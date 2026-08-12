@@ -6,7 +6,9 @@
 //! (`session::state`, `session::reducer`, `session::jsonl`, `compaction`,
 //! `messages`, `events`, `skills`, `agent_harness`) are added as M5 progresses.
 
+pub mod compaction;
 pub mod error;
+pub mod messages;
 pub mod result;
 pub mod session;
 pub mod types;
