@@ -1097,6 +1097,10 @@ impl Default for ForkPosition {
 pub struct SessionCreateOptions {
     pub id: Option<String>,
     pub parent_session_id: Option<String>,
+    /// Opaque application-owned metadata. The in-memory repo ignores it; the
+    /// JSONL repo persists it into the v4 header and surfaces it on
+    /// [`crate::session::jsonl::types::JsonlSessionMetadata`].
+    pub metadata: Option<serde_json::Map<String, JsonValue>>,
 }
 
 // ---------------------------------------------------------------------------

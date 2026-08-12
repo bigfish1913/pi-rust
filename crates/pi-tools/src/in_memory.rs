@@ -149,6 +149,26 @@ impl InMemoryExecutionEnv {
             cwd.join(pb)
         }
     }
+
+    /// Normalize a path string to forward slashes. The internal `BTreeMap` keys
+    /// are always stored normalized so that path-separator differences across
+    /// platforms (Windows `\` vs POSIX `/`) do not break the prefix-based
+    /// `list_dir` / `remove` lookups against POSIX-style test paths like
+    /// `/sessions` / `/proj`. `PathBuf::push`/`join` insert the OS separator
+    /// (`\` on Windows); without normalization, a file written at
+    /// `/sessions\--proj--\file.jsonl` would never match a `list_dir` prefix of
+    /// `/sessions/--proj--/` — which is exactly the cross-platform bug this
+    /// guards. This is a test double, so canonicalizing to `/` is safe and keeps
+    /// test paths portable.
+    fn norm(s: &str) -> String {
+        s.replace('\\', "/")
+    }
+
+    /// Resolve `path` against `cwd` and normalize to a forward-slash absolute
+    /// string suitable for use as a `BTreeMap` key.
+    fn resolve_key(cwd: &Path, path: &str) -> String {
+        Self::norm(&Self::resolve(cwd, path).to_string_lossy())
+    }
 }
 
 impl Default for InMemoryExecutionEnv {
@@ -170,7 +190,11 @@ impl FileSystem for InMemoryExecutionEnv {
     ) -> Result<PathBuf, FileError> {
         check_cancel_file(cancel, Some(path))?;
         let g = self.inner.lock().await;
-        Ok(Self::resolve(&g.cwd, path))
+        let resolved = Self::resolve(&g.cwd, path).to_string_lossy().into_owned();
+        // Normalize to forward slashes so absolute_path() returns a string
+        // consistent with the BTreeMap keys (POSIX-style), keeping the repo's
+        // join_path + write_file + list_dir chain coherent on Windows.
+        Ok(PathBuf::from(Self::norm(&resolved)))
     }
 
     async fn join_path(
@@ -179,11 +203,19 @@ impl FileSystem for InMemoryExecutionEnv {
         cancel: Option<&CancellationToken>,
     ) -> Result<PathBuf, FileError> {
         check_cancel_file(cancel, None)?;
-        let mut out = PathBuf::new();
+        let mut out = String::new();
         for p in parts {
-            out.push(p);
+            if out.is_empty() {
+                out = p.to_string();
+            } else if out.ends_with('/') {
+                out.push_str(p);
+            } else {
+                out.push('/');
+                out.push_str(p);
+            }
         }
-        Ok(out)
+        // Normalize any `\` the parts may carry to `/`.
+        Ok(PathBuf::from(Self::norm(&out)))
     }
 
     async fn read_text_file(
@@ -227,7 +259,7 @@ impl FileSystem for InMemoryExecutionEnv {
     ) -> Result<Vec<u8>, FileError> {
         check_cancel_file(cancel, Some(path))?;
         let g = self.inner.lock().await;
-        let abs = Self::resolve(&g.cwd, path).to_string_lossy().into_owned();
+        let abs = Self::resolve_key(&g.cwd, path);
         match g.files.get(&abs) {
             Some(f) if f.kind == FileKind::File => Ok(f.bytes.clone()),
             Some(f) if f.kind == FileKind::Directory => Err(FileError::new(
@@ -251,9 +283,12 @@ impl FileSystem for InMemoryExecutionEnv {
     ) -> Result<(), FileError> {
         check_cancel_file(cancel, Some(path))?;
         let mut g = self.inner.lock().await;
-        let abs = Self::resolve(&g.cwd, path).to_string_lossy().into_owned();
-        // Auto-create parent dirs.
-        let parent = Path::new(&abs).parent().map(|p| p.to_string_lossy().into_owned());
+        let abs = Self::resolve_key(&g.cwd, path);
+        // Auto-create parent dirs (normalized so the key matches what later
+        // reads/writes look up).
+        let parent = Path::new(&abs)
+            .parent()
+            .map(|p| Self::norm(&p.to_string_lossy()));
         if let Some(p) = parent {
             if !p.is_empty() && !g.files.contains_key(&p) {
                 let mtime = self.bump_clock(&mut g).await;
@@ -287,7 +322,7 @@ impl FileSystem for InMemoryExecutionEnv {
     ) -> Result<(), FileError> {
         check_cancel_file(cancel, Some(path))?;
         let mut g = self.inner.lock().await;
-        let abs = Self::resolve(&g.cwd, path).to_string_lossy().into_owned();
+        let abs = Self::resolve_key(&g.cwd, path);
         let mtime = self.bump_clock(&mut g).await;
         match g.files.get_mut(&abs) {
             Some(f) if f.kind == FileKind::File => {
@@ -322,8 +357,8 @@ impl FileSystem for InMemoryExecutionEnv {
     ) -> Result<(), FileError> {
         check_cancel_file(cancel, Some(source))?;
         let mut g = self.inner.lock().await;
-        let src_abs = Self::resolve(&g.cwd, source).to_string_lossy().into_owned();
-        let dst_abs = Self::resolve(&g.cwd, dest).to_string_lossy().into_owned();
+        let src_abs = Self::resolve_key(&g.cwd, source);
+        let dst_abs = Self::resolve_key(&g.cwd, dest);
         match g.files.remove(&src_abs) {
             Some(f) => {
                 let mtime = self.bump_clock(&mut g).await;
@@ -348,7 +383,7 @@ impl FileSystem for InMemoryExecutionEnv {
     ) -> Result<FileInfo, FileError> {
         check_cancel_file(cancel, Some(path))?;
         let g = self.inner.lock().await;
-        let abs = Self::resolve(&g.cwd, path).to_string_lossy().into_owned();
+        let abs = Self::resolve_key(&g.cwd, path);
         match g.files.get(&abs) {
             Some(f) => Ok(FileInfo {
                 name: Path::new(&abs)
@@ -371,7 +406,7 @@ impl FileSystem for InMemoryExecutionEnv {
     ) -> Result<Vec<FileInfo>, FileError> {
         check_cancel_file(cancel, Some(path))?;
         let g = self.inner.lock().await;
-        let abs = Self::resolve(&g.cwd, path).to_string_lossy().into_owned();
+        let abs = Self::resolve_key(&g.cwd, path);
         // Normalize the directory prefix for matching children.
         let prefix = if abs.ends_with('/') {
             abs.clone()
@@ -412,7 +447,7 @@ impl FileSystem for InMemoryExecutionEnv {
     ) -> Result<PathBuf, FileError> {
         check_cancel_file(cancel, Some(path))?;
         let g = self.inner.lock().await;
-        let abs = Self::resolve(&g.cwd, path).to_string_lossy().into_owned();
+        let abs = Self::resolve_key(&g.cwd, path);
         if g.files.contains_key(&abs) || abs == "/" {
             Ok(PathBuf::from(&abs))
         } else {
@@ -427,7 +462,7 @@ impl FileSystem for InMemoryExecutionEnv {
     ) -> Result<bool, FileError> {
         check_cancel_file(cancel, Some(path))?;
         let g = self.inner.lock().await;
-        let abs = Self::resolve(&g.cwd, path).to_string_lossy().into_owned();
+        let abs = Self::resolve_key(&g.cwd, path);
         Ok(g.files.contains_key(&abs) || abs == "/")
     }
 
@@ -439,7 +474,7 @@ impl FileSystem for InMemoryExecutionEnv {
     ) -> Result<(), FileError> {
         check_cancel_file(cancel, Some(path))?;
         let mut g = self.inner.lock().await;
-        let abs = Self::resolve(&g.cwd, path).to_string_lossy().into_owned();
+        let abs = Self::resolve_key(&g.cwd, path);
         if recursive {
             // Create all ancestor dirs.
             let mut acc = String::new();
@@ -486,7 +521,7 @@ impl FileSystem for InMemoryExecutionEnv {
     ) -> Result<(), FileError> {
         check_cancel_file(cancel, Some(path))?;
         let mut g = self.inner.lock().await;
-        let abs = Self::resolve(&g.cwd, path).to_string_lossy().into_owned();
+        let abs = Self::resolve_key(&g.cwd, path);
         if !g.files.contains_key(&abs) {
             if force {
                 return Ok(());

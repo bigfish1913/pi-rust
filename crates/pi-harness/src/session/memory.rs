@@ -328,7 +328,10 @@ impl SessionStorage for InMemorySessionStorage {
 /// Stamp a record's `seq`/`lane`/`timestamp` fields. The caller-built record may
 /// carry only the intent-level fields; this rebuilds it with the storage-assigned
 /// [`RecordBase`] fields set. Mirrors TS `{ ...newRecord, seq, timestamp }`.
-fn stamp_record(record: LaneRecord, seq: u64, lane: String, timestamp: i64) -> LaneRecord {
+///
+/// Shared by both in-memory and JSONL storage backends (each stamps `seq` +
+/// `timestamp` from its own clock + state before persisting), hence `pub(crate)`.
+pub(crate) fn stamp_record(record: LaneRecord, seq: u64, lane: String, timestamp: i64) -> LaneRecord {
     use crate::session::types::*;
     let stamp = |mut base: RecordBase| {
         base.seq = seq;

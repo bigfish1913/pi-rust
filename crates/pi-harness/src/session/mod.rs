@@ -7,6 +7,7 @@
 //!
 //! Built up incrementally across M5b–M5f.
 
+pub mod jsonl;
 pub mod memory;
 pub mod reducer;
 pub mod state;
