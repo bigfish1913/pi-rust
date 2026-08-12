@@ -8,6 +8,8 @@ members = [
     "crates/pi-tools",
     "crates/pi-harness",
     "crates/pi-cli",
+    "examples/minimal",
+    "examples/tools",
 ]
 default-members = ["crates/pi-agent", "crates/pi-tools", "crates/pi-harness"]
 resolver = "2"

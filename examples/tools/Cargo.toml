@@ -1,0 +1,11 @@
+[package]
+name = "tools-example"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+pi-agent = { workspace = true }
+pi-ai = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
