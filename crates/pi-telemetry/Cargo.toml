@@ -1,0 +1,15 @@
+[package]
+name = "pi-telemetry"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+version.workspace = true
+authors.workspace = true
+description = "Telemetry span/event contracts (noop default), port of pi-telemetry"
+
+[dependencies]
+async-trait = { workspace = true }
+tokio = { workspace = true }
+
+[features]
+testing = []

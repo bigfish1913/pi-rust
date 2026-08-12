@@ -1,0 +1,10 @@
+[package]
+name = "pi-cli"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+version.workspace = true
+authors.workspace = true
+description = "Reserved for a future CLI built on top of the pi-rust library crates"
+
+[dependencies]

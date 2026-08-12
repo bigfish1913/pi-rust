@@ -1,0 +1,24 @@
+[package]
+name = "pi-harness"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+version.workspace = true
+authors.workspace = true
+description = "Session tree + JSONL persistence + compaction + AgentHarness loop, port of pi harness layer"
+
+[dependencies]
+pi-telemetry = { workspace = true }
+pi-ai = { workspace = true }
+pi-agent = { workspace = true }
+pi-tools = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
