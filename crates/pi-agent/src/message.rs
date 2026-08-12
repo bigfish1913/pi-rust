@@ -18,7 +18,11 @@ use serde::{Deserialize, Serialize};
 
 /// `AgentMessage = Message | Custom`. The open-enum port of TS
 /// `AgentMessage = Message | CustomAgentMessages[keyof CustomAgentMessages]`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `PartialEq` is derived so `pi-harness` entry equality (and tests) can compare
+/// persisted messages by value. `pi_ai`'s base message types already implement
+/// `PartialEq`; `CustomMessage` does too, so the four-arm enum derives cleanly.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentMessage {
     User(UserMessage),
@@ -113,7 +117,11 @@ impl AgentMessageRole {
 ///
 /// `pi-harness::messages` provides typed constructors per known role;
 /// `pi-agent` stays role-agnostic and only owns this shell.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `PartialEq` is derived so `pi-harness` entry equality (and tests) can compare
+/// persisted custom messages by value. `serde_json::Value` + `Content` both
+/// implement `PartialEq`, so the derive is sound.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CustomMessage {
     pub role: String,

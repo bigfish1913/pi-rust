@@ -22,3 +22,8 @@ schemars = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+pi-telemetry = { workspace = true }
+pi-ai = { workspace = true }
+pi-agent = { workspace = true }
