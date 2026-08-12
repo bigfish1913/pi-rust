@@ -24,15 +24,19 @@ pub mod types;
 
 pub use abort::AbortHandle;
 pub use agent::{Agent, AgentBuilder, AgentOptions};
+pub use agent_loop::{run_agent_loop, run_agent_loop_continue, LoopOutcome, NewMessages};
 pub use agent_tool::AgentTool;
 pub use error::AgentError;
 pub use events::{AgentEmitter, AgentEvent, CollectorEmitter};
-pub use hooks::AgentLoopConfig;
+pub use hooks::{
+    AgentLoopConfig, AfterToolCall, BeforeToolCall, ConvertToLlm, GetApiKey, GetFollowUpMessages,
+    GetSteeringMessages, PrepareNextTurn, ShouldStopAfterTurn, TransformContext,
+};
 pub use message::{AgentMessage, AgentMessageRole, CustomMessage};
 pub use queue::PendingMessageQueue;
-pub use stream_fn::StreamFn;
+pub use stream_fn::{StreamFn, stream_fn};
 pub use types::{
     AfterToolCallContext, AfterToolCallResult, AgentContext, AgentLoopTurnUpdate, AgentState,
     AgentToolResult, BeforeToolCallContext, BeforeToolCallResult, QueueMode,
-    ShouldStopAfterTurnContext, ToolExecutionMode, ToolResultPartial,
+    ShouldStopAfterTurnContext, TextContentOrImage, ToolExecutionMode, ToolResultPartial,
 };

@@ -812,7 +812,13 @@ async fn prepare_tool_call(
         }
     };
 
-    // before_tool_call hook (may block + set terminate).
+    // before_tool_call hook (may block + set terminate, may replace args).
+    // TS hands the callback `args` by reference and lets JS mutate it in place;
+    // Rust hands an immutable borrow, so a rewrite is signalled by
+    // `BeforeToolCallResult::args`. The replacement is applied WITHOUT
+    // re-validation, mirroring TS where the mutation lands after
+    // `validateToolArguments` and is trusted.
+    let mut validated_args = validated_args;
     if let Some(before) = &config.before_tool_call {
         let ctx = BeforeToolCallContext {
             assistant_message,
@@ -828,6 +834,9 @@ async fn prepare_tool_call(
             };
         }
         if let Some(br) = before_result {
+            if let Some(replacement) = br.args {
+                validated_args = replacement;
+            }
             if br.block {
                 let mut result =
                     create_error_tool_result(&br.reason.unwrap_or_else(|| "Tool execution was blocked".to_string()));
@@ -871,25 +880,27 @@ async fn execute_prepared_tool_call(
     let tool_name = tool_call.name.clone();
     let args_clone = args.clone();
     let emit_clone = Arc::clone(emit);
-    let gate = Arc::clone(&accepting_updates);
 
-    let on_update = move |partial: crate::types::ToolResultPartial| {
-        if !gate.load(Ordering::SeqCst) {
-            return;
-        }
-        // Cancellation during a cancelled batch: still emit for non-cancelled
-        // runs; the gate above is the real suppression.
-        let ev = AgentEvent::ToolExecutionUpdate {
-            tool_call_id: tool_call_id.clone(),
-            tool_name: tool_name.clone(),
-            args: args_clone.clone(),
-            partial_result: Arc::new(partial),
-        };
-        // The trait requires a `&dyn Fn` synchronous body; use the non-blocking
-        // `try_emit` surface so on_update never awaits (late-update suppression
-        // + ordering: update events interleave correctly because they share the
-        // collector's mutex / the broadcast's channel).
-        emit_clone.try_emit(ev);
+    let on_update: Arc<dyn Fn(crate::types::ToolResultPartial) + Send + Sync> = {
+        let gate = Arc::clone(&accepting_updates);
+        Arc::new(move |partial: crate::types::ToolResultPartial| {
+            if !gate.load(Ordering::SeqCst) {
+                return;
+            }
+            // Cancellation during a cancelled batch: still emit for non-cancelled
+            // runs; the gate above is the real suppression.
+            let ev = AgentEvent::ToolExecutionUpdate {
+                tool_call_id: tool_call_id.clone(),
+                tool_name: tool_name.clone(),
+                args: args_clone.clone(),
+                partial_result: Arc::new(partial),
+            };
+            // `try_emit` is the non-blocking sync surface, so `on_update` never
+            // awaits (it's an `Arc<dyn Fn>`, not an async). Late-update
+            // suppression + ordering: update events interleave correctly because
+            // they share the collector's mutex / the broadcast's channel.
+            emit_clone.try_emit(ev);
+        })
     };
 
     let child_token = config.signal.child_token();
@@ -898,7 +909,7 @@ async fn execute_prepared_tool_call(
             &tool_call.id,
             args.clone(),
             child_token,
-            &on_update,
+            on_update,
         )
         .await
     {

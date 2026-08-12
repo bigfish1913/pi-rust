@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::AgentError;
 use crate::types::{AgentToolResult, ToolExecutionMode, ToolResultPartial};
+use std::sync::Arc;
 
 /// A tool the agent can call. Mirrors TS `AgentTool<TParameters, TDetails>`.
 ///
@@ -48,13 +49,18 @@ pub trait AgentTool: Send + Sync {
     /// Execute the tool call. Throw via `Err(AgentError)` on failure — the loop
     /// encodes the error message into an error `ToolResultMessage`.
     ///
-    /// `on_update` streams partial results; calls made after this future
-    /// resolves are ignored by the loop's `accepting_updates` gate.
+    /// `on_update` streams partial results. It is passed as an `Arc<dyn Fn>`
+    /// (not a borrow) so a tool may clone it into a background task that emits
+    /// progress after `execute` has returned its main result — e.g. a bash tool
+    /// whose throttled output flusher outlives the `await` point. Calls made
+    /// after the loop has flipped its `accepting_updates` gate to false are
+    /// silently dropped by the loop (late-update suppression, invariant §5.3);
+    /// the tool never needs to track settlement itself.
     async fn execute(
         &self,
         tool_call_id: &str,
         params: serde_json::Value,
         signal: CancellationToken,
-        on_update: &(dyn Fn(ToolResultPartial) + Send + Sync),
+        on_update: Arc<dyn Fn(ToolResultPartial) + Send + Sync>,
     ) -> Result<AgentToolResult, AgentError>;
 }

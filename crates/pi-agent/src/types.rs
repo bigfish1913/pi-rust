@@ -105,11 +105,20 @@ pub type ToolResultPartial = AgentToolResult;
 /// Result of a `before_tool_call` hook. `block` prevents execution; the loop
 /// emits an error tool result with `reason` (or a default) instead. `terminate`
 /// participates in the batch early-termination rule (all results must set it).
+///
+/// `args` is the Rust equivalent of TS `beforeToolCall` mutating the validated
+/// args object in place: JS callbacks receive `args` by reference and write to
+/// it; Rust hands the hook an immutable `&serde_json::Value`, so to rewrite the
+/// args the hook returns them here. Replacement args are applied **without
+/// re-validation** — mirroring TS, where the mutation happens after
+/// `validateToolArguments` and is never re-checked. `None` keeps the validated
+/// args.
 #[derive(Debug, Clone, Default)]
 pub struct BeforeToolCallResult {
     pub block: bool,
     pub reason: Option<String>,
     pub terminate: bool,
+    pub args: Option<serde_json::Value>,
 }
 
 /// Partial override returned from `after_tool_call`. Field-by-field merge:
