@@ -467,6 +467,22 @@ pub enum ThinkingLevel {
 /// unsupported. Mirrors `ThinkingLevelMap = Partial<Record<...>>`.
 pub type ThinkingLevelMap = BTreeMap<ThinkingLevel, Option<String>>;
 
+/// Custom token budgets per thinking level for token-budgeted reasoning models.
+/// Mirrors TS `ThinkingBudgets`; all fields optional (defaults live in
+/// `simple-options.ts::adjustMaxTokensForThinking`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThinkingBudgets {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimal: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub low: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub medium: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub high: Option<u64>,
+}
+
 // ----------------------------------------------------------------------------
 // Deferred responses
 // ----------------------------------------------------------------------------

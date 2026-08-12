@@ -27,7 +27,7 @@ pub use schema::validate_tool_arguments;
 pub use types::{
     Api, AssistantMessage, AssistantMessageEvent, Content, Context, DeferredHandle, DoneReason,
     ErrorReason, ImageContent, InputModality, Message, ModelCost, ModelCostRates,
-    ModelCostTier, ProviderId, Schema, StopReason, TextContent, ThinkingContent, ThinkingLevel,
-    ThinkingLevelMap, Tool, ToolCall, ToolCallType, ToolResultMessage,
-    Usage, UsageCost, UserContent, UserMessage,
+    ModelCostTier, ProviderId, Schema, StopReason, TextContent, ThinkingBudgets,
+    ThinkingContent, ThinkingLevel, ThinkingLevelMap, Tool, ToolCall, ToolCallType,
+    ToolResultMessage, Usage, UsageCost, UserContent, UserMessage,
 };

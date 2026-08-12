@@ -5,7 +5,7 @@
 
 use crate::event_stream::AssistantMessageEventStream;
 use crate::model::Model;
-use crate::types::Context;
+use crate::types::{Context, ThinkingBudgets, ThinkingLevel};
 use std::collections::BTreeMap;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -37,7 +37,8 @@ pub struct SimpleStreamOptions {
     pub max_retry_delay: Option<Duration>,
     /// Extra HTTP headers to send (merged over provider defaults).
     pub headers: Option<BTreeMap<String, String>>,
-    /// Free-form provider metadata (request id, trace id, …).
+    /// Free-form provider metadata (request id, trace id, …). Anthropic reads
+    /// `user_id` for abuse tracking; faux ignores it.
     pub metadata: Option<BTreeMap<String, String>>,
     /// Cache-retention hint for prompt caching.
     pub cache_retention: CacheRetention,
@@ -47,6 +48,21 @@ pub struct SimpleStreamOptions {
     /// `Error { reason: Aborted }` terminal event when cancelled. Defaults to a
     /// fresh un-cancelled token so `Default`-constructed options never abort.
     pub signal: CancellationToken,
+    /// Extended-thinking level. `None`/`Off` → thinking disabled (provider may
+    /// still emit `thinking: { type: "disabled" }` when the model reasons).
+    /// Mirrors TS `SimpleStreamOptions.reasoning`.
+    pub reasoning: Option<ThinkingLevel>,
+    /// Optional caller override for the requested output-token ceiling. `None`
+    /// lets the provider fit the thinking budget inside `Model::max_tokens`.
+    /// Mirrors TS `SimpleStreamOptions.maxTokens`.
+    pub max_tokens: Option<u64>,
+    /// Sampling temperature. Only applied when the model supports it AND
+    /// thinking is disabled (Anthropic rejects temperature under thinking).
+    /// Mirrors TS `StreamOptions.temperature`.
+    pub temperature: Option<f64>,
+    /// Per-level reasoning token budgets for budget-based thinking models.
+    /// Faux ignores this; anthropic uses it in `adjust_max_tokens_for_thinking`.
+    pub thinking_budgets: Option<ThinkingBudgets>,
 }
 
 impl Default for SimpleStreamOptions {
@@ -61,6 +77,10 @@ impl Default for SimpleStreamOptions {
             cache_retention: CacheRetention::default(),
             session_id: None,
             signal: CancellationToken::new(),
+            reasoning: None,
+            max_tokens: None,
+            temperature: None,
+            thinking_budgets: None,
         }
     }
 }
@@ -78,6 +98,11 @@ impl SimpleStreamOptions {
     pub fn with_signal(mut self, signal: CancellationToken) -> Self {
         self.signal = signal;
         self
+    }
+
+    /// Resolve the effective reasoning level, defaulting to `Off` when unset.
+    pub fn reasoning_level(&self) -> ThinkingLevel {
+        self.reasoning.unwrap_or(ThinkingLevel::Off)
     }
 }
 

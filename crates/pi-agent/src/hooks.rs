@@ -151,7 +151,7 @@ impl std::fmt::Debug for AgentLoopConfig {
 /// `{ ...config, apiKey: resolvedApiKey, signal }` passed to `streamFunction`.
 impl AgentLoopConfig {
     pub fn to_stream_options(&self, api_key: Option<String>) -> SimpleStreamOptions {
-        SimpleStreamOptions {
+        let mut opts = SimpleStreamOptions {
             api_key,
             timeout: self.timeout,
             max_retries: self.max_retries,
@@ -161,7 +161,17 @@ impl AgentLoopConfig {
             cache_retention: self.cache_retention,
             session_id: self.session_id.clone(),
             signal: self.signal.clone(),
+            ..SimpleStreamOptions::default()
+        };
+        // Forward the run's thinking level as `reasoning` (the provider-level
+        // knob) so a real provider like anthropic can map it to adaptive vs
+        // budget-based thinking. TS `AgentLoopConfig extends SimpleStreamOptions`
+        // and so carries `reasoning` through directly.
+        match self.thinking_level {
+            ThinkingLevel::Off => opts.reasoning = None,
+            other => opts.reasoning = Some(other),
         }
+        opts
     }
 }
 
