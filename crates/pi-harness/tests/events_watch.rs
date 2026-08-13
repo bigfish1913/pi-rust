@@ -17,7 +17,7 @@
 use std::sync::{Arc, Mutex};
 
 use pi_harness::events::{
-    HarnessEvent, HarnessEventBus, RunEndEvent, RunOutcome, RunStartEvent, WatchListener,
+    HarnessEvent, HarnessEventBus, RunEndEvent, RunEndOutcome, RunStartEvent, WatchListener,
 };
 
 fn run_start() -> HarnessEvent {
@@ -28,7 +28,7 @@ fn run_end() -> HarnessEvent {
     HarnessEvent::RunEnd(RunEndEvent {
         lane: "main".into(),
         run_id: "run-1".into(),
-        outcome: RunOutcome::Completed,
+        outcome: RunEndOutcome::Completed,
         leaf_id: "entry-1".into(),
     })
 }

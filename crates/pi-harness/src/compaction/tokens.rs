@@ -1,22 +1,19 @@
 //! Mirrors the token-estimation + file-operation + conversation-serialization
 //! pieces of `packages/agent/src/harness/compaction/utils.ts`, plus
-//! `estimate_tokens`/`estimate_context_tokens` (from `compaction.ts`) and a
-//! minimal `build_session_context` (from `session/context.ts`) that compaction
-//! needs for `tokens_before`.
+//! `estimate_tokens`/`estimate_context_tokens` (from `compaction.ts`).
 //!
-//! `build_session_context` is pulled forward from M5f because `prepare_compaction`
-//! needs it; this is a faithful-but-minimal port the M5f Session facade will
-//! later own/expand.
+//! The context-builder pieces (`build_session_context`/
+//! `default_context_entry_transform`/`SessionContext`) are re-exported from
+//! the canonical `session::context` module (the authoritative
+//! `session/context.ts` port) — compaction's `tokens_before` path delegates to
+//! that module's no-options wrapper so the two never diverge.
 
 use std::collections::BTreeSet;
 
 use pi_ai::types::{AssistantMessage, Content, Message, Usage};
 use pi_agent::message::AgentMessage;
 
-use crate::messages::{
-    bash_execution_data, branch_summary_data, compaction_summary_data, create_branch_summary_message,
-    create_compaction_summary_message, BashExecutionData,
-};
+use crate::messages::{bash_execution_data, branch_summary_data, compaction_summary_data};
 use crate::session::types::Entry;
 
 // ---------------------------------------------------------------------------
@@ -340,120 +337,25 @@ pub fn estimate_context_tokens(messages: &[AgentMessage]) -> ContextUsageEstimat
 }
 
 // ---------------------------------------------------------------------------
-// build_session_context — minimal port of session/context.ts, for tokensBefore
+// build_session_context — compaction's tokensBefore path delegates to the
+// canonical `session::context` module (the authoritative `session/context.ts`
+// port). The no-options shape compaction needs is `build_session_context_default`.
 // ---------------------------------------------------------------------------
 
-/// A minimal `SessionContext`. Mirrors the TS `SessionContext` shape; compaction
-/// only reads `.messages` today, but the state fields are carried for parity and
-/// for M5f's Session facade.
-#[derive(Debug, Clone, Default)]
-pub struct SessionContext {
-    pub messages: Vec<AgentMessage>,
-    pub thinking_level: String,
-    pub model: Option<(String, String)>,
-    pub active_tool_names: Option<Vec<String>>,
-}
-
-/// `defaultContextEntryTransform` — keep the last compaction entry + everything
-/// after it; if no compaction, keep all entries. Mirrors
+/// `defaultContextEntryTransform` — re-exported from the canonical context
+/// module so compaction callers reach it without a second path. Mirrors
 /// `defaultContextEntryTransform`.
-fn default_context_entries(path_entries: &[Entry]) -> Vec<Entry> {
-    let mut compaction_index = None;
-    for (i, entry) in path_entries.iter().enumerate().rev() {
-        if matches!(entry, Entry::Compaction(_)) {
-            compaction_index = Some(i);
-            break;
-        }
-    }
-    match compaction_index {
-        None => path_entries.to_vec(),
-        Some(i) => {
-            let mut out = Vec::with_capacity(path_entries.len() - i);
-            out.push(path_entries[i].clone());
-            out.extend(path_entries[i + 1..].iter().cloned());
-            out
-        }
-    }
-}
+pub use crate::session::context::default_context_entry_transform;
 
-/// `sessionEntryToContextMessages` (no-projector form): message (skip deferred
-/// assistant) → `[message]`; compaction → `[compactionSummary, …retainedTail]`;
-/// branch_summary → `[branchSummary]`; others → `[]`.
-fn entry_to_context_messages(entry: &Entry) -> Vec<AgentMessage> {
-    match entry {
-        Entry::Message(m) => {
-            if let AgentMessage::Assistant(a) = &m.message {
-                if a.stop_reason == pi_ai::types::StopReason::Deferred {
-                    return Vec::new();
-                }
-            }
-            vec![m.message.clone()]
-        }
-        Entry::Compaction(c) => {
-            let mut out = Vec::with_capacity(c.retained_tail.len() + 1);
-            out.push(create_compaction_summary_message(
-                &c.summary,
-                c.tokens_before,
-                c.base.timestamp,
-            ));
-            out.extend(c.retained_tail.iter().cloned());
-            out
-        }
-        Entry::BranchSummary(b) => {
-            vec![create_branch_summary_message(&b.summary, &b.from_id, b.base.timestamp)]
-        }
-        // thinking_level_change / model_change / active_tools_change / custom → no
-        // context message (custom projectors are a M5f concern; compaction does
-        // not need them for `tokens_before`).
-        _ => Vec::new(),
-    }
-}
+/// `SessionContext` — re-exported from the canonical context module. Mirrors TS
+/// `SessionContext`. Carried in `compaction::tokens` for tokens-path callers.
+pub use crate::session::context::SessionContext;
 
-/// Derive `thinking_level`/`model`/`active_tool_names` from the full path.
-/// Mirrors `deriveSessionContextState`.
-fn derive_session_context_state(path_entries: &[Entry]) -> SessionContext {
-    let mut thinking_level = "off".to_string();
-    let mut model: Option<(String, String)> = None;
-    let mut active_tool_names: Option<Vec<String>> = None;
-    for entry in path_entries {
-        match entry {
-            Entry::ThinkingLevel(t) => thinking_level = t.thinking_level.clone(),
-            Entry::ModelChange(m) => model = Some((m.provider.clone(), m.model_id.clone())),
-            Entry::Message(m) => {
-                if let AgentMessage::Assistant(a) = &m.message {
-                    model = Some((a.provider.as_str().to_string(), a.model.clone()));
-                }
-            }
-            Entry::ActiveTools(a) => active_tool_names = Some(a.active_tool_names.clone()),
-            _ => {}
-        }
-    }
-    SessionContext {
-        messages: Vec::new(),
-        thinking_level,
-        model,
-        active_tool_names,
-    }
-}
-
-/// `buildSessionContext(pathEntries)`. Mirrors TS: derive state from the full
-/// path, apply `defaultContextEntryTransform`, flatMap each entry to context
-/// messages.
+/// `buildSessionContext(pathEntries)` (no options) — the shape compaction uses
+/// for `tokensBefore`. Delegates to the canonical context builder. Mirrors TS
+/// `buildSessionContext`.
 pub fn build_session_context(path_entries: &[Entry]) -> SessionContext {
-    let mut ctx = derive_session_context_state(path_entries);
-    let context_entries = default_context_entries(path_entries);
-    let mut messages = Vec::new();
-    for entry in &context_entries {
-        messages.extend(entry_to_context_messages(entry));
-    }
-    ctx.messages = messages;
-    ctx
-}
-
-// Silence the unused-import/struct helper if the `_retain_*` marker is dead.
-#[allow(unused)]
-fn _retain_bash_execution_data_marker(d: &BashExecutionData) -> BashExecutionData {
-    d.clone()
+    crate::session::context::build_session_context(path_entries, &Default::default())
 }
 
 #[cfg(test)]

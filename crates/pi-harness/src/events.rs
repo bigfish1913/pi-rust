@@ -19,6 +19,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
+use pi_ai::types::DeferredHandle;
+
 /// `run_start` event. Mirrors TS `RunStartEvent`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunStartEvent {
@@ -26,30 +28,78 @@ pub struct RunStartEvent {
     pub run_id: String,
 }
 
-/// Terminal state of a run. Mirrors TS `"completed" | "aborted" | "failed"`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The terminal state a run settles into. Mirrors TS `RunOutcome` (the full
+/// harness-level union — `completed`/`aborted`/`failed`/`suspended`). The bus's
+/// `RunEndEvent` carries the `RunEndOutcome` subset (`completed`/`aborted`/
+/// `failed`); `suspended` is NOT a run_end — the run is still open, parked on a
+/// deferred handle — so it never appears in a `RunEndEvent` payload and has no
+/// `as_str`. Callers observe suspension via `RunOutcome` returned from the lane
+/// operation, not via the event stream.
+#[derive(Debug, Clone, PartialEq)]
 pub enum RunOutcome {
+    Completed,
+    Aborted,
+    Failed,
+    /// Mirrors TS `{ kind: "suspended"; deferred: DeferredHandle }`. The run
+    /// parked on a deferred provider response; `resume` continues it.
+    Suspended { deferred: DeferredHandle },
+}
+
+/// The subset of [`RunOutcome`] that a `RunEndEvent` may carry. Mirrors the TS
+/// `RunEndEvent["outcome"]` (`"completed" | "aborted" | "failed"`). `suspended`
+/// is excluded because a suspended run does not emit `run_end`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunEndOutcome {
     Completed,
     Aborted,
     Failed,
 }
 
-impl RunOutcome {
+impl RunEndOutcome {
     pub fn as_str(self) -> &'static str {
         match self {
-            RunOutcome::Completed => "completed",
-            RunOutcome::Aborted => "aborted",
-            RunOutcome::Failed => "failed",
+            RunEndOutcome::Completed => "completed",
+            RunEndOutcome::Aborted => "aborted",
+            RunEndOutcome::Failed => "failed",
         }
     }
 }
 
-/// `run_end` event payload. Mirrors TS `RunEndEvent`.
+impl From<RunEndOutcome> for RunOutcome {
+    fn from(o: RunEndOutcome) -> Self {
+        match o {
+            RunEndOutcome::Completed => RunOutcome::Completed,
+            RunEndOutcome::Aborted => RunOutcome::Aborted,
+            RunEndOutcome::Failed => RunOutcome::Failed,
+        }
+    }
+}
+
+impl RunOutcome {
+    /// True for the three `run_end`-emitting outcomes.
+    pub fn is_terminal_run_end(&self) -> bool {
+        !matches!(self, RunOutcome::Suspended { .. })
+    }
+
+    /// Map to the `RunEndEvent` outcome subset. Returns `None` for `Suspended`
+    /// (a suspended run never emits `run_end`).
+    pub fn to_run_end_outcome(&self) -> Option<RunEndOutcome> {
+        match self {
+            RunOutcome::Completed => Some(RunEndOutcome::Completed),
+            RunOutcome::Aborted => Some(RunEndOutcome::Aborted),
+            RunOutcome::Failed => Some(RunEndOutcome::Failed),
+            RunOutcome::Suspended { .. } => None,
+        }
+    }
+}
+
+/// `run_end` event payload. Mirrors TS `RunEndEvent`. The `outcome` is the
+/// three-value `RunEndOutcome` subset (suspended runs do not emit `run_end`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunEndEvent {
     pub lane: String,
     pub run_id: String,
-    pub outcome: RunOutcome,
+    pub outcome: RunEndOutcome,
     pub leaf_id: String,
 }
 
@@ -138,7 +188,9 @@ struct BusInner {
     watch_listeners: Vec<Arc<Mutex<WatchDelivery>>>,
 }
 
-/// The harness event bus. Mirrors TS `HarnessEventBus`.
+/// The harness event bus. Mirrors TS `HarnessEventBus`. Cheaply [`Clone`] —
+/// the inner state is behind an `Arc<Mutex>`, so clones share the same bus.
+#[derive(Clone)]
 pub struct HarnessEventBus {
     inner: Arc<Mutex<BusInner>>,
 }
@@ -374,6 +426,35 @@ impl<T> Drop for WatchHandle<T> {
 mod tests {
     use super::*;
 
+    #[cfg(test)]
+    mod tests_case_outcomes {
+        use super::*;
+        #[test]
+        fn suspended_is_not_run_end() {
+            let d = DeferredHandle {
+                provider: "p".into(),
+                model_id: "m".into(),
+                api: "openai-responses".into(),
+                id: "r-1".into(),
+                expires_at: None,
+                poll_after_ms: None,
+                data: None,
+            };
+            let s = RunOutcome::Suspended { deferred: d };
+            assert!(!s.is_terminal_run_end());
+            assert!(s.to_run_end_outcome().is_none());
+        }
+
+        #[test]
+        fn completed_maps_to_run_end() {
+            assert_eq!(
+                RunOutcome::Completed.to_run_end_outcome(),
+                Some(RunEndOutcome::Completed)
+            );
+            assert!(RunOutcome::Completed.is_terminal_run_end());
+        }
+    }
+
     fn run_start() -> HarnessEvent {
         HarnessEvent::RunStart(RunStartEvent { lane: "main".into(), run_id: "run-1".into() })
     }
@@ -382,7 +463,7 @@ mod tests {
         HarnessEvent::RunEnd(RunEndEvent {
             lane: "main".into(),
             run_id: "run-1".into(),
-            outcome: RunOutcome::Completed,
+            outcome: RunEndOutcome::Completed,
             leaf_id: "entry-1".into(),
         })
     }

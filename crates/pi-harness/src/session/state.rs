@@ -219,6 +219,7 @@ impl SessionState {
                     self.stats.total_tokens += usage_rec.usage.total_tokens;
                     self.stats.cost_total += usage_rec.usage.cost.total;
                 }
+                self.records.push(record.clone());
                 self.log.push(LogItem::Record { seq, record: record.clone() });
                 Ok(ApplyOutcome::Record(record))
             }

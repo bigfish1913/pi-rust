@@ -478,13 +478,19 @@ fn deserialize_base(obj: &serde_json::Map<String, serde_json::Value>) -> Result<
 /// We store the parts the caller DOES provide (`id` + the arm fields) and let
 /// the storage layer synthesize the full [`Entry`] by stamping the storage
 /// fields via [`provisioned_into_entry`].
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Serialize` is derived so the `Session` facade can run
+/// `assertJsonSerializable` on the provisioned payload before commit (mirrors
+/// TS `assertJsonSerializable(entry)`). The on-disk codec serializes the full
+/// [`Entry`] (post-stamping), not this shape; this derive is for validation
+/// only and carries no serde tag attributes.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ProvisionedEntry {
     pub id: String,
     pub kind: ProvisionedKind,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum ProvisionedKind {
     Message {
         message: pi_agent::message::AgentMessage,

@@ -13,9 +13,12 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use pi_ai::{CacheRetention, Model, SimpleStreamOptions, ThinkingLevel};
-use pi_agent::{AgentTool, QueueMode};
+use pi_ai::{CacheRetention, Model, Provider, SimpleStreamOptions, ThinkingLevel};
+use pi_agent::{AgentTool, ConvertToLlm, QueueMode};
 use serde::{Deserialize, Serialize};
+
+use crate::session::context::CustomEntryContextMessageProjector;
+use crate::session::Session;
 
 /// A skill loaded from a `SKILL.md` file or provided by an application. Mirrors
 /// TS `Skill`.
@@ -84,6 +87,7 @@ pub enum ToolReplay {
 
 /// A harness tool = an `AgentTool` plus a replay policy. The harness registry
 /// stores `HarnessTool` and projects the `AgentTool` to the loop.
+#[derive(Clone)]
 pub struct HarnessTool {
     pub tool: Arc<dyn AgentTool>,
     pub replay: ToolReplay,
@@ -96,6 +100,16 @@ impl HarnessTool {
     pub fn with_replay(mut self, replay: ToolReplay) -> Self {
         self.replay = replay;
         self
+    }
+}
+
+/// Convert a `HarnessTool` replay policy to the session record variant.
+impl From<ToolReplay> for crate::session::types::ToolReplay {
+    fn from(r: ToolReplay) -> Self {
+        match r {
+            ToolReplay::Never => crate::session::types::ToolReplay::Never,
+            ToolReplay::Safe => crate::session::types::ToolReplay::Safe,
+        }
     }
 }
 
@@ -317,6 +331,29 @@ pub struct AgentHarnessOptions {
     pub follow_up_mode: QueueMode,
     pub tool_execution: HarnessToolExecution,
     pub drive: DrivingMode,
+
+    // ---- M5f additions (the pieces the real run loop needs) ---------------
+
+    /// The durable session the harness drives. Required: every run persists
+    /// entries/records through this facade (mirrors TS `options.session`).
+    pub session: Session,
+
+    /// Provider registry keyed by `model.provider`. The harness resolves which
+    /// provider serves the configured `model` (and any compaction model) and
+    /// calls `provider.stream_simple` inside the `StreamFn` it builds. Mirrors
+    /// TS `options.models`.
+    pub models: Vec<Arc<dyn Provider>>,
+
+    /// The agent-level `convert_to_llm` (AgentMessage[] → Message[]). The
+    /// harness installs the harness-level converter (which projects custom-role
+    /// messages into user text) by default; callers may override. Mirrors the
+    /// TS wiring where the harness composes its converter into `AgentLoopConfig`.
+    pub to_provider_messages: Option<ConvertToLlm>,
+
+    /// Optional entry projectors folded into the per-turn context build. Maps a
+    /// `custom` entry's `custom_type` → the messages to splice into the context.
+    /// Mirrors TS `entryProjectors`.
+    pub entry_projectors: BTreeMap<String, CustomEntryContextMessageProjector>,
 }
 
 impl Default for AgentHarnessOptions {
@@ -341,6 +378,21 @@ impl Default for AgentHarnessOptions {
             follow_up_mode: QueueMode::default(),
             tool_execution: HarnessToolExecution::default(),
             drive: DrivingMode::default(),
+            session: Session::new(
+                Arc::new(crate::session::memory::InMemorySessionStorage::new(
+                    crate::session::types::SessionMetadata {
+                        id: "default".into(),
+                        created_at: 0,
+                        parent_session_id: None,
+                    },
+                    Arc::new(crate::session::memory::SystemClock),
+                    Arc::new(crate::session::session::DefaultIdGenerator::new()),
+                )),
+                None,
+            ),
+            models: Vec::new(),
+            to_provider_messages: None,
+            entry_projectors: BTreeMap::new(),
         }
     }
 }
