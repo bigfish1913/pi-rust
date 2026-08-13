@@ -1,5 +1,58 @@
-//! Reserved for a future CLI built on top of the pi-rust library crates.
+//! `pi-cli` — a terminal coding-agent CLI built on the pi-rust library crates.
 //!
-//! The library crates (`pi-ai`, `pi-agent`, `pi-tools`, `pi-harness`) must never
-//! depend on this crate. It is a workspace member only so the workspace closes and
-//! so the future CLI has a home.
+//! This is the post-SDK deliverable per the user's instruction "把sdk复制完后，把cli也写下"
+//! (after the SDK port, also write the CLI). It mirrors the *CLI surface* of the
+//! TypeScript reference `packages/coding-agent` ([`packages/coding-agent/src/cli.ts`]
+//! → [`main.ts`] → [`cli/args.ts`] → [`modes/print-mode.ts`]), ported onto the Rust
+//! `AgentHarness` instead of the TS `AgentSession`.
+//!
+//! # What is ported (v1 scope)
+//!
+//! - **Argument parsing** ([`args`]) — `parseArgs`/`printHelp` for the flags a
+//!   harness-backed CLI actually honors: `--provider`/`--model`/`--api-key`,
+//!   `--thinking`, `--print`/`-p`, `--mode {text,json}`, `-c`/`--continue`,
+//!   `-r`/`--resume`, `--session`/`--session-dir`/`--no-session`, `--tools`/
+//!   `-t`, `--exclude-tools`/`-xt`, `--no-tools`, `--no-builtin-tools`,
+//!   `--system-prompt`, `--append-system-prompt`, `--name`/`-n`, `--verbose`,
+//!   `--help`/`-h`, `--version`/`-v`, positional `messages`, and `@file`
+//!   attachments.
+//! - **Provider/model resolution** ([`provider`]) — Anthropic-only (v1), API key
+//!   from `--api-key` → `ANTHROPIC_API_KEY`; model pattern `provider/id[:thinking]`
+//!   resolved against the provider's catalog.
+//! - **Harness construction + run loop** ([`session`]) — `OsExecutionEnv` +
+//!   built-in `read`/`write`/`edit`/`bash` tools, durable JSONL session storage,
+//!   `AgentHarness`, and the `prompt_text → outcome` run.
+//! - **Output modes** ([`modes`]) — `print` (text, single-shot) and `json`
+//!   (newline-delimited harness events), plus a simple interactive REPL.
+//! - **`app`** ([`app`]) — argument dispatch, model resolution, harness build,
+//!   mode dispatch, exit codes.
+//!
+//! # What is NOT ported (deferred — tracked in `docs/m6-cli-open-questions.md`)
+//!
+//! The TS `coding-agent` is a large, full-featured product. v1 deliberately
+//! scopes to a minimal-but-real CLI exercising the Rust harness end-to-end:
+//! no TUI (`modes/interactive`), no extension system, no package manager
+//! (`install`/`remove`/`update`/`config`), no OAuth/Copilot auth, no HTML
+//! export, no skills/prompt-template/theme discovery, no model cycling
+//! (`--models`), no `--fork`/`--export`/`--list-models`. The library APIs for
+//! many of these (skills, prompt templates, compaction, JSONL session fork)
+//! already exist; wiring them is future work.
+//!
+//! [`packages/coding-agent/src/cli.ts`]: ../../.reference/pi/packages/coding-agent/src/cli.ts
+//! [`main.ts`]: ../../.reference/pi/packages/coding-agent/src/main.ts
+//! [`cli/args.ts`]: ../../.reference/pi/packages/coding-agent/src/cli/args.ts
+//! [`modes/print-mode.ts`]: ../../.reference/pi/packages/coding-agent/src/modes/print-mode.ts
+
+pub mod args;
+pub mod app;
+pub mod modes;
+pub mod provider;
+pub mod session;
+
+/// Crate version, surfaced by `pi --version`. Mirrors the TS `VERSION` export
+/// (sourced from `package.json`; here from `env!("CARGO_PKG_VERSION")`).
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The application name used in help + version output. Mirrors TS `APP_NAME`
+/// (= `"pi"`, the `bin` field of the coding-agent `package.json`).
+pub const APP_NAME: &str = "pi";

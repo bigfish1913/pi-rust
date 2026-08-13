@@ -1076,6 +1076,23 @@ dependencies = [
 [[package]]
 name = "pi-cli"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "pi-agent",
+ "pi-ai",
+ "pi-harness",
+ "pi-telemetry",
+ "pi-tools",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
 
 [[package]]
 name = "pi-harness"

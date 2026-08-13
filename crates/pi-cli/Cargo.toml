@@ -5,6 +5,28 @@ rust-version.workspace = true
 license.workspace = true
 version.workspace = true
 authors.workspace = true
-description = "Reserved for a future CLI built on top of the pi-rust library crates"
+description = "Terminal coding-agent CLI built on the pi-rust library crates — a Rust port of @earendil-works/pi-coding-agent's CLI surface"
 
 [dependencies]
+pi-telemetry = { workspace = true }
+pi-ai = { workspace = true, features = ["providers"] }
+pi-agent = { workspace = true }
+pi-tools = { workspace = true }
+pi-harness = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+reqwest = { workspace = true }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "pi"
+path = "src/bin/pi.rs"

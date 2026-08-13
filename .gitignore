@@ -1,0 +1,7 @@
+.reference/
+.idea/
+.vscode/
+.gitignore
+
+# Locally-created pi sessions (from running the `pi` binary against this repo)
+.pi/
