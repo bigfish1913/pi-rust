@@ -283,15 +283,6 @@ pub fn bash_execution_to_text(data: &BashExecutionData) -> String {
 // convertToLlm — the harness-level AgentMessage[] -> Message[] converter
 // ---------------------------------------------------------------------------
 
-/// Plain-text extraction from a `UserContent` (mirrors `contentText` for the
-/// user-message arm). String → the string; blocks → joined `Text` blocks.
-fn user_content_text(content: &UserContent) -> String {
-    match content {
-        UserContent::Text(s) => s.clone(),
-        UserContent::Blocks(blocks) => Content::text_only(blocks, ""),
-    }
-}
-
 /// The harness converter. Mirrors TS `convertToLlm`: drops `bashExecution` when
 /// `excludeFromContext`; renders `bashExecution`/`branchSummary`/`compactionSummary`
 /// as `User` text messages; passes through `user`/`assistant`/`toolResult`;

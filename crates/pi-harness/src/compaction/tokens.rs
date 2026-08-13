@@ -477,12 +477,6 @@ mod tests {
 
     #[test]
     fn extract_file_ops_classifies_read_write_edit() {
-        let assistant = AgentMessage::Assistant(Box::new(pi_ai::types::AssistantMessage::empty(
-            pi_ai::types::Api::Faux,
-            "faux",
-            "faux",
-            1,
-        )));
         // Build a real assistant with three tool calls.
         let mut a = pi_ai::types::AssistantMessage::empty(
             pi_ai::types::Api::Faux,

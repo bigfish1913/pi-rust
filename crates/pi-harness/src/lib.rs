@@ -8,7 +8,12 @@
 
 pub mod compaction;
 pub mod error;
+pub mod events;
+pub mod frontmatter;
 pub mod messages;
+pub mod prompt_templates;
 pub mod result;
 pub mod session;
+pub mod skills;
+pub mod system_prompt;
 pub mod types;
