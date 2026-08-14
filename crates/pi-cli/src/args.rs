@@ -366,9 +366,9 @@ pub enum RunMode {
 
 /// Print the help text to stdout. Mirrors TS `printHelp`, scoped to v1 flags.
 pub fn print_help() {
-    let builtin = "read, bash, edit, write";
+    let builtin = "read, bash, edit, write, grep, find, ls";
     println!(
-        "{name} - AI coding assistant with read, bash, edit, write tools
+        "{name} - AI coding assistant with read, bash, edit, write, grep, find, ls tools
 
 {u}Usage:{r}
   {name} [options] [@files...] [messages...]
@@ -391,13 +391,13 @@ pub fn print_help() {
   --tools, -t <list>             Comma-separated allowlist of tool names to enable
   --exclude-tools, -xt <list>    Comma-separated denylist of tool names to disable
   --no-tools, -nt                Disable all tools
-  --no-builtin-tools, -nbt       Disable the built-in tools (read, bash, edit, write)
+  --no-builtin-tools, -nbt       Disable the built-in tools (read, bash, edit, write, grep, find, ls)
   --verbose                      Show startup warnings (e.g. ignored flags)
   --help, -h                     Show this help
   --version, -v                  Show version
 
 {u}Built-in Tools:{r}
-  {builtin}  (enabled by default; read-only tools grep/find/ls are not in v1)
+  {builtin}  (enabled by default; grep/find/ls are read-only)
 
 {u}Examples:{r}
   # Interactive with an initial prompt

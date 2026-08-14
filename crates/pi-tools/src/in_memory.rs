@@ -98,10 +98,33 @@ impl InMemoryExecutionEnv {
 
     pub fn with_cwd(cwd: PathBuf) -> Self {
         let snap = Arc::new(cwd.clone());
+        let mut files: BTreeMap<String, InMemoryFile> = BTreeMap::new();
+        // The cwd (and every ancestor) always exists on a real fs — you're in
+        // it. Register them as directories so tools that default their search
+        // path to `.` (ls/find/grep) can `list_dir`/`exists` the cwd without the
+        // test needing to `make_dir` it first. Matches `OsExecutionEnv` where
+        // `cwd()` is guaranteed to resolve + be listable.
+        let cwd_norm = Self::norm(&cwd.to_string_lossy());
+        let mut acc = String::new();
+        for seg in cwd_norm.trim_matches('/').split('/') {
+            acc = if acc.is_empty() {
+                format!("/{seg}")
+            } else {
+                format!("{acc}/{seg}")
+            };
+            files.insert(
+                acc.clone(),
+                InMemoryFile {
+                    bytes: Vec::new(),
+                    mtime_ms: 0,
+                    kind: FileKind::Directory,
+                },
+            );
+        }
         Self {
             inner: Arc::new(Mutex::new(Inner {
                 cwd,
-                files: BTreeMap::new(),
+                files,
                 clock: 0,
                 shell_scripts: Vec::new(),
                 active_pids: Vec::new(),
@@ -140,14 +163,30 @@ impl InMemoryExecutionEnv {
         inner.clock
     }
 
-    /// Resolve a path to an absolute string using the env's cwd.
+    /// Resolve a path to an absolute `PathBuf` using the env's cwd.
+    ///
+    /// After joining, `.`/`..` components are collapsed component-by-component
+    /// (without a FS round-trip) to match `OsExecutionEnv::normalize_absolute`.
+    /// This matters because `PathBuf::join` preserves `.` as a `CurDir`
+    /// component: `cwd.join(".")` yields `/tmp/work/.`, which would miss the
+    /// `BTreeMap` key `/tmp/work` (and break tools that default their search
+    /// path to `.`). Collapsing here keeps the in-memory env consistent with the
+    /// OS env — every `absolute_path`/`resolve_key` consumer sees the same
+    /// canonical form both in tests (`InMemory`) and in production (`Os`).
     fn resolve(cwd: &Path, path: &str) -> PathBuf {
         let pb = PathBuf::from(path);
-        if pb.is_absolute() {
-            pb
-        } else {
-            cwd.join(pb)
+        let joined = if pb.is_absolute() { pb } else { cwd.join(pb) };
+        let mut out = PathBuf::new();
+        for comp in joined.components() {
+            match comp {
+                std::path::Component::ParentDir => {
+                    out.pop();
+                }
+                std::path::Component::CurDir => {}
+                other => out.push(other),
+            }
         }
+        out
     }
 
     /// Normalize a path string to forward slashes. The internal `BTreeMap` keys

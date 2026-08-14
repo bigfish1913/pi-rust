@@ -201,22 +201,38 @@ the gap is discovery + wiring, not capability.
 
 ---
 
-## 9. Read-only tools `grep`/`find`/`ls` are absent (not yet ported to pi-tools)
+## 9. ✅ RESOLVED — Read-only `grep`/`find`/`ls` ported to `pi-tools` (in-process)
 
-**Where:** `crates/pi-cli/src/session.rs::BUILTIN_TOOL_NAMES` + the help text's
-"read-only tools grep/find/ls are not in v1" note.
+**Where:** `crates/pi-cli/src/session.rs::BUILTIN_TOOL_NAMES` + the help text.
 
-**What.** v1 ships `read`/`bash`/`edit`/`write` (the M4 pi-tools set). The TS
-`createCodingTools` also registers `grep`/`find`/`ls`; those were **not** ported
-in M4 (scope was read/write/edit/bash + `ExecutionEnv`). The CLI help mentions
-the gap so `--tools grep` doesn't silently no-op — it just produces a tool that
-isn't there (the allowlist retains only existing names, so `grep` is simply
-absent from the active set).
+**Status.** `grep`/`find`/`ls` are now in `BUILTIN_TOOL_NAMES` and registered by
+`build_tools`. The CLI help lists them; `--tools grep` works. The tools live in
+`crates/pi-tools/src/tools/{grep,find,ls}.rs` with full test coverage
+(`tests/{grep,find,ls}.rs`, 23 tests, all green) against `InMemoryExecutionEnv`.
 
-**To revisit.** Port `grep`/`find`/`ls` to `pi-tools` (they are read-only
-`ExecutionEnv` consumers, lower-risk than the mutating tools), then add them to
-`BUILTIN_TOOL_NAMES`. This unblocks genuinely useful read-only coding-agent
-runs.
+**Divergence from TS (documented).** The TS `grep` shells out to `rg`
+(JSON-stream parsing) and `find` to `fd` (`--full-path` rewrites, gitignore-aware
+walking, optional auto-download); `ls` is pure fs. The Rust port implements
+**all three in-process** through the `FileSystem` trait + the `regex`/`globset`
+crates, so they run against *any* `ExecutionEnv` — both `OsExecutionEnv` and
+`InMemoryExecutionEnv` (the TS shell-out design cannot do the latter, which is
+the reason this port chose in-process: trait-fidelity + testability). v1 skips
+full `.gitignore` matching (only `.git/` directories are skipped); revisit via
+the [`ignore`](https://docs.rs/ignore) crate for an `OsExecutionEnv`-only fast
+path if parsing performance demands it. `ls` matches TS exactly. `grep` output
+shape, match/context line formats, per-line + byte truncation, and match-limit
+semantics match TS exactly. `find` ports the `**/`-prepend rewrite and
+relativization; the Windows `[/\\]` separator rewrite is unnecessary (paths are
+posix-normalized internally).
+
+**Cwd resolution fix.** Porting these uncovered that
+`InMemoryExecutionEnv::resolve` preserved `.`/`..` path components (so
+`resolve_read_tool_path(".")` → `/tmp/work/.`, missing the BTreeMap key
+`/tmp/work`), while `OsExecutionEnv::normalize_absolute` collapses them. `resolve`
+now collapses `.`/`..` component-by-component to match the OS env, and
+`with_cwd` pre-registers the cwd + ancestors as directories (the cwd always
+exists on a real fs — you're in it), so tools that default their search path to
+`.` work without the test needing to `make_dir` the cwd first.
 
 ---
 

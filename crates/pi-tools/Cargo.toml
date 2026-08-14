@@ -27,7 +27,8 @@ uuid = { workspace = true }
 dirs = "5"
 similar = { version = "2", features = ["text"] }
 unicode-normalization = "0.1"
-regex = "1"
+regex = { workspace = true }
+globset = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }

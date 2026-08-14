@@ -11,7 +11,12 @@ members = [
     "examples/minimal",
     "examples/tools",
 ]
-default-members = ["crates/pi-agent", "crates/pi-tools", "crates/pi-harness"]
+default-members = [
+    "crates/pi-agent",
+    "crates/pi-tools",
+    "crates/pi-harness",
+    "crates/pi-cli",
+]
 resolver = "2"
 
 [workspace.package]
@@ -48,6 +53,8 @@ tracing = "0.1"
 uuid = { version = "1", features = ["v4", "v7"] }
 base64 = "0.22"
 tempfile = "3"
+regex = "1"
+globset = "0.4"
 
 # pi-rust internal crates
 pi-telemetry = { path = "crates/pi-telemetry", version = "0.1.0" }

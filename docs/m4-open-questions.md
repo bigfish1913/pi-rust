@@ -93,3 +93,46 @@ capture completes. Recorded here for completeness; not a new finding.
 
 The `crates/pi-tools/tests/bash.rs` module doc references this file. It now
 exists. No action needed beyond keeping this doc in tree.
+
+---
+
+## 5. `grep`/`find` ported in-process (no `rg`/`fd`); `ls` pure fs — RESOLVED
+
+The M4 pi-tools scope shipped `read`/`write`/`edit`/`bash` only. The read-only
+`grep`/`find`/`ls` trio is now ported (separate follow-on to M6, not a
+milestone). Sources:
+`crates/pi-tools/src/tools/{grep,find,ls}.rs`, tests
+`crates/pi-tools/tests/{grep,find,ls}.rs` (23 tests, all green against
+`InMemoryExecutionEnv`).
+
+**Divergence from TS.** The TS `grep` shells out to `rg` (ripgrep, JSON-stream
+parsing, gitignore-aware) and `find` to `fd` (`--full-path` rewrites,
+gitignore-aware walking, optional auto-download of the binary). `ls` is already
+pure `FileSystem`. The Rust port implements **all three in-process** through the
+`FileSystem` trait + the `regex`/`globset` crates. Rationale: `read`/`write`/
+`edit` already go through `FileSystem` (so they run against both
+`OsExecutionEnv` and `InMemoryExecutionEnv`); shelling out to `rg`/`fd` would
+bypass the trait — it would only work on the real OS fs and could not be tested
+with `InMemoryExecutionEnv`, breaking the abstraction the rest of `pi-tools` is
+built on. The in-process port works against *any* `ExecutionEnv`.
+
+**Trade-offs (v1).** No full `.gitignore` awareness (only `.git/` directories
+are skipped; revisit via the [`ignore`](https://docs.rs/ignore) crate for an
+`OsExecutionEnv`-only fast path if parsing performance demands it). No external
+binary, no auto-download. Traversal order is a deterministic sorted BFS rather
+than rg/fd's walk order. `grep`'s output shape, match/context line formats,
+per-line (`GREP_MAX_LINE_LENGTH`=500) + byte (`DEFAULT_MAX_BYTES`=50KB)
+truncation, and match-limit semantics match TS exactly. `find` ports the
+`/**/`-prepend rewrite for path-containing patterns and `relativizeFindResultPath`;
+the Windows `[/\\]` separator rewrite is unnecessary (paths are posix-normalized
+internally). `ls` matches TS exactly (the only folding: `list_dir` already
+returns `FileInfo` with a `kind`, so the per-entry stat is folded into the
+listing — no second round-trip).
+
+**Cwd resolution.** Porting these uncovered that
+`InMemoryExecutionEnv::resolve` preserved `.`/`..` path components (so
+`resolve_read_tool_path(".")` → `/tmp/work/.`, missing the BTreeMap key), while
+`OsExecutionEnv::normalize_absolute` collapses them. `resolve` now collapses
+components to match the OS env, and `with_cwd` pre-registers the cwd + ancestors
+as directories (the cwd always exists on a real fs). See also
+`docs/m6-cli-open-questions.md` §9.

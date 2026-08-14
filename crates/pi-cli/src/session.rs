@@ -9,11 +9,10 @@
 //!   caller's `--system-prompt` or the built-in default ([`default_system_prompt`]).
 //! - **No `--models` cycling, no `ModelRuntime`/multi-provider.** One model,
 //!   one provider (Anthropic), resolved up-front by [`crate::provider`].
-//! - **Built-in tools**: `read`, `bash`, `edit`, `write` (the TS `createCodingTools`
-//!   default set). The TS `grep`/`find`/`ls` tools are not yet ported to
-//!   `pi-tools` (M4 shipped read/write/edit/bash only), so they're absent here
-//!   even though the help text mentions a read-only set — see the open-questions
-//!   doc.
+//! - **Built-in tools**: `read`, `bash`, `edit`, `write` plus the read-only
+//!   `grep`/`find`/`ls` (the TS `createCodingTools` default set). `grep`/`find`
+//!   use an in-process `FileSystem`+`regex`/`globset` implementation (documented
+//!   divergence from the TS `rg`/`fd` shell-out; see `docs/m4-tools-open-questions.md`).
 //! - **Session restore (`-c`/`-r`/`--session`)** is *partially* supported: a
 //!   fresh session is always created. The harness's `create` rejects sessions
 //!   that already have records (restore not implemented — M5f divergence #3),
@@ -34,17 +33,18 @@ use pi_harness::types::{
     HarnessToolExecution, HarnessTool, RetryPolicy, ToolReplay,
 };
 use pi_tools::{
-    create_bash_tool, create_edit_tool, create_read_tool, create_write_tool,
-    ExecutionToolContext, MutationQueueRegistry, OsExecutionEnv,
+    create_bash_tool, create_edit_tool, create_find_tool, create_grep_tool, create_ls_tool,
+    create_read_tool, create_write_tool, ExecutionToolContext, MutationQueueRegistry,
+    OsExecutionEnv,
 };
 
 use crate::args::Args;
 use crate::provider::ResolvedModel;
 
 /// The built-in tool names v1 ships, in the order the TS `createCodingTools`
-/// registers them. `grep`/`find`/`ls` are omitted (not yet ported — see module
-/// docs).
-pub const BUILTIN_TOOL_NAMES: &[&str] = &["read", "bash", "edit", "write"];
+/// registers them: the mutating set (`read`/`bash`/`edit`/`write`) followed by
+/// the read-only search set (`grep`/`find`/`ls`).
+pub const BUILTIN_TOOL_NAMES: &[&str] = &["read", "bash", "edit", "write", "grep", "find", "ls"];
 
 /// The default coding system prompt. A condensed port of the TS
 /// `packages/coding-agent/src/core/system-prompt.ts` base prompt — the
@@ -60,6 +60,9 @@ Available tools:
 - bash  — Execute shell commands
 - edit  — Find/replace edits to existing files
 - write — Create or overwrite files
+- grep  — Search file contents for a pattern
+- find  — Search for files by glob pattern
+- ls    — List directory contents
 
 Guidelines:
 - Be concise in your responses
@@ -207,11 +210,16 @@ fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
         return Vec::new();
     }
     // Construct every built-in once (cheap; the allowlist filters below).
+    // Read-only search tools (grep/find/ls) take the same context and need no
+    // mutation queue — they go through the `FileSystem` trait only.
     let mut all: Vec<(&'static str, HarnessTool)> = vec![
         ("read", HarnessTool::new(create_read_tool(ctx, None))),
         ("bash", HarnessTool::new(create_bash_tool(ctx, None))),
         ("edit", HarnessTool::new(create_edit_tool(ctx))),
         ("write", HarnessTool::new(create_write_tool(ctx))),
+        ("grep", HarnessTool::new(create_grep_tool(ctx, None))),
+        ("find", HarnessTool::new(create_find_tool(ctx, None))),
+        ("ls", HarnessTool::new(create_ls_tool(ctx, None))),
     ];
 
     // `--no-builtin-tools` disables the built-in set but would keep
@@ -356,6 +364,9 @@ mod tests {
         assert!(p.contains("bash"));
         assert!(p.contains("edit"));
         assert!(p.contains("write"));
+        assert!(p.contains("grep"));
+        assert!(p.contains("find"));
+        assert!(p.contains("ls"));
     }
 
     #[test]
