@@ -1,36 +1,30 @@
 # pi-rust — Rust port of the Pi agent SDK
 
-A Rust port of [earendil-works/pi](https://github.com/earendil-works/pi)'s SDK layer (`pi-ai` + `pi-agent-core` + built-in tools + session persistence). **No CLI** — the goal is a library that makes it easy to build your own agent in Rust. A CLI crate is reserved for later.
+A Rust port of [earendil-works/pi](https://github.com/earendil-works/pi)'s SDK
+layer — a library-first, multi-crate workspace for building personal LLM coding
+agents in Rust, plus a `pi` CLI built on top.
+
+## Crates
+
+| Crate          | What it is                                                          |
+|----------------|---------------------------------------------------------------------|
+| `pi-telemetry` | Telemetry span/event contracts (noop default).                      |
+| `pi-ai`        | Unified multi-provider LLM types + streaming (Anthropic + faux).    |
+| `pi-agent`     | Agent runtime + loop, `AgentTool` trait, events, hooks, queues.     |
+| `pi-tools`     | Built-in tools (`read`/`write`/`edit`/`bash`/`grep`/`find`/`ls`) + `ExecutionEnv`. |
+| `pi-harness`   | `AgentHarness`: session tree, JSONL persistence, compaction, run loop. |
+| `pi-cli`       | Terminal coding-agent CLI (`pi` binary) on top of the library crates. |
+
+Dependency direction: `pi-telemetry → pi-ai → pi-agent → pi-tools → pi-harness → pi-cli`.
 
 ## Relationship to the TypeScript source
 
-The TypeScript reference is checked out under `.reference/pi/` (read-only). Every Rust module names the TS file it mirrors in its module-level doc comment.
-
-| TS package                  | Rust crate        | Status        |
-|-----------------------------|-------------------|---------------|
-| `pi-ai`                     | `pi-ai`           | core + faux + anthropic; others via trait |
-| `pi-agent-core` (core loop) | `pi-agent`        | done          |
-| `pi-agent-core` (harness)   | `pi-harness`      | skeleton (phase 2) |
-| built-in tools              | `pi-tools`        | read/write/bash + `ExecutionEnv` trait |
-| `pi-telemetry`              | `pi-telemetry`    | minimal noop  |
-| `pi-coding-agent` (CLI)     | `pi-cli`          | reserved (future) |
-
-## Workspace layout
-
-```
-crates/
-  pi-telemetry/  → pi-ai       (span/event contracts, noop impl)
-  pi-ai/         → pi-agent    (types, models, Provider trait, streaming, providers)
-  pi-agent/      → pi-tools    (Agent, agent loop, AgentTool trait, events, hooks, queues)
-  pi-tools/      → pi-harness  (ExecutionEnv + read/write/bash)
-  pi-harness/    → pi-cli      (AgentHarness: session tree, compaction, JSONL)
-  pi-cli/        (future binary)
-examples/
-  minimal/       — agent with the faux provider, no I/O
-  tools/         — agent with read/write/bash over a real FileSystem
-```
-
-Dependency direction: `pi-telemetry → pi-ai → pi-agent → pi-tools → pi-harness → pi-cli`.
+The TypeScript reference is checked out under `.reference/pi/` (read-only). Every
+Rust module names the TS file it mirrors in its module-level doc comment. The
+crate family is a Rust-native reimplementation, not a thin wrapper — it ports the
+SDK surface (`pi-ai`, `pi-agent-core`, the harness tools, the session layer) and
+the CLI, keeping the layering and behavior faithful while using idiomatic Rust
+(`async`/`await`, `Arc`, `serde`, `tokio`).
 
 ## How you build an agent
 
@@ -55,3 +49,17 @@ agent.prompt("Hello!").await.unwrap();
 ```
 
 See [docs/architecture.md](docs/architecture.md) for the full design.
+
+## Status (v1)
+
+- **Providers:** Anthropic (API-key auth) + a faux provider for tests. OAuth /
+  Copilot auth is deferred — bring an `ANTHROPIC_API_KEY`.
+- **Tools:** `read`, `write`, `edit`, `bash` (mutating, run through a
+  `MutationQueue`) + `grep`, `find`, `ls` (read-only, in-process via the
+  `FileSystem` trait — no `rg`/`fd` shell-out).
+- **Sessions:** JSONL v4 durable backend + in-memory ephemeral; compaction + a
+  split-turn two-LLM-call invariant.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

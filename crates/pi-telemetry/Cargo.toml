@@ -5,7 +5,11 @@ rust-version.workspace = true
 license.workspace = true
 version.workspace = true
 authors.workspace = true
+repository.workspace = true
 description = "Telemetry span/event contracts (noop default), port of pi-telemetry"
+readme = "../../README.md"
+keywords = ["agent", "llm", "ai", "claude", "telemetry"]
+categories = ["api-bindings", "asynchronous"]
 
 [dependencies]
 async-trait = { workspace = true }

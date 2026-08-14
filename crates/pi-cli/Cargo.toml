@@ -5,7 +5,11 @@ rust-version.workspace = true
 license.workspace = true
 version.workspace = true
 authors.workspace = true
+repository.workspace = true
 description = "Terminal coding-agent CLI built on the pi-rust library crates — a Rust port of @earendil-works/pi-coding-agent's CLI surface"
+readme = "../../README.md"
+keywords = ["agent", "llm", "ai", "claude", "cli"]
+categories = ["command-line-interface", "api-bindings", "development-tools"]
 
 [dependencies]
 pi-telemetry = { workspace = true }

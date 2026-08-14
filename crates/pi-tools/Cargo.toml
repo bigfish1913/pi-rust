@@ -5,7 +5,11 @@ rust-version.workspace = true
 license.workspace = true
 version.workspace = true
 authors.workspace = true
-description = "Built-in agent tools (read/write/edit/bash) + ExecutionEnv, port of pi harness tools"
+repository.workspace = true
+description = "Built-in agent tools (read/write/edit/bash/grep/find/ls) + ExecutionEnv, port of pi harness tools"
+readme = "../../README.md"
+keywords = ["agent", "llm", "ai", "claude", "tools"]
+categories = ["api-bindings", "asynchronous", "development-tools"]
 
 [dependencies]
 pi-agent = { workspace = true }

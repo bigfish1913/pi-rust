@@ -5,7 +5,11 @@ rust-version.workspace = true
 license.workspace = true
 version.workspace = true
 authors.workspace = true
+repository.workspace = true
 description = "Session tree + JSONL persistence + compaction + AgentHarness loop, port of pi harness layer"
+readme = "../../README.md"
+keywords = ["agent", "llm", "ai", "claude", "harness"]
+categories = ["api-bindings", "asynchronous"]
 
 [dependencies]
 pi-telemetry = { workspace = true }
