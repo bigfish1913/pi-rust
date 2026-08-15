@@ -79,3 +79,8 @@ dep-ordered, dry-run by default:
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+This is a Rust port of [earendil-works/pi](https://github.com/earendil-works/pi)
+(© Mario Zechner, MIT). The `rpi-*` crates are a Rust-native reimplementation of
+the original MIT-licensed TypeScript SDK; the upstream source is checked out
+under `.reference/pi/` (read-only, gitignored).
