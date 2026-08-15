@@ -50,6 +50,14 @@ pub async fn run() -> i32 {
     // argv[0] is the program name; skip it (TS `main(args)` receives the same,
     // already sliced by the Node CLI entry).
     let argv: Vec<String> = std::env::args().skip(1).collect();
+
+    // ---- `rpi auth …` subcommand dispatch (before flag parsing) ----
+    // `auth` is a top-level subcommand (mirrors TS `runAuthCommand` routing in
+    // `main.ts`); dispatching it here avoids it being misparsed as a prompt.
+    if argv.first().map(|s| s.as_str()) == Some("auth") {
+        return crate::auth::run(&argv[1..]).await;
+    }
+
     let parsed = parse_args(&argv);
 
     // ---- --help / --version short-circuit (before any heavy work) ----
@@ -111,12 +119,13 @@ pub async fn run() -> i32 {
         parsed.model.as_deref(),
         parsed.thinking,
         parsed.api_key.as_deref(),
+        parsed.base_url.as_deref(),
     ) {
         Ok(r) => r,
         Err(e) => {
             print_resolve_error(&e);
             return match e {
-                ResolveError::NoApiKey { .. } => EXIT_USAGE,
+                ResolveError::NoApiKey { .. } | ResolveError::Config(_) => EXIT_USAGE,
                 _ => EXIT_RUNTIME,
             };
         }
@@ -273,10 +282,15 @@ fn build_initial_message(
 /// auth-guidance / model-resolver error formatting (condensed to stderr lines).
 fn print_resolve_error(e: &ResolveError) {
     match e {
-        ResolveError::NoApiKey { env } => {
+        ResolveError::NoApiKey { hint } => {
             eprintln!("error: {e}");
             eprintln!();
-            eprintln!("Set the {env} environment variable, or pass --api-key <key>.");
+            eprintln!("Provide credentials via one of: {hint}.");
+        }
+        ResolveError::Config(_) => {
+            eprintln!("error: {e}");
+            eprintln!();
+            eprintln!("Check ~/.rpi/auth.json / ~/.rpi/models.json (set RPI_CODING_AGENT_DIR to relocate).");
         }
         _ => eprintln!("error: {e}"),
     }

@@ -45,6 +45,9 @@ pub struct Args {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub api_key: Option<String>,
+    /// `--base-url` — overrides `ANTHROPIC_BASE_URL` + each model's base URL,
+    /// for third-party Anthropic-compatible gateways/proxies.
+    pub base_url: Option<String>,
     pub system_prompt: Option<String>,
     pub append_system_prompt: Vec<String>,
     pub thinking: Option<ThinkingLevel>,
@@ -197,6 +200,7 @@ pub fn parse_args(args: &[String]) -> Args {
             "--provider" => result.provider = take_value(&mut result, "--provider"),
             "--model" => result.model = take_value(&mut result, "--model"),
             "--api-key" => result.api_key = take_value(&mut result, "--api-key"),
+            "--base-url" => result.base_url = take_value(&mut result, "--base-url"),
             "--system-prompt" => result.system_prompt = take_value(&mut result, "--system-prompt"),
             "--append-system-prompt" => {
                 if let Some(v) = take_value(&mut result, "--append-system-prompt") {
@@ -376,7 +380,8 @@ pub fn print_help() {
 {u}Options:{r}
   --provider <name>              Provider name (v1: anthropic)
   --model <pattern>              Model pattern or ID (supports \"provider/id\" and optional \":<thinking>\")
-  --api-key <key>                API key (defaults to ANTHROPIC_API_KEY)
+  --api-key <key>                API key (x-api-key; defaults to ~/.rpi/auth.json, then ANTHROPIC_API_KEY)
+  --base-url <url>               Override the Anthropic endpoint (defaults to ANTHROPIC_BASE_URL)
   --system-prompt <text>         Replace the default system prompt
   --append-system-prompt <text>  Append text to the system prompt (repeatable)
   --thinking <level>             off, minimal, low, medium, high, xhigh, max
@@ -395,6 +400,10 @@ pub fn print_help() {
   --verbose                      Show startup warnings (e.g. ignored flags)
   --help, -h                     Show this help
   --version, -v                  Show version
+
+{u}Subcommands:{r}
+  auth login|check|logout        Manage persisted credentials in ~/.rpi/auth.json
+                                (see `rpi auth --help`)
 
 {u}Built-in Tools:{r}
   {builtin}  (enabled by default; grep/find/ls are read-only)
@@ -422,12 +431,18 @@ pub fn print_help() {
   {name} --tools read,bash -p \"Review the code in src/\"
 
 {u}Environment:{r}
-  ANTHROPIC_API_KEY              Anthropic API key (required for real runs)
+  ANTHROPIC_API_KEY              Anthropic API key (x-api-key) — fallback when no stored credential
+  ANTHROPIC_AUTH_TOKEN           Bearer token (Authorization: Bearer) for third-party gateways
+  ANTHROPIC_BASE_URL             Override the Anthropic endpoint (e.g. a compatible proxy)
+  RPI_CODING_AGENT_DIR           Override the ~/.rpi config directory (auth.json + models.json)
 
 {u}Notes:{r}
-  v1 is Anthropic-only (API key). TUI, extensions, skills, prompt templates,
-  themes, model cycling, package manager, HTML export, --fork, --list-models,
-  --export, and OAuth are recognized but not implemented yet.
+  v1 speaks the Anthropic Messages protocol only. Auth is resolved in order:
+  --api-key → ~/.rpi/auth.json (via `rpi auth login`) → ANTHROPIC_AUTH_TOKEN
+  (Bearer) → ANTHROPIC_API_KEY (x-api-key). Define custom model catalogs in
+  ~/.rpi/models.json. TUI, extensions, skills, prompt templates, themes, model
+  cycling, package manager, HTML export, --fork, --list-models, --export, and
+  OAuth are recognized but not implemented yet.
 ",
         name = crate::APP_NAME,
         builtin = builtin,

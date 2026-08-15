@@ -170,7 +170,16 @@ async fn run_anthropic_stream(
 
     // ---- resolve auth (assertRequestAuth) ----
     let resolved_key = resolve_api_key(&provider_key, opts);
-    let header_owned_auth = has_header_auth(&opts.headers);
+    // TS `assertRequestAuth(model.provider, options?.apiKey, options?.headers)`
+    // checks `options.headers` alone — but upstream the model-resolution layer
+    // has *already merged* `model.headers` into `options.headers` (models.ts
+    // `getApiKeyAndHeaders` → `auth.headers = merge(..., providerOrModel.headers)`).
+    // The Rust port keeps auth headers on `model.headers` and merges them later
+    // in `assemble_headers`, so here the check must consider BOTH sources to
+    // reproduce the TS net effect. This is what lets a Bearer header folded onto
+    // `model.headers` (the `ANTHROPIC_AUTH_TOKEN` / `models.json authHeader:true`
+    // paths in rpi-cli's `provider::resolve`) authenticate without an `x-api-key`.
+    let header_owned_auth = has_header_auth(&opts.headers) || has_header_auth(&model.headers);
     let api_key_for_header = match (resolved_key, header_owned_auth) {
         (Some(k), _) => Some(k),
         (None, true) => None,      // headers carry auth; do not send x-api-key.
@@ -592,5 +601,40 @@ mod tests {
         assert!(!p.models().is_empty());
         assert!(p.models().iter().any(|m| m.id == "claude-haiku-4-5"));
         assert!(p.api_key().is_none(), "from_env does not pre-read the key");
+    }
+
+    /// Regression for the Bearer-on-`model.headers` path (the
+    /// `ANTHROPIC_AUTH_TOKEN` / `models.json authHeader:true` routes in
+    /// rpi-cli's `provider::resolve`): when the auth header lives on
+    /// `model.headers` and no key is set, the header-owned-auth check must pass
+    /// so the request is NOT rejected as "No API key for provider". This mirrors
+    /// the net effect of upstream `assertRequestAuth`, which runs *after* the
+    /// model-resolution layer has merged `model.headers` into `options.headers`.
+    #[test]
+    fn header_auth_on_model_headers_counts_as_owned() {
+        let mut model = test_model();
+        let mut mh = std::collections::BTreeMap::new();
+        mh.insert("authorization".to_string(), "Bearer tok".to_string());
+        model.headers = Some(mh);
+
+        // No opts.headers, no key — the only auth is on the model. Must satisfy.
+        let owned =
+            has_header_auth(&SimpleStreamOptions::default().headers) || has_header_auth(&model.headers);
+        assert!(
+            owned,
+            "a Bearer header on model.headers must satisfy header-owned auth"
+        );
+
+        // A model carrying only non-auth headers must NOT satisfy it.
+        let mut model2 = test_model();
+        let mut mh2 = std::collections::BTreeMap::new();
+        mh2.insert("x-custom".to_string(), "v".to_string());
+        model2.headers = Some(mh2);
+        let owned2 = has_header_auth(&SimpleStreamOptions::default().headers)
+            || has_header_auth(&model2.headers);
+        assert!(
+            !owned2,
+            "non-auth headers on model.headers must not satisfy header-owned auth"
+        );
     }
 }

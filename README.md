@@ -57,13 +57,61 @@ See [docs/architecture.md](docs/architecture.md) for the full design.
 
 ## Status (v1)
 
-- **Providers:** Anthropic (API-key auth) + a faux provider for tests. OAuth /
-  Copilot auth is deferred — bring an `ANTHROPIC_API_KEY`.
+- **Providers:** Anthropic (API-key auth) + a faux provider for tests. Also
+  supports **third-party Anthropic-compatible endpoints** (one-api/new-api/
+  claude-code-router/private proxies) via `ANTHROPIC_BASE_URL`/`--base-url` +
+  Bearer auth (`ANTHROPIC_AUTH_TOKEN` or a `~/.rpi/models.json` gateway with
+  `authHeader: true`). OAuth / Copilot device-code auth is deferred.
+- **Auth (in priority order):** `--api-key` → `~/.rpi/auth.json` (set via
+  `rpi auth login`) → `~/.rpi/models.json` gateway (`authHeader:true`+`apiKey`) →
+  `ANTHROPIC_AUTH_TOKEN` (Bearer) → `ANTHROPIC_API_KEY` (x-api-key). `rpi auth
+  login`/`check`/`logout` manage the stored credential.
 - **Tools:** `read`, `write`, `edit`, `bash` (mutating, run through a
   `MutationQueue`) + `grep`, `find`, `ls` (read-only, in-process via the
   `FileSystem` trait — no `rg`/`fd` shell-out).
 - **Sessions:** JSONL v4 durable backend + in-memory ephemeral; compaction + a
   split-turn two-LLM-call invariant.
+
+## Configuration
+
+`rpi` persists credentials under `~/.rpi/` (override the dir with the
+`RPI_CODING_AGENT_DIR` env var):
+
+```
+~/.rpi/
+├── auth.json     # set with `rpi auth login` (0o600 on Unix)
+└── models.json   # optional: custom Anthropic-compatible providers/models
+```
+
+`auth.json` holds the stored API key for `anthropic` (written by
+`rpi auth login`, removed by `rpi auth logout`); `auth check` reports whether
+any auth source is ready without touching the network.
+
+`models.json` is a hand-edited file for custom Anthropic-compatible gateways:
+
+```jsonc
+{
+  "providers": {
+    "gateway": {
+      "baseUrl": "https://gateway.example.com",
+      "apiKey": "sk-gateway-secret",
+      "authHeader": true,             // wrap apiKey as Authorization: Bearer
+      "headers": { "x-portkey-key": "…" }, // optional extra headers
+      "models": [
+        { "id": "custom-claude", "name": "Custom Claude" }
+      ]
+    }
+  }
+}
+```
+
+Then `rpi --model gateway/custom-claude -p "hi"` routes to the gateway (the
+`gateway/` prefix is CLI namespacing; v1 routes every `anthropic-messages`
+model through its single AnthropicProvider, using the model's `base_url` +
+`headers` to reach the endpoint). See
+[docs/m6-cli-open-questions.md §4](docs/m6-cli-open-questions.md) for the
+full auth precedence, the `~/.rpi`-flat-vs-nested divergence, and what's
+deferred (OAuth, `$ENV` credential expansion, multi-provider registry).
 
 ## Releasing
 

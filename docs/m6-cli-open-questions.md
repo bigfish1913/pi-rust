@@ -87,24 +87,151 @@ navigation) already exist on `AgentLane`/`AgentHarness`; the gap is purely UI.
 
 ---
 
-## 4. Anthropic-only; no OAuth/Copilot; API key required up-front
+## 4. Anthropic-only; persistent config + Bearer/custom-endpoint support; no OAuth/Copilot
 
-**Where:** `crates/pi-cli/src/provider.rs::resolve`.
+**Where:** `crates/pi-cli/src/provider.rs::resolve`, `crates/pi-cli/src/config.rs`,
+`crates/pi-cli/src/auth.rs`.
 
-**What.** v1 is Anthropic-only (plan §5.16: "OAuth/Copilot skipped v1; API-key
-auth only"). `--provider` must be `anthropic` (or absent); any other value is a
-hard `UnknownProvider` error. The API key is resolved `--api-key` →
-`ANTHROPIC_API_KEY`; if neither is set, `resolve` returns `NoApiKey` and the
-CLI exits 2 with guidance before any network call.
+**What.** v1 is Anthropic-only (plan §5.16: "OAuth/Copilot skipped v1"). `--provider`
+must be `anthropic` (or absent); any other value is a hard `UnknownProvider` error.
+Beyond the original `ANTHROPIC_API_KEY` / `--api-key` x-api-key paths, v1 now mirrors
+the upstream native pi config layer to support:
 
-**Divergence.** TS `ModelRuntime`/`ModelRegistry` resolves multiple providers
-and auth strategies (API key, OAuth token, Copilot seat). v1 builds a single
-`AnthropicProvider` from the key. The `models` catalog is the fixed
-`pi_ai::providers::anthropic::models::anthropic_models()` set.
+- **Persistent credentials** — `rpi auth login` writes a key to `~/.rpi/auth.json`
+  (0o600 on Unix) under the `anthropic` provider id; `resolve` loads it ahead of env
+  vars. `rpi auth check` / `rpi auth logout` round out the subcommand.
+- **Third-party Anthropic-compatible endpoints** — `ANTHROPIC_BASE_URL` / `--base-url`
+  override `model.base_url` at request time; `ANTHROPIC_AUTH_TOKEN` (or a
+  `models.json` provider with `authHeader: true` + `apiKey`) authenticates as
+  `Authorization: Bearer …` instead of `x-api-key`. This lets `rpi` talk to
+  one-api / new-api / claude-code-router / private reverse proxies that speak the
+  Anthropic Messages protocol over a Bearer header.
+- **`~/.rpi/models.json`** — a hand-edited `{providers: {id: ProviderConfig}}` file
+  that augments/replaces the built-in Anthropic catalog with custom model ids, a
+  custom `base_url`, extra `headers`, and a gateway `authHeader`+`apiKey` Bearer
+  source. A models.json-only gateway (no env, no stored cred, no `--api-key`) is a
+  complete setup: `authHeader:true` + `apiKey` satisfies auth and the Bearer rides
+  on `model.headers`.
 
-**To revisit.** OpenAI/Google/Bedrock providers have a `Provider` trait seam in
-`pi-ai` already; wiring them needs a resolver + their catalogs. OAuth/Copilot
-needs an auth store + token refresh — not started.
+Auth resolution precedence (`provider.rs::resolve`, mirrors upstream
+`packages/coding-agent/src/cli/anthropic.ts` resolve order):
+
+1. `--api-key` → `x-api-key` header.
+2. `~/.rpi/auth.json` `anthropic.api_key.key` → `x-api-key` (the persistent login).
+3. `~/.rpi/models.json` first anthropic-compatible provider with `authHeader:true` +
+   non-empty `apiKey` → `Authorization: Bearer <apiKey>` on `model.headers`.
+4. `ANTHROPIC_AUTH_TOKEN` env → `Authorization: Bearer <token>` on `model.headers`.
+5. `ANTHROPIC_API_KEY` env → `x-api-key` header.
+6. none → `NoApiKey` (exit 2, before any network call).
+
+`base_url` resolves `--base-url` → `ANTHROPIC_BASE_URL` → the model's catalog
+`base_url`; the winner overwrites `resolved.model.base_url`, which the provider
+reads at request time (`rpi-ai` — no protocol change, the `Model.base_url` field is
+already a mutable `String`).
+
+**How the Bearer path authenticates without an x-api-key (rpi-ai fix).** Upstream,
+the model-resolution layer merges `providerOrModel.headers` into `options.headers`
+*before* `assertRequestAuth` (`models.ts:560` `mergeHeaders(result.auth.headers,
+providerOrModel.headers)`), so the auth check sees the Bearer the model carries.
+The Rust port keeps auth headers on `model.headers` and merges them later in
+`assemble_headers`, so the `has_header_auth(&opts.headers)` check — which decides
+whether to demand an x-api-key — saw an empty `opts.headers` and errored
+"No API key for provider: anthropic" even when `model.headers` carried a Bearer.
+The fix consults *both*: `has_header_auth(&opts.headers) || has_header_auth(&model.headers)`
+(`crates/pi-ai/src/providers/anthropic/mod.rs`, `run_anthropic_stream`). This mirrors
+the TS net effect and lets a Bearer folded onto `model.headers` authenticate. A
+regression test (`header_auth_on_model_headers_counts_as_owned`) pins it.
+
+### 4a. `~/.rpi` is flat; upstream `~/.pi/agent/` is nested
+
+**Divergence.** Upstream uses `<agentDir>/` = `~/.pi/agent/` and nests `auth.json`,
+`models.json`, *plus* themes/bin/prompts/sessions/etc. under it. v1 uses `~/.rpi/`
+**directly** with only `auth.json` + `models.json` — two files, one flat dir. The
+extra upstream nesting exists because that one dir hosts many subsystems; v1 has
+only auth+models, so the `agent/` layer would be dead weight. `RPI_CODING_AGENT_DIR`
+(absolute path only) overrides the dir, mirroring `PI_CODING_AGENT_DIR`. The default
+session dir is still `<cwd>/.pi/sessions` (see §6) — independent of `~/.rpi`.
+
+**To revisit.** If v1 grows themes/prompts/skills on disk, either adopt the `agent/`
+subdir or keep flat and name files distinctly.
+
+### 4b. No file lock; atomic rename instead
+
+**Divergence.** Upstream uses `proper-lockfile` for cross-process safety on
+auth.json/models.json writes. v1 is a single-process CLI, so it writes a temp file
+then `fs::rename`s it into place (atomic on the same filesystem) and chmods 0o600 on
+Unix afterward. Concurrent `rpi auth login` from two shells could lose one write
+(last-rename-wins); this is a documented v1 trade-off, not a defect.
+
+**To revisit.** Add `fs4`/`proper-lockfile` if multi-process safety matters (e.g. a
+future daemon/TUI left open while a `rpi` one-shot runs).
+
+### 4c. models.json has no `$ENV` / `!command` / `${ENV}` credential expansion
+
+**Where:** `crates/pi-cli/src/config.rs` — `apiKey`/`headers` values are taken as
+literal strings.
+
+**Divergence.** Upstream `resolveConfigValue` interpolates `$ENV_VAR`,
+`!shell-command`, and `${ENV}` inside config values, so a models.json can reference
+`$ANTHROPIC_API_KEY` without copying the secret. v1 parses only literals — put the
+secret in the file, or use the env-var auth sources (`ANTHROPIC_AUTH_TOKEN` /
+`ANTHROPIC_API_KEY`) instead. This avoids pulling a shell-eval / env-expansion
+machinery (and its security surface) into a v1 config reader.
+
+**To revisit.** Port a constrained `resolveConfigValue` (env-only, no `!command`)
+if users want models.json to stay secret-free on disk.
+
+### 4d. OAuth / Copilot device-code still deferred
+
+**Divergence.** The `Credential` enum declares an `Oauth { access, refresh, expires }`
+variant for format forward-compat, but `rpi auth login` writes only the `ApiKey`
+variant and `resolve` never consults OAuth. Claude Pro/Max subscription auth
+(device-code grant + token refresh) remains deferred (plan §5.16). The stored-cred
+path (`auth.json` `anthropic.api_key.key`) is the "persistent login" equivalent.
+
+**To revisit.** Port the device-code flow + token refresh when subscription auth is
+needed; the `Credential::Oauth` shape is already there to hold it.
+
+### 4e. `authHeader: true` Bearer synthesis is centralized, not per-model
+
+**Where:** `crates/pi-cli/src/provider.rs::resolve` (via `models_json_bearer_token`)
+vs `provider_to_models` (which deliberately does *not* synthesize it).
+
+**Divergence.** Upstream folds the `authHeader:true`-wrapped Bearer onto each model
+at config-load time (`provider-composer.ts`). v1 synthesizes it **centrally in
+`resolve`** and only when no higher-priority x-api-key source (`--api-key` /
+auth.json / `ANTHROPIC_API_KEY`) wins — otherwise the x-api-key path would also
+carry a spurious Bearer. So `provider_to_models` merges declared `headers` only;
+`resolve` adds the `Authorization: Bearer` per-model when it's the chosen auth
+source. This means a models.json gateway `apiKey` is *both* an auth source (step 3
+above) *and* the value folded into the Bearer — one place, one decision.
+
+### 4f. models.json provider id is config-namespacing only
+
+**Where:** `crates/pi-cli/src/config.rs::provider_to_models` stamps
+`provider = "anthropic"` (not the models.json key) on every models.json model.
+
+**Divergence.** v1 has a **single** `AnthropicProvider` (its `id()` is hardcoded
+`"anthropic"`) and the harness routes by `provider.id() == model.provider`
+(`AgentHarness::resolve_provider`). Upstream `registerProvider(providerName, …)`
+registers a distinct provider per models.json key and routes by that key. So a
+`gateway/custom-claude` models.json entry carries `provider = "anthropic"` and is
+addressed as `--model gateway/custom-claude` (the `gateway/` prefix is stripped by
+`split_model_pattern`; it's pure CLI namespacing). The actual per-endpoint
+differentiation — `base_url` and `headers` — rides on the model fields, which the
+provider reads at request time. Divergence is structural: v1 has no multi-provider
+registry.
+
+**To revisit.** If v1 supports non-Anthropic protocols (OpenAI/Google) via
+models.json, build a provider registry keyed by the models.json `api` value and
+stamp the real provider id; the current `"anthropic"` stamp is the single-provider
+shortcut.
+
+**To revisit (whole section).** OpenAI/Google/Bedrock providers have a `Provider`
+trait seam in `rpi-ai` already; wiring them needs a resolver + their catalogs. The
+`models.json` non-`anthropic-messages` `api` values are parsed-and-ignored in v1
+(`provider_is_anthropic_compatible` returns false → the provider is skipped,
+documented).
 
 ---
 
@@ -278,14 +405,14 @@ the split surprising; otherwise keep it.
 
 ---
 
-## Verification (M6)
+## Verification (M6 / config+auth follow-up)
 
-- `cargo build -p pi-cli` — green (lib + bin).
-- `cargo test -p pi-cli` — 40 unit tests pass (args/provider/session/modes/app).
+- `cargo build -p rpi-cli` — green (lib + bin).
+- `cargo test -p rpi-cli` — 68 unit tests pass (args/provider/session/modes/app
+  + the new config.rs path/auth/models tests + auth.rs login/check/logout +
+  provider.rs Bearer/base_url/models.json-precedence tests).
 - `cargo test --workspace` — full suite green (pi-telemetry/pi-ai/pi-agent/
-  pi-tools/pi-harness/pi-cli + examples).
-- `cargo run -p minimal` / `cargo run -p tools-example` — both run (M2/M4
-  examples unaffected by the CLI addition).
+  pi-tools/pi-harness/pi-cli + examples, `--features rpi-ai/providers`).
 - `pi --version` → `pi 0.1.0` (exit 0); `pi --help` → help (exit 0);
   `pi -Z` → "Unknown option" (exit 2); `pi -p hi` with no key → `NoApiKey`
   (exit 2); `pi --mode rpc -p hi` → "rpc not implemented" (exit 2);
@@ -293,3 +420,12 @@ the split surprising; otherwise keep it.
   `pi --no-session --model claude-sonnet-5 -p "Say hi"` with a fake key →
   harness builds, run fails at the Anthropic 401 with a clean error (exit 1).
   No silent exits; no panics.
+- **Bearer/custom-endpoint verification (no real Anthropic key needed):** a local
+  fake Anthropic-SSE server confirms both Bearer paths end-to-end —
+  `ANTHROPIC_AUTH_TOKEN` + `ANTHROPIC_BASE_URL` → probe received
+  `Authorization: Bearer sk-…` with no `x-api-key`; and a `~/.rpi/models.json`
+  gateway (`authHeader:true` + `apiKey`, no env vars, no stored cred, no flag) →
+  probe received `Authorization: Bearer <gateway apiKey>` with no `x-api-key`.
+  Both streamed the probe's reply text. The `--api-key` path correctly sends
+  `x-api-key` and *no* Bearer (the central-bearer synthesis is skipped on the
+  x-api-key path — pinned by `api_key_flag_beats_models_json_bearer`).

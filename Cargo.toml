@@ -55,6 +55,8 @@ base64 = "0.22"
 tempfile = "3"
 regex = "1"
 globset = "0.4"
+dirs = "5"
+rpassword = "7"
 
 # pi-rust internal crates (published under the `rpi-` prefix; directories keep
 # the `pi-` name — package `name` is what crates.io + `extern crate` see).

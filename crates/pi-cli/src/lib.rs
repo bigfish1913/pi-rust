@@ -45,6 +45,8 @@
 
 pub mod args;
 pub mod app;
+pub mod auth;
+pub mod config;
 pub mod modes;
 pub mod provider;
 pub mod session;
