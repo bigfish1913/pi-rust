@@ -397,8 +397,14 @@ fn parse_input_modalities(input: Option<&[String]>) -> Vec<InputModality> {
 /// The first-party Anthropic endpoint — used as the fallback `base_url` when a
 /// models.json provider omits it. Kept here (not imported from `rpi_ai`) so the
 /// config layer never depends on the provider's private `models` module.
+/// Public so [`crate::provider::resolve`] can tell a gateway model (whose
+/// `base_url` differs from this) from a built-in Anthropic model.
+pub const ANTHROPIC_DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
+
+/// Same value as [`ANTHROPIC_DEFAULT_BASE_URL`], as an owned `String` for the
+/// `unwrap_or_else` ergonomic used by [`provider_to_models`].
 fn default_anthropic_base_url() -> String {
-    "https://api.anthropic.com".to_string()
+    ANTHROPIC_DEFAULT_BASE_URL.to_string()
 }
 
 // ---------------------------------------------------------------------------

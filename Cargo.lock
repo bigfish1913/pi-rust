@@ -870,7 +870,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "minimal"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "futures",
  "rpi-agent",
@@ -1308,7 +1308,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-agent"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "futures",
@@ -1325,7 +1325,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-ai"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "base64",
@@ -1347,7 +1347,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "dirs",
@@ -1371,7 +1371,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-harness"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "futures",
@@ -1391,7 +1391,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-telemetry"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "tokio",
@@ -1399,7 +1399,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-tools"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "base64",
@@ -1863,7 +1863,7 @@ dependencies = [
 
 [[package]]
 name = "tools-example"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "futures",
  "rpi-agent",

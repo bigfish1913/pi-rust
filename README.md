@@ -108,21 +108,38 @@ any auth source is ready without touching the network.
 Then `rpi --model gateway/custom-claude -p "hi"` routes to the gateway (the
 `gateway/` prefix is CLI namespacing; v1 routes every `anthropic-messages`
 model through its single AnthropicProvider, using the model's `base_url` +
-`headers` to reach the endpoint). See
-[docs/m6-cli-open-questions.md §4](docs/m6-cli-open-questions.md) for the
-full auth precedence, the `~/.rpi`-flat-vs-nested divergence, and what's
-deferred (OAuth, `$ENV` credential expansion, multi-provider registry).
+`headers` to reach the endpoint).
+
+**Default model (no `--model`).** A bare `rpi -p "hi"` picks the default the way
+native pi does — the first *authenticated* model in the catalog when the
+built-in default isn't authenticated. So a `models.json`-only gateway setup
+(no Anthropic key) "just works": the gateway model is the only authenticated
+one, so `rpi -p "hi"` routes through it — no `--model` needed. With a standard
+`ANTHROPIC_API_KEY`/`auth.json`/`--api-key` setup, the built-in
+`claude-sonnet-5` remains the default. (A gateway key is folded onto the
+gateway models only; an `ANTHROPIC_AUTH_TOKEN` is folded onto every model.)
+See
+[docs/m6-cli-open-questions.md §4–5](docs/m6-cli-open-questions.md) for the
+full auth precedence, the default-selection rule, the `~/.rpi`-flat-vs-nested
+divergence, and what's deferred (OAuth, `$ENV` credential expansion,
+multi-provider registry).
 
 ## Releasing
 
-Publish the crate family with `release.ps1` (Windows) or `release.sh` (Unix/CI),
-dep-ordered, dry-run by default:
+Publish the crate family in dependency order with `cargo publish` (run
+`cargo login` once first so `~/.cargo/credentials.toml` exists with a
+publish-scoped token; crates.io records are permanent):
 
 ```
-./release.ps1            # safe dry run
-./release.ps1 -DryRun    # same, explicit
-./release.ps1 -Publish   # real publish to crates.io (run `cargo login` first)
+# dep order: telemetry → ai → agent → tools → harness → cli
+for c in rpi-telemetry rpi-ai rpi-agent rpi-tools rpi-harness rpi-cli; do
+  cargo publish -p "$c"
+done
 ```
+
+The workspace `Taskfile.yml` (`task dry-run` / `task publish`) used to wrap
+`release.ps1`/`release.sh`, but those scripts were removed; publish directly
+as above.
 
 ## License
 

@@ -1,14 +1,15 @@
 # Taskfile for the rpi-* crate family release.
 #
-# Wraps release.ps1 (Windows, canonical) / release.sh (Unix mirror) so the
-# publish is driven by `task <target>` instead of remembering script flags. The
-# dependency-ordered publish logic, pre-flight checks, and per-crate retry live
-# in the release scripts — this is just the ergonomic entry point.
+# The release.ps1 / release.sh scripts were removed (commit 2e5fe54); the
+# dep-ordered publish is now driven directly by the targets below via plain
+# `cargo publish`. Keep this file as the ergonomic entry point so the
+# dependency order (telemetry → ai → agent → tools → harness → cli) is encoded
+# once and `cargo test` stays the pre-flight.
 #
 # Usage:
 #   task              # list targets
-#   task dry-run      # safe dry run (default behavior)
-#   task publish      # real publish to crates.io, with pre-flight `cargo test`
+#   task dry-run      # cargo publish --dry-run per crate, dep-ordered (no upload)
+#   task publish      # real publish to crates.io, dep-ordered, with pre-flight test
 #   task publish:fast # real publish, skip pre-flight tests (only after a green `task test`)
 #   task test         # cargo test --workspace
 #
@@ -24,28 +25,35 @@ tasks:
       - task --list
 
   dry-run:
-    desc: Safe dry-run of the crates.io publish (packs + verifies each crate, no upload)
+    desc: cargo publish --dry-run per crate, dep-ordered (no upload)
     cmds:
-      - cmd: powershell -NoProfile -ExecutionPolicy Bypass -File release.ps1 -DryRun
-        platforms: [windows]
-      - cmd: ./release.sh --dry-run
-        platforms: [linux, darwin]
+      - cargo publish --dry-run -p rpi-telemetry
+      - cargo publish --dry-run -p rpi-ai
+      - cargo publish --dry-run -p rpi-agent
+      - cargo publish --dry-run -p rpi-tools
+      - cargo publish --dry-run -p rpi-harness
+      - cargo publish --dry-run -p rpi-cli
 
   publish:
     desc: Real publish rpi-* crates to crates.io in dependency order (runs pre-flight `cargo test`)
     cmds:
-      - cmd: powershell -NoProfile -ExecutionPolicy Bypass -File release.ps1 -Publish
-        platforms: [windows]
-      - cmd: ./release.sh --publish
-        platforms: [linux, darwin]
+      - cargo test --workspace
+      - cargo publish -p rpi-telemetry
+      - cargo publish -p rpi-ai
+      - cargo publish -p rpi-agent
+      - cargo publish -p rpi-tools
+      - cargo publish -p rpi-harness
+      - cargo publish -p rpi-cli
 
   publish:fast:
-    desc: Real publish, skip pre-flight tests (use only after a fresh green `task test`)
+    desc: Real publish, dep-ordered, skip pre-flight tests (use only after a fresh green `task test`)
     cmds:
-      - cmd: powershell -NoProfile -ExecutionPolicy Bypass -File release.ps1 -Publish -SkipTest
-        platforms: [windows]
-      - cmd: ./release.sh --publish --skip-test
-        platforms: [linux, darwin]
+      - cargo publish -p rpi-telemetry
+      - cargo publish -p rpi-ai
+      - cargo publish -p rpi-agent
+      - cargo publish -p rpi-tools
+      - cargo publish -p rpi-harness
+      - cargo publish -p rpi-cli
 
   test:
     desc: cargo test --workspace (the release pre-flight, run standalone)

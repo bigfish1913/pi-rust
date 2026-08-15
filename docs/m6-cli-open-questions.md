@@ -251,6 +251,42 @@ common source of "got the wrong model" surprises. A typo now yields a clear
 **To revisit.** If users want shorthand (`sonnet` → `claude-sonnet-5`), add an
 opt-in `--fuzzy-model` flag rather than changing the default.
 
+**Default selection (no `--model`).** When `--model` is absent, v1 now picks the
+default the way the TS `findInitialModel`
+(`packages/coding-agent/src/core/model-resolver.ts`) does over the
+auth-filtered snapshot — not the old hard-coded `claude-sonnet-5`. The rule
+(`provider.rs::pick_default_model`): (1) the built-in default
+`claude-sonnet-5` if it is *already authenticated*, else (2) the **first
+authenticated model** in the catalog (TS `availableModels[0]`). A model is
+"authenticated" when it carries an auth-owned header (a folded Bearer — see
+`Auth source → fold scope` below) or the provider holds a resolved `x-api-key`
+(the `--api-key`/`auth.json`/`ANTHROPIC_API_KEY` path).
+
+This matters for the **gateway-only** case: a `~/.rpi/models.json` with a
+single `authHeader:true` gateway and no Anthropic key. The gateway's Bearer is
+folded onto the gateway model *only* (its `base_url` is the custom endpoint);
+the built-in `claude-*` models keep `api.anthropic.com` and stay Bearer-less,
+so they are not "authenticated" → the default selector skips them and picks
+the gateway model. The previous behavior folded the gateway Bearer onto *every*
+model and then defaulted to `claude-sonnet-5` (base_url `api.anthropic.com`),
+which sent a foreign token to Anthropic → 401 "Invalid bearer token". Fixed in
+M6-followup F (see `rpi-config-auth-bearer` notes).
+
+**Auth source → fold scope** (`provider.rs::resolve`):
+
+| Bearer source | Fold scope | Default picks |
+|---|---|---|
+| `~/.rpi/models.json` gateway (`authHeader:true`+`apiKey`) | gateway models only (`base_url` ≠ Anthropic, or a `--base-url` override is active) | the gateway model |
+| `ANTHROPIC_AUTH_TOKEN` env | **every** model (a global credential for the configured endpoint) | `claude-sonnet-5` |
+| `--api-key` / `auth.json` / `ANTHROPIC_API_KEY` (x-api-key path) | no Bearer at all (auth rides on the provider key) | `claude-sonnet-5` |
+
+Why two fold scopes: a `models.json` gateway key is endpoint-specific (the
+DashScope key only works against DashScope), so it must not ride on built-in
+models pointed at `api.anthropic.com`. An `ANTHROPIC_AUTH_TOKEN` is a global
+credential the user intends for whatever endpoint is configured (default
+Anthropic, or `--base-url`), so it rides on every model — matching the TS
+provider-level credential behavior and the pre-gateway v1 behavior.
+
 ---
 
 ## 6. Session restore (`-c`/`-r`/`--session`) is recognized but not wired

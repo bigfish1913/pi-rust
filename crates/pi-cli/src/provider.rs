@@ -57,8 +57,18 @@
 //!    keeps it exact to avoid surprising model picks (partial match is a common
 //!    source of "got the wrong model" bugs — documented as a divergence in
 //!    `docs/m6-cli-open-questions.md`).
-//! 5. No `--model` ⇒ the default ([`DEFAULT_MODEL_ID`] = `claude-sonnet-5`),
-//!    mirroring the TS per-provider default.
+//! 5. No `--model` ⇒ [`pick_default_model`]:
+//!    (a) the built-in default ([`DEFAULT_MODEL_ID`] = `claude-sonnet-5`) if it
+//!    is already authenticated (has a folded Bearer, or the provider holds an
+//!    `x-api-key`); otherwise (b) the **first authenticated model** in the
+//!    catalog — mirroring the TS `findInitialModel` step-4 fallback
+//!    `availableModels[0]` over the auth-filtered snapshot. This lets a
+//!    `models.json`-only gateway config "just work": the built-in Anthropic
+//!    models carry no auth, so the gateway model (the only authenticated one)
+//!    is picked. The all-builtin/no-custom-code default (`ANTHROPIC_API_KEY`
+//!    path) still selects `claude-sonnet-5`. Last resort falls back to
+//!    [`DEFAULT_MODEL_ID`] (or the catalog head) — unreachable in practice
+//!    because the auth gate refuses an unauthed catalog earlier.
 //!
 //! [`AnthropicProvider`]: rpi_ai::providers::anthropic::AnthropicProvider
 
@@ -170,6 +180,10 @@ pub fn resolve(
     // ---- Auth resolution: provider_key (x-api-key) OR auth_headers (Bearer) ----
     let mut provider_key: Option<String> = None;
     let mut auth_headers: BTreeMap<String, String> = BTreeMap::new();
+    // Whether the resolved Bearer came from a `~/.rpi/models.json` gateway
+    // (endpoint-specific — fold onto gateway models only) vs `ANTHROPIC_AUTH_TOKEN`
+    // env (a global credential — fold onto every model). See the fold below.
+    let mut bearer_from_models_json = false;
 
     // Load the models.json config ONCE — it is consulted both as an auth source
     // (a provider with `authHeader: true` + `apiKey` supplies a Bearer token,
@@ -198,10 +212,13 @@ pub fn resolve(
     //    The first anthropic-compatible provider that declares a static gateway
     //    key supplies the Bearer token (v1 routes through one provider, so the
     //    first match is authoritative). Mirrors upstream's `authHeader` handling
-    //    where the resolved apiKey is wrapped as `Authorization: Bearer`.
+    //    where the resolved apiKey is wrapped as `Authorization: Bearer`. Mark
+    //    this Bearer as endpoint-specific so the fold below targets only the
+    //    gateway's models (NOT the built-in Anthropic catalog).
     if provider_key.is_none() && auth_headers.is_empty() {
         if let Some(tok) = models_json_bearer_token(&models_cfg) {
             auth_headers.insert("authorization".to_string(), format!("Bearer {tok}"));
+            bearer_from_models_json = true;
         }
     }
     // 4. ANTHROPIC_AUTH_TOKEN → Authorization: Bearer (third-party gateways).
@@ -247,17 +264,48 @@ pub fn resolve(
         }
     }
 
-    // Fold the Bearer header (if any) into every model so `has_header_auth`
-    // recognizes it and the provider skips `x-api-key`. Provider-level headers
-    // from models.json are preserved; an env-derived Bearer is additive
-    // (inserted via `entry` so a models.json bearer isn't clobbered when the
-    // env token is absent — but when both exist, the env token is the
-    // interactive-session override and wins).
-    if !auth_headers.is_empty() {
+    // Fold the Bearer header (if any) into the catalog — but only onto models
+    // the Bearer is actually meant for. Upstream `withConfiguredAuth` synthesizes
+    // the Bearer per-provider: a models.json gateway's Bearer rides only on that
+    // gateway's models, NOT the built-in Anthropic claude-* catalog (whose
+    // `base_url` is `api.anthropic.com`). Folding it onto every model — the old
+    // behavior — meant the *default* model (`claude-sonnet-5`, whose base_url is
+    // Anthropic) carried a gateway Bearer to the wrong endpoint → 401 "Invalid
+    // bearer token".
+    //
+    // Two Bearer sources, two fold scopes:
+    //  - `~/.rpi/models.json` gateway (`bearer_from_models_json`): endpoint-
+    //    specific. Fold onto gateway models only — a model counts as a "gateway
+    //    model" when either (a) a `--base-url`/`ANTHROPIC_BASE_URL` override
+    //    rewrote every model's `base_url`, or (b) the model's own `base_url` was
+    //    set to a non-Anthropic URL by `provider_to_models` (i.e. it came from
+    //    `models.json`). Built-in `claude-*` keeps `api.anthropic.com` → stays
+    //    Bearer-less. This is what lets `pick_default_model` pick the gateway
+    //    model (the only authed one) in a gateway-only setup.
+    //  - `ANTHROPIC_AUTH_TOKEN` env: a global credential the user intends for the
+    //    configured endpoint (either the built-in Anthropic endpoint or a
+    //    `--base-url` override). Fold onto EVERY model so the default
+    //    `claude-sonnet-5` carries it — matching the pre-gateway behavior and
+    //    the TS behavior where an env Bearer is a provider-level credential.
+    if !auth_headers.is_empty() && !bearer_from_models_json {
+        // ANTHROPIC_AUTH_TOKEN: global — stamp onto every model.
         for m in catalog.iter_mut() {
             let headers = m.headers.get_or_insert_with(BTreeMap::new);
             for (k, v) in &auth_headers {
                 headers.insert(k.clone(), v.clone());
+            }
+        }
+    } else if !auth_headers.is_empty() {
+        // models.json gateway Bearer: endpoint-specific — gateway models only.
+        let override_active = base_url_override.is_some();
+        for m in catalog.iter_mut() {
+            let is_gateway =
+                override_active || m.base_url != config::ANTHROPIC_DEFAULT_BASE_URL;
+            if is_gateway {
+                let headers = m.headers.get_or_insert_with(BTreeMap::new);
+                for (k, v) in &auth_headers {
+                    headers.insert(k.clone(), v.clone());
+                }
             }
         }
     }
@@ -268,22 +316,37 @@ pub fn resolve(
         .collect::<Vec<_>>()
         .join(", ");
 
-    // ---- Model + thinking pattern parse ----
-    let (pattern, pattern_thinking) = split_model_pattern(cli_model.unwrap_or(DEFAULT_MODEL_ID));
-
-    // Effective thinking: `--thinking` wins over a `:level` suffix; else default.
-    let thinking_level = cli_thinking
-        .or(pattern_thinking)
-        .unwrap_or(DEFAULT_THINKING_LEVEL);
-
-    // Match the pattern against the catalog.
-    let model = match find_model(&pattern, &catalog) {
-        Some(m) => m,
+    // ---- Model selection ----
+    // With `--model`: parse the pattern (`provider/id[:thinking]`), match it
+    // exactly against the catalog (TS fuzzy/partial match is a deliberate v1
+    // omission — see module docs §5). Without `--model`: pick the default per
+    // upstream `findInitialModel` semantics (built-in default if it is authed,
+    // else the first authed model) via `pick_default_model` — see its doc.
+    let (model, thinking_level) = match cli_model {
+        Some(raw) => {
+            let (pattern, pattern_thinking) = split_model_pattern(raw);
+            // `--thinking` wins over a `:level` suffix; else default.
+            let thinking_level = cli_thinking
+                .or(pattern_thinking)
+                .unwrap_or(DEFAULT_THINKING_LEVEL);
+            let model = match find_model(&pattern, &catalog) {
+                Some(m) => m,
+                None => {
+                    return Err(ResolveError::NoMatch {
+                        pattern: pattern.clone(),
+                        available,
+                    });
+                }
+            };
+            (model, thinking_level)
+        }
         None => {
-            return Err(ResolveError::NoMatch {
-                pattern: pattern.clone(),
-                available,
-            });
+            // No `:level` suffix to honor here; `--thinking` still wins, else
+            // the default. Matches the TS `findInitialModel` default-thinking
+            // behavior (DEFAULT_THINKING_LEVEL unless a scoped model overrides).
+            let thinking_level = cli_thinking.unwrap_or(DEFAULT_THINKING_LEVEL);
+            let model = pick_default_model(&catalog, provider_key.as_deref());
+            (model, thinking_level)
         }
     };
 
@@ -383,6 +446,79 @@ fn find_model(pattern: &str, catalog: &[Model]) -> Option<Model> {
         .iter()
         .find(|m| m.id.eq_ignore_ascii_case(pattern))
         .cloned()
+}
+
+/// Whether a catalog model is "configured-auth" — i.e. the request built for it
+/// would pass `assertRequestAuth` and not return "No API key". Mirrors the TS
+/// `hasConfiguredAuth(providerId)` filter that `getAvailableSnapshot()` applies
+/// (`available = all.filter(m => configuredProviders.has(m.provider))`).
+///
+/// In v1's single-provider world, "configured auth" is decided statically after
+/// the Bearer fold: a model counts as authed when EITHER
+/// (a) it carries an auth-owned header (`authorization`/`x-api-key`/`cf-aig-…`)
+///     — the Bearer fold has stamped a gateway/env Bearer onto it — OR
+/// (b) the provider holds a resolved `provider_key` (the x-api-key path:
+///     `--api-key`/auth.json/`ANTHROPIC_API_KEY`), which `assemble_headers`
+///     attaches out-of-band to every model regardless of `headers`.
+///
+/// This is called *after* the Bearer fold, so `has_header_auth(&m.headers)`
+/// truthfully reflects whether a Bearer was folded onto *this* model (gateway
+/// models only — see the fold's `is_gateway` gate; built-in claude-* without an
+/// override stay Bearer-less).
+fn model_is_authed(m: &Model, provider_key: Option<&str>) -> bool {
+    model_has_header_auth(m) || provider_key.is_some()
+}
+
+/// Same three-name check as rpi-ai's `has_header_auth`, but called from the
+/// CLI layer (rpi-ai's `has_header_auth` is private to the provider module, so
+/// we mirror it here over the model's `headers` map).
+fn model_has_header_auth(m: &Model) -> bool {
+    let Some(h) = &m.headers else { return false };
+    const NAMES: &[&str] = &["authorization", "x-api-key", "cf-aig-authorization"];
+    h.keys()
+        .any(|k| NAMES.contains(&k.to_ascii_lowercase().as_str()))
+}
+
+/// Choose the default model when `--model` is absent. Mirrors upstream
+/// `findInitialModel` [`packages/coding-agent/src/core/model-resolver.ts`]:
+/// the built-in default (`claude-sonnet-5`) wins *if it has configured auth*;
+/// otherwise fall back to the first authed model in the catalog (the TS
+/// `availableModels[0]` when no `defaultModelPerProvider` entry matches — e.g.
+/// a `~/.rpi/models.json` gateway is the only configured endpoint). This fixes
+/// the gateway-only case where the old hard-coded `claude-sonnet-5` default
+/// carried a gateway Bearer to `api.anthropic.com` and 401'd.
+///
+/// `provider_key` is the resolved x-api-key (`Some` on the `--api-key`/
+/// auth.json/`ANTHROPIC_API_KEY` path; `None` on the Bearer path). It is passed
+/// in (not read from a field) because the auth decision is local to `resolve`.
+fn pick_default_model(catalog: &[Model], provider_key: Option<&str>) -> Model {
+    // 1. Built-in default, when it is authed — preserves the standard
+    //    `ANTHROPIC_API_KEY`/`auth.json` behavior (claude-sonnet-5).
+    if let Some(m) = catalog
+        .iter()
+        .find(|m| m.id.eq_ignore_ascii_case(DEFAULT_MODEL_ID))
+        .filter(|m| model_is_authed(m, provider_key))
+    {
+        return m.clone();
+    }
+    // 2. First authed model (TS `availableModels[0]`). In a gateway-only setup
+    //    this is the gateway model (Bearer folded onto it, base_url = gateway).
+    if let Some(m) = catalog
+        .iter()
+        .find(|m| model_is_authed(m, provider_key))
+    {
+        return m.clone();
+    }
+    // 3. Last resort: the built-in default, authed or not. The auth gate above
+    //    already errored when no source resolved, so reaching here means *some*
+    //    auth exists but none folded/attached to a model we can see — keep the
+    //    historical default to avoid a NoMatch surprise.
+    catalog
+        .iter()
+        .find(|m| m.id.eq_ignore_ascii_case(DEFAULT_MODEL_ID))
+        .or_else(|| catalog.first())
+        .expect("catalog is never empty (built-in anthropic_models)")
+        .clone()
 }
 
 #[cfg(test)]
@@ -592,6 +728,10 @@ mod tests {
         // No provider key carries auth — it lives on the model header.
         let headers = r.model.headers.as_ref().expect("bearer header on model");
         assert_eq!(headers.get("authorization").map(|s| s.as_str()), Some("Bearer tok-123"));
+        // ANTHROPIC_AUTH_TOKEN is a *global* credential (not endpoint-specific
+        // like a models.json gateway key): the default claude-sonnet-5 is picked
+        // (it carries the env Bearer) — NOT a gateway model.
+        assert_eq!(r.model.id, DEFAULT_MODEL_ID);
     }
 
     #[test]
@@ -663,8 +803,9 @@ mod tests {
     /// A models.json gateway with `authHeader:true` + `apiKey` is itself an auth
     /// source — it satisfies the `resolve` auth gate WITHOUT any env var, stored
     /// cred, or `--api-key`. This is the "models.json file alone sets up a
-    /// third-party endpoint" path. The Bearer token folds onto every model and
-    /// `resolve` succeeds.
+    /// third-party endpoint" path. The Bearer folds onto the gateway model only
+    /// (built-in claude-* stays Bearer-less), and — with no `--model` — the
+    /// default selector picks that gateway model (the only authed one).
     #[test]
     fn models_json_auth_header_satisfies_auth_without_env() {
         let _env = TestEnv::new();
@@ -696,6 +837,48 @@ mod tests {
     /// The `--api-key` flag wins over a models.json `authHeader:true` gateway
     /// key (the flag is the highest-priority x-api-key source; the gateway
     /// Bearer is only consulted when no key path is taken).
+    /// A `models.json`-only gateway config (no `--model`, no env, no auth.json)
+    /// should pick the gateway model by default — mirroring the TS
+    /// `findInitialModel` step-4 fallback `availableModels[0]` over the
+    /// auth-filtered snapshot. The built-in Anthropic models carry no auth in a
+    /// gateway-only setup, so the gateway model is the first (and only)
+    /// authenticated model. This is the `rpi -p hi` (no `--model`) case.
+    #[test]
+    fn default_prefers_gateway_when_only_gateway_configured() {
+        // TestEnv already holds the shared env_lock for its whole lifetime —
+        // don't take it again here (would self-deadlock and poison the mutex).
+        let _env = TestEnv::new();
+        std::fs::write(
+            config::models_path().unwrap(),
+            r#"{
+  "providers": {
+    "gateway": {
+      "baseUrl": "https://gw.example.com",
+      "api": "anthropic-messages",
+      "authHeader": true,
+      "apiKey": "gw-secret",
+      "models": [
+        { "id": "custom-claude", "contextWindow": 200000, "maxTokens": 8192 }
+      ]
+    }
+  }
+}"#,
+        )
+        .unwrap();
+        // No --model (None): the default selector must pick the gateway model,
+        // NOT the built-in claude-sonnet-5 (which would carry a foreign Bearer
+        // to api.anthropic.com → 401, the bug this fixes).
+        let r = resolve(None, None, None, None, None).unwrap();
+        assert_eq!(r.model.id, "custom-claude");
+        assert_eq!(r.model.base_url, "https://gw.example.com");
+        // Gateway model carries the folded Bearer.
+        let headers = r.model.headers.as_ref().expect("bearer on gateway model");
+        assert_eq!(
+            headers.get("authorization").map(|s| s.as_str()),
+            Some("Bearer gw-secret")
+        );
+    }
+
     #[test]
     fn api_key_flag_beats_models_json_bearer() {
         let _env = TestEnv::new();
