@@ -3,14 +3,14 @@
   pi-rust crates.io release helper.
 
 .DESCRIPTION
-  Publishes the pi-rust workspace crates to crates.io in dependency order:
-    pi-telemetry -> pi-ai -> pi-agent -> pi-tools -> pi-harness -> pi-cli
+  Publishes the rpi-* workspace crates to crates.io in dependency order:
+    rpi-telemetry -> rpi-ai -> rpi-agent -> rpi-tools -> rpi-harness -> rpi-cli
   (examples are publish=false and skipped).
 
   Default mode is a SAFE DRY RUN (-DryRun): each crate is packed + verified
-  with `cargo publish --dry-run`. Only the workspace leaf (pi-telemetry) can
+  with `cargo publish --dry-run`. Only the workspace leaf (rpi-telemetry) can
   fully resolve in a dry run — every downstream crate is expected to SKIP with
-  "no matching package `pi-X`" because its pi-* deps are not on crates.io yet.
+  "no matching package `rpi-X`" because its rpi-* deps are not on crates.io yet.
   That is NORMAL for a first-time workspace publish; the real publish (-Publish)
   resolves them in order.
 
@@ -27,10 +27,8 @@
     * `cargo login` must have been run once interactively
       (creates ~/.cargo/credentials(.toml)). The script warns if it can't find
       credentials.
-    * The workspace `repository` URL in the root Cargo.toml should be set to
-      YOUR pi-rust repo. It ships pointing at the upstream TS source as a
-      placeholder; the script warns loudly on -Publish if it is still the
-      placeholder. crates.io names are permanent — check them first.
+    * The workspace `repository` URL in the root Cargo.toml should point at
+      YOUR rpi repo. crates.io names are permanent — check them first.
 
 .PARAMETER Publish
   Really publish to crates.io. Without this flag the script is a dry run.
@@ -72,7 +70,7 @@ $OutputEncoding = [System.Text.UTF8Encoding]::new()
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()
 
 # Dependency order. examples/* are publish=false and not listed.
-$Order = @('pi-telemetry', 'pi-ai', 'pi-agent', 'pi-tools', 'pi-harness', 'pi-cli')
+$Order = @('rpi-telemetry', 'rpi-ai', 'rpi-agent', 'rpi-tools', 'rpi-harness', 'rpi-cli')
 
 $repoRoot = Split-Path -Parent $PSCommandPath
 Set-Location $repoRoot
@@ -111,15 +109,15 @@ if ($Real -and -not $hasCreds) {
     exit 1
 }
 
-# --- repository placeholder check ---
+# --- repository sanity check ---
 $rootManifest = Join-Path $repoRoot 'Cargo.toml'
 $manifestText = Get-Content -Raw $rootManifest
 if ($manifestText -match 'earendil-works/pi') {
     if ($Real) {
-        Write-Bad "repository in Cargo.toml still points at the upstream TS source (earendil-works/pi)."
-        Write-Host "  Edit [workspace.package].repository to YOUR pi-rust repo URL before publishing." -ForegroundColor Yellow
-        Write-Host "  crates.io records are permanent — continuing in 5s (Ctrl-C to abort)..." -ForegroundColor Yellow
-        Start-Sleep -Seconds 5
+        Write-Bad "repository in Cargo.toml points at the upstream TS source (earendil-works/pi)."
+        Write-Host "  Set [workspace.package].repository to YOUR rpi repo URL before publishing." -ForegroundColor Yellow
+        Write-Host "  crates.io records are permanent — aborting." -ForegroundColor Yellow
+        exit 1
     } else {
         Write-Skip "repository URL is the upstream placeholder (fine for a dry run; fix before -Publish)."
     }
@@ -192,7 +190,7 @@ foreach ($crate in $Order) {
                     Start-Sleep -Seconds $SleepSeconds
                     continue
                 }
-                Write-Skip "$crate (expected: pi-* deps not on crates.io yet)"
+                Write-Skip "$crate (expected: rpi-* deps not on crates.io yet)"
                 $results += [pscustomobject]@{ Crate = $crate; Status = 'SKIP'; Note = 'deps not on crates.io yet' }
                 $done = $true
             } else {

@@ -2,14 +2,14 @@
 # pi-rust crates.io release helper (Unix/CI). PowerShell release.ps1 is the
 # canonical source; this mirrors it for Linux/macOS and CI.
 #
-# Publishes the workspace crates to crates.io in dependency order:
-#   pi-telemetry -> pi-ai -> pi-agent -> pi-tools -> pi-harness -> pi-cli
+# Publishes the rpi-* workspace crates to crates.io in dependency order:
+#   rpi-telemetry -> rpi-ai -> rpi-agent -> rpi-tools -> rpi-harness -> rpi-cli
 # (examples are publish=false and skipped).
 #
 # Default mode is a SAFE DRY RUN: each crate is packed + verified with
-# `cargo publish --dry-run`. Only pi-telemetry fully resolves in a dry run —
-# every downstream crate SKIPs with "no matching package `pi-X`" because its
-# pi-* deps aren't on crates.io yet. That's NORMAL for a first-time workspace
+# `cargo publish --dry-run`. Only rpi-telemetry fully resolves in a dry run —
+# every downstream crate SKIPs with "no matching package `rpi-X`" because its
+# rpi-* deps aren't on crates.io yet. That's NORMAL for a first-time workspace
 # publish; the real publish (--publish) resolves them in order.
 #
 # --publish runs the real `cargo publish` per crate, stopping on the first hard
@@ -19,8 +19,8 @@
 #
 # Prerequisites for --publish:
 #   * `cargo login` run once interactively (creates ~/.cargo/credentials(.toml)).
-#   * workspace.repository in the root Cargo.toml set to YOUR pi-rust repo
-#     (it ships as the upstream earendil-works/pi placeholder; the script warns).
+#   * workspace.repository in the root Cargo.toml set to YOUR repo URL
+#     (must NOT be the upstream earendil-works/pi placeholder).
 #   * crates.io names are permanent — check them first.
 #
 # Usage:
@@ -50,7 +50,7 @@ done
 MODE="DRY RUN"
 if [ "$REAL" = "1" ]; then MODE="PUBLISH (real)"; fi
 
-ORDER=(pi-telemetry pi-ai pi-agent pi-tools pi-harness pi-cli)
+ORDER=(rpi-telemetry rpi-ai rpi-agent rpi-tools rpi-harness rpi-cli)
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$REPO_ROOT"
 
@@ -67,13 +67,13 @@ if [ "$REAL" = "1" ]; then
   fi
 fi
 
-# --- repository placeholder check ---
+# --- repository sanity check ---
 if grep -q 'earendil-works/pi' Cargo.toml; then
   if [ "$REAL" = "1" ]; then
-    bad "repository in Cargo.toml still points at the upstream TS source (earendil-works/pi)."
-    echo "  Edit [workspace.package].repository to YOUR pi-rust repo URL before publishing." >&2
-    echo "  crates.io records are permanent — continuing in 5s (Ctrl-C to abort)..." >&2
-    sleep 5
+    bad "repository in Cargo.toml points at the upstream TS source (earendil-works/pi)."
+    echo "  Set [workspace.package].repository to YOUR rpi repo URL before publishing." >&2
+    echo "  crates.io records are permanent — aborting." >&2
+    exit 1
   else
     skip "repository URL is the upstream placeholder (fine for dry run; fix before --publish)."
   fi
@@ -135,7 +135,7 @@ publish_one() {
         sleep "$SLEEP_SECONDS"
         continue
       fi
-      skip "$crate (expected: pi-* deps not on crates.io yet)"
+      skip "$crate (expected: rpi-* deps not on crates.io yet)"
       SUM_CRATE+=("$crate"); SUM_STATUS+=("SKIP")
       return 0
     fi
@@ -186,6 +186,6 @@ elif [ "$REAL" = "1" ]; then
   ok "All crates published."
 else
   echo "Dry run complete. (Skipped crates resolve only during a real --publish,"
-  echo "  once their pi-* deps are live on crates.io.)"
+  echo "  once their rpi-* deps are live on crates.io.)"
 fi
 exit 0

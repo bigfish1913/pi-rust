@@ -4,13 +4,13 @@
 //! TS extends the agent's `AgentMessage` via declaration merging on
 //! `CustomAgentMessages` with four roles: `bashExecution`, `custom`,
 //! `branchSummary`, `compactionSummary`. Rust has no declaration merging, so
-//! each role is a `pi_agent::message::AgentMessage::Custom(CustomMessage)`
+//! each role is a `rpi_agent::message::AgentMessage::Custom(CustomMessage)`
 //! whose `role` field carries the TS role string and whose `data: Value` carries
 //! the role-specific structured payload (mirrors the TS role interface fields).
 //!
 //! `convert_to_llm` is the *harness* converter (distinct from
-//! `pi_agent::default_convert_to_llm`, which drops custom roles): it projects
-//! each custom role into a provider-facing `pi_ai::Message` (a `User` message
+//! `rpi_agent::default_convert_to_llm`, which drops custom roles): it projects
+//! each custom role into a provider-facing `rpi_ai::Message` (a `User` message
 //! with role-rendered text), so the LLM sees bash output / branch + compaction
 //! summaries as user text. Unregistered custom roles are dropped (mirrors the
 //! TS `default → undefined` branch).
@@ -19,8 +19,8 @@
 //! (`createCompactionSummaryMessage`, `createBranchSummaryMessage`,
 //! `convertToLlm`).
 
-use pi_ai::types::{Content, Message, UserContent, UserMessage};
-use pi_agent::message::{AgentMessage, CustomMessage};
+use rpi_ai::types::{Content, Message, UserContent, UserMessage};
+use rpi_agent::message::{AgentMessage, CustomMessage};
 use serde::{Deserialize, Serialize};
 
 /// Wraps `summary` in the compaction-summary text envelope. Mirrors

@@ -5,16 +5,16 @@
 
 use std::sync::Arc;
 
-use pi_agent::agent_tool::AgentTool;
-use pi_agent::error::AgentError;
-use pi_tools::{ExecutionToolContext, FileSystem, InMemoryExecutionEnv};
+use rpi_agent::agent_tool::AgentTool;
+use rpi_agent::error::AgentError;
+use rpi_tools::{ExecutionToolContext, FileSystem, InMemoryExecutionEnv};
 use tokio_util::sync::CancellationToken;
 
 /// Build a fresh in-memory tool context rooted at `/tmp/work`.
-fn fresh_context() -> (Arc<InMemoryExecutionEnv>, pi_tools::ExecutionToolContext) {
+fn fresh_context() -> (Arc<InMemoryExecutionEnv>, rpi_tools::ExecutionToolContext) {
     let env = Arc::new(InMemoryExecutionEnv::with_cwd("/tmp/work".into()));
-    let env_dyn: Arc<dyn pi_tools::ExecutionEnv> = env.clone();
-    let mut_env: Arc<dyn pi_tools::MutatingEnv> = env.clone();
+    let env_dyn: Arc<dyn rpi_tools::ExecutionEnv> = env.clone();
+    let mut_env: Arc<dyn rpi_tools::MutatingEnv> = env.clone();
     let ctx = ExecutionToolContext::new(env_dyn, Some(mut_env));
     (env, ctx)
 }
@@ -31,8 +31,8 @@ async fn make_dir(env: &InMemoryExecutionEnv, rel: &str) {
     env.create_dir(rel, true, None).await.expect("create_dir");
 }
 
-fn text_output(r: &pi_agent::types::AgentToolResult) -> String {
-    use pi_agent::types::TextContentOrImage;
+fn text_output(r: &rpi_agent::types::AgentToolResult) -> String {
+    use rpi_agent::types::TextContentOrImage;
     r.content
         .iter()
         .filter_map(|c| match c {
@@ -46,7 +46,7 @@ fn text_output(r: &pi_agent::types::AgentToolResult) -> String {
 async fn run_find(
     tool: Arc<dyn AgentTool>,
     params: serde_json::Value,
-) -> Result<pi_agent::types::AgentToolResult, AgentError> {
+) -> Result<rpi_agent::types::AgentToolResult, AgentError> {
     let signal = CancellationToken::new();
     let on_update = Arc::new(|_p| ());
     tool.execute("find-1", params, signal, on_update).await
@@ -59,7 +59,7 @@ async fn find_basename_glob() {
     seed(&env, "b.txt", b"".to_vec()).await;
     seed(&env, "c.rs", b"".to_vec()).await;
 
-    let tool = pi_tools::create_find_tool(&ctx, None);
+    let tool = rpi_tools::create_find_tool(&ctx, None);
     let result = run_find(tool, serde_json::json!({ "pattern": "*.rs", "path": "." }))
         .await
         .expect("find ok");
@@ -77,7 +77,7 @@ async fn find_path_glob_recursive() {
     seed(&env, "src/other.txt", b"".to_vec()).await;
     seed(&env, "top.json", b"{}".to_vec()).await;
 
-    let tool = pi_tools::create_find_tool(&ctx, None);
+    let tool = rpi_tools::create_find_tool(&ctx, None);
     let result = run_find(
         tool,
         serde_json::json!({ "pattern": "**/*.json", "path": "." }),
@@ -96,7 +96,7 @@ async fn find_path_glob_recursive() {
 async fn find_no_matches() {
     let (env, ctx) = fresh_context();
     seed(&env, "a.rs", b"".to_vec()).await;
-    let tool = pi_tools::create_find_tool(&ctx, None);
+    let tool = rpi_tools::create_find_tool(&ctx, None);
     let result = run_find(
         tool,
         serde_json::json!({ "pattern": "*.foo", "path": "." }),
@@ -113,7 +113,7 @@ async fn find_result_limit() {
     for i in 0..6 {
         seed(&env, &format!("f{i}.rs"), b"".to_vec()).await;
     }
-    let tool = pi_tools::create_find_tool(&ctx, None);
+    let tool = rpi_tools::create_find_tool(&ctx, None);
     let result = run_find(
         tool,
         serde_json::json!({ "pattern": "*.rs", "path": ".", "limit": 3 }),
@@ -136,7 +136,7 @@ async fn find_skips_git_directory() {
     seed(&env, ".git/HEAD", b"ref".to_vec()).await;
     seed(&env, "real.rs", b"".to_vec()).await;
 
-    let tool = pi_tools::create_find_tool(&ctx, None);
+    let tool = rpi_tools::create_find_tool(&ctx, None);
     // `*` matches everything — but `.git/HEAD` must be excluded.
     let result = run_find(
         tool,
@@ -152,7 +152,7 @@ async fn find_skips_git_directory() {
 #[tokio::test]
 async fn find_path_not_found() {
     let (_env, ctx) = fresh_context();
-    let tool = pi_tools::create_find_tool(&ctx, None);
+    let tool = rpi_tools::create_find_tool(&ctx, None);
     let err = run_find(
         tool,
         serde_json::json!({ "pattern": "*.rs", "path": "does-not-exist" }),
@@ -172,7 +172,7 @@ async fn find_directory_match_has_trailing_slash() {
     make_dir(&env, "components").await;
     seed(&env, "components/button.rs", b"".to_vec()).await;
 
-    let tool = pi_tools::create_find_tool(&ctx, None);
+    let tool = rpi_tools::create_find_tool(&ctx, None);
     // `components` matches the dir glob — should carry a trailing `/`.
     let result = run_find(
         tool,

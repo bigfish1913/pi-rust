@@ -35,7 +35,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
-use pi_tools::env::{FileContent, FileSystem};
+use rpi_tools::env::{FileContent, FileSystem};
 
 use crate::error::{SessionError, SessionErrorCode, SessionResult};
 use crate::session::jsonl::codec::{
@@ -517,8 +517,8 @@ mod tests {
     use crate::session::memory::{CounterIdGenerator, FakeClock};
     use crate::session::types::{OperationIntent, OperationStartedRecord, ProvisionedEntry, ProvisionedKind, RecordBase};
 
-    fn user_msg(text: &str) -> pi_agent::message::AgentMessage {
-        pi_agent::message::AgentMessage::User(pi_ai::types::UserMessage::new(text, 1))
+    fn user_msg(text: &str) -> rpi_agent::message::AgentMessage {
+        rpi_agent::message::AgentMessage::User(rpi_ai::types::UserMessage::new(text, 1))
     }
 
     fn header() -> JsonlV4Header {
@@ -534,7 +534,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_append_reload_roundtrips() {
-        let env = pi_tools::InMemoryExecutionEnv::with_cwd("/".into());
+        let env = rpi_tools::InMemoryExecutionEnv::with_cwd("/".into());
         let fs: Arc<dyn FileSystem> = Arc::new(env);
         let clock: Arc<dyn Clock> = Arc::new(FakeClock::new());
         let ids: Arc<dyn IdGenerator> = Arc::new(CounterIdGenerator::new());
@@ -561,7 +561,7 @@ mod tests {
 
     #[tokio::test]
     async fn torn_tail_last_line_is_repaired() {
-        let env = pi_tools::InMemoryExecutionEnv::with_cwd("/".into());
+        let env = rpi_tools::InMemoryExecutionEnv::with_cwd("/".into());
         let fs: Arc<dyn FileSystem> = Arc::new(env);
         let clock: Arc<dyn Clock> = Arc::new(FakeClock::new());
         let ids: Arc<dyn IdGenerator> = Arc::new(CounterIdGenerator::new());
@@ -586,7 +586,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_last_syntax_error_is_hard_corruption() {
-        let env = pi_tools::InMemoryExecutionEnv::with_cwd("/".into());
+        let env = rpi_tools::InMemoryExecutionEnv::with_cwd("/".into());
         let fs: Arc<dyn FileSystem> = Arc::new(env);
         let clock: Arc<dyn Clock> = Arc::new(FakeClock::new());
         let ids: Arc<dyn IdGenerator> = Arc::new(CounterIdGenerator::new());
@@ -604,7 +604,7 @@ mod tests {
 
     #[tokio::test]
     async fn schema_error_on_last_line_is_hard_corruption() {
-        let env = pi_tools::InMemoryExecutionEnv::with_cwd("/".into());
+        let env = rpi_tools::InMemoryExecutionEnv::with_cwd("/".into());
         let fs: Arc<dyn FileSystem> = Arc::new(env);
         let clock: Arc<dyn Clock> = Arc::new(FakeClock::new());
         let ids: Arc<dyn IdGenerator> = Arc::new(CounterIdGenerator::new());
@@ -621,7 +621,7 @@ mod tests {
 
     #[tokio::test]
     async fn append_record_rejects_second_open_operation() {
-        let env = pi_tools::InMemoryExecutionEnv::with_cwd("/".into());
+        let env = rpi_tools::InMemoryExecutionEnv::with_cwd("/".into());
         let fs: Arc<dyn FileSystem> = Arc::new(env);
         let clock: Arc<dyn Clock> = Arc::new(FakeClock::new());
         let ids: Arc<dyn IdGenerator> = Arc::new(CounterIdGenerator::new());

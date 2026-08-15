@@ -3,15 +3,15 @@
 //! `packages/agent/test/harness/compaction.test.ts` and the split-turn cases in
 //! `packages/coding-agent/test/compaction.test.ts`.
 //!
-//! Runs against the public `pi_harness::compaction` surface only — no LLM, no
+//! Runs against the public `rpi_harness::compaction` surface only — no LLM, no
 //! session storage.
 
-use pi_ai::types::{Api, StopReason, Usage, UsageCost, UserContent, UserMessage};
-use pi_agent::message::AgentMessage;
-use pi_harness::compaction::{
+use rpi_ai::types::{Api, StopReason, Usage, UsageCost, UserContent, UserMessage};
+use rpi_agent::message::AgentMessage;
+use rpi_harness::compaction::{
     find_cut_point, find_turn_start_index, find_valid_cut_points, CutPointResult,
 };
-use pi_harness::session::types::{Entry, EntryBase, MessageEntry};
+use rpi_harness::session::types::{Entry, EntryBase, MessageEntry};
 
 // ---- helpers (mirror the TS `createUserMessage`/`createAssistantMessage`) ----
 
@@ -47,13 +47,13 @@ fn usage(input: i64, output: i64, cache_read: i64, cache_write: i64) -> Usage {
 }
 
 fn assistant_msg(text: &str, seq: u64, parent: Option<&str>, stop: StopReason, u: Usage) -> Entry {
-    let mut m = pi_ai::types::AssistantMessage::empty(
+    let mut m = rpi_ai::types::AssistantMessage::empty(
         Api::AnthropicMessages,
         "anthropic",
         "claude-sonnet-4-5",
         seq as i64,
     );
-    m.content = vec![pi_ai::types::Content::text(text)];
+    m.content = vec![rpi_ai::types::Content::text(text)];
     m.stop_reason = stop;
     m.usage = u;
     Entry::Message(MessageEntry {
@@ -66,11 +66,11 @@ fn assistant_msg(text: &str, seq: u64, parent: Option<&str>, stop: StopReason, u
 fn tool_result_msg(seq: u64, parent: Option<&str>) -> Entry {
     Entry::Message(MessageEntry {
         base: base(seq, parent, "message"),
-        message: AgentMessage::ToolResult(Box::new(pi_ai::types::ToolResultMessage {
-            role: pi_ai::types::ToolResultRole,
+        message: AgentMessage::ToolResult(Box::new(rpi_ai::types::ToolResultMessage {
+            role: rpi_ai::types::ToolResultRole,
             tool_call_id: "call-1".to_string(),
             tool_name: "read".to_string(),
-            content: vec![pi_ai::types::Content::text("tool output")],
+            content: vec![rpi_ai::types::Content::text("tool output")],
             details: None,
             usage: None,
             added_tool_names: Vec::new(),
@@ -82,7 +82,7 @@ fn tool_result_msg(seq: u64, parent: Option<&str>) -> Entry {
 }
 
 fn compaction_entry(summary: &str, seq: u64, parent: Option<&str>) -> Entry {
-    Entry::Compaction(pi_harness::session::types::CompactionEntry {
+    Entry::Compaction(rpi_harness::session::types::CompactionEntry {
         base: base(seq, parent, "compaction"),
         summary: summary.to_string(),
         retained_tail: Vec::new(),
@@ -154,7 +154,7 @@ fn walk_back_picks_valid_cut_near_budget() {
     let r = find_cut_point(&entries, 0, entries.len(), 2500);
     assert!(matches!(entries[r.first_kept_entry_index], Entry::Message(_)));
     let role_ok = match &entries[r.first_kept_entry_index] {
-        Entry::Message(m) => matches!(m.message.role(), pi_agent::message::AgentMessageRole::User | pi_agent::message::AgentMessageRole::Assistant),
+        Entry::Message(m) => matches!(m.message.role(), rpi_agent::message::AgentMessageRole::User | rpi_agent::message::AgentMessageRole::Assistant),
         _ => false,
     };
     assert!(role_ok);
@@ -175,7 +175,7 @@ fn split_turn_when_cut_at_assistant_inside_turn() {
     ];
     let r = find_cut_point(&entries, 0, entries.len(), 3000);
     let cut_is_assistant = match &entries[r.first_kept_entry_index] {
-        Entry::Message(m) => m.message.role() == pi_agent::message::AgentMessageRole::Assistant,
+        Entry::Message(m) => m.message.role() == rpi_agent::message::AgentMessageRole::Assistant,
         _ => false,
     };
     if cut_is_assistant {

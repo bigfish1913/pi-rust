@@ -13,14 +13,14 @@
 //! and the inner role-specific fields survive a round-trip. `Custom` carries a
 //! free-form `data: Value` so each role's structured payload rides along.
 
-use pi_ai::types::{AssistantMessage, Content, Message, ToolResultMessage, UserMessage};
+use rpi_ai::types::{AssistantMessage, Content, Message, ToolResultMessage, UserMessage};
 use serde::{Deserialize, Serialize};
 
 /// `AgentMessage = Message | Custom`. The open-enum port of TS
 /// `AgentMessage = Message | CustomAgentMessages[keyof CustomAgentMessages]`.
 ///
 /// `PartialEq` is derived so `pi-harness` entry equality (and tests) can compare
-/// persisted messages by value. `pi_ai`'s base message types already implement
+/// persisted messages by value. `rpi_ai`'s base message types already implement
 /// `PartialEq`; `CustomMessage` does too, so the four-arm enum derives cleanly.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

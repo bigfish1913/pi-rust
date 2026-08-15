@@ -15,10 +15,10 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use pi_agent::agent_tool::AgentTool;
-use pi_agent::error::AgentError;
-use pi_agent::types::{AgentToolResult, TextContentOrImage, ToolResultPartial};
-use pi_ai::types::Tool;
+use rpi_agent::agent_tool::AgentTool;
+use rpi_agent::error::AgentError;
+use rpi_agent::types::{AgentToolResult, TextContentOrImage, ToolResultPartial};
+use rpi_ai::types::Tool;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
@@ -76,7 +76,7 @@ impl LsTool {
                  or {kb}KB (whichever is hit first).",
                 kb = DEFAULT_MAX_BYTES / 1024
             ),
-            parameters: pi_ai::types::Schema::new(serde_json::to_value(params).unwrap_or_default()),
+            parameters: rpi_ai::types::Schema::new(serde_json::to_value(params).unwrap_or_default()),
             constrained_sampling: None,
         }
     }

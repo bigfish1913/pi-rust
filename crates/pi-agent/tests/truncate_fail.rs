@@ -17,19 +17,19 @@ mod common;
 use std::sync::Arc;
 
 use common::{base_config, run_and_collect, user_message};
-use pi_agent::{AgentContext, AgentEvent, AgentToolResult};
-use pi_ai::types::StopReason;
+use rpi_agent::{AgentContext, AgentEvent, AgentToolResult};
+use rpi_ai::types::StopReason;
 
 /// An echo tool that records every executed `value` — must stay empty on a
 /// truncated turn.
 struct EchoTool {
-    schema: pi_ai::types::Tool,
+    schema: rpi_ai::types::Tool,
     executed: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 #[async_trait::async_trait]
-impl pi_agent::AgentTool for EchoTool {
-    fn schema(&self) -> &pi_ai::types::Tool {
+impl rpi_agent::AgentTool for EchoTool {
+    fn schema(&self) -> &rpi_ai::types::Tool {
         &self.schema
     }
     fn label(&self) -> &str {
@@ -40,8 +40,8 @@ impl pi_agent::AgentTool for EchoTool {
         _tool_call_id: &str,
         params: serde_json::Value,
         _signal: tokio_util::sync::CancellationToken,
-        _on_update: Arc<dyn Fn(pi_agent::ToolResultPartial) + Send + Sync>,
-    ) -> Result<AgentToolResult, pi_agent::AgentError> {
+        _on_update: Arc<dyn Fn(rpi_agent::ToolResultPartial) + Send + Sync>,
+    ) -> Result<AgentToolResult, rpi_agent::AgentError> {
         let value = params
             .get("value")
             .and_then(|v| v.as_str())
@@ -52,11 +52,11 @@ impl pi_agent::AgentTool for EchoTool {
     }
 }
 
-fn echo_schema() -> pi_ai::types::Tool {
-    pi_ai::types::Tool {
+fn echo_schema() -> rpi_ai::types::Tool {
+    rpi_ai::types::Tool {
         name: "echo".to_string(),
         description: "Echo tool".to_string(),
-        parameters: pi_ai::types::Schema::new(serde_json::json!({
+        parameters: rpi_ai::types::Schema::new(serde_json::json!({
             "type": "object",
             "properties": { "value": { "type": "string" } },
             "required": ["value"],
@@ -114,7 +114,7 @@ async fn stop_reason_length_fails_tool_calls_without_executing() {
             .content
             .iter()
             .filter_map(|c| match c {
-                pi_agent::TextContentOrImage::Text(t) => Some(t.text.clone()),
+                rpi_agent::TextContentOrImage::Text(t) => Some(t.text.clone()),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -133,12 +133,12 @@ async fn stop_reason_length_fails_tool_calls_without_executing() {
 }
 
 /// Build the truncated assistant message: one tool call + `stop_reason: Length`.
-fn assistant_message_with_tool_call_and_length() -> pi_ai::types::AssistantMessage {
-    use pi_ai::types::{Api, AssistantMessage, Content, ToolCall, Usage};
+fn assistant_message_with_tool_call_and_length() -> rpi_ai::types::AssistantMessage {
+    use rpi_ai::types::{Api, AssistantMessage, Content, ToolCall, Usage};
     AssistantMessage {
-        role: pi_ai::types::AssistantRole,
+        role: rpi_ai::types::AssistantRole,
         content: vec![Content::ToolCall(ToolCall {
-            kind: pi_ai::types::ToolCallType,
+            kind: rpi_ai::types::ToolCallType,
             id: "tool-1".to_string(),
             name: "echo".to_string(),
             arguments: serde_json::json!({ "value": "hel" }),

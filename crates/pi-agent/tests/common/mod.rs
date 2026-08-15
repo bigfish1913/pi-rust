@@ -14,9 +14,9 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use pi_agent::StreamFn;
-use pi_ai::event_stream::create_assistant_message_event_stream;
-use pi_ai::types::{
+use rpi_agent::StreamFn;
+use rpi_ai::event_stream::create_assistant_message_event_stream;
+use rpi_ai::types::{
     Api, AssistantMessage, AssistantMessageEvent, Content, DoneReason, ErrorReason, Message,
     StopReason, Tool, ToolCall, ToolCallType,
 };
@@ -30,7 +30,7 @@ use pi_ai::types::{
 /// hanging.
 pub fn mock_stream_fn(messages: Vec<AssistantMessage>) -> StreamFn {
     let queue: Arc<Mutex<VecDeque<AssistantMessage>>> = Arc::new(Mutex::new(messages.into()));
-    pi_agent::stream_fn(move |_model, _ctx, _opts| {
+    rpi_agent::stream_fn(move |_model, _ctx, _opts| {
         let (mut prod, stream) = create_assistant_message_event_stream();
         let q = Arc::clone(&queue);
         tokio::spawn(async move {
@@ -86,8 +86,8 @@ fn done_reason_from_stop(stop: StopReason) -> DoneReason {
 }
 
 /// A mock model with the `openai-responses` api (matches the TS `createModel`).
-pub fn mock_model() -> pi_ai::Model {
-    pi_ai::Model::new(
+pub fn mock_model() -> rpi_ai::Model {
+    rpi_ai::Model::new(
         "mock",
         "mock",
         Api::Other("openai-responses".into()),
@@ -97,9 +97,9 @@ pub fn mock_model() -> pi_ai::Model {
 }
 
 /// `createUserMessage(text)` — mirrors the TS helper.
-pub fn user_message(text: impl Into<String>) -> pi_agent::AgentMessage {
-    pi_agent::AgentMessage::User(pi_ai::types::UserMessage::new(
-        pi_ai::types::UserContent::Text(text.into()),
+pub fn user_message(text: impl Into<String>) -> rpi_agent::AgentMessage {
+    rpi_agent::AgentMessage::User(rpi_ai::types::UserMessage::new(
+        rpi_ai::types::UserContent::Text(text.into()),
         0,
     ))
 }
@@ -108,14 +108,14 @@ pub fn user_message(text: impl Into<String>) -> pi_agent::AgentMessage {
 /// `createAssistantMessage([{type:"text",text}])`.
 pub fn assistant_text(text: impl Into<String>, stop: StopReason) -> AssistantMessage {
     AssistantMessage {
-        role: pi_ai::types::AssistantRole,
+        role: rpi_ai::types::AssistantRole,
         content: vec![Content::text(text)],
         api: Api::Other("openai-responses".into()),
         provider: "mock".to_string(),
         model: "mock".to_string(),
         response_model: None,
         response_id: None,
-        usage: pi_ai::types::Usage::zero(),
+        usage: rpi_ai::types::Usage::zero(),
         stop_reason: stop,
         deferred: None,
         error_message: None,
@@ -145,14 +145,14 @@ pub fn assistant_tool_calls(
         })
         .collect();
     AssistantMessage {
-        role: pi_ai::types::AssistantRole,
+        role: rpi_ai::types::AssistantRole,
         content,
         api: Api::Other("openai-responses".into()),
         provider: "mock".to_string(),
         model: "mock".to_string(),
         response_model: None,
         response_id: None,
-        usage: pi_ai::types::Usage::zero(),
+        usage: rpi_ai::types::Usage::zero(),
         stop_reason: stop,
         deferred: None,
         error_message: None,
@@ -166,16 +166,16 @@ pub fn assistant_tool_calls(
 /// drop `custom`. Mirrors TS `identityConverter`. Returns the `ConvertToLlm`
 /// Arc shape the loop config expects.
 pub fn identity_converter(
-) -> Arc<dyn Fn(Vec<pi_agent::AgentMessage>) -> futures::future::BoxFuture<'static, Vec<Message>> + Send + Sync>
+) -> Arc<dyn Fn(Vec<rpi_agent::AgentMessage>) -> futures::future::BoxFuture<'static, Vec<Message>> + Send + Sync>
 {
-    Arc::new(|messages: Vec<pi_agent::AgentMessage>| {
+    Arc::new(|messages: Vec<rpi_agent::AgentMessage>| {
         let out: Vec<Message> = messages
             .into_iter()
             .filter_map(|m| match m {
-                pi_agent::AgentMessage::User(u) => Some(Message::User(u)),
-                pi_agent::AgentMessage::Assistant(a) => Some(Message::Assistant(a)),
-                pi_agent::AgentMessage::ToolResult(t) => Some(Message::ToolResult(t)),
-                pi_agent::AgentMessage::Custom(_) => None,
+                rpi_agent::AgentMessage::User(u) => Some(Message::User(u)),
+                rpi_agent::AgentMessage::Assistant(a) => Some(Message::Assistant(a)),
+                rpi_agent::AgentMessage::ToolResult(t) => Some(Message::ToolResult(t)),
+                rpi_agent::AgentMessage::Custom(_) => None,
             })
             .collect();
         Box::pin(async move { out })
@@ -184,15 +184,15 @@ pub fn identity_converter(
 
 /// A minimal config with the identity converter + the mock model. Mirrors the
 /// TS `{ model: createModel(), convertToLlm: identityConverter }` baseline.
-pub fn base_config() -> pi_agent::AgentLoopConfig {
+pub fn base_config() -> rpi_agent::AgentLoopConfig {
     loop_config_with_converter(identity_converter())
 }
 
 /// Build a config with a specific converter + mock model.
 pub fn loop_config_with_converter(
-    convert_to_llm: pi_agent::ConvertToLlm,
-) -> pi_agent::AgentLoopConfig {
-    pi_agent::AgentLoopConfig {
+    convert_to_llm: rpi_agent::ConvertToLlm,
+) -> rpi_agent::AgentLoopConfig {
+    rpi_agent::AgentLoopConfig {
         model: mock_model(),
         convert_to_llm,
         transform_context: None,
@@ -203,20 +203,20 @@ pub fn loop_config_with_converter(
         get_follow_up_messages: None,
         before_tool_call: None,
         after_tool_call: None,
-        tool_execution: pi_agent::ToolExecutionMode::Parallel,
-        thinking_level: pi_ai::types::ThinkingLevel::Off,
+        tool_execution: rpi_agent::ToolExecutionMode::Parallel,
+        thinking_level: rpi_ai::types::ThinkingLevel::Off,
         api_key: None,
         timeout: None,
         max_retries: None,
         max_retry_delay: None,
-        cache_retention: pi_ai::provider::CacheRetention::default(),
+        cache_retention: rpi_ai::provider::CacheRetention::default(),
         session_id: None,
         signal: tokio_util::sync::CancellationToken::new(),
     }
 }
 
 /// Extract the text content of a `ToolResultMessage`.
-pub fn tool_result_text(trm: &pi_ai::types::ToolResultMessage) -> String {
+pub fn tool_result_text(trm: &rpi_ai::types::ToolResultMessage) -> String {
     trm.content
         .iter()
         .filter_map(|c| match c {
@@ -230,15 +230,15 @@ pub fn tool_result_text(trm: &pi_ai::types::ToolResultMessage) -> String {
 /// Collect every event from a completed `run_agent_loop` into a `Vec`. Drains
 /// the collector's buffer after the run settles.
 pub async fn run_and_collect(
-    prompts: Vec<pi_agent::AgentMessage>,
-    context: pi_agent::AgentContext,
-    config: pi_agent::AgentLoopConfig,
+    prompts: Vec<rpi_agent::AgentMessage>,
+    context: rpi_agent::AgentContext,
+    config: rpi_agent::AgentLoopConfig,
     stream_fn: StreamFn,
-) -> (Vec<pi_agent::AgentEvent>, Vec<pi_agent::AgentMessage>) {
-    let (collector, events) = pi_agent::CollectorEmitter::new();
-    let emit: Arc<dyn pi_agent::AgentEmitter> = Arc::new(collector);
+) -> (Vec<rpi_agent::AgentEvent>, Vec<rpi_agent::AgentMessage>) {
+    let (collector, events) = rpi_agent::CollectorEmitter::new();
+    let emit: Arc<dyn rpi_agent::AgentEmitter> = Arc::new(collector);
     let new_messages =
-        pi_agent::run_agent_loop(prompts, context, config, emit, stream_fn)
+        rpi_agent::run_agent_loop(prompts, context, config, emit, stream_fn)
             .await
             .expect("run_agent_loop failed");
     let events = events.lock().expect("events lock").clone();
@@ -247,16 +247,16 @@ pub async fn run_and_collect(
 
 /// Map an `AgentEvent` to its `type` tag — the Rust equivalent of the TS
 /// `events.map((e) => e.type)`.
-pub fn type_tags(events: &[pi_agent::AgentEvent]) -> Vec<&'static str> {
+pub fn type_tags(events: &[rpi_agent::AgentEvent]) -> Vec<&'static str> {
     events.iter().map(|e| e.type_tag()).collect()
 }
 
 /// Pull the `tool_call_id`s of every `ToolExecutionEnd`, in emit order.
-pub fn tool_execution_end_ids(events: &[pi_agent::AgentEvent]) -> Vec<String> {
+pub fn tool_execution_end_ids(events: &[rpi_agent::AgentEvent]) -> Vec<String> {
     events
         .iter()
         .filter_map(|e| match e {
-            pi_agent::AgentEvent::ToolExecutionEnd { tool_call_id, .. } => {
+            rpi_agent::AgentEvent::ToolExecutionEnd { tool_call_id, .. } => {
                 Some(tool_call_id.clone())
             }
             _ => None,
@@ -266,12 +266,12 @@ pub fn tool_execution_end_ids(events: &[pi_agent::AgentEvent]) -> Vec<String> {
 
 /// Pull the `tool_call_id`s of every `MessageEnd` whose payload is a
 /// `toolResult` message, in emit (source/ordinal) order.
-pub fn tool_result_message_ids(events: &[pi_agent::AgentEvent]) -> Vec<String> {
+pub fn tool_result_message_ids(events: &[rpi_agent::AgentEvent]) -> Vec<String> {
     events
         .iter()
         .filter_map(|e| match e {
-            pi_agent::AgentEvent::MessageEnd { message } => match message {
-                pi_agent::AgentMessage::ToolResult(t) => Some(t.tool_call_id.clone()),
+            rpi_agent::AgentEvent::MessageEnd { message } => match message {
+                rpi_agent::AgentMessage::ToolResult(t) => Some(t.tool_call_id.clone()),
                 _ => None,
             },
             _ => None,
@@ -282,7 +282,7 @@ pub fn tool_result_message_ids(events: &[pi_agent::AgentEvent]) -> Vec<String> {
 // Suppress unused-import warnings for symbols re-exported only for test
 // convenience; they're referenced indirectly through the helper fns above.
 #[allow(unused_imports)]
-use pi_ai::types::Tool as _ToolUnused;
+use rpi_ai::types::Tool as _ToolUnused;
 
 /// A canned tool-definition builder used by the test-doubled `AgentTool`
 /// implementations: `Object { value: String }`. Mirrors the TS
@@ -299,7 +299,7 @@ pub fn value_string_schema() -> Tool {
     Tool {
         name: "unused".to_string(),
         description: String::new(),
-        parameters: pi_ai::types::Schema::new(schema),
+        parameters: rpi_ai::types::Schema::new(schema),
         constrained_sampling: None,
     }
 }

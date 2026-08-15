@@ -6,7 +6,7 @@
 //! [`crate::message`]). Everything else here is a straight port of the TS
 //! interfaces, adapted to Rust ownership/async idioms.
 
-use pi_ai::types::{AssistantMessage, ImageContent, TextContent, ToolResultMessage, Usage};
+use rpi_ai::types::{AssistantMessage, ImageContent, TextContent, ToolResultMessage, Usage};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -56,7 +56,7 @@ pub enum TextContentOrImage {
 impl TextContentOrImage {
     pub fn text<S: Into<String>>(s: S) -> Self {
         TextContentOrImage::Text(TextContent {
-            kind: pi_ai::types::TextContentType,
+            kind: rpi_ai::types::TextContentType,
             text: s.into(),
             text_signature: None,
         })
@@ -81,12 +81,12 @@ impl AgentToolResult {
         Self::text(message)
     }
 
-    pub fn into_content(self) -> Vec<pi_ai::types::Content> {
+    pub fn into_content(self) -> Vec<rpi_ai::types::Content> {
         self.content
             .into_iter()
             .map(|c| match c {
-                TextContentOrImage::Text(t) => pi_ai::types::Content::Text(t),
-                TextContentOrImage::Image(i) => pi_ai::types::Content::Image(i),
+                TextContentOrImage::Text(t) => rpi_ai::types::Content::Text(t),
+                TextContentOrImage::Image(i) => rpi_ai::types::Content::Image(i),
             })
             .collect()
     }
@@ -136,7 +136,7 @@ pub struct AfterToolCallResult {
 /// Context passed to `before_tool_call`. Mirrors TS `BeforeToolCallContext`.
 pub struct BeforeToolCallContext<'a> {
     pub assistant_message: &'a AssistantMessage,
-    pub tool_call: &'a pi_ai::types::ToolCall,
+    pub tool_call: &'a rpi_ai::types::ToolCall,
     pub args: &'a serde_json::Value,
     pub context: &'a AgentContext,
 }
@@ -144,7 +144,7 @@ pub struct BeforeToolCallContext<'a> {
 /// Context passed to `after_tool_call`. Mirrors TS `AfterToolCallContext`.
 pub struct AfterToolCallContext<'a> {
     pub assistant_message: &'a AssistantMessage,
-    pub tool_call: &'a pi_ai::types::ToolCall,
+    pub tool_call: &'a rpi_ai::types::ToolCall,
     pub args: &'a serde_json::Value,
     pub result: &'a AgentToolResult,
     pub is_error: bool,
@@ -192,8 +192,8 @@ impl AgentContext {
 #[derive(Debug, Clone, Default)]
 pub struct AgentLoopTurnUpdate {
     pub context: Option<AgentContext>,
-    pub model: Option<pi_ai::model::Model>,
-    pub thinking_level: Option<pi_ai::types::ThinkingLevel>,
+    pub model: Option<rpi_ai::model::Model>,
+    pub thinking_level: Option<rpi_ai::types::ThinkingLevel>,
 }
 
 /// Public agent state snapshot. Mirrors TS `AgentState` (the readable subset).
@@ -201,8 +201,8 @@ pub struct AgentLoopTurnUpdate {
 #[derive(Clone)]
 pub struct AgentState {
     pub system_prompt: String,
-    pub model: pi_ai::model::Model,
-    pub thinking_level: pi_ai::types::ThinkingLevel,
+    pub model: rpi_ai::model::Model,
+    pub thinking_level: rpi_ai::types::ThinkingLevel,
     pub tools: Vec<Arc<dyn crate::agent_tool::AgentTool>>,
     pub messages: Vec<AgentMessage>,
     pub is_streaming: bool,
@@ -232,7 +232,7 @@ impl Default for AgentState {
         Self {
             system_prompt: String::new(),
             model: default_model(),
-            thinking_level: pi_ai::types::ThinkingLevel::Off,
+            thinking_level: rpi_ai::types::ThinkingLevel::Off,
             tools: Vec::new(),
             messages: Vec::new(),
             is_streaming: false,
@@ -244,6 +244,6 @@ impl Default for AgentState {
 }
 
 /// The placeholder model used when none is configured. Mirrors TS `DEFAULT_MODEL`.
-pub(crate) fn default_model() -> pi_ai::model::Model {
-    pi_ai::model::Model::new("unknown", "unknown", pi_ai::types::Api::Other("unknown".into()), "unknown", "")
+pub(crate) fn default_model() -> rpi_ai::model::Model {
+    rpi_ai::model::Model::new("unknown", "unknown", rpi_ai::types::Api::Other("unknown".into()), "unknown", "")
 }

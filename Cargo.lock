@@ -873,8 +873,8 @@ name = "minimal"
 version = "0.1.0"
 dependencies = [
  "futures",
- "pi-agent",
- "pi-ai",
+ "rpi-agent",
+ "rpi-ai",
  "tokio",
 ]
 
@@ -1056,121 +1056,6 @@ name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
-
-[[package]]
-name = "pi-agent"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "futures",
- "pi-ai",
- "pi-telemetry",
- "schemars",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "pi-ai"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base64",
- "bytes",
- "eventsource-stream",
- "futures",
- "jsonschema",
- "pi-telemetry",
- "reqwest",
- "schemars",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "pi-cli"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "futures",
- "pi-agent",
- "pi-ai",
- "pi-harness",
- "pi-telemetry",
- "pi-tools",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "pi-harness"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "futures",
- "pi-agent",
- "pi-ai",
- "pi-telemetry",
- "pi-tools",
- "schemars",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "pi-telemetry"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "tokio",
-]
-
-[[package]]
-name = "pi-tools"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base64",
- "dirs",
- "futures",
- "globset",
- "nix",
- "pi-agent",
- "pi-ai",
- "regex",
- "schemars",
- "serde",
- "serde_json",
- "similar",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
- "tracing",
- "unicode-normalization",
- "uuid",
- "windows-sys 0.59.0",
-]
 
 [[package]]
 name = "pin-project-lite"
@@ -1408,6 +1293,121 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "rpi-agent"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "rpi-ai",
+ "rpi-telemetry",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "rpi-ai"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "bytes",
+ "eventsource-stream",
+ "futures",
+ "jsonschema",
+ "reqwest",
+ "rpi-telemetry",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "rpi-cli"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "reqwest",
+ "rpi-agent",
+ "rpi-ai",
+ "rpi-harness",
+ "rpi-telemetry",
+ "rpi-tools",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "rpi-harness"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "rpi-agent",
+ "rpi-ai",
+ "rpi-telemetry",
+ "rpi-tools",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "rpi-telemetry"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "tokio",
+]
+
+[[package]]
+name = "rpi-tools"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "dirs",
+ "futures",
+ "globset",
+ "nix",
+ "regex",
+ "rpi-agent",
+ "rpi-ai",
+ "schemars",
+ "serde",
+ "serde_json",
+ "similar",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "unicode-normalization",
+ "uuid",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1842,9 +1842,9 @@ name = "tools-example"
 version = "0.1.0"
 dependencies = [
  "futures",
- "pi-agent",
- "pi-ai",
- "pi-tools",
+ "rpi-agent",
+ "rpi-ai",
+ "rpi-tools",
  "serde_json",
  "tokio",
 ]

@@ -10,9 +10,9 @@
 
 use std::collections::BTreeSet;
 
-use pi_ai::types::{Content, Context, Message, StopReason, Usage, UserContent, UserMessage};
-use pi_ai::ThinkingLevel;
-use pi_agent::message::AgentMessage;
+use rpi_ai::types::{Content, Context, Message, StopReason, Usage, UserContent, UserMessage};
+use rpi_ai::ThinkingLevel;
+use rpi_agent::message::AgentMessage;
 use serde::{Deserialize, Serialize};
 
 use crate::compaction::compaction::{
@@ -105,7 +105,7 @@ impl Default for GenerateBranchSummaryOptions {
 fn get_message_from_entry(entry: &Entry) -> Option<AgentMessage> {
     match entry {
         Entry::Message(m) => {
-            if matches!(m.message.role(), pi_agent::message::AgentMessageRole::ToolResult) {
+            if matches!(m.message.role(), rpi_agent::message::AgentMessageRole::ToolResult) {
                 return None;
             }
             Some(m.message.clone())
@@ -300,7 +300,7 @@ pub async fn generate_branch_summary(
         tools: Vec::new(),
     };
 
-    let mut req_opts = pi_ai::SimpleStreamOptions::default();
+    let mut req_opts = rpi_ai::SimpleStreamOptions::default();
     req_opts.api_key = options.llm.api_key.clone();
     req_opts.signal = options.llm.signal.clone();
     req_opts.max_tokens = Some(2048);

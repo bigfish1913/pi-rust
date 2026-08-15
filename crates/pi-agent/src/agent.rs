@@ -22,8 +22,8 @@ use crate::queue::PendingMessageQueue;
 use crate::stream_fn::{get_default_stream_fn, StreamFn};
 use crate::types::{AgentContext, AgentState, QueueMode, ToolExecutionMode};
 
-use pi_ai::types::{UserContent, UserMessage};
-use pi_ai::Model;
+use rpi_ai::types::{UserContent, UserMessage};
+use rpi_ai::Model;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, Notify};
@@ -37,7 +37,7 @@ pub struct AgentOptions {
     pub initial_state: Option<InitialState>,
     pub convert_to_llm: Option<ConvertToLlm>,
     pub stream_fn: Option<StreamFn>,
-    pub thinking_level: Option<pi_ai::types::ThinkingLevel>,
+    pub thinking_level: Option<rpi_ai::types::ThinkingLevel>,
     pub queue_mode: Option<QueueMode>,
     pub follow_up_mode: Option<QueueMode>,
     pub tool_execution: Option<ToolExecutionMode>,
@@ -49,7 +49,7 @@ pub struct AgentOptions {
 pub struct InitialState {
     pub system_prompt: Option<String>,
     pub model: Option<Model>,
-    pub thinking_level: Option<pi_ai::types::ThinkingLevel>,
+    pub thinking_level: Option<rpi_ai::types::ThinkingLevel>,
     pub tools: Option<Vec<Arc<dyn crate::agent_tool::AgentTool>>>,
     pub messages: Option<Vec<AgentMessage>>,
 }
@@ -58,7 +58,7 @@ pub struct InitialState {
 struct MutableAgentState {
     system_prompt: String,
     model: Model,
-    thinking_level: pi_ai::types::ThinkingLevel,
+    thinking_level: rpi_ai::types::ThinkingLevel,
     tools: Vec<Arc<dyn crate::agent_tool::AgentTool>>,
     messages: Vec<AgentMessage>,
     is_streaming: bool,
@@ -193,7 +193,7 @@ impl AgentBuilder {
         self
     }
 
-    pub fn thinking_level(mut self, level: pi_ai::types::ThinkingLevel) -> Self {
+    pub fn thinking_level(mut self, level: rpi_ai::types::ThinkingLevel) -> Self {
         self.opts
             .initial_state
             .get_or_insert_with(InitialState::default)
@@ -261,7 +261,7 @@ impl AgentBuilder {
             .opts
             .thinking_level
             .or(initial.thinking_level)
-            .unwrap_or(pi_ai::types::ThinkingLevel::Off);
+            .unwrap_or(rpi_ai::types::ThinkingLevel::Off);
         let convert_to_llm = self.opts.convert_to_llm.unwrap_or_else(default_convert_to_llm_fn);
 
         let state = MutableAgentState {
@@ -517,7 +517,7 @@ impl Agent {
             timeout: None,
             max_retries: None,
             max_retry_delay: None,
-            cache_retention: pi_ai::provider::CacheRetention::default(),
+            cache_retention: rpi_ai::provider::CacheRetention::default(),
             session_id: self.inner.session_id.clone(),
             signal,
         }
@@ -559,10 +559,10 @@ impl Agent {
 }
 
 fn default_model() -> Model {
-    pi_ai::model::Model::new(
+    rpi_ai::model::Model::new(
         "unknown",
         "unknown",
-        pi_ai::types::Api::Other("unknown".into()),
+        rpi_ai::types::Api::Other("unknown".into()),
         "unknown",
         "",
     )
@@ -577,9 +577,9 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pi_ai::event_stream::create_assistant_message_event_stream;
-    use pi_ai::providers::faux::{FauxScript, FauxProvider};
-    use pi_ai::provider::Provider;
+    use rpi_ai::event_stream::create_assistant_message_event_stream;
+    use rpi_ai::providers::faux::{FauxScript, FauxProvider};
+    use rpi_ai::provider::Provider;
 
     fn faux_stream_fn(provider: Arc<FauxProvider>) -> StreamFn {
         crate::stream_fn::stream_fn(move |model, ctx, opts| {

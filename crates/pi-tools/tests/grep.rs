@@ -6,16 +6,16 @@
 
 use std::sync::Arc;
 
-use pi_agent::agent_tool::AgentTool;
-use pi_agent::error::AgentError;
-use pi_tools::{ExecutionToolContext, FileSystem, InMemoryExecutionEnv};
+use rpi_agent::agent_tool::AgentTool;
+use rpi_agent::error::AgentError;
+use rpi_tools::{ExecutionToolContext, FileSystem, InMemoryExecutionEnv};
 use tokio_util::sync::CancellationToken;
 
 /// Build a fresh in-memory tool context rooted at `/tmp/work`.
-fn fresh_context() -> (Arc<InMemoryExecutionEnv>, pi_tools::ExecutionToolContext) {
+fn fresh_context() -> (Arc<InMemoryExecutionEnv>, rpi_tools::ExecutionToolContext) {
     let env = Arc::new(InMemoryExecutionEnv::with_cwd("/tmp/work".into()));
-    let env_dyn: Arc<dyn pi_tools::ExecutionEnv> = env.clone();
-    let mut_env: Arc<dyn pi_tools::MutatingEnv> = env.clone();
+    let env_dyn: Arc<dyn rpi_tools::ExecutionEnv> = env.clone();
+    let mut_env: Arc<dyn rpi_tools::MutatingEnv> = env.clone();
     let ctx = ExecutionToolContext::new(env_dyn, Some(mut_env));
     (env, ctx)
 }
@@ -28,8 +28,8 @@ async fn seed(env: &InMemoryExecutionEnv, rel: &str, bytes: Vec<u8>) {
     env.seed_file(&abs.to_string_lossy(), bytes).await;
 }
 
-fn text_output(r: &pi_agent::types::AgentToolResult) -> String {
-    use pi_agent::types::TextContentOrImage;
+fn text_output(r: &rpi_agent::types::AgentToolResult) -> String {
+    use rpi_agent::types::TextContentOrImage;
     r.content
         .iter()
         .filter_map(|c| match c {
@@ -43,7 +43,7 @@ fn text_output(r: &pi_agent::types::AgentToolResult) -> String {
 async fn run_grep(
     tool: Arc<dyn AgentTool>,
     params: serde_json::Value,
-) -> Result<pi_agent::types::AgentToolResult, AgentError> {
+) -> Result<rpi_agent::types::AgentToolResult, AgentError> {
     let signal = CancellationToken::new();
     let on_update = Arc::new(|_p| ());
     tool.execute("grep-1", params, signal, on_update).await
@@ -55,7 +55,7 @@ async fn grep_pattern_match_format() {
     seed(&env, "a.txt", b"foo\nbar\nbaz\n".to_vec()).await;
     seed(&env, "b.txt", b"hello bar world\n".to_vec()).await;
 
-    let tool = pi_tools::create_grep_tool(&ctx, None);
+    let tool = rpi_tools::create_grep_tool(&ctx, None);
     let result = run_grep(tool, serde_json::json!({ "pattern": "bar", "path": "." }))
         .await
         .expect("grep ok");
@@ -69,7 +69,7 @@ async fn grep_pattern_match_format() {
 async fn grep_regex_match() {
     let (env, ctx) = fresh_context();
     seed(&env, "nums.txt", b"val=123\nval=456\nother\n".to_vec()).await;
-    let tool = pi_tools::create_grep_tool(&ctx, None);
+    let tool = rpi_tools::create_grep_tool(&ctx, None);
     let result = run_grep(tool, serde_json::json!({ "pattern": "val=\\d+", "path": "nums.txt" }))
         .await
         .expect("grep ok");
@@ -83,7 +83,7 @@ async fn grep_regex_match() {
 async fn grep_literal_escapes_regex() {
     let (env, ctx) = fresh_context();
     seed(&env, "lit.txt", b"1+1=2\n2+2=4\n".to_vec()).await;
-    let tool = pi_tools::create_grep_tool(&ctx, None);
+    let tool = rpi_tools::create_grep_tool(&ctx, None);
     // Literal `1+1` — the `+` must not act as a regex quantifier.
     let result = run_grep(
         tool,
@@ -100,7 +100,7 @@ async fn grep_literal_escapes_regex() {
 async fn grep_ignore_case() {
     let (env, ctx) = fresh_context();
     seed(&env, "c.txt", b"Hello\nHELLO\nworld\n".to_vec()).await;
-    let tool = pi_tools::create_grep_tool(&ctx, None);
+    let tool = rpi_tools::create_grep_tool(&ctx, None);
     let result = run_grep(
         tool,
         serde_json::json!({ "pattern": "hello", "path": "c.txt", "ignoreCase": true }),
@@ -117,7 +117,7 @@ async fn grep_ignore_case() {
 async fn grep_no_matches() {
     let (env, ctx) = fresh_context();
     seed(&env, "x.txt", b"alpha\nbeta\n".to_vec()).await;
-    let tool = pi_tools::create_grep_tool(&ctx, None);
+    let tool = rpi_tools::create_grep_tool(&ctx, None);
     let result = run_grep(tool, serde_json::json!({ "pattern": "zzz", "path": "x.txt" }))
         .await
         .expect("grep ok");
@@ -130,7 +130,7 @@ async fn grep_match_limit() {
     // 5 match lines; limit to 2.
     let body: String = (0..5).map(|_| "match").collect::<Vec<_>>().join("\n") + "\n";
     seed(&env, "many.txt", body.into_bytes()).await;
-    let tool = pi_tools::create_grep_tool(&ctx, None);
+    let tool = rpi_tools::create_grep_tool(&ctx, None);
     let result = run_grep(
         tool,
         serde_json::json!({ "pattern": "match", "path": "many.txt", "limit": 2 }),
@@ -150,7 +150,7 @@ async fn grep_match_limit() {
 async fn grep_context_lines_use_dash_separator() {
     let (env, ctx) = fresh_context();
     seed(&env, "ctx.txt", b"l1\nl2 MATCH\nl3\nl4\n".to_vec()).await;
-    let tool = pi_tools::create_grep_tool(&ctx, None);
+    let tool = rpi_tools::create_grep_tool(&ctx, None);
     let result = run_grep(
         tool,
         serde_json::json!({ "pattern": "MATCH", "path": "ctx.txt", "context": 1 }),
@@ -171,7 +171,7 @@ async fn grep_truncates_long_line() {
     let long_line: String = "x".repeat(600);
     let body = format!("nomatch\n{long_line}\n");
     seed(&env, "long.txt", body.into_bytes()).await;
-    let tool = pi_tools::create_grep_tool(&ctx, None);
+    let tool = rpi_tools::create_grep_tool(&ctx, None);
     let result = run_grep(tool, serde_json::json!({ "pattern": "x", "path": "long.txt" }))
         .await
         .expect("grep ok");
@@ -184,7 +184,7 @@ async fn grep_truncates_long_line() {
 async fn grep_invalid_regex_errors() {
     let (env, ctx) = fresh_context();
     seed(&env, "e.txt", b"x\n".to_vec()).await;
-    let tool = pi_tools::create_grep_tool(&ctx, None);
+    let tool = rpi_tools::create_grep_tool(&ctx, None);
     let err = run_grep(tool, serde_json::json!({ "pattern": "(unclosed", "path": "e.txt" }))
         .await
         .expect_err("bad regex should fail");
@@ -196,7 +196,7 @@ async fn grep_glob_filter() {
     let (env, ctx) = fresh_context();
     seed(&env, "keep.ts", b"target\ntext\n".to_vec()).await;
     seed(&env, "skip.txt", b"target\n".to_vec()).await;
-    let tool = pi_tools::create_grep_tool(&ctx, None);
+    let tool = rpi_tools::create_grep_tool(&ctx, None);
     // `*.ts` basename glob → only keep.ts is searched.
     let result = run_grep(
         tool,

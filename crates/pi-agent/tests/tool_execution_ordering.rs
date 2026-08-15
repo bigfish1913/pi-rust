@@ -19,9 +19,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use common::{base_config, run_and_collect, user_message};
-use pi_agent::{AgentContext, AgentEvent, ToolExecutionMode};
-use pi_ai::event_stream::create_assistant_message_event_stream;
-use pi_ai::types::{AssistantMessage, AssistantMessageEvent, DoneReason, StopReason};
+use rpi_agent::{AgentContext, AgentEvent, ToolExecutionMode};
+use rpi_ai::event_stream::create_assistant_message_event_stream;
+use rpi_ai::types::{AssistantMessage, AssistantMessageEvent, DoneReason, StopReason};
 use tokio::sync::Notify;
 
 /// Shared coordination state for the two-call parallel batch.
@@ -39,13 +39,13 @@ struct Coord {
 /// for `value == "second"` it sets `parallel_observed` if `first` hasn't
 /// resolved yet.
 struct EchoTool {
-    schema: pi_ai::types::Tool,
+    schema: rpi_ai::types::Tool,
     coord: Coord,
 }
 
 #[async_trait::async_trait]
-impl pi_agent::AgentTool for EchoTool {
-    fn schema(&self) -> &pi_ai::types::Tool {
+impl rpi_agent::AgentTool for EchoTool {
+    fn schema(&self) -> &rpi_ai::types::Tool {
         &self.schema
     }
     fn label(&self) -> &str {
@@ -59,8 +59,8 @@ impl pi_agent::AgentTool for EchoTool {
         _tool_call_id: &str,
         params: serde_json::Value,
         _signal: tokio_util::sync::CancellationToken,
-        _on_update: Arc<dyn Fn(pi_agent::ToolResultPartial) + Send + Sync>,
-    ) -> Result<pi_agent::AgentToolResult, pi_agent::AgentError> {
+        _on_update: Arc<dyn Fn(rpi_agent::ToolResultPartial) + Send + Sync>,
+    ) -> Result<rpi_agent::AgentToolResult, rpi_agent::AgentError> {
         let value = params
             .get("value")
             .and_then(|v| v.as_str())
@@ -74,15 +74,15 @@ impl pi_agent::AgentTool for EchoTool {
         if value == "second" && !self.coord.first_resolved.load(Ordering::SeqCst) {
             self.coord.parallel_observed.store(true, Ordering::SeqCst);
         }
-        Ok(pi_agent::AgentToolResult::text(format!("echoed: {value}")))
+        Ok(rpi_agent::AgentToolResult::text(format!("echoed: {value}")))
     }
 }
 
-fn echo_schema() -> pi_ai::types::Tool {
-    pi_ai::types::Tool {
+fn echo_schema() -> rpi_ai::types::Tool {
+    rpi_ai::types::Tool {
         name: "echo".to_string(),
         description: "Echo tool".to_string(),
-        parameters: pi_ai::types::Schema::new(serde_json::json!({
+        parameters: rpi_ai::types::Schema::new(serde_json::json!({
             "type": "object",
             "properties": { "value": { "type": "string" } },
             "required": ["value"],
@@ -96,7 +96,7 @@ fn echo_schema() -> pi_ai::types::Tool {
 /// calls (`toolUse`), then 20ms later releases `tool-1`; call 2 → text "done"
 /// (`stop`). The script is shared via `Arc<Mutex<VecDeque>>` so a `Fn` closure
 /// (not `FnMut`) can shift one message per call.
-fn two_call_stream_fn(release: Arc<Notify>) -> pi_agent::StreamFn {
+fn two_call_stream_fn(release: Arc<Notify>) -> rpi_agent::StreamFn {
     use std::collections::VecDeque;
     // The script is dequeued FRONT-FIRST: call 1 first (tool calls), then
     // call 2 (text "done").
@@ -104,14 +104,14 @@ fn two_call_stream_fn(release: Arc<Notify>) -> pi_agent::StreamFn {
         Arc::new(std::sync::Mutex::new(VecDeque::from(vec![
             assistant_two_tool_calls(),
             AssistantMessage {
-                role: pi_ai::types::AssistantRole,
-                content: vec![pi_ai::types::Content::text("done")],
-                api: pi_ai::types::Api::Other("openai-responses".into()),
+                role: rpi_ai::types::AssistantRole,
+                content: vec![rpi_ai::types::Content::text("done")],
+                api: rpi_ai::types::Api::Other("openai-responses".into()),
                 provider: "mock".to_string(),
                 model: "mock".to_string(),
                 response_model: None,
                 response_id: None,
-                usage: pi_ai::types::Usage::zero(),
+                usage: rpi_ai::types::Usage::zero(),
                 stop_reason: StopReason::Stop,
                 deferred: None,
                 error_message: None,
@@ -120,7 +120,7 @@ fn two_call_stream_fn(release: Arc<Notify>) -> pi_agent::StreamFn {
                 timestamp: 0,
             },
         ])));
-    pi_agent::stream_fn(move |_model, _ctx, _opts| {
+    rpi_agent::stream_fn(move |_model, _ctx, _opts| {
         let (mut prod, stream) = create_assistant_message_event_stream();
         let next = script.lock().expect("script lock").pop_front();
         let release = Arc::clone(&release);
@@ -129,7 +129,7 @@ fn two_call_stream_fn(release: Arc<Notify>) -> pi_agent::StreamFn {
                 Some(m) => m,
                 None => {
                     let err = AssistantMessage::terminal(
-                        pi_ai::types::Api::Other("mock".into()),
+                        rpi_ai::types::Api::Other("mock".into()),
                         "mock",
                         "mock",
                         StopReason::Error,
@@ -137,7 +137,7 @@ fn two_call_stream_fn(release: Arc<Notify>) -> pi_agent::StreamFn {
                         0,
                     );
                     prod.push(AssistantMessageEvent::Error {
-                        reason: pi_ai::types::ErrorReason::Error,
+                        reason: rpi_ai::types::ErrorReason::Error,
                         error: err,
                     });
                     return;
@@ -165,25 +165,25 @@ fn two_call_stream_fn(release: Arc<Notify>) -> pi_agent::StreamFn {
 
 fn assistant_two_tool_calls() -> AssistantMessage {
     AssistantMessage {
-        role: pi_ai::types::AssistantRole,
+        role: rpi_ai::types::AssistantRole,
         content: vec![
-            pi_ai::types::Content::tool_call(
+            rpi_ai::types::Content::tool_call(
                 "tool-1",
                 "echo",
                 serde_json::json!({ "value": "first" }),
             ),
-            pi_ai::types::Content::tool_call(
+            rpi_ai::types::Content::tool_call(
                 "tool-2",
                 "echo",
                 serde_json::json!({ "value": "second" }),
             ),
         ],
-        api: pi_ai::types::Api::Other("openai-responses".into()),
+        api: rpi_ai::types::Api::Other("openai-responses".into()),
         provider: "mock".to_string(),
         model: "mock".to_string(),
         response_model: None,
         response_id: None,
-        usage: pi_ai::types::Usage::zero(),
+        usage: rpi_ai::types::Usage::zero(),
         stop_reason: StopReason::ToolUse,
         deferred: None,
         error_message: None,
@@ -210,7 +210,7 @@ fn tool_result_message_ids(events: &[AgentEvent]) -> Vec<String> {
         .iter()
         .filter_map(|e| match e {
             AgentEvent::MessageEnd { message } => match message {
-                pi_agent::AgentMessage::ToolResult(t) => Some(t.tool_call_id.clone()),
+                rpi_agent::AgentMessage::ToolResult(t) => Some(t.tool_call_id.clone()),
                 _ => None,
             },
             _ => None,

@@ -1,19 +1,19 @@
 [package]
-name = "pi-tools"
+name = "rpi-tools"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 version.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Built-in agent tools (read/write/edit/bash/grep/find/ls) + ExecutionEnv, port of pi harness tools"
+description = "Built-in agent tools (read/write/edit/bash/grep/find/ls) + ExecutionEnv, Rust port of pi harness tools"
 readme = "../../README.md"
 keywords = ["agent", "llm", "ai", "claude", "tools"]
 categories = ["api-bindings", "asynchronous", "development-tools"]
 
 [dependencies]
-pi-agent = { workspace = true }
-pi-ai = { workspace = true }
+rpi-agent = { workspace = true }
+rpi-ai = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }

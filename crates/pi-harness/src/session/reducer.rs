@@ -33,7 +33,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use pi_ai::types::{Content, StopReason};
+use rpi_ai::types::{Content, StopReason};
 
 use crate::session::types::{
     Entry, LaneRecord, OperationIntent, OperationStartedRecord, ProvisionedEntryJSON,
@@ -491,7 +491,7 @@ fn validate_tool_start(
     let tool_call = match assistant_entry {
         Some(Entry::Message(m)) if m.message.is_assistant() => {
             let asst = match &m.message {
-                pi_agent::message::AgentMessage::Assistant(a) => Some(a.as_ref()),
+                rpi_agent::message::AgentMessage::Assistant(a) => Some(a.as_ref()),
                 _ => None,
             };
             match asst {
@@ -533,7 +533,7 @@ fn validate_tool_start(
 fn is_tool_result_for(entry: &Entry, tool_call_id: &str, tool_name: &str) -> bool {
     match entry {
         Entry::Message(m) => match &m.message {
-            pi_agent::message::AgentMessage::ToolResult(tr) => {
+            rpi_agent::message::AgentMessage::ToolResult(tr) => {
                 tr.tool_call_id == tool_call_id && tr.tool_name == tool_name
             }
             _ => false,
@@ -548,7 +548,7 @@ fn validate_deferred_handles<'a>(
 ) -> Result<(), RecordLogCorruption> {
     for entry in entries {
         if let Entry::Message(m) = entry {
-            if let pi_agent::message::AgentMessage::Assistant(asst) = &m.message {
+            if let rpi_agent::message::AgentMessage::Assistant(asst) = &m.message {
                 if asst.stop_reason == StopReason::Deferred && asst.deferred.is_none() {
                     return corrupt(
                         RecordLogCorruptionReason::InvalidDeferredHandle,

@@ -49,10 +49,11 @@ pub mod modes;
 pub mod provider;
 pub mod session;
 
-/// Crate version, surfaced by `pi --version`. Mirrors the TS `VERSION` export
+/// Crate version, surfaced by `rpi --version`. Mirrors the TS `VERSION` export
 /// (sourced from `package.json`; here from `env!("CARGO_PKG_VERSION")`).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The application name used in help + version output. Mirrors TS `APP_NAME`
-/// (= `"pi"`, the `bin` field of the coding-agent `package.json`).
-pub const APP_NAME: &str = "pi";
+/// (the TS bin is `"pi"`; the Rust crate publishes under the `rpi-` namespace,
+/// so the binary + displayed name is `"rpi"` to match).
+pub const APP_NAME: &str = "rpi";

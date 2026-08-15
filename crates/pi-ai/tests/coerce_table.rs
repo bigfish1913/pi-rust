@@ -3,8 +3,8 @@
 //! `tests/` so it exercises the crate's public API exactly the way `pi-agent`
 //! and `pi-tools` will.
 
-use pi_ai::schema::{coerce_with_json_schema, validate_tool_arguments, validate_tool_call};
-use pi_ai::{AiError, Schema, Tool, ToolCall, ToolCallType};
+use rpi_ai::schema::{coerce_with_json_schema, validate_tool_arguments, validate_tool_call};
+use rpi_ai::{AiError, Schema, Tool, ToolCall, ToolCallType};
 use serde_json::{json, Value};
 
 fn tool(name: &str, schema: Value) -> Tool {

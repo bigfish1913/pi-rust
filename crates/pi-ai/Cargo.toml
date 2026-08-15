@@ -1,18 +1,18 @@
 [package]
-name = "pi-ai"
+name = "rpi-ai"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 version.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Unified multi-provider LLM types + streaming, port of pi-ai"
+description = "Unified multi-provider LLM types + streaming, Rust port of pi-ai"
 readme = "../../README.md"
 keywords = ["agent", "llm", "ai", "claude", "anthropic"]
 categories = ["api-bindings", "asynchronous"]
 
 [dependencies]
-pi-telemetry = { workspace = true }
+rpi-telemetry = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }

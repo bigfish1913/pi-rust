@@ -6,7 +6,7 @@
 //! because torn-tail recovery keys off `kind === "syntax"` (only a syntactically
 //! malformed *last* line is a recoverable torn tail).
 
-use pi_tools::error::{FileError, FileErrorCode};
+use rpi_tools::error::{FileError, FileErrorCode};
 
 use crate::error::{SessionError, SessionErrorCode};
 

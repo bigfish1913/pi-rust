@@ -2,13 +2,13 @@
 //! repo's typed options + metadata + v4 header shape.
 //!
 //! The TS `JsonlSessionRepoFileSystem` is a `Pick` of the harness `FileSystem`
-//! trait; the Rust port reuses [`pi_tools::env::FileSystem`] directly (it
+//! trait; the Rust port reuses [`rpi_tools::env::FileSystem`] directly (it
 //! already exposes every method the Pick selected), so there is no separate
 //! file-system trait here.
 
 use std::sync::Arc;
 
-use pi_tools::env::FileSystem;
+use rpi_tools::env::FileSystem;
 
 use crate::session::memory::Clock;
 use crate::session::types::{IdGenerator, JsonValue, SessionCreateOptions, SessionMetadata};
@@ -100,7 +100,7 @@ impl JsonlSessionMetadata {
 }
 
 /// Mirrors TS `JsonlSessionRepoOptions`. `fs` is the shared
-/// [`pi_tools::env::FileSystem`] (the Rust analog of the TS `Pick<FileSystem,…>`).
+/// [`rpi_tools::env::FileSystem`] (the Rust analog of the TS `Pick<FileSystem,…>`).
 ///
 /// The Rust port additionally carries a shared [`Clock`] + [`IdGenerator`]: the
 /// TS repo reaches into `Date.now()` / `uuidv7()` directly, but the Rust harness

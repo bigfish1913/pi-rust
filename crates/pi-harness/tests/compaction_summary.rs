@@ -7,20 +7,20 @@
 //!   appended file-operations tags;
 //! - error / `aborted` stop reasons map to `CompactionError`.
 //!
-//! Runs against the public `pi_harness::compaction::{prepare_compaction, compact,
-//! CompactionError, CompactionLlmOptions}` surface + `pi_ai`'s faux provider.
+//! Runs against the public `rpi_harness::compaction::{prepare_compaction, compact,
+//! CompactionError, CompactionLlmOptions}` surface + `rpi_ai`'s faux provider.
 
 use std::sync::Arc;
 
-use pi_ai::providers::faux::{FauxProvider, FauxScript, FauxStep};
-use pi_ai::types::{StopReason, UserContent, UserMessage};
-use pi_ai::{Model, Provider};
-use pi_agent::message::AgentMessage;
-use pi_harness::compaction::{
+use rpi_ai::providers::faux::{FauxProvider, FauxScript, FauxStep};
+use rpi_ai::types::{StopReason, UserContent, UserMessage};
+use rpi_ai::{Model, Provider};
+use rpi_agent::message::AgentMessage;
+use rpi_harness::compaction::{
     compact, prepare_compaction, CompactionLlmOptions, CompactResult,
 };
-use pi_harness::session::types::{Entry, EntryBase, MessageEntry};
-use pi_harness::types::{CompactionSettings, DEFAULT_COMPACTION_SETTINGS};
+use rpi_harness::session::types::{Entry, EntryBase, MessageEntry};
+use rpi_harness::types::{CompactionSettings, DEFAULT_COMPACTION_SETTINGS};
 use tokio_util::sync::CancellationToken;
 
 // ---- entry builders (mirror the TS createMessageEntry helpers) ----
@@ -44,13 +44,13 @@ fn user_msg(text: &str, seq: u64, parent: Option<&str>) -> Entry {
 }
 
 fn assistant_msg(text: &str, seq: u64, parent: Option<&str>) -> Entry {
-    let mut m = pi_ai::types::AssistantMessage::empty(
-        pi_ai::types::Api::AnthropicMessages,
+    let mut m = rpi_ai::types::AssistantMessage::empty(
+        rpi_ai::types::Api::AnthropicMessages,
         "anthropic",
         "claude-sonnet-4-5",
         seq as i64,
     );
-    m.content = vec![pi_ai::types::Content::text(text)];
+    m.content = vec![rpi_ai::types::Content::text(text)];
     m.stop_reason = StopReason::Stop;
     Entry::Message(MessageEntry {
         base: base(seq, parent),
@@ -118,7 +118,7 @@ async fn compact_single_call_returns_summary_and_file_ops() {
 async fn compact_maps_error_stop_reason_to_summarization_failed() {
     // A minimal preparation with one message to summarize + a split turn is NOT
     // required; a single history call that errors yields summarization_failed.
-    let preparation = pi_harness::compaction::CompactionPreparation {
+    let preparation = rpi_harness::compaction::CompactionPreparation {
         messages_to_summarize: vec![AgentMessage::User(UserMessage::new(
             UserContent::Text("Summarize this.".to_string()),
             0,
@@ -128,14 +128,14 @@ async fn compact_maps_error_stop_reason_to_summarization_failed() {
         is_split_turn: false,
         tokens_before: 100,
         previous_summary: None,
-        file_ops: pi_harness::compaction::FileOperations::default(),
+        file_ops: rpi_harness::compaction::FileOperations::default(),
         settings: CompactionSettings { enabled: true, reserve_tokens: 2000, keep_recent_tokens: 20 },
     };
 
     let (provider, model) = faux_provider_model();
     // Faux step carrying an error terminal message.
-    let mut err = pi_ai::types::AssistantMessage::empty(
-        pi_ai::types::Api::Faux,
+    let mut err = rpi_ai::types::AssistantMessage::empty(
+        rpi_ai::types::Api::Faux,
         "faux",
         "faux",
         0,
@@ -155,7 +155,7 @@ async fn compact_maps_error_stop_reason_to_summarization_failed() {
 async fn prepare_compaction_noop_on_empty_and_on_last_compaction() {
     assert!(prepare_compaction(&[], DEFAULT_COMPACTION_SETTINGS).unwrap().is_none());
 
-    let compaction = Entry::Compaction(pi_harness::session::types::CompactionEntry {
+    let compaction = Entry::Compaction(rpi_harness::session::types::CompactionEntry {
         base: base_of("compaction", "c1", 1, None),
         summary: "already".to_string(),
         retained_tail: Vec::new(),

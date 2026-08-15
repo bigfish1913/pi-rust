@@ -13,9 +13,9 @@
 //! installed via `set_default_stream_fn` — `pi-ai` providers are not silently
 //! picked so the agent crate stays free of provider wiring.
 
-use pi_ai::provider::SimpleStreamOptions;
-use pi_ai::types::Context;
-use pi_ai::{AssistantMessageEventStream, Model};
+use rpi_ai::provider::SimpleStreamOptions;
+use rpi_ai::types::Context;
+use rpi_ai::{AssistantMessageEventStream, Model};
 use std::sync::{Arc, OnceLock};
 
 /// The provider-boundary callable. Arc'd so `Agent`/`AgentLoopConfig` can clone
@@ -81,7 +81,7 @@ mod tests {
     #[test]
     fn stream_fn_is_arc_clone() {
         let f = stream_fn(|_, _, _| {
-            let (_prod, stream) = pi_ai::event_stream::create_assistant_message_event_stream();
+            let (_prod, stream) = rpi_ai::event_stream::create_assistant_message_event_stream();
             stream
         });
         let _clone: StreamFn = Arc::clone(&f);

@@ -6,7 +6,7 @@
 //! Rust's analogue: a thin `#[tokio::main]` wrapper that boots the multi-thread
 //! runtime the harness needs (the harness's `StreamFn` bridge uses
 //! `block_in_place`, which requires the multi-thread flavor) and hands control
-//! to [`pi_cli::main::run`], exiting with its returned code.
+//! to [`rpi_cli::main::run`], exiting with its returned code.
 
 use std::process::ExitCode;
 
@@ -16,6 +16,6 @@ async fn main() -> ExitCode {
     // synchronously inside the async lane; that requires the multi-thread
     // runtime (configured above). `run` does everything else: arg parse, model
     // resolution, harness build, mode dispatch.
-    let code = pi_cli::app::run().await;
+    let code = rpi_cli::app::run().await;
     ExitCode::from(code as u8)
 }

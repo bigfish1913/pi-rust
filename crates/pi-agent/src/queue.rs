@@ -75,7 +75,7 @@ impl PendingMessageQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pi_ai::types::UserMessage;
+    use rpi_ai::types::UserMessage;
     use AgentMessage;
 
     fn user(s: &str) -> AgentMessage {

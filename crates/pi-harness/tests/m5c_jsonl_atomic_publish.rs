@@ -26,27 +26,27 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use pi_agent::message::AgentMessage;
-use pi_harness::error::SessionErrorCode;
-use pi_harness::session::jsonl::{
+use rpi_agent::message::AgentMessage;
+use rpi_harness::error::SessionErrorCode;
+use rpi_harness::session::jsonl::{
     encode_mutation, JsonlSessionRepo, JsonlSessionRepoOptions, JsonlSessionStorage, JsonlV4Header,
 };
-use pi_harness::session::jsonl::types::{JsonlSessionCreateOptions, JsonlSessionListOptions};
-use pi_harness::session::memory::{CounterIdGenerator, FakeClock};
-use pi_harness::session::types::{
+use rpi_harness::session::jsonl::types::{JsonlSessionCreateOptions, JsonlSessionListOptions};
+use rpi_harness::session::memory::{CounterIdGenerator, FakeClock};
+use rpi_harness::session::types::{
     BranchBounds, EntryOrder, EntryQuery, ForkOptions, LaneRecord, LanePointer, LogItem,
     LogOptions, OperationIntent, OperationStartedRecord, ProvisionedEntry, ProvisionedKind,
     RecordBase, SessionCreateOptions, SessionMetadata, SessionMutation, SessionStorage,
 };
-use pi_tools::env::{FileContent, FileKind, FileInfo, FileSystem};
-use pi_tools::error::{FileError, FileErrorCode};
+use rpi_tools::env::{FileContent, FileKind, FileInfo, FileSystem};
+use rpi_tools::error::{FileError, FileErrorCode};
 
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
 
 fn user_msg(text: &str) -> AgentMessage {
-    AgentMessage::User(pi_ai::types::UserMessage::new(text, 1))
+    AgentMessage::User(rpi_ai::types::UserMessage::new(text, 1))
 }
 
 fn header(id: &str) -> JsonlV4Header {
@@ -337,7 +337,7 @@ impl FileSystem for FaultyFs {
 /// Attach a `FaultyFs` to a fresh in-memory env + repo, returning both.
 fn faulty_repo(target: FaultTarget) -> (Arc<FaultyFs>, JsonlSessionRepo) {
     let base: Arc<dyn FileSystem> =
-        Arc::new(pi_tools::InMemoryExecutionEnv::with_cwd("/proj".into()));
+        Arc::new(rpi_tools::InMemoryExecutionEnv::with_cwd("/proj".into()));
     let faulty = FaultyFs::new(base, target);
     let fs: Arc<dyn FileSystem> = faulty.clone();
     (faulty, repo(fs))
@@ -354,7 +354,7 @@ fn faulty_repo(target: FaultTarget) -> (Arc<FaultyFs>, JsonlSessionRepo) {
 async fn fork_staging_failure_leaves_no_destination_and_no_tmp() {
     // Use a non-faulty repo to build the source (we only fault the fork path).
     let base: Arc<dyn FileSystem> =
-        Arc::new(pi_tools::InMemoryExecutionEnv::with_cwd("/proj".into()));
+        Arc::new(rpi_tools::InMemoryExecutionEnv::with_cwd("/proj".into()));
     let r = repo(base.clone());
 
     let source = r.create_typed(&create_options("source")).await.unwrap();
@@ -408,7 +408,7 @@ async fn fork_staging_failure_leaves_no_destination_and_no_tmp() {
 #[tokio::test]
 async fn fork_rename_failure_leaves_no_destination_and_no_tmp() {
     let base: Arc<dyn FileSystem> =
-        Arc::new(pi_tools::InMemoryExecutionEnv::with_cwd("/proj".into()));
+        Arc::new(rpi_tools::InMemoryExecutionEnv::with_cwd("/proj".into()));
     let r = repo(base.clone());
 
     let source = r.create_typed(&create_options("source")).await.unwrap();
@@ -474,7 +474,7 @@ async fn failed_create_releases_reservation_and_is_retriable() {
 #[tokio::test]
 async fn torn_tail_repair_staging_failure_preserves_original() {
     let base: Arc<dyn FileSystem> =
-        Arc::new(pi_tools::InMemoryExecutionEnv::with_cwd("/".into()));
+        Arc::new(rpi_tools::InMemoryExecutionEnv::with_cwd("/".into()));
     let path = "/s.jsonl";
     let _ = JsonlSessionStorage::create(base.clone(), path, header("repair"), clock(), ids())
         .await
@@ -505,7 +505,7 @@ async fn torn_tail_repair_staging_failure_preserves_original() {
 #[tokio::test]
 async fn torn_tail_repair_rename_failure_preserves_original() {
     let base: Arc<dyn FileSystem> =
-        Arc::new(pi_tools::InMemoryExecutionEnv::with_cwd("/".into()));
+        Arc::new(rpi_tools::InMemoryExecutionEnv::with_cwd("/".into()));
     let path = "/s.jsonl";
     let _ = JsonlSessionStorage::create(base.clone(), path, header("repair"), clock(), ids())
         .await
@@ -535,7 +535,7 @@ async fn torn_tail_repair_rename_failure_preserves_original() {
 #[tokio::test]
 async fn concurrent_cross_lane_writes_serialize_in_shared_sequence_order() {
     let fs: Arc<dyn FileSystem> =
-        Arc::new(pi_tools::InMemoryExecutionEnv::with_cwd("/proj".into()));
+        Arc::new(rpi_tools::InMemoryExecutionEnv::with_cwd("/proj".into()));
     let r = repo(fs.clone());
     let storage = r.create_typed(&create_options("concurrent")).await.unwrap();
     let root_entry = storage.append_entry(note_provisioned("root"), "main").await.unwrap();
@@ -604,7 +604,7 @@ async fn concurrent_cross_lane_writes_serialize_in_shared_sequence_order() {
 #[tokio::test]
 async fn concurrent_duplicate_create_one_wins_one_already_exists() {
     let fs: Arc<dyn FileSystem> =
-        Arc::new(pi_tools::InMemoryExecutionEnv::with_cwd("/proj".into()));
+        Arc::new(rpi_tools::InMemoryExecutionEnv::with_cwd("/proj".into()));
     let r = repo(fs.clone());
     let opts = create_options("same");
 
@@ -633,7 +633,7 @@ async fn concurrent_duplicate_create_one_wins_one_already_exists() {
 #[tokio::test]
 async fn repo_round_trip_preserves_order_and_is_appendable() {
     let fs: Arc<dyn FileSystem> =
-        Arc::new(pi_tools::InMemoryExecutionEnv::with_cwd("/proj".into()));
+        Arc::new(rpi_tools::InMemoryExecutionEnv::with_cwd("/proj".into()));
     let r = repo(fs);
     let storage = r.create_typed(&create_options("rt")).await.unwrap();
     storage.append_entry(message_provisioned("u1", "one"), "main").await.unwrap();
@@ -672,7 +672,7 @@ async fn repo_round_trip_preserves_order_and_is_appendable() {
 #[tokio::test]
 async fn find_entries_returns_independent_clones() {
     let fs: Arc<dyn FileSystem> =
-        Arc::new(pi_tools::InMemoryExecutionEnv::with_cwd("/proj".into()));
+        Arc::new(rpi_tools::InMemoryExecutionEnv::with_cwd("/proj".into()));
     let r = repo(fs);
     let storage = r.create_typed(&create_options("dc")).await.unwrap();
     storage.append_entry(note_provisioned("e1"), "main").await.unwrap();

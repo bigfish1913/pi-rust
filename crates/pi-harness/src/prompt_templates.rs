@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use pi_tools::env::{ExecutionEnv, FileKind};
+use rpi_tools::env::{ExecutionEnv, FileKind};
 use tokio_util::sync::CancellationToken;
 
 use crate::frontmatter::parse_frontmatter;
@@ -71,7 +71,7 @@ pub async fn load_prompt_templates(
         let info = match env.file_info(path, Some(&cancel)).await {
             Ok(i) => i,
             Err(e) => {
-                if e.code != pi_tools::FileErrorCode::NotFound {
+                if e.code != rpi_tools::FileErrorCode::NotFound {
                     diagnostics.push(PromptTemplateDiagnostic {
                         code: PromptTemplateDiagnosticCode::FileInfoFailed,
                         message: e.message,
@@ -256,7 +256,7 @@ async fn load_template_from_file(
 
 async fn resolve_kind(
     env: &Arc<dyn ExecutionEnv>,
-    info: &pi_tools::env::FileInfo,
+    info: &rpi_tools::env::FileInfo,
     diagnostics: &mut Vec<PromptTemplateDiagnostic>,
     cancel: &CancellationToken,
 ) -> Option<FileKind> {
@@ -273,7 +273,7 @@ async fn resolve_kind(
                 }
             }
             Err(e) => {
-                if e.code != pi_tools::FileErrorCode::NotFound {
+                if e.code != rpi_tools::FileErrorCode::NotFound {
                     diagnostics.push(PromptTemplateDiagnostic {
                         code: PromptTemplateDiagnosticCode::FileInfoFailed,
                         message: e.message,
@@ -284,7 +284,7 @@ async fn resolve_kind(
             }
         },
         Err(e) => {
-            if e.code != pi_tools::FileErrorCode::NotFound {
+            if e.code != rpi_tools::FileErrorCode::NotFound {
                 diagnostics.push(PromptTemplateDiagnostic {
                     code: PromptTemplateDiagnosticCode::FileInfoFailed,
                     message: e.message,

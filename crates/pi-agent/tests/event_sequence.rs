@@ -17,24 +17,24 @@ use common::{
     assistant_text, assistant_tool_calls, base_config, mock_stream_fn, run_and_collect, type_tags,
     user_message,
 };
-use pi_agent::{AgentContext, AgentEvent};
-use pi_ai::types::StopReason;
+use rpi_agent::{AgentContext, AgentEvent};
+use rpi_ai::types::StopReason;
 
 /// A scripted echo tool — mirrors the TS `echo` tool used across
 /// `agent-loop.test.ts`. Records every `value` it executed so tests can assert
 /// ordering + that (un)expected calls did/didn't run.
 struct EchoTool {
-    schema: pi_ai::types::Tool,
+    schema: rpi_ai::types::Tool,
     executed: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl EchoTool {
     fn new() -> (Self, Arc<std::sync::Mutex<Vec<String>>>) {
         let executed = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let schema = pi_ai::types::Tool {
+        let schema = rpi_ai::types::Tool {
             name: "echo".to_string(),
             description: "Echo tool".to_string(),
-            parameters: pi_ai::types::Schema::new(serde_json::json!({
+            parameters: rpi_ai::types::Schema::new(serde_json::json!({
                 "type": "object",
                 "properties": { "value": { "type": "string" } },
                 "required": ["value"],
@@ -48,8 +48,8 @@ impl EchoTool {
 }
 
 #[async_trait::async_trait]
-impl pi_agent::AgentTool for EchoTool {
-    fn schema(&self) -> &pi_ai::types::Tool {
+impl rpi_agent::AgentTool for EchoTool {
+    fn schema(&self) -> &rpi_ai::types::Tool {
         &self.schema
     }
     fn label(&self) -> &str {
@@ -60,20 +60,20 @@ impl pi_agent::AgentTool for EchoTool {
         _tool_call_id: &str,
         params: serde_json::Value,
         _signal: tokio_util::sync::CancellationToken,
-        _on_update: Arc<dyn Fn(pi_agent::ToolResultPartial) + Send + Sync>,
-    ) -> Result<pi_agent::AgentToolResult, pi_agent::AgentError> {
+        _on_update: Arc<dyn Fn(rpi_agent::ToolResultPartial) + Send + Sync>,
+    ) -> Result<rpi_agent::AgentToolResult, rpi_agent::AgentError> {
         let value = params
             .get("value")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
         self.executed.lock().expect("executed lock").push(value.clone());
-        Ok(pi_agent::AgentToolResult::text(format!("echoed: {value}")))
+        Ok(rpi_agent::AgentToolResult::text(format!("echoed: {value}")))
     }
 }
 
 /// Build an `AgentContext` with the given tools + an empty prompt history.
-fn context_with_tools(tools: Vec<Arc<dyn pi_agent::AgentTool>>) -> AgentContext {
+fn context_with_tools(tools: Vec<Arc<dyn rpi_agent::AgentTool>>) -> AgentContext {
     AgentContext {
         system_prompt: String::new(),
         messages: Vec::new(),
@@ -125,9 +125,9 @@ async fn emits_exact_sequence_when_should_stop_after_turn() {
     // (no cancellation token — unlike before/afterToolCall). Returns `true`
     // so the loop stops after exactly one turn.
     let stop_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let should_stop: pi_agent::ShouldStopAfterTurn = {
+    let should_stop: rpi_agent::ShouldStopAfterTurn = {
         let stop_calls = Arc::clone(&stop_calls);
-        Arc::new(move |_ctx: pi_agent::ShouldStopAfterTurnContext<'_>| {
+        Arc::new(move |_ctx: rpi_agent::ShouldStopAfterTurnContext<'_>| {
             let stop_calls = Arc::clone(&stop_calls);
             Box::pin(async move {
                 stop_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -184,21 +184,21 @@ async fn emits_exact_sequence_when_should_stop_after_turn() {
 async fn emits_message_update_events_on_streaming_deltas() {
     // A faux-like stream emitting a Start + TextStart + TextDelta + TextEnd +
     // Done should produce message_update events between the start and end.
-    use pi_ai::event_stream::create_assistant_message_event_stream;
-    use pi_ai::types::{AssistantMessage, AssistantMessageEvent, DoneReason, StopReason};
+    use rpi_ai::event_stream::create_assistant_message_event_stream;
+    use rpi_ai::types::{AssistantMessage, AssistantMessageEvent, DoneReason, StopReason};
 
     // Build a custom stream_fn that emits a richer event sequence than the
     // common mock (which only pushes Start + terminal).
-    let stream_fn = pi_agent::stream_fn(move |_model, _ctx, _opts| {
+    let stream_fn = rpi_agent::stream_fn(move |_model, _ctx, _opts| {
         let (mut prod, stream) = create_assistant_message_event_stream();
         tokio::spawn(async move {
             let mut partial = AssistantMessage::empty(
-                pi_ai::types::Api::Other("openai-responses".into()),
+                rpi_ai::types::Api::Other("openai-responses".into()),
                 "mock",
                 "mock",
                 0,
             );
-            partial.content.push(pi_ai::types::Content::text(""));
+            partial.content.push(rpi_ai::types::Content::text(""));
             let p = std::sync::Arc::new(partial.clone());
             prod.push(AssistantMessageEvent::Start { partial: p.clone() });
             prod.push(AssistantMessageEvent::TextStart { content_index: 0, partial: p.clone() });
@@ -220,7 +220,7 @@ async fn emits_message_update_events_on_streaming_deltas() {
             let mut final_msg = (*p).clone();
             final_msg.stop_reason = StopReason::Stop;
             final_msg.content.clear();
-            final_msg.content.push(pi_ai::types::Content::text("Hi there!"));
+            final_msg.content.push(rpi_ai::types::Content::text("Hi there!"));
             prod.push(AssistantMessageEvent::Done {
                 reason: DoneReason::Stop,
                 message: final_msg,

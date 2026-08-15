@@ -3,7 +3,7 @@
 //!
 //! **Plan §2.3 refinement #2:** the TS `AgentHarness` is a stub shell (every
 //! operation rejects with `HarnessNotImplemented`). The Rust port implements
-//! the *real* run loop on top of [`pi_agent::run_agent_loop`]. The TS file is
+//! the *real* run loop on top of [`rpi_agent::run_agent_loop`]. The TS file is
 //! treated as the **type contract only**: the option shape, the `AgentLane`
 //! interface, the outcome unions, and the defensive-copy contract (setters
 //! clone inputs, getters return clones — mirroring TS `[...]`/`{...}`).
@@ -38,13 +38,13 @@ use futures::future::BoxFuture;
 use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
 
-use pi_ai::types::{
+use rpi_ai::types::{
     AssistantMessage, Content, DeferredHandle, StopReason, ThinkingLevel, Usage, UserContent,
     UserMessage,
 };
-use pi_ai::{Model, Provider as AiProvider};
-use pi_agent::message::AgentMessage;
-use pi_agent::{
+use rpi_ai::{Model, Provider as AiProvider};
+use rpi_agent::message::AgentMessage;
+use rpi_agent::{
     run_agent_loop, AgentContext, AgentEmitter, AgentLoopConfig, AgentTool, ConvertToLlm,
     StreamFn,
 };
@@ -86,9 +86,9 @@ use crate::types::{
 /// assistant message. `Suspended` carries the provider deferred handle.
 #[derive(Debug, Clone)]
 pub enum HarnessRunOutcome {
-    Completed { leaf_id: String, final_entry_id: String, final_message: pi_ai::types::AssistantMessage },
-    Aborted { leaf_id: String, final_entry_id: String, final_message: pi_ai::types::AssistantMessage },
-    Failed { leaf_id: String, error: OperationError, final_entry_id: Option<String>, final_message: Option<pi_ai::types::AssistantMessage> },
+    Completed { leaf_id: String, final_entry_id: String, final_message: rpi_ai::types::AssistantMessage },
+    Aborted { leaf_id: String, final_entry_id: String, final_message: rpi_ai::types::AssistantMessage },
+    Failed { leaf_id: String, error: OperationError, final_entry_id: Option<String>, final_message: Option<rpi_ai::types::AssistantMessage> },
     Suspended { leaf_id: String, final_entry_id: String, deferred: DeferredHandle },
 }
 
@@ -177,7 +177,7 @@ pub trait AgentLane: Send + Sync {
     fn name(&self) -> &str;
     async fn get_leaf_id(&self) -> HarnessResult<Option<String>>;
 
-    async fn prompt_text(&self, text: &str, images: Vec<pi_ai::types::ImageContent>) -> HarnessResult<RunResult>;
+    async fn prompt_text(&self, text: &str, images: Vec<rpi_ai::types::ImageContent>) -> HarnessResult<RunResult>;
     async fn prompt_message(&self, message: AgentMessage) -> HarnessResult<RunResult>;
     async fn prompt_messages(&self, messages: Vec<AgentMessage>) -> HarnessResult<RunResult>;
     async fn skill(&self, name: &str, additional_instructions: Option<&str>) -> HarnessResult<RunResult>;
@@ -448,7 +448,7 @@ impl AgentHarness {
         // Resolve the provider lazily per call (the model may change between
         // turns via prepare_next_turn). If no provider matches, emit an Error
         // terminal event on a synthetic stream.
-        let stream_fn = pi_agent::stream_fn(move |model: &Model, ctx: &pi_ai::types::Context, opts: &pi_ai::SimpleStreamOptions| {
+        let stream_fn = rpi_agent::stream_fn(move |model: &Model, ctx: &rpi_ai::types::Context, opts: &rpi_ai::SimpleStreamOptions| {
             let provider = models.iter().find(|p| p.id() == model.provider).cloned();
             match provider {
                 Some(p) => {
@@ -463,7 +463,7 @@ impl AgentHarness {
                 }
                 None => {
                     // No provider: synthesize an Error terminal stream.
-                    let (mut producer, stream) = pi_ai::event_stream::create_assistant_message_event_stream();
+                    let (mut producer, stream) = rpi_ai::event_stream::create_assistant_message_event_stream();
                     let msg = AssistantMessage::terminal(
                         model.api.clone(),
                         &model.provider,
@@ -472,8 +472,8 @@ impl AgentHarness {
                         format!("No provider registered for '{}'", model.provider),
                         0,
                     );
-                    let _ = producer.push(pi_ai::types::AssistantMessageEvent::Error {
-                        reason: pi_ai::types::ErrorReason::Error,
+                    let _ = producer.push(rpi_ai::types::AssistantMessageEvent::Error {
+                        reason: rpi_ai::types::ErrorReason::Error,
                         error: msg,
                     });
                     stream
@@ -926,7 +926,7 @@ impl AgentHarness {
         // Emitter: a collector that discards events (the harness surfaces
         // RunStart/RunEnd via its own bus). A future revision can bridge
         // AgentEvent -> a harness event stream.
-        let emitter: Arc<dyn AgentEmitter> = Arc::new(pi_agent::CollectorEmitter::default());
+        let emitter: Arc<dyn AgentEmitter> = Arc::new(rpi_agent::CollectorEmitter::default());
 
         // Drive the loop. We pass an EMPTY prompts vec to `run_agent_loop`
         // (NOT `prompts`): the prompts were already persisted to the session
@@ -1166,7 +1166,7 @@ impl AgentLane for AgentHarness {
             .map_err(session_to_harness_err)
     }
 
-    async fn prompt_text(&self, text: &str, images: Vec<pi_ai::types::ImageContent>) -> HarnessResult<RunResult> {
+    async fn prompt_text(&self, text: &str, images: Vec<rpi_ai::types::ImageContent>) -> HarnessResult<RunResult> {
         let content = if images.is_empty() {
             UserContent::Text(text.to_string())
         } else {
@@ -1470,7 +1470,7 @@ impl AgentLane for LaneHandle {
             .map_err(session_to_harness_err)
     }
 
-    async fn prompt_text(&self, _text: &str, _images: Vec<pi_ai::types::ImageContent>) -> HarnessResult<RunResult> {
+    async fn prompt_text(&self, _text: &str, _images: Vec<rpi_ai::types::ImageContent>) -> HarnessResult<RunResult> {
         Err(HarnessError::invalid_lane(
             self.lane.clone(),
             "non_main_lane",

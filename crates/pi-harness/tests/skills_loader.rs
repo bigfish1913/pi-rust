@@ -17,18 +17,18 @@
 
 use std::sync::Arc;
 
-use pi_harness::skills::{
+use rpi_harness::skills::{
     format_skill_invocation, format_skills_for_system_prompt, load_skills, load_sourced_skills,
     SkillDiagnosticCode, SourcedSkillInput,
 };
-use pi_tools::in_memory::InMemoryExecutionEnv;
-use pi_tools::FileSystem;
+use rpi_tools::in_memory::InMemoryExecutionEnv;
+use rpi_tools::FileSystem;
 
 /// Build an env, returning the typed handle (for seeding) and the dyn view (for
 /// `load_skills`). The env is `Arc`-shared, so both point at the same state.
-fn fresh_env() -> (Arc<InMemoryExecutionEnv>, Arc<dyn pi_tools::ExecutionEnv>) {
+fn fresh_env() -> (Arc<InMemoryExecutionEnv>, Arc<dyn rpi_tools::ExecutionEnv>) {
     let typed = Arc::new(InMemoryExecutionEnv::new());
-    let env: Arc<dyn pi_tools::ExecutionEnv> = typed.clone();
+    let env: Arc<dyn rpi_tools::ExecutionEnv> = typed.clone();
     (typed, env)
 }
 
@@ -114,7 +114,7 @@ async fn missing_input_directory_is_silently_skipped() {
 #[tokio::test]
 async fn listing_is_xml_escaped_and_invocation_is_not() {
     // Invariant §9: the two skill-format paths are distinct.
-    use pi_harness::types::Skill;
+    use rpi_harness::types::Skill;
     let s = Skill {
         name: "a&b".to_string(),
         description: "Use <this> & that".to_string(),

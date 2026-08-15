@@ -2,8 +2,8 @@
 //! `event-stream.ts` test shapes: drain deltas + Done; `result()` resolves to
 //! the assembled `AssistantMessage`; `Error` path resolves to the error message.
 
-use pi_ai::event_stream::create_assistant_message_event_stream;
-use pi_ai::{Api, AssistantMessage, AssistantMessageEvent, DoneReason, ErrorReason, StopReason};
+use rpi_ai::event_stream::create_assistant_message_event_stream;
+use rpi_ai::{Api, AssistantMessage, AssistantMessageEvent, DoneReason, ErrorReason, StopReason};
 use std::sync::Arc;
 
 fn empty_partial(ts: i64) -> Arc<AssistantMessage> {

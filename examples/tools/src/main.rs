@@ -15,10 +15,10 @@
 
 use std::sync::Arc;
 
-use pi_agent::AgentBuilder;
-use pi_ai::providers::faux::{FauxProvider, FauxScript};
-use pi_ai::Provider;
-use pi_tools::{
+use rpi_agent::AgentBuilder;
+use rpi_ai::providers::faux::{FauxProvider, FauxScript};
+use rpi_ai::Provider;
+use rpi_tools::{
     create_bash_tool, create_write_tool, ExecutionToolContext, OsExecutionEnv,
 };
 
@@ -32,8 +32,8 @@ async fn main() {
 
     // The built-in tools take an `ExecutionToolContext`. `OsExecutionEnv`
     // implements both `ExecutionEnv` and `MutatingEnv`.
-    let env_dyn: Arc<dyn pi_tools::ExecutionEnv> = env.clone();
-    let mut_env: Arc<dyn pi_tools::MutatingEnv> = env.clone();
+    let env_dyn: Arc<dyn rpi_tools::ExecutionEnv> = env.clone();
+    let mut_env: Arc<dyn rpi_tools::MutatingEnv> = env.clone();
     let ctx = ExecutionToolContext::new(env_dyn, Some(mut_env));
     let write_tool = create_write_tool(&ctx);
     let bash_tool = create_bash_tool(&ctx, None);
@@ -79,8 +79,8 @@ async fn main() {
 /// Same sync-over-async StreamFn bridge as `examples/minimal` — the faux
 /// provider spawns its producer task before `stream_simple` resolves, so the
 /// returned stream is immediately live.
-fn make_stream_fn(provider: Arc<FauxProvider>) -> pi_agent::StreamFn {
-    pi_agent::stream_fn(move |model, ctx, opts| {
+fn make_stream_fn(provider: Arc<FauxProvider>) -> rpi_agent::StreamFn {
+    rpi_agent::stream_fn(move |model, ctx, opts| {
         let p = Arc::clone(&provider);
         let model = model.clone();
         let ctx = ctx.clone();

@@ -11,7 +11,7 @@
 //! message) it also returns the turn's start so compaction can summarize the
 //! turn prefix separately (the split-turn two-LLM-call path, invariant §10).
 
-use pi_agent::message::AgentMessageRole;
+use rpi_agent::message::AgentMessageRole;
 
 use crate::compaction::tokens::estimate_tokens;
 use crate::messages::{BASH_EXECUTION_ROLE, BRANCH_SUMMARY_ROLE, COMPACTION_SUMMARY_ROLE, CUSTOM_ROLE};
@@ -171,8 +171,8 @@ pub fn find_cut_point(
 mod tests {
     use super::*;
     use crate::session::types::{EntryBase, MessageEntry};
-    use pi_ai::types::{UserContent, UserMessage};
-    use pi_agent::message::AgentMessage;
+    use rpi_ai::types::{UserContent, UserMessage};
+    use rpi_agent::message::AgentMessage;
 
     fn base(seq: u64) -> EntryBase {
         EntryBase {
@@ -203,13 +203,13 @@ mod tests {
     #[test]
     fn valid_cut_points_exclude_tool_result() {
         // user, assistant(toolCall implicit), toolResult, user.
-        let mut assistant = pi_ai::types::AssistantMessage::empty(
-            pi_ai::types::Api::Faux,
+        let mut assistant = rpi_ai::types::AssistantMessage::empty(
+            rpi_ai::types::Api::Faux,
             "faux",
             "faux",
             2,
         );
-        assistant.stop_reason = pi_ai::types::StopReason::Stop;
+        assistant.stop_reason = rpi_ai::types::StopReason::Stop;
         let entries = vec![
             user_msg("hi", 1),
             Entry::Message(MessageEntry {
@@ -219,11 +219,11 @@ mod tests {
             }),
             Entry::Message(MessageEntry {
                 base: base(3),
-                message: AgentMessage::ToolResult(Box::new(pi_ai::types::ToolResultMessage {
-                    role: pi_ai::types::ToolResultRole,
+                message: AgentMessage::ToolResult(Box::new(rpi_ai::types::ToolResultMessage {
+                    role: rpi_ai::types::ToolResultRole,
                     tool_call_id: "c1".into(),
                     tool_name: "read".into(),
-                    content: vec![pi_ai::types::Content::text("out")],
+                    content: vec![rpi_ai::types::Content::text("out")],
                     details: None,
                     usage: None,
                     added_tool_names: Vec::new(),

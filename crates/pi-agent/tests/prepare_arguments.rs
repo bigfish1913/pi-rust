@@ -15,25 +15,25 @@ mod common;
 use std::sync::Arc;
 
 use common::{assistant_text, base_config, mock_stream_fn, run_and_collect, user_message};
-use pi_agent::{AgentContext, AgentError, AgentTool, AgentToolResult, ToolResultPartial};
-use pi_ai::types::StopReason;
+use rpi_agent::{AgentContext, AgentError, AgentTool, AgentToolResult, ToolResultPartial};
+use rpi_ai::types::StopReason;
 use tokio_util::sync::CancellationToken;
 
 /// The `edit` tool. Mirrors the TS test tool: `prepare_arguments` folds legacy
 /// `oldText`/`newText` into `edits`; `execute` records the `edits` array it
 /// received.
 struct EditTool {
-    schema: pi_ai::types::Tool,
+    schema: rpi_ai::types::Tool,
     executed: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
 }
 
 impl EditTool {
     fn new() -> (Self, Arc<std::sync::Mutex<Vec<serde_json::Value>>>) {
         let executed = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let schema = pi_ai::types::Tool {
+        let schema = rpi_ai::types::Tool {
             name: "edit".to_string(),
             description: "Edit tool".to_string(),
-            parameters: pi_ai::types::Schema::new(serde_json::json!({
+            parameters: rpi_ai::types::Schema::new(serde_json::json!({
                 "type": "object",
                 "properties": {
                     "edits": {
@@ -61,7 +61,7 @@ impl EditTool {
 
 #[async_trait::async_trait]
 impl AgentTool for EditTool {
-    fn schema(&self) -> &pi_ai::types::Tool {
+    fn schema(&self) -> &rpi_ai::types::Tool {
         &self.schema
     }
     fn label(&self) -> &str {
@@ -104,7 +104,7 @@ impl AgentTool for EditTool {
 
 #[tokio::test]
 async fn prepare_arguments_folds_legacy_oldtext_newtext_into_edits() {
-    use pi_ai::types::{Api, AssistantMessage, Content, ToolCall, Usage};
+    use rpi_ai::types::{Api, AssistantMessage, Content, ToolCall, Usage};
 
     let (tool, executed) = EditTool::new();
     let context = AgentContext {
@@ -115,9 +115,9 @@ async fn prepare_arguments_folds_legacy_oldtext_newtext_into_edits() {
 
     // call 1: raw legacy args `{oldText, newText}`; call 2: text "done".
     let tool_use = AssistantMessage {
-        role: pi_ai::types::AssistantRole,
+        role: rpi_ai::types::AssistantRole,
         content: vec![Content::ToolCall(ToolCall {
-            kind: pi_ai::types::ToolCallType,
+            kind: rpi_ai::types::ToolCallType,
             id: "tool-1".to_string(),
             name: "edit".to_string(),
             arguments: serde_json::json!({ "oldText": "before", "newText": "after" }),

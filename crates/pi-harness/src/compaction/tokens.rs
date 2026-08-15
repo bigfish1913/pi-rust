@@ -10,8 +10,8 @@
 
 use std::collections::BTreeSet;
 
-use pi_ai::types::{AssistantMessage, Content, Message, Usage};
-use pi_agent::message::AgentMessage;
+use rpi_ai::types::{AssistantMessage, Content, Message, Usage};
+use rpi_agent::message::AgentMessage;
 
 use crate::messages::{bash_execution_data, branch_summary_data, compaction_summary_data};
 use crate::session::types::Entry;
@@ -188,10 +188,10 @@ pub fn serialize_conversation(messages: &[Message]) -> String {
     parts.join("\n\n")
 }
 
-fn user_content_text(content: &pi_ai::types::UserContent) -> String {
+fn user_content_text(content: &rpi_ai::types::UserContent) -> String {
     match content {
-        pi_ai::types::UserContent::Text(s) => s.clone(),
-        pi_ai::types::UserContent::Blocks(blocks) => Content::text_only(blocks, ""),
+        rpi_ai::types::UserContent::Text(s) => s.clone(),
+        rpi_ai::types::UserContent::Blocks(blocks) => Content::text_only(blocks, ""),
     }
 }
 
@@ -225,8 +225,8 @@ pub fn estimate_tokens(message: &AgentMessage) -> i64 {
 fn estimate_message_chars(message: &AgentMessage) -> usize {
     match message {
         AgentMessage::User(u) => match &u.content {
-            pi_ai::types::UserContent::Text(s) => s.len(),
-            pi_ai::types::UserContent::Blocks(blocks) => estimate_text_and_image_chars_content(blocks),
+            rpi_ai::types::UserContent::Text(s) => s.len(),
+            rpi_ai::types::UserContent::Blocks(blocks) => estimate_text_and_image_chars_content(blocks),
         },
         AgentMessage::Assistant(a) => estimate_assistant_chars(a),
         AgentMessage::ToolResult(t) => estimate_text_and_image_chars_content(&t.content),
@@ -249,7 +249,7 @@ fn estimate_assistant_chars(a: &AssistantMessage) -> usize {
     chars
 }
 
-fn estimate_custom_chars(c: &pi_agent::message::CustomMessage) -> usize {
+fn estimate_custom_chars(c: &rpi_agent::message::CustomMessage) -> usize {
     match c.role.as_str() {
         crate::messages::BASH_EXECUTION_ROLE => {
             if let Some(d) = bash_execution_data(&AgentMessage::Custom(c.clone())) {
@@ -286,8 +286,8 @@ fn div_ceil(a: i64, b: i64) -> i64 {
 fn last_assistant_usage_info(messages: &[AgentMessage]) -> Option<(Usage, usize)> {
     for (i, msg) in messages.iter().enumerate().rev() {
         if let AgentMessage::Assistant(a) = msg {
-            if a.stop_reason != pi_ai::types::StopReason::Aborted
-                && a.stop_reason != pi_ai::types::StopReason::Error
+            if a.stop_reason != rpi_ai::types::StopReason::Aborted
+                && a.stop_reason != rpi_ai::types::StopReason::Error
                 && a.usage.context_tokens() > 0
             {
                 return Some((a.usage.clone(), i));
@@ -361,8 +361,8 @@ pub fn build_session_context(path_entries: &[Entry]) -> SessionContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pi_ai::types::{UserContent, UserMessage};
-    use pi_agent::message::AgentMessage;
+    use rpi_ai::types::{UserContent, UserMessage};
+    use rpi_agent::message::AgentMessage;
 
     fn user(text: &str) -> AgentMessage {
         AgentMessage::User(UserMessage::new(UserContent::Text(text.into()), 1))
@@ -380,8 +380,8 @@ mod tests {
     #[test]
     fn extract_file_ops_classifies_read_write_edit() {
         // Build a real assistant with three tool calls.
-        let mut a = pi_ai::types::AssistantMessage::empty(
-            pi_ai::types::Api::Faux,
+        let mut a = rpi_ai::types::AssistantMessage::empty(
+            rpi_ai::types::Api::Faux,
             "faux",
             "faux",
             1,
@@ -431,8 +431,8 @@ mod tests {
 
     #[test]
     fn estimate_context_tokens_uses_last_assistant_usage_plus_trailing() {
-        let mut a = pi_ai::types::AssistantMessage::empty(
-            pi_ai::types::Api::Faux,
+        let mut a = rpi_ai::types::AssistantMessage::empty(
+            rpi_ai::types::Api::Faux,
             "faux",
             "faux",
             1,
@@ -445,9 +445,9 @@ mod tests {
             cache_write_1h: None,
             reasoning: None,
             total_tokens: 110,
-            cost: pi_ai::types::UsageCost::default(),
+            cost: rpi_ai::types::UsageCost::default(),
         };
-        a.stop_reason = pi_ai::types::StopReason::Stop;
+        a.stop_reason = rpi_ai::types::StopReason::Stop;
         let msgs = vec![
             user("abcdefgh"), // 2
             AgentMessage::Assistant(Box::new(a)), // usage 110, index 1

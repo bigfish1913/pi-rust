@@ -9,7 +9,7 @@
 //! tests compare event sequences via `Debug`. This avoids requiring
 //! `Deserialize` on `AssistantMessageEvent` (which is stream-protocol-only).
 
-use pi_ai::types::{AssistantMessageEvent, ToolResultMessage};
+use rpi_ai::types::{AssistantMessageEvent, ToolResultMessage};
 use std::sync::Arc;
 
 use crate::message::AgentMessage;

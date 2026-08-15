@@ -13,9 +13,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use pi_agent::agent_tool::AgentTool;
-use pi_agent::error::AgentError;
-use pi_tools::{
+use rpi_agent::agent_tool::AgentTool;
+use rpi_agent::error::AgentError;
+use rpi_tools::{
     BashToolOptions, ExecutionToolContext, FileSystem, InMemoryExecutionEnv, ShellScript,
     DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES,
 };
@@ -23,8 +23,8 @@ use tokio_util::sync::CancellationToken;
 
 fn fresh_context() -> (Arc<InMemoryExecutionEnv>, ExecutionToolContext) {
     let env = Arc::new(InMemoryExecutionEnv::with_cwd("/tmp/work".into()));
-    let env_dyn: Arc<dyn pi_tools::ExecutionEnv> = env.clone();
-    let mut_env: Arc<dyn pi_tools::MutatingEnv> = env.clone();
+    let env_dyn: Arc<dyn rpi_tools::ExecutionEnv> = env.clone();
+    let mut_env: Arc<dyn rpi_tools::MutatingEnv> = env.clone();
     let ctx = ExecutionToolContext::new(env_dyn, Some(mut_env));
     (env, ctx)
 }
@@ -32,15 +32,15 @@ fn fresh_context() -> (Arc<InMemoryExecutionEnv>, ExecutionToolContext) {
 async fn run_bash(
     tool: Arc<dyn AgentTool>,
     params: serde_json::Value,
-) -> Result<pi_agent::types::AgentToolResult, AgentError> {
+) -> Result<rpi_agent::types::AgentToolResult, AgentError> {
     let signal = CancellationToken::new();
     let on_update = Arc::new(|_p| ());
     let prepared = tool.prepare_arguments(params.clone()).unwrap_or_else(|_| params);
     tool.execute("bash-x", prepared, signal, on_update).await
 }
 
-fn text_output(r: &pi_agent::types::AgentToolResult) -> String {
-    use pi_agent::types::TextContentOrImage;
+fn text_output(r: &rpi_agent::types::AgentToolResult) -> String {
+    use rpi_agent::types::TextContentOrImage;
     r.content
         .iter()
         .filter_map(|c| match c {
@@ -62,7 +62,7 @@ fn err_text(e: &AgentError) -> String {
 async fn no_output_renders_placeholder() {
     let (env, ctx) = fresh_context();
     env.register_shell("noop", ShellScript::success("")).await;
-    let tool = pi_tools::create_bash_tool(&ctx, None);
+    let tool = rpi_tools::create_bash_tool(&ctx, None);
     let r = run_bash(tool, serde_json::json!({ "command": "noop" }))
         .await
         .expect("ok");
@@ -84,7 +84,7 @@ async fn combines_stdout_and_stderr() {
         },
     )
     .await;
-    let tool = pi_tools::create_bash_tool(&ctx, None);
+    let tool = rpi_tools::create_bash_tool(&ctx, None);
     let r = run_bash(tool, serde_json::json!({ "command": "both" }))
         .await
         .expect("ok");
@@ -106,7 +106,7 @@ async fn nonzero_exit_returns_error_with_output() {
         },
     )
     .await;
-    let tool = pi_tools::create_bash_tool(&ctx, None);
+    let tool = rpi_tools::create_bash_tool(&ctx, None);
     let err = run_bash(tool, serde_json::json!({ "command": "fail" }))
         .await
         .expect_err("nonzero exit → Err");
@@ -128,7 +128,7 @@ async fn abort_returns_error() {
         },
     )
     .await;
-    let tool = pi_tools::create_bash_tool(&ctx, None);
+    let tool = rpi_tools::create_bash_tool(&ctx, None);
     let signal = CancellationToken::new();
     let on_update = Arc::new(|_p| ());
     let handle = {
@@ -164,7 +164,7 @@ async fn persists_truncated_full_output_to_temp_file() {
         + "\n";
     env.register_shell("big", ShellScript::success(lines)).await;
 
-    let tool = pi_tools::create_bash_tool(&ctx, None);
+    let tool = rpi_tools::create_bash_tool(&ctx, None);
     let r = run_bash(tool, serde_json::json!({ "command": "big" }))
         .await
         .expect("ok");
@@ -195,7 +195,7 @@ async fn reports_oversized_final_line_size() {
     env.register_shell("oneline", ShellScript::success(big_line))
         .await;
 
-    let tool = pi_tools::create_bash_tool(&ctx, None);
+    let tool = rpi_tools::create_bash_tool(&ctx, None);
     let r = run_bash(tool, serde_json::json!({ "command": "oneline" }))
         .await
         .expect("ok");
@@ -214,7 +214,7 @@ async fn supports_command_prefix() {
     env.register_shell("value=hello\necho hello", ShellScript::success("hello"))
         .await;
     let tool =
-        pi_tools::create_bash_tool(&ctx, Some(BashToolOptions { command_prefix: Some("value=hello".into()) }));
+        rpi_tools::create_bash_tool(&ctx, Some(BashToolOptions { command_prefix: Some("value=hello".into()) }));
     // The shell_script prefix-matches on the composed command start; echo is the
     // user command. Register a broader prefix to be safe.
     env.register_shell("value=hello", ShellScript::success("hello"))

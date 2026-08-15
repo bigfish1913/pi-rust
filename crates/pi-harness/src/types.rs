@@ -4,7 +4,7 @@
 //! (ported in M4 to `pi-tools/src/env.rs`) and a harness-configuration section
 //! (`Skill`, `PromptTemplate`, `AgentHarnessResources`, `AgentHarnessTool`,
 //! `AgentHarnessStreamOptions` + `Patch`, `AgentHarnessOptions`, `DrivingMode`).
-//! This module mirrors the latter; it re-exports the M4 env types via `pi_tools`
+//! This module mirrors the latter; it re-exports the M4 env types via `rpi_tools`
 //! where the harness needs them.
 //!
 //! `Result`/`ok`/`err`/`getOrThrow`/`toError` from the same TS file are dropped —
@@ -13,8 +13,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use pi_ai::{CacheRetention, Model, Provider, SimpleStreamOptions, ThinkingLevel};
-use pi_agent::{AgentTool, ConvertToLlm, QueueMode};
+use rpi_ai::{CacheRetention, Model, Provider, SimpleStreamOptions, ThinkingLevel};
+use rpi_agent::{AgentTool, ConvertToLlm, QueueMode};
 use serde::{Deserialize, Serialize};
 
 use crate::session::context::CustomEntryContextMessageProjector;
@@ -285,7 +285,7 @@ pub enum DrivingMode {
 }
 
 /// How a batch of tool calls executes. Mirrors TS `toolExecution` option; maps
-/// 1:1 to `pi_agent::ToolExecutionMode`.
+/// 1:1 to `rpi_agent::ToolExecutionMode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HarnessToolExecution {
     #[default]
@@ -294,25 +294,25 @@ pub enum HarnessToolExecution {
 }
 
 impl HarnessToolExecution {
-    pub fn to_agent_mode(self) -> pi_agent::ToolExecutionMode {
+    pub fn to_agent_mode(self) -> rpi_agent::ToolExecutionMode {
         match self {
-            HarnessToolExecution::Parallel => pi_agent::ToolExecutionMode::Parallel,
-            HarnessToolExecution::Sequential => pi_agent::ToolExecutionMode::Sequential,
+            HarnessToolExecution::Parallel => rpi_agent::ToolExecutionMode::Parallel,
+            HarnessToolExecution::Sequential => rpi_agent::ToolExecutionMode::Sequential,
         }
     }
 }
 
-/// Re-export of `pi_tools::ExecutionEnv` so harness consumers can reach the env
-/// trait through `pi_harness::types::ExecutionEnv` (mirroring how `types.ts`
+/// Re-export of `rpi_tools::ExecutionEnv` so harness consumers can reach the env
+/// trait through `rpi_harness::types::ExecutionEnv` (mirroring how `types.ts`
 /// declares `ExecutionEnv` itself).
-pub use pi_tools::ExecutionEnv;
+pub use rpi_tools::ExecutionEnv;
 
 /// Re-export the operation-kind enum so callers referencing it via the harness
 /// root see the TS-equivalent name.
 pub use crate::result::OperationKind as HarnessOperationKind;
 
 /// `Usage` re-export for harness-record helpers.
-pub use pi_ai::types::Usage as HarnessUsage;
+pub use rpi_ai::types::Usage as HarnessUsage;
 
 /// Reserved container for the `AgentHarnessOptions` config. Populated in M5f
 /// when the `AgentHarness` is implemented; declared now so downstream modules
@@ -362,7 +362,7 @@ impl Default for AgentHarnessOptions {
             model: Model::new(
                 "faux".to_string(),
                 "Faux".to_string(),
-                pi_ai::Api::AnthropicMessages,
+                rpi_ai::Api::AnthropicMessages,
                 "faux".to_string(),
                 "https://example.test".to_string(),
             ),

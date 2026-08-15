@@ -13,17 +13,17 @@
 
 use std::sync::Arc;
 
-use pi_harness::prompt_templates::{
+use rpi_harness::prompt_templates::{
     format_prompt_template_invocation, load_prompt_templates, load_sourced_prompt_templates,
     substitute_args, PromptTemplateDiagnosticCode, SourcedTemplateInput,
 };
-use pi_harness::types::PromptTemplate;
-use pi_tools::in_memory::InMemoryExecutionEnv;
-use pi_tools::FileSystem;
+use rpi_harness::types::PromptTemplate;
+use rpi_tools::in_memory::InMemoryExecutionEnv;
+use rpi_tools::FileSystem;
 
-fn fresh_env() -> (Arc<InMemoryExecutionEnv>, Arc<dyn pi_tools::ExecutionEnv>) {
+fn fresh_env() -> (Arc<InMemoryExecutionEnv>, Arc<dyn rpi_tools::ExecutionEnv>) {
     let typed = Arc::new(InMemoryExecutionEnv::new());
-    let env: Arc<dyn pi_tools::ExecutionEnv> = typed.clone();
+    let env: Arc<dyn rpi_tools::ExecutionEnv> = typed.clone();
     (typed, env)
 }
 
@@ -171,7 +171,7 @@ fn substitute_args_does_not_re_expand_expansion() {
 fn template_name_strips_single_md_once() {
     // Mirrors TS `fileName.replace(/\.md$/i, "")` — a single (not repeated)
     // case-insensitive trailing `.md` strip.
-    use pi_harness::prompt_templates::parse_command_args;
+    use rpi_harness::prompt_templates::parse_command_args;
     assert_eq!(parse_command_args("a b c"), vec!["a", "b", "c"]);
     // sanity-check the helper isn't dead: a quoted multi-word arg.
     assert_eq!(parse_command_args("'hello world' test"), vec!["hello world", "test"]);

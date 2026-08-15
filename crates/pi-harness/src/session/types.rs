@@ -11,7 +11,7 @@
 
 use std::collections::BTreeMap;
 
-use pi_ai::types::{DeferredHandle, StopReason, Usage};
+use rpi_ai::types::{DeferredHandle, StopReason, Usage};
 use serde::{Deserialize, Serialize};
 
 use crate::error::SessionResult;
@@ -68,7 +68,7 @@ pub fn provisioned_from_entry(entry: &Entry) -> ProvisionedEntry {
 /// terminal stop reasons; `pending` is a transient streaming state.
 ///
 /// Serialized with `rename_all = "camelCase"` so `ToolUse` → `"toolUse"` matches
-/// the `pi_ai` wire convention (NOT `"tool_use"`).
+/// the `rpi_ai` wire convention (NOT `"tool_use"`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum SessionStopReason {
@@ -141,7 +141,7 @@ pub struct EntryBase {
 pub struct MessageEntry {
     #[serde(flatten)]
     pub base: EntryBase,
-    pub message: pi_agent::message::AgentMessage,
+    pub message: rpi_agent::message::AgentMessage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminate: Option<bool>,
 }
@@ -177,7 +177,7 @@ pub struct CompactionEntry {
     #[serde(flatten)]
     pub base: EntryBase,
     pub summary: String,
-    pub retained_tail: Vec<pi_agent::message::AgentMessage>,
+    pub retained_tail: Vec<rpi_agent::message::AgentMessage>,
     pub tokens_before: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<JsonValue>,
@@ -274,9 +274,9 @@ impl Entry {
 
     /// The role of a message entry's message, or `None` for non-message entries.
     /// Used by compaction's `findValidCutPoints` / `findTurnStartIndex`.
-    /// Returns an owned [`pi_agent::message::AgentMessageRole`] (it may carry a
+    /// Returns an owned [`rpi_agent::message::AgentMessageRole`] (it may carry a
     /// custom role `String`, so it can't be a cheap `Copy`).
-    pub fn message_role(&self) -> Option<pi_agent::message::AgentMessageRole> {
+    pub fn message_role(&self) -> Option<rpi_agent::message::AgentMessageRole> {
         match self {
             Entry::Message(m) => Some(m.message.role()),
             _ => None,
@@ -284,7 +284,7 @@ impl Entry {
     }
 
     /// Borrow the message if this is a `Message` entry.
-    pub fn as_message(&self) -> Option<&pi_agent::message::AgentMessage> {
+    pub fn as_message(&self) -> Option<&rpi_agent::message::AgentMessage> {
         match self {
             Entry::Message(m) => Some(&m.message),
             _ => None,
@@ -493,7 +493,7 @@ pub struct ProvisionedEntry {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum ProvisionedKind {
     Message {
-        message: pi_agent::message::AgentMessage,
+        message: rpi_agent::message::AgentMessage,
         terminate: Option<bool>,
     },
     ModelChange { provider: String, model_id: String },
@@ -501,7 +501,7 @@ pub enum ProvisionedKind {
     ActiveTools { active_tool_names: Vec<String> },
     Compaction {
         summary: String,
-        retained_tail: Vec<pi_agent::message::AgentMessage>,
+        retained_tail: Vec<rpi_agent::message::AgentMessage>,
         tokens_before: i64,
         details: Option<JsonValue>,
         usage: Option<Usage>,
@@ -594,7 +594,7 @@ pub enum OperationIntent {
     Run {
         /// Normalized caller input before `before_run`; kept for suspended
         /// operations and `before_resume`.
-        original_prompt: Vec<pi_agent::message::AgentMessage>,
+        original_prompt: Vec<rpi_agent::message::AgentMessage>,
         /// Captured nextRun items, then the prompt, then before_run injections.
         initial_messages: Vec<ProvisionedEntryJSON>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1215,7 +1215,7 @@ pub trait SessionTree: Send + Sync {
 
     /// Writes resolve on durable acceptance; the returned id is the entry's id
     /// (provisioned when the write defers).
-    async fn append_message(&self, message: pi_agent::message::AgentMessage) -> SessionResult<String>;
+    async fn append_message(&self, message: rpi_agent::message::AgentMessage) -> SessionResult<String>;
     async fn append_custom_entry(&self, custom_type: &str, data: Option<JsonValue>) -> SessionResult<String>;
 }
 

@@ -17,22 +17,22 @@ mod common;
 use std::sync::Arc;
 
 use common::{base_config, run_and_collect, user_message};
-use pi_agent::{AgentContext, AgentEvent, AgentToolResult, ToolResultPartial};
-use pi_ai::event_stream::create_assistant_message_event_stream;
-use pi_ai::types::{AssistantMessage, AssistantMessageEvent, DoneReason, StopReason};
+use rpi_agent::{AgentContext, AgentEvent, AgentToolResult, ToolResultPartial};
+use rpi_ai::event_stream::create_assistant_message_event_stream;
+use rpi_ai::types::{AssistantMessage, AssistantMessageEvent, DoneReason, StopReason};
 use tokio_util::sync::CancellationToken;
 
 /// A tool that captures the `on_update` callback it was handed so the test can
 /// invoke it later. Emits one update ("running") during `execute`, then returns
 /// a terminating result ("ok"). The captured callback outlives `execute`.
 struct DelayedTool {
-    schema: pi_ai::types::Tool,
+    schema: rpi_ai::types::Tool,
     captured: Arc<std::sync::Mutex<Option<Arc<dyn Fn(ToolResultPartial) + Send + Sync>>>>,
 }
 
 #[async_trait::async_trait]
-impl pi_agent::AgentTool for DelayedTool {
-    fn schema(&self) -> &pi_ai::types::Tool {
+impl rpi_agent::AgentTool for DelayedTool {
+    fn schema(&self) -> &rpi_ai::types::Tool {
         &self.schema
     }
     fn label(&self) -> &str {
@@ -44,19 +44,19 @@ impl pi_agent::AgentTool for DelayedTool {
         _params: serde_json::Value,
         _signal: CancellationToken,
         on_update: Arc<dyn Fn(ToolResultPartial) + Send + Sync>,
-    ) -> Result<AgentToolResult, pi_agent::AgentError> {
+    ) -> Result<AgentToolResult, rpi_agent::AgentError> {
         // Stash the callback so the test can fire a late update.
         *self.captured.lock().expect("captured lock") = Some(Arc::clone(&on_update));
         // One legitimate update during execution.
         on_update(AgentToolResult {
-            content: vec![pi_agent::TextContentOrImage::text("running")],
+            content: vec![rpi_agent::TextContentOrImage::text("running")],
             details: serde_json::json!({ "status": "running" }),
             ..AgentToolResult::default()
         });
         // Delay a beat so the late call is provably *after* settle.
         tokio::task::yield_now().await;
         Ok(AgentToolResult {
-            content: vec![pi_agent::TextContentOrImage::text("ok")],
+            content: vec![rpi_agent::TextContentOrImage::text("ok")],
             details: serde_json::json!({ "status": "done" }),
             terminate: true,
             ..AgentToolResult::default()
@@ -64,11 +64,11 @@ impl pi_agent::AgentTool for DelayedTool {
     }
 }
 
-fn empty_object_schema(name: &str, _label: &str, description: &str) -> pi_ai::types::Tool {
-    pi_ai::types::Tool {
+fn empty_object_schema(name: &str, _label: &str, description: &str) -> rpi_ai::types::Tool {
+    rpi_ai::types::Tool {
         name: name.to_string(),
         description: description.to_string(),
-        parameters: pi_ai::types::Schema::new(serde_json::json!({
+        parameters: rpi_ai::types::Schema::new(serde_json::json!({
             "type": "object",
             "properties": {},
             "additionalProperties": false,
@@ -78,13 +78,13 @@ fn empty_object_schema(name: &str, _label: &str, description: &str) -> pi_ai::ty
 }
 
 /// Build a one-call mock stream returning an assistant message with tool calls.
-fn single_tool_use_stream_fn(calls: Vec<(&str, &str)>) -> pi_agent::StreamFn {
-    use pi_ai::types::{Content, ToolCall};
+fn single_tool_use_stream_fn(calls: Vec<(&str, &str)>) -> rpi_agent::StreamFn {
+    use rpi_ai::types::{Content, ToolCall};
     let content: Vec<Content> = calls
         .into_iter()
         .map(|(id, name)| {
             Content::ToolCall(ToolCall {
-                kind: pi_ai::types::ToolCallType,
+                kind: rpi_ai::types::ToolCallType,
                 id: id.to_string(),
                 name: name.to_string(),
                 arguments: serde_json::json!({}),
@@ -94,14 +94,14 @@ fn single_tool_use_stream_fn(calls: Vec<(&str, &str)>) -> pi_agent::StreamFn {
         })
         .collect();
     let message = AssistantMessage {
-        role: pi_ai::types::AssistantRole,
+        role: rpi_ai::types::AssistantRole,
         content,
-        api: pi_ai::types::Api::Other("openai-responses".into()),
+        api: rpi_ai::types::Api::Other("openai-responses".into()),
         provider: "mock".to_string(),
         model: "mock".to_string(),
         response_model: None,
         response_id: None,
-        usage: pi_ai::types::Usage::zero(),
+        usage: rpi_ai::types::Usage::zero(),
         stop_reason: StopReason::ToolUse,
         deferred: None,
         error_message: None,
@@ -109,7 +109,7 @@ fn single_tool_use_stream_fn(calls: Vec<(&str, &str)>) -> pi_agent::StreamFn {
         end_turn: None,
         timestamp: 0,
     };
-    pi_agent::stream_fn(move |_model, _ctx, _opts| {
+    rpi_agent::stream_fn(move |_model, _ctx, _opts| {
         // Re-clone the message for every call — but this stream_fn is only
         // used for a single-turn terminate run, so one-shot is fine.
         let msg = message.clone();
@@ -165,7 +165,7 @@ async fn ignores_tool_updates_after_execute_settles() {
     let late = captured.lock().expect("captured lock").clone();
     if let Some(cb) = late {
         cb(AgentToolResult {
-            content: vec![pi_agent::TextContentOrImage::text("late")],
+            content: vec![rpi_agent::TextContentOrImage::text("late")],
             details: serde_json::json!({ "status": "late" }),
             ..AgentToolResult::default()
         });
@@ -190,14 +190,14 @@ async fn ignores_tool_updates_after_execute_settles() {
 /// A tool that blocks until a release `Notify` is fired. Keeps the agent run
 /// active so a *settled* peer's late update can be attempted mid-run.
 struct BlockingTool {
-    schema: pi_ai::types::Tool,
+    schema: rpi_ai::types::Tool,
     release: Arc<tokio::sync::Notify>,
     started: Arc<tokio::sync::Notify>,
 }
 
 #[async_trait::async_trait]
-impl pi_agent::AgentTool for BlockingTool {
-    fn schema(&self) -> &pi_ai::types::Tool {
+impl rpi_agent::AgentTool for BlockingTool {
+    fn schema(&self) -> &rpi_ai::types::Tool {
         &self.schema
     }
     fn label(&self) -> &str {
@@ -209,11 +209,11 @@ impl pi_agent::AgentTool for BlockingTool {
         _params: serde_json::Value,
         _signal: CancellationToken,
         _on_update: Arc<dyn Fn(ToolResultPartial) + Send + Sync>,
-    ) -> Result<AgentToolResult, pi_agent::AgentError> {
+    ) -> Result<AgentToolResult, rpi_agent::AgentError> {
         self.started.notify_one();
         self.release.notified().await;
         Ok(AgentToolResult {
-            content: vec![pi_agent::TextContentOrImage::text("done")],
+            content: vec![rpi_agent::TextContentOrImage::text("done")],
             details: serde_json::json!({ "status": "done" }),
             terminate: true,
             ..AgentToolResult::default()
@@ -223,13 +223,13 @@ impl pi_agent::AgentTool for BlockingTool {
 
 /// A tool that settles immediately and captures its `on_update` for the test.
 struct SettledTool {
-    schema: pi_ai::types::Tool,
+    schema: rpi_ai::types::Tool,
     captured: Arc<std::sync::Mutex<Option<Arc<dyn Fn(ToolResultPartial) + Send + Sync>>>>,
 }
 
 #[async_trait::async_trait]
-impl pi_agent::AgentTool for SettledTool {
-    fn schema(&self) -> &pi_ai::types::Tool {
+impl rpi_agent::AgentTool for SettledTool {
+    fn schema(&self) -> &rpi_ai::types::Tool {
         &self.schema
     }
     fn label(&self) -> &str {
@@ -241,10 +241,10 @@ impl pi_agent::AgentTool for SettledTool {
         _params: serde_json::Value,
         _signal: CancellationToken,
         on_update: Arc<dyn Fn(ToolResultPartial) + Send + Sync>,
-    ) -> Result<AgentToolResult, pi_agent::AgentError> {
+    ) -> Result<AgentToolResult, rpi_agent::AgentError> {
         *self.captured.lock().expect("captured lock") = Some(Arc::clone(&on_update));
         Ok(AgentToolResult {
-            content: vec![pi_agent::TextContentOrImage::text("done")],
+            content: vec![rpi_agent::TextContentOrImage::text("done")],
             details: serde_json::json!({ "status": "done" }),
             terminate: true,
             ..AgentToolResult::default()
@@ -289,14 +289,14 @@ async fn ignores_settled_parallel_update_while_another_tool_runs() {
 
     // We can't use run_and_collect — we need to interject mid-run. Drive the
     // loop on a task and collect events into a shared buffer.
-    let (collector, events_buf) = pi_agent::CollectorEmitter::new();
-    let emit: Arc<dyn pi_agent::AgentEmitter> = Arc::new(collector);
+    let (collector, events_buf) = rpi_agent::CollectorEmitter::new();
+    let emit: Arc<dyn rpi_agent::AgentEmitter> = Arc::new(collector);
     let cfg = base_config();
     let prompts = vec![user_message("run tools")];
     let ctx = context;
     let sf = stream_fn;
     let run_handle = tokio::spawn(async move {
-        pi_agent::run_agent_loop(prompts, ctx, cfg, emit, sf).await
+        rpi_agent::run_agent_loop(prompts, ctx, cfg, emit, sf).await
     });
 
     // Wait for slow_tool to start (notified inside its execute).
@@ -328,7 +328,7 @@ async fn ignores_settled_parallel_update_while_another_tool_runs() {
     let late = settled_captured.lock().expect("captured lock").clone();
     if let Some(cb) = late {
         cb(AgentToolResult {
-            content: vec![pi_agent::TextContentOrImage::text("late")],
+            content: vec![rpi_agent::TextContentOrImage::text("late")],
             details: serde_json::json!({ "status": "late" }),
             ..AgentToolResult::default()
         });

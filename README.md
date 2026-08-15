@@ -1,21 +1,26 @@
-# pi-rust — Rust port of the Pi agent SDK
+# rpi — Rust port of the Pi agent SDK
 
 A Rust port of [earendil-works/pi](https://github.com/earendil-works/pi)'s SDK
 layer — a library-first, multi-crate workspace for building personal LLM coding
-agents in Rust, plus a `pi` CLI built on top.
+agents in Rust, plus an `rpi` CLI built on top.
 
-## Crates
+> **Naming.** The published crates use the `rpi-` prefix (the upstream `pi-*`
+> names are owned on crates.io by a parallel port). The on-disk directories stay
+> `crates/pi-*` for history; the `package.name` in each `Cargo.toml` is
+> `rpi-*`, so `extern crate` / `use` paths are `rpi_ai`, `rpi_agent`, etc.
 
-| Crate          | What it is                                                          |
-|----------------|---------------------------------------------------------------------|
-| `pi-telemetry` | Telemetry span/event contracts (noop default).                      |
-| `pi-ai`        | Unified multi-provider LLM types + streaming (Anthropic + faux).    |
-| `pi-agent`     | Agent runtime + loop, `AgentTool` trait, events, hooks, queues.     |
-| `pi-tools`     | Built-in tools (`read`/`write`/`edit`/`bash`/`grep`/`find`/`ls`) + `ExecutionEnv`. |
-| `pi-harness`   | `AgentHarness`: session tree, JSONL persistence, compaction, run loop. |
-| `pi-cli`       | Terminal coding-agent CLI (`pi` binary) on top of the library crates. |
+## Crates (published as `rpi-*`)
 
-Dependency direction: `pi-telemetry → pi-ai → pi-agent → pi-tools → pi-harness → pi-cli`.
+| Crate (crates.io) | On-disk dir      | What it is                                                          |
+|-------------------|------------------|---------------------------------------------------------------------|
+| `rpi-telemetry`   | `pi-telemetry/`  | Telemetry span/event contracts (noop default).                      |
+| `rpi-ai`          | `pi-ai/`         | Unified multi-provider LLM types + streaming (Anthropic + faux).    |
+| `rpi-agent`       | `pi-agent/`      | Agent runtime + loop, `AgentTool` trait, events, hooks, queues.     |
+| `rpi-tools`       | `pi-tools/`      | Built-in tools (`read`/`write`/`edit`/`bash`/`grep`/`find`/`ls`) + `ExecutionEnv`. |
+| `rpi-harness`     | `pi-harness/`    | `AgentHarness`: session tree, JSONL persistence, compaction, run loop. |
+| `rpi-cli`         | `pi-cli/`        | Terminal coding-agent CLI (`rpi` binary) on top of the library crates. |
+
+Dependency direction: `rpi-telemetry → rpi-ai → rpi-agent → rpi-tools → rpi-harness → rpi-cli`.
 
 ## Relationship to the TypeScript source
 
@@ -29,8 +34,8 @@ the CLI, keeping the layering and behavior faithful while using idiomatic Rust
 ## How you build an agent
 
 ```rust
-use pi_agent::{Agent, AgentTool, AgentEvent};
-use pi_ai::{providers::faux::faux_provider, Model};
+use rpi_agent::{Agent, AgentTool, AgentEvent};
+use rpi_ai::{providers::faux::faux_provider, Model};
 
 let model = faux_provider().model("echo");
 let mut agent = Agent::builder(model)
@@ -59,6 +64,17 @@ See [docs/architecture.md](docs/architecture.md) for the full design.
   `FileSystem` trait — no `rg`/`fd` shell-out).
 - **Sessions:** JSONL v4 durable backend + in-memory ephemeral; compaction + a
   split-turn two-LLM-call invariant.
+
+## Releasing
+
+Publish the crate family with `release.ps1` (Windows) or `release.sh` (Unix/CI),
+dep-ordered, dry-run by default:
+
+```
+./release.ps1            # safe dry run
+./release.ps1 -DryRun    # same, explicit
+./release.ps1 -Publish   # real publish to crates.io (run `cargo login` first)
+```
 
 ## License
 

@@ -27,7 +27,7 @@
 use std::io::{IsTerminal, Read};
 use std::path::Path;
 
-use pi_ai::types::ImageContent;
+use rpi_ai::types::ImageContent;
 
 use crate::args::{parse_args, print_help, print_version, resolve_mode, Args, RunMode};
 use crate::provider::{resolve, ResolveError};

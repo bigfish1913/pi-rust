@@ -3,18 +3,18 @@
 //!
 //! Exercises the public codec surface (`encode_header`/`parse_header`,
 //! `encode_mutation`/`parse_mutation`, `metadata_from_header`) against the
-//! rust wire shapes. Run against `pi_harness::session::jsonl::*` only — no FS.
+//! rust wire shapes. Run against `rpi_harness::session::jsonl::*` only — no FS.
 
 use std::collections::BTreeMap;
 
-use pi_harness::session::jsonl::{
+use rpi_harness::session::jsonl::{
     encode_header, encode_mutation, metadata_from_header, parse_header, parse_mutation,
     HeaderKind, JsonlDecodeErrorKind, JsonlSessionMetadata, JsonlSourceFormat, JsonlV4Header,
 };
-use pi_harness::session::types::{
+use rpi_harness::session::types::{
     EntryBase, LaneRecord, OperationIntent, OperationStartedRecord, RecordBase, SessionMutation,
 };
-use pi_agent::message::AgentMessage;
+use rpi_agent::message::AgentMessage;
 
 fn header_with_parent() -> JsonlV4Header {
     let mut metadata = serde_json::Map::new();
@@ -61,8 +61,8 @@ fn header_with_metadata_map() -> JsonlV4Header {
     )
 }
 
-fn custom_entry(id: &str, seq: u64, parent_id: Option<&str>, timestamp: i64) -> pi_harness::session::types::Entry {
-    use pi_harness::session::types::{CustomEntry, Entry};
+fn custom_entry(id: &str, seq: u64, parent_id: Option<&str>, timestamp: i64) -> rpi_harness::session::types::Entry {
+    use rpi_harness::session::types::{CustomEntry, Entry};
     let base = EntryBase {
         entry_type: "custom".to_string(),
         id: id.to_string(),
@@ -148,7 +148,7 @@ fn assert_mutation_round_trip(mutation: &SessionMutation) {
 }
 
 fn user_message(text: &str) -> AgentMessage {
-    AgentMessage::User(pi_ai::types::UserMessage::new(text, 1))
+    AgentMessage::User(rpi_ai::types::UserMessage::new(text, 1))
 }
 
 #[test]

@@ -13,18 +13,18 @@
 
 use std::sync::Arc;
 
-use pi_agent::message::AgentMessage;
-use pi_harness::error::SessionErrorCode;
-use pi_harness::session::jsonl::{encode_mutation, JsonlSessionStorage, JsonlV4Header};
-use pi_harness::session::memory::{CounterIdGenerator, FakeClock};
-use pi_harness::session::types::{
+use rpi_agent::message::AgentMessage;
+use rpi_harness::error::SessionErrorCode;
+use rpi_harness::session::jsonl::{encode_mutation, JsonlSessionStorage, JsonlV4Header};
+use rpi_harness::session::memory::{CounterIdGenerator, FakeClock};
+use rpi_harness::session::types::{
     EntryOrder, EntryQuery, LaneRecord, OperationIntent, OperationStartedRecord, ProvisionedEntry,
     ProvisionedKind, RecordBase, SessionMutation, SessionStorage,
 };
-use pi_tools::env::{FileContent, FileSystem};
+use rpi_tools::env::{FileContent, FileSystem};
 
 fn user_msg(text: &str) -> AgentMessage {
-    AgentMessage::User(pi_ai::types::UserMessage::new(text, 1))
+    AgentMessage::User(rpi_ai::types::UserMessage::new(text, 1))
 }
 
 fn header() -> JsonlV4Header {
@@ -45,7 +45,7 @@ type Fixture = (
 );
 
 fn fixture() -> Fixture {
-    let env = pi_tools::InMemoryExecutionEnv::with_cwd("/".into());
+    let env = rpi_tools::InMemoryExecutionEnv::with_cwd("/".into());
     let fs: Arc<dyn FileSystem> = Arc::new(env);
     (fs, Arc::new(FakeClock::new()), Arc::new(CounterIdGenerator::new()))
 }

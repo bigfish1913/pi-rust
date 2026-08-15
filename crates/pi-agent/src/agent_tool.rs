@@ -4,7 +4,7 @@
 //! TS `AgentTool` extends `Tool` with `label`, optional `prepareArguments`,
 //! `execute`, and per-tool `executionMode`. The Rust port keeps the same shape:
 //! a struct-less `#[async_trait]` `AgentTool` returning the public `Tool`
-//! schema from `pi_ai`. Tools are held behind `Arc<dyn AgentTool>` so the agent
+//! schema from `rpi_ai`. Tools are held behind `Arc<dyn AgentTool>` so the agent
 //! can store + dispatch them without generics.
 //!
 //! The `execute` signature carries an `on_update` callback (`&dyn Fn`) for
@@ -13,7 +13,7 @@
 //! resolves are no-ops — the late-update suppression invariant (plan §5.3).
 
 use async_trait::async_trait;
-use pi_ai::types::Tool;
+use rpi_ai::types::Tool;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::AgentError;

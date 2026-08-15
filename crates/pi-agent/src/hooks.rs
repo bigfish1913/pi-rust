@@ -16,9 +16,9 @@ use crate::types::{
     BeforeToolCallResult, ShouldStopAfterTurnContext, ToolExecutionMode,
 };
 use futures::future::BoxFuture;
-use pi_ai::provider::{CacheRetention, SimpleStreamOptions};
-use pi_ai::types::{Message, ThinkingLevel};
-use pi_ai::Model;
+use rpi_ai::provider::{CacheRetention, SimpleStreamOptions};
+use rpi_ai::types::{Message, ThinkingLevel};
+use rpi_ai::Model;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;

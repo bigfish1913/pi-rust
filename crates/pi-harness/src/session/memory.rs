@@ -498,8 +498,8 @@ mod tests {
         RecordBase { id: id.to_string(), seq, lane: lane.to_string(), timestamp: seq as i64 }
     }
 
-    fn user_msg(text: &str) -> pi_agent::message::AgentMessage {
-        pi_agent::message::AgentMessage::User(pi_ai::types::UserMessage::new(text, 1))
+    fn user_msg(text: &str) -> rpi_agent::message::AgentMessage {
+        rpi_agent::message::AgentMessage::User(rpi_ai::types::UserMessage::new(text, 1))
     }
 
     #[tokio::test]

@@ -22,11 +22,11 @@ mod common;
 use std::sync::Arc;
 
 use common::{assistant_text, assistant_tool_calls, base_config, run_and_collect, user_message};
-use pi_agent::{
+use rpi_agent::{
     AgentContext, AgentEvent, AgentToolResult, AfterToolCall, AfterToolCallResult, BeforeToolCall,
     BeforeToolCallResult, ToolExecutionMode,
 };
-use pi_ai::types::{StopReason, Usage, UsageCost};
+use rpi_ai::types::{StopReason, Usage, UsageCost};
 use tokio_util::sync::CancellationToken;
 
 // ----------------------------------------------------------------------------
@@ -40,7 +40,7 @@ type Executed = Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
 /// A scripted echo tool — records every executed `value` (as a raw JSON value
 /// so the mutate-args test can observe a number where a string was validated).
 struct EchoTool {
-    schema: pi_ai::types::Tool,
+    schema: rpi_ai::types::Tool,
     executed: Executed,
     /// When `Some`, `execute` returns this `usage` on its result. The
     /// `after_tool_call` test uses this to assert the hook observes it.
@@ -70,8 +70,8 @@ impl EchoTool {
 }
 
 #[async_trait::async_trait]
-impl pi_agent::AgentTool for EchoTool {
-    fn schema(&self) -> &pi_ai::types::Tool {
+impl rpi_agent::AgentTool for EchoTool {
+    fn schema(&self) -> &rpi_ai::types::Tool {
         &self.schema
     }
     fn label(&self) -> &str {
@@ -82,8 +82,8 @@ impl pi_agent::AgentTool for EchoTool {
         _tool_call_id: &str,
         params: serde_json::Value,
         _signal: CancellationToken,
-        _on_update: Arc<dyn Fn(pi_agent::ToolResultPartial) + Send + Sync>,
-    ) -> Result<AgentToolResult, pi_agent::AgentError> {
+        _on_update: Arc<dyn Fn(rpi_agent::ToolResultPartial) + Send + Sync>,
+    ) -> Result<AgentToolResult, rpi_agent::AgentError> {
         let value = params.get("value").cloned().unwrap_or(serde_json::Value::Null);
         self.executed.lock().expect("executed lock").push(value.clone());
         let mut result = AgentToolResult::text(format!("echoed: {value}"));
@@ -95,11 +95,11 @@ impl pi_agent::AgentTool for EchoTool {
     }
 }
 
-fn value_schema(name: &str) -> pi_ai::types::Tool {
-    pi_ai::types::Tool {
+fn value_schema(name: &str) -> rpi_ai::types::Tool {
+    rpi_ai::types::Tool {
         name: name.to_string(),
         description: "Echo tool".to_string(),
-        parameters: pi_ai::types::Schema::new(serde_json::json!({
+        parameters: rpi_ai::types::Schema::new(serde_json::json!({
             "type": "object",
             "properties": { "value": { "type": "string" } },
             "required": ["value"],
@@ -109,7 +109,7 @@ fn value_schema(name: &str) -> pi_ai::types::Tool {
     }
 }
 
-fn context_with_tools(tools: Vec<Arc<dyn pi_agent::AgentTool>>) -> AgentContext {
+fn context_with_tools(tools: Vec<Arc<dyn rpi_agent::AgentTool>>) -> AgentContext {
     AgentContext {
         system_prompt: String::new(),
         messages: Vec::new(),
@@ -172,7 +172,7 @@ async fn after_tool_call_overrides_usage() {
     let after: AfterToolCall = {
         let observed = Arc::clone(&observed);
         let patched = patched_usage.clone();
-        Arc::new(move |ctx: pi_agent::AfterToolCallContext<'_>, _signal: CancellationToken| {
+        Arc::new(move |ctx: rpi_agent::AfterToolCallContext<'_>, _signal: CancellationToken| {
             let observed = Arc::clone(&observed);
             let patched = patched.clone();
             // Clone out of the borrowed context BEFORE the async block — the
@@ -230,7 +230,7 @@ async fn after_tool_call_overrides_usage() {
 
     // The persisted ToolResultMessage carries the patched usage too.
     let tool_result = new_messages.iter().find_map(|m| match m {
-        pi_agent::AgentMessage::ToolResult(t) => Some(t),
+        rpi_agent::AgentMessage::ToolResult(t) => Some(t),
         _ => None,
     });
     let tool_result = tool_result.expect("a toolResult message");
@@ -258,7 +258,7 @@ async fn before_tool_call_mutates_args_without_revalidation() {
     let context = context_with_tools(vec![Arc::new(tool)]);
 
     let before: BeforeToolCall =
-        Arc::new(|_ctx: pi_agent::BeforeToolCallContext<'_>, _signal: CancellationToken| {
+        Arc::new(|_ctx: rpi_agent::BeforeToolCallContext<'_>, _signal: CancellationToken| {
             Box::pin(async move {
                 Some(BeforeToolCallResult {
                     args: Some(serde_json::json!({ "value": 123 })),
@@ -301,7 +301,7 @@ async fn before_tool_call_block_terminate_stops_loop() {
     let context = context_with_tools(vec![Arc::new(tool)]);
 
     let before: BeforeToolCall =
-        Arc::new(|_ctx: pi_agent::BeforeToolCallContext<'_>, _signal: CancellationToken| {
+        Arc::new(|_ctx: rpi_agent::BeforeToolCallContext<'_>, _signal: CancellationToken| {
             Box::pin(async move {
                 Some(BeforeToolCallResult {
                     block: true,
@@ -341,7 +341,7 @@ async fn before_tool_call_block_terminate_stops_loop() {
 
     // The tool result is an error carrying the block reason.
     let tool_result = new_messages.iter().find_map(|m| match m {
-        pi_agent::AgentMessage::ToolResult(t) => Some(t),
+        rpi_agent::AgentMessage::ToolResult(t) => Some(t),
         _ => None,
     });
     let tool_result = tool_result.expect("a toolResult message");
@@ -350,7 +350,7 @@ async fn before_tool_call_block_terminate_stops_loop() {
         .content
         .iter()
         .filter_map(|c| match c {
-            pi_ai::types::Content::Text(t) => Some(t.text.clone()),
+            rpi_ai::types::Content::Text(t) => Some(t.text.clone()),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -375,7 +375,7 @@ async fn before_tool_call_mixed_batch_continues() {
     let context = context_with_tools(vec![Arc::new(tool)]);
 
     let before: BeforeToolCall = {
-        Arc::new(|ctx: pi_agent::BeforeToolCallContext<'_>, _signal: CancellationToken| {
+        Arc::new(|ctx: rpi_agent::BeforeToolCallContext<'_>, _signal: CancellationToken| {
             let value = ctx.args.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string();
             Box::pin(async move {
                 if value == "first" {

@@ -49,7 +49,7 @@ use async_trait::async_trait;
 use tokio::sync::Mutex as TokioMutex;
 use uuid::Uuid;
 
-use pi_tools::env::{FileKind, FileSystem};
+use rpi_tools::env::{FileKind, FileSystem};
 
 use crate::error::{SessionError, SessionResult};
 use crate::session::jsonl::codec::{metadata_from_header, parse_header};
@@ -665,8 +665,8 @@ mod tests {
     use crate::session::types::{OperationIntent, OperationStartedRecord, ProvisionedEntry, ProvisionedKind, RecordBase};
     use crate::session::types::SessionStorage;
 
-    fn user_msg(text: &str) -> pi_agent::message::AgentMessage {
-        pi_agent::message::AgentMessage::User(pi_ai::types::UserMessage::new(text, 1))
+    fn user_msg(text: &str) -> rpi_agent::message::AgentMessage {
+        rpi_agent::message::AgentMessage::User(rpi_ai::types::UserMessage::new(text, 1))
     }
 
     fn repo(fs: Arc<dyn FileSystem>) -> JsonlSessionRepo {
@@ -729,7 +729,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_open_list_delete_roundtrip() {
-        let env = pi_tools::InMemoryExecutionEnv::with_cwd("/proj".into());
+        let env = rpi_tools::InMemoryExecutionEnv::with_cwd("/proj".into());
         let fs: Arc<dyn FileSystem> = Arc::new(env);
         let r = repo(fs.clone());
 
@@ -778,7 +778,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_duplicate_id_is_already_exists() {
-        let env = pi_tools::InMemoryExecutionEnv::with_cwd("/proj".into());
+        let env = rpi_tools::InMemoryExecutionEnv::with_cwd("/proj".into());
         let fs: Arc<dyn FileSystem> = Arc::new(env);
         let r = repo(fs);
 
@@ -795,7 +795,7 @@ mod tests {
 
     #[tokio::test]
     async fn trait_impl_create_open_roundtrip() {
-        let env = pi_tools::InMemoryExecutionEnv::with_cwd("/proj".into());
+        let env = rpi_tools::InMemoryExecutionEnv::with_cwd("/proj".into());
         let fs: Arc<dyn FileSystem> = Arc::new(env);
         let r = repo(fs);
 
@@ -815,7 +815,7 @@ mod tests {
 
     #[tokio::test]
     async fn fork_typed_branch_default_leaf() {
-        let env = pi_tools::InMemoryExecutionEnv::with_cwd("/proj".into());
+        let env = rpi_tools::InMemoryExecutionEnv::with_cwd("/proj".into());
         let fs: Arc<dyn FileSystem> = Arc::new(env);
         let r = repo(fs);
 
@@ -871,7 +871,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_missing_session_is_not_found() {
-        let env = pi_tools::InMemoryExecutionEnv::with_cwd("/proj".into());
+        let env = rpi_tools::InMemoryExecutionEnv::with_cwd("/proj".into());
         let fs: Arc<dyn FileSystem> = Arc::new(env);
         let r = repo(fs);
         let err = r
@@ -884,7 +884,7 @@ mod tests {
 
     #[tokio::test]
     async fn metadata_map_round_trips_through_create() {
-        let env = pi_tools::InMemoryExecutionEnv::with_cwd("/proj".into());
+        let env = rpi_tools::InMemoryExecutionEnv::with_cwd("/proj".into());
         let fs: Arc<dyn FileSystem> = Arc::new(env);
         let r = repo(fs);
 
@@ -912,7 +912,7 @@ mod tests {
 
     #[tokio::test]
     async fn listed_sessions_sorted_newest_first() {
-        let env = pi_tools::InMemoryExecutionEnv::with_cwd("/proj".into());
+        let env = rpi_tools::InMemoryExecutionEnv::with_cwd("/proj".into());
         let fs: Arc<dyn FileSystem> = Arc::new(env);
         // A clock that increments per call so created_at strictly increases.
         let clock: Arc<dyn Clock> = Arc::new(FakeClock::new());

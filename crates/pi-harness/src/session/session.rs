@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use uuid::Uuid;
 
-use pi_agent::message::AgentMessage;
+use rpi_agent::message::AgentMessage;
 
 use crate::error::{SessionError, SessionErrorCode, SessionResult};
 use crate::session::types::{
@@ -646,8 +646,8 @@ mod tests {
     use super::*;
     use crate::session::memory::{InMemorySessionStorage, SystemClock};
     use crate::session::types::{EntryQuery, SessionMetadata};
-    use pi_agent::message::AgentMessage;
-    use pi_ai::types::UserMessage;
+    use rpi_agent::message::AgentMessage;
+    use rpi_ai::types::UserMessage;
 
     fn fixture_session() -> Session {
         let metadata = SessionMetadata { id: "s1".into(), created_at: 0, parent_session_id: None };

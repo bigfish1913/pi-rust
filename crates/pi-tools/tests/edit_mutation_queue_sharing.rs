@@ -14,14 +14,14 @@
 
 use std::sync::Arc;
 
-use pi_agent::agent_tool::AgentTool;
-use pi_tools::{ExecutionToolContext, FileSystem, InMemoryExecutionEnv};
+use rpi_agent::agent_tool::AgentTool;
+use rpi_tools::{ExecutionToolContext, FileSystem, InMemoryExecutionEnv};
 use tokio_util::sync::CancellationToken;
 
 fn fresh_context() -> (Arc<InMemoryExecutionEnv>, ExecutionToolContext) {
     let env = Arc::new(InMemoryExecutionEnv::with_cwd("/tmp/work".into()));
-    let env_dyn: Arc<dyn pi_tools::ExecutionEnv> = env.clone();
-    let mut_env: Arc<dyn pi_tools::MutatingEnv> = env.clone();
+    let env_dyn: Arc<dyn rpi_tools::ExecutionEnv> = env.clone();
+    let mut_env: Arc<dyn rpi_tools::MutatingEnv> = env.clone();
     let ctx = ExecutionToolContext::new(env_dyn, Some(mut_env));
     (env, ctx)
 }
@@ -39,7 +39,7 @@ async fn read_back(env: &InMemoryExecutionEnv, rel: &str) -> String {
 async fn run_edit_raw(
     tool: Arc<dyn AgentTool>,
     params: serde_json::Value,
-) -> Result<pi_agent::types::AgentToolResult, pi_agent::error::AgentError> {
+) -> Result<rpi_agent::types::AgentToolResult, rpi_agent::error::AgentError> {
     let signal = CancellationToken::new();
     let on_update = Arc::new(|_p| ());
     let prepared = tool.prepare_arguments(params.clone()).unwrap_or_else(|_| params);
@@ -56,8 +56,8 @@ async fn concurrent_edits_to_same_path_serialize_no_lost_update() {
         .join("\n");
     seed(&env, "file.txt", body.into_bytes()).await;
 
-    let tool_a = pi_tools::create_edit_tool(&ctx);
-    let tool_b = pi_tools::create_edit_tool(&ctx);
+    let tool_a = rpi_tools::create_edit_tool(&ctx);
+    let tool_b = rpi_tools::create_edit_tool(&ctx);
 
     let a = tokio::spawn(run_edit_raw(
         tool_a,
@@ -81,8 +81,8 @@ async fn concurrent_edits_to_same_path_serialize_no_lost_update() {
 #[tokio::test]
 async fn concurrent_writes_to_same_path_serialize_last_wins() {
     let (env, ctx) = fresh_context();
-    let tool_a = pi_tools::create_write_tool(&ctx);
-    let tool_b = pi_tools::create_write_tool(&ctx);
+    let tool_a = rpi_tools::create_write_tool(&ctx);
+    let tool_b = rpi_tools::create_write_tool(&ctx);
 
     let a = tokio::spawn(run_edit_raw(
         tool_a,

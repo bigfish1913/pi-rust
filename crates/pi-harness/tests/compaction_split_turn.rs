@@ -7,18 +7,18 @@
 //! turn-prefix @ 0.5×reserve), concatenating the two summaries with the
 //! `**Turn Context (split turn):**` divider and summing the two usages.
 //!
-//! Runs against the public `pi_harness::compaction::{compact, CompactionLlmOptions,
-//! CompactionPreparation, FileOperations}` surface + `pi_ai`'s faux provider.
+//! Runs against the public `rpi_harness::compaction::{compact, CompactionLlmOptions,
+//! CompactionPreparation, FileOperations}` surface + `rpi_ai`'s faux provider.
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use pi_ai::providers::faux::{FauxProvider, FauxScript, FauxStep};
-use pi_ai::types::{StopReason, Usage, UsageCost, UserContent, UserMessage};
-use pi_ai::{Model, Provider};
-use pi_agent::message::AgentMessage;
-use pi_harness::compaction::{compact, CompactionError, CompactionLlmOptions, CompactionPreparation, FileOperations};
-use pi_harness::types::CompactionSettings;
+use rpi_ai::providers::faux::{FauxProvider, FauxScript, FauxStep};
+use rpi_ai::types::{StopReason, Usage, UsageCost, UserContent, UserMessage};
+use rpi_ai::{Model, Provider};
+use rpi_agent::message::AgentMessage;
+use rpi_harness::compaction::{compact, CompactionError, CompactionLlmOptions, CompactionPreparation, FileOperations};
+use rpi_harness::types::CompactionSettings;
 use tokio_util::sync::CancellationToken;
 
 fn mock_usage(input: i64, output: i64, cache_read: i64, cache_write: i64) -> Usage {
@@ -135,7 +135,7 @@ async fn split_turn_turn_prefix_error_maps_to_summarization_failed() {
     let mut preparation = split_preparation(messages.clone());
     preparation.messages_to_summarize = Vec::new();
 
-    let mut err_msg = pi_ai::types::AssistantMessage::empty(pi_ai::types::Api::Faux, "faux", "faux", 0);
+    let mut err_msg = rpi_ai::types::AssistantMessage::empty(rpi_ai::types::Api::Faux, "faux", "faux", 0);
     err_msg.stop_reason = StopReason::Error;
     err_msg.error_message = Some("prefix failed".to_string());
     let script = FauxScript::new();

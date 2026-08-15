@@ -26,9 +26,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use common::{assistant_tool_calls, base_config};
-use pi_agent::{AbortHandle, AgentContext, AgentEvent, AgentToolResult};
-use pi_ai::event_stream::create_assistant_message_event_stream;
-use pi_ai::types::{
+use rpi_agent::{AbortHandle, AgentContext, AgentEvent, AgentToolResult};
+use rpi_ai::event_stream::create_assistant_message_event_stream;
+use rpi_ai::types::{
     AssistantMessage, AssistantMessageEvent, ErrorReason, StopReason,
 };
 use tokio_util::sync::CancellationToken;
@@ -51,12 +51,12 @@ async fn abort_during_stream_produces_agent_end() {
     let handle = AbortHandle::new();
     let token = handle.token();
 
-    let stream_fn = pi_agent::stream_fn(move |_model, _ctx, opts| {
+    let stream_fn = rpi_agent::stream_fn(move |_model, _ctx, opts| {
         let token = opts.signal.clone();
         let (mut prod, stream) = create_assistant_message_event_stream();
         tokio::spawn(async move {
             let partial = AssistantMessage::empty(
-                pi_ai::types::Api::Other("openai-responses".into()),
+                rpi_ai::types::Api::Other("openai-responses".into()),
                 "mock",
                 "mock",
                 0,
@@ -66,7 +66,7 @@ async fn abort_during_stream_produces_agent_end() {
             loop {
                 if token.is_cancelled() {
                     let aborted = AssistantMessage::terminal(
-                        pi_ai::types::Api::Other("mock".into()),
+                        rpi_ai::types::Api::Other("mock".into()),
                         "mock",
                         "mock",
                         StopReason::Aborted,
@@ -89,12 +89,12 @@ async fn abort_during_stream_produces_agent_end() {
     let mut config = base_config();
     config.signal = token;
 
-    let (collector, events_buf) = pi_agent::CollectorEmitter::new();
-    let emit: Arc<dyn pi_agent::AgentEmitter> = Arc::new(collector);
+    let (collector, events_buf) = rpi_agent::CollectorEmitter::new();
+    let emit: Arc<dyn rpi_agent::AgentEmitter> = Arc::new(collector);
 
     // Drive the run on a task so we can cancel mid-stream.
     let run_handle = tokio::spawn(async move {
-        pi_agent::run_agent_loop(
+        rpi_agent::run_agent_loop(
             vec![common::user_message("hello")],
             AgentContext::default(),
             config,
@@ -132,13 +132,13 @@ async fn abort_during_stream_produces_agent_end() {
 /// a normal result. If the run token is cancelled, the child is too, so the
 /// tool resolves and the run settles.
 struct BlockingTool {
-    schema: pi_ai::types::Tool,
+    schema: rpi_ai::types::Tool,
     started: Arc<tokio::sync::Notify>,
 }
 
 #[async_trait::async_trait]
-impl pi_agent::AgentTool for BlockingTool {
-    fn schema(&self) -> &pi_ai::types::Tool {
+impl rpi_agent::AgentTool for BlockingTool {
+    fn schema(&self) -> &rpi_ai::types::Tool {
         &self.schema
     }
     fn label(&self) -> &str {
@@ -149,8 +149,8 @@ impl pi_agent::AgentTool for BlockingTool {
         _tool_call_id: &str,
         _params: serde_json::Value,
         signal: CancellationToken,
-        _on_update: Arc<dyn Fn(pi_agent::ToolResultPartial) + Send + Sync>,
-    ) -> Result<AgentToolResult, pi_agent::AgentError> {
+        _on_update: Arc<dyn Fn(rpi_agent::ToolResultPartial) + Send + Sync>,
+    ) -> Result<AgentToolResult, rpi_agent::AgentError> {
         self.started.notify_one();
         // Block until cancelled. `cancelled()` resolves when the token fires.
         signal.cancelled().await;
@@ -158,11 +158,11 @@ impl pi_agent::AgentTool for BlockingTool {
     }
 }
 
-fn empty_schema(name: &str) -> pi_ai::types::Tool {
-    pi_ai::types::Tool {
+fn empty_schema(name: &str) -> rpi_ai::types::Tool {
+    rpi_ai::types::Tool {
         name: name.to_string(),
         description: "Blocking tool".to_string(),
-        parameters: pi_ai::types::Schema::new(serde_json::json!({
+        parameters: rpi_ai::types::Schema::new(serde_json::json!({
             "type": "object",
             "properties": {},
             "additionalProperties": false,
@@ -199,10 +199,10 @@ async fn abort_during_tool_unblocks_and_settles() {
             StopReason::ToolUse,
         )]);
 
-    let (collector, events_buf) = pi_agent::CollectorEmitter::new();
-    let emit: Arc<dyn pi_agent::AgentEmitter> = Arc::new(collector);
+    let (collector, events_buf) = rpi_agent::CollectorEmitter::new();
+    let emit: Arc<dyn rpi_agent::AgentEmitter> = Arc::new(collector);
     let run_handle = tokio::spawn(async move {
-        pi_agent::run_agent_loop(
+        rpi_agent::run_agent_loop(
             vec![common::user_message("run the tool")],
             context,
             config,

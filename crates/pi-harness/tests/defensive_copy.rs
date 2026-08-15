@@ -17,13 +17,13 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use pi_agent::agent_tool::AgentTool;
-use pi_agent::error::AgentError;
-use pi_agent::types::{AgentToolResult, ToolResultPartial};
-use pi_ai::types::{Schema, Tool};
-use pi_harness::agent_harness::{AgentHarness, AgentLane};
-use pi_harness::result::HarnessError;
-use pi_harness::types::{AgentHarnessOptions, HarnessTool, ToolReplay};
+use rpi_agent::agent_tool::AgentTool;
+use rpi_agent::error::AgentError;
+use rpi_agent::types::{AgentToolResult, ToolResultPartial};
+use rpi_ai::types::{Schema, Tool};
+use rpi_harness::agent_harness::{AgentHarness, AgentLane};
+use rpi_harness::result::HarnessError;
+use rpi_harness::types::{AgentHarnessOptions, HarnessTool, ToolReplay};
 use tokio_util::sync::CancellationToken;
 
 /// A trivial `AgentTool` whose only configurable field is the schema name. Used

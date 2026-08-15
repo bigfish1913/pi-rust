@@ -32,18 +32,18 @@
 
 use std::sync::{Arc, Mutex};
 
-use pi_ai::providers::faux::{FauxProvider, FauxScript};
-use pi_ai::Provider;
-use pi_harness::agent_harness::{AgentHarness, AgentLane, HarnessRunOutcome};
-use pi_harness::events::{HarnessEvent, RunEndOutcome};
-use pi_harness::session::types::{
+use rpi_ai::providers::faux::{FauxProvider, FauxScript};
+use rpi_ai::Provider;
+use rpi_harness::agent_harness::{AgentHarness, AgentLane, HarnessRunOutcome};
+use rpi_harness::events::{HarnessEvent, RunEndOutcome};
+use rpi_harness::session::types::{
     BranchBounds, EntryOrder, EntryQuery, LaneRecord, RecordQuery,
 };
-use pi_harness::session::{DefaultIdGenerator, Session};
-use pi_harness::session::memory::{InMemorySessionStorage, SystemClock};
-use pi_harness::session::types::SessionMetadata;
-use pi_harness::types::{AgentHarnessOptions, HarnessTool};
-use pi_tools::{
+use rpi_harness::session::{DefaultIdGenerator, Session};
+use rpi_harness::session::memory::{InMemorySessionStorage, SystemClock};
+use rpi_harness::session::types::SessionMetadata;
+use rpi_harness::types::{AgentHarnessOptions, HarnessTool};
+use rpi_tools::{
     create_bash_tool, create_read_tool, create_write_tool, ExecutionToolContext,
     FileSystem, InMemoryExecutionEnv, MutationQueueRegistry,
 };
@@ -65,8 +65,8 @@ async fn harness_with(
     // In-memory execution env + tool context. `InMemoryExecutionEnv` implements
     // both `ExecutionEnv` and `MutatingEnv`.
     let env = Arc::new(InMemoryExecutionEnv::new());
-    let env_dyn: Arc<dyn pi_tools::ExecutionEnv> = env.clone();
-    let mut_env: Arc<dyn pi_tools::MutatingEnv> = env.clone();
+    let env_dyn: Arc<dyn rpi_tools::ExecutionEnv> = env.clone();
+    let mut_env: Arc<dyn rpi_tools::MutatingEnv> = env.clone();
     let _registry = Arc::new(MutationQueueRegistry::new());
     let ctx = ExecutionToolContext::new(env_dyn, Some(mut_env));
     let read = create_read_tool(&ctx, None);
@@ -124,7 +124,7 @@ fn record_runtime_events(
     // for the duration of the run by returning both. But we only need the vec;
     // drop the guard to keep it simple — events during the run still land
     // because the harness emits synchronously inline on the calling task.
-    let _off = harness.events().on::<pi_harness::events::RunEndEvent, _>(
+    let _off = harness.events().on::<rpi_harness::events::RunEndEvent, _>(
         move |_e| {
             // no-op placeholder; we use the all-events watch below
         },
@@ -168,9 +168,9 @@ async fn full_run_with_write_tool_call_completes_and_persists() {
             assert!(!leaf_id.is_empty(), "leaf_id must be set on Completed");
             assert!(!final_entry_id.is_empty(), "final_entry_id must be set");
             // The final assistant message is the "Done — ..." text turn (no tool calls).
-            let has_text = final_message.content.iter().any(|c| matches!(c, pi_ai::types::Content::Text(_)));
+            let has_text = final_message.content.iter().any(|c| matches!(c, rpi_ai::types::Content::Text(_)));
             assert!(has_text, "final message should carry text content");
-            assert_eq!(final_message.stop_reason, pi_ai::types::StopReason::Stop);
+            assert_eq!(final_message.stop_reason, rpi_ai::types::StopReason::Stop);
         }
         other => panic!("expected Completed, got {other:?}"),
     }
@@ -215,10 +215,10 @@ async fn full_run_with_write_tool_call_completes_and_persists() {
         path.len()
     );
     // Sanity: the first entry is the user prompt.
-    assert!(matches!(path[0], pi_harness::session::types::Entry::Message(_)));
+    assert!(matches!(path[0], rpi_harness::session::types::Entry::Message(_)));
     // And the leaf entry (last) is the final assistant text turn.
     let last = path.last().unwrap();
-    assert!(matches!(last, pi_harness::session::types::Entry::Message(_)));
+    assert!(matches!(last, rpi_harness::session::types::Entry::Message(_)));
 
     // An operation_started (intent Run) + operation_finished (Completed) record
     // pair should be present on the lane, with matching run_id.
@@ -243,7 +243,7 @@ async fn full_run_with_write_tool_call_completes_and_persists() {
         .expect("find operation_finished");
     assert_eq!(finished.len(), 1, "exactly one operation_finished for this run_id");
     if let LaneRecord::OperationFinished(f) = &finished[0] {
-        assert_eq!(f.outcome, pi_harness::session::types::OperationOutcome::Completed);
+        assert_eq!(f.outcome, rpi_harness::session::types::OperationOutcome::Completed);
     } else {
         panic!("expected OperationFinished record");
     }

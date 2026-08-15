@@ -5,16 +5,16 @@
 
 use std::sync::Arc;
 
-use pi_agent::agent_tool::AgentTool;
-use pi_agent::error::AgentError;
-use pi_tools::{ExecutionToolContext, FileSystem, InMemoryExecutionEnv};
+use rpi_agent::agent_tool::AgentTool;
+use rpi_agent::error::AgentError;
+use rpi_tools::{ExecutionToolContext, FileSystem, InMemoryExecutionEnv};
 use tokio_util::sync::CancellationToken;
 
 /// Build a fresh in-memory tool context rooted at `/tmp/work`.
 fn fresh_context() -> (Arc<InMemoryExecutionEnv>, ExecutionToolContext) {
     let env = Arc::new(InMemoryExecutionEnv::with_cwd("/tmp/work".into()));
-    let env_dyn: Arc<dyn pi_tools::ExecutionEnv> = env.clone();
-    let mut_env: Arc<dyn pi_tools::MutatingEnv> = env.clone();
+    let env_dyn: Arc<dyn rpi_tools::ExecutionEnv> = env.clone();
+    let mut_env: Arc<dyn rpi_tools::MutatingEnv> = env.clone();
     let ctx = ExecutionToolContext::new(env_dyn, Some(mut_env));
     (env, ctx)
 }
@@ -40,7 +40,7 @@ async fn read_back(env: &InMemoryExecutionEnv, rel: &str) -> String {
 async fn run_edit(
     tool: Arc<dyn AgentTool>,
     params: serde_json::Value,
-) -> Result<pi_agent::types::AgentToolResult, AgentError> {
+) -> Result<rpi_agent::types::AgentToolResult, AgentError> {
     let signal = CancellationToken::new();
     let on_update = Arc::new(|_p| ());
     // prepare_arguments folds legacy fields + JSON-string edits, mirroring the
@@ -49,8 +49,8 @@ async fn run_edit(
     tool.execute("edit-1", prepared, signal, on_update).await
 }
 
-fn text_output(r: &pi_agent::types::AgentToolResult) -> String {
-    use pi_agent::types::TextContentOrImage;
+fn text_output(r: &rpi_agent::types::AgentToolResult) -> String {
+    use rpi_agent::types::TextContentOrImage;
     r.content
         .iter()
         .filter_map(|c| match c {
@@ -67,7 +67,7 @@ async fn applies_disjoint_edits_and_returns_diffs() {
     let original = "alpha\nbeta\ngamma\ndelta\n";
     seed(&env, "edit.txt", original.as_bytes().to_vec()).await;
 
-    let tool = pi_tools::create_edit_tool(&ctx);
+    let tool = rpi_tools::create_edit_tool(&ctx);
     let result = run_edit(
         tool,
         serde_json::json!({
@@ -95,7 +95,7 @@ async fn applies_disjoint_edits_and_returns_diffs() {
 async fn rejects_overlapping_edits_and_leaves_file_unchanged() {
     let (env, ctx) = fresh_context();
     seed(&env, "edit.txt", b"one\ntwo\nthree\n".to_vec()).await;
-    let tool = pi_tools::create_edit_tool(&ctx);
+    let tool = rpi_tools::create_edit_tool(&ctx);
     let err = run_edit(
         tool,
         serde_json::json!({
@@ -120,7 +120,7 @@ async fn rejects_overlapping_edits_and_leaves_file_unchanged() {
 async fn rejects_missing_and_duplicate_target() {
     let (env, ctx) = fresh_context();
     seed(&env, "edit.txt", b"foo foo foo".to_vec()).await;
-    let tool = pi_tools::create_edit_tool(&ctx);
+    let tool = rpi_tools::create_edit_tool(&ctx);
 
     let err_missing = run_edit(
         tool.clone(),
@@ -154,7 +154,7 @@ async fn preserves_bom_and_crlf() {
     let body = "\u{FEFF}one\r\ntwo\r\n";
     seed(&env, "edit.txt", body.as_bytes().to_vec()).await;
 
-    let tool = pi_tools::create_edit_tool(&ctx);
+    let tool = rpi_tools::create_edit_tool(&ctx);
     let _result = run_edit(
         tool,
         serde_json::json!({
@@ -177,7 +177,7 @@ async fn fuzzy_matches_smart_quote_apostrophe() {
     let body = "it\u{2019}s a file\n";
     seed(&env, "edit.txt", body.as_bytes().to_vec()).await;
 
-    let tool = pi_tools::create_edit_tool(&ctx);
+    let tool = rpi_tools::create_edit_tool(&ctx);
     let result = run_edit(
         tool,
         serde_json::json!({
@@ -195,7 +195,7 @@ async fn fuzzy_matches_smart_quote_apostrophe() {
 async fn rejects_noop_edit() {
     let (env, ctx) = fresh_context();
     seed(&env, "edit.txt", b"alpha\n".to_vec()).await;
-    let tool = pi_tools::create_edit_tool(&ctx);
+    let tool = rpi_tools::create_edit_tool(&ctx);
     let err = run_edit(
         tool,
         serde_json::json!({

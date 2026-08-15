@@ -2,16 +2,16 @@
 //! corruption reasons. Mirrors `packages/agent/test/harness/reducer.test.ts`
 //! (corruption cases) + the `session-state` invariant slice of the plan's §5.
 //!
-//! These run against the public `pi_harness::session` API only — no JSONL,
+//! These run against the public `rpi_harness::session` API only — no JSONL,
 //! no harness run loop (those land in M5c/M5g).
 
-use pi_ai::types::{Api, StopReason, Usage};
-use pi_agent::message::AgentMessage;
-use pi_harness::session::types::*;
-use pi_harness::session::{
+use rpi_ai::types::{Api, StopReason, Usage};
+use rpi_agent::message::AgentMessage;
+use rpi_harness::session::types::*;
+use rpi_harness::session::{
     validate_record_log, RecordLogCorruptionReason, RecordLogSlice, SessionState,
 };
-use pi_harness::session::types::{
+use rpi_harness::session::types::{
     EntryBase, ProvisionedEntry, ProvisionedKind, SessionMutation,
 };
 
@@ -26,7 +26,7 @@ fn usage_fixture() -> Usage {
         cache_write_1h: None,
         reasoning: None,
         total_tokens: 2,
-        cost: pi_ai::types::UsageCost {
+        cost: rpi_ai::types::UsageCost {
             input: 0.0,
             output: 0.0,
             cache_read: 0.0,
@@ -37,11 +37,11 @@ fn usage_fixture() -> Usage {
 }
 
 fn user_message(text: &str) -> AgentMessage {
-    AgentMessage::User(pi_ai::types::UserMessage::new(text, 1))
+    AgentMessage::User(rpi_ai::types::UserMessage::new(text, 1))
 }
 
-fn assistant_message(content: Vec<pi_ai::types::Content>, stop_reason: StopReason) -> AgentMessage {
-    let mut msg = pi_ai::types::AssistantMessage::empty(
+fn assistant_message(content: Vec<rpi_ai::types::Content>, stop_reason: StopReason) -> AgentMessage {
+    let mut msg = rpi_ai::types::AssistantMessage::empty(
         Api::OpenaiResponses,
         "openai",
         "test-model",
@@ -54,11 +54,11 @@ fn assistant_message(content: Vec<pi_ai::types::Content>, stop_reason: StopReaso
 }
 
 fn tool_result_message(tool_call_id: &str, tool_name: &str) -> AgentMessage {
-    AgentMessage::ToolResult(std::boxed::Box::new(pi_ai::types::ToolResultMessage {
-        role: pi_ai::types::ToolResultRole,
+    AgentMessage::ToolResult(std::boxed::Box::new(rpi_ai::types::ToolResultMessage {
+        role: rpi_ai::types::ToolResultRole,
         tool_call_id: tool_call_id.to_string(),
         tool_name: tool_name.to_string(),
-        content: vec![pi_ai::types::Content::text("result")],
+        content: vec![rpi_ai::types::Content::text("result")],
         details: None,
         usage: None,
         added_tool_names: vec![],
@@ -305,7 +305,7 @@ fn state_fork_omits_lane_so_chaining_is_skipped() {
 
 #[test]
 fn state_open_operation_tracking_records_and_removes() {
-    use pi_harness::session::types::OperationStartedRecord;
+    use rpi_harness::session::types::OperationStartedRecord;
     let mut state = SessionState::new();
     let started = LaneRecord::OperationStarted(OperationStartedRecord {
         base: rec_base("op-1", 1, "main"),
@@ -465,7 +465,7 @@ fn reducer_tool_call_mismatch() {
     let assistant_tools = msg_entry(
         "assistant-tools",
         assistant_message(
-            vec![pi_ai::types::Content::tool_call("call-1", "tool-1", serde_json::json!({}))],
+            vec![rpi_ai::types::Content::tool_call("call-1", "tool-1", serde_json::json!({}))],
             StopReason::ToolUse,
         ),
         1,
@@ -494,7 +494,7 @@ fn reducer_duplicate_tool_invocation() {
     let assistant_tools = msg_entry(
         "assistant-tools",
         assistant_message(
-            vec![pi_ai::types::Content::tool_call("call-1", "tool-1", serde_json::json!({}))],
+            vec![rpi_ai::types::Content::tool_call("call-1", "tool-1", serde_json::json!({}))],
             StopReason::ToolUse,
         ),
         1,
@@ -555,7 +555,7 @@ fn reducer_valid_one_tool_run_prefixes() {
     let assistant_tools = msg_entry(
         "assistant-tools",
         assistant_message(
-            vec![pi_ai::types::Content::tool_call("call-1", "tool-1", serde_json::json!({}))],
+            vec![rpi_ai::types::Content::tool_call("call-1", "tool-1", serde_json::json!({}))],
             StopReason::ToolUse,
         ),
         4,
@@ -564,7 +564,7 @@ fn reducer_valid_one_tool_run_prefixes() {
     let tool_result = msg_entry("tool-result-1", tool_result_message("call-1", "tool-1"), 6, Some("assistant-tools"));
     let assistant_final = msg_entry(
         "assistant-final",
-        assistant_message(vec![pi_ai::types::Content::text("done")], StopReason::Stop),
+        assistant_message(vec![rpi_ai::types::Content::text("done")], StopReason::Stop),
         8,
         Some("tool-result-1"),
     );
@@ -639,7 +639,7 @@ fn valid_prefixes(actions: &[VariantAction]) -> Vec<RecordLogSlice> {
 
 fn provisioned_json(p: ProvisionedEntry) -> serde_json::Value {
     // Use Entry::to_flat_json through a temporary stamp, then strip storage fields.
-    let entry = pi_harness::session::types::provisioned_into_entry(p, 0, None, 0);
+    let entry = rpi_harness::session::types::provisioned_into_entry(p, 0, None, 0);
     let mut value = entry.to_flat_json();
     if let serde_json::Value::Object(map) = &mut value {
         map.remove("seq");

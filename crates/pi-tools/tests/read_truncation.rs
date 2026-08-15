@@ -5,16 +5,16 @@
 
 use std::sync::Arc;
 
-use pi_agent::agent_tool::AgentTool;
-use pi_agent::error::AgentError;
-use pi_tools::{ExecutionToolContext, FileSystem, InMemoryExecutionEnv};
+use rpi_agent::agent_tool::AgentTool;
+use rpi_agent::error::AgentError;
+use rpi_tools::{ExecutionToolContext, FileSystem, InMemoryExecutionEnv};
 use tokio_util::sync::CancellationToken;
 
 /// Build a fresh in-memory tool context rooted at `/tmp/work`.
-fn fresh_context() -> (Arc<InMemoryExecutionEnv>, pi_tools::ExecutionToolContext) {
+fn fresh_context() -> (Arc<InMemoryExecutionEnv>, rpi_tools::ExecutionToolContext) {
     let env = Arc::new(InMemoryExecutionEnv::with_cwd("/tmp/work".into()));
-    let env_dyn: Arc<dyn pi_tools::ExecutionEnv> = env.clone();
-    let mut_env: Arc<dyn pi_tools::MutatingEnv> = env.clone();
+    let env_dyn: Arc<dyn rpi_tools::ExecutionEnv> = env.clone();
+    let mut_env: Arc<dyn rpi_tools::MutatingEnv> = env.clone();
     let ctx = ExecutionToolContext::new(env_dyn, Some(mut_env));
     (env, ctx)
 }
@@ -31,8 +31,8 @@ async fn seed(env: &InMemoryExecutionEnv, rel: &str, bytes: Vec<u8>) {
 }
 
 /// Extract the single text block's text from a tool result (panics if absent).
-fn text_output(r: &pi_agent::types::AgentToolResult) -> String {
-    use pi_agent::types::TextContentOrImage;
+fn text_output(r: &rpi_agent::types::AgentToolResult) -> String {
+    use rpi_agent::types::TextContentOrImage;
     r.content
         .iter()
         .filter_map(|c| match c {
@@ -46,7 +46,7 @@ fn text_output(r: &pi_agent::types::AgentToolResult) -> String {
 async fn run_read(
     tool: Arc<dyn AgentTool>,
     params: serde_json::Value,
-) -> Result<pi_agent::types::AgentToolResult, AgentError> {
+) -> Result<rpi_agent::types::AgentToolResult, AgentError> {
     let signal = CancellationToken::new();
     let on_update = Arc::new(|_p| ());
     tool.execute("read-1", params, signal, on_update).await
@@ -61,7 +61,7 @@ async fn read_offsets_limits_and_continuation_notice() {
         .join("\n");
     seed(&env, "test.txt", body.into_bytes()).await;
 
-    let tool = pi_tools::create_read_tool(&ctx, None);
+    let tool = rpi_tools::create_read_tool(&ctx, None);
     let result = run_read(
         tool,
         serde_json::json!({ "path": "test.txt", "offset": 41, "limit": 20 }),
@@ -86,7 +86,7 @@ async fn read_truncates_large_text_by_line_count() {
         .join("\n");
     seed(&env, "large.txt", body.into_bytes()).await;
 
-    let tool = pi_tools::create_read_tool(&ctx, None);
+    let tool = rpi_tools::create_read_tool(&ctx, None);
     let result = run_read(tool, serde_json::json!({ "path": "large.txt" }))
         .await
         .expect("read ok");
@@ -109,7 +109,7 @@ async fn read_does_not_overcount_trailing_newline_at_limit() {
     let body: String = (0..2000).map(|_| "x").collect::<Vec<_>>().join("\n") + "\n";
     seed(&env, "exact.txt", body.into_bytes()).await;
 
-    let tool = pi_tools::create_read_tool(&ctx, None);
+    let tool = rpi_tools::create_read_tool(&ctx, None);
     let result = run_read(tool, serde_json::json!({ "path": "exact.txt" }))
         .await
         .expect("read ok");
@@ -122,7 +122,7 @@ async fn read_does_not_overcount_trailing_newline_at_limit() {
 async fn read_rejects_offset_beyond_end() {
     let (env, ctx) = fresh_context();
     seed(&env, "short.txt", b"one\ntwo\nthree".to_vec()).await;
-    let tool = pi_tools::create_read_tool(&ctx, None);
+    let tool = rpi_tools::create_read_tool(&ctx, None);
     let err = run_read(
         tool,
         serde_json::json!({ "path": "short.txt", "offset": 100 }),
@@ -138,13 +138,13 @@ async fn read_rejects_offset_beyond_end() {
 
 #[tokio::test]
 async fn read_detects_supported_image_by_content() {
-    use pi_tools::encode_base64;
+    use rpi_tools::encode_base64;
     let (env, ctx) = fresh_context();
     // Minimal valid 1x1 PNG.
     let png: Vec<u8> = base64_png();
     seed(&env, "image.txt", png.clone()).await;
 
-    let tool = pi_tools::create_read_tool(&ctx, None);
+    let tool = rpi_tools::create_read_tool(&ctx, None);
     let result = run_read(tool, serde_json::json!({ "path": "image.txt" }))
         .await
         .expect("read ok");
@@ -153,7 +153,7 @@ async fn read_detects_supported_image_by_content() {
     let has_image = result.content.iter().any(|c| {
         matches!(
             c,
-            pi_agent::types::TextContentOrImage::Image(_)
+            rpi_agent::types::TextContentOrImage::Image(_)
         )
     });
     assert!(has_image, "expected an image content block");
@@ -161,7 +161,7 @@ async fn read_detects_supported_image_by_content() {
     let found = result
         .content
         .iter()
-        .any(|c| matches!(c, pi_agent::types::TextContentOrImage::Image(i) if i.data == b64));
+        .any(|c| matches!(c, rpi_agent::types::TextContentOrImage::Image(i) if i.data == b64));
     assert!(found, "image block data must equal base64(raw bytes)");
 }
 

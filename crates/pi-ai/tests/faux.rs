@@ -3,10 +3,10 @@
 //! sequence + `Done` with args parse; (c) abort-after → `Error`/`Aborted`;
 //! (d) usage estimate populated.
 
-use pi_ai::model::Model;
-use pi_ai::provider::{Provider, SimpleStreamOptions};
-use pi_ai::providers::faux::{FauxProvider, FauxScript, FauxStep};
-use pi_ai::types::{
+use rpi_ai::model::Model;
+use rpi_ai::provider::{Provider, SimpleStreamOptions};
+use rpi_ai::providers::faux::{FauxProvider, FauxScript, FauxStep};
+use rpi_ai::types::{
     Api, AssistantMessageEvent, Content, Context, Message, StopReason, UserContent, UserMessage,
 };
 use serde_json::json;
@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 fn user(text: &str) -> Message {
     Message::User(UserMessage {
-        role: pi_ai::types::UserRole,
+        role: rpi_ai::types::UserRole,
         content: UserContent::Text(text.to_string()),
         timestamp: 0,
     })
@@ -29,7 +29,7 @@ fn ctx(text: &str) -> Context {
     }
 }
 
-async fn drain(stream: &mut pi_ai::AssistantMessageEventStream) -> Vec<AssistantMessageEvent> {
+async fn drain(stream: &mut rpi_ai::AssistantMessageEventStream) -> Vec<AssistantMessageEvent> {
     let mut out = Vec::new();
     while let Some(ev) = stream.next().await {
         out.push(ev);
@@ -186,7 +186,7 @@ async fn factory_step_sees_context() {
                 _ => None,
             })
             .unwrap_or_default();
-        pi_ai::providers::faux::faux_assistant_message(
+        rpi_ai::providers::faux::faux_assistant_message(
             format!("echo:{last}"),
             StopReason::Stop,
         )

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
-use pi_tools::{
+use rpi_tools::{
     ExecutionEnv, ExecutionToolContext, FileContent, FileError, FileInfo, FileSystem,
     InMemoryExecutionEnv, MutatingEnv, MutationQueueRegistry, Shell, ShellExecOptions,
     ShellOutput,
@@ -110,7 +110,7 @@ impl Shell for StreamingEnv {
         &'a self,
         command: &str,
         mut options: ShellExecOptions<'a>,
-    ) -> Result<ShellOutput, pi_tools::ExecutionError> {
+    ) -> Result<ShellOutput, rpi_tools::ExecutionError> {
         if command.starts_with("stream") {
             // Fire 500 chunks as fast as possible — without throttling this
             // would produce ~500 on_update calls.
@@ -143,12 +143,12 @@ async fn coalesces_updates_within_throttle_window() {
     let mut_env: Arc<dyn MutatingEnv> = wrapper.clone() as Arc<dyn MutatingEnv>;
     let ctx = ExecutionToolContext::new(env_dyn, Some(mut_env));
 
-    let tool = pi_tools::create_bash_tool(&ctx, None);
+    let tool = rpi_tools::create_bash_tool(&ctx, None);
 
     // Count on_update invocations. The Arc<AtomicUsize> survives the closure.
     let count = Arc::new(AtomicUsize::new(0));
     let count_for_cb = count.clone();
-    let on_update: Arc<dyn Fn(pi_agent::types::ToolResultPartial) + Send + Sync> =
+    let on_update: Arc<dyn Fn(rpi_agent::types::ToolResultPartial) + Send + Sync> =
         Arc::new(move |_p| {
             count_for_cb.fetch_add(1, Ordering::SeqCst);
         });

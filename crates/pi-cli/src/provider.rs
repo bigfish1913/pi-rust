@@ -26,13 +26,13 @@
 //! 5. No `--model` ⇒ the default ([`DEFAULT_MODEL_ID`] = `claude-sonnet-5`),
 //!    mirroring the TS per-provider default.
 //!
-//! [`AnthropicProvider`]: pi_ai::providers::anthropic::AnthropicProvider
+//! [`AnthropicProvider`]: rpi_ai::providers::anthropic::AnthropicProvider
 
 use std::sync::Arc;
 
-use pi_ai::providers::anthropic::models::anthropic_models;
-use pi_ai::providers::anthropic::AnthropicProvider;
-use pi_ai::{Model, Provider, ThinkingLevel};
+use rpi_ai::providers::anthropic::models::anthropic_models;
+use rpi_ai::providers::anthropic::AnthropicProvider;
+use rpi_ai::{Model, Provider, ThinkingLevel};
 
 use crate::args::parse_thinking_level;
 

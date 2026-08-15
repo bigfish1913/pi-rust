@@ -23,8 +23,8 @@ mod common;
 use std::sync::Arc;
 
 use common::{assistant_text, base_config, user_message};
-use pi_agent::{AgentContext, AgentEvent, GetFollowUpMessages, GetSteeringMessages};
-use pi_ai::types::StopReason;
+use rpi_agent::{AgentContext, AgentEvent, GetFollowUpMessages, GetSteeringMessages};
+use rpi_ai::types::StopReason;
 
 /// Count `turn_start` events — one per LLM call.
 fn turn_start_count(events: &[AgentEvent]) -> usize {
@@ -94,9 +94,9 @@ async fn follow_up_queue_drives_an_extra_turn_after_stop() {
             assistant_text("Processed 2", StopReason::Stop),
         ]);
 
-    let (collector, events_buf) = pi_agent::CollectorEmitter::new();
-    let emit: Arc<dyn pi_agent::AgentEmitter> = Arc::new(collector);
-    let new_messages = pi_agent::run_agent_loop(
+    let (collector, events_buf) = rpi_agent::CollectorEmitter::new();
+    let emit: Arc<dyn rpi_agent::AgentEmitter> = Arc::new(collector);
+    let new_messages = rpi_agent::run_agent_loop(
         vec![user_message("Initial")],
         AgentContext::default(),
         config,
@@ -117,7 +117,7 @@ async fn follow_up_queue_drives_an_extra_turn_after_stop() {
     // The "Queued follow-up" user message is in the new messages, and the last
     // new message is an assistant reply.
     let has_follow_up = new_messages.iter().any(|m| match m {
-        pi_agent::AgentMessage::User(u) => u.content.as_text() == Some("Queued follow-up"),
+        rpi_agent::AgentMessage::User(u) => u.content.as_text() == Some("Queued follow-up"),
         _ => false,
     });
     assert!(has_follow_up, "follow-up message should be in new_messages");
@@ -158,9 +158,9 @@ async fn one_at_a_time_steering_drains_one_message_per_turn() {
         // exhausts to an Error event if a 3rd call is made.
     ]);
 
-    let (collector, events_buf) = pi_agent::CollectorEmitter::new();
-    let emit: Arc<dyn pi_agent::AgentEmitter> = Arc::new(collector);
-    let new_messages = pi_agent::run_agent_loop(
+    let (collector, events_buf) = rpi_agent::CollectorEmitter::new();
+    let emit: Arc<dyn rpi_agent::AgentEmitter> = Arc::new(collector);
+    let new_messages = rpi_agent::run_agent_loop(
         vec![user_message("Initial")],
         AgentContext::default(),
         config,

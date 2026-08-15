@@ -23,8 +23,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use pi_ai::types::StopReason;
-use pi_agent::message::AgentMessage;
+use rpi_ai::types::StopReason;
+use rpi_agent::message::AgentMessage;
 
 use crate::messages::{create_branch_summary_message, create_compaction_summary_message};
 use crate::session::types::{BranchSummaryEntry, CompactionEntry, CustomEntry, Entry};
@@ -206,17 +206,17 @@ pub fn build_session_context(path_entries: &[Entry], options: &SessionContextBui
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pi_ai::types::AssistantMessage;
-    use pi_agent::message::AgentMessage;
+    use rpi_ai::types::AssistantMessage;
+    use rpi_agent::message::AgentMessage;
 
     fn user(text: &str) -> AgentMessage {
-        AgentMessage::User(pi_ai::types::UserMessage::new(text, 1))
+        AgentMessage::User(rpi_ai::types::UserMessage::new(text, 1))
     }
 
     fn assistant(text: &str) -> AgentMessage {
-        let mut a = AssistantMessage::empty(pi_ai::types::Api::Faux, "anthropic", "claude-sonnet-4-5", 1);
-        a.content = vec![pi_ai::types::Content::text(text)];
-        a.stop_reason = pi_ai::types::StopReason::Stop;
+        let mut a = AssistantMessage::empty(rpi_ai::types::Api::Faux, "anthropic", "claude-sonnet-4-5", 1);
+        a.content = vec![rpi_ai::types::Content::text(text)];
+        a.stop_reason = rpi_ai::types::StopReason::Stop;
         AgentMessage::Assistant(Box::new(a))
     }
 
@@ -362,9 +362,9 @@ mod tests {
     #[test]
     fn projects_custom_entries_and_omits_deferred_assistant() {
         // Deferred assistant handle → dropped (not model-visible).
-        let mut deferred = AssistantMessage::empty(pi_ai::types::Api::Faux, "openai", "gpt-5", 1);
-        deferred.stop_reason = pi_ai::types::StopReason::Deferred;
-        deferred.deferred = Some(pi_ai::types::DeferredHandle {
+        let mut deferred = AssistantMessage::empty(rpi_ai::types::Api::Faux, "openai", "gpt-5", 1);
+        deferred.stop_reason = rpi_ai::types::StopReason::Deferred;
+        deferred.deferred = Some(rpi_ai::types::DeferredHandle {
             provider: "openai".into(),
             model_id: "gpt-5".into(),
             api: "openai-responses".into(),

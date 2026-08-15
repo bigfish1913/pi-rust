@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use pi_agent::agent_tool::AgentTool;
-use pi_tools::{
+use rpi_agent::agent_tool::AgentTool;
+use rpi_tools::{
     ExecutionEnv, ExecutionToolContext, FileContent, FileError, FileInfo, FileSystem,
     InMemoryExecutionEnv, MutatingEnv, MutationQueueRegistry, Shell, ShellExecOptions,
     ShellOutput,
@@ -206,7 +206,7 @@ impl Shell for BlockingWriteEnv {
         &'a self,
         command: &str,
         options: ShellExecOptions<'a>,
-    ) -> Result<ShellOutput, pi_tools::ExecutionError> {
+    ) -> Result<ShellOutput, rpi_tools::ExecutionError> {
         self.inner.exec(command, options).await
     }
     async fn cleanup(&self) {
@@ -221,7 +221,7 @@ async fn run_write(
     tool: Arc<dyn AgentTool>,
     params: serde_json::Value,
     signal: Option<CancellationToken>,
-) -> Result<pi_agent::types::AgentToolResult, pi_agent::error::AgentError> {
+) -> Result<rpi_agent::types::AgentToolResult, rpi_agent::error::AgentError> {
     let signal = signal.unwrap_or_default();
     let on_update = Arc::new(|_p| ());
     let prepared = tool.prepare_arguments(params.clone()).unwrap_or_else(|_| params);
@@ -236,7 +236,7 @@ async fn queue_stays_locked_until_aborted_write_settles() {
     let mut_env: Arc<dyn MutatingEnv> = wrapper.clone() as Arc<dyn MutatingEnv>;
     let ctx = ExecutionToolContext::new(env_dyn, Some(mut_env));
 
-    let tool = pi_tools::create_write_tool(&ctx);
+    let tool = rpi_tools::create_write_tool(&ctx);
 
     // First write parks inside the queue closure. Its cancellation token lets
     // the test abort it — but abort must NOT unblock the queue: the parked

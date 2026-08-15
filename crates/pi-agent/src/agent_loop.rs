@@ -28,11 +28,11 @@ use crate::message::AgentMessage;
 use crate::stream_fn::StreamFn;
 use crate::types::{AfterToolCallContext, AgentContext, AgentToolResult, BeforeToolCallContext, ToolExecutionMode};
 
-use pi_ai::types::{
+use rpi_ai::types::{
     AssistantMessage, AssistantMessageEvent, Content, StopReason, ToolCall,
     ToolCallType, ToolResultMessage, ToolResultRole,
 };
-use pi_ai::validate_tool_arguments;
+use rpi_ai::validate_tool_arguments;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -302,7 +302,7 @@ async fn stream_assistant_response(
     // convert_to_llm (AgentMessage[] → Message[]).
     let llm_messages = (config.convert_to_llm)(messages).await;
 
-    let llm_context = pi_ai::types::Context {
+    let llm_context = rpi_ai::types::Context {
         system_prompt: if context.system_prompt.is_empty() {
             None
         } else {

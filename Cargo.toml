@@ -23,9 +23,9 @@ resolver = "2"
 edition = "2021"
 rust-version = "1.78"
 license = "MIT"
-repository = "https://github.com/earendil-works/pi"
+repository = "https://github.com/bigfish1913/pi-rust"
 version = "0.1.0"
-authors = ["pi-rust contributors"]
+authors = ["BigFish <bigfish1913@gmail.com>"]
 
 [workspace.dependencies]
 # Async runtime
@@ -56,12 +56,13 @@ tempfile = "3"
 regex = "1"
 globset = "0.4"
 
-# pi-rust internal crates
-pi-telemetry = { path = "crates/pi-telemetry", version = "0.1.0" }
-pi-ai = { path = "crates/pi-ai", version = "0.1.0" }
-pi-agent = { path = "crates/pi-agent", version = "0.1.0" }
-pi-tools = { path = "crates/pi-tools", version = "0.1.0" }
-pi-harness = { path = "crates/pi-harness", version = "0.1.0" }
+# pi-rust internal crates (published under the `rpi-` prefix; directories keep
+# the `pi-` name — package `name` is what crates.io + `extern crate` see).
+rpi-telemetry = { path = "crates/pi-telemetry", version = "0.1.0" }
+rpi-ai = { path = "crates/pi-ai", version = "0.1.0" }
+rpi-agent = { path = "crates/pi-agent", version = "0.1.0" }
+rpi-tools = { path = "crates/pi-tools", version = "0.1.0" }
+rpi-harness = { path = "crates/pi-harness", version = "0.1.0" }
 
 [profile.release]
 lto = "thin"

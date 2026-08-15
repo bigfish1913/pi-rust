@@ -18,9 +18,9 @@
 use std::io::{BufRead, IsTerminal, Write};
 use std::sync::{Arc, Mutex};
 
-use pi_ai::types::{AssistantMessage, Content, StopReason};
-use pi_harness::agent_harness::{AgentHarness, AgentLane, HarnessRunOutcome};
-use pi_harness::events::{HarnessEvent, RunEndOutcome};
+use rpi_ai::types::{AssistantMessage, Content, StopReason};
+use rpi_harness::agent_harness::{AgentHarness, AgentLane, HarnessRunOutcome};
+use rpi_harness::events::{HarnessEvent, RunEndOutcome};
 
 use crate::args::Args;
 
@@ -257,7 +257,7 @@ pub async fn interactive(
     let is_tty = stdin.is_terminal();
 
     if is_tty {
-        println!("pi interactive (v1 minimal REPL). Type /exit to quit, /abort to cancel a run.\n");
+        println!("rpi interactive (v1 minimal REPL). Type /exit to quit, /abort to cancel a run.\n");
     }
 
     // Run the initial prompt + extra messages first (same as print mode).
@@ -344,18 +344,18 @@ async fn run_one(lane: &Arc<dyn AgentLane>, prompt: &str) -> Result<(), i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pi_ai::types::{AssistantMessage, Content, StopReason, TextContent, TextContentType, Usage};
-    use pi_harness::session::types::OperationError;
+    use rpi_ai::types::{AssistantMessage, Content, StopReason, TextContent, TextContentType, Usage};
+    use rpi_harness::session::types::OperationError;
 
     fn assistant(text: &str, stop: StopReason) -> AssistantMessage {
         AssistantMessage {
-            role: pi_ai::types::AssistantRole,
+            role: rpi_ai::types::AssistantRole,
             content: vec![Content::Text(TextContent {
                 kind: TextContentType,
                 text: text.into(),
                 text_signature: None,
             })],
-            api: pi_ai::Api::AnthropicMessages,
+            api: rpi_ai::Api::AnthropicMessages,
             provider: "anthropic".into(),
             model: "claude-sonnet-5".into(),
             response_model: None,

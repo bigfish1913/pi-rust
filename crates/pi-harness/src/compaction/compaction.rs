@@ -29,9 +29,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use pi_ai::types::{AssistantMessage, Content, Context, Message, StopReason, Usage, UserContent, UserMessage};
-use pi_ai::{CacheRetention, Model, Provider, SimpleStreamOptions, ThinkingLevel};
-use pi_agent::message::AgentMessage;
+use rpi_ai::types::{AssistantMessage, Content, Context, Message, StopReason, Usage, UserContent, UserMessage};
+use rpi_ai::{CacheRetention, Model, Provider, SimpleStreamOptions, ThinkingLevel};
+use rpi_agent::message::AgentMessage;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -825,7 +825,7 @@ mod tests {
             cache_write_1h: Some(3),
             reasoning: None,
             total_tokens: 18,
-            cost: pi_ai::types::UsageCost { input: 1.0, output: 2.0, cache_read: 0.5, cache_write: 0.25, total: 3.75 },
+            cost: rpi_ai::types::UsageCost { input: 1.0, output: 2.0, cache_read: 0.5, cache_write: 0.25, total: 3.75 },
         };
         let b = Usage {
             input: 1,
@@ -835,7 +835,7 @@ mod tests {
             cache_write_1h: None,
             reasoning: Some(4),
             total_tokens: 2,
-            cost: pi_ai::types::UsageCost { input: 0.1, output: 0.2, cache_read: 0.0, cache_write: 0.0, total: 0.3 },
+            cost: rpi_ai::types::UsageCost { input: 0.1, output: 0.2, cache_read: 0.0, cache_write: 0.0, total: 0.3 },
         };
         let c = combine_usage(&a, &b);
         assert_eq!(c.input, 11);

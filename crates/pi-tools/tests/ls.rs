@@ -5,16 +5,16 @@
 
 use std::sync::Arc;
 
-use pi_agent::agent_tool::AgentTool;
-use pi_agent::error::AgentError;
-use pi_tools::{ExecutionToolContext, FileSystem, InMemoryExecutionEnv};
+use rpi_agent::agent_tool::AgentTool;
+use rpi_agent::error::AgentError;
+use rpi_tools::{ExecutionToolContext, FileSystem, InMemoryExecutionEnv};
 use tokio_util::sync::CancellationToken;
 
 /// Build a fresh in-memory tool context rooted at `/tmp/work`.
-fn fresh_context() -> (Arc<InMemoryExecutionEnv>, pi_tools::ExecutionToolContext) {
+fn fresh_context() -> (Arc<InMemoryExecutionEnv>, rpi_tools::ExecutionToolContext) {
     let env = Arc::new(InMemoryExecutionEnv::with_cwd("/tmp/work".into()));
-    let env_dyn: Arc<dyn pi_tools::ExecutionEnv> = env.clone();
-    let mut_env: Arc<dyn pi_tools::MutatingEnv> = env.clone();
+    let env_dyn: Arc<dyn rpi_tools::ExecutionEnv> = env.clone();
+    let mut_env: Arc<dyn rpi_tools::MutatingEnv> = env.clone();
     let ctx = ExecutionToolContext::new(env_dyn, Some(mut_env));
     (env, ctx)
 }
@@ -35,8 +35,8 @@ async fn seed_file(env: &InMemoryExecutionEnv, rel: &str, bytes: Vec<u8>) {
 }
 
 /// Extract the single text block's text from a tool result (panics if absent).
-fn text_output(r: &pi_agent::types::AgentToolResult) -> String {
-    use pi_agent::types::TextContentOrImage;
+fn text_output(r: &rpi_agent::types::AgentToolResult) -> String {
+    use rpi_agent::types::TextContentOrImage;
     r.content
         .iter()
         .filter_map(|c| match c {
@@ -50,7 +50,7 @@ fn text_output(r: &pi_agent::types::AgentToolResult) -> String {
 async fn run_ls(
     tool: Arc<dyn AgentTool>,
     params: serde_json::Value,
-) -> Result<pi_agent::types::AgentToolResult, AgentError> {
+) -> Result<rpi_agent::types::AgentToolResult, AgentError> {
     let signal = CancellationToken::new();
     let on_update = Arc::new(|_p| ());
     tool.execute("ls-1", params, signal, on_update).await
@@ -63,7 +63,7 @@ async fn ls_lists_entries_with_dir_suffix() {
     seed_file(&env, "alpha.txt", b"1".to_vec()).await;
     seed_file(&env, "beta.md", b"2".to_vec()).await;
 
-    let tool = pi_tools::create_ls_tool(&ctx, None);
+    let tool = rpi_tools::create_ls_tool(&ctx, None);
     let result = run_ls(tool, serde_json::json!({})).await.expect("ls ok");
     let out = text_output(&result);
     // Directory gets a `/` suffix; files do not.
@@ -79,7 +79,7 @@ async fn ls_sorts_case_insensitively() {
     seed_file(&env, "alpha.txt", b"2".to_vec()).await;
     seed_file(&env, "Beta.txt", b"3".to_vec()).await;
 
-    let tool = pi_tools::create_ls_tool(&ctx, None);
+    let tool = rpi_tools::create_ls_tool(&ctx, None);
     let result = run_ls(tool, serde_json::json!({})).await.expect("ls ok");
     let out = text_output(&result);
     let lines: Vec<&str> = out.lines().collect();
@@ -94,7 +94,7 @@ async fn ls_empty_directory() {
     let (env, ctx) = fresh_context();
     make_dir(&env, "empty").await;
 
-    let tool = pi_tools::create_ls_tool(&ctx, None);
+    let tool = rpi_tools::create_ls_tool(&ctx, None);
     let result = run_ls(tool, serde_json::json!({ "path": "empty" }))
         .await
         .expect("ls ok");
@@ -108,7 +108,7 @@ async fn ls_entry_limit_reached() {
     for i in 0..6 {
         seed_file(&env, &format!("f{i}.txt"), b"x".to_vec()).await;
     }
-    let tool = pi_tools::create_ls_tool(&ctx, None);
+    let tool = rpi_tools::create_ls_tool(&ctx, None);
     let result = run_ls(tool, serde_json::json!({ "limit": 3 }))
         .await
         .expect("ls ok");
@@ -121,7 +121,7 @@ async fn ls_entry_limit_reached() {
 #[tokio::test]
 async fn ls_path_not_found() {
     let (_env, ctx) = fresh_context();
-    let tool = pi_tools::create_ls_tool(&ctx, None);
+    let tool = rpi_tools::create_ls_tool(&ctx, None);
     let err = run_ls(tool, serde_json::json!({ "path": "nope" }))
         .await
         .expect_err("missing path should error");
@@ -136,7 +136,7 @@ async fn ls_path_not_found() {
 async fn ls_not_a_directory() {
     let (env, ctx) = fresh_context();
     seed_file(&env, "afile.txt", b"hi".to_vec()).await;
-    let tool = pi_tools::create_ls_tool(&ctx, None);
+    let tool = rpi_tools::create_ls_tool(&ctx, None);
     let err = run_ls(tool, serde_json::json!({ "path": "afile.txt" }))
         .await
         .expect_err("file not dir should error");

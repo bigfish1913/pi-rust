@@ -18,10 +18,10 @@
 
 #![cfg(feature = "smoke")]
 
-use pi_ai::model::Model;
-use pi_ai::provider::{Provider, SimpleStreamOptions};
-use pi_ai::providers::anthropic::{models::get_model, AnthropicProvider};
-use pi_ai::types::{
+use rpi_ai::model::Model;
+use rpi_ai::provider::{Provider, SimpleStreamOptions};
+use rpi_ai::providers::anthropic::{models::get_model, AnthropicProvider};
+use rpi_ai::types::{
     AssistantMessageEvent, Content, Context, Message, Schema, StopReason, Tool, UserContent,
     UserMessage,
 };
@@ -49,7 +49,7 @@ fn weather_tool() -> Tool {
 }
 
 async fn drain(
-    stream: &mut pi_ai::AssistantMessageEventStream,
+    stream: &mut rpi_ai::AssistantMessageEventStream,
 ) -> Vec<AssistantMessageEvent> {
     let mut out = Vec::new();
     while let Some(ev) = stream.next().await {

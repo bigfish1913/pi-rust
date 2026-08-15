@@ -22,17 +22,17 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use pi_ai::Provider;
-use pi_harness::agent_harness::AgentHarness;
-use pi_harness::session::memory::{InMemorySessionStorage, SystemClock};
-use pi_harness::session::session::DefaultIdGenerator;
-use pi_harness::session::types::SessionMetadata;
-use pi_harness::session::Session;
-use pi_harness::types::{
+use rpi_ai::Provider;
+use rpi_harness::agent_harness::AgentHarness;
+use rpi_harness::session::memory::{InMemorySessionStorage, SystemClock};
+use rpi_harness::session::session::DefaultIdGenerator;
+use rpi_harness::session::types::SessionMetadata;
+use rpi_harness::session::Session;
+use rpi_harness::types::{
     AgentHarnessOptions, AgentHarnessResources, CompactionSettings, DrivingMode,
     HarnessToolExecution, HarnessTool, RetryPolicy, ToolReplay,
 };
-use pi_tools::{
+use rpi_tools::{
     create_bash_tool, create_edit_tool, create_find_tool, create_grep_tool, create_ls_tool,
     create_read_tool, create_write_tool, ExecutionToolContext, MutationQueueRegistry,
     OsExecutionEnv,
@@ -133,8 +133,8 @@ pub async fn build(
 
     // ---- Execution env + tools ----
     let env = Arc::new(OsExecutionEnv::with_cwd(cwd.to_path_buf()));
-    let env_dyn: Arc<dyn pi_tools::ExecutionEnv> = env.clone();
-    let mut_env: Arc<dyn pi_tools::MutatingEnv> = env.clone();
+    let env_dyn: Arc<dyn rpi_tools::ExecutionEnv> = env.clone();
+    let mut_env: Arc<dyn rpi_tools::MutatingEnv> = env.clone();
     let _registry = Arc::new(MutationQueueRegistry::new());
     let ctx = ExecutionToolContext::new(env_dyn, Some(mut_env));
 
@@ -308,10 +308,10 @@ fn ephemeral_session() -> Session {
 /// rooted at the cwd, so paths resolve consistently with the tools. Mirrors the
 /// TS `SessionManager.create` flow (header write + `JsonlSessionStorage` open).
 async fn create_jsonl_session(dir: &Path, cwd: &str) -> Result<Session, String> {
-    use pi_harness::session::jsonl::{
+    use rpi_harness::session::jsonl::{
         JsonlSessionCreateOptions, JsonlSessionRepo, JsonlSessionRepoOptions,
     };
-    use pi_tools::FileSystem;
+    use rpi_tools::FileSystem;
 
     // A dedicated OS env for session-file I/O, rooted at the cwd so the repo's
     // relative-path resolution matches the tool env.
@@ -336,7 +336,7 @@ async fn create_jsonl_session(dir: &Path, cwd: &str) -> Result<Session, String> 
         .await
         .map_err(|e| format!("create session: {e}"))?;
     // `JsonlSessionStorage` implements `SessionStorage`; wrap in the facade.
-    let storage_arc: Arc<dyn pi_harness::session::types::SessionStorage> = Arc::new(storage);
+    let storage_arc: Arc<dyn rpi_harness::session::types::SessionStorage> = Arc::new(storage);
     Ok(Session::new(storage_arc, None))
 }
 

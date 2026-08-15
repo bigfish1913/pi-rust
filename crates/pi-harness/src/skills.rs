@@ -28,7 +28,7 @@
 
 use std::sync::Arc;
 
-use pi_tools::env::{ExecutionEnv, FileInfo, FileKind};
+use rpi_tools::env::{ExecutionEnv, FileInfo, FileKind};
 use tokio_util::sync::CancellationToken;
 
 use crate::frontmatter::parse_frontmatter;
@@ -167,7 +167,7 @@ pub async fn load_skills(env: &Arc<dyn ExecutionEnv>, dirs: &[String]) -> LoadSk
         let root_info = match env.file_info(dir, Some(&cancel)).await {
             Ok(info) => info,
             Err(e) => {
-                if e.code != pi_tools::FileErrorCode::NotFound {
+                if e.code != rpi_tools::FileErrorCode::NotFound {
                     diagnostics.push(SkillDiagnostic {
                         code: SkillDiagnosticCode::FileInfoFailed,
                         message: e.message,
@@ -257,7 +257,7 @@ async fn load_skills_from_dir_internal(
     let dir_info = match env.file_info(dir, Some(&cancel)).await {
         Ok(info) => info,
         Err(e) => {
-            if e.code != pi_tools::FileErrorCode::NotFound {
+            if e.code != rpi_tools::FileErrorCode::NotFound {
                 diagnostics.push(SkillDiagnostic {
                     code: SkillDiagnosticCode::FileInfoFailed,
                     message: e.message,
@@ -488,7 +488,7 @@ async fn resolve_kind(
                 }
             }
             Err(e) => {
-                if e.code != pi_tools::FileErrorCode::NotFound {
+                if e.code != rpi_tools::FileErrorCode::NotFound {
                     diagnostics.push(SkillDiagnostic {
                         code: SkillDiagnosticCode::FileInfoFailed,
                         message: e.message,
@@ -499,7 +499,7 @@ async fn resolve_kind(
             }
         },
         Err(e) => {
-            if e.code != pi_tools::FileErrorCode::NotFound {
+            if e.code != rpi_tools::FileErrorCode::NotFound {
                 diagnostics.push(SkillDiagnostic {
                     code: SkillDiagnosticCode::FileInfoFailed,
                     message: e.message,
@@ -538,7 +538,7 @@ async fn add_ignore_rules(
         let info = match env.file_info(&ignore_path, Some(&cancel)).await {
             Ok(i) => i,
             Err(e) => {
-                if e.code != pi_tools::FileErrorCode::NotFound {
+                if e.code != rpi_tools::FileErrorCode::NotFound {
                     diagnostics.push(SkillDiagnostic {
                         code: SkillDiagnosticCode::FileInfoFailed,
                         message: e.message,

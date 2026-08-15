@@ -5,7 +5,7 @@
 //! The struct + constant themselves live in [`crate::types`] (declared there so
 //! `AgentHarnessOptions`, which predates this module, can carry the field
 //! without a forward dependency). This module owns only the threshold check and
-//! re-exports the struct for a stable `pi_harness::compaction::settings` path.
+//! re-exports the struct for a stable `rpi_harness::compaction::settings` path.
 
 // Re-export so `super::mod` can surface them as `compaction::CompactionSettings`.
 pub use crate::types::{CompactionSettings, DEFAULT_COMPACTION_SETTINGS};

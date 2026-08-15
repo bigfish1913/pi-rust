@@ -16,7 +16,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use pi_harness::events::{
+use rpi_harness::events::{
     HarnessEvent, HarnessEventBus, RunEndEvent, RunEndOutcome, RunStartEvent, WatchListener,
 };
 

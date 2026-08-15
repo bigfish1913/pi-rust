@@ -17,14 +17,14 @@
 //!   `--no-*` discovery toggles are **recognized but ignored** (parsed so users
 //!   don't get a hard error for muscle-memory flags, with a warning). They are
 //!   not in v1's surface.
-//! - `--thinking` is typed via [`ThinkingLevel`] from `pi_ai` (the TS parser
+//! - `--thinking` is typed via [`ThinkingLevel`] from `rpi_ai` (the TS parser
 //!   validates against the same string set).
 //! - `--print`/`-p` may consume a following positional as its prompt (the TS
 //!   parser's `next !== undefined && !startsWith('@')` heuristic) — preserved.
 
 use std::path::PathBuf;
 
-use pi_ai::ThinkingLevel;
+use rpi_ai::ThinkingLevel;
 
 /// Output mode. Mirrors TS `Mode = "text" | "json" | "rpc"`. `rpc` is parsed
 /// (so `--mode rpc` doesn't error) but v1 does not implement it; `main`

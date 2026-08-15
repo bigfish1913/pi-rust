@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-use pi_ai::types::DeferredHandle;
+use rpi_ai::types::DeferredHandle;
 
 /// `run_start` event. Mirrors TS `RunStartEvent`.
 #[derive(Debug, Clone, PartialEq, Eq)]

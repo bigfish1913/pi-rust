@@ -17,21 +17,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use common::{assistant_text, assistant_tool_calls, base_config, run_and_collect, user_message};
-use pi_agent::{AgentContext, AgentEvent, AgentToolResult, GetSteeringMessages, ToolExecutionMode};
-use pi_ai::types::StopReason;
+use rpi_agent::{AgentContext, AgentEvent, AgentToolResult, GetSteeringMessages, ToolExecutionMode};
+use rpi_ai::types::StopReason;
 use tokio_util::sync::CancellationToken;
 
 /// An echo tool that records every executed `value` into a shared buffer. The
 /// steering hook reads the buffer's length to decide when to release the
 /// interrupt.
 struct EchoTool {
-    schema: pi_ai::types::Tool,
+    schema: rpi_ai::types::Tool,
     executed: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 #[async_trait::async_trait]
-impl pi_agent::AgentTool for EchoTool {
-    fn schema(&self) -> &pi_ai::types::Tool {
+impl rpi_agent::AgentTool for EchoTool {
+    fn schema(&self) -> &rpi_ai::types::Tool {
         &self.schema
     }
     fn label(&self) -> &str {
@@ -42,8 +42,8 @@ impl pi_agent::AgentTool for EchoTool {
         _tool_call_id: &str,
         params: serde_json::Value,
         _signal: CancellationToken,
-        _on_update: Arc<dyn Fn(pi_agent::ToolResultPartial) + Send + Sync>,
-    ) -> Result<AgentToolResult, pi_agent::AgentError> {
+        _on_update: Arc<dyn Fn(rpi_agent::ToolResultPartial) + Send + Sync>,
+    ) -> Result<AgentToolResult, rpi_agent::AgentError> {
         let value = params
             .get("value")
             .and_then(|v| v.as_str())
@@ -60,11 +60,11 @@ impl pi_agent::AgentTool for EchoTool {
     }
 }
 
-fn echo_schema() -> pi_ai::types::Tool {
-    pi_ai::types::Tool {
+fn echo_schema() -> rpi_ai::types::Tool {
+    rpi_ai::types::Tool {
         name: "echo".to_string(),
         description: "Echo tool".to_string(),
-        parameters: pi_ai::types::Schema::new(serde_json::json!({
+        parameters: rpi_ai::types::Schema::new(serde_json::json!({
             "type": "object",
             "properties": { "value": { "type": "string" } },
             "required": ["value"],
@@ -163,10 +163,10 @@ async fn steering_injected_after_tool_batch_completes() {
         .iter()
         .filter_map(|e| match e {
             AgentEvent::MessageStart { message } => match message {
-                pi_agent::AgentMessage::ToolResult(t) => {
+                rpi_agent::AgentMessage::ToolResult(t) => {
                     Some(format!("tool:{}", t.tool_call_id))
                 }
-                pi_agent::AgentMessage::User(u) => u.content.as_text().map(|s| s.to_string()),
+                rpi_agent::AgentMessage::User(u) => u.content.as_text().map(|s| s.to_string()),
                 _ => None,
             },
             _ => None,
@@ -202,13 +202,13 @@ async fn steering_injected_after_tool_batch_completes() {
 /// message is the "interrupt" user text, set `saw`. Returns a new `StreamFn`
 /// that forwards to `inner`.
 fn inspect_for_interrupt(
-    inner: pi_agent::StreamFn,
+    inner: rpi_agent::StreamFn,
     saw: Arc<AtomicBool>,
-) -> pi_agent::StreamFn {
-    pi_agent::stream_fn(move |model, ctx, opts| {
+) -> rpi_agent::StreamFn {
+    rpi_agent::stream_fn(move |model, ctx, opts| {
         // Inspect: does the LLM context carry the "interrupt" user message?
         let has_interrupt = ctx.messages.iter().any(|m| match m {
-            pi_ai::types::Message::User(u) => u.content.as_text() == Some("interrupt"),
+            rpi_ai::types::Message::User(u) => u.content.as_text() == Some("interrupt"),
             _ => false,
         });
         if has_interrupt {

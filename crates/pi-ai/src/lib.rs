@@ -18,7 +18,7 @@ pub mod providers;
 pub mod schema;
 pub mod types;
 
-// Flat re-exports — consumers do `use pi_ai::Message` not `pi_ai::types::Message`.
+// Flat re-exports — consumers do `use rpi_ai::Message` not `rpi_ai::types::Message`.
 pub use error::AiError;
 pub use event_stream::{AssistantMessageEventStream, AssistantMessageEventStreamProducer};
 pub use model::{Model, StreamingProtocolCompat};
