@@ -138,9 +138,10 @@ if ($dirty.Trim().Length -gt 0) {
 # --- pre-flight tests ---
 if (-not $SkipTest) {
     Write-Section "Pre-flight: cargo test --workspace"
-    & cargo test --workspace 2>&1 | Out-String | Write-Host
-    if ($LASTEXITCODE -ne 0) {
-        Write-Bad "Pre-flight tests failed (exit $LASTEXITCODE). Aborting."
+    $testRes = Invoke-Cargo @('test', '--workspace')
+    Write-Host $testRes.Text
+    if ($testRes.Code -ne 0) {
+        Write-Bad "Pre-flight tests failed (exit $($testRes.Code)). Aborting."
         exit 1
     }
     Write-Ok "tests pass"
