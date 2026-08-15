@@ -1,0 +1,53 @@
+# Taskfile for the rpi-* crate family release.
+#
+# Wraps release.ps1 (Windows, canonical) / release.sh (Unix mirror) so the
+# publish is driven by `task <target>` instead of remembering script flags. The
+# dependency-ordered publish logic, pre-flight checks, and per-crate retry live
+# in the release scripts — this is just the ergonomic entry point.
+#
+# Usage:
+#   task              # list targets
+#   task dry-run      # safe dry run (default behavior)
+#   task publish      # real publish to crates.io, with pre-flight `cargo test`
+#   task publish:fast # real publish, skip pre-flight tests (only after a green `task test`)
+#   task test         # cargo test --workspace
+#
+# Prerequisite for `task publish*`: run `cargo login` once so ~/.cargo/credentials.toml
+# exists with a valid publish-scoped token. crates.io records are permanent.
+
+version: '3'
+
+tasks:
+  default:
+    desc: List available release targets
+    cmds:
+      - task --list
+
+  dry-run:
+    desc: Safe dry-run of the crates.io publish (packs + verifies each crate, no upload)
+    cmds:
+      - cmd: powershell -NoProfile -ExecutionPolicy Bypass -File release.ps1 -DryRun
+        platforms: [windows]
+      - cmd: ./release.sh --dry-run
+        platforms: [linux, darwin]
+
+  publish:
+    desc: Real publish rpi-* crates to crates.io in dependency order (runs pre-flight `cargo test`)
+    cmds:
+      - cmd: powershell -NoProfile -ExecutionPolicy Bypass -File release.ps1 -Publish
+        platforms: [windows]
+      - cmd: ./release.sh --publish
+        platforms: [linux, darwin]
+
+  publish:fast:
+    desc: Real publish, skip pre-flight tests (use only after a fresh green `task test`)
+    cmds:
+      - cmd: powershell -NoProfile -ExecutionPolicy Bypass -File release.ps1 -Publish -SkipTest
+        platforms: [windows]
+      - cmd: ./release.sh --publish --skip-test
+        platforms: [linux, darwin]
+
+  test:
+    desc: cargo test --workspace (the release pre-flight, run standalone)
+    cmds:
+      - cargo test --workspace
