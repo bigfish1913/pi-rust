@@ -8,8 +8,10 @@ members = [
     "crates/pi-tools",
     "crates/pi-harness",
     "crates/pi-cli",
+    "crates/pi-tui",
     "examples/minimal",
     "examples/tools",
+    "examples/tui",
 ]
 default-members = [
     "crates/pi-agent",
@@ -65,6 +67,8 @@ rpi-ai = { path = "crates/pi-ai", version = "0.1.2" }
 rpi-agent = { path = "crates/pi-agent", version = "0.1.2" }
 rpi-tools = { path = "crates/pi-tools", version = "0.1.2" }
 rpi-harness = { path = "crates/pi-harness", version = "0.1.2" }
+
+rpi-tui = { path = "crates/pi-tui", version = "0.1.2" }
 
 [profile.release]
 lto = "thin"

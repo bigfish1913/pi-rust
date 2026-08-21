@@ -1,0 +1,18 @@
+[package]
+name = "rpi-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Terminal User Interface for pi-rust"
+
+[dependencies]
+crossterm = { version = "0.27", features = ["events"] }
+unicode-width = "0.1"
+unicode-segmentation = "1"
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }

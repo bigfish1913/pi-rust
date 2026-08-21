@@ -245,8 +245,25 @@ fn run_end_outcome_str(o: RunEndOutcome) -> &'static str {
     }
 }
 
-/// `interactive` mode: a minimal line-oriented REPL. NOT a port of the TS TUI.
+/// `interactive` mode: uses TUI if terminal supports it, falls back to minimal REPL.
 pub async fn interactive(
+    harness: &AgentHarness,
+    args: &Args,
+    initial: Option<String>,
+    extra_messages: &[String],
+) -> i32 {
+    // Check if TUI is supported
+    if crate::interactive_tui::is_tui_supported() {
+        // Use TUI-based interactive mode
+        crate::interactive_tui::interactive_tui(harness, args, initial, extra_messages).await
+    } else {
+        // Fall back to simple REPL
+        interactive_repl(harness, args, initial, extra_messages).await
+    }
+}
+
+/// Simple REPL-based interactive mode (fallback for non-TTY environments).
+pub async fn interactive_repl(
     harness: &AgentHarness,
     #[allow(unused_variables)] args: &Args,
     initial: Option<String>,
