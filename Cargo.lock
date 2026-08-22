@@ -1467,7 +1467,9 @@ dependencies = [
 name = "rpi-tui"
 version = "0.1.2"
 dependencies = [
+ "base64",
  "crossterm",
+ "regex",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

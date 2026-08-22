@@ -13,6 +13,14 @@ unicode-width = "0.1"
 unicode-segmentation = "1"
 thiserror.workspace = true
 tracing.workspace = true
+regex = "1"
+base64 = "0.22"
+# Optional: East Asian Width support
+# We'll implement our own version for now
+
+[features]
+default = []
+image-support = []
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }

@@ -248,6 +248,8 @@ struct HarnessInner {
     /// `convert_to_llm` is used.
     to_provider_messages: Option<ConvertToLlm>,
     entry_projectors: BTreeMap<String, CustomEntryContextMessageProjector>,
+    /// Optional emitter override; see [`AgentHarnessOptions::agent_emitter`].
+    agent_emitter: Option<Arc<dyn AgentEmitter>>,
     closed: bool,
     active_run: Option<ActiveRun>,
 }
@@ -301,6 +303,7 @@ impl AgentHarness {
             models: options.models,
             to_provider_messages: options.to_provider_messages,
             entry_projectors: options.entry_projectors,
+            agent_emitter: options.agent_emitter,
             closed: false,
             active_run: None,
         };
@@ -546,6 +549,7 @@ impl AgentHarness {
             models: inner.models.clone(),
             to_provider_messages: inner.to_provider_messages.clone(),
             entry_projectors: inner.entry_projectors.clone(),
+            agent_emitter: inner.agent_emitter.clone(),
         })
     }
 
@@ -923,10 +927,12 @@ impl AgentHarness {
             signal: signal.clone(),
         };
 
-        // Emitter: a collector that discards events (the harness surfaces
-        // RunStart/RunEnd via its own bus). A future revision can bridge
-        // AgentEvent -> a harness event stream.
-        let emitter: Arc<dyn AgentEmitter> = Arc::new(rpi_agent::CollectorEmitter::default());
+        // Emitter: use the caller's override if one was supplied (e.g. the TUI
+        // installs a BroadcastEmitter so it can render AgentEvents live);
+        // otherwise fall back to a collector that discards events (the harness
+        // still surfaces RunStart/RunEnd via its own bus).
+        let emitter: Arc<dyn AgentEmitter> = snap.agent_emitter.clone()
+            .unwrap_or_else(|| Arc::new(rpi_agent::CollectorEmitter::default()));
 
         // Drive the loop. We pass an EMPTY prompts vec to `run_agent_loop`
         // (NOT `prompts`): the prompts were already persisted to the session
@@ -1147,6 +1153,7 @@ struct ConfigSnapshot {
     models: Vec<Arc<dyn AiProvider>>,
     to_provider_messages: Option<ConvertToLlm>,
     entry_projectors: BTreeMap<String, CustomEntryContextMessageProjector>,
+    agent_emitter: Option<Arc<dyn AgentEmitter>>,
 }
 
 // ===========================================================================

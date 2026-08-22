@@ -8,11 +8,12 @@ use std::sync::{Arc, Mutex};
 
 use super::component::Component;
 use super::container::Container;
+use super::editor::Editor;
 use super::layout::{extract_cursor_position, render_layout_frame, LayoutFrame};
 use super::scroll_view::ScrollView;
 use super::tui::{OverlayHandle, OverlayOptions, TuiMode, TuiStopOptions, TUI};
 use crate::ansi::CURSOR_MARKER;
-use crate::terminal::{InputEvent, Terminal};
+use crate::terminal::{InputEvent, Terminal, TerminalInfo};
 
 /// Symbol for ViewportTUI capability check.
 pub const VIEWPORT_TUI: &[u8] = b"@earendil-works/pi-tui/viewport";
@@ -22,7 +23,7 @@ pub struct TuiAltScreen {
     terminal: Mutex<Box<dyn Terminal>>,
     container: Container,
     layout_root: Mutex<Option<Arc<dyn Component>>>,
-    running: Mutex<bool>,
+    running: Arc<Mutex<bool>>,
     show_hardware_cursor: Mutex<bool>,
     clear_on_shrink: Mutex<bool>,
     focused: Mutex<Option<Arc<dyn Component>>>,
@@ -31,6 +32,9 @@ pub struct TuiAltScreen {
     scroll_top: Mutex<usize>,
     stick_to_bottom: Mutex<bool>,
     current_frame: Mutex<Option<LayoutFrame>>,
+    // Input handlers
+    input_handler: Mutex<Option<Arc<dyn Fn(InputEvent) + Send + Sync>>>,
+    resize_handler: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl TuiAltScreen {
@@ -40,7 +44,7 @@ impl TuiAltScreen {
             terminal: Mutex::new(terminal),
             container: Container::new(),
             layout_root: Mutex::new(None),
-            running: Mutex::new(false),
+            running: Arc::new(Mutex::new(false)),
             show_hardware_cursor: Mutex::new(show_hardware_cursor),
             clear_on_shrink: Mutex::new(false),
             focused: Mutex::new(None),
@@ -49,6 +53,8 @@ impl TuiAltScreen {
             scroll_top: Mutex::new(0),
             stick_to_bottom: Mutex::new(true),
             current_frame: Mutex::new(None),
+            input_handler: Mutex::new(None),
+            resize_handler: Mutex::new(None),
         }
     }
 
@@ -259,10 +265,13 @@ impl TUI for TuiAltScreen {
     }
 
     fn terminal(&self) -> &dyn Terminal {
-        // This is a bit awkward because we need to return a reference
-        // For now, we'll return a static reference to a dummy terminal
-        // A better approach would be to store the terminal differently
-        unimplemented!("Use terminal_direct() instead")
+        // This trait method is problematic because we store Terminal in Mutex<Box<dyn Terminal>>
+        // We cannot return a reference through a Mutex guard. 
+        // For now, we provide a stub that should not be called.
+        // Alternative: change the trait to not require this method, or use different storage.
+        // This is a known design issue - users should use the terminal through other methods.
+        static DUMMY: DummyTerminal = DummyTerminal;
+        &DUMMY
     }
 
     fn children(&self) -> Vec<Arc<dyn Component>> {
@@ -324,41 +333,59 @@ impl TUI for TuiAltScreen {
             *running = true;
         }
         
-        // Set up terminal input handling
-        let scroll_top = Arc::new(Mutex::new(0usize));
-        let stick_to_bottom = Arc::new(Mutex::new(true));
-        let running = Arc::new(Mutex::new(true));
+        // Clone the necessary Arc references for the closures
+        let running = self.running.clone();
         
-        {
-            let terminal = self.terminal.lock().unwrap();
-            let scroll_top_clone = scroll_top.clone();
-            let stick_to_bottom_clone = stick_to_bottom.clone();
-            let running_clone = running.clone();
-            
+        // Get terminal and start it
+        if let Ok(terminal) = self.terminal.lock() {
             terminal.start(
-                Box::new(move |_event: InputEvent| {
+                Box::new(move |event: InputEvent| {
+                    // Check if still running
+                    if !*running.lock().unwrap() {
+                        return;
+                    }
+                    
                     // Handle input events
-                    // This would include keyboard scrolling, mouse wheel, etc.
+                    match event {
+                        InputEvent::Key(_key) => {
+                            // Key handling would be done by focused component
+                            // For now, this is a placeholder
+                        }
+                        InputEvent::Mouse(_mouse) => {
+                            // Mouse handling - could be implemented later
+                        }
+                        InputEvent::Resize(_cols, _rows) => {
+                            // Resize triggers re-render
+                            // For now, this is a placeholder
+                        }
+                        _ => {}
+                    }
                 }),
                 Box::new(move || {
                     // Handle resize
-                    // This would trigger a re-render
+                    // For now, this is a placeholder
                 }),
             );
         }
         
         self.enter_alt_screen();
+        
+        // Trigger initial render after entering alt screen
+        self.do_render();
     }
 
     fn stop(&self, options: TuiStopOptions) {
         if let Ok(mut running) = self.running.lock() {
             *running = false;
         }
-        self.exit_alt_screen(options.preserve_screen);
         
+        // Stop terminal first
         if let Ok(terminal) = self.terminal.lock() {
             terminal.stop();
         }
+        
+        // Exit alt screen
+        self.exit_alt_screen(options.preserve_screen);
     }
 
     fn render_now(&self, force: bool) {
@@ -394,4 +421,24 @@ impl OverlayHandle for DummyOverlayHandle {
     fn is_hidden(&self) -> bool { false }
     fn focus(&self) {}
     fn is_focused(&self) -> bool { false }
+}
+
+/// Dummy terminal for the terminal() stub.
+struct DummyTerminal;
+
+impl Terminal for DummyTerminal {
+    fn info(&self) -> TerminalInfo { TerminalInfo::default() }
+    fn write(&self, _data: &str) {}
+    fn hide_cursor(&self) {}
+    fn show_cursor(&self) {}
+    fn move_cursor(&self, _row: usize, _col: usize) {}
+    fn clear_screen(&self) {}
+    fn set_title(&self, _title: &str) {}
+    fn enable_mouse(&self) {}
+    fn disable_mouse(&self) {}
+    fn start(&self, _on_input: Box<dyn Fn(InputEvent) + Send + Sync>, _on_resize: Box<dyn Fn() + Send + Sync>) {}
+    fn stop(&self) {}
+    fn is_tty(&self) -> bool { false }
+    fn set_progress(&self, _active: bool) {}
+    fn flush(&self) {}
 }

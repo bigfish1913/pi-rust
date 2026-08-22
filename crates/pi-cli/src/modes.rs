@@ -246,16 +246,22 @@ fn run_end_outcome_str(o: RunEndOutcome) -> &'static str {
 }
 
 /// `interactive` mode: uses TUI if terminal supports it, falls back to minimal REPL.
+///
+/// `event_rx` carries the live `AgentEvent` stream (drained by the TUI to
+/// render streaming responses). The REPL fallback ignores it.
 pub async fn interactive(
     harness: &AgentHarness,
+    event_rx: Option<tokio::sync::broadcast::Receiver<rpi_agent::AgentEvent>>,
     args: &Args,
     initial: Option<String>,
     extra_messages: &[String],
 ) -> i32 {
     // Check if TUI is supported
-    if crate::interactive_tui::is_tui_supported() {
+    let force_tui = std::env::var("RPI_FORCE_TUI").map(|v| v == "1").unwrap_or(false);
+    if force_tui || crate::interactive_tui::is_tui_supported() {
         // Use TUI-based interactive mode
-        crate::interactive_tui::interactive_tui(harness, args, initial, extra_messages).await
+        crate::interactive_tui::interactive_tui(harness, event_rx, args, initial, extra_messages)
+            .await
     } else {
         // Fall back to simple REPL
         interactive_repl(harness, args, initial, extra_messages).await
@@ -269,6 +275,7 @@ pub async fn interactive_repl(
     initial: Option<String>,
     extra_messages: &[String],
 ) -> i32 {
+    // Debug: confirm we entered REPL mode
     let lane: Arc<dyn AgentLane> = harness.lane("main");
     let stdin = std::io::stdin();
     let is_tty = stdin.is_terminal();

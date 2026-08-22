@@ -6,43 +6,130 @@
 //! - Alternate screen mode (fullscreen with constrained layout)
 //! - Component-based UI with VStack, HStack, ScrollView
 //! - Mouse and keyboard input handling
+//! - Image support (Kitty/iTerm2 protocols)
+//! - Autocomplete, search, and more
 
+pub mod alt_screen_search;
 pub mod ansi;
+pub mod assistant_message;
+pub mod autocomplete;
+pub mod box_component;
 pub mod component;
 pub mod container;
 pub mod editor;
+pub mod fuzzy;
+pub mod footer;
 pub mod hstack;
+pub mod image;
+pub mod input;
 pub mod keybindings;
+pub mod keys;
+pub mod kill_ring;
 pub mod layout;
 pub mod layout_node;
+pub mod latex;
+pub mod loader;
 pub mod markdown;
 pub mod overlay;
 pub mod render;
 pub mod scroll_view;
+pub mod select_list;
+pub mod settings_list;
 pub mod spacer;
+pub mod stdin_buffer;
 pub mod terminal;
+pub mod terminal_colors;
+pub mod terminal_image;
 pub mod text;
+pub mod theme;
+pub mod tool_execution;
+pub mod truncated_text;
 pub mod tui;
 pub mod tui_alt_screen;
 pub mod tui_main_screen;
+pub mod undo_stack;
+pub mod utils;
 pub mod vstack;
+pub mod word_navigation;
 
 // Re-export main types
+pub use alt_screen_search::{AltScreenSearch, SearchMatch, SearchState};
 pub use ansi::{strip_ansi, visible_width, CURSOR_MARKER};
+pub use assistant_message::{AssistantMessageComponent, AssistantMessageOptions};
+pub use autocomplete::{
+    AutocompleteItem, AutocompleteManager, AutocompleteProvider, AutocompleteSuggestions,
+    CombinedAutocompleteProvider, FilePathAutocompleteProvider, SlashCommand,
+    SlashCommandAutocompleteProvider,
+};
+pub use box_component::Box;
 pub use component::{Component, Focusable};
 pub use container::Container;
 pub use editor::{Editor, EditorOptions, EditorStyle};
+pub use footer::FooterComponent;
+pub use fuzzy::{fuzzy_filter, fuzzy_match, FuzzyMatch};
 pub use hstack::HStack;
-pub use keybindings::{KeyCombo, Keybindings, KeybindingId};
-pub use layout::{composite_tui_line, extract_cursor_position, hit_test, render_layout_frame, LayoutBox, LayoutFrame, LayoutRect};
-pub use layout_node::{allocate_stack_sizes, LayoutNode, LayoutNodeProvider, LayoutViewport, StackLayoutEntry};
+pub use image::{Image, ImageOptions, ImageTheme};
+pub use input::Input;
+pub use keybindings::{
+    get_keybindings, set_keybindings, KeybindingConflict, KeybindingDefinition,
+    KeybindingId, Keybindings, KeyCombo,
+};
+pub use keys::{
+    is_key_release, is_key_repeat, is_kitty_protocol_active, matches_key, parse_key,
+    set_kitty_protocol_active, Key, KeyEventType, KeyHelper, KeyId,
+};
+pub use kill_ring::{KillRing, PushOptions};
+pub use layout::{
+    composite_tui_line, extract_cursor_position, hit_test, render_layout_frame,
+    LayoutBox, LayoutFrame, LayoutRect,
+};
+pub use layout_node::{
+    allocate_stack_sizes, LayoutNode, LayoutNodeProvider, LayoutViewport, StackLayoutEntry,
+};
+pub use latex::{is_latex, render_latex, strip_latex, RenderLatexOptions};
+pub use loader::{CancellableLoader, Loader, LoaderIndicatorOptions, ProgressLoader};
 pub use markdown::{Markdown, MarkdownOptions};
 pub use overlay::{Dialog, OverlayHandle, OverlayManager, Selector, SelectorItem};
 pub use scroll_view::{FollowMode, ScrollView, ScrollViewOptions};
+pub use select_list::{SelectItem, SelectList, SelectListLayoutOptions, SelectListTheme};
+pub use settings_list::{SettingItem, SettingType, SettingsList, SettingsListTheme};
 pub use spacer::Spacer;
-pub use terminal::{ProcessTerminal, Terminal, TerminalError};
+pub use stdin_buffer::{StdinBuffer, StdinBufferEvent, StdinBufferOptions};
+pub use terminal::{InputEvent, ProcessTerminal, Terminal, TerminalError, TerminalInfo};
+pub use terminal_colors::{
+    parse_osc11_background_color, parse_terminal_color_scheme_report,
+    query_background_color, query_color_scheme, query_cursor_color, query_foreground_color,
+    RgbColor, TerminalColorScheme,
+};
+pub use terminal_image::{
+    allocate_image_id, calculate_image_rows, delete_all_kitty_images, delete_kitty_image,
+    detect_capabilities, encode_iterm2, encode_kitty, get_capabilities, get_cell_dimensions,
+    get_gif_dimensions, get_image_dimensions, get_jpeg_dimensions, get_png_dimensions,
+    get_webp_dimensions, hyperlink, image_fallback, render_image, reset_capabilities_cache,
+    set_capabilities, set_cell_dimensions, CellDimensions, ImageDimensions, ImageProtocol,
+    ImageRenderOptions, TerminalCapabilities,
+};
 pub use text::Text;
-pub use tui::{OverlayAnchor, OverlayHandle as TuiOverlayHandle, OverlayMargin, OverlayOptions, TuiMode, TUI};
+pub use theme::{theme, Color, Theme, ThemeColors, ThemeManager, ThemePreset};
+pub use tool_execution::{ToolExecutionComponent, ToolStatus};
+pub use truncated_text::TruncatedText;
+pub use tui::{
+    OverlayAnchor, OverlayHandle as TuiOverlayHandle, OverlayMargin,
+    OverlayOptions, TuiMode, TuiStopOptions, TUI,
+};
 pub use tui_alt_screen::{is_viewport_tui, TuiAltScreen, VIEWPORT_TUI};
 pub use tui_main_screen::TuiMainScreen;
-pub use vstack::{layout_vstack_constrained, StackAlign, StackChild, StackEntry, StackEntryOptions, StackOptions, VStack};
+pub use undo_stack::{RedoStack, UndoRedoManager, UndoStack};
+pub use utils::{
+    apply_background_to_line, get_grapheme_segmenter, get_osc8_link_at_column,
+    is_whitespace_char, slice_by_column, truncate_to_width,
+    visible_width as visible_width_util, wrap_text_with_ansi, Grapheme, GraphemeSegmenter,
+};
+pub use vstack::{
+    layout_vstack_constrained, StackAlign, StackChild, StackEntry, StackEntryOptions,
+    StackOptions, VStack,
+};
+pub use word_navigation::{
+    find_word_backward, find_word_end, find_word_forward, find_line_end, find_line_start,
+    get_current_word_range, is_at_word_end, is_at_word_start, is_word_boundary, is_word_char,
+};

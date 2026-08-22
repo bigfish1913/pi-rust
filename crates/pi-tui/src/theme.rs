@@ -2,7 +2,7 @@
 //!
 //! Provides color schemes and styling options.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 /// Theme colors.
 #[derive(Debug, Clone)]
@@ -279,12 +279,11 @@ pub enum ThemePreset {
 
 /// Global theme helper functions.
 pub fn theme() -> Theme {
-    THEME_MANAGER.get()
+    THEME_MANAGER.get_or_init(ThemeManager::new).get()
 }
 
 /// Global theme manager.
-static THEME_MANAGER: once_cell::sync::Lazy<ThemeManager> = 
-    once_cell::sync::Lazy::new(ThemeManager::new);
+static THEME_MANAGER: std::sync::OnceLock<ThemeManager> = std::sync::OnceLock::new();
 
 /// Apply color from theme.
 pub fn themed_text(text: &str, color_fn: fn(&ThemeColors) -> Color) -> String {

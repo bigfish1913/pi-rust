@@ -354,6 +354,12 @@ pub struct AgentHarnessOptions {
     /// `custom` entry's `custom_type` → the messages to splice into the context.
     /// Mirrors TS `entryProjectors`.
     pub entry_projectors: BTreeMap<String, CustomEntryContextMessageProjector>,
+
+    /// Optional emitter override. When `Some`, the harness passes this emitter
+    /// to `run_agent_loop` so callers (e.g. the TUI) can observe `AgentEvent`s
+    /// live as a run unfolds. `None` (the default) preserves the discard
+    /// behavior — the harness only surfaces `RunStart`/`RunEnd` on its own bus.
+    pub agent_emitter: Option<Arc<dyn rpi_agent::AgentEmitter>>,
 }
 
 impl Default for AgentHarnessOptions {
@@ -393,6 +399,7 @@ impl Default for AgentHarnessOptions {
             models: Vec::new(),
             to_provider_messages: None,
             entry_projectors: BTreeMap::new(),
+            agent_emitter: None,
         }
     }
 }

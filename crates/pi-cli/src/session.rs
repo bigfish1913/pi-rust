@@ -124,11 +124,22 @@ pub fn default_session_dir(cwd: &Path) -> PathBuf {
 ///    `--exclude-tools`/`--no-tools`/`--no-builtin-tools`).
 /// 3. Resolves the session storage (ephemeral vs fresh JSONL vs restore-error).
 /// 4. Assembles `AgentHarnessOptions` and calls `AgentHarness::create`.
+///
+/// Returns the harness plus a `broadcast::Receiver<AgentEvent>` carrying the
+/// live `AgentEvent` stream from every run (backed by a `BroadcastEmitter`
+/// installed on the harness). Interactive mode drains this to render streaming
+/// responses; the non-interactive modes simply drop it.
 pub async fn build(
     resolved: &ResolvedModel,
     args: &Args,
     cwd: &Path,
-) -> Result<AgentHarness, BuildError> {
+) -> Result<
+    (
+        AgentHarness,
+        tokio::sync::broadcast::Receiver<rpi_agent::AgentEvent>,
+    ),
+    BuildError,
+> {
     let cwd_str = cwd.to_string_lossy().to_string();
 
     // ---- Execution env + tools ----
@@ -166,6 +177,12 @@ pub async fn build(
     };
 
     // ---- Options ----
+    // Install a BroadcastEmitter so the caller (the interactive TUI) can drain
+    // AgentEvents live as a run unfolds. The corresponding broadcast::Receiver
+    // is returned alongside the harness; non-interactive modes simply drop it.
+    let (emitter, event_rx) = rpi_agent::events::BroadcastEmitter::new(256);
+    let emitter: Arc<dyn rpi_agent::AgentEmitter> = Arc::new(emitter);
+
     let options = AgentHarnessOptions {
         model: resolved.model.clone(),
         thinking_level: resolved.thinking_level,
@@ -184,10 +201,12 @@ pub async fn build(
         models: vec![resolved.provider.clone() as Arc<dyn Provider>],
         to_provider_messages: None,
         entry_projectors: Default::default(),
+        agent_emitter: Some(emitter),
     };
 
     AgentHarness::create(options)
         .await
+        .map(|harness| (harness, event_rx))
         .map_err(|e| BuildError::HarnessCreate(e.to_string()))
 }
 

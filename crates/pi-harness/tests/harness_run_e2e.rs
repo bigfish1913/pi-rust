@@ -108,6 +108,7 @@ async fn harness_with(
         models: vec![provider.clone() as Arc<dyn Provider>],
         to_provider_messages: None,
         entry_projectors: Default::default(),
+        agent_emitter: None,
     };
 
     let harness = AgentHarness::create(options).await.expect("create harness");

@@ -80,13 +80,6 @@ pub async fn run() -> i32 {
         return EXIT_USAGE;
     }
 
-    // ---- Startup warnings (ignored-but-recognized flags) ----
-    if parsed.verbose {
-        for warn in &parsed.ignored {
-            eprintln!("warning: {warn}");
-        }
-    }
-
     // ---- cwd ----
     let cwd = match std::env::current_dir() {
         Ok(c) => c,
@@ -95,6 +88,13 @@ pub async fn run() -> i32 {
             return EXIT_USAGE;
         }
     };
+
+    // ---- Startup warnings (ignored-but-recognized flags) ----
+    if parsed.verbose {
+        for warn in &parsed.ignored {
+            eprintln!("warning: {warn}");
+        }
+    }
 
     // ---- stdin (TS readPipedStdin: non-TTY stdin becomes initial prompt text) ----
     let stdin_text = read_piped_stdin();
@@ -132,8 +132,8 @@ pub async fn run() -> i32 {
     };
 
     // ---- harness build ----
-    let harness = match build(&resolved, &parsed, &cwd).await {
-        Ok(h) => h,
+    let (harness, event_rx) = match build(&resolved, &parsed, &cwd).await {
+        Ok(pair) => pair,
         Err(e) => {
             print_build_error(&e);
             return EXIT_RUNTIME;
@@ -152,11 +152,26 @@ pub async fn run() -> i32 {
         mode
     };
 
+    // Debug/testing escape hatch: RPI_FORCE_TUI=1 forces interactive mode
+    // (for testing the TUI in non-TTY environments).
+    let mode = if std::env::var("RPI_FORCE_TUI").map(|v| v == "1").unwrap_or(false) {
+        RunMode::Interactive
+    } else {
+        mode
+    };
+
     match mode {
         RunMode::Print => crate::modes::print(&harness, &parsed, initial.clone(), &extra).await,
         RunMode::Json => crate::modes::json(&harness, &parsed, initial.clone(), &extra).await,
         RunMode::Interactive => {
-            crate::modes::interactive(&harness, &parsed, initial.clone(), &extra).await
+            crate::modes::interactive(
+                &harness,
+                Some(event_rx),
+                &parsed,
+                initial.clone(),
+                &extra,
+            )
+            .await
         }
         RunMode::Rpc => {
             // `--mode rpc` is parsed (so it doesn't hard-error) but not
@@ -175,6 +190,11 @@ pub async fn run() -> i32 {
 /// NOTE: if stdin is *not* a TTY but no bytes arrive (e.g. `pi < /dev/null`),
 /// this returns `None` (empty), which is what TS does too (`data.trim() || undefined`).
 fn read_piped_stdin() -> Option<String> {
+    // Debug/testing escape hatch: RPI_SKIP_STDIN=1 skips reading piped stdin
+    // (avoids blocking on non-TTY stdin in automated environments).
+    if std::env::var("RPI_SKIP_STDIN").map(|v| v == "1").unwrap_or(false) {
+        return None;
+    }
     if std::io::stdin().is_terminal() {
         return None;
     }
