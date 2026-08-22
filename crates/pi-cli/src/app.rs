@@ -131,6 +131,10 @@ pub async fn run() -> i32 {
         }
     };
 
+    // The full authenticated catalog (read-only) for the TUI's `/model` selector.
+    // v1 does not switch models mid-session, so this is display-only.
+    let model_catalog = crate::provider::available_catalog(&resolved);
+
     // ---- harness build ----
     let (harness, event_rx) = match build(&resolved, &parsed, &cwd).await {
         Ok(pair) => pair,
@@ -168,6 +172,7 @@ pub async fn run() -> i32 {
                 &harness,
                 Some(event_rx),
                 &parsed,
+                model_catalog,
                 initial.clone(),
                 &extra,
             )

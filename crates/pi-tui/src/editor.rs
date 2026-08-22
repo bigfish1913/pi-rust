@@ -166,6 +166,19 @@ impl Editor {
             .unwrap_or((0, 0))
     }
 
+    /// Set the cursor position (clamped to text bounds), clearing any
+    /// in-progress selection. Used by autocomplete to place the caret after
+    /// accepting a suggestion (`set_text` resets the caret to the start).
+    pub fn set_cursor(&self, row: usize, col: usize) {
+        if let Ok(mut state) = self.state.lock() {
+            let row = row.min(state.lines.len().saturating_sub(1));
+            let col = col.min(state.lines[row].len());
+            state.cursor_row = row;
+            state.cursor_col = col;
+            state.selection_anchor = None;
+        }
+    }
+
     /// Insert text at cursor position.
     pub fn insert(&self, text: &str) {
         if let Ok(mut state) = self.state.lock() {

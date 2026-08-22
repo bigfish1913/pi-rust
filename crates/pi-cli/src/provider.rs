@@ -362,6 +362,19 @@ pub fn resolve(
     Ok(ResolvedModel { provider, model, thinking_level })
 }
 
+/// The catalog the TUI's `/model` selector displays (read-only). Re-derives the
+/// authenticated catalog the provider was built from so the selector shows the
+/// same ids `resolve` saw. v1 does *not* switch models mid-session; the selector
+/// is informational only (the chosen model surfaces guidance "use --model at
+/// startup"), so this is a convenience re-derivation rather than a live view.
+///
+/// On any config read error it falls back to the built-in Anthropic catalog —
+/// the selector is non-critical and must never block the TUI from starting.
+pub fn available_catalog(resolved: &ResolvedModel) -> Vec<Model> {
+    // The provider already holds the catalog it was built with; surface it.
+    resolved.provider.models().to_vec()
+}
+
 /// Merge `~/.rpi/models.json` providers into the built-in catalog. Models from
 /// the user file replace any built-in entry with the same id (custom
 /// definitions win); brand-new ids are appended. Non-`anthropic-messages`

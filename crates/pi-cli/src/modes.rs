@@ -249,10 +249,15 @@ fn run_end_outcome_str(o: RunEndOutcome) -> &'static str {
 ///
 /// `event_rx` carries the live `AgentEvent` stream (drained by the TUI to
 /// render streaming responses). The REPL fallback ignores it.
+///
+/// `model_catalog` is the resolved provider's full model list, passed through
+/// so the TUI's `/model` selector can display available models (read-only —
+/// v1 does not switch models mid-session; see `docs/m6-cli-open-questions.md`).
 pub async fn interactive(
     harness: &AgentHarness,
     event_rx: Option<tokio::sync::broadcast::Receiver<rpi_agent::AgentEvent>>,
     args: &Args,
+    model_catalog: Vec<rpi_ai::Model>,
     initial: Option<String>,
     extra_messages: &[String],
 ) -> i32 {
@@ -260,8 +265,15 @@ pub async fn interactive(
     let force_tui = std::env::var("RPI_FORCE_TUI").map(|v| v == "1").unwrap_or(false);
     if force_tui || crate::interactive_tui::is_tui_supported() {
         // Use TUI-based interactive mode
-        crate::interactive_tui::interactive_tui(harness, event_rx, args, initial, extra_messages)
-            .await
+        crate::interactive_tui::interactive_tui(
+            harness,
+            event_rx,
+            args,
+            model_catalog,
+            initial,
+            extra_messages,
+        )
+        .await
     } else {
         // Fall back to simple REPL
         interactive_repl(harness, args, initial, extra_messages).await

@@ -31,6 +31,14 @@ reqwest = { workspace = true }
 dirs = { workspace = true }
 rpassword = { workspace = true }
 crossterm = { version = "0.27", features = ["events"] }
+base64 = { workspace = true }
+arboard = { version = "3", optional = true }
+
+[features]
+default = []
+# Enables real clipboard support for the `/copy` slash command (best-effort;
+# off by default so the CLI builds without a system clipboard dependency).
+clipboard = ["dep:arboard"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
