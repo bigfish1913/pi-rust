@@ -2,7 +2,6 @@
 //!
 //! Provides autocomplete suggestions for file paths, commands, and custom items.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -10,6 +9,20 @@ use super::fuzzy::fuzzy_filter;
 
 /// Path delimiters for parsing.
 const PATH_DELIMITERS: &[char] = &[' ', '\t', '"', '\'', '='];
+
+/// Greatest char-boundary byte index in `s` that is `<= idx` (clamped to
+/// `s.len()`). Callers receive a `cursor` that may be a *character* count or a
+/// byte offset handed back from the editor; either way, slicing
+/// `&input[..cursor]` panics if `cursor` lands inside a multibyte char. Snap to
+/// the nearest preceding boundary so the slice is always sound.
+fn snap_cursor(s: &str, idx: usize) -> usize {
+    let idx = idx.min(s.len());
+    s.char_indices()
+        .take_while(|(b, _)| *b <= idx)
+        .last()
+        .map(|(b, _)| b)
+        .unwrap_or(0)
+}
 
 /// An autocomplete item.
 #[derive(Debug, Clone)]
@@ -130,9 +143,12 @@ impl FilePathAutocompleteProvider {
 
     /// Extract the path prefix from input.
     fn extract_path_prefix(&self, input: &str, cursor: usize) -> Option<(String, usize)> {
+        // Snap to a char boundary so the slices below can never land inside a
+        // multibyte char (callers may pass a char count, not a byte offset).
+        let cursor = snap_cursor(input, cursor);
         // Find the start of the current path token
-        let before_cursor = &input[..cursor.min(input.len())];
-        
+        let before_cursor = &input[..cursor];
+
         // Find the last path delimiter before cursor
         let mut start = 0;
         for (i, c) in before_cursor.char_indices().rev() {
@@ -143,7 +159,7 @@ impl FilePathAutocompleteProvider {
         }
 
         // Check for @file reference
-        let token = &input[start..cursor.min(input.len())];
+        let token = &input[start..cursor];
         if token.starts_with('@') {
             return Some((token[1..].to_string(), start));
         } else if token.starts_with('"') {
@@ -207,9 +223,10 @@ impl Default for FilePathAutocompleteProvider {
 
 impl AutocompleteProvider for FilePathAutocompleteProvider {
     fn get_suggestions(&self, input: &str, cursor: usize) -> Option<AutocompleteSuggestions> {
+        let cursor = snap_cursor(input, cursor);
         let (prefix, start) = self.extract_path_prefix(input, cursor)?;
-        
-        if prefix.is_empty() && !input[start..cursor.min(input.len())].starts_with('@') {
+
+        if prefix.is_empty() && !input[start..cursor].starts_with('@') {
             return None;
         }
 
@@ -276,8 +293,9 @@ impl SlashCommandAutocompleteProvider {
 
 impl AutocompleteProvider for SlashCommandAutocompleteProvider {
     fn get_suggestions(&self, input: &str, cursor: usize) -> Option<AutocompleteSuggestions> {
-        let before_cursor = &input[..cursor.min(input.len())];
-        
+        let cursor = snap_cursor(input, cursor);
+        let before_cursor = &input[..cursor];
+
         // Check if we're at the start of a slash command
         if !before_cursor.starts_with('/') {
             return None;

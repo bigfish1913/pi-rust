@@ -1292,11 +1292,14 @@ fn open_theme_selector(
 fn refresh_autocomplete(state: &Arc<TuiState>, editor: &Arc<Editor>) {
     let text = editor.get_text();
     let (_row, col) = editor.cursor_position();
-    // The editor stores a single-line cursor col; for autocomplete we treat
-    // the whole text as one string and use the linear char count. (v1 editor
-    // is effectively single-line for input purposes; multi-line Enter inserts
-    // a newline but the cursor col resets, so this is a reasonable proxy.)
-    let cursor = text.len().min(col);
+    // The editor's `cursor_col` is a byte offset into the current line; for
+    // single-line input (the common case) that equals the byte offset into
+    // `get_text()`, which is exactly what the autocomplete providers expect to
+    // slice on. Clamp to the text length so a stale/multi-line col can't
+    // overshoot. Providers snap to a char boundary internally as a safety net
+    // (`autocomplete::snap_cursor`), so a byte col landing mid-character never
+    // panics.
+    let cursor = col.min(text.len());
     let suggestions = state.autocomplete.get_suggestions(&text, cursor);
     render_autocomplete(state, suggestions);
 }
@@ -1334,14 +1337,16 @@ fn render_autocomplete(state: &Arc<TuiState>, suggestions: Option<AutocompleteSu
 fn accept_top_suggestion(state: &Arc<TuiState>, editor: &Arc<Editor>) -> bool {
     let text = editor.get_text();
     let (_row, col) = editor.cursor_position();
-    let cursor = text.len().min(col);
+    let cursor = col.min(text.len());
     let Some(sugg) = state.autocomplete.get_suggestions(&text, cursor) else {
         return false;
     };
     let Some(top) = sugg.items.first() else {
         return false;
     };
-    // Replace the [start, end) span with the suggestion text.
+    // Replace the [start, end) span with the suggestion text. `start`/`end`
+    // are byte offsets emitted by the providers on char boundaries, so the
+    // `text[..start]` / `text[end..]` slices are sound for multibyte input.
     let start = sugg.start.min(text.len());
     let end = sugg.end.min(text.len());
     let mut replaced = String::with_capacity(text.len() + top.text.len());
@@ -1350,8 +1355,16 @@ fn accept_top_suggestion(state: &Arc<TuiState>, editor: &Arc<Editor>) -> bool {
     if top.insert_space && !replaced.ends_with('/') {
         replaced.push(' ');
     }
-    // New caret position: after the inserted text.
-    let new_cursor = replaced.len().min(start + top.text.len() + if top.insert_space && !top.text.ends_with('/') { 1 } else { 0 });
+    // New caret position: after the inserted text (byte offset; the editor
+    // snaps `set_cursor` to a char boundary as a safety net).
+    let new_cursor = replaced.len().min(
+        start + top.text.len()
+            + if top.insert_space && !top.text.ends_with('/') {
+                1
+            } else {
+                0
+            },
+    );
     let _ = end;
     editor.set_text(&replaced);
     editor.set_cursor(0, new_cursor);

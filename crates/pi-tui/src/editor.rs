@@ -76,6 +76,27 @@ impl Default for EditorState {
     }
 }
 
+/// Greatest char-boundary byte index in `s` that is `<= idx` (clamped to
+/// `s.len()`). The editor tracks `cursor_col` as a **byte** index and keeps it
+/// on a char boundary; this helper restores that invariant when a caller
+/// supplies a column that may be mid-character (e.g. clamping after moving
+/// across lines of differing widths) and when converting external char counts.
+///
+/// Why byte indices: every `String` mutation the editor performs
+/// (`insert`, `remove`, `truncate`, `drain`) and the `len()` comparisons used
+/// for clamping are byte-indexed in `std`. Treating `cursor_col` as a byte
+/// offset (advanced by `ch.len_utf8()`, never `+1`) keeps all of those sound
+/// for multibyte input. Movement ops use this helper to step by *character*
+/// while storing bytes.
+fn snap_boundary(s: &str, idx: usize) -> usize {
+    let idx = idx.min(s.len());
+    s.char_indices()
+        .take_while(|(b, _)| *b <= idx)
+        .last()
+        .map(|(b, _)| b)
+        .unwrap_or(0)
+}
+
 /// Editor - A multi-line text editor component.
 pub struct Editor {
     state: Mutex<EditorState>,
@@ -169,10 +190,15 @@ impl Editor {
     /// Set the cursor position (clamped to text bounds), clearing any
     /// in-progress selection. Used by autocomplete to place the caret after
     /// accepting a suggestion (`set_text` resets the caret to the start).
+    ///
+    /// `col` is interpreted as a **byte** offset (callers in the autocomplete
+    /// path pass byte indices from `String::len`/`char_indices`) and snapped to
+    /// the nearest preceding char boundary so multibyte input never lands
+    /// mid-character.
     pub fn set_cursor(&self, row: usize, col: usize) {
         if let Ok(mut state) = self.state.lock() {
             let row = row.min(state.lines.len().saturating_sub(1));
-            let col = col.min(state.lines[row].len());
+            let col = snap_boundary(&state.lines[row], col);
             state.cursor_row = row;
             state.cursor_col = col;
             state.selection_anchor = None;
@@ -196,7 +222,12 @@ impl Editor {
                     let row = state.cursor_row;
                     let col = state.cursor_col;
                     state.lines[row].insert(col, ch);
-                    state.cursor_col += 1;
+                    // Advance by the BYTE length of the inserted char so
+                    // `cursor_col` stays a valid char boundary (and a sound
+                    // byte index for the next `String` mutation). The old
+                    // `+= 1` was a char count and panicked on multibyte input
+                    // the moment a second keystroke landed mid-character.
+                    state.cursor_col += ch.len_utf8();
                 }
             }
         }
@@ -208,9 +239,19 @@ impl Editor {
         if let Ok(mut state) = self.state.lock() {
             if state.cursor_col > 0 {
                 let row = state.cursor_row;
-                let col = state.cursor_col - 1;
+                // Step back by the byte length of the char immediately
+                // before the cursor, then remove that char. (`remove` takes
+                // a byte index and must land on a boundary.) Compute the
+                // length through a shared borrow first so the mutable borrow
+                // for `remove` is the only outstanding alias.
+                let prev_len = state.lines[row][..state.cursor_col]
+                    .chars()
+                    .last()
+                    .map(|c| c.len_utf8())
+                    .unwrap_or(0);
+                let col = state.cursor_col - prev_len;
                 state.lines[row].remove(col);
-                state.cursor_col -= 1;
+                state.cursor_col = col;
             } else if state.cursor_row > 0 {
                 // Join with previous line
                 let row = state.cursor_row;
@@ -245,7 +286,16 @@ impl Editor {
     fn cursor_left(&self) {
         if let Ok(mut state) = self.state.lock() {
             if state.cursor_col > 0 {
-                state.cursor_col -= 1;
+                let row = state.cursor_row;
+                let line = &state.lines[row];
+                // Retrear by the byte length of the preceding char so the
+                // caret stays on a char boundary.
+                let prev_len = line[..state.cursor_col]
+                    .chars()
+                    .last()
+                    .map(|c| c.len_utf8())
+                    .unwrap_or(0);
+                state.cursor_col -= prev_len;
             } else if state.cursor_row > 0 {
                 state.cursor_row -= 1;
                 state.cursor_col = state.lines[state.cursor_row].len();
@@ -257,8 +307,15 @@ impl Editor {
     fn cursor_right(&self) {
         if let Ok(mut state) = self.state.lock() {
             let row = state.cursor_row;
-            if state.cursor_col < state.lines[row].len() {
-                state.cursor_col += 1;
+            let line = &state.lines[row];
+            if state.cursor_col < line.len() {
+                // Advance by the byte length of the char at the cursor.
+                let ch_len = line[state.cursor_col..]
+                    .chars()
+                    .next()
+                    .map(|c| c.len_utf8())
+                    .unwrap_or(0);
+                state.cursor_col += ch_len;
             } else if row < state.lines.len() - 1 {
                 state.cursor_row += 1;
                 state.cursor_col = 0;
@@ -272,7 +329,10 @@ impl Editor {
             if state.cursor_row > 0 {
                 state.cursor_row -= 1;
                 let new_row = state.cursor_row;
-                state.cursor_col = state.cursor_col.min(state.lines[new_row].len());
+                let max = state.lines[new_row].len();
+                // The byte column may fall mid-character in the new (shorter
+                // or differently-encoded) line; snap to a boundary.
+                state.cursor_col = snap_boundary(&state.lines[new_row], state.cursor_col.min(max));
             }
         }
     }
@@ -283,7 +343,8 @@ impl Editor {
             if state.cursor_row < state.lines.len() - 1 {
                 state.cursor_row += 1;
                 let new_row = state.cursor_row;
-                state.cursor_col = state.cursor_col.min(state.lines[new_row].len());
+                let max = state.lines[new_row].len();
+                state.cursor_col = snap_boundary(&state.lines[new_row], state.cursor_col.min(max));
             }
         }
     }
@@ -433,15 +494,17 @@ impl Component for Editor {
 
             let mut rendered = format!("{pad}{content}{right_pad_cursor}");
 
-            // Cursor marker if this focused row holds the cursor. The offset
-            // is now purely `cursor_col + padding_x` (no prompt offset).
+            // Cursor marker if this focused row holds the cursor. `cursor_col`
+            // is a byte offset into `line`; the rendered prefix up to the caret
+            // is `pad` (ASCII, `padding_x` bytes) + `line[..cursor_col]`.
+            // Because `content` may carry ANSI escapes (placeholder branch),
+            // and the prefix length is computed in *bytes* of the source line,
+            // snap the insertion point to the nearest preceding char boundary
+            // in `rendered` before byte-slicing — never slice mid-character.
             if state.focused && row_idx == state.cursor_row {
-                let cursor_pos = rendered
-                    .len()
-                    .min(state.cursor_col + self.options.padding_x);
-                let before: String = rendered.chars().take(cursor_pos).collect();
-                let after: String = rendered.chars().skip(cursor_pos).collect();
-                rendered = format!("{}{}{}", before, CURSOR_MARKER, after);
+                let prefix_bytes = self.options.padding_x + state.cursor_col;
+                let pos = snap_boundary(&rendered, prefix_bytes);
+                rendered = format!("{}{}{}", &rendered[..pos], CURSOR_MARKER, &rendered[pos..]);
             }
 
             content_lines.push(rendered);
@@ -544,5 +607,63 @@ mod tests {
         let content = crate::ansi::strip_ansi(&lines[1]);
         assert!(content.contains("hi"), "content line missing text: {content:?}");
         assert!(!content.contains("> "), "content line should not have a prompt prefix: {content:?}");
+    }
+
+    #[test]
+    fn test_editor_multibyte_no_panic() {
+        // Inserting a multibyte char (读 = 3 bytes) and then a second char
+        // used to panic: `cursor_col += 1` left the caret at byte 1, inside
+        // '读', so the next `String::insert(1, …)` hit a char boundary. This
+        // exercises the byte-cursor fix across insert + render + a second
+        // keystroke.
+        let editor = Editor::simple();
+        editor.set_focused(true);
+        editor.insert("读");
+        editor.insert("a");
+        editor.insert("书");
+        assert_eq!(editor.get_text(), "读a书");
+        // cursor_col should be at the end (byte offset 7: 读=3 + a=1 + 书=3).
+        assert_eq!(editor.cursor_position(), (0, 7));
+        // Render must not panic when placing the cursor marker on the row.
+        let lines = editor.render(20);
+        assert_eq!(lines.len(), 3, "bordered box keeps [border, content, border]");
+
+        // Backspace / left/right must also stay on boundaries.
+        editor.backspace(); // remove 书
+        assert_eq!(editor.get_text(), "读a");
+        editor.cursor_left(); // left of 'a'
+        assert_eq!(editor.cursor_position(), (0, 3));
+        editor.insert("b"); // insert between 读 and a
+        assert_eq!(editor.get_text(), "读ba");
+    }
+
+    #[test]
+    fn test_autocomplete_cursor_origin() {
+        // Origin of the autocomplete panic (autocomplete.rs:279, before the
+        // fix): the editor handed back a byte `cursor_col` for multibyte
+        // text, and the slash-command provider sliced `&input[..cursor]`
+        // mid-character. `refresh_autocomplete` in the CLI now passes the
+        // byte col directly (providers snap to a boundary), so a multibyte
+        // editor line must round-trip through `get_suggestions` without
+        // panicking.
+        use crate::autocomplete::AutocompleteManager;
+
+        let editor = Editor::simple();
+        editor.set_text("读");
+        editor.set_cursor(0, 3); // byte end of line
+        // Emulate refresh_autocomplete: col (byte) min text len.
+        let text = editor.get_text();
+        let (_r, col) = editor.cursor_position();
+        let cursor = col.min(text.len());
+        let mgr = AutocompleteManager::new();
+
+        // No slash prefix → None; must not panic on the multibyte slice.
+        assert!(mgr.get_suggestions(&text, cursor).is_none());
+        // And the slash path with a char-count overshoot also must not panic.
+        editor.set_text("/读");
+        editor.set_cursor(0, 4);
+        let text2 = editor.get_text();
+        let mgr2 = AutocompleteManager::new();
+        let _ = mgr2.get_suggestions(&text2, 9); // overshoot past end
     }
 }
