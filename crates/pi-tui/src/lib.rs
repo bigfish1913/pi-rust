@@ -13,16 +13,21 @@ pub mod alt_screen_search;
 pub mod ansi;
 pub mod assistant_message;
 pub mod autocomplete;
+pub mod bash_execution;
+pub mod bordered_loader;
 pub mod box_component;
 pub mod component;
 pub mod container;
+pub mod countdown_timer;
 pub mod diff;
+pub mod dynamic_border;
 pub mod editor;
 pub mod fuzzy;
 pub mod footer;
 pub mod hstack;
 pub mod image;
 pub mod input;
+pub mod keybinding_hints;
 pub mod keybindings;
 pub mod keys;
 pub mod kill_ring;
@@ -37,6 +42,7 @@ pub mod scroll_view;
 pub mod select_list;
 pub mod settings_list;
 pub mod spacer;
+pub mod status_indicator;
 pub mod stdin_buffer;
 pub mod terminal;
 pub mod terminal_colors;
@@ -49,7 +55,9 @@ pub mod tui;
 pub mod tui_alt_screen;
 pub mod tui_main_screen;
 pub mod undo_stack;
+pub mod user_message;
 pub mod utils;
+pub mod visual_truncate;
 pub mod vstack;
 pub mod word_navigation;
 
@@ -62,16 +70,21 @@ pub use autocomplete::{
     CombinedAutocompleteProvider, FilePathAutocompleteProvider, SlashCommand,
     SlashCommandAutocompleteProvider,
 };
+pub use bash_execution::{BashExecutionComponent, BashStatus, BashTruncation};
+pub use bordered_loader::{BorderedLoader, BorderedLoaderInner};
 pub use box_component::Box;
 pub use component::{Component, Focusable};
 pub use container::Container;
+pub use countdown_timer::CountdownTimer;
 pub use diff::render_diff;
+pub use dynamic_border::DynamicBorder;
 pub use editor::{Editor, EditorOptions, EditorStyle};
 pub use footer::FooterComponent;
 pub use fuzzy::{fuzzy_filter, fuzzy_match, FuzzyMatch};
 pub use hstack::HStack;
 pub use image::{Image, ImageOptions, ImageTheme};
 pub use input::Input;
+pub use keybinding_hints::{format_combo, key_code_name, key_display_text, key_hint, key_text, raw_key_hint};
 pub use keybindings::{
     get_keybindings, set_keybindings, KeybindingConflict, KeybindingDefinition,
     KeybindingId, Keybindings, KeyCombo,
@@ -96,6 +109,7 @@ pub use scroll_view::{FollowMode, ScrollView, ScrollViewOptions};
 pub use select_list::{SelectItem, SelectList, SelectListLayoutOptions, SelectListTheme};
 pub use settings_list::{SettingItem, SettingType, SettingsList, SettingsListTheme};
 pub use spacer::Spacer;
+pub use status_indicator::{CompactionReason, IdleStatus, StatusIndicator, StatusKind};
 pub use stdin_buffer::{StdinBuffer, StdinBufferEvent, StdinBufferOptions};
 pub use terminal::{InputEvent, ProcessTerminal, Terminal, TerminalError, TerminalInfo};
 pub use terminal_colors::{
@@ -122,11 +136,13 @@ pub use tui::{
 pub use tui_alt_screen::{is_viewport_tui, TuiAltScreen, VIEWPORT_TUI};
 pub use tui_main_screen::TuiMainScreen;
 pub use undo_stack::{RedoStack, UndoRedoManager, UndoStack};
+pub use user_message::UserMessageComponent;
 pub use utils::{
     apply_background_to_line, get_grapheme_segmenter, get_osc8_link_at_column,
     is_whitespace_char, slice_by_column, truncate_to_width,
     visible_width as visible_width_util, wrap_text_with_ansi, Grapheme, GraphemeSegmenter,
 };
+pub use visual_truncate::{truncate_to_visual_lines, VisualTruncateResult};
 pub use vstack::{
     layout_vstack_constrained, StackAlign, StackChild, StackEntry, StackEntryOptions,
     StackOptions, VStack,

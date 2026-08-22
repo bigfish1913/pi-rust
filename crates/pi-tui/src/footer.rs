@@ -7,7 +7,7 @@ use std::any::Any;
 use std::sync::Mutex;
 
 use super::component::Component;
-use super::text::Text;
+use crate::utils::{truncate_to_width, visible_width};
 
 /// Footer component that displays status information.
 /// 
@@ -90,12 +90,14 @@ impl Component for FooterComponent {
         
         // Add hints
         line.push_str(&hints);
-        
-        // Truncate to width
-        if line.len() > width {
-            line = line[..width].to_string();
+
+        // Truncate to width — ANSI-safe and multibyte-safe. The previous
+        // `line[..width]` byte-slice panicked on CJK/emoji and leaked ANSI
+        // mid-sequence (same bug class as the markdown fix in 600b595).
+        if visible_width(&line) > width {
+            line = truncate_to_width(&line, width, "…");
         }
-        
+
         vec![line]
     }
 
@@ -139,6 +141,6 @@ mod tests {
         footer.set_hints("Ctrl+C: Exit | Shift+Enter: Send | Ctrl+L: Clear | More hints here");
         
         let lines = footer.render(40);
-        assert!(lines[0].len() <= 40);
+        assert!(visible_width(&lines[0]) <= 40);
     }
 }
