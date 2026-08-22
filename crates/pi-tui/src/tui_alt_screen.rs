@@ -128,6 +128,20 @@ impl TuiAltScreen {
     }
 
     /// Enter alternate screen mode.
+    /// Refresh the cached terminal size (call on `Event::Resize`) and force a
+    /// full redraw so the constrained layout re-fits the new dimensions.
+    pub fn refresh_size(&self) {
+        if let Ok(terminal) = self.terminal.lock() {
+            terminal.refresh_size();
+        }
+        // Drop the previous screen so `do_render` treats the next frame as a
+        // full redraw (repaints every row at the new size).
+        if let Ok(mut prev) = self.previous_screen.lock() {
+            prev.clear();
+        }
+        self.request_render(false);
+    }
+
     fn enter_alt_screen(&self) {
         if let Ok(terminal) = self.terminal.lock() {
             // Enter alternate screen buffer and disable autowrap
@@ -332,45 +346,27 @@ impl TUI for TuiAltScreen {
         if let Ok(mut running) = self.running.lock() {
             *running = true;
         }
-        
+
         // Clone the necessary Arc references for the closures
         let running = self.running.clone();
-        
-        // Get terminal and start it
+
+        // Get terminal and start it (spawns its own input-reader thread whose
+        // callbacks are stubs below; kept for the non-pi-tui callers that still
+        // rely on `start()`). The asynchronous interactive path uses
+        // `start_readerless` instead to avoid a competing stdin reader.
         if let Ok(terminal) = self.terminal.lock() {
             terminal.start(
                 Box::new(move |event: InputEvent| {
-                    // Check if still running
                     if !*running.lock().unwrap() {
                         return;
                     }
-                    
-                    // Handle input events
-                    match event {
-                        InputEvent::Key(_key) => {
-                            // Key handling would be done by focused component
-                            // For now, this is a placeholder
-                        }
-                        InputEvent::Mouse(_mouse) => {
-                            // Mouse handling - could be implemented later
-                        }
-                        InputEvent::Resize(_cols, _rows) => {
-                            // Resize triggers re-render
-                            // For now, this is a placeholder
-                        }
-                        _ => {}
-                    }
+                    let _ = event; // stub: input handled by the caller's own loop
                 }),
-                Box::new(move || {
-                    // Handle resize
-                    // For now, this is a placeholder
-                }),
+                Box::new(move || {}),
             );
         }
-        
+
         self.enter_alt_screen();
-        
-        // Trigger initial render after entering alt screen
         self.do_render();
     }
 
@@ -406,6 +402,28 @@ impl TUI for TuiAltScreen {
     }
 }
 
+impl TuiAltScreen {
+    /// Set up the tty and render the first frame **without** spawning the
+    /// `ProcessTerminal` input-reader thread. The caller owns the input loop
+    /// (e.g. a `spawn_blocking` `event::read()` loop) and handles resize/key
+    /// events directly via [`TuiAltScreen::refresh_size`] / its key dispatch.
+    ///
+    /// This avoids two `event::read()` consumers racing the same stdin queue
+    /// (the stub thread in [`TUI::start`] dropped a fraction of keystrokes).
+    /// The caller is responsible for `enable_raw_mode`-dependent event reads
+    /// and for calling `refresh_size` on `Event::Resize`.
+    pub fn start_readerless(&self) {
+        if let Ok(mut running) = self.running.lock() {
+            *running = true;
+        }
+        if let Ok(terminal) = self.terminal.lock() {
+            terminal.enter_raw_mode();
+        }
+        self.enter_alt_screen();
+        self.do_render();
+    }
+}
+
 /// Check if a TUI implements ViewportTUI.
 pub fn is_viewport_tui(_tui: &dyn TUI) -> bool {
     // This would need proper implementation using Any
@@ -436,6 +454,8 @@ impl Terminal for DummyTerminal {
     fn set_title(&self, _title: &str) {}
     fn enable_mouse(&self) {}
     fn disable_mouse(&self) {}
+    fn enter_raw_mode(&self) {}
+    fn refresh_size(&self) {}
     fn start(&self, _on_input: Box<dyn Fn(InputEvent) + Send + Sync>, _on_resize: Box<dyn Fn() + Send + Sync>) {}
     fn stop(&self) {}
     fn is_tty(&self) -> bool { false }

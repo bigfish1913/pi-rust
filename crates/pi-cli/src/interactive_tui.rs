@@ -28,7 +28,7 @@ use std::io::IsTerminal;
 use std::sync::Arc;
 use std::sync::mpsc::channel;
 
-use crossterm::event::{Event, KeyCode, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use tokio::sync::broadcast;
 
 use rpi_agent::{AgentEvent, AgentMessage};
@@ -389,22 +389,38 @@ pub async fn interactive_tui(
         .unwrap_or_default();
 
     // ---- Layout root (built ONCE; mirrors TS fullscreenLayoutRoot) ----
-    // root = VStack[ scrollview(grow=1), dock ]
-    // dock  = VStack[ status_container, autocomplete_container, editor_container, footer ]
+    // root = VStack[ scrollview(basis:0 grow:1 shrink:1 min:1), dock(shrink:1) ]
+    // dock  = VStack[ status(auto), autocomplete(auto), editor_container(shrink:0 min:3), footer(auto) ]
+    //
+    // The scrollview gets `basis(0)` so the constrained stack allocator starts
+    // it at zero height and grows it to fill the space the dock does not need
+    // — this keeps the dock (editor borders + footer) pinned to the bottom and
+    // never shrinks it below the editor's 3 rows (top border + content + bottom
+    // border). The editor_container is `shrink(0).min_size(3)` so a tall
+    // transcript can never clip the bordered editor below its minimum.
     let editor_container = Arc::new(Container::new());
-    editor_container.add_child(Arc::new(Spacer::new(0)));
     editor_container.add_child(editor.clone());
 
     let dock = Arc::new(VStack::from_children(vec![
         StackChild::Entry(StackEntry::new(status_container.clone())),
         StackChild::Entry(StackEntry::new(autocomplete_container.clone())),
-        StackChild::Entry(StackEntry::new(editor_container.clone())),
+        StackChild::Entry(
+            StackEntry::new(editor_container.clone())
+                .shrink(0)
+                .min_size(3),
+        ),
         StackChild::Entry(StackEntry::new(footer.clone())),
     ]));
 
     let root = VStack::from_children(vec![
-        StackChild::Entry(StackEntry::new(scroll_view.clone()).grow(1).min_size(1)),
-        StackChild::Entry(StackEntry::new(dock)),
+        StackChild::Entry(
+            StackEntry::new(scroll_view.clone())
+                .basis(0)
+                .grow(1)
+                .shrink(1)
+                .min_size(1),
+        ),
+        StackChild::Entry(StackEntry::new(dock).shrink(1)),
     ]);
 
     tui.set_layout_root(Some(Arc::new(root)));
@@ -509,7 +525,7 @@ pub async fn interactive_tui(
         let _ = tx_for_cb.send(TuiMessage::UserInput(text.to_string()));
     }));
 
-    tui.start();
+    tui.start_readerless();
 
     // ---- Streaming drain task ----
     let drain_handle = if let Some(rx) = event_rx {
@@ -561,9 +577,26 @@ pub async fn interactive_tui(
             if !*running_key.lock().unwrap() {
                 break;
             }
-            let Ok(Event::Key(key)) = crossterm::event::read() else {
+            let Ok(ev) = crossterm::event::read() else {
                 continue;
             };
+            // `Event::Resize` is delivered as its own event (not a Key). With
+            // `start_readerless` there is no competing terminal-reader thread to
+            // handle it, so refresh the cached terminal size here and force a
+            // full redraw so the constrained layout re-fits the new dimensions.
+            if let Event::Resize(_cols, _rows) = ev {
+                tui_for_key.refresh_size();
+                continue;
+            }
+            let Event::Key(key) = ev else { continue; };
+            // Drop release/repeat events — on Windows a single keystroke
+            // yields both a Press and a Release; without this filter every
+            // char is inserted twice. (Mirrors the TS `isKeyRelease` guard;
+            // the editor never sets `wants_key_release`.) On terminals that
+            // only emit Press this is a no-op.
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
 
             // 1. A selector overlay is open → route to it first. Only Esc
             //    (cancel) and Enter/Up/Down/Ctrl-K/J/P/N (navigate/select)
@@ -1085,10 +1118,9 @@ fn summarize_tool_result(result: &rpi_agent::AgentToolResult) -> String {
 // Selectors — editor-container swap (TS showSelector pattern)
 // ===========================================================================
 
-/// Swap the `editor_container`'s second child (the editor) for a `SelectList`,
-/// hiding the editor while the selector is open. The first child (a Spacer) is
-/// preserved. Records the selector in `state.active_selector` so the key loop
-/// routes to it.
+/// Swap the `editor_container`'s child (the editor) for a `SelectList`,
+/// hiding the editor while the selector is open. Records the selector in
+/// `state.active_selector` so the key loop routes to it.
 fn open_selector(
     state: &Arc<TuiState>,
     editor_container: &Arc<Container>,
@@ -1099,9 +1131,8 @@ fn open_selector(
 ) {
     // Unfocus the editor so its cursor marker doesn't render behind the list.
     editor.set_focused(false);
-    // Swap: clear the container, re-add the Spacer + the list.
+    // Swap: clear the container and add just the list.
     editor_container.clear();
-    editor_container.add_child(Arc::new(Spacer::new(0)));
     editor_container.add_child(list.clone());
     *state.active_selector.lock().unwrap() = Some((list, kind));
     tui.request_render(false);
@@ -1111,7 +1142,6 @@ fn open_selector(
 /// selector. Called by selector `on_cancel` and the Esc handler.
 fn close_selector(state: &Arc<TuiState>, editor_container: &Arc<Container>, editor: &Arc<Editor>, tui: &Arc<TuiAltScreen>) {
     editor_container.clear();
-    editor_container.add_child(Arc::new(Spacer::new(0)));
     editor_container.add_child(editor.clone());
     editor.set_focused(true);
     *state.active_selector.lock().unwrap() = None;
@@ -1727,7 +1757,6 @@ mod tests {
         });
         let editor_container = Arc::new(Container::new());
         let editor = Arc::new(Editor::simple());
-        editor_container.add_child(Arc::new(Spacer::new(0)));
         editor_container.add_child(editor.clone());
         assert!(!state.selector_open());
 
@@ -1739,13 +1768,13 @@ mod tests {
         ));
         open_selector(&state, &editor_container, &editor, &tui, list, SelectorKind::Theme);
         assert!(state.selector_open());
-        // Spacer + list = 2 children (editor swapped out).
-        assert_eq!(editor_container.child_count(), 2);
+        // list only (editor swapped out).
+        assert_eq!(editor_container.child_count(), 1);
 
         close_selector(&state, &editor_container, &editor, &tui);
         assert!(!state.selector_open());
-        // Spacer + editor = 2 children (restored).
-        assert_eq!(editor_container.child_count(), 2);
+        // editor restored.
+        assert_eq!(editor_container.child_count(), 1);
     }
 
     #[test]

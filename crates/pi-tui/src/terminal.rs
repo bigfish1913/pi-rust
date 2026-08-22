@@ -83,6 +83,19 @@ pub trait Terminal: Send + Sync {
     /// Disable mouse events.
     fn disable_mouse(&self);
 
+    /// Enter terminal raw mode (required for `event::read()` to deliver
+    /// individual key events without line buffering). Pairs with
+    /// [`Terminal::stop`], which exits raw mode.
+    ///
+    /// Callers that drive their own input loop (instead of the reader thread
+    /// spawned by [`Terminal::start`]) use this to set up the tty without
+    /// spawning a competing reader — see `TuiAltScreen::start_readerless`.
+    fn enter_raw_mode(&self);
+
+    /// Re-read the current terminal size into the cached [`TerminalInfo`].
+    /// Called on `Event::Resize` so subsequent renders use the new dimensions.
+    fn refresh_size(&self);
+
     /// Start terminal raw mode.
     fn start(&self, on_input: Box<dyn Fn(InputEvent) + Send + Sync>, on_resize: Box<dyn Fn() + Send + Sync>);
 
@@ -183,10 +196,25 @@ impl Terminal for ProcessTerminal {
         self.write("\x1b[?1006l\x1b[?1002l\x1b[?1000l");
     }
 
+    fn enter_raw_mode(&self) {
+        let _ = cterm::enable_raw_mode();
+        if let Ok(mut running) = self.running.lock() {
+            *running = true;
+        }
+        self.enable_mouse();
+        self.hide_cursor();
+        self.update_size();
+        self.flush();
+    }
+
+    fn refresh_size(&self) {
+        self.update_size();
+    }
+
     fn start(&self, on_input: Box<dyn Fn(InputEvent) + Send + Sync>, on_resize: Box<dyn Fn() + Send + Sync>) {
         // Enter raw mode
         let _ = cterm::enable_raw_mode();
-        
+
         if let Ok(mut running) = self.running.lock() {
             *running = true;
         }

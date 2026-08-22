@@ -8,13 +8,15 @@
 use std::io::IsTerminal;
 use std::sync::Arc;
 
-use crossterm::event::{Event, KeyCode, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 
 use rpi_tui::{
     Container, Editor, EditorOptions, EditorStyle, Focusable, FollowMode, ProcessTerminal,
     ScrollView, ScrollViewOptions, Spacer, StackChild, StackEntry,
     Text, TuiAltScreen, VStack, TUI,
 };
+#[allow(unused_imports)]
+use rpi_tui::TUI as _;
 
 #[tokio::main]
 async fn main() {
@@ -132,11 +134,13 @@ async fn run_interactive() {
         StackChild::Entry(StackEntry::new(footer)),
     ]);
 
-    // Set layout and start
+    // Set layout and start. `start_readerless` sets up raw mode + the alt
+    // screen without spawning a competing input-reader thread — this example
+    // drives its own `event::read()` loop below.
     tui.set_layout_root(Some(Arc::new(root)));
     tui.set_focus(Some(editor.clone()));
     editor.set_focused(true);
-    tui.start();
+    tui.start_readerless();
 
     // Event loop
     let running = Arc::new(std::sync::Mutex::new(true));
@@ -151,17 +155,29 @@ async fn run_interactive() {
                 break;
             }
 
-            if let Ok(Event::Key(key)) = crossterm::event::read() {
-                // Check for Ctrl+C
-                if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
-                    *running_clone.lock().unwrap() = false;
-                    break;
-                }
-
-                // Forward to editor
-                editor_clone.handle_key(key);
-                tui_clone.request_render(false);
+            let Ok(ev) = crossterm::event::read() else { continue; };
+            // Handle resize: no reader thread to do it for us, so refresh the
+            // cached terminal size and force a full redraw.
+            if let Event::Resize(_cols, _rows) = ev {
+                tui_clone.refresh_size();
+                continue;
             }
+            let Event::Key(key) = ev else { continue; };
+            // Drop release/repeat events so a single keystroke isn't doubled
+            // (Windows emits Press + Release per key).
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+
+            // Check for Ctrl+C
+            if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
+                *running_clone.lock().unwrap() = false;
+                break;
+            }
+
+            // Forward to editor
+            editor_clone.handle_key(key);
+            tui_clone.request_render(false);
         }
     });
 

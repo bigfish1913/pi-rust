@@ -9,8 +9,9 @@
 use std::sync::Arc;
 
 use super::component::Component;
-use super::layout_node::{LayoutViewport, StackLayoutEntry, allocate_stack_sizes};
+use super::layout_node::LayoutViewport;
 use super::scroll_view::ScrollView;
+use super::vstack::{layout_vstack_constrained, VStack};
 use crate::ansi::{slice_by_column, visible_width, CURSOR_MARKER};
 
 /// A rectangle in the layout.
@@ -119,8 +120,19 @@ impl LayoutFrame {
 
 /// Context for layout operations.
 struct LayoutContext {
+    #[allow(dead_code)]
     viewport: LayoutViewport,
     primary_scroll_view: Option<Arc<ScrollView>>,
+}
+
+impl LayoutContext {
+    fn register_scroll_view(&mut self, sv: &Arc<ScrollView>) {
+        // Keep the first primary scroll view encountered (the root transcript
+        // area). Non-primary scroll views are not tracked globally.
+        if sv.is_primary() && self.primary_scroll_view.is_none() {
+            self.primary_scroll_view = Some(sv.clone());
+        }
+    }
 }
 
 /// Render a component tree into a layout frame with constrained layout.
@@ -157,6 +169,11 @@ pub fn render_layout_frame(
 }
 
 /// Layout a single component and its children.
+///
+/// Recognizes `VStack` and `ScrollView` (via `as_any` downcast) and lays
+/// them out with the existing constrained machinery, so stack `grow`/`shrink`/
+/// `min_size` semantics are honored and the scroll view clips to its
+/// allocated viewport. Any other component is treated as a leaf.
 fn layout_component(
     component: &Arc<dyn Component>,
     x: usize,
@@ -164,16 +181,31 @@ fn layout_component(
     width: usize,
     height: Option<usize>,
     clip: LayoutRect,
-    _context: &mut LayoutContext,
+    context: &mut LayoutContext,
 ) -> LayoutBox {
     let safe_width = width.max(1);
-    
-    // For now, treat all components as leaves
-    // A more complete implementation would check for layout nodes
+
+    // VStack: distribute the available height across children according to
+    // their basis/grow/shrink/min_size (mirrors TS stack layout). This was
+    // previously dead — the layout engine treated the root VStack as a leaf
+    // and concatenated each child's full intrinsic height, which pushed the
+    // bottom dock below the visible viewport.
+    if let Some(vstack) = component.as_any().downcast_ref::<VStack>() {
+        return layout_vstack(component, vstack, x, y, safe_width, height, clip, context);
+    }
+
+    // ScrollView: clip the child to the allocated viewport height and render
+    // only the visible window. Without this the scroll view emitted *all*
+    // transcript lines, overflowing past the terminal bottom.
+    if let Some(sv) = component.as_any().downcast_ref::<ScrollView>() {
+        return layout_scroll_view(component, sv, x, y, safe_width, height, clip, context);
+    }
+
+    // ---- Leaf (Container/Editor/Footer/Text/...) ----
     let lines = component.render(safe_width);
-    
+
     let allocated_height = height.unwrap_or_else(|| lines.len());
-    
+
     // Calculate line offset for cursor visibility
     let line_offset = if lines.len() > allocated_height && allocated_height > 0 {
         let cursor_line = lines.iter().position(|line| line.contains(CURSOR_MARKER));
@@ -183,9 +215,9 @@ fn layout_component(
     } else {
         0
     };
-    
+
     let rect = LayoutRect::new(x, y, safe_width, allocated_height);
-    
+
     LayoutBox {
         component: component.clone(),
         rect,
@@ -196,6 +228,108 @@ fn layout_component(
         line_offset,
         layer: 0,
         scroll_view: None,
+        scroll_content_lines: None,
+    }
+}
+
+/// Lay out a VStack by distributing `height` across its children.
+fn layout_vstack(
+    component: &Arc<dyn Component>,
+    vstack: &VStack,
+    x: usize,
+    y: usize,
+    width: usize,
+    height: Option<usize>,
+    clip: LayoutRect,
+    context: &mut LayoutContext,
+) -> LayoutBox {
+    let children = vstack.get_children();
+    let gap = vstack.gap();
+    let allocated = layout_vstack_constrained(&children, width, height.unwrap_or(0), gap);
+
+    // The box's own rect spans its full allocated height (or, when
+    // unconstrained, the sum of child heights + gaps).
+    let total_child_height: usize = allocated.iter().map(|(_, h)| *h).sum();
+    let total_gap = if children.len() > 1 { gap * (children.len() - 1) } else { 0 };
+    let box_height = height.unwrap_or(total_child_height + total_gap);
+
+    let rect = LayoutRect::new(x, y, width, box_height);
+    let own_clip = clip.intersect(&rect);
+
+    let mut child_boxes = Vec::with_capacity(allocated.len());
+    let mut cursor_y = y;
+    for (idx, (child_component, child_height)) in allocated.iter().enumerate() {
+        if idx > 0 && gap > 0 {
+            cursor_y = cursor_y.saturating_add(gap);
+        }
+        let child_box = layout_component(
+            child_component,
+            x,
+            cursor_y,
+            width,
+            Some(*child_height),
+            own_clip,
+            context,
+        );
+        // `parent_index` is the child's ordinal within its parent; `paint_box`
+        // does not rely on it, but `hit_test` walks children front-to-back so
+        // keeping the positional index is harmless.
+        child_boxes.push(child_box);
+        cursor_y = cursor_y.saturating_add(*child_height);
+    }
+    for (i, child) in child_boxes.iter_mut().enumerate() {
+        child.parent_index = Some(i);
+        child.layer = 0;
+    }
+
+    // The parent box carries no lines of its own — its children paint into
+    // the screen buffer directly via `paint_box` recursion.
+    let mut box_layout = LayoutBox::new(component.clone(), rect, own_clip);
+    box_layout.children = child_boxes;
+    box_layout
+}
+
+/// Lay out a ScrollView by clipping its child to the allocated viewport.
+fn layout_scroll_view(
+    component: &Arc<dyn Component>,
+    sv: &ScrollView,
+    x: usize,
+    y: usize,
+    width: usize,
+    height: Option<usize>,
+    clip: LayoutRect,
+    context: &mut LayoutContext,
+) -> LayoutBox {
+    // Track the primary scroll view globally so `get_primary_scroll_view`
+    // returns the live transcript area.
+    let sv_arc: Arc<ScrollView> = Arc::new(sv.clone());
+    context.register_scroll_view(&sv_arc);
+
+    let allocated_height = height.unwrap_or_else(|| sv.render(width).len());
+    // `render_with_viewport` honors `scroll_top` and pads to `height`.
+    let lines = sv.render_with_viewport(width, allocated_height);
+
+    let line_offset = if lines.len() > allocated_height && allocated_height > 0 {
+        let cursor_line = lines.iter().position(|line| line.contains(CURSOR_MARKER));
+        cursor_line
+            .map(|idx| if idx >= allocated_height { idx - allocated_height + 1 } else { 0 })
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    let rect = LayoutRect::new(x, y, width, allocated_height);
+
+    LayoutBox {
+        component: component.clone(),
+        rect,
+        clip: clip.intersect(&rect),
+        children: Vec::new(),
+        parent_index: None,
+        lines: Some(lines),
+        line_offset,
+        layer: 0,
+        scroll_view: Some(sv_arc),
         scroll_content_lines: None,
     }
 }
@@ -406,7 +540,8 @@ pub fn strip_cursor_markers(lines: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Text;
+    use crate::{Container, Editor, EditorOptions, EditorStyle, Focusable,
+        ScrollView, ScrollViewOptions, StackChild, StackEntry, Text, VStack};
 
     #[test]
     fn test_layout_rect_contains() {
@@ -445,5 +580,98 @@ mod tests {
         assert_eq!(frame.width, 20);
         assert_eq!(frame.height, 10);
         assert!(!frame.lines.is_empty());
+    }
+
+    /// Regression for the leaf-only layout bug: a root `VStack[ scrollview
+    /// (grow1), dock ]` must pin the dock (editor borders + footer) to the
+    /// bottom of the viewport and clip the scrollview to the remainder. Before
+    /// the fix the dock was pushed below the visible rows and the screen was
+    /// black where the editor should be.
+    #[test]
+    fn test_constrained_layout_dock_pinned_to_bottom() {
+        // Tall transcript (many lines) so the scrollview's intrinsic height
+        // exceeds the viewport — it must be clipped, not overflow.
+        let transcript = Arc::new(Container::new());
+        for i in 0..40 {
+            transcript.add_child(Arc::new(Text::new(&format!("line {i:02}"), 0, 0)));
+        }
+        let scroll = Arc::new(ScrollView::new(
+            transcript,
+            // FollowMode::None so the scrollview doesn't jump to the end
+            // (which would push the first 30 lines off-screen) — we want to
+            // assert the top of the transcript is visible, i.e. clipped, not
+            // that it rendered *all* 40 lines.
+            ScrollViewOptions {
+                follow: crate::FollowMode::None,
+                ..Default::default()
+            },
+        ));
+
+        let editor = Arc::new(Editor::new(
+            EditorOptions::default(),
+            EditorStyle::default(),
+            Arc::new(crate::Keybindings::new()),
+        ));
+        editor.set_focused(true);
+        let editor_container = Arc::new(Container::new());
+        editor_container.add_child(editor.clone());
+        let footer = Arc::new(Text::new("FOOTER LINE", 0, 0));
+
+        let dock = Arc::new(VStack::from_children(vec![
+            StackChild::Entry(
+                StackEntry::new(editor_container.clone())
+                    .shrink(0)
+                    .min_size(3),
+            ),
+            StackChild::Entry(StackEntry::new(footer.clone())),
+        ]));
+
+        let root = VStack::from_children(vec![
+            StackChild::Entry(
+                StackEntry::new(scroll.clone())
+                    .basis(0)
+                    .grow(1)
+                    .shrink(1)
+                    .min_size(1),
+            ),
+            StackChild::Entry(StackEntry::new(dock).shrink(1)),
+        ]);
+
+        // 40-col wide, 10-row tall viewport.
+        let frame = render_layout_frame(Arc::new(root), 40, 10);
+
+        // The screen buffer must be exactly the viewport height.
+        assert_eq!(frame.lines.len(), 10, "frame should be clipped to viewport height");
+
+        // The dock (editor borders + footer) must occupy the bottom rows of
+        // the painted screen — the editor renders 3 rows (top border, content,
+        // bottom border) + the footer 1 row = 4 dock rows. The bottom-most
+        // painted row must be the footer.
+        let bottom = frame.lines.last().expect("non-empty frame");
+        assert!(
+            bottom.contains("FOOTER"),
+            "footer should be the last painted row; got: {bottom:?}"
+        );
+
+        // The editor's top border (a run of `─`) must appear on-screen just
+        // above the footer region. Borders are colored via the theme border
+        // color, so check for the `─` glyph rather than a raw repeat.
+        let on_screen: String = frame.lines.join("\n");
+        assert!(
+            on_screen.contains('─'),
+            "editor top border `─` should be visible on-screen; rendered:\n{on_screen}"
+        );
+
+        // The scrollview must NOT paint all 40 transcript lines — it must be
+        // clipped to the top rows. "line 39" (the last) must be absent.
+        assert!(
+            !on_screen.contains("line 39"),
+            "scrollview should be clipped to the viewport, not render all 40 lines"
+        );
+
+        // Primary scroll view should be tracked so get_primary_scroll_view /
+        // frame.primary_scroll_view is populated for the scroll routing.
+        // (The default ScrollView is non-primary; skip that assertion here and
+        // rely on the is_primary branch in layout_scroll_view.)
     }
 }
