@@ -332,16 +332,15 @@ pub async fn interactive_tui(
     ));
 
     // ---- Editor ----
+    // Bordered box matching native pi: no `> ` prompt, no placeholder — the
+    // editor renders full-width `─` top/bottom borders with padding-only lines
+    // (see Editor::render). padding_x:1 gives a 1-col inset inside the box.
     let editor = Arc::new(Editor::new(
         EditorOptions {
             padding_x: 1,
-            placeholder: Some("Type a message...".to_string()),
             ..Default::default()
         },
-        EditorStyle {
-            prompt: "> ".to_string(),
-            ..Default::default()
-        },
+        EditorStyle::default(),
         Arc::new(rpi_tui::Keybindings::new()),
     ));
 

@@ -388,51 +388,82 @@ impl Editor {
 impl Component for Editor {
     fn render(&self, width: usize) -> Vec<String> {
         let state = self.state.lock().map(|s| s.clone()).unwrap_or_default();
-        let mut lines = Vec::new();
+        let mut content_lines = Vec::new();
 
-        let prompt_width = crate::ansi::visible_width(&self.style.prompt);
-        let _content_width = width.saturating_sub(self.options.padding_x * 2).saturating_sub(prompt_width);
-
+        let pad = " ".repeat(self.options.padding_x);
+        // `prompt` is no longer rendered (mirrors the TS editor, which draws a
+        // bordered box with padding-only lines and no `> ` prefix — see
+        // `editor.ts:539-578`). The `EditorStyle.prompt` field is retained for
+        // API compatibility but unread here.
         for (row_idx, line) in state.lines.iter().enumerate() {
-            let mut rendered = String::new();
-            
-            // Add padding
-            if self.options.padding_x > 0 {
-                rendered.push_str(&" ".repeat(self.options.padding_x));
-            }
-
-            // Add prompt on first line or continuation indicator
-            if row_idx == 0 {
-                rendered.push_str(&self.style.prompt);
-            } else {
-                rendered.push_str(&" ".repeat(prompt_width));
-            }
-
-            // Add line content
-            if line.is_empty() && row_idx == state.cursor_row && state.lines.len() == 1 {
+            // Placeholder (dim) only on the single empty line at the cursor —
+            // honors callers that set `placeholder`; production drops it.
+            let content = if line.is_empty()
+                && row_idx == state.cursor_row
+                && state.lines.len() == 1
+            {
                 if let Some(placeholder) = &self.options.placeholder {
-                    rendered.push_str(&format!("\x1b[2m{}\x1b[22m", placeholder));
+                    format!("\x1b[2m{}\x1b[22m", placeholder)
+                } else {
+                    String::new()
                 }
             } else {
-                rendered.push_str(line);
-            }
+                line.clone()
+            };
 
-            // Add cursor marker if focused
+            let visible_w = crate::ansi::visible_width(&content);
+            // Pad the line out to the full width (left padding + content +
+            // right padding) so the border box has a uniform interior width
+            // (mirrors editor.ts:522-578).
+            let right_pad = " ".repeat(
+                width
+                    .saturating_sub(self.options.padding_x)
+                    .saturating_sub(visible_w),
+            );
+            let right_pad_cursor = if state.focused
+                && row_idx == state.cursor_row
+                && content.is_empty()
+            {
+                // Reserve room for the empty-cursor (`\x1b[7m \x1b[0m`) so
+                // the trailing cursor doesn't wrap past the right border.
+                right_pad.get(..right_pad.len().saturating_sub(1)).unwrap_or("").to_string()
+            } else {
+                right_pad
+            };
+
+            let mut rendered = format!("{pad}{content}{right_pad_cursor}");
+
+            // Cursor marker if this focused row holds the cursor. The offset
+            // is now purely `cursor_col + padding_x` (no prompt offset).
             if state.focused && row_idx == state.cursor_row {
-                // Insert cursor marker at cursor position
-                let cursor_pos = rendered.len().min(state.cursor_col + prompt_width + self.options.padding_x);
+                let cursor_pos = rendered
+                    .len()
+                    .min(state.cursor_col + self.options.padding_x);
                 let before: String = rendered.chars().take(cursor_pos).collect();
                 let after: String = rendered.chars().skip(cursor_pos).collect();
                 rendered = format!("{}{}{}", before, CURSOR_MARKER, after);
             }
 
-            lines.push(rendered);
+            content_lines.push(rendered);
         }
 
-        if lines.is_empty() {
-            lines.push(format!("{}{}", self.style.prompt, CURSOR_MARKER));
+        // Guard against an empty `lines` vector (the invariant is `[""]`, but
+        // be defensive): emit one blank interior row so the box still renders.
+        if content_lines.is_empty() {
+            content_lines.push(format!("{pad}{}", " ".repeat(width.saturating_sub(self.options.padding_x))));
         }
 
+        // Full-width top + bottom border, colored via the theme border color
+        // (mirrors editor.ts:494,530,587). The global `theme()` is read-only
+        // after OnceLock init; `Color::fg` wraps the `─` run in the escape.
+        let border_color = crate::theme::theme().colors.border;
+        let horizontal = "─".repeat(width);
+        let border = border_color.fg(&horizontal);
+
+        let mut lines = Vec::with_capacity(content_lines.len() + 2);
+        lines.push(border.clone());
+        lines.extend(content_lines);
+        lines.push(border);
         lines
     }
 
@@ -489,5 +520,29 @@ mod tests {
         editor.set_text("Test");
         editor.clear();
         assert_eq!(editor.get_text(), "");
+    }
+
+    #[test]
+    fn test_editor_render_has_borders() {
+        // The editor renders a native-pi bordered box: a full-width `─` line
+        // above and below the content, with no `> ` prompt prefix on the text
+        // lines (mirrors TS editor.ts:525-588).
+        let editor = Editor::new(
+            EditorOptions { padding_x: 1, ..Default::default() },
+            EditorStyle::default(),
+            Arc::new(Keybindings::new()),
+        );
+        editor.set_text("hi");
+        let lines = editor.render(20);
+        assert_eq!(lines.len(), 3, "expected [border, content, border]");
+        // Both borders are a 20-wide `─` run (visible width, ANSI stripped).
+        let top = crate::ansi::strip_ansi(&lines[0]);
+        let bottom = crate::ansi::strip_ansi(lines.last().unwrap());
+        assert_eq!(top.chars().filter(|c| *c == '─').count(), 20, "top border not full width: {top:?}");
+        assert_eq!(bottom.chars().filter(|c| *c == '─').count(), 20, "bottom border not full width: {bottom:?}");
+        // The content line carries the text with no `> ` prompt.
+        let content = crate::ansi::strip_ansi(&lines[1]);
+        assert!(content.contains("hi"), "content line missing text: {content:?}");
+        assert!(!content.contains("> "), "content line should not have a prompt prefix: {content:?}");
     }
 }
