@@ -91,6 +91,11 @@ impl ToolExecutionComponent {
         }
     }
 
+    /// Whether the component is currently expanded (for toggle helpers).
+    pub fn is_expanded(&self) -> bool {
+        *self.expanded.lock().unwrap()
+    }
+
     /// Get the status.
     pub fn status(&self) -> ToolStatus {
         *self.status.lock().unwrap()
