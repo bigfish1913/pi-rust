@@ -7,9 +7,11 @@ use std::any::Any;
 use std::sync::Mutex;
 
 use super::component::Component;
-use super::container::Container;
-use super::spacer::Spacer;
-use super::text::Text;
+use crate::ansi::strip_ansi;
+use crate::utils::truncate_to_width;
+
+/// Maximum diff lines rendered inline before collapsing the rest.
+const DIFF_LINE_CAP: usize = 40;
 
 /// Tool execution status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,7 +27,7 @@ pub enum ToolStatus {
 }
 
 /// Component that displays a tool execution.
-/// 
+///
 /// Mirrors TypeScript ToolExecutionComponent class (simplified).
 pub struct ToolExecutionComponent {
     /// Tool name
@@ -38,6 +40,10 @@ pub struct ToolExecutionComponent {
     status: Mutex<ToolStatus>,
     /// Whether expanded
     expanded: Mutex<bool>,
+    /// Optional pre-rendered colored diff lines (from `render_diff`). When
+    /// present the diff is always shown regardless of `expanded` — the diff
+    /// IS the useful content for an `edit` tool.
+    diff_lines: Mutex<Option<Vec<String>>>,
 }
 
 impl ToolExecutionComponent {
@@ -49,6 +55,7 @@ impl ToolExecutionComponent {
             result: Mutex::new(None),
             status: Mutex::new(ToolStatus::Pending),
             expanded: Mutex::new(false),
+            diff_lines: Mutex::new(None),
         }
     }
 
@@ -93,17 +100,27 @@ impl ToolExecutionComponent {
     pub fn name(&self) -> String {
         self.name.lock().unwrap().clone()
     }
+
+    /// Attach a pre-rendered colored diff (from [`crate::diff::render_diff`]).
+    /// When set, the diff lines are always shown (regardless of `expanded`)
+    /// so an edit's changes are visible directly in the transcript.
+    pub fn set_diff(&self, lines: Vec<String>) {
+        if let Ok(mut d) = self.diff_lines.lock() {
+            *d = Some(lines);
+        }
+    }
 }
 
 impl Component for ToolExecutionComponent {
     fn render(&self, width: usize) -> Vec<String> {
         let mut lines = Vec::new();
-        
+
         let name = self.name.lock().unwrap();
         let status = self.status.lock().unwrap();
         let args = self.args.lock().unwrap();
         let result = self.result.lock().unwrap();
         let expanded = self.expanded.lock().unwrap();
+        let diff_lines = self.diff_lines.lock().unwrap();
 
         // Status indicator
         let status_icon = match *status {
@@ -114,14 +131,12 @@ impl Component for ToolExecutionComponent {
         };
 
         // Tool header line
-        let header = format!("{} Tool: {} {}", status_icon, name, 
+        let header = format!("{} Tool: {} {}", status_icon, name,
             if *expanded { "▼" } else { "▶" });
-        
+
         let mut header_line = " ".repeat(1);
         header_line.push_str(&header);
-        if header_line.len() > width {
-            header_line = header_line[..width].to_string();
-        }
+        header_line = truncate_to_width(&header_line, width, "…");
         lines.push(header_line);
 
         // If expanded, show args and result
@@ -138,6 +153,29 @@ impl Component for ToolExecutionComponent {
                     let result_line = format!("  {}", line);
                     lines.push(result_line);
                 }
+            }
+        }
+
+        // A colored diff (from `render_diff`) is always shown — the diff IS
+        // the useful content for an edit; the summary header + (optional)
+        // expanded args sit above it. Cap to keep large diffs readable.
+        if let Some(diff) = diff_lines.as_ref() {
+            let total = diff.len();
+            let shown = diff.iter().take(DIFF_LINE_CAP);
+            for dl in shown {
+                // Strip any leading ANSI-styled padding-less body: diff lines
+                // are already complete (colors + content). Indent by 2 cols.
+                let body = strip_ansi(dl);
+                if body.is_empty() {
+                    lines.push(String::new());
+                } else {
+                    let indented = format!("  {}", dl);
+                    lines.push(truncate_to_width(&indented, width, "…"));
+                }
+            }
+            if total > DIFF_LINE_CAP {
+                let more = total - DIFF_LINE_CAP;
+                lines.push(format!("  … {} more diff lines hidden", more));
             }
         }
 

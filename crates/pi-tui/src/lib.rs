@@ -16,6 +16,7 @@ pub mod autocomplete;
 pub mod box_component;
 pub mod component;
 pub mod container;
+pub mod diff;
 pub mod editor;
 pub mod fuzzy;
 pub mod footer;
@@ -64,6 +65,7 @@ pub use autocomplete::{
 pub use box_component::Box;
 pub use component::{Component, Focusable};
 pub use container::Container;
+pub use diff::render_diff;
 pub use editor::{Editor, EditorOptions, EditorStyle};
 pub use footer::FooterComponent;
 pub use fuzzy::{fuzzy_filter, fuzzy_match, FuzzyMatch};

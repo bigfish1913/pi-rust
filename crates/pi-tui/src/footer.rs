@@ -27,7 +27,7 @@ impl FooterComponent {
         Self {
             status: Mutex::new(String::new()),
             model: Mutex::new("claude-sonnet-5".to_string()),
-            hints: Mutex::new("Ctrl+C: Exit | Shift+Enter: Send".to_string()),
+            hints: Mutex::new("Ctrl+C: Exit | Enter: Send | Shift+Enter: New line".to_string()),
         }
     }
 

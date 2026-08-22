@@ -40,7 +40,7 @@ use rpi_tui::{
     ScrollView, ScrollViewOptions, SlashCommand, SlashCommandAutocompleteProvider, Spacer,
     StackChild, StackEntry, Text, TuiAltScreen, TUI, VStack, AssistantMessageComponent,
     AssistantMessageOptions, AutocompleteSuggestions, FooterComponent, SelectList, SelectItem,
-    ThemeManager, ThemePreset, ToolExecutionComponent,
+    ThemeManager, ThemePreset, ToolExecutionComponent, render_diff,
 };
 
 use crate::args::Args;
@@ -347,7 +347,7 @@ pub async fn interactive_tui(
     // ---- Footer + status ----
     let footer = Arc::new(FooterComponent::new());
     footer.set_model(&model_name);
-    footer.set_hints("Shift+Enter: Send | Ctrl+C: Abort/Exit | /help | Tab: Complete");
+    footer.set_hints("Enter: Send | Shift+Enter: New line | Ctrl+C: Abort/Exit | /help | Tab: Complete");
 
     let status_container = Arc::new(Container::new());
     let loader = Arc::new(Loader::with_text("Working…"));
@@ -1062,11 +1062,13 @@ async fn handle_agent_event(
             if let Some(comp) = state.tool_components.lock().unwrap().get(&tool_call_id) {
                 let summary = summarize_tool_result(&partial_result);
                 comp.set_result(&summary, false);
+                apply_edit_diff(&comp, &tool_name, &partial_result.details, &tui);
             } else {
                 // No component yet — create a running one so the partial shows.
                 let comp = Arc::new(ToolExecutionComponent::new(&tool_name, ""));
                 comp.set_running();
                 comp.set_result(&summarize_tool_result(&partial_result), false);
+                apply_edit_diff(&comp, &tool_name, &partial_result.details, &tui);
                 chat.add_child(comp.clone());
                 state
                     .tool_components
@@ -1077,20 +1079,46 @@ async fn handle_agent_event(
             tui.request_render(false);
         }
 
-        AgentEvent::ToolExecutionEnd { tool_call_id, tool_name: _, result, is_error } => {
+        AgentEvent::ToolExecutionEnd { tool_call_id, tool_name, result, is_error } => {
             let comp = state.tool_components.lock().unwrap().remove(&tool_call_id);
             if let Some(comp) = comp {
                 comp.set_result(&summarize_tool_result(&result), is_error);
+                apply_edit_diff(&comp, &tool_name, &result.details, &tui);
             } else {
                 // Tool ended without a Start/Update (e.g. a very fast tool):
                 // render a finalized component directly.
-                let comp = Arc::new(ToolExecutionComponent::new("", ""));
+                let comp = Arc::new(ToolExecutionComponent::new(&tool_name, ""));
                 comp.set_result(&summarize_tool_result(&result), is_error);
+                apply_edit_diff(&comp, &tool_name, &result.details, &tui);
                 chat.add_child(comp);
             }
             tui.request_render(false);
         }
     }
+}
+
+/// If `tool_name` is an editing tool (`edit`) whose `details.diff` carries a
+/// display-diff string, render it with colors and attach to the component so
+/// the changes show in the transcript. `write` has no diff (details: Null) and
+/// stays a plain summary.
+fn apply_edit_diff(
+    comp: &Arc<ToolExecutionComponent>,
+    tool_name: &str,
+    details: &serde_json::Value,
+    tui: &Arc<TuiAltScreen>,
+) {
+    if tool_name != "edit" {
+        return;
+    }
+    let Some(diff_text) = details.get("diff").and_then(|v| v.as_str()) else {
+        return;
+    };
+    if diff_text.is_empty() {
+        return;
+    }
+    let width = tui.width();
+    let lines = render_diff(diff_text, width);
+    comp.set_diff(lines);
 }
 
 /// Render an `AgentToolResult` as a single-line summary for the
@@ -1411,11 +1439,11 @@ fn add_welcome_message(container: &Arc<Container>) {
     container.add_child(Arc::new(Text::new("rpi interactive TUI", 1, 0)));
     container.add_child(Arc::new(Spacer::new(1)));
     container.add_child(Arc::new(Text::new(
-        "Type your message and press Shift+Enter to send.",
+        "Type your message and press Enter to send.",
         1, 0,
     )));
     container.add_child(Arc::new(Text::new(
-        "Ctrl+C: Abort/Exit | Enter: New line | Shift+Enter: Send | Tab: Complete | /help for commands",
+        "Ctrl+C: Abort/Exit | Enter: Send | Shift+Enter: New line | Tab: Complete | /help for commands",
         1, 0,
     )));
     container.add_child(Arc::new(Spacer::new(1)));
@@ -1454,8 +1482,8 @@ fn add_version_message(container: &Arc<Container>) {
 fn add_hotkeys_message(container: &Arc<Container>) {
     container.add_child(Arc::new(Text::new("⌨️  Keyboard Shortcuts:", 1, 0)));
     container.add_child(Arc::new(Spacer::new(1)));
-    container.add_child(Arc::new(Text::new("  Shift+Enter   — Send message", 1, 0)));
-    container.add_child(Arc::new(Text::new("  Enter         — New line", 1, 0)));
+    container.add_child(Arc::new(Text::new("  Enter         — Send message", 1, 0)));
+    container.add_child(Arc::new(Text::new("  Shift+Enter   — New line", 1, 0)));
     container.add_child(Arc::new(Text::new("  Tab           — Accept autocomplete suggestion", 1, 0)));
     container.add_child(Arc::new(Text::new("  Ctrl+A / Ctrl+E — Line start / end", 1, 0)));
     container.add_child(Arc::new(Text::new("  Ctrl+K / Ctrl+U — Delete to end / start of line", 1, 0)));

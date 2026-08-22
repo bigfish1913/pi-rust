@@ -122,6 +122,16 @@ impl TuiAltScreen {
         self.current_frame.lock().ok()?.as_ref()?.primary_scroll_view.clone()
     }
 
+    /// Get the current terminal column count (cached, refreshed on resize).
+    /// Used by callers that need a width for off-layout rendering (e.g.
+    /// diff-line width sizing) without re-reading the terminal themselves.
+    pub fn width(&self) -> usize {
+        self.terminal
+            .lock()
+            .map(|t| t.columns())
+            .unwrap_or(80)
+    }
+
     /// Check if this implements ViewportTUI.
     pub fn is_viewport_tui(&self) -> bool {
         true

@@ -406,10 +406,11 @@ impl Editor {
             (KeyModifiers::NONE, KeyCode::Backspace) => self.backspace(),
             (KeyModifiers::NONE, KeyCode::Delete) => self.delete(),
             (KeyModifiers::NONE, KeyCode::Enter) => {
-                // Multi-line: insert newline
-                self.insert("\n");
+                // Submit on Enter (mirrors TS `tui.input.submit`).
+                self.submit();
             }
-            (KeyModifiers::SHIFT, KeyCode::Enter) => self.submit(),
+            // Shift+Enter inserts a newline (mirrors `tui.input.newLine`).
+            (KeyModifiers::SHIFT, KeyCode::Enter) => self.insert("\n"),
             
             // Ctrl shortcuts
             (KeyModifiers::CONTROL, KeyCode::Char('a')) => self.cursor_home(),
