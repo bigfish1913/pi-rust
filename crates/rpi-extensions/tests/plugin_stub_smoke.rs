@@ -39,6 +39,7 @@ use std::ffi::c_void;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+
 use rpi_agent::agent_tool::AgentTool;
 use rpi_agent::types::{TextContentOrImage, ToolResultPartial};
 use rpi_extensions::{PluginDiagnostics, PluginToolAdapter, load_session};
@@ -161,6 +162,69 @@ async fn loads_real_cdylib_and_drives_echo_tool() {
         other => panic!("expected text content, got {other:?}"),
     }
 
+    // ---- B3a: the ExtensionEmitter round-trips AgentEvent → handlers --------
+    // The stub registered one `MessageEnd` handler that bumps a process-global
+    // counter. Driving the emitter with a synthetic MessageEnd event proves the
+    // full dispatch path (translate → catch_unwind fan-out → plugin handler) is
+    // wired against the real cdylib. We read the counter back via the cdylib's
+    // exported `plugin_stub_message_end_hits` accessor (looked up the same way
+    // the loader looks up `rpi_plugin_register`).
+    use rpi_extensions::ExtensionEmitter;
+    use rpi_agent::events::AgentEmitter;
+    use rpi_agent::message::AgentMessage;
+    use rpi_ai::types::{AssistantMessage, Content, Usage};
+
+    let snapshot = session.snapshot_arc().expect("snapshot present");
+    let emitter = ExtensionEmitter::new(snapshot, session.keepalive());
+    let am = AgentMessage::Assistant(Box::new(AssistantMessage {
+        role: rpi_ai::types::AssistantRole,
+        content: vec![Content::text("smoke")],
+        api: rpi_ai::types::Api::AnthropicMessages,
+        provider: "anthropic".to_string(),
+        model: "m".into(),
+        response_model: None,
+        response_id: None,
+        usage: Usage::zero(),
+        stop_reason: rpi_ai::types::StopReason::Stop,
+        deferred: None,
+        error_message: None,
+        raw_stop_reason: None,
+        end_turn: None,
+        timestamp: 0,
+    }));
+    let before = stub_message_end_hits(&stub_path);
+    emitter.try_emit(rpi_agent::AgentEvent::MessageEnd { message: am });
+    let after = stub_message_end_hits(&stub_path);
+    assert_eq!(
+        after, before + 1,
+        "MessageEnd handler in the real cdylib should have fired once"
+    );
+
     // The session's keepalive is still alive (adapter holds a clone), so the
     // cdylib stays mapped; dropping the adapter + session unloads it.
+}
+
+/// Read the stub's `plugin_stub_message_end_hits` counter through the cdylib.
+/// Loads the library fresh (a second mapping — cdylibs are refcounted on Windows
+/// / dlopen-refcounted on Unix, so a second open is fine and the first open in
+/// the session's keepalive stays alive). Returns 0 if the symbol isn't found
+/// (defensive; the stub exports it, but a stale build might not).
+fn stub_message_end_hits(stub_path: &std::path::Path) -> usize {
+    // Hold the second mapping alive across the symbol call by keeping `lib`
+    // in scope until after `sym()` returns (the Symbol borrows lib).
+    let lib = match unsafe { libloading::Library::new(stub_path) } {
+        Ok(l) => l,
+        Err(_) => return 0,
+    };
+    type HitFn = extern "C" fn() -> usize;
+    let sym: libloading::Symbol<HitFn> = match unsafe {
+        lib.get(b"plugin_stub_message_end_hits\0")
+    } {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let hits = sym();
+    drop(sym);
+    drop(lib);
+    hits
 }

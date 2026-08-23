@@ -74,6 +74,7 @@ pub use registry::{
     ExtensionRegistry, ExtensionTool, RegistryEntry, RegistrySnapshot, assert_active,
 };
 pub use tool::{PluginToolAdapter, PluginToolHandle};
+pub use translate::{ExtensionEmitter, TeeEmitter};
 
 mod loader;
 mod registry;

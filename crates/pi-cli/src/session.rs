@@ -53,7 +53,8 @@ use crate::resource_dirs::{
     prompt_template_dirs, skill_dirs,
 };
 use rpi_extensions::{
-    ExtensionSession, NullDiagnostics, PluginDiagnostics, PluginToolAdapter, load_session,
+    ExtensionEmitter, ExtensionSession, NullDiagnostics, PluginDiagnostics, PluginToolAdapter,
+    TeeEmitter, load_session,
 };
 
 /// The subdirectory (under both project `.pi/` and global `agent_dir()/`) where
@@ -366,8 +367,28 @@ pub async fn build(
     // Install a BroadcastEmitter so the caller (the interactive TUI) can drain
     // AgentEvents live as a run unfolds. The corresponding broadcast::Receiver
     // is returned alongside the harness; non-interactive modes simply drop it.
-    let (emitter, event_rx) = rpi_agent::events::BroadcastEmitter::new(256);
-    let emitter: Arc<dyn rpi_agent::AgentEmitter> = Arc::new(emitter);
+    let (broadcast, event_rx) = rpi_agent::events::BroadcastEmitter::new(256);
+    let broadcast_emitter: Arc<dyn rpi_agent::AgentEmitter> = Arc::new(broadcast);
+
+    // ---- Extensions emitter (Part B3a) ----
+    // If extensions loaded + registered any `on()` handlers, wrap the
+    // broadcast emitter in a `TeeEmitter` so every `AgentEvent` flows to BOTH
+    // the TUI (via the broadcast receiver above) AND the plugin handlers (via
+    // the `ExtensionEmitter`, which translates each `AgentEvent` →
+    // `StablePluginEvent` and fans out to the handlers registered for its tag).
+    // With no extensions the tee degrades to the bare broadcast emitter (a
+    // one-child passthrough), so the TUI path is unchanged.
+    let emitter: Arc<dyn rpi_agent::AgentEmitter> =
+        match extension_session.snapshot_arc() {
+            Some(snapshot) => {
+                let ext = ExtensionEmitter::new(snapshot, extension_session.keepalive());
+                Arc::new(TeeEmitter::new(vec![
+                    broadcast_emitter,
+                    Arc::new(ext),
+                ]))
+            }
+            None => broadcast_emitter,
+        };
 
     let options = AgentHarnessOptions {
         model: resolved.model.clone(),

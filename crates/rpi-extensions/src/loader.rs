@@ -258,9 +258,14 @@ impl PluginKeepalive {
 /// the cdylib handles + a snapshot of the merged registry. Built by
 /// [`load_session`]; the host (pi-cli) stashes one per harness build and hands
 /// clones of the keepalive to each adapter it constructs from the snapshot.
+///
+/// The snapshot is held behind `Arc` so the host can hand a clone to the
+/// [`ExtensionEmitter`](crate::ExtensionEmitter) (installed as the harness's
+/// `agent_emitter`) without borrowing — the emitter must outlive this session
+/// local (it lives for the harness lifetime inside `AgentHarnessOptions`).
 pub struct ExtensionSession {
     keepalive: Arc<PluginKeepalive>,
-    snapshot: Option<RegistrySnapshot>,
+    snapshot: Option<Arc<RegistrySnapshot>>,
     loaded_paths: Vec<PathBuf>,
 }
 
@@ -281,9 +286,19 @@ impl ExtensionSession {
     }
 
     /// The merged registry snapshot (tools/commands/handlers), if any plugin
-    /// loaded. `None` when no plugins loaded successfully.
+    /// loaded. `None` when no plugins loaded successfully. Borrowed view for
+    /// iterating tools/commands; for an owned share (e.g. handing to the
+    /// emitter) use [`snapshot_arc`](Self::snapshot_arc).
     pub fn snapshot(&self) -> Option<&RegistrySnapshot> {
-        self.snapshot.as_ref()
+        self.snapshot.as_deref()
+    }
+
+    /// A shared (`Arc`) clone of the merged registry snapshot, for host code that
+    /// must keep the snapshot alive beyond this session local — notably the
+    /// [`ExtensionEmitter`](crate::ExtensionEmitter) installed into
+    /// `AgentHarnessOptions.agent_emitter`.
+    pub fn snapshot_arc(&self) -> Option<Arc<RegistrySnapshot>> {
+        self.snapshot.clone()
     }
 
     /// Paths of the cdylibs that loaded + registered successfully (diagnostics).
@@ -341,7 +356,7 @@ pub fn load_session(dirs: &[PathBuf], diagnostics: Arc<dyn PluginDiagnostics>) -
         let LoadedPlugin { library, registry: _, path: _ } = p;
         libs.push(library);
     }
-    let snapshot = session_registry.snapshot();
+    let snapshot = Arc::new(session_registry.snapshot());
     ExtensionSession {
         keepalive: Arc::new(PluginKeepalive::new(libs)),
         snapshot: Some(snapshot),

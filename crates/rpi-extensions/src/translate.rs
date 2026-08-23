@@ -163,8 +163,12 @@ fn free_event_strings(_event: &StablePluginEvent) {
 /// An [`AgentEmitter`] that fans each [`AgentEvent`] out to every plugin handler
 /// registered for the event's tag. Built from a [`RegistrySnapshot`] (so it
 /// shares the registry's staleness flag) and installed into
-/// `AgentHarnessOptions.agent_emitter` alongside (or wrapping) the host's
-/// `BroadcastEmitter`.
+/// `AgentHarnessOptions.agent_emitter` **alongside** the host's
+/// [`BroadcastEmitter`] — events flow to BOTH the TUI (which drains the
+/// broadcast receiver) and the plugin handlers (which receive translated
+/// `StablePluginEvent`s). The host composes the two via
+/// [`TeeEmitter`](super::TeeEmitter); this emitter alone only dispatches to
+/// plugins.
 ///
 /// Dispatch is `catch_unwind`-wrapped: a panicking plugin handler is logged and
 /// skipped (abort-on-unwind policy would be too aggressive for event dispatch
@@ -175,11 +179,19 @@ fn free_event_strings(_event: &StablePluginEvent) {
 /// `spawn_blocking` cross-FFI where recovery is unsafe.
 pub struct ExtensionEmitter {
     snapshot: Arc<RegistrySnapshot>,
+    /// Keeps the loaded cdylibs mapped for as long as this emitter (installed
+    /// into `AgentHarnessOptions.agent_emitter`) may dispatch to handler fn
+    /// pointers that live inside them. Cloned from the load session; the
+    /// libraries unload only when every holder (adapter + emitter) drops.
+    #[allow(dead_code)]
+    keepalive: Arc<crate::PluginKeepalive>,
 }
 
 impl ExtensionEmitter {
-    pub fn new(snapshot: Arc<RegistrySnapshot>) -> Self {
-        Self { snapshot }
+    /// Build an emitter over a snapshot. The `keepalive` keeps the cdylibs that
+    /// own the snapshot's handler fn pointers mapped for the emitter's lifetime.
+    pub fn new(snapshot: Arc<RegistrySnapshot>, keepalive: Arc<crate::PluginKeepalive>) -> Self {
+        Self { snapshot, keepalive }
     }
 
     /// Dispatch one stable event to all handlers for its tag. Each handler call
@@ -244,6 +256,60 @@ impl AgentEmitter for ExtensionEmitter {
     fn try_emit(&self, event: AgentEvent) {
         if let Some(stable) = translate(&event) {
             self.dispatch(&stable);
+        }
+    }
+}
+
+// ===========================================================================
+// TeeEmitter — fan an AgentEvent out to N AgentEmitters (host + plugins)
+// ===========================================================================
+
+/// An [`AgentEmitter`] that forwards every event to each of its children, in
+/// registration order. The host builds one around `[BroadcastEmitter (→ TUI),
+/// ExtensionEmitter (→ plugin handlers)]` so a single `AgentHarnessOptions
+/// .agent_emitter` slot feeds both consumers: the TUI keeps rendering from its
+/// broadcast receiver, and plugin `on()` handlers receive translated
+/// `StablePluginEvent`s.
+///
+/// `emit` awaits each child in turn (the loop awaits `emit`, so order matches
+/// registration); `try_emit` calls each child's `try_emit` (the tool
+/// `on_update` path — non-blocking). A child that panics is isolated by the
+/// child's own `catch_unwind` where applicable (the `ExtensionEmitter` does);
+/// the `BroadcastEmitter` cannot panic (it's a `tx.send`). We do NOT wrap the
+/// fan-out itself in `catch_unwind` — each child is responsible for its own
+/// soundness, and a generic wrapper would mask a child's contract violation.
+pub struct TeeEmitter {
+    emitters: Vec<Arc<dyn AgentEmitter>>,
+}
+
+impl TeeEmitter {
+    /// Build a tee over the given emitters. Order is preserved: `emit`/`try_emit`
+    /// visit them front-to-back. A single-child tee is a trivial passthrough
+    /// (the host uses that when no extensions loaded, so the code path is
+    /// uniform).
+    pub fn new(emitters: Vec<Arc<dyn AgentEmitter>>) -> Self {
+        Self { emitters }
+    }
+}
+
+impl AgentEmitter for TeeEmitter {
+    fn emit(&self, event: AgentEvent) -> BoxFuture<'static, ()> {
+        // We can't hold `&self` across an await boundary into a 'static future
+        // cheaply here without cloning the Arcs — so clone them and drive the
+        // fan-out inside a pinned async block. Each child's emit returns a
+        // no-op future (both BroadcastEmitter and ExtensionEmitter complete
+        // synchronously), so this is effectively a synchronous loop in practice.
+        let emitters = self.emitters.clone();
+        Box::pin(async move {
+            for e in &emitters {
+                e.emit(event.clone()).await;
+            }
+        })
+    }
+
+    fn try_emit(&self, event: AgentEvent) {
+        for e in &self.emitters {
+            e.try_emit(event.clone());
         }
     }
 }
@@ -323,6 +389,16 @@ mod tests {
     use rpi_ai::types::{AssistantMessage, Usage};
     use rpi_plugin_sdk::EventTag;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    // The two handler-fan-out tests share the process-global `HANDLER_HITS`
+    // counter (the handler is an `extern "C" fn` that can't capture per-test
+    // state). Parallel #[test] execution would have one test's `store(0)`
+    // wipe the other's in-flight increment. Hold this lock for the ENTIRE
+    // body of both tests so their reset/dispatch windows don't overlap. The
+    // dispatch is synchronous (fn-pointer calls), so the guard is released
+    // before the test returns — no handler outlives the test.
+    static HANDLER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn all_ten_agent_events_map_to_a_tag() {
@@ -425,6 +501,7 @@ mod tests {
 
     #[test]
     fn emitter_dispatches_to_registered_handlers() {
+        let _guard = HANDLER_TEST_LOCK.lock().unwrap();
         HANDLER_HITS.store(0, Ordering::SeqCst);
         let mut reg = crate::registry::ExtensionRegistry::new();
         reg.register_event_handler(
@@ -433,7 +510,7 @@ mod tests {
             std::ptr::null_mut(),
         );
         let snap = Arc::new(reg.snapshot());
-        let emitter = ExtensionEmitter::new(snap);
+        let emitter = ExtensionEmitter::new(snap, crate::loader::PluginKeepalive::empty());
 
         let am = AgentMessage::Assistant(Box::new(AssistantMessage {
             role: rpi_ai::types::AssistantRole,
@@ -479,5 +556,51 @@ mod tests {
             1,
             "stale registry must not dispatch"
         );
+    }
+
+    // --- TeeEmitter: fan-out to both the broadcast + the extension emitter ----
+
+    #[tokio::test]
+    async fn tee_emitter_fans_out_to_every_child() {
+        let _guard = HANDLER_TEST_LOCK.lock().unwrap();
+        use rpi_agent::events::{AgentEmitter, CollectorEmitter};
+
+        // Two collector emitters + record how many plugin handler hits land.
+        let (collector_a, events_a) = CollectorEmitter::new();
+        let (collector_b, events_b) = CollectorEmitter::new();
+        HANDLER_HITS.store(0, Ordering::SeqCst);
+        let mut reg = crate::registry::ExtensionRegistry::new();
+        reg.register_event_handler(EventTag::MessageEnd, counting_handler, std::ptr::null_mut());
+        let snap = Arc::new(reg.snapshot());
+        let ext = ExtensionEmitter::new(snap, crate::loader::PluginKeepalive::empty());
+
+        let tee = TeeEmitter::new(vec![
+            Arc::new(collector_a),
+            Arc::new(collector_b),
+            Arc::new(ext),
+        ]);
+
+        let am = AgentMessage::Assistant(Box::new(AssistantMessage {
+            role: rpi_ai::types::AssistantRole,
+            content: vec![rpi_ai::types::Content::text("hi")],
+            api: rpi_ai::types::Api::AnthropicMessages,
+            provider: "anthropic".to_string(),
+            model: "m".into(),
+            response_model: None,
+            response_id: None,
+            usage: Usage::zero(),
+            stop_reason: rpi_ai::types::StopReason::Stop,
+            deferred: None,
+            error_message: None,
+            raw_stop_reason: None,
+            end_turn: None,
+            timestamp: 0,
+        }));
+        // Broadcast path: both collectors receive the event, and the extension
+        // emitter dispatches to the one registered handler.
+        tee.emit(AgentEvent::MessageEnd { message: am }).await;
+        assert_eq!(events_a.lock().unwrap().len(), 1, "collector A got the event");
+        assert_eq!(events_b.lock().unwrap().len(), 1, "collector B got the event");
+        assert_eq!(HANDLER_HITS.load(Ordering::SeqCst), 1, "plugin handler fired once");
     }
 }
