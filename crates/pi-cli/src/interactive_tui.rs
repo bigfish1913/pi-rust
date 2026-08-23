@@ -38,9 +38,10 @@ use rpi_tui::{
     AutocompleteManager, CombinedAutocompleteProvider, Container, Editor, EditorOptions,
     EditorStyle, FilePathAutocompleteProvider, Focusable, FollowMode, Loader, ProcessTerminal,
     ScrollView, ScrollViewOptions, SlashCommand, SlashCommandAutocompleteProvider, Spacer,
-    StackChild, StackEntry, Text, TuiAltScreen, TUI, VStack, AssistantMessageComponent,
-    AssistantMessageOptions, AutocompleteSuggestions, FooterComponent, SelectList, SelectItem,
-    ThemeManager, ThemePreset, ToolExecutionComponent, render_diff,
+    StackChild, StackEntry, Text, TuiAltScreen, TUI, VStack, AssistantBlock,
+    AssistantMessageComponent, AssistantMessageOptions, AutocompleteSuggestions,
+    FooterComponent, SelectList, SelectItem, ThemeManager, ThemePreset,
+    ToolExecutionComponent, render_diff,
     BashExecutionComponent, BashTruncation, UserMessageComponent,
 };
 
@@ -190,6 +191,23 @@ fn assistant_text(msg: &AssistantMessage) -> String {
         .iter()
         .filter_map(|c| match c {
             Content::Text(t) => Some(t.text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Project an assistant message's content into the provider-free
+/// [`AssistantBlock`] list (text + thinking blocks, in document order) the
+/// `AssistantMessageComponent` renders. Tool-call/image blocks are dropped —
+/// they're rendered by their own components in the transcript. This keeps the
+/// thinking blocks visible in the TUI (they previously vanished because the
+/// stream path only fed the concatenated *text* into the component).
+fn assistant_blocks(msg: &AssistantMessage) -> Vec<AssistantBlock> {
+    msg.content
+        .iter()
+        .filter_map(|c| match c {
+            Content::Text(t) => Some(AssistantBlock::Text(t.text.clone())),
+            Content::Thinking(t) => Some(AssistantBlock::Thinking(t.thinking.clone())),
             _ => None,
         })
         .collect()
@@ -1150,7 +1168,7 @@ async fn handle_agent_event(
             // Finalize the assistant message for this turn.
             if let Some(comp) = state.current_assistant.lock().unwrap().take() {
                 if let AgentMessage::Assistant(a) = &message {
-                    comp.update_text(&assistant_text(a));
+                    comp.update_blocks(&assistant_blocks(a));
                 }
                 comp.set_streaming(false);
             }
@@ -1176,10 +1194,9 @@ async fn handle_agent_event(
                     AssistantMessageOptions::default(),
                 ));
                 comp.set_streaming(true);
-                let text = assistant_text(&a);
-                if !text.is_empty() {
-                    comp.update_text(&text);
-                }
+                // Render text AND thinking blocks in order (the old path fed
+                // only the concatenated text, so thinking blocks never showed).
+                comp.update_blocks(&assistant_blocks(&a));
                 chat.add_child(comp.clone());
                 chat.add_child(Arc::new(Spacer::new(0)));
                 *state.current_assistant.lock().unwrap() = Some(comp);
@@ -1213,7 +1230,9 @@ async fn handle_agent_event(
                 }
                 let _ = assistant_message_event; // snapshot already applied via `a`
                 if let Some(comp) = state.current_assistant.lock().unwrap().as_ref() {
-                    comp.update_text(&text);
+                    // Stream the full block list (text + thinking) each update
+                    // so thinking blocks render live as they arrive.
+                    comp.update_blocks(&assistant_blocks(a));
                 }
                 *state.last_assistant_text.lock().unwrap() = text;
                 tui.request_render(false);
@@ -1224,7 +1243,7 @@ async fn handle_agent_event(
             if let AgentMessage::Assistant(a) = &message {
                 let text = assistant_text(a);
                 if let Some(comp) = state.current_assistant.lock().unwrap().take() {
-                    comp.update_text(&text);
+                    comp.update_blocks(&assistant_blocks(a));
                     comp.set_streaming(false);
                 }
                 // Cache the finalized text for `/copy`.
@@ -2221,7 +2240,7 @@ mod tests {
     fn test_agent_event_mapping_creates_assistant_and_tool() {
         // Synthetic AgentEvent sequence → UI mutations, exercised against the
         // real drain handler with a no-op TUI stand-in.
-        use rpi_ai::types::{StopReason, TextContent, TextContentType, ToolCall, ToolCallType, Usage};
+        use rpi_ai::types::{StopReason, TextContent, TextContentType, ThinkingContent, ThinkingContentType, ToolCall, ToolCallType, Usage};
 
         let state = Arc::new(TuiState {
             current_assistant: std::sync::Mutex::new(None),
@@ -2249,6 +2268,12 @@ mod tests {
         let assistant = AssistantMessage {
             role: rpi_ai::types::AssistantRole,
             content: vec![
+                Content::Thinking(ThinkingContent {
+                    kind: ThinkingContentType,
+                    thinking: "Reasoning about the reply.".into(),
+                    thinking_signature: None,
+                    redacted: false,
+                }),
                 Content::Text(TextContent {
                     kind: TextContentType,
                     text: "Hello.".into(),
@@ -2281,7 +2306,7 @@ mod tests {
         // drain handler, without needing a TuiAltScreen).
         let comp = Arc::new(AssistantMessageComponent::new(AssistantMessageOptions::default()));
         comp.set_streaming(true);
-        comp.update_text(&assistant_text(&assistant));
+        comp.update_blocks(&assistant_blocks(&assistant));
         let chat = Arc::new(Container::new());
         chat.add_child(comp.clone());
         *state.current_assistant.lock().unwrap() = Some(comp);
@@ -2302,11 +2327,16 @@ mod tests {
             }
         }
 
-        // Assert: the assistant component rendered the text, and a tool
+        // Assert: the assistant component rendered the text + the thinking
+        // block (the update_blocks path keeps thinking visible), and a tool
         // component was registered.
         let rendered = chat.render(80);
         let joined: String = rendered.join("\n");
         assert!(joined.contains("Hello."), "assistant text not rendered: {joined}");
+        assert!(
+            joined.contains("Reasoning about the reply."),
+            "thinking block not rendered: {joined}"
+        );
         assert_eq!(state.tool_components.lock().unwrap().len(), 1);
         assert!(state.current_assistant.lock().unwrap().is_some());
 
