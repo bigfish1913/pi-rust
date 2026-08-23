@@ -1343,6 +1343,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
+name = "plugin-stub"
+version = "0.1.3"
+dependencies = [
+ "rpi-plugin-sdk",
+ "serde_json",
+]
+
+[[package]]
 name = "png"
 version = "0.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1663,7 +1671,9 @@ dependencies = [
  "rpassword",
  "rpi-agent",
  "rpi-ai",
+ "rpi-extensions",
  "rpi-harness",
+ "rpi-plugin-sdk",
  "rpi-telemetry",
  "rpi-tools",
  "rpi-tui",

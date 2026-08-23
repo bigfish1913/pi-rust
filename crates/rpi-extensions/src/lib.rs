@@ -66,7 +66,10 @@ use rpi_plugin_sdk::{
 };
 use thiserror::Error;
 
-pub use loader::{LoadedPlugin, PluginLoadError, load_dir, load_one};
+pub use loader::{
+    ExtensionSession, LoadedPlugin, PluginKeepalive, PluginLoadError, load_dir, load_one,
+    load_session, merge_registries,
+};
 pub use registry::{
     ExtensionRegistry, ExtensionTool, RegistryEntry, RegistrySnapshot, assert_active,
 };

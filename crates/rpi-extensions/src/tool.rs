@@ -28,6 +28,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::host_free_string;
+use crate::loader::PluginKeepalive;
 
 // ---------------------------------------------------------------------------
 // PluginToolHandle — the 4-fn bundle + the plugin's free_string
@@ -161,18 +162,37 @@ fn stb_to_result(s: &StbString) -> AgentToolResult {
 /// An [`AgentTool`] backed by a plugin's 4-function handle. One adapter is built
 /// per registered tool (`schema` copied from the registration) and inserted into
 /// the session's tool set in B2.
+///
+/// Holds a clone of the session's [`PluginKeepalive`] so the cdylib that owns
+/// `handle`'s fn pointers stays mapped for as long as the adapter (and thus any
+/// in-flight `execute`) may call them. Without this the `Library` could drop
+/// (unload the cdylib) while a fn pointer is still callable → UAF. The keepalive
+/// is `Arc`-shared with every other adapter built from the same session, so the
+/// last drop — which can only happen once the harness's tool vec drops — unloads.
 pub struct PluginToolAdapter {
     schema: Tool,
     label: String,
     handle: PluginToolHandle,
+    // Drop order: `keepalive` is declared AFTER `handle` so the cdylib unloads
+    // only after the fn-pointer bundle is itself dropped — though since both are
+    // fine to drop in any order (fn pointers are Copy, the real call sites are
+    // all inside `execute` which holds `&self`, so the adapter is never dropped
+    // mid-call), this is belt-and-suspenders.
+    #[allow(dead_code)]
+    keepalive: Arc<PluginKeepalive>,
 }
 
 impl PluginToolAdapter {
-    /// Build an adapter from the registered schema + handle. `label` defaults to
-    /// the tool name.
-    pub fn new(schema: Tool, handle: PluginToolHandle) -> Self {
+    /// Build an adapter from the registered schema + handle + the session's
+    /// keepalive. `label` defaults to the tool name. The keepalive clone keeps
+    /// the owning cdylib mapped for the adapter's lifetime.
+    pub fn new(
+        schema: Tool,
+        handle: PluginToolHandle,
+        keepalive: Arc<PluginKeepalive>,
+    ) -> Self {
         let label = schema.name.clone();
-        Self { schema, label, handle }
+        Self { schema, label, handle, keepalive }
     }
 }
 
@@ -496,7 +516,7 @@ mod tests {
             parameters: rpi_ai::types::Schema::new(serde_json::json!({})),
             constrained_sampling: None,
         };
-        PluginToolAdapter::new(tool, stub_handle())
+        PluginToolAdapter::new(tool, stub_handle(), PluginKeepalive::empty())
     }
 
     fn reset_counters() {
@@ -588,7 +608,7 @@ mod tests {
             destroy_fn: slow_destroy,
             plugin_free_string: stub_free,
         };
-        let adapter = PluginToolAdapter::new(tool, handle);
+        let adapter = PluginToolAdapter::new(tool, handle, PluginKeepalive::empty());
         let on_update: Arc<dyn Fn(ToolResultPartial) + Send + Sync> = Arc::new(|_| {});
         let signal = CancellationToken::new();
         let signal_clone = signal.clone();

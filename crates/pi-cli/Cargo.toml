@@ -18,6 +18,8 @@ rpi-agent = { workspace = true }
 rpi-tools = { workspace = true }
 rpi-harness = { workspace = true }
 rpi-tui = { workspace = true }
+rpi-plugin-sdk = { workspace = true }
+rpi-extensions = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }

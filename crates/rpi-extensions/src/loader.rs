@@ -20,7 +20,7 @@ use thiserror::Error;
 
 use rpi_plugin_sdk::{PluginApiVt, RPI_PLUGIN_ABI_VERSION, RpiPluginRegister};
 
-use crate::registry::ExtensionRegistry;
+use crate::registry::{ExtensionRegistry, RegistrySnapshot};
 use crate::{HostApi, NullDiagnostics, PluginDiagnostics, set_current_api, clear_current_api};
 
 // ---------------------------------------------------------------------------
@@ -221,6 +221,132 @@ pub fn merge_registries(plugins: &mut [LoadedPlugin]) -> ExtensionRegistry {
         session.absorb(taken);
     }
     session
+}
+
+// ---------------------------------------------------------------------------
+// PluginKeepalive + ExtensionSession — the host session's plugin lifetime
+// ---------------------------------------------------------------------------
+
+/// Owns the loaded `Library` handles so the cdylibs stay mapped for as long as
+/// any registered tool/handler (whose fn pointers live inside the cdylib) may be
+/// called. Shared via `Arc`: every [`PluginToolAdapter`](crate::PluginToolAdapter)
+/// (and, in B3, the [`ExtensionEmitter`](crate::ExtensionEmitter)) holds a clone,
+/// so the libraries unload only when the last holder drops — which is never
+/// before the harness's tool vec (and thus the last possible tool call) drops.
+///
+/// `libloading::Library` is `Send + Sync` (a handle/HMODULE), so the keepalive is
+/// too — required because `AgentTool: Send + Sync` and the adapter carries it.
+pub struct PluginKeepalive {
+    #[allow(dead_code)]
+    libraries: Vec<Library>,
+}
+
+impl PluginKeepalive {
+    fn new(libraries: Vec<Library>) -> Self {
+        Self { libraries }
+    }
+
+    /// An empty keepalive owning no libraries — for host code that builds an
+    /// adapter outside a real load session (notably in-process tests of the
+    /// adapter against stub fns that live in the test binary, not a cdylib).
+    pub fn empty() -> Arc<Self> {
+        Arc::new(Self::new(Vec::new()))
+    }
+}
+
+/// The result of loading a session's worth of extensions: a shared keepalive for
+/// the cdylib handles + a snapshot of the merged registry. Built by
+/// [`load_session`]; the host (pi-cli) stashes one per harness build and hands
+/// clones of the keepalive to each adapter it constructs from the snapshot.
+pub struct ExtensionSession {
+    keepalive: Arc<PluginKeepalive>,
+    snapshot: Option<RegistrySnapshot>,
+    loaded_paths: Vec<PathBuf>,
+}
+
+impl ExtensionSession {
+    /// An empty session (no plugins loaded — `--no-extensions` or no dirs found).
+    pub fn none() -> Self {
+        Self {
+            keepalive: Arc::new(PluginKeepalive::new(Vec::new())),
+            snapshot: None,
+            loaded_paths: Vec::new(),
+        }
+    }
+
+    /// The shared keepalive — clone one per adapter/emitter you build from this
+    /// session so the cdylibs outlive them.
+    pub fn keepalive(&self) -> Arc<PluginKeepalive> {
+        Arc::clone(&self.keepalive)
+    }
+
+    /// The merged registry snapshot (tools/commands/handlers), if any plugin
+    /// loaded. `None` when no plugins loaded successfully.
+    pub fn snapshot(&self) -> Option<&RegistrySnapshot> {
+        self.snapshot.as_ref()
+    }
+
+    /// Paths of the cdylibs that loaded + registered successfully (diagnostics).
+    pub fn loaded_paths(&self) -> &[PathBuf] {
+        &self.loaded_paths
+    }
+
+    /// Whether zero plugins loaded.
+    pub fn is_empty(&self) -> bool {
+        self.loaded_paths.is_empty()
+    }
+
+    /// A one-line human summary for `--verbose` startup output, or `None` when
+    /// nothing loaded (so the line is omitted entirely).
+    pub fn summary(&self) -> Option<String> {
+        if self.is_empty() {
+            return None;
+        }
+        let tools = self.snapshot.as_ref().map(|s| s.tools().len()).unwrap_or(0);
+        Some(format!(
+            "loaded {} plugin(s) ({} tool(s))",
+            self.loaded_paths.len(),
+            tools
+        ))
+    }
+}
+
+/// Load + register every cdylib in the given dirs (in order, non-recursive),
+/// merge their registries first-wins, and return a session with a shared
+/// keepalive over the `Library` handles + the merged snapshot. Dirs that don't
+/// exist are skipped silently; individual plugin load failures are logged via
+/// `diagnostics` and skipped (one bad plugin doesn't abort the rest).
+///
+/// The order of `dirs` matters: earlier dirs win on tool/command name collision
+/// (pi registration order). Callers pass default dirs first, then `--extensions-dir`
+/// extras, so a same-named tool in a default-dir plugin wins over an extra-dir one.
+pub fn load_session(dirs: &[PathBuf], diagnostics: Arc<dyn PluginDiagnostics>) -> ExtensionSession {
+    let mut loaded: Vec<LoadedPlugin> = Vec::new();
+    for dir in dirs {
+        loaded.extend(load_dir(dir, Arc::clone(&diagnostics)));
+    }
+    if loaded.is_empty() {
+        return ExtensionSession::none();
+    }
+    let loaded_paths: Vec<PathBuf> = loaded.iter().map(|p| p.path.clone()).collect();
+    // Merge the per-plugin registries first-wins. This drains each `registry`
+    // field (via mem::take inside `absorb`) but leaves `library` intact, so we
+    // can then destructure-own each Library into the keepalive below.
+    let session_registry = merge_registries(&mut loaded);
+    // Now move each Library out of its (registry-hollowed) LoadedPlugin by struct
+    // destructuring, collecting them into the keepalive. `registry`/`path` were
+    // left valid-but-empty / cloned already, and `library` is a move into `libs`.
+    let mut libs: Vec<Library> = Vec::with_capacity(loaded.len());
+    for p in loaded {
+        let LoadedPlugin { library, registry: _, path: _ } = p;
+        libs.push(library);
+    }
+    let snapshot = session_registry.snapshot();
+    ExtensionSession {
+        keepalive: Arc::new(PluginKeepalive::new(libs)),
+        snapshot: Some(snapshot),
+        loaded_paths,
+    }
 }
 
 // ---------------------------------------------------------------------------

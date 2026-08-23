@@ -48,10 +48,17 @@ use rpi_tools::{
 use crate::args::Args;
 use crate::provider::ResolvedModel;
 use crate::resource_dirs::{
-    discover_append_system_prompt_file, discover_system_prompt_file,
-    load_prompt_templates_with_precedence, load_skills_with_precedence, prompt_template_dirs,
-    skill_dirs,
+    discover_append_system_prompt_file, discover_system_prompt_file, global_dir,
+    load_prompt_templates_with_precedence, load_skills_with_precedence, project_dir,
+    prompt_template_dirs, skill_dirs,
 };
+use rpi_extensions::{
+    ExtensionSession, NullDiagnostics, PluginDiagnostics, PluginToolAdapter, load_session,
+};
+
+/// The subdirectory (under both project `.pi/` and global `agent_dir()/`) where
+/// rpi scans for cdylib plugins. Mirrors pi's `.pi/extensions`.
+const EXTENSIONS_SUBDIR: &str = "extensions";
 
 /// The built-in tool names v1 ships, in the order the TS `createCodingTools`
 /// registers them: the mutating set (`read`/`bash`/`edit`/`write`) followed by
@@ -164,6 +171,26 @@ pub async fn build(
     let ctx = ExecutionToolContext::new(env_dyn.clone(), Some(mut_env));
 
     let tools = build_tools(&ctx, args);
+    let mut tools = tools;
+
+    // ---- Extensions (Part B2) ----
+    // Load cdylib plugins from the resolved extension dirs, merge their tools
+    // into the built-in set (extension overrides same-named built-in; first-
+    // extension-wins across plugins; explicit `--tools`/`--exclude-tools` still
+    // apply to the merged set), and keep the loaded `Library` handles alive for
+    // the harness lifetime via the returned session guard. `--no-extensions`
+    // skips discovery entirely (no dirs scanned, no plugins loaded).
+    let extension_session = if args.no_extensions {
+        ExtensionSession::none()
+    } else {
+        load_extensions(args, cwd)
+    };
+    if args.verbose {
+        if let Some(s) = extension_session.summary() {
+            eprintln!("extensions: {s}");
+        }
+    }
+    merge_extension_tools(&mut tools, &extension_session, args);
     let active = active_tool_names(&tools, args);
 
     // ---- Session storage ----
@@ -385,6 +412,50 @@ pub enum BuildError {
     RestoreNotImplemented { requested: String, flag: &'static str },
     #[error("Could not build the harness: {0}")]
     HarnessCreate(String),
+}
+
+/// Resolve the extension dirs to scan and load the cdylib plugins, returning
+/// the loaded session guard (keeps the `Library` handles alive for the harness
+/// lifetime). Scan order: project `.pi/extensions`, global `agent_dir()/`
+/// `extensions`, then any `--extensions-dir` flags (scanned after the defaults
+/// — `args.rs`). Diagnostics are a no-op sink for now; load skips/ABI mismatches
+/// surface via the `--verbose` summary.
+fn load_extensions(args: &Args, cwd: &Path) -> ExtensionSession {
+    let mut dirs = vec![project_dir(cwd, EXTENSIONS_SUBDIR)];
+    if let Some(g) = global_dir(EXTENSIONS_SUBDIR) {
+        dirs.push(g);
+    }
+    dirs.extend(args.extensions_dir.iter().cloned());
+    let diagnostics: Arc<dyn PluginDiagnostics> = Arc::new(NullDiagnostics);
+    load_session(&dirs, diagnostics)
+}
+
+/// Merge the loaded extension tools into the built-in set. An extension tool
+/// overrides a same-named built-in; first-extension-wins across plugins is
+/// already guaranteed by the registry (`register_tool` keeps the prior). The
+/// explicit `--tools` allowlist / `--exclude-tools` denylist apply to the
+/// merged set (the built-ins were already filtered in [`build_tools`]).
+fn merge_extension_tools(tools: &mut Vec<HarnessTool>, session: &ExtensionSession, args: &Args) {
+    let Some(snapshot) = session.snapshot() else { return };
+    for et in snapshot.tools() {
+        let name = &et.tool.name;
+        if let Some(allow) = &args.tools {
+            if !allow.iter().any(|a| a == name) {
+                continue;
+            }
+        }
+        if let Some(deny) = &args.exclude_tools {
+            if deny.iter().any(|d| d == name) {
+                continue;
+            }
+        }
+        let adapter = PluginToolAdapter::new(et.tool.clone(), et.handle(), session.keepalive());
+        let harness_tool = HarnessTool::new(Arc::new(adapter));
+        match tools.iter_mut().find(|t| t.tool.schema().name == *name) {
+            Some(slot) => *slot = harness_tool,
+            None => tools.push(harness_tool),
+        }
+    }
 }
 
 /// Build the tool list per `--tools`/`--exclude-tools`/`--no-tools`/

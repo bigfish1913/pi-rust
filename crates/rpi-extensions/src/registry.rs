@@ -40,6 +40,14 @@ impl ExtensionTool {
     pub fn new(tool: Tool, handle: PluginToolHandle) -> Self {
         Self { tool, handle }
     }
+
+    /// The plugin-side function handles backing this tool. `Copy` (fn pointers
+    /// + a `FreeStringFn`), so handing it out is free. Public so the host
+    /// (e.g. rpi-cli's session builder) can wrap a registered tool in a
+    /// [`PluginToolAdapter`](crate::PluginToolAdapter) outside this crate.
+    pub fn handle(&self) -> PluginToolHandle {
+        self.handle
+    }
 }
 
 /// A registered slash command (name + description). The handler fn is not yet

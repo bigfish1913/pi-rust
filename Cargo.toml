@@ -14,6 +14,7 @@ members = [
     "examples/minimal",
     "examples/tools",
     "examples/tui",
+    "examples/plugin-stub",
 ]
 default-members = [
     "crates/pi-agent",

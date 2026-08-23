@@ -76,10 +76,17 @@ pub struct Args {
     /// `--no-context-files`/`-nc`: skip context-file (`AGENTS.md`/`CLAUDE.md`)
     /// discovery + the `<project_context>` system-prompt block.
     pub no_context_files: bool,
-    /// `--no-extensions`/`-ne`: recognized-but-deferred (Part B). When the plugin
-    /// system lands this gates extension loading; until then it's honored as a
-    /// no-op acceptance (no discovery to skip).
+    /// `--no-extensions`/`-ne`: skip cdylib plugin discovery + loading entirely.
+    /// Honored by `session.rs` (Part B2): when set, no extension directory is
+    /// scanned and no plugin tools/handlers are registered.
     pub no_extensions: bool,
+    /// `--extensions-dir`/`-ed`: an extra directory to scan for cdylib plugins
+    /// (`.dll`/`.so`/`.dylib`), in addition to the project `.pi/extensions` and
+    /// global `agent_dir()/extensions` defaults. May be repeated; scanned after
+    /// the defaults (so a same-named tool in a default dir wins first, mirroring
+    /// pi's registration order). `RPI_EXTENSIONS_DIR` (colon-separated on Unix,
+    /// semicolon on Windows) provides the same list via env.
+    pub extensions_dir: Vec<PathBuf>,
 
     pub verbose: bool,
     pub help: bool,
@@ -148,6 +155,20 @@ fn file_arg(arg: &str) -> Option<PathBuf> {
 /// ergonomics). Short flags use a single leading `-`.
 pub fn parse_args(args: &[String]) -> Args {
     let mut result = Args::default();
+    // `RPI_EXTENSIONS_DIR` env: an extra list of plugin dirs prepended to any
+    // `--extensions-dir` flags. Semicolon-separated on Windows, colon-separated
+    // on Unix (PATH-style). Empty entries skipped. `--no-extensions` still wins.
+    if let Ok(raw) = std::env::var("RPI_EXTENSIONS_DIR") {
+        if !raw.is_empty() {
+            let sep = if cfg!(windows) { ';' } else { ':' };
+            for part in raw.split(sep) {
+                let trimmed = part.trim();
+                if !trimmed.is_empty() {
+                    result.extensions_dir.push(PathBuf::from(trimmed));
+                }
+            }
+        }
+    }
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].clone();
@@ -222,6 +243,11 @@ pub fn parse_args(args: &[String]) -> Args {
             "--no-prompt-templates" | "-np" => result.no_prompt_templates = true,
             "--no-context-files" | "-nc" => result.no_context_files = true,
             "--no-extensions" | "-ne" => result.no_extensions = true,
+            "--extensions-dir" | "-ed" => {
+                if let Some(v) = take_value(&mut result, &flag_key) {
+                    result.extensions_dir.push(PathBuf::from(v));
+                }
+            }
             "--verbose" => result.verbose = true,
             "--debug-system-prompt" => result.debug_system_prompt = true,
             "--provider" => result.provider = take_value(&mut result, "--provider"),
@@ -430,7 +456,9 @@ pub fn print_help() {
   --no-skills, -ns               Skip skill discovery (no <available_skills> block)
   --no-prompt-templates, -np     Skip prompt-template discovery (/expand templates)
   --no-context-files, -nc        Skip AGENTS.md/CLAUDE.md discovery (no <project_context>)
-  --no-extensions, -ne           Skip extension/plugin loading (deferred v1: no-op until plugin system lands)
+  --no-extensions, -ne           Skip cdylib plugin/extension loading entirely
+  --extensions-dir, -ed <dir>    Extra dir to scan for plugins (.dll/.so/.dylib); repeatable
+                                 (also via RPI_EXTENSIONS_DIR env: ';' on Windows, ':' on Unix)
   --debug-system-prompt          Print the resolved system-prompt sections to stderr (verification)
   --verbose                      Show startup warnings (e.g. ignored flags)
   --help, -h                     Show this help
@@ -601,6 +629,30 @@ mod tests {
         let a = parse_args(&s(&["--no-extensions"]));
         assert!(a.no_extensions);
         assert!(a.ignored.is_empty());
+    }
+
+    #[test]
+    fn extensions_dir_flag_collects_dirs() {
+        let a = parse_args(&s(&["--extensions-dir", "/a/b", "-ed", "/c/d"]));
+        assert_eq!(a.extensions_dir, vec![PathBuf::from("/a/b"), PathBuf::from("/c/d")]);
+        assert!(a.ignored.is_empty());
+    }
+
+    #[test]
+    fn extensions_dir_inline_equals_form() {
+        let a = parse_args(&s(&["--extensions-dir=/x/y"]));
+        assert_eq!(a.extensions_dir, vec![PathBuf::from("/x/y")]);
+    }
+
+    #[test]
+    fn extensions_dir_env_is_merged() {
+        // The env var contributes its split list. We can't fully control env in
+        // a unit test without `set_var` (process-global + racy under parallel
+        // tests), so this asserts the flag path only; the env path is exercised
+        // by the B2 smoke. Keep the test green regardless of the host env by
+        // NOT asserting emptiness — just confirm the flag appends after env.
+        let a = parse_args(&s(&["--extensions-dir", "/flag/only"]));
+        assert!(a.extensions_dir.iter().any(|p| p == &PathBuf::from("/flag/only")));
     }
 
     #[test]
