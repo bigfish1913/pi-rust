@@ -15,10 +15,19 @@ const PATH_DELIMITERS: &[char] = &[' ', '\t', '"', '\'', '='];
 /// byte offset handed back from the editor; either way, slicing
 /// `&input[..cursor]` panics if `cursor` lands inside a multibyte char. Snap to
 /// the nearest preceding boundary so the slice is always sound.
+///
+/// A position that IS a char boundary (including the END of the string) is
+/// kept as-is — the old `take_while(b <= idx)` returned the START of the char
+/// at `idx`, so `end: cursor` came out one char short and Tab-accept kept the
+/// input's last char: typing "/mode" + Tab produced "/modele" instead of
+/// "/model".
 fn snap_cursor(s: &str, idx: usize) -> usize {
     let idx = idx.min(s.len());
+    if s.is_char_boundary(idx) {
+        return idx;
+    }
     s.char_indices()
-        .take_while(|(b, _)| *b <= idx)
+        .take_while(|(b, _)| *b < idx)
         .last()
         .map(|(b, _)| b)
         .unwrap_or(0)
@@ -423,6 +432,23 @@ impl Default for AutocompleteManager {
 mod tests {
     use super::*;
 
+
+    #[test]
+    fn snap_cursor_keeps_boundaries_including_end() {
+        // Regression: the caret at the END of the input (what Tab-accept sees)
+        // snapped one char short, so `end` excluded the last char and accept
+        // kept it: "/mode" + Tab became "/modele" instead of "/model".
+        assert_eq!(snap_cursor("/mode", 5), 5);
+        assert_eq!(snap_cursor("/mo", 3), 3);
+        assert_eq!(snap_cursor("/model", 6), 6);
+        assert_eq!(snap_cursor("abc", 3), 3);
+        // Interior boundary + mid-multibyte snap down.
+        assert_eq!(snap_cursor("/mode", 2), 2);
+        assert_eq!(snap_cursor("你", 1), 0);
+        assert_eq!(snap_cursor("你", 3), 3);
+        // Out-of-range clamps to the end.
+        assert_eq!(snap_cursor("/mode", 99), 5);
+    }
     #[test]
     fn test_slash_command_provider() {
         let provider = SlashCommandAutocompleteProvider::with_default_commands();

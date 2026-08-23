@@ -2657,6 +2657,7 @@ mod tests {
         let mut replaced = String::new();
         replaced.push_str(&text[..start]);
         replaced.push_str(&top.text);
+        replaced.push_str(&text[end..]);
         if top.insert_space && !replaced.ends_with('/') {
             replaced.push(' ');
         }
@@ -2738,6 +2739,7 @@ mod tests {
     }
 
     #[test]
+
     fn test_registry_visible_entries_cover_dispatch() {
         // The autocomplete list is derived from the registry, so every visible
         // command the dispatcher recognizes must appear in it — by construction,
