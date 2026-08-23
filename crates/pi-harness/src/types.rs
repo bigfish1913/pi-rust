@@ -14,10 +14,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use rpi_ai::{CacheRetention, Model, Provider, SimpleStreamOptions, ThinkingLevel};
-use rpi_agent::{AgentTool, ConvertToLlm, QueueMode};
+use rpi_agent::{
+    AgentTool, AfterToolCall, BeforeToolCall, ConvertToLlm, QueueMode, TransformContext,
+};
 use serde::{Deserialize, Serialize};
 
-use crate::session::context::CustomEntryContextMessageProjector;
+use crate::session::context::{ContextEntryTransform, CustomEntryContextMessageProjector};
 use crate::session::Session;
 
 /// A skill loaded from a `SKILL.md` file or provided by an application. Mirrors
@@ -360,6 +362,36 @@ pub struct AgentHarnessOptions {
     /// live as a run unfolds. `None` (the default) preserves the discard
     /// behavior — the harness only surfaces `RunStart`/`RunEnd` on its own bus.
     pub agent_emitter: Option<Arc<dyn rpi_agent::AgentEmitter>>,
+
+    // ---- B3b additions: the three exists-but-`None` `AgentLoopConfig` hooks --
+    //
+    // `AgentLoopConfig` already has `before_tool_call`/`after_tool_call`/
+    // `transform_context` slots (pi-agent/hooks.rs), but the harness hardcoded
+    // them to `None` (agent_harness.rs:944/950-951). These option fields expose
+    // them on `AgentHarnessOptions` so a host (pi-cli, via rpi-extensions
+    // adapters) can populate them; the harness forwards them into the config it
+    // builds per run (snapshot_config + the config build site).
+
+    /// `(context, signal) -> Option<BeforeToolCallResult>` — can block a tool
+    /// call before it runs. Mirrors `AgentLoopConfig.before_tool_call`.
+    pub before_tool_call: Option<BeforeToolCall>,
+
+    /// `(context, signal) -> Option<AfterToolCallResult>` — overrides fields of
+    /// an executed tool result before `tool_execution_end`/`MessageEnd`. Mirrors
+    /// `AgentLoopConfig.after_tool_call`.
+    pub after_tool_call: Option<AfterToolCall>,
+
+    /// `(messages, signal) -> AgentMessage[]` — optional pre-convert transform
+    /// at the `AgentMessage` level (context-window pruning, external injection).
+    /// Mirrors `AgentLoopConfig.transform_context`.
+    pub transform_context: Option<TransformContext>,
+
+    /// Caller-supplied context-entry transforms applied AFTER the default
+    /// compaction-boundary transform during the per-turn `build_session_context`.
+    /// Previously the harness hardcoded `Vec::new()` at the `build_opts` site
+    /// (agent_harness.rs:520); this field lets a host inject transforms (the
+    /// pi `context`/`transform_context` event folds here too).
+    pub entry_transforms: Vec<ContextEntryTransform>,
 }
 
 impl Default for AgentHarnessOptions {
@@ -400,6 +432,10 @@ impl Default for AgentHarnessOptions {
             to_provider_messages: None,
             entry_projectors: BTreeMap::new(),
             agent_emitter: None,
+            before_tool_call: None,
+            after_tool_call: None,
+            transform_context: None,
+            entry_transforms: Vec::new(),
         }
     }
 }

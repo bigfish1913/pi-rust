@@ -45,8 +45,8 @@ use rpi_ai::types::{
 use rpi_ai::{Model, Provider as AiProvider};
 use rpi_agent::message::AgentMessage;
 use rpi_agent::{
-    run_agent_loop, AgentContext, AgentEmitter, AgentLoopConfig, AgentTool, ConvertToLlm,
-    StreamFn,
+    run_agent_loop, AfterToolCall, AgentContext, AgentEmitter, AgentLoopConfig, AgentTool,
+    BeforeToolCall, ConvertToLlm, StreamFn, TransformContext,
 };
 
 use crate::compaction::{
@@ -59,7 +59,8 @@ use crate::events::{
 use crate::messages::convert_to_llm as harness_convert_to_llm;
 use crate::result::{HarnessError, HarnessResult, OperationKind};
 use crate::session::context::{
-    build_session_context, CustomEntryContextMessageProjector, SessionContextBuildOptions,
+    build_session_context, ContextEntryTransform, CustomEntryContextMessageProjector,
+    SessionContextBuildOptions,
 };
 use crate::session::session::Session;
 use crate::session::types::{
@@ -248,8 +249,15 @@ struct HarnessInner {
     /// `convert_to_llm` is used.
     to_provider_messages: Option<ConvertToLlm>,
     entry_projectors: BTreeMap<String, CustomEntryContextMessageProjector>,
+    /// Caller-supplied context-entry transforms (B3b). Forwarded into
+    /// `SessionContextBuildOptions.entry_transforms` at the `build_opts` site.
+    entry_transforms: Vec<ContextEntryTransform>,
     /// Optional emitter override; see [`AgentHarnessOptions::agent_emitter`].
     agent_emitter: Option<Arc<dyn AgentEmitter>>,
+    // ---- B3b: the three exists-but-`None` AgentLoopConfig hooks -----------
+    before_tool_call: Option<BeforeToolCall>,
+    after_tool_call: Option<AfterToolCall>,
+    transform_context: Option<TransformContext>,
     closed: bool,
     active_run: Option<ActiveRun>,
 }
@@ -303,7 +311,11 @@ impl AgentHarness {
             models: options.models,
             to_provider_messages: options.to_provider_messages,
             entry_projectors: options.entry_projectors,
+            entry_transforms: options.entry_transforms,
             agent_emitter: options.agent_emitter,
+            before_tool_call: options.before_tool_call,
+            after_tool_call: options.after_tool_call,
+            transform_context: options.transform_context,
             closed: false,
             active_run: None,
         };
@@ -514,10 +526,16 @@ impl AgentHarness {
         })
     }
 
-    /// Build the `SessionContextBuildOptions` from the entry projectors.
-    fn build_opts(projectors: &BTreeMap<String, CustomEntryContextMessageProjector>) -> SessionContextBuildOptions {
+    /// Build the `SessionContextBuildOptions` from the entry projectors + the
+    /// caller-supplied context-entry transforms (B3b). Previously
+    /// `entry_transforms` was hardcoded to `Vec::new()`; the options field now
+    /// flows through so a host (pi-cli, via rpi-extensions) can inject transforms.
+    fn build_opts(
+        projectors: &BTreeMap<String, CustomEntryContextMessageProjector>,
+        entry_transforms: &[ContextEntryTransform],
+    ) -> SessionContextBuildOptions {
         SessionContextBuildOptions {
-            entry_transforms: Vec::new(),
+            entry_transforms: entry_transforms.to_vec(),
             entry_projectors: projectors.clone(),
         }
     }
@@ -564,7 +582,11 @@ impl AgentHarness {
             models: inner.models.clone(),
             to_provider_messages: inner.to_provider_messages.clone(),
             entry_projectors: inner.entry_projectors.clone(),
+            entry_transforms: inner.entry_transforms.clone(),
             agent_emitter: inner.agent_emitter.clone(),
+            before_tool_call: inner.before_tool_call.clone(),
+            after_tool_call: inner.after_tool_call.clone(),
+            transform_context: inner.transform_context.clone(),
         })
     }
 
@@ -846,7 +868,7 @@ impl AgentHarness {
 
         // Build the branch path (now includes the just-persisted prompts).
         let path = self.branch_path_oldest_first().await?;
-        let build_opts = Self::build_opts(&snap.entry_projectors);
+        let build_opts = Self::build_opts(&snap.entry_projectors, &snap.entry_transforms);
 
         // Pre-run compaction evaluation.
         if snap.compaction.enabled && snap.model.context_window > 0 {
@@ -920,7 +942,7 @@ impl AgentHarness {
 
         // Rebuild path after potential compaction.
         let path = self.branch_path_oldest_first().await?;
-        let build_opts = Self::build_opts(&snap.entry_projectors);
+        let build_opts = Self::build_opts(&snap.entry_projectors, &snap.entry_transforms);
         let ctx = build_session_context(&path, &build_opts);
         let system_prompt = Self::compose_prompt(
             snap.system_prompt.as_deref(),
@@ -941,14 +963,14 @@ impl AgentHarness {
         let config = AgentLoopConfig {
             model: snap.model.clone(),
             convert_to_llm: convert,
-            transform_context: None,
+            transform_context: snap.transform_context.clone(),
             get_api_key: None,
             should_stop_after_turn: None,
             prepare_next_turn: None,
             get_steering_messages: None,
             get_follow_up_messages: None,
-            before_tool_call: None,
-            after_tool_call: None,
+            before_tool_call: snap.before_tool_call.clone(),
+            after_tool_call: snap.after_tool_call.clone(),
             tool_execution: snap.tool_execution.to_agent_mode(),
             thinking_level: snap.thinking_level,
             api_key: None,
@@ -1192,7 +1214,11 @@ struct ConfigSnapshot {
     models: Vec<Arc<dyn AiProvider>>,
     to_provider_messages: Option<ConvertToLlm>,
     entry_projectors: BTreeMap<String, CustomEntryContextMessageProjector>,
+    entry_transforms: Vec<ContextEntryTransform>,
     agent_emitter: Option<Arc<dyn AgentEmitter>>,
+    before_tool_call: Option<BeforeToolCall>,
+    after_tool_call: Option<AfterToolCall>,
+    transform_context: Option<TransformContext>,
 }
 
 // ===========================================================================

@@ -416,6 +416,15 @@ pub async fn build(
         to_provider_messages: None,
         entry_projectors: Default::default(),
         agent_emitter: Some(emitter),
+        // B3b: the three exists-but-`None` loop hooks — populated when an
+        // extension session registers handlers for the matching pi `on()`
+        // tags (before_tool_call/after_tool_call/context). v1 leaves them `None`
+        // here; the rpi-extensions adapter that owns plugin handler dispatch is
+        // wired in the same build path once B3b's host-side adapter lands.
+        before_tool_call: None,
+        after_tool_call: None,
+        transform_context: None,
+        entry_transforms: Vec::new(),
     };
 
     AgentHarness::create(options)

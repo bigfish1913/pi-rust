@@ -109,6 +109,10 @@ async fn harness_with(
         to_provider_messages: None,
         entry_projectors: Default::default(),
         agent_emitter: None,
+        before_tool_call: None,
+        after_tool_call: None,
+        transform_context: None,
+        entry_transforms: Vec::new(),
     };
 
     let harness = AgentHarness::create(options).await.expect("create harness");
@@ -319,4 +323,167 @@ async fn run_with_no_tool_calls_completes_in_single_turn() {
         .await
         .unwrap();
     assert_eq!(path.len(), 2, "user + assistant reply only");
+}
+
+// ---------------------------------------------------------------------------
+// B3b: AgentHarnessOptions forwards before_tool_call / after_tool_call /
+// transform_context into the live AgentLoopConfig (previously these existed on
+// AgentLoopConfig but the harness hardcoded them to None). This test is the
+// harness-level proof: set after_tool_call on the options, run a tool-call
+// script, and assert the persisted ToolResultMessage carries the patched usage
+// — i.e. the hook the host installed via options actually ran inside the loop.
+//
+// (The pi-agent before_after_hooks tests prove the loop itself honors the hooks
+// at the unit level; this proves the harness WIRING from options → inner →
+// snapshot_config → AgentLoopConfig is live, which is the B3b deliverable.)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn harness_forwards_after_tool_call_option_into_loop() {
+    use rpi_agent::{AfterToolCall, AfterToolCallResult};
+    use rpi_ai::types::{Usage, UsageCost};
+
+    let patched = Usage {
+        input: 5,
+        output: 6,
+        cache_read: 7,
+        cache_write: 8,
+        cache_write_1h: None,
+        reasoning: None,
+        total_tokens: 26,
+        cost: UsageCost {
+            input: 0.5,
+            output: 0.6,
+            cache_read: 0.7,
+            cache_write: 0.8,
+            total: 2.6,
+        },
+    };
+    let patched_for_hook = patched.clone();
+
+    let fired: Arc<std::sync::Mutex<bool>> = Arc::new(std::sync::Mutex::new(false));
+    let after: AfterToolCall = {
+        let fired = Arc::clone(&fired);
+        let patched = patched_for_hook.clone();
+        Arc::new(move |_ctx: rpi_agent::AfterToolCallContext<'_>, _signal| {
+            let fired = Arc::clone(&fired);
+            let patched = patched.clone();
+            Box::pin(async move {
+                *fired.lock().unwrap() = true;
+                Some(AfterToolCallResult {
+                    usage: Some(patched),
+                    ..AfterToolCallResult::default()
+                })
+            })
+        })
+    };
+
+    // Script: turn 1 a `write` tool call, turn 2 a final text turn.
+    let script = FauxScript::new()
+        .with_tool_call(
+            "write",
+            serde_json::json!({ "path": "b3b.txt", "content": "patched-usage" }),
+        )
+        .with_text("done");
+    let (harness, _provider, _env) = {
+        // Build a harness that carries the after_tool_call option. We reuse
+        // `harness_with` for everything else, then rebuild options with the
+        // hook attached. Easiest: construct a second harness via the same path
+        // but we need the options — so replicate the minimal build inline.
+        let provider = FauxProvider::new(script);
+        let model = provider.default_model().clone();
+        let env = Arc::new(InMemoryExecutionEnv::new());
+        let env_dyn: Arc<dyn rpi_tools::ExecutionEnv> = env.clone();
+        let mut_env: Arc<dyn rpi_tools::MutatingEnv> = env.clone();
+        let _ = Arc::new(MutationQueueRegistry::new());
+        let ctx = ExecutionToolContext::new(env_dyn, Some(mut_env));
+        let write = create_write_tool(&ctx);
+        let tools: Vec<HarnessTool> = vec![write].into_iter().map(HarnessTool::new).collect();
+        let active: Vec<String> = tools.iter().map(|t| t.tool.schema().name.clone()).collect();
+        let metadata = SessionMetadata {
+            id: "b3b-after".into(),
+            created_at: 0,
+            parent_session_id: None,
+        };
+        let storage = Arc::new(InMemorySessionStorage::new(
+            metadata,
+            Arc::new(SystemClock),
+            Arc::new(DefaultIdGenerator::new()),
+        ));
+        let session = Session::new(storage, None);
+        let options = AgentHarnessOptions {
+            model,
+            thinking_level: Default::default(),
+            active_tool_names: active,
+            tools,
+            system_prompt: None,
+            resources: Default::default(),
+            stream_options: Default::default(),
+            retry: Default::default(),
+            compaction: Default::default(),
+            steering_mode: Default::default(),
+            follow_up_mode: Default::default(),
+            tool_execution: Default::default(),
+            drive: Default::default(),
+            session,
+            models: vec![provider.clone() as Arc<dyn Provider>],
+            to_provider_messages: None,
+            entry_projectors: Default::default(),
+            agent_emitter: None,
+            before_tool_call: None,
+            after_tool_call: Some(after),
+            transform_context: None,
+            entry_transforms: Vec::new(),
+        };
+        let harness = AgentHarness::create(options).await.expect("create harness");
+        (harness, provider, env)
+    };
+
+    let result = harness
+        .prompt_text("Write patched-usage to b3b.txt.", vec![])
+        .await
+        .expect("prompt_text completes");
+    assert!(
+        matches!(result.outcome, HarnessRunOutcome::Completed { .. }),
+        "expected Completed, got {:?}",
+        result.outcome
+    );
+
+    // The hook fired (the harness forwarded options.after_tool_call into the
+    // live AgentLoopConfig, so the loop invoked it).
+    assert!(
+        *fired.lock().unwrap(),
+        "after_tool_call hook installed via AgentHarnessOptions must fire inside the loop"
+    );
+
+    // And the persisted ToolResultMessage carries the patched usage — the
+    // override the hook returned was applied by the loop and survived the
+    // harness's persist path. This is the end-to-end B3b proof.
+    let leaf = harness
+        .session()
+        .get_leaf_id()
+        .await
+        .unwrap()
+        .expect("leaf present");
+    let path = harness
+        .session()
+        .find_entries_on_branch(
+            &EntryQuery { order: Some(EntryOrder::OldestFirst), ..Default::default() },
+            &BranchBounds { start: Some(leaf), ..Default::default() },
+        )
+        .await
+        .expect("branch path");
+    let tool_result = path.iter().find_map(|e| match e {
+        rpi_harness::session::types::Entry::Message(m) => match &m.message {
+            rpi_agent::AgentMessage::ToolResult(t) => Some(t.clone()),
+            _ => None,
+        },
+        _ => None,
+    });
+    let tool_result = tool_result.expect("a toolResult message persisted");
+    assert_eq!(
+        tool_result.usage,
+        Some(patched),
+        "persisted ToolResultMessage.usage must be the after_tool_call override"
+    );
 }
