@@ -1171,6 +1171,23 @@ pub async fn interactive_tui(
                 continue;
             }
 
+            // 2a. Ctrl+D (EOF): exit. Mirrors pi binding Ctrl+D to quit — and
+            //     when a run is active, abort it first (same as Ctrl+C) so the
+            //     key is never a no-op while a stuck command is running.
+            if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('d') {
+                let status = *state_for_key.status.lock().unwrap();
+                if status == RunStatus::Working {
+                    state_for_key.set_status(RunStatus::Aborting);
+                    let lane = lane_for_key.clone();
+                    tokio::spawn(async move {
+                        let _ = lane.abort().await;
+                    });
+                } else {
+                    let _ = tx_for_key.send(TuiMessage::Exit);
+                }
+                continue;
+            }
+
             // 2b. Esc: interrupt an active run (mirrors Ctrl+C abort). When a
             //     selector is open Esc already cancelled it above; when idle,
             //     Esc falls through to the editor (no-op-ish). Only fire while
@@ -1277,6 +1294,11 @@ pub async fn interactive_tui(
         }
         match rx.try_recv() {
             Ok(TuiMessage::UserInput(prompt)) => {
+                // Clear the editor so the next prompt starts fresh (the submit
+                // handler runs on the blocking key thread and can't mutate the
+                // editor state safely there; clearing here, on the async loop,
+                // keeps it on one thread).
+                editor.clear();
                 run_prompt_streaming(&lane, &prompt, &tui, &state, drain_handle.is_some()).await;
             }
             Ok(TuiMessage::ClearChat) => {

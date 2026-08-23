@@ -9,6 +9,7 @@
 
 use std::any::Any;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use super::component::Component;
 use crate::ansi::strip_ansi;
@@ -22,6 +23,11 @@ use crate::visual_truncate::truncate_to_visual_lines;
 
 /// Preview line limit when collapsed (matches the TS `PREVIEW_LINES`).
 const PREVIEW_LINES: usize = 20;
+
+/// After this long without a result, a running bash panel shows the
+/// "Esc / Ctrl+C 中止" hint (the tool has no default timeout — the model must
+/// pass one, and a stuck command otherwise looks frozen).
+const LONG_RUNNING_HINT_AFTER: Duration = Duration::from_secs(60);
 
 /// Bash execution status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,6 +220,17 @@ impl Component for BashExecutionComponent {
         let status = *self.status.lock().unwrap();
         if status == BashStatus::Running {
             lines.extend(self.loader.render(width));
+            // Long-running hint: after a minute, tell the user how to abort so
+            // a command without a tool-level timeout (model didn't pass one)
+            // never looks stuck with no recourse.
+            if self.loader.elapsed() > LONG_RUNNING_HINT_AFTER {
+                let colors = theme().colors;
+                let hint = format!(
+                    "  {} Esc / Ctrl+C 中止",
+                    colors.muted.fg("⏸")
+                );
+                lines.push(truncate_to_width(&hint, width, "…"));
+            }
         } else {
             let sl = self.status_line(hidden);
             if !sl.is_empty() {
