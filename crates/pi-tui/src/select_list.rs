@@ -361,7 +361,7 @@ impl SelectList {
     }
 
     /// Truncate primary text.
-    fn truncate_primary(&self, item: &SelectItem, is_selected: bool, max_width: usize, column_width: usize) -> String {
+    fn truncate_primary(&self, item: &SelectItem, _is_selected: bool, max_width: usize, column_width: usize) -> String {
         let display = item.display_value();
         
         if let Some(ref truncate_fn) = self.layout.truncate_primary {

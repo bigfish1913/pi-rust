@@ -2,8 +2,6 @@
 //!
 //! Provides utilities for parsing terminal color schemes and OSC 11 responses.
 
-use std::str::FromStr;
-
 /// RGB color representation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RgbColor {

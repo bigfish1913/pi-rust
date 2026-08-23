@@ -2,7 +2,7 @@
 //!
 //! Provides support for displaying images in terminals using Kitty and iTerm2 protocols.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 /// Image protocol type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,7 +193,7 @@ pub fn encode_kitty(data: &[u8], options: &ImageRenderOptions) -> String {
         .collect();
 
     for (i, chunk) in chunks.iter().enumerate() {
-        let m = if i == chunks.len() - 1 { 0 } else { 1 };
+        let _m = if i == chunks.len() - 1 { 0 } else { 1 };
         parts.push(format!("\x1b_G{};{}\x1b\\", control, chunk));
         // After first chunk, don't repeat control
         if i == 0 {
@@ -408,7 +408,7 @@ pub fn render_image(data: &[u8], options: &ImageRenderOptions) -> String {
 }
 
 /// Image fallback for unsupported terminals.
-pub fn image_fallback(alt_text: &str, width: usize) -> String {
+pub fn image_fallback(_alt_text: &str, width: usize) -> String {
     let placeholder = "█".repeat(width.saturating_sub(2));
     format!("╭{}╮\n│{}│\n╰{}╯", 
         "─".repeat(width.saturating_sub(2)),

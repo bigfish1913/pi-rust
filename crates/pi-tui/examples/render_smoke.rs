@@ -4,7 +4,7 @@
 //!
 //! Run: cargo run -p rpi-tui --example render_smoke
 
-use rpi_tui::{render_diff, Markdown, ToolExecutionComponent};
+use rpi_tui::{render_diff, FooterComponent, Markdown, ToolExecutionComponent};
 use rpi_tui::component::Component;
 
 fn main() {
@@ -67,6 +67,27 @@ fn main() {
     println!();
     println!("╔══ ToolExecutionComponent (with diff) ═════════════════════════════╗");
     for line in comp.render(width) {
+        println!("{}", line);
+    }
+
+    // ---- ToolExecutionComponent in error state (red bg tint + ✗ glyph) ----
+    let err = ToolExecutionComponent::new("bash", "rm -rf /");
+    err.set_result("command not found: rm", true);
+    println!();
+    println!("╔══ ToolExecutionComponent (failed) ════════════════════════════════╗");
+    for line in err.render(width) {
+        println!("{}", line);
+    }
+
+    // ---- Footer: separator + [model] status row with right-aligned hints ----
+    let footer = FooterComponent::new();
+    footer.set_model("glm-5");
+    footer.set_status("Working…");
+    footer.set_thinking_level(Some("medium"));
+    footer.set_hints("Enter: Send | Shift+Enter: New line | Ctrl+C: Abort | Ctrl+M: Cycle | Ctrl+T: Expand");
+    println!();
+    println!("╔══ Footer (working + thinking) ════════════════════════════════════╗");
+    for line in footer.render(width) {
         println!("{}", line);
     }
 }

@@ -4,7 +4,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use super::fuzzy::fuzzy_match;
 use crate::utils::visible_width;
 
 /// Search state.
@@ -307,7 +306,7 @@ impl AltScreenSearch {
         let mut result = String::new();
         let mut last_end = 0;
         let mut in_ansi = false;
-        let mut ansi_start = 0;
+        let mut _ansi_start = 0;
         let mut chars = line.char_indices().peekable();
         let mut visible_idx = 0;
 
@@ -315,7 +314,7 @@ impl AltScreenSearch {
             // Track ANSI sequences
             if c == '\x1b' {
                 in_ansi = true;
-                ansi_start = byte_idx;
+                _ansi_start = byte_idx;
                 continue;
             }
 

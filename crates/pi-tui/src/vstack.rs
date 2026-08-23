@@ -265,6 +265,7 @@ impl VStack {
     }
 
     /// Calculate the intrinsic height of all children.
+    #[allow(dead_code)]
     fn intrinsic_height(&self, width: usize) -> usize {
         if let Ok(children) = self.children.lock() {
             let mut total = 0;

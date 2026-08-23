@@ -8,7 +8,8 @@ use std::any::Any;
 use std::sync::Mutex;
 
 use super::component::Component;
-use crate::ansi::{bold, dim, italic, underline, fg_256};
+use crate::ansi::{bold, italic, underline};
+use crate::theme::theme;
 use crate::utils::{truncate_to_width, visible_width, wrap_text_with_ansi};
 
 /// Markdown rendering options.
@@ -83,6 +84,7 @@ impl Markdown {
     /// Render markdown to lines.
     fn render_markdown(&self, width: usize) -> Vec<String> {
         let content = self.content.lock().map(|c| c.clone()).unwrap_or_default();
+        let colors = theme().colors;
         let mut lines: Vec<String> = Vec::new();
         let indent = " ".repeat(self.options.code_block_indent);
         let pad = self.pad();
@@ -107,19 +109,16 @@ impl Markdown {
             if let Some(lang) = fence {
                 in_code_block = !in_code_block;
                 if in_code_block {
-                    // Opening border with language label.
-                    let label = if lang.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" {lang}")
-                    };
+                    // Opening fence: keep pi's ```` ```lang ```` text visible so
+                    // the language is annotated, colored as the code-block border.
+                    let label = lang.clone();
                     lines.push(format!(
                         "{pad}{indent}{}",
-                        dim(&format!("┌─{label}"))
+                        colors.md_code_block_border.fg(&format!("```{}", label))
                     ));
                 } else {
-                    // Closing border.
-                    lines.push(format!("{pad}{indent}{}", dim("└─")));
+                    // Closing fence (matches the opening style).
+                    lines.push(format!("{pad}{indent}{}", colors.md_code_block_border.fg("```")));
                 }
                 i += 1;
                 continue;
@@ -127,10 +126,11 @@ impl Markdown {
 
             if in_code_block {
                 // Code body: no reflow; clip long lines ANSI-safely with a `…`.
-                let prefix = format!("{pad}{indent}│ ");
+                // Indent + a faint left rule, body in the code-block color.
+                let prefix = format!("{pad}{indent}{} ", colors.md_code_block_border.fg("│"));
                 let body_width = cwidth.saturating_sub(visible_width(&prefix));
                 let clipped = truncate_to_width(line, body_width.max(1), "…");
-                lines.push(format!("{prefix}{clipped}"));
+                lines.push(format!("{prefix}{}", colors.md_code_block.fg(&clipped)));
                 i += 1;
                 continue;
             }
@@ -153,42 +153,54 @@ impl Markdown {
             }
 
             // ---- Headers ----
+            // pi colors the whole heading (prefix + text) with mdHeading and
+            // bolds it; h1/h2 are additionally underlined.
             if let Some(rest) = strip_header(line, "######") {
-                push_wrapped(&pad, &bold(&format!("###### {rest}")), cwidth, &mut lines);
+                let h = bold(&colors.md_heading.fg(&format!("###### {rest}")));
+                push_wrapped(&pad, &h, cwidth, &mut lines);
             } else if let Some(rest) = strip_header(line, "#####") {
-                push_wrapped(&pad, &bold(&format!("##### {rest}")), cwidth, &mut lines);
+                let h = bold(&colors.md_heading.fg(&format!("##### {rest}")));
+                push_wrapped(&pad, &h, cwidth, &mut lines);
             } else if let Some(rest) = strip_header(line, "####") {
-                push_wrapped(&pad, &bold(&format!("#### {rest}")), cwidth, &mut lines);
+                let h = bold(&colors.md_heading.fg(&format!("#### {rest}")));
+                push_wrapped(&pad, &h, cwidth, &mut lines);
             } else if let Some(rest) = strip_header(line, "###") {
-                push_wrapped(&pad, &bold(&self.render_inline(rest)), cwidth, &mut lines);
+                let h = bold(&colors.md_heading.fg(&self.render_inline(rest)));
+                push_wrapped(&pad, &h, cwidth, &mut lines);
             } else if let Some(rest) = strip_header(line, "##") {
-                let h = bold(&underline(&self.render_inline(rest)));
-                let rendered = format!("{}{}", bold(&dim("## ")), h);
-                push_wrapped(&pad, &rendered, cwidth, &mut lines);
+                let inner = bold(&underline(&self.render_inline(rest)));
+                let h = colors.md_heading.fg(&format!("{}{}", bold("## "), inner));
+                push_wrapped(&pad, &h, cwidth, &mut lines);
             } else if let Some(rest) = strip_header(line, "#") {
-                let h = bold(&underline(&bold(&self.render_inline(rest))));
-                let rendered = format!("{}{}", bold(&dim("# ")), h);
-                push_wrapped(&pad, &rendered, cwidth, &mut lines);
+                let inner = bold(&underline(&bold(&self.render_inline(rest))));
+                let h = colors.md_heading.fg(&format!("{}{}", bold("# "), inner));
+                push_wrapped(&pad, &h, cwidth, &mut lines);
             } else if is_task_list_item(line) {
                 let (marker, body) = task_list_item(line).unwrap();
-                let rendered = format!("{pad}  {marker} {}", self.render_inline(body));
+                let bullet = colors.md_list_bullet.fg(&format!("{marker}"));
+                let rendered = format!("{pad}  {bullet} {}", self.render_inline(body));
                 push_wrapped(&pad, &rendered, cwidth, &mut lines);
             } else if line.starts_with("- ") || line.starts_with("* ") {
-                // Unordered list
-                let rendered = format!("{pad}  • {}", self.render_inline(line[2..].trim()));
+                // Unordered list — accent-colored bullet.
+                let bullet = colors.md_list_bullet.fg("•");
+                let rendered = format!("{pad}  {bullet} {}", self.render_inline(line[2..].trim()));
                 push_wrapped(&pad, &rendered, cwidth, &mut lines);
             } else if line.starts_with(|c: char| c.is_ascii_digit()) && line.contains(". ") {
-                // Ordered list
-                let rendered = format!("{pad}  {}", line);
+                // Ordered list — accent-colored marker.
+                let (num, rest) = split_ordered(line);
+                let marker = colors.md_list_bullet.fg(&num);
+                let rendered = format!("{pad}  {marker}{}", self.render_inline(rest));
                 push_wrapped(&pad, &rendered, cwidth, &mut lines);
             } else if line.starts_with("> ") {
-                // Blockquote
-                let rendered = format!("{}  {} {}", pad, dim("│"), italic(&self.render_inline(&line[2..])));
+                // Blockquote — gray border + italic muted body (pi quote style).
+                let border = colors.md_quote_border.fg("│");
+                let body = colors.md_quote.fg(&italic(&self.render_inline(&line[2..])));
+                let rendered = format!("{pad}  {border} {body}");
                 push_wrapped(&pad, &rendered, cwidth, &mut lines);
             } else if line.trim().starts_with("---") || line.trim().starts_with("***") {
-                // Horizontal rule (capped like the TS reference).
+                // Horizontal rule (capped like the TS reference), mdHr colored.
                 let rule_w = width.min(80).saturating_sub(self.padding_x * 2);
-                lines.push(format!("{pad}{}", dim(&"─".repeat(rule_w.max(1)))));
+                lines.push(format!("{pad}{}", colors.md_hr.fg(&"─".repeat(rule_w.max(1)))));
             } else if line.trim().is_empty() {
                 // Empty line — emit a (padded) blank so spacing is preserved.
                 lines.push(String::new());
@@ -214,6 +226,7 @@ impl Markdown {
 
     /// Render inline markdown (bold, italic, code, links).
     fn render_inline(&self, text: &str) -> String {
+        let colors = theme().colors;
         let mut result = String::new();
         let mut chars = text.chars().peekable();
 
@@ -242,17 +255,33 @@ impl Markdown {
             } else if c == '`' {
                 // Inline code
                 let code_text = self.consume_until(&mut chars, "`");
-                result.push_str(&fg_256(14, &code_text)); // Cyan
+                result.push_str(&colors.md_code.fg(&code_text));
             } else if c == '[' {
                 // Link
                 let link_text = self.consume_until(&mut chars, "]");
                 if chars.next() == Some('(') {
-                    let _url = self.consume_until(&mut chars, ")");
-                    result.push_str(&underline(&link_text));
+                    let url = self.consume_until(&mut chars, ")");
+                    // pi renders the link text underlined + md_link colored; the
+                    // URL is shown inline (dimmed) only when it differs from
+                    // the visible text.
+                    let styled = colors.md_link.fg(&underline(&link_text));
+                    if link_text == url {
+                        result.push_str(&styled);
+                    } else {
+                        result.push_str(&styled);
+                        result.push_str(&colors.md_link_url.fg(&format!(" ({})", url)));
+                    }
                 } else {
                     result.push('[');
                     result.push_str(&link_text);
                 }
+            } else if c == '~' && chars.peek() == Some(&'~') {
+                // Strikethrough (~~text~~) — pi's StrictStrikethrough.
+                chars.next(); // consume second ~
+                let del_text = self.consume_until(&mut chars, "~~");
+                result.push_str(&"\x1b[9m"); // strikethrough on
+                result.push_str(&del_text);
+                result.push_str(&"\x1b[29m"); // strikethrough off
             } else {
                 result.push(c);
             }
@@ -314,6 +343,24 @@ fn fence_info(line: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Split an ordered-list line into its marker (`"1. "` / `"12) "`) and body.
+/// `line` must already match the ordered-list shape checked by the caller.
+fn split_ordered(line: &str) -> (String, &str) {
+    let mut idx = 0;
+    let bytes = line.as_bytes();
+    while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+        idx += 1;
+    }
+    // Include the following `.`/`)` and one space in the marker.
+    if idx < bytes.len() && (bytes[idx] == b'.' || bytes[idx] == b')') {
+        idx += 1;
+    }
+    if idx < bytes.len() && bytes[idx] == b' ' {
+        idx += 1;
+    }
+    (line[..idx].to_string(), &line[idx..])
 }
 
 /// Strip a leading `prefix` of `#`s followed by a space from `line`.
@@ -546,9 +593,12 @@ mod tests {
     fn test_markdown_code_block_has_closing_border() {
         let md = Markdown::new("```rust\nlet x = 1;\n```", 0, 0);
         let joined = md.render(80).join("\n");
-        assert!(joined.contains('┌'), "missing opening border");
-        assert!(joined.contains('└'), "missing closing border");
-        assert!(joined.contains("rust"), "missing language label");
+        // The opening fence keeps its ```` ```rust ```` text (pi style) and the
+        // closing fence is a bare ```` ``` ````.
+        assert!(joined.contains("```rust"), "missing opening fence label");
+        assert!(joined.contains("let x = 1;"), "missing code body");
+        // Two fences total (open + close).
+        assert_eq!(joined.matches("```").count(), 2, "expected open+close fences");
     }
 
     #[test]

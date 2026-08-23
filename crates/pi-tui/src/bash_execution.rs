@@ -11,7 +11,8 @@ use std::any::Any;
 use std::sync::Mutex;
 
 use super::component::Component;
-use crate::ansi::{strip_ansi, visible_width};
+use crate::ansi::strip_ansi;
+use crate::ansi::bold;
 use crate::dynamic_border::DynamicBorder;
 use crate::loader::Loader;
 use crate::spacer::Spacer;
@@ -181,7 +182,7 @@ impl Component for BashExecutionComponent {
 
         // Command header: "$ {command}" in accent.
         let header_text = format!("$ {}", self.command);
-        let header_line = format!("  {}", colors.accent.fg(&header_text));
+        let header_line = format!("  {}", colors.bash_mode.fg(&bold(&header_text)));
         lines.push(truncate_to_width(&header_line, width, "…"));
 
         // Output preview (collapsed: last PREVIEW_LINES visual lines;

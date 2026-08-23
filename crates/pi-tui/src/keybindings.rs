@@ -3,8 +3,7 @@
 //! Provides configurable keyboard shortcuts for TUI actions.
 //! This is a 1:1 port of the TypeScript keybindings.ts
 
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
 
 use crossterm::event::{KeyCode, KeyModifiers};
 

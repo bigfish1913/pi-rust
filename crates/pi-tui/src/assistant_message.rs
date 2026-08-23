@@ -181,17 +181,17 @@ impl AssistantMessageComponent {
                     if opts.hide_thinking {
                         // One static dim label per thinking run (TS path).
                         self.content_container.add_child(Arc::new(Text::new(
-                            italic(&theme().colors.muted.fg(&opts.hidden_thinking_label)),
+                            italic(&theme().colors.thinking_text.fg(&opts.hidden_thinking_label)),
                             opts.output_pad,
                             0,
                         )));
                     } else {
                         // Render the joined thinking as one dim italic markdown
                         // section — the TS `color: thinkingText, italic: true`
-                        // styling, approximated via a muted-foreground italic
+                        // styling, applied via the thinking-text color + italic
                         // wrapper around the markdown lines.
                         let body = joined.join("\n\n");
-                        let wrapped = italic(&theme().colors.muted.fg(&body));
+                        let wrapped = italic(&theme().colors.thinking_text.fg(&body));
                         let md = Arc::new(Markdown::new(wrapped, opts.output_pad, 0));
                         self.content_container.add_child(md);
                     }

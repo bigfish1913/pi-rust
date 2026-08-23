@@ -2,15 +2,25 @@
 //!
 //! Based on TypeScript implementation:
 //! packages/coding-agent/src/modes/interactive/components/footer.ts
+//!
+//! The TS footer is a two-line status bar: a dim `pwd (branch)` line then a
+//! stats line with the model right-aligned. Our Rust host carries less session
+//! state (no pwd/token/cost aggregation here), so this is a **styled
+//! single-row** version: a thin theme-colored separator border, then
+//! `[model]` in accent brackets, a status word colored by run state, and the
+//! keybinding hints dimmed on the right. The model is right-aligned to mirror
+//! pi's layout; an optional thinking-level suffix (pi shows
+//! `model • thinking off`) follows the model when set.
 
 use std::any::Any;
 use std::sync::Mutex;
 
 use super::component::Component;
+use crate::theme::theme;
 use crate::utils::{truncate_to_width, visible_width};
 
 /// Footer component that displays status information.
-/// 
+///
 /// Mirrors TypeScript FooterComponent class (simplified version).
 pub struct FooterComponent {
     /// Current status text
@@ -19,6 +29,9 @@ pub struct FooterComponent {
     model: Mutex<String>,
     /// Keybinding hints
     hints: Mutex<String>,
+    /// Optional thinking-level suffix shown after the model (pi parity:
+    /// `model • thinking off` / `model • medium`). `None` → not shown.
+    thinking_level: Mutex<Option<String>>,
 }
 
 impl FooterComponent {
@@ -28,6 +41,7 @@ impl FooterComponent {
             status: Mutex::new(String::new()),
             model: Mutex::new("claude-sonnet-5".to_string()),
             hints: Mutex::new("Ctrl+C: Exit | Enter: Send | Shift+Enter: New line".to_string()),
+            thinking_level: Mutex::new(None),
         }
     }
 
@@ -52,6 +66,21 @@ impl FooterComponent {
         }
     }
 
+    /// Set the thinking-level suffix shown after the model name (pi parity).
+    /// Pass `None` (or [`Self::clear_thinking_level`]) to hide it.
+    pub fn set_thinking_level(&self, level: Option<&str>) {
+        if let Ok(mut t) = self.thinking_level.lock() {
+            *t = level.map(|s| s.to_string());
+        }
+    }
+
+    /// Clear the thinking-level suffix.
+    pub fn clear_thinking_level(&self) {
+        if let Ok(mut t) = self.thinking_level.lock() {
+            *t = None;
+        }
+    }
+
     /// Get the status text.
     pub fn get_status(&self) -> String {
         self.status.lock().unwrap().clone()
@@ -71,34 +100,70 @@ impl Default for FooterComponent {
 
 impl Component for FooterComponent {
     fn render(&self, width: usize) -> Vec<String> {
+        let colors = theme().colors;
         let status = self.status.lock().unwrap();
         let model = self.model.lock().unwrap();
         let hints = self.hints.lock().unwrap();
+        let thinking_level = self.thinking_level.lock().unwrap();
 
-        // Build footer line
-        let mut line = String::new();
-        
-        // Add model name if present
-        if !model.is_empty() {
-            line.push_str(&format!("[{}] ", model));
-        }
-        
-        // Add status if present
-        if !status.is_empty() {
-            line.push_str(&format!("{} | ", status));
-        }
-        
-        // Add hints
-        line.push_str(&hints);
+        // Line 1 — a thin themed separator border (visual separation from the
+        // editor/input area above, matching pi's footer weight).
+        let sep = colors.border_muted.fg(&"─".repeat(width.max(1)));
 
-        // Truncate to width — ANSI-safe and multibyte-safe. The previous
-        // `line[..width]` byte-slice panicked on CJK/emoji and leaked ANSI
-        // mid-sequence (same bug class as the markdown fix in 600b595).
-        if visible_width(&line) > width {
-            line = truncate_to_width(&line, width, "…");
-        }
+        // Line 2 — the status row. Left side: `[model]` in accent brackets
+        // (dim model name inside) + a status word colored by run state.
+        // Right side: the keybinding hints, dimmed. Right-aligned to mirror
+        // pi's model-on-the-right layout.
+        let model_label = if !model.is_empty() {
+            // pi renders the model dim; the brackets are the accent cue.
+            let inner = if let Some(ref lvl) = *thinking_level {
+                format!("{} • {}", model, lvl)
+            } else {
+                model.clone()
+            };
+            format!("{}{} {}", colors.accent.fg("["), colors.dim.fg(&inner), colors.accent.fg("]"))
+        } else {
+            String::new()
+        };
 
-        vec![line]
+        // Status word colored by content: working/aborting → accent, error →
+        // error, idle/blank → muted. Anything else stays as-is.
+        let status_word = if status.is_empty() {
+            String::new()
+        } else {
+            let lower = status.to_ascii_lowercase();
+            let color = if lower.contains("abort") {
+                colors.error
+            } else if lower.contains("work") || lower.contains("running") {
+                colors.accent
+            } else {
+                colors.muted
+            };
+            format!(" {}", color.fg(&status))
+        };
+
+        let left = format!("{}{}", model_label, status_word);
+        let right = colors.dim.fg(&hints);
+
+        let left_w = visible_width(&left);
+        let right_w = visible_width(&right);
+
+        let row = if left_w + right_w + 2 <= width {
+            // Both fit — pad to right-align the hints.
+            let pad = " ".repeat(width.saturating_sub(left_w + right_w));
+            format!("{}{}{}", left, pad, right)
+        } else {
+            // Too tight — drop the right-aligned hints, show left side,
+            // truncate if needed.
+            let combined = format!("{}", left);
+            if visible_width(&combined) > width {
+                truncate_to_width(&combined, width, "…")
+            } else {
+                combined
+            }
+        };
+
+        vec![sep, row]
     }
 
     fn invalidate(&self) {
@@ -113,24 +178,27 @@ impl Component for FooterComponent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ansi::strip_ansi;
 
     #[test]
     fn test_footer_basic() {
         let footer = FooterComponent::new();
         let lines = footer.render(80);
-        assert_eq!(lines.len(), 1);
-        assert!(lines[0].contains("Ctrl+C"));
+        // Separator + status row.
+        assert_eq!(lines.len(), 2);
+        assert!(strip_ansi(&lines[1]).contains("Ctrl+C"));
     }
 
     #[test]
     fn test_footer_with_status() {
         let footer = FooterComponent::new();
-        footer.set_status("Working...");
+        footer.set_status("Working…");
         footer.set_model("claude-sonnet-5");
-        
+
         let lines = footer.render(80);
-        assert!(lines[0].contains("Working..."));
-        assert!(lines[0].contains("claude-sonnet-5"));
+        let row = strip_ansi(&lines[1]);
+        assert!(row.contains("Working…"));
+        assert!(row.contains("claude-sonnet-5"));
     }
 
     #[test]
@@ -139,8 +207,19 @@ mod tests {
         footer.set_status("This is a very long status message that should be truncated");
         footer.set_model("claude-opus-4");
         footer.set_hints("Ctrl+C: Exit | Shift+Enter: Send | Ctrl+L: Clear | More hints here");
-        
+
         let lines = footer.render(40);
-        assert!(visible_width(&lines[0]) <= 40);
+        // The status row (index 1) must respect the width budget; the
+        // separator (index 0) is exactly width — both <= 40.
+        assert!(visible_width(&lines[1]) <= 40, "row too wide: {}", visible_width(&lines[1]));
+    }
+
+    #[test]
+    fn test_footer_thinking_level_suffix() {
+        let footer = FooterComponent::new();
+        footer.set_model("test-model");
+        footer.set_thinking_level(Some("medium"));
+        let row = strip_ansi(&footer.render(80)[1]);
+        assert!(row.contains("test-model • medium"), "suffix missing: {row}");
     }
 }

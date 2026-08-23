@@ -44,6 +44,7 @@ pub struct Input {
     state: Mutex<InputState>,
     prompt: String,
     placeholder: Option<String>,
+    #[allow(dead_code)]
     keybindings: Arc<Keybindings>,
     kill_ring: Mutex<KillRing>,
     undo_stack: Mutex<UndoStack<InputState>>,
@@ -131,6 +132,7 @@ impl Input {
     }
 
     /// Handle bracketed paste.
+    #[allow(dead_code)]
     fn handle_paste(&self, pasted_text: &str) {
         self.set_last_action(LastAction::None);
         self.push_undo();
@@ -333,6 +335,7 @@ impl Input {
     }
 
     /// Yank pop (cycle through kill ring).
+    #[allow(dead_code)]
     fn yank_pop(&self) {
         if self.get_last_action() != LastAction::Yank {
             return;

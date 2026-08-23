@@ -335,6 +335,7 @@ fn layout_scroll_view(
 }
 
 /// Translate a box and its children by a delta.
+#[allow(dead_code)]
 fn translate_box(lbox: &mut LayoutBox, delta_y: i32) {
     if delta_y >= 0 {
         lbox.rect.y += delta_y as usize;
@@ -347,6 +348,7 @@ fn translate_box(lbox: &mut LayoutBox, delta_y: i32) {
 }
 
 /// Update clips for a box and its children.
+#[allow(dead_code)]
 fn update_clips(lbox: &mut LayoutBox, parent_clip: LayoutRect) {
     lbox.clip = parent_clip.intersect(&lbox.rect);
     let child_clip = lbox.clip;

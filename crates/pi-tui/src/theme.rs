@@ -5,13 +5,22 @@
 use std::sync::Mutex;
 
 /// Theme colors.
+///
+/// Mirrors the pi `ThemeJson.colors` tokens (see
+/// `.reference/pi/.../theme/dark.json`). The semantic core (`muted`, `accent`,
+/// `error`, `success`, `warning`, `border`, `surface`) drives most components;
+/// the `md_*` / `tool_*` / `thinking_*` fields correspond 1:1 to the pi md* /
+/// toolDiff* / thinking-level tokens and let the markdown renderer and tool
+/// blocks match pi's palette instead of hardcoded `Ansi256`/`fg_256` literals.
 #[derive(Debug, Clone)]
 pub struct ThemeColors {
     /// Primary text color.
     pub text: Color,
-    /// Muted/dimmed text color.
+    /// Muted/dimmed text color (pi `muted`).
     pub muted: Color,
-    /// Accent/highlight color.
+    /// Dimmer-than-muted color (pi `dim`).
+    pub dim: Color,
+    /// Accent/highlight color (pi `accent`, e.g. teal-ish).
     pub accent: Color,
     /// Error color.
     pub error: Color,
@@ -23,31 +32,116 @@ pub struct ThemeColors {
     pub info: Color,
     /// Background color.
     pub background: Color,
-    /// Primary surface color.
+    /// Primary surface color (pi `userMessageBg`).
     pub surface: Color,
-    /// Border color.
+    /// Border color (pi `border`).
     pub border: Color,
+    /// Accent border color (pi `borderAccent`).
+    pub border_accent: Color,
+    /// Muted border color (pi `borderMuted`).
+    pub border_muted: Color,
     /// Selection background color.
     pub selection: Color,
     /// Cursor color.
     pub cursor: Color,
+    /// Text color for thinking/reasoning blocks (pi `thinkingText`).
+    pub thinking_text: Color,
+
+    // -- Markdown syntax tokens (pi md*) --
+    /// Heading color (pi `mdHeading`, gold on dark).
+    pub md_heading: Color,
+    /// Inline link color (pi `mdLink`).
+    pub md_link: Color,
+    /// Link URL color (pi `mdLinkUrl`).
+    pub md_link_url: Color,
+    /// Inline `code` color (pi `mdCode`).
+    pub md_code: Color,
+    /// Code-block body color (pi `mdCodeBlock`).
+    pub md_code_block: Color,
+    /// Code-block fence/border color (pi `mdCodeBlockBorder`).
+    pub md_code_block_border: Color,
+    /// Blockquote body color (pi `mdQuote`).
+    pub md_quote: Color,
+    /// Blockquote border color (pi `mdQuoteBorder`).
+    pub md_quote_border: Color,
+    /// Horizontal rule color (pi `mdHr`).
+    pub md_hr: Color,
+    /// List bullet color (pi `mdListBullet`).
+    pub md_list_bullet: Color,
+
+    // -- Tool execution backgrounds (pi tool*Bg / toolTitle / toolOutput) --
+    /// Pending-tool background.
+    pub tool_pending_bg: Color,
+    /// Successful-tool background.
+    pub tool_success_bg: Color,
+    /// Failed-tool background.
+    pub tool_error_bg: Color,
+    /// Tool title text color.
+    pub tool_title: Color,
+    /// Tool output text color.
+    pub tool_output: Color,
+    /// Bash mode accent color (pi `bashMode`).
+    pub bash_mode: Color,
+
+    // -- Tool diffs (pi toolDiff*) --
+    /// Added-line color.
+    pub tool_diff_added: Color,
+    /// Removed-line color.
+    pub tool_diff_removed: Color,
+    /// Context-line color.
+    pub tool_diff_context: Color,
 }
 
 impl Default for ThemeColors {
     fn default() -> Self {
+        // Defaults mirror the pi `dark.json` palette (`accent` teal, the
+        // `#f0c674` gold heading, `#b5bd68` green code blocks, and the
+        // `#282832`/`#283228`/`#3c2828` tool backgrounds). Exact pi hexes are
+        // approximated by their nearest ANSI-256 index so 8/256-color
+        // terminals reproduce the same relationships; truecolor rendering is
+        // handled per-`Color` variant at emit time.
         Self {
             text: Color::Default,
-            muted: Color::Ansi256(240),
-            accent: Color::Ansi256(39),  // Bright blue
-            error: Color::Ansi256(196),  // Red
-            success: Color::Ansi256(46), // Green
-            warning: Color::Ansi256(226), // Yellow
-            info: Color::Ansi256(81),    // Cyan
+            muted: Color::Ansi256(244),    // gray (#808080-ish)
+            dim: Color::Ansi256(242),      // dimGray (#666666-ish)
+            accent: Color::Ansi256(108),   // accent teal (#8abeb7) ≈ 108
+            error: Color::Ansi256(131),    // red (#cc6666) ≈ 131
+            success: Color::Ansi256(107),  // green (#b5bd68) ≈ 107
+            warning: Color::Ansi256(226),  // yellow
+            info: Color::Ansi256(81),      // cyan
             background: Color::Default,
-            surface: Color::Ansi256(235),
-            border: Color::Ansi256(238),
-            selection: Color::Ansi256(24),
+            surface: Color::Ansi256(236),  // userMessageBg (#343541) ≈ 236
+            border: Color::Ansi256(67),    // border blue (#5f87ff) ≈ 67
+            border_accent: Color::Ansi256(45),   // borderAccent cyan (#00d7ff) ≈ 45
+            border_muted: Color::Ansi256(239),   // borderMuted darkGray (#505050) ≈ 239
+            selection: Color::Ansi256(60), // selectedBg (#3a3a4a) ≈ 60
             cursor: Color::Ansi256(81),
+            thinking_text: Color::Ansi256(244),  // thinkingText gray
+
+            // Markdown
+            md_heading: Color::Ansi256(179),     // gold (#f0c674) ≈ 179
+            md_link: Color::Ansi256(110),        // blue (#81a2be) ≈ 110
+            md_link_url: Color::Ansi256(242),    // dimGray
+            md_code: Color::Ansi256(108),        // accent teal
+            md_code_block: Color::Ansi256(107),  // green (#b5bd68) ≈ 107
+            md_code_block_border: Color::Ansi256(244), // gray
+            md_quote: Color::Ansi256(244),       // gray
+            md_quote_border: Color::Ansi256(244),
+            md_hr: Color::Ansi256(244),
+            md_list_bullet: Color::Ansi256(108), // accent
+
+            // Tool blocks
+            tool_pending_bg: Color::Ansi256(235),  // (#282832) ≈ 235
+            tool_success_bg: Color::Ansi256(22),   // dark-green (#283228) ≈ 22
+            tool_error_bg: Color::Ansi256(52),     // dark-red (#3c2828) ≈ 52
+            tool_title: Color::Default,
+            tool_output: Color::Ansi256(244),
+            bash_mode: Color::Ansi256(107),        // green
+
+            // Tool diffs
+            tool_diff_added: Color::Ansi256(107),   // green
+            tool_diff_removed: Color::Ansi256(131), // red
+            tool_diff_context: Color::Ansi256(244), // gray
         }
     }
 }
@@ -224,40 +318,89 @@ impl ThemeManager {
     pub fn apply_preset(&self, preset: ThemePreset) {
         let theme = match preset {
             ThemePreset::Dark => Theme::default(),
-            ThemePreset::Light => Theme {
-                colors: ThemeColors {
-                    text: Color::Default,
-                    muted: Color::Ansi256(244),
-                    accent: Color::Ansi256(27),
-                    error: Color::Ansi256(124),
-                    success: Color::Ansi256(34),
-                    warning: Color::Ansi256(178),
-                    info: Color::Ansi256(31),
-                    background: Color::Default,
-                    surface: Color::Ansi256(254),
-                    border: Color::Ansi256(249),
-                    selection: Color::Ansi256(153),
-                    cursor: Color::Ansi256(31),
-                },
-                ..Default::default()
-            },
-            ThemePreset::Monochrome => Theme {
-                colors: ThemeColors {
-                    text: Color::Default,
-                    muted: Color::Ansi256(244),
-                    accent: Color::Ansi256(15),
-                    error: Color::Ansi256(9),
-                    success: Color::Ansi256(15),
-                    warning: Color::Ansi256(15),
-                    info: Color::Ansi256(15),
-                    background: Color::Default,
-                    surface: Color::Ansi256(236),
-                    border: Color::Ansi256(244),
-                    selection: Color::Ansi256(244),
-                    cursor: Color::Ansi256(15),
-                },
-                ..Default::default()
-            },
+            ThemePreset::Light => {
+                let mut colors = ThemeColors::default();
+                colors.text = Color::Default;
+                colors.muted = Color::Ansi256(241); // mediumGray (#6c6c6c)
+                colors.dim = Color::Ansi256(243);   // dimGray (#767676)
+                colors.accent = Color::Ansi256(66); // teal (#5a8080)
+                colors.error = Color::Ansi256(131); // red (#aa5555)
+                colors.success = Color::Ansi256(65); // green (#588458)
+                colors.warning = Color::Ansi256(136); // yellow (#9a7326)
+                colors.info = Color::Ansi256(67);   // blue
+                colors.background = Color::Default;
+                colors.surface = Color::Ansi256(254); // userMsgBg (#e8e8e8)
+                colors.border = Color::Ansi256(67);  // blue (#547da7)
+                colors.border_accent = Color::Ansi256(66); // teal
+                colors.border_muted = Color::Ansi256(249); // lightGray (#b0b0b0)
+                colors.selection = Color::Ansi256(189);    // selectedBg (#d0d0e0)
+                colors.cursor = Color::Ansi256(67);
+                colors.thinking_text = Color::Ansi256(241);
+                colors.md_heading = Color::Ansi256(136); // yellow
+                colors.md_link = Color::Ansi256(67);     // blue
+                colors.md_link_url = Color::Ansi256(243);
+                colors.md_code = Color::Ansi256(66);     // teal
+                colors.md_code_block = Color::Ansi256(65); // green
+                colors.md_code_block_border = Color::Ansi256(241);
+                colors.md_quote = Color::Ansi256(241);
+                colors.md_quote_border = Color::Ansi256(241);
+                colors.md_hr = Color::Ansi256(241);
+                colors.md_list_bullet = Color::Ansi256(65); // green
+                colors.tool_pending_bg = Color::Ansi256(189);
+                colors.tool_success_bg = Color::Ansi256(151);
+                colors.tool_error_bg = Color::Ansi256(181);
+                colors.tool_title = Color::Default;
+                colors.tool_output = Color::Ansi256(241);
+                colors.bash_mode = Color::Ansi256(65);
+                colors.tool_diff_added = Color::Ansi256(65);
+                colors.tool_diff_removed = Color::Ansi256(131);
+                colors.tool_diff_context = Color::Ansi256(241);
+                Theme {
+                    colors,
+                    ..Default::default()
+                }
+            }
+            ThemePreset::Monochrome => {
+                let mut colors = ThemeColors::default();
+                for f in [
+                    &mut colors.accent,
+                    &mut colors.border_accent,
+                    &mut colors.md_code,
+                    &mut colors.md_list_bullet,
+                    &mut colors.bash_mode,
+                ] {
+                    *f = Color::Ansi256(15);
+                }
+                colors.muted = Color::Ansi256(244);
+                colors.dim = Color::Ansi256(242);
+                colors.error = Color::Ansi256(9);
+                colors.success = Color::Ansi256(15);
+                colors.warning = Color::Ansi256(15);
+                colors.info = Color::Ansi256(15);
+                colors.surface = Color::Ansi256(236);
+                colors.border = Color::Ansi256(244);
+                colors.border_muted = Color::Ansi256(240);
+                colors.selection = Color::Ansi256(244);
+                colors.cursor = Color::Ansi256(15);
+                colors.thinking_text = Color::Ansi256(244);
+                colors.md_heading = Color::Ansi256(15);
+                colors.md_link = Color::Ansi256(15);
+                colors.md_link_url = Color::Ansi256(242);
+                colors.md_code_block = Color::Ansi256(15);
+                colors.md_code_block_border = Color::Ansi256(244);
+                colors.md_quote = Color::Ansi256(244);
+                colors.md_quote_border = Color::Ansi256(244);
+                colors.md_hr = Color::Ansi256(244);
+                colors.tool_title = Color::Default;
+                colors.tool_output = Color::Ansi256(244);
+                colors.tool_diff_added = Color::Ansi256(15);
+                colors.tool_diff_removed = Color::Ansi256(9);
+                colors.tool_diff_context = Color::Ansi256(244);
+                Theme {
+                    colors,
+                    ..Default::default()
+                }
+            }
         };
         self.set(theme);
     }
@@ -308,6 +451,6 @@ mod tests {
         let manager = ThemeManager::new();
         manager.apply_preset(ThemePreset::Dark);
         let theme = manager.get();
-        assert!(matches!(theme.colors.accent, Color::Ansi256(39)));
+        assert!(matches!(theme.colors.accent, Color::Ansi256(108)));
     }
 }

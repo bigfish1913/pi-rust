@@ -185,7 +185,7 @@ impl Image {
                 ((w as f32 / cell_dims.width as f32).ceil() as u16).min(width as u16)
             });
             let cell_height = self.options.height.unwrap_or_else(|| {
-                ((h as f32 / cell_dims.height as f32).ceil() as u16)
+                (h as f32 / cell_dims.height as f32).ceil() as u16
             });
             (cell_width, cell_height)
         } else {

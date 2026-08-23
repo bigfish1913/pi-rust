@@ -28,9 +28,9 @@ use crate::utils::{truncate_to_width, visible_width};
 /// `…` rather than wrapped (a wrapped diff is unreadable).
 pub fn render_diff(diff_text: &str, width: usize) -> Vec<String> {
     let colors = &theme().colors;
-    let removed_color = colors.error; // red
-    let added_color = colors.success; // green
-    let context_color = colors.muted; // dim
+    let removed_color = colors.tool_diff_removed; // red
+    let added_color = colors.tool_diff_added; // green
+    let context_color = colors.tool_diff_context; // dim
 
     let lines: Vec<&str> = diff_text.split('\n').collect();
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
@@ -259,8 +259,8 @@ mod tests {
         let diff = " 5 context line";
         let lines = render_diff(diff, 80);
         assert_eq!(lines.len(), 1);
-        // Muted color (Ansi256(240)) applied.
-        assert!(lines[0].contains("\x1b[38;5;240m"), "context not dimmed");
+        // Muted context color (Ansi256(244) by default — tool_diff_context).
+        assert!(lines[0].contains("\x1b[38;5;244m"), "context not dimmed");
     }
 
     #[test]

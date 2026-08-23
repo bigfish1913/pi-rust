@@ -195,6 +195,7 @@ const MOD_CTRL: u8 = 1;
 const MOD_SHIFT: u8 = 2;
 const MOD_ALT: u8 = 4;
 const MOD_SUPER: u8 = 8;
+#[allow(dead_code)]
 const LOCK_MASK: u8 = 64 + 128; // Caps Lock + Num Lock
 
 /// Parse a key event from terminal input data.

@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex};
 
 use super::component::Component;
 use super::container::Container;
-use super::editor::Editor;
 use super::layout::{extract_cursor_position, render_layout_frame, LayoutFrame};
 use super::scroll_view::ScrollView;
 use super::tui::{OverlayHandle, OverlayOptions, TuiMode, TuiStopOptions, TUI};
@@ -33,7 +32,9 @@ pub struct TuiAltScreen {
     stick_to_bottom: Mutex<bool>,
     current_frame: Mutex<Option<LayoutFrame>>,
     // Input handlers
+    #[allow(dead_code)]
     input_handler: Mutex<Option<Arc<dyn Fn(InputEvent) + Send + Sync>>>,
+    #[allow(dead_code)]
     resize_handler: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 

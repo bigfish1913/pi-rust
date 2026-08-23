@@ -1787,9 +1787,14 @@ fn open_thinking_selector(
             return;
         };
         let lane = lane_sel.clone();
+        let footer_sel = state_sel.footer.clone();
         tokio::spawn(async move {
             let _ = lane.set_thinking_level(level).await;
         });
+        // Reflect the chosen level in the footer's model suffix (pi parity:
+        // `model • thinking off` / `model • medium`). The shown text for the
+        // Off level is "off", matching the TS `thinkingLevel === "off"` branch.
+        footer_sel.set_thinking_level(Some(thinking_level_name(level)));
         add_note_message(&chat_sel, &format!("Thinking set to {}.", item.label));
         close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
     }));

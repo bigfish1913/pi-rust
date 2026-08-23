@@ -6,7 +6,6 @@
 use std::sync::Arc;
 
 use super::component::Component;
-use super::scroll_view::ScrollView;
 use super::vstack::StackAlign;
 
 /// A viewport for layout calculations.

@@ -52,6 +52,7 @@ struct EditorState {
     /// Selection anchor (row, col) if any.
     selection_anchor: Option<(usize, usize)>,
     /// Scroll offset for multi-line.
+    #[allow(dead_code)]
     scroll_offset: usize,
     /// Whether the editor is focused.
     focused: bool,
@@ -101,7 +102,9 @@ fn snap_boundary(s: &str, idx: usize) -> usize {
 pub struct Editor {
     state: Mutex<EditorState>,
     options: EditorOptions,
+    #[allow(dead_code)]
     style: EditorStyle,
+    #[allow(dead_code)]
     keybindings: Arc<Keybindings>,
     on_submit: Mutex<Option<Arc<dyn Fn(&str) + Send + Sync>>>,
     on_change: Mutex<Option<Arc<dyn Fn(&str) + Send + Sync>>>,

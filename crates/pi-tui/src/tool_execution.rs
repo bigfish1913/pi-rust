@@ -7,8 +7,9 @@ use std::any::Any;
 use std::sync::Mutex;
 
 use super::component::Component;
-use crate::ansi::strip_ansi;
-use crate::utils::truncate_to_width;
+use crate::ansi::{bold, strip_ansi};
+use crate::theme::theme;
+use crate::utils::{apply_background_to_line, truncate_to_width};
 
 /// Maximum diff lines rendered inline before collapsing the rest.
 const DIFF_LINE_CAP: usize = 40;
@@ -69,8 +70,10 @@ impl ToolExecutionComponent {
     /// Set the tool result.
     pub fn set_result(&self, result: &str, is_error: bool) {
         if let Ok(mut r) = self.result.lock() {
-            let prefix = if is_error { "❌ " } else { "✓ " };
-            *r = Some(format!("{}{}", prefix, result));
+            // The header glyph + bg tint already convey status (✗/red for
+            // failure, ✓/green for success), so the result text is stored
+            // raw — no redundant emoji prefix (pi doesn't double these up).
+            *r = Some(result.to_string());
         }
         if let Ok(mut s) = self.status.lock() {
             *s = if is_error { ToolStatus::Failed } else { ToolStatus::Completed };
@@ -118,6 +121,7 @@ impl ToolExecutionComponent {
 
 impl Component for ToolExecutionComponent {
     fn render(&self, width: usize) -> Vec<String> {
+        let colors = theme().colors;
         let mut lines = Vec::new();
 
         let name = self.name.lock().unwrap();
@@ -127,38 +131,57 @@ impl Component for ToolExecutionComponent {
         let expanded = self.expanded.lock().unwrap();
         let diff_lines = self.diff_lines.lock().unwrap();
 
-        // Status indicator
-        let status_icon = match *status {
-            ToolStatus::Pending => "⏳",
-            ToolStatus::Running => "🔄",
-            ToolStatus::Completed => "✓",
-            ToolStatus::Failed => "❌",
+        // Status indicator — a colored glyph (no emoji), pi style.
+        let (status_icon, status_color) = match *status {
+            ToolStatus::Pending => ("●", colors.muted),
+            ToolStatus::Running => ("●", colors.accent),
+            ToolStatus::Completed => ("✓", colors.success),
+            ToolStatus::Failed => ("✗", colors.error),
         };
 
-        // Tool header line
-        let header = format!("{} Tool: {} {}", status_icon, name,
-            if *expanded { "▼" } else { "▶" });
+        // Background tint for the header row reflects status (pi tool*Bg).
+        let bg = match *status {
+            ToolStatus::Pending | ToolStatus::Running => colors.tool_pending_bg,
+            ToolStatus::Failed => colors.tool_error_bg,
+            ToolStatus::Completed => colors.tool_success_bg,
+        };
 
-        let mut header_line = " ".repeat(1);
-        header_line.push_str(&header);
-        header_line = truncate_to_width(&header_line, width, "…");
+        // Tool header line: "● Tool: name ▶" themed, padded, bg-tinted.
+        let chevron = if *expanded { "▾" } else { "▸" };
+        let header_inner = format!(
+            "{} {} {} {}",
+            status_color.fg(status_icon),
+            colors.tool_title.fg(&bold("Tool:")),
+            colors.tool_title.fg(&bold(&name)),
+            colors.muted.fg(chevron),
+        );
+        let header_line = apply_background_to_line(&format!(" {}", header_inner), width, |s| bg.bg(s));
         lines.push(header_line);
 
-        // If expanded, show args and result
+        // If expanded, show args above the result. The result itself (and the
+        // diff) are always shown — they are the useful payload; `expanded`
+        // only gates the verbose args block.
         if *expanded {
-            // Show args
             if !args.is_empty() {
-                let args_line = format!("  Args: {}", args);
+                let args_line = format!("  {} {}", colors.muted.fg("Args:"), args);
+                let args_line = apply_background_to_line(&args_line, width, |s| bg.bg(s));
                 lines.push(args_line);
             }
+        }
 
-            // Show result if available
-            if let Some(ref r) = *result {
-                for line in r.lines() {
-                    let result_line = format!("  {}", line);
-                    lines.push(result_line);
-                }
+        // Show result if available (always — a failure's error text is the
+        // payload, not a detail to hide behind expand).
+        if let Some(ref r) = *result {
+            for line in r.lines() {
+                let result_line = format!("  {}", colors.tool_output.fg(line));
+                let result_line = apply_background_to_line(&result_line, width, |s| bg.bg(s));
+                lines.push(result_line);
             }
+        } else if diff_lines.is_none() && !*expanded {
+            // No result yet, no diff, and collapsed: pad one bg-tinted row so
+            // the tool block still reads as a block (pi keeps the bg band).
+            let pad = apply_background_to_line("", width, |s| bg.bg(s));
+            lines.push(pad);
         }
 
         // A colored diff (from `render_diff`) is always shown — the diff IS
@@ -180,7 +203,7 @@ impl Component for ToolExecutionComponent {
             }
             if total > DIFF_LINE_CAP {
                 let more = total - DIFF_LINE_CAP;
-                lines.push(format!("  … {} more diff lines hidden", more));
+                lines.push(format!("  {}", colors.muted.fg(&format!("… {} more diff lines hidden", more))));
             }
         }
 
@@ -234,8 +257,12 @@ mod tests {
     fn test_tool_execution_error() {
         let tool = ToolExecutionComponent::new("bash", "invalid_command");
         tool.set_result("command not found", true);
-        
+
         let lines = tool.render(80);
-        assert!(lines.join("\n").contains("❌"));
+        let joined = lines.join("\n");
+        // Failed state: error-colored ✗ glyph + the result text echoed
+        // (expanded path includes the `❌ command not found` result line).
+        assert!(joined.contains("command not found"), "result text missing: {joined}");
+        assert!(joined.contains('✗'), "error glyph missing: {joined}");
     }
 }
