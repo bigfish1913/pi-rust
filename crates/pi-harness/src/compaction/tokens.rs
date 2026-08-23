@@ -10,8 +10,8 @@
 
 use std::collections::BTreeSet;
 
-use rpi_ai::types::{AssistantMessage, Content, Message, Usage};
 use rpi_agent::message::AgentMessage;
+use rpi_ai::types::{AssistantMessage, Content, Message, Usage};
 
 use crate::messages::{bash_execution_data, branch_summary_data, compaction_summary_data};
 use crate::session::types::Entry;
@@ -92,7 +92,10 @@ pub fn compute_file_lists(file_ops: &FileOperations) -> (Vec<String>, Vec<String
 pub fn format_file_operations(read_files: &[String], modified_files: &[String]) -> String {
     let mut sections: Vec<String> = Vec::new();
     if !read_files.is_empty() {
-        sections.push(format!("<read-files>\n{}\n</read-files>", read_files.join("\n")));
+        sections.push(format!(
+            "<read-files>\n{}\n</read-files>",
+            read_files.join("\n")
+        ));
     }
     if !modified_files.is_empty() {
         sections.push(format!(
@@ -165,10 +168,16 @@ pub fn serialize_conversation(messages: &[Message]) -> String {
                     }
                 }
                 if !thinking_parts.is_empty() {
-                    parts.push(format!("[Assistant thinking]: {}", thinking_parts.join("\n")));
+                    parts.push(format!(
+                        "[Assistant thinking]: {}",
+                        thinking_parts.join("\n")
+                    ));
                 }
                 if a.content.iter().any(|b| matches!(b, Content::Text(_))) {
-                    parts.push(format!("[Assistant]: {}", Content::text_only(&a.content, "\n")));
+                    parts.push(format!(
+                        "[Assistant]: {}",
+                        Content::text_only(&a.content, "\n")
+                    ));
                 }
                 if !tool_calls.is_empty() {
                     parts.push(format!("[Assistant tool calls]: {}", tool_calls.join("; ")));
@@ -226,7 +235,9 @@ fn estimate_message_chars(message: &AgentMessage) -> usize {
     match message {
         AgentMessage::User(u) => match &u.content {
             rpi_ai::types::UserContent::Text(s) => s.len(),
-            rpi_ai::types::UserContent::Blocks(blocks) => estimate_text_and_image_chars_content(blocks),
+            rpi_ai::types::UserContent::Blocks(blocks) => {
+                estimate_text_and_image_chars_content(blocks)
+            }
         },
         AgentMessage::Assistant(a) => estimate_assistant_chars(a),
         AgentMessage::ToolResult(t) => estimate_text_and_image_chars_content(&t.content),
@@ -361,8 +372,8 @@ pub fn build_session_context(path_entries: &[Entry]) -> SessionContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rpi_ai::types::{UserContent, UserMessage};
     use rpi_agent::message::AgentMessage;
+    use rpi_ai::types::{UserContent, UserMessage};
 
     fn user(text: &str) -> AgentMessage {
         AgentMessage::User(UserMessage::new(UserContent::Text(text.into()), 1))
@@ -380,15 +391,23 @@ mod tests {
     #[test]
     fn extract_file_ops_classifies_read_write_edit() {
         // Build a real assistant with three tool calls.
-        let mut a = rpi_ai::types::AssistantMessage::empty(
-            rpi_ai::types::Api::Faux,
-            "faux",
-            "faux",
-            1,
-        );
-        a.content.push(Content::tool_call("c1", "read", serde_json::json!({"path": "/a"})));
-        a.content.push(Content::tool_call("c2", "write", serde_json::json!({"path": "/b"})));
-        a.content.push(Content::tool_call("c3", "edit", serde_json::json!({"path": "/c"})));
+        let mut a =
+            rpi_ai::types::AssistantMessage::empty(rpi_ai::types::Api::Faux, "faux", "faux", 1);
+        a.content.push(Content::tool_call(
+            "c1",
+            "read",
+            serde_json::json!({"path": "/a"}),
+        ));
+        a.content.push(Content::tool_call(
+            "c2",
+            "write",
+            serde_json::json!({"path": "/b"}),
+        ));
+        a.content.push(Content::tool_call(
+            "c3",
+            "edit",
+            serde_json::json!({"path": "/c"}),
+        ));
         let msg = AgentMessage::Assistant(Box::new(a));
         let mut ops = create_file_ops();
         extract_file_ops_from_message(&msg, &mut ops);
@@ -413,9 +432,10 @@ mod tests {
 
     #[test]
     fn serialize_conversation_renders_roles() {
-        let msgs = vec![
-            Message::User(UserMessage::new(UserContent::Text("hello".into()), 1)),
-        ];
+        let msgs = vec![Message::User(UserMessage::new(
+            UserContent::Text("hello".into()),
+            1,
+        ))];
         let s = serialize_conversation(&msgs);
         assert_eq!(s, "[User]: hello");
     }
@@ -431,12 +451,8 @@ mod tests {
 
     #[test]
     fn estimate_context_tokens_uses_last_assistant_usage_plus_trailing() {
-        let mut a = rpi_ai::types::AssistantMessage::empty(
-            rpi_ai::types::Api::Faux,
-            "faux",
-            "faux",
-            1,
-        );
+        let mut a =
+            rpi_ai::types::AssistantMessage::empty(rpi_ai::types::Api::Faux, "faux", "faux", 1);
         a.usage = Usage {
             input: 100,
             output: 10,
@@ -449,9 +465,9 @@ mod tests {
         };
         a.stop_reason = rpi_ai::types::StopReason::Stop;
         let msgs = vec![
-            user("abcdefgh"), // 2
+            user("abcdefgh"),                     // 2
             AgentMessage::Assistant(Box::new(a)), // usage 110, index 1
-            user("abcdefghi"), // 3 trailing
+            user("abcdefghi"),                    // 3 trailing
         ];
         let est = estimate_context_tokens(&msgs);
         assert_eq!(est.usage_tokens, 110);

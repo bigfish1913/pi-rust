@@ -264,7 +264,13 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, AiError::Http { status: Some(400), .. }));
+        assert!(matches!(
+            err,
+            AiError::Http {
+                status: Some(400),
+                ..
+            }
+        ));
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
@@ -366,9 +372,21 @@ mod tests {
             x_should_retry: None,
         };
         // retry_index 0 → 500ms, 1 → 1000ms, 4 → 8000ms (cap), 5 → 8000ms.
-        assert_eq!(retry_delay(&err, 0, None).unwrap(), Duration::from_millis(500));
-        assert_eq!(retry_delay(&err, 1, None).unwrap(), Duration::from_millis(1000));
-        assert_eq!(retry_delay(&err, 4, None).unwrap(), Duration::from_millis(8000));
-        assert_eq!(retry_delay(&err, 5, None).unwrap(), Duration::from_millis(8000));
+        assert_eq!(
+            retry_delay(&err, 0, None).unwrap(),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            retry_delay(&err, 1, None).unwrap(),
+            Duration::from_millis(1000)
+        );
+        assert_eq!(
+            retry_delay(&err, 4, None).unwrap(),
+            Duration::from_millis(8000)
+        );
+        assert_eq!(
+            retry_delay(&err, 5, None).unwrap(),
+            Duration::from_millis(8000)
+        );
     }
 }

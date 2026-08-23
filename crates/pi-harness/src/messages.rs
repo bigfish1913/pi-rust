@@ -19,8 +19,8 @@
 //! (`createCompactionSummaryMessage`, `createBranchSummaryMessage`,
 //! `convertToLlm`).
 
-use rpi_ai::types::{Content, Message, UserContent, UserMessage};
 use rpi_agent::message::{AgentMessage, CustomMessage};
+use rpi_ai::types::{Content, Message, UserContent, UserMessage};
 use serde::{Deserialize, Serialize};
 
 /// Wraps `summary` in the compaction-summary text envelope. Mirrors
@@ -246,7 +246,9 @@ pub fn bash_execution_data(msg: &AgentMessage) -> Option<BashExecutionData> {
 /// If `msg` is a generic `custom` role message, deserialize its `data`.
 pub fn custom_data(msg: &AgentMessage) -> Option<CustomData> {
     match msg {
-        AgentMessage::Custom(c) if c.role == CUSTOM_ROLE => serde_json::from_value(c.data.clone()).ok(),
+        AgentMessage::Custom(c) if c.role == CUSTOM_ROLE => {
+            serde_json::from_value(c.data.clone()).ok()
+        }
         _ => None,
     }
 }
@@ -312,11 +314,17 @@ fn convert_custom_to_llm(c: CustomMessage) -> Option<Message> {
         }
         CUSTOM_ROLE => {
             // Generic custom: content is the stored text/image blocks.
-            Some(Message::User(UserMessage::new(UserContent::Blocks(c.content), timestamp)))
+            Some(Message::User(UserMessage::new(
+                UserContent::Blocks(c.content),
+                timestamp,
+            )))
         }
         BRANCH_SUMMARY_ROLE => {
             let data: BranchSummaryData = serde_json::from_value(c.data).ok()?;
-            let text = format!("{BRANCH_SUMMARY_PREFIX}{}{BRANCH_SUMMARY_SUFFIX}", data.summary);
+            let text = format!(
+                "{BRANCH_SUMMARY_PREFIX}{}{BRANCH_SUMMARY_SUFFIX}",
+                data.summary
+            );
             Some(Message::User(UserMessage::new(text, timestamp)))
         }
         COMPACTION_SUMMARY_ROLE => {

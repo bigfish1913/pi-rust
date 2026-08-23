@@ -12,13 +12,11 @@
 
 use std::sync::Arc;
 
+use rpi_agent::message::AgentMessage;
 use rpi_ai::providers::faux::{FauxProvider, FauxScript, FauxStep};
 use rpi_ai::types::{StopReason, UserContent, UserMessage};
 use rpi_ai::{Model, Provider};
-use rpi_agent::message::AgentMessage;
-use rpi_harness::compaction::{
-    compact, prepare_compaction, CompactionLlmOptions, CompactResult,
-};
+use rpi_harness::compaction::{compact, prepare_compaction, CompactResult, CompactionLlmOptions};
 use rpi_harness::session::types::{Entry, EntryBase, MessageEntry};
 use rpi_harness::types::{CompactionSettings, DEFAULT_COMPACTION_SETTINGS};
 use tokio_util::sync::CancellationToken;
@@ -38,7 +36,10 @@ fn base(seq: u64, parent: Option<&str>) -> EntryBase {
 fn user_msg(text: &str, seq: u64, parent: Option<&str>) -> Entry {
     Entry::Message(MessageEntry {
         base: base(seq, parent),
-        message: AgentMessage::User(UserMessage::new(UserContent::Text(text.to_string()), seq as i64)),
+        message: AgentMessage::User(UserMessage::new(
+            UserContent::Text(text.to_string()),
+            seq as i64,
+        )),
         terminate: None,
     })
 }
@@ -96,21 +97,37 @@ async fn compact_single_call_returns_summary_and_file_ops() {
     let _ = parent_owned;
 
     // Small keep_recent so prepare_compaction actually yields messages to summarize.
-    let settings = CompactionSettings { enabled: true, reserve_tokens: 2000, keep_recent_tokens: 20 };
+    let settings = CompactionSettings {
+        enabled: true,
+        reserve_tokens: 2000,
+        keep_recent_tokens: 20,
+    };
     let preparation = prepare_compaction(&entries, settings).unwrap().unwrap();
     assert!(!preparation.is_split_turn);
 
     let (provider, model) = faux_provider_model();
-    provider.script().set_responses(vec![FauxStep::text("## Goal\nTest summary")]);
+    provider
+        .script()
+        .set_responses(vec![FauxStep::text("## Goal\nTest summary")]);
 
-    let result: CompactResult = compact(&preparation, &llm_options(provider.clone() as Arc<dyn Provider>, model))
-        .await
-        .expect("compact should succeed");
+    let result: CompactResult = compact(
+        &preparation,
+        &llm_options(provider.clone() as Arc<dyn Provider>, model),
+    )
+    .await
+    .expect("compact should succeed");
 
-    assert!(result.summary.contains("Test summary"), "summary was: {}", result.summary);
+    assert!(
+        result.summary.contains("Test summary"),
+        "summary was: {}",
+        result.summary
+    );
     // No file ops in the fixture → file-ops section must be empty.
     assert!(!result.summary.contains("<read-files>"));
-    assert!(result.usage.is_some(), "single-call compaction carries the call usage");
+    assert!(
+        result.usage.is_some(),
+        "single-call compaction carries the call usage"
+    );
     assert!(result.details.is_some());
 }
 
@@ -129,31 +146,38 @@ async fn compact_maps_error_stop_reason_to_summarization_failed() {
         tokens_before: 100,
         previous_summary: None,
         file_ops: rpi_harness::compaction::FileOperations::default(),
-        settings: CompactionSettings { enabled: true, reserve_tokens: 2000, keep_recent_tokens: 20 },
+        settings: CompactionSettings {
+            enabled: true,
+            reserve_tokens: 2000,
+            keep_recent_tokens: 20,
+        },
     };
 
     let (provider, model) = faux_provider_model();
     // Faux step carrying an error terminal message.
-    let mut err = rpi_ai::types::AssistantMessage::empty(
-        rpi_ai::types::Api::Faux,
-        "faux",
-        "faux",
-        0,
-    );
+    let mut err =
+        rpi_ai::types::AssistantMessage::empty(rpi_ai::types::Api::Faux, "faux", "faux", 0);
     err.stop_reason = StopReason::Error;
     err.error_message = Some("boom".to_string());
-    provider.script().set_responses(vec![FauxStep::Message(err)]);
+    provider
+        .script()
+        .set_responses(vec![FauxStep::Message(err)]);
 
-    let err = compact(&preparation, &llm_options(provider.clone() as Arc<dyn Provider>, model))
-        .await
-        .expect_err("error stop reason must map to a CompactionError");
+    let err = compact(
+        &preparation,
+        &llm_options(provider.clone() as Arc<dyn Provider>, model),
+    )
+    .await
+    .expect_err("error stop reason must map to a CompactionError");
     assert_eq!(err.code.as_str(), "summarization_failed");
     assert!(err.message.contains("boom"), "message was: {}", err.message);
 }
 
 #[tokio::test]
 async fn prepare_compaction_noop_on_empty_and_on_last_compaction() {
-    assert!(prepare_compaction(&[], DEFAULT_COMPACTION_SETTINGS).unwrap().is_none());
+    assert!(prepare_compaction(&[], DEFAULT_COMPACTION_SETTINGS)
+        .unwrap()
+        .is_none());
 
     let compaction = Entry::Compaction(rpi_harness::session::types::CompactionEntry {
         base: base_of("compaction", "c1", 1, None),
@@ -163,7 +187,11 @@ async fn prepare_compaction_noop_on_empty_and_on_last_compaction() {
         details: None,
         usage: None,
     });
-    assert!(prepare_compaction(&[compaction], DEFAULT_COMPACTION_SETTINGS).unwrap().is_none());
+    assert!(
+        prepare_compaction(&[compaction], DEFAULT_COMPACTION_SETTINGS)
+            .unwrap()
+            .is_none()
+    );
 }
 
 fn base_of(entry_type: &str, id: &str, seq: u64, parent: Option<&str>) -> EntryBase {

@@ -105,9 +105,7 @@ impl JsonlV4Header {
 
 fn decode_header(line: &str) -> Result<JsonlV4Header, JsonlDecodeError> {
     let value = parse_object(line)?;
-    let kind = value
-        .get("kind")
-        .and_then(|v| v.as_str());
+    let kind = value.get("kind").and_then(|v| v.as_str());
     if kind != Some("header") {
         return Err(schema("is not a header"));
     }
@@ -122,7 +120,9 @@ fn decode_header(line: &str) -> Result<JsonlV4Header, JsonlDecodeError> {
     let parent_session_id = optional_string_field(&value, "parentSessionId")?;
     let legacy_parent_session_path = optional_string_field(&value, "legacyParentSessionPath")?;
     if parent_session_id.is_some() && legacy_parent_session_path.is_some() {
-        return Err(schema("has both parentSessionId and legacyParentSessionPath"));
+        return Err(schema(
+            "has both parentSessionId and legacyParentSessionPath",
+        ));
     }
 
     let metadata_value = value.get("metadata");
@@ -206,7 +206,8 @@ pub fn encode_mutation(mutation: &SessionMutation) -> String {
                     map.insert(k, v);
                 }
             }
-            let mut s = serde_json::to_string(&Value::Object(map)).expect("entry mutates serialize");
+            let mut s =
+                serde_json::to_string(&Value::Object(map)).expect("entry mutates serialize");
             s.push('\n');
             s
         }
@@ -220,7 +221,8 @@ pub fn encode_mutation(mutation: &SessionMutation) -> String {
                     map.insert(k, v);
                 }
             }
-            let mut s = serde_json::to_string(&Value::Object(map)).expect("record mutates serialize");
+            let mut s =
+                serde_json::to_string(&Value::Object(map)).expect("record mutates serialize");
             s.push('\n');
             s
         }
@@ -254,7 +256,11 @@ pub fn encode_mutation(mutation: &SessionMutation) -> String {
             s.push('\n');
             s
         }
-        SessionMutation::FactLabel { seq, target_id, label } => {
+        SessionMutation::FactLabel {
+            seq,
+            target_id,
+            label,
+        } => {
             let mut map = serde_json::Map::new();
             map.insert("kind".into(), Value::String("fact".into()));
             map.insert("seq".into(), Value::Number((*seq).into()));
@@ -397,7 +403,11 @@ fn parse_fact_mutation(
                 Some(Value::String(s)) => Some(s.clone()),
                 _ => return Err(schema("has invalid label")),
             };
-            Ok(SessionMutation::FactLabel { seq, target_id, label })
+            Ok(SessionMutation::FactLabel {
+                seq,
+                target_id,
+                label,
+            })
         }
         _ => Err(schema("has unknown fact type")),
     }
@@ -413,7 +423,10 @@ fn parse_object(line: &str) -> Result<serde_json::Map<String, Value>, JsonlDecod
     }
 }
 
-fn require_string(value: &serde_json::Map<String, Value>, field: &str) -> Result<String, JsonlDecodeError> {
+fn require_string(
+    value: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<String, JsonlDecodeError> {
     value
         .get(field)
         .and_then(|v| v.as_str())
@@ -421,7 +434,10 @@ fn require_string(value: &serde_json::Map<String, Value>, field: &str) -> Result
         .ok_or_else(|| schema(format!("has invalid {field}")))
 }
 
-fn require_string_map(value: &serde_json::Map<String, Value>, field: &str) -> Result<String, JsonlDecodeError> {
+fn require_string_map(
+    value: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<String, JsonlDecodeError> {
     require_string(value, field)
 }
 
@@ -433,7 +449,10 @@ fn require_sequence(value: &serde_json::Map<String, Value>) -> Result<u64, Jsonl
         .ok_or_else(|| schema("has invalid seq"))
 }
 
-fn require_timestamp(value: &serde_json::Map<String, Value>, field: &str) -> Result<i64, JsonlDecodeError> {
+fn require_timestamp(
+    value: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<i64, JsonlDecodeError> {
     require_timestamp_map(value, field)
 }
 
@@ -532,7 +551,11 @@ mod tests {
 
     #[test]
     fn lane_mutation_round_trips() {
-        let s = SessionMutation::Lane { seq: 2, lane: "main".into(), leaf_id: None };
+        let s = SessionMutation::Lane {
+            seq: 2,
+            lane: "main".into(),
+            leaf_id: None,
+        };
         let line = encode_mutation(&s);
         let parsed = parse_mutation(line.trim_end()).unwrap();
         match parsed {
@@ -547,7 +570,10 @@ mod tests {
 
     #[test]
     fn fact_name_round_trips() {
-        let s = SessionMutation::FactName { seq: 3, name: Some("hello".into()) };
+        let s = SessionMutation::FactName {
+            seq: 3,
+            name: Some("hello".into()),
+        };
         let line = encode_mutation(&s);
         let parsed = parse_mutation(line.trim_end()).unwrap();
         match parsed {

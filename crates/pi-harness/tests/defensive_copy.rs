@@ -84,8 +84,13 @@ fn options_with(tools: Vec<HarnessTool>) -> AgentHarnessOptions {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_tools_returns_clone_independent_of_internal() {
     let alpha = DummyTool::new("alpha");
-    let tools = vec![HarnessTool::new(alpha.clone()), HarnessTool::new(DummyTool::new("beta"))];
-    let harness = AgentHarness::create(options_with(tools)).await.expect("create");
+    let tools = vec![
+        HarnessTool::new(alpha.clone()),
+        HarnessTool::new(DummyTool::new("beta")),
+    ];
+    let harness = AgentHarness::create(options_with(tools))
+        .await
+        .expect("create");
 
     let got = harness.get_tools().await.expect("get_tools");
     assert_eq!(got.len(), 2);
@@ -103,16 +108,21 @@ async fn get_tools_returns_clone_independent_of_internal() {
     mutated.clear();
 
     let again = harness.get_tools().await.expect("get_tools again");
-    assert_eq!(again.len(), 2, "clearing the returned Vec must not reach internal state");
+    assert_eq!(
+        again.len(),
+        2,
+        "clearing the returned Vec must not reach internal state"
+    );
     assert_eq!(again[0].tool.schema().name, "alpha");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn set_tools_none_resets_active_names_to_all_schema_names() {
-    let harness =
-        AgentHarness::create(options_with(vec![HarnessTool::new(DummyTool::new("alpha"))]))
-            .await
-            .expect("create");
+    let harness = AgentHarness::create(options_with(vec![HarnessTool::new(DummyTool::new(
+        "alpha",
+    ))]))
+    .await
+    .expect("create");
 
     // Replace with a distinct set; pass `None` for active names → harness must
     // reset active_tool_names to every new tool's schema name (TS `setTools`
@@ -121,7 +131,10 @@ async fn set_tools_none_resets_active_names_to_all_schema_names() {
     let beta = DummyTool::new("beta");
     harness
         .set_tools(
-            vec![HarnessTool::new(beta.clone()), HarnessTool::new(gamma.clone())],
+            vec![
+                HarnessTool::new(beta.clone()),
+                HarnessTool::new(gamma.clone()),
+            ],
             None,
         )
         .await
@@ -140,7 +153,9 @@ async fn set_tools_none_resets_active_names_to_all_schema_names() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn set_tools_some_pins_active_names_exactly() {
-    let harness = AgentHarness::create(options_with(vec![])).await.expect("create");
+    let harness = AgentHarness::create(options_with(vec![]))
+        .await
+        .expect("create");
 
     let alpha = DummyTool::new("alpha");
     let beta = DummyTool::new("beta");
@@ -161,10 +176,13 @@ async fn set_tools_some_pins_active_names_exactly() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn get_and_set_active_tools_are_defensive_copies() {
     let alpha = DummyTool::new("alpha");
-    let harness =
-        AgentHarness::create(options_with(vec![HarnessTool::new(alpha)])).await.expect("create");
+    let harness = AgentHarness::create(options_with(vec![HarnessTool::new(alpha)]))
+        .await
+        .expect("create");
 
-    let got = <AgentHarness as AgentLane>::get_active_tools(&harness).await.expect("get");
+    let got = <AgentHarness as AgentLane>::get_active_tools(&harness)
+        .await
+        .expect("get");
     assert_eq!(got, vec!["alpha".to_string()]);
 
     // Mutate the returned Vec; internal must be unchanged.
@@ -172,7 +190,9 @@ async fn get_and_set_active_tools_are_defensive_copies() {
     mutated.push("sneaky".to_string());
     let _ = mutated;
 
-    let again = <AgentHarness as AgentLane>::get_active_tools(&harness).await.expect("get again");
+    let again = <AgentHarness as AgentLane>::get_active_tools(&harness)
+        .await
+        .expect("get again");
     assert_eq!(again, vec!["alpha".to_string()]);
 
     // set_active_tools moves the Vec in; re-get returns that exact set as a clone.
@@ -182,16 +202,19 @@ async fn get_and_set_active_tools_are_defensive_copies() {
     )
     .await
     .expect("set_active_tools");
-    let after = <AgentHarness as AgentLane>::get_active_tools(&harness).await.expect("get");
+    let after = <AgentHarness as AgentLane>::get_active_tools(&harness)
+        .await
+        .expect("get");
     assert_eq!(after, vec!["alpha".to_string(), "extra".to_string()]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn close_rejects_subsequent_tool_ops_with_closed() {
-    let harness =
-        AgentHarness::create(options_with(vec![HarnessTool::new(DummyTool::new("alpha"))]))
-            .await
-            .expect("create");
+    let harness = AgentHarness::create(options_with(vec![HarnessTool::new(DummyTool::new(
+        "alpha",
+    ))]))
+    .await
+    .expect("create");
 
     harness.close().await.expect("close");
     // After close, every tool-registry op rejects with HarnessError::Closed.
@@ -202,7 +225,10 @@ async fn close_rejects_subsequent_tool_ops_with_closed() {
         Err(e) => assert!(matches!(e, HarnessError::Closed { .. }), "got {e:?}"),
         Ok(_) => panic!("get_tools after close should reject with Closed"),
     }
-    match harness.set_tools(vec![HarnessTool::new(DummyTool::new("beta"))], None).await {
+    match harness
+        .set_tools(vec![HarnessTool::new(DummyTool::new("beta"))], None)
+        .await
+    {
         Err(e) => assert!(matches!(e, HarnessError::Closed { .. }), "got {e:?}"),
         Ok(_) => panic!("set_tools after close should reject with Closed"),
     }
@@ -214,7 +240,7 @@ async fn harness_tool_replay_flag_round_trips() {
     // each `HarnessTool`. set/get must preserve it (clone, not strip).
     let alpha = DummyTool::new("alpha");
     let harness = AgentHarness::create(options_with(vec![
-        HarnessTool::new(alpha.clone()).with_replay(ToolReplay::Never),
+        HarnessTool::new(alpha.clone()).with_replay(ToolReplay::Never)
     ]))
     .await
     .expect("create");

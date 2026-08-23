@@ -27,8 +27,8 @@ pub mod tokens;
 pub use compaction::{
     combine_usage, compact, complete_simple_with_retries, extract_file_operations,
     generate_summary_with_usage, generate_turn_prefix_summary, get_message_from_entry,
-    get_message_from_entry_for_compaction, prepare_compaction, CompactionError,
-    CompactionLlmOptions, CompactionPreparation, CompactResult, CompactionDetails,
+    get_message_from_entry_for_compaction, prepare_compaction, CompactResult, CompactionDetails,
+    CompactionError, CompactionLlmOptions, CompactionPreparation,
 };
 pub use cut_point::{find_cut_point, find_turn_start_index, find_valid_cut_points, CutPointResult};
 pub use settings::{should_compact, CompactionSettings, DEFAULT_COMPACTION_SETTINGS};

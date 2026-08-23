@@ -196,9 +196,9 @@ impl Model {
         let map = self.thinking_level_map.as_ref();
         let supported = |lvl: crate::types::ThinkingLevel| -> bool {
             match map.and_then(|m| m.get(&lvl)) {
-                Some(None) => false,    // explicitly null → unsupported
-                Some(Some(_)) => true,  // mapped → supported
-                None => true,           // absent → use provider default (supported)
+                Some(None) => false,   // explicitly null → unsupported
+                Some(Some(_)) => true, // mapped → supported
+                None => true,          // absent → use provider default (supported)
             }
         };
         let mut levels = vec![Off, Minimal, Low, Medium, High];

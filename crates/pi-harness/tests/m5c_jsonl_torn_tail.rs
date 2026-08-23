@@ -38,16 +38,16 @@ fn header() -> JsonlV4Header {
     )
 }
 
-type Fixture = (
-    Arc<dyn FileSystem>,
-    Arc<FakeClock>,
-    Arc<CounterIdGenerator>,
-);
+type Fixture = (Arc<dyn FileSystem>, Arc<FakeClock>, Arc<CounterIdGenerator>);
 
 fn fixture() -> Fixture {
     let env = rpi_tools::InMemoryExecutionEnv::with_cwd("/".into());
     let fs: Arc<dyn FileSystem> = Arc::new(env);
-    (fs, Arc::new(FakeClock::new()), Arc::new(CounterIdGenerator::new()))
+    (
+        fs,
+        Arc::new(FakeClock::new()),
+        Arc::new(CounterIdGenerator::new()),
+    )
 }
 
 async fn create_simple(fs: &Arc<dyn FileSystem>, path: &str) -> JsonlSessionStorage {
@@ -71,17 +71,26 @@ fn lane_mutation(seq: u64, lane: &str) -> SessionMutation {
 }
 
 fn newest_first() -> EntryQuery {
-    EntryQuery { order: Some(EntryOrder::NewestFirst), ..Default::default() }
+    EntryQuery {
+        order: Some(EntryOrder::NewestFirst),
+        ..Default::default()
+    }
 }
 
 fn oldest_first() -> EntryQuery {
-    EntryQuery { order: Some(EntryOrder::OldestFirst), ..Default::default() }
+    EntryQuery {
+        order: Some(EntryOrder::OldestFirst),
+        ..Default::default()
+    }
 }
 
 fn message_provisioned(id: &str, text: &str) -> ProvisionedEntry {
     ProvisionedEntry {
         id: id.to_string(),
-        kind: ProvisionedKind::Message { message: user_msg(text), terminate: None },
+        kind: ProvisionedKind::Message {
+            message: user_msg(text),
+            terminate: None,
+        },
     }
 }
 
@@ -92,10 +101,16 @@ async fn torn_tail_syntax_error_on_last_line_is_repaired() {
     let _ = create_simple(&fs, path).await;
     // Append a valid first mutation (seq=1) + a garbage partial last line.
     let valid = encode_mutation(&lane_mutation(1, "main"));
-    fs.append_file(path, FileContent::Text(valid), None).await.unwrap();
-    fs.append_file(path, FileContent::Text("{not json".into()), None).await.unwrap();
+    fs.append_file(path, FileContent::Text(valid), None)
+        .await
+        .unwrap();
+    fs.append_file(path, FileContent::Text("{not json".into()), None)
+        .await
+        .unwrap();
 
-    let reloaded = JsonlSessionStorage::load(fs.clone(), path, clock, ids).await.unwrap();
+    let reloaded = JsonlSessionStorage::load(fs.clone(), path, clock, ids)
+        .await
+        .unwrap();
     // The torn tail was dropped; the file ends after the valid lane line.
     let content = fs.read_text_file(path, None).await.unwrap();
     assert!(!content.contains("{not json"), "torn line must be removed");
@@ -111,17 +126,27 @@ async fn torn_tail_partial_json_object_on_last_line_is_repaired() {
     let (fs, clock, ids) = fixture();
     let path = "/s.jsonl";
     let storage = create_simple(&fs, path).await;
-    storage.append_entry(message_provisioned("note", "kept"), "main").await.unwrap();
+    storage
+        .append_entry(message_provisioned("note", "kept"), "main")
+        .await
+        .unwrap();
     let valid_prefix = fs.read_text_file(path, None).await.unwrap();
-    fs.append_file(path, FileContent::Text("{\"kind\":\"entry\"".into()), None).await.unwrap();
+    fs.append_file(path, FileContent::Text("{\"kind\":\"entry\"".into()), None)
+        .await
+        .unwrap();
 
-    let reopened = JsonlSessionStorage::load(fs.clone(), path, clock, ids).await.unwrap();
+    let reopened = JsonlSessionStorage::load(fs.clone(), path, clock, ids)
+        .await
+        .unwrap();
     let listed = reopened.find_entries(&newest_first()).await.unwrap();
     assert_eq!(listed.len(), 1, "torn append must not survive");
     // File content is back to the valid prefix.
     assert_eq!(fs.read_text_file(path, None).await.unwrap(), valid_prefix);
     // A further append lands on its own line at seq=2.
-    let after = reopened.append_entry(message_provisioned("after", "after"), "main").await.unwrap();
+    let after = reopened
+        .append_entry(message_provisioned("after", "after"), "main")
+        .await
+        .unwrap();
     assert_eq!(after.seq(), 2);
 }
 
@@ -155,8 +180,16 @@ async fn syntax_error_on_non_last_line_is_hard_corruption() {
     let (fs, clock, ids) = fixture();
     let path = "/s.jsonl";
     let _ = create_simple(&fs, path).await;
-    fs.append_file(path, FileContent::Text("{not json\n".into()), None).await.unwrap();
-    fs.append_file(path, FileContent::Text(encode_mutation(&lane_mutation(1, "main"))), None).await.unwrap();
+    fs.append_file(path, FileContent::Text("{not json\n".into()), None)
+        .await
+        .unwrap();
+    fs.append_file(
+        path,
+        FileContent::Text(encode_mutation(&lane_mutation(1, "main"))),
+        None,
+    )
+    .await
+    .unwrap();
     let corrupted = fs.read_text_file(path, None).await.unwrap();
 
     let err = JsonlSessionStorage::load(fs.clone(), path, clock, ids)
@@ -181,7 +214,13 @@ async fn schema_error_on_non_last_line_is_hard_corruption() {
     )
     .await
     .unwrap();
-    fs.append_file(path, FileContent::Text(encode_mutation(&lane_mutation(2, "main"))), None).await.unwrap();
+    fs.append_file(
+        path,
+        FileContent::Text(encode_mutation(&lane_mutation(2, "main"))),
+        None,
+    )
+    .await
+    .unwrap();
 
     let err = JsonlSessionStorage::load(fs.clone(), path, clock, ids)
         .await
@@ -198,19 +237,34 @@ async fn missing_trailing_newline_is_repaired_on_load() {
     let (fs, clock, ids) = fixture();
     let path = "/s.jsonl";
     let storage = create_simple(&fs, path).await;
-    storage.append_entry(message_provisioned("first", "first"), "main").await.unwrap();
-    let unterminated = fs.read_text_file(path, None).await.unwrap().trim_end().to_string();
-    fs.write_file(path, FileContent::Text(unterminated.clone()), None).await.unwrap();
+    storage
+        .append_entry(message_provisioned("first", "first"), "main")
+        .await
+        .unwrap();
+    let unterminated = fs
+        .read_text_file(path, None)
+        .await
+        .unwrap()
+        .trim_end()
+        .to_string();
+    fs.write_file(path, FileContent::Text(unterminated.clone()), None)
+        .await
+        .unwrap();
 
     let reopened = JsonlSessionStorage::load(fs.clone(), path, clock.clone(), ids.clone())
         .await
         .unwrap();
     let content = fs.read_text_file(path, None).await.unwrap();
     assert_eq!(content, format!("{unterminated}\n"));
-    let second = reopened.append_entry(message_provisioned("second", "second"), "main").await.unwrap();
+    let second = reopened
+        .append_entry(message_provisioned("second", "second"), "main")
+        .await
+        .unwrap();
     assert_eq!(second.seq(), 2);
 
-    let verified = JsonlSessionStorage::load(fs, path, clock, ids).await.unwrap();
+    let verified = JsonlSessionStorage::load(fs, path, clock, ids)
+        .await
+        .unwrap();
     let listed = verified.find_entries(&oldest_first()).await.unwrap();
     assert_eq!(listed.len(), 2);
     assert_eq!(listed[0].id(), "first");
@@ -221,8 +275,13 @@ async fn missing_trailing_newline_is_repaired_on_load() {
 async fn empty_file_is_invalid_entry() {
     let (fs, clock, ids) = fixture();
     let path = "/s.jsonl";
-    fs.write_file(path, FileContent::Text(String::new()), None).await.unwrap();
-    let err = JsonlSessionStorage::load(fs, path, clock, ids).await.err().unwrap();
+    fs.write_file(path, FileContent::Text(String::new()), None)
+        .await
+        .unwrap();
+    let err = JsonlSessionStorage::load(fs, path, clock, ids)
+        .await
+        .err()
+        .unwrap();
     assert_eq!(err.code, SessionErrorCode::InvalidEntry);
 }
 
@@ -234,7 +293,9 @@ async fn header_only_round_trips_and_is_appendable() {
     let _ = JsonlSessionStorage::create(fs.clone(), path, header(), clock.clone(), ids.clone())
         .await
         .unwrap();
-    let reopened = JsonlSessionStorage::load(fs.clone(), path, clock, ids).await.unwrap();
+    let reopened = JsonlSessionStorage::load(fs.clone(), path, clock, ids)
+        .await
+        .unwrap();
     let started = LaneRecord::OperationStarted(OperationStartedRecord {
         base: RecordBase {
             id: "run-1".into(),

@@ -31,10 +31,10 @@ use async_trait::async_trait;
 use crate::error::{SessionError, SessionResult};
 use crate::session::state::SessionState;
 use crate::session::types::{
-    provisioned_into_entry, BranchBounds, Entry, EntryQuery, ForkOptions, IdGenerator,
-    LanePointer, LaneRecord, LogItem, LogOptions, OperationStartedRecord, ProvisionedEntry,
-    RecordQuery, SessionCreateOptions, SessionMetadata, SessionMutation,
-    SessionStats, SessionStorage, SessionRepo,
+    provisioned_into_entry, BranchBounds, Entry, EntryQuery, ForkOptions, IdGenerator, LanePointer,
+    LaneRecord, LogItem, LogOptions, OperationStartedRecord, ProvisionedEntry, RecordQuery,
+    SessionCreateOptions, SessionMetadata, SessionMutation, SessionRepo, SessionStats,
+    SessionStorage,
 };
 
 /// A simple shared id-generator producing stringified u64 counters — the
@@ -59,7 +59,6 @@ impl IdGenerator for CounterIdGenerator {
         format!("id-{x}")
     }
 }
-
 
 /// Wall-clock timestamp source — abstracted so tests can inject a fixed clock.
 /// Production uses [`SystemClock`]; tests use [`FakeClock`] for deterministic
@@ -113,7 +112,10 @@ struct Inner {
 }
 
 impl Inner {
-    fn with_state<R>(&self, f: impl FnOnce(&mut SessionState) -> SessionResult<R>) -> SessionResult<R> {
+    fn with_state<R>(
+        &self,
+        f: impl FnOnce(&mut SessionState) -> SessionResult<R>,
+    ) -> SessionResult<R> {
         let mut state = self.state.lock().expect("state not poisoned");
         f(&mut state)
     }
@@ -136,7 +138,11 @@ pub struct InMemorySessionStorage {
 impl InMemorySessionStorage {
     /// Build with a given metadata + clock + id generator. Production paths
     /// use [`SystemClock`] + uuidv7; tests inject deterministic doubles.
-    pub fn new(metadata: SessionMetadata, clock: Arc<dyn Clock>, ids: Arc<dyn IdGenerator>) -> Self {
+    pub fn new(
+        metadata: SessionMetadata,
+        clock: Arc<dyn Clock>,
+        ids: Arc<dyn IdGenerator>,
+    ) -> Self {
         Self {
             metadata,
             inner: Arc::new(Inner {
@@ -157,7 +163,9 @@ impl InMemorySessionStorage {
         ids: Arc<dyn IdGenerator>,
     ) -> SessionResult<Self> {
         let forked = InMemorySessionStorage::new(metadata, clock, ids);
-        let mutations = self.inner.read_state(|state| state.create_fork_mutations(options))?;
+        let mutations = self
+            .inner
+            .read_state(|state| state.create_fork_mutations(options))?;
         forked.inner.with_state(|state| {
             for mutation in mutations {
                 let _ = state.apply_mutation(mutation)?;
@@ -240,15 +248,16 @@ impl SessionStorage for InMemorySessionStorage {
                 if let Some(current) = open.first() {
                     return Err(SessionError::storage(format!(
                         "Lane {} already has an open operation {}",
-                        lane,
-                        current.base.id
+                        lane, current.base.id
                     )));
                 }
             }
             let seq = state.next_sequence();
             let timestamp = self.inner.clock.now_ms();
             let stamped = stamp_record(record, seq, lane.clone(), timestamp);
-            state.apply_mutation(SessionMutation::Record { record: stamped.clone() })?;
+            state.apply_mutation(SessionMutation::Record {
+                record: stamped.clone(),
+            })?;
             Ok(stamped)
         })
     }
@@ -289,7 +298,9 @@ impl SessionStorage for InMemorySessionStorage {
     }
 
     async fn get_name(&self) -> SessionResult<Option<String>> {
-        Ok(self.inner.read_state(|state| state.get_name().map(|s| s.to_string())))
+        Ok(self
+            .inner
+            .read_state(|state| state.get_name().map(|s| s.to_string())))
     }
 
     async fn set_name(&self, name: Option<&str>) -> SessionResult<()> {
@@ -304,7 +315,9 @@ impl SessionStorage for InMemorySessionStorage {
     }
 
     async fn get_label(&self, id: &str) -> SessionResult<Option<String>> {
-        Ok(self.inner.read_state(|state| state.get_label(id).map(|s| s.to_string())))
+        Ok(self
+            .inner
+            .read_state(|state| state.get_label(id).map(|s| s.to_string())))
     }
 
     async fn set_label(&self, id: &str, label: Option<&str>) -> SessionResult<()> {
@@ -331,7 +344,12 @@ impl SessionStorage for InMemorySessionStorage {
 ///
 /// Shared by both in-memory and JSONL storage backends (each stamps `seq` +
 /// `timestamp` from its own clock + state before persisting), hence `pub(crate)`.
-pub(crate) fn stamp_record(record: LaneRecord, seq: u64, lane: String, timestamp: i64) -> LaneRecord {
+pub(crate) fn stamp_record(
+    record: LaneRecord,
+    seq: u64,
+    lane: String,
+    timestamp: i64,
+) -> LaneRecord {
     use crate::session::types::*;
     let stamp = |mut base: RecordBase| {
         base.seq = seq;
@@ -465,7 +483,8 @@ impl SessionRepo for InMemorySessionRepo {
                 .clone()
                 .or_else(|| Some(source.id.clone())),
         };
-        let forked = source_storage.fork_from(metadata, fork, self.clock.clone(), self.ids.clone())?;
+        let forked =
+            source_storage.fork_from(metadata, fork, self.clock.clone(), self.ids.clone())?;
         sessions.insert(id, forked.clone());
         Ok(forked)
     }
@@ -475,7 +494,7 @@ impl SessionRepo for InMemorySessionRepo {
 mod tests {
     use super::*;
     use crate::session::types::{
-        OperationIntent, OperationStartedRecord, RecordBase, ProvisionedKind,
+        OperationIntent, OperationStartedRecord, ProvisionedKind, RecordBase,
     };
 
     fn counter_ids() -> Arc<dyn IdGenerator> {
@@ -495,7 +514,12 @@ mod tests {
     }
 
     fn rec_base(id: &str, seq: u64, lane: &str) -> RecordBase {
-        RecordBase { id: id.to_string(), seq, lane: lane.to_string(), timestamp: seq as i64 }
+        RecordBase {
+            id: id.to_string(),
+            seq,
+            lane: lane.to_string(),
+            timestamp: seq as i64,
+        }
     }
 
     fn user_msg(text: &str) -> rpi_agent::message::AgentMessage {
@@ -509,7 +533,10 @@ mod tests {
             .append_entry(
                 ProvisionedEntry {
                     id: "e1".to_string(),
-                    kind: ProvisionedKind::Message { message: user_msg("hello"), terminate: None },
+                    kind: ProvisionedKind::Message {
+                        message: user_msg("hello"),
+                        terminate: None,
+                    },
                 },
                 "main",
             )
@@ -519,7 +546,11 @@ mod tests {
         assert_eq!(entry.seq(), 1);
         assert_eq!(entry.parent_id(), None);
 
-        let got = storage.get_entry("e1").await.unwrap().expect("entry exists");
+        let got = storage
+            .get_entry("e1")
+            .await
+            .unwrap()
+            .expect("entry exists");
         assert_eq!(got.id(), "e1");
     }
 
@@ -559,7 +590,10 @@ mod tests {
             .append_entry(
                 ProvisionedEntry {
                     id: "e1".to_string(),
-                    kind: ProvisionedKind::Message { message: user_msg("hi"), terminate: None },
+                    kind: ProvisionedKind::Message {
+                        message: user_msg("hi"),
+                        terminate: None,
+                    },
                 },
                 "main",
             )

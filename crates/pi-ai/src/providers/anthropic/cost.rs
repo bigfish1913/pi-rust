@@ -33,9 +33,9 @@ pub fn calculate_cost(cost: &ModelCost, usage: &Usage) -> UsageCost {
     let input_cost = (rates.input / 1_000_000.0) * usage.input as f64;
     let output_cost = (rates.output / 1_000_000.0) * usage.output as f64;
     let cache_read_cost = (rates.cache_read / 1_000_000.0) * usage.cache_read as f64;
-    let cache_write_cost =
-        (rates.cache_write * short_write as f64 + rates.input * 2.0 * long_write as f64)
-            / 1_000_000.0;
+    let cache_write_cost = (rates.cache_write * short_write as f64
+        + rates.input * 2.0 * long_write as f64)
+        / 1_000_000.0;
     let total = input_cost + output_cost + cache_read_cost + cache_write_cost;
 
     UsageCost {

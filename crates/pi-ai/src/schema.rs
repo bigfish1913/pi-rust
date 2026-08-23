@@ -264,8 +264,7 @@ pub fn coerce_with_json_schema(value: Value, schema: &Value) -> Value {
     }
 
     let types = schema_types(schema);
-    let matches_union_member =
-        types.len() > 1 && types.iter().any(|t| matches_json_type(&next, t));
+    let matches_union_member = types.len() > 1 && types.iter().any(|t| matches_json_type(&next, t));
     if !types.is_empty() && !matches_union_member {
         for ty in &types {
             let candidate = coerce_primitive_by_type(&next, ty);
@@ -589,7 +588,10 @@ mod tests {
     fn validate_tool_call_finds_named_tool() {
         let tools = vec![
             tool("other", json!({"type":"object"})),
-            tool("t", json!({"type":"object","properties":{"n":{"type":"number"}},"required":["n"]})),
+            tool(
+                "t",
+                json!({"type":"object","properties":{"n":{"type":"number"}},"required":["n"]}),
+            ),
         ];
         let tc = ToolCall {
             kind: ToolCallType,

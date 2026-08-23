@@ -103,10 +103,10 @@ fn object_property_coercion() {
 #[test]
 fn array_item_coercion() {
     let v = coerce_with_json_schema(
-        json!(["1","2","3"]),
+        json!(["1", "2", "3"]),
         &json!({"type":"array","items":{"type":"integer"}}),
     );
-    assert_eq!(v, json!([1,2,3]));
+    assert_eq!(v, json!([1, 2, 3]));
 }
 
 #[test]
@@ -190,7 +190,10 @@ fn validate_tool_call_missing_tool_errors() {
 fn validate_tool_call_dispatches_to_named_tool() {
     let tools = vec![
         tool("other", json!({"type":"object"})),
-        tool("t", json!({"type":"object","properties":{"n":{"type":"number"}},"required":["n"]})),
+        tool(
+            "t",
+            json!({"type":"object","properties":{"n":{"type":"number"}},"required":["n"]}),
+        ),
     ];
     let tc = call("t", json!({"n":"9"}));
     let v = validate_tool_call(&tools, &tc).unwrap();

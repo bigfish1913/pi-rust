@@ -56,8 +56,8 @@ use crate::session::jsonl::codec::{metadata_from_header, parse_header};
 use crate::session::jsonl::errors::file_result;
 use crate::session::jsonl::storage::JsonlSessionStorage;
 use crate::session::jsonl::types::{
-    JsonlSessionCreateOptions, JsonlSessionListOptions, JsonlSessionMetadata, JsonlSessionRepoOptions,
-    JsonlV4Header,
+    JsonlSessionCreateOptions, JsonlSessionListOptions, JsonlSessionMetadata,
+    JsonlSessionRepoOptions, JsonlV4Header,
 };
 use crate::session::memory::Clock;
 use crate::session::types::{
@@ -79,14 +79,23 @@ fn validate_session_id(id: &str) -> SessionResult<()> {
         ));
     }
     let chars: Vec<char> = id.chars().collect();
-    if !chars.first().map(|c| c.is_ascii_alphanumeric()).unwrap_or(false)
-        || !chars.last().map(|c| c.is_ascii_alphanumeric()).unwrap_or(false)
+    if !chars
+        .first()
+        .map(|c| c.is_ascii_alphanumeric())
+        .unwrap_or(false)
+        || !chars
+            .last()
+            .map(|c| c.is_ascii_alphanumeric())
+            .unwrap_or(false)
     {
         return Err(SessionError::invalid_payload(
             "Session id must be non-empty, contain only alphanumeric characters, '-', '_', and '.', and start and end with an alphanumeric character",
         ));
     }
-    if !chars.iter().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')) {
+    if !chars
+        .iter()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
         return Err(SessionError::invalid_payload(
             "Session id must be non-empty, contain only alphanumeric characters, '-', '_', and '.', and start and end with an alphanumeric character",
         ));
@@ -136,9 +145,7 @@ fn iso_timestamp_from_ms(ms: i64) -> String {
     let second = secs_of_day % 60;
 
     let (year, month, day) = civil_from_days(days_since_epoch);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z"
-    )
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
 }
 
 /// Howard Hinnant's days-from-epoch → civil date algorithm. Returns
@@ -225,31 +232,50 @@ impl JsonlSessionRepo {
     // ---- inherent typed API (primary; mirrors TS signatures) ----
 
     /// Create a new session file. Mirrors TS `create(options: JsonlSessionCreateOptions)`.
-    pub async fn create_typed(&self, options: &JsonlSessionCreateOptions) -> SessionResult<JsonlSessionStorage> {
+    pub async fn create_typed(
+        &self,
+        options: &JsonlSessionCreateOptions,
+    ) -> SessionResult<JsonlSessionStorage> {
         let destination = self.resolve_create_destination(options).await?;
         self.claim_create_destination(&destination, async {
             let (header, path) = self.prepare_create(&destination, options).await?;
-            JsonlSessionStorage::create(self.fs.clone(), &path, header, self.clock.clone(), self.ids.clone()).await
+            JsonlSessionStorage::create(
+                self.fs.clone(),
+                &path,
+                header,
+                self.clock.clone(),
+                self.ids.clone(),
+            )
+            .await
         })
         .await
     }
 
     /// List session metadata, newest-first. Mirrors TS
     /// `list(options: JsonlSessionListOptions = {})`.
-    pub async fn list_typed(&self, options: &JsonlSessionListOptions) -> SessionResult<Vec<JsonlSessionMetadata>> {
+    pub async fn list_typed(
+        &self,
+        options: &JsonlSessionListOptions,
+    ) -> SessionResult<Vec<JsonlSessionMetadata>> {
         list_jsonl_session_metadata(self, options).await
     }
 
     /// Open a session by its rich JSONL metadata. Mirrors TS
     /// `open(metadata: JsonlSessionMetadata)` — the preferred open path since
     /// it has the on-disk `path` in hand (no scan).
-    pub async fn open_by_jsonl_metadata(&self, metadata: &JsonlSessionMetadata) -> SessionResult<JsonlSessionStorage> {
+    pub async fn open_by_jsonl_metadata(
+        &self,
+        metadata: &JsonlSessionMetadata,
+    ) -> SessionResult<JsonlSessionStorage> {
         load_jsonl_session_storage(self, metadata).await
     }
 
     /// Delete a session by its rich JSONL metadata (direct-path remove).
     /// Mirrors TS `delete(metadata: JsonlSessionMetadata)`.
-    pub async fn delete_by_jsonl_metadata(&self, metadata: &JsonlSessionMetadata) -> SessionResult<()> {
+    pub async fn delete_by_jsonl_metadata(
+        &self,
+        metadata: &JsonlSessionMetadata,
+    ) -> SessionResult<()> {
         file_result(
             self.fs.remove(&metadata.path, false, true, None).await,
             &format!("Failed to delete session {}", metadata.path),
@@ -284,7 +310,10 @@ impl JsonlSessionRepo {
 
     /// Resolve `{id, cwd}` for a create op: default the id to a fresh uuidv7,
     /// validate it, and absolute-path the cwd. Mirrors `resolveCreateDestination`.
-    async fn resolve_create_destination(&self, options: &JsonlSessionCreateOptions) -> SessionResult<CreateDestination> {
+    async fn resolve_create_destination(
+        &self,
+        options: &JsonlSessionCreateOptions,
+    ) -> SessionResult<CreateDestination> {
         let id = match &options.id {
             Some(id) => id.clone(),
             None => Uuid::now_v7().to_string(),
@@ -302,13 +331,20 @@ impl JsonlSessionRepo {
     /// Prevent same-process create/fork races for one logical destination.
     /// Mirrors `claimCreateDestination`: if `{cwd,id}` is already being created,
     /// `already_exists`; otherwise insert, run the op, remove in `finally`.
-    async fn claim_create_destination<F, T>(&self, destination: &CreateDestination, op: F) -> SessionResult<T>
+    async fn claim_create_destination<F, T>(
+        &self,
+        destination: &CreateDestination,
+        op: F,
+    ) -> SessionResult<T>
     where
         F: std::future::Future<Output = SessionResult<T>>,
     {
         let key = destination.dedup_key();
         {
-            let mut active = self.active_create_destinations.lock().expect("active create set not poisoned");
+            let mut active = self
+                .active_create_destinations
+                .lock()
+                .expect("active create set not poisoned");
             if active.contains(&key) {
                 return Err(SessionError::already_exists(format!(
                     "Session already exists: {}",
@@ -319,7 +355,10 @@ impl JsonlSessionRepo {
         }
         let result = op.await;
         {
-            let mut active = self.active_create_destinations.lock().expect("active create set not poisoned");
+            let mut active = self
+                .active_create_destinations
+                .lock()
+                .expect("active create set not poisoned");
             active.remove(&key);
         }
         result
@@ -334,14 +373,19 @@ impl JsonlSessionRepo {
     ) -> SessionResult<(JsonlV4Header, String)> {
         let CreateDestination { id, cwd } = destination.clone();
         if self.session_id_exists(&id, &cwd).await? {
-            return Err(SessionError::already_exists(format!("Session already exists: {id}")));
+            return Err(SessionError::already_exists(format!(
+                "Session already exists: {id}"
+            )));
         }
 
         let created_at = self.clock.now_ms();
         let session_directory = self.session_directory(&cwd).await?;
         let path = file_result(
             self.fs
-                .join_path(&[&session_directory, &session_file_name(created_at, &id)], None)
+                .join_path(
+                    &[&session_directory, &session_file_name(created_at, &id)],
+                    None,
+                )
                 .await,
             &format!("Failed to resolve path for session {id}"),
         )?
@@ -416,7 +460,10 @@ impl JsonlSessionRepo {
         }
         let resolved = file_result(
             self.fs.absolute_path(&self.sessions_root_input, None).await,
-            &format!("Failed to resolve sessions root {}", self.sessions_root_input),
+            &format!(
+                "Failed to resolve sessions root {}",
+                self.sessions_root_input
+            ),
         )?;
         let resolved_str = resolved.to_string_lossy().into_owned();
         {
@@ -446,7 +493,11 @@ async fn jsonl_session_directories(
         .to_string_lossy()
         .into_owned();
         let directory = file_result(
-            fs.join_path(&[&sessions_root, &jsonl_session_directory_name(&resolved_cwd)], None).await,
+            fs.join_path(
+                &[&sessions_root, &jsonl_session_directory_name(&resolved_cwd)],
+                None,
+            )
+            .await,
             &format!("Failed to resolve sessions directory for {cwd}"),
         )?
         .to_string_lossy()
@@ -495,7 +546,8 @@ async fn list_jsonl_session_metadata(
             .collect();
         for file in files {
             let lines = file_result(
-                fs.read_text_lines(&file.path.to_string_lossy(), Some(1), None).await,
+                fs.read_text_lines(&file.path.to_string_lossy(), Some(1), None)
+                    .await,
                 &format!("Failed to read session header {}", file.path.display()),
             )?;
             let first_line = match lines.first() {
@@ -529,9 +581,18 @@ async fn load_jsonl_session_storage(
         fs.exists(&metadata.path, None).await,
         &format!("Failed to check session {}", metadata.path),
     )? {
-        return Err(SessionError::not_found(format!("Session not found: {}", metadata.id)));
+        return Err(SessionError::not_found(format!(
+            "Session not found: {}",
+            metadata.id
+        )));
     }
-    let storage = JsonlSessionStorage::load(repo.fs.clone(), &metadata.path, repo.clock.clone(), repo.ids.clone()).await?;
+    let storage = JsonlSessionStorage::load(
+        repo.fs.clone(),
+        &metadata.path,
+        repo.clock.clone(),
+        repo.ids.clone(),
+    )
+    .await?;
     let loaded = storage.jsonl_metadata();
     if loaded.id != metadata.id {
         return Err(SessionError::invalid_entry(format!(
@@ -551,20 +612,27 @@ async fn load_jsonl_session_storage(
 /// in through `f64` (kept for parity; `Map<String, Value>` values are already
 /// constrained, so this is a defensive double-check).
 fn assert_json_serializable(value: &serde_json::Map<String, JsonValue>) -> SessionResult<()> {
-    fn check(value: &JsonValue, active: &mut Vec<*const serde_json::Map<String, JsonValue>>) -> SessionResult<()> {
+    fn check(
+        value: &JsonValue,
+        active: &mut Vec<*const serde_json::Map<String, JsonValue>>,
+    ) -> SessionResult<()> {
         match value {
             JsonValue::Null | JsonValue::Bool(_) | JsonValue::String(_) => Ok(()),
             JsonValue::Number(n) => {
                 if n.as_f64().map(|f| f.is_finite()).unwrap_or(true) {
                     Ok(())
                 } else {
-                    Err(SessionError::invalid_payload("Durable payload contains a non-finite number"))
+                    Err(SessionError::invalid_payload(
+                        "Durable payload contains a non-finite number",
+                    ))
                 }
             }
             JsonValue::Object(map) => {
                 let ptr = map as *const _;
                 if active.iter().any(|p| *p == ptr) {
-                    return Err(SessionError::invalid_payload("Durable payload contains a cycle"));
+                    return Err(SessionError::invalid_payload(
+                        "Durable payload contains a cycle",
+                    ));
                 }
                 active.push(ptr);
                 for v in map.values() {
@@ -607,30 +675,40 @@ impl SessionRepo for JsonlSessionRepo {
         // The trait carries only the base metadata (id); the JSONL backend needs
         // the on-disk path. Scan the default-cwd directory for a matching id.
         let listed = self
-            .list_typed(&JsonlSessionListOptions { cwd: Some(self.default_cwd.clone()) })
+            .list_typed(&JsonlSessionListOptions {
+                cwd: Some(self.default_cwd.clone()),
+            })
             .await?;
         let jsonl_meta = listed
             .into_iter()
             .find(|m| m.id == metadata.id)
-            .ok_or_else(|| SessionError::not_found(format!("Session not found: {}", metadata.id)))?;
+            .ok_or_else(|| {
+                SessionError::not_found(format!("Session not found: {}", metadata.id))
+            })?;
         self.open_by_jsonl_metadata(&jsonl_meta).await
     }
 
     async fn list(&self) -> SessionResult<Vec<SessionMetadata>> {
         let listed = self
-            .list_typed(&JsonlSessionListOptions { cwd: Some(self.default_cwd.clone()) })
+            .list_typed(&JsonlSessionListOptions {
+                cwd: Some(self.default_cwd.clone()),
+            })
             .await?;
         Ok(listed.into_iter().map(|m| m.to_base()).collect())
     }
 
     async fn delete(&self, metadata: &SessionMetadata) -> SessionResult<()> {
         let listed = self
-            .list_typed(&JsonlSessionListOptions { cwd: Some(self.default_cwd.clone()) })
+            .list_typed(&JsonlSessionListOptions {
+                cwd: Some(self.default_cwd.clone()),
+            })
             .await?;
         let jsonl_meta = listed
             .into_iter()
             .find(|m| m.id == metadata.id)
-            .ok_or_else(|| SessionError::not_found(format!("Session not found: {}", metadata.id)))?;
+            .ok_or_else(|| {
+                SessionError::not_found(format!("Session not found: {}", metadata.id))
+            })?;
         self.delete_by_jsonl_metadata(&jsonl_meta).await
     }
 
@@ -643,7 +721,9 @@ impl SessionRepo for JsonlSessionRepo {
         // Resolve the source's full JSONL metadata via a list scan (the trait
         // gives us only the base id).
         let listed = self
-            .list_typed(&JsonlSessionListOptions { cwd: Some(self.default_cwd.clone()) })
+            .list_typed(&JsonlSessionListOptions {
+                cwd: Some(self.default_cwd.clone()),
+            })
             .await?;
         let source_jsonl = listed
             .into_iter()
@@ -662,8 +742,10 @@ mod tests {
     use super::*;
     use crate::error::SessionErrorCode;
     use crate::session::memory::{CounterIdGenerator, FakeClock};
-    use crate::session::types::{OperationIntent, OperationStartedRecord, ProvisionedEntry, ProvisionedKind, RecordBase};
     use crate::session::types::SessionStorage;
+    use crate::session::types::{
+        OperationIntent, OperationStartedRecord, ProvisionedEntry, ProvisionedKind, RecordBase,
+    };
 
     fn user_msg(text: &str) -> rpi_agent::message::AgentMessage {
         rpi_agent::message::AgentMessage::User(rpi_ai::types::UserMessage::new(text, 1))
@@ -697,9 +779,15 @@ mod tests {
     #[test]
     fn directory_name_encoding() {
         assert_eq!(jsonl_session_directory_name("/home/user"), "--home-user--");
-        assert_eq!(jsonl_session_directory_name("/home/user/proj"), "--home-user-proj--");
+        assert_eq!(
+            jsonl_session_directory_name("/home/user/proj"),
+            "--home-user-proj--"
+        );
         // Leading backslash stripped; backslashes + colons → '-'.
-        assert_eq!(jsonl_session_directory_name("\\Users\\bob"), "--Users-bob--");
+        assert_eq!(
+            jsonl_session_directory_name("\\Users\\bob"),
+            "--Users-bob--"
+        );
         // `C:\dev` (in TS/literal form): leading char is `C` (not a slash, no
         // strip), then `:` and `\` both → `-`, giving `C--dev`.
         assert_eq!(jsonl_session_directory_name("C:\\dev"), "--C--dev--");
@@ -722,9 +810,15 @@ mod tests {
         // Unix epoch.
         assert_eq!(iso_timestamp_from_ms(0), "1970-01-01T00:00:00.000Z");
         // 2023-11-14T22:13:20.000Z (1700000000000 ms).
-        assert_eq!(iso_timestamp_from_ms(1_700_000_000_000), "2023-11-14T22:13:20.000Z");
+        assert_eq!(
+            iso_timestamp_from_ms(1_700_000_000_000),
+            "2023-11-14T22:13:20.000Z"
+        );
         // Millisecond precision.
-        assert_eq!(iso_timestamp_from_ms(1_700_000_000_123), "2023-11-14T22:13:20.123Z");
+        assert_eq!(
+            iso_timestamp_from_ms(1_700_000_000_123),
+            "2023-11-14T22:13:20.123Z"
+        );
     }
 
     #[tokio::test]
@@ -747,7 +841,10 @@ mod tests {
             .append_entry(
                 ProvisionedEntry {
                     id: "e1".into(),
-                    kind: ProvisionedKind::Message { message: user_msg("hi"), terminate: None },
+                    kind: ProvisionedKind::Message {
+                        message: user_msg("hi"),
+                        terminate: None,
+                    },
                 },
                 "main",
             )
@@ -756,7 +853,9 @@ mod tests {
 
         // list surfaces it.
         let listed = r
-            .list_typed(&JsonlSessionListOptions { cwd: Some("/proj".into()) })
+            .list_typed(&JsonlSessionListOptions {
+                cwd: Some("/proj".into()),
+            })
             .await
             .unwrap();
         assert_eq!(listed.len(), 1);
@@ -764,13 +863,19 @@ mod tests {
 
         // open_by_jsonl_metadata re-loads it.
         let reopened = r.open_by_jsonl_metadata(&listed[0]).await.unwrap();
-        let got = reopened.get_entry("e1").await.unwrap().expect("entry exists");
+        let got = reopened
+            .get_entry("e1")
+            .await
+            .unwrap()
+            .expect("entry exists");
         assert_eq!(got.id(), "e1");
 
         // delete removes the file.
         r.delete_by_jsonl_metadata(&listed[0]).await.unwrap();
         let after = r
-            .list_typed(&JsonlSessionListOptions { cwd: Some("/proj".into()) })
+            .list_typed(&JsonlSessionListOptions {
+                cwd: Some("/proj".into()),
+            })
             .await
             .unwrap();
         assert!(after.is_empty());
@@ -801,7 +906,11 @@ mod tests {
 
         // Trait create uses the repo's default cwd ("/proj" from env.cwd).
         let _storage = r
-            .create(&SessionCreateOptions { id: Some("t-1".into()), parent_session_id: None, metadata: None })
+            .create(&SessionCreateOptions {
+                id: Some("t-1".into()),
+                parent_session_id: None,
+                metadata: None,
+            })
             .await
             .unwrap();
         let listed = r.list().await.unwrap();
@@ -832,14 +941,19 @@ mod tests {
             .append_entry(
                 ProvisionedEntry {
                     id: "m1".into(),
-                    kind: ProvisionedKind::Message { message: user_msg("hello"), terminate: None },
+                    kind: ProvisionedKind::Message {
+                        message: user_msg("hello"),
+                        terminate: None,
+                    },
                 },
                 "main",
             )
             .await
             .unwrap();
         let listed = r
-            .list_typed(&JsonlSessionListOptions { cwd: Some("/proj".into()) })
+            .list_typed(&JsonlSessionListOptions {
+                cwd: Some("/proj".into()),
+            })
             .await
             .unwrap();
         let src_meta = listed.iter().find(|m| m.id == "src").unwrap().clone();
@@ -858,11 +972,17 @@ mod tests {
             .await
             .unwrap();
         // Forked session carries the source's message.
-        let got = forked.get_entry("m1").await.unwrap().expect("forked entry exists");
+        let got = forked
+            .get_entry("m1")
+            .await
+            .unwrap()
+            .expect("forked entry exists");
         assert_eq!(got.id(), "m1");
         // And lists as a separate session with parent = src.
         let listed = r
-            .list_typed(&JsonlSessionListOptions { cwd: Some("/proj".into()) })
+            .list_typed(&JsonlSessionListOptions {
+                cwd: Some("/proj".into()),
+            })
             .await
             .unwrap();
         let fork_meta = listed.iter().find(|m| m.id == "fork-1").unwrap();
@@ -875,7 +995,11 @@ mod tests {
         let fs: Arc<dyn FileSystem> = Arc::new(env);
         let r = repo(fs);
         let err = r
-            .open(&SessionMetadata { id: "ghost".into(), created_at: 0, parent_session_id: None })
+            .open(&SessionMetadata {
+                id: "ghost".into(),
+                created_at: 0,
+                parent_session_id: None,
+            })
             .await
             .err()
             .unwrap();
@@ -902,12 +1026,20 @@ mod tests {
             .await
             .unwrap();
         let listed = r
-            .list_typed(&JsonlSessionListOptions { cwd: Some("/proj".into()) })
+            .list_typed(&JsonlSessionListOptions {
+                cwd: Some("/proj".into()),
+            })
             .await
             .unwrap();
         let m = listed.iter().find(|m| m.id == "m-1").unwrap();
-        assert_eq!(m.metadata.as_ref().unwrap().get("title"), Some(&JsonValue::String("my session".into())));
-        assert_eq!(m.metadata.as_ref().unwrap().get("count"), Some(&JsonValue::Number(42.into())));
+        assert_eq!(
+            m.metadata.as_ref().unwrap().get("title"),
+            Some(&JsonValue::String("my session".into()))
+        );
+        assert_eq!(
+            m.metadata.as_ref().unwrap().get("count"),
+            Some(&JsonValue::Number(42.into()))
+        );
     }
 
     #[tokio::test]
@@ -938,7 +1070,9 @@ mod tests {
                 .unwrap();
         }
         let listed = r
-            .list_typed(&JsonlSessionListOptions { cwd: Some("/proj".into()) })
+            .list_typed(&JsonlSessionListOptions {
+                cwd: Some("/proj".into()),
+            })
             .await
             .unwrap();
         let ids: Vec<&str> = listed.iter().map(|m| m.id.as_str()).collect();
@@ -952,7 +1086,12 @@ mod tests {
     #[allow(dead_code)]
     fn _operation_started_record() -> OperationStartedRecord {
         OperationStartedRecord {
-            base: RecordBase { id: "op".into(), seq: 0, lane: "main".into(), timestamp: 0 },
+            base: RecordBase {
+                id: "op".into(),
+                seq: 0,
+                lane: "main".into(),
+                timestamp: 0,
+            },
             source_leaf_id: None,
             intent: OperationIntent::Run {
                 original_prompt: vec![],

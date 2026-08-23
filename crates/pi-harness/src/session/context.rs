@@ -23,8 +23,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use rpi_ai::types::StopReason;
 use rpi_agent::message::AgentMessage;
+use rpi_ai::types::StopReason;
 
 use crate::messages::{create_branch_summary_message, create_compaction_summary_message};
 use crate::session::types::{BranchSummaryEntry, CompactionEntry, CustomEntry, Entry};
@@ -62,7 +62,10 @@ impl std::fmt::Debug for SessionContextBuildOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SessionContextBuildOptions")
             .field("entry_transforms", &self.entry_transforms.len())
-            .field("entry_projectors", &self.entry_projectors.keys().collect::<Vec<_>>())
+            .field(
+                "entry_projectors",
+                &self.entry_projectors.keys().collect::<Vec<_>>(),
+            )
             .finish()
     }
 }
@@ -91,7 +94,10 @@ pub fn default_context_entry_transform(path_entries: &[Entry]) -> Vec<Entry> {
 
 /// `buildContextEntries` — apply the default transform, then each caller
 /// transform in order. Mirrors TS `buildContextEntries`.
-pub fn build_context_entries(path_entries: &[Entry], options: &SessionContextBuildOptions) -> Vec<Entry> {
+pub fn build_context_entries(
+    path_entries: &[Entry],
+    options: &SessionContextBuildOptions,
+) -> Vec<Entry> {
     let mut entries = default_context_entry_transform(path_entries);
     for transform in &options.entry_transforms {
         entries = transform(&entries);
@@ -144,7 +150,11 @@ fn branch_summary_to_context_messages(b: &BranchSummaryEntry) -> Vec<AgentMessag
     if b.summary.is_empty() {
         return Vec::new();
     }
-    vec![create_branch_summary_message(&b.summary, &b.from_id, b.base.timestamp)]
+    vec![create_branch_summary_message(
+        &b.summary,
+        &b.from_id,
+        b.base.timestamp,
+    )]
 }
 
 /// Custom entry → registered projector's messages, or `[]` when no projector is
@@ -192,12 +202,20 @@ fn derive_session_context_state(path_entries: &[Entry]) -> SessionContext {
 /// `buildSessionContext(pathEntries, options)` — derive state from the full path,
 /// build context entries (default transform + caller transforms), flatMap each
 /// to context messages. Mirrors TS `buildSessionContext`.
-pub fn build_session_context(path_entries: &[Entry], options: &SessionContextBuildOptions) -> SessionContext {
+pub fn build_session_context(
+    path_entries: &[Entry],
+    options: &SessionContextBuildOptions,
+) -> SessionContext {
     let mut ctx = derive_session_context_state(path_entries);
     let context_entries = build_context_entries(path_entries, options);
     let mut messages = Vec::new();
     for (index, entry) in context_entries.iter().enumerate() {
-        messages.extend(session_entry_to_context_messages(entry, index, &context_entries, options));
+        messages.extend(session_entry_to_context_messages(
+            entry,
+            index,
+            &context_entries,
+            options,
+        ));
     }
     ctx.messages = messages;
     ctx
@@ -206,15 +224,20 @@ pub fn build_session_context(path_entries: &[Entry], options: &SessionContextBui
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rpi_ai::types::AssistantMessage;
     use rpi_agent::message::AgentMessage;
+    use rpi_ai::types::AssistantMessage;
 
     fn user(text: &str) -> AgentMessage {
         AgentMessage::User(rpi_ai::types::UserMessage::new(text, 1))
     }
 
     fn assistant(text: &str) -> AgentMessage {
-        let mut a = AssistantMessage::empty(rpi_ai::types::Api::Faux, "anthropic", "claude-sonnet-4-5", 1);
+        let mut a = AssistantMessage::empty(
+            rpi_ai::types::Api::Faux,
+            "anthropic",
+            "claude-sonnet-4-5",
+            1,
+        );
         a.content = vec![rpi_ai::types::Content::text(text)];
         a.stop_reason = rpi_ai::types::StopReason::Stop;
         AgentMessage::Assistant(Box::new(a))
@@ -241,8 +264,14 @@ mod tests {
         msg_entry(id, Some(parent), message, seq)
     }
 
-    fn compaction_entry(id: &str, parent: &str, summary: &str, tail: Vec<AgentMessage>, seq: u64) -> Entry {
-        use crate::session::types::{EntryBase, CompactionEntry};
+    fn compaction_entry(
+        id: &str,
+        parent: &str,
+        summary: &str,
+        tail: Vec<AgentMessage>,
+        seq: u64,
+    ) -> Entry {
+        use crate::session::types::{CompactionEntry, EntryBase};
         Entry::Compaction(CompactionEntry {
             base: EntryBase {
                 entry_type: "compaction".into(),
@@ -288,8 +317,14 @@ mod tests {
         })
     }
 
-    fn branch_summary_entry(id: &str, parent: &str, from_id: &str, summary: &str, seq: u64) -> Entry {
-        use crate::session::types::{EntryBase, BranchSummaryEntry};
+    fn branch_summary_entry(
+        id: &str,
+        parent: &str,
+        from_id: &str,
+        summary: &str,
+        seq: u64,
+    ) -> Entry {
+        use crate::session::types::{BranchSummaryEntry, EntryBase};
         Entry::BranchSummary(BranchSummaryEntry {
             base: EntryBase {
                 entry_type: "branch_summary".into(),
@@ -306,7 +341,7 @@ mod tests {
     }
 
     fn custom_entry(id: &str, parent: &str, custom_type: &str, data: &str, seq: u64) -> Entry {
-        use crate::session::types::{EntryBase, CustomEntry};
+        use crate::session::types::{CustomEntry, EntryBase};
         Entry::Custom(CustomEntry {
             base: EntryBase {
                 entry_type: "custom".into(),
@@ -324,14 +359,23 @@ mod tests {
     fn starts_at_latest_compaction_and_materializes_retained_tail() {
         let entries = vec![
             msg_entry("old", None, user("old"), 1),
-            compaction_entry("compact", "old", "summary", vec![user("retained"), assistant("answer")], 2),
+            compaction_entry(
+                "compact",
+                "old",
+                "summary",
+                vec![user("retained"), assistant("answer")],
+                2,
+            ),
             model_change("model", "compact", "openai", "gpt-5", 3),
             thinking_level("thinking", "model", "high", 4),
             msg_entry_p("tail", "thinking", user("tail"), 5),
         ];
         let ctx = build_session_context(&entries, &SessionContextBuildOptions::default());
         assert_eq!(
-            ctx.messages.iter().map(|m| m.role().as_str().to_string()).collect::<Vec<_>>(),
+            ctx.messages
+                .iter()
+                .map(|m| m.role().as_str().to_string())
+                .collect::<Vec<_>>(),
             ["compactionSummary", "user", "assistant", "user"]
         );
         assert_eq!(ctx.model, Some(("openai".to_string(), "gpt-5".to_string())));
@@ -346,15 +390,23 @@ mod tests {
             branch_summary_entry("branch", "compact", "abandoned", "branch summary", 3),
             msg_entry_p("tail", "branch", user("tail"), 4),
         ];
-        let drop_compaction: ContextEntryTransform =
-            Arc::new(|ctx_entries: &[Entry]| ctx_entries.iter().filter(|e| !matches!(e, Entry::Compaction(_))).cloned().collect());
+        let drop_compaction: ContextEntryTransform = Arc::new(|ctx_entries: &[Entry]| {
+            ctx_entries
+                .iter()
+                .filter(|e| !matches!(e, Entry::Compaction(_)))
+                .cloned()
+                .collect()
+        });
         let opts = SessionContextBuildOptions {
             entry_transforms: vec![drop_compaction],
             entry_projectors: BTreeMap::new(),
         };
         let ctx = build_session_context(&entries, &opts);
         assert_eq!(
-            ctx.messages.iter().map(|m| m.role().as_str().to_string()).collect::<Vec<_>>(),
+            ctx.messages
+                .iter()
+                .map(|m| m.role().as_str().to_string())
+                .collect::<Vec<_>>(),
             ["branchSummary", "user"]
         );
     }
@@ -375,18 +427,36 @@ mod tests {
         });
         let entries = vec![
             msg_entry("user", None, user("hello"), 1),
-            msg_entry_p("deferred", "user", AgentMessage::Assistant(Box::new(deferred)), 2),
+            msg_entry_p(
+                "deferred",
+                "user",
+                AgentMessage::Assistant(Box::new(deferred)),
+                2,
+            ),
             custom_entry("custom", "deferred", "note", "project me", 3),
         ];
         let projector: CustomEntryContextMessageProjector = Arc::new(|c: &CustomEntry, _, _| {
-            vec![user(&format!("note: {}", c.data.clone().unwrap_or(serde_json::Value::Null).to_string().trim_matches('"')))]
+            vec![user(&format!(
+                "note: {}",
+                c.data
+                    .clone()
+                    .unwrap_or(serde_json::Value::Null)
+                    .to_string()
+                    .trim_matches('"')
+            ))]
         });
         let mut projectors = BTreeMap::new();
         projectors.insert("note".to_string(), projector);
-        let opts = SessionContextBuildOptions { entry_transforms: vec![], entry_projectors: projectors };
+        let opts = SessionContextBuildOptions {
+            entry_transforms: vec![],
+            entry_projectors: projectors,
+        };
         let ctx = build_session_context(&entries, &opts);
         assert_eq!(
-            ctx.messages.iter().map(|m| m.role().as_str().to_string()).collect::<Vec<_>>(),
+            ctx.messages
+                .iter()
+                .map(|m| m.role().as_str().to_string())
+                .collect::<Vec<_>>(),
             ["user", "user"]
         );
     }

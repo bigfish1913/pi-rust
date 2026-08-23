@@ -13,11 +13,13 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+use rpi_agent::message::AgentMessage;
 use rpi_ai::providers::faux::{FauxProvider, FauxScript, FauxStep};
 use rpi_ai::types::{StopReason, Usage, UsageCost, UserContent, UserMessage};
 use rpi_ai::{Model, Provider};
-use rpi_agent::message::AgentMessage;
-use rpi_harness::compaction::{compact, CompactionError, CompactionLlmOptions, CompactionPreparation, FileOperations};
+use rpi_harness::compaction::{
+    compact, CompactionError, CompactionLlmOptions, CompactionPreparation, FileOperations,
+};
 use rpi_harness::types::CompactionSettings;
 use tokio_util::sync::CancellationToken;
 
@@ -30,7 +32,13 @@ fn mock_usage(input: i64, output: i64, cache_read: i64, cache_write: i64) -> Usa
         cache_write_1h: None,
         reasoning: None,
         total_tokens: input + output + cache_read + cache_write,
-        cost: UsageCost { input: 0.0, output: 0.0, cache_read: 0.0, cache_write: 0.0, total: 0.0 },
+        cost: UsageCost {
+            input: 0.0,
+            output: 0.0,
+            cache_read: 0.0,
+            cache_write: 0.0,
+            total: 0.0,
+        },
     }
 }
 
@@ -59,7 +67,11 @@ fn split_preparation(messages: Vec<AgentMessage>) -> CompactionPreparation {
         tokens_before: 100,
         previous_summary: None,
         file_ops: FileOperations::default(),
-        settings: CompactionSettings { enabled: true, reserve_tokens: 2000, keep_recent_tokens: 20 },
+        settings: CompactionSettings {
+            enabled: true,
+            reserve_tokens: 2000,
+            keep_recent_tokens: 20,
+        },
     }
 }
 
@@ -85,17 +97,36 @@ async fn split_turn_invokes_provider_twice_and_combines_usage() {
     let provider = FauxProvider::new(script);
     let model = provider.default_model().clone();
 
-    let result = compact(&preparation, &llm_options(provider.clone() as Arc<dyn Provider>, model))
-        .await
-        .expect("split-turn compact should succeed");
+    let result = compact(
+        &preparation,
+        &llm_options(provider.clone() as Arc<dyn Provider>, model),
+    )
+    .await
+    .expect("split-turn compact should succeed");
 
     // Invariant §10: exactly TWO LLM calls.
-    assert_eq!(provider.state().call_count.load(Ordering::Relaxed), 2, "split-turn must make two LLM calls");
+    assert_eq!(
+        provider.state().call_count.load(Ordering::Relaxed),
+        2,
+        "split-turn must make two LLM calls"
+    );
 
     // The two summaries are concatenated with the split-turn divider.
-    assert!(result.summary.contains("history summary"), "summary was: {}", result.summary);
-    assert!(result.summary.contains("Turn Context (split turn):"), "missing divider: {}", result.summary);
-    assert!(result.summary.contains("turn prefix summary"), "summary was: {}", result.summary);
+    assert!(
+        result.summary.contains("history summary"),
+        "summary was: {}",
+        result.summary
+    );
+    assert!(
+        result.summary.contains("Turn Context (split turn):"),
+        "missing divider: {}",
+        result.summary
+    );
+    assert!(
+        result.summary.contains("turn prefix summary"),
+        "summary was: {}",
+        result.summary
+    );
 
     let _ = (history_usage, turn_prefix_usage);
 }
@@ -114,15 +145,30 @@ async fn split_turn_with_empty_history_still_calls_turn_prefix_once() {
     let provider = FauxProvider::new(script);
     let model = provider.default_model().clone();
 
-    let result = compact(&preparation, &llm_options(provider.clone() as Arc<dyn Provider>, model))
-        .await
-        .expect("compact should succeed");
+    let result = compact(
+        &preparation,
+        &llm_options(provider.clone() as Arc<dyn Provider>, model),
+    )
+    .await
+    .expect("compact should succeed");
 
     // Only ONE call: the turn-prefix call.
     assert_eq!(provider.state().call_count.load(Ordering::Relaxed), 1);
-    assert!(result.summary.contains("No prior history."), "summary was: {}", result.summary);
-    assert!(result.summary.contains("prefix only summary"), "summary was: {}", result.summary);
-    assert!(result.summary.contains("Turn Context (split turn):"), "summary was: {}", result.summary);
+    assert!(
+        result.summary.contains("No prior history."),
+        "summary was: {}",
+        result.summary
+    );
+    assert!(
+        result.summary.contains("prefix only summary"),
+        "summary was: {}",
+        result.summary
+    );
+    assert!(
+        result.summary.contains("Turn Context (split turn):"),
+        "summary was: {}",
+        result.summary
+    );
 }
 
 #[tokio::test]
@@ -135,7 +181,8 @@ async fn split_turn_turn_prefix_error_maps_to_summarization_failed() {
     let mut preparation = split_preparation(messages.clone());
     preparation.messages_to_summarize = Vec::new();
 
-    let mut err_msg = rpi_ai::types::AssistantMessage::empty(rpi_ai::types::Api::Faux, "faux", "faux", 0);
+    let mut err_msg =
+        rpi_ai::types::AssistantMessage::empty(rpi_ai::types::Api::Faux, "faux", "faux", 0);
     err_msg.stop_reason = StopReason::Error;
     err_msg.error_message = Some("prefix failed".to_string());
     let script = FauxScript::new();
@@ -143,12 +190,23 @@ async fn split_turn_turn_prefix_error_maps_to_summarization_failed() {
     let provider = FauxProvider::new(script);
     let model = provider.default_model().clone();
 
-    let err = compact(&preparation, &llm_options(provider.clone() as Arc<dyn Provider>, model))
-        .await
-        .expect_err("turn-prefix error must map to a CompactionError");
+    let err = compact(
+        &preparation,
+        &llm_options(provider.clone() as Arc<dyn Provider>, model),
+    )
+    .await
+    .expect_err("turn-prefix error must map to a CompactionError");
     assert_eq!(err.code.as_str(), "summarization_failed");
-    assert!(err.message.contains("Turn prefix summarization failed"), "message was: {}", err.message);
-    assert!(err.message.contains("prefix failed"), "message was: {}", err.message);
+    assert!(
+        err.message.contains("Turn prefix summarization failed"),
+        "message was: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("prefix failed"),
+        "message was: {}",
+        err.message
+    );
 
     let _ = CompactionError::summarization_failed("");
 }

@@ -45,7 +45,10 @@ pub struct SessionError {
 
 impl SessionError {
     pub fn new(code: SessionErrorCode, message: impl Into<String>) -> Self {
-        Self { code, message: message.into() }
+        Self {
+            code,
+            message: message.into(),
+        }
     }
 
     pub fn not_found(message: impl Into<String>) -> Self {

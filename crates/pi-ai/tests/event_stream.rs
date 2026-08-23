@@ -15,7 +15,9 @@ async fn drain_deltas_then_done() {
     let (mut prod, mut stream) = create_assistant_message_event_stream();
     let partial = empty_partial(0);
 
-    prod.push(AssistantMessageEvent::Start { partial: partial.clone() });
+    prod.push(AssistantMessageEvent::Start {
+        partial: partial.clone(),
+    });
     prod.push(AssistantMessageEvent::TextStart {
         content_index: 0,
         partial: partial.clone(),
@@ -42,7 +44,10 @@ async fn drain_deltas_then_done() {
     while let Some(ev) = stream.next().await {
         tags.push(ev.type_tag());
     }
-    assert_eq!(tags, vec!["start", "text_start", "text_delta", "text_end", "done"]);
+    assert_eq!(
+        tags,
+        vec!["start", "text_start", "text_delta", "text_end", "done"]
+    );
 
     let result = stream.result().await.unwrap();
     assert!(matches!(result.stop_reason, StopReason::Stop));
@@ -71,20 +76,15 @@ async fn result_resolves_to_error_message() {
 #[tokio::test]
 async fn push_after_terminal_is_noop() {
     let (mut prod, mut stream) = create_assistant_message_event_stream();
-    let msg = AssistantMessage::terminal(
-        Api::Faux,
-        "faux",
-        "faux",
-        StopReason::Stop,
-        "",
-        0,
-    );
+    let msg = AssistantMessage::terminal(Api::Faux, "faux", "faux", StopReason::Stop, "", 0);
     assert!(prod.push(AssistantMessageEvent::Done {
         reason: DoneReason::Stop,
         message: msg,
     }));
     // Post-terminal push must not deliver an extra event.
-    assert!(prod.push(AssistantMessageEvent::Start { partial: empty_partial(1) }));
+    assert!(prod.push(AssistantMessageEvent::Start {
+        partial: empty_partial(1)
+    }));
 
     let mut tags = Vec::new();
     while let Some(ev) = stream.next().await {

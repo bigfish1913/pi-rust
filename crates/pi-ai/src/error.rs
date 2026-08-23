@@ -17,39 +17,32 @@ pub enum AiError {
         message: String,
     },
     /// SSE parse / stream-corruption failure.
-    Sse {
-        message: String,
-    },
+    Sse { message: String },
     /// Auth failure (401/403, missing/expired key).
-    Auth {
-        message: String,
-    },
+    Auth { message: String },
     /// Operation cancelled via `CancellationToken`.
-    Abort {
-        message: String,
-    },
+    Abort { message: String },
     /// JSON-Schema validation of tool arguments failed (after coercion).
-    Schema {
-        message: String,
-    },
+    Schema { message: String },
     /// Provider returned a structured error body.
-    Provider {
-        code: String,
-        message: String,
-    },
+    Provider { code: String, message: String },
     /// Usage / cost computation failed (malformed provider usage payload).
-    Usage {
-        message: String,
-    },
+    Usage { message: String },
 }
 
 impl fmt::Display for AiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            AiError::Http { status: Some(s), message } => {
+            AiError::Http {
+                status: Some(s),
+                message,
+            } => {
                 write!(f, "http error {s}: {message}")
             }
-            AiError::Http { status: None, message } => write!(f, "http error: {message}"),
+            AiError::Http {
+                status: None,
+                message,
+            } => write!(f, "http error: {message}"),
             AiError::Sse { message } => write!(f, "sse error: {message}"),
             AiError::Auth { message } => write!(f, "auth error: {message}"),
             AiError::Abort { message } => write!(f, "abort error: {message}"),
@@ -72,7 +65,9 @@ impl AiError {
     /// predicate (408/409/429/>=500 plus transport-level Http with no status).
     pub fn is_retryable(&self) -> bool {
         match self {
-            AiError::Http { status: Some(s), .. } => matches!(*s, 408 | 409 | 429) || *s >= 500,
+            AiError::Http {
+                status: Some(s), ..
+            } => matches!(*s, 408 | 409 | 429) || *s >= 500,
             AiError::Http { status: None, .. } => true,
             _ => false,
         }

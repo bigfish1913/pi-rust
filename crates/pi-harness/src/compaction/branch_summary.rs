@@ -10,9 +10,9 @@
 
 use std::collections::BTreeSet;
 
+use rpi_agent::message::AgentMessage;
 use rpi_ai::types::{Content, Context, Message, StopReason, Usage, UserContent, UserMessage};
 use rpi_ai::ThinkingLevel;
-use rpi_agent::message::AgentMessage;
 use serde::{Deserialize, Serialize};
 
 use crate::compaction::compaction::{
@@ -105,14 +105,19 @@ impl Default for GenerateBranchSummaryOptions {
 fn get_message_from_entry(entry: &Entry) -> Option<AgentMessage> {
     match entry {
         Entry::Message(m) => {
-            if matches!(m.message.role(), rpi_agent::message::AgentMessageRole::ToolResult) {
+            if matches!(
+                m.message.role(),
+                rpi_agent::message::AgentMessageRole::ToolResult
+            ) {
                 return None;
             }
             Some(m.message.clone())
         }
-        Entry::BranchSummary(b) => {
-            Some(create_branch_summary_message(&b.summary, &b.from_id, b.base.timestamp))
-        }
+        Entry::BranchSummary(b) => Some(create_branch_summary_message(
+            &b.summary,
+            &b.from_id,
+            b.base.timestamp,
+        )),
         Entry::Compaction(c) => Some(create_compaction_summary_message(
             &c.summary,
             c.tokens_before,
@@ -136,13 +141,21 @@ pub async fn collect_entries_for_branch_summary<S: SessionTree + ?Sized>(
 ) -> SessionResult<CollectEntriesResult> {
     let old_leaf_id = match old_leaf_id {
         Some(id) => id,
-        None => return Ok(CollectEntriesResult { entries: Vec::new(), common_ancestor_id: None }),
+        None => {
+            return Ok(CollectEntriesResult {
+                entries: Vec::new(),
+                common_ancestor_id: None,
+            })
+        }
     };
 
     let old_path: BTreeSet<String> = session
         .find_entries_on_branch(
             &EntryQuery::default(),
-            &BranchBounds { start: Some(old_leaf_id.to_string()), ..Default::default() },
+            &BranchBounds {
+                start: Some(old_leaf_id.to_string()),
+                ..Default::default()
+            },
         )
         .await?
         .iter()
@@ -152,7 +165,10 @@ pub async fn collect_entries_for_branch_summary<S: SessionTree + ?Sized>(
     let target_path = session
         .find_entries_on_branch(
             &EntryQuery::default(),
-            &BranchBounds { start: Some(target_id.to_string()), ..Default::default() },
+            &BranchBounds {
+                start: Some(target_id.to_string()),
+                ..Default::default()
+            },
         )
         .await?;
 
@@ -167,15 +183,19 @@ pub async fn collect_entries_for_branch_summary<S: SessionTree + ?Sized>(
         if Some(&cur) == common_ancestor_id.as_ref() {
             break;
         }
-        let entry = session
-            .get_entry(&cur)
-            .await?
-            .ok_or_else(|| SessionError::invalid_entry(format!("Entry {cur} not found while collecting branch summary")))?;
+        let entry = session.get_entry(&cur).await?.ok_or_else(|| {
+            SessionError::invalid_entry(format!(
+                "Entry {cur} not found while collecting branch summary"
+            ))
+        })?;
         current = entry.parent_id().map(|s| s.to_string());
         entries.push(entry);
     }
     entries.reverse();
-    Ok(CollectEntriesResult { entries, common_ancestor_id })
+    Ok(CollectEntriesResult {
+        entries,
+        common_ancestor_id,
+    })
 }
 
 /// Prepare branch entries for summarization within an optional token budget.
@@ -198,7 +218,10 @@ pub fn prepare_branch_entries(entries: &[Entry], token_budget: i64) -> BranchPre
                         }
                     }
                 }
-                if let Some(arr) = details_value.get("modifiedFiles").and_then(|v| v.as_array()) {
+                if let Some(arr) = details_value
+                    .get("modifiedFiles")
+                    .and_then(|v| v.as_array())
+                {
                     for f in arr {
                         if let Some(s) = f.as_str() {
                             file_ops.edited.insert(s.to_string());
@@ -241,7 +264,11 @@ pub fn prepare_branch_entries(entries: &[Entry], token_budget: i64) -> BranchPre
         }
     }
 
-    BranchPreparation { messages, file_ops, total_tokens }
+    BranchPreparation {
+        messages,
+        file_ops,
+        total_tokens,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -283,12 +310,16 @@ pub async fn generate_branch_summary(
     let llm_messages = convert_to_llm(prep.messages.clone());
     let conversation_text = serialize_conversation(&llm_messages);
 
-    let instructions: String = match (&options.llm.custom_instructions, options.replace_instructions) {
+    let instructions: String = match (
+        &options.llm.custom_instructions,
+        options.replace_instructions,
+    ) {
         (Some(ci), true) => ci.clone(),
         (Some(ci), false) => format!("{BRANCH_SUMMARY_PROMPT}\n\nAdditional focus: {ci}"),
         (None, _) => BRANCH_SUMMARY_PROMPT.to_string(),
     };
-    let prompt_text = format!("<conversation>\n{conversation_text}\n</conversation>\n\n{instructions}");
+    let prompt_text =
+        format!("<conversation>\n{conversation_text}\n</conversation>\n\n{instructions}");
 
     let summarization_messages = vec![Message::User(UserMessage::new(
         UserContent::Blocks(vec![Content::text(prompt_text)]),
@@ -323,7 +354,10 @@ pub async fn generate_branch_summary(
 
     if response.stop_reason == StopReason::Aborted {
         return Err(BranchSummaryError::aborted(
-            response.error_message.as_deref().unwrap_or("Branch summary aborted"),
+            response
+                .error_message
+                .as_deref()
+                .unwrap_or("Branch summary aborted"),
         ));
     }
     if response.stop_reason == StopReason::Error {
@@ -339,7 +373,11 @@ pub async fn generate_branch_summary(
     summary += &format_file_operations(&read_files, &modified_files);
 
     Ok(BranchSummaryResult {
-        summary: if summary.is_empty() { "No summary generated".to_string() } else { summary },
+        summary: if summary.is_empty() {
+            "No summary generated".to_string()
+        } else {
+            summary
+        },
         usage: Some(response.usage.clone()),
         read_files,
         modified_files,
@@ -351,7 +389,11 @@ pub async fn generate_branch_summary(
 impl GenerateBranchSummaryOptions {
     /// Build options with a given LLM config and the default reserve.
     pub fn new(llm: CompactionLlmOptions) -> Self {
-        Self { llm, replace_instructions: false, reserve_tokens: Self::DEFAULT_RESERVE_TOKENS }
+        Self {
+            llm,
+            replace_instructions: false,
+            reserve_tokens: Self::DEFAULT_RESERVE_TOKENS,
+        }
     }
 }
 
@@ -369,7 +411,10 @@ mod tests {
                 parent_id: None,
                 timestamp: seq as i64,
             },
-            message: AgentMessage::User(UserMessage::new(UserContent::Text(text.into()), seq as i64)),
+            message: AgentMessage::User(UserMessage::new(
+                UserContent::Text(text.into()),
+                seq as i64,
+            )),
             terminate: None,
         })
     }
@@ -387,7 +432,10 @@ mod tests {
         // and is unshifted; leading 26-char msg (ceil(26/4)=7) overflows
         // (1+7=8 > 3), is a plain user message (not compaction/branch_summary),
         // so it is dropped and the loop breaks. Result: only the trailing msg.
-        let entries = vec![user_msg("abcdefghijklmnopqrstuvwxyz", 1), user_msg("XYZ", 2)];
+        let entries = vec![
+            user_msg("abcdefghijklmnopqrstuvwxyz", 1),
+            user_msg("XYZ", 2),
+        ];
         let p = prepare_branch_entries(&entries, 3);
         assert_eq!(p.messages.len(), 1);
         assert!(matches!(

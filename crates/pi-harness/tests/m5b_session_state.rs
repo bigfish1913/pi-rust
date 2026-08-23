@@ -5,14 +5,12 @@
 //! These run against the public `rpi_harness::session` API only — no JSONL,
 //! no harness run loop (those land in M5c/M5g).
 
-use rpi_ai::types::{Api, StopReason, Usage};
 use rpi_agent::message::AgentMessage;
+use rpi_ai::types::{Api, StopReason, Usage};
 use rpi_harness::session::types::*;
+use rpi_harness::session::types::{EntryBase, ProvisionedEntry, ProvisionedKind, SessionMutation};
 use rpi_harness::session::{
     validate_record_log, RecordLogCorruptionReason, RecordLogSlice, SessionState,
-};
-use rpi_harness::session::types::{
-    EntryBase, ProvisionedEntry, ProvisionedKind, SessionMutation,
 };
 
 // ---- builders that mirror the TS `reducer.test.ts` fixtures ----
@@ -40,13 +38,12 @@ fn user_message(text: &str) -> AgentMessage {
     AgentMessage::User(rpi_ai::types::UserMessage::new(text, 1))
 }
 
-fn assistant_message(content: Vec<rpi_ai::types::Content>, stop_reason: StopReason) -> AgentMessage {
-    let mut msg = rpi_ai::types::AssistantMessage::empty(
-        Api::OpenaiResponses,
-        "openai",
-        "test-model",
-        1,
-    );
+fn assistant_message(
+    content: Vec<rpi_ai::types::Content>,
+    stop_reason: StopReason,
+) -> AgentMessage {
+    let mut msg =
+        rpi_ai::types::AssistantMessage::empty(Api::OpenaiResponses, "openai", "test-model", 1);
     msg.content = content;
     msg.stop_reason = stop_reason;
     msg.usage = usage_fixture();
@@ -68,7 +65,13 @@ fn tool_result_message(tool_call_id: &str, tool_name: &str) -> AgentMessage {
 }
 
 fn msg_provisioned(id: &str, message: AgentMessage) -> ProvisionedEntry {
-    ProvisionedEntry { id: id.to_string(), kind: ProvisionedKind::Message { message, terminate: None } }
+    ProvisionedEntry {
+        id: id.to_string(),
+        kind: ProvisionedKind::Message {
+            message,
+            terminate: None,
+        },
+    }
 }
 
 fn msg_entry(id: &str, message: AgentMessage, seq: u64, parent_id: Option<&str>) -> Entry {
@@ -79,7 +82,11 @@ fn msg_entry(id: &str, message: AgentMessage, seq: u64, parent_id: Option<&str>)
         parent_id: parent_id.map(|s| s.to_string()),
         timestamp: seq as i64,
     };
-    Entry::Message(MessageEntry { base, message, terminate: None })
+    Entry::Message(MessageEntry {
+        base,
+        message,
+        terminate: None,
+    })
 }
 
 #[allow(dead_code)]
@@ -118,7 +125,12 @@ fn branch_summary_entry(id: &str, seq: u64) -> Entry {
 }
 
 fn rec_base(id: &str, seq: u64, lane: &str) -> RecordBase {
-    RecordBase { id: id.to_string(), seq, lane: lane.to_string(), timestamp: seq as i64 }
+    RecordBase {
+        id: id.to_string(),
+        seq,
+        lane: lane.to_string(),
+        timestamp: seq as i64,
+    }
 }
 
 fn run_started(seq: u64, id: &str) -> OperationStartedRecord {
@@ -134,7 +146,11 @@ fn run_started(seq: u64, id: &str) -> OperationStartedRecord {
     }
 }
 
-fn run_started_with_initials(seq: u64, id: &str, initials: Vec<serde_json::Value>) -> OperationStartedRecord {
+fn run_started_with_initials(
+    seq: u64,
+    id: &str,
+    initials: Vec<serde_json::Value>,
+) -> OperationStartedRecord {
     OperationStartedRecord {
         base: rec_base(id, seq, "main"),
         source_leaf_id: None,
@@ -148,7 +164,10 @@ fn run_started_with_initials(seq: u64, id: &str, initials: Vec<serde_json::Value
 }
 
 fn abort_requested(seq: u64, id: &str, run_id: &str) -> LaneRecord {
-    LaneRecord::AbortRequested(AbortRequestedRecord { base: rec_base(id, seq, "main"), run_id: run_id.to_string() })
+    LaneRecord::AbortRequested(AbortRequestedRecord {
+        base: rec_base(id, seq, "main"),
+        run_id: run_id.to_string(),
+    })
 }
 
 fn operation_finished(seq: u64, id: &str, run_id: &str) -> LaneRecord {
@@ -160,7 +179,15 @@ fn operation_finished(seq: u64, id: &str, run_id: &str) -> LaneRecord {
     })
 }
 
-fn attempt(seq: u64, id: &str, run_id: &str, step: StepKind, attempt_no: u32, result_id: &str, compaction_reason: Option<CompactionReason>) -> LaneRecord {
+fn attempt(
+    seq: u64,
+    id: &str,
+    run_id: &str,
+    step: StepKind,
+    attempt_no: u32,
+    result_id: &str,
+    compaction_reason: Option<CompactionReason>,
+) -> LaneRecord {
     LaneRecord::StepAttempt(StepAttemptRecord {
         base: rec_base(id, seq, "main"),
         run_id: run_id.to_string(),
@@ -189,7 +216,12 @@ fn recovery_slice(records: Vec<LaneRecord>, entries: Vec<Entry>) -> RecordLogSli
         })
         .collect();
     open.sort_by(|a, b| b.base.seq.cmp(&a.base.seq));
-    RecordLogSlice { lane: "main".to_string(), open_operations: open, records, entries }
+    RecordLogSlice {
+        lane: "main".to_string(),
+        open_operations: open,
+        records,
+        entries,
+    }
 }
 
 fn expect_corruption(slice: &RecordLogSlice, reason: RecordLogCorruptionReason) {
@@ -206,7 +238,11 @@ fn state_rejects_non_consecutive_seq() {
     let mut state = SessionState::new();
     // First mutation must be seq=1.
     let err = state
-        .apply_mutation(SessionMutation::Lane { seq: 5, lane: "main".to_string(), leaf_id: None })
+        .apply_mutation(SessionMutation::Lane {
+            seq: 5,
+            lane: "main".to_string(),
+            leaf_id: None,
+        })
         .unwrap_err();
     assert!(err.to_string().contains("non-consecutive seq"));
 }
@@ -317,7 +353,9 @@ fn state_open_operation_tracking_records_and_removes() {
             resume_data: None,
         },
     });
-    state.apply_mutation(SessionMutation::Record { record: started }).unwrap();
+    state
+        .apply_mutation(SessionMutation::Record { record: started })
+        .unwrap();
     let open = state.find_open_operations("main", Some(2)).unwrap();
     assert_eq!(open.len(), 1);
 
@@ -334,10 +372,16 @@ fn state_open_operation_tracking_records_and_removes() {
 fn state_facts_latest_wins() {
     let mut state = SessionState::new();
     state
-        .apply_mutation(SessionMutation::FactName { seq: 1, name: Some("first".to_string()) })
+        .apply_mutation(SessionMutation::FactName {
+            seq: 1,
+            name: Some("first".to_string()),
+        })
         .unwrap();
     state
-        .apply_mutation(SessionMutation::FactName { seq: 2, name: Some("second".to_string()) })
+        .apply_mutation(SessionMutation::FactName {
+            seq: 2,
+            name: Some("second".to_string()),
+        })
         .unwrap();
     assert_eq!(state.get_name(), Some("second"));
 }
@@ -380,8 +424,24 @@ fn reducer_non_consecutive_attempt() {
     let slice = recovery_slice(
         vec![
             LaneRecord::OperationStarted(run_started(1, "run-1")),
-            attempt(2, "a-1", "run-1", StepKind::Assistant, 1, "assistant-1", None),
-            attempt(3, "a-2", "run-1", StepKind::Assistant, 3, "assistant-2", None),
+            attempt(
+                2,
+                "a-1",
+                "run-1",
+                StepKind::Assistant,
+                1,
+                "assistant-1",
+                None,
+            ),
+            attempt(
+                3,
+                "a-2",
+                "run-1",
+                StepKind::Assistant,
+                3,
+                "assistant-2",
+                None,
+            ),
         ],
         vec![],
     );
@@ -405,7 +465,15 @@ fn reducer_invalid_compaction_reason_on_non_compaction() {
     let slice = recovery_slice(
         vec![
             LaneRecord::OperationStarted(run_started(1, "run-1")),
-            attempt(2, "a-1", "run-1", StepKind::Assistant, 1, "a-1", Some(CompactionReason::Manual)),
+            attempt(
+                2,
+                "a-1",
+                "run-1",
+                StepKind::Assistant,
+                1,
+                "a-1",
+                Some(CompactionReason::Manual),
+            ),
         ],
         vec![],
     );
@@ -441,7 +509,10 @@ fn reducer_invalid_queue_cancellation_no_enqueue() {
         entry_id: "queue-1".to_string(),
     });
     let slice = recovery_slice(
-        vec![LaneRecord::OperationStarted(run_started(1, "run-1")), cancel],
+        vec![
+            LaneRecord::OperationStarted(run_started(1, "run-1")),
+            cancel,
+        ],
         vec![],
     );
     expect_corruption(&slice, RecordLogCorruptionReason::InvalidQueueCancellation);
@@ -452,8 +523,24 @@ fn reducer_inconsistent_step_result_id() {
     let slice = recovery_slice(
         vec![
             LaneRecord::OperationStarted(run_started(1, "run-1")),
-            attempt(2, "a-1", "run-1", StepKind::Compaction, 1, "c-1", Some(CompactionReason::Threshold)),
-            attempt(3, "a-2", "run-1", StepKind::Compaction, 2, "c-2", Some(CompactionReason::Threshold)),
+            attempt(
+                2,
+                "a-1",
+                "run-1",
+                StepKind::Compaction,
+                1,
+                "c-1",
+                Some(CompactionReason::Threshold),
+            ),
+            attempt(
+                3,
+                "a-2",
+                "run-1",
+                StepKind::Compaction,
+                2,
+                "c-2",
+                Some(CompactionReason::Threshold),
+            ),
         ],
         vec![],
     );
@@ -465,7 +552,11 @@ fn reducer_tool_call_mismatch() {
     let assistant_tools = msg_entry(
         "assistant-tools",
         assistant_message(
-            vec![rpi_ai::types::Content::tool_call("call-1", "tool-1", serde_json::json!({}))],
+            vec![rpi_ai::types::Content::tool_call(
+                "call-1",
+                "tool-1",
+                serde_json::json!({}),
+            )],
             StopReason::ToolUse,
         ),
         1,
@@ -483,7 +574,10 @@ fn reducer_tool_call_mismatch() {
         replay: ToolReplay::Never,
     });
     let slice = recovery_slice(
-        vec![LaneRecord::OperationStarted(run_started(1, "run-1")), tool_start],
+        vec![
+            LaneRecord::OperationStarted(run_started(1, "run-1")),
+            tool_start,
+        ],
         vec![assistant_tools],
     );
     expect_corruption(&slice, RecordLogCorruptionReason::ToolCallMismatch);
@@ -494,7 +588,11 @@ fn reducer_duplicate_tool_invocation() {
     let assistant_tools = msg_entry(
         "assistant-tools",
         assistant_message(
-            vec![rpi_ai::types::Content::tool_call("call-1", "tool-1", serde_json::json!({}))],
+            vec![rpi_ai::types::Content::tool_call(
+                "call-1",
+                "tool-1",
+                serde_json::json!({}),
+            )],
             StopReason::ToolUse,
         ),
         1,
@@ -543,7 +641,10 @@ fn reducer_invalid_deferred_handle() {
         a.deferred = None;
     }
     let persisted = msg_entry("assistant-deferred", msg, 2, None);
-    let slice = recovery_slice(vec![LaneRecord::OperationStarted(run_started(1, "run-1"))], vec![persisted]);
+    let slice = recovery_slice(
+        vec![LaneRecord::OperationStarted(run_started(1, "run-1"))],
+        vec![persisted],
+    );
     expect_corruption(&slice, RecordLogCorruptionReason::InvalidDeferredHandle);
 }
 
@@ -555,13 +656,22 @@ fn reducer_valid_one_tool_run_prefixes() {
     let assistant_tools = msg_entry(
         "assistant-tools",
         assistant_message(
-            vec![rpi_ai::types::Content::tool_call("call-1", "tool-1", serde_json::json!({}))],
+            vec![rpi_ai::types::Content::tool_call(
+                "call-1",
+                "tool-1",
+                serde_json::json!({}),
+            )],
             StopReason::ToolUse,
         ),
         4,
         Some("prompt-1"),
     );
-    let tool_result = msg_entry("tool-result-1", tool_result_message("call-1", "tool-1"), 6, Some("assistant-tools"));
+    let tool_result = msg_entry(
+        "tool-result-1",
+        tool_result_message("call-1", "tool-1"),
+        6,
+        Some("assistant-tools"),
+    );
     let assistant_final = msg_entry(
         "assistant-final",
         assistant_message(vec![rpi_ai::types::Content::text("done")], StopReason::Stop),
@@ -570,9 +680,21 @@ fn reducer_valid_one_tool_run_prefixes() {
     );
 
     let actions: Vec<VariantAction> = vec![
-        VariantAction::Record(LaneRecord::OperationStarted(run_started_with_initials(1, "run-1", vec![prompt_json]))),
+        VariantAction::Record(LaneRecord::OperationStarted(run_started_with_initials(
+            1,
+            "run-1",
+            vec![prompt_json],
+        ))),
         VariantAction::Entry(msg_entry("prompt-1", user_message("fix the bug"), 2, None)),
-        VariantAction::Record(attempt(3, "a-1", "run-1", StepKind::Assistant, 1, "assistant-tools", None)),
+        VariantAction::Record(attempt(
+            3,
+            "a-1",
+            "run-1",
+            StepKind::Assistant,
+            1,
+            "assistant-tools",
+            None,
+        )),
         VariantAction::Entry(assistant_tools),
         VariantAction::Record(LaneRecord::ToolStarted(ToolStartedRecord {
             base: rec_base("ts-5", 5, "main"),
@@ -586,7 +708,15 @@ fn reducer_valid_one_tool_run_prefixes() {
             replay: ToolReplay::Never,
         })),
         VariantAction::Entry(tool_result),
-        VariantAction::Record(attempt(7, "a-2", "run-1", StepKind::Assistant, 1, "assistant-final", None)),
+        VariantAction::Record(attempt(
+            7,
+            "a-2",
+            "run-1",
+            StepKind::Assistant,
+            1,
+            "assistant-final",
+            None,
+        )),
         VariantAction::Entry(assistant_final),
         VariantAction::Record(operation_finished(9, "finish-1", "run-1")),
     ];
@@ -624,14 +754,20 @@ fn valid_prefixes(actions: &[VariantAction]) -> Vec<RecordLogSlice> {
     let mut out = Vec::new();
     for i in 0..actions.len() {
         let prefix = &actions[..=i];
-        let records: Vec<LaneRecord> = prefix.iter().filter_map(|a| match a {
-            VariantAction::Record(r) => Some(r.clone()),
-            _ => None,
-        }).collect();
-        let entries: Vec<Entry> = prefix.iter().filter_map(|a| match a {
-            VariantAction::Entry(e) => Some(e.clone()),
-            _ => None,
-        }).collect();
+        let records: Vec<LaneRecord> = prefix
+            .iter()
+            .filter_map(|a| match a {
+                VariantAction::Record(r) => Some(r.clone()),
+                _ => None,
+            })
+            .collect();
+        let entries: Vec<Entry> = prefix
+            .iter()
+            .filter_map(|a| match a {
+                VariantAction::Entry(e) => Some(e.clone()),
+                _ => None,
+            })
+            .collect();
         out.push(recovery_slice(records, entries));
     }
     out

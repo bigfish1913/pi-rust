@@ -42,7 +42,9 @@ pub enum RunOutcome {
     Failed,
     /// Mirrors TS `{ kind: "suspended"; deferred: DeferredHandle }`. The run
     /// parked on a deferred provider response; `resume` continues it.
-    Suspended { deferred: DeferredHandle },
+    Suspended {
+        deferred: DeferredHandle,
+    },
 }
 
 /// The subset of [`RunOutcome`] that a `RunEndEvent` may carry. Mirrors the TS
@@ -225,7 +227,11 @@ impl HarnessEventBus {
         });
         {
             let mut inner = self.inner.lock().unwrap();
-            inner.listeners.entry(type_tag).or_default().push(ListenerEntry { id, f: wrapper });
+            inner
+                .listeners
+                .entry(type_tag)
+                .or_default()
+                .push(ListenerEntry { id, f: wrapper });
         }
         OnUnsubscribe {
             inner: Arc::downgrade(&self.inner),
@@ -358,7 +364,9 @@ pub struct WatchHandle<T> {
 impl<T> WatchHandle<T> {
     /// The snapshot captured at registration. Panics if taken twice.
     pub fn snapshot(&self) -> &T {
-        self.snapshot.as_ref().expect("watch snapshot already taken")
+        self.snapshot
+            .as_ref()
+            .expect("watch snapshot already taken")
     }
 
     /// Move the snapshot out (the TS `WatchHandle.snapshot` is a plain field).
@@ -402,7 +410,9 @@ impl<T> WatchHandle<T> {
         }
         if let Some(inner) = self.bus.upgrade() {
             let mut inner = inner.lock().unwrap();
-            inner.watch_listeners.retain(|s| !Arc::ptr_eq(s, &self.slot));
+            inner
+                .watch_listeners
+                .retain(|s| !Arc::ptr_eq(s, &self.slot));
         }
         {
             let mut del = self.slot.lock().unwrap();
@@ -456,7 +466,10 @@ mod tests {
     }
 
     fn run_start() -> HarnessEvent {
-        HarnessEvent::RunStart(RunStartEvent { lane: "main".into(), run_id: "run-1".into() })
+        HarnessEvent::RunStart(RunStartEvent {
+            lane: "main".into(),
+            run_id: "run-1".into(),
+        })
     }
 
     fn run_end() -> HarnessEvent {
@@ -475,10 +488,13 @@ mod tests {
         let watch_events: Arc<Mutex<Vec<HarnessEvent>>> = Arc::new(Mutex::new(Vec::new()));
 
         let direct_clone = direct.clone();
-        let off = events.on::<RunStartEvent, _>(move |e| direct_clone.lock().unwrap().push(e.clone()));
+        let off =
+            events.on::<RunStartEvent, _>(move |e| direct_clone.lock().unwrap().push(e.clone()));
         let watch_events_clone = watch_events.clone();
         let mut watch = events.watch(|| ());
-        watch.start(Arc::new(move |event| watch_events_clone.lock().unwrap().push(event.clone())));
+        watch.start(Arc::new(move |event| {
+            watch_events_clone.lock().unwrap().push(event.clone())
+        }));
 
         events.emit(&run_start());
         events.emit(&run_end());
@@ -509,13 +525,21 @@ mod tests {
         // Snapshot was captured (the TS test asserts `watch.snapshot === expected`).
         assert_eq!(**watch.snapshot(), *expected_snapshot);
         assert!(received.lock().unwrap().is_empty());
-        watch.start(Arc::new(move |event| received_clone.lock().unwrap().push(event.clone())));
+        watch.start(Arc::new(move |event| {
+            received_clone.lock().unwrap().push(event.clone())
+        }));
         assert_eq!(received.lock().unwrap().as_slice(), &[run_start()]);
         events.emit(&run_end());
-        assert_eq!(received.lock().unwrap().as_slice(), &[run_start(), run_end()]);
+        assert_eq!(
+            received.lock().unwrap().as_slice(),
+            &[run_start(), run_end()]
+        );
         watch.unsubscribe();
         events.emit(&run_start());
-        assert_eq!(received.lock().unwrap().as_slice(), &[run_start(), run_end()]);
+        assert_eq!(
+            received.lock().unwrap().as_slice(),
+            &[run_start(), run_end()]
+        );
     }
 
     /// `HarnessEventBus` is not `Clone`, but the snapshot-closure test needs to
@@ -558,6 +582,8 @@ mod tests {
     }
 
     fn events_clone_for_closure(bus: &HarnessEventBus) -> EmitterHandle {
-        EmitterHandle { inner: bus.inner.clone() }
+        EmitterHandle {
+            inner: bus.inner.clone(),
+        }
     }
 }

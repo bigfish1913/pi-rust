@@ -13,10 +13,10 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use rpi_ai::{CacheRetention, Model, Provider, ProviderHooks, SimpleStreamOptions, ThinkingLevel};
 use rpi_agent::{
-    AgentTool, AfterToolCall, BeforeToolCall, ConvertToLlm, QueueMode, TransformContext,
+    AfterToolCall, AgentTool, BeforeToolCall, ConvertToLlm, QueueMode, TransformContext,
 };
+use rpi_ai::{CacheRetention, Model, Provider, ProviderHooks, SimpleStreamOptions, ThinkingLevel};
 use serde::{Deserialize, Serialize};
 
 use crate::session::context::{ContextEntryTransform, CustomEntryContextMessageProjector};
@@ -97,7 +97,10 @@ pub struct HarnessTool {
 
 impl HarnessTool {
     pub fn new(tool: Arc<dyn AgentTool>) -> Self {
-        Self { tool, replay: ToolReplay::default() }
+        Self {
+            tool,
+            replay: ToolReplay::default(),
+        }
     }
     pub fn with_replay(mut self, replay: ToolReplay) -> Self {
         self.replay = replay;
@@ -246,7 +249,11 @@ pub struct RetryPolicy {
 
 impl Default for RetryPolicy {
     fn default() -> Self {
-        Self { enabled: false, max_retries: 0, base_delay_ms: 1000 }
+        Self {
+            enabled: false,
+            max_retries: 0,
+            base_delay_ms: 1000,
+        }
     }
 }
 
@@ -335,7 +342,6 @@ pub struct AgentHarnessOptions {
     pub drive: DrivingMode,
 
     // ---- M5f additions (the pieces the real run loop needs) ---------------
-
     /// The durable session the harness drives. Required: every run persists
     /// entries/records through this facade (mirrors TS `options.session`).
     pub session: Session,
@@ -378,7 +384,6 @@ pub struct AgentHarnessOptions {
     // them on `AgentHarnessOptions` so a host (pi-cli, via rpi-extensions
     // adapters) can populate them; the harness forwards them into the config it
     // builds per run (snapshot_config + the config build site).
-
     /// `(context, signal) -> Option<BeforeToolCallResult>` — can block a tool
     /// call before it runs. Mirrors `AgentLoopConfig.before_tool_call`.
     pub before_tool_call: Option<BeforeToolCall>,

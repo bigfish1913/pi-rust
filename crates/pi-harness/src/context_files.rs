@@ -76,7 +76,10 @@ pub async fn load_context_file_from_dir(
             Ok(c) => c,
             Err(_) => continue,
         };
-        return Some(ContextFile { path: candidate, content });
+        return Some(ContextFile {
+            path: candidate,
+            content,
+        });
     }
     None
 }
@@ -205,10 +208,7 @@ mod tests {
         let env = Arc::new(InMemoryExecutionEnv::with_cwd(PathBuf::from("/proj")));
         for (rel, content) in files {
             // `absolute_path` normalizes `.` / `/`-relative against cwd.
-            let abs = env
-                .absolute_path(rel, None)
-                .await
-                .expect("absolute_path");
+            let abs = env.absolute_path(rel, None).await.expect("absolute_path");
             env.seed_file(&abs.to_string_lossy(), content.as_bytes().to_vec())
                 .await;
         }
@@ -221,7 +221,8 @@ mod tests {
     /// absolute strings — `Path::join` on Windows would insert backslashes and
     /// the lookup would miss.
     async fn seed(env: &InMemoryExecutionEnv, abs_slash_path: &str, content: &str) {
-        env.seed_file(abs_slash_path, content.as_bytes().to_vec()).await;
+        env.seed_file(abs_slash_path, content.as_bytes().to_vec())
+            .await;
     }
 
     #[tokio::test]

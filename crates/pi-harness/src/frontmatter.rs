@@ -34,10 +34,14 @@ pub(crate) fn parse_frontmatter(content: &str) -> Result<(Value, String), String
         return Ok((Value::Object(Map::new()), normalized));
     };
     let end_index = end_rel + 3; // index of the `\n` in `\n---`
-    // `slice(4, endIndex)` in TS; empty when endIndex < 4.
+                                 // `slice(4, endIndex)` in TS; empty when endIndex < 4.
     let yaml_string = normalized.get(4..end_index).unwrap_or("");
     // `slice(endIndex + 4)` skips `\n---`; `.trim()`.
-    let body = normalized.get(end_index + 4..).unwrap_or("").trim().to_string();
+    let body = normalized
+        .get(end_index + 4..)
+        .unwrap_or("")
+        .trim()
+        .to_string();
     let frontmatter = parse_simple_yaml(yaml_string)?;
     Ok((frontmatter, body))
 }
@@ -187,8 +191,14 @@ mod tests {
         let (fm, body) = parse_frontmatter(content).unwrap();
         let o = fm.as_object().unwrap();
         assert_eq!(o.get("name").and_then(|v| v.as_str()), Some("example"));
-        assert_eq!(o.get("description").and_then(|v| v.as_str()), Some("Example skill"));
-        assert_eq!(o.get("disable-model-invocation").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            o.get("description").and_then(|v| v.as_str()),
+            Some("Example skill")
+        );
+        assert_eq!(
+            o.get("disable-model-invocation").and_then(|v| v.as_bool()),
+            Some(true)
+        );
         assert_eq!(body, "Use this skill.");
     }
 

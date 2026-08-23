@@ -264,8 +264,7 @@ mod tests {
         let raw = r#"{"path":"A\H","text":"col1\tcol2"}"#;
         let repaired = repair_json(raw);
         assert!(repaired.contains(r#"path":"A\\H"#));
-        let v: serde_json::Value =
-            serde_json::from_str(&repaired).expect("repaired parses");
+        let v: serde_json::Value = serde_json::from_str(&repaired).expect("repaired parses");
         assert_eq!(v["path"], json!("A\\H"));
         assert_eq!(v["text"], json!("col1\tcol2"));
     }

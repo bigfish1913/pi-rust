@@ -87,14 +87,18 @@ pub async fn load_prompt_templates(
             prompt_templates.append(&mut result.prompt_templates);
             diagnostics.append(&mut result.diagnostics);
         } else if kind == Some(FileKind::File) && info.name.ends_with(".md") {
-            let mut result = load_template_from_file(env, &info.path.to_string_lossy(), &info.name).await;
+            let mut result =
+                load_template_from_file(env, &info.path.to_string_lossy(), &info.name).await;
             if let Some(t) = result.template.take() {
                 prompt_templates.push(t);
             }
             diagnostics.append(&mut result.diagnostics);
         }
     }
-    LoadPromptTemplatesResult { prompt_templates, diagnostics }
+    LoadPromptTemplatesResult {
+        prompt_templates,
+        diagnostics,
+    }
 }
 
 /// Load prompt templates from source-tagged paths. Mirrors TS
@@ -108,13 +112,22 @@ pub async fn load_sourced_prompt_templates<S: Clone>(
     for input in inputs {
         let result = load_prompt_templates(env, std::slice::from_ref(&input.path)).await;
         for t in result.prompt_templates {
-            templates.push(SourcedTemplate { template: t, source: input.source.clone() });
+            templates.push(SourcedTemplate {
+                template: t,
+                source: input.source.clone(),
+            });
         }
         for d in result.diagnostics {
-            diagnostics.push(SourcedTemplateDiagnostic { diagnostic: d, source: input.source.clone() });
+            diagnostics.push(SourcedTemplateDiagnostic {
+                diagnostic: d,
+                source: input.source.clone(),
+            });
         }
     }
-    SourcedLoadTemplatesResult { templates, diagnostics }
+    SourcedLoadTemplatesResult {
+        templates,
+        diagnostics,
+    }
 }
 
 /// One source-tagged input. Mirrors TS `{ path: string; source: TSource }`.
@@ -160,7 +173,10 @@ async fn load_templates_from_dir(
                 message: e.message,
                 path: dir.to_string(),
             });
-            return LoadPromptTemplatesResult { prompt_templates, diagnostics };
+            return LoadPromptTemplatesResult {
+                prompt_templates,
+                diagnostics,
+            };
         }
     };
 
@@ -178,7 +194,10 @@ async fn load_templates_from_dir(
         }
         diagnostics.append(&mut result.diagnostics);
     }
-    LoadPromptTemplatesResult { prompt_templates, diagnostics }
+    LoadPromptTemplatesResult {
+        prompt_templates,
+        diagnostics,
+    }
 }
 
 struct LoadTemplateResult {
@@ -201,7 +220,10 @@ async fn load_template_from_file(
                 message: e.message,
                 path: file_path.to_string(),
             });
-            return LoadTemplateResult { template: None, diagnostics };
+            return LoadTemplateResult {
+                template: None,
+                diagnostics,
+            };
         }
     };
 
@@ -213,12 +235,18 @@ async fn load_template_from_file(
                 message: msg,
                 path: file_path.to_string(),
             });
-            return LoadTemplateResult { template: None, diagnostics };
+            return LoadTemplateResult {
+                template: None,
+                diagnostics,
+            };
         }
     };
 
     // First non-blank body line (for description fallback).
-    let first_line = body.lines().find(|l| !l.trim().is_empty()).map(|s| s.to_string());
+    let first_line = body
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .map(|s| s.to_string());
     let description = frontmatter
         .get("description")
         .and_then(|v| v.as_str())
@@ -263,7 +291,10 @@ async fn resolve_kind(
     if matches!(info.kind, FileKind::File | FileKind::Directory) {
         return Some(info.kind);
     }
-    match env.canonical_path(&info.path.to_string_lossy(), Some(cancel)).await {
+    match env
+        .canonical_path(&info.path.to_string_lossy(), Some(cancel))
+        .await
+    {
         Ok(canon) => match env.file_info(&canon.to_string_lossy(), Some(cancel)).await {
             Ok(target) => {
                 if matches!(target.kind, FileKind::File | FileKind::Directory) {
@@ -451,14 +482,20 @@ mod tests {
     #[test]
     fn parse_command_args_shell_style() {
         assert_eq!(parse_command_args("a b c"), vec!["a", "b", "c"]);
-        assert_eq!(parse_command_args("'hello world' test"), vec!["hello world", "test"]);
+        assert_eq!(
+            parse_command_args("'hello world' test"),
+            vec!["hello world", "test"]
+        );
         // Double quotes: the TS parser does NOT interpret backslash escapes, so
         // a `"` always toggles the quote state. `"a b"` -> ["a b"].
         assert_eq!(parse_command_args("\"a b\" c"), vec!["a b", "c"]);
         // A quote that opens then closes then re-opens collapses the gaps:
         // `"a"b"c"` -> a, b, c joined with no spaces => ["abc"].
         assert_eq!(parse_command_args("\"a\"b\"c\""), vec!["abc"]);
-        assert_eq!(parse_command_args("  multi   space  "), vec!["multi", "space"]);
+        assert_eq!(
+            parse_command_args("  multi   space  "),
+            vec!["multi", "space"]
+        );
         assert_eq!(parse_command_args(""), Vec::<String>::new());
     }
 
@@ -499,7 +536,8 @@ mod tests {
             description: None,
             content: "$1 ${@:2} $ARGUMENTS".to_string(),
         };
-        let out = format_prompt_template_invocation(&t, &["hello world".to_string(), "test".to_string()]);
+        let out =
+            format_prompt_template_invocation(&t, &["hello world".to_string(), "test".to_string()]);
         assert_eq!(out, "hello world test hello world test");
     }
 
@@ -514,6 +552,8 @@ mod tests {
     }
 
     fn strip_md(name: &str) -> &str {
-        name.strip_suffix(".md").or_else(|| name.strip_suffix(".MD")).unwrap_or(name)
+        name.strip_suffix(".md")
+            .or_else(|| name.strip_suffix(".MD"))
+            .unwrap_or(name)
     }
 }

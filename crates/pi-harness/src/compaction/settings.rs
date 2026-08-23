@@ -38,13 +38,21 @@ mod tests {
 
     #[test]
     fn disabled_never_compacts() {
-        let s = CompactionSettings { enabled: false, reserve_tokens: 1000, keep_recent_tokens: 500 };
+        let s = CompactionSettings {
+            enabled: false,
+            reserve_tokens: 1000,
+            keep_recent_tokens: 500,
+        };
         assert!(!should_compact(9_999_999, 10_000, &s));
     }
 
     #[test]
     fn trips_above_threshold() {
-        let s = CompactionSettings { enabled: true, reserve_tokens: 1000, keep_recent_tokens: 500 };
+        let s = CompactionSettings {
+            enabled: true,
+            reserve_tokens: 1000,
+            keep_recent_tokens: 500,
+        };
         // window 10000 - reserve 1000 = 9000 threshold.
         assert!(!should_compact(9000, 10000, &s));
         assert!(should_compact(9001, 10000, &s));
@@ -56,7 +64,11 @@ mod tests {
         // Mirrors TS: threshold = contextWindow - reserve = 10000 - 20000 = -10000,
         // and `contextTokens > -10000` is true for every non-negative context_tokens,
         // so compaction trips even at zero usage.
-        let s = CompactionSettings { enabled: true, reserve_tokens: 20_000, keep_recent_tokens: 500 };
+        let s = CompactionSettings {
+            enabled: true,
+            reserve_tokens: 20_000,
+            keep_recent_tokens: 500,
+        };
         assert!(should_compact(0, 10_000, &s));
         assert!(should_compact(1, 10_000, &s));
     }

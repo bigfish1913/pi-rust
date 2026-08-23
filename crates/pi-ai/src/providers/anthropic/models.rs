@@ -273,25 +273,36 @@ mod tests {
     #[test]
     fn opus_4_8_is_adaptive_and_temperatureless() {
         let m = claude_opus_4_8();
-        let c = m.compat.as_ref().and_then(|c| match c {
-            StreamingProtocolCompat::AnthropicMessages(a) => Some(a),
-            _ => None,
-        }).unwrap();
+        let c = m
+            .compat
+            .as_ref()
+            .and_then(|c| match c {
+                StreamingProtocolCompat::AnthropicMessages(a) => Some(a),
+                _ => None,
+            })
+            .unwrap();
         assert!(c.adaptive_thinking());
         assert!(!c.temperature());
         // Opus 4.7+ carries xhigh + max effort mappings.
         let map = m.thinking_level_map.as_ref().unwrap();
-        assert_eq!(map.get(&ThinkingLevel::Xhigh), Some(&Some("xhigh".to_string())));
+        assert_eq!(
+            map.get(&ThinkingLevel::Xhigh),
+            Some(&Some("xhigh".to_string()))
+        );
         assert_eq!(map.get(&ThinkingLevel::Max), Some(&Some("max".to_string())));
     }
 
     #[test]
     fn haiku_4_5_disables_tool_references() {
         let m = claude_haiku_4_5();
-        let c = m.compat.as_ref().and_then(|c| match c {
-            StreamingProtocolCompat::AnthropicMessages(a) => Some(a),
-            _ => None,
-        }).unwrap();
+        let c = m
+            .compat
+            .as_ref()
+            .and_then(|c| match c {
+                StreamingProtocolCompat::AnthropicMessages(a) => Some(a),
+                _ => None,
+            })
+            .unwrap();
         assert!(!c.tool_references());
         assert!(!c.adaptive_thinking());
         assert!(c.temperature());
@@ -302,16 +313,23 @@ mod tests {
         let m = claude_fable_5();
         let map = m.thinking_level_map.as_ref().unwrap();
         assert_eq!(map.get(&ThinkingLevel::Off), Some(&None));
-        assert!(m.supported_thinking_levels().iter().all(|&l| l != ThinkingLevel::Off));
+        assert!(m
+            .supported_thinking_levels()
+            .iter()
+            .all(|&l| l != ThinkingLevel::Off));
     }
 
     #[test]
     fn strict_tools_set_for_first_party() {
         for m in anthropic_models() {
-            let c = m.compat.as_ref().and_then(|c| match c {
-                StreamingProtocolCompat::AnthropicMessages(a) => Some(a),
-                _ => None,
-            }).unwrap();
+            let c = m
+                .compat
+                .as_ref()
+                .and_then(|c| match c {
+                    StreamingProtocolCompat::AnthropicMessages(a) => Some(a),
+                    _ => None,
+                })
+                .unwrap();
             assert!(c.strict_tools(), "{} should support strict tools", m.id);
         }
     }

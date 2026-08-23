@@ -21,7 +21,10 @@ use rpi_harness::events::{
 };
 
 fn run_start() -> HarnessEvent {
-    HarnessEvent::RunStart(RunStartEvent { lane: "main".into(), run_id: "run-1".into() })
+    HarnessEvent::RunStart(RunStartEvent {
+        lane: "main".into(),
+        run_id: "run-1".into(),
+    })
 }
 
 fn run_end() -> HarnessEvent {
@@ -43,8 +46,9 @@ fn delivers_matching_events_to_direct_listeners_and_watchers() {
     let off = events.on::<RunStartEvent, _>(move |e| direct_clone.lock().unwrap().push(e.clone()));
     let watch_events_clone = watch_events.clone();
     let mut watch = events.watch(|| ());
-    let listener: WatchListener =
-        Arc::new(move |event: &HarnessEvent| watch_events_clone.lock().unwrap().push(event.clone()));
+    let listener: WatchListener = Arc::new(move |event: &HarnessEvent| {
+        watch_events_clone.lock().unwrap().push(event.clone())
+    });
     watch.start(listener);
 
     events.emit(&run_start());
@@ -85,9 +89,15 @@ fn snapshot_then_flush_then_live() {
     // The run_start emitted inside the snapshot closure is flushed by `start`.
     assert_eq!(received.lock().unwrap().as_slice(), &[run_start()]);
     events.emit(&run_end());
-    assert_eq!(received.lock().unwrap().as_slice(), &[run_start(), run_end()]);
+    assert_eq!(
+        received.lock().unwrap().as_slice(),
+        &[run_start(), run_end()]
+    );
     watch.unsubscribe();
     events.emit(&run_start());
     // After unsubscribe no further events arrive.
-    assert_eq!(received.lock().unwrap().as_slice(), &[run_start(), run_end()]);
+    assert_eq!(
+        received.lock().unwrap().as_slice(),
+        &[run_start(), run_end()]
+    );
 }

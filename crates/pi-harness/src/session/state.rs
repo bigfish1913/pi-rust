@@ -102,7 +102,9 @@ impl SessionState {
     /// `already_exists` if the lane already exists. Mirrors `validateNewLane`.
     pub fn validate_new_lane(&self, lane: &str) -> SessionResult<()> {
         if self.lanes.contains_key(lane) {
-            return Err(SessionError::already_exists(format!("Lane already exists: {lane}")));
+            return Err(SessionError::already_exists(format!(
+                "Lane already exists: {lane}"
+            )));
         }
         Ok(())
     }
@@ -120,7 +122,9 @@ impl SessionState {
     /// `already_exists` if the id was already used. Mirrors `validateUnusedId`.
     pub fn validate_unused_id(&self, id: &str) -> SessionResult<()> {
         if self.used_ids.contains(id) {
-            return Err(SessionError::already_exists(format!("Session id already exists: {id}")));
+            return Err(SessionError::already_exists(format!(
+                "Session id already exists: {id}"
+            )));
         }
         Ok(())
     }
@@ -138,24 +142,21 @@ impl SessionState {
         }
 
         match mutation {
-            SessionMutation::Entry { seq, lane, entry, .. } => {
+            SessionMutation::Entry {
+                seq, lane, entry, ..
+            } => {
                 self.validate_unused_id(entry.id())?;
                 // Lane chaining — only when a lane is named (fork passes None).
                 if let Some(lane_name) = lane.as_deref() {
-                    let leaf = self
-                        .lanes
-                        .get(lane_name)
-                        .cloned()
-                        .ok_or_else(|| {
-                            SessionError::invalid_entry(format!(
-                                "Invalid session mutation: references missing lane {lane_name}"
-                            ))
-                        })?;
+                    let leaf = self.lanes.get(lane_name).cloned().ok_or_else(|| {
+                        SessionError::invalid_entry(format!(
+                            "Invalid session mutation: references missing lane {lane_name}"
+                        ))
+                    })?;
                     // `entry.parent_id` must equal the lane's current leaf.
                     if entry.parent_id().map(|s| s.to_string()) != leaf {
                         return Err(SessionError::invalid_entry(
-                            "Invalid session mutation: does not chain to the lane leaf"
-                                .to_string(),
+                            "Invalid session mutation: does not chain to the lane leaf".to_string(),
                         ));
                     }
                 }
@@ -172,13 +173,17 @@ impl SessionState {
                 self.sequence = seq;
                 self.used_ids.insert(entry.id().to_string());
                 self.entries.push(entry.clone());
-                self.entries_by_id.insert(entry.id().to_string(), entry.clone());
+                self.entries_by_id
+                    .insert(entry.id().to_string(), entry.clone());
                 if let Some(lane_name) = lane.as_deref() {
                     if let Some(slot) = self.lanes.get_mut(lane_name) {
                         *slot = Some(entry.id().to_string());
                     }
                 }
-                self.log.push(LogItem::Entry { seq, entry: entry.clone() });
+                self.log.push(LogItem::Entry {
+                    seq,
+                    entry: entry.clone(),
+                });
                 if is_message {
                     self.stats.message_count += 1;
                 }
@@ -215,12 +220,16 @@ impl SessionState {
                 }
                 if let LaneRecord::Usage(usage_rec) = &record {
                     self.stats.cached_tokens += usage_rec.usage.cache_read;
-                    self.stats.uncached_tokens += usage_rec.usage.input + usage_rec.usage.cache_write;
+                    self.stats.uncached_tokens +=
+                        usage_rec.usage.input + usage_rec.usage.cache_write;
                     self.stats.total_tokens += usage_rec.usage.total_tokens;
                     self.stats.cost_total += usage_rec.usage.cost.total;
                 }
                 self.records.push(record.clone());
-                self.log.push(LogItem::Record { seq, record: record.clone() });
+                self.log.push(LogItem::Record {
+                    seq,
+                    record: record.clone(),
+                });
                 Ok(ApplyOutcome::Record(record))
             }
             SessionMutation::Lane { seq, lane, leaf_id } => {
@@ -242,7 +251,11 @@ impl SessionState {
                 self.log.push(LogItem::FactName { seq, name });
                 Ok(ApplyOutcome::Fact)
             }
-            SessionMutation::FactLabel { seq, target_id, label } => {
+            SessionMutation::FactLabel {
+                seq,
+                target_id,
+                label,
+            } => {
                 if !self.entries_by_id.contains_key(&target_id) {
                     return Err(SessionError::invalid_entry(format!(
                         "Invalid session mutation: references missing label target {target_id}"
@@ -257,7 +270,11 @@ impl SessionState {
                         self.labels.remove(&target_id);
                     }
                 }
-                self.log.push(LogItem::FactLabel { seq, target_id, label });
+                self.log.push(LogItem::FactLabel {
+                    seq,
+                    target_id,
+                    label,
+                });
                 Ok(ApplyOutcome::Fact)
             }
         }
@@ -303,13 +320,14 @@ impl SessionState {
             EntryOrder::OldestFirst => {
                 for entry in path.into_iter().rev() {
                     let reached_bound = bounds.stop_at_id.as_deref() == Some(entry.id())
-                        || bounds.stop_at_type.map(|t| t == entry.entry_type()).unwrap_or(false);
+                        || bounds
+                            .stop_at_type
+                            .map(|t| t == entry.entry_type())
+                            .unwrap_or(false);
                     if self.matches_entry_query(&entry, query) {
                         results.push(entry);
                     }
-                    if reached_bound
-                        || query.limit.map(|l| results.len() >= l).unwrap_or(false)
-                    {
+                    if reached_bound || query.limit.map(|l| results.len() >= l).unwrap_or(false) {
                         break;
                     }
                 }
@@ -402,7 +420,10 @@ impl SessionState {
     /// forked session replays these from `seq=1`. Forked entries keep their
     /// original `id` + `parent_id` chain and pass `lane: None` so lane-leaf
     /// chaining is NOT re-checked (invariant §7).
-    pub fn create_fork_mutations(&self, options: &ForkOptions) -> SessionResult<Vec<SessionMutation>> {
+    pub fn create_fork_mutations(
+        &self,
+        options: &ForkOptions,
+    ) -> SessionResult<Vec<SessionMutation>> {
         let (copied_entries, fork_lanes): (Vec<Entry>, Vec<LanePointer>) = match options {
             ForkOptions::Tree => {
                 let entries = self.find_entries(&EntryQuery {
@@ -418,9 +439,9 @@ impl SessionState {
                     None => self.require_lane("main")?,
                 };
                 let target_id: Option<String> = if let Some(sel) = selected {
-                    let entry = self
-                        .get_entry(&sel)
-                        .ok_or_else(|| SessionError::not_found(format!("Entry not found: {sel}")))?;
+                    let entry = self.get_entry(&sel).ok_or_else(|| {
+                        SessionError::not_found(format!("Entry not found: {sel}"))
+                    })?;
                     if !matches!(entry, Entry::Message(_)) {
                         return Err(SessionError::invalid_fork_target(format!(
                             "Fork target is not a message entry: {sel}"
@@ -439,14 +460,20 @@ impl SessionState {
                 };
                 let copied = if let Some(target) = &target_id {
                     self.find_entries_on_branch(
-                        &EntryQuery { order: Some(EntryOrder::OldestFirst), ..Default::default() },
+                        &EntryQuery {
+                            order: Some(EntryOrder::OldestFirst),
+                            ..Default::default()
+                        },
                         &BranchBounds::default(),
                         target,
                     )?
                 } else {
                     Vec::new()
                 };
-                let lanes = vec![LanePointer { lane: "main".into(), leaf_id: target_id }];
+                let lanes = vec![LanePointer {
+                    lane: "main".into(),
+                    leaf_id: target_id,
+                }];
                 (copied, lanes)
             }
         };
@@ -476,7 +503,10 @@ impl SessionState {
             sequence += 1;
         }
         if let Some(name) = &self.name {
-            mutations.push(SessionMutation::FactName { seq: sequence, name: Some(name.clone()) });
+            mutations.push(SessionMutation::FactName {
+                seq: sequence,
+                name: Some(name.clone()),
+            });
             sequence += 1;
         }
         for entry in &copied_entries {
@@ -516,7 +546,10 @@ impl SessionState {
             }
             visited.insert(current.id().to_string());
             let reached = bounds.stop_at_id.as_deref() == Some(current.id())
-                || bounds.stop_at_type.map(|t| t == current.entry_type()).unwrap_or(false)
+                || bounds
+                    .stop_at_type
+                    .map(|t| t == current.entry_type())
+                    .unwrap_or(false)
                 || current.parent_id().is_none();
             path.push(current.clone());
             if reached {
@@ -557,7 +590,11 @@ impl SessionState {
     }
 
     fn matches_record_query(&self, record: &LaneRecord, query: &RecordQuery) -> bool {
-        let lane_ok = query.lane.as_deref().map(|l| record.lane() == l).unwrap_or(true);
+        let lane_ok = query
+            .lane
+            .as_deref()
+            .map(|l| record.lane() == l)
+            .unwrap_or(true);
         let type_ok = query
             .record_type
             .map(|t| t == record.record_type())
@@ -577,7 +614,10 @@ impl SessionState {
                     LaneRecord::OperationStarted(s) if s.intent.kind() == k)
             })
             .unwrap_or(true);
-        let after_ok = query.after_seq.map(|after| record.seq() > after).unwrap_or(true);
+        let after_ok = query
+            .after_seq
+            .map(|after| record.seq() > after)
+            .unwrap_or(true);
         lane_ok && type_ok && run_ok && kind_ok && after_ok
     }
 }
@@ -604,7 +644,9 @@ pub struct ForkResult {
 fn validate_limit(limit: Option<usize>) -> SessionResult<()> {
     if let Some(l) = limit {
         if l == 0 {
-            return Err(SessionError::invalid_query("limit must be a positive integer"));
+            return Err(SessionError::invalid_query(
+                "limit must be a positive integer",
+            ));
         }
     }
     Ok(())

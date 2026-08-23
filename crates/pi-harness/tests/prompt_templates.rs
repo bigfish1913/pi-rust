@@ -33,21 +33,35 @@ async fn loads_markdown_templates_non_recursively_from_dirs() {
     typed.create_dir("a/nested", true, None).await.unwrap();
     typed.create_dir("b", true, None).await.unwrap();
     typed
-        .write_file("a/one.md", "---\ndescription: One template\n---\nHello $1".into(), None)
+        .write_file(
+            "a/one.md",
+            "---\ndescription: One template\n---\nHello $1".into(),
+            None,
+        )
         .await
         .unwrap();
     // Nested .md must be ignored (loader recurses? NO — prompt-templates load is
     // non-recursive; only direct children load).
-    typed.write_file("a/nested/ignored.md", "Ignored".into(), None).await.unwrap();
+    typed
+        .write_file("a/nested/ignored.md", "Ignored".into(), None)
+        .await
+        .unwrap();
     // No frontmatter: description falls back to the first non-blank body line.
-    typed.write_file("b/two.md", "First line description\nBody".into(), None).await.unwrap();
+    typed
+        .write_file("b/two.md", "First line description\nBody".into(), None)
+        .await
+        .unwrap();
 
     let result = load_prompt_templates(&env, &["a".to_string(), "b".to_string()]).await;
     assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
     assert_eq!(result.prompt_templates.len(), 2);
     assert_eq!(
         result.prompt_templates[0],
-        PromptTemplate { name: "one".to_string(), description: Some("One template".to_string()), content: "Hello $1".to_string() }
+        PromptTemplate {
+            name: "one".to_string(),
+            description: Some("One template".to_string()),
+            content: "Hello $1".to_string()
+        }
     );
     assert_eq!(
         result.prompt_templates[1],
@@ -66,7 +80,11 @@ async fn loads_explicit_markdown_file_input() {
     // `.md` (single, case-insensitive strip).
     let (typed, env) = fresh_env();
     typed
-        .write_file("target.md", "---\ndescription: Target\n---\nTarget body".into(), None)
+        .write_file(
+            "target.md",
+            "---\ndescription: Target\n---\nTarget body".into(),
+            None,
+        )
         .await
         .unwrap();
     let result = load_prompt_templates(&env, &["target.md".to_string()]).await;
@@ -81,7 +99,11 @@ async fn sourced_templates_preserve_source() {
     let (typed, env) = fresh_env();
     typed.create_dir("prompts", true, None).await.unwrap();
     typed
-        .write_file("prompts/example.md", "---\ndescription: Example\n---\nExample body".into(), None)
+        .write_file(
+            "prompts/example.md",
+            "---\ndescription: Example\n---\nExample body".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -92,7 +114,10 @@ async fn sourced_templates_preserve_source() {
 
     let result = load_sourced_prompt_templates::<Source>(
         &env,
-        &[SourcedTemplateInput { path: "prompts".to_string(), source: Source::Project }],
+        &[SourcedTemplateInput {
+            path: "prompts".to_string(),
+            source: Source::Project,
+        }],
     )
     .await;
     assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
@@ -111,7 +136,11 @@ async fn sourced_templates_attach_source_to_parse_diagnostics() {
     // source attached.
     let (typed, env) = fresh_env();
     typed
-        .write_file("broken.md", "---\ndescription: [unterminated\n---\nBody".into(), None)
+        .write_file(
+            "broken.md",
+            "---\ndescription: [unterminated\n---\nBody".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -122,7 +151,10 @@ async fn sourced_templates_attach_source_to_parse_diagnostics() {
 
     let result = load_sourced_prompt_templates::<Source>(
         &env,
-        &[SourcedTemplateInput { path: "broken.md".to_string(), source: Source::User }],
+        &[SourcedTemplateInput {
+            path: "broken.md".to_string(),
+            source: Source::User,
+        }],
     )
     .await;
     assert!(result.templates.is_empty());
@@ -141,7 +173,8 @@ fn format_invocation_substitutes_command_arguments() {
         description: None,
         content: "$1 ${@:2} $ARGUMENTS".to_string(),
     };
-    let out = format_prompt_template_invocation(&t, &["hello world".to_string(), "test".to_string()]);
+    let out =
+        format_prompt_template_invocation(&t, &["hello world".to_string(), "test".to_string()]);
     assert_eq!(out, "hello world test hello world test");
 }
 
@@ -174,5 +207,8 @@ fn template_name_strips_single_md_once() {
     use rpi_harness::prompt_templates::parse_command_args;
     assert_eq!(parse_command_args("a b c"), vec!["a", "b", "c"]);
     // sanity-check the helper isn't dead: a quoted multi-word arg.
-    assert_eq!(parse_command_args("'hello world' test"), vec!["hello world", "test"]);
+    assert_eq!(
+        parse_command_args("'hello world' test"),
+        vec!["hello world", "test"]
+    );
 }

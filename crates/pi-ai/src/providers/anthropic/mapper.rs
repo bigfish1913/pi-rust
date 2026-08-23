@@ -114,7 +114,11 @@ impl MapperState {
         event: &AnthropicEvent,
         prod: &mut AssistantMessageEventStreamProducer,
     ) -> Result<(), AiError> {
-        let AnthropicEvent::Message { event_type, payload } = event else {
+        let AnthropicEvent::Message {
+            event_type,
+            payload,
+        } = event
+        else {
             return Ok(()); // Skipped events are a mapper no-op.
         };
 
@@ -186,8 +190,7 @@ impl MapperState {
             };
             // Anthropic doesn't report total_tokens; compute from components
             // (mirrors the TS `input + output + cacheRead + cacheWrite` line).
-            self.output.usage.total_tokens =
-                input + output + cache_read + cache_write;
+            self.output.usage.total_tokens = input + output + cache_read + cache_write;
             // Cost is recomputed in the provider after the model is known; the
             // mapper zeroes cost here so the provider's final pass owns it.
             self.output.usage.cost = UsageCost::default();
@@ -200,17 +203,18 @@ impl MapperState {
         prod: &mut AssistantMessageEventStreamProducer,
     ) {
         self.ensure_started(prod);
-        let anthropic_index = payload
-            .get("index")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
+        let anthropic_index = payload.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
         let Some(block) = payload.get("content_block") else {
             return;
         };
         let kind = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
         match kind {
             "text" => {
-                let text = block.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let text = block
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let content = Content::Text(TextContent {
                     kind: TextContentType,
                     text,
@@ -304,9 +308,10 @@ impl MapperState {
                     .to_string();
                 // `input` is usually `{}` on block_start (streaming fills it
                 // via deltas); keep whatever's present as the initial args.
-                let args = block.get("input").cloned().unwrap_or(serde_json::Value::Object(
-                    serde_json::Map::new(),
-                ));
+                let args = block
+                    .get("input")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
                 let content = Content::tool_call(id, name, args);
                 self.output.content.push(content);
                 let content_index = self.output.content.len() - 1;
@@ -332,10 +337,7 @@ impl MapperState {
         payload: &serde_json::Value,
         prod: &mut AssistantMessageEventStreamProducer,
     ) -> Result<(), AiError> {
-        let anthropic_index = payload
-            .get("index")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
+        let anthropic_index = payload.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
         let Some(delta) = payload.get("delta") else {
             return Ok(());
         };
@@ -371,8 +373,7 @@ impl MapperState {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                if let Some(Content::Thinking(slot)) = self.output.content.get_mut(content_index)
-                {
+                if let Some(Content::Thinking(slot)) = self.output.content.get_mut(content_index) {
                     slot.thinking.push_str(&thinking);
                 }
                 prod.push(AssistantMessageEvent::ThinkingDelta {
@@ -388,8 +389,7 @@ impl MapperState {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                if let Some(Content::Thinking(slot)) = self.output.content.get_mut(content_index)
-                {
+                if let Some(Content::Thinking(slot)) = self.output.content.get_mut(content_index) {
                     let current = slot.thinking_signature.take().unwrap_or_default();
                     slot.thinking_signature = Some(format!("{current}{sig}"));
                 }
@@ -404,8 +404,7 @@ impl MapperState {
                 // Re-parse the accumulated partial JSON on every delta so the
                 // partial assistant message renders args live. Mirrors the TS
                 // `block.arguments = parseStreamingJson(block.partialJson)`.
-                if let Some(Content::ToolCall(slot)) = self.output.content.get_mut(content_index)
-                {
+                if let Some(Content::ToolCall(slot)) = self.output.content.get_mut(content_index) {
                     slot.arguments = parse_streaming_json(Some(&scratch.partial_json));
                 }
                 prod.push(AssistantMessageEvent::ToolCallDelta {
@@ -426,10 +425,7 @@ impl MapperState {
         payload: &serde_json::Value,
         prod: &mut AssistantMessageEventStreamProducer,
     ) {
-        let anthropic_index = payload
-            .get("index")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
+        let anthropic_index = payload.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
         let Some(scratch_index) = self.find_block_by_anthropic_index(anthropic_index) else {
             return;
         };
@@ -465,8 +461,7 @@ impl MapperState {
             BlockKind::ToolCall => {
                 // Final authoritative parse. Mirrors the TS
                 // `block.arguments = parseStreamingJson(block.partialJson)`.
-                let final_args =
-                    parse_streaming_json(Some(&scratch.partial_json));
+                let final_args = parse_streaming_json(Some(&scratch.partial_json));
                 let tool_call = match &self.output.content[content_index] {
                     Content::ToolCall(tc) => ToolCall {
                         kind: ToolCallType,
@@ -478,8 +473,7 @@ impl MapperState {
                     },
                     _ => return,
                 };
-                if let Some(Content::ToolCall(slot)) = self.output.content.get_mut(content_index)
-                {
+                if let Some(Content::ToolCall(slot)) = self.output.content.get_mut(content_index) {
                     slot.arguments = tool_call.arguments.clone();
                 }
                 prod.push(AssistantMessageEvent::ToolCallEnd {
@@ -497,7 +491,7 @@ impl MapperState {
         prod: &mut AssistantMessageEventStreamProducer,
     ) {
         let _ = prod; // message_delta never pushes events; it mutates output only.
-        // `delta.stop_reason` → mapStopReason + rawStopReason.
+                      // `delta.stop_reason` → mapStopReason + rawStopReason.
         if let Some(stop_reason) = payload
             .pointer("/delta/stop_reason")
             .and_then(|v| v.as_str())
@@ -505,7 +499,10 @@ impl MapperState {
             self.output.raw_stop_reason = Some(stop_reason.to_string());
             let stop_details = payload.pointer("/delta/stop_details");
             match map_stop_reason(stop_reason, stop_details) {
-                Ok(MappedStop { stop_reason, error_message }) => {
+                Ok(MappedStop {
+                    stop_reason,
+                    error_message,
+                }) => {
                     self.output.stop_reason = stop_reason;
                     if let Some(msg) = error_message {
                         self.output.error_message = Some(msg);
@@ -532,10 +529,16 @@ impl MapperState {
             if let Some(v) = usage.get("output_tokens").and_then(|v| v.as_i64()) {
                 self.output.usage.output = v;
             }
-            if let Some(v) = usage.get("cache_read_input_tokens").and_then(|v| v.as_i64()) {
+            if let Some(v) = usage
+                .get("cache_read_input_tokens")
+                .and_then(|v| v.as_i64())
+            {
                 self.output.usage.cache_read = v;
             }
-            if let Some(v) = usage.get("cache_creation_input_tokens").and_then(|v| v.as_i64()) {
+            if let Some(v) = usage
+                .get("cache_creation_input_tokens")
+                .and_then(|v| v.as_i64())
+            {
                 self.output.usage.cache_write = v;
             }
             // Reasoning tokens — a subset of output_tokens, reported via
@@ -638,14 +641,14 @@ pub async fn run_mapper<F>(
         match stream.next_event().await {
             Ok(None) => break,
             Ok(Some(sse_frame)) => {
-                let event = match crate::providers::anthropic::sse::parse_anthropic_event(&sse_frame)
-                {
-                    Ok(e) => e,
-                    Err(err) => {
-                        emit_terminal_error(prod, state, err.to_string(), false);
-                        return;
-                    }
-                };
+                let event =
+                    match crate::providers::anthropic::sse::parse_anthropic_event(&sse_frame) {
+                        Ok(e) => e,
+                        Err(err) => {
+                            emit_terminal_error(prod, state, err.to_string(), false);
+                            return;
+                        }
+                    };
                 if let Err(err) = state.apply(&event, prod) {
                     emit_terminal_error(prod, state, err.to_string(), false);
                     return;
@@ -789,12 +792,8 @@ mod tests {
     /// returning the emitted event tags and the terminal `AssistantMessage`.
     async fn run_fixture(frames: Vec<ServerSentEvent>) -> Run {
         let (mut prod, stream) = create_assistant_message_event_stream();
-        let mut state = MapperState::new(
-            Api::AnthropicMessages,
-            "anthropic",
-            "claude-haiku-4-5",
-            0,
-        );
+        let mut state =
+            MapperState::new(Api::AnthropicMessages, "anthropic", "claude-haiku-4-5", 0);
         for f in &frames {
             let event = parse_anthropic_event(f).expect("event parses");
             state.apply(&event, &mut prod).expect("apply");
@@ -887,11 +886,20 @@ mod tests {
                 _ => None,
             })
             .expect("a tool call block");
-        assert_eq!(toolcall.arguments, json!({ "path": "A\\H", "text": "col1\tcol2" }));
+        assert_eq!(
+            toolcall.arguments,
+            json!({ "path": "A\\H", "text": "col1\tcol2" })
+        );
         // Event sequence: start, toolcall_start, toolcall_delta, toolcall_end, done.
         assert_eq!(
             run.tags,
-            vec!["start", "toolcall_start", "toolcall_delta", "toolcall_end", "done"]
+            vec![
+                "start",
+                "toolcall_start",
+                "toolcall_delta",
+                "toolcall_end",
+                "done"
+            ]
         );
     }
 
@@ -913,26 +921,42 @@ mod tests {
             ),
             frame(
                 "content_block_start",
-                &j(&json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "Initial text" } })),
+                &j(
+                    &json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "Initial text" } }),
+                ),
             ),
             frame(
                 "content_block_delta",
-                &j(&json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": " plus delta" } })),
+                &j(
+                    &json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": " plus delta" } }),
+                ),
             ),
-            frame("content_block_stop", &j(&json!({ "type": "content_block_stop", "index": 0 }))),
+            frame(
+                "content_block_stop",
+                &j(&json!({ "type": "content_block_stop", "index": 0 })),
+            ),
             frame(
                 "content_block_start",
-                &j(&json!({ "type": "content_block_start", "index": 1, "content_block": { "type": "thinking", "thinking": "Initial thinking", "signature": "initial signature" } })),
+                &j(
+                    &json!({ "type": "content_block_start", "index": 1, "content_block": { "type": "thinking", "thinking": "Initial thinking", "signature": "initial signature" } }),
+                ),
             ),
             frame(
                 "content_block_delta",
-                &j(&json!({ "type": "content_block_delta", "index": 1, "delta": { "type": "thinking_delta", "thinking": " plus delta" } })),
+                &j(
+                    &json!({ "type": "content_block_delta", "index": 1, "delta": { "type": "thinking_delta", "thinking": " plus delta" } }),
+                ),
             ),
             frame(
                 "content_block_delta",
-                &j(&json!({ "type": "content_block_delta", "index": 1, "delta": { "type": "signature_delta", "signature": " plus delta" } })),
+                &j(
+                    &json!({ "type": "content_block_delta", "index": 1, "delta": { "type": "signature_delta", "signature": " plus delta" } }),
+                ),
             ),
-            frame("content_block_stop", &j(&json!({ "type": "content_block_stop", "index": 1 }))),
+            frame(
+                "content_block_stop",
+                &j(&json!({ "type": "content_block_stop", "index": 1 })),
+            ),
             frame(
                 "message_delta",
                 &j(&json!({
@@ -1002,11 +1026,15 @@ mod tests {
         let frames = vec![
             frame(
                 "message_start",
-                &j(&json!({ "type": "message_start", "message": { "id": "msg_sensitive", "usage": { "input_tokens": 12, "output_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0 } } })),
+                &j(
+                    &json!({ "type": "message_start", "message": { "id": "msg_sensitive", "usage": { "input_tokens": 12, "output_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0 } } }),
+                ),
             ),
             frame(
                 "message_delta",
-                &j(&json!({ "type": "message_delta", "delta": { "stop_reason": "sensitive" }, "usage": { "input_tokens": 12, "output_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0 } })),
+                &j(
+                    &json!({ "type": "message_delta", "delta": { "stop_reason": "sensitive" }, "usage": { "input_tokens": 12, "output_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0 } }),
+                ),
             ),
             frame("message_stop", &j(&json!({ "type": "message_stop" }))),
         ];
@@ -1028,17 +1056,26 @@ mod tests {
         let frames = vec![
             frame(
                 "message_start",
-                &j(&json!({ "type": "message_start", "message": { "id": "msg_test", "usage": { "input_tokens": 12, "output_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0 } } })),
+                &j(
+                    &json!({ "type": "message_start", "message": { "id": "msg_test", "usage": { "input_tokens": 12, "output_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0 } } }),
+                ),
             ),
             frame(
                 "content_block_start",
-                &j(&json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } })),
+                &j(
+                    &json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }),
+                ),
             ),
             frame(
                 "content_block_delta",
-                &j(&json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": "Hello" } })),
+                &j(
+                    &json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": "Hello" } }),
+                ),
             ),
-            frame("content_block_stop", &j(&json!({ "type": "content_block_stop", "index": 0 }))),
+            frame(
+                "content_block_stop",
+                &j(&json!({ "type": "content_block_stop", "index": 0 })),
+            ),
             // message_delta with stop_reason but NO usage object.
             frame(
                 "message_delta",
@@ -1067,20 +1104,31 @@ mod tests {
         let mut frames = vec![
             frame(
                 "message_start",
-                &j(&json!({ "type": "message_start", "message": { "id": "msg_test", "usage": { "input_tokens": 12, "output_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0 } } })),
+                &j(
+                    &json!({ "type": "message_start", "message": { "id": "msg_test", "usage": { "input_tokens": 12, "output_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0 } } }),
+                ),
             ),
             frame(
                 "content_block_start",
-                &j(&json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } })),
+                &j(
+                    &json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }),
+                ),
             ),
             frame(
                 "content_block_delta",
-                &j(&json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": "Hello" } })),
+                &j(
+                    &json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": "Hello" } }),
+                ),
             ),
-            frame("content_block_stop", &j(&json!({ "type": "content_block_stop", "index": 0 }))),
+            frame(
+                "content_block_stop",
+                &j(&json!({ "type": "content_block_stop", "index": 0 })),
+            ),
             frame(
                 "message_delta",
-                &j(&json!({ "type": "message_delta", "delta": { "stop_reason": "end_turn" }, "usage": { "input_tokens": 12, "output_tokens": 5, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0 } })),
+                &j(
+                    &json!({ "type": "message_delta", "delta": { "stop_reason": "end_turn" }, "usage": { "input_tokens": 12, "output_tokens": 5, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0 } }),
+                ),
             ),
             frame("message_stop", &j(&json!({ "type": "message_stop" }))),
         ];
@@ -1177,7 +1225,9 @@ mod tests {
         let frames = vec![
             frame(
                 "message_start",
-                &j(&json!({ "type": "message_start", "message": { "id": "m", "usage": { "input_tokens": 1, "output_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0 } } })),
+                &j(
+                    &json!({ "type": "message_start", "message": { "id": "m", "usage": { "input_tokens": 1, "output_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0 } } }),
+                ),
             ),
             frame(
                 "message_delta",
@@ -1208,13 +1258,20 @@ mod tests {
         let frames = vec![
             frame(
                 "message_start",
-                &j(&json!({ "type": "message_start", "message": { "id": "m", "usage": { "input_tokens": 1, "output_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0 } } })),
+                &j(
+                    &json!({ "type": "message_start", "message": { "id": "m", "usage": { "input_tokens": 1, "output_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0 } } }),
+                ),
             ),
             frame(
                 "content_block_start",
-                &j(&json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "redacted_thinking", "data": "opaque-base64" } })),
+                &j(
+                    &json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "redacted_thinking", "data": "opaque-base64" } }),
+                ),
             ),
-            frame("content_block_stop", &j(&json!({ "type": "content_block_stop", "index": 0 }))),
+            frame(
+                "content_block_stop",
+                &j(&json!({ "type": "content_block_stop", "index": 0 })),
+            ),
             frame(
                 "message_delta",
                 &j(&json!({ "type": "message_delta", "delta": { "stop_reason": "end_turn" } })),
@@ -1228,7 +1285,10 @@ mod tests {
         };
         assert!(thinking.redacted);
         assert_eq!(thinking.thinking, "[Reasoning redacted]");
-        assert_eq!(thinking.thinking_signature.as_deref(), Some("opaque-base64"));
+        assert_eq!(
+            thinking.thinking_signature.as_deref(),
+            Some("opaque-base64")
+        );
         // Redacted thinking emits a thinking_start/thinking_end pair.
         assert!(run.tags.contains(&"thinking_start"));
         assert!(run.tags.contains(&"thinking_end"));
@@ -1244,7 +1304,9 @@ mod tests {
         let frames = vec![
             frame(
                 "message_start",
-                &j(&json!({ "type": "message_start", "message": { "id": "m", "usage": { "input_tokens": 1, "output_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0 } } })),
+                &j(
+                    &json!({ "type": "message_start", "message": { "id": "m", "usage": { "input_tokens": 1, "output_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0 } } }),
+                ),
             ),
             frame("message_stop", &j(&json!({ "type": "message_stop" }))),
         ];
@@ -1260,7 +1322,9 @@ mod tests {
     async fn stream_ending_before_message_stop_is_error() {
         let frames = vec![frame(
             "message_start",
-            &j(&json!({ "type": "message_start", "message": { "id": "m", "usage": { "input_tokens": 1, "output_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0 } } })),
+            &j(
+                &json!({ "type": "message_start", "message": { "id": "m", "usage": { "input_tokens": 1, "output_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0 } } }),
+            ),
         )];
         let run = run_fixture(frames).await;
         assert_eq!(run.result.stop_reason, StopReason::Error);
@@ -1275,22 +1339,33 @@ mod tests {
         let frames = vec![
             frame(
                 "message_start",
-                &j(&json!({ "type": "message_start", "message": { "id": "m", "usage": { "input_tokens": 1, "output_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0 } } })),
+                &j(
+                    &json!({ "type": "message_start", "message": { "id": "m", "usage": { "input_tokens": 1, "output_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0 } } }),
+                ),
             ),
             frame(
                 "content_block_start",
-                &j(&json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "tool_use", "id": "t1", "name": "write", "input": {} } })),
+                &j(
+                    &json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "tool_use", "id": "t1", "name": "write", "input": {} } }),
+                ),
             ),
             // Two deltas building the args object incrementally.
             frame(
                 "content_block_delta",
-                &j(&json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "input_json_delta", "partial_json": "{\"path\":\"a\"," } })),
+                &j(
+                    &json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "input_json_delta", "partial_json": "{\"path\":\"a\"," } }),
+                ),
             ),
             frame(
                 "content_block_delta",
-                &j(&json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "input_json_delta", "partial_json": "\"text\":\"b\"}" } })),
+                &j(
+                    &json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "input_json_delta", "partial_json": "\"text\":\"b\"}" } }),
+                ),
             ),
-            frame("content_block_stop", &j(&json!({ "type": "content_block_stop", "index": 0 }))),
+            frame(
+                "content_block_stop",
+                &j(&json!({ "type": "content_block_stop", "index": 0 })),
+            ),
             frame(
                 "message_delta",
                 &j(&json!({ "type": "message_delta", "delta": { "stop_reason": "tool_use" } })),
@@ -1320,12 +1395,8 @@ mod tests {
     async fn sse_error_event_surfaces_error() {
         let (prod, stream) = create_assistant_message_event_stream();
         let mut prod = prod;
-        let mut state = MapperState::new(
-            Api::AnthropicMessages,
-            "anthropic",
-            "claude-haiku-4-5",
-            0,
-        );
+        let mut state =
+            MapperState::new(Api::AnthropicMessages, "anthropic", "claude-haiku-4-5", 0);
         // An error frame — parse_anthropic_event returns Err.
         let err_frame = frame("error", "rate limited");
         match parse_anthropic_event(&err_frame) {
@@ -1334,6 +1405,10 @@ mod tests {
         }
         let result = stream.result().await.expect("terminal");
         assert_eq!(result.stop_reason, StopReason::Error);
-        assert!(result.error_message.as_deref().unwrap().contains("rate limited"));
+        assert!(result
+            .error_message
+            .as_deref()
+            .unwrap()
+            .contains("rate limited"));
     }
 }

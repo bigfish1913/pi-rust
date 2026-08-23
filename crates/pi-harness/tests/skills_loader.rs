@@ -35,7 +35,10 @@ fn fresh_env() -> (Arc<InMemoryExecutionEnv>, Arc<dyn rpi_tools::ExecutionEnv>) 
 #[tokio::test]
 async fn loads_skill_md_with_frontmatter() {
     let (typed, env) = fresh_env();
-    typed.create_dir(".agents/skills/example", true, None).await.unwrap();
+    typed
+        .create_dir(".agents/skills/example", true, None)
+        .await
+        .unwrap();
     typed
         .write_file(
             ".agents/skills/example/SKILL.md",
@@ -62,7 +65,11 @@ async fn drops_skill_with_missing_description_and_emits_diagnostic() {
     let (typed, env) = fresh_env();
     typed.create_dir("user/broken", true, None).await.unwrap();
     typed
-        .write_file("user/broken/SKILL.md", "---\nname: broken\n---\nMissing description.".into(), None)
+        .write_file(
+            "user/broken/SKILL.md",
+            "---\nname: broken\n---\nMissing description.".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -84,7 +91,11 @@ async fn loads_direct_markdown_children_only_from_root() {
     let (typed, env) = fresh_env();
     typed.create_dir("skills/nested", true, None).await.unwrap();
     typed
-        .write_file("skills/root.md", "---\ndescription: Root skill\n---\nRoot content".into(), None)
+        .write_file(
+            "skills/root.md",
+            "---\ndescription: Root skill\n---\nRoot content".into(),
+            None,
+        )
         .await
         .unwrap();
     typed
@@ -108,7 +119,11 @@ async fn missing_input_directory_is_silently_skipped() {
     let (_typed, env) = fresh_env();
     let result = load_skills(&env, &["does/not/exist".to_string()]).await;
     assert!(result.skills.is_empty());
-    assert!(result.diagnostics.is_empty(), "not_found should be silent: {:?}", result.diagnostics);
+    assert!(
+        result.diagnostics.is_empty(),
+        "not_found should be silent: {:?}",
+        result.diagnostics
+    );
 }
 
 #[tokio::test]
@@ -153,7 +168,11 @@ async fn sourced_skills_preserve_source_and_attach_to_diagnostics() {
         .unwrap();
     typed.create_dir("user/broken", true, None).await.unwrap();
     typed
-        .write_file("user/broken/SKILL.md", "---\nname: broken\n---\nMissing description.".into(), None)
+        .write_file(
+            "user/broken/SKILL.md",
+            "---\nname: broken\n---\nMissing description.".into(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -165,8 +184,14 @@ async fn sourced_skills_preserve_source_and_attach_to_diagnostics() {
     let result = load_sourced_skills::<Source>(
         &env,
         &[
-            SourcedSkillInput { path: "user/example".to_string(), source: Source::User },
-            SourcedSkillInput { path: "user/broken".to_string(), source: Source::User },
+            SourcedSkillInput {
+                path: "user/example".to_string(),
+                source: Source::User,
+            },
+            SourcedSkillInput {
+                path: "user/broken".to_string(),
+                source: Source::User,
+            },
         ],
     )
     .await;

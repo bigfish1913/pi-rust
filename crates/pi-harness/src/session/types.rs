@@ -349,91 +349,84 @@ impl<'de> Deserialize<'de> for Entry {
         let entry = match ty {
             "message" => Entry::Message(MessageEntry {
                 base,
-                message: serde_json::from_value(
-                    obj.get("message")
-                        .cloned()
-                        .ok_or_else(|| serde::de::Error::custom("message entry missing \"message\""))?,
-                )
+                message: serde_json::from_value(obj.get("message").cloned().ok_or_else(|| {
+                    serde::de::Error::custom("message entry missing \"message\"")
+                })?)
                 .map_err(serde::de::Error::custom)?,
                 terminate: obj.get("terminate").and_then(|v| v.as_bool()),
             }),
-            "model_change" => Entry::ModelChange(ModelChangeEntry {
-                base,
-                provider: serde_json::from_value(
-                    obj.get("provider")
-                        .cloned()
-                        .ok_or_else(|| serde::de::Error::custom("model_change missing \"provider\""))?,
-                )
-                .map_err(serde::de::Error::custom)?,
-                model_id: serde_json::from_value(
-                    obj.get("modelId")
-                        .cloned()
-                        .ok_or_else(|| serde::de::Error::custom("model_change missing \"modelId\""))?,
-                )
-                .map_err(serde::de::Error::custom)?,
-            }),
+            "model_change" => {
+                Entry::ModelChange(ModelChangeEntry {
+                    base,
+                    provider: serde_json::from_value(obj.get("provider").cloned().ok_or_else(
+                        || serde::de::Error::custom("model_change missing \"provider\""),
+                    )?)
+                    .map_err(serde::de::Error::custom)?,
+                    model_id: serde_json::from_value(obj.get("modelId").cloned().ok_or_else(
+                        || serde::de::Error::custom("model_change missing \"modelId\""),
+                    )?)
+                    .map_err(serde::de::Error::custom)?,
+                })
+            }
             "thinking_level_change" => Entry::ThinkingLevel(ThinkingLevelEntry {
                 base,
                 thinking_level: serde_json::from_value(
-                    obj.get("thinkingLevel")
-                        .cloned()
-                        .ok_or_else(|| serde::de::Error::custom("thinking_level_change missing \"thinkingLevel\""))?,
+                    obj.get("thinkingLevel").cloned().ok_or_else(|| {
+                        serde::de::Error::custom("thinking_level_change missing \"thinkingLevel\"")
+                    })?,
                 )
                 .map_err(serde::de::Error::custom)?,
             }),
             "active_tools_change" => Entry::ActiveTools(ActiveToolsEntry {
                 base,
                 active_tool_names: serde_json::from_value(
-                    obj.get("activeToolNames")
-                        .cloned()
-                        .ok_or_else(|| serde::de::Error::custom("active_tools_change missing \"activeToolNames\""))?,
+                    obj.get("activeToolNames").cloned().ok_or_else(|| {
+                        serde::de::Error::custom("active_tools_change missing \"activeToolNames\"")
+                    })?,
                 )
                 .map_err(serde::de::Error::custom)?,
             }),
             "compaction" => {
-                let retained_tail = serde_json::from_value(
-                    obj.get("retainedTail")
-                        .cloned()
-                        .ok_or_else(|| serde::de::Error::custom("compaction missing \"retainedTail\""))?,
-                )
-                .map_err(serde::de::Error::custom)?;
-                let summary = serde_json::from_value(
-                    obj.get("summary")
-                        .cloned()
-                        .ok_or_else(|| serde::de::Error::custom("compaction missing \"summary\""))?,
-                )
-                .map_err(serde::de::Error::custom)?;
-                let tokens_before = serde_json::from_value(
-                    obj.get("tokensBefore")
-                        .cloned()
-                        .ok_or_else(|| serde::de::Error::custom("compaction missing \"tokensBefore\""))?,
-                )
-                .map_err(serde::de::Error::custom)?;
+                let retained_tail =
+                    serde_json::from_value(obj.get("retainedTail").cloned().ok_or_else(|| {
+                        serde::de::Error::custom("compaction missing \"retainedTail\"")
+                    })?)
+                    .map_err(serde::de::Error::custom)?;
+                let summary =
+                    serde_json::from_value(obj.get("summary").cloned().ok_or_else(|| {
+                        serde::de::Error::custom("compaction missing \"summary\"")
+                    })?)
+                    .map_err(serde::de::Error::custom)?;
+                let tokens_before =
+                    serde_json::from_value(obj.get("tokensBefore").cloned().ok_or_else(|| {
+                        serde::de::Error::custom("compaction missing \"tokensBefore\"")
+                    })?)
+                    .map_err(serde::de::Error::custom)?;
                 Entry::Compaction(CompactionEntry {
                     base,
                     summary,
                     retained_tail,
                     tokens_before,
                     details: obj.get("details").cloned(),
-                    usage: obj.get("usage").and_then(|v| serde_json::from_value(v.clone()).ok()),
+                    usage: obj
+                        .get("usage")
+                        .and_then(|v| serde_json::from_value(v.clone()).ok()),
                 })
             }
             "branch_summary" => Entry::BranchSummary(BranchSummaryEntry {
                 base,
-                from_id: serde_json::from_value(
-                    obj.get("fromId")
-                        .cloned()
-                        .ok_or_else(|| serde::de::Error::custom("branch_summary missing \"fromId\""))?,
-                )
+                from_id: serde_json::from_value(obj.get("fromId").cloned().ok_or_else(|| {
+                    serde::de::Error::custom("branch_summary missing \"fromId\"")
+                })?)
                 .map_err(serde::de::Error::custom)?,
-                summary: serde_json::from_value(
-                    obj.get("summary")
-                        .cloned()
-                        .ok_or_else(|| serde::de::Error::custom("branch_summary missing \"summary\""))?,
-                )
+                summary: serde_json::from_value(obj.get("summary").cloned().ok_or_else(|| {
+                    serde::de::Error::custom("branch_summary missing \"summary\"")
+                })?)
                 .map_err(serde::de::Error::custom)?,
                 details: obj.get("details").cloned(),
-                usage: obj.get("usage").and_then(|v| serde_json::from_value(v.clone()).ok()),
+                usage: obj
+                    .get("usage")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok()),
             }),
             "custom" => Entry::Custom(CustomEntry {
                 base,
@@ -445,7 +438,11 @@ impl<'de> Deserialize<'de> for Entry {
                 .map_err(serde::de::Error::custom)?,
                 data: obj.get("data").cloned(),
             }),
-            other => return Err(serde::de::Error::custom(format!("unknown entry type {other}"))),
+            other => {
+                return Err(serde::de::Error::custom(format!(
+                    "unknown entry type {other}"
+                )))
+            }
         };
         Ok(entry)
     }
@@ -463,8 +460,14 @@ fn deserialize_base(obj: &serde_json::Map<String, serde_json::Value>) -> Result<
             .and_then(|v| v.as_str())
             .ok_or("missing id")?
             .to_string(),
-        seq: obj.get("seq").and_then(|v| v.as_u64()).ok_or("missing seq")?,
-        parent_id: obj.get("parentId").and_then(|v| v.as_str()).map(String::from),
+        seq: obj
+            .get("seq")
+            .and_then(|v| v.as_u64())
+            .ok_or("missing seq")?,
+        parent_id: obj
+            .get("parentId")
+            .and_then(|v| v.as_str())
+            .map(String::from),
         timestamp: obj
             .get("timestamp")
             .and_then(|v| v.as_i64())
@@ -496,9 +499,16 @@ pub enum ProvisionedKind {
         message: rpi_agent::message::AgentMessage,
         terminate: Option<bool>,
     },
-    ModelChange { provider: String, model_id: String },
-    ThinkingLevel { thinking_level: String },
-    ActiveTools { active_tool_names: Vec<String> },
+    ModelChange {
+        provider: String,
+        model_id: String,
+    },
+    ThinkingLevel {
+        thinking_level: String,
+    },
+    ActiveTools {
+        active_tool_names: Vec<String>,
+    },
     Compaction {
         summary: String,
         retained_tail: Vec<rpi_agent::message::AgentMessage>,
@@ -512,7 +522,10 @@ pub enum ProvisionedKind {
         details: Option<JsonValue>,
         usage: Option<Usage>,
     },
-    Custom { custom_type: String, data: Option<JsonValue> },
+    Custom {
+        custom_type: String,
+        data: Option<JsonValue>,
+    },
 }
 
 impl ProvisionedEntry {
@@ -545,27 +558,61 @@ pub fn provisioned_into_entry(
         timestamp,
     };
     match p.kind {
-        ProvisionedKind::Message { message, terminate } => {
-            Entry::Message(MessageEntry { base, message, terminate })
-        }
+        ProvisionedKind::Message { message, terminate } => Entry::Message(MessageEntry {
+            base,
+            message,
+            terminate,
+        }),
         ProvisionedKind::ModelChange { provider, model_id } => {
-            Entry::ModelChange(ModelChangeEntry { base, provider, model_id })
+            Entry::ModelChange(ModelChangeEntry {
+                base,
+                provider,
+                model_id,
+            })
         }
         ProvisionedKind::ThinkingLevel { thinking_level } => {
-            Entry::ThinkingLevel(ThinkingLevelEntry { base, thinking_level })
+            Entry::ThinkingLevel(ThinkingLevelEntry {
+                base,
+                thinking_level,
+            })
         }
         ProvisionedKind::ActiveTools { active_tool_names } => {
-            Entry::ActiveTools(ActiveToolsEntry { base, active_tool_names })
+            Entry::ActiveTools(ActiveToolsEntry {
+                base,
+                active_tool_names,
+            })
         }
-        ProvisionedKind::Compaction { summary, retained_tail, tokens_before, details, usage } => {
-            Entry::Compaction(CompactionEntry { base, summary, retained_tail, tokens_before, details, usage })
-        }
-        ProvisionedKind::BranchSummary { from_id, summary, details, usage } => {
-            Entry::BranchSummary(BranchSummaryEntry { base, from_id, summary, details, usage })
-        }
-        ProvisionedKind::Custom { custom_type, data } => {
-            Entry::Custom(CustomEntry { base, custom_type, data })
-        }
+        ProvisionedKind::Compaction {
+            summary,
+            retained_tail,
+            tokens_before,
+            details,
+            usage,
+        } => Entry::Compaction(CompactionEntry {
+            base,
+            summary,
+            retained_tail,
+            tokens_before,
+            details,
+            usage,
+        }),
+        ProvisionedKind::BranchSummary {
+            from_id,
+            summary,
+            details,
+            usage,
+        } => Entry::BranchSummary(BranchSummaryEntry {
+            base,
+            from_id,
+            summary,
+            details,
+            usage,
+        }),
+        ProvisionedKind::Custom { custom_type, data } => Entry::Custom(CustomEntry {
+            base,
+            custom_type,
+            data,
+        }),
     }
 }
 
@@ -1003,11 +1050,28 @@ pub struct LanePointer {
 /// (`entry | record | lane | fact(name) | fact(label)`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogItem {
-    Entry { seq: u64, entry: Entry },
-    Record { seq: u64, record: LaneRecord },
-    Lane { seq: u64, lane: String, leaf_id: Option<String> },
-    FactName { seq: u64, name: Option<String> },
-    FactLabel { seq: u64, target_id: String, label: Option<String> },
+    Entry {
+        seq: u64,
+        entry: Entry,
+    },
+    Record {
+        seq: u64,
+        record: LaneRecord,
+    },
+    Lane {
+        seq: u64,
+        lane: String,
+        leaf_id: Option<String>,
+    },
+    FactName {
+        seq: u64,
+        name: Option<String>,
+    },
+    FactLabel {
+        seq: u64,
+        target_id: String,
+        label: Option<String>,
+    },
 }
 
 impl LogItem {
@@ -1043,11 +1107,19 @@ pub enum SessionMutation {
     /// Append a lane record (seq/timestamp already stamped by the caller).
     Record { record: LaneRecord },
     /// Move/create a lane leaf.
-    Lane { seq: u64, lane: String, leaf_id: Option<String> },
+    Lane {
+        seq: u64,
+        lane: String,
+        leaf_id: Option<String>,
+    },
     /// Global name fact (latest-wins).
     FactName { seq: u64, name: Option<String> },
     /// Global label fact (latest-wins per target).
-    FactLabel { seq: u64, target_id: String, label: Option<String> },
+    FactLabel {
+        seq: u64,
+        target_id: String,
+        label: Option<String>,
+    },
 }
 
 impl SessionMutation {
@@ -1083,7 +1155,10 @@ pub enum ForkOptions {
 impl Default for ForkOptions {
     /// TS default is branch-scope at the lane leaf.
     fn default() -> Self {
-        ForkOptions::Branch { entry_id: None, position: None }
+        ForkOptions::Branch {
+            entry_id: None,
+            position: None,
+        }
     }
 }
 
@@ -1215,8 +1290,15 @@ pub trait SessionTree: Send + Sync {
 
     /// Writes resolve on durable acceptance; the returned id is the entry's id
     /// (provisioned when the write defers).
-    async fn append_message(&self, message: rpi_agent::message::AgentMessage) -> SessionResult<String>;
-    async fn append_custom_entry(&self, custom_type: &str, data: Option<JsonValue>) -> SessionResult<String>;
+    async fn append_message(
+        &self,
+        message: rpi_agent::message::AgentMessage,
+    ) -> SessionResult<String>;
+    async fn append_custom_entry(
+        &self,
+        custom_type: &str,
+        data: Option<JsonValue>,
+    ) -> SessionResult<String>;
 }
 
 /// Used by `SuspendedOperation` snapshots and `AbortResult`. Carries a deferred

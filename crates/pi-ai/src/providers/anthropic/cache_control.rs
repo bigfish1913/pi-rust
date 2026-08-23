@@ -41,7 +41,9 @@ impl<'de> Deserialize<'de> for EphemeralType {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
         if s != "ephemeral" {
-            return Err(serde::de::Error::custom(format!("expected \"ephemeral\", got {s:?}")));
+            return Err(serde::de::Error::custom(format!(
+                "expected \"ephemeral\", got {s:?}"
+            )));
         }
         Ok(Self)
     }
@@ -59,7 +61,9 @@ impl<'de> Deserialize<'de> for EphemeralTtl {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
         if s != "1h" {
-            return Err(serde::de::Error::custom(format!("expected \"1h\", got {s:?}")));
+            return Err(serde::de::Error::custom(format!(
+                "expected \"1h\", got {s:?}"
+            )));
         }
         Ok(Self)
     }

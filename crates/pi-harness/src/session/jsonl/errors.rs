@@ -33,10 +33,16 @@ pub struct JsonlDecodeError {
 
 impl JsonlDecodeError {
     pub fn syntax(message: impl Into<String>) -> Self {
-        Self { kind: JsonlDecodeErrorKind::Syntax, message: message.into() }
+        Self {
+            kind: JsonlDecodeErrorKind::Syntax,
+            message: message.into(),
+        }
     }
     pub fn schema(message: impl Into<String>) -> Self {
-        Self { kind: JsonlDecodeErrorKind::Schema, message: message.into() }
+        Self {
+            kind: JsonlDecodeErrorKind::Schema,
+            message: message.into(),
+        }
     }
 }
 
@@ -61,5 +67,7 @@ pub fn file_result<T>(result: Result<T, FileError>, message: &str) -> Result<T, 
 /// Mirrors TS `invalidFile`: build an `invalid_entry` `SessionError` pointing
 /// at the offending line. `cause` is rendered via its `Display`.
 pub fn invalid_file<T: std::fmt::Display>(path: &str, line: u32, cause: &T) -> SessionError {
-    SessionError::invalid_entry(format!("Invalid JSONL v4 session {path}: line {line} {cause}"))
+    SessionError::invalid_entry(format!(
+        "Invalid JSONL v4 session {path}: line {line} {cause}"
+    ))
 }

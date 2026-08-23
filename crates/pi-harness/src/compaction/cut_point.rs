@@ -14,7 +14,9 @@
 use rpi_agent::message::AgentMessageRole;
 
 use crate::compaction::tokens::estimate_tokens;
-use crate::messages::{BASH_EXECUTION_ROLE, BRANCH_SUMMARY_ROLE, COMPACTION_SUMMARY_ROLE, CUSTOM_ROLE};
+use crate::messages::{
+    BASH_EXECUTION_ROLE, BRANCH_SUMMARY_ROLE, COMPACTION_SUMMARY_ROLE, CUSTOM_ROLE,
+};
 use crate::session::types::Entry;
 
 /// `true` if `entry` is a valid compaction cut point. Mirrors the per-entry
@@ -23,8 +25,7 @@ use crate::session::types::Entry;
 fn is_valid_cut_point(entry: &Entry) -> bool {
     match entry {
         Entry::Message(m) => match m.message.role() {
-            AgentMessageRole::User
-            | AgentMessageRole::Assistant => true,
+            AgentMessageRole::User | AgentMessageRole::Assistant => true,
             AgentMessageRole::Custom(role) => matches!(
                 role.as_str(),
                 BASH_EXECUTION_ROLE | CUSTOM_ROLE | BRANCH_SUMMARY_ROLE | COMPACTION_SUMMARY_ROLE
@@ -40,7 +41,11 @@ fn is_valid_cut_point(entry: &Entry) -> bool {
 
 /// Collect the indices in `[start_index, end_index)` that are valid cut points.
 /// Mirrors `findValidCutPoints`.
-pub fn find_valid_cut_points(entries: &[Entry], start_index: usize, end_index: usize) -> Vec<usize> {
+pub fn find_valid_cut_points(
+    entries: &[Entry],
+    start_index: usize,
+    end_index: usize,
+) -> Vec<usize> {
     let mut out = Vec::new();
     let end = end_index.min(entries.len());
     for i in start_index..end {
@@ -152,7 +157,8 @@ pub fn find_cut_point(
     }
 
     let cut_entry = &entries[cut_index];
-    let is_user_message = matches!(cut_entry, Entry::Message(m) if m.message.role() == AgentMessageRole::User);
+    let is_user_message =
+        matches!(cut_entry, Entry::Message(m) if m.message.role() == AgentMessageRole::User);
     let turn_start_index = if is_user_message {
         None
     } else {
@@ -171,8 +177,8 @@ pub fn find_cut_point(
 mod tests {
     use super::*;
     use crate::session::types::{EntryBase, MessageEntry};
-    use rpi_ai::types::{UserContent, UserMessage};
     use rpi_agent::message::AgentMessage;
+    use rpi_ai::types::{UserContent, UserMessage};
 
     fn base(seq: u64) -> EntryBase {
         EntryBase {
@@ -187,7 +193,10 @@ mod tests {
     fn user_msg(text: &str, seq: u64) -> Entry {
         Entry::Message(MessageEntry {
             base: base(seq),
-            message: AgentMessage::User(UserMessage::new(UserContent::Text(text.into()), seq as i64)),
+            message: AgentMessage::User(UserMessage::new(
+                UserContent::Text(text.into()),
+                seq as i64,
+            )),
             terminate: None,
         })
     }
@@ -203,12 +212,8 @@ mod tests {
     #[test]
     fn valid_cut_points_exclude_tool_result() {
         // user, assistant(toolCall implicit), toolResult, user.
-        let mut assistant = rpi_ai::types::AssistantMessage::empty(
-            rpi_ai::types::Api::Faux,
-            "faux",
-            "faux",
-            2,
-        );
+        let mut assistant =
+            rpi_ai::types::AssistantMessage::empty(rpi_ai::types::Api::Faux, "faux", "faux", 2);
         assistant.stop_reason = rpi_ai::types::StopReason::Stop;
         let entries = vec![
             user_msg("hi", 1),

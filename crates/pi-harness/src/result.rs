@@ -108,7 +108,11 @@ pub enum HarnessError {
     #[error("{message}")]
     NothingToResume { lane: String, message: String },
     #[error("{message}")]
-    InvalidMessage { lane: String, reason: String, message: String },
+    InvalidMessage {
+        lane: String,
+        reason: String,
+        message: String,
+    },
     #[error("{message}")]
     UnknownSkill { name: String, message: String },
     #[error("{message}")]
@@ -116,11 +120,19 @@ pub enum HarnessError {
     #[error("{message}")]
     UnknownTarget { target_id: String, message: String },
     #[error("{message}")]
-    UnknownQueueItem { lane: String, entry_id: String, message: String },
+    UnknownQueueItem {
+        lane: String,
+        entry_id: String,
+        message: String,
+    },
     #[error("{message}")]
     LaneExists { lane: String, message: String },
     #[error("{message}")]
-    InvalidLane { lane: String, reason: String, message: String },
+    InvalidLane {
+        lane: String,
+        reason: String,
+        message: String,
+    },
     #[error("{message}")]
     NothingToCompact { lane: String, message: String },
     #[error("{message}")]
@@ -179,16 +191,27 @@ impl HarnessError {
         }
     }
     pub fn no_active_run(lane: impl Into<String>, message: impl Into<String>) -> Self {
-        HarnessError::NoActiveRun { lane: lane.into(), message: message.into() }
+        HarnessError::NoActiveRun {
+            lane: lane.into(),
+            message: message.into(),
+        }
     }
     pub fn no_active_operation(lane: impl Into<String>, message: impl Into<String>) -> Self {
-        HarnessError::NoActiveOperation { lane: lane.into(), message: message.into() }
+        HarnessError::NoActiveOperation {
+            lane: lane.into(),
+            message: message.into(),
+        }
     }
     pub fn closed() -> Self {
-        HarnessError::Closed { message: "AgentHarness was closed".into() }
+        HarnessError::Closed {
+            message: "AgentHarness was closed".into(),
+        }
     }
     pub fn lane_exists(lane: impl Into<String>, message: impl Into<String>) -> Self {
-        HarnessError::LaneExists { lane: lane.into(), message: message.into() }
+        HarnessError::LaneExists {
+            lane: lane.into(),
+            message: message.into(),
+        }
     }
     pub fn invalid_lane(
         lane: impl Into<String>,
@@ -202,13 +225,22 @@ impl HarnessError {
         }
     }
     pub fn unknown_skill(name: impl Into<String>, message: impl Into<String>) -> Self {
-        HarnessError::UnknownSkill { name: name.into(), message: message.into() }
+        HarnessError::UnknownSkill {
+            name: name.into(),
+            message: message.into(),
+        }
     }
     pub fn unknown_template(name: impl Into<String>, message: impl Into<String>) -> Self {
-        HarnessError::UnknownTemplate { name: name.into(), message: message.into() }
+        HarnessError::UnknownTemplate {
+            name: name.into(),
+            message: message.into(),
+        }
     }
     pub fn unknown_target(target_id: impl Into<String>, message: impl Into<String>) -> Self {
-        HarnessError::UnknownTarget { target_id: target_id.into(), message: message.into() }
+        HarnessError::UnknownTarget {
+            target_id: target_id.into(),
+            message: message.into(),
+        }
     }
     pub fn nothing_to_compact(lane: impl Into<String>) -> Self {
         HarnessError::NothingToCompact {
@@ -217,13 +249,19 @@ impl HarnessError {
         }
     }
     pub fn agent(message: impl Into<String>) -> Self {
-        HarnessError::Agent { message: message.into() }
+        HarnessError::Agent {
+            message: message.into(),
+        }
     }
     pub fn compaction(message: impl Into<String>) -> Self {
-        HarnessError::Compaction { message: message.into() }
+        HarnessError::Compaction {
+            message: message.into(),
+        }
     }
     pub fn io(message: impl Into<String>) -> Self {
-        HarnessError::Io { message: message.into() }
+        HarnessError::Io {
+            message: message.into(),
+        }
     }
 }
 
@@ -239,10 +277,16 @@ pub struct HarnessFault {
 
 impl HarnessFault {
     pub fn new(message: impl Into<String>) -> Self {
-        Self { message: message.into(), cause: None }
+        Self {
+            message: message.into(),
+            cause: None,
+        }
     }
     pub fn with_cause(message: impl Into<String>, cause: impl ToString) -> Self {
-        Self { message: message.into(), cause: Some(cause.to_string()) }
+        Self {
+            message: message.into(),
+            cause: Some(cause.to_string()),
+        }
     }
 }
 

@@ -48,9 +48,7 @@ fn weather_tool() -> Tool {
     }
 }
 
-async fn drain(
-    stream: &mut rpi_ai::AssistantMessageEventStream,
-) -> Vec<AssistantMessageEvent> {
+async fn drain(stream: &mut rpi_ai::AssistantMessageEventStream) -> Vec<AssistantMessageEvent> {
     let mut out = Vec::new();
     while let Some(ev) = stream.next().await {
         out.push(ev);
@@ -123,7 +121,11 @@ async fn anthropic_smoke_tool_use_roundtrip() {
     assert_eq!(tool_calls.len(), 1, "expected exactly one tool call");
     let tc = &tool_calls[0];
     assert_eq!(tc.name, "get_weather", "tool call name mismatch");
-    assert!(tc.arguments.is_object(), "args not an object: {:?}", tc.arguments);
+    assert!(
+        tc.arguments.is_object(),
+        "args not an object: {:?}",
+        tc.arguments
+    );
     assert!(
         tc.arguments.get("city").is_some(),
         "args missing `city`: {:?}",

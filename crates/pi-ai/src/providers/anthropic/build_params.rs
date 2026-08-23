@@ -108,11 +108,15 @@ pub enum ToolResultContent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AnthropicToolResultBlock {
-    Text { text: String },
+    Text {
+        text: String,
+    },
     /// A deferred-tool load reference. Mirrors Anthropic's `tool_reference`
     /// content-block (replaces the ordinary text content of a `tool_result`
     /// when the result is being used to announce an on-demand tool load).
-    ToolReference { tool_name: String },
+    ToolReference {
+        tool_name: String,
+    },
 }
 
 /// A serialized Anthropic tool definition. Mirrors the shape `convertTools`
@@ -249,12 +253,10 @@ fn is_same_model(msg: &AssistantMessage, model: &Model) -> bool {
 /// `normalize_tool_call_id` is the Anthropic normalizer; `model.input` drives
 /// the image-downgrade branch. The out `Vec<Message>` is what `convert_messages`
 /// then serializes.
-pub fn transform_messages(
-    messages: &[Message],
-    model: &Model,
-) -> Vec<Message> {
+pub fn transform_messages(messages: &[Message], model: &Model) -> Vec<Message> {
     let supports_images = model.input.contains(&InputModality::Image);
-    let mut tool_call_id_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut tool_call_id_map: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
     // First pass: image downgrade + thinking/tool-call transforms (mutate
     // per-message content; collect tool-call id remappings).
@@ -420,7 +422,11 @@ pub fn transform_messages(
             }
         }
     }
-    flush_pending(&mut pending_tool_calls, &existing_tool_result_ids, &mut result);
+    flush_pending(
+        &mut pending_tool_calls,
+        &existing_tool_result_ids,
+        &mut result,
+    );
     result
 }
 
@@ -662,7 +668,11 @@ pub fn convert_tools(
             } else {
                 None
             },
-            strict: if strict == Some(true) { Some(true) } else { None },
+            strict: if strict == Some(true) {
+                Some(true)
+            } else {
+                None
+            },
             input_schema,
             defer_loading: if defer_loading { Some(true) } else { None },
             cache_control: cc,
@@ -913,9 +923,10 @@ fn sibling_content_from(converted: ToolResultContent) -> Vec<AnthropicContentBlo
         ToolResultContent::Blocks(blocks) => blocks
             .into_iter()
             .map(|b| match b {
-                AnthropicToolResultBlock::Text { text } => {
-                    AnthropicContentBlock::Text { text, cache_control: None }
-                }
+                AnthropicToolResultBlock::Text { text } => AnthropicContentBlock::Text {
+                    text,
+                    cache_control: None,
+                },
                 AnthropicToolResultBlock::ToolReference { tool_name } => {
                     AnthropicContentBlock::ToolReference { tool_name }
                 }
@@ -964,9 +975,12 @@ fn convert_content_blocks(content: &[Content]) -> ToolResultContent {
         }
     }
     if !has_text {
-        blocks.insert(0, AnthropicToolResultBlock::Text {
-            text: "(see attached image)".to_string(),
-        });
+        blocks.insert(
+            0,
+            AnthropicToolResultBlock::Text {
+                text: "(see attached image)".to_string(),
+            },
+        );
     }
     ToolResultContent::Blocks(blocks)
 }
@@ -1002,7 +1016,10 @@ fn attach_cache_control_to_last_block(msg: &mut AnthropicMessage, cc: &CacheCont
     }
 }
 
-fn set_cache_control_on_block(block: &mut AnthropicContentBlock, cc: Option<CacheControlEphemeral>) {
+fn set_cache_control_on_block(
+    block: &mut AnthropicContentBlock,
+    cc: Option<CacheControlEphemeral>,
+) {
     match block {
         AnthropicContentBlock::Text { cache_control, .. }
         | AnthropicContentBlock::Image { cache_control, .. }
@@ -1084,10 +1101,7 @@ pub fn adjust_max_tokens_for_thinking(
 /// Mirrors `mapThinkingLevelToEffort`. The per-model `thinking_level_map` wins
 /// when it carries a non-null string for the level; otherwise minimal/low→low,
 /// medium→medium, high/xhigh/max→high.
-pub fn map_thinking_level_to_effort(
-    model: &Model,
-    level: ThinkingLevel,
-) -> &'static str {
+pub fn map_thinking_level_to_effort(model: &Model, level: ThinkingLevel) -> &'static str {
     if let Some(map) = &model.thinking_level_map {
         if let Some(Some(mapped)) = map.get(&level) {
             // The mapped value may be "xhigh" or "max" (only valid for models
@@ -1269,7 +1283,12 @@ pub fn build_params(
     // max_tokens: opts.max_tokens wins; else model.max_tokens. Thinking may
     // inflate this (handled below for budget-based models).
     let base_max_tokens = opts.max_tokens.unwrap_or(model.max_tokens);
-    let mut max_tokens = clamp_max_tokens_to_context(model, &ctx.messages, ctx.system_prompt.as_deref(), base_max_tokens);
+    let mut max_tokens = clamp_max_tokens_to_context(
+        model,
+        &ctx.messages,
+        ctx.system_prompt.as_deref(),
+        base_max_tokens,
+    );
 
     // Thinking config.
     let thinking_enabled = opts.reasoning.is_some() && opts.reasoning != Some(ThinkingLevel::Off);
@@ -1312,9 +1331,7 @@ pub fn build_params(
                     display,
                 });
             }
-        } else if opts.reasoning == Some(ThinkingLevel::Off)
-            && !off_mapped_to_null(model)
-        {
+        } else if opts.reasoning == Some(ThinkingLevel::Off) && !off_mapped_to_null(model) {
             // off is supported (not mapped to null) → explicit disabled.
             thinking = Some(AnthropicThinking::Disabled);
         }
@@ -1348,10 +1365,7 @@ pub fn build_params(
     };
 
     // Temperature: only when not thinking and the model supports it.
-    let temperature = if !thinking_enabled
-        && compat.temperature()
-        && opts.temperature.is_some()
-    {
+    let temperature = if !thinking_enabled && compat.temperature() && opts.temperature.is_some() {
         opts.temperature
     } else {
         None
@@ -1393,7 +1407,8 @@ pub fn build_params(
     let use_fine_grained_tool_streaming_beta =
         !ctx.tools.is_empty() && !compat.eager_tool_input_streaming();
     let needs_interleaved_beta = thinking_enabled && !compat.adaptive_thinking();
-    let beta_header = build_beta_header(use_fine_grained_tool_streaming_beta, needs_interleaved_beta);
+    let beta_header =
+        build_beta_header(use_fine_grained_tool_streaming_beta, needs_interleaved_beta);
 
     let request = AnthropicRequest {
         model: model.id.clone(),
@@ -1747,7 +1762,10 @@ mod tests {
             built.request.thinking,
             Some(AnthropicThinking::Adaptive { .. })
         ));
-        assert_eq!(built.request.output_config, Some(json!({ "effort": "high" })));
+        assert_eq!(
+            built.request.output_config,
+            Some(json!({ "effort": "high" }))
+        );
     }
 
     #[test]
@@ -1784,7 +1802,8 @@ mod tests {
         let mut compat = AnthropicMessagesCompat::default();
         compat.supports_tool_references = Some(false);
         let model = model_with_compat(compat);
-        let assistant = AssistantMessage::empty(Api::AnthropicMessages, "anthropic", "claude-haiku-4-5", 0);
+        let assistant =
+            AssistantMessage::empty(Api::AnthropicMessages, "anthropic", "claude-haiku-4-5", 0);
         let mut a = assistant;
         a.stop_reason = StopReason::ToolUse;
         a.content = vec![Content::tool_call("t1", "search", json!({}))];

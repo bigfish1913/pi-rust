@@ -14,7 +14,9 @@ pub mod repo;
 pub mod storage;
 pub mod types;
 
-pub use codec::{encode_header, encode_mutation, metadata_from_header, parse_header, parse_mutation};
+pub use codec::{
+    encode_header, encode_mutation, metadata_from_header, parse_header, parse_mutation,
+};
 pub use errors::{file_result, invalid_file, JsonlDecodeError, JsonlDecodeErrorKind};
 pub use repo::JsonlSessionRepo;
 pub use storage::JsonlSessionStorage;

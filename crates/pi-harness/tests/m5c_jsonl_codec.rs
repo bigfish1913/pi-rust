@@ -7,26 +7,20 @@
 
 use std::collections::BTreeMap;
 
+use rpi_agent::message::AgentMessage;
 use rpi_harness::session::jsonl::{
-    encode_header, encode_mutation, metadata_from_header, parse_header, parse_mutation,
-    HeaderKind, JsonlDecodeErrorKind, JsonlSessionMetadata, JsonlSourceFormat, JsonlV4Header,
+    encode_header, encode_mutation, metadata_from_header, parse_header, parse_mutation, HeaderKind,
+    JsonlDecodeErrorKind, JsonlSessionMetadata, JsonlSourceFormat, JsonlV4Header,
 };
 use rpi_harness::session::types::{
     EntryBase, LaneRecord, OperationIntent, OperationStartedRecord, RecordBase, SessionMutation,
 };
-use rpi_agent::message::AgentMessage;
 
 fn header_with_parent() -> JsonlV4Header {
     let mut metadata = serde_json::Map::new();
     metadata.insert("owner".into(), serde_json::Value::String("agent".into()));
-    metadata.insert(
-        "nested".into(),
-        serde_json::json!({ "enabled": true }),
-    );
-    metadata.insert(
-        "values".into(),
-        serde_json::json!([1, null, "two"]),
-    );
+    metadata.insert("nested".into(), serde_json::json!({ "enabled": true }));
+    metadata.insert("values".into(), serde_json::json!([1, null, "two"]));
     JsonlV4Header::new(
         "session".into(),
         1_700_000_000_000,
@@ -61,7 +55,12 @@ fn header_with_metadata_map() -> JsonlV4Header {
     )
 }
 
-fn custom_entry(id: &str, seq: u64, parent_id: Option<&str>, timestamp: i64) -> rpi_harness::session::types::Entry {
+fn custom_entry(
+    id: &str,
+    seq: u64,
+    parent_id: Option<&str>,
+    timestamp: i64,
+) -> rpi_harness::session::types::Entry {
     use rpi_harness::session::types::{CustomEntry, Entry};
     let base = EntryBase {
         entry_type: "custom".to_string(),
@@ -134,13 +133,19 @@ fn assert_header_round_trip(header: &JsonlV4Header) {
     assert_eq!(parsed.created_at, header.created_at);
     assert_eq!(parsed.cwd, header.cwd);
     assert_eq!(parsed.parent_session_id, header.parent_session_id);
-    assert_eq!(parsed.legacy_parent_session_path, header.legacy_parent_session_path);
+    assert_eq!(
+        parsed.legacy_parent_session_path,
+        header.legacy_parent_session_path
+    );
     assert_eq!(parsed.metadata, header.metadata);
 }
 
 fn assert_mutation_round_trip(mutation: &SessionMutation) {
     let encoded = encode_mutation(mutation);
-    assert!(encoded.ends_with('\n'), "mutation line must end with newline");
+    assert!(
+        encoded.ends_with('\n'),
+        "mutation line must end with newline"
+    );
     let parsed = parse_mutation(encoded.trim_end()).expect("mutation parses");
     assert_eq!(parsed.seq(), mutation.seq());
     // Round-trip equality holds for SessionMutation (Entry/Record/Lane/Fact).
@@ -252,7 +257,10 @@ fn mutation_round_trips_lane_line_with_null_leaf() {
 
 #[test]
 fn mutation_round_trips_fact_name_lines_including_cleared() {
-    assert_mutation_round_trip(&SessionMutation::FactName { seq: 1, name: Some("Example".into()) });
+    assert_mutation_round_trip(&SessionMutation::FactName {
+        seq: 1,
+        name: Some("Example".into()),
+    });
     assert_mutation_round_trip(&SessionMutation::FactName { seq: 2, name: None });
     assert_mutation_round_trip(&SessionMutation::FactLabel {
         seq: 3,
@@ -269,7 +277,8 @@ fn mutation_round_trips_fact_name_lines_including_cleared() {
 #[test]
 fn mutation_rejects_custom_entry_without_custom_type() {
     // {kind:"entry", type:"custom", id, parentId:null, seq, timestamp} — no customType.
-    let line = r#"{"kind":"entry","type":"custom","id":"entry","parentId":null,"seq":1,"timestamp":1}"#;
+    let line =
+        r#"{"kind":"entry","type":"custom","id":"entry","parentId":null,"seq":1,"timestamp":1}"#;
     let err = parse_mutation(line).unwrap_err();
     assert_eq!(err.kind, JsonlDecodeErrorKind::Schema);
 }

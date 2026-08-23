@@ -35,7 +35,8 @@ impl Schema {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_null() || (self.0.is_object() && self.0.as_object().map(|m| m.is_empty()).unwrap_or(true))
+        self.0.is_null()
+            || (self.0.is_object() && self.0.as_object().map(|m| m.is_empty()).unwrap_or(true))
     }
 }
 
@@ -80,7 +81,9 @@ impl<'de> Deserialize<'de> for TextContentType {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
         if s != "text" {
-            return Err(serde::de::Error::custom(format!("expected \"text\", got {s:?}")));
+            return Err(serde::de::Error::custom(format!(
+                "expected \"text\", got {s:?}"
+            )));
         }
         Ok(Self)
     }
@@ -112,7 +115,9 @@ impl<'de> Deserialize<'de> for ThinkingContentType {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
         if s != "thinking" {
-            return Err(serde::de::Error::custom(format!("expected \"thinking\", got {s:?}")));
+            return Err(serde::de::Error::custom(format!(
+                "expected \"thinking\", got {s:?}"
+            )));
         }
         Ok(Self)
     }
@@ -143,7 +148,9 @@ impl<'de> Deserialize<'de> for ImageContentType {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
         if s != "image" {
-            return Err(serde::de::Error::custom(format!("expected \"image\", got {s:?}")));
+            return Err(serde::de::Error::custom(format!(
+                "expected \"image\", got {s:?}"
+            )));
         }
         Ok(Self)
     }
@@ -179,7 +186,9 @@ impl<'de> Deserialize<'de> for ToolCallType {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
         if s != "toolCall" {
-            return Err(serde::de::Error::custom(format!("expected \"toolCall\", got {s:?}")));
+            return Err(serde::de::Error::custom(format!(
+                "expected \"toolCall\", got {s:?}"
+            )));
         }
         Ok(Self)
     }
@@ -215,7 +224,11 @@ impl Content {
         })
     }
 
-    pub fn tool_call<I: Into<String>, N: Into<String>>(id: I, name: N, arguments: serde_json::Value) -> Self {
+    pub fn tool_call<I: Into<String>, N: Into<String>>(
+        id: I,
+        name: N,
+        arguments: serde_json::Value,
+    ) -> Self {
         Content::ToolCall(ToolCall {
             kind: ToolCallType,
             id: id.into(),
@@ -327,7 +340,8 @@ impl Usage {
         self.cache_read += other.cache_read;
         self.cache_write += other.cache_write;
         if other.cache_write_1h.is_some() {
-            self.cache_write_1h = Some(self.cache_write_1h.unwrap_or(0) + other.cache_write_1h.unwrap());
+            self.cache_write_1h =
+                Some(self.cache_write_1h.unwrap_or(0) + other.cache_write_1h.unwrap());
         }
         if other.reasoning.is_some() {
             self.reasoning = Some(self.reasoning.unwrap_or(0) + other.reasoning.unwrap());
@@ -456,7 +470,9 @@ pub enum InputModality {
 }
 
 /// Thinking levels, mirroring TS `ThinkingLevel | "off"`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum ThinkingLevel {
     #[default]
@@ -562,7 +578,9 @@ impl<'de> Deserialize<'de> for UserRole {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
         if s != "user" {
-            return Err(serde::de::Error::custom(format!("expected \"user\", got {s:?}")));
+            return Err(serde::de::Error::custom(format!(
+                "expected \"user\", got {s:?}"
+            )));
         }
         Ok(Self)
     }
@@ -608,7 +626,9 @@ impl<'de> Deserialize<'de> for ToolResultRole {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
         if s != "toolResult" {
-            return Err(serde::de::Error::custom(format!("expected \"toolResult\", got {s:?}")));
+            return Err(serde::de::Error::custom(format!(
+                "expected \"toolResult\", got {s:?}"
+            )));
         }
         Ok(Self)
     }
@@ -652,7 +672,9 @@ impl<'de> Deserialize<'de> for AssistantRole {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
         if s != "assistant" {
-            return Err(serde::de::Error::custom(format!("expected \"assistant\", got {s:?}")));
+            return Err(serde::de::Error::custom(format!(
+                "expected \"assistant\", got {s:?}"
+            )));
         }
         Ok(Self)
     }
@@ -661,7 +683,12 @@ impl<'de> Deserialize<'de> for AssistantRole {
 impl AssistantMessage {
     /// Construct a new assistant message with zeroed usage and `Pending` stop reason,
     /// ready for the stream mapper to mutate per-event.
-    pub fn empty(api: Api, provider: impl Into<String>, model: impl Into<String>, timestamp: i64) -> Self {
+    pub fn empty(
+        api: Api,
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        timestamp: i64,
+    ) -> Self {
         Self {
             role: AssistantRole,
             content: Vec::new(),
@@ -949,7 +976,10 @@ impl AssistantMessageEvent {
 
     /// True for the two terminal variants.
     pub fn is_terminal(&self) -> bool {
-        matches!(self, AssistantMessageEvent::Done { .. } | AssistantMessageEvent::Error { .. })
+        matches!(
+            self,
+            AssistantMessageEvent::Done { .. } | AssistantMessageEvent::Error { .. }
+        )
     }
 
     /// Snapshot of the partial message for live rendering. Terminal events do not
@@ -984,17 +1014,34 @@ impl Serialize for AssistantMessageEvent {
                 m.serialize_entry("partial", &**partial)?;
                 m.end()
             }
-            AssistantMessageEvent::TextStart { content_index, partial }
-            | AssistantMessageEvent::ThinkingStart { content_index, partial }
-            | AssistantMessageEvent::ToolCallStart { content_index, partial } => {
+            AssistantMessageEvent::TextStart {
+                content_index,
+                partial,
+            }
+            | AssistantMessageEvent::ThinkingStart {
+                content_index,
+                partial,
+            }
+            | AssistantMessageEvent::ToolCallStart {
+                content_index,
+                partial,
+            } => {
                 let mut m = s.serialize_map(Some(3))?;
                 m.serialize_entry("type", tag)?;
                 m.serialize_entry("contentIndex", content_index)?;
                 m.serialize_entry("partial", &**partial)?;
                 m.end()
             }
-            AssistantMessageEvent::TextDelta { content_index, delta, partial }
-            | AssistantMessageEvent::ThinkingDelta { content_index, delta, partial } => {
+            AssistantMessageEvent::TextDelta {
+                content_index,
+                delta,
+                partial,
+            }
+            | AssistantMessageEvent::ThinkingDelta {
+                content_index,
+                delta,
+                partial,
+            } => {
                 let mut m = s.serialize_map(Some(4))?;
                 m.serialize_entry("type", tag)?;
                 m.serialize_entry("contentIndex", content_index)?;
@@ -1002,7 +1049,11 @@ impl Serialize for AssistantMessageEvent {
                 m.serialize_entry("partial", &**partial)?;
                 m.end()
             }
-            AssistantMessageEvent::ToolCallDelta { content_index, delta, partial } => {
+            AssistantMessageEvent::ToolCallDelta {
+                content_index,
+                delta,
+                partial,
+            } => {
                 let mut m = s.serialize_map(Some(4))?;
                 m.serialize_entry("type", tag)?;
                 m.serialize_entry("contentIndex", content_index)?;
@@ -1010,8 +1061,16 @@ impl Serialize for AssistantMessageEvent {
                 m.serialize_entry("partial", &**partial)?;
                 m.end()
             }
-            AssistantMessageEvent::TextEnd { content_index, content, partial }
-            | AssistantMessageEvent::ThinkingEnd { content_index, content, partial } => {
+            AssistantMessageEvent::TextEnd {
+                content_index,
+                content,
+                partial,
+            }
+            | AssistantMessageEvent::ThinkingEnd {
+                content_index,
+                content,
+                partial,
+            } => {
                 let mut m = s.serialize_map(Some(4))?;
                 m.serialize_entry("type", tag)?;
                 m.serialize_entry("contentIndex", content_index)?;
@@ -1019,7 +1078,11 @@ impl Serialize for AssistantMessageEvent {
                 m.serialize_entry("partial", &**partial)?;
                 m.end()
             }
-            AssistantMessageEvent::ToolCallEnd { content_index, tool_call, partial } => {
+            AssistantMessageEvent::ToolCallEnd {
+                content_index,
+                tool_call,
+                partial,
+            } => {
                 let mut m = s.serialize_map(Some(4))?;
                 m.serialize_entry("type", tag)?;
                 m.serialize_entry("contentIndex", content_index)?;

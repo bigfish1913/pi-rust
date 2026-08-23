@@ -69,7 +69,13 @@ async fn text_reply_sequence_and_done() {
     assert_eq!(text, "hello world");
     // Usage estimate populated (non-zero input).
     assert!(result.usage.input > 0);
-    assert_eq!(provider.state().call_count.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(
+        provider
+            .state()
+            .call_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
 }
 
 #[tokio::test]
@@ -186,10 +192,7 @@ async fn factory_step_sees_context() {
                 _ => None,
             })
             .unwrap_or_default();
-        rpi_ai::providers::faux::faux_assistant_message(
-            format!("echo:{last}"),
-            StopReason::Stop,
-        )
+        rpi_ai::providers::faux::faux_assistant_message(format!("echo:{last}"), StopReason::Stop)
     })]);
     let provider = FauxProvider::new(script);
     let model = provider.default_model().clone();

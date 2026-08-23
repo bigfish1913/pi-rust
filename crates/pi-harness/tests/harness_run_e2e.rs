@@ -36,16 +36,14 @@ use rpi_ai::providers::faux::{FauxProvider, FauxScript};
 use rpi_ai::Provider;
 use rpi_harness::agent_harness::{AgentHarness, AgentLane, HarnessRunOutcome};
 use rpi_harness::events::{HarnessEvent, RunEndOutcome};
-use rpi_harness::session::types::{
-    BranchBounds, EntryOrder, EntryQuery, LaneRecord, RecordQuery,
-};
-use rpi_harness::session::{DefaultIdGenerator, Session};
 use rpi_harness::session::memory::{InMemorySessionStorage, SystemClock};
 use rpi_harness::session::types::SessionMetadata;
+use rpi_harness::session::types::{BranchBounds, EntryOrder, EntryQuery, LaneRecord, RecordQuery};
+use rpi_harness::session::{DefaultIdGenerator, Session};
 use rpi_harness::types::{AgentHarnessOptions, HarnessTool};
 use rpi_tools::{
-    create_bash_tool, create_read_tool, create_write_tool, ExecutionToolContext,
-    FileSystem, InMemoryExecutionEnv, MutationQueueRegistry,
+    create_bash_tool, create_read_tool, create_write_tool, ExecutionToolContext, FileSystem,
+    InMemoryExecutionEnv, MutationQueueRegistry,
 };
 
 /// Build an `AgentHarness` over a faux provider + in-memory env + the read/
@@ -54,11 +52,7 @@ use rpi_tools::{
 /// provider call count + the in-memory FS after the run.
 async fn harness_with(
     script: FauxScript,
-) -> (
-    AgentHarness,
-    Arc<FauxProvider>,
-    Arc<InMemoryExecutionEnv>,
-) {
+) -> (AgentHarness, Arc<FauxProvider>, Arc<InMemoryExecutionEnv>) {
     let provider = FauxProvider::new(script);
     let model = provider.default_model().clone();
 
@@ -72,8 +66,10 @@ async fn harness_with(
     let read = create_read_tool(&ctx, None);
     let write = create_write_tool(&ctx);
     let bash = create_bash_tool(&ctx, None);
-    let tools: Vec<HarnessTool> =
-        vec![read, write, bash].into_iter().map(HarnessTool::new).collect();
+    let tools: Vec<HarnessTool> = vec![read, write, bash]
+        .into_iter()
+        .map(HarnessTool::new)
+        .collect();
     let active: Vec<String> = tools.iter().map(|t| t.tool.schema().name.clone()).collect();
 
     // Fresh in-memory session storage (no prior records — `create` would
@@ -114,7 +110,7 @@ async fn harness_with(
         transform_context: None,
         entry_transforms: Vec::new(),
         provider_hooks: None,
-            allow_existing_session: false,
+        allow_existing_session: false,
     };
 
     let harness = AgentHarness::create(options).await.expect("create harness");
@@ -122,20 +118,18 @@ async fn harness_with(
 }
 
 /// Collect bus events into a shared vec while the closure owns a `Handle`.
-fn record_runtime_events(
-    harness: &AgentHarness,
-) -> Arc<Mutex<Vec<HarnessEvent>>> {
+fn record_runtime_events(harness: &AgentHarness) -> Arc<Mutex<Vec<HarnessEvent>>> {
     let collected: Arc<Mutex<Vec<HarnessEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let collected_for_listener = collected.clone();
     // `on` registers a direct listener; we keep the `OnUnsubscribe` guard alive
     // for the duration of the run by returning both. But we only need the vec;
     // drop the guard to keep it simple — events during the run still land
     // because the harness emits synchronously inline on the calling task.
-    let _off = harness.events().on::<rpi_harness::events::RunEndEvent, _>(
-        move |_e| {
+    let _off = harness
+        .events()
+        .on::<rpi_harness::events::RunEndEvent, _>(move |_e| {
             // no-op placeholder; we use the all-events watch below
-        },
-    );
+        });
     // Use the watch surface (snapshot now → buffer → start) to capture every
     // event including RunStart, which fires *during* `prompt_text` before a
     // live listener could be installed post-call.
@@ -171,11 +165,18 @@ async fn full_run_with_write_tool_call_completes_and_persists() {
         .expect("prompt_text completes");
     let run_id = result.run_id.clone();
     match &result.outcome {
-        HarnessRunOutcome::Completed { leaf_id, final_entry_id, final_message } => {
+        HarnessRunOutcome::Completed {
+            leaf_id,
+            final_entry_id,
+            final_message,
+        } => {
             assert!(!leaf_id.is_empty(), "leaf_id must be set on Completed");
             assert!(!final_entry_id.is_empty(), "final_entry_id must be set");
             // The final assistant message is the "Done — ..." text turn (no tool calls).
-            let has_text = final_message.content.iter().any(|c| matches!(c, rpi_ai::types::Content::Text(_)));
+            let has_text = final_message
+                .content
+                .iter()
+                .any(|c| matches!(c, rpi_ai::types::Content::Text(_)));
             assert!(has_text, "final message should carry text content");
             assert_eq!(final_message.stop_reason, rpi_ai::types::StopReason::Stop);
         }
@@ -184,7 +185,10 @@ async fn full_run_with_write_tool_call_completes_and_persists() {
 
     // The faux provider was called once per turn = 2 calls.
     assert_eq!(
-        provider.state().call_count.load(std::sync::atomic::Ordering::Relaxed),
+        provider
+            .state()
+            .call_count
+            .load(std::sync::atomic::Ordering::Relaxed),
         2,
         "faux provider should have been called for both turns"
     );
@@ -211,8 +215,14 @@ async fn full_run_with_write_tool_call_completes_and_persists() {
     let path = harness
         .session()
         .find_entries_on_branch(
-            &EntryQuery { order: Some(EntryOrder::OldestFirst), ..Default::default() },
-            &BranchBounds { start: Some(leaf), ..Default::default() },
+            &EntryQuery {
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            },
+            &BranchBounds {
+                start: Some(leaf),
+                ..Default::default()
+            },
         )
         .await
         .expect("branch path");
@@ -222,10 +232,16 @@ async fn full_run_with_write_tool_call_completes_and_persists() {
         path.len()
     );
     // Sanity: the first entry is the user prompt.
-    assert!(matches!(path[0], rpi_harness::session::types::Entry::Message(_)));
+    assert!(matches!(
+        path[0],
+        rpi_harness::session::types::Entry::Message(_)
+    ));
     // And the leaf entry (last) is the final assistant text turn.
     let last = path.last().unwrap();
-    assert!(matches!(last, rpi_harness::session::types::Entry::Message(_)));
+    assert!(matches!(
+        last,
+        rpi_harness::session::types::Entry::Message(_)
+    ));
 
     // An operation_started (intent Run) + operation_finished (Completed) record
     // pair should be present on the lane, with matching run_id.
@@ -238,7 +254,11 @@ async fn full_run_with_write_tool_call_completes_and_persists() {
         })
         .await
         .expect("find operation_started");
-    assert_eq!(started.len(), 1, "exactly one operation_started for this run_id");
+    assert_eq!(
+        started.len(),
+        1,
+        "exactly one operation_started for this run_id"
+    );
     let finished = harness
         .session()
         .find_records(&RecordQuery {
@@ -248,9 +268,16 @@ async fn full_run_with_write_tool_call_completes_and_persists() {
         })
         .await
         .expect("find operation_finished");
-    assert_eq!(finished.len(), 1, "exactly one operation_finished for this run_id");
+    assert_eq!(
+        finished.len(),
+        1,
+        "exactly one operation_finished for this run_id"
+    );
     if let LaneRecord::OperationFinished(f) = &finished[0] {
-        assert_eq!(f.outcome, rpi_harness::session::types::OperationOutcome::Completed);
+        assert_eq!(
+            f.outcome,
+            rpi_harness::session::types::OperationOutcome::Completed
+        );
     } else {
         panic!("expected OperationFinished record");
     }
@@ -306,7 +333,10 @@ async fn run_with_no_tool_calls_completes_in_single_turn() {
     );
     // One turn → one provider call.
     assert_eq!(
-        provider.state().call_count.load(std::sync::atomic::Ordering::Relaxed),
+        provider
+            .state()
+            .call_count
+            .load(std::sync::atomic::Ordering::Relaxed),
         1,
     );
     // Two persisted entries: the user prompt + the assistant reply.
@@ -319,8 +349,14 @@ async fn run_with_no_tool_calls_completes_in_single_turn() {
     let path = harness
         .session()
         .find_entries_on_branch(
-            &EntryQuery { order: Some(EntryOrder::OldestFirst), ..Default::default() },
-            &BranchBounds { start: Some(leaf), ..Default::default() },
+            &EntryQuery {
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            },
+            &BranchBounds {
+                start: Some(leaf),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -472,8 +508,14 @@ async fn harness_forwards_after_tool_call_option_into_loop() {
     let path = harness
         .session()
         .find_entries_on_branch(
-            &EntryQuery { order: Some(EntryOrder::OldestFirst), ..Default::default() },
-            &BranchBounds { start: Some(leaf), ..Default::default() },
+            &EntryQuery {
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            },
+            &BranchBounds {
+                start: Some(leaf),
+                ..Default::default()
+            },
         )
         .await
         .expect("branch path");
@@ -530,8 +572,9 @@ async fn harness_fires_provider_hooks_before_request_per_call() {
         }
     }
 
-    let hooks: Arc<dyn ProviderHooks> =
-        Arc::new(CountingHooks { fires: Arc::clone(&fires) });
+    let hooks: Arc<dyn ProviderHooks> = Arc::new(CountingHooks {
+        fires: Arc::clone(&fires),
+    });
 
     let script = FauxScript::new()
         .with_tool_call(
@@ -603,8 +646,10 @@ async fn harness_fires_provider_hooks_before_request_per_call() {
     );
 
     // Two turn script → two provider calls; before_request fired once each.
-    let provider_calls =
-        provider.state().call_count.load(std::sync::atomic::Ordering::Relaxed);
+    let provider_calls = provider
+        .state()
+        .call_count
+        .load(std::sync::atomic::Ordering::Relaxed);
     let hook_fires = fires.lock().unwrap().clone();
     assert_eq!(provider_calls, 2, "two-turn script = two provider calls");
     assert_eq!(

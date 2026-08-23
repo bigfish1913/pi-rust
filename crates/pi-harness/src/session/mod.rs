@@ -25,6 +25,8 @@ pub use context::{
 pub use memory::{
     Clock, CounterIdGenerator, FakeClock, InMemorySessionRepo, InMemorySessionStorage, SystemClock,
 };
-pub use reducer::{RecordLogCorruption, RecordLogCorruptionReason, RecordLogSlice, validate_record_log};
+pub use reducer::{
+    validate_record_log, RecordLogCorruption, RecordLogCorruptionReason, RecordLogSlice,
+};
 pub use session::{DefaultIdGenerator, Session};
 pub use state::{ApplyOutcome, SessionState};

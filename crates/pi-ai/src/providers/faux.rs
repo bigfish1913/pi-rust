@@ -37,7 +37,11 @@ const DEFAULT_MAX_TOKEN_SIZE: usize = 5;
 pub enum FauxBlock {
     Text(String),
     Thinking(String),
-    ToolCall { name: String, arguments: serde_json::Value, id: String },
+    ToolCall {
+        name: String,
+        arguments: serde_json::Value,
+        id: String,
+    },
 }
 
 impl FauxBlock {
@@ -143,7 +147,11 @@ pub fn faux_assistant_message(
         .map(|b| match b {
             FauxBlock::Text(s) => faux_text(s),
             FauxBlock::Thinking(s) => faux_thinking(s),
-            FauxBlock::ToolCall { name, arguments, id } => Content::tool_call(id, name, arguments),
+            FauxBlock::ToolCall {
+                name,
+                arguments,
+                id,
+            } => Content::tool_call(id, name, arguments),
         })
         .collect();
     AssistantMessage {
@@ -272,14 +280,13 @@ impl FauxScript {
     }
     pub fn with_thinking<S: Into<String>>(mut self, s: S) -> Self {
         let blocks = vec![FauxBlock::thinking(s)];
-        self.push(FauxStep::Message(faux_assistant_message(blocks, StopReason::Stop)));
+        self.push(FauxStep::Message(faux_assistant_message(
+            blocks,
+            StopReason::Stop,
+        )));
         self
     }
-    pub fn with_tool_call(
-        mut self,
-        name: impl Into<String>,
-        arguments: serde_json::Value,
-    ) -> Self {
+    pub fn with_tool_call(mut self, name: impl Into<String>, arguments: serde_json::Value) -> Self {
         self.push(FauxStep::tool_call(name, arguments));
         self
     }
@@ -509,7 +516,10 @@ fn serialize_context(ctx: &Context) -> String {
                 parts.push(format!("user:{}", user_content_text(&u.content)));
             }
             crate::types::Message::Assistant(a) => {
-                parts.push(format!("assistant:{}", content_to_assistant_text(&a.content)));
+                parts.push(format!(
+                    "assistant:{}",
+                    content_to_assistant_text(&a.content)
+                ));
             }
             crate::types::Message::ToolResult(t) => {
                 let text: String = t

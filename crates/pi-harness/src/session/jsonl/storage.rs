@@ -101,7 +101,8 @@ impl JsonlSessionStorage {
         ids: Arc<dyn IdGenerator>,
     ) -> SessionResult<Self> {
         file_result(
-            fs.write_file(path, FileContent::Text(encode_header(&header)), None).await,
+            fs.write_file(path, FileContent::Text(encode_header(&header)), None)
+                .await,
             &format!("Failed to initialize session {path}"),
         )?;
         let info = file_result(
@@ -132,8 +133,7 @@ impl JsonlSessionStorage {
         if physical_lines.is_empty() || physical_lines[0].is_empty() {
             return Err(invalid_file(path, 1, &"is missing a header".to_string()));
         }
-        let header = parse_header(physical_lines[0])
-            .map_err(|e| invalid_file(path, 1, &e))?;
+        let header = parse_header(physical_lines[0]).map_err(|e| invalid_file(path, 1, &e))?;
         let info = file_result(
             fs.file_info(path, None).await,
             &format!("Failed to read session metadata {path}"),
@@ -161,30 +161,21 @@ impl JsonlSessionStorage {
                     if is_torn_tail {
                         // Drop the unacknowledged partial append by atomically
                         // publishing the valid prefix.
-                        let valid_prefix =
-                            format!("{}\n", physical_lines[..idx].join("\n"));
+                        let valid_prefix = format!("{}\n", physical_lines[..idx].join("\n"));
                         let fs = storage.fs.clone();
                         let path_owned = path.to_string();
-                        publish_file_atomically(
-                            &fs,
-                            &path_owned,
-                            |fs, temp_path| {
-                                let valid_prefix = valid_prefix.clone();
-                                let path_owned = path_owned.clone();
-                                Box::pin(async move {
-                                    file_result(
-                                        fs.write_file(
-                                            temp_path,
-                                            FileContent::Text(valid_prefix),
-                                            None,
-                                        )
+                        publish_file_atomically(&fs, &path_owned, |fs, temp_path| {
+                            let valid_prefix = valid_prefix.clone();
+                            let path_owned = path_owned.clone();
+                            Box::pin(async move {
+                                file_result(
+                                    fs.write_file(temp_path, FileContent::Text(valid_prefix), None)
                                         .await,
-                                        &format!("Failed to stage torn-tail repair {path_owned}"),
-                                    )?;
-                                    Ok(())
-                                })
-                            },
-                        )
+                                    &format!("Failed to stage torn-tail repair {path_owned}"),
+                                )?;
+                                Ok(())
+                            })
+                        })
                         .await?;
                         return Ok(storage);
                     }
@@ -196,7 +187,10 @@ impl JsonlSessionStorage {
         // on their own line.
         if !content.ends_with('\n') {
             file_result(
-                storage.fs.append_file(path, FileContent::Text("\n".into()), None).await,
+                storage
+                    .fs
+                    .append_file(path, FileContent::Text("\n".into()), None)
+                    .await,
                 &format!("Failed to repair unterminated session tail {path}"),
             )?;
         }
@@ -224,11 +218,13 @@ impl JsonlSessionStorage {
             let clock = clock.clone();
             let ids = ids.clone();
             Box::pin(async move {
-                let target = JsonlSessionStorage::create(fs.clone(), temp_path, header, clock, ids).await?;
+                let target =
+                    JsonlSessionStorage::create(fs.clone(), temp_path, header, clock, ids).await?;
                 for mutation in &mutations {
                     let line = encode_mutation(mutation);
                     file_result(
-                        fs.append_file(temp_path, FileContent::Text(line), None).await,
+                        fs.append_file(temp_path, FileContent::Text(line), None)
+                            .await,
                         &format!("Failed to append session {temp_path}"),
                     )?;
                     let mut state = target.state.lock().await;
@@ -297,7 +293,11 @@ impl SessionStorage for JsonlSessionStorage {
         state.validate_new_lane(&lane)?;
         state.validate_target(at.as_deref())?;
         let seq = state.next_sequence();
-        let mutation = SessionMutation::Lane { seq, lane: lane.clone(), leaf_id: at };
+        let mutation = SessionMutation::Lane {
+            seq,
+            lane: lane.clone(),
+            leaf_id: at,
+        };
         drop(state);
         self.append_mutation_line(&mutation).await?;
         let mut state = self.state.lock().await;
@@ -313,7 +313,11 @@ impl SessionStorage for JsonlSessionStorage {
         state.require_lane(&lane)?;
         state.validate_target(to.as_deref())?;
         let seq = state.next_sequence();
-        let mutation = SessionMutation::Lane { seq, lane, leaf_id: to };
+        let mutation = SessionMutation::Lane {
+            seq,
+            lane,
+            leaf_id: to,
+        };
         drop(state);
         self.append_mutation_line(&mutation).await?;
         let mut state = self.state.lock().await;
@@ -357,15 +361,16 @@ impl SessionStorage for JsonlSessionStorage {
             if let Some(current) = open.first() {
                 return Err(SessionError::storage(format!(
                     "Lane {} already has an open operation {}",
-                    lane,
-                    current.base.id
+                    lane, current.base.id
                 )));
             }
         }
         let seq = state.next_sequence();
         let timestamp = self.clock.now_ms();
         let stamped = stamp_record(record, seq, lane.clone(), timestamp);
-        let mutation = SessionMutation::Record { record: stamped.clone() };
+        let mutation = SessionMutation::Record {
+            record: stamped.clone(),
+        };
         drop(state);
         self.append_mutation_line(&mutation).await?;
         let mut state = self.state.lock().await;
@@ -421,7 +426,10 @@ impl SessionStorage for JsonlSessionStorage {
         let _g = self.tail.lock().await;
         let state = self.state.lock().await;
         let seq = state.next_sequence();
-        let mutation = SessionMutation::FactName { seq, name: name.map(|s| s.to_string()) };
+        let mutation = SessionMutation::FactName {
+            seq,
+            name: name.map(|s| s.to_string()),
+        };
         drop(state);
         self.append_mutation_line(&mutation).await?;
         let mut state = self.state.lock().await;
@@ -464,7 +472,10 @@ impl SessionStorage for JsonlSessionStorage {
 // `tail` Promise chain provides). `enqueue` + `self_append_and_apply` are kept
 // only as documentation of the intent and are unused.
 #[allow(dead_code)]
-async fn self_append_and_apply(_storage: &JsonlSessionStorage, _m: &SessionMutation) -> SessionResult<()> {
+async fn self_append_and_apply(
+    _storage: &JsonlSessionStorage,
+    _m: &SessionMutation,
+) -> SessionResult<()> {
     Ok(())
 }
 
@@ -488,7 +499,12 @@ async fn publish_file_atomically<F>(
     populate: F,
 ) -> SessionResult<()>
 where
-    F: for<'a> FnOnce(&'a Arc<dyn FileSystem>, &'a str) -> std::pin::Pin<Box<dyn std::future::Future<Output = SessionResult<()>> + Send + 'a>>,
+    F: for<'a> FnOnce(
+        &'a Arc<dyn FileSystem>,
+        &'a str,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = SessionResult<()>> + Send + 'a>,
+    >,
 {
     let temp_path = format!("{destination_path}.tmp");
     // Mirror the TS `try { populate; rename } catch { remove(tempPath) }` shape:
@@ -515,7 +531,9 @@ where
 mod tests {
     use super::*;
     use crate::session::memory::{CounterIdGenerator, FakeClock};
-    use crate::session::types::{OperationIntent, OperationStartedRecord, ProvisionedEntry, ProvisionedKind, RecordBase};
+    use crate::session::types::{
+        OperationIntent, OperationStartedRecord, ProvisionedEntry, ProvisionedKind, RecordBase,
+    };
 
     fn user_msg(text: &str) -> rpi_agent::message::AgentMessage {
         rpi_agent::message::AgentMessage::User(rpi_ai::types::UserMessage::new(text, 1))
@@ -539,14 +557,23 @@ mod tests {
         let clock: Arc<dyn Clock> = Arc::new(FakeClock::new());
         let ids: Arc<dyn IdGenerator> = Arc::new(CounterIdGenerator::new());
 
-        let storage = JsonlSessionStorage::create(fs.clone(), "/s.jsonl", header(), clock.clone(), ids.clone())
-            .await
-            .unwrap();
+        let storage = JsonlSessionStorage::create(
+            fs.clone(),
+            "/s.jsonl",
+            header(),
+            clock.clone(),
+            ids.clone(),
+        )
+        .await
+        .unwrap();
         let entry = storage
             .append_entry(
                 ProvisionedEntry {
                     id: "e1".into(),
-                    kind: ProvisionedKind::Message { message: user_msg("hi"), terminate: None },
+                    kind: ProvisionedKind::Message {
+                        message: user_msg("hi"),
+                        terminate: None,
+                    },
                 },
                 "main",
             )
@@ -554,8 +581,14 @@ mod tests {
             .unwrap();
         assert_eq!(entry.id(), "e1");
 
-        let reloaded = JsonlSessionStorage::load(fs, "/s.jsonl", clock, ids).await.unwrap();
-        let got = reloaded.get_entry("e1").await.unwrap().expect("entry exists");
+        let reloaded = JsonlSessionStorage::load(fs, "/s.jsonl", clock, ids)
+            .await
+            .unwrap();
+        let got = reloaded
+            .get_entry("e1")
+            .await
+            .unwrap()
+            .expect("entry exists");
         assert_eq!(got.id(), "e1");
     }
 
@@ -566,17 +599,33 @@ mod tests {
         let clock: Arc<dyn Clock> = Arc::new(FakeClock::new());
         let ids: Arc<dyn IdGenerator> = Arc::new(CounterIdGenerator::new());
 
-        let _ = JsonlSessionStorage::create(fs.clone(), "/s.jsonl", header(), clock.clone(), ids.clone())
-            .await
-            .unwrap();
+        let _ = JsonlSessionStorage::create(
+            fs.clone(),
+            "/s.jsonl",
+            header(),
+            clock.clone(),
+            ids.clone(),
+        )
+        .await
+        .unwrap();
         // Manually append a valid entry line + a garbage (torn) last line.
         // The first mutation after the header is seq 1 (the header does not
         // consume a sequence number — see `create_append_reload_roundtrips`).
-        let valid = encode_mutation(&SessionMutation::Lane { seq: 1, lane: "main".into(), leaf_id: None });
-        fs.append_file("/s.jsonl", FileContent::Text(valid), None).await.unwrap();
-        fs.append_file("/s.jsonl", FileContent::Text("{not json".into()), None).await.unwrap();
+        let valid = encode_mutation(&SessionMutation::Lane {
+            seq: 1,
+            lane: "main".into(),
+            leaf_id: None,
+        });
+        fs.append_file("/s.jsonl", FileContent::Text(valid), None)
+            .await
+            .unwrap();
+        fs.append_file("/s.jsonl", FileContent::Text("{not json".into()), None)
+            .await
+            .unwrap();
 
-        let reloaded = JsonlSessionStorage::load(fs.clone(), "/s.jsonl", clock, ids).await.unwrap();
+        let reloaded = JsonlSessionStorage::load(fs.clone(), "/s.jsonl", clock, ids)
+            .await
+            .unwrap();
         // The torn tail was dropped; the file now ends after the valid lane line.
         let content = fs.read_text_file("/s.jsonl", None).await.unwrap();
         assert!(!content.contains("{not json"));
@@ -591,14 +640,35 @@ mod tests {
         let clock: Arc<dyn Clock> = Arc::new(FakeClock::new());
         let ids: Arc<dyn IdGenerator> = Arc::new(CounterIdGenerator::new());
 
-        let _ = JsonlSessionStorage::create(fs.clone(), "/s.jsonl", header(), clock.clone(), ids.clone())
+        let _ = JsonlSessionStorage::create(
+            fs.clone(),
+            "/s.jsonl",
+            header(),
+            clock.clone(),
+            ids.clone(),
+        )
+        .await
+        .unwrap();
+        // Garbage on line 2 (NOT last), then a valid line 3.
+        fs.append_file("/s.jsonl", FileContent::Text("{not json\n".into()), None)
             .await
             .unwrap();
-        // Garbage on line 2 (NOT last), then a valid line 3.
-        fs.append_file("/s.jsonl", FileContent::Text("{not json\n".into()), None).await.unwrap();
-        fs.append_file("/s.jsonl", FileContent::Text(encode_mutation(&SessionMutation::Lane { seq: 1, lane: "main".into(), leaf_id: None })), None).await.unwrap();
+        fs.append_file(
+            "/s.jsonl",
+            FileContent::Text(encode_mutation(&SessionMutation::Lane {
+                seq: 1,
+                lane: "main".into(),
+                leaf_id: None,
+            })),
+            None,
+        )
+        .await
+        .unwrap();
 
-        let err = JsonlSessionStorage::load(fs, "/s.jsonl", clock, ids).await.err().unwrap();
+        let err = JsonlSessionStorage::load(fs, "/s.jsonl", clock, ids)
+            .await
+            .err()
+            .unwrap();
         assert_eq!(err.code, SessionErrorCode::InvalidEntry);
     }
 
@@ -609,13 +679,28 @@ mod tests {
         let clock: Arc<dyn Clock> = Arc::new(FakeClock::new());
         let ids: Arc<dyn IdGenerator> = Arc::new(CounterIdGenerator::new());
 
-        let _ = JsonlSessionStorage::create(fs.clone(), "/s.jsonl", header(), clock.clone(), ids.clone())
-            .await
-            .unwrap();
+        let _ = JsonlSessionStorage::create(
+            fs.clone(),
+            "/s.jsonl",
+            header(),
+            clock.clone(),
+            ids.clone(),
+        )
+        .await
+        .unwrap();
         // A schema error (valid JSON, unknown kind) on the last line is NOT a
         // torn tail.
-        fs.append_file("/s.jsonl", FileContent::Text("{\"kind\":\"bogus\",\"seq\":2}\n".into()), None).await.unwrap();
-        let err = JsonlSessionStorage::load(fs, "/s.jsonl", clock, ids).await.err().unwrap();
+        fs.append_file(
+            "/s.jsonl",
+            FileContent::Text("{\"kind\":\"bogus\",\"seq\":2}\n".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        let err = JsonlSessionStorage::load(fs, "/s.jsonl", clock, ids)
+            .await
+            .err()
+            .unwrap();
         assert_eq!(err.code, SessionErrorCode::InvalidEntry);
     }
 
@@ -626,9 +711,16 @@ mod tests {
         let clock: Arc<dyn Clock> = Arc::new(FakeClock::new());
         let ids: Arc<dyn IdGenerator> = Arc::new(CounterIdGenerator::new());
 
-        let storage = JsonlSessionStorage::create(fs, "/s.jsonl", header(), clock, ids).await.unwrap();
+        let storage = JsonlSessionStorage::create(fs, "/s.jsonl", header(), clock, ids)
+            .await
+            .unwrap();
         let started = LaneRecord::OperationStarted(OperationStartedRecord {
-            base: RecordBase { id: "op-1".into(), seq: 0, lane: "main".into(), timestamp: 0 },
+            base: RecordBase {
+                id: "op-1".into(),
+                seq: 0,
+                lane: "main".into(),
+                timestamp: 0,
+            },
             source_leaf_id: None,
             intent: OperationIntent::Run {
                 original_prompt: vec![],
@@ -639,7 +731,12 @@ mod tests {
         });
         storage.append_record(started).await.unwrap();
         let second = LaneRecord::OperationStarted(OperationStartedRecord {
-            base: RecordBase { id: "op-2".into(), seq: 0, lane: "main".into(), timestamp: 0 },
+            base: RecordBase {
+                id: "op-2".into(),
+                seq: 0,
+                lane: "main".into(),
+                timestamp: 0,
+            },
             source_leaf_id: None,
             intent: OperationIntent::Run {
                 original_prompt: vec![],

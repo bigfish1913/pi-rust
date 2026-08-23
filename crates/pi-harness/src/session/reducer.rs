@@ -89,7 +89,10 @@ pub struct RecordLogCorruption {
 
 impl RecordLogCorruption {
     pub fn new(reason: RecordLogCorruptionReason, message: impl Into<String>) -> Self {
-        Self { reason, message: message.into() }
+        Self {
+            reason,
+            message: message.into(),
+        }
     }
 }
 
@@ -157,8 +160,11 @@ pub fn validate_record_log(input: &RecordLogSlice) -> Result<(), RecordLogCorrup
         );
     }
 
-    let entries_by_id: HashMap<String, Entry> =
-        input.entries.iter().map(|e| (e.id().to_string(), e.clone())).collect();
+    let entries_by_id: HashMap<String, Entry> = input
+        .entries
+        .iter()
+        .map(|e| (e.id().to_string(), e.clone()))
+        .collect();
     validate_deferred_handles(input.entries.iter())?;
 
     let mut starts: HashMap<String, OperationStartedRecord> = HashMap::new();
@@ -250,9 +256,7 @@ pub fn validate_record_log(input: &RecordLogSlice) -> Result<(), RecordLogCorrup
                 let entry_exists = entries_by_id.contains_key(r.entry_id.as_str());
                 let valid = match enqueue {
                     Some(enq) => {
-                        enq.base.seq < r.base.seq
-                            && enq.run_id == r.run_id
-                            && !entry_exists
+                        enq.base.seq < r.base.seq && enq.run_id == r.run_id && !entry_exists
                     }
                     None => false,
                 };
@@ -353,7 +357,10 @@ fn validate_attempt_reason(record: &StepAttemptRecord) -> Result<(), RecordLogCo
             if record.compaction_reason.is_none() {
                 return corrupt(
                     RecordLogCorruptionReason::InvalidCompactionReason,
-                    format!("Compaction attempt {} has no valid compaction reason", record.base.id),
+                    format!(
+                        "Compaction attempt {} has no valid compaction reason",
+                        record.base.id
+                    ),
                 );
             }
         }
@@ -419,7 +426,10 @@ fn validate_attempt_sequence(
     if record.result_entry_id != prev.result_entry_id {
         return corrupt(
             RecordLogCorruptionReason::InconsistentStep,
-            format!("{:?} attempts disagree on their result entry id", record.step),
+            format!(
+                "{:?} attempts disagree on their result entry id",
+                record.step
+            ),
         );
     }
     if record.compaction_reason != prev.compaction_reason {
@@ -552,7 +562,10 @@ fn validate_deferred_handles<'a>(
                 if asst.stop_reason == StopReason::Deferred && asst.deferred.is_none() {
                     return corrupt(
                         RecordLogCorruptionReason::InvalidDeferredHandle,
-                        format!("Deferred assistant entry {} does not carry a handle", entry.id()),
+                        format!(
+                            "Deferred assistant entry {} does not carry a handle",
+                            entry.id()
+                        ),
                     );
                 }
             }
@@ -569,12 +582,16 @@ fn validate_operation_result(
     record: &OperationStartedRecord,
 ) -> Result<(), RecordLogCorruption> {
     match &record.intent {
-        OperationIntent::Run { initial_messages, .. } => {
+        OperationIntent::Run {
+            initial_messages, ..
+        } => {
             for target in initial_messages {
                 validate_exact_provisioned_entry(entries_by_id, target)?;
             }
         }
-        OperationIntent::Compaction { result_entry_id, .. } => {
+        OperationIntent::Compaction {
+            result_entry_id, ..
+        } => {
             validate_result_entry(
                 entries_by_id,
                 result_entry_id,
@@ -582,7 +599,10 @@ fn validate_operation_result(
                 "manual compaction",
             )?;
         }
-        OperationIntent::Navigation { summary_entry_id: Some(summary_id), .. } => {
+        OperationIntent::Navigation {
+            summary_entry_id: Some(summary_id),
+            ..
+        } => {
             validate_result_entry(
                 entries_by_id,
                 summary_id,
@@ -590,7 +610,10 @@ fn validate_operation_result(
                 "navigation summary",
             )?;
         }
-        OperationIntent::Navigation { summary_entry_id: None, .. } => {}
+        OperationIntent::Navigation {
+            summary_entry_id: None,
+            ..
+        } => {}
     }
     Ok(())
 }

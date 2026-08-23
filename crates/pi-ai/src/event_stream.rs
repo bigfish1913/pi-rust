@@ -186,7 +186,9 @@ mod tests {
         let (mut prod, mut stream) = create_assistant_message_event_stream();
 
         let partial = empty_partial();
-        prod.push(AssistantMessageEvent::Start { partial: partial.clone() });
+        prod.push(AssistantMessageEvent::Start {
+            partial: partial.clone(),
+        });
         prod.push(AssistantMessageEvent::TextStart {
             content_index: 0,
             partial: partial.clone(),
@@ -238,7 +240,10 @@ mod tests {
             error: err_msg.clone(),
         });
         let result = stream.result().await.unwrap();
-        assert!(matches!(result.stop_reason, crate::types::StopReason::Aborted));
+        assert!(matches!(
+            result.stop_reason,
+            crate::types::StopReason::Aborted
+        ));
         assert_eq!(result.error_message.as_deref(), Some("cancelled"));
     }
 
@@ -258,7 +263,9 @@ mod tests {
             message: msg,
         });
         // Post-terminal push should not deliver.
-        prod.push(AssistantMessageEvent::Start { partial: empty_partial() });
+        prod.push(AssistantMessageEvent::Start {
+            partial: empty_partial(),
+        });
 
         let first = stream.next().await.unwrap();
         assert!(matches!(first, AssistantMessageEvent::Done { .. }));

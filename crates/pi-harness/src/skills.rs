@@ -124,8 +124,14 @@ pub fn format_skills_for_system_prompt(skills: &[Skill]) -> String {
     for skill in visible {
         lines.push("  <skill>".to_string());
         lines.push(format!("    <name>{}</name>", escape_xml(&skill.name)));
-        lines.push(format!("    <description>{}</description>", escape_xml(&skill.description)));
-        lines.push(format!("    <location>{}</location>", escape_xml(&skill.file_path)));
+        lines.push(format!(
+            "    <description>{}</description>",
+            escape_xml(&skill.description)
+        ));
+        lines.push(format!(
+            "    <location>{}</location>",
+            escape_xml(&skill.file_path)
+        ));
         lines.push("  </skill>".to_string());
     }
 
@@ -177,7 +183,9 @@ pub async fn load_skills(env: &Arc<dyn ExecutionEnv>, dirs: &[String]) -> LoadSk
                 continue;
             }
         };
-        if resolve_kind(env, &root_info, &mut diagnostics, &cancel).await != Some(FileKind::Directory) {
+        if resolve_kind(env, &root_info, &mut diagnostics, &cancel).await
+            != Some(FileKind::Directory)
+        {
             continue;
         }
         let mut result = load_skills_from_dir_internal(
@@ -191,7 +199,10 @@ pub async fn load_skills(env: &Arc<dyn ExecutionEnv>, dirs: &[String]) -> LoadSk
         skills.append(&mut result.skills);
         diagnostics.append(&mut result.diagnostics);
     }
-    LoadSkillsResult { skills, diagnostics }
+    LoadSkillsResult {
+        skills,
+        diagnostics,
+    }
 }
 
 /// Load skills from source-tagged directories. Mirrors TS `loadSourcedSkills`.
@@ -206,13 +217,22 @@ pub async fn load_sourced_skills<S: Clone>(
     for input in inputs {
         let result = load_skills(env, std::slice::from_ref(&input.path)).await;
         for skill in result.skills {
-            skills.push(SourcedSkill { skill, source: input.source.clone() });
+            skills.push(SourcedSkill {
+                skill,
+                source: input.source.clone(),
+            });
         }
         for diag in result.diagnostics {
-            diagnostics.push(SourcedSkillDiagnostic { diagnostic: diag, source: input.source.clone() });
+            diagnostics.push(SourcedSkillDiagnostic {
+                diagnostic: diag,
+                source: input.source.clone(),
+            });
         }
     }
-    SourcedLoadSkillsResult { skills, diagnostics }
+    SourcedLoadSkillsResult {
+        skills,
+        diagnostics,
+    }
 }
 
 /// One source-tagged input. Mirrors TS `{ path: string; source: TSource }`.
@@ -264,11 +284,17 @@ async fn load_skills_from_dir_internal(
                     path: dir.to_string(),
                 });
             }
-            return LoadSkillsResult { skills, diagnostics };
+            return LoadSkillsResult {
+                skills,
+                diagnostics,
+            };
         }
     };
     if resolve_kind(env, &dir_info, &mut diagnostics, &cancel).await != Some(FileKind::Directory) {
-        return LoadSkillsResult { skills, diagnostics };
+        return LoadSkillsResult {
+            skills,
+            diagnostics,
+        };
     }
 
     let mut matcher = ignore_matcher.clone();
@@ -282,7 +308,10 @@ async fn load_skills_from_dir_internal(
                 message: e.message,
                 path: dir.to_string(),
             });
-            return LoadSkillsResult { skills, diagnostics };
+            return LoadSkillsResult {
+                skills,
+                diagnostics,
+            };
         }
     };
 
@@ -305,7 +334,10 @@ async fn load_skills_from_dir_internal(
             skills.push(skill);
         }
         diagnostics.append(&mut result.diagnostics);
-        return LoadSkillsResult { skills, diagnostics };
+        return LoadSkillsResult {
+            skills,
+            diagnostics,
+        };
     }
 
     // Second pass: recurse into subdirs (non-hidden, non-node_modules) sorted by
@@ -349,7 +381,10 @@ async fn load_skills_from_dir_internal(
         diagnostics.append(&mut result.diagnostics);
     }
 
-    LoadSkillsResult { skills, diagnostics }
+    LoadSkillsResult {
+        skills,
+        diagnostics,
+    }
 }
 
 struct LoadSkillFromFileResult {
@@ -372,7 +407,10 @@ async fn load_skill_from_file(
                 message: e.message,
                 path: file_path.to_string(),
             });
-            return LoadSkillFromFileResult { skill: None, diagnostics };
+            return LoadSkillFromFileResult {
+                skill: None,
+                diagnostics,
+            };
         }
     };
 
@@ -384,7 +422,10 @@ async fn load_skill_from_file(
                 message: msg,
                 path: file_path.to_string(),
             });
-            return LoadSkillFromFileResult { skill: None, diagnostics };
+            return LoadSkillFromFileResult {
+                skill: None,
+                diagnostics,
+            };
         }
     };
 
@@ -401,7 +442,10 @@ async fn load_skill_from_file(
         });
     }
 
-    let frontmatter_name = frontmatter.get("name").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let frontmatter_name = frontmatter
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let name = frontmatter_name.unwrap_or_else(|| parent_dir_name.to_string());
     for err in validate_name(&name, parent_dir_name) {
         diagnostics.push(SkillDiagnostic {
@@ -415,7 +459,10 @@ async fn load_skill_from_file(
         Some(d) if !d.trim().is_empty() => d,
         _ => {
             // Mirrors TS: `if (!description || description.trim() === "") return null`.
-            return LoadSkillFromFileResult { skill: None, diagnostics };
+            return LoadSkillFromFileResult {
+                skill: None,
+                diagnostics,
+            };
         }
     };
 
@@ -438,13 +485,25 @@ async fn load_skill_from_file(
 fn validate_name(name: &str, parent_dir_name: &str) -> Vec<String> {
     let mut errors = Vec::new();
     if name != parent_dir_name {
-        errors.push(format!("name \"{name}\" does not match parent directory \"{parent_dir_name}\""));
+        errors.push(format!(
+            "name \"{name}\" does not match parent directory \"{parent_dir_name}\""
+        ));
     }
     if name.chars().count() > MAX_NAME_LENGTH {
-        errors.push(format!("name exceeds {MAX_NAME_LENGTH} characters ({})", name.chars().count()));
+        errors.push(format!(
+            "name exceeds {MAX_NAME_LENGTH} characters ({})",
+            name.chars().count()
+        ));
     }
-    if !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') || name.is_empty() {
-        errors.push("name contains invalid characters (must be lowercase a-z, 0-9, hyphens only)".to_string());
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        || name.is_empty()
+    {
+        errors.push(
+            "name contains invalid characters (must be lowercase a-z, 0-9, hyphens only)"
+                .to_string(),
+        );
     }
     if name.starts_with('-') || name.ends_with('-') {
         errors.push("name must not start or end with a hyphen".to_string());
@@ -461,7 +520,10 @@ fn validate_description(description: Option<&str>) -> Vec<String> {
         None | Some("") => errors.push("description is required".to_string()),
         Some(d) if d.trim().is_empty() => errors.push("description is required".to_string()),
         Some(d) if d.chars().count() > MAX_DESCRIPTION_LENGTH => {
-            errors.push(format!("description exceeds {MAX_DESCRIPTION_LENGTH} characters ({})", d.chars().count()));
+            errors.push(format!(
+                "description exceeds {MAX_DESCRIPTION_LENGTH} characters ({})",
+                d.chars().count()
+            ));
         }
         _ => {}
     }
@@ -478,7 +540,10 @@ async fn resolve_kind(
         return Some(info.kind);
     }
     // Symlink or unknown: canonicalize then re-stat.
-    match env.canonical_path(&info.path.to_string_lossy(), Some(cancel)).await {
+    match env
+        .canonical_path(&info.path.to_string_lossy(), Some(cancel))
+        .await
+    {
         Ok(canon) => match env.file_info(&canon.to_string_lossy(), Some(cancel)).await {
             Ok(target) => {
                 if matches!(target.kind, FileKind::File | FileKind::Directory) {
@@ -520,7 +585,11 @@ async fn add_ignore_rules(
 ) {
     let cancel = CancellationToken::new();
     let relative_dir = relative_env_path(root_dir, dir);
-    let prefix = if relative_dir.is_empty() { String::new() } else { format!("{relative_dir}/") };
+    let prefix = if relative_dir.is_empty() {
+        String::new()
+    } else {
+        format!("{relative_dir}/")
+    };
 
     for &filename in IGNORE_FILE_NAMES {
         let joined = match env.join_path(&[dir, filename], Some(&cancel)).await {
@@ -598,8 +667,16 @@ fn prefix_ignore_pattern(line: &str, prefix: &str) -> Option<String> {
     if let Some(rest) = pattern.strip_prefix('/') {
         pattern = rest;
     }
-    let prefixed = if prefix.is_empty() { pattern.to_string() } else { format!("{prefix}{pattern}") };
-    if negated { Some(format!("!{prefixed}")) } else { Some(prefixed) }
+    let prefixed = if prefix.is_empty() {
+        pattern.to_string()
+    } else {
+        format!("{prefix}{pattern}")
+    };
+    if negated {
+        Some(format!("!{prefixed}"))
+    } else {
+        Some(prefixed)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -690,7 +767,11 @@ impl IgnoreMatcher {
         if body.is_empty() {
             return None;
         }
-        Some(IgnorePattern { negated, body, dir_only })
+        Some(IgnorePattern {
+            negated,
+            body,
+            dir_only,
+        })
     }
 
     /// Whether `rel_path` is ignored. `rel_path` is relative to the root Dir
@@ -810,11 +891,19 @@ mod tests {
 
     #[test]
     fn listing_escapes_all_fields() {
-        let weird = skill("a&b", "Quote \"double\" and 'single'", "/skills/<bad>&\"quote\"/SKILL.md");
+        let weird = skill(
+            "a&b",
+            "Quote \"double\" and 'single'",
+            "/skills/<bad>&\"quote\"/SKILL.md",
+        );
         let out = format_skills_for_system_prompt(&[weird]);
         assert!(out.contains("<name>a&amp;b</name>"));
-        assert!(out.contains("<description>Quote &quot;double&quot; and &apos;single&apos;</description>"));
-        assert!(out.contains("<location>/skills/&lt;bad&gt;&amp;&quot;quote&quot;/SKILL.md</location>"));
+        assert!(out.contains(
+            "<description>Quote &quot;double&quot; and &apos;single&apos;</description>"
+        ));
+        assert!(
+            out.contains("<location>/skills/&lt;bad&gt;&amp;&quot;quote&quot;/SKILL.md</location>")
+        );
     }
 
     #[test]
@@ -856,19 +945,34 @@ mod tests {
 
     #[test]
     fn prefix_ignore_pattern_strips_and_negates() {
-        assert_eq!(prefix_ignore_pattern("node_modules", "pfx/"), Some("pfx/node_modules".into()));
-        assert_eq!(prefix_ignore_pattern("!keep", "pfx/"), Some("!pfx/keep".into()));
-        assert_eq!(prefix_ignore_pattern("/abs", "pfx/"), Some("pfx/abs".into()));
+        assert_eq!(
+            prefix_ignore_pattern("node_modules", "pfx/"),
+            Some("pfx/node_modules".into())
+        );
+        assert_eq!(
+            prefix_ignore_pattern("!keep", "pfx/"),
+            Some("!pfx/keep".into())
+        );
+        assert_eq!(
+            prefix_ignore_pattern("/abs", "pfx/"),
+            Some("pfx/abs".into())
+        );
         assert_eq!(prefix_ignore_pattern("#comment", "pfx/"), None);
         assert_eq!(prefix_ignore_pattern("", "pfx/"), None);
     }
 
     #[test]
     fn dirname_and_relative_helpers() {
-        assert_eq!(dirname_env_path("/skills/example/SKILL.md"), "/skills/example");
+        assert_eq!(
+            dirname_env_path("/skills/example/SKILL.md"),
+            "/skills/example"
+        );
         assert_eq!(dirname_env_path("C:\\proj\\SKILL.md"), "C:\\proj");
         assert_eq!(dirname_env_path("/SKILL.md"), "/");
-        assert_eq!(relative_env_path("/skills", "/skills/example/SKILL.md"), "example/SKILL.md");
+        assert_eq!(
+            relative_env_path("/skills", "/skills/example/SKILL.md"),
+            "example/SKILL.md"
+        );
         assert_eq!(relative_env_path("/skills", "/skills"), "");
     }
 

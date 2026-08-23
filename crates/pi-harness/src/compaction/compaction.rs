@@ -29,9 +29,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rpi_ai::types::{AssistantMessage, Content, Context, Message, StopReason, Usage, UserContent, UserMessage};
-use rpi_ai::{CacheRetention, Model, Provider, SimpleStreamOptions, ThinkingLevel};
 use rpi_agent::message::AgentMessage;
+use rpi_ai::types::{
+    AssistantMessage, Content, Context, Message, StopReason, Usage, UserContent, UserMessage,
+};
+use rpi_ai::{CacheRetention, Model, Provider, SimpleStreamOptions, ThinkingLevel};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -40,8 +42,8 @@ use crate::compaction::tokens::{
     build_session_context, compute_file_lists, create_file_ops, estimate_context_tokens,
     extract_file_ops_from_message, format_file_operations, serialize_conversation, FileOperations,
 };
-use crate::messages::{create_branch_summary_message, create_compaction_summary_message};
 use crate::messages::convert_to_llm;
+use crate::messages::{create_branch_summary_message, create_compaction_summary_message};
 use crate::session::types::{Entry, EntryBase, MessageEntry};
 use crate::types::{CompactionSettings, RetryPolicy};
 
@@ -86,10 +88,16 @@ pub struct CompactionError {
 
 impl CompactionError {
     pub fn aborted(message: impl Into<String>) -> Self {
-        Self { code: CompactionErrorCode::Aborted, message: message.into() }
+        Self {
+            code: CompactionErrorCode::Aborted,
+            message: message.into(),
+        }
     }
     pub fn summarization_failed(message: impl Into<String>) -> Self {
-        Self { code: CompactionErrorCode::SummarizationFailed, message: message.into() }
+        Self {
+            code: CompactionErrorCode::SummarizationFailed,
+            message: message.into(),
+        }
     }
 }
 
@@ -162,9 +170,11 @@ pub struct CompactionLlmOptions {
 pub fn get_message_from_entry(entry: &Entry) -> Option<AgentMessage> {
     match entry {
         Entry::Message(m) => Some(m.message.clone()),
-        Entry::BranchSummary(b) => {
-            Some(create_branch_summary_message(&b.summary, &b.from_id, b.base.timestamp))
-        }
+        Entry::BranchSummary(b) => Some(create_branch_summary_message(
+            &b.summary,
+            &b.from_id,
+            b.base.timestamp,
+        )),
         Entry::Compaction(c) => Some(create_compaction_summary_message(
             &c.summary,
             c.tokens_before,
@@ -260,53 +270,62 @@ pub fn prepare_compaction(
         .find(|(_, e)| matches!(e, Entry::Compaction(_)))
         .map(|(i, _)| i);
 
-    let (previous_summary, compactable_entries): (Option<String>, Vec<Entry>) = match prev_compaction_index {
-        Some(i) => {
-            let prev = match &path_entries[i] {
-                Entry::Compaction(c) => c.clone(),
-                _ => unreachable!("prev_compaction_index points at a compaction"),
-            };
-            let prev_summary = prev.summary.clone();
-            let prev_id = prev.base.id.clone();
-            let prev_seq = prev.base.seq;
-            let mut virtual_entries: Vec<Entry> = Vec::with_capacity(prev.retained_tail.len());
-            for (idx, message) in prev.retained_tail.iter().enumerate() {
-                let id = format!("{prev_id}:retained:{idx}");
-                let parent_id = if idx == 0 {
-                    Some(prev_id.clone())
-                } else {
-                    Some(format!("{prev_id}:retained:{}", idx - 1))
+    let (previous_summary, compactable_entries): (Option<String>, Vec<Entry>) =
+        match prev_compaction_index {
+            Some(i) => {
+                let prev = match &path_entries[i] {
+                    Entry::Compaction(c) => c.clone(),
+                    _ => unreachable!("prev_compaction_index points at a compaction"),
                 };
-                let timestamp = agent_message_timestamp(message);
-                virtual_entries.push(Entry::Message(MessageEntry {
-                    base: EntryBase {
-                        entry_type: "message".into(),
-                        id,
-                        seq: prev_seq,
-                        parent_id,
-                        timestamp,
-                    },
-                    message: message.clone(),
-                    terminate: None,
-                }));
+                let prev_summary = prev.summary.clone();
+                let prev_id = prev.base.id.clone();
+                let prev_seq = prev.base.seq;
+                let mut virtual_entries: Vec<Entry> = Vec::with_capacity(prev.retained_tail.len());
+                for (idx, message) in prev.retained_tail.iter().enumerate() {
+                    let id = format!("{prev_id}:retained:{idx}");
+                    let parent_id = if idx == 0 {
+                        Some(prev_id.clone())
+                    } else {
+                        Some(format!("{prev_id}:retained:{}", idx - 1))
+                    };
+                    let timestamp = agent_message_timestamp(message);
+                    virtual_entries.push(Entry::Message(MessageEntry {
+                        base: EntryBase {
+                            entry_type: "message".into(),
+                            id,
+                            seq: prev_seq,
+                            parent_id,
+                            timestamp,
+                        },
+                        message: message.clone(),
+                        terminate: None,
+                    }));
+                }
+                // `…virtualRetainedEntries, ...pathEntries.slice(prevCompactionIndex + 1)`.
+                let rest: Vec<Entry> = path_entries[i + 1..].to_vec();
+                virtual_entries.extend(rest);
+                (Some(prev_summary), virtual_entries)
             }
-            // `…virtualRetainedEntries, ...pathEntries.slice(prevCompactionIndex + 1)`.
-            let rest: Vec<Entry> = path_entries[i + 1..].to_vec();
-            virtual_entries.extend(rest);
-            (Some(prev_summary), virtual_entries)
-        }
-        None => (None, path_entries.to_vec()),
-    };
+            None => (None, path_entries.to_vec()),
+        };
 
     let boundary_end = compactable_entries.len();
 
     // `tokensBefore` uses the ORIGINAL path entries (not compactable), matching
     // TS `buildSessionContext(pathEntries).messages`.
-    let tokens_before = estimate_context_tokens(&build_session_context(path_entries).messages).tokens;
+    let tokens_before =
+        estimate_context_tokens(&build_session_context(path_entries).messages).tokens;
 
-    let cut_point = find_cut_point(&compactable_entries, 0, boundary_end, settings.keep_recent_tokens);
+    let cut_point = find_cut_point(
+        &compactable_entries,
+        0,
+        boundary_end,
+        settings.keep_recent_tokens,
+    );
     let history_end = if cut_point.is_split_turn {
-        cut_point.turn_start_index.expect("is_split_turn ⇒ turn_start_index is Some")
+        cut_point
+            .turn_start_index
+            .expect("is_split_turn ⇒ turn_start_index is Some")
     } else {
         cut_point.first_kept_entry_index
     };
@@ -320,8 +339,14 @@ pub fn prepare_compaction(
 
     let mut turn_prefix_messages: Vec<AgentMessage> = Vec::new();
     if cut_point.is_split_turn {
-        let turn_start = cut_point.turn_start_index.expect("is_split_turn ⇒ turn_start_index is Some");
-        for entry in compactable_entries.iter().take(cut_point.first_kept_entry_index).skip(turn_start) {
+        let turn_start = cut_point
+            .turn_start_index
+            .expect("is_split_turn ⇒ turn_start_index is Some");
+        for entry in compactable_entries
+            .iter()
+            .take(cut_point.first_kept_entry_index)
+            .skip(turn_start)
+        {
             if let Some(m) = get_message_from_entry_for_compaction(entry) {
                 turn_prefix_messages.push(m);
             }
@@ -329,13 +354,17 @@ pub fn prepare_compaction(
     }
 
     let mut retained_tail: Vec<AgentMessage> = Vec::new();
-    for entry in compactable_entries.iter().skip(cut_point.first_kept_entry_index) {
+    for entry in compactable_entries
+        .iter()
+        .skip(cut_point.first_kept_entry_index)
+    {
         if let Some(m) = get_message_from_entry_for_compaction(entry) {
             retained_tail.push(m);
         }
     }
 
-    let mut file_ops = extract_file_operations(&messages_to_summarize, path_entries, prev_compaction_index);
+    let mut file_ops =
+        extract_file_operations(&messages_to_summarize, path_entries, prev_compaction_index);
     if cut_point.is_split_turn {
         for msg in &turn_prefix_messages {
             extract_file_ops_from_message(msg, &mut file_ops);
@@ -630,7 +659,10 @@ pub async fn generate_summary_with_usage(
 
     if response.stop_reason == StopReason::Aborted {
         return Err(CompactionError::aborted(
-            response.error_message.as_deref().unwrap_or("Summarization aborted"),
+            response
+                .error_message
+                .as_deref()
+                .unwrap_or("Summarization aborted"),
         ));
     }
     if response.stop_reason == StopReason::Error {
@@ -682,7 +714,10 @@ pub async fn generate_turn_prefix_summary(
 
     if response.stop_reason == StopReason::Aborted {
         return Err(CompactionError::aborted(
-            response.error_message.as_deref().unwrap_or("Turn prefix summarization aborted"),
+            response
+                .error_message
+                .as_deref()
+                .unwrap_or("Turn prefix summarization aborted"),
         ));
     }
     if response.stop_reason == StopReason::Error {
@@ -709,9 +744,33 @@ pub async fn compact(
     preparation: &CompactionPreparation,
     opts: &CompactionLlmOptions,
 ) -> Result<CompactResult, CompactionError> {
-    let (summary, usage) = if preparation.is_split_turn && !preparation.turn_prefix_messages.is_empty() {
-        let (history_text, history_usage) = if preparation.messages_to_summarize.is_empty() {
-            ("No prior history.".to_string(), None)
+    let (summary, usage) =
+        if preparation.is_split_turn && !preparation.turn_prefix_messages.is_empty() {
+            let (history_text, history_usage) = if preparation.messages_to_summarize.is_empty() {
+                ("No prior history.".to_string(), None)
+            } else {
+                let (t, u) = generate_summary_with_usage(
+                    &preparation.messages_to_summarize,
+                    preparation.settings.reserve_tokens,
+                    preparation.previous_summary.as_deref(),
+                    opts,
+                )
+                .await?;
+                (t, Some(u))
+            };
+            let (turn_text, turn_usage) = generate_turn_prefix_summary(
+                &preparation.turn_prefix_messages,
+                preparation.settings.reserve_tokens,
+                opts,
+            )
+            .await?;
+            let combined =
+                format!("{history_text}\n\n---\n\n**Turn Context (split turn):**\n\n{turn_text}");
+            let combined_usage = match history_usage {
+                Some(hu) => Some(combine_usage(&hu, &turn_usage)),
+                None => Some(turn_usage),
+            };
+            (combined, combined_usage)
         } else {
             let (t, u) = generate_summary_with_usage(
                 &preparation.messages_to_summarize,
@@ -722,28 +781,6 @@ pub async fn compact(
             .await?;
             (t, Some(u))
         };
-        let (turn_text, turn_usage) = generate_turn_prefix_summary(
-            &preparation.turn_prefix_messages,
-            preparation.settings.reserve_tokens,
-            opts,
-        )
-        .await?;
-        let combined = format!("{history_text}\n\n---\n\n**Turn Context (split turn):**\n\n{turn_text}");
-        let combined_usage = match history_usage {
-            Some(hu) => Some(combine_usage(&hu, &turn_usage)),
-            None => Some(turn_usage),
-        };
-        (combined, combined_usage)
-    } else {
-        let (t, u) = generate_summary_with_usage(
-            &preparation.messages_to_summarize,
-            preparation.settings.reserve_tokens,
-            preparation.previous_summary.as_deref(),
-            opts,
-        )
-        .await?;
-        (t, Some(u))
-    };
 
     let (read_files, modified_files) = compute_file_lists(&preparation.file_ops);
     let file_ops_text = format_file_operations(&read_files, &modified_files);
@@ -754,7 +791,10 @@ pub async fn compact(
         tokens_before: preparation.tokens_before,
         usage,
         retained_tail: preparation.retained_tail.clone(),
-        details: Some(CompactionDetails { read_files, modified_files }),
+        details: Some(CompactionDetails {
+            read_files,
+            modified_files,
+        }),
     })
 }
 
@@ -772,7 +812,10 @@ mod tests {
                 parent_id: None,
                 timestamp: seq as i64,
             },
-            message: AgentMessage::User(UserMessage::new(UserContent::Text(text.into()), seq as i64)),
+            message: AgentMessage::User(UserMessage::new(
+                UserContent::Text(text.into()),
+                seq as i64,
+            )),
             terminate: None,
         })
     }
@@ -800,7 +843,11 @@ mod tests {
             details: None,
             usage: None,
         });
-        let r = prepare_compaction(&[entries[0].clone(), compaction], CompactionSettings::default()).unwrap();
+        let r = prepare_compaction(
+            &[entries[0].clone(), compaction],
+            CompactionSettings::default(),
+        )
+        .unwrap();
         assert!(r.is_none());
     }
 
@@ -808,10 +855,17 @@ mod tests {
     fn prepare_compaction_single_user_returns_some_with_empty_summarize() {
         // One user message, small keep_recent — no history to summarize.
         let entries = vec![user_msg("hi", 1)];
-        let settings = CompactionSettings { enabled: true, reserve_tokens: 1000, keep_recent_tokens: 10 };
+        let settings = CompactionSettings {
+            enabled: true,
+            reserve_tokens: 1000,
+            keep_recent_tokens: 10,
+        };
         let p = prepare_compaction(&entries, settings).unwrap().unwrap();
         assert!(p.messages_to_summarize.is_empty());
-        assert!(p.retained_tail.iter().any(|m| matches!(m, AgentMessage::User(u) if u.content.as_text()==Some("hi"))));
+        assert!(p
+            .retained_tail
+            .iter()
+            .any(|m| matches!(m, AgentMessage::User(u) if u.content.as_text()==Some("hi"))));
         assert!(!p.is_split_turn);
     }
 
@@ -825,7 +879,13 @@ mod tests {
             cache_write_1h: Some(3),
             reasoning: None,
             total_tokens: 18,
-            cost: rpi_ai::types::UsageCost { input: 1.0, output: 2.0, cache_read: 0.5, cache_write: 0.25, total: 3.75 },
+            cost: rpi_ai::types::UsageCost {
+                input: 1.0,
+                output: 2.0,
+                cache_read: 0.5,
+                cache_write: 0.25,
+                total: 3.75,
+            },
         };
         let b = Usage {
             input: 1,
@@ -835,7 +895,13 @@ mod tests {
             cache_write_1h: None,
             reasoning: Some(4),
             total_tokens: 2,
-            cost: rpi_ai::types::UsageCost { input: 0.1, output: 0.2, cache_read: 0.0, cache_write: 0.0, total: 0.3 },
+            cost: rpi_ai::types::UsageCost {
+                input: 0.1,
+                output: 0.2,
+                cache_read: 0.0,
+                cache_write: 0.0,
+                total: 0.3,
+            },
         };
         let c = combine_usage(&a, &b);
         assert_eq!(c.input, 11);

@@ -20,25 +20,25 @@
 //! a delegating `FileSystem` whose single-shot hooks inject a chosen error on
 //! the Nth call to a chosen method).
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use rpi_agent::message::AgentMessage;
 use rpi_harness::error::SessionErrorCode;
+use rpi_harness::session::jsonl::types::{JsonlSessionCreateOptions, JsonlSessionListOptions};
 use rpi_harness::session::jsonl::{
     encode_mutation, JsonlSessionRepo, JsonlSessionRepoOptions, JsonlSessionStorage, JsonlV4Header,
 };
-use rpi_harness::session::jsonl::types::{JsonlSessionCreateOptions, JsonlSessionListOptions};
 use rpi_harness::session::memory::{CounterIdGenerator, FakeClock};
 use rpi_harness::session::types::{
-    BranchBounds, EntryOrder, EntryQuery, ForkOptions, LaneRecord, LanePointer, LogItem,
+    BranchBounds, EntryOrder, EntryQuery, ForkOptions, LanePointer, LaneRecord, LogItem,
     LogOptions, OperationIntent, OperationStartedRecord, ProvisionedEntry, ProvisionedKind,
     RecordBase, SessionCreateOptions, SessionMetadata, SessionMutation, SessionStorage,
 };
-use rpi_tools::env::{FileContent, FileKind, FileInfo, FileSystem};
+use rpi_tools::env::{FileContent, FileInfo, FileKind, FileSystem};
 use rpi_tools::error::{FileError, FileErrorCode};
 
 // ---------------------------------------------------------------------------
@@ -50,7 +50,14 @@ fn user_msg(text: &str) -> AgentMessage {
 }
 
 fn header(id: &str) -> JsonlV4Header {
-    JsonlV4Header::new(id.into(), 1_700_000_000_000, "/proj".into(), None, None, None)
+    JsonlV4Header::new(
+        id.into(),
+        1_700_000_000_000,
+        "/proj".into(),
+        None,
+        None,
+        None,
+    )
 }
 
 fn clock() -> Arc<FakeClock> {
@@ -92,7 +99,10 @@ fn note_provisioned(id: &str) -> ProvisionedEntry {
 fn message_provisioned(id: &str, text: &str) -> ProvisionedEntry {
     ProvisionedEntry {
         id: id.to_string(),
-        kind: ProvisionedKind::Message { message: user_msg(text), terminate: None },
+        kind: ProvisionedKind::Message {
+            message: user_msg(text),
+            terminate: None,
+        },
     }
 }
 
@@ -105,12 +115,14 @@ fn lane_mutation(seq: u64, lane: &str, leaf_id: Option<&str>) -> SessionMutation
 }
 
 async fn list_ids(r: &JsonlSessionRepo, cwd: &str) -> Vec<String> {
-    r.list_typed(&JsonlSessionListOptions { cwd: Some(cwd.into()) })
-        .await
-        .unwrap()
-        .iter()
-        .map(|m| m.id.clone())
-        .collect()
+    r.list_typed(&JsonlSessionListOptions {
+        cwd: Some(cwd.into()),
+    })
+    .await
+    .unwrap()
+    .iter()
+    .map(|m| m.id.clone())
+    .collect()
 }
 
 async fn tmp_files_in_sessions_dir(fs: &Arc<dyn FileSystem>) -> Vec<String> {
@@ -161,10 +173,7 @@ impl FaultyFs {
     }
 
     fn fault_error(method: &str) -> FileError {
-        FileError::new(
-            FileErrorCode::Unknown,
-            format!("injected {method} failure"),
-        )
+        FileError::new(FileErrorCode::Unknown, format!("injected {method} failure"))
     }
 
     /// Take the fault if armed + matching; returns `Some(error)` to inject.
@@ -289,7 +298,11 @@ impl FileSystem for FaultyFs {
         self.inner.canonical_path(path, cancel).await
     }
 
-    async fn exists(&self, path: &str, cancel: Option<&CancellationToken>) -> Result<bool, FileError> {
+    async fn exists(
+        &self,
+        path: &str,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<bool, FileError> {
         self.inner.exists(path, cancel).await
     }
 
@@ -358,10 +371,18 @@ async fn fork_staging_failure_leaves_no_destination_and_no_tmp() {
     let r = repo(base.clone());
 
     let source = r.create_typed(&create_options("source")).await.unwrap();
-    source.append_entry(note_provisioned("m1"), "main").await.unwrap();
-    source.append_entry(note_provisioned("m2"), "main").await.unwrap();
+    source
+        .append_entry(note_provisioned("m1"), "main")
+        .await
+        .unwrap();
+    source
+        .append_entry(note_provisioned("m2"), "main")
+        .await
+        .unwrap();
     let src_meta = r
-        .list_typed(&JsonlSessionListOptions { cwd: Some("/proj".into()) })
+        .list_typed(&JsonlSessionListOptions {
+            cwd: Some("/proj".into()),
+        })
         .await
         .unwrap()
         .into_iter()
@@ -392,14 +413,19 @@ async fn fork_staging_failure_leaves_no_destination_and_no_tmp() {
 
     // The fork was never published.
     let listed = r
-        .list_typed(&JsonlSessionListOptions { cwd: Some("/proj".into()) })
+        .list_typed(&JsonlSessionListOptions {
+            cwd: Some("/proj".into()),
+        })
         .await
         .unwrap();
     assert_eq!(listed.iter().filter(|m| m.id == "fork-1").count(), 0);
     // No `.tmp` residue.
     assert!(tmp_files_in_sessions_dir(&base).await.is_empty());
     // And the fault was actually consumed (it didn't silently pass through).
-    assert!(!faulty.armed.load(Ordering::SeqCst), "write_file fault was consumed by the fork staging");
+    assert!(
+        !faulty.armed.load(Ordering::SeqCst),
+        "write_file fault was consumed by the fork staging"
+    );
 }
 
 /// Mirrors "does not publish a fork when atomic rename fails": the staged
@@ -412,9 +438,14 @@ async fn fork_rename_failure_leaves_no_destination_and_no_tmp() {
     let r = repo(base.clone());
 
     let source = r.create_typed(&create_options("source")).await.unwrap();
-    source.append_entry(note_provisioned("m1"), "main").await.unwrap();
+    source
+        .append_entry(note_provisioned("m1"), "main")
+        .await
+        .unwrap();
     let src_meta = r
-        .list_typed(&JsonlSessionListOptions { cwd: Some("/proj".into()) })
+        .list_typed(&JsonlSessionListOptions {
+            cwd: Some("/proj".into()),
+        })
         .await
         .unwrap()
         .into_iter()
@@ -449,9 +480,16 @@ async fn failed_create_releases_reservation_and_is_retriable() {
     let (faulty, r) = faulty_repo(FaultTarget::WriteFile);
 
     // First create faults on the write_file of the header.
-    let err = r.create_typed(&create_options("retry")).await.err().unwrap();
+    let err = r
+        .create_typed(&create_options("retry"))
+        .await
+        .err()
+        .unwrap();
     assert_eq!(err.code, SessionErrorCode::Storage);
-    assert!(faulty.armed.load(Ordering::SeqCst) == false, "fault consumed");
+    assert!(
+        faulty.armed.load(Ordering::SeqCst) == false,
+        "fault consumed"
+    );
 
     // Build a fresh repo over the same (now-disarmed) FaultyFs: retry succeeds.
     let fs: Arc<dyn FileSystem> = faulty.clone();
@@ -461,7 +499,10 @@ async fn failed_create_releases_reservation_and_is_retriable() {
         clock: clock(),
         ids: ids(),
     });
-    let storage = r_reuse.create_typed(&create_options("retry")).await.unwrap();
+    let storage = r_reuse
+        .create_typed(&create_options("retry"))
+        .await
+        .unwrap();
     let _ = storage.get_name().await.unwrap();
     // The session now lists exactly one "retry".
     let fresh = repo(faulty.clone() as Arc<dyn FileSystem>);
@@ -473,17 +514,22 @@ async fn failed_create_releases_reservation_and_is_retriable() {
 /// repair fails".
 #[tokio::test]
 async fn torn_tail_repair_staging_failure_preserves_original() {
-    let base: Arc<dyn FileSystem> =
-        Arc::new(rpi_tools::InMemoryExecutionEnv::with_cwd("/".into()));
+    let base: Arc<dyn FileSystem> = Arc::new(rpi_tools::InMemoryExecutionEnv::with_cwd("/".into()));
     let path = "/s.jsonl";
     let _ = JsonlSessionStorage::create(base.clone(), path, header("repair"), clock(), ids())
         .await
         .unwrap();
-    base.append_file(path, FileContent::Text(encode_mutation(&lane_mutation(1, "main", None))), None)
+    base.append_file(
+        path,
+        FileContent::Text(encode_mutation(&lane_mutation(1, "main", None))),
+        None,
+    )
+    .await
+    .unwrap();
+    // Append a torn last line.
+    base.append_file(path, FileContent::Text("{\"kind\":\"entry\"".into()), None)
         .await
         .unwrap();
-    // Append a torn last line.
-    base.append_file(path, FileContent::Text("{\"kind\":\"entry\"".into()), None).await.unwrap();
     let original = base.read_text_file(path, None).await.unwrap();
 
     let faulty = FaultyFs::new(base.clone(), FaultTarget::WriteFile);
@@ -504,16 +550,21 @@ async fn torn_tail_repair_staging_failure_preserves_original() {
 /// cannot be published".
 #[tokio::test]
 async fn torn_tail_repair_rename_failure_preserves_original() {
-    let base: Arc<dyn FileSystem> =
-        Arc::new(rpi_tools::InMemoryExecutionEnv::with_cwd("/".into()));
+    let base: Arc<dyn FileSystem> = Arc::new(rpi_tools::InMemoryExecutionEnv::with_cwd("/".into()));
     let path = "/s.jsonl";
     let _ = JsonlSessionStorage::create(base.clone(), path, header("repair"), clock(), ids())
         .await
         .unwrap();
-    base.append_file(path, FileContent::Text(encode_mutation(&lane_mutation(1, "main", None))), None)
+    base.append_file(
+        path,
+        FileContent::Text(encode_mutation(&lane_mutation(1, "main", None))),
+        None,
+    )
+    .await
+    .unwrap();
+    base.append_file(path, FileContent::Text("{\"kind\":\"entry\"".into()), None)
         .await
         .unwrap();
-    base.append_file(path, FileContent::Text("{\"kind\":\"entry\"".into()), None).await.unwrap();
     let original = base.read_text_file(path, None).await.unwrap();
 
     let faulty = FaultyFs::new(base.clone(), FaultTarget::RenameFile);
@@ -538,8 +589,14 @@ async fn concurrent_cross_lane_writes_serialize_in_shared_sequence_order() {
         Arc::new(rpi_tools::InMemoryExecutionEnv::with_cwd("/proj".into()));
     let r = repo(fs.clone());
     let storage = r.create_typed(&create_options("concurrent")).await.unwrap();
-    let root_entry = storage.append_entry(note_provisioned("root"), "main").await.unwrap();
-    storage.create_lane("thread", Some(root_entry.id())).await.unwrap();
+    let root_entry = storage
+        .append_entry(note_provisioned("root"), "main")
+        .await
+        .unwrap();
+    storage
+        .create_lane("thread", Some(root_entry.id()))
+        .await
+        .unwrap();
 
     // Issue 4 concurrent appends across the two lanes. The tail mutex
     // serializes the stamp→persist→apply critical section per op, so each
@@ -553,7 +610,9 @@ async fn concurrent_cross_lane_writes_serialize_in_shared_sequence_order() {
     for (id, lane) in labels.into_iter().zip(lanes.into_iter()) {
         let entry = note_provisioned(id);
         let s = storage.clone();
-        handles.push(tokio::spawn(async move { s.append_entry(entry, lane).await }));
+        handles.push(tokio::spawn(
+            async move { s.append_entry(entry, lane).await },
+        ));
     }
     let mut results = Vec::new();
     for h in handles {
@@ -566,15 +625,23 @@ async fn concurrent_cross_lane_writes_serialize_in_shared_sequence_order() {
     let ordered_ids: Vec<&str> = ordered.iter().map(|e| e.id()).collect();
     let seqs: Vec<u64> = ordered.iter().map(|e| e.seq()).collect();
     assert_eq!(seqs, vec![3, 4, 5, 6]); // root=1 + lane-record=2, then 3..6.
-    // Order by seq is the commit order; the ids are whichever lane won each
-    // slot (deterministic only per-seq, so check by-pair rather than exact id
-    // sequence — the invariant is distinct consecutive seqs + faithful reload).
+                                        // Order by seq is the commit order; the ids are whichever lane won each
+                                        // slot (deterministic only per-seq, so check by-pair rather than exact id
+                                        // sequence — the invariant is distinct consecutive seqs + faithful reload).
     assert_eq!(ordered_ids.len(), 4);
-    assert_eq!(ordered_ids.iter().collect::<std::collections::HashSet<_>>().len(), 4);
+    assert_eq!(
+        ordered_ids
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        4
+    );
 
     // The durable log is non-interleaved + consecutive on reload.
     let metadata = r
-        .list_typed(&JsonlSessionListOptions { cwd: Some("/proj".into()) })
+        .list_typed(&JsonlSessionListOptions {
+            cwd: Some("/proj".into()),
+        })
         .await
         .unwrap()
         .into_iter()
@@ -608,20 +675,24 @@ async fn concurrent_duplicate_create_one_wins_one_already_exists() {
     let r = repo(fs.clone());
     let opts = create_options("same");
 
-    let (a, b) = tokio::join!(
-        r.create_typed(&opts),
-        r.create_typed(&opts),
-    );
+    let (a, b) = tokio::join!(r.create_typed(&opts), r.create_typed(&opts),);
     let results = vec![a, b];
     let successes = results.iter().filter(|r| r.is_ok()).count();
     let failures = results.iter().filter(|r| r.is_err()).count();
     assert_eq!(successes, 1, "exactly one concurrent create wins");
-    let err = results.into_iter().find_map(|r| r.err()).expect("one failure");
+    let err = results
+        .into_iter()
+        .find_map(|r| r.err())
+        .expect("one failure");
     assert_eq!(failures, 1, "the loser is already_exists");
     assert_eq!(err.code, SessionErrorCode::AlreadyExists);
     let fresh = repo(fs);
     assert_eq!(
-        list_ids(&fresh, "/proj").await.iter().filter(|i| *i == "same").count(),
+        list_ids(&fresh, "/proj")
+            .await
+            .iter()
+            .filter(|i| *i == "same")
+            .count(),
         1
     );
 }
@@ -636,12 +707,23 @@ async fn repo_round_trip_preserves_order_and_is_appendable() {
         Arc::new(rpi_tools::InMemoryExecutionEnv::with_cwd("/proj".into()));
     let r = repo(fs);
     let storage = r.create_typed(&create_options("rt")).await.unwrap();
-    storage.append_entry(message_provisioned("u1", "one"), "main").await.unwrap();
-    storage.append_entry(message_provisioned("u2", "two"), "main").await.unwrap();
-    storage.append_record(operation_started("run-1", "main")).await.unwrap();
+    storage
+        .append_entry(message_provisioned("u1", "one"), "main")
+        .await
+        .unwrap();
+    storage
+        .append_entry(message_provisioned("u2", "two"), "main")
+        .await
+        .unwrap();
+    storage
+        .append_record(operation_started("run-1", "main"))
+        .await
+        .unwrap();
 
     let listed = r
-        .list_typed(&JsonlSessionListOptions { cwd: Some("/proj".into()) })
+        .list_typed(&JsonlSessionListOptions {
+            cwd: Some("/proj".into()),
+        })
         .await
         .unwrap();
     let meta = listed.iter().find(|m| m.id == "rt").unwrap().clone();
@@ -649,20 +731,32 @@ async fn repo_round_trip_preserves_order_and_is_appendable() {
 
     // Oldest-first reflects durable order; the operation_started record sits
     // at seq 3 between the messages and any later entry.
-    let q = EntryQuery { order: Some(EntryOrder::OldestFirst), ..Default::default() };
+    let q = EntryQuery {
+        order: Some(EntryOrder::OldestFirst),
+        ..Default::default()
+    };
     let entries = reopened.find_entries(&q).await.unwrap();
     let ids: Vec<&str> = entries.iter().map(|e| e.id()).collect();
     assert_eq!(ids, vec!["u1", "u2"]);
 
     // A trailing append lands at seq 4 on the reopened handle, and the lane
     // leaf is the last persisted entry (u2).
-    let after = reopened.append_entry(message_provisioned("u3", "three"), "main").await.unwrap();
+    let after = reopened
+        .append_entry(message_provisioned("u3", "three"), "main")
+        .await
+        .unwrap();
     assert_eq!(after.seq(), 4);
     assert_eq!(after.parent_id().unwrap(), "u2");
 
     // The cross-lane view still resolves via the lane pointer table.
     let lanes = reopened.get_lanes().await.unwrap();
-    assert_eq!(lanes, vec![LanePointer { lane: "main".into(), leaf_id: Some("u3".into()) }]);
+    assert_eq!(
+        lanes,
+        vec![LanePointer {
+            lane: "main".into(),
+            leaf_id: Some("u3".into())
+        }]
+    );
 }
 
 /// Defensive-copy contract (plan §5.8): entries returned by `find_entries` are
@@ -675,17 +769,26 @@ async fn find_entries_returns_independent_clones() {
         Arc::new(rpi_tools::InMemoryExecutionEnv::with_cwd("/proj".into()));
     let r = repo(fs);
     let storage = r.create_typed(&create_options("dc")).await.unwrap();
-    storage.append_entry(note_provisioned("e1"), "main").await.unwrap();
+    storage
+        .append_entry(note_provisioned("e1"), "main")
+        .await
+        .unwrap();
 
     let first = storage
-        .find_entries(&EntryQuery { order: Some(EntryOrder::OldestFirst), ..Default::default() })
+        .find_entries(&EntryQuery {
+            order: Some(EntryOrder::OldestFirst),
+            ..Default::default()
+        })
         .await
         .unwrap();
     assert_eq!(first.len(), 1);
     // Drop + re-read: the state is unaffected by the caller holding/draining.
     drop(first);
     let second = storage
-        .find_entries(&EntryQuery { order: Some(EntryOrder::OldestFirst), ..Default::default() })
+        .find_entries(&EntryQuery {
+            order: Some(EntryOrder::OldestFirst),
+            ..Default::default()
+        })
         .await
         .unwrap();
     assert_eq!(second.len(), 1);
@@ -694,7 +797,10 @@ async fn find_entries_returns_independent_clones() {
     let bounds = BranchBounds::default();
     let on_branch = storage
         .find_entries_on_branch(
-            &EntryQuery { order: Some(EntryOrder::OldestFirst), ..Default::default() },
+            &EntryQuery {
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            },
             &bounds,
             "e1",
         )

@@ -72,11 +72,7 @@ impl AnthropicProvider {
     }
 
     /// Build with a custom model catalog (e.g. a generated models.dev snapshot).
-    pub fn with_models(
-        api_key: Option<String>,
-        http: reqwest::Client,
-        models: Vec<Model>,
-    ) -> Self {
+    pub fn with_models(api_key: Option<String>, http: reqwest::Client, models: Vec<Model>) -> Self {
         Self {
             api_key,
             http,
@@ -182,7 +178,7 @@ async fn run_anthropic_stream(
     let header_owned_auth = has_header_auth(&opts.headers) || has_header_auth(&model.headers);
     let api_key_for_header = match (resolved_key, header_owned_auth) {
         (Some(k), _) => Some(k),
-        (None, true) => None,      // headers carry auth; do not send x-api-key.
+        (None, true) => None, // headers carry auth; do not send x-api-key.
         (None, false) => {
             // Mirrors `assertRequestAuth`'s `throw new Error("No API key for…")`.
             let msg = format!("No API key for provider: {}", model.provider);
@@ -298,10 +294,7 @@ async fn run_anthropic_stream(
 /// Resolve the API key: `opts.api_key` wins, then the provider default, then
 /// `ANTHROPIC_API_KEY` from the environment. Mirrors the TS fallback chain
 /// (`options?.apiKey` → SDK's `apiKey: null` reads the env var internally).
-fn resolve_api_key(
-    provider_key: &Option<String>,
-    opts: &SimpleStreamOptions,
-) -> Option<String> {
+fn resolve_api_key(provider_key: &Option<String>, opts: &SimpleStreamOptions) -> Option<String> {
     opts.api_key
         .clone()
         .or_else(|| provider_key.clone())
@@ -470,7 +463,12 @@ mod tests {
     fn assemble_headers_applies_beta_when_present() {
         let model = test_model();
         let opts = SimpleStreamOptions::default();
-        let headers = assemble_headers(&model, &opts, Some("fine-grained-tool-streaming-2025-05-14"), Some("k"));
+        let headers = assemble_headers(
+            &model,
+            &opts,
+            Some("fine-grained-tool-streaming-2025-05-14"),
+            Some("k"),
+        );
         let beta = headers
             .iter()
             .find(|(k, _)| k == "anthropic-beta")
@@ -618,8 +616,8 @@ mod tests {
         model.headers = Some(mh);
 
         // No opts.headers, no key — the only auth is on the model. Must satisfy.
-        let owned =
-            has_header_auth(&SimpleStreamOptions::default().headers) || has_header_auth(&model.headers);
+        let owned = has_header_auth(&SimpleStreamOptions::default().headers)
+            || has_header_auth(&model.headers);
         assert!(
             owned,
             "a Bearer header on model.headers must satisfy header-owned auth"
