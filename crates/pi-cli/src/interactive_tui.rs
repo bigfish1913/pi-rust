@@ -401,6 +401,7 @@ pub async fn interactive_tui(
     model_catalog: Vec<rpi_ai::Model>,
     initial: Option<String>,
     extra_messages: &[String],
+    theme: Option<&str>,
 ) -> i32 {
     let lane: Arc<dyn AgentLane> = harness.lane("main");
 
@@ -502,6 +503,22 @@ pub async fn interactive_tui(
         current_model_id: std::sync::Mutex::new(lane_model_id.clone()),
         show_images: std::sync::Mutex::new(true),
     });
+
+    // Apply the saved theme from `~/.rpi/agent/settings.json` (best-effort).
+    // The host passes `theme` in; when it matches a known preset it is applied
+    // immediately so launch opens in the user's chosen theme (matching pi
+    // reading `Settings.theme` at startup). Unknown values are ignored.
+    if let Some(theme_name) = theme {
+        let preset = match theme_name {
+            "light" => Some(ThemePreset::Light),
+            "monochrome" => Some(ThemePreset::Monochrome),
+            "dark" => Some(ThemePreset::Dark),
+            _ => None,
+        };
+        if let Some(preset) = preset {
+            state.theme_manager.apply_preset(preset);
+        }
+    }
 
     // Capture the model catalog + cwd for the selector builders + the key loop
     // (the callbacks fire on blocking threads and need owned data).

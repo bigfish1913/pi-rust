@@ -52,6 +52,7 @@ pub mod interactive_tui;
 pub mod modes;
 pub mod provider;
 pub mod session;
+pub mod settings;
 
 /// Crate version, surfaced by `rpi --version`. Mirrors the TS `VERSION` export
 /// (sourced from `package.json`; here from `env!("CARGO_PKG_VERSION")`).

@@ -81,6 +81,7 @@ use rpi_ai::{Model, Provider, ThinkingLevel};
 
 use crate::args::parse_thinking_level;
 use crate::config::{self, Credential, DEFAULT_PROVIDER_ID};
+use crate::settings;
 
 /// The v1-default model id when `--model` is absent. Mirrors the TS
 /// `defaultModelPerProvider["anthropic"]` (the first current-generation
@@ -105,6 +106,10 @@ pub struct ResolvedModel {
     /// Effective thinking level (the requested level, before model-clamp — the
     /// harness/provider clamps to the model's supported set).
     pub thinking_level: ThinkingLevel,
+    /// Saved theme name from `~/.rpi/agent/settings.json`, if any. Best-effort:
+    /// the TUI applies it at startup when it matches a known preset
+    /// (dark/light/monochrome); otherwise ignored.
+    pub theme: Option<String>,
 }
 
 impl std::fmt::Debug for ResolvedModel {
@@ -113,6 +118,7 @@ impl std::fmt::Debug for ResolvedModel {
             .field("provider", &self.provider.id())
             .field("model", &self.model.id)
             .field("thinking_level", &self.thinking_level)
+            .field("theme", &self.theme)
             .finish()
     }
 }
@@ -198,12 +204,19 @@ pub fn resolve(
     if let Some(k) = cli_api_key.filter(|s| !s.is_empty()) {
         provider_key = Some(k.to_string());
     }
-    // 2. ~/.rpi/auth.json anthropic.api_key.key (persistent login).
+    // 2. ~/.rpi/auth.json anthropic.api_key.key (persistent login). The key may
+    //    be a `$ENV`/`!command` template (mirrors pi auth-storage.ts:267, which
+    //    runs `resolveConfigValue(credential.key, credential.env)`); the
+    //    credential's `env` map is the overlay. A key that resolves to `None`
+    //    (e.g. references an unset env var) is skipped, exactly as pi skips an
+    //    unresolvable key.
     if provider_key.is_none() {
         if let Ok(store) = config::read_auth() {
-            if let Some(Credential::ApiKey { key: Some(k), .. }) = store.get(DEFAULT_PROVIDER_ID) {
-                if !k.is_empty() {
-                    provider_key = Some(k.clone());
+            if let Some(Credential::ApiKey { key: Some(k), env }) = store.get(DEFAULT_PROVIDER_ID) {
+                if let Some(resolved) = config::resolve_config_value(k, env.as_ref()) {
+                    if !resolved.is_empty() {
+                        provider_key = Some(resolved);
+                    }
                 }
             }
         }
@@ -250,6 +263,11 @@ pub fn resolve(
                 .ok()
                 .filter(|s| !s.is_empty())
         });
+
+    // Load saved settings once — `defaultProvider`/`defaultModel`/
+    // `defaultThinkingLevel`/`theme` (pi `findInitialModel` step 3 + the theme
+    // the TUI applies at startup). Missing file ⇒ defaults (no error).
+    let settings = settings::load_settings().unwrap_or_default();
 
     // ---- Catalog: built-in + ~/.rpi/models.json (merged, reusing the
     // already-loaded config) ----
@@ -319,9 +337,11 @@ pub fn resolve(
     // ---- Model selection ----
     // With `--model`: parse the pattern (`provider/id[:thinking]`), match it
     // exactly against the catalog (TS fuzzy/partial match is a deliberate v1
-    // omission — see module docs §5). Without `--model`: pick the default per
-    // upstream `findInitialModel` semantics (built-in default if it is authed,
-    // else the first authed model) via `pick_default_model` — see its doc.
+    // omission — see module docs §5). Without `--model`: pi `findInitialModel`
+    // precedence — (3) the saved default from settings (when present + authed),
+    // then (4) `pick_default_model` (built-in default if authed, else first
+    // authed). The saved default mirrors `findInitialModel` step 3 and lets a
+    // copied pi `settings.json`'s `defaultModel` come alive on launch.
     let (model, thinking_level) = match cli_model {
         Some(raw) => {
             let (pattern, pattern_thinking) = split_model_pattern(raw);
@@ -341,9 +361,48 @@ pub fn resolve(
             (model, thinking_level)
         }
         None => {
-            // No `:level` suffix to honor here; `--thinking` still wins, else
-            // the default. Matches the TS `findInitialModel` default-thinking
-            // behavior (DEFAULT_THINKING_LEVEL unless a scoped model overrides).
+            // `--thinking` > settings `defaultThinkingLevel` > built-in default.
+            // The settings level is honored only when its model is also the
+            // saved default (matches pi, which applies `defaultThinkingLevel`
+            // inside the step-3 branch). For the fallback default, keep
+            // `DEFAULT_THINKING_LEVEL`.
+            let settings_thinking = settings
+                .default_thinking_level
+                .as_deref()
+                .and_then(parse_thinking_level);
+
+            // (3) Saved default from settings, when the provider is anthropic
+            // (or absent — v1 is anthropic-only) and the model is authed.
+            if settings.default_provider.as_deref().map_or(true, |p| {
+                p.eq_ignore_ascii_case("anthropic")
+            }) {
+                if let Some(id) = settings.default_model.as_deref() {
+                    // Clone the match to release the catalog borrow before
+                    // moving `catalog` into the provider below.
+                    let found = catalog
+                        .iter()
+                        .find(|m| m.id.eq_ignore_ascii_case(id))
+                        .filter(|m| model_is_authed(m, provider_key.as_deref()))
+                        .cloned();
+                    if let Some(m) = found {
+                        let thinking_level = cli_thinking
+                            .or(settings_thinking)
+                            .unwrap_or(DEFAULT_THINKING_LEVEL);
+                        return Ok(ResolvedModel {
+                            provider: Arc::new(AnthropicProvider::with_models(
+                                provider_key,
+                                reqwest::Client::new(),
+                                catalog,
+                            )),
+                            model: m,
+                            thinking_level,
+                            theme: settings.theme.clone(),
+                        });
+                    }
+                }
+            }
+
+            // (4) Fallback: built-in default if authed, else first authed.
             let thinking_level = cli_thinking.unwrap_or(DEFAULT_THINKING_LEVEL);
             let model = pick_default_model(&catalog, provider_key.as_deref());
             (model, thinking_level)
@@ -359,7 +418,7 @@ pub fn resolve(
         catalog,
     ));
 
-    Ok(ResolvedModel { provider, model, thinking_level })
+    Ok(ResolvedModel { provider, model, thinking_level, theme: settings.theme.clone() })
 }
 
 /// The catalog the TUI's `/model` selector displays (read-only). Re-derives the
@@ -398,17 +457,24 @@ fn merge_user_catalog(catalog: &mut Vec<Model>, cfg: &config::ModelsConfig) {
 
 /// Extract a static gateway Bearer token from the first anthropic-compatible
 /// models.json provider that declares `authHeader: true` + a non-empty
-/// `apiKey`. Mirrors upstream's `withConfiguredAuth` (`authHeader` wraps the
-/// resolved key as `Authorization: Bearer`). Returns `None` when no such
-/// provider exists (the env/stored-cred/cli-flag sources still apply).
+/// `apiKey`. The `apiKey` is resolved via [`config::resolve_config_value`]
+/// (`$ENV`/`!command` expansion, mirroring pi provider-composer.ts:351) — a
+/// copied pi models.json referencing an env var resolves the same way. Returns
+/// `None` when no such provider exists (the env/stored-cred/cli-flag sources
+/// still apply).
 fn models_json_bearer_token(cfg: &config::ModelsConfig) -> Option<String> {
     for (_provider_id, provider_cfg) in &cfg.providers {
         if !config::provider_is_anthropic_compatible(provider_cfg) {
             continue;
         }
         if provider_cfg.auth_header.unwrap_or(false) {
-            if let Some(key) = provider_cfg.api_key.as_deref().filter(|s| !s.is_empty()) {
-                return Some(key.to_string());
+            if let Some(raw) = provider_cfg.api_key.as_deref().filter(|s| !s.is_empty()) {
+                // models.json providers have no credential env overlay — env-only.
+                if let Some(resolved) = config::resolve_config_value(raw, None) {
+                    if !resolved.is_empty() {
+                        return Some(resolved);
+                    }
+                }
             }
         }
     }
@@ -610,6 +676,31 @@ mod tests {
         assert_eq!(r.model.id, DEFAULT_MODEL_ID);
         assert_eq!(r.thinking_level, DEFAULT_THINKING_LEVEL);
         assert_eq!(r.provider.id(), "anthropic");
+    }
+
+    #[test]
+    fn settings_default_model_wins_when_authed() {
+        // A copied pi `settings.json` carrying `defaultModel` (step 3 of pi's
+        // `findInitialModel`) overrides the built-in `claude-sonnet-5` default
+        // when that model is in the catalog and authed. Mirrors the on-disk-
+        // parity goal: drop a `.pi/agent/` dir at `~/.rpi/agent/` and the saved
+        // default comes alive on launch (no `--model` needed).
+        let _env = TestEnv::new();
+        std::env::set_var(ANTHROPIC_API_KEY_ENV, "k");
+        let path = config::settings_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"defaultProvider":"anthropic","defaultModel":"claude-haiku-4-5","defaultThinkingLevel":"high"}"#,
+        )
+        .unwrap();
+        let r = resolve(None, None, None, None, None).unwrap();
+        assert_eq!(r.model.id, "claude-haiku-4-5");
+        assert_eq!(r.thinking_level, ThinkingLevel::High);
+        // An unauthed saved default (unknown id) falls through to the built-in.
+        std::fs::write(&path, r#"{"defaultModel":"claude-does-not-exist"}"#).unwrap();
+        let r = resolve(None, None, None, None, None).unwrap();
+        assert_eq!(r.model.id, DEFAULT_MODEL_ID);
     }
 
     #[test]

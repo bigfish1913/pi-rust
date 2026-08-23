@@ -1,19 +1,23 @@
-//! `~/.rpi/` persistent configuration — auth + model catalog. Mirrors (a
-//! Rust-flattened slice of) the TS `packages/coding-agent/src/config.ts`
-//! (`getAgentDir`/`getAuthPath`/`getModelsPath`) + `core/auth-storage.ts`
-//! (`FileAuthStorageBackend`) + `core/model-config.ts` (`ModelConfig`).
+//! # Layout
 //!
-//! # Layout (divergence from upstream — documented in `docs/m6-cli-open-questions.md`)
-//!
-//! Upstream uses `~/.pi/agent/{auth.json, models.json, …}` because the same dir
-//! also hosts themes/bin/prompts/sessions. rpi v1 has only two files, so it
-//! drops the `agent/` layer and goes flat:
+//! Mirrors upstream's nested layout, so a `~/.pi/agent/` directory can be
+//! copied to `~/.rpi/agent/` (or pointed at via `RPI_CODING_AGENT_DIR`) and
+//! "just works". The `agent/` layer matches pi's `getAgentDir()`:
 //!
 //! ```text
-//! ~/.rpi/                 (RPI_CODING_AGENT_DIR env overrides this)
-//! ├── auth.json          # persisted credentials (mode 0o600 on Unix)
-//! └── models.json        # user-defined provider/model catalog (hand-edited)
+//! ~/.rpi/                 (RPI_CODING_AGENT_DIR env overrides the agent/ dir)
+//! └── agent/
+//!     ├── auth.json       # persisted credentials (mode 0o600 on Unix)
+//!     ├── models.json     # user-defined provider/model catalog (hand-edited)
+//!     ├── settings.json   # saved default provider/model/thinking + theme
+//!     ├── trust.json      # per-cwd project trust decisions (read-only parity)
+//!     ├── .setup_done     # first-time-setup sentinel (extras.rs)
+//!     └── .earendil_seen  # earendil-announcement sentinel (extras.rs)
 //! ```
+//!
+//! Flat-installed `~/.rpi/{auth.json,models.json}` from older rpi releases are
+//! migrated under `agent/` on the next launch by [`migrate_legacy_layout`]
+//! (best-effort, idempotent; only when the env override is unset).
 //!
 //! # Concurrency
 //!
@@ -23,11 +27,13 @@
 //! Concurrent `rpi auth login` from two shells could lose one update — that's
 //! accepted and documented; adding a file lock is deferred.
 //!
-//! # models.json credential expansion
+//! # Config-value expansion
 //!
-//! Upstream `resolveConfigValue` expands `$ENV`/`!command`/`${ENV}` inside
-//! `apiKey`/`headers`. **v1 does not** — only literal strings are accepted
-//! (use the `ANTHROPIC_*` env vars for dynamic secrets). Documented divergence.
+//! [`resolve_config_value`] expands `$ENV`/`${ENV}`/`!command` inside
+//! `apiKey`/`headers` exactly like upstream's `resolve-config-value.ts` — so a
+//! copied pi `models.json`/`auth.json` that references env vars or shell
+//! commands resolves the same way. Applied where rpi consumes those values
+//! (auth.json key, models.json bearer apiKey, provider/model `headers`).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -70,8 +76,11 @@ pub enum ConfigError {
 // Path resolution
 // ---------------------------------------------------------------------------
 
-/// The rpi config directory (`~/.rpi` by default, `RPI_CODING_AGENT_DIR`
-/// override). Creates nothing — purely a path computation.
+/// The rpi config directory (`~/.rpi/agent` by default, `RPI_CODING_AGENT_DIR`
+/// override). Creates nothing — purely a path computation. The `agent/` layer
+/// mirrors upstream `getAgentDir()` (`join(homedir(), CONFIG_DIR_NAME, "agent")`)
+/// so a copied `~/.pi/agent/` directory reads in place. The env override points
+/// at the agent dir itself (same as pi's `PI_CODING_AGENT_DIR`).
 pub fn agent_dir() -> Result<PathBuf, ConfigError> {
     if let Some(val) = std::env::var_os(CONFIG_DIR_ENV) {
         let p = PathBuf::from(&val);
@@ -85,17 +94,98 @@ pub fn agent_dir() -> Result<PathBuf, ConfigError> {
     }
     let home = dirs::home_dir()
         .ok_or(ConfigError::NoHomeDir { env: CONFIG_DIR_ENV })?;
-    Ok(home.join(CONFIG_DIR_NAME))
+    Ok(home.join(CONFIG_DIR_NAME).join("agent"))
 }
 
-/// `~/.rpi/auth.json`.
+/// The config dir one level above the agent dir (`~/.rpi`, or the parent of an
+/// env override). Used by [`migrate_legacy_layout`] to locate the old flat
+/// layout. Returns `None` when the env override has no parent (a root path).
+fn config_root_dir() -> Result<PathBuf, ConfigError> {
+    let agent = agent_dir()?;
+    agent
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or(ConfigError::NoHomeDir { env: CONFIG_DIR_ENV })
+}
+
+/// `~/.rpi/agent/auth.json`.
 pub fn auth_path() -> Result<PathBuf, ConfigError> {
     Ok(agent_dir()?.join("auth.json"))
 }
 
-/// `~/.rpi/models.json`.
+/// `~/.rpi/agent/models.json`.
 pub fn models_path() -> Result<PathBuf, ConfigError> {
     Ok(agent_dir()?.join("models.json"))
+}
+
+/// `~/.rpi/agent/settings.json` (saved default provider/model/thinking + theme).
+pub fn settings_path() -> Result<PathBuf, ConfigError> {
+    Ok(agent_dir()?.join("settings.json"))
+}
+
+/// `~/.rpi/agent/trust.json` (per-cwd project trust decisions — read-only
+/// parity with pi; rpi does not gate resources behind trust in v1).
+pub fn trust_path() -> Result<PathBuf, ConfigError> {
+    Ok(agent_dir()?.join("trust.json"))
+}
+
+/// One-time best-effort migration of a pre-nesting flat layout
+/// (`~/.rpi/{auth.json,models.json,.setup_done,.earendil_seen}`) into the
+/// nested `~/.rpi/agent/` layout. **No-op when `RPI_CODING_AGENT_DIR` is set**
+/// (never touch an explicit override), when the agent dir already exists, or
+/// when no flat files are present. Idempotent: a partial move resumes. Errors
+/// are swallowed (logged via the returned `Result` only so tests can observe);
+/// `app::run` ignores them so a migration hiccup never blocks startup.
+pub fn migrate_legacy_layout() -> Result<usize, ConfigError> {
+    // Only migrate the default home-backed layout — never an env override.
+    if std::env::var_os(CONFIG_DIR_ENV).is_some() {
+        return Ok(0);
+    }
+    let root = match config_root_dir() {
+        Ok(p) => p,
+        Err(_) => return Ok(0),
+    };
+    let agent = agent_dir()?;
+    migrate_legacy_layout_in(&root, &agent)
+}
+
+/// The core migration (no env gate): if `agent/` is absent but flat files exist
+/// under `root`, move `{auth.json,models.json,.setup_done,.earendil_seen}` into
+/// `agent/`. Idempotent. Factored out so tests can drive it against a temp
+/// root/agent pair without touching the env (the public
+/// [`migrate_legacy_layout`] short-circuits on an env override, which tests
+/// can't unset portably while other tests run).
+fn migrate_legacy_layout_in(root: &Path, agent: &Path) -> Result<usize, ConfigError> {
+    // If the agent dir already exists with any content, assume already migrated.
+    if agent.exists() {
+        return Ok(0);
+    }
+    // Probe for a flat file. If none, nothing to migrate.
+    let flat_auth = root.join("auth.json");
+    let flat_models = root.join("models.json");
+    if !flat_auth.exists() && !flat_models.exists() {
+        return Ok(0);
+    }
+    std::fs::create_dir_all(agent).map_err(|e| ConfigError::Write {
+        path: agent.to_path_buf(),
+        source: e,
+    })?;
+    let mut moved = 0usize;
+    for leaf in ["auth.json", "models.json", ".setup_done", ".earendil_seen"] {
+        let from = root.join(leaf);
+        let to = agent.join(leaf);
+        if from.exists() && !to.exists() {
+            // `rename` across the same filesystem is atomic; fall back to copy
+            // + remove on cross-device (rare for a home dir).
+            if let Err(_e) = std::fs::rename(&from, &to) {
+                if std::fs::copy(&from, &to).is_ok() {
+                    let _ = std::fs::remove_file(&from);
+                }
+            }
+            moved += 1;
+        }
+    }
+    Ok(moved)
 }
 
 // ---------------------------------------------------------------------------
@@ -249,6 +339,32 @@ pub fn load_models_config() -> Result<ModelsConfig, ConfigError> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// trust.json — project-trust store (read-only layout parity with pi)
+// ---------------------------------------------------------------------------
+
+/// The trust store: `canonicalCwd -> decision` (`true`/`false`/`null`). Mirrors
+/// pi's `TrustFile = Record<string, boolean | null | undefined>`
+/// (`trust-manager.ts`). rpi reads this for layout parity (a copied pi
+/// `trust.json` parses + is located correctly) but does **not** gate any
+/// project resources behind trust in v1 — there is no trust prompt. Deferred.
+pub type TrustStore = BTreeMap<String, Option<bool>>;
+
+/// Read `~/.rpi/agent/trust.json`. Missing file ⇒ empty store (not an error).
+/// Malformed JSON ⇒ `ConfigError::Json`. `null` decisions deserialize as
+/// `None`; absent entries are simply not present.
+pub fn read_trust() -> Result<TrustStore, ConfigError> {
+    let path = trust_path()?;
+    match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str(&text).map_err(|e| ConfigError::Json {
+            path: path.clone(),
+            source: e,
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(TrustStore::new()),
+        Err(e) => Err(ConfigError::Read { path, source: e }),
+    }
+}
+
 /// Parse the models JSON, tolerating `//` line comments (a minimal subset of
 /// upstream's `stripJsonComments`). Tries strict JSON first; on failure, strips
 /// `//…` to end-of-line and retries.
@@ -260,20 +376,24 @@ fn parse_models_json(text: &str) -> Result<ModelsConfig, serde_json::Error> {
             // (a `//` inside a JSON string would already have made the strict
             // parse fail for a *different* reason; stripping naively is an
             // acceptable v1 trade-off, documented as a limitation).
-            let stripped: String = text
-                .lines()
-                .map(|line| {
-                    if let Some(idx) = find_line_comment(line) {
-                        line[..idx].to_string()
-                    } else {
-                        line.to_string()
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
+            let stripped = strip_line_comments(text);
             serde_json::from_str(&stripped).map_err(|_| first)
         }
     }
+}
+
+/// Strip `//` line comments (to end-of-line), skipping `//` that appears inside
+/// a double-quoted string. A minimal subset of upstream's `stripJsonComments`,
+/// shared by [`parse_models_json`] and [`crate::settings::load_settings`] so a
+/// copied pi `models.json`/`settings.json` (which pi allows comments in) parses.
+pub(crate) fn strip_line_comments(text: &str) -> String {
+    text.lines()
+        .map(|line| match find_line_comment(line) {
+            Some(idx) => line[..idx].to_string(),
+            None => line.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Index of a `//` line comment that is *not* inside a double-quoted string.
@@ -299,7 +419,260 @@ fn find_line_comment(line: &str) -> Option<usize> {
     None
 }
 
-/// Whether the entry under `provider_id` speaks the v1-honored protocol
+// ---------------------------------------------------------------------------
+// Config-value expansion (mirrors pi `resolve-config-value.ts`)
+// ---------------------------------------------------------------------------
+
+/// A process-lifetime cache for `!command` resolutions, mirroring pi's
+/// `commandResultCache`. Keyed by the raw `!cmd` string (including the `!`).
+fn command_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, Option<String>>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, Option<String>>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Resolve a config value (API key, header value) that may be a shell command,
+/// an env-var template, or a literal — mirroring pi's `resolveConfigValue`.
+///
+/// - `!command` → run the rest as a shell command (`sh -c` on Unix, `cmd /C` on
+///   Windows), return trimmed stdout (cached per process). Missing shell or
+///   non-zero exit ⇒ `None`.
+/// - `$VAR` / `${VAR}` templates: interpolate from `env_overlay` (winning) then
+///   the process env. `$$`→`$`, `$!`→`!` escapes. Any referenced var that is
+///   unset ⇒ the **whole** value resolves to `None` (pi semantics).
+/// - Otherwise the literal string (returned as-is).
+///
+/// `env_overlay` is the `credential.env` map for auth.json keys (pi passes the
+/// same). `None` (or an empty overlay) means process-env only — used for
+/// models.json apiKey/headers, which have no env overlay.
+pub fn resolve_config_value(
+    config: &str,
+    env_overlay: Option<&BTreeMap<String, String>>,
+) -> Option<String> {
+    if let Some(cmd) = config.strip_prefix('!') {
+        return resolve_command(cmd);
+    }
+    resolve_template(config, env_overlay)
+}
+
+/// Like [`resolve_config_value`] but **uncached** — mirrors pi's
+/// `resolveConfigValueUncached`, used when a fresh resolution is required
+/// (e.g. headers, which pi resolves uncached so a rotating token is re-read).
+pub fn resolve_config_value_uncached(
+    config: &str,
+    env_overlay: Option<&BTreeMap<String, String>>,
+) -> Option<String> {
+    if let Some(cmd) = config.strip_prefix('!') {
+        return resolve_command_uncached(cmd);
+    }
+    resolve_template(config, env_overlay)
+}
+
+/// Resolve every header value via [`resolve_config_value_uncached`]; drop
+/// entries that resolve to `None` (mirrors pi `resolveHeaders`). Used on
+/// models.json `headers` maps before folding onto a model.
+pub fn resolve_headers(
+    headers: &BTreeMap<String, String>,
+    env_overlay: Option<&BTreeMap<String, String>>,
+) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for (k, v) in headers {
+        if let Some(resolved) = resolve_config_value_uncached(v, env_overlay) {
+            out.insert(k.clone(), resolved);
+        }
+    }
+    out
+}
+
+/// Env lookup: `env_overlay` (if present) wins over the process env, matching
+/// pi's `resolveEnvConfigValue` (which checks `env?.[name]` before `process.env`).
+fn env_lookup(name: &str, env_overlay: Option<&BTreeMap<String, String>>) -> Option<String> {
+    if let Some(overlay) = env_overlay {
+        if let Some(v) = overlay.get(name) {
+            return Some(v.clone());
+        }
+    }
+    std::env::var(name).ok()
+}
+
+/// A parsed template part — literal text or an env-var reference.
+enum TemplatePart {
+    Literal(String),
+    Env(String),
+}
+
+/// Parse a `$VAR`/`${VAR}` template (mirrors pi `parseConfigValueTemplate`).
+/// `$$`→`$` and `$!`→`!` are escapes; `${NAME}` requires `NAME` to match
+/// `^[A-Za-z_][A-Za-z0-9_]*$` else the raw slice is kept literal; `$NAME` takes
+/// the longest `[A-Za-z_][A-Za-z0-9_]*` prefix as the name.
+fn parse_template(config: &str) -> Vec<TemplatePart> {
+    let mut parts: Vec<TemplatePart> = Vec::new();
+    let bytes = config.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        // Find the next `$`.
+        match config[i..].find('$') {
+            None => {
+                push_literal(&mut parts, &config[i..]);
+                break;
+            }
+            Some(offset) => {
+                let dollar = i + offset;
+                push_literal(&mut parts, &config[i..dollar]);
+                let after = dollar + 1;
+                let next = bytes.get(after).copied();
+                if next == Some(b'$') || next == Some(b'!') {
+                    push_literal(&mut parts, &config[after..after + 1]);
+                    i = after + 1;
+                    continue;
+                }
+                if next == Some(b'{') {
+                    // ${NAME}
+                    if let Some(end_rel) = config[after + 1..].find('}') {
+                        let end = after + 1 + end_rel;
+                        let name = &config[after + 1..end];
+                        if is_env_name(name) {
+                            parts.push(TemplatePart::Env(name.to_string()));
+                        } else {
+                            // Not a valid name — keep the raw `${…}` literal.
+                            push_literal(&mut parts, &config[dollar..=end]);
+                        }
+                        i = end + 1;
+                        continue;
+                    }
+                    // No closing `}` — literal `$`.
+                    push_literal(&mut parts, "$");
+                    i = after;
+                    continue;
+                }
+                // $NAME (greedy prefix). Bare `$` with no name char follows.
+                if let Some(name) = env_name_prefix(&config[after..]) {
+                    parts.push(TemplatePart::Env(name.to_string()));
+                    i = after + name.len();
+                } else {
+                    push_literal(&mut parts, "$");
+                    i = after;
+                }
+            }
+        }
+    }
+    parts
+}
+
+fn push_literal(parts: &mut Vec<TemplatePart>, value: &str) {
+    if value.is_empty() {
+        return;
+    }
+    if let Some(TemplatePart::Literal(s)) = parts.last_mut() {
+        s.push_str(value);
+    } else {
+        parts.push(TemplatePart::Literal(value.to_string()));
+    }
+}
+
+fn is_env_name(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The longest `[A-Za-z_][A-Za-z0-9_]*` prefix of `s` (mirrors the TS
+/// `ENV_VAR_NAME_PREFIX_RE` match), or `None` when `s` doesn't start with one.
+fn env_name_prefix(s: &str) -> Option<&str> {
+    let mut chars = s.char_indices();
+    match chars.next() {
+        Some((_, c)) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return None,
+    }
+    let end = chars
+        .find(|(_, c)| !(c.is_ascii_alphanumeric() || *c == '_'))
+        .map(|(idx, _)| idx)
+        .unwrap_or(s.len());
+    Some(&s[..end])
+}
+
+/// Resolve a parsed template: any referenced env var that is unset ⇒ the whole
+/// value is `None` (pi semantics). Literal-only templates pass through as-is.
+fn resolve_template(
+    config: &str,
+    env_overlay: Option<&BTreeMap<String, String>>,
+) -> Option<String> {
+    let parts = parse_template(config);
+    let mut out = String::with_capacity(config.len());
+    for part in parts {
+        match part {
+            TemplatePart::Literal(s) => out.push_str(&s),
+            TemplatePart::Env(name) => match env_lookup(&name, env_overlay) {
+                Some(v) => out.push_str(&v),
+                None => return None,
+            },
+        }
+    }
+    Some(out)
+}
+
+/// Run `cmd` (without the leading `!`), returning trimmed stdout. Cached per
+/// process (mirrors pi `executeCommand`). 10s timeout; non-zero exit / missing
+/// shell ⇒ `None`.
+fn resolve_command(cmd: &str) -> Option<String> {
+    let key = format!("!{cmd}");
+    if let Some(v) = command_cache().lock().ok()?.get(&key) {
+        return v.clone();
+    }
+    let result = resolve_command_uncached(cmd);
+    if let Ok(mut cache) = command_cache().lock() {
+        cache.insert(key, result.clone());
+    }
+    result
+}
+
+#[cfg(unix)]
+fn spawn_shell_command(cmd: &str) -> Option<std::process::Output> {
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+}
+
+#[cfg(windows)]
+fn spawn_shell_command(cmd: &str) -> Option<std::process::Output> {
+    use std::os::windows::process::CommandExt;
+    std::process::Command::new("cmd")
+        .arg("/C")
+        .arg(cmd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .output()
+        .ok()
+}
+
+/// Uncached `!command` execution (mirrors pi `executeCommandUncached`).
+fn resolve_command_uncached(cmd: &str) -> Option<String> {
+    let output = spawn_shell_command(cmd)?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+
 /// (`anthropic-messages`, or omitted/unknown). Unknown `api` is allowed through
 /// for forward-compat but flagged ignored-in-v1 in the docs. Public so
 /// [`crate::provider`] can scan models.json providers for an `authHeader:true`
@@ -355,6 +728,11 @@ pub fn provider_to_models(
         m.input = parse_input_modalities(def.input.as_deref());
         // Merge: model-level headers, then provider-level headers (provider wins
         // on conflict — it's the more specific-to-this-endpoint declaration).
+        // Values are resolved via `resolve_headers` (`$ENV`/`!command` expansion,
+        // mirroring pi's `resolveHeadersOrThrow`) so a copied pi models.json
+        // referencing env vars / commands resolves the same way. Models.json
+        // providers have no credential env overlay (only auth.json keys do), so
+        // the expansion is env-only here.
         // NOTE: the `authHeader:true` Bearer synthesis is NOT done here —
         // [`crate::provider::resolve`] applies it centrally so it can skip it
         // when a higher-priority x-api-key source (`--api-key` / auth.json /
@@ -363,10 +741,14 @@ pub fn provider_to_models(
         // `models_json_bearer_token` + the fold loop in `resolve`.
         let mut headers: BTreeMap<String, String> = BTreeMap::new();
         if let Some(h) = def.headers.clone() {
-            headers.extend(h);
+            for (k, v) in resolve_headers(&h, None) {
+                headers.insert(k, v);
+            }
         }
         if let Some(h) = cfg.headers.clone() {
-            headers.extend(h);
+            for (k, v) in resolve_headers(&h, None) {
+                headers.insert(k, v);
+            }
         }
         if !headers.is_empty() {
             m.headers = Some(headers);
@@ -663,6 +1045,181 @@ mod tests {
         let _cfg = TempConfig::new();
         std::fs::write(auth_path().unwrap(), "{ not json").unwrap();
         assert!(matches!(read_auth(), Err(ConfigError::Json { .. })));
+    }
+
+    #[test]
+    fn agent_dir_nests_under_agent_by_default() {
+        // With no env override, agent_dir() must end in `.../.rpi/agent`
+        // (mirrors pi's `getAgentDir`). We can't assertion the home prefix
+        // portably, but the leaf two segments are stable.
+        let _guard = env_lock().lock().unwrap();
+        let prev = std::env::var_os(CONFIG_DIR_ENV);
+        std::env::remove_var(CONFIG_DIR_ENV);
+        let dir = agent_dir().unwrap();
+        restore_env(CONFIG_DIR_ENV, prev);
+        assert!(dir.ends_with("agent"));
+        assert!(dir
+            .parent()
+            .map(|p| p.ends_with(CONFIG_DIR_NAME))
+            .unwrap_or(false));
+    }
+
+    #[test]
+    fn migrate_legacy_layout_moves_flat_files_into_agent() {
+        // Drive the core migration directly against a temp root/agent so the
+        // result is independent of whatever RPI_CODING_AGENT_DIR the parallel
+        // TempConfig tests happen to set.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let agent = root.join("agent");
+        std::fs::write(root.join("auth.json"), "{}").unwrap();
+        std::fs::write(root.join("models.json"), "{}").unwrap();
+        std::fs::write(root.join(".setup_done"), "1").unwrap();
+        let moved = migrate_legacy_layout_in(&root, &agent).unwrap();
+        assert_eq!(moved, 3);
+        assert!(agent.join("auth.json").exists());
+        assert!(agent.join("models.json").exists());
+        assert!(agent.join(".setup_done").exists());
+        assert!(!root.join("auth.json").exists());
+    }
+
+    #[test]
+    fn migrate_legacy_layout_noop_when_agent_exists() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let agent = root.join("agent");
+        std::fs::write(root.join("auth.json"), "{}").unwrap();
+        std::fs::create_dir_all(&agent).unwrap();
+        let moved = migrate_legacy_layout_in(&root, &agent).unwrap();
+        assert_eq!(moved, 0); // agent/ already present — leave flat file alone
+    }
+
+    #[test]
+    fn migrate_legacy_layout_noop_when_no_flat_files() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let agent = root.join("agent");
+        let moved = migrate_legacy_layout_in(&root, &agent).unwrap();
+        assert_eq!(moved, 0);
+    }
+
+    #[test]
+    fn migrate_legacy_layout_public_skips_env_override() {
+        // When RPI_CODING_AGENT_DIR is set, the public entry point is a no-op
+        // (it must never touch an explicit override). TempConfig sets it.
+        let _cfg = TempConfig::new();
+        let moved = migrate_legacy_layout().unwrap();
+        assert_eq!(moved, 0);
+    }
+
+    #[test]
+    fn read_trust_missing_file_is_empty() {
+        let _cfg = TempConfig::new();
+        assert!(read_trust().unwrap().is_empty());
+    }
+
+    #[test]
+    fn read_trust_parses_decisions() {
+        let _cfg = TempConfig::new();
+        let path = trust_path().unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{ "/home/me/proj": true, "/home/me/untrusted": false, "/home/me/null": null }"#,
+        )
+        .unwrap();
+        let store = read_trust().unwrap();
+        assert_eq!(store.len(), 3);
+        assert_eq!(store.get("/home/me/proj").copied().flatten(), Some(true));
+        assert_eq!(store.get("/home/me/untrusted").copied().flatten(), Some(false));
+        assert_eq!(store.get("/home/me/null").copied().flatten(), None);
+    }
+
+    #[test]
+    fn resolve_config_value_literal_passthrough() {
+        assert_eq!(resolve_config_value("sk-literal-key", None), Some("sk-literal-key".into()));
+    }
+
+    #[test]
+    fn resolve_config_value_env_var() {
+        let _guard = env_lock().lock().unwrap();
+        let prev = std::env::var_os("RPI_TEST_CFG_KEY");
+        let prev2 = std::env::var_os("RPI_TEST_CFG_KEY2");
+        std::env::set_var("RPI_TEST_CFG_KEY", "secret-from-env");
+        assert_eq!(
+            resolve_config_value("$RPI_TEST_CFG_KEY", None),
+            Some("secret-from-env".into())
+        );
+        assert_eq!(
+            resolve_config_value("prefix-${RPI_TEST_CFG_KEY}-suffix", None),
+            Some("prefix-secret-from-env-suffix".into())
+        );
+        // Two vars in one template.
+        std::env::set_var("RPI_TEST_CFG_KEY2", "two");
+        assert_eq!(
+            resolve_config_value("a-$RPI_TEST_CFG_KEY-b-$RPI_TEST_CFG_KEY2-c", None),
+            Some("a-secret-from-env-b-two-c".into())
+        );
+        // Env overlay wins over process env.
+        let mut overlay = BTreeMap::new();
+        overlay.insert("RPI_TEST_CFG_KEY".into(), "overlay-value".into());
+        assert_eq!(
+            resolve_config_value("$RPI_TEST_CFG_KEY", Some(&overlay)),
+            Some("overlay-value".into())
+        );
+        restore_env("RPI_TEST_CFG_KEY", prev);
+        restore_env("RPI_TEST_CFG_KEY2", prev2);
+    }
+
+    #[test]
+    fn resolve_config_value_unset_env_is_none() {
+        let _guard = env_lock().lock().unwrap();
+        let prev = std::env::var_os("RPI_TEST_CFG_ABSENT");
+        std::env::remove_var("RPI_TEST_CFG_ABSENT");
+        // Any referenced unset var ⇒ the whole value is None (pi semantics).
+        assert_eq!(resolve_config_value("$RPI_TEST_CFG_ABSENT", None), None);
+        assert_eq!(
+            resolve_config_value("prefix-$RPI_TEST_CFG_ABSENT-suffix", None),
+            None
+        );
+        restore_env("RPI_TEST_CFG_ABSENT", prev);
+    }
+
+    #[test]
+    fn resolve_config_value_dollar_dollar_escapes_literal() {
+        assert_eq!(resolve_config_value("price-$$5", None), Some("price-$5".into()));
+        assert_eq!(resolve_config_value("$!bang", None), Some("!bang".into()));
+    }
+
+    #[test]
+    fn resolve_config_value_command_runs_shell() {
+        // `!echo resolved` → "resolved" (sh on Unix; `echo` works under cmd too).
+        assert_eq!(
+            resolve_config_value_uncached("!echo rpi-cfg-resolved", None),
+            Some("rpi-cfg-resolved".into())
+        );
+        // Non-zero exit ⇒ None.
+        assert_eq!(
+            resolve_config_value_uncached("!false", None),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_headers_drops_unresolvable() {
+        let _guard = env_lock().lock().unwrap();
+        let prev = std::env::var_os("RPI_TEST_HDR_SET");
+        std::env::set_var("RPI_TEST_HDR_SET", "set-value");
+        let mut h = BTreeMap::new();
+        h.insert("x-set".into(), "$RPI_TEST_HDR_SET".into());
+        h.insert("x-unset".into(), "$RPI_TEST_HDR_UNSET".into());
+        h.insert("x-literal".into(), "literal-value".into());
+        let resolved = resolve_headers(&h, None);
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved.get("x-set").map(|s| s.as_str()), Some("set-value"));
+        assert_eq!(resolved.get("x-literal").map(|s| s.as_str()), Some("literal-value"));
+        assert!(!resolved.contains_key("x-unset"));
+        restore_env("RPI_TEST_HDR_SET", prev);
     }
 
     #[test]

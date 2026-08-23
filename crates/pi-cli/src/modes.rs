@@ -260,6 +260,7 @@ pub async fn interactive(
     model_catalog: Vec<rpi_ai::Model>,
     initial: Option<String>,
     extra_messages: &[String],
+    theme: Option<&str>,
 ) -> i32 {
     // Check if TUI is supported
     let force_tui = std::env::var("RPI_FORCE_TUI").map(|v| v == "1").unwrap_or(false);
@@ -272,6 +273,7 @@ pub async fn interactive(
             model_catalog,
             initial,
             extra_messages,
+            theme,
         )
         .await
     } else {

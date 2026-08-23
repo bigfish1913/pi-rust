@@ -89,6 +89,11 @@ pub async fn run() -> i32 {
         }
     };
 
+    // ---- Legacy-layout migration (flat ~/.rpi → ~/.rpi/agent/) ----
+    // Best-effort; never blocks startup. Skipped when RPI_CODING_AGENT_DIR is
+    // set (an explicit override is its own layout).
+    let _ = crate::config::migrate_legacy_layout();
+
     // ---- Startup warnings (ignored-but-recognized flags) ----
     if parsed.verbose {
         for warn in &parsed.ignored {
@@ -175,6 +180,7 @@ pub async fn run() -> i32 {
                 model_catalog,
                 initial.clone(),
                 &extra,
+                resolved.theme.as_deref(),
             )
             .await
         }

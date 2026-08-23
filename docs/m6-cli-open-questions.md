@@ -142,18 +142,48 @@ The fix consults *both*: `has_header_auth(&opts.headers) || has_header_auth(&mod
 the TS net effect and lets a Bearer folded onto `model.headers` authenticate. A
 regression test (`header_auth_on_model_headers_counts_as_owned`) pins it.
 
-### 4a. `~/.rpi` is flat; upstream `~/.pi/agent/` is nested
+### 4a. ✅ RESOLVED — `~/.rpi/agent/` is nested (parity with upstream `~/.pi/agent/`)
 
-**Divergence.** Upstream uses `<agentDir>/` = `~/.pi/agent/` and nests `auth.json`,
-`models.json`, *plus* themes/bin/prompts/sessions/etc. under it. v1 uses `~/.rpi/`
-**directly** with only `auth.json` + `models.json` — two files, one flat dir. The
-extra upstream nesting exists because that one dir hosts many subsystems; v1 has
-only auth+models, so the `agent/` layer would be dead weight. `RPI_CODING_AGENT_DIR`
-(absolute path only) overrides the dir, mirroring `PI_CODING_AGENT_DIR`. The default
-session dir is still `<cwd>/.pi/sessions` (see §6) — independent of `~/.rpi`.
+**Status.** v1 now mirrors upstream `getAgentDir()`: config lives under
+`~/.rpi/agent/` (`auth.json`, `models.json`, `settings.json`, `trust.json`),
+matching `~/.pi/agent/`. `RPI_CODING_AGENT_DIR` (absolute path only) overrides
+the agent dir itself — same semantics as `PI_CODING_AGENT_DIR`. The goal
+(".pi 目录靠过来就能用" — drop a `.pi/agent/` dir at `~/.rpi/agent/` or point
+`RPI_CODING_AGENT_DIR` at it and it works) is met for the config layer: rpi
+reads the same `auth.json`/`models.json`/`settings.json`/`trust.json` pi
+writes, honors a saved `defaultModel`/`defaultThinkingLevel`/`theme`, and
+expands `$ENV`/`!command` config values (§4c).
 
-**To revisit.** If v1 grows themes/prompts/skills on disk, either adopt the `agent/`
-subdir or keep flat and name files distinctly.
+**Migration.** A one-shot `config::migrate_legacy_layout()` (called from
+`app::run` on startup, **only when `RPI_CODING_AGENT_DIR` is unset**) moves
+legacy flat `~/.rpi/{auth.json,models.json,.setup_done,.earendil_seen}` into
+`~/.rpi/agent/`. It's idempotent, best-effort (rename with copy-fallback),
+no-ops when `agent/` already exists or no flat files are present, and never
+blocks startup. Existing flat installs upgrade transparently on the next run.
+
+**Sentinels.** `.setup_done` / `.earendil_seen` moved under `agent/` (the
+`extras.rs` sentinels now delegate to `config::agent_dir()` instead of a
+private `rpi_dir()`, which also fixes an old bug where they ignored the env
+override).
+
+**Remaining divergences under this heading (deferred):**
+- **`bare apiKey` → `x-api-key`.** Upstream `provider-composer` routes a
+  models.json provider's bare `apiKey` (no `authHeader`) as `x-api-key`
+  (`composeApiKeyAuth`). v1 consumes a models.json `api_key` **only** via the
+  `authHeader:true` Bearer path. A copied pi models.json using a bare
+  `apiKey` (no `authHeader`) is the one remaining copy-over gap — it won't
+  satisfy auth on its own. Adding the bare→x-api-key path is a separate
+  auth-precedence change; deferred.
+- **Project-trust prompt + `trust.json` gate.** rpi reads `trust.json`
+  (`config::read_trust`) for layout parity (a copied pi `trust.json` parses +
+  is located at `~/.rpi/agent/trust.json`), but does **not** wire a trust
+  prompt or gate project `.pi` resources behind it — rpi doesn't load the
+  resources pi gates there (skills/templates/context, §8). Deferred until
+  resource discovery lands.
+- **Session dir.** v1's default session dir is still `<cwd>/.pi/sessions`
+  (see §6), **not** `<agentDir>/sessions`. pi encodes cwd into session
+  filenames; rpi's session layer is a separate design. Aligning the session
+  location is out of scope for this config-parity pass.
 
 ### 4b. No file lock; atomic rename instead
 
@@ -166,20 +196,31 @@ Unix afterward. Concurrent `rpi auth login` from two shells could lose one write
 **To revisit.** Add `fs4`/`proper-lockfile` if multi-process safety matters (e.g. a
 future daemon/TUI left open while a `rpi` one-shot runs).
 
-### 4c. models.json has no `$ENV` / `!command` / `${ENV}` credential expansion
+### 4c. ✅ RESOLVED — `resolveConfigValue` (`$ENV` / `${ENV}` / `!command`) ported
 
-**Where:** `crates/pi-cli/src/config.rs` — `apiKey`/`headers` values are taken as
-literal strings.
+**Where:** `crates/pi-cli/src/config.rs::resolve_config_value` +
+`resolve_headers` + `resolve_command`, applied at the three consumption points
+that mirror upstream (`resolve-config-value.ts`):
 
-**Divergence.** Upstream `resolveConfigValue` interpolates `$ENV_VAR`,
-`!shell-command`, and `${ENV}` inside config values, so a models.json can reference
-`$ANTHROPIC_API_KEY` without copying the secret. v1 parses only literals — put the
-secret in the file, or use the env-var auth sources (`ANTHROPIC_AUTH_TOKEN` /
-`ANTHROPIC_API_KEY`) instead. This avoids pulling a shell-eval / env-expansion
-machinery (and its security surface) into a v1 config reader.
+| Value | Where applied | Upstream mirror |
+|---|---|---|
+| `auth.json` `anthropic.api_key.key` | `provider::resolve` auth step 2 | `auth-storage.ts:267` (with `credential.env` overlay) |
+| `models.json` provider `apiKey` | `models_json_bearer_token` (Bearer wrap) | `provider-composer.ts:351` |
+| `models.json` `headers` values | `provider_to_models` (merge) | `provider-composer.ts:361` `resolveHeadersOrThrow` |
 
-**To revisit.** Port a constrained `resolveConfigValue` (env-only, no `!command`)
-if users want models.json to stay secret-free on disk.
+**Semantics.** A `!cmd` value runs the shell (`sh -c` / `cmd /C`), cached
+per-process (10s, success⇒trimmed stdout, ENOENT/non-zero⇒`None`). A `$VAR`/
+`${VAR}` template interpolates from an optional env overlay then the process
+env; `$$`→`$` and `$!`→`!` escape; **any referenced unset var ⇒ the whole
+value resolves to `None`** (pi semantics). A literal otherwise. Auth headers
+that resolve to `None` are dropped (`resolve_headers`), matching pi
+`resolveHeaders`. A models.json referencing `$ANTHROPIC_API_KEY` no longer
+needs the secret copied into the file.
+
+**Deferred under this heading:** the **bare** `apiKey`→`x-api-key` path (see
+§4a) — the `api_key` value is resolved through `resolve_config_value` on the
+Bearer path it already serves; the bare-x-api-key routing is the deferred
+piece, not the value expansion itself.
 
 ### 4d. OAuth / Copilot device-code still deferred
 
@@ -254,13 +295,24 @@ opt-in `--fuzzy-model` flag rather than changing the default.
 **Default selection (no `--model`).** When `--model` is absent, v1 now picks the
 default the way the TS `findInitialModel`
 (`packages/coding-agent/src/core/model-resolver.ts`) does over the
-auth-filtered snapshot — not the old hard-coded `claude-sonnet-5`. The rule
-(`provider.rs::pick_default_model`): (1) the built-in default
-`claude-sonnet-5` if it is *already authenticated*, else (2) the **first
-authenticated model** in the catalog (TS `availableModels[0]`). A model is
-"authenticated" when it carries an auth-owned header (a folded Bearer — see
-`Auth source → fold scope` below) or the provider holds a resolved `x-api-key`
-(the `--api-key`/`auth.json`/`ANTHROPIC_API_KEY` path).
+auth-filtered snapshot — including the **saved settings default** (step 3),
+which is what makes a copied pi `settings.json`'s `defaultModel` come alive
+on launch. The precedence (`provider.rs::resolve` None-branch):
+
+1. **Saved settings default** (pi step 3): if `~/.rpi/agent/settings.json`
+   has `defaultProvider` = `"anthropic"` (or absent — v1 is anthropic-only)
+   **and** `defaultModel`, and that model is in the catalog **and authed**,
+   select it (honoring `defaultThinkingLevel`). This is the on-disk-parity
+   path — drop a pi `settings.json` at `~/.rpi/agent/` and the saved default
+   wins without `--model`.
+2. **Built-in default** `claude-sonnet-5` if it is *already authenticated*
+   (pi step 4 / `defaultModelPerProvider`; v1 keeps `claude-sonnet-5` vs
+   pi's `claude-opus-4-8` as a deliberate divergence).
+3. **First authenticated model** in the catalog (TS `availableModels[0]`).
+
+A model is "authenticated" when it carries an auth-owned header (a folded
+Bearer — see `Auth source → fold scope` below) or the provider holds a
+resolved `x-api-key` (the `--api-key`/`auth.json`/`ANTHROPIC_API_KEY` path).
 
 This matters for the **gateway-only** case: a `~/.rpi/models.json` with a
 single `authHeader:true` gateway and no Anthropic key. The gateway's Bearer is

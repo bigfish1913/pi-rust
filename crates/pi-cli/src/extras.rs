@@ -10,6 +10,8 @@ use std::sync::Arc;
 
 use rpi_tui::{Container, EarendilAnnouncementComponent, ArminComponent, Spacer};
 
+use crate::config;
+
 /// Push the armin XBM art block (+ a trailing spacer) into the chat transcript.
 /// Triggered by `/armin`.
 pub fn add_armin(chat: &Arc<Container>) {
@@ -18,7 +20,7 @@ pub fn add_armin(chat: &Arc<Container>) {
 }
 
 /// Push the earendil announcement block (+ a trailing spacer) into the chat
-/// transcript, and mark it seen via the `~/.rpi/.earendil_seen` sentinel.
+/// transcript, and mark it seen via the `~/.rpi/agent/.earendil_seen` sentinel.
 /// Triggered by `/earendil` or the first-launch gate.
 pub fn add_earendil(chat: &Arc<Container>) {
     chat.add_child(Arc::new(EarendilAnnouncementComponent::new()));
@@ -26,19 +28,14 @@ pub fn add_earendil(chat: &Arc<Container>) {
     let _ = mark_earendil_seen();
 }
 
-/// The `.rpi` config dir (shared with `rpi-cli`'s auth/config). Resolved the
-/// same way as `rpi-cli::config`/`auth`: `$HOME/.rpi` on Unix,
-/// `%USERPROFILE%\.rpi` on Windows.
-fn rpi_dir() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(std::path::PathBuf::from)
-        .map(|p| p.join(".rpi"))
-}
-
-/// Path of the "earendil announcement seen" sentinel.
+/// Path of the "earendil announcement seen" sentinel, under the agent dir
+/// (`~/.rpi/agent/.earendil_seen`). Delegates to [`config::agent_dir`] so an
+/// `RPI_CODING_AGENT_DIR` override is honored (the old `rpi_dir()` ignored it).
+/// Returns `None` when the home dir can't be resolved.
 pub fn earendil_seen_path() -> Option<std::path::PathBuf> {
-    rpi_dir().map(|d| d.join(".earendil_seen"))
+    config::agent_dir()
+        .ok()
+        .map(|d| d.join(".earendil_seen"))
 }
 
 /// Whether the earendil announcement has already been shown (sentinel present).
@@ -48,11 +45,11 @@ pub fn earendil_seen() -> bool {
         .unwrap_or(false)
 }
 
-/// Write the `~/.rpi/.earendil_seen` sentinel so the announcement isn't shown
-/// again on later launches. Best-effort: a missing `.rpi` dir is created.
+/// Write the `~/.rpi/agent/.earendil_seen` sentinel so the announcement isn't
+/// shown again on later launches. Best-effort: a missing agent dir is created.
 fn mark_earendil_seen() -> std::io::Result<()> {
     let path = earendil_seen_path().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "no home dir for .rpi")
+        std::io::Error::new(std::io::ErrorKind::NotFound, "no home dir for .rpi/agent")
     })?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -60,9 +57,12 @@ fn mark_earendil_seen() -> std::io::Result<()> {
     std::fs::write(&path, b"1")
 }
 
-/// Path of the "first-time setup done" sentinel.
+/// Path of the "first-time setup done" sentinel, under the agent dir
+/// (`~/.rpi/agent/.setup_done`).
 pub fn setup_done_path() -> Option<std::path::PathBuf> {
-    rpi_dir().map(|d| d.join(".setup_done"))
+    config::agent_dir()
+        .ok()
+        .map(|d| d.join(".setup_done"))
 }
 
 /// Whether first-time setup has already been completed (sentinel present).
@@ -75,7 +75,7 @@ pub fn setup_done() -> bool {
 /// Mark first-time setup complete (write the sentinel). Best-effort.
 pub fn mark_setup_done() -> std::io::Result<()> {
     let path = setup_done_path().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "no home dir for .rpi")
+        std::io::Error::new(std::io::ErrorKind::NotFound, "no home dir for .rpi/agent")
     })?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -138,14 +138,29 @@ mod tests {
     }
 
     #[test]
-    fn test_sentinel_paths_under_rpi() {
-        // The sentinel paths live under <home>/.rpi regardless of platform.
+    fn test_sentinel_paths_under_agent_dir() {
+        // The sentinels live directly under the resolved agent dir and honor
+        // the `RPI_CODING_AGENT_DIR` override (delegated to `config::agent_dir`).
+        // With the override set, agent_dir() returns the override verbatim, so
+        // the sentinel's parent must equal agent_dir() — not end in a literal
+        // "agent" segment (that only holds for the default nested path).
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        let prev = std::env::var_os(crate::config::CONFIG_DIR_ENV);
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, tmp.path());
+        let agent = crate::config::agent_dir().unwrap();
+        assert_eq!(agent.as_path(), tmp.path());
         if let Some(p) = earendil_seen_path() {
             assert!(p.ends_with(".earendil_seen"));
-            assert!(p.parent().map(|d| d.ends_with(".rpi")).unwrap_or(false));
+            assert_eq!(p.parent().unwrap(), agent);
         }
         if let Some(p) = setup_done_path() {
             assert!(p.ends_with(".setup_done"));
+            assert_eq!(p.parent().unwrap(), agent);
+        }
+        match prev {
+            Some(v) => std::env::set_var(crate::config::CONFIG_DIR_ENV, v),
+            None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
         }
     }
 }
