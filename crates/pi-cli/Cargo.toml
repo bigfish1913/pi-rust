@@ -17,7 +17,7 @@ rpi-ai = { workspace = true, features = ["providers"] }
 rpi-agent = { workspace = true }
 rpi-tools = { workspace = true }
 rpi-harness = { workspace = true }
-rpi-tui = { path = "../../crates/pi-tui" }
+rpi-tui = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }
