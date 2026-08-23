@@ -4,9 +4,14 @@
 //! `AgentHarnessOptions`, then `AgentHarness::create`.
 //!
 //! v1 scope cuts vs the TS SDK (tracked in `docs/m6-cli-open-questions.md`):
-//! - **No extension / skill / prompt-template / theme / context-file discovery.**
-//!   The harness `resources` stay empty; the system prompt is either the
-//!   caller's `--system-prompt` or the built-in default ([`default_system_prompt`]).
+//! - **Skill / prompt-template / context-file discovery IS wired**
+//!   (`--no-skills`/`-ns`, `--no-prompt-templates`/`-np`, `--no-context-files`/
+//!   `-nc` each suppress one channel; project `.pi/<sub>` + global
+//!   `agent_dir()<sub>` discovery with project-wins dedupe via
+//!   [`crate::resource_dirs`]; SYSTEM.md/APPEND_SYSTEM.md project-wins
+//!   precedence). **Extension/theme discovery and trust gating remain
+//!   deferred** — the harness `resources` carry skills+prompt-templates; the
+//!   system prompt adds `<project_context>` + `APPEND_SYSTEM.md` append text.
 //! - **No `--models` cycling, no `ModelRuntime`/multi-provider.** One model,
 //!   one provider (Anthropic), resolved up-front by [`crate::provider`].
 //! - **Built-in tools**: `read`, `bash`, `edit`, `write` plus the read-only
@@ -24,10 +29,12 @@ use std::sync::Arc;
 
 use rpi_ai::Provider;
 use rpi_harness::agent_harness::AgentHarness;
+use rpi_harness::context_files::{format_project_context, load_project_context_files};
 use rpi_harness::session::memory::{InMemorySessionStorage, SystemClock};
 use rpi_harness::session::session::DefaultIdGenerator;
 use rpi_harness::session::types::SessionMetadata;
 use rpi_harness::session::Session;
+use rpi_harness::system_prompt::compose_system_prompt;
 use rpi_harness::types::{
     AgentHarnessOptions, AgentHarnessResources, CompactionSettings, DrivingMode,
     HarnessToolExecution, HarnessTool, RetryPolicy, ToolReplay,
@@ -40,6 +47,11 @@ use rpi_tools::{
 
 use crate::args::Args;
 use crate::provider::ResolvedModel;
+use crate::resource_dirs::{
+    discover_append_system_prompt_file, discover_system_prompt_file,
+    load_prompt_templates_with_precedence, load_skills_with_precedence, prompt_template_dirs,
+    skill_dirs,
+};
 
 /// The built-in tool names v1 ships, in the order the TS `createCodingTools`
 /// registers them: the mutating set (`read`/`bash`/`edit`/`write`) followed by
@@ -147,7 +159,9 @@ pub async fn build(
     let env_dyn: Arc<dyn rpi_tools::ExecutionEnv> = env.clone();
     let mut_env: Arc<dyn rpi_tools::MutatingEnv> = env.clone();
     let _registry = Arc::new(MutationQueueRegistry::new());
-    let ctx = ExecutionToolContext::new(env_dyn, Some(mut_env));
+    // `env_dyn` is shared between the tool context (moved in) and the resource
+    // loaders below (borrowed); clone one branch so both hold a reference.
+    let ctx = ExecutionToolContext::new(env_dyn.clone(), Some(mut_env));
 
     let tools = build_tools(&ctx, args);
     let active = active_tool_names(&tools, args);
@@ -156,25 +170,170 @@ pub async fn build(
     let selection = select_session(args, cwd);
     let session = build_session(&selection, &cwd_str).await?;
 
-    // ---- System prompt ----
-    let base_prompt = args
-        .system_prompt
-        .clone()
-        .unwrap_or_else(|| default_system_prompt(&cwd_str));
-    let system_prompt = if args.append_system_prompt.is_empty() {
-        base_prompt
-    } else {
-        // Append each `--append-system-prompt` (text or, if it's a readable
-        // file path, the file contents — mirrors the TS behavior where the
-        // flag accepts either).
-        let mut out = base_prompt;
-        for extra in &args.append_system_prompt {
-            let text = read_append_target(extra).unwrap_or_else(|| extra.clone());
-            out.push_str("\n\n");
-            out.push_str(&text);
-        }
-        out
+    // ---- System prompt base (precedence: --system-prompt > SYSTEM.md > default) ----
+    // Mirrors pi `discoverSystemPromptFile` (`resource-loader.ts:1022-1034`):
+    // an explicit `--system-prompt` flag wins; otherwise a discovered
+    // `<cwd>/.pi/SYSTEM.md` (project) overrides `<agent_dir>/SYSTEM.md`
+    // (global); otherwise the built-in default. **Project-wins** — the same
+    // direction as skills/prompts precedence.
+    let base_prompt = match args.system_prompt.as_deref() {
+        Some(explicit) => explicit.to_string(),
+        None => match discover_system_prompt_file(cwd) {
+            Some(path) => std::fs::read_to_string(&path).unwrap_or_else(|_| {
+                default_system_prompt(&cwd_str)
+            }),
+            None => default_system_prompt(&cwd_str),
+        },
     };
+
+    // ---- Append-text sources (precedence: --append-system-prompt > APPEND_SYSTEM.md) ----
+    // Mirrors pi `appendSystemPrompt` (`resource-loader.ts:525-542`). Explicit
+    // `--append-system-prompt` flags are joined together; when none are given, a
+    // discovered `APPEND_SYSTEM.md` (project-wins over global) provides the
+    // append text. `--append-system-prompt` takes a value that may be a literal
+    // string OR a readable file path (mirrors TS `resolvePromptInput`).
+    let mut append_texts: Vec<String> = Vec::new();
+    for extra in &args.append_system_prompt {
+        let text = read_append_target(extra).unwrap_or_else(|| extra.clone());
+        append_texts.push(text);
+    }
+    if args.append_system_prompt.is_empty() {
+        if let Some(path) = discover_append_system_prompt_file(cwd) {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                append_texts.push(text);
+            }
+        }
+    }
+    let append_join = if append_texts.is_empty() {
+        None
+    } else {
+        Some(append_texts.join("\n\n"))
+    };
+
+    // ---- Resource discovery (skills + prompt-templates + context-files) ----
+    // The env is OS-backed, rooted at cwd. Each `--no-*` flag suppresses its
+    // channel independently (pi parity). Skills/prompts load project→global then
+    // dedupe first-wins-by-name (project wins). Context files walk
+    // global→ancestor(cwd→root), deepest-last (pi parity).
+    //
+    // **Trust gate (v1 divergence):** pi gates project `.pi/*` discovery on
+    // `isProjectTrusted()` (global resources are unconditional). rpi v1 has no
+    // trust prompt — project resources are discovered unconditionally (a copied
+    // `.pi/` drops in and works). Full trust gating is deferred.
+    let agent_dir = crate::config::agent_dir().ok();
+
+    let mut skills: Vec<rpi_harness::types::Skill> = Vec::new();
+    let mut skill_diags: Vec<rpi_harness::skills::SkillDiagnostic> = Vec::new();
+    if !args.no_skills {
+        let dirs = skill_dirs(cwd);
+        let result = load_skills_with_precedence(&env_dyn, &dirs).await;
+        skills = result.skills;
+        skill_diags = result.diagnostics;
+    }
+
+    let mut prompt_templates: Vec<rpi_harness::types::PromptTemplate> = Vec::new();
+    let mut prompt_diags: Vec<rpi_harness::prompt_templates::PromptTemplateDiagnostic> = Vec::new();
+    if !args.no_prompt_templates {
+        let dirs = prompt_template_dirs(cwd);
+        let result = load_prompt_templates_with_precedence(&env_dyn, &dirs).await;
+        prompt_templates = result.prompt_templates;
+        prompt_diags = result.diagnostics;
+    }
+
+    let context_block = if args.no_context_files {
+        String::new()
+    } else {
+        // `load_project_context_files` walks the global agentDir first then
+        // ancestor-walks cwd→root (deepest last). It needs a real agent_dir; if
+        // none is resolvable, pass the cwd dir so only the ancestor-walk runs
+        // (the global step returns None anyway).
+        let agent_dir_path = agent_dir.clone().unwrap_or_else(|| cwd.to_path_buf());
+        let files = load_project_context_files(&env_dyn, cwd, &agent_dir_path).await;
+        format_project_context(&files)
+    };
+
+    // Surface resource-discovery diagnostics as startup warnings (verbose-only).
+    if args.verbose {
+        for d in &skill_diags {
+            eprintln!("warning: skill {} ({}): {}", d.path, d.code.as_str(), d.message);
+        }
+        for d in &prompt_diags {
+            eprintln!(
+                "warning: prompt template {} ({}): {}",
+                d.path,
+                d.code.as_str(),
+                d.message
+            );
+        }
+    }
+
+    // ---- Compose the full system prompt ----
+    // Order mirrors pi `buildSystemPrompt` (`system-prompt.ts:28-72`):
+    // base → append → context → skills. The skills listing is the harness's own
+    // section: `AgentHarness::compose_prompt` appends `<available_skills>` (gated
+    // on the `read` tool + `disable_model_invocation`, applied inside
+    // `format_skills_for_system_prompt`). So we pass None for skills here (the
+    // harness adds the listing itself) and fold only base+append+context into
+    // the prompt we hand the harness.
+    let system_prompt = compose_system_prompt(
+        Some(&base_prompt),
+        &[], // skills: harness appends the listing itself
+        if context_block.is_empty() { None } else { Some(&context_block) },
+        append_join.as_deref(),
+    );
+
+    // ---- Debug: dump the resolved system-prompt sections (verification) ----
+    // A verification affordance for Part-A resource discovery: prints the
+    // composed sections + resource counts to stderr so a smoke can confirm
+    // `<available_skills>` + `<project_context>` + appended text reached the
+    // prompt without parsing a provider round-trip. The harness composes the
+    // final prompt (base → append → context → skills); here we print the
+    // pre-harness sections (the harness adds the skills listing itself, gated
+    // on `read` + `disable_model_invocation`).
+    if args.debug_system_prompt {
+        eprintln!("=== --debug-system-prompt ===");
+        let base_src = if args.system_prompt.is_some() {
+            "--system-prompt"
+        } else if discover_system_prompt_file(cwd).is_some() {
+            "SYSTEM.md"
+        } else {
+            "default"
+        };
+        eprintln!("[base source: {base_src}]");
+        eprintln!("--- base ---\n{base_prompt}");
+        if let Some(append) = append_join.as_deref() {
+            eprintln!("--- append ---\n{append}");
+        } else {
+            eprintln!("--- append: (none) ---");
+        }
+        if context_block.is_empty() {
+            eprintln!("--- context: (none) ---");
+        } else {
+            eprintln!("--- context ---{context_block}");
+        }
+        let visible_skills = skills
+            .iter()
+            .filter(|s| s.disable_model_invocation != Some(true))
+            .count();
+        eprintln!(
+            "--- skills: {} loaded ({} model-visible, {} hidden) ---",
+            skills.len(),
+            visible_skills,
+            skills.len() - visible_skills
+        );
+        for s in &skills {
+            let hidden = if s.disable_model_invocation == Some(true) { " [hidden]" } else { "" };
+            eprintln!("    {}{hidden} — {}", s.name, s.description);
+        }
+        eprintln!("--- prompt templates: {} ---", prompt_templates.len());
+        for t in &prompt_templates {
+            eprintln!("    /{}", t.name);
+        }
+        eprintln!(
+            "--- final composed base+append+context (skills listing added by harness) ---\n{system_prompt}"
+        );
+        eprintln!("=== end --debug-system-prompt ===");
+    }
 
     // ---- Options ----
     // Install a BroadcastEmitter so the caller (the interactive TUI) can drain
@@ -189,7 +348,14 @@ pub async fn build(
         active_tool_names: active,
         tools,
         system_prompt: Some(system_prompt),
-        resources: AgentHarnessResources::empty(),
+        resources: AgentHarnessResources {
+            skills: if skills.is_empty() { None } else { Some(skills) },
+            prompt_templates: if prompt_templates.is_empty() {
+                None
+            } else {
+                Some(prompt_templates)
+            },
+        },
         stream_options: Default::default(),
         retry: RetryPolicy::default(),
         compaction: CompactionSettings::default(),

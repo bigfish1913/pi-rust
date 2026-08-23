@@ -259,6 +259,19 @@ impl SlashCommandAutocompleteProvider {
         Self { commands }
     }
 
+    /// Create with default commands plus a set of dynamically-discovered slash
+    /// commands. The discovered commands (e.g. prompt-template names exposed as
+    /// `/expand`-style `/`-prefixed entries) are appended to the built-in set so
+    /// the built-in names win on a fuzzy tie and the discovered names appear as
+    /// additional suggestions. Mirrors pi's behavior where prompt-template
+    /// invocations (`/<name>`) surface alongside built-in slash commands in
+    /// `/`-autocomplete (`agent-session.ts:1124` + `expandPromptTemplate`).
+    pub fn with_commands(discovered: Vec<SlashCommand>) -> Self {
+        let mut commands = Self::with_default_commands().commands;
+        commands.extend(discovered);
+        Self { commands }
+    }
+
     /// Create with default commands.
     pub fn with_default_commands() -> Self {
         Self::new(vec![
@@ -280,7 +293,7 @@ impl SlashCommandAutocompleteProvider {
             },
             SlashCommand {
                 name: "/context".to_string(),
-                description: "Manage context files".to_string(),
+                description: "List discovered context files, skills, and prompt templates".to_string(),
             },
         ])
     }

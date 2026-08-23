@@ -51,6 +51,7 @@ pub mod extras;
 pub mod interactive_tui;
 pub mod modes;
 pub mod provider;
+pub mod resource_dirs;
 pub mod session;
 pub mod settings;
 

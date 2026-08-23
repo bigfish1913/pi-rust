@@ -67,9 +67,31 @@ pub struct Args {
     pub no_tools: bool,
     pub no_builtin_tools: bool,
 
+    /// `--no-skills`/`-ns`: skip skill discovery + the `<available_skills>`
+    /// system-prompt listing.
+    pub no_skills: bool,
+    /// `--no-prompt-templates`/`-np`: skip prompt-template discovery (templates
+    /// are on-demand only; this suppresses populating the resource registry).
+    pub no_prompt_templates: bool,
+    /// `--no-context-files`/`-nc`: skip context-file (`AGENTS.md`/`CLAUDE.md`)
+    /// discovery + the `<project_context>` system-prompt block.
+    pub no_context_files: bool,
+    /// `--no-extensions`/`-ne`: recognized-but-deferred (Part B). When the plugin
+    /// system lands this gates extension loading; until then it's honored as a
+    /// no-op acceptance (no discovery to skip).
+    pub no_extensions: bool,
+
     pub verbose: bool,
     pub help: bool,
     pub version: bool,
+
+    /// `--debug-system-prompt`: print the resolved system-prompt sections
+    /// (base, append, context, skills listing) + resource counts to stderr at
+    /// harness build time, then proceed normally. A verification affordance for
+    /// resource-discovery (Part A) — lets a smoke confirm `<available_skills>` +
+    /// `<project_context>` + appended text reached the prompt without a full
+    /// round-trip parse. Mirrors the plan's "add --debug-system-prompt if absent".
+    pub debug_system_prompt: bool,
 
     /// Positional prompt text (one or more messages). Mirrors TS `messages`.
     pub messages: Vec<String>,
@@ -196,7 +218,12 @@ pub fn parse_args(args: &[String]) -> Args {
             "--no-session" => result.no_session = true,
             "--no-tools" | "-nt" => result.no_tools = true,
             "--no-builtin-tools" | "-nbt" => result.no_builtin_tools = true,
+            "--no-skills" | "-ns" => result.no_skills = true,
+            "--no-prompt-templates" | "-np" => result.no_prompt_templates = true,
+            "--no-context-files" | "-nc" => result.no_context_files = true,
+            "--no-extensions" | "-ne" => result.no_extensions = true,
             "--verbose" => result.verbose = true,
+            "--debug-system-prompt" => result.debug_system_prompt = true,
             "--provider" => result.provider = take_value(&mut result, "--provider"),
             "--model" => result.model = take_value(&mut result, "--model"),
             "--api-key" => result.api_key = take_value(&mut result, "--api-key"),
@@ -238,6 +265,13 @@ pub fn parse_args(args: &[String]) -> Args {
             // ---- Recognized-but-ignored v1 scope cuts (warn, don't error) ----
             // `flag_key` has already had any `=value` peeled, so these match the
             // bare flag name even when the user wrote `--offline=1`.
+            //
+            // NOTE: `--no-skills`/`-ns`, `--no-prompt-templates`/`-np`,
+            // `--no-context-files`/`-nc`, and `--no-extensions`/`-ne` are now
+            // HONORED (parsed into real fields above), so they no longer reach
+            // this arm. The skill/prompt/context flags gate resource discovery
+            // (`session.rs`); `--no-extensions` is a no-op acceptance until the
+            // Part-B plugin system lands.
             other
                 if matches!(
                     other,
@@ -247,11 +281,7 @@ pub fn parse_args(args: &[String]) -> Args {
                         | "--tui-mode"
                         | "--approve" | "-a"
                         | "--no-approve" | "-na"
-                        | "--no-extensions" | "-ne"
-                        | "--no-skills" | "-ns"
-                        | "--no-prompt-templates" | "-np"
                         | "--no-themes"
-                        | "--no-context-files" | "-nc"
                 ) =>
             {
                 // Consume a value if the next token isn't a flag (so
@@ -397,6 +427,11 @@ pub fn print_help() {
   --exclude-tools, -xt <list>    Comma-separated denylist of tool names to disable
   --no-tools, -nt                Disable all tools
   --no-builtin-tools, -nbt       Disable the built-in tools (read, bash, edit, write, grep, find, ls)
+  --no-skills, -ns               Skip skill discovery (no <available_skills> block)
+  --no-prompt-templates, -np     Skip prompt-template discovery (/expand templates)
+  --no-context-files, -nc        Skip AGENTS.md/CLAUDE.md discovery (no <project_context>)
+  --no-extensions, -ne           Skip extension/plugin loading (deferred v1: no-op until plugin system lands)
+  --debug-system-prompt          Print the resolved system-prompt sections to stderr (verification)
   --verbose                      Show startup warnings (e.g. ignored flags)
   --help, -h                     Show this help
   --version, -v                  Show version
@@ -534,6 +569,38 @@ mod tests {
         assert!(!a.ignored.is_empty());
         // The value is consumed, not read as a message:
         assert!(a.messages.is_empty());
+    }
+
+    #[test]
+    fn no_skills_flag_honored() {
+        let a = parse_args(&s(&["-ns"]));
+        assert!(a.errors.is_empty());
+        assert!(a.no_skills);
+        // Honored flags do NOT also warn-ignore themselves.
+        assert!(a.ignored.is_empty());
+    }
+
+    #[test]
+    fn no_prompt_templates_flag_honored() {
+        let a = parse_args(&s(&["--no-prompt-templates"]));
+        assert!(a.no_prompt_templates);
+        assert!(a.ignored.is_empty());
+    }
+
+    #[test]
+    fn no_context_files_flag_honored() {
+        let a = parse_args(&s(&["-nc"]));
+        assert!(a.no_context_files);
+        assert!(a.ignored.is_empty());
+    }
+
+    #[test]
+    fn no_extensions_flag_honored() {
+        // `--no-extensions` is now parsed (no-op acceptance until Part B), no
+        // longer a warn-ignored v1 scope cut.
+        let a = parse_args(&s(&["--no-extensions"]));
+        assert!(a.no_extensions);
+        assert!(a.ignored.is_empty());
     }
 
     #[test]

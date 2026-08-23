@@ -90,6 +90,10 @@ enum SlashCommandResult {
     Compact,
     /// Copy the last assistant message to the clipboard.
     Copy,
+    /// Show the discovered resources panel: loaded context files, skills, and
+    /// prompt templates (Part A `/context`). Resolved here (not in
+    /// `handle_slash_command`) because it needs the harness resources.
+    Context,
     /// Not supported in this v1 build (carries the command for the message).
     Unsupported(String),
 }
@@ -122,6 +126,10 @@ fn handle_slash_command(text: &str) -> SlashCommandResult {
         "/theme" => SlashCommandResult::SelectTheme,
         "/compact" => SlashCommandResult::Compact,
         "/copy" => SlashCommandResult::Copy,
+        // `/context` lists discovered context files, skills, and prompt
+        // templates. Resolved in the submit handler (needs the resources
+        // snapshot), so it just signals the intent here.
+        "/context" => SlashCommandResult::Context,
         // `/name` is recognized-v1 but inert (no session-renaming surface yet).
         "/name" => SlashCommandResult::Unsupported("/name".to_string()),
         // The remaining TS builtins are out of v1 scope.
@@ -473,11 +481,43 @@ pub async fn interactive_tui(
     let loader = Arc::new(Loader::with_text("Working…"));
 
     // ---- Autocomplete (slash commands + @file paths, rooted at cwd) ----
+    // Prompt templates discovered at session build (Part A2) are surfaced as
+    // `/`-prefixed entries alongside the built-in slash commands: typing
+    // `/<name>` in the editor expands the template (mirrors pi
+    // `expandPromptTemplate`, `agent-session.ts:1124`). The description carries
+    // the template's frontmatter description (or a fallback) so the autocomplete
+    // popover shows what each template does.
+    //
+    // We snapshot the full resources once (skills + prompt-templates): the
+    // autocomplete builder consumes the templates, and the `/context` command
+    // (fired from the blocking submit handler, which can't `.await`) reads the
+    // snapshot to render the discovered-resources panel without touching the
+    // harness async accessor.
+    let resources_snapshot = harness.get_resources().await.unwrap_or_default();
+    let template_slash_commands: Vec<SlashCommand> = resources_snapshot
+        .prompt_templates
+        .clone()
+        .unwrap_or_default()
+        .iter()
+        .map(|t| SlashCommand {
+            name: format!("/{}", t.name),
+            description: t
+                .description
+                .clone()
+                .unwrap_or_else(|| "Expand prompt template".to_string()),
+        })
+        .collect();
+    let resources_arc: Arc<rpi_harness::types::AgentHarnessResources> = Arc::new(resources_snapshot);
+    // Merge the v1 built-in slash commands with the discovered prompt-template
+    // commands (templates surface as `/<name>`). Built-ins first so they win on
+    // a fuzzy tie.
+    let mut all_slash_commands = v1_slash_commands();
+    all_slash_commands.extend(template_slash_commands);
     let autocomplete = AutocompleteManager::new();
     {
         let mut combined = CombinedAutocompleteProvider::new();
         combined.add_provider(Arc::new(SlashCommandAutocompleteProvider::new(
-            v1_slash_commands(),
+            all_slash_commands,
         )));
         combined.add_provider(Arc::new(FilePathAutocompleteProvider::with_root(cwd.clone())));
         autocomplete.set_provider(Arc::new(combined));
@@ -575,6 +615,10 @@ pub async fn interactive_tui(
     let state_for_cb = state.clone();
     let editor_for_cb = editor.clone();
     let lane_for_cb = lane.clone();
+    // The resources snapshot (skills + prompt-templates) for the `/context`
+    // command — the blocking submit handler can't `.await` `get_resources()`,
+    // so it reads this pre-captured clone. Built once above from the harness.
+    let resources_for_cb = resources_arc.clone();
     // Clone the shared selector inputs for the closure; the originals stay
     // available for the key-dispatch loop below (Ctrl+L opens /model too).
     let editor_container_for_cb = editor_container.clone();
@@ -680,6 +724,10 @@ pub async fn interactive_tui(
                 }
                 SlashCommandResult::Copy => {
                     let _ = tx_for_cb.send(TuiMessage::Copy);
+                }
+                SlashCommandResult::Context => {
+                    show_context_panel(&chat_for_cb, &resources_for_cb);
+                    tui_for_cb.request_render(false);
                 }
                 SlashCommandResult::Unsupported(cmd) => {
                     add_note_message(
@@ -2125,6 +2173,68 @@ fn add_error_message(container: &Arc<Container>, text: &str) {
 /// Add a neutral note (e.g. unsupported-command message) to the chat container.
 fn add_note_message(container: &Arc<Container>, text: &str) {
     container.add_child(Arc::new(Text::new(format!("ℹ️  {text}"), 1, 0)));
+    container.add_child(Arc::new(Spacer::new(1)));
+}
+
+/// Render the `/context` panel: a transcript message listing the discovered
+/// context files, skills, and prompt templates loaded for this session
+/// (Part A resource discovery). Reads the harness resources snapshot captured
+/// at TUI startup (the blocking submit handler can't `await get_resources()`.
+///
+/// Mirrors pi's context-panel intent (pi surfaces loaded resources on startup +
+/// via `/reload`); here it's a transcript note rather than an overlay since the
+/// resource set is session-static between `/reload`s (deferred).
+fn show_context_panel(
+    chat: &Arc<Container>,
+    resources: &Arc<rpi_harness::types::AgentHarnessResources>,
+) {
+    let skills = resources.skills.as_deref().unwrap_or(&[]);
+    let templates = resources.prompt_templates.as_deref().unwrap_or(&[]);
+    let mut lines: Vec<String> = Vec::new();
+    lines.push("📂 Discovered resources for this session:".into());
+
+    if skills.is_empty() {
+        lines.push("  Skills: (none discovered — create .pi/skills/ or ~/.rpi/agent/skills/)".into());
+    } else {
+        lines.push(format!("  Skills ({}):", skills.len()));
+        for s in skills {
+            let marker = if s.disable_model_invocation == Some(true) {
+                " [hidden]"
+            } else {
+                ""
+            };
+            let desc: String = s.description.chars().take(72).collect();
+            lines.push(format!("    • {}{marker} — {desc}", s.name));
+        }
+    }
+
+    if templates.is_empty() {
+        lines.push("  Prompt templates: (none — create .pi/prompts/ or ~/.rpi/agent/prompts/)".into());
+    } else {
+        lines.push(format!("  Prompt templates ({}):", templates.len()));
+        for t in templates {
+            let desc = t
+                .description
+                .as_deref()
+                .unwrap_or("(no description)")
+                .chars()
+                .take(72)
+                .collect::<String>();
+            lines.push(format!("    • /{} — {desc}", t.name));
+        }
+    }
+    lines.push("  Context files (AGENTS.md/CLAUDE.md) are injected from the ancestor walk;".into());
+    lines.push("  SYSTEM.md / APPEND_SYSTEM.md feed the base + append prompt sections.".into());
+    lines.push("  Use --no-skills/-ns, --no-prompt-templates/-np, --no-context-files/-nc to suppress.".into());
+    let body = lines.join("\n");
+    container_note_block(chat, &body);
+}
+
+/// Append a multi-line neutral note (header line + body) to the chat container.
+fn container_note_block(container: &Arc<Container>, body: &str) {
+    for line in body.lines() {
+        container.add_child(Arc::new(Text::new(line.to_string(), 1, 0)));
+    }
     container.add_child(Arc::new(Spacer::new(1)));
 }
 

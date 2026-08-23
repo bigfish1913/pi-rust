@@ -7,6 +7,7 @@
 //! `messages`, `events`, `skills`, `agent_harness`) are added as M5 progresses.
 
 pub mod compaction;
+pub mod context_files;
 pub mod error;
 pub mod events;
 pub mod frontmatter;

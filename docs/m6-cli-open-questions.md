@@ -406,26 +406,65 @@ already accepts `Vec<ImageContent>`; this is purely CLI-side wiring.
 
 ---
 
-## 8. System prompt is a condensed default; no skills/templates/resources
+## 8. ✅ RESOLVED — Skills / prompt-templates / context-files discovery wired (extensions + themes still deferred)
 
-**Where:** `crates/pi-cli/src/session.rs::default_system_prompt` + the
-`AgentHarnessResources::empty()` in `build`.
+**Where:** `crates/pi-cli/src/session.rs::build` + `crates/pi-cli/src/resource_dirs.rs`
++ `crates/pi-harness/src/context_files.rs` + `crates/pi-harness/src/system_prompt.rs`.
 
-**What.** TS composes the system prompt from a base prompt + discovered
-skills (`<available_skills>`) + context files + extension contributions. v1
-uses a **condensed** port of the TS base prompt (role + tools + guidelines +
-cwd), with no skills/templates/context-file machinery. `--system-prompt`
-replaces it; `--append-system-prompt` (repeatable, text-or-file) appends.
+**Status (Part A, done).** Resource discovery is wired end-to-end:
+- **Skills**: discovered from `<cwd>/.pi/skills` then `agent_dir()/skills`,
+  project-wins-first dedupe (`resource_dirs::dedupe_skills`, mirrors pi
+  `addSkills` collision semantics). The `<available_skills>` listing is injected
+  into the system prompt by `AgentHarness::compose_prompt`, gated on the `read`
+  tool being active AND `disable_model_invocation` filtering (applied inside
+  `format_skills_for_system_prompt`, mirroring pi `skills.ts:335-336`).
+- **Prompt-templates**: discovered from `<cwd>/.pi/prompts` then
+  `agent_dir()/prompts`, project-wins-first dedupe. On-demand only (never in the
+  system prompt); surfaced as `/<name>` slash commands in the TUI autocomplete +
+  expandable via the harness `prompt_from_template` lane call. `/context` lists
+  them.
+- **Context-files**: the new `context_files.rs` loader mirrors pi
+  `loadProjectContextFiles` (AGENTS-first candidates `["AGENTS.override.md",
+  "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"]`, global agentDir first
+  then ancestor-walk cwd→root with the **deepest (cwd) file concatenated last**).
+  Rendered as a `<project_context>` block by `format_project_context`.
+- **SYSTEM.md / APPEND_SYSTEM.md**: project `<cwd>/.pi/SYSTEM.md` overrides
+  global `<agent_dir>/SYSTEM.md` (mirrors pi `discoverSystemPromptFile`); the
+  same precedence for `APPEND_SYSTEM.md`. Explicit `--system-prompt` wins over
+  SYSTEM.md; `--append-system-prompt` wins over APPEND_SYSTEM.md (pi
+  `appendSystemPrompt`). System-prompt order mirrors pi `buildSystemPrompt`:
+  base → append → context → skills.
+- **Flags**: `--no-skills`/`-ns`, `--no-prompt-templates`/`-np`,
+  `--no-context-files`/`-nc` each suppress one channel independently;
+  `--no-extensions`/`-ne` is parsed (no-op until Part B).
+- **`/context` (TUI)**: lists discovered skills, prompt templates, and a note on
+  context/system/append sources (`interactive_tui::show_context_panel`).
 
-**Divergence.** The library APIs for skills (`pi_harness::skills`),
-prompt-templates (`pi_harness::prompt_templates`), and the system-prompt
-composer (`compose_system_prompt`) **already exist and are tested** — the CLI
-just doesn't discover `.md` files from disk into `AgentHarnessResources`. So
-the gap is discovery + wiring, not capability.
+**Divergences (documented, deferred).**
+- **Trust gating**: pi gates project `.pi/*` SYSTEM.md/APPEND_SYSTEM.md (+ some
+  resources) behind `isProjectTrusted()`; rpi v1 has no trust prompt, so project
+  resources are read unconditionally (a copied `.pi/` drops in and works). Full
+  trust gating deferred.
+- **Discovery roots**: pi reads 4 roots (`.pi/skills`, `.agents/skills`,
+  `~/.pi/agent/skills`, `~/.agents/skills`) + installed packages; rpi v1 mirrors
+  the two primary (`<cwd>/.pi/<sub>` + `agent_dir()/<sub>`). `.agents/*` + package
+  skills/prompts deferred.
+- **Worktree shadowed-context-file dedup** (`findShadowedContextFile`,
+  `.reference/.../resource-loader.ts:100-116`): deferred (git-layout edge case).
+- **Full structured collision diagnostics**: pi carries `winnerPath`/`loserPath`
+  on skill collisions; rpi v1 encodes collisions as an `InvalidMetadata`/
+  `ParseFailed` diagnostic with a descriptive message naming both paths (or the
+  template name — `PromptTemplate` carries no file path). Structured fields
+  deferred.
+- **Skill validation parity**: pi drops empty-description skills + warns on
+  invalid name/description length (`skills.ts:290-307`). rpi's per-dir loader
+  already drops missing-description skills; the name/desc-length warning is
+  flagged as a gap to mirror (or defer with doc).
 
-**To revisit.** Port the TS resource discovery (`ResourceLoader`):
-`.pi/skills/**`, `.pi/prompts/**`, context files. Feed them into
-`AgentHarnessResources` and let `compose_system_prompt` do the composition.
+**Still deferred (Part B + later):** extension/plugin discovery (`--extensions-dir`,
+`.pi/extensions`, `--extension`/`-e`), theme discovery (`--theme`,
+`--no-themes`), `--skill`/`--prompt-template`/`--models` cycling, session
+restore (`-c`/`-r`/`--session`). These remain §1–§7 open questions below.
 
 ---
 

@@ -388,6 +388,21 @@ impl AgentHarness {
         Ok(())
     }
 
+    /// `getResources()`. Mirrors TS `AgentHarness.getResources`
+    /// (`agent-harness.ts:460-464`) — returns a defensive clone of the
+    /// resources (skills + prompt-templates) the harness was built with.
+    /// Callers (e.g. the interactive TUI's `/`-autocomplete, which lists
+    /// prompt-template names alongside built-in slash commands) read the
+    /// discovered set through this accessor without touching the lock-held
+    /// inner directly.
+    pub async fn get_resources(&self) -> HarnessResult<AgentHarnessResources> {
+        let inner = self.inner.lock().unwrap();
+        if inner.closed {
+            return Err(HarnessError::closed());
+        }
+        Ok(inner.resources.clone())
+    }
+
     // -- private helpers ----------------------------------------------------
 
     /// Reject if closed or if `main` already has an active operation. On
@@ -566,10 +581,30 @@ impl AgentHarness {
             .collect()
     }
 
-    /// Compose the system prompt: base prompt + skills listing.
-    fn compose_prompt(base: Option<&str>, resources: &AgentHarnessResources) -> String {
-        let skills: &[Skill] = resources.skills.as_deref().unwrap_or(&[]);
-        compose_system_prompt(base, skills)
+    /// Compose the system prompt: base prompt + skills listing. The base prompt
+    /// the CLI hands the harness already carries the `append` + `context`
+    /// sections (folded in by `session.rs` via `compose_system_prompt` before
+    /// `AgentHarness::create`), so here the harness only appends the
+    /// `<available_skills>` listing — the one section it owns itself.
+    ///
+    /// **Read-tool gate** (pi `skills.ts:335-336`): the skills listing is
+    /// injected only when the `read` tool is in `active_tool_names`. The model
+    /// needs `read` to load a skill's full file on invocation; without it, the
+    /// listing would advertise skills the model cannot act on, so pi suppresses
+    /// it. The `disable_model_invocation` filter is applied inside
+    /// `format_skills_for_system_prompt`.
+    fn compose_prompt(
+        base: Option<&str>,
+        resources: &AgentHarnessResources,
+        active_tool_names: &[String],
+    ) -> String {
+        let all_skills: &[Skill] = resources.skills.as_deref().unwrap_or(&[]);
+        let skills: &[Skill] = if active_tool_names.iter().any(|n| n == "read") {
+            all_skills
+        } else {
+            &[]
+        };
+        compose_system_prompt(base, skills, None, None)
     }
 
     /// Persist a `Compaction` entry and return the stamped `Entry`.
@@ -887,7 +922,11 @@ impl AgentHarness {
         let path = self.branch_path_oldest_first().await?;
         let build_opts = Self::build_opts(&snap.entry_projectors);
         let ctx = build_session_context(&path, &build_opts);
-        let system_prompt = Self::compose_prompt(snap.system_prompt.as_deref(), &snap.resources);
+        let system_prompt = Self::compose_prompt(
+            snap.system_prompt.as_deref(),
+            &snap.resources,
+            &snap.active_tool_names,
+        );
         let tools = Self::active_tools(&snap.tools, &snap.active_tool_names);
 
         let agent_context = AgentContext {
