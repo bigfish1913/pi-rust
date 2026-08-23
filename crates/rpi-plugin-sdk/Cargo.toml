@@ -1,0 +1,23 @@
+[package]
+name = "rpi-plugin-sdk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Stable #[repr(C)] ABI contract for rpi Rust-native (cdylib) plugins — no rpi-* deps"
+readme = "../../README.md"
+keywords = ["agent", "llm", "ai", "plugin", "ffi"]
+categories = ["api-bindings", "development-tools::ffi"]
+
+[dependencies]
+# Core FFI types are zero-dep (std only). JSON round-trip helpers for
+# `StableJsonValue` / `StableToolSchema.parameters` pull serde_json, gated behind
+# the `json` feature (default on). A plugin that wants to avoid the dep can
+# disable default features and do its own (de)serialization.
+serde_json = { workspace = true, optional = true }
+
+[features]
+default = ["json"]
+json = ["dep:serde_json"]
