@@ -106,6 +106,17 @@ pub struct ResolvedModel {
     /// Effective thinking level (the requested level, before model-clamp — the
     /// harness/provider clamps to the model's supported set).
     pub thinking_level: ThinkingLevel,
+    /// Whether the x-api-key path was taken (`--api-key` / auth.json /
+    /// `ANTHROPIC_API_KEY` ⇒ the provider carries a default key that
+    /// `assemble_headers` attaches to EVERY model out-of-band). When `false`,
+    /// auth rides only on model headers (Bearer fold / models.json `apiKey`
+    /// fold) — so only header-authed models can actually run.
+    ///
+    /// Kept so [`available_catalog`] can reproduce the auth-filtered snapshot
+    /// (pi `getAvailableSnapshot`: `available = all.filter(m =>
+    /// configuredProviders.has(m.provider))`) and surface only models that
+    /// won't fail at request time with "No API key for provider".
+    pub has_provider_key: bool,
     /// Saved theme name from `~/.rpi/agent/settings.json`, if any. Best-effort:
     /// the TUI applies it at startup when it matches a known preset
     /// (dark/light/monochrome); otherwise ignored.
@@ -118,6 +129,7 @@ impl std::fmt::Debug for ResolvedModel {
             .field("provider", &self.provider.id())
             .field("model", &self.model.id)
             .field("thinking_level", &self.thinking_level)
+            .field("has_provider_key", &self.has_provider_key)
             .field("theme", &self.theme)
             .finish()
     }
@@ -224,34 +236,25 @@ pub fn resolve(
             }
         }
     }
-    // 3a. ~/.rpi/models.json provider with authHeader:true + apiKey → Bearer.
-    //     The first anthropic-compatible provider that declares a static gateway
-    //     key supplies the Bearer token (v1 routes through one provider, so the
-    //     first match is authoritative). Mirrors upstream's `authHeader` handling
-    //     where the resolved apiKey is wrapped as `Authorization: Bearer`. Mark
-    //     this Bearer as endpoint-specific so the fold below targets only the
-    //     gateway's models (NOT the built-in Anthropic catalog).
-    if provider_key.is_none() && auth_headers.is_empty() {
-        if let Some(tok) = models_json_bearer_token(&models_cfg) {
-            auth_headers.insert("authorization".to_string(), format!("Bearer {tok}"));
-            auth_from_models_json = true;
-        }
-    }
-    // 3b. ~/.rpi/models.json provider with a bare apiKey (no authHeader) →
-    //     x-api-key. Mirrors upstream `composeApiKeyAuth` (provider-composer.ts
-    //     :349-354): a provider's configured `apiKey` without `authHeader` is
-    //     routed as `x-api-key` for THAT provider's models. Endpoint-specific —
-    //     the resolved key folds onto gateway model headers as `x-api-key` (NOT
-    //     set as the global `provider_key`, which `assemble_headers` would stamp
-    //     onto every model incl. built-in claude-* → 401 to a gateway key sent
-    //     to api.anthropic.com). `has_header_auth` treats a model-header
-    //     `x-api-key` as owned auth, authenticating the gateway models the same
-    //     way the Bearer fold does.
-    if provider_key.is_none() && auth_headers.is_empty() {
-        if let Some(tok) = models_json_api_key(&models_cfg) {
-            auth_headers.insert("x-api-key".to_string(), tok);
-            auth_from_models_json = true;
-        }
+    // 3. ~/.rpi/models.json provider keys — ONE auth entry PER provider, keyed
+    //    by that provider's `base_url`. Each provider's credential folds onto
+    //    ITS OWN models only (upstream `composeApiKeyAuth` is per-provider:
+    //    provider-composer.ts routes a provider's `apiKey` as the auth for
+    //    that provider's models). The old code collapsed this to a single
+    //    "first provider's key" and stamped it onto EVERY gateway model — with
+    //    two gateways the 2nd gateway's models received the 1st gateway's key
+    //    → 401 at request time. This is the multi-gateway case this
+    //    restructure fixes. Both models.json auth shapes are covered: an
+    //    `authHeader:true` key becomes `Authorization: Bearer`, a bare
+    //    `apiKey` becomes `x-api-key` (`composeApiKeyAuth` arm).
+    let models_json_auth = models_json_provider_auth(&models_cfg);
+    if provider_key.is_none() && auth_headers.is_empty() && !models_json_auth.is_empty() {
+        // The models.json file alone is a complete third-party-endpoint setup:
+        // each gateway model is stamped with its own provider's credential in
+        // the fold below, so auth is satisfied without any env var / stored
+        // cred / `--api-key`. Mark the auth as endpoint-specific so the fold
+        // targets gateway models only (NOT the built-in Anthropic catalog).
+        auth_from_models_json = true;
     }
     // 4. ANTHROPIC_AUTH_TOKEN → Authorization: Bearer (third-party gateways).
     if provider_key.is_none() && auth_headers.is_empty() {
@@ -270,7 +273,10 @@ pub fn resolve(
         }
     }
     // 6. Nothing → clear error listing every accepted source.
-    if provider_key.is_none() && auth_headers.is_empty() {
+    //    `models_json_auth` counts as a source: per-provider gateway keys were
+    //    moved out of the single `auth_headers` map (they now ride on each
+    //    gateway model's own headers), so the gate must see them here.
+    if provider_key.is_none() && auth_headers.is_empty() && models_json_auth.is_empty() {
         return Err(ResolveError::NoApiKey { hint: NO_API_KEY_HINT });
     }
 
@@ -338,18 +344,28 @@ pub fn resolve(
                 headers.insert(k.clone(), v.clone());
             }
         }
-    } else if !auth_headers.is_empty() {
-        // models.json gateway header auth (Bearer or x-api-key): endpoint-
-        // specific — gateway models only.
+    } else if auth_from_models_json {
+        // models.json gateway auth: per-provider — each gateway model carries
+        // the credential of the models.json provider whose `base_url` matches
+        // its own (the `composeApiKeyAuth` per-provider contract). With a
+        // `--base-url`/`ANTHROPIC_BASE_URL` override (single endpoint) fall
+        // back to the first keyed provider for all gateway models.
         let override_active = base_url_override.is_some();
         for m in catalog.iter_mut() {
             let is_gateway =
                 override_active || m.base_url != config::ANTHROPIC_DEFAULT_BASE_URL;
-            if is_gateway {
-                let headers = m.headers.get_or_insert_with(BTreeMap::new);
-                for (k, v) in &auth_headers {
-                    headers.insert(k.clone(), v.clone());
-                }
+            if !is_gateway {
+                continue;
+            }
+            let provider_auth = if override_active {
+                models_json_auth.values().next()
+            } else {
+                models_json_auth.get(&m.base_url)
+            };
+            let Some(provider_auth) = provider_auth else { continue };
+            let headers = m.headers.get_or_insert_with(BTreeMap::new);
+            for (k, v) in provider_auth {
+                headers.insert(k.clone(), v.clone());
             }
         }
     }
@@ -398,22 +414,32 @@ pub fn resolve(
                 .and_then(parse_thinking_level);
 
             // (3) Saved default from settings, when the provider is anthropic
-            // (or absent — v1 is anthropic-only) and the model is authed.
-            if settings.default_provider.as_deref().map_or(true, |p| {
+            // (or absent — v1 is anthropic-only) OR names a configured
+            // models.json gateway (config-namespacing: the saved
+            // `defaultProvider` id matches a `~/.rpi/models.json` provider
+            // key), and the saved model is authed. Without the gateway arm a
+            // copied pi settings.json (`defaultProvider:
+            // "cc-switch-deep-seek-copy-2"`) is ignored and the default falls
+            // to first-authed — which, once a second gateway is enabled, may
+            // NOT be the user's saved choice (BTreeMap provider order).
+            let saved_provider_ok = settings.default_provider.as_deref().map_or(true, |p| {
                 p.eq_ignore_ascii_case("anthropic")
-            }) {
+                    || models_cfg.providers.contains_key(p)
+            });
+            if saved_provider_ok {
                 if let Some(id) = settings.default_model.as_deref() {
                     // Clone the match to release the catalog borrow before
                     // moving `catalog` into the provider below.
                     let found = catalog
                         .iter()
                         .find(|m| m.id.eq_ignore_ascii_case(id))
-                        .filter(|m| model_is_authed(m, provider_key.as_deref()))
+                        .filter(|m| model_is_authed(m, provider_key.is_some()))
                         .cloned();
                     if let Some(m) = found {
                         let thinking_level = cli_thinking
                             .or(settings_thinking)
                             .unwrap_or(DEFAULT_THINKING_LEVEL);
+                        let has_provider_key = provider_key.is_some();
                         return Ok(ResolvedModel {
                             provider: Arc::new(AnthropicProvider::with_models(
                                 provider_key,
@@ -422,6 +448,7 @@ pub fn resolve(
                             )),
                             model: m,
                             thinking_level,
+                            has_provider_key,
                             theme: settings.theme.clone(),
                         });
                     }
@@ -430,7 +457,7 @@ pub fn resolve(
 
             // (4) Fallback: built-in default if authed, else first authed.
             let thinking_level = cli_thinking.unwrap_or(DEFAULT_THINKING_LEVEL);
-            let model = pick_default_model(&catalog, provider_key.as_deref());
+            let model = pick_default_model(&catalog, provider_key.is_some());
             (model, thinking_level)
         }
     };
@@ -438,26 +465,41 @@ pub fn resolve(
     // ---- Provider build ----
     // Bearer path: `provider_key = None` — the model headers carry the auth
     // (`has_header_auth` skips x-api-key). x-api-key path: pass the key.
+    let has_provider_key = provider_key.is_some();
     let provider: Arc<dyn Provider> = Arc::new(AnthropicProvider::with_models(
         provider_key,
         reqwest::Client::new(),
         catalog,
     ));
 
-    Ok(ResolvedModel { provider, model, thinking_level, theme: settings.theme.clone() })
+    Ok(ResolvedModel { provider, model, thinking_level, has_provider_key, theme: settings.theme.clone() })
 }
 
 /// The catalog the TUI's `/model` selector displays (read-only). Re-derives the
-/// authenticated catalog the provider was built from so the selector shows the
-/// same ids `resolve` saw. v1 does *not* switch models mid-session; the selector
-/// is informational only (the chosen model surfaces guidance "use --model at
-/// startup"), so this is a convenience re-derivation rather than a live view.
+/// **auth-filtered** snapshot the provider was built from so the selector shows
+/// exactly the models that can actually run (mirrors pi `getAvailableSnapshot`:
+/// `available = all.filter(m => configuredProviders.has(m.provider))` — v1's
+/// single-provider equivalent of "configured" is [`model_is_authed`]).
+///
+/// Why the filter matters: in a models.json-gateway-only setup the gateway's
+/// `apiKey` folds onto the gateway models only — the built-in Anthropic models
+/// stay header-less and the provider carries no default key (`has_provider_key
+/// == false`). Without the filter the `/model` selector / Ctrl+M cycle would
+/// offer those built-ins, and selecting one would fail at request time with
+/// "No API key for provider: anthropic" (rpi-ai's `assertRequestAuth`). pi
+/// avoids this by only listing configured providers; this filter is the same
+/// guarantee on the v1 single-provider world.
 ///
 /// On any config read error it falls back to the built-in Anthropic catalog —
 /// the selector is non-critical and must never block the TUI from starting.
 pub fn available_catalog(resolved: &ResolvedModel) -> Vec<Model> {
-    // The provider already holds the catalog it was built with; surface it.
-    resolved.provider.models().to_vec()
+    resolved
+        .provider
+        .models()
+        .iter()
+        .filter(|m| model_is_authed(m, resolved.has_provider_key))
+        .cloned()
+        .collect()
 }
 
 /// Merge `~/.rpi/models.json` providers into the built-in catalog. Models from
@@ -487,61 +529,53 @@ fn merge_user_catalog(catalog: &mut Vec<Model>, cfg: &config::ModelsConfig) {
 /// (`$ENV`/`!command` expansion, mirroring pi provider-composer.ts:351) — a
 /// copied pi models.json referencing an env var resolves the same way. Returns
 /// `None` when no such provider exists (the env/stored-cred/cli-flag sources
-/// still apply).
-fn models_json_bearer_token(cfg: &config::ModelsConfig) -> Option<String> {
-    for (_provider_id, provider_cfg) in &cfg.providers {
-        if !config::provider_is_anthropic_compatible(provider_cfg) {
-            continue;
-        }
-        if provider_cfg.auth_header.unwrap_or(false) {
-            if let Some(raw) = provider_cfg.api_key.as_deref().filter(|s| !s.is_empty()) {
-                // models.json providers have no credential env overlay — env-only.
-                if let Some(resolved) = config::resolve_config_value(raw, None) {
-                    if !resolved.is_empty() {
-                        return Some(resolved);
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Extract a static gateway `x-api-key` from the first anthropic-compatible
-/// models.json provider that declares a **bare** `apiKey` (i.e. `authHeader` is
-/// absent/false). This is the `composeApiKeyAuth` arm of upstream
-/// `provider-composer.ts`: a provider's configured `apiKey` with no
-/// `authHeader` is sent as `x-api-key` (the SDK attaches it out-of-band for
-/// THAT provider's models). The `apiKey` is resolved via
-/// [`config::resolve_config_value`] (`$ENV`/`!command` expansion, mirroring
-/// provider-composer.ts:351). Providers with `authHeader: true` are skipped
-/// here — they own the Bearer path ([`models_json_bearer_token`]). Returns
-/// `None` when no bare-`apiKey` provider exists.
+/// Build the per-provider auth headers from `~/.rpi/models.json`: a map of
+/// provider `base_url` → the auth headers that provider's models should carry.
+/// Each anthropic-compatible provider with a non-empty, resolvable `apiKey`
+/// contributes one entry (`authHeader:true` ⇒ `Authorization: Bearer <key>`, a
+/// bare `apiKey` ⇒ `x-api-key: <key>` — the upstream `composeApiKeyAuth`
+/// arms). The `apiKey` is resolved via [`config::resolve_config_value`]
+/// (`$ENV`/`!command` expansion, mirroring pi provider-composer.ts:351) so a
+/// copied pi models.json referencing an env var resolves the same way.
 ///
-/// The returned key is folded **endpoint-specifically** onto gateway model
-/// headers as `x-api-key` (see the fold in `resolve`), NOT set as the global
-/// `provider_key` — `assemble_headers` applies `provider_key` to every model
-/// including built-in `claude-*` (base_url `api.anthropic.com`), which would
-/// route a gateway key to the wrong endpoint → 401. `has_header_auth` treats a
-/// model-header `x-api-key` as owned auth, so the fold authenticates the
-/// gateway models the same way the Bearer fold does.
-fn models_json_api_key(cfg: &config::ModelsConfig) -> Option<String> {
+/// The map is keyed by `base_url` (falling back to the Anthropic default when
+/// omitted) so [`resolve`]'s fold can stamp each gateway model with the
+/// credential of ITS endpoint — a per-provider contract. Several providers
+/// sharing one `base_url` collapse to the first keyed entry (same endpoint ⇒
+/// one credential per endpoint is the sane contract). Returns an empty map when
+/// no keyed anthropic-compatible provider exists (the env/stored-cred/
+/// cli-flag sources still apply).
+fn models_json_provider_auth(
+    cfg: &config::ModelsConfig,
+) -> BTreeMap<String, BTreeMap<String, String>> {
+    let mut out: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     for (_provider_id, provider_cfg) in &cfg.providers {
         if !config::provider_is_anthropic_compatible(provider_cfg) {
             continue;
         }
-        if !provider_cfg.auth_header.unwrap_or(false) {
-            if let Some(raw) = provider_cfg.api_key.as_deref().filter(|s| !s.is_empty()) {
-                // models.json providers have no credential env overlay — env-only.
-                if let Some(resolved) = config::resolve_config_value(raw, None) {
-                    if !resolved.is_empty() {
-                        return Some(resolved);
-                    }
-                }
-            }
+        let Some(raw) = provider_cfg.api_key.as_deref().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        // models.json providers have no credential env overlay — env-only.
+        let Some(resolved) = config::resolve_config_value(raw, None) else {
+            continue;
+        };
+        if resolved.is_empty() {
+            continue;
         }
+        let base = provider_cfg
+            .base_url
+            .clone()
+            .unwrap_or_else(config::default_anthropic_base_url);
+        let mut headers = BTreeMap::new();
+        if provider_cfg.auth_header.unwrap_or(false) {
+            headers.insert("authorization".to_string(), format!("Bearer {resolved}"));
+        } else {
+            headers.insert("x-api-key".to_string(), resolved);
+        }
+        out.entry(base).or_insert(headers);
     }
-    None
+    out
 }
 
 /// Split a `--model` value into `(id_pattern, optional_thinking_level)`.
@@ -607,8 +641,8 @@ fn find_model(pattern: &str, catalog: &[Model]) -> Option<Model> {
 /// truthfully reflects whether a Bearer was folded onto *this* model (gateway
 /// models only — see the fold's `is_gateway` gate; built-in claude-* without an
 /// override stay Bearer-less).
-fn model_is_authed(m: &Model, provider_key: Option<&str>) -> bool {
-    model_has_header_auth(m) || provider_key.is_some()
+fn model_is_authed(m: &Model, has_provider_key: bool) -> bool {
+    model_has_header_auth(m) || has_provider_key
 }
 
 /// Same three-name check as rpi-ai's `has_header_auth`, but called from the
@@ -633,22 +667,19 @@ fn model_has_header_auth(m: &Model) -> bool {
 /// `provider_key` is the resolved x-api-key (`Some` on the `--api-key`/
 /// auth.json/`ANTHROPIC_API_KEY` path; `None` on the Bearer path). It is passed
 /// in (not read from a field) because the auth decision is local to `resolve`.
-fn pick_default_model(catalog: &[Model], provider_key: Option<&str>) -> Model {
+fn pick_default_model(catalog: &[Model], has_provider_key: bool) -> Model {
     // 1. Built-in default, when it is authed — preserves the standard
     //    `ANTHROPIC_API_KEY`/`auth.json` behavior (claude-sonnet-5).
     if let Some(m) = catalog
         .iter()
         .find(|m| m.id.eq_ignore_ascii_case(DEFAULT_MODEL_ID))
-        .filter(|m| model_is_authed(m, provider_key))
+        .filter(|m| model_is_authed(m, has_provider_key))
     {
         return m.clone();
     }
     // 2. First authed model (TS `availableModels[0]`). In a gateway-only setup
     //    this is the gateway model (Bearer folded onto it, base_url = gateway).
-    if let Some(m) = catalog
-        .iter()
-        .find(|m| model_is_authed(m, provider_key))
-    {
+    if let Some(m) = catalog.iter().find(|m| model_is_authed(m, has_provider_key)) {
         return m.clone();
     }
     // 3. Last resort: the built-in default, authed or not. The auth gate above
@@ -1182,12 +1213,15 @@ mod tests {
 
     /// `authHeader: true` takes precedence over a bare `apiKey` on the SAME or a
     /// later provider: the Bearer step (3a) runs before the bare-apiKey step
-    /// (3b), so an `authHeader:true` provider's key becomes a Bearer, not an
-    /// x-api-key. A copied pi models.json mixing both shapes routes the
-    /// authHeader provider as Bearer (pi's behavior — `authHeader` opts into
-    /// Bearer; its absence leaves the default x-api-key).
+    /// A models.json with BOTH auth shapes — `authHeader:true` and bare
+    /// `apiKey` — routes each provider's credential onto ITS OWN models
+    /// (per-provider fold, mirroring upstream `composeApiKeyAuth`): the
+    /// authHeader provider's key becomes `Authorization: Bearer` on its model,
+    /// the bare-apiKey provider's key becomes `x-api-key` on its model. A
+    /// copied pi models.json mixing both shapes works end-to-end — no model
+    /// ends up unauthenticated because another provider "won" the gate.
     #[test]
-    fn auth_header_provider_beats_bare_apikey_provider() {
+    fn auth_header_provider_and_bare_apikey_provider_each_fold_their_own() {
         let _env = TestEnv::new();
         std::fs::write(
             config::models_path().unwrap(),
@@ -1210,25 +1244,131 @@ mod tests {
 }"#,
         )
         .unwrap();
-        // The Bearer provider wins the auth gate (3a before 3b). Picking the
-        // xkey-gw model should still succeed — its headers carry the folded
-        // x-api-key ONLY if no auth won earlier. Since the Bearer provider
-        // satisfied auth, the bare-apiKey step was skipped, so NO x-api-key is
-        // folded onto any model. The Bearer folds endpoint-specifically onto
-        // bearer-model; xkey-model gets nothing (no auth on it).
+        // Both providers satisfy the auth gate together (no env / stored cred
+        // needed); the default selector picks the first authed model.
+        let r = resolve(None, None, None, None, None).unwrap();
+        assert_eq!(r.model.id, "bearer-model");
+
+        // bearer-gw's key folds as Bearer onto bearer-model only.
         let r = resolve(None, Some("bearer-model"), None, None, None).unwrap();
         let h = r.model.headers.as_ref().expect("bearer folded");
         assert_eq!(h.get("authorization").map(|s| s.as_str()), Some("Bearer bearer-secret"));
-        assert!(h.get("x-api-key").is_none(), "bare-apiKey step was skipped once Bearer won");
+        assert!(h.get("x-api-key").is_none(), "authHeader path must not synthesize x-api-key");
 
-        // xkey-model is in the catalog but carries no header auth (its provider's
-        // bare apiKey was never folded — the Bearer provider satisfied the gate).
+        // xkey-gw's bare apiKey folds as x-api-key onto xkey-model only (its
+        // own provider's key — per-provider, NOT the bearer-gw secret).
         let r2 = resolve(None, Some("xkey-model"), None, None, None).unwrap();
-        // No auth header on xkey-model — but the model is still selected (exact
-        // --model match bypasses the auth filter; the provider builds it).
-        assert!(
-            r2.model.headers.as_ref().and_then(|h| h.get("x-api-key")).is_none(),
-            "xkey provider's bare apiKey must NOT fold when a Bearer provider satisfied auth"
-        );
+        let h2 = r2.model.headers.as_ref().expect("x-api-key folded");
+        assert_eq!(h2.get("x-api-key").map(|s| s.as_str()), Some("xkey-secret"));
+        assert!(h2.get("authorization").is_none(), "xkey-gw has no authHeader");
+
+        // Both gateway models are authed ⇒ BOTH appear in the `/model`
+        // selector catalog (the multi-gateway case the old single-key fold
+        // made impossible — it 401'd the 2nd gateway).
+        let catalog = available_catalog(&r);
+        let ids: Vec<&str> = catalog.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["bearer-model", "xkey-model"]);
+    }
+
+    /// A copied pi settings.json whose `defaultProvider` names a **models.json
+    /// gateway** (not "anthropic") must still honor the saved `defaultModel` —
+    /// pi's `findInitialModel` step-3 applies `defaultModelPerProvider`
+    /// regardless of provider id. Without this, enabling a second gateway
+    /// flips the no-`--model` default to the FIRST authed model in catalog
+    /// order (BTreeMap sorts provider ids), not the user's saved choice.
+    #[test]
+    fn settings_default_model_honored_for_models_json_provider() {
+        let _env = TestEnv::new();
+        std::fs::write(
+            config::models_path().unwrap(),
+            r#"{
+  "providers": {
+    "beta-gw": {
+      "baseUrl": "https://beta.example.com",
+      "api": "anthropic-messages",
+      "apiKey": "beta-secret",
+      "models": [ { "id": "beta-model" } ]
+    },
+    "alpha-gw": {
+      "baseUrl": "https://alpha.example.com",
+      "api": "anthropic-messages",
+      "apiKey": "alpha-secret",
+      "models": [ { "id": "alpha-model" } ]
+    }
+  }
+}"#,
+        )
+        .unwrap();
+        // Saved default points at the BETA gateway's model — even though
+        // "alpha-gw" sorts first and would win first-authed without the
+        // settings arm.
+        std::fs::write(
+            config::settings_path().unwrap(),
+            r#"{"defaultProvider":"beta-gw","defaultModel":"beta-model"}"#,
+        )
+        .unwrap();
+        let r = resolve(None, None, None, None, None).unwrap();
+        assert_eq!(r.model.id, "beta-model");
+        // An unknown provider id falls through to first-authed (alpha-gw).
+        std::fs::write(
+            config::settings_path().unwrap(),
+            r#"{"defaultProvider":"not-a-provider","defaultModel":"beta-model"}"#,
+        )
+        .unwrap();
+        let r = resolve(None, None, None, None, None).unwrap();
+        assert_eq!(r.model.id, "alpha-model");
+    }
+
+    /// The `/model` selector catalog (`available_catalog`) is auth-filtered —
+    /// it must NOT offer built-in claude-* models that carry no auth headers in
+    /// a gateway-only setup (selecting one would fail at request time with
+    /// "No API key for provider: anthropic"). Mirrors pi's
+    /// `getAvailableSnapshot` filter (`available = all.filter(m =>
+    /// configuredProviders.has(m.provider))`): only the gateway model is
+    /// loadable, so only it appears in the selector / Ctrl+M cycle.
+    #[test]
+    fn available_catalog_filters_to_authed_models_in_gateway_only_setup() {
+        let _env = TestEnv::new();
+        std::fs::write(
+            config::models_path().unwrap(),
+            r#"{
+  "providers": {
+    "gateway": {
+      "baseUrl": "https://gw.example.com",
+      "api": "anthropic-messages",
+      "apiKey": "gw-secret",
+      "models": [
+        { "id": "custom-claude", "contextWindow": 200000, "maxTokens": 8192 }
+      ]
+    }
+  }
+}"#,
+        )
+        .unwrap();
+        let r = resolve(None, None, None, None, None).unwrap();
+        // Auth is header-carried (provider_key = None ⇒ has_provider_key false)
+        assert!(!r.has_provider_key);
+        let catalog = available_catalog(&r);
+        // Exactly one loadable model: the gateway one. The 7 built-in Anthropic
+        // models are filtered out.
+        let ids: Vec<&str> = catalog.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["custom-claude"], "selector must only list authed models");
+        // Sanity: the provider still serves the full catalog (the filter is
+        // selector-side only — resolve/pick_default_model unchanged).
+        assert!(r.provider.models().len() > catalog.len());
+    }
+
+    /// On the x-api-key path (`--api-key`/auth.json/`ANTHROPIC_API_KEY`), the
+    /// provider's default key attaches to EVERY model out-of-band — so the
+    /// catalog filter keeps the full list (all models are loadable).
+    #[test]
+    fn available_catalog_keeps_all_models_on_provider_key_path() {
+        let _env = TestEnv::new();
+        std::env::set_var(ANTHROPIC_API_KEY_ENV, "k");
+        let r = resolve(None, None, None, None, None).unwrap();
+        assert!(r.has_provider_key);
+        let catalog = available_catalog(&r);
+        assert_eq!(catalog.len(), r.provider.models().len());
+        assert!(catalog.iter().any(|m| m.id == DEFAULT_MODEL_ID));
     }
 }

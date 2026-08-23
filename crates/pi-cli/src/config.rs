@@ -784,8 +784,9 @@ fn parse_input_modalities(input: Option<&[String]>) -> Vec<InputModality> {
 pub const ANTHROPIC_DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 
 /// Same value as [`ANTHROPIC_DEFAULT_BASE_URL`], as an owned `String` for the
-/// `unwrap_or_else` ergonomic used by [`provider_to_models`].
-fn default_anthropic_base_url() -> String {
+/// `unwrap_or_else` ergonomic used by [`provider_to_models`] and
+/// [`crate::provider::models_json_provider_auth`].
+pub fn default_anthropic_base_url() -> String {
     ANTHROPIC_DEFAULT_BASE_URL.to_string()
 }
 

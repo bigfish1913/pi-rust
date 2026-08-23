@@ -63,6 +63,12 @@ pub struct MapperState {
     /// defers it to the first event so a pre-stream failure (auth/SSE) doesn't
     /// deliver a partial `start` with no terminal event.
     started: bool,
+    /// Whether the protocol's terminal `message_stop` event arrived. Some
+    /// proxy gateways end the stream at `message_stop` WITHOUT a preceding
+    /// `message_delta` (which carries `stop_reason`); [`finalize_mapper`] uses
+    /// this to default a still-`Pending` stop reason to a normal stop instead
+    /// of erroring (documented divergence — see `finalize_mapper`).
+    saw_message_end: bool,
 }
 
 impl MapperState {
@@ -78,6 +84,7 @@ impl MapperState {
             output: AssistantMessage::empty(api, provider, model, timestamp),
             blocks: Vec::new(),
             started: false,
+            saw_message_end: false,
         }
     }
 
@@ -120,7 +127,7 @@ impl MapperState {
             "content_block_delta" => self.apply_content_block_delta(payload, prod)?,
             "content_block_stop" => self.apply_content_block_stop(payload, prod),
             "message_delta" => self.apply_message_delta(payload, prod),
-            "message_stop" => { /* TS reads message_stop only to flip sawMessageEnd; noop here. */ }
+            "message_stop" => self.saw_message_end = true,
             _ => {}
         }
         Ok(())
@@ -670,6 +677,18 @@ pub fn finalize_mapper<F>(
 ) where
     F: Fn(&Usage) -> UsageCost,
 {
+    // A stream that reached the protocol's terminal `message_stop` without a
+    // `message_delta` is a normal stop — some proxy gateways (e.g. the
+    // anthropic-messages endpoints of DeepSeek/GLM relays) omit `message_delta`
+    // entirely. The TS check throws "Anthropic stream ended without a stop
+    // reason" here, which would reject those gateways; v1 defaults the still-
+    // `Pending` stop reason to a normal `Stop` instead (documented divergence —
+    // a completed `message_stop` is authoritative, and `message_delta` only
+    // carries usage + stop_reason). The Pending-error is preserved for streams
+    // that end WITHOUT `message_stop` (the SSE closed early).
+    if state.output.stop_reason == StopReason::Pending && state.saw_message_end {
+        state.output.stop_reason = StopReason::Stop;
+    }
     if state.output.stop_reason == StopReason::Pending {
         emit_terminal_error(
             prod,
@@ -1215,11 +1234,13 @@ mod tests {
         assert!(run.tags.contains(&"thinking_end"));
     }
 
-    // A stream that ends without ever setting a stop_reason (no message_delta)
-    // finalizes to an Error terminal, mirroring the TS "Anthropic stream ended
-    // without a stop reason" throw.
+    // A stream that reaches the protocol's terminal `message_stop` without a
+    // `message_delta` (no stop_reason) finalizes as a NORMAL stop — proxy
+    // gateways may omit `message_delta` (documented divergence from the TS
+    // throw; `message_stop` is authoritative). The Pending-error is preserved
+    // for streams that end WITHOUT `message_stop` (early SSE close).
     #[tokio::test]
-    async fn stream_without_stop_reason_is_error() {
+    async fn message_stop_without_stop_reason_is_normal_stop() {
         let frames = vec![
             frame(
                 "message_start",
@@ -1227,6 +1248,20 @@ mod tests {
             ),
             frame("message_stop", &j(&json!({ "type": "message_stop" }))),
         ];
+        let run = run_fixture(frames).await;
+        assert_eq!(run.result.stop_reason, StopReason::Stop);
+        assert_eq!(run.tags.last().copied(), Some("done"));
+    }
+
+    // A stream whose SSE closes BEFORE `message_stop` (no stop_reason, no
+    // terminal event) still finalizes to an Error terminal — the early-close
+    // case the Pending check guards.
+    #[tokio::test]
+    async fn stream_ending_before_message_stop_is_error() {
+        let frames = vec![frame(
+            "message_start",
+            &j(&json!({ "type": "message_start", "message": { "id": "m", "usage": { "input_tokens": 1, "output_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0 } } })),
+        )];
         let run = run_fixture(frames).await;
         assert_eq!(run.result.stop_reason, StopReason::Error);
         assert_eq!(run.tags.last().copied(), Some("error"));
