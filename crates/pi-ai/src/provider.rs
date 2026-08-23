@@ -5,7 +5,7 @@
 
 use crate::event_stream::AssistantMessageEventStream;
 use crate::model::Model;
-use crate::types::{Context, ThinkingBudgets, ThinkingLevel};
+use crate::types::{AssistantMessage, Context, ThinkingBudgets, ThinkingLevel};
 use std::collections::BTreeMap;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -129,4 +129,142 @@ pub trait Provider: Send + Sync {
         ctx: &Context,
         opts: &SimpleStreamOptions,
     ) -> AssistantMessageEventStream;
+}
+
+// ---------------------------------------------------------------------------
+// ProviderHooks (B4) — a per-call sidecar hook fired inside the harness
+// `StreamFn` closure BEFORE each `stream_simple` call.
+//
+// Why a sidecar trait (not an extension of `Provider`): `Provider` is not
+// sealed (verified), so extending it directly is viable — but that would force
+// EVERY `Provider` impl to stub no-op hooks, even faux/anthropic. A sidecar
+// trait keeps `Provider` lean and lets only the host (harness) supply hooks;
+// the harness captures `Option<Arc<dyn ProviderHooks>>` into its `StreamFn`
+// closure and applies the patch per call. This mirrors pi's `beforeRequest`
+// per-call semantics, NOT a run-once config-build patch (applying once per run
+// is not equivalent — e.g. a hook that injects a per-request id or rotates a
+// header must run before every provider call).
+//
+// The patch type is `SimpleStreamOptionsPatch` (against `SimpleStreamOptions`,
+// the type actually passed to `stream_simple`) — NOT the harness-side
+// `AgentHarnessStreamOptionsPatch` (which targets `AgentHarnessStreamOptions`,
+// the pinned subset, and lives in rpi-harness): defining it here keeps rpi-ai
+// free of any rpi-harness dep (cycle-free) and targets the live options the
+// provider sees. The harness's existing `AgentHarnessStreamOptionsPatch` stays
+// for harness config, a separate concern.
+// ---------------------------------------------------------------------------
+
+/// A per-call provider hook. `before_request` may patch the live
+/// [`SimpleStreamOptions`] (e.g. inject/rotate headers, set metadata, override
+/// timeout) before the harness calls `stream_simple`; `after_response` observes
+/// the terminal assistant message after the stream resolves. Both are
+/// `Option`-returning: `None` = no change / no observation.
+///
+/// Implementations MUST be infallible at the API boundary — a hook error is
+/// swallowed (the run continues with the unpatched options), mirroring the
+/// "hooks must not throw" contract from pi and the harness's other hooks
+/// (`before_tool_call` etc.).
+pub trait ProviderHooks: Send + Sync {
+    /// Fired before each `stream_simple` call, with a snapshot of the model +
+    /// context + opts the harness is about to pass. Return a patch that the
+    /// harness applies to a clone of `opts` before calling the provider; return
+    /// `None` to leave `opts` untouched.
+    ///
+    /// The hook receives a reference to the planned `opts`, not ownership — it
+    /// must not retain the borrow (the closure clones before `await`). Runs on
+    /// the blocking-bridge thread inside the harness `StreamFn` closure.
+    fn before_request(
+        &self,
+        _model: &Model,
+        _ctx: &Context,
+        _opts: &SimpleStreamOptions,
+    ) -> Option<SimpleStreamOptionsPatch> {
+        None
+    }
+
+    /// Fired after the stream resolves with the terminal assistant message.
+    /// `message` is the final `AssistantMessage` the provider produced (the same
+    /// one the loop emits as `MessageEnd`). `None` lets the default no-op impl
+    /// apply. Runs on the blocking-bridge thread.
+    fn after_response(&self, _model: &Model, _message: &AssistantMessage) {}
+}
+
+/// A no-op default so the harness can install a `ProviderHooks` slot cheaply
+/// when none is supplied (uniform code path vs `Option<Arc<dyn>>`).
+#[derive(Default)]
+pub struct NoopProviderHooks;
+impl ProviderHooks for NoopProviderHooks {}
+
+/// A patch against [`SimpleStreamOptions`] returned by [`ProviderHooks::before_request`].
+/// Mirrors TS `beforeRequest`'s per-request overrides but targets the live
+/// `SimpleStreamOptions` (the type `stream_simple` receives), not the harness
+/// pinned subset. `Option<Option<T>>` semantics: outer `None` = "leave this
+/// field"; inner `Some(None)` on the headers/metadata maps = "delete this key".
+///
+/// This is *distinct* from the harness-side `AgentHarnessStreamOptionsPatch`
+/// (which lives in rpi-harness and patches `AgentHarnessStreamOptions`). Both
+/// exist; this one is the rpi-ai seam so provider hooks can be defined without
+/// a rpi-harness cycle.
+#[derive(Debug, Clone, Default)]
+pub struct SimpleStreamOptionsPatch {
+    pub timeout: Option<Option<Duration>>,
+    pub max_retries: Option<Option<u32>>,
+    pub max_retry_delay: Option<Option<Duration>>,
+    /// `None` = leave; `Some(map)` = merge, inner `None` deletes a key.
+    pub headers: Option<BTreeMap<String, Option<String>>>,
+    /// `None` = leave; `Some(map)` = merge, inner `None` deletes a key.
+    pub metadata: Option<BTreeMap<String, Option<String>>>,
+    pub cache_retention: Option<Option<CacheRetention>>,
+    pub max_tokens: Option<Option<u64>>,
+    pub temperature: Option<Option<f64>>,
+    pub session_id: Option<Option<String>>,
+}
+
+impl SimpleStreamOptionsPatch {
+    /// Apply this patch to `opts` in place. Mirrors the harness patch semantics:
+    /// outer `None` = leave the field; an explicit value replaces it; `None`
+    /// inside a map entry deletes that key.
+    pub fn apply(&self, opts: &mut SimpleStreamOptions) {
+        if let Some(v) = self.timeout {
+            opts.timeout = v;
+        }
+        if let Some(v) = self.max_retries {
+            opts.max_retries = v;
+        }
+        if let Some(v) = self.max_retry_delay {
+            opts.max_retry_delay = v;
+        }
+        if let Some(patch) = &self.headers {
+            let mut map = opts.headers.take().unwrap_or_default();
+            for (k, v) in patch {
+                match v {
+                    Some(val) => map.insert(k.clone(), val.clone()),
+                    None => map.remove(k),
+                };
+            }
+            opts.headers = if map.is_empty() { None } else { Some(map) };
+        }
+        if let Some(patch) = &self.metadata {
+            let mut map = opts.metadata.take().unwrap_or_default();
+            for (k, v) in patch {
+                match v {
+                    Some(val) => map.insert(k.clone(), val.clone()),
+                    None => map.remove(k),
+                };
+            }
+            opts.metadata = if map.is_empty() { None } else { Some(map) };
+        }
+        if let Some(v) = self.cache_retention {
+            opts.cache_retention = v.unwrap_or_default();
+        }
+        if let Some(v) = self.max_tokens {
+            opts.max_tokens = v;
+        }
+        if let Some(v) = self.temperature {
+            opts.temperature = v;
+        }
+        if let Some(v) = &self.session_id {
+            opts.session_id = v.clone();
+        }
+    }
 }

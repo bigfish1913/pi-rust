@@ -22,12 +22,15 @@ pub mod types;
 pub use error::AiError;
 pub use event_stream::{AssistantMessageEventStream, AssistantMessageEventStreamProducer};
 pub use model::{Model, StreamingProtocolCompat};
-pub use provider::{Provider, SimpleStreamOptions, CacheRetention};
+pub use provider::{
+    CacheRetention, NoopProviderHooks, Provider, ProviderHooks, SimpleStreamOptions,
+    SimpleStreamOptionsPatch,
+};
 pub use schema::validate_tool_arguments;
 pub use types::{
     Api, AssistantMessage, AssistantMessageEvent, Content, Context, DeferredHandle, DoneReason,
-    ErrorReason, ImageContent, InputModality, Message, ModelCost, ModelCostRates,
-    ModelCostTier, ProviderId, Schema, StopReason, TextContent, ThinkingBudgets,
-    ThinkingContent, ThinkingLevel, ThinkingLevelMap, Tool, ToolCall, ToolCallType,
-    ToolResultMessage, Usage, UsageCost, UserContent, UserMessage,
+    ErrorReason, ImageContent, InputModality, Message, ModelCost, ModelCostRates, ModelCostTier,
+    ProviderId, Schema, StopReason, TextContent, ThinkingBudgets, ThinkingContent, ThinkingLevel,
+    ThinkingLevelMap, Tool, ToolCall, ToolCallType, ToolResultMessage, Usage, UsageCost,
+    UserContent, UserMessage,
 };
