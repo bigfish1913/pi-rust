@@ -258,6 +258,8 @@ struct HarnessInner {
     before_tool_call: Option<BeforeToolCall>,
     after_tool_call: Option<AfterToolCall>,
     transform_context: Option<TransformContext>,
+    /// B4: per-call provider hooks fired inside the `StreamFn` closure.
+    provider_hooks: Option<Arc<dyn rpi_ai::ProviderHooks>>,
     closed: bool,
     active_run: Option<ActiveRun>,
 }
@@ -278,22 +280,24 @@ pub struct AgentHarness {
 }
 
 impl AgentHarness {
-    /// Construct from options. Mirrors TS `AgentHarness.create` minus the
-    /// restore path: if the session already has records (a prior operation),
-    /// reject with [`HarnessError::Io`] (restore is not implemented in v1).
+    /// Construct from options. Mirrors TS `AgentHarness.create`: when the
+    /// session already has records (a prior operation) the default is to
+    /// reject (TS throws `HarnessNotImplemented("create.restore")`). The
+    /// restore path (`--continue`/`--resume`/`--session`) sets
+    /// `allow_existing_session` so the harness loads the existing transcript
+    /// and continues appending.
     pub async fn create(options: AgentHarnessOptions) -> HarnessResult<Self> {
-        // TS `create`: `findRecords({ limit: 1 })` non-empty -> throw
-        // `HarnessNotImplemented("create.restore")`. v1 surfaces this as
-        // `HarnessError::Io`.
-        let existing = options
-            .session
-            .find_records(&RecordQuery { limit: Some(1), ..Default::default() })
-            .await
-            .map_err(session_to_harness_err)?;
-        if !existing.is_empty() {
-            return Err(HarnessError::io(
-                "create.restore is not implemented: session already has records",
-            ));
+        if !options.allow_existing_session {
+            let existing = options
+                .session
+                .find_records(&RecordQuery { limit: Some(1), ..Default::default() })
+                .await
+                .map_err(session_to_harness_err)?;
+            if !existing.is_empty() {
+                return Err(HarnessError::io(
+                    "create.restore is not implemented: session already has records",
+                ));
+            }
         }
 
         let inner = HarnessInner {
@@ -316,6 +320,7 @@ impl AgentHarness {
             before_tool_call: options.before_tool_call,
             after_tool_call: options.after_tool_call,
             transform_context: options.transform_context,
+            provider_hooks: options.provider_hooks,
             closed: false,
             active_run: None,
         };
@@ -474,7 +479,22 @@ impl AgentHarness {
     /// Build a `StreamFn` that bridges the sync-return contract to the async
     /// `Provider::stream_simple`. Mirrors `examples/minimal`'s `make_stream_fn`:
     /// `block_in_place` + `Handle::current().block_on`.
-    fn build_stream_fn(models: Vec<Arc<dyn AiProvider>>) -> HarnessResult<StreamFn> {
+    ///
+    /// B4: the closure also captures `provider_hooks`; before each
+    /// `stream_simple` it fires `before_request` and applies the returned
+    /// `SimpleStreamOptionsPatch` to a clone of `opts`, so an extension's
+    /// `before_provider_request`/`before_provider_headers` `on()` handlers can
+    /// patch the LIVE per-call options (not a run-once config-build — that
+    /// would not be equivalent to pi's `beforeRequest`, which fires before
+    /// every provider call). `after_response` observation is wired on the
+    /// emitter side (B3+) where the terminal `MessageEnd` is visible without
+    /// stealing the stream from the loop; the per-call patch is the
+    /// load-bearing B4 deliverable here.
+    fn build_stream_fn(
+        models: Vec<Arc<dyn AiProvider>>,
+        provider_hooks: Option<Arc<dyn rpi_ai::ProviderHooks>>,
+        stream_options: AgentHarnessStreamOptions,
+    ) -> HarnessResult<StreamFn> {
         // Resolve the provider lazily per call (the model may change between
         // turns via prepare_next_turn). If no provider matches, emit an Error
         // terminal event on a synthetic stream.
@@ -484,7 +504,20 @@ impl AgentHarness {
                 Some(p) => {
                     let model = model.clone();
                     let ctx = ctx.clone();
-                    let opts = opts.clone();
+                    // B4 [merge_into]: the loop builds `opts` via
+                    // `AgentLoopConfig::to_stream_options`, which DROPS the
+                    // harness's pinned `headers`/`metadata` (AgentLoopConfig
+                    // has no such fields → to_stream_options sets them None).
+                    // Fold the pinned `AgentHarnessStreamOptions` into the
+                    // live opts here, at the per-call site, so headers/metadata
+                    // reach the provider — then layer the per-call
+                    // `ProviderHooks::before_request` patch on top.
+                    let mut opts = stream_options.merge_into(opts.clone());
+                    if let Some(hooks) = &provider_hooks {
+                        if let Some(patch) = hooks.before_request(&model, &ctx, &opts) {
+                            patch.apply(&mut opts);
+                        }
+                    }
                     tokio::task::block_in_place(|| {
                         Handle::current().block_on(async move {
                             p.stream_simple(&model, &ctx, &opts).await
@@ -587,6 +620,7 @@ impl AgentHarness {
             before_tool_call: inner.before_tool_call.clone(),
             after_tool_call: inner.after_tool_call.clone(),
             transform_context: inner.transform_context.clone(),
+            provider_hooks: inner.provider_hooks.clone(),
         })
     }
 
@@ -959,7 +993,11 @@ impl AgentHarness {
 
         // Build the config.
         let convert = Self::build_convert_to_llm(snap.to_provider_messages);
-        let stream_fn = Self::build_stream_fn(snap.models.clone())?;
+        let stream_fn = Self::build_stream_fn(
+            snap.models.clone(),
+            snap.provider_hooks.clone(),
+            snap.stream_options.clone(),
+        )?;
         let config = AgentLoopConfig {
             model: snap.model.clone(),
             convert_to_llm: convert,
@@ -1219,6 +1257,7 @@ struct ConfigSnapshot {
     before_tool_call: Option<BeforeToolCall>,
     after_tool_call: Option<AfterToolCall>,
     transform_context: Option<TransformContext>,
+    provider_hooks: Option<Arc<dyn rpi_ai::ProviderHooks>>,
 }
 
 // ===========================================================================

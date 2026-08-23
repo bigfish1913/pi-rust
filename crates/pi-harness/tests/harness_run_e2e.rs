@@ -113,6 +113,8 @@ async fn harness_with(
         after_tool_call: None,
         transform_context: None,
         entry_transforms: Vec::new(),
+        provider_hooks: None,
+            allow_existing_session: false,
     };
 
     let harness = AgentHarness::create(options).await.expect("create harness");
@@ -434,6 +436,8 @@ async fn harness_forwards_after_tool_call_option_into_loop() {
             after_tool_call: Some(after),
             transform_context: None,
             entry_transforms: Vec::new(),
+            provider_hooks: None,
+            allow_existing_session: false,
         };
         let harness = AgentHarness::create(options).await.expect("create harness");
         (harness, provider, env)
@@ -485,5 +489,127 @@ async fn harness_forwards_after_tool_call_option_into_loop() {
         tool_result.usage,
         Some(patched),
         "persisted ToolResultMessage.usage must be the after_tool_call override"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B4: ProviderHooks before_request patches the LIVE per-call SimpleStreamOptions.
+// The harness build_stream_fn closure fires the hook before each stream_simple
+// call and applies the returned SimpleStreamOptionsPatch to a clone of opts.
+// The FauxProvider surfaces the opts.session_id it received on the assistant
+// message... but faux ignores most opt fields. The clean observable is the
+// `metadata`/`headers` route: faux carries `session_id` from opts onto its
+// faux-cache-hit path, but simplest is to assert the hook FIRED with the model
+// the loop is about to call (the per-call bridge ran). We pair the hook with a
+// counter and assert call_count == hook fires (one per stream_simple call).
+// (after_response observation is wired on the emitter side in B3+; here we
+// prove before_request runs per-call, which is the load-bearing B4 fix.)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn harness_fires_provider_hooks_before_request_per_call() {
+    use rpi_ai::{ProviderHooks, SimpleStreamOptions, SimpleStreamOptionsPatch};
+
+    // One hook fire per stream_simple call. The script has 2 turns
+    // (tool-call + final text), so we expect 2 provider calls == 2 hook fires.
+    let fires: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    struct CountingHooks {
+        fires: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    impl ProviderHooks for CountingHooks {
+        fn before_request(
+            &self,
+            model: &rpi_ai::Model,
+            _ctx: &rpi_ai::types::Context,
+            _opts: &SimpleStreamOptions,
+        ) -> Option<SimpleStreamOptionsPatch> {
+            self.fires.lock().unwrap().push(model.id.clone());
+            // Return a no-op patch (None would also work; exercise the apply path).
+            None
+        }
+    }
+
+    let hooks: Arc<dyn ProviderHooks> =
+        Arc::new(CountingHooks { fires: Arc::clone(&fires) });
+
+    let script = FauxScript::new()
+        .with_tool_call(
+            "write",
+            serde_json::json!({ "path": "b4.txt", "content": "hook" }),
+        )
+        .with_text("done");
+    // Reuse the harness build, then rebuild options with the provider hook.
+    let (harness, provider, _env) = {
+        let provider = FauxProvider::new(script);
+        let model = provider.default_model().clone();
+        let env = Arc::new(InMemoryExecutionEnv::new());
+        let env_dyn: Arc<dyn rpi_tools::ExecutionEnv> = env.clone();
+        let mut_env: Arc<dyn rpi_tools::MutatingEnv> = env.clone();
+        let _ = Arc::new(MutationQueueRegistry::new());
+        let ctx = ExecutionToolContext::new(env_dyn, Some(mut_env));
+        let write = create_write_tool(&ctx);
+        let tools: Vec<HarnessTool> = vec![write].into_iter().map(HarnessTool::new).collect();
+        let active: Vec<String> = tools.iter().map(|t| t.tool.schema().name.clone()).collect();
+        let metadata = SessionMetadata {
+            id: "b4-hooks".into(),
+            created_at: 0,
+            parent_session_id: None,
+        };
+        let storage = Arc::new(InMemorySessionStorage::new(
+            metadata,
+            Arc::new(SystemClock),
+            Arc::new(DefaultIdGenerator::new()),
+        ));
+        let session = Session::new(storage, None);
+        let options = AgentHarnessOptions {
+            model,
+            thinking_level: Default::default(),
+            active_tool_names: active,
+            tools,
+            system_prompt: None,
+            resources: Default::default(),
+            stream_options: Default::default(),
+            retry: Default::default(),
+            compaction: Default::default(),
+            steering_mode: Default::default(),
+            follow_up_mode: Default::default(),
+            tool_execution: Default::default(),
+            drive: Default::default(),
+            session,
+            models: vec![provider.clone() as Arc<dyn Provider>],
+            to_provider_messages: None,
+            entry_projectors: Default::default(),
+            agent_emitter: None,
+            before_tool_call: None,
+            after_tool_call: None,
+            transform_context: None,
+            entry_transforms: Vec::new(),
+            provider_hooks: Some(hooks),
+            allow_existing_session: false,
+        };
+        let harness = AgentHarness::create(options).await.expect("create harness");
+        (harness, provider, env)
+    };
+
+    let result = harness
+        .prompt_text("Write hook to b4.txt.", vec![])
+        .await
+        .expect("prompt_text completes");
+    assert!(
+        matches!(result.outcome, HarnessRunOutcome::Completed { .. }),
+        "expected Completed, got {:?}",
+        result.outcome
+    );
+
+    // Two turn script → two provider calls; before_request fired once each.
+    let provider_calls =
+        provider.state().call_count.load(std::sync::atomic::Ordering::Relaxed);
+    let hook_fires = fires.lock().unwrap().clone();
+    assert_eq!(provider_calls, 2, "two-turn script = two provider calls");
+    assert_eq!(
+        hook_fires.len(),
+        2,
+        "before_request must fire once per stream_simple call (per-call, not run-once)"
     );
 }

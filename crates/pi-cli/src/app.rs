@@ -330,12 +330,10 @@ fn print_resolve_error(e: &ResolveError) {
 /// Print a harness-build error with flag-specific guidance for restore requests.
 fn print_build_error(e: &BuildError) {
     match e {
-        BuildError::RestoreNotImplemented { requested: _, flag } => {
+        BuildError::SessionNotFound { .. } => {
             eprintln!("error: {e}");
             eprintln!();
-            eprintln!(
-                "To start a fresh session instead, drop {flag} (and any --session argument)."
-            );
+            eprintln!("List saved sessions with the /session command in interactive mode.");
         }
         _ => eprintln!("error: {e}"),
     }

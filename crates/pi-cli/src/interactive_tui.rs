@@ -32,6 +32,7 @@ use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use tokio::sync::broadcast;
 
 use rpi_agent::{AgentEvent, AgentMessage};
+use rpi_harness::session::types::{Entry, EntryQuery};
 use rpi_ai::types::{AssistantMessage, Content};
 use rpi_harness::agent_harness::{AgentHarness, AgentLane, HarnessRunOutcome};
 use rpi_tui::{
@@ -607,6 +608,62 @@ fn assistant_text(msg: &AssistantMessage) -> String {
         .collect()
 }
 
+/// The user message's text (Text content or the text blocks of a Blocks
+/// payload — images are skipped, consistent with the v1 text-only prompt path).
+fn user_message_text(msg: &rpi_ai::types::UserMessage) -> String {
+    match &msg.content {
+        rpi_ai::types::UserContent::Text(s) => s.clone(),
+        rpi_ai::types::UserContent::Blocks(blocks) => blocks
+            .iter()
+            .filter_map(|c| match c {
+                Content::Text(t) => Some(t.text.clone()),
+                _ => None,
+            })
+            .collect(),
+    }
+}
+
+/// Render the restored session's prior transcript (user + assistant messages)
+/// into the chat container. Called at TUI startup for `--continue`/`--resume`/
+/// `--session` launches; a no-op for fresh sessions (no entries). Best-effort:
+/// any session read failure just starts with an empty transcript.
+async fn render_session_history(harness: &AgentHarness, chat: &Arc<Container>) {
+    let tree = harness.session().view("main");
+    let entries = match tree.find_entries(&EntryQuery {
+        entry_type: None,
+        custom_type: None,
+        order: None,
+        limit: None,
+        cursor: None,
+    }).await {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let mut rendered_any = false;
+    for e in entries {
+        let Entry::Message(me) = e else { continue };
+        match &me.message {
+            AgentMessage::User(u) => {
+                add_user_message(chat, &user_message_text(u));
+                rendered_any = true;
+            }
+            AgentMessage::Assistant(a) => {
+                let comp = Arc::new(AssistantMessageComponent::new(
+                    AssistantMessageOptions::default(),
+                ));
+                comp.update_blocks(&assistant_blocks(a));
+                chat.add_child(comp);
+                chat.add_child(Arc::new(Spacer::new(1)));
+                rendered_any = true;
+            }
+            _ => {}
+        }
+    }
+    if rendered_any {
+        chat.add_child(Arc::new(Spacer::new(1)));
+    }
+}
+
 /// Project an assistant message's content into the provider-free
 /// [`AssistantBlock`] list (text + thinking blocks, in document order) the
 /// `AssistantMessageComponent` renders. Tool-call/image blocks are dropped —
@@ -935,6 +992,12 @@ pub async fn interactive_tui(
     // v1 simplifies to a one-shot banner (theme still pickable via `/theme`,
     // analytics deferred — no telemetry wiring). See `extras.rs`.
     crate::extras::maybe_first_time_setup(&chat_container);
+
+    // A --continue/--resume/--session launch opens on an existing JSONL
+    // session — render its prior user/assistant transcript so the user sees
+    // where they left off (tool executions are skipped: their live display
+    // belongs to the current run, and replaying old results would be noise).
+    render_session_history(&harness, &chat_container).await;
 
     // `document_container` wraps the welcome header + chat so the scrollview
     // follows the whole transcript (mirrors TS `documentContainer`).

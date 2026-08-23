@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use rpi_ai::{CacheRetention, Model, Provider, SimpleStreamOptions, ThinkingLevel};
+use rpi_ai::{CacheRetention, Model, Provider, ProviderHooks, SimpleStreamOptions, ThinkingLevel};
 use rpi_agent::{
     AgentTool, AfterToolCall, BeforeToolCall, ConvertToLlm, QueueMode, TransformContext,
 };
@@ -340,6 +340,13 @@ pub struct AgentHarnessOptions {
     /// entries/records through this facade (mirrors TS `options.session`).
     pub session: Session,
 
+    /// Allow [`AgentHarness::create`] to proceed when the session already has
+    /// records. `false` (default) keeps the v1 guard that rejects a non-empty
+    /// session (`create.restore is not implemented`); the `--continue`/
+    /// `--resume`/`--session` restore path sets it so the harness loads the
+    /// existing transcript and keeps appending to the same file.
+    pub allow_existing_session: bool,
+
     /// Provider registry keyed by `model.provider`. The harness resolves which
     /// provider serves the configured `model` (and any compaction model) and
     /// calls `provider.stream_simple` inside the `StreamFn` it builds. Mirrors
@@ -392,6 +399,19 @@ pub struct AgentHarnessOptions {
     /// (agent_harness.rs:520); this field lets a host inject transforms (the
     /// pi `context`/`transform_context` event folds here too).
     pub entry_transforms: Vec<ContextEntryTransform>,
+
+    // ---- B4: per-call provider hooks ---------------------------------------
+    //
+    // `ProviderHooks` (defined in rpi-ai, cycle-free) is a sidecar trait the
+    // harness fires inside its `StreamFn` closure before each `stream_simple`
+    // call. This lets an extension's `before_provider_request` /
+    // `before_provider_headers` / `after_provider_response` `on()` handlers
+    // patch the live `SimpleStreamOptions` per call (e.g. rotate a header,
+    // inject a request id) — NOT once per run at the config-build site (that
+    // would not be equivalent to pi's `beforeRequest`, which runs before every
+    // provider call). `None` (default) = no hooks; the harness code path stays
+    // uniform via `NoopProviderHooks`.
+    pub provider_hooks: Option<Arc<dyn ProviderHooks>>,
 }
 
 impl Default for AgentHarnessOptions {
@@ -428,6 +448,7 @@ impl Default for AgentHarnessOptions {
                 )),
                 None,
             ),
+            allow_existing_session: false,
             models: Vec::new(),
             to_provider_messages: None,
             entry_projectors: BTreeMap::new(),
@@ -436,6 +457,7 @@ impl Default for AgentHarnessOptions {
             after_tool_call: None,
             transform_context: None,
             entry_transforms: Vec::new(),
+            provider_hooks: None,
         }
     }
 }

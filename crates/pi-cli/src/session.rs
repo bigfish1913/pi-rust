@@ -93,19 +93,23 @@ Current working directory: {cwd}"
     )
 }
 
-/// How the user asked to select a session. v1 only honors `NoSession`
-/// (ephemeral `InMemorySessionStorage`) and `New` (a fresh JSONL file). The
-/// continue/resume/specific-session paths are recognized but not wired (the
-/// harness rejects restore — see module docs).
+/// How the user asked to select a session. v1 honors `NoSession` (ephemeral
+/// `InMemorySessionStorage`), `New` (a fresh JSONL file), and — new this pass —
+/// `Latest` / `ById`, which **restore** an existing JSONL session on launch
+/// (`--continue`/`-c`, `--resume`/`-r`, `--session <id|path>`). The restored
+/// transcript renders into the TUI on startup and the run continues appending
+/// to the same file.
 #[derive(Debug, Clone)]
 pub enum SessionSelection {
     /// `--no-session`: ephemeral, in-memory, nothing persisted.
     Ephemeral,
     /// Fresh durable JSONL session under `--session-dir` (or the default dir).
     New { dir: PathBuf, name: Option<String> },
-    /// `-c` / `-r` / `--session <id|path>`: requested an existing session.
-    /// v1 can't restore it, so [`build`] surfaces an error.
-    Existing { requested: String },
+    /// `-c` / `-r`: restore the most recent session in the default dir.
+    Latest,
+    /// `--session <id|path>`: restore the session whose id matches, or whose
+    /// file name contains the id.
+    ById { id: String },
 }
 
 /// Decide the session selection from parsed args + the resolved cwd.
@@ -113,14 +117,12 @@ pub fn select_session(args: &Args, cwd: &Path) -> SessionSelection {
     if args.no_session {
         return SessionSelection::Ephemeral;
     }
-    if args.continue_session {
-        return SessionSelection::Existing { requested: "--continue".into() };
-    }
-    if args.resume {
-        return SessionSelection::Existing { requested: "--resume".into() };
+    if args.continue_session || args.resume {
+        // `--continue` and `--resume` both restore the most recent session.
+        return SessionSelection::Latest;
     }
     if let Some(s) = &args.session {
-        return SessionSelection::Existing { requested: s.clone() };
+        return SessionSelection::ById { id: s.clone() };
     }
     let dir = args
         .session_dir
@@ -404,6 +406,12 @@ pub async fn build(
                 Some(prompt_templates)
             },
         },
+        // A restored session (--continue/--resume/--session) already has
+        // records — let the harness load it and keep appending.
+        allow_existing_session: matches!(
+            selection,
+            SessionSelection::Latest | SessionSelection::ById { .. }
+        ),
         stream_options: Default::default(),
         retry: RetryPolicy::default(),
         compaction: CompactionSettings::default(),
@@ -425,6 +433,9 @@ pub async fn build(
         after_tool_call: None,
         transform_context: None,
         entry_transforms: Vec::new(),
+        // Extension provider hooks (B4) land here once the adapter wires them;
+        // a plain session runs hook-free.
+        provider_hooks: None,
     };
 
     AgentHarness::create(options)
@@ -438,8 +449,8 @@ pub async fn build(
 pub enum BuildError {
     #[error("Could not create the session directory: {0}")]
     SessionDir(String),
-    #[error("Session restore is not implemented in v1 (requested: {requested}). Start a fresh session instead (drop {flag}).")]
-    RestoreNotImplemented { requested: String, flag: &'static str },
+    #[error("No session found for {requested} in {dir}. Start a fresh session instead (drop --continue/--resume/--session).")]
+    SessionNotFound { requested: String, dir: String },
     #[error("Could not build the harness: {0}")]
     HarnessCreate(String),
 }
@@ -559,19 +570,65 @@ async fn build_session(selection: &SessionSelection, cwd: &str) -> Result<Sessio
                 .map_err(|e| BuildError::SessionDir(format!("{}: {e}", dir.display())))?;
             Ok(session)
         }
-        SessionSelection::Existing { requested } => {
-            // Map the request to the flag that produced it for a helpful message.
-            let flag = match requested.as_str() {
-                "--continue" => "--continue",
-                "--resume" => "--resume",
-                _ => "--session",
-            };
-            Err(BuildError::RestoreNotImplemented {
-                requested: requested.clone(),
-                flag,
-            })
+        SessionSelection::Latest | SessionSelection::ById { .. } => {
+            restore_session(selection, cwd).await
         }
     }
+}
+
+/// Open an existing JSONL session for `Latest` / `ById`. Mirrors the TS
+/// `SessionManager.resume`/`open` flow: list the session dir (newest-first),
+/// match the request, then open the matched file and wrap it in a `Session`
+/// facade. The restored transcript renders into the TUI at startup and the
+/// harness continues appending to the same file.
+async fn restore_session(selection: &SessionSelection, cwd: &str) -> Result<Session, BuildError> {
+    use rpi_harness::session::jsonl::{
+        JsonlSessionListOptions, JsonlSessionRepo, JsonlSessionRepoOptions,
+    };
+    use rpi_harness::session::types::SessionStorage;
+    use rpi_tools::FileSystem;
+
+    let dir = default_session_dir(Path::new(cwd));
+    let env = Arc::new(OsExecutionEnv::with_cwd(PathBuf::from(cwd)));
+    let fs: Arc<dyn FileSystem> = env.clone();
+    let repo = JsonlSessionRepo::with_env_cwd(JsonlSessionRepoOptions {
+        fs: fs.clone(),
+        sessions_root: dir.to_string_lossy().into_owned(),
+        clock: Arc::new(SystemClock),
+        ids: Arc::new(DefaultIdGenerator::new()),
+    });
+    let metas = repo
+        .list_typed(&JsonlSessionListOptions::default())
+        .await
+        .map_err(|e| BuildError::SessionDir(format!("list sessions: {e}")))?;
+
+    // `list_typed` is newest-first; `Latest` takes the head, `ById` matches
+    // the id exactly or by file-name containment (so `--session 01a02…` or a
+    // partial id works, mirroring the TS id/path matching).
+    let matched = match selection {
+        SessionSelection::Latest => metas.first(),
+        SessionSelection::ById { id } => metas
+            .iter()
+            .find(|m| m.id == *id || m.path.contains(id.as_str()) || id.contains(&m.id)),
+        _ => unreachable!("restore_session only called for Latest/ById"),
+    };
+    let Some(meta) = matched else {
+        let requested = match selection {
+            SessionSelection::Latest => "the most recent session".to_string(),
+            SessionSelection::ById { id } => format!("--session {id}"),
+            _ => unreachable!(),
+        };
+        return Err(BuildError::SessionNotFound {
+            requested,
+            dir: dir.display().to_string(),
+        });
+    };
+    let storage = repo
+        .open_by_jsonl_metadata(meta)
+        .await
+        .map_err(|e| BuildError::SessionDir(format!("open {}: {e}", meta.path)))?;
+    let storage_arc: Arc<dyn SessionStorage> = Arc::new(storage);
+    Ok(Session::new(storage_arc, None))
 }
 
 /// A fresh ephemeral in-memory session (no persistence). Used for `--no-session`.
@@ -663,12 +720,25 @@ mod tests {
     }
 
     #[test]
-    fn select_existing_for_continue() {
+    fn select_latest_for_continue_and_resume() {
         let args = Args { continue_session: true, ..Args::default() };
+        let cwd = Path::new("/tmp");
+        assert!(matches!(select_session(&args, cwd), SessionSelection::Latest));
+
+        let args = Args { resume: true, ..Args::default() };
+        assert!(matches!(select_session(&args, cwd), SessionSelection::Latest));
+    }
+
+    #[test]
+    fn select_by_id_for_session_flag() {
+        let args = Args {
+            session: Some("01a02ece".into()),
+            ..Args::default()
+        };
         let cwd = Path::new("/tmp");
         assert!(matches!(
             select_session(&args, cwd),
-            SessionSelection::Existing { .. }
+            SessionSelection::ById { id } if id == "01a02ece"
         ));
     }
 

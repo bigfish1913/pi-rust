@@ -53,7 +53,13 @@ impl From<serde_json::Value> for Schema {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TextContent {
-    #[serde(rename = "type")]
+    // `kind` renames to "type" so direct serialization carries the block
+    // discriminator. `default`: `Content` is `#[serde(tag="type")]`, and the
+    // tagged path consumes the `type` field as the tag before the payload is
+    // deserialized — without a default, re-reading a persisted `Content`
+    // failed with "missing field `type`" (sessions could be written but never
+    // restored). The unit-marker default is the correct value per variant.
+    #[serde(default, rename = "type")]
     pub kind: TextContentType,
     pub text: String,
     /// Provider message-metadata signature (OpenAI Responses legacy id string or
@@ -84,7 +90,7 @@ impl<'de> Deserialize<'de> for TextContentType {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThinkingContent {
-    #[serde(rename = "type")]
+    #[serde(default, rename = "type")]
     pub kind: ThinkingContentType,
     pub thinking: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -147,7 +153,7 @@ impl<'de> Deserialize<'de> for ImageContentType {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolCall {
-    #[serde(rename = "type")]
+    #[serde(default, rename = "type")]
     pub kind: ToolCallType,
     pub id: String,
     pub name: String,
