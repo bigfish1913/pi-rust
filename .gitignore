@@ -10,3 +10,4 @@
 *-publish.log
 task-*.log
 release-*.log
+.claude/*

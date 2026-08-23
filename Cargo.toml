@@ -10,6 +10,7 @@ members = [
     "crates/pi-cli",
     "crates/pi-tui",
     "crates/rpi-plugin-sdk",
+    "crates/rpi-extensions",
     "examples/minimal",
     "examples/tools",
     "examples/tui",
@@ -72,6 +73,7 @@ rpi-harness = { path = "crates/pi-harness", version = "0.1.3" }
 rpi-tui = { path = "crates/pi-tui", version = "0.1.3" }
 
 rpi-plugin-sdk = { path = "crates/rpi-plugin-sdk", version = "0.1.3" }
+rpi-extensions = { path = "crates/rpi-extensions", version = "0.1.3" }
 
 [profile.release]
 lto = "thin"
