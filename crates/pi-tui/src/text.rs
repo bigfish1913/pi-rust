@@ -53,9 +53,14 @@ impl Component for Text {
             } else {
                 line.to_string()
             };
-            // Truncate to width
-            let truncated = if padded.len() > width {
-                padded[..width].to_string()
+            // Truncate to width — ANSI-aware + char-boundary-safe. The old
+            // `padded[..width]` byte-sliced and panicked mid-character on
+            // multi-byte chars (e.g. `⏎` is 3 bytes: "end byte index 120 is
+            // not a char boundary") whenever a line containing one was wider
+            // than the layout column. `truncate_to_width` walks chars, tracks
+            // escape sequences, and keeps the visible width within `width`.
+            let truncated = if crate::ansi::visible_width(&padded) > width {
+                crate::utils::truncate_to_width(&padded, width, "")
             } else {
                 padded
             };
@@ -80,5 +85,39 @@ impl Component for Text {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::component::Component;
+
+    /// Regression: rendering a line wider than the layout column used to
+    /// byte-slice `padded[..width]` and panic mid-character on multi-byte
+    /// chars — "end byte index 120 is not a char boundary; it is inside
+    /// '⏎' (bytes 119..122)". Truncation must never split a char: it keeps
+    /// whole chars whose visible width fits the column.
+    #[test]
+    fn render_truncates_multibyte_at_char_boundary() {
+        let t = Text::new("x⏎y", 0, 0);
+        // Width 1: only 'x' fits (the 3-byte ⏎ is dropped whole, never split).
+        let out = t.render(1);
+        assert_eq!(out[0], "x");
+        // Width 2: 'x' + '⏎' (⏎ is visible-width 1) — whole chars only.
+        let out = t.render(2);
+        assert_eq!(out[0], "x⏎");
+        // Width 3: everything fits unchanged.
+        let out = t.render(3);
+        assert_eq!(out[0], "x⏎y");
+    }
+
+    #[test]
+    fn render_keeps_ansi_and_truncates() {
+        let styled = "\x1b[31mred\x1b[0m text";
+        let t = Text::new(styled, 0, 0);
+        let out = t.render(3);
+        // No panic on ANSI content; visible width respected.
+        assert!(crate::ansi::visible_width(&out[0]) <= 3);
     }
 }

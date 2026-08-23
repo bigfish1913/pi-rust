@@ -26,7 +26,7 @@
 use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::sync::Arc;
-use std::sync::mpsc::channel;
+use std::sync::mpsc::{self, channel};
 
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use tokio::sync::broadcast;
@@ -37,7 +37,7 @@ use rpi_harness::agent_harness::{AgentHarness, AgentLane, HarnessRunOutcome};
 use rpi_tui::{
     AutocompleteManager, CombinedAutocompleteProvider, Container, Editor, EditorOptions,
     EditorStyle, FilePathAutocompleteProvider, Focusable, FollowMode, Loader, ProcessTerminal,
-    ScrollView, ScrollViewOptions, SlashCommand, SlashCommandAutocompleteProvider, Spacer,
+    ScrollView, ScrollViewOptions, SlashCommand as SlashCommandEntry, SlashCommandAutocompleteProvider, Spacer,
     StackChild, StackEntry, Text, TuiAltScreen, TUI, VStack, AssistantBlock,
     AssistantMessageComponent, AssistantMessageOptions, AutocompleteSuggestions,
     FooterComponent, SelectList, SelectItem, ThemeManager, ThemePreset,
@@ -51,128 +51,531 @@ use rpi_tui::BashStatus;
 use crate::args::Args;
 
 // ===========================================================================
-// Slash commands
+// Slash commands — trait + registry
 // ===========================================================================
+//
+// Each built-in slash command is one `impl SlashCommand`. The commands are
+// registered at startup into a [`CommandRegistry`] (one source of truth) that
+// serves both dispatch ("given this token, run the command") and autocomplete
+// ("list the visible commands"). This replaces the old two-list + sync-test
+// arrangement, where `handle_slash_command` and `v1_slash_commands()` had to be
+// kept in lock-step by hand.
+//
+// `execute` runs on the blocking key/compose thread (the editor `on_submit`
+// callback and the Ctrl+L hotkey both land there), so it MUST stay synchronous:
+//   - commands needing async (`set_model`/`set_thinking_level`/`set_active_tools`)
+//     `tokio::spawn` the work and return immediately;
+//   - commands needing the main async loop (`compact`/`copy`/`exit`/`clear`/
+//     `user-input`) signal it via `ctx.tx.send(TuiMessage::…)`;
+//   - everything else mutates the chat container + requests a render directly.
 
-/// Result of slash command handling.
-enum SlashCommandResult {
-    /// Exit the application.
-    Exit,
-    /// Clear the chat.
-    ClearChat,
-    /// Unknown command.
-    Unknown,
-    /// Not a command, send as message.
-    SendMessage(String),
-    /// Show help information.
-    Help,
-    /// Show version.
-    Version,
-    /// Show hotkeys.
-    Hotkeys,
-    /// Open the model selector overlay.
-    SelectModel,
-    /// Open the thinking-level selector overlay.
-    SelectThinking,
-    /// Open the tools toggle selector overlay.
-    SelectTools,
-    /// Open the image-display toggle overlay.
-    SelectImages,
-    /// Show the armin easter-egg.
-    Armin,
-    /// Show the earendil announcement.
-    Earendil,
-    /// Open the session selector overlay.
-    SelectSession,
-    /// Open the theme selector overlay.
-    SelectTheme,
-    /// Compact the conversation (lane.compact).
-    Compact,
-    /// Copy the last assistant message to the clipboard.
-    Copy,
-    /// Show the discovered resources panel: loaded context files, skills, and
-    /// prompt templates (Part A `/context`). Resolved here (not in
-    /// `handle_slash_command`) because it needs the harness resources.
-    Context,
-    /// Not supported in this v1 build (carries the command for the message).
-    Unsupported(String),
+/// The borrowed world a slash command runs against. All fields are `Arc` (or a
+/// cheap `String` snapshot), so one `CommandContext` clones freely into each
+/// command without per-capture ceremony — this struct is exactly the set of
+/// `*_for_cb` clones the old submit closure used to make individually.
+#[derive(Clone)]
+struct CommandContext {
+    chat: Arc<Container>,
+    tui: Arc<TuiAltScreen>,
+    tx: mpsc::Sender<TuiMessage>,
+    state: Arc<TuiState>,
+    editor: Arc<Editor>,
+    editor_container: Arc<Container>,
+    lane: Arc<dyn AgentLane>,
+    model_catalog: Arc<Vec<rpi_ai::Model>>,
+    /// Lane model id snapshot, read once via `lane.get_model().await` BEFORE the
+    /// blocking key loop starts. Selectors/key loop can't await, so they read
+    /// this owned string instead. Semantically unchanged from pre-refactor.
+    lane_model_id: String,
+    cwd: std::path::PathBuf,
+    /// Harness resources snapshot (skills + prompt templates) for `/context`.
+    /// Captured once at TUI startup because the blocking submit thread can't
+    /// `.await get_resources()`.
+    resources: Arc<rpi_harness::types::AgentHarnessResources>,
 }
 
-/// Handle slash commands. Returns the result indicating what action to take.
-///
-/// Mirrors the v1-applicable subset of the TS `BUILTIN_SLASH_COMMANDS`
-/// (`.reference/.../core/slash-commands.ts`). Commands beyond the v1 surface
-/// resolve to `Unsupported` with a consistent message.
-fn handle_slash_command(text: &str) -> SlashCommandResult {
-    let parts: Vec<&str> = text.split_whitespace().collect();
-    if parts.is_empty() {
-        return SlashCommandResult::SendMessage(text.to_string());
+/// One slash command.
+trait SlashCommand: Send + Sync {
+    /// Canonical name, with the leading `/` (e.g. "/model").
+    fn name(&self) -> &'static str;
+    /// Aliases, also `/`-prefixed. Matched alongside `name()` during dispatch.
+    /// Use [`SlashCommand::alias_visible`] to also surface an alias in the
+    /// `/`-autocomplete list (most aliases stay hidden).
+    fn aliases(&self) -> &'static [&'static str] {
+        &[]
+    }
+    /// Whether the canonical name appears in the `/` autocomplete list. Hidden
+    /// commands (`/context`, `/name`, …) return `false`.
+    fn visible(&self) -> bool {
+        true
+    }
+    /// Aliases that should also appear in the `/` autocomplete list. Defaults to
+    /// none — most aliases (`/q`, `/m`, `/think`, `/resume`, `/v`) are kept off
+    /// the list to keep it short. `/new` and `/quit` override this to surface.
+    fn alias_visible(&self) -> &'static [&'static str] {
+        &[]
+    }
+    /// Description shown in autocomplete and `/help`. A non-empty description is
+    /// required to surface in autocomplete even when `visible()` is true.
+    fn description(&self) -> &'static str {
+        ""
+    }
+    /// Execute the command. Only invoked for inputs starting with `/` whose
+    /// first token matches `name()` or an alias. Must stay synchronous (see the
+    /// module-level note).
+    fn execute(&self, ctx: &CommandContext);
+}
+
+/// Holds all registered slash commands; the single source of truth for both
+/// dispatch and the autocomplete list.
+struct CommandRegistry {
+    commands: Vec<Arc<dyn SlashCommand>>,
+}
+
+impl CommandRegistry {
+    fn new() -> Self {
+        Self { commands: Vec::new() }
     }
 
-    let command = parts[0];
-    match command {
-        "/help" | "/?" => SlashCommandResult::Help,
-        "/clear" | "/new" => SlashCommandResult::ClearChat,
-        "/exit" | "/quit" | "/q" => SlashCommandResult::Exit,
-        "/version" | "/v" => SlashCommandResult::Version,
-        "/model" | "/m" => SlashCommandResult::SelectModel,
-        "/thinking" | "/think" => SlashCommandResult::SelectThinking,
-        "/tools" => SlashCommandResult::SelectTools,
-        "/images" => SlashCommandResult::SelectImages,
-        "/armin" => SlashCommandResult::Armin,
-        "/earendil" => SlashCommandResult::Earendil,
-        "/hotkeys" => SlashCommandResult::Hotkeys,
-        "/session" | "/resume" => SlashCommandResult::SelectSession,
-        "/theme" => SlashCommandResult::SelectTheme,
-        "/compact" => SlashCommandResult::Compact,
-        "/copy" => SlashCommandResult::Copy,
-        // `/context` lists discovered context files, skills, and prompt
-        // templates. Resolved in the submit handler (needs the resources
-        // snapshot), so it just signals the intent here.
-        "/context" => SlashCommandResult::Context,
-        // `/name` is recognized-v1 but inert (no session-renaming surface yet).
-        "/name" => SlashCommandResult::Unsupported("/name".to_string()),
-        // The remaining TS builtins are out of v1 scope.
-        "/settings"
-        | "/scoped-models"
-        | "/export"
-        | "/import"
-        | "/share"
-        | "/fork"
-        | "/clone"
-        | "/tree"
-        | "/trust"
-        | "/login"
-        | "/logout"
-        | "/reload" => SlashCommandResult::Unsupported(command.to_string()),
-        _ => SlashCommandResult::Unknown,
+    fn register(&mut self, cmd: Arc<dyn SlashCommand>) {
+        self.commands.push(cmd);
+    }
+
+    /// Find the command whose `name()` or an alias matches `token` (e.g. "/q").
+    /// `token` is the first whitespace-delimited word of the input, `/`-prefixed.
+    fn find(&self, token: &str) -> Option<&Arc<dyn SlashCommand>> {
+        self.commands
+            .iter()
+            .find(|c| c.name() == token || c.aliases().contains(&token))
+    }
+
+    /// The autocomplete entries, derived from the registry so it can never drift
+    /// from what dispatch recognizes. Surfaces the canonical name when
+    /// `visible()` + non-empty description, plus any `alias_visible()` entries.
+    /// Order = registration order; built-ins are registered before templates,
+    /// so they win on a fuzzy tie (unchanged).
+    fn visible_entries(&self) -> Vec<SlashCommandEntry> {
+        let mut out: Vec<SlashCommandEntry> = Vec::new();
+        for c in &self.commands {
+            if c.visible() && !c.description().is_empty() {
+                out.push(SlashCommandEntry {
+                    name: c.name().into(),
+                    description: c.description().into(),
+                });
+            }
+            // Surfaced aliases share the command's description.
+            for alias in c.alias_visible() {
+                out.push(SlashCommandEntry {
+                    name: (*alias).into(),
+                    description: c.description().into(),
+                });
+            }
+        }
+        out
     }
 }
 
-/// The v1 slash commands surfaced to the autocomplete provider (the TS
-/// `BUILTIN_SLASH_COMMANDS` v1 subset, with descriptions). Kept in sync with
-/// [`handle_slash_command`] so `/`-autocomplete lists exactly the commands the
-/// dispatcher recognizes.
-fn v1_slash_commands() -> Vec<SlashCommand> {
-    vec![
-        SlashCommand { name: "/help".into(), description: "Show available commands".into() },
-        SlashCommand { name: "/clear".into(), description: "Clear the conversation".into() },
-        SlashCommand { name: "/new".into(), description: "Clear the conversation".into() },
-        SlashCommand { name: "/exit".into(), description: "Exit the application".into() },
-        SlashCommand { name: "/quit".into(), description: "Exit the application".into() },
-        SlashCommand { name: "/version".into(), description: "Show version information".into() },
-        SlashCommand { name: "/model".into(), description: "Choose a model (selector)".into() },
-        SlashCommand { name: "/thinking".into(), description: "Set thinking level (selector)".into() },
-        SlashCommand { name: "/tools".into(), description: "Toggle tools on/off".into() },
-        SlashCommand { name: "/images".into(), description: "Toggle inline images".into() },
-        SlashCommand { name: "/session".into(), description: "List saved sessions".into() },
-        SlashCommand { name: "/theme".into(), description: "Choose a theme (selector)".into() },
-        SlashCommand { name: "/compact".into(), description: "Compact the conversation".into() },
-        SlashCommand { name: "/copy".into(), description: "Copy last reply to clipboard".into() },
-        SlashCommand { name: "/hotkeys".into(), description: "Show keyboard shortcuts".into() },
-        SlashCommand { name: "/armin".into(), description: "??? (easter egg)".into() },
-        SlashCommand { name: "/earendil".into(), description: "Announcement".into() },
-    ]
+/// Resolve the command for a `/`-prefixed input and run it, or emit the
+/// unknown-command error if nothing matches. Non-slash text never reaches here
+/// — callers route only `/`-prefixed inputs and send plain text directly.
+fn dispatch_slash(text: &str, ctx: &CommandContext, registry: &CommandRegistry) {
+    let token = text.split_whitespace().next().unwrap_or("");
+    match registry.find(token) {
+        Some(cmd) => cmd.execute(ctx),
+        None => {
+            add_error_message(
+                &ctx.chat,
+                &format!("Unknown command: {text}. Type /help for available commands."),
+            );
+            ctx.tui.request_render(false);
+        }
+    }
+}
+
+/// A slash command that is recognized but not implemented in this v1 build.
+/// One struct feeds every `/settings`/`/export`/… entry — no per-command
+/// boilerplate.
+struct UnsupportedCommand {
+    name: &'static str,
+    desc: &'static str,
+}
+
+impl UnsupportedCommand {
+    fn new(name: &'static str, desc: &'static str) -> Self {
+        Self { name, desc }
+    }
+}
+
+impl SlashCommand for UnsupportedCommand {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+    /// Visible with a description so autocomplete lists it (the user discovers
+    /// the command exists) even though running it reports "not supported".
+    fn description(&self) -> &'static str {
+        self.desc
+    }
+    fn execute(&self, ctx: &CommandContext) {
+        add_note_message(&ctx.chat, &format!("{} is not supported in v1.", self.name));
+        ctx.tui.request_render(false);
+    }
+}
+
+// ---- Built-in command implementations ----
+
+struct HelpCommand;
+impl SlashCommand for HelpCommand {
+    fn name(&self) -> &'static str {
+        "/help"
+    }
+    fn aliases(&self) -> &'static [&'static str] {
+        &["/?"]
+    }
+    fn description(&self) -> &'static str {
+        "Show available commands"
+    }
+    fn execute(&self, ctx: &CommandContext) {
+        add_help_message(&ctx.chat);
+        ctx.tui.request_render(false);
+    }
+}
+
+struct ClearChatCommand;
+impl SlashCommand for ClearChatCommand {
+    fn name(&self) -> &'static str {
+        "/clear"
+    }
+    fn aliases(&self) -> &'static [&'static str] {
+        &["/new"]
+    }
+    // `/new` carries its own weight as a discoverable entry, so surface it.
+    fn alias_visible(&self) -> &'static [&'static str] {
+        &["/new"]
+    }
+    fn description(&self) -> &'static str {
+        "Clear the conversation"
+    }
+    fn execute(&self, ctx: &CommandContext) {
+        let _ = ctx.tx.send(TuiMessage::ClearChat);
+    }
+}
+
+struct ExitCommand;
+impl SlashCommand for ExitCommand {
+    fn name(&self) -> &'static str {
+        "/exit"
+    }
+    fn aliases(&self) -> &'static [&'static str] {
+        &["/quit", "/q"]
+    }
+    // `/quit` is surfaced (matches pi's BUILTIN list); `/q` stays a hidden alias.
+    fn alias_visible(&self) -> &'static [&'static str] {
+        &["/quit"]
+    }
+    fn description(&self) -> &'static str {
+        "Exit the application"
+    }
+    fn execute(&self, ctx: &CommandContext) {
+        let _ = ctx.tx.send(TuiMessage::Exit);
+    }
+}
+
+struct VersionCommand;
+impl SlashCommand for VersionCommand {
+    fn name(&self) -> &'static str {
+        "/version"
+    }
+    fn aliases(&self) -> &'static [&'static str] {
+        &["/v"]
+    }
+    fn description(&self) -> &'static str {
+        "Show version information"
+    }
+    fn execute(&self, ctx: &CommandContext) {
+        add_version_message(&ctx.chat);
+        ctx.tui.request_render(false);
+    }
+}
+
+struct HotkeysCommand;
+impl SlashCommand for HotkeysCommand {
+    fn name(&self) -> &'static str {
+        "/hotkeys"
+    }
+    fn description(&self) -> &'static str {
+        "Show keyboard shortcuts"
+    }
+    fn execute(&self, ctx: &CommandContext) {
+        add_hotkeys_message(&ctx.chat);
+        ctx.tui.request_render(false);
+    }
+}
+
+struct ModelCommand;
+impl SlashCommand for ModelCommand {
+    fn name(&self) -> &'static str {
+        "/model"
+    }
+    fn aliases(&self) -> &'static [&'static str] {
+        &["/m"]
+    }
+    fn description(&self) -> &'static str {
+        "Choose a model (selector)"
+    }
+    fn execute(&self, ctx: &CommandContext) {
+        open_model_selector(
+            &ctx.state,
+            &ctx.editor_container,
+            &ctx.editor,
+            &ctx.tui,
+            &ctx.model_catalog,
+            &ctx.lane,
+            &ctx.lane_model_id,
+            &ctx.chat,
+        );
+    }
+}
+
+struct ThinkingCommand;
+impl SlashCommand for ThinkingCommand {
+    fn name(&self) -> &'static str {
+        "/thinking"
+    }
+    fn aliases(&self) -> &'static [&'static str] {
+        &["/think"]
+    }
+    fn description(&self) -> &'static str {
+        "Set thinking level (selector)"
+    }
+    fn execute(&self, ctx: &CommandContext) {
+        open_thinking_selector(
+            &ctx.state,
+            &ctx.editor_container,
+            &ctx.editor,
+            &ctx.tui,
+            &ctx.lane,
+            &ctx.model_catalog,
+            &ctx.lane_model_id,
+            &ctx.chat,
+        );
+    }
+}
+
+struct ToolsCommand;
+impl SlashCommand for ToolsCommand {
+    fn name(&self) -> &'static str {
+        "/tools"
+    }
+    fn description(&self) -> &'static str {
+        "Toggle tools on/off"
+    }
+    fn execute(&self, ctx: &CommandContext) {
+        open_tools_selector(
+            &ctx.state,
+            &ctx.editor_container,
+            &ctx.editor,
+            &ctx.tui,
+            &ctx.lane,
+            &ctx.chat,
+        );
+    }
+}
+
+struct ImagesCommand;
+impl SlashCommand for ImagesCommand {
+    fn name(&self) -> &'static str {
+        "/images"
+    }
+    fn description(&self) -> &'static str {
+        "Toggle inline images"
+    }
+    fn execute(&self, ctx: &CommandContext) {
+        open_images_selector(
+            &ctx.state,
+            &ctx.editor_container,
+            &ctx.editor,
+            &ctx.tui,
+            &ctx.chat,
+        );
+    }
+}
+
+struct SessionCommand;
+impl SlashCommand for SessionCommand {
+    fn name(&self) -> &'static str {
+        "/session"
+    }
+    fn aliases(&self) -> &'static [&'static str] {
+        &["/resume"]
+    }
+    fn description(&self) -> &'static str {
+        "List saved sessions"
+    }
+    fn execute(&self, ctx: &CommandContext) {
+        open_session_selector(
+            &ctx.state,
+            &ctx.editor_container,
+            &ctx.editor,
+            &ctx.tui,
+            &ctx.cwd,
+        );
+    }
+}
+
+struct ThemeCommand;
+impl SlashCommand for ThemeCommand {
+    fn name(&self) -> &'static str {
+        "/theme"
+    }
+    fn description(&self) -> &'static str {
+        "Choose a theme (selector)"
+    }
+    fn execute(&self, ctx: &CommandContext) {
+        open_theme_selector(&ctx.state, &ctx.editor_container, &ctx.editor, &ctx.tui);
+    }
+}
+
+struct CompactCommand;
+impl SlashCommand for CompactCommand {
+    fn name(&self) -> &'static str {
+        "/compact"
+    }
+    fn description(&self) -> &'static str {
+        "Compact the conversation"
+    }
+    fn execute(&self, ctx: &CommandContext) {
+        let _ = ctx.tx.send(TuiMessage::Compact);
+    }
+}
+
+struct CopyCommand;
+impl SlashCommand for CopyCommand {
+    fn name(&self) -> &'static str {
+        "/copy"
+    }
+    fn description(&self) -> &'static str {
+        "Copy last reply to clipboard"
+    }
+    fn execute(&self, ctx: &CommandContext) {
+        let _ = ctx.tx.send(TuiMessage::Copy);
+    }
+}
+
+struct ArminCommand;
+impl SlashCommand for ArminCommand {
+    fn name(&self) -> &'static str {
+        "/armin"
+    }
+    fn description(&self) -> &'static str {
+        "??? (easter egg)"
+    }
+    fn execute(&self, ctx: &CommandContext) {
+        crate::extras::add_armin(&ctx.chat);
+        ctx.tui.request_render(false);
+    }
+}
+
+struct EarendilCommand;
+impl SlashCommand for EarendilCommand {
+    fn name(&self) -> &'static str {
+        "/earendil"
+    }
+    fn description(&self) -> &'static str {
+        "Announcement"
+    }
+    fn execute(&self, ctx: &CommandContext) {
+        crate::extras::add_earendil(&ctx.chat);
+        ctx.tui.request_render(false);
+    }
+}
+
+/// `/context` — lists discovered context files, skills, and prompt templates.
+/// Hidden from autocomplete (needs the resources snapshot to be meaningful as a
+/// discovery surface; like `/name`, it's recognized-v1 but kept off the list).
+struct ContextCommand;
+impl SlashCommand for ContextCommand {
+    fn name(&self) -> &'static str {
+        "/context"
+    }
+    fn visible(&self) -> bool {
+        false
+    }
+    fn execute(&self, ctx: &CommandContext) {
+        show_context_panel(&ctx.chat, &ctx.resources);
+        ctx.tui.request_render(false);
+    }
+}
+
+/// Build the full command registry: active built-ins first (so they win on a
+/// fuzzy autocomplete tie), then the v1-out-of-scope stubs. Prompt-template
+/// commands are merged in separately by the autocomplete builder (they dispatch
+/// via template expansion, not this registry).
+fn build_builtin_registry() -> CommandRegistry {
+    let mut r = CommandRegistry::new();
+    r.register(Arc::new(HelpCommand));
+    r.register(Arc::new(ClearChatCommand));
+    r.register(Arc::new(ExitCommand));
+    r.register(Arc::new(VersionCommand));
+    r.register(Arc::new(ModelCommand));
+    r.register(Arc::new(ThinkingCommand));
+    r.register(Arc::new(ToolsCommand));
+    r.register(Arc::new(ImagesCommand));
+    r.register(Arc::new(SessionCommand));
+    r.register(Arc::new(ThemeCommand));
+    r.register(Arc::new(CompactCommand));
+    r.register(Arc::new(CopyCommand));
+    r.register(Arc::new(HotkeysCommand));
+    r.register(Arc::new(ArminCommand));
+    r.register(Arc::new(EarendilCommand));
+    r.register(Arc::new(ContextCommand));
+    // Recognized but inert in v1 (one struct backs them all). `/name` is
+    // recognized-v1 but inert (no session-renaming surface yet); the rest are
+    // the TS builtins out of v1 scope. Each carries a description so autocomplete
+    // surfaces its existence even though running it reports "not supported".
+    r.register(Arc::new(UnsupportedCommand::new("/name", "Set session display name")));
+    r.register(Arc::new(UnsupportedCommand::new(
+        "/settings",
+        "Open settings menu",
+    )));
+    r.register(Arc::new(UnsupportedCommand::new(
+        "/scoped-models",
+        "Enable/disable models for Ctrl+P cycling",
+    )));
+    r.register(Arc::new(UnsupportedCommand::new("/export", "Export session")));
+    r.register(Arc::new(UnsupportedCommand::new(
+        "/import",
+        "Import and resume a session",
+    )));
+    r.register(Arc::new(UnsupportedCommand::new(
+        "/share",
+        "Share session as a GitHub gist",
+    )));
+    r.register(Arc::new(UnsupportedCommand::new("/fork", "Create a new fork")));
+    r.register(Arc::new(UnsupportedCommand::new(
+        "/clone",
+        "Duplicate the current session",
+    )));
+    r.register(Arc::new(UnsupportedCommand::new(
+        "/tree",
+        "Navigate session tree",
+    )));
+    r.register(Arc::new(UnsupportedCommand::new(
+        "/trust",
+        "Save project trust decision",
+    )));
+    r.register(Arc::new(UnsupportedCommand::new(
+        "/login",
+        "Configure provider authentication",
+    )));
+    r.register(Arc::new(UnsupportedCommand::new(
+        "/logout",
+        "Remove provider authentication",
+    )));
+    r.register(Arc::new(UnsupportedCommand::new(
+        "/reload",
+        "Reload keybindings, extensions, skills, prompts",
+    )));
+    r
 }
 
 // ===========================================================================
@@ -494,12 +897,12 @@ pub async fn interactive_tui(
     // snapshot to render the discovered-resources panel without touching the
     // harness async accessor.
     let resources_snapshot = harness.get_resources().await.unwrap_or_default();
-    let template_slash_commands: Vec<SlashCommand> = resources_snapshot
+    let template_slash_commands: Vec<SlashCommandEntry> = resources_snapshot
         .prompt_templates
         .clone()
         .unwrap_or_default()
         .iter()
-        .map(|t| SlashCommand {
+        .map(|t| SlashCommandEntry {
             name: format!("/{}", t.name),
             description: t
                 .description
@@ -508,10 +911,13 @@ pub async fn interactive_tui(
         })
         .collect();
     let resources_arc: Arc<rpi_harness::types::AgentHarnessResources> = Arc::new(resources_snapshot);
-    // Merge the v1 built-in slash commands with the discovered prompt-template
-    // commands (templates surface as `/<name>`). Built-ins first so they win on
-    // a fuzzy tie.
-    let mut all_slash_commands = v1_slash_commands();
+    // Build the built-in command registry once — the single source of truth for
+    // both dispatch and the built-in autocomplete entries. The discovered
+    // prompt-template commands are merged into the autocomplete list separately
+    // (they dispatch via template expansion, not the registry); built-ins come
+    // first so they win on a fuzzy tie.
+    let registry = Arc::new(build_builtin_registry());
+    let mut all_slash_commands = registry.visible_entries();
     all_slash_commands.extend(template_slash_commands);
     let autocomplete = AutocompleteManager::new();
     {
@@ -609,22 +1015,31 @@ pub async fn interactive_tui(
     editor.set_focused(true);
 
     // ---- Submit handler (fires on the blocking key thread; must stay sync) ----
-    let chat_for_cb = chat_container.clone();
-    let tui_for_cb = tui.clone();
-    let tx_for_cb = tx.clone();
-    let state_for_cb = state.clone();
-    let editor_for_cb = editor.clone();
-    let lane_for_cb = lane.clone();
-    // The resources snapshot (skills + prompt-templates) for the `/context`
-    // command — the blocking submit handler can't `.await` `get_resources()`,
-    // so it reads this pre-captured clone. Built once above from the harness.
-    let resources_for_cb = resources_arc.clone();
-    // Clone the shared selector inputs for the closure; the originals stay
-    // available for the key-dispatch loop below (Ctrl+L opens /model too).
-    let editor_container_for_cb = editor_container.clone();
-    let model_catalog_for_cb = model_catalog_arc.clone();
-    let lane_model_id_for_cb = lane_model_id.clone();
-    let cwd_for_cb = cwd.clone();
+    //
+    // The handler captures one `CommandContext` (the set of `*_for_cb` clones
+    // the old version made individually) + the registry, then routes `/`-text
+    // through `dispatch_slash` and sends plain text directly. Each command's
+    // `execute` owns its own effects (selector open, `tx.send`, `tokio::spawn`,
+    // chat mutation) — the handler itself stays a thin router.
+    //
+    // One `CommandContext` is built and cloned for both the submit handler and
+    // the key loop (Ctrl+L routes `/model` through the same registry); all
+    // fields are `Arc`/cheap, so the clones are free.
+    let ctx = CommandContext {
+        chat: chat_container.clone(),
+        tui: tui.clone(),
+        tx: tx.clone(),
+        state: state.clone(),
+        editor: editor.clone(),
+        editor_container: editor_container.clone(),
+        lane: lane.clone(),
+        model_catalog: model_catalog_arc.clone(),
+        lane_model_id: lane_model_id.clone(),
+        cwd: cwd.clone(),
+        resources: resources_arc.clone(),
+    };
+    let ctx_for_cb = ctx.clone();
+    let registry_for_cb = registry.clone();
     editor.on_submit(Arc::new(move |text: &str| {
         let text = text.trim();
         if text.is_empty() {
@@ -632,129 +1047,13 @@ pub async fn interactive_tui(
         }
 
         if text.starts_with('/') {
-            match handle_slash_command(text) {
-                SlashCommandResult::Exit => {
-                    let _ = tx_for_cb.send(TuiMessage::Exit);
-                }
-                SlashCommandResult::ClearChat => {
-                    let _ = tx_for_cb.send(TuiMessage::ClearChat);
-                }
-                SlashCommandResult::Help => {
-                    add_help_message(&chat_for_cb);
-                    tui_for_cb.request_render(false);
-                }
-                SlashCommandResult::Version => {
-                    add_version_message(&chat_for_cb);
-                    tui_for_cb.request_render(false);
-                }
-                SlashCommandResult::Hotkeys => {
-                    add_hotkeys_message(&chat_for_cb);
-                    tui_for_cb.request_render(false);
-                }
-                SlashCommandResult::SelectModel => {
-                    open_model_selector(
-                        &state_for_cb,
-                        &editor_container_for_cb,
-                        &editor_for_cb,
-                        &tui_for_cb,
-                        &model_catalog_for_cb,
-                        &lane_for_cb,
-                        &lane_model_id_for_cb,
-                        &chat_for_cb,
-                    );
-                }
-                SlashCommandResult::SelectThinking => {
-                    open_thinking_selector(
-                        &state_for_cb,
-                        &editor_container_for_cb,
-                        &editor_for_cb,
-                        &tui_for_cb,
-                        &lane_for_cb,
-                        &model_catalog_for_cb,
-                        &lane_model_id_for_cb,
-                        &chat_for_cb,
-                    );
-                }
-                SlashCommandResult::SelectTools => {
-                    open_tools_selector(
-                        &state_for_cb,
-                        &editor_container_for_cb,
-                        &editor_for_cb,
-                        &tui_for_cb,
-                        &lane_for_cb,
-                        &chat_for_cb,
-                    );
-                }
-                SlashCommandResult::SelectImages => {
-                    open_images_selector(
-                        &state_for_cb,
-                        &editor_container_for_cb,
-                        &editor_for_cb,
-                        &tui_for_cb,
-                        &chat_for_cb,
-                    );
-                }
-                SlashCommandResult::Armin => {
-                    crate::extras::add_armin(&chat_for_cb);
-                    tui_for_cb.request_render(false);
-                }
-                SlashCommandResult::Earendil => {
-                    crate::extras::add_earendil(&chat_for_cb);
-                    tui_for_cb.request_render(false);
-                }
-                SlashCommandResult::SelectSession => {
-                    open_session_selector(
-                        &state_for_cb,
-                        &editor_container_for_cb,
-                        &editor_for_cb,
-                        &tui_for_cb,
-                        &cwd_for_cb,
-                    );
-                }
-                SlashCommandResult::SelectTheme => {
-                    open_theme_selector(
-                        &state_for_cb,
-                        &editor_container_for_cb,
-                        &editor_for_cb,
-                        &tui_for_cb,
-                    );
-                }
-                SlashCommandResult::Compact => {
-                    let _ = tx_for_cb.send(TuiMessage::Compact);
-                }
-                SlashCommandResult::Copy => {
-                    let _ = tx_for_cb.send(TuiMessage::Copy);
-                }
-                SlashCommandResult::Context => {
-                    show_context_panel(&chat_for_cb, &resources_for_cb);
-                    tui_for_cb.request_render(false);
-                }
-                SlashCommandResult::Unsupported(cmd) => {
-                    add_note_message(
-                        &chat_for_cb,
-                        &format!("{cmd} is not supported in v1."),
-                    );
-                    tui_for_cb.request_render(false);
-                }
-                SlashCommandResult::Unknown => {
-                    add_error_message(
-                        &chat_for_cb,
-                        &format!("Unknown command: {text}. Type /help for available commands."),
-                    );
-                    tui_for_cb.request_render(false);
-                }
-                SlashCommandResult::SendMessage(msg) => {
-                    add_user_message(&chat_for_cb, &msg);
-                    tui_for_cb.request_render(false);
-                    let _ = tx_for_cb.send(TuiMessage::UserInput(msg));
-                }
-            }
+            dispatch_slash(text, &ctx_for_cb, &registry_for_cb);
             return;
         }
 
-        add_user_message(&chat_for_cb, text);
-        tui_for_cb.request_render(false);
-        let _ = tx_for_cb.send(TuiMessage::UserInput(text.to_string()));
+        add_user_message(&ctx_for_cb.chat, text);
+        ctx_for_cb.tui.request_render(false);
+        let _ = ctx_for_cb.tx.send(TuiMessage::UserInput(text.to_string()));
     }));
 
     tui.start_readerless();
@@ -799,11 +1098,11 @@ pub async fn interactive_tui(
     let scroll_for_key = scroll_view.clone();
     let lane_for_key = lane.clone();
     let state_for_key = state.clone();
-    // The Ctrl+L model selector needs the catalog + current id; these are
-    // already-known owned values (no async needed in the blocking key loop).
-    let catalog_for_key = model_catalog_arc.clone();
-    let lane_model_id_for_key = lane_model_id.clone();
-    let chat_for_key = chat_container.clone();
+    // Ctrl+L routes through the same registry as `/model` (one path, not two),
+    // so the key loop needs the same `CommandContext` + registry the submit
+    // handler uses. All fields are `Arc`/cheap, so this clone is free.
+    let ctx_for_key = ctx.clone();
+    let registry_for_key = registry.clone();
 
     tokio::task::spawn_blocking(move || {
         loop {
@@ -904,7 +1203,9 @@ pub async fn interactive_tui(
             //     in-flight run's config is already snapshotted), and update the
             //     footer. `set_model` is async so it runs on a spawned task.
             if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('m') {
-                if let Some(next) = cycle_next_model(&catalog_for_key, &state_for_key.current_model_id()) {
+                if let Some(next) =
+                    cycle_next_model(&ctx_for_key.model_catalog, &state_for_key.current_model_id())
+                {
                     state_for_key.set_current_model(&next);
                     let lane = lane_for_key.clone();
                     tokio::spawn(async move {
@@ -915,21 +1216,13 @@ pub async fn interactive_tui(
                 continue;
             }
 
-            // 3. Ctrl+L: open the model selector (TS binds Ctrl+L to
-            //    model-select). Selecting now applies live via `lane.set_model`
-            //    (next-prompt effect); the catalog + current id were captured
-            //    before this blocking loop.
+            // 3. Ctrl+L: open the model selector. Routed through the `/model`
+            //    command so the hotkey and the slash command share one path
+            //    (TS binds Ctrl+L to model-select).
             if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('l') {
-                open_model_selector(
-                    &state_for_key,
-                    &editor_container_for_key,
-                    &editor_for_key,
-                    &tui_for_key,
-                    &catalog_for_key,
-                    &lane_for_key,
-                    &lane_model_id_for_key,
-                    &chat_for_key,
-                );
+                if let Some(cmd) = registry_for_key.find("/model") {
+                    cmd.execute(&ctx_for_key);
+                }
                 continue;
             }
 
@@ -2065,6 +2358,9 @@ fn accept_top_suggestion(state: &Arc<TuiState>, editor: &Arc<Editor>) -> bool {
     let mut replaced = String::with_capacity(text.len() + top.text.len());
     replaced.push_str(&text[..start]);
     replaced.push_str(&top.text);
+    // Keep the text AFTER the replaced span (mid-line completion: replacing
+    // `[start, end)` must not drop the rest of the line).
+    replaced.push_str(&text[end..]);
     if top.insert_space && !replaced.ends_with('/') {
         replaced.push(' ');
     }
@@ -2078,7 +2374,6 @@ fn accept_top_suggestion(state: &Arc<TuiState>, editor: &Arc<Editor>) -> bool {
                 0
             },
     );
-    let _ = end;
     editor.set_text(&replaced);
     editor.set_cursor(0, new_cursor);
     state.autocomplete_container.clear();
@@ -2306,65 +2601,170 @@ mod tests {
         assert!(all.contains("rpi interactive"), "Welcome message not in chat container: {:?}", lines);
     }
 
+    /// Reproduction for "Tab 补全了但显示没刷新": after `accept_top_suggestion`
+    /// replaces the editor text, the NEXT rendered frame must show the
+    /// completed text (" /model " with the caret after it), not the old
+    /// prefix. Mirrors the real dock layout (autocomplete_container above the
+    /// bordered editor) and drives the same accept path the Tab handler uses.
     #[test]
-    fn test_slash_command_dispatch() {
-        assert!(matches!(handle_slash_command("/help"), SlashCommandResult::Help));
-        assert!(matches!(handle_slash_command("/clear"), SlashCommandResult::ClearChat));
-        assert!(matches!(handle_slash_command("/q"), SlashCommandResult::Exit));
-        assert!(matches!(handle_slash_command("/hotkeys"), SlashCommandResult::Hotkeys));
-        assert!(matches!(
-            handle_slash_command("/model"),
-            SlashCommandResult::SelectModel
+    fn tab_accept_suggestion_reflects_in_next_render() {
+        use rpi_tui::render_layout_frame;
+
+        let editor = Arc::new(Editor::new(
+            EditorOptions { padding_x: 1, ..Default::default() },
+            EditorStyle::default(),
+            Arc::new(rpi_tui::Keybindings::new()),
         ));
-        assert!(matches!(
-            handle_slash_command("/theme"),
-            SlashCommandResult::SelectTheme
-        ));
-        assert!(matches!(handle_slash_command("/session"), SlashCommandResult::SelectSession));
-        assert!(matches!(handle_slash_command("/compact"), SlashCommandResult::Compact));
-        assert!(matches!(handle_slash_command("/copy"), SlashCommandResult::Copy));
-        assert!(matches!(
-            handle_slash_command("/thinking"),
-            SlashCommandResult::SelectThinking
-        ));
-        assert!(matches!(
-            handle_slash_command("/think"),
-            SlashCommandResult::SelectThinking
-        ));
-        assert!(matches!(
-            handle_slash_command("/tools"),
-            SlashCommandResult::SelectTools
-        ));
-        assert!(matches!(
-            handle_slash_command("/images"),
-            SlashCommandResult::SelectImages
-        ));
-        assert!(matches!(handle_slash_command("/armin"), SlashCommandResult::Armin));
-        assert!(matches!(handle_slash_command("/earendil"), SlashCommandResult::Earendil));
-        assert!(matches!(
-            handle_slash_command("/settings"),
-            SlashCommandResult::Unsupported(_)
-        ));
-        assert!(matches!(handle_slash_command("/nope"), SlashCommandResult::Unknown));
-        // Empty input resolves to SendMessage (defensive; the submit handler
-        // guards on `starts_with('/')` so this path is only hit for blanks).
-        assert!(matches!(
-            handle_slash_command(""),
-            SlashCommandResult::SendMessage(_)
-        ));
+        editor.set_focused(true);
+        let editor_container = Arc::new(Container::new());
+        editor_container.add_child(editor.clone());
+        let autocomplete_container = Arc::new(Container::new());
+        let footer = Arc::new(rpi_tui::Text::new("FOOTER", 0, 0));
+        let dock = Arc::new(VStack::from_children(vec![
+            StackChild::Entry(StackEntry::new(autocomplete_container.clone())),
+            StackChild::Entry(StackEntry::new(editor_container.clone()).shrink(0).min_size(3)),
+            StackChild::Entry(StackEntry::new(footer)),
+        ]));
+
+        // Simulate the user typing "/mo" (the popup shows suggestions).
+        let mut manager = AutocompleteManager::new();
+        let mut combined = CombinedAutocompleteProvider::new();
+        combined.add_provider(Arc::new(SlashCommandAutocompleteProvider::with_default_commands()));
+        combined.add_provider(Arc::new(FilePathAutocompleteProvider::new()));
+        manager.set_provider(Arc::new(combined));
+        // Simulate typing "/mo" via the real insert path (advances the caret
+        // by char length, like `handle_key` does).
+        editor.insert("/mo");
+        assert_eq!(editor.cursor_position(), (0, 3));
+
+        let frame_before = render_layout_frame(dock.clone(), 80, 10);
+        assert!(
+            frame_before.lines.iter().any(|l| l.contains("/mo")),
+            "precondition: editor shows the typed prefix. Frame rows:\n{}",
+            frame_before.lines.iter().map(|l| format!("  [{l}]")).collect::<Vec<_>>().join("\n")
+        );
+
+        // Tab: accept the top suggestion (the same code path as the key loop).
+        let text = editor.get_text();
+        let (_row, col) = editor.cursor_position();
+        let cursor = col.min(text.len());
+        let sugg = manager
+            .get_suggestions(&text, cursor)
+            .expect("slash suggestions for /mo");
+        let top = sugg.items.first().expect("at least one suggestion");
+        let start = sugg.start.min(text.len());
+        let end = sugg.end.min(text.len());
+        let mut replaced = String::new();
+        replaced.push_str(&text[..start]);
+        replaced.push_str(&top.text);
+        if top.insert_space && !replaced.ends_with('/') {
+            replaced.push(' ');
+        }
+        editor.set_text(&replaced);
+        editor.set_cursor(0, replaced.len().min(start + top.text.len()));
+        autocomplete_container.clear();
+        assert_eq!(editor.get_text(), "/model");
+
+        // The next render MUST display the completed text.
+        let frame_after = render_layout_frame(dock, 80, 10);
+        let all: String = frame_after.lines.join("\n");
+        assert!(
+            all.contains("/model"),
+            "completed text missing from next render. Got:\n{all}"
+        );
+        // The caret must sit AFTER the completed command (the snap_boundary
+        // regression put it one char early: "/mode|l" with the final char
+        // dangling past the caret).
+        let editor_line = frame_after
+            .lines
+            .iter()
+            .find(|l| l.contains("/model"))
+            .expect("editor row with completed text");
+        assert!(
+            editor_line.contains(&format!("/model{}", rpi_tui::CURSOR_MARKER)),
+            "caret must follow the full completed text. Got: {editor_line:?}"
+        );
     }
 
     #[test]
-    fn test_v1_slash_commands_cover_dispatcher() {
-        // Every command the dispatcher recognizes as non-Unsupported/Unknown
-        // should appear in the autocomplete list (so `/`-autocomplete stays in
-        // sync with the actual command surface).
-        let cmds = v1_slash_commands();
-        let names: Vec<&str> = cmds.iter().map(|c| c.name.as_str()).collect();
-        for recognized in ["/help", "/clear", "/new", "/exit", "/quit", "/version",
-            "/model", "/session", "/theme", "/compact", "/copy", "/hotkeys"]
-        {
-            assert!(names.contains(&recognized), "{recognized} missing from autocomplete list");
+    fn test_slash_command_dispatch() {
+        // The registry is the single source of truth for dispatch: `find(token)`
+        // returns the command (by name or alias) whose `name()` is the canonical
+        // form, or `None` for an unknown token. This replaces the old enum-based
+        // `handle_slash_command` assertions with equivalent registry lookups.
+        let registry = build_builtin_registry();
+
+        // Helper: a token resolves to the command with this canonical name.
+        let resolves_to = |token: &str, canonical: &str| {
+            let found = registry.find(token).expect("{token} should resolve");
+            assert_eq!(
+                found.name(),
+                canonical,
+                "{token} resolved to {} (expected {canonical})",
+                found.name()
+            );
+        };
+
+        resolves_to("/help", "/help");
+        resolves_to("/?", "/help"); // alias → canonical
+        resolves_to("/clear", "/clear");
+        resolves_to("/new", "/clear"); // alias
+        resolves_to("/q", "/exit"); // alias
+        resolves_to("/quit", "/exit"); // alias
+        resolves_to("/version", "/version");
+        resolves_to("/v", "/version"); // alias
+        resolves_to("/hotkeys", "/hotkeys");
+        resolves_to("/model", "/model");
+        resolves_to("/m", "/model"); // alias
+        resolves_to("/theme", "/theme");
+        resolves_to("/session", "/session");
+        resolves_to("/resume", "/session"); // alias
+        resolves_to("/compact", "/compact");
+        resolves_to("/copy", "/copy");
+        resolves_to("/thinking", "/thinking");
+        resolves_to("/think", "/thinking"); // alias
+        resolves_to("/tools", "/tools");
+        resolves_to("/images", "/images");
+        resolves_to("/armin", "/armin");
+        resolves_to("/earendil", "/earendil");
+        resolves_to("/context", "/context");
+        // Out-of-v1-scope commands resolve to their own UnsupportedCommand entry.
+        resolves_to("/settings", "/settings");
+        resolves_to("/name", "/name");
+        resolves_to("/export", "/export");
+
+        // Unknown token → not found.
+        assert!(registry.find("/nope").is_none(), "/nope should be unknown");
+    }
+
+    #[test]
+    fn test_registry_visible_entries_cover_dispatch() {
+        // The autocomplete list is derived from the registry, so every visible
+        // command the dispatcher recognizes must appear in it — by construction,
+        // but this guards against a future command being registered with
+        // `visible()` / a non-empty description that the builder drops.
+        let registry = build_builtin_registry();
+        let names: Vec<String> = registry
+            .visible_entries()
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        for recognized in [
+            "/help", "/clear", "/new", "/exit", "/quit", "/version", "/model", "/session", "/theme",
+            "/compact", "/copy", "/hotkeys", "/tools", "/images", "/thinking", "/armin",
+            "/earendil",
+        ] {
+            assert!(
+                names.contains(&recognized.to_string()),
+                "{recognized} missing from autocomplete list"
+            );
+        }
+        // Hidden commands stay off the list.
+        for hidden in ["/context", "/q", "/m", "/v", "/think", "/resume", "/?"] {
+            assert!(
+                !names.contains(&hidden.to_string()),
+                "{hidden} should be hidden from autocomplete"
+            );
         }
     }
 
@@ -2527,7 +2927,7 @@ mod tests {
         {
             let mut combined = CombinedAutocompleteProvider::new();
             combined.add_provider(Arc::new(SlashCommandAutocompleteProvider::new(
-                v1_slash_commands(),
+                build_builtin_registry().visible_entries(),
             )));
             state.autocomplete.set_provider(Arc::new(combined));
         }
@@ -2618,7 +3018,7 @@ mod tests {
         {
             let mut combined = CombinedAutocompleteProvider::new();
             combined.add_provider(Arc::new(SlashCommandAutocompleteProvider::new(
-                v1_slash_commands(),
+                build_builtin_registry().visible_entries(),
             )));
             state.autocomplete.set_provider(Arc::new(combined));
         }

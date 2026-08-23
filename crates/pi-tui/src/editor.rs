@@ -91,8 +91,17 @@ impl Default for EditorState {
 /// while storing bytes.
 fn snap_boundary(s: &str, idx: usize) -> usize {
     let idx = idx.min(s.len());
+    // A valid char boundary (including the END of the string) is kept as-is —
+    // the old `take_while(b <= idx)` returned the START of the char AT `idx`
+    // for boundary positions, so a caret placed exactly after the last char
+    // (e.g. autocomplete accept: `set_cursor(0, len)`) snapped one char EARLY
+    // and the terminal showed "/mode|l" with the final char dangling past the
+    // caret. Mid-character positions snap DOWN to the char start instead.
+    if s.is_char_boundary(idx) {
+        return idx;
+    }
     s.char_indices()
-        .take_while(|(b, _)| *b <= idx)
+        .take_while(|(b, _)| *b < idx)
         .last()
         .map(|(b, _)| b)
         .unwrap_or(0)
@@ -564,6 +573,33 @@ impl Focusable for Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snap_boundary_keeps_char_boundaries_including_end() {
+        // The regression: a caret placed exactly at the END of the text (what
+        // autocomplete accept does — `set_cursor(0, text.len())`) used to snap
+        // one char EARLY, rendering "/mode|l" instead of "/model|".
+        assert_eq!(snap_boundary("/mo", 3), 3);
+        assert_eq!(snap_boundary("/model", 6), 6);
+        assert_eq!(snap_boundary("hello", 5), 5);
+        // Interior boundaries are kept as-is.
+        assert_eq!(snap_boundary("/model", 0), 0);
+        assert_eq!(snap_boundary("/model", 2), 2);
+        // Out-of-range clamps to the end (a valid boundary).
+        assert_eq!(snap_boundary("/mo", 99), 3);
+    }
+
+    #[test]
+    fn snap_boundary_mid_multibyte_snaps_down_to_char_start() {
+        // "你" occupies bytes 0..3: a position inside it must snap to 0.
+        assert_eq!(snap_boundary("你", 1), 0);
+        assert_eq!(snap_boundary("你", 2), 0);
+        // Position after it (end of string) stays 3.
+        assert_eq!(snap_boundary("你", 3), 3);
+        // Mixed: "a你b" — 你 is bytes 1..4; end of string is 5.
+        assert_eq!(snap_boundary("a你b", 5), 5);
+        assert_eq!(snap_boundary("a你b", 2), 1);
+    }
 
     #[test]
     fn test_editor_text() {
