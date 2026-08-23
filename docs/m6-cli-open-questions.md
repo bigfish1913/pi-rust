@@ -167,13 +167,25 @@ private `rpi_dir()`, which also fixes an old bug where they ignored the env
 override).
 
 **Remaining divergences under this heading (deferred):**
-- **`bare apiKey` → `x-api-key`.** Upstream `provider-composer` routes a
-  models.json provider's bare `apiKey` (no `authHeader`) as `x-api-key`
-  (`composeApiKeyAuth`). v1 consumes a models.json `api_key` **only** via the
-  `authHeader:true` Bearer path. A copied pi models.json using a bare
-  `apiKey` (no `authHeader`) is the one remaining copy-over gap — it won't
-  satisfy auth on its own. Adding the bare→x-api-key path is a separate
-  auth-precedence change; deferred.
+- ~~**`bare apiKey` → `x-api-key`.**~~ **✅ RESOLVED.** Upstream
+  `provider-composer` routes a models.json provider's bare `apiKey` (no
+  `authHeader`) as `x-api-key` (`composeApiKeyAuth`). rpi now mirrors this:
+  `provider::models_json_api_key` extracts the first anthropic-compatible
+  provider's bare `apiKey` (resolved via `resolve_config_value`), and
+  `provider::resolve` auth step 3b folds it as `x-api-key` onto **gateway
+  model headers** specifically — NOT as the global `provider_key` (which
+  `assemble_headers` would stamp onto every model incl. built-in `claude-*`,
+  routing a gateway key to `api.anthropic.com` → 401). The fold reuses the
+  same `is_gateway` predicate + `auth_from_models_json` flag as the
+  `authHeader:true` Bearer path (step 3a), so a bare-`apiKey` gateway
+  satisfies auth on its own and a no-`--model` launch picks the gateway
+  model. `has_header_auth` treats the model-header `x-api-key` as owned
+  auth. `authHeader:true` wins over bare `apiKey` when both exist (3a before
+  3b). A copied pi models.json using bare `apiKey` now "just works"; tests
+  `models_json_bare_apikey_satisfies_auth_without_env`,
+  `default_prefers_gateway_when_only_bare_apikey_configured`,
+  `models_json_bare_apikey_env_template_resolves`,
+  `auth_header_provider_beats_bare_apikey_provider` pin it.
 - **Project-trust prompt + `trust.json` gate.** rpi reads `trust.json`
   (`config::read_trust`) for layout parity (a copied pi `trust.json` parses +
   is located at `~/.rpi/agent/trust.json`), but does **not** wire a trust
@@ -205,7 +217,8 @@ that mirror upstream (`resolve-config-value.ts`):
 | Value | Where applied | Upstream mirror |
 |---|---|---|
 | `auth.json` `anthropic.api_key.key` | `provider::resolve` auth step 2 | `auth-storage.ts:267` (with `credential.env` overlay) |
-| `models.json` provider `apiKey` | `models_json_bearer_token` (Bearer wrap) | `provider-composer.ts:351` |
+| `models.json` provider `apiKey` (Bearer wrap) | `models_json_bearer_token` | `provider-composer.ts:351` |
+| `models.json` provider `apiKey` (bare → x-api-key) | `models_json_api_key` + resolve step 3b | `provider-composer.ts:349-354` `composeApiKeyAuth` |
 | `models.json` `headers` values | `provider_to_models` (merge) | `provider-composer.ts:361` `resolveHeadersOrThrow` |
 
 **Semantics.** A `!cmd` value runs the shell (`sh -c` / `cmd /C`), cached
@@ -217,10 +230,10 @@ that resolve to `None` are dropped (`resolve_headers`), matching pi
 `resolveHeaders`. A models.json referencing `$ANTHROPIC_API_KEY` no longer
 needs the secret copied into the file.
 
-**Deferred under this heading:** the **bare** `apiKey`→`x-api-key` path (see
-§4a) — the `api_key` value is resolved through `resolve_config_value` on the
-Bearer path it already serves; the bare-x-api-key routing is the deferred
-piece, not the value expansion itself.
+**Bare-`apiKey` routing (resolved, see §4a):** a models.json provider's
+`api_key` with no `authHeader` now folds as `x-api-key` onto gateway model
+headers (endpoint-specific), completing the copy-over gap that was previously
+deferred under §4c.
 
 ### 4d. OAuth / Copilot device-code still deferred
 
