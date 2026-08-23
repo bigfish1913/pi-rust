@@ -12,7 +12,7 @@
 //! that lane. Lane resolution goes through `get_leaf_id_for_lane`, which throws
 //! `invalid_lane` when the lane does not exist — matching TS.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -132,20 +132,49 @@ pub fn assert_json_serializable(value: &Value) -> SessionResult<()> {
 /// The session facade over a [`SessionStorage`] + [`IdGenerator`]. Mirrors TS
 /// `Session<TMetadata>`. Holds shared handles (`Arc`) so it is cheaply
 /// [`Clone`] — a `view` of any lane shares the same storage + id generator.
-#[derive(Clone)]
 pub struct Session {
-    storage: Arc<dyn SessionStorage>,
+    storage: RwLock<Arc<dyn SessionStorage>>,
     id_generator: Arc<dyn IdGenerator>,
+}
+
+impl Clone for Session {
+    fn clone(&self) -> Self {
+        Self {
+            storage: RwLock::new(self.storage_arc()),
+            id_generator: Arc::clone(&self.id_generator),
+        }
+    }
 }
 
 impl Session {
     /// Build a facade over `storage` with an optional id generator (default
     /// [`DefaultIdGenerator`] / uuidv7). Mirrors TS `constructor`.
-    pub fn new(storage: Arc<dyn SessionStorage>, id_generator: Option<Arc<dyn IdGenerator>>) -> Self {
+    pub fn new(
+        storage: Arc<dyn SessionStorage>,
+        id_generator: Option<Arc<dyn IdGenerator>>,
+    ) -> Self {
         Self {
-            storage,
+            storage: RwLock::new(storage),
             id_generator: id_generator.unwrap_or_else(|| Arc::new(DefaultIdGenerator::new())),
         }
+    }
+
+    /// Atomically swap the backing storage (TUI `/session` hot-switch). The
+    /// facade is a thin `Arc` pair, so every existing `Session` clone — the
+    /// harness's field, lane handles, the config snapshot — observes the new
+    /// storage immediately; no harness rebuild, no field restructure. The
+    /// caller is responsible for aborting any in-flight run first. Mirrors the
+    /// TS `SessionManager.rebind` intent (swap the durable backing without
+    /// rebuilding the harness).
+    pub fn set_storage(&self, storage: Arc<dyn SessionStorage>) {
+        *self.storage.write().unwrap() = storage;
+    }
+
+    /// A cheap owned handle to the backing storage. Releases the read lock
+    /// immediately, so the returned `Arc` is safe to hold across awaits (the
+    /// lock guard itself is not `Send`).
+    fn storage_arc(&self) -> Arc<dyn SessionStorage> {
+        self.storage.read().unwrap().clone()
     }
 
     /// The shared id generator. Mirrors TS `readonly idGenerator`.
@@ -155,13 +184,13 @@ impl Session {
 
     /// The shared storage handle (the harness needs the full storage API beyond
     /// what [`SessionTree`] exposes).
-    pub fn storage(&self) -> &Arc<dyn SessionStorage> {
-        &self.storage
+    pub fn storage(&self) -> Arc<dyn SessionStorage> {
+        self.storage_arc()
     }
 
     /// `getMetadata()`. Mirrors TS `Session.getMetadata`.
     pub async fn get_metadata(&self) -> SessionResult<SessionMetadata> {
-        Ok(self.storage.metadata())
+        Ok(self.storage_arc().metadata())
     }
 
     /// Return a lane-scoped [`SessionTree`] view. `view("main")` returns a view
@@ -173,7 +202,10 @@ impl Session {
             // `Session` itself implements `SessionTree` for the main lane.
             Arc::new(self.clone()) as Arc<dyn SessionTree>
         } else {
-            Arc::new(LaneView { session: self.clone(), lane: lane.to_string() }) as Arc<dyn SessionTree>
+            Arc::new(LaneView {
+                session: self.clone(),
+                lane: lane.to_string(),
+            }) as Arc<dyn SessionTree>
         }
     }
 
@@ -186,32 +218,32 @@ impl Session {
 
     /// `getEntry(id)`. Mirrors TS `Session.getEntry`.
     pub async fn get_entry(&self, id: &str) -> SessionResult<Option<Entry>> {
-        self.storage.get_entry(id).await
+        self.storage_arc().get_entry(id).await
     }
 
     /// `getStats()`. Mirrors TS `Session.getStats`.
     pub async fn get_stats(&self) -> SessionResult<SessionStats> {
-        self.storage.get_stats().await
+        self.storage_arc().get_stats().await
     }
 
     /// `getName()`. Mirrors TS `Session.getName`.
     pub async fn get_name(&self) -> SessionResult<Option<String>> {
-        self.storage.get_name().await
+        self.storage_arc().get_name().await
     }
 
     /// `setName(name)`. Mirrors TS `Session.setName`.
     pub async fn set_name(&self, name: Option<&str>) -> SessionResult<()> {
-        self.storage.set_name(name).await
+        self.storage_arc().set_name(name).await
     }
 
     /// `getLabel(targetId)`. Mirrors TS `Session.getLabel`.
     pub async fn get_label(&self, target_id: &str) -> SessionResult<Option<String>> {
-        self.storage.get_label(target_id).await
+        self.storage_arc().get_label(target_id).await
     }
 
     /// `setLabel(targetId, label)`. Mirrors TS `Session.setLabel`.
     pub async fn set_label(&self, target_id: &str, label: Option<&str>) -> SessionResult<()> {
-        self.storage.set_label(target_id, label).await
+        self.storage_arc().set_label(target_id, label).await
     }
 
     // -- Entry queries (session-wide, sequence order) ------------------------
@@ -234,7 +266,8 @@ impl Session {
         query: &EntryQuery,
         bounds: &BranchBounds,
     ) -> SessionResult<Vec<Entry>> {
-        self.query_branch_entries("main", query, bounds, query.limit).await
+        self.query_branch_entries("main", query, bounds, query.limit)
+            .await
     }
 
     /// `findEntryOnBranch(query?)` — first match on the main-lane branch path.
@@ -244,7 +277,9 @@ impl Session {
         query: &EntryQuery,
         bounds: &BranchBounds,
     ) -> SessionResult<Option<Entry>> {
-        let mut entries = self.query_branch_entries("main", query, bounds, Some(1)).await?;
+        let mut entries = self
+            .query_branch_entries("main", query, bounds, Some(1))
+            .await?;
         Ok(entries.pop())
     }
 
@@ -263,35 +298,32 @@ impl Session {
         custom_type: &str,
         data: Option<JsonValue>,
     ) -> SessionResult<String> {
-        self.append_custom_entry_to_lane("main", custom_type, data).await
+        self.append_custom_entry_to_lane("main", custom_type, data)
+            .await
     }
 
     // -- Lanes ---------------------------------------------------------------
 
     /// `getLanes()`. Mirrors TS `Session.getLanes`.
     pub async fn get_lanes(&self) -> SessionResult<Vec<LanePointer>> {
-        self.storage.get_lanes().await
+        self.storage_arc().get_lanes().await
     }
 
     /// `createLane(lane, at)`. Mirrors TS `Session.createLane`.
     pub async fn create_lane(&self, lane: &str, at: Option<&str>) -> SessionResult<()> {
-        self.storage.create_lane(lane, at).await
+        self.storage_arc().create_lane(lane, at).await
     }
 
     /// `moveLane(lane, to)`. Mirrors TS `Session.moveLane`.
     pub async fn move_lane(&self, lane: &str, to: Option<&str>) -> SessionResult<()> {
-        self.storage.move_lane(lane, to).await
+        self.storage_arc().move_lane(lane, to).await
     }
 
     // -- Raw append (provisioned entry / record) -----------------------------
 
     /// `appendEntry(entry, lane)` — validate-then-commit a provisioned entry.
     /// Mirrors TS `Session.appendEntry`. Returns the storage-stamped entry.
-    pub async fn append_entry(
-        &self,
-        entry: ProvisionedEntry,
-        lane: &str,
-    ) -> SessionResult<Entry> {
+    pub async fn append_entry(&self, entry: ProvisionedEntry, lane: &str) -> SessionResult<Entry> {
         self.commit_entry(entry, lane).await
     }
 
@@ -316,7 +348,7 @@ impl Session {
         limit: Option<usize>,
     ) -> SessionResult<Vec<OperationStartedRecord>> {
         assert_valid_limit(limit)?;
-        self.storage.find_open_operations(lane, limit).await
+        self.storage_arc().find_open_operations(lane, limit).await
     }
 
     /// `getLog(options?)`. Mirrors TS `Session.getLog`.
@@ -331,14 +363,12 @@ impl Session {
     /// `Session.getLeafIdForLane`.
     async fn get_leaf_id_for_lane(&self, lane: &str) -> SessionResult<Option<String>> {
         let pointer = self
-            .storage
+            .storage_arc()
             .get_lanes()
             .await?
             .into_iter()
             .find(|p| p.lane == lane)
-            .ok_or_else(|| {
-                SessionError::invalid_lane(format!("Lane not found: {lane}"))
-            })?;
+            .ok_or_else(|| SessionError::invalid_lane(format!("Lane not found: {lane}")))?;
         Ok(pointer.leaf_id)
     }
 
@@ -354,11 +384,11 @@ impl Session {
             assert_valid_cursor(Some(cursor.after_seq))?;
         }
         if result_limit == query.limit {
-            self.storage.find_entries(query).await
+            self.storage_arc().find_entries(query).await
         } else {
             let mut overridden = query.clone();
             overridden.limit = result_limit;
-            self.storage.find_entries(&overridden).await
+            self.storage_arc().find_entries(&overridden).await
         }
     }
 
@@ -399,7 +429,7 @@ impl Session {
             q
         };
         let _ = storage_bounds; // bounds passed through unchanged
-        self.storage
+        self.storage_arc()
             .find_entries_on_branch(&storage_query, bounds, &start)
             .await
     }
@@ -416,7 +446,7 @@ impl Session {
                 "operationKind requires type \"operation_started\"",
             ));
         }
-        self.storage.find_records(query).await
+        self.storage_arc().find_records(query).await
     }
 
     /// `queryLog(options)` — validate, delegate. Mirrors TS private
@@ -424,7 +454,7 @@ impl Session {
     async fn query_log(&self, options: &LogOptions) -> SessionResult<Vec<LogItem>> {
         assert_valid_limit(options.limit)?;
         assert_valid_cursor(options.after_seq)?;
-        self.storage.get_log(options).await
+        self.storage_arc().get_log(options).await
     }
 
     /// `appendMessageToLane(lane, message)` — mint id, commit. Mirrors TS
@@ -438,7 +468,10 @@ impl Session {
             .commit_entry(
                 ProvisionedEntry {
                     id: self.id_generator.next(),
-                    kind: ProvisionedKind::Message { message, terminate: None },
+                    kind: ProvisionedKind::Message {
+                        message,
+                        terminate: None,
+                    },
                 },
                 lane,
             )
@@ -458,7 +491,10 @@ impl Session {
             .commit_entry(
                 ProvisionedEntry {
                     id: self.id_generator.next(),
-                    kind: ProvisionedKind::Custom { custom_type: custom_type.to_string(), data },
+                    kind: ProvisionedKind::Custom {
+                        custom_type: custom_type.to_string(),
+                        data,
+                    },
                 },
                 lane,
             )
@@ -468,27 +504,25 @@ impl Session {
 
     /// `commitEntry(entry, lane)` — `assertJsonSerializable` then
     /// `storage.appendEntry`. Mirrors TS private `Session.commitEntry`.
-    async fn commit_entry(
-        &self,
-        entry: ProvisionedEntry,
-        lane: &str,
-    ) -> SessionResult<Entry> {
+    async fn commit_entry(&self, entry: ProvisionedEntry, lane: &str) -> SessionResult<Entry> {
         // Serialize-then-validate mirrors TS `assertJsonSerializable(entry)`.
         // `ProvisionedEntry` is a typed struct, but its arms carry arbitrary
         // `JsonValue`/`f64` payloads, so the non-finite-number guard is real.
-        let value = serde_json::to_value(&entry)
-            .map_err(|e| SessionError::invalid_payload(format!("Durable payload is not serializable: {e}")))?;
+        let value = serde_json::to_value(&entry).map_err(|e| {
+            SessionError::invalid_payload(format!("Durable payload is not serializable: {e}"))
+        })?;
         assert_json_serializable(&value)?;
-        self.storage.append_entry(entry, lane).await
+        self.storage_arc().append_entry(entry, lane).await
     }
 
     /// `commitRecord(record)` — `assertJsonSerializable` then
     /// `storage.appendRecord`. Mirrors TS private `Session.commitRecord`.
     async fn commit_record(&self, record: LaneRecord) -> SessionResult<LaneRecord> {
-        let value = serde_json::to_value(&record)
-            .map_err(|e| SessionError::invalid_payload(format!("Durable payload is not serializable: {e}")))?;
+        let value = serde_json::to_value(&record).map_err(|e| {
+            SessionError::invalid_payload(format!("Durable payload is not serializable: {e}"))
+        })?;
         assert_json_serializable(&value)?;
-        self.storage.append_record(record).await
+        self.storage_arc().append_record(record).await
     }
 }
 
@@ -624,7 +658,9 @@ impl SessionTree for LaneView {
         Ok(entries.pop())
     }
     async fn append_message(&self, message: AgentMessage) -> SessionResult<String> {
-        self.session.append_message_to_lane(&self.lane, message).await
+        self.session
+            .append_message_to_lane(&self.lane, message)
+            .await
     }
     async fn append_custom_entry(
         &self,
@@ -650,7 +686,11 @@ mod tests {
     use rpi_ai::types::UserMessage;
 
     fn fixture_session() -> Session {
-        let metadata = SessionMetadata { id: "s1".into(), created_at: 0, parent_session_id: None };
+        let metadata = SessionMetadata {
+            id: "s1".into(),
+            created_at: 0,
+            parent_session_id: None,
+        };
         let storage: Arc<dyn SessionStorage> = Arc::new(InMemorySessionStorage::new(
             metadata,
             Arc::new(SystemClock),
@@ -678,7 +718,11 @@ mod tests {
         let session = fixture_session();
         let id = session.append_message(user("hello")).await.unwrap();
         assert!(!id.is_empty());
-        let entry = session.get_entry(&id).await.unwrap().expect("entry present");
+        let entry = session
+            .get_entry(&id)
+            .await
+            .unwrap()
+            .expect("entry present");
         assert_eq!(entry.base().id, id);
     }
 
@@ -687,7 +731,10 @@ mod tests {
         let session = fixture_session();
         assert!(session.get_leaf_id().await.unwrap().is_none());
         let id = session.append_message(user("hi")).await.unwrap();
-        assert_eq!(session.get_leaf_id().await.unwrap().as_deref(), Some(id.as_str()));
+        assert_eq!(
+            session.get_leaf_id().await.unwrap().as_deref(),
+            Some(id.as_str())
+        );
     }
 
     #[tokio::test]
@@ -695,8 +742,14 @@ mod tests {
         let session = fixture_session();
         let main = session.view("main");
         let id = main.append_message(user("on main")).await.unwrap();
-        assert_eq!(session.get_leaf_id().await.unwrap().as_deref(), Some(id.as_str()));
-        assert_eq!(main.get_leaf_id().await.unwrap().as_deref(), Some(id.as_str()));
+        assert_eq!(
+            session.get_leaf_id().await.unwrap().as_deref(),
+            Some(id.as_str())
+        );
+        assert_eq!(
+            main.get_leaf_id().await.unwrap().as_deref(),
+            Some(id.as_str())
+        );
     }
 
     #[tokio::test]
@@ -714,11 +767,20 @@ mod tests {
         session.create_lane("side", Some(&root)).await.unwrap();
         let side = session.view("side");
         // New lane forks at `root`: its leaf is `root` until appended.
-        assert_eq!(side.get_leaf_id().await.unwrap().as_deref(), Some(root.as_str()));
+        assert_eq!(
+            side.get_leaf_id().await.unwrap().as_deref(),
+            Some(root.as_str())
+        );
         let side_id = side.append_message(user("on side")).await.unwrap();
-        assert_eq!(side.get_leaf_id().await.unwrap().as_deref(), Some(side_id.as_str()));
+        assert_eq!(
+            side.get_leaf_id().await.unwrap().as_deref(),
+            Some(side_id.as_str())
+        );
         // Main lane is unaffected.
-        assert_eq!(session.get_leaf_id().await.unwrap().as_deref(), Some(root.as_str()));
+        assert_eq!(
+            session.get_leaf_id().await.unwrap().as_deref(),
+            Some(root.as_str())
+        );
     }
 
     #[tokio::test]
@@ -737,7 +799,10 @@ mod tests {
     #[tokio::test]
     async fn invalid_limit_rejected() {
         let session = fixture_session();
-        let q = EntryQuery { limit: Some(0), ..EntryQuery::default() };
+        let q = EntryQuery {
+            limit: Some(0),
+            ..EntryQuery::default()
+        };
         let err = session.find_entries(&q).await.unwrap_err();
         assert_eq!(err.code, SessionErrorCode::InvalidQuery);
     }

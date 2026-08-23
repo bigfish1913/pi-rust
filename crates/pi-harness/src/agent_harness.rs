@@ -38,25 +38,24 @@ use futures::future::BoxFuture;
 use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
 
-use rpi_ai::types::{
-    AssistantMessage, Content, DeferredHandle, StopReason, ThinkingLevel, Usage, UserContent,
-    UserMessage,
-};
-use rpi_ai::{Model, Provider as AiProvider};
 use rpi_agent::message::AgentMessage;
 use rpi_agent::{
     run_agent_loop, AfterToolCall, AgentContext, AgentEmitter, AgentLoopConfig, AgentTool,
     BeforeToolCall, ConvertToLlm, StreamFn, TransformContext,
 };
+use rpi_ai::types::{
+    AssistantMessage, Content, DeferredHandle, StopReason, ThinkingLevel, Usage, UserContent,
+    UserMessage,
+};
+use rpi_ai::{Model, Provider as AiProvider};
 
 use crate::compaction::{
     compact, estimate_context_tokens, prepare_compaction, should_compact, CompactionLlmOptions,
 };
 use crate::error::{SessionError, SessionErrorCode};
-use crate::events::{
-    HarnessEvent, HarnessEventBus, RunEndEvent, RunEndOutcome, RunStartEvent,
-};
+use crate::events::{HarnessEvent, HarnessEventBus, RunEndEvent, RunEndOutcome, RunStartEvent};
 use crate::messages::convert_to_llm as harness_convert_to_llm;
+use crate::prompt_templates::format_prompt_template_invocation;
 use crate::result::{HarnessError, HarnessResult, OperationKind};
 use crate::session::context::{
     build_session_context, ContextEntryTransform, CustomEntryContextMessageProjector,
@@ -70,7 +69,6 @@ use crate::session::types::{
     UsageRecord,
 };
 use crate::skills::format_skill_invocation;
-use crate::prompt_templates::format_prompt_template_invocation;
 use crate::system_prompt::compose_system_prompt;
 use crate::types::{
     AgentHarnessOptions, AgentHarnessResources, AgentHarnessStreamOptions, CompactionSettings,
@@ -87,19 +85,46 @@ use crate::types::{
 /// assistant message. `Suspended` carries the provider deferred handle.
 #[derive(Debug, Clone)]
 pub enum HarnessRunOutcome {
-    Completed { leaf_id: String, final_entry_id: String, final_message: rpi_ai::types::AssistantMessage },
-    Aborted { leaf_id: String, final_entry_id: String, final_message: rpi_ai::types::AssistantMessage },
-    Failed { leaf_id: String, error: OperationError, final_entry_id: Option<String>, final_message: Option<rpi_ai::types::AssistantMessage> },
-    Suspended { leaf_id: String, final_entry_id: String, deferred: DeferredHandle },
+    Completed {
+        leaf_id: String,
+        final_entry_id: String,
+        final_message: rpi_ai::types::AssistantMessage,
+    },
+    Aborted {
+        leaf_id: String,
+        final_entry_id: String,
+        final_message: rpi_ai::types::AssistantMessage,
+    },
+    Failed {
+        leaf_id: String,
+        error: OperationError,
+        final_entry_id: Option<String>,
+        final_message: Option<rpi_ai::types::AssistantMessage>,
+    },
+    Suspended {
+        leaf_id: String,
+        final_entry_id: String,
+        deferred: DeferredHandle,
+    },
 }
 
 /// `CompactionOutcome`. Mirrors TS `CompactionOutcome`.
 #[derive(Debug, Clone)]
 pub enum CompactionOutcome {
-    Completed { leaf_id: String, entry: Entry },
-    Declined { leaf_id: String },
-    Aborted { leaf_id: String },
-    Failed { leaf_id: String, error: OperationError },
+    Completed {
+        leaf_id: String,
+        entry: Entry,
+    },
+    Declined {
+        leaf_id: String,
+    },
+    Aborted {
+        leaf_id: String,
+    },
+    Failed {
+        leaf_id: String,
+        error: OperationError,
+    },
 }
 
 /// `NavigationOutcome`. Mirrors TS `NavigationOutcome`. v1 only emits
@@ -107,10 +132,20 @@ pub enum CompactionOutcome {
 /// deferred).
 #[derive(Debug, Clone)]
 pub enum NavigationOutcome {
-    Completed { new_leaf_id: Option<String>, summary_entry: Option<Entry> },
-    Declined { leaf_id: Option<String> },
-    Aborted { leaf_id: Option<String> },
-    Failed { leaf_id: Option<String>, error: OperationError },
+    Completed {
+        new_leaf_id: Option<String>,
+        summary_entry: Option<Entry>,
+    },
+    Declined {
+        leaf_id: Option<String>,
+    },
+    Aborted {
+        leaf_id: Option<String>,
+    },
+    Failed {
+        leaf_id: Option<String>,
+        error: OperationError,
+    },
 }
 
 /// Result of a `prompt`/`skill`/`prompt_from_template` call. Mirrors TS `RunResult`
@@ -178,14 +213,28 @@ pub trait AgentLane: Send + Sync {
     fn name(&self) -> &str;
     async fn get_leaf_id(&self) -> HarnessResult<Option<String>>;
 
-    async fn prompt_text(&self, text: &str, images: Vec<rpi_ai::types::ImageContent>) -> HarnessResult<RunResult>;
+    async fn prompt_text(
+        &self,
+        text: &str,
+        images: Vec<rpi_ai::types::ImageContent>,
+    ) -> HarnessResult<RunResult>;
     async fn prompt_message(&self, message: AgentMessage) -> HarnessResult<RunResult>;
     async fn prompt_messages(&self, messages: Vec<AgentMessage>) -> HarnessResult<RunResult>;
-    async fn skill(&self, name: &str, additional_instructions: Option<&str>) -> HarnessResult<RunResult>;
+    async fn skill(
+        &self,
+        name: &str,
+        additional_instructions: Option<&str>,
+    ) -> HarnessResult<RunResult>;
     async fn prompt_from_template(&self, name: &str, args: &[String]) -> HarnessResult<RunResult>;
 
     async fn compact(&self, custom_instructions: Option<&str>) -> HarnessResult<CompactionResult>;
-    async fn navigate_tree(&self, target_id: Option<&str>, summarize: bool, custom_instructions: Option<&str>, label: Option<&str>) -> HarnessResult<NavigationResult>;
+    async fn navigate_tree(
+        &self,
+        target_id: Option<&str>,
+        summarize: bool,
+        custom_instructions: Option<&str>,
+        label: Option<&str>,
+    ) -> HarnessResult<NavigationResult>;
 
     async fn abort(&self) -> HarnessResult<AbortResult>;
 
@@ -193,10 +242,18 @@ pub trait AgentLane: Send + Sync {
     async fn follow_up(&self, message: AgentMessage) -> HarnessResult<QueueResult>;
     async fn next_run(&self, message: AgentMessage) -> HarnessResult<QueueResult>;
     async fn cancel_queued(&self, entry_id: &str) -> HarnessResult<CancelQueuedResult>;
-    async fn record_usage(&self, usage: Usage, entry_id: Option<&str>, details: Option<JsonValue>) -> HarnessResult<RecordUsageResult>;
+    async fn record_usage(
+        &self,
+        usage: Usage,
+        entry_id: Option<&str>,
+        details: Option<JsonValue>,
+    ) -> HarnessResult<RecordUsageResult>;
 
     async fn wait_for_idle(&self) -> HarnessResult<()>;
-    async fn run_when_idle(&self, callback: Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>) -> HarnessResult<()>;
+    async fn run_when_idle(
+        &self,
+        callback: Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>,
+    ) -> HarnessResult<()>;
 
     async fn get_model(&self) -> HarnessResult<Model>;
     async fn set_model(&self, model: Model) -> HarnessResult<()>;
@@ -290,7 +347,10 @@ impl AgentHarness {
         if !options.allow_existing_session {
             let existing = options
                 .session
-                .find_records(&RecordQuery { limit: Some(1), ..Default::default() })
+                .find_records(&RecordQuery {
+                    limit: Some(1),
+                    ..Default::default()
+                })
                 .await
                 .map_err(session_to_harness_err)?;
             if !existing.is_empty() {
@@ -387,9 +447,8 @@ impl AgentHarness {
         if inner.closed {
             return Err(HarnessError::closed());
         }
-        let active = active_names.unwrap_or_else(|| {
-            tools.iter().map(|t| t.tool.schema().name.clone()).collect()
-        });
+        let active = active_names
+            .unwrap_or_else(|| tools.iter().map(|t| t.tool.schema().name.clone()).collect());
         inner.tools = tools;
         inner.active_tool_names = active;
         Ok(())
@@ -402,6 +461,24 @@ impl AgentHarness {
     pub async fn close(&self) -> HarnessResult<()> {
         let mut inner = self.inner.lock().unwrap();
         inner.closed = true;
+        Ok(())
+    }
+
+    /// Swap the harness's durable session facade (TUI `/session` hot-switch).
+    /// `run_core` re-reads the session on every run (branch path, leaf id,
+    /// context build), so replacing `inner.session` makes the next run
+    /// continue in the new session file — no harness rebuild, no lane/event
+    /// wiring churn. The caller is responsible for aborting any in-flight run
+    /// first.
+    pub async fn set_session(&self, session: Session) -> HarnessResult<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.closed {
+            return Err(HarnessError::closed());
+        }
+        drop(inner);
+        // Swap the durable backing on the shared facade — every lane handle /
+        // config snapshot observes the new storage immediately.
+        self.session.set_storage(session.storage());
         Ok(())
     }
 
@@ -425,7 +502,10 @@ impl AgentHarness {
     /// Reject if closed or if `main` already has an active operation. On
     /// success, installs the `ActiveRun` guard and returns `(run_id, signal,
     /// idle_notify)`.
-    fn acquire_run(&self, kind: OperationKind) -> HarnessResult<(String, CancellationToken, Arc<tokio::sync::Notify>)> {
+    fn acquire_run(
+        &self,
+        kind: OperationKind,
+    ) -> HarnessResult<(String, CancellationToken, Arc<tokio::sync::Notify>)> {
         let mut inner = self.inner.lock().unwrap();
         if inner.closed {
             return Err(HarnessError::closed());
@@ -435,7 +515,10 @@ impl AgentHarness {
                 "main",
                 active.run_id.clone(),
                 active.kind,
-                format!("Lane main already has an active {} operation", active.kind.as_str()),
+                format!(
+                    "Lane main already has an active {} operation",
+                    active.kind.as_str()
+                ),
             ));
         }
         let run_id = self.session.id_generator().next();
@@ -463,7 +546,10 @@ impl AgentHarness {
 
     /// Resolve the provider for `model.provider`. Returns the first registered
     /// provider whose `id()` matches.
-    fn resolve_provider(models: &[Arc<dyn AiProvider>], model: &Model) -> HarnessResult<Arc<dyn AiProvider>> {
+    fn resolve_provider(
+        models: &[Arc<dyn AiProvider>],
+        model: &Model,
+    ) -> HarnessResult<Arc<dyn AiProvider>> {
         models
             .iter()
             .find(|p| p.id() == model.provider)
@@ -498,59 +584,61 @@ impl AgentHarness {
         // Resolve the provider lazily per call (the model may change between
         // turns via prepare_next_turn). If no provider matches, emit an Error
         // terminal event on a synthetic stream.
-        let stream_fn = rpi_agent::stream_fn(move |model: &Model, ctx: &rpi_ai::types::Context, opts: &rpi_ai::SimpleStreamOptions| {
-            let provider = models.iter().find(|p| p.id() == model.provider).cloned();
-            match provider {
-                Some(p) => {
-                    let model = model.clone();
-                    let ctx = ctx.clone();
-                    // B4 [merge_into]: the loop builds `opts` via
-                    // `AgentLoopConfig::to_stream_options`, which DROPS the
-                    // harness's pinned `headers`/`metadata` (AgentLoopConfig
-                    // has no such fields → to_stream_options sets them None).
-                    // Fold the pinned `AgentHarnessStreamOptions` into the
-                    // live opts here, at the per-call site, so headers/metadata
-                    // reach the provider — then layer the per-call
-                    // `ProviderHooks::before_request` patch on top.
-                    let mut opts = stream_options.merge_into(opts.clone());
-                    if let Some(hooks) = &provider_hooks {
-                        if let Some(patch) = hooks.before_request(&model, &ctx, &opts) {
-                            patch.apply(&mut opts);
+        let stream_fn = rpi_agent::stream_fn(
+            move |model: &Model,
+                  ctx: &rpi_ai::types::Context,
+                  opts: &rpi_ai::SimpleStreamOptions| {
+                let provider = models.iter().find(|p| p.id() == model.provider).cloned();
+                match provider {
+                    Some(p) => {
+                        let model = model.clone();
+                        let ctx = ctx.clone();
+                        // B4 [merge_into]: the loop builds `opts` via
+                        // `AgentLoopConfig::to_stream_options`, which DROPS the
+                        // harness's pinned `headers`/`metadata` (AgentLoopConfig
+                        // has no such fields → to_stream_options sets them None).
+                        // Fold the pinned `AgentHarnessStreamOptions` into the
+                        // live opts here, at the per-call site, so headers/metadata
+                        // reach the provider — then layer the per-call
+                        // `ProviderHooks::before_request` patch on top.
+                        let mut opts = stream_options.merge_into(opts.clone());
+                        if let Some(hooks) = &provider_hooks {
+                            if let Some(patch) = hooks.before_request(&model, &ctx, &opts) {
+                                patch.apply(&mut opts);
+                            }
                         }
-                    }
-                    tokio::task::block_in_place(|| {
-                        Handle::current().block_on(async move {
-                            p.stream_simple(&model, &ctx, &opts).await
+                        tokio::task::block_in_place(|| {
+                            Handle::current()
+                                .block_on(async move { p.stream_simple(&model, &ctx, &opts).await })
                         })
-                    })
+                    }
+                    None => {
+                        // No provider: synthesize an Error terminal stream.
+                        let (mut producer, stream) =
+                            rpi_ai::event_stream::create_assistant_message_event_stream();
+                        let msg = AssistantMessage::terminal(
+                            model.api.clone(),
+                            &model.provider,
+                            &model.id,
+                            StopReason::Error,
+                            format!("No provider registered for '{}'", model.provider),
+                            0,
+                        );
+                        let _ = producer.push(rpi_ai::types::AssistantMessageEvent::Error {
+                            reason: rpi_ai::types::ErrorReason::Error,
+                            error: msg,
+                        });
+                        stream
+                    }
                 }
-                None => {
-                    // No provider: synthesize an Error terminal stream.
-                    let (mut producer, stream) = rpi_ai::event_stream::create_assistant_message_event_stream();
-                    let msg = AssistantMessage::terminal(
-                        model.api.clone(),
-                        &model.provider,
-                        &model.id,
-                        StopReason::Error,
-                        format!("No provider registered for '{}'", model.provider),
-                        0,
-                    );
-                    let _ = producer.push(rpi_ai::types::AssistantMessageEvent::Error {
-                        reason: rpi_ai::types::ErrorReason::Error,
-                        error: msg,
-                    });
-                    stream
-                }
-            }
-        });
+            },
+        );
         Ok(stream_fn)
     }
 
     /// Build the `ConvertToLlm` Arc for `AgentLoopConfig`: use the caller's
     /// override if provided, else wrap the harness-level `convert_to_llm`.
-    fn build_convert_to_llm(
-        to_provider_messages: Option<ConvertToLlm>,
-    ) -> ConvertToLlm {
+    fn build_convert_to_llm(to_provider_messages: Option<ConvertToLlm>) -> ConvertToLlm {
         to_provider_messages.unwrap_or_else(|| {
             Arc::new(|messages: Vec<AgentMessage>| {
                 let out = harness_convert_to_llm(messages);
@@ -588,7 +676,10 @@ impl AgentHarness {
             order: Some(EntryOrder::OldestFirst),
             ..Default::default()
         };
-        let bounds = BranchBounds { start: Some(leaf_id), ..Default::default() };
+        let bounds = BranchBounds {
+            start: Some(leaf_id),
+            ..Default::default()
+        };
         self.session
             .find_entries_on_branch(&query, &bounds)
             .await
@@ -669,7 +760,10 @@ impl AgentHarness {
         result: &crate::compaction::CompactResult,
     ) -> HarnessResult<Entry> {
         let id = self.session.id_generator().next();
-        let details = result.details.as_ref().map(|d| serde_json::to_value(d).unwrap_or(JsonValue::Null));
+        let details = result
+            .details
+            .as_ref()
+            .map(|d| serde_json::to_value(d).unwrap_or(JsonValue::Null));
         let entry = ProvisionedEntry {
             id,
             kind: ProvisionedKind::Compaction {
@@ -788,7 +882,11 @@ impl AgentHarness {
                     code: "no_assistant".into(),
                     message: "Run ended without producing an assistant message".into(),
                 },
-                final_entry_id: if final_id.is_empty() { None } else { Some(final_id) },
+                final_entry_id: if final_id.is_empty() {
+                    None
+                } else {
+                    Some(final_id)
+                },
                 final_message: None,
             },
             Some(am) => match am.stop_reason {
@@ -798,7 +896,11 @@ impl AgentHarness {
                         code: "error".into(),
                         message: am.error_message.clone().unwrap_or_default(),
                     },
-                    final_entry_id: if final_id.is_empty() { None } else { Some(final_id) },
+                    final_entry_id: if final_id.is_empty() {
+                        None
+                    } else {
+                        Some(final_id)
+                    },
                     final_message: Some(am.clone()),
                 },
                 StopReason::Aborted => HarnessRunOutcome::Aborted {
@@ -816,9 +918,14 @@ impl AgentHarness {
                         leaf_id: leaf,
                         error: OperationError {
                             code: "deferred_no_handle".into(),
-                            message: "Assistant returned Deferred stop reason without a handle".into(),
+                            message: "Assistant returned Deferred stop reason without a handle"
+                                .into(),
                         },
-                        final_entry_id: if final_id.is_empty() { None } else { Some(final_id) },
+                        final_entry_id: if final_id.is_empty() {
+                            None
+                        } else {
+                            Some(final_id)
+                        },
                         final_message: Some(am.clone()),
                     },
                 },
@@ -871,14 +978,16 @@ impl AgentHarness {
         let snap = self.snapshot_config()?;
         if snap.models.is_empty() {
             self.release_run();
-            let _ = self.write_operation_finished(
-                &run_id,
-                OperationOutcome::Failed,
-                Some(OperationError {
-                    code: "no_provider".into(),
-                    message: "No models/providers configured".into(),
-                }),
-            ).await;
+            let _ = self
+                .write_operation_finished(
+                    &run_id,
+                    OperationOutcome::Failed,
+                    Some(OperationError {
+                        code: "no_provider".into(),
+                        message: "No models/providers configured".into(),
+                    }),
+                )
+                .await;
             let leaf = source_leaf.unwrap_or_default();
             self.bus.emit(&HarnessEvent::RunEnd(RunEndEvent {
                 lane: "main".into(),
@@ -915,9 +1024,10 @@ impl AgentHarness {
                         .or_else(|_| {
                             // Fall back to first provider if the model's
                             // provider isn't registered but others are.
-                            snap.models.first().cloned().ok_or_else(|| {
-                                HarnessError::agent("No provider for compaction")
-                            })
+                            snap.models
+                                .first()
+                                .cloned()
+                                .ok_or_else(|| HarnessError::agent("No provider for compaction"))
                         });
                     if let Ok(provider) = compaction_provider {
                         let llm_opts = CompactionLlmOptions {
@@ -940,7 +1050,13 @@ impl AgentHarness {
                             Err(e) => {
                                 // Compaction failed; abort the run.
                                 self.release_run();
-                                let leaf = self.session.get_leaf_id().await.ok().flatten().unwrap_or_default();
+                                let leaf = self
+                                    .session
+                                    .get_leaf_id()
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .unwrap_or_default();
                                 let err = OperationError {
                                     code: "compaction_failed".into(),
                                     message: e.message.clone(),
@@ -1018,9 +1134,7 @@ impl AgentHarness {
             } else {
                 None
             },
-            max_retry_delay: Some(std::time::Duration::from_millis(
-                snap.retry.base_delay_ms,
-            )),
+            max_retry_delay: Some(std::time::Duration::from_millis(snap.retry.base_delay_ms)),
             cache_retention: snap.stream_options.cache_retention.unwrap_or_default(),
             session_id: None,
             signal: signal.clone(),
@@ -1030,7 +1144,9 @@ impl AgentHarness {
         // installs a BroadcastEmitter so it can render AgentEvents live);
         // otherwise fall back to a collector that discards events (the harness
         // still surfaces RunStart/RunEnd via its own bus).
-        let emitter: Arc<dyn AgentEmitter> = snap.agent_emitter.clone()
+        let emitter: Arc<dyn AgentEmitter> = snap
+            .agent_emitter
+            .clone()
             .unwrap_or_else(|| Arc::new(rpi_agent::CollectorEmitter::default()));
 
         // Drive the loop. We pass an EMPTY prompts vec to `run_agent_loop`
@@ -1070,7 +1186,13 @@ impl AgentHarness {
                 (leaf, final_id, outcome, op_outcome, op_error)
             }
             Err(e) => {
-                let leaf = self.session.get_leaf_id().await.ok().flatten().unwrap_or_default();
+                let leaf = self
+                    .session
+                    .get_leaf_id()
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
                 let error = OperationError {
                     code: "agent_error".into(),
                     message: e.to_string(),
@@ -1081,7 +1203,13 @@ impl AgentHarness {
                     final_entry_id: None,
                     final_message: None,
                 };
-                (Some(leaf), None, outcome, OperationOutcome::Failed, Some(error))
+                (
+                    Some(leaf),
+                    None,
+                    outcome,
+                    OperationOutcome::Failed,
+                    Some(error),
+                )
             }
         };
 
@@ -1117,7 +1245,10 @@ impl AgentHarness {
 
     /// Explicit compaction. Drives `prepare_compaction` + `compact` and
     /// persists the result entry.
-    async fn compact_core(&self, custom_instructions: Option<String>) -> HarnessResult<CompactionResult> {
+    async fn compact_core(
+        &self,
+        custom_instructions: Option<String>,
+    ) -> HarnessResult<CompactionResult> {
         let (run_id, signal, _idle) = self.acquire_run(OperationKind::Compaction)?;
 
         let source_leaf = self
@@ -1193,9 +1324,16 @@ impl AgentHarness {
                             let entry = self.persist_compaction_entry(&result).await?;
                             let leaf = entry.base().id.clone();
                             let _ = self
-                                .write_operation_finished(&run_id, OperationOutcome::Completed, None)
+                                .write_operation_finished(
+                                    &run_id,
+                                    OperationOutcome::Completed,
+                                    None,
+                                )
                                 .await;
-                            CompactionOutcome::Completed { leaf_id: leaf, entry }
+                            CompactionOutcome::Completed {
+                                leaf_id: leaf,
+                                entry,
+                            }
                         }
                         Err(e) => {
                             let err = OperationError {
@@ -1222,7 +1360,11 @@ impl AgentHarness {
                         message: e.message.clone(),
                     };
                     let _ = self
-                        .write_operation_finished(&run_id, OperationOutcome::Failed, Some(err.clone()))
+                        .write_operation_finished(
+                            &run_id,
+                            OperationOutcome::Failed,
+                            Some(err.clone()),
+                        )
                         .await;
                     CompactionOutcome::Failed {
                         leaf_id: source_leaf.unwrap_or_default(),
@@ -1277,7 +1419,11 @@ impl AgentLane for AgentHarness {
             .map_err(session_to_harness_err)
     }
 
-    async fn prompt_text(&self, text: &str, images: Vec<rpi_ai::types::ImageContent>) -> HarnessResult<RunResult> {
+    async fn prompt_text(
+        &self,
+        text: &str,
+        images: Vec<rpi_ai::types::ImageContent>,
+    ) -> HarnessResult<RunResult> {
         let content = if images.is_empty() {
             UserContent::Text(text.to_string())
         } else {
@@ -1300,17 +1446,20 @@ impl AgentLane for AgentHarness {
         self.run_core(messages).await
     }
 
-    async fn skill(&self, name: &str, additional_instructions: Option<&str>) -> HarnessResult<RunResult> {
+    async fn skill(
+        &self,
+        name: &str,
+        additional_instructions: Option<&str>,
+    ) -> HarnessResult<RunResult> {
         // Scope the `std::sync::MutexGuard` so it is provably dropped before the
         // `.await` below (a !Send guard cannot cross an await point in a
         // `Send` future).
         let message = {
             let inner = self.inner.lock().unwrap();
             let skills: &[Skill] = inner.resources.skills.as_deref().unwrap_or(&[]);
-            let skill = skills
-                .iter()
-                .find(|s| s.name == name)
-                .ok_or_else(|| HarnessError::unknown_skill(name, format!("No skill named '{name}'")))?;
+            let skill = skills.iter().find(|s| s.name == name).ok_or_else(|| {
+                HarnessError::unknown_skill(name, format!("No skill named '{name}'"))
+            })?;
             let invocation = format_skill_invocation(skill, additional_instructions);
             AgentMessage::User(UserMessage::new(invocation, now_ms()))
         };
@@ -1320,17 +1469,11 @@ impl AgentLane for AgentHarness {
     async fn prompt_from_template(&self, name: &str, args: &[String]) -> HarnessResult<RunResult> {
         let message = {
             let inner = self.inner.lock().unwrap();
-            let templates: &[PromptTemplate] = inner
-                .resources
-                .prompt_templates
-                .as_deref()
-                .unwrap_or(&[]);
-            let template = templates
-                .iter()
-                .find(|t| t.name == name)
-                .ok_or_else(|| {
-                    HarnessError::unknown_template(name, format!("No prompt template named '{name}'"))
-                })?;
+            let templates: &[PromptTemplate] =
+                inner.resources.prompt_templates.as_deref().unwrap_or(&[]);
+            let template = templates.iter().find(|t| t.name == name).ok_or_else(|| {
+                HarnessError::unknown_template(name, format!("No prompt template named '{name}'"))
+            })?;
             let invocation = format_prompt_template_invocation(template, args);
             AgentMessage::User(UserMessage::new(invocation, now_ms()))
         };
@@ -1338,7 +1481,8 @@ impl AgentLane for AgentHarness {
     }
 
     async fn compact(&self, custom_instructions: Option<&str>) -> HarnessResult<CompactionResult> {
-        self.compact_core(custom_instructions.map(|s| s.to_string())).await
+        self.compact_core(custom_instructions.map(|s| s.to_string()))
+            .await
     }
 
     async fn navigate_tree(
@@ -1581,7 +1725,11 @@ impl AgentLane for LaneHandle {
             .map_err(session_to_harness_err)
     }
 
-    async fn prompt_text(&self, _text: &str, _images: Vec<rpi_ai::types::ImageContent>) -> HarnessResult<RunResult> {
+    async fn prompt_text(
+        &self,
+        _text: &str,
+        _images: Vec<rpi_ai::types::ImageContent>,
+    ) -> HarnessResult<RunResult> {
         Err(HarnessError::invalid_lane(
             self.lane.clone(),
             "non_main_lane",
@@ -1605,7 +1753,11 @@ impl AgentLane for LaneHandle {
         ))
     }
 
-    async fn skill(&self, _name: &str, _additional_instructions: Option<&str>) -> HarnessResult<RunResult> {
+    async fn skill(
+        &self,
+        _name: &str,
+        _additional_instructions: Option<&str>,
+    ) -> HarnessResult<RunResult> {
         Err(HarnessError::invalid_lane(
             self.lane.clone(),
             "non_main_lane",
@@ -1613,7 +1765,11 @@ impl AgentLane for LaneHandle {
         ))
     }
 
-    async fn prompt_from_template(&self, _name: &str, _args: &[String]) -> HarnessResult<RunResult> {
+    async fn prompt_from_template(
+        &self,
+        _name: &str,
+        _args: &[String],
+    ) -> HarnessResult<RunResult> {
         Err(HarnessError::invalid_lane(
             self.lane.clone(),
             "non_main_lane",
@@ -1822,9 +1978,7 @@ impl AgentLane for LaneHandle {
 /// surface as `Io`; invalid-lane errors surface as `InvalidLane`.
 fn session_to_harness_err(e: SessionError) -> HarnessError {
     match e.code {
-        SessionErrorCode::InvalidLane => {
-            HarnessError::invalid_lane("main", "session", e.message)
-        }
+        SessionErrorCode::InvalidLane => HarnessError::invalid_lane("main", "session", e.message),
         _ => HarnessError::io(e.message),
     }
 }
@@ -1835,4 +1989,95 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod session_switch_tests {
+    use super::*;
+    use crate::session::jsonl::{JsonlSessionCreateOptions, JsonlSessionRepo, JsonlSessionRepoOptions};
+    use crate::session::memory::{InMemorySessionStorage, SystemClock};
+    use crate::session::session::DefaultIdGenerator;
+    use crate::session::types::SessionMetadata;
+    use rpi_ai::{Api, Model};
+    use rpi_tools::{FileSystem, OsExecutionEnv};
+
+    fn opts() -> AgentHarnessOptions {
+        AgentHarnessOptions {
+            model: Model::new("m", "m", Api::Faux, "faux", "http://x"),
+            thinking_level: Default::default(),
+            active_tool_names: Vec::new(),
+            tools: Vec::new(),
+            system_prompt: None,
+            resources: AgentHarnessResources::default(),
+            stream_options: Default::default(),
+            retry: RetryPolicy::default(),
+            compaction: CompactionSettings::default(),
+            steering_mode: Default::default(),
+            follow_up_mode: Default::default(),
+            tool_execution: HarnessToolExecution::default(),
+            drive: DrivingMode::default(),
+            session: Session::new(
+                Arc::new(InMemorySessionStorage::new(
+                    SessionMetadata { id: "a".into(), created_at: 0, parent_session_id: None },
+                    Arc::new(SystemClock),
+                    Arc::new(DefaultIdGenerator::new()),
+                )),
+                None,
+            ),
+            allow_existing_session: true,
+            models: Vec::new(),
+            to_provider_messages: None,
+            entry_projectors: Default::default(),
+            agent_emitter: None,
+            before_tool_call: None,
+            after_tool_call: None,
+            transform_context: None,
+            entry_transforms: Vec::new(),
+            provider_hooks: None,
+        }
+    }
+
+    /// `set_session` swaps the durable backing: the harness's `session()`
+    /// facade (shared with lane handles) then reads the NEW storage's entries
+    /// — the TUI `/session` hot-switch path.
+    #[tokio::test]
+    async fn set_session_swaps_durable_backing() {
+        let h = AgentHarness::create(opts()).await.unwrap();
+        // Build two JSONL sessions with one user message each.
+        let tmp = std::env::temp_dir().join(format!("rpi-set-session-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let cwd = tmp.to_string_lossy().into_owned();
+        let env = Arc::new(OsExecutionEnv::with_cwd(tmp.clone()));
+        let fs: Arc<dyn FileSystem> = env.clone();
+        let repo = JsonlSessionRepo::with_env_cwd(JsonlSessionRepoOptions {
+            fs,
+            sessions_root: tmp.join("sessions").to_string_lossy().into_owned(),
+            clock: Arc::new(SystemClock),
+            ids: Arc::new(DefaultIdGenerator::new()),
+        });
+        let s1 = repo.create_typed(&JsonlSessionCreateOptions {
+            id: Some("sess-one".into()), parent_session_id: None, cwd: cwd.clone(), metadata: None,
+        }).await.unwrap();
+        let s2 = repo.create_typed(&JsonlSessionCreateOptions {
+            id: Some("sess-two".into()), parent_session_id: None, cwd, metadata: None,
+        }).await.unwrap();
+        let sess1 = Session::new(Arc::new(s1), None);
+        let sess2 = Session::new(Arc::new(s2), None);
+        sess1.append_message(rpi_agent::AgentMessage::User(
+            rpi_ai::types::UserMessage::new(String::from("alpha"), 1),
+        )).await.unwrap();
+        sess2.append_message(rpi_agent::AgentMessage::User(
+            rpi_ai::types::UserMessage::new(String::from("beta"), 2),
+        )).await.unwrap();
+
+        h.set_session(sess1).await.unwrap();
+        let e1 = h.session().view("main").find_entries(&EntryQuery { entry_type: None, custom_type: None, order: None, limit: None, cursor: None }).await.unwrap();
+        assert_eq!(e1.len(), 1);
+
+        h.set_session(sess2).await.unwrap();
+        let e2 = h.session().view("main").find_entries(&EntryQuery { entry_type: None, custom_type: None, order: None, limit: None, cursor: None }).await.unwrap();
+        assert_eq!(e2.len(), 1);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

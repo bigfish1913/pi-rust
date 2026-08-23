@@ -419,6 +419,7 @@ impl SlashCommand for SessionCommand {
             &ctx.editor,
             &ctx.tui,
             &ctx.cwd,
+            &ctx.tx,
         );
     }
 }
@@ -594,6 +595,9 @@ enum TuiMessage {
     Compact,
     /// Copy the last assistant reply to the clipboard (from `/copy`).
     Copy,
+    /// Hot-switch to another saved session (from the `/session` selector):
+    /// the payload is the session id the selector's item value carried.
+    SwitchSession(String),
 }
 
 /// Extract the concatenated text content from an assistant message (mirrors
@@ -1500,6 +1504,40 @@ pub async fn interactive_tui(
                 *running.lock().unwrap() = false;
                 break;
             }
+            Ok(TuiMessage::SwitchSession(id)) => {
+                // Hot-switch to another saved session: abort any in-flight
+                // run, open the target session file, swap the harness's
+                // durable backing, and re-render the transcript from the new
+                // history (mirrors pi's `/session` resume-in-place). The
+                // current model/footer stay put (v1 doesn't replay the
+                // session's ModelChange entries).
+                if *state.status.lock().unwrap() == RunStatus::Working {
+                    state.set_status(RunStatus::Aborting);
+                    let _ = lane.abort().await;
+                }
+                let cwd_str = cwd.to_string_lossy().to_string();
+                match crate::session::open_session_by_id(&id, &cwd_str).await {
+                    Ok(new_session) => {
+                        let _ = harness.set_session(new_session).await;
+                        chat_container.clear();
+                        add_welcome_message(&chat_container);
+                        render_session_history(&harness, &chat_container).await;
+                        state.set_status(RunStatus::Idle);
+                        add_note_message(
+                            &chat_container,
+                            &format!("Switched to session {id}."),
+                        );
+                    }
+                    Err(e) => {
+                        state.set_status(RunStatus::Idle);
+                        add_error_message(
+                            &chat_container,
+                            &format!("Could not open session {id}: {e}"),
+                        );
+                    }
+                }
+                tui.request_render(false);
+            }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
@@ -2163,6 +2201,7 @@ fn open_session_selector(
     editor: &Arc<Editor>,
     tui: &Arc<TuiAltScreen>,
     cwd: &std::path::Path,
+    tx: &mpsc::Sender<TuiMessage>,
 ) {
     let dir = crate::session::default_session_dir(cwd);
     let mut items: Vec<SelectItem> = Vec::new();
@@ -2199,13 +2238,13 @@ fn open_session_selector(
     let ec_sel = editor_container.clone();
     let editor_sel = editor.clone();
     let tui_sel = tui.clone();
-    let chat_sel = state.chat_container.clone();
+    let tx_sel = tx.clone();
     list.on_select(Arc::new(move |item| {
-        add_note_message(
-            &chat_sel,
-            &format!("Session {} — restore is not implemented in v1.", item.label),
-        );
+        // Close the selector first, then ask the async loop to hot-switch:
+        // opening the session file + swapping the harness backing is async
+        // (repo list/open) and must not run on the blocking key thread.
         close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
+        let _ = tx_sel.send(TuiMessage::SwitchSession(item.value.clone()));
     }));
     let state_cancel = state.clone();
     let ec_cancel = editor_container.clone();

@@ -582,9 +582,96 @@ async fn build_session(selection: &SessionSelection, cwd: &str) -> Result<Sessio
 /// facade. The restored transcript renders into the TUI at startup and the
 /// harness continues appending to the same file.
 async fn restore_session(selection: &SessionSelection, cwd: &str) -> Result<Session, BuildError> {
-    use rpi_harness::session::jsonl::{
-        JsonlSessionListOptions, JsonlSessionRepo, JsonlSessionRepoOptions,
+    // `list_typed` is newest-first; `Latest` takes the head, `ById` matches
+    // the id exactly or by file-name containment (so `--session 01a02…` or a
+    // partial id works, mirroring the TS id/path matching).
+    match selection {
+        SessionSelection::Latest => {
+            let metas = list_session_metadata(cwd).await?;
+            let Some(meta) = metas.first() else {
+                return Err(BuildError::SessionNotFound {
+                    requested: "the most recent session".to_string(),
+                    dir: default_session_dir(Path::new(cwd)).display().to_string(),
+                });
+            };
+            open_session(meta, cwd).await
+        }
+        SessionSelection::ById { id } => {
+            open_session_by_id(id, cwd).await.map_err(|e| match e {
+                OpenError::NotFound { requested } => BuildError::SessionNotFound {
+                    requested,
+                    dir: default_session_dir(Path::new(cwd)).display().to_string(),
+                },
+                OpenError::Other(msg) => BuildError::SessionDir(msg),
+            })
+        }
+        _ => unreachable!("restore_session only called for Latest/ById"),
+    }
+}
+
+/// Errors from [`open_session_by_id`], split so the CLI can map them to
+/// [`BuildError`] while the TUI can surface a friendlier note.
+pub enum OpenError {
+    /// No session matched the request.
+    NotFound { requested: String },
+    /// The match existed but could not be opened/parsed.
+    Other(String),
+}
+
+impl std::fmt::Display for OpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OpenError::NotFound { requested } => write!(f, "no session matches {requested}"),
+            OpenError::Other(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+/// List the JSONL session metadata under the default session dir, newest
+/// first. Shared by startup restore and the TUI `/session` hot-switch.
+pub async fn list_session_metadata(cwd: &str) -> Result<Vec<rpi_harness::session::jsonl::JsonlSessionMetadata>, BuildError> {
+    use rpi_harness::session::jsonl::{JsonlSessionListOptions, JsonlSessionRepo, JsonlSessionRepoOptions};
+    use rpi_tools::FileSystem;
+
+    let dir = default_session_dir(Path::new(cwd));
+    let env = Arc::new(OsExecutionEnv::with_cwd(PathBuf::from(cwd)));
+    let fs: Arc<dyn FileSystem> = env.clone();
+    let repo = JsonlSessionRepo::with_env_cwd(JsonlSessionRepoOptions {
+        fs: fs.clone(),
+        sessions_root: dir.to_string_lossy().into_owned(),
+        clock: Arc::new(SystemClock),
+        ids: Arc::new(DefaultIdGenerator::new()),
+    });
+    repo.list_typed(&JsonlSessionListOptions::default())
+        .await
+        .map_err(|e| BuildError::SessionDir(format!("list sessions: {e}")))
+}
+
+/// Open a session whose id matches exactly or by file-name containment
+/// (so `--session 01a02…` / a partial id / a full file name all work). The
+/// TUI `/session` hot-switch calls this with the selector's item value.
+pub async fn open_session_by_id(id: &str, cwd: &str) -> Result<Session, OpenError> {
+    let metas = list_session_metadata(cwd)
+        .await
+        .map_err(|e| OpenError::Other(e.to_string()))?;
+    let Some(meta) = metas
+        .iter()
+        .find(|m| m.id == id || m.path.contains(id) || id.contains(&m.id))
+    else {
+        return Err(OpenError::NotFound { requested: format!("session {id}") });
     };
+    open_session(meta, cwd)
+        .await
+        .map_err(|e| OpenError::Other(e.to_string()))
+}
+
+/// Wrap an opened [`JsonlSessionStorage`] in the `Session` facade (shared by
+/// startup restore + TUI hot-switch).
+async fn open_session(
+    meta: &rpi_harness::session::jsonl::JsonlSessionMetadata,
+    cwd: &str,
+) -> Result<Session, BuildError> {
+    use rpi_harness::session::jsonl::{JsonlSessionRepo, JsonlSessionRepoOptions};
     use rpi_harness::session::types::SessionStorage;
     use rpi_tools::FileSystem;
 
@@ -597,32 +684,6 @@ async fn restore_session(selection: &SessionSelection, cwd: &str) -> Result<Sess
         clock: Arc::new(SystemClock),
         ids: Arc::new(DefaultIdGenerator::new()),
     });
-    let metas = repo
-        .list_typed(&JsonlSessionListOptions::default())
-        .await
-        .map_err(|e| BuildError::SessionDir(format!("list sessions: {e}")))?;
-
-    // `list_typed` is newest-first; `Latest` takes the head, `ById` matches
-    // the id exactly or by file-name containment (so `--session 01a02…` or a
-    // partial id works, mirroring the TS id/path matching).
-    let matched = match selection {
-        SessionSelection::Latest => metas.first(),
-        SessionSelection::ById { id } => metas
-            .iter()
-            .find(|m| m.id == *id || m.path.contains(id.as_str()) || id.contains(&m.id)),
-        _ => unreachable!("restore_session only called for Latest/ById"),
-    };
-    let Some(meta) = matched else {
-        let requested = match selection {
-            SessionSelection::Latest => "the most recent session".to_string(),
-            SessionSelection::ById { id } => format!("--session {id}"),
-            _ => unreachable!(),
-        };
-        return Err(BuildError::SessionNotFound {
-            requested,
-            dir: dir.display().to_string(),
-        });
-    };
     let storage = repo
         .open_by_jsonl_metadata(meta)
         .await
