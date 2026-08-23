@@ -718,6 +718,94 @@ struct TuiState {
     /// even though image wiring is minimal this pass — the flag is consulted
     /// where images would be shown and echoed back by `/images`.
     show_images: std::sync::Mutex<bool>,
+    /// Submitted-message history for ↑/↓ recall, most recent first (mirrors
+    /// the TS editor `history` array). Bounded at [`HISTORY_LIMIT`].
+    history: std::sync::Mutex<Vec<String>>,
+    /// Browse index while recalling history: -1 = not browsing, 0 = most
+    /// recent, 1 = older, … Reset to -1 on every submit.
+    history_index: std::sync::Mutex<isize>,
+    /// The editor text captured when entering browse mode, restored when the
+    /// user navigates back past the newest entry (TS `historyDraft`).
+    history_draft: std::sync::Mutex<Option<String>>,
+    /// The previous turn's input token count, used by the cache-miss notice:
+    /// a large input that reads nothing from cache after an established prefix
+    /// means the prefix was re-billed (simplified `maybeShowCacheMissNotice`).
+    last_input_tokens: std::sync::Mutex<i64>,
+}
+
+/// How many submitted messages are kept for ↑ recall (mirrors the TS
+/// editor's 100-entry cap).
+const HISTORY_LIMIT: usize = 100;
+
+/// A turn with at least this many input tokens is worth a cache-miss notice
+/// when nothing was read from cache (matches the TS 20k threshold).
+const CACHE_MISS_MIN_INPUT_TOKENS: i64 = 20_000;
+
+/// Compact token count for the cache-miss notice: 1.2M / 34.5K / 900.
+fn format_tokens(n: i64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Record a submitted message for ↑ recall (mirrors TS `addToHistory`):
+/// trims, skips empty + consecutive duplicates, caps at [`HISTORY_LIMIT`], and
+/// resets the browse state so a fresh prompt never resumes mid-history.
+fn push_history(state: &Arc<TuiState>, text: &str) {
+    let trimmed = text.trim().to_string();
+    if trimmed.is_empty() {
+        return;
+    }
+    let mut history = state.history.lock().unwrap();
+    if history.first() == Some(&trimmed) {
+        return;
+    }
+    history.insert(0, trimmed);
+    history.truncate(HISTORY_LIMIT);
+    *state.history_index.lock().unwrap() = -1;
+    *state.history_draft.lock().unwrap() = None;
+}
+
+/// Navigate message history. `direction` is -1 (↑, older) or 1 (↓, newer).
+/// Mirrors TS `navigateHistory`: the first entry into browse mode stashes the
+/// current editor text as the draft; navigating back past the newest entry
+/// restores that draft.
+fn navigate_history(state: &Arc<TuiState>, editor: &Arc<Editor>, direction: i32) {
+    let history = state.history.lock().unwrap();
+    if history.is_empty() {
+        return;
+    }
+    let mut index = state.history_index.lock().unwrap();
+    let new_index = *index - direction as isize;
+    if new_index < -1 || new_index >= history.len() as isize {
+        return;
+    }
+    if *index == -1 && new_index >= 0 {
+        // Entering browse mode: stash the current input.
+        *state.history_draft.lock().unwrap() = Some(editor.get_text());
+    }
+    *index = new_index;
+    if new_index == -1 {
+        // Exited browse mode: restore the draft (or clear if there was none).
+        let draft = state.history_draft.lock().unwrap().take();
+        match draft {
+            Some(d) => {
+                let len = d.len();
+                editor.set_text(&d);
+                editor.set_cursor(0, len);
+            }
+            None => editor.set_text(""),
+        }
+    } else {
+        let text = history[new_index as usize].clone();
+        let len = text.len();
+        editor.set_text(&text);
+        editor.set_cursor(0, len);
+    }
 }
 
 impl TuiState {
@@ -948,6 +1036,10 @@ pub async fn interactive_tui(
         tui: Some(tui.clone()),
         current_model_id: std::sync::Mutex::new(lane_model_id.clone()),
         show_images: std::sync::Mutex::new(true),
+        history: std::sync::Mutex::new(Vec::new()),
+        history_index: std::sync::Mutex::new(-1),
+        history_draft: std::sync::Mutex::new(None),
+        last_input_tokens: std::sync::Mutex::new(0),
     });
 
     // Apply the saved theme from `~/.rpi/agent/settings.json` (best-effort).
@@ -1053,6 +1145,9 @@ pub async fn interactive_tui(
 
         add_user_message(&ctx_for_cb.chat, text);
         ctx_for_cb.tui.request_render(false);
+        // Remember the message for ↑ recall (slash commands are not part of
+        // the replayable message history).
+        push_history(&ctx_for_cb.state, text);
         let _ = ctx_for_cb.tx.send(TuiMessage::UserInput(text.to_string()));
     }));
 
@@ -1261,6 +1356,31 @@ pub async fn interactive_tui(
                 scroll_for_key.scroll_by(10);
                 tui_for_key.request_render(false);
                 continue;
+            }
+
+            // 5b. ↑/↓ browse submitted-message history when the caret sits at
+            //     the start/end of the editor (mirrors TS
+            //     `tui.editor.historyPrevious/Next`, which only intercept at
+            //     the first/last visual line); anywhere else they fall through
+            //     to the editor for multi-line cursor movement.
+            if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::Up {
+                let (row, col) = editor_for_key.cursor_position();
+                if row == 0 && col == 0 {
+                    navigate_history(&state_for_key, &editor_for_key, -1);
+                    tui_for_key.request_render(false);
+                    continue;
+                }
+            }
+            if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::Down {
+                let text = editor_for_key.get_text();
+                let (row, col) = editor_for_key.cursor_position();
+                let last_row = text.lines().count().saturating_sub(1);
+                let last_len = text.lines().last().map(str::len).unwrap_or(0);
+                if row == last_row && col >= last_len {
+                    navigate_history(&state_for_key, &editor_for_key, 1);
+                    tui_for_key.request_render(false);
+                    continue;
+                }
             }
 
             // 6. Otherwise forward to the editor + refresh autocomplete.
@@ -1630,6 +1750,26 @@ async fn handle_agent_event(
                 if !text.is_empty() {
                     *state.last_assistant_text.lock().unwrap() = text;
                 }
+                // Cache-miss notice (simplified `maybeShowCacheMissNotice`):
+                // the previous turn's input established a cacheable prefix; a
+                // large input this turn that read nothing from cache means the
+                // prefix was re-billed. No cost display — v1 has no per-run
+                // cost tracking here.
+                let usage = &a.usage;
+                let prev_input = *state.last_input_tokens.lock().unwrap();
+                if prev_input > 0
+                    && usage.input >= CACHE_MISS_MIN_INPUT_TOKENS
+                    && usage.cache_read == 0
+                {
+                    add_note_message(
+                        &state.chat_container,
+                        &format!(
+                            "Cache miss: {} tokens re-billed",
+                            format_tokens(usage.input)
+                        ),
+                    );
+                }
+                *state.last_input_tokens.lock().unwrap() = usage.input;
             }
             tui.request_render(false);
         }
@@ -2816,6 +2956,10 @@ mod tests {
             tui: None,
             current_model_id: std::sync::Mutex::new(String::new()),
             show_images: std::sync::Mutex::new(true),
+            history: std::sync::Mutex::new(Vec::new()),
+            history_index: std::sync::Mutex::new(-1),
+            history_draft: std::sync::Mutex::new(None),
+        last_input_tokens: std::sync::Mutex::new(0),
         });
 
         // The drain handler takes `Arc<TuiAltScreen>`, which needs a real
@@ -2947,6 +3091,10 @@ mod tests {
             tui: None,
             current_model_id: std::sync::Mutex::new(String::new()),
             show_images: std::sync::Mutex::new(true),
+            history: std::sync::Mutex::new(Vec::new()),
+            history_index: std::sync::Mutex::new(-1),
+            history_draft: std::sync::Mutex::new(None),
+        last_input_tokens: std::sync::Mutex::new(0),
         });
         {
             let mut combined = CombinedAutocompleteProvider::new();
@@ -2994,6 +3142,10 @@ mod tests {
             tui: None,
             current_model_id: std::sync::Mutex::new(String::new()),
             show_images: std::sync::Mutex::new(true),
+            history: std::sync::Mutex::new(Vec::new()),
+            history_index: std::sync::Mutex::new(-1),
+            history_draft: std::sync::Mutex::new(None),
+        last_input_tokens: std::sync::Mutex::new(0),
         });
         let editor_container = Arc::new(Container::new());
         let editor = Arc::new(Editor::simple());
@@ -3018,6 +3170,68 @@ mod tests {
     }
 
     #[test]
+    fn test_message_history_browse_restores_draft() {
+        // ↑/↓ recall semantics (mirrors TS navigateHistory): push two
+        // messages, browse older → newer → back past the newest restores the
+        // draft the user was typing.
+        let state = Arc::new(TuiState {
+            current_assistant: std::sync::Mutex::new(None),
+            tool_components: std::sync::Mutex::new(HashMap::new()),
+            bash_components: std::sync::Mutex::new(HashMap::new()),
+            last_tool_comp: std::sync::Mutex::new(None),
+            status: std::sync::Mutex::new(RunStatus::Idle),
+            footer: Arc::new(FooterComponent::new()),
+            status_container: Arc::new(Container::new()),
+            chat_container: Arc::new(Container::new()),
+            loader: Arc::new(Loader::new()),
+            last_assistant_text: std::sync::Mutex::new(String::new()),
+            active_selector: std::sync::Mutex::new(None),
+            autocomplete: AutocompleteManager::new(),
+            autocomplete_container: Arc::new(Container::new()),
+            theme_manager: Arc::new(ThemeManager::new()),
+            tui: None,
+            current_model_id: std::sync::Mutex::new(String::new()),
+            show_images: std::sync::Mutex::new(true),
+            history: std::sync::Mutex::new(Vec::new()),
+            history_index: std::sync::Mutex::new(-1),
+            history_draft: std::sync::Mutex::new(None),
+        last_input_tokens: std::sync::Mutex::new(0),
+        });
+        let editor = Arc::new(Editor::simple());
+
+        push_history(&state, "first message");
+        push_history(&state, "second message");
+        // Consecutive duplicate is skipped.
+        push_history(&state, "second message");
+        push_history(&state, "   "); // empty → skipped
+        assert_eq!(state.history.lock().unwrap().len(), 2);
+        assert_eq!(state.history.lock().unwrap()[0], "second message");
+
+        // User starts typing a fresh prompt.
+        editor.set_text("half-typed");
+        editor.set_cursor(0, 11);
+
+        // ↑ → most recent.
+        navigate_history(&state, &editor, -1);
+        assert_eq!(editor.get_text(), "second message");
+        assert_eq!(*state.history_index.lock().unwrap(), 0);
+        // ↑ → older.
+        navigate_history(&state, &editor, -1);
+        assert_eq!(editor.get_text(), "first message");
+        assert_eq!(*state.history_index.lock().unwrap(), 1);
+        // ↑ past the oldest → stays (no wrap).
+        navigate_history(&state, &editor, -1);
+        assert_eq!(editor.get_text(), "first message");
+        // ↓ → newer.
+        navigate_history(&state, &editor, 1);
+        assert_eq!(editor.get_text(), "second message");
+        // ↓ past the newest → restores the draft.
+        navigate_history(&state, &editor, 1);
+        assert_eq!(editor.get_text(), "half-typed");
+        assert_eq!(*state.history_index.lock().unwrap(), -1);
+    }
+
+    #[test]
     fn test_accept_top_suggestion_replaces_prefix() {
         // `/he` + Tab → `/help ` (slash command provider inserts a space).
         let state = Arc::new(TuiState {
@@ -3038,6 +3252,10 @@ mod tests {
             tui: None,
             current_model_id: std::sync::Mutex::new(String::new()),
             show_images: std::sync::Mutex::new(true),
+            history: std::sync::Mutex::new(Vec::new()),
+            history_index: std::sync::Mutex::new(-1),
+            history_draft: std::sync::Mutex::new(None),
+        last_input_tokens: std::sync::Mutex::new(0),
         });
         {
             let mut combined = CombinedAutocompleteProvider::new();
