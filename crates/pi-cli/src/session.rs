@@ -468,7 +468,9 @@ fn load_extensions(args: &Args, cwd: &Path) -> ExtensionSession {
     }
     dirs.extend(args.extensions_dir.iter().cloned());
     let diagnostics: Arc<dyn PluginDiagnostics> = Arc::new(NullDiagnostics);
-    load_session(&dirs, diagnostics)
+    // Action bridge (B-series extension actions) is not wired from the CLI
+    // yet — the harness emits through the extension emitter without it.
+    load_session(&dirs, diagnostics, None)
 }
 
 /// Merge the loaded extension tools into the built-in set. An extension tool

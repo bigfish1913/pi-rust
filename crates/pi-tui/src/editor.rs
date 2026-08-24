@@ -10,6 +10,8 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use super::component::{Component, Focusable};
 use super::keybindings::Keybindings;
 use crate::ansi::CURSOR_MARKER;
+use crate::kill_ring::{KillRing, PushOptions};
+use crate::undo_stack::UndoStack;
 
 /// Editor style configuration.
 #[derive(Debug, Clone)]
@@ -117,6 +119,24 @@ pub struct Editor {
     keybindings: Arc<Keybindings>,
     on_submit: Mutex<Option<Arc<dyn Fn(&str) + Send + Sync>>>,
     on_change: Mutex<Option<Arc<dyn Fn(&str) + Send + Sync>>>,
+    /// Undo history (text + caret snapshots). Pushed before each mutation;
+    /// consecutive character insertions coalesce into one entry.
+    undo_stack: Mutex<UndoStack<EditorSnapshot>>,
+    /// Popped undo entries, for Ctrl+R redo.
+    redo_stack: Mutex<Vec<EditorSnapshot>>,
+    /// Emacs-style kill ring for Ctrl+K/U/W kills; Ctrl+Y yanks.
+    kill_ring: Mutex<KillRing>,
+    /// The last mutation kind, for undo coalescing + kill accumulation.
+    last_action: Mutex<Option<&'static str>>,
+}
+
+/// A restorable editor state snapshot (text + caret). Selection/scroll/focus
+/// are not part of undo (mirrors the TS `EditorSnapshot` minus paste state).
+#[derive(Clone)]
+struct EditorSnapshot {
+    lines: Vec<String>,
+    cursor_row: usize,
+    cursor_col: usize,
 }
 
 impl Editor {
@@ -137,6 +157,10 @@ impl Editor {
             keybindings,
             on_submit: Mutex::new(None),
             on_change: Mutex::new(None),
+            undo_stack: Mutex::new(UndoStack::with_max_size(200)),
+            redo_stack: Mutex::new(Vec::new()),
+            kill_ring: Mutex::new(KillRing::new()),
+            last_action: Mutex::new(None),
         }
     }
 
@@ -217,8 +241,104 @@ impl Editor {
         }
     }
 
+    /// Snapshot the current text + caret state (for undo/redo).
+    fn snapshot_state(&self) -> EditorSnapshot {
+        let state = self.state.lock().unwrap();
+        EditorSnapshot {
+            lines: state.lines.clone(),
+            cursor_row: state.cursor_row,
+            cursor_col: state.cursor_col,
+        }
+    }
+
+    /// Restore a snapshot, notifying change observers.
+    fn restore_state(&self, snap: &EditorSnapshot) {
+        if let Ok(mut state) = self.state.lock() {
+            state.lines = snap.lines.clone();
+            state.cursor_row = snap.cursor_row;
+            state.cursor_col = snap.cursor_col;
+        }
+        self.notify_change();
+    }
+
+    /// Record an undo snapshot before a mutation. `action` names the mutation
+    /// kind: consecutive `"insert"` actions coalesce into a single undo entry
+    /// (typing a word undoes as one step, mirroring the TS coalescing); any
+    /// other mutation starts a fresh entry. A new mutation clears the redo
+    /// stack (the classic undo/redo semantics).
+    fn push_undo(&self, action: &'static str) {
+        let coalesce = action == "insert"
+            && *self.last_action.lock().unwrap() == Some("insert");
+        if !coalesce {
+            let snap = self.snapshot_state();
+            if let Ok(mut stack) = self.undo_stack.lock() {
+                stack.push(snap);
+            }
+            if let Ok(mut redo) = self.redo_stack.lock() {
+                redo.clear();
+            }
+        }
+        *self.last_action.lock().unwrap() = Some(action);
+    }
+
+    /// Undo the last mutation (Ctrl+-). Restores the prior snapshot; the
+    /// undone state moves to the redo stack for Ctrl+R.
+    pub fn undo(&self) {
+        let popped = self
+            .undo_stack
+            .lock()
+            .unwrap()
+            .pop();
+        let Some(snap) = popped else { return };
+        // The current state is the redo target.
+        self.redo_stack.lock().unwrap().push(self.snapshot_state());
+        self.restore_state(&snap);
+        *self.last_action.lock().unwrap() = None;
+    }
+
+    /// Redo the last undone mutation (Ctrl+R).
+    pub fn redo(&self) {
+        let popped = self.redo_stack.lock().unwrap().pop();
+        let Some(snap) = popped else { return };
+        self.undo_stack.lock().unwrap().push(self.snapshot_state());
+        self.restore_state(&snap);
+        *self.last_action.lock().unwrap() = None;
+    }
+
+    /// Push killed (deleted) text onto the kill ring, accumulating consecutive
+    /// kills into one entry (mirrors the TS kill-ring semantics).
+    fn kill(&self, text: String, prepend: bool) {
+        if text.is_empty() {
+            return;
+        }
+        let accumulate = *self.last_action.lock().unwrap() == Some("kill");
+        if let Ok(mut ring) = self.kill_ring.lock() {
+            ring.push(&text, PushOptions { prepend, accumulate });
+        }
+        *self.last_action.lock().unwrap() = Some("kill");
+    }
+
+    /// Yank (paste) the most recent kill at the cursor (Ctrl+Y).
+    pub fn yank(&self) {
+        let text = self.kill_ring.lock().unwrap().peek().map(str::to_string);
+        let Some(text) = text else { return };
+        self.push_undo("yank");
+        self.insert(&text);
+        *self.last_action.lock().unwrap() = Some("yank");
+    }
+
+    /// Yank-pop: rotate the kill ring and yank the next entry (Alt+Y).
+    pub fn yank_pop(&self) {
+        if self.kill_ring.lock().unwrap().len() <= 1 {
+            return;
+        }
+        self.kill_ring.lock().unwrap().rotate();
+        self.yank();
+    }
+
     /// Insert text at cursor position.
     pub fn insert(&self, text: &str) {
+        self.push_undo("insert");
         if let Ok(mut state) = self.state.lock() {
             for ch in text.chars() {
                 if ch == '\n' {
@@ -248,6 +368,7 @@ impl Editor {
 
     /// Delete character before cursor (Backspace).
     fn backspace(&self) {
+        self.push_undo("edit");
         if let Ok(mut state) = self.state.lock() {
             if state.cursor_col > 0 {
                 let row = state.cursor_row;
@@ -279,6 +400,7 @@ impl Editor {
 
     /// Delete character at cursor (Delete).
     fn delete(&self) {
+        self.push_undo("edit");
         if let Ok(mut state) = self.state.lock() {
             let row = state.cursor_row;
             let line_len = state.lines[row].len();
@@ -385,6 +507,10 @@ impl Editor {
                 state.history_index = state.history.len();
             }
         }
+        // Submitted text is committed — don't let Ctrl+- resurrect it.
+        self.undo_stack.lock().unwrap().clear();
+        self.redo_stack.lock().unwrap().clear();
+        *self.last_action.lock().unwrap() = None;
         if let Ok(cb) = self.on_submit.lock() {
             if let Some(callback) = cb.as_ref() {
                 callback(&text);
@@ -428,23 +554,75 @@ impl Editor {
             (KeyModifiers::CONTROL, KeyCode::Char('a')) => self.cursor_home(),
             (KeyModifiers::CONTROL, KeyCode::Char('e')) => self.cursor_end(),
             (KeyModifiers::CONTROL, KeyCode::Char('k')) => {
-                // Delete to end of line
-                if let Ok(mut state) = self.state.lock() {
+                // Kill to end of line (push the killed text onto the ring).
+                self.push_undo("kill");
+                let killed = if let Ok(mut state) = self.state.lock() {
                     let row = state.cursor_row;
                     let col = state.cursor_col;
+                    let dead: String = state.lines[row].drain(col..).collect();
                     state.lines[row].truncate(col);
-                }
+                    dead
+                } else {
+                    String::new()
+                };
+                self.kill(killed, false);
                 self.notify_change();
             }
             (KeyModifiers::CONTROL, KeyCode::Char('u')) => {
-                // Delete to start of line
-                if let Ok(mut state) = self.state.lock() {
+                // Kill to start of line (killed text prepends to the ring entry
+                // so Ctrl+Y pastes it back in the same order).
+                self.push_undo("kill");
+                let killed = if let Ok(mut state) = self.state.lock() {
                     let row = state.cursor_row;
                     let col = state.cursor_col;
-                    let after: String = state.lines[row].drain(col..).collect();
-                    state.lines[row] = after;
+                    let before: String = state.lines[row].drain(..col).collect();
                     state.cursor_col = 0;
-                }
+                    before
+                } else {
+                    String::new()
+                };
+                self.kill(killed, true);
+                self.notify_change();
+            }
+            // Undo / redo (pi binds undo to Ctrl+-; Ctrl+R redo is a Rust port
+            // convenience since pi has no redo binding).
+            (KeyModifiers::CONTROL, KeyCode::Char('-')) => self.undo(),
+            (KeyModifiers::CONTROL, KeyCode::Char('r')) => self.redo(),
+            // Kill-ring yank (Ctrl+Y) / yank-pop (Alt+Y).
+            (KeyModifiers::CONTROL, KeyCode::Char('y')) => self.yank(),
+            (KeyModifiers::ALT, KeyCode::Char('y')) => self.yank_pop(),
+            // Delete the word before the cursor, killing it (Alt+Backspace).
+            (KeyModifiers::ALT, KeyCode::Backspace) => {
+                self.push_undo("kill");
+                let killed = if let Ok(mut state) = self.state.lock() {
+                    let row = state.cursor_row;
+                    let col = state.cursor_col;
+                    let bytes = state.lines[row].as_bytes();
+                    // Emacs backward-kill-word: skip the current word, then
+                    // the intervening delimiters, landing on the previous
+                    // word's start (or the line start).
+                    let mut start = col;
+                    while start > 0 {
+                        let b = bytes[start - 1];
+                        if !(b.is_ascii_alphanumeric() || b == b'_') {
+                            break;
+                        }
+                        start -= 1;
+                    }
+                    while start > 0 {
+                        let b = bytes[start - 1];
+                        if b.is_ascii_alphanumeric() || b == b'_' {
+                            break;
+                        }
+                        start -= 1;
+                    }
+                    let dead: String = state.lines[row].drain(start..col).collect();
+                    state.cursor_col = start;
+                    dead
+                } else {
+                    String::new()
+                };
+                self.kill(killed, true);
                 self.notify_change();
             }
             
@@ -601,6 +779,71 @@ mod tests {
         assert_eq!(snap_boundary("a你b", 2), 1);
     }
 
+
+    #[test]
+    fn test_undo_redo_roundtrip() {
+        let editor = Editor::simple();
+        editor.insert("hello");
+        editor.insert(" world");
+        // Consecutive inserts coalesce: one undo restores the empty state.
+        assert_eq!(editor.get_text(), "hello world");
+        editor.undo();
+        assert_eq!(editor.get_text(), "", "coalesced inserts undo as one step");
+        // Redo restores everything.
+        editor.redo();
+        assert_eq!(editor.get_text(), "hello world");
+        // A fresh edit after undo clears redo.
+        editor.undo();
+        editor.insert("hi");
+        editor.redo();
+        assert_eq!(editor.get_text(), "hi", "new edit clears the redo stack");
+    }
+
+    #[test]
+    fn test_kill_ring_yank() {
+        let editor = Editor::simple();
+        editor.insert("alpha beta gamma");
+        // Ctrl+K kills to end of line.
+        editor.set_cursor(0, 6); // after "alpha "
+        let key = |m, c| crossterm::event::KeyEvent::new(c, m);
+        editor.handle_key(key(
+            crossterm::event::KeyModifiers::CONTROL,
+            crossterm::event::KeyCode::Char('k'),
+        ));
+        assert_eq!(editor.get_text(), "alpha ");
+        // Ctrl+Y yanks it back.
+        editor.handle_key(key(
+            crossterm::event::KeyModifiers::CONTROL,
+            crossterm::event::KeyCode::Char('y'),
+        ));
+        assert_eq!(editor.get_text(), "alpha beta gamma");
+    }
+
+    #[test]
+    fn test_undo_after_kill() {
+        let editor = Editor::simple();
+        editor.insert("hello world");
+        editor.set_cursor(0, 5);
+        editor.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('k'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        assert_eq!(editor.get_text(), "hello");
+        editor.undo();
+        assert_eq!(editor.get_text(), "hello world", "kill is undoable");
+    }
+
+    #[test]
+    fn test_submit_clears_undo() {
+        let editor = Editor::simple();
+        editor.insert("committed");
+        editor.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        editor.undo();
+        assert_eq!(editor.get_text(), "", "submit clears undo so committed text stays committed");
+    }
     #[test]
     fn test_editor_text() {
         let editor = Editor::simple();

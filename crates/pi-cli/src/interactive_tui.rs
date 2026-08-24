@@ -3567,7 +3567,10 @@ fn add_hotkeys_message(container: &Arc<Container>) {
     container.add_child(Arc::new(Text::new("  Shift+Enter   — New line", 1, 0)));
     container.add_child(Arc::new(Text::new("  Tab           — Accept autocomplete suggestion", 1, 0)));
     container.add_child(Arc::new(Text::new("  Ctrl+A / Ctrl+E — Line start / end", 1, 0)));
-    container.add_child(Arc::new(Text::new("  Ctrl+K / Ctrl+U — Delete to end / start of line", 1, 0)));
+    container.add_child(Arc::new(Text::new("  Ctrl+K / Ctrl+U — Kill to end / start of line (Ctrl+Y yanks)", 1, 0)));
+    container.add_child(Arc::new(Text::new("  Ctrl+- / Ctrl+R — Undo / redo", 1, 0)));
+    container.add_child(Arc::new(Text::new("  Ctrl+Y / Alt+Y — Yank / yank-pop", 1, 0)));
+    container.add_child(Arc::new(Text::new("  Alt+Backspace — Kill previous word", 1, 0)));
     container.add_child(Arc::new(Text::new("  Ctrl+C        — Abort a run, or exit when idle", 1, 0)));
     container.add_child(Arc::new(Text::new("  Esc           — Abort a running prompt", 1, 0)));
     container.add_child(Arc::new(Text::new("  Ctrl+L        — Open model selector", 1, 0)));
