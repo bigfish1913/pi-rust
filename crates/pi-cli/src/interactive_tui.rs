@@ -51,6 +51,127 @@ use rpi_tui::BashStatus;
 
 use crate::args::Args;
 
+/// B5e: the markdown-transformer trait object the assistant-message render path
+/// applies to raw text BEFORE the [`Markdown`] renderer styles it. A plain
+/// `Fn(&str) -> String` (NO `rpi-extensions` types) so `rpi-tui` stays free of
+/// an `rpi-extensions` dep — `rpi-cli` (which already depends on
+/// `rpi-extensions`) builds the closure from the live `RegistrySnapshot` and
+/// hands the trait object to `AssistantMessageComponent::set_markdown_transformer`.
+type MarkdownTransformer = Arc<dyn Fn(&str) -> String + Send + Sync>;
+
+/// B5e: build the `AssistantMessageComponent` markdown-transformer closure the
+/// render path applies to raw assistant text before styling. Wraps any plugin
+/// `register_markdown_transformer` handlers registered in `snapshot` (chained
+/// in registration order: each handler's output feeds the next). `None` when
+/// no markdown transformers are registered (the component defaults to the
+/// identity transform + this avoids a closure allocation on the hot render
+/// path).
+///
+/// The closure captures an `Arc<RegistrySnapshot>` clone so it outlives the
+/// borrow that built it (the snapshot's `active` flag guards dispatch in
+/// `emit_resources_discover`/event translation; a reloaded session's old
+/// snapshot flips false, so a stale closure no-ops rather than driving a
+/// half-swapped registry — the transformer falls back to the input unchanged
+/// on an inactive snapshot, matching the plugin's per-handler skip-on-error).
+///
+/// This is the cycle-free seam: `rpi-tui` takes a `Fn(&str) -> String` trait
+/// object (no `rpi-extensions` dep); `rpi-cli` (which already depends on
+/// `rpi-extensions`) builds the closure from the live `RegistrySnapshot`. The
+/// calling pattern mirrors `plugin_stub_smoke.rs`'s direct `RenderFn` round-
+/// trip (input `{"markdown":…}` → `render_fn` → reclaim `out` via the plugin's
+/// `free_string` → parse `{"markdown":…}`).
+fn build_markdown_transformer(
+    snapshot: Option<std::sync::Arc<rpi_extensions::RegistrySnapshot>>,
+) -> Option<MarkdownTransformer> {
+    let snapshot = snapshot?;
+    // Pre-check: if no markdown renderers are registered, return None so the
+    // component uses the identity path (no per-delta closure call). The
+    // renderers list is a per-call `renderers_of` clone; snapshotting it once
+    // here keeps the closure cheap on the hot path.
+    let renderers = snapshot.renderers_of(rpi_extensions::RegisteredRendererKind::Markdown);
+    if renderers.is_empty() {
+        return None;
+    }
+    Some(Arc::new(move |raw: &str| -> String {
+        transform_markdown_chain(&snapshot, &renderers, raw)
+    }))
+}
+
+/// Drive the markdown-transformer chain for one input string. Each registered
+/// handler receives the previous handler's output (or the raw input for the
+/// first), as a `{"markdown": <text>}` JSON envelope; its `RenderFn` returns
+/// `{"markdown": <transformed>}` (rc=0) or an error (rc!=0). On any failure —
+/// nonzero rc, a panic across the FFI (caught), a missing `markdown` field, or
+/// an inactive snapshot — the chain short-circuits to the current text
+/// unchanged (per-handler skip-on-error, mirroring pi's `runner.ts` fan-out).
+fn transform_markdown_chain(
+    snapshot: &rpi_extensions::RegistrySnapshot,
+    renderers: &[rpi_extensions::RegisteredRenderer],
+    raw: &str,
+) -> String {
+    // A stale snapshot (post-/reload) must not drive a swapped-out registry.
+    // The renderers were captured from this snapshot; if it has gone inactive,
+    // fall back to the raw input so the UI never renders stale-transformed text
+    // from a dead plugin.
+    if !snapshot.is_active() {
+        return raw.to_string();
+    }
+
+    let mut current = raw.to_string();
+    for renderer in renderers {
+        let input = match serde_json::to_string(&serde_json::json!({ "markdown": current })) {
+            Ok(s) => s,
+            Err(_) => return current, // serialize failure — keep current, stop chain
+        };
+        // SAFETY: `render_fn` is a plugin-provided `extern "C" fn` over a
+        // borrowed `StbStringRef` + an out-param. The plugin warrants
+        // `poll`/`render` are non-blocking + thread-safe (the same contract
+        // the tool adapter relies on). `user_data` is the plugin's opaque
+        // pointer, stable for the registry lifetime (the keepalive keeps the
+        // cdylib mapped). We reclaim `out` via the plugin's `free_string`
+        // exactly once. The whole call is `catch_unwind`-wrapped — a plugin
+        // panic must not unwind across the FFI boundary (same policy as the
+        // tool partial cb + the runtime_action trampoline).
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut out = rpi_plugin_sdk::StbString::empty();
+            let rc = (renderer.render_fn)(
+                rpi_plugin_sdk::StbStringRef::from_str(&input),
+                &mut out as *mut rpi_plugin_sdk::StbString,
+                renderer.user_data,
+            );
+            let text = if rc == 0 {
+                let s = out.to_string_lossy();
+                Some(s)
+            } else {
+                None
+            };
+            // Reclaim the plugin-owned `out` regardless of rc (rc!=0 may still
+            // have written an error JSON the plugin allocated). `free_with` is
+            // idempotent on an empty `StbString`.
+            out.free_with(Some(renderer.plugin_free_string));
+            text
+        }));
+        let out_text = match outcome {
+            Ok(Some(s)) => s,
+            Ok(None) => return current, // rc != 0 — skip this handler, keep current
+            Err(_) => return current,  // panic — skip, keep current (do not abort: the
+            // render path is not the action trampoline; a panicking transformer
+            // degrades to identity rather than killing the process. Logged via
+            // the `tracing` crate's panic hook.)
+        };
+        // Parse `{"markdown": <text>}`; lenient — a missing/non-string field
+        // keeps the current text (skip this handler).
+        let next = serde_json::from_str::<serde_json::Value>(&out_text)
+            .ok()
+            .and_then(|v| v.get("markdown").and_then(|m| m.as_str()).map(|s| s.to_string()))
+            .unwrap_or(current);
+        current = next;
+    }
+    current
+}
+
+
+
 // ===========================================================================
 // Slash commands — trait + registry
 // ===========================================================================
@@ -1390,7 +1511,7 @@ async fn switch_to_session(
             let _ = harness.set_session(new_session).await;
             chat.clear();
             add_welcome_message(chat);
-            render_session_history(harness, chat).await;
+            render_session_history(harness, chat, state.markdown_transformer()).await;
             state.set_status(RunStatus::Idle);
             add_note_message(chat, &format!("Switched to session {id}."));
             true
@@ -1505,7 +1626,7 @@ async fn fork_session(
     let _ = harness.set_session(new_session).await;
     chat.clear();
     add_welcome_message(chat);
-    render_session_history(harness, chat).await;
+    render_session_history(harness, chat, state.markdown_transformer()).await;
     state.set_status(RunStatus::Idle);
     add_note_message(chat, "Forked into a new session.");
 }
@@ -1514,7 +1635,16 @@ async fn fork_session(
 /// into the chat container. Called at TUI startup for `--continue`/`--resume`/
 /// `--session` launches; a no-op for fresh sessions (no entries). Best-effort:
 /// any session read failure just starts with an empty transcript.
-async fn render_session_history(harness: &AgentHarness, chat: &Arc<Container>) {
+///
+/// `transformer` is the live assistant-markdown transformer (B5e); `None` is
+/// the identity path. Each restored assistant component installs it so replayed
+/// history renders through the same `register_markdown_transformer` handlers
+/// the live stream does.
+async fn render_session_history(
+    harness: &AgentHarness,
+    chat: &Arc<Container>,
+    transformer: Option<MarkdownTransformer>,
+) {
     let tree = harness.session().view("main");
     let entries = match tree.find_entries(&EntryQuery {
         entry_type: None,
@@ -1538,6 +1668,9 @@ async fn render_session_history(harness: &AgentHarness, chat: &Arc<Container>) {
                 let comp = Arc::new(AssistantMessageComponent::new(
                     AssistantMessageOptions::default(),
                 ));
+                if let Some(t) = &transformer {
+                    comp.set_markdown_transformer(Some(t.clone()));
+                }
                 comp.update_blocks(&assistant_blocks(a));
                 chat.add_child(comp);
                 chat.add_child(Arc::new(Spacer::new(1)));
@@ -1682,6 +1815,16 @@ struct TuiState {
     /// The in-progress scoped-models selection while the `/scoped-models`
     /// selector is open (toggle per item, Esc saves). `None` when not editing.
     scoped_edit: std::sync::Mutex<Option<Vec<String>>>,
+    /// B5e: the live assistant-markdown transformer, built from the current
+    /// `RegistrySnapshot`'s `register_markdown_transformer` handlers. `None`
+    /// when no markdown transformers are registered (identity render path).
+    /// Swapped on `/reload` (a fresh snapshot ⇒ a fresh closure; the old
+    /// closure no-ops once its snapshot's `active` flag flips false) and
+    /// re-installed on the in-flight `current_assistant` so a reloaded plugin's
+    /// transform takes effect on the visible streaming message immediately.
+    /// New assistant components pick up whatever closure is current at
+    /// construction time via [`install_markdown_transformer`].
+    markdown_transformer: std::sync::Mutex<Option<MarkdownTransformer>>,
 }
 
 /// How many submitted messages are kept for ↑ recall (mirrors the TS
@@ -1825,6 +1968,28 @@ impl TuiState {
         *self.current_model_id.lock().unwrap() = model.id.clone();
         self.footer.set_model(&short_model_name(&model.id));
     }
+
+    /// B5e: read a clone of the current assistant-markdown transformer (if any).
+    /// New assistant components call this at construction so they render with
+    /// whatever plugin `register_markdown_transformer` handlers are live.
+    fn markdown_transformer(&self) -> Option<MarkdownTransformer> {
+        self.markdown_transformer.lock().unwrap().clone()
+    }
+
+    /// B5e: swap the live transformer. Used at startup (install the first
+    /// closure built from the initial `RegistrySnapshot`) and on `/reload`
+    /// (rebuild from the fresh snapshot). On a reload the reloaded plugin's
+    /// transform should take effect on the VISIBLE streaming message too, so
+    /// this re-installs on the in-flight `current_assistant` component — its
+    /// `set_markdown_transformer` rebuilds the last blocks immediately. A
+    /// `None` clears the transform (identity), e.g. a reload that unregisters
+    /// every markdown transformer.
+    fn set_markdown_transformer_with_reinstall(&self, transformer: Option<MarkdownTransformer>) {
+        *self.markdown_transformer.lock().unwrap() = transformer.clone();
+        if let Some(comp) = self.current_assistant.lock().unwrap().as_ref() {
+            comp.set_markdown_transformer(transformer);
+        }
+    }
 }
 
 // ===========================================================================
@@ -1892,7 +2057,10 @@ pub async fn interactive_tui(
     // session — render its prior user/assistant transcript so the user sees
     // where they left off (tool executions are skipped: their live display
     // belongs to the current run, and replaying old results would be noise).
-    render_session_history(&harness, &chat_container).await;
+    let initial_transformer = build_markdown_transformer(
+        reload_context.extension_session.lock().unwrap().snapshot_arc(),
+    );
+    render_session_history(&harness, &chat_container, initial_transformer.clone()).await;
 
     // `document_container` wraps the welcome header + chat so the scrollview
     // follows the whole transcript (mirrors TS `documentContainer`).
@@ -1999,6 +2167,7 @@ pub async fn interactive_tui(
         history_draft: std::sync::Mutex::new(None),
         last_input_tokens: std::sync::Mutex::new(0),
         scoped_edit: std::sync::Mutex::new(None),
+        markdown_transformer: std::sync::Mutex::new(initial_transformer),
     });
 
     // Apply the saved theme from `~/.rpi/agent/settings.json` (best-effort).
@@ -2474,6 +2643,18 @@ pub async fn interactive_tui(
                 tui.request_render(false);
                 let outcome =
                     crate::session::reload_extension_resources(&harness, &reload_ctx).await;
+                // B5e: the reload swapped a fresh `ExtensionSession` into the
+                // context's cell. Rebuild the markdown transformer from that
+                // fresh snapshot and install it on the in-flight streaming
+                // component (so a reloaded plugin's transformer takes effect on
+                // the visible message immediately) + future components (they
+                // read `state.markdown_transformer()` at construction). The old
+                // closure no-ops once its snapshot's `active` flag flips false
+                // (reload already did that before the swap).
+                let fresh_transformer = build_markdown_transformer(
+                    reload_ctx.extension_session.lock().unwrap().snapshot_arc(),
+                );
+                state.set_markdown_transformer_with_reinstall(fresh_transformer);
                 if outcome.had_warnings {
                     add_error_message(
                         &chat_container,
@@ -2574,7 +2755,11 @@ async fn run_prompt_streaming(
                 if !streaming {
                     let text = assistant_text(final_message);
                     if !text.is_empty() {
-                        add_assistant_message_blocking(&state.chat_container, &text);
+                        add_assistant_message_blocking(
+                            &state.chat_container,
+                            &text,
+                            state.markdown_transformer(),
+                        );
                         *state.last_assistant_text.lock().unwrap() = text;
                     }
                 }
@@ -2649,11 +2834,22 @@ fn copy_to_clipboard(_text: &str) -> bool {
 
 /// Blocking fallback (no `event_rx`): render the final assistant text as a
 /// single `AssistantMessageComponent`, mirroring the pre-streaming behavior.
-fn add_assistant_message_blocking(container: &Arc<Container>, text: &str) {
+/// `transformer` is the live assistant-markdown transformer (B5e); `None` is
+/// the identity path. The blocking path only fires when `event_rx` is absent,
+/// so it shares the same transformer the streaming path installs on its
+/// components.
+fn add_assistant_message_blocking(
+    container: &Arc<Container>,
+    text: &str,
+    transformer: Option<MarkdownTransformer>,
+) {
     if text.is_empty() {
         return;
     }
     let msg = Arc::new(AssistantMessageComponent::new(AssistantMessageOptions::default()));
+    if let Some(t) = &transformer {
+        msg.set_markdown_transformer(Some(t.clone()));
+    }
     msg.update_text(text);
     container.add_child(msg);
     container.add_child(Arc::new(Spacer::new(1)));
@@ -2745,6 +2941,13 @@ async fn handle_agent_event(
                 let comp = Arc::new(AssistantMessageComponent::new(
                     AssistantMessageOptions::default(),
                 ));
+                // B5e: install the live markdown transformer so the plugin's
+                // `register_markdown_transformer` handlers apply from the very
+                // first streamed delta. `set_streaming` before the transform
+                // install is fine (transform fires on `update_blocks`, below).
+                if let Some(t) = state.markdown_transformer() {
+                    comp.set_markdown_transformer(Some(t));
+                }
                 comp.set_streaming(true);
                 // Render text AND thinking blocks in order (the old path fed
                 // only the concatenated text, so thinking blocks never showed).
@@ -4017,6 +4220,7 @@ mod tests {
             history_draft: std::sync::Mutex::new(None),
         last_input_tokens: std::sync::Mutex::new(0),
         scoped_edit: std::sync::Mutex::new(None),
+        markdown_transformer: std::sync::Mutex::new(None),
         });
 
         // The drain handler takes `Arc<TuiAltScreen>`, which needs a real
@@ -4153,6 +4357,7 @@ mod tests {
             history_draft: std::sync::Mutex::new(None),
         last_input_tokens: std::sync::Mutex::new(0),
         scoped_edit: std::sync::Mutex::new(None),
+        markdown_transformer: std::sync::Mutex::new(None),
         });
         {
             let mut combined = CombinedAutocompleteProvider::new();
@@ -4205,6 +4410,7 @@ mod tests {
             history_draft: std::sync::Mutex::new(None),
         last_input_tokens: std::sync::Mutex::new(0),
         scoped_edit: std::sync::Mutex::new(None),
+        markdown_transformer: std::sync::Mutex::new(None),
         });
         let editor_container = Arc::new(Container::new());
         let editor = Arc::new(Editor::simple());
@@ -4256,6 +4462,7 @@ mod tests {
             history_draft: std::sync::Mutex::new(None),
         last_input_tokens: std::sync::Mutex::new(0),
         scoped_edit: std::sync::Mutex::new(None),
+        markdown_transformer: std::sync::Mutex::new(None),
         });
         let editor = Arc::new(Editor::simple());
 
@@ -4317,6 +4524,7 @@ mod tests {
             history_draft: std::sync::Mutex::new(None),
         last_input_tokens: std::sync::Mutex::new(0),
         scoped_edit: std::sync::Mutex::new(None),
+        markdown_transformer: std::sync::Mutex::new(None),
         });
         {
             let mut combined = CombinedAutocompleteProvider::new();

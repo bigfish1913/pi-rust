@@ -466,6 +466,60 @@ already accepts `Vec<ImageContent>`; this is purely CLI-side wiring.
 `--no-themes`), `--skill`/`--prompt-template`/`--models` cycling, session
 restore (`-c`/`-r`/`--session`). These remain §1–§7 open questions below.
 
+### Part B status (Rust-native cdylib plugin system — 完整复刻 pi)
+
+Part B lands a Rust-native (cdylib via `libloading`, NOT TS/jiti) plugin system
+mirroring pi's extension surface: the 8 `register*` methods (tool, command,
+event_handler, shortcut, flag, provider, + the three renderers), the 33 `on()`
+event categories, 16 `runtime_action` host actions, and `resources_discover`.
+Phased commits B0→B5e; **B5e completes the final phase**.
+
+**Wired + active:**
+- `register_tool` (plugin tools override same-named built-ins; first-extension-
+  wins; explicit `--tools`/`--exclude-tools` still apply) — `rpi-extensions`.
+- `register_event_handler` → 10 always-emitted `AgentEvent`s fanned out via the
+  `ExtensionEmitter` (`rpi-extensions/translate.rs`); the three exists-but-`None`
+  loop hooks (`before_tool_call`/`after_tool_call`/`transform_context`) populated
+  via new `AgentHarnessOptions` fields (no crate cycle).
+- `register_provider` → `PluggableProvider` (v1 one-shot non-streaming, see
+  `crate-level docs`); `register_resources_discover` → `emit_resources_discover`
+  feeding Part-A loaders (the "三者同交付" coherence point — plugin skill paths
+  land through the SAME loaders as static skills; project skills keep winning
+  name collisions).
+- `runtime_action` (16 actions) via `ActionBridge` (the inverted-FFI
+  `user_data`→bridge recovery + `spawn`+std-mpsc park; no ambient-runtime
+  unsoundness). `/reload` staleness: `ActionBridge.invalidate()` + a fresh
+  `ExtensionSession` + harness setters (`set_system_prompt`/`set_resources`/
+  `set_agent_emitter`/`set_models`/`set_provider_hooks`/`set_tools`); a plugin's
+  `runtime_action(Reload)` signals a `ReloadMailbox` the TUI drains (avoids the
+  self-unmapping race).
+- **B5e: `register_markdown_transformer`** wires into the TUI render path —
+  `AssistantMessageComponent` applies an installed `Fn(&str) -> String` to raw
+  assistant text BEFORE `Markdown` styling (both the text arm + the thinking arm;
+  thinking transforms the plain body first, then ANSI-wraps). The cycle-free
+  seam: `rpi-tui` takes only the trait object (NO `rpi-extensions` dep); `rpi-cli`
+  builds the closure from the live `RegistrySnapshot` (chains handlers in
+  registration order, `{"markdown":…}` envelope, `catch_unwind`-wrapped FFI,
+  per-handler skip-on-error, stale-snapshot no-ops to identity). `/reload`
+  rebuilds the transformer from the fresh snapshot + reinstalls on the in-flight
+  streaming component so a reloaded plugin's transform takes effect immediately.
+
+**Recorded + exposed, TUI consumption deferred (with diagnostic):**
+- `register_message_renderer` / `register_entry_renderer` are registered + held
+  in the registry (`RegistrySnapshot::renderers_of`), but v1 does not drive the
+  TUI from them. Under `--verbose`, `session::report_deferred_renderers` prints
+  a one-line count ("`N markdown-transform (active), M message-render
+  (deferred), K entry-render (deferred)`") so a plugin author sees the
+  registration landed. Consumption lands when the TUI gains a per-message /
+  per-entry renderer seam.
+
+**Documented limits (v1):** plugin providers are one-shot (sync `ProviderRequestFn`
+can't drive a chunked `stream_simple`); SDK JSON crosses as a string
+round-trip (documented precision caveat — enable `arbitrary_precision`+
+`preserve_order` consistently host+plugin, or accept the limit). `.agents/*`
++ package skills/prompts, worktree shadow (`findShadowedContextFile`), full
+skill name/desc-length validation, and project-trust gating remain deferred.
+
 ---
 
 ## 9. ✅ RESOLVED — Read-only `grep`/`find`/`ls` ported to `pi-tools` (in-process)

@@ -241,6 +241,7 @@ pub async fn build(
         if let Some(s) = extension_session.summary() {
             eprintln!("extensions: {s}");
         }
+        report_deferred_renderers(&extension_session);
     }
     merge_extension_tools(&mut tools, &extension_session, args);
     let active = active_tool_names(&tools, args);
@@ -747,6 +748,7 @@ pub async fn reload_extension_resources(
         if let Some(s) = extension_session.summary() {
             eprintln!("reload: {s}");
         }
+        report_deferred_renderers(&extension_session);
     }
 
     // ---- 2. Invalidate the old session + bridge BEFORE the swap ----
@@ -945,6 +947,40 @@ fn build_models_with_extensions_for_reload(
     let pluggable = rpi_extensions::PluggableProvider::from_session(extension_session, runtime);
     models.extend(pluggable);
     models
+}
+
+/// B5e: diagnostic for the deferred TUI renderers. `register_message_renderer`
+/// + `register_entry_renderer` (B5c) are recorded + exposed in the registry but
+/// their TUI consumption is deferred (the plan's B5e v1 wires ONLY
+/// `register_markdown_transformer` into the render path); a plugin that
+/// registers a message/entry renderer gets a one-line stderr note under
+/// `--verbose` so the author knows the registration landed but isn't driving
+/// the UI yet. `register_markdown_transformer` handlers ARE wired (B5e) — they
+/// are counted separately as "active".
+fn report_deferred_renderers(session: &ExtensionSession) {
+    let Some(snap) = session.snapshot_arc() else {
+        return;
+    };
+    let all = snap.renderers();
+    let markdown = all
+        .iter()
+        .filter(|r| r.kind == rpi_extensions::RegisteredRendererKind::Markdown)
+        .count();
+    let message = all
+        .iter()
+        .filter(|r| r.kind == rpi_extensions::RegisteredRendererKind::Message)
+        .count();
+    let entry = all
+        .iter()
+        .filter(|r| r.kind == rpi_extensions::RegisteredRendererKind::Entry)
+        .count();
+    if markdown + message + entry == 0 {
+        return;
+    }
+    eprintln!(
+        "renderers: {} markdown-transform (active), {} message-render (deferred), {} entry-render (deferred)",
+        markdown, message, entry
+    );
 }
 
 /// A harness-build error.

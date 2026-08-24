@@ -75,6 +75,17 @@ pub struct AssistantMessageComponent {
     is_streaming: Mutex<bool>,
     /// The last blocks rendered (kept so `invalidate`/option changes can rebuild).
     last_blocks: Mutex<Vec<AssistantBlock>>,
+    /// B5e: an optional markdown transformer applied to the raw assistant text
+    /// BEFORE it reaches the [`Markdown`] renderer. The host (`rpi-cli`) injects
+    /// a closure wrapping any plugin `register_markdown_transformer` handlers
+    /// (called as a sync request/response across the cdylib FFI). `None` is the
+    /// no-op identity transform, so this render crate gains **no** `rpi-extensions`
+    /// dep — only a `Fn(&str) -> String` trait object. The transform fires on
+    /// every `rebuild_content` (i.e. once per streaming delta + once on
+    /// finalize), so the plugin always sees the latest full markdown; the FFI
+    /// call is cheap (a bare fn-pointer invocation + one JSON round-trip).
+    markdown_transformer:
+        Mutex<Option<Arc<dyn Fn(&str) -> String + Send + Sync>>>,
 }
 
 impl AssistantMessageComponent {
@@ -88,6 +99,48 @@ impl AssistantMessageComponent {
             has_tool_calls: Mutex::new(false),
             is_streaming: Mutex::new(false),
             last_blocks: Mutex::new(Vec::new()),
+            markdown_transformer: Mutex::new(None),
+        }
+    }
+
+    /// B5e: install a markdown transformer applied to raw assistant text before
+    /// the [`Markdown`] renderer styles it. The closure is `Send + Sync` so it
+    /// is safe across the streaming-drain + render threads. Idempotent against
+    /// `rebuild_content`: callers may set it before the first `update_blocks` or
+    /// swap it on a `/reload`; either way the next rebuild re-applies it. A
+    /// `None` value clears the transform (identity) — used on a reload that
+    /// unregisters all markdown transformers.
+    ///
+    /// On a transform CHANGE, the last blocks are rebuilt so the new transform
+    /// is reflected immediately (mirrors `set_hide_thinking`/`set_output_pad`).
+    pub fn set_markdown_transformer(
+        &self,
+        transformer: Option<Arc<dyn Fn(&str) -> String + Send + Sync>>,
+    ) {
+        let blocks = {
+            let mut cur = self.markdown_transformer.lock().unwrap();
+            // `Arc<dyn Fn>` has no PartialEq, so we can't short-circuit on
+            // "unchanged" like the option setters. Always rebuild: the call is
+            // cheap and the rebuild only fires on an explicit set/swap.
+            *cur = transformer;
+            self.last_blocks.lock().unwrap().clone()
+        };
+        if !blocks.is_empty() {
+            self.rebuild_content(&blocks);
+        }
+    }
+
+    /// Apply the installed transformer to a raw markdown string (identity when
+    /// none is installed). Both the text arm and the thinking arm of
+    /// `rebuild_content` route through here so a single install point covers
+    /// both. Thinking is treated like text — the spec transforms "assistant
+    /// markdown text" and thinking is rendered as markdown too; a plugin that
+    /// wants to skip thinking can inspect the input it receives (no flag is
+    /// carried in the `{"markdown": …}` envelope).
+    fn transform_markdown(&self, raw: &str) -> String {
+        match self.markdown_transformer.lock().unwrap().clone() {
+            Some(f) => f(raw),
+            None => raw.to_string(),
         }
     }
 
@@ -150,7 +203,13 @@ impl AssistantMessageComponent {
             let block = &blocks[i];
             match block {
                 AssistantBlock::Text(t) if !t.trim().is_empty() => {
-                    let md = Arc::new(Markdown::new(t.trim().to_string(), opts.output_pad, 0));
+                    // B5e: apply the installed markdown transformer (identity
+                    // when none) BEFORE styling, so a plugin's
+                    // `register_markdown_transformer` sees the raw assistant
+                    // markdown and `Markdown::render_markdown` styles the
+                    // transformed text.
+                    let transformed = self.transform_markdown(t.trim());
+                    let md = Arc::new(Markdown::new(transformed, opts.output_pad, 0));
                     self.content_container.add_child(md);
                     i += 1;
                 }
@@ -191,7 +250,13 @@ impl AssistantMessageComponent {
                         // styling, applied via the thinking-text color + italic
                         // wrapper around the markdown lines.
                         let body = joined.join("\n\n");
-                        let wrapped = italic(&theme().colors.thinking_text.fg(&body));
+                        // B5e: transform the PLAIN thinking markdown first (the
+                        // plugin must see markdown, not ANSI), then apply the
+                        // thinking-text color + italic wrap around the
+                        // transformed text — same order as the text block
+                        // (transform → style → render).
+                        let transformed = self.transform_markdown(&body);
+                        let wrapped = italic(&theme().colors.thinking_text.fg(&transformed));
                         let md = Arc::new(Markdown::new(wrapped, opts.output_pad, 0));
                         self.content_container.add_child(md);
                     }
@@ -268,6 +333,16 @@ impl AssistantMessageComponent {
     /// Check if has tool calls.
     pub fn has_tool_calls(&self) -> bool {
         *self.has_tool_calls.lock().unwrap()
+    }
+
+    /// The currently installed markdown transformer (B5e), if any. The host
+    /// reads this to carry an existing transform into a fresh component (e.g.
+    /// after a `/reload`) so the new component renders with the same plugin
+    /// transformer without the host re-querying the registry.
+    pub fn markdown_transformer(
+        &self,
+    ) -> Option<Arc<dyn Fn(&str) -> String + Send + Sync>> {
+        self.markdown_transformer.lock().unwrap().clone()
     }
 
     /// Set streaming state.
@@ -415,5 +490,56 @@ mod tests {
         let after = strip_ansi(&msg.render(80).join("\n"));
         assert!(!after.contains("internal"), "not rebuilt after toggle: {after}");
         assert!(after.contains("Thinking..."));
+    }
+
+    #[test]
+    fn test_markdown_transformer_applied_to_text_and_thinking() {
+        // B5e: an installed transformer rewrites the raw markdown BEFORE styling.
+        // A trivial uppercasing transformer proves the text arm + the thinking
+        // arm both route through `transform_markdown` (and that the thinking arm
+        // transforms the PLAIN body, not the ANSI-wrapped output).
+        let msg = AssistantMessageComponent::default();
+        let transformer: Arc<dyn Fn(&str) -> String + Send + Sync> =
+            Arc::new(|raw: &str| raw.to_uppercase());
+        msg.set_markdown_transformer(Some(transformer));
+        msg.update_blocks(&[
+            AssistantBlock::Thinking("quiet reasoning".to_string()),
+            AssistantBlock::Text("hello world".to_string()),
+        ]);
+        let joined = strip_ansi(&msg.render(80).join("\n"));
+        assert!(
+            joined.contains("QUIET REASONING"),
+            "thinking not transformed: {joined}"
+        );
+        assert!(
+            joined.contains("HELLO WORLD"),
+            "text not transformed: {joined}"
+        );
+    }
+
+    #[test]
+    fn test_markdown_transformer_swap_rebuilds() {
+        // B5e: swapping the transformer after an update rebuilds the last blocks
+        // so the new transform is reflected immediately (mirrors the option
+        // setters). A None clears the transform (identity).
+        let msg = AssistantMessageComponent::default();
+        msg.update_blocks(&[AssistantBlock::Text("hello".to_string())]);
+        let upper: Arc<dyn Fn(&str) -> String + Send + Sync> =
+            Arc::new(|raw: &str| raw.to_uppercase());
+        msg.set_markdown_transformer(Some(upper));
+        assert!(strip_ansi(&msg.render(80).join("\n")).contains("HELLO"));
+        // Clear → identity.
+        msg.set_markdown_transformer(None);
+        assert!(strip_ansi(&msg.render(80).join("\n")).contains("hello"));
+    }
+
+    #[test]
+    fn test_no_transformer_is_identity() {
+        // B5e: with no transformer installed, raw text reaches the renderer
+        // unchanged (the default path — every existing test relies on this).
+        let msg = AssistantMessageComponent::default();
+        msg.update_blocks(&[AssistantBlock::Text("plain text".to_string())]);
+        assert!(msg.markdown_transformer().is_none());
+        assert!(strip_ansi(&msg.render(80).join("\n")).contains("plain text"));
     }
 }
