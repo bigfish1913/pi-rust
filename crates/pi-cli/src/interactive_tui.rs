@@ -543,11 +543,19 @@ impl SlashCommand for SettingsCommand {
         "/settings"
     }
     fn description(&self) -> &'static str {
-        "Show saved settings"
+        "Open settings menu"
     }
     fn execute(&self, ctx: &CommandContext, _args: &str) {
-        show_settings_panel(&ctx.chat);
-        ctx.tui.request_render(false);
+        open_settings_selector(
+            &ctx.state,
+            &ctx.editor_container,
+            &ctx.editor,
+            &ctx.tui,
+            &ctx.lane,
+            &ctx.model_catalog,
+            &ctx.lane_model_id,
+            &ctx.chat,
+        );
     }
 }
 
@@ -749,7 +757,8 @@ fn user_message_text(msg: &rpi_ai::types::UserMessage) -> String {
 
 /// Render the `/settings` panel: the saved settings.json values the session
 /// honors, plus pointers to the commands that edit them (theme via `/theme`,
-/// defaults via flags, cycle scope via `/scoped-models`).
+/// defaults via flags, cycle scope via `/scoped-models`). Kept for the
+/// read-only summary; the interactive menu is [`open_settings_selector`].
 fn show_settings_panel(chat: &Arc<Container>) {
     let s = crate::settings::load_settings().unwrap_or_default();
     let mut lines: Vec<String> = Vec::new();
@@ -800,6 +809,291 @@ fn scoped_catalog(catalog: &[rpi_ai::Model], current_id: &str) -> Vec<rpi_ai::Mo
         }
     }
     out
+}
+
+/// Interactive `/settings` menu: a top-level selector over the editable
+/// settings, each opening a sub-selector that applies the choice AND persists
+/// it to settings.json (theme / default model / default thinking / cycle
+/// scope). Selecting a menu item swaps the current selector for the
+/// sub-selector (the `active_selector` slot is single, so each open replaces
+/// the previous list); the sub-selector's cancel restores the editor.
+fn open_settings_selector(
+    state: &Arc<TuiState>,
+    editor_container: &Arc<Container>,
+    editor: &Arc<Editor>,
+    tui: &Arc<TuiAltScreen>,
+    lane: &Arc<dyn AgentLane>,
+    catalog: &[rpi_ai::Model],
+    lane_model_id: &str,
+    chat: &Arc<Container>,
+) {
+    let settings = crate::settings::load_settings().unwrap_or_default();
+    let mut items: Vec<SelectItem> = Vec::new();
+    items.push(
+        SelectItem::new("theme", "Theme")
+            .with_description(&settings.theme.clone().unwrap_or_else(|| "(default)".into())),
+    );
+    items.push(
+        SelectItem::new("model", "Default model")
+            .with_description(&settings.default_model.clone().unwrap_or_else(|| "(none)".into())),
+    );
+    items.push(
+        SelectItem::new("thinking", "Default thinking")
+            .with_description(&settings.default_thinking_level.clone().unwrap_or_else(|| "(default)".into())),
+    );
+    let scope_desc = match &settings.scoped_models {
+        Some(list) if !list.is_empty() => format!("{}", list.join(", ")),
+        _ => "all models".to_string(),
+    };
+    items.push(
+        SelectItem::new("scoped-models", "Ctrl+M cycle scope").with_description(&scope_desc),
+    );
+    let list = Arc::new(SelectList::new(items, 10));
+
+    let state_sel = state.clone();
+    let ec_sel = editor_container.clone();
+    let editor_sel = editor.clone();
+    let tui_sel = tui.clone();
+    let lane_sel = lane.clone();
+    let chat_sel = chat.clone();
+    let catalog_sel = catalog.to_vec();
+    let lane_model_sel = lane_model_id.to_string();
+    list.on_select(Arc::new(move |item| {
+        // Swap this menu for the sub-selector; each sub-selector saves its
+        // choice to settings.json on select.
+        match item.value.as_str() {
+            "theme" => open_settings_theme_selector(
+                &state_sel, &ec_sel, &editor_sel, &tui_sel, &chat_sel,
+            ),
+            "model" => open_settings_model_selector(
+                &state_sel,
+                &ec_sel,
+                &editor_sel,
+                &tui_sel,
+                &lane_sel,
+                &catalog_sel,
+                &lane_model_sel,
+                &chat_sel,
+            ),
+            "thinking" => open_settings_thinking_selector(
+                &state_sel,
+                &ec_sel,
+                &editor_sel,
+                &tui_sel,
+                &lane_sel,
+                &catalog_sel,
+                &lane_model_sel,
+                &chat_sel,
+            ),
+            "scoped-models" => open_scoped_models_selector(
+                &state_sel, &ec_sel, &editor_sel, &tui_sel, &catalog_sel, &chat_sel,
+            ),
+            _ => close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel),
+        }
+    }));
+    let state_cancel = state.clone();
+    let ec_cancel = editor_container.clone();
+    let editor_cancel = editor.clone();
+    let tui_cancel = tui.clone();
+    list.on_cancel(Arc::new(move || {
+        close_selector(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
+    }));
+
+    open_selector(state, editor_container, editor, tui, list, SelectorKind::Settings);
+}
+
+/// Apply a theme choice AND persist it to settings.json (`/settings` → Theme).
+fn open_settings_theme_selector(
+    state: &Arc<TuiState>,
+    editor_container: &Arc<Container>,
+    editor: &Arc<Editor>,
+    tui: &Arc<TuiAltScreen>,
+    chat: &Arc<Container>,
+) {
+    let items = vec![
+        SelectItem::new("dark", "Dark").with_description("Default dark theme"),
+        SelectItem::new("light", "Light").with_description("Light background"),
+        SelectItem::new("monochrome", "Monochrome").with_description("No color accents"),
+    ];
+    let list = Arc::new(SelectList::new(items, 10));
+
+    let state_sel = state.clone();
+    let ec_sel = editor_container.clone();
+    let editor_sel = editor.clone();
+    let tui_sel = tui.clone();
+    let chat_sel = chat.clone();
+    list.on_select(Arc::new(move |item| {
+        let preset = match item.value.as_str() {
+            "light" => ThemePreset::Light,
+            "monochrome" => ThemePreset::Monochrome,
+            _ => ThemePreset::Dark,
+        };
+        state_sel.theme_manager.apply_preset(preset);
+        let mut settings = crate::settings::load_settings().unwrap_or_default();
+        settings.theme = Some(item.value.clone());
+        let saved = crate::settings::save_settings(&settings);
+        add_note_message(
+            &chat_sel,
+            &format!(
+                "Theme set to {} (saved{})",
+                item.label,
+                if saved.is_ok() { "" } else { ", not saved" },
+            ),
+        );
+        close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
+        tui_sel.render_now(true);
+    }));
+    let state_cancel = state.clone();
+    let ec_cancel = editor_container.clone();
+    let editor_cancel = editor.clone();
+    let tui_cancel = tui.clone();
+    list.on_cancel(Arc::new(move || {
+        close_selector(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
+    }));
+
+    open_selector(state, editor_container, editor, tui, list, SelectorKind::Settings);
+}
+
+/// Choose the default model AND persist it (`/settings` → Default model):
+/// applies live via `lane.set_model` and saves `defaultModel` to settings.json
+/// (which `provider::resolve` honors as pi's `findInitialModel` step 3).
+fn open_settings_model_selector(
+    state: &Arc<TuiState>,
+    editor_container: &Arc<Container>,
+    editor: &Arc<Editor>,
+    tui: &Arc<TuiAltScreen>,
+    lane: &Arc<dyn AgentLane>,
+    catalog: &[rpi_ai::Model],
+    lane_model_id: &str,
+    chat: &Arc<Container>,
+) {
+    let mut items: Vec<SelectItem> = Vec::new();
+    for m in catalog {
+        let label = if m.name.is_empty() { short_model_name(&m.id) } else { m.name.clone() };
+        let marker = if m.id.eq_ignore_ascii_case(lane_model_id) { " (current)" } else { "" };
+        items.push(SelectItem::new(&m.id, &label).with_description(&format!("{id}{marker}", id = m.id)));
+    }
+    if items.is_empty() {
+        add_note_message(chat, "No models in the catalog.");
+        tui.request_render(false);
+        return;
+    }
+    let list = Arc::new(SelectList::new(items, 10));
+
+    let catalog_arc = catalog.to_vec();
+    let state_sel = state.clone();
+    let ec_sel = editor_container.clone();
+    let editor_sel = editor.clone();
+    let tui_sel = tui.clone();
+    let chat_sel = chat.clone();
+    let lane_sel = lane.clone();
+    list.on_select(Arc::new(move |item| {
+        let Some(model) = catalog_arc.iter().find(|m| m.id == item.value).cloned() else {
+            add_note_message(&chat_sel, &format!("Model {} not found.", item.label));
+            close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
+            return;
+        };
+        state_sel.set_current_model(&model);
+        let lane = lane_sel.clone();
+        tokio::spawn(async move {
+            let _ = lane.set_model(model).await;
+        });
+        let mut settings = crate::settings::load_settings().unwrap_or_default();
+        settings.default_model = Some(item.value.clone());
+        let saved = crate::settings::save_settings(&settings);
+        add_note_message(
+            &chat_sel,
+            &format!(
+                "Default model set to {} (saved{}",
+                short_model_name(&item.value),
+                if saved.is_ok() { ")" } else { ", not saved)" },
+            ),
+        );
+        close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
+    }));
+    let state_cancel = state.clone();
+    let ec_cancel = editor_container.clone();
+    let editor_cancel = editor.clone();
+    let tui_cancel = tui.clone();
+    list.on_cancel(Arc::new(move || {
+        close_selector(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
+    }));
+
+    open_selector(state, editor_container, editor, tui, list, SelectorKind::Settings);
+}
+
+/// Choose the default thinking level AND persist it (`/settings` → Default
+/// thinking): applies live via `lane.set_thinking_level` and saves
+/// `defaultThinkingLevel` to settings.json.
+fn open_settings_thinking_selector(
+    state: &Arc<TuiState>,
+    editor_container: &Arc<Container>,
+    editor: &Arc<Editor>,
+    tui: &Arc<TuiAltScreen>,
+    lane: &Arc<dyn AgentLane>,
+    catalog: &[rpi_ai::Model],
+    lane_model_id: &str,
+    chat: &Arc<Container>,
+) {
+    let model = catalog.iter().find(|m| m.id.eq_ignore_ascii_case(lane_model_id));
+    let levels: Vec<rpi_ai::types::ThinkingLevel> = model
+        .map(|m| m.supported_thinking_levels())
+        .unwrap_or_else(|| {
+            use rpi_ai::types::ThinkingLevel::*;
+            vec![Off, Minimal, Low, Medium, High]
+        });
+    let mut items: Vec<SelectItem> = Vec::new();
+    for lvl in &levels {
+        let name = thinking_level_name(*lvl);
+        items.push(SelectItem::new(name, name).with_description(thinking_level_description(*lvl)));
+    }
+    if items.is_empty() {
+        add_note_message(chat, "This model has no supported thinking levels.");
+        tui.request_render(false);
+        return;
+    }
+    let list = Arc::new(SelectList::new(items, 10));
+
+    let state_sel = state.clone();
+    let ec_sel = editor_container.clone();
+    let editor_sel = editor.clone();
+    let tui_sel = tui.clone();
+    let chat_sel = chat.clone();
+    let lane_sel = lane.clone();
+    list.on_select(Arc::new(move |item| {
+        let Some(level) = thinking_level_from_name(&item.value) else {
+            add_note_message(&chat_sel, &format!("Unknown thinking level: {}.", item.label));
+            close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
+            return;
+        };
+        let lane = lane_sel.clone();
+        let footer_sel = state_sel.footer.clone();
+        tokio::spawn(async move {
+            let _ = lane.set_thinking_level(level).await;
+        });
+        footer_sel.set_thinking_level(Some(thinking_level_name(level)));
+        let mut settings = crate::settings::load_settings().unwrap_or_default();
+        settings.default_thinking_level = Some(item.value.clone());
+        let saved = crate::settings::save_settings(&settings);
+        add_note_message(
+            &chat_sel,
+            &format!(
+                "Default thinking set to {} (saved{}",
+                item.label,
+                if saved.is_ok() { ")" } else { ", not saved)" },
+            ),
+        );
+        close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
+    }));
+    let state_cancel = state.clone();
+    let ec_cancel = editor_container.clone();
+    let editor_cancel = editor.clone();
+    let tui_cancel = tui.clone();
+    list.on_cancel(Arc::new(move || {
+        close_selector(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
+    }));
+
+    open_selector(state, editor_container, editor, tui, list, SelectorKind::Settings);
 }
 
 /// `/scoped-models`: a multi-toggle selector over the catalog. Selecting an
@@ -1274,6 +1568,8 @@ enum SelectorKind {
     Theme,
     /// `/scoped-models` — multi-toggle Ctrl+M cycle scope.
     ScopedModels,
+    /// `/settings` — interactive settings menu (and its sub-selectors).
+    Settings,
 }
 
 /// Shared mutable TUI state, `Arc`-cloned into the drain task, the key loop,
@@ -1848,6 +2144,24 @@ pub async fn interactive_tui(
                 continue;
             }
 
+            // 0. Ctrl+C is ALWAYS the escape hatch — even with a selector
+            //    open (a stuck run or a mis-open selector must never trap the
+            //    user): abort an active run, else exit. Checked before the
+            //    selector routing below.
+            if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
+                let status = *state_for_key.status.lock().unwrap();
+                if status == RunStatus::Working {
+                    state_for_key.set_status(RunStatus::Aborting);
+                    let lane = lane_for_key.clone();
+                    tokio::spawn(async move {
+                        let _ = lane.abort().await;
+                    });
+                } else {
+                    let _ = tx_for_key.send(TuiMessage::Exit);
+                }
+                continue;
+            }
+
             // 1. A selector overlay is open → route to it first. Only Esc
             //    (cancel) and Enter/Up/Down/Ctrl-K/J/P/N (navigate/select)
             //    escape to the selector; on done/cancel the selector callbacks
@@ -1876,21 +2190,6 @@ pub async fn interactive_tui(
                     .expect("selector_open guaranteed Some");
                 selector.handle_key(key);
                 tui_for_key.request_render(false);
-                continue;
-            }
-
-            // 2. Ctrl+C: abort a run if one is active, else exit.
-            if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
-                let status = *state_for_key.status.lock().unwrap();
-                if status == RunStatus::Working {
-                    state_for_key.set_status(RunStatus::Aborting);
-                    let lane = lane_for_key.clone();
-                    tokio::spawn(async move {
-                        let _ = lane.abort().await;
-                    });
-                } else {
-                    let _ = tx_for_key.send(TuiMessage::Exit);
-                }
                 continue;
             }
 
