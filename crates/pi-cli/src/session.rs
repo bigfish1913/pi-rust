@@ -191,7 +191,9 @@ pub async fn build(
         runtime.clone(),
     );
     let host_arc: Arc<dyn rpi_extensions::RuntimeActionHost> = Arc::new(action_host);
-    let action_bridge = rpi_extensions::ActionBridge::new(runtime, host_arc);
+    // `runtime` is reused below (B5c: `PluggableProvider` needs a captured
+    // `Handle` to `spawn_blocking` the sync `ProviderRequestFn`), so clone here.
+    let action_bridge = rpi_extensions::ActionBridge::new(runtime.clone(), host_arc);
 
     // ---- Execution env + tools ----
     let env = Arc::new(OsExecutionEnv::with_cwd(cwd.to_path_buf()));
@@ -483,7 +485,14 @@ pub async fn build(
         tool_execution: HarnessToolExecution::default(),
         drive: DrivingMode::default(),
         session,
-        models: vec![resolved.provider.clone() as Arc<dyn Provider>],
+        // B5c: inject the resolved gateway provider PLUS one `Arc<dyn Provider>`
+        // per registered extension provider (`PluggableProvider` wraps a plugin's
+        // sync `ProviderRequestFn`). The harness's `build_stream_fn` resolves a
+        // provider lazily per call by `models.iter().find(|p| p.id() == model.provider)`,
+        // so a catalog model whose `provider` matches an extension provider's id
+        // routes to it. Extension providers land AFTER the gateway so the gateway
+        // stays first-match for its own ids (first-wins on a `.find`).
+        models: build_models_with_extensions(resolved, &extension_session, runtime.clone()),
         to_provider_messages: None,
         entry_projectors: Default::default(),
         agent_emitter: Some(emitter),
@@ -531,6 +540,27 @@ pub enum BuildError {
     #[error("Could not build the harness: {0}")]
     HarnessCreate(String),
 }
+
+/// B5c: build the `AgentHarnessOptions.models` vec — the resolved gateway
+/// provider first, then one `Arc<dyn Provider>` per registered extension
+/// provider (each a [`rpi_extensions::PluggableProvider`] wrapping a plugin's
+/// sync `ProviderRequestFn`). The harness resolves a provider lazily per call by
+/// `models.iter().find(|p| p.id() == model.provider)`, so the gateway stays
+/// first-match for its own ids and an extension provider serves a catalog model
+/// whose `provider` matches its id. `runtime` is the same `Handle` captured for
+/// the action bridge — `PluggableProvider` needs a captured `Handle` to
+/// `spawn_blocking` the sync ffi call from the async `stream_simple`.
+fn build_models_with_extensions(
+    resolved: &ResolvedModel,
+    extension_session: &ExtensionSession,
+    runtime: tokio::runtime::Handle,
+) -> Vec<Arc<dyn Provider>> {
+    let mut models: Vec<Arc<dyn Provider>> = vec![resolved.provider.clone() as Arc<dyn Provider>];
+    let pluggable = rpi_extensions::PluggableProvider::from_session(extension_session, runtime);
+    models.extend(pluggable);
+    models
+}
+
 
 /// Resolve the extension dirs to scan and load the cdylib plugins, returning
 /// the loaded session guard (keeps the `Library` handles alive for the harness

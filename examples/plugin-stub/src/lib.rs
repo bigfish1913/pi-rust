@@ -41,6 +41,12 @@ use rpi_plugin_sdk::{
     register_entrypoint, EventTag, FreeStringFn, PluginApiVt, StableToolSchema, StbString,
     StbStringRef, StepHandle, StepResult, StepResultTag, ToolPartialCb, RPI_PLUGIN_ABI_VERSION,
 };
+// The provider/render fn signatures are referenced transitively by the
+// `register_provider`/`register_markdown_transformer` vtable slots (the host
+// passes our `extern "C" fn`s as `ProviderRequestFn`/`RenderFn`-typed params).
+// Naming the types here keeps the import live and documents the contract.
+#[allow(unused_imports)]
+use rpi_plugin_sdk::{ProviderRequestFn, RenderFn};
 
 // ---------------------------------------------------------------------------
 // The echo tool's per-drive state — what execute() allocates and destroy() frees.
@@ -248,6 +254,85 @@ extern "C" fn on_resources_discover(
 }
 
 // ---------------------------------------------------------------------------
+// The register provider (B5c) — proves the provider-injection round-trip
+// ---------------------------------------------------------------------------
+
+/// How many times the stub's `ProviderRequestFn` was called. The host smoke test
+/// reads this through the cdylib to assert the provider was driven. A
+/// process-global atomic because `extern "C" fn` cannot capture.
+static PROVIDER_REQUEST_HITS: AtomicUsize = AtomicUsize::new(0);
+
+/// Read the `ProviderRequestFn` hit counter (host smoke test uses this).
+#[no_mangle]
+pub extern "C" fn plugin_stub_provider_request_hits() -> usize {
+    PROVIDER_REQUEST_HITS.load(Ordering::SeqCst)
+}
+
+/// The stub's `ProviderRequestFn`: `req_json` is a borrowed request envelope
+/// (`{model, context, options}`); `out` is an owning response we write a full
+/// assistant-message JSON into (the host parses it + reclaims it via our
+/// `plugin_free_string`). v1 one-shot: the stub returns the complete message as
+/// one terminal payload (the host's `PluggableProvider` emits it as a single
+/// `Done` chunk).
+///
+/// We return a canned text message so the round-trip has something concrete to
+/// assert (the model the host routes here is `stub-model` — see the smoke test).
+extern "C" fn on_provider_request(
+    _req_json: StbStringRef,
+    out: *mut StbString,
+    _user_data: *mut c_void,
+) -> i32 {
+    PROVIDER_REQUEST_HITS.fetch_add(1, Ordering::SeqCst);
+    let json = r#"{"role":"assistant","content":[{"type":"text","text":"from-stub-provider"}],"api":"faux","provider":"stub-provider","model":"stub-model","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":0.0}},"stopReason":"stop","timestamp":0}"#;
+    unsafe {
+        *out = StbString::from_string(json.to_string());
+    }
+    0
+}
+
+// ---------------------------------------------------------------------------
+// The markdown-transformer renderer (B5c) — proves the renderer registrar
+// ---------------------------------------------------------------------------
+
+/// How many times the stub's markdown `RenderFn` was called. The host smoke test
+/// reads this to assert registration landed (B5e wires the TUI consumption; for
+/// now registration + exposure is the B5c smoke — calling it is a unit-level
+/// check the smoke optionally performs).
+static MARKDOWN_TRANSFORM_HITS: AtomicUsize = AtomicUsize::new(0);
+
+/// Read the markdown-transformer hit counter (host smoke test uses this).
+#[no_mangle]
+pub extern "C" fn plugin_stub_markdown_transform_hits() -> usize {
+    MARKDOWN_TRANSFORM_HITS.load(Ordering::SeqCst)
+}
+
+/// The stub's markdown `RenderFn`: `input_json` is a borrowed
+/// `{ "markdown": "..." }`; `out` gets the transformed markdown JSON
+/// `{ "markdown": "<uppercased>" }` (a trivial transform so the round-trip has a
+/// concrete assertion). The host reclaims `out` via our `plugin_free_string`.
+extern "C" fn on_markdown_transform(
+    input_json: StbStringRef,
+    out: *mut StbString,
+    _user_data: *mut c_void,
+) -> i32 {
+    MARKDOWN_TRANSFORM_HITS.fetch_add(1, Ordering::SeqCst);
+    // Parse the input (borrowed — must NOT free). lenient: missing `markdown` ⇒ "".
+    let input = unsafe { input_json.as_str() };
+    let parsed: serde_json::Value =
+        serde_json::from_str(input).unwrap_or(serde_json::Value::Null);
+    let md = parsed
+        .get("markdown")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_uppercase();
+    let json = format!(r#"{{"markdown":"{}"}}"#, escape_json_string(&md));
+    unsafe {
+        *out = StbString::from_string(json);
+    }
+    0
+}
+
+// ---------------------------------------------------------------------------
 // The register entrypoint
 // ---------------------------------------------------------------------------
 
@@ -315,6 +400,46 @@ pub extern "C" fn rpi_plugin_register(api: *const PluginApiVt, abi_version: u32)
             return 3;
         };
         let rc = register_resources_discover(on_resources_discover, plugin_free_string, std::ptr::null_mut());
+        if rc != 0 {
+            return rc;
+        }
+
+        // Register a custom provider (B5c). The host wraps `on_provider_request`
+        // in a `PluggableProvider` impl of `rpi_ai::Provider` and injects it into
+        // `AgentHarnessOptions.models`; a catalog model whose `provider` field is
+        // `"stub-provider"` routes to it. The host calls `request_fn` on
+        // `spawn_blocking` (it's sync), reclaims the plugin-owned `out` via our
+        // `plugin_free_string`, parses it as an assistant message, emits it as one
+        // terminal chunk.
+        let Some(register_provider) = api.register_provider else {
+            // Host without the provider path — degrade.
+            return 4;
+        };
+        let rc = register_provider(
+            StbStringRef::from_str("stub-provider"),
+            StbStringRef::from_str("https://stub.example"),
+            StbStringRef::from_str("faux"),
+            on_provider_request,
+            plugin_free_string,
+            std::ptr::null_mut(),
+        );
+        if rc != 0 {
+            return rc;
+        }
+
+        // Register a markdown transformer (B5c). The host records it now; TUI
+        // consumption is B5e (the render path calls `RenderFn` at display time).
+        // We register one to prove the registrar + registry storage + snapshot
+        // exposure round-trips.
+        let Some(register_markdown_transformer) = api.register_markdown_transformer else {
+            return 5;
+        };
+        let rc = register_markdown_transformer(
+            StbStringRef::from_str("stub-uppercase"),
+            on_markdown_transform,
+            plugin_free_string,
+            std::ptr::null_mut(),
+        );
         if rc != 0 {
             return rc;
         }

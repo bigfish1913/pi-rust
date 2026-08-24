@@ -765,17 +765,56 @@ pub struct PluginApiVt {
     /// Register a CLI flag. Nullable.
     pub register_flag: Option<extern "C" fn(name: StbStringRef, description: StbStringRef) -> i32>,
 
-    /// Register a custom provider. Nullable (B4/B5).
-    pub register_provider: Option<extern "C" fn(provider_id: StbStringRef, base_url: StbStringRef, api_style: StbStringRef, request_fn: ProviderRequestFn) -> i32>,
+    /// Register a custom provider. The host stores `provider_id`/`base_url`/
+    /// `api_style` + the plugin's `request_fn` + the plugin's own
+    /// `plugin_free_string` (the `out` [`StbString`] `request_fn` *produces* is
+    /// plugin-owned and the host must reclaim it — same ownership rule as
+    /// `register_resources_discover`) + the plugin's `user_data` (which
+    /// `request_fn` receives back unmodified on every call). Nullable (B5c).
+    pub register_provider: Option<
+        extern "C" fn(
+            provider_id: StbStringRef,
+            base_url: StbStringRef,
+            api_style: StbStringRef,
+            request_fn: ProviderRequestFn,
+            plugin_free_string: FreeStringFn,
+            user_data: *mut c_void,
+        ) -> i32,
+    >,
 
-    /// Register a message renderer. Nullable (B5 TUI).
-    pub register_message_renderer: Option<extern "C" fn(name: StbStringRef, render_fn: RenderFn) -> i32>,
+    /// Register a message renderer. `plugin_free_string` reclaims the `out`
+    /// [`StbString`] `render_fn` produces; `user_data` is passed back to it on
+    /// every render call. Nullable (B5c; TUI consumption deferred).
+    pub register_message_renderer: Option<
+        extern "C" fn(
+            name: StbStringRef,
+            render_fn: RenderFn,
+            plugin_free_string: FreeStringFn,
+            user_data: *mut c_void,
+        ) -> i32,
+    >,
 
-    /// Register a markdown transformer. Nullable (B5 TUI).
-    pub register_markdown_transformer: Option<extern "C" fn(name: StbStringRef, render_fn: RenderFn) -> i32>,
+    /// Register a markdown transformer. Same ownership shape as
+    /// `register_message_renderer`. Nullable (B5c; TUI wiring in B5e).
+    pub register_markdown_transformer: Option<
+        extern "C" fn(
+            name: StbStringRef,
+            render_fn: RenderFn,
+            plugin_free_string: FreeStringFn,
+            user_data: *mut c_void,
+        ) -> i32,
+    >,
 
-    /// Register an entry renderer. Nullable (B5 TUI).
-    pub register_entry_renderer: Option<extern "C" fn(name: StbStringRef, render_fn: RenderFn) -> i32>,
+    /// Register an entry renderer. Same ownership shape as
+    /// `register_message_renderer`. Nullable (B5c; TUI consumption deferred).
+    pub register_entry_renderer: Option<
+        extern "C" fn(
+            name: StbStringRef,
+            render_fn: RenderFn,
+            plugin_free_string: FreeStringFn,
+            user_data: *mut c_void,
+        ) -> i32,
+    >,
 
     // --- on() event handler registration (the 33-category subscription) ---
 
@@ -829,7 +868,11 @@ unsafe impl Sync for PluginApiVt {}
 /// declared `RPI_PLUGIN_ABI_VERSION` differs from its own (skip + diagnostic,
 /// never load — no half-compatible call surface). Bump only on a breaking ABI
 /// change (reorder/retype a vtable slot, change a crossing struct layout);
-/// adding a nullable vtable slot within a version is *not* a bump.
+/// adding a nullable vtable slot **or widening an existing nullable slot**'s
+/// parameter list within a version is *not* a bump — the plugin and host are
+/// both recompiled from this same SDK, and a nullable slot a plugin never calls
+/// is unaffected by a wider callee signature. (B5c widens the four
+/// renderer/provider registrar slots within ABI v1 on this basis.)
 pub const RPI_PLUGIN_ABI_VERSION: u32 = 1;
 
 /// The symbol the host looks up in each cdylib via `libloading::Library::get`.

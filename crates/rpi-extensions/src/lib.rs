@@ -61,9 +61,9 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
 use rpi_plugin_sdk::{
-    EventHandlerFn, EventTag, FreeStringFn, PluginApiVt, ResourcesDiscoverFn, RuntimeActionFn,
-    StbString, StbStringRef, StableToolSchema, StablePluginEvent, ToolCancelFn, ToolDestroyFn,
-    ToolExecuteFn, ToolPollFn,
+    EventHandlerFn, EventTag, FreeStringFn, PluginApiVt, ProviderRequestFn, RenderFn,
+    ResourcesDiscoverFn, RuntimeActionFn, StbString, StbStringRef, StableToolSchema,
+    StablePluginEvent, ToolCancelFn, ToolDestroyFn, ToolExecuteFn, ToolPollFn,
 };
 use thiserror::Error;
 
@@ -73,9 +73,11 @@ pub use loader::{
     load_session, merge_registries,
 };
 pub use provider_hooks::ExtensionProviderHooks;
+pub use provider::PluggableProvider;
 pub use registry::{
-    ExtensionRegistry, ExtensionTool, RegisteredHandler, RegistryEntry, RegistrySnapshot,
-    ResourcesDiscoverHandler, assert_active,
+    ExtensionRegistry, ExtensionTool, RegisteredHandler, RegisteredProvider, RegisteredRenderer,
+    RegisteredRendererKind, RegistryEntry, RegistrySnapshot, ResourcesDiscoverHandler,
+    assert_active,
 };
 pub use resources::{DiscoveredResources, emit_resources_discover};
 pub use tool::{PluginToolAdapter, PluginToolHandle};
@@ -83,6 +85,7 @@ pub use translate::{ExtensionEmitter, TeeEmitter};
 
 mod actions;
 mod loader;
+mod provider;
 mod provider_hooks;
 mod registry;
 mod resources;
@@ -249,10 +252,10 @@ impl HostApi {
             register_command: Some(trampoline_register_command),
             register_shortcut: Some(trampoline_register_shortcut),
             register_flag: Some(trampoline_register_flag),
-            register_provider: None, // B4
-            register_message_renderer: None, // B5 TUI
-            register_markdown_transformer: None, // B5 TUI
-            register_entry_renderer: None, // B5 TUI
+            register_provider: Some(trampoline_register_provider), // B5c
+            register_message_renderer: Some(trampoline_register_message_renderer), // B5c
+            register_markdown_transformer: Some(trampoline_register_markdown_transformer), // B5c
+            register_entry_renderer: Some(trampoline_register_entry_renderer), // B5c
             register_event_handler: Some(trampoline_register_event_handler),
             register_resources_discover: Some(trampoline_register_resources_discover),
             runtime_action: runtime_action_fn,
@@ -415,6 +418,122 @@ extern "C" fn trampoline_register_event_handler(
     } else {
         -1
     }
+}
+
+/// B5c: `register_provider` trampoline. Runs synchronously inside a plugin's
+/// `register` call (thread-local `CURRENT_HOST_API` is set). The plugin hands its
+/// `provider_id`/`base_url`/`api_style` (borrowed `StbStringRef`s), its
+/// `request_fn`, its own `plugin_free_string` (the `out` StbString `request_fn`
+/// later produces is plugin-owned — the host reclaims it via this fn), and its
+/// opaque `user_data`. We copy the id/base_url/api_style to owned `String`s
+/// (they're the provider's identity, read when building the
+/// [`PluggableProvider`](crate::PluggableProvider) — we can't keep the borrowed
+/// refs past register), then store the full record in the registry.
+extern "C" fn trampoline_register_provider(
+    provider_id: StbStringRef,
+    base_url: StbStringRef,
+    api_style: StbStringRef,
+    request_fn: ProviderRequestFn,
+    plugin_free_string: FreeStringFn,
+    user_data: *mut c_void,
+) -> i32 {
+    if !current_api_present() {
+        return -1;
+    }
+    // SAFETY: the plugin guarantees the refs are valid for this call.
+    let record = crate::registry::RegisteredProvider {
+        provider_id: unsafe { provider_id.as_str().to_string() },
+        base_url: unsafe { base_url.as_str().to_string() },
+        api_style: unsafe { api_style.as_str().to_string() },
+        request_fn,
+        plugin_free_string,
+        user_data,
+    };
+    let ok = with_current_api(|api| match api.with_registry(|reg| reg.register_provider(record)) {
+        Some(_) => true,
+        None => false,
+    });
+    if ok == Some(true) {
+        0
+    } else {
+        -1
+    }
+}
+
+/// B5c: the three renderer registrars share a single recording helper; each
+/// trampoline below fixes its [`RegisteredRendererKind`] and forwards here.
+fn register_renderer_common(
+    name: StbStringRef,
+    kind: crate::registry::RegisteredRendererKind,
+    render_fn: RenderFn,
+    plugin_free_string: FreeStringFn,
+    user_data: *mut c_void,
+) -> i32 {
+    if !current_api_present() {
+        return -1;
+    }
+    // SAFETY: the plugin guarantees the ref is valid for this call.
+    let record = crate::registry::RegisteredRenderer {
+        name: unsafe { name.as_str().to_string() },
+        kind,
+        render_fn,
+        plugin_free_string,
+        user_data,
+    };
+    let ok = with_current_api(|api| match api.with_registry(|reg| reg.register_renderer(record)) {
+        Some(_) => true,
+        None => false,
+    });
+    if ok == Some(true) {
+        0
+    } else {
+        -1
+    }
+}
+
+extern "C" fn trampoline_register_message_renderer(
+    name: StbStringRef,
+    render_fn: RenderFn,
+    plugin_free_string: FreeStringFn,
+    user_data: *mut c_void,
+) -> i32 {
+    register_renderer_common(
+        name,
+        crate::registry::RegisteredRendererKind::Message,
+        render_fn,
+        plugin_free_string,
+        user_data,
+    )
+}
+
+extern "C" fn trampoline_register_markdown_transformer(
+    name: StbStringRef,
+    render_fn: RenderFn,
+    plugin_free_string: FreeStringFn,
+    user_data: *mut c_void,
+) -> i32 {
+    register_renderer_common(
+        name,
+        crate::registry::RegisteredRendererKind::Markdown,
+        render_fn,
+        plugin_free_string,
+        user_data,
+    )
+}
+
+extern "C" fn trampoline_register_entry_renderer(
+    name: StbStringRef,
+    render_fn: RenderFn,
+    plugin_free_string: FreeStringFn,
+    user_data: *mut c_void,
+) -> i32 {
+    register_renderer_common(
+        name,
+        crate::registry::RegisteredRendererKind::Entry,
+        render_fn,
+        plugin_free_string,
+        user_data,
+    )
 }
 
 extern "C" fn trampoline_dispatch_event(_event: StablePluginEvent, _user_data: *mut c_void) -> i32 {

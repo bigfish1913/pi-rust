@@ -13,7 +13,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use rpi_agent::error::AgentError;
-use rpi_plugin_sdk::{EventTag, EventHandlerFn, FreeStringFn, ResourcesDiscoverFn, EVENT_TAG_COUNT};
+use rpi_plugin_sdk::{
+    EventTag, EventHandlerFn, FreeStringFn, ProviderRequestFn, RenderFn, ResourcesDiscoverFn,
+    EVENT_TAG_COUNT,
+};
 use rpi_ai::types::Tool;
 
 use crate::tool::PluginToolHandle;
@@ -93,6 +96,68 @@ pub struct ResourcesDiscoverHandler {
 unsafe impl Send for ResourcesDiscoverHandler {}
 unsafe impl Sync for ResourcesDiscoverHandler {}
 
+/// A registered custom provider (B5c). The host wraps `request_fn` in a
+/// [`PluggableProvider`](crate::PluggableProvider) impl of `rpi_ai::Provider`;
+/// its `stream_simple` drives `request_fn` on `spawn_blocking` (the sync fn
+/// can't own a chunked stream), reads the **plugin-owned** `out` JSON (a full
+/// assistant message), reclaims it via `plugin_free_string`, parses it to an
+/// [`AssistantMessage`](rpi_ai::types::AssistantMessage), and emits it as one
+/// terminal `Done` chunk (v1 one-shot, documented divergence from pi's async
+/// streaming). `provider_id`/`base_url`/`api_style` carry the provider's
+/// identity (copied from the borrowed `StbStringRef`s at registration); the fn
+/// pointers + `user_data` live as long as the plugin (keepalive-mapped).
+/// `user_data` is the plugin's opaque context, passed back on every
+/// `request_fn` call.
+///
+/// SAFETY: the plugin warrants `request_fn` is callable from any thread (the
+/// host calls it from a `spawn_blocking` pool thread) and `user_data` is valid
+/// for the plugin's lifetime; the host never frees `user_data`.
+#[derive(Clone)]
+pub struct RegisteredProvider {
+    pub provider_id: String,
+    pub base_url: String,
+    pub api_style: String,
+    pub request_fn: ProviderRequestFn,
+    pub plugin_free_string: FreeStringFn,
+    pub user_data: *mut std::ffi::c_void,
+}
+// SAFETY: fn pointers + owned `String`s + an opaque plugin pointer the plugin
+// warrants is thread-safe; the host never frees `user_data`.
+unsafe impl Send for RegisteredProvider {}
+unsafe impl Sync for RegisteredProvider {}
+
+/// A registered message/markdown/entry renderer (B5c). The host records the
+/// metadata now; TUI consumption lands in B5e (`register_markdown_transformer`
+/// wires into the render path first; message/entry renderers are recorded +
+/// exposed but deferred with a diagnostic). `render_fn` produces a
+/// **plugin-owned** `out` [`StbString`] the host reclaims via
+/// `plugin_free_string`; `user_data` is passed back on every render call. `name`
+/// is copied from the borrowed `StbStringRef` at registration.
+///
+/// SAFETY: same as [`RegisteredProvider`].
+#[derive(Clone)]
+pub struct RegisteredRenderer {
+    pub name: String,
+    pub kind: RegisteredRendererKind,
+    pub render_fn: RenderFn,
+    pub plugin_free_string: FreeStringFn,
+    pub user_data: *mut std::ffi::c_void,
+}
+
+/// Which render path this renderer targets — mirrors the three distinct
+/// `register_*` slots (`register_message_renderer` /
+/// `register_markdown_transformer` / `register_entry_renderer`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RegisteredRendererKind {
+    Message,
+    Markdown,
+    Entry,
+}
+// SAFETY: same as [`RegisteredProvider`] — fn pointers + owned `String` + an
+// opaque plugin pointer the plugin warrants is thread-safe.
+unsafe impl Send for RegisteredRenderer {}
+unsafe impl Sync for RegisteredRenderer {}
+
 /// One flat registration record, for iteration/diagnostics. Built on demand
 /// from the typed vecs in [`RegistrySnapshot`].
 #[derive(Clone)]
@@ -122,6 +187,13 @@ pub struct ExtensionRegistry {
     /// are a single flat list — `resources_discover` has its own out-param
     /// signature and is never dispatched through the fire-and-forget event path.
     resources_discover: Vec<ResourcesDiscoverHandler>,
+    /// Registered custom providers (B5c). The host wraps each in a
+    /// [`PluggableProvider`](crate::PluggableProvider). First-registration-wins on
+    /// `provider_id`.
+    providers: Vec<RegisteredProvider>,
+    /// Registered renderers (B5c), split by kind at registration. First-wins on
+    /// `(kind, name)`. The host records these now; TUI consumption is B5e.
+    renderers: Vec<RegisteredRenderer>,
     /// Shared staleness flag. `true` while the session owning this registry is
     /// active; set `false` on swap/`/reload`. Tool/event dispatch checks it.
     active: Arc<AtomicBool>,
@@ -145,6 +217,8 @@ impl ExtensionRegistry {
             commands: Vec::new(),
             handlers,
             resources_discover: Vec::new(),
+            providers: Vec::new(),
+            renderers: Vec::new(),
             active: Arc::new(AtomicBool::new(true)),
         }
     }
@@ -205,6 +279,34 @@ impl ExtensionRegistry {
         false
     }
 
+    /// Register a custom provider (B5c). First-registration-wins on `provider_id`
+    /// (a later registration for an existing id is dropped, mirroring tool/command
+    /// first-wins). Returns `true` if a prior provider of the same id was kept.
+    pub fn register_provider(&mut self, provider: RegisteredProvider) -> bool {
+        if self
+            .providers
+            .iter()
+            .any(|p| p.provider_id == provider.provider_id)
+        {
+            return true;
+        }
+        self.providers.push(provider);
+        false
+    }
+
+    /// Register a renderer (B5c — message/markdown/entry). First-wins on
+    /// `(kind, name)`. Returns `true` if a prior renderer of the same kind+name
+    /// was kept.
+    pub fn register_renderer(&mut self, renderer: RegisteredRenderer) -> bool {
+        if self.renderers.iter().any(|r| {
+            r.kind == renderer.kind && r.name == renderer.name
+        }) {
+            return true;
+        }
+        self.renderers.push(renderer);
+        false
+    }
+
     /// Build a snapshot the host session keeps. The registry's `active` flag is
     /// shared (Arc) so a later `invalidate` on the registry also invalidates the
     /// snapshot — important for cross-session staleness.
@@ -217,6 +319,8 @@ impl ExtensionRegistry {
             commands: self.commands.clone(),
             handlers: self.handlers.clone(),
             resources_discover: self.resources_discover.clone(),
+            providers: self.providers.clone(),
+            renderers: self.renderers.clone(),
             active: Arc::clone(&self.active),
         }
     }
@@ -257,6 +361,18 @@ impl ExtensionRegistry {
             self.handlers[tag_idx].append(handlers);
         }
         self.resources_discover.append(&mut other.resources_discover);
+        for p in other.providers.drain(..) {
+            if self.providers.iter().any(|x| x.provider_id == p.provider_id) {
+                continue;
+            }
+            self.providers.push(p);
+        }
+        for r in other.renderers.drain(..) {
+            if self.renderers.iter().any(|x| x.kind == r.kind && x.name == r.name) {
+                continue;
+            }
+            self.renderers.push(r);
+        }
     }
 }
 
@@ -276,6 +392,8 @@ pub struct RegistrySnapshot {
     commands: Vec<RegisteredCommand>,
     handlers: [Vec<RegisteredHandler>; EVENT_TAG_COUNT],
     resources_discover: Vec<ResourcesDiscoverHandler>,
+    providers: Vec<RegisteredProvider>,
+    renderers: Vec<RegisteredRenderer>,
     active: Arc<AtomicBool>,
 }
 
@@ -309,6 +427,30 @@ impl RegistrySnapshot {
     /// no plugin registered a discovery handler.
     pub fn resources_discover(&self) -> &[ResourcesDiscoverHandler] {
         &self.resources_discover
+    }
+
+    /// The registered custom providers (B5c), registration order. The host wraps
+    /// each in a [`PluggableProvider`](crate::PluggableProvider). Empty when no
+    /// plugin registered a provider.
+    pub fn providers(&self) -> &[RegisteredProvider] {
+        &self.providers
+    }
+
+    /// All registered renderers (B5c), registration order, across all three
+    /// kinds.
+    pub fn renderers(&self) -> &[RegisteredRenderer] {
+        &self.renderers
+    }
+
+    /// The registered renderers of a specific kind (B5c). The TUI render path
+    /// (B5e) reads the `Markdown` subset to transform assistant markdown before
+    /// display; `Message`/`Entry` are recorded + exposed but deferred.
+    pub fn renderers_of(&self, kind: RegisteredRendererKind) -> Vec<RegisteredRenderer> {
+        self.renderers
+            .iter()
+            .filter(|r| r.kind == kind)
+            .cloned()
+            .collect()
     }
 
     /// A flat iterator of all registrations (tools + commands), for diagnostics.

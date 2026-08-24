@@ -34,6 +34,12 @@
 //!    appears in the merged result, and the handler's process-global hit counter
 //!    bumped. This is the plan's verification §3 B5 smoke: "plugin-stub
 //!    registers a `resources_discover` handler → its skill path appears …".
+//! 5. (B5c) A custom provider is registered (`stub-provider`), and the stub's
+//!    sync `ProviderRequestFn` — wrapped by `PluggableProvider` — drives and
+//!    returns a full assistant-message payload through the event stream, with
+//!    the `out` StbString reclaimed via the plugin's `free_string`. A markdown
+//!    transformer is also registered (the registrar round-trips; calling it is a
+//!    TUI concern, B5e).
 //!
 //! Run it after building the stub:
 //! ```sh
@@ -260,6 +266,101 @@ async fn loads_real_cdylib_and_drives_echo_tool() {
         discovered.theme_paths.is_empty(),
         "stub returns no themePaths"
     );
+
+    // ---- B5c: custom provider + markdown-transformer round-trip -------------
+    // (a) The stub registered one custom provider (`stub-provider`) + one
+    //     markdown transformer (`stub-uppercase`). Both must land in the
+    //     registry snapshot — proving the widened vtable slots' trampolines
+    //     recorded the registrations (plugin_free_string + user_data carried).
+    // (b) Build `PluggableProvider`s from the session (one per registered
+    //     provider) and drive `stream_simple` against a model whose `provider`
+    //     matches the stub's id: the stub's sync `ProviderRequestFn` runs on
+    //     `spawn_blocking`, the plugin-owned `out` is reclaimed, the response
+    //     JSON parses to an AssistantMessage, and it surfaces as one terminal
+    //     `Done` chunk on the event stream — with the stub's hit counter bumped.
+    // (c) Drive the markdown transformer's `RenderFn` directly through the
+    //     snapshot record (B5e wires the TUI render path; this proves the fn
+    //     pointer + free_string round-trip now).
+    use rpi_ai::{Api, Model, Provider, SimpleStreamOptions};
+    use rpi_plugin_sdk::StbStringRef;
+    let snap = session.snapshot_arc().expect("snapshot present");
+
+    // (a) registration landed.
+    let providers = snap.providers();
+    assert_eq!(providers.len(), 1, "expected one stub provider registered");
+    assert_eq!(providers[0].provider_id, "stub-provider");
+    let markdown_renderers = snap.renderers_of(rpi_extensions::RegisteredRendererKind::Markdown);
+    assert_eq!(
+        markdown_renderers.len(),
+        1,
+        "expected one markdown transformer registered"
+    );
+    assert_eq!(markdown_renderers[0].name, "stub-uppercase");
+
+    // (b) PluggableProvider drives the stub's request_fn on a runtime. The test
+    //     is `#[tokio::test]`, so the ambient runtime handle is available and
+    //     `stream_simple` (which spawns its producer task on the captured
+    //     handle) cooperates directly — no second runtime / `block_on`.
+    let ambient = tokio::runtime::Handle::current();
+    let pluggable = rpi_extensions::PluggableProvider::from_session(
+        &session,
+        ambient.clone(),
+    );
+    assert_eq!(pluggable.len(), 1, "one PluggableProvider per registered provider");
+    let provider: Arc<dyn Provider> = pluggable.into_iter().next().unwrap();
+    assert_eq!(provider.id(), "stub-provider");
+
+    let model = Model::new("stub-model", "Stub", Api::Faux, "stub-provider", "https://stub.example");
+    let ctx = rpi_ai::Context::new(Vec::new());
+    let opts = SimpleStreamOptions::default();
+
+    let before = stub_provider_request_hits(&stub_path);
+    // `stream_simple` is async — the producer task spawns on `ambient`. Await
+    // the stream + drain the single terminal chunk (v1 one-shot).
+    let mut ev_stream = provider.stream_simple(&model, &ctx, &opts).await;
+    let mut terminal: Option<rpi_ai::AssistantMessageEvent> = None;
+    while let Some(ev) = ev_stream.next().await {
+        terminal = Some(ev);
+    }
+    let (reason, text, message_provider) = match terminal.expect("a terminal event") {
+        rpi_ai::AssistantMessageEvent::Done { reason, message } => {
+            let text = match &message.content[0] {
+                rpi_ai::types::Content::Text(t) => t.text.clone(),
+                other => panic!("expected text content, got {other:?}"),
+            };
+            (reason, text, message.provider)
+        }
+        other => panic!("expected Done terminal, got {other:?}"),
+    };
+    let after = stub_provider_request_hits(&stub_path);
+    assert_eq!(
+        after,
+        before + 1,
+        "the stub's ProviderRequestFn should have run once via spawn_blocking"
+    );
+    assert_eq!(reason, rpi_ai::types::DoneReason::Stop);
+    assert_eq!(text, "from-stub-provider");
+    assert_eq!(message_provider, "stub-provider");
+
+    // (c) markdown transformer round-trip (call the RenderFn directly via the
+    // recorded fn pointer + reclaim the out via the plugin's free_string).
+    let renderer = &markdown_renderers[0];
+    let input = r#"{"markdown":"hello world"}"#;
+    let mut out = rpi_plugin_sdk::StbString::empty();
+    let rc = (renderer.render_fn)(
+        StbStringRef::from_str(input),
+        &mut out as *mut rpi_plugin_sdk::StbString,
+        renderer.user_data,
+    );
+    assert_eq!(rc, 0, "render_fn should succeed");
+    let transformed = out.to_string_lossy();
+    out.free_with(Some(renderer.plugin_free_string));
+    assert!(
+        transformed.contains(r#""markdown":"HELLO WORLD""#),
+        "stub uppercases markdown: got {transformed}"
+    );
+    let md_hits = stub_markdown_transform_hits(&stub_path);
+    assert!(md_hits >= 1, "markdown transform fn should have fired");
 }
 
 /// Read the stub's `plugin_stub_discover_hits` counter through the cdylib
@@ -282,14 +383,54 @@ fn stub_discover_hits(stub_path: &std::path::Path) -> usize {
     hits
 }
 
+/// Read the stub's `plugin_stub_provider_request_hits` counter through the
+/// cdylib (second mapping — same refcounted pattern as the other helpers).
+/// Returns 0 if the symbol isn't found (defensive against a stale build).
+fn stub_provider_request_hits(stub_path: &std::path::Path) -> usize {
+    let lib = match unsafe { libloading::Library::new(stub_path) } {
+        Ok(l) => l,
+        Err(_) => return 0,
+    };
+    type HitFn = extern "C" fn() -> usize;
+    let sym: libloading::Symbol<HitFn> = match unsafe {
+        lib.get(b"plugin_stub_provider_request_hits\0")
+    } {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let hits = sym();
+    drop(sym);
+    drop(lib);
+    hits
+}
+
+/// Read the stub's `plugin_stub_markdown_transform_hits` counter through the
+/// cdylib (second mapping — same refcounted pattern as the other helpers).
+/// Returns 0 if the symbol isn't found (defensive against a stale build).
+fn stub_markdown_transform_hits(stub_path: &std::path::Path) -> usize {
+    let lib = match unsafe { libloading::Library::new(stub_path) } {
+        Ok(l) => l,
+        Err(_) => return 0,
+    };
+    type HitFn = extern "C" fn() -> usize;
+    let sym: libloading::Symbol<HitFn> = match unsafe {
+        lib.get(b"plugin_stub_markdown_transform_hits\0")
+    } {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let hits = sym();
+    drop(sym);
+    drop(lib);
+    hits
+}
+
 /// Read the stub's `plugin_stub_message_end_hits` counter through the cdylib.
 /// Loads the library fresh (a second mapping — cdylibs are refcounted on Windows
 /// / dlopen-refcounted on Unix, so a second open is fine and the first open in
 /// the session's keepalive stays alive). Returns 0 if the symbol isn't found
 /// (defensive; the stub exports it, but a stale build might not).
 fn stub_message_end_hits(stub_path: &std::path::Path) -> usize {
-    // Hold the second mapping alive across the symbol call by keeping `lib`
-    // in scope until after `sym()` returns (the Symbol borrows lib).
     let lib = match unsafe { libloading::Library::new(stub_path) } {
         Ok(l) => l,
         Err(_) => return 0,
