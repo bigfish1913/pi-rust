@@ -21,7 +21,9 @@ use thiserror::Error;
 use rpi_plugin_sdk::{PluginApiVt, RPI_PLUGIN_ABI_VERSION, RpiPluginRegister};
 
 use crate::registry::{ExtensionRegistry, RegistrySnapshot};
-use crate::{HostApi, NullDiagnostics, PluginDiagnostics, set_current_api, clear_current_api};
+use crate::{
+    ActionBridge, HostApi, NullDiagnostics, PluginDiagnostics, clear_current_api, set_current_api,
+};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -75,9 +77,18 @@ pub struct LoadedPlugin {
 /// loader creates a fresh `ExtensionRegistry` for THIS plugin (so a plugin that
 /// fails partway can't pollute others), and the caller merges per-plugin
 /// registries into the session registry in load-order (first-wins on name).
+///
+/// `action_bridge` (B5a): when `Some`, the plugin's vtable wires the real
+/// [`trampoline_runtime_action`] and carries the bridge in `user_data`, so the
+/// plugin can invoke host runtime actions post-register from any thread. `None`
+/// keeps the v1 stub (actions return `-1`). `rpi-cli` builds ONE master
+/// `Arc<ActionBridge>` per session and clones it into every `load_one` — every
+/// plugin's `user_data` points at the same bridge (Arc-ptr-stable, kept alive
+/// by `rpi-cli` for the harness lifetime).
 pub fn load_one(
     path: impl AsRef<Path>,
     diagnostics: Arc<dyn PluginDiagnostics>,
+    action_bridge: Option<Arc<ActionBridge>>,
 ) -> Result<LoadedPlugin, PluginLoadError> {
     let path = path.as_ref().to_path_buf();
     // 1. Open the cdylib.
@@ -97,7 +108,10 @@ pub fn load_one(
 
     // 3. Build a fresh registry + HostApi + vtable for this plugin.
     let registry = ExtensionRegistry::new();
-    let host_api = HostApi::new(registry, Arc::clone(&diagnostics));
+    let host_api = match action_bridge {
+        Some(bridge) => HostApi::with_action_bridge(registry, Arc::clone(&diagnostics), bridge),
+        None => HostApi::new(registry, Arc::clone(&diagnostics)),
+    };
     let vtable = host_api.build_vtable();
 
     // 4. Set the thread-local current api so the register trampolines can reach
@@ -164,9 +178,13 @@ const CDYLIB_EXTS: &[&str] = &["dll", "so", "dylib", "pyd"];
 /// Load every cdylib in `dir` (non-recursive). Each load failure is logged via
 /// `diagnostics` and skipped (one bad plugin doesn't abort the rest). Returns
 /// the successfully loaded plugins in directory order.
+///
+/// `action_bridge` (B5a) is cloned into each loaded plugin's vtable `user_data`
+/// so post-register `runtime_action` calls recover the bridge on any thread.
 pub fn load_dir(
     dir: impl AsRef<Path>,
     diagnostics: Arc<dyn PluginDiagnostics>,
+    action_bridge: Option<Arc<ActionBridge>>,
 ) -> Vec<LoadedPlugin> {
     let dir = dir.as_ref();
     let mut out = Vec::new();
@@ -186,7 +204,7 @@ pub fn load_dir(
         if !is_cdylib(&path) {
             continue;
         }
-        match load_one(&path, Arc::clone(&diagnostics)) {
+        match load_one(&path, Arc::clone(&diagnostics), action_bridge.clone()) {
             Ok(p) => out.push(p),
             Err(e) => diagnostics.warn(&format!("skipped plugin {}: {e}", path.display())),
         }
@@ -239,18 +257,32 @@ pub fn merge_registries(plugins: &mut [LoadedPlugin]) -> ExtensionRegistry {
 pub struct PluginKeepalive {
     #[allow(dead_code)]
     libraries: Vec<Library>,
+    /// B5a: the session's action bridge. Retained here so the raw pointer a
+    /// plugin stored in its vtable `user_data` (`Arc::as_ptr`) stays valid for
+    /// the harness lifetime — every `PluginToolAdapter` + the `ExtensionEmitter`
+    /// clone the keepalive, so the bridge outlives any plugin→host
+    /// `runtime_action` call. `None` under `--no-extensions`, when zero plugins
+    /// loaded, or in tests.
+    #[allow(dead_code)]
+    action_bridge: Option<Arc<ActionBridge>>,
 }
 
 impl PluginKeepalive {
-    fn new(libraries: Vec<Library>) -> Self {
-        Self { libraries }
+    /// Build a keepalive. `pub` so tests + host code can construct an empty
+    /// one (no loaded cdylibs) where the plugin lifecycle is exercised without
+    /// real plugins.
+    pub fn new(libraries: Vec<Library>, action_bridge: Option<Arc<ActionBridge>>) -> Self {
+        Self {
+            libraries,
+            action_bridge,
+        }
     }
 
     /// An empty keepalive owning no libraries — for host code that builds an
     /// adapter outside a real load session (notably in-process tests of the
     /// adapter against stub fns that live in the test binary, not a cdylib).
     pub fn empty() -> Arc<Self> {
-        Arc::new(Self::new(Vec::new()))
+        Arc::new(Self::new(Vec::new(), None))
     }
 }
 
@@ -267,15 +299,23 @@ pub struct ExtensionSession {
     keepalive: Arc<PluginKeepalive>,
     snapshot: Option<Arc<RegistrySnapshot>>,
     loaded_paths: Vec<PathBuf>,
+    /// B5a: the session's action bridge (`None` when no plugins / tests / the
+    /// `--no-extensions` path). Kept here so `rpi-cli` can recover it after
+    /// `AgentHarness::create` to call `set_harness` — the bridge's `user_data`
+    /// pointer was already handed out during `register`, so pi-cli must fill the
+    /// host's harness cell immediately after create. Cloning is cheap (an `Arc`
+    /// clone); the keepalive also holds a clone for the lifetime guarantee.
+    action_bridge: Option<Arc<ActionBridge>>,
 }
 
 impl ExtensionSession {
     /// An empty session (no plugins loaded — `--no-extensions` or no dirs found).
     pub fn none() -> Self {
         Self {
-            keepalive: Arc::new(PluginKeepalive::new(Vec::new())),
+            keepalive: Arc::new(PluginKeepalive::new(Vec::new(), None)),
             snapshot: None,
             loaded_paths: Vec::new(),
+            action_bridge: None,
         }
     }
 
@@ -324,6 +364,17 @@ impl ExtensionSession {
             tools
         ))
     }
+
+    /// B5a: the session's action bridge, if one was threaded into `load_*`.
+    /// `rpi-cli` recovers this after `AgentHarness::create` succeeds to call
+    /// `HarnessActionHost::set_harness` (filling the host cell the bridge's
+    /// `user_data`-recovered host reads on the first plugin→host action). The
+    /// bridge pointer was already handed to plugins during `register`, so this
+    /// must happen before any run. `None` when no plugins loaded / tests /
+    /// `--no-extensions`.
+    pub fn action_bridge(&self) -> Option<Arc<ActionBridge>> {
+        self.action_bridge.clone()
+    }
 }
 
 /// Load + register every cdylib in the given dirs (in order, non-recursive),
@@ -335,10 +386,19 @@ impl ExtensionSession {
 /// The order of `dirs` matters: earlier dirs win on tool/command name collision
 /// (pi registration order). Callers pass default dirs first, then `--extensions-dir`
 /// extras, so a same-named tool in a default-dir plugin wins over an extra-dir one.
-pub fn load_session(dirs: &[PathBuf], diagnostics: Arc<dyn PluginDiagnostics>) -> ExtensionSession {
+///
+/// `action_bridge` (B5a) is cloned into every loaded plugin's vtable so
+/// post-register `runtime_action` calls recover the bridge on any thread.
+/// `rpi-cli` builds one master `Arc<ActionBridge>` per session and passes it
+/// here; `None` keeps the v1 stub (used by tests / `--no-extensions` no-ops).
+pub fn load_session(
+    dirs: &[PathBuf],
+    diagnostics: Arc<dyn PluginDiagnostics>,
+    action_bridge: Option<Arc<ActionBridge>>,
+) -> ExtensionSession {
     let mut loaded: Vec<LoadedPlugin> = Vec::new();
     for dir in dirs {
-        loaded.extend(load_dir(dir, Arc::clone(&diagnostics)));
+        loaded.extend(load_dir(dir, Arc::clone(&diagnostics), action_bridge.clone()));
     }
     if loaded.is_empty() {
         return ExtensionSession::none();
@@ -358,9 +418,10 @@ pub fn load_session(dirs: &[PathBuf], diagnostics: Arc<dyn PluginDiagnostics>) -
     }
     let snapshot = Arc::new(session_registry.snapshot());
     ExtensionSession {
-        keepalive: Arc::new(PluginKeepalive::new(libs)),
+        keepalive: Arc::new(PluginKeepalive::new(libs, action_bridge.clone())),
         snapshot: Some(snapshot),
         loaded_paths,
+        action_bridge,
     }
 }
 
@@ -389,7 +450,7 @@ mod tests {
     #[test]
     fn load_one_missing_file_reports_open_error() {
         let diag: Arc<dyn PluginDiagnostics> = Arc::new(CapturingDiag::default());
-        let res = load_one("definitely_not_a_plugin.dll", diag);
+        let res = load_one("definitely_not_a_plugin.dll", diag, None);
         assert!(matches!(res, Err(PluginLoadError::Open { .. })));
     }
 
@@ -398,6 +459,7 @@ mod tests {
         let empty = load_dir(
             "no_such_dir_xyz",
             Arc::new(CapturingDiag::default()) as Arc<dyn PluginDiagnostics>,
+            None,
         );
         assert!(empty.is_empty());
     }

@@ -199,47 +199,62 @@ impl ExtensionEmitter {
     /// abort the fan-out (one handler's failure doesn't block the others — mir-
     /// rors pi's per-handler try/catch).
     fn dispatch(&self, event: &StablePluginEvent) {
-        // Staleness guard: a stale registry (swapped-out session) does nothing.
-        if !crate::registry::assert_active(self.snapshot.active_flag()) {
-            return;
-        }
-        let handlers = self.snapshot.handlers_for(event.tag);
-        if handlers.is_empty() {
-            // No subscribers — and critically, the event's StbStrings are owned
-            // by the host and must still be freed (no handler ran to free them).
-            free_dispatched_event(event);
-            return;
-        }
-        for h in handlers {
-            // SAFETY: the plugin warrants `handler` + `user_data` are safe to
-            // call from this thread. catch_unwind so a panic cannot cross FFI.
-            let outcome = catch_unwind(AssertUnwindSafe(|| {
-                // The event is Copy (StbString ptr+len); the handler receives a
-                // copy and owns freeing its strings. We pass the same `event`
-                // copy to each handler — but each handler is contractually
-                // responsible for freeing, so only ONE handler may free. v1
-                // contract: the LAST handler frees (or, more simply, the host
-                // frees after the fan-out and handlers MUST NOT free — see the
-                // free_dispatched_event path below). To avoid ambiguity we
-                // adopt: **handlers MUST NOT free event strings; the host frees
-                // exactly once after dispatch**. This is the safer default and
-                // matches "host is producer, host owns cleanup when the plugin
-                // doesn't". Documented in the SDK event-handler contract.
-                (h.handler)(*event, h.user_data)
-            }));
-            match outcome {
-                Ok(rc) if rc != 0 => {
-                    tracing::warn!(tag = ?event.tag, rc, "extension event handler returned nonzero");
-                }
-                Ok(_) => {}
-                Err(_) => {
-                    tracing::error!(tag = ?event.tag, "extension event handler panicked — skipped");
-                }
+        dispatch_to_handlers(&self.snapshot, event);
+    }
+}
+
+/// Fan an already-built event out to the tag's handlers (or free it when no
+/// handler subscribes). Shared by [`ExtensionEmitter`] and the provider-hook
+/// dispatcher ([`crate::provider_hooks`]). Handlers MUST NOT free the event
+/// strings; the host frees exactly once after the fan-out.
+pub fn dispatch_to_handlers(snapshot: &RegistrySnapshot, event: &StablePluginEvent) {
+    // Staleness guard: a stale registry (swapped-out session) does nothing.
+    if !crate::registry::assert_active(snapshot.active_flag()) {
+        return;
+    }
+    let handlers = snapshot.handlers_for(event.tag);
+    if handlers.is_empty() {
+        // No subscribers — and critically, the event's StbStrings are owned
+        // by the host and must still be freed (no handler ran to free them).
+        free_dispatched_event(event);
+        return;
+    }
+    for h in handlers {
+        // SAFETY: the plugin warrants `handler` + `user_data` are safe to
+        // call from this thread. catch_unwind so a panic cannot cross FFI.
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            (h.handler)(*event, h.user_data)
+        }));
+        match outcome {
+            Ok(rc) if rc != 0 => {
+                tracing::warn!(tag = ?event.tag, rc, "extension event handler returned nonzero");
+            }
+            Ok(_) => {}
+            Err(_) => {
+                tracing::error!(tag = ?event.tag, "extension event handler panicked — skipped");
             }
         }
-        // Host frees the event's strings exactly once after the fan-out.
-        free_dispatched_event(event);
     }
+    // Host frees the event's strings exactly once after the fan-out.
+    free_dispatched_event(event);
+}
+
+/// Build + dispatch a generic `data` event (JSON payload) to the tag's
+/// handlers. Returns whether any handler was invoked. Used by the B4
+/// provider-hook observer path ([`crate::provider_hooks`]) which has no
+/// matching `AgentEvent` to translate.
+pub fn dispatch_data_event(
+    snapshot: &RegistrySnapshot,
+    tag: EventTag,
+    data: &str,
+) -> bool {
+    let handlers = snapshot.handlers_for(tag);
+    if handlers.is_empty() {
+        return false;
+    }
+    let event = StablePluginEvent::data(tag, StbString::from_string(data.to_string()));
+    dispatch_to_handlers(snapshot, &event);
+    true
 }
 
 impl AgentEmitter for ExtensionEmitter {
@@ -354,9 +369,6 @@ fn free_dispatched_event(event: &StablePluginEvent) {
         | T::SessionBeforeTree
         | T::SessionTree
         | T::Context
-        | T::BeforeProviderRequest
-        | T::BeforeProviderHeaders
-        | T::AfterProviderResponse
         | T::BeforeAgentStart
         | T::AgentStart
         | T::AgentEnd
@@ -367,9 +379,13 @@ fn free_dispatched_event(event: &StablePluginEvent) {
         | T::ThinkingLevelSelect
         | T::UserBash
         | T::Input => {
-            // no payload or data payload (we never construct data payloads from
-            // AgentEvent today). If a future emitter builds a data payload, add
-            // a free here.
+            // no payload today.
+        }
+        // The B4 provider-hook observer events carry a generic data payload
+        // (built by `dispatch_data_event`); free the single StbString.
+        T::BeforeProviderRequest | T::BeforeProviderHeaders | T::AfterProviderResponse => {
+            // SAFETY: these tags are only ever constructed as data payloads.
+            unsafe { host_free_string(event.payload.data.data) };
         }
     }
 }

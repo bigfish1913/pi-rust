@@ -164,6 +164,31 @@ pub async fn build(
 > {
     let cwd_str = cwd.to_string_lossy().to_string();
 
+    // ---- B5a: build the action bridge BEFORE extension load ----
+    // Extensions load before `AgentHarness::create` (extensions provide tools the
+    // harness is built with), but a plugin stores the `ActionBridge`'s raw
+    // `user_data` pointer during `register` and it must remain valid + the host
+    // must be ready for the whole session. So:
+    //  1. Capture the current tokio `Handle` (the async main-thread runtime) —
+    //     the bridge spawns dispatch from any thread via `Handle::spawn`.
+    //  2. Build an *empty* `HarnessActionHost` (its harness cell is unset; no
+    //     plugin can call a runtime action before the harness runs).
+    //  3. Wrap it as `Arc<dyn RuntimeActionHost>` + `ActionBridge`, thread
+    //     `Some(bridge)` into `load_extensions` so every plugin's `user_data`
+    //     points at this bridge.
+    //  4. After `AgentHarness::create` succeeds, call `set_harness(&cell, …)` to
+    //     fill the host cell the bridge recovers on the first action call.
+    let runtime = tokio::runtime::Handle::try_current()
+        .map_err(|e| BuildError::HarnessCreate(format!("no tokio runtime for action bridge: {e}")))?;
+    let catalog = crate::provider::available_catalog(resolved);
+    let (action_host, harness_cell) = crate::extensions_actions::HarnessActionHost::new_empty(
+        catalog,
+        cwd.to_path_buf(),
+        runtime.clone(),
+    );
+    let host_arc: Arc<dyn rpi_extensions::RuntimeActionHost> = Arc::new(action_host);
+    let action_bridge = rpi_extensions::ActionBridge::new(runtime, host_arc);
+
     // ---- Execution env + tools ----
     let env = Arc::new(OsExecutionEnv::with_cwd(cwd.to_path_buf()));
     let env_dyn: Arc<dyn rpi_tools::ExecutionEnv> = env.clone();
@@ -176,22 +201,6 @@ pub async fn build(
     let tools = build_tools(&ctx, args);
     let mut tools = tools;
 
-    // ---- Extension action bridge (B-series) ----
-    // Plugins' `runtime_action` trampolines dispatch through this bridge into
-    // the harness host (send_message / set_model / switch_session / fork / …).
-    // The host is built empty and filled with the harness right after
-    // `AgentHarness::create` succeeds (plugins may only act once the session
-    // exists).
-    let (action_host, harness_cell) = crate::extensions_actions::HarnessActionHost::new_empty(
-        crate::provider::available_catalog(resolved),
-        cwd.to_path_buf(),
-        tokio::runtime::Handle::current(),
-    );
-    let action_bridge = rpi_extensions::ActionBridge::new(
-        tokio::runtime::Handle::current(),
-        Arc::new(action_host),
-    );
-
     // ---- Extensions (Part B2) ----
     // Load cdylib plugins from the resolved extension dirs, merge their tools
     // into the built-in set (extension overrides same-named built-in; first-
@@ -202,7 +211,7 @@ pub async fn build(
     let extension_session = if args.no_extensions {
         ExtensionSession::none()
     } else {
-        load_extensions(args, cwd, Some(action_bridge))
+        load_extensions(args, cwd, Some(Arc::clone(&action_bridge)))
     };
     if args.verbose {
         if let Some(s) = extension_session.summary() {
@@ -449,9 +458,15 @@ pub async fn build(
         after_tool_call: None,
         transform_context: None,
         entry_transforms: Vec::new(),
-        // Extension provider hooks (B4) land here once the adapter wires them;
-        // a plain session runs hook-free.
-        provider_hooks: None,
+        // Extension provider hooks (B4): plugins subscribing to the
+        // BeforeProviderRequest / BeforeProviderHeaders / AfterProviderResponse
+        // events observe every provider call (observer semantics — the handler
+        // ABI has no patch channel in v1). A session without provider-hook
+        // subscribers runs hook-free.
+        provider_hooks: rpi_extensions::ExtensionProviderHooks::from_session(
+            &extension_session,
+        )
+        .map(|h| Arc::new(h) as Arc<dyn rpi_ai::ProviderHooks>),
     };
 
     AgentHarness::create(options)
@@ -496,15 +511,13 @@ fn load_extensions(
     }
     dirs.extend(args.extensions_dir.iter().cloned());
     let diagnostics: Arc<dyn PluginDiagnostics> = Arc::new(NullDiagnostics);
-    // Action bridge (B-series): plugins' `runtime_action` calls trampoline
-    // through the bridge into the harness host (send_message / set_model /
-    // switch_session / fork / …). `None` when `--no-extensions` (no plugins
-    // to serve).
-    let bridge = args
-        .no_extensions
-        .then(|| action_bridge.clone())
-        .flatten();
-    load_session(&dirs, diagnostics, bridge)
+    // B5a: the action bridge is cloned into every loaded plugin's vtable
+    // `user_data` so post-register `runtime_action` calls recover the harness
+    // host from any thread. The call site already gates `load_extensions` behind
+    // `!no_extensions` and threads `Some(bridge)`; `None` is only passed by the
+    // `--no-extensions` branch (which calls `ExtensionSession::none()` directly)
+    // and tests.
+    load_session(&dirs, diagnostics, action_bridge)
 }
 
 /// Merge the loaded extension tools into the built-in set. An extension tool

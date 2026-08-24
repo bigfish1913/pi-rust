@@ -102,7 +102,11 @@ async fn loads_real_cdylib_and_drives_echo_tool() {
 
     let diag = Arc::new(RecordingDiag::default());
     let warnings = Arc::clone(&diag);
-    let session = load_session(&[dir], Arc::clone(&diag) as Arc<dyn PluginDiagnostics>);
+    let session = load_session(
+        &[dir],
+        Arc::clone(&diag) as Arc<dyn PluginDiagnostics>,
+        None,
+    );
 
     // No load warnings (ABI mismatch / skip would land here).
     let warned = warnings.warnings.lock().unwrap().clone();

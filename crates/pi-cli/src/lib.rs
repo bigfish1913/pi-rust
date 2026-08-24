@@ -47,6 +47,7 @@ pub mod args;
 pub mod app;
 pub mod auth;
 pub mod config;
+pub mod extensions_actions;
 pub mod extras;
 pub mod interactive_tui;
 pub mod modes;

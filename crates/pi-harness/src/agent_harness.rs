@@ -497,6 +497,20 @@ impl AgentHarness {
         Ok(inner.resources.clone())
     }
 
+    /// `getSystemPrompt()`. Mirrors TS `AgentHarness.getSystemPrompt` — a
+    /// defensive clone of the composed base system prompt the harness was built
+    /// with (base + append + context; the `<available_skills>` listing is added
+    /// at run time from the resource skills, so this returns the *base* prompt
+    /// the plugin's `runtime_action(GetSystemPrompt)` sees). B5a: backs the
+    /// [`rpi_extensions::RuntimeActionHost::get_system_prompt`] action.
+    pub async fn get_system_prompt(&self) -> HarnessResult<Option<String>> {
+        let inner = self.inner.lock().unwrap();
+        if inner.closed {
+            return Err(HarnessError::closed());
+        }
+        Ok(inner.system_prompt.clone())
+    }
+
     // -- private helpers ----------------------------------------------------
 
     /// Reject if closed or if `main` already has an active operation. On
