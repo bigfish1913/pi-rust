@@ -122,9 +122,11 @@ trait SlashCommand: Send + Sync {
         ""
     }
     /// Execute the command. Only invoked for inputs starting with `/` whose
-    /// first token matches `name()` or an alias. Must stay synchronous (see the
-    /// module-level note).
-    fn execute(&self, ctx: &CommandContext);
+    /// first token matches `name()` or an alias. `args` is the whitespace-
+    /// trimmed remainder after the command token ("" when none). Must stay
+    /// synchronous (see the module-level note) — async work goes through
+    /// `ctx.tx.send(TuiMessage::…)` or `tokio::spawn`.
+    fn execute(&self, ctx: &CommandContext, args: &str);
 }
 
 /// Holds all registered slash commands; the single source of truth for both
@@ -180,9 +182,11 @@ impl CommandRegistry {
 /// unknown-command error if nothing matches. Non-slash text never reaches here
 /// — callers route only `/`-prefixed inputs and send plain text directly.
 fn dispatch_slash(text: &str, ctx: &CommandContext, registry: &CommandRegistry) {
-    let token = text.split_whitespace().next().unwrap_or("");
+    let mut parts = text.split_whitespace();
+    let token = parts.next().unwrap_or("");
+    let args = parts.collect::<Vec<_>>().join(" ");
     match registry.find(token) {
-        Some(cmd) => cmd.execute(ctx),
+        Some(cmd) => cmd.execute(ctx, &args),
         None => {
             add_error_message(
                 &ctx.chat,
@@ -216,7 +220,7 @@ impl SlashCommand for UnsupportedCommand {
     fn description(&self) -> &'static str {
         self.desc
     }
-    fn execute(&self, ctx: &CommandContext) {
+    fn execute(&self, ctx: &CommandContext, _args: &str) {
         add_note_message(&ctx.chat, &format!("{} is not supported in v1.", self.name));
         ctx.tui.request_render(false);
     }
@@ -235,7 +239,7 @@ impl SlashCommand for HelpCommand {
     fn description(&self) -> &'static str {
         "Show available commands"
     }
-    fn execute(&self, ctx: &CommandContext) {
+    fn execute(&self, ctx: &CommandContext, _args: &str) {
         add_help_message(&ctx.chat);
         ctx.tui.request_render(false);
     }
@@ -256,7 +260,7 @@ impl SlashCommand for ClearChatCommand {
     fn description(&self) -> &'static str {
         "Clear the conversation"
     }
-    fn execute(&self, ctx: &CommandContext) {
+    fn execute(&self, ctx: &CommandContext, _args: &str) {
         let _ = ctx.tx.send(TuiMessage::ClearChat);
     }
 }
@@ -276,7 +280,7 @@ impl SlashCommand for ExitCommand {
     fn description(&self) -> &'static str {
         "Exit the application"
     }
-    fn execute(&self, ctx: &CommandContext) {
+    fn execute(&self, ctx: &CommandContext, _args: &str) {
         let _ = ctx.tx.send(TuiMessage::Exit);
     }
 }
@@ -292,7 +296,7 @@ impl SlashCommand for VersionCommand {
     fn description(&self) -> &'static str {
         "Show version information"
     }
-    fn execute(&self, ctx: &CommandContext) {
+    fn execute(&self, ctx: &CommandContext, _args: &str) {
         add_version_message(&ctx.chat);
         ctx.tui.request_render(false);
     }
@@ -306,7 +310,7 @@ impl SlashCommand for HotkeysCommand {
     fn description(&self) -> &'static str {
         "Show keyboard shortcuts"
     }
-    fn execute(&self, ctx: &CommandContext) {
+    fn execute(&self, ctx: &CommandContext, _args: &str) {
         add_hotkeys_message(&ctx.chat);
         ctx.tui.request_render(false);
     }
@@ -323,7 +327,7 @@ impl SlashCommand for ModelCommand {
     fn description(&self) -> &'static str {
         "Choose a model (selector)"
     }
-    fn execute(&self, ctx: &CommandContext) {
+    fn execute(&self, ctx: &CommandContext, _args: &str) {
         open_model_selector(
             &ctx.state,
             &ctx.editor_container,
@@ -348,7 +352,7 @@ impl SlashCommand for ThinkingCommand {
     fn description(&self) -> &'static str {
         "Set thinking level (selector)"
     }
-    fn execute(&self, ctx: &CommandContext) {
+    fn execute(&self, ctx: &CommandContext, _args: &str) {
         open_thinking_selector(
             &ctx.state,
             &ctx.editor_container,
@@ -370,7 +374,7 @@ impl SlashCommand for ToolsCommand {
     fn description(&self) -> &'static str {
         "Toggle tools on/off"
     }
-    fn execute(&self, ctx: &CommandContext) {
+    fn execute(&self, ctx: &CommandContext, _args: &str) {
         open_tools_selector(
             &ctx.state,
             &ctx.editor_container,
@@ -390,7 +394,7 @@ impl SlashCommand for ImagesCommand {
     fn description(&self) -> &'static str {
         "Toggle inline images"
     }
-    fn execute(&self, ctx: &CommandContext) {
+    fn execute(&self, ctx: &CommandContext, _args: &str) {
         open_images_selector(
             &ctx.state,
             &ctx.editor_container,
@@ -412,7 +416,7 @@ impl SlashCommand for SessionCommand {
     fn description(&self) -> &'static str {
         "List saved sessions"
     }
-    fn execute(&self, ctx: &CommandContext) {
+    fn execute(&self, ctx: &CommandContext, _args: &str) {
         open_session_selector(
             &ctx.state,
             &ctx.editor_container,
@@ -432,7 +436,7 @@ impl SlashCommand for ThemeCommand {
     fn description(&self) -> &'static str {
         "Choose a theme (selector)"
     }
-    fn execute(&self, ctx: &CommandContext) {
+    fn execute(&self, ctx: &CommandContext, _args: &str) {
         open_theme_selector(&ctx.state, &ctx.editor_container, &ctx.editor, &ctx.tui);
     }
 }
@@ -445,7 +449,7 @@ impl SlashCommand for CompactCommand {
     fn description(&self) -> &'static str {
         "Compact the conversation"
     }
-    fn execute(&self, ctx: &CommandContext) {
+    fn execute(&self, ctx: &CommandContext, _args: &str) {
         let _ = ctx.tx.send(TuiMessage::Compact);
     }
 }
@@ -458,8 +462,78 @@ impl SlashCommand for CopyCommand {
     fn description(&self) -> &'static str {
         "Copy last reply to clipboard"
     }
-    fn execute(&self, ctx: &CommandContext) {
+    fn execute(&self, ctx: &CommandContext, _args: &str) {
         let _ = ctx.tx.send(TuiMessage::Copy);
+    }
+}
+
+struct ExportCommand;
+impl SlashCommand for ExportCommand {
+    fn name(&self) -> &'static str {
+        "/export"
+    }
+    fn description(&self) -> &'static str {
+        "Export session to a markdown file"
+    }
+    fn execute(&self, ctx: &CommandContext, _args: &str) {
+        let _ = ctx.tx.send(TuiMessage::ExportSession);
+    }
+}
+
+struct ForkCommand;
+impl SlashCommand for ForkCommand {
+    fn name(&self) -> &'static str {
+        "/fork"
+    }
+    fn description(&self) -> &'static str {
+        "Fork the session into a new one"
+    }
+    fn execute(&self, ctx: &CommandContext, _args: &str) {
+        let _ = ctx.tx.send(TuiMessage::ForkSession);
+    }
+}
+
+struct NameCommand;
+impl SlashCommand for NameCommand {
+    fn name(&self) -> &'static str {
+        "/name"
+    }
+    fn description(&self) -> &'static str {
+        "Set session display name"
+    }
+    fn execute(&self, ctx: &CommandContext, args: &str) {
+        let name = args.trim();
+        if name.is_empty() {
+            add_note_message(
+                &ctx.chat,
+                "Usage: /name <display name> — sets the current session's name.",
+            );
+            ctx.tui.request_render(false);
+            return;
+        }
+        let _ = ctx.tx.send(TuiMessage::SetSessionName(name.to_string()));
+    }
+}
+
+struct ImportCommand;
+impl SlashCommand for ImportCommand {
+    fn name(&self) -> &'static str {
+        "/import"
+    }
+    fn description(&self) -> &'static str {
+        "Import a session file (path)"
+    }
+    fn execute(&self, ctx: &CommandContext, args: &str) {
+        let path = args.trim();
+        if path.is_empty() {
+            add_note_message(
+                &ctx.chat,
+                "Usage: /import <path-to-session.jsonl> — copies the file into the session dir and switches to it.",
+            );
+            ctx.tui.request_render(false);
+            return;
+        }
+        let _ = ctx.tx.send(TuiMessage::ImportSession(path.to_string()));
     }
 }
 
@@ -471,7 +545,7 @@ impl SlashCommand for ArminCommand {
     fn description(&self) -> &'static str {
         "??? (easter egg)"
     }
-    fn execute(&self, ctx: &CommandContext) {
+    fn execute(&self, ctx: &CommandContext, _args: &str) {
         crate::extras::add_armin(&ctx.chat);
         ctx.tui.request_render(false);
     }
@@ -485,7 +559,7 @@ impl SlashCommand for EarendilCommand {
     fn description(&self) -> &'static str {
         "Announcement"
     }
-    fn execute(&self, ctx: &CommandContext) {
+    fn execute(&self, ctx: &CommandContext, _args: &str) {
         crate::extras::add_earendil(&ctx.chat);
         ctx.tui.request_render(false);
     }
@@ -502,7 +576,7 @@ impl SlashCommand for ContextCommand {
     fn visible(&self) -> bool {
         false
     }
-    fn execute(&self, ctx: &CommandContext) {
+    fn execute(&self, ctx: &CommandContext, _args: &str) {
         show_context_panel(&ctx.chat, &ctx.resources);
         ctx.tui.request_render(false);
     }
@@ -530,11 +604,10 @@ fn build_builtin_registry() -> CommandRegistry {
     r.register(Arc::new(ArminCommand));
     r.register(Arc::new(EarendilCommand));
     r.register(Arc::new(ContextCommand));
-    // Recognized but inert in v1 (one struct backs them all). `/name` is
-    // recognized-v1 but inert (no session-renaming surface yet); the rest are
-    // the TS builtins out of v1 scope. Each carries a description so autocomplete
-    // surfaces its existence even though running it reports "not supported".
-    r.register(Arc::new(UnsupportedCommand::new("/name", "Set session display name")));
+    // Recognized but inert in v1 (one struct backs them all). The TS builtins
+    // out of v1 scope; each carries a description so autocomplete surfaces its
+    // existence even though running it reports "not supported".
+    r.register(Arc::new(NameCommand));
     r.register(Arc::new(UnsupportedCommand::new(
         "/settings",
         "Open settings menu",
@@ -543,16 +616,13 @@ fn build_builtin_registry() -> CommandRegistry {
         "/scoped-models",
         "Enable/disable models for Ctrl+P cycling",
     )));
-    r.register(Arc::new(UnsupportedCommand::new("/export", "Export session")));
-    r.register(Arc::new(UnsupportedCommand::new(
-        "/import",
-        "Import and resume a session",
-    )));
+    r.register(Arc::new(ExportCommand));
+    r.register(Arc::new(ImportCommand));
     r.register(Arc::new(UnsupportedCommand::new(
         "/share",
         "Share session as a GitHub gist",
     )));
-    r.register(Arc::new(UnsupportedCommand::new("/fork", "Create a new fork")));
+    r.register(Arc::new(ForkCommand));
     r.register(Arc::new(UnsupportedCommand::new(
         "/clone",
         "Duplicate the current session",
@@ -598,6 +668,15 @@ enum TuiMessage {
     /// Hot-switch to another saved session (from the `/session` selector):
     /// the payload is the session id the selector's item value carried.
     SwitchSession(String),
+    /// Export the current session to a markdown file (from `/export`).
+    ExportSession,
+    /// Fork the current session into a new one and switch to it (from `/fork`).
+    ForkSession,
+    /// Rename the current session (from `/name <name>`).
+    SetSessionName(String),
+    /// Import a JSONL session file into the session dir and switch to it
+    /// (from `/import <path>`).
+    ImportSession(String),
 }
 
 /// Extract the concatenated text content from an assistant message (mirrors
@@ -625,6 +704,213 @@ fn user_message_text(msg: &rpi_ai::types::UserMessage) -> String {
             })
             .collect(),
     }
+}
+
+/// Export the current session to a markdown transcript file. Writes
+/// `<cwd>/<session-name-or-id>.md` with the user/assistant/tool-call history
+/// (mirrors the TS `/export` intent locally — no remote sharing in v1).
+/// Best-effort: failures surface as a chat note.
+async fn export_session(harness: &AgentHarness, chat: &Arc<Container>) {
+    let tree = harness.session().view("main");
+    let entries = match tree.find_entries(&EntryQuery {
+        entry_type: None,
+        custom_type: None,
+        order: None,
+        limit: None,
+        cursor: None,
+    }).await {
+        Ok(e) => e,
+        Err(e) => {
+            add_error_message(chat, &format!("Could not read session: {e}"));
+            return;
+        }
+    };
+    let name = tree.get_name().await.ok().flatten().unwrap_or_default();
+    let id = tree
+        .get_leaf_id()
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "session".to_string());
+    let mut md = String::from("# Session\n\n");
+    for e in entries {
+        let Entry::Message(me) = e else { continue };
+        match &me.message {
+            AgentMessage::User(u) => {
+                md.push_str(&format!("## User\n\n{}\n\n", user_message_text(u)));
+            }
+            AgentMessage::Assistant(a) => {
+                let text = assistant_text(a);
+                if !text.is_empty() {
+                    md.push_str(&format!("## Assistant\n\n{}\n\n", text));
+                }
+            }
+            _ => {}
+        }
+    }
+    let file_name = if name.is_empty() {
+        format!("{id}.md")
+    } else {
+        format!("{name}.md")
+    };
+    let path = std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join(&file_name);
+    match std::fs::write(&path, md) {
+        Ok(_) => add_note_message(
+            chat,
+            &format!("Exported session to {}", path.display()),
+        ),
+        Err(e) => add_error_message(chat, &format!("Could not write export: {e}")),
+    }
+}
+
+/// Fork the current session into a new JSONL session and switch to it (TS
+/// `/fork` — a copy of the transcript in a fresh file; the fork is a new
+/// session the user continues in). Uses the repo's `fork_typed`, then swaps
+/// the harness backing and renders the (empty-ish) fork transcript.
+/// Hot-switch the harness to another saved session: abort any in-flight run,
+/// open the target session file, swap the durable backing, and re-render the
+/// transcript from the new history (mirrors pi's `/session` resume-in-place).
+/// Shared by the `/session` selector, `/import`, and `/fork`. The current
+/// model/footer stay put (v1 doesn't replay the session's ModelChange entries).
+async fn switch_to_session(
+    harness: &AgentHarness,
+    lane: &Arc<dyn AgentLane>,
+    id: &str,
+    cwd: &std::path::Path,
+    chat: &Arc<Container>,
+    state: &Arc<TuiState>,
+) -> bool {
+    if *state.status.lock().unwrap() == RunStatus::Working {
+        state.set_status(RunStatus::Aborting);
+        let _ = lane.abort().await;
+    }
+    let cwd_str = cwd.to_string_lossy().to_string();
+    match crate::session::open_session_by_id(id, &cwd_str).await {
+        Ok(new_session) => {
+            let _ = harness.set_session(new_session).await;
+            chat.clear();
+            add_welcome_message(chat);
+            render_session_history(harness, chat).await;
+            state.set_status(RunStatus::Idle);
+            add_note_message(chat, &format!("Switched to session {id}."));
+            true
+        }
+        Err(e) => {
+            state.set_status(RunStatus::Idle);
+            add_error_message(chat, &format!("Could not open session {id}: {e}"));
+            false
+        }
+    }
+}
+
+/// `/import <path>`: copy a JSONL session file into the default session dir,
+/// then hot-switch to it (the file name becomes its id — matching the
+/// selector/`open_session_by_id` containment rules).
+async fn import_session(
+    harness: &AgentHarness,
+    lane: &Arc<dyn AgentLane>,
+    path: &str,
+    cwd: &std::path::Path,
+    chat: &Arc<Container>,
+    state: &Arc<TuiState>,
+) {
+    use std::path::Path as FsPath;
+
+    let src = FsPath::new(path);
+    if !src.is_file() {
+        add_error_message(chat, &format!("Import source not found: {path}"));
+        return;
+    }
+    let Some(fname) = src.file_name().and_then(|f| f.to_str()) else {
+        add_error_message(chat, "Import source has no file name.");
+        return;
+    };
+    if !fname.ends_with(".jsonl") {
+        add_error_message(chat, "Import source must be a .jsonl session file.");
+        return;
+    }
+    let dir = crate::session::default_session_dir(cwd);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        add_error_message(chat, &format!("Could not create session dir: {e}"));
+        return;
+    }
+    let dest = dir.join(fname);
+    match std::fs::copy(src, &dest) {
+        Ok(_) => {
+            let id = fname
+                .strip_suffix(".jsonl")
+                .unwrap_or(fname)
+                .to_string();
+            if switch_to_session(harness, lane, &id, cwd, chat, state).await {
+                add_note_message(chat, &format!("Imported session from {path}"));
+            }
+        }
+        Err(e) => add_error_message(chat, &format!("Could not copy import: {e}")),
+    }
+}
+
+async fn fork_session(
+    harness: &AgentHarness,
+    cwd: &std::path::Path,
+    chat: &Arc<Container>,
+    state: &Arc<TuiState>,
+) {
+    use rpi_harness::session::jsonl::{JsonlSessionRepo, JsonlSessionRepoOptions};
+    use rpi_harness::session::types::SessionStorage;
+    use rpi_tools::FileSystem;
+
+    let cwd_str = cwd.to_string_lossy().to_string();
+    let dir = crate::session::default_session_dir(cwd);
+    let env = Arc::new(rpi_tools::OsExecutionEnv::with_cwd(cwd.to_path_buf()));
+    let fs: Arc<dyn FileSystem> = env.clone();
+    let repo = JsonlSessionRepo::with_env_cwd(JsonlSessionRepoOptions {
+        fs,
+        sessions_root: dir.to_string_lossy().into_owned(),
+        clock: Arc::new(rpi_harness::session::memory::SystemClock),
+        ids: Arc::new(rpi_harness::session::session::DefaultIdGenerator::new()),
+    });
+    // The fork needs the rich JSONL metadata (with the on-disk path); resolve
+    // it from the session list by the current session's id.
+    let id = harness.session().storage().metadata().id.clone();
+    let metas = match crate::session::list_session_metadata(&cwd_str).await {
+        Ok(m) => m,
+        Err(e) => {
+            add_error_message(chat, &format!("Could not list sessions: {e}"));
+            return;
+        }
+    };
+    let Some(source) = metas.iter().find(|m| m.id == id) else {
+        add_error_message(chat, &format!("Current session {id} not found on disk."));
+        return;
+    };
+    let fork_storage = match repo
+        .fork_typed(
+            source,
+            &rpi_harness::session::jsonl::JsonlSessionCreateOptions {
+                id: None,
+                parent_session_id: Some(source.id.clone()),
+                cwd: cwd_str.clone(),
+                metadata: None,
+            },
+            &rpi_harness::session::types::ForkOptions::default(),
+        )
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            add_error_message(chat, &format!("Could not fork session: {e}"));
+            return;
+        }
+    };
+    let new_session = rpi_harness::session::session::Session::new(Arc::new(fork_storage), None);
+    let _ = harness.set_session(new_session).await;
+    chat.clear();
+    add_welcome_message(chat);
+    render_session_history(harness, chat).await;
+    state.set_status(RunStatus::Idle);
+    add_note_message(chat, "Forked into a new session.");
 }
 
 /// Render the restored session's prior transcript (user + assistant messages)
@@ -1400,7 +1686,7 @@ pub async fn interactive_tui(
             //    (TS binds Ctrl+L to model-select).
             if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('l') {
                 if let Some(cmd) = registry_for_key.find("/model") {
-                    cmd.execute(&ctx_for_key);
+                    cmd.execute(&ctx_for_key, "");
                 }
                 continue;
             }
@@ -1505,37 +1791,33 @@ pub async fn interactive_tui(
                 break;
             }
             Ok(TuiMessage::SwitchSession(id)) => {
-                // Hot-switch to another saved session: abort any in-flight
-                // run, open the target session file, swap the harness's
-                // durable backing, and re-render the transcript from the new
-                // history (mirrors pi's `/session` resume-in-place). The
-                // current model/footer stay put (v1 doesn't replay the
-                // session's ModelChange entries).
-                if *state.status.lock().unwrap() == RunStatus::Working {
-                    state.set_status(RunStatus::Aborting);
-                    let _ = lane.abort().await;
+                switch_to_session(&harness, &lane, &id, &cwd, &chat_container, &state).await;
+                tui.request_render(false);
+            }
+            Ok(TuiMessage::ImportSession(path)) => {
+                import_session(&harness, &lane, &path, &cwd, &chat_container, &state).await;
+                tui.request_render(false);
+            }
+            Ok(TuiMessage::SetSessionName(name)) => {
+                let outcome = harness.session().set_name(Some(&name)).await;
+                match outcome {
+                    Ok(_) => add_note_message(
+                        &chat_container,
+                        &format!("Session renamed to \"{name}\"."),
+                    ),
+                    Err(e) => add_error_message(
+                        &chat_container,
+                        &format!("Could not rename session: {e}"),
+                    ),
                 }
-                let cwd_str = cwd.to_string_lossy().to_string();
-                match crate::session::open_session_by_id(&id, &cwd_str).await {
-                    Ok(new_session) => {
-                        let _ = harness.set_session(new_session).await;
-                        chat_container.clear();
-                        add_welcome_message(&chat_container);
-                        render_session_history(&harness, &chat_container).await;
-                        state.set_status(RunStatus::Idle);
-                        add_note_message(
-                            &chat_container,
-                            &format!("Switched to session {id}."),
-                        );
-                    }
-                    Err(e) => {
-                        state.set_status(RunStatus::Idle);
-                        add_error_message(
-                            &chat_container,
-                            &format!("Could not open session {id}: {e}"),
-                        );
-                    }
-                }
+                tui.request_render(false);
+            }
+            Ok(TuiMessage::ExportSession) => {
+                export_session(&harness, &chat_container).await;
+                tui.request_render(false);
+            }
+            Ok(TuiMessage::ForkSession) => {
+                fork_session(&harness, &cwd, &chat_container, &state).await;
                 tui.request_render(false);
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
