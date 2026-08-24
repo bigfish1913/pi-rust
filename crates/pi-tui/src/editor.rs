@@ -257,6 +257,8 @@ impl Editor {
             state.lines = snap.lines.clone();
             state.cursor_row = snap.cursor_row;
             state.cursor_col = snap.cursor_col;
+            // Snapshots don't carry the selection; undo/redo ends it.
+            state.selection_anchor = None;
         }
         self.notify_change();
     }
@@ -318,12 +320,16 @@ impl Editor {
         *self.last_action.lock().unwrap() = Some("kill");
     }
 
-    /// Yank (paste) the most recent kill at the cursor (Ctrl+Y).
+    /// Yank (paste) the most recent kill at the cursor (Ctrl+Y). Replaces an
+    /// active selection.
     pub fn yank(&self) {
         let text = self.kill_ring.lock().unwrap().peek().map(str::to_string);
         let Some(text) = text else { return };
         self.push_undo("yank");
-        self.insert(&text);
+        if self.has_selection() {
+            self.delete_selection_no_undo();
+        }
+        self.insert_no_undo(&text);
         *self.last_action.lock().unwrap() = Some("yank");
     }
 
@@ -336,9 +342,154 @@ impl Editor {
         self.yank();
     }
 
-    /// Insert text at cursor position.
+    // -------------------------------------------------------------------
+    // Selection (Shift+arrows select, Ctrl+X/C/V cut/copy/paste).
+    // -------------------------------------------------------------------
+
+    /// Whether a selection is active.
+    pub fn has_selection(&self) -> bool {
+        self.state.lock().unwrap().selection_anchor.is_some()
+    }
+
+    /// The ordered selection span `(start_row, start_col, end_row, end_col)`
+    /// with start <= end (byte offsets, both on char boundaries).
+    fn selection_ordered(&self) -> Option<(usize, usize, usize, usize)> {
+        let state = self.state.lock().unwrap();
+        let (ar, ac) = state.selection_anchor?;
+        let (br, bc) = (state.cursor_row, state.cursor_col);
+        Some(if (ar, ac) <= (br, bc) {
+            (ar, ac, br, bc)
+        } else {
+            (br, bc, ar, ac)
+        })
+    }
+
+    /// The selected text ("\n"-joined across rows), if any.
+    pub fn selected_text(&self) -> Option<String> {
+        let (sr, sc, er, ec) = self.selection_ordered()?;
+        let lines = self.state.lock().unwrap().lines.clone();
+        if sr == er {
+            Some(lines[sr][sc..ec].to_string())
+        } else {
+            let mut out = String::new();
+            out.push_str(&lines[sr][sc..]);
+            for r in sr + 1..er {
+                out.push('\n');
+                out.push_str(&lines[r]);
+            }
+            out.push('\n');
+            out.push_str(&lines[er][..ec]);
+            Some(out)
+        }
+    }
+
+    /// The selection span on `row`, as `(start_col, end_col)` byte offsets,
+    /// for render-time highlighting. `None` when the row is outside the span.
+    fn selection_span_on_row(&self, state: &EditorState, row: usize) -> Option<(usize, usize)> {
+        let (ar, ac) = state.selection_anchor?;
+        let (br, bc) = (state.cursor_row, state.cursor_col);
+        let (sr, sc, er, ec) = if (ar, ac) <= (br, bc) {
+            (ar, ac, br, bc)
+        } else {
+            (br, bc, ar, ac)
+        };
+        if row < sr || row > er {
+            return None;
+        }
+        if sr == er {
+            (sc != ec).then_some((sc, ec))
+        } else if row == sr {
+            (sc < state.lines[row].len()).then_some((sc, state.lines[row].len()))
+        } else if row == er {
+            (ec > 0).then_some((0, ec))
+        } else {
+            (!state.lines[row].is_empty()).then_some((0, state.lines[row].len()))
+        }
+    }
+
+    /// Seed the selection anchor at the current caret (Shift+direction start).
+    fn begin_selection(&self) {
+        let mut state = self.state.lock().unwrap();
+        if state.selection_anchor.is_none() {
+            state.selection_anchor = Some((state.cursor_row, state.cursor_col));
+        }
+    }
+
+    /// Clear the active selection (plain cursor movement / edits).
+    fn clear_selection(&self) {
+        self.state.lock().unwrap().selection_anchor = None;
+    }
+
+    /// Delete the selected span, leaving the caret at its start. Pushes an
+    /// undo snapshot; no-op without a selection.
+    fn delete_selection(&self) {
+        if !self.has_selection() {
+            return;
+        }
+        self.push_undo("edit");
+        self.delete_selection_no_undo();
+    }
+
+    /// Delete the selected span WITHOUT an undo snapshot (caller pushed one,
+    /// e.g. a replace-through-insert coalesced with the insertion).
+    fn delete_selection_no_undo(&self) {
+        let (sr, sc, er, ec) = match self.selection_ordered() {
+            Some(s) => s,
+            None => return,
+        };
+        let mut state = self.state.lock().unwrap();
+        if sr == er {
+            state.lines[sr].replace_range(sc..ec, "");
+            state.cursor_row = sr;
+            state.cursor_col = sc;
+        } else {
+            let mut joined = state.lines[sr][..sc].to_string();
+            joined.push_str(&state.lines[er][ec..]);
+            state.lines.drain(sr + 1..=er);
+            state.lines[sr] = joined;
+            state.cursor_row = sr;
+            state.cursor_col = sc;
+        }
+        state.selection_anchor = None;
+        drop(state);
+        self.notify_change();
+    }
+
+    /// Copy the selection onto the kill ring (Ctrl+C). No-op without one.
+    pub fn copy_selection(&self) -> bool {
+        let Some(text) = self.selected_text() else { return false };
+        if text.is_empty() {
+            return false;
+        }
+        if let Ok(mut ring) = self.kill_ring.lock() {
+            ring.push(&text, PushOptions::default());
+        }
+        true
+    }
+
+    /// Cut the selection (copy + delete, Ctrl+X). Returns whether anything
+    /// was cut.
+    pub fn cut_selection(&self) -> bool {
+        if !self.copy_selection() {
+            return false;
+        }
+        self.delete_selection();
+        true
+    }
+
+    /// Insert text at cursor position. Replaces an active selection (one undo
+    /// step: the snapshot is taken before the selection is deleted).
     pub fn insert(&self, text: &str) {
         self.push_undo("insert");
+        if self.has_selection() {
+            self.delete_selection_no_undo();
+        }
+        self.insert_no_undo(text);
+    }
+
+    /// Insert without an undo snapshot (caller pushed one — yank/replace
+    /// paths). Notifies change observers.
+    fn insert_no_undo(&self, text: &str) {
         if let Ok(mut state) = self.state.lock() {
             for ch in text.chars() {
                 if ch == '\n' {
@@ -366,8 +517,13 @@ impl Editor {
         self.notify_change();
     }
 
-    /// Delete character before cursor (Backspace).
+    /// Delete character before cursor (Backspace). With a selection, deletes
+    /// the selection instead.
     fn backspace(&self) {
+        if self.has_selection() {
+            self.delete_selection();
+            return;
+        }
         self.push_undo("edit");
         if let Ok(mut state) = self.state.lock() {
             if state.cursor_col > 0 {
@@ -398,8 +554,13 @@ impl Editor {
         self.notify_change();
     }
 
-    /// Delete character at cursor (Delete).
+    /// Delete character at cursor (Delete). With a selection, deletes the
+    /// selection instead.
     fn delete(&self) {
+        if self.has_selection() {
+            self.delete_selection();
+            return;
+        }
         self.push_undo("edit");
         if let Ok(mut state) = self.state.lock() {
             let row = state.cursor_row;
@@ -532,14 +693,57 @@ impl Editor {
     /// Handle keyboard input.
     pub fn handle_key(&self, key: crossterm::event::KeyEvent) -> bool {
         match (key.modifiers, key.code) {
-            // Navigation
-            (KeyModifiers::NONE, KeyCode::Left) => self.cursor_left(),
-            (KeyModifiers::NONE, KeyCode::Right) => self.cursor_right(),
-            (KeyModifiers::NONE, KeyCode::Up) => self.cursor_up(),
-            (KeyModifiers::NONE, KeyCode::Down) => self.cursor_down(),
-            (KeyModifiers::NONE, KeyCode::Home) => self.cursor_home(),
-            (KeyModifiers::NONE, KeyCode::End) => self.cursor_end(),
-            
+            // Navigation — plain movement clears any active selection;
+            // Shift+movement extends it.
+            (KeyModifiers::NONE, KeyCode::Left) => {
+                self.clear_selection();
+                self.cursor_left();
+            }
+            (KeyModifiers::NONE, KeyCode::Right) => {
+                self.clear_selection();
+                self.cursor_right();
+            }
+            (KeyModifiers::NONE, KeyCode::Up) => {
+                self.clear_selection();
+                self.cursor_up();
+            }
+            (KeyModifiers::NONE, KeyCode::Down) => {
+                self.clear_selection();
+                self.cursor_down();
+            }
+            (KeyModifiers::NONE, KeyCode::Home) => {
+                self.clear_selection();
+                self.cursor_home();
+            }
+            (KeyModifiers::NONE, KeyCode::End) => {
+                self.clear_selection();
+                self.cursor_end();
+            }
+            (KeyModifiers::SHIFT, KeyCode::Left) => {
+                self.begin_selection();
+                self.cursor_left();
+            }
+            (KeyModifiers::SHIFT, KeyCode::Right) => {
+                self.begin_selection();
+                self.cursor_right();
+            }
+            (KeyModifiers::SHIFT, KeyCode::Up) => {
+                self.begin_selection();
+                self.cursor_up();
+            }
+            (KeyModifiers::SHIFT, KeyCode::Down) => {
+                self.begin_selection();
+                self.cursor_down();
+            }
+            (KeyModifiers::SHIFT, KeyCode::Home) => {
+                self.begin_selection();
+                self.cursor_home();
+            }
+            (KeyModifiers::SHIFT, KeyCode::End) => {
+                self.begin_selection();
+                self.cursor_end();
+            }
+
             // Editing
             (KeyModifiers::NONE, KeyCode::Backspace) => self.backspace(),
             (KeyModifiers::NONE, KeyCode::Delete) => self.delete(),
@@ -588,6 +792,16 @@ impl Editor {
             // convenience since pi has no redo binding).
             (KeyModifiers::CONTROL, KeyCode::Char('-')) => self.undo(),
             (KeyModifiers::CONTROL, KeyCode::Char('r')) => self.redo(),
+            // Selection cut/copy/paste (Ctrl+X / Ctrl+C / Ctrl+V).
+            (KeyModifiers::CONTROL, KeyCode::Char('x')) => {
+                self.cut_selection();
+            }
+            (KeyModifiers::CONTROL, KeyCode::Char('c')) => {
+                self.copy_selection();
+            }
+            (KeyModifiers::CONTROL, KeyCode::Char('v')) => {
+                self.yank();
+            }
             // Kill-ring yank (Ctrl+Y) / yank-pop (Alt+Y).
             (KeyModifiers::CONTROL, KeyCode::Char('y')) => self.yank(),
             (KeyModifiers::ALT, KeyCode::Char('y')) => self.yank_pop(),
@@ -662,6 +876,19 @@ impl Component for Editor {
             } else {
                 line.clone()
             };
+
+            // Selection highlight: inverse-video the span on this row (byte
+            // offsets are char boundaries — both anchor and caret always sit
+            // on one).
+            let mut content = content;
+            if let Some((sc, ec)) = self.selection_span_on_row(&state, row_idx) {
+                if ec <= content.len() && sc <= ec && content.is_char_boundary(sc) && content.is_char_boundary(ec) {
+                    let before = &content[..sc];
+                    let sel = &content[sc..ec];
+                    let after = &content[ec..];
+                    content = format!("{before}\x1b[7m{sel}\x1b[27m{after}");
+                }
+            }
 
             let visible_w = crate::ansi::visible_width(&content);
             // Pad the line out to the full width (left padding + content +
@@ -780,6 +1007,100 @@ mod tests {
     }
 
 
+
+
+    #[test]
+    fn test_selection_cut_copy_paste() {
+        let editor = Editor::simple();
+        editor.insert("hello world");
+        // Caret to the start, then Shift+Right ×5 selects "hello".
+        editor.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Home,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        let shift_right = || {
+            editor.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Right,
+                crossterm::event::KeyModifiers::SHIFT,
+            ))
+        };
+        for _ in 0..5 {
+            shift_right();
+        }
+        assert!(editor.has_selection());
+        assert_eq!(editor.selected_text().as_deref(), Some("hello"));
+        // Ctrl+C copies (selection intact), then plain Right clears it.
+        editor.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('c'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        assert_eq!(editor.get_text(), "hello world");
+        editor.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Right,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(!editor.has_selection(), "plain movement clears selection");
+        // Move to the end and yank the copied text.
+        editor.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::End,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        editor.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('v'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        assert_eq!(editor.get_text(), "hello worldhello");
+    }
+
+
+    #[test]
+    fn test_selection_replace_and_cut() {
+        let editor = Editor::simple();
+        editor.insert("abcdef");
+        // Caret to the start, then Shift+Right ×4 selects "abcd".
+        editor.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Home,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        for _ in 0..4 {
+            editor.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Right,
+                crossterm::event::KeyModifiers::SHIFT,
+            ));
+        }
+        // Backspace deletes the selection ("abcd" → "ef").
+        editor.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Backspace,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(editor.get_text(), "ef", "backspace deletes the selection");
+        // Undo restores it.
+        editor.undo();
+        assert_eq!(editor.get_text(), "abcdef");
+        // Cut: return to the start, select "ab", Ctrl+X removes + kills it.
+        editor.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Home,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        for _ in 0..2 {
+            editor.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Right,
+                crossterm::event::KeyModifiers::SHIFT,
+            ));
+        }
+        editor.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('x'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        assert_eq!(editor.get_text(), "cdef");
+        // Type over a selection replaces it.
+        editor.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Right,
+            crossterm::event::KeyModifiers::SHIFT,
+        ));
+        editor.insert("Z");
+        assert_eq!(editor.get_text(), "Zdef", "typing replaces the selection");
+    }
     #[test]
     fn test_undo_redo_roundtrip() {
         let editor = Editor::simple();
