@@ -261,6 +261,7 @@ pub async fn interactive(
     initial: Option<String>,
     extra_messages: &[String],
     theme: Option<&str>,
+    reload_context: &crate::session::ReloadContext,
 ) -> i32 {
     // Check if TUI is supported
     let force_tui = std::env::var("RPI_FORCE_TUI").map(|v| v == "1").unwrap_or(false);
@@ -274,6 +275,7 @@ pub async fn interactive(
             initial,
             extra_messages,
             theme,
+            reload_context,
         )
         .await
     } else {

@@ -67,7 +67,10 @@ use rpi_plugin_sdk::{
 };
 use thiserror::Error;
 
-pub use actions::{ActionBridge, RuntimeActionHost, trampoline_runtime_action};
+pub use actions::{
+    ActionBridge, ReloadMailbox, RuntimeActionHost, reload_callback_from_mailbox,
+    trampoline_runtime_action,
+};
 pub use loader::{
     ExtensionSession, LoadedPlugin, PluginKeepalive, PluginLoadError, load_dir, load_one,
     load_session, merge_registries,

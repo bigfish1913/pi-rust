@@ -34,6 +34,7 @@
 //! (`lib.rs:10-16`: `rpi-extensions` does NOT depend on `rpi-harness`).
 
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
 use rpi_plugin_sdk::{RuntimeActionId, StbString, StbStringRef};
@@ -98,7 +99,20 @@ pub trait RuntimeActionHost: Send + Sync {
 /// it constructs the bridge) — this is the foreign-thread fix. `host` is the
 /// `rpi-cli` impl over the harness. `reload` is a CLI-owned callback that
 /// re-runs extension discovery + Part-A loaders (a CLI concern, NOT a harness
-/// op) — wired by `rpi-cli` in B5d; `None` until then.
+/// op) — wired by `rpi-cli` in B5d via [`reload_callback_from_mailbox`].
+///
+/// ## Staleness (B5d)
+///
+/// `active: Arc<AtomicBool>` is shared with a [`ReloadMailbox`]-driven swap
+/// site. A `/reload` (TUI command OR a plugin's `runtime_action(Reload)`) builds
+/// a fresh `ExtensionSession` + a fresh `ActionBridge`, calls
+/// [`invalidate`](Self::invalidate) on the old bridge, and swaps the new one in.
+/// In-flight `runtime_action` calls that recovered the OLD bridge from
+/// `user_data` (the pointer a plugin stored during the prior `register`) then
+/// hit the staleness guard in [`run_action`] and fail with a structured error
+/// instead of driving a half-swapped harness. (Plugins load fresh on reload,
+/// handing them the NEW bridge pointer; the guard only catches the race window
+/// where an old call is still parked on `rx.recv()`.)
 ///
 /// Held behind `Arc` (pointer-stable for the bridge's lifetime via
 /// [`Arc::as_ptr`]); `rpi-cli` keeps one clone for the session lifetime so the
@@ -113,23 +127,126 @@ pub struct ActionBridge {
     pub(crate) host: Arc<dyn RuntimeActionHost>,
     /// B5d reload callback; `None` until the TUI wires `/reload`.
     pub(crate) reload: Option<Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>>,
+    /// B5d staleness flag. Shared so [`invalidate`] flips it for every clone.
+    /// `true` while this bridge is the live session's bridge.
+    active: Arc<AtomicBool>,
 }
 
 impl ActionBridge {
     /// Build a bridge. The `Handle` MUST be captured from a thread running the
     /// target runtime (pi-cli builds the bridge on the async main thread).
     pub fn new(runtime: Handle, host: Arc<dyn RuntimeActionHost>) -> Arc<Self> {
-        Arc::new(Self { runtime, host, reload: None })
+        Arc::new(Self { runtime, host, reload: None, active: Arc::new(AtomicBool::new(true)) })
     }
 
-    /// Same as [`new`](Self::new) with a reload callback (B5d wires this).
+    /// Same as [`new`](Self::new) with a reload callback (B5d wires this via
+    /// [`reload_callback_from_mailbox`]).
     pub fn with_reload(
         runtime: Handle,
         host: Arc<dyn RuntimeActionHost>,
         reload: Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>,
     ) -> Arc<Self> {
-        Arc::new(Self { runtime, host, reload: Some(reload) })
+        Arc::new(Self { runtime, host, reload: Some(reload), active: Arc::new(AtomicBool::new(true)) })
     }
+
+    /// Mark this bridge stale (B5d). A `/reload` that swaps in a fresh bridge
+    /// calls this on the old one so in-flight `runtime_action` calls parked on
+    /// the old `user_data` pointer fail fast with a staleness error instead of
+    /// driving the swapped-out session. Idempotent.
+    pub fn invalidate(&self) {
+        self.active.store(false, Ordering::SeqCst);
+    }
+
+    /// Whether this bridge is still the live session's bridge.
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::SeqCst)
+    }
+
+    /// B5d: clone the host impl so a `/reload` can build a FRESH `ActionBridge`
+    /// over the SAME `RuntimeActionHost` (the host's harness cell already points
+    /// at the live harness — the harness is NOT rebuilt on reload — so the host
+    /// is reusable across reloads; only the bridge's staleness flag + reload
+    /// callback differ). The fresh bridge gets a fresh `active` flag (true) +
+    /// the reload callback the TUI installed; the old bridge is `invalidate`d.
+    pub fn clone_host(&self) -> Arc<dyn RuntimeActionHost> {
+        Arc::clone(&self.host)
+    }
+}
+
+/// A reload-signal mail slot (B5d). The reload callback (built by
+/// [`reload_callback_from_mailbox`]) captures a clone; the TUI installs a
+/// `tokio` unbounded sender after it starts. When a plugin calls
+/// `runtime_action(Reload)`, the callback signals `()` (if a TUI is installed)
+/// and the TUI performs the reload **asynchronously** — the plugin's call
+/// returns `Ok(null)` immediately, so the calling plugin's cdylib is NOT
+/// unmapped while its `runtime_action` frame is still on the stack (the reload,
+/// which drops the old keepalive, happens after the call returns). This breaks
+/// the self-unmapping race a synchronous plugin-initiated reload would have.
+///
+/// rpi-extensions carries only `()` (no pi-cli `TuiMessage` type) — preserving
+/// the leaf DAG. The TUI owns the receiver + the actual reload routine.
+#[derive(Clone)]
+pub struct ReloadMailbox {
+    tx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<()>>>>,
+}
+
+impl Default for ReloadMailbox {
+    fn default() -> Self {
+        Self {
+            tx: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+}
+
+impl ReloadMailbox {
+    /// A fresh empty mail slot (no TUI installed yet).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Install the TUI's reload-signal sender (after the TUI starts). Replaces
+    /// any prior sender. The TUI drops the receiver on shutdown; a sender held
+    /// here keeps the channel half-open, so [`clear`] on shutdown is advised.
+    pub fn install(&self, tx: tokio::sync::mpsc::UnboundedSender<()>) {
+        *self.tx.lock().unwrap() = Some(tx);
+    }
+
+    /// Signal a reload (plugin-initiated via `runtime_action(Reload)`).
+    /// `Ok(())` if a TUI is installed (the signal was enqueued; the TUI may
+    /// still be mid-reload). `Err(())` if no TUI is installed (the host returns
+    /// a "reload not available" error to the plugin).
+    pub fn signal(&self) -> Result<(), ()> {
+        let g = self.tx.lock().unwrap();
+        match &*g {
+            Some(tx) => {
+                let _ = tx.send(());
+                Ok(())
+            }
+            None => Err(()),
+        }
+    }
+
+    /// Drop the installed sender (TUI shutdown). Idempotent.
+    pub fn clear(&self) {
+        *self.tx.lock().unwrap() = None;
+    }
+}
+
+/// Build the reload callback the bridge carries, backed by a [`ReloadMailbox`].
+/// When a plugin calls `runtime_action(Reload)`, the bridge's spawn site awaits
+/// this callback, which signals the TUI (if installed) and returns; the plugin
+/// receives `Ok(null)` and the TUI performs the reload asynchronously. If no
+/// TUI is installed, the callback returns without signalling and the host's
+/// [`RuntimeActionHost::reload`] fallback surfaces the "not configured" error.
+pub fn reload_callback_from_mailbox(
+    mailbox: ReloadMailbox,
+) -> Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync> {
+    Arc::new(move || {
+        let m = mailbox.clone();
+        Box::pin(async move {
+            let _ = m.signal();
+        })
+    })
 }
 
 // `Handle` is Send+Sync, `Arc<dyn RuntimeActionHost>` (with `Send + Sync` bound)
@@ -222,6 +339,27 @@ fn run_action(
     // harness lifetime; `Arc::as_ptr` is pointer-stable while any clone lives.
     // We only borrow for the duration of this call.
     let bridge: &ActionBridge = unsafe { &*(user_data as *const ActionBridge) };
+
+    // B5d staleness guard: a `/reload` that swapped in a fresh bridge calls
+    // `invalidate` on the old one. A plugin that still holds the old pointer
+    // (stored during the prior `register`) must not drive the swapped-out
+    // session. Surface a structured "stale bridge" error so the plugin's
+    // `runtime_action` returns nonzero + `{"error": ...}` instead of racing
+    // the swap. (The new bridge's pointer was handed to the reloaded plugins;
+    // this guard only catches the race window where an old call is still parked.)
+    if !bridge.is_active() {
+        if out.is_null() {
+            return 1;
+        }
+        let json = serde_json::json!({
+            "error": "runtime_action on a stale ActionBridge (session reloaded/swapped)"
+        })
+        .to_string();
+        unsafe {
+            *out = StbString::from_string(json);
+        }
+        return 1;
+    }
 
     // Parse args. An empty/invalid JSON blob collapses to `{}` — getters ignore
     // args; setters that require a field surface a clear error string.
@@ -476,5 +614,65 @@ mod tests {
         assert_eq!(reload_calls.load(Ordering::SeqCst), 1);
         assert!(host_for_assert.saw.lock().unwrap().is_empty());
         crate::host_free_string(out);
+    }
+
+    /// B5d: an invalidated bridge rejects `runtime_action` with a stale-bridge
+    /// error instead of dispatching. A `/reload` calls `invalidate` on the old
+    /// bridge; an in-flight call that still holds the old pointer must fail
+    /// fast rather than drive the swapped-out session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn trampoline_rejects_stale_bridge_with_invalidate() {
+        let host = Arc::new(MockHost {
+            prompt: String::new(),
+            saw: Mutex::new(Vec::new()),
+        });
+        let host_for_assert = Arc::clone(&host);
+        let host_dyn: Arc<dyn RuntimeActionHost> = host;
+        let runtime = tokio::runtime::Handle::current();
+        let bridge = ActionBridge::new(runtime, host_dyn);
+        let user_data = Arc::as_ptr(&bridge) as *mut c_void;
+
+        // Invalidate (as a `/reload` would on the old bridge).
+        bridge.invalidate();
+        assert!(!bridge.is_active());
+
+        let args_ref = StbStringRef::from_str("{}");
+        let mut out = StbString::empty();
+        let rc = trampoline_runtime_action(
+            RuntimeActionId::GetSystemPrompt,
+            args_ref,
+            &mut out as *mut StbString,
+            user_data,
+        );
+        // Nonzero (error), and the host method never ran (no dispatch).
+        assert_eq!(rc, 1, "stale bridge ⇒ error return code");
+        let json_text = out.to_string_lossy();
+        assert!(
+            json_text.contains("stale"),
+            "stale-bridge error payload: {json_text}"
+        );
+        crate::host_free_string(out);
+        assert!(
+            host_for_assert.saw.lock().unwrap().is_empty(),
+            "host dispatch must NOT run on a stale bridge"
+        );
+    }
+
+    /// `ReloadMailbox` + `reload_callback_from_mailbox` round-trip: signalling
+    /// fires the installed receiver; an uninstalled mailbox yields `Err` (the
+    /// host's "not configured" fallback). Exercises the B5d reload-signal path
+    /// the TUI installs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reload_mailbox_signals_installed_receiver() {
+        let mailbox = ReloadMailbox::new();
+        // No receiver installed yet ⇒ signal fails.
+        assert!(matches!(mailbox.signal(), Err(())));
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        mailbox.install(tx);
+        let cb = reload_callback_from_mailbox(mailbox.clone());
+        cb().await;
+        assert_eq!(rx.recv().await, Some(()), "installed receiver saw the signal");
+        mailbox.clear();
     }
 }

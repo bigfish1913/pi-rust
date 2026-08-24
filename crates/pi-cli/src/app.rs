@@ -141,8 +141,8 @@ pub async fn run() -> i32 {
     let model_catalog = crate::provider::available_catalog(&resolved);
 
     // ---- harness build ----
-    let (harness, event_rx) = match build(&resolved, &parsed, &cwd).await {
-        Ok(pair) => pair,
+    let (harness, event_rx, reload_context) = match build(&resolved, &parsed, &cwd).await {
+        Ok(triple) => triple,
         Err(e) => {
             print_build_error(&e);
             return EXIT_RUNTIME;
@@ -181,6 +181,7 @@ pub async fn run() -> i32 {
                 initial.clone(),
                 &extra,
                 resolved.theme.as_deref(),
+                &reload_context,
             )
             .await
         }

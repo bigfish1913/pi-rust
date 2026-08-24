@@ -93,6 +93,12 @@ struct CommandContext {
     /// Captured once at TUI startup because the blocking submit thread can't
     /// `.await get_resources()`.
     resources: Arc<rpi_harness::types::AgentHarnessResources>,
+    /// B5d: the reload context `/reload` drives. `Arc<ReloadContext>` so the
+    /// blocking submit thread can cheaply clone it into the `ReloadCommand`
+    /// without an `.await` (the command can't drive reload directly — it signals
+    /// the main loop via `TuiMessage::ReloadExtensions`, which awaits the shared
+    /// `reload_extension_resources` routine on the async runtime).
+    reload_context: Arc<crate::session::ReloadContext>,
 }
 
 /// One slash command.
@@ -637,6 +643,37 @@ impl SlashCommand for ContextCommand {
     }
 }
 
+/// `/reload` — re-run extension + resource discovery into the LIVE harness
+/// (B5d): reload the cdylib plugins, invalidate the old `ActionBridge` +
+/// registry snapshot, rebuild skills/prompts/context/SYSTEM.md/APPEND_SYSTEM.md
+/// + the `TeeEmitter`, and push the rebuilt state via the B5d harness setters.
+/// The command itself runs on the blocking submit thread, so it can't drive
+/// the async `reload_extension_resources` routine directly — it signals the main
+/// loop via `TuiMessage::ReloadExtensions`, which awaits it on the async runtime.
+/// (A plugin's `runtime_action(Reload)` signals the same loop via the
+/// `ReloadMailbox` the TUI installs — the B5d async-reload design avoids the
+/// self-unmapping race a synchronous plugin-initiated reload would have.)
+struct ReloadCommand;
+impl SlashCommand for ReloadCommand {
+    fn name(&self) -> &'static str {
+        "/reload"
+    }
+    fn description(&self) -> &'static str {
+        "Reload extensions, skills, prompts"
+    }
+    fn execute(&self, ctx: &CommandContext, _args: &str) {
+        // Signal the main loop. It owns the `&AgentHarness` borrow the
+        // `reload_extension_resources` routine needs (the blocking submit thread
+        // only has the context's `Arc<ReloadContext>` + the `Arc<dyn AgentLane>`).
+        add_note_message(
+            &ctx.chat,
+            "Reloading extensions + resources…",
+        );
+        ctx.tui.request_render(false);
+        let _ = ctx.tx.send(TuiMessage::ReloadExtensions);
+    }
+}
+
 /// Build the full command registry: active built-ins first (so they win on a
 /// fuzzy autocomplete tie), then the v1-out-of-scope stubs. Prompt-template
 /// commands are merged in separately by the autocomplete builder (they dispatch
@@ -689,10 +726,7 @@ fn build_builtin_registry() -> CommandRegistry {
         "/logout",
         "Remove provider authentication",
     )));
-    r.register(Arc::new(UnsupportedCommand::new(
-        "/reload",
-        "Reload keybindings, extensions, skills, prompts",
-    )));
+    r.register(Arc::new(ReloadCommand));
     r
 }
 
@@ -726,6 +760,11 @@ enum TuiMessage {
     /// Share the current session (`/share`): `gh gist create` when the gh CLI
     /// is available, otherwise copy the transcript to the clipboard.
     ShareSession,
+    /// `/reload` — re-run extension + resource discovery into the live harness
+    /// (B5d). The command (and a plugin's `runtime_action(Reload)` via the
+    /// mailbox) signal the main loop, which awaits
+    /// `reload_extension_resources` on the async runtime.
+    ReloadExtensions,
 }
 
 /// Extract the concatenated text content from an assistant message (mirrors
@@ -1813,6 +1852,7 @@ pub async fn interactive_tui(
     initial: Option<String>,
     extra_messages: &[String],
     theme: Option<&str>,
+    reload_context: &crate::session::ReloadContext,
 ) -> i32 {
     let lane: Arc<dyn AgentLane> = harness.lane("main");
 
@@ -2048,6 +2088,7 @@ pub async fn interactive_tui(
         lane_model_id: lane_model_id.clone(),
         cwd: cwd.clone(),
         resources: resources_arc.clone(),
+        reload_context: Arc::new(reload_context.clone()),
     };
     let ctx_for_cb = ctx.clone();
     let registry_for_cb = registry.clone();
@@ -2083,6 +2124,27 @@ pub async fn interactive_tui(
     } else {
         None
     };
+
+    // ---- B5d: plugin→TUI reload bridge ----
+    // A plugin's `runtime_action(Reload)` can't drive the reload synchronously
+    // (its cdylib would be unmapped while the call frame is still on the stack).
+    // Instead the `ActionBridge`'s reload callback signals `reload_context.mailbox`
+    // (an `UnboundedSender<()>`); this task drains those signals and forwards
+    // `TuiMessage::ReloadExtensions` into the main loop, which runs the shared
+    // `reload_extension_resources` routine asynchronously. The mailbox is the
+    // cycle-free seam: rpi-extensions carries only `()` (no `TuiMessage` type —
+    // leaf DAG preserved); the TUI owns the receiver + the reload routine.
+    let (reload_sig_tx, mut reload_sig_rx) =
+        tokio::sync::mpsc::unbounded_channel::<()>();
+    reload_context.mailbox.install(reload_sig_tx);
+    let reload_tx = tx.clone();
+    let reload_bridge_handle = tokio::spawn(async move {
+        while reload_sig_rx.recv().await.is_some() {
+            if reload_tx.send(TuiMessage::ReloadExtensions).is_err() {
+                break; // main loop gone — stop forwarding
+            }
+        }
+    });
 
     // ---- Render-tick task (advances the loader spinner while Working) ----
     //
@@ -2400,6 +2462,28 @@ pub async fn interactive_tui(
                 fork_session(&harness, &cwd, &chat_container, &state).await;
                 tui.request_render(false);
             }
+            Ok(TuiMessage::ReloadExtensions) => {
+                // B5d: drive the shared reload routine on the async runtime,
+                // then surface the outcome. `reload_context` was passed into
+                // `interactive_tui` and is the same `Arc<ReloadContext>` the
+                // `ReloadCommand` + the plugin mailbox both route through —
+                // clone the `Arc` out so the borrow of `harness` (the main
+                // loop's `&AgentHarness`) lives across the await.
+                let reload_ctx = ctx.reload_context.clone();
+                add_note_message(&chat_container, "Reloading extensions + resources…");
+                tui.request_render(false);
+                let outcome =
+                    crate::session::reload_extension_resources(&harness, &reload_ctx).await;
+                if outcome.had_warnings {
+                    add_error_message(
+                        &chat_container,
+                        &format!("{} (with warnings — see stderr for details).", outcome.summary),
+                    );
+                } else {
+                    add_note_message(&chat_container, &outcome.summary);
+                }
+                tui.request_render(false);
+            }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
@@ -2412,6 +2496,11 @@ pub async fn interactive_tui(
     if let Some(handle) = drain_handle {
         handle.abort();
     }
+    // Drop the reload bridge: clearing the mailbox closes the signal channel,
+    // the drain task's `recv` returns `None`, and the task exits. (Aborting is
+    // redundant — the recv terminates — but cheap + makes shutdown explicit.)
+    reload_context.mailbox.clear();
+    reload_bridge_handle.abort();
     tui.stop(Default::default());
     println!("\nGoodbye!");
     let _ = args;

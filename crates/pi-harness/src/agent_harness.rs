@@ -471,7 +471,7 @@ impl AgentHarness {
     /// wiring churn. The caller is responsible for aborting any in-flight run
     /// first.
     pub async fn set_session(&self, session: Session) -> HarnessResult<()> {
-        let mut inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap();
         if inner.closed {
             return Err(HarnessError::closed());
         }
@@ -509,6 +509,91 @@ impl AgentHarness {
             return Err(HarnessError::closed());
         }
         Ok(inner.system_prompt.clone())
+    }
+
+    // ---- B5d: reload mutation setters -------------------------------------
+    //
+    // `/reload` re-runs skill/prompt/context/SYSTEM discovery and must push the
+    // rebuilt state into a *live* harness without rebuilding it (rebuilding
+    // would tear down the session/lane/event wiring). These setters mirror
+    // `set_tools`/`set_session`: take the lock, reject if closed, assign, drop.
+    // The next `run_core` snapshots the new values via `snapshot_config`, so a
+    // mutation here takes effect on the NEXT run — exactly the contract pi's
+    // `/reload` offers (in-flight runs finish on the old config; the reloaded
+    // resources apply to the subsequent turn).
+    //
+    // All five are `pub async` (uniform with the existing setters) even though
+    // the bodies are sync; the `async` keeps the call sites uniform with
+    // `set_tools`/`set_session` and leaves room for future emission (e.g. a
+    // `ResourcesChanged` harness event) without an API break.
+
+    /// `setSystemPrompt(prompt)`. Replace the composed base system prompt the
+    /// harness was built with. B5d `/reload` calls this after recomposing
+    /// (base + context + append); the next run's `snapshot_config` picks it up.
+    pub async fn set_system_prompt(&self, prompt: Option<String>) -> HarnessResult<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.closed {
+            return Err(HarnessError::closed());
+        }
+        inner.system_prompt = prompt;
+        Ok(())
+    }
+
+    /// `setResources(resources)`. Replace the skills + prompt-templates the
+    /// harness advertises (TUI `/context` listing, `<available_skills>` gate).
+    pub async fn set_resources(&self, resources: AgentHarnessResources) -> HarnessResult<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.closed {
+            return Err(HarnessError::closed());
+        }
+        inner.resources = resources;
+        Ok(())
+    }
+    /// `setAgentEmitter(emitter)`. Replace the emitter override (B3a's
+    /// `ExtensionEmitter` fans `AgentEvent`s to plugin `on()` handlers). On
+    /// `/reload` the old emitter is dropped (unsubscribing from the broadcast)
+    /// and a fresh one over the reloaded registry takes its place.
+    pub async fn set_agent_emitter(
+        &self,
+        emitter: Option<Arc<dyn AgentEmitter>>,
+    ) -> HarnessResult<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.closed {
+            return Err(HarnessError::closed());
+        }
+        inner.agent_emitter = emitter;
+        Ok(())
+    }
+
+    /// `setModels(models)`. Replace the provider registry. B5d `/reload`
+    /// rebuilds `vec![gateway] + PluggableProvider::from_session(&new_session)`
+    /// and installs it here so the next run resolves provider plugins from the
+    /// reloaded registry (the old `ActionBridge`/`ExtensionSession` are
+    /// invalidated; their `PluggableProvider`s reject calls via the staleness
+    /// guard).
+    pub async fn set_models(&self, models: Vec<Arc<dyn AiProvider>>) -> HarnessResult<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.closed {
+            return Err(HarnessError::closed());
+        }
+        inner.models = models;
+        Ok(())
+    }
+
+    /// `setProviderHooks(hooks)`. Replace the per-call provider hooks (B4's
+    /// `ExtensionProviderHooks` fires `before_request`/`after_response` inside
+    /// the `StreamFn` closure). `/reload` builds a fresh hooks adapter over the
+    /// reloaded registry snapshot.
+    pub async fn set_provider_hooks(
+        &self,
+        hooks: Option<Arc<dyn rpi_ai::ProviderHooks>>,
+    ) -> HarnessResult<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.closed {
+            return Err(HarnessError::closed());
+        }
+        inner.provider_hooks = hooks;
+        Ok(())
     }
 
     // -- private helpers ----------------------------------------------------

@@ -29,7 +29,8 @@
 //!   message rather than silently starting fresh. See [`SessionSelection`].
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 
 use rpi_ai::Provider;
 use rpi_harness::agent_harness::AgentHarness;
@@ -155,6 +156,10 @@ pub fn default_session_dir(cwd: &Path) -> PathBuf {
 /// live `AgentEvent` stream from every run (backed by a `BroadcastEmitter`
 /// installed on the harness). Interactive mode drains this to render streaming
 /// responses; the non-interactive modes simply drop it.
+/// Returns the harness, the live `AgentEvent` broadcast receiver, and a
+/// [`ReloadContext`] the interactive TUI holds to drive `/reload` (and a
+/// plugin's `runtime_action(Reload)` via the mailbox). Non-interactive modes
+/// drop the context (no `/reload` surface in print/json mode).
 pub async fn build(
     resolved: &ResolvedModel,
     args: &Args,
@@ -163,6 +168,7 @@ pub async fn build(
     (
         AgentHarness,
         tokio::sync::broadcast::Receiver<rpi_agent::AgentEvent>,
+        ReloadContext,
     ),
     BuildError,
 > {
@@ -186,14 +192,26 @@ pub async fn build(
         .map_err(|e| BuildError::HarnessCreate(format!("no tokio runtime for action bridge: {e}")))?;
     let catalog = crate::provider::available_catalog(resolved);
     let (action_host, harness_cell) = crate::extensions_actions::HarnessActionHost::new_empty(
-        catalog,
+        catalog.clone(),
         cwd.to_path_buf(),
         runtime.clone(),
     );
     let host_arc: Arc<dyn rpi_extensions::RuntimeActionHost> = Arc::new(action_host);
     // `runtime` is reused below (B5c: `PluggableProvider` needs a captured
     // `Handle` to `spawn_blocking` the sync `ProviderRequestFn`), so clone here.
-    let action_bridge = rpi_extensions::ActionBridge::new(runtime.clone(), host_arc);
+    //
+    // B5d: build the initial bridge WITH a reload callback backed by a session-
+    // long `ReloadMailbox` (cloned into `ReloadContext` + handed to the TUI). A
+    // plugin's `runtime_action(Reload)` then signals the TUI's main loop instead
+    // of hitting the "not configured" fallback. The same mailbox is reused on
+    // `/reload` (the fresh bridge carries `ctx.mailbox`), so the bridge always
+    // points at the one TUI-installed sender across reloads.
+    let reload_mailbox = rpi_extensions::ReloadMailbox::new();
+    let action_bridge = rpi_extensions::ActionBridge::with_reload(
+        runtime.clone(),
+        host_arc,
+        rpi_extensions::reload_callback_from_mailbox(reload_mailbox.clone()),
+    );
 
     // ---- Execution env + tools ----
     let env = Arc::new(OsExecutionEnv::with_cwd(cwd.to_path_buf()));
@@ -436,6 +454,10 @@ pub async fn build(
     // is returned alongside the harness; non-interactive modes simply drop it.
     let (broadcast, event_rx) = rpi_agent::events::BroadcastEmitter::new(256);
     let broadcast_emitter: Arc<dyn rpi_agent::AgentEmitter> = Arc::new(broadcast);
+    // The broadcast half stays live for the whole session (the TUI's drain task
+    // holds the receiver); reload re-wraps it in a fresh `TeeEmitter`, so keep
+    // a clone for the `ReloadContext` before the tee match consumes the original.
+    let broadcast_for_context: Arc<dyn rpi_agent::AgentEmitter> = Arc::clone(&broadcast_emitter);
 
     // ---- Extensions emitter (Part B3a) ----
     // If extensions loaded + registered any `on()` handlers, wrap the
@@ -516,18 +538,413 @@ pub async fn build(
         .map(|h| Arc::new(h) as Arc<dyn rpi_ai::ProviderHooks>),
     };
 
-    AgentHarness::create(options)
-        .await
-        .map(|harness| {
+    let harness = match AgentHarness::create(options).await {
+        Ok(h) => {
             // Fill the extension action host now that the harness exists
             // (plugin runtime_action calls can then reach it).
             crate::extensions_actions::HarnessActionHost::set_harness(
                 &harness_cell,
+                Arc::new(h.clone()),
+            );
+            h
+        }
+        Err(e) => return Err(BuildError::HarnessCreate(e.to_string())),
+    };
+
+    // ---- B5d: assemble the ReloadContext the TUI holds ----
+    // Every field is cheap to clone (Arc / Vec / args Clone). The cells own the
+    // live session + bridge so `/reload` can swap them; the harness itself is
+    // NOT held here (the TUI already owns a `&AgentHarness` / clone at the call
+    // site — passing it into `reload_extension_resources` keeps this structfree
+    // of a harness back-reference so it can be `Clone` into the reload callback).
+    let reload_context = ReloadContext {
+        extension_session: Arc::new(Mutex::new(extension_session)),
+        action_bridge: Arc::new(Mutex::new(Some(Arc::clone(&action_bridge)))),
+        catalog,
+        gateway: resolved.provider.clone(),
+        runtime: runtime.clone(),
+        cwd: cwd.to_path_buf(),
+        args: args.clone(),
+        resolved_model: resolved.model.clone(),
+        broadcast: broadcast_for_context,
+        mailbox: reload_mailbox,
+    };
+
+    Ok((harness, event_rx, reload_context))
+}
+
+// ===========================================================================
+// B5d — `/reload`: re-run extension + resource discovery into a LIVE harness
+// ===========================================================================
+//
+// `/reload` (interactive TUI command, or a plugin's `runtime_action(Reload)`)
+// re-runs everything `build` did around resources/extensions WITHOUT rebuilding
+// the `AgentHarness` itself (rebuilding would tear down the session/lane/event
+// wiring + the broadcast drain task the TUI owns). Instead it:
+//
+//  1. Builds a fresh `ExtensionSession` (re-load the cdylibs) over the same
+//     dir set, with a FRESH `ActionBridge` (the old one is `invalidate`d so
+//     in-flight plugin→host calls on the old bridge fail fast).
+//  2. Fans `resources_discover(_, "reload")` over the fresh snapshot.
+//  3. Re-runs the Part-A loaders (skills/prompts/context/SYSTEM.md/
+//     APPEND_SYSTEM.md) with the discovered paths merged in — same precedence
+//     + `--no-*` gates as startup.
+//  4. Rebuilds the harness's live state via the B5d setters
+//     (`set_system_prompt`/`set_resources`/`set_agent_emitter`/`set_models`/
+//     `set_provider_hooks`/`set_tools`) so the NEXT run observes the reloaded
+//     config (in-flight runs finish on the old `ConfigSnapshot`).
+//  5. Swaps the cells (`ExtensionSession`, `ActionBridge`, harness action
+//     host's harness cell stays — the harness is the same object) and drops
+//     the old session + bridge (their keepalives unmap the old cdylibs; the
+//     new session's keepalive holds the fresh mappings).
+//
+// The reload is a `rpi-cli` concern (NOT a harness op): `rpi-extensions`
+// carries only the `ActionBridge` staleness flag + a `ReloadMailbox` `()` signal
+// (no pi-cli `TuiMessage` type — leaf DAG preserved). The TUI owns the mailbox
+// receiver + the actual reload routine; a plugin's
+// `runtime_action(Reload)` signals the mailbox and returns `Ok(null)`
+// immediately so the calling plugin's cdylib is NOT unmapped while its
+// `runtime_action` frame is still on the stack (the self-unmapping race a
+// synchronous plugin-initiated reload would have).
+//
+// `reload_extension_resources` is the shared routine both `/reload` (TUI) and
+// a plugin's `runtime_action(Reload)` (via the mailbox) drive. It is `pub` so
+// the TUI's main-loop handler + the mailbox-driven path call the same code.
+
+/// The cell that holds the live `ExtensionSession` across a `/reload`. Cloned
+/// into every site that needs the current session (the TUI, the reload
+/// callback). On reload the old session is `replace`d out (its `active` flag
+/// flipped + its keepalive dropped, unmapping the old cdylibs) and the fresh one
+/// `store`d. Carried as a plain `ExtensionSession` (not `Option`) — a `none()`
+/// placeholder fills the slot while the fresh one is being built.
+pub type ExtensionSessionCell = Arc<Mutex<ExtensionSession>>;
+
+/// The cell that holds the live `ActionBridge` across a `/reload`. A plugin
+/// stores the bridge's raw `user_data` pointer during `register`; on reload the
+/// old bridge is `invalidate`d (in-flight calls fail fast) and the fresh one
+/// `store`d. The fresh session's plugins are handed the fresh bridge pointer.
+pub type ActionBridgeCell = Arc<Mutex<Option<Arc<rpi_extensions::ActionBridge>>>>;
+
+/// Everything `/reload` needs to rebuild extension + resource state into a live
+/// harness. Built once in [`build`] (alongside the harness) and held by the TUI
+/// (cloned into the reload callback the bridge carries + the `/reload` command
+/// handler). The harness itself is NOT held here — the TUI already owns a
+/// `&AgentHarness` / a clone; passing it at the call site keeps this struct
+/// free of a harness back-reference (so it can be `Clone` and moved into the
+/// reload callback without borrowing the harness).
+#[derive(Clone)]
+pub struct ReloadContext {
+    /// The live extension-session cell (swapped on reload).
+    pub extension_session: ExtensionSessionCell,
+    /// The live action-bridge cell (swapped + old invalidated on reload).
+    pub action_bridge: ActionBridgeCell,
+    /// The model catalog (read-only) the host uses to resolve `set_model(id)`.
+    /// `available_catalog(resolved)` is captured once — reload does not re-resolve
+    /// the provider (auth/provider resolution is a startup concern; reloading
+    /// extensions does not re-open auth).
+    pub catalog: Vec<rpi_ai::Model>,
+    /// The resolved gateway provider clone (for rebuilding `models` =
+    /// `vec![gateway] + PluggableProvider::from_session`). Cheap to clone (`Arc`).
+    pub gateway: Arc<dyn Provider>,
+    /// The ambient runtime handle (captured in `build`) — `PluggableProvider`
+    /// + the fresh `ActionBridge` need a captured `Handle` to spawn from any
+    /// thread.
+    pub runtime: tokio::runtime::Handle,
+    /// The cwd (for static resource-dir resolution + context-file walk).
+    pub cwd: PathBuf,
+    /// The parsed args (cloned) — `--no-*`/`--tools`/`--exclude-tools`/
+    /// `--extensions-dir`/`--no-extensions`/`--system-prompt`/etc all apply on
+    /// reload exactly as at startup (a reload re-reads the same flags; it does
+    /// not pick up argv changes mid-session, which is the right contract — pi's
+    /// `/reload` re-runs discovery with the same config).
+    pub args: Args,
+    /// The resolved model + thinking level (the harness's active model stays
+    /// unless `set_model` changed it; reload does not touch the model).
+    pub resolved_model: rpi_ai::Model,
+    /// The broadcast emitter the harness was built with. Reload rebuilds the
+    /// `TeeEmitter` over the fresh `ExtensionEmitter` (the old tee's extension
+    /// child is dropped, unsubscribing from the old registry). The broadcast
+    /// half stays live the whole session (the TUI's drain task holds the
+    /// receiver), so we keep a handle to re-wrap.
+    pub broadcast: Arc<dyn rpi_agent::AgentEmitter>,
+    /// The session-long reload mailbox (B5d). Build creates one, installs it on
+    /// the initial `ActionBridge` via [`reload_callback_from_mailbox`], and hands
+    /// a clone to the TUI. The TUI installs its `TuiMessage` sender so a plugin's
+    /// `runtime_action(Reload)` signals the main loop — the reload routine reuses
+    /// THIS mailbox (not a fresh default) when building the fresh bridge, so the
+    /// bridge always carries the mailbox the TUI installed across reloads.
+    pub mailbox: rpi_extensions::ReloadMailbox,
+}
+
+/// The outcome of a reload: a human-readable status line for the transcript
+/// (counts of what reloaded), and whether any load diagnostics appeared.
+pub struct ReloadOutcome {
+    /// One-line summary for the transcript note (e.g. "Reloaded 2 plugin(s),
+    /// 5 skill(s), 1 prompt(s).").
+    pub summary: String,
+    /// True iff at least one extension load warning fired (ABI mismatch / skip).
+    pub had_warnings: bool,
+}
+
+/// Re-run extension + resource discovery and push the rebuilt state into the
+/// live `harness` via the B5d setters. The old `ExtensionSession` +
+/// `ActionBridge` are invalidated + swapped in [`ReloadContext`]'s cells. This
+/// is the single routine both `/reload` (TUI) and a plugin's
+/// `runtime_action(Reload)` drive (the latter via the mailbox signal).
+///
+/// Returns a [`ReloadOutcome`] for the transcript. Best-effort: a failure in
+/// one channel (e.g. a plugin that fails to reload) does not abort the others —
+/// the reload completes with whatever loaded, mirroring pi's per-plugin
+/// skip-on-error. A hard failure (e.g. the harness is closed) surfaces as an
+/// error summary.
+pub async fn reload_extension_resources(
+    harness: &AgentHarness,
+    ctx: &ReloadContext,
+) -> ReloadOutcome {
+    let cwd_str = ctx.cwd.to_string_lossy().to_string();
+    let mut warnings = false;
+
+    // ---- 1. Build a fresh ActionBridge + ExtensionSession ----
+    // The fresh bridge carries the SAME `HarnessActionHost` (the host's harness
+    // cell already points at this harness; the host impl is reusable across
+    // reloads — only the bridge's staleness flag + reload callback differ). We
+    // re-use the host by reading it off the OLD bridge (it's the same
+    // `Arc<dyn RuntimeActionHost>`).
+    let old_bridge = ctx.action_bridge.lock().unwrap().clone();
+    let host: Arc<dyn rpi_extensions::RuntimeActionHost> = match &old_bridge {
+        Some(b) => b.clone_host(),
+        None => {
+            // No prior bridge (no extensions ever loaded). Build a fresh host so
+            // a reload that newly discovers plugins can still drive actions.
+            let (action_host, _cell) =
+                crate::extensions_actions::HarnessActionHost::new_empty(
+                    ctx.catalog.clone(),
+                    ctx.cwd.clone(),
+                    ctx.runtime.clone(),
+                );
+            crate::extensions_actions::HarnessActionHost::set_harness(
+                &_cell,
                 Arc::new(harness.clone()),
             );
-            (harness, event_rx)
-        })
-        .map_err(|e| BuildError::HarnessCreate(e.to_string()))
+            Arc::new(action_host)
+        }
+    };
+
+    let reload_cb = rpi_extensions::reload_callback_from_mailbox(ctx.mailbox.clone());
+    let fresh_bridge =
+        rpi_extensions::ActionBridge::with_reload(ctx.runtime.clone(), host, reload_cb);
+
+    let extension_session = if ctx.args.no_extensions {
+        rpi_extensions::ExtensionSession::none()
+    } else {
+        load_extensions(&ctx.args, &ctx.cwd, Some(Arc::clone(&fresh_bridge)))
+    };
+    if extension_session.is_empty() && !ctx.args.no_extensions {
+        // The fresh session may be empty if no cdylibs are present — not a
+        // warning per se, but note it.
+    }
+    if ctx.args.verbose {
+        if let Some(s) = extension_session.summary() {
+            eprintln!("reload: {s}");
+        }
+    }
+
+    // ---- 2. Invalidate the old session + bridge BEFORE the swap ----
+    // The old registry's `active` flag flips false so any in-flight
+    // `emit_resources_discover`/event dispatch on the old snapshot no-ops; the
+    // old bridge's flag flips false so in-flight `runtime_action` calls parked
+    // on the old `user_data` hit the staleness guard. We do this BEFORE storing
+    // the fresh session so there is no window where both are "active".
+    //
+    // The session cell carries a plain `ExtensionSession` (not `Option`), so we
+    // `mem::replace` the live one out with a `none()` placeholder to extract it
+    // for invalidation (the snapshot's `active` flag is on a shared `Arc`, so a
+    // borrow of the extracted value is enough to flip it; the extraction itself
+    // also drops the old keepalive once we drop `old_session`, unmapping the old
+    // cdylibs). `mem::replace` (not `.take()`) because the cell is not `Option`.
+    {
+        let mut session_guard = ctx.extension_session.lock().unwrap();
+        let old_session =
+            std::mem::replace(&mut *session_guard, rpi_extensions::ExtensionSession::none());
+        if let Some(old_snap) = old_session.snapshot_arc() {
+            // `invalidate` is on the registry, but the snapshot shares the flag —
+            // flipping the snapshot's flag invalidates the registry too (same Arc).
+            // `RegistrySnapshot` exposes `active_flag()` for this.
+            old_snap.active_flag().store(false, Ordering::SeqCst);
+        }
+        // `old_session` drops here — its keepalive releases the old `Library`
+        // handles (unmapping the old cdylibs). The fresh session's keepalive
+        // (built below) holds the fresh mappings.
+    }
+    if let Some(old_b) = old_bridge {
+        old_b.invalidate();
+    }
+
+    // The fresh bridge is now the live one. Store it + the fresh session so
+    // subsequent reloads (or plugin calls still resolving the cells) see them.
+    *ctx.action_bridge.lock().unwrap() = Some(Arc::clone(&fresh_bridge));
+    *ctx.extension_session.lock().unwrap() = extension_session.clone();
+
+    // ---- 3. resources_discover ("reload") over the fresh snapshot ----
+    let discovered = extension_session
+        .snapshot_arc()
+        .map(|snap| rpi_extensions::emit_resources_discover(&cwd_str, "reload", &snap))
+        .unwrap_or_default();
+
+    // ---- 4. Re-run the Part-A loaders (same precedence + --no-* gates) ----
+    let env = Arc::new(rpi_tools::OsExecutionEnv::with_cwd(ctx.cwd.clone()));
+    let env_dyn: Arc<dyn rpi_tools::ExecutionEnv> = env.clone();
+
+    let mut skills: Vec<rpi_harness::types::Skill> = Vec::new();
+    let mut skill_diags: Vec<rpi_harness::skills::SkillDiagnostic> = Vec::new();
+    if !ctx.args.no_skills {
+        let mut dirs = skill_dirs(&ctx.cwd);
+        dirs.extend(discovered.skill_paths.iter().map(PathBuf::from));
+        let result = load_skills_with_precedence(&env_dyn, &dirs).await;
+        skills = result.skills;
+        skill_diags = result.diagnostics;
+    }
+
+    let mut prompt_templates: Vec<rpi_harness::types::PromptTemplate> = Vec::new();
+    let mut prompt_diags: Vec<rpi_harness::prompt_templates::PromptTemplateDiagnostic> = Vec::new();
+    if !ctx.args.no_prompt_templates {
+        let mut dirs = prompt_template_dirs(&ctx.cwd);
+        dirs.extend(discovered.prompt_paths.iter().map(PathBuf::from));
+        let result = load_prompt_templates_with_precedence(&env_dyn, &dirs).await;
+        prompt_templates = result.prompt_templates;
+        prompt_diags = result.diagnostics;
+    }
+
+    let context_block = if ctx.args.no_context_files {
+        String::new()
+    } else {
+        let agent_dir = crate::config::agent_dir().ok();
+        let agent_dir_path = agent_dir.unwrap_or_else(|| ctx.cwd.clone());
+        let files = load_project_context_files(&env_dyn, &ctx.cwd, &agent_dir_path).await;
+        format_project_context(&files)
+    };
+
+    if !skill_diags.is_empty() || !prompt_diags.is_empty() {
+        warnings = true;
+        if ctx.args.verbose {
+            for d in &skill_diags {
+                eprintln!("warning: skill {} ({}): {}", d.path, d.code.as_str(), d.message);
+            }
+            for d in &prompt_diags {
+                eprintln!(
+                    "warning: prompt template {} ({}): {}",
+                    d.path,
+                    d.code.as_str(),
+                    d.message
+                );
+            }
+        }
+    }
+
+    // ---- Re-compose the system prompt (same precedence as build) ----
+    let base_prompt = match ctx.args.system_prompt.as_deref() {
+        Some(explicit) => explicit.to_string(),
+        None => match discover_system_prompt_file(&ctx.cwd) {
+            Some(path) => std::fs::read_to_string(&path)
+                .unwrap_or_else(|_| default_system_prompt(&cwd_str)),
+            None => default_system_prompt(&cwd_str),
+        },
+    };
+    let mut append_texts: Vec<String> = Vec::new();
+    for extra in &ctx.args.append_system_prompt {
+        let text = read_append_target(extra).unwrap_or_else(|| extra.clone());
+        append_texts.push(text);
+    }
+    if ctx.args.append_system_prompt.is_empty() {
+        if let Some(path) = discover_append_system_prompt_file(&ctx.cwd) {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                append_texts.push(text);
+            }
+        }
+    }
+    let append_join = if append_texts.is_empty() {
+        None
+    } else {
+        Some(append_texts.join("\n\n"))
+    };
+    let system_prompt = compose_system_prompt(
+        Some(&base_prompt),
+        &[],
+        if context_block.is_empty() { None } else { Some(&context_block) },
+        append_join.as_deref(),
+    );
+
+    // ---- Rebuild the emitter (TeeEmitter over fresh ExtensionEmitter) ----
+    let emitter: Arc<dyn rpi_agent::AgentEmitter> =
+        match extension_session.snapshot_arc() {
+            Some(snapshot) => {
+                let ext = ExtensionEmitter::new(snapshot, extension_session.keepalive());
+                Arc::new(TeeEmitter::new(vec![
+                    ctx.broadcast.clone(),
+                    Arc::new(ext),
+                ]))
+            }
+            None => ctx.broadcast.clone(),
+        };
+
+    // ---- 5. Push the rebuilt state into the live harness via the B5d setters ----
+    let resources = AgentHarnessResources {
+        skills: if skills.is_empty() { None } else { Some(skills.clone()) },
+        prompt_templates: if prompt_templates.is_empty() {
+            None
+        } else {
+            Some(prompt_templates.clone())
+        },
+    };
+    let _ = harness.set_system_prompt(Some(system_prompt)).await;
+    let _ = harness.set_resources(resources).await;
+    let _ = harness.set_agent_emitter(Some(emitter)).await;
+    let _ = harness
+        .set_models(build_models_with_extensions_for_reload(
+            &ctx.gateway,
+            &extension_session,
+            ctx.runtime.clone(),
+        ))
+        .await;
+    let _ = harness
+        .set_provider_hooks(
+            rpi_extensions::ExtensionProviderHooks::from_session(&extension_session)
+                .map(|h| Arc::new(h) as Arc<dyn rpi_ai::ProviderHooks>),
+        )
+        .await;
+
+    // Re-merge extension tools (a reloaded plugin may have added/removed a
+    // tool). The built-in set is rebuilt from scratch + extension tools merged
+    // on top, mirroring `build`.
+    let mut_env: Arc<dyn rpi_tools::MutatingEnv> = env.clone();
+    let tool_ctx = rpi_tools::ExecutionToolContext::new(env_dyn.clone(), Some(mut_env));
+    let mut tools = build_tools(&tool_ctx, &ctx.args);
+    merge_extension_tools(&mut tools, &extension_session, &ctx.args);
+    let active = active_tool_names(&tools, &ctx.args);
+    let _ = harness.set_tools(tools, Some(active)).await;
+
+    let summary = format!(
+        "Reloaded {} plugin(s), {} skill(s), {} prompt(s).",
+        extension_session.loaded_paths().len(),
+        skills.len(),
+        prompt_templates.len(),
+    );
+    ReloadOutcome { summary, had_warnings: warnings }
+}
+
+/// `build_models_with_extensions` for the reload path: the resolved gateway
+/// (NOT `resolved` — the reload context carries the gateway `Arc<dyn Provider>`
+/// directly, since the provider/auth did not change) first, then one
+/// `PluggableProvider` per registered extension provider in the fresh session.
+fn build_models_with_extensions_for_reload(
+    gateway: &Arc<dyn Provider>,
+    extension_session: &ExtensionSession,
+    runtime: tokio::runtime::Handle,
+) -> Vec<Arc<dyn Provider>> {
+    let mut models: Vec<Arc<dyn Provider>> = vec![gateway.clone()];
+    let pluggable = rpi_extensions::PluggableProvider::from_session(extension_session, runtime);
+    models.extend(pluggable);
+    models
 }
 
 /// A harness-build error.

@@ -295,6 +295,13 @@ impl PluginKeepalive {
 /// [`ExtensionEmitter`](crate::ExtensionEmitter) (installed as the harness's
 /// `agent_emitter`) without borrowing — the emitter must outlive this session
 /// local (it lives for the harness lifetime inside `AgentHarnessOptions`).
+///
+/// `Clone` (B5d): every field is already cheaply clonable (`Arc<PluginKeepalive>`,
+/// `Option<Arc<RegistrySnapshot>>`, `Vec<PathBuf>`, `Option<Arc<ActionBridge>>`),
+/// so the reload routine can clone the live session out of its `Mutex` cell for
+/// local inspection (snapshot/keepalive/loaded_paths) and store a fresh one back
+/// in — without a borrow spanning the store.
+#[derive(Clone)]
 pub struct ExtensionSession {
     keepalive: Arc<PluginKeepalive>,
     snapshot: Option<Arc<RegistrySnapshot>>,
