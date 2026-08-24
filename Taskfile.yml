@@ -3,8 +3,12 @@
 # The release.ps1 / release.sh scripts were removed (commit 2e5fe54); the
 # dep-ordered publish is now driven directly by the targets below via plain
 # `cargo publish`. Keep this file as the ergonomic entry point so the
-# dependency order (telemetry → ai → agent → tools → harness → cli) is encoded
-# once and `cargo test` stays the pre-flight.
+# dependency order is encoded once and `cargo test` stays the pre-flight.
+#
+# Dependency order (v0.1.4+): telemetry → ai → agent → plugin-sdk →
+# extensions → tools → harness → tui → cli. plugin-sdk is a zero-dep leaf
+# and extensions depends on plugin-sdk + ai + agent, so both land before
+# tools/harness (which are independent of them but published in family order).
 #
 # Usage:
 #   task              # list targets
@@ -30,8 +34,11 @@ tasks:
       - cargo publish --dry-run -p rpi-telemetry
       - cargo publish --dry-run -p rpi-ai
       - cargo publish --dry-run -p rpi-agent
+      - cargo publish --dry-run -p rpi-plugin-sdk
+      - cargo publish --dry-run -p rpi-extensions
       - cargo publish --dry-run -p rpi-tools
       - cargo publish --dry-run -p rpi-harness
+      - cargo publish --dry-run -p rpi-tui
       - cargo publish --dry-run -p rpi-cli
 
   publish:
@@ -41,8 +48,11 @@ tasks:
       - cargo publish -p rpi-telemetry
       - cargo publish -p rpi-ai
       - cargo publish -p rpi-agent
+      - cargo publish -p rpi-plugin-sdk
+      - cargo publish -p rpi-extensions
       - cargo publish -p rpi-tools
       - cargo publish -p rpi-harness
+      - cargo publish -p rpi-tui
       - cargo publish -p rpi-cli
 
   publish:fast:
@@ -51,8 +61,11 @@ tasks:
       - cargo publish -p rpi-telemetry
       - cargo publish -p rpi-ai
       - cargo publish -p rpi-agent
+      - cargo publish -p rpi-plugin-sdk
+      - cargo publish -p rpi-extensions
       - cargo publish -p rpi-tools
       - cargo publish -p rpi-harness
+      - cargo publish -p rpi-tui
       - cargo publish -p rpi-cli
 
   test:
