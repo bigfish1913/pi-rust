@@ -176,6 +176,22 @@ pub async fn build(
     let tools = build_tools(&ctx, args);
     let mut tools = tools;
 
+    // ---- Extension action bridge (B-series) ----
+    // Plugins' `runtime_action` trampolines dispatch through this bridge into
+    // the harness host (send_message / set_model / switch_session / fork / …).
+    // The host is built empty and filled with the harness right after
+    // `AgentHarness::create` succeeds (plugins may only act once the session
+    // exists).
+    let (action_host, harness_cell) = crate::extensions_actions::HarnessActionHost::new_empty(
+        crate::provider::available_catalog(resolved),
+        cwd.to_path_buf(),
+        tokio::runtime::Handle::current(),
+    );
+    let action_bridge = rpi_extensions::ActionBridge::new(
+        tokio::runtime::Handle::current(),
+        Arc::new(action_host),
+    );
+
     // ---- Extensions (Part B2) ----
     // Load cdylib plugins from the resolved extension dirs, merge their tools
     // into the built-in set (extension overrides same-named built-in; first-
@@ -186,7 +202,7 @@ pub async fn build(
     let extension_session = if args.no_extensions {
         ExtensionSession::none()
     } else {
-        load_extensions(args, cwd)
+        load_extensions(args, cwd, Some(action_bridge))
     };
     if args.verbose {
         if let Some(s) = extension_session.summary() {
@@ -440,7 +456,15 @@ pub async fn build(
 
     AgentHarness::create(options)
         .await
-        .map(|harness| (harness, event_rx))
+        .map(|harness| {
+            // Fill the extension action host now that the harness exists
+            // (plugin runtime_action calls can then reach it).
+            crate::extensions_actions::HarnessActionHost::set_harness(
+                &harness_cell,
+                Arc::new(harness.clone()),
+            );
+            (harness, event_rx)
+        })
         .map_err(|e| BuildError::HarnessCreate(e.to_string()))
 }
 
@@ -461,16 +485,26 @@ pub enum BuildError {
 /// `extensions`, then any `--extensions-dir` flags (scanned after the defaults
 /// — `args.rs`). Diagnostics are a no-op sink for now; load skips/ABI mismatches
 /// surface via the `--verbose` summary.
-fn load_extensions(args: &Args, cwd: &Path) -> ExtensionSession {
+fn load_extensions(
+    args: &Args,
+    cwd: &Path,
+    action_bridge: Option<Arc<rpi_extensions::ActionBridge>>,
+) -> ExtensionSession {
     let mut dirs = vec![project_dir(cwd, EXTENSIONS_SUBDIR)];
     if let Some(g) = global_dir(EXTENSIONS_SUBDIR) {
         dirs.push(g);
     }
     dirs.extend(args.extensions_dir.iter().cloned());
     let diagnostics: Arc<dyn PluginDiagnostics> = Arc::new(NullDiagnostics);
-    // Action bridge (B-series extension actions) is not wired from the CLI
-    // yet — the harness emits through the extension emitter without it.
-    load_session(&dirs, diagnostics, None)
+    // Action bridge (B-series): plugins' `runtime_action` calls trampoline
+    // through the bridge into the harness host (send_message / set_model /
+    // switch_session / fork / …). `None` when `--no-extensions` (no plugins
+    // to serve).
+    let bridge = args
+        .no_extensions
+        .then(|| action_bridge.clone())
+        .flatten();
+    load_session(&dirs, diagnostics, bridge)
 }
 
 /// Merge the loaded extension tools into the built-in set. An extension tool
@@ -667,6 +701,51 @@ pub async fn open_session_by_id(id: &str, cwd: &str) -> Result<Session, OpenErro
         .map_err(|e| OpenError::Other(e.to_string()))
 }
 
+/// Fork the harness's current session into a new JSONL session (new id, parent
+/// set to the source) and wrap it in a `Session`. Mirrors the TUI's
+/// `fork_session` flow (`interactive_tui.rs`) — hoisted here so both the TUI
+/// and the plugin `runtime_action(Fork)` host share one implementation.
+/// Returns the new `Session` (NOT yet swapped onto the harness — the caller
+/// does `harness.set_session(...)`).
+pub(crate) async fn fork_session_storage(
+    harness: &AgentHarness,
+    cwd: &str,
+) -> Result<Session, String> {
+    use rpi_harness::session::jsonl::{JsonlSessionRepo, JsonlSessionRepoOptions};
+    use rpi_tools::FileSystem;
+
+    let dir = default_session_dir(Path::new(cwd));
+    let env = Arc::new(OsExecutionEnv::with_cwd(PathBuf::from(cwd)));
+    let fs: Arc<dyn FileSystem> = env.clone();
+    let repo = JsonlSessionRepo::with_env_cwd(JsonlSessionRepoOptions {
+        fs,
+        sessions_root: dir.to_string_lossy().into_owned(),
+        clock: Arc::new(SystemClock),
+        ids: Arc::new(DefaultIdGenerator::new()),
+    });
+    // The fork needs the rich JSONL metadata (with the on-disk path); resolve
+    // it from the session list by the current session's id.
+    let id = harness.session().storage().metadata().id.clone();
+    let metas = list_session_metadata(cwd).await.map_err(|e| e.to_string())?;
+    let Some(source) = metas.iter().find(|m| m.id == id) else {
+        return Err(format!("current session {id} not found on disk"));
+    };
+    let fork_storage = repo
+        .fork_typed(
+            source,
+            &rpi_harness::session::jsonl::JsonlSessionCreateOptions {
+                id: None,
+                parent_session_id: Some(source.id.clone()),
+                cwd: cwd.to_string(),
+                metadata: None,
+            },
+            &rpi_harness::session::types::ForkOptions::default(),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(Session::new(Arc::new(fork_storage), None))
+}
+
 /// Wrap an opened [`JsonlSessionStorage`] in the `Session` facade (shared by
 /// startup restore + TUI hot-switch).
 async fn open_session(
@@ -713,7 +792,12 @@ fn ephemeral_session() -> Session {
 /// Uses the `JsonlSessionRepo` over an `OsExecutionEnv`-backed `FileSystem`
 /// rooted at the cwd, so paths resolve consistently with the tools. Mirrors the
 /// TS `SessionManager.create` flow (header write + `JsonlSessionStorage` open).
-async fn create_jsonl_session(dir: &Path, cwd: &str) -> Result<Session, String> {
+/// Create a fresh JSONL session file under `dir` and wrap it in a `Session`.
+///
+/// Uses the `JsonlSessionRepo` over an `OsExecutionEnv`-backed `FileSystem`
+/// rooted at the cwd, so paths resolve consistently with the tools. Mirrors the
+/// TS `SessionManager.create` flow (header write + `JsonlSessionStorage` open).
+pub(crate) async fn create_jsonl_session(dir: &Path, cwd: &str) -> Result<Session, String> {
     use rpi_harness::session::jsonl::{
         JsonlSessionCreateOptions, JsonlSessionRepo, JsonlSessionRepoOptions,
     };
