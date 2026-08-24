@@ -647,6 +647,21 @@ impl StablePluginEvent {
 /// handlers — one handler's error does not abort the fan-out).
 pub type EventHandlerFn = extern "C" fn(event: StablePluginEvent, user_data: *mut c_void) -> i32;
 
+/// `resources_discover` handler signature (B5b). Unlike [`EventHandlerFn`]
+/// (fire-and-forget, `i32` only), this carries an owning `out` so the plugin
+/// can hand `{skillPaths, promptPaths, themePaths}` back to the host. `cwd` and
+/// `reason` are borrowed inputs ([`StbStringRef`]); `out` is plugin-produced
+/// and reclaimed via the `plugin_free_string` the host stored alongside the
+/// handler at registration. `user_data` is the plugin's opaque context. Returns
+/// `0` on success (host reads `out`); nonzero on a handled error (host logs +
+/// skips this handler, fan-out continues — mirrors pi `runner.ts:1179-1188`).
+pub type ResourcesDiscoverFn = extern "C" fn(
+    cwd: StbStringRef,
+    reason: StbStringRef,
+    out: *mut StbString,
+    user_data: *mut c_void,
+) -> i32;
+
 // ---------------------------------------------------------------------------
 // Runtime actions — uniform JSON-RPC dispatch by RuntimeActionId
 // ---------------------------------------------------------------------------
@@ -768,6 +783,18 @@ pub struct PluginApiVt {
     /// events. The host dispatches [`StablePluginEvent`]s of that tag to the
     /// handler (`catch_unwind`-wrapped).
     pub register_event_handler: Option<extern "C" fn(tag: EventTag, handler: EventHandlerFn, user_data: *mut c_void) -> i32>,
+
+    /// Register a `resources_discover` handler (B5b). The host stores `handler`
+    /// + the plugin's own `plugin_free_string` (the `out` [`StbString`] the
+    /// handler produces is plugin-owned and the host must reclaim it) +
+    /// `user_data`. On discovery (`startup`/`reload`) the host fans the event to
+    /// every registered handler in order, concatenating their returned
+    /// `{skillPaths, promptPaths, themePaths}` (errors per-handler do NOT abort
+    /// the fan-out). Nullable: a host without the resources-discover path leaves
+    /// this null and the plugin must degrade (no dynamic resource contribution).
+    pub register_resources_discover: Option<
+        extern "C" fn(handler: ResourcesDiscoverFn, plugin_free_string: FreeStringFn, user_data: *mut c_void) -> i32,
+    >,
 
     // --- runtime actions (~14, uniform dispatch) ---
 
@@ -1046,6 +1073,7 @@ mod tests {
             register_markdown_transformer: None,
             register_entry_renderer: None,
             register_event_handler: None,
+            register_resources_discover: None,
             runtime_action: noop_runtime_action,
             dispatch_event: None,
             user_data: core::ptr::null_mut(),
@@ -1053,6 +1081,7 @@ mod tests {
         // All optional slots are null → plugin must degrade.
         assert!(vt.register_tool.is_none());
         assert!(vt.register_event_handler.is_none());
+        assert!(vt.register_resources_discover.is_none());
         // Copy (POD) — no UB from a plain copy.
         let _copy = vt;
         // `assert!(core::mem::needs_drop::<PluginApiVt>() == false)` — verified
@@ -1077,6 +1106,7 @@ mod tests {
             register_markdown_transformer: None,
             register_entry_renderer: None,
             register_event_handler: None,
+            register_resources_discover: None,
             runtime_action: noop_runtime_action,
             dispatch_event: None,
             user_data: core::ptr::null_mut(),

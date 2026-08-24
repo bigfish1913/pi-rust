@@ -29,6 +29,11 @@
 //!    destroy-count invariant).
 //! 3. A `MessageEnd` handler is registered in the snapshot (B3 will fire it;
 //!    B2 only proves registration landed).
+//! 4. (B5b) A `resources_discover` handler is registered, and
+//!    `emit_resources_discover` fans the event to it → its canned skill path
+//!    appears in the merged result, and the handler's process-global hit counter
+//!    bumped. This is the plan's verification §3 B5 smoke: "plugin-stub
+//!    registers a `resources_discover` handler → its skill path appears …".
 //!
 //! Run it after building the stub:
 //! ```sh
@@ -206,6 +211,75 @@ async fn loads_real_cdylib_and_drives_echo_tool() {
 
     // The session's keepalive is still alive (adapter holds a clone), so the
     // cdylib stays mapped; dropping the adapter + session unloads it.
+
+    // ---- B5b: resources_discover round-trip through the real cdylib ----------
+    // The stub registered a `resources_discover` handler that returns a canned
+    // skill path. `emit_resources_discover` fans the event to every registered
+    // handler in registration order, merges their `{skillPaths, promptPaths,
+    // themePaths}` arrays, and returns the concat. We assert:
+    //   (a) exactly one discover handler registered;
+    //   (b) the handler fired (its process-global counter bumped);
+    //   (c) its canned skill path appears in the merged result.
+    // This is the plan verification §3 B5 smoke ("plugin-stub registers a
+    // resources_discover handler → its skill path appears …").
+    use rpi_extensions::emit_resources_discover;
+
+    let snap = session.snapshot_arc().expect("snapshot present");
+    let handlers = snap.resources_discover();
+    assert_eq!(
+        handlers.len(),
+        1,
+        "expected exactly one resources_discover handler registered"
+    );
+
+    let discover_before = stub_discover_hits(&stub_path);
+    let discovered = emit_resources_discover("/cwd", "startup", &snap);
+    let discover_after = stub_discover_hits(&stub_path);
+    assert_eq!(
+        discover_after,
+        discover_before + 1,
+        "resources_discover handler in the real cdylib should have fired once"
+    );
+    // The stub advertises exactly one skill path (its marker string). It must
+    // land in the merged `skill_paths`; prompt/theme stay empty (the stub
+    // returns only skillPaths).
+    assert_eq!(
+        discovered.skill_paths.len(),
+        1,
+        "one skill path from one handler"
+    );
+    assert_eq!(
+        discovered.skill_paths[0], "plugin-stub-discovered/SKILL.md",
+        "the canned path the stub advertises must round-trip unchanged"
+    );
+    assert!(
+        discovered.prompt_paths.is_empty(),
+        "stub returns no promptPaths"
+    );
+    assert!(
+        discovered.theme_paths.is_empty(),
+        "stub returns no themePaths"
+    );
+}
+
+/// Read the stub's `plugin_stub_discover_hits` counter through the cdylib
+/// (second mapping — refcounted, same pattern as `stub_message_end_hits`).
+fn stub_discover_hits(stub_path: &std::path::Path) -> usize {
+    let lib = match unsafe { libloading::Library::new(stub_path) } {
+        Ok(l) => l,
+        Err(_) => return 0,
+    };
+    type HitFn = extern "C" fn() -> usize;
+    let sym: libloading::Symbol<HitFn> = match unsafe {
+        lib.get(b"plugin_stub_discover_hits\0")
+    } {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let hits = sym();
+    drop(sym);
+    drop(lib);
+    hits
 }
 
 /// Read the stub's `plugin_stub_message_end_hits` counter through the cdylib.

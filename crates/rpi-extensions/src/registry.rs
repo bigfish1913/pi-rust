@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use rpi_agent::error::AgentError;
-use rpi_plugin_sdk::{EventTag, EventHandlerFn, EVENT_TAG_COUNT};
+use rpi_plugin_sdk::{EventTag, EventHandlerFn, FreeStringFn, ResourcesDiscoverFn, EVENT_TAG_COUNT};
 use rpi_ai::types::Tool;
 
 use crate::tool::PluginToolHandle;
@@ -76,6 +76,23 @@ pub struct RegisteredHandler {
 unsafe impl Send for RegisteredHandler {}
 unsafe impl Sync for RegisteredHandler {}
 
+/// A registered `resources_discover` handler (B5b). The `out` [`StbString`] the
+/// handler produces is **plugin-owned**, so the host reclaims it via the
+/// plugin's own `plugin_free_string` traveled alongside. `user_data` is the
+/// plugin's opaque context. SAFETY: same as [`RegisteredHandler`] — the plugin
+/// warrants `handler` is callable from any thread and `user_data` is valid for
+/// the registry's lifetime; the host never frees `user_data`.
+#[derive(Clone, Copy)]
+pub struct ResourcesDiscoverHandler {
+    pub handler: ResourcesDiscoverFn,
+    pub plugin_free_string: FreeStringFn,
+    pub user_data: *mut std::ffi::c_void,
+}
+// SAFETY: fn pointers + an opaque plugin pointer the plugin warrants is
+// thread-safe; the host only reads `user_data` through `handler`.
+unsafe impl Send for ResourcesDiscoverHandler {}
+unsafe impl Sync for ResourcesDiscoverHandler {}
+
 /// One flat registration record, for iteration/diagnostics. Built on demand
 /// from the typed vecs in [`RegistrySnapshot`].
 #[derive(Clone)]
@@ -100,6 +117,11 @@ pub struct ExtensionRegistry {
     commands: Vec<RegisteredCommand>,
     /// `handlers[tag as usize]` — all handlers subscribed to that tag.
     handlers: [Vec<RegisteredHandler>; EVENT_TAG_COUNT],
+    /// `resources_discover` handlers (B5b). Fan-out on discovery, in registration
+    /// order. Unlike event handlers (which key off a tag in a fixed array), these
+    /// are a single flat list — `resources_discover` has its own out-param
+    /// signature and is never dispatched through the fire-and-forget event path.
+    resources_discover: Vec<ResourcesDiscoverHandler>,
     /// Shared staleness flag. `true` while the session owning this registry is
     /// active; set `false` on swap/`/reload`. Tool/event dispatch checks it.
     active: Arc<AtomicBool>,
@@ -122,6 +144,7 @@ impl ExtensionRegistry {
             tools: Vec::new(),
             commands: Vec::new(),
             handlers,
+            resources_discover: Vec::new(),
             active: Arc::new(AtomicBool::new(true)),
         }
     }
@@ -166,6 +189,22 @@ impl ExtensionRegistry {
         false
     }
 
+    /// Register a `resources_discover` handler (B5b). Multiple handlers are kept
+    /// (fan-out on discovery, registration order). Always inserts; returns `false`.
+    pub fn register_resources_discover(
+        &mut self,
+        handler: ResourcesDiscoverFn,
+        plugin_free_string: FreeStringFn,
+        user_data: *mut std::ffi::c_void,
+    ) -> bool {
+        self.resources_discover.push(ResourcesDiscoverHandler {
+            handler,
+            plugin_free_string,
+            user_data,
+        });
+        false
+    }
+
     /// Build a snapshot the host session keeps. The registry's `active` flag is
     /// shared (Arc) so a later `invalidate` on the registry also invalidates the
     /// snapshot — important for cross-session staleness.
@@ -177,6 +216,7 @@ impl ExtensionRegistry {
             }).collect(),
             commands: self.commands.clone(),
             handlers: self.handlers.clone(),
+            resources_discover: self.resources_discover.clone(),
             active: Arc::clone(&self.active),
         }
     }
@@ -216,6 +256,7 @@ impl ExtensionRegistry {
         for (tag_idx, handlers) in other.handlers.iter_mut().enumerate() {
             self.handlers[tag_idx].append(handlers);
         }
+        self.resources_discover.append(&mut other.resources_discover);
     }
 }
 
@@ -234,6 +275,7 @@ pub struct RegistrySnapshot {
     tools: Vec<ExtensionTool>,
     commands: Vec<RegisteredCommand>,
     handlers: [Vec<RegisteredHandler>; EVENT_TAG_COUNT],
+    resources_discover: Vec<ResourcesDiscoverHandler>,
     active: Arc<AtomicBool>,
 }
 
@@ -261,6 +303,12 @@ impl RegistrySnapshot {
         } else {
             &[]
         }
+    }
+
+    /// The `resources_discover` handlers, registration order (B5b). Empty when
+    /// no plugin registered a discovery handler.
+    pub fn resources_discover(&self) -> &[ResourcesDiscoverHandler] {
+        &self.resources_discover
     }
 
     /// A flat iterator of all registrations (tools + commands), for diagnostics.

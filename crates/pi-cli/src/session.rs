@@ -9,9 +9,13 @@
 //!   `-nc` each suppress one channel; project `.pi/<sub>` + global
 //!   `agent_dir()<sub>` discovery with project-wins dedupe via
 //!   [`crate::resource_dirs`]; SYSTEM.md/APPEND_SYSTEM.md project-wins
-//!   precedence). **Extension/theme discovery and trust gating remain
-//!   deferred** — the harness `resources` carry skills+prompt-templates; the
-//!   system prompt adds `<project_context>` + `APPEND_SYSTEM.md` append text.
+//!   precedence). **Extension `resources_discover` (B5b) feeds the SAME loaders:
+//!   a plugin's discovered skill/prompt paths merge with the static dirs and
+//!   re-run through `load_skills`/`load_prompt_templates` (individual `.md` files
+//!   load too — `load_skills` accepts both dirs and files). Theme discovery is
+//!   accepted but ignored (rpi has no theme system — documented divergence).**
+//!   **Trust gating remains deferred** — project resources are discovered
+//!   unconditionally (a copied `.pi/` drops in and works).
 //! - **No `--models` cycling, no `ModelRuntime`/multi-provider.** One model,
 //!   one provider (Anthropic), resolved up-front by [`crate::provider`].
 //! - **Built-in tools**: `read`, `bash`, `edit`, `write` plus the read-only
@@ -54,7 +58,7 @@ use crate::resource_dirs::{
 };
 use rpi_extensions::{
     ExtensionEmitter, ExtensionSession, NullDiagnostics, PluginDiagnostics, PluginToolAdapter,
-    TeeEmitter, load_session,
+    TeeEmitter, emit_resources_discover, load_session,
 };
 
 /// The subdirectory (under both project `.pi/` and global `agent_dir()/`) where
@@ -277,10 +281,29 @@ pub async fn build(
     // `.pi/` drops in and works). Full trust gating is deferred.
     let agent_dir = crate::config::agent_dir().ok();
 
+    // ---- B5b: extension resources_discover ----
+    // If any plugin registered a `resources_discover` handler, fan the event out
+    // (reason "startup") and collect skill/prompt/theme paths. These plugin-
+    // contributed paths merge WITH the static Part-A dirs (project `.pi/skills` +
+    // `agent_dir/skills`, etc.) and the loaders re-run over the union — the
+    // coherence point: a plugin's discovered skills land through the SAME loaders
+    // as static skills. Static dirs load FIRST so project skills keep winning name
+    // collisions (a plugin must not shadow a project skill of the same name —
+    // mirrors pi `extendResources` running AFTER the default load's first-wins
+    // map). `load_skills` now accepts both dirs and individual `.md` files, so a
+    // plugin returning bare `SKILL.md` paths loads them (the gap this closes).
+    // Themes are accepted but ignored (rpi has no theme system — documented).
+    // A `--no-*` flag suppresses its channel for BOTH static and discovered paths.
+    let discovered = extension_session
+        .snapshot_arc()
+        .map(|snap| emit_resources_discover(&cwd_str, "startup", &snap))
+        .unwrap_or_default();
+
     let mut skills: Vec<rpi_harness::types::Skill> = Vec::new();
     let mut skill_diags: Vec<rpi_harness::skills::SkillDiagnostic> = Vec::new();
     if !args.no_skills {
-        let dirs = skill_dirs(cwd);
+        let mut dirs = skill_dirs(cwd);
+        dirs.extend(discovered.skill_paths.iter().map(PathBuf::from));
         let result = load_skills_with_precedence(&env_dyn, &dirs).await;
         skills = result.skills;
         skill_diags = result.diagnostics;
@@ -289,7 +312,8 @@ pub async fn build(
     let mut prompt_templates: Vec<rpi_harness::types::PromptTemplate> = Vec::new();
     let mut prompt_diags: Vec<rpi_harness::prompt_templates::PromptTemplateDiagnostic> = Vec::new();
     if !args.no_prompt_templates {
-        let dirs = prompt_template_dirs(cwd);
+        let mut dirs = prompt_template_dirs(cwd);
+        dirs.extend(discovered.prompt_paths.iter().map(PathBuf::from));
         let result = load_prompt_templates_with_precedence(&env_dyn, &dirs).await;
         prompt_templates = result.prompt_templates;
         prompt_diags = result.diagnostics;
@@ -383,6 +407,20 @@ pub async fn build(
         eprintln!("--- prompt templates: {} ---", prompt_templates.len());
         for t in &prompt_templates {
             eprintln!("    /{}", t.name);
+        }
+        // B5b: surface plugin-contributed discovery paths so a smoke can confirm
+        // the resources_discover round-trip fed the loaders (themes ignored).
+        eprintln!(
+            "--- discovered via resources_discover: {} skill(s), {} prompt(s), {} theme(s) (ignored) ---",
+            discovered.skill_paths.len(),
+            discovered.prompt_paths.len(),
+            discovered.theme_paths.len(),
+        );
+        for p in &discovered.skill_paths {
+            eprintln!("    skill: {p}");
+        }
+        for p in &discovered.prompt_paths {
+            eprintln!("    prompt: {p}");
         }
         eprintln!(
             "--- final composed base+append+context (skills listing added by harness) ---\n{system_prompt}"

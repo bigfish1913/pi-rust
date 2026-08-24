@@ -183,21 +183,51 @@ pub async fn load_skills(env: &Arc<dyn ExecutionEnv>, dirs: &[String]) -> LoadSk
                 continue;
             }
         };
-        if resolve_kind(env, &root_info, &mut diagnostics, &cancel).await
-            != Some(FileKind::Directory)
-        {
-            continue;
+        // Mirror pi `skills.ts:462-481`: a skillPath may be a directory OR an
+        // individual `.md` file. (Previously this branch was directory-only — a
+        // plugin's `resources_discover` returning bare `SKILL.md` file paths was
+        // silently skipped. B5b widens this to files so discovered skills load.)
+        let kind = resolve_kind(env, &root_info, &mut diagnostics, &cancel).await;
+        match kind {
+            Some(FileKind::Directory) => {
+                let mut result = load_skills_from_dir_internal(
+                    env,
+                    &root_info.path.to_string_lossy(),
+                    true,
+                    &IgnoreMatcher::new(),
+                    &root_info.path.to_string_lossy(),
+                )
+                .await;
+                skills.append(&mut result.skills);
+                diagnostics.append(&mut result.diagnostics);
+            }
+            Some(FileKind::File) if root_info.name.ends_with(".md") => {
+                // pi `loadSkillFromFile` (skills.ts:277-325) falls back to
+                // `basename(dirname(filePath))` for the skill name when the
+                // frontmatter has no `name`. `dirname_env_path` (skills.rs:688)
+                // is the env-path dirname helper; the final segment of THAT is
+                // the parent directory's basename.
+                let dir_path = dirname_env_path(&root_info.path.to_string_lossy());
+                let parent_dir_name = basename_of(&dir_path);
+                let mut result = load_skill_from_file(
+                    env,
+                    &root_info.path.to_string_lossy(),
+                    &parent_dir_name,
+                )
+                .await;
+                if let Some(skill) = result.skill.take() {
+                    skills.push(skill);
+                }
+                diagnostics.append(&mut result.diagnostics);
+            }
+            _ => {
+                // Not a dir, not an `.md` file (or symlink-unresolvable): skip
+                // silently, mirroring pi's "is not a markdown file" warning
+                // path (skills.ts:474-476) — we emit no diagnostic to stay
+                // consistent with the prior directory-only skip behavior.
+                continue;
+            }
         }
-        let mut result = load_skills_from_dir_internal(
-            env,
-            &root_info.path.to_string_lossy(),
-            true,
-            &IgnoreMatcher::new(),
-            &root_info.path.to_string_lossy(),
-        )
-        .await;
-        skills.append(&mut result.skills);
-        diagnostics.append(&mut result.diagnostics);
     }
     LoadSkillsResult {
         skills,
@@ -704,6 +734,23 @@ fn dirname_env_path(path: &str) -> String {
         return "/".to_string();
     }
     normalized[..sep_index].to_string()
+}
+
+/// Basename (final path segment) of an env-path string, handling both `/` and
+/// `\`. Mirrors TS `basename`. Returns the whole string when there's no
+/// separator. Used by [`load_skills`] to compute a discovered `.md` skill file's
+/// parent-directory name (the pi frontmatter-`name` fallback,
+/// `basename(dirname(filePath))` at skills.ts:286-296).
+fn basename_of(path: &str) -> String {
+    let normalized = path.trim_end_matches(|c: char| c == '/' || c == '\\');
+    let bs = normalized.rfind('\\');
+    let fs = normalized.rfind('/');
+    match (bs, fs) {
+        (Some(b), Some(f)) => normalized[b.max(f) + 1..].to_string(),
+        (Some(b), None) => normalized[b + 1..].to_string(),
+        (None, Some(f)) => normalized[f + 1..].to_string(),
+        (None, None) => normalized.to_string(),
+    }
 }
 
 /// Relative path of `path` from `root`. Mirrors TS `relativeEnvPath`.

@@ -61,8 +61,9 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
 use rpi_plugin_sdk::{
-    EventHandlerFn, EventTag, FreeStringFn, PluginApiVt, RuntimeActionFn, StbString, StbStringRef,
-    StableToolSchema, StablePluginEvent, ToolCancelFn, ToolDestroyFn, ToolExecuteFn, ToolPollFn,
+    EventHandlerFn, EventTag, FreeStringFn, PluginApiVt, ResourcesDiscoverFn, RuntimeActionFn,
+    StbString, StbStringRef, StableToolSchema, StablePluginEvent, ToolCancelFn, ToolDestroyFn,
+    ToolExecuteFn, ToolPollFn,
 };
 use thiserror::Error;
 
@@ -73,8 +74,10 @@ pub use loader::{
 };
 pub use provider_hooks::ExtensionProviderHooks;
 pub use registry::{
-    ExtensionRegistry, ExtensionTool, RegistryEntry, RegistrySnapshot, assert_active,
+    ExtensionRegistry, ExtensionTool, RegisteredHandler, RegistryEntry, RegistrySnapshot,
+    ResourcesDiscoverHandler, assert_active,
 };
+pub use resources::{DiscoveredResources, emit_resources_discover};
 pub use tool::{PluginToolAdapter, PluginToolHandle};
 pub use translate::{ExtensionEmitter, TeeEmitter};
 
@@ -82,6 +85,7 @@ mod actions;
 mod loader;
 mod provider_hooks;
 mod registry;
+mod resources;
 mod tool;
 mod translate;
 
@@ -250,6 +254,7 @@ impl HostApi {
             register_markdown_transformer: None, // B5 TUI
             register_entry_renderer: None, // B5 TUI
             register_event_handler: Some(trampoline_register_event_handler),
+            register_resources_discover: Some(trampoline_register_resources_discover),
             runtime_action: runtime_action_fn,
             dispatch_event: Some(trampoline_dispatch_event),
             user_data: ud,
@@ -417,6 +422,34 @@ extern "C" fn trampoline_dispatch_event(_event: StablePluginEvent, _user_data: *
     // not yet forward to host subscribers (no upstream channel wired). B5 wires
     // the reverse-direction event bus.
     0
+}
+
+/// B5b: `register_resources_discover` trampoline. Runs synchronously inside a
+/// plugin's `register` call (so the thread-local `CURRENT_HOST_API` is set → the
+/// register-path recovery works, same as the other `trampoline_register_*` fns).
+/// The plugin hands its `handler`, its own `plugin_free_string` (the `out`
+/// StbString the handler later produces is plugin-owned — the host must reclaim
+/// it via this fn), and its opaque `user_data`. The host stores all three in the
+/// registry and later fans the discovery event out via `emit_resources_discover`.
+extern "C" fn trampoline_register_resources_discover(
+    handler: ResourcesDiscoverFn,
+    plugin_free_string: FreeStringFn,
+    user_data: *mut c_void,
+) -> i32 {
+    if !current_api_present() {
+        return -1;
+    }
+    let ok = with_current_api(|api| {
+        match api.with_registry(|reg| reg.register_resources_discover(handler, plugin_free_string, user_data)) {
+            Some(_) => true,
+            None => false,
+        }
+    });
+    if ok == Some(true) {
+        0
+    } else {
+        -1
+    }
 }
 
 /// v1 fallback: kept for [`HostApi`]s built without an [`ActionBridge`] (the

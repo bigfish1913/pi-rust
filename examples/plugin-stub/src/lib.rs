@@ -14,6 +14,12 @@
 //!    message it saw into a process-global slot — proving the 33-category `on()`
 //!    dispatch path is wired for at least one tag (the full fan-out to every
 //!    `AgentEvent`-folded tag lands in B3).
+//! 3. Registers a **`resources_discover`** handler (B5b) that hands back a
+//!    canned skill path — proving the discover→host round-trip (the host fans
+//!    the event out to every registered handler, the plugin returns
+//!    `{skillPaths:[...]}`, the host merges the arrays and feeds Part A's skill
+//!    loader). This is the "三者同交付" coherence point: a plugin's discovered
+//!    paths reuse the same loader as static `.pi/skills` dirs.
 //!
 //! It depends on **`rpi-plugin-sdk` only** — never on `rpi-extensions`,
 //! `rpi-harness`, or `rpi-cli` (a cdylib plugin must not link the host; the host
@@ -181,6 +187,67 @@ pub extern "C" fn plugin_stub_message_end_hits() -> usize {
 }
 
 // ---------------------------------------------------------------------------
+// The resources_discover handler (B5b) — proves the discover round-trip
+// ---------------------------------------------------------------------------
+
+/// A canned skill path the discover handler advertises. The host merges this
+/// into its skill-loading list (alongside static `.pi/skills` dirs) and the path
+/// flows into the system prompt's `<available_skills>` block. The path points
+/// at a `SKILL.md` shipped alongside the cdylib in the build dir — the host
+/// smoke test asserts it appears in the discover result.
+///
+/// `discovered_echo` lives as a pre-canned skill the plugin "discovers" so the
+/// round-trip has something concrete to assert without the plugin needing write
+/// access at runtime. The fn below is `#[no_mangle]` so the host test can read
+/// the exact path it expects back (mirrors `plugin_stub_message_end_hits`).
+#[no_mangle]
+pub extern "C" fn plugin_stub_discover_skill_path() -> *const u8 {
+    DISCOVER_SKILL.as_ptr()
+}
+
+/// How many times the discover handler has been invoked (host smoke asserts ≥1).
+#[no_mangle]
+pub extern "C" fn plugin_stub_discover_hits() -> usize {
+    DISCOVER_HITS.load(Ordering::SeqCst)
+}
+
+/// The canned skill path this stub advertises via `resources_discover`. A
+/// `static` so the handler can hand a pointer back without allocating (and
+/// `plugin_stub_discover_skill_path` returns its head). The path is a fixed
+/// string the test resolves against the cdylib's own directory at runtime —
+/// see `plugin_stub_discover_skills_dir`.
+static DISCOVER_SKILL: &[u8] = b"plugin-stub-discovered/SKILL.md";
+static DISCOVER_HITS: AtomicUsize = AtomicUsize::new(0);
+
+/// `resources_discover(cwd, reason, out, user_data) -> i32`.
+///
+/// Receives `cwd` + `reason` (`"startup"` or `"reload"`) as borrowed
+/// [`StbStringRef`]s and writes a JSON `{skillPaths:[...]}` payload into the
+/// `out` [`StbString`] (plugin-owned; the host reclaims it via the
+/// `plugin_free_string` we handed the host at registration). Returns `0`.
+///
+/// The payload carries one skill path — a fixed marker string the host smoke
+/// test asserts appears in `emit_resources_discover`'s merged result. We model
+/// the real contract (a plugin hands back paths it discovered) without the
+/// plugin needing filesystem access at runtime.
+extern "C" fn on_resources_discover(
+    _cwd: rpi_plugin_sdk::StbStringRef,
+    _reason: rpi_plugin_sdk::StbStringRef,
+    out: *mut rpi_plugin_sdk::StbString,
+    _user_data: *mut c_void,
+) -> i32 {
+    DISCOVER_HITS.fetch_add(1, Ordering::SeqCst);
+    // Build the JSON payload the host parses. `skillPaths` only (prompt/theme
+    // omitted — lenient host treats missing fields as empty).
+    let path = std::str::from_utf8(DISCOVER_SKILL).unwrap_or("");
+    let json = format!(r#"{{"skillPaths":["{}"]}}"#, path);
+    unsafe {
+        *out = StbString::from_string(json);
+    }
+    0
+}
+
+// ---------------------------------------------------------------------------
 // The register entrypoint
 // ---------------------------------------------------------------------------
 
@@ -233,6 +300,21 @@ pub extern "C" fn rpi_plugin_register(api: *const PluginApiVt, abi_version: u32)
             return 2;
         };
         let rc = register_event_handler(EventTag::MessageEnd, on_message_end, std::ptr::null_mut());
+        if rc != 0 {
+            return rc;
+        }
+
+        // Register the resources_discover handler (B5b). The host stores our
+        // handler + our `plugin_free_string` (the `out` StbString we produce is
+        // plugin-owned; the host reclaims it via that fn) + our `user_data`. On
+        // discovery the host fans the event out to every registered handler and
+        // merges their returned `{skillPaths, promptPaths, themePaths}`.
+        let Some(register_resources_discover) = api.register_resources_discover else {
+            // Host without the discover path — degrade (the smoke test host
+            // always wires it; a non-wiring host logs + we continue).
+            return 3;
+        };
+        let rc = register_resources_discover(on_resources_discover, plugin_free_string, std::ptr::null_mut());
         if rc != 0 {
             return rc;
         }
