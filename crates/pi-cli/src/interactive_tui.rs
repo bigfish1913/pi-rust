@@ -537,6 +537,53 @@ impl SlashCommand for ImportCommand {
     }
 }
 
+struct SettingsCommand;
+impl SlashCommand for SettingsCommand {
+    fn name(&self) -> &'static str {
+        "/settings"
+    }
+    fn description(&self) -> &'static str {
+        "Show saved settings"
+    }
+    fn execute(&self, ctx: &CommandContext, _args: &str) {
+        show_settings_panel(&ctx.chat);
+        ctx.tui.request_render(false);
+    }
+}
+
+struct ScopedModelsCommand;
+impl SlashCommand for ScopedModelsCommand {
+    fn name(&self) -> &'static str {
+        "/scoped-models"
+    }
+    fn description(&self) -> &'static str {
+        "Choose models for Ctrl+M cycling"
+    }
+    fn execute(&self, ctx: &CommandContext, _args: &str) {
+        open_scoped_models_selector(
+            &ctx.state,
+            &ctx.editor_container,
+            &ctx.editor,
+            &ctx.tui,
+            &ctx.model_catalog,
+            &ctx.chat,
+        );
+    }
+}
+
+struct ShareCommand;
+impl SlashCommand for ShareCommand {
+    fn name(&self) -> &'static str {
+        "/share"
+    }
+    fn description(&self) -> &'static str {
+        "Share session (gist via gh, or clipboard)"
+    }
+    fn execute(&self, ctx: &CommandContext, _args: &str) {
+        let _ = ctx.tx.send(TuiMessage::ShareSession);
+    }
+}
+
 struct ArminCommand;
 impl SlashCommand for ArminCommand {
     fn name(&self) -> &'static str {
@@ -608,20 +655,11 @@ fn build_builtin_registry() -> CommandRegistry {
     // out of v1 scope; each carries a description so autocomplete surfaces its
     // existence even though running it reports "not supported".
     r.register(Arc::new(NameCommand));
-    r.register(Arc::new(UnsupportedCommand::new(
-        "/settings",
-        "Open settings menu",
-    )));
-    r.register(Arc::new(UnsupportedCommand::new(
-        "/scoped-models",
-        "Enable/disable models for Ctrl+P cycling",
-    )));
+    r.register(Arc::new(SettingsCommand));
+    r.register(Arc::new(ScopedModelsCommand));
     r.register(Arc::new(ExportCommand));
     r.register(Arc::new(ImportCommand));
-    r.register(Arc::new(UnsupportedCommand::new(
-        "/share",
-        "Share session as a GitHub gist",
-    )));
+    r.register(Arc::new(ShareCommand));
     r.register(Arc::new(ForkCommand));
     r.register(Arc::new(UnsupportedCommand::new(
         "/clone",
@@ -677,6 +715,9 @@ enum TuiMessage {
     /// Import a JSONL session file into the session dir and switch to it
     /// (from `/import <path>`).
     ImportSession(String),
+    /// Share the current session (`/share`): `gh gist create` when the gh CLI
+    /// is available, otherwise copy the transcript to the clipboard.
+    ShareSession,
 }
 
 /// Extract the concatenated text content from an assistant message (mirrors
@@ -706,6 +747,230 @@ fn user_message_text(msg: &rpi_ai::types::UserMessage) -> String {
     }
 }
 
+/// Render the `/settings` panel: the saved settings.json values the session
+/// honors, plus pointers to the commands that edit them (theme via `/theme`,
+/// defaults via flags, cycle scope via `/scoped-models`).
+fn show_settings_panel(chat: &Arc<Container>) {
+    let s = crate::settings::load_settings().unwrap_or_default();
+    let mut lines: Vec<String> = Vec::new();
+    lines.push("⚙️  Saved settings:".into());
+    lines.push(format!(
+        "  Theme: {} (edit with /theme)",
+        s.theme.as_deref().unwrap_or("(default)")
+    ));
+    lines.push(format!(
+        "  Default model: {} (set at launch with --model)",
+        s.default_model.as_deref().unwrap_or("(none)")
+    ));
+    lines.push(format!(
+        "  Default thinking: {} (set at launch with --thinking)",
+        s.default_thinking_level.as_deref().unwrap_or("(default)")
+    ));
+    match &s.scoped_models {
+        Some(list) if !list.is_empty() => lines.push(format!(
+            "  Ctrl+M cycle scope: {} (edit with /scoped-models)",
+            list.join(", ")
+        )),
+        _ => lines.push("  Ctrl+M cycle scope: all models (edit with /scoped-models)".into()),
+    }
+    let body = lines.join("\n");
+    container_note_block(chat, &body);
+}
+
+/// The catalog allowed in the Ctrl+M cycle: the `/scoped-models` set from
+/// settings.json when present, otherwise every model. The current model is
+/// always included (fallback) so cycling can never strand the user off-scope.
+fn scoped_catalog(catalog: &[rpi_ai::Model], current_id: &str) -> Vec<rpi_ai::Model> {
+    let scoped = crate::settings::load_settings()
+        .ok()
+        .and_then(|s| s.scoped_models)
+        .unwrap_or_default();
+    if scoped.is_empty() {
+        return catalog.to_vec();
+    }
+    let mut out: Vec<rpi_ai::Model> = catalog
+        .iter()
+        .filter(|m| scoped.iter().any(|s| s.eq_ignore_ascii_case(&m.id)))
+        .cloned()
+        .collect();
+    // Never strand the user: if the current model isn't in scope, keep it.
+    if !out.iter().any(|m| m.id.eq_ignore_ascii_case(current_id)) {
+        if let Some(cur) = catalog.iter().find(|m| m.id.eq_ignore_ascii_case(current_id)) {
+            out.push(cur.clone());
+        }
+    }
+    out
+}
+
+/// `/scoped-models`: a multi-toggle selector over the catalog. Selecting an
+/// item toggles it in the in-progress set (the selector stays open); Esc saves
+/// the set to settings.json and closes. The active scoped set is echoed after
+/// each toggle so the user sees the current selection.
+fn open_scoped_models_selector(
+    state: &Arc<TuiState>,
+    editor_container: &Arc<Container>,
+    editor: &Arc<Editor>,
+    tui: &Arc<TuiAltScreen>,
+    catalog: &[rpi_ai::Model],
+    chat: &Arc<Container>,
+) {
+    if catalog.is_empty() {
+        add_note_message(chat, "No models in the catalog.");
+        tui.request_render(false);
+        return;
+    }
+    // Seed the edit set from the saved scoped models.
+    let seed: Vec<String> = crate::settings::load_settings()
+        .ok()
+        .and_then(|s| s.scoped_models)
+        .unwrap_or_default();
+    *state.scoped_edit.lock().unwrap() = Some(seed);
+
+    let mut items: Vec<SelectItem> = Vec::new();
+    for m in catalog {
+        items.push(SelectItem::new(&m.id, &m.id));
+    }
+    let list = Arc::new(SelectList::new(items, 10));
+
+    let state_sel = state.clone();
+    let chat_sel = chat.clone();
+    let tui_sel = tui.clone();
+    list.on_select(Arc::new(move |item| {
+        // Toggle the model in the in-progress set; the selector stays open.
+        let mut set = state_sel.scoped_edit.lock().unwrap();
+        let set = set.get_or_insert_with(Vec::new);
+        if let Some(pos) = set.iter().position(|m| m.eq_ignore_ascii_case(&item.value)) {
+            set.remove(pos);
+            add_note_message(
+                &chat_sel,
+                &format!("{} removed — Esc to save", item.label),
+            );
+        } else {
+            set.push(item.value.clone());
+            add_note_message(
+                &chat_sel,
+                &format!("{} added — Esc to save", item.label),
+            );
+        }
+        tui_sel.request_render(false);
+    }));
+    let state_cancel = state.clone();
+    let ec_cancel = editor_container.clone();
+    let editor_cancel = editor.clone();
+    let tui_cancel = tui.clone();
+    let chat_cancel = chat.clone();
+    list.on_cancel(Arc::new(move || {
+        // Save the edited set to settings.json and close.
+        let set = state_cancel.scoped_edit.lock().unwrap().take().unwrap_or_default();
+        let mut settings = crate::settings::load_settings().unwrap_or_default();
+        settings.scoped_models = if set.is_empty() { None } else { Some(set.clone()) };
+        match crate::settings::save_settings(&settings) {
+            Ok(()) => {
+                if set.is_empty() {
+                    add_note_message(&chat_cancel, "Ctrl+M cycles all models (scope cleared).");
+                } else {
+                    add_note_message(
+                        &chat_cancel,
+                        &format!("Ctrl+M cycle scope: {}", set.join(", ")),
+                    );
+                }
+            }
+            Err(e) => add_error_message(&chat_cancel, &format!("Could not save settings: {e}")),
+        }
+        close_selector(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
+    }));
+
+    open_selector(state, editor_container, editor, tui, list, SelectorKind::ScopedModels);
+}
+
+/// `/share`: mirror the TS intent (share the session). With the `gh` CLI on
+/// PATH, create a gist of the exported markdown; otherwise fall back to the
+/// clipboard (best-effort) and note the local path.
+async fn share_session(harness: &AgentHarness, chat: &Arc<Container>) {
+    use std::process::Stdio;
+
+    // Reuse the export builder for the transcript text.
+    let tree = harness.session().view("main");
+    let entries = match tree.find_entries(&EntryQuery {
+        entry_type: None,
+        custom_type: None,
+        order: None,
+        limit: None,
+        cursor: None,
+    }).await {
+        Ok(e) => e,
+        Err(e) => {
+            add_error_message(chat, &format!("Could not read session: {e}"));
+            return;
+        }
+    };
+    let mut md = String::from("# Session\n\n");
+    for e in entries {
+        let Entry::Message(me) = e else { continue };
+        match &me.message {
+            AgentMessage::User(u) => {
+                md.push_str(&format!("## User\n\n{}\n\n", user_message_text(u)));
+            }
+            AgentMessage::Assistant(a) => {
+                let text = assistant_text(a);
+                if !text.is_empty() {
+                    md.push_str(&format!("## Assistant\n\n{}\n\n", text));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // `gh gist create` — stdin-piped, best-effort; only when gh exists.
+    let gh = std::process::Command::new("gh")
+        .arg("gist")
+        .arg("create")
+        .arg("--filename")
+        .arg("session.md")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn();
+    if let Ok(mut child) = gh {
+        use std::io::Write;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(md.as_bytes());
+            let _ = stdin.flush();
+        }
+        let out = child.wait_with_output().ok();
+        if let Some(out) = out {
+            if out.status.success() {
+                let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                add_note_message(chat, &format!("Shared session: {url}"));
+                return;
+            }
+        }
+        add_note_message(
+            chat,
+            "gh gist failed — falling back to the clipboard.",
+        );
+    } else {
+        add_note_message(
+            chat,
+            "gh CLI not found — falling back to the clipboard.",
+        );
+    }
+    // Clipboard fallback (or transcript echo when the clipboard feature is off).
+    if copy_to_clipboard(&md) {
+        add_note_message(chat, "Session transcript copied to the clipboard.");
+    } else {
+        add_note_message(
+            chat,
+            "Clipboard unavailable — use /export to write the transcript to a file.",
+        );
+    }
+}
+
+/// Export the current session to a markdown transcript file. Writes
+/// `<cwd>/<session-name-or-id>.md` with the user/assistant/tool-call history
+/// (mirrors the TS `/export` intent locally — no remote sharing in v1).
+/// Best-effort: failures surface as a chat note.
 /// Export the current session to a markdown transcript file. Writes
 /// `<cwd>/<session-name-or-id>.md` with the user/assistant/tool-call history
 /// (mirrors the TS `/export` intent locally — no remote sharing in v1).
@@ -858,7 +1123,6 @@ async fn fork_session(
     state: &Arc<TuiState>,
 ) {
     use rpi_harness::session::jsonl::{JsonlSessionRepo, JsonlSessionRepoOptions};
-    use rpi_harness::session::types::SessionStorage;
     use rpi_tools::FileSystem;
 
     let cwd_str = cwd.to_string_lossy().to_string();
@@ -1008,6 +1272,8 @@ enum SelectorKind {
     Session,
     /// `/theme` — dark / light / monochrome presets applied live.
     Theme,
+    /// `/scoped-models` — multi-toggle Ctrl+M cycle scope.
+    ScopedModels,
 }
 
 /// Shared mutable TUI state, `Arc`-cloned into the drain task, the key loop,
@@ -1078,6 +1344,9 @@ struct TuiState {
     /// a large input that reads nothing from cache after an established prefix
     /// means the prefix was re-billed (simplified `maybeShowCacheMissNotice`).
     last_input_tokens: std::sync::Mutex<i64>,
+    /// The in-progress scoped-models selection while the `/scoped-models`
+    /// selector is open (toggle per item, Esc saves). `None` when not editing.
+    scoped_edit: std::sync::Mutex<Option<Vec<String>>>,
 }
 
 /// How many submitted messages are kept for ↑ recall (mirrors the TS
@@ -1393,6 +1662,7 @@ pub async fn interactive_tui(
         history_index: std::sync::Mutex::new(-1),
         history_draft: std::sync::Mutex::new(None),
         last_input_tokens: std::sync::Mutex::new(0),
+        scoped_edit: std::sync::Mutex::new(None),
     });
 
     // Apply the saved theme from `~/.rpi/agent/settings.json` (best-effort).
@@ -1584,13 +1854,18 @@ pub async fn interactive_tui(
             //    restore the editor and clear `active_selector`.
             if state_for_key.selector_open() {
                 // Esc always cancels the selector (even with modifiers off).
+                // Route through `SelectList::handle_key(Esc)` so the list's
+                // `on_cancel` fires (the `/scoped-models` toggle selector saves
+                // its edits there) — the old shortcut called `close_selector`
+                // directly and skipped the callback.
                 if key.code == KeyCode::Esc {
-                    close_selector(
-                        &state_for_key,
-                        &editor_container_for_key,
-                        &editor_for_key,
-                        &tui_for_key,
-                    );
+                    let (selector, _kind) = state_for_key
+                        .active_selector
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .expect("selector_open guaranteed Some");
+                    selector.handle_key(key);
                     continue;
                 }
                 let (selector, _kind) = state_for_key
@@ -1668,9 +1943,11 @@ pub async fn interactive_tui(
             //     in-flight run's config is already snapshotted), and update the
             //     footer. `set_model` is async so it runs on a spawned task.
             if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('m') {
-                if let Some(next) =
-                    cycle_next_model(&ctx_for_key.model_catalog, &state_for_key.current_model_id())
-                {
+                let current = state_for_key.current_model_id();
+                // Cycle within the `/scoped-models` set (settings.json) when
+                // configured; otherwise the full catalog.
+                let scope = scoped_catalog(&ctx_for_key.model_catalog, &current);
+                if let Some(next) = cycle_next_model(&scope, &current) {
                     state_for_key.set_current_model(&next);
                     let lane = lane_for_key.clone();
                     tokio::spawn(async move {
@@ -1796,6 +2073,10 @@ pub async fn interactive_tui(
             }
             Ok(TuiMessage::ImportSession(path)) => {
                 import_session(&harness, &lane, &path, &cwd, &chat_container, &state).await;
+                tui.request_render(false);
+            }
+            Ok(TuiMessage::ShareSession) => {
+                share_session(&harness, &chat_container).await;
                 tui.request_render(false);
             }
             Ok(TuiMessage::SetSessionName(name)) => {
@@ -3344,6 +3625,7 @@ mod tests {
             history_index: std::sync::Mutex::new(-1),
             history_draft: std::sync::Mutex::new(None),
         last_input_tokens: std::sync::Mutex::new(0),
+        scoped_edit: std::sync::Mutex::new(None),
         });
 
         // The drain handler takes `Arc<TuiAltScreen>`, which needs a real
@@ -3479,6 +3761,7 @@ mod tests {
             history_index: std::sync::Mutex::new(-1),
             history_draft: std::sync::Mutex::new(None),
         last_input_tokens: std::sync::Mutex::new(0),
+        scoped_edit: std::sync::Mutex::new(None),
         });
         {
             let mut combined = CombinedAutocompleteProvider::new();
@@ -3530,6 +3813,7 @@ mod tests {
             history_index: std::sync::Mutex::new(-1),
             history_draft: std::sync::Mutex::new(None),
         last_input_tokens: std::sync::Mutex::new(0),
+        scoped_edit: std::sync::Mutex::new(None),
         });
         let editor_container = Arc::new(Container::new());
         let editor = Arc::new(Editor::simple());
@@ -3580,6 +3864,7 @@ mod tests {
             history_index: std::sync::Mutex::new(-1),
             history_draft: std::sync::Mutex::new(None),
         last_input_tokens: std::sync::Mutex::new(0),
+        scoped_edit: std::sync::Mutex::new(None),
         });
         let editor = Arc::new(Editor::simple());
 
@@ -3640,6 +3925,7 @@ mod tests {
             history_index: std::sync::Mutex::new(-1),
             history_draft: std::sync::Mutex::new(None),
         last_input_tokens: std::sync::Mutex::new(0),
+        scoped_edit: std::sync::Mutex::new(None),
         });
         {
             let mut combined = CombinedAutocompleteProvider::new();

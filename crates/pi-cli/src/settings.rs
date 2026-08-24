@@ -29,6 +29,10 @@ pub struct Settings {
     /// Saved theme name. Surfaced for best-effort TUI theme application.
     #[serde(default)]
     pub theme: Option<String>,
+    /// `/scoped-models`: the model ids allowed in the Ctrl+M cycle. Absent /
+    /// empty ⇒ every catalog model cycles (the default).
+    #[serde(default)]
+    pub scoped_models: Option<Vec<String>>,
 }
 
 /// Load `~/.rpi/agent/settings.json`. Missing file ⇒ `Settings::default()`
@@ -54,6 +58,56 @@ fn parse_settings(text: &str) -> Result<Settings, serde_json::Error> {
             serde_json::from_str(&stripped).map_err(|_| first)
         }
     }
+}
+
+/// Persist the honored settings back to `~/.rpi/agent/settings.json`.
+/// Unknown pi fields (which `Settings` doesn't model) are **preserved**: the
+/// current file is read as raw JSON, the known fields are overlaid, and the
+/// merged object is written — so a copied pi `settings.json` survives edits
+/// without losing pi-only keys. Missing file ⇒ a fresh object. Best-effort
+/// errors are returned as strings for the caller to surface.
+pub fn save_settings(settings: &Settings) -> Result<(), String> {
+    let path = config::settings_path().map_err(|e| e.to_string())?;
+    // Read the existing file as a raw object to preserve unknown fields.
+    let mut merged = match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
+            .unwrap_or(serde_json::Value::Object(Default::default())),
+        Err(_) => serde_json::Value::Object(Default::default()),
+    };
+    let obj = merged.as_object_mut().ok_or("settings file is not an object")?;
+    for (key, val) in [
+        ("defaultProvider", settings.default_provider.as_ref()),
+        ("defaultModel", settings.default_model.as_ref()),
+        ("defaultThinkingLevel", settings.default_thinking_level.as_ref()),
+        ("theme", settings.theme.as_ref()),
+    ] {
+        match val {
+            Some(v) => {
+                obj.insert(key.to_string(), serde_json::Value::String(v.clone()));
+            }
+            None => {
+                obj.remove(key);
+            }
+        }
+    }
+    match &settings.scoped_models {
+        Some(list) if !list.is_empty() => {
+            obj.insert(
+                "scopedModels".to_string(),
+                serde_json::Value::Array(
+                    list.iter().map(|m| serde_json::Value::String(m.clone())).collect(),
+                ),
+            );
+        }
+        _ => {
+            obj.remove("scopedModels");
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let text = serde_json::to_string_pretty(&merged).map_err(|e| e.to_string())?;
+    std::fs::write(&path, text).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -144,5 +198,48 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "{ not json").unwrap();
         assert!(matches!(load_settings(), Err(ConfigError::Json { .. })));
+    }
+}
+
+#[cfg(test)]
+mod scoped_tests {
+    use super::*;
+    use crate::config::test_support::env_lock;
+
+    fn with_temp_env() -> (tempfile::TempDir, std::sync::MutexGuard<'static, ()>) {
+        let guard = env_lock().lock().unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::env::set_var(config::CONFIG_DIR_ENV, tmp.path());
+        (tmp, guard)
+    }
+
+    #[test]
+    fn save_load_scoped_models_roundtrip() {
+        let (_tmp, _guard) = with_temp_env();
+        let mut s = Settings::default();
+        s.scoped_models = Some(vec!["a".into(), "b".into()]);
+        save_settings(&s).unwrap();
+        let loaded = load_settings().unwrap();
+        assert_eq!(loaded.scoped_models, Some(vec!["a".to_string(), "b".to_string()]));
+        // Clearing removes the key.
+        let mut s2 = load_settings().unwrap();
+        s2.scoped_models = None;
+        save_settings(&s2).unwrap();
+        assert_eq!(load_settings().unwrap().scoped_models, None);
+    }
+
+    #[test]
+    fn save_preserves_unknown_fields() {
+        let (_tmp, _guard) = with_temp_env();
+        let path = config::settings_path().unwrap();
+        std::fs::write(&path, r#"{"piOnlyField":"keep-me","theme":"dark"}"#).unwrap();
+        let mut s = load_settings().unwrap();
+        s.scoped_models = Some(vec!["m1".into()]);
+        save_settings(&s).unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw["piOnlyField"], "keep-me");
+        assert_eq!(raw["scopedModels"][0], "m1");
+        assert_eq!(raw["theme"], "dark");
     }
 }
