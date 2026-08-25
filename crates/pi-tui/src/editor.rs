@@ -1144,6 +1144,21 @@ mod tests {
 
 
 
+
+
+    #[test]
+    fn left_arrow_keeps_text_in_render() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        use crate::component::Component;
+        let mk = |m, c| crossterm::event::KeyEvent::new(c, m);
+        let editor = Editor::simple();
+        editor.set_focused(true);
+        editor.insert("hello world");
+        editor.handle_key(mk(KeyModifiers::NONE, KeyCode::Left));
+        let rendered = editor.render(40).join("
+");
+        assert!(rendered.contains("hello"), "text must survive Left, got: {rendered:?}");
+    }
     #[test]
     fn test_char_jump_and_page_scroll() {
         use crossterm::event::{KeyCode, KeyModifiers};

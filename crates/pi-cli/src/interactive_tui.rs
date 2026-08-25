@@ -457,7 +457,33 @@ impl SlashCommand for ModelCommand {
     fn description(&self) -> &'static str {
         "Choose a model (selector)"
     }
-    fn execute(&self, ctx: &CommandContext, _args: &str) {
+    fn execute(&self, ctx: &CommandContext, args: &str) {
+        let term = args.trim();
+        if !term.is_empty() {
+            // /model <name> — direct switch by id (pi handleModelCommand).
+            let Some(model) = ctx
+                .model_catalog
+                .iter()
+                .find(|m| m.id.eq_ignore_ascii_case(term))
+                .cloned()
+            else {
+                add_error_message(&ctx.chat, &format!("No model matches \"{term}\". Try /model for the list."));
+                ctx.tui.request_render(false);
+                return;
+            };
+            let model_id = model.id.clone();
+            ctx.state.set_current_model(&model);
+            let lane = ctx.lane.clone();
+            tokio::spawn(async move {
+                let _ = lane.set_model(model).await;
+            });
+            add_note_message(
+                &ctx.chat,
+                &format!("Model set to {} — applies to the next message.", short_model_name(&model_id)),
+            );
+            ctx.tui.request_render(false);
+            return;
+        }
         open_model_selector(
             &ctx.state,
             &ctx.editor_container,
@@ -482,7 +508,28 @@ impl SlashCommand for ThinkingCommand {
     fn description(&self) -> &'static str {
         "Set thinking level (selector)"
     }
-    fn execute(&self, ctx: &CommandContext, _args: &str) {
+    fn execute(&self, ctx: &CommandContext, args: &str) {
+        let level_name = args.trim();
+        if !level_name.is_empty() {
+            // /thinking <level> — direct set (pi supports the param form).
+            let Some(level) = thinking_level_from_name(level_name) else {
+                add_error_message(
+                    &ctx.chat,
+                    &format!("Unknown thinking level \"{level_name}\". Valid: {}", crate::args::VALID_THINKING_LEVELS.join(", ")),
+                );
+                ctx.tui.request_render(false);
+                return;
+            };
+            let lane = ctx.lane.clone();
+            let footer = ctx.state.footer.clone();
+            tokio::spawn(async move {
+                let _ = lane.set_thinking_level(level).await;
+            });
+            footer.set_thinking_level(Some(thinking_level_name(level)));
+            add_note_message(&ctx.chat, &format!("Thinking set to {level_name}."));
+            ctx.tui.request_render(false);
+            return;
+        }
         open_thinking_selector(
             &ctx.state,
             &ctx.editor_container,
@@ -566,7 +613,29 @@ impl SlashCommand for ThemeCommand {
     fn description(&self) -> &'static str {
         "Choose a theme (selector)"
     }
-    fn execute(&self, ctx: &CommandContext, _args: &str) {
+    fn execute(&self, ctx: &CommandContext, args: &str) {
+        let name = args.trim().to_ascii_lowercase();
+        if !name.is_empty() {
+            // /theme <name> — direct apply + persist (matches /settings Theme).
+            let preset = match name.as_str() {
+                "light" => ThemePreset::Light,
+                "monochrome" => ThemePreset::Monochrome,
+                "dark" => ThemePreset::Dark,
+                _ => {
+                    add_error_message(&ctx.chat, &format!("Unknown theme \"{name}\". Valid: dark, light, monochrome."));
+                    ctx.tui.request_render(false);
+                    return;
+                }
+            };
+            ctx.state.theme_manager.apply_preset(preset);
+            let mut settings = crate::settings::load_settings().unwrap_or_default();
+            settings.theme = Some(name.clone());
+            let _ = crate::settings::save_settings(&settings);
+            add_note_message(&ctx.chat, &format!("Theme set to {name} (saved)."));
+            ctx.tui.request_render(false);
+            ctx.tui.render_now(true);
+            return;
+        }
         open_theme_selector(&ctx.state, &ctx.editor_container, &ctx.editor, &ctx.tui);
     }
 }
@@ -2539,25 +2608,25 @@ pub async fn interactive_tui(
                 continue;
             }
 
-            // 5b. ↑/↓ browse submitted-message history when the caret sits at
-            //     the start/end of the editor (mirrors TS
-            //     `tui.editor.historyPrevious/Next`, which only intercept at
-            //     the first/last visual line); anywhere else they fall through
-            //     to the editor for multi-line cursor movement.
+            // 5b. ↑/↓ browse submitted-message history when the editor is
+            //     EMPTY (a fresh prompt) — mirrors TS historyPrevious/Next
+            //     without the surprise of replacing typed text. When the
+            //     editor holds content, ↑/↓ fall through to cursor movement
+            //     (typing "hello", pressing ↑ at the start, must never swap
+            //     the draft for a history entry — reported as "text
+            //     disappeared"). Once browsing, ↓ walks back and restores the
+            //     draft.
             if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::Up {
-                let (row, col) = editor_for_key.cursor_position();
-                if row == 0 && col == 0 {
+                let browsing = *state_for_key.history_index.lock().unwrap() != -1;
+                if editor_for_key.get_text().is_empty() || browsing {
                     navigate_history(&state_for_key, &editor_for_key, -1);
                     tui_for_key.request_render(false);
                     continue;
                 }
             }
             if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::Down {
-                let text = editor_for_key.get_text();
-                let (row, col) = editor_for_key.cursor_position();
-                let last_row = text.lines().count().saturating_sub(1);
-                let last_len = text.lines().last().map(str::len).unwrap_or(0);
-                if row == last_row && col >= last_len {
+                let browsing = *state_for_key.history_index.lock().unwrap() != -1;
+                if editor_for_key.get_text().is_empty() || browsing {
                     navigate_history(&state_for_key, &editor_for_key, 1);
                     tui_for_key.request_render(false);
                     continue;
