@@ -58,6 +58,17 @@ pub struct Args {
     pub continue_session: bool,
     pub resume: bool,
     pub session: Option<String>,
+    /// `--session-id <id>`: use the EXACT project session id, creating it if
+    /// missing (pi `--session-id`). Unlike `--session` (partial match), this
+    /// is an exact-id open-or-create.
+    pub session_id: Option<String>,
+    /// `--fork <path|id>`: fork the given session into a new one and start in
+    /// the fork (pi `--fork`).
+    pub fork: Option<String>,
+    /// `--models <patterns>`: comma-separated model patterns for the Ctrl+M
+    /// cycle (globs/fuzzy in pi; v1 writes the matched ids to settings.json's
+    /// scopedModels — the same set /scoped-models edits). Empty = all models.
+    pub models: Option<Vec<String>>,
     pub session_dir: Option<PathBuf>,
     pub no_session: bool,
     pub name: Option<String>,
@@ -87,6 +98,14 @@ pub struct Args {
     /// pi's registration order). `RPI_EXTENSIONS_DIR` (colon-separated on Unix,
     /// semicolon on Windows) provides the same list via env.
     pub extensions_dir: Vec<PathBuf>,
+    /// `--extension`/`-e <path>`: load an explicit extension cdylib file (may
+    /// be repeated). Loaded in addition to the discovered dirs.
+    pub extension: Vec<PathBuf>,
+    /// `--skill <path>`: load an explicit skill file or directory (repeated).
+    pub skill: Vec<PathBuf>,
+    /// `--prompt-template <path>`: load an explicit prompt-template file or
+    /// directory (repeated).
+    pub prompt_template: Vec<PathBuf>,
 
     pub verbose: bool,
     pub help: bool,
@@ -262,6 +281,28 @@ pub fn parse_args(args: &[String]) -> Args {
             }
             "--name" | "-n" => result.name = take_value(&mut result, "--name"),
             "--session" => result.session = take_value(&mut result, "--session"),
+            "--session-id" => result.session_id = take_value(&mut result, "--session-id"),
+            "--fork" => result.fork = take_value(&mut result, "--fork"),
+            "--models" => {
+                if let Some(v) = take_value(&mut result, &flag_key) {
+                    result.models = Some(split_csv(&v));
+                }
+            }
+            "--extension" | "-e" => {
+                if let Some(v) = take_value(&mut result, &flag_key) {
+                    result.extension.push(PathBuf::from(v));
+                }
+            }
+            "--skill" => {
+                if let Some(v) = take_value(&mut result, &flag_key) {
+                    result.skill.push(PathBuf::from(v));
+                }
+            }
+            "--prompt-template" => {
+                if let Some(v) = take_value(&mut result, &flag_key) {
+                    result.prompt_template.push(PathBuf::from(v));
+                }
+            }
             "--session-dir" => {
                 if let Some(v) = take_value(&mut result, "--session-dir") {
                     result.session_dir = Some(PathBuf::from(v));
@@ -591,12 +632,25 @@ mod tests {
     }
 
     #[test]
-    fn ignored_scope_cuts_warn() {
-        let a = parse_args(&s(&["--models", "sonnet"]));
+    fn models_flag_parses_csv() {
+        let a = parse_args(&s(&["--models", "a,b,c"]));
         assert!(a.errors.is_empty());
-        assert!(!a.ignored.is_empty());
+        assert!(a.ignored.is_empty(), "--models is implemented");
+        assert_eq!(a.models.as_deref(), Some(&["a".to_string(), "b".to_string(), "c".to_string()][..]));
         // The value is consumed, not read as a message:
         assert!(a.messages.is_empty());
+    }
+
+    #[test]
+    fn session_id_and_fork_flags_parse() {
+        let a = parse_args(&s(&["--session-id", "01abc", "--fork", "xyz"]));
+        assert!(a.errors.is_empty());
+        assert_eq!(a.session_id.as_deref(), Some("01abc"));
+        assert_eq!(a.fork.as_deref(), Some("xyz"));
+        let a = parse_args(&s(&["-e", "plugin.dll", "--skill", "s", "--prompt-template", "t.md"]));
+        assert_eq!(a.extension.len(), 1);
+        assert_eq!(a.skill.len(), 1);
+        assert_eq!(a.prompt_template.len(), 1);
     }
 
     #[test]

@@ -2417,7 +2417,6 @@ pub async fn interactive_tui(
     let tx_for_key = tx.clone();
     let tui_for_key = tui.clone();
     let editor_for_key = editor.clone();
-    let editor_container_for_key = editor_container.clone();
     let scroll_for_key = scroll_view.clone();
     let lane_for_key = lane.clone();
     let state_for_key = state.clone();

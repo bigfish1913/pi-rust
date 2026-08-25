@@ -59,7 +59,7 @@ use crate::resource_dirs::{
 };
 use rpi_extensions::{
     ExtensionEmitter, ExtensionSession, NullDiagnostics, PluginDiagnostics, PluginToolAdapter,
-    TeeEmitter, emit_resources_discover, load_session,
+    TeeEmitter, emit_resources_discover,
 };
 
 /// The subdirectory (under both project `.pi/` and global `agent_dir()/`) where
@@ -115,6 +115,11 @@ pub enum SessionSelection {
     /// `--session <id|path>`: restore the session whose id matches, or whose
     /// file name contains the id.
     ById { id: String },
+    /// `--session-id <id>`: use the EXACT session id, creating it if missing.
+    ByExactId { id: String },
+    /// `--fork <path|id>`: fork the given session into a new one and start in
+    /// the fork.
+    Fork { source: String },
 }
 
 /// Decide the session selection from parsed args + the resolved cwd.
@@ -125,6 +130,12 @@ pub fn select_session(args: &Args, cwd: &Path) -> SessionSelection {
     if args.continue_session || args.resume {
         // `--continue` and `--resume` both restore the most recent session.
         return SessionSelection::Latest;
+    }
+    if let Some(s) = &args.fork {
+        return SessionSelection::Fork { source: s.clone() };
+    }
+    if let Some(s) = &args.session_id {
+        return SessionSelection::ByExactId { id: s.clone() };
     }
     if let Some(s) = &args.session {
         return SessionSelection::ById { id: s.clone() };
@@ -324,6 +335,7 @@ pub async fn build(
     let mut skill_diags: Vec<rpi_harness::skills::SkillDiagnostic> = Vec::new();
     if !args.no_skills {
         let mut dirs = skill_dirs(cwd);
+        dirs.extend(args.skill.iter().cloned());
         dirs.extend(discovered.skill_paths.iter().map(PathBuf::from));
         let result = load_skills_with_precedence(&env_dyn, &dirs).await;
         skills = result.skills;
@@ -334,6 +346,7 @@ pub async fn build(
     let mut prompt_diags: Vec<rpi_harness::prompt_templates::PromptTemplateDiagnostic> = Vec::new();
     if !args.no_prompt_templates {
         let mut dirs = prompt_template_dirs(cwd);
+        dirs.extend(args.prompt_template.iter().cloned());
         dirs.extend(discovered.prompt_paths.iter().map(PathBuf::from));
         let result = load_prompt_templates_with_precedence(&env_dyn, &dirs).await;
         prompt_templates = result.prompt_templates;
@@ -498,7 +511,10 @@ pub async fn build(
         // records — let the harness load it and keep appending.
         allow_existing_session: matches!(
             selection,
-            SessionSelection::Latest | SessionSelection::ById { .. }
+            SessionSelection::Latest
+                | SessionSelection::ById { .. }
+                | SessionSelection::ByExactId { .. }
+                | SessionSelection::Fork { .. }
         ),
         stream_options: Default::default(),
         retry: RetryPolicy::default(),
@@ -1037,8 +1053,8 @@ fn load_extensions(
     // host from any thread. The call site already gates `load_extensions` behind
     // `!no_extensions` and threads `Some(bridge)`; `None` is only passed by the
     // `--no-extensions` branch (which calls `ExtensionSession::none()` directly)
-    // and tests.
-    load_session(&dirs, diagnostics, action_bridge)
+    // and tests. Explicit `--extension`/`-e` files load after the dirs.
+    rpi_extensions::load_session_mixed(&dirs, &args.extension, diagnostics, action_bridge)
 }
 
 /// Merge the loaded extension tools into the built-in set. An extension tool
@@ -1140,9 +1156,10 @@ async fn build_session(selection: &SessionSelection, cwd: &str) -> Result<Sessio
                 .map_err(|e| BuildError::SessionDir(format!("{}: {e}", dir.display())))?;
             Ok(session)
         }
-        SessionSelection::Latest | SessionSelection::ById { .. } => {
+        SessionSelection::Latest | SessionSelection::ById { .. } | SessionSelection::ByExactId { .. } => {
             restore_session(selection, cwd).await
         }
+        SessionSelection::Fork { source } => fork_session_at_launch(source, cwd).await,
     }
 }
 
@@ -1175,8 +1192,68 @@ async fn restore_session(selection: &SessionSelection, cwd: &str) -> Result<Sess
                 OpenError::Other(msg) => BuildError::SessionDir(msg),
             })
         }
-        _ => unreachable!("restore_session only called for Latest/ById"),
+        SessionSelection::ByExactId { id } => {
+            // Exact id match only (pi `--session-id`): restore when the
+            // session exists, else create a fresh one under the default dir.
+            let metas = list_session_metadata(cwd).await?;
+            if let Some(meta) = metas.iter().find(|m| m.id == *id) {
+                return open_session(meta, cwd).await;
+            }
+            let dir = default_session_dir(Path::new(cwd));
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| BuildError::SessionDir(format!("{}: {e}", dir.display())))?;
+            create_jsonl_session_with_id(&dir, cwd, Some(id.clone()))
+                .await
+                .map_err(|e| BuildError::SessionDir(format!("{}: {e}", dir.display())))
+        }
+        _ => unreachable!("restore_session only called for Latest/ById/ByExactId"),
     }
+}
+
+/// `--fork <path|id>`: open the source session, fork it into a new JSONL
+/// session (records the parent id), and start in the fork.
+async fn fork_session_at_launch(source: &str, cwd: &str) -> Result<Session, BuildError> {
+    use rpi_harness::session::jsonl::{JsonlSessionCreateOptions, JsonlSessionRepo, JsonlSessionRepoOptions};
+    use rpi_harness::session::types::{ForkOptions, SessionStorage};
+    use rpi_tools::FileSystem;
+
+    let dir = default_session_dir(Path::new(cwd));
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| BuildError::SessionDir(format!("{}: {e}", dir.display())))?;
+    let env = Arc::new(OsExecutionEnv::with_cwd(PathBuf::from(cwd)));
+    let fs: Arc<dyn FileSystem> = env.clone();
+    let repo = JsonlSessionRepo::with_env_cwd(JsonlSessionRepoOptions {
+        fs: fs.clone(),
+        sessions_root: dir.to_string_lossy().into_owned(),
+        clock: Arc::new(SystemClock),
+        ids: Arc::new(DefaultIdGenerator::new()),
+    });
+    let metas = repo
+        .list_typed(&rpi_harness::session::jsonl::JsonlSessionListOptions::default())
+        .await
+        .map_err(|e| BuildError::SessionDir(format!("list sessions: {e}")))?;
+    let source_meta = metas
+        .iter()
+        .find(|m| m.id == *source || m.path.contains(source) || source.contains(&m.id))
+        .ok_or_else(|| BuildError::SessionNotFound {
+            requested: format!("--fork {source}"),
+            dir: dir.display().to_string(),
+        })?;
+    let fork_storage = repo
+        .fork_typed(
+            source_meta,
+            &JsonlSessionCreateOptions {
+                id: None,
+                parent_session_id: Some(source_meta.id.clone()),
+                cwd: cwd.to_string(),
+                metadata: None,
+            },
+            &ForkOptions::default(),
+        )
+        .await
+        .map_err(|e| BuildError::SessionDir(format!("fork {}: {e}", source_meta.path)))?;
+    let storage_arc: Arc<dyn SessionStorage> = Arc::new(fork_storage);
+    Ok(Session::new(storage_arc, None))
 }
 
 /// Errors from [`open_session_by_id`], split so the CLI can map them to
@@ -1332,6 +1409,17 @@ fn ephemeral_session() -> Session {
 /// rooted at the cwd, so paths resolve consistently with the tools. Mirrors the
 /// TS `SessionManager.create` flow (header write + `JsonlSessionStorage` open).
 pub(crate) async fn create_jsonl_session(dir: &Path, cwd: &str) -> Result<Session, String> {
+    create_jsonl_session_with_id(dir, cwd, None).await
+}
+
+/// `create_jsonl_session` with an explicit id (the `--session-id` fixed-id
+/// contract: the file is named with the given id so later `--session-id`
+/// launches restore the same session).
+pub(crate) async fn create_jsonl_session_with_id(
+    dir: &Path,
+    cwd: &str,
+    id: Option<String>,
+) -> Result<Session, String> {
     use rpi_harness::session::jsonl::{
         JsonlSessionCreateOptions, JsonlSessionRepo, JsonlSessionRepoOptions,
     };
@@ -1350,7 +1438,7 @@ pub(crate) async fn create_jsonl_session(dir: &Path, cwd: &str) -> Result<Sessio
     });
 
     let opts = JsonlSessionCreateOptions {
-        id: None, // fresh uuidv7
+        id, // fresh uuidv7 when None (--session-id passes the fixed id)
         parent_session_id: None,
         cwd: cwd.to_string(),
         metadata: None,

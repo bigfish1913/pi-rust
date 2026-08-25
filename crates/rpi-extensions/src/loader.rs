@@ -316,6 +316,23 @@ pub struct ExtensionSession {
 }
 
 impl ExtensionSession {
+    /// Assemble a session from already-loaded parts (explicit `--extension`
+    /// files via `load_one` + `merge_registries`). Mirrors `load_session`'s
+    /// internal assembly so callers can build a session without a dir scan.
+    pub fn from_parts(
+        snapshot: Arc<RegistrySnapshot>,
+        keepalive: Arc<PluginKeepalive>,
+        loaded_paths: Vec<PathBuf>,
+        action_bridge: Option<Arc<ActionBridge>>,
+    ) -> Self {
+        Self {
+            keepalive,
+            snapshot: Some(snapshot),
+            loaded_paths,
+            action_bridge,
+        }
+    }
+
     /// An empty session (no plugins loaded — `--no-extensions` or no dirs found).
     pub fn none() -> Self {
         Self {
@@ -403,9 +420,26 @@ pub fn load_session(
     diagnostics: Arc<dyn PluginDiagnostics>,
     action_bridge: Option<Arc<ActionBridge>>,
 ) -> ExtensionSession {
+    load_session_mixed(dirs, &[], diagnostics, action_bridge)
+}
+
+/// Load plugins from a mix of scanned dirs and explicit cdylib files
+/// (the `--extension`/`-e` CLI paths), assembled into one session. Mirrors
+/// `load_session` but additionally `load_one`s each explicit file.
+pub fn load_session_mixed(
+    dirs: &[PathBuf],
+    files: &[PathBuf],
+    diagnostics: Arc<dyn PluginDiagnostics>,
+    action_bridge: Option<Arc<ActionBridge>>,
+) -> ExtensionSession {
     let mut loaded: Vec<LoadedPlugin> = Vec::new();
     for dir in dirs {
         loaded.extend(load_dir(dir, Arc::clone(&diagnostics), action_bridge.clone()));
+    }
+    for f in files {
+        if let Ok(plugin) = load_one(f, Arc::clone(&diagnostics), action_bridge.clone()) {
+            loaded.push(plugin);
+        }
     }
     if loaded.is_empty() {
         return ExtensionSession::none();

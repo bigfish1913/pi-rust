@@ -73,7 +73,7 @@ pub use actions::{
 };
 pub use loader::{
     ExtensionSession, LoadedPlugin, PluginKeepalive, PluginLoadError, load_dir, load_one,
-    load_session, merge_registries,
+    load_session, load_session_mixed, merge_registries,
 };
 pub use provider_hooks::ExtensionProviderHooks;
 pub use provider::PluggableProvider;

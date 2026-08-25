@@ -140,6 +140,30 @@ pub async fn run() -> i32 {
     // v1 does not switch models mid-session, so this is display-only.
     let model_catalog = crate::provider::available_catalog(&resolved);
 
+    // `--models <patterns>`: persist the Ctrl+M cycle scope to settings.json
+    // (the same set `/scoped-models` edits). Each pattern matches catalog ids
+    // case-insensitively; unmatched patterns are reported so a typo doesn't
+    // silently empty the cycle.
+    if let Some(patterns) = &parsed.models {
+        let mut matched: Vec<String> = Vec::new();
+        for p in patterns {
+            let hits: Vec<String> = model_catalog
+                .iter()
+                .filter(|m| m.id.eq_ignore_ascii_case(p))
+                .map(|m| m.id.clone())
+                .collect();
+            if hits.is_empty() {
+                eprintln!("warning: --models pattern \"{p}\" matched no model");
+            }
+            matched.extend(hits);
+        }
+        let mut settings = crate::settings::load_settings().unwrap_or_default();
+        settings.scoped_models = if matched.is_empty() { None } else { Some(matched) };
+        if let Err(e) = crate::settings::save_settings(&settings) {
+            eprintln!("warning: could not save --models scope: {e}");
+        }
+    }
+
     // ---- harness build ----
     let (harness, event_rx, reload_context) = match build(&resolved, &parsed, &cwd).await {
         Ok(triple) => triple,
