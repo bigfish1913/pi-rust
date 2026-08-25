@@ -3111,15 +3111,16 @@ async fn handle_agent_event(
                         .insert(tool_call_id.clone(), comp);
                 }
             } else if let Some(comp) = state.tool_components.lock().unwrap().get(&tool_call_id) {
-                let summary = summarize_tool_result(&partial_result);
-                comp.set_result(&summary, false);
+                // Raw multi-line text — read/ls-style tools must show their
+                // full content, not the single-line ⏎-folded summary.
+                comp.set_result(&tool_result_text(&partial_result), false);
                 apply_edit_diff(comp, &tool_name, &partial_result.details, &tui);
                 state.remember_tool(comp.clone());
             } else {
                 // No component yet — create a running one so the partial shows.
                 let comp = Arc::new(ToolExecutionComponent::new(&tool_name, ""));
                 comp.set_running();
-                comp.set_result(&summarize_tool_result(&partial_result), false);
+                comp.set_result(&tool_result_text(&partial_result), false);
                 apply_edit_diff(&comp, &tool_name, &partial_result.details, &tui);
                 chat.add_child(comp.clone());
                 state
@@ -3154,13 +3155,13 @@ async fn handle_agent_event(
             } else {
                 let comp = state.tool_components.lock().unwrap().remove(&tool_call_id);
                 if let Some(comp) = comp {
-                    comp.set_result(&summarize_tool_result(&result), is_error);
+                    comp.set_result(&tool_result_text(&result), is_error);
                     apply_edit_diff(&comp, &tool_name, &result.details, &tui);
                 } else {
                     // Tool ended without a Start/Update (e.g. a very fast tool):
                     // render a finalized component directly.
                     let comp = Arc::new(ToolExecutionComponent::new(&tool_name, ""));
-                    comp.set_result(&summarize_tool_result(&result), is_error);
+                    comp.set_result(&tool_result_text(&result), is_error);
                     apply_edit_diff(&comp, &tool_name, &result.details, &tui);
                     chat.add_child(comp.clone());
                     state.remember_tool(comp);

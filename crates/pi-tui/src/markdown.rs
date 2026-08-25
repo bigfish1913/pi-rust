@@ -104,6 +104,17 @@ impl Markdown {
         while i < raw_lines.len() {
             let line = raw_lines[i];
 
+            // Streamed partial closing fences (pi #5825): while the assistant
+            // streams the final ```` ``` ````, the tail arrives one char at a
+            // time (``, ```` ``` ````…). Rendering those would flicker the block
+            // (content shrinks, then the real fence closes) — and a lone ``
+            // or `````` would be mis-rendered as ordinary text. Trim any line
+            // that is a partial fence run (1-2 fence chars, whole line).
+            if is_partial_fence(line) {
+                i += 1;
+                continue;
+            }
+
             // ---- Code fences ----
             let fence = fence_info(line);
             if let Some(lang) = fence {
@@ -343,6 +354,18 @@ fn fence_info(line: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// True when the whole line is a run of 1-2 fence chars (``/````/`~`/`~~`)
+/// — a streamed, not-yet-complete closing fence. pi trims these (issue
+/// #5825) so code blocks don't flicker/shrink while the final fence char
+/// streams in; rendering them as text would also misrender the block tail.
+fn is_partial_fence(line: &str) -> bool {
+    let t = line.trim();
+    if t.is_empty() || t.len() > 2 {
+        return false;
+    }
+    t.chars().all(|c| c == '`' || c == '~')
 }
 
 /// Split an ordered-list line into its marker (`"1. "` / `"12) "`) and body.
