@@ -128,6 +128,10 @@ pub struct Editor {
     kill_ring: Mutex<KillRing>,
     /// The last mutation kind, for undo coalescing + kill accumulation.
     last_action: Mutex<Option<&'static str>>,
+    /// Character-jump mode (pi `jumpForward`/`jumpBackward`): `Some(1)` waits
+    /// for the next printable char to jump forward to, `Some(-1)` backward.
+    /// The next character input consumes it instead of inserting.
+    jump_mode: Mutex<Option<i32>>,
 }
 
 /// A restorable editor state snapshot (text + caret). Selection/scroll/focus
@@ -161,6 +165,7 @@ impl Editor {
             redo_stack: Mutex::new(Vec::new()),
             kill_ring: Mutex::new(KillRing::new()),
             last_action: Mutex::new(None),
+            jump_mode: Mutex::new(None),
         }
     }
 
@@ -724,6 +729,65 @@ impl Editor {
         }
     }
 
+    /// Page-scroll the editor caret up/down by a page (pi `tui.editor.pageUp/
+    /// pageDown`): move the cursor row by a page and clamp the column to the
+    /// target line (page = 10 rows; a terminal-height-aware version would need
+    /// the viewport, which the component doesn't own).
+    fn page_scroll(&self, dir: i32) {
+        const PAGE: usize = 10;
+        if let Ok(mut state) = self.state.lock() {
+            let target = if dir > 0 {
+                (state.cursor_row + PAGE).min(state.lines.len().saturating_sub(1))
+            } else {
+                state.cursor_row.saturating_sub(PAGE)
+            };
+            state.cursor_row = target;
+            let max = state.lines[target].len();
+            state.cursor_col = snap_boundary(&state.lines[target], state.cursor_col.min(max));
+        }
+    }
+
+    /// Jump the caret to the next/previous occurrence of `target` (pi
+    /// `jumpToChar`): scan the current line from after/before the caret, then
+    /// onward/backward line by line. Byte-safe: `find`/`rfind` return char
+    /// boundaries and all search offsets start on one.
+    fn jump_to_char(&self, target: char, dir: i32) {
+        let forward = dir > 0;
+        let mut state = self.state.lock().unwrap();
+        let start_row = state.cursor_row;
+        let mut row = start_row;
+        let step: isize = if forward { 1 } else { -1 };
+        loop {
+            let line = &state.lines[row];
+            let search_from = if row == start_row {
+                if forward {
+                    (state.cursor_col + target.len_utf8()).min(line.len())
+                } else {
+                    state.cursor_col.saturating_sub(target.len_utf8())
+                }
+            } else if forward {
+                0
+            } else {
+                line.len()
+            };
+            let found = if forward {
+                line[search_from..].find(target).map(|i| search_from + i)
+            } else {
+                line[..search_from].rfind(target)
+            };
+            if let Some(idx) = found {
+                state.cursor_row = row;
+                state.cursor_col = idx;
+                return;
+            }
+            let next = row as isize + step;
+            if next < 0 || next >= state.lines.len() as isize {
+                return;
+            }
+            row = next as usize;
+        }
+    }
+
     /// Submit current text (Enter).
     fn submit(&self) {
         let text = self.get_text();
@@ -884,10 +948,32 @@ impl Editor {
             (KeyModifiers::CONTROL, KeyCode::Char('j')) => self.insert_no_undo("
 "),
             (KeyModifiers::CONTROL, KeyCode::Char('d')) => self.delete(),
+            // Editor page scroll (pi tui.editor.pageUp/pageDown — the
+            // unmodified PageUp/Down are the alt-screen transcript scroll).
+            (KeyModifiers::CONTROL, KeyCode::PageUp) => self.page_scroll(-1),
+            (KeyModifiers::CONTROL, KeyCode::PageDown) => self.page_scroll(1),
+            // Character jump mode (pi jumpForward/jumpBackward): Ctrl+] jumps
+            // forward to the next typed char, Ctrl+Alt+] backward. NB: a
+            // CONTROL|ALT pattern in a match arm is an or-pattern (matches
+            // EITHER modifier), so the backward arm uses a guard.
+            (_, KeyCode::Char(']')) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                // Ctrl+Alt+] jumps backward, Ctrl+] forward. A bare CONTROL
+                // arm wouldn't match the CONTROL|ALT combination.
+                if key.modifiers.contains(KeyModifiers::ALT) {
+                    *self.jump_mode.lock().unwrap() = Some(-1);
+                } else {
+                    *self.jump_mode.lock().unwrap() = Some(1);
+                }
+            }
             
-            // Regular character input
+            // Regular character input — unless a character jump is pending
+            // (Ctrl+] / Ctrl+Alt+] consumed the key as the jump target).
             (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char(c)) => {
-                self.insert(&c.to_string());
+                let jump = self.jump_mode.lock().unwrap().take();
+                match jump {
+                    Some(dir) => self.jump_to_char(c, dir),
+                    None => self.insert(&c.to_string()),
+                }
             }
             
             _ => return false,
@@ -1055,6 +1141,46 @@ mod tests {
 
 
 
+
+
+
+    #[test]
+    fn test_char_jump_and_page_scroll() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mk = |m, c| crossterm::event::KeyEvent::new(c, m);
+        let editor = Editor::simple();
+
+        // Character jump: from the end, Ctrl+Alt+] then 'x' jumps backward to
+        // the previous 'x' ("alpha xray xray" — the second "xray" starts at 11).
+        editor.insert("alpha xray xray");
+        editor.handle_key(mk(KeyModifiers::CONTROL | KeyModifiers::ALT, KeyCode::End)); // caret at end
+        editor.handle_key(mk(KeyModifiers::CONTROL | KeyModifiers::ALT, KeyCode::Char(']')));
+        // The next printable char is consumed as the jump target.
+        editor.handle_key(mk(KeyModifiers::NONE, KeyCode::Char('x')));
+        assert_eq!(editor.cursor_position(), (0, 11));
+
+        // Page scroll on a multi-line buffer clamps to the last row.
+        editor.set_text("l0
+l1
+l2
+l3
+l4
+l5
+l6
+l7
+l8
+l9
+l10
+l11
+l12");
+        editor.set_cursor(0, 2);
+        editor.handle_key(mk(KeyModifiers::CONTROL, KeyCode::PageDown));
+        let (row, _) = editor.cursor_position();
+        assert!(row >= 10, "page-down moves ~10 rows, got {row}");
+        editor.handle_key(mk(KeyModifiers::CONTROL, KeyCode::PageUp));
+        let (row2, _) = editor.cursor_position();
+        assert!(row2 <= 2, "page-up returns near the start, got {row2}");
+    }
     #[test]
     fn test_word_ops_and_new_keys() {
         use crossterm::event::{KeyCode, KeyModifiers};
