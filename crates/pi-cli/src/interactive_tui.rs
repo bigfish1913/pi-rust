@@ -2329,7 +2329,9 @@ pub async fn interactive_tui(
     let tui_tick = tui.clone();
     let state_tick = state.clone();
     let tick_handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(120));
+        // 80ms — pi's loader DEFAULT_INTERVAL_MS (the spinner would visibly
+        // stutter at the old 120ms).
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(80));
         interval.tick().await; // discard immediate
         loop {
             interval.tick().await;

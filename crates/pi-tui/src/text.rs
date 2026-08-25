@@ -46,25 +46,22 @@ impl Component for Text {
             lines.push(String::new());
         }
 
-        // Render each line with horizontal padding
+        // Render each line with horizontal padding, WORD-WRAPPING to the
+        // content width (pi text.ts: wrapTextWithAnsi) instead of truncating —
+        // long model output flows onto continuation lines rather than being
+        // cut. Each wrapped line carries the padding prefix (matching pi's
+        // per-line padding).
+        let pad = " ".repeat(self.padding_x);
+        let content_width = width.saturating_sub(self.padding_x).max(1);
         for line in content.lines() {
-            let padded = if self.padding_x > 0 {
-                format!("{}{}", " ".repeat(self.padding_x), line)
-            } else {
-                line.to_string()
-            };
-            // Truncate to width — ANSI-aware + char-boundary-safe. The old
-            // `padded[..width]` byte-sliced and panicked mid-character on
-            // multi-byte chars (e.g. `⏎` is 3 bytes: "end byte index 120 is
-            // not a char boundary") whenever a line containing one was wider
-            // than the layout column. `truncate_to_width` walks chars, tracks
-            // escape sequences, and keeps the visible width within `width`.
-            let truncated = if crate::ansi::visible_width(&padded) > width {
-                crate::utils::truncate_to_width(&padded, width, "")
-            } else {
-                padded
-            };
-            lines.push(truncated);
+            let wrapped = crate::utils::wrap_text_with_ansi(line, content_width);
+            for wl in wrapped {
+                if self.padding_x > 0 {
+                    lines.push(format!("{pad}{wl}"));
+                } else {
+                    lines.push(wl);
+                }
+            }
         }
 
         // Add bottom padding
