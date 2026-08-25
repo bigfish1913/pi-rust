@@ -11,7 +11,6 @@ use super::container::Container;
 use super::layout::{extract_cursor_position, render_layout_frame, LayoutFrame};
 use super::scroll_view::ScrollView;
 use super::tui::{OverlayHandle, OverlayOptions, TuiMode, TuiStopOptions, TUI};
-use crate::ansi::CURSOR_MARKER;
 use crate::terminal::{InputEvent, Terminal, TerminalInfo};
 
 /// Symbol for ViewportTUI capability check.
@@ -183,22 +182,13 @@ impl TuiAltScreen {
             if preserve_screen {
                 terminal.write("\x1b[?1049l\x1b[?25h");
             } else {
-                // Render final document to main buffer
-                let width = terminal.columns();
-                let lines = self.render(width);
-                
-                // Exit alt screen first
-                terminal.write("\x1b[?1049l");
-                
-                // Print final document
-                for (i, line) in lines.iter().enumerate() {
-                    if i > 0 {
-                        terminal.write("\r\n");
-                    }
-                    let clean_line = line.replace(CURSOR_MARKER, "");
-                    terminal.write(&clean_line);
-                }
-                terminal.write("\r\n\x1b[?25h");
+                // Exit the alt buffer CLEANLY: back to the main buffer, clear
+                // it, and show the cursor. The old path re-rendered the full
+                // TUI frame (borders, backgrounds, spinner state, cursor
+                // markers) into the main buffer, which is exactly the garbage
+                // that made quitting look scrambled. The caller prints its own
+                // farewell after this.
+                terminal.write("\x1b[?1049l\x1b[2J\x1b[H\x1b[?25h");
             }
             terminal.flush();
         }
