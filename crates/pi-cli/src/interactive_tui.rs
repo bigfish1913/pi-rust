@@ -36,7 +36,7 @@ use rpi_harness::session::types::{Entry, EntryQuery};
 use rpi_ai::types::{AssistantMessage, Content};
 use rpi_harness::agent_harness::{AgentHarness, AgentLane, HarnessRunOutcome};
 use rpi_tui::{
-    AutocompleteManager, CombinedAutocompleteProvider, Container, Editor, EditorOptions,
+    AutocompleteManager, CombinedAutocompleteProvider, Container, DynamicBorder, Editor, EditorOptions,
     EditorStyle, FilePathAutocompleteProvider, Focusable, FollowMode, Loader, ProcessTerminal,
     ScrollView, ScrollViewOptions, SlashCommand as SlashCommandEntry, SlashCommandAutocompleteProvider, Spacer,
     StackChild, StackEntry, Text, TuiAltScreen, TUI, VStack, AssistantBlock,
@@ -45,6 +45,9 @@ use rpi_tui::{
     ToolExecutionComponent, render_diff,
     BashExecutionComponent, BashTruncation, UserMessageComponent,
 };
+use rpi_tui::{bold as tui_bold, theme as current_theme};
+#[cfg(test)]
+use rpi_tui::strip_ansi;
 
 #[allow(unused_imports)]
 use rpi_tui::BashStatus;
@@ -1673,6 +1676,9 @@ async fn render_session_history(
                 }
                 comp.update_blocks(&assistant_blocks(a));
                 chat.add_child(comp);
+                // Single trailing spacer: the next transcript entry (user or
+                // assistant) follows one blank line below. No leading spacer
+                // — see AssistantMessageComponent::rebuild_content.
                 chat.add_child(Arc::new(Spacer::new(1)));
                 rendered_any = true;
             }
@@ -1680,7 +1686,8 @@ async fn render_session_history(
         }
     }
     if rendered_any {
-        chat.add_child(Arc::new(Spacer::new(1)));
+        // No trailing spacer here — each entry already adds its own trailing
+        // Spacer(1), so an extra would double the bottom gap.
     }
 }
 
@@ -2375,11 +2382,15 @@ pub async fn interactive_tui(
                 continue;
             }
 
-            // 0. Ctrl+C is ALWAYS the escape hatch — even with a selector
-            //    open (a stuck run or a mis-open selector must never trap the
-            //    user): abort an active run, else exit. Checked before the
-            //    selector routing below.
+            // 0. Ctrl+C: copy the selection when the editor has one (pi
+            //    `tui.input.copy`); otherwise it's the escape hatch — even
+            //    with a selector open (a stuck run or a mis-open selector must
+            //    never trap the user): abort an active run, else exit.
             if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
+                if !state_for_key.selector_open() && editor_for_key.has_selection() {
+                    editor_for_key.copy_selection();
+                    continue;
+                }
                 let status = *state_for_key.status.lock().unwrap();
                 if status == RunStatus::Working {
                     state_for_key.set_status(RunStatus::Aborting);
@@ -2424,9 +2435,10 @@ pub async fn interactive_tui(
                 continue;
             }
 
-            // 2a. Ctrl+D (EOF): exit. Mirrors pi binding Ctrl+D to quit — and
-            //     when a run is active, abort it first (same as Ctrl+C) so the
-            //     key is never a no-op while a stuck command is running.
+            // 2a. Ctrl+D: pi's deleteCharForward inside the editor (mirrors
+            //     `tui.editor.deleteCharForward`), and EOF-quit on an empty
+            //     editor. With a run active, abort it first (same as Ctrl+C)
+            //     so the key is never a no-op while a stuck command runs.
             if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('d') {
                 let status = *state_for_key.status.lock().unwrap();
                 if status == RunStatus::Working {
@@ -2435,9 +2447,16 @@ pub async fn interactive_tui(
                     tokio::spawn(async move {
                         let _ = lane.abort().await;
                     });
-                } else {
-                    let _ = tx_for_key.send(TuiMessage::Exit);
+                    continue;
                 }
+                if !state_for_key.selector_open() && !editor_for_key.get_text().is_empty() {
+                    // Editor holds text — delete the char forward (pi parity).
+                    editor_for_key.handle_key(key);
+                    refresh_autocomplete(&state_for_key, &editor_for_key);
+                    tui_for_key.request_render(false);
+                    continue;
+                }
+                let _ = tx_for_key.send(TuiMessage::Exit);
                 continue;
             }
 
@@ -2953,7 +2972,9 @@ async fn handle_agent_event(
                 // only the concatenated text, so thinking blocks never showed).
                 comp.update_blocks(&assistant_blocks(&a));
                 chat.add_child(comp.clone());
-                chat.add_child(Arc::new(Spacer::new(0)));
+                // Spacer(1) separates this assistant turn from the next entry;
+                // the component itself adds no leading spacer.
+                chat.add_child(Arc::new(Spacer::new(1)));
                 *state.current_assistant.lock().unwrap() = Some(comp);
                 tui.request_render(false);
             }
@@ -3804,91 +3825,133 @@ fn accept_top_suggestion(state: &Arc<TuiState>, editor: &Arc<Editor>) -> bool {
 
 /// Add the welcome header to the chat container.
 fn add_welcome_message(container: &Arc<Container>) {
-    container.add_child(Arc::new(Text::new("rpi interactive TUI", 1, 0)));
+    let c = current_theme().colors;
+    // Accent logotype + a dim tagline, separated from the rest by a thin
+    // themed rule. Plain `Text("rpi interactive TUI")` was visually identical
+    // to the body text, so the header didn't read as a header.
+    let title = format!("{} {}",
+        c.accent.fg(&tui_bold("rpi")),
+        c.muted.fg("interactive TUI"));
+    container.add_child(Arc::new(Text::new(title, 1, 0)));
     container.add_child(Arc::new(Spacer::new(1)));
     container.add_child(Arc::new(Text::new(
-        "Type your message and press Enter to send.",
+        c.dim.fg("Type your message and press Enter to send."),
         1, 0,
     )));
-    container.add_child(Arc::new(Text::new(
-        "Ctrl+C: Abort/Exit | Esc: Abort | Enter: Send | Shift+Enter: New line | Tab: Complete | Ctrl+L: Model | Ctrl+M: Cycle | Ctrl+T: Expand tool | /help",
-        1, 0,
-    )));
-    container.add_child(Arc::new(Spacer::new(1)));
+    let hint = c.dim.fg(
+        "Enter send · Shift+Enter newline · Ctrl+C abort · Esc abort · /help",
+    );
+    container.add_child(Arc::new(Text::new(hint, 1, 0)));
+    container.add_child(Arc::new(DynamicBorder::new()));
 }
 
 /// Add the `/help` command listing to the chat container.
 fn add_help_message(container: &Arc<Container>) {
-    container.add_child(Arc::new(Text::new("📚 Available Commands:", 1, 0)));
+    let c = current_theme().colors;
+    // Section header + a thin themed rule, then a two-column command table:
+    // `cmd` in accent, `— desc` in muted. The old single-space layout made
+    // the description column wander depending on command length.
+    container.add_child(Arc::new(Text::new(
+        c.md_heading.fg(&tui_bold("📚 Available Commands")), 1, 0)));
     container.add_child(Arc::new(Spacer::new(1)));
-    container.add_child(Arc::new(Text::new("  /help, /?       — Show this help message", 1, 0)));
-    container.add_child(Arc::new(Text::new("  /clear, /new    — Clear the conversation", 1, 0)));
-    container.add_child(Arc::new(Text::new("  /exit, /quit, /q — Exit the application", 1, 0)));
-    container.add_child(Arc::new(Text::new("  /version, /v    — Show version information", 1, 0)));
-    container.add_child(Arc::new(Text::new("  /model, /m      — Choose a model (live switch)", 1, 0)));
-    container.add_child(Arc::new(Text::new("  /thinking, /think — Set reasoning depth (selector)", 1, 0)));
-    container.add_child(Arc::new(Text::new("  /tools          — Toggle built-in tools on/off", 1, 0)));
-    container.add_child(Arc::new(Text::new("  /images         — Toggle inline image rendering", 1, 0)));
-    container.add_child(Arc::new(Text::new("  /session        — List saved sessions", 1, 0)));
-    container.add_child(Arc::new(Text::new("  /theme          — Choose a theme (selector)", 1, 0)));
-    container.add_child(Arc::new(Text::new("  /compact        — Compact the conversation", 1, 0)));
-    container.add_child(Arc::new(Text::new("  /copy           — Copy last reply to clipboard", 1, 0)));
-    container.add_child(Arc::new(Text::new("  /hotkeys        — Show keyboard shortcuts", 1, 0)));
-    container.add_child(Arc::new(Text::new("  /armin          — 🐾 Easter egg", 1, 0)));
-    container.add_child(Arc::new(Text::new("  /earendil       — Earendil announcement", 1, 0)));
+
+    let cmds: &[(&str, &str)] = &[
+        ("/help, /?",        "Show this help message"),
+        ("/clear, /new",     "Clear the conversation"),
+        ("/exit, /quit, /q", "Exit the application"),
+        ("/version, /v",     "Show version information"),
+        ("/model, /m",       "Choose a model (live switch)"),
+        ("/thinking, /think","Set reasoning depth (selector)"),
+        ("/tools",           "Toggle built-in tools on/off"),
+        ("/images",          "Toggle inline image rendering"),
+        ("/session",         "List saved sessions"),
+        ("/theme",           "Choose a theme (selector)"),
+        ("/compact",         "Compact the conversation"),
+        ("/copy",            "Copy last reply to clipboard"),
+        ("/hotkeys",         "Show keyboard shortcuts"),
+        ("/armin",           "🐾 Easter egg"),
+        ("/earendil",        "Earendil announcement"),
+    ];
+    let cmd_w = cmds.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+    for (cmd, desc) in cmds {
+        let row = format!("  {:<cmd_w$}  {}  {}",
+            c.accent.fg(cmd), c.dim.fg("—"), c.muted.fg(desc));
+        container.add_child(Arc::new(Text::new(row, 1, 0)));
+    }
     container.add_child(Arc::new(Spacer::new(1)));
 }
 
 /// Add the `/version` block to the chat container.
 fn add_version_message(container: &Arc<Container>) {
-    container.add_child(Arc::new(Text::new("📦 Version Information:", 1, 0)));
-    container.add_child(Arc::new(Spacer::new(1)));
-    container.add_child(Arc::new(Text::new("  rpi-cli v0.1.2", 1, 0)));
+    let c = current_theme().colors;
     container.add_child(Arc::new(Text::new(
-        "  Rust implementation of pi coding agent TUI",
-        1, 0,
-    )));
+        c.md_heading.fg(&tui_bold("📦 Version Information")), 1, 0)));
+    container.add_child(Arc::new(Spacer::new(1)));
+    // Use the crate version (kept in sync via `version.workspace = true`)
+    // instead of the stale hardcoded "v0.1.2".
+    container.add_child(Arc::new(Text::new(
+        format!("  {} {}", c.muted.fg("rpi-cli"), c.text.fg(&format!("v{}", crate::VERSION))),
+        1, 0)));
+    container.add_child(Arc::new(Text::new(
+        format!("  {}", c.dim.fg("Rust implementation of pi coding agent TUI")),
+        1, 0)));
     container.add_child(Arc::new(Spacer::new(1)));
 }
 
 /// Add the `/hotkeys` block to the chat container.
 fn add_hotkeys_message(container: &Arc<Container>) {
-    container.add_child(Arc::new(Text::new("⌨️  Keyboard Shortcuts:", 1, 0)));
+    let c = current_theme().colors;
+    container.add_child(Arc::new(Text::new(
+        c.md_heading.fg(&tui_bold("⌨️  Keyboard Shortcuts")), 1, 0)));
     container.add_child(Arc::new(Spacer::new(1)));
-    container.add_child(Arc::new(Text::new("  Enter         — Send message", 1, 0)));
-    container.add_child(Arc::new(Text::new("  Shift+Enter   — New line", 1, 0)));
-    container.add_child(Arc::new(Text::new("  Tab           — Accept autocomplete suggestion", 1, 0)));
-    container.add_child(Arc::new(Text::new("  Ctrl+A / Ctrl+E — Line start / end", 1, 0)));
-    container.add_child(Arc::new(Text::new("  Ctrl+K / Ctrl+U — Kill to end / start of line (Ctrl+Y yanks)", 1, 0)));
-    container.add_child(Arc::new(Text::new("  Ctrl+- / Ctrl+R — Undo / redo", 1, 0)));
-    container.add_child(Arc::new(Text::new("  Ctrl+Y / Alt+Y — Yank / yank-pop", 1, 0)));
-    container.add_child(Arc::new(Text::new("  Alt+Backspace — Kill previous word", 1, 0)));
-    container.add_child(Arc::new(Text::new("  Ctrl+C        — Abort a run, or exit when idle", 1, 0)));
-    container.add_child(Arc::new(Text::new("  Esc           — Abort a running prompt", 1, 0)));
-    container.add_child(Arc::new(Text::new("  Ctrl+L        — Open model selector", 1, 0)));
-    container.add_child(Arc::new(Text::new("  Ctrl+M        — Cycle to the next model (live)", 1, 0)));
-    container.add_child(Arc::new(Text::new("  Ctrl+T        — Expand/collapse last tool result", 1, 0)));
-    container.add_child(Arc::new(Text::new("  PageUp/Down   — Scroll transcript", 1, 0)));
+    let keys: &[(&str, &str)] = &[
+        ("Enter",           "Send message"),
+        ("Shift+Enter",     "New line"),
+        ("Tab",             "Accept autocomplete suggestion"),
+        ("Ctrl+A / Ctrl+E","Line start / end"),
+        ("Ctrl+K / Ctrl+U","Kill to end / start of line (Ctrl+Y yanks)"),
+        ("Ctrl+- / Ctrl+R","Undo / redo"),
+        ("Ctrl+Y / Alt+Y",  "Yank / yank-pop"),
+        ("Alt+Backspace",   "Kill previous word"),
+        ("Ctrl+C",          "Abort a run, or exit when idle"),
+        ("Esc",             "Abort a running prompt"),
+        ("Ctrl+L",          "Open model selector"),
+        ("Ctrl+M",          "Cycle to the next model (live)"),
+        ("Ctrl+T",          "Expand/collapse last tool result"),
+        ("PageUp/Down",     "Scroll transcript"),
+    ];
+    let key_w = keys.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+    for (key, desc) in keys {
+        let row = format!("  {:<key_w$}  {}  {}",
+            c.accent.fg(key), c.dim.fg("—"), c.muted.fg(desc));
+        container.add_child(Arc::new(Text::new(row, 1, 0)));
+    }
     container.add_child(Arc::new(Spacer::new(1)));
 }
 
 /// Add a user message echo to the chat container — a bordered `UserMessageComponent`
 /// (surface-colored box with OSC133 prompt-boundary markers) replacing the old
-/// plain `> text` echo.
+/// plain `> text` echo. A trailing Spacer(1) separates it from the next
+// transcript entry (every entry contributes one trailing spacer so
+// consecutive turns are separated by exactly one blank line).
 fn add_user_message(container: &Arc<Container>, text: &str) {
     container.add_child(Arc::new(UserMessageComponent::new(text.to_string())));
-    container.add_child(Arc::new(Spacer::new(0)));
+    container.add_child(Arc::new(Spacer::new(1)));
 }
 
 /// Add an error message to the chat container.
 fn add_error_message(container: &Arc<Container>, text: &str) {
-    container.add_child(Arc::new(Text::new(format!("❌ {text}"), 1, 0)));
+    let c = current_theme().colors;
+    container.add_child(Arc::new(Text::new(
+        format!("  {} {}", c.error.fg("✗"), c.error.fg(text)), 1, 0)));
     container.add_child(Arc::new(Spacer::new(1)));
 }
 
 /// Add a neutral note (e.g. unsupported-command message) to the chat container.
 fn add_note_message(container: &Arc<Container>, text: &str) {
-    container.add_child(Arc::new(Text::new(format!("ℹ️  {text}"), 1, 0)));
+    let c = current_theme().colors;
+    container.add_child(Arc::new(Text::new(
+        format!("  {} {}", c.info.fg("ℹ"), c.muted.fg(text)), 1, 0)));
     container.add_child(Arc::new(Spacer::new(1)));
 }
 
@@ -4008,7 +4071,7 @@ mod tests {
         let frame = rpi_tui::render_layout_frame(Arc::new(root), 80, 24);
 
         let all: String = frame.lines.join("\n");
-        assert!(all.contains("rpi interactive"), "Welcome message not found. Rendered: {}", all);
+        assert!(all.contains("rpi"), "Welcome message not found. Rendered: {}", all);
         assert!(all.contains("Type your message"), "Help text not found. Rendered: {}", all);
     }
 
@@ -4019,7 +4082,10 @@ mod tests {
 
         let lines = chat.render(80);
         let all: String = lines.join("\n");
-        assert!(all.contains("rpi interactive"), "Welcome message not in chat container: {:?}", lines);
+        // Welcome title is "rpi" (accent bold) + "interactive TUI" (muted),
+        // joined by an ANSI reset — strip ANSI before checking the substring.
+        let plain = strip_ansi(&all);
+        assert!(plain.contains("rpi"), "Welcome message not in chat container: {:?}", lines);
     }
 
     /// Reproduction for "Tab 补全了但显示没刷新": after `accept_top_suggestion`

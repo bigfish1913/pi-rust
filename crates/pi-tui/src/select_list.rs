@@ -222,6 +222,18 @@ impl SelectList {
             KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.move_down();
             }
+            KeyCode::PageUp => {
+                // Page up in the list (tui.select.pageUp).
+                for _ in 0..self.max_visible.saturating_sub(1) {
+                    self.move_up();
+                }
+            }
+            KeyCode::PageDown => {
+                // Page down in the list (tui.select.pageDown).
+                for _ in 0..self.max_visible.saturating_sub(1) {
+                    self.move_down();
+                }
+            }
             _ => {}
         }
     }

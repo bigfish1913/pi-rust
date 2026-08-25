@@ -659,6 +659,71 @@ impl Editor {
         }
     }
 
+    /// Kill the word before the cursor (Ctrl+W / Alt+Backspace): Emacs
+    /// backward-kill-word — skip the current word, then the intervening
+    /// delimiters, landing on the previous word's start.
+    fn kill_word_backward(&self) {
+        self.push_undo("kill");
+        let killed = if let Ok(mut state) = self.state.lock() {
+            let row = state.cursor_row;
+            let col = state.cursor_col;
+            let start = crate::word_navigation::find_word_backward(
+                &state.lines[row],
+                col,
+            );
+            let dead: String = state.lines[row].drain(start..col).collect();
+            state.cursor_col = start;
+            dead
+        } else {
+            String::new()
+        };
+        self.kill(killed, true);
+        self.notify_change();
+    }
+
+    /// Kill the word after the cursor (Alt+D / Alt+Delete).
+    fn kill_word_forward(&self) {
+        self.push_undo("kill");
+        let killed = if let Ok(mut state) = self.state.lock() {
+            let row = state.cursor_row;
+            let col = state.cursor_col;
+            // Kill only the current word (not the trailing delimiter) —
+            // `find_word_end` stops at the last word char.
+            let end = crate::word_navigation::find_word_end(
+                &state.lines[row],
+                col,
+            );
+            let dead: String = state.lines[row].drain(col..end).collect();
+            dead
+        } else {
+            String::new()
+        };
+        self.kill(killed, false);
+        self.notify_change();
+    }
+
+    /// Jump to the previous word boundary (Alt+Left).
+    fn cursor_word_left(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            let row = state.cursor_row;
+            state.cursor_col = crate::word_navigation::find_word_backward(
+                &state.lines[row],
+                state.cursor_col,
+            );
+        }
+    }
+
+    /// Jump to the next word boundary (Alt+Right).
+    fn cursor_word_right(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            let row = state.cursor_row;
+            state.cursor_col = crate::word_navigation::find_word_forward(
+                &state.lines[row],
+                state.cursor_col,
+            );
+        }
+    }
+
     /// Submit current text (Enter).
     fn submit(&self) {
         let text = self.get_text();
@@ -806,39 +871,19 @@ impl Editor {
             (KeyModifiers::CONTROL, KeyCode::Char('y')) => self.yank(),
             (KeyModifiers::ALT, KeyCode::Char('y')) => self.yank_pop(),
             // Delete the word before the cursor, killing it (Alt+Backspace).
-            (KeyModifiers::ALT, KeyCode::Backspace) => {
-                self.push_undo("kill");
-                let killed = if let Ok(mut state) = self.state.lock() {
-                    let row = state.cursor_row;
-                    let col = state.cursor_col;
-                    let bytes = state.lines[row].as_bytes();
-                    // Emacs backward-kill-word: skip the current word, then
-                    // the intervening delimiters, landing on the previous
-                    // word's start (or the line start).
-                    let mut start = col;
-                    while start > 0 {
-                        let b = bytes[start - 1];
-                        if !(b.is_ascii_alphanumeric() || b == b'_') {
-                            break;
-                        }
-                        start -= 1;
-                    }
-                    while start > 0 {
-                        let b = bytes[start - 1];
-                        if b.is_ascii_alphanumeric() || b == b'_' {
-                            break;
-                        }
-                        start -= 1;
-                    }
-                    let dead: String = state.lines[row].drain(start..col).collect();
-                    state.cursor_col = start;
-                    dead
-                } else {
-                    String::new()
-                };
-                self.kill(killed, true);
-                self.notify_change();
+            (KeyModifiers::CONTROL, KeyCode::Char('w')) => self.kill_word_backward(),
+            (KeyModifiers::ALT, KeyCode::Backspace) => self.kill_word_backward(),
+            (KeyModifiers::ALT, KeyCode::Char('d')) | (KeyModifiers::ALT, KeyCode::Delete) => {
+                self.kill_word_forward();
             }
+            // Word navigation (Alt+Left / Alt+Right — pi's word-jump bindings).
+            (KeyModifiers::ALT, KeyCode::Left) => self.cursor_word_left(),
+            (KeyModifiers::ALT, KeyCode::Right) => self.cursor_word_right(),
+            // Ctrl+J inserts a newline (pi tui.input.newLine alongside
+            // Shift+Enter). Ctrl+D deletes the char forward (deleteCharForward).
+            (KeyModifiers::CONTROL, KeyCode::Char('j')) => self.insert_no_undo("
+"),
+            (KeyModifiers::CONTROL, KeyCode::Char('d')) => self.delete(),
             
             // Regular character input
             (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char(c)) => {
@@ -1009,6 +1054,38 @@ mod tests {
 
 
 
+
+    #[test]
+    fn test_word_ops_and_new_keys() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mk = |m, c| crossterm::event::KeyEvent::new(c, m);
+        let editor = Editor::simple();
+        editor.insert("alpha beta gamma");
+
+        // Ctrl+W kills the word before the cursor.
+        editor.handle_key(mk(KeyModifiers::CONTROL, KeyCode::End));
+        editor.handle_key(mk(KeyModifiers::CONTROL, KeyCode::Char('w')));
+        assert_eq!(editor.get_text(), "alpha beta ");
+
+        // Alt+Left jumps back a word; Alt+D kills the word after.
+        editor.handle_key(mk(KeyModifiers::ALT, KeyCode::Left));
+        assert_eq!(editor.cursor_position(), (0, 6));
+        editor.handle_key(mk(KeyModifiers::ALT, KeyCode::Char('d')));
+        assert_eq!(editor.get_text(), "alpha  ");
+
+        // Ctrl+J inserts a newline.
+        editor.set_text("a");
+        editor.set_cursor(0, 1);
+        editor.handle_key(mk(KeyModifiers::CONTROL, KeyCode::Char('j')));
+        assert_eq!(editor.get_text(), "a
+");
+
+        // Ctrl+D deletes the char forward (deleteCharForward).
+        editor.set_text("abc");
+        editor.set_cursor(0, 1);
+        editor.handle_key(mk(KeyModifiers::CONTROL, KeyCode::Char('d')));
+        assert_eq!(editor.get_text(), "ac");
+    }
     #[test]
     fn test_selection_cut_copy_paste() {
         let editor = Editor::simple();
