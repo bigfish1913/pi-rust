@@ -49,7 +49,7 @@ pub struct BashTruncation {
 
 /// Component that displays a bash command execution with streaming output.
 pub struct BashExecutionComponent {
-    command: String,
+    command: Mutex<String>,
     output_lines: Mutex<Vec<String>>,
     status: Mutex<BashStatus>,
     exit_code: Mutex<Option<i32>>,
@@ -64,13 +64,23 @@ impl BashExecutionComponent {
         let loader = Loader::with_text("Running...");
         loader.start();
         Self {
-            command: command.into(),
+            command: Mutex::new(command.into()),
             output_lines: Mutex::new(Vec::new()),
             status: Mutex::new(BashStatus::Running),
             exit_code: Mutex::new(None),
             expanded: Mutex::new(false),
             truncation: Mutex::new(BashTruncation::default()),
             loader,
+        }
+    }
+
+    /// Backfill the command header when the panel was created from a
+    /// ToolExecutionUpdate (command unknown at that point) and the
+    /// ToolExecutionStart arrives later — replaces the empty `$ ` header.
+    pub fn set_command(&self, command: &str) {
+        let mut c = self.command.lock().unwrap();
+        if c.is_empty() {
+            *c = command.to_string();
         }
     }
 
@@ -187,7 +197,8 @@ impl Component for BashExecutionComponent {
         lines.extend(DynamicBorder::with_color(colors.border).render(width));
 
         // Command header: "$ {command}" in accent.
-        let header_text = format!("$ {}", self.command);
+        let command = self.command.lock().unwrap().clone();
+        let header_text = format!("$ {command}");
         let header_line = format!("  {}", colors.bash_mode.fg(&bold(&header_text)));
         lines.push(truncate_to_width(&header_line, width, "…"));
 

@@ -3131,13 +3131,18 @@ async fn handle_agent_event(
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let comp = Arc::new(BashExecutionComponent::new(command));
-                chat.add_child(comp.clone());
-                state
-                    .bash_components
-                    .lock()
-                    .unwrap()
-                    .insert(tool_call_id.clone(), comp);
+                let mut bash_map = state.bash_components.lock().unwrap();
+                if let Some(existing) = bash_map.get(&tool_call_id) {
+                    // A ToolExecutionUpdate already created the panel (fast
+                    // command — Update can arrive before Start); backfill the
+                    // command header instead of adding a SECOND panel, which
+                    // used to stack an empty "$ " box above the real one.
+                    existing.set_command(&command);
+                } else {
+                    let comp = Arc::new(BashExecutionComponent::new(command));
+                    chat.add_child(comp.clone());
+                    bash_map.insert(tool_call_id.clone(), comp);
+                }
             } else {
                 let comp = {
                     let mut tools = state.tool_components.lock().unwrap();

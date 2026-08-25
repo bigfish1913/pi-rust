@@ -1088,6 +1088,21 @@ fn merge_extension_tools(tools: &mut Vec<HarnessTool>, session: &ExtensionSessio
 /// Build the tool list per `--tools`/`--exclude-tools`/`--no-tools`/
 /// `--no-builtin-tools`. Mirrors the TS `tools`/`excludeTools`/`noTools`
 /// resolution in `createAgentSession`.
+/// Default bash timeout: 120s when the model doesn't pass one (prevents a
+/// forgotten `timeout` from hanging the run forever — the "卡住" report).
+/// `RPI_BASH_TIMEOUT` overrides; a model-supplied timeout always wins.
+pub fn bash_options() -> rpi_tools::tools::bash::BashToolOptions {
+    use rpi_tools::tools::bash::BashToolOptions;
+    let default = std::env::var("RPI_BASH_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(120.0);
+    BashToolOptions {
+        command_prefix: None,
+        default_timeout: Some(default),
+    }
+}
+
 fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
     if args.no_tools {
         return Vec::new();
@@ -1097,7 +1112,7 @@ fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
     // mutation queue — they go through the `FileSystem` trait only.
     let mut all: Vec<(&'static str, HarnessTool)> = vec![
         ("read", HarnessTool::new(create_read_tool(ctx, None))),
-        ("bash", HarnessTool::new(create_bash_tool(ctx, None))),
+        ("bash", HarnessTool::new(create_bash_tool(ctx, Some(bash_options())))),
         ("edit", HarnessTool::new(create_edit_tool(ctx))),
         ("write", HarnessTool::new(create_write_tool(ctx))),
         ("grep", HarnessTool::new(create_grep_tool(ctx, None))),

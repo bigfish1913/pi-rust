@@ -214,7 +214,7 @@ async fn supports_command_prefix() {
     env.register_shell("value=hello\necho hello", ShellScript::success("hello"))
         .await;
     let tool =
-        rpi_tools::create_bash_tool(&ctx, Some(BashToolOptions { command_prefix: Some("value=hello".into()) }));
+        rpi_tools::create_bash_tool(&ctx, Some(BashToolOptions { command_prefix: Some("value=hello".into()), default_timeout: None }));
     // The shell_script prefix-matches on the composed command start; echo is the
     // user command. Register a broader prefix to be safe.
     env.register_shell("value=hello", ShellScript::success("hello"))

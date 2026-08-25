@@ -56,6 +56,11 @@ pub struct BashToolDetails {
 pub struct BashToolOptions {
     /// Prepended to the command (separated by `\n`) before execution.
     pub command_prefix: Option<String>,
+    /// Fallback timeout in seconds applied when the model doesn't pass one.
+    /// pi has no default, but a model that forgets `timeout` can hang the run
+    /// forever (reported as "卡住") — rpi injects this at the harness build
+    /// site. A model-supplied timeout still wins.
+    pub default_timeout: Option<f64>,
 }
 
 /// The built-in `bash` tool. Holds an `Arc<dyn ExecutionEnv>` (read-only view
@@ -119,7 +124,7 @@ impl AgentTool for BashTool {
             Some(p) => format!("{p}\n{}", input.command),
             None => input.command,
         };
-        let timeout = input.timeout;
+        let timeout = input.timeout.or(self.options.default_timeout);
 
         // Initial empty update (mirrors TS `onUpdate?.({ content: [], details: undefined })`).
         emit_update(&on_update, String::new(), None, None);
