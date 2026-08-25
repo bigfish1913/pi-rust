@@ -3092,7 +3092,10 @@ async fn handle_agent_event(
         AgentEvent::ToolExecutionUpdate { tool_call_id, tool_name, partial_result, .. } => {
             if tool_name == "bash" {
                 // Append the streamed chunk to the bash component's preview.
-                let chunk = summarize_tool_result(&partial_result);
+                // RAW text (no single-line collapsing) — the old
+                // `summarize_tool_result` folded every newline into a `⏎`
+                // glyph, cramming e.g. `ls -la`'s listing onto one line.
+                let chunk = tool_result_text(&partial_result);
                 if let Some(bash) = state.bash_components.lock().unwrap().get(&tool_call_id) {
                     bash.append_output(&chunk);
                 } else {
@@ -3144,7 +3147,7 @@ async fn handle_agent_event(
                         .unwrap_or("")
                         .to_string();
                     let comp = Arc::new(BashExecutionComponent::new(command));
-                    comp.append_output(&summarize_tool_result(&result));
+                    comp.append_output(&tool_result_text(&result));
                     finalize_bash(&comp, &result, is_error);
                     chat.add_child(comp);
                 }
@@ -3237,6 +3240,21 @@ fn summarize_tool_result(result: &rpi_agent::AgentToolResult) -> String {
     } else {
         one_line
     }
+}
+
+/// The raw multi-line text of a tool result (no single-line collapsing). The
+/// bash panel needs the original line structure — the old path fed it through
+/// [`summarize_tool_result`], which folded every newline into a `⏎` glyph and
+/// crammed e.g. `ls -la`'s whole listing onto one line.
+fn tool_result_text(result: &rpi_agent::AgentToolResult) -> String {
+    use rpi_agent::TextContentOrImage;
+    let mut parts: Vec<String> = Vec::new();
+    for c in &result.content {
+        if let TextContentOrImage::Text(t) = c {
+            parts.push(t.text.clone());
+        }
+    }
+    parts.join("\n")
 }
 
 // ===========================================================================

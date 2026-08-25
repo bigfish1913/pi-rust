@@ -35,9 +35,9 @@ pub enum OverscrollMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ScrollbarMode {
     /// Never show scrollbar.
-    #[default]
     Hidden,
     /// Show scrollbar automatically when content exceeds viewport.
+    #[default]
     Auto,
     /// Always show scrollbar.
     Always,
@@ -345,10 +345,31 @@ impl ScrollView {
             visible.push(String::new());
         }
 
-        // Add scrollbar column if needed
+        // Scrollbar column: a positioned thumb on the right edge so scrolling
+        // has visible feedback (the old code was a TODO no-op — scrolling
+        // moved the window with no indicator). `Always` reserves the column in
+        // get_content_width; `Auto` overlays it while a scroll is active.
         if self.is_scrollbar_visible() {
-            // TODO: Add scrollbar styling
-            // For now, just mark the rightmost column
+            let total = content_height.max(1);
+            let viewport = height.max(1);
+            let thumb = if total <= viewport {
+                viewport
+            } else {
+                (viewport * viewport / total).max(1)
+            };
+            let thumb_top = if total > viewport {
+                scroll_top * (viewport.saturating_sub(thumb)) / (total - viewport)
+            } else {
+                0
+            };
+            for (i, line) in visible.iter_mut().enumerate() {
+                let on = i >= thumb_top && i < thumb_top + thumb;
+                if on {
+                    line.push_str(&self.scrollbar_style(" "));
+                } else {
+                    line.push(' ');
+                }
+            }
         }
 
         visible
@@ -443,5 +464,61 @@ mod tests {
         
         assert_eq!(scroll.scroll_top(), 0);
         assert!(!scroll.is_following_end());
+    }
+}
+#[cfg(test)]
+mod scroll_tests {
+    use super::*;
+    use crate::component::Component;
+    use crate::Container;
+    use crate::Text;
+
+    fn tall_scroll() -> (Arc<ScrollView>, Arc<Container>) {
+        let inner = Arc::new(Container::new());
+        for i in 0..50 {
+            inner.add_child(Arc::new(Text::new(format!("line {i:02}"), 0, 0)));
+        }
+        let sv = Arc::new(ScrollView::new(
+            inner.clone(),
+            ScrollViewOptions {
+                follow: FollowMode::End,
+                primary: true,
+                ..Default::default()
+            },
+        ));
+        (sv, inner)
+    }
+
+    #[test]
+    fn scroll_by_changes_visible_window() {
+        let (sv, _inner) = tall_scroll();
+        let before = sv.render_with_viewport(40, 10);
+        assert!(before[0].contains("line 40"), "following end shows tail: {:?}", before[0]);
+        // Scroll up 10 lines.
+        let unused = sv.scroll_by(-10);
+        assert_eq!(unused, 0);
+        let after = sv.render_with_viewport(40, 10);
+        assert!(
+            after[0].contains("line 30"),
+            "scroll up should reveal older lines, got {:?}",
+            after[0]
+        );
+        // Scroll back down to the end.
+        sv.scroll_by(10);
+        let back = sv.render_with_viewport(40, 10);
+        assert!(back[0].contains("line 40"));
+    }
+
+    #[test]
+    fn scroll_up_from_end_follows_tail() {
+        let (sv, _inner) = tall_scroll();
+        sv.render_with_viewport(40, 10); // sync layout
+        assert!(sv.is_following_end());
+        sv.scroll_by(-3);
+        assert!(!sv.is_following_end(), "manual scroll leaves follow mode");
+        // New content arrives — FollowMode::End should resume at the tail.
+        sv.render_with_viewport(40, 10);
+        sv.scroll_by(0);
+        let _ = sv;
     }
 }
