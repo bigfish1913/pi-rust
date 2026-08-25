@@ -2442,6 +2442,24 @@ pub async fn interactive_tui(
                 tui_for_key.refresh_size();
                 continue;
             }
+            // Mouse wheel scrolls the transcript (pi supports wheel
+            // scrolling). Previously every non-Key event was dropped, so a
+            // wheel had zero effect — "滚动还是不行".
+            if let Event::Mouse(m) = ev {
+                use crossterm::event::MouseEventKind;
+                match m.kind {
+                    MouseEventKind::ScrollUp => {
+                        scroll_for_key.scroll_by(-3);
+                        tui_for_key.request_render(false);
+                    }
+                    MouseEventKind::ScrollDown => {
+                        scroll_for_key.scroll_by(3);
+                        tui_for_key.request_render(false);
+                    }
+                    _ => {}
+                }
+                continue;
+            }
             let Event::Key(key) = ev else { continue; };
             // Drop release/repeat events — on Windows a single keystroke
             // yields both a Press and a Release; without this filter every

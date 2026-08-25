@@ -677,3 +677,35 @@ mod tests {
         // rely on the is_primary branch in layout_scroll_view.)
     }
 }
+
+#[cfg(test)]
+mod scroll_layout_tests {
+    use super::*;
+    use crate::{Container, ScrollView, ScrollViewOptions, Text};
+    use crate::component::Component;
+
+    fn tall() -> (Arc<ScrollView>, Arc<Container>) {
+        let inner = Arc::new(Container::new());
+        for i in 0..50 {
+            inner.add_child(Arc::new(Text::new(format!("row {i:02}"), 0, 0)));
+        }
+        let sv = Arc::new(ScrollView::new(
+            inner.clone(),
+            ScrollViewOptions { follow: crate::FollowMode::End, primary: true, ..Default::default() },
+        ));
+        (sv, inner)
+    }
+
+    #[test]
+    fn layout_scroll_view_respects_scroll_top() {
+        let (sv, _) = tall();
+        let root: Arc<dyn Component> = sv.clone();
+        // Initial: following end → tail visible.
+        let f1 = render_layout_frame(root.clone(), 40, 10);
+        assert!(f1.lines[0].contains("row 40"), "tail visible: {:?}", f1.lines[0]);
+        // Scroll up, then re-layout: older rows must appear.
+        sv.scroll_by(-10);
+        let f2 = render_layout_frame(root, 40, 10);
+        assert!(f2.lines[0].contains("row 30"), "after scroll-up, row 30 top: {:?}", f2.lines[0]);
+    }
+}
