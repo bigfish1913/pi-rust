@@ -40,7 +40,11 @@ impl FooterComponent {
         Self {
             status: Mutex::new(String::new()),
             model: Mutex::new("claude-sonnet-5".to_string()),
-            hints: Mutex::new("Ctrl+C: Exit | Enter: Send | Shift+Enter: New line".to_string()),
+            // Compact default so the right-aligned hints actually fit
+            // alongside the model on an 80-col terminal (the render path
+            // drops hints when `left + right + 2 > width`; the old 50-char
+            // default was silently dropped on every common width).
+            hints: Mutex::new("Enter send · Ctrl+C abort · /help".to_string()),
             thinking_level: Mutex::new(None),
         }
     }

@@ -26,20 +26,35 @@ use crate::utils::{truncate_to_width, visible_width};
 ///
 /// `width` is the available column count; long diff lines are clipped with
 /// `…` rather than wrapped (a wrapped diff is unreadable).
+///
+/// Layout: a fixed 4-col gutter `SIGN NUM│ ` where SIGN is `+`/`-`/` `, NUM
+/// is the right-aligned line number, and `│` is a thin themed rule. The
+/// content body follows after the gutter. This lines every diff row up on a
+/// shared left edge (the old `+123 content` format let the content column
+/// drift with line-number width) and gives +/- a consistent glyph column.
 pub fn render_diff(diff_text: &str, width: usize) -> Vec<String> {
     let colors = &theme().colors;
     let removed_color = colors.tool_diff_removed; // red
     let added_color = colors.tool_diff_added; // green
     let context_color = colors.tool_diff_context; // dim
+    let gutter_color = colors.dim;
 
     let lines: Vec<&str> = diff_text.split('\n').collect();
+    // Right-align line numbers to a shared width so the gutter rule `│`
+    // stays in one column across the whole hunk.
+    let num_width = lines
+        .iter()
+        .filter_map(|l| parse_diff_line(l))
+        .map(|p| p.line_num.len())
+        .max()
+        .unwrap_or(1);
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
 
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i];
         let Some(parsed) = parse_diff_line(line) else {
-            // Unparseable line — render as dim context.
+            // Unparseable line — render as dim context with no gutter.
             out.push(context_color.fg(&clip(line, width)));
             i += 1;
             continue;
@@ -65,49 +80,57 @@ pub fn render_diff(diff_text: &str, width: usize) -> Vec<String> {
 
             if removed.len() == 1 && added.len() == 1 {
                 // Single-line modification → intra-line word diff.
-                let (rem_line, add_line) = render_intra_line_diff(
+                let (rem_body, add_body) = render_intra_line_diff(
                     &replace_tabs(&removed[0].content),
                     &replace_tabs(&added[0].content),
                 );
-                out.push(removed_color.fg(&clip(
-                    &format!("-{} {}", removed[0].line_num, rem_line),
-                    width,
-                )));
-                out.push(added_color.fg(&clip(
-                    &format!("+{} {}", added[0].line_num, add_line),
-                    width,
-                )));
+                out.push(render_diff_row('-', &removed[0].line_num, &rem_body,
+                    removed_color, gutter_color, num_width, width));
+                out.push(render_diff_row('+', &added[0].line_num, &add_body,
+                    added_color, gutter_color, num_width, width));
             } else {
                 for r in &removed {
-                    out.push(removed_color.fg(&clip(
-                        &format!("-{} {}", r.line_num, replace_tabs(&r.content)),
-                        width,
-                    )));
+                    out.push(render_diff_row('-', &r.line_num, &replace_tabs(&r.content),
+                        removed_color, gutter_color, num_width, width));
                 }
                 for a in &added {
-                    out.push(added_color.fg(&clip(
-                        &format!("+{} {}", a.line_num, replace_tabs(&a.content)),
-                        width,
-                    )));
+                    out.push(render_diff_row('+', &a.line_num, &replace_tabs(&a.content),
+                        added_color, gutter_color, num_width, width));
                 }
             }
         } else if parsed.prefix == '+' {
-            out.push(added_color.fg(&clip(
-                &format!("+{} {}", parsed.line_num, replace_tabs(&parsed.content)),
-                width,
-            )));
+            out.push(render_diff_row('+', &parsed.line_num, &replace_tabs(&parsed.content),
+                added_color, gutter_color, num_width, width));
             i += 1;
         } else {
             // Context line.
-            out.push(context_color.fg(&clip(
-                &format!(" {} {}", parsed.line_num, replace_tabs(&parsed.content)),
-                width,
-            )));
+            out.push(render_diff_row(' ', &parsed.line_num, &replace_tabs(&parsed.content),
+                context_color, gutter_color, num_width, width));
             i += 1;
         }
     }
 
     out
+}
+
+/// Render one diff row with a themed gutter: `SIGN NUM│ body`.
+/// `body` may already carry ANSI (intra-line inverse highlights); `clip`
+/// handles that. The sign and the gutter rule use `gutter_color` so the
+/// colored body (red/green/dim) reads as the payload, not the chrome.
+fn render_diff_row(
+    sign: char,
+    line_num: &str,
+    body: &str,
+    body_color: crate::theme::Color,
+    gutter_color: crate::theme::Color,
+    num_width: usize,
+    width: usize,
+) -> String {
+    let num = format!("{num:>num_width$}", num = line_num, num_width = num_width);
+    let gutter = format!("{} {}{}", gutter_color.fg(&sign.to_string()),
+        gutter_color.fg(&num), gutter_color.fg("│"));
+    let body = format!(" {}", body_color.fg(body));
+    clip(&format!("{}{}", gutter, body), width)
 }
 
 #[derive(Debug)]

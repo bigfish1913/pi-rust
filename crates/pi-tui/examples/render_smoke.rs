@@ -61,7 +61,7 @@ fn main() {
     }
 
     // ---- ToolExecutionComponent with attached diff ----
-    let comp = ToolExecutionComponent::new("edit", "{\"file_path\":\"src/main.rs\"}");
+    let comp = ToolExecutionComponent::new("edit", r#"{"path":"src/main.rs"}"#);
     comp.set_result("Successfully replaced 2 block(s) in src/main.rs", false);
     comp.set_diff(render_diff(diff, width));
     println!();
@@ -71,7 +71,7 @@ fn main() {
     }
 
     // ---- ToolExecutionComponent in error state (red bg tint + ✗ glyph) ----
-    let err = ToolExecutionComponent::new("bash", "rm -rf /");
+    let err = ToolExecutionComponent::new("bash", r#"{"command":"rm -rf /"}"#);
     err.set_result("command not found: rm", true);
     println!();
     println!("╔══ ToolExecutionComponent (failed) ════════════════════════════════╗");

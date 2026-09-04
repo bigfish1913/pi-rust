@@ -79,3 +79,4 @@ rpi-extensions = { path = "crates/rpi-extensions", version = "0.1.4" }
 [profile.release]
 lto = "thin"
 codegen-units = 16
+strip = "symbols"

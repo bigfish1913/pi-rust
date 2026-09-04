@@ -195,9 +195,10 @@ impl AssistantMessageComponent {
             return;
         }
 
-        // Leading spacer, matching the TS `Spacer(1)` before the first block.
-        self.content_container.add_child(Arc::new(Spacer::new(1)));
-
+        // No leading spacer here — the host adds a Spacer(1) after each
+        // transcript entry, which already separates this message from the
+        // one above. A leading spacer stacked with the host's trailing one
+        // produced a double blank between messages.
         let mut i = 0;
         while i < blocks.len() {
             let block = &blocks[i];

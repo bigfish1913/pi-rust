@@ -65,7 +65,7 @@ pub mod word_navigation;
 
 // Re-export main types
 pub use alt_screen_search::{AltScreenSearch, SearchMatch, SearchState};
-pub use ansi::{strip_ansi, visible_width, CURSOR_MARKER};
+pub use ansi::{bold, strip_ansi, visible_width, CURSOR_MARKER};
 pub use armin::ArminComponent;
 pub use assistant_message::{AssistantBlock, AssistantMessageComponent, AssistantMessageOptions};
 pub use autocomplete::{
