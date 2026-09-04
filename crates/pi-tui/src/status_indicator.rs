@@ -190,7 +190,11 @@ impl Component for StatusIndicator {
         };
 
         let spinner = self.spinner_char();
-        let prefix = format!("{} {}", spinner_color.fg(&spinner.to_string()), msg_color.fg(&time_str));
+        let prefix = format!(
+            "{} {}",
+            spinner_color.fg(&spinner.to_string()),
+            msg_color.fg(&time_str)
+        );
         let prefix_w = visible_width(&prefix);
 
         // Truncate message to fit remaining width, leaving a separating space.

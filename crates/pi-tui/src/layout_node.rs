@@ -17,7 +17,10 @@ pub struct LayoutViewport {
 
 impl Default for LayoutViewport {
     fn default() -> Self {
-        Self { width: 80, height: 24 }
+        Self {
+            width: 80,
+            height: 24,
+        }
     }
 }
 
@@ -146,7 +149,9 @@ pub fn allocate_stack_sizes(
         .iter()
         .enumerate()
         .map(|(i, entry)| {
-            let basis = entry.basis.unwrap_or_else(|| intrinsic_sizes.get(i).copied().unwrap_or(0));
+            let basis = entry
+                .basis
+                .unwrap_or_else(|| intrinsic_sizes.get(i).copied().unwrap_or(0));
             basis.clamp(entry.min_size, entry.max_size)
         })
         .collect();
@@ -162,7 +167,7 @@ pub fn allocate_stack_sizes(
 
             if total_grow > 0 {
                 let mut to_distribute = remaining;
-                
+
                 // First pass: distribute proportionally
                 for (i, entry) in entries.iter().enumerate() {
                     if entry.grow > 0 && to_distribute > 0 {
@@ -220,7 +225,10 @@ pub fn allocate_stack_sizes(
 }
 
 /// Filter visible stack entries based on viewport.
-pub fn visible_stack_entries(entries: &[StackLayoutEntry], viewport: LayoutViewport) -> Vec<StackLayoutEntry> {
+pub fn visible_stack_entries(
+    entries: &[StackLayoutEntry],
+    viewport: LayoutViewport,
+) -> Vec<StackLayoutEntry> {
     entries
         .iter()
         .filter(|entry| entry.visible.map(|v| v(viewport)).unwrap_or(true))

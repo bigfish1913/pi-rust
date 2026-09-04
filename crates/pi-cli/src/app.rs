@@ -58,7 +58,7 @@ pub async fn run() -> i32 {
         return crate::auth::run(&argv[1..]).await;
     }
 
-    let parsed = parse_args(&argv);
+    let mut parsed = parse_args(&argv);
 
     // ---- --help / --version short-circuit (before any heavy work) ----
     if parsed.help {
@@ -94,6 +94,27 @@ pub async fn run() -> i32 {
     // set (an explicit override is its own layout).
     let _ = crate::config::migrate_legacy_layout();
 
+    // `-r/--resume` is an interactive picker, unlike `-c/--continue` which
+    // immediately opens the latest session. Resolve the picker result before
+    // building the harness so cancelling does not create or modify a session.
+    if parsed.resume {
+        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+            eprintln!("error: --resume requires an interactive terminal");
+            return EXIT_USAGE;
+        }
+        match crate::resume_picker::select(&cwd).await {
+            Ok(Some(id)) => {
+                parsed.resume = false;
+                parsed.session = Some(id);
+            }
+            Ok(None) => return 0,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return EXIT_RUNTIME;
+            }
+        }
+    }
+
     // ---- Startup warnings (ignored-but-recognized flags) ----
     if parsed.verbose {
         for warn in &parsed.ignored {
@@ -114,9 +135,12 @@ pub async fn run() -> i32 {
     };
 
     // ---- initial message + extra messages (TS buildInitialMessage) ----
-    let file_text_opt = if file_text.is_empty() { None } else { Some(file_text.as_str()) };
-    let (initial, extra) =
-        build_initial_message(&parsed, stdin_text.as_deref(), file_text_opt);
+    let file_text_opt = if file_text.is_empty() {
+        None
+    } else {
+        Some(file_text.as_str())
+    };
+    let (initial, extra) = build_initial_message(&parsed, stdin_text.as_deref(), file_text_opt);
 
     // ---- provider + model resolution ----
     let resolved = match resolve(
@@ -158,7 +182,11 @@ pub async fn run() -> i32 {
             matched.extend(hits);
         }
         let mut settings = crate::settings::load_settings().unwrap_or_default();
-        settings.scoped_models = if matched.is_empty() { None } else { Some(matched) };
+        settings.scoped_models = if matched.is_empty() {
+            None
+        } else {
+            Some(matched)
+        };
         if let Err(e) = crate::settings::save_settings(&settings) {
             eprintln!("warning: could not save --models scope: {e}");
         }
@@ -187,7 +215,10 @@ pub async fn run() -> i32 {
 
     // Debug/testing escape hatch: RPI_FORCE_TUI=1 forces interactive mode
     // (for testing the TUI in non-TTY environments).
-    let mode = if std::env::var("RPI_FORCE_TUI").map(|v| v == "1").unwrap_or(false) {
+    let mode = if std::env::var("RPI_FORCE_TUI")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
         RunMode::Interactive
     } else {
         mode
@@ -228,7 +259,10 @@ pub async fn run() -> i32 {
 fn read_piped_stdin() -> Option<String> {
     // Debug/testing escape hatch: RPI_SKIP_STDIN=1 skips reading piped stdin
     // (avoids blocking on non-TTY stdin in automated environments).
-    if std::env::var("RPI_SKIP_STDIN").map(|v| v == "1").unwrap_or(false) {
+    if std::env::var("RPI_SKIP_STDIN")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
         return None;
     }
     if std::io::stdin().is_terminal() {
@@ -289,10 +323,7 @@ fn process_file_args(
                 ));
             }
             Err(e) => {
-                return Err(format!(
-                    "could not read file {}: {e}",
-                    abs.display()
-                ));
+                return Err(format!("could not read file {}: {e}", abs.display()));
             }
         }
     }
@@ -303,7 +334,10 @@ fn process_file_args(
 /// have base64-attached. Used to route `@file` away from the text branch.
 fn is_likely_image(path: &Path) -> bool {
     matches!(
-        path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
         Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp")
     )
 }
@@ -330,7 +364,11 @@ fn build_initial_message(
     if !extra.is_empty() {
         parts.push(extra.remove(0));
     }
-    let initial = if parts.is_empty() { None } else { Some(parts.join("")) };
+    let initial = if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(""))
+    };
     (initial, extra)
 }
 

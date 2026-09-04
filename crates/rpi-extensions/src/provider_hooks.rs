@@ -14,9 +14,9 @@
 use std::sync::Arc;
 
 use rpi_ai::types::AssistantMessage;
+use rpi_ai::Context;
 use rpi_ai::{Model, ProviderHooks, SimpleStreamOptions, SimpleStreamOptionsPatch};
 use rpi_plugin_sdk::EventTag;
-use rpi_ai::Context;
 
 use crate::loader::ExtensionSession;
 use crate::registry::RegistrySnapshot;
@@ -144,8 +144,16 @@ mod tests {
 
         let mut registry = crate::registry::ExtensionRegistry::new();
         let handler: rpi_plugin_sdk::EventHandlerFn = counting_provider_handler;
-        registry.register_event_handler(EventTag::BeforeProviderRequest, handler, std::ptr::null_mut());
-        registry.register_event_handler(EventTag::BeforeProviderHeaders, handler, std::ptr::null_mut());
+        registry.register_event_handler(
+            EventTag::BeforeProviderRequest,
+            handler,
+            std::ptr::null_mut(),
+        );
+        registry.register_event_handler(
+            EventTag::BeforeProviderHeaders,
+            handler,
+            std::ptr::null_mut(),
+        );
         let snapshot = Arc::new(registry.snapshot());
 
         // dispatch_data_event directly: one request event ⇒ one hit.

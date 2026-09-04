@@ -7,8 +7,10 @@
 use std::sync::Arc;
 
 use rpi_tools::{
-    ExecutionEnv, FileContent, FileKind, InMemoryExecutionEnv, OsExecutionEnv,
+    ExecutionEnv, ExecutionErrorCode, FileContent, FileKind, InMemoryExecutionEnv, OsExecutionEnv,
+    Shell, ShellExecOptions,
 };
+use tokio_util::sync::CancellationToken;
 
 /// The conformance suite, generic over any `ExecutionEnv`. Each case seeds a
 /// relative path against the env's cwd and asserts the documented behavior.
@@ -19,7 +21,10 @@ async fn run_suite(env: Arc<dyn ExecutionEnv>) {
         .await
         .expect("absolute_path");
     assert!(abs.is_absolute(), "absolute_path yields absolute");
-    let joined = env.join_path(&["a", "b", "c"], None).await.expect("join_path");
+    let joined = env
+        .join_path(&["a", "b", "c"], None)
+        .await
+        .expect("join_path");
     assert!(joined.ends_with("c"));
 
     // write_file creates parent dirs + round-trips text.
@@ -82,4 +87,39 @@ async fn os_conforms_over_tempdir() {
     let env: Arc<dyn ExecutionEnv> = Arc::new(OsExecutionEnv::with_cwd(tmp.clone()));
     run_suite(env).await;
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[tokio::test]
+async fn os_cancel_interrupts_even_when_timeout_is_set() {
+    let tmp = std::env::temp_dir().join(format!("pi-tools-cancel-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp);
+    let env = OsExecutionEnv::with_cwd(tmp.clone());
+    let cancel = CancellationToken::new();
+    let cancel_after_start = cancel.clone();
+    let started = std::time::Instant::now();
+
+    let cancel_task = async move {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        cancel_after_start.cancel();
+    };
+    let exec_task = env.exec(
+        "sleep 30",
+        ShellExecOptions {
+            timeout: Some(2.0),
+            cancel: Some(&cancel),
+            ..Default::default()
+        },
+    );
+    let (_, result) = tokio::join!(cancel_task, exec_task);
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    match result {
+        Err(error) if error.code == ExecutionErrorCode::ShellUnavailable => return,
+        Err(error) => assert_eq!(error.code, ExecutionErrorCode::Aborted),
+        Ok(_) => panic!("cancelled command unexpectedly completed"),
+    }
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(1500),
+        "cancellation waited for the configured timeout"
+    );
 }

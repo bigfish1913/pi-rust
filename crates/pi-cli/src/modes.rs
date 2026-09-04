@@ -264,7 +264,9 @@ pub async fn interactive(
     reload_context: &crate::session::ReloadContext,
 ) -> i32 {
     // Check if TUI is supported
-    let force_tui = std::env::var("RPI_FORCE_TUI").map(|v| v == "1").unwrap_or(false);
+    let force_tui = std::env::var("RPI_FORCE_TUI")
+        .map(|v| v == "1")
+        .unwrap_or(false);
     if force_tui || crate::interactive_tui::is_tui_supported() {
         // Use TUI-based interactive mode
         crate::interactive_tui::interactive_tui(
@@ -297,7 +299,9 @@ pub async fn interactive_repl(
     let is_tty = stdin.is_terminal();
 
     if is_tty {
-        println!("rpi interactive (v1 minimal REPL). Type /exit to quit, /abort to cancel a run.\n");
+        println!(
+            "rpi interactive (v1 minimal REPL). Type /exit to quit, /abort to cancel a run.\n"
+        );
     }
 
     // Run the initial prompt + extra messages first (same as print mode).
@@ -360,7 +364,11 @@ async fn run_one(lane: &Arc<dyn AgentLane>, prompt: &str) -> Result<(), i32> {
                         println!("{text}");
                     }
                 }
-                HarnessRunOutcome::Failed { error, final_message, .. } => {
+                HarnessRunOutcome::Failed {
+                    error,
+                    final_message,
+                    ..
+                } => {
                     if let Some(m) = final_message {
                         if let Some(em) = &m.error_message {
                             eprintln!("error: {em}");
@@ -384,7 +392,9 @@ async fn run_one(lane: &Arc<dyn AgentLane>, prompt: &str) -> Result<(), i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rpi_ai::types::{AssistantMessage, Content, StopReason, TextContent, TextContentType, Usage};
+    use rpi_ai::types::{
+        AssistantMessage, Content, StopReason, TextContent, TextContentType, Usage,
+    };
     use rpi_harness::session::types::OperationError;
 
     fn assistant(text: &str, stop: StopReason) -> AssistantMessage {
@@ -420,7 +430,10 @@ mod tests {
     fn outcome_exit_code_maps_failed_aborted_to_1() {
         let failed = HarnessRunOutcome::Failed {
             leaf_id: "l".into(),
-            error: OperationError { code: "boom".into(), message: "boom".into() },
+            error: OperationError {
+                code: "boom".into(),
+                message: "boom".into(),
+            },
             final_entry_id: None,
             final_message: None,
         };

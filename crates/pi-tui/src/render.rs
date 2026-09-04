@@ -36,7 +36,7 @@ pub fn render_to_buffer(
 /// Apply line resets to ensure styles don't leak between lines.
 pub fn apply_line_resets(lines: Vec<String>) -> Vec<String> {
     const SEGMENT_RESET: &str = "\x1b[0m\x1b]8;;\x07";
-    
+
     lines
         .into_iter()
         .map(|line| {
@@ -50,13 +50,13 @@ pub fn apply_line_resets(lines: Vec<String>) -> Vec<String> {
 }
 
 /// Composite a line from overlay onto a base line.
-/// 
+///
 /// # Arguments
 /// * `base` - The base line to composite onto
 /// * `overlay` - The overlay line to composite
 /// * `col` - The column position to start the overlay
 /// * `width` - The maximum width of the result line (for bounds checking)
-/// 
+///
 /// # Returns
 /// A new string with the overlay composited onto the base
 pub fn composite_line(base: &str, overlay: &str, col: usize, width: usize) -> String {
@@ -68,10 +68,10 @@ pub fn composite_line(base: &str, overlay: &str, col: usize, width: usize) -> St
 
     // For a simple implementation without ANSI handling:
     let base_chars: Vec<char> = base.chars().collect();
-    
+
     // Build the result
     let mut result = String::new();
-    
+
     // Add characters before the overlay position
     for i in 0..col {
         if i < base_chars.len() {
@@ -80,16 +80,16 @@ pub fn composite_line(base: &str, overlay: &str, col: usize, width: usize) -> St
             result.push(' ');
         }
     }
-    
+
     // Add the overlay
     result.push_str(overlay);
-    
+
     // Add characters after the overlay, skipping the replaced region
     let after_start = col + overlay_width;
     for i in after_start..base_chars.len() {
         result.push(base_chars[i]);
     }
-    
+
     result
 }
 

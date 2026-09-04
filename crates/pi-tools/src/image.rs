@@ -196,7 +196,7 @@ mod tests {
         bytes.extend_from_slice(b"IHDR");
         bytes.extend_from_slice(&[0u8; 13]);
         bytes.extend_from_slice(&[0u8; 4]); // CRC placeholder
-        // IDAT chunk (length 0) to terminate the acTL walk.
+                                            // IDAT chunk (length 0) to terminate the acTL walk.
         bytes.extend_from_slice(&0u32.to_be_bytes());
         bytes.extend_from_slice(b"IDAT");
         bytes.extend_from_slice(&[0u8; 4]); // CRC

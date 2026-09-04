@@ -84,8 +84,7 @@ pub struct AssistantMessageComponent {
     /// every `rebuild_content` (i.e. once per streaming delta + once on
     /// finalize), so the plugin always sees the latest full markdown; the FFI
     /// call is cheap (a bare fn-pointer invocation + one JSON round-trip).
-    markdown_transformer:
-        Mutex<Option<Arc<dyn Fn(&str) -> String + Send + Sync>>>,
+    markdown_transformer: Mutex<Option<Arc<dyn Fn(&str) -> String + Send + Sync>>>,
 }
 
 impl AssistantMessageComponent {
@@ -184,10 +183,10 @@ impl AssistantMessageComponent {
         self.content_container.clear();
 
         let opts = self.options.lock().unwrap().clone();
-        let has_visible = blocks
-            .iter()
-            .any(|b| matches!(b, AssistantBlock::Text(t) if !t.trim().is_empty())
-                || matches!(b, AssistantBlock::Thinking(t) if !t.trim().is_empty()));
+        let has_visible = blocks.iter().any(|b| {
+            matches!(b, AssistantBlock::Text(t) if !t.trim().is_empty())
+                || matches!(b, AssistantBlock::Thinking(t) if !t.trim().is_empty())
+        });
 
         if !has_visible {
             // Empty / whitespace-only content renders nothing (matches the TS
@@ -264,10 +263,10 @@ impl AssistantMessageComponent {
 
                     // Spacer before a following visible block (TS
                     // `hasVisibleContentAfter` → Spacer(1)).
-                    let has_after = blocks[i..]
-                        .iter()
-                        .any(|b| matches!(b, AssistantBlock::Text(t) if !t.trim().is_empty())
-                            || matches!(b, AssistantBlock::Thinking(t) if !t.trim().is_empty()));
+                    let has_after = blocks[i..].iter().any(|b| {
+                        matches!(b, AssistantBlock::Text(t) if !t.trim().is_empty())
+                            || matches!(b, AssistantBlock::Thinking(t) if !t.trim().is_empty())
+                    });
                     if has_after {
                         self.content_container.add_child(Arc::new(Spacer::new(1)));
                     }
@@ -340,9 +339,7 @@ impl AssistantMessageComponent {
     /// reads this to carry an existing transform into a fresh component (e.g.
     /// after a `/reload`) so the new component renders with the same plugin
     /// transformer without the host re-querying the registry.
-    pub fn markdown_transformer(
-        &self,
-    ) -> Option<Arc<dyn Fn(&str) -> String + Send + Sync>> {
+    pub fn markdown_transformer(&self) -> Option<Arc<dyn Fn(&str) -> String + Send + Sync>> {
         self.markdown_transformer.lock().unwrap().clone()
     }
 
@@ -437,7 +434,10 @@ mod tests {
         let text_pos = joined.find("Here is the answer");
         assert!(think_pos.is_some(), "thinking not rendered: {joined}");
         assert!(text_pos.is_some(), "text not rendered: {joined}");
-        assert!(think_pos < text_pos, "thinking should precede text: {joined}");
+        assert!(
+            think_pos < text_pos,
+            "thinking should precede text: {joined}"
+        );
     }
 
     #[test]
@@ -489,7 +489,10 @@ mod tests {
         assert!(before.contains("internal"));
         msg.set_hide_thinking(true);
         let after = strip_ansi(&msg.render(80).join("\n"));
-        assert!(!after.contains("internal"), "not rebuilt after toggle: {after}");
+        assert!(
+            !after.contains("internal"),
+            "not rebuilt after toggle: {after}"
+        );
         assert!(after.contains("Thinking..."));
     }
 

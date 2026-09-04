@@ -64,16 +64,24 @@ pub fn render_diff(diff_text: &str, width: usize) -> Vec<String> {
             // Collect consecutive removed lines.
             let mut removed: Vec<ParsedLine> = Vec::new();
             while i < lines.len() {
-                let Some(p) = parse_diff_line(lines[i]) else { break };
-                if p.prefix != '-' { break; }
+                let Some(p) = parse_diff_line(lines[i]) else {
+                    break;
+                };
+                if p.prefix != '-' {
+                    break;
+                }
                 removed.push(p);
                 i += 1;
             }
             // Collect consecutive added lines immediately after.
             let mut added: Vec<ParsedLine> = Vec::new();
             while i < lines.len() {
-                let Some(p) = parse_diff_line(lines[i]) else { break };
-                if p.prefix != '+' { break; }
+                let Some(p) = parse_diff_line(lines[i]) else {
+                    break;
+                };
+                if p.prefix != '+' {
+                    break;
+                }
                 added.push(p);
                 i += 1;
             }
@@ -84,28 +92,70 @@ pub fn render_diff(diff_text: &str, width: usize) -> Vec<String> {
                     &replace_tabs(&removed[0].content),
                     &replace_tabs(&added[0].content),
                 );
-                out.push(render_diff_row('-', &removed[0].line_num, &rem_body,
-                    removed_color, gutter_color, num_width, width));
-                out.push(render_diff_row('+', &added[0].line_num, &add_body,
-                    added_color, gutter_color, num_width, width));
+                out.push(render_diff_row(
+                    '-',
+                    &removed[0].line_num,
+                    &rem_body,
+                    removed_color,
+                    gutter_color,
+                    num_width,
+                    width,
+                ));
+                out.push(render_diff_row(
+                    '+',
+                    &added[0].line_num,
+                    &add_body,
+                    added_color,
+                    gutter_color,
+                    num_width,
+                    width,
+                ));
             } else {
                 for r in &removed {
-                    out.push(render_diff_row('-', &r.line_num, &replace_tabs(&r.content),
-                        removed_color, gutter_color, num_width, width));
+                    out.push(render_diff_row(
+                        '-',
+                        &r.line_num,
+                        &replace_tabs(&r.content),
+                        removed_color,
+                        gutter_color,
+                        num_width,
+                        width,
+                    ));
                 }
                 for a in &added {
-                    out.push(render_diff_row('+', &a.line_num, &replace_tabs(&a.content),
-                        added_color, gutter_color, num_width, width));
+                    out.push(render_diff_row(
+                        '+',
+                        &a.line_num,
+                        &replace_tabs(&a.content),
+                        added_color,
+                        gutter_color,
+                        num_width,
+                        width,
+                    ));
                 }
             }
         } else if parsed.prefix == '+' {
-            out.push(render_diff_row('+', &parsed.line_num, &replace_tabs(&parsed.content),
-                added_color, gutter_color, num_width, width));
+            out.push(render_diff_row(
+                '+',
+                &parsed.line_num,
+                &replace_tabs(&parsed.content),
+                added_color,
+                gutter_color,
+                num_width,
+                width,
+            ));
             i += 1;
         } else {
             // Context line.
-            out.push(render_diff_row(' ', &parsed.line_num, &replace_tabs(&parsed.content),
-                context_color, gutter_color, num_width, width));
+            out.push(render_diff_row(
+                ' ',
+                &parsed.line_num,
+                &replace_tabs(&parsed.content),
+                context_color,
+                gutter_color,
+                num_width,
+                width,
+            ));
             i += 1;
         }
     }
@@ -127,8 +177,12 @@ fn render_diff_row(
     width: usize,
 ) -> String {
     let num = format!("{num:>num_width$}", num = line_num, num_width = num_width);
-    let gutter = format!("{} {}{}", gutter_color.fg(&sign.to_string()),
-        gutter_color.fg(&num), gutter_color.fg("│"));
+    let gutter = format!(
+        "{} {}{}",
+        gutter_color.fg(&sign.to_string()),
+        gutter_color.fg(&num),
+        gutter_color.fg("│")
+    );
     let body = format!(" {}", body_color.fg(body));
     clip(&format!("{}{}", gutter, body), width)
 }
@@ -272,8 +326,14 @@ mod tests {
         let diff = "-1 hello world\n+1 hello earth";
         let lines = render_diff(diff, 80);
         // The removed line highlights "world", the added line highlights "earth".
-        assert!(lines[0].contains("\x1b[7m"), "removed intra-line not inversed");
-        assert!(lines[1].contains("\x1b[7m"), "added intra-line not inversed");
+        assert!(
+            lines[0].contains("\x1b[7m"),
+            "removed intra-line not inversed"
+        );
+        assert!(
+            lines[1].contains("\x1b[7m"),
+            "added intra-line not inversed"
+        );
         assert!(lines[1].contains("earth"));
     }
 

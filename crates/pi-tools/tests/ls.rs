@@ -67,7 +67,10 @@ async fn ls_lists_entries_with_dir_suffix() {
     let result = run_ls(tool, serde_json::json!({})).await.expect("ls ok");
     let out = text_output(&result);
     // Directory gets a `/` suffix; files do not.
-    assert!(out.contains("sub/"), "dir should have trailing slash: {out}");
+    assert!(
+        out.contains("sub/"),
+        "dir should have trailing slash: {out}"
+    );
     assert!(out.contains("alpha.txt"), "file alpha present: {out}");
     assert!(out.contains("beta.md"), "file beta present: {out}");
 }

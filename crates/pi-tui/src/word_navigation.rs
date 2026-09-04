@@ -4,12 +4,8 @@
 
 /// Characters that are considered word boundaries.
 const WORD_BOUNDARY_CHARS: &[char] = &[
-    ' ', '\t', '\n', '\r',
-    '-', '_', '.', '/', ':', '\\',
-    '(', ')', '[', ']', '{', '}',
-    '<', '>', '=', '+', '*', '&', '|', '!',
-    '@', '#', '$', '%', '^', '~', '`',
-    ',', ';', '"', '\'',
+    ' ', '\t', '\n', '\r', '-', '_', '.', '/', ':', '\\', '(', ')', '[', ']', '{', '}', '<', '>',
+    '=', '+', '*', '&', '|', '!', '@', '#', '$', '%', '^', '~', '`', ',', ';', '"', '\'',
 ];
 
 /// Check if a character is a word boundary.
@@ -114,13 +110,15 @@ pub fn find_line_start(text: &str, position: usize) -> usize {
     }
 
     // Work with byte positions, converting as needed
-    let byte_pos = text.char_indices()
+    let byte_pos = text
+        .char_indices()
         .nth(position)
         .map(|(i, _)| i)
         .unwrap_or(text.len());
 
     // Find the previous newline
-    text[..byte_pos].rfind('\n')
+    text[..byte_pos]
+        .rfind('\n')
         .map(|i| {
             // Convert byte position to char position
             text[..i].chars().count() + 1
@@ -145,7 +143,7 @@ pub fn find_line_end(text: &str, position: usize) -> usize {
 /// Returns (start, end) indices of the word.
 pub fn get_current_word_range(text: &str, position: usize) -> (usize, usize) {
     let chars: Vec<char> = text.chars().collect();
-    
+
     if position >= chars.len() {
         return (position, position);
     }

@@ -97,6 +97,12 @@ impl ScrollViewState {
     }
 }
 
+#[derive(Clone)]
+struct ScrollRenderCache {
+    content_width: usize,
+    lines: Arc<Vec<String>>,
+}
+
 /// ScrollView - A scrollable container.
 ///
 /// Provides vertical scrolling with optional follow-end behavior.
@@ -107,6 +113,9 @@ pub struct ScrollView {
     child: Arc<dyn Component>,
     options: ScrollViewOptions,
     state: Arc<Mutex<ScrollViewState>>,
+    /// Last fully rendered child. Pure scroll frames only change which rows
+    /// are visible, so rebuilding the entire transcript would be wasted work.
+    render_cache: Arc<Mutex<Option<ScrollRenderCache>>>,
     /// Callback to request a render.
     request_render_callback: Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>,
 }
@@ -119,6 +128,7 @@ impl ScrollView {
             child,
             options,
             state: Arc::new(Mutex::new(ScrollViewState::new(follow))),
+            render_cache: Arc::new(Mutex::new(None)),
             request_render_callback: Arc::new(Mutex::new(None)),
         }
     }
@@ -130,11 +140,14 @@ impl ScrollView {
 
     /// Create a primary ScrollView with follow-end behavior.
     pub fn primary(child: Arc<dyn Component>) -> Self {
-        Self::new(child, ScrollViewOptions {
-            follow: FollowMode::End,
-            primary: true,
-            ..Default::default()
-        })
+        Self::new(
+            child,
+            ScrollViewOptions {
+                follow: FollowMode::End,
+                primary: true,
+                ..Default::default()
+            },
+        )
     }
 
     /// Get the child component.
@@ -149,7 +162,10 @@ impl ScrollView {
 
     /// Check if following the end.
     pub fn is_following_end(&self) -> bool {
-        self.state.lock().map(|s| s.is_following_end).unwrap_or(false)
+        self.state
+            .lock()
+            .map(|s| s.is_following_end)
+            .unwrap_or(false)
     }
 
     /// Get the viewport height.
@@ -172,8 +188,12 @@ impl ScrollView {
         match self.options.scrollbar {
             ScrollbarMode::Always => self.viewport_height() > 0,
             ScrollbarMode::Auto => {
-                self.content_height() > self.viewport_height() 
-                    && self.state.lock().map(|s| s.transient_scrollbar_visible).unwrap_or(false)
+                self.content_height() > self.viewport_height()
+                    && self
+                        .state
+                        .lock()
+                        .map(|s| s.transient_scrollbar_visible)
+                        .unwrap_or(false)
             }
             ScrollbarMode::Hidden => false,
         }
@@ -199,10 +219,14 @@ impl ScrollView {
 
         if let Ok(mut state) = self.state.lock() {
             let max_scroll = state.content_height.saturating_sub(state.viewport_height);
-            
+
             // If following end, start from the end position
-            let start = if state.is_following_end { max_scroll } else { state.scroll_top };
-            
+            let start = if state.is_following_end {
+                max_scroll
+            } else {
+                state.scroll_top
+            };
+
             let new_top = if delta > 0 {
                 start.saturating_add(delta as usize)
             } else {
@@ -211,9 +235,10 @@ impl ScrollView {
 
             let clamped = new_top.min(max_scroll);
             let moved = (clamped as i32) - (start as i32);
-            
+
             state.scroll_top = clamped;
-            state.is_following_end = self.options.follow == FollowMode::End && clamped >= max_scroll;
+            state.is_following_end =
+                self.options.follow == FollowMode::End && clamped >= max_scroll;
             state.follow_suppressed_at_end = false;
 
             // Mark scrollbar activity
@@ -245,9 +270,11 @@ impl ScrollView {
     /// Scroll to the start.
     pub fn scroll_to_start(&self) {
         if let Ok(mut state) = self.state.lock() {
-            let changed = state.scroll_top != 0 || state.is_following_end;
+            let content_fits = state.content_height <= state.viewport_height;
+            let following_end = self.options.follow == FollowMode::End && content_fits;
+            let changed = state.scroll_top != 0 || state.is_following_end != following_end;
             state.scroll_top = 0;
-            state.is_following_end = false;
+            state.is_following_end = following_end;
             state.follow_suppressed_at_end = false;
 
             if changed {
@@ -274,7 +301,12 @@ impl ScrollView {
     }
 
     /// Update layout information (called by the layout system).
-    pub fn update_layout(&self, content_height: usize, viewport_height: usize, request_render: Option<Arc<dyn Fn() + Send + Sync>>) {
+    pub fn update_layout(
+        &self,
+        content_height: usize,
+        viewport_height: usize,
+        request_render: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
         if let Ok(mut state) = self.state.lock() {
             state.content_height = content_height;
             state.viewport_height = viewport_height;
@@ -298,9 +330,9 @@ impl ScrollView {
             if state.scroll_top < max_scroll {
                 state.follow_suppressed_at_end = false;
             }
-            if self.options.follow == FollowMode::End 
-                && state.scroll_top == max_scroll 
-                && !state.follow_suppressed_at_end 
+            if self.options.follow == FollowMode::End
+                && state.scroll_top == max_scroll
+                && !state.follow_suppressed_at_end
             {
                 state.is_following_end = true;
             }
@@ -321,10 +353,47 @@ impl ScrollView {
         }
     }
 
-    /// Render the child content, applying scroll for a fixed viewport.
+    /// Render fresh child content, applying scroll for a fixed viewport.
+    ///
+    /// Normal UI updates use this path so streamed text and mutable tool
+    /// components are reflected immediately. The result also primes the
+    /// cache used by subsequent pure scroll frames.
     pub fn render_with_viewport(&self, width: usize, height: usize) -> Vec<String> {
+        self.render_with_viewport_impl(width, height, false)
+    }
+
+    /// Apply the viewport to the last rendered child content when possible.
+    /// A width change automatically falls back to a fresh render.
+    pub fn render_with_cached_content(&self, width: usize, height: usize) -> Vec<String> {
+        self.render_with_viewport_impl(width, height, true)
+    }
+
+    fn render_with_viewport_impl(
+        &self,
+        width: usize,
+        height: usize,
+        reuse_cached_content: bool,
+    ) -> Vec<String> {
         let content_width = self.get_content_width(width);
-        let all_lines = self.child.render(content_width);
+        let cached = if reuse_cached_content {
+            self.render_cache
+                .lock()
+                .ok()
+                .and_then(|cache| cache.clone())
+                .filter(|cache| cache.content_width == content_width)
+        } else {
+            None
+        };
+        let all_lines = cached.map(|cache| cache.lines).unwrap_or_else(|| {
+            let lines = Arc::new(self.child.render(content_width));
+            if let Ok(mut cache) = self.render_cache.lock() {
+                *cache = Some(ScrollRenderCache {
+                    content_width,
+                    lines: lines.clone(),
+                });
+            }
+            lines
+        });
         let content_height = all_lines.len();
 
         // Update state
@@ -334,9 +403,10 @@ impl ScrollView {
 
         // Extract visible portion
         let visible: Vec<String> = all_lines
-            .into_iter()
+            .iter()
             .skip(scroll_top)
             .take(height)
+            .cloned()
             .collect();
 
         // Pad to fill viewport if needed
@@ -389,6 +459,9 @@ impl Component for ScrollView {
     }
 
     fn invalidate(&self) {
+        if let Ok(mut cache) = self.render_cache.lock() {
+            *cache = None;
+        }
         self.child.invalidate();
     }
 
@@ -411,13 +484,13 @@ pub fn render_scroll_view(scroll_view: &ScrollView, width: usize, height: usize)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Text, Container};
+    use crate::Text;
 
     #[test]
     fn test_scroll_view_basic() {
         let text = Arc::new(Text::new("Line 1\nLine 2\nLine 3\nLine 4\nLine 5", 0, 0));
         let scroll = ScrollView::simple(text);
-        
+
         assert_eq!(scroll.scroll_top(), 0);
         assert!(scroll.is_following_end());
     }
@@ -425,14 +498,17 @@ mod tests {
     #[test]
     fn test_scroll_by() {
         let text = Arc::new(Text::new("Line 1\nLine 2\nLine 3\nLine 4\nLine 5", 0, 0));
-        let scroll = ScrollView::new(text, ScrollViewOptions {
-            follow: FollowMode::None,
-            ..Default::default()
-        });
-        
+        let scroll = ScrollView::new(
+            text,
+            ScrollViewOptions {
+                follow: FollowMode::None,
+                ..Default::default()
+            },
+        );
+
         // Simulate content and viewport
         scroll.update_layout(5, 2, None);
-        
+
         let unused = scroll.scroll_by(1);
         assert_eq!(unused, 0);
         assert_eq!(scroll.scroll_top(), 1);
@@ -441,14 +517,17 @@ mod tests {
     #[test]
     fn test_scroll_to_end() {
         let text = Arc::new(Text::new("Line 1\nLine 2\nLine 3", 0, 0));
-        let scroll = ScrollView::new(text, ScrollViewOptions {
-            follow: FollowMode::End,
-            ..Default::default()
-        });
-        
+        let scroll = ScrollView::new(
+            text,
+            ScrollViewOptions {
+                follow: FollowMode::End,
+                ..Default::default()
+            },
+        );
+
         scroll.update_layout(3, 1, None);
         scroll.scroll_to_end();
-        
+
         assert!(scroll.is_following_end());
         assert_eq!(scroll.scroll_top(), 2);
     }
@@ -457,11 +536,11 @@ mod tests {
     fn test_scroll_to_start() {
         let text = Arc::new(Text::new("Line 1\nLine 2\nLine 3", 0, 0));
         let scroll = ScrollView::simple(text);
-        
+
         scroll.update_layout(3, 1, None);
         scroll.scroll_by(2);
         scroll.scroll_to_start();
-        
+
         assert_eq!(scroll.scroll_top(), 0);
         assert!(!scroll.is_following_end());
     }
@@ -469,7 +548,6 @@ mod tests {
 #[cfg(test)]
 mod scroll_tests {
     use super::*;
-    use crate::component::Component;
     use crate::Container;
     use crate::Text;
 
@@ -493,7 +571,11 @@ mod scroll_tests {
     fn scroll_by_changes_visible_window() {
         let (sv, _inner) = tall_scroll();
         let before = sv.render_with_viewport(40, 10);
-        assert!(before[0].contains("line 40"), "following end shows tail: {:?}", before[0]);
+        assert!(
+            before[0].contains("line 40"),
+            "following end shows tail: {:?}",
+            before[0]
+        );
         // Scroll up 10 lines.
         let unused = sv.scroll_by(-10);
         assert_eq!(unused, 0);
@@ -510,15 +592,42 @@ mod scroll_tests {
     }
 
     #[test]
-    fn scroll_up_from_end_follows_tail() {
-        let (sv, _inner) = tall_scroll();
+    fn manual_scroll_up_stays_put_until_user_returns_to_end() {
+        let (sv, inner) = tall_scroll();
         sv.render_with_viewport(40, 10); // sync layout
         assert!(sv.is_following_end());
         sv.scroll_by(-3);
         assert!(!sv.is_following_end(), "manual scroll leaves follow mode");
-        // New content arrives — FollowMode::End should resume at the tail.
+
+        let position = sv.scroll_top();
+        inner.add_child(Arc::new(Text::new("new output", 0, 0)));
         sv.render_with_viewport(40, 10);
-        sv.scroll_by(0);
-        let _ = sv;
+        assert_eq!(
+            sv.scroll_top(),
+            position,
+            "new output must not steal the viewport"
+        );
+        assert!(!sv.is_following_end());
+
+        sv.scroll_to_end();
+        assert!(sv.is_following_end());
+        let previous_end = sv.scroll_top();
+        inner.add_child(Arc::new(Text::new("more output", 0, 0)));
+        sv.render_with_viewport(40, 10);
+        assert!(
+            sv.scroll_top() > previous_end,
+            "tail should advance after follow is restored"
+        );
+    }
+
+    #[test]
+    fn scroll_to_start_keeps_follow_when_content_fits() {
+        let text = Arc::new(Text::new("short", 0, 0));
+        let sv = ScrollView::simple(text);
+        sv.update_layout(1, 10, None);
+
+        sv.scroll_to_start();
+
+        assert!(sv.is_following_end());
     }
 }

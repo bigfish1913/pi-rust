@@ -33,7 +33,10 @@ pub type StreamFn = Arc<
 /// AssistantMessageEventStream + Send + Sync`.
 pub fn stream_fn<F>(f: F) -> StreamFn
 where
-    F: Fn(&Model, &Context, &SimpleStreamOptions) -> AssistantMessageEventStream + Send + Sync + 'static,
+    F: Fn(&Model, &Context, &SimpleStreamOptions) -> AssistantMessageEventStream
+        + Send
+        + Sync
+        + 'static,
 {
     Arc::new(f)
 }

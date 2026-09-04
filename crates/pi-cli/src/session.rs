@@ -41,8 +41,8 @@ use rpi_harness::session::types::SessionMetadata;
 use rpi_harness::session::Session;
 use rpi_harness::system_prompt::compose_system_prompt;
 use rpi_harness::types::{
-    AgentHarnessOptions, AgentHarnessResources, CompactionSettings, DrivingMode,
-    HarnessToolExecution, HarnessTool, RetryPolicy, ToolReplay,
+    AgentHarnessOptions, AgentHarnessResources, CompactionSettings, DrivingMode, HarnessTool,
+    HarnessToolExecution, RetryPolicy, ToolReplay,
 };
 use rpi_tools::{
     create_bash_tool, create_edit_tool, create_find_tool, create_grep_tool, create_ls_tool,
@@ -58,8 +58,8 @@ use crate::resource_dirs::{
     prompt_template_dirs, skill_dirs,
 };
 use rpi_extensions::{
-    ExtensionEmitter, ExtensionSession, NullDiagnostics, PluginDiagnostics, PluginToolAdapter,
-    TeeEmitter, emit_resources_discover,
+    emit_resources_discover, ExtensionEmitter, ExtensionSession, NullDiagnostics,
+    PluginDiagnostics, PluginToolAdapter, TeeEmitter,
 };
 
 /// The subdirectory (under both project `.pi/` and global `agent_dir()/`) where
@@ -144,7 +144,10 @@ pub fn select_session(args: &Args, cwd: &Path) -> SessionSelection {
         .session_dir
         .clone()
         .unwrap_or_else(|| default_session_dir(cwd));
-    SessionSelection::New { dir, name: args.name.clone() }
+    SessionSelection::New {
+        dir,
+        name: args.name.clone(),
+    }
 }
 
 /// The default session directory: `<cwd>/.pi/sessions`. Mirrors the TS
@@ -199,8 +202,9 @@ pub async fn build(
     //     points at this bridge.
     //  4. After `AgentHarness::create` succeeds, call `set_harness(&cell, …)` to
     //     fill the host cell the bridge recovers on the first action call.
-    let runtime = tokio::runtime::Handle::try_current()
-        .map_err(|e| BuildError::HarnessCreate(format!("no tokio runtime for action bridge: {e}")))?;
+    let runtime = tokio::runtime::Handle::try_current().map_err(|e| {
+        BuildError::HarnessCreate(format!("no tokio runtime for action bridge: {e}"))
+    })?;
     let catalog = crate::provider::available_catalog(resolved);
     let (action_host, harness_cell) = crate::extensions_actions::HarnessActionHost::new_empty(
         catalog.clone(),
@@ -270,9 +274,9 @@ pub async fn build(
     let base_prompt = match args.system_prompt.as_deref() {
         Some(explicit) => explicit.to_string(),
         None => match discover_system_prompt_file(cwd) {
-            Some(path) => std::fs::read_to_string(&path).unwrap_or_else(|_| {
-                default_system_prompt(&cwd_str)
-            }),
+            Some(path) => {
+                std::fs::read_to_string(&path).unwrap_or_else(|_| default_system_prompt(&cwd_str))
+            }
             None => default_system_prompt(&cwd_str),
         },
     };
@@ -368,7 +372,12 @@ pub async fn build(
     // Surface resource-discovery diagnostics as startup warnings (verbose-only).
     if args.verbose {
         for d in &skill_diags {
-            eprintln!("warning: skill {} ({}): {}", d.path, d.code.as_str(), d.message);
+            eprintln!(
+                "warning: skill {} ({}): {}",
+                d.path,
+                d.code.as_str(),
+                d.message
+            );
         }
         for d in &prompt_diags {
             eprintln!(
@@ -391,7 +400,11 @@ pub async fn build(
     let system_prompt = compose_system_prompt(
         Some(&base_prompt),
         &[], // skills: harness appends the listing itself
-        if context_block.is_empty() { None } else { Some(&context_block) },
+        if context_block.is_empty() {
+            None
+        } else {
+            Some(&context_block)
+        },
         append_join.as_deref(),
     );
 
@@ -435,7 +448,11 @@ pub async fn build(
             skills.len() - visible_skills
         );
         for s in &skills {
-            let hidden = if s.disable_model_invocation == Some(true) { " [hidden]" } else { "" };
+            let hidden = if s.disable_model_invocation == Some(true) {
+                " [hidden]"
+            } else {
+                ""
+            };
             eprintln!("    {}{hidden} — {}", s.name, s.description);
         }
         eprintln!("--- prompt templates: {} ---", prompt_templates.len());
@@ -481,17 +498,13 @@ pub async fn build(
     // `StablePluginEvent` and fans out to the handlers registered for its tag).
     // With no extensions the tee degrades to the bare broadcast emitter (a
     // one-child passthrough), so the TUI path is unchanged.
-    let emitter: Arc<dyn rpi_agent::AgentEmitter> =
-        match extension_session.snapshot_arc() {
-            Some(snapshot) => {
-                let ext = ExtensionEmitter::new(snapshot, extension_session.keepalive());
-                Arc::new(TeeEmitter::new(vec![
-                    broadcast_emitter,
-                    Arc::new(ext),
-                ]))
-            }
-            None => broadcast_emitter,
-        };
+    let emitter: Arc<dyn rpi_agent::AgentEmitter> = match extension_session.snapshot_arc() {
+        Some(snapshot) => {
+            let ext = ExtensionEmitter::new(snapshot, extension_session.keepalive());
+            Arc::new(TeeEmitter::new(vec![broadcast_emitter, Arc::new(ext)]))
+        }
+        None => broadcast_emitter,
+    };
 
     let options = AgentHarnessOptions {
         model: resolved.model.clone(),
@@ -500,7 +513,11 @@ pub async fn build(
         tools,
         system_prompt: Some(system_prompt),
         resources: AgentHarnessResources {
-            skills: if skills.is_empty() { None } else { Some(skills) },
+            skills: if skills.is_empty() {
+                None
+            } else {
+                Some(skills)
+            },
             prompt_templates: if prompt_templates.is_empty() {
                 None
             } else {
@@ -549,10 +566,8 @@ pub async fn build(
         // events observe every provider call (observer semantics — the handler
         // ABI has no patch channel in v1). A session without provider-hook
         // subscribers runs hook-free.
-        provider_hooks: rpi_extensions::ExtensionProviderHooks::from_session(
-            &extension_session,
-        )
-        .map(|h| Arc::new(h) as Arc<dyn rpi_ai::ProviderHooks>),
+        provider_hooks: rpi_extensions::ExtensionProviderHooks::from_session(&extension_session)
+            .map(|h| Arc::new(h) as Arc<dyn rpi_ai::ProviderHooks>),
     };
 
     let harness = match AgentHarness::create(options).await {
@@ -733,12 +748,11 @@ pub async fn reload_extension_resources(
         None => {
             // No prior bridge (no extensions ever loaded). Build a fresh host so
             // a reload that newly discovers plugins can still drive actions.
-            let (action_host, _cell) =
-                crate::extensions_actions::HarnessActionHost::new_empty(
-                    ctx.catalog.clone(),
-                    ctx.cwd.clone(),
-                    ctx.runtime.clone(),
-                );
+            let (action_host, _cell) = crate::extensions_actions::HarnessActionHost::new_empty(
+                ctx.catalog.clone(),
+                ctx.cwd.clone(),
+                ctx.runtime.clone(),
+            );
             crate::extensions_actions::HarnessActionHost::set_harness(
                 &_cell,
                 Arc::new(harness.clone()),
@@ -782,8 +796,10 @@ pub async fn reload_extension_resources(
     // cdylibs). `mem::replace` (not `.take()`) because the cell is not `Option`.
     {
         let mut session_guard = ctx.extension_session.lock().unwrap();
-        let old_session =
-            std::mem::replace(&mut *session_guard, rpi_extensions::ExtensionSession::none());
+        let old_session = std::mem::replace(
+            &mut *session_guard,
+            rpi_extensions::ExtensionSession::none(),
+        );
         if let Some(old_snap) = old_session.snapshot_arc() {
             // `invalidate` is on the registry, but the snapshot shares the flag —
             // flipping the snapshot's flag invalidates the registry too (same Arc).
@@ -846,7 +862,12 @@ pub async fn reload_extension_resources(
         warnings = true;
         if ctx.args.verbose {
             for d in &skill_diags {
-                eprintln!("warning: skill {} ({}): {}", d.path, d.code.as_str(), d.message);
+                eprintln!(
+                    "warning: skill {} ({}): {}",
+                    d.path,
+                    d.code.as_str(),
+                    d.message
+                );
             }
             for d in &prompt_diags {
                 eprintln!(
@@ -863,8 +884,9 @@ pub async fn reload_extension_resources(
     let base_prompt = match ctx.args.system_prompt.as_deref() {
         Some(explicit) => explicit.to_string(),
         None => match discover_system_prompt_file(&ctx.cwd) {
-            Some(path) => std::fs::read_to_string(&path)
-                .unwrap_or_else(|_| default_system_prompt(&cwd_str)),
+            Some(path) => {
+                std::fs::read_to_string(&path).unwrap_or_else(|_| default_system_prompt(&cwd_str))
+            }
             None => default_system_prompt(&cwd_str),
         },
     };
@@ -888,26 +910,30 @@ pub async fn reload_extension_resources(
     let system_prompt = compose_system_prompt(
         Some(&base_prompt),
         &[],
-        if context_block.is_empty() { None } else { Some(&context_block) },
+        if context_block.is_empty() {
+            None
+        } else {
+            Some(&context_block)
+        },
         append_join.as_deref(),
     );
 
     // ---- Rebuild the emitter (TeeEmitter over fresh ExtensionEmitter) ----
-    let emitter: Arc<dyn rpi_agent::AgentEmitter> =
-        match extension_session.snapshot_arc() {
-            Some(snapshot) => {
-                let ext = ExtensionEmitter::new(snapshot, extension_session.keepalive());
-                Arc::new(TeeEmitter::new(vec![
-                    ctx.broadcast.clone(),
-                    Arc::new(ext),
-                ]))
-            }
-            None => ctx.broadcast.clone(),
-        };
+    let emitter: Arc<dyn rpi_agent::AgentEmitter> = match extension_session.snapshot_arc() {
+        Some(snapshot) => {
+            let ext = ExtensionEmitter::new(snapshot, extension_session.keepalive());
+            Arc::new(TeeEmitter::new(vec![ctx.broadcast.clone(), Arc::new(ext)]))
+        }
+        None => ctx.broadcast.clone(),
+    };
 
     // ---- 5. Push the rebuilt state into the live harness via the B5d setters ----
     let resources = AgentHarnessResources {
-        skills: if skills.is_empty() { None } else { Some(skills.clone()) },
+        skills: if skills.is_empty() {
+            None
+        } else {
+            Some(skills.clone())
+        },
         prompt_templates: if prompt_templates.is_empty() {
             None
         } else {
@@ -947,7 +973,10 @@ pub async fn reload_extension_resources(
         skills.len(),
         prompt_templates.len(),
     );
-    ReloadOutcome { summary, had_warnings: warnings }
+    ReloadOutcome {
+        summary,
+        had_warnings: warnings,
+    }
 }
 
 /// `build_models_with_extensions` for the reload path: the resolved gateway
@@ -1030,7 +1059,6 @@ fn build_models_with_extensions(
     models
 }
 
-
 /// Resolve the extension dirs to scan and load the cdylib plugins, returning
 /// the loaded session guard (keeps the `Library` handles alive for the harness
 /// lifetime). Scan order: project `.pi/extensions`, global `agent_dir()/`
@@ -1063,7 +1091,9 @@ fn load_extensions(
 /// explicit `--tools` allowlist / `--exclude-tools` denylist apply to the
 /// merged set (the built-ins were already filtered in [`build_tools`]).
 fn merge_extension_tools(tools: &mut Vec<HarnessTool>, session: &ExtensionSession, args: &Args) {
-    let Some(snapshot) = session.snapshot() else { return };
+    let Some(snapshot) = session.snapshot() else {
+        return;
+    };
     for et in snapshot.tools() {
         let name = &et.tool.name;
         if let Some(allow) = &args.tools {
@@ -1112,7 +1142,10 @@ fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
     // mutation queue — they go through the `FileSystem` trait only.
     let mut all: Vec<(&'static str, HarnessTool)> = vec![
         ("read", HarnessTool::new(create_read_tool(ctx, None))),
-        ("bash", HarnessTool::new(create_bash_tool(ctx, Some(bash_options())))),
+        (
+            "bash",
+            HarnessTool::new(create_bash_tool(ctx, Some(bash_options()))),
+        ),
         ("edit", HarnessTool::new(create_edit_tool(ctx))),
         ("write", HarnessTool::new(create_write_tool(ctx))),
         ("grep", HarnessTool::new(create_grep_tool(ctx, None))),
@@ -1136,7 +1169,9 @@ fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
         all.retain(|(name, _)| !deny.iter().any(|d| d == name));
     }
 
-    all.into_iter().map(|(_, t)| t.with_replay(ToolReplay::Safe)).collect()
+    all.into_iter()
+        .map(|(_, t)| t.with_replay(ToolReplay::Safe))
+        .collect()
 }
 
 /// Resolve the active tool names from the constructed tools when no explicit
@@ -1150,7 +1185,11 @@ fn active_tool_names(tools: &[HarnessTool], args: &Args) -> Vec<String> {
         // The allowlist IS the active set (TS: `tools` doubles as the active
         // set when provided). Keep order + only those that exist.
         let names: Vec<String> = tools.iter().map(|t| t.tool.schema().name.clone()).collect();
-        return allow.iter().filter(|a| names.iter().any(|n| n == *a)).cloned().collect();
+        return allow
+            .iter()
+            .filter(|a| names.iter().any(|n| n == *a))
+            .cloned()
+            .collect();
     }
     // Default: every constructed tool is active. If `--exclude-tools` dropped
     // some, they're simply absent from `tools`, so this lands right.
@@ -1171,9 +1210,9 @@ async fn build_session(selection: &SessionSelection, cwd: &str) -> Result<Sessio
                 .map_err(|e| BuildError::SessionDir(format!("{}: {e}", dir.display())))?;
             Ok(session)
         }
-        SessionSelection::Latest | SessionSelection::ById { .. } | SessionSelection::ByExactId { .. } => {
-            restore_session(selection, cwd).await
-        }
+        SessionSelection::Latest
+        | SessionSelection::ById { .. }
+        | SessionSelection::ByExactId { .. } => restore_session(selection, cwd).await,
         SessionSelection::Fork { source } => fork_session_at_launch(source, cwd).await,
     }
 }
@@ -1198,15 +1237,13 @@ async fn restore_session(selection: &SessionSelection, cwd: &str) -> Result<Sess
             };
             open_session(meta, cwd).await
         }
-        SessionSelection::ById { id } => {
-            open_session_by_id(id, cwd).await.map_err(|e| match e {
-                OpenError::NotFound { requested } => BuildError::SessionNotFound {
-                    requested,
-                    dir: default_session_dir(Path::new(cwd)).display().to_string(),
-                },
-                OpenError::Other(msg) => BuildError::SessionDir(msg),
-            })
-        }
+        SessionSelection::ById { id } => open_session_by_id(id, cwd).await.map_err(|e| match e {
+            OpenError::NotFound { requested } => BuildError::SessionNotFound {
+                requested,
+                dir: default_session_dir(Path::new(cwd)).display().to_string(),
+            },
+            OpenError::Other(msg) => BuildError::SessionDir(msg),
+        }),
         SessionSelection::ByExactId { id } => {
             // Exact id match only (pi `--session-id`): restore when the
             // session exists, else create a fresh one under the default dir.
@@ -1228,7 +1265,9 @@ async fn restore_session(selection: &SessionSelection, cwd: &str) -> Result<Sess
 /// `--fork <path|id>`: open the source session, fork it into a new JSONL
 /// session (records the parent id), and start in the fork.
 async fn fork_session_at_launch(source: &str, cwd: &str) -> Result<Session, BuildError> {
-    use rpi_harness::session::jsonl::{JsonlSessionCreateOptions, JsonlSessionRepo, JsonlSessionRepoOptions};
+    use rpi_harness::session::jsonl::{
+        JsonlSessionCreateOptions, JsonlSessionRepo, JsonlSessionRepoOptions,
+    };
     use rpi_harness::session::types::{ForkOptions, SessionStorage};
     use rpi_tools::FileSystem;
 
@@ -1291,8 +1330,12 @@ impl std::fmt::Display for OpenError {
 
 /// List the JSONL session metadata under the default session dir, newest
 /// first. Shared by startup restore and the TUI `/session` hot-switch.
-pub async fn list_session_metadata(cwd: &str) -> Result<Vec<rpi_harness::session::jsonl::JsonlSessionMetadata>, BuildError> {
-    use rpi_harness::session::jsonl::{JsonlSessionListOptions, JsonlSessionRepo, JsonlSessionRepoOptions};
+pub async fn list_session_metadata(
+    cwd: &str,
+) -> Result<Vec<rpi_harness::session::jsonl::JsonlSessionMetadata>, BuildError> {
+    use rpi_harness::session::jsonl::{
+        JsonlSessionListOptions, JsonlSessionRepo, JsonlSessionRepoOptions,
+    };
     use rpi_tools::FileSystem;
 
     let dir = default_session_dir(Path::new(cwd));
@@ -1320,7 +1363,9 @@ pub async fn open_session_by_id(id: &str, cwd: &str) -> Result<Session, OpenErro
         .iter()
         .find(|m| m.id == id || m.path.contains(id) || id.contains(&m.id))
     else {
-        return Err(OpenError::NotFound { requested: format!("session {id}") });
+        return Err(OpenError::NotFound {
+            requested: format!("session {id}"),
+        });
     };
     open_session(meta, cwd)
         .await
@@ -1352,7 +1397,9 @@ pub(crate) async fn fork_session_storage(
     // The fork needs the rich JSONL metadata (with the on-disk path); resolve
     // it from the session list by the current session's id.
     let id = harness.session().storage().metadata().id.clone();
-    let metas = list_session_metadata(cwd).await.map_err(|e| e.to_string())?;
+    let metas = list_session_metadata(cwd)
+        .await
+        .map_err(|e| e.to_string())?;
     let Some(source) = metas.iter().find(|m| m.id == id) else {
         return Err(format!("current session {id} not found on disk"));
     };
@@ -1498,19 +1545,37 @@ mod tests {
 
     #[test]
     fn select_ephemeral_when_no_session() {
-        let args = Args { no_session: true, ..Args::default() };
+        let args = Args {
+            no_session: true,
+            ..Args::default()
+        };
         let cwd = Path::new("/tmp");
-        assert!(matches!(select_session(&args, cwd), SessionSelection::Ephemeral));
+        assert!(matches!(
+            select_session(&args, cwd),
+            SessionSelection::Ephemeral
+        ));
     }
 
     #[test]
     fn select_latest_for_continue_and_resume() {
-        let args = Args { continue_session: true, ..Args::default() };
+        let args = Args {
+            continue_session: true,
+            ..Args::default()
+        };
         let cwd = Path::new("/tmp");
-        assert!(matches!(select_session(&args, cwd), SessionSelection::Latest));
+        assert!(matches!(
+            select_session(&args, cwd),
+            SessionSelection::Latest
+        ));
 
-        let args = Args { resume: true, ..Args::default() };
-        assert!(matches!(select_session(&args, cwd), SessionSelection::Latest));
+        let args = Args {
+            resume: true,
+            ..Args::default()
+        };
+        assert!(matches!(
+            select_session(&args, cwd),
+            SessionSelection::Latest
+        ));
     }
 
     #[test]

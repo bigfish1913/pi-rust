@@ -282,6 +282,18 @@ struct ActiveRun {
     kind: OperationKind,
 }
 
+/// Releases the in-memory active-run slot on every exit path, including an
+/// early `?` caused by session I/O or configuration errors.
+struct ActiveRunLease<'a> {
+    harness: &'a AgentHarness,
+}
+
+impl Drop for ActiveRunLease<'_> {
+    fn drop(&mut self) {
+        self.harness.release_run();
+    }
+}
+
 /// Shared mutable state. Cloned out (field-by-field) at the start of each
 /// operation so the loop sees a consistent snapshot; setters replace fields
 /// in place.
@@ -358,6 +370,10 @@ impl AgentHarness {
                     "create.restore is not implemented: session already has records",
                 ));
             }
+        }
+
+        if options.allow_existing_session {
+            Self::finish_interrupted_operation(&options.session).await?;
         }
 
         let inner = HarnessInner {
@@ -641,6 +657,43 @@ impl AgentHarness {
         if let Some(idle) = idle {
             idle.notify_waiters();
         }
+    }
+
+    /// Close an operation left open by a suspended run or an interrupted
+    /// process. Resume is not implemented yet, so leaving it open would make
+    /// every future operation on the lane fail permanently.
+    async fn finish_interrupted_operation(session: &Session) -> HarnessResult<()> {
+        let open = session
+            .find_open_operations("main", Some(2))
+            .await
+            .map_err(session_to_harness_err)?;
+        if open.len() > 1 {
+            return Err(HarnessError::io(
+                "Lane main has multiple open operations; the session log is corrupted",
+            ));
+        }
+        let Some(operation) = open.first() else {
+            return Ok(());
+        };
+
+        session
+            .append_record(LaneRecord::OperationFinished(OperationFinishedRecord {
+                base: RecordBase {
+                    id: session.id_generator().next(),
+                    seq: 0,
+                    lane: "main".to_string(),
+                    timestamp: 0,
+                },
+                run_id: operation.base.id.clone(),
+                outcome: OperationOutcome::Aborted,
+                error: Some(OperationError {
+                    code: "interrupted".to_string(),
+                    message: "Operation was interrupted before it could finish".to_string(),
+                }),
+            }))
+            .await
+            .map_err(session_to_harness_err)?;
+        Ok(())
     }
 
     /// Resolve the provider for `model.provider`. Returns the first registered
@@ -1040,6 +1093,8 @@ impl AgentHarness {
     /// The core run loop shared by all prompt overloads + skill + template.
     async fn run_core(&self, prompts: Vec<AgentMessage>) -> HarnessResult<RunResult> {
         let (run_id, signal, _idle) = self.acquire_run(OperationKind::Run)?;
+        let _run_lease = ActiveRunLease { harness: self };
+        Self::finish_interrupted_operation(&self.session).await?;
 
         // Snapshot the source leaf (before persisting prompts) for the
         // operation_started record.
@@ -1076,7 +1131,6 @@ impl AgentHarness {
         // Snapshot config.
         let snap = self.snapshot_config()?;
         if snap.models.is_empty() {
-            self.release_run();
             let _ = self
                 .write_operation_finished(
                     &run_id,
@@ -1148,7 +1202,6 @@ impl AgentHarness {
                             }
                             Err(e) => {
                                 // Compaction failed; abort the run.
-                                self.release_run();
                                 let leaf = self
                                     .session
                                     .get_leaf_id()
@@ -1336,9 +1389,6 @@ impl AgentHarness {
             }));
         }
 
-        // Release the run guard.
-        self.release_run();
-
         Ok(RunResult { run_id, outcome })
     }
 
@@ -1349,6 +1399,8 @@ impl AgentHarness {
         custom_instructions: Option<String>,
     ) -> HarnessResult<CompactionResult> {
         let (run_id, signal, _idle) = self.acquire_run(OperationKind::Compaction)?;
+        let _run_lease = ActiveRunLease { harness: self };
+        Self::finish_interrupted_operation(&self.session).await?;
 
         let source_leaf = self
             .session
@@ -1394,7 +1446,6 @@ impl AgentHarness {
                                         Some(err.clone()),
                                     )
                                     .await;
-                                self.release_run();
                                 return Ok(CompactionResult {
                                     run_id,
                                     outcome: CompactionOutcome::Failed {
@@ -1473,7 +1524,6 @@ impl AgentHarness {
             }
         };
 
-        self.release_run();
         Ok(CompactionResult { run_id, outcome })
     }
 }
@@ -2093,7 +2143,9 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod session_switch_tests {
     use super::*;
-    use crate::session::jsonl::{JsonlSessionCreateOptions, JsonlSessionRepo, JsonlSessionRepoOptions};
+    use crate::session::jsonl::{
+        JsonlSessionCreateOptions, JsonlSessionRepo, JsonlSessionRepoOptions,
+    };
     use crate::session::memory::{InMemorySessionStorage, SystemClock};
     use crate::session::session::DefaultIdGenerator;
     use crate::session::types::SessionMetadata;
@@ -2117,7 +2169,11 @@ mod session_switch_tests {
             drive: DrivingMode::default(),
             session: Session::new(
                 Arc::new(InMemorySessionStorage::new(
-                    SessionMetadata { id: "a".into(), created_at: 0, parent_session_id: None },
+                    SessionMetadata {
+                        id: "a".into(),
+                        created_at: 0,
+                        parent_session_id: None,
+                    },
                     Arc::new(SystemClock),
                     Arc::new(DefaultIdGenerator::new()),
                 )),
@@ -2136,6 +2192,53 @@ mod session_switch_tests {
         }
     }
 
+    #[tokio::test]
+    async fn create_closes_interrupted_operation_when_restoring() {
+        let options = opts();
+        options
+            .session
+            .append_record(LaneRecord::OperationStarted(OperationStartedRecord {
+                base: RecordBase {
+                    id: "interrupted-run".into(),
+                    seq: 0,
+                    lane: "main".into(),
+                    timestamp: 0,
+                },
+                source_leaf_id: None,
+                intent: OperationIntent::Run {
+                    original_prompt: Vec::new(),
+                    initial_messages: Vec::new(),
+                    system_prompt_override: None,
+                    resume_data: None,
+                },
+            }))
+            .await
+            .unwrap();
+
+        let harness = AgentHarness::create(options).await.unwrap();
+
+        assert!(harness
+            .session()
+            .find_open_operations("main", Some(1))
+            .await
+            .unwrap()
+            .is_empty());
+        let records = harness
+            .session()
+            .find_records(&RecordQuery {
+                record_type: Some("operation_finished"),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            records.as_slice(),
+            [LaneRecord::OperationFinished(finished)]
+                if finished.run_id == "interrupted-run"
+                    && finished.outcome == OperationOutcome::Aborted
+        ));
+    }
+
     /// `set_session` swaps the durable backing: the harness's `session()`
     /// facade (shared with lane handles) then reads the NEW storage's entries
     /// — the TUI `/session` hot-switch path.
@@ -2143,7 +2246,8 @@ mod session_switch_tests {
     async fn set_session_swaps_durable_backing() {
         let h = AgentHarness::create(opts()).await.unwrap();
         // Build two JSONL sessions with one user message each.
-        let tmp = std::env::temp_dir().join(format!("rpi-set-session-probe-{}", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("rpi-set-session-probe-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         let cwd = tmp.to_string_lossy().into_owned();
@@ -2155,27 +2259,67 @@ mod session_switch_tests {
             clock: Arc::new(SystemClock),
             ids: Arc::new(DefaultIdGenerator::new()),
         });
-        let s1 = repo.create_typed(&JsonlSessionCreateOptions {
-            id: Some("sess-one".into()), parent_session_id: None, cwd: cwd.clone(), metadata: None,
-        }).await.unwrap();
-        let s2 = repo.create_typed(&JsonlSessionCreateOptions {
-            id: Some("sess-two".into()), parent_session_id: None, cwd, metadata: None,
-        }).await.unwrap();
+        let s1 = repo
+            .create_typed(&JsonlSessionCreateOptions {
+                id: Some("sess-one".into()),
+                parent_session_id: None,
+                cwd: cwd.clone(),
+                metadata: None,
+            })
+            .await
+            .unwrap();
+        let s2 = repo
+            .create_typed(&JsonlSessionCreateOptions {
+                id: Some("sess-two".into()),
+                parent_session_id: None,
+                cwd,
+                metadata: None,
+            })
+            .await
+            .unwrap();
         let sess1 = Session::new(Arc::new(s1), None);
         let sess2 = Session::new(Arc::new(s2), None);
-        sess1.append_message(rpi_agent::AgentMessage::User(
-            rpi_ai::types::UserMessage::new(String::from("alpha"), 1),
-        )).await.unwrap();
-        sess2.append_message(rpi_agent::AgentMessage::User(
-            rpi_ai::types::UserMessage::new(String::from("beta"), 2),
-        )).await.unwrap();
+        sess1
+            .append_message(rpi_agent::AgentMessage::User(
+                rpi_ai::types::UserMessage::new(String::from("alpha"), 1),
+            ))
+            .await
+            .unwrap();
+        sess2
+            .append_message(rpi_agent::AgentMessage::User(
+                rpi_ai::types::UserMessage::new(String::from("beta"), 2),
+            ))
+            .await
+            .unwrap();
 
         h.set_session(sess1).await.unwrap();
-        let e1 = h.session().view("main").find_entries(&EntryQuery { entry_type: None, custom_type: None, order: None, limit: None, cursor: None }).await.unwrap();
+        let e1 = h
+            .session()
+            .view("main")
+            .find_entries(&EntryQuery {
+                entry_type: None,
+                custom_type: None,
+                order: None,
+                limit: None,
+                cursor: None,
+            })
+            .await
+            .unwrap();
         assert_eq!(e1.len(), 1);
 
         h.set_session(sess2).await.unwrap();
-        let e2 = h.session().view("main").find_entries(&EntryQuery { entry_type: None, custom_type: None, order: None, limit: None, cursor: None }).await.unwrap();
+        let e2 = h
+            .session()
+            .view("main")
+            .find_entries(&EntryQuery {
+                entry_type: None,
+                custom_type: None,
+                order: None,
+                limit: None,
+                cursor: None,
+            })
+            .await
+            .unwrap();
         assert_eq!(e2.len(), 1);
         let _ = std::fs::remove_dir_all(&tmp);
     }

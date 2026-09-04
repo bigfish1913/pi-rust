@@ -6,8 +6,8 @@ use std::any::Any;
 use std::sync::{Arc, Mutex};
 
 use super::component::Component;
-use super::layout_node::{LayoutNode, LayoutNodeProvider, HStackNode, StackLayoutEntry};
-use super::vstack::{StackEntry, StackEntryOptions, StackOptions, StackAlign};
+use super::layout_node::{HStackNode, LayoutNode, LayoutNodeProvider, StackLayoutEntry};
+use super::vstack::{StackAlign, StackEntry, StackEntryOptions, StackOptions};
 use crate::ansi::{slice_by_column, visible_width};
 
 /// HStack - Horizontal stack layout.
@@ -52,7 +52,11 @@ impl HStack {
     }
 
     /// Add a child with options.
-    pub fn add_child_with_options(&self, component: Arc<dyn Component>, options: StackEntryOptions) {
+    pub fn add_child_with_options(
+        &self,
+        component: Arc<dyn Component>,
+        options: StackEntryOptions,
+    ) {
         if let Ok(mut children) = self.children.lock() {
             children.push(StackEntry::with_options(component, options));
         }
@@ -89,7 +93,8 @@ impl HStack {
 
     /// Get layout entries for the layout system.
     pub fn get_layout_entries(&self) -> Vec<StackLayoutEntry> {
-        self.children.lock()
+        self.children
+            .lock()
             .map(|c| c.iter().map(|e| e.to_layout_entry()).collect())
             .unwrap_or_default()
     }
@@ -118,13 +123,13 @@ impl Component for HStack {
             // Render child to get intrinsic height
             let lines = entry.component.render(width);
             let max_line_width = lines.iter().map(|l| visible_width(l)).max().unwrap_or(0);
-            
+
             let basis = entry.options.basis.unwrap_or(max_line_width);
             let min_size = entry.options.min_size;
             let max_size = entry.options.max_size.unwrap_or(width);
-            
+
             let basis = basis.clamp(min_size, max_size);
-            
+
             child_data.push((lines, basis));
             total_basis += basis;
 
@@ -157,7 +162,11 @@ impl Component for HStack {
         }
 
         // Find the max height
-        let max_height = child_data.iter().map(|(lines, _)| lines.len()).max().unwrap_or(1);
+        let max_height = child_data
+            .iter()
+            .map(|(lines, _)| lines.len())
+            .max()
+            .unwrap_or(1);
 
         // Build output lines by compositing horizontally
         let mut result: Vec<String> = vec![String::new(); max_height];

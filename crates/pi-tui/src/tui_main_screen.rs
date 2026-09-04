@@ -24,7 +24,11 @@ pub struct TuiMainScreen {
 
 impl TuiMainScreen {
     /// Create a new main screen TUI.
-    pub fn new(terminal: Box<dyn Terminal>, show_hardware_cursor: bool, _log_directory: Option<&str>) -> Self {
+    pub fn new(
+        terminal: Box<dyn Terminal>,
+        show_hardware_cursor: bool,
+        _log_directory: Option<&str>,
+    ) -> Self {
         Self {
             terminal,
             container: Container::new(),
@@ -78,7 +82,10 @@ impl TUI for TuiMainScreen {
     }
 
     fn get_show_hardware_cursor(&self) -> bool {
-        self.show_hardware_cursor.lock().map(|s| *s).unwrap_or(false)
+        self.show_hardware_cursor
+            .lock()
+            .map(|s| *s)
+            .unwrap_or(false)
     }
 
     fn set_show_hardware_cursor(&self, enabled: bool) {
@@ -107,7 +114,11 @@ impl TUI for TuiMainScreen {
         self.focused.lock().ok()?.clone()
     }
 
-    fn show_overlay(&self, _component: Arc<dyn Component>, _options: Option<OverlayOptions>) -> Arc<dyn OverlayHandle> {
+    fn show_overlay(
+        &self,
+        _component: Arc<dyn Component>,
+        _options: Option<OverlayOptions>,
+    ) -> Arc<dyn OverlayHandle> {
         // Main screen doesn't support overlays in the same way
         Arc::new(DummyOverlayHandle)
     }
@@ -142,10 +153,10 @@ impl TUI for TuiMainScreen {
                 *count += 1;
             }
         }
-        
+
         let width = self.terminal.columns();
         let lines = self.render(width);
-        
+
         // Write each line to terminal
         for (i, line) in lines.iter().enumerate() {
             if i > 0 {
@@ -153,7 +164,7 @@ impl TUI for TuiMainScreen {
             }
             self.terminal.write(line);
         }
-        
+
         self.terminal.flush();
     }
 
@@ -173,7 +184,11 @@ struct DummyOverlayHandle;
 impl OverlayHandle for DummyOverlayHandle {
     fn hide(&self) {}
     fn set_hidden(&self, _hidden: bool) {}
-    fn is_hidden(&self) -> bool { false }
+    fn is_hidden(&self) -> bool {
+        false
+    }
     fn focus(&self) {}
-    fn is_focused(&self) -> bool { false }
+    fn is_focused(&self) -> bool {
+        false
+    }
 }

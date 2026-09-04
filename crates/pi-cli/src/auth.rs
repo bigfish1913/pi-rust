@@ -76,7 +76,10 @@ async fn run_login(args: &[String]) -> i32 {
         eprintln!("error: an empty key was entered; nothing saved.");
         return EXIT_ERROR;
     }
-    let cred = Credential::ApiKey { key: Some(key.to_string()), env: None };
+    let cred = Credential::ApiKey {
+        key: Some(key.to_string()),
+        env: None,
+    };
     if let Err(e) = upsert_credential(provider, cred) {
         eprintln!("error: could not save credentials: {e}");
         return EXIT_ERROR;
@@ -167,8 +170,10 @@ fn parse_provider(args: &[String]) -> Option<&str> {
 /// Where a credential was found — used by `auth check` to report its source.
 enum CredentialSource {
     StoredFile,
+    ModelsJson,
     EnvApiKey,
     EnvAuthTToken,
+    EnvOpenAiApiKey,
     CliFlagUnset, // placeholder so the enum stays exhaustive; not used as "present"
 }
 
@@ -179,16 +184,20 @@ impl CredentialSource {
     fn as_json_str(&self) -> &'static str {
         match self {
             CredentialSource::StoredFile => "auth.json",
+            CredentialSource::ModelsJson => "models.json",
             CredentialSource::EnvApiKey => "ANTHROPIC_API_KEY",
             CredentialSource::EnvAuthTToken => "ANTHROPIC_AUTH_TOKEN",
+            CredentialSource::EnvOpenAiApiKey => "OPENAI_API_KEY",
             CredentialSource::CliFlagUnset => "none",
         }
     }
     fn as_display(&self) -> Option<&'static str> {
         match self {
             CredentialSource::StoredFile => Some("key in ~/.rpi/auth.json"),
+            CredentialSource::ModelsJson => Some("apiKey in ~/.rpi/agent/models.json"),
             CredentialSource::EnvApiKey => Some("ANTHROPIC_API_KEY env var"),
             CredentialSource::EnvAuthTToken => Some("ANTHROPIC_AUTH_TOKEN env var"),
+            CredentialSource::EnvOpenAiApiKey => Some("OPENAI_API_KEY env var"),
             CredentialSource::CliFlagUnset => None,
         }
     }
@@ -200,20 +209,62 @@ impl CredentialSource {
 fn detect_credential(provider: &str) -> CredentialSource {
     if let Ok(store) = read_auth() {
         if matches!(store.get(provider), Some(Credential::ApiKey { key: Some(k), .. }) if !k.is_empty())
-            || matches!(store.get(provider), Some(Credential::ApiKey { key: None, env: Some(_env), .. }))
+            || matches!(
+                store.get(provider),
+                Some(Credential::ApiKey {
+                    key: None,
+                    env: Some(_env),
+                    ..
+                })
+            )
         {
             return CredentialSource::StoredFile;
         }
     }
-    if std::env::var(crate::provider::ANTHROPIC_AUTH_TOKEN_ENV)
-        .map(|v| !v.is_empty())
-        .unwrap_or(false)
+    let configured = config::load_models_config().ok().and_then(|models| {
+        models
+            .providers
+            .into_iter()
+            .find(|(id, cfg)| {
+                id.eq_ignore_ascii_case(provider)
+                    || ((provider.eq_ignore_ascii_case("openai")
+                        || provider.eq_ignore_ascii_case("openai-completions"))
+                        && config::provider_is_openai_completions(cfg))
+            })
+            .map(|(_, cfg)| cfg)
+    });
+    if configured.as_ref().is_some_and(|cfg| {
+        cfg.api_key
+            .as_deref()
+            .filter(|key| !key.is_empty())
+            .and_then(|key| config::resolve_config_value(key, None))
+            .is_some()
+    }) {
+        return CredentialSource::ModelsJson;
+    }
+    let is_openai = provider.eq_ignore_ascii_case("openai")
+        || provider.eq_ignore_ascii_case("openai-completions")
+        || configured
+            .as_ref()
+            .is_some_and(config::provider_is_openai_completions);
+    if is_openai
+        && std::env::var(crate::provider::OPENAI_API_KEY_ENV)
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
+    {
+        return CredentialSource::EnvOpenAiApiKey;
+    }
+    if !is_openai
+        && std::env::var(crate::provider::ANTHROPIC_AUTH_TOKEN_ENV)
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
     {
         return CredentialSource::EnvAuthTToken;
     }
-    if std::env::var(crate::provider::ANTHROPIC_API_KEY_ENV)
-        .map(|v| !v.is_empty())
-        .unwrap_or(false)
+    if !is_openai
+        && std::env::var(crate::provider::ANTHROPIC_API_KEY_ENV)
+            .map(|v| !v.is_empty())
+            .unwrap_or(false)
     {
         return CredentialSource::EnvApiKey;
     }
@@ -225,7 +276,7 @@ fn print_auth_help() {
     println!(
         "Usage: {name} auth <subcommand> [options]
 
-Manage persisted Anthropic credentials in ~/.rpi/auth.json.
+Manage persisted credentials and inspect models.json provider authentication.
 
 Subcommands:
   login   Prompt for an API key and save it (input is not echoed).
@@ -233,15 +284,17 @@ Subcommands:
   logout  Remove the stored credential.
 
 Options:
-  --provider <id>   Provider id (v1: anthropic; default: anthropic)
+  --provider <id>   Provider id (default: anthropic)
   --json            (check only) Emit a {{ready, provider, source}} JSON object
 
 Environment:
   ANTHROPIC_API_KEY      Fallback API key (x-api-key) when no stored credential.
   ANTHROPIC_AUTH_TOKEN   Fallback bearer token (Authorization: Bearer).
+  OPENAI_API_KEY         Fallback bearer token for openai-completions.
 
 Notes:
-  v1 supports only the anthropic provider. OAuth (Claude Pro/Max) is deferred.
+  `login` stores Anthropic credentials. OpenAI-compatible providers normally
+  store apiKey in ~/.rpi/agent/models.json. OAuth remains deferred.
 ",
         name = crate::APP_NAME
     );
@@ -258,7 +311,7 @@ fn _keep_btreemap() -> Option<BTreeMap<String, String>> {
 mod tests {
     use super::*;
     use crate::config::{
-        auth_path, upsert_credential, Credential, DEFAULT_PROVIDER_ID, test_support::env_lock,
+        auth_path, test_support::env_lock, upsert_credential, Credential, DEFAULT_PROVIDER_ID,
     };
 
     /// Scope `RPI_CODING_AGENT_DIR` + the `ANTHROPIC_*` env vars to a temp dir
@@ -270,6 +323,7 @@ mod tests {
         prev_dir: Option<std::ffi::OsString>,
         prev_key: Option<std::ffi::OsString>,
         prev_tok: Option<std::ffi::OsString>,
+        prev_openai_key: Option<std::ffi::OsString>,
     }
     impl TempConfig {
         fn new() -> Self {
@@ -277,16 +331,19 @@ mod tests {
             let prev_dir = std::env::var_os(crate::config::CONFIG_DIR_ENV);
             let prev_key = std::env::var_os(crate::provider::ANTHROPIC_API_KEY_ENV);
             let prev_tok = std::env::var_os(crate::provider::ANTHROPIC_AUTH_TOKEN_ENV);
+            let prev_openai_key = std::env::var_os(crate::provider::OPENAI_API_KEY_ENV);
             let tmp = tempfile::TempDir::new().unwrap();
             std::env::set_var(crate::config::CONFIG_DIR_ENV, tmp.path());
             std::env::remove_var(crate::provider::ANTHROPIC_API_KEY_ENV);
             std::env::remove_var(crate::provider::ANTHROPIC_AUTH_TOKEN_ENV);
+            std::env::remove_var(crate::provider::OPENAI_API_KEY_ENV);
             Self {
                 _guard: guard,
                 _tmp: tmp,
                 prev_dir,
                 prev_key,
                 prev_tok,
+                prev_openai_key,
             }
         }
     }
@@ -294,7 +351,14 @@ mod tests {
         fn drop(&mut self) {
             restore(crate::config::CONFIG_DIR_ENV, self.prev_dir.take());
             restore(crate::provider::ANTHROPIC_API_KEY_ENV, self.prev_key.take());
-            restore(crate::provider::ANTHROPIC_AUTH_TOKEN_ENV, self.prev_tok.take());
+            restore(
+                crate::provider::ANTHROPIC_AUTH_TOKEN_ENV,
+                self.prev_tok.take(),
+            );
+            restore(
+                crate::provider::OPENAI_API_KEY_ENV,
+                self.prev_openai_key.take(),
+            );
         }
     }
     fn restore(name: &str, prev: Option<std::ffi::OsString>) {
@@ -316,7 +380,10 @@ mod tests {
         let _cfg = TempConfig::new();
         upsert_credential(
             DEFAULT_PROVIDER_ID,
-            Credential::ApiKey { key: Some("sk-stored".into()), env: None },
+            Credential::ApiKey {
+                key: Some("sk-stored".into()),
+                env: None,
+            },
         )
         .unwrap();
         let code = run_check(&[]).await;
@@ -332,13 +399,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn check_ready_with_openai_models_json_key() {
+        let _cfg = TempConfig::new();
+        std::fs::write(
+            crate::config::models_path().unwrap(),
+            r#"{"providers":{"gateway":{"api":"openai-completions","apiKey":"key","models":[{"id":"gpt-test"}]}}}"#,
+        )
+        .unwrap();
+        let code = run_check(&["--provider".to_string(), "gateway".to_string()]).await;
+        assert_eq!(code, 0);
+    }
+
+    #[tokio::test]
     async fn check_json_outputs_object() {
         let _cfg = TempConfig::new();
         // Capture stdout is awkward in unit tests; just assert the exit code +
         // that a stored cred flips `ready`.
         upsert_credential(
             DEFAULT_PROVIDER_ID,
-            Credential::ApiKey { key: Some("sk-x".into()), env: None },
+            Credential::ApiKey {
+                key: Some("sk-x".into()),
+                env: None,
+            },
         )
         .unwrap();
         let code = run_check(&["--json".to_string()]).await;
@@ -350,7 +432,10 @@ mod tests {
         let _cfg = TempConfig::new();
         upsert_credential(
             DEFAULT_PROVIDER_ID,
-            Credential::ApiKey { key: Some("sk".into()), env: None },
+            Credential::ApiKey {
+                key: Some("sk".into()),
+                env: None,
+            },
         )
         .unwrap();
         assert!(auth_path().unwrap().exists());

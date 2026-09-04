@@ -153,7 +153,7 @@ impl Editor {
                 state.lines.push(String::new());
             }
         }
-        
+
         Self {
             state: Mutex::new(state),
             options,
@@ -171,7 +171,11 @@ impl Editor {
 
     /// Create a new editor with default options.
     pub fn simple() -> Self {
-        Self::new(EditorOptions::default(), EditorStyle::default(), Arc::new(Keybindings::new()))
+        Self::new(
+            EditorOptions::default(),
+            EditorStyle::default(),
+            Arc::new(Keybindings::new()),
+        )
     }
 
     /// Set the text content.
@@ -192,7 +196,8 @@ impl Editor {
 
     /// Get the text content.
     pub fn get_text(&self) -> String {
-        self.state.lock()
+        self.state
+            .lock()
             .map(|s| s.lines.join("\n"))
             .unwrap_or_default()
     }
@@ -223,7 +228,8 @@ impl Editor {
 
     /// Get cursor position.
     pub fn cursor_position(&self) -> (usize, usize) {
-        self.state.lock()
+        self.state
+            .lock()
             .map(|s| (s.cursor_row, s.cursor_col))
             .unwrap_or((0, 0))
     }
@@ -274,8 +280,7 @@ impl Editor {
     /// other mutation starts a fresh entry. A new mutation clears the redo
     /// stack (the classic undo/redo semantics).
     fn push_undo(&self, action: &'static str) {
-        let coalesce = action == "insert"
-            && *self.last_action.lock().unwrap() == Some("insert");
+        let coalesce = action == "insert" && *self.last_action.lock().unwrap() == Some("insert");
         if !coalesce {
             let snap = self.snapshot_state();
             if let Ok(mut stack) = self.undo_stack.lock() {
@@ -291,11 +296,7 @@ impl Editor {
     /// Undo the last mutation (Ctrl+-). Restores the prior snapshot; the
     /// undone state moves to the redo stack for Ctrl+R.
     pub fn undo(&self) {
-        let popped = self
-            .undo_stack
-            .lock()
-            .unwrap()
-            .pop();
+        let popped = self.undo_stack.lock().unwrap().pop();
         let Some(snap) = popped else { return };
         // The current state is the redo target.
         self.redo_stack.lock().unwrap().push(self.snapshot_state());
@@ -320,7 +321,13 @@ impl Editor {
         }
         let accumulate = *self.last_action.lock().unwrap() == Some("kill");
         if let Ok(mut ring) = self.kill_ring.lock() {
-            ring.push(&text, PushOptions { prepend, accumulate });
+            ring.push(
+                &text,
+                PushOptions {
+                    prepend,
+                    accumulate,
+                },
+            );
         }
         *self.last_action.lock().unwrap() = Some("kill");
     }
@@ -462,7 +469,9 @@ impl Editor {
 
     /// Copy the selection onto the kill ring (Ctrl+C). No-op without one.
     pub fn copy_selection(&self) -> bool {
-        let Some(text) = self.selected_text() else { return false };
+        let Some(text) = self.selected_text() else {
+            return false;
+        };
         if text.is_empty() {
             return false;
         }
@@ -672,10 +681,7 @@ impl Editor {
         let killed = if let Ok(mut state) = self.state.lock() {
             let row = state.cursor_row;
             let col = state.cursor_col;
-            let start = crate::word_navigation::find_word_backward(
-                &state.lines[row],
-                col,
-            );
+            let start = crate::word_navigation::find_word_backward(&state.lines[row], col);
             let dead: String = state.lines[row].drain(start..col).collect();
             state.cursor_col = start;
             dead
@@ -694,10 +700,7 @@ impl Editor {
             let col = state.cursor_col;
             // Kill only the current word (not the trailing delimiter) —
             // `find_word_end` stops at the last word char.
-            let end = crate::word_navigation::find_word_end(
-                &state.lines[row],
-                col,
-            );
+            let end = crate::word_navigation::find_word_end(&state.lines[row], col);
             let dead: String = state.lines[row].drain(col..end).collect();
             dead
         } else {
@@ -711,10 +714,8 @@ impl Editor {
     fn cursor_word_left(&self) {
         if let Ok(mut state) = self.state.lock() {
             let row = state.cursor_row;
-            state.cursor_col = crate::word_navigation::find_word_backward(
-                &state.lines[row],
-                state.cursor_col,
-            );
+            state.cursor_col =
+                crate::word_navigation::find_word_backward(&state.lines[row], state.cursor_col);
         }
     }
 
@@ -722,10 +723,8 @@ impl Editor {
     fn cursor_word_right(&self) {
         if let Ok(mut state) = self.state.lock() {
             let row = state.cursor_row;
-            state.cursor_col = crate::word_navigation::find_word_forward(
-                &state.lines[row],
-                state.cursor_col,
-            );
+            state.cursor_col =
+                crate::word_navigation::find_word_forward(&state.lines[row], state.cursor_col);
         }
     }
 
@@ -882,7 +881,7 @@ impl Editor {
             }
             // Shift+Enter inserts a newline (mirrors `tui.input.newLine`).
             (KeyModifiers::SHIFT, KeyCode::Enter) => self.insert("\n"),
-            
+
             // Ctrl shortcuts
             (KeyModifiers::CONTROL, KeyCode::Char('a')) => self.cursor_home(),
             (KeyModifiers::CONTROL, KeyCode::Char('e')) => self.cursor_end(),
@@ -945,8 +944,10 @@ impl Editor {
             (KeyModifiers::ALT, KeyCode::Right) => self.cursor_word_right(),
             // Ctrl+J inserts a newline (pi tui.input.newLine alongside
             // Shift+Enter). Ctrl+D deletes the char forward (deleteCharForward).
-            (KeyModifiers::CONTROL, KeyCode::Char('j')) => self.insert_no_undo("
-"),
+            (KeyModifiers::CONTROL, KeyCode::Char('j')) => self.insert_no_undo(
+                "
+",
+            ),
             (KeyModifiers::CONTROL, KeyCode::Char('d')) => self.delete(),
             // Editor page scroll (pi tui.editor.pageUp/pageDown — the
             // unmodified PageUp/Down are the alt-screen transcript scroll).
@@ -965,7 +966,7 @@ impl Editor {
                     *self.jump_mode.lock().unwrap() = Some(1);
                 }
             }
-            
+
             // Regular character input — unless a character jump is pending
             // (Ctrl+] / Ctrl+Alt+] consumed the key as the jump target).
             (KeyModifiers::NONE | KeyModifiers::SHIFT, KeyCode::Char(c)) => {
@@ -975,7 +976,7 @@ impl Editor {
                     None => self.insert(&c.to_string()),
                 }
             }
-            
+
             _ => return false,
         }
         true
@@ -995,25 +996,27 @@ impl Component for Editor {
         for (row_idx, line) in state.lines.iter().enumerate() {
             // Placeholder (dim) only on the single empty line at the cursor —
             // honors callers that set `placeholder`; production drops it.
-            let content = if line.is_empty()
-                && row_idx == state.cursor_row
-                && state.lines.len() == 1
-            {
-                if let Some(placeholder) = &self.options.placeholder {
-                    format!("\x1b[2m{}\x1b[22m", placeholder)
+            let content =
+                if line.is_empty() && row_idx == state.cursor_row && state.lines.len() == 1 {
+                    if let Some(placeholder) = &self.options.placeholder {
+                        format!("\x1b[2m{}\x1b[22m", placeholder)
+                    } else {
+                        String::new()
+                    }
                 } else {
-                    String::new()
-                }
-            } else {
-                line.clone()
-            };
+                    line.clone()
+                };
 
             // Selection highlight: inverse-video the span on this row (byte
             // offsets are char boundaries — both anchor and caret always sit
             // on one).
             let mut content = content;
             if let Some((sc, ec)) = self.selection_span_on_row(&state, row_idx) {
-                if ec <= content.len() && sc <= ec && content.is_char_boundary(sc) && content.is_char_boundary(ec) {
+                if ec <= content.len()
+                    && sc <= ec
+                    && content.is_char_boundary(sc)
+                    && content.is_char_boundary(ec)
+                {
                     let before = &content[..sc];
                     let sel = &content[sc..ec];
                     let after = &content[ec..];
@@ -1030,16 +1033,17 @@ impl Component for Editor {
                     .saturating_sub(self.options.padding_x)
                     .saturating_sub(visible_w),
             );
-            let right_pad_cursor = if state.focused
-                && row_idx == state.cursor_row
-                && content.is_empty()
-            {
-                // Reserve room for the empty-cursor (`\x1b[7m \x1b[0m`) so
-                // the trailing cursor doesn't wrap past the right border.
-                right_pad.get(..right_pad.len().saturating_sub(1)).unwrap_or("").to_string()
-            } else {
-                right_pad
-            };
+            let right_pad_cursor =
+                if state.focused && row_idx == state.cursor_row && content.is_empty() {
+                    // Reserve room for the empty-cursor (`\x1b[7m \x1b[0m`) so
+                    // the trailing cursor doesn't wrap past the right border.
+                    right_pad
+                        .get(..right_pad.len().saturating_sub(1))
+                        .unwrap_or("")
+                        .to_string()
+                } else {
+                    right_pad
+                };
 
             let mut rendered = format!("{pad}{content}{right_pad_cursor}");
 
@@ -1062,7 +1066,10 @@ impl Component for Editor {
         // Guard against an empty `lines` vector (the invariant is `[""]`, but
         // be defensive): emit one blank interior row so the box still renders.
         if content_lines.is_empty() {
-            content_lines.push(format!("{pad}{}", " ".repeat(width.saturating_sub(self.options.padding_x))));
+            content_lines.push(format!(
+                "{pad}{}",
+                " ".repeat(width.saturating_sub(self.options.padding_x))
+            ));
         }
 
         // Full-width top + bottom border, colored via the theme border color
@@ -1137,27 +1144,23 @@ mod tests {
         assert_eq!(snap_boundary("a你b", 2), 1);
     }
 
-
-
-
-
-
-
-
-
-
     #[test]
     fn left_arrow_keeps_text_in_render() {
-        use crossterm::event::{KeyCode, KeyModifiers};
         use crate::component::Component;
+        use crossterm::event::{KeyCode, KeyModifiers};
         let mk = |m, c| crossterm::event::KeyEvent::new(c, m);
         let editor = Editor::simple();
         editor.set_focused(true);
         editor.insert("hello world");
         editor.handle_key(mk(KeyModifiers::NONE, KeyCode::Left));
-        let rendered = editor.render(40).join("
-");
-        assert!(rendered.contains("hello"), "text must survive Left, got: {rendered:?}");
+        let rendered = editor.render(40).join(
+            "
+",
+        );
+        assert!(
+            rendered.contains("hello"),
+            "text must survive Left, got: {rendered:?}"
+        );
     }
     #[test]
     fn test_char_jump_and_page_scroll() {
@@ -1169,13 +1172,17 @@ mod tests {
         // the previous 'x' ("alpha xray xray" — the second "xray" starts at 11).
         editor.insert("alpha xray xray");
         editor.handle_key(mk(KeyModifiers::CONTROL | KeyModifiers::ALT, KeyCode::End)); // caret at end
-        editor.handle_key(mk(KeyModifiers::CONTROL | KeyModifiers::ALT, KeyCode::Char(']')));
+        editor.handle_key(mk(
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+            KeyCode::Char(']'),
+        ));
         // The next printable char is consumed as the jump target.
         editor.handle_key(mk(KeyModifiers::NONE, KeyCode::Char('x')));
         assert_eq!(editor.cursor_position(), (0, 11));
 
         // Page scroll on a multi-line buffer clamps to the last row.
-        editor.set_text("l0
+        editor.set_text(
+            "l0
 l1
 l2
 l3
@@ -1187,7 +1194,8 @@ l8
 l9
 l10
 l11
-l12");
+l12",
+        );
         editor.set_cursor(0, 2);
         editor.handle_key(mk(KeyModifiers::CONTROL, KeyCode::PageDown));
         let (row, _) = editor.cursor_position();
@@ -1218,8 +1226,11 @@ l12");
         editor.set_text("a");
         editor.set_cursor(0, 1);
         editor.handle_key(mk(KeyModifiers::CONTROL, KeyCode::Char('j')));
-        assert_eq!(editor.get_text(), "a
-");
+        assert_eq!(
+            editor.get_text(),
+            "a
+"
+        );
 
         // Ctrl+D deletes the char forward (deleteCharForward).
         editor.set_text("abc");
@@ -1269,7 +1280,6 @@ l12");
         ));
         assert_eq!(editor.get_text(), "hello worldhello");
     }
-
 
     #[test]
     fn test_selection_replace_and_cut() {
@@ -1381,7 +1391,11 @@ l12");
             crossterm::event::KeyModifiers::NONE,
         ));
         editor.undo();
-        assert_eq!(editor.get_text(), "", "submit clears undo so committed text stays committed");
+        assert_eq!(
+            editor.get_text(),
+            "",
+            "submit clears undo so committed text stays committed"
+        );
     }
     #[test]
     fn test_editor_text() {
@@ -1413,7 +1427,10 @@ l12");
         // above and below the content, with no `> ` prompt prefix on the text
         // lines (mirrors TS editor.ts:525-588).
         let editor = Editor::new(
-            EditorOptions { padding_x: 1, ..Default::default() },
+            EditorOptions {
+                padding_x: 1,
+                ..Default::default()
+            },
             EditorStyle::default(),
             Arc::new(Keybindings::new()),
         );
@@ -1423,12 +1440,26 @@ l12");
         // Both borders are a 20-wide `─` run (visible width, ANSI stripped).
         let top = crate::ansi::strip_ansi(&lines[0]);
         let bottom = crate::ansi::strip_ansi(lines.last().unwrap());
-        assert_eq!(top.chars().filter(|c| *c == '─').count(), 20, "top border not full width: {top:?}");
-        assert_eq!(bottom.chars().filter(|c| *c == '─').count(), 20, "bottom border not full width: {bottom:?}");
+        assert_eq!(
+            top.chars().filter(|c| *c == '─').count(),
+            20,
+            "top border not full width: {top:?}"
+        );
+        assert_eq!(
+            bottom.chars().filter(|c| *c == '─').count(),
+            20,
+            "bottom border not full width: {bottom:?}"
+        );
         // The content line carries the text with no `> ` prompt.
         let content = crate::ansi::strip_ansi(&lines[1]);
-        assert!(content.contains("hi"), "content line missing text: {content:?}");
-        assert!(!content.contains("> "), "content line should not have a prompt prefix: {content:?}");
+        assert!(
+            content.contains("hi"),
+            "content line missing text: {content:?}"
+        );
+        assert!(
+            !content.contains("> "),
+            "content line should not have a prompt prefix: {content:?}"
+        );
     }
 
     #[test]
@@ -1448,7 +1479,11 @@ l12");
         assert_eq!(editor.cursor_position(), (0, 7));
         // Render must not panic when placing the cursor marker on the row.
         let lines = editor.render(20);
-        assert_eq!(lines.len(), 3, "bordered box keeps [border, content, border]");
+        assert_eq!(
+            lines.len(),
+            3,
+            "bordered box keeps [border, content, border]"
+        );
 
         // Backspace / left/right must also stay on boundaries.
         editor.backspace(); // remove 书
@@ -1473,7 +1508,7 @@ l12");
         let editor = Editor::simple();
         editor.set_text("读");
         editor.set_cursor(0, 3); // byte end of line
-        // Emulate refresh_autocomplete: col (byte) min text len.
+                                 // Emulate refresh_autocomplete: col (byte) min text len.
         let text = editor.get_text();
         let (_r, col) = editor.cursor_position();
         let cursor = col.min(text.len());

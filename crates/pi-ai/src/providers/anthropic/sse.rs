@@ -192,13 +192,21 @@ impl SseEventStream {
                 return Ok(self.state.flush());
             }
 
-            if self.signal.is_cancelled() {
-                return Err(AiError::Abort {
-                    message: "Request was aborted".to_string(),
-                });
-            }
+            // Cancellation must race the body read itself. Checking the token
+            // only before `.next().await` leaves the task stuck forever when a
+            // server keeps the SSE connection open without sending another
+            // chunk (and makes Ctrl+C/Esc appear to freeze the TUI).
+            let next = tokio::select! {
+                biased;
+                _ = self.signal.cancelled() => {
+                    return Err(AiError::Abort {
+                        message: "Request was aborted".to_string(),
+                    });
+                }
+                next = self.bytes_stream.next() => next,
+            };
 
-            match self.bytes_stream.next().await {
+            match next {
                 None => {
                     self.done = true;
                     continue;
@@ -433,5 +441,45 @@ mod tests {
         };
         let err = parse_anthropic_event(&frame).unwrap_err();
         assert!(matches!(err, AiError::Sse { .. }));
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_pending_body_read() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                      Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .unwrap();
+        let signal = CancellationToken::new();
+        let cancel = signal.clone();
+        let mut stream = SseEventStream::new(response, signal);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            cancel.cancel();
+        });
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next_event())
+            .await
+            .expect("cancellation must wake a pending response body read");
+        assert!(matches!(result, Err(AiError::Abort { .. })));
+        server.abort();
     }
 }

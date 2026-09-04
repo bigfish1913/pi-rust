@@ -43,7 +43,10 @@ async fn main() {
     }
 
     let state = agent.state();
-    println!("minimal example: {} messages after run", state.messages.len());
+    println!(
+        "minimal example: {} messages after run",
+        state.messages.len()
+    );
     for m in &state.messages {
         println!("  - {}", m.role().as_str());
     }

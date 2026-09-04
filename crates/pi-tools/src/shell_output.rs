@@ -32,8 +32,8 @@ use tokio_util::sync::CancellationToken;
 use crate::env::{ExecutionEnv, FileContent, ShellExecOptions};
 use crate::error::{ExecutionError, ExecutionErrorCode};
 use crate::truncate::{
-    trim_to_last_utf8_bytes, truncate_tail, TruncationOptions, TruncationLimit,
-    TruncationResult, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES,
+    trim_to_last_utf8_bytes, truncate_tail, TruncationLimit, TruncationOptions, TruncationResult,
+    DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES,
 };
 
 /// The 100KB cap on the in-memory `tail_output` rolling buffer.
@@ -131,11 +131,13 @@ impl CaptureState {
         let total_lines = self.completed_lines + if self.has_open_line { 1 } else { 0 };
         let truncated = total_lines > DEFAULT_MAX_LINES || self.total_bytes > DEFAULT_MAX_BYTES;
         let truncated_by = if truncated {
-            tail_truncation.truncated_by.or(if self.total_bytes > DEFAULT_MAX_BYTES {
-                Some(TruncationLimit::Bytes)
-            } else {
-                Some(TruncationLimit::Lines)
-            })
+            tail_truncation
+                .truncated_by
+                .or(if self.total_bytes > DEFAULT_MAX_BYTES {
+                    Some(TruncationLimit::Bytes)
+                } else {
+                    Some(TruncationLimit::Lines)
+                })
         } else {
             None
         };
@@ -193,8 +195,9 @@ pub async fn execute_shell_with_capture(
     // The user on_chunk callback. Both streams fire it (the TS wires both to the
     // same onChunk); we share it via Arc<Mutex<Option<Box>>> so both closures can
     // call it without moving the Box twice.
-    let user_cb: Arc<Mutex<Option<Box<dyn FnMut(&str, &dyn Fn() -> ShellCaptureProgress) + Send>>>> =
-        Arc::new(Mutex::new(options.on_chunk));
+    let user_cb: Arc<
+        Mutex<Option<Box<dyn FnMut(&str, &dyn Fn() -> ShellCaptureProgress) + Send>>>,
+    > = Arc::new(Mutex::new(options.on_chunk));
 
     let state_stdout = state.clone();
     let user_cb_stdout = user_cb.clone();

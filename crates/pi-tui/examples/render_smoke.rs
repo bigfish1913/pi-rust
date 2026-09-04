@@ -4,8 +4,8 @@
 //!
 //! Run: cargo run -p rpi-tui --example render_smoke
 
-use rpi_tui::{render_diff, FooterComponent, Markdown, ToolExecutionComponent};
 use rpi_tui::component::Component;
+use rpi_tui::{render_diff, FooterComponent, Markdown, ToolExecutionComponent};
 
 fn main() {
     let width = 72usize;
@@ -84,7 +84,9 @@ fn main() {
     footer.set_model("glm-5");
     footer.set_status("Working…");
     footer.set_thinking_level(Some("medium"));
-    footer.set_hints("Enter: Send | Shift+Enter: New line | Ctrl+C: Abort | Ctrl+M: Cycle | Ctrl+T: Expand");
+    footer.set_hints(
+        "Enter: Send | Shift+Enter: New line | Ctrl+C: Abort | Ctrl+M: Cycle | Ctrl+T: Expand",
+    );
     println!();
     println!("╔══ Footer (working + thinking) ════════════════════════════════════╗");
     for line in footer.render(width) {

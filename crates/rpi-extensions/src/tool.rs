@@ -113,21 +113,31 @@ fn stb_to_result(s: &StbString) -> AgentToolResult {
                 let kind = block.get("type").and_then(|v| v.as_str()).unwrap_or("text");
                 match kind {
                     "image" => {
-                        let data = block.get("data").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let data = block
+                            .get("data")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
                         let mime = block
                             .get("mimeType")
                             .or_else(|| block.get("mime_type"))
                             .and_then(|v| v.as_str())
                             .unwrap_or("image/png")
                             .to_string();
-                        result.content.push(TextContentOrImage::Image(rpi_ai::types::ImageContent {
-                            kind: rpi_ai::types::ImageContentType,
-                            data,
-                            mime_type: mime,
-                        }));
+                        result.content.push(TextContentOrImage::Image(
+                            rpi_ai::types::ImageContent {
+                                kind: rpi_ai::types::ImageContentType,
+                                data,
+                                mime_type: mime,
+                            },
+                        ));
                     }
                     _ => {
-                        let t = block.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let t = block
+                            .get("text")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
                         result.content.push(TextContentOrImage::text(t));
                     }
                 }
@@ -144,7 +154,10 @@ fn stb_to_result(s: &StbString) -> AgentToolResult {
             .or_else(|| obj.get("added_tool_names"))
             .and_then(|v| v.as_array())
         {
-            result.added_tool_names = arr.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+            result.added_tool_names = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
         }
         if let Some(usage) = obj.get("usage") {
             if let Ok(u) = serde_json::from_value::<rpi_ai::types::Usage>(usage.clone()) {
@@ -186,13 +199,14 @@ impl PluginToolAdapter {
     /// Build an adapter from the registered schema + handle + the session's
     /// keepalive. `label` defaults to the tool name. The keepalive clone keeps
     /// the owning cdylib mapped for the adapter's lifetime.
-    pub fn new(
-        schema: Tool,
-        handle: PluginToolHandle,
-        keepalive: Arc<PluginKeepalive>,
-    ) -> Self {
+    pub fn new(schema: Tool, handle: PluginToolHandle, keepalive: Arc<PluginKeepalive>) -> Self {
         let label = schema.name.clone();
-        Self { schema, label, handle, keepalive }
+        Self {
+            schema,
+            label,
+            handle,
+            keepalive,
+        }
     }
 }
 
@@ -253,7 +267,10 @@ impl AgentTool for PluginToolAdapter {
         // 1. Acquire the ambient runtime (the adapter only runs inside the agent
         //    loop's runtime). Do NOT own a runtime.
         let runtime = tokio::runtime::Handle::try_current().map_err(|e| {
-            AgentError::State(format!("plugin tool '{}' executed off-runtime: {e}", self.schema.name))
+            AgentError::State(format!(
+                "plugin tool '{}' executed off-runtime: {e}",
+                self.schema.name
+            ))
         })?;
 
         // 2. Bridges: unbounded mpsc for partials, oneshot for terminal.
@@ -486,7 +503,9 @@ mod tests {
         if h.is_null() {
             return;
         }
-        unsafe { let _ = Box::from_raw(h as *mut DriveState); }
+        unsafe {
+            let _ = Box::from_raw(h as *mut DriveState);
+        }
     }
 
     extern "C" fn stub_free(s: StbString) {
@@ -536,8 +555,16 @@ mod tests {
             .await
             .expect("drive should succeed");
         assert_eq!(result.content.len(), 1);
-        assert_eq!(DESTROY_COUNT.load(Ordering::SeqCst), 1, "destroy exactly once");
-        assert_eq!(CANCEL_COUNT.load(Ordering::SeqCst), 0, "no cancel in happy path");
+        assert_eq!(
+            DESTROY_COUNT.load(Ordering::SeqCst),
+            1,
+            "destroy exactly once"
+        );
+        assert_eq!(
+            CANCEL_COUNT.load(Ordering::SeqCst),
+            0,
+            "no cancel in happy path"
+        );
     }
 
     #[tokio::test]
@@ -573,10 +600,21 @@ mod tests {
             cancelled: Arc<AtomicBool>,
             polls: usize,
         }
-        extern "C" fn slow_execute(_: StbStringRef, _: StbString, _: Option<FreeStringFn>) -> StepHandle {
-            Box::into_raw(Box::new(SlowState { cancelled: Arc::new(AtomicBool::new(false)), polls: 0 })) as StepHandle
+        extern "C" fn slow_execute(
+            _: StbStringRef,
+            _: StbString,
+            _: Option<FreeStringFn>,
+        ) -> StepHandle {
+            Box::into_raw(Box::new(SlowState {
+                cancelled: Arc::new(AtomicBool::new(false)),
+                polls: 0,
+            })) as StepHandle
         }
-        extern "C" fn slow_poll(h: StepHandle, _: Option<ToolPartialCb>, _: *mut c_void) -> StepResult {
+        extern "C" fn slow_poll(
+            h: StepHandle,
+            _: Option<ToolPartialCb>,
+            _: *mut c_void,
+        ) -> StepResult {
             let s = unsafe { &mut *(h as *mut SlowState) };
             s.polls += 1;
             if s.cancelled.load(Ordering::SeqCst) {
@@ -587,12 +625,18 @@ mod tests {
         }
         extern "C" fn slow_cancel(h: StepHandle) {
             CANCEL_COUNT.fetch_add(1, Ordering::SeqCst);
-            unsafe { (*(h as *mut SlowState)).cancelled.store(true, Ordering::SeqCst); }
+            unsafe {
+                (*(h as *mut SlowState))
+                    .cancelled
+                    .store(true, Ordering::SeqCst);
+            }
         }
         extern "C" fn slow_destroy(h: StepHandle) {
             DESTROY_COUNT.fetch_add(1, Ordering::SeqCst);
             if !h.is_null() {
-                unsafe { let _ = Box::from_raw(h as *mut SlowState); }
+                unsafe {
+                    let _ = Box::from_raw(h as *mut SlowState);
+                }
             }
         }
         let tool = Tool {
@@ -616,8 +660,14 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             signal_clone.cancel();
         });
-        let _ = adapter.execute("call_3", serde_json::json!({}), signal, on_update).await;
+        let _ = adapter
+            .execute("call_3", serde_json::json!({}), signal, on_update)
+            .await;
         // No hang + destroy exactly once (cancel observed via the AtomicBool).
-        assert_eq!(DESTROY_COUNT.load(Ordering::SeqCst), 1, "destroy once on cancel");
+        assert_eq!(
+            DESTROY_COUNT.load(Ordering::SeqCst),
+            1,
+            "destroy once on cancel"
+        );
     }
 }

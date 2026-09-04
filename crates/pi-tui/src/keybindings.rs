@@ -90,7 +90,8 @@ impl Keybindings {
     /// Create a new keybindings manager with default bindings.
     pub fn new() -> Self {
         let definitions = Self::default_definitions();
-        let keys_by_id = definitions.iter()
+        let keys_by_id = definitions
+            .iter()
             .map(|(id, def)| (*id, def.default_keys.clone()))
             .collect();
         Self {
@@ -109,249 +110,390 @@ impl Keybindings {
         let mut map = HashMap::new();
 
         // Editor navigation and editing
-        map.insert("tui.editor.cursorUp", KeybindingDefinition {
-            default_keys: vec![KeyCombo::new(Up, M::NONE)],
-            description: Some("Move cursor up"),
-        });
-        map.insert("tui.editor.cursorDown", KeybindingDefinition {
-            default_keys: vec![KeyCombo::new(Down, M::NONE)],
-            description: Some("Move cursor down"),
-        });
-        map.insert("tui.editor.historyPrevious", KeybindingDefinition {
-            default_keys: vec![],
-            description: Some("Select previous prompt history entry"),
-        });
-        map.insert("tui.editor.historyNext", KeybindingDefinition {
-            default_keys: vec![],
-            description: Some("Select next prompt history entry"),
-        });
-        map.insert("tui.editor.cursorLeft", KeybindingDefinition {
-            default_keys: vec![
-                KeyCombo::new(Left, M::NONE),
-                KeyCombo::new(Char('b'), M::CONTROL),
-            ],
-            description: Some("Move cursor left"),
-        });
-        map.insert("tui.editor.cursorRight", KeybindingDefinition {
-            default_keys: vec![
-                KeyCombo::new(Right, M::NONE),
-                KeyCombo::new(Char('f'), M::CONTROL),
-            ],
-            description: Some("Move cursor right"),
-        });
-        map.insert("tui.editor.cursorWordLeft", KeybindingDefinition {
-            default_keys: vec![
-                KeyCombo::new(Left, M::ALT),
-                KeyCombo::new(Left, M::CONTROL),
-                KeyCombo::new(Char('b'), M::ALT),
-            ],
-            description: Some("Move cursor word left"),
-        });
-        map.insert("tui.editor.cursorWordRight", KeybindingDefinition {
-            default_keys: vec![
-                KeyCombo::new(Right, M::ALT),
-                KeyCombo::new(Right, M::CONTROL),
-                KeyCombo::new(Char('f'), M::ALT),
-            ],
-            description: Some("Move cursor word right"),
-        });
-        map.insert("tui.editor.cursorLineStart", KeybindingDefinition {
-            default_keys: vec![
-                KeyCombo::new(Home, M::NONE),
-                KeyCombo::new(Home, M::CONTROL),
-                KeyCombo::new(Char('a'), M::CONTROL),
-            ],
-            description: Some("Move to line start"),
-        });
-        map.insert("tui.editor.cursorLineEnd", KeybindingDefinition {
-            default_keys: vec![
-                KeyCombo::new(End, M::NONE),
-                KeyCombo::new(End, M::CONTROL),
-                KeyCombo::new(Char('e'), M::CONTROL),
-            ],
-            description: Some("Move to line end"),
-        });
-        map.insert("tui.editor.jumpForward", KeybindingDefinition {
-            default_keys: vec![KeyCombo::new(Char(']'), M::CONTROL)],
-            description: Some("Jump forward to character"),
-        });
-        map.insert("tui.editor.jumpBackward", KeybindingDefinition {
-            default_keys: vec![KeyCombo::new(Char(']'), M::CONTROL | M::ALT)],
-            description: Some("Jump backward to character"),
-        });
-        map.insert("tui.editor.pageUp", KeybindingDefinition {
-            default_keys: vec![
-                KeyCombo::new(PageUp, M::NONE),
-                KeyCombo::new(PageUp, M::CONTROL),
-            ],
-            description: Some("Page up"),
-        });
-        map.insert("tui.editor.pageDown", KeybindingDefinition {
-            default_keys: vec![
-                KeyCombo::new(PageDown, M::NONE),
-                KeyCombo::new(PageDown, M::CONTROL),
-            ],
-            description: Some("Page down"),
-        });
-        map.insert("tui.editor.deleteCharBackward", KeybindingDefinition {
-            default_keys: vec![KeyCombo::new(Backspace, M::NONE)],
-            description: Some("Delete character backward"),
-        });
-        map.insert("tui.editor.deleteCharForward", KeybindingDefinition {
-            default_keys: vec![
-                KeyCombo::new(Delete, M::NONE),
-                KeyCombo::new(Char('d'), M::CONTROL),
-            ],
-            description: Some("Delete character forward"),
-        });
-        map.insert("tui.editor.deleteWordBackward", KeybindingDefinition {
-            default_keys: vec![
-                KeyCombo::new(Char('w'), M::CONTROL),
-                KeyCombo::new(Backspace, M::ALT),
-            ],
-            description: Some("Delete word backward"),
-        });
-        map.insert("tui.editor.deleteWordForward", KeybindingDefinition {
-            default_keys: vec![
-                KeyCombo::new(Char('d'), M::ALT),
-                KeyCombo::new(Delete, M::ALT),
-            ],
-            description: Some("Delete word forward"),
-        });
-        map.insert("tui.editor.deleteToLineStart", KeybindingDefinition {
-            default_keys: vec![KeyCombo::new(Char('u'), M::CONTROL)],
-            description: Some("Delete to line start"),
-        });
-        map.insert("tui.editor.deleteToLineEnd", KeybindingDefinition {
-            default_keys: vec![KeyCombo::new(Char('k'), M::CONTROL)],
-            description: Some("Delete to line end"),
-        });
-        map.insert("tui.editor.yank", KeybindingDefinition {
-            default_keys: vec![KeyCombo::new(Char('y'), M::CONTROL)],
-            description: Some("Yank"),
-        });
-        map.insert("tui.editor.yankPop", KeybindingDefinition {
-            default_keys: vec![KeyCombo::new(Char('y'), M::ALT)],
-            description: Some("Yank pop"),
-        });
-        map.insert("tui.editor.undo", KeybindingDefinition {
-            default_keys: vec![KeyCombo::new(Char('-'), M::CONTROL)],
-            description: Some("Undo"),
-        });
+        map.insert(
+            "tui.editor.cursorUp",
+            KeybindingDefinition {
+                default_keys: vec![KeyCombo::new(Up, M::NONE)],
+                description: Some("Move cursor up"),
+            },
+        );
+        map.insert(
+            "tui.editor.cursorDown",
+            KeybindingDefinition {
+                default_keys: vec![KeyCombo::new(Down, M::NONE)],
+                description: Some("Move cursor down"),
+            },
+        );
+        map.insert(
+            "tui.editor.historyPrevious",
+            KeybindingDefinition {
+                default_keys: vec![],
+                description: Some("Select previous prompt history entry"),
+            },
+        );
+        map.insert(
+            "tui.editor.historyNext",
+            KeybindingDefinition {
+                default_keys: vec![],
+                description: Some("Select next prompt history entry"),
+            },
+        );
+        map.insert(
+            "tui.editor.cursorLeft",
+            KeybindingDefinition {
+                default_keys: vec![
+                    KeyCombo::new(Left, M::NONE),
+                    KeyCombo::new(Char('b'), M::CONTROL),
+                ],
+                description: Some("Move cursor left"),
+            },
+        );
+        map.insert(
+            "tui.editor.cursorRight",
+            KeybindingDefinition {
+                default_keys: vec![
+                    KeyCombo::new(Right, M::NONE),
+                    KeyCombo::new(Char('f'), M::CONTROL),
+                ],
+                description: Some("Move cursor right"),
+            },
+        );
+        map.insert(
+            "tui.editor.cursorWordLeft",
+            KeybindingDefinition {
+                default_keys: vec![
+                    KeyCombo::new(Left, M::ALT),
+                    KeyCombo::new(Left, M::CONTROL),
+                    KeyCombo::new(Char('b'), M::ALT),
+                ],
+                description: Some("Move cursor word left"),
+            },
+        );
+        map.insert(
+            "tui.editor.cursorWordRight",
+            KeybindingDefinition {
+                default_keys: vec![
+                    KeyCombo::new(Right, M::ALT),
+                    KeyCombo::new(Right, M::CONTROL),
+                    KeyCombo::new(Char('f'), M::ALT),
+                ],
+                description: Some("Move cursor word right"),
+            },
+        );
+        map.insert(
+            "tui.editor.cursorLineStart",
+            KeybindingDefinition {
+                default_keys: vec![
+                    KeyCombo::new(Home, M::NONE),
+                    KeyCombo::new(Home, M::CONTROL),
+                    KeyCombo::new(Char('a'), M::CONTROL),
+                ],
+                description: Some("Move to line start"),
+            },
+        );
+        map.insert(
+            "tui.editor.cursorLineEnd",
+            KeybindingDefinition {
+                default_keys: vec![
+                    KeyCombo::new(End, M::NONE),
+                    KeyCombo::new(End, M::CONTROL),
+                    KeyCombo::new(Char('e'), M::CONTROL),
+                ],
+                description: Some("Move to line end"),
+            },
+        );
+        map.insert(
+            "tui.editor.jumpForward",
+            KeybindingDefinition {
+                default_keys: vec![KeyCombo::new(Char(']'), M::CONTROL)],
+                description: Some("Jump forward to character"),
+            },
+        );
+        map.insert(
+            "tui.editor.jumpBackward",
+            KeybindingDefinition {
+                default_keys: vec![KeyCombo::new(Char(']'), M::CONTROL | M::ALT)],
+                description: Some("Jump backward to character"),
+            },
+        );
+        map.insert(
+            "tui.editor.pageUp",
+            KeybindingDefinition {
+                default_keys: vec![
+                    KeyCombo::new(PageUp, M::NONE),
+                    KeyCombo::new(PageUp, M::CONTROL),
+                ],
+                description: Some("Page up"),
+            },
+        );
+        map.insert(
+            "tui.editor.pageDown",
+            KeybindingDefinition {
+                default_keys: vec![
+                    KeyCombo::new(PageDown, M::NONE),
+                    KeyCombo::new(PageDown, M::CONTROL),
+                ],
+                description: Some("Page down"),
+            },
+        );
+        map.insert(
+            "tui.editor.deleteCharBackward",
+            KeybindingDefinition {
+                default_keys: vec![KeyCombo::new(Backspace, M::NONE)],
+                description: Some("Delete character backward"),
+            },
+        );
+        map.insert(
+            "tui.editor.deleteCharForward",
+            KeybindingDefinition {
+                default_keys: vec![
+                    KeyCombo::new(Delete, M::NONE),
+                    KeyCombo::new(Char('d'), M::CONTROL),
+                ],
+                description: Some("Delete character forward"),
+            },
+        );
+        map.insert(
+            "tui.editor.deleteWordBackward",
+            KeybindingDefinition {
+                default_keys: vec![
+                    KeyCombo::new(Char('w'), M::CONTROL),
+                    KeyCombo::new(Backspace, M::ALT),
+                ],
+                description: Some("Delete word backward"),
+            },
+        );
+        map.insert(
+            "tui.editor.deleteWordForward",
+            KeybindingDefinition {
+                default_keys: vec![
+                    KeyCombo::new(Char('d'), M::ALT),
+                    KeyCombo::new(Delete, M::ALT),
+                ],
+                description: Some("Delete word forward"),
+            },
+        );
+        map.insert(
+            "tui.editor.deleteToLineStart",
+            KeybindingDefinition {
+                default_keys: vec![KeyCombo::new(Char('u'), M::CONTROL)],
+                description: Some("Delete to line start"),
+            },
+        );
+        map.insert(
+            "tui.editor.deleteToLineEnd",
+            KeybindingDefinition {
+                default_keys: vec![KeyCombo::new(Char('k'), M::CONTROL)],
+                description: Some("Delete to line end"),
+            },
+        );
+        map.insert(
+            "tui.editor.yank",
+            KeybindingDefinition {
+                default_keys: vec![KeyCombo::new(Char('y'), M::CONTROL)],
+                description: Some("Yank"),
+            },
+        );
+        map.insert(
+            "tui.editor.yankPop",
+            KeybindingDefinition {
+                default_keys: vec![KeyCombo::new(Char('y'), M::ALT)],
+                description: Some("Yank pop"),
+            },
+        );
+        map.insert(
+            "tui.editor.undo",
+            KeybindingDefinition {
+                default_keys: vec![KeyCombo::new(Char('-'), M::CONTROL)],
+                description: Some("Undo"),
+            },
+        );
 
         // Generic input actions
-        map.insert("tui.input.newLine", KeybindingDefinition {
-            default_keys: vec![
-                KeyCombo::new(Enter, M::SHIFT),
-                KeyCombo::new(Char('j'), M::CONTROL),
-            ],
-            description: Some("Insert newline"),
-        });
-        map.insert("tui.input.submit", KeybindingDefinition {
-            default_keys: vec![KeyCombo::new(Enter, M::NONE)],
-            description: Some("Submit input"),
-        });
-        map.insert("tui.input.tab", KeybindingDefinition {
-            default_keys: vec![KeyCombo::new(Tab, M::NONE)],
-            description: Some("Tab / autocomplete"),
-        });
-        map.insert("tui.input.copy", KeybindingDefinition {
-            default_keys: vec![KeyCombo::new(Char('c'), M::CONTROL)],
-            description: Some("Copy selection"),
-        });
+        map.insert(
+            "tui.input.newLine",
+            KeybindingDefinition {
+                default_keys: vec![
+                    KeyCombo::new(Enter, M::SHIFT),
+                    KeyCombo::new(Char('j'), M::CONTROL),
+                ],
+                description: Some("Insert newline"),
+            },
+        );
+        map.insert(
+            "tui.input.submit",
+            KeybindingDefinition {
+                default_keys: vec![KeyCombo::new(Enter, M::NONE)],
+                description: Some("Submit input"),
+            },
+        );
+        map.insert(
+            "tui.input.tab",
+            KeybindingDefinition {
+                default_keys: vec![KeyCombo::new(Tab, M::NONE)],
+                description: Some("Tab / autocomplete"),
+            },
+        );
+        map.insert(
+            "tui.input.copy",
+            KeybindingDefinition {
+                default_keys: vec![KeyCombo::new(Char('c'), M::CONTROL)],
+                description: Some("Copy selection"),
+            },
+        );
 
         // Generic selection actions
-        map.insert("tui.select.up", KeybindingDefinition {
-            default_keys: vec![KeyCombo::new(Up, M::NONE)],
-            description: Some("Move selection up"),
-        });
-        map.insert("tui.select.down", KeybindingDefinition {
-            default_keys: vec![KeyCombo::new(Down, M::NONE)],
-            description: Some("Move selection down"),
-        });
-        map.insert("tui.select.pageUp", KeybindingDefinition {
-            default_keys: vec![KeyCombo::new(PageUp, M::NONE)],
-            description: Some("Selection page up"),
-        });
-        map.insert("tui.select.pageDown", KeybindingDefinition {
-            default_keys: vec![KeyCombo::new(PageDown, M::NONE)],
-            description: Some("Selection page down"),
-        });
-        map.insert("tui.select.confirm", KeybindingDefinition {
-            default_keys: vec![KeyCombo::new(Enter, M::NONE)],
-            description: Some("Confirm selection"),
-        });
-        map.insert("tui.select.cancel", KeybindingDefinition {
-            default_keys: vec![
-                KeyCombo::new(Esc, M::NONE),
-                KeyCombo::new(Char('c'), M::CONTROL),
-            ],
-            description: Some("Cancel selection"),
-        });
+        map.insert(
+            "tui.select.up",
+            KeybindingDefinition {
+                default_keys: vec![KeyCombo::new(Up, M::NONE)],
+                description: Some("Move selection up"),
+            },
+        );
+        map.insert(
+            "tui.select.down",
+            KeybindingDefinition {
+                default_keys: vec![KeyCombo::new(Down, M::NONE)],
+                description: Some("Move selection down"),
+            },
+        );
+        map.insert(
+            "tui.select.pageUp",
+            KeybindingDefinition {
+                default_keys: vec![KeyCombo::new(PageUp, M::NONE)],
+                description: Some("Selection page up"),
+            },
+        );
+        map.insert(
+            "tui.select.pageDown",
+            KeybindingDefinition {
+                default_keys: vec![KeyCombo::new(PageDown, M::NONE)],
+                description: Some("Selection page down"),
+            },
+        );
+        map.insert(
+            "tui.select.confirm",
+            KeybindingDefinition {
+                default_keys: vec![KeyCombo::new(Enter, M::NONE)],
+                description: Some("Confirm selection"),
+            },
+        );
+        map.insert(
+            "tui.select.cancel",
+            KeybindingDefinition {
+                default_keys: vec![
+                    KeyCombo::new(Esc, M::NONE),
+                    KeyCombo::new(Char('c'), M::CONTROL),
+                ],
+                description: Some("Cancel selection"),
+            },
+        );
 
         // Alternate-screen viewport navigation
-        map.insert("tui.altScreen.pageUp", KeybindingDefinition {
-            default_keys: vec![KeyCombo::new(PageUp, M::NONE)],
-            description: Some("Scroll viewport up one page"),
-        });
-        map.insert("tui.altScreen.pageDown", KeybindingDefinition {
-            default_keys: vec![KeyCombo::new(PageDown, M::NONE)],
-            description: Some("Scroll viewport down one page"),
-        });
-        map.insert("tui.altScreen.halfPageUp", KeybindingDefinition {
-            default_keys: vec![],
-            description: Some("Scroll viewport up half a page"),
-        });
-        map.insert("tui.altScreen.halfPageDown", KeybindingDefinition {
-            default_keys: vec![],
-            description: Some("Scroll viewport down half a page"),
-        });
-        map.insert("tui.altScreen.lineUp", KeybindingDefinition {
-            default_keys: vec![],
-            description: Some("Scroll viewport up one line"),
-        });
-        map.insert("tui.altScreen.lineDown", KeybindingDefinition {
-            default_keys: vec![],
-            description: Some("Scroll viewport down one line"),
-        });
-        map.insert("tui.altScreen.previousPrompt", KeybindingDefinition {
-            default_keys: vec![KeyCombo::new(Up, M::CONTROL | M::SHIFT)],
-            description: Some("Jump to previous semantic prompt"),
-        });
-        map.insert("tui.altScreen.nextPrompt", KeybindingDefinition {
-            default_keys: vec![KeyCombo::new(Down, M::CONTROL | M::SHIFT)],
-            description: Some("Jump to next semantic prompt"),
-        });
-        map.insert("tui.altScreen.search", KeybindingDefinition {
-            default_keys: vec![KeyCombo::new(Char('f'), M::CONTROL | M::SHIFT)],
-            description: Some("Search the primary scroll view"),
-        });
-        map.insert("tui.altScreen.searchNext", KeybindingDefinition {
-            default_keys: vec![
-                KeyCombo::new(Enter, M::NONE),
-                KeyCombo::new(Char('g'), M::CONTROL),
-            ],
-            description: Some("Select the next search match"),
-        });
-        map.insert("tui.altScreen.searchPrevious", KeybindingDefinition {
-            default_keys: vec![
-                KeyCombo::new(Enter, M::SHIFT),
-                KeyCombo::new(Char('g'), M::CONTROL | M::SHIFT),
-            ],
-            description: Some("Select the previous search match"),
-        });
-        map.insert("tui.altScreen.searchClose", KeybindingDefinition {
-            default_keys: vec![KeyCombo::new(Esc, M::NONE)],
-            description: Some("Close transcript search"),
-        });
-        map.insert("tui.altScreen.top", KeybindingDefinition {
-            default_keys: vec![KeyCombo::new(Home, M::NONE)],
-            description: Some("Scroll viewport to top"),
-        });
-        map.insert("tui.altScreen.bottom", KeybindingDefinition {
-            default_keys: vec![KeyCombo::new(End, M::NONE)],
-            description: Some("Scroll viewport to bottom"),
-        });
+        map.insert(
+            "tui.altScreen.pageUp",
+            KeybindingDefinition {
+                default_keys: vec![KeyCombo::new(PageUp, M::NONE)],
+                description: Some("Scroll viewport up one page"),
+            },
+        );
+        map.insert(
+            "tui.altScreen.pageDown",
+            KeybindingDefinition {
+                default_keys: vec![KeyCombo::new(PageDown, M::NONE)],
+                description: Some("Scroll viewport down one page"),
+            },
+        );
+        map.insert(
+            "tui.altScreen.halfPageUp",
+            KeybindingDefinition {
+                default_keys: vec![],
+                description: Some("Scroll viewport up half a page"),
+            },
+        );
+        map.insert(
+            "tui.altScreen.halfPageDown",
+            KeybindingDefinition {
+                default_keys: vec![],
+                description: Some("Scroll viewport down half a page"),
+            },
+        );
+        map.insert(
+            "tui.altScreen.lineUp",
+            KeybindingDefinition {
+                default_keys: vec![],
+                description: Some("Scroll viewport up one line"),
+            },
+        );
+        map.insert(
+            "tui.altScreen.lineDown",
+            KeybindingDefinition {
+                default_keys: vec![],
+                description: Some("Scroll viewport down one line"),
+            },
+        );
+        map.insert(
+            "tui.altScreen.previousPrompt",
+            KeybindingDefinition {
+                default_keys: vec![KeyCombo::new(Up, M::CONTROL | M::SHIFT)],
+                description: Some("Jump to previous semantic prompt"),
+            },
+        );
+        map.insert(
+            "tui.altScreen.nextPrompt",
+            KeybindingDefinition {
+                default_keys: vec![KeyCombo::new(Down, M::CONTROL | M::SHIFT)],
+                description: Some("Jump to next semantic prompt"),
+            },
+        );
+        map.insert(
+            "tui.altScreen.search",
+            KeybindingDefinition {
+                default_keys: vec![KeyCombo::new(Char('f'), M::CONTROL | M::SHIFT)],
+                description: Some("Search the primary scroll view"),
+            },
+        );
+        map.insert(
+            "tui.altScreen.searchNext",
+            KeybindingDefinition {
+                default_keys: vec![
+                    KeyCombo::new(Enter, M::NONE),
+                    KeyCombo::new(Char('g'), M::CONTROL),
+                ],
+                description: Some("Select the next search match"),
+            },
+        );
+        map.insert(
+            "tui.altScreen.searchPrevious",
+            KeybindingDefinition {
+                default_keys: vec![
+                    KeyCombo::new(Enter, M::SHIFT),
+                    KeyCombo::new(Char('g'), M::CONTROL | M::SHIFT),
+                ],
+                description: Some("Select the previous search match"),
+            },
+        );
+        map.insert(
+            "tui.altScreen.searchClose",
+            KeybindingDefinition {
+                default_keys: vec![KeyCombo::new(Esc, M::NONE)],
+                description: Some("Close transcript search"),
+            },
+        );
+        map.insert(
+            "tui.altScreen.top",
+            KeybindingDefinition {
+                default_keys: vec![KeyCombo::new(Home, M::NONE)],
+                description: Some("Scroll viewport to top"),
+            },
+        );
+        map.insert(
+            "tui.altScreen.bottom",
+            KeybindingDefinition {
+                default_keys: vec![KeyCombo::new(End, M::NONE)],
+                description: Some("Scroll viewport to bottom"),
+            },
+        );
 
         map
     }
@@ -445,7 +587,8 @@ impl Default for Keybindings {
 }
 
 /// Global keybindings manager.
-static GLOBAL_KEYBINDINGS: std::sync::OnceLock<std::sync::Mutex<Keybindings>> = std::sync::OnceLock::new();
+static GLOBAL_KEYBINDINGS: std::sync::OnceLock<std::sync::Mutex<Keybindings>> =
+    std::sync::OnceLock::new();
 
 /// Set global keybindings.
 pub fn set_keybindings(keybindings: Keybindings) {
@@ -458,9 +601,7 @@ pub fn set_keybindings(keybindings: Keybindings) {
 
 /// Get global keybindings.
 pub fn get_keybindings() -> std::sync::MutexGuard<'static, Keybindings> {
-    let guard = GLOBAL_KEYBINDINGS.get_or_init(|| {
-        std::sync::Mutex::new(Keybindings::new())
-    });
+    let guard = GLOBAL_KEYBINDINGS.get_or_init(|| std::sync::Mutex::new(Keybindings::new()));
     guard.lock().expect("Failed to lock global keybindings")
 }
 

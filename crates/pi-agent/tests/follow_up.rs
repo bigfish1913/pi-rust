@@ -28,7 +28,10 @@ use rpi_ai::types::StopReason;
 
 /// Count `turn_start` events — one per LLM call.
 fn turn_start_count(events: &[AgentEvent]) -> usize {
-    events.iter().filter(|e| matches!(e, AgentEvent::TurnStart)).count()
+    events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::TurnStart))
+        .count()
 }
 
 /// A simple shared FIFO used to model the `Agent`'s follow-up/steering enqueued
@@ -46,7 +49,9 @@ mod queue_state {
 
     impl<T> Queue<T> {
         pub fn new() -> Self {
-            Self { inner: Arc::new(Mutex::new(VecDeque::new())) }
+            Self {
+                inner: Arc::new(Mutex::new(VecDeque::new())),
+            }
         }
         pub fn push(&self, value: T) {
             self.inner.lock().expect("queue lock").push_back(value);
@@ -88,11 +93,10 @@ async fn follow_up_queue_drives_an_extra_turn_after_stop() {
     let mut config = base_config();
     config.get_follow_up_messages = Some(get_follow_up);
 
-    let stream_fn =
-        common::mock_stream_fn(vec![
-            assistant_text("Processed 1", StopReason::Stop),
-            assistant_text("Processed 2", StopReason::Stop),
-        ]);
+    let stream_fn = common::mock_stream_fn(vec![
+        assistant_text("Processed 1", StopReason::Stop),
+        assistant_text("Processed 2", StopReason::Stop),
+    ]);
 
     let (collector, events_buf) = rpi_agent::CollectorEmitter::new();
     let emit: Arc<dyn rpi_agent::AgentEmitter> = Arc::new(collector);

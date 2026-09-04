@@ -29,12 +29,12 @@ pub use agent_tool::AgentTool;
 pub use error::AgentError;
 pub use events::{AgentEmitter, AgentEvent, CollectorEmitter};
 pub use hooks::{
-    AgentLoopConfig, AfterToolCall, BeforeToolCall, ConvertToLlm, GetApiKey, GetFollowUpMessages,
+    AfterToolCall, AgentLoopConfig, BeforeToolCall, ConvertToLlm, GetApiKey, GetFollowUpMessages,
     GetSteeringMessages, PrepareNextTurn, ShouldStopAfterTurn, TransformContext,
 };
 pub use message::{AgentMessage, AgentMessageRole, CustomMessage};
 pub use queue::PendingMessageQueue;
-pub use stream_fn::{StreamFn, stream_fn};
+pub use stream_fn::{stream_fn, StreamFn};
 pub use types::{
     AfterToolCallContext, AfterToolCallResult, AgentContext, AgentLoopTurnUpdate, AgentState,
     AgentToolResult, BeforeToolCallContext, BeforeToolCallResult, QueueMode,

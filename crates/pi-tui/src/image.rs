@@ -7,8 +7,8 @@ use std::sync::Mutex;
 
 use super::component::Component;
 use super::terminal_image::{
-    allocate_image_id, get_capabilities, get_image_dimensions,
-    render_image, ImageProtocol, ImageRenderOptions,
+    allocate_image_id, get_capabilities, get_image_dimensions, render_image, ImageProtocol,
+    ImageRenderOptions,
 };
 use crate::utils::visible_width;
 
@@ -184,12 +184,16 @@ impl Image {
             let cell_width = self.options.width.unwrap_or_else(|| {
                 ((w as f32 / cell_dims.width as f32).ceil() as u16).min(width as u16)
             });
-            let cell_height = self.options.height.unwrap_or_else(|| {
-                (h as f32 / cell_dims.height as f32).ceil() as u16
-            });
+            let cell_height = self
+                .options
+                .height
+                .unwrap_or_else(|| (h as f32 / cell_dims.height as f32).ceil() as u16);
             (cell_width, cell_height)
         } else {
-            (self.options.width.unwrap_or(width as u16), self.options.height.unwrap_or(5))
+            (
+                self.options.width.unwrap_or(width as u16),
+                self.options.height.unwrap_or(5),
+            )
         };
 
         // Render based on protocol
@@ -235,10 +239,7 @@ impl Image {
         let mut lines = Vec::new();
 
         // Top border
-        lines.push(format!(
-            "{}╭{}╮\x1b[0m",
-            self.theme.border_color, border_h
-        ));
+        lines.push(format!("{}╭{}╮\x1b[0m", self.theme.border_color, border_h));
 
         // Content
         let alt_text = self.options.alt_text.as_deref().unwrap_or("[Image]");
@@ -267,24 +268,23 @@ impl Image {
             };
 
             let content_padded = if visible_width(&content) < inner_width {
-                format!("{}{}", content, " ".repeat(inner_width - visible_width(&content)))
+                format!(
+                    "{}{}",
+                    content,
+                    " ".repeat(inner_width - visible_width(&content))
+                )
             } else {
                 crate::utils::truncate_to_width(&content, inner_width, "")
             };
 
             lines.push(format!(
                 "{}│{}{}\x1b[0m│\x1b[0m",
-                self.theme.border_color,
-                self.theme.placeholder_bg,
-                content_padded
+                self.theme.border_color, self.theme.placeholder_bg, content_padded
             ));
         }
 
         // Bottom border
-        lines.push(format!(
-            "{}╰{}╯\x1b[0m",
-            self.theme.border_color, border_h
-        ));
+        lines.push(format!("{}╰{}╯\x1b[0m", self.theme.border_color, border_h));
 
         lines.join("\n")
     }

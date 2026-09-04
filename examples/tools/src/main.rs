@@ -18,9 +18,7 @@ use std::sync::Arc;
 use rpi_agent::AgentBuilder;
 use rpi_ai::providers::faux::{FauxProvider, FauxScript};
 use rpi_ai::Provider;
-use rpi_tools::{
-    create_bash_tool, create_write_tool, ExecutionToolContext, OsExecutionEnv,
-};
+use rpi_tools::{create_bash_tool, create_write_tool, ExecutionToolContext, OsExecutionEnv};
 
 #[tokio::main]
 async fn main() {
@@ -57,7 +55,10 @@ async fn main() {
         .expect("agent builds");
 
     let mut rx = agent.subscribe();
-    agent.prompt("Write 'hello from the tools example' to out.txt.").await.expect("prompt completes");
+    agent
+        .prompt("Write 'hello from the tools example' to out.txt.")
+        .await
+        .expect("prompt completes");
 
     // Drain lifecycle events.
     while let Ok(_ev) = rx.try_recv() {}
@@ -67,7 +68,8 @@ async fn main() {
 
     // Confirm the tool actually wrote the file on the real FS.
     let out_path = tmp.join("out.txt");
-    let written = std::fs::read_to_string(&out_path).expect("out.txt was written by the write tool");
+    let written =
+        std::fs::read_to_string(&out_path).expect("out.txt was written by the write tool");
     println!("wrote out.txt ({} bytes): {:?}", written.len(), written);
     assert_eq!(written, "hello from the tools example");
 

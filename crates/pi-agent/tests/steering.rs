@@ -17,7 +17,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use common::{assistant_text, assistant_tool_calls, base_config, run_and_collect, user_message};
-use rpi_agent::{AgentContext, AgentEvent, AgentToolResult, GetSteeringMessages, ToolExecutionMode};
+use rpi_agent::{
+    AgentContext, AgentEvent, AgentToolResult, GetSteeringMessages, ToolExecutionMode,
+};
 use rpi_ai::types::StopReason;
 use tokio_util::sync::CancellationToken;
 
@@ -77,9 +79,11 @@ fn echo_schema() -> rpi_ai::types::Tool {
 #[tokio::test]
 async fn steering_injected_after_tool_batch_completes() {
     // Mirrors TS "should inject queued messages after all tool calls complete".
-    let executed: Arc<std::sync::Mutex<Vec<String>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
-    let tool = EchoTool { schema: echo_schema(), executed: Arc::clone(&executed) };
+    let executed: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let tool = EchoTool {
+        schema: echo_schema(),
+        executed: Arc::clone(&executed),
+    };
     let context = AgentContext {
         system_prompt: String::new(),
         messages: Vec::new(),
@@ -150,7 +154,11 @@ async fn steering_injected_after_tool_batch_completes() {
         .iter()
         .filter(|e| matches!(e, AgentEvent::ToolExecutionEnd { .. }))
         .collect();
-    assert_eq!(ends.len(), 2, "expected exactly 2 tool_execution_end events");
+    assert_eq!(
+        ends.len(),
+        2,
+        "expected exactly 2 tool_execution_end events"
+    );
     for e in &ends {
         if let AgentEvent::ToolExecutionEnd { is_error, .. } = e {
             assert!(!*is_error, "tool_execution_end should not be an error");
@@ -163,9 +171,7 @@ async fn steering_injected_after_tool_batch_completes() {
         .iter()
         .filter_map(|e| match e {
             AgentEvent::MessageStart { message } => match message {
-                rpi_agent::AgentMessage::ToolResult(t) => {
-                    Some(format!("tool:{}", t.tool_call_id))
-                }
+                rpi_agent::AgentMessage::ToolResult(t) => Some(format!("tool:{}", t.tool_call_id)),
                 rpi_agent::AgentMessage::User(u) => u.content.as_text().map(|s| s.to_string()),
                 _ => None,
             },
@@ -201,10 +207,7 @@ async fn steering_injected_after_tool_batch_completes() {
 /// Wrap a `StreamFn` so the inner context is inspected on every call: if any
 /// message is the "interrupt" user text, set `saw`. Returns a new `StreamFn`
 /// that forwards to `inner`.
-fn inspect_for_interrupt(
-    inner: rpi_agent::StreamFn,
-    saw: Arc<AtomicBool>,
-) -> rpi_agent::StreamFn {
+fn inspect_for_interrupt(inner: rpi_agent::StreamFn, saw: Arc<AtomicBool>) -> rpi_agent::StreamFn {
     rpi_agent::stream_fn(move |model, ctx, opts| {
         // Inspect: does the LLM context carry the "interrupt" user message?
         let has_interrupt = ctx.messages.iter().any(|m| match m {

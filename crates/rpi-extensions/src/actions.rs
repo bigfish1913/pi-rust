@@ -59,7 +59,8 @@ pub trait RuntimeActionHost: Send + Sync {
     /// `SendMessage` — drive a full agent run from an assistant/user message.
     async fn send_message(&self, args: serde_json::Value) -> Result<serde_json::Value, String>;
     /// `SendUserMessage` — drive a run from a user-text message.
-    async fn send_user_message(&self, args: serde_json::Value) -> Result<serde_json::Value, String>;
+    async fn send_user_message(&self, args: serde_json::Value)
+        -> Result<serde_json::Value, String>;
     /// `AppendEntry` — append a raw entry to the session transcript (no run).
     async fn append_entry(&self, args: serde_json::Value) -> Result<serde_json::Value, String>;
     /// `SetSessionName` — set the session's display name.
@@ -71,13 +72,20 @@ pub trait RuntimeActionHost: Send + Sync {
     /// `SetModel` — switch the active model (by id; host resolves to a `Model`).
     async fn set_model(&self, args: serde_json::Value) -> Result<serde_json::Value, String>;
     /// `GetThinkingLevel` — the current thinking level.
-    async fn get_thinking_level(&self, args: serde_json::Value) -> Result<serde_json::Value, String>;
+    async fn get_thinking_level(
+        &self,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, String>;
     /// `SetThinkingLevel` — set the thinking level.
-    async fn set_thinking_level(&self, args: serde_json::Value) -> Result<serde_json::Value, String>;
+    async fn set_thinking_level(
+        &self,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, String>;
     /// `Compact` — compact the session transcript.
     async fn compact(&self, args: serde_json::Value) -> Result<serde_json::Value, String>;
     /// `GetSystemPrompt` — the live composed system prompt.
-    async fn get_system_prompt(&self, args: serde_json::Value) -> Result<serde_json::Value, String>;
+    async fn get_system_prompt(&self, args: serde_json::Value)
+        -> Result<serde_json::Value, String>;
     /// `NewSession` — start a fresh session and switch to it.
     async fn new_session(&self, args: serde_json::Value) -> Result<serde_json::Value, String>;
     /// `Fork` — fork the current session and switch to the fork.
@@ -126,7 +134,8 @@ pub struct ActionBridge {
     /// The host impl (`HarnessActionHost` in rpi-cli).
     pub(crate) host: Arc<dyn RuntimeActionHost>,
     /// B5d reload callback; `None` until the TUI wires `/reload`.
-    pub(crate) reload: Option<Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>>,
+    pub(crate) reload:
+        Option<Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>>,
     /// B5d staleness flag. Shared so [`invalidate`] flips it for every clone.
     /// `true` while this bridge is the live session's bridge.
     active: Arc<AtomicBool>,
@@ -136,7 +145,12 @@ impl ActionBridge {
     /// Build a bridge. The `Handle` MUST be captured from a thread running the
     /// target runtime (pi-cli builds the bridge on the async main thread).
     pub fn new(runtime: Handle, host: Arc<dyn RuntimeActionHost>) -> Arc<Self> {
-        Arc::new(Self { runtime, host, reload: None, active: Arc::new(AtomicBool::new(true)) })
+        Arc::new(Self {
+            runtime,
+            host,
+            reload: None,
+            active: Arc::new(AtomicBool::new(true)),
+        })
     }
 
     /// Same as [`new`](Self::new) with a reload callback (B5d wires this via
@@ -146,7 +160,12 @@ impl ActionBridge {
         host: Arc<dyn RuntimeActionHost>,
         reload: Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>,
     ) -> Arc<Self> {
-        Arc::new(Self { runtime, host, reload: Some(reload), active: Arc::new(AtomicBool::new(true)) })
+        Arc::new(Self {
+            runtime,
+            host,
+            reload: Some(reload),
+            active: Arc::new(AtomicBool::new(true)),
+        })
     }
 
     /// Mark this bridge stale (B5d). A `/reload` that swaps in a fresh bridge
@@ -466,28 +485,46 @@ mod tests {
         async fn send_message(&self, _: serde_json::Value) -> Result<serde_json::Value, String> {
             unreachable!("not under test")
         }
-        async fn send_user_message(&self, _: serde_json::Value) -> Result<serde_json::Value, String> {
+        async fn send_user_message(
+            &self,
+            _: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
             unreachable!("not under test")
         }
         async fn append_entry(&self, _: serde_json::Value) -> Result<serde_json::Value, String> {
             unreachable!("not under test")
         }
-        async fn set_session_name(&self, _: serde_json::Value) -> Result<serde_json::Value, String> {
+        async fn set_session_name(
+            &self,
+            _: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
             unreachable!("not under test")
         }
-        async fn get_active_tools(&self, _: serde_json::Value) -> Result<serde_json::Value, String> {
+        async fn get_active_tools(
+            &self,
+            _: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
             unreachable!("not under test")
         }
-        async fn set_active_tools(&self, _: serde_json::Value) -> Result<serde_json::Value, String> {
+        async fn set_active_tools(
+            &self,
+            _: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
             unreachable!("not under test")
         }
         async fn set_model(&self, _: serde_json::Value) -> Result<serde_json::Value, String> {
             unreachable!("not under test")
         }
-        async fn get_thinking_level(&self, _: serde_json::Value) -> Result<serde_json::Value, String> {
+        async fn get_thinking_level(
+            &self,
+            _: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
             unreachable!("not under test")
         }
-        async fn set_thinking_level(&self, _: serde_json::Value) -> Result<serde_json::Value, String> {
+        async fn set_thinking_level(
+            &self,
+            _: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
             unreachable!("not under test")
         }
         async fn compact(&self, _: serde_json::Value) -> Result<serde_json::Value, String> {
@@ -497,7 +534,10 @@ mod tests {
             &self,
             _: serde_json::Value,
         ) -> Result<serde_json::Value, String> {
-            self.saw.lock().unwrap().push(RuntimeActionId::GetSystemPrompt);
+            self.saw
+                .lock()
+                .unwrap()
+                .push(RuntimeActionId::GetSystemPrompt);
             Ok(serde_json::json!({ "prompt": self.prompt }))
         }
         async fn new_session(&self, _: serde_json::Value) -> Result<serde_json::Value, String> {
@@ -672,7 +712,11 @@ mod tests {
         mailbox.install(tx);
         let cb = reload_callback_from_mailbox(mailbox.clone());
         cb().await;
-        assert_eq!(rx.recv().await, Some(()), "installed receiver saw the signal");
+        assert_eq!(
+            rx.recv().await,
+            Some(()),
+            "installed receiver saw the signal"
+        );
         mailbox.clear();
     }
 }

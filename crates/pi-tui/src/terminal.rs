@@ -97,7 +97,11 @@ pub trait Terminal: Send + Sync {
     fn refresh_size(&self);
 
     /// Start terminal raw mode.
-    fn start(&self, on_input: Box<dyn Fn(InputEvent) + Send + Sync>, on_resize: Box<dyn Fn() + Send + Sync>);
+    fn start(
+        &self,
+        on_input: Box<dyn Fn(InputEvent) + Send + Sync>,
+        on_resize: Box<dyn Fn() + Send + Sync>,
+    );
 
     /// Stop terminal and restore original state.
     fn stop(&self);
@@ -211,7 +215,11 @@ impl Terminal for ProcessTerminal {
         self.update_size();
     }
 
-    fn start(&self, on_input: Box<dyn Fn(InputEvent) + Send + Sync>, on_resize: Box<dyn Fn() + Send + Sync>) {
+    fn start(
+        &self,
+        on_input: Box<dyn Fn(InputEvent) + Send + Sync>,
+        on_resize: Box<dyn Fn() + Send + Sync>,
+    ) {
         // Enter raw mode
         let _ = cterm::enable_raw_mode();
 
@@ -259,7 +267,7 @@ impl Terminal for ProcessTerminal {
                             }
                         }
                     }
-                    Ok(false) => {} // Timeout, continue polling
+                    Ok(false) => {}  // Timeout, continue polling
                     Err(_) => break, // Error, stop the thread
                 }
             }

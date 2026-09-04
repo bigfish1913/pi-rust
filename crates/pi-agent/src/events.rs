@@ -155,7 +155,12 @@ pub struct CollectorEmitter {
 impl CollectorEmitter {
     pub fn new() -> (Self, std::sync::Arc<std::sync::Mutex<Vec<AgentEvent>>>) {
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        (Self { events: Arc::clone(&events) }, events)
+        (
+            Self {
+                events: Arc::clone(&events),
+            },
+            events,
+        )
     }
 }
 

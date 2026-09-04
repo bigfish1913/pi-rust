@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use super::component::Component;
 use crate::ansi::{bold, strip_ansi};
 use crate::theme::theme;
-use crate::utils::{apply_background_to_line, truncate_to_width};
+use crate::utils::{apply_background_to_line, truncate_to_width, wrap_text_with_ansi};
 
 /// Maximum diff lines rendered inline when expanded before collapsing the rest.
 const DIFF_LINE_CAP: usize = 40;
@@ -80,7 +80,11 @@ impl ToolExecutionComponent {
             *r = Some(result.to_string());
         }
         if let Ok(mut s) = self.status.lock() {
-            *s = if is_error { ToolStatus::Failed } else { ToolStatus::Completed };
+            *s = if is_error {
+                ToolStatus::Failed
+            } else {
+                ToolStatus::Completed
+            };
         }
     }
 
@@ -179,7 +183,8 @@ impl Component for ToolExecutionComponent {
                 colors.muted.fg(chevron),
             )
         };
-        let header_line = apply_background_to_line(&format!(" {}", head_parts), width, |s| bg.bg(s));
+        let header_content = truncate_to_width(&format!(" {}", head_parts), width, "…");
+        let header_line = apply_background_to_line(&header_content, width, |s| bg.bg(s));
         lines.push(header_line);
 
         // Expanded: the full args JSON (indented, dim) above the result. The
@@ -187,21 +192,30 @@ impl Component for ToolExecutionComponent {
         // "show me everything" path for debugging a tool call.
         if *expanded {
             if !args.is_empty() && args.trim() != "{}" {
-                let args_line = format!("  {} {}",
+                let args_line = format!(
+                    "  {} {}",
                     colors.muted.fg("args:"),
-                    colors.dim.fg(&pretty_args(&args)));
+                    colors.dim.fg(&pretty_args(&args))
+                );
+                let args_line = truncate_to_width(&args_line, width, "…");
                 let args_line = apply_background_to_line(&args_line, width, |s| bg.bg(s));
                 lines.push(args_line);
             }
         }
 
         // Show result if available (always — a failure's error text is the
-        // payload, not a detail to hide behind expand).
+        // payload, not a detail to hide behind expand). Long logical lines wrap
+        // inside the panel instead of overflowing into the next terminal row.
         if let Some(ref r) = *result {
-            for line in r.lines() {
-                let result_line = format!("  {}", colors.tool_output.fg(line));
-                let result_line = apply_background_to_line(&result_line, width, |s| bg.bg(s));
-                lines.push(result_line);
+            let body_width = width.saturating_sub(4).max(1);
+            for line in normalized_output_lines(r) {
+                let wrapped = wrap_text_with_ansi(&line, body_width);
+                for part in wrapped {
+                    let result_line =
+                        format!("  {} {}", colors.dim.fg("│"), colors.tool_output.fg(&part));
+                    let result_line = apply_background_to_line(&result_line, width, |s| bg.bg(s));
+                    lines.push(result_line);
+                }
             }
         } else if diff_lines.as_ref().is_none_or(|d| d.is_empty()) && !*expanded {
             // No result yet, no diff, and collapsed: pad one bg-tinted row so
@@ -216,7 +230,11 @@ impl Component for ToolExecutionComponent {
         // swamped the conversation. Cap at DIFF_LINE_CAP even when expanded.
         if let Some(diff) = diff_lines.as_ref() {
             let total = diff.len();
-            let cap = if *expanded { DIFF_LINE_CAP } else { DIFF_PREVIEW_LINES };
+            let cap = if *expanded {
+                DIFF_LINE_CAP
+            } else {
+                DIFF_PREVIEW_LINES
+            };
             let shown = diff.iter().take(cap);
             for dl in shown {
                 // Diff lines are already complete (colors + content). Indent
@@ -250,6 +268,22 @@ impl Component for ToolExecutionComponent {
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+/// Normalize tool output for display. Tool payloads are not guaranteed to use
+/// Unix line endings and may contain tabs/control sequences from subprocesses.
+fn normalized_output_lines(output: &str) -> Vec<String> {
+    let clean = strip_ansi(output).replace("\r\n", "\n").replace('\r', "\n");
+    clean
+        .split('\n')
+        .map(|line| {
+            let expanded = line.replace('\t', "    ");
+            expanded
+                .chars()
+                .filter(|c| *c == ' ' || !c.is_control())
+                .collect()
+        })
+        .collect()
 }
 
 /// Best-effort pretty-print of a tool args JSON blob for the expanded args
@@ -302,10 +336,10 @@ mod tools {
         };
         let get = |k: &str| field(&map, k);
         match tool {
-            "read"  => get("path"),
+            "read" => get("path"),
             "write" => get("path"),
-            "ls"    => get("path"),
-            "find"  => {
+            "ls" => get("path"),
+            "find" => {
                 let p = get("pattern");
                 let dir = get("path");
                 match dir.as_str() {
@@ -318,16 +352,26 @@ mod tools {
                 let path = get("path");
                 let glob = get("glob");
                 let mut parts = vec![p];
-                if !glob.is_empty() { parts.push(format!("glob {}", glob)); }
-                if !path.is_empty() { parts.push(path); }
+                if !glob.is_empty() {
+                    parts.push(format!("glob {}", glob));
+                }
+                if !path.is_empty() {
+                    parts.push(path);
+                }
                 parts.join(" · ")
             }
             "edit" => {
                 // path + count of edits (oldText is too long to inline).
                 let path = get("path");
                 if let Some(arr) = parse_json_array_len(args_json, "edits") {
-                    if arr == 1 { path } else { format!("{} ({} edits)", path, arr) }
-                } else { path }
+                    if arr == 1 {
+                        path
+                    } else {
+                        format!("{} ({} edits)", path, arr)
+                    }
+                } else {
+                    path
+                }
             }
             "bash" => get("command"),
             _ => {
@@ -352,7 +396,9 @@ mod tools {
     /// it's good enough for the expanded args block where the compact header
     /// already showed the important bit.
     pub fn flatten_json_object(json: &str) -> String {
-        let Some(map) = parse_json_object(json) else { return String::new(); };
+        let Some(map) = parse_json_object(json) else {
+            return String::new();
+        };
         map.into_iter()
             .map(|(k, v)| format!("{}={}", k, unquote(&v)))
             .collect::<Vec<_>>()
@@ -369,26 +415,38 @@ mod tools {
     /// their raw substring (the caller treats them opaquely).
     fn parse_json_object(json: &str) -> Option<Vec<(String, String)>> {
         let s = json.trim();
-        if !s.starts_with('{') || !s.ends_with('}') { return None; }
+        if !s.starts_with('{') || !s.ends_with('}') {
+            return None;
+        }
         let inner = &s[1..s.len() - 1];
         let mut out = Vec::new();
         let mut chars = inner.chars().peekable();
         loop {
             skip_ws(&mut chars);
-            if chars.peek().is_none() { break; }
+            if chars.peek().is_none() {
+                break;
+            }
             // key (must be a quoted string)
-            if chars.peek() != Some(&'"') { return None; }
+            if chars.peek() != Some(&'"') {
+                return None;
+            }
             let key = read_string(&mut chars)?;
             skip_ws(&mut chars);
-            if chars.next() != Some(':') { return None; }
+            if chars.next() != Some(':') {
+                return None;
+            }
             skip_ws(&mut chars);
             // value: string, number, true/false/null, or nested (raw).
             let val = read_value(&mut chars);
             out.push((key, val));
             skip_ws(&mut chars);
             match chars.peek() {
-                Some(&',') => { chars.next(); }
-                Some(_) => { return None; }   // malformed
+                Some(&',') => {
+                    chars.next();
+                }
+                Some(_) => {
+                    return None;
+                } // malformed
                 None => break,
             }
         }
@@ -403,7 +461,9 @@ mod tools {
         let idx = json.find(&pat)?;
         let rest = &json[idx + pat.len()..];
         let rest = rest.trim_start();
-        if !rest.starts_with('[') { return None; }
+        if !rest.starts_with('[') {
+            return None;
+        }
         // Scan the array body respecting nested brackets + strings.
         let mut depth = 0isize;
         let mut in_str = false;
@@ -412,9 +472,13 @@ mod tools {
         let mut saw_any = false;
         for c in rest.chars() {
             if in_str {
-                if esc { esc = false; }
-                else if c == '\\' { esc = true; }
-                else if c == '"' { in_str = false; }
+                if esc {
+                    esc = false;
+                } else if c == '\\' {
+                    esc = true;
+                } else if c == '"' {
+                    in_str = false;
+                }
                 continue;
             }
             match c {
@@ -422,28 +486,44 @@ mod tools {
                 '[' | '{' => depth += 1,
                 ']' | '}' => {
                     depth -= 1;
-                    if depth == 0 { break; }
+                    if depth == 0 {
+                        break;
+                    }
                 }
                 ',' if depth == 1 => count += 1,
                 _ if !c.is_whitespace() && depth >= 1 => saw_any = true,
                 _ => {}
             }
         }
-        if !saw_any { Some(0) } else { Some(count + 1) }
+        if !saw_any {
+            Some(0)
+        } else {
+            Some(count + 1)
+        }
     }
 
     fn skip_ws(chars: &mut std::iter::Peekable<std::str::Chars>) {
         while let Some(&c) = chars.peek() {
-            if c.is_whitespace() { chars.next(); } else { break; }
+            if c.is_whitespace() {
+                chars.next();
+            } else {
+                break;
+            }
         }
     }
 
     fn read_string(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<String> {
-        if chars.next()? != '"' { return None; }
+        if chars.next()? != '"' {
+            return None;
+        }
         let mut s = String::new();
         let mut esc = false;
         while let Some(c) = chars.next() {
-            if esc { esc = false; s.push(c); continue; }
+            if esc {
+                esc = false;
+                s.push(c);
+                continue;
+            }
             match c {
                 '\\' => esc = true,
                 '"' => return Some(s),
@@ -464,9 +544,17 @@ mod tools {
                 let mut esc = false;
                 while let Some(c) = chars.next() {
                     s.push(c);
-                    if esc { esc = false; continue; }
-                    if c == '\\' { esc = true; continue; }
-                    if c == '"' { break; }
+                    if esc {
+                        esc = false;
+                        continue;
+                    }
+                    if c == '\\' {
+                        esc = true;
+                        continue;
+                    }
+                    if c == '"' {
+                        break;
+                    }
                 }
                 s
             }
@@ -475,7 +563,9 @@ mod tools {
                 // Bare token (number/true/false/null) — read until , or }.
                 let mut s = String::new();
                 while let Some(&c) = chars.peek() {
-                    if c == ',' || c == '}' { break; }
+                    if c == ',' || c == '}' {
+                        break;
+                    }
                     s.push(c);
                     chars.next();
                 }
@@ -494,7 +584,13 @@ mod tools {
         while let Some(c) = chars.next() {
             s.push(c);
             if in_str {
-                if esc { esc = false; } else if c == '\\' { esc = true; } else if c == '"' { in_str = false; }
+                if esc {
+                    esc = false;
+                } else if c == '\\' {
+                    esc = true;
+                } else if c == '"' {
+                    in_str = false;
+                }
                 continue;
             }
             match c {
@@ -502,7 +598,9 @@ mod tools {
                 '[' | '{' => depth += 1,
                 ']' | '}' => {
                     depth -= 1;
-                    if depth == 0 { break; }
+                    if depth == 0 {
+                        break;
+                    }
                 }
                 _ => {}
             }
@@ -533,12 +631,12 @@ mod tests {
     #[test]
     fn test_tool_execution_status() {
         let tool = ToolExecutionComponent::new("bash", "ls -la");
-        
+
         assert_eq!(tool.status(), ToolStatus::Pending);
-        
+
         tool.set_running();
         assert_eq!(tool.status(), ToolStatus::Running);
-        
+
         tool.set_result("output", false);
         assert_eq!(tool.status(), ToolStatus::Completed);
     }
@@ -548,7 +646,7 @@ mod tests {
         let tool = ToolExecutionComponent::new("edit", "file.rs");
         tool.set_expanded(true);
         tool.set_result("success", false);
-        
+
         let lines = tool.render(80);
         assert!(lines.len() > 1); // Should have more lines when expanded
     }
@@ -560,10 +658,33 @@ mod tests {
 
         let lines = tool.render(80);
         let joined = lines.join("\n");
-        // Failed state: error-colored ✗ glyph + the result text echoed
-        // (expanded path includes the `❌ command not found` result line).
-        assert!(joined.contains("command not found"), "result text missing: {joined}");
+        // Failed state: error-colored ✗ glyph + the result text echoed.
+        assert!(
+            joined.contains("command not found"),
+            "result text missing: {joined}"
+        );
         assert!(joined.contains('✗'), "error glyph missing: {joined}");
+    }
+
+    #[test]
+    fn tool_output_wraps_with_a_stable_gutter_and_background() {
+        let tool = ToolExecutionComponent::new("read", r#"{"path":"wide.txt"}"#);
+        tool.set_result("0123456789ABCDEFGHIJ", false);
+        let rendered = tool.render(12);
+        let body: Vec<String> = rendered
+            .iter()
+            .map(|line| crate::ansi::strip_ansi(line))
+            .filter(|line| line.contains('│'))
+            .collect();
+        assert!(body.len() >= 2, "long output should wrap: {body:?}");
+        assert!(body.iter().all(|line| line.starts_with("  │ ")));
+        assert!(rendered
+            .iter()
+            .all(|line| crate::utils::visible_width(line) <= 12));
+        // Nested foreground resets must re-apply the panel background.
+        assert!(rendered
+            .iter()
+            .any(|line| line.matches("\x1b[48;5;22m").count() > 1));
     }
 
     /// The header summarizes the args JSON into a compact signature instead
@@ -586,8 +707,10 @@ mod tests {
         assert!(plain.contains("TODO · src"), "grep summary: {plain}");
 
         // `edit` with multiple edits → `(N edits)` suffix.
-        let t = ToolExecutionComponent::new("edit",
-            r#"{"path":"a.rs","edits":[{"oldText":"x"},{"oldText":"y"}]}"#);
+        let t = ToolExecutionComponent::new(
+            "edit",
+            r#"{"path":"a.rs","edits":[{"oldText":"x"},{"oldText":"y"}]}"#,
+        );
         let plain = crate::ansi::strip_ansi(&t.render(80).join("\n"));
         assert!(plain.contains("a.rs (2 edits)"), "edit count: {plain}");
     }
@@ -619,22 +742,36 @@ mod tests {
 
         let collapsed = t.render(80);
         // Preview cap = 6 lines + 1 header + 1 result + 1 hint.
-        let diff_body = collapsed.iter().filter(|l| {
-            let p = crate::ansi::strip_ansi(l);
-            p.trim_start().starts_with('-') || p.trim_start().starts_with('+')
-        }).count();
-        assert_eq!(diff_body, 6, "collapsed preview should cap at 6: {collapsed:?}");
-        let hint = collapsed.iter().map(|l| crate::ansi::strip_ansi(l))
+        let diff_body = collapsed
+            .iter()
+            .filter(|l| {
+                let p = crate::ansi::strip_ansi(l);
+                p.trim_start().starts_with('-') || p.trim_start().starts_with('+')
+            })
+            .count();
+        assert_eq!(
+            diff_body, 6,
+            "collapsed preview should cap at 6: {collapsed:?}"
+        );
+        let hint = collapsed
+            .iter()
+            .map(|l| crate::ansi::strip_ansi(l))
             .find(|l| l.contains("more diff lines"));
         assert!(hint.is_some(), "preview hint missing");
-        assert!(hint.as_ref().unwrap().contains("Ctrl+T to expand"), "hint text: {hint:?}");
+        assert!(
+            hint.as_ref().unwrap().contains("Ctrl+T to expand"),
+            "hint text: {hint:?}"
+        );
 
         t.set_expanded(true);
         let expanded = t.render(80);
-        let diff_body = expanded.iter().filter(|l| {
-            let p = crate::ansi::strip_ansi(l);
-            p.trim_start().starts_with('-') || p.trim_start().starts_with('+')
-        }).count();
+        let diff_body = expanded
+            .iter()
+            .filter(|l| {
+                let p = crate::ansi::strip_ansi(l);
+                p.trim_start().starts_with('-') || p.trim_start().starts_with('+')
+            })
+            .count();
         assert_eq!(diff_body, 12, "expanded should show all 12: {expanded:?}");
     }
 }

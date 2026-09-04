@@ -80,7 +80,9 @@ impl EditTool {
                           instead of emitting overlapping edits. Do not include large unchanged \
                           regions just to connect distant changes."
                 .to_string(),
-            parameters: rpi_ai::types::Schema::new(serde_json::to_value(params).unwrap_or_default()),
+            parameters: rpi_ai::types::Schema::new(
+                serde_json::to_value(params).unwrap_or_default(),
+            ),
             constrained_sampling: None,
         }
     }
@@ -161,11 +163,11 @@ impl AgentTool for EditTool {
                 async move {
                     check_abort(cancel)?;
                     // FileInfo: must be a file or symlink.
-                    let info = env
-                        .as_env()
-                        .file_info(&abs_str, Some(cancel))
-                        .await?;
-                    if !matches!(info.kind, crate::env::FileKind::File | crate::env::FileKind::Symlink) {
+                    let info = env.as_env().file_info(&abs_str, Some(cancel)).await?;
+                    if !matches!(
+                        info.kind,
+                        crate::env::FileKind::File | crate::env::FileKind::Symlink
+                    ) {
                         return Err(FileError::new(
                             FileErrorCode::Invalid,
                             format!("Could not edit file: {path}. Path is not a file."),
@@ -182,8 +184,10 @@ impl AgentTool for EditTool {
                     let apply = apply_edits_to_normalized_content(&normalized, &edits, &path)?;
                     check_abort(cancel)?;
 
-                    let final_content =
-                        format!("{bom}{}", restore_line_endings(&apply.new_content, original_ending));
+                    let final_content = format!(
+                        "{bom}{}",
+                        restore_line_endings(&apply.new_content, original_ending)
+                    );
                     env.as_env()
                         .write_file(&abs_str, FileContent::Text(final_content), Some(cancel))
                         .await?;
@@ -239,8 +243,16 @@ fn prepare_edit_arguments(input: serde_json::Value) -> serde_json::Value {
     if !has_legacy {
         return serde_json::Value::Object(args);
     }
-    let old_text = args.get("oldText").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let new_text = args.get("newText").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let old_text = args
+        .get("oldText")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let new_text = args
+        .get("newText")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let mut edits_arr = match args.get("edits").cloned() {
         Some(serde_json::Value::Array(a)) => a,
         _ => Vec::new(),

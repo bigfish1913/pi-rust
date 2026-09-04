@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use rpi_agent::events::{AgentEmitter, AgentEvent};
-use rpi_plugin_sdk::{EventTag, StbString, StablePluginEvent};
+use rpi_plugin_sdk::{EventTag, StablePluginEvent, StbString};
 
 use crate::host_free_string;
 use crate::registry::RegistrySnapshot;
@@ -63,17 +63,29 @@ pub fn translate(event: &AgentEvent) -> Option<StablePluginEvent> {
             Some(StablePluginEvent::message(tag, stb))
         }
 
-        AgentEvent::ToolExecutionStart { tool_call_id, tool_name, args }
-        | AgentEvent::ToolExecutionUpdate { tool_call_id, tool_name, args, .. } => {
-            Some(StablePluginEvent::tool_call(
-                tag,
-                StbString::from_string(tool_call_id.clone()),
-                StbString::from_string(tool_name.clone()),
-                StbString::from_string(serde_json::to_string(args).unwrap_or_else(|_| "null".into())),
-            ))
+        AgentEvent::ToolExecutionStart {
+            tool_call_id,
+            tool_name,
+            args,
         }
+        | AgentEvent::ToolExecutionUpdate {
+            tool_call_id,
+            tool_name,
+            args,
+            ..
+        } => Some(StablePluginEvent::tool_call(
+            tag,
+            StbString::from_string(tool_call_id.clone()),
+            StbString::from_string(tool_name.clone()),
+            StbString::from_string(serde_json::to_string(args).unwrap_or_else(|_| "null".into())),
+        )),
 
-        AgentEvent::ToolExecutionEnd { tool_call_id, tool_name, result, is_error } => {
+        AgentEvent::ToolExecutionEnd {
+            tool_call_id,
+            tool_name,
+            result,
+            is_error,
+        } => {
             // Serialize the AgentToolResult to JSON for the result payload.
             let result_json = agent_tool_result_to_json(result);
             Some(StablePluginEvent::tool_result(
@@ -191,7 +203,10 @@ impl ExtensionEmitter {
     /// Build an emitter over a snapshot. The `keepalive` keeps the cdylibs that
     /// own the snapshot's handler fn pointers mapped for the emitter's lifetime.
     pub fn new(snapshot: Arc<RegistrySnapshot>, keepalive: Arc<crate::PluginKeepalive>) -> Self {
-        Self { snapshot, keepalive }
+        Self {
+            snapshot,
+            keepalive,
+        }
     }
 
     /// Dispatch one stable event to all handlers for its tag. Each handler call
@@ -222,9 +237,7 @@ pub fn dispatch_to_handlers(snapshot: &RegistrySnapshot, event: &StablePluginEve
     for h in handlers {
         // SAFETY: the plugin warrants `handler` + `user_data` are safe to
         // call from this thread. catch_unwind so a panic cannot cross FFI.
-        let outcome = catch_unwind(AssertUnwindSafe(|| {
-            (h.handler)(*event, h.user_data)
-        }));
+        let outcome = catch_unwind(AssertUnwindSafe(|| (h.handler)(*event, h.user_data)));
         match outcome {
             Ok(rc) if rc != 0 => {
                 tracing::warn!(tag = ?event.tag, rc, "extension event handler returned nonzero");
@@ -243,11 +256,7 @@ pub fn dispatch_to_handlers(snapshot: &RegistrySnapshot, event: &StablePluginEve
 /// handlers. Returns whether any handler was invoked. Used by the B4
 /// provider-hook observer path ([`crate::provider_hooks`]) which has no
 /// matching `AgentEvent` to translate.
-pub fn dispatch_data_event(
-    snapshot: &RegistrySnapshot,
-    tag: EventTag,
-    data: &str,
-) -> bool {
+pub fn dispatch_data_event(snapshot: &RegistrySnapshot, tag: EventTag, data: &str) -> bool {
     let handlers = snapshot.handlers_for(tag);
     if handlers.is_empty() {
         return false;
@@ -442,7 +451,9 @@ mod tests {
                 message: am.clone(),
                 tool_results: vec![],
             },
-            AgentEvent::MessageStart { message: am.clone() },
+            AgentEvent::MessageStart {
+                message: am.clone(),
+            },
             AgentEvent::MessageUpdate {
                 message: am.clone(),
                 assistant_message_event: rpi_ai::types::AssistantMessageEvent::Start {
@@ -469,7 +480,11 @@ mod tests {
             },
         ];
         for e in &events {
-            assert!(event_tag_for(e).is_some(), "event {:?} should map", e.type_tag());
+            assert!(
+                event_tag_for(e).is_some(),
+                "event {:?} should map",
+                e.type_tag()
+            );
         }
         // Spot-check the fold targets.
         assert_eq!(event_tag_for(&events[0]), Some(EventTag::AgentStart));
@@ -520,11 +535,7 @@ mod tests {
         let _guard = HANDLER_TEST_LOCK.lock().unwrap();
         HANDLER_HITS.store(0, Ordering::SeqCst);
         let mut reg = crate::registry::ExtensionRegistry::new();
-        reg.register_event_handler(
-            EventTag::MessageEnd,
-            counting_handler,
-            std::ptr::null_mut(),
-        );
+        reg.register_event_handler(EventTag::MessageEnd, counting_handler, std::ptr::null_mut());
         let snap = Arc::new(reg.snapshot());
         let emitter = ExtensionEmitter::new(snap, crate::loader::PluginKeepalive::empty());
 
@@ -615,8 +626,20 @@ mod tests {
         // Broadcast path: both collectors receive the event, and the extension
         // emitter dispatches to the one registered handler.
         tee.emit(AgentEvent::MessageEnd { message: am }).await;
-        assert_eq!(events_a.lock().unwrap().len(), 1, "collector A got the event");
-        assert_eq!(events_b.lock().unwrap().len(), 1, "collector B got the event");
-        assert_eq!(HANDLER_HITS.load(Ordering::SeqCst), 1, "plugin handler fired once");
+        assert_eq!(
+            events_a.lock().unwrap().len(),
+            1,
+            "collector A got the event"
+        );
+        assert_eq!(
+            events_b.lock().unwrap().len(),
+            1,
+            "collector B got the event"
+        );
+        assert_eq!(
+            HANDLER_HITS.load(Ordering::SeqCst),
+            1,
+            "plugin handler fired once"
+        );
     }
 }

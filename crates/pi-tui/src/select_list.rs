@@ -308,7 +308,7 @@ impl SelectList {
     /// Get primary column width.
     fn get_primary_column_width(&self, filtered: &[SelectItem]) -> usize {
         let (min_width, max_width) = self.get_primary_column_bounds();
-        
+
         let widest = filtered
             .iter()
             .map(|item| visible_width(item.display_value()) + PRIMARY_COLUMN_GAP)
@@ -320,10 +320,14 @@ impl SelectList {
 
     /// Get primary column bounds.
     fn get_primary_column_bounds(&self) -> (usize, usize) {
-        let raw_min = self.layout.min_primary_column_width
+        let raw_min = self
+            .layout
+            .min_primary_column_width
             .or(self.layout.max_primary_column_width)
             .unwrap_or(DEFAULT_PRIMARY_COLUMN_WIDTH);
-        let raw_max = self.layout.max_primary_column_width
+        let raw_max = self
+            .layout
+            .max_primary_column_width
             .or(self.layout.min_primary_column_width)
             .unwrap_or(DEFAULT_PRIMARY_COLUMN_WIDTH);
 
@@ -333,29 +337,42 @@ impl SelectList {
     }
 
     /// Render an item.
-    fn render_item(&self, item: &SelectItem, is_selected: bool, width: usize, primary_column_width: usize) -> String {
+    fn render_item(
+        &self,
+        item: &SelectItem,
+        is_selected: bool,
+        width: usize,
+        primary_column_width: usize,
+    ) -> String {
         let prefix = if is_selected { "→ " } else { "  " };
         let prefix_width = visible_width(prefix);
 
         // Handle description
         if let Some(ref description) = item.description {
             if width > 40 {
-                let effective_primary = primary_column_width.min(width.saturating_sub(prefix_width + 4));
+                let effective_primary =
+                    primary_column_width.min(width.saturating_sub(prefix_width + 4));
                 let max_primary = effective_primary.saturating_sub(PRIMARY_COLUMN_GAP).max(1);
-                
-                let truncated_value = self.truncate_primary(item, is_selected, max_primary, effective_primary);
+
+                let truncated_value =
+                    self.truncate_primary(item, is_selected, max_primary, effective_primary);
                 let value_width = visible_width(&truncated_value);
                 let spacing = " ".repeat(effective_primary.saturating_sub(value_width).max(1));
-                
+
                 let desc_start = prefix_width + value_width + spacing.len();
                 let remaining = width.saturating_sub(desc_start + 2);
 
                 if remaining > MIN_DESCRIPTION_WIDTH {
-                    let truncated_desc = truncate_to_width(&normalize_single_line(description), remaining, "");
+                    let truncated_desc =
+                        truncate_to_width(&normalize_single_line(description), remaining, "");
                     if is_selected {
-                        return (self.theme.selected_text)(&format!("{}{}{}{}", prefix, truncated_value, spacing, truncated_desc));
+                        return (self.theme.selected_text)(&format!(
+                            "{}{}{}{}",
+                            prefix, truncated_value, spacing, truncated_desc
+                        ));
                     }
-                    let desc_text = (self.theme.description)(&format!("{}{}", spacing, truncated_desc));
+                    let desc_text =
+                        (self.theme.description)(&format!("{}{}", spacing, truncated_desc));
                     return format!("{}{}{}", prefix, truncated_value, desc_text);
                 }
             }
@@ -364,7 +381,7 @@ impl SelectList {
         // No description or not enough space
         let max_width = width.saturating_sub(prefix_width + 2);
         let truncated = self.truncate_primary(item, is_selected, max_width, max_width);
-        
+
         if is_selected {
             (self.theme.selected_text)(&format!("{}{}", prefix, truncated))
         } else {
@@ -373,9 +390,15 @@ impl SelectList {
     }
 
     /// Truncate primary text.
-    fn truncate_primary(&self, item: &SelectItem, _is_selected: bool, max_width: usize, column_width: usize) -> String {
+    fn truncate_primary(
+        &self,
+        item: &SelectItem,
+        _is_selected: bool,
+        max_width: usize,
+        column_width: usize,
+    ) -> String {
         let display = item.display_value();
-        
+
         if let Some(ref truncate_fn) = self.layout.truncate_primary {
             truncate_fn(display, max_width, column_width)
         } else {
@@ -399,7 +422,10 @@ impl Component for SelectList {
             return lines;
         }
 
-        let selected = self.selected_index.lock().unwrap_or_else(|e| e.into_inner());
+        let selected = self
+            .selected_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let primary_column_width = self.get_primary_column_width(&filtered);
 
         // Calculate visible range with scrolling
@@ -423,7 +449,11 @@ impl Component for SelectList {
         // Add scroll indicator if needed
         if start_index > 0 || end_index < filtered.len() {
             let scroll_text = format!("  ({}/{})", *selected + 1, filtered.len());
-            lines.push((self.theme.scroll_info)(&truncate_to_width(&scroll_text, width.saturating_sub(2), "")));
+            lines.push((self.theme.scroll_info)(&truncate_to_width(
+                &scroll_text,
+                width.saturating_sub(2),
+                "",
+            )));
         }
 
         lines
@@ -440,7 +470,9 @@ impl Component for SelectList {
 
 /// Normalize text to a single line.
 fn normalize_single_line(text: &str) -> String {
-    text.replace(|c: char| c == '\r' || c == '\n', " ").trim().to_string()
+    text.replace(|c: char| c == '\r' || c == '\n', " ")
+        .trim()
+        .to_string()
 }
 
 #[cfg(test)]
@@ -449,12 +481,9 @@ mod tests {
 
     #[test]
     fn test_select_list_new() {
-        let items = vec![
-            SelectItem::new("one", "One"),
-            SelectItem::new("two", "Two"),
-        ];
+        let items = vec![SelectItem::new("one", "One"), SelectItem::new("two", "Two")];
         let list = SelectList::new(items, 5);
-        
+
         let lines = list.render(40);
         assert_eq!(lines.len(), 2);
     }
@@ -467,7 +496,7 @@ mod tests {
             SelectItem::new("apricot", "Apricot"),
         ];
         let list = SelectList::new(items, 5);
-        
+
         list.set_filter("ap");
         let lines = list.render(40);
         assert_eq!(lines.len(), 2); // Apple and Apricot
@@ -475,23 +504,19 @@ mod tests {
 
     #[test]
     fn test_select_list_navigation() {
-        let items = vec![
-            SelectItem::new("one", "One"),
-            SelectItem::new("two", "Two"),
-        ];
+        let items = vec![SelectItem::new("one", "One"), SelectItem::new("two", "Two")];
         let list = SelectList::new(items, 5);
-        
+
         assert_eq!(list.get_selected_item().unwrap().value, "one");
-        
+
         list.set_selected_index(1);
         assert_eq!(list.get_selected_item().unwrap().value, "two");
     }
 
     #[test]
     fn test_select_item() {
-        let item = SelectItem::new("value", "Label")
-            .with_description("Description");
-        
+        let item = SelectItem::new("value", "Label").with_description("Description");
+
         assert_eq!(item.value, "value");
         assert_eq!(item.label, "Label");
         assert_eq!(item.description, Some("Description".to_string()));

@@ -57,14 +57,13 @@ See [docs/architecture.md](docs/architecture.md) for the full design.
 
 ## Status (v1)
 
-- **Providers:** Anthropic (API-key auth) + a faux provider for tests. Also
-  supports **third-party Anthropic-compatible endpoints** (one-api/new-api/
-  claude-code-router/private proxies) via `ANTHROPIC_BASE_URL`/`--base-url` +
-  Bearer auth (`ANTHROPIC_AUTH_TOKEN` or a `~/.rpi/models.json` gateway with
-  `authHeader: true`). OAuth / Copilot device-code auth is deferred.
+- **Providers:** Anthropic Messages and OpenAI-compatible Chat Completions,
+  plus a faux provider for tests. Third-party endpoints are configured through
+  `~/.rpi/agent/models.json`; Anthropic endpoint overrides also support
+  `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`.
 - **Auth (in priority order):** `--api-key` → `~/.rpi/auth.json` (set via
-  `rpi auth login`) → `~/.rpi/models.json` gateway (`authHeader:true`+`apiKey`) →
-  `ANTHROPIC_AUTH_TOKEN` (Bearer) → `ANTHROPIC_API_KEY` (x-api-key). `rpi auth
+  `rpi auth login`) → `~/.rpi/agent/models.json` `apiKey` → provider environment
+  variables (`OPENAI_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`). `rpi auth
   login`/`check`/`logout` manage the stored credential.
 - **Tools:** `read`, `write`, `edit`, `bash` (mutating, run through a
   `MutationQueue`) + `grep`, `find`, `ls` (read-only, in-process via the
@@ -79,20 +78,22 @@ See [docs/architecture.md](docs/architecture.md) for the full design.
 
 ```
 ~/.rpi/
-├── auth.json     # set with `rpi auth login` (0o600 on Unix)
-└── models.json   # optional: custom Anthropic-compatible providers/models
+└── agent/
+    ├── auth.json     # set with `rpi auth login` (0o600 on Unix)
+    └── models.json   # optional: custom providers/models
 ```
 
 `auth.json` holds the stored API key for `anthropic` (written by
 `rpi auth login`, removed by `rpi auth logout`); `auth check` reports whether
 any auth source is ready without touching the network.
 
-`models.json` is a hand-edited file for custom Anthropic-compatible gateways:
+`models.json` is a hand-edited file for custom Anthropic or OpenAI-compatible gateways:
 
 ```jsonc
 {
   "providers": {
     "gateway": {
+      "api": "anthropic-messages",
       "baseUrl": "https://gateway.example.com",
       "apiKey": "sk-gateway-secret",
       "authHeader": true,             // wrap apiKey as Authorization: Bearer
@@ -106,18 +107,17 @@ any auth source is ready without touching the network.
 ```
 
 Then `rpi --model gateway/custom-claude -p "hi"` routes to the gateway (the
-`gateway/` prefix is CLI namespacing; v1 routes every `anthropic-messages`
-model through its single AnthropicProvider, using the model's `base_url` +
-`headers` to reach the endpoint).
+`gateway/` prefix is CLI namespacing). For an OpenAI-compatible endpoint, set
+`"api": "openai-completions"`; its `apiKey` is sent as a Bearer token and the
+provider streams `/v1/chat/completions`.
 
 **Default model (no `--model`).** A bare `rpi -p "hi"` picks the default the way
 native pi does — the first *authenticated* model in the catalog when the
-built-in default isn't authenticated. So a `models.json`-only gateway setup
-(no Anthropic key) "just works": the gateway model is the only authenticated
+built-in default isn't authenticated. So a `models.json`-only Anthropic or
+OpenAI gateway setup "just works": the gateway model is the only authenticated
 one, so `rpi -p "hi"` routes through it — no `--model` needed. With a standard
 `ANTHROPIC_API_KEY`/`auth.json`/`--api-key` setup, the built-in
-`claude-sonnet-5` remains the default. (A gateway key is folded onto the
-gateway models only; an `ANTHROPIC_AUTH_TOKEN` is folded onto every model.)
+`claude-sonnet-5` remains the default.
 See
 [docs/m6-cli-open-questions.md §4–5](docs/m6-cli-open-questions.md) for the
 full auth precedence, the default-selection rule, the `~/.rpi`-flat-vs-nested

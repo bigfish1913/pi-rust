@@ -62,27 +62,27 @@ use std::sync::{Arc, Mutex};
 
 use rpi_plugin_sdk::{
     EventHandlerFn, EventTag, FreeStringFn, PluginApiVt, ProviderRequestFn, RenderFn,
-    ResourcesDiscoverFn, RuntimeActionFn, StbString, StbStringRef, StableToolSchema,
-    StablePluginEvent, ToolCancelFn, ToolDestroyFn, ToolExecuteFn, ToolPollFn,
+    ResourcesDiscoverFn, RuntimeActionFn, StablePluginEvent, StableToolSchema, StbString,
+    StbStringRef, ToolCancelFn, ToolDestroyFn, ToolExecuteFn, ToolPollFn,
 };
 use thiserror::Error;
 
 pub use actions::{
-    ActionBridge, ReloadMailbox, RuntimeActionHost, reload_callback_from_mailbox,
-    trampoline_runtime_action,
+    reload_callback_from_mailbox, trampoline_runtime_action, ActionBridge, ReloadMailbox,
+    RuntimeActionHost,
 };
 pub use loader::{
-    ExtensionSession, LoadedPlugin, PluginKeepalive, PluginLoadError, load_dir, load_one,
-    load_session, load_session_mixed, merge_registries,
+    load_dir, load_one, load_session, load_session_mixed, merge_registries, ExtensionSession,
+    LoadedPlugin, PluginKeepalive, PluginLoadError,
 };
-pub use provider_hooks::ExtensionProviderHooks;
 pub use provider::PluggableProvider;
+pub use provider_hooks::ExtensionProviderHooks;
 pub use registry::{
-    ExtensionRegistry, ExtensionTool, RegisteredHandler, RegisteredProvider, RegisteredRenderer,
-    RegisteredRendererKind, RegistryEntry, RegistrySnapshot, ResourcesDiscoverHandler,
-    assert_active,
+    assert_active, ExtensionRegistry, ExtensionTool, RegisteredHandler, RegisteredProvider,
+    RegisteredRenderer, RegisteredRendererKind, RegistryEntry, RegistrySnapshot,
+    ResourcesDiscoverHandler,
 };
-pub use resources::{DiscoveredResources, emit_resources_discover};
+pub use resources::{emit_resources_discover, DiscoveredResources};
 pub use tool::{PluginToolAdapter, PluginToolHandle};
 pub use translate::{ExtensionEmitter, TeeEmitter};
 
@@ -360,10 +360,13 @@ extern "C" fn trampoline_register_tool(
     // tool). For the plugin a name collision is not a hard failure — always
     // return 0 (success) when the registry accepted it; -1 only if the registry
     // was already detached.
-    let ok = with_current_api(|api| match api.with_registry(|reg| reg.register_tool(tool, handle)) {
-        Some(_) => true,
-        None => false,
-    });
+    let ok =
+        with_current_api(
+            |api| match api.with_registry(|reg| reg.register_tool(tool, handle)) {
+                Some(_) => true,
+                None => false,
+            },
+        );
     if ok == Some(true) {
         0
     } else {
@@ -380,10 +383,13 @@ extern "C" fn trampoline_register_command(
         return -1;
     }
     // SAFETY: the plugin guarantees the refs are valid for this call.
-    let (name, description) = unsafe { (name.as_str().to_string(), description.as_str().to_string()) };
-    let ok = with_current_api(|api| match api.with_registry(|reg| reg.register_command(name, description)) {
-        Some(_) => true,
-        None => false,
+    let (name, description) =
+        unsafe { (name.as_str().to_string(), description.as_str().to_string()) };
+    let ok = with_current_api(|api| {
+        match api.with_registry(|reg| reg.register_command(name, description)) {
+            Some(_) => true,
+            None => false,
+        }
     });
     if ok == Some(true) {
         0
@@ -412,9 +418,11 @@ extern "C" fn trampoline_register_event_handler(
     if !current_api_present() {
         return -1;
     }
-    let ok = with_current_api(|api| match api.with_registry(|reg| reg.register_event_handler(tag, handler, user_data)) {
-        Some(_) => true,
-        None => false,
+    let ok = with_current_api(|api| {
+        match api.with_registry(|reg| reg.register_event_handler(tag, handler, user_data)) {
+            Some(_) => true,
+            None => false,
+        }
     });
     if ok == Some(true) {
         0
@@ -452,10 +460,12 @@ extern "C" fn trampoline_register_provider(
         plugin_free_string,
         user_data,
     };
-    let ok = with_current_api(|api| match api.with_registry(|reg| reg.register_provider(record)) {
-        Some(_) => true,
-        None => false,
-    });
+    let ok = with_current_api(
+        |api| match api.with_registry(|reg| reg.register_provider(record)) {
+            Some(_) => true,
+            None => false,
+        },
+    );
     if ok == Some(true) {
         0
     } else {
@@ -483,10 +493,12 @@ fn register_renderer_common(
         plugin_free_string,
         user_data,
     };
-    let ok = with_current_api(|api| match api.with_registry(|reg| reg.register_renderer(record)) {
-        Some(_) => true,
-        None => false,
-    });
+    let ok = with_current_api(
+        |api| match api.with_registry(|reg| reg.register_renderer(record)) {
+            Some(_) => true,
+            None => false,
+        },
+    );
     if ok == Some(true) {
         0
     } else {
@@ -562,7 +574,9 @@ extern "C" fn trampoline_register_resources_discover(
         return -1;
     }
     let ok = with_current_api(|api| {
-        match api.with_registry(|reg| reg.register_resources_discover(handler, plugin_free_string, user_data)) {
+        match api.with_registry(|reg| {
+            reg.register_resources_discover(handler, plugin_free_string, user_data)
+        }) {
             Some(_) => true,
             None => false,
         }

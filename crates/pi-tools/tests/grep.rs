@@ -70,9 +70,12 @@ async fn grep_regex_match() {
     let (env, ctx) = fresh_context();
     seed(&env, "nums.txt", b"val=123\nval=456\nother\n".to_vec()).await;
     let tool = rpi_tools::create_grep_tool(&ctx, None);
-    let result = run_grep(tool, serde_json::json!({ "pattern": "val=\\d+", "path": "nums.txt" }))
-        .await
-        .expect("grep ok");
+    let result = run_grep(
+        tool,
+        serde_json::json!({ "pattern": "val=\\d+", "path": "nums.txt" }),
+    )
+    .await
+    .expect("grep ok");
     let out = text_output(&result);
     assert!(out.contains("nums.txt:1: val=123"), "got: {out}");
     assert!(out.contains("nums.txt:2: val=456"), "got: {out}");
@@ -118,9 +121,12 @@ async fn grep_no_matches() {
     let (env, ctx) = fresh_context();
     seed(&env, "x.txt", b"alpha\nbeta\n".to_vec()).await;
     let tool = rpi_tools::create_grep_tool(&ctx, None);
-    let result = run_grep(tool, serde_json::json!({ "pattern": "zzz", "path": "x.txt" }))
-        .await
-        .expect("grep ok");
+    let result = run_grep(
+        tool,
+        serde_json::json!({ "pattern": "zzz", "path": "x.txt" }),
+    )
+    .await
+    .expect("grep ok");
     assert_eq!(text_output(&result), "No matches found");
 }
 
@@ -172,9 +178,12 @@ async fn grep_truncates_long_line() {
     let body = format!("nomatch\n{long_line}\n");
     seed(&env, "long.txt", body.into_bytes()).await;
     let tool = rpi_tools::create_grep_tool(&ctx, None);
-    let result = run_grep(tool, serde_json::json!({ "pattern": "x", "path": "long.txt" }))
-        .await
-        .expect("grep ok");
+    let result = run_grep(
+        tool,
+        serde_json::json!({ "pattern": "x", "path": "long.txt" }),
+    )
+    .await
+    .expect("grep ok");
     let out = text_output(&result);
     assert!(out.contains("... [truncated]"), "got: {out}");
     assert_eq!(result.details["lines_truncated"], true);
@@ -185,9 +194,12 @@ async fn grep_invalid_regex_errors() {
     let (env, ctx) = fresh_context();
     seed(&env, "e.txt", b"x\n".to_vec()).await;
     let tool = rpi_tools::create_grep_tool(&ctx, None);
-    let err = run_grep(tool, serde_json::json!({ "pattern": "(unclosed", "path": "e.txt" }))
-        .await
-        .expect_err("bad regex should fail");
+    let err = run_grep(
+        tool,
+        serde_json::json!({ "pattern": "(unclosed", "path": "e.txt" }),
+    )
+    .await
+    .expect_err("bad regex should fail");
     assert!(matches!(err, AgentError::Validation(_)), "got: {err:?}");
 }
 
@@ -206,5 +218,8 @@ async fn grep_glob_filter() {
     .expect("grep ok");
     let out = text_output(&result);
     assert!(out.contains("keep.ts"), "got: {out}");
-    assert!(!out.contains("skip.txt"), "txt should be filtered out: {out}");
+    assert!(
+        !out.contains("skip.txt"),
+        "txt should be filtered out: {out}"
+    );
 }

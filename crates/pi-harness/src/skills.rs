@@ -209,12 +209,9 @@ pub async fn load_skills(env: &Arc<dyn ExecutionEnv>, dirs: &[String]) -> LoadSk
                 // the parent directory's basename.
                 let dir_path = dirname_env_path(&root_info.path.to_string_lossy());
                 let parent_dir_name = basename_of(&dir_path);
-                let mut result = load_skill_from_file(
-                    env,
-                    &root_info.path.to_string_lossy(),
-                    &parent_dir_name,
-                )
-                .await;
+                let mut result =
+                    load_skill_from_file(env, &root_info.path.to_string_lossy(), &parent_dir_name)
+                        .await;
                 if let Some(skill) = result.skill.take() {
                     skills.push(skill);
                 }

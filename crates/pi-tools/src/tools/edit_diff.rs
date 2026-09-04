@@ -21,9 +21,15 @@ pub struct BomResult<'a> {
 pub fn strip_bom(content: &str) -> BomResult<'_> {
     const BOM: &str = "\u{FEFF}";
     if let Some(rest) = content.strip_prefix(BOM) {
-        BomResult { bom: BOM, text: rest }
+        BomResult {
+            bom: BOM,
+            text: rest,
+        }
     } else {
-        BomResult { bom: "", text: content }
+        BomResult {
+            bom: "",
+            text: content,
+        }
     }
 }
 
@@ -76,9 +82,8 @@ pub fn normalize_for_fuzzy_match(text: &str) -> String {
         match c {
             '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => out.push('\''),
             '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' => out.push('"'),
-            '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}' | '\u{2212}' => {
-                out.push('-')
-            }
+            '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
+            | '\u{2212}' => out.push('-'),
             '\u{00A0}' | '\u{2002}' | '\u{2003}' | '\u{2004}' | '\u{2005}' | '\u{2006}'
             | '\u{2007}' | '\u{2008}' | '\u{2009}' | '\u{200A}' | '\u{202F}' | '\u{205F}'
             | '\u{3000}' => out.push(' '),
@@ -308,7 +313,8 @@ fn apply_replacements_preserving_unchanged_lines(
     sorted.sort_by(|a, b| a.match_index.cmp(&b.match_index));
     let mut groups: Vec<(usize, usize, Vec<MatchedEdit>)> = Vec::new();
     for r in &sorted {
-        let range = get_replacement_line_range(&base_lines, r.match_index, r.match_index + r.match_length);
+        let range =
+            get_replacement_line_range(&base_lines, r.match_index, r.match_index + r.match_length);
         if let Some(last) = groups.last_mut() {
             if range.start_line < last.1 {
                 last.1 = last.1.max(range.end_line);
@@ -390,7 +396,11 @@ struct LineRange {
 
 /// Find the line range covering `[start_offset, end_offset)`. Mirrors
 /// `getReplacementLineRange`. `end_line` is exclusive.
-fn get_replacement_line_range(lines: &[(usize, usize)], start_offset: usize, end_offset: usize) -> LineRange {
+fn get_replacement_line_range(
+    lines: &[(usize, usize)],
+    start_offset: usize,
+    end_offset: usize,
+) -> LineRange {
     let mut start_line = 0usize;
     for (i, span) in lines.iter().enumerate() {
         if start_offset >= span.0 && start_offset < span.1 {
@@ -403,7 +413,10 @@ fn get_replacement_line_range(lines: &[(usize, usize)], start_offset: usize, end
     while end_line < lines.len() && lines[end_line - 1].1 < end_offset {
         end_line += 1;
     }
-    LineRange { start_line, end_line }
+    LineRange {
+        start_line,
+        end_line,
+    }
 }
 
 /// `{ diff, first_changed_line }`. Mirrors `generateDiffString`.
@@ -414,7 +427,11 @@ pub struct DiffResult {
 
 /// A display-oriented diff (NOT a unified patch) with line-number prefixes.
 /// Mirrors `generateDiffString` with a 4-line context window.
-pub fn generate_diff_string(old_content: &str, new_content: &str, context_lines: usize) -> DiffResult {
+pub fn generate_diff_string(
+    old_content: &str,
+    new_content: &str,
+    context_lines: usize,
+) -> DiffResult {
     let parts = TextDiff::from_lines(old_content, new_content);
     let ops: Vec<_> = parts.ops().to_vec();
     let old_lines: Vec<&str> = old_content.split('\n').collect();
@@ -452,11 +469,21 @@ pub fn generate_diff_string(old_content: &str, new_content: &str, context_lines:
             }
             for line in &raw {
                 if is_added {
-                    out.push(format!("+{:>width$} {}", new_line_num, line, width = line_num_width));
+                    out.push(format!(
+                        "+{:>width$} {}",
+                        new_line_num,
+                        line,
+                        width = line_num_width
+                    ));
                     new_line_num += 1;
                 }
                 if is_removed {
-                    out.push(format!("-{:>width$} {}", old_line_num, line, width = line_num_width));
+                    out.push(format!(
+                        "-{:>width$} {}",
+                        old_line_num,
+                        line,
+                        width = line_num_width
+                    ));
                     old_line_num += 1;
                 }
             }
@@ -469,9 +496,7 @@ pub fn generate_diff_string(old_content: &str, new_content: &str, context_lines:
             let next_is_change = i + 1 < ops.len()
                 && matches!(
                     ops[i + 1].tag(),
-                    similar::DiffTag::Insert
-                        | similar::DiffTag::Delete
-                        | similar::DiffTag::Replace
+                    similar::DiffTag::Insert | similar::DiffTag::Delete | similar::DiffTag::Replace
                 );
             let has_leading_change = last_was_change;
             let has_trailing_change = next_is_change;
@@ -479,7 +504,12 @@ pub fn generate_diff_string(old_content: &str, new_content: &str, context_lines:
             if has_leading_change && has_trailing_change {
                 if raw_len <= context_lines * 2 {
                     for line in &raw {
-                        out.push(format!(" {:>width$} {}", old_line_num, line, width = line_num_width));
+                        out.push(format!(
+                            " {:>width$} {}",
+                            old_line_num,
+                            line,
+                            width = line_num_width
+                        ));
                         old_line_num += 1;
                         new_line_num += 1;
                     }
@@ -488,7 +518,12 @@ pub fn generate_diff_string(old_content: &str, new_content: &str, context_lines:
                     let trailing = &raw[raw_len - context_lines..];
                     let skipped = raw_len - leading.len() - trailing.len();
                     for line in leading {
-                        out.push(format!(" {:>width$} {}", old_line_num, line, width = line_num_width));
+                        out.push(format!(
+                            " {:>width$} {}",
+                            old_line_num,
+                            line,
+                            width = line_num_width
+                        ));
                         old_line_num += 1;
                         new_line_num += 1;
                     }
@@ -496,16 +531,30 @@ pub fn generate_diff_string(old_content: &str, new_content: &str, context_lines:
                     old_line_num += skipped;
                     new_line_num += skipped;
                     for line in trailing {
-                        out.push(format!(" {:>width$} {}", old_line_num, line, width = line_num_width));
+                        out.push(format!(
+                            " {:>width$} {}",
+                            old_line_num,
+                            line,
+                            width = line_num_width
+                        ));
                         old_line_num += 1;
                         new_line_num += 1;
                     }
                 }
             } else if has_leading_change {
-                let shown = if raw_len <= context_lines { &raw[..] } else { &raw[..context_lines] };
+                let shown = if raw_len <= context_lines {
+                    &raw[..]
+                } else {
+                    &raw[..context_lines]
+                };
                 let skipped = raw_len - shown.len();
                 for line in shown {
-                    out.push(format!(" {:>width$} {}", old_line_num, line, width = line_num_width));
+                    out.push(format!(
+                        " {:>width$} {}",
+                        old_line_num,
+                        line,
+                        width = line_num_width
+                    ));
                     old_line_num += 1;
                     new_line_num += 1;
                 }
@@ -522,7 +571,12 @@ pub fn generate_diff_string(old_content: &str, new_content: &str, context_lines:
                     new_line_num += skipped;
                 }
                 for line in &raw[skipped..] {
-                    out.push(format!(" {:>width$} {}", old_line_num, line, width = line_num_width));
+                    out.push(format!(
+                        " {:>width$} {}",
+                        old_line_num,
+                        line,
+                        width = line_num_width
+                    ));
                     old_line_num += 1;
                     new_line_num += 1;
                 }
@@ -548,7 +602,13 @@ pub fn generate_unified_patch(path: &str, old_content: &str, new_content: &str) 
     // `similar::udiff::unified_diff(alg, old, new, context_radius, header)`
     // where `header: Option<(&str,&str)>` carries the (old_label, new_label)
     // file headers (`--- ` / `+++ `). No timestamps, matching the TS port.
-    unified_diff(Algorithm::Myers, old_content, new_content, 4, Some((path, path)))
+    unified_diff(
+        Algorithm::Myers,
+        old_content,
+        new_content,
+        4,
+        Some((path, path)),
+    )
 }
 
 // --- error-message builders (mirror the TS single-vs-multi variants) ---

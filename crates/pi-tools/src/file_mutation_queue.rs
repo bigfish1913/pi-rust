@@ -103,7 +103,9 @@ pub async fn with_file_mutation_queue<F, R>(
     f: F,
 ) -> Result<R, FileError>
 where
-    F: for<'a> FnOnce(&'a CancellationToken) -> futures::future::BoxFuture<'a, Result<R, FileError>>,
+    F: for<'a> FnOnce(
+        &'a CancellationToken,
+    ) -> futures::future::BoxFuture<'a, Result<R, FileError>>,
     R: Send + 'static,
 {
     let key = get_mutation_queue_key(env.as_env(), path, Some(cancel)).await?;

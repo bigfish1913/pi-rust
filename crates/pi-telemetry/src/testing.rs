@@ -40,7 +40,10 @@ impl TelemetryContext for InMemoryTelemetryContext {
             events
                 .lock()
                 .expect("events lock poisoned")
-                .push(SpanEvent { name: name.clone(), status });
+                .push(SpanEvent {
+                    name: name.clone(),
+                    status,
+                });
         })
     }
 }

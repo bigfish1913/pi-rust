@@ -53,7 +53,7 @@ pub trait Component: Send + Sync {
 pub trait Focusable: Component {
     /// Set by TUI when focus changes. Component should emit CURSOR_MARKER when true.
     fn set_focused(&self, focused: bool);
-    
+
     /// Check if the component is currently focused.
     fn is_focused(&self) -> bool;
 }
@@ -72,7 +72,10 @@ pub const CURSOR_MARKER: &str = "\x1b_pi:c\x07";
 
 /// Helper to check if a component implements Focusable.
 pub fn is_focusable(component: &ComponentRef) -> bool {
-    component.as_any().downcast_ref::<Arc<dyn Focusable>>().is_some()
+    component
+        .as_any()
+        .downcast_ref::<Arc<dyn Focusable>>()
+        .is_some()
         || component.as_any().type_id() == std::any::TypeId::of::<Arc<dyn Focusable>>()
 }
 

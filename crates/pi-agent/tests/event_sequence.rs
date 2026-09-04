@@ -42,7 +42,10 @@ impl EchoTool {
             })),
             constrained_sampling: None,
         };
-        let tool = EchoTool { schema, executed: Arc::clone(&executed) };
+        let tool = EchoTool {
+            schema,
+            executed: Arc::clone(&executed),
+        };
         (tool, executed)
     }
 }
@@ -67,7 +70,10 @@ impl rpi_agent::AgentTool for EchoTool {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        self.executed.lock().expect("executed lock").push(value.clone());
+        self.executed
+            .lock()
+            .expect("executed lock")
+            .push(value.clone());
         Ok(rpi_agent::AgentToolResult::text(format!("echoed: {value}")))
     }
 }
@@ -100,10 +106,19 @@ async fn emits_event_types_for_text_turn() {
 
     // The required event types are present.
     let tags = type_tags(&events);
-    assert!(tags.contains(&"agent_start"), "missing agent_start: {tags:?}");
+    assert!(
+        tags.contains(&"agent_start"),
+        "missing agent_start: {tags:?}"
+    );
     assert!(tags.contains(&"turn_start"), "missing turn_start: {tags:?}");
-    assert!(tags.contains(&"message_start"), "missing message_start: {tags:?}");
-    assert!(tags.contains(&"message_end"), "missing message_end: {tags:?}");
+    assert!(
+        tags.contains(&"message_start"),
+        "missing message_start: {tags:?}"
+    );
+    assert!(
+        tags.contains(&"message_end"),
+        "missing message_end: {tags:?}"
+    );
     assert!(tags.contains(&"turn_end"), "missing turn_end: {tags:?}");
     assert!(tags.contains(&"agent_end"), "missing agent_end: {tags:?}");
 }
@@ -156,9 +171,16 @@ async fn emits_exact_sequence_when_should_stop_after_turn() {
             .iter()
             .map(|m| m.role().as_str().to_string())
             .collect::<Vec<_>>(),
-        vec!["user".to_string(), "assistant".to_string(), "toolResult".to_string()],
+        vec![
+            "user".to_string(),
+            "assistant".to_string(),
+            "toolResult".to_string()
+        ],
     );
-    assert_eq!(executed.lock().expect("executed lock").as_slice(), &["hello"]);
+    assert_eq!(
+        executed.lock().expect("executed lock").as_slice(),
+        &["hello"]
+    );
     assert_eq!(stop_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
     assert_eq!(
@@ -201,7 +223,10 @@ async fn emits_message_update_events_on_streaming_deltas() {
             partial.content.push(rpi_ai::types::Content::text(""));
             let p = std::sync::Arc::new(partial.clone());
             prod.push(AssistantMessageEvent::Start { partial: p.clone() });
-            prod.push(AssistantMessageEvent::TextStart { content_index: 0, partial: p.clone() });
+            prod.push(AssistantMessageEvent::TextStart {
+                content_index: 0,
+                partial: p.clone(),
+            });
             prod.push(AssistantMessageEvent::TextDelta {
                 content_index: 0,
                 delta: "Hi ".into(),
@@ -220,7 +245,9 @@ async fn emits_message_update_events_on_streaming_deltas() {
             let mut final_msg = (*p).clone();
             final_msg.stop_reason = StopReason::Stop;
             final_msg.content.clear();
-            final_msg.content.push(rpi_ai::types::Content::text("Hi there!"));
+            final_msg
+                .content
+                .push(rpi_ai::types::Content::text("Hi there!"));
             prod.push(AssistantMessageEvent::Done {
                 reason: DoneReason::Stop,
                 message: final_msg,

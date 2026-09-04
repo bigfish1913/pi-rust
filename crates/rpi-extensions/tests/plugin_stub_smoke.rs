@@ -50,10 +50,9 @@ use std::ffi::c_void;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-
 use rpi_agent::agent_tool::AgentTool;
 use rpi_agent::types::{TextContentOrImage, ToolResultPartial};
-use rpi_extensions::{PluginDiagnostics, PluginToolAdapter, load_session};
+use rpi_extensions::{load_session, PluginDiagnostics, PluginToolAdapter};
 use rpi_plugin_sdk::EventTag;
 use tokio_util::sync::CancellationToken;
 
@@ -121,10 +120,7 @@ async fn loads_real_cdylib_and_drives_echo_tool() {
 
     // No load warnings (ABI mismatch / skip would land here).
     let warned = warnings.warnings.lock().unwrap().clone();
-    assert!(
-        warned.is_empty(),
-        "unexpected load diagnostics: {warned:?}"
-    );
+    assert!(warned.is_empty(), "unexpected load diagnostics: {warned:?}");
     assert!(!session.is_empty(), "expected the stub to load");
     assert_eq!(session.loaded_paths().len(), 1);
 
@@ -150,7 +146,12 @@ async fn loads_real_cdylib_and_drives_echo_tool() {
     let on_update: Arc<dyn Fn(ToolResultPartial) + Send + Sync> = Arc::new(|_| {});
     let signal = CancellationToken::new();
     let result = adapter
-        .execute("smoke_call_1", serde_json::json!({ "text": "hi" }), signal, on_update)
+        .execute(
+            "smoke_call_1",
+            serde_json::json!({ "text": "hi" }),
+            signal,
+            on_update,
+        )
         .await
         .expect("echo execute should succeed");
 
@@ -169,7 +170,12 @@ async fn loads_real_cdylib_and_drives_echo_tool() {
     let _user: *mut c_void = std::ptr::null_mut();
     let _ = _user;
     let result2 = adapter
-        .execute("smoke_call_2", serde_json::json!({ "text": "again" }), signal2, on_update2)
+        .execute(
+            "smoke_call_2",
+            serde_json::json!({ "text": "again" }),
+            signal2,
+            on_update2,
+        )
         .await
         .expect("second echo execute should succeed");
     match &result2.content[0] {
@@ -184,10 +190,10 @@ async fn loads_real_cdylib_and_drives_echo_tool() {
     // wired against the real cdylib. We read the counter back via the cdylib's
     // exported `plugin_stub_message_end_hits` accessor (looked up the same way
     // the loader looks up `rpi_plugin_register`).
-    use rpi_extensions::ExtensionEmitter;
     use rpi_agent::events::AgentEmitter;
     use rpi_agent::message::AgentMessage;
     use rpi_ai::types::{AssistantMessage, Content, Usage};
+    use rpi_extensions::ExtensionEmitter;
 
     let snapshot = session.snapshot_arc().expect("snapshot present");
     let emitter = ExtensionEmitter::new(snapshot, session.keepalive());
@@ -211,7 +217,8 @@ async fn loads_real_cdylib_and_drives_echo_tool() {
     emitter.try_emit(rpi_agent::AgentEvent::MessageEnd { message: am });
     let after = stub_message_end_hits(&stub_path);
     assert_eq!(
-        after, before + 1,
+        after,
+        before + 1,
         "MessageEnd handler in the real cdylib should have fired once"
     );
 
@@ -302,15 +309,22 @@ async fn loads_real_cdylib_and_drives_echo_tool() {
     //     `stream_simple` (which spawns its producer task on the captured
     //     handle) cooperates directly — no second runtime / `block_on`.
     let ambient = tokio::runtime::Handle::current();
-    let pluggable = rpi_extensions::PluggableProvider::from_session(
-        &session,
-        ambient.clone(),
+    let pluggable = rpi_extensions::PluggableProvider::from_session(&session, ambient.clone());
+    assert_eq!(
+        pluggable.len(),
+        1,
+        "one PluggableProvider per registered provider"
     );
-    assert_eq!(pluggable.len(), 1, "one PluggableProvider per registered provider");
     let provider: Arc<dyn Provider> = pluggable.into_iter().next().unwrap();
     assert_eq!(provider.id(), "stub-provider");
 
-    let model = Model::new("stub-model", "Stub", Api::Faux, "stub-provider", "https://stub.example");
+    let model = Model::new(
+        "stub-model",
+        "Stub",
+        Api::Faux,
+        "stub-provider",
+        "https://stub.example",
+    );
     let ctx = rpi_ai::Context::new(Vec::new());
     let opts = SimpleStreamOptions::default();
 
@@ -371,9 +385,7 @@ fn stub_discover_hits(stub_path: &std::path::Path) -> usize {
         Err(_) => return 0,
     };
     type HitFn = extern "C" fn() -> usize;
-    let sym: libloading::Symbol<HitFn> = match unsafe {
-        lib.get(b"plugin_stub_discover_hits\0")
-    } {
+    let sym: libloading::Symbol<HitFn> = match unsafe { lib.get(b"plugin_stub_discover_hits\0") } {
         Ok(s) => s,
         Err(_) => return 0,
     };
@@ -392,12 +404,11 @@ fn stub_provider_request_hits(stub_path: &std::path::Path) -> usize {
         Err(_) => return 0,
     };
     type HitFn = extern "C" fn() -> usize;
-    let sym: libloading::Symbol<HitFn> = match unsafe {
-        lib.get(b"plugin_stub_provider_request_hits\0")
-    } {
-        Ok(s) => s,
-        Err(_) => return 0,
-    };
+    let sym: libloading::Symbol<HitFn> =
+        match unsafe { lib.get(b"plugin_stub_provider_request_hits\0") } {
+            Ok(s) => s,
+            Err(_) => return 0,
+        };
     let hits = sym();
     drop(sym);
     drop(lib);
@@ -413,12 +424,11 @@ fn stub_markdown_transform_hits(stub_path: &std::path::Path) -> usize {
         Err(_) => return 0,
     };
     type HitFn = extern "C" fn() -> usize;
-    let sym: libloading::Symbol<HitFn> = match unsafe {
-        lib.get(b"plugin_stub_markdown_transform_hits\0")
-    } {
-        Ok(s) => s,
-        Err(_) => return 0,
-    };
+    let sym: libloading::Symbol<HitFn> =
+        match unsafe { lib.get(b"plugin_stub_markdown_transform_hits\0") } {
+            Ok(s) => s,
+            Err(_) => return 0,
+        };
     let hits = sym();
     drop(sym);
     drop(lib);
@@ -436,9 +446,8 @@ fn stub_message_end_hits(stub_path: &std::path::Path) -> usize {
         Err(_) => return 0,
     };
     type HitFn = extern "C" fn() -> usize;
-    let sym: libloading::Symbol<HitFn> = match unsafe {
-        lib.get(b"plugin_stub_message_end_hits\0")
-    } {
+    let sym: libloading::Symbol<HitFn> = match unsafe { lib.get(b"plugin_stub_message_end_hits\0") }
+    {
         Ok(s) => s,
         Err(_) => return 0,
     };

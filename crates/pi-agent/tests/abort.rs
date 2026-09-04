@@ -28,14 +28,14 @@ use std::sync::Arc;
 use common::{assistant_tool_calls, base_config};
 use rpi_agent::{AbortHandle, AgentContext, AgentEvent, AgentToolResult};
 use rpi_ai::event_stream::create_assistant_message_event_stream;
-use rpi_ai::types::{
-    AssistantMessage, AssistantMessageEvent, ErrorReason, StopReason,
-};
+use rpi_ai::types::{AssistantMessage, AssistantMessageEvent, ErrorReason, StopReason};
 use tokio_util::sync::CancellationToken;
 
 /// True once an `AgentEnd` event has appeared.
 fn saw_agent_end(events: &[AgentEvent]) -> bool {
-    events.iter().any(|e| matches!(e, AgentEvent::AgentEnd { .. }))
+    events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::AgentEnd { .. }))
 }
 
 // ----------------------------------------------------------------------------
@@ -61,7 +61,9 @@ async fn abort_during_stream_produces_agent_end() {
                 "mock",
                 0,
             );
-            prod.push(AssistantMessageEvent::Start { partial: Arc::new(partial) });
+            prod.push(AssistantMessageEvent::Start {
+                partial: Arc::new(partial),
+            });
             // Poll the token until cancelled (TS `checkAbort` loop).
             loop {
                 if token.is_cancelled() {
@@ -193,11 +195,10 @@ async fn abort_during_tool_unblocks_and_settles() {
     let mut config = base_config();
     config.signal = token;
 
-    let stream_fn =
-        common::mock_stream_fn(vec![assistant_tool_calls(
-            vec![("tool-1", "blocking", serde_json::json!({}))],
-            StopReason::ToolUse,
-        )]);
+    let stream_fn = common::mock_stream_fn(vec![assistant_tool_calls(
+        vec![("tool-1", "blocking", serde_json::json!({}))],
+        StopReason::ToolUse,
+    )]);
 
     let (collector, events_buf) = rpi_agent::CollectorEmitter::new();
     let emit: Arc<dyn rpi_agent::AgentEmitter> = Arc::new(collector);
@@ -216,9 +217,7 @@ async fn abort_during_tool_unblocks_and_settles() {
     started.notified().await;
     handle.abort();
 
-    let _new_messages = run_handle
-        .await
-        .expect("run task did not panic");
+    let _new_messages = run_handle.await.expect("run task did not panic");
     let events = events_buf.lock().expect("events lock").clone();
     assert!(
         saw_agent_end(&events),
@@ -253,5 +252,8 @@ async fn abort_with_no_active_run_is_a_no_op() {
         saw2.store(true, Ordering::SeqCst);
     });
     t.await.expect("child task did not panic");
-    assert!(saw.load(Ordering::SeqCst), "born-cancelled child should resolve cancelled()");
+    assert!(
+        saw.load(Ordering::SeqCst),
+        "born-cancelled child should resolve cancelled()"
+    );
 }

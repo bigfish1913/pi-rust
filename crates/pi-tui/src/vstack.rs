@@ -6,7 +6,7 @@ use std::any::Any;
 use std::sync::{Arc, Mutex};
 
 use super::component::Component;
-use super::layout_node::{LayoutNode, LayoutNodeProvider, VStackNode, StackLayoutEntry};
+use super::layout_node::{LayoutNode, LayoutNodeProvider, StackLayoutEntry, VStackNode};
 
 /// Options for a stack entry.
 #[derive(Debug, Clone, Default)]
@@ -222,7 +222,11 @@ impl VStack {
     }
 
     /// Add a child with options.
-    pub fn add_child_with_options(&self, component: Arc<dyn Component>, options: StackEntryOptions) {
+    pub fn add_child_with_options(
+        &self,
+        component: Arc<dyn Component>,
+        options: StackEntryOptions,
+    ) {
         if let Ok(mut children) = self.children.lock() {
             children.push(StackEntry::with_options(component, options));
         }
@@ -259,7 +263,8 @@ impl VStack {
 
     /// Get layout entries for the layout system.
     pub fn get_layout_entries(&self) -> Vec<StackLayoutEntry> {
-        self.children.lock()
+        self.children
+            .lock()
             .map(|c| c.iter().map(|e| e.to_layout_entry()).collect())
             .unwrap_or_default()
     }
@@ -356,16 +361,18 @@ pub fn layout_vstack_constrained(
 
     // First pass: calculate basis sizes and intrinsic heights
     let mut sizes: Vec<usize> = Vec::with_capacity(n);
-    let mut intrinsic: Vec<usize> = Vec::with_capacity(n);
     let mut total_basis = 0usize;
     let mut total_grow = 0usize;
     let mut grow_indices = Vec::new();
 
     for (i, entry) in children.iter().enumerate() {
-        let intrinsic_h = entry.component.render(width).len();
-        intrinsic.push(intrinsic_h);
-
-        let basis = entry.options.basis.unwrap_or(intrinsic_h);
+        // An explicit basis does not depend on intrinsic content. The
+        // transcript scroll view uses basis 0 + grow 1, so measuring it here
+        // used to render the complete history before its actual paint.
+        let basis = entry
+            .options
+            .basis
+            .unwrap_or_else(|| entry.component.render(width).len());
         let min_size = entry.options.min_size;
         let max_size = entry.options.max_size.unwrap_or(usize::MAX);
 

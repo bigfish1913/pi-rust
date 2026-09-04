@@ -12,8 +12,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use super::component::Component;
-use crate::ansi::strip_ansi;
 use crate::ansi::bold;
+use crate::ansi::strip_ansi;
 use crate::dynamic_border::DynamicBorder;
 use crate::loader::Loader;
 use crate::spacer::Spacer;
@@ -84,19 +84,22 @@ impl BashExecutionComponent {
         }
     }
 
-    /// Append a streamed chunk. ANSI is stripped and line endings normalized.
+    /// Replace the displayed output with the latest streamed snapshot.
+    ///
+    /// The bash tool's `on_update` contract sends the complete captured output
+    /// so far, not a delta. Appending each update duplicated all prior lines
+    /// (`a`, then `a\nb` became `aa\nb`). Keep the latest snapshot instead.
     pub fn append_output(&self, chunk: &str) {
         let clean = strip_ansi(chunk).replace("\r\n", "\n").replace('\r', "\n");
-        let new_lines: Vec<&str> = clean.split('\n').collect();
         if let Ok(mut out) = self.output_lines.lock() {
-            if !out.is_empty() && !new_lines.is_empty() {
-                // Continuation: first new chunk appends to the last partial line.
-                let last = out.last_mut().unwrap();
-                last.push_str(new_lines[0]);
-                out.extend(new_lines[1..].iter().map(|s| s.to_string()));
+            *out = if clean.is_empty() {
+                Vec::new()
             } else {
-                out.extend(new_lines.iter().map(|s| s.to_string()));
-            }
+                clean
+                    .split('\n')
+                    .map(|line| line.replace('\t', "    "))
+                    .collect()
+            };
         }
     }
 
@@ -159,25 +162,31 @@ impl BashExecutionComponent {
             if expanded {
                 parts.push(colors.muted.fg("(Ctrl+T to collapse)"));
             } else {
-                parts.push(colors.muted.fg(&format!(
-                    "... {} more lines (Ctrl+T to expand)",
-                    hidden
-                )));
+                parts.push(
+                    colors
+                        .muted
+                        .fg(&format!("... {} more lines (Ctrl+T to expand)", hidden)),
+                );
             }
         }
         match status {
             BashStatus::Cancelled => parts.push(colors.warning.fg("(cancelled)")),
             BashStatus::Error => {
-                parts.push(colors.error.fg(&format!("(exit {})", exit_code.unwrap_or(-1))));
+                parts.push(
+                    colors
+                        .error
+                        .fg(&format!("(exit {})", exit_code.unwrap_or(-1))),
+                );
             }
             _ => {}
         }
         if truncation.truncated {
             let path = truncation.full_output_path.as_deref().unwrap_or("");
-            parts.push(colors.warning.fg(&format!(
-                "Output truncated. Full output: {}",
-                path
-            )));
+            parts.push(
+                colors
+                    .warning
+                    .fg(&format!("Output truncated. Full output: {}", path)),
+            );
         }
         if parts.is_empty() {
             Vec::new()
@@ -214,7 +223,10 @@ impl Component for BashExecutionComponent {
                 let muted = colors.muted;
                 let styled = format!(
                     "\n{}",
-                    out.iter().map(|l| muted.fg(l)).collect::<Vec<_>>().join("\n")
+                    out.iter()
+                        .map(|l| muted.fg(l))
+                        .collect::<Vec<_>>()
+                        .join("\n")
                 );
                 if expanded {
                     let all = crate::text::Text::new(&styled, 1, 0).render(width);
@@ -236,10 +248,7 @@ impl Component for BashExecutionComponent {
             // never looks stuck with no recourse.
             if self.loader.elapsed() > LONG_RUNNING_HINT_AFTER {
                 let colors = theme().colors;
-                let hint = format!(
-                    "  {} Esc / Ctrl+C 中止",
-                    colors.muted.fg("⏸")
-                );
+                let hint = format!("  {} Esc / Ctrl+C 中止", colors.muted.fg("⏸"));
                 lines.push(truncate_to_width(&hint, width, "…"));
             }
         } else {
@@ -286,6 +295,14 @@ mod tests {
         let joined = lines.join("\n");
         // After completion the spinner is gone; output "hi" is visible.
         assert!(strip_ansi(&joined).contains("hi"), "joined: {joined}");
+    }
+
+    #[test]
+    fn streamed_output_updates_replace_snapshots_instead_of_duplicating() {
+        let c = BashExecutionComponent::new("printf test");
+        c.append_output("one\n");
+        c.append_output("one\ntwo\n");
+        assert_eq!(c.get_output(), "one\ntwo\n");
     }
 
     #[test]

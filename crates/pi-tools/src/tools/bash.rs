@@ -83,7 +83,9 @@ impl BashTool {
                  Optionally provide a timeout in seconds.",
                 kb = DEFAULT_MAX_BYTES / 1024
             ),
-            parameters: rpi_ai::types::Schema::new(serde_json::to_value(params).unwrap_or_default()),
+            parameters: rpi_ai::types::Schema::new(
+                serde_json::to_value(params).unwrap_or_default(),
+            ),
             constrained_sampling: None,
         }
     }
@@ -141,8 +143,8 @@ impl AgentTool for BashTool {
 
         let throttle_for_cb = throttle.clone();
         let on_update_for_cb = on_update.clone();
-        let on_chunk: Box<dyn FnMut(&str, &dyn Fn() -> ShellCaptureProgress) + Send> =
-            Box::new(move |_chunk, get_progress: &dyn Fn() -> ShellCaptureProgress| {
+        let on_chunk: Box<dyn FnMut(&str, &dyn Fn() -> ShellCaptureProgress) + Send> = Box::new(
+            move |_chunk, get_progress: &dyn Fn() -> ShellCaptureProgress| {
                 let progress = get_progress();
                 // Snapshot the fields we need from the progress before touching
                 // the async mutex — the on_chunk callback runs on whatever thread
@@ -172,7 +174,8 @@ impl AgentTool for BashTool {
                 if elapsed >= Duration::from_millis(BASH_UPDATE_THROTTLE_MS) {
                     flush_now(&mut st, &on_update_for_cb);
                 }
-            });
+            },
+        );
 
         let cwd = self.env.cwd().to_path_buf();
         let env = self.env.clone();
@@ -321,7 +324,10 @@ fn build_bash_output(capture: &ShellCaptureResult) -> (String, BashToolDetails) 
                 format_size(t.output_bytes),
                 path_str.as_deref().unwrap_or("?")
             ));
-        } else if matches!(t.truncated_by, Some(crate::truncate::TruncationLimit::Lines)) {
+        } else if matches!(
+            t.truncated_by,
+            Some(crate::truncate::TruncationLimit::Lines)
+        ) {
             output_text.push_str(&format!(
                 "\n\n[Showing lines {start_line}-{end_line} of {}. Full output: {}]",
                 t.total_lines,

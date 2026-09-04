@@ -28,11 +28,11 @@
 //! [`EventHandlerFn`]: rpi_plugin_sdk::EventHandlerFn
 //! [`RuntimeActionFn`]: rpi_plugin_sdk::RuntimeActionFn
 
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use rpi_plugin_sdk::{StbString, StbStringRef};
 
-use crate::registry::{RegistrySnapshot, assert_active};
+use crate::registry::{assert_active, RegistrySnapshot};
 
 /// The merged `resources_discover` result across all handlers: bare string
 /// arrays for skills, prompt-templates, and themes. `theme_paths` is collected
@@ -56,7 +56,11 @@ pub struct DiscoveredResources {
 /// NOT abort the fan-out (mirrors pi `runner.ts:1179-1188`). The `out`
 /// StbString each handler produces is plugin-owned and reclaimed via that
 /// handler's stored `plugin_free_string` before moving to the next handler.
-pub fn emit_resources_discover(cwd: &str, reason: &str, snapshot: &RegistrySnapshot) -> DiscoveredResources {
+pub fn emit_resources_discover(
+    cwd: &str,
+    reason: &str,
+    snapshot: &RegistrySnapshot,
+) -> DiscoveredResources {
     if !assert_active(snapshot.active_flag()) {
         return DiscoveredResources::default();
     }
@@ -158,13 +162,16 @@ fn parse_discover_payload(json: &str) -> DiscoveredResources {
         }
     };
     if let Some(arr) = obj.get("skillPaths").and_then(|v| v.as_array()) {
-        out.skill_paths.extend(arr.iter().filter_map(|v| v.as_str()).map(str::to_string));
+        out.skill_paths
+            .extend(arr.iter().filter_map(|v| v.as_str()).map(str::to_string));
     }
     if let Some(arr) = obj.get("promptPaths").and_then(|v| v.as_array()) {
-        out.prompt_paths.extend(arr.iter().filter_map(|v| v.as_str()).map(str::to_string));
+        out.prompt_paths
+            .extend(arr.iter().filter_map(|v| v.as_str()).map(str::to_string));
     }
     if let Some(arr) = obj.get("themePaths").and_then(|v| v.as_array()) {
-        out.theme_paths.extend(arr.iter().filter_map(|v| v.as_str()).map(str::to_string));
+        out.theme_paths
+            .extend(arr.iter().filter_map(|v| v.as_str()).map(str::to_string));
     }
     out
 }
@@ -269,10 +276,7 @@ mod tests {
     }
 
     /// Build a snapshot whose handlers all count into `counter` via `user_data`.
-    fn reg_with(
-        handlers: &[ResourcesDiscoverFn],
-        counter: &AtomicUsize,
-    ) -> RegistrySnapshot {
+    fn reg_with(handlers: &[ResourcesDiscoverFn], counter: &AtomicUsize) -> RegistrySnapshot {
         counter.store(0, Ordering::SeqCst);
         let mut reg = ExtensionRegistry::new();
         let ud = counter as *const AtomicUsize as *mut std::ffi::c_void;
@@ -337,7 +341,11 @@ mod tests {
         snap.active_flag().store(false, Ordering::SeqCst);
         let r = emit_resources_discover("/cwd", "startup", &snap);
         assert!(r.skill_paths.is_empty());
-        assert_eq!(counter.load(Ordering::SeqCst), 0, "stale registry must not invoke handlers");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "stale registry must not invoke handlers"
+        );
     }
 
     #[test]
@@ -349,8 +357,13 @@ mod tests {
             ["/x"]
         );
         // Non-object payloads collapse to empty, never panic.
-        assert_eq!(parse_discover_payload("[1,2,3]"), DiscoveredResources::default());
-        assert_eq!(parse_discover_payload("null"), DiscoveredResources::default());
+        assert_eq!(
+            parse_discover_payload("[1,2,3]"),
+            DiscoveredResources::default()
+        );
+        assert_eq!(
+            parse_discover_payload("null"),
+            DiscoveredResources::default()
+        );
     }
 }
-

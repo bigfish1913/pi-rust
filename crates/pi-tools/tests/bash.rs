@@ -35,7 +35,9 @@ async fn run_bash(
 ) -> Result<rpi_agent::types::AgentToolResult, AgentError> {
     let signal = CancellationToken::new();
     let on_update = Arc::new(|_p| ());
-    let prepared = tool.prepare_arguments(params.clone()).unwrap_or_else(|_| params);
+    let prepared = tool
+        .prepare_arguments(params.clone())
+        .unwrap_or_else(|_| params);
     tool.execute("bash-x", prepared, signal, on_update).await
 }
 
@@ -184,7 +186,14 @@ async fn persists_truncated_full_output_to_temp_file() {
         .await
         .expect("read full output");
     assert!(full.contains("line-1\nline-2"), "{full}");
-    assert!(full.contains(&format!("line-{}\nline-{}", DEFAULT_MAX_LINES, DEFAULT_MAX_LINES + 1)), "{full}");
+    assert!(
+        full.contains(&format!(
+            "line-{}\nline-{}",
+            DEFAULT_MAX_LINES,
+            DEFAULT_MAX_LINES + 1
+        )),
+        "{full}"
+    );
 }
 
 #[tokio::test]
@@ -213,8 +222,13 @@ async fn supports_command_prefix() {
     // tool emits (prefix + "\n" + command).
     env.register_shell("value=hello\necho hello", ShellScript::success("hello"))
         .await;
-    let tool =
-        rpi_tools::create_bash_tool(&ctx, Some(BashToolOptions { command_prefix: Some("value=hello".into()), default_timeout: None }));
+    let tool = rpi_tools::create_bash_tool(
+        &ctx,
+        Some(BashToolOptions {
+            command_prefix: Some("value=hello".into()),
+            default_timeout: None,
+        }),
+    );
     // The shell_script prefix-matches on the composed command start; echo is the
     // user command. Register a broader prefix to be safe.
     env.register_shell("value=hello", ShellScript::success("hello"))

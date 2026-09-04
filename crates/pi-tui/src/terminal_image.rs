@@ -88,7 +88,8 @@ impl Default for ImageRenderOptions {
 }
 
 /// Global capabilities cache.
-static CAPABILITIES_CACHE: std::sync::OnceLock<Mutex<TerminalCapabilities>> = std::sync::OnceLock::new();
+static CAPABILITIES_CACHE: std::sync::OnceLock<Mutex<TerminalCapabilities>> =
+    std::sync::OnceLock::new();
 
 /// Get cached capabilities.
 pub fn get_capabilities() -> TerminalCapabilities {
@@ -158,8 +159,8 @@ pub fn allocate_image_id() -> u32 {
 
 /// Encode image data for Kitty protocol.
 pub fn encode_kitty(data: &[u8], options: &ImageRenderOptions) -> String {
-    use base64::{Engine, engine::general_purpose::STANDARD};
-    
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
     let mut parts = Vec::new();
 
     // Build control string
@@ -187,7 +188,8 @@ pub fn encode_kitty(data: &[u8], options: &ImageRenderOptions) -> String {
 
     // Chunk the data (Kitty has a 4096 byte limit per chunk)
     let chunk_size = 4000;
-    let chunks: Vec<&str> = encoded.as_bytes()
+    let chunks: Vec<&str> = encoded
+        .as_bytes()
         .chunks(chunk_size)
         .map(|c| std::str::from_utf8(c).unwrap_or(""))
         .collect();
@@ -206,8 +208,8 @@ pub fn encode_kitty(data: &[u8], options: &ImageRenderOptions) -> String {
 
 /// Encode image data for iTerm2 protocol.
 pub fn encode_iterm2(data: &[u8], options: &ImageRenderOptions) -> String {
-    use base64::{Engine, engine::general_purpose::STANDARD};
-    
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
     let encoded = STANDARD.encode(data);
 
     let mut name = String::new();
@@ -226,12 +228,7 @@ pub fn encode_iterm2(data: &[u8], options: &ImageRenderOptions) -> String {
         dims.push_str(&format!("height={}", h));
     }
 
-    format!(
-        "\x1b]1337;File={};{}:{}\x07",
-        name,
-        dims,
-        encoded
-    )
+    format!("\x1b]1337;File={};{}:{}\x07", name, dims, encoded)
 }
 
 /// Delete a Kitty image by ID.
@@ -398,7 +395,8 @@ pub fn render_image(data: &[u8], options: &ImageRenderOptions) -> String {
         ImageProtocol::ITerm2 => encode_iterm2(data, options),
         ImageProtocol::None => {
             // Fallback: show placeholder
-            let alt_text = format!("[Image {}x{}]", 
+            let alt_text = format!(
+                "[Image {}x{}]",
                 options.width.unwrap_or(1),
                 options.height.unwrap_or(1)
             );
@@ -410,7 +408,8 @@ pub fn render_image(data: &[u8], options: &ImageRenderOptions) -> String {
 /// Image fallback for unsupported terminals.
 pub fn image_fallback(_alt_text: &str, width: usize) -> String {
     let placeholder = "█".repeat(width.saturating_sub(2));
-    format!("╭{}╮\n│{}│\n╰{}╯", 
+    format!(
+        "╭{}╮\n│{}│\n╰{}╯",
         "─".repeat(width.saturating_sub(2)),
         placeholder,
         "─".repeat(width.saturating_sub(2))

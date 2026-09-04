@@ -26,11 +26,13 @@ use crate::events::{AgentEmitter, AgentEvent};
 use crate::hooks::AgentLoopConfig;
 use crate::message::AgentMessage;
 use crate::stream_fn::StreamFn;
-use crate::types::{AfterToolCallContext, AgentContext, AgentToolResult, BeforeToolCallContext, ToolExecutionMode};
+use crate::types::{
+    AfterToolCallContext, AgentContext, AgentToolResult, BeforeToolCallContext, ToolExecutionMode,
+};
 
 use rpi_ai::types::{
-    AssistantMessage, AssistantMessageEvent, Content, StopReason, ToolCall,
-    ToolCallType, ToolResultMessage, ToolResultRole,
+    AssistantMessage, AssistantMessageEvent, Content, StopReason, ToolCall, ToolCallType,
+    ToolResultMessage, ToolResultRole,
 };
 use rpi_ai::validate_tool_arguments;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -88,8 +90,20 @@ pub async fn run_agent_loop(
     emit_event(&emit, AgentEvent::AgentStart).await;
     emit_event(&emit, AgentEvent::TurnStart).await;
     for prompt in &new_messages {
-        emit_event(&emit, AgentEvent::MessageStart { message: prompt.clone() }).await;
-        emit_event(&emit, AgentEvent::MessageEnd { message: prompt.clone() }).await;
+        emit_event(
+            &emit,
+            AgentEvent::MessageStart {
+                message: prompt.clone(),
+            },
+        )
+        .await;
+        emit_event(
+            &emit,
+            AgentEvent::MessageEnd {
+                message: prompt.clone(),
+            },
+        )
+        .await;
     }
 
     run_loop(
@@ -113,7 +127,9 @@ pub async fn run_agent_loop_continue(
     stream_fn: StreamFn,
 ) -> Result<NewMessages, AgentError> {
     if context.messages.is_empty() {
-        return Err(AgentError::State("cannot continue: no messages in context".into()));
+        return Err(AgentError::State(
+            "cannot continue: no messages in context".into(),
+        ));
     }
     if context.messages.last().unwrap().is_assistant() {
         return Err(AgentError::State(
@@ -184,8 +200,20 @@ async fn run_loop(
             // Inject pending (steering/follow-up) messages before the next LLM call.
             if !pending_messages.is_empty() {
                 for message in pending_messages.drain(..) {
-                    emit_event(emit, AgentEvent::MessageStart { message: message.clone() }).await;
-                    emit_event(emit, AgentEvent::MessageEnd { message: message.clone() }).await;
+                    emit_event(
+                        emit,
+                        AgentEvent::MessageStart {
+                            message: message.clone(),
+                        },
+                    )
+                    .await;
+                    emit_event(
+                        emit,
+                        AgentEvent::MessageEnd {
+                            message: message.clone(),
+                        },
+                    )
+                    .await;
                     current_context.messages.push(message.clone());
                     new_messages.push(message);
                 }
@@ -198,8 +226,21 @@ async fn run_loop(
 
             if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
                 let am = AgentMessage::Assistant(Box::new(message.clone()));
-                emit_event(emit, AgentEvent::TurnEnd { message: am, tool_results: Vec::new() }).await;
-                emit_event(emit, AgentEvent::AgentEnd { messages: new_messages.clone() }).await;
+                emit_event(
+                    emit,
+                    AgentEvent::TurnEnd {
+                        message: am,
+                        tool_results: Vec::new(),
+                    },
+                )
+                .await;
+                emit_event(
+                    emit,
+                    AgentEvent::AgentEnd {
+                        messages: new_messages.clone(),
+                    },
+                )
+                .await;
                 return Ok(LoopOutcome::from_stop(message.stop_reason));
             }
 
@@ -245,21 +286,47 @@ async fn run_loop(
             // prepareNextTurn: replace context if provided. (Model/thinking swaps
             // are owned by Agent; run_loop borrows config immutably for hook
             // stability. M2 tests exercise context replacement only.)
-            if let Some(upd) =
-                prepare_next_turn(config, &message, &tool_results, current_context, new_messages).await
+            if let Some(upd) = prepare_next_turn(
+                config,
+                &message,
+                &tool_results,
+                current_context,
+                new_messages,
+            )
+            .await
             {
                 if let Some(ctx) = upd.context {
                     *current_context = ctx;
                 }
             }
 
-            if should_stop_after_turn(config, &message, &tool_results, current_context, new_messages).await {
-                emit_event(emit, AgentEvent::AgentEnd { messages: new_messages.clone() }).await;
+            if should_stop_after_turn(
+                config,
+                &message,
+                &tool_results,
+                current_context,
+                new_messages,
+            )
+            .await
+            {
+                emit_event(
+                    emit,
+                    AgentEvent::AgentEnd {
+                        messages: new_messages.clone(),
+                    },
+                )
+                .await;
                 return Ok(LoopOutcome::Completed);
             }
 
             if config.signal.is_cancelled() {
-                emit_event(emit, AgentEvent::AgentEnd { messages: new_messages.clone() }).await;
+                emit_event(
+                    emit,
+                    AgentEvent::AgentEnd {
+                        messages: new_messages.clone(),
+                    },
+                )
+                .await;
                 return Ok(LoopOutcome::Aborted);
             }
 
@@ -275,7 +342,13 @@ async fn run_loop(
         break;
     }
 
-    emit_event(emit, AgentEvent::AgentEnd { messages: new_messages.clone() }).await;
+    emit_event(
+        emit,
+        AgentEvent::AgentEnd {
+            messages: new_messages.clone(),
+        },
+    )
+    .await;
     Ok(LoopOutcome::Completed)
 }
 
@@ -371,7 +444,13 @@ async fn stream_assistant_response(
                     }
                 } else {
                     context.messages.push(am.clone());
-                    emit_event(emit, AgentEvent::MessageStart { message: am.clone() }).await;
+                    emit_event(
+                        emit,
+                        AgentEvent::MessageStart {
+                            message: am.clone(),
+                        },
+                    )
+                    .await;
                 }
                 emit_event(emit, AgentEvent::MessageEnd { message: am }).await;
                 return Ok(final_message);
@@ -391,7 +470,13 @@ async fn stream_assistant_response(
         }
     } else {
         context.messages.push(am.clone());
-        emit_event(emit, AgentEvent::MessageStart { message: am.clone() }).await;
+        emit_event(
+            emit,
+            AgentEvent::MessageStart {
+                message: am.clone(),
+            },
+        )
+        .await;
     }
     emit_event(emit, AgentEvent::MessageEnd { message: am }).await;
     Ok(final_message)
@@ -468,23 +553,11 @@ async fn execute_tool_calls(
             .unwrap_or(false)
     });
     if config.tool_execution == ToolExecutionMode::Sequential || has_sequential {
-        execute_tool_calls_sequential(
-            current_context,
-            assistant_message,
-            tool_calls,
-            config,
-            emit,
-        )
-        .await
+        execute_tool_calls_sequential(current_context, assistant_message, tool_calls, config, emit)
+            .await
     } else {
-        execute_tool_calls_parallel(
-            current_context,
-            assistant_message,
-            tool_calls,
-            config,
-            emit,
-        )
-        .await
+        execute_tool_calls_parallel(current_context, assistant_message, tool_calls, config, emit)
+            .await
     }
 }
 
@@ -509,17 +582,12 @@ async fn execute_tool_calls_sequential(
         )
         .await;
 
-        let finalized = run_one_tool_call(
-            current_context,
-            assistant_message,
-            tool_call,
-            config,
-            emit,
-        )
-        .await?;
+        let finalized =
+            run_one_tool_call(current_context, assistant_message, tool_call, config, emit).await?;
 
         emit_tool_execution_end(emit, &finalized).await;
-        let trm = create_tool_result_message(&finalized.tool_call, &finalized.result, finalized.is_error);
+        let trm =
+            create_tool_result_message(&finalized.tool_call, &finalized.result, finalized.is_error);
         emit_tool_result_message(emit, &trm).await;
         finalized_calls.push(finalized);
         messages.push(trm);
@@ -700,8 +768,7 @@ async fn race_one_and_collect(
     // so `select_all` can race them. Each future resolves to its ordinal + the
     // finalized outcome; as each completes we emit `tool_execution_end` (THIS is
     // where completion order is honored) and stash the result by ordinal.
-    let indexed: Vec<(usize, tokio::task::JoinHandle<FinalizedToolCall>)> =
-        std::mem::take(pending);
+    let indexed: Vec<(usize, tokio::task::JoinHandle<FinalizedToolCall>)> = std::mem::take(pending);
     let mut boxed: Vec<
         std::pin::Pin<Box<dyn std::future::Future<Output = (usize, FinalizedToolCall)> + Send>>,
     > = Vec::with_capacity(indexed.len());
@@ -741,8 +808,7 @@ async fn run_one_tool_call(
             is_error,
         }),
         Prepared::Ready { tool, args } => {
-            let executed =
-                execute_prepared_tool_call(tool_call, &tool, &args, config, emit).await;
+            let executed = execute_prepared_tool_call(tool_call, &tool, &args, config, emit).await;
             Ok(finalize_executed_tool_call(
                 current_context,
                 assistant_message,
@@ -778,7 +844,11 @@ async fn prepare_tool_call(
     tool_call: &ToolCall,
     config: &AgentLoopConfig,
 ) -> Prepared {
-    let tool = current_context.tools.iter().find(|t| t.schema().name == tool_call.name).cloned();
+    let tool = current_context
+        .tools
+        .iter()
+        .find(|t| t.schema().name == tool_call.name)
+        .cloned();
     let tool = match tool {
         Some(t) => t,
         None => {
@@ -838,8 +908,10 @@ async fn prepare_tool_call(
                 validated_args = replacement;
             }
             if br.block {
-                let mut result =
-                    create_error_tool_result(&br.reason.unwrap_or_else(|| "Tool execution was blocked".to_string()));
+                let mut result = create_error_tool_result(
+                    &br.reason
+                        .unwrap_or_else(|| "Tool execution was blocked".to_string()),
+                );
                 if br.terminate {
                     result.terminate = true;
                 }
@@ -905,12 +977,7 @@ async fn execute_prepared_tool_call(
 
     let child_token = config.signal.child_token();
     match tool
-        .execute(
-            &tool_call.id,
-            args.clone(),
-            child_token,
-            on_update,
-        )
+        .execute(&tool_call.id, args.clone(), child_token, on_update)
         .await
     {
         Ok(result) => {
@@ -994,8 +1061,7 @@ async fn finalize_executed_tool_call(
 /// Early-terminate iff the batch is non-empty AND every result sets
 /// `terminate == true`. Mirrors TS `shouldTerminateToolBatch`.
 fn should_terminate_tool_batch(finalized_calls: &[FinalizedToolCall]) -> bool {
-    !finalized_calls.is_empty()
-        && finalized_calls.iter().all(|f| f.result.terminate)
+    !finalized_calls.is_empty() && finalized_calls.iter().all(|f| f.result.terminate)
 }
 
 /// Build an error `AgentToolResult` — text content, null details.
@@ -1026,10 +1092,7 @@ fn create_tool_result_message(
 }
 
 /// Emit `tool_execution_end` for a finalized call.
-async fn emit_tool_execution_end(
-    emit: &Arc<dyn AgentEmitter>,
-    finalized: &FinalizedToolCall,
-) {
+async fn emit_tool_execution_end(emit: &Arc<dyn AgentEmitter>, finalized: &FinalizedToolCall) {
     emit_event(
         emit,
         AgentEvent::ToolExecutionEnd {
@@ -1046,7 +1109,13 @@ async fn emit_tool_execution_end(
 /// messages fire AFTER all `tool_execution_end`s, in source/ordinal order.
 async fn emit_tool_result_message(emit: &Arc<dyn AgentEmitter>, trm: &ToolResultMessage) {
     let am = AgentMessage::ToolResult(Box::new(trm.clone()));
-    emit_event(emit, AgentEvent::MessageStart { message: am.clone() }).await;
+    emit_event(
+        emit,
+        AgentEvent::MessageStart {
+            message: am.clone(),
+        },
+    )
+    .await;
     emit_event(emit, AgentEvent::MessageEnd { message: am }).await;
 }
 

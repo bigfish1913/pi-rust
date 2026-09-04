@@ -104,7 +104,10 @@ unsafe impl Sync for StbString {}
 impl StbString {
     /// An empty string: null pointer, zero length. `free` is a no-op.
     pub const fn empty() -> Self {
-        Self { ptr: ptr::null_mut(), len: 0 }
+        Self {
+            ptr: ptr::null_mut(),
+            len: 0,
+        }
     }
 
     /// Whether this is the empty/null string.
@@ -187,13 +190,19 @@ unsafe impl Sync for StbStringRef {}
 impl StbStringRef {
     /// Empty input.
     pub const fn empty() -> Self {
-        Self { ptr: ptr::null(), len: 0 }
+        Self {
+            ptr: ptr::null(),
+            len: 0,
+        }
     }
 
     /// Borrow a `&str` for the duration of a call. The caller must outlive the
     /// call (normal borrow rules).
     pub fn from_str(s: &str) -> Self {
-        Self { ptr: s.as_ptr() as *const c_char, len: s.len() }
+        Self {
+            ptr: s.as_ptr() as *const c_char,
+            len: s.len(),
+        }
     }
 
     /// Read into a safe `&str` for the callee's lifetime `'a`.
@@ -362,17 +371,32 @@ pub struct StepResult {
 impl StepResult {
     /// Build a `Pending` with a progress JSON string (may be empty).
     pub fn pending(progress: StbString) -> Self {
-        Self { tag: StepResultTag::Pending, payload: StepResultPayload { pending: StbPending { progress } } }
+        Self {
+            tag: StepResultTag::Pending,
+            payload: StepResultPayload {
+                pending: StbPending { progress },
+            },
+        }
     }
 
     /// Build a `Done` with the terminal JSON `AgentToolResult`.
     pub fn done(result: StbString) -> Self {
-        Self { tag: StepResultTag::Done, payload: StepResultPayload { done: StbDone { result } } }
+        Self {
+            tag: StepResultTag::Done,
+            payload: StepResultPayload {
+                done: StbDone { result },
+            },
+        }
     }
 
     /// Build an `Err` with an error message.
     pub fn err(message: StbString) -> Self {
-        Self { tag: StepResultTag::Err, payload: StepResultPayload { err: StbErr { message } } }
+        Self {
+            tag: StepResultTag::Err,
+            payload: StepResultPayload {
+                err: StbErr { message },
+            },
+        }
     }
 
     /// Access the `pending` payload. Caller MUST guarantee `tag == Pending`.
@@ -427,8 +451,11 @@ pub type ToolExecuteFn = extern "C" fn(
 /// `poll(handle, partial_cb, user_data) -> StepResult`. **Non-blocking.** Must
 /// observe the cancel flag (set by [`ToolCancelFn`]) and return `Done`/`Err`
 /// within a bounded number of polls. Borrows `handle` (does not free it).
-pub type ToolPollFn =
-    extern "C" fn(handle: StepHandle, partial_cb: Option<ToolPartialCb>, user_data: *mut c_void) -> StepResult;
+pub type ToolPollFn = extern "C" fn(
+    handle: StepHandle,
+    partial_cb: Option<ToolPartialCb>,
+    user_data: *mut c_void,
+) -> StepResult;
 
 /// `cancel(handle)`. Sets an internal `AtomicBool` (SeqCst) cancel flag.
 /// **Idempotent, thread-safe, does NOT free.** The poll loop observes it.
@@ -592,7 +619,12 @@ pub struct StablePluginEvent {
 impl StablePluginEvent {
     /// Build a no-payload event.
     pub fn empty(tag: EventTag) -> Self {
-        Self { tag, payload: EventPayload { empty: EventEmpty::INSTANCE } }
+        Self {
+            tag,
+            payload: EventPayload {
+                empty: EventEmpty::INSTANCE,
+            },
+        }
     }
 
     /// Build a message event.
@@ -601,16 +633,35 @@ impl StablePluginEvent {
             tag,
             EventTag::MessageStart | EventTag::MessageUpdate | EventTag::MessageEnd
         ));
-        Self { tag, payload: EventPayload { message: EventMessage { message } } }
+        Self {
+            tag,
+            payload: EventPayload {
+                message: EventMessage { message },
+            },
+        }
     }
 
     /// Build a tool-call event.
-    pub fn tool_call(tag: EventTag, tool_call_id: StbString, tool_name: StbString, params: StbString) -> Self {
+    pub fn tool_call(
+        tag: EventTag,
+        tool_call_id: StbString,
+        tool_name: StbString,
+        params: StbString,
+    ) -> Self {
         debug_assert!(matches!(
             tag,
             EventTag::ToolCall | EventTag::ToolExecutionStart | EventTag::ToolExecutionUpdate
         ));
-        Self { tag, payload: EventPayload { tool_call: EventToolCall { tool_call_id, tool_name, params } } }
+        Self {
+            tag,
+            payload: EventPayload {
+                tool_call: EventToolCall {
+                    tool_call_id,
+                    tool_name,
+                    params,
+                },
+            },
+        }
     }
 
     /// Build a tool-result event.
@@ -621,23 +672,41 @@ impl StablePluginEvent {
         result: StbString,
         is_error: bool,
     ) -> Self {
-        debug_assert!(matches!(tag, EventTag::ToolResult | EventTag::ToolExecutionEnd));
+        debug_assert!(matches!(
+            tag,
+            EventTag::ToolResult | EventTag::ToolExecutionEnd
+        ));
         Self {
             tag,
             payload: EventPayload {
-                tool_result: EventToolResult { tool_call_id, tool_name, result, is_error: is_error as u8 },
+                tool_result: EventToolResult {
+                    tool_call_id,
+                    tool_name,
+                    result,
+                    is_error: is_error as u8,
+                },
             },
         }
     }
 
     /// Build an error event.
     pub fn error(tag: EventTag, message: StbString) -> Self {
-        Self { tag, payload: EventPayload { error: EventError { message } } }
+        Self {
+            tag,
+            payload: EventPayload {
+                error: EventError { message },
+            },
+        }
     }
 
     /// Build a generic data event (JSON in `data`).
     pub fn data(tag: EventTag, data: StbString) -> Self {
-        Self { tag, payload: EventPayload { data: EventData { data } } }
+        Self {
+            tag,
+            payload: EventPayload {
+                data: EventData { data },
+            },
+        }
     }
 }
 
@@ -713,7 +782,8 @@ pub type CommandHandlerFn =
 
 /// A render/transform fn (for the renderer registrars). `input_json` is borrowed;
 /// `out` is owning output the plugin frees via host `free_string`.
-pub type RenderFn = extern "C" fn(input_json: StbStringRef, out: *mut StbString, user_data: *mut c_void) -> i32;
+pub type RenderFn =
+    extern "C" fn(input_json: StbStringRef, out: *mut StbString, user_data: *mut c_void) -> i32;
 
 /// A provider-injection factory fn (for `register_provider`). `req_json` is a
 /// borrowed request envelope; `out` is an owning response the plugin frees.
@@ -741,7 +811,6 @@ pub struct PluginApiVt {
     pub free_string: FreeStringFn,
 
     // --- 8 registrars (plugin → host "register X into the host") ---
-
     /// Register a tool. `schema` + the four lifecycle fns + the plugin's own
     /// `free_string` (for the [`StbString`]s in `schema`). Returns `0` on
     /// success. Nullable: host not yet wired for tool registration.
@@ -757,10 +826,17 @@ pub struct PluginApiVt {
     >,
 
     /// Register a slash command. Nullable.
-    pub register_command: Option<extern "C" fn(name: StbStringRef, description: StbStringRef, handler: CommandHandlerFn) -> i32>,
+    pub register_command: Option<
+        extern "C" fn(
+            name: StbStringRef,
+            description: StbStringRef,
+            handler: CommandHandlerFn,
+        ) -> i32,
+    >,
 
     /// Register a keyboard shortcut. Nullable.
-    pub register_shortcut: Option<extern "C" fn(key: StbStringRef, description: StbStringRef) -> i32>,
+    pub register_shortcut:
+        Option<extern "C" fn(key: StbStringRef, description: StbStringRef) -> i32>,
 
     /// Register a CLI flag. Nullable.
     pub register_flag: Option<extern "C" fn(name: StbStringRef, description: StbStringRef) -> i32>,
@@ -817,11 +893,12 @@ pub struct PluginApiVt {
     >,
 
     // --- on() event handler registration (the 33-category subscription) ---
-
     /// Subscribe a handler to one event `tag`. Nullable: host not yet wiring
     /// events. The host dispatches [`StablePluginEvent`]s of that tag to the
     /// handler (`catch_unwind`-wrapped).
-    pub register_event_handler: Option<extern "C" fn(tag: EventTag, handler: EventHandlerFn, user_data: *mut c_void) -> i32>,
+    pub register_event_handler: Option<
+        extern "C" fn(tag: EventTag, handler: EventHandlerFn, user_data: *mut c_void) -> i32,
+    >,
 
     /// Register a `resources_discover` handler (B5b). The host stores `handler`
     /// + the plugin's own `plugin_free_string` (the `out` [`StbString`] the
@@ -832,21 +909,24 @@ pub struct PluginApiVt {
     /// the fan-out). Nullable: a host without the resources-discover path leaves
     /// this null and the plugin must degrade (no dynamic resource contribution).
     pub register_resources_discover: Option<
-        extern "C" fn(handler: ResourcesDiscoverFn, plugin_free_string: FreeStringFn, user_data: *mut c_void) -> i32,
+        extern "C" fn(
+            handler: ResourcesDiscoverFn,
+            plugin_free_string: FreeStringFn,
+            user_data: *mut c_void,
+        ) -> i32,
     >,
 
     // --- runtime actions (~14, uniform dispatch) ---
-
     /// Invoke a host runtime action. See [`RuntimeActionId`] / [`RuntimeActionFn`].
     /// Nullable: host not yet exposing actions.
     pub runtime_action: RuntimeActionFn,
 
     // --- event dispatch (plugin → host "emit an event upstream") ---
-
     /// Emit an event upstream (e.g. a tool announcing a custom UI event). The
     /// host forwards to interested subscribers. Ownership of the event's
     /// [`StbString`]s passes to the host (freed via `free_string`). Nullable.
-    pub dispatch_event: Option<extern "C" fn(event: StablePluginEvent, user_data: *mut c_void) -> i32>,
+    pub dispatch_event:
+        Option<extern "C" fn(event: StablePluginEvent, user_data: *mut c_void) -> i32>,
 
     /// The host's opaque context, passed through to every host-provided fn.
     /// The plugin stores this and hands it back unmodified on each call.
@@ -999,7 +1079,10 @@ mod tests {
         assert_eq!(sr.tag, StepResultTag::Done);
         // SAFETY: tag == Done.
         let done = unsafe { sr.done_payload() };
-        assert_eq!(done.result.to_string_lossy(), r#"{"content":[{"text":"hi"}]}"#);
+        assert_eq!(
+            done.result.to_string_lossy(),
+            r#"{"content":[{"text":"hi"}]}"#
+        );
         done.result.free_with(Some(test_free));
         let _ = reset_freed();
     }

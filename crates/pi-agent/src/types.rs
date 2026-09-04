@@ -172,7 +172,14 @@ impl std::fmt::Debug for AgentContext {
         f.debug_struct("AgentContext")
             .field("system_prompt", &self.system_prompt)
             .field("messages", &self.messages)
-            .field("tools", &self.tools.iter().map(|t| t.schema().name.as_str()).collect::<Vec<_>>())
+            .field(
+                "tools",
+                &self
+                    .tools
+                    .iter()
+                    .map(|t| t.schema().name.as_str())
+                    .collect::<Vec<_>>(),
+            )
             .finish()
     }
 }
@@ -217,7 +224,14 @@ impl std::fmt::Debug for AgentState {
             .field("system_prompt", &self.system_prompt)
             .field("model", &self.model)
             .field("thinking_level", &self.thinking_level)
-            .field("tools", &self.tools.iter().map(|t| t.schema().name.as_str()).collect::<Vec<_>>())
+            .field(
+                "tools",
+                &self
+                    .tools
+                    .iter()
+                    .map(|t| t.schema().name.as_str())
+                    .collect::<Vec<_>>(),
+            )
             .field("messages", &self.messages)
             .field("is_streaming", &self.is_streaming)
             .field("streaming_message", &self.streaming_message)
@@ -245,5 +259,11 @@ impl Default for AgentState {
 
 /// The placeholder model used when none is configured. Mirrors TS `DEFAULT_MODEL`.
 pub(crate) fn default_model() -> rpi_ai::model::Model {
-    rpi_ai::model::Model::new("unknown", "unknown", rpi_ai::types::Api::Other("unknown".into()), "unknown", "")
+    rpi_ai::model::Model::new(
+        "unknown",
+        "unknown",
+        rpi_ai::types::Api::Other("unknown".into()),
+        "unknown",
+        "",
+    )
 }

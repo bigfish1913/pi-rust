@@ -23,11 +23,13 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use crate::env::FileKind;
 use crate::env::ExecutionEnv;
+use crate::env::FileKind;
 use crate::path_utils::resolve_read_tool_path;
 use crate::tools::tool_context::ExecutionToolContext;
-use crate::truncate::{format_size, truncate_head, TruncationOptions, TruncationResult, DEFAULT_MAX_BYTES};
+use crate::truncate::{
+    format_size, truncate_head, TruncationOptions, TruncationResult, DEFAULT_MAX_BYTES,
+};
 
 /// Default max entries. Mirrors TS `ls.ts::DEFAULT_LIMIT`.
 const DEFAULT_LIMIT: u32 = 500;
@@ -83,7 +85,10 @@ impl LsTool {
 }
 
 /// Build the `ls` tool from a context. Mirrors TS `createLsTool`.
-pub fn create_ls_tool(context: &ExecutionToolContext, options: Option<LsToolOptions>) -> Arc<dyn AgentTool> {
+pub fn create_ls_tool(
+    context: &ExecutionToolContext,
+    options: Option<LsToolOptions>,
+) -> Arc<dyn AgentTool> {
     let _ = options; // no options surface in v1 (forward-compat seam)
     Arc::new(LsTool {
         schema: LsTool::schema(),
@@ -114,23 +119,37 @@ impl AgentTool for LsTool {
         let effective_limit = input.limit.unwrap_or(DEFAULT_LIMIT).max(1) as usize;
 
         // Resolve the directory path (read-only resolution + fuzzy variants).
-        let dir_path = resolve_read_tool_path(&*self.env, input.path.as_deref().unwrap_or("."), cancel)
-            .await
-            .map_err(file_err_to_agent)?;
+        let dir_path =
+            resolve_read_tool_path(&*self.env, input.path.as_deref().unwrap_or("."), cancel)
+                .await
+                .map_err(file_err_to_agent)?;
 
         // Path-not-found.
-        if !self.env.exists(&dir_path, cancel).await.map_err(file_err_to_agent)? {
+        if !self
+            .env
+            .exists(&dir_path, cancel)
+            .await
+            .map_err(file_err_to_agent)?
+        {
             return Err(AgentError::Tool(format!("Path not found: {dir_path}")));
         }
         // Must be a directory.
-        let info = self.env.file_info(&dir_path, cancel).await.map_err(file_err_to_agent)?;
+        let info = self
+            .env
+            .file_info(&dir_path, cancel)
+            .await
+            .map_err(file_err_to_agent)?;
         if info.kind != FileKind::Directory {
             return Err(AgentError::Tool(format!("Not a directory: {dir_path}")));
         }
 
         // Read entries. (TS wraps readdir in try/catch → "Cannot read directory";
         // the env surfaces that as a FileError which we map here.)
-        let mut entries = self.env.list_dir(&dir_path, cancel).await.map_err(file_err_to_agent)?;
+        let mut entries = self
+            .env
+            .list_dir(&dir_path, cancel)
+            .await
+            .map_err(file_err_to_agent)?;
 
         // Sort alphabetically, case-insensitive. Mirrors TS
         // `entries.sort((a,b) => a.toLowerCase().localeCompare(b.toLowerCase()))`.
@@ -144,7 +163,11 @@ impl AgentTool for LsTool {
                 entry_limit_reached = true;
                 break;
             }
-            let suffix = if entry.kind == FileKind::Directory { "/" } else { "" };
+            let suffix = if entry.kind == FileKind::Directory {
+                "/"
+            } else {
+                ""
+            };
             results.push(format!("{}{suffix}", entry.name));
         }
 

@@ -26,13 +26,10 @@ const NARROW_NO_BREAK_SPACE: char = '\u{202F}';
 /// Replace unicode spaces with ASCII space and strip a leading `@`. Mirrors
 /// `normalizeToolPath`.
 pub fn normalize_tool_path(path: &str) -> String {
-    let mut out: String = path.chars().map(|c| {
-        if UNICODE_SPACES.contains(&c) {
-            ' '
-        } else {
-            c
-        }
-    }).collect();
+    let mut out: String = path
+        .chars()
+        .map(|c| if UNICODE_SPACES.contains(&c) { ' ' } else { c })
+        .collect();
     if out.starts_with('@') {
         out.remove(0);
     }
@@ -79,7 +76,10 @@ pub async fn resolve_read_tool_path(
 
     // Dedupe preserving insertion order.
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let deduped: Vec<String> = variants.into_iter().filter(|v| seen.insert(v.clone())).collect();
+    let deduped: Vec<String> = variants
+        .into_iter()
+        .filter(|v| seen.insert(v.clone()))
+        .collect();
 
     for variant in &deduped {
         if env.exists(variant, cancel).await? {

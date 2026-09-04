@@ -38,7 +38,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use rpi_ai::{Api, InputModality, Model};
+use rpi_ai::{Api, InputModality, Model, StreamingProtocolCompat};
 
 /// The config directory name under the home dir. Upstream is `.pi`; rpi uses
 /// `.rpi` to avoid colliding with a native `pi` install on the same machine.
@@ -65,11 +65,23 @@ pub enum ConfigError {
     #[error("config dir override {env}={val:?} is not an absolute path")]
     RelativeOverride { env: &'static str, val: String },
     #[error("could not read {path}: {source}")]
-    Read { path: PathBuf, #[source] source: std::io::Error },
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("could not write {path}: {source}")]
-    Write { path: PathBuf, #[source] source: std::io::Error },
+    Write {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("invalid JSON in {path}: {source}")]
-    Json { path: PathBuf, #[source] source: serde_json::Error },
+    Json {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -92,8 +104,9 @@ pub fn agent_dir() -> Result<PathBuf, ConfigError> {
         }
         return Ok(p);
     }
-    let home = dirs::home_dir()
-        .ok_or(ConfigError::NoHomeDir { env: CONFIG_DIR_ENV })?;
+    let home = dirs::home_dir().ok_or(ConfigError::NoHomeDir {
+        env: CONFIG_DIR_ENV,
+    })?;
     Ok(home.join(CONFIG_DIR_NAME).join("agent"))
 }
 
@@ -105,7 +118,9 @@ fn config_root_dir() -> Result<PathBuf, ConfigError> {
     agent
         .parent()
         .map(Path::to_path_buf)
-        .ok_or(ConfigError::NoHomeDir { env: CONFIG_DIR_ENV })
+        .ok_or(ConfigError::NoHomeDir {
+            env: CONFIG_DIR_ENV,
+        })
 }
 
 /// `~/.rpi/agent/auth.json`.
@@ -324,6 +339,8 @@ pub struct ModelDefinition {
     pub input: Option<Vec<String>>,
     #[serde(default)]
     pub headers: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub compat: Option<serde_json::Value>,
 }
 
 /// Load `~/.rpi/models.json`. Missing file ⇒ empty config (no error).
@@ -425,8 +442,7 @@ fn find_line_comment(line: &str) -> Option<usize> {
 
 /// A process-lifetime cache for `!command` resolutions, mirroring pi's
 /// `commandResultCache`. Keyed by the raw `!cmd` string (including the `!`).
-fn command_cache(
-) -> &'static std::sync::Mutex<std::collections::HashMap<String, Option<String>>> {
+fn command_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, Option<String>>> {
     static CACHE: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<String, Option<String>>>,
     > = std::sync::OnceLock::new();
@@ -672,7 +688,6 @@ fn resolve_command_uncached(cmd: &str) -> Option<String> {
     }
 }
 
-
 /// (`anthropic-messages`, or omitted/unknown). Unknown `api` is allowed through
 /// for forward-compat but flagged ignored-in-v1 in the docs. Public so
 /// [`crate::provider`] can scan models.json providers for an `authHeader:true`
@@ -684,18 +699,26 @@ pub fn provider_is_anthropic_compatible(cfg: &ProviderConfig) -> bool {
     }
 }
 
+/// Whether a configured provider uses the OpenAI Chat Completions protocol.
+pub fn provider_is_openai_completions(cfg: &ProviderConfig) -> bool {
+    matches!(cfg.api.as_deref(), Some("openai-completions"))
+}
+
 /// Convert a `(provider_id, ProviderConfig)` pair into a list of library
 /// [`Model`]s. Provider-level `base_url`/`headers`/`auth_header` fold into each
-/// model. Returns `None` for non-anthropic providers (v1 ignores them).
-pub fn provider_to_models(
-    provider_id: &str,
-    cfg: &ProviderConfig,
-) -> Option<Vec<Model>> {
-    let _ = provider_id; // config-namespacing only; v1 routes via the single AnthropicProvider.
-    if !provider_is_anthropic_compatible(cfg) {
+/// model. Returns `None` for protocols that do not have a runtime provider.
+pub fn provider_to_models(provider_id: &str, cfg: &ProviderConfig) -> Option<Vec<Model>> {
+    let api = if provider_is_anthropic_compatible(cfg) {
+        Api::AnthropicMessages
+    } else if provider_is_openai_completions(cfg) {
+        Api::OpenaiCompletions
+    } else {
         return None;
-    }
-    let provider_base = cfg.base_url.clone().unwrap_or_else(default_anthropic_base_url);
+    };
+    let provider_base = cfg.base_url.clone().unwrap_or_else(|| match api {
+        Api::OpenaiCompletions => "https://api.openai.com".to_string(),
+        _ => default_anthropic_base_url(),
+    });
     let mut merged: Vec<Model> = Vec::with_capacity(cfg.models.len());
     for def in &cfg.models {
         let base_url = def
@@ -715,11 +738,15 @@ pub fn provider_to_models(
         // `provider = "gateway"` and the run would fail with "No provider
         // registered for 'gateway'". Divergence documented in
         // `docs/m6-cli-open-questions.md`.
+        let runtime_provider = match api {
+            Api::OpenaiCompletions => provider_id,
+            _ => DEFAULT_PROVIDER_ID,
+        };
         let mut m = Model::new(
             def.id.clone(),
             name,
-            Api::AnthropicMessages,
-            DEFAULT_PROVIDER_ID.to_string(),
+            api.clone(),
+            runtime_provider.to_string(),
             base_url,
         );
         m.reasoning = def.reasoning.unwrap_or(false);
@@ -750,6 +777,22 @@ pub fn provider_to_models(
                 headers.insert(k, v);
             }
         }
+        if matches!(api, Api::OpenaiCompletions) {
+            if let Some(key) = cfg
+                .api_key
+                .as_deref()
+                .filter(|key| !key.is_empty())
+                .and_then(|key| resolve_config_value(key, None))
+            {
+                headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
+                headers.insert("authorization".to_string(), format!("Bearer {key}"));
+            }
+            if let Some(value) = def.compat.clone() {
+                if let Ok(compat) = serde_json::from_value(value) {
+                    m.compat = Some(StreamingProtocolCompat::OpenaiCompletions(compat));
+                }
+            }
+        }
         if !headers.is_empty() {
             m.headers = Some(headers);
         }
@@ -772,7 +815,13 @@ fn parse_input_modalities(input: Option<&[String]>) -> Vec<InputModality> {
                 _ => None,
             })
             .collect::<Vec<_>>()
-            .pipe(|v| if v.is_empty() { vec![InputModality::Text] } else { v }),
+            .pipe(|v| {
+                if v.is_empty() {
+                    vec![InputModality::Text]
+                } else {
+                    v
+                }
+            }),
     }
 }
 
@@ -817,17 +866,18 @@ fn ensure_dir(dir: &Path) -> Result<(), ConfigError> {
 /// Write `bytes` to `path` atomically: a temp sibling → `rename`. The temp
 /// file lives next to the target so the rename stays on one filesystem.
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
-    let dir = path
-        .parent()
-        .ok_or_else(|| ConfigError::Write {
-            path: path.to_path_buf(),
-            source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent"),
-        })?;
+    let dir = path.parent().ok_or_else(|| ConfigError::Write {
+        path: path.to_path_buf(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent"),
+    })?;
     let tmp = dir.join(format!(
         ".{}.tmp",
         path.file_name().and_then(|n| n.to_str()).unwrap_or("rpi")
     ));
-    std::fs::write(&tmp, bytes).map_err(|e| ConfigError::Write { path: tmp.clone(), source: e })?;
+    std::fs::write(&tmp, bytes).map_err(|e| ConfigError::Write {
+        path: tmp.clone(),
+        source: e,
+    })?;
     std::fs::rename(&tmp, path).map_err(|e| ConfigError::Write {
         path: path.to_path_buf(),
         source: e,
@@ -840,10 +890,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
 fn set_owner_only(_path: &Path) {
     #[cfg(unix)]
     {
-        let _ = std::fs::set_permissions(
-            _path,
-            std::fs::Permissions::from_mode(0o600),
-        );
+        let _ = std::fs::set_permissions(_path, std::fs::Permissions::from_mode(0o600));
     }
 }
 
@@ -893,7 +940,11 @@ mod tests {
             let prev = std::env::var_os(CONFIG_DIR_ENV);
             let tmp = tempfile::TempDir::new().unwrap();
             std::env::set_var(CONFIG_DIR_ENV, tmp.path());
-            Self { _guard: guard, _tmp: tmp, prev }
+            Self {
+                _guard: guard,
+                _tmp: tmp,
+                prev,
+            }
         }
     }
     impl Drop for TempConfig {
@@ -914,7 +965,10 @@ mod tests {
         let _cfg = TempConfig::new();
         upsert_credential(
             "anthropic",
-            Credential::ApiKey { key: Some("sk-test-123".into()), env: None },
+            Credential::ApiKey {
+                key: Some("sk-test-123".into()),
+                env: None,
+            },
         )
         .unwrap();
         let store = read_auth().unwrap();
@@ -933,8 +987,14 @@ mod tests {
     #[test]
     fn delete_credential_removes_entry() {
         let _cfg = TempConfig::new();
-        upsert_credential("anthropic", Credential::ApiKey { key: Some("k".into()), env: None })
-            .unwrap();
+        upsert_credential(
+            "anthropic",
+            Credential::ApiKey {
+                key: Some("k".into()),
+                env: None,
+            },
+        )
+        .unwrap();
         assert!(delete_credential("anthropic").unwrap());
         // Second delete is a no-op.
         assert!(!delete_credential("anthropic").unwrap());
@@ -966,7 +1026,10 @@ mod tests {
 }"#;
         std::fs::write(models_path().unwrap(), json).unwrap();
         let c = load_models_config().unwrap();
-        let gw = c.providers.get("gateway").expect("gateway provider present");
+        let gw = c
+            .providers
+            .get("gateway")
+            .expect("gateway provider present");
         assert_eq!(gw.base_url.as_deref(), Some("https://gw.example.com"));
         assert!(gw.auth_header.unwrap_or(false));
         assert_eq!(gw.models.len(), 1);
@@ -1000,6 +1063,7 @@ mod tests {
                 max_tokens: None,
                 input: None,
                 headers: None,
+                compat: None,
             }],
         };
         let models = provider_to_models("gateway", &cfg).expect("anthropic-compatible");
@@ -1028,17 +1092,33 @@ mod tests {
     }
 
     #[test]
-    fn provider_to_models_ignores_non_anthropic_api() {
-        let cfg = ProviderConfig {
-            name: None,
-            base_url: None,
-            api_key: None,
-            api: Some("openai-completions".into()),
-            headers: None,
-            auth_header: None,
-            models: vec![],
-        };
-        assert!(provider_to_models("oai", &cfg).is_none());
+    fn provider_to_models_supports_openai_completions() {
+        let config: ModelsConfig = serde_json::from_str(
+            r#"{
+                "providers": {
+                    "oai": {
+                        "api": "openai-completions",
+                        "baseUrl": "https://gateway.example.com/v1",
+                        "apiKey": "secret",
+                        "models": [{"id":"gpt-test","maxTokens":4096}]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let models = provider_to_models("oai", &config.providers["oai"]).unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].api, Api::OpenaiCompletions);
+        assert_eq!(models[0].provider, "oai");
+        assert_eq!(models[0].max_tokens, 4096);
+        assert_eq!(
+            models[0]
+                .headers
+                .as_ref()
+                .and_then(|headers| headers.get("authorization"))
+                .map(String::as_str),
+            Some("Bearer secret")
+        );
     }
 
     #[test]
@@ -1132,13 +1212,19 @@ mod tests {
         let store = read_trust().unwrap();
         assert_eq!(store.len(), 3);
         assert_eq!(store.get("/home/me/proj").copied().flatten(), Some(true));
-        assert_eq!(store.get("/home/me/untrusted").copied().flatten(), Some(false));
+        assert_eq!(
+            store.get("/home/me/untrusted").copied().flatten(),
+            Some(false)
+        );
         assert_eq!(store.get("/home/me/null").copied().flatten(), None);
     }
 
     #[test]
     fn resolve_config_value_literal_passthrough() {
-        assert_eq!(resolve_config_value("sk-literal-key", None), Some("sk-literal-key".into()));
+        assert_eq!(
+            resolve_config_value("sk-literal-key", None),
+            Some("sk-literal-key".into())
+        );
     }
 
     #[test]
@@ -1188,7 +1274,10 @@ mod tests {
 
     #[test]
     fn resolve_config_value_dollar_dollar_escapes_literal() {
-        assert_eq!(resolve_config_value("price-$$5", None), Some("price-$5".into()));
+        assert_eq!(
+            resolve_config_value("price-$$5", None),
+            Some("price-$5".into())
+        );
         assert_eq!(resolve_config_value("$!bang", None), Some("!bang".into()));
     }
 
@@ -1200,10 +1289,7 @@ mod tests {
             Some("rpi-cfg-resolved".into())
         );
         // Non-zero exit ⇒ None.
-        assert_eq!(
-            resolve_config_value_uncached("!false", None),
-            None
-        );
+        assert_eq!(resolve_config_value_uncached("!false", None), None);
     }
 
     #[test]
@@ -1218,7 +1304,10 @@ mod tests {
         let resolved = resolve_headers(&h, None);
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved.get("x-set").map(|s| s.as_str()), Some("set-value"));
-        assert_eq!(resolved.get("x-literal").map(|s| s.as_str()), Some("literal-value"));
+        assert_eq!(
+            resolved.get("x-literal").map(|s| s.as_str()),
+            Some("literal-value")
+        );
         assert!(!resolved.contains_key("x-unset"));
         restore_env("RPI_TEST_HDR_SET", prev);
     }

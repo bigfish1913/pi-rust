@@ -180,9 +180,8 @@ impl KeyHelper {
 
 /// Symbol keys set.
 const SYMBOL_KEYS: &[&str] = &[
-    "`", "-", "=", "[", "]", "\\", ";", "'", ",", ".", "/",
-    "!", "@", "#", "$", "%", "^", "&", "*", "(", ")",
-    "_", "+", "|", "~", "{", "}", ":", "<", ">", "?",
+    "`", "-", "=", "[", "]", "\\", ";", "'", ",", ".", "/", "!", "@", "#", "$", "%", "^", "&", "*",
+    "(", ")", "_", "+", "|", "~", "{", "}", ":", "<", ">", "?",
 ];
 
 /// Check if a key is a symbol key.
@@ -232,7 +231,7 @@ fn parse_single_char(c: char) -> Option<Key> {
             return Some(Key::new(KeyHelper::ctrl(&letter.to_string())));
         }
         0x08 => return Some(Key::new(KeyHelper::BACKSPACE)), // Ctrl+H = Backspace
-        0x09 => return Some(Key::new(KeyHelper::TAB)), // Ctrl+I = Tab
+        0x09 => return Some(Key::new(KeyHelper::TAB)),       // Ctrl+I = Tab
         0x0a | 0x0d => return Some(Key::new(KeyHelper::ENTER)), // Ctrl+J/M = Enter
         0x0b..=0x1a => {
             // Ctrl+K to Ctrl+Z
@@ -346,12 +345,11 @@ fn parse_csi_sequence(data: &str) -> Option<Key> {
         _ => return None,
     };
 
-    Some(key)
-        .map(|mut k| {
-            k.modifiers.extend(modifiers);
-            k.event_type = event_type;
-            k
-        })
+    Some(key).map(|mut k| {
+        k.modifiers.extend(modifiers);
+        k.event_type = event_type;
+        k
+    })
 }
 
 /// Parse CSI tilde key (~ sequences).
@@ -396,7 +394,7 @@ fn parse_ss3_sequence(data: &str) -> Option<Key> {
 /// Decode Kitty printable character (CSI-u).
 fn decode_kitty_printable(params: &[u32]) -> Option<Key> {
     let code = params.first().copied().unwrap_or(0);
-    
+
     // Printable ASCII
     if code >= 32 && code < 127 {
         let c = code as u8 as char;
@@ -456,7 +454,7 @@ pub fn is_key_repeat(data: &str) -> bool {
 /// Returns the printable character if this is a Kitty CSI-u sequence.
 pub fn decode_kitty_printable_from_str(data: &str) -> Option<String> {
     let bytes = data.as_bytes();
-    
+
     // Must be a CSI sequence ending with 'u'
     if data.starts_with("\x1b[") && bytes.last()? == &b'u' {
         // Parse parameters
@@ -465,16 +463,16 @@ pub fn decode_kitty_printable_from_str(data: &str) -> Option<String> {
             .split(';')
             .filter_map(|s| s.parse().ok())
             .collect();
-        
+
         let code = params.first().copied().unwrap_or(0);
-        
+
         // Printable ASCII
         if code >= 32 && code < 127 {
             let c = code as u8 as char;
             return Some(c.to_string());
         }
     }
-    
+
     None
 }
 
@@ -505,7 +503,7 @@ mod tests {
     fn test_arrow_keys() {
         let key = parse_key("\x1b[A").unwrap();
         assert_eq!(key.key, KeyHelper::UP);
-        
+
         let key = parse_key("\x1b[B").unwrap();
         assert_eq!(key.key, KeyHelper::DOWN);
     }

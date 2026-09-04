@@ -24,8 +24,8 @@ pub mod diff;
 pub mod dynamic_border;
 pub mod earendil;
 pub mod editor;
-pub mod fuzzy;
 pub mod footer;
+pub mod fuzzy;
 pub mod hstack;
 pub mod image;
 pub mod input;
@@ -33,9 +33,9 @@ pub mod keybinding_hints;
 pub mod keybindings;
 pub mod keys;
 pub mod kill_ring;
+pub mod latex;
 pub mod layout;
 pub mod layout_node;
-pub mod latex;
 pub mod loader;
 pub mod markdown;
 pub mod overlay;
@@ -88,24 +88,26 @@ pub use fuzzy::{fuzzy_filter, fuzzy_match, FuzzyMatch};
 pub use hstack::HStack;
 pub use image::{Image, ImageOptions, ImageTheme};
 pub use input::Input;
-pub use keybinding_hints::{format_combo, key_code_name, key_display_text, key_hint, key_text, raw_key_hint};
+pub use keybinding_hints::{
+    format_combo, key_code_name, key_display_text, key_hint, key_text, raw_key_hint,
+};
 pub use keybindings::{
-    get_keybindings, set_keybindings, KeybindingConflict, KeybindingDefinition,
-    KeybindingId, Keybindings, KeyCombo,
+    get_keybindings, set_keybindings, KeyCombo, KeybindingConflict, KeybindingDefinition,
+    KeybindingId, Keybindings,
 };
 pub use keys::{
     is_key_release, is_key_repeat, is_kitty_protocol_active, matches_key, parse_key,
     set_kitty_protocol_active, Key, KeyEventType, KeyHelper, KeyId,
 };
 pub use kill_ring::{KillRing, PushOptions};
+pub use latex::{is_latex, render_latex, strip_latex, RenderLatexOptions};
 pub use layout::{
-    composite_tui_line, extract_cursor_position, hit_test, render_layout_frame,
-    LayoutBox, LayoutFrame, LayoutRect,
+    composite_tui_line, extract_cursor_position, hit_test, render_layout_frame, LayoutBox,
+    LayoutFrame, LayoutRect,
 };
 pub use layout_node::{
     allocate_stack_sizes, LayoutNode, LayoutNodeProvider, LayoutViewport, StackLayoutEntry,
 };
-pub use latex::{is_latex, render_latex, strip_latex, RenderLatexOptions};
 pub use loader::{CancellableLoader, Loader, LoaderIndicatorOptions, ProgressLoader};
 pub use markdown::{Markdown, MarkdownOptions};
 pub use overlay::{Dialog, OverlayHandle, OverlayManager, Selector, SelectorItem};
@@ -117,9 +119,8 @@ pub use status_indicator::{CompactionReason, IdleStatus, StatusIndicator, Status
 pub use stdin_buffer::{StdinBuffer, StdinBufferEvent, StdinBufferOptions};
 pub use terminal::{InputEvent, ProcessTerminal, Terminal, TerminalError, TerminalInfo};
 pub use terminal_colors::{
-    parse_osc11_background_color, parse_terminal_color_scheme_report,
-    query_background_color, query_color_scheme, query_cursor_color, query_foreground_color,
-    RgbColor, TerminalColorScheme,
+    parse_osc11_background_color, parse_terminal_color_scheme_report, query_background_color,
+    query_color_scheme, query_cursor_color, query_foreground_color, RgbColor, TerminalColorScheme,
 };
 pub use terminal_image::{
     allocate_image_id, calculate_image_rows, delete_all_kitty_images, delete_kitty_image,
@@ -130,28 +131,31 @@ pub use terminal_image::{
     ImageRenderOptions, TerminalCapabilities,
 };
 pub use text::Text;
-pub use theme::{theme, Color, Theme, ThemeColors, ThemeManager, ThemePreset};
+pub use theme::{
+    apply_theme_preset, global_theme_manager, theme, Color, Theme, ThemeColors, ThemeManager,
+    ThemePreset,
+};
 pub use tool_execution::{ToolExecutionComponent, ToolStatus};
 pub use truncated_text::TruncatedText;
 pub use tui::{
-    OverlayAnchor, OverlayHandle as TuiOverlayHandle, OverlayMargin,
-    OverlayOptions, TuiMode, TuiStopOptions, TUI,
+    OverlayAnchor, OverlayHandle as TuiOverlayHandle, OverlayMargin, OverlayOptions, TuiMode,
+    TuiStopOptions, TUI,
 };
 pub use tui_alt_screen::{is_viewport_tui, TuiAltScreen, VIEWPORT_TUI};
 pub use tui_main_screen::TuiMainScreen;
 pub use undo_stack::{RedoStack, UndoRedoManager, UndoStack};
 pub use user_message::UserMessageComponent;
 pub use utils::{
-    apply_background_to_line, get_grapheme_segmenter, get_osc8_link_at_column,
-    is_whitespace_char, slice_by_column, truncate_to_width,
-    visible_width as visible_width_util, wrap_text_with_ansi, Grapheme, GraphemeSegmenter,
+    apply_background_to_line, get_grapheme_segmenter, get_osc8_link_at_column, is_whitespace_char,
+    slice_by_column, truncate_to_width, visible_width as visible_width_util, wrap_text_with_ansi,
+    Grapheme, GraphemeSegmenter,
 };
 pub use visual_truncate::{truncate_to_visual_lines, VisualTruncateResult};
 pub use vstack::{
-    layout_vstack_constrained, StackAlign, StackChild, StackEntry, StackEntryOptions,
-    StackOptions, VStack,
+    layout_vstack_constrained, StackAlign, StackChild, StackEntry, StackEntryOptions, StackOptions,
+    VStack,
 };
 pub use word_navigation::{
-    find_word_backward, find_word_end, find_word_forward, find_line_end, find_line_start,
+    find_line_end, find_line_start, find_word_backward, find_word_end, find_word_forward,
     get_current_word_range, is_at_word_end, is_at_word_start, is_word_boundary, is_word_char,
 };

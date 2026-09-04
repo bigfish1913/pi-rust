@@ -31,7 +31,11 @@ impl SpanOptions {
         }
     }
 
-    pub fn with_attribute(mut self, key: impl Into<String>, value: impl Into<AttributeValue>) -> Self {
+    pub fn with_attribute(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<AttributeValue>,
+    ) -> Self {
         self.attributes.insert(key.into(), value.into());
         self
     }

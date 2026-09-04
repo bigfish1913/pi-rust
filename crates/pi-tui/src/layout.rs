@@ -25,7 +25,12 @@ pub struct LayoutRect {
 
 impl LayoutRect {
     pub fn new(x: usize, y: usize, width: usize, height: usize) -> Self {
-        Self { x, y, width, height }
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
     }
 
     /// Check if a point is inside this rectangle.
@@ -123,6 +128,7 @@ struct LayoutContext {
     #[allow(dead_code)]
     viewport: LayoutViewport,
     primary_scroll_view: Option<Arc<ScrollView>>,
+    reuse_scroll_content: bool,
 }
 
 impl LayoutContext {
@@ -136,19 +142,38 @@ impl LayoutContext {
 }
 
 /// Render a component tree into a layout frame with constrained layout.
-pub fn render_layout_frame(
+pub fn render_layout_frame(root: Arc<dyn Component>, width: usize, height: usize) -> LayoutFrame {
+    render_layout_frame_impl(root, width, height, false)
+}
+
+/// Render a frame where only scroll positions and non-scroll content changed.
+/// Scroll views may reuse their last full child rendering.
+pub(crate) fn render_layout_frame_reusing_scroll_content(
     root: Arc<dyn Component>,
     width: usize,
     height: usize,
 ) -> LayoutFrame {
+    render_layout_frame_impl(root, width, height, true)
+}
+
+fn render_layout_frame_impl(
+    root: Arc<dyn Component>,
+    width: usize,
+    height: usize,
+    reuse_scroll_content: bool,
+) -> LayoutFrame {
     let safe_width = width.max(1);
     let safe_height = height.max(1);
-    
+
     let mut context = LayoutContext {
-        viewport: LayoutViewport { width: safe_width, height: safe_height },
+        viewport: LayoutViewport {
+            width: safe_width,
+            height: safe_height,
+        },
         primary_scroll_view: None,
+        reuse_scroll_content,
     };
-    
+
     let root_box = layout_component(
         &root,
         0,
@@ -158,13 +183,13 @@ pub fn render_layout_frame(
         LayoutRect::new(0, 0, safe_width, safe_height),
         &mut context,
     );
-    
+
     let mut frame = LayoutFrame::new(root_box, safe_width, safe_height);
     frame.primary_scroll_view = context.primary_scroll_view;
-    
+
     // Paint the root box into the screen lines
     paint_box(&frame.root, &mut frame.lines, safe_width);
-    
+
     frame
 }
 
@@ -210,7 +235,13 @@ fn layout_component(
     let line_offset = if lines.len() > allocated_height && allocated_height > 0 {
         let cursor_line = lines.iter().position(|line| line.contains(CURSOR_MARKER));
         cursor_line
-            .map(|idx| if idx >= allocated_height { idx - allocated_height + 1 } else { 0 })
+            .map(|idx| {
+                if idx >= allocated_height {
+                    idx - allocated_height + 1
+                } else {
+                    0
+                }
+            })
             .unwrap_or(0)
     } else {
         0
@@ -250,7 +281,11 @@ fn layout_vstack(
     // The box's own rect spans its full allocated height (or, when
     // unconstrained, the sum of child heights + gaps).
     let total_child_height: usize = allocated.iter().map(|(_, h)| *h).sum();
-    let total_gap = if children.len() > 1 { gap * (children.len() - 1) } else { 0 };
+    let total_gap = if children.len() > 1 {
+        gap * (children.len() - 1)
+    } else {
+        0
+    };
     let box_height = height.unwrap_or(total_child_height + total_gap);
 
     let rect = LayoutRect::new(x, y, width, box_height);
@@ -306,13 +341,24 @@ fn layout_scroll_view(
     context.register_scroll_view(&sv_arc);
 
     let allocated_height = height.unwrap_or_else(|| sv.render(width).len());
-    // `render_with_viewport` honors `scroll_top` and pads to `height`.
-    let lines = sv.render_with_viewport(width, allocated_height);
+    // Cached frames are used only for pure viewport movement or animation in
+    // the bottom dock. Ordinary content updates always refresh this cache.
+    let lines = if context.reuse_scroll_content {
+        sv.render_with_cached_content(width, allocated_height)
+    } else {
+        sv.render_with_viewport(width, allocated_height)
+    };
 
     let line_offset = if lines.len() > allocated_height && allocated_height > 0 {
         let cursor_line = lines.iter().position(|line| line.contains(CURSOR_MARKER));
         cursor_line
-            .map(|idx| if idx >= allocated_height { idx - allocated_height + 1 } else { 0 })
+            .map(|idx| {
+                if idx >= allocated_height {
+                    idx - allocated_height + 1
+                } else {
+                    0
+                }
+            })
             .unwrap_or(0)
     } else {
         0
@@ -361,23 +407,25 @@ fn update_clips(lbox: &mut LayoutBox, parent_clip: LayoutRect) {
 fn paint_box(lbox: &LayoutBox, screen: &mut [String], total_width: usize) {
     if let Some(ref lines) = lbox.lines {
         let offset = lbox.line_offset;
-        
+
         // Calculate visible row range
         let first_row = lbox.rect.y.max(lbox.clip.y);
-        let last_row = (lbox.rect.y + lbox.rect.height).min(lbox.clip.y + lbox.clip.height).min(screen.len());
-        
+        let last_row = (lbox.rect.y + lbox.rect.height)
+            .min(lbox.clip.y + lbox.clip.height)
+            .min(screen.len());
+
         for row in first_row..last_row {
             if row >= screen.len() {
                 break;
             }
-            
+
             let source_idx = offset + row.saturating_sub(lbox.rect.y);
             if source_idx >= lines.len() {
                 break;
             }
-            
+
             let source_line = &lines[source_idx];
-            
+
             // Composite the line into the screen
             if lbox.rect.x == 0 && lbox.rect.width >= total_width {
                 // Fast path: full-width box at left edge
@@ -394,7 +442,7 @@ fn paint_box(lbox: &LayoutBox, screen: &mut [String], total_width: usize) {
             }
         }
     }
-    
+
     // Paint children
     for child in &lbox.children {
         paint_box(child, screen, total_width);
@@ -402,57 +450,72 @@ fn paint_box(lbox: &LayoutBox, screen: &mut [String], total_width: usize) {
 }
 
 /// Composite an overlay line onto a base line at a given column position.
-pub fn composite_tui_line(base: &str, overlay: &str, start_col: usize, overlay_width: usize, total_width: usize) -> String {
+pub fn composite_tui_line(
+    base: &str,
+    overlay: &str,
+    start_col: usize,
+    overlay_width: usize,
+    total_width: usize,
+) -> String {
     let base_width = visible_width(base);
     let overlay_actual_width = visible_width(overlay);
-    
+
     // If overlay is empty or starts beyond total width, return base
     if overlay_actual_width == 0 || start_col >= total_width {
         return base.to_string();
     }
-    
+
     // Calculate the portion of overlay that fits
     let effective_width = overlay_width.min(total_width.saturating_sub(start_col));
-    
+
     // Slice or pad overlay to effective width
     let overlay_padded = if overlay_actual_width < effective_width {
         // Pad right
-        format!("{}{}", overlay, " ".repeat(effective_width - overlay_actual_width))
+        format!(
+            "{}{}",
+            overlay,
+            " ".repeat(effective_width - overlay_actual_width)
+        )
     } else if overlay_actual_width > effective_width {
         // Truncate
         slice_by_column(overlay, 0, effective_width, true)
     } else {
         overlay.to_string()
     };
-    
+
     // Build the composite line
     let before_width = start_col.min(base_width);
     let after_start = start_col + effective_width;
-    
+
     // Get before portion from base
     let before = if before_width > 0 {
         slice_by_column(base, 0, before_width, true)
     } else {
         String::new()
     };
-    
+
     // Get after portion from base
     let after = if after_start < base_width {
-        slice_by_column(base, after_start, base_width.saturating_sub(after_start), true)
+        slice_by_column(
+            base,
+            after_start,
+            base_width.saturating_sub(after_start),
+            true,
+        )
     } else {
         String::new()
     };
-    
+
     // Combine with resets to prevent style leakage
     const SEGMENT_RESET: &str = "\x1b[0m\x1b]8;;\x07";
-    
+
     // Calculate padding
     let before_pad = if visible_width(&before) < before_width {
         " ".repeat(before_width - visible_width(&before))
     } else {
         String::new()
     };
-    
+
     let after_pad = if after_start < total_width {
         let expected_after_width = total_width.saturating_sub(after_start);
         let actual_after_width = visible_width(&after);
@@ -464,8 +527,11 @@ pub fn composite_tui_line(base: &str, overlay: &str, start_col: usize, overlay_w
     } else {
         String::new()
     };
-    
-    format!("{}{}{}{}{}{}{}", before, before_pad, SEGMENT_RESET, overlay_padded, SEGMENT_RESET, after, after_pad)
+
+    format!(
+        "{}{}{}{}{}{}{}",
+        before, before_pad, SEGMENT_RESET, overlay_padded, SEGMENT_RESET, after, after_pad
+    )
 }
 
 /// Hit test to find the deepest box at a given coordinate.
@@ -478,19 +544,19 @@ fn hit_test_box(lbox: &LayoutBox, x: usize, y: usize) -> Option<&LayoutBox> {
     if !lbox.clip.contains(x, y) {
         return None;
     }
-    
+
     // Check if point is in rect
     if !lbox.rect.contains(x, y) {
         return None;
     }
-    
+
     // Check children first (front to back)
     for child in lbox.children.iter().rev() {
         if let Some(hit) = hit_test_box(child, x, y) {
             return Some(hit);
         }
     }
-    
+
     // Return this box if no child was hit
     Some(lbox)
 }
@@ -506,11 +572,11 @@ fn collect_scroll_views(lbox: &LayoutBox, x: usize, y: usize, result: &mut Vec<A
     if !lbox.clip.contains(x, y) || !lbox.rect.contains(x, y) {
         return;
     }
-    
+
     if let Some(ref sv) = lbox.scroll_view {
         result.push(sv.clone());
     }
-    
+
     for child in &lbox.children {
         collect_scroll_views(child, x, y, result);
     }
@@ -519,7 +585,7 @@ fn collect_scroll_views(lbox: &LayoutBox, x: usize, y: usize, result: &mut Vec<A
 /// Extract cursor position from rendered lines.
 pub fn extract_cursor_position(lines: &[String], height: usize) -> Option<(usize, usize)> {
     let viewport_top = lines.len().saturating_sub(height);
-    
+
     for row in (viewport_top..lines.len()).rev() {
         let line = &lines[row];
         if let Some(marker_idx) = line.find(CURSOR_MARKER) {
@@ -528,13 +594,14 @@ pub fn extract_cursor_position(lines: &[String], height: usize) -> Option<(usize
             return Some((row, col));
         }
     }
-    
+
     None
 }
 
 /// Strip cursor markers from lines.
 pub fn strip_cursor_markers(lines: &[String]) -> Vec<String> {
-    lines.iter()
+    lines
+        .iter()
         .map(|line| line.replace(CURSOR_MARKER, ""))
         .collect()
 }
@@ -542,8 +609,10 @@ pub fn strip_cursor_markers(lines: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Container, Editor, EditorOptions, EditorStyle, Focusable,
-        ScrollView, ScrollViewOptions, StackChild, StackEntry, Text, VStack};
+    use crate::{
+        Container, Editor, EditorOptions, EditorStyle, Focusable, ScrollView, ScrollViewOptions,
+        StackChild, StackEntry, Text, VStack,
+    };
 
     #[test]
     fn test_layout_rect_contains() {
@@ -643,7 +712,11 @@ mod tests {
         let frame = render_layout_frame(Arc::new(root), 40, 10);
 
         // The screen buffer must be exactly the viewport height.
-        assert_eq!(frame.lines.len(), 10, "frame should be clipped to viewport height");
+        assert_eq!(
+            frame.lines.len(),
+            10,
+            "frame should be clipped to viewport height"
+        );
 
         // The dock (editor borders + footer) must occupy the bottom rows of
         // the painted screen — the editor renders 3 rows (top border, content,
@@ -681,8 +754,27 @@ mod tests {
 #[cfg(test)]
 mod scroll_layout_tests {
     use super::*;
-    use crate::{Container, ScrollView, ScrollViewOptions, Text};
     use crate::component::Component;
+    use crate::{Container, ScrollView, ScrollViewOptions, Text};
+    use std::any::Any;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingTranscript {
+        renders: Arc<AtomicUsize>,
+    }
+
+    impl Component for CountingTranscript {
+        fn render(&self, _width: usize) -> Vec<String> {
+            self.renders.fetch_add(1, Ordering::SeqCst);
+            (0..100).map(|i| format!("row {i:03}")).collect()
+        }
+
+        fn invalidate(&self) {}
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
 
     fn tall() -> (Arc<ScrollView>, Arc<Container>) {
         let inner = Arc::new(Container::new());
@@ -691,7 +783,11 @@ mod scroll_layout_tests {
         }
         let sv = Arc::new(ScrollView::new(
             inner.clone(),
-            ScrollViewOptions { follow: crate::FollowMode::End, primary: true, ..Default::default() },
+            ScrollViewOptions {
+                follow: crate::FollowMode::End,
+                primary: true,
+                ..Default::default()
+            },
         ));
         (sv, inner)
     }
@@ -702,10 +798,68 @@ mod scroll_layout_tests {
         let root: Arc<dyn Component> = sv.clone();
         // Initial: following end → tail visible.
         let f1 = render_layout_frame(root.clone(), 40, 10);
-        assert!(f1.lines[0].contains("row 40"), "tail visible: {:?}", f1.lines[0]);
+        assert!(
+            f1.lines[0].contains("row 40"),
+            "tail visible: {:?}",
+            f1.lines[0]
+        );
         // Scroll up, then re-layout: older rows must appear.
         sv.scroll_by(-10);
         let f2 = render_layout_frame(root, 40, 10);
-        assert!(f2.lines[0].contains("row 30"), "after scroll-up, row 30 top: {:?}", f2.lines[0]);
+        assert!(
+            f2.lines[0].contains("row 30"),
+            "after scroll-up, row 30 top: {:?}",
+            f2.lines[0]
+        );
+    }
+
+    #[test]
+    fn scroll_frames_reuse_rendered_transcript() {
+        let renders = Arc::new(AtomicUsize::new(0));
+        let transcript = Arc::new(CountingTranscript {
+            renders: renders.clone(),
+        });
+        let scroll = Arc::new(ScrollView::new(
+            transcript,
+            ScrollViewOptions {
+                follow: crate::FollowMode::End,
+                primary: true,
+                ..Default::default()
+            },
+        ));
+        let root: Arc<dyn Component> = Arc::new(VStack::from_children(vec![
+            crate::StackChild::Entry(
+                crate::StackEntry::new(scroll.clone())
+                    .basis(0)
+                    .grow(1)
+                    .min_size(1),
+            ),
+            crate::StackChild::Entry(crate::StackEntry::new(Arc::new(Text::new("dock", 0, 0)))),
+        ]));
+
+        render_layout_frame(root.clone(), 40, 10);
+        assert_eq!(renders.load(Ordering::SeqCst), 1);
+
+        scroll.scroll_by(-1);
+        render_layout_frame_reusing_scroll_content(root.clone(), 40, 10);
+        assert_eq!(
+            renders.load(Ordering::SeqCst),
+            1,
+            "pure scrolling must not rebuild the transcript",
+        );
+
+        render_layout_frame(root.clone(), 40, 10);
+        assert_eq!(
+            renders.load(Ordering::SeqCst),
+            2,
+            "ordinary frames must refresh mutable transcript content",
+        );
+
+        render_layout_frame_reusing_scroll_content(root, 60, 10);
+        assert_eq!(
+            renders.load(Ordering::SeqCst),
+            3,
+            "a width change must invalidate wrapped transcript lines",
+        );
     }
 }

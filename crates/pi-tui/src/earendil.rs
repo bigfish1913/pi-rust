@@ -47,9 +47,17 @@ impl Component for EarendilAnnouncementComponent {
         let muted = theme().colors.muted;
         let mut lines = Vec::new();
         lines.extend(self.top.render(width));
-        lines.push(Text::new(accent.fg(&bold("pi has joined Earendil")), 1, 0).render(width).remove(0));
+        lines.push(
+            Text::new(accent.fg(&bold("pi has joined Earendil")), 1, 0)
+                .render(width)
+                .remove(0),
+        );
         lines.extend(Spacer::new(1).render(width));
-        lines.push(Text::new(muted.fg("Read the blog post:"), 1, 0).render(width).remove(0));
+        lines.push(
+            Text::new(muted.fg("Read the blog post:"), 1, 0)
+                .render(width)
+                .remove(0),
+        );
         lines.push(Text::new(accent.fg(BLOG_URL), 1, 0).render(width).remove(0));
         lines.extend(Spacer::new(1).render(width));
         lines.extend(self.bottom.render(width));
@@ -80,7 +88,10 @@ mod tests {
         let comp = EarendilAnnouncementComponent::new();
         let lines = comp.render(80);
         let joined: String = lines.join("\n");
-        assert!(joined.contains("pi has joined Earendil"), "title missing: {joined}");
+        assert!(
+            joined.contains("pi has joined Earendil"),
+            "title missing: {joined}"
+        );
         assert!(joined.contains(BLOG_URL), "url missing: {joined}");
         // Borders present (─ run at width).
         assert!(joined.contains('─'), "no border drawn");

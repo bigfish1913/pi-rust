@@ -50,7 +50,12 @@ impl Markdown {
     }
 
     /// Create with options.
-    pub fn with_options(content: impl Into<String>, options: MarkdownOptions, padding_x: usize, padding_y: usize) -> Self {
+    pub fn with_options(
+        content: impl Into<String>,
+        options: MarkdownOptions,
+        padding_x: usize,
+        padding_y: usize,
+    ) -> Self {
         Self {
             content: Mutex::new(content.into()),
             options,
@@ -99,8 +104,10 @@ impl Markdown {
         let raw_lines: Vec<&str> = content.lines().collect();
         let mut i = 0;
 
-        // Code-fence state
+        // Code-fence state. Fenced blocks are rendered as a compact terminal
+        // panel rather than echoing Markdown's literal ``` markers.
         let mut in_code_block = false;
+        let mut code_fence_char = '`';
         while i < raw_lines.len() {
             let line = raw_lines[i];
 
@@ -117,31 +124,41 @@ impl Markdown {
 
             // ---- Code fences ----
             let fence = fence_info(line);
-            if let Some(lang) = fence {
-                in_code_block = !in_code_block;
-                if in_code_block {
-                    // Opening fence: keep pi's ```` ```lang ```` text visible so
-                    // the language is annotated, colored as the code-block border.
-                    let label = lang.clone();
+            if let Some((fence_char, lang)) = fence {
+                // Inside a block, only the matching fence closes it. This keeps
+                // backticks embedded in a ~~~ block from collapsing the panel.
+                if !in_code_block {
+                    in_code_block = true;
+                    code_fence_char = fence_char;
+                    let label = if lang.is_empty() {
+                        "─".to_string()
+                    } else {
+                        format!("─ {lang} ")
+                    };
+                    let chrome = format!("╭{label}");
                     lines.push(format!(
                         "{pad}{indent}{}",
-                        colors.md_code_block_border.fg(&format!("```{}", label))
+                        colors.md_code_block_border.fg(&chrome)
+                    ));
+                } else if fence_char == code_fence_char {
+                    in_code_block = false;
+                    lines.push(format!(
+                        "{pad}{indent}{}",
+                        colors.md_code_block_border.fg("╰─")
                     ));
                 } else {
-                    // Closing fence (matches the opening style).
-                    lines.push(format!("{pad}{indent}{}", colors.md_code_block_border.fg("```")));
+                    // A non-matching fence is code content.
+                    push_code_line(line, &pad, &indent, cwidth, &mut lines);
                 }
                 i += 1;
                 continue;
             }
 
             if in_code_block {
-                // Code body: no reflow; clip long lines ANSI-safely with a `…`.
-                // Indent + a faint left rule, body in the code-block color.
-                let prefix = format!("{pad}{indent}{} ", colors.md_code_block_border.fg("│"));
-                let body_width = cwidth.saturating_sub(visible_width(&prefix));
-                let clipped = truncate_to_width(line, body_width.max(1), "…");
-                lines.push(format!("{prefix}{}", colors.md_code_block.fg(&clipped)));
+                // Code is never reflowed: wrapping destroys indentation and
+                // makes copied snippets invalid. Tabs are normalized and long
+                // physical lines are clipped with an ellipsis.
+                push_code_line(line, &pad, &indent, cwidth, &mut lines);
                 i += 1;
                 continue;
             }
@@ -189,29 +206,32 @@ impl Markdown {
             } else if is_task_list_item(line) {
                 let (marker, body) = task_list_item(line).unwrap();
                 let bullet = colors.md_list_bullet.fg(&format!("{marker}"));
-                let rendered = format!("{pad}  {bullet} {}", self.render_inline(body));
+                let rendered = format!("  {bullet} {}", self.render_inline(body));
                 push_wrapped(&pad, &rendered, cwidth, &mut lines);
             } else if line.starts_with("- ") || line.starts_with("* ") {
                 // Unordered list — accent-colored bullet.
                 let bullet = colors.md_list_bullet.fg("•");
-                let rendered = format!("{pad}  {bullet} {}", self.render_inline(line[2..].trim()));
+                let rendered = format!("  {bullet} {}", self.render_inline(line[2..].trim()));
                 push_wrapped(&pad, &rendered, cwidth, &mut lines);
             } else if line.starts_with(|c: char| c.is_ascii_digit()) && line.contains(". ") {
                 // Ordered list — accent-colored marker.
                 let (num, rest) = split_ordered(line);
                 let marker = colors.md_list_bullet.fg(&num);
-                let rendered = format!("{pad}  {marker}{}", self.render_inline(rest));
+                let rendered = format!("  {marker}{}", self.render_inline(rest));
                 push_wrapped(&pad, &rendered, cwidth, &mut lines);
             } else if line.starts_with("> ") {
                 // Blockquote — gray border + italic muted body (pi quote style).
                 let border = colors.md_quote_border.fg("│");
                 let body = colors.md_quote.fg(&italic(&self.render_inline(&line[2..])));
-                let rendered = format!("{pad}  {border} {body}");
+                let rendered = format!("  {border} {body}");
                 push_wrapped(&pad, &rendered, cwidth, &mut lines);
             } else if line.trim().starts_with("---") || line.trim().starts_with("***") {
                 // Horizontal rule (capped like the TS reference), mdHr colored.
                 let rule_w = width.min(80).saturating_sub(self.padding_x * 2);
-                lines.push(format!("{pad}{}", colors.md_hr.fg(&"─".repeat(rule_w.max(1)))));
+                lines.push(format!(
+                    "{pad}{}",
+                    colors.md_hr.fg(&"─".repeat(rule_w.max(1)))
+                ));
             } else if line.trim().is_empty() {
                 // Empty line — emit a (padded) blank so spacing is preserved.
                 lines.push(String::new());
@@ -245,7 +265,7 @@ impl Markdown {
             if c == '*' {
                 if chars.peek() == Some(&'*') {
                     chars.next(); // consume second *
-                    // Bold
+                                  // Bold
                     let bold_text = self.consume_until(&mut chars, "**");
                     result.push_str(&bold(&bold_text));
                 } else {
@@ -302,7 +322,11 @@ impl Markdown {
     }
 
     /// Consume characters until the delimiter.
-    fn consume_until(&self, chars: &mut std::iter::Peekable<std::str::Chars<'_>>, delimiter: &str) -> String {
+    fn consume_until(
+        &self,
+        chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+        delimiter: &str,
+    ) -> String {
         let mut result = String::new();
         let delim_chars: Vec<char> = delimiter.chars().collect();
 
@@ -345,15 +369,29 @@ impl Markdown {
 
 /// If `line` is a ```` ``` ```` (or ```` ~~~ ````) fence, return the language
 /// label (possibly empty). Returns `None` for non-fence lines.
-fn fence_info(line: &str) -> Option<String> {
+fn fence_info(line: &str) -> Option<(char, String)> {
     let trimmed = line.trim_start();
     if trimmed.starts_with("```") {
-        Some(trimmed[3..].trim().to_string())
+        Some(('`', trimmed[3..].trim().to_string()))
     } else if trimmed.starts_with("~~~") {
-        Some(trimmed[3..].trim().to_string())
+        Some(('~', trimmed[3..].trim().to_string()))
     } else {
         None
     }
+}
+
+/// Render one physical code line with stable chrome and ANSI-safe clipping.
+fn push_code_line(line: &str, pad: &str, indent: &str, cwidth: usize, out: &mut Vec<String>) {
+    let colors = theme().colors;
+    let rule = colors.md_code_block_border.fg("│");
+    let prefix = format!("{pad}{indent}{rule} ");
+    // `cwidth` excludes Markdown padding, so only subtract the code indent and
+    // panel chrome here (not the already-accounted-for `pad`).
+    let chrome_width = visible_width(indent) + 2;
+    let body_width = cwidth.saturating_sub(chrome_width).max(1);
+    let expanded = line.replace('\t', "    ");
+    let clipped = truncate_to_width(&expanded, body_width, "…");
+    out.push(format!("{prefix}{}", colors.md_code_block.fg(&clipped)));
 }
 
 /// True when the whole line is a run of 1-2 fence chars (``/````/`~`/`~~`)
@@ -539,19 +577,16 @@ fn push_wrapped(pad: &str, rendered: &str, cwidth: usize, out: &mut Vec<String>)
         out.push(rendered.to_string());
         return;
     }
-    // The first line already carries the left pad; wrapped continuation
-    // lines must re-apply it.
+    // Padding is layout chrome, not part of `rendered`; applying it here keeps
+    // first and continuation lines aligned (the old renderer omitted padding
+    // from the first line of ordinary paragraphs and headings).
     let wrapped = wrap_text_with_ansi(rendered, cwidth);
     if wrapped.is_empty() {
         out.push(String::new());
         return;
     }
-    for (idx, sub) in wrapped.iter().enumerate() {
-        if idx == 0 {
-            out.push(sub.clone());
-        } else {
-            out.push(format!("{pad}{sub}"));
-        }
+    for sub in wrapped {
+        out.push(format!("{pad}{sub}"));
     }
 }
 
@@ -616,12 +651,43 @@ mod tests {
     fn test_markdown_code_block_has_closing_border() {
         let md = Markdown::new("```rust\nlet x = 1;\n```", 0, 0);
         let joined = md.render(80).join("\n");
-        // The opening fence keeps its ```` ```rust ```` text (pi style) and the
-        // closing fence is a bare ```` ``` ````.
-        assert!(joined.contains("```rust"), "missing opening fence label");
-        assert!(joined.contains("let x = 1;"), "missing code body");
-        // Two fences total (open + close).
-        assert_eq!(joined.matches("```").count(), 2, "expected open+close fences");
+        let plain = crate::ansi::strip_ansi(&joined);
+        assert!(
+            plain.contains("╭─ rust"),
+            "missing language header: {plain}"
+        );
+        assert!(plain.contains("│ let x = 1;"), "missing code body: {plain}");
+        assert!(plain.contains("╰─"), "missing closing border: {plain}");
+        assert!(
+            !plain.contains("```"),
+            "literal fences should be hidden: {plain}"
+        );
+    }
+
+    #[test]
+    fn test_markdown_padding_applies_to_first_and_wrapped_lines() {
+        let md = Markdown::new("abcdefgh", 2, 0);
+        let lines = md.render(6);
+        assert_eq!(lines, vec!["  ab", "  cd", "  ef", "  gh"]);
+    }
+
+    #[test]
+    fn test_markdown_code_expands_tabs_and_clips() {
+        let md = Markdown::new("```\n\tlet value = 123456;\n```", 0, 0);
+        let lines = md.render(14);
+        let plain: Vec<String> = lines
+            .iter()
+            .map(|line| crate::ansi::strip_ansi(line))
+            .collect();
+        assert!(
+            plain[1].starts_with("  │     let"),
+            "tab/indent lost: {plain:?}"
+        );
+        assert!(
+            plain[1].contains('…'),
+            "long code line should clip: {plain:?}"
+        );
+        assert!(plain.iter().all(|line| visible_width(line) <= 14));
     }
 
     #[test]
@@ -648,7 +714,10 @@ mod tests {
         let joined = md.render(80).join("\n");
         // `\x1b[1m` is the bold SGR; `\x1b[4m` is underline.
         assert!(joined.contains("\x1b[1m"), "`__` should render bold");
-        assert!(!joined.contains("\x1b[4m"), "`__` should NOT render underline");
+        assert!(
+            !joined.contains("\x1b[4m"),
+            "`__` should NOT render underline"
+        );
     }
 
     #[test]

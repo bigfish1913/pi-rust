@@ -131,7 +131,12 @@ pub struct CustomMessage {
 }
 
 impl CustomMessage {
-    pub fn new(role: impl Into<String>, content: Vec<Content>, data: serde_json::Value, timestamp: i64) -> Self {
+    pub fn new(
+        role: impl Into<String>,
+        content: Vec<Content>,
+        data: serde_json::Value,
+        timestamp: i64,
+    ) -> Self {
         Self {
             role: role.into(),
             content,

@@ -187,7 +187,10 @@ pub fn render_latex(latex: &str, options: &RenderLatexOptions) -> String {
     result = result.replace('{', "").replace('}', "");
 
     // Handle special LaTeX spaces
-    result = result.replace("\\,", " ").replace("\\:", " ").replace("\\;", " ");
+    result = result
+        .replace("\\,", " ")
+        .replace("\\:", " ")
+        .replace("\\;", " ");
     result = result.replace("\\!", "").replace("\\ ", " ");
 
     // Handle quotes
@@ -306,12 +309,7 @@ pub fn strip_latex(latex: &str) -> String {
         while let Some(start) = result.find(cmd) {
             if let Some(end) = find_matching_brace(&result, start + cmd.len() - 1) {
                 let content = &result[start + cmd.len()..end];
-                result = format!(
-                    "{}{}{}",
-                    &result[..start],
-                    content,
-                    &result[end + 1..]
-                );
+                result = format!("{}{}{}", &result[..start], content, &result[end + 1..]);
             } else {
                 break;
             }

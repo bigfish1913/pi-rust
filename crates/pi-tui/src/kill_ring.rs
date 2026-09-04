@@ -74,7 +74,7 @@ impl KillRing {
             // Check if the text is already at the front (don't duplicate)
             if self.entries.front() != Some(&text.to_string()) {
                 self.entries.push_front(text.to_string());
-                
+
                 // Trim if over capacity
                 while self.entries.len() > self.max_size {
                     self.entries.pop_back();
@@ -155,7 +155,13 @@ mod tests {
     fn test_accumulate() {
         let mut ring = KillRing::new();
         ring.push("hello", PushOptions::default());
-        ring.push(" world", PushOptions { prepend: false, accumulate: true });
+        ring.push(
+            " world",
+            PushOptions {
+                prepend: false,
+                accumulate: true,
+            },
+        );
         assert_eq!(ring.peek(), Some("hello world"));
         assert_eq!(ring.len(), 1);
     }
@@ -164,7 +170,13 @@ mod tests {
     fn test_accumulate_prepend() {
         let mut ring = KillRing::new();
         ring.push("world", PushOptions::default());
-        ring.push("hello ", PushOptions { prepend: true, accumulate: true });
+        ring.push(
+            "hello ",
+            PushOptions {
+                prepend: true,
+                accumulate: true,
+            },
+        );
         assert_eq!(ring.peek(), Some("hello world"));
     }
 
@@ -174,7 +186,7 @@ mod tests {
         ring.push("first", PushOptions::default());
         ring.push("second", PushOptions::default());
         ring.push("third", PushOptions::default());
-        
+
         assert_eq!(ring.peek(), Some("third"));
         ring.rotate();
         assert_eq!(ring.peek(), Some("second"));
@@ -197,7 +209,7 @@ mod tests {
         ring.push("2", PushOptions::default());
         ring.push("3", PushOptions::default());
         ring.push("4", PushOptions::default());
-        
+
         assert_eq!(ring.len(), 3);
         assert_eq!(ring.peek(), Some("4"));
         assert_eq!(ring.get(2), Some("2")); // "1" should be evicted

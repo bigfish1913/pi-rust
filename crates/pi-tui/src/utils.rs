@@ -2,8 +2,8 @@
 //!
 //! Provides functions for text manipulation with ANSI awareness.
 
-use unicode_width::UnicodeWidthStr;
 use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 /// Get the visible width of a string, ignoring ANSI escape sequences.
 pub fn visible_width(s: &str) -> usize {
@@ -78,7 +78,7 @@ pub fn slice_by_column(s: &str, start_col: usize, max_cols: usize, pad: bool) ->
 
         if in_escape {
             pending_styles.push(c);
-            
+
             // Check for sequence end
             if c == '\x07' {
                 in_escape = false;
@@ -212,7 +212,7 @@ pub fn truncate_to_width(s: &str, max_width: usize, suffix: &str) -> String {
 
     // Add suffix
     result.push_str(suffix);
-    
+
     // Only reset style if input had ANSI codes
     if has_ansi {
         result.push_str("\x1b[0m");
@@ -432,7 +432,11 @@ pub fn get_osc8_link_at_column(s: &str, column: usize) -> Option<String> {
 }
 
 /// Apply background color to a line, respecting existing styling.
-pub fn apply_background_to_line(line: &str, width: usize, bg_fn: impl Fn(&str) -> String) -> String {
+pub fn apply_background_to_line(
+    line: &str,
+    width: usize,
+    bg_fn: impl Fn(&str) -> String,
+) -> String {
     let line_width = visible_width(line);
     let padding = " ".repeat(width.saturating_sub(line_width));
     let padded = format!("{}{}", line, padding);

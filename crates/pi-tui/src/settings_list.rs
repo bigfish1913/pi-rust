@@ -194,7 +194,11 @@ impl SettingsList {
     pub fn toggle(&self) {
         if let Some(item) = self.get_selected() {
             if item.setting_type == SettingType::Boolean {
-                let new_value = if item.value == "true" { "false" } else { "true" };
+                let new_value = if item.value == "true" {
+                    "false"
+                } else {
+                    "true"
+                };
                 self.update_value(&item.key, new_value);
 
                 if let Ok(cb) = self.on_change.lock() {
@@ -308,7 +312,8 @@ impl Component for SettingsList {
         let start = if filtered.len() <= self.max_visible {
             0
         } else {
-            selected.saturating_sub(self.max_visible / 2)
+            selected
+                .saturating_sub(self.max_visible / 2)
                 .min(filtered.len().saturating_sub(self.max_visible))
         };
         let end = (start + self.max_visible).min(filtered.len());

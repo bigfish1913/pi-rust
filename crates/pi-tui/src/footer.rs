@@ -125,7 +125,12 @@ impl Component for FooterComponent {
             } else {
                 model.clone()
             };
-            format!("{}{} {}", colors.accent.fg("["), colors.dim.fg(&inner), colors.accent.fg("]"))
+            format!(
+                "{}{} {}",
+                colors.accent.fg("["),
+                colors.dim.fg(&inner),
+                colors.accent.fg("]")
+            )
         } else {
             String::new()
         };
@@ -215,7 +220,11 @@ mod tests {
         let lines = footer.render(40);
         // The status row (index 1) must respect the width budget; the
         // separator (index 0) is exactly width — both <= 40.
-        assert!(visible_width(&lines[1]) <= 40, "row too wide: {}", visible_width(&lines[1]));
+        assert!(
+            visible_width(&lines[1]) <= 40,
+            "row too wide: {}",
+            visible_width(&lines[1])
+        );
     }
 
     #[test]

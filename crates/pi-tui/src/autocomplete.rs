@@ -187,12 +187,13 @@ impl FilePathAutocompleteProvider {
         let (dir, partial) = if prefix.contains('/') || prefix.contains('\\') {
             let path = Path::new(prefix);
             let parent = path.parent().unwrap_or(Path::new("."));
-            let file_name = path.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
+            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             (parent.to_path_buf(), file_name.to_string())
         } else {
-            (self.root_path.clone().unwrap_or_else(|| PathBuf::from(".")), prefix.to_string())
+            (
+                self.root_path.clone().unwrap_or_else(|| PathBuf::from(".")),
+                prefix.to_string(),
+            )
         };
 
         // Read directory
@@ -200,22 +201,22 @@ impl FilePathAutocompleteProvider {
             for entry in entries.take(self.max_results) {
                 if let Ok(entry) = entry {
                     let name = entry.file_name().to_string_lossy().to_string();
-                    
+
                     // Filter by prefix
-                    if !partial.is_empty() && !name.to_lowercase().starts_with(&partial.to_lowercase()) {
+                    if !partial.is_empty()
+                        && !name.to_lowercase().starts_with(&partial.to_lowercase())
+                    {
                         continue;
                     }
 
                     let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                    let text = if is_dir {
-                        format!("{}/", name)
-                    } else {
-                        name
-                    };
+                    let text = if is_dir { format!("{}/", name) } else { name };
 
-                    items.push(AutocompleteItem::new(&text)
-                        .as_directory()
-                        .with_insert_space(!is_dir));
+                    items.push(
+                        AutocompleteItem::new(&text)
+                            .as_directory()
+                            .with_insert_space(!is_dir),
+                    );
                 }
             }
         }
@@ -302,7 +303,8 @@ impl SlashCommandAutocompleteProvider {
             },
             SlashCommand {
                 name: "/context".to_string(),
-                description: "List discovered context files, skills, and prompt templates".to_string(),
+                description: "List discovered context files, skills, and prompt templates"
+                    .to_string(),
             },
         ])
     }
@@ -326,9 +328,11 @@ impl AutocompleteProvider for SlashCommandAutocompleteProvider {
         let query = &before_cursor[1..];
         let items: Vec<AutocompleteItem> = fuzzy_filter(&self.commands, query, |cmd| &cmd.name)
             .into_iter()
-            .map(|cmd| AutocompleteItem::new(&cmd.name)
-                .with_description(&cmd.description)
-                .with_insert_space(false))
+            .map(|cmd| {
+                AutocompleteItem::new(&cmd.name)
+                    .with_description(&cmd.description)
+                    .with_insert_space(false)
+            })
             .collect();
 
         if items.is_empty() {
@@ -369,7 +373,9 @@ impl CombinedAutocompleteProvider {
     /// Create with default providers.
     pub fn with_defaults() -> Self {
         let mut combined = Self::new();
-        combined.add_provider(Arc::new(SlashCommandAutocompleteProvider::with_default_commands()));
+        combined.add_provider(Arc::new(
+            SlashCommandAutocompleteProvider::with_default_commands(),
+        ));
         combined.add_provider(Arc::new(FilePathAutocompleteProvider::new()));
         combined
     }
@@ -418,7 +424,11 @@ impl AutocompleteManager {
 
     /// Get suggestions.
     pub fn get_suggestions(&self, input: &str, cursor: usize) -> Option<AutocompleteSuggestions> {
-        self.provider.lock().ok()?.as_ref()?.get_suggestions(input, cursor)
+        self.provider
+            .lock()
+            .ok()?
+            .as_ref()?
+            .get_suggestions(input, cursor)
     }
 }
 
@@ -431,7 +441,6 @@ impl Default for AutocompleteManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     #[test]
     fn snap_cursor_keeps_boundaries_including_end() {
@@ -453,7 +462,7 @@ mod tests {
     fn test_slash_command_provider() {
         let provider = SlashCommandAutocompleteProvider::with_default_commands();
         let suggestions = provider.get_suggestions("/he", 3);
-        
+
         assert!(suggestions.is_some());
         let s = suggestions.unwrap();
         assert!(!s.items.is_empty());
@@ -465,7 +474,7 @@ mod tests {
         let item = AutocompleteItem::new("test.txt")
             .with_description("A test file")
             .as_directory();
-        
+
         assert_eq!(item.text, "test.txt");
         assert!(item.is_directory);
     }

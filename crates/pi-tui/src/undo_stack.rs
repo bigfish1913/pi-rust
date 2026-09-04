@@ -36,7 +36,7 @@ impl<T: Clone> UndoStack<T> {
     /// Push a state onto the undo stack.
     pub fn push(&mut self, state: T) {
         self.states.push_back(state);
-        
+
         // Trim if over capacity
         while self.states.len() > self.max_size {
             self.states.pop_front();
@@ -121,7 +121,7 @@ impl<T: Clone> RedoStack<T> {
     /// Push a state onto the redo stack.
     pub fn push(&mut self, state: T) {
         self.states.push_back(state);
-        
+
         while self.states.len() > self.max_size {
             self.states.pop_front();
         }
@@ -244,7 +244,7 @@ mod tests {
         stack.push(1);
         stack.push(2);
         stack.push(3);
-        
+
         assert_eq!(stack.len(), 3);
         assert_eq!(stack.pop(), Some(3));
         assert_eq!(stack.pop(), Some(2));
@@ -258,7 +258,7 @@ mod tests {
         stack.push(1);
         stack.push(2);
         stack.push(3);
-        
+
         assert_eq!(stack.len(), 2);
         assert_eq!(stack.pop(), Some(3));
         assert_eq!(stack.pop(), Some(2));
@@ -268,19 +268,19 @@ mod tests {
     #[test]
     fn test_undo_redo_manager() {
         let mut manager = UndoRedoManager::new();
-        
+
         manager.push("state1".to_string());
         manager.push("state2".to_string());
         manager.push("state3".to_string());
-        
+
         assert!(manager.can_undo());
         assert!(!manager.can_redo());
-        
+
         // Undo
         let prev = manager.undo("current".to_string());
         assert_eq!(prev, Some("state3".to_string()));
         assert!(manager.can_redo());
-        
+
         // Redo
         let next = manager.redo("state3".to_string());
         assert_eq!(next, Some("current".to_string()));
@@ -289,13 +289,13 @@ mod tests {
     #[test]
     fn test_push_clears_redo() {
         let mut manager = UndoRedoManager::new();
-        
+
         manager.push("state1".to_string());
         manager.push("state2".to_string());
-        
+
         let _ = manager.undo("current".to_string());
         assert!(manager.can_redo());
-        
+
         // New push should clear redo
         manager.push("new_state".to_string());
         assert!(!manager.can_redo());

@@ -13,11 +13,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use rpi_agent::error::AgentError;
+use rpi_ai::types::Tool;
 use rpi_plugin_sdk::{
-    EventTag, EventHandlerFn, FreeStringFn, ProviderRequestFn, RenderFn, ResourcesDiscoverFn,
+    EventHandlerFn, EventTag, FreeStringFn, ProviderRequestFn, RenderFn, ResourcesDiscoverFn,
     EVENT_TAG_COUNT,
 };
-use rpi_ai::types::Tool;
 
 use crate::tool::PluginToolHandle;
 
@@ -298,9 +298,11 @@ impl ExtensionRegistry {
     /// `(kind, name)`. Returns `true` if a prior renderer of the same kind+name
     /// was kept.
     pub fn register_renderer(&mut self, renderer: RegisteredRenderer) -> bool {
-        if self.renderers.iter().any(|r| {
-            r.kind == renderer.kind && r.name == renderer.name
-        }) {
+        if self
+            .renderers
+            .iter()
+            .any(|r| r.kind == renderer.kind && r.name == renderer.name)
+        {
             return true;
         }
         self.renderers.push(renderer);
@@ -312,10 +314,14 @@ impl ExtensionRegistry {
     /// snapshot — important for cross-session staleness.
     pub fn snapshot(&self) -> RegistrySnapshot {
         RegistrySnapshot {
-            tools: self.tools.iter().map(|t| ExtensionTool {
-                tool: t.tool.clone(),
-                handle: t.handle,
-            }).collect(),
+            tools: self
+                .tools
+                .iter()
+                .map(|t| ExtensionTool {
+                    tool: t.tool.clone(),
+                    handle: t.handle,
+                })
+                .collect(),
             commands: self.commands.clone(),
             handlers: self.handlers.clone(),
             resources_discover: self.resources_discover.clone(),
@@ -360,15 +366,24 @@ impl ExtensionRegistry {
         for (tag_idx, handlers) in other.handlers.iter_mut().enumerate() {
             self.handlers[tag_idx].append(handlers);
         }
-        self.resources_discover.append(&mut other.resources_discover);
+        self.resources_discover
+            .append(&mut other.resources_discover);
         for p in other.providers.drain(..) {
-            if self.providers.iter().any(|x| x.provider_id == p.provider_id) {
+            if self
+                .providers
+                .iter()
+                .any(|x| x.provider_id == p.provider_id)
+            {
                 continue;
             }
             self.providers.push(p);
         }
         for r in other.renderers.drain(..) {
-            if self.renderers.iter().any(|x| x.kind == r.kind && x.name == r.name) {
+            if self
+                .renderers
+                .iter()
+                .any(|x| x.kind == r.kind && x.name == r.name)
+            {
                 continue;
             }
             self.renderers.push(r);

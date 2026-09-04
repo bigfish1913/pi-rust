@@ -29,7 +29,7 @@ pub fn strip_ansi(s: &str) -> String {
             match chars.peek() {
                 Some('[') => {
                     chars.next(); // consume '['
-                    // CSI sequence: skip until final byte (0x40-0x7E)
+                                  // CSI sequence: skip until final byte (0x40-0x7E)
                     while let Some(&c) = chars.peek() {
                         chars.next();
                         if (c as u8) >= 0x40 && (c as u8) <= 0x7E {
@@ -39,7 +39,7 @@ pub fn strip_ansi(s: &str) -> String {
                 }
                 Some(']') => {
                     chars.next(); // consume ']'
-                    // OSC sequence: skip until BEL (0x07) or ST (ESC \)
+                                  // OSC sequence: skip until BEL (0x07) or ST (ESC \)
                     while let Some(&c) = chars.peek() {
                         chars.next();
                         if c == '\x07' {
@@ -55,7 +55,7 @@ pub fn strip_ansi(s: &str) -> String {
                 }
                 Some('(' | ')') => {
                     chars.next(); // consume '(' or ')'
-                    // Character set designation: skip one more char
+                                  // Character set designation: skip one more char
                     chars.next();
                 }
                 Some(_) => {
@@ -64,7 +64,9 @@ pub fn strip_ansi(s: &str) -> String {
                 }
                 None => break,
             }
-        } else if c == CURSOR_MARKER.chars().next().unwrap() && s[s.char_indices().next().unwrap().0..].starts_with(CURSOR_MARKER) {
+        } else if c == CURSOR_MARKER.chars().next().unwrap()
+            && s[s.char_indices().next().unwrap().0..].starts_with(CURSOR_MARKER)
+        {
             // Skip cursor marker
             for _ in CURSOR_MARKER.chars().skip(1) {
                 chars.next();

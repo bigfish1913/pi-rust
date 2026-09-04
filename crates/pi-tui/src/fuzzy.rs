@@ -15,12 +15,18 @@ pub struct FuzzyMatch {
 impl FuzzyMatch {
     /// Create a non-matching result.
     pub fn no_match() -> Self {
-        Self { matches: false, score: 0 }
+        Self {
+            matches: false,
+            score: 0,
+        }
     }
 
     /// Create a matching result with the given score.
     pub fn with_score(score: i32) -> Self {
-        Self { matches: true, score }
+        Self {
+            matches: true,
+            score,
+        }
     }
 }
 
@@ -122,11 +128,11 @@ fn is_word_boundary_char(c: char) -> bool {
 /// Swap alphanumeric parts (e.g., "f2" -> "2f", "2file" -> "file2").
 fn swap_alphanumeric(query: &str) -> Option<String> {
     let chars: Vec<char> = query.chars().collect();
-    
+
     // Find the split point between letters and digits
     let mut letter_end = 0;
     let mut digit_start = 0;
-    
+
     for (i, &c) in chars.iter().enumerate() {
         if c.is_ascii_lowercase() {
             letter_end = i + 1;
@@ -135,18 +141,18 @@ fn swap_alphanumeric(query: &str) -> Option<String> {
             break;
         }
     }
-    
+
     // Check for pattern: letters followed by digits
     if letter_end > 0 && digit_start >= letter_end {
         let letters: String = chars[..letter_end].iter().collect();
         let digits: String = chars[digit_start..].iter().collect();
         return Some(format!("{}{}", digits, letters));
     }
-    
+
     // Check for pattern: digits followed by letters
     let mut digit_end = 0;
     let mut letter_start = 0;
-    
+
     for (i, &c) in chars.iter().enumerate() {
         if c.is_ascii_digit() {
             digit_end = i + 1;
@@ -155,13 +161,13 @@ fn swap_alphanumeric(query: &str) -> Option<String> {
             break;
         }
     }
-    
+
     if digit_end > 0 && letter_start >= digit_end {
         let digits: String = chars[..digit_end].iter().collect();
         let letters: String = chars[letter_start..].iter().collect();
         return Some(format!("{}{}", letters, digits));
     }
-    
+
     None
 }
 

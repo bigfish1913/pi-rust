@@ -43,8 +43,8 @@
 //! [`cli/args.ts`]: ../../.reference/pi/packages/coding-agent/src/cli/args.ts
 //! [`modes/print-mode.ts`]: ../../.reference/pi/packages/coding-agent/src/modes/print-mode.ts
 
-pub mod args;
 pub mod app;
+pub mod args;
 pub mod auth;
 pub mod config;
 pub mod extensions_actions;
@@ -53,6 +53,7 @@ pub mod interactive_tui;
 pub mod modes;
 pub mod provider;
 pub mod resource_dirs;
+pub mod resume_picker;
 pub mod session;
 pub mod settings;
 

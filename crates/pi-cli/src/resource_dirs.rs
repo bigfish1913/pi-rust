@@ -37,9 +37,7 @@ use rpi_harness::prompt_templates::{
     load_prompt_templates, LoadPromptTemplatesResult, PromptTemplateDiagnostic,
     PromptTemplateDiagnosticCode,
 };
-use rpi_harness::skills::{
-    load_skills, LoadSkillsResult, SkillDiagnostic, SkillDiagnosticCode,
-};
+use rpi_harness::skills::{load_skills, LoadSkillsResult, SkillDiagnostic, SkillDiagnosticCode};
 use rpi_harness::types::{PromptTemplate, Skill};
 use rpi_tools::env::ExecutionEnv;
 
@@ -197,7 +195,10 @@ pub async fn load_skills_with_precedence(
     env: &Arc<dyn ExecutionEnv>,
     dirs: &[PathBuf],
 ) -> LoadSkillsResult {
-    let dir_strs: Vec<String> = dirs.iter().map(|d| d.to_string_lossy().into_owned()).collect();
+    let dir_strs: Vec<String> = dirs
+        .iter()
+        .map(|d| d.to_string_lossy().into_owned())
+        .collect();
     let mut result = load_skills(env, &dir_strs).await;
     result.skills = dedupe_skills(result.skills, &mut result.diagnostics);
     result
@@ -210,9 +211,13 @@ pub async fn load_prompt_templates_with_precedence(
     env: &Arc<dyn ExecutionEnv>,
     paths: &[PathBuf],
 ) -> LoadPromptTemplatesResult {
-    let path_strs: Vec<String> = paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+    let path_strs: Vec<String> = paths
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
     let mut result = load_prompt_templates(env, &path_strs).await;
-    result.prompt_templates = dedupe_prompt_templates(result.prompt_templates, &mut result.diagnostics);
+    result.prompt_templates =
+        dedupe_prompt_templates(result.prompt_templates, &mut result.diagnostics);
     result
 }
 
@@ -251,7 +256,11 @@ mod tests {
     }
 
     fn tmpl(name: &str) -> PromptTemplate {
-        PromptTemplate { name: name.to_string(), description: None, content: "c".to_string() }
+        PromptTemplate {
+            name: name.to_string(),
+            description: None,
+            content: "c".to_string(),
+        }
     }
 
     #[test]
@@ -266,7 +275,9 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].file_path, "/proj/.pi/skills/echo/SKILL.md");
         assert_eq!(diags.len(), 1);
-        assert!(diags[0].message.contains("/home/.rpi/agent/skills/echo/SKILL.md"));
+        assert!(diags[0]
+            .message
+            .contains("/home/.rpi/agent/skills/echo/SKILL.md"));
         assert!(diags[0].message.contains("/proj/.pi/skills/echo/SKILL.md"));
         assert_eq!(diags[0].path, "/home/.rpi/agent/skills/echo/SKILL.md");
     }

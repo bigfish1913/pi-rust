@@ -74,11 +74,16 @@ pub fn save_settings(settings: &Settings) -> Result<(), String> {
             .unwrap_or(serde_json::Value::Object(Default::default())),
         Err(_) => serde_json::Value::Object(Default::default()),
     };
-    let obj = merged.as_object_mut().ok_or("settings file is not an object")?;
+    let obj = merged
+        .as_object_mut()
+        .ok_or("settings file is not an object")?;
     for (key, val) in [
         ("defaultProvider", settings.default_provider.as_ref()),
         ("defaultModel", settings.default_model.as_ref()),
-        ("defaultThinkingLevel", settings.default_thinking_level.as_ref()),
+        (
+            "defaultThinkingLevel",
+            settings.default_thinking_level.as_ref(),
+        ),
         ("theme", settings.theme.as_ref()),
     ] {
         match val {
@@ -95,7 +100,9 @@ pub fn save_settings(settings: &Settings) -> Result<(), String> {
             obj.insert(
                 "scopedModels".to_string(),
                 serde_json::Value::Array(
-                    list.iter().map(|m| serde_json::Value::String(m.clone())).collect(),
+                    list.iter()
+                        .map(|m| serde_json::Value::String(m.clone()))
+                        .collect(),
                 ),
             );
         }
@@ -127,7 +134,11 @@ mod tests {
             let prev = std::env::var_os(config::CONFIG_DIR_ENV);
             let tmp = tempfile::TempDir::new().unwrap();
             std::env::set_var(config::CONFIG_DIR_ENV, tmp.path());
-            Self { _guard: guard, _tmp: tmp, prev }
+            Self {
+                _guard: guard,
+                _tmp: tmp,
+                prev,
+            }
         }
     }
     impl Drop for TempConfig {
@@ -220,7 +231,10 @@ mod scoped_tests {
         s.scoped_models = Some(vec!["a".into(), "b".into()]);
         save_settings(&s).unwrap();
         let loaded = load_settings().unwrap();
-        assert_eq!(loaded.scoped_models, Some(vec!["a".to_string(), "b".to_string()]));
+        assert_eq!(
+            loaded.scoped_models,
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
         // Clearing removes the key.
         let mut s2 = load_settings().unwrap();
         s2.scoped_models = None;

@@ -49,7 +49,9 @@ impl WriteTool {
             description: "Write content to a file. Creates the file if it doesn't exist, \
                           overwrites if it does. Automatically creates parent directories."
                 .to_string(),
-            parameters: rpi_ai::types::Schema::new(serde_json::to_value(params).unwrap_or_default()),
+            parameters: rpi_ai::types::Schema::new(
+                serde_json::to_value(params).unwrap_or_default(),
+            ),
             constrained_sampling: None,
         }
     }

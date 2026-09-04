@@ -138,7 +138,11 @@ async fn ignores_tool_updates_after_execute_settles() {
     let captured: Arc<std::sync::Mutex<Option<Arc<dyn Fn(ToolResultPartial) + Send + Sync>>>> =
         Arc::new(std::sync::Mutex::new(None));
     let tool = DelayedTool {
-        schema: empty_object_schema("delayed_tool", "Delayed Tool", "Captures progress callbacks"),
+        schema: empty_object_schema(
+            "delayed_tool",
+            "Delayed Tool",
+            "Captures progress callbacks",
+        ),
         captured: Arc::clone(&captured),
     };
     let context = AgentContext {
@@ -148,8 +152,13 @@ async fn ignores_tool_updates_after_execute_settles() {
     };
 
     let stream_fn = single_tool_use_stream_fn(vec![("call-1", "delayed_tool")]);
-    let (events, _new_messages) =
-        run_and_collect(vec![user_message("run tool")], context, base_config(), stream_fn).await;
+    let (events, _new_messages) = run_and_collect(
+        vec![user_message("run tool")],
+        context,
+        base_config(),
+        stream_fn,
+    )
+    .await;
 
     // Exactly one update — the in-flight "running" one. The late call below
     // must NOT add another.
@@ -269,7 +278,11 @@ async fn ignores_settled_parallel_update_while_another_tool_runs() {
     > = Arc::new(std::sync::Mutex::new(None));
 
     let settled = SettledTool {
-        schema: empty_object_schema("settled_tool", "Settled Tool", "Captures progress callbacks"),
+        schema: empty_object_schema(
+            "settled_tool",
+            "Settled Tool",
+            "Captures progress callbacks",
+        ),
         captured: Arc::clone(&settled_captured),
     };
     let slow = BlockingTool {
@@ -285,7 +298,8 @@ async fn ignores_settled_parallel_update_while_another_tool_runs() {
 
     // Two tool calls in one message; settled_tool terminates, slow_tool blocks.
     // The run will end once slow_tool is released.
-    let stream_fn = single_tool_use_stream_fn(vec![("call-1", "settled_tool"), ("call-2", "slow_tool")]);
+    let stream_fn =
+        single_tool_use_stream_fn(vec![("call-1", "settled_tool"), ("call-2", "slow_tool")]);
 
     // We can't use run_and_collect — we need to interject mid-run. Drive the
     // loop on a task and collect events into a shared buffer.
@@ -295,9 +309,8 @@ async fn ignores_settled_parallel_update_while_another_tool_runs() {
     let prompts = vec![user_message("run tools")];
     let ctx = context;
     let sf = stream_fn;
-    let run_handle = tokio::spawn(async move {
-        rpi_agent::run_agent_loop(prompts, ctx, cfg, emit, sf).await
-    });
+    let run_handle =
+        tokio::spawn(async move { rpi_agent::run_agent_loop(prompts, ctx, cfg, emit, sf).await });
 
     // Wait for slow_tool to start (notified inside its execute).
     slow_started.notified().await;
@@ -349,7 +362,10 @@ async fn ignores_settled_parallel_update_while_another_tool_runs() {
 
     // Release slow_tool and let the run finish.
     release.notify_one();
-    let _ = run_handle.await.expect("run task panicked").expect("run ok");
+    let _ = run_handle
+        .await
+        .expect("run task panicked")
+        .expect("run ok");
 
     let final_updates = events_buf
         .lock()

@@ -19,13 +19,13 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::env::{
-    check_cancel_exec, check_cancel_file, ExecutionEnv, FileContent, FileKind, FileInfo,
+    check_cancel_exec, check_cancel_file, ExecutionEnv, FileContent, FileInfo, FileKind,
     FileSystem, Shell, ShellExecOptions, ShellOutput,
 };
-use crate::error::{io_to_file_code, ExecutionError, FileError, FileErrorCode};
 #[cfg(test)]
 use crate::error::ExecutionErrorCode;
-use crate::file_mutation_queue::{MutationQueueRegistry, MutatingEnv};
+use crate::error::{io_to_file_code, ExecutionError, FileError, FileErrorCode};
+use crate::file_mutation_queue::{MutatingEnv, MutationQueueRegistry};
 
 /// An in-memory file: bytes + mtime counter.
 #[derive(Clone)]
@@ -308,7 +308,10 @@ impl FileSystem for InMemoryExecutionEnv {
             .with_path(&abs)),
             Some(f) if f.kind == FileKind::Symlink => {
                 // Symlinks aren't really modeled here; treat as not-supported.
-                Err(FileError::new(FileErrorCode::NotSupported, "symlink read unsupported").with_path(&abs))
+                Err(
+                    FileError::new(FileErrorCode::NotSupported, "symlink read unsupported")
+                        .with_path(&abs),
+                )
             }
             _ => Err(FileError::not_found(&abs)),
         }
@@ -453,10 +456,15 @@ impl FileSystem for InMemoryExecutionEnv {
             format!("{abs}/")
         };
         // Verify the dir itself exists.
-        let dir_exists = g.files.get(&abs).map(|f| f.kind == FileKind::Directory).unwrap_or(abs == "/");
+        let dir_exists = g
+            .files
+            .get(&abs)
+            .map(|f| f.kind == FileKind::Directory)
+            .unwrap_or(abs == "/");
         if !dir_exists {
             return Err(if g.files.contains_key(&abs) {
-                FileError::new(FileErrorCode::NotDirectory, "path is not a directory").with_path(&abs)
+                FileError::new(FileErrorCode::NotDirectory, "path is not a directory")
+                    .with_path(&abs)
             } else {
                 FileError::not_found(&abs)
             });
@@ -794,7 +802,9 @@ mod tests {
     #[tokio::test]
     async fn write_read_roundtrip() {
         let env = InMemoryExecutionEnv::new();
-        env.write_file("/a/b.txt", "hello".into(), None).await.unwrap();
+        env.write_file("/a/b.txt", "hello".into(), None)
+            .await
+            .unwrap();
         let text = env.read_text_file("/a/b.txt", None).await.unwrap();
         assert_eq!(text, "hello");
         // Parent dir auto-created.
@@ -850,9 +860,15 @@ mod tests {
             .await;
         env.register_shell("git status", ShellScript::success("clean"))
             .await;
-        let out = env.exec("git status", ShellExecOptions::default()).await.unwrap();
+        let out = env
+            .exec("git status", ShellExecOptions::default())
+            .await
+            .unwrap();
         assert_eq!(out.stdout, "clean");
-        let out2 = env.exec("git log", ShellExecOptions::default()).await.unwrap();
+        let out2 = env
+            .exec("git log", ShellExecOptions::default())
+            .await
+            .unwrap();
         assert_eq!(out2.stdout, "git-out");
     }
 
@@ -861,7 +877,21 @@ mod tests {
         let env = InMemoryExecutionEnv::new();
         let token = CancellationToken::new();
         token.cancel();
-        let r = env.exec("anything", ShellExecOptions { cancel: Some(&token), ..Default::default() }).await;
-        assert!(matches!(r, Err(ExecutionError { code: ExecutionErrorCode::Aborted, .. })));
+        let r = env
+            .exec(
+                "anything",
+                ShellExecOptions {
+                    cancel: Some(&token),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(matches!(
+            r,
+            Err(ExecutionError {
+                code: ExecutionErrorCode::Aborted,
+                ..
+            })
+        ));
     }
 }

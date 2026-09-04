@@ -18,8 +18,7 @@ use async_trait::async_trait;
 use rpi_agent::agent_tool::AgentTool;
 use rpi_tools::{
     ExecutionEnv, ExecutionToolContext, FileContent, FileError, FileInfo, FileSystem,
-    InMemoryExecutionEnv, MutatingEnv, MutationQueueRegistry, Shell, ShellExecOptions,
-    ShellOutput,
+    InMemoryExecutionEnv, MutatingEnv, MutationQueueRegistry, Shell, ShellExecOptions, ShellOutput,
 };
 use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
@@ -224,7 +223,9 @@ async fn run_write(
 ) -> Result<rpi_agent::types::AgentToolResult, rpi_agent::error::AgentError> {
     let signal = signal.unwrap_or_default();
     let on_update = Arc::new(|_p| ());
-    let prepared = tool.prepare_arguments(params.clone()).unwrap_or_else(|_| params);
+    let prepared = tool
+        .prepare_arguments(params.clone())
+        .unwrap_or_else(|_| params);
     tool.execute("write-x", prepared, signal, on_update).await
 }
 
@@ -278,7 +279,10 @@ async fn queue_stays_locked_until_aborted_write_settles() {
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     {
         let started = *second_started.lock().await;
-        assert!(!started, "second write must not start while first is parked (abort does not unblock the queue)");
+        assert!(
+            !started,
+            "second write must not start while first is parked (abort does not unblock the queue)"
+        );
     }
 
     // Release the first write; it observes the abort and returns Err, releasing
@@ -295,10 +299,7 @@ async fn queue_stays_locked_until_aborted_write_settles() {
         .expect("second write ok");
 
     // The file reflects the second (winning) write only.
-    let abs = inner
-        .absolute_path("file.txt", None)
-        .await
-        .expect("abs");
+    let abs = inner.absolute_path("file.txt", None).await.expect("abs");
     let text = inner
         .read_text_file(&abs.to_string_lossy(), None)
         .await

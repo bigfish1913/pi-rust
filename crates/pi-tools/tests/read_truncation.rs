@@ -90,7 +90,8 @@ async fn read_truncates_large_text_by_line_count() {
     let result = run_read(tool, serde_json::json!({ "path": "large.txt" }))
         .await
         .expect("read ok");
-    assert!(text_output(&result).contains("[Showing lines 1-2000 of 2500. Use offset=2001 to continue.]"));
+    assert!(text_output(&result)
+        .contains("[Showing lines 1-2000 of 2500. Use offset=2001 to continue.]"));
     // details.truncation snapshot.
     let trunc = result
         .details
@@ -133,7 +134,10 @@ async fn read_rejects_offset_beyond_end() {
         AgentError::Tool(m) => m,
         other => panic!("expected Tool error, got {other:?}"),
     };
-    assert!(msg.contains("Offset 100 is beyond end of file (3 lines total)"), "got: {msg}");
+    assert!(
+        msg.contains("Offset 100 is beyond end of file (3 lines total)"),
+        "got: {msg}"
+    );
 }
 
 #[tokio::test]
@@ -150,12 +154,10 @@ async fn read_detects_supported_image_by_content() {
         .expect("read ok");
     assert!(text_output(&result).contains("Read image file [image/png]"));
     // The image content block carries the base64 of the raw bytes.
-    let has_image = result.content.iter().any(|c| {
-        matches!(
-            c,
-            rpi_agent::types::TextContentOrImage::Image(_)
-        )
-    });
+    let has_image = result
+        .content
+        .iter()
+        .any(|c| matches!(c, rpi_agent::types::TextContentOrImage::Image(_)));
     assert!(has_image, "expected an image content block");
     let b64 = encode_base64(&png);
     let found = result
@@ -178,7 +180,9 @@ fn base64_png() -> Vec<u8> {
     // Use the well-known 1x1 PNG base64:
     let b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGD4DwABBAEAX+XDSwAAAABJRU5ErkJggg==";
     use base64::Engine;
-    let full = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
+    let full = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .unwrap();
     let _ = bytes;
     full
 }

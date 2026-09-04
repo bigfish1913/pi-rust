@@ -28,8 +28,8 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use crate::env::FileKind;
 use crate::env::ExecutionEnv;
+use crate::env::FileKind;
 use crate::path_utils::resolve_read_tool_path;
 use crate::tools::tool_context::ExecutionToolContext;
 use crate::truncate::{
@@ -103,7 +103,9 @@ impl GrepTool {
                  {GREP_MAX_LINE_LENGTH} chars.",
                 kb = DEFAULT_MAX_BYTES / 1024
             ),
-            parameters: rpi_ai::types::Schema::new(serde_json::to_value(params).unwrap_or_default()),
+            parameters: rpi_ai::types::Schema::new(
+                serde_json::to_value(params).unwrap_or_default(),
+            ),
             constrained_sampling: None,
         }
     }
@@ -175,7 +177,11 @@ impl AgentTool for GrepTool {
                 .map_err(file_err_to_agent)?;
 
         // Determine dir vs file (following a symlinked root via canonical_path).
-        let info = self.env.file_info(&search_path, cancel).await.map_err(file_err_to_agent)?;
+        let info = self
+            .env
+            .file_info(&search_path, cancel)
+            .await
+            .map_err(file_err_to_agent)?;
         let root_kind = if info.kind == FileKind::Symlink {
             match self.env.canonical_path(&search_path, cancel).await {
                 Ok(canon) => match self.env.file_info(&canon.to_string_lossy(), cancel).await {
@@ -357,7 +363,11 @@ async fn search_file(
     // Glob filter (basename vs full-relative-path per `has_separator`).
     if let Some((matcher, has_sep)) = glob {
         let basename = basename(abs);
-        let passes = if *has_sep { matcher.is_match(rel) } else { matcher.is_match(&basename) };
+        let passes = if *has_sep {
+            matcher.is_match(rel)
+        } else {
+            matcher.is_match(&basename)
+        };
         if !passes {
             return Ok(());
         }

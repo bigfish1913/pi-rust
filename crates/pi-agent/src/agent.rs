@@ -15,7 +15,7 @@
 //!   blocks until the run settles and `abort`/`wait_for_idle` can act on it.
 
 use crate::agent_loop::{run_agent_loop, run_agent_loop_continue};
-use crate::events::{AgentEvent, AgentEmitter, BroadcastEmitter};
+use crate::events::{AgentEmitter, AgentEvent, BroadcastEmitter};
 use crate::hooks::{default_convert_to_llm_fn, AgentLoopConfig, ConvertToLlm};
 use crate::message::AgentMessage;
 use crate::queue::PendingMessageQueue;
@@ -262,7 +262,10 @@ impl AgentBuilder {
             .thinking_level
             .or(initial.thinking_level)
             .unwrap_or(rpi_ai::types::ThinkingLevel::Off);
-        let convert_to_llm = self.opts.convert_to_llm.unwrap_or_else(default_convert_to_llm_fn);
+        let convert_to_llm = self
+            .opts
+            .convert_to_llm
+            .unwrap_or_else(default_convert_to_llm_fn);
 
         let state = MutableAgentState {
             system_prompt: initial.system_prompt.unwrap_or_default(),
@@ -366,7 +369,8 @@ impl Agent {
 
     /// Start a new prompt from text. Convenience for `prompt_message`.
     pub async fn prompt(&self, text: impl Into<String>) -> Result<(), crate::AgentError> {
-        let message = AgentMessage::User(UserMessage::new(UserContent::Text(text.into()), now_ms()));
+        let message =
+            AgentMessage::User(UserMessage::new(UserContent::Text(text.into()), now_ms()));
         self.prompt_messages(vec![message]).await
     }
 
@@ -417,7 +421,12 @@ impl Agent {
         state.pending_tool_calls.clear();
         state.error_message = None;
         drop(state);
-        let _ = self.inner.steering_queue.lock().expect("steer lock").try_drain();
+        let _ = self
+            .inner
+            .steering_queue
+            .lock()
+            .expect("steer lock")
+            .try_drain();
         let _ = self
             .inner
             .follow_up_queue
@@ -540,7 +549,9 @@ impl Agent {
         let signal = self.abort_token();
         let context = self.context_snapshot();
         if context.messages.is_empty() {
-            return Err(crate::AgentError::State("No messages to continue from".into()));
+            return Err(crate::AgentError::State(
+                "No messages to continue from".into(),
+            ));
         }
         if context.messages.last().unwrap().is_assistant() {
             return Err(crate::AgentError::State(
@@ -578,8 +589,8 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use rpi_ai::event_stream::create_assistant_message_event_stream;
-    use rpi_ai::providers::faux::{FauxScript, FauxProvider};
     use rpi_ai::provider::Provider;
+    use rpi_ai::providers::faux::{FauxProvider, FauxScript};
 
     fn faux_stream_fn(provider: Arc<FauxProvider>) -> StreamFn {
         crate::stream_fn::stream_fn(move |model, ctx, opts| {

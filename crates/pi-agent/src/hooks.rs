@@ -26,24 +26,19 @@ use tokio_util::sync::CancellationToken;
 /// `(messages: AgentMessage[]) -> Message[]` — the required
 /// LLM-boundary converter. Filters/transforms custom messages into the
 /// provider-facing `Message` union. Must not panic.
-pub type ConvertToLlm = Arc<
-    dyn Fn(Vec<AgentMessage>) -> BoxFuture<'static, Vec<Message>> + Send + Sync,
->;
+pub type ConvertToLlm =
+    Arc<dyn Fn(Vec<AgentMessage>) -> BoxFuture<'static, Vec<Message>> + Send + Sync>;
 
 /// `(messages, signal) -> AgentMessage[]` — optional pre-convert transform at
 /// the `AgentMessage` level (context-window pruning, external injection).
 pub type TransformContext = Arc<
-    dyn Fn(
-            Vec<AgentMessage>,
-            CancellationToken,
-        ) -> BoxFuture<'static, Vec<AgentMessage>>
+    dyn Fn(Vec<AgentMessage>, CancellationToken) -> BoxFuture<'static, Vec<AgentMessage>>
         + Send
         + Sync,
 >;
 
 /// `(provider: &str) -> Option<String>` — dynamic API-key resolver per turn.
-pub type GetApiKey =
-    Arc<dyn Fn(&str) -> BoxFuture<'static, Option<String>> + Send + Sync>;
+pub type GetApiKey = Arc<dyn Fn(&str) -> BoxFuture<'static, Option<String>> + Send + Sync>;
 
 /// `(context) -> bool` — return true to stop after the current turn (before
 /// steering/follow-up drain).
@@ -59,12 +54,10 @@ pub type PrepareNextTurn = Arc<
 >;
 
 /// `() -> Vec<AgentMessage>` — messages to inject mid-run after a tool batch.
-pub type GetSteeringMessages =
-    Arc<dyn Fn() -> BoxFuture<'static, Vec<AgentMessage>> + Send + Sync>;
+pub type GetSteeringMessages = Arc<dyn Fn() -> BoxFuture<'static, Vec<AgentMessage>> + Send + Sync>;
 
 /// `() -> Vec<AgentMessage>` — messages to inject after the loop would stop.
-pub type GetFollowUpMessages =
-    Arc<dyn Fn() -> BoxFuture<'static, Vec<AgentMessage>> + Send + Sync>;
+pub type GetFollowUpMessages = Arc<dyn Fn() -> BoxFuture<'static, Vec<AgentMessage>> + Send + Sync>;
 
 /// `(context, signal) -> Option<BeforeToolCallResult>` — can block a tool call
 /// before it runs.
@@ -136,10 +129,19 @@ impl std::fmt::Debug for AgentLoopConfig {
             .field("session_id", &self.session_id)
             .field("transform_context", &self.transform_context.is_some())
             .field("get_api_key", &self.get_api_key.is_some())
-            .field("should_stop_after_turn", &self.should_stop_after_turn.is_some())
+            .field(
+                "should_stop_after_turn",
+                &self.should_stop_after_turn.is_some(),
+            )
             .field("prepare_next_turn", &self.prepare_next_turn.is_some())
-            .field("get_steering_messages", &self.get_steering_messages.is_some())
-            .field("get_follow_up_messages", &self.get_follow_up_messages.is_some())
+            .field(
+                "get_steering_messages",
+                &self.get_steering_messages.is_some(),
+            )
+            .field(
+                "get_follow_up_messages",
+                &self.get_follow_up_messages.is_some(),
+            )
             .field("before_tool_call", &self.before_tool_call.is_some())
             .field("after_tool_call", &self.after_tool_call.is_some())
             .finish()

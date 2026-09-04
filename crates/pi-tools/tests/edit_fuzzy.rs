@@ -45,7 +45,9 @@ async fn run_edit(
     let on_update = Arc::new(|_p| ());
     // prepare_arguments folds legacy fields + JSON-string edits, mirroring the
     // TS pre-validation step the loop applies before execute.
-    let prepared = tool.prepare_arguments(params.clone()).unwrap_or_else(|_| params);
+    let prepared = tool
+        .prepare_arguments(params.clone())
+        .unwrap_or_else(|_| params);
     tool.execute("edit-1", prepared, signal, on_update).await
 }
 
@@ -81,14 +83,20 @@ async fn applies_disjoint_edits_and_returns_diffs() {
     .await
     .expect("edit ok");
 
-    assert_eq!(text_output(&result), "Successfully replaced 2 block(s) in edit.txt.");
+    assert_eq!(
+        text_output(&result),
+        "Successfully replaced 2 block(s) in edit.txt."
+    );
     let diff = result.details["diff"].as_str().expect("diff present");
     assert!(diff.contains("ALPHA"), "{diff}");
     assert!(diff.contains("GAMMA"), "{diff}");
     // Patch reproduces the edited content when applied to the original.
     let patch = result.details["patch"].as_str().expect("patch present");
     assert!(patch.contains("ALPHA"), "patch should mention ALPHA");
-    assert_eq!(read_back(&env, "edit.txt").await, "ALPHA\nbeta\nGAMMA\ndelta\n");
+    assert_eq!(
+        read_back(&env, "edit.txt").await,
+        "ALPHA\nbeta\nGAMMA\ndelta\n"
+    );
 }
 
 #[tokio::test]
@@ -187,7 +195,10 @@ async fn fuzzy_matches_smart_quote_apostrophe() {
     )
     .await
     .expect("fuzzy edit ok");
-    assert_eq!(text_output(&result), "Successfully replaced 1 block(s) in edit.txt.");
+    assert_eq!(
+        text_output(&result),
+        "Successfully replaced 1 block(s) in edit.txt."
+    );
     assert_eq!(read_back(&env, "edit.txt").await, "it is a file\n");
 }
 
@@ -209,5 +220,8 @@ async fn rejects_noop_edit() {
         AgentError::Tool(m) => m,
         other => panic!("expected Tool error, got {other:?}"),
     };
-    assert!(m.to_lowercase().contains("no change") || m.to_lowercase().contains("no-op"), "got: {m}");
+    assert!(
+        m.to_lowercase().contains("no change") || m.to_lowercase().contains("no-op"),
+        "got: {m}"
+    );
 }

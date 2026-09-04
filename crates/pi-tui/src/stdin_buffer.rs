@@ -273,13 +273,13 @@ mod tests {
         let buffer = StdinBuffer::new();
         let received = Arc::new(Mutex::new(String::new()));
         let received_clone = received.clone();
-        
+
         buffer.on_event(Arc::new(move |event| {
             if let StdinBufferEvent::Data(data) = event {
                 *received_clone.lock().unwrap() = data.clone();
             }
         }));
-        
+
         buffer.process("hello");
         assert_eq!(*received.lock().unwrap(), "hello");
     }
@@ -289,13 +289,13 @@ mod tests {
         let buffer = StdinBuffer::new();
         let received = Arc::new(Mutex::new(String::new()));
         let received_clone = received.clone();
-        
+
         buffer.on_event(Arc::new(move |event| {
             if let StdinBufferEvent::PasteEnd(data) = event {
                 *received_clone.lock().unwrap() = data.clone();
             }
         }));
-        
+
         buffer.process("\x1b[200~pasted content\x1b[201~");
         assert_eq!(*received.lock().unwrap(), "pasted content");
     }
@@ -305,7 +305,7 @@ mod tests {
         let buffer = StdinBuffer::new();
         buffer.process("data");
         buffer.reset();
-        
+
         assert!(!buffer.is_in_paste());
     }
 }

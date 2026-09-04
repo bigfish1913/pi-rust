@@ -8,7 +8,10 @@ use std::sync::{Arc, Mutex};
 
 use super::component::Component;
 use super::container::Container;
-use super::layout::{extract_cursor_position, render_layout_frame, LayoutFrame};
+use super::layout::{
+    extract_cursor_position, render_layout_frame, render_layout_frame_reusing_scroll_content,
+    LayoutFrame,
+};
 use super::scroll_view::ScrollView;
 use super::tui::{OverlayHandle, OverlayOptions, TuiMode, TuiStopOptions, TUI};
 use crate::terminal::{InputEvent, Terminal, TerminalInfo};
@@ -18,6 +21,11 @@ pub const VIEWPORT_TUI: &[u8] = b"@earendil-works/pi-tui/viewport";
 
 /// Alternate screen TUI with application-owned scrolling.
 pub struct TuiAltScreen {
+    /// Serializes the complete diff/render/write transaction. Input, streaming
+    /// events, and loader ticks can request frames from different threads; if
+    /// they race, an older frame can otherwise overwrite `previous_screen`
+    /// after a newer frame has already reached the terminal.
+    render_lock: Mutex<()>,
     terminal: Mutex<Box<dyn Terminal>>,
     container: Container,
     layout_root: Mutex<Option<Arc<dyn Component>>>,
@@ -39,8 +47,13 @@ pub struct TuiAltScreen {
 
 impl TuiAltScreen {
     /// Create a new alternate screen TUI.
-    pub fn new(terminal: Box<dyn Terminal>, show_hardware_cursor: bool, _log_directory: Option<&str>) -> Self {
+    pub fn new(
+        terminal: Box<dyn Terminal>,
+        show_hardware_cursor: bool,
+        _log_directory: Option<&str>,
+    ) -> Self {
         Self {
+            render_lock: Mutex::new(()),
             terminal: Mutex::new(terminal),
             container: Container::new(),
             layout_root: Mutex::new(None),
@@ -69,6 +82,10 @@ impl TuiAltScreen {
     /// Get the layout root.
     pub fn get_layout_root(&self) -> Option<Arc<dyn Component>> {
         self.layout_root.lock().ok()?.clone()
+    }
+
+    fn is_running(&self) -> bool {
+        self.running.lock().map(|running| *running).unwrap_or(false)
     }
 
     /// Get the current scroll position.
@@ -119,17 +136,19 @@ impl TuiAltScreen {
 
     /// Get the primary scroll view if any.
     pub fn get_primary_scroll_view(&self) -> Option<Arc<ScrollView>> {
-        self.current_frame.lock().ok()?.as_ref()?.primary_scroll_view.clone()
+        self.current_frame
+            .lock()
+            .ok()?
+            .as_ref()?
+            .primary_scroll_view
+            .clone()
     }
 
     /// Get the current terminal column count (cached, refreshed on resize).
     /// Used by callers that need a width for off-layout rendering (e.g.
     /// diff-line width sizing) without re-reading the terminal themselves.
     pub fn width(&self) -> usize {
-        self.terminal
-            .lock()
-            .map(|t| t.columns())
-            .unwrap_or(80)
+        self.terminal.lock().map(|t| t.columns()).unwrap_or(80)
     }
 
     /// Set the terminal window/tab title.
@@ -195,7 +214,11 @@ impl TuiAltScreen {
     }
 
     /// Perform a differential render with constrained layout.
-    fn do_render(&self) {
+    fn do_render(&self, reuse_scroll_content: bool) {
+        let Ok(_render_guard) = self.render_lock.lock() else {
+            return;
+        };
+
         let (width, height) = if let Ok(terminal) = self.terminal.lock() {
             (terminal.columns(), terminal.rows())
         } else {
@@ -204,10 +227,15 @@ impl TuiAltScreen {
 
         // Get layout root or use container
         let root = self.get_layout_root();
-        let root_component: Arc<dyn Component> = root.unwrap_or_else(|| Arc::new(self.container.clone()));
+        let root_component: Arc<dyn Component> =
+            root.unwrap_or_else(|| Arc::new(self.container.clone()));
 
         // Render layout frame
-        let frame = render_layout_frame(root_component.clone(), width, height);
+        let frame = if reuse_scroll_content {
+            render_layout_frame_reusing_scroll_content(root_component.clone(), width, height)
+        } else {
+            render_layout_frame(root_component.clone(), width, height)
+        };
 
         // Store the frame for input handling
         if let Ok(mut current) = self.current_frame.lock() {
@@ -218,7 +246,11 @@ impl TuiAltScreen {
         let visible = frame.lines;
 
         // Check for full redraw
-        let previous = self.previous_screen.lock().map(|p| p.clone()).unwrap_or_default();
+        let previous = self
+            .previous_screen
+            .lock()
+            .map(|p| p.clone())
+            .unwrap_or_default();
         let full_redraw = previous.len() != height || previous.is_empty();
 
         // Build output buffer
@@ -295,7 +327,7 @@ impl TUI for TuiAltScreen {
 
     fn terminal(&self) -> &dyn Terminal {
         // This trait method is problematic because we store Terminal in Mutex<Box<dyn Terminal>>
-        // We cannot return a reference through a Mutex guard. 
+        // We cannot return a reference through a Mutex guard.
         // For now, we provide a stub that should not be called.
         // Alternative: change the trait to not require this method, or use different storage.
         // This is a known design issue - users should use the terminal through other methods.
@@ -318,7 +350,10 @@ impl TUI for TuiAltScreen {
     }
 
     fn get_show_hardware_cursor(&self) -> bool {
-        self.show_hardware_cursor.lock().map(|s| *s).unwrap_or(false)
+        self.show_hardware_cursor
+            .lock()
+            .map(|s| *s)
+            .unwrap_or(false)
     }
 
     fn set_show_hardware_cursor(&self, enabled: bool) {
@@ -347,7 +382,11 @@ impl TUI for TuiAltScreen {
         self.focused.lock().ok()?.clone()
     }
 
-    fn show_overlay(&self, _component: Arc<dyn Component>, _options: Option<OverlayOptions>) -> Arc<dyn OverlayHandle> {
+    fn show_overlay(
+        &self,
+        _component: Arc<dyn Component>,
+        _options: Option<OverlayOptions>,
+    ) -> Arc<dyn OverlayHandle> {
         Arc::new(DummyOverlayHandle)
     }
 
@@ -382,30 +421,38 @@ impl TUI for TuiAltScreen {
         }
 
         self.enter_alt_screen();
-        self.do_render();
+        self.do_render(false);
     }
 
     fn stop(&self, options: TuiStopOptions) {
         if let Ok(mut running) = self.running.lock() {
             *running = false;
         }
-        
-        // Stop terminal first
+
+        // Leave the alternate buffer and clear the restored main screen while
+        // the terminal is still in raw mode. Restoring terminal modes first can
+        // make some Windows terminals repaint the saved pre-TUI contents after
+        // our clear sequence.
+        self.exit_alt_screen(options.preserve_screen);
+
         if let Ok(terminal) = self.terminal.lock() {
             terminal.stop();
         }
-        
-        // Exit alt screen
-        self.exit_alt_screen(options.preserve_screen);
     }
 
     fn render_now(&self, force: bool) {
+        // Layout is assembled before `start()`. Rendering during that phase
+        // writes the future TUI frame into the main screen, which is then
+        // restored on exit and appears as uncleared output.
+        if !self.is_running() {
+            return;
+        }
         if force {
             if let Ok(mut prev) = self.previous_screen.lock() {
                 prev.clear();
             }
         }
-        self.do_render();
+        self.do_render(false);
     }
 
     fn request_render(&self, _force: bool) {
@@ -435,7 +482,16 @@ impl TuiAltScreen {
             terminal.enter_raw_mode();
         }
         self.enter_alt_screen();
-        self.do_render();
+        self.do_render(false);
+    }
+
+    /// Render a frame while reusing scroll-view content. This is appropriate
+    /// when only the viewport or bottom dock changed. A missing cache or width
+    /// change falls back to rendering fresh content automatically.
+    pub fn request_render_reusing_scroll_content(&self) {
+        if self.is_running() {
+            self.do_render(true);
+        }
     }
 }
 
@@ -451,16 +507,22 @@ struct DummyOverlayHandle;
 impl OverlayHandle for DummyOverlayHandle {
     fn hide(&self) {}
     fn set_hidden(&self, _hidden: bool) {}
-    fn is_hidden(&self) -> bool { false }
+    fn is_hidden(&self) -> bool {
+        false
+    }
     fn focus(&self) {}
-    fn is_focused(&self) -> bool { false }
+    fn is_focused(&self) -> bool {
+        false
+    }
 }
 
 /// Dummy terminal for the terminal() stub.
 struct DummyTerminal;
 
 impl Terminal for DummyTerminal {
-    fn info(&self) -> TerminalInfo { TerminalInfo::default() }
+    fn info(&self) -> TerminalInfo {
+        TerminalInfo::default()
+    }
     fn write(&self, _data: &str) {}
     fn hide_cursor(&self) {}
     fn show_cursor(&self) {}
@@ -471,9 +533,85 @@ impl Terminal for DummyTerminal {
     fn disable_mouse(&self) {}
     fn enter_raw_mode(&self) {}
     fn refresh_size(&self) {}
-    fn start(&self, _on_input: Box<dyn Fn(InputEvent) + Send + Sync>, _on_resize: Box<dyn Fn() + Send + Sync>) {}
+    fn start(
+        &self,
+        _on_input: Box<dyn Fn(InputEvent) + Send + Sync>,
+        _on_resize: Box<dyn Fn() + Send + Sync>,
+    ) {
+    }
     fn stop(&self) {}
-    fn is_tty(&self) -> bool { false }
+    fn is_tty(&self) -> bool {
+        false
+    }
     fn set_progress(&self, _active: bool) {}
     fn flush(&self) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Text;
+
+    struct RecordingTerminal {
+        output: Arc<Mutex<String>>,
+    }
+
+    impl Terminal for RecordingTerminal {
+        fn info(&self) -> TerminalInfo {
+            TerminalInfo {
+                columns: 40,
+                rows: 8,
+                ..Default::default()
+            }
+        }
+
+        fn write(&self, data: &str) {
+            self.output.lock().unwrap().push_str(data);
+        }
+
+        fn hide_cursor(&self) {}
+        fn show_cursor(&self) {}
+        fn move_cursor(&self, _row: usize, _col: usize) {}
+        fn clear_screen(&self) {}
+        fn set_title(&self, _title: &str) {}
+        fn enable_mouse(&self) {}
+        fn disable_mouse(&self) {}
+        fn enter_raw_mode(&self) {}
+        fn refresh_size(&self) {}
+        fn start(
+            &self,
+            _on_input: Box<dyn Fn(InputEvent) + Send + Sync>,
+            _on_resize: Box<dyn Fn() + Send + Sync>,
+        ) {
+        }
+        fn stop(&self) {}
+        fn is_tty(&self) -> bool {
+            true
+        }
+        fn set_progress(&self, _active: bool) {}
+        fn flush(&self) {}
+    }
+
+    #[test]
+    fn layout_does_not_touch_main_screen_and_stop_clears_it() {
+        let output = Arc::new(Mutex::new(String::new()));
+        let terminal = RecordingTerminal {
+            output: output.clone(),
+        };
+        let tui = TuiAltScreen::new(Box::new(terminal), true, None);
+
+        tui.set_layout_root(Some(Arc::new(Text::new("screen content", 0, 0))));
+        assert!(output.lock().unwrap().is_empty());
+
+        tui.start_readerless();
+        assert!(output.lock().unwrap().contains("screen content"));
+
+        tui.stop(TuiStopOptions::default());
+        let rendered = output.lock().unwrap().clone();
+        let content_position = rendered.find("screen content").unwrap();
+        let clear_position = rendered
+            .rfind("\x1b[?1049l\x1b[2J\x1b[H\x1b[?25h")
+            .expect("stop should leave alt screen and clear the restored main screen");
+        assert!(clear_position > content_position);
+    }
 }

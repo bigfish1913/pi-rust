@@ -36,9 +36,12 @@
 
 use std::sync::Arc;
 
-use rpi_ai::event_stream::{create_assistant_message_event_stream};
+use rpi_ai::event_stream::create_assistant_message_event_stream;
 use rpi_ai::types::{AssistantMessage, DoneReason, ErrorReason};
-use rpi_ai::{AssistantMessageEvent, AssistantMessageEventStream, AssistantMessageEventStreamProducer, Context, Model, Provider, SimpleStreamOptions};
+use rpi_ai::{
+    AssistantMessageEvent, AssistantMessageEventStream, AssistantMessageEventStreamProducer,
+    Context, Model, Provider, SimpleStreamOptions,
+};
 use tokio::runtime::Handle;
 
 use crate::loader::ExtensionSession;
@@ -83,10 +86,7 @@ impl PluggableProvider {
     /// nothing). The `Handle` MUST be captured from a thread running the target
     /// runtime (pi-cli builds providers on the async main thread, same as the
     /// `ActionBridge`).
-    pub fn from_session(
-        session: &ExtensionSession,
-        runtime: Handle,
-    ) -> Vec<Arc<dyn Provider>> {
+    pub fn from_session(session: &ExtensionSession, runtime: Handle) -> Vec<Arc<dyn Provider>> {
         let Some(snapshot) = session.snapshot_arc() else {
             return Vec::new();
         };
@@ -96,8 +96,12 @@ impl PluggableProvider {
             .iter()
             .cloned()
             .map(|record| {
-                Self::new(record, Arc::clone(&snapshot), Arc::clone(&keepalive), runtime.clone())
-                    as Arc<dyn Provider>
+                Self::new(
+                    record,
+                    Arc::clone(&snapshot),
+                    Arc::clone(&keepalive),
+                    runtime.clone(),
+                ) as Arc<dyn Provider>
             })
             .collect()
     }
@@ -201,9 +205,7 @@ async fn drive_plugin_provider(
     // `spawn_blocking` the sync ffi call — `request_fn` is blocking by contract.
     // The join handle is awaited so a panic in the plugin (caught by
     // `catch_unwind` below) surfaces as an error, not a silent hang.
-    let join = runtime.spawn_blocking(move || {
-        run_provider_request(&record, &request_json)
-    });
+    let join = runtime.spawn_blocking(move || run_provider_request(&record, &request_json));
     let outcome = match join.await {
         Ok(inner) => inner,
         Err(join_err) => {
@@ -264,10 +266,7 @@ fn run_provider_request(record: &RegisteredProvider, request_json: &str) -> Prov
     }
 }
 
-fn run_provider_request_inner(
-    record: &RegisteredProvider,
-    request_json: &str,
-) -> ProviderOutcome {
+fn run_provider_request_inner(record: &RegisteredProvider, request_json: &str) -> ProviderOutcome {
     // Borrowed request envelope: the plugin must NOT free it (StbStringRef is a
     // borrow — the SDK contract).
     let req_ref = StbStringRef::from_str(request_json);

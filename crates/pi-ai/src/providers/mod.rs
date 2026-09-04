@@ -2,11 +2,13 @@
 //! provider (`packages/agent/src/faux.ts`, hoisted here so every crate's tests
 //! can reuse it without depending on `pi-agent`).
 //!
-//! v1 ships faux (always-on) + anthropic (behind the `providers` feature).
-//! Other providers (openai/google/bedrock) leave the trait seam in
-//! [`crate::provider`] for the future.
+//! Faux is always available. HTTP providers are enabled by the `providers`
+//! feature.
 
 pub mod faux;
 
 #[cfg(feature = "providers")]
 pub mod anthropic;
+
+#[cfg(feature = "providers")]
+pub mod openai_completions;

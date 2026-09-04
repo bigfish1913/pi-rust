@@ -102,41 +102,41 @@ impl Default for ThemeColors {
         // handled per-`Color` variant at emit time.
         Self {
             text: Color::Default,
-            muted: Color::Ansi256(244),    // gray (#808080-ish)
-            dim: Color::Ansi256(242),      // dimGray (#666666-ish)
-            accent: Color::Ansi256(108),   // accent teal (#8abeb7) ≈ 108
-            error: Color::Ansi256(131),    // red (#cc6666) ≈ 131
-            success: Color::Ansi256(107),  // green (#b5bd68) ≈ 107
-            warning: Color::Ansi256(226),  // yellow
-            info: Color::Ansi256(81),      // cyan
+            muted: Color::Ansi256(244),   // gray (#808080-ish)
+            dim: Color::Ansi256(242),     // dimGray (#666666-ish)
+            accent: Color::Ansi256(108),  // accent teal (#8abeb7) ≈ 108
+            error: Color::Ansi256(131),   // red (#cc6666) ≈ 131
+            success: Color::Ansi256(107), // green (#b5bd68) ≈ 107
+            warning: Color::Ansi256(226), // yellow
+            info: Color::Ansi256(81),     // cyan
             background: Color::Default,
-            surface: Color::Ansi256(236),  // userMessageBg (#343541) ≈ 236
-            border: Color::Ansi256(67),    // border blue (#5f87ff) ≈ 67
-            border_accent: Color::Ansi256(45),   // borderAccent cyan (#00d7ff) ≈ 45
-            border_muted: Color::Ansi256(239),   // borderMuted darkGray (#505050) ≈ 239
+            surface: Color::Ansi256(236), // userMessageBg (#343541) ≈ 236
+            border: Color::Ansi256(67),   // border blue (#5f87ff) ≈ 67
+            border_accent: Color::Ansi256(45), // borderAccent cyan (#00d7ff) ≈ 45
+            border_muted: Color::Ansi256(239), // borderMuted darkGray (#505050) ≈ 239
             selection: Color::Ansi256(60), // selectedBg (#3a3a4a) ≈ 60
             cursor: Color::Ansi256(81),
-            thinking_text: Color::Ansi256(244),  // thinkingText gray
+            thinking_text: Color::Ansi256(244), // thinkingText gray
 
             // Markdown
-            md_heading: Color::Ansi256(179),     // gold (#f0c674) ≈ 179
-            md_link: Color::Ansi256(110),        // blue (#81a2be) ≈ 110
-            md_link_url: Color::Ansi256(242),    // dimGray
-            md_code: Color::Ansi256(108),        // accent teal
-            md_code_block: Color::Ansi256(107),  // green (#b5bd68) ≈ 107
+            md_heading: Color::Ansi256(179),  // gold (#f0c674) ≈ 179
+            md_link: Color::Ansi256(110),     // blue (#81a2be) ≈ 110
+            md_link_url: Color::Ansi256(242), // dimGray
+            md_code: Color::Ansi256(108),     // accent teal
+            md_code_block: Color::Ansi256(107), // green (#b5bd68) ≈ 107
             md_code_block_border: Color::Ansi256(244), // gray
-            md_quote: Color::Ansi256(244),       // gray
+            md_quote: Color::Ansi256(244),    // gray
             md_quote_border: Color::Ansi256(244),
             md_hr: Color::Ansi256(244),
             md_list_bullet: Color::Ansi256(108), // accent
 
             // Tool blocks
-            tool_pending_bg: Color::Ansi256(235),  // (#282832) ≈ 235
-            tool_success_bg: Color::Ansi256(22),   // dark-green (#283228) ≈ 22
-            tool_error_bg: Color::Ansi256(52),     // dark-red (#3c2828) ≈ 52
+            tool_pending_bg: Color::Ansi256(235), // (#282832) ≈ 235
+            tool_success_bg: Color::Ansi256(22),  // dark-green (#283228) ≈ 22
+            tool_error_bg: Color::Ansi256(52),    // dark-red (#3c2828) ≈ 52
             tool_title: Color::Default,
             tool_output: Color::Ansi256(244),
-            bash_mode: Color::Ansi256(107),        // green
+            bash_mode: Color::Ansi256(107), // green
 
             // Tool diffs
             tool_diff_added: Color::Ansi256(107),   // green
@@ -187,7 +187,13 @@ impl Color {
 
     /// Apply color to text (background).
     pub fn bg(&self, text: &str) -> String {
-        format!("{}{}\x1b[0m", self.to_bg(), text)
+        let bg = self.to_bg();
+        // Foreground helpers deliberately terminate with SGR 0. When such a
+        // styled span is nested in a panel background, that reset also clears
+        // the background and used to leave the rest of tool/user rows patchy.
+        // Re-apply this background after every nested reset.
+        let nested = text.replace("\x1b[0m", &format!("\x1b[0m{bg}"));
+        format!("{bg}{nested}\x1b[0m")
     }
 }
 
@@ -314,95 +320,102 @@ impl ThemeManager {
         }
     }
 
-    /// Apply a preset theme.
+    /// Apply a preset theme to this manager.
     pub fn apply_preset(&self, preset: ThemePreset) {
-        let theme = match preset {
-            ThemePreset::Dark => Theme::default(),
-            ThemePreset::Light => {
-                let mut colors = ThemeColors::default();
-                colors.text = Color::Default;
-                colors.muted = Color::Ansi256(241); // mediumGray (#6c6c6c)
-                colors.dim = Color::Ansi256(243);   // dimGray (#767676)
-                colors.accent = Color::Ansi256(66); // teal (#5a8080)
-                colors.error = Color::Ansi256(131); // red (#aa5555)
-                colors.success = Color::Ansi256(65); // green (#588458)
-                colors.warning = Color::Ansi256(136); // yellow (#9a7326)
-                colors.info = Color::Ansi256(67);   // blue
-                colors.background = Color::Default;
-                colors.surface = Color::Ansi256(254); // userMsgBg (#e8e8e8)
-                colors.border = Color::Ansi256(67);  // blue (#547da7)
-                colors.border_accent = Color::Ansi256(66); // teal
-                colors.border_muted = Color::Ansi256(249); // lightGray (#b0b0b0)
-                colors.selection = Color::Ansi256(189);    // selectedBg (#d0d0e0)
-                colors.cursor = Color::Ansi256(67);
-                colors.thinking_text = Color::Ansi256(241);
-                colors.md_heading = Color::Ansi256(136); // yellow
-                colors.md_link = Color::Ansi256(67);     // blue
-                colors.md_link_url = Color::Ansi256(243);
-                colors.md_code = Color::Ansi256(66);     // teal
-                colors.md_code_block = Color::Ansi256(65); // green
-                colors.md_code_block_border = Color::Ansi256(241);
-                colors.md_quote = Color::Ansi256(241);
-                colors.md_quote_border = Color::Ansi256(241);
-                colors.md_hr = Color::Ansi256(241);
-                colors.md_list_bullet = Color::Ansi256(65); // green
-                colors.tool_pending_bg = Color::Ansi256(189);
-                colors.tool_success_bg = Color::Ansi256(151);
-                colors.tool_error_bg = Color::Ansi256(181);
-                colors.tool_title = Color::Default;
-                colors.tool_output = Color::Ansi256(241);
-                colors.bash_mode = Color::Ansi256(65);
-                colors.tool_diff_added = Color::Ansi256(65);
-                colors.tool_diff_removed = Color::Ansi256(131);
-                colors.tool_diff_context = Color::Ansi256(241);
-                Theme {
-                    colors,
-                    ..Default::default()
-                }
+        self.set(theme_for_preset(preset));
+    }
+}
+
+/// Build a complete theme for a preset.
+///
+/// Kept separate from [`ThemeManager::apply_preset`] so the process-wide theme
+/// used by components can be updated without maintaining a second palette.
+fn theme_for_preset(preset: ThemePreset) -> Theme {
+    match preset {
+        ThemePreset::Dark => Theme::default(),
+        ThemePreset::Light => {
+            let mut colors = ThemeColors::default();
+            colors.text = Color::Default;
+            colors.muted = Color::Ansi256(241); // mediumGray (#6c6c6c)
+            colors.dim = Color::Ansi256(243); // dimGray (#767676)
+            colors.accent = Color::Ansi256(66); // teal (#5a8080)
+            colors.error = Color::Ansi256(131); // red (#aa5555)
+            colors.success = Color::Ansi256(65); // green (#588458)
+            colors.warning = Color::Ansi256(136); // yellow (#9a7326)
+            colors.info = Color::Ansi256(67); // blue
+            colors.background = Color::Default;
+            colors.surface = Color::Ansi256(254); // userMsgBg (#e8e8e8)
+            colors.border = Color::Ansi256(67); // blue (#547da7)
+            colors.border_accent = Color::Ansi256(66); // teal
+            colors.border_muted = Color::Ansi256(249); // lightGray (#b0b0b0)
+            colors.selection = Color::Ansi256(189); // selectedBg (#d0d0e0)
+            colors.cursor = Color::Ansi256(67);
+            colors.thinking_text = Color::Ansi256(241);
+            colors.md_heading = Color::Ansi256(136); // yellow
+            colors.md_link = Color::Ansi256(67); // blue
+            colors.md_link_url = Color::Ansi256(243);
+            colors.md_code = Color::Ansi256(66); // teal
+            colors.md_code_block = Color::Ansi256(65); // green
+            colors.md_code_block_border = Color::Ansi256(241);
+            colors.md_quote = Color::Ansi256(241);
+            colors.md_quote_border = Color::Ansi256(241);
+            colors.md_hr = Color::Ansi256(241);
+            colors.md_list_bullet = Color::Ansi256(65); // green
+            colors.tool_pending_bg = Color::Ansi256(189);
+            colors.tool_success_bg = Color::Ansi256(151);
+            colors.tool_error_bg = Color::Ansi256(181);
+            colors.tool_title = Color::Default;
+            colors.tool_output = Color::Ansi256(241);
+            colors.bash_mode = Color::Ansi256(65);
+            colors.tool_diff_added = Color::Ansi256(65);
+            colors.tool_diff_removed = Color::Ansi256(131);
+            colors.tool_diff_context = Color::Ansi256(241);
+            Theme {
+                colors,
+                ..Default::default()
             }
-            ThemePreset::Monochrome => {
-                let mut colors = ThemeColors::default();
-                for f in [
-                    &mut colors.accent,
-                    &mut colors.border_accent,
-                    &mut colors.md_code,
-                    &mut colors.md_list_bullet,
-                    &mut colors.bash_mode,
-                ] {
-                    *f = Color::Ansi256(15);
-                }
-                colors.muted = Color::Ansi256(244);
-                colors.dim = Color::Ansi256(242);
-                colors.error = Color::Ansi256(9);
-                colors.success = Color::Ansi256(15);
-                colors.warning = Color::Ansi256(15);
-                colors.info = Color::Ansi256(15);
-                colors.surface = Color::Ansi256(236);
-                colors.border = Color::Ansi256(244);
-                colors.border_muted = Color::Ansi256(240);
-                colors.selection = Color::Ansi256(244);
-                colors.cursor = Color::Ansi256(15);
-                colors.thinking_text = Color::Ansi256(244);
-                colors.md_heading = Color::Ansi256(15);
-                colors.md_link = Color::Ansi256(15);
-                colors.md_link_url = Color::Ansi256(242);
-                colors.md_code_block = Color::Ansi256(15);
-                colors.md_code_block_border = Color::Ansi256(244);
-                colors.md_quote = Color::Ansi256(244);
-                colors.md_quote_border = Color::Ansi256(244);
-                colors.md_hr = Color::Ansi256(244);
-                colors.tool_title = Color::Default;
-                colors.tool_output = Color::Ansi256(244);
-                colors.tool_diff_added = Color::Ansi256(15);
-                colors.tool_diff_removed = Color::Ansi256(9);
-                colors.tool_diff_context = Color::Ansi256(244);
-                Theme {
-                    colors,
-                    ..Default::default()
-                }
+        }
+        ThemePreset::Monochrome => {
+            let mut colors = ThemeColors::default();
+            for f in [
+                &mut colors.accent,
+                &mut colors.border_accent,
+                &mut colors.md_code,
+                &mut colors.md_list_bullet,
+                &mut colors.bash_mode,
+            ] {
+                *f = Color::Ansi256(15);
             }
-        };
-        self.set(theme);
+            colors.muted = Color::Ansi256(244);
+            colors.dim = Color::Ansi256(242);
+            colors.error = Color::Ansi256(9);
+            colors.success = Color::Ansi256(15);
+            colors.warning = Color::Ansi256(15);
+            colors.info = Color::Ansi256(15);
+            colors.surface = Color::Ansi256(236);
+            colors.border = Color::Ansi256(244);
+            colors.border_muted = Color::Ansi256(240);
+            colors.selection = Color::Ansi256(244);
+            colors.cursor = Color::Ansi256(15);
+            colors.thinking_text = Color::Ansi256(244);
+            colors.md_heading = Color::Ansi256(15);
+            colors.md_link = Color::Ansi256(15);
+            colors.md_link_url = Color::Ansi256(242);
+            colors.md_code_block = Color::Ansi256(15);
+            colors.md_code_block_border = Color::Ansi256(244);
+            colors.md_quote = Color::Ansi256(244);
+            colors.md_quote_border = Color::Ansi256(244);
+            colors.md_hr = Color::Ansi256(244);
+            colors.tool_title = Color::Default;
+            colors.tool_output = Color::Ansi256(244);
+            colors.tool_diff_added = Color::Ansi256(15);
+            colors.tool_diff_removed = Color::Ansi256(9);
+            colors.tool_diff_context = Color::Ansi256(244);
+            Theme {
+                colors,
+                ..Default::default()
+            }
+        }
     }
 }
 
@@ -422,7 +435,20 @@ pub enum ThemePreset {
 
 /// Global theme helper functions.
 pub fn theme() -> Theme {
-    THEME_MANAGER.get_or_init(ThemeManager::new).get()
+    global_theme_manager().get()
+}
+
+/// Apply a preset to the process-wide theme read by every component.
+///
+/// Creating a standalone [`ThemeManager`] does not affect components that call
+/// [`theme`]. Hosts should use this function for live theme switching.
+pub fn apply_theme_preset(preset: ThemePreset) {
+    global_theme_manager().apply_preset(preset);
+}
+
+/// Return the process-wide theme manager.
+pub fn global_theme_manager() -> &'static ThemeManager {
+    THEME_MANAGER.get_or_init(ThemeManager::new)
 }
 
 /// Global theme manager.

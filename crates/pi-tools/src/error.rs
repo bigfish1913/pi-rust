@@ -72,10 +72,7 @@ impl FileError {
         self
     }
 
-    pub fn with_source(
-        mut self,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    ) -> Self {
+    pub fn with_source(mut self, source: Box<dyn std::error::Error + Send + Sync>) -> Self {
         self.source = Some(source);
         self
     }
@@ -161,10 +158,7 @@ impl ExecutionError {
         }
     }
 
-    pub fn with_source(
-        mut self,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    ) -> Self {
+    pub fn with_source(mut self, source: Box<dyn std::error::Error + Send + Sync>) -> Self {
         self.source_message = Some(source.to_string());
         self
     }

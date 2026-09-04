@@ -145,7 +145,9 @@ fn two_call_stream_fn(release: Arc<Notify>) -> rpi_agent::StreamFn {
             };
             let is_tool_turn = matches!(message.stop_reason, StopReason::ToolUse);
             let partial = Arc::new(message.clone());
-            prod.push(AssistantMessageEvent::Start { partial: partial.clone() });
+            prod.push(AssistantMessageEvent::Start {
+                partial: partial.clone(),
+            });
             let reason = match message.stop_reason {
                 StopReason::ToolUse => DoneReason::ToolUse,
                 StopReason::Stop => DoneReason::Stop,
@@ -223,9 +225,12 @@ fn turn_end_tool_result_ids(events: &[AgentEvent]) -> Vec<String> {
     events
         .iter()
         .filter_map(|e| match e {
-            AgentEvent::TurnEnd { tool_results, .. } => {
-                Some(tool_results.iter().map(|t| t.tool_call_id.clone()).collect::<Vec<_>>())
-            }
+            AgentEvent::TurnEnd { tool_results, .. } => Some(
+                tool_results
+                    .iter()
+                    .map(|t| t.tool_call_id.clone())
+                    .collect::<Vec<_>>(),
+            ),
             _ => None,
         })
         .flatten()
@@ -239,11 +244,14 @@ async fn tool_execution_end_in_completion_order_results_in_source_order() {
         first_resolved: Arc::new(AtomicBool::new(false)),
         parallel_observed: Arc::new(AtomicBool::new(false)),
     };
-    let tool = EchoTool { schema: echo_schema(), coord: Coord {
-        release: Arc::clone(&coord.release),
-        first_resolved: Arc::clone(&coord.first_resolved),
-        parallel_observed: Arc::clone(&coord.parallel_observed),
-    }};
+    let tool = EchoTool {
+        schema: echo_schema(),
+        coord: Coord {
+            release: Arc::clone(&coord.release),
+            first_resolved: Arc::clone(&coord.first_resolved),
+            parallel_observed: Arc::clone(&coord.parallel_observed),
+        },
+    };
     let context = AgentContext {
         system_prompt: String::new(),
         messages: Vec::new(),

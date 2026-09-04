@@ -89,7 +89,8 @@ impl Loader {
 
     /// Get the elapsed time since the loader started.
     pub fn elapsed(&self) -> Duration {
-        self.start_time.lock()
+        self.start_time
+            .lock()
             .ok()
             .and_then(|t| t.map(|s| s.elapsed()))
             .unwrap_or_default()
@@ -105,7 +106,11 @@ impl Loader {
     /// Get the current spinner character.
     fn current_char(&self) -> char {
         let frame = *self.frame.lock().unwrap();
-        self.options.spinner_chars.get(frame).copied().unwrap_or('⠋')
+        self.options
+            .spinner_chars
+            .get(frame)
+            .copied()
+            .unwrap_or('⠋')
     }
 
     /// Set the text.
@@ -151,7 +156,10 @@ impl Component for Loader {
             } else {
                 text
             };
-            format!("\x1b[36m{}\x1b[0m \x1b[1m{}\x1b[0m \x1b[90m{}\x1b[0m", spinner, display_text, time_str)
+            format!(
+                "\x1b[36m{}\x1b[0m \x1b[1m{}\x1b[0m \x1b[90m{}\x1b[0m",
+                spinner, display_text, time_str
+            )
         };
 
         // Advance frame for next render
@@ -335,7 +343,8 @@ impl Component for ProgressLoader {
         let line = if text.is_empty() {
             bar
         } else {
-            let text_display = crate::utils::truncate_to_width(&text, width.saturating_sub(bar_width + 5), "...");
+            let text_display =
+                crate::utils::truncate_to_width(&text, width.saturating_sub(bar_width + 5), "...");
             format!("{} {}", text_display, bar)
         };
 

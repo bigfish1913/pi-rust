@@ -80,16 +80,16 @@ pub struct OverlayOptions {
 pub trait OverlayHandle: Send + Sync {
     /// Permanently remove the overlay.
     fn hide(&self);
-    
+
     /// Temporarily hide or show the overlay.
     fn set_hidden(&self, hidden: bool);
-    
+
     /// Check if overlay is temporarily hidden.
     fn is_hidden(&self) -> bool;
-    
+
     /// Focus this overlay.
     fn focus(&self);
-    
+
     /// Check if this overlay has focus.
     fn is_focused(&self) -> bool;
 }
@@ -105,61 +105,65 @@ pub struct TuiStopOptions {
 pub trait TUI: Component + Send + Sync {
     /// Get the TUI mode.
     fn mode(&self) -> TuiMode;
-    
+
     /// Get the terminal.
     fn terminal(&self) -> &dyn Terminal;
-    
+
     /// Get the children.
     fn children(&self) -> Vec<Arc<dyn Component>>;
-    
+
     /// Add a child component.
     fn add_child(&self, component: Arc<dyn Component>);
-    
+
     /// Remove a child component.
     fn remove_child(&self, component: &Arc<dyn Component>);
-    
+
     /// Clear all children.
     fn clear(&self);
-    
+
     /// Get whether to show hardware cursor.
     fn get_show_hardware_cursor(&self) -> bool;
-    
+
     /// Set whether to show hardware cursor.
     fn set_show_hardware_cursor(&self, enabled: bool);
-    
+
     /// Get whether to clear on shrink.
     fn get_clear_on_shrink(&self) -> bool;
-    
+
     /// Set whether to clear on shrink.
     fn set_clear_on_shrink(&self, enabled: bool);
-    
+
     /// Set the focused component.
     fn set_focus(&self, component: Option<Arc<dyn Component>>);
-    
+
     /// Get the focused component.
     fn get_focus(&self) -> Option<Arc<dyn Component>>;
-    
+
     /// Show an overlay component.
-    fn show_overlay(&self, component: Arc<dyn Component>, options: Option<OverlayOptions>) -> Arc<dyn OverlayHandle>;
-    
+    fn show_overlay(
+        &self,
+        component: Arc<dyn Component>,
+        options: Option<OverlayOptions>,
+    ) -> Arc<dyn OverlayHandle>;
+
     /// Hide the topmost overlay.
     fn hide_overlay(&self);
-    
+
     /// Check if there are any overlays.
     fn has_overlay(&self) -> bool;
-    
+
     /// Start the TUI event loop.
     fn start(&self);
-    
+
     /// Stop the TUI.
     fn stop(&self, options: TuiStopOptions);
-    
+
     /// Render immediately.
     fn render_now(&self, force: bool);
-    
+
     /// Request a render.
     fn request_render(&self, force: bool);
-    
+
     /// Get the number of full redraws performed.
     fn full_redraws(&self) -> usize;
 }

@@ -152,9 +152,8 @@ impl AgentTool for ReadTool {
         }
 
         // Text path.
-        let text_content = String::from_utf8(bytes).map_err(|e| {
-            AgentError::Tool(format!("read: invalid utf-8 in {}: {e}", input.path))
-        })?;
+        let text_content = String::from_utf8(bytes)
+            .map_err(|e| AgentError::Tool(format!("read: invalid utf-8 in {}: {e}", input.path)))?;
         let all_lines: Vec<&str> = text_content.split('\n').collect();
         // Mirror TS: `textContent.split("\n")` keeps a trailing "" when the
         // content ends with '\n'; the line-count + slice math below uses the raw
@@ -185,10 +184,11 @@ impl AgentTool for ReadTool {
             };
 
         let truncation = truncate_head(&selected_content, TruncationOptions::default());
-        let (output_text, details): (String, Option<TruncationResult>) =
-            if truncation.first_line_exceeds_limit {
-                let first_line_size = format_size(all_lines[start_line].len());
-                (
+        let (output_text, details): (String, Option<TruncationResult>) = if truncation
+            .first_line_exceeds_limit
+        {
+            let first_line_size = format_size(all_lines[start_line].len());
+            (
                     format!(
                         "[Line {start_line_display} is {first_line_size}, exceeds {} limit. \
                          Use bash: sed -n '{start_line_display}p' {} | head -c {DEFAULT_MAX_BYTES}]",
@@ -197,47 +197,49 @@ impl AgentTool for ReadTool {
                     ),
                     Some(truncation),
                 )
-            } else if truncation.truncated {
-                let end_line_display = start_line_display + truncation.output_lines - 1;
-                let next_offset = end_line_display + 1;
-                let mut text = truncation.content.clone();
-                match truncation.truncated_by {
-                    Some(crate::truncate::TruncationLimit::Lines) => {
-                        text.push_str(&format!(
-                            "\n\n[Showing lines {start_line_display}-{end_line_display} of \
+        } else if truncation.truncated {
+            let end_line_display = start_line_display + truncation.output_lines - 1;
+            let next_offset = end_line_display + 1;
+            let mut text = truncation.content.clone();
+            match truncation.truncated_by {
+                Some(crate::truncate::TruncationLimit::Lines) => {
+                    text.push_str(&format!(
+                        "\n\n[Showing lines {start_line_display}-{end_line_display} of \
                              {total_file_lines}. Use offset={next_offset} to continue.]"
-                        ));
-                    }
-                    _ => {
-                        text.push_str(&format!(
-                            "\n\n[Showing lines {start_line_display}-{end_line_display} of \
-                             {total_file_lines} ({} limit). Use offset={next_offset} to continue.]",
-                            format_size(DEFAULT_MAX_BYTES)
-                        ));
-                    }
+                    ));
                 }
-                (text, Some(truncation))
-            } else if let Some(ull) = user_limited_lines {
-                if start_line + ull < all_lines.len() {
-                    let remaining = all_lines.len() - (start_line + ull);
-                    let next_offset = start_line + ull + 1;
-                    (
+                _ => {
+                    text.push_str(&format!(
+                        "\n\n[Showing lines {start_line_display}-{end_line_display} of \
+                             {total_file_lines} ({} limit). Use offset={next_offset} to continue.]",
+                        format_size(DEFAULT_MAX_BYTES)
+                    ));
+                }
+            }
+            (text, Some(truncation))
+        } else if let Some(ull) = user_limited_lines {
+            if start_line + ull < all_lines.len() {
+                let remaining = all_lines.len() - (start_line + ull);
+                let next_offset = start_line + ull + 1;
+                (
                         format!(
                             "{}\n\n[{remaining} more lines in file. Use offset={next_offset} to continue.]",
                             truncation.content
                         ),
                         None,
                     )
-                } else {
-                    (truncation.content, None)
-                }
             } else {
                 (truncation.content, None)
-            };
+            }
+        } else {
+            (truncation.content, None)
+        };
 
         let details_value = match details {
-            Some(t) => serde_json::to_value(ReadToolDetails { truncation: Some(t) })
-                .unwrap_or(serde_json::Value::Null),
+            Some(t) => serde_json::to_value(ReadToolDetails {
+                truncation: Some(t),
+            })
+            .unwrap_or(serde_json::Value::Null),
             None => serde_json::Value::Null,
         };
         Ok(AgentToolResult {
@@ -266,7 +268,10 @@ fn image_result(
                 };
                 return AgentToolResult {
                     content: vec![
-                        TextContentOrImage::text(format!("Read image file [{}]{}", p.mime_type, hints)),
+                        TextContentOrImage::text(format!(
+                            "Read image file [{}]{}",
+                            p.mime_type, hints
+                        )),
                         TextContentOrImage::Image(ImageContent {
                             kind: ImageContentType,
                             data: p.data,

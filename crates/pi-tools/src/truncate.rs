@@ -378,7 +378,10 @@ mod tests {
 
     #[test]
     fn truncate_head_line_limit() {
-        let s: String = (0..3000).map(|i| format!("line{}", i)).collect::<Vec<_>>().join("\n");
+        let s: String = (0..3000)
+            .map(|i| format!("line{}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
         let r = truncate_head(&s, TruncationOptions::default());
         assert!(r.truncated);
         assert_eq!(r.truncated_by, Some(TruncationLimit::Lines));
@@ -406,7 +409,10 @@ mod tests {
 
     #[test]
     fn truncate_tail_keeps_last_n_lines() {
-        let s: String = (0..3000).map(|i| format!("line{}", i)).collect::<Vec<_>>().join("\n");
+        let s: String = (0..3000)
+            .map(|i| format!("line{}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
         let r = truncate_tail(&s, TruncationOptions::default());
         assert!(r.truncated);
         assert_eq!(r.truncated_by, Some(TruncationLimit::Lines));

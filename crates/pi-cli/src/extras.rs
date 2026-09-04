@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use rpi_tui::{Container, EarendilAnnouncementComponent, ArminComponent, Spacer};
+use rpi_tui::{ArminComponent, Container, EarendilAnnouncementComponent, Spacer};
 
 use crate::config;
 
@@ -33,16 +33,12 @@ pub fn add_earendil(chat: &Arc<Container>) {
 /// `RPI_CODING_AGENT_DIR` override is honored (the old `rpi_dir()` ignored it).
 /// Returns `None` when the home dir can't be resolved.
 pub fn earendil_seen_path() -> Option<std::path::PathBuf> {
-    config::agent_dir()
-        .ok()
-        .map(|d| d.join(".earendil_seen"))
+    config::agent_dir().ok().map(|d| d.join(".earendil_seen"))
 }
 
 /// Whether the earendil announcement has already been shown (sentinel present).
 pub fn earendil_seen() -> bool {
-    earendil_seen_path()
-        .map(|p| p.exists())
-        .unwrap_or(false)
+    earendil_seen_path().map(|p| p.exists()).unwrap_or(false)
 }
 
 /// Write the `~/.rpi/agent/.earendil_seen` sentinel so the announcement isn't
@@ -60,16 +56,12 @@ fn mark_earendil_seen() -> std::io::Result<()> {
 /// Path of the "first-time setup done" sentinel, under the agent dir
 /// (`~/.rpi/agent/.setup_done`).
 pub fn setup_done_path() -> Option<std::path::PathBuf> {
-    config::agent_dir()
-        .ok()
-        .map(|d| d.join(".setup_done"))
+    config::agent_dir().ok().map(|d| d.join(".setup_done"))
 }
 
 /// Whether first-time setup has already been completed (sentinel present).
 pub fn setup_done() -> bool {
-    setup_done_path()
-        .map(|p| p.exists())
-        .unwrap_or(false)
+    setup_done_path().map(|p| p.exists()).unwrap_or(false)
 }
 
 /// Mark first-time setup complete (write the sentinel). Best-effort.
@@ -89,8 +81,8 @@ pub fn mark_setup_done() -> std::io::Result<()> {
 /// + the theme remains pickable via `/theme`. Analytics is deferred (no
 /// telemetry wiring). Returns `true` if anything was shown.
 pub fn maybe_first_time_setup(chat: &Arc<Container>) -> bool {
-    use rpi_tui::{Text, DynamicBorder, Spacer};
     use rpi_tui::Component;
+    use rpi_tui::{DynamicBorder, Spacer, Text};
     if setup_done() {
         return false;
     }
@@ -100,9 +92,18 @@ pub fn maybe_first_time_setup(chat: &Arc<Container>) -> bool {
     // Use the Component trait method explicitly for the border/Text render.
     let mut lines: Vec<String> = Vec::new();
     lines.extend(border.render(80));
-    lines.push(format!(" {} Welcome to rpi!", accent.fg(&bold("Welcome to rpi!"))));
-    lines.push(format!(" {} Pick a theme with /theme (dark/light/monochrome).", muted.fg("Pick a theme with /theme (dark/light/monochrome).")));
-    lines.push(format!(" {} Type /help for commands.", muted.fg("Type /help for commands.")));
+    lines.push(format!(
+        " {} Welcome to rpi!",
+        accent.fg(&bold("Welcome to rpi!"))
+    ));
+    lines.push(format!(
+        " {} Pick a theme with /theme (dark/light/monochrome).",
+        muted.fg("Pick a theme with /theme (dark/light/monochrome).")
+    ));
+    lines.push(format!(
+        " {} Type /help for commands.",
+        muted.fg("Type /help for commands.")
+    ));
     lines.extend(border.render(80));
     for line in lines {
         chat.add_child(Arc::new(Text::new(line, 1, 0)));

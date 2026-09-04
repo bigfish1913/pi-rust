@@ -80,9 +80,11 @@ impl OverlayManager {
 
     /// Get visible overlays sorted by z-index.
     pub fn get_visible(&self) -> Vec<(Arc<dyn Component>, OverlayOptions)> {
-        self.overlays.lock()
+        self.overlays
+            .lock()
             .map(|overlays| {
-                overlays.iter()
+                overlays
+                    .iter()
                     .filter(|e| e.visible)
                     .map(|e| (e.component.clone(), e.options.clone()))
                     .collect()
@@ -122,7 +124,9 @@ impl OverlayHandle {
 
     /// Check if visible.
     pub fn is_visible(&self) -> bool {
-        self.manager.overlays.lock()
+        self.manager
+            .overlays
+            .lock()
             .map(|o| o.iter().any(|e| e.z_index == self.id && e.visible))
             .unwrap_or(false)
     }
@@ -231,18 +235,27 @@ impl Selector {
     /// Get filtered items based on query.
     fn filtered_items(&self) -> Vec<(usize, SelectorItem)> {
         let items = self.items.lock().map(|i| i.clone()).unwrap_or_default();
-        let query = self.query.lock().map(|q| q.to_lowercase()).unwrap_or_default();
+        let query = self
+            .query
+            .lock()
+            .map(|q| q.to_lowercase())
+            .unwrap_or_default();
 
         if query.is_empty() {
             return items.into_iter().enumerate().collect();
         }
 
-        items.into_iter()
+        items
+            .into_iter()
             .enumerate()
             .filter(|(_, item)| {
-                item.label.to_lowercase().contains(&query) ||
-                item.value.to_lowercase().contains(&query) ||
-                item.description.as_ref().map(|d| d.to_lowercase().contains(&query)).unwrap_or(false)
+                item.label.to_lowercase().contains(&query)
+                    || item.value.to_lowercase().contains(&query)
+                    || item
+                        .description
+                        .as_ref()
+                        .map(|d| d.to_lowercase().contains(&query))
+                        .unwrap_or(false)
             })
             .collect()
     }
@@ -267,7 +280,8 @@ impl Component for Selector {
         let visible_count = self.max_visible.min(filtered.len());
         let scroll_offset = selected.saturating_sub(self.max_visible / 2);
 
-        for (i, (_original_idx, item)) in filtered.iter()
+        for (i, (_original_idx, item)) in filtered
+            .iter()
             .skip(scroll_offset)
             .take(visible_count)
             .enumerate()
@@ -346,7 +360,11 @@ impl Dialog {
 
     /// Create a confirm dialog.
     pub fn confirm(message: impl Into<String>) -> Self {
-        Self::new("Confirm", message, vec!["Yes".to_string(), "No".to_string()])
+        Self::new(
+            "Confirm",
+            message,
+            vec!["Yes".to_string(), "No".to_string()],
+        )
     }
 
     /// Get selected button index.
@@ -390,14 +408,22 @@ impl Component for Dialog {
         lines.push(format!("┌{}┐", "─".repeat(border_width.saturating_sub(2))));
 
         // Title
-        lines.push(format!("│ {} {}│", bold(&title), " ".repeat(border_width.saturating_sub(4) - title.len())));
+        lines.push(format!(
+            "│ {} {}│",
+            bold(&title),
+            " ".repeat(border_width.saturating_sub(4) - title.len())
+        ));
 
         // Separator
         lines.push(format!("├{}┤", "─".repeat(border_width.saturating_sub(2))));
 
         // Message
         for line in message.lines() {
-            let padded = format!("│ {}{}", line, " ".repeat(border_width.saturating_sub(3) - visible_width(line)));
+            let padded = format!(
+                "│ {}{}",
+                line,
+                " ".repeat(border_width.saturating_sub(3) - visible_width(line))
+            );
             lines.push(padded);
         }
 
@@ -413,7 +439,8 @@ impl Component for Dialog {
                 button_line.push_str(&format!("[{}] ", button));
             }
         }
-        button_line.push_str(&" ".repeat(border_width.saturating_sub(3) - visible_width(&button_line)));
+        button_line
+            .push_str(&" ".repeat(border_width.saturating_sub(3) - visible_width(&button_line)));
         button_line.push('│');
         lines.push(button_line);
 
@@ -439,8 +466,16 @@ mod tests {
     #[test]
     fn test_selector() {
         let items = vec![
-            SelectorItem { label: "Item 1".into(), value: "1".into(), description: None },
-            SelectorItem { label: "Item 2".into(), value: "2".into(), description: None },
+            SelectorItem {
+                label: "Item 1".into(),
+                value: "1".into(),
+                description: None,
+            },
+            SelectorItem {
+                label: "Item 2".into(),
+                value: "2".into(),
+                description: None,
+            },
         ];
         let selector = Selector::new(items, 5);
         assert_eq!(selector.selected(), 0);

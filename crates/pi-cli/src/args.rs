@@ -245,9 +245,9 @@ pub fn parse_args(args: &[String]) -> Args {
                         "json" => Mode::Json,
                         "rpc" => Mode::Rpc,
                         other => {
-                            result
-                                .errors
-                                .push(format!("Invalid --mode \"{other}\". Valid: text, json, rpc"));
+                            result.errors.push(format!(
+                                "Invalid --mode \"{other}\". Valid: text, json, rpc"
+                            ));
                             Mode::Text
                         }
                     };
@@ -346,8 +346,10 @@ pub fn parse_args(args: &[String]) -> Args {
                         | "--offline"
                         | "--export"
                         | "--tui-mode"
-                        | "--approve" | "-a"
-                        | "--no-approve" | "-na"
+                        | "--approve"
+                        | "-a"
+                        | "--no-approve"
+                        | "-na"
                         | "--no-themes"
                 ) =>
             {
@@ -360,9 +362,11 @@ pub fn parse_args(args: &[String]) -> Args {
                 {
                     i += 1;
                 }
-                result.ignored.push(format!("{other} is not supported in v1 (ignored)"));
+                result
+                    .ignored
+                    .push(format!("{other} is not supported in v1 (ignored)"));
             }
-            flag @ ("--extension" | "-e" | "--skill" | "--prompt-template" | "--theme") => {
+            "--theme" => {
                 // These take a value (or an inline `=`); consume the next token
                 // when there's no inline value so the path isn't read as a
                 // message, then warn.
@@ -373,7 +377,9 @@ pub fn parse_args(args: &[String]) -> Args {
                 {
                     i += 1;
                 }
-                result.ignored.push(format!("{flag} is not supported in v1 (ignored)"));
+                result
+                    .ignored
+                    .push("--theme is not supported in v1 (ignored)".to_string());
             }
             "--list-models" => {
                 // Optionally consumes a search term.
@@ -384,13 +390,9 @@ pub fn parse_args(args: &[String]) -> Args {
                 {
                     i += 1;
                 }
-                result.ignored.push("--list-models is not supported in v1 (ignored)".to_string());
-            }
-            "--fork" => {
-                result.ignored.push("--fork is not supported in v1 (ignored)".to_string());
-                if inline.is_none() && i + 1 < args.len() && !args[i + 1].starts_with('-') {
-                    i += 1;
-                }
+                result
+                    .ignored
+                    .push("--list-models is not supported in v1 (ignored)".to_string());
             }
             // Unknown long flag (with or without `=`). `flag_key` already holds
             // the bare name, so both `--frobnicate` and `--frobnicate=x` land
@@ -404,21 +406,20 @@ pub fn parse_args(args: &[String]) -> Args {
                 {
                     i += 1;
                 }
-                result.ignored.push(format!("{name} is not a recognized flag (ignored)"));
+                result
+                    .ignored
+                    .push(format!("{name} is not a recognized flag (ignored)"));
             }
             // Unknown short flag → hard error (mirrors TS).
             other if other.starts_with('-') && other.len() > 1 => {
-                result
-                    .errors
-                    .push(format!("Unknown option: {other}"));
+                result.errors.push(format!("Unknown option: {other}"));
             }
-            // `@file` attachment.
-            other if let Some(path) = file_arg(other) => {
-                result.file_args.push(path);
-            }
-            // Bare positional → prompt message.
             other => {
-                result.messages.push(other.to_string());
+                if let Some(path) = file_arg(other) {
+                    result.file_args.push(path);
+                } else {
+                    result.messages.push(other.to_string());
+                }
             }
         }
         i += 1;
@@ -432,7 +433,10 @@ pub fn parse_args(args: &[String]) -> Args {
 
 /// Split a comma-separated list (mirrors the TS `.split(',').map(trim)`).
 fn split_csv(v: &str) -> Vec<String> {
-    v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+    v.split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 /// Resolve the effective output [`Mode`]. Mirrors TS `resolveAppMode`:
@@ -475,10 +479,10 @@ pub fn print_help() {
   {name} [options] [@files...] [messages...]
 
 {u}Options:{r}
-  --provider <name>              Provider name (v1: anthropic)
+  --provider <name>              Provider name (anthropic, openai-completions, or models.json id)
   --model <pattern>              Model pattern or ID (supports \"provider/id\" and optional \":<thinking>\")
-  --api-key <key>                API key (x-api-key; defaults to ~/.rpi/auth.json, then ANTHROPIC_API_KEY)
-  --base-url <url>               Override the Anthropic endpoint (defaults to ANTHROPIC_BASE_URL)
+  --api-key <key>                API key override for the selected provider
+  --base-url <url>               Override the selected model endpoint
   --system-prompt <text>         Replace the default system prompt
   --append-system-prompt <text>  Append text to the system prompt (repeatable)
   --thinking <level>             off, minimal, low, medium, high, xhigh, max
@@ -538,13 +542,13 @@ pub fn print_help() {
   ANTHROPIC_API_KEY              Anthropic API key (x-api-key) — fallback when no stored credential
   ANTHROPIC_AUTH_TOKEN           Bearer token (Authorization: Bearer) for third-party gateways
   ANTHROPIC_BASE_URL             Override the Anthropic endpoint (e.g. a compatible proxy)
+  OPENAI_API_KEY                 Bearer token for openai-completions
   RPI_CODING_AGENT_DIR           Override the ~/.rpi config directory (auth.json + models.json)
 
 {u}Notes:{r}
-  v1 speaks the Anthropic Messages protocol only. Auth is resolved in order:
-  --api-key → ~/.rpi/auth.json (via `rpi auth login`) → ANTHROPIC_AUTH_TOKEN
-  (Bearer) → ANTHROPIC_API_KEY (x-api-key). Define custom model catalogs in
-  ~/.rpi/models.json. TUI, extensions, skills, prompt templates, themes, model
+  Supported HTTP protocols are Anthropic Messages and OpenAI Chat Completions.
+  Define custom model catalogs and provider apiKey values in
+  ~/.rpi/agent/models.json. TUI, extensions, skills, prompt templates, themes, model
   cycling, package manager, HTML export, --fork, --list-models, --export, and
   OAuth are recognized but not implemented yet.
 ",
@@ -615,7 +619,10 @@ mod tests {
     #[test]
     fn tools_split_csv() {
         let a = parse_args(&s(&["--tools", "read, bash ,write"]));
-        assert_eq!(a.tools.as_deref(), Some(&["read".to_string(), "bash".to_string(), "write".to_string()][..]));
+        assert_eq!(
+            a.tools.as_deref(),
+            Some(&["read".to_string(), "bash".to_string(), "write".to_string()][..])
+        );
     }
 
     #[test]
@@ -636,7 +643,10 @@ mod tests {
         let a = parse_args(&s(&["--models", "a,b,c"]));
         assert!(a.errors.is_empty());
         assert!(a.ignored.is_empty(), "--models is implemented");
-        assert_eq!(a.models.as_deref(), Some(&["a".to_string(), "b".to_string(), "c".to_string()][..]));
+        assert_eq!(
+            a.models.as_deref(),
+            Some(&["a".to_string(), "b".to_string(), "c".to_string()][..])
+        );
         // The value is consumed, not read as a message:
         assert!(a.messages.is_empty());
     }
@@ -647,7 +657,14 @@ mod tests {
         assert!(a.errors.is_empty());
         assert_eq!(a.session_id.as_deref(), Some("01abc"));
         assert_eq!(a.fork.as_deref(), Some("xyz"));
-        let a = parse_args(&s(&["-e", "plugin.dll", "--skill", "s", "--prompt-template", "t.md"]));
+        let a = parse_args(&s(&[
+            "-e",
+            "plugin.dll",
+            "--skill",
+            "s",
+            "--prompt-template",
+            "t.md",
+        ]));
         assert_eq!(a.extension.len(), 1);
         assert_eq!(a.skill.len(), 1);
         assert_eq!(a.prompt_template.len(), 1);
@@ -688,7 +705,10 @@ mod tests {
     #[test]
     fn extensions_dir_flag_collects_dirs() {
         let a = parse_args(&s(&["--extensions-dir", "/a/b", "-ed", "/c/d"]));
-        assert_eq!(a.extensions_dir, vec![PathBuf::from("/a/b"), PathBuf::from("/c/d")]);
+        assert_eq!(
+            a.extensions_dir,
+            vec![PathBuf::from("/a/b"), PathBuf::from("/c/d")]
+        );
         assert!(a.ignored.is_empty());
     }
 
@@ -706,13 +726,19 @@ mod tests {
         // by the B2 smoke. Keep the test green regardless of the host env by
         // NOT asserting emptiness — just confirm the flag appends after env.
         let a = parse_args(&s(&["--extensions-dir", "/flag/only"]));
-        assert!(a.extensions_dir.iter().any(|p| p == &PathBuf::from("/flag/only")));
+        assert!(a
+            .extensions_dir
+            .iter()
+            .any(|p| p == &PathBuf::from("/flag/only")));
     }
 
     #[test]
     fn file_args_stripped() {
         let a = parse_args(&s(&["@a.txt", "@b.md", "hi"]));
-        assert_eq!(a.file_args, vec![PathBuf::from("a.txt"), PathBuf::from("b.md")]);
+        assert_eq!(
+            a.file_args,
+            vec![PathBuf::from("a.txt"), PathBuf::from("b.md")]
+        );
         assert_eq!(a.messages, vec!["hi".to_string()]);
     }
 
@@ -725,13 +751,22 @@ mod tests {
 
     #[test]
     fn resolve_mode_interactive_when_tty() {
-        let a = Args { print: true, ..Args::default() };
+        let a = Args {
+            print: true,
+            ..Args::default()
+        };
         assert_eq!(resolve_mode(&a, true, true), RunMode::Print);
         let a = Args::default();
         assert_eq!(resolve_mode(&a, true, true), RunMode::Interactive);
-        let a = Args { mode: Mode::Json, ..Args::default() };
+        let a = Args {
+            mode: Mode::Json,
+            ..Args::default()
+        };
         assert_eq!(resolve_mode(&a, true, true), RunMode::Json);
-        let a = Args { mode: Mode::Rpc, ..Args::default() };
+        let a = Args {
+            mode: Mode::Rpc,
+            ..Args::default()
+        };
         assert_eq!(resolve_mode(&a, true, true), RunMode::Rpc);
     }
 

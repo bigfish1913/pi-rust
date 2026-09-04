@@ -28,11 +28,13 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use crate::env::FileKind;
 use crate::env::ExecutionEnv;
+use crate::env::FileKind;
 use crate::path_utils::resolve_read_tool_path;
 use crate::tools::tool_context::ExecutionToolContext;
-use crate::truncate::{format_size, truncate_head, TruncationOptions, TruncationResult, DEFAULT_MAX_BYTES};
+use crate::truncate::{
+    format_size, truncate_head, TruncationOptions, TruncationResult, DEFAULT_MAX_BYTES,
+};
 
 /// Default max results. Mirrors TS `find.ts::DEFAULT_LIMIT`.
 const DEFAULT_LIMIT: u32 = 1000;
@@ -130,7 +132,12 @@ impl AgentTool for FindTool {
 
         // Path-not-found (the TS custom-glob branch checks exists; the fd branch
         // lets fd error — we check up-front for a uniform in-process path).
-        if !self.env.exists(&search_path, cancel).await.map_err(file_err_to_agent)? {
+        if !self
+            .env
+            .exists(&search_path, cancel)
+            .await
+            .map_err(file_err_to_agent)?
+        {
             return Err(AgentError::Tool(format!("Path not found: {search_path}")));
         }
 

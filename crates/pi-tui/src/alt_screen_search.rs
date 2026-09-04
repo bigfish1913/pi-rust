@@ -88,7 +88,10 @@ impl AltScreenSearch {
 
     /// Get current query.
     pub fn get_query(&self) -> String {
-        self.state.lock().map(|s| s.query.clone()).unwrap_or_default()
+        self.state
+            .lock()
+            .map(|s| s.query.clone())
+            .unwrap_or_default()
     }
 
     /// Get current match index.
@@ -278,7 +281,10 @@ impl AltScreenSearch {
         let available = width.saturating_sub(prompt_len + info_len);
 
         let query_display = if state.query.len() > available {
-            format!("...{}", &state.query[state.query.len().saturating_sub(available)..])
+            format!(
+                "...{}",
+                &state.query[state.query.len().saturating_sub(available)..]
+            )
         } else {
             state.query.clone()
         };
@@ -286,9 +292,7 @@ impl AltScreenSearch {
         // Build the search bar with styling
         format!(
             "\x1b[7m{}{}\x1b[0m \x1b[90m{}\x1b[0m",
-            prompt,
-            query_display,
-            match_info
+            prompt, query_display, match_info
         )
     }
 
@@ -408,10 +412,7 @@ mod tests {
         let search = AltScreenSearch::new();
         search.set_query("test");
 
-        let lines = vec![
-            "test one".to_string(),
-            "test two".to_string(),
-        ];
+        let lines = vec!["test one".to_string(), "test two".to_string()];
 
         search.find_matches(&lines);
         let m1 = search.next_match();

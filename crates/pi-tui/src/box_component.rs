@@ -6,7 +6,7 @@ use std::any::Any;
 use std::sync::{Arc, Mutex};
 
 use super::component::Component;
-use crate::utils::{visible_width, apply_background_to_line};
+use crate::utils::{apply_background_to_line, visible_width};
 
 /// Render cache for Box component.
 #[derive(Debug, Clone)]
@@ -88,13 +88,22 @@ impl Box {
     }
 
     /// Check if the cache is valid.
-    fn is_cache_valid(&self, width: usize, child_lines: &[String], bg_sample: Option<&str>) -> bool {
+    fn is_cache_valid(
+        &self,
+        width: usize,
+        child_lines: &[String],
+        bg_sample: Option<&str>,
+    ) -> bool {
         if let Ok(cache) = self.cache.lock() {
             if let Some(ref cache) = *cache {
                 return cache.width == width
                     && cache.bg_sample.as_deref() == bg_sample
                     && cache.child_lines.len() == child_lines.len()
-                    && cache.child_lines.iter().zip(child_lines.iter()).all(|(a, b)| a == b);
+                    && cache
+                        .child_lines
+                        .iter()
+                        .zip(child_lines.iter())
+                        .all(|(a, b)| a == b);
             }
         }
         false
@@ -216,7 +225,7 @@ mod tests {
 
         let lines = box_component.render(10);
         assert!(!lines.is_empty());
-        
+
         // Should have top padding, content, and bottom padding
         assert!(lines.len() >= 3);
     }
@@ -234,7 +243,7 @@ mod tests {
         let text = Arc::new(Text::new("Hello", 1, 0));
         box_component.add_child(text);
         box_component.clear();
-        
+
         let lines = box_component.render(10);
         assert!(lines.is_empty());
     }

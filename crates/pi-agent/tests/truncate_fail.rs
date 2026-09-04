@@ -47,7 +47,10 @@ impl rpi_agent::AgentTool for EchoTool {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        self.executed.lock().expect("executed lock").push(value.clone());
+        self.executed
+            .lock()
+            .expect("executed lock")
+            .push(value.clone());
         Ok(AgentToolResult::text(format!("echoed: {value}")))
     }
 }
@@ -90,9 +93,13 @@ async fn stop_reason_length_fails_tool_calls_without_executing() {
     let followup = assistant_text("done", StopReason::Stop);
     let stream_fn = mock_stream_fn(vec![truncated, followup]);
 
-    let (events, new_messages) =
-        run_and_collect(vec![user_message("echo something")], context, base_config(), stream_fn)
-            .await;
+    let (events, new_messages) = run_and_collect(
+        vec![user_message("echo something")],
+        context,
+        base_config(),
+        stream_fn,
+    )
+    .await;
 
     // The tool MUST NOT have executed.
     assert!(
@@ -107,8 +114,16 @@ async fn stop_reason_length_fails_tool_calls_without_executing() {
         .iter()
         .filter(|e| matches!(e, AgentEvent::ToolExecutionEnd { .. }))
         .collect();
-    assert_eq!(ends.len(), 1, "expected exactly one tool_execution_end, got {}", ends.len());
-    if let AgentEvent::ToolExecutionEnd { is_error, result, .. } = ends[0] {
+    assert_eq!(
+        ends.len(),
+        1,
+        "expected exactly one tool_execution_end, got {}",
+        ends.len()
+    );
+    if let AgentEvent::ToolExecutionEnd {
+        is_error, result, ..
+    } = ends[0]
+    {
         assert!(*is_error, "truncated tool end must be an error");
         let text = result
             .content
@@ -128,8 +143,14 @@ async fn stop_reason_length_fails_tool_calls_without_executing() {
     // The loop continued: 2 LLM calls → 3 new messages (prompt + truncated
     // assistant + tool result ... + follow-up assistant). The last new message
     // is the follow-up assistant reply.
-    let last = new_messages.last().expect("at least the follow-up assistant");
-    assert_eq!(last.role().as_str(), "assistant", "loop should continue past the truncated turn");
+    let last = new_messages
+        .last()
+        .expect("at least the follow-up assistant");
+    assert_eq!(
+        last.role().as_str(),
+        "assistant",
+        "loop should continue past the truncated turn"
+    );
 }
 
 /// Build the truncated assistant message: one tool call + `stop_reason: Length`.

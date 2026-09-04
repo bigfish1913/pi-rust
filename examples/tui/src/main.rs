@@ -10,13 +10,12 @@ use std::sync::Arc;
 
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 
-use rpi_tui::{
-    Container, Editor, EditorOptions, EditorStyle, Focusable, FollowMode, ProcessTerminal,
-    ScrollView, ScrollViewOptions, Spacer, StackChild, StackEntry,
-    Text, TuiAltScreen, VStack, TUI,
-};
 #[allow(unused_imports)]
 use rpi_tui::TUI as _;
+use rpi_tui::{
+    Container, Editor, EditorOptions, EditorStyle, Focusable, FollowMode, ProcessTerminal,
+    ScrollView, ScrollViewOptions, Spacer, StackChild, StackEntry, Text, TuiAltScreen, VStack, TUI,
+};
 
 #[tokio::main]
 async fn main() {
@@ -52,7 +51,11 @@ async fn run_interactive() {
 
     // Create transcript container
     let transcript = Arc::new(Container::new());
-    transcript.add_child(Arc::new(Text::new("Welcome to pi-tui Interactive Demo", 1, 0)));
+    transcript.add_child(Arc::new(Text::new(
+        "Welcome to pi-tui Interactive Demo",
+        1,
+        0,
+    )));
     transcript.add_child(Arc::new(Spacer::new(1)));
     transcript.add_child(Arc::new(Text::new("Your messages will appear here:", 1, 0)));
     transcript.add_child(Arc::new(Spacer::new(1)));
@@ -111,7 +114,11 @@ async fn run_interactive() {
             }
 
             let root = VStack::from_children(vec![
-                StackChild::Entry(StackEntry::new(scroll_view_clone.clone()).grow(1).min_size(1)),
+                StackChild::Entry(
+                    StackEntry::new(scroll_view_clone.clone())
+                        .grow(1)
+                        .min_size(1),
+                ),
                 StackChild::Entry(StackEntry::new(Arc::new(dock))),
             ]);
 
@@ -125,7 +132,11 @@ async fn run_interactive() {
     dock.add_child(editor.clone());
 
     // Create footer
-    let footer = Arc::new(Text::new("Ctrl+C: Exit | Enter: Send | Arrow keys: Navigate", 1, 0));
+    let footer = Arc::new(Text::new(
+        "Ctrl+C: Exit | Enter: Send | Arrow keys: Navigate",
+        1,
+        0,
+    ));
 
     // Create root layout
     let root = VStack::from_children(vec![
@@ -155,14 +166,18 @@ async fn run_interactive() {
                 break;
             }
 
-            let Ok(ev) = crossterm::event::read() else { continue; };
+            let Ok(ev) = crossterm::event::read() else {
+                continue;
+            };
             // Handle resize: no reader thread to do it for us, so refresh the
             // cached terminal size and force a full redraw.
             if let Event::Resize(_cols, _rows) = ev {
                 tui_clone.refresh_size();
                 continue;
             }
-            let Event::Key(key) = ev else { continue; };
+            let Event::Key(key) = ev else {
+                continue;
+            };
             // Drop release/repeat events so a single keystroke isn't doubled
             // (Windows emits Press + Release per key).
             if key.kind != KeyEventKind::Press {

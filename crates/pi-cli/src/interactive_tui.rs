@@ -26,28 +26,28 @@
 use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::sync::Arc;
-use std::sync::mpsc::{self, channel};
 
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
 use rpi_agent::{AgentEvent, AgentMessage};
-use rpi_harness::session::types::{Entry, EntryQuery};
 use rpi_ai::types::{AssistantMessage, Content};
 use rpi_harness::agent_harness::{AgentHarness, AgentLane, HarnessRunOutcome};
-use rpi_tui::{
-    AutocompleteManager, CombinedAutocompleteProvider, Container, DynamicBorder, Editor, EditorOptions,
-    EditorStyle, FilePathAutocompleteProvider, Focusable, FollowMode, Loader, ProcessTerminal,
-    ScrollView, ScrollViewOptions, SlashCommand as SlashCommandEntry, SlashCommandAutocompleteProvider, Spacer,
-    StackChild, StackEntry, Text, TuiAltScreen, TUI, VStack, AssistantBlock,
-    AssistantMessageComponent, AssistantMessageOptions, AutocompleteSuggestions,
-    FooterComponent, SelectList, SelectItem, ThemeManager, ThemePreset,
-    ToolExecutionComponent, render_diff,
-    BashExecutionComponent, BashTruncation, UserMessageComponent,
-};
-use rpi_tui::{bold as tui_bold, theme as current_theme};
+use rpi_harness::session::types::{Entry, EntryQuery};
+use rpi_tui::scroll_view::OverscrollMode;
 #[cfg(test)]
 use rpi_tui::strip_ansi;
+use rpi_tui::{
+    apply_theme_preset, render_diff, AssistantBlock, AssistantMessageComponent,
+    AssistantMessageOptions, AutocompleteManager, AutocompleteSuggestions, BashExecutionComponent,
+    BashTruncation, CombinedAutocompleteProvider, Container, DynamicBorder, Editor, EditorOptions,
+    EditorStyle, FilePathAutocompleteProvider, Focusable, FollowMode, FooterComponent, Loader,
+    ProcessTerminal, ScrollView, ScrollViewOptions, SelectItem, SelectList,
+    SlashCommand as SlashCommandEntry, SlashCommandAutocompleteProvider, Spacer, StackChild,
+    StackEntry, Text, ThemeManager, ThemePreset, ToolExecutionComponent, TuiAltScreen,
+    UserMessageComponent, VStack, TUI,
+};
+use rpi_tui::{bold as tui_bold, theme as current_theme};
 
 #[allow(unused_imports)]
 use rpi_tui::BashStatus;
@@ -157,23 +157,25 @@ fn transform_markdown_chain(
         let out_text = match outcome {
             Ok(Some(s)) => s,
             Ok(None) => return current, // rc != 0 — skip this handler, keep current
-            Err(_) => return current,  // panic — skip, keep current (do not abort: the
-            // render path is not the action trampoline; a panicking transformer
-            // degrades to identity rather than killing the process. Logged via
-            // the `tracing` crate's panic hook.)
+            Err(_) => return current,   // panic — skip, keep current (do not abort: the
+                                         // render path is not the action trampoline; a panicking transformer
+                                         // degrades to identity rather than killing the process. Logged via
+                                         // the `tracing` crate's panic hook.)
         };
         // Parse `{"markdown": <text>}`; lenient — a missing/non-string field
         // keeps the current text (skip this handler).
         let next = serde_json::from_str::<serde_json::Value>(&out_text)
             .ok()
-            .and_then(|v| v.get("markdown").and_then(|m| m.as_str()).map(|s| s.to_string()))
+            .and_then(|v| {
+                v.get("markdown")
+                    .and_then(|m| m.as_str())
+                    .map(|s| s.to_string())
+            })
             .unwrap_or(current);
         current = next;
     }
     current
 }
-
-
 
 // ===========================================================================
 // Slash commands — trait + registry
@@ -202,7 +204,7 @@ fn transform_markdown_chain(
 struct CommandContext {
     chat: Arc<Container>,
     tui: Arc<TuiAltScreen>,
-    tx: mpsc::Sender<TuiMessage>,
+    tx: mpsc::UnboundedSender<TuiMessage>,
     state: Arc<TuiState>,
     editor: Arc<Editor>,
     editor_container: Arc<Container>,
@@ -267,7 +269,9 @@ struct CommandRegistry {
 
 impl CommandRegistry {
     fn new() -> Self {
-        Self { commands: Vec::new() }
+        Self {
+            commands: Vec::new(),
+        }
     }
 
     fn register(&mut self, cmd: Arc<dyn SlashCommand>) {
@@ -467,7 +471,10 @@ impl SlashCommand for ModelCommand {
                 .find(|m| m.id.eq_ignore_ascii_case(term))
                 .cloned()
             else {
-                add_error_message(&ctx.chat, &format!("No model matches \"{term}\". Try /model for the list."));
+                add_error_message(
+                    &ctx.chat,
+                    &format!("No model matches \"{term}\". Try /model for the list."),
+                );
                 ctx.tui.request_render(false);
                 return;
             };
@@ -479,7 +486,10 @@ impl SlashCommand for ModelCommand {
             });
             add_note_message(
                 &ctx.chat,
-                &format!("Model set to {} — applies to the next message.", short_model_name(&model_id)),
+                &format!(
+                    "Model set to {} — applies to the next message.",
+                    short_model_name(&model_id)
+                ),
             );
             ctx.tui.request_render(false);
             return;
@@ -515,7 +525,10 @@ impl SlashCommand for ThinkingCommand {
             let Some(level) = thinking_level_from_name(level_name) else {
                 add_error_message(
                     &ctx.chat,
-                    &format!("Unknown thinking level \"{level_name}\". Valid: {}", crate::args::VALID_THINKING_LEVELS.join(", ")),
+                    &format!(
+                        "Unknown thinking level \"{level_name}\". Valid: {}",
+                        crate::args::VALID_THINKING_LEVELS.join(", ")
+                    ),
                 );
                 ctx.tui.request_render(false);
                 return;
@@ -622,12 +635,15 @@ impl SlashCommand for ThemeCommand {
                 "monochrome" => ThemePreset::Monochrome,
                 "dark" => ThemePreset::Dark,
                 _ => {
-                    add_error_message(&ctx.chat, &format!("Unknown theme \"{name}\". Valid: dark, light, monochrome."));
+                    add_error_message(
+                        &ctx.chat,
+                        &format!("Unknown theme \"{name}\". Valid: dark, light, monochrome."),
+                    );
                     ctx.tui.request_render(false);
                     return;
                 }
             };
-            ctx.state.theme_manager.apply_preset(preset);
+            apply_theme_preset(preset);
             let mut settings = crate::settings::load_settings().unwrap_or_default();
             settings.theme = Some(name.clone());
             let _ = crate::settings::save_settings(&settings);
@@ -858,10 +874,7 @@ impl SlashCommand for ReloadCommand {
         // Signal the main loop. It owns the `&AgentHarness` borrow the
         // `reload_extension_resources` routine needs (the blocking submit thread
         // only has the context's `Arc<ReloadContext>` + the `Arc<dyn AgentLane>`).
-        add_note_message(
-            &ctx.chat,
-            "Reloading extensions + resources…",
-        );
+        add_note_message(&ctx.chat, "Reloading extensions + resources…");
         ctx.tui.request_render(false);
         let _ = ctx.tx.send(TuiMessage::ReloadExtensions);
     }
@@ -1036,7 +1049,10 @@ fn scoped_catalog(catalog: &[rpi_ai::Model], current_id: &str) -> Vec<rpi_ai::Mo
         .collect();
     // Never strand the user: if the current model isn't in scope, keep it.
     if !out.iter().any(|m| m.id.eq_ignore_ascii_case(current_id)) {
-        if let Some(cur) = catalog.iter().find(|m| m.id.eq_ignore_ascii_case(current_id)) {
+        if let Some(cur) = catalog
+            .iter()
+            .find(|m| m.id.eq_ignore_ascii_case(current_id))
+        {
             out.push(cur.clone());
         }
     }
@@ -1066,20 +1082,27 @@ fn open_settings_selector(
             .with_description(&settings.theme.clone().unwrap_or_else(|| "(default)".into())),
     );
     items.push(
-        SelectItem::new("model", "Default model")
-            .with_description(&settings.default_model.clone().unwrap_or_else(|| "(none)".into())),
+        SelectItem::new("model", "Default model").with_description(
+            &settings
+                .default_model
+                .clone()
+                .unwrap_or_else(|| "(none)".into()),
+        ),
     );
     items.push(
-        SelectItem::new("thinking", "Default thinking")
-            .with_description(&settings.default_thinking_level.clone().unwrap_or_else(|| "(default)".into())),
+        SelectItem::new("thinking", "Default thinking").with_description(
+            &settings
+                .default_thinking_level
+                .clone()
+                .unwrap_or_else(|| "(default)".into()),
+        ),
     );
     let scope_desc = match &settings.scoped_models {
         Some(list) if !list.is_empty() => format!("{}", list.join(", ")),
         _ => "all models".to_string(),
     };
-    items.push(
-        SelectItem::new("scoped-models", "Ctrl+M cycle scope").with_description(&scope_desc),
-    );
+    items
+        .push(SelectItem::new("scoped-models", "Ctrl+M cycle scope").with_description(&scope_desc));
     let list = Arc::new(SelectList::new(items, 10));
 
     let state_sel = state.clone();
@@ -1094,9 +1117,9 @@ fn open_settings_selector(
         // Swap this menu for the sub-selector; each sub-selector saves its
         // choice to settings.json on select.
         match item.value.as_str() {
-            "theme" => open_settings_theme_selector(
-                &state_sel, &ec_sel, &editor_sel, &tui_sel, &chat_sel,
-            ),
+            "theme" => {
+                open_settings_theme_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel, &chat_sel)
+            }
             "model" => open_settings_model_selector(
                 &state_sel,
                 &ec_sel,
@@ -1118,7 +1141,12 @@ fn open_settings_selector(
                 &chat_sel,
             ),
             "scoped-models" => open_scoped_models_selector(
-                &state_sel, &ec_sel, &editor_sel, &tui_sel, &catalog_sel, &chat_sel,
+                &state_sel,
+                &ec_sel,
+                &editor_sel,
+                &tui_sel,
+                &catalog_sel,
+                &chat_sel,
             ),
             _ => close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel),
         }
@@ -1131,7 +1159,14 @@ fn open_settings_selector(
         close_selector(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
     }));
 
-    open_selector(state, editor_container, editor, tui, list, SelectorKind::Settings);
+    open_selector(
+        state,
+        editor_container,
+        editor,
+        tui,
+        list,
+        SelectorKind::Settings,
+    );
 }
 
 /// Apply a theme choice AND persist it to settings.json (`/settings` → Theme).
@@ -1160,7 +1195,7 @@ fn open_settings_theme_selector(
             "monochrome" => ThemePreset::Monochrome,
             _ => ThemePreset::Dark,
         };
-        state_sel.theme_manager.apply_preset(preset);
+        apply_theme_preset(preset);
         let mut settings = crate::settings::load_settings().unwrap_or_default();
         settings.theme = Some(item.value.clone());
         let saved = crate::settings::save_settings(&settings);
@@ -1183,7 +1218,14 @@ fn open_settings_theme_selector(
         close_selector(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
     }));
 
-    open_selector(state, editor_container, editor, tui, list, SelectorKind::Settings);
+    open_selector(
+        state,
+        editor_container,
+        editor,
+        tui,
+        list,
+        SelectorKind::Settings,
+    );
 }
 
 /// Choose the default model AND persist it (`/settings` → Default model):
@@ -1201,9 +1243,19 @@ fn open_settings_model_selector(
 ) {
     let mut items: Vec<SelectItem> = Vec::new();
     for m in catalog {
-        let label = if m.name.is_empty() { short_model_name(&m.id) } else { m.name.clone() };
-        let marker = if m.id.eq_ignore_ascii_case(lane_model_id) { " (current)" } else { "" };
-        items.push(SelectItem::new(&m.id, &label).with_description(&format!("{id}{marker}", id = m.id)));
+        let label = if m.name.is_empty() {
+            short_model_name(&m.id)
+        } else {
+            m.name.clone()
+        };
+        let marker = if m.id.eq_ignore_ascii_case(lane_model_id) {
+            " (current)"
+        } else {
+            ""
+        };
+        items.push(
+            SelectItem::new(&m.id, &label).with_description(&format!("{id}{marker}", id = m.id)),
+        );
     }
     if items.is_empty() {
         add_note_message(chat, "No models in the catalog.");
@@ -1251,7 +1303,14 @@ fn open_settings_model_selector(
         close_selector(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
     }));
 
-    open_selector(state, editor_container, editor, tui, list, SelectorKind::Settings);
+    open_selector(
+        state,
+        editor_container,
+        editor,
+        tui,
+        list,
+        SelectorKind::Settings,
+    );
 }
 
 /// Choose the default thinking level AND persist it (`/settings` → Default
@@ -1267,7 +1326,9 @@ fn open_settings_thinking_selector(
     lane_model_id: &str,
     chat: &Arc<Container>,
 ) {
-    let model = catalog.iter().find(|m| m.id.eq_ignore_ascii_case(lane_model_id));
+    let model = catalog
+        .iter()
+        .find(|m| m.id.eq_ignore_ascii_case(lane_model_id));
     let levels: Vec<rpi_ai::types::ThinkingLevel> = model
         .map(|m| m.supported_thinking_levels())
         .unwrap_or_else(|| {
@@ -1294,7 +1355,10 @@ fn open_settings_thinking_selector(
     let lane_sel = lane.clone();
     list.on_select(Arc::new(move |item| {
         let Some(level) = thinking_level_from_name(&item.value) else {
-            add_note_message(&chat_sel, &format!("Unknown thinking level: {}.", item.label));
+            add_note_message(
+                &chat_sel,
+                &format!("Unknown thinking level: {}.", item.label),
+            );
             close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
             return;
         };
@@ -1325,7 +1389,14 @@ fn open_settings_thinking_selector(
         close_selector(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
     }));
 
-    open_selector(state, editor_container, editor, tui, list, SelectorKind::Settings);
+    open_selector(
+        state,
+        editor_container,
+        editor,
+        tui,
+        list,
+        SelectorKind::Settings,
+    );
 }
 
 /// `/scoped-models`: a multi-toggle selector over the catalog. Selecting an
@@ -1367,16 +1438,10 @@ fn open_scoped_models_selector(
         let set = set.get_or_insert_with(Vec::new);
         if let Some(pos) = set.iter().position(|m| m.eq_ignore_ascii_case(&item.value)) {
             set.remove(pos);
-            add_note_message(
-                &chat_sel,
-                &format!("{} removed — Esc to save", item.label),
-            );
+            add_note_message(&chat_sel, &format!("{} removed — Esc to save", item.label));
         } else {
             set.push(item.value.clone());
-            add_note_message(
-                &chat_sel,
-                &format!("{} added — Esc to save", item.label),
-            );
+            add_note_message(&chat_sel, &format!("{} added — Esc to save", item.label));
         }
         tui_sel.request_render(false);
     }));
@@ -1387,9 +1452,18 @@ fn open_scoped_models_selector(
     let chat_cancel = chat.clone();
     list.on_cancel(Arc::new(move || {
         // Save the edited set to settings.json and close.
-        let set = state_cancel.scoped_edit.lock().unwrap().take().unwrap_or_default();
+        let set = state_cancel
+            .scoped_edit
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or_default();
         let mut settings = crate::settings::load_settings().unwrap_or_default();
-        settings.scoped_models = if set.is_empty() { None } else { Some(set.clone()) };
+        settings.scoped_models = if set.is_empty() {
+            None
+        } else {
+            Some(set.clone())
+        };
         match crate::settings::save_settings(&settings) {
             Ok(()) => {
                 if set.is_empty() {
@@ -1406,7 +1480,14 @@ fn open_scoped_models_selector(
         close_selector(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
     }));
 
-    open_selector(state, editor_container, editor, tui, list, SelectorKind::ScopedModels);
+    open_selector(
+        state,
+        editor_container,
+        editor,
+        tui,
+        list,
+        SelectorKind::ScopedModels,
+    );
 }
 
 /// `/share`: mirror the TS intent (share the session). With the `gh` CLI on
@@ -1417,13 +1498,16 @@ async fn share_session(harness: &AgentHarness, chat: &Arc<Container>) {
 
     // Reuse the export builder for the transcript text.
     let tree = harness.session().view("main");
-    let entries = match tree.find_entries(&EntryQuery {
-        entry_type: None,
-        custom_type: None,
-        order: None,
-        limit: None,
-        cursor: None,
-    }).await {
+    let entries = match tree
+        .find_entries(&EntryQuery {
+            entry_type: None,
+            custom_type: None,
+            order: None,
+            limit: None,
+            cursor: None,
+        })
+        .await
+    {
         Ok(e) => e,
         Err(e) => {
             add_error_message(chat, &format!("Could not read session: {e}"));
@@ -1472,15 +1556,9 @@ async fn share_session(harness: &AgentHarness, chat: &Arc<Container>) {
                 return;
             }
         }
-        add_note_message(
-            chat,
-            "gh gist failed — falling back to the clipboard.",
-        );
+        add_note_message(chat, "gh gist failed — falling back to the clipboard.");
     } else {
-        add_note_message(
-            chat,
-            "gh CLI not found — falling back to the clipboard.",
-        );
+        add_note_message(chat, "gh CLI not found — falling back to the clipboard.");
     }
     // Clipboard fallback (or transcript echo when the clipboard feature is off).
     if copy_to_clipboard(&md) {
@@ -1503,13 +1581,16 @@ async fn share_session(harness: &AgentHarness, chat: &Arc<Container>) {
 /// Best-effort: failures surface as a chat note.
 async fn export_session(harness: &AgentHarness, chat: &Arc<Container>) {
     let tree = harness.session().view("main");
-    let entries = match tree.find_entries(&EntryQuery {
-        entry_type: None,
-        custom_type: None,
-        order: None,
-        limit: None,
-        cursor: None,
-    }).await {
+    let entries = match tree
+        .find_entries(&EntryQuery {
+            entry_type: None,
+            custom_type: None,
+            order: None,
+            limit: None,
+            cursor: None,
+        })
+        .await
+    {
         Ok(e) => e,
         Err(e) => {
             add_error_message(chat, &format!("Could not read session: {e}"));
@@ -1548,10 +1629,7 @@ async fn export_session(harness: &AgentHarness, chat: &Arc<Container>) {
         .unwrap_or_else(|_| std::path::PathBuf::from("."))
         .join(&file_name);
     match std::fs::write(&path, md) {
-        Ok(_) => add_note_message(
-            chat,
-            &format!("Exported session to {}", path.display()),
-        ),
+        Ok(_) => add_note_message(chat, &format!("Exported session to {}", path.display())),
         Err(e) => add_error_message(chat, &format!("Could not write export: {e}")),
     }
 }
@@ -1630,10 +1708,7 @@ async fn import_session(
     let dest = dir.join(fname);
     match std::fs::copy(src, &dest) {
         Ok(_) => {
-            let id = fname
-                .strip_suffix(".jsonl")
-                .unwrap_or(fname)
-                .to_string();
+            let id = fname.strip_suffix(".jsonl").unwrap_or(fname).to_string();
             if switch_to_session(harness, lane, &id, cwd, chat, state).await {
                 add_note_message(chat, &format!("Imported session from {path}"));
             }
@@ -1718,13 +1793,16 @@ async fn render_session_history(
     transformer: Option<MarkdownTransformer>,
 ) {
     let tree = harness.session().view("main");
-    let entries = match tree.find_entries(&EntryQuery {
-        entry_type: None,
-        custom_type: None,
-        order: None,
-        limit: None,
-        cursor: None,
-    }).await {
+    let entries = match tree
+        .find_entries(&EntryQuery {
+            entry_type: None,
+            custom_type: None,
+            order: None,
+            limit: None,
+            cursor: None,
+        })
+        .await
+    {
         Ok(e) => e,
         Err(_) => return,
     };
@@ -1911,6 +1989,21 @@ const HISTORY_LIMIT: usize = 100;
 /// when nothing was read from cache (matches the TS 20k threshold).
 const CACHE_MISS_MIN_INPUT_TOKENS: i64 = 20_000;
 
+/// Keep a few rows of overlap so page scrolling preserves visual context,
+/// matching the upstream fullscreen viewport behavior.
+const PAGE_SCROLL_OVERLAP: usize = 4;
+
+fn transcript_page_size(viewport_height: usize) -> i32 {
+    viewport_height
+        .saturating_sub(PAGE_SCROLL_OVERLAP)
+        .max(1)
+        .min(i32::MAX as usize) as i32
+}
+
+fn should_dispatch_key(kind: KeyEventKind) -> bool {
+    kind != KeyEventKind::Release
+}
+
 /// Compact token count for the cache-miss notice: 1.2M / 34.5K / 900.
 fn format_tokens(n: i64) -> String {
     if n >= 1_000_000 {
@@ -1981,6 +2074,25 @@ fn navigate_history(state: &Arc<TuiState>, editor: &Arc<Editor>, direction: i32)
 impl TuiState {
     fn set_status(&self, status: RunStatus) {
         *self.status.lock().unwrap() = status;
+        self.apply_status(status);
+    }
+
+    /// Atomically reserve the single interactive run slot. The editor callback
+    /// runs on a different thread from the async prompt loop, so checking and
+    /// setting in separate steps would allow rapid Enter presses to queue more
+    /// than one operation.
+    fn try_start_working(&self) -> bool {
+        let mut status = self.status.lock().unwrap();
+        if *status != RunStatus::Idle {
+            return false;
+        }
+        *status = RunStatus::Working;
+        drop(status);
+        self.apply_status(RunStatus::Working);
+        true
+    }
+
+    fn apply_status(&self, status: RunStatus) {
         match status {
             RunStatus::Working => {
                 self.footer.set_status("Working…");
@@ -1995,6 +2107,10 @@ impl TuiState {
             }
             RunStatus::Aborting => {
                 self.footer.set_status("Aborting…");
+                // Do not leave a frozen "Working" spinner on screen after the
+                // render tick intentionally stops advancing in this state.
+                self.loader.stop();
+                self.status_container.clear();
             }
             RunStatus::Idle => {
                 self.footer.set_status("");
@@ -2004,6 +2120,20 @@ impl TuiState {
                 self.loader.stop();
                 self.status_container.clear();
             }
+        }
+    }
+
+    /// The bash panel has its own `Running...` spinner. Keep the global
+    /// `Working...` loader out of the status slot while any bash tool is active
+    /// so the same operation is not presented as two simultaneous loaders.
+    fn sync_working_loader_with_bash(&self) {
+        if *self.status.lock().unwrap() != RunStatus::Working {
+            return;
+        }
+
+        self.status_container.clear();
+        if self.bash_components.lock().unwrap().is_empty() {
+            self.status_container.add_child(self.loader.clone());
         }
     }
 
@@ -2100,11 +2230,7 @@ pub async fn interactive_tui(
     // Resolve the active model once, up front. The full id feeds the TuiState
     // tracking field + the selectors/key loop (which run on a blocking thread
     // and can't await `lane.get_model()`); the short name feeds the footer.
-    let lane_model_id = lane
-        .get_model()
-        .await
-        .map(|m| m.id)
-        .unwrap_or_default();
+    let lane_model_id = lane.get_model().await.map(|m| m.id).unwrap_or_default();
     let model_name = short_model_name(&lane_model_id);
 
     // The cwd for @file autocomplete + session discovery.
@@ -2113,7 +2239,19 @@ pub async fn interactive_tui(
         .unwrap_or_else(|_| std::path::PathBuf::from("."));
 
     // Channel between the key/callback threads and the main async loop.
-    let (tx, rx) = channel::<TuiMessage>();
+    let (tx, mut rx) = mpsc::unbounded_channel::<TuiMessage>();
+
+    // Apply the saved theme before constructing transcript components. Some
+    // components keep styled text, so doing this after the welcome banner left
+    // the first screen in the dark palette until it was rebuilt.
+    if let Some(preset) = match theme {
+        Some("light") => Some(ThemePreset::Light),
+        Some("monochrome") => Some(ThemePreset::Monochrome),
+        Some("dark") => Some(ThemePreset::Dark),
+        _ => None,
+    } {
+        apply_theme_preset(preset);
+    }
 
     // ---- TUI + containers ----
     let terminal = Box::new(ProcessTerminal::new());
@@ -2134,7 +2272,11 @@ pub async fn interactive_tui(
     // where they left off (tool executions are skipped: their live display
     // belongs to the current run, and replaying old results would be noise).
     let initial_transformer = build_markdown_transformer(
-        reload_context.extension_session.lock().unwrap().snapshot_arc(),
+        reload_context
+            .extension_session
+            .lock()
+            .unwrap()
+            .snapshot_arc(),
     );
     render_session_history(&harness, &chat_container, initial_transformer.clone()).await;
 
@@ -2148,6 +2290,7 @@ pub async fn interactive_tui(
         ScrollViewOptions {
             follow: FollowMode::End,
             primary: true,
+            overscroll: OverscrollMode::Chain,
             ..Default::default()
         },
     ));
@@ -2200,7 +2343,8 @@ pub async fn interactive_tui(
                 .unwrap_or_else(|| "Expand prompt template".to_string()),
         })
         .collect();
-    let resources_arc: Arc<rpi_harness::types::AgentHarnessResources> = Arc::new(resources_snapshot);
+    let resources_arc: Arc<rpi_harness::types::AgentHarnessResources> =
+        Arc::new(resources_snapshot);
     // Build the built-in command registry once — the single source of truth for
     // both dispatch and the built-in autocomplete entries. The discovered
     // prompt-template commands are merged into the autocomplete list separately
@@ -2215,7 +2359,9 @@ pub async fn interactive_tui(
         combined.add_provider(Arc::new(SlashCommandAutocompleteProvider::new(
             all_slash_commands,
         )));
-        combined.add_provider(Arc::new(FilePathAutocompleteProvider::with_root(cwd.clone())));
+        combined.add_provider(Arc::new(FilePathAutocompleteProvider::with_root(
+            cwd.clone(),
+        )));
         autocomplete.set_provider(Arc::new(combined));
     }
     let autocomplete_container = Arc::new(Container::new());
@@ -2246,30 +2392,10 @@ pub async fn interactive_tui(
         markdown_transformer: std::sync::Mutex::new(initial_transformer),
     });
 
-    // Apply the saved theme from `~/.rpi/agent/settings.json` (best-effort).
-    // The host passes `theme` in; when it matches a known preset it is applied
-    // immediately so launch opens in the user's chosen theme (matching pi
-    // reading `Settings.theme` at startup). Unknown values are ignored.
-    if let Some(theme_name) = theme {
-        let preset = match theme_name {
-            "light" => Some(ThemePreset::Light),
-            "monochrome" => Some(ThemePreset::Monochrome),
-            "dark" => Some(ThemePreset::Dark),
-            _ => None,
-        };
-        if let Some(preset) = preset {
-            state.theme_manager.apply_preset(preset);
-        }
-    }
-
     // Capture the model catalog + cwd for the selector builders + the key loop
     // (the callbacks fire on blocking threads and need owned data).
     let model_catalog_arc = Arc::new(model_catalog.clone());
-    let lane_model_id = lane
-        .get_model()
-        .await
-        .map(|m| m.id)
-        .unwrap_or_default();
+    let lane_model_id = lane.get_model().await.map(|m| m.id).unwrap_or_default();
 
     // ---- Layout root (built ONCE; mirrors TS fullscreenLayoutRoot) ----
     // root = VStack[ scrollview(basis:0 grow:1 shrink:1 min:1), dock(shrink:1) ]
@@ -2348,12 +2474,27 @@ pub async fn interactive_tui(
             return;
         }
 
+        if !ctx_for_cb.state.try_start_working() {
+            return;
+        }
+
         add_user_message(&ctx_for_cb.chat, text);
+        // A new prompt starts a fresh interaction at the tail even when the
+        // user had scrolled up to inspect older output.
+        if let Some(scroll) = ctx_for_cb.tui.get_primary_scroll_view() {
+            scroll.scroll_to_end();
+        }
         ctx_for_cb.tui.request_render(false);
         // Remember the message for ↑ recall (slash commands are not part of
         // the replayable message history).
         push_history(&ctx_for_cb.state, text);
-        let _ = ctx_for_cb.tx.send(TuiMessage::UserInput(text.to_string()));
+        if ctx_for_cb
+            .tx
+            .send(TuiMessage::UserInput(text.to_string()))
+            .is_err()
+        {
+            ctx_for_cb.state.set_status(RunStatus::Idle);
+        }
     }));
 
     tui.start_readerless();
@@ -2379,8 +2520,7 @@ pub async fn interactive_tui(
     // `reload_extension_resources` routine asynchronously. The mailbox is the
     // cycle-free seam: rpi-extensions carries only `()` (no `TuiMessage` type —
     // leaf DAG preserved); the TUI owns the receiver + the reload routine.
-    let (reload_sig_tx, mut reload_sig_rx) =
-        tokio::sync::mpsc::unbounded_channel::<()>();
+    let (reload_sig_tx, mut reload_sig_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     reload_context.mailbox.install(reload_sig_tx);
     let reload_tx = tx.clone();
     let reload_bridge_handle = tokio::spawn(async move {
@@ -2406,7 +2546,15 @@ pub async fn interactive_tui(
             interval.tick().await;
             let working = *state_tick.status.lock().unwrap() == RunStatus::Working;
             if working {
-                tui_tick.request_render(false);
+                if state_tick.bash_components.lock().unwrap().is_empty() {
+                    // Only the dock loader animates. Keep the already-rendered
+                    // transcript instead of rebuilding a long history at 12.5
+                    // frames per second.
+                    tui_tick.request_render_reusing_scroll_content();
+                } else {
+                    // A running bash panel owns a loader inside the transcript.
+                    tui_tick.request_render(false);
+                }
             }
         }
     });
@@ -2426,13 +2574,24 @@ pub async fn interactive_tui(
     let ctx_for_key = ctx.clone();
     let registry_for_key = registry.clone();
 
-    tokio::task::spawn_blocking(move || {
+    let key_handle = tokio::task::spawn_blocking(move || {
         loop {
             if !*running_key.lock().unwrap() {
                 break;
             }
+            // `event::read()` blocks indefinitely. Poll first so shutdown can
+            // stop and join this worker even when no further key arrives.
+            match crossterm::event::poll(std::time::Duration::from_millis(50)) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(_) => {
+                    let _ = tx_for_key.send(TuiMessage::Exit);
+                    break;
+                }
+            }
             let Ok(ev) = crossterm::event::read() else {
-                continue;
+                let _ = tx_for_key.send(TuiMessage::Exit);
+                break;
             };
             // `Event::Resize` is delivered as its own event (not a Key). With
             // `start_readerless` there is no competing terminal-reader thread to
@@ -2449,24 +2608,27 @@ pub async fn interactive_tui(
                 use crossterm::event::MouseEventKind;
                 match m.kind {
                     MouseEventKind::ScrollUp => {
-                        scroll_for_key.scroll_by(-3);
-                        tui_for_key.request_render(false);
+                        if scroll_for_key.scroll_by(-1) != -1 {
+                            tui_for_key.request_render_reusing_scroll_content();
+                        }
                     }
                     MouseEventKind::ScrollDown => {
-                        scroll_for_key.scroll_by(3);
-                        tui_for_key.request_render(false);
+                        if scroll_for_key.scroll_by(1) != 1 {
+                            tui_for_key.request_render_reusing_scroll_content();
+                        }
                     }
                     _ => {}
                 }
                 continue;
             }
-            let Event::Key(key) = ev else { continue; };
-            // Drop release/repeat events — on Windows a single keystroke
-            // yields both a Press and a Release; without this filter every
-            // char is inserted twice. (Mirrors the TS `isKeyRelease` guard;
-            // the editor never sets `wants_key_release`.) On terminals that
-            // only emit Press this is a no-op.
-            if key.kind != KeyEventKind::Press {
+            let Event::Key(key) = ev else {
+                continue;
+            };
+            // Drop releases but preserve Repeat so holding arrows, Backspace,
+            // PageUp, etc. behaves naturally. Windows emits Press + Release
+            // for a tap; terminals with keyboard enhancement may additionally
+            // emit Repeat while a key is held.
+            if !should_dispatch_key(key.kind) {
                 continue;
             }
 
@@ -2480,14 +2642,21 @@ pub async fn interactive_tui(
                     continue;
                 }
                 let status = *state_for_key.status.lock().unwrap();
-                if status == RunStatus::Working {
-                    state_for_key.set_status(RunStatus::Aborting);
-                    let lane = lane_for_key.clone();
-                    tokio::spawn(async move {
-                        let _ = lane.abort().await;
-                    });
-                } else {
-                    let _ = tx_for_key.send(TuiMessage::Exit);
+                match status {
+                    RunStatus::Working => {
+                        state_for_key.set_status(RunStatus::Aborting);
+                        let lane = lane_for_key.clone();
+                        tokio::spawn(async move {
+                            let _ = lane.abort().await;
+                        });
+                    }
+                    // A held Ctrl+C can emit Repeat immediately after Press.
+                    // Keep waiting for the in-flight cancellation instead of
+                    // treating that repeat as a request to exit the process.
+                    RunStatus::Aborting => {}
+                    RunStatus::Idle => {
+                        let _ = tx_for_key.send(TuiMessage::Exit);
+                    }
                 }
                 continue;
             }
@@ -2519,7 +2688,7 @@ pub async fn interactive_tui(
                     .clone()
                     .expect("selector_open guaranteed Some");
                 selector.handle_key(key);
-                tui_for_key.request_render(false);
+                tui_for_key.request_render_reusing_scroll_content();
                 continue;
             }
 
@@ -2529,19 +2698,23 @@ pub async fn interactive_tui(
             //     so the key is never a no-op while a stuck command runs.
             if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('d') {
                 let status = *state_for_key.status.lock().unwrap();
-                if status == RunStatus::Working {
-                    state_for_key.set_status(RunStatus::Aborting);
-                    let lane = lane_for_key.clone();
-                    tokio::spawn(async move {
-                        let _ = lane.abort().await;
-                    });
-                    continue;
+                match status {
+                    RunStatus::Working => {
+                        state_for_key.set_status(RunStatus::Aborting);
+                        let lane = lane_for_key.clone();
+                        tokio::spawn(async move {
+                            let _ = lane.abort().await;
+                        });
+                        continue;
+                    }
+                    RunStatus::Aborting => continue,
+                    RunStatus::Idle => {}
                 }
                 if !state_for_key.selector_open() && !editor_for_key.get_text().is_empty() {
                     // Editor holds text — delete the char forward (pi parity).
                     editor_for_key.handle_key(key);
                     refresh_autocomplete(&state_for_key, &editor_for_key);
-                    tui_for_key.request_render(false);
+                    tui_for_key.request_render_reusing_scroll_content();
                     continue;
                 }
                 let _ = tx_for_key.send(TuiMessage::Exit);
@@ -2590,7 +2763,7 @@ pub async fn interactive_tui(
                     tokio::spawn(async move {
                         let _ = lane.set_model(next).await;
                     });
-                    tui_for_key.request_render(false);
+                    tui_for_key.request_render_reusing_scroll_content();
                 }
                 continue;
             }
@@ -2608,20 +2781,36 @@ pub async fn interactive_tui(
             // 4. Tab: accept the top autocomplete suggestion (if any).
             if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::Tab {
                 if accept_top_suggestion(&state_for_key, &editor_for_key) {
-                    tui_for_key.request_render(false);
+                    tui_for_key.request_render_reusing_scroll_content();
                 }
                 continue;
             }
 
-            // 5. Global transcript scroll: PageUp/PageDown move the scrollview.
+            // 5. Global transcript scroll. PageUp/PageDown use the actual
+            // viewport height with four rows of overlap (upstream behavior),
+            // while Home/End jump to the transcript boundaries.
             if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::PageUp {
-                scroll_for_key.scroll_by(-10);
-                tui_for_key.request_render(false);
+                let delta = -transcript_page_size(scroll_for_key.viewport_height());
+                if scroll_for_key.scroll_by(delta) != delta {
+                    tui_for_key.request_render_reusing_scroll_content();
+                }
                 continue;
             }
             if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::PageDown {
-                scroll_for_key.scroll_by(10);
-                tui_for_key.request_render(false);
+                let delta = transcript_page_size(scroll_for_key.viewport_height());
+                if scroll_for_key.scroll_by(delta) != delta {
+                    tui_for_key.request_render_reusing_scroll_content();
+                }
+                continue;
+            }
+            if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::Home {
+                scroll_for_key.scroll_to_start();
+                tui_for_key.request_render_reusing_scroll_content();
+                continue;
+            }
+            if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::End {
+                scroll_for_key.scroll_to_end();
+                tui_for_key.request_render_reusing_scroll_content();
                 continue;
             }
 
@@ -2637,7 +2826,7 @@ pub async fn interactive_tui(
                 let browsing = *state_for_key.history_index.lock().unwrap() != -1;
                 if editor_for_key.get_text().is_empty() || browsing {
                     navigate_history(&state_for_key, &editor_for_key, -1);
-                    tui_for_key.request_render(false);
+                    tui_for_key.request_render_reusing_scroll_content();
                     continue;
                 }
             }
@@ -2645,15 +2834,25 @@ pub async fn interactive_tui(
                 let browsing = *state_for_key.history_index.lock().unwrap() != -1;
                 if editor_for_key.get_text().is_empty() || browsing {
                     navigate_history(&state_for_key, &editor_for_key, 1);
-                    tui_for_key.request_render(false);
+                    tui_for_key.request_render_reusing_scroll_content();
                     continue;
                 }
+            }
+
+            // Keep the draft intact while an operation is running. The submit
+            // callback also reserves the status atomically to cover two Enter
+            // events arriving before the async main loop receives the first.
+            if key.modifiers == KeyModifiers::NONE
+                && key.code == KeyCode::Enter
+                && *state_for_key.status.lock().unwrap() != RunStatus::Idle
+            {
+                continue;
             }
 
             // 6. Otherwise forward to the editor + refresh autocomplete.
             editor_for_key.handle_key(key);
             refresh_autocomplete(&state_for_key, &editor_for_key);
-            tui_for_key.request_render(false);
+            tui_for_key.request_render_reusing_scroll_content();
         }
     });
 
@@ -2679,8 +2878,8 @@ pub async fn interactive_tui(
         if !*running.lock().unwrap() {
             break;
         }
-        match rx.try_recv() {
-            Ok(TuiMessage::UserInput(prompt)) => {
+        match rx.recv().await {
+            Some(TuiMessage::UserInput(prompt)) => {
                 // Clear the editor so the next prompt starts fresh (the submit
                 // handler runs on the blocking key thread and can't mutate the
                 // editor state safely there; clearing here, on the async loop,
@@ -2688,35 +2887,35 @@ pub async fn interactive_tui(
                 editor.clear();
                 run_prompt_streaming(&lane, &prompt, &tui, &state, drain_handle.is_some()).await;
             }
-            Ok(TuiMessage::ClearChat) => {
+            Some(TuiMessage::ClearChat) => {
                 chat_container.clear();
                 add_welcome_message(&chat_container);
                 tui.request_render(false);
             }
-            Ok(TuiMessage::Compact) => {
+            Some(TuiMessage::Compact) => {
                 run_compact(&lane, &tui, &state).await;
             }
-            Ok(TuiMessage::Copy) => {
+            Some(TuiMessage::Copy) => {
                 copy_last_assistant(&state, &chat_container);
                 tui.request_render(false);
             }
-            Ok(TuiMessage::Exit) => {
+            Some(TuiMessage::Exit) => {
                 *running.lock().unwrap() = false;
                 break;
             }
-            Ok(TuiMessage::SwitchSession(id)) => {
+            Some(TuiMessage::SwitchSession(id)) => {
                 switch_to_session(&harness, &lane, &id, &cwd, &chat_container, &state).await;
                 tui.request_render(false);
             }
-            Ok(TuiMessage::ImportSession(path)) => {
+            Some(TuiMessage::ImportSession(path)) => {
                 import_session(&harness, &lane, &path, &cwd, &chat_container, &state).await;
                 tui.request_render(false);
             }
-            Ok(TuiMessage::ShareSession) => {
+            Some(TuiMessage::ShareSession) => {
                 share_session(&harness, &chat_container).await;
                 tui.request_render(false);
             }
-            Ok(TuiMessage::SetSessionName(name)) => {
+            Some(TuiMessage::SetSessionName(name)) => {
                 let outcome = harness.session().set_name(Some(&name)).await;
                 match outcome {
                     Ok(_) => add_note_message(
@@ -2730,15 +2929,15 @@ pub async fn interactive_tui(
                 }
                 tui.request_render(false);
             }
-            Ok(TuiMessage::ExportSession) => {
+            Some(TuiMessage::ExportSession) => {
                 export_session(&harness, &chat_container).await;
                 tui.request_render(false);
             }
-            Ok(TuiMessage::ForkSession) => {
+            Some(TuiMessage::ForkSession) => {
                 fork_session(&harness, &cwd, &chat_container, &state).await;
                 tui.request_render(false);
             }
-            Ok(TuiMessage::ReloadExtensions) => {
+            Some(TuiMessage::ReloadExtensions) => {
                 // B5d: drive the shared reload routine on the async runtime,
                 // then surface the outcome. `reload_context` was passed into
                 // `interactive_tui` and is the same `Arc<ReloadContext>` the
@@ -2765,21 +2964,25 @@ pub async fn interactive_tui(
                 if outcome.had_warnings {
                     add_error_message(
                         &chat_container,
-                        &format!("{} (with warnings — see stderr for details).", outcome.summary),
+                        &format!(
+                            "{} (with warnings — see stderr for details).",
+                            outcome.summary
+                        ),
                     );
                 } else {
                     add_note_message(&chat_container, &outcome.summary);
                 }
                 tui.request_render(false);
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            None => break,
         }
     }
 
     // ---- Shutdown ----
+    *running.lock().unwrap() = false;
+    // The input worker checks `running` at least every 50ms. Join it before
+    // restoring cooked mode so no late event read races terminal cleanup.
+    let _ = key_handle.await;
     tick_handle.abort();
     if let Some(handle) = drain_handle {
         handle.abort();
@@ -2831,7 +3034,11 @@ async fn run_prompt_streaming(
 
     match outcome {
         Ok(result) => match &result.outcome {
-            HarnessRunOutcome::Failed { error, final_message, .. } => {
+            HarnessRunOutcome::Failed {
+                error,
+                final_message,
+                ..
+            } => {
                 // Only add an error line if the stream did NOT already render
                 // an assistant message for it (drain task leaves
                 // current_assistant Some only on an abrupt end).
@@ -2892,10 +3099,7 @@ async fn run_compact(lane: &Arc<dyn AgentLane>, tui: &Arc<TuiAltScreen>, state: 
             add_note_message(&state.chat_container, "Conversation compacted.");
         }
         Err(e) => {
-            add_error_message(
-                &state.chat_container,
-                &format!("Compact failed: {e}"),
-            );
+            add_error_message(&state.chat_container, &format!("Compact failed: {e}"));
         }
     }
     state.set_status(RunStatus::Idle);
@@ -2919,7 +3123,14 @@ fn copy_last_assistant(state: &Arc<TuiState>, chat: &Arc<Container>) {
         let preview: String = text.chars().take(200).collect();
         add_note_message(
             chat,
-            &format!("Clipboard unavailable. Last reply: {preview}{}", if text.chars().count() > 200 { "…" } else { "" }),
+            &format!(
+                "Clipboard unavailable. Last reply: {preview}{}",
+                if text.chars().count() > 200 {
+                    "…"
+                } else {
+                    ""
+                }
+            ),
         );
     }
 }
@@ -2953,7 +3164,9 @@ fn add_assistant_message_blocking(
     if text.is_empty() {
         return;
     }
-    let msg = Arc::new(AssistantMessageComponent::new(AssistantMessageOptions::default()));
+    let msg = Arc::new(AssistantMessageComponent::new(
+        AssistantMessageOptions::default(),
+    ));
     if let Some(t) = &transformer {
         msg.set_markdown_transformer(Some(t.clone()));
     }
@@ -3019,7 +3232,10 @@ async fn handle_agent_event(
             }
         }
 
-        AgentEvent::TurnEnd { message, tool_results } => {
+        AgentEvent::TurnEnd {
+            message,
+            tool_results,
+        } => {
             // Finalize the assistant message for this turn.
             if let Some(comp) = state.current_assistant.lock().unwrap().take() {
                 if let AgentMessage::Assistant(a) = &message {
@@ -3071,7 +3287,10 @@ async fn handle_agent_event(
             _ => {}
         },
 
-        AgentEvent::MessageUpdate { message, assistant_message_event } => {
+        AgentEvent::MessageUpdate {
+            message,
+            assistant_message_event,
+        } => {
             if let AgentMessage::Assistant(a) = &message {
                 let text = assistant_text(a);
                 // Scan content for finalized tool calls → proactively create
@@ -3138,7 +3357,11 @@ async fn handle_agent_event(
             tui.request_render(false);
         }
 
-        AgentEvent::ToolExecutionStart { tool_call_id, tool_name, args } => {
+        AgentEvent::ToolExecutionStart {
+            tool_call_id,
+            tool_name,
+            args,
+        } => {
             if tool_name == "bash" {
                 // Bash streams into a dedicated BashExecutionComponent (command
                 // header + live preview + exit/truncation status) rather than a
@@ -3168,7 +3391,8 @@ async fn handle_agent_event(
                         existing.set_args(&args.to_string());
                         existing.clone()
                     } else {
-                        let comp = Arc::new(ToolExecutionComponent::new(&tool_name, &args.to_string()));
+                        let comp =
+                            Arc::new(ToolExecutionComponent::new(&tool_name, &args.to_string()));
                         comp.set_running();
                         chat.add_child(comp.clone());
                         tools.insert(tool_call_id.clone(), comp.clone());
@@ -3177,10 +3401,16 @@ async fn handle_agent_event(
                 };
                 state.remember_tool(comp);
             }
+            state.sync_working_loader_with_bash();
             tui.request_render(false);
         }
 
-        AgentEvent::ToolExecutionUpdate { tool_call_id, tool_name, partial_result, .. } => {
+        AgentEvent::ToolExecutionUpdate {
+            tool_call_id,
+            tool_name,
+            partial_result,
+            ..
+        } => {
             if tool_name == "bash" {
                 // Append the streamed chunk to the bash component's preview.
                 // RAW text (no single-line collapsing) — the old
@@ -3221,10 +3451,16 @@ async fn handle_agent_event(
                     .insert(tool_call_id.clone(), comp.clone());
                 state.remember_tool(comp);
             }
+            state.sync_working_loader_with_bash();
             tui.request_render(false);
         }
 
-        AgentEvent::ToolExecutionEnd { tool_call_id, tool_name, result, is_error } => {
+        AgentEvent::ToolExecutionEnd {
+            tool_call_id,
+            tool_name,
+            result,
+            is_error,
+        } => {
             if tool_name == "bash" {
                 let bash = state.bash_components.lock().unwrap().remove(&tool_call_id);
                 if let Some(bash) = bash {
@@ -3258,6 +3494,7 @@ async fn handle_agent_event(
                     state.remember_tool(comp);
                 }
             }
+            state.sync_working_loader_with_bash();
             tui.request_render(false);
         }
     }
@@ -3266,7 +3503,11 @@ async fn handle_agent_event(
 /// Extract `BashToolDetails` (`truncation`, `full_output_path`) from a bash
 /// tool result and mark the component complete. Mirrors the TS bash finalize
 /// path; only the fields `BashExecutionComponent` needs are read.
-fn finalize_bash(comp: &Arc<BashExecutionComponent>, result: &rpi_agent::AgentToolResult, is_error: bool) {
+fn finalize_bash(
+    comp: &Arc<BashExecutionComponent>,
+    result: &rpi_agent::AgentToolResult,
+    is_error: bool,
+) {
     // The exit code isn't in details directly (TS carries it elsewhere); use
     // `is_error` as the error signal and 0/1 as a best-effort exit code.
     let exit_code = if is_error { Some(1) } else { Some(0) };
@@ -3375,7 +3616,12 @@ fn open_selector(
 
 /// Restore the editor into the `editor_container` and clear the active
 /// selector. Called by selector `on_cancel` and the Esc handler.
-fn close_selector(state: &Arc<TuiState>, editor_container: &Arc<Container>, editor: &Arc<Editor>, tui: &Arc<TuiAltScreen>) {
+fn close_selector(
+    state: &Arc<TuiState>,
+    editor_container: &Arc<Container>,
+    editor: &Arc<Editor>,
+    tui: &Arc<TuiAltScreen>,
+) {
     editor_container.clear();
     editor_container.add_child(editor.clone());
     editor.set_focused(true);
@@ -3400,11 +3646,18 @@ fn open_model_selector(
 ) {
     let mut items: Vec<SelectItem> = Vec::new();
     for m in catalog {
-        let label = if m.name.is_empty() { short_model_name(&m.id) } else { m.name.clone() };
-        let marker = if m.id.eq_ignore_ascii_case(lane_model_id) { " (current)" } else { "" };
+        let label = if m.name.is_empty() {
+            short_model_name(&m.id)
+        } else {
+            m.name.clone()
+        };
+        let marker = if m.id.eq_ignore_ascii_case(lane_model_id) {
+            " (current)"
+        } else {
+            ""
+        };
         items.push(
-            SelectItem::new(&m.id, &label)
-                .with_description(&format!("{id}{marker}", id = m.id)),
+            SelectItem::new(&m.id, &label).with_description(&format!("{id}{marker}", id = m.id)),
         );
     }
     if items.is_empty() {
@@ -3429,7 +3682,10 @@ fn open_model_selector(
     let lane_sel = lane.clone();
     list.on_select(Arc::new(move |item| {
         let Some(model) = catalog_arc.iter().find(|m| m.id == item.value).cloned() else {
-            add_note_message(&chat_sel, &format!("Model {} not found in catalog.", item.label));
+            add_note_message(
+                &chat_sel,
+                &format!("Model {} not found in catalog.", item.label),
+            );
             close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
             return;
         };
@@ -3455,7 +3711,14 @@ fn open_model_selector(
         close_selector(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
     }));
 
-    open_selector(state, editor_container, editor, tui, list, SelectorKind::Model);
+    open_selector(
+        state,
+        editor_container,
+        editor,
+        tui,
+        list,
+        SelectorKind::Model,
+    );
 }
 
 /// Cycle to the next catalog entry after `current_id`, wrapping to the first.
@@ -3488,7 +3751,7 @@ fn open_session_selector(
     editor: &Arc<Editor>,
     tui: &Arc<TuiAltScreen>,
     cwd: &std::path::Path,
-    tx: &mpsc::Sender<TuiMessage>,
+    tx: &mpsc::UnboundedSender<TuiMessage>,
 ) {
     let dir = crate::session::default_session_dir(cwd);
     let mut items: Vec<SelectItem> = Vec::new();
@@ -3541,7 +3804,14 @@ fn open_session_selector(
         close_selector(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
     }));
 
-    open_selector(state, editor_container, editor, tui, list, SelectorKind::Session);
+    open_selector(
+        state,
+        editor_container,
+        editor,
+        tui,
+        list,
+        SelectorKind::Session,
+    );
 }
 
 /// Build + open the `/theme` selector. Presets [dark, light, monochrome];
@@ -3570,7 +3840,7 @@ fn open_theme_selector(
             "monochrome" => ThemePreset::Monochrome,
             _ => ThemePreset::Dark,
         };
-        state_sel.theme_manager.apply_preset(preset);
+        apply_theme_preset(preset);
         // A quick accent note so the user sees the change registered even if
         // the terminal's own colors mask the preset difference.
         add_note_message(&chat_sel, &format!("Theme set to {}.", item.label));
@@ -3585,7 +3855,14 @@ fn open_theme_selector(
         close_selector(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
     }));
 
-    open_selector(state, editor_container, editor, tui, list, SelectorKind::Theme);
+    open_selector(
+        state,
+        editor_container,
+        editor,
+        tui,
+        list,
+        SelectorKind::Theme,
+    );
 }
 
 // ===========================================================================
@@ -3671,10 +3948,7 @@ fn open_thinking_selector(
     let mut items: Vec<SelectItem> = Vec::new();
     for lvl in &levels {
         let name = thinking_level_name(*lvl);
-        items.push(
-            SelectItem::new(name, name)
-                .with_description(thinking_level_description(*lvl)),
-        );
+        items.push(SelectItem::new(name, name).with_description(thinking_level_description(*lvl)));
     }
     if items.is_empty() {
         add_note_message(chat, "This model has no supported thinking levels.");
@@ -3691,7 +3965,10 @@ fn open_thinking_selector(
     let lane_sel = lane.clone();
     list.on_select(Arc::new(move |item| {
         let Some(level) = thinking_level_from_name(&item.value) else {
-            add_note_message(&chat_sel, &format!("Unknown thinking level: {}.", item.label));
+            add_note_message(
+                &chat_sel,
+                &format!("Unknown thinking level: {}.", item.label),
+            );
             close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
             return;
         };
@@ -3715,7 +3992,14 @@ fn open_thinking_selector(
         close_selector(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
     }));
 
-    open_selector(state, editor_container, editor, tui, list, SelectorKind::Thinking);
+    open_selector(
+        state,
+        editor_container,
+        editor,
+        tui,
+        list,
+        SelectorKind::Thinking,
+    );
 }
 
 /// Build + open the `/tools` selector. Lists the 7 builtin tool names; each
@@ -3736,13 +4020,19 @@ fn open_tools_selector(
     // closure that lives on the blocking thread — but `handle.block_on` is safe
     // because `get_active_tools` is std-Mutex-backed and finishes quickly).
     let active = match tokio::runtime::Handle::try_current() {
-        Ok(h) => h.block_on(async { lane.get_active_tools().await }).unwrap_or_default(),
+        Ok(h) => h
+            .block_on(async { lane.get_active_tools().await })
+            .unwrap_or_default(),
         Err(_) => Vec::new(),
     };
     let mut items: Vec<SelectItem> = Vec::new();
     for name in crate::session::BUILTIN_TOOL_NAMES {
         let on = active.iter().any(|a| a == name);
-        let label = if on { format!("{name} (on)") } else { (*name).to_string() };
+        let label = if on {
+            format!("{name} (on)")
+        } else {
+            (*name).to_string()
+        };
         items.push(SelectItem::new(name, &label).with_description("Toggle tool on/off"));
     }
     let list = Arc::new(SelectList::new(items, 10));
@@ -3792,7 +4082,14 @@ fn open_tools_selector(
         close_selector(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
     }));
 
-    open_selector(state, editor_container, editor, tui, list, SelectorKind::Tools);
+    open_selector(
+        state,
+        editor_container,
+        editor,
+        tui,
+        list,
+        SelectorKind::Tools,
+    );
 }
 
 /// Build + open the `/images` selector (Yes/No). Stores the choice in
@@ -3807,10 +4104,16 @@ fn open_images_selector(
 ) {
     let current = *state.show_images.lock().unwrap();
     let items = vec![
-        SelectItem::new("yes", "Yes")
-            .with_description(if current { "Inline images (current)" } else { "Inline images" }),
-        SelectItem::new("no", "No")
-            .with_description(if current { "Placeholder only" } else { "Placeholder only (current)" }),
+        SelectItem::new("yes", "Yes").with_description(if current {
+            "Inline images (current)"
+        } else {
+            "Inline images"
+        }),
+        SelectItem::new("no", "No").with_description(if current {
+            "Placeholder only"
+        } else {
+            "Placeholder only (current)"
+        }),
     ];
     let list = Arc::new(SelectList::new(items, 5));
 
@@ -3836,7 +4139,14 @@ fn open_images_selector(
         close_selector(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
     }));
 
-    open_selector(state, editor_container, editor, tui, list, SelectorKind::Images);
+    open_selector(
+        state,
+        editor_container,
+        editor,
+        tui,
+        list,
+        SelectorKind::Images,
+    );
 }
 
 // ===========================================================================
@@ -3878,9 +4188,17 @@ fn render_autocomplete(state: &Arc<TuiState>, suggestions: Option<AutocompleteSu
         let prefix = if i == 0 { "→ " } else { "  " };
         let label = item.display_text();
         let line = if i == 0 {
-            format!("{prefix}{} {}", accent.fg(label), muted.fg(item.description.as_deref().unwrap_or("")))
+            format!(
+                "{prefix}{} {}",
+                accent.fg(label),
+                muted.fg(item.description.as_deref().unwrap_or(""))
+            )
         } else {
-            format!("{prefix}{} {}", muted.fg(label), muted.fg(item.description.as_deref().unwrap_or("")))
+            format!(
+                "{prefix}{} {}",
+                muted.fg(label),
+                muted.fg(item.description.as_deref().unwrap_or(""))
+            )
         };
         state
             .autocomplete_container
@@ -3918,7 +4236,8 @@ fn accept_top_suggestion(state: &Arc<TuiState>, editor: &Arc<Editor>) -> bool {
     // New caret position: after the inserted text (byte offset; the editor
     // snaps `set_cursor` to a char boundary as a safety net).
     let new_cursor = replaced.len().min(
-        start + top.text.len()
+        start
+            + top.text.len()
             + if top.insert_space && !top.text.ends_with('/') {
                 1
             } else {
@@ -3941,18 +4260,21 @@ fn add_welcome_message(container: &Arc<Container>) {
     // Accent logotype + a dim tagline, separated from the rest by a thin
     // themed rule. Plain `Text("rpi interactive TUI")` was visually identical
     // to the body text, so the header didn't read as a header.
-    let title = format!("{} {}",
+    let title = format!(
+        "{} {}",
         c.accent.fg(&tui_bold("rpi")),
-        c.muted.fg("interactive TUI"));
+        c.muted.fg("interactive TUI")
+    );
     container.add_child(Arc::new(Text::new(title, 1, 0)));
     container.add_child(Arc::new(Spacer::new(1)));
     container.add_child(Arc::new(Text::new(
         c.dim.fg("Type your message and press Enter to send."),
-        1, 0,
+        1,
+        0,
     )));
-    let hint = c.dim.fg(
-        "Enter send · Shift+Enter newline · Ctrl+C abort · Esc abort · /help",
-    );
+    let hint = c
+        .dim
+        .fg("Enter send · Shift+Enter newline · Ctrl+C abort · Esc abort · /help");
     container.add_child(Arc::new(Text::new(hint, 1, 0)));
     container.add_child(Arc::new(DynamicBorder::new()));
 }
@@ -3964,30 +4286,37 @@ fn add_help_message(container: &Arc<Container>) {
     // `cmd` in accent, `— desc` in muted. The old single-space layout made
     // the description column wander depending on command length.
     container.add_child(Arc::new(Text::new(
-        c.md_heading.fg(&tui_bold("📚 Available Commands")), 1, 0)));
+        c.md_heading.fg(&tui_bold("📚 Available Commands")),
+        1,
+        0,
+    )));
     container.add_child(Arc::new(Spacer::new(1)));
 
     let cmds: &[(&str, &str)] = &[
-        ("/help, /?",        "Show this help message"),
-        ("/clear, /new",     "Clear the conversation"),
+        ("/help, /?", "Show this help message"),
+        ("/clear, /new", "Clear the conversation"),
         ("/exit, /quit, /q", "Exit the application"),
-        ("/version, /v",     "Show version information"),
-        ("/model, /m",       "Choose a model (live switch)"),
-        ("/thinking, /think","Set reasoning depth (selector)"),
-        ("/tools",           "Toggle built-in tools on/off"),
-        ("/images",          "Toggle inline image rendering"),
-        ("/session",         "List saved sessions"),
-        ("/theme",           "Choose a theme (selector)"),
-        ("/compact",         "Compact the conversation"),
-        ("/copy",            "Copy last reply to clipboard"),
-        ("/hotkeys",         "Show keyboard shortcuts"),
-        ("/armin",           "🐾 Easter egg"),
-        ("/earendil",        "Earendil announcement"),
+        ("/version, /v", "Show version information"),
+        ("/model, /m", "Choose a model (live switch)"),
+        ("/thinking, /think", "Set reasoning depth (selector)"),
+        ("/tools", "Toggle built-in tools on/off"),
+        ("/images", "Toggle inline image rendering"),
+        ("/session", "List saved sessions"),
+        ("/theme", "Choose a theme (selector)"),
+        ("/compact", "Compact the conversation"),
+        ("/copy", "Copy last reply to clipboard"),
+        ("/hotkeys", "Show keyboard shortcuts"),
+        ("/armin", "🐾 Easter egg"),
+        ("/earendil", "Earendil announcement"),
     ];
     let cmd_w = cmds.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
     for (cmd, desc) in cmds {
-        let row = format!("  {:<cmd_w$}  {}  {}",
-            c.accent.fg(cmd), c.dim.fg("—"), c.muted.fg(desc));
+        let row = format!(
+            "  {:<cmd_w$}  {}  {}",
+            c.accent.fg(cmd),
+            c.dim.fg("—"),
+            c.muted.fg(desc)
+        );
         container.add_child(Arc::new(Text::new(row, 1, 0)));
     }
     container.add_child(Arc::new(Spacer::new(1)));
@@ -3997,16 +4326,30 @@ fn add_help_message(container: &Arc<Container>) {
 fn add_version_message(container: &Arc<Container>) {
     let c = current_theme().colors;
     container.add_child(Arc::new(Text::new(
-        c.md_heading.fg(&tui_bold("📦 Version Information")), 1, 0)));
+        c.md_heading.fg(&tui_bold("📦 Version Information")),
+        1,
+        0,
+    )));
     container.add_child(Arc::new(Spacer::new(1)));
     // Use the crate version (kept in sync via `version.workspace = true`)
     // instead of the stale hardcoded "v0.1.2".
     container.add_child(Arc::new(Text::new(
-        format!("  {} {}", c.muted.fg("rpi-cli"), c.text.fg(&format!("v{}", crate::VERSION))),
-        1, 0)));
+        format!(
+            "  {} {}",
+            c.muted.fg("rpi-cli"),
+            c.text.fg(&format!("v{}", crate::VERSION))
+        ),
+        1,
+        0,
+    )));
     container.add_child(Arc::new(Text::new(
-        format!("  {}", c.dim.fg("Rust implementation of pi coding agent TUI")),
-        1, 0)));
+        format!(
+            "  {}",
+            c.dim.fg("Rust implementation of pi coding agent TUI")
+        ),
+        1,
+        0,
+    )));
     container.add_child(Arc::new(Spacer::new(1)));
 }
 
@@ -4014,28 +4357,39 @@ fn add_version_message(container: &Arc<Container>) {
 fn add_hotkeys_message(container: &Arc<Container>) {
     let c = current_theme().colors;
     container.add_child(Arc::new(Text::new(
-        c.md_heading.fg(&tui_bold("⌨️  Keyboard Shortcuts")), 1, 0)));
+        c.md_heading.fg(&tui_bold("⌨️  Keyboard Shortcuts")),
+        1,
+        0,
+    )));
     container.add_child(Arc::new(Spacer::new(1)));
     let keys: &[(&str, &str)] = &[
-        ("Enter",           "Send message"),
-        ("Shift+Enter",     "New line"),
-        ("Tab",             "Accept autocomplete suggestion"),
-        ("Ctrl+A / Ctrl+E","Line start / end"),
-        ("Ctrl+K / Ctrl+U","Kill to end / start of line (Ctrl+Y yanks)"),
-        ("Ctrl+- / Ctrl+R","Undo / redo"),
-        ("Ctrl+Y / Alt+Y",  "Yank / yank-pop"),
-        ("Alt+Backspace",   "Kill previous word"),
-        ("Ctrl+C",          "Abort a run, or exit when idle"),
-        ("Esc",             "Abort a running prompt"),
-        ("Ctrl+L",          "Open model selector"),
-        ("Ctrl+M",          "Cycle to the next model (live)"),
-        ("Ctrl+T",          "Expand/collapse last tool result"),
-        ("PageUp/Down",     "Scroll transcript"),
+        ("Enter", "Send message"),
+        ("Shift+Enter", "New line"),
+        ("Tab", "Accept autocomplete suggestion"),
+        ("Ctrl+A / Ctrl+E", "Line start / end"),
+        (
+            "Ctrl+K / Ctrl+U",
+            "Kill to end / start of line (Ctrl+Y yanks)",
+        ),
+        ("Ctrl+- / Ctrl+R", "Undo / redo"),
+        ("Ctrl+Y / Alt+Y", "Yank / yank-pop"),
+        ("Alt+Backspace", "Kill previous word"),
+        ("Ctrl+C", "Abort a run, or exit when idle"),
+        ("Esc", "Abort a running prompt"),
+        ("Ctrl+L", "Open model selector"),
+        ("Ctrl+M", "Cycle to the next model (live)"),
+        ("Ctrl+T", "Expand/collapse last tool result"),
+        ("PageUp/Down", "Scroll transcript by one page"),
+        ("Home / End", "Jump to transcript start / latest output"),
     ];
     let key_w = keys.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
     for (key, desc) in keys {
-        let row = format!("  {:<key_w$}  {}  {}",
-            c.accent.fg(key), c.dim.fg("—"), c.muted.fg(desc));
+        let row = format!(
+            "  {:<key_w$}  {}  {}",
+            c.accent.fg(key),
+            c.dim.fg("—"),
+            c.muted.fg(desc)
+        );
         container.add_child(Arc::new(Text::new(row, 1, 0)));
     }
     container.add_child(Arc::new(Spacer::new(1)));
@@ -4055,7 +4409,10 @@ fn add_user_message(container: &Arc<Container>, text: &str) {
 fn add_error_message(container: &Arc<Container>, text: &str) {
     let c = current_theme().colors;
     container.add_child(Arc::new(Text::new(
-        format!("  {} {}", c.error.fg("✗"), c.error.fg(text)), 1, 0)));
+        format!("  {} {}", c.error.fg("✗"), c.error.fg(text)),
+        1,
+        0,
+    )));
     container.add_child(Arc::new(Spacer::new(1)));
 }
 
@@ -4063,7 +4420,10 @@ fn add_error_message(container: &Arc<Container>, text: &str) {
 fn add_note_message(container: &Arc<Container>, text: &str) {
     let c = current_theme().colors;
     container.add_child(Arc::new(Text::new(
-        format!("  {} {}", c.info.fg("ℹ"), c.muted.fg(text)), 1, 0)));
+        format!("  {} {}", c.info.fg("ℹ"), c.muted.fg(text)),
+        1,
+        0,
+    )));
     container.add_child(Arc::new(Spacer::new(1)));
 }
 
@@ -4085,7 +4445,9 @@ fn show_context_panel(
     lines.push("📂 Discovered resources for this session:".into());
 
     if skills.is_empty() {
-        lines.push("  Skills: (none discovered — create .pi/skills/ or ~/.rpi/agent/skills/)".into());
+        lines.push(
+            "  Skills: (none discovered — create .pi/skills/ or ~/.rpi/agent/skills/)".into(),
+        );
     } else {
         lines.push(format!("  Skills ({}):", skills.len()));
         for s in skills {
@@ -4100,7 +4462,9 @@ fn show_context_panel(
     }
 
     if templates.is_empty() {
-        lines.push("  Prompt templates: (none — create .pi/prompts/ or ~/.rpi/agent/prompts/)".into());
+        lines.push(
+            "  Prompt templates: (none — create .pi/prompts/ or ~/.rpi/agent/prompts/)".into(),
+        );
     } else {
         lines.push(format!("  Prompt templates ({}):", templates.len()));
         for t in templates {
@@ -4116,7 +4480,10 @@ fn show_context_panel(
     }
     lines.push("  Context files (AGENTS.md/CLAUDE.md) are injected from the ancestor walk;".into());
     lines.push("  SYSTEM.md / APPEND_SYSTEM.md feed the base + append prompt sections.".into());
-    lines.push("  Use --no-skills/-ns, --no-prompt-templates/-np, --no-context-files/-nc to suppress.".into());
+    lines.push(
+        "  Use --no-skills/-ns, --no-prompt-templates/-np, --no-context-files/-nc to suppress."
+            .into(),
+    );
     let body = lines.join("\n");
     container_note_block(chat, &body);
 }
@@ -4146,6 +4513,20 @@ use rpi_tui::Color as _Color;
 mod tests {
     use super::*;
     use rpi_tui::Component;
+
+    #[test]
+    fn transcript_page_uses_viewport_with_overlap() {
+        assert_eq!(transcript_page_size(24), 20);
+        assert_eq!(transcript_page_size(4), 1);
+        assert_eq!(transcript_page_size(0), 1);
+    }
+
+    #[test]
+    fn key_repeat_is_dispatched_but_release_is_not() {
+        assert!(should_dispatch_key(KeyEventKind::Press));
+        assert!(should_dispatch_key(KeyEventKind::Repeat));
+        assert!(!should_dispatch_key(KeyEventKind::Release));
+    }
 
     #[test]
     fn test_layout_renders_welcome_message() {
@@ -4183,8 +4564,16 @@ mod tests {
         let frame = rpi_tui::render_layout_frame(Arc::new(root), 80, 24);
 
         let all: String = frame.lines.join("\n");
-        assert!(all.contains("rpi"), "Welcome message not found. Rendered: {}", all);
-        assert!(all.contains("Type your message"), "Help text not found. Rendered: {}", all);
+        assert!(
+            all.contains("rpi"),
+            "Welcome message not found. Rendered: {}",
+            all
+        );
+        assert!(
+            all.contains("Type your message"),
+            "Help text not found. Rendered: {}",
+            all
+        );
     }
 
     #[test]
@@ -4197,7 +4586,11 @@ mod tests {
         // Welcome title is "rpi" (accent bold) + "interactive TUI" (muted),
         // joined by an ANSI reset — strip ANSI before checking the substring.
         let plain = strip_ansi(&all);
-        assert!(plain.contains("rpi"), "Welcome message not in chat container: {:?}", lines);
+        assert!(
+            plain.contains("rpi"),
+            "Welcome message not in chat container: {:?}",
+            lines
+        );
     }
 
     /// Reproduction for "Tab 补全了但显示没刷新": after `accept_top_suggestion`
@@ -4210,7 +4603,10 @@ mod tests {
         use rpi_tui::render_layout_frame;
 
         let editor = Arc::new(Editor::new(
-            EditorOptions { padding_x: 1, ..Default::default() },
+            EditorOptions {
+                padding_x: 1,
+                ..Default::default()
+            },
             EditorStyle::default(),
             Arc::new(rpi_tui::Keybindings::new()),
         ));
@@ -4221,14 +4617,20 @@ mod tests {
         let footer = Arc::new(rpi_tui::Text::new("FOOTER", 0, 0));
         let dock = Arc::new(VStack::from_children(vec![
             StackChild::Entry(StackEntry::new(autocomplete_container.clone())),
-            StackChild::Entry(StackEntry::new(editor_container.clone()).shrink(0).min_size(3)),
+            StackChild::Entry(
+                StackEntry::new(editor_container.clone())
+                    .shrink(0)
+                    .min_size(3),
+            ),
             StackChild::Entry(StackEntry::new(footer)),
         ]));
 
         // Simulate the user typing "/mo" (the popup shows suggestions).
         let mut manager = AutocompleteManager::new();
         let mut combined = CombinedAutocompleteProvider::new();
-        combined.add_provider(Arc::new(SlashCommandAutocompleteProvider::with_default_commands()));
+        combined.add_provider(Arc::new(
+            SlashCommandAutocompleteProvider::with_default_commands(),
+        ));
         combined.add_provider(Arc::new(FilePathAutocompleteProvider::new()));
         manager.set_provider(Arc::new(combined));
         // Simulate typing "/mo" via the real insert path (advances the caret
@@ -4240,7 +4642,12 @@ mod tests {
         assert!(
             frame_before.lines.iter().any(|l| l.contains("/mo")),
             "precondition: editor shows the typed prefix. Frame rows:\n{}",
-            frame_before.lines.iter().map(|l| format!("  [{l}]")).collect::<Vec<_>>().join("\n")
+            frame_before
+                .lines
+                .iter()
+                .map(|l| format!("  [{l}]"))
+                .collect::<Vec<_>>()
+                .join("\n")
         );
 
         // Tab: accept the top suggestion (the same code path as the key loop).
@@ -4351,8 +4758,22 @@ mod tests {
             .map(|c| c.name.clone())
             .collect();
         for recognized in [
-            "/help", "/clear", "/new", "/exit", "/quit", "/version", "/model", "/session", "/theme",
-            "/compact", "/copy", "/hotkeys", "/tools", "/images", "/thinking", "/armin",
+            "/help",
+            "/clear",
+            "/new",
+            "/exit",
+            "/quit",
+            "/version",
+            "/model",
+            "/session",
+            "/theme",
+            "/compact",
+            "/copy",
+            "/hotkeys",
+            "/tools",
+            "/images",
+            "/thinking",
+            "/armin",
             "/earendil",
         ] {
             assert!(
@@ -4373,7 +4794,10 @@ mod tests {
     fn test_agent_event_mapping_creates_assistant_and_tool() {
         // Synthetic AgentEvent sequence → UI mutations, exercised against the
         // real drain handler with a no-op TUI stand-in.
-        use rpi_ai::types::{StopReason, TextContent, TextContentType, ThinkingContent, ThinkingContentType, ToolCall, ToolCallType, Usage};
+        use rpi_ai::types::{
+            StopReason, TextContent, TextContentType, ThinkingContent, ThinkingContentType,
+            ToolCall, ToolCallType, Usage,
+        };
 
         let state = Arc::new(TuiState {
             current_assistant: std::sync::Mutex::new(None),
@@ -4396,9 +4820,9 @@ mod tests {
             history: std::sync::Mutex::new(Vec::new()),
             history_index: std::sync::Mutex::new(-1),
             history_draft: std::sync::Mutex::new(None),
-        last_input_tokens: std::sync::Mutex::new(0),
-        scoped_edit: std::sync::Mutex::new(None),
-        markdown_transformer: std::sync::Mutex::new(None),
+            last_input_tokens: std::sync::Mutex::new(0),
+            scoped_edit: std::sync::Mutex::new(None),
+            markdown_transformer: std::sync::Mutex::new(None),
         });
 
         // The drain handler takes `Arc<TuiAltScreen>`, which needs a real
@@ -4443,7 +4867,9 @@ mod tests {
 
         // Manually apply the MessageStart assistant branch logic (mirrors the
         // drain handler, without needing a TuiAltScreen).
-        let comp = Arc::new(AssistantMessageComponent::new(AssistantMessageOptions::default()));
+        let comp = Arc::new(AssistantMessageComponent::new(
+            AssistantMessageOptions::default(),
+        ));
         comp.set_streaming(true);
         comp.update_blocks(&assistant_blocks(&assistant));
         let chat = Arc::new(Container::new());
@@ -4471,7 +4897,10 @@ mod tests {
         // component was registered.
         let rendered = chat.render(80);
         let joined: String = rendered.join("\n");
-        assert!(joined.contains("Hello."), "assistant text not rendered: {joined}");
+        assert!(
+            joined.contains("Hello."),
+            "assistant text not rendered: {joined}"
+        );
         assert!(
             joined.contains("Reasoning about the reply."),
             "thinking block not rendered: {joined}"
@@ -4483,11 +4912,49 @@ mod tests {
         let ended = state.tool_components.lock().unwrap().remove("tc1").unwrap();
         ended.set_result("hi", false);
         assert!(state.tool_components.lock().unwrap().is_empty());
+
+        // A running bash panel owns the visible spinner. The global loader is
+        // hidden until the last concurrent bash tool completes, then restored
+        // while the agent remains in the Working state.
+        assert!(state.try_start_working());
+        assert!(
+            !state.try_start_working(),
+            "a second submit must be rejected"
+        );
+        state.set_status(RunStatus::Idle);
+        state.set_status(RunStatus::Working);
+        assert_eq!(state.status_container.child_count(), 1);
+        {
+            let mut bash = state.bash_components.lock().unwrap();
+            bash.insert(
+                "bash-1".into(),
+                Arc::new(BashExecutionComponent::new("one")),
+            );
+            bash.insert(
+                "bash-2".into(),
+                Arc::new(BashExecutionComponent::new("two")),
+            );
+        }
+        state.sync_working_loader_with_bash();
+        assert_eq!(state.status_container.child_count(), 0);
+        state.bash_components.lock().unwrap().remove("bash-1");
+        state.sync_working_loader_with_bash();
+        assert_eq!(state.status_container.child_count(), 0);
+        state.bash_components.lock().unwrap().remove("bash-2");
+        state.sync_working_loader_with_bash();
+        assert_eq!(state.status_container.child_count(), 1);
+
+        state.set_status(RunStatus::Aborting);
+        assert_eq!(state.status_container.child_count(), 0);
+        assert!(!state.loader.is_running());
     }
 
     #[test]
     fn test_short_model_name() {
-        assert_eq!(short_model_name("anthropic:claude-sonnet-5"), "claude-sonnet-5");
+        assert_eq!(
+            short_model_name("anthropic:claude-sonnet-5"),
+            "claude-sonnet-5"
+        );
         assert_eq!(short_model_name("claude-sonnet-5"), "claude-sonnet-5");
     }
 
@@ -4495,7 +4962,13 @@ mod tests {
     fn test_cycle_next_model_wraps_around() {
         use rpi_ai::{Api, Model};
         let mk = |id: &str| {
-            Model::new(id, id, Api::AnthropicMessages, "anthropic", "https://api.anthropic.com")
+            Model::new(
+                id,
+                id,
+                Api::AnthropicMessages,
+                "anthropic",
+                "https://api.anthropic.com",
+            )
         };
         let catalog = [mk("a"), mk("b"), mk("c")];
         // Next after "a" is "b"; after "c" wraps to "a".
@@ -4533,9 +5006,9 @@ mod tests {
             history: std::sync::Mutex::new(Vec::new()),
             history_index: std::sync::Mutex::new(-1),
             history_draft: std::sync::Mutex::new(None),
-        last_input_tokens: std::sync::Mutex::new(0),
-        scoped_edit: std::sync::Mutex::new(None),
-        markdown_transformer: std::sync::Mutex::new(None),
+            last_input_tokens: std::sync::Mutex::new(0),
+            scoped_edit: std::sync::Mutex::new(None),
+            markdown_transformer: std::sync::Mutex::new(None),
         });
         {
             let mut combined = CombinedAutocompleteProvider::new();
@@ -4551,7 +5024,10 @@ mod tests {
         refresh_autocomplete(&state, &editor);
         let lines = state.autocomplete_container.render(80);
         let joined: String = lines.join("\n");
-        assert!(joined.contains("/help"), "slash suggestions not rendered: {joined}");
+        assert!(
+            joined.contains("/help"),
+            "slash suggestions not rendered: {joined}"
+        );
 
         // Clear: no suggestions for plain text.
         editor.set_text("hello");
@@ -4586,9 +5062,9 @@ mod tests {
             history: std::sync::Mutex::new(Vec::new()),
             history_index: std::sync::Mutex::new(-1),
             history_draft: std::sync::Mutex::new(None),
-        last_input_tokens: std::sync::Mutex::new(0),
-        scoped_edit: std::sync::Mutex::new(None),
-        markdown_transformer: std::sync::Mutex::new(None),
+            last_input_tokens: std::sync::Mutex::new(0),
+            scoped_edit: std::sync::Mutex::new(None),
+            markdown_transformer: std::sync::Mutex::new(None),
         });
         let editor_container = Arc::new(Container::new());
         let editor = Arc::new(Editor::simple());
@@ -4601,7 +5077,14 @@ mod tests {
             vec![SelectItem::new("a", "A"), SelectItem::new("b", "B")],
             5,
         ));
-        open_selector(&state, &editor_container, &editor, &tui, list, SelectorKind::Theme);
+        open_selector(
+            &state,
+            &editor_container,
+            &editor,
+            &tui,
+            list,
+            SelectorKind::Theme,
+        );
         assert!(state.selector_open());
         // list only (editor swapped out).
         assert_eq!(editor_container.child_count(), 1);
@@ -4638,9 +5121,9 @@ mod tests {
             history: std::sync::Mutex::new(Vec::new()),
             history_index: std::sync::Mutex::new(-1),
             history_draft: std::sync::Mutex::new(None),
-        last_input_tokens: std::sync::Mutex::new(0),
-        scoped_edit: std::sync::Mutex::new(None),
-        markdown_transformer: std::sync::Mutex::new(None),
+            last_input_tokens: std::sync::Mutex::new(0),
+            scoped_edit: std::sync::Mutex::new(None),
+            markdown_transformer: std::sync::Mutex::new(None),
         });
         let editor = Arc::new(Editor::simple());
 
@@ -4700,9 +5183,9 @@ mod tests {
             history: std::sync::Mutex::new(Vec::new()),
             history_index: std::sync::Mutex::new(-1),
             history_draft: std::sync::Mutex::new(None),
-        last_input_tokens: std::sync::Mutex::new(0),
-        scoped_edit: std::sync::Mutex::new(None),
-        markdown_transformer: std::sync::Mutex::new(None),
+            last_input_tokens: std::sync::Mutex::new(0),
+            scoped_edit: std::sync::Mutex::new(None),
+            markdown_transformer: std::sync::Mutex::new(None),
         });
         {
             let mut combined = CombinedAutocompleteProvider::new();

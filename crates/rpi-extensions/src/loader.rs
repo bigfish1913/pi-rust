@@ -18,11 +18,11 @@ use std::sync::Arc;
 use libloading::{Library, Symbol};
 use thiserror::Error;
 
-use rpi_plugin_sdk::{PluginApiVt, RPI_PLUGIN_ABI_VERSION, RpiPluginRegister};
+use rpi_plugin_sdk::{PluginApiVt, RpiPluginRegister, RPI_PLUGIN_ABI_VERSION};
 
 use crate::registry::{ExtensionRegistry, RegistrySnapshot};
 use crate::{
-    ActionBridge, HostApi, NullDiagnostics, PluginDiagnostics, clear_current_api, set_current_api,
+    clear_current_api, set_current_api, ActionBridge, HostApi, NullDiagnostics, PluginDiagnostics,
 };
 
 // ---------------------------------------------------------------------------
@@ -34,13 +34,23 @@ use crate::{
 #[derive(Debug, Error)]
 pub enum PluginLoadError {
     #[error("could not open library {path}: {source}")]
-    Open { path: PathBuf, #[source] source: libloading::Error },
+    Open {
+        path: PathBuf,
+        #[source]
+        source: libloading::Error,
+    },
     #[error("symbol `rpi_plugin_register` not found in {path}: {source}")]
-    Symbol { path: PathBuf, #[source] source: libloading::Error },
+    Symbol {
+        path: PathBuf,
+        #[source]
+        source: libloading::Error,
+    },
     #[error("register returned nonzero code {code} for {path}")]
     RegisterReturned { path: PathBuf, code: i32 },
     /// ABI version reported by the plugin mismatches the host's. Skip + diag.
-    #[error("ABI version mismatch in {path}: plugin built for {plugin_version}, host is {host_version}")]
+    #[error(
+        "ABI version mismatch in {path}: plugin built for {plugin_version}, host is {host_version}"
+    )]
     AbiVersionMismatch {
         path: PathBuf,
         plugin_version: u32,
@@ -165,7 +175,11 @@ pub fn load_one(
             code: -2,
         })?;
 
-    Ok(LoadedPlugin { library, path, registry })
+    Ok(LoadedPlugin {
+        library,
+        path,
+        registry,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -434,7 +448,11 @@ pub fn load_session_mixed(
 ) -> ExtensionSession {
     let mut loaded: Vec<LoadedPlugin> = Vec::new();
     for dir in dirs {
-        loaded.extend(load_dir(dir, Arc::clone(&diagnostics), action_bridge.clone()));
+        loaded.extend(load_dir(
+            dir,
+            Arc::clone(&diagnostics),
+            action_bridge.clone(),
+        ));
     }
     for f in files {
         if let Ok(plugin) = load_one(f, Arc::clone(&diagnostics), action_bridge.clone()) {
@@ -454,7 +472,11 @@ pub fn load_session_mixed(
     // left valid-but-empty / cloned already, and `library` is a move into `libs`.
     let mut libs: Vec<Library> = Vec::with_capacity(loaded.len());
     for p in loaded {
-        let LoadedPlugin { library, registry: _, path: _ } = p;
+        let LoadedPlugin {
+            library,
+            registry: _,
+            path: _,
+        } = p;
         libs.push(library);
     }
     let snapshot = Arc::new(session_registry.snapshot());

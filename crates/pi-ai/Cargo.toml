@@ -8,7 +8,7 @@ authors.workspace = true
 repository.workspace = true
 description = "Unified multi-provider LLM types + streaming, Rust port of pi-ai"
 readme = "../../README.md"
-keywords = ["agent", "llm", "ai", "claude", "anthropic"]
+keywords = ["agent", "llm", "ai", "anthropic", "openai"]
 categories = ["api-bindings", "asynchronous"]
 
 [dependencies]

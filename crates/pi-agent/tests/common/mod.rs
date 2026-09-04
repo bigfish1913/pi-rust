@@ -46,7 +46,10 @@ pub fn mock_stream_fn(messages: Vec<AssistantMessage>) -> StreamFn {
                             let reason = matches!(message.stop_reason, StopReason::Aborted)
                                 .then_some(ErrorReason::Aborted)
                                 .unwrap_or(ErrorReason::Error);
-                            prod.push(AssistantMessageEvent::Error { reason, error: message });
+                            prod.push(AssistantMessageEvent::Error {
+                                reason,
+                                error: message,
+                            });
                         }
                         _ => {
                             let reason = done_reason_from_stop(message.stop_reason);
@@ -165,9 +168,11 @@ pub fn assistant_tool_calls(
 /// The identity converter: keep only `user`/`assistant`/`toolResult` messages,
 /// drop `custom`. Mirrors TS `identityConverter`. Returns the `ConvertToLlm`
 /// Arc shape the loop config expects.
-pub fn identity_converter(
-) -> Arc<dyn Fn(Vec<rpi_agent::AgentMessage>) -> futures::future::BoxFuture<'static, Vec<Message>> + Send + Sync>
-{
+pub fn identity_converter() -> Arc<
+    dyn Fn(Vec<rpi_agent::AgentMessage>) -> futures::future::BoxFuture<'static, Vec<Message>>
+        + Send
+        + Sync,
+> {
     Arc::new(|messages: Vec<rpi_agent::AgentMessage>| {
         let out: Vec<Message> = messages
             .into_iter()
@@ -237,10 +242,9 @@ pub async fn run_and_collect(
 ) -> (Vec<rpi_agent::AgentEvent>, Vec<rpi_agent::AgentMessage>) {
     let (collector, events) = rpi_agent::CollectorEmitter::new();
     let emit: Arc<dyn rpi_agent::AgentEmitter> = Arc::new(collector);
-    let new_messages =
-        rpi_agent::run_agent_loop(prompts, context, config, emit, stream_fn)
-            .await
-            .expect("run_agent_loop failed");
+    let new_messages = rpi_agent::run_agent_loop(prompts, context, config, emit, stream_fn)
+        .await
+        .expect("run_agent_loop failed");
     let events = events.lock().expect("events lock").clone();
     (events, new_messages)
 }

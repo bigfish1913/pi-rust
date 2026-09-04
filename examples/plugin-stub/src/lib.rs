@@ -81,14 +81,16 @@ extern "C" fn echo_execute(
         params.free_with(free_params);
         s
     };
-    let parsed: serde_json::Value =
-        serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+    let parsed: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
     let value = parsed
         .get("text")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let drive = Box::new(EchoDrive { text: value, polls: 0 });
+    let drive = Box::new(EchoDrive {
+        text: value,
+        polls: 0,
+    });
     Box::into_raw(drive) as StepHandle
 }
 
@@ -114,9 +116,8 @@ extern "C" fn echo_poll(
     if drive.polls == 1 {
         // Emit a partial progress result through the callback path.
         if let Some(cb) = partial_cb {
-            let progress = StbString::from_string(
-                r#"{"content":[{"type":"text","text":"..."}]}"#.to_string(),
-            );
+            let progress =
+                StbString::from_string(r#"{"content":[{"type":"text","text":"..."}]}"#.to_string());
             // The host frees the partial's StbString (it is plugin-produced here,
             // but the host's partial_cb_trampoline reclaims via host_free_string).
             cb(progress, user_data);
@@ -180,7 +181,10 @@ static MESSAGE_END_HITS: AtomicUsize = AtomicUsize::new(0);
 /// [`rpi_plugin_sdk::StablePluginEvent`]; per the SDK contract the handler MUST
 /// NOT free the event's strings (the host frees exactly once after the fan-out).
 /// Returns 0 (success); nonzero would be logged but not abort the fan-out.
-extern "C" fn on_message_end(_event: rpi_plugin_sdk::StablePluginEvent, _user_data: *mut c_void) -> i32 {
+extern "C" fn on_message_end(
+    _event: rpi_plugin_sdk::StablePluginEvent,
+    _user_data: *mut c_void,
+) -> i32 {
     MESSAGE_END_HITS.fetch_add(1, Ordering::SeqCst);
     0
 }
@@ -318,8 +322,7 @@ extern "C" fn on_markdown_transform(
     MARKDOWN_TRANSFORM_HITS.fetch_add(1, Ordering::SeqCst);
     // Parse the input (borrowed — must NOT free). lenient: missing `markdown` ⇒ "".
     let input = unsafe { input_json.as_str() };
-    let parsed: serde_json::Value =
-        serde_json::from_str(input).unwrap_or(serde_json::Value::Null);
+    let parsed: serde_json::Value = serde_json::from_str(input).unwrap_or(serde_json::Value::Null);
     let md = parsed
         .get("markdown")
         .and_then(|v| v.as_str())
@@ -399,7 +402,11 @@ pub extern "C" fn rpi_plugin_register(api: *const PluginApiVt, abi_version: u32)
             // always wires it; a non-wiring host logs + we continue).
             return 3;
         };
-        let rc = register_resources_discover(on_resources_discover, plugin_free_string, std::ptr::null_mut());
+        let rc = register_resources_discover(
+            on_resources_discover,
+            plugin_free_string,
+            std::ptr::null_mut(),
+        );
         if rc != 0 {
             return rc;
         }
@@ -478,5 +485,7 @@ fn escape_json_string(s: &str) -> String {
 // silent layout drift in the SDK that would corrupt the poll() return.
 #[allow(dead_code)]
 const _ASSERT_STEP_TAG_REPR: () = assert!(
-    StepResultTag::Pending as u32 == 0 && StepResultTag::Done as u32 == 1 && StepResultTag::Err as u32 == 2
+    StepResultTag::Pending as u32 == 0
+        && StepResultTag::Done as u32 == 1
+        && StepResultTag::Err as u32 == 2
 );

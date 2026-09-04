@@ -11,3 +11,4 @@
 task-*.log
 release-*.log
 .claude/*
+target/*

@@ -12,7 +12,7 @@ use super::kill_ring::KillRing;
 use super::undo_stack::UndoStack;
 use super::word_navigation::{find_word_backward, find_word_forward};
 use crate::ansi::CURSOR_MARKER;
-use crate::utils::{visible_width, slice_by_column};
+use crate::utils::{slice_by_column, visible_width};
 
 /// Input state for undo.
 #[derive(Debug, Clone)]
@@ -89,7 +89,8 @@ impl Input {
 
     /// Get the current value.
     pub fn get_value(&self) -> String {
-        self.state.lock()
+        self.state
+            .lock()
             .map(|s| s.value.clone())
             .unwrap_or_default()
     }
@@ -161,7 +162,11 @@ impl Input {
     /// Insert a character at the cursor.
     fn insert_character(&self, char: &str) {
         // Undo coalescing: consecutive word chars coalesce into one undo unit
-        if char.chars().next().map(|c| c.is_whitespace()).unwrap_or(true)
+        if char
+            .chars()
+            .next()
+            .map(|c| c.is_whitespace())
+            .unwrap_or(true)
             || self.get_last_action() != LastAction::TypeWord
         {
             self.push_undo();
@@ -190,11 +195,7 @@ impl Input {
                 self.push_undo();
                 // Move cursor back and delete the character
                 let cursor = state.cursor;
-                state.value = format!(
-                    "{}{}",
-                    &state.value[..cursor - 1],
-                    &state.value[cursor..]
-                );
+                state.value = format!("{}{}", &state.value[..cursor - 1], &state.value[cursor..]);
                 state.cursor -= 1;
                 self.notify_change();
             }
@@ -208,11 +209,7 @@ impl Input {
             let cursor = state.cursor;
             if cursor < state.value.len() {
                 self.push_undo();
-                state.value = format!(
-                    "{}{}",
-                    &state.value[..cursor],
-                    &state.value[cursor + 1..]
-                );
+                state.value = format!("{}{}", &state.value[..cursor], &state.value[cursor + 1..]);
                 self.notify_change();
             }
         }
@@ -229,7 +226,13 @@ impl Input {
             if let Ok(mut kill_ring) = self.kill_ring.lock() {
                 use super::kill_ring::PushOptions;
                 let accumulate = self.get_last_action() == LastAction::Kill;
-                kill_ring.push(deleted, PushOptions { prepend: true, accumulate });
+                kill_ring.push(
+                    deleted,
+                    PushOptions {
+                        prepend: true,
+                        accumulate,
+                    },
+                );
             }
             self.set_last_action(LastAction::Kill);
             state.value = state.value[state.cursor..].to_string();
@@ -249,7 +252,13 @@ impl Input {
             if let Ok(mut kill_ring) = self.kill_ring.lock() {
                 use super::kill_ring::PushOptions;
                 let accumulate = self.get_last_action() == LastAction::Kill;
-                kill_ring.push(deleted, PushOptions { prepend: false, accumulate });
+                kill_ring.push(
+                    deleted,
+                    PushOptions {
+                        prepend: false,
+                        accumulate,
+                    },
+                );
             }
             self.set_last_action(LastAction::Kill);
             state.value = state.value[..state.cursor].to_string();
@@ -270,7 +279,13 @@ impl Input {
             let deleted = &state.value[new_cursor..old_cursor];
             if let Ok(mut kill_ring) = self.kill_ring.lock() {
                 use super::kill_ring::PushOptions;
-                kill_ring.push(deleted, PushOptions { prepend: true, accumulate: was_kill });
+                kill_ring.push(
+                    deleted,
+                    PushOptions {
+                        prepend: true,
+                        accumulate: was_kill,
+                    },
+                );
             }
             self.set_last_action(LastAction::Kill);
             state.value = format!(
@@ -296,7 +311,13 @@ impl Input {
             let deleted = &state.value[old_cursor..new_cursor];
             if let Ok(mut kill_ring) = self.kill_ring.lock() {
                 use super::kill_ring::PushOptions;
-                kill_ring.push(deleted, PushOptions { prepend: false, accumulate: was_kill });
+                kill_ring.push(
+                    deleted,
+                    PushOptions {
+                        prepend: false,
+                        accumulate: was_kill,
+                    },
+                );
             }
             self.set_last_action(LastAction::Kill);
             state.value = format!(
@@ -316,7 +337,7 @@ impl Input {
         } else {
             None
         };
-        
+
         if let Some(text) = text {
             self.push_undo();
             if let Ok(mut state) = self.state.lock() {
@@ -345,14 +366,14 @@ impl Input {
                 return;
             }
             drop(kill_ring);
-            
+
             self.push_undo();
-            
+
             if let Ok(mut kill_ring) = self.kill_ring.lock() {
                 let prev_text = kill_ring.peek().unwrap_or("").to_string();
                 kill_ring.rotate();
                 let new_text = kill_ring.peek().unwrap_or("").to_string();
-                
+
                 if let Ok(mut state) = self.state.lock() {
                     // Remove previously yanked text
                     let cursor = state.cursor;
@@ -363,7 +384,7 @@ impl Input {
                             &state.value[cursor..]
                         );
                         state.cursor -= prev_text.len();
-                        
+
                         // Insert new text
                         let cursor = state.cursor;
                         state.value = format!(
@@ -461,7 +482,8 @@ impl Input {
 
     /// Get the last action.
     fn get_last_action(&self) -> LastAction {
-        self.last_action.lock()
+        self.last_action
+            .lock()
             .map(|a| *a)
             .unwrap_or(LastAction::None)
     }
@@ -518,28 +540,24 @@ impl Input {
             (KeyCode::Backspace, _) => self.handle_backspace(),
             (KeyCode::Delete, _) => self.handle_forward_delete(),
             // Character input
-            (KeyCode::Char(c), KeyModifiers::CONTROL) => {
-                match c {
-                    'a' => self.move_to_line_start(),
-                    'e' => self.move_to_line_end(),
-                    'b' => self.move_cursor_left(),
-                    'f' => self.move_cursor_right(),
-                    'w' => self.delete_word_backwards(),
-                    'k' => self.delete_to_line_end(),
-                    'u' => self.delete_to_line_start(),
-                    'y' => self.yank(),
-                    '_' | '/' => self.undo(),
-                    _ => {}
-                }
-            }
-            (KeyCode::Char(c), KeyModifiers::ALT) => {
-                match c {
-                    'b' => self.move_word_left(),
-                    'f' => self.move_word_right(),
-                    'd' => self.delete_word_forward(),
-                    _ => {}
-                }
-            }
+            (KeyCode::Char(c), KeyModifiers::CONTROL) => match c {
+                'a' => self.move_to_line_start(),
+                'e' => self.move_to_line_end(),
+                'b' => self.move_cursor_left(),
+                'f' => self.move_cursor_right(),
+                'w' => self.delete_word_backwards(),
+                'k' => self.delete_to_line_end(),
+                'u' => self.delete_to_line_start(),
+                'y' => self.yank(),
+                '_' | '/' => self.undo(),
+                _ => {}
+            },
+            (KeyCode::Char(c), KeyModifiers::ALT) => match c {
+                'b' => self.move_word_left(),
+                'f' => self.move_word_right(),
+                'd' => self.delete_word_forward(),
+                _ => {}
+            },
             (KeyCode::Char(c), _) => {
                 self.insert_character(&c.to_string());
             }
@@ -558,7 +576,7 @@ impl Component for Input {
     fn render(&self, width: usize) -> Vec<String> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let focused = *self.focused.lock().unwrap_or_else(|e| e.into_inner());
-        
+
         let prompt_len = visible_width(&self.prompt);
         let available_width = width.saturating_sub(prompt_len);
 
@@ -631,9 +649,13 @@ impl Component for Input {
                 }
             };
             cursor.saturating_sub(
-                value.chars().take_while(|c| {
-                    visible_width(&value[..value.chars().position(|ch| ch == *c).unwrap_or(0)]) < scroll_start_col
-                }).count()
+                value
+                    .chars()
+                    .take_while(|c| {
+                        visible_width(&value[..value.chars().position(|ch| ch == *c).unwrap_or(0)])
+                            < scroll_start_col
+                    })
+                    .count(),
             )
         };
 
@@ -652,12 +674,7 @@ impl Component for Input {
 
         let line = format!(
             "{}{}{}{}{}{}",
-            self.prompt,
-            marker,
-            before_cursor,
-            cursor_char,
-            after_cursor,
-            "\x1b[0m"
+            self.prompt, marker, before_cursor, cursor_char, after_cursor, "\x1b[0m"
         );
 
         vec![line]

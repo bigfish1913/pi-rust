@@ -9,14 +9,13 @@
 //! that replays N chunks — same pattern as `abort_bracketing.rs`.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use rpi_tools::{
     ExecutionEnv, ExecutionToolContext, FileContent, FileError, FileInfo, FileSystem,
-    InMemoryExecutionEnv, MutatingEnv, MutationQueueRegistry, Shell, ShellExecOptions,
-    ShellOutput,
+    InMemoryExecutionEnv, MutatingEnv, MutationQueueRegistry, Shell, ShellExecOptions, ShellOutput,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -50,52 +49,120 @@ impl FileSystem for StreamingEnv {
     fn cwd(&self) -> &Path {
         self.inner.cwd()
     }
-    async fn absolute_path(&self, p: &str, c: Option<&CancellationToken>) -> Result<PathBuf, FileError> {
+    async fn absolute_path(
+        &self,
+        p: &str,
+        c: Option<&CancellationToken>,
+    ) -> Result<PathBuf, FileError> {
         self.inner.absolute_path(p, c).await
     }
-    async fn join_path(&self, p: &[&str], c: Option<&CancellationToken>) -> Result<PathBuf, FileError> {
+    async fn join_path(
+        &self,
+        p: &[&str],
+        c: Option<&CancellationToken>,
+    ) -> Result<PathBuf, FileError> {
         self.inner.join_path(p, c).await
     }
-    async fn read_text_file(&self, p: &str, c: Option<&CancellationToken>) -> Result<String, FileError> {
+    async fn read_text_file(
+        &self,
+        p: &str,
+        c: Option<&CancellationToken>,
+    ) -> Result<String, FileError> {
         self.inner.read_text_file(p, c).await
     }
-    async fn read_text_lines(&self, p: &str, m: Option<usize>, c: Option<&CancellationToken>) -> Result<Vec<String>, FileError> {
+    async fn read_text_lines(
+        &self,
+        p: &str,
+        m: Option<usize>,
+        c: Option<&CancellationToken>,
+    ) -> Result<Vec<String>, FileError> {
         self.inner.read_text_lines(p, m, c).await
     }
-    async fn read_binary_file(&self, p: &str, c: Option<&CancellationToken>) -> Result<Vec<u8>, FileError> {
+    async fn read_binary_file(
+        &self,
+        p: &str,
+        c: Option<&CancellationToken>,
+    ) -> Result<Vec<u8>, FileError> {
         self.inner.read_binary_file(p, c).await
     }
-    async fn write_file(&self, p: &str, c: FileContent, c2: Option<&CancellationToken>) -> Result<(), FileError> {
+    async fn write_file(
+        &self,
+        p: &str,
+        c: FileContent,
+        c2: Option<&CancellationToken>,
+    ) -> Result<(), FileError> {
         self.inner.write_file(p, c, c2).await
     }
-    async fn append_file(&self, p: &str, c: FileContent, c2: Option<&CancellationToken>) -> Result<(), FileError> {
+    async fn append_file(
+        &self,
+        p: &str,
+        c: FileContent,
+        c2: Option<&CancellationToken>,
+    ) -> Result<(), FileError> {
         self.inner.append_file(p, c, c2).await
     }
-    async fn rename_file(&self, s: &str, d: &str, c: Option<&CancellationToken>) -> Result<(), FileError> {
+    async fn rename_file(
+        &self,
+        s: &str,
+        d: &str,
+        c: Option<&CancellationToken>,
+    ) -> Result<(), FileError> {
         self.inner.rename_file(s, d, c).await
     }
-    async fn file_info(&self, p: &str, c: Option<&CancellationToken>) -> Result<FileInfo, FileError> {
+    async fn file_info(
+        &self,
+        p: &str,
+        c: Option<&CancellationToken>,
+    ) -> Result<FileInfo, FileError> {
         self.inner.file_info(p, c).await
     }
-    async fn list_dir(&self, p: &str, c: Option<&CancellationToken>) -> Result<Vec<FileInfo>, FileError> {
+    async fn list_dir(
+        &self,
+        p: &str,
+        c: Option<&CancellationToken>,
+    ) -> Result<Vec<FileInfo>, FileError> {
         self.inner.list_dir(p, c).await
     }
-    async fn canonical_path(&self, p: &str, c: Option<&CancellationToken>) -> Result<PathBuf, FileError> {
+    async fn canonical_path(
+        &self,
+        p: &str,
+        c: Option<&CancellationToken>,
+    ) -> Result<PathBuf, FileError> {
         self.inner.canonical_path(p, c).await
     }
     async fn exists(&self, p: &str, c: Option<&CancellationToken>) -> Result<bool, FileError> {
         self.inner.exists(p, c).await
     }
-    async fn create_dir(&self, p: &str, r: bool, c: Option<&CancellationToken>) -> Result<(), FileError> {
+    async fn create_dir(
+        &self,
+        p: &str,
+        r: bool,
+        c: Option<&CancellationToken>,
+    ) -> Result<(), FileError> {
         self.inner.create_dir(p, r, c).await
     }
-    async fn remove(&self, p: &str, r: bool, f: bool, c: Option<&CancellationToken>) -> Result<(), FileError> {
+    async fn remove(
+        &self,
+        p: &str,
+        r: bool,
+        f: bool,
+        c: Option<&CancellationToken>,
+    ) -> Result<(), FileError> {
         self.inner.remove(p, r, f, c).await
     }
-    async fn create_temp_dir(&self, p: Option<&str>, c: Option<&CancellationToken>) -> Result<PathBuf, FileError> {
+    async fn create_temp_dir(
+        &self,
+        p: Option<&str>,
+        c: Option<&CancellationToken>,
+    ) -> Result<PathBuf, FileError> {
         self.inner.create_temp_dir(p, c).await
     }
-    async fn create_temp_file(&self, p: &str, s: &str, c: Option<&CancellationToken>) -> Result<PathBuf, FileError> {
+    async fn create_temp_file(
+        &self,
+        p: &str,
+        s: &str,
+        c: Option<&CancellationToken>,
+    ) -> Result<PathBuf, FileError> {
         self.inner.create_temp_file(p, s, c).await
     }
     async fn cleanup(&self) {
@@ -155,7 +222,12 @@ async fn coalesces_updates_within_throttle_window() {
 
     let signal = CancellationToken::new();
     let _r = tool
-        .execute("bash-throttle", serde_json::json!({ "command": "stream" }), signal, on_update)
+        .execute(
+            "bash-throttle",
+            serde_json::json!({ "command": "stream" }),
+            signal,
+            on_update,
+        )
         .await
         .expect("ok");
 

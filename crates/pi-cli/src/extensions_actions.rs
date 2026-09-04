@@ -86,7 +86,12 @@ impl HarnessActionHost {
     ) -> (Self, Arc<OnceLock<Arc<AgentHarness>>>) {
         let harness = Arc::new(OnceLock::new());
         (
-            Self { harness: Arc::clone(&harness), catalog, cwd, runtime },
+            Self {
+                harness: Arc::clone(&harness),
+                catalog,
+                cwd,
+                runtime,
+            },
             harness,
         )
     }
@@ -137,7 +142,9 @@ fn arg_str(args: &serde_json::Value, key: &str) -> Result<String, String> {
 
 /// Helper: pull an optional string field.
 fn arg_str_opt(args: &serde_json::Value, key: &str) -> Option<String> {
-    args.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+    args.get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 /// Helper: pull a bool field (default `false`).
@@ -162,7 +169,11 @@ fn arg_str_array(args: &serde_json::Value, key: &str) -> Result<Vec<String>, Str
 /// assistant content is too rich for a v1 action result).
 fn run_outcome_json(outcome: HarnessRunOutcome) -> serde_json::Value {
     match outcome {
-        HarnessRunOutcome::Completed { leaf_id, final_entry_id, final_message } => {
+        HarnessRunOutcome::Completed {
+            leaf_id,
+            final_entry_id,
+            final_message,
+        } => {
             serde_json::json!({
                 "status": "completed",
                 "leafId": leaf_id,
@@ -170,7 +181,11 @@ fn run_outcome_json(outcome: HarnessRunOutcome) -> serde_json::Value {
                 "text": assistant_text(&final_message),
             })
         }
-        HarnessRunOutcome::Aborted { leaf_id, final_entry_id, final_message } => {
+        HarnessRunOutcome::Aborted {
+            leaf_id,
+            final_entry_id,
+            final_message,
+        } => {
             serde_json::json!({
                 "status": "aborted",
                 "leafId": leaf_id,
@@ -178,7 +193,12 @@ fn run_outcome_json(outcome: HarnessRunOutcome) -> serde_json::Value {
                 "text": assistant_text(&final_message),
             })
         }
-        HarnessRunOutcome::Failed { leaf_id, error, final_entry_id, final_message } => {
+        HarnessRunOutcome::Failed {
+            leaf_id,
+            error,
+            final_entry_id,
+            final_message,
+        } => {
             serde_json::json!({
                 "status": "failed",
                 "leafId": leaf_id,
@@ -187,7 +207,11 @@ fn run_outcome_json(outcome: HarnessRunOutcome) -> serde_json::Value {
                 "text": final_message.map(|m| assistant_text(&m)).unwrap_or_default(),
             })
         }
-        HarnessRunOutcome::Suspended { leaf_id, final_entry_id, .. } => {
+        HarnessRunOutcome::Suspended {
+            leaf_id,
+            final_entry_id,
+            ..
+        } => {
             serde_json::json!({
                 "status": "suspended",
                 "leafId": leaf_id,
@@ -216,7 +240,10 @@ impl RuntimeActionHost for HarnessActionHost {
         // kind. Falls back to `{"text": "..."}` as a user-text shorthand.
         let lane = self.harness()?.lane("main");
         if let Some(text) = arg_str_opt(&args, "text") {
-            let result = lane.prompt_text(&text, Vec::new()).await.map_err(|e| e.to_string())?;
+            let result = lane
+                .prompt_text(&text, Vec::new())
+                .await
+                .map_err(|e| e.to_string())?;
             return Ok(run_outcome_json(result.outcome));
         }
         let msg = args
@@ -224,14 +251,23 @@ impl RuntimeActionHost for HarnessActionHost {
             .ok_or_else(|| "missing `message` or `text` field".to_string())?;
         let message: rpi_agent::AgentMessage =
             serde_json::from_value(msg.clone()).map_err(|e| format!("invalid message: {e}"))?;
-        let result = lane.prompt_message(message).await.map_err(|e| e.to_string())?;
+        let result = lane
+            .prompt_message(message)
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(run_outcome_json(result.outcome))
     }
 
-    async fn send_user_message(&self, args: serde_json::Value) -> Result<serde_json::Value, String> {
+    async fn send_user_message(
+        &self,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
         let text = arg_str(&args, "text")?;
         let lane = self.harness()?.lane("main");
-        let result = lane.prompt_text(&text, Vec::new()).await.map_err(|e| e.to_string())?;
+        let result = lane
+            .prompt_text(&text, Vec::new())
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(run_outcome_json(result.outcome))
     }
 
@@ -273,7 +309,10 @@ impl RuntimeActionHost for HarnessActionHost {
         Ok(serde_json::Value::Null)
     }
 
-    async fn get_active_tools(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
+    async fn get_active_tools(
+        &self,
+        _args: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
         let lane = self.harness()?.lane("main");
         let tools = lane.get_active_tools().await.map_err(|e| e.to_string())?;
         Ok(serde_json::json!({ "tools": tools }))
@@ -282,7 +321,9 @@ impl RuntimeActionHost for HarnessActionHost {
     async fn set_active_tools(&self, args: serde_json::Value) -> Result<serde_json::Value, String> {
         let tools = arg_str_array(&args, "tools")?;
         let lane = self.harness()?.lane("main");
-        lane.set_active_tools(tools).await.map_err(|e| e.to_string())?;
+        lane.set_active_tools(tools)
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(serde_json::Value::Null)
     }
 
@@ -292,17 +333,25 @@ impl RuntimeActionHost for HarnessActionHost {
             .resolve_model(&id)
             .ok_or_else(|| format!("model `{id}` not in catalog"))?;
         let lane = self.harness()?.lane("main");
-        lane.set_model(model.clone()).await.map_err(|e| e.to_string())?;
+        lane.set_model(model.clone())
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(serde_json::json!({ "model": model.id }))
     }
 
-    async fn get_thinking_level(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
+    async fn get_thinking_level(
+        &self,
+        _args: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
         let lane = self.harness()?.lane("main");
         let level = lane.get_thinking_level().await.map_err(|e| e.to_string())?;
         Ok(serde_json::json!({ "level": level }))
     }
 
-    async fn set_thinking_level(&self, args: serde_json::Value) -> Result<serde_json::Value, String> {
+    async fn set_thinking_level(
+        &self,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
         let level_val = args
             .get("level")
             .ok_or_else(|| "missing `level` field".to_string())?;
@@ -314,7 +363,9 @@ impl RuntimeActionHost for HarnessActionHost {
                 .map_err(|e| format!("invalid thinking level: {e}"))?
         };
         let lane = self.harness()?.lane("main");
-        lane.set_thinking_level(level).await.map_err(|e| e.to_string())?;
+        lane.set_thinking_level(level)
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(serde_json::Value::Null)
     }
 
@@ -325,11 +376,17 @@ impl RuntimeActionHost for HarnessActionHost {
             .compact(custom.as_deref())
             .await
             .map_err(|e| e.to_string())?;
-        Ok(serde_json::json!({ "runId": result.run_id, "outcome": format!("{:?}", result.outcome) }))
+        Ok(
+            serde_json::json!({ "runId": result.run_id, "outcome": format!("{:?}", result.outcome) }),
+        )
     }
 
-    async fn get_system_prompt(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
-        let prompt = self.harness()?
+    async fn get_system_prompt(
+        &self,
+        _args: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let prompt = self
+            .harness()?
             .get_system_prompt()
             .await
             .map_err(|e| e.to_string())?;
@@ -372,7 +429,12 @@ impl RuntimeActionHost for HarnessActionHost {
         let label = arg_str_opt(&args, "label");
         let lane = self.harness()?.lane("main");
         let result = lane
-            .navigate_tree(target_id.as_deref(), summarize, custom.as_deref(), label.as_deref())
+            .navigate_tree(
+                target_id.as_deref(),
+                summarize,
+                custom.as_deref(),
+                label.as_deref(),
+            )
             .await
             .map_err(|e| e.to_string())?;
         let status = match &result.outcome {
@@ -387,8 +449,9 @@ impl RuntimeActionHost for HarnessActionHost {
     async fn switch_session(&self, args: serde_json::Value) -> Result<serde_json::Value, String> {
         let id = arg_str(&args, "id")?;
         let cwd_str = self.cwd.to_string_lossy().to_string();
-        let new_session: Session =
-            open_session_by_id(&id, &cwd_str).await.map_err(|e| e.to_string())?;
+        let new_session: Session = open_session_by_id(&id, &cwd_str)
+            .await
+            .map_err(|e| e.to_string())?;
         let new_id = new_session.storage().metadata().id.clone();
         self.harness()?
             .set_session(new_session)

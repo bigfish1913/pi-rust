@@ -97,11 +97,8 @@ async fn find_no_matches() {
     let (env, ctx) = fresh_context();
     seed(&env, "a.rs", b"".to_vec()).await;
     let tool = rpi_tools::create_find_tool(&ctx, None);
-    let result = run_find(
-        tool,
-        serde_json::json!({ "pattern": "*.foo", "path": "." }),
-    )
-    .await
+    let result = run_find(tool, serde_json::json!({ "pattern": "*.foo", "path": "." }))
+        .await
         .expect("find ok");
     assert_eq!(text_output(&result), "No files found matching pattern");
 }
@@ -138,12 +135,9 @@ async fn find_skips_git_directory() {
 
     let tool = rpi_tools::create_find_tool(&ctx, None);
     // `*` matches everything — but `.git/HEAD` must be excluded.
-    let result = run_find(
-        tool,
-        serde_json::json!({ "pattern": "**/*", "path": "." }),
-    )
-    .await
-    .expect("find ok");
+    let result = run_find(tool, serde_json::json!({ "pattern": "**/*", "path": "." }))
+        .await
+        .expect("find ok");
     let out = text_output(&result);
     assert!(out.contains("real.rs"), "got: {out}");
     assert!(!out.contains(".git"), ".git should be skipped: {out}");
@@ -181,5 +175,8 @@ async fn find_directory_match_has_trailing_slash() {
     .await
     .expect("find ok");
     let out = text_output(&result);
-    assert!(out.contains("components/"), "dir match should have trailing slash: {out}");
+    assert!(
+        out.contains("components/"),
+        "dir match should have trailing slash: {out}"
+    );
 }

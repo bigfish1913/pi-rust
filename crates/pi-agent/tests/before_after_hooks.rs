@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use common::{assistant_text, assistant_tool_calls, base_config, run_and_collect, user_message};
 use rpi_agent::{
-    AgentContext, AgentEvent, AgentToolResult, AfterToolCall, AfterToolCallResult, BeforeToolCall,
+    AfterToolCall, AfterToolCallResult, AgentContext, AgentEvent, AgentToolResult, BeforeToolCall,
     BeforeToolCallResult, ToolExecutionMode,
 };
 use rpi_ai::types::{StopReason, Usage, UsageCost};
@@ -84,8 +84,14 @@ impl rpi_agent::AgentTool for EchoTool {
         _signal: CancellationToken,
         _on_update: Arc<dyn Fn(rpi_agent::ToolResultPartial) + Send + Sync>,
     ) -> Result<AgentToolResult, rpi_agent::AgentError> {
-        let value = params.get("value").cloned().unwrap_or(serde_json::Value::Null);
-        self.executed.lock().expect("executed lock").push(value.clone());
+        let value = params
+            .get("value")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        self.executed
+            .lock()
+            .expect("executed lock")
+            .push(value.clone());
         let mut result = AgentToolResult::text(format!("echoed: {value}"));
         result.details = serde_json::json!({ "value": value });
         if let Some(u) = &self.usage {
@@ -120,7 +126,10 @@ fn context_with_tools(tools: Vec<Arc<dyn rpi_agent::AgentTool>>) -> AgentContext
 /// Count `turn_start` events — each turn is exactly one LLM call, so this is the
 /// Rust equivalent of the TS `llmCalls` counter.
 fn turn_start_count(events: &[AgentEvent]) -> usize {
-    events.iter().filter(|e| matches!(e, AgentEvent::TurnStart)).count()
+    events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::TurnStart))
+        .count()
 }
 
 // ----------------------------------------------------------------------------
@@ -164,28 +173,29 @@ async fn after_tool_call_overrides_usage() {
     let tool_usage = usage_block(1, 2, 3, 4, 10, (0.1, 0.2, 0.3, 0.4, 1.0));
     let patched_usage = usage_block(5, 6, 7, 8, 26, (0.5, 0.6, 0.7, 0.8, 2.6));
 
-    let observed: Arc<std::sync::Mutex<Option<Usage>>> =
-        Arc::new(std::sync::Mutex::new(None));
+    let observed: Arc<std::sync::Mutex<Option<Usage>>> = Arc::new(std::sync::Mutex::new(None));
     let (tool, executed) = EchoTool::new_with_usage(tool_usage.clone());
     let context = context_with_tools(vec![Arc::new(tool)]);
 
     let after: AfterToolCall = {
         let observed = Arc::clone(&observed);
         let patched = patched_usage.clone();
-        Arc::new(move |ctx: rpi_agent::AfterToolCallContext<'_>, _signal: CancellationToken| {
-            let observed = Arc::clone(&observed);
-            let patched = patched.clone();
-            // Clone out of the borrowed context BEFORE the async block — the
-            // BoxFuture is `'static`, so it can't hold the `'_` borrow.
-            let observed_usage = ctx.result.usage.clone();
-            Box::pin(async move {
-                *observed.lock().expect("observed lock") = observed_usage;
-                Some(AfterToolCallResult {
-                    usage: Some(patched),
-                    ..AfterToolCallResult::default()
+        Arc::new(
+            move |ctx: rpi_agent::AfterToolCallContext<'_>, _signal: CancellationToken| {
+                let observed = Arc::clone(&observed);
+                let patched = patched.clone();
+                // Clone out of the borrowed context BEFORE the async block — the
+                // BoxFuture is `'static`, so it can't hold the `'_` borrow.
+                let observed_usage = ctx.result.usage.clone();
+                Box::pin(async move {
+                    *observed.lock().expect("observed lock") = observed_usage;
+                    Some(AfterToolCallResult {
+                        usage: Some(patched),
+                        ..AfterToolCallResult::default()
+                    })
                 })
-            })
-        })
+            },
+        )
     };
 
     let mut config = base_config();
@@ -199,8 +209,13 @@ async fn after_tool_call_overrides_usage() {
         ),
         assistant_text("done", StopReason::Stop),
     ]);
-    let (events, new_messages) =
-        run_and_collect(vec![user_message("echo something")], context, config, stream_fn).await;
+    let (events, new_messages) = run_and_collect(
+        vec![user_message("echo something")],
+        context,
+        config,
+        stream_fn,
+    )
+    .await;
 
     // The tool ran once with the validated string args.
     assert_eq!(
@@ -216,14 +231,22 @@ async fn after_tool_call_overrides_usage() {
     );
 
     // ToolExecutionStart + ToolExecutionEnd both present; end is not an error.
-    let start = events.iter().find(|e| matches!(e, AgentEvent::ToolExecutionStart { .. }));
-    let end = events.iter().find(|e| matches!(e, AgentEvent::ToolExecutionEnd { .. }));
+    let start = events
+        .iter()
+        .find(|e| matches!(e, AgentEvent::ToolExecutionStart { .. }));
+    let end = events
+        .iter()
+        .find(|e| matches!(e, AgentEvent::ToolExecutionEnd { .. }));
     assert!(start.is_some(), "missing tool_execution_start");
     assert!(end.is_some(), "missing tool_execution_end");
-    if let Some(AgentEvent::ToolExecutionEnd { is_error, result, .. }) = end {
+    if let Some(AgentEvent::ToolExecutionEnd {
+        is_error, result, ..
+    }) = end
+    {
         assert!(!*is_error, "tool_execution_end should not be an error");
         assert_eq!(
-            result.usage, Some(patched_usage.clone()),
+            result.usage,
+            Some(patched_usage.clone()),
             "ToolExecutionEnd.result.usage must be the patched usage"
         );
     }
@@ -236,7 +259,8 @@ async fn after_tool_call_overrides_usage() {
     let tool_result = tool_result.expect("a toolResult message");
     assert!(!tool_result.is_error, "toolResult should not be an error");
     assert_eq!(
-        tool_result.usage, Some(patched_usage),
+        tool_result.usage,
+        Some(patched_usage),
         "ToolResultMessage.usage must be the patched usage"
     );
 }
@@ -257,15 +281,16 @@ async fn before_tool_call_mutates_args_without_revalidation() {
     let (tool, executed) = EchoTool::new_recording();
     let context = context_with_tools(vec![Arc::new(tool)]);
 
-    let before: BeforeToolCall =
-        Arc::new(|_ctx: rpi_agent::BeforeToolCallContext<'_>, _signal: CancellationToken| {
+    let before: BeforeToolCall = Arc::new(
+        |_ctx: rpi_agent::BeforeToolCallContext<'_>, _signal: CancellationToken| {
             Box::pin(async move {
                 Some(BeforeToolCallResult {
                     args: Some(serde_json::json!({ "value": 123 })),
                     ..BeforeToolCallResult::default()
                 })
             })
-        });
+        },
+    );
 
     let mut config = base_config();
     config.before_tool_call = Some(before);
@@ -277,8 +302,13 @@ async fn before_tool_call_mutates_args_without_revalidation() {
         ),
         assistant_text("done", StopReason::Stop),
     ]);
-    let (_events, _new_messages) =
-        run_and_collect(vec![user_message("echo something")], context, config, stream_fn).await;
+    let (_events, _new_messages) = run_and_collect(
+        vec![user_message("echo something")],
+        context,
+        config,
+        stream_fn,
+    )
+    .await;
 
     // execute received the mutated number, not the validated string.
     assert_eq!(
@@ -300,8 +330,8 @@ async fn before_tool_call_block_terminate_stops_loop() {
     let (tool, executed) = EchoTool::new_recording();
     let context = context_with_tools(vec![Arc::new(tool)]);
 
-    let before: BeforeToolCall =
-        Arc::new(|_ctx: rpi_agent::BeforeToolCallContext<'_>, _signal: CancellationToken| {
+    let before: BeforeToolCall = Arc::new(
+        |_ctx: rpi_agent::BeforeToolCallContext<'_>, _signal: CancellationToken| {
             Box::pin(async move {
                 Some(BeforeToolCallResult {
                     block: true,
@@ -310,7 +340,8 @@ async fn before_tool_call_block_terminate_stops_loop() {
                     ..BeforeToolCallResult::default()
                 })
             })
-        });
+        },
+    );
 
     let mut config = base_config();
     config.before_tool_call = Some(before);
@@ -323,8 +354,13 @@ async fn before_tool_call_block_terminate_stops_loop() {
         // "should not run" — if the loop wrongly continues, this is call 2.
         assistant_text("should not run", StopReason::Stop),
     ]);
-    let (events, new_messages) =
-        run_and_collect(vec![user_message("echo something")], context, config, stream_fn).await;
+    let (events, new_messages) = run_and_collect(
+        vec![user_message("echo something")],
+        context,
+        config,
+        stream_fn,
+    )
+    .await;
 
     // The tool did not execute.
     assert!(
@@ -375,21 +411,28 @@ async fn before_tool_call_mixed_batch_continues() {
     let context = context_with_tools(vec![Arc::new(tool)]);
 
     let before: BeforeToolCall = {
-        Arc::new(|ctx: rpi_agent::BeforeToolCallContext<'_>, _signal: CancellationToken| {
-            let value = ctx.args.get("value").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            Box::pin(async move {
-                if value == "first" {
-                    Some(BeforeToolCallResult {
-                        block: true,
-                        reason: Some("Blocked first".to_string()),
-                        terminate: true,
-                        ..BeforeToolCallResult::default()
-                    })
-                } else {
-                    None
-                }
-            })
-        })
+        Arc::new(
+            |ctx: rpi_agent::BeforeToolCallContext<'_>, _signal: CancellationToken| {
+                let value = ctx
+                    .args
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                Box::pin(async move {
+                    if value == "first" {
+                        Some(BeforeToolCallResult {
+                            block: true,
+                            reason: Some("Blocked first".to_string()),
+                            terminate: true,
+                            ..BeforeToolCallResult::default()
+                        })
+                    } else {
+                        None
+                    }
+                })
+            },
+        )
     };
 
     let mut config = base_config();

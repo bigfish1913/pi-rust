@@ -32,11 +32,13 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::env::{
-    check_cancel_exec, check_cancel_file, ExecutionEnv, FileContent, FileKind, FileInfo,
+    check_cancel_exec, check_cancel_file, ExecutionEnv, FileContent, FileInfo, FileKind,
     FileSystem, Shell, ShellExecOptions, ShellOutput,
 };
-use crate::error::{ExecutionError, ExecutionErrorCode, FileError, FileErrorCode, io_to_file_error};
-use crate::file_mutation_queue::{MutationQueueRegistry, MutatingEnv};
+use crate::error::{
+    io_to_file_error, ExecutionError, ExecutionErrorCode, FileError, FileErrorCode,
+};
+use crate::file_mutation_queue::{MutatingEnv, MutationQueueRegistry};
 
 /// Max timeout in ms (Int32 max). Mirrors `MAX_TIMEOUT_MS`.
 const MAX_TIMEOUT_MS: u64 = 2_147_483_647;
@@ -164,8 +166,8 @@ impl OsExecutionEnv {
                 });
             }
             // `which bash` fallback.
-            if let Some(found) = run_command("which", &["bash"], std::time::Duration::from_millis(5000))
-                .await
+            if let Some(found) =
+                run_command("which", &["bash"], std::time::Duration::from_millis(5000)).await
             {
                 let trimmed = found.trim();
                 if !trimmed.is_empty() && tokio::fs::metadata(trimmed).await.is_ok() {
@@ -267,8 +269,12 @@ async fn windows_probe_bash() -> Option<ShellConfig> {
         }
     }
     // `where bash.exe`.
-    if let Some(found) = run_command("where", &["bash.exe"], std::time::Duration::from_millis(5000))
-        .await
+    if let Some(found) = run_command(
+        "where",
+        &["bash.exe"],
+        std::time::Duration::from_millis(5000),
+    )
+    .await
     {
         let first = found.lines().next().unwrap_or("").trim().to_string();
         if !first.is_empty() && tokio::fs::metadata(&first).await.is_ok() {
@@ -492,8 +498,10 @@ impl FileSystem for OsExecutionEnv {
         } else if ft.is_symlink() {
             FileKind::Symlink
         } else {
-            return Err(FileError::new(FileErrorCode::Invalid, "Unsupported file type")
-                .with_path(abs.to_string_lossy()));
+            return Err(
+                FileError::new(FileErrorCode::Invalid, "Unsupported file type")
+                    .with_path(abs.to_string_lossy()),
+            );
         };
         let mtime_ms = meta
             .modified()
@@ -524,9 +532,11 @@ impl FileSystem for OsExecutionEnv {
             .await
             .map_err(|e| io_to_file_error(e, Some(&abs.to_string_lossy())))?;
         let mut out = Vec::new();
-        while let Some(entry) = entries.next_entry().await.map_err(|e| {
-            io_to_file_error(e, Some(&abs.to_string_lossy()))
-        })? {
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| io_to_file_error(e, Some(&abs.to_string_lossy())))?
+        {
             if let Some(t) = cancel {
                 if t.is_cancelled() {
                     return Err(FileError::aborted().with_path(abs.to_string_lossy()));
@@ -541,10 +551,7 @@ impl FileSystem for OsExecutionEnv {
                     if code == FileErrorCode::NotSupported {
                         continue;
                     }
-                    return Err(io_to_file_error(
-                        e,
-                        Some(&ep.to_string_lossy()),
-                    ));
+                    return Err(io_to_file_error(e, Some(&ep.to_string_lossy())));
                 }
             };
             let ft = meta.file_type();
@@ -564,10 +571,7 @@ impl FileSystem for OsExecutionEnv {
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
             out.push(FileInfo {
-                name: entry
-                    .file_name()
-                    .to_string_lossy()
-                    .into_owned(),
+                name: entry.file_name().to_string_lossy().into_owned(),
                 path: ep,
                 kind,
                 size: meta.len(),
@@ -652,12 +656,12 @@ impl FileSystem for OsExecutionEnv {
         check_cancel_file(cancel, None)?;
         let prefix = prefix.unwrap_or("tmp-");
         // Use tempfile's NamedTempFile-less builder for a dir.
-        let tmp = tempfile::tempdir_in(std::env::temp_dir())
-            .map_err(|e| io_to_file_error(e, None))?;
+        let tmp =
+            tempfile::tempdir_in(std::env::temp_dir()).map_err(|e| io_to_file_error(e, None))?;
         // tempfile picks a random name; rename to include the prefix.
         let path = tmp.path().to_path_buf();
         std::mem::forget(tmp); // keep the dir alive; caller manages cleanup.
-        // Build a prefixed sibling.
+                               // Build a prefixed sibling.
         let final_path = std::env::temp_dir().join(format!("{}{}", prefix, random_suffix()));
         // Rename the tempdir into the prefixed path.
         if let Err(e) = tokio::fs::rename(&path, &final_path).await {
@@ -897,33 +901,47 @@ impl Shell for OsExecutionEnv {
             // touched again AFTER the join completes (kill + reap), so the
             // borrow ends cleanly.
             let status_fut = async {
-                if let Some(to) = timeout {
-                    match tokio::time::timeout(to, child.wait()).await {
-                        Ok(s) => s,
+                match (timeout, cancel) {
+                    (Some(to), Some(token)) => {
+                        tokio::select! {
+                            status = child.wait() => status,
+                            _ = tokio::time::sleep(to) => {
+                                timed_out = true;
+                                if let Some(pid) = child.id() {
+                                    kill_process_tree(pid).await;
+                                }
+                                child.wait().await
+                            }
+                            _ = token.cancelled() => {
+                                if let Some(pid) = child.id() {
+                                    kill_process_tree(pid).await;
+                                }
+                                child.wait().await
+                            }
+                        }
+                    }
+                    (Some(to), None) => match tokio::time::timeout(to, child.wait()).await {
+                        Ok(status) => status,
                         Err(_) => {
                             timed_out = true;
-                            let pid_opt = child.id();
-                            let killed_pid = pid_opt;
-                            if let Some(pid) = killed_pid {
-                                kill_process_tree(pid).await;
-                            }
-                            // Reap the killed child.
-                            child.wait().await
-                        }
-                    }
-                } else if let Some(t) = cancel {
-                    tokio::select! {
-                        s = child.wait() => s,
-                        _ = t.cancelled() => {
-                            let killed_pid = child.id();
-                            if let Some(pid) = killed_pid {
+                            if let Some(pid) = child.id() {
                                 kill_process_tree(pid).await;
                             }
                             child.wait().await
                         }
+                    },
+                    (None, Some(token)) => {
+                        tokio::select! {
+                            status = child.wait() => status,
+                            _ = token.cancelled() => {
+                                if let Some(pid) = child.id() {
+                                    kill_process_tree(pid).await;
+                                }
+                                child.wait().await
+                            }
+                        }
                     }
-                } else {
-                    child.wait().await
+                    (None, None) => child.wait().await,
                 }
             };
             // Run stdio + status concurrently.
@@ -1002,7 +1020,10 @@ fn resolve_timeout(timeout: Option<f64>) -> Result<Option<std::time::Duration>, 
             if ms > MAX_TIMEOUT_MS as f64 {
                 return Err(ExecutionError::new(
                     ExecutionErrorCode::Timeout,
-                    format!("Invalid timeout: maximum is {} seconds", MAX_TIMEOUT_SECONDS),
+                    format!(
+                        "Invalid timeout: maximum is {} seconds",
+                        MAX_TIMEOUT_SECONDS
+                    ),
                 ));
             }
             Ok(Some(std::time::Duration::from_secs_f64(secs)))

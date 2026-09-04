@@ -54,7 +54,10 @@ impl EditTool {
             })),
             constrained_sampling: None,
         };
-        let tool = EditTool { schema, executed: Arc::clone(&executed) };
+        let tool = EditTool {
+            schema,
+            executed: Arc::clone(&executed),
+        };
         (tool, executed)
     }
 }
@@ -95,7 +98,10 @@ impl AgentTool for EditTool {
         _signal: CancellationToken,
         _on_update: Arc<dyn Fn(ToolResultPartial) + Send + Sync>,
     ) -> Result<AgentToolResult, AgentError> {
-        let edits = params.get("edits").cloned().unwrap_or(serde_json::Value::Null);
+        let edits = params
+            .get("edits")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         let count = edits.as_array().map(|a| a.len()).unwrap_or(0);
         self.executed.lock().expect("executed lock").push(edits);
         Ok(AgentToolResult::text(format!("edited {count}")))
@@ -140,9 +146,13 @@ async fn prepare_arguments_folds_legacy_oldtext_newtext_into_edits() {
     let done = assistant_text("done", StopReason::Stop);
 
     let stream_fn = mock_stream_fn(vec![tool_use, done]);
-    let (_events, _new_messages) =
-        run_and_collect(vec![user_message("edit something")], context, base_config(), stream_fn)
-            .await;
+    let (_events, _new_messages) = run_and_collect(
+        vec![user_message("edit something")],
+        context,
+        base_config(),
+        stream_fn,
+    )
+    .await;
 
     // The edit tool saw the folded `edits` array — not the legacy shape.
     let executed = executed.lock().expect("executed lock").clone();

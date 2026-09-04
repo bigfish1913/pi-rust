@@ -129,7 +129,10 @@ mod tests {
         // DISPLAY_HEIGHT rows + 1 caption.
         assert_eq!(lines.len(), DISPLAY_HEIGHT + 1);
         let joined: String = lines.join("\n");
-        assert!(joined.contains("ARMIN SAYS HI"), "caption missing: {joined}");
+        assert!(
+            joined.contains("ARMIN SAYS HI"),
+            "caption missing: {joined}"
+        );
     }
 
     #[test]

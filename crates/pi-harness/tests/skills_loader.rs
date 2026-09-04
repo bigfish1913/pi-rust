@@ -169,7 +169,10 @@ async fn loads_skill_md_file_without_frontmatter_name_uses_parent_dir_basename()
 
     let result = load_skills(&env, &["dyn/skills/dynamic.md".to_string()]).await;
     assert_eq!(result.skills.len(), 1);
-    assert_eq!(result.skills[0].name, "skills", "parent dir basename fallback");
+    assert_eq!(
+        result.skills[0].name, "skills",
+        "parent dir basename fallback"
+    );
 }
 
 #[tokio::test]
@@ -178,7 +181,10 @@ async fn load_skills_mixed_dirs_and_files() {
     // First-registration order preserved by the append-only loader (dedupe is
     // the caller's job — `load_skills_with_precedence` in rpi-cli).
     let (typed, env) = fresh_env();
-    typed.create_dir("skillsdir/good", true, None).await.unwrap();
+    typed
+        .create_dir("skillsdir/good", true, None)
+        .await
+        .unwrap();
     typed
         .write_file(
             "skillsdir/good/SKILL.md",
@@ -197,11 +203,7 @@ async fn load_skills_mixed_dirs_and_files() {
         .await
         .unwrap();
 
-    let result = load_skills(
-        &env,
-        &["skillsdir".to_string(), "dyn/loose.md".to_string()],
-    )
-    .await;
+    let result = load_skills(&env, &["skillsdir".to_string(), "dyn/loose.md".to_string()]).await;
     assert_eq!(result.skills.len(), 2, "{:?}", result.diagnostics);
     let names: Vec<&str> = result.skills.iter().map(|s| s.name.as_str()).collect();
     assert!(names.contains(&"dirskill"));
@@ -215,11 +217,7 @@ async fn non_markdown_file_is_silently_skipped() {
     let (typed, env) = fresh_env();
     typed.create_dir("dyn", true, None).await.unwrap();
     typed
-        .write_file(
-            "dyn/notes.txt",
-            "not a skill".into(),
-            None,
-        )
+        .write_file("dyn/notes.txt", "not a skill".into(), None)
         .await
         .unwrap();
     let result = load_skills(&env, &["dyn/notes.txt".to_string()]).await;
