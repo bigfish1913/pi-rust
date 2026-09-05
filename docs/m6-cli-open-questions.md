@@ -504,14 +504,20 @@ Phased commits B0→B5e; **B5e completes the final phase**.
   rebuilds the transformer from the fresh snapshot + reinstalls on the in-flight
   streaming component so a reloaded plugin's transform takes effect immediately.
 
-**Recorded + exposed, TUI consumption deferred (with diagnostic):**
-- `register_message_renderer` / `register_entry_renderer` are registered + held
-  in the registry (`RegistrySnapshot::renderers_of`), but v1 does not drive the
-  TUI from them. Under `--verbose`, `session::report_deferred_renderers` prints
-  a one-line count ("`N markdown-transform (active), M message-render
-  (deferred), K entry-render (deferred)`") so a plugin author sees the
-  registration landed. Consumption lands when the TUI gains a per-message /
-  per-entry renderer seam.
+**Message/entry renderer UI is now wired:**
+- `register_message_renderer` / `register_entry_renderer` are held in the
+  live `RegistrySnapshot` and invoked by both restored-history and streaming
+  TUI paths. The host accepts `{text, markdown?}` or `{lines:[...]}` output and
+  maps it to native terminal components; failures fall back to the built-in
+  custom-message/entry display. `session::report_deferred_renderers` now only
+  reports active renderer counts for `--verbose`.
+
+**Extension command UI is now wired:**
+- Registered commands participate in slash autocomplete and dispatch. A
+  handler may return `{kind:"message",text}`, `{kind:"selector",items:[...]}`
+  or `{kind:"editor",initialText}`; selector/editor submissions call the same
+  handler with an `action` envelope and restore the native editor on completion
+  or cancellation.
 
 **Documented limits (v1):** plugin providers are one-shot (sync `ProviderRequestFn`
 can't drive a chunked `stream_simple`); SDK JSON crosses as a string

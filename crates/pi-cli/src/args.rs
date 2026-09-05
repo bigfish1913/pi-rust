@@ -548,9 +548,10 @@ pub fn print_help() {
 {u}Notes:{r}
   Supported HTTP protocols are Anthropic Messages and OpenAI Chat Completions.
   Define custom model catalogs and provider apiKey values in
-  ~/.rpi/agent/models.json. TUI, extensions, skills, prompt templates, themes, model
-  cycling, package manager, HTML export, --fork, --list-models, --export, and
-  OAuth are recognized but not implemented yet.
+  ~/.rpi/agent/models.json. The interactive TUI, extensions, skills, prompt
+  templates, themes, model cycling, session fork/export, and trust commands are
+  available in the current build. OAuth, package manager, and HTML export remain
+  outside the current implementation.
 ",
         name = crate::APP_NAME,
         builtin = builtin,

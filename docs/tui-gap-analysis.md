@@ -1,5 +1,15 @@
 # pi TUI 完整差距分析报告
 
+> 状态说明（2026-09-05）：本文保留了最初的差距基线。当前 `interactive_tui.rs`
+> 已经接入流式事件、工具/Bash 渲染、会话恢复、滚动、自动补全、steering/follow-up
+> 队列、图片 block、alternate-screen/regular-screen overlay、`/tree`、`/clone`、
+> `/trust` 和基础 `/login`/`/logout`。恢复历史也会显示 compaction、branch summary、
+> model/tool 配置变更和常见 custom entry。因此下方早期的“未实现”表格不能直接代表
+> 当前状态；非 main lane 的 agent runner 和 lane-isolated queues 也已接入。剩余重点是
+> OAuth 登录对话框仍待补齐；Mermaid 专用终端渲染和扩展 editor/selector
+> 已完成接入。扩展 command、message renderer、entry renderer 都通过同一份
+> live registry 接到 TUI。
+
 ## 概述
 
 对比 TypeScript 版本的 pi TUI（`packages/coding-agent/src/modes/interactive/interactive-mode.ts`，6000+ 行）与 Rust 版本（`crates/pi-cli/src/interactive_tui.rs`，591 行），差距非常大。
@@ -79,7 +89,7 @@
 | status-indicator.ts | 状态指示器（Working/Loading 等） |
 | keybinding-hints.ts | 键绑定提示 |
 | markdown-transform.ts | Markdown 转换器 |
-| mermaid.ts | Mermaid 图表渲染 |
+| mermaid.ts | mermaid.rs（flowchart/graph/sequenceDiagram，未知语法源码回退，已接入） |
 | model-selector.ts | 模型选择器 |
 | session-selector.ts | 会话选择器（33KB） |
 | session-selector-search.ts | 会话搜索 |
@@ -96,9 +106,9 @@
 | visual-truncate.ts | 视觉截断 |
 | first-time-setup.ts | 首次设置 |
 | earendil-announcement.ts | 公告 |
-| extension-editor.ts | 扩展编辑器 |
-| extension-input.ts | 扩展输入 |
-| extension-selector.ts | 扩展选择器 |
+| extension-editor.ts | `register_command` 返回 `{"kind":"editor"}`，接入原生 Editor（已接入） |
+| extension-input.ts | 扩展 editor action 的 initialText/placeholder/submit 回传（已接入） |
+| extension-selector.ts | `register_command` 返回 `{"kind":"selector"}`，接入原生 SelectList（已接入） |
 | skill-invocation-message.ts | 技能调用消息 |
 | armin.ts / daxnuts.ts | 彩蛋组件 |
 

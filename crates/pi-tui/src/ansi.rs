@@ -25,6 +25,20 @@ pub fn strip_ansi(s: &str) -> String {
 
     while let Some(c) = chars.next() {
         if c == '\x1b' {
+            // Cursor markers are private escape sequences, not ANSI CSI/OSC
+            // sequences. Treat the complete marker as zero-width; otherwise
+            // the old logic skipped only `\\x1b_` and counted `pi:c` as text,
+            // making the hardware cursor jump several columns when moving.
+            let mut marker_tail = chars.clone();
+            let marker = ['_', 'p', 'i', ':', 'c', '\x07'];
+            let is_cursor_marker = marker
+                .iter()
+                .all(|expected| marker_tail.next() == Some(*expected));
+            if is_cursor_marker {
+                chars = marker_tail;
+                continue;
+            }
+
             // Start of escape sequence
             match chars.peek() {
                 Some('[') => {
@@ -63,13 +77,6 @@ pub fn strip_ansi(s: &str) -> String {
                     chars.next();
                 }
                 None => break,
-            }
-        } else if c == CURSOR_MARKER.chars().next().unwrap()
-            && s[s.char_indices().next().unwrap().0..].starts_with(CURSOR_MARKER)
-        {
-            // Skip cursor marker
-            for _ in CURSOR_MARKER.chars().skip(1) {
-                chars.next();
             }
         } else {
             result.push(c);

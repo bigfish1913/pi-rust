@@ -38,6 +38,7 @@ pub mod layout;
 pub mod layout_node;
 pub mod loader;
 pub mod markdown;
+pub mod mermaid;
 pub mod overlay;
 pub mod render;
 pub mod scroll_view;
@@ -110,6 +111,7 @@ pub use layout_node::{
 };
 pub use loader::{CancellableLoader, Loader, LoaderIndicatorOptions, ProgressLoader};
 pub use markdown::{Markdown, MarkdownOptions};
+pub use mermaid::Mermaid;
 pub use overlay::{Dialog, OverlayHandle, OverlayManager, Selector, SelectorItem};
 pub use scroll_view::{FollowMode, ScrollView, ScrollViewOptions};
 pub use select_list::{SelectItem, SelectList, SelectListLayoutOptions, SelectListTheme};

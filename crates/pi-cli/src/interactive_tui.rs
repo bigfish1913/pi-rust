@@ -7,8 +7,8 @@
 //! emits via the `BroadcastEmitter` installed in [`crate::session`].
 //!
 //! Key architecture facts (see `docs/tui-gap-analysis.md`):
-//! - `TuiAltScreen::start()` and `show_overlay` are stubs, so this module owns
-//!   a `spawn_blocking` crossterm `read()` loop for key dispatch and a
+//! - `TuiAltScreen::start()` still has a readerless companion, so this module
+//!   owns a `spawn_blocking` crossterm `read()` loop for key dispatch and a
 //!   `tokio::spawn` task that drains `broadcast::Receiver<AgentEvent>` into UI
 //!   mutations.
 //! - The layout root is built ONCE at startup (mirrors the TS
@@ -27,13 +27,14 @@ use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::sync::Arc;
 
+use base64::Engine;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use tokio::sync::{broadcast, mpsc};
 
 use rpi_agent::{AgentEvent, AgentMessage};
-use rpi_ai::types::{AssistantMessage, Content};
+use rpi_ai::types::{AssistantMessage, Content, UserMessage};
 use rpi_harness::agent_harness::{AgentHarness, AgentLane, HarnessRunOutcome};
-use rpi_harness::session::types::{Entry, EntryQuery};
+use rpi_harness::session::types::{Entry, EntryOrder, EntryQuery};
 use rpi_tui::scroll_view::{OverscrollMode, ScrollbarMode};
 #[cfg(test)]
 use rpi_tui::strip_ansi;
@@ -230,7 +231,7 @@ struct CommandContext {
 /// One slash command.
 trait SlashCommand: Send + Sync {
     /// Canonical name, with the leading `/` (e.g. "/model").
-    fn name(&self) -> &'static str;
+    fn name(&self) -> &str;
     /// Aliases, also `/`-prefixed. Matched alongside `name()` during dispatch.
     /// Use [`SlashCommand::alias_visible`] to also surface an alias in the
     /// `/`-autocomplete list (most aliases stay hidden).
@@ -252,6 +253,9 @@ trait SlashCommand: Send + Sync {
     /// required to surface in autocomplete even when `visible()` is true.
     fn description(&self) -> &'static str {
         ""
+    }
+    fn description_owned(&self) -> String {
+        self.description().to_string()
     }
     /// Execute the command. Only invoked for inputs starting with `/` whose
     /// first token matches `name()` or an alias. `args` is the whitespace-
@@ -294,17 +298,18 @@ impl CommandRegistry {
     fn visible_entries(&self) -> Vec<SlashCommandEntry> {
         let mut out: Vec<SlashCommandEntry> = Vec::new();
         for c in &self.commands {
-            if c.visible() && !c.description().is_empty() {
+            let description = c.description_owned();
+            if c.visible() && !description.is_empty() {
                 out.push(SlashCommandEntry {
                     name: c.name().into(),
-                    description: c.description().into(),
+                    description: description.clone(),
                 });
             }
             // Surfaced aliases share the command's description.
             for alias in c.alias_visible() {
                 out.push(SlashCommandEntry {
                     name: (*alias).into(),
-                    description: c.description().into(),
+                    description: description.clone(),
                 });
             }
         }
@@ -331,33 +336,241 @@ fn dispatch_slash(text: &str, ctx: &CommandContext, registry: &CommandRegistry) 
     }
 }
 
-/// A slash command that is recognized but not implemented in this v1 build.
-/// One struct feeds every `/settings`/`/export`/… entry — no per-command
-/// boilerplate.
-struct UnsupportedCommand {
-    name: &'static str,
-    desc: &'static str,
+/// A slash command registered by a native extension. The command metadata is
+/// captured for autocomplete, while the handler is looked up from the live
+/// session on every invocation so `/reload` takes effect without rebuilding
+/// the editor callback.
+struct ExtensionCommand {
+    name: String,
+    description: String,
+    session: crate::session::ExtensionSessionCell,
 }
 
-impl UnsupportedCommand {
-    fn new(name: &'static str, desc: &'static str) -> Self {
-        Self { name, desc }
+impl SlashCommand for ExtensionCommand {
+    fn name(&self) -> &str {
+        &self.name
     }
-}
 
-impl SlashCommand for UnsupportedCommand {
-    fn name(&self) -> &'static str {
-        self.name
-    }
-    /// Visible with a description so autocomplete lists it (the user discovers
-    /// the command exists) even though running it reports "not supported".
     fn description(&self) -> &'static str {
-        self.desc
+        "extension command"
     }
-    fn execute(&self, ctx: &CommandContext, _args: &str) {
-        add_note_message(&ctx.chat, &format!("{} is not supported in v1.", self.name));
+
+    fn description_owned(&self) -> String {
+        self.description.clone()
+    }
+
+    fn execute(&self, ctx: &CommandContext, args: &str) {
+        let result = invoke_extension_command(&self.session, &self.name, args);
+        handle_extension_ui_result(result, ctx, self.session.clone(), self.name.clone());
+    }
+}
+
+fn invoke_extension_command(
+    session: &crate::session::ExtensionSessionCell,
+    name: &str,
+    args: &str,
+) -> Option<serde_json::Value> {
+    let command = session
+        .lock()
+        .ok()
+        .and_then(|s| s.snapshot_arc())
+        .and_then(|snap| {
+            snap.commands()
+                .iter()
+                .find(|c| c.name.trim_start_matches('/') == name.trim_start_matches('/'))
+                .cloned()
+        })?;
+    let input = serde_json::json!({ "args": args, "command": name });
+    let input = serde_json::to_string(&input).ok()?;
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut out = rpi_plugin_sdk::StbString::empty();
+        let rc = (command.handler)(
+            rpi_plugin_sdk::StbStringRef::from_str(&input),
+            &mut out as *mut rpi_plugin_sdk::StbString,
+            command.user_data,
+        );
+        let text = if rc == 0 {
+            Some(out.to_string_lossy())
+        } else {
+            None
+        };
+        rpi_extensions::host_free_string(out);
+        text
+    }))
+    .ok()
+    .flatten()?;
+    serde_json::from_str(&outcome).ok()
+}
+
+fn handle_extension_ui_result(
+    result: Option<serde_json::Value>,
+    ctx: &CommandContext,
+    session: crate::session::ExtensionSessionCell,
+    command_name: String,
+) {
+    let Some(value) = result else {
+        add_error_message(&ctx.chat, "Extension command failed.");
         ctx.tui.request_render(false);
+        return;
+    };
+    match value.get("kind").and_then(|v| v.as_str()) {
+        Some("message") | None => {
+            let fallback = value.to_string();
+            let text = value
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&fallback)
+                .to_string();
+            if !text.is_empty() {
+                add_note_message(&ctx.chat, &text);
+            }
+            ctx.tui.request_render(false);
+        }
+        Some("selector") => open_extension_selector(ctx, session, command_name, value),
+        Some("editor") => open_extension_editor(ctx, session, command_name, value),
+        Some(other) => {
+            add_error_message(&ctx.chat, &format!("Unsupported extension UI: {other}"));
+            ctx.tui.request_render(false);
+        }
     }
+}
+
+fn open_extension_selector(
+    ctx: &CommandContext,
+    session: crate::session::ExtensionSessionCell,
+    command_name: String,
+    value: serde_json::Value,
+) {
+    let items = value
+        .get("items")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let value = item.get("value")?.as_str()?;
+                    let label = item.get("label").and_then(|v| v.as_str()).unwrap_or(value);
+                    let mut out = SelectItem::new(value, label);
+                    if let Some(desc) = item.get("description").and_then(|v| v.as_str()) {
+                        out = out.with_description(desc);
+                    }
+                    Some(out)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if items.is_empty() {
+        add_error_message(&ctx.chat, "Extension selector has no items.");
+        ctx.tui.request_render(false);
+        return;
+    }
+    let list = Arc::new(SelectList::new(items, 10));
+    let state = ctx.state.clone();
+    let ec = ctx.editor_container.clone();
+    let editor = ctx.editor.clone();
+    let tui = ctx.tui.clone();
+    let session_select = session.clone();
+    let command_select = command_name.clone();
+    let ctx_select = ctx.clone();
+    list.on_select(Arc::new(move |item| {
+        let args = serde_json::json!({ "action": "select", "value": item.value });
+        let result = invoke_extension_command(
+            &session_select,
+            &command_select,
+            &serde_json::to_string(&args).unwrap_or_default(),
+        );
+        close_selector(&state, &ec, &editor, &tui);
+        handle_extension_ui_result(
+            result,
+            &ctx_select,
+            session_select.clone(),
+            command_select.clone(),
+        );
+    }));
+    let state_cancel = ctx.state.clone();
+    let ec_cancel = ctx.editor_container.clone();
+    let editor_cancel = ctx.editor.clone();
+    let tui_cancel = ctx.tui.clone();
+    list.on_cancel(Arc::new(move || {
+        close_selector(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
+    }));
+    open_selector(
+        &ctx.state,
+        &ctx.editor_container,
+        &ctx.editor,
+        &ctx.tui,
+        list,
+        SelectorKind::Extension,
+    );
+}
+
+fn open_extension_editor(
+    ctx: &CommandContext,
+    session: crate::session::ExtensionSessionCell,
+    command_name: String,
+    value: serde_json::Value,
+) {
+    let initial = value
+        .get("initialText")
+        .or_else(|| value.get("text"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let editor = Arc::new(Editor::new(
+        EditorOptions {
+            padding_x: 1,
+            autocomplete_max_visible: 0,
+            placeholder: value
+                .get("placeholder")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            initial_text: Some(initial),
+        },
+        EditorStyle {
+            prompt: "> ".to_string(),
+            placeholder: String::new(),
+        },
+        Arc::new(rpi_tui::Keybindings::new()),
+    ));
+    editor.set_focused(true);
+    *ctx.state.active_extension_editor.lock().unwrap() = Some(editor.clone());
+    ctx.editor_container.clear();
+    ctx.editor_container.add_child(editor.clone());
+
+    let state = ctx.state.clone();
+    let ec = ctx.editor_container.clone();
+    let original = ctx.editor.clone();
+    let session_submit = session.clone();
+    let command_submit = command_name.clone();
+    let ctx_submit = ctx.clone();
+    editor.on_submit(Arc::new(move |text| {
+        let args = serde_json::json!({ "action": "edit", "text": text });
+        let result = invoke_extension_command(
+            &session_submit,
+            &command_submit,
+            &serde_json::to_string(&args).unwrap_or_default(),
+        );
+        close_extension_editor(&state, &ec, &original);
+        handle_extension_ui_result(
+            result,
+            &ctx_submit,
+            session_submit.clone(),
+            command_submit.clone(),
+        );
+    }));
+    ctx.tui.set_focus(Some(editor));
+    ctx.tui.request_render(false);
+}
+
+fn close_extension_editor(
+    state: &Arc<TuiState>,
+    editor_container: &Arc<Container>,
+    editor: &Arc<Editor>,
+) {
+    editor_container.clear();
+    editor_container.add_child(editor.clone());
+    *state.active_extension_editor.lock().unwrap() = None;
+    editor.set_focused(true);
 }
 
 // ---- Built-in command implementations ----
@@ -708,6 +921,124 @@ impl SlashCommand for ForkCommand {
     }
 }
 
+/// `/clone` is the native Pi spelling for duplicating the current session.
+/// Reuse the same durable fork path as `/fork`; both create a child session
+/// and rebind the live harness to it.
+struct CloneCommand;
+impl SlashCommand for CloneCommand {
+    fn name(&self) -> &'static str {
+        "/clone"
+    }
+    fn description(&self) -> &'static str {
+        "Duplicate the current session"
+    }
+    fn execute(&self, ctx: &CommandContext, _args: &str) {
+        let _ = ctx.tx.send(TuiMessage::ForkSession);
+    }
+}
+
+struct TreeCommand;
+impl SlashCommand for TreeCommand {
+    fn name(&self) -> &'static str {
+        "/tree"
+    }
+    fn description(&self) -> &'static str {
+        "Navigate the current session tree"
+    }
+    fn execute(&self, ctx: &CommandContext, _args: &str) {
+        let _ = ctx.tx.send(TuiMessage::OpenTree);
+    }
+}
+
+struct LoginCommand;
+impl SlashCommand for LoginCommand {
+    fn name(&self) -> &'static str {
+        "/login"
+    }
+    fn description(&self) -> &'static str {
+        "Save an Anthropic API key"
+    }
+    fn execute(&self, ctx: &CommandContext, args: &str) {
+        let key = args.trim();
+        if key.is_empty() {
+            add_note_message(&ctx.chat, "Usage: /login <api-key>");
+        } else {
+            let result = crate::config::upsert_credential(
+                "anthropic",
+                crate::config::Credential::ApiKey {
+                    key: Some(key.to_string()),
+                    env: None,
+                },
+            );
+            match result {
+                Ok(()) => add_note_message(&ctx.chat, "Saved Anthropic credentials."),
+                Err(error) => {
+                    add_error_message(&ctx.chat, &format!("Could not save credentials: {error}"))
+                }
+            }
+        }
+        ctx.tui.request_render(false);
+    }
+}
+
+struct LogoutCommand;
+impl SlashCommand for LogoutCommand {
+    fn name(&self) -> &'static str {
+        "/logout"
+    }
+    fn description(&self) -> &'static str {
+        "Remove saved Anthropic credentials"
+    }
+    fn execute(&self, ctx: &CommandContext, _args: &str) {
+        match crate::config::delete_credential("anthropic") {
+            Ok(true) => add_note_message(&ctx.chat, "Removed saved Anthropic credentials."),
+            Ok(false) => add_note_message(&ctx.chat, "No saved Anthropic credentials found."),
+            Err(error) => {
+                add_error_message(&ctx.chat, &format!("Could not remove credentials: {error}"))
+            }
+        }
+        ctx.tui.request_render(false);
+    }
+}
+
+struct TrustCommand;
+impl SlashCommand for TrustCommand {
+    fn name(&self) -> &'static str {
+        "/trust"
+    }
+    fn description(&self) -> &'static str {
+        "Trust the current project"
+    }
+    fn execute(&self, ctx: &CommandContext, args: &str) {
+        let value = match args.trim().to_ascii_lowercase().as_str() {
+            "" | "yes" | "y" | "true" => Some(true),
+            "no" | "n" | "false" => Some(false),
+            "clear" | "reset" | "none" => None,
+            _ => {
+                add_note_message(&ctx.chat, "Usage: /trust [yes|no|clear]");
+                ctx.tui.request_render(false);
+                return;
+            }
+        };
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        match crate::config::set_project_trust(&cwd, value) {
+            Ok(()) => {
+                let label = match value {
+                    Some(true) => "trusted",
+                    Some(false) => "untrusted",
+                    None => "trust decision cleared",
+                };
+                add_note_message(&ctx.chat, &format!("Current project marked {label}."));
+            }
+            Err(error) => add_error_message(
+                &ctx.chat,
+                &format!("Could not save trust decision: {error}"),
+            ),
+        }
+        ctx.tui.request_render(false);
+    }
+}
+
 struct NameCommand;
 impl SlashCommand for NameCommand {
     fn name(&self) -> &'static str {
@@ -912,28 +1243,40 @@ fn build_builtin_registry() -> CommandRegistry {
     r.register(Arc::new(ImportCommand));
     r.register(Arc::new(ShareCommand));
     r.register(Arc::new(ForkCommand));
-    r.register(Arc::new(UnsupportedCommand::new(
-        "/clone",
-        "Duplicate the current session",
-    )));
-    r.register(Arc::new(UnsupportedCommand::new(
-        "/tree",
-        "Navigate session tree",
-    )));
-    r.register(Arc::new(UnsupportedCommand::new(
-        "/trust",
-        "Save project trust decision",
-    )));
-    r.register(Arc::new(UnsupportedCommand::new(
-        "/login",
-        "Configure provider authentication",
-    )));
-    r.register(Arc::new(UnsupportedCommand::new(
-        "/logout",
-        "Remove provider authentication",
-    )));
+    r.register(Arc::new(CloneCommand));
+    r.register(Arc::new(TreeCommand));
+    r.register(Arc::new(TrustCommand));
+    r.register(Arc::new(LoginCommand));
+    r.register(Arc::new(LogoutCommand));
     r.register(Arc::new(ReloadCommand));
     r
+}
+
+fn register_extension_commands(
+    registry: &mut CommandRegistry,
+    session: crate::session::ExtensionSessionCell,
+) {
+    let commands = session
+        .lock()
+        .ok()
+        .and_then(|s| s.snapshot_arc())
+        .map(|snap| snap.commands().to_vec())
+        .unwrap_or_default();
+    for command in commands {
+        let name = if command.name.starts_with('/') {
+            command.name.clone()
+        } else {
+            format!("/{}", command.name)
+        };
+        if registry.find(&name).is_some() {
+            continue;
+        }
+        registry.register(Arc::new(ExtensionCommand {
+            name,
+            description: command.description,
+            session: session.clone(),
+        }));
+    }
 }
 
 // ===========================================================================
@@ -944,6 +1287,12 @@ fn build_builtin_registry() -> CommandRegistry {
 /// main async loop.
 enum TuiMessage {
     UserInput(String),
+    QueueInput {
+        prompt: String,
+        follow_up: bool,
+    },
+    OpenTree,
+    NavigateTree(String),
     Exit,
     /// Clear the transcript (from `/clear`).
     ClearChat,
@@ -1661,7 +2010,13 @@ async fn switch_to_session(
             let _ = harness.set_session(new_session).await;
             chat.clear();
             add_welcome_message(chat);
-            render_session_history(harness, chat, state.markdown_transformer()).await;
+            render_session_history(
+                harness,
+                chat,
+                state.markdown_transformer(),
+                Some(state.extension_session.clone()),
+            )
+            .await;
             state.set_status(RunStatus::Idle);
             add_note_message(chat, &format!("Switched to session {id}."));
             true
@@ -1773,7 +2128,13 @@ async fn fork_session(
     let _ = harness.set_session(new_session).await;
     chat.clear();
     add_welcome_message(chat);
-    render_session_history(harness, chat, state.markdown_transformer()).await;
+    render_session_history(
+        harness,
+        chat,
+        state.markdown_transformer(),
+        Some(state.extension_session.clone()),
+    )
+    .await;
     state.set_status(RunStatus::Idle);
     add_note_message(chat, "Forked into a new session.");
 }
@@ -1791,6 +2152,7 @@ async fn render_session_history(
     harness: &AgentHarness,
     chat: &Arc<Container>,
     transformer: Option<MarkdownTransformer>,
+    extension_session: Option<crate::session::ExtensionSessionCell>,
 ) {
     let tree = harness.session().view("main");
     let entries = match tree
@@ -1808,28 +2170,99 @@ async fn render_session_history(
     };
     let mut rendered_any = false;
     for e in entries {
-        let Entry::Message(me) = e else { continue };
-        match &me.message {
-            AgentMessage::User(u) => {
-                add_user_message(chat, &user_message_text(u));
-                rendered_any = true;
-            }
-            AgentMessage::Assistant(a) => {
-                let comp = Arc::new(AssistantMessageComponent::new(
-                    AssistantMessageOptions::default(),
-                ));
-                if let Some(t) = &transformer {
-                    comp.set_markdown_transformer(Some(t.clone()));
+        match e {
+            Entry::Message(me) => match &me.message {
+                AgentMessage::User(u) => {
+                    add_user_message(chat, &user_message_text(u));
+                    rendered_any = true;
                 }
-                comp.update_blocks(&assistant_blocks(a));
-                chat.add_child(comp);
-                // Single trailing spacer: the next transcript entry (user or
-                // assistant) follows one blank line below. No leading spacer
-                // — see AssistantMessageComponent::rebuild_content.
-                chat.add_child(Arc::new(Spacer::new(1)));
+                AgentMessage::Assistant(a) => {
+                    let comp = Arc::new(AssistantMessageComponent::new(
+                        AssistantMessageOptions::default(),
+                    ));
+                    if let Some(t) = &transformer {
+                        comp.set_markdown_transformer(Some(t.clone()));
+                    }
+                    comp.update_blocks(&assistant_blocks(a));
+                    chat.add_child(comp);
+                    // Single trailing spacer: the next transcript entry (user or
+                    // assistant) follows one blank line below.
+                    chat.add_child(Arc::new(Spacer::new(1)));
+                    rendered_any = true;
+                }
+                AgentMessage::Custom(custom) => {
+                    if let Some(session) = &extension_session {
+                        if let Some(component) = extension_message_component(
+                            session,
+                            &custom.role,
+                            &serde_json::json!({
+                                "customType": custom.role,
+                                "content": custom.content,
+                                "details": custom.data,
+                            }),
+                            transformer.clone(),
+                        ) {
+                            chat.add_child(component);
+                            chat.add_child(Arc::new(Spacer::new(1)));
+                            rendered_any = true;
+                            continue;
+                        }
+                    }
+                    add_note_message(chat, &custom_message_fallback(&custom));
+                    rendered_any = true;
+                }
+                _ => {}
+            },
+            Entry::Compaction(compaction) => {
+                add_note_message(
+                    chat,
+                    &format!(
+                        "Compacted {} tokens: {}",
+                        compaction.tokens_before, compaction.summary
+                    ),
+                );
                 rendered_any = true;
             }
-            _ => {}
+            Entry::BranchSummary(summary) => {
+                add_note_message(chat, &format!("Branch summary: {}", summary.summary));
+                rendered_any = true;
+            }
+            Entry::Custom(custom) => {
+                let rendered = extension_session.as_ref().and_then(|session| {
+                    extension_entry_component(session, &custom.custom_type, custom.data.clone())
+                });
+                if let Some(component) = rendered {
+                    chat.add_child(component);
+                    chat.add_child(Arc::new(Spacer::new(1)));
+                    rendered_any = true;
+                } else if let Some(text) =
+                    custom_entry_display_text(&custom.custom_type, custom.data.as_ref())
+                {
+                    add_note_message(chat, &text);
+                    rendered_any = true;
+                }
+            }
+            Entry::ModelChange(change) => {
+                add_note_message(
+                    chat,
+                    &format!("Model changed to {}:{}", change.provider, change.model_id),
+                );
+                rendered_any = true;
+            }
+            Entry::ThinkingLevel(change) => {
+                add_note_message(
+                    chat,
+                    &format!("Thinking level: {:?}", change.thinking_level),
+                );
+                rendered_any = true;
+            }
+            Entry::ActiveTools(change) => {
+                add_note_message(
+                    chat,
+                    &format!("Active tools: {}", change.active_tool_names.join(", ")),
+                );
+                rendered_any = true;
+            }
         }
     }
     if rendered_any {
@@ -1838,12 +2271,107 @@ async fn render_session_history(
     }
 }
 
+fn invoke_extension_renderer(
+    session: &crate::session::ExtensionSessionCell,
+    kind: rpi_extensions::RegisteredRendererKind,
+    payload: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let snapshot = session.lock().ok()?.snapshot_arc()?;
+    let input = serde_json::to_string(payload).ok()?;
+    for renderer in snapshot.renderers_of(kind) {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut out = rpi_plugin_sdk::StbString::empty();
+            let rc = (renderer.render_fn)(
+                rpi_plugin_sdk::StbStringRef::from_str(&input),
+                &mut out as *mut rpi_plugin_sdk::StbString,
+                renderer.user_data,
+            );
+            let text = if rc == 0 {
+                Some(out.to_string_lossy())
+            } else {
+                None
+            };
+            out.free_with(Some(renderer.plugin_free_string));
+            text
+        }))
+        .ok()
+        .flatten();
+        let Some(text) = outcome else { continue };
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn extension_text_component(value: &serde_json::Value) -> Option<Arc<dyn rpi_tui::Component>> {
+    if let Some(lines) = value.get("lines").and_then(|v| v.as_array()) {
+        let text = lines
+            .iter()
+            .filter_map(|line| line.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Some(Arc::new(Text::new(text, 0, 0)));
+    }
+    let text = value.get("text").and_then(|v| v.as_str())?;
+    if value.get("markdown").and_then(|v| v.as_bool()) == Some(true) {
+        let component = Arc::new(AssistantMessageComponent::new(
+            AssistantMessageOptions::default(),
+        ));
+        component.update_blocks(&[AssistantBlock::Text(text.to_string())]);
+        Some(component)
+    } else {
+        Some(Arc::new(Text::new(text, 0, 0)))
+    }
+}
+
+fn extension_message_component(
+    session: &crate::session::ExtensionSessionCell,
+    custom_type: &str,
+    payload: &serde_json::Value,
+    transformer: Option<MarkdownTransformer>,
+) -> Option<Arc<dyn rpi_tui::Component>> {
+    let value = invoke_extension_renderer(
+        session,
+        rpi_extensions::RegisteredRendererKind::Message,
+        payload,
+    )?;
+    if value.get("markdown").and_then(|v| v.as_bool()) == Some(true) {
+        let text = value.get("text").and_then(|v| v.as_str())?;
+        let component = Arc::new(AssistantMessageComponent::new(
+            AssistantMessageOptions::default(),
+        ));
+        if let Some(transformer) = transformer {
+            component.set_markdown_transformer(Some(transformer));
+        }
+        component.update_blocks(&[AssistantBlock::Text(text.to_string())]);
+        return Some(component);
+    }
+    extension_text_component(&value)
+        .or_else(|| Some(Arc::new(Text::new(format!("[{custom_type}]"), 0, 0))))
+}
+
+fn extension_entry_component(
+    session: &crate::session::ExtensionSessionCell,
+    custom_type: &str,
+    data: Option<serde_json::Value>,
+) -> Option<Arc<dyn rpi_tui::Component>> {
+    let payload = serde_json::json!({
+        "customType": custom_type,
+        "data": data,
+    });
+    let value = invoke_extension_renderer(
+        session,
+        rpi_extensions::RegisteredRendererKind::Entry,
+        &payload,
+    )?;
+    extension_text_component(&value)
+}
+
 /// Project an assistant message's content into the provider-free
-/// [`AssistantBlock`] list (text + thinking blocks, in document order) the
-/// `AssistantMessageComponent` renders. Tool-call/image blocks are dropped —
-/// they're rendered by their own components in the transcript. This keeps the
-/// thinking blocks visible in the TUI (they previously vanished because the
-/// stream path only fed the concatenated *text* into the component).
+/// [`AssistantBlock`] list (text, thinking, and decoded image blocks, in
+/// document order) the `AssistantMessageComponent` renders. Tool-call blocks
+/// are rendered by their own components in the transcript.
 /// Whether startup intentionally opened a session that already has history.
 fn launch_restores_history(args: &Args) -> bool {
     args.continue_session
@@ -1859,9 +2387,31 @@ fn assistant_blocks(msg: &AssistantMessage) -> Vec<AssistantBlock> {
         .filter_map(|c| match c {
             Content::Text(t) => Some(AssistantBlock::Text(t.text.clone())),
             Content::Thinking(t) => Some(AssistantBlock::Thinking(t.thinking.clone())),
+            Content::Image(image) => base64::engine::general_purpose::STANDARD
+                .decode(&image.data)
+                .ok()
+                .filter(|data| !data.is_empty())
+                .map(AssistantBlock::Image),
             _ => None,
         })
         .collect()
+}
+
+fn custom_message_fallback(custom: &rpi_agent::CustomMessage) -> String {
+    let content = custom
+        .content
+        .iter()
+        .filter_map(|item| match item {
+            Content::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if content.is_empty() {
+        format!("{}: {}", custom.role, custom.data)
+    } else {
+        format!("{}: {}", custom.role, content)
+    }
 }
 
 /// The name displayed for a model id (last path segment / after the final
@@ -1897,7 +2447,7 @@ enum SelectorKind {
     Tools,
     /// `/images` — toggle inline image rendering.
     Images,
-    /// `/session` — saved JSONL sessions (restore not implemented in v1).
+    /// `/session` — browse and switch saved JSONL sessions.
     Session,
     /// `/theme` — dark / light / monochrome presets applied live.
     Theme,
@@ -1905,6 +2455,10 @@ enum SelectorKind {
     ScopedModels,
     /// `/settings` — interactive settings menu (and its sub-selectors).
     Settings,
+    /// `/tree` — navigate to an existing entry in the current session.
+    Tree,
+    /// Extension-provided selector; uses the same keyboard contract.
+    Extension,
 }
 
 /// Shared mutable TUI state, `Arc`-cloned into the drain task, the key loop,
@@ -1940,6 +2494,8 @@ struct TuiState {
     /// a selector is open; the key loop routes to it first and restores the
     /// editor on done/cancel.
     active_selector: std::sync::Mutex<Option<(Arc<SelectList>, SelectorKind)>>,
+    /// Extension-provided editor currently occupying the input slot.
+    active_extension_editor: std::sync::Mutex<Option<Arc<Editor>>>,
     /// The autocomplete manager (slash + @file providers) consulted on every
     /// editor keystroke.
     autocomplete: AutocompleteManager,
@@ -1988,6 +2544,8 @@ struct TuiState {
     /// New assistant components pick up whatever closure is current at
     /// construction time via [`install_markdown_transformer`].
     markdown_transformer: std::sync::Mutex<Option<MarkdownTransformer>>,
+    /// Live extension registry used by message/entry renderer dispatch.
+    extension_session: crate::session::ExtensionSessionCell,
 }
 
 /// How many submitted messages are kept for ↑ recall (mirrors the TS
@@ -2156,6 +2714,10 @@ impl TuiState {
         self.active_selector.lock().unwrap().is_some()
     }
 
+    fn extension_editor_open(&self) -> bool {
+        self.active_extension_editor.lock().unwrap().is_some()
+    }
+
     /// Record a freshly created tool component as the "most recent" so Ctrl+T
     /// can toggle its expansion. Idempotent overwrites — only the latest lives.
     fn remember_tool(&self, comp: Arc<ToolExecutionComponent>) {
@@ -2296,7 +2858,13 @@ pub async fn interactive_tui(
     // another/project harness. Only explicit restore/fork modes render prior
     // conversation history. This fixes stale prompts appearing every startup.
     if launch_restores_history(args) {
-        render_session_history(&harness, &chat_container, initial_transformer.clone()).await;
+        render_session_history(
+            &harness,
+            &chat_container,
+            initial_transformer.clone(),
+            Some(reload_context.extension_session.clone()),
+        )
+        .await;
     }
 
     // `document_container` wraps the welcome header + chat so the scrollview
@@ -2373,7 +2941,12 @@ pub async fn interactive_tui(
     // prompt-template commands are merged into the autocomplete list separately
     // (they dispatch via template expansion, not the registry); built-ins come
     // first so they win on a fuzzy tie.
-    let registry = Arc::new(build_builtin_registry());
+    let mut command_registry = build_builtin_registry();
+    register_extension_commands(
+        &mut command_registry,
+        reload_context.extension_session.clone(),
+    );
+    let registry = Arc::new(command_registry);
     let mut all_slash_commands = registry.visible_entries();
     all_slash_commands.extend(template_slash_commands);
     let autocomplete = AutocompleteManager::new();
@@ -2401,6 +2974,7 @@ pub async fn interactive_tui(
         loader: loader.clone(),
         last_assistant_text: std::sync::Mutex::new(String::new()),
         active_selector: std::sync::Mutex::new(None),
+        active_extension_editor: std::sync::Mutex::new(None),
         autocomplete,
         autocomplete_container: autocomplete_container.clone(),
         theme_manager: Arc::new(ThemeManager::new()),
@@ -2413,6 +2987,7 @@ pub async fn interactive_tui(
         last_input_tokens: std::sync::Mutex::new(0),
         scoped_edit: std::sync::Mutex::new(None),
         markdown_transformer: std::sync::Mutex::new(initial_transformer),
+        extension_session: reload_context.extension_session.clone(),
     });
 
     // Capture the model catalog + cwd for the selector builders + the key loop
@@ -2494,6 +3069,19 @@ pub async fn interactive_tui(
 
         if text.starts_with('/') {
             dispatch_slash(text, &ctx_for_cb, &registry_for_cb);
+            return;
+        }
+
+        if *ctx_for_cb.state.status.lock().unwrap() != RunStatus::Idle {
+            let _ = ctx_for_cb.tx.send(TuiMessage::QueueInput {
+                prompt: text.to_string(),
+                follow_up: false,
+            });
+            add_note_message(
+                &ctx_for_cb.chat,
+                &format!("Queued steering message: {text}"),
+            );
+            ctx_for_cb.tui.request_render(false);
             return;
         }
 
@@ -2657,6 +3245,19 @@ pub async fn interactive_tui(
                 continue;
             }
 
+            if state_for_key.extension_editor_open()
+                && key.modifiers == KeyModifiers::CONTROL
+                && key.code == KeyCode::Char('c')
+            {
+                close_extension_editor(
+                    &state_for_key,
+                    &ctx_for_key.editor_container,
+                    &editor_for_key,
+                );
+                tui_for_key.request_render_reusing_scroll_content();
+                continue;
+            }
+
             // 0. Ctrl+C: copy the selection when the editor has one (pi
             //    `tui.input.copy`); otherwise it's the escape hatch — even
             //    with a selector open (a stuck run or a mis-open selector must
@@ -2713,6 +3314,29 @@ pub async fn interactive_tui(
                     .clone()
                     .expect("selector_open guaranteed Some");
                 selector.handle_key(key);
+                tui_for_key.request_render_reusing_scroll_content();
+                continue;
+            }
+
+            // Extension editor occupies the same input slot as the native
+            // editor. Esc cancels it; every other key is delivered to the
+            // extension-owned editor instance.
+            if state_for_key.extension_editor_open() {
+                let extension_editor = state_for_key
+                    .active_extension_editor
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .expect("extension_editor_open guaranteed Some");
+                if key.code == KeyCode::Esc {
+                    close_extension_editor(
+                        &state_for_key,
+                        &ctx_for_key.editor_container,
+                        &editor_for_key,
+                    );
+                } else {
+                    extension_editor.handle_key(key);
+                }
                 tui_for_key.request_render_reusing_scroll_content();
                 continue;
             }
@@ -2864,13 +3488,33 @@ pub async fn interactive_tui(
                 }
             }
 
-            // Keep the draft intact while an operation is running. The submit
-            // callback also reserves the status atomically to cover two Enter
-            // events arriving before the async main loop receives the first.
-            if key.modifiers == KeyModifiers::NONE
-                && key.code == KeyCode::Enter
-                && *state_for_key.status.lock().unwrap() != RunStatus::Idle
-            {
+            // Alt+Enter queues a follow-up while a run is active. It is
+            // handled here because Editor treats only a bare Enter as submit;
+            // idle Alt+Enter keeps the normal prompt behavior.
+            if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Enter {
+                let prompt = editor_for_key.get_text().trim().to_string();
+                if prompt.is_empty() {
+                    continue;
+                }
+                editor_for_key.clear();
+                let status = *state_for_key.status.lock().unwrap();
+                if status == RunStatus::Idle {
+                    if state_for_key.try_start_working() {
+                        add_user_message(&state_for_key.chat_container, &prompt);
+                        push_history(&state_for_key, &prompt);
+                        let _ = tx_for_key.send(TuiMessage::UserInput(prompt));
+                    }
+                } else {
+                    add_note_message(
+                        &state_for_key.chat_container,
+                        &format!("Queued follow-up message: {prompt}"),
+                    );
+                    let _ = tx_for_key.send(TuiMessage::QueueInput {
+                        prompt,
+                        follow_up: true,
+                    });
+                }
+                tui_for_key.request_render(false);
                 continue;
             }
 
@@ -2911,6 +3555,79 @@ pub async fn interactive_tui(
                 // keeps it on one thread).
                 editor.clear();
                 run_prompt_streaming(&lane, &prompt, &tui, &state, drain_handle.is_some()).await;
+            }
+            Some(TuiMessage::QueueInput { prompt, follow_up }) => {
+                let message = AgentMessage::User(UserMessage::new(prompt.clone(), 0));
+                let aborting = *state.status.lock().unwrap() == RunStatus::Aborting;
+                let result = if aborting {
+                    // An aborting run will not reach either agent-loop drain
+                    // point, so preserve the message for the next run.
+                    lane.next_run(message).await
+                } else if follow_up {
+                    lane.follow_up(message).await
+                } else {
+                    lane.steer(message).await
+                };
+                if let Err(error) = result {
+                    add_error_message(
+                        &chat_container,
+                        &format!("Could not queue message: {error}"),
+                    );
+                    tui.request_render(false);
+                }
+            }
+            Some(TuiMessage::OpenTree) => {
+                if *state.status.lock().unwrap() != RunStatus::Idle {
+                    add_note_message(
+                        &chat_container,
+                        "Wait for the current run to finish before opening the tree.",
+                    );
+                    tui.request_render(false);
+                } else {
+                    open_tree_selector(
+                        &harness,
+                        &state,
+                        &editor_container,
+                        &editor,
+                        &tui,
+                        &chat_container,
+                        &tx,
+                    )
+                    .await;
+                }
+            }
+            Some(TuiMessage::NavigateTree(entry_id)) => {
+                match lane.navigate_tree(Some(&entry_id), false, None, None).await {
+                    Ok(result) => match result.outcome {
+                        rpi_harness::agent_harness::NavigationOutcome::Completed { .. } => {
+                            chat_container.clear();
+                            add_welcome_message(&chat_container);
+                            render_session_history(
+                                &harness,
+                                &chat_container,
+                                state.markdown_transformer(),
+                                Some(state.extension_session.clone()),
+                            )
+                            .await;
+                            add_note_message(
+                                &chat_container,
+                                "Moved to the selected session entry.",
+                            );
+                        }
+                        rpi_harness::agent_harness::NavigationOutcome::Failed { error, .. } => {
+                            add_error_message(&chat_container, &error.message);
+                        }
+                        _ => add_note_message(
+                            &chat_container,
+                            "The selected entry could not be opened.",
+                        ),
+                    },
+                    Err(error) => add_error_message(
+                        &chat_container,
+                        &format!("Could not navigate session tree: {error}"),
+                    ),
+                }
+                tui.request_render(false);
             }
             Some(TuiMessage::ClearChat) => {
                 chat_container.clear();
@@ -3307,8 +4024,30 @@ async fn handle_agent_event(
                 *state.current_assistant.lock().unwrap() = Some(comp);
                 tui.request_render(false);
             }
+            AgentMessage::Custom(custom) => {
+                let payload = serde_json::json!({
+                    "customType": custom.role,
+                    "content": custom.content,
+                    "details": custom.data,
+                    "expanded": false,
+                    "outputPad": 1,
+                });
+                if let Some(component) = extension_message_component(
+                    &state.extension_session,
+                    &custom.role,
+                    &payload,
+                    state.markdown_transformer(),
+                ) {
+                    chat.add_child(component);
+                    chat.add_child(Arc::new(Spacer::new(1)));
+                    tui.request_render(false);
+                } else {
+                    add_note_message(chat, &custom_message_fallback(&custom));
+                    tui.request_render(false);
+                }
+            }
             // User / ToolResult / Custom starts are echoed at submit time or
-            // via the tool-execution components; ignore here to avoid dupes.
+            // via the tool-execution components; ignore user/tool dupes.
             _ => {}
         },
 
@@ -3836,6 +4575,102 @@ fn open_session_selector(
         tui,
         list,
         SelectorKind::Session,
+    );
+}
+
+fn custom_entry_display_text(
+    custom_type: &str,
+    data: Option<&serde_json::Value>,
+) -> Option<String> {
+    let data = data?;
+    let text = data
+        .get("summary")
+        .or_else(|| data.get("text"))
+        .or_else(|| data.get("output"))
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())?;
+    let label = match custom_type {
+        "compactionSummary" => "Compaction summary",
+        "branchSummary" => "Branch summary",
+        "bashExecution" => "Command output",
+        other => other,
+    };
+    Some(format!("{label}: {text}"))
+}
+
+/// Open a selector for the current session's persisted entry tree. Selecting a
+/// message moves the main lane leaf to that entry, then the caller reloads the
+/// visible branch from durable storage.
+async fn open_tree_selector(
+    harness: &AgentHarness,
+    state: &Arc<TuiState>,
+    editor_container: &Arc<Container>,
+    editor: &Arc<Editor>,
+    tui: &Arc<TuiAltScreen>,
+    chat: &Arc<Container>,
+    tx: &mpsc::UnboundedSender<TuiMessage>,
+) {
+    let entries = match harness
+        .session()
+        .view("main")
+        .find_entries(&EntryQuery {
+            order: Some(EntryOrder::OldestFirst),
+            ..Default::default()
+        })
+        .await
+    {
+        Ok(entries) => entries,
+        Err(error) => {
+            add_error_message(chat, &format!("Could not read session tree: {error}"));
+            tui.request_render(false);
+            return;
+        }
+    };
+    let current = harness.session().get_leaf_id().await.ok().flatten();
+    let items: Vec<SelectItem> = entries
+        .iter()
+        .map(|entry| {
+            let marker = if current.as_deref() == Some(entry.id()) {
+                " (current)"
+            } else {
+                ""
+            };
+            SelectItem::new(
+                entry.id(),
+                &format!("{} #{}{}", entry.entry_type(), entry.seq(), marker),
+            )
+            .with_description(&entry.id()[..entry.id().len().min(12)])
+        })
+        .collect();
+    if items.is_empty() {
+        add_note_message(chat, "The current session has no entries to navigate.");
+        tui.request_render(false);
+        return;
+    }
+    let list = Arc::new(SelectList::new(items, 12));
+    let state_sel = state.clone();
+    let ec_sel = editor_container.clone();
+    let editor_sel = editor.clone();
+    let tui_sel = tui.clone();
+    let tx_sel = tx.clone();
+    list.on_select(Arc::new(move |item| {
+        let _ = tx_sel.send(TuiMessage::NavigateTree(item.value.clone()));
+        close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
+    }));
+    let state_cancel = state.clone();
+    let ec_cancel = editor_container.clone();
+    let editor_cancel = editor.clone();
+    let tui_cancel = tui.clone();
+    list.on_cancel(Arc::new(move || {
+        close_selector(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
+    }));
+    open_selector(
+        state,
+        editor_container,
+        editor,
+        tui,
+        list,
+        SelectorKind::Tree,
     );
 }
 
@@ -4836,6 +5671,7 @@ mod tests {
             loader: Arc::new(Loader::new()),
             last_assistant_text: std::sync::Mutex::new(String::new()),
             active_selector: std::sync::Mutex::new(None),
+            active_extension_editor: std::sync::Mutex::new(None),
             autocomplete: AutocompleteManager::new(),
             autocomplete_container: Arc::new(Container::new()),
             theme_manager: Arc::new(ThemeManager::new()),
@@ -4848,6 +5684,9 @@ mod tests {
             last_input_tokens: std::sync::Mutex::new(0),
             scoped_edit: std::sync::Mutex::new(None),
             markdown_transformer: std::sync::Mutex::new(None),
+            extension_session: Arc::new(std::sync::Mutex::new(
+                rpi_extensions::ExtensionSession::none(),
+            )),
         });
 
         // The drain handler takes `Arc<TuiAltScreen>`, which needs a real
@@ -5040,6 +5879,7 @@ mod tests {
             loader: Arc::new(Loader::new()),
             last_assistant_text: std::sync::Mutex::new(String::new()),
             active_selector: std::sync::Mutex::new(None),
+            active_extension_editor: std::sync::Mutex::new(None),
             autocomplete: AutocompleteManager::new(),
             autocomplete_container: Arc::new(Container::new()),
             theme_manager: Arc::new(ThemeManager::new()),
@@ -5052,6 +5892,9 @@ mod tests {
             last_input_tokens: std::sync::Mutex::new(0),
             scoped_edit: std::sync::Mutex::new(None),
             markdown_transformer: std::sync::Mutex::new(None),
+            extension_session: Arc::new(std::sync::Mutex::new(
+                rpi_extensions::ExtensionSession::none(),
+            )),
         });
         {
             let mut combined = CombinedAutocompleteProvider::new();
@@ -5096,6 +5939,7 @@ mod tests {
             loader: Arc::new(Loader::new()),
             last_assistant_text: std::sync::Mutex::new(String::new()),
             active_selector: std::sync::Mutex::new(None),
+            active_extension_editor: std::sync::Mutex::new(None),
             autocomplete: AutocompleteManager::new(),
             autocomplete_container: Arc::new(Container::new()),
             theme_manager: Arc::new(ThemeManager::new()),
@@ -5108,6 +5952,9 @@ mod tests {
             last_input_tokens: std::sync::Mutex::new(0),
             scoped_edit: std::sync::Mutex::new(None),
             markdown_transformer: std::sync::Mutex::new(None),
+            extension_session: Arc::new(std::sync::Mutex::new(
+                rpi_extensions::ExtensionSession::none(),
+            )),
         });
         let editor_container = Arc::new(Container::new());
         let editor = Arc::new(Editor::simple());
@@ -5155,6 +6002,7 @@ mod tests {
             loader: Arc::new(Loader::new()),
             last_assistant_text: std::sync::Mutex::new(String::new()),
             active_selector: std::sync::Mutex::new(None),
+            active_extension_editor: std::sync::Mutex::new(None),
             autocomplete: AutocompleteManager::new(),
             autocomplete_container: Arc::new(Container::new()),
             theme_manager: Arc::new(ThemeManager::new()),
@@ -5167,6 +6015,9 @@ mod tests {
             last_input_tokens: std::sync::Mutex::new(0),
             scoped_edit: std::sync::Mutex::new(None),
             markdown_transformer: std::sync::Mutex::new(None),
+            extension_session: Arc::new(std::sync::Mutex::new(
+                rpi_extensions::ExtensionSession::none(),
+            )),
         });
         let editor = Arc::new(Editor::simple());
 
@@ -5217,6 +6068,7 @@ mod tests {
             loader: Arc::new(Loader::new()),
             last_assistant_text: std::sync::Mutex::new(String::new()),
             active_selector: std::sync::Mutex::new(None),
+            active_extension_editor: std::sync::Mutex::new(None),
             autocomplete: AutocompleteManager::new(),
             autocomplete_container: Arc::new(Container::new()),
             theme_manager: Arc::new(ThemeManager::new()),
@@ -5229,6 +6081,9 @@ mod tests {
             last_input_tokens: std::sync::Mutex::new(0),
             scoped_edit: std::sync::Mutex::new(None),
             markdown_transformer: std::sync::Mutex::new(None),
+            extension_session: Arc::new(std::sync::Mutex::new(
+                rpi_extensions::ExtensionSession::none(),
+            )),
         });
         {
             let mut combined = CombinedAutocompleteProvider::new();

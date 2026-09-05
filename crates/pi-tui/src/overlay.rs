@@ -11,7 +11,8 @@ use crate::ansi::{bold, dim, visible_width};
 
 /// Overlay manager for managing multiple overlays.
 pub struct OverlayManager {
-    overlays: Mutex<Vec<OverlayEntry>>,
+    overlays: Arc<Mutex<Vec<OverlayEntry>>>,
+    next_id: Arc<Mutex<usize>>,
 }
 
 struct OverlayEntry {
@@ -37,17 +38,27 @@ impl OverlayManager {
     /// Create a new overlay manager.
     pub fn new() -> Self {
         Self {
-            overlays: Mutex::new(Vec::new()),
+            overlays: Arc::new(Mutex::new(Vec::new())),
+            next_id: Arc::new(Mutex::new(0)),
         }
     }
 
     /// Add an overlay.
     pub fn add(&self, component: Arc<dyn Component>, options: OverlayOptions) -> OverlayHandle {
+        let id = self
+            .next_id
+            .lock()
+            .map(|mut next| {
+                let id = *next;
+                *next += 1;
+                id
+            })
+            .unwrap_or(0);
         let entry = OverlayEntry {
             component,
             options,
             visible: true,
-            z_index: self.overlays.lock().map(|o| o.len()).unwrap_or(0),
+            z_index: id,
         };
 
         let handle = OverlayHandle {
@@ -92,10 +103,29 @@ impl OverlayManager {
             .unwrap_or_default()
     }
 
+    /// Remove the highest z-index overlay and return whether one existed.
+    pub fn remove_topmost(&self) -> bool {
+        let Ok(mut overlays) = self.overlays.lock() else {
+            return false;
+        };
+        let Some(id) = overlays.iter().map(|entry| entry.z_index).max() else {
+            return false;
+        };
+        overlays.retain(|entry| entry.z_index != id);
+        true
+    }
+
     fn clone_manager(&self) -> Self {
         Self {
-            overlays: Mutex::new(self.overlays.lock().map(|o| o.clone()).unwrap_or_default()),
+            overlays: Arc::clone(&self.overlays),
+            next_id: Arc::clone(&self.next_id),
         }
+    }
+}
+
+impl Clone for OverlayManager {
+    fn clone(&self) -> Self {
+        self.clone_manager()
     }
 }
 

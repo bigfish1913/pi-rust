@@ -1,5 +1,5 @@
 //! Mirrors `packages/agent/src/harness/agent-harness.ts` — the `AgentHarness`
-//! run loop, `AgentLane` trait, and `LaneHandle`.
+//! run loop and `AgentLane` trait.
 //!
 //! **Plan §2.3 refinement #2:** the TS `AgentHarness` is a stub shell (every
 //! operation rejects with `HarnessNotImplemented`). The Rust port implements
@@ -22,8 +22,8 @@
 //!   persisted before the run proceeds.
 //! - `compact` (explicit), `abort`, `record_usage`, `wait_for_idle`,
 //!   `run_when_idle`, and the full set of cloned get/set accessors.
-//! - `AgentLane` trait + [`LaneHandle`] (non-main lanes delegate reads to a
-//!   [`SessionTree`] view; the run loop is main-lane only for v1).
+//! - `AgentLane` trait + lane-bound runners. Existing session lanes execute
+//!   against their own branch while sharing harness configuration and events.
 //!
 //! Outcome mapping: `run_agent_loop` returns `Result<NewMessages, AgentError>`.
 //! The terminal assistant message's `stop_reason` decides
@@ -31,7 +31,7 @@
 //! `RunOutcome::Suspended` (the operation stays open until `resume`). All
 //! rejections are `Result<T, HarnessError>`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
@@ -41,7 +41,7 @@ use tokio_util::sync::CancellationToken;
 use rpi_agent::message::AgentMessage;
 use rpi_agent::{
     run_agent_loop, AfterToolCall, AgentContext, AgentEmitter, AgentLoopConfig, AgentTool,
-    BeforeToolCall, ConvertToLlm, StreamFn, TransformContext,
+    BeforeToolCall, ConvertToLlm, QueueMode, StreamFn, TransformContext,
 };
 use rpi_ai::types::{
     AssistantMessage, Content, DeferredHandle, StopReason, ThinkingLevel, Usage, UserContent,
@@ -65,7 +65,7 @@ use crate::session::session::Session;
 use crate::session::types::{
     BranchBounds, Entry, EntryOrder, EntryQuery, JsonValue, LaneRecord, OperationError,
     OperationFinishedRecord, OperationIntent, OperationOutcome, OperationStartedRecord,
-    ProvisionedEntry, ProvisionedKind, RecordBase, RecordQuery, SessionTree, UsageCause,
+    ProvisionedEntry, ProvisionedKind, QueueKind, RecordBase, RecordQuery, SessionTree, UsageCause,
     UsageRecord,
 };
 use crate::skills::format_skill_invocation;
@@ -277,9 +277,67 @@ pub trait AgentLane: Send + Sync {
 /// to abort. `idle` fires when the guard is released.
 struct ActiveRun {
     run_id: String,
+    lane: String,
     signal: CancellationToken,
     idle: Arc<tokio::sync::Notify>,
     kind: OperationKind,
+}
+
+/// A queued user message keeps its public entry id until the agent loop drains
+/// it. The loop only needs the message, while the harness API also needs the id
+/// for cancellation and UI feedback.
+#[derive(Clone)]
+struct QueuedMessage {
+    entry_id: String,
+    lane: String,
+    message: AgentMessage,
+}
+
+struct MessageQueue {
+    mode: QueueMode,
+    pending: VecDeque<QueuedMessage>,
+}
+
+type SharedMessageQueue = Arc<Mutex<MessageQueue>>;
+
+impl MessageQueue {
+    fn new(mode: QueueMode) -> Self {
+        Self {
+            mode,
+            pending: VecDeque::new(),
+        }
+    }
+
+    fn drain_messages_for_lane(&mut self, lane: &str) -> Vec<AgentMessage> {
+        let items: Vec<QueuedMessage> = match self.mode {
+            QueueMode::All => {
+                let mut selected = Vec::new();
+                let mut retained = VecDeque::new();
+                for item in self.pending.drain(..) {
+                    if item.lane == lane {
+                        selected.push(item);
+                    } else {
+                        retained.push_back(item);
+                    }
+                }
+                self.pending = retained;
+                selected
+            }
+            QueueMode::OneAtATime => {
+                let Some(index) = self.pending.iter().position(|item| item.lane == lane) else {
+                    return Vec::new();
+                };
+                self.pending.remove(index).into_iter().collect()
+            }
+        };
+        items.into_iter().map(|item| item.message).collect()
+    }
+
+    fn remove(&mut self, entry_id: &str) -> bool {
+        let before = self.pending.len();
+        self.pending.retain(|item| item.entry_id != entry_id);
+        self.pending.len() != before
+    }
 }
 
 /// Releases the in-memory active-run slot on every exit path, including an
@@ -331,21 +389,25 @@ struct HarnessInner {
     provider_hooks: Option<Arc<dyn rpi_ai::ProviderHooks>>,
     closed: bool,
     active_run: Option<ActiveRun>,
+    steering_queue: SharedMessageQueue,
+    follow_up_queue: SharedMessageQueue,
+    next_run_queue: SharedMessageQueue,
 }
 
 // ===========================================================================
-// AgentHarness - the main lane. Drives run_agent_loop over the session
+// AgentHarness - a lane-bound runner. Drives run_agent_loop over its session
 // branch path, persists entries/records, emits RunStart/RunEnd.
 // ===========================================================================
 
-/// The harness. Implements [`AgentLane`] for the `"main"` lane. Cheap to
-/// [`Clone`] (all state is behind `Arc`); clones share the same session +
-/// event bus + inner state.
+/// The harness created by [`AgentHarness::create`] is bound to `"main"`.
+/// [`AgentHarness::lane`] creates another lane-bound runner. Cheap to clone;
+/// clones share the same session, event bus, and inner state.
 #[derive(Clone)]
 pub struct AgentHarness {
     session: Session,
     inner: Arc<Mutex<HarnessInner>>,
     bus: HarnessEventBus,
+    lane: String,
 }
 
 impl AgentHarness {
@@ -373,7 +435,7 @@ impl AgentHarness {
         }
 
         if options.allow_existing_session {
-            Self::finish_interrupted_operation(&options.session).await?;
+            Self::finish_interrupted_operation(&options.session, "main").await?;
         }
 
         let inner = HarnessInner {
@@ -399,12 +461,16 @@ impl AgentHarness {
             provider_hooks: options.provider_hooks,
             closed: false,
             active_run: None,
+            steering_queue: Arc::new(Mutex::new(MessageQueue::new(options.steering_mode))),
+            follow_up_queue: Arc::new(Mutex::new(MessageQueue::new(options.follow_up_mode))),
+            next_run_queue: Arc::new(Mutex::new(MessageQueue::new(QueueMode::All))),
         };
 
         Ok(Self {
             session: options.session,
             inner: Arc::new(Mutex::new(inner)),
             bus: HarnessEventBus::new(),
+            lane: "main".to_string(),
         })
     }
 
@@ -419,21 +485,16 @@ impl AgentHarness {
         &self.session
     }
 
-    /// Return a lane handle. `"main"` returns a clone of self (the main lane);
-    /// any other lane returns a [`LaneHandle`] backed by the session's lane
-    /// view. The lane must already exist in the session.
+    /// Return a runner bound to a session lane. All lanes share configuration,
+    /// cancellation, and the event bus, while persistence and context use the
+    /// selected lane's branch. The lane must already exist in the session.
     pub fn lane(&self, name: &str) -> Arc<dyn AgentLane> {
-        if name == "main" {
-            Arc::new(self.clone())
-        } else {
-            Arc::new(LaneHandle {
-                session: self.session.clone(),
-                lane: name.to_string(),
-                view: self.session.view(name),
-                inner: Arc::clone(&self.inner),
-                bus: self.bus.clone(),
-            })
-        }
+        Arc::new(Self {
+            session: self.session.clone(),
+            inner: Arc::clone(&self.inner),
+            bus: self.bus.clone(),
+            lane: name.to_string(),
+        })
     }
 
     // -- harness-level config accessors (TS `AgentHarness` class surface, not
@@ -614,7 +675,7 @@ impl AgentHarness {
 
     // -- private helpers ----------------------------------------------------
 
-    /// Reject if closed or if `main` already has an active operation. On
+    /// Reject if closed or if a lane already has an active operation. On
     /// success, installs the `ActiveRun` guard and returns `(run_id, signal,
     /// idle_notify)`.
     fn acquire_run(
@@ -627,11 +688,12 @@ impl AgentHarness {
         }
         if let Some(active) = &inner.active_run {
             return Err(HarnessError::lane_busy(
-                "main",
+                self.lane.clone(),
                 active.run_id.clone(),
                 active.kind,
                 format!(
-                    "Lane main already has an active {} operation",
+                    "Lane {} already has an active {} operation",
+                    self.lane,
                     active.kind.as_str()
                 ),
             ));
@@ -641,6 +703,7 @@ impl AgentHarness {
         let idle = Arc::new(tokio::sync::Notify::new());
         inner.active_run = Some(ActiveRun {
             run_id: run_id.clone(),
+            lane: self.lane.clone(),
             signal: signal.clone(),
             idle: Arc::clone(&idle),
             kind,
@@ -659,18 +722,57 @@ impl AgentHarness {
         }
     }
 
+    async fn enqueue_active(
+        &self,
+        message: AgentMessage,
+        kind: QueueKind,
+    ) -> HarnessResult<QueueResult> {
+        let (entry_id, queue) = {
+            let inner = self.inner.lock().unwrap();
+            if inner.closed {
+                return Err(HarnessError::closed());
+            }
+            if inner
+                .active_run
+                .as_ref()
+                .map(|active| active.lane != self.lane)
+                .unwrap_or(true)
+            {
+                return Err(HarnessError::no_active_run(
+                    &self.lane,
+                    format!(
+                        "Cannot enqueue {} message while the lane is idle",
+                        kind.as_str()
+                    ),
+                ));
+            }
+            let queue = match kind {
+                QueueKind::Steer => Arc::clone(&inner.steering_queue),
+                QueueKind::FollowUp => Arc::clone(&inner.follow_up_queue),
+                QueueKind::NextRun => Arc::clone(&inner.next_run_queue),
+            };
+            (self.session.id_generator().next(), queue)
+        };
+        queue.lock().unwrap().pending.push_back(QueuedMessage {
+            entry_id: entry_id.clone(),
+            lane: self.lane.clone(),
+            message,
+        });
+        Ok(QueueResult { entry_id })
+    }
+
     /// Close an operation left open by a suspended run or an interrupted
     /// process. Resume is not implemented yet, so leaving it open would make
     /// every future operation on the lane fail permanently.
-    async fn finish_interrupted_operation(session: &Session) -> HarnessResult<()> {
+    async fn finish_interrupted_operation(session: &Session, lane: &str) -> HarnessResult<()> {
         let open = session
-            .find_open_operations("main", Some(2))
+            .find_open_operations(lane, Some(2))
             .await
             .map_err(session_to_harness_err)?;
         if open.len() > 1 {
-            return Err(HarnessError::io(
-                "Lane main has multiple open operations; the session log is corrupted",
-            ));
+            return Err(HarnessError::io(format!(
+                "Lane {lane} has multiple open operations; the session log is corrupted"
+            )));
         }
         let Some(operation) = open.first() else {
             return Ok(());
@@ -681,7 +783,7 @@ impl AgentHarness {
                 base: RecordBase {
                     id: session.id_generator().next(),
                     seq: 0,
-                    lane: "main".to_string(),
+                    lane: lane.to_string(),
                     timestamp: 0,
                 },
                 run_id: operation.base.id.clone(),
@@ -813,11 +915,12 @@ impl AgentHarness {
         }
     }
 
-    /// Load the main-lane branch path, oldest-first. Returns an empty vec when
+    /// Load this lane's branch path, oldest-first. Returns an empty vec when
     /// the lane is empty (no leaf).
     async fn branch_path_oldest_first(&self) -> HarnessResult<Vec<Entry>> {
         let leaf = self
             .session
+            .view(&self.lane)
             .get_leaf_id()
             .await
             .map_err(session_to_harness_err)?;
@@ -833,6 +936,7 @@ impl AgentHarness {
             ..Default::default()
         };
         self.session
+            .view(&self.lane)
             .find_entries_on_branch(&query, &bounds)
             .await
             .map_err(session_to_harness_err)
@@ -864,6 +968,8 @@ impl AgentHarness {
             after_tool_call: inner.after_tool_call.clone(),
             transform_context: inner.transform_context.clone(),
             provider_hooks: inner.provider_hooks.clone(),
+            steering_queue: Arc::clone(&inner.steering_queue),
+            follow_up_queue: Arc::clone(&inner.follow_up_queue),
         })
     }
 
@@ -927,7 +1033,7 @@ impl AgentHarness {
             },
         };
         self.session
-            .append_entry(entry, "main")
+            .append_entry(entry, &self.lane)
             .await
             .map_err(session_to_harness_err)
     }
@@ -945,7 +1051,7 @@ impl AgentHarness {
             base: RecordBase {
                 id: run_id.to_string(),
                 seq: 0,
-                lane: "main".to_string(),
+                lane: self.lane.clone(),
                 timestamp: 0,
             },
             source_leaf_id,
@@ -973,7 +1079,7 @@ impl AgentHarness {
             base: RecordBase {
                 id: self.session.id_generator().next(),
                 seq: 0,
-                lane: "main".to_string(),
+                lane: self.lane.clone(),
                 timestamp: 0,
             },
             run_id: run_id.to_string(),
@@ -998,6 +1104,7 @@ impl AgentHarness {
     ) -> HarnessResult<(Option<String>, Option<String>)> {
         let mut leaf_id = self
             .session
+            .view(&self.lane)
             .get_leaf_id()
             .await
             .map_err(session_to_harness_err)?;
@@ -1005,6 +1112,7 @@ impl AgentHarness {
         for msg in new_messages {
             let id = self
                 .session
+                .view(&self.lane)
                 .append_message(msg.clone())
                 .await
                 .map_err(session_to_harness_err)?;
@@ -1093,20 +1201,31 @@ impl AgentHarness {
     /// The core run loop shared by all prompt overloads + skill + template.
     async fn run_core(&self, prompts: Vec<AgentMessage>) -> HarnessResult<RunResult> {
         let (run_id, signal, _idle) = self.acquire_run(OperationKind::Run)?;
+
+        // `nextRun` messages are consumed when a new run starts, before the
+        // caller's prompt. This matches pi's ordering and keeps them durable
+        // through the normal prompt persistence path below.
+        let prompts = {
+            let inner = self.inner.lock().unwrap();
+            let mut queue = inner.next_run_queue.lock().unwrap();
+            let queued = queue.drain_messages_for_lane(&self.lane);
+            queued.into_iter().chain(prompts).collect::<Vec<_>>()
+        };
         let _run_lease = ActiveRunLease { harness: self };
-        Self::finish_interrupted_operation(&self.session).await?;
+        Self::finish_interrupted_operation(&self.session, &self.lane).await?;
 
         // Snapshot the source leaf (before persisting prompts) for the
         // operation_started record.
         let source_leaf = self
             .session
+            .view(&self.lane)
             .get_leaf_id()
             .await
             .map_err(session_to_harness_err)?;
 
         // Emit RunStart.
         self.bus.emit(&HarnessEvent::RunStart(RunStartEvent {
-            lane: "main".into(),
+            lane: self.lane.clone(),
             run_id: run_id.clone(),
         }));
 
@@ -1123,6 +1242,7 @@ impl AgentHarness {
         // Persist prompts (the user's input) BEFORE the run so they're durable.
         for msg in &prompts {
             self.session
+                .view(&self.lane)
                 .append_message(msg.clone())
                 .await
                 .map_err(session_to_harness_err)?;
@@ -1143,7 +1263,7 @@ impl AgentHarness {
                 .await;
             let leaf = source_leaf.unwrap_or_default();
             self.bus.emit(&HarnessEvent::RunEnd(RunEndEvent {
-                lane: "main".into(),
+                lane: self.lane.clone(),
                 run_id: run_id.clone(),
                 outcome: RunEndOutcome::Failed,
                 leaf_id: leaf.clone(),
@@ -1204,6 +1324,7 @@ impl AgentHarness {
                                 // Compaction failed; abort the run.
                                 let leaf = self
                                     .session
+                                    .view(&self.lane)
                                     .get_leaf_id()
                                     .await
                                     .ok()
@@ -1221,7 +1342,7 @@ impl AgentHarness {
                                     )
                                     .await;
                                 self.bus.emit(&HarnessEvent::RunEnd(RunEndEvent {
-                                    lane: "main".into(),
+                                    lane: self.lane.clone(),
                                     run_id: run_id.clone(),
                                     outcome: RunEndOutcome::Failed,
                                     leaf_id: leaf.clone(),
@@ -1273,8 +1394,24 @@ impl AgentHarness {
             get_api_key: None,
             should_stop_after_turn: None,
             prepare_next_turn: None,
-            get_steering_messages: None,
-            get_follow_up_messages: None,
+            get_steering_messages: Some({
+                let queue = Arc::clone(&snap.steering_queue);
+                let lane = self.lane.clone();
+                Arc::new(move || {
+                    let queue = Arc::clone(&queue);
+                    let lane = lane.clone();
+                    Box::pin(async move { queue.lock().unwrap().drain_messages_for_lane(&lane) })
+                })
+            }),
+            get_follow_up_messages: Some({
+                let queue = Arc::clone(&snap.follow_up_queue);
+                let lane = self.lane.clone();
+                Arc::new(move || {
+                    let queue = Arc::clone(&queue);
+                    let lane = lane.clone();
+                    Box::pin(async move { queue.lock().unwrap().drain_messages_for_lane(&lane) })
+                })
+            }),
             before_tool_call: snap.before_tool_call.clone(),
             after_tool_call: snap.after_tool_call.clone(),
             tool_execution: snap.tool_execution.to_agent_mode(),
@@ -1340,6 +1477,7 @@ impl AgentHarness {
             Err(e) => {
                 let leaf = self
                     .session
+                    .view(&self.lane)
                     .get_leaf_id()
                     .await
                     .ok()
@@ -1382,7 +1520,7 @@ impl AgentHarness {
             HarnessRunOutcome::Suspended { .. } => None,
         } {
             self.bus.emit(&HarnessEvent::RunEnd(RunEndEvent {
-                lane: "main".into(),
+                lane: self.lane.clone(),
                 run_id: run_id.clone(),
                 outcome: run_end_outcome,
                 leaf_id: leaf_id.clone().unwrap_or_default(),
@@ -1400,10 +1538,11 @@ impl AgentHarness {
     ) -> HarnessResult<CompactionResult> {
         let (run_id, signal, _idle) = self.acquire_run(OperationKind::Compaction)?;
         let _run_lease = ActiveRunLease { harness: self };
-        Self::finish_interrupted_operation(&self.session).await?;
+        Self::finish_interrupted_operation(&self.session, &self.lane).await?;
 
         let source_leaf = self
             .session
+            .view(&self.lane)
             .get_leaf_id()
             .await
             .map_err(session_to_harness_err)?;
@@ -1549,6 +1688,8 @@ struct ConfigSnapshot {
     after_tool_call: Option<AfterToolCall>,
     transform_context: Option<TransformContext>,
     provider_hooks: Option<Arc<dyn rpi_ai::ProviderHooks>>,
+    steering_queue: SharedMessageQueue,
+    follow_up_queue: SharedMessageQueue,
 }
 
 // ===========================================================================
@@ -1558,11 +1699,12 @@ struct ConfigSnapshot {
 #[async_trait::async_trait]
 impl AgentLane for AgentHarness {
     fn name(&self) -> &str {
-        "main"
+        &self.lane
     }
 
     async fn get_leaf_id(&self) -> HarnessResult<Option<String>> {
         self.session
+            .view(&self.lane)
             .get_leaf_id()
             .await
             .map_err(session_to_harness_err)
@@ -1636,23 +1778,46 @@ impl AgentLane for AgentHarness {
 
     async fn navigate_tree(
         &self,
-        _target_id: Option<&str>,
+        target_id: Option<&str>,
         _summarize: bool,
         _custom_instructions: Option<&str>,
         _label: Option<&str>,
     ) -> HarnessResult<NavigationResult> {
-        // v1: navigation is deferred (see docs/m5f-open-questions.md). Return
-        // Declined with the current leaf.
-        let leaf = self
-            .session
-            .get_leaf_id()
-            .await
-            .map_err(session_to_harness_err)?;
         let run_id = self.session.id_generator().next();
-        Ok(NavigationResult {
-            run_id,
-            outcome: NavigationOutcome::Declined { leaf_id: leaf },
-        })
+        let target = target_id.filter(|id| !id.is_empty());
+        match self.session.move_lane(&self.lane, target).await {
+            Ok(()) => {
+                let leaf = self
+                    .session
+                    .view(&self.lane)
+                    .get_leaf_id()
+                    .await
+                    .map_err(session_to_harness_err)?;
+                Ok(NavigationResult {
+                    run_id,
+                    outcome: NavigationOutcome::Completed {
+                        new_leaf_id: leaf,
+                        summary_entry: None,
+                    },
+                })
+            }
+            Err(error) => Ok(NavigationResult {
+                run_id,
+                outcome: NavigationOutcome::Failed {
+                    leaf_id: self
+                        .session
+                        .view(&self.lane)
+                        .get_leaf_id()
+                        .await
+                        .ok()
+                        .flatten(),
+                    error: OperationError {
+                        code: "navigation_failed".into(),
+                        message: error.to_string(),
+                    },
+                },
+            }),
+        }
     }
 
     async fn abort(&self) -> HarnessResult<AbortResult> {
@@ -1662,13 +1827,19 @@ impl AgentLane for AgentHarness {
                 return Err(HarnessError::closed());
             }
             match &inner.active_run {
-                Some(active) => {
+                Some(active) if active.lane == self.lane => {
                     active.signal.cancel();
                     (active.run_id.clone(), Vec::new(), Vec::new())
                 }
+                Some(_) => {
+                    return Err(HarnessError::no_active_run(
+                        &self.lane,
+                        "No active run to abort on this lane",
+                    ));
+                }
                 None => {
                     return Err(HarnessError::no_active_run(
-                        "main",
+                        &self.lane,
                         "No active run to abort",
                     ));
                 }
@@ -1681,33 +1852,48 @@ impl AgentLane for AgentHarness {
         })
     }
 
-    async fn steer(&self, _message: AgentMessage) -> HarnessResult<QueueResult> {
-        // v1: steering queue is deferred (see docs/m5f-open-questions.md).
-        Err(HarnessError::no_active_run(
-            "main",
-            "Steering is not implemented in v1",
-        ))
+    async fn steer(&self, message: AgentMessage) -> HarnessResult<QueueResult> {
+        self.enqueue_active(message, QueueKind::Steer).await
     }
 
-    async fn follow_up(&self, _message: AgentMessage) -> HarnessResult<QueueResult> {
-        Err(HarnessError::no_active_run(
-            "main",
-            "Follow-up queue is not implemented in v1",
-        ))
+    async fn follow_up(&self, message: AgentMessage) -> HarnessResult<QueueResult> {
+        self.enqueue_active(message, QueueKind::FollowUp).await
     }
 
-    async fn next_run(&self, _message: AgentMessage) -> HarnessResult<QueueResult> {
-        Err(HarnessError::no_active_run(
-            "main",
-            "Next-run queue is not implemented in v1",
-        ))
+    async fn next_run(&self, message: AgentMessage) -> HarnessResult<QueueResult> {
+        let (entry_id, queue) = {
+            let inner = self.inner.lock().unwrap();
+            if inner.closed {
+                return Err(HarnessError::closed());
+            }
+            (
+                self.session.id_generator().next(),
+                Arc::clone(&inner.next_run_queue),
+            )
+        };
+        queue.lock().unwrap().pending.push_back(QueuedMessage {
+            entry_id: entry_id.clone(),
+            lane: self.lane.clone(),
+            message,
+        });
+        Ok(QueueResult { entry_id })
     }
 
-    async fn cancel_queued(&self, _entry_id: &str) -> HarnessResult<CancelQueuedResult> {
-        Err(HarnessError::no_active_run(
-            "main",
-            "Queue cancellation is not implemented in v1",
-        ))
+    async fn cancel_queued(&self, entry_id: &str) -> HarnessResult<CancelQueuedResult> {
+        let inner = self.inner.lock().unwrap();
+        if inner.closed {
+            return Err(HarnessError::closed());
+        }
+        let removed = inner.steering_queue.lock().unwrap().remove(entry_id)
+            || inner.follow_up_queue.lock().unwrap().remove(entry_id)
+            || inner.next_run_queue.lock().unwrap().remove(entry_id);
+        Ok(CancelQueuedResult {
+            outcome: if removed {
+                CancelQueuedOutcome::Cancelled
+            } else {
+                CancelQueuedOutcome::AlreadyConsumed
+            },
+        })
     }
 
     async fn record_usage(
@@ -1729,7 +1915,7 @@ impl AgentLane for AgentHarness {
             base: RecordBase {
                 id: self.session.id_generator().next(),
                 seq: 0,
-                lane: "main".to_string(),
+                lane: self.lane.clone(),
                 timestamp: 0,
             },
             usage,
@@ -1837,15 +2023,13 @@ impl AgentLane for AgentHarness {
     }
 
     fn session_view(&self) -> Arc<dyn SessionTree> {
-        self.session.view("main")
+        self.session.view(&self.lane)
     }
 }
 
 // ===========================================================================
-// LaneHandle - non-main lanes. Delegates reads to the session's SessionTree
-// view; run ops reject with InvalidLane (the run loop is main-lane only in
-// v1). Get/set accessors + record_usage + wait_for_idle delegate to the
-// shared inner state (harness-wide config).
+// LaneHandle - legacy read-oriented compatibility wrapper. New callers should
+// use `AgentHarness::lane`, which returns a fully executable lane runner.
 // ===========================================================================
 
 /// A non-main lane handle. Cheap to clone (shares the harness inner state).
@@ -1859,6 +2043,17 @@ pub struct LaneHandle {
     /// `watch`/`events` are surfaced for non-main lanes; v1 leaves it unused.
     #[allow(dead_code)]
     bus: HarnessEventBus,
+}
+
+impl LaneHandle {
+    fn runner(&self) -> AgentHarness {
+        AgentHarness {
+            session: self.session.clone(),
+            inner: Arc::clone(&self.inner),
+            bus: self.bus.clone(),
+            lane: self.lane.clone(),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -1876,116 +2071,66 @@ impl AgentLane for LaneHandle {
 
     async fn prompt_text(
         &self,
-        _text: &str,
-        _images: Vec<rpi_ai::types::ImageContent>,
+        text: &str,
+        images: Vec<rpi_ai::types::ImageContent>,
     ) -> HarnessResult<RunResult> {
-        Err(HarnessError::invalid_lane(
-            self.lane.clone(),
-            "non_main_lane",
-            "The run loop is only available on the main lane in v1",
-        ))
+        self.runner().prompt_text(text, images).await
     }
 
-    async fn prompt_message(&self, _message: AgentMessage) -> HarnessResult<RunResult> {
-        Err(HarnessError::invalid_lane(
-            self.lane.clone(),
-            "non_main_lane",
-            "The run loop is only available on the main lane in v1",
-        ))
+    async fn prompt_message(&self, message: AgentMessage) -> HarnessResult<RunResult> {
+        self.runner().prompt_message(message).await
     }
 
-    async fn prompt_messages(&self, _messages: Vec<AgentMessage>) -> HarnessResult<RunResult> {
-        Err(HarnessError::invalid_lane(
-            self.lane.clone(),
-            "non_main_lane",
-            "The run loop is only available on the main lane in v1",
-        ))
+    async fn prompt_messages(&self, messages: Vec<AgentMessage>) -> HarnessResult<RunResult> {
+        self.runner().prompt_messages(messages).await
     }
 
     async fn skill(
         &self,
-        _name: &str,
-        _additional_instructions: Option<&str>,
+        name: &str,
+        additional_instructions: Option<&str>,
     ) -> HarnessResult<RunResult> {
-        Err(HarnessError::invalid_lane(
-            self.lane.clone(),
-            "non_main_lane",
-            "Skills are only available on the main lane in v1",
-        ))
+        self.runner().skill(name, additional_instructions).await
     }
 
-    async fn prompt_from_template(
-        &self,
-        _name: &str,
-        _args: &[String],
-    ) -> HarnessResult<RunResult> {
-        Err(HarnessError::invalid_lane(
-            self.lane.clone(),
-            "non_main_lane",
-            "Prompt templates are only available on the main lane in v1",
-        ))
+    async fn prompt_from_template(&self, name: &str, args: &[String]) -> HarnessResult<RunResult> {
+        self.runner().prompt_from_template(name, args).await
     }
 
-    async fn compact(&self, _custom_instructions: Option<&str>) -> HarnessResult<CompactionResult> {
-        Err(HarnessError::invalid_lane(
-            self.lane.clone(),
-            "non_main_lane",
-            "Compaction is only available on the main lane in v1",
-        ))
+    async fn compact(&self, custom_instructions: Option<&str>) -> HarnessResult<CompactionResult> {
+        self.runner().compact(custom_instructions).await
     }
 
     async fn navigate_tree(
         &self,
-        _target_id: Option<&str>,
-        _summarize: bool,
-        _custom_instructions: Option<&str>,
-        _label: Option<&str>,
+        target_id: Option<&str>,
+        summarize: bool,
+        custom_instructions: Option<&str>,
+        label: Option<&str>,
     ) -> HarnessResult<NavigationResult> {
-        let leaf = self
-            .view
-            .get_leaf_id()
+        self.runner()
+            .navigate_tree(target_id, summarize, custom_instructions, label)
             .await
-            .map_err(session_to_harness_err)?;
-        let run_id = self.session.id_generator().next();
-        Ok(NavigationResult {
-            run_id,
-            outcome: NavigationOutcome::Declined { leaf_id: leaf },
-        })
     }
 
     async fn abort(&self) -> HarnessResult<AbortResult> {
-        Err(HarnessError::no_active_run(
-            self.lane.clone(),
-            "No active run on this lane",
-        ))
+        self.runner().abort().await
     }
 
-    async fn steer(&self, _message: AgentMessage) -> HarnessResult<QueueResult> {
-        Err(HarnessError::no_active_run(
-            self.lane.clone(),
-            "Steering is not implemented in v1",
-        ))
+    async fn steer(&self, message: AgentMessage) -> HarnessResult<QueueResult> {
+        self.runner().steer(message).await
     }
 
-    async fn follow_up(&self, _message: AgentMessage) -> HarnessResult<QueueResult> {
-        Err(HarnessError::no_active_run(
-            self.lane.clone(),
-            "Follow-up queue is not implemented in v1",
-        ))
+    async fn follow_up(&self, message: AgentMessage) -> HarnessResult<QueueResult> {
+        self.runner().follow_up(message).await
     }
 
-    async fn next_run(&self, _message: AgentMessage) -> HarnessResult<QueueResult> {
-        Err(HarnessError::no_active_run(
-            self.lane.clone(),
-            "Next-run queue is not implemented in v1",
-        ))
+    async fn next_run(&self, message: AgentMessage) -> HarnessResult<QueueResult> {
+        self.runner().next_run(message).await
     }
 
-    async fn cancel_queued(&self, _entry_id: &str) -> HarnessResult<CancelQueuedResult> {
-        Err(HarnessError::no_active_run(
-            self.lane.clone(),
-            "Queue cancellation is not implemented in v1",
-        ))
+    async fn cancel_queued(&self, entry_id: &str) -> HarnessResult<CancelQueuedResult> {
+        self.runner().cancel_queued(entry_id).await
     }
 
     async fn record_usage(
@@ -2116,6 +2261,79 @@ impl AgentLane for LaneHandle {
 
     fn session_view(&self) -> Arc<dyn SessionTree> {
         Arc::clone(&self.view)
+    }
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+    use rpi_ai::types::UserMessage;
+
+    fn user(text: &str) -> AgentMessage {
+        AgentMessage::User(UserMessage::new(text, 0))
+    }
+
+    #[test]
+    fn queue_mode_one_at_a_time_preserves_entry_order() {
+        let mut queue = MessageQueue::new(QueueMode::OneAtATime);
+        queue.pending.push_back(QueuedMessage {
+            entry_id: "a".into(),
+            lane: "main".into(),
+            message: user("first"),
+        });
+        queue.pending.push_back(QueuedMessage {
+            entry_id: "b".into(),
+            lane: "main".into(),
+            message: user("second"),
+        });
+        assert_eq!(queue.drain_messages_for_lane("main").len(), 1);
+        assert_eq!(
+            queue.pending.front().map(|item| item.entry_id.as_str()),
+            Some("b")
+        );
+    }
+
+    #[test]
+    fn queue_cancel_removes_only_the_requested_entry() {
+        let mut queue = MessageQueue::new(QueueMode::All);
+        queue.pending.push_back(QueuedMessage {
+            entry_id: "a".into(),
+            lane: "main".into(),
+            message: user("first"),
+        });
+        queue.pending.push_back(QueuedMessage {
+            entry_id: "b".into(),
+            lane: "main".into(),
+            message: user("second"),
+        });
+        assert!(queue.remove("a"));
+        assert!(!queue.remove("missing"));
+        assert_eq!(
+            queue.pending.front().map(|item| item.entry_id.as_str()),
+            Some("b")
+        );
+    }
+
+    #[test]
+    fn queue_drain_isolated_by_lane() {
+        let mut queue = MessageQueue::new(QueueMode::All);
+        queue.pending.push_back(QueuedMessage {
+            entry_id: "main-1".into(),
+            lane: "main".into(),
+            message: user("main"),
+        });
+        queue.pending.push_back(QueuedMessage {
+            entry_id: "side-1".into(),
+            lane: "side".into(),
+            message: user("side"),
+        });
+        assert_eq!(queue.drain_messages_for_lane("main").len(), 1);
+        assert_eq!(
+            queue.pending.front().map(|item| item.entry_id.as_str()),
+            Some("side-1")
+        );
+        assert_eq!(queue.drain_messages_for_lane("side").len(), 1);
+        assert!(queue.pending.is_empty());
     }
 }
 
@@ -2322,5 +2540,32 @@ mod session_switch_tests {
             .unwrap();
         assert_eq!(e2.len(), 1);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn non_main_lane_runner_persists_prompt_on_its_branch() {
+        let h = AgentHarness::create(opts()).await.unwrap();
+        h.session().create_lane("side", None).await.unwrap();
+        let side = h.lane("side");
+
+        let result = side.prompt_text("side branch", Vec::new()).await.unwrap();
+        assert!(matches!(result.outcome, HarnessRunOutcome::Failed { .. }));
+
+        let entries = side
+            .session_view()
+            .find_entries(&EntryQuery::default())
+            .await
+            .unwrap();
+        assert!(entries.iter().any(|entry| {
+            matches!(
+                entry,
+                Entry::Message(message)
+                    if matches!(
+                        &message.message,
+                        AgentMessage::User(user)
+                            if matches!(&user.content, UserContent::Text(text) if text == "side branch")
+                    )
+            )
+        }));
     }
 }

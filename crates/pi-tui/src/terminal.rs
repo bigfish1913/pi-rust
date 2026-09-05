@@ -296,8 +296,14 @@ impl Terminal for ProcessTerminal {
         std::io::stdout().is_terminal()
     }
 
-    fn set_progress(&self, _active: bool) {
-        // Progress indicator support not implemented yet
+    fn set_progress(&self, active: bool) {
+        // OSC 9;4 is supported by modern terminal emulators (including
+        // Windows Terminal, iTerm2-compatible terminals, and many Linux
+        // terminals). State 1 starts an indeterminate progress indicator and
+        // state 0 clears it.
+        let state = if active { 1 } else { 0 };
+        self.write(&format!("\x1b]9;4;{state};0\x07"));
+        self.flush();
     }
 
     fn flush(&self) {

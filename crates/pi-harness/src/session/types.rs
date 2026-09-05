@@ -1261,7 +1261,7 @@ pub trait SessionRepo: Send + Sync {
 }
 
 /// Branch-scoped read+write view the harness exposes per lane. Mirrors TS
-/// `SessionTree`. `LaneHandle` in `agent_harness.rs` owns one of these.
+/// `SessionTree`. Lane-bound harness runners own one of these views.
 #[async_trait::async_trait]
 pub trait SessionTree: Send + Sync {
     async fn get_leaf_id(&self) -> SessionResult<Option<String>>;

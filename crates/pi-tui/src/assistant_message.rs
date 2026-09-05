@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 
 use super::component::Component;
 use super::container::Container;
+use super::image::{Image, ImageOptions};
 use super::markdown::Markdown;
 use super::spacer::Spacer;
 use super::text::Text;
@@ -33,6 +34,8 @@ pub enum AssistantBlock {
     Text(String),
     /// Reasoning / thinking text (rendered as dim italic markdown).
     Thinking(String),
+    /// Inline image bytes decoded from the provider's base64 image block.
+    Image(Vec<u8>),
 }
 
 /// Configuration for assistant message rendering.
@@ -186,6 +189,7 @@ impl AssistantMessageComponent {
         let has_visible = blocks.iter().any(|b| {
             matches!(b, AssistantBlock::Text(t) if !t.trim().is_empty())
                 || matches!(b, AssistantBlock::Thinking(t) if !t.trim().is_empty())
+                || matches!(b, AssistantBlock::Image(data) if !data.is_empty())
         });
 
         if !has_visible {
@@ -215,6 +219,16 @@ impl AssistantMessageComponent {
                 }
                 AssistantBlock::Text(_) => {
                     // Whitespace-only text block — skip (TS trims + skips empty).
+                    i += 1;
+                }
+                AssistantBlock::Image(data) if !data.is_empty() => {
+                    self.content_container.add_child(Arc::new(Image::from_data(
+                        data.clone(),
+                        ImageOptions::default(),
+                    )));
+                    i += 1;
+                }
+                AssistantBlock::Image(_) => {
                     i += 1;
                 }
                 AssistantBlock::Thinking(_) => {
@@ -266,6 +280,7 @@ impl AssistantMessageComponent {
                     let has_after = blocks[i..].iter().any(|b| {
                         matches!(b, AssistantBlock::Text(t) if !t.trim().is_empty())
                             || matches!(b, AssistantBlock::Thinking(t) if !t.trim().is_empty())
+                            || matches!(b, AssistantBlock::Image(data) if !data.is_empty())
                     });
                     if has_after {
                         self.content_container.add_child(Arc::new(Spacer::new(1)));

@@ -15,8 +15,8 @@ use std::sync::Arc;
 use rpi_agent::error::AgentError;
 use rpi_ai::types::Tool;
 use rpi_plugin_sdk::{
-    EventHandlerFn, EventTag, FreeStringFn, ProviderRequestFn, RenderFn, ResourcesDiscoverFn,
-    EVENT_TAG_COUNT,
+    CommandHandlerFn, EventHandlerFn, EventTag, FreeStringFn, ProviderRequestFn, RenderFn,
+    ResourcesDiscoverFn, EVENT_TAG_COUNT,
 };
 
 use crate::tool::PluginToolHandle;
@@ -53,13 +53,19 @@ impl ExtensionTool {
     }
 }
 
-/// A registered slash command (name + description). The handler fn is not yet
-/// wired on the host (B5) — the registry records the metadata only.
+/// A registered slash command and its plugin callback.
 #[derive(Clone)]
 pub struct RegisteredCommand {
     pub name: String,
     pub description: String,
+    pub handler: CommandHandlerFn,
+    pub user_data: *mut std::ffi::c_void,
 }
+
+// SAFETY: the plugin owns the callback/context and promises they remain valid
+// for the loaded library lifetime, matching the other registered callbacks.
+unsafe impl Send for RegisteredCommand {}
+unsafe impl Sync for RegisteredCommand {}
 
 /// A registered `on(tag)` event handler. `user_data` is the plugin's opaque
 /// context, passed back unchanged on every dispatch.
@@ -126,10 +132,8 @@ pub struct RegisteredProvider {
 unsafe impl Send for RegisteredProvider {}
 unsafe impl Sync for RegisteredProvider {}
 
-/// A registered message/markdown/entry renderer (B5c). The host records the
-/// metadata now; TUI consumption lands in B5e (`register_markdown_transformer`
-/// wires into the render path first; message/entry renderers are recorded +
-/// exposed but deferred with a diagnostic). `render_fn` produces a
+/// A registered message/markdown/entry renderer (B5c). The interactive TUI
+/// consumes all three kinds through the JSON component adapter. `render_fn` produces a
 /// **plugin-owned** `out` [`StbString`] the host reclaims via
 /// `plugin_free_string`; `user_data` is passed back on every render call. `name`
 /// is copied from the borrowed `StbStringRef` at registration.
@@ -240,11 +244,22 @@ impl ExtensionRegistry {
     }
 
     /// Register a slash command (first-wins by name). `true` if a prior was kept.
-    pub fn register_command(&mut self, name: String, description: String) -> bool {
+    pub fn register_command(
+        &mut self,
+        name: String,
+        description: String,
+        handler: CommandHandlerFn,
+        user_data: *mut std::ffi::c_void,
+    ) -> bool {
         if self.commands.iter().any(|c| c.name == name) {
             return true;
         }
-        self.commands.push(RegisteredCommand { name, description });
+        self.commands.push(RegisteredCommand {
+            name,
+            description,
+            handler,
+            user_data,
+        });
         false
     }
 
@@ -457,9 +472,9 @@ impl RegistrySnapshot {
         &self.renderers
     }
 
-    /// The registered renderers of a specific kind (B5c). The TUI render path
-    /// (B5e) reads the `Markdown` subset to transform assistant markdown before
-    /// display; `Message`/`Entry` are recorded + exposed but deferred.
+    /// The registered renderers of a specific kind (B5c). The TUI dispatches
+    /// message and entry renderers through the same JSON adapter used by the
+    /// markdown transformer.
     pub fn renderers_of(&self, kind: RegisteredRendererKind) -> Vec<RegisteredRenderer> {
         self.renderers
             .iter()

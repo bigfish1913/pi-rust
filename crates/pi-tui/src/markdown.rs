@@ -8,6 +8,7 @@ use std::any::Any;
 use std::sync::Mutex;
 
 use super::component::Component;
+use super::mermaid::Mermaid;
 use crate::ansi::{bold, italic, underline};
 use crate::theme::theme;
 use crate::utils::{
@@ -114,6 +115,8 @@ impl Markdown {
         // panel rather than echoing Markdown's literal ``` markers.
         let mut in_code_block = false;
         let mut code_fence_char = '`';
+        let mut code_language = String::new();
+        let mut mermaid_source: Vec<String> = Vec::new();
         while i < raw_lines.len() {
             let line = raw_lines[i];
 
@@ -137,9 +140,11 @@ impl Markdown {
                 if !in_code_block {
                     in_code_block = true;
                     code_fence_char = fence_char;
+                    code_language = lang.to_ascii_lowercase();
+                    mermaid_source.clear();
                     // No decorative frame: a small language label is enough
                     // chrome. For an unlabelled block, start directly with code.
-                    if !lang.is_empty() {
+                    if !lang.is_empty() && code_language != "mermaid" {
                         let panel_width = cwidth.saturating_sub(visible_width(&indent)).max(1);
                         let header = colors.md_code_block_border.fg(&format!(" {lang}"));
                         let header = apply_background_to_line(&header, panel_width, |text| {
@@ -148,7 +153,14 @@ impl Markdown {
                         lines.push(format!("{pad}{indent}{header}"));
                     }
                 } else if fence_char == code_fence_char {
+                    if code_language == "mermaid" {
+                        let component = Mermaid::new(mermaid_source.join("\n"));
+                        let mermaid_lines = component.render(cwidth);
+                        lines.extend(mermaid_lines.into_iter().map(|line| format!("{pad}{line}")));
+                    }
                     in_code_block = false;
+                    code_language.clear();
+                    mermaid_source.clear();
                     // The closing fence is structural only; do not draw a
                     // bottom border around the code surface.
                 } else {
@@ -161,6 +173,11 @@ impl Markdown {
 
             if in_code_block {
                 list_continuation_indent = None;
+                if code_language == "mermaid" {
+                    mermaid_source.push(line.to_string());
+                    i += 1;
+                    continue;
+                }
                 // Code is never reflowed: wrapping destroys indentation and
                 // makes copied snippets invalid. Tabs are normalized and long
                 // physical lines are clipped with an ellipsis.
@@ -218,7 +235,15 @@ impl Markdown {
                 push_wrapped(&pad, &h, cwidth, &mut lines);
             } else if let Some(rest) = strip_header(line, "###") {
                 list_continuation_indent = None;
-                let h = bold(&colors.md_heading.fg(&self.render_inline(rest)));
+                // Keep the heading marker visible at every level. H1/H2
+                // already do this; omitting `### ` here made H3 look like a
+                // regular bold paragraph and made streamed markdown jump
+                // between styles.
+                let h = bold(
+                    &colors
+                        .md_heading
+                        .fg(&format!("### {}", self.render_inline(rest))),
+                );
                 push_wrapped(&pad, &h, cwidth, &mut lines);
             } else if let Some(rest) = strip_header(line, "##") {
                 list_continuation_indent = None;
@@ -654,11 +679,18 @@ where
     out.push(format!("{pad}{}", border("┌", "─", "┬", "┐")));
     out.push(format!("{pad}│{}│", join(&header)));
     out.push(format!("{pad}{}", border("├", "─", "┼", "┤")));
-    for row in &body {
+    for (row_index, row) in body.iter().enumerate() {
         let cells: Vec<String> = (0..ncols)
             .map(|c| row.get(c).cloned().unwrap_or_default())
             .collect();
         out.push(format!("{pad}│{}│", join(&cells)));
+        // Keep the table grid visible between body rows as well as between the
+        // header and the first row. This is especially useful for narrow
+        // terminals where adjacent wrapped-looking rows are otherwise hard
+        // to distinguish.
+        if row_index + 1 < body.len() {
+            out.push(format!("{pad}{}", border("├", "─", "┼", "┤")));
+        }
     }
     out.push(format!("{pad}{}", border("└", "─", "┴", "┘")));
 }
@@ -836,6 +868,21 @@ mod tests {
     }
 
     #[test]
+    fn test_mermaid_fence_uses_diagram_renderer() {
+        let md = Markdown::new("```mermaid\nflowchart LR\nA[Start] --> B[End]\n```", 0, 0);
+        let plain = crate::ansi::strip_ansi(&md.render(80).join("\n"));
+        assert!(plain.contains("mermaid"));
+        assert!(
+            plain.contains("Start ──▶ End"),
+            "diagram body missing: {plain}"
+        );
+        assert!(
+            !plain.contains("flowchart LR"),
+            "raw mermaid header leaked: {plain}"
+        );
+    }
+
+    #[test]
     fn test_markdown_padding_applies_to_first_and_wrapped_lines() {
         let md = Markdown::new("abcdefgh", 2, 0);
         let lines = md.render(6);
@@ -877,6 +924,26 @@ mod tests {
         assert!(joined.contains('┬'), "missing top-mid");
         assert!(joined.contains('┐'), "missing top-right");
         assert!(joined.contains('└'), "missing bottom-left");
+    }
+
+    #[test]
+    fn test_markdown_table_has_internal_horizontal_lines() {
+        let md = Markdown::new(
+            "| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n| 5 | 6 |",
+            0,
+            0,
+        );
+        let plain = crate::ansi::strip_ansi(&md.render(80).join("\n"));
+        assert_eq!(
+            plain.matches('├').count(),
+            3,
+            "missing internal row lines: {plain}"
+        );
+        assert_eq!(
+            plain.matches('┼').count(),
+            3,
+            "missing internal separators: {plain}"
+        );
     }
 
     #[test]

@@ -138,8 +138,7 @@ pub fn settings_path() -> Result<PathBuf, ConfigError> {
     Ok(agent_dir()?.join("settings.json"))
 }
 
-/// `~/.rpi/agent/trust.json` (per-cwd project trust decisions — read-only
-/// parity with pi; rpi does not gate resources behind trust in v1).
+/// `~/.rpi/agent/trust.json` (per-cwd project trust decisions).
 pub fn trust_path() -> Result<PathBuf, ConfigError> {
     Ok(agent_dir()?.join("trust.json"))
 }
@@ -380,6 +379,27 @@ pub fn read_trust() -> Result<TrustStore, ConfigError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(TrustStore::new()),
         Err(e) => Err(ConfigError::Read { path, source: e }),
     }
+}
+
+/// Persist the trust decision for a project directory. The path is canonical
+/// when it exists, with an absolute fallback for a project being created.
+pub fn set_project_trust(cwd: &Path, trusted: Option<bool>) -> Result<(), ConfigError> {
+    let key = std::fs::canonicalize(cwd)
+        .unwrap_or_else(|_| cwd.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    let mut store = read_trust()?;
+    if let Some(decision) = trusted {
+        store.insert(key, Some(decision));
+    } else {
+        store.remove(&key);
+    }
+    let path = trust_path()?;
+    ensure_dir(&agent_dir()?)?;
+    let json = serde_json::to_string_pretty(&store).unwrap();
+    atomic_write(&path, json.as_bytes())?;
+    set_owner_only(&path);
+    Ok(())
 }
 
 /// Parse the models JSON, tolerating `//` line comments (a minimal subset of

@@ -9,11 +9,14 @@ use std::sync::{Arc, Mutex};
 use super::component::Component;
 use super::container::Container;
 use super::layout::{
-    extract_cursor_position, render_layout_frame, render_layout_frame_reusing_scroll_content,
-    LayoutFrame,
+    composite_tui_line, extract_cursor_position, render_layout_frame,
+    render_layout_frame_reusing_scroll_content, LayoutFrame,
 };
+use super::overlay::OverlayManager;
 use super::scroll_view::ScrollView;
-use super::tui::{OverlayHandle, OverlayOptions, TuiMode, TuiStopOptions, TUI};
+use super::tui::{
+    OverlayAnchor, OverlayHandle, OverlayOptions, SizeValue, TuiMode, TuiStopOptions, TUI,
+};
 use crate::ansi::{visible_width, CURSOR_MARKER};
 use crate::terminal::{InputEvent, Terminal, TerminalInfo};
 
@@ -27,7 +30,8 @@ pub struct TuiAltScreen {
     /// they race, an older frame can otherwise overwrite `previous_screen`
     /// after a newer frame has already reached the terminal.
     render_lock: Mutex<()>,
-    terminal: Mutex<Box<dyn Terminal>>,
+    terminal: Arc<Mutex<Box<dyn Terminal>>>,
+    terminal_proxy: TerminalProxy,
     container: Container,
     layout_root: Mutex<Option<Arc<dyn Component>>>,
     running: Arc<Mutex<bool>>,
@@ -51,6 +55,7 @@ pub struct TuiAltScreen {
     input_handler: Mutex<Option<Arc<dyn Fn(InputEvent) + Send + Sync>>>,
     #[allow(dead_code)]
     resize_handler: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    overlays: Arc<OverlayManager>,
 }
 
 impl TuiAltScreen {
@@ -60,9 +65,14 @@ impl TuiAltScreen {
         show_hardware_cursor: bool,
         _log_directory: Option<&str>,
     ) -> Self {
+        let terminal = Arc::new(Mutex::new(terminal));
+        let terminal_proxy = TerminalProxy {
+            terminal: terminal.clone(),
+        };
         Self {
             render_lock: Mutex::new(()),
-            terminal: Mutex::new(terminal),
+            terminal,
+            terminal_proxy,
             container: Container::new(),
             layout_root: Mutex::new(None),
             running: Arc::new(Mutex::new(false)),
@@ -81,6 +91,7 @@ impl TuiAltScreen {
             main_viewport_top: Mutex::new(0),
             input_handler: Mutex::new(None),
             resize_handler: Mutex::new(None),
+            overlays: Arc::new(OverlayManager::new()),
         }
     }
 
@@ -409,8 +420,9 @@ impl TuiAltScreen {
             *current = Some(frame.clone());
         }
 
-        // Get screen lines
-        let visible = frame.lines;
+        // Get screen lines and composite modal overlays above the layout.
+        let mut visible = frame.lines;
+        self.paint_overlays(&mut visible, width, height);
 
         // Check for full redraw
         let previous = self
@@ -465,6 +477,69 @@ impl TuiAltScreen {
             *prev = visible;
         }
     }
+
+    fn paint_overlays(&self, lines: &mut [String], width: usize, height: usize) {
+        for (component, options) in self.overlays.get_visible() {
+            if let Some(visible) = options.visible {
+                if !visible(width, height) {
+                    continue;
+                }
+            }
+            let mut overlay_lines = component.render(width);
+            if overlay_lines.is_empty() {
+                continue;
+            }
+            let natural_width = overlay_lines
+                .iter()
+                .map(|line| visible_width(line))
+                .max()
+                .unwrap_or(1);
+            let overlay_width = match options.width {
+                Some(SizeValue::Absolute(value)) => value,
+                Some(SizeValue::Percent(value)) => ((width as f64 * value).round() as usize).max(1),
+                None => natural_width,
+            }
+            .max(options.min_width.unwrap_or(0))
+            .min(width.max(1));
+            if let Some(max_height) = options.max_height.map(|value| match value {
+                SizeValue::Absolute(value) => value,
+                SizeValue::Percent(value) => ((height as f64 * value).round() as usize).max(1),
+            }) {
+                overlay_lines.truncate(max_height.max(1));
+            }
+            let overlay_height = overlay_lines.len().min(height.max(1));
+            let margin = options.margin.unwrap_or_default();
+            let x = match options.anchor {
+                OverlayAnchor::TopLeft | OverlayAnchor::LeftCenter | OverlayAnchor::BottomLeft => {
+                    margin.left
+                }
+                OverlayAnchor::TopRight
+                | OverlayAnchor::RightCenter
+                | OverlayAnchor::BottomRight => width.saturating_sub(overlay_width + margin.right),
+                _ => width.saturating_sub(overlay_width) / 2,
+            };
+            let y = match options.anchor {
+                OverlayAnchor::TopLeft | OverlayAnchor::TopCenter | OverlayAnchor::TopRight => {
+                    margin.top
+                }
+                OverlayAnchor::BottomLeft
+                | OverlayAnchor::BottomCenter
+                | OverlayAnchor::BottomRight => {
+                    height.saturating_sub(overlay_height + margin.bottom)
+                }
+                _ => height.saturating_sub(overlay_height) / 2,
+            };
+            let x = (x as i32 + options.offset_x).max(0) as usize;
+            let y = (y as i32 + options.offset_y).max(0) as usize;
+            for (index, line) in overlay_lines.iter().take(overlay_height).enumerate() {
+                let row = y + index;
+                if row >= lines.len() {
+                    break;
+                }
+                lines[row] = composite_tui_line(&lines[row], line, x, overlay_width, width);
+            }
+        }
+    }
 }
 
 impl Component for TuiAltScreen {
@@ -493,24 +568,20 @@ impl TUI for TuiAltScreen {
     }
 
     fn terminal(&self) -> &dyn Terminal {
-        // This trait method is problematic because we store Terminal in Mutex<Box<dyn Terminal>>
-        // We cannot return a reference through a Mutex guard.
-        // For now, we provide a stub that should not be called.
-        // Alternative: change the trait to not require this method, or use different storage.
-        // This is a known design issue - users should use the terminal through other methods.
-        static DUMMY: DummyTerminal = DummyTerminal;
-        &DUMMY
+        &self.terminal_proxy
     }
 
     fn children(&self) -> Vec<Arc<dyn Component>> {
-        Vec::new()
+        self.container.get_children()
     }
 
     fn add_child(&self, component: Arc<dyn Component>) {
         self.container.add_child(component);
     }
 
-    fn remove_child(&self, _component: &Arc<dyn Component>) {}
+    fn remove_child(&self, component: &Arc<dyn Component>) {
+        self.container.remove_child(component);
+    }
 
     fn clear(&self) {
         self.container.clear();
@@ -551,16 +622,25 @@ impl TUI for TuiAltScreen {
 
     fn show_overlay(
         &self,
-        _component: Arc<dyn Component>,
-        _options: Option<OverlayOptions>,
+        component: Arc<dyn Component>,
+        options: Option<OverlayOptions>,
     ) -> Arc<dyn OverlayHandle> {
-        Arc::new(DummyOverlayHandle)
+        let handle = self.overlays.add(component, options.unwrap_or_default());
+        self.request_render(false);
+        Arc::new(ManagedOverlayHandle {
+            handle,
+            hidden: Mutex::new(false),
+            focused: Mutex::new(true),
+        })
     }
 
-    fn hide_overlay(&self) {}
+    fn hide_overlay(&self) {
+        self.overlays.remove_topmost();
+        self.request_render(false);
+    }
 
     fn has_overlay(&self) -> bool {
-        false
+        !self.overlays.get_visible().is_empty()
     }
 
     fn start(&self) {
@@ -677,54 +757,129 @@ impl TuiAltScreen {
 
 /// Check if a TUI implements ViewportTUI.
 pub fn is_viewport_tui(_tui: &dyn TUI) -> bool {
-    // This would need proper implementation using Any
-    false
+    _tui.as_any().is::<TuiAltScreen>()
 }
 
-/// Dummy overlay handle for alternate screen.
-struct DummyOverlayHandle;
+struct ManagedOverlayHandle {
+    handle: super::overlay::OverlayHandle,
+    hidden: Mutex<bool>,
+    focused: Mutex<bool>,
+}
 
-impl OverlayHandle for DummyOverlayHandle {
-    fn hide(&self) {}
-    fn set_hidden(&self, _hidden: bool) {}
+impl OverlayHandle for ManagedOverlayHandle {
+    fn hide(&self) {
+        self.handle.hide();
+        if let Ok(mut hidden) = self.hidden.lock() {
+            *hidden = true;
+        }
+    }
+
+    fn set_hidden(&self, hidden: bool) {
+        self.handle.set_visible(!hidden);
+        if let Ok(mut current) = self.hidden.lock() {
+            *current = hidden;
+        }
+    }
+
     fn is_hidden(&self) -> bool {
-        false
+        self.hidden.lock().map(|hidden| *hidden).unwrap_or(true)
     }
-    fn focus(&self) {}
+
+    fn focus(&self) {
+        if let Ok(mut focused) = self.focused.lock() {
+            *focused = true;
+        }
+    }
+
     fn is_focused(&self) -> bool {
-        false
+        self.focused.lock().map(|focused| *focused).unwrap_or(false)
     }
 }
 
-/// Dummy terminal for the terminal() stub.
-struct DummyTerminal;
+/// Shared terminal proxy exposed through [`TUI::terminal`]. The TUI owns the
+/// terminal behind a mutex because render and input paths can run concurrently,
+/// while callers of the trait need a stable `&dyn Terminal` reference.
+struct TerminalProxy {
+    terminal: Arc<Mutex<Box<dyn Terminal>>>,
+}
 
-impl Terminal for DummyTerminal {
-    fn info(&self) -> TerminalInfo {
-        TerminalInfo::default()
+impl TerminalProxy {
+    fn with<R>(&self, f: impl FnOnce(&dyn Terminal) -> R) -> Option<R> {
+        self.terminal
+            .lock()
+            .ok()
+            .map(|terminal| f(terminal.as_ref()))
     }
-    fn write(&self, _data: &str) {}
-    fn hide_cursor(&self) {}
-    fn show_cursor(&self) {}
-    fn move_cursor(&self, _row: usize, _col: usize) {}
-    fn clear_screen(&self) {}
-    fn set_title(&self, _title: &str) {}
-    fn enable_mouse(&self) {}
-    fn disable_mouse(&self) {}
-    fn enter_raw_mode(&self) {}
-    fn refresh_size(&self) {}
+}
+
+impl Terminal for TerminalProxy {
+    fn info(&self) -> TerminalInfo {
+        self.with(|terminal| terminal.info()).unwrap_or_default()
+    }
+
+    fn write(&self, data: &str) {
+        let _ = self.with(|terminal| terminal.write(data));
+    }
+
+    fn hide_cursor(&self) {
+        let _ = self.with(|terminal| terminal.hide_cursor());
+    }
+
+    fn show_cursor(&self) {
+        let _ = self.with(|terminal| terminal.show_cursor());
+    }
+
+    fn move_cursor(&self, row: usize, col: usize) {
+        let _ = self.with(|terminal| terminal.move_cursor(row, col));
+    }
+
+    fn clear_screen(&self) {
+        let _ = self.with(|terminal| terminal.clear_screen());
+    }
+
+    fn set_title(&self, title: &str) {
+        let _ = self.with(|terminal| terminal.set_title(title));
+    }
+
+    fn enable_mouse(&self) {
+        let _ = self.with(|terminal| terminal.enable_mouse());
+    }
+
+    fn disable_mouse(&self) {
+        let _ = self.with(|terminal| terminal.disable_mouse());
+    }
+
+    fn enter_raw_mode(&self) {
+        let _ = self.with(|terminal| terminal.enter_raw_mode());
+    }
+
+    fn refresh_size(&self) {
+        let _ = self.with(|terminal| terminal.refresh_size());
+    }
+
     fn start(
         &self,
-        _on_input: Box<dyn Fn(InputEvent) + Send + Sync>,
-        _on_resize: Box<dyn Fn() + Send + Sync>,
+        on_input: Box<dyn Fn(InputEvent) + Send + Sync>,
+        on_resize: Box<dyn Fn() + Send + Sync>,
     ) {
+        let _ = self.with(|terminal| terminal.start(on_input, on_resize));
     }
-    fn stop(&self) {}
+
+    fn stop(&self) {
+        let _ = self.with(|terminal| terminal.stop());
+    }
+
     fn is_tty(&self) -> bool {
-        false
+        self.with(|terminal| terminal.is_tty()).unwrap_or(false)
     }
-    fn set_progress(&self, _active: bool) {}
-    fn flush(&self) {}
+
+    fn set_progress(&self, active: bool) {
+        let _ = self.with(|terminal| terminal.set_progress(active));
+    }
+
+    fn flush(&self) {
+        let _ = self.with(|terminal| terminal.flush());
+    }
 }
 
 #[cfg(test)]

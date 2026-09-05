@@ -707,7 +707,7 @@ mod tests {
         // Nested foreground resets must re-apply the panel background.
         assert!(rendered
             .iter()
-            .any(|line| line.matches("\x1b[48;5;22m").count() > 1));
+            .any(|line| line.matches("\x1b[48;2;38;48;52m").count() > 1));
     }
 
     #[test]

@@ -775,13 +775,19 @@ pub type RuntimeActionFn = extern "C" fn(
 // PluginApiVt — host-provided vtable of fn pointers the plugin calls
 // ---------------------------------------------------------------------------
 
-/// A generic command-handler fn (for `register_command`). `args_json` is
-/// borrowed input; `out` is owning output the plugin frees via host `free_string`.
+/// A generic command-handler fn (for `register_command`). `args_json` is a
+/// borrowed `{"args":"...","command":"/..."}` envelope; `out` is owning
+/// JSON output reclaimed with the host `free_string`. The TUI understands
+/// `{kind:"message",text}`, `{kind:"selector",items:[...]}`, and
+/// `{kind:"editor",initialText}` responses; selector/editor submissions call
+/// the same handler with an `action` field in `args`.
 pub type CommandHandlerFn =
     extern "C" fn(args_json: StbStringRef, out: *mut StbString, user_data: *mut c_void) -> i32;
 
 /// A render/transform fn (for the renderer registrars). `input_json` is borrowed;
-/// `out` is owning output the plugin frees via host `free_string`.
+/// `out` is owning output the plugin frees via host `free_string`. Markdown
+/// handlers return `{markdown:"..."}`; message/entry handlers return
+/// `{text:"...",markdown?:true}` or `{lines:["..."]}` for terminal UI.
 pub type RenderFn =
     extern "C" fn(input_json: StbStringRef, out: *mut StbString, user_data: *mut c_void) -> i32;
 
@@ -860,7 +866,8 @@ pub struct PluginApiVt {
 
     /// Register a message renderer. `plugin_free_string` reclaims the `out`
     /// [`StbString`] `render_fn` produces; `user_data` is passed back to it on
-    /// every render call. Nullable (B5c; TUI consumption deferred).
+    /// every render call. Nullable; interactive TUI consumption accepts the
+    /// host JSON component envelope (`text`/`lines`).
     pub register_message_renderer: Option<
         extern "C" fn(
             name: StbStringRef,
@@ -871,7 +878,8 @@ pub struct PluginApiVt {
     >,
 
     /// Register a markdown transformer. Same ownership shape as
-    /// `register_message_renderer`. Nullable (B5c; TUI wiring in B5e).
+    /// `register_message_renderer`. Nullable; markdown output is chained in
+    /// assistant rendering.
     pub register_markdown_transformer: Option<
         extern "C" fn(
             name: StbStringRef,
@@ -882,7 +890,8 @@ pub struct PluginApiVt {
     >,
 
     /// Register an entry renderer. Same ownership shape as
-    /// `register_message_renderer`. Nullable (B5c; TUI consumption deferred).
+    /// `register_message_renderer`. Nullable; interactive TUI consumption
+    /// accepts the host JSON component envelope (`text`/`lines`).
     pub register_entry_renderer: Option<
         extern "C" fn(
             name: StbStringRef,

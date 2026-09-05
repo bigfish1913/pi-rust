@@ -24,9 +24,9 @@
 //!   divergence from the TS `rg`/`fd` shell-out; see `docs/m4-tools-open-questions.md`).
 //! - **Session restore (`-c`/`-r`/`--session`)** is *partially* supported: a
 //!   fresh session is always created. The harness's `create` rejects sessions
-//!   that already have records (restore not implemented — M5f divergence #3),
-//!   so `-c`/`-r`/`--session` currently surface a clear "not implemented"
-//!   message rather than silently starting fresh. See [`SessionSelection`].
+//!   that already have records unless `allow_existing_session` is enabled.
+//!   The interactive `-c`/`-r`/`--session` paths enable that mode and replay
+//!   the existing branch before appending new messages. See [`SessionSelection`].
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -994,14 +994,9 @@ fn build_models_with_extensions_for_reload(
     models
 }
 
-/// B5e: diagnostic for the deferred TUI renderers. `register_message_renderer`
-/// + `register_entry_renderer` (B5c) are recorded + exposed in the registry but
-/// their TUI consumption is deferred (the plan's B5e v1 wires ONLY
-/// `register_markdown_transformer` into the render path); a plugin that
-/// registers a message/entry renderer gets a one-line stderr note under
-/// `--verbose` so the author knows the registration landed but isn't driving
-/// the UI yet. `register_markdown_transformer` handlers ARE wired (B5e) — they
-/// are counted separately as "active".
+/// Diagnostic for registered TUI renderers. All three renderer kinds are
+/// consumed by the interactive TUI's JSON component adapter; this line remains
+/// useful under `--verbose` for extension authors.
 fn report_deferred_renderers(session: &ExtensionSession) {
     let Some(snap) = session.snapshot_arc() else {
         return;
@@ -1023,7 +1018,7 @@ fn report_deferred_renderers(session: &ExtensionSession) {
         return;
     }
     eprintln!(
-        "renderers: {} markdown-transform (active), {} message-render (deferred), {} entry-render (deferred)",
+        "renderers: {} markdown-transform, {} message-render, {} entry-render (active)",
         markdown, message, entry
     );
 }

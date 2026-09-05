@@ -8,7 +8,11 @@ use std::sync::{Arc, Mutex};
 
 use super::component::Component;
 use super::container::Container;
+use super::layout::composite_tui_line;
+use super::overlay::OverlayManager;
+use super::tui::{OverlayAnchor, SizeValue};
 use super::tui::{OverlayHandle, OverlayOptions, TuiMode, TuiStopOptions, TUI};
+use crate::ansi::visible_width;
 use crate::terminal::Terminal;
 
 /// Main screen TUI that uses terminal scrollback for scrolling.
@@ -20,6 +24,7 @@ pub struct TuiMainScreen {
     clear_on_shrink: Mutex<bool>,
     focused: Mutex<Option<Arc<dyn Component>>>,
     full_redraw_count: Mutex<usize>,
+    overlays: Arc<OverlayManager>,
 }
 
 impl TuiMainScreen {
@@ -37,6 +42,7 @@ impl TuiMainScreen {
             clear_on_shrink: Mutex::new(false),
             focused: Mutex::new(None),
             full_redraw_count: Mutex::new(0),
+            overlays: Arc::new(OverlayManager::new()),
         }
     }
 }
@@ -65,16 +71,15 @@ impl TUI for TuiMainScreen {
     }
 
     fn children(&self) -> Vec<Arc<dyn Component>> {
-        // Container doesn't expose children directly, return empty for now
-        Vec::new()
+        self.container.get_children()
     }
 
     fn add_child(&self, component: Arc<dyn Component>) {
         self.container.add_child(component);
     }
 
-    fn remove_child(&self, _component: &Arc<dyn Component>) {
-        // Container doesn't support this yet
+    fn remove_child(&self, component: &Arc<dyn Component>) {
+        self.container.remove_child(component);
     }
 
     fn clear(&self) {
@@ -116,19 +121,25 @@ impl TUI for TuiMainScreen {
 
     fn show_overlay(
         &self,
-        _component: Arc<dyn Component>,
-        _options: Option<OverlayOptions>,
+        component: Arc<dyn Component>,
+        options: Option<OverlayOptions>,
     ) -> Arc<dyn OverlayHandle> {
-        // Main screen doesn't support overlays in the same way
-        Arc::new(DummyOverlayHandle)
+        let handle = self.overlays.add(component, options.unwrap_or_default());
+        self.request_render(false);
+        Arc::new(ManagedOverlayHandle {
+            handle,
+            hidden: Mutex::new(false),
+            focused: Mutex::new(true),
+        })
     }
 
     fn hide_overlay(&self) {
-        // No-op for main screen
+        self.overlays.remove_topmost();
+        self.request_render(false);
     }
 
     fn has_overlay(&self) -> bool {
-        false
+        !self.overlays.get_visible().is_empty()
     }
 
     fn start(&self) {
@@ -157,13 +168,17 @@ impl TUI for TuiMainScreen {
         let width = self.terminal.columns();
         let lines = self.render(width);
 
-        // Write each line to terminal
+        // Write the base transcript first. A trailing newline leaves the cursor
+        // one row below it, which lets the temporary overlay be painted with
+        // relative cursor movement without turning it into scrollback content.
         for (i, line) in lines.iter().enumerate() {
             if i > 0 {
                 self.terminal.write("\r\n");
             }
             self.terminal.write(line);
         }
+
+        self.paint_overlays(&lines, width);
 
         self.terminal.flush();
     }
@@ -178,17 +193,127 @@ impl TUI for TuiMainScreen {
     }
 }
 
-/// Dummy overlay handle for main screen.
-struct DummyOverlayHandle;
+impl TuiMainScreen {
+    fn paint_overlays(&self, base_lines: &[String], width: usize) {
+        let height = self.terminal.rows().max(1);
+        let overlays = self.overlays.get_visible();
+        if overlays.is_empty() || base_lines.is_empty() {
+            return;
+        }
 
-impl OverlayHandle for DummyOverlayHandle {
-    fn hide(&self) {}
-    fn set_hidden(&self, _hidden: bool) {}
-    fn is_hidden(&self) -> bool {
-        false
+        // Move from the cursor at the end of the base output back to its first
+        // row, paint each overlay in place, then restore the cursor. The next
+        // regular render appends fresh transcript output and naturally replaces
+        // the temporary visual layer.
+        let base_height = base_lines.len().min(height);
+        self.terminal.write("\r\n");
+        self.terminal.write(&format!("\x1b[{}A\x1b[s", base_height));
+
+        for (component, options) in overlays {
+            if let Some(visible) = options.visible {
+                if !visible(width, height) {
+                    continue;
+                }
+            }
+            let mut overlay_lines = component.render(width);
+            if overlay_lines.is_empty() {
+                continue;
+            }
+            let natural_width = overlay_lines
+                .iter()
+                .map(|line| visible_width(line))
+                .max()
+                .unwrap_or(1);
+            let overlay_width = match options.width {
+                Some(SizeValue::Absolute(value)) => value,
+                Some(SizeValue::Percent(value)) => ((width as f64 * value).round() as usize).max(1),
+                None => natural_width,
+            }
+            .max(options.min_width.unwrap_or(0))
+            .min(width.max(1));
+            if let Some(max_height) = options.max_height.map(|value| match value {
+                SizeValue::Absolute(value) => value,
+                SizeValue::Percent(value) => ((height as f64 * value).round() as usize).max(1),
+            }) {
+                overlay_lines.truncate(max_height.max(1));
+            }
+            let overlay_height = overlay_lines.len().min(height);
+            let margin = options.margin.unwrap_or_default();
+            let x = match options.anchor {
+                OverlayAnchor::TopLeft | OverlayAnchor::LeftCenter | OverlayAnchor::BottomLeft => {
+                    margin.left
+                }
+                OverlayAnchor::TopRight
+                | OverlayAnchor::RightCenter
+                | OverlayAnchor::BottomRight => width.saturating_sub(overlay_width + margin.right),
+                _ => width.saturating_sub(overlay_width) / 2,
+            };
+            let y = match options.anchor {
+                OverlayAnchor::TopLeft | OverlayAnchor::TopCenter | OverlayAnchor::TopRight => {
+                    margin.top
+                }
+                OverlayAnchor::BottomLeft
+                | OverlayAnchor::BottomCenter
+                | OverlayAnchor::BottomRight => {
+                    height.saturating_sub(overlay_height + margin.bottom)
+                }
+                _ => height.saturating_sub(overlay_height) / 2,
+            };
+            let x = (x as i32 + options.offset_x).max(0) as usize;
+            let y = (y as i32 + options.offset_y).max(0) as usize;
+
+            if y >= height {
+                continue;
+            }
+            // Restore the first base row before positioning each overlay so
+            // multiple overlays retain their z-order and anchor independently.
+            self.terminal.write("\x1b[u");
+            self.terminal.write(&format!("\x1b[{}B", y));
+            for (index, line) in overlay_lines.iter().take(overlay_height).enumerate() {
+                if index > 0 {
+                    self.terminal.write("\x1b[1B");
+                }
+                let row = y + index;
+                let base_line = base_lines.get(row).map(String::as_str).unwrap_or("");
+                let composite = composite_tui_line(base_line, line, x, overlay_width, width);
+                self.terminal.write("\r");
+                self.terminal.write(&composite);
+            }
+        }
+        // Return the cursor to the append position below the base transcript.
+        self.terminal.write("\x1b[u");
+        self.terminal.write(&format!("\x1b[{}B", base_height));
     }
-    fn focus(&self) {}
+}
+
+struct ManagedOverlayHandle {
+    handle: super::overlay::OverlayHandle,
+    hidden: Mutex<bool>,
+    focused: Mutex<bool>,
+}
+
+impl OverlayHandle for ManagedOverlayHandle {
+    fn hide(&self) {
+        self.handle.hide();
+        if let Ok(mut hidden) = self.hidden.lock() {
+            *hidden = true;
+        }
+    }
+    fn set_hidden(&self, hidden: bool) {
+        self.handle.set_visible(!hidden);
+        if let Ok(mut current) = self.hidden.lock() {
+            *current = hidden;
+        }
+    }
+    fn is_hidden(&self) -> bool {
+        self.hidden.lock().map(|hidden| *hidden).unwrap_or(true)
+    }
+    fn focus(&self) {
+        if let Ok(mut focused) = self.focused.lock() {
+            *focused = true;
+        }
+    }
     fn is_focused(&self) -> bool {
-        false
+        self.focused.lock().map(|focused| *focused).unwrap_or(false)
     }
 }

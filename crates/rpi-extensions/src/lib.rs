@@ -217,9 +217,8 @@ impl HostApi {
     ///
     /// Every optional registrar slot currently resolves to a real `extern "C"`
     /// trampoline that forwards into `self`'s registry (so a plugin that calls
-    /// `register_tool` / `register_event_handler` now sees its registration
-    /// land). Slots the host genuinely cannot wire yet are `None` (renderer
-    /// registrars — B5 TUI; `register_provider` — B4). `runtime_action` resolves
+    /// `register_tool` / `register_command` / renderer registration now sees
+    /// its registration land). `runtime_action` resolves
     /// to the real [`trampoline_runtime_action`] when a bridge is present (B5a),
     /// else the stub returning `-1` (v1).
     ///
@@ -377,7 +376,7 @@ extern "C" fn trampoline_register_tool(
 extern "C" fn trampoline_register_command(
     name: StbStringRef,
     description: StbStringRef,
-    _handler: rpi_plugin_sdk::CommandHandlerFn,
+    handler: rpi_plugin_sdk::CommandHandlerFn,
 ) -> i32 {
     if !current_api_present() {
         return -1;
@@ -386,7 +385,12 @@ extern "C" fn trampoline_register_command(
     let (name, description) =
         unsafe { (name.as_str().to_string(), description.as_str().to_string()) };
     let ok = with_current_api(|api| {
-        match api.with_registry(|reg| reg.register_command(name, description)) {
+        // The v1 command ABI predates an explicit context parameter. Keep a
+        // null context for compatibility; plugins that need host state can use
+        // `runtime_action` from their command callback.
+        match api.with_registry(|reg| {
+            reg.register_command(name, description, handler, std::ptr::null_mut())
+        }) {
             Some(_) => true,
             None => false,
         }

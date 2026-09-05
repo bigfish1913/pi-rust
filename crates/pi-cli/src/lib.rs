@@ -29,14 +29,11 @@
 //!
 //! # What is NOT ported (deferred — tracked in `docs/m6-cli-open-questions.md`)
 //!
-//! The TS `coding-agent` is a large, full-featured product. v1 deliberately
-//! scopes to a minimal-but-real CLI exercising the Rust harness end-to-end:
-//! no TUI (`modes/interactive`), no extension system, no package manager
-//! (`install`/`remove`/`update`/`config`), no OAuth/Copilot auth, no HTML
-//! export, no skills/prompt-template/theme discovery, no model cycling
-//! (`--models`), no `--fork`/`--export`/`--list-models`. The library APIs for
-//! many of these (skills, prompt templates, compaction, JSONL session fork)
-//! already exist; wiring them is future work.
+//! The TS `coding-agent` is a large, full-featured product. The current Rust
+//! CLI includes the interactive TUI, extension loading, skills and prompt
+//! templates, compaction, session fork/export, and lane-aware harness runs.
+//! Package management, OAuth/Copilot auth, HTML export, and full model cycling
+//! remain outside the current implementation.
 //!
 //! [`packages/coding-agent/src/cli.ts`]: ../../.reference/pi/packages/coding-agent/src/cli.ts
 //! [`main.ts`]: ../../.reference/pi/packages/coding-agent/src/main.ts

@@ -138,9 +138,12 @@ impl Default for ThemeColors {
             md_list_bullet: Color::Ansi256(108), // accent
 
             // Tool blocks
-            tool_pending_bg: Color::Ansi256(235), // (#282832) ≈ 235
-            tool_success_bg: Color::Ansi256(22),  // dark-green (#283228) ≈ 22
-            tool_error_bg: Color::Ansi256(52),    // dark-red (#3c2828) ≈ 52
+            // Keep status backgrounds close to the terminal surface. Status is
+            // communicated by the icon/foreground; a full saturated green
+            // panel makes successful tools dominate the transcript.
+            tool_pending_bg: Color::Rgb(40, 44, 52),
+            tool_success_bg: Color::Rgb(38, 48, 52), // subtle blue/teal tint
+            tool_error_bg: Color::Rgb(55, 40, 45),   // subtle red tint
             tool_title: Color::Default,
             tool_output: Color::Ansi256(244),
             bash_mode: Color::Ansi256(107), // green
