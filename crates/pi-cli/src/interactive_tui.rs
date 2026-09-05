@@ -34,7 +34,7 @@ use rpi_agent::{AgentEvent, AgentMessage};
 use rpi_ai::types::{AssistantMessage, Content};
 use rpi_harness::agent_harness::{AgentHarness, AgentLane, HarnessRunOutcome};
 use rpi_harness::session::types::{Entry, EntryQuery};
-use rpi_tui::scroll_view::OverscrollMode;
+use rpi_tui::scroll_view::{OverscrollMode, ScrollbarMode};
 #[cfg(test)]
 use rpi_tui::strip_ansi;
 use rpi_tui::{
@@ -1844,6 +1844,15 @@ async fn render_session_history(
 /// they're rendered by their own components in the transcript. This keeps the
 /// thinking blocks visible in the TUI (they previously vanished because the
 /// stream path only fed the concatenated *text* into the component).
+/// Whether startup intentionally opened a session that already has history.
+fn launch_restores_history(args: &Args) -> bool {
+    args.continue_session
+        || args.resume
+        || args.session.is_some()
+        || args.session_id.is_some()
+        || args.fork.is_some()
+}
+
 fn assistant_blocks(msg: &AssistantMessage) -> Vec<AssistantBlock> {
     msg.content
         .iter()
@@ -1992,6 +2001,11 @@ const CACHE_MISS_MIN_INPUT_TOKENS: i64 = 20_000;
 /// Keep a few rows of overlap so page scrolling preserves visual context,
 /// matching the upstream fullscreen viewport behavior.
 const PAGE_SCROLL_OVERLAP: usize = 4;
+
+/// Native pi scrolls a small chunk for each wheel notch rather than moving the
+/// transcript one physical row at a time. Three lines stays precise while
+/// avoiding the sluggish feel of the previous implementation.
+const MOUSE_WHEEL_SCROLL_LINES: i32 = 3;
 
 fn transcript_page_size(viewport_height: usize) -> i32 {
     viewport_height
@@ -2278,7 +2292,12 @@ pub async fn interactive_tui(
             .unwrap()
             .snapshot_arc(),
     );
-    render_session_history(&harness, &chat_container, initial_transformer.clone()).await;
+    // A normal launch creates a fresh session and must not replay records from
+    // another/project harness. Only explicit restore/fork modes render prior
+    // conversation history. This fixes stale prompts appearing every startup.
+    if launch_restores_history(args) {
+        render_session_history(&harness, &chat_container, initial_transformer.clone()).await;
+    }
 
     // `document_container` wraps the welcome header + chat so the scrollview
     // follows the whole transcript (mirrors TS `documentContainer`).
@@ -2291,6 +2310,10 @@ pub async fn interactive_tui(
             follow: FollowMode::End,
             primary: true,
             overscroll: OverscrollMode::Chain,
+            // Native pi keeps transcript chrome out of the way. Our Auto mode
+            // has no hide timer yet and therefore became effectively permanent
+            // after the first wheel event, unlike the upstream experience.
+            scrollbar: ScrollbarMode::Hidden,
             ..Default::default()
         },
     ));
@@ -2404,9 +2427,9 @@ pub async fn interactive_tui(
     // The scrollview gets `basis(0)` so the constrained stack allocator starts
     // it at zero height and grows it to fill the space the dock does not need
     // — this keeps the dock (editor borders + footer) pinned to the bottom and
-    // never shrinks it below the editor's 3 rows (top border + content + bottom
-    // border). The editor_container is `shrink(0).min_size(3)` so a tall
-    // transcript can never clip the bordered editor below its minimum.
+    // never shrinks it below the editor's 3 rows (top + content + bottom). The
+    // editor_container is `shrink(0).min_size(3)` so a tall transcript can
+    // never clip the input panel below its minimum.
     let editor_container = Arc::new(Container::new());
     editor_container.add_child(editor.clone());
 
@@ -2608,12 +2631,14 @@ pub async fn interactive_tui(
                 use crossterm::event::MouseEventKind;
                 match m.kind {
                     MouseEventKind::ScrollUp => {
-                        if scroll_for_key.scroll_by(-1) != -1 {
+                        let delta = -MOUSE_WHEEL_SCROLL_LINES;
+                        if scroll_for_key.scroll_by(delta) != delta {
                             tui_for_key.request_render_reusing_scroll_content();
                         }
                     }
                     MouseEventKind::ScrollDown => {
-                        if scroll_for_key.scroll_by(1) != 1 {
+                        let delta = MOUSE_WHEEL_SCROLL_LINES;
+                        if scroll_for_key.scroll_by(delta) != delta {
                             tui_for_key.request_render_reusing_scroll_content();
                         }
                     }
@@ -4947,6 +4972,24 @@ mod tests {
         state.set_status(RunStatus::Aborting);
         assert_eq!(state.status_container.child_count(), 0);
         assert!(!state.loader.is_running());
+    }
+
+    #[test]
+    fn fresh_launch_does_not_restore_old_history() {
+        let fresh = Args::default();
+        assert!(!launch_restores_history(&fresh));
+
+        let continued = Args {
+            continue_session: true,
+            ..Args::default()
+        };
+        assert!(launch_restores_history(&continued));
+
+        let selected = Args {
+            session: Some("session-id".into()),
+            ..Args::default()
+        };
+        assert!(launch_restores_history(&selected));
     }
 
     #[test]

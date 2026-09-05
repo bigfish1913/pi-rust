@@ -5,11 +5,10 @@
 //!
 //! The TS footer is a two-line status bar: a dim `pwd (branch)` line then a
 //! stats line with the model right-aligned. Our Rust host carries less session
-//! state (no pwd/token/cost aggregation here), so this is a **styled
-//! single-row** version: a thin theme-colored separator border, then
-//! `[model]` in accent brackets, a status word colored by run state, and the
-//! keybinding hints dimmed on the right. The model is right-aligned to mirror
-//! pi's layout; an optional thinking-level suffix (pi shows
+//! state (no pwd/token/cost aggregation here), so this is a compact single-row
+//! version with `[model]`, status, and dimmed keybinding hints. The editor's own
+//! bottom edge provides separation, so the footer adds no duplicate rule. The
+//! model is right-aligned to mirror pi's layout; an optional thinking-level suffix (pi shows
 //! `model • thinking off`) follows the model when set.
 
 use std::any::Any;
@@ -110,11 +109,8 @@ impl Component for FooterComponent {
         let hints = self.hints.lock().unwrap();
         let thinking_level = self.thinking_level.lock().unwrap();
 
-        // Line 1 — a thin themed separator border (visual separation from the
-        // editor/input area above, matching pi's footer weight).
-        let sep = colors.border_muted.fg(&"─".repeat(width.max(1)));
-
-        // Line 2 — the status row. Left side: `[model]` in accent brackets
+        // Status row. The editor already has a bottom edge, so the footer does
+        // not draw another horizontal separator below it.
         // (dim model name inside) + a status word colored by run state.
         // Right side: the keybinding hints, dimmed. Right-aligned to mirror
         // pi's model-on-the-right layout.
@@ -172,7 +168,7 @@ impl Component for FooterComponent {
             }
         };
 
-        vec![sep, row]
+        vec![row]
     }
 
     fn invalidate(&self) {
@@ -193,9 +189,8 @@ mod tests {
     fn test_footer_basic() {
         let footer = FooterComponent::new();
         let lines = footer.render(80);
-        // Separator + status row.
-        assert_eq!(lines.len(), 2);
-        assert!(strip_ansi(&lines[1]).contains("Ctrl+C"));
+        assert_eq!(lines.len(), 1);
+        assert!(strip_ansi(&lines[0]).contains("Ctrl+C"));
     }
 
     #[test]
@@ -205,7 +200,7 @@ mod tests {
         footer.set_model("claude-sonnet-5");
 
         let lines = footer.render(80);
-        let row = strip_ansi(&lines[1]);
+        let row = strip_ansi(&lines[0]);
         assert!(row.contains("Working…"));
         assert!(row.contains("claude-sonnet-5"));
     }
@@ -218,12 +213,10 @@ mod tests {
         footer.set_hints("Ctrl+C: Exit | Shift+Enter: Send | Ctrl+L: Clear | More hints here");
 
         let lines = footer.render(40);
-        // The status row (index 1) must respect the width budget; the
-        // separator (index 0) is exactly width — both <= 40.
         assert!(
-            visible_width(&lines[1]) <= 40,
+            visible_width(&lines[0]) <= 40,
             "row too wide: {}",
-            visible_width(&lines[1])
+            visible_width(&lines[0])
         );
     }
 
@@ -232,7 +225,7 @@ mod tests {
         let footer = FooterComponent::new();
         footer.set_model("test-model");
         footer.set_thinking_level(Some("medium"));
-        let row = strip_ansi(&footer.render(80)[1]);
+        let row = strip_ansi(&footer.render(80)[0]);
         assert!(row.contains("test-model • medium"), "suffix missing: {row}");
     }
 }

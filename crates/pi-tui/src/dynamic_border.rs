@@ -8,13 +8,14 @@
 use std::any::Any;
 
 use super::component::Component;
+use crate::ansi::dim;
 use crate::theme::{theme, Color};
 
 /// A single-row horizontal rule (`─` repeated to `width`) in a chosen color.
 ///
-/// `None` resolves to the global [`theme`] border color at render time; pass a
-/// fixed [`Color`] for components that must color the border independently of
-/// the current theme (mirrors the TS extension-safety caveat).
+/// `None` resolves to the low-contrast `border_muted` theme token and is also
+/// rendered faint, so command separators never compete with the editor border.
+/// Explicit colors remain full strength for intentional accent components.
 pub struct DynamicBorder {
     color: Option<Color>,
 }
@@ -39,9 +40,12 @@ impl Default for DynamicBorder {
 
 impl Component for DynamicBorder {
     fn render(&self, width: usize) -> Vec<String> {
-        let color = self.color.unwrap_or_else(|| theme().colors.border);
-        // `width.max(1)` — the TS original guards against 0-width viewports.
-        vec![color.fg(&"─".repeat(width.max(1)))]
+        let rule = "─".repeat(width.max(1));
+        let rendered = match self.color {
+            Some(color) => color.fg(&rule),
+            None => dim(&theme().colors.border_muted.fg(&rule)),
+        };
+        vec![rendered]
     }
 
     fn invalidate(&self) {
@@ -63,8 +67,9 @@ mod tests {
         let border = DynamicBorder::new();
         let lines = border.render(40);
         assert_eq!(lines.len(), 1);
-        // Visible width (ignoring ANSI) should match the requested width.
+        // Visible width is stable and default separators are deliberately faint.
         assert_eq!(visible_width(&lines[0]), 40);
+        assert!(lines[0].contains("\x1b[2m"));
     }
 
     #[test]

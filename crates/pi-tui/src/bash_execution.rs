@@ -201,9 +201,9 @@ impl Component for BashExecutionComponent {
         let colors = theme().colors;
         let mut lines: Vec<String> = Vec::new();
 
-        // Spacer + top border
+        // Spacer + a faint command separator (distinct from the editor border).
         lines.extend(Spacer::new(1).render(width));
-        lines.extend(DynamicBorder::with_color(colors.border).render(width));
+        lines.extend(DynamicBorder::new().render(width));
 
         // Command header: "$ {command}" in accent.
         let command = self.command.lock().unwrap().clone();
@@ -259,8 +259,8 @@ impl Component for BashExecutionComponent {
             }
         }
 
-        // Bottom border
-        lines.extend(DynamicBorder::with_color(colors.border).render(width));
+        // Bottom command separator uses the same muted hierarchy.
+        lines.extend(DynamicBorder::new().render(width));
         lines
     }
 

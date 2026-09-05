@@ -56,8 +56,13 @@ pub struct ThemeColors {
     pub md_link_url: Color,
     /// Inline `code` color (pi `mdCode`).
     pub md_code: Color,
+    /// Subtle inline-code background. This Rust extension keeps code readable
+    /// without applying a card background to the whole assistant message.
+    pub md_code_bg: Color,
     /// Code-block body color (pi `mdCodeBlock`).
     pub md_code_block: Color,
+    /// Low-contrast code-block surface (One Dark inspired).
+    pub md_code_block_bg: Color,
     /// Code-block fence/border color (pi `mdCodeBlockBorder`).
     pub md_code_block_border: Color,
     /// Blockquote body color (pi `mdQuote`).
@@ -122,8 +127,10 @@ impl Default for ThemeColors {
             md_heading: Color::Ansi256(179),  // gold (#f0c674) ≈ 179
             md_link: Color::Ansi256(110),     // blue (#81a2be) ≈ 110
             md_link_url: Color::Ansi256(242), // dimGray
-            md_code: Color::Ansi256(108),     // accent teal
-            md_code_block: Color::Ansi256(107), // green (#b5bd68) ≈ 107
+            md_code: Color::Rgb(138, 190, 183), // native pi accent #8abeb7
+            md_code_bg: Color::Rgb(48, 52, 59), // subtle inline chip
+            md_code_block: Color::Rgb(212, 212, 212), // neutral code text
+            md_code_block_bg: Color::Rgb(40, 44, 52), // One Dark #282c34
             md_code_block_border: Color::Ansi256(244), // gray
             md_quote: Color::Ansi256(244),    // gray
             md_quote_border: Color::Ansi256(244),
@@ -354,8 +361,10 @@ fn theme_for_preset(preset: ThemePreset) -> Theme {
             colors.md_heading = Color::Ansi256(136); // yellow
             colors.md_link = Color::Ansi256(67); // blue
             colors.md_link_url = Color::Ansi256(243);
-            colors.md_code = Color::Ansi256(66); // teal
-            colors.md_code_block = Color::Ansi256(65); // green
+            colors.md_code = Color::Rgb(90, 128, 128); // native light teal
+            colors.md_code_bg = Color::Rgb(232, 234, 237);
+            colors.md_code_block = Color::Rgb(31, 35, 40);
+            colors.md_code_block_bg = Color::Rgb(246, 248, 250); // GitHub light code
             colors.md_code_block_border = Color::Ansi256(241);
             colors.md_quote = Color::Ansi256(241);
             colors.md_quote_border = Color::Ansi256(241);
@@ -401,7 +410,9 @@ fn theme_for_preset(preset: ThemePreset) -> Theme {
             colors.md_heading = Color::Ansi256(15);
             colors.md_link = Color::Ansi256(15);
             colors.md_link_url = Color::Ansi256(242);
+            colors.md_code_bg = Color::Ansi256(237);
             colors.md_code_block = Color::Ansi256(15);
+            colors.md_code_block_bg = Color::Ansi256(235);
             colors.md_code_block_border = Color::Ansi256(244);
             colors.md_quote = Color::Ansi256(244);
             colors.md_quote_border = Color::Ansi256(244);

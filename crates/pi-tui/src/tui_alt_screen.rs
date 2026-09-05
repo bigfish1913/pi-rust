@@ -14,6 +14,7 @@ use super::layout::{
 };
 use super::scroll_view::ScrollView;
 use super::tui::{OverlayHandle, OverlayOptions, TuiMode, TuiStopOptions, TUI};
+use crate::ansi::{visible_width, CURSOR_MARKER};
 use crate::terminal::{InputEvent, Terminal, TerminalInfo};
 
 /// Symbol for ViewportTUI capability check.
@@ -38,6 +39,13 @@ pub struct TuiAltScreen {
     scroll_top: Mutex<usize>,
     stick_to_bottom: Mutex<bool>,
     current_frame: Mutex<Option<LayoutFrame>>,
+    /// When true, render into the terminal's main buffer and let the terminal
+    /// own scrollback (native pi's default `regular` mode).
+    main_screen_mode: Mutex<bool>,
+    main_previous_width: Mutex<usize>,
+    main_previous_height: Mutex<usize>,
+    main_hardware_row: Mutex<usize>,
+    main_viewport_top: Mutex<usize>,
     // Input handlers
     #[allow(dead_code)]
     input_handler: Mutex<Option<Arc<dyn Fn(InputEvent) + Send + Sync>>>,
@@ -66,9 +74,29 @@ impl TuiAltScreen {
             scroll_top: Mutex::new(0),
             stick_to_bottom: Mutex::new(true),
             current_frame: Mutex::new(None),
+            main_screen_mode: Mutex::new(false),
+            main_previous_width: Mutex::new(0),
+            main_previous_height: Mutex::new(0),
+            main_hardware_row: Mutex::new(0),
+            main_viewport_top: Mutex::new(0),
             input_handler: Mutex::new(None),
             resize_handler: Mutex::new(None),
         }
+    }
+
+    /// Use the terminal's main screen and native scrollback instead of the
+    /// constrained alternate-screen viewport. Must be set before start.
+    pub fn set_main_screen_mode(&self, enabled: bool) {
+        if !self.is_running() {
+            *self.main_screen_mode.lock().unwrap() = enabled;
+        }
+    }
+
+    fn uses_main_screen(&self) -> bool {
+        self.main_screen_mode
+            .lock()
+            .map(|mode| *mode)
+            .unwrap_or(false)
     }
 
     /// Set the layout root component.
@@ -177,10 +205,13 @@ impl TuiAltScreen {
         if let Ok(terminal) = self.terminal.lock() {
             terminal.refresh_size();
         }
-        // Drop the previous screen so `do_render` treats the next frame as a
-        // full redraw (repaints every row at the new size).
-        if let Ok(mut prev) = self.previous_screen.lock() {
-            prev.clear();
+        // Alt-screen frames need every viewport row repainted. Main-screen mode
+        // keeps the previous document so its renderer can detect width changes
+        // and deliberately rebuild terminal scrollback once.
+        if !self.uses_main_screen() {
+            if let Ok(mut prev) = self.previous_screen.lock() {
+                prev.clear();
+            }
         }
         self.request_render(false);
     }
@@ -213,8 +244,144 @@ impl TuiAltScreen {
         }
     }
 
+    /// Render the complete component tree into the main terminal buffer. This
+    /// follows native pi's regular-mode strategy: append growth with CRLF so
+    /// the terminal creates real scrollback, and rewrite only the changed tail.
+    fn do_render_main_screen(&self) {
+        let Ok(_render_guard) = self.render_lock.lock() else {
+            return;
+        };
+        let Ok(terminal) = self.terminal.lock() else {
+            return;
+        };
+        let width = terminal.columns();
+        let height = terminal.rows();
+        let root: Arc<dyn Component> = self
+            .get_layout_root()
+            .unwrap_or_else(|| Arc::new(self.container.clone()));
+        let raw_lines = root.render(width);
+        let cursor = raw_lines.iter().enumerate().rev().find_map(|(row, line)| {
+            line.find(CURSOR_MARKER)
+                .map(|idx| (row, visible_width(&line[..idx])))
+        });
+        let lines: Vec<String> = raw_lines
+            .into_iter()
+            .map(|line| line.replace(CURSOR_MARKER, ""))
+            .collect();
+        let previous = self
+            .previous_screen
+            .lock()
+            .map(|p| p.clone())
+            .unwrap_or_default();
+        let previous_width = *self.main_previous_width.lock().unwrap();
+        let previous_height = *self.main_previous_height.lock().unwrap();
+
+        // Width changes alter wrapping everywhere; redraw the document. Normal
+        // streaming updates stay incremental and preserve terminal scrollback.
+        if previous_width != 0 && previous_width != width {
+            terminal.write("\x1b[2J\x1b[H\x1b[3J");
+            terminal.write("\x1b[?2026h");
+            terminal.write(&lines.join("\r\n"));
+            terminal.write("\x1b[?2026l");
+            *self.main_hardware_row.lock().unwrap() = lines.len().saturating_sub(1);
+            *self.main_viewport_top.lock().unwrap() = lines.len().saturating_sub(height);
+        } else if previous.is_empty() {
+            terminal.write("\x1b[?2026h");
+            terminal.write(&lines.join("\r\n"));
+            terminal.write("\x1b[?2026l");
+            *self.main_hardware_row.lock().unwrap() = lines.len().saturating_sub(1);
+            *self.main_viewport_top.lock().unwrap() = lines.len().saturating_sub(height);
+        } else {
+            let mut first_changed = None;
+            let max = previous.len().max(lines.len());
+            for index in 0..max {
+                if previous.get(index) != lines.get(index) {
+                    first_changed = Some(index);
+                    break;
+                }
+            }
+            if let Some(first) = first_changed {
+                let mut hardware_row = *self.main_hardware_row.lock().unwrap();
+                let mut viewport_top = *self.main_viewport_top.lock().unwrap();
+                let viewport_bottom = viewport_top + height.saturating_sub(1);
+                let move_target = if first == previous.len() && first > 0 {
+                    first - 1
+                } else {
+                    first
+                };
+                let mut output = String::from("\x1b[?2026h");
+                if move_target > viewport_bottom {
+                    let current_screen = hardware_row
+                        .saturating_sub(viewport_top)
+                        .min(height.saturating_sub(1));
+                    let down = height.saturating_sub(1).saturating_sub(current_screen);
+                    if down > 0 {
+                        output.push_str(&format!("\x1b[{down}B"));
+                    }
+                    let scroll = move_target - viewport_bottom;
+                    output.push_str(&"\r\n".repeat(scroll));
+                    viewport_top += scroll;
+                    hardware_row = move_target;
+                }
+                let current_screen = hardware_row.saturating_sub(viewport_top);
+                let target_screen = move_target.saturating_sub(viewport_top);
+                if target_screen > current_screen {
+                    output.push_str(&format!("\x1b[{}B", target_screen - current_screen));
+                } else if current_screen > target_screen {
+                    output.push_str(&format!("\x1b[{}A", current_screen - target_screen));
+                }
+                output.push_str(if first == previous.len() && first > 0 {
+                    "\r\n"
+                } else {
+                    "\r"
+                });
+                for index in first..lines.len() {
+                    if index > first {
+                        output.push_str("\r\n");
+                    }
+                    output.push_str("\x1b[2K");
+                    output.push_str(&lines[index]);
+                }
+                if previous.len() > lines.len() {
+                    for _ in lines.len()..previous.len() {
+                        output.push_str("\r\n\x1b[2K");
+                    }
+                }
+                output.push_str("\x1b[?2026l");
+                terminal.write(&output);
+                let final_row = lines.len().saturating_sub(1);
+                let advanced = final_row.saturating_sub(viewport_top + height.saturating_sub(1));
+                viewport_top += advanced;
+                *self.main_hardware_row.lock().unwrap() = final_row;
+                *self.main_viewport_top.lock().unwrap() = viewport_top;
+            }
+        }
+
+        if let Some((row, col)) = cursor {
+            let hardware_row = *self.main_hardware_row.lock().unwrap();
+            if hardware_row > row {
+                terminal.write(&format!("\x1b[{}A", hardware_row - row));
+            } else if row > hardware_row {
+                terminal.write(&format!("\x1b[{}B", row - hardware_row));
+            }
+            terminal.write(&format!("\r\x1b[{}C", col));
+            terminal.write("\x1b[?25h");
+            *self.main_hardware_row.lock().unwrap() = row;
+        } else {
+            terminal.write("\x1b[?25l");
+        }
+        terminal.flush();
+        *self.previous_screen.lock().unwrap() = lines;
+        *self.main_previous_width.lock().unwrap() = width;
+        *self.main_previous_height.lock().unwrap() = previous_height.max(height);
+    }
+
     /// Perform a differential render with constrained layout.
     fn do_render(&self, reuse_scroll_content: bool) {
+        if self.uses_main_screen() {
+            self.do_render_main_screen();
+            return;
+        }
         let Ok(_render_guard) = self.render_lock.lock() else {
             return;
         };
@@ -429,14 +596,20 @@ impl TUI for TuiAltScreen {
             *running = false;
         }
 
-        // Leave the alternate buffer and clear the restored main screen while
-        // the terminal is still in raw mode. Restoring terminal modes first can
-        // make some Windows terminals repaint the saved pre-TUI contents after
-        // our clear sequence.
-        self.exit_alt_screen(options.preserve_screen);
-
-        if let Ok(terminal) = self.terminal.lock() {
-            terminal.stop();
+        if self.uses_main_screen() {
+            if let Ok(terminal) = self.terminal.lock() {
+                // Leave the shell prompt below the rendered footer while
+                // preserving all conversation rows in terminal scrollback.
+                terminal.write("\x1b[?25h\r\n");
+                terminal.stop();
+            }
+        } else {
+            // Leave the alternate buffer and clear the restored main screen
+            // while the terminal is still in raw mode.
+            self.exit_alt_screen(options.preserve_screen);
+            if let Ok(terminal) = self.terminal.lock() {
+                terminal.stop();
+            }
         }
     }
 
@@ -480,8 +653,15 @@ impl TuiAltScreen {
         }
         if let Ok(terminal) = self.terminal.lock() {
             terminal.enter_raw_mode();
+            if self.uses_main_screen() {
+                // Give wheel/touchpad gestures back to the terminal emulator;
+                // it can now scroll its native history smoothly.
+                terminal.disable_mouse();
+            }
         }
-        self.enter_alt_screen();
+        if !self.uses_main_screen() {
+            self.enter_alt_screen();
+        }
         self.do_render(false);
     }
 

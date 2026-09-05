@@ -17,6 +17,10 @@ const DIFF_LINE_CAP: usize = 40;
 /// from dumping 40 lines into the transcript while still showing what changed.
 /// Ctrl+T expands to [`DIFF_LINE_CAP`].
 const DIFF_PREVIEW_LINES: usize = 6;
+/// Maximum visual rows shown for a regular tool result while collapsed.
+/// Read/grep/find output can be hundreds of physical lines; keeping a compact
+/// preview prevents one tool from taking over the conversation transcript.
+const OUTPUT_PREVIEW_LINES: usize = 12;
 
 /// Tool execution status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,14 +212,33 @@ impl Component for ToolExecutionComponent {
         // inside the panel instead of overflowing into the next terminal row.
         if let Some(ref r) = *result {
             let body_width = width.saturating_sub(4).max(1);
-            for line in normalized_output_lines(r) {
-                let wrapped = wrap_text_with_ansi(&line, body_width);
-                for part in wrapped {
-                    let result_line =
-                        format!("  {} {}", colors.dim.fg("│"), colors.tool_output.fg(&part));
-                    let result_line = apply_background_to_line(&result_line, width, |s| bg.bg(s));
-                    lines.push(result_line);
-                }
+            let visual_lines: Vec<String> = normalized_output_lines(r)
+                .into_iter()
+                .flat_map(|line| wrap_text_with_ansi(&line, body_width))
+                .collect();
+            let shown = if *expanded {
+                visual_lines.len()
+            } else {
+                visual_lines.len().min(OUTPUT_PREVIEW_LINES)
+            };
+            for part in visual_lines.iter().take(shown) {
+                let result_line =
+                    format!("  {} {}", colors.dim.fg("│"), colors.tool_output.fg(part));
+                let result_line = apply_background_to_line(&result_line, width, |s| bg.bg(s));
+                lines.push(result_line);
+            }
+            let hidden = visual_lines.len().saturating_sub(shown);
+            if hidden > 0 {
+                let hint = format!(
+                    "  {} … {hidden} more lines (Ctrl+T to expand)",
+                    colors.dim.fg("│")
+                );
+                let hint = colors.muted.fg(&hint);
+                lines.push(apply_background_to_line(&hint, width, |s| bg.bg(s)));
+            } else if *expanded && visual_lines.len() > OUTPUT_PREVIEW_LINES {
+                let hint = format!("  {} Ctrl+T to collapse", colors.dim.fg("│"));
+                let hint = colors.muted.fg(&hint);
+                lines.push(apply_background_to_line(&hint, width, |s| bg.bg(s)));
             }
         } else if diff_lines.as_ref().is_none_or(|d| d.is_empty()) && !*expanded {
             // No result yet, no diff, and collapsed: pad one bg-tinted row so
@@ -685,6 +708,27 @@ mod tests {
         assert!(rendered
             .iter()
             .any(|line| line.matches("\x1b[48;5;22m").count() > 1));
+    }
+
+    #[test]
+    fn long_tool_output_collapses_and_ctrl_t_expands() {
+        let tool = ToolExecutionComponent::new("read", r#"{"path":"large.rs"}"#);
+        let output = (1..=20)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        tool.set_result(&output, false);
+
+        let collapsed = tool.render(80);
+        let collapsed_plain = crate::ansi::strip_ansi(&collapsed.join("\n"));
+        assert!(collapsed_plain.contains("8 more lines (Ctrl+T to expand)"));
+        assert!(!collapsed_plain.contains("line 20"));
+
+        tool.set_expanded(true);
+        let expanded = tool.render(80);
+        let expanded_plain = crate::ansi::strip_ansi(&expanded.join("\n"));
+        assert!(expanded_plain.contains("line 20"));
+        assert!(expanded_plain.contains("Ctrl+T to collapse"));
     }
 
     /// The header summarizes the args JSON into a compact signature instead
