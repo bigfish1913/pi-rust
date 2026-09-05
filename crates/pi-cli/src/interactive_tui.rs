@@ -4063,15 +4063,34 @@ async fn handle_agent_event(
                 // already exists).
                 for c in &a.content {
                     if let Content::ToolCall(tc) = c {
-                        let mut tools = state.tool_components.lock().unwrap();
-                        if !tools.contains_key(&tc.id) {
-                            let comp = Arc::new(ToolExecutionComponent::new(
-                                &tc.name,
-                                &tc.arguments.to_string(),
-                            ));
-                            comp.set_running();
-                            chat.add_child(comp.clone());
-                            tools.insert(tc.id.clone(), comp);
+                        if tc.name == "bash" {
+                            // Bash has a dedicated component. Create it here as
+                            // well as on ToolExecutionStart because the tool
+                            // call can become visible in a MessageUpdate first.
+                            // Keeping it in the bash map lets Start coalesce
+                            // with this panel instead of appending a second one.
+                            let command = tc
+                                .arguments
+                                .get("command")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let mut bash = state.bash_components.lock().unwrap();
+                            if !bash.contains_key(&tc.id) {
+                                let comp = Arc::new(BashExecutionComponent::new(command));
+                                chat.add_child(comp.clone());
+                                bash.insert(tc.id.clone(), comp);
+                            }
+                        } else {
+                            let mut tools = state.tool_components.lock().unwrap();
+                            if !tools.contains_key(&tc.id) {
+                                let comp = Arc::new(ToolExecutionComponent::new(
+                                    &tc.name,
+                                    &tc.arguments.to_string(),
+                                ));
+                                comp.set_running();
+                                chat.add_child(comp.clone());
+                                tools.insert(tc.id.clone(), comp);
+                            }
                         }
                     }
                 }
