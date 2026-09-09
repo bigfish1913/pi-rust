@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="rpi Documentation — 使用文档和 SDK API 参考。" />
+    <title>Documentation · rpi</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body class="docs-page">
+    <div class="site-shell">
+      <header class="topbar" data-sticky-header>
+        <a class="brand" href="./index.html#top" aria-label="rpi home"><span class="brand-mark"><span></span><span></span><span></span></span><span>rpi</span></a>
+        <nav class="desktop-nav" aria-label="主导航"><a href="./index.html#top">Home</a><a class="is-current" href="./docs.html">Documentation</a><a href="./packages.html">Packages</a></nav>
+        <div class="topbar-actions"><a class="text-link desktop-only" href="https://github.com/bigfish1913/pi-rust" target="_blank" rel="noreferrer">GitHub <span aria-hidden="true">↗</span></a><a class="button button-small desktop-only" href="./index.html#get-started">开始使用 <span aria-hidden="true">→</span></a><button class="menu-toggle" type="button" aria-label="打开导航" aria-expanded="false" data-menu-toggle><span></span><span></span></button></div>
+      </header>
+      <div class="mobile-menu" data-mobile-menu><a href="./index.html#top">Home</a><a href="./docs.html">Documentation</a><a href="./packages.html">Packages</a><a href="https://github.com/bigfish1913/pi-rust" target="_blank" rel="noreferrer">GitHub ↗</a></div>
+
+      <main>
+        <section class="docs-hero page-section">
+          <div class="eyebrow eyebrow-dark">RPI / KNOWLEDGE BASE</div>
+          <h1 data-docs-title>Documentation</h1>
+          <p data-docs-intro>使用文档和 SDK 文档，帮助你从第一个 faux agent 开始，逐步接入工具、会话和插件。</p>
+        </section>
+        <section class="docs-workspace page-section">
+          <div class="docs-toolbar">
+            <div class="docs-modes" role="tablist" aria-label="文档类型" data-docs-modes></div>
+            <label class="docs-search"><span aria-hidden="true">⌕</span><input type="search" placeholder="搜索章节、API 或 crate" aria-label="搜索文档" data-docs-search /></label>
+          </div>
+          <div class="docs-layout">
+            <aside class="docs-sidebar"><div class="docs-sidebar-label">ON THIS PAGE</div><nav data-docs-nav aria-label="文档章节"></nav><a class="docs-repo-link" href="https://github.com/bigfish1913/pi-rust" target="_blank" rel="noreferrer">在 GitHub 打开仓库 ↗</a></aside>
+            <div class="docs-content"><div class="docs-mode-intro"><div class="eyebrow eyebrow-dark" data-docs-eyebrow></div><p data-docs-description></p></div><div data-docs-sections></div><div class="docs-no-results" data-docs-empty hidden>没有找到匹配章节。试试 `Agent`、`Provider` 或 `插件`。</div></div>
+          </div>
+        </section>
+      </main>
+      <footer class="footer"><div class="footer-brand"><span class="brand-mark"><span></span><span></span><span></span></span><span>rpi</span><span class="footer-tagline">Rust Agent Toolkit</span></div><div class="footer-links"><a href="./index.html">首页</a><a href="./packages.html">Packages</a><a href="https://github.com/bigfish1913/pi-rust" target="_blank" rel="noreferrer">GitHub ↗</a><span>MIT License</span></div></footer>
+      <div class="toast" role="status" aria-live="polite" data-toast></div>
+    </div>
+    <script src="./docs.js" type="module"></script>
+  </body>
+</html>

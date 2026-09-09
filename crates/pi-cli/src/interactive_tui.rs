@@ -1287,10 +1287,6 @@ fn register_extension_commands(
 /// main async loop.
 enum TuiMessage {
     UserInput(String),
-    QueueInput {
-        prompt: String,
-        follow_up: bool,
-    },
     OpenTree,
     NavigateTree(String),
     Exit,
@@ -3072,10 +3068,27 @@ pub async fn interactive_tui(
             return;
         }
 
-        if *ctx_for_cb.state.status.lock().unwrap() != RunStatus::Idle {
-            let _ = ctx_for_cb.tx.send(TuiMessage::QueueInput {
-                prompt: text.to_string(),
-                follow_up: false,
+        let run_status = *ctx_for_cb.state.status.lock().unwrap();
+        if run_status != RunStatus::Idle {
+            let message = AgentMessage::User(UserMessage::new(text.to_string(), 0));
+            let aborting = run_status == RunStatus::Aborting;
+            let lane = ctx_for_cb.lane.clone();
+            let chat = ctx_for_cb.chat.clone();
+            let tui = ctx_for_cb.tui.clone();
+            tokio::spawn(async move {
+                // Queue immediately while the agent loop is still running.
+                // Routing this through the TUI's main channel delayed it until
+                // `prompt_text()` returned, after the loop's drain points had
+                // passed, so the queued message appeared to disappear.
+                let result = if aborting {
+                    lane.next_run(message).await
+                } else {
+                    lane.steer(message).await
+                };
+                if let Err(error) = result {
+                    add_error_message(&chat, &format!("Could not queue message: {error}"));
+                    tui.request_render(false);
+                }
             });
             add_note_message(
                 &ctx_for_cb.chat,
@@ -3509,9 +3522,15 @@ pub async fn interactive_tui(
                         &state_for_key.chat_container,
                         &format!("Queued follow-up message: {prompt}"),
                     );
-                    let _ = tx_for_key.send(TuiMessage::QueueInput {
-                        prompt,
-                        follow_up: true,
+                    let message = AgentMessage::User(UserMessage::new(prompt, 0));
+                    let lane = lane_for_key.clone();
+                    let chat = state_for_key.chat_container.clone();
+                    let tui = tui_for_key.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = lane.follow_up(message).await {
+                            add_error_message(&chat, &format!("Could not queue message: {error}"));
+                            tui.request_render(false);
+                        }
                     });
                 }
                 tui_for_key.request_render(false);
@@ -3555,26 +3574,6 @@ pub async fn interactive_tui(
                 // keeps it on one thread).
                 editor.clear();
                 run_prompt_streaming(&lane, &prompt, &tui, &state, drain_handle.is_some()).await;
-            }
-            Some(TuiMessage::QueueInput { prompt, follow_up }) => {
-                let message = AgentMessage::User(UserMessage::new(prompt.clone(), 0));
-                let aborting = *state.status.lock().unwrap() == RunStatus::Aborting;
-                let result = if aborting {
-                    // An aborting run will not reach either agent-loop drain
-                    // point, so preserve the message for the next run.
-                    lane.next_run(message).await
-                } else if follow_up {
-                    lane.follow_up(message).await
-                } else {
-                    lane.steer(message).await
-                };
-                if let Err(error) = result {
-                    add_error_message(
-                        &chat_container,
-                        &format!("Could not queue message: {error}"),
-                    );
-                    tui.request_render(false);
-                }
             }
             Some(TuiMessage::OpenTree) => {
                 if *state.status.lock().unwrap() != RunStatus::Idle {
@@ -4057,6 +4056,7 @@ async fn handle_agent_event(
         } => {
             if let AgentMessage::Assistant(a) = &message {
                 let text = assistant_text(a);
+                let mut saw_bash_tool_call = false;
                 // Scan content for finalized tool calls → proactively create
                 // tool components (TS shows the tool as soon as the assistant
                 // emits the ToolCall; ToolExecutionStart coalesces if it
@@ -4064,6 +4064,7 @@ async fn handle_agent_event(
                 for c in &a.content {
                     if let Content::ToolCall(tc) = c {
                         if tc.name == "bash" {
+                            saw_bash_tool_call = true;
                             // Bash has a dedicated component. Create it here as
                             // well as on ToolExecutionStart because the tool
                             // call can become visible in a MessageUpdate first.
@@ -4093,6 +4094,13 @@ async fn handle_agent_event(
                             }
                         }
                     }
+                }
+                // MessageUpdate can expose the finalized bash call before
+                // ToolExecutionStart arrives. Hide the global `Working…`
+                // loader immediately when creating that bash panel; otherwise
+                // it briefly appears alongside the panel's `Running…` spinner.
+                if saw_bash_tool_call {
+                    state.sync_working_loader_with_bash();
                 }
                 let _ = assistant_message_event; // snapshot already applied via `a`
                 if let Some(comp) = state.current_assistant.lock().unwrap().as_ref() {

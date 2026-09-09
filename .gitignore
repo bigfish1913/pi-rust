@@ -12,3 +12,6 @@ task-*.log
 release-*.log
 .claude/*
 target/*
+
+# Static frontend deployment bundle
+.deploy/

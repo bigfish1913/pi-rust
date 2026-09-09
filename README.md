@@ -1,5 +1,9 @@
 # rpi — Rust port of the Pi agent SDK
 
+[![rpi-cli on crates.io](https://img.shields.io/crates/v/rpi-cli.svg)](https://crates.io/crates/rpi-cli)
+[![rpi-plugin-sdk docs](https://docs.rs/rpi-plugin-sdk/badge.svg)](https://docs.rs/rpi-plugin-sdk)
+[![CI](https://github.com/bigfish1913/pi-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/bigfish1913/pi-rust/actions)
+
 A Rust port of [earendil-works/pi](https://github.com/earendil-works/pi)'s SDK
 layer — a library-first, multi-crate workspace for building personal LLM coding
 agents in Rust, plus an `rpi` CLI built on top.
@@ -19,8 +23,24 @@ agents in Rust, plus an `rpi` CLI built on top.
 | `rpi-tools`       | `pi-tools/`      | Built-in tools (`read`/`write`/`edit`/`bash`/`grep`/`find`/`ls`) + `ExecutionEnv`. |
 | `rpi-harness`     | `pi-harness/`    | `AgentHarness`: session tree, JSONL persistence, compaction, run loop. |
 | `rpi-cli`         | `pi-cli/`        | Terminal coding-agent CLI (`rpi` binary) on top of the library crates. |
+| `rpi-plugin-sdk`   | `rpi-plugin-sdk/` | Stable C ABI for Rust-native plugins and extension discovery.        |
+| `rpi-extensions`   | `rpi-extensions/` | Dynamic plugin loader and `AgentTool` adapter.                       |
+| `rpi-tui`          | `pi-tui/`        | Terminal UI primitives used by the interactive CLI.                 |
 
 Dependency direction: `rpi-telemetry → rpi-ai → rpi-agent → rpi-tools → rpi-harness → rpi-cli`.
+
+### Rust registry links
+
+| Package | crates.io | docs.rs |
+| --- | --- | --- |
+| `rpi-cli` | [crates.io](https://crates.io/crates/rpi-cli) | [docs.rs](https://docs.rs/rpi-cli) |
+| `rpi-agent` | [crates.io](https://crates.io/crates/rpi-agent) | [docs.rs](https://docs.rs/rpi-agent) |
+| `rpi-plugin-sdk` | [crates.io](https://crates.io/crates/rpi-plugin-sdk) | [docs.rs](https://docs.rs/rpi-plugin-sdk) |
+| `rpi-extensions` | [crates.io](https://crates.io/crates/rpi-extensions) | [docs.rs](https://docs.rs/rpi-extensions) |
+
+The registry pages are the canonical entry points for installing the CLI or
+embedding the SDK. The repository may contain unreleased changes; check the
+published version shown on crates.io before depending on a new API.
 
 ## Relationship to the TypeScript source
 
@@ -54,6 +74,29 @@ agent.prompt("Hello!").await.unwrap();
 ```
 
 See [docs/architecture.md](docs/architecture.md) for the full design.
+
+## Build a plugin
+
+Plugins are Rust `cdylib` libraries loaded through the stable ABI exposed by
+`rpi-plugin-sdk`. The repository includes a complete `echo` tool example that
+also exercises event and resource discovery:
+
+```bash
+cargo build -p plugin-stub
+```
+
+Then point the CLI at the directory containing the generated library (the
+extension is named `plugin_stub.dll`, `libplugin_stub.so`, or
+`libplugin_stub.dylib` depending on the platform):
+
+```bash
+rpi --extensions-dir target/debug -p 'echo "hi"'
+```
+
+The plugin depends on `rpi-plugin-sdk` only; the host-side loader lives in
+`rpi-extensions`. See [`examples/plugin-stub`](examples/plugin-stub) and the
+[`rpi-plugin-sdk` API docs](https://docs.rs/rpi-plugin-sdk) for the ABI
+contract.
 
 ## Status (v1)
 
@@ -131,8 +174,8 @@ Publish the crate family in dependency order with `cargo publish` (run
 publish-scoped token; crates.io records are permanent):
 
 ```
-# dep order: telemetry → ai → agent → tools → harness → cli
-for c in rpi-telemetry rpi-ai rpi-agent rpi-tools rpi-harness rpi-cli; do
+# dep order: telemetry → ai → agent → tools → harness → plugin-sdk → extensions → tui → cli
+for c in rpi-telemetry rpi-ai rpi-agent rpi-tools rpi-harness rpi-plugin-sdk rpi-extensions rpi-tui rpi-cli; do
   cargo publish -p "$c"
 done
 ```

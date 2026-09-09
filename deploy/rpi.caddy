@@ -1,0 +1,13 @@
+# rpi.laofu.online - rpi Rust Agent Toolkit static website
+rpi.laofu.online {
+    encode gzip
+    root * /var/www/rpi
+    file_server
+    tls {
+        issuer acme
+    }
+}
+
+http://rpi.laofu.online {
+    redir https://{host}{uri} permanent
+}

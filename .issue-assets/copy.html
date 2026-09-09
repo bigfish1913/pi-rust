@@ -1,0 +1,23 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Copy screenshot</title>
+<button id="interactive">Copy interactive screenshot</button>
+<button id="working">Copy working screenshot</button>
+<pre id="payload" hidden></pre>
+<script>
+async function copyImage(name) {
+  const response = await fetch(name);
+  const blob = await response.blob();
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  payload.textContent = btoa(binary);
+  payload.hidden = false;
+  await navigator.clipboard.write([
+    new ClipboardItem({ [blob.type]: blob })
+  ]);
+  document.title = `copied:${name}`;
+}
+interactive.onclick = () => copyImage('rpi-interactive.png');
+working.onclick = () => copyImage('rpi-working.png');
+</script>

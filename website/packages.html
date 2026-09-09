@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="rpi packages — 扩展、skills、providers 和工具的静态目录。" />
+    <title>Packages · rpi</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body class="packages-page">
+    <div class="site-shell">
+      <header class="topbar" data-sticky-header>
+        <a class="brand" href="./index.html#top" aria-label="rpi home"><span class="brand-mark"><span></span><span></span><span></span></span><span>rpi</span></a>
+        <nav class="desktop-nav" aria-label="主导航"><a href="./index.html#top">Home</a><a href="./docs.html">Documentation</a><a class="is-current" href="./packages.html">Packages</a></nav>
+        <div class="topbar-actions"><a class="text-link desktop-only" href="https://github.com/bigfish1913/pi-rust" target="_blank" rel="noreferrer">GitHub <span aria-hidden="true">↗</span></a><a class="button button-small desktop-only" href="./index.html#get-started">开始使用 <span aria-hidden="true">→</span></a><button class="menu-toggle" type="button" aria-label="打开导航" aria-expanded="false" data-menu-toggle><span></span><span></span></button></div>
+      </header>
+      <div class="mobile-menu" data-mobile-menu><a href="./index.html#top">Home</a><a href="./docs.html">Documentation</a><a href="./packages.html">Packages</a><a href="https://github.com/bigfish1913/pi-rust" target="_blank" rel="noreferrer">GitHub ↗</a></div>
+
+      <main>
+        <section class="packages-hero page-section">
+          <div class="eyebrow eyebrow-dark">RPI / PACKAGE CATALOG</div>
+          <h1>把 Agent 的能力，<br /><em>装进你的工作流。</em></h1>
+          <p>扩展、skills、providers 和 prompt templates 的静态目录。先从这里发现组合方式，再用 Cargo 或 Git 接入自己的 rpi 项目。</p>
+          <div class="packages-install"><span class="command-prompt">$</span><code>cargo add rpi-tools</code><button type="button" data-copy-command aria-label="复制安装命令">⧉</button></div>
+        </section>
+
+        <section class="package-catalog page-section">
+          <div class="catalog-heading"><div><div class="eyebrow eyebrow-dark">DISCOVER / <span data-package-count>0</span> PACKAGES</div><h2>最近值得试试的东西。</h2></div><p>这些条目先用静态 JSON 代替后端数据。以后可以直接接 crates.io、GitHub 或你自己的 registry。</p></div>
+          <div class="recent-packages" data-recent-packages></div>
+          <div class="catalog-toolbar"><label class="search-field"><span aria-hidden="true">⌕</span><input type="search" placeholder="搜索名称、描述或作者" aria-label="搜索包" data-package-search /></label><label class="select-field"><span>类型</span><select aria-label="按类型筛选" data-package-type><option value="all">全部类型</option><option value="crate">crate</option><option value="extension">extension</option><option value="skill">skill</option><option value="provider">provider</option><option value="prompt">prompt</option></select></label><label class="select-field"><span>排序</span><select aria-label="包排序" data-package-sort><option value="downloads">下载量</option><option value="recent">最近更新</option><option value="name">名称 A-Z</option></select></label></div>
+          <div class="catalog-meta"><span data-results-count>0 个结果</span><button type="button" class="reset-button" data-reset>重置筛选 ↺</button></div>
+          <div class="package-list" data-package-list></div>
+          <div class="empty-state" data-empty-state hidden>当前还没有发布 package，后续接入 registry 后会显示在这里。</div>
+        </section>
+      </main>
+      <footer class="footer"><div class="footer-brand"><span class="brand-mark"><span></span><span></span><span></span></span><span>rpi</span><span class="footer-tagline">Rust Agent Toolkit</span></div><div class="footer-links"><a href="./index.html">首页</a><a href="https://github.com/bigfish1913/pi-rust" target="_blank" rel="noreferrer">GitHub ↗</a><span>MIT License</span></div></footer>
+      <div class="toast" role="status" aria-live="polite" data-toast></div>
+    </div>
+    <script src="./packages.js" type="module"></script>
+  </body>
+</html>

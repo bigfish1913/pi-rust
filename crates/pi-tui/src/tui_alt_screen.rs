@@ -424,6 +424,15 @@ impl TuiAltScreen {
         let mut visible = frame.lines;
         self.paint_overlays(&mut visible, width, height);
 
+        // Cursor markers are an internal layout protocol, not terminal output.
+        // Extract the location first, then strip every marker before diffing or
+        // writing. Sending the APC marker to some Windows terminals caused the
+        // character under the cursor to be erased when moving left/right.
+        let cursor = extract_cursor_position(&visible, height);
+        for line in &mut visible {
+            *line = line.replace(CURSOR_MARKER, "");
+        }
+
         // Check for full redraw
         let previous = self
             .previous_screen
@@ -454,8 +463,9 @@ impl TuiAltScreen {
                 buffer.push_str(&format!("\x1b[{};1H\x1b[2K{}", row + 1, line));
             }
 
-            // Find cursor position if present
-            if let Some((row, col)) = extract_cursor_position(&visible, height) {
+            // Position the hardware cursor using the marker location captured
+            // before internal markers were stripped from `visible`.
+            if let Some((row, col)) = cursor {
                 buffer.push_str(&format!("\x1b[{};{}H", row + 1, col + 1));
                 if self.get_show_hardware_cursor() {
                     buffer.push_str("\x1b[?25h");
@@ -885,7 +895,8 @@ impl Terminal for TerminalProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Text;
+    use crate::{Editor, Focusable, Text};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     struct RecordingTerminal {
         output: Arc<Mutex<String>>,
@@ -925,6 +936,28 @@ mod tests {
         }
         fn set_progress(&self, _active: bool) {}
         fn flush(&self) {}
+    }
+
+    #[test]
+    fn cursor_marker_is_never_written_to_the_terminal() {
+        let output = Arc::new(Mutex::new(String::new()));
+        let terminal = RecordingTerminal {
+            output: output.clone(),
+        };
+        let tui = TuiAltScreen::new(Box::new(terminal), true, None);
+        let editor = Arc::new(Editor::simple());
+        editor.set_focused(true);
+        editor.insert("hello");
+        tui.set_layout_root(Some(editor.clone()));
+        tui.start_readerless();
+
+        editor.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        tui.request_render(false);
+
+        let rendered = output.lock().unwrap().clone();
+        assert!(!rendered.contains(CURSOR_MARKER));
+        assert!(rendered.contains("hello"));
+        assert_eq!(editor.get_text(), "hello");
     }
 
     #[test]
