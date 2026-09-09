@@ -1631,7 +1631,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-agent"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "futures",
@@ -1648,7 +1648,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-ai"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "base64",
@@ -1670,7 +1670,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-cli"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "arboard",
  "async-trait",
@@ -1700,7 +1700,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-extensions"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "futures",
@@ -1718,7 +1718,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-harness"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "futures",
@@ -1738,14 +1738,14 @@ dependencies = [
 
 [[package]]
 name = "rpi-plugin-sdk"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "rpi-telemetry"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "tokio",
@@ -1753,7 +1753,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-tools"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "base64",
@@ -1780,7 +1780,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-tui"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "base64",
  "crossterm",

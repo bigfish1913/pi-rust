@@ -201,10 +201,7 @@ async fn run_anthropic_stream(
             return;
         }
     };
-    let non_stream = std::env::var("RPI_ANTHROPIC_NON_STREAM")
-        .ok()
-        .as_deref()
-        == Some("1");
+    let non_stream = std::env::var("RPI_ANTHROPIC_NON_STREAM").ok().as_deref() == Some("1");
     if non_stream {
         body["stream"] = serde_json::Value::Bool(false);
         strip_cache_control(&mut body);
@@ -316,7 +313,9 @@ async fn run_anthropic_stream(
             .map(|blocks| {
                 blocks
                     .iter()
-                    .filter(|block| block.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+                    .filter(|block| {
+                        block.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                    })
                     .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
                     .collect::<String>()
             })
@@ -417,7 +416,10 @@ fn simplify_non_stream_request(value: &mut serde_json::Value) {
             })
             .unwrap_or_default()
     };
-    if let Some(messages) = value.get_mut("messages").and_then(serde_json::Value::as_array_mut) {
+    if let Some(messages) = value
+        .get_mut("messages")
+        .and_then(serde_json::Value::as_array_mut)
+    {
         for message in messages {
             if let Some(content) = message.get_mut("content") {
                 if content.is_array() {

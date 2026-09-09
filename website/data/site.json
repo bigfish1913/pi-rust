@@ -5,7 +5,7 @@
     "description": "rpi 是一个 library-first 的 Rust SDK。用清晰的分层、可替换的模型 Provider 和真正可测试的工具循环，构建属于你的 coding agent。"
   },
   "stats": [
-    { "value": "6", "label": "个可组合 crate" },
+    { "value": "15", "label": "个可组合 crate" },
     { "value": "2", "label": "种内置 Provider" },
     { "value": "7", "label": "个开箱即用工具" },
     { "value": "0", "label": "网络依赖的测试" }
@@ -40,7 +40,7 @@
     }
   ],
   "releases": [
-    { "version": "0.1.6", "status": "current", "title": "Core stable", "description": "Provider、Agent loop、工具、Harness 和 CLI 组成第一条完整路径。" },
+    { "version": "0.1.7", "status": "current", "title": "Install + extensions", "description": "新增 rpi install，并接入 9 个已发布的 Rust 扩展 package。" },
     { "version": "next", "status": "building", "title": "More surfaces", "description": "扩展 package manifest、更多 Provider 和更完整的插件资源协议。" },
     { "version": "future", "status": "exploring", "title": "Your ideas", "description": "把 rpi 接进你的产品、工作流和自己的运行环境。" }
   ]

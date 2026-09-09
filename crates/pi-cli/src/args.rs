@@ -512,6 +512,8 @@ pub fn print_help() {
 {u}Subcommands:{r}
   auth login|check|logout        Manage persisted credentials in ~/.rpi/auth.json
                                 (see `rpi auth --help`)
+  install <crate>                Build and install a Rust cdylib extension
+                                (see `rpi install --help`)
 
 {u}Built-in Tools:{r}
   {builtin}  (enabled by default; grep/find/ls are read-only)
@@ -550,7 +552,7 @@ pub fn print_help() {
   Define custom model catalogs and provider apiKey values in
   ~/.rpi/agent/models.json. The interactive TUI, extensions, skills, prompt
   templates, themes, model cycling, session fork/export, and trust commands are
-  available in the current build. OAuth, package manager, and HTML export remain
+  available in the current build. OAuth and HTML export remain
   outside the current implementation.
 ",
         name = crate::APP_NAME,

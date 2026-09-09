@@ -98,6 +98,26 @@ The plugin depends on `rpi-plugin-sdk` only; the host-side loader lives in
 [`rpi-plugin-sdk` API docs](https://docs.rs/rpi-plugin-sdk) for the ABI
 contract.
 
+### Install a crates.io extension
+
+`rpi install` installs Rust-native extensions directly from Cargo. The package
+must expose an `rpi-plugin-sdk` compatible `cdylib` target:
+
+```bash
+rpi install rpi-extension-example
+rpi install rpi-extension-example --version 0.1.0
+rpi install rpi-extension-example --force
+```
+
+The command resolves and builds the crate with Cargo in release mode, then
+copies its `.dll`, `.so`, or `.dylib` into `~/.rpi/agent/extensions` (or the
+directory selected by `RPI_CODING_AGENT_DIR`). The extension is loaded on the
+next `rpi` start. For local development, use
+`rpi install my-extension --path ../my-rpi-extension --force`.
+
+This is intentionally different from plain `cargo install`: `cargo install`
+only copies executable targets, while rpi loads dynamic-library extensions.
+
 ## Status (v1)
 
 - **Providers:** Anthropic Messages and OpenAI-compatible Chat Completions,
@@ -111,6 +131,9 @@ contract.
 - **Tools:** `read`, `write`, `edit`, `bash` (mutating, run through a
   `MutationQueue`) + `grep`, `find`, `ls` (read-only, in-process via the
   `FileSystem` trait — no `rg`/`fd` shell-out).
+- **Extensions:** Rust `cdylib` plugins can be installed with `rpi install` and
+  are discovered from project `.pi/extensions`, global
+  `~/.rpi/agent/extensions`, and `--extensions-dir`.
 - **Sessions:** JSONL v4 durable backend + in-memory ephemeral; compaction + a
   split-turn two-LLM-call invariant.
 

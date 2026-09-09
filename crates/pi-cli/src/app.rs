@@ -57,6 +57,9 @@ pub async fn run() -> i32 {
     if argv.first().map(|s| s.as_str()) == Some("auth") {
         return crate::auth::run(&argv[1..]).await;
     }
+    if argv.first().map(|s| s.as_str()) == Some("install") {
+        return crate::install::run(&argv[1..]);
+    }
 
     let mut parsed = parse_args(&argv);
 

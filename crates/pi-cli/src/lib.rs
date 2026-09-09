@@ -32,8 +32,8 @@
 //! The TS `coding-agent` is a large, full-featured product. The current Rust
 //! CLI includes the interactive TUI, extension loading, skills and prompt
 //! templates, compaction, session fork/export, and lane-aware harness runs.
-//! Package management, OAuth/Copilot auth, HTML export, and full model cycling
-//! remain outside the current implementation.
+//! OAuth/Copilot auth, HTML export, and full model cycling remain outside the
+//! current implementation. `rpi install` supports Rust cdylib extensions.
 //!
 //! [`packages/coding-agent/src/cli.ts`]: ../../.reference/pi/packages/coding-agent/src/cli.ts
 //! [`main.ts`]: ../../.reference/pi/packages/coding-agent/src/main.ts
@@ -46,6 +46,7 @@ pub mod auth;
 pub mod config;
 pub mod extensions_actions;
 pub mod extras;
+pub mod install;
 pub mod interactive_tui;
 pub mod modes;
 pub mod provider;
