@@ -1,0 +1,10 @@
+services:
+  caddy:
+    volumes:
+      - ./config/caddy:/etc/caddy:ro
+      - /var/lib/docker/volumes/app-caddy-data/_data:/data
+      - /var/lib/docker/volumes/app-caddy-config/_data:/config
+      - /var/www/openmatrix:/var/www/openmatrix:ro
+      - /var/www/matrixcode:/var/www/matrixcode:ro
+      - /var/www/easytier-web:/var/www/easytier-web:ro
+      - /var/www/rpi:/var/www/rpi:ro

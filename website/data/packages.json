@@ -1,0 +1,74 @@
+[
+  {
+    "name": "rpi-cli",
+    "type": "crate",
+    "age": 1,
+    "ageLabel": "v0.1.6 · current",
+    "description": "终端 coding-agent CLI，提供 rpi 命令、交互式 TUI、配置和插件加载。",
+    "author": "rpi / crates.io",
+    "downloads": 105,
+    "downloadsLabel": "105",
+    "install": "cargo install rpi-cli",
+    "repository": "https://crates.io/crates/rpi-cli"
+  },
+  {
+    "name": "rpi-agent",
+    "type": "crate",
+    "age": 2,
+    "ageLabel": "v0.1.6 · current",
+    "description": "异步 Agent runtime 和 loop，包含 AgentTool、事件、hooks 与消息队列。",
+    "author": "rpi / crates.io",
+    "downloads": 165,
+    "downloadsLabel": "165",
+    "install": "cargo add rpi-agent",
+    "repository": "https://crates.io/crates/rpi-agent"
+  },
+  {
+    "name": "rpi-tools",
+    "type": "crate",
+    "age": 3,
+    "ageLabel": "v0.1.6 · current",
+    "description": "开箱即用的 read、write、edit、bash、grep、find、ls 工具和 ExecutionEnv。",
+    "author": "rpi / crates.io",
+    "downloads": 138,
+    "downloadsLabel": "138",
+    "install": "cargo add rpi-tools",
+    "repository": "https://crates.io/crates/rpi-tools"
+  },
+  {
+    "name": "rpi-plugin-sdk",
+    "type": "extension",
+    "age": 4,
+    "ageLabel": "v0.1.6 · ABI v1",
+    "description": "Rust cdylib 插件的稳定 #[repr(C)] ABI 合约，插件只依赖这一层边界。",
+    "author": "rpi / crates.io",
+    "downloads": 37,
+    "downloadsLabel": "37",
+    "install": "cargo add rpi-plugin-sdk",
+    "repository": "https://crates.io/crates/rpi-plugin-sdk"
+  },
+  {
+    "name": "rpi-extensions",
+    "type": "extension",
+    "age": 5,
+    "ageLabel": "v0.1.6 · loader",
+    "description": "宿主侧动态插件加载器，将 ABI 插件适配为 AgentTool 并管理生命周期。",
+    "author": "rpi / crates.io",
+    "downloads": 38,
+    "downloadsLabel": "38",
+    "install": "cargo add rpi-extensions",
+    "repository": "https://crates.io/crates/rpi-extensions"
+  },
+  {
+    "name": "rpi-harness",
+    "type": "crate",
+    "age": 6,
+    "ageLabel": "v0.1.6 · sessions",
+    "description": "Session 树、JSONL 持久化、上下文压缩和 AgentHarness run loop。",
+    "author": "rpi / crates.io",
+    "downloads": 126,
+    "downloadsLabel": "126",
+    "install": "cargo add rpi-harness",
+    "repository": "https://crates.io/crates/rpi-harness"
+  }
+]

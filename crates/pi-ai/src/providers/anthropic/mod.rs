@@ -27,7 +27,7 @@ use crate::event_stream::{
 };
 use crate::model::{Model, StreamingProtocolCompat};
 use crate::provider::{CacheRetention, Provider, SimpleStreamOptions};
-use crate::types::{Context, Usage};
+use crate::types::{AssistantMessageEvent, Content, Context, DoneReason, StopReason, Usage};
 use async_trait::async_trait;
 use std::sync::Arc;
 
@@ -189,7 +189,7 @@ async fn run_anthropic_stream(
 
     // ---- build params (is_oauth = false in v1) ----
     let built = build_params(model, ctx, false, opts);
-    let body = match serde_json::to_value(&built.request) {
+    let mut body = match serde_json::to_value(&built.request) {
         Ok(v) => v,
         Err(e) => {
             emit_terminal_error(
@@ -201,6 +201,15 @@ async fn run_anthropic_stream(
             return;
         }
     };
+    let non_stream = std::env::var("RPI_ANTHROPIC_NON_STREAM")
+        .ok()
+        .as_deref()
+        == Some("1");
+    if non_stream {
+        body["stream"] = serde_json::Value::Bool(false);
+        strip_cache_control(&mut body);
+        simplify_non_stream_request(&mut body);
+    }
 
     // ---- assemble headers (createClient, API-key arm) ----
     let headers = assemble_headers(
@@ -270,10 +279,102 @@ async fn run_anthropic_stream(
         Ok(r) => r,
         Err(err) => {
             let aborted = err.is_abort();
+            eprintln!("anthropic request failed: {err}");
             emit_terminal_error(prod, &mut state, err.to_string(), aborted);
             return;
         }
     };
+
+    if non_stream {
+        let response_body = match response.text().await {
+            Ok(body) => body,
+            Err(error) => {
+                emit_terminal_error(
+                    prod,
+                    &mut state,
+                    format!("failed to read non-stream response: {error}"),
+                    false,
+                );
+                return;
+            }
+        };
+        let value: serde_json::Value = match serde_json::from_str(&response_body) {
+            Ok(value) => value,
+            Err(error) => {
+                emit_terminal_error(
+                    prod,
+                    &mut state,
+                    format!("failed to parse non-stream response: {error}"),
+                    false,
+                );
+                return;
+            }
+        };
+        let text = value
+            .get("content")
+            .and_then(serde_json::Value::as_array)
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter(|block| block.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+                    .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
+                    .collect::<String>()
+            })
+            .unwrap_or_default();
+        if text.trim().is_empty() {
+            emit_terminal_error(
+                prod,
+                &mut state,
+                "non-stream response contained no text content".into(),
+                false,
+            );
+            return;
+        }
+        state.output.content.push(Content::text(text.clone()));
+        state.output.response_id = value
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        state.output.response_model = value
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        if let Some(usage) = value.get("usage") {
+            state.output.usage.input = usage
+                .get("input_tokens")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            state.output.usage.output = usage
+                .get("output_tokens")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            state.output.usage.total_tokens = state.output.usage.input + state.output.usage.output;
+        }
+        state.output.stop_reason = StopReason::Stop;
+        let partial = std::sync::Arc::new(state.output.clone());
+        prod.push(AssistantMessageEvent::Start {
+            partial: partial.clone(),
+        });
+        prod.push(AssistantMessageEvent::TextStart {
+            content_index: 0,
+            partial: partial.clone(),
+        });
+        prod.push(AssistantMessageEvent::TextDelta {
+            content_index: 0,
+            delta: text.clone(),
+            partial: partial.clone(),
+        });
+        prod.push(AssistantMessageEvent::TextEnd {
+            content_index: 0,
+            content: text,
+            partial,
+        });
+        prod.push(AssistantMessageEvent::Done {
+            reason: DoneReason::Stop,
+            message: state.output,
+        });
+        return;
+    }
 
     // ---- push start, drive SSE → mapper → terminal ----
     // The TS pushes `start` here right before the event loop; the Rust mapper
@@ -285,6 +386,51 @@ async fn run_anthropic_stream(
     let cost_model = model.cost.clone();
     let cost_fn = move |usage: &Usage| calculate_cost(&cost_model, usage);
     run_mapper(&mut sse, prod, &mut state, cost_fn).await;
+}
+
+fn strip_cache_control(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.remove("cache_control");
+            for child in map.values_mut() {
+                strip_cache_control(child);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for child in items {
+                strip_cache_control(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn simplify_non_stream_request(value: &mut serde_json::Value) {
+    let text_from_blocks = |blocks: &serde_json::Value| {
+        blocks
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.get("text").and_then(serde_json::Value::as_str))
+                    .collect::<String>()
+            })
+            .unwrap_or_default()
+    };
+    if let Some(messages) = value.get_mut("messages").and_then(serde_json::Value::as_array_mut) {
+        for message in messages {
+            if let Some(content) = message.get_mut("content") {
+                if content.is_array() {
+                    *content = serde_json::Value::String(text_from_blocks(content));
+                }
+            }
+        }
+    }
+    if let Some(system) = value.get_mut("system") {
+        if system.is_array() {
+            *system = serde_json::Value::String(text_from_blocks(system));
+        }
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -333,10 +479,12 @@ fn assemble_headers(
 ) -> Vec<(String, String)> {
     let mut headers: Vec<(String, String)> = Vec::new();
     headers.push(("accept".into(), "application/json".into()));
-    headers.push((
-        "anthropic-dangerous-direct-browser-access".into(),
-        "true".into(),
-    ));
+    if std::env::var("RPI_ANTHROPIC_NON_STREAM").ok().as_deref() != Some("1") {
+        headers.push((
+            "anthropic-dangerous-direct-browser-access".into(),
+            "true".into(),
+        ));
+    }
     headers.push(("anthropic-version".into(), ANTHROPIC_VERSION.into()));
     if let Some(beta) = beta_header {
         headers.push(("anthropic-beta".into(), beta.into()));

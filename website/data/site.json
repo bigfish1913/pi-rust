@@ -1,0 +1,47 @@
+{
+  "hero": {
+    "eyebrow": "RUST AGENT TOOLKIT",
+    "title": "把 Agent 做成你自己的工具。",
+    "description": "rpi 是一个 library-first 的 Rust SDK。用清晰的分层、可替换的模型 Provider 和真正可测试的工具循环，构建属于你的 coding agent。"
+  },
+  "stats": [
+    { "value": "6", "label": "个可组合 crate" },
+    { "value": "2", "label": "种内置 Provider" },
+    { "value": "7", "label": "个开箱即用工具" },
+    { "value": "0", "label": "网络依赖的测试" }
+  ],
+  "features": [
+    { "number": "01", "title": "Library-first", "description": "核心能力不依赖 CLI。只引入你需要的 crate，从一个 Agent loop 开始。", "tag": "可组合" },
+    { "number": "02", "title": "Provider agnostic", "description": "Anthropic、OpenAI-compatible 或你自己的服务，都落在同一个 Provider 边界后面。", "tag": "可替换" },
+    { "number": "03", "title": "Tool loop ready", "description": "工具参数校验、并行执行、流式事件、取消和 follow-up 都是循环的一部分。", "tag": "可观测" },
+    { "number": "04", "title": "Durable by choice", "description": "需要时再接入 Session、JSONL、分支和上下文压缩，不为简单实验提前付复杂度。", "tag": "可持久化" }
+  ],
+  "architecture": [
+    { "name": "rpi-ai", "label": "Models + streaming", "description": "统一消息类型、Provider 和流式事件", "tone": "orange" },
+    { "name": "rpi-agent", "label": "Agent loop", "description": "工具调用、事件、Hook、steering", "tone": "mint" },
+    { "name": "rpi-tools", "label": "Built-in tools", "description": "read / write / edit / bash / grep", "tone": "blue" },
+    { "name": "rpi-harness", "label": "Sessions", "description": "会话树、JSONL、compaction", "tone": "violet" },
+    { "name": "rpi-cli", "label": "Your interface", "description": "CLI、TUI、配置和插件", "tone": "cream" }
+  ],
+  "examples": [
+    {
+      "id": "minimal",
+      "label": "Minimal agent",
+      "file": "examples/minimal/src/main.rs",
+      "note": "确定性的本地 provider，不需要 API key。",
+      "code": "use rpi_agent::AgentBuilder;\nuse rpi_ai::providers::faux::{FauxProvider, FauxScript};\n\n#[tokio::main]\nasync fn main() {\n    let script = FauxScript::new()\n        .with_text(\"Hello from rpi!\");\n    let provider = FauxProvider::new(script);\n    let model = provider.default_model().clone();\n\n    let agent = AgentBuilder::new()\n        .model(model)\n        .stream_fn(make_stream_fn(provider))\n        .build()\n        .expect(\"agent builds\");\n\n    agent.prompt(\"hi\").await.expect(\"prompt completes\");\n}\n"
+    },
+    {
+      "id": "tools",
+      "label": "Tool loop",
+      "file": "examples/tools/src/main.rs",
+      "note": "把内置 write 和 bash 工具接进真实文件系统。",
+      "code": "let env = Arc::new(OsExecutionEnv::with_cwd(tmp));\nlet ctx = ExecutionToolContext::new(\n    env.clone() as Arc<dyn ExecutionEnv>,\n    Some(env as Arc<dyn MutatingEnv>),\n);\n\nlet write = create_write_tool(&ctx);\nlet bash = create_bash_tool(&ctx, None);\n\nlet agent = AgentBuilder::new()\n    .model(model)\n    .stream_fn(make_stream_fn(provider))\n    .tools(vec![write, bash])\n    .build()?;\n\nagent.prompt(\"Write hello to out.txt\").await?;\n"
+    }
+  ],
+  "releases": [
+    { "version": "0.1.6", "status": "current", "title": "Core stable", "description": "Provider、Agent loop、工具、Harness 和 CLI 组成第一条完整路径。" },
+    { "version": "next", "status": "building", "title": "More surfaces", "description": "扩展 package manifest、更多 Provider 和更完整的插件资源协议。" },
+    { "version": "future", "status": "exploring", "title": "Your ideas", "description": "把 rpi 接进你的产品、工作流和自己的运行环境。" }
+  ]
+}

@@ -1044,7 +1044,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "minimal"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "futures",
  "rpi-agent",
@@ -1344,7 +1344,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "plugin-stub"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "rpi-plugin-sdk",
  "serde_json",
@@ -1385,6 +1385,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "pulldown-cmark"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f86ba2052aebccc42cbbb3ed234b8b13ce76f75c3551a303cb2bcffcff12bb14"
+dependencies = [
+ "bitflags",
+ "memchr",
+ "unicase",
 ]
 
 [[package]]
@@ -1620,7 +1631,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-agent"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "futures",
@@ -1637,7 +1648,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-ai"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "base64",
@@ -1659,7 +1670,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-cli"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "arboard",
  "async-trait",
@@ -1689,7 +1700,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-extensions"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "futures",
@@ -1707,7 +1718,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-harness"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "futures",
@@ -1727,14 +1738,14 @@ dependencies = [
 
 [[package]]
 name = "rpi-plugin-sdk"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "rpi-telemetry"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "tokio",
@@ -1742,7 +1753,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-tools"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "base64",
@@ -1769,10 +1780,11 @@ dependencies = [
 
 [[package]]
 name = "rpi-tui"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "base64",
  "crossterm",
+ "pulldown-cmark",
  "regex",
  "similar",
  "thiserror 1.0.69",
@@ -2266,7 +2278,7 @@ dependencies = [
 
 [[package]]
 name = "tools-example"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "futures",
  "rpi-agent",
@@ -2360,12 +2372,18 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tui-example"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "crossterm",
  "rpi-tui",
  "tokio",
 ]
+
+[[package]]
+name = "unicase"
+version = "2.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dbc4bc3a9f746d862c45cb89d705aa10f187bb96c76001afab07a0d35ce60142"
 
 [[package]]
 name = "unicode-ident"

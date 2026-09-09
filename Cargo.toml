@@ -29,7 +29,7 @@ edition = "2021"
 rust-version = "1.78"
 license = "MIT"
 repository = "https://github.com/bigfish193/pi-rust"
-version = "0.1.5"
+version = "0.1.6"
 authors = ["BigFish <bigfish1913@gmail.com>"]
 
 [workspace.dependencies]
@@ -65,16 +65,16 @@ rpassword = "7"
 
 # pi-rust internal crates (published under the `rpi-` prefix; directories keep
 # the `pi-` name — package `name` is what crates.io + `extern crate` see).
-rpi-telemetry = { path = "crates/pi-telemetry", version = "0.1.5" }
-rpi-ai = { path = "crates/pi-ai", version = "0.1.5" }
-rpi-agent = { path = "crates/pi-agent", version = "0.1.5" }
-rpi-tools = { path = "crates/pi-tools", version = "0.1.5" }
-rpi-harness = { path = "crates/pi-harness", version = "0.1.5" }
+rpi-telemetry = { path = "crates/pi-telemetry", version = "0.1.6" }
+rpi-ai = { path = "crates/pi-ai", version = "0.1.6" }
+rpi-agent = { path = "crates/pi-agent", version = "0.1.6" }
+rpi-tools = { path = "crates/pi-tools", version = "0.1.6" }
+rpi-harness = { path = "crates/pi-harness", version = "0.1.6" }
 
-rpi-tui = { path = "crates/pi-tui", version = "0.1.5" }
+rpi-tui = { path = "crates/pi-tui", version = "0.1.6" }
 
-rpi-plugin-sdk = { path = "crates/rpi-plugin-sdk", version = "0.1.5" }
-rpi-extensions = { path = "crates/rpi-extensions", version = "0.1.5" }
+rpi-plugin-sdk = { path = "crates/rpi-plugin-sdk", version = "0.1.6" }
+rpi-extensions = { path = "crates/rpi-extensions", version = "0.1.6" }
 
 [profile.release]
 lto = "thin"

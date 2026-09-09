@@ -7,6 +7,8 @@
 use std::any::Any;
 use std::sync::Mutex;
 
+use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+
 use super::component::Component;
 use super::mermaid::Mermaid;
 use crate::ansi::{bold, italic, underline};
@@ -207,53 +209,35 @@ impl Markdown {
             }
 
             // ---- Headers ----
-            // pi colors the whole heading (prefix + text) with mdHeading and
-            // bolds it; h1/h2 are additionally underlined.
+            // Headings are rendered with the mdHeading color and bold text;
+            // h1/h2 are additionally underlined. Markdown markers are hidden.
             if let Some(rest) = strip_header(line, "######") {
                 list_continuation_indent = None;
-                let h = bold(
-                    &colors
-                        .md_heading
-                        .fg(&format!("###### {}", self.render_inline(rest))),
-                );
+                let h = bold(&colors.md_heading.fg(&self.render_inline(rest)));
                 push_wrapped(&pad, &h, cwidth, &mut lines);
             } else if let Some(rest) = strip_header(line, "#####") {
                 list_continuation_indent = None;
-                let h = bold(
-                    &colors
-                        .md_heading
-                        .fg(&format!("##### {}", self.render_inline(rest))),
-                );
+                let h = bold(&colors.md_heading.fg(&self.render_inline(rest)));
                 push_wrapped(&pad, &h, cwidth, &mut lines);
             } else if let Some(rest) = strip_header(line, "####") {
                 list_continuation_indent = None;
-                let h = bold(
-                    &colors
-                        .md_heading
-                        .fg(&format!("#### {}", self.render_inline(rest))),
-                );
+                let h = bold(&colors.md_heading.fg(&self.render_inline(rest)));
                 push_wrapped(&pad, &h, cwidth, &mut lines);
             } else if let Some(rest) = strip_header(line, "###") {
                 list_continuation_indent = None;
-                // Keep the heading marker visible at every level. H1/H2
-                // already do this; omitting `### ` here made H3 look like a
-                // regular bold paragraph and made streamed markdown jump
-                // between styles.
-                let h = bold(
-                    &colors
-                        .md_heading
-                        .fg(&format!("### {}", self.render_inline(rest))),
-                );
+                let h = bold(&colors.md_heading.fg(&self.render_inline(rest)));
                 push_wrapped(&pad, &h, cwidth, &mut lines);
             } else if let Some(rest) = strip_header(line, "##") {
                 list_continuation_indent = None;
-                let inner = bold(&underline(&self.render_inline(rest)));
-                let h = colors.md_heading.fg(&format!("{}{}", bold("## "), inner));
+                let h = colors
+                    .md_heading
+                    .fg(&bold(&underline(&self.render_inline(rest))));
                 push_wrapped(&pad, &h, cwidth, &mut lines);
             } else if let Some(rest) = strip_header(line, "#") {
                 list_continuation_indent = None;
-                let inner = bold(&underline(&bold(&self.render_inline(rest))));
-                let h = colors.md_heading.fg(&format!("{}{}", bold("# "), inner));
+                let h = colors
+                    .md_heading
+                    .fg(&bold(&underline(&self.render_inline(rest))));
                 push_wrapped(&pad, &h, cwidth, &mut lines);
             } else if let Some(item) = parse_list_item(line) {
                 let marker = match item.marker {
@@ -319,136 +303,161 @@ impl Markdown {
         lines
     }
 
-    /// Render inline markdown (bold, italic, code, links).
+    /// Render inline CommonMark/GFM with terminal-specific ANSI styling.
     fn render_inline(&self, text: &str) -> String {
         let colors = theme().colors;
-        let mut result = String::new();
-        let mut offset = 0;
+        let mut options = Options::empty();
+        options.insert(Options::ENABLE_STRIKETHROUGH);
 
-        while offset < text.len() {
-            let rest = &text[offset..];
+        // pulldown-cmark parses complete documents and has no inline-only
+        // entry point. A plain prefix keeps block-looking text in inline
+        // context; it is discarded from the first text event below.
+        let source = format!("x {text}");
+        let mut discard_prefix = true;
+        let mut frames = vec![InlineFrame::root()];
 
-            if let Some(escaped) = rest.strip_prefix('\\') {
-                if let Some(ch) = escaped.chars().next() {
-                    result.push(ch);
-                    offset += 1 + ch.len_utf8();
-                } else {
-                    result.push('\\');
-                    offset += 1;
+        for event in Parser::new_ext(&source, options) {
+            match event {
+                Event::Start(Tag::Strong) => frames.push(InlineFrame::new(InlineKind::Bold)),
+                Event::Start(Tag::Emphasis) => frames.push(InlineFrame::new(InlineKind::Italic)),
+                Event::Start(Tag::Strikethrough) => {
+                    frames.push(InlineFrame::new(InlineKind::Strike));
                 }
-                continue;
-            }
-
-            if rest.starts_with('`') {
-                let ticks = rest.chars().take_while(|c| *c == '`').count();
-                let delimiter = "`".repeat(ticks);
-                if let Some(end) = rest[ticks..].find(&delimiter) {
-                    let code = &rest[ticks..ticks + end];
+                Event::Start(Tag::Link { dest_url, .. }) => {
+                    frames.push(InlineFrame::new(InlineKind::Link(dest_url.into_string())))
+                }
+                Event::Start(Tag::Image { dest_url, .. }) => {
+                    frames.push(InlineFrame::new(InlineKind::Image(dest_url.into_string())))
+                }
+                Event::End(
+                    TagEnd::Strong
+                    | TagEnd::Emphasis
+                    | TagEnd::Strikethrough
+                    | TagEnd::Link
+                    | TagEnd::Image,
+                ) => close_inline_frame(&mut frames, &colors),
+                Event::Text(value) => {
+                    let mut value = value.as_ref();
+                    if discard_prefix {
+                        value = value.strip_prefix("x ").unwrap_or(value);
+                        discard_prefix = false;
+                    }
+                    frames
+                        .last_mut()
+                        .expect("root inline frame")
+                        .text
+                        .push_str(value);
+                }
+                Event::Code(code) => {
                     let chip = format!(" {} ", colors.md_code.fg(code.trim()));
-                    result.push_str(&colors.md_code_bg.bg(&chip));
-                    offset += ticks + end + ticks;
-                    continue;
+                    frames
+                        .last_mut()
+                        .expect("root inline frame")
+                        .text
+                        .push_str(&colors.md_code_bg.bg(&chip));
                 }
+                Event::InlineMath(value) => frames
+                    .last_mut()
+                    .expect("root inline frame")
+                    .text
+                    .push_str(&format!("${value}$")),
+                Event::DisplayMath(value) => frames
+                    .last_mut()
+                    .expect("root inline frame")
+                    .text
+                    .push_str(&format!("$${value}$$")),
+                Event::Html(value) | Event::InlineHtml(value) => frames
+                    .last_mut()
+                    .expect("root inline frame")
+                    .text
+                    .push_str(&value),
+                Event::FootnoteReference(label) => frames
+                    .last_mut()
+                    .expect("root inline frame")
+                    .text
+                    .push_str(&format!("[^{label}]")),
+                Event::SoftBreak => frames.last_mut().expect("root inline frame").text.push(' '),
+                Event::HardBreak => frames
+                    .last_mut()
+                    .expect("root inline frame")
+                    .text
+                    .push('\n'),
+                Event::TaskListMarker(checked) => frames
+                    .last_mut()
+                    .expect("root inline frame")
+                    .text
+                    .push(if checked { '☒' } else { '☐' }),
+                Event::Rule | Event::Start(_) | Event::End(_) => {}
             }
-
-            if rest.starts_with('[') {
-                if let Some(label_end) = rest.find("](") {
-                    let url_start = label_end + 2;
-                    if let Some(url_end) = matching_paren(&rest[url_start..]) {
-                        let label = &rest[1..label_end];
-                        let url = &rest[url_start..url_start + url_end];
-                        let styled = colors.md_link.fg(&underline(&self.render_inline(label)));
-                        result.push_str(&styled);
-                        if label != url {
-                            result.push_str(&colors.md_link_url.fg(&format!(" ({url})")));
-                        }
-                        offset += url_start + url_end + 1;
-                        continue;
-                    }
-                }
-            }
-
-            if let Some((delimiter, style)) = emphasis_delimiter(rest) {
-                if let Some(end) = rest[delimiter.len()..].find(delimiter) {
-                    let inner = &rest[delimiter.len()..delimiter.len() + end];
-                    if !inner.is_empty() {
-                        let rendered = self.render_inline(inner);
-                        match style {
-                            InlineStyle::Bold => result.push_str(&bold(&rendered)),
-                            InlineStyle::Italic => result.push_str(&italic(&rendered)),
-                            InlineStyle::Strike => {
-                                result.push_str("\x1b[9m");
-                                result.push_str(&rendered);
-                                result.push_str("\x1b[29m");
-                            }
-                        }
-                        offset += delimiter.len() + end + delimiter.len();
-                        continue;
-                    }
-                }
-            }
-
-            let ch = rest.chars().next().expect("offset is a character boundary");
-            result.push(ch);
-            offset += ch.len_utf8();
         }
 
-        result
+        while frames.len() > 1 {
+            close_inline_frame(&mut frames, &colors);
+        }
+        frames.pop().expect("root inline frame").text
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum InlineStyle {
+#[derive(Debug)]
+enum InlineKind {
+    Root,
     Bold,
     Italic,
     Strike,
+    Link(String),
+    Image(String),
 }
 
-/// Return an emphasis delimiter only when it can begin a formatting span.
-/// This intentionally leaves identifiers such as `snake_case` untouched.
-fn emphasis_delimiter(rest: &str) -> Option<(&'static str, InlineStyle)> {
-    if rest.starts_with("**") {
-        Some(("**", InlineStyle::Bold))
-    } else if rest.starts_with("__") {
-        Some(("__", InlineStyle::Bold))
-    } else if rest.starts_with("~~") {
-        Some(("~~", InlineStyle::Strike))
-    } else if rest.starts_with('*') {
-        Some(("*", InlineStyle::Italic))
-    } else if rest.starts_with('_') {
-        let next = rest[1..].chars().next();
-        if next.is_some_and(|ch| !ch.is_whitespace()) {
-            Some(("_", InlineStyle::Italic))
-        } else {
-            None
+#[derive(Debug)]
+struct InlineFrame {
+    kind: InlineKind,
+    text: String,
+}
+
+impl InlineFrame {
+    fn root() -> Self {
+        Self::new(InlineKind::Root)
+    }
+
+    fn new(kind: InlineKind) -> Self {
+        Self {
+            kind,
+            text: String::new(),
         }
-    } else {
-        None
     }
 }
 
-/// Return the byte offset of the close paren matching the opening paren that
-/// follows a Markdown link label. Parentheses in URLs are common in docs.
-fn matching_paren(text: &str) -> Option<usize> {
-    let mut depth = 0usize;
-    let mut escaped = false;
-    for (offset, ch) in text.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if ch == '\\' {
-            escaped = true;
-        } else if ch == '(' {
-            depth += 1;
-        } else if ch == ')' {
-            if depth == 0 {
-                return Some(offset);
+fn close_inline_frame(frames: &mut Vec<InlineFrame>, colors: &crate::theme::ThemeColors) {
+    let Some(frame) = (frames.len() > 1).then(|| frames.pop()).flatten() else {
+        return;
+    };
+    let rendered = match frame.kind {
+        InlineKind::Root => frame.text,
+        InlineKind::Bold => bold(&frame.text),
+        InlineKind::Italic => italic(&frame.text),
+        InlineKind::Strike => format!("\x1b[9m{}\x1b[29m", frame.text),
+        InlineKind::Link(url) => {
+            let label = colors.md_link.fg(&underline(&frame.text));
+            if crate::ansi::strip_ansi(&frame.text) == url {
+                label
+            } else {
+                format!("{label}{}", colors.md_link_url.fg(&format!(" ({url})")))
             }
-            depth -= 1;
         }
-    }
-    None
+        InlineKind::Image(url) => {
+            let alt = if frame.text.is_empty() {
+                "image".to_string()
+            } else {
+                frame.text
+            };
+            format!("{alt}{}", colors.md_link_url.fg(&format!(" ({url})")))
+        }
+    };
+    frames
+        .last_mut()
+        .expect("root inline frame")
+        .text
+        .push_str(&rendered);
 }
 
 enum ListMarker {
@@ -805,9 +814,35 @@ mod tests {
 
     #[test]
     fn test_markdown_headers() {
-        let md = Markdown::new("# Title\n## Subtitle\n### Heading", 0, 0);
+        let md = Markdown::new("# H1\n## H2\n### H3\n#### H4\n##### H5\n###### H6", 0, 0);
         let lines = md.render(80);
-        assert_eq!(lines.len(), 3);
+        let plain: Vec<String> = lines
+            .iter()
+            .map(|line| crate::ansi::strip_ansi(line))
+            .collect();
+        assert_eq!(plain, vec!["H1", "H2", "H3", "H4", "H5", "H6"]);
+    }
+
+    #[test]
+    fn test_commonmark_inline_parser_handles_nested_spans_and_images() {
+        let md = Markdown::new(
+            "This is ***nested***, ``a ` b``, <https://example.com>, ![plot](plot.png)",
+            0,
+            0,
+        );
+        let rendered = md.render(120).join("\n");
+        let plain = crate::ansi::strip_ansi(&rendered);
+
+        assert_eq!(
+            plain,
+            "This is nested,  a ` b , https://example.com, plot (plot.png)"
+        );
+        assert!(rendered.contains("\x1b[1m"), "nested strong style missing");
+        assert!(rendered.contains("\x1b[3m"), "nested emphasis missing");
+        assert!(
+            rendered.contains("\x1b[48;2;48;52;59m"),
+            "multi-backtick code span should use the code chip"
+        );
     }
 
     #[test]
