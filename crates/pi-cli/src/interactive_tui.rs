@@ -2838,6 +2838,19 @@ pub async fn interactive_tui(
     let lane_model_id = lane.get_model().await.map(|m| m.id).unwrap_or_default();
     let model_name = short_model_name(&lane_model_id);
 
+    // Snapshot startup capabilities for the welcome screen. Both accessors
+    // return defensive clones, so rendering this summary does not retain a
+    // harness lock or trigger a second resource scan.
+    let active_tool_names = lane.get_active_tools().await.unwrap_or_default();
+    let resources_snapshot = harness.get_resources().await.unwrap_or_default();
+    let skill_names: Vec<String> = resources_snapshot
+        .skills
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(|skill| skill.name.clone())
+        .collect();
+
     // The cwd for @file autocomplete + session discovery.
     let cwd = std::env::current_dir()
         .map(|p| p.to_path_buf())
@@ -2863,7 +2876,7 @@ pub async fn interactive_tui(
     let tui = Arc::new(TuiAltScreen::new(terminal, true, None));
 
     let chat_container = Arc::new(Container::new());
-    add_welcome_message(&chat_container);
+    add_welcome_message_with_capabilities(&chat_container, &active_tool_names, &skill_names);
 
     // First-launch gate: if `~/.rpi/.setup_done` is absent, show the welcome
     // banner + the earendil announcement once, then write the sentinel. The TS
@@ -2949,7 +2962,6 @@ pub async fn interactive_tui(
     // (fired from the blocking submit handler, which can't `.await`) reads the
     // snapshot to render the discovered-resources panel without touching the
     // harness async accessor.
-    let resources_snapshot = harness.get_resources().await.unwrap_or_default();
     let template_slash_commands: Vec<SlashCommandEntry> = resources_snapshot
         .prompt_templates
         .clone()
@@ -5179,6 +5191,17 @@ fn accept_top_suggestion(state: &Arc<TuiState>, editor: &Arc<Editor>) -> bool {
 
 /// Add the welcome header to the chat container.
 fn add_welcome_message(container: &Arc<Container>) {
+    add_welcome_message_with_capabilities(container, &[], &[]);
+}
+
+/// Add the startup welcome header and a compact snapshot of active tools and
+/// discovered skills. The snapshot reflects the harness configuration used by
+/// the first turn, including tools contributed by extensions.
+fn add_welcome_message_with_capabilities(
+    container: &Arc<Container>,
+    active_tools: &[String],
+    skills: &[String],
+) {
     let c = current_theme().colors;
     // Accent logotype + a dim tagline, separated from the rest by a thin
     // themed rule. Plain `Text("rpi interactive TUI")` was visually identical
@@ -5199,7 +5222,32 @@ fn add_welcome_message(container: &Arc<Container>) {
         .dim
         .fg("Enter send · Shift+Enter newline · Ctrl+C abort · Esc abort · /help");
     container.add_child(Arc::new(Text::new(hint, 1, 0)));
+    container.add_child(Arc::new(Spacer::new(1)));
+    container.add_child(Arc::new(Text::new(
+        welcome_capability_line("Tools", active_tools),
+        1,
+        0,
+    )));
+    container.add_child(Arc::new(Text::new(
+        welcome_capability_line("Skills", skills),
+        1,
+        0,
+    )));
     container.add_child(Arc::new(DynamicBorder::new()));
+}
+
+fn welcome_capability_line(label: &str, names: &[String]) -> String {
+    let c = current_theme().colors;
+    let value = if names.is_empty() {
+        "none".to_string()
+    } else {
+        names.join(" · ")
+    };
+    format!(
+        "{} {}",
+        c.accent.fg(&format!("{label} ({})", names.len())),
+        c.muted.fg(&value)
+    )
 }
 
 /// Add the `/help` command listing to the chat container.
@@ -5502,7 +5550,11 @@ mod tests {
     #[test]
     fn test_chat_container_has_welcome_content() {
         let chat = Arc::new(Container::new());
-        add_welcome_message(&chat);
+        add_welcome_message_with_capabilities(
+            &chat,
+            &["read".into(), "bash".into(), "web_fetch".into()],
+            &["rust-review".into(), "release".into()],
+        );
 
         let lines = chat.render(80);
         let all: String = lines.join("\n");
@@ -5514,6 +5566,22 @@ mod tests {
             "Welcome message not in chat container: {:?}",
             lines
         );
+        assert!(plain.contains("Tools (3)"), "Tool count missing: {plain}");
+        assert!(
+            plain.contains("read · bash · web_fetch"),
+            "Tool names missing: {plain}"
+        );
+        assert!(plain.contains("Skills (2)"), "Skill count missing: {plain}");
+        assert!(
+            plain.contains("rust-review · release"),
+            "Skill names missing: {plain}"
+        );
+    }
+
+    #[test]
+    fn welcome_capabilities_show_empty_state() {
+        let plain = strip_ansi(&welcome_capability_line("Skills", &[]));
+        assert_eq!(plain, "Skills (0) none");
     }
 
     /// Reproduction for "Tab 补全了但显示没刷新": after `accept_top_suggestion`
