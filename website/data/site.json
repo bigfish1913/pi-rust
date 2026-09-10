@@ -40,7 +40,7 @@
     }
   ],
   "releases": [
-    { "version": "0.1.7", "status": "current", "title": "Install + extensions", "description": "新增 rpi install，并接入 9 个已发布的 Rust 扩展 package。" },
+    { "version": "0.1.8", "status": "current", "title": "Better sessions + packages", "description": "会话按时间顺序恢复与导出，扩展可渲染 token usage，并明确核心 crate 与扩展 package 的安装方式。" },
     { "version": "next", "status": "building", "title": "More surfaces", "description": "扩展 package manifest、更多 Provider 和更完整的插件资源协议。" },
     { "version": "future", "status": "exploring", "title": "Your ideas", "description": "把 rpi 接进你的产品、工作流和自己的运行环境。" }
   ]

@@ -1847,7 +1847,9 @@ async fn share_session(harness: &AgentHarness, chat: &Arc<Container>) {
         .find_entries(&EntryQuery {
             entry_type: None,
             custom_type: None,
-            order: None,
+            // Exports append entries top-to-bottom, so use chronological order
+            // instead of the session query default (newest-first).
+            order: Some(EntryOrder::OldestFirst),
             limit: None,
             cursor: None,
         })
@@ -1930,7 +1932,9 @@ async fn export_session(harness: &AgentHarness, chat: &Arc<Container>) {
         .find_entries(&EntryQuery {
             entry_type: None,
             custom_type: None,
-            order: None,
+            // Keep exported entries in the same chronological order shown in
+            // the transcript; the storage default is newest-first.
+            order: Some(EntryOrder::OldestFirst),
             limit: None,
             cursor: None,
         })
@@ -2155,7 +2159,10 @@ async fn render_session_history(
         .find_entries(&EntryQuery {
             entry_type: None,
             custom_type: None,
-            order: None,
+            // Session queries default to newest-first for selectors and
+            // pagination. The transcript appends children top-to-bottom, so
+            // restored history must explicitly be chronological.
+            order: Some(EntryOrder::OldestFirst),
             limit: None,
             cursor: None,
         })
@@ -2184,6 +2191,9 @@ async fn render_session_history(
                     // Single trailing spacer: the next transcript entry (user or
                     // assistant) follows one blank line below.
                     chat.add_child(Arc::new(Spacer::new(1)));
+                    if let Some(text) = extension_usage_text(extension_session.as_ref(), &a.usage) {
+                        add_note_message(chat, &text);
+                    }
                     rendered_any = true;
                 }
                 AgentMessage::Custom(custom) => {
@@ -2345,6 +2355,29 @@ fn extension_message_component(
     }
     extension_text_component(&value)
         .or_else(|| Some(Arc::new(Text::new(format!("[{custom_type}]"), 0, 0))))
+}
+
+/// Render usage from a completed assistant message through the registered
+/// message renderers. Hosts without a token-usage renderer return `None`.
+fn extension_usage_text(
+    session: Option<&crate::session::ExtensionSessionCell>,
+    usage: &rpi_ai::types::Usage,
+) -> Option<String> {
+    let session = session?;
+    let payload = serde_json::json!({
+        "customType": "token-usage",
+        "usage": usage,
+    });
+    let value = invoke_extension_renderer(
+        session,
+        rpi_extensions::RegisteredRendererKind::Message,
+        &payload,
+    )?;
+    value
+        .get("text")
+        .and_then(|value| value.as_str())
+        .filter(|text| !text.trim().is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn extension_entry_component(
@@ -4142,6 +4175,9 @@ async fn handle_agent_event(
                             format_tokens(usage.input)
                         ),
                     );
+                }
+                if let Some(text) = extension_usage_text(Some(&state.extension_session), usage) {
+                    add_note_message(chat, &text);
                 }
                 *state.last_input_tokens.lock().unwrap() = usage.input;
             }
