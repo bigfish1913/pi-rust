@@ -37,7 +37,7 @@
   },
   {
     "name": "rpi-plugin-sdk",
-    "type": "extension",
+    "type": "crate",
     "age": 4,
     "ageLabel": "v0.1.7 · ABI v1",
     "description": "Rust cdylib 插件的稳定 #[repr(C)] ABI 合约，插件只依赖这一层边界。",
@@ -49,7 +49,7 @@
   },
   {
     "name": "rpi-extensions",
-    "type": "extension",
+    "type": "crate",
     "age": 5,
     "ageLabel": "v0.1.7 · loader",
     "description": "宿主侧动态插件加载器，将 ABI 插件适配为 AgentTool 并管理生命周期。",

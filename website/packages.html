@@ -23,8 +23,12 @@
         <section class="packages-hero page-section">
           <div class="eyebrow eyebrow-dark">RPI / PACKAGE CATALOG</div>
           <h1>把 Agent 的能力，<br /><em>装进你的工作流。</em></h1>
-          <p>扩展、skills、providers 和 prompt templates 的静态目录。先从这里发现组合方式，再用 Cargo 或 Git 接入自己的 rpi 项目。</p>
-          <div class="packages-install"><span class="command-prompt">$</span><code>cargo add rpi-tools</code><button type="button" data-copy-command aria-label="复制安装命令">⧉</button></div>
+          <p>核心 crate 用 Cargo 接入项目；已发布的 cdylib 扩展用 rpi CLI 安装。先从这里发现组合方式，再接入自己的 rpi 工作流。</p>
+          <div class="packages-install-grid">
+            <div><div class="command-label">核心 crate</div><div class="packages-install"><span class="command-prompt">$</span><code>cargo add rpi-tools</code><button type="button" data-copy-command aria-label="复制核心 crate 安装命令">⧉</button></div></div>
+            <div><div class="command-label">扩展 package</div><div class="packages-install"><span class="command-prompt">$</span><code>rpi install rpi-todo</code><button type="button" data-copy-command aria-label="复制扩展安装命令">⧉</button></div></div>
+          </div>
+          <p class="packages-install-note">`cargo add` 适用于库依赖；`rpi install` 适用于 crates.io 上的 Rust cdylib 扩展。</p>
         </section>
 
         <section class="package-catalog page-section">

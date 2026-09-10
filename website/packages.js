@@ -56,7 +56,7 @@ async function init() {
   $('[data-package-type]').addEventListener('change', (event) => { state.type = event.target.value; renderList(); });
   $('[data-package-sort]').addEventListener('change', (event) => { state.sort = event.target.value; renderList(); });
   $('[data-reset]').addEventListener('click', () => { state.query = ''; state.type = 'all'; state.sort = 'downloads'; $('[data-package-search]').value = ''; $('[data-package-type]').value = 'all'; $('[data-package-sort]').value = 'downloads'; renderList(); });
-  $('[data-copy-command]').addEventListener('click', async () => { try { await navigator.clipboard.writeText($('[data-copy-command]').previousElementSibling.textContent); showToast('安装命令已复制'); } catch { showToast('复制失败，请手动选择文本'); } });
+  $$('[data-copy-command]').forEach((button) => button.addEventListener('click', async () => { try { await navigator.clipboard.writeText(button.previousElementSibling.textContent); showToast('安装命令已复制'); } catch { showToast('复制失败，请手动选择文本'); } }));
 }
 
 init().catch((error) => { console.error(error); showToast('数据加载失败，请通过本地开发服务器打开网站'); });
