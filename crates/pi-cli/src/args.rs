@@ -510,6 +510,12 @@ pub fn print_help() {
                                 (see `rpi install --help`)
   install-pi <spec>              Install an npm/git/local Pi package
                                 (see `rpi install-pi --help`)
+  uninstall <crate>              Remove an installed Rust cdylib extension
+                                (use `rpi uninstall pi <spec>` for Pi packages)
+  uninstall-pi <spec>            Remove an installed npm/git/local Pi package
+                                (see `rpi uninstall-pi --help`)
+  dev [options]                  Build, watch, and hot-reload a Rust extension
+                                (see `rpi dev --help`)
 
 {u}Built-in Tools:{r}
   {builtin}  (enabled by default; grep/find/ls are read-only)

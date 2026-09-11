@@ -50,7 +50,33 @@ pub const EXIT_RUNTIME: i32 = 1;
 pub async fn run() -> i32 {
     // argv[0] is the program name; skip it (TS `main(args)` receives the same,
     // already sliced by the Node CLI entry).
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let mut argv: Vec<String> = std::env::args().skip(1).collect();
+
+    if argv.first().map(String::as_str) == Some("__rpi_dev_cleanup") {
+        return crate::dev_extension::run_cleanup_helper(&argv[1..]);
+    }
+
+    // `rpi dev` wraps the normal CLI: consume only development-specific
+    // options, then pass every remaining argument through the regular parser.
+    let dev_options = if argv.first().map(String::as_str) == Some("dev") {
+        match crate::dev_extension::parse_args(&argv[1..]) {
+            Ok(options) if options.help => {
+                crate::dev_extension::print_help();
+                return 0;
+            }
+            Ok(options) => {
+                argv = options.passthrough.clone();
+                Some(options)
+            }
+            Err(error) => {
+                eprintln!("error: {error}");
+                crate::dev_extension::print_help();
+                return EXIT_USAGE;
+            }
+        }
+    } else {
+        None
+    };
 
     // ---- `rpi auth …` subcommand dispatch (before flag parsing) ----
     // `auth` is a top-level subcommand (mirrors TS `runAuthCommand` routing in
@@ -69,6 +95,15 @@ pub async fn run() -> i32 {
     }
     if argv.first().map(|s| s.as_str()) == Some("install-pi") {
         return crate::install_pi::run(&argv[1..]);
+    }
+    if argv.first().map(|s| s.as_str()) == Some("uninstall") {
+        if argv.get(1).map(String::as_str) == Some("pi") {
+            return crate::install_pi::uninstall(&argv[2..]);
+        }
+        return crate::install::uninstall(&argv[1..]);
+    }
+    if argv.first().map(|s| s.as_str()) == Some("uninstall-pi") {
+        return crate::install_pi::uninstall(&argv[1..]);
     }
 
     let mut parsed = parse_args(&argv);
@@ -106,6 +141,29 @@ pub async fn run() -> i32 {
     // Best-effort; never blocks startup. Skipped when RPI_CODING_AGENT_DIR is
     // set (an explicit override is its own layout).
     let _ = crate::config::migrate_legacy_layout();
+
+    // Build before provider resolution so compiler errors do not require
+    // valid model credentials. The staged directory joins normal discovery.
+    let dev_extension = if let Some(options) = &dev_options {
+        let extension = match crate::dev_extension::DevExtension::detect(&cwd, options) {
+            Ok(extension) => extension,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return EXIT_USAGE;
+            }
+        };
+        if let Err(error) = extension.rebuild() {
+            eprintln!("error: initial extension build failed: {error}");
+            return EXIT_RUNTIME;
+        }
+        if let Err(error) = extension.apply_to_args(&mut parsed) {
+            eprintln!("error: {error}");
+            return EXIT_RUNTIME;
+        }
+        Some(extension)
+    } else {
+        None
+    };
 
     // Update checks are interactive-only and best-effort. They write to
     // stderr so print/JSON modes remain machine-readable, and the checker
@@ -214,13 +272,14 @@ pub async fn run() -> i32 {
     }
 
     // ---- harness build ----
-    let (harness, event_rx, reload_context) = match build(&resolved, &parsed, &cwd).await {
+    let (harness, event_rx, mut reload_context) = match build(&resolved, &parsed, &cwd).await {
         Ok(triple) => triple,
         Err(e) => {
             print_build_error(&e);
             return EXIT_RUNTIME;
         }
     };
+    reload_context.dev_extension = dev_extension;
 
     // ---- mode dispatch (TS resolveAppMode → runPrintMode / InteractiveMode / runRpcMode) ----
     let stdin_is_tty = std::io::stdin().is_terminal();
@@ -245,7 +304,17 @@ pub async fn run() -> i32 {
         mode
     };
 
-    match mode {
+    let dev_cleanup = reload_context.dev_extension.clone();
+    let dev_watcher = if matches!(mode, RunMode::Interactive) {
+        reload_context
+            .dev_extension
+            .as_ref()
+            .and_then(|extension| extension.start_watcher(reload_context.mailbox.clone()))
+    } else {
+        None
+    };
+
+    let exit_code = match mode {
         RunMode::Print => crate::modes::print(&harness, &parsed, initial.clone(), &extra).await,
         RunMode::Json => crate::modes::json(&harness, &parsed, initial.clone(), &extra).await,
         RunMode::Interactive => {
@@ -268,7 +337,20 @@ pub async fn run() -> i32 {
             eprintln!("error: rpc mode is not implemented in v1 (use --mode text or --mode json)");
             EXIT_USAGE
         }
+    };
+
+    if let Some(dev) = &dev_cleanup {
+        dev.stop_watcher();
     }
+    if let Some(watcher) = dev_watcher {
+        let _ = watcher.join();
+    }
+    drop(reload_context);
+    drop(harness);
+    if let Some(dev) = dev_cleanup {
+        dev.cleanup();
+    }
+    exit_code
 }
 
 /// Read piped stdin into a string. Mirrors TS `readPipedStdin`: returns `None`

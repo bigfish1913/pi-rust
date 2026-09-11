@@ -192,6 +192,193 @@ pub fn update_npm_package(root: &Path, name: &str) -> Result<PathBuf, String> {
     install_npm(destination, &format!("npm:{name}@latest"), true)
 }
 
+#[derive(Debug, Clone)]
+struct UninstallOptions {
+    spec: String,
+    global: bool,
+}
+
+/// Remove a Pi package installed by `rpi install-pi` and disable its settings
+/// entry. Source directories outside rpi/pi package stores are never deleted.
+pub fn uninstall(args: &[String]) -> i32 {
+    let options = match parse_uninstall_args(args) {
+        Ok(options) => options,
+        Err(message) if message == "help" => {
+            print_uninstall_help();
+            return 0;
+        }
+        Err(message) => {
+            eprintln!("error: {message}");
+            print_uninstall_help();
+            return 2;
+        }
+    };
+    let cwd = match std::env::current_dir() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("error: could not determine current directory: {error}");
+            return 1;
+        }
+    };
+    let root = find_installed_root(&cwd, &options);
+    let removed_settings = match remove_settings_entries(&cwd, &options.spec, root.as_deref()) {
+        Ok(count) => count,
+        Err(error) => {
+            eprintln!("error: could not update package settings: {error}");
+            return 1;
+        }
+    };
+    let mut removed_files = false;
+    if let Some(root) = root {
+        if root.exists() && is_managed_package_root(&cwd, &root) {
+            match std::fs::remove_dir_all(&root) {
+                Ok(()) => {
+                    println!("removed Pi package {}", root.display());
+                    removed_files = true;
+                }
+                Err(error) => {
+                    eprintln!("error: could not remove {}: {error}", root.display());
+                    return 1;
+                }
+            }
+        } else if root.exists() {
+            println!(
+                "disabled Pi package at {}; source directory was left intact",
+                root.display()
+            );
+        }
+    }
+    if !removed_files && removed_settings == 0 {
+        println!("Pi package is not installed: {}", options.spec);
+    } else if removed_settings > 0 && !removed_files {
+        println!("disabled Pi package {}", options.spec);
+    }
+    0
+}
+
+fn parse_uninstall_args(args: &[String]) -> Result<UninstallOptions, String> {
+    let mut spec = None;
+    let mut global = false;
+    for arg in args {
+        match arg.as_str() {
+            "--help" | "-h" => return Err("help".into()),
+            "--global" | "-g" => global = true,
+            value if value.starts_with('-') => {
+                return Err(format!("unknown uninstall-pi option `{value}`"));
+            }
+            value => {
+                if spec.replace(value.to_string()).is_some() {
+                    return Err("uninstall-pi accepts exactly one package spec".into());
+                }
+            }
+        }
+    }
+    Ok(UninstallOptions {
+        spec: spec.ok_or_else(|| "missing npm, git, or local package spec".to_string())?,
+        global,
+    })
+}
+
+fn find_installed_root(cwd: &Path, options: &UninstallOptions) -> Option<PathBuf> {
+    let raw = options.spec.strip_prefix("file:").unwrap_or(&options.spec);
+    let package_key = package_dir_name(&options.spec);
+    let mut candidates = Vec::new();
+    let direct = PathBuf::from(raw);
+    if direct.is_absolute() || raw.starts_with('.') {
+        candidates.push(if direct.is_absolute() {
+            direct
+        } else {
+            cwd.join(direct)
+        });
+    }
+    let add_store = |store: PathBuf, candidates: &mut Vec<PathBuf>| {
+        candidates.push(store.join(&package_key));
+    };
+    if !options.global {
+        add_store(cwd.join(".rpi/packages"), &mut candidates);
+        add_store(cwd.join(".pi/packages"), &mut candidates);
+    }
+    if let Ok(agent) = crate::config::agent_dir() {
+        add_store(agent.join("packages"), &mut candidates);
+    }
+    if let Some(home) = dirs::home_dir() {
+        add_store(home.join(".pi/agent/packages"), &mut candidates);
+    }
+    let wanted_name = package_name(&options.spec);
+    for package in crate::packages::discover_from_settings(cwd).packages {
+        if package.name == wanted_name
+            || safe_name(&package.name) == package_key
+            || package
+                .root
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == package_key)
+        {
+            candidates.push(package.root);
+        }
+    }
+    candidates
+        .into_iter()
+        .find_map(|path| std::fs::canonicalize(path).ok())
+}
+
+fn package_dir_name(spec: &str) -> String {
+    let raw = spec.strip_prefix("git:").unwrap_or(spec);
+    if raw.starts_with("http://") || raw.starts_with("https://") {
+        return safe_name(
+            raw.trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .unwrap_or("package"),
+        );
+    }
+    safe_name(raw)
+}
+
+fn is_managed_package_root(cwd: &Path, root: &Path) -> bool {
+    let mut stores = vec![cwd.join(".rpi/packages"), cwd.join(".pi/packages")];
+    if let Ok(agent) = crate::config::agent_dir() {
+        stores.push(agent.join("packages"));
+    }
+    if let Some(home) = dirs::home_dir() {
+        stores.push(home.join(".pi/agent/packages"));
+    }
+    stores.iter().any(|store| {
+        let store = std::fs::canonicalize(store).unwrap_or_else(|_| store.clone());
+        root.starts_with(store)
+    })
+}
+
+fn remove_settings_entries(cwd: &Path, spec: &str, root: Option<&Path>) -> Result<usize, String> {
+    let mut settings = crate::settings::load_settings().unwrap_or_default();
+    let Some(packages) = settings.packages.as_mut() else {
+        return Ok(0);
+    };
+    let wanted_name = package_name(spec);
+    let before = packages.len();
+    packages.retain(|entry| {
+        if entry == spec || package_name(entry) == wanted_name && !entry.starts_with('.') {
+            return false;
+        }
+        let matches_root = root.is_some_and(|root| {
+            crate::packages::resolve_package(cwd, entry)
+                .ok()
+                .and_then(|package| std::fs::canonicalize(package.root).ok())
+                .is_some_and(|candidate| candidate == root)
+        });
+        !matches_root
+    });
+    let removed = before - packages.len();
+    if removed == 0 {
+        return Ok(0);
+    }
+    if packages.is_empty() {
+        settings.packages = None;
+    }
+    crate::settings::save_settings(&settings).map_err(|error| error.to_string())?;
+    Ok(removed)
+}
+
 fn npm_module_name(spec: &str) -> String {
     let raw = spec.strip_prefix("npm:").unwrap_or(spec);
     if raw.starts_with('@') {
@@ -421,6 +608,10 @@ pub fn print_help() {
     println!("Usage: rpi install-pi [options] <spec>\n\nInstall a Pi npm/git/local package and enable its static resources and JS/TS extensions.\n\nSpecs:\n  npm:@scope/package@1.0.0\n  git:github.com/user/repo@v1\n  ./local-package\n\nOptions:\n  --global, -g  Install into ~/.rpi/agent/packages\n  --force, -f   Replace an existing package\n  --help, -h    Show this help");
 }
 
+fn print_uninstall_help() {
+    println!("Usage: rpi uninstall-pi [options] <spec>\n\nRemove an installed Pi npm/git/local package and disable it in settings.\n\nSpecs:\n  npm:@scope/package\n  git:github.com/user/repo\n  ./local-package\n\nOptions:\n  --global, -g  Remove from ~/.rpi/agent/packages\n  --help, -h    Show this help\n\nAliases:\n  rpi uninstall pi <spec>");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,5 +628,17 @@ mod tests {
     #[test]
     fn rejects_missing_spec() {
         assert!(parse_args(&[]).is_err());
+    }
+
+    #[test]
+    fn parses_uninstall_specs_and_flags() {
+        let options = parse_uninstall_args(&["--global".into(), "npm:@scope/pkg".into()]).unwrap();
+        assert!(options.global);
+        assert_eq!(options.spec, "npm:@scope/pkg");
+    }
+
+    #[test]
+    fn rejects_multiple_uninstall_specs() {
+        assert!(parse_uninstall_args(&["a".into(), "b".into()]).is_err());
     }
 }

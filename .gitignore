@@ -16,4 +16,8 @@ target/*
 # Static frontend deployment bundle
 .deploy/
 .codegraph
-.rpi/
+.rpi/*
+!.rpi/skills/
+.rpi/skills/*
+!.rpi/skills/rpi-extension-authoring/
+!.rpi/skills/rpi-extension-authoring/SKILL.md

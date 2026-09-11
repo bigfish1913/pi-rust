@@ -26,6 +26,11 @@ pub struct InstalledNativePackage {
     pub version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// Dynamic-library file names copied into the extension store. Older
+    /// metadata files omit this field; uninstall falls back to crate-name
+    /// matching for those records.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -188,12 +193,140 @@ pub fn run(args: &[String]) -> i32 {
             .path
             .as_ref()
             .map(|path| path.to_string_lossy().into_owned()),
+        artifacts: artifacts
+            .iter()
+            .filter_map(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .collect(),
     };
     if let Err(error) = record_native_package(&record) {
         eprintln!("warning: extension installed but package metadata was not saved: {error}");
     }
     println!("rpi will load this extension on the next start.");
     0
+}
+
+/// Remove a Rust-native extension installed by `rpi install`.
+///
+/// The install registry is authoritative for new installs. For metadata from
+/// older rpi versions, dynamic libraries whose normalized file stem matches
+/// the crate name are removed as a compatibility fallback.
+pub fn uninstall(args: &[String]) -> i32 {
+    if args.len() == 1 && matches!(args[0].as_str(), "--help" | "-h") {
+        print_uninstall_help();
+        return 0;
+    }
+    let name = match parse_uninstall_name(args) {
+        Ok(name) => name,
+        Err(error) => {
+            eprintln!("error: {error}");
+            print_uninstall_help();
+            return 2;
+        }
+    };
+    let agent = match crate::config::agent_dir() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("error: could not resolve the rpi config directory: {error}");
+            return 1;
+        }
+    };
+    let extension_dir = agent.join("extensions");
+    let records = installed_native_packages();
+    let had_record = records.iter().any(|record| record.name == name);
+    let wanted = normalize_name(&name);
+    let artifact_names: std::collections::HashSet<String> = records
+        .iter()
+        .filter(|record| record.name == name)
+        .flat_map(|record| record.artifacts.iter().cloned())
+        .collect();
+    let mut removed = 0usize;
+    if let Ok(entries) = std::fs::read_dir(&extension_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_artifact = artifact_names.contains(
+                &path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            ) || path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(|stem| normalize_name(stem.trim_start_matches("lib")) == wanted)
+                .unwrap_or(false);
+            if is_artifact && is_dynamic_library(&path) {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {
+                        println!("removed {}", path.display());
+                        removed += 1;
+                    }
+                    Err(error) => {
+                        eprintln!("warning: could not remove {}: {error}", path.display())
+                    }
+                }
+            }
+        }
+    }
+    let mut remaining: Vec<_> = records
+        .into_iter()
+        .filter(|record| record.name != name)
+        .collect();
+    if had_record {
+        remaining.sort_by(|left, right| left.name.cmp(&right.name));
+        if let Err(error) = write_native_packages(&remaining) {
+            eprintln!("error: extension files removed but metadata could not be saved: {error}");
+            return 1;
+        }
+    }
+    if removed == 0 && !had_record {
+        println!("Rust extension is not installed: {name}");
+        return 0;
+    }
+    println!("uninstalled Rust extension {name}");
+    0
+}
+
+fn parse_uninstall_name(args: &[String]) -> Result<String, String> {
+    let mut name = None;
+    for arg in args {
+        match arg.as_str() {
+            "--help" | "-h" => return Err("use `rpi uninstall --help` for usage".into()),
+            value if value.starts_with('-') => {
+                return Err(format!("unknown uninstall option `{value}`"))
+            }
+            value => {
+                if name.replace(value.to_string()).is_some() {
+                    return Err("uninstall accepts exactly one crate name".into());
+                }
+            }
+        }
+    }
+    let name = name.ok_or_else(|| "missing crate name".to_string())?;
+    if !valid_package_name(&name) {
+        return Err(format!("invalid Cargo package name `{name}`"));
+    }
+    Ok(name)
+}
+
+fn write_native_packages(records: &[InstalledNativePackage]) -> Result<(), String> {
+    let path = crate::config::agent_dir()
+        .map_err(|error| error.to_string())?
+        .join(NATIVE_PACKAGES_FILE);
+    if records.is_empty() {
+        match std::fs::remove_file(&path) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| "native package metadata has no parent".to_string())?;
+    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let data = serde_json::to_vec_pretty(records).map_err(|error| error.to_string())?;
+    std::fs::write(path, data).map_err(|error| error.to_string())
 }
 
 /// Read the registry of Rust-native extensions installed by `rpi install`.
@@ -294,6 +427,12 @@ fn help_requested() -> &'static str {
 pub fn print_help() {
     println!(
         "Usage: rpi install <crate> [options]\n\nInstall an rpi Rust cdylib extension from crates.io.\n\nOptions:\n  --version <version>  Install a specific crates.io version\n  --path <directory>   Build a local extension crate\n  --locked             Require Cargo.lock to remain unchanged\n  --force, -f          Replace an existing installed extension\n  --help, -h           Show this help\n\nExamples:\n  rpi install rpi-extension-example\n  rpi install rpi-extension-example --version 0.1.0\n  rpi install my-extension --path ../my-rpi-extension --force"
+    );
+}
+
+fn print_uninstall_help() {
+    println!(
+        "Usage: rpi uninstall <crate>\n\nRemove a Rust cdylib extension installed by `rpi install`.\n\nOptions:\n  --help, -h           Show this help\n\nExample:\n  rpi uninstall rpi-extension-example"
     );
 }
 

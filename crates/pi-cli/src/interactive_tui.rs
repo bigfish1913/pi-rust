@@ -391,50 +391,62 @@ impl SlashCommand for JsExtensionCommand {
         "JS extension command".to_string()
     }
     fn execute(&self, ctx: &CommandContext, args: &str) {
-        match self.session.invoke_command_with_context(
-            self.name.trim_start_matches('/'),
-            args,
-            serde_json::json!({"editorText": ctx.editor.get_text()}),
-        ) {
-            Ok(value) => {
-                if let Some(editor_text) = value.get("editorText").and_then(|v| v.as_str()) {
-                    if editor_text != ctx.editor.get_text() {
-                        let cursor = editor_text.chars().count();
-                        ctx.editor.set_text(editor_text);
-                        ctx.editor.set_cursor(0, cursor);
-                    }
-                }
-                if let Some(notifications) = value.get("notifications").and_then(|v| v.as_array()) {
-                    for notification in notifications {
-                        let message = notification
-                            .get("message")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default();
-                        if message.is_empty() {
-                            continue;
-                        }
-                        match notification.get("level").and_then(|v| v.as_str()) {
-                            Some("error") => add_error_message(&ctx.chat, message),
-                            _ => add_note_message(&ctx.chat, message),
+        // JS commands may own the terminal for their entire lifetime (for
+        // example pi-btw's fullscreen side thread). Running them inline here
+        // would block the crossterm key thread, so no input could reach the
+        // extension while it is waiting for `ui.custom()` to complete.
+        let session = self.session.clone();
+        let command = self.name.trim_start_matches('/').to_string();
+        let args = args.to_string();
+        let ctx = ctx.clone();
+        tokio::task::spawn_blocking(move || {
+            match session.invoke_command_with_context(
+                &command,
+                &args,
+                serde_json::json!({"editorText": ctx.editor.get_text()}),
+            ) {
+                Ok(value) => {
+                    if let Some(editor_text) = value.get("editorText").and_then(|v| v.as_str()) {
+                        if editor_text != ctx.editor.get_text() {
+                            let cursor = editor_text.chars().count();
+                            ctx.editor.set_text(editor_text);
+                            ctx.editor.set_cursor(0, cursor);
                         }
                     }
+                    if let Some(notifications) =
+                        value.get("notifications").and_then(|v| v.as_array())
+                    {
+                        for notification in notifications {
+                            let message = notification
+                                .get("message")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default();
+                            if message.is_empty() {
+                                continue;
+                            }
+                            match notification.get("level").and_then(|v| v.as_str()) {
+                                Some("error") => add_error_message(&ctx.chat, message),
+                                _ => add_note_message(&ctx.chat, message),
+                            }
+                        }
+                    }
+                    let result = value.get("result").unwrap_or(&value);
+                    let text = result
+                        .get("text")
+                        .and_then(|item| item.as_str())
+                        .map(str::to_string)
+                        .or_else(|| result.as_str().map(str::to_string))
+                        .filter(|text| !text.is_empty() && text != "null");
+                    if let Some(text) = text {
+                        add_note_message(&ctx.chat, &text);
+                    }
                 }
-                let result = value.get("result").unwrap_or(&value);
-                let text = result
-                    .get("text")
-                    .and_then(|item| item.as_str())
-                    .map(str::to_string)
-                    .or_else(|| result.as_str().map(str::to_string))
-                    .filter(|text| !text.is_empty() && text != "null");
-                if let Some(text) = text {
-                    add_note_message(&ctx.chat, &text);
+                Err(error) => {
+                    add_error_message(&ctx.chat, &format!("JS extension command failed: {error}"))
                 }
             }
-            Err(error) => {
-                add_error_message(&ctx.chat, &format!("JS extension command failed: {error}"))
-            }
-        }
-        ctx.tui.request_render(false);
+            ctx.tui.request_render(false);
+        });
     }
 }
 

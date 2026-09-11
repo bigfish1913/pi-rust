@@ -506,7 +506,7 @@ impl JsExtensionSession {
                     model.provider
                 ));
             }
-            let context: Context = serde_json::from_value(
+            let context = normalize_provider_context(
                 args.get("context")
                     .cloned()
                     .ok_or("provider.complete missing context")?,
@@ -551,6 +551,47 @@ impl JsExtensionSession {
             "capabilities": ["provider_calls"],
         }))
     }
+}
+
+/// Accept Pi-compatible response objects that omit the discriminating `role`
+/// field when a side thread feeds a previous response back into `Context`.
+/// Only infer roles from unambiguous shape markers; malformed/ambiguous
+/// messages still fail the typed deserialization with the original error.
+fn normalize_provider_context(mut value: serde_json::Value) -> Result<Context, String> {
+    let Some(messages) = value
+        .get_mut("messages")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return serde_json::from_value(value).map_err(|error| error.to_string());
+    };
+    for message in messages {
+        let Some(object) = message.as_object_mut() else {
+            continue;
+        };
+        if object.contains_key("role") {
+            continue;
+        }
+        let inferred = if object.contains_key("toolCallId")
+            || object.contains_key("toolName")
+            || object.contains_key("isError")
+        {
+            Some("toolResult")
+        } else if object.contains_key("stopReason")
+            && object.contains_key("content")
+            && (object.contains_key("provider") || object.contains_key("model"))
+        {
+            Some("assistant")
+        } else {
+            None
+        };
+        if let Some(role) = inferred {
+            object.insert(
+                "role".to_string(),
+                serde_json::Value::String(role.to_string()),
+            );
+        }
+    }
+    serde_json::from_value(value).map_err(|error| error.to_string())
 }
 
 fn parse_simple_stream_options(
@@ -937,6 +978,26 @@ mod tests {
         );
         drop(session);
         runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn provider_context_infers_missing_assistant_role_for_pi_extensions() {
+        let assistant = rpi_ai::types::AssistantMessage::empty(
+            rpi_ai::types::Api::AnthropicMessages,
+            "anthropic",
+            "model",
+            1,
+        );
+        let mut message = serde_json::to_value(assistant).unwrap();
+        message.as_object_mut().unwrap().remove("role");
+        let context = normalize_provider_context(serde_json::json!({
+            "messages": [message]
+        }))
+        .expect("Pi response without role should be normalized");
+        assert!(matches!(
+            context.messages[0],
+            rpi_ai::types::Message::Assistant(_)
+        ));
     }
 
     #[test]

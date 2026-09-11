@@ -2,11 +2,14 @@
 //! pi's `Settings` interface (`packages/coding-agent/src/core/settings-manager.ts`)
 //! that rpi honors: `defaultProvider` / `defaultModel` / `defaultThinkingLevel`
 //! (consumed by `provider::resolve` as pi's `findInitialModel` step 3 — the
-//! saved default, when authed, wins over the built-in fallback) and `theme`.
+//! saved default, when authed, wins over the built-in fallback), `theme`,
+//! packages, and configurable resource directories.
 //!
-//! pi's `Settings` carries ~40 fields; rpi reads the 4 it uses and drops the
+//! pi's `Settings` carries ~40 fields; rpi reads the fields it uses and drops the
 //! rest (serde `default` ignores unknown fields), so a copied pi `settings.json`
 //! parses clean.
+
+use std::path::{Path, PathBuf};
 
 use crate::config::{self, strip_line_comments, ConfigError};
 
@@ -37,6 +40,19 @@ pub struct Settings {
     /// directories, `package.json` files, or installed package names.
     #[serde(default)]
     pub packages: Option<Vec<String>>,
+    /// Additional skill directories. Relative paths are resolved against the
+    /// settings file's owner (project root for project settings, agent dir for
+    /// global settings). `skills` is accepted as a compatibility shorthand.
+    #[serde(default, alias = "skills")]
+    pub skill_dirs: Option<Vec<String>>,
+    /// Additional prompt-template directories/files. `prompts` is accepted as
+    /// a compatibility shorthand.
+    #[serde(default, alias = "prompts")]
+    pub prompt_dirs: Option<Vec<String>>,
+    /// Additional Rust cdylib extension directories. `extensions` is accepted
+    /// as a compatibility shorthand.
+    #[serde(default, alias = "extensions")]
+    pub extension_dirs: Option<Vec<String>>,
 }
 
 /// Load `~/.rpi/agent/settings.json`. Missing file ⇒ `Settings::default()`
@@ -77,6 +93,65 @@ pub fn load_settings() -> Result<Settings, ConfigError> {
         }
         Err(e) => Err(ConfigError::Read { path, source: e }),
     }
+}
+
+/// Load project-local settings in precedence order: `.rpi/settings.json`,
+/// then legacy `.pi/settings.json`. Both files may contribute additional
+/// resource paths; the preferred `.rpi` file is returned first so its paths
+/// register before legacy Pi paths. Malformed or unreadable optional project
+/// settings are ignored, matching the best-effort behavior of resource-dir
+/// discovery; global settings remain available through [`load_settings`].
+pub fn load_project_settings(cwd: &Path) -> Vec<Settings> {
+    load_project_settings_with_paths(cwd)
+        .into_iter()
+        .map(|(_, settings)| settings)
+        .collect()
+}
+
+/// Load project settings together with their source paths. The path is kept
+/// so callers can preserve `.rpi` before `.pi` ordering even when only one of
+/// the two files exists.
+pub fn load_project_settings_with_paths(cwd: &Path) -> Vec<(PathBuf, Settings)> {
+    [
+        cwd.join(".rpi").join("settings.json"),
+        cwd.join(".pi").join("settings.json"),
+    ]
+    .into_iter()
+    .filter_map(|path| {
+        load_settings_file(&path)
+            .ok()
+            .map(|settings| (path, settings))
+    })
+    .collect()
+}
+
+fn load_settings_file(path: &Path) -> Result<Settings, ConfigError> {
+    let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    parse_settings(&text).map_err(|source| ConfigError::Json {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+/// Resolve a configured path relative to its settings owner. Absolute paths
+/// are preserved; empty entries are ignored.
+pub fn resolve_configured_paths(base: &Path, values: &[String]) -> Vec<PathBuf> {
+    values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            let path = PathBuf::from(value);
+            if path.is_absolute() {
+                path
+            } else {
+                base.join(path)
+            }
+        })
+        .collect()
 }
 
 fn parse_settings(text: &str) -> Result<Settings, serde_json::Error> {
@@ -154,6 +229,27 @@ pub fn save_settings(settings: &Settings) -> Result<(), String> {
             obj.remove("packages");
         }
     }
+    for (key, values) in [
+        ("skillDirs", settings.skill_dirs.as_ref()),
+        ("promptDirs", settings.prompt_dirs.as_ref()),
+        ("extensionDirs", settings.extension_dirs.as_ref()),
+    ] {
+        match values {
+            Some(list) if !list.is_empty() => {
+                obj.insert(
+                    key.to_string(),
+                    serde_json::Value::Array(
+                        list.iter()
+                            .map(|path| serde_json::Value::String(path.clone()))
+                            .collect(),
+                    ),
+                );
+            }
+            _ => {
+                obj.remove(key);
+            }
+        }
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -202,6 +298,9 @@ mod tests {
         assert!(s.default_model.is_none());
         assert!(s.default_thinking_level.is_none());
         assert!(s.theme.is_none());
+        assert!(s.skill_dirs.is_none());
+        assert!(s.prompt_dirs.is_none());
+        assert!(s.extension_dirs.is_none());
     }
 
     #[test]
@@ -229,6 +328,43 @@ mod tests {
         assert_eq!(s.default_model.as_deref(), Some("claude-sonnet-5"));
         assert_eq!(s.default_thinking_level.as_deref(), Some("high"));
         assert_eq!(s.theme.as_deref(), Some("dark"));
+        assert_eq!(s.packages, Some(vec!["some-pkg".to_string()]));
+    }
+
+    #[test]
+    fn loads_project_settings_in_rpi_then_pi_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".rpi")).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".pi")).unwrap();
+        std::fs::write(
+            tmp.path().join(".rpi/settings.json"),
+            r#"{"skillDirs":["rpi-skills"],"extensions":["rpi-ext"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join(".pi/settings.json"),
+            r#"{"skills":["pi-skills"],"extensionDirs":["pi-ext"]}"#,
+        )
+        .unwrap();
+
+        let settings = load_project_settings(tmp.path());
+        assert_eq!(settings.len(), 2);
+        assert_eq!(
+            settings[0].skill_dirs.as_deref(),
+            Some(["rpi-skills".to_string()].as_slice())
+        );
+        assert_eq!(
+            settings[0].extension_dirs.as_deref(),
+            Some(["rpi-ext".to_string()].as_slice())
+        );
+        assert_eq!(
+            settings[1].skill_dirs.as_deref(),
+            Some(["pi-skills".to_string()].as_slice())
+        );
+        assert_eq!(
+            settings[1].extension_dirs.as_deref(),
+            Some(["pi-ext".to_string()].as_slice())
+        );
     }
 
     #[test]

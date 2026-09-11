@@ -29,6 +29,12 @@ struct DocPage {
 
 static DOCS: &[DocPage] = &[
     DocPage {
+        topic: "authoring",
+        description: "创建 Pi JS/TS package 与 Rust cdylib 扩展的模板、开发流程、安全边界、测试和发布最佳实践",
+        content: include_str!("../../../docs/extension-authoring.md"),
+        aliases: &["package-authoring", "extension-authoring", "create-package", "create-extension"],
+    },
+    DocPage {
         topic: "guide",
         description: "完整使用手册：安装、模型、CLI、.rpi 资源、Pi package、扩展、SDK、排错和发布",
         content: include_str!("../../../docs/user-guide.md"),
@@ -80,7 +86,7 @@ impl DocsTool {
         Self {
             schema: Tool {
                 name: "docs".to_string(),
-                description: "Look up rpi usage documentation. Omit topic (or use topic=list) to list topics; pass a topic such as guide, overview, extensions, architecture, or compatibility. Add query to find relevant sections. Use this before guessing rpi commands, Pi package compatibility, extension APIs, or .rpi configuration.".to_string(),
+                description: "Look up rpi usage documentation. Omit topic (or use topic=list) to list topics; pass a topic such as guide, authoring, extensions, architecture, or compatibility. Add query to find relevant sections. Use this before guessing rpi commands, creating packages/extensions, Pi compatibility, extension APIs, or .rpi configuration.".to_string(),
                 parameters: rpi_ai::types::Schema::new(
                     serde_json::to_value(params).unwrap_or_default(),
                 ),
@@ -241,6 +247,7 @@ mod tests {
         let output = execute(serde_json::json!({})).await;
         assert!(output.contains("overview"));
         assert!(output.contains("guide"));
+        assert!(output.contains("authoring"));
         assert!(output.contains("extensions"));
     }
 
@@ -249,6 +256,13 @@ mod tests {
         let output = execute(serde_json::json!({"topic": "guide", "query": "install-pi"})).await;
         assert!(output.contains("rpi install-pi"));
         assert!(output.contains("npm"));
+    }
+
+    #[tokio::test]
+    async fn returns_extension_authoring_practices() {
+        let output = execute(serde_json::json!({"topic": "authoring", "query": "rpi dev"})).await;
+        assert!(output.contains("rpi dev"));
+        assert!(output.contains("cdylib"));
     }
 
     #[tokio::test]

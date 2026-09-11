@@ -118,6 +118,31 @@ next `rpi` start. For local development, use
 This is intentionally different from plain `cargo install`: `cargo install`
 only copies executable targets, while rpi loads dynamic-library extensions.
 
+### Develop an extension with watch mode
+
+From a Rust extension crate (`[lib] crate-type` contains `"cdylib"`), start the
+development host with:
+
+```bash
+rpi dev
+```
+
+The command detects the Cargo package, performs an initial build, stages a
+versioned library under `.rpi/extensions/.dev`, and watches the crate sources.
+Successful source changes trigger a rebuild and the same live reload used by
+the TUI's `/reload` command. A failed build keeps the currently loaded plugin.
+For a workspace containing multiple extensions, select one explicitly:
+
+```bash
+rpi dev --package rpi-todo
+rpi dev --release
+rpi dev --no-watch
+```
+
+See [`docs/extension-authoring.md`](docs/extension-authoring.md) for complete
+Rust extension and Pi JS/TS package templates, safety rules, testing, and
+release checklists.
+
 ### Load static Pi packages
 
 rpi can load Pi packages, including their static resources and executable
@@ -127,6 +152,14 @@ JavaScript/TypeScript extensions. Install a package with:
 rpi install-pi npm:@scope/my-package@1.0.0
 rpi install-pi git:github.com/user/my-package@v1
 rpi install-pi ./my-pi-package
+```
+
+卸载已安装的扩展或 Pi package：
+
+```bash
+rpi uninstall rpi-extension-example
+rpi uninstall-pi npm:@scope/my-package
+# 等价写法：rpi uninstall pi npm:@scope/my-package
 ```
 
 The installer stores project packages under `.rpi/packages` (use `--global`
@@ -183,7 +216,8 @@ global resources, so `.rpi`/`.pi` and `~/.rpi/agent` always win collisions.
 - **Project resources:** rpi-owned skills, prompts, system instructions, and
   extensions use `.rpi/` first; the original Pi `.pi/` layout remains a
   compatibility fallback. When both contain the same skill or prompt name,
-  `.rpi/` wins.
+  `.rpi/` wins. Project `.rpi/settings.json` can add `skillDirs`, `promptDirs`,
+  `extensionDirs`, and `packages` (with `.pi/settings.json` as fallback).
 - **Pi packages:** static package resources are loaded from the package specs in
   `~/.rpi/agent/settings.json` (`packages` array). Skills, prompt templates,
   themes, system prompt fragments, and JavaScript/TypeScript extensions are

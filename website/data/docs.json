@@ -17,7 +17,8 @@
             "推荐先阅读安装与第一次运行，再按需求进入 Provider、Pi package、扩展或 SDK 集成章节。"
           ],
           "links": [
-            {"label": "打开在线完整手册", "url": "https://rpi.laofu.online/user-guide.md"}
+            {"label": "打开在线完整手册", "url": "https://rpi.laofu.online/user-guide.md"},
+            {"label": "Package 与扩展作者指南", "url": "https://rpi.laofu.online/extension-authoring.md"}
           ]
         },
         {

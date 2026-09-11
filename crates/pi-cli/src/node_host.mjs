@@ -445,6 +445,10 @@ for (const file of files(paths)) {
 }
 const resources = { skillPaths: [], promptPaths: [], themePaths: [] };
 for (const handler of resourceHandlers) { const result = await handler(); if (result) for (const key of Object.keys(resources)) if (Array.isArray(result[key])) resources[key].push(...result[key]); }
+// Runtime requests can still be queued by a custom component while the host
+// is shutting down. Rust closes the pipe first, so ignore the resulting EPIPE
+// instead of turning a normal Ctrl+C exit into an uncaught Node exception.
+process.stdout.on('error', () => {});
 const write = value => process.stdout.write(JSON.stringify(value) + '\n');
 const toolSummaries = [...tools.values()].map(t => ({
   name: t.name,

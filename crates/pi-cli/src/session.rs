@@ -58,7 +58,7 @@ use crate::extension_api::ExtensionBackend;
 use crate::provider::ResolvedModel;
 use crate::resource_dirs::{
     discover_append_system_prompt_file_with_packages, discover_system_prompt_file_with_packages,
-    global_dir, load_prompt_templates_with_precedence, load_skills_with_precedence, project_dirs,
+    extension_dirs, load_prompt_templates_with_precedence, load_skills_with_precedence,
     prompt_template_dirs, skill_dirs,
 };
 use rpi_extensions::{
@@ -68,8 +68,6 @@ use rpi_extensions::{
 
 /// The subdirectory (under project `.rpi/`, legacy `.pi/`, and global
 /// `agent_dir()`) where rpi scans for cdylib plugins.
-const EXTENSIONS_SUBDIR: &str = "extensions";
-
 /// The built-in tool names v1 ships, in the order the TS `createCodingTools`
 /// registers them: the mutating set (`read`/`bash`/`edit`/`write`) followed by
 /// the read-only search set (`grep`/`find`/`ls`).
@@ -109,6 +107,7 @@ Guidelines:
 - Show file paths clearly when working with files
 - Prefer the smallest change that solves the problem
 - When unsure about rpi commands, extensions, Pi package compatibility, or .rpi configuration, use the docs tool before guessing
+- Before creating an rpi package or extension, query the docs authoring topic and follow its backend-specific templates and verification checklist
 
 Current working directory: {cwd}"
     )
@@ -724,6 +723,7 @@ pub async fn build(
         resolved_model: resolved.model.clone(),
         broadcast: broadcast_for_context,
         mailbox: reload_mailbox,
+        dev_extension: None,
     };
 
     Ok((harness, event_rx, reload_context))
@@ -832,6 +832,10 @@ pub struct ReloadContext {
     /// THIS mailbox (not a fresh default) when building the fresh bridge, so the
     /// bridge always carries the mailbox the TUI installed across reloads.
     pub mailbox: rpi_extensions::ReloadMailbox,
+    /// Active `rpi dev` extension builder. `/reload` rebuilds it before
+    /// swapping plugin sessions; its watcher signals `mailbox` after a
+    /// successful background build.
+    pub dev_extension: Option<Arc<crate::dev_extension::DevExtension>>,
 }
 
 /// The outcome of a reload: a human-readable status line for the transcript
@@ -859,6 +863,21 @@ pub async fn reload_extension_resources(
     harness: &AgentHarness,
     ctx: &ReloadContext,
 ) -> ReloadOutcome {
+    let mut load_args = ctx.args.clone();
+    if let Some(dev) = &ctx.dev_extension {
+        if let Err(error) = dev
+            .rebuild()
+            .and_then(|_| dev.apply_to_args(&mut load_args))
+        {
+            return ReloadOutcome {
+                summary: format!(
+                    "Extension build failed for {}: {error}. Keeping the currently loaded version.",
+                    dev.package_name()
+                ),
+                had_warnings: true,
+            };
+        }
+    }
     let cwd_str = ctx.cwd.to_string_lossy().to_string();
     let package_resources = crate::packages::discover_from_settings(&ctx.cwd);
     let mut warnings = false;
@@ -892,10 +911,10 @@ pub async fn reload_extension_resources(
     let fresh_bridge =
         rpi_extensions::ActionBridge::with_reload(ctx.runtime.clone(), host, reload_cb);
 
-    let extension_session = if ctx.args.no_extensions {
+    let extension_session = if load_args.no_extensions {
         rpi_extensions::ExtensionSession::none()
     } else {
-        load_extensions(&ctx.args, &ctx.cwd, Some(Arc::clone(&fresh_bridge)))
+        load_extensions(&load_args, &ctx.cwd, Some(Arc::clone(&fresh_bridge)))
     };
     if extension_session.is_empty() && !ctx.args.no_extensions {
         // The fresh session may be empty if no cdylibs are present — not a
@@ -1193,20 +1212,17 @@ fn build_models_with_extensions(
 
 /// Resolve the extension dirs to scan and load the cdylib plugins, returning
 /// the loaded session guard (keeps the `Library` handles alive for the harness
-/// lifetime). Scan order: project `.rpi/extensions`, legacy `.pi/extensions`,
-/// global `agent_dir()/`
-/// `extensions`, then any `--extensions-dir` flags (scanned after the defaults
-/// — `args.rs`). Diagnostics are a no-op sink for now; load skips/ABI mismatches
-/// surface via the `--verbose` summary.
+/// lifetime). Scan order: configured project paths, project `.rpi/extensions`,
+/// legacy `.pi/extensions`, configured/global conventional paths, then any
+/// `--extensions-dir` flags (scanned after the defaults — `args.rs`).
+/// Diagnostics are a no-op sink for now; load skips/ABI mismatches surface via
+/// the `--verbose` summary.
 fn load_extensions(
     args: &Args,
     cwd: &Path,
     action_bridge: Option<Arc<rpi_extensions::ActionBridge>>,
 ) -> ExtensionSession {
-    let mut dirs = project_dirs(cwd, EXTENSIONS_SUBDIR);
-    if let Some(g) = global_dir(EXTENSIONS_SUBDIR) {
-        dirs.push(g);
-    }
+    let mut dirs = extension_dirs(cwd);
     dirs.extend(args.extensions_dir.iter().cloned());
     let diagnostics: Arc<dyn PluginDiagnostics> = Arc::new(NullDiagnostics);
     // B5a: the action bridge is cloned into every loaded plugin's vtable
@@ -1224,7 +1240,7 @@ fn js_extension_paths(
     packages: &crate::packages::PackageResources,
 ) -> Vec<PathBuf> {
     let mut paths = packages.extension_paths();
-    for dir in project_dirs(cwd, EXTENSIONS_SUBDIR) {
+    for dir in extension_dirs(cwd) {
         if let Ok(entries) = std::fs::read_dir(dir) {
             paths.extend(entries.flatten().map(|entry| entry.path()).filter(|path| {
                 matches!(

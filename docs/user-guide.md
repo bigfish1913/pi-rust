@@ -142,6 +142,8 @@ rpi auth login|check|logout
 rpi package list|add|remove|update
 rpi install <crate>
 rpi install-pi <spec>
+rpi uninstall <crate>
+rpi uninstall-pi <spec>
 rpi update
 ```
 
@@ -163,7 +165,7 @@ rpi update
 {"topic":"guide","query":"install-pi"}
 ```
 
-当前主题包括 `guide`、`overview`、`extensions`、`architecture`、`compatibility`。`plugin`、`plugins`、`js`、`ts`、`pi` 等常用别名也可以使用。普通 `read` 仍然适合读取项目中的任意文件。
+当前主题包括 `guide`、`authoring`、`overview`、`extensions`、`architecture`、`compatibility`。创建 package 或扩展前优先查询 `authoring`；`plugin`、`plugins`、`js`、`ts`、`pi` 等常用别名也可以使用。普通 `read` 仍然适合读取项目中的任意文件。
 
 限制工具范围时请显式列出 `docs`：
 
@@ -191,6 +193,19 @@ rpi 会优先使用 rpi 自己的目录，同时兼容原 Pi 的 `.pi` 布局：
 
 项目 `.rpi` 优先于项目 `.pi`。全局资源默认位于 `~/.rpi/agent/`，包括 `settings.json`、`models.json`、`skills/`、`prompts/`、`themes/`、`extensions/` 和 `packages/`。同名资源发生冲突时，项目资源优先于全局资源，`.rpi` 优先于 `.pi`。
 
+项目级 `.rpi/settings.json`（兼容 `.pi/settings.json`）可以追加资源目录和 package：
+
+```json
+{
+  "skillDirs": ["./team-skills"],
+  "promptDirs": ["./prompts/shared"],
+  "extensionDirs": ["./target/debug"],
+  "packages": ["./packages/review-tools"]
+}
+```
+
+路径相对于项目根目录；`skills`、`prompts`、`extensions` 是对应 `*Dirs` 字段的简写。自定义目录会与 `.rpi`、`.pi` 和全局约定目录一起加载，`.rpi` 优先。全局 `~/.rpi/agent/settings.json` 也支持这些字段，相对路径相对于 agent 目录。
+
 配置目录可以重定位：
 
 ```bash
@@ -212,6 +227,24 @@ rpi install-pi git:github.com/user/repo@v1
 rpi install-pi ./my-pi-package
 rpi install-pi --global npm:@scope/package
 ```
+
+卸载时，Rust 扩展使用：
+
+```bash
+rpi uninstall <crate>
+```
+
+Pi package 使用：
+
+```bash
+rpi uninstall-pi npm:@scope/package
+rpi uninstall-pi --global npm:@scope/package
+# 等价写法
+rpi uninstall pi npm:@scope/package
+```
+
+卸载 Pi package 会同时移除启用配置。只有位于 `.rpi/packages`、`.pi/packages`
+或全局 agent package store 的安装目录才会被删除；项目源码目录只会被禁用，不会删除。
 
 本地 package 也可以只启用、不下载：
 
@@ -269,6 +302,16 @@ rpi install rpi-extension-example --force
 ```bash
 rpi install my-extension --path ../my-rpi-extension --force
 ```
+
+开发扩展项目时使用 watch 模式：
+
+```bash
+cd ../my-rpi-extension
+rpi dev
+# 多扩展 workspace：rpi dev --package my-extension
+```
+
+`rpi dev` 会自动识别 Cargo `cdylib`、首次编译并从 `.rpi/extensions/.dev` 加载版本化产物。源码变化会触发重新编译和热重载；手工执行 `/reload` 也会先重新编译。编译失败时继续保留当前已经加载的版本。完整模板和边界规则见在线扩展作者指南：<https://rpi.laofu.online/extension-authoring.md>。
 
 安装后的动态库位于 `~/.rpi/agent/extensions`（或 `RPI_CODING_AGENT_DIR` 指定的目录），下次启动 rpi 时加载。插件通过稳定 ABI 注册工具、Provider、事件处理器和资源处理器；不要直接依赖 `rpi-cli` 的私有模块。
 
@@ -339,5 +382,6 @@ rpi-plugin-sdk → rpi-extensions → rpi-tui → rpi-cli
 - 源码仓库：<https://github.com/bigfish1913/pi-rust>
 - Rust API：<https://docs.rs/rpi-agent>、<https://docs.rs/rpi-plugin-sdk>
 - Pi 参考实现：<https://github.com/earendil-works/pi>
+- Package 与扩展作者指南：<https://rpi.laofu.online/extension-authoring.md>
 
 当在线文档和已安装版本不一致时，以当前二进制中的 `docs` 工具和对应版本的 Git tag 为准。

@@ -275,25 +275,87 @@ pub async fn load_prompt_templates_with_precedence(
     result
 }
 
-/// The ordered skill dirs for a project: `[<cwd>/.rpi/skills,
-/// <cwd>/.pi/skills, <agent_dir>/skills]`.
+/// The ordered skill dirs for a project: configured project paths, then
+/// `[<cwd>/.rpi/skills, <cwd>/.pi/skills, <agent_dir>/skills]`, followed by
+/// configured and conventional global paths.
 /// The global dir is omitted when `agent_dir()` can't be resolved (no home dir).
 pub fn skill_dirs(cwd: &Path) -> Vec<PathBuf> {
-    let mut dirs = project_dirs(cwd, "skills");
+    let mut dirs = project_resource_dirs(cwd, "skills", ResourceKind::Skills);
     if let Some(g) = global_dir("skills") {
+        dirs.extend(configured_global_dirs(g.clone(), ResourceKind::Skills));
         dirs.push(g);
     }
     dirs
 }
 
-/// The ordered prompt-template paths for a project:
+/// The ordered prompt-template paths for a project: configured paths, then
 /// `[<cwd>/.rpi/prompts, <cwd>/.pi/prompts, <agent_dir>/prompts]`.
 pub fn prompt_template_dirs(cwd: &Path) -> Vec<PathBuf> {
-    let mut dirs = project_dirs(cwd, "prompts");
+    let mut dirs = project_resource_dirs(cwd, "prompts", ResourceKind::Prompts);
     if let Some(g) = global_dir("prompts") {
+        dirs.extend(configured_global_dirs(g.clone(), ResourceKind::Prompts));
         dirs.push(g);
     }
     dirs
+}
+
+/// The ordered Rust extension directories for a project. Configured paths are
+/// added before conventional directories so an explicit project path can be
+/// used for development while `.rpi` remains ahead of legacy `.pi` defaults.
+pub fn extension_dirs(cwd: &Path) -> Vec<PathBuf> {
+    let mut dirs = project_resource_dirs(cwd, "extensions", ResourceKind::Extensions);
+    if let Some(g) = global_dir("extensions") {
+        dirs.extend(configured_global_dirs(g.clone(), ResourceKind::Extensions));
+        dirs.push(g);
+    }
+    dirs
+}
+
+#[derive(Clone, Copy)]
+enum ResourceKind {
+    Skills,
+    Prompts,
+    Extensions,
+}
+
+fn project_resource_dirs(cwd: &Path, sub: &str, kind: ResourceKind) -> Vec<PathBuf> {
+    let loaded = crate::settings::load_project_settings_with_paths(cwd);
+    let mut dirs = Vec::new();
+    for config_name in [".rpi", ".pi"] {
+        if let Some((_, settings)) = loaded.iter().find(|(path, _)| {
+            path.parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                == Some(config_name)
+        }) {
+            dirs.extend(configured_paths(settings, cwd, kind));
+        }
+        dirs.push(cwd.join(config_name).join(sub));
+    }
+    dirs
+}
+
+fn configured_global_dirs(agent_dir: PathBuf, kind: ResourceKind) -> Vec<PathBuf> {
+    crate::settings::load_settings()
+        .ok()
+        .into_iter()
+        .flat_map(|settings| configured_paths(&settings, &agent_dir, kind))
+        .collect()
+}
+
+fn configured_paths(
+    settings: &crate::settings::Settings,
+    base: &Path,
+    kind: ResourceKind,
+) -> Vec<PathBuf> {
+    let values = match kind {
+        ResourceKind::Skills => settings.skill_dirs.as_ref(),
+        ResourceKind::Prompts => settings.prompt_dirs.as_ref(),
+        ResourceKind::Extensions => settings.extension_dirs.as_ref(),
+    };
+    values
+        .map(|paths| crate::settings::resolve_configured_paths(base, paths))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -418,5 +480,27 @@ mod tests {
                 PathBuf::from("/proj/.pi/SYSTEM.md")
             ]
         );
+    }
+
+    #[test]
+    fn project_settings_add_configured_resource_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".rpi")).unwrap();
+        std::fs::write(
+            tmp.path().join(".rpi/settings.json"),
+            r#"{"skills":["shared-skills"],"promptDirs":["prompt-pack"],"extensionDirs":["target/debug"]}"#,
+        )
+        .unwrap();
+
+        let skills = skill_dirs(tmp.path());
+        assert_eq!(skills[0], tmp.path().join("shared-skills"));
+        assert!(skills.contains(&tmp.path().join(".rpi/skills")));
+
+        let prompts = prompt_template_dirs(tmp.path());
+        assert_eq!(prompts[0], tmp.path().join("prompt-pack"));
+
+        let extensions = extension_dirs(tmp.path());
+        assert_eq!(extensions[0], tmp.path().join("target/debug"));
+        assert!(extensions.contains(&tmp.path().join(".rpi/extensions")));
     }
 }

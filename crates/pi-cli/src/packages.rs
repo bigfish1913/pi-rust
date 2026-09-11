@@ -118,10 +118,17 @@ impl PackageResources {
 /// explicit package list instead of silently executing every directory found
 /// under the user's home directory.
 pub fn discover_from_settings(cwd: &Path) -> PackageResources {
-    let specs = crate::settings::load_settings()
-        .ok()
-        .and_then(|settings| settings.packages)
-        .unwrap_or_default();
+    let mut specs = Vec::new();
+    for settings in crate::settings::load_project_settings(cwd) {
+        if let Some(packages) = settings.packages {
+            specs.extend(packages);
+        }
+    }
+    if let Ok(settings) = crate::settings::load_settings() {
+        if let Some(packages) = settings.packages {
+            specs.extend(packages);
+        }
+    }
     discover(cwd, &specs)
 }
 

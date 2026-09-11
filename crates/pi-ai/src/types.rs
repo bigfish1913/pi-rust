@@ -737,12 +737,42 @@ impl AssistantMessage {
 
 /// `Message = UserMessage | AssistantMessage | ToolResultMessage`. The base
 /// provider-facing message type.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "role", rename_all = "camelCase")]
 pub enum Message {
     User(UserMessage),
     Assistant(Box<AssistantMessage>),
     ToolResult(Box<ToolResultMessage>),
+}
+
+// The concrete message structs intentionally retain their `role` field so
+// they serialize exactly like Pi's TypeScript messages. An internally tagged
+// enum would consume that field before deserializing the struct variant,
+// causing `missing field role` for otherwise valid messages. Decode the tag
+// explicitly and pass the complete object through to the concrete type.
+impl<'de> Deserialize<'de> for Message {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let role = value
+            .get("role")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| serde::de::Error::missing_field("role"))?;
+        match role {
+            "user" => serde_json::from_value(value)
+                .map(Message::User)
+                .map_err(serde::de::Error::custom),
+            "assistant" => serde_json::from_value(value)
+                .map(|message| Message::Assistant(Box::new(message)))
+                .map_err(serde::de::Error::custom),
+            "toolResult" => serde_json::from_value(value)
+                .map(|message| Message::ToolResult(Box::new(message)))
+                .map_err(serde::de::Error::custom),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &["user", "assistant", "toolResult"],
+            )),
+        }
+    }
 }
 
 impl From<UserMessage> for Message {
