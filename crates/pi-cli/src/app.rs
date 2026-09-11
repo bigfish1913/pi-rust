@@ -16,11 +16,12 @@
 //!
 //! # v1 scope cuts vs TS `main.ts` (in `docs/m6-cli-open-questions.md`)
 //!
-//! The TS `main` is enormous: auth-command routing, package-manager commands,
-//! HTTP proxy config, project-trust prompts, first-time setup, migrations,
-//! settings managers, theme init, extension/resource discovery. **None of that
-//! is ported** — v1 is a straight parse → resolve → build → run pipeline. The
-//! `@file` expansion ports *only* the text-file branch (images are detected
+//! The TS `main` is enormous: HTTP proxy config, project-trust prompts,
+//! first-time setup, migrations, and full npm package management remain
+//! outside this port. rpi does support local static package management via
+//! `rpi package` and Rust cdylib extension installation. The regular agent path
+//! remains a straight parse → resolve → build → run pipeline. The `@file`
+//! expansion ports *only* the text-file branch (images are detected
 //! but not attached to the prompt — the harness `prompt_text` accepts images,
 //! but v1 does not yet wire an image processor; binary/non-UTF-8 files error).
 
@@ -57,8 +58,17 @@ pub async fn run() -> i32 {
     if argv.first().map(|s| s.as_str()) == Some("auth") {
         return crate::auth::run(&argv[1..]).await;
     }
+    if argv.first().map(|s| s.as_str()) == Some("package") {
+        return crate::packages::run_cli(&argv[1..]);
+    }
+    if argv.first().map(|s| s.as_str()) == Some("update") {
+        return crate::updates::run_self_update(&argv[1..]);
+    }
     if argv.first().map(|s| s.as_str()) == Some("install") {
         return crate::install::run(&argv[1..]);
+    }
+    if argv.first().map(|s| s.as_str()) == Some("install-pi") {
+        return crate::install_pi::run(&argv[1..]);
     }
 
     let mut parsed = parse_args(&argv);
@@ -96,6 +106,14 @@ pub async fn run() -> i32 {
     // Best-effort; never blocks startup. Skipped when RPI_CODING_AGENT_DIR is
     // set (an explicit override is its own layout).
     let _ = crate::config::migrate_legacy_layout();
+
+    // Update checks are interactive-only and best-effort. They write to
+    // stderr so print/JSON modes remain machine-readable, and the checker
+    // itself uses a short timeout plus a cache.
+    if !parsed.print && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        let report = crate::updates::check_startup(&cwd).await;
+        crate::updates::print_startup_notices(&report);
+    }
 
     // `-r/--resume` is an interactive picker, unlike `-c/--continue` which
     // immediately opens the latest session. Resolve the picker result before
@@ -238,7 +256,7 @@ pub async fn run() -> i32 {
                 model_catalog,
                 initial.clone(),
                 &extra,
-                resolved.theme.as_deref(),
+                parsed.theme.as_deref().or(resolved.theme.as_deref()),
                 &reload_context,
             )
             .await

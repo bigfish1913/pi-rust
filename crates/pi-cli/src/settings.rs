@@ -33,6 +33,10 @@ pub struct Settings {
     /// empty ⇒ every catalog model cycles (the default).
     #[serde(default)]
     pub scoped_models: Option<Vec<String>>,
+    /// Pi-compatible static package specs. Entries may be local package
+    /// directories, `package.json` files, or installed package names.
+    #[serde(default)]
+    pub packages: Option<Vec<String>>,
 }
 
 /// Load `~/.rpi/agent/settings.json`. Missing file ⇒ `Settings::default()`
@@ -45,7 +49,32 @@ pub fn load_settings() -> Result<Settings, ConfigError> {
             path: path.clone(),
             source: e,
         }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Settings::default()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // A native Pi installation keeps its settings under ~/.pi/agent.
+            // Read that file only as a fallback; all writes still target the
+            // rpi-owned ~/.rpi/agent/settings.json path.
+            let legacy = if std::env::var_os(config::CONFIG_DIR_ENV).is_some() {
+                None
+            } else {
+                dirs::home_dir().map(|home| home.join(".pi/agent/settings.json"))
+            };
+            match legacy.filter(|candidate| candidate != &path) {
+                Some(legacy_path) => match std::fs::read_to_string(&legacy_path) {
+                    Ok(text) => parse_settings(&text).map_err(|e| ConfigError::Json {
+                        path: legacy_path,
+                        source: e,
+                    }),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        Ok(Settings::default())
+                    }
+                    Err(error) => Err(ConfigError::Read {
+                        path: legacy_path,
+                        source: error,
+                    }),
+                },
+                None => Ok(Settings::default()),
+            }
+        }
         Err(e) => Err(ConfigError::Read { path, source: e }),
     }
 }
@@ -108,6 +137,21 @@ pub fn save_settings(settings: &Settings) -> Result<(), String> {
         }
         _ => {
             obj.remove("scopedModels");
+        }
+    }
+    match &settings.packages {
+        Some(list) if !list.is_empty() => {
+            obj.insert(
+                "packages".to_string(),
+                serde_json::Value::Array(
+                    list.iter()
+                        .map(|p| serde_json::Value::String(p.clone()))
+                        .collect(),
+                ),
+            );
+        }
+        _ => {
+            obj.remove("packages");
         }
     }
     if let Some(parent) = path.parent() {

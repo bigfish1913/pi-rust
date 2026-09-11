@@ -56,6 +56,7 @@ pub struct TuiAltScreen {
     #[allow(dead_code)]
     resize_handler: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     overlays: Arc<OverlayManager>,
+    render_suspended: Mutex<bool>,
 }
 
 impl TuiAltScreen {
@@ -92,6 +93,7 @@ impl TuiAltScreen {
             input_handler: Mutex::new(None),
             resize_handler: Mutex::new(None),
             overlays: Arc::new(OverlayManager::new()),
+            render_suspended: Mutex::new(false),
         }
     }
 
@@ -125,6 +127,26 @@ impl TuiAltScreen {
 
     fn is_running(&self) -> bool {
         self.running.lock().map(|running| *running).unwrap_or(false)
+    }
+
+    /// Temporarily suspend the outer application renderer while a foreign
+    /// runtime owns the terminal (for example a Node extension's fullscreen
+    /// component). The terminal remains in raw/alternate-screen mode; only
+    /// background repaint requests are suppressed.
+    pub fn set_render_suspended(&self, suspended: bool) {
+        if let Ok(mut value) = self.render_suspended.lock() {
+            *value = suspended;
+        }
+        if !suspended {
+            self.request_render(true);
+        }
+    }
+
+    pub fn is_render_suspended(&self) -> bool {
+        self.render_suspended
+            .lock()
+            .map(|value| *value)
+            .unwrap_or(false)
     }
 
     /// Get the current scroll position.
@@ -710,6 +732,9 @@ impl TUI for TuiAltScreen {
         if !self.is_running() {
             return;
         }
+        if self.is_render_suspended() {
+            return;
+        }
         if force {
             if let Ok(mut prev) = self.previous_screen.lock() {
                 prev.clear();
@@ -719,6 +744,9 @@ impl TUI for TuiAltScreen {
     }
 
     fn request_render(&self, _force: bool) {
+        if self.is_render_suspended() {
+            return;
+        }
         self.render_now(false);
     }
 

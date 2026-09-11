@@ -23,10 +23,8 @@
 //! `.pi/` directory drops in and works (the documented intent). Full trust
 //! gating is deferred.
 //!
-//! **Deferred (documented):** pi's `.agents/skills` + `~/.agents/skills` +
-//! package-installed skills/prompts (4 discovery roots in pi; rpi v1 mirrors the
-//! three primary roots: project `.rpi/<sub>`, legacy project `.pi/<sub>`, and
-//! user `agent_dir()<sub>`); worktree
+//! **Deferred (documented):** pi's `.agents/skills` + `~/.agents/skills` (rpi
+//! package-installed static resources are handled by `crate::packages`); worktree
 //! shadowed-context-file dedup (`findShadowedContextFile`); full structured
 //! winner/loser collision diagnostics (rpi v1 encodes collisions as a
 //! `SkillDiagnostic`/`PromptTemplateDiagnostic` with a descriptive message).
@@ -108,12 +106,29 @@ pub fn global_config_file(name: &str) -> Option<PathBuf> {
 /// no trust prompt (`config.rs:349`), so project files are read unconditionally
 /// — a copied `.rpi/` or `.pi/` drops in and works. Full trust gating is deferred.
 pub fn discover_system_prompt_file(cwd: &Path) -> Option<PathBuf> {
+    let packages = crate::packages::discover_from_settings(cwd);
+    discover_system_prompt_file_with_packages(cwd, &packages)
+}
+
+/// Discover `SYSTEM.md` with already-resolved package resources. Package files
+/// are considered after project and global files, so installing a package
+/// cannot unexpectedly override a user's project instructions.
+pub fn discover_system_prompt_file_with_packages(
+    cwd: &Path,
+    packages: &crate::packages::PackageResources,
+) -> Option<PathBuf> {
     for project in project_config_files(cwd, "SYSTEM.md") {
         if project.is_file() {
             return Some(project);
         }
     }
-    global_config_file("SYSTEM.md").filter(|p| p.is_file())
+    if let Some(global) = global_config_file("SYSTEM.md").filter(|p| p.is_file()) {
+        return Some(global);
+    }
+    packages
+        .system_prompt_files()
+        .into_iter()
+        .find(|path| path.is_file())
 }
 
 /// Discover `APPEND_SYSTEM.md`: same precedence as `SYSTEM.md` — project
@@ -127,12 +142,27 @@ pub fn discover_system_prompt_file(cwd: &Path) -> Option<PathBuf> {
 /// **Trust gate (v1 divergence):** same as [`discover_system_prompt_file`] —
 /// pi gates the project file on trust, rpi v1 reads it unconditionally.
 pub fn discover_append_system_prompt_file(cwd: &Path) -> Option<PathBuf> {
+    let packages = crate::packages::discover_from_settings(cwd);
+    discover_append_system_prompt_file_with_packages(cwd, &packages)
+}
+
+/// Discover `APPEND_SYSTEM.md` with already-resolved package resources.
+pub fn discover_append_system_prompt_file_with_packages(
+    cwd: &Path,
+    packages: &crate::packages::PackageResources,
+) -> Option<PathBuf> {
     for project in project_config_files(cwd, "APPEND_SYSTEM.md") {
         if project.is_file() {
             return Some(project);
         }
     }
-    global_config_file("APPEND_SYSTEM.md").filter(|p| p.is_file())
+    if let Some(global) = global_config_file("APPEND_SYSTEM.md").filter(|p| p.is_file()) {
+        return Some(global);
+    }
+    packages
+        .append_system_prompt_files()
+        .into_iter()
+        .find(|path| path.is_file())
 }
 
 // ---------------------------------------------------------------------------

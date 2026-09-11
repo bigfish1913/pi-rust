@@ -13,8 +13,8 @@
 //!   precedence). **Extension `resources_discover` (B5b) feeds the SAME loaders:
 //!   a plugin's discovered skill/prompt paths merge with the static dirs and
 //!   re-run through `load_skills`/`load_prompt_templates` (individual `.md` files
-//!   load too — `load_skills` accepts both dirs and files). Theme discovery is
-//!   accepted but ignored (rpi has no theme system — documented divergence).**
+//!   load too — `load_skills` accepts both dirs and files). Package themes are
+//!   parsed by the TUI when selected via settings or `--theme`.**
 //!   **Trust gating remains deferred** — project resources are discovered
 //!   unconditionally (a copied `.rpi/` or legacy `.pi/` drops in and works).
 //! - **No `--models` cycling, no `ModelRuntime`/multi-provider.** One model,
@@ -33,12 +33,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
+use rpi_agent::AgentTool;
 use rpi_ai::Provider;
 use rpi_harness::agent_harness::AgentHarness;
 use rpi_harness::context_files::{format_project_context, load_project_context_files};
 use rpi_harness::session::memory::{InMemorySessionStorage, SystemClock};
 use rpi_harness::session::session::DefaultIdGenerator;
-use rpi_harness::session::types::SessionMetadata;
+use rpi_harness::session::types::{BranchBounds, EntryQuery, SessionMetadata};
 use rpi_harness::session::Session;
 use rpi_harness::system_prompt::compose_system_prompt;
 use rpi_harness::types::{
@@ -52,10 +53,11 @@ use rpi_tools::{
 };
 
 use crate::args::Args;
+use crate::extension_api::ExtensionBackend;
 use crate::provider::ResolvedModel;
 use crate::resource_dirs::{
-    discover_append_system_prompt_file, discover_system_prompt_file, global_dir,
-    load_prompt_templates_with_precedence, load_skills_with_precedence, project_dirs,
+    discover_append_system_prompt_file_with_packages, discover_system_prompt_file_with_packages,
+    global_dir, load_prompt_templates_with_precedence, load_skills_with_precedence, project_dirs,
     prompt_template_dirs, skill_dirs,
 };
 use rpi_extensions::{
@@ -194,6 +196,7 @@ pub async fn build(
     BuildError,
 > {
     let cwd_str = cwd.to_string_lossy().to_string();
+    let package_resources = crate::packages::discover_from_settings(cwd);
 
     // ---- B5a: build the action bridge BEFORE extension load ----
     // Extensions load before `AgentHarness::create` (extensions provide tools the
@@ -259,18 +262,100 @@ pub async fn build(
     } else {
         load_extensions(args, cwd, Some(Arc::clone(&action_bridge)))
     };
+    let js_extension_session = if args.no_extensions {
+        None
+    } else {
+        let paths = js_extension_paths(args, cwd, &package_resources);
+        let js_context = serde_json::json!({
+            "cwd": cwd_str,
+            "theme": resolved.theme.clone(),
+            "currentModel": resolved.model.clone(),
+            "models": catalog.clone(),
+            "thinkingLevel": resolved.thinking_level,
+        });
+        match crate::js_extensions::JsExtensionSession::load_with_context(
+            &paths,
+            args.verbose,
+            js_context,
+        ) {
+            Ok(session) => session,
+            Err(error) => {
+                eprintln!("warning: JS/TS extensions were not loaded: {error}");
+                None
+            }
+        }
+    };
+    if js_extension_session.is_some() {
+        eprintln!(
+            "warning: enabled Pi JS/TS extensions execute with the current user's permissions"
+        );
+    }
+    if let Some(session) = &js_extension_session {
+        if let Err(error) =
+            session.enable_provider_runtime(resolved.provider.clone(), runtime.clone())
+        {
+            if args.verbose {
+                eprintln!("warning: JS provider runtime was not enabled: {error}");
+            }
+        }
+    }
     if args.verbose {
+        if let Some(session) = &js_extension_session {
+            let info = session.backend_info();
+            eprintln!(
+                "JS extension backend: {} v{} ({})",
+                info.name,
+                info.api_version,
+                info.capability_names().join(", ")
+            );
+        }
         if let Some(s) = extension_session.summary() {
             eprintln!("extensions: {s}");
         }
         report_deferred_renderers(&extension_session);
     }
     merge_extension_tools(&mut tools, &extension_session, args);
+    if let Some(session) = &js_extension_session {
+        merge_js_extension_tools(&mut tools, session, args);
+        if args.verbose && !session.commands.is_empty() {
+            eprintln!("JS extension commands: {}", session.commands.join(", "));
+        }
+    }
     let active = active_tool_names(&tools, args);
 
     // ---- Session storage ----
     let selection = select_session(args, cwd);
     let session = build_session(&selection, &cwd_str).await?;
+    if let Some(js) = &js_extension_session {
+        let session_id = session
+            .get_metadata()
+            .await
+            .ok()
+            .map(|metadata| metadata.id);
+        let leaf_id = session.get_leaf_id().await.ok().flatten();
+        if let Some(session_id) = session_id {
+            let branch = session
+                .find_entries_on_branch(&EntryQuery::default(), &BranchBounds::default())
+                .await
+                .ok()
+                .unwrap_or_default();
+            let branch_json =
+                serde_json::to_value(&branch).unwrap_or_else(|_| serde_json::json!([]));
+            let runtime_context = serde_json::json!({
+                "session": {
+                    "id": session_id,
+                    "leafId": leaf_id,
+                    "branch": branch_json,
+                    "entries": branch_json.clone(),
+                },
+            });
+            if let Err(error) = js.set_runtime_context(runtime_context) {
+                if args.verbose {
+                    eprintln!("warning: could not sync JS session context: {error}");
+                }
+            }
+        }
+    }
 
     // ---- System prompt base (precedence: --system-prompt > SYSTEM.md > default) ----
     // Mirrors pi `discoverSystemPromptFile` (`resource-loader.ts:1022-1034`):
@@ -281,7 +366,7 @@ pub async fn build(
     // direction as skills/prompts precedence.
     let base_prompt = match args.system_prompt.as_deref() {
         Some(explicit) => explicit.to_string(),
-        None => match discover_system_prompt_file(cwd) {
+        None => match discover_system_prompt_file_with_packages(cwd, &package_resources) {
             Some(path) => {
                 std::fs::read_to_string(&path).unwrap_or_else(|_| default_system_prompt(&cwd_str))
             }
@@ -301,7 +386,9 @@ pub async fn build(
         append_texts.push(text);
     }
     if args.append_system_prompt.is_empty() {
-        if let Some(path) = discover_append_system_prompt_file(cwd) {
+        if let Some(path) =
+            discover_append_system_prompt_file_with_packages(cwd, &package_resources)
+        {
             if let Ok(text) = std::fs::read_to_string(&path) {
                 append_texts.push(text);
             }
@@ -315,8 +402,9 @@ pub async fn build(
 
     // ---- Resource discovery (skills + prompt-templates + context-files) ----
     // The env is OS-backed, rooted at cwd. Each `--no-*` flag suppresses its
-    // channel independently (pi parity). Skills/prompts load project→global then
-    // dedupe first-wins-by-name (project wins). Context files walk
+    // channel independently (pi parity). Skills/prompts load project→global,
+    // explicit/plugin paths, then static packages; dedupe first-wins-by-name
+    // keeps project and user resources ahead of packages. Context files walk
     // global→ancestor(cwd→root), deepest-last (pi parity).
     //
     // **Trust gate (v1 divergence):** pi gates project config discovery on
@@ -337,7 +425,8 @@ pub async fn build(
     // mirrors pi `extendResources` running AFTER the default load's first-wins
     // map). `load_skills` now accepts both dirs and individual `.md` files, so a
     // plugin returning bare `SKILL.md` paths loads them (the gap this closes).
-    // Themes are accepted but ignored (rpi has no theme system — documented).
+    // Theme paths are available to the TUI through the package resource list;
+    // skill/prompt loaders are the only resources needed by the harness here.
     // A `--no-*` flag suppresses its channel for BOTH static and discovered paths.
     let discovered = extension_session
         .snapshot_arc()
@@ -350,6 +439,10 @@ pub async fn build(
         let mut dirs = skill_dirs(cwd);
         dirs.extend(args.skill.iter().cloned());
         dirs.extend(discovered.skill_paths.iter().map(PathBuf::from));
+        if let Some(session) = &js_extension_session {
+            dirs.extend(session.resources.skill_paths.iter().cloned());
+        }
+        dirs.extend(package_resources.skill_dirs());
         let result = load_skills_with_precedence(&env_dyn, &dirs).await;
         skills = result.skills;
         skill_diags = result.diagnostics;
@@ -361,6 +454,10 @@ pub async fn build(
         let mut dirs = prompt_template_dirs(cwd);
         dirs.extend(args.prompt_template.iter().cloned());
         dirs.extend(discovered.prompt_paths.iter().map(PathBuf::from));
+        if let Some(session) = &js_extension_session {
+            dirs.extend(session.resources.prompt_paths.iter().cloned());
+        }
+        dirs.extend(package_resources.prompt_dirs());
         let result = load_prompt_templates_with_precedence(&env_dyn, &dirs).await;
         prompt_templates = result.prompt_templates;
         prompt_diags = result.diagnostics;
@@ -380,6 +477,9 @@ pub async fn build(
 
     // Surface resource-discovery diagnostics as startup warnings (verbose-only).
     if args.verbose {
+        for d in &package_resources.diagnostics {
+            eprintln!("warning: package {}: {}", d.spec, d.message);
+        }
         for d in &skill_diags {
             eprintln!(
                 "warning: skill {} ({}): {}",
@@ -429,7 +529,7 @@ pub async fn build(
         eprintln!("=== --debug-system-prompt ===");
         let base_src = if args.system_prompt.is_some() {
             "--system-prompt"
-        } else if discover_system_prompt_file(cwd).is_some() {
+        } else if discover_system_prompt_file_with_packages(cwd, &package_resources).is_some() {
             "SYSTEM.md"
         } else {
             "default"
@@ -469,9 +569,10 @@ pub async fn build(
             eprintln!("    /{}", t.name);
         }
         // B5b: surface plugin-contributed discovery paths so a smoke can confirm
-        // the resources_discover round-trip fed the loaders (themes ignored).
+        // the resources_discover round-trip fed the loaders; package themes are
+        // selected by the TUI rather than injected into the harness prompt.
         eprintln!(
-            "--- discovered via resources_discover: {} skill(s), {} prompt(s), {} theme(s) (ignored) ---",
+            "--- discovered via resources_discover: {} skill(s), {} prompt(s), {} theme(s) ---",
             discovered.skill_paths.len(),
             discovered.prompt_paths.len(),
             discovered.theme_paths.len(),
@@ -600,6 +701,7 @@ pub async fn build(
     // of a harness back-reference so it can be `Clone` into the reload callback).
     let reload_context = ReloadContext {
         extension_session: Arc::new(Mutex::new(extension_session)),
+        js_extension_session: js_extension_session.clone(),
         action_bridge: Arc::new(Mutex::new(Some(Arc::clone(&action_bridge)))),
         catalog,
         gateway: resolved.provider.clone(),
@@ -677,6 +779,8 @@ pub type ActionBridgeCell = Arc<Mutex<Option<Arc<rpi_extensions::ActionBridge>>>
 pub struct ReloadContext {
     /// The live extension-session cell (swapped on reload).
     pub extension_session: ExtensionSessionCell,
+    /// JS/TS Pi extension host kept alive for the interactive session.
+    pub js_extension_session: Option<crate::js_extensions::JsExtensionSession>,
     /// The live action-bridge cell (swapped + old invalidated on reload).
     pub action_bridge: ActionBridgeCell,
     /// The model catalog (read-only) the host uses to resolve `set_model(id)`.
@@ -743,6 +847,7 @@ pub async fn reload_extension_resources(
     ctx: &ReloadContext,
 ) -> ReloadOutcome {
     let cwd_str = ctx.cwd.to_string_lossy().to_string();
+    let package_resources = crate::packages::discover_from_settings(&ctx.cwd);
     let mut warnings = false;
 
     // ---- 1. Build a fresh ActionBridge + ExtensionSession ----
@@ -843,6 +948,7 @@ pub async fn reload_extension_resources(
     if !ctx.args.no_skills {
         let mut dirs = skill_dirs(&ctx.cwd);
         dirs.extend(discovered.skill_paths.iter().map(PathBuf::from));
+        dirs.extend(package_resources.skill_dirs());
         let result = load_skills_with_precedence(&env_dyn, &dirs).await;
         skills = result.skills;
         skill_diags = result.diagnostics;
@@ -853,6 +959,7 @@ pub async fn reload_extension_resources(
     if !ctx.args.no_prompt_templates {
         let mut dirs = prompt_template_dirs(&ctx.cwd);
         dirs.extend(discovered.prompt_paths.iter().map(PathBuf::from));
+        dirs.extend(package_resources.prompt_dirs());
         let result = load_prompt_templates_with_precedence(&env_dyn, &dirs).await;
         prompt_templates = result.prompt_templates;
         prompt_diags = result.diagnostics;
@@ -867,9 +974,15 @@ pub async fn reload_extension_resources(
         format_project_context(&files)
     };
 
-    if !skill_diags.is_empty() || !prompt_diags.is_empty() {
+    if !skill_diags.is_empty()
+        || !prompt_diags.is_empty()
+        || !package_resources.diagnostics.is_empty()
+    {
         warnings = true;
         if ctx.args.verbose {
+            for d in &package_resources.diagnostics {
+                eprintln!("warning: package {}: {}", d.spec, d.message);
+            }
             for d in &skill_diags {
                 eprintln!(
                     "warning: skill {} ({}): {}",
@@ -892,7 +1005,7 @@ pub async fn reload_extension_resources(
     // ---- Re-compose the system prompt (same precedence as build) ----
     let base_prompt = match ctx.args.system_prompt.as_deref() {
         Some(explicit) => explicit.to_string(),
-        None => match discover_system_prompt_file(&ctx.cwd) {
+        None => match discover_system_prompt_file_with_packages(&ctx.cwd, &package_resources) {
             Some(path) => {
                 std::fs::read_to_string(&path).unwrap_or_else(|_| default_system_prompt(&cwd_str))
             }
@@ -905,7 +1018,9 @@ pub async fn reload_extension_resources(
         append_texts.push(text);
     }
     if ctx.args.append_system_prompt.is_empty() {
-        if let Some(path) = discover_append_system_prompt_file(&ctx.cwd) {
+        if let Some(path) =
+            discover_append_system_prompt_file_with_packages(&ctx.cwd, &package_resources)
+        {
             if let Ok(text) = std::fs::read_to_string(&path) {
                 append_texts.push(text);
             }
@@ -1090,6 +1205,42 @@ fn load_extensions(
     rpi_extensions::load_session_mixed(&dirs, &args.extension, diagnostics, action_bridge)
 }
 
+fn js_extension_paths(
+    args: &Args,
+    cwd: &Path,
+    packages: &crate::packages::PackageResources,
+) -> Vec<PathBuf> {
+    let mut paths = packages.extension_paths();
+    for dir in project_dirs(cwd, EXTENSIONS_SUBDIR) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            paths.extend(entries.flatten().map(|entry| entry.path()).filter(|path| {
+                matches!(
+                    path.extension()
+                        .and_then(|ext| ext.to_str())
+                        .map(|ext| ext.to_ascii_lowercase())
+                        .as_deref(),
+                    Some("js" | "mjs" | "cjs" | "ts" | "tsx")
+                )
+            }));
+        }
+    }
+    paths.extend(
+        args.extension
+            .iter()
+            .filter(|path| {
+                matches!(
+                    path.extension()
+                        .and_then(|ext| ext.to_str())
+                        .map(|ext| ext.to_ascii_lowercase())
+                        .as_deref(),
+                    Some("js" | "mjs" | "cjs" | "ts" | "tsx")
+                )
+            })
+            .cloned(),
+    );
+    paths
+}
+
 /// Merge the loaded extension tools into the built-in set. An extension tool
 /// overrides a same-named built-in; first-extension-wins across plugins is
 /// already guaranteed by the registry (`register_tool` keeps the prior). The
@@ -1114,6 +1265,35 @@ fn merge_extension_tools(tools: &mut Vec<HarnessTool>, session: &ExtensionSessio
         let adapter = PluginToolAdapter::new(et.tool.clone(), et.handle(), session.keepalive());
         let harness_tool = HarnessTool::new(Arc::new(adapter));
         match tools.iter_mut().find(|t| t.tool.schema().name == *name) {
+            Some(slot) => *slot = harness_tool,
+            None => tools.push(harness_tool),
+        }
+    }
+}
+
+fn merge_js_extension_tools(
+    tools: &mut Vec<HarnessTool>,
+    session: &crate::js_extensions::JsExtensionSession,
+    args: &Args,
+) {
+    for adapter in session.tools() {
+        let name = adapter.schema().name.clone();
+        if args
+            .tools
+            .as_ref()
+            .is_some_and(|allow| !allow.iter().any(|value| value == &name))
+            || args
+                .exclude_tools
+                .as_ref()
+                .is_some_and(|deny| deny.iter().any(|value| value == &name))
+        {
+            continue;
+        }
+        let harness_tool = HarnessTool::new(Arc::new(adapter));
+        match tools
+            .iter_mut()
+            .find(|tool| tool.tool.schema().name == name)
+        {
             Some(slot) => *slot = harness_tool,
             None => tools.push(harness_tool),
         }

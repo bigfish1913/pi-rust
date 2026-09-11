@@ -33,7 +33,9 @@
 //! CLI includes the interactive TUI, extension loading, skills and prompt
 //! templates, compaction, session fork/export, and lane-aware harness runs.
 //! OAuth/Copilot auth, HTML export, and full model cycling remain outside the
-//! current implementation. `rpi install` supports Rust cdylib extensions.
+//! current implementation. `rpi install` supports Rust cdylib extensions and
+//! `rpi install-pi` supports Pi npm/git/local packages through a Node JS/TS
+//! extension bridge.
 //!
 //! [`packages/coding-agent/src/cli.ts`]: ../../.reference/pi/packages/coding-agent/src/cli.ts
 //! [`main.ts`]: ../../.reference/pi/packages/coding-agent/src/main.ts
@@ -44,16 +46,21 @@ pub mod app;
 pub mod args;
 pub mod auth;
 pub mod config;
+pub mod extension_api;
 pub mod extensions_actions;
 pub mod extras;
 pub mod install;
+pub mod install_pi;
 pub mod interactive_tui;
+pub mod js_extensions;
 pub mod modes;
+pub mod packages;
 pub mod provider;
 pub mod resource_dirs;
 pub mod resume_picker;
 pub mod session;
 pub mod settings;
+pub mod updates;
 
 /// Crate version, surfaced by `rpi --version`. Mirrors the TS `VERSION` export
 /// (sourced from `package.json`; here from `env!("CARGO_PKG_VERSION")`).
