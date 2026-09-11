@@ -10,9 +10,23 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 const INSTALLER_MANIFEST: &str = "rpi-extension-installer";
+const NATIVE_PACKAGES_FILE: &str = "native-packages.json";
+
+/// A Rust-native extension installed through `rpi install`.
+///
+/// `source` is absent for crates.io packages and contains the local source
+/// path for `--path` installs. Local development crates are intentionally not
+/// eligible for automatic registry updates.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InstalledNativePackage {
+    pub name: String,
+    pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
 
 #[derive(Debug, Clone)]
 struct InstallOptions {
@@ -31,6 +45,7 @@ struct CargoMetadata {
 #[derive(Debug, Deserialize)]
 struct CargoPackage {
     name: String,
+    version: String,
     targets: Vec<CargoTarget>,
 }
 
@@ -160,8 +175,55 @@ pub fn run(args: &[String]) -> i32 {
         }
         println!("installed {}", target.display());
     }
+    let version = metadata
+        .packages
+        .iter()
+        .find(|candidate| candidate.name == options.package)
+        .map(|candidate| candidate.version.clone())
+        .unwrap_or_else(|| "0.0.0".to_string());
+    let record = InstalledNativePackage {
+        name: options.package.clone(),
+        version,
+        source: options
+            .path
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned()),
+    };
+    if let Err(error) = record_native_package(&record) {
+        eprintln!("warning: extension installed but package metadata was not saved: {error}");
+    }
     println!("rpi will load this extension on the next start.");
     0
+}
+
+/// Read the registry of Rust-native extensions installed by `rpi install`.
+pub fn installed_native_packages() -> Vec<InstalledNativePackage> {
+    let Ok(path) = crate::config::agent_dir().map(|dir| dir.join(NATIVE_PACKAGES_FILE)) else {
+        return Vec::new();
+    };
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+fn record_native_package(record: &InstalledNativePackage) -> Result<(), String> {
+    let path = crate::config::agent_dir()
+        .map_err(|error| error.to_string())?
+        .join(NATIVE_PACKAGES_FILE);
+    let mut records = installed_native_packages();
+    if let Some(existing) = records.iter_mut().find(|item| item.name == record.name) {
+        *existing = record.clone();
+    } else {
+        records.push(record.clone());
+    }
+    records.sort_by(|left, right| left.name.cmp(&right.name));
+    let parent = path
+        .parent()
+        .ok_or_else(|| "native package metadata has no parent".to_string())?;
+    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let data = serde_json::to_vec_pretty(&records).map_err(|error| error.to_string())?;
+    std::fs::write(path, data).map_err(|error| error.to_string())
 }
 
 fn parse_args(args: &[String]) -> Result<InstallOptions, String> {

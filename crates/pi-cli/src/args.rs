@@ -11,12 +11,12 @@
 //!
 //! Divergences from the TS parser (all deliberate v1 scope cuts, documented in
 //! `docs/m6-cli-open-questions.md`):
-//! - `--mode rpc`, `--tui-mode`, `--export`, `--list-models`, `--models`,
-//!   `--fork`, `--offline`, `--approve`/`-na`, the package-manager subcommands,
-//!   `--extension`/`-e`, `--skill`, `--prompt-template`, `--theme`, and their
-//!   `--no-*` discovery toggles are **recognized but ignored** (parsed so users
-//!   don't get a hard error for muscle-memory flags, with a warning). They are
-//!   not in v1's surface.
+//! - `--mode rpc`, `--tui-mode`, `--export`, `--list-models`,
+//!   `--fork`, `--offline`, `--approve`/`-na`,
+//!   `--extension`/`-e`, `--skill`, and `--prompt-template` are recognized but
+//!   not all wired into the full TS package manager. The supported resource
+//!   flags are handled by the Rust loader; remaining compatibility flags are
+//!   accepted with a warning.
 //! - `--thinking` is typed via [`ThinkingLevel`] from `rpi_ai` (the TS parser
 //!   validates against the same string set).
 //! - `--print`/`-p` may consume a following positional as its prompt (the TS
@@ -50,6 +50,8 @@ pub struct Args {
     pub base_url: Option<String>,
     pub system_prompt: Option<String>,
     pub append_system_prompt: Vec<String>,
+    /// `--theme` — built-in theme name or a static package theme name/path.
+    pub theme: Option<String>,
     pub thinking: Option<ThinkingLevel>,
 
     pub print: bool,
@@ -87,7 +89,7 @@ pub struct Args {
     /// `--no-context-files`/`-nc`: skip context-file (`AGENTS.md`/`CLAUDE.md`)
     /// discovery + the `<project_context>` system-prompt block.
     pub no_context_files: bool,
-    /// `--no-extensions`/`-ne`: skip cdylib plugin discovery + loading entirely.
+    /// `--no-extensions`/`-ne`: skip Rust cdylib and JS/TS extension loading.
     /// Honored by `session.rs` (Part B2): when set, no extension directory is
     /// scanned and no plugin tools/handlers are registered.
     pub no_extensions: bool,
@@ -368,19 +370,7 @@ pub fn parse_args(args: &[String]) -> Args {
                     .push(format!("{other} is not supported in v1 (ignored)"));
             }
             "--theme" => {
-                // These take a value (or an inline `=`); consume the next token
-                // when there's no inline value so the path isn't read as a
-                // message, then warn.
-                if inline.is_none()
-                    && i + 1 < args.len()
-                    && !args[i + 1].starts_with('-')
-                    && !args[i + 1].starts_with('@')
-                {
-                    i += 1;
-                }
-                result
-                    .ignored
-                    .push("--theme is not supported in v1 (ignored)".to_string());
+                result.theme = take_value(&mut result, "--theme");
             }
             "--list-models" => {
                 // Optionally consumes a search term.
@@ -502,7 +492,7 @@ pub fn print_help() {
   --no-skills, -ns               Skip skill discovery (no <available_skills> block)
   --no-prompt-templates, -np     Skip prompt-template discovery (/expand templates)
   --no-context-files, -nc        Skip AGENTS.md/CLAUDE.md discovery (no <project_context>)
-  --no-extensions, -ne           Skip cdylib plugin/extension loading entirely
+  --no-extensions, -ne           Skip Rust cdylib and JS/TS extension loading
   --extensions-dir, -ed <dir>    Extra dir to scan for plugins (.dll/.so/.dylib); repeatable
                                  (also via RPI_EXTENSIONS_DIR env: ';' on Windows, ':' on Unix)
   --debug-system-prompt          Print the resolved system-prompt sections to stderr (verification)
@@ -511,10 +501,15 @@ pub fn print_help() {
   --version, -v                  Show version
 
 {u}Subcommands:{r}
+  update                       Update the rpi CLI from crates.io
   auth login|check|logout        Manage persisted credentials in ~/.rpi/auth.json
                                 (see `rpi auth --help`)
+  package list|add|remove|update Manage TS packages and Rust extensions
+                                (see `rpi package --help`)
   install <crate>                Build and install a Rust cdylib extension
                                 (see `rpi install --help`)
+  install-pi <spec>              Install an npm/git/local Pi package
+                                (see `rpi install-pi --help`)
 
 {u}Built-in Tools:{r}
   {builtin}  (enabled by default; grep/find/ls are read-only)
@@ -551,8 +546,9 @@ pub fn print_help() {
 {u}Notes:{r}
   Supported HTTP protocols are Anthropic Messages and OpenAI Chat Completions.
   Define custom model catalogs and provider apiKey values in
-  ~/.rpi/agent/models.json. The interactive TUI, extensions, skills, prompt
-  templates, themes, model cycling, session fork/export, and trust commands are
+  ~/.rpi/agent/models.json. The interactive TUI, Rust and JS/TS extensions,
+  Pi package resources, skills, prompt templates, themes, model cycling, session
+  fork/export, and trust commands are
   available in the current build. OAuth and HTML export remain
   outside the current implementation.
 ",
@@ -751,6 +747,13 @@ mod tests {
         let a = parse_args(&s(&["--model=claude-sonnet-5", "--thinking=low"]));
         assert_eq!(a.model.as_deref(), Some("claude-sonnet-5"));
         assert_eq!(a.thinking, Some(ThinkingLevel::Low));
+    }
+
+    #[test]
+    fn theme_flag_is_honored() {
+        let a = parse_args(&s(&["--theme", "ocean.json"]));
+        assert_eq!(a.theme.as_deref(), Some("ocean.json"));
+        assert!(a.ignored.is_empty());
     }
 
     #[test]

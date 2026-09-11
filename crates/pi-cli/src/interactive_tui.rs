@@ -336,6 +336,35 @@ fn dispatch_slash(text: &str, ctx: &CommandContext, registry: &CommandRegistry) 
     }
 }
 
+fn key_event_to_input(key: crossterm::event::KeyEvent) -> String {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        if let KeyCode::Char(ch) = key.code {
+            let code = (ch.to_ascii_lowercase() as u8) & 0x1f;
+            return char::from(code).to_string();
+        }
+    }
+    match key.code {
+        KeyCode::Char(ch) => ch.to_string(),
+        KeyCode::Enter => "\r".into(),
+        KeyCode::Esc => "\x1b".into(),
+        KeyCode::Backspace => "\x7f".into(),
+        KeyCode::Tab => "\t".into(),
+        KeyCode::Up => "\x1b[A".into(),
+        KeyCode::Down => "\x1b[B".into(),
+        KeyCode::Right => "\x1b[C".into(),
+        KeyCode::Left => "\x1b[D".into(),
+        KeyCode::Home => "\x1b[H".into(),
+        KeyCode::End => "\x1b[F".into(),
+        KeyCode::PageUp => "\x1b[5~".into(),
+        KeyCode::PageDown => "\x1b[6~".into(),
+        KeyCode::Delete => "\x1b[3~".into(),
+        KeyCode::Insert => "\x1b[2~".into(),
+        KeyCode::F(n) => format!("\x1b[{}~", 10 + n as u16),
+        _ => String::new(),
+    }
+}
+
 /// A slash command registered by a native extension. The command metadata is
 /// captured for autocomplete, while the handler is looked up from the live
 /// session on every invocation so `/reload` takes effect without rebuilding
@@ -344,6 +373,69 @@ struct ExtensionCommand {
     name: String,
     description: String,
     session: crate::session::ExtensionSessionCell,
+}
+
+struct JsExtensionCommand {
+    name: String,
+    session: crate::js_extensions::JsExtensionSession,
+}
+
+impl SlashCommand for JsExtensionCommand {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn description(&self) -> &'static str {
+        "JS extension command"
+    }
+    fn description_owned(&self) -> String {
+        "JS extension command".to_string()
+    }
+    fn execute(&self, ctx: &CommandContext, args: &str) {
+        match self.session.invoke_command_with_context(
+            self.name.trim_start_matches('/'),
+            args,
+            serde_json::json!({"editorText": ctx.editor.get_text()}),
+        ) {
+            Ok(value) => {
+                if let Some(editor_text) = value.get("editorText").and_then(|v| v.as_str()) {
+                    if editor_text != ctx.editor.get_text() {
+                        let cursor = editor_text.chars().count();
+                        ctx.editor.set_text(editor_text);
+                        ctx.editor.set_cursor(0, cursor);
+                    }
+                }
+                if let Some(notifications) = value.get("notifications").and_then(|v| v.as_array()) {
+                    for notification in notifications {
+                        let message = notification
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        if message.is_empty() {
+                            continue;
+                        }
+                        match notification.get("level").and_then(|v| v.as_str()) {
+                            Some("error") => add_error_message(&ctx.chat, message),
+                            _ => add_note_message(&ctx.chat, message),
+                        }
+                    }
+                }
+                let result = value.get("result").unwrap_or(&value);
+                let text = result
+                    .get("text")
+                    .and_then(|item| item.as_str())
+                    .map(str::to_string)
+                    .or_else(|| result.as_str().map(str::to_string))
+                    .filter(|text| !text.is_empty() && text != "null");
+                if let Some(text) = text {
+                    add_note_message(&ctx.chat, &text);
+                }
+            }
+            Err(error) => {
+                add_error_message(&ctx.chat, &format!("JS extension command failed: {error}"))
+            }
+        }
+        ctx.tui.request_render(false);
+    }
 }
 
 impl SlashCommand for ExtensionCommand {
@@ -1274,6 +1366,28 @@ fn register_extension_commands(
     }
 }
 
+fn register_js_extension_commands(
+    registry: &mut CommandRegistry,
+    session: Option<crate::js_extensions::JsExtensionSession>,
+) {
+    let Some(session) = session else {
+        return;
+    };
+    for command in &session.commands {
+        let name = if command.starts_with('/') {
+            command.clone()
+        } else {
+            format!("/{command}")
+        };
+        if registry.find(&name).is_none() {
+            registry.register(Arc::new(JsExtensionCommand {
+                name,
+                session: session.clone(),
+            }));
+        }
+    }
+}
+
 // ===========================================================================
 // Channel + helpers
 // ===========================================================================
@@ -1517,11 +1631,18 @@ fn open_settings_theme_selector(
     tui: &Arc<TuiAltScreen>,
     chat: &Arc<Container>,
 ) {
-    let items = vec![
+    let mut items = vec![
         SelectItem::new("dark", "Dark").with_description("Default dark theme"),
         SelectItem::new("light", "Light").with_description("Light background"),
         SelectItem::new("monochrome", "Monochrome").with_description("No color accents"),
     ];
+    if let Ok(cwd) = std::env::current_dir() {
+        for path in crate::packages::discover_from_settings(&cwd).theme_files() {
+            if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
+                items.push(SelectItem::new(name, name).with_description("Package theme"));
+            }
+        }
+    }
     let list = Arc::new(SelectList::new(items, 10));
 
     let state_sel = state.clone();
@@ -1531,11 +1652,25 @@ fn open_settings_theme_selector(
     let chat_sel = chat.clone();
     list.on_select(Arc::new(move |item| {
         let preset = match item.value.as_str() {
-            "light" => ThemePreset::Light,
-            "monochrome" => ThemePreset::Monochrome,
-            _ => ThemePreset::Dark,
+            "light" => Some(ThemePreset::Light),
+            "monochrome" => Some(ThemePreset::Monochrome),
+            "dark" => Some(ThemePreset::Dark),
+            name => {
+                if let Ok(cwd) = std::env::current_dir() {
+                    if let Ok(custom) = crate::packages::load_theme(&cwd, name) {
+                        rpi_tui::global_theme_manager().set(custom.clone());
+                        state_sel.theme_manager.set(custom);
+                    }
+                }
+                add_note_message(&chat_sel, &format!("Theme set to {}.", item.label));
+                close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
+                tui_sel.render_now(true);
+                return;
+            }
         };
+        let Some(preset) = preset else { return };
         apply_theme_preset(preset);
+        state_sel.theme_manager.apply_preset(preset);
         let mut settings = crate::settings::load_settings().unwrap_or_default();
         settings.theme = Some(item.value.clone());
         let saved = crate::settings::save_settings(&settings);
@@ -2901,6 +3036,7 @@ pub async fn interactive_tui(
     // Apply the saved theme before constructing transcript components. Some
     // components keep styled text, so doing this after the welcome banner left
     // the first screen in the dark palette until it was rebuilt.
+    let theme_manager = Arc::new(ThemeManager::new());
     if let Some(preset) = match theme {
         Some("light") => Some(ThemePreset::Light),
         Some("monochrome") => Some(ThemePreset::Monochrome),
@@ -2908,11 +3044,28 @@ pub async fn interactive_tui(
         _ => None,
     } {
         apply_theme_preset(preset);
+        theme_manager.apply_preset(preset);
+    } else if let Some(name) = theme {
+        match crate::packages::load_theme(&cwd, name) {
+            Ok(custom) => {
+                rpi_tui::global_theme_manager().set(custom.clone());
+                theme_manager.set(custom);
+            }
+            Err(error) => {
+                eprintln!("warning: could not load package theme `{name}`: {error}");
+            }
+        }
     }
 
     // ---- TUI + containers ----
     let terminal = Box::new(ProcessTerminal::new());
     let tui = Arc::new(TuiAltScreen::new(terminal, true, None));
+
+    if let Some(js) = &reload_context.js_extension_session {
+        if let Err(error) = js.install_ui_runtime(tui.clone()) {
+            eprintln!("warning: could not enable JS custom UI bridge: {error}");
+        }
+    }
 
     let chat_container = Arc::new(Container::new());
     add_welcome_message_with_capabilities(&chat_container, &active_tool_names, &skill_names);
@@ -3026,6 +3179,10 @@ pub async fn interactive_tui(
         &mut command_registry,
         reload_context.extension_session.clone(),
     );
+    register_js_extension_commands(
+        &mut command_registry,
+        reload_context.js_extension_session.clone(),
+    );
     let registry = Arc::new(command_registry);
     let mut all_slash_commands = registry.visible_entries();
     all_slash_commands.extend(template_slash_commands);
@@ -3057,7 +3214,7 @@ pub async fn interactive_tui(
         active_extension_editor: std::sync::Mutex::new(None),
         autocomplete,
         autocomplete_container: autocomplete_container.clone(),
-        theme_manager: Arc::new(ThemeManager::new()),
+        theme_manager,
         tui: Some(tui.clone()),
         current_model_id: std::sync::Mutex::new(lane_model_id.clone()),
         show_images: std::sync::Mutex::new(true),
@@ -3276,6 +3433,7 @@ pub async fn interactive_tui(
     let scroll_for_key = scroll_view.clone();
     let lane_for_key = lane.clone();
     let state_for_key = state.clone();
+    let js_for_key = reload_context.js_extension_session.clone();
     // Ctrl+L routes through the same registry as `/model` (one path, not two),
     // so the key loop needs the same `CommandContext` + registry the submit
     // handler uses. All fields are `Arc`/cheap, so this clone is free.
@@ -3307,6 +3465,11 @@ pub async fn interactive_tui(
             // full redraw so the constrained layout re-fits the new dimensions.
             if let Event::Resize(_cols, _rows) = ev {
                 tui_for_key.refresh_size();
+                if let Some(js) = &js_for_key {
+                    if js.custom_active() {
+                        let _ = js.send_custom_resize(_cols as usize, _rows as usize);
+                    }
+                }
                 continue;
             }
             // Mouse wheel scrolls the transcript (pi supports wheel
@@ -3340,6 +3503,16 @@ pub async fn interactive_tui(
             // emit Repeat while a key is held.
             if !should_dispatch_key(key.kind) {
                 continue;
+            }
+
+            if let Some(js) = &js_for_key {
+                if js.custom_active() {
+                    let data = key_event_to_input(key);
+                    if !data.is_empty() {
+                        let _ = js.send_custom_input(&data);
+                    }
+                    continue;
+                }
             }
 
             if state_for_key.extension_editor_open()
@@ -4798,19 +4971,26 @@ async fn open_tree_selector(
     );
 }
 
-/// Build + open the `/theme` selector. Presets [dark, light, monochrome];
-/// selecting applies it live via the owned `ThemeManager` + re-renders.
+/// Build + open the `/theme` selector. Built-in presets and enabled package
+/// themes are shown; selecting applies the theme live and re-renders.
 fn open_theme_selector(
     state: &Arc<TuiState>,
     editor_container: &Arc<Container>,
     editor: &Arc<Editor>,
     tui: &Arc<TuiAltScreen>,
 ) {
-    let items = vec![
+    let mut items = vec![
         SelectItem::new("dark", "Dark").with_description("Default dark theme"),
         SelectItem::new("light", "Light").with_description("Light background"),
         SelectItem::new("monochrome", "Monochrome").with_description("No color accents"),
     ];
+    if let Ok(cwd) = std::env::current_dir() {
+        for path in crate::packages::discover_from_settings(&cwd).theme_files() {
+            if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
+                items.push(SelectItem::new(name, name).with_description("Package theme"));
+            }
+        }
+    }
     let list = Arc::new(SelectList::new(items, 10));
 
     let state_sel = state.clone();
@@ -4820,11 +5000,25 @@ fn open_theme_selector(
     let chat_sel = state.chat_container.clone();
     list.on_select(Arc::new(move |item| {
         let preset = match item.value.as_str() {
-            "light" => ThemePreset::Light,
-            "monochrome" => ThemePreset::Monochrome,
-            _ => ThemePreset::Dark,
+            "light" => Some(ThemePreset::Light),
+            "monochrome" => Some(ThemePreset::Monochrome),
+            "dark" => Some(ThemePreset::Dark),
+            name => {
+                if let Ok(cwd) = std::env::current_dir() {
+                    if let Ok(custom) = crate::packages::load_theme(&cwd, name) {
+                        rpi_tui::global_theme_manager().set(custom.clone());
+                        state_sel.theme_manager.set(custom);
+                    }
+                }
+                add_note_message(&chat_sel, &format!("Theme set to {}.", item.label));
+                close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
+                tui_sel.render_now(true);
+                return;
+            }
         };
+        let Some(preset) = preset else { return };
         apply_theme_preset(preset);
+        state_sel.theme_manager.apply_preset(preset);
         // A quick accent note so the user sees the change registered even if
         // the terminal's own colors mask the preset difference.
         add_note_message(&chat_sel, &format!("Theme set to {}.", item.label));
