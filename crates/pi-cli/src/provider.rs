@@ -567,11 +567,29 @@ pub fn resolve(
 /// On any config read error it falls back to the built-in Anthropic catalog —
 /// the selector is non-critical and must never block the TUI from starting.
 pub fn available_catalog(resolved: &ResolvedModel) -> Vec<Model> {
+    let selected_api = &resolved.model.api;
+    let selected_provider = &resolved.model.provider;
+    let mut seen = std::collections::HashSet::new();
     resolved
         .provider
         .models()
         .iter()
+        // A provider snapshot is expected to be homogeneous, but extension
+        // and gateway providers can expose a broader catalog. The selector
+        // must only offer models the current lane can actually route to.
+        .filter(|m| {
+            m.api == *selected_api
+                && (matches!(m.api, rpi_ai::Api::AnthropicMessages)
+                    || m.provider.eq_ignore_ascii_case(selected_provider))
+        })
         .filter(|m| model_is_authed(m, resolved.has_provider_key))
+        .filter(|m| {
+            seen.insert((
+                m.api.clone(),
+                m.provider.to_ascii_lowercase(),
+                m.id.to_ascii_lowercase(),
+            ))
+        })
         .cloned()
         .collect()
 }

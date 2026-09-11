@@ -678,12 +678,7 @@ impl SlashCommand for ModelCommand {
         let term = args.trim();
         if !term.is_empty() {
             // /model <name> — direct switch by id (pi handleModelCommand).
-            let Some(model) = ctx
-                .model_catalog
-                .iter()
-                .find(|m| m.id.eq_ignore_ascii_case(term))
-                .cloned()
-            else {
+            let Some(model) = find_model_selector_match(&ctx.model_catalog, term) else {
                 add_error_message(
                     &ctx.chat,
                     &format!("No model matches \"{term}\". Try /model for the list."),
@@ -1586,22 +1581,7 @@ fn open_settings_model_selector(
     lane_model_id: &str,
     chat: &Arc<Container>,
 ) {
-    let mut items: Vec<SelectItem> = Vec::new();
-    for m in catalog {
-        let label = if m.name.is_empty() {
-            short_model_name(&m.id)
-        } else {
-            m.name.clone()
-        };
-        let marker = if m.id.eq_ignore_ascii_case(lane_model_id) {
-            " (current)"
-        } else {
-            ""
-        };
-        items.push(
-            SelectItem::new(&m.id, &label).with_description(&format!("{id}{marker}", id = m.id)),
-        );
-    }
+    let items = model_selector_items(catalog, lane_model_id);
     if items.is_empty() {
         add_note_message(chat, "No models in the catalog.");
         tui.request_render(false);
@@ -1656,6 +1636,65 @@ fn open_settings_model_selector(
         list,
         SelectorKind::Settings,
     );
+}
+
+/// Convert the authenticated runtime catalog into selector rows. Keep the
+/// model id as the value so `/model <id>` and the selection callback share one
+/// lookup path, while making the provider visible for OpenAI-compatible
+/// gateways where the same model id may exist at multiple endpoints.
+fn model_selector_items(catalog: &[rpi_ai::Model], lane_model_id: &str) -> Vec<SelectItem> {
+    let mut seen = std::collections::HashSet::new();
+    catalog
+        .iter()
+        .filter(|m| {
+            seen.insert((
+                m.api.clone(),
+                m.provider.to_ascii_lowercase(),
+                m.id.to_ascii_lowercase(),
+            ))
+        })
+        .map(|m| {
+            let label = if m.name.is_empty() {
+                short_model_name(&m.id)
+            } else {
+                m.name.clone()
+            };
+            let identity = if matches!(m.api, rpi_ai::Api::AnthropicMessages)
+                && m.provider.eq_ignore_ascii_case("anthropic")
+            {
+                m.id.clone()
+            } else {
+                format!("{}/{}", m.provider, m.id)
+            };
+            let marker = if m.id.eq_ignore_ascii_case(lane_model_id) {
+                " (current)"
+            } else {
+                ""
+            };
+            SelectItem::new(&m.id, &label).with_description(&format!("{identity}{marker}"))
+        })
+        .collect()
+}
+
+/// Resolve a selector input by either bare model id or the qualified
+/// `provider/model` identity shown for gateway models. This keeps manual
+/// `/model ...` input consistent with the rows rendered by the selector.
+fn find_model_selector_match(catalog: &[rpi_ai::Model], input: &str) -> Option<rpi_ai::Model> {
+    let (provider, id) = input
+        .split_once('/')
+        .filter(|(provider, id)| !provider.is_empty() && !id.is_empty())
+        .map_or((None, input), |(provider, id)| (Some(provider), id));
+    catalog
+        .iter()
+        .find(|model| {
+            model.id.eq_ignore_ascii_case(id)
+                && provider.is_none_or(|provider| {
+                    model.provider.eq_ignore_ascii_case(provider)
+                        || (provider.eq_ignore_ascii_case("anthropic")
+                            && matches!(model.api, rpi_ai::Api::AnthropicMessages))
+                })
+        })
+        .cloned()
 }
 
 /// Choose the default thinking level AND persist it (`/settings` → Default
@@ -4191,6 +4230,13 @@ async fn handle_agent_event(
                 if let Some(text) = extension_usage_text(Some(&state.extension_session), usage) {
                     add_note_message(chat, &text);
                 }
+                // Error assistant messages carry the provider diagnostic in
+                // `error_message`, not in text content. The assistant
+                // component is empty for these messages, so surface the
+                // diagnostic as a visible error row in the transcript.
+                if let Some(error) = assistant_error_text(a) {
+                    add_error_message(chat, &error);
+                }
                 *state.last_input_tokens.lock().unwrap() = usage.input;
             }
             tui.request_render(false);
@@ -4339,6 +4385,23 @@ async fn handle_agent_event(
     }
 }
 
+/// Return the diagnostic carried by a failed assistant message. Providers may
+/// omit `error_message`; keep a stable fallback so an error can never render as
+/// an empty transcript turn.
+fn assistant_error_text(message: &rpi_ai::AssistantMessage) -> Option<String> {
+    if message.stop_reason != rpi_ai::StopReason::Error {
+        return None;
+    }
+    Some(
+        message
+            .error_message
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+            .unwrap_or("Provider request failed.")
+            .to_string(),
+    )
+}
+
 /// Extract `BashToolDetails` (`truncation`, `full_output_path`) from a bash
 /// tool result and mark the component complete. Mirrors the TS bash finalize
 /// path; only the fields `BashExecutionComponent` needs are read.
@@ -4483,22 +4546,7 @@ fn open_model_selector(
     lane_model_id: &str,
     chat: &Arc<Container>,
 ) {
-    let mut items: Vec<SelectItem> = Vec::new();
-    for m in catalog {
-        let label = if m.name.is_empty() {
-            short_model_name(&m.id)
-        } else {
-            m.name.clone()
-        };
-        let marker = if m.id.eq_ignore_ascii_case(lane_model_id) {
-            " (current)"
-        } else {
-            ""
-        };
-        items.push(
-            SelectItem::new(&m.id, &label).with_description(&format!("{id}{marker}", id = m.id)),
-        );
-    }
+    let items = model_selector_items(catalog, lane_model_id);
     if items.is_empty() {
         add_note_message(
             chat,
@@ -5969,6 +6017,114 @@ mod tests {
             "claude-sonnet-5"
         );
         assert_eq!(short_model_name("claude-sonnet-5"), "claude-sonnet-5");
+    }
+
+    #[test]
+    fn model_selector_items_are_deduplicated_and_provider_qualified() {
+        use rpi_ai::{Api, Model};
+
+        let mut gateway = Model::new(
+            "gpt-5.6-sol",
+            "GPT 5.6 Sol",
+            Api::OpenaiCompletions,
+            "routeryo-copy",
+            "https://gateway.example.com",
+        );
+        let duplicate = gateway.clone();
+        let anthropic = Model::new(
+            "claude-sonnet-5",
+            "Claude Sonnet 5",
+            Api::AnthropicMessages,
+            "anthropic",
+            "https://api.anthropic.com",
+        );
+        gateway.headers = Some(std::collections::BTreeMap::from([(
+            "authorization".into(),
+            "Bearer test".into(),
+        )]));
+
+        let items = model_selector_items(&[gateway, duplicate, anthropic], "gpt-5.6-sol");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].value, "gpt-5.6-sol");
+        assert_eq!(items[0].label, "GPT 5.6 Sol");
+        assert_eq!(
+            items[0].description.as_deref(),
+            Some("routeryo-copy/gpt-5.6-sol (current)")
+        );
+        assert_eq!(items[1].description.as_deref(), Some("claude-sonnet-5"));
+    }
+
+    #[test]
+    fn model_selector_match_accepts_bare_and_qualified_ids() {
+        use rpi_ai::{Api, Model};
+
+        let gateway = Model::new(
+            "gpt-5.6-sol",
+            "GPT 5.6 Sol",
+            Api::OpenaiCompletions,
+            "routeryo-copy",
+            "https://gateway.example.com",
+        );
+        let anthropic = Model::new(
+            "claude-sonnet-5",
+            "Claude Sonnet 5",
+            Api::AnthropicMessages,
+            "anthropic",
+            "https://api.anthropic.com",
+        );
+        let catalog = [gateway, anthropic];
+        assert_eq!(
+            find_model_selector_match(&catalog, "gpt-5.6-sol")
+                .unwrap()
+                .provider,
+            "routeryo-copy"
+        );
+        assert_eq!(
+            find_model_selector_match(&catalog, "routeryo-copy/gpt-5.6-sol")
+                .unwrap()
+                .id,
+            "gpt-5.6-sol"
+        );
+        assert_eq!(
+            find_model_selector_match(&catalog, "anthropic/claude-sonnet-5")
+                .unwrap()
+                .id,
+            "claude-sonnet-5"
+        );
+        assert!(find_model_selector_match(&catalog, "other/gpt-5.6-sol").is_none());
+    }
+
+    #[test]
+    fn assistant_error_text_keeps_provider_diagnostic_visible() {
+        use rpi_ai::types::{AssistantMessage, AssistantRole, StopReason, Usage};
+
+        let failed = AssistantMessage {
+            role: AssistantRole,
+            content: Vec::new(),
+            api: rpi_ai::Api::AnthropicMessages,
+            provider: "anthropic".into(),
+            model: "claude-sonnet-5".into(),
+            response_model: None,
+            response_id: None,
+            usage: Usage::zero(),
+            stop_reason: StopReason::Error,
+            deferred: None,
+            error_message: Some("upstream returned 401".into()),
+            raw_stop_reason: None,
+            end_turn: None,
+            timestamp: 0,
+        };
+        assert_eq!(
+            assistant_error_text(&failed).as_deref(),
+            Some("upstream returned 401")
+        );
+
+        let mut no_detail = failed;
+        no_detail.error_message = Some("  ".into());
+        assert_eq!(
+            assistant_error_text(&no_detail).as_deref(),
+            Some("Provider request failed.")
+        );
     }
 
     #[test]
