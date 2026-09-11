@@ -92,8 +92,9 @@ pub struct Args {
     /// scanned and no plugin tools/handlers are registered.
     pub no_extensions: bool,
     /// `--extensions-dir`/`-ed`: an extra directory to scan for cdylib plugins
-    /// (`.dll`/`.so`/`.dylib`), in addition to the project `.pi/extensions` and
-    /// global `agent_dir()/extensions` defaults. May be repeated; scanned after
+    /// (`.dll`/`.so`/`.dylib`), in addition to project `.rpi/extensions`
+    /// (with legacy `.pi/extensions` compatibility) and global
+    /// `agent_dir()/extensions` defaults. May be repeated; scanned after
     /// the defaults (so a same-named tool in a default dir wins first, mirroring
     /// pi's registration order). `RPI_EXTENSIONS_DIR` (colon-separated on Unix,
     /// semicolon on Windows) provides the same list via env.

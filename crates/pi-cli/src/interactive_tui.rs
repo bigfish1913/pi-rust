@@ -4629,7 +4629,8 @@ fn cycle_next_model(catalog: &[rpi_ai::Model], current_id: &str) -> Option<rpi_a
 }
 
 /// Build + open the `/session` selector. Lists JSONL session files under the
-/// default session dir (`<cwd>/.pi/sessions`). Selecting reports "restore not
+/// default session dir (`<cwd>/.rpi/sessions`, with legacy `.pi/sessions`
+/// fallback). Selecting reports "restore not
 /// implemented in v1" (existing constraint) but shows the list for
 /// discoverability.
 fn open_session_selector(
@@ -5465,7 +5466,7 @@ fn show_context_panel(
 
     if skills.is_empty() {
         lines.push(
-            "  Skills: (none discovered — create .pi/skills/ or ~/.rpi/agent/skills/)".into(),
+            "  Skills: (none discovered — create .rpi/skills/ (.pi/skills also works) or ~/.rpi/agent/skills/)".into(),
         );
     } else {
         lines.push(format!("  Skills ({}):", skills.len()));
@@ -5482,7 +5483,7 @@ fn show_context_panel(
 
     if templates.is_empty() {
         lines.push(
-            "  Prompt templates: (none — create .pi/prompts/ or ~/.rpi/agent/prompts/)".into(),
+            "  Prompt templates: (none — create .rpi/prompts/ (.pi/prompts also works) or ~/.rpi/agent/prompts/)".into(),
         );
     } else {
         lines.push(format!("  Prompt templates ({}):", templates.len()));

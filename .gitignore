@@ -15,3 +15,4 @@ target/*
 
 # Static frontend deployment bundle
 .deploy/
+.codegraph

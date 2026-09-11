@@ -15,16 +15,18 @@
 //! module is that caller-side merge: load project dir then global dir, then
 //! dedupe first-wins-by-name so project wins.
 //!
-//! **Trust gate (v1 divergence):** pi gates project `.pi/SYSTEM.md` /
-//! `.pi/APPEND_SYSTEM.md` (and some project resources) behind
+//! **Trust gate (v1 divergence):** pi gates project `SYSTEM.md` /
+//! `APPEND_SYSTEM.md` (and some project resources) behind
 //! `settingsManager.isProjectTrusted()`. rpi v1 has **no trust prompt**
 //! (`config.rs:349`: "does not gate any project resources behind trust in v1"),
-//! so project resources are read unconditionally here. A copied `.pi/` directory
-//! drops in and works (the documented intent). Full trust gating is deferred.
+//! so project resources are read unconditionally here. A copied `.rpi/` or
+//! `.pi/` directory drops in and works (the documented intent). Full trust
+//! gating is deferred.
 //!
 //! **Deferred (documented):** pi's `.agents/skills` + `~/.agents/skills` +
 //! package-installed skills/prompts (4 discovery roots in pi; rpi v1 mirrors the
-//! two primary: project `.pi/<sub>` + user `agent_dir()<sub>`); worktree
+//! three primary roots: project `.rpi/<sub>`, legacy project `.pi/<sub>`, and
+//! user `agent_dir()<sub>`); worktree
 //! shadowed-context-file dedup (`findShadowedContextFile`); full structured
 //! winner/loser collision diagnostics (rpi v1 encodes collisions as a
 //! `SkillDiagnostic`/`PromptTemplateDiagnostic` with a descriptive message).
@@ -41,16 +43,24 @@ use rpi_harness::skills::{load_skills, LoadSkillsResult, SkillDiagnostic, SkillD
 use rpi_harness::types::{PromptTemplate, Skill};
 use rpi_tools::env::ExecutionEnv;
 
-/// The project-local config dir name. Mirrors pi's `.pi/` (NOT `.rpi/`) so a
-/// copied pi project directory drops in and works: skills under `<cwd>/.pi/skills`,
-/// prompts under `<cwd>/.pi/prompts`, `SYSTEM.md`/`APPEND_SYSTEM.md` under
-/// `<cwd>/.pi/`. The **global** config lives under `agent_dir()` (`~/.rpi/agent`),
-/// which IS `.rpi` — see `config.rs`.
-pub const PROJECT_CONFIG_DIR_NAME: &str = ".pi";
+/// The preferred project-local config dir. rpi-owned resources live under
+/// `<cwd>/.rpi`; the legacy `.pi` directory remains a compatibility fallback.
+pub const PROJECT_CONFIG_DIR_NAME: &str = ".rpi";
+/// The upstream Pi project-local config dir, loaded after `.rpi`.
+pub const LEGACY_PROJECT_CONFIG_DIR_NAME: &str = ".pi";
 
-/// Resolve the project-local resource subdir `<cwd>/.pi/<sub>`.
+/// Resolve the preferred project-local resource subdir `<cwd>/.rpi/<sub>`.
 pub fn project_dir(cwd: &Path, sub: &str) -> PathBuf {
     cwd.join(PROJECT_CONFIG_DIR_NAME).join(sub)
+}
+
+/// Resolve project-local resource dirs in precedence order: `.rpi` first,
+/// then the original Pi `.pi` layout for compatibility.
+pub fn project_dirs(cwd: &Path, sub: &str) -> Vec<PathBuf> {
+    vec![
+        project_dir(cwd, sub),
+        cwd.join(LEGACY_PROJECT_CONFIG_DIR_NAME).join(sub),
+    ]
 }
 
 /// Resolve the global resource subdir `<agent_dir>/<sub>` (e.g.
@@ -61,11 +71,21 @@ pub fn global_dir(sub: &str) -> Option<PathBuf> {
 }
 
 /// The candidate context/SYSTEM/APPEND filenames live directly under
-/// `<cwd>/.pi/` and `<agent_dir>/` (no `skills`/`prompts` subdir). Re-exports the
+/// `<cwd>/.rpi/`, `<cwd>/.pi/`, and `<agent_dir>/` (no `skills`/`prompts`
+/// subdir). Re-exports the
 /// harness context-file candidates for the system/append discovery path so
 /// callers share one source of truth.
 pub fn project_config_file(cwd: &Path, name: &str) -> PathBuf {
     cwd.join(PROJECT_CONFIG_DIR_NAME).join(name)
+}
+
+/// Resolve project config files in precedence order: preferred `.rpi`, then
+/// legacy `.pi`.
+pub fn project_config_files(cwd: &Path, name: &str) -> Vec<PathBuf> {
+    vec![
+        project_config_file(cwd, name),
+        cwd.join(LEGACY_PROJECT_CONFIG_DIR_NAME).join(name),
+    ]
 }
 
 /// Global config file under `<agent_dir>/<name>` (`~/.rpi/agent/SYSTEM.md`).
@@ -77,25 +97,28 @@ pub fn global_config_file(name: &str) -> Option<PathBuf> {
 // SYSTEM.md / APPEND_SYSTEM.md discovery (project-wins, mirroring pi)
 // ---------------------------------------------------------------------------
 
-/// Discover `SYSTEM.md`: project `<cwd>/.pi/SYSTEM.md` overrides global
-/// `<agent_dir>/SYSTEM.md` (mirrors pi `discoverSystemPromptFile`
+/// Discover `SYSTEM.md`: project `<cwd>/.rpi/SYSTEM.md` overrides the legacy
+/// `<cwd>/.pi/SYSTEM.md`, and both override global `<agent_dir>/SYSTEM.md`
+/// (mirrors pi `discoverSystemPromptFile`
 /// `resource-loader.ts:1022-1034`). Returns the first existing file in that
 /// order, or `None`.
 ///
 /// **Trust gate (v1 divergence):** pi gates the **project** `SYSTEM.md` behind
 /// `settingsManager.isProjectTrusted()` (global is always honored). rpi v1 has
-/// no trust prompt (`config.rs:349`), so the project file is read unconditionally
-/// — a copied `.pi/` drops in and works. Full trust gating is deferred.
+/// no trust prompt (`config.rs:349`), so project files are read unconditionally
+/// — a copied `.rpi/` or `.pi/` drops in and works. Full trust gating is deferred.
 pub fn discover_system_prompt_file(cwd: &Path) -> Option<PathBuf> {
-    let project = project_config_file(cwd, "SYSTEM.md");
-    if project.is_file() {
-        return Some(project);
+    for project in project_config_files(cwd, "SYSTEM.md") {
+        if project.is_file() {
+            return Some(project);
+        }
     }
     global_config_file("SYSTEM.md").filter(|p| p.is_file())
 }
 
 /// Discover `APPEND_SYSTEM.md`: same precedence as `SYSTEM.md` — project
-/// `<cwd>/.pi/APPEND_SYSTEM.md` overrides global `<agent_dir>/APPEND_SYSTEM.md`
+/// `<cwd>/.rpi/APPEND_SYSTEM.md` overrides `<cwd>/.pi/APPEND_SYSTEM.md`, and
+/// both override global `<agent_dir>/APPEND_SYSTEM.md`
 /// (mirrors pi `discoverAppendSystemPromptFile` `resource-loader.ts:1036-1048`).
 /// Returns the first existing file in that order, or `None`. The discovered
 /// content is appended to the system prompt (pi `appendSystemPrompt`
@@ -104,9 +127,10 @@ pub fn discover_system_prompt_file(cwd: &Path) -> Option<PathBuf> {
 /// **Trust gate (v1 divergence):** same as [`discover_system_prompt_file`] —
 /// pi gates the project file on trust, rpi v1 reads it unconditionally.
 pub fn discover_append_system_prompt_file(cwd: &Path) -> Option<PathBuf> {
-    let project = project_config_file(cwd, "APPEND_SYSTEM.md");
-    if project.is_file() {
-        return Some(project);
+    for project in project_config_files(cwd, "APPEND_SYSTEM.md") {
+        if project.is_file() {
+            return Some(project);
+        }
     }
     global_config_file("APPEND_SYSTEM.md").filter(|p| p.is_file())
 }
@@ -221,10 +245,11 @@ pub async fn load_prompt_templates_with_precedence(
     result
 }
 
-/// The ordered skill dirs for a project: `[<cwd>/.pi/skills, <agent_dir>/skills]`.
+/// The ordered skill dirs for a project: `[<cwd>/.rpi/skills,
+/// <cwd>/.pi/skills, <agent_dir>/skills]`.
 /// The global dir is omitted when `agent_dir()` can't be resolved (no home dir).
 pub fn skill_dirs(cwd: &Path) -> Vec<PathBuf> {
-    let mut dirs = vec![project_dir(cwd, "skills")];
+    let mut dirs = project_dirs(cwd, "skills");
     if let Some(g) = global_dir("skills") {
         dirs.push(g);
     }
@@ -232,9 +257,9 @@ pub fn skill_dirs(cwd: &Path) -> Vec<PathBuf> {
 }
 
 /// The ordered prompt-template paths for a project:
-/// `[<cwd>/.pi/prompts, <agent_dir>/prompts]`.
+/// `[<cwd>/.rpi/prompts, <cwd>/.pi/prompts, <agent_dir>/prompts]`.
 pub fn prompt_template_dirs(cwd: &Path) -> Vec<PathBuf> {
-    let mut dirs = vec![project_dir(cwd, "prompts")];
+    let mut dirs = project_dirs(cwd, "prompts");
     if let Some(g) = global_dir("prompts") {
         dirs.push(g);
     }
@@ -335,14 +360,33 @@ mod tests {
     }
 
     #[test]
-    fn project_dir_uses_pi_name() {
+    fn project_dir_uses_rpi_name() {
         let d = project_dir(Path::new("/proj"), "skills");
-        assert_eq!(d, PathBuf::from("/proj/.pi/skills"));
+        assert_eq!(d, PathBuf::from("/proj/.rpi/skills"));
     }
 
     #[test]
-    fn project_config_file_under_pi() {
+    fn project_dirs_keep_pi_compatibility_after_rpi() {
+        let dirs = project_dirs(Path::new("/proj"), "extensions");
+        assert_eq!(
+            dirs,
+            vec![
+                PathBuf::from("/proj/.rpi/extensions"),
+                PathBuf::from("/proj/.pi/extensions")
+            ]
+        );
+    }
+
+    #[test]
+    fn project_config_file_prefers_rpi_and_keeps_pi_fallback() {
         let p = project_config_file(Path::new("/proj"), "SYSTEM.md");
-        assert_eq!(p, PathBuf::from("/proj/.pi/SYSTEM.md"));
+        assert_eq!(p, PathBuf::from("/proj/.rpi/SYSTEM.md"));
+        assert_eq!(
+            project_config_files(Path::new("/proj"), "SYSTEM.md"),
+            vec![
+                PathBuf::from("/proj/.rpi/SYSTEM.md"),
+                PathBuf::from("/proj/.pi/SYSTEM.md")
+            ]
+        );
     }
 }

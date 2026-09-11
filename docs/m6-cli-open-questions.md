@@ -189,10 +189,11 @@ override).
 - **Project-trust prompt + `trust.json` gate.** rpi reads `trust.json`
   (`config::read_trust`) for layout parity (a copied pi `trust.json` parses +
   is located at `~/.rpi/agent/trust.json`), but does **not** wire a trust
-  prompt or gate project `.pi` resources behind it — rpi doesn't load the
+  prompt or gate project `.rpi`/`.pi` resources behind it — rpi doesn't load the
   resources pi gates there (skills/templates/context, §8). Deferred until
   resource discovery lands.
-- **Session dir.** v1's default session dir is still `<cwd>/.pi/sessions`
+- **Session dir.** v1's default session dir is `<cwd>/.rpi/sessions`, with an
+  existing `<cwd>/.pi/sessions` directory retained as a compatibility fallback
   (see §6), **not** `<agentDir>/sessions`. pi encodes cwd into session
   filenames; rpi's session layer is a separate design. Aligning the session
   location is out of scope for this config-parity pass.
@@ -376,7 +377,8 @@ rehydrate a session from an existing JSONL file, wire `-c` (most-recent in the
 cwd's session dir), `-r` (a picker — needs a TUI), and `--session` (id/path
 resolution).
 
-**Note.** The v1 default session dir is `<cwd>/.pi/sessions` (TS uses
+**Note.** The v1 default session dir is `<cwd>/.rpi/sessions`; an existing
+`<cwd>/.pi/sessions` is used when no `.rpi/sessions` exists (TS uses
 `<agentDir>/sessions` under the home dir). This is a documented divergence so
 sessions live *with the project* rather than globally; revisit if a global
 location is preferred.
@@ -412,14 +414,16 @@ already accepts `Vec<ImageContent>`; this is purely CLI-side wiring.
 + `crates/pi-harness/src/context_files.rs` + `crates/pi-harness/src/system_prompt.rs`.
 
 **Status (Part A, done).** Resource discovery is wired end-to-end:
-- **Skills**: discovered from `<cwd>/.pi/skills` then `agent_dir()/skills`,
-  project-wins-first dedupe (`resource_dirs::dedupe_skills`, mirrors pi
+- **Skills**: discovered from `<cwd>/.rpi/skills`, then legacy
+  `<cwd>/.pi/skills`, then `agent_dir()/skills`, project-wins-first dedupe
+  (`resource_dirs::dedupe_skills`, mirrors pi
   `addSkills` collision semantics). The `<available_skills>` listing is injected
   into the system prompt by `AgentHarness::compose_prompt`, gated on the `read`
   tool being active AND `disable_model_invocation` filtering (applied inside
   `format_skills_for_system_prompt`, mirroring pi `skills.ts:335-336`).
-- **Prompt-templates**: discovered from `<cwd>/.pi/prompts` then
-  `agent_dir()/prompts`, project-wins-first dedupe. On-demand only (never in the
+- **Prompt-templates**: discovered from `<cwd>/.rpi/prompts`, then legacy
+  `<cwd>/.pi/prompts`, then `agent_dir()/prompts`, project-wins-first dedupe.
+  On-demand only (never in the
   system prompt); surfaced as `/<name>` slash commands in the TUI autocomplete +
   expandable via the harness `prompt_from_template` lane call. `/context` lists
   them.
@@ -428,9 +432,10 @@ already accepts `Vec<ImageContent>`; this is purely CLI-side wiring.
   "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"]`, global agentDir first
   then ancestor-walk cwd→root with the **deepest (cwd) file concatenated last**).
   Rendered as a `<project_context>` block by `format_project_context`.
-- **SYSTEM.md / APPEND_SYSTEM.md**: project `<cwd>/.pi/SYSTEM.md` overrides
-  global `<agent_dir>/SYSTEM.md` (mirrors pi `discoverSystemPromptFile`); the
-  same precedence for `APPEND_SYSTEM.md`. Explicit `--system-prompt` wins over
+- **SYSTEM.md / APPEND_SYSTEM.md**: project `<cwd>/.rpi/` wins, then legacy
+  `<cwd>/.pi/`, then global `<agent_dir>/` (mirrors pi
+  `discoverSystemPromptFile` with an rpi-owned project layer); the same
+  precedence applies to `APPEND_SYSTEM.md`. Explicit `--system-prompt` wins over
   SYSTEM.md; `--append-system-prompt` wins over APPEND_SYSTEM.md (pi
   `appendSystemPrompt`). System-prompt order mirrors pi `buildSystemPrompt`:
   base → append → context → skills.
@@ -441,14 +446,14 @@ already accepts `Vec<ImageContent>`; this is purely CLI-side wiring.
   context/system/append sources (`interactive_tui::show_context_panel`).
 
 **Divergences (documented, deferred).**
-- **Trust gating**: pi gates project `.pi/*` SYSTEM.md/APPEND_SYSTEM.md (+ some
-  resources) behind `isProjectTrusted()`; rpi v1 has no trust prompt, so project
-  resources are read unconditionally (a copied `.pi/` drops in and works). Full
+- **Trust gating**: pi gates project config files (+ some resources) behind
+  `isProjectTrusted()`; rpi v1 has no trust prompt, so project resources are
+  read unconditionally (a copied `.rpi/` or `.pi/` drops in and works). Full
   trust gating deferred.
 - **Discovery roots**: pi reads 4 roots (`.pi/skills`, `.agents/skills`,
-  `~/.pi/agent/skills`, `~/.agents/skills`) + installed packages; rpi v1 mirrors
-  the two primary (`<cwd>/.pi/<sub>` + `agent_dir()/<sub>`). `.agents/*` + package
-  skills/prompts deferred.
+  `~/.pi/agent/skills`, `~/.agents/skills`) + installed packages; rpi reads
+  `<cwd>/.rpi/<sub>` first, then legacy `<cwd>/.pi/<sub>`, then
+  `agent_dir()/<sub>`. `.agents/*` + package skills/prompts remain deferred.
 - **Worktree shadowed-context-file dedup** (`findShadowedContextFile`,
   `.reference/.../resource-loader.ts:100-116`): deferred (git-layout edge case).
 - **Full structured collision diagnostics**: pi carries `winnerPath`/`loserPath`
@@ -462,7 +467,7 @@ already accepts `Vec<ImageContent>`; this is purely CLI-side wiring.
   flagged as a gap to mirror (or defer with doc).
 
 **Still deferred (Part B + later):** extension/plugin discovery (`--extensions-dir`,
-`.pi/extensions`, `--extension`/`-e`), theme discovery (`--theme`,
+`.rpi/extensions`, legacy `.pi/extensions`, `--extension`/`-e`), theme discovery (`--theme`,
 `--no-themes`), `--skill`/`--prompt-template`/`--models` cycling, session
 restore (`-c`/`-r`/`--session`). These remain §1–§7 open questions below.
 

@@ -6,7 +6,8 @@
 //! v1 scope cuts vs the TS SDK (tracked in `docs/m6-cli-open-questions.md`):
 //! - **Skill / prompt-template / context-file discovery IS wired**
 //!   (`--no-skills`/`-ns`, `--no-prompt-templates`/`-np`, `--no-context-files`/
-//!   `-nc` each suppress one channel; project `.pi/<sub>` + global
+//!   `-nc` each suppress one channel; project `.rpi/<sub>` + legacy
+//!   `.pi/<sub>` + global
 //!   `agent_dir()<sub>` discovery with project-wins dedupe via
 //!   [`crate::resource_dirs`]; SYSTEM.md/APPEND_SYSTEM.md project-wins
 //!   precedence). **Extension `resources_discover` (B5b) feeds the SAME loaders:
@@ -15,7 +16,7 @@
 //!   load too — `load_skills` accepts both dirs and files). Theme discovery is
 //!   accepted but ignored (rpi has no theme system — documented divergence).**
 //!   **Trust gating remains deferred** — project resources are discovered
-//!   unconditionally (a copied `.pi/` drops in and works).
+//!   unconditionally (a copied `.rpi/` or legacy `.pi/` drops in and works).
 //! - **No `--models` cycling, no `ModelRuntime`/multi-provider.** One model,
 //!   one provider (Anthropic), resolved up-front by [`crate::provider`].
 //! - **Built-in tools**: `read`, `bash`, `edit`, `write` plus the read-only
@@ -54,7 +55,7 @@ use crate::args::Args;
 use crate::provider::ResolvedModel;
 use crate::resource_dirs::{
     discover_append_system_prompt_file, discover_system_prompt_file, global_dir,
-    load_prompt_templates_with_precedence, load_skills_with_precedence, project_dir,
+    load_prompt_templates_with_precedence, load_skills_with_precedence, project_dirs,
     prompt_template_dirs, skill_dirs,
 };
 use rpi_extensions::{
@@ -62,8 +63,8 @@ use rpi_extensions::{
     PluginDiagnostics, PluginToolAdapter, TeeEmitter,
 };
 
-/// The subdirectory (under both project `.pi/` and global `agent_dir()/`) where
-/// rpi scans for cdylib plugins. Mirrors pi's `.pi/extensions`.
+/// The subdirectory (under project `.rpi/`, legacy `.pi/`, and global
+/// `agent_dir()`) where rpi scans for cdylib plugins.
 const EXTENSIONS_SUBDIR: &str = "extensions";
 
 /// The built-in tool names v1 ships, in the order the TS `createCodingTools`
@@ -150,11 +151,17 @@ pub fn select_session(args: &Args, cwd: &Path) -> SessionSelection {
     }
 }
 
-/// The default session directory: `<cwd>/.pi/sessions`. Mirrors the TS
-/// `getDefaultSessionDir` (`.pi/agent/sessions` in TS; v1 uses `.pi/sessions`
-/// under the project — a documented divergence).
+/// The default session directory: prefer `<cwd>/.rpi/sessions`, while keeping
+/// an existing `<cwd>/.pi/sessions` directory usable for compatibility. A new
+/// project therefore starts with the rpi-owned directory.
 pub fn default_session_dir(cwd: &Path) -> PathBuf {
-    cwd.join(".pi").join("sessions")
+    let preferred = cwd.join(".rpi").join("sessions");
+    let legacy = cwd.join(".pi").join("sessions");
+    if preferred.exists() || !legacy.exists() {
+        preferred
+    } else {
+        legacy
+    }
 }
 
 /// Build the `AgentHarness` from the resolved model + parsed args + cwd.
@@ -268,7 +275,8 @@ pub async fn build(
     // ---- System prompt base (precedence: --system-prompt > SYSTEM.md > default) ----
     // Mirrors pi `discoverSystemPromptFile` (`resource-loader.ts:1022-1034`):
     // an explicit `--system-prompt` flag wins; otherwise a discovered
-    // `<cwd>/.pi/SYSTEM.md` (project) overrides `<agent_dir>/SYSTEM.md`
+    // `<cwd>/.rpi/SYSTEM.md` wins, then legacy `<cwd>/.pi/SYSTEM.md`, then
+    // `<agent_dir>/SYSTEM.md`.
     // (global); otherwise the built-in default. **Project-wins** — the same
     // direction as skills/prompts precedence.
     let base_prompt = match args.system_prompt.as_deref() {
@@ -311,16 +319,17 @@ pub async fn build(
     // dedupe first-wins-by-name (project wins). Context files walk
     // global→ancestor(cwd→root), deepest-last (pi parity).
     //
-    // **Trust gate (v1 divergence):** pi gates project `.pi/*` discovery on
+    // **Trust gate (v1 divergence):** pi gates project config discovery on
     // `isProjectTrusted()` (global resources are unconditional). rpi v1 has no
     // trust prompt — project resources are discovered unconditionally (a copied
-    // `.pi/` drops in and works). Full trust gating is deferred.
+    // `.rpi/` or `.pi/` drops in and works). Full trust gating is deferred.
     let agent_dir = crate::config::agent_dir().ok();
 
     // ---- B5b: extension resources_discover ----
     // If any plugin registered a `resources_discover` handler, fan the event out
     // (reason "startup") and collect skill/prompt/theme paths. These plugin-
-    // contributed paths merge WITH the static Part-A dirs (project `.pi/skills` +
+    // contributed paths merge WITH the static Part-A dirs (project
+    // `.rpi/skills`, legacy `.pi/skills` +
     // `agent_dir/skills`, etc.) and the loaders re-run over the union — the
     // coherence point: a plugin's discovered skills land through the SAME loaders
     // as static skills. Static dirs load FIRST so project skills keep winning name
@@ -1056,7 +1065,8 @@ fn build_models_with_extensions(
 
 /// Resolve the extension dirs to scan and load the cdylib plugins, returning
 /// the loaded session guard (keeps the `Library` handles alive for the harness
-/// lifetime). Scan order: project `.pi/extensions`, global `agent_dir()/`
+/// lifetime). Scan order: project `.rpi/extensions`, legacy `.pi/extensions`,
+/// global `agent_dir()/`
 /// `extensions`, then any `--extensions-dir` flags (scanned after the defaults
 /// — `args.rs`). Diagnostics are a no-op sink for now; load skips/ABI mismatches
 /// surface via the `--verbose` summary.
@@ -1065,7 +1075,7 @@ fn load_extensions(
     cwd: &Path,
     action_bridge: Option<Arc<rpi_extensions::ActionBridge>>,
 ) -> ExtensionSession {
-    let mut dirs = vec![project_dir(cwd, EXTENSIONS_SUBDIR)];
+    let mut dirs = project_dirs(cwd, EXTENSIONS_SUBDIR);
     if let Some(g) = global_dir(EXTENSIONS_SUBDIR) {
         dirs.push(g);
     }
@@ -1605,10 +1615,20 @@ mod tests {
         let cwd = Path::new("/proj");
         match select_session(&args, cwd) {
             SessionSelection::New { dir, .. } => {
-                assert_eq!(dir, Path::new("/proj/.pi/sessions"));
+                assert_eq!(dir, Path::new("/proj/.rpi/sessions"));
             }
             other => panic!("expected New, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn default_session_dir_prefers_rpi_but_reads_legacy_pi() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        std::fs::create_dir_all(cwd.join(".pi/sessions")).unwrap();
+        assert_eq!(default_session_dir(cwd), cwd.join(".pi/sessions"));
+        std::fs::create_dir_all(cwd.join(".rpi/sessions")).unwrap();
+        assert_eq!(default_session_dir(cwd), cwd.join(".rpi/sessions"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

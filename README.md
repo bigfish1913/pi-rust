@@ -132,8 +132,13 @@ only copies executable targets, while rpi loads dynamic-library extensions.
   `MutationQueue`) + `grep`, `find`, `ls` (read-only, in-process via the
   `FileSystem` trait — no `rg`/`fd` shell-out).
 - **Extensions:** Rust `cdylib` plugins can be installed with `rpi install` and
-  are discovered from project `.pi/extensions`, global
-  `~/.rpi/agent/extensions`, and `--extensions-dir`.
+  are discovered from project `.rpi/extensions`, legacy `.pi/extensions`,
+  global `~/.rpi/agent/extensions`, and `--extensions-dir`.
+
+- **Project resources:** rpi-owned skills, prompts, system instructions, and
+  extensions use `.rpi/` first; the original Pi `.pi/` layout remains a
+  compatibility fallback. When both contain the same skill or prompt name,
+  `.rpi/` wins.
 - **Sessions:** JSONL v4 durable backend + in-memory ephemeral; compaction + a
   split-turn two-LLM-call invariant.
 
