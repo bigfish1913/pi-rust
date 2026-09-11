@@ -184,7 +184,7 @@
         { "id": "tools", "label": "Tool loop", "file": "examples/tools/src/main.rs", "note": "Connect the built-in write and bash tools to a real filesystem." }
       ],
       "releases": [
-        { "version": "0.1.9", "status": "current", "title": "Visible tools + skills", "description": "The welcome screen lists available tools and loaded skills so the runtime is visible at a glance." },
+        { "version": "0.1.10", "status": "current", "title": "Concurrent Node extensions", "description": "Node and TypeScript extensions now support concurrent requests, cancellation propagation and a more reliable runtime transport." },
         { "version": "next", "status": "building", "title": "More surfaces", "description": "Expanded package manifests, more providers and a richer plugin resource protocol." },
         { "version": "future", "status": "exploring", "title": "Your ideas", "description": "Bring rpi into your product, workflow and runtime environment." }
       ]

@@ -40,7 +40,7 @@
     }
   ],
   "releases": [
-    { "version": "0.1.9", "status": "current", "title": "Visible tools + skills", "description": "启动欢迎页会列出当前可用的 tools 和已加载的 skills，让运行环境一眼可见。" },
+    { "version": "0.1.10", "status": "current", "title": "Concurrent Node extensions", "description": "Node/TypeScript 扩展支持并发请求、取消传播和更稳定的运行时通信。" },
     { "version": "next", "status": "building", "title": "More surfaces", "description": "扩展 package manifest、更多 Provider 和更完整的插件资源协议。" },
     { "version": "future", "status": "exploring", "title": "Your ideas", "description": "把 rpi 接进你的产品、工作流和自己的运行环境。" }
   ]

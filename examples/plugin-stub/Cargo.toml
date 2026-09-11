@@ -1,6 +1,6 @@
 [package]
 name = "plugin-stub"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2021"
 publish = false
 description = "Minimal rpi Rust-cdylib plugin: registers an `echo` tool + one event handler (the Part B2 ABI smoke target)."
