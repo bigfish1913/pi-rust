@@ -14,7 +14,9 @@ use async_trait::async_trait;
 use rpi_agent::agent_tool::AgentTool;
 use rpi_agent::error::AgentError;
 use rpi_agent::types::{AgentToolResult, TextContentOrImage, ToolResultPartial};
-use rpi_ai::types::{ImageContent, ImageContentType, Tool};
+use rpi_ai::types::{
+    ConstrainedSamplingConfig, ConstrainedStrictness, ImageContent, ImageContentType, Tool,
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
@@ -95,7 +97,7 @@ impl ReadTool {
                 kb = DEFAULT_MAX_BYTES / 1024
             ),
             parameters: rpi_ai::types::Schema::new(serde_json::to_value(params).unwrap_or_default()),
-            constrained_sampling: None,
+            constrained_sampling: Some(ConstrainedSamplingConfig::JsonSchema { strict: ConstrainedStrictness::Prefer }),
         }
     }
 }

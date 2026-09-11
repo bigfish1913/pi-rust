@@ -14,6 +14,7 @@ pub mod jsonl;
 pub mod memory;
 pub mod reducer;
 pub mod session;
+pub mod sqlite;
 pub mod state;
 pub mod types;
 
@@ -29,4 +30,5 @@ pub use reducer::{
     validate_record_log, RecordLogCorruption, RecordLogCorruptionReason, RecordLogSlice,
 };
 pub use session::{DefaultIdGenerator, Session};
+pub use sqlite::{SqliteSessionRepo, SqliteSessionStorage};
 pub use state::{ApplyOutcome, SessionState};

@@ -26,8 +26,10 @@ schemars = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+rusqlite = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 rpi-telemetry = { workspace = true }
 rpi-ai = { workspace = true }
 rpi-agent = { workspace = true }

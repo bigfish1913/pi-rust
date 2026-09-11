@@ -26,6 +26,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::{SessionError, SessionResult};
 use crate::session::types::{
     BranchBounds, Entry, EntryOrder, EntryQuery, ForkOptions, ForkPosition, LanePointer,
@@ -36,6 +38,7 @@ use crate::session::types::{
 /// The in-memory mutation reducer. Mirrors TS `SessionState`. Owns the
 /// append-only entry/record logs, the lane→leaf map, open operations per lane,
 /// global name/labels facts, and running stats.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionState {
     sequence: u64,
     used_ids: std::collections::HashSet<String>,

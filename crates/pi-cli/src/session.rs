@@ -47,8 +47,8 @@ use rpi_harness::types::{
 };
 use rpi_tools::{
     create_bash_tool, create_edit_tool, create_find_tool, create_grep_tool, create_ls_tool,
-    create_read_tool, create_write_tool, ExecutionToolContext, MutationQueueRegistry,
-    OsExecutionEnv,
+    create_powershell_tool, create_read_tool, create_write_tool, ExecutionToolContext,
+    MutationQueueRegistry, OsExecutionEnv,
 };
 
 use crate::args::Args;
@@ -70,7 +70,16 @@ const EXTENSIONS_SUBDIR: &str = "extensions";
 /// The built-in tool names v1 ships, in the order the TS `createCodingTools`
 /// registers them: the mutating set (`read`/`bash`/`edit`/`write`) followed by
 /// the read-only search set (`grep`/`find`/`ls`).
-pub const BUILTIN_TOOL_NAMES: &[&str] = &["read", "bash", "edit", "write", "grep", "find", "ls"];
+pub const BUILTIN_TOOL_NAMES: &[&str] = &[
+    "read",
+    "bash",
+    "edit",
+    "write",
+    "grep",
+    "find",
+    "ls",
+    "powershell",
+];
 
 /// The default coding system prompt. A condensed port of the TS
 /// `packages/coding-agent/src/core/system-prompt.ts` base prompt — the
@@ -89,6 +98,7 @@ Available tools:
 - grep  — Search file contents for a pattern
 - find  — Search for files by glob pattern
 - ls    — List directory contents
+- powershell — Execute PowerShell commands on Windows
 
 Guidelines:
 - Be concise in your responses
@@ -1156,6 +1166,7 @@ fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
         ("grep", HarnessTool::new(create_grep_tool(ctx, None))),
         ("find", HarnessTool::new(create_find_tool(ctx, None))),
         ("ls", HarnessTool::new(create_ls_tool(ctx, None))),
+        ("powershell", HarnessTool::new(create_powershell_tool(ctx))),
     ];
 
     // `--no-builtin-tools` disables the built-in set but would keep

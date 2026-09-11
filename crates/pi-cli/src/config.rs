@@ -724,6 +724,10 @@ pub fn provider_is_openai_completions(cfg: &ProviderConfig) -> bool {
     matches!(cfg.api.as_deref(), Some("openai-completions"))
 }
 
+pub fn provider_is_openai_responses(cfg: &ProviderConfig) -> bool {
+    matches!(cfg.api.as_deref(), Some("openai-responses"))
+}
+
 /// Convert a `(provider_id, ProviderConfig)` pair into a list of library
 /// [`Model`]s. Provider-level `base_url`/`headers`/`auth_header` fold into each
 /// model. Returns `None` for protocols that do not have a runtime provider.
@@ -732,11 +736,13 @@ pub fn provider_to_models(provider_id: &str, cfg: &ProviderConfig) -> Option<Vec
         Api::AnthropicMessages
     } else if provider_is_openai_completions(cfg) {
         Api::OpenaiCompletions
+    } else if provider_is_openai_responses(cfg) {
+        Api::OpenaiResponses
     } else {
         return None;
     };
     let provider_base = cfg.base_url.clone().unwrap_or_else(|| match api {
-        Api::OpenaiCompletions => "https://api.openai.com".to_string(),
+        Api::OpenaiCompletions | Api::OpenaiResponses => "https://api.openai.com".to_string(),
         _ => default_anthropic_base_url(),
     });
     let mut merged: Vec<Model> = Vec::with_capacity(cfg.models.len());
@@ -759,7 +765,7 @@ pub fn provider_to_models(provider_id: &str, cfg: &ProviderConfig) -> Option<Vec
         // registered for 'gateway'". Divergence documented in
         // `docs/m6-cli-open-questions.md`.
         let runtime_provider = match api {
-            Api::OpenaiCompletions => provider_id,
+            Api::OpenaiCompletions | Api::OpenaiResponses => provider_id,
             _ => DEFAULT_PROVIDER_ID,
         };
         let mut m = Model::new(
@@ -797,7 +803,7 @@ pub fn provider_to_models(provider_id: &str, cfg: &ProviderConfig) -> Option<Vec
                 headers.insert(k, v);
             }
         }
-        if matches!(api, Api::OpenaiCompletions) {
+        if matches!(api, Api::OpenaiCompletions | Api::OpenaiResponses) {
             if let Some(key) = cfg
                 .api_key
                 .as_deref()
@@ -808,7 +814,11 @@ pub fn provider_to_models(provider_id: &str, cfg: &ProviderConfig) -> Option<Vec
                 headers.insert("authorization".to_string(), format!("Bearer {key}"));
             }
             if let Some(value) = def.compat.clone() {
-                if let Ok(compat) = serde_json::from_value(value) {
+                if matches!(api, Api::OpenaiResponses) {
+                    if let Ok(compat) = serde_json::from_value(value) {
+                        m.compat = Some(StreamingProtocolCompat::OpenaiResponses(compat));
+                    }
+                } else if let Ok(compat) = serde_json::from_value(value) {
                     m.compat = Some(StreamingProtocolCompat::OpenaiCompletions(compat));
                 }
             }

@@ -78,6 +78,8 @@ use std::sync::Arc;
 use rpi_ai::providers::anthropic::models::anthropic_models;
 use rpi_ai::providers::anthropic::AnthropicProvider;
 use rpi_ai::providers::openai_completions::OpenAiCompletionsProvider;
+use rpi_ai::providers::openai_responses::openai_responses_models;
+use rpi_ai::providers::openai_responses::OpenAiResponsesProvider;
 use rpi_ai::{Model, Provider, ThinkingLevel};
 
 use crate::args::parse_thinking_level;
@@ -165,7 +167,7 @@ pub const NO_API_KEY_HINT: &str =
 /// exit) except `NoApiKey`, which prints guidance then exits.
 #[derive(Debug, thiserror::Error)]
 pub enum ResolveError {
-    #[error("Unknown provider \"{0}\". Supported: anthropic, openai-completions, or a models.json provider id")]
+    #[error("Unknown provider \"{0}\". Supported: anthropic, openai-completions, openai-responses, or a models.json provider id")]
     UnknownProvider(String),
     #[error("No model matches \"{pattern}\". Available: {available}")]
     NoMatch { pattern: String, available: String },
@@ -318,6 +320,7 @@ pub fn resolve(
     // ---- Catalog: built-in + ~/.rpi/models.json (merged, reusing the
     // already-loaded config) ----
     let mut catalog = anthropic_models();
+    catalog.extend(openai_responses_models());
     merge_user_catalog(&mut catalog, &models_cfg);
 
     // Apply the endpoint override to every model (the request URL is built from
@@ -537,6 +540,18 @@ pub fn resolve(
                 has_key,
             )
         }
+        rpi_ai::Api::OpenaiResponses => {
+            let has_key = openai_provider_key.is_some();
+            (
+                Arc::new(OpenAiResponsesProvider::with_models(
+                    selected_provider,
+                    openai_provider_key,
+                    reqwest::Client::new(),
+                    provider_models,
+                )),
+                has_key,
+            )
+        }
         _ => unreachable!("unsupported APIs are filtered while loading models.json"),
     };
 
@@ -722,6 +737,7 @@ fn provider_is_known(requested: &str, cfg: &config::ModelsConfig) -> bool {
     requested.eq_ignore_ascii_case("anthropic")
         || requested.eq_ignore_ascii_case("openai")
         || requested.eq_ignore_ascii_case("openai-completions")
+        || requested.eq_ignore_ascii_case("openai-responses")
         || cfg
             .providers
             .keys()
@@ -735,7 +751,13 @@ fn provider_matches(model: &Model, requested: &str, cfg: &config::ModelsConfig) 
     if requested.eq_ignore_ascii_case("openai")
         || requested.eq_ignore_ascii_case("openai-completions")
     {
-        return matches!(model.api, rpi_ai::Api::OpenaiCompletions);
+        return matches!(
+            model.api,
+            rpi_ai::Api::OpenaiCompletions | rpi_ai::Api::OpenaiResponses
+        );
+    }
+    if requested.eq_ignore_ascii_case("openai-responses") {
+        return matches!(model.api, rpi_ai::Api::OpenaiResponses);
     }
     if model.provider.eq_ignore_ascii_case(requested) {
         return true;
@@ -783,7 +805,7 @@ fn model_is_authed_for_resolution(
     model_has_header_auth(model)
         || match model.api {
             rpi_ai::Api::AnthropicMessages => has_anthropic_key,
-            rpi_ai::Api::OpenaiCompletions => has_openai_key,
+            rpi_ai::Api::OpenaiCompletions | rpi_ai::Api::OpenaiResponses => has_openai_key,
             _ => false,
         }
 }

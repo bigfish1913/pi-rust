@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use rpi_agent::agent_tool::AgentTool;
 use rpi_agent::error::AgentError;
 use rpi_agent::types::{AgentToolResult, TextContentOrImage, ToolResultPartial};
-use rpi_ai::types::Tool;
+use rpi_ai::types::{ConstrainedSamplingConfig, ConstrainedStrictness, Tool};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::sync::Mutex;
@@ -86,7 +86,9 @@ impl BashTool {
             parameters: rpi_ai::types::Schema::new(
                 serde_json::to_value(params).unwrap_or_default(),
             ),
-            constrained_sampling: None,
+            constrained_sampling: Some(ConstrainedSamplingConfig::JsonSchema {
+                strict: ConstrainedStrictness::Prefer,
+            }),
         }
     }
 }

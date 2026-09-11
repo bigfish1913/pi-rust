@@ -32,6 +32,7 @@
 //! rejections are `Result<T, HarnessError>`.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
@@ -40,8 +41,9 @@ use tokio_util::sync::CancellationToken;
 
 use rpi_agent::message::AgentMessage;
 use rpi_agent::{
-    run_agent_loop, AfterToolCall, AgentContext, AgentEmitter, AgentLoopConfig, AgentTool,
-    BeforeToolCall, ConvertToLlm, QueueMode, StreamFn, TransformContext,
+    run_agent_loop, AfterToolCall, AfterToolResults, AgentContext, AgentEmitter, AgentLoopConfig,
+    AgentTool, BeforeToolCall, ConvertToLlm, QueueMode, ShouldStopAfterTurnContext, StreamFn,
+    TransformContext,
 };
 use rpi_ai::types::{
     AssistantMessage, Content, DeferredHandle, StopReason, ThinkingLevel, Usage, UserContent,
@@ -54,7 +56,9 @@ use crate::compaction::{
 };
 use crate::error::{SessionError, SessionErrorCode};
 use crate::events::{HarnessEvent, HarnessEventBus, RunEndEvent, RunEndOutcome, RunStartEvent};
-use crate::messages::convert_to_llm as harness_convert_to_llm;
+use crate::messages::{
+    convert_to_llm as harness_convert_to_llm, create_compaction_summary_message,
+};
 use crate::prompt_templates::format_prompt_template_invocation;
 use crate::result::{HarnessError, HarnessResult, OperationKind};
 use crate::session::context::{
@@ -1387,6 +1391,7 @@ impl AgentHarness {
             snap.provider_hooks.clone(),
             snap.stream_options.clone(),
         )?;
+        let post_compaction_cut = Arc::new(AtomicUsize::new(0));
         let config = AgentLoopConfig {
             model: snap.model.clone(),
             convert_to_llm: convert,
@@ -1394,6 +1399,51 @@ impl AgentHarness {
             get_api_key: None,
             should_stop_after_turn: None,
             prepare_next_turn: None,
+            after_tool_results: {
+                let harness = self.clone();
+                let enabled = snap.compaction.enabled;
+                let settings = snap.compaction;
+                let model = snap.model.clone();
+                let provider = snap
+                    .models
+                    .iter()
+                    .find(|p| p.id() == model.provider)
+                    .cloned();
+                let compaction_signal = signal.clone();
+                if enabled && model.context_window > 0 && provider.is_some() {
+                    let cut_for_hook = Arc::clone(&post_compaction_cut);
+                    Some(Arc::new(move |ctx: ShouldStopAfterTurnContext<'_>| -> BoxFuture<'static, Option<rpi_agent::AgentLoopTurnUpdate>> {
+                        let harness = harness.clone();
+                        let model = model.clone();
+                        let provider = provider.clone().expect("checked above");
+                        let cut = Arc::clone(&cut_for_hook);
+                        let compaction_signal = compaction_signal.clone();
+                        let context = ctx.context.clone();
+                        let new_messages_len = ctx.new_messages.len();
+                        Box::pin(async move {
+                            let tokens = estimate_context_tokens(&context.messages).tokens;
+                            if !should_compact(tokens, model.context_window as i64, &settings) {
+                                return None;
+                            }
+                            let entries: Vec<Entry> = context.messages.iter().enumerate().map(|(i, message)| Entry::Message(crate::session::types::MessageEntry {
+                                base: crate::session::types::EntryBase { entry_type: "message".into(), id: format!("runtime-{i}"), seq: i as u64 + 1, parent_id: None, timestamp: i as i64 },
+                                message: message.clone(), terminate: None,
+                            })).collect();
+                            let prep = match prepare_compaction(&entries, settings) { Ok(Some(p)) => p, _ => return None };
+                            let opts = CompactionLlmOptions { provider, model: model.clone(), api_key: None, signal: compaction_signal, thinking_level: None, retry: None, custom_instructions: None };
+                            let result = match compact(&prep, &opts).await { Ok(r) => r, Err(_) => return None };
+                            if harness.persist_compaction_entry(&result).await.is_err() { return None; }
+                            cut.store(new_messages_len, Ordering::Release);
+                            let mut messages = Vec::with_capacity(result.retained_tail.len() + 1);
+                            messages.push(create_compaction_summary_message(&result.summary, result.tokens_before, 0));
+                            messages.extend(result.retained_tail);
+                            Some(rpi_agent::AgentLoopTurnUpdate { context: Some(AgentContext { system_prompt: context.system_prompt.clone(), messages, tools: context.tools.clone() }), model: None, thinking_level: None })
+                        })
+                    }) as AfterToolResults)
+                } else {
+                    None
+                }
+            },
             get_steering_messages: Some({
                 let queue = Arc::clone(&snap.steering_queue);
                 let lane = self.lane.clone();
@@ -1423,7 +1473,9 @@ impl AgentHarness {
             } else {
                 None
             },
-            max_retry_delay: Some(std::time::Duration::from_millis(snap.retry.base_delay_ms)),
+            max_retry_delay: Some(std::time::Duration::from_millis(
+                snap.retry.max_agent_delay_ms,
+            )),
             cache_retention: snap.stream_options.cache_retention.unwrap_or_default(),
             session_id: None,
             signal: signal.clone(),
@@ -1456,7 +1508,10 @@ impl AgentHarness {
         // Persist new messages + derive outcome.
         let (leaf_id, _final_entry_id, outcome, op_outcome, op_error) = match result {
             Ok(new_messages) => {
-                let (leaf, final_id) = self.persist_new_messages(&new_messages).await?;
+                let cut = post_compaction_cut.load(Ordering::Acquire);
+                let (leaf, final_id) = self
+                    .persist_new_messages(&new_messages[cut.min(new_messages.len())..])
+                    .await?;
                 let outcome = Self::derive_outcome(&new_messages, leaf.clone(), final_id.clone());
                 let op_outcome = match &outcome {
                     HarnessRunOutcome::Completed { .. } => OperationOutcome::Completed,

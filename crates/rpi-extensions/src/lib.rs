@@ -331,8 +331,7 @@ extern "C" fn trampoline_register_tool(
         (
             s.name.to_string_lossy(),
             s.description.to_string_lossy(),
-            serde_json::from_str::<serde_json::Value>(&s.parameters.to_string_lossy())
-                .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
+            serde_json::from_str::<serde_json::Value>(&s.parameters.to_string_lossy()).ok(),
             *s,
         )
     };
@@ -342,6 +341,12 @@ extern "C" fn trampoline_register_tool(
     plugin_free_string(schema_owned.name);
     plugin_free_string(schema_owned.description);
     plugin_free_string(schema_owned.parameters);
+    let Some(parameters_value) = parameters_value else {
+        return 2;
+    };
+    if name.trim().is_empty() || !parameters_value.is_object() {
+        return 2;
+    }
     let tool = rpi_ai::types::Tool {
         name,
         description,

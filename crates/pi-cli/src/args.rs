@@ -480,7 +480,7 @@ pub fn print_help() {
   {name} [options] [@files...] [messages...]
 
 {u}Options:{r}
-  --provider <name>              Provider name (anthropic, openai-completions, or models.json id)
+  --provider <name>              Provider name (anthropic, openai-completions, openai-responses, or models.json id)
   --model <pattern>              Model pattern or ID (supports \"provider/id\" and optional \":<thinking>\")
   --api-key <key>                API key override for the selected provider
   --base-url <url>               Override the selected model endpoint
@@ -545,7 +545,7 @@ pub fn print_help() {
   ANTHROPIC_API_KEY              Anthropic API key (x-api-key) — fallback when no stored credential
   ANTHROPIC_AUTH_TOKEN           Bearer token (Authorization: Bearer) for third-party gateways
   ANTHROPIC_BASE_URL             Override the Anthropic endpoint (e.g. a compatible proxy)
-  OPENAI_API_KEY                 Bearer token for openai-completions
+  OPENAI_API_KEY                 Bearer token for openai-completions/responses
   RPI_CODING_AGENT_DIR           Override the ~/.rpi config directory (auth.json + models.json)
 
 {u}Notes:{r}

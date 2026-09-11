@@ -273,6 +273,22 @@ async fn run_loop(
                 }
             }
 
+            if !tool_results.is_empty() {
+                if let Some(upd) = after_tool_results(
+                    config,
+                    &message,
+                    &tool_results,
+                    current_context,
+                    new_messages,
+                )
+                .await
+                {
+                    if let Some(ctx) = upd.context {
+                        *current_context = ctx;
+                    }
+                }
+            }
+
             let am = AgentMessage::Assistant(Box::new(message.clone()));
             emit_event(
                 emit,
@@ -1156,6 +1172,23 @@ async fn prepare_next_turn(
     } else {
         None
     }
+}
+
+async fn after_tool_results(
+    config: &AgentLoopConfig,
+    message: &AssistantMessage,
+    tool_results: &[ToolResultMessage],
+    context: &AgentContext,
+    new_messages: &[AgentMessage],
+) -> Option<crate::types::AgentLoopTurnUpdate> {
+    let hook = config.after_tool_results.as_ref()?;
+    let ctx = crate::types::ShouldStopAfterTurnContext {
+        message,
+        tool_results,
+        context,
+        new_messages,
+    };
+    hook(ctx).await
 }
 
 /// Call `should_stop_after_turn` if configured.

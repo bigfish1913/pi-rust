@@ -1048,7 +1048,7 @@ pub struct LanePointer {
 
 /// `LogItem` — the unified mutation log `get_log` returns. Mirrors the TS union
 /// (`entry | record | lane | fact(name) | fact(label)`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum LogItem {
     Entry {
         seq: u64,

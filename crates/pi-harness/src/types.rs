@@ -244,7 +244,11 @@ impl AgentHarnessStreamOptionsPatch {
 pub struct RetryPolicy {
     pub enabled: bool,
     pub max_retries: u32,
+    /// Exponential delay base for assistant-level retries.
     pub base_delay_ms: u64,
+    /// Hard cap for the accumulated agent retry delay. Mirrors pi's
+    /// `maxAgentDelayMs` (60 seconds by default).
+    pub max_agent_delay_ms: u64,
 }
 
 impl Default for RetryPolicy {
@@ -253,6 +257,7 @@ impl Default for RetryPolicy {
             enabled: false,
             max_retries: 0,
             base_delay_ms: 1000,
+            max_agent_delay_ms: 60_000,
         }
     }
 }

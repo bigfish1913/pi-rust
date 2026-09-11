@@ -153,6 +153,33 @@ impl InMemorySessionStorage {
         }
     }
 
+    /// Return a defensive snapshot of the reducer state. Used by durable
+    /// backends that persist the same session semantics in another store.
+    pub fn snapshot_state(&self) -> SessionState {
+        self.inner.read_state(Clone::clone)
+    }
+
+    pub fn replace_state(&self, state: SessionState) {
+        *self.inner.state.lock().expect("state not poisoned") = state;
+    }
+
+    /// Restore an in-memory storage from a previously persisted reducer state.
+    pub fn from_state(
+        metadata: SessionMetadata,
+        state: SessionState,
+        clock: Arc<dyn Clock>,
+        ids: Arc<dyn IdGenerator>,
+    ) -> Self {
+        Self {
+            metadata,
+            inner: Arc::new(Inner {
+                state: Mutex::new(state),
+                clock,
+                ids,
+            }),
+        }
+    }
+
     /// Fork from a source storage — mirrors TS `fork`. Applies the source
     /// state's [`SessionState::create_fork_mutations`] into a fresh backend.
     pub fn fork_from(

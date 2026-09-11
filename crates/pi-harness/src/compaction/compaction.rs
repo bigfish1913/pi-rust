@@ -456,6 +456,10 @@ where
     let policy = retry.filter(|p| p.enabled);
     let max_attempts: u32 = policy.as_ref().map(|p| p.max_retries).unwrap_or(0);
     let base_delay_ms: u64 = policy.as_ref().map(|p| p.base_delay_ms).unwrap_or(1000);
+    let max_agent_delay_ms: u64 = policy
+        .as_ref()
+        .map(|p| p.max_agent_delay_ms)
+        .unwrap_or(60_000);
 
     let mut attempt: u32 = 0;
     loop {
@@ -474,7 +478,9 @@ where
             return response;
         }
         attempt += 1;
-        let delay_ms = base_delay_ms.saturating_mul(1u64 << (attempt - 1));
+        let delay_ms = base_delay_ms
+            .saturating_mul(1u64 << (attempt - 1))
+            .min(max_agent_delay_ms);
         // Sleep honoring cancellation → normalize to aborted.
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {}

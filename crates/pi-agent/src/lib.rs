@@ -29,8 +29,9 @@ pub use agent_tool::AgentTool;
 pub use error::AgentError;
 pub use events::{AgentEmitter, AgentEvent, CollectorEmitter};
 pub use hooks::{
-    AfterToolCall, AgentLoopConfig, BeforeToolCall, ConvertToLlm, GetApiKey, GetFollowUpMessages,
-    GetSteeringMessages, PrepareNextTurn, ShouldStopAfterTurn, TransformContext,
+    AfterToolCall, AfterToolResults, AgentLoopConfig, BeforeToolCall, ConvertToLlm, GetApiKey,
+    GetFollowUpMessages, GetSteeringMessages, PrepareNextTurn, ShouldStopAfterTurn,
+    TransformContext,
 };
 pub use message::{AgentMessage, AgentMessageRole, CustomMessage};
 pub use queue::PendingMessageQueue;

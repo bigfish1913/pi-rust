@@ -53,6 +53,15 @@ pub type PrepareNextTurn = Arc<
         + Sync,
 >;
 
+/// Hook invoked after a tool-result batch is appended and before the next
+/// assistant request. Implementations may replace the context (for example by
+/// inserting a compaction boundary).
+pub type AfterToolResults = Arc<
+    dyn Fn(ShouldStopAfterTurnContext<'_>) -> BoxFuture<'static, Option<AgentLoopTurnUpdate>>
+        + Send
+        + Sync,
+>;
+
 /// `() -> Vec<AgentMessage>` — messages to inject mid-run after a tool batch.
 pub type GetSteeringMessages = Arc<dyn Fn() -> BoxFuture<'static, Vec<AgentMessage>> + Send + Sync>;
 
@@ -99,6 +108,7 @@ pub struct AgentLoopConfig {
     pub get_api_key: Option<GetApiKey>,
     pub should_stop_after_turn: Option<ShouldStopAfterTurn>,
     pub prepare_next_turn: Option<PrepareNextTurn>,
+    pub after_tool_results: Option<AfterToolResults>,
     pub get_steering_messages: Option<GetSteeringMessages>,
     pub get_follow_up_messages: Option<GetFollowUpMessages>,
     pub before_tool_call: Option<BeforeToolCall>,
@@ -134,6 +144,7 @@ impl std::fmt::Debug for AgentLoopConfig {
                 &self.should_stop_after_turn.is_some(),
             )
             .field("prepare_next_turn", &self.prepare_next_turn.is_some())
+            .field("after_tool_results", &self.after_tool_results.is_some())
             .field(
                 "get_steering_messages",
                 &self.get_steering_messages.is_some(),
