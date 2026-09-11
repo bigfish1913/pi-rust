@@ -19,6 +19,7 @@ const customs = new Map();
 const customStack = [];
 let nextCustomId = 1;
 const pendingRuntimeRequests = new Map();
+const activeHostRequests = new Map();
 let nextRuntimeRequestId = 1;
 const hostCapabilities = ['tools', 'commands', 'resources', 'models', 'session', 'ui.notify', 'ui.editor'];
 function runtimeRequest(action, args = {}) {
@@ -229,7 +230,7 @@ function createModelRegistry() {
     },
   };
 }
-function commandContext(initial = {}) {
+function commandContext(initial = {}, signal = new AbortController().signal) {
   const notifications = [];
   let editorText = String(initial.editorText ?? '');
   const ui = {
@@ -310,7 +311,7 @@ function commandContext(initial = {}) {
       capabilities: new Set(hostCapabilities),
       cwd: String(hostContext.cwd || process.cwd()),
       ui,
-      signal: new AbortController().signal,
+      signal,
       model: currentModel,
       modelRegistry: createModelRegistry(),
       scopedModels: Array.isArray(hostContext.scopedModels) ? hostContext.scopedModels : runtimeModels,
@@ -445,6 +446,7 @@ for (const file of files(paths)) {
 }
 const resources = { skillPaths: [], promptPaths: [], themePaths: [] };
 for (const handler of resourceHandlers) { const result = await handler(); if (result) for (const key of Object.keys(resources)) if (Array.isArray(result[key])) resources[key].push(...result[key]); }
+process.stdout.on('error', () => {});
 const write = value => process.stdout.write(JSON.stringify(value) + '\n');
 const toolSummaries = [...tools.values()].map(t => ({
   name: t.name,
@@ -464,7 +466,11 @@ async function handleLine(line) {
   if (!line.trim()) return;
   let request; try { request = JSON.parse(line); } catch { return; }
   if (request.type === 'host_event') {
-      if (request.event === 'custom_input') void invokeCustomInput(request.customId, request.data);
+    if (request.event === 'cancel_request') {
+      activeHostRequests.get(request.id)?.abort();
+      return;
+    }
+    if (request.event === 'custom_input') void invokeCustomInput(request.customId, request.data);
     if (request.event === 'custom_resize') {
       const custom = customs.get(request.customId);
       custom?.terminal?._setSize(request.width, request.height);
@@ -480,17 +486,19 @@ async function handleLine(line) {
     else pending.reject(new Error(request.error || 'runtime request failed'));
     return;
   }
+  const controller = new AbortController();
+  activeHostRequests.set(request.id, controller);
   try {
     let result;
     if (request.method === 'invoke_tool') {
       const tool = tools.get(request.tool); if (!tool) throw new Error(`unknown JS tool: ${request.tool}`);
-      result = await tool.execute(request.toolCallId || 'rpi', request.args || {}, undefined, () => {} , {});
+      result = await tool.execute(request.toolCallId || 'rpi', request.args || {}, controller.signal, () => {} , {});
     } else if (request.method === 'set_runtime_context') {
       updateRuntimeContext(request.context || {});
       result = true;
     } else if (request.method === 'invoke_command') {
       const command = commands.get(request.command); if (!command) throw new Error(`unknown JS command: ${request.command}`);
-      const runtime = commandContext(request.context || {});
+      const runtime = commandContext(request.context || {}, controller.signal);
       result = await command.handler(request.args || '', runtime.context);
       result = {
         result: result ?? null,
@@ -502,6 +510,8 @@ async function handleLine(line) {
   } catch (error) {
     if (request.method === 'invoke_command') closeCustoms();
     write({ id: request.id, ok: false, error: String(error?.stack || error) });
+  } finally {
+    activeHostRequests.delete(request.id);
   }
 }
 rl.on('line', line => { void handleLine(line); });
