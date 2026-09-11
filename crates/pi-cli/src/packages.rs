@@ -569,6 +569,13 @@ fn resolve_spec(cwd: &Path, spec: &str) -> Option<PathBuf> {
             if package_key != raw {
                 candidates.push(agent.join("packages").join(&package_key));
             }
+            // Pi's native npm installer keeps packages under
+            // ~/.pi/agent/npm/node_modules rather than ~/.pi/agent/packages.
+            // Keep the same layout usable when rpi reads Pi's settings.json.
+            candidates.push(agent.join("npm/node_modules").join(raw));
+            if package_key != raw {
+                candidates.push(agent.join("npm/node_modules").join(&package_key));
+            }
         }
         if let Some(home) = dirs::home_dir() {
             // Keep native Pi's installed package store usable when the user
@@ -576,6 +583,10 @@ fn resolve_spec(cwd: &Path, spec: &str) -> Option<PathBuf> {
             candidates.push(home.join(".pi/agent/packages").join(raw));
             if package_key != raw {
                 candidates.push(home.join(".pi/agent/packages").join(&package_key));
+            }
+            candidates.push(home.join(".pi/agent/npm/node_modules").join(raw));
+            if package_key != raw {
+                candidates.push(home.join(".pi/agent/npm/node_modules").join(&package_key));
             }
         }
         if !explicit_relative_path {

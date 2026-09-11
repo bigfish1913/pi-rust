@@ -1735,6 +1735,7 @@ dependencies = [
  "rpi-telemetry",
  "rpi-tools",
  "rpi-tui",
+ "schemars",
  "serde",
  "serde_json",
  "tempfile",

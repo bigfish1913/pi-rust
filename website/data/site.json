@@ -5,7 +5,7 @@
     "description": "rpi 是一个 library-first 的 Rust SDK。用清晰的分层、可替换的模型 Provider 和真正可测试的工具循环，构建属于你的 coding agent。"
   },
   "stats": [
-    { "value": "15", "label": "个可组合 crate" },
+    { "value": "22", "label": "个可组合软件包" },
     { "value": "2", "label": "种内置 Provider" },
     { "value": "7", "label": "个开箱即用工具" },
     { "value": "0", "label": "网络依赖的测试" }

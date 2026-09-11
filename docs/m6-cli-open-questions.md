@@ -408,7 +408,7 @@ already accepts `Vec<ImageContent>`; this is purely CLI-side wiring.
 
 ---
 
-## 8. ✅ RESOLVED — Skills / prompt-templates / context-files discovery wired (extensions + themes still deferred)
+## 8. ✅ RESOLVED — Skills / prompt-templates / context-files/packages discovery wired
 
 **Where:** `crates/pi-cli/src/session.rs::build` + `crates/pi-cli/src/resource_dirs.rs`
 + `crates/pi-harness/src/context_files.rs` + `crates/pi-harness/src/system_prompt.rs`.
@@ -453,7 +453,10 @@ already accepts `Vec<ImageContent>`; this is purely CLI-side wiring.
 - **Discovery roots**: pi reads 4 roots (`.pi/skills`, `.agents/skills`,
   `~/.pi/agent/skills`, `~/.agents/skills`) + installed packages; rpi reads
   `<cwd>/.rpi/<sub>` first, then legacy `<cwd>/.pi/<sub>`, then
-  `agent_dir()/<sub>`. `.agents/*` + package skills/prompts remain deferred.
+  `agent_dir()/<sub>` plus enabled static package resources. rpi also resolves
+  Pi's native npm store (`~/.pi/agent/npm/node_modules/<package>`) when a copied
+  Pi `settings.json` contains an `npm:` package spec. `.agents/*` remains
+  deferred.
 - **Worktree shadowed-context-file dedup** (`findShadowedContextFile`,
   `.reference/.../resource-loader.ts:100-116`): deferred (git-layout edge case).
 - **Full structured collision diagnostics**: pi carries `winnerPath`/`loserPath`
@@ -466,10 +469,13 @@ already accepts `Vec<ImageContent>`; this is purely CLI-side wiring.
   already drops missing-description skills; the name/desc-length warning is
   flagged as a gap to mirror (or defer with doc).
 
-**Still deferred (Part B + later):** extension/plugin discovery (`--extensions-dir`,
-`.rpi/extensions`, legacy `.pi/extensions`, `--extension`/`-e`), theme discovery (`--theme`,
-`--no-themes`), `--skill`/`--prompt-template`/`--models` cycling, session
-restore (`-c`/`-r`/`--session`). These remain §1–§7 open questions below.
+**Still deferred (Part B + later):** `.agents/*` discovery, npm package
+lockfile/update management parity, and JavaScript/TypeScript package extensions
+beyond the current `registerTool`/`registerCommand`/`resources_discover` plus
+provider/runtime/UI bridge,
+`--no-themes`, `--skill`/`--prompt-template`/`--models` cycling, and session
+restore (`-c`/`-r`/`--session`). Local static package resources are now loaded
+from settings package specs via `rpi package add|list|remove`.
 
 ### Part B status (Rust-native cdylib plugin system — 完整复刻 pi)
 
@@ -527,9 +533,12 @@ Phased commits B0→B5e; **B5e completes the final phase**.
 **Documented limits (v1):** plugin providers are one-shot (sync `ProviderRequestFn`
 can't drive a chunked `stream_simple`); SDK JSON crosses as a string
 round-trip (documented precision caveat — enable `arbitrary_precision`+
-`preserve_order` consistently host+plugin, or accept the limit). `.agents/*`
-+ package skills/prompts, worktree shadow (`findShadowedContextFile`), full
-skill name/desc-length validation, and project-trust gating remain deferred.
+`preserve_order` consistently host+plugin, or accept the limit). `.agents/*`,
+npm package update/lockfile management, JavaScript/TypeScript package
+extensions beyond the supported Node bridge surface, worktree shadow (`findShadowedContextFile`), full skill
+name/desc-length validation, and project-trust gating remain deferred. Static
+package skills, prompts, themes, and system prompt fragments are supported by
+`rpi package`.
 
 ---
 

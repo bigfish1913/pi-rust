@@ -97,6 +97,14 @@ tasks:
       - >-
         echo "前端文件已上传到 /var/www/{{.RPI_SERVICE_NAME}}/"
 
+  rpi-upload-guide:
+    desc: 上传 rpi 完整使用手册
+    cmds:
+      - ssh root@139.196.85.175 "mkdir -p /var/www/{{.RPI_SERVICE_NAME}}"
+      - scp docs/user-guide.md root@139.196.85.175:/var/www/{{.RPI_SERVICE_NAME}}/user-guide.md
+      - >-
+        echo "完整手册已上传到 /var/www/{{.RPI_SERVICE_NAME}}/user-guide.md"
+
   rpi-caddy-upload:
     desc: 上传 rpi Caddy 配置并重载
     cmds:
@@ -126,6 +134,7 @@ tasks:
     desc: 打包、上传并发布 rpi 静态官网
     cmds:
       - task: rpi-upload-frontend
+      - task: rpi-upload-guide
       - task: rpi-caddy-mount
       - task: rpi-caddy-upload
       - task: rpi-verify

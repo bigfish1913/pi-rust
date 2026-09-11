@@ -432,11 +432,32 @@ fn user_content(content: &UserContent) -> Value {
 
 fn chat_completions_url(base_url: &str) -> String {
     let base = base_url.trim_end_matches('/');
-    if base.ends_with("/v1") {
+    // Pi-compatible configs commonly use either a host root (append `/v1`)
+    // or a provider-specific versioned root such as `/api/coding/v3` (append
+    // only `/chat/completions`). Do not turn the latter into `/v3/v1/...`.
+    if base.ends_with("/chat/completions") {
+        base.to_string()
+    } else if base
+        .rsplit('/')
+        .next()
+        .is_some_and(|segment| is_version_segment(segment))
+    {
         format!("{base}/chat/completions")
     } else {
         format!("{base}/v1/chat/completions")
     }
+}
+
+fn is_version_segment(segment: &str) -> bool {
+    let Some(digits) = segment.strip_prefix('v') else {
+        return false;
+    };
+    let digit_count = digits.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    digit_count > 0
+        && digits
+            .chars()
+            .skip(digit_count)
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
 }
 
 fn compat(model: &Model) -> Option<&crate::model::OpenaiCompletionsCompat> {
@@ -1080,6 +1101,18 @@ mod tests {
         assert_eq!(
             chat_completions_url("https://gateway.test"),
             "https://gateway.test/v1/chat/completions"
+        );
+        assert_eq!(
+            chat_completions_url("https://ark.cn-beijing.volces.com/api/coding/v3"),
+            "https://ark.cn-beijing.volces.com/api/coding/v3/chat/completions"
+        );
+        assert_eq!(
+            chat_completions_url("https://gateway.test/v1beta/"),
+            "https://gateway.test/v1beta/chat/completions"
+        );
+        assert_eq!(
+            chat_completions_url("https://gateway.test/custom/chat/completions"),
+            "https://gateway.test/custom/chat/completions"
         );
     }
 }

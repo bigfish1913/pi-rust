@@ -1,6 +1,8 @@
+import { initI18n, localizeData, onLocaleChange, t } from './i18n.js';
+
 const $ = (selector, scope = document) => scope.querySelector(selector);
 const $$ = (selector, scope = document) => [...scope.querySelectorAll(selector)];
-const state = { data: null, mode: 'guide', query: '' };
+const state = { rawData: null, data: null, mode: 'guide', query: '' };
 
 function showToast(message) {
   const toast = $('[data-toast]'); toast.textContent = message; toast.classList.add('is-visible');
@@ -39,13 +41,13 @@ function renderNav(sections) {
 
 function sectionMarkup(section) {
   const links = (section.links || []).map((link) => `<a href="${link.url}" target="_blank" rel="noreferrer">${link.label} ↗</a>`).join('');
-  const code = section.code ? `<div class="docs-code"><div class="docs-code-top"><span>${section.code.file}</span><button type="button" data-copy-docs-code aria-label="复制代码">复制 <span aria-hidden="true">⧉</span></button></div><pre><code>${section.code.content}</code></pre></div>` : '';
+  const code = section.code ? `<div class="docs-code"><div class="docs-code-top"><span>${section.code.file}</span><button type="button" data-copy-docs-code aria-label="${t('docs.copyCode')}">${t('action.copy')} <span aria-hidden="true">⧉</span></button></div><pre><code>${section.code.content}</code></pre></div>` : '';
   return `<article class="docs-section" id="${section.id}"><div class="docs-section-heading"><span class="eyebrow eyebrow-dark">${section.kicker}</span><h2>${section.title}</h2><p class="docs-summary">${section.summary}</p></div><div class="docs-section-body">${section.body.map((paragraph) => `<p>${paragraph}</p>`).join('')}${code}<div class="docs-links">${links}</div></div></article>`;
 }
 
 function bindCodeCopy() {
   $$('[data-copy-docs-code]').forEach((button) => button.addEventListener('click', async () => {
-    try { await navigator.clipboard.writeText(button.closest('.docs-code').querySelector('code').textContent); showToast('代码已复制'); } catch { showToast('复制失败，请手动选择文本'); }
+    try { await navigator.clipboard.writeText(button.closest('.docs-code').querySelector('code').textContent); showToast(t('copy.codeSuccess')); } catch { showToast(t('copy.failed')); }
   }));
 }
 
@@ -56,9 +58,12 @@ function render() {
 }
 
 async function init() {
-  const response = await fetch('./data/docs.json?v=2'); state.data = await response.json();
+  await initI18n();
+  const response = await fetch('./data/docs.json?v=2');
+  state.rawData = await response.json(); state.data = localizeData(state.rawData, 'docs');
   bindMenu(); bindScrollEffects(); render();
   $('[data-docs-search]').addEventListener('input', (event) => { state.query = event.target.value; render(); });
+  onLocaleChange(() => { state.data = localizeData(state.rawData, 'docs'); render(); });
 }
 
-init().catch((error) => { console.error(error); showToast('文档数据加载失败，请通过本地开发服务器打开网站'); });
+init().catch((error) => { console.error(error); showToast(t('error.data')); });

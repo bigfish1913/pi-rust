@@ -53,6 +53,7 @@ use rpi_tools::{
 };
 
 use crate::args::Args;
+use crate::docs_tool::create_docs_tool;
 use crate::extension_api::ExtensionBackend;
 use crate::provider::ResolvedModel;
 use crate::resource_dirs::{
@@ -73,6 +74,7 @@ const EXTENSIONS_SUBDIR: &str = "extensions";
 /// registers them: the mutating set (`read`/`bash`/`edit`/`write`) followed by
 /// the read-only search set (`grep`/`find`/`ls`).
 pub const BUILTIN_TOOL_NAMES: &[&str] = &[
+    "docs",
     "read",
     "bash",
     "edit",
@@ -84,15 +86,15 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
 ];
 
 /// The default coding system prompt. A condensed port of the TS
-/// `packages/coding-agent/src/core/system-prompt.ts` base prompt — the
-/// pi-internal docs/skills/context-file sections are omitted (v1 has none of
-/// that machinery), leaving the role + tools + guidelines core.
+/// `packages/coding-agent/src/core/system-prompt.ts` base prompt. The
+/// `docs` tool is the installed-binary equivalent of Pi's bundled docs lookup.
 pub fn default_system_prompt(cwd: &str) -> String {
     format!(
-        "You are an expert coding assistant operating inside pi, a coding agent harness. \
+        "You are an expert coding assistant operating inside rpi, a coding agent harness. \
 You help users by reading files, executing commands, editing code, and writing new files.
 
 Available tools:
+- docs  — Look up rpi usage, package, plugin, and compatibility documentation
 - read  — Read file contents
 - bash  — Execute shell commands
 - edit  — Find/replace edits to existing files
@@ -106,6 +108,7 @@ Guidelines:
 - Be concise in your responses
 - Show file paths clearly when working with files
 - Prefer the smallest change that solves the problem
+- When unsure about rpi commands, extensions, Pi package compatibility, or .rpi configuration, use the docs tool before guessing
 
 Current working directory: {cwd}"
     )
@@ -1336,6 +1339,7 @@ fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
     // Read-only search tools (grep/find/ls) take the same context and need no
     // mutation queue — they go through the `FileSystem` trait only.
     let mut all: Vec<(&'static str, HarnessTool)> = vec![
+        ("docs", HarnessTool::new(create_docs_tool())),
         ("read", HarnessTool::new(create_read_tool(ctx, None))),
         (
             "bash",

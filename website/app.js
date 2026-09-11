@@ -1,4 +1,6 @@
-const state = { data: null, activeExample: 0 };
+import { getLocale, initI18n, localizeData, onLocaleChange, t } from './i18n.js';
+
+const state = { rawData: null, data: null, activeExample: 0 };
 const $ = (selector, scope = document) => scope.querySelector(selector);
 const $$ = (selector, scope = document) => [...scope.querySelectorAll(selector)];
 
@@ -41,7 +43,7 @@ function renderReleases(releases) {
 
 function bindCopy(buttonSelector, getText, successMessage) {
   $(buttonSelector)?.addEventListener('click', async () => {
-    try { await navigator.clipboard.writeText(getText()); showToast(successMessage); } catch { showToast('复制失败，请手动选择文本'); }
+    try { await navigator.clipboard.writeText(getText()); showToast(successMessage); } catch { showToast(t('copy.failed')); }
   });
 }
 
@@ -62,24 +64,32 @@ function bindScrollEffects() {
 }
 
 async function init() {
-  const response = await fetch('./data/site.json'); state.data = await response.json();
+  await initI18n();
+  const response = await fetch('./data/site.json'); state.rawData = await response.json();
+  state.data = localizeData(state.rawData, 'site');
   $$('[data-content]').forEach((element) => {
     const value = getPath(state.data, element.dataset.content);
     if (!value) return;
-    if (element.dataset.content === 'hero.title') {
-      const [lead] = value.split('你自己的工具。');
-      element.innerHTML = `<span class="hero-title-line">${lead}</span><br /><em class="hero-title-line">你自己的工具。</em>`;
-      return;
-    }
-    element.textContent = value;
+    if (element.dataset.content === 'hero.title') element.innerHTML = value.includes('<') ? value : `<span class="hero-title-line">把 Agent 做成</span><br /><em class="hero-title-line">你自己的工具。</em>`;
+    else element.textContent = value;
   });
   $$('[data-stat]').forEach((element) => { const value = getPath(state.data, element.dataset.stat); if (value) element.textContent = value; });
   renderFeatures(state.data.features); renderArchitecture(state.data.architecture); renderExamples(state.data.examples); renderReleases(state.data.releases);
-  bindCopy('[data-copy-code]', () => state.data.examples[state.activeExample].code, '代码已复制');
+  bindCopy('[data-copy-code]', () => state.data.examples[state.activeExample].code, t('copy.codeSuccess'));
   $$('[data-copy-command]').forEach((button) => button.addEventListener('click', async () => {
-    try { await navigator.clipboard.writeText(button.previousElementSibling.textContent); showToast('命令已复制'); } catch { showToast('复制失败，请手动选择文本'); }
+    try { await navigator.clipboard.writeText(button.previousElementSibling.textContent); showToast(t('copy.commandSuccess')); } catch { showToast(t('copy.failed')); }
   }));
   bindMenu(); bindScrollEffects();
+  onLocaleChange(() => {
+    state.data = localizeData(state.rawData, 'site');
+    $$('[data-content]').forEach((element) => {
+      const value = getPath(state.data, element.dataset.content);
+      if (element.dataset.content === 'hero.title') element.innerHTML = value.includes('<') ? value : `<span class="hero-title-line">把 Agent 做成</span><br /><em class="hero-title-line">你自己的工具。</em>`;
+      else element.textContent = value;
+    });
+    $$('[data-stat]').forEach((element) => { const value = getPath(state.data, element.dataset.stat); if (value) element.textContent = value; });
+    renderFeatures(state.data.features); renderArchitecture(state.data.architecture); renderExamples(state.data.examples); renderReleases(state.data.releases);
+  });
 }
 
-init().catch((error) => { console.error(error); showToast('数据加载失败，请通过本地开发服务器打开网站'); });
+init().catch((error) => { console.error(error); showToast(t('error.data')); });

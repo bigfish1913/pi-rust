@@ -8,6 +8,19 @@
       "description": "面向第一次使用 rpi 的开发者：从安装、运行到把 Agent 接进自己的应用。",
       "sections": [
         {
+          "id": "complete-guide",
+          "kicker": "00 / COMPLETE GUIDE",
+          "title": "完整使用手册",
+          "summary": "从安装、模型配置、.rpi 资源和 Pi package，到 JS/TS 扩展、Rust 插件、SDK、排错和发布的完整路径。",
+          "body": [
+            "CLI 内置 docs 工具和线上 /user-guide.md 使用同一份内容。安装后的 rpi 可以离线查询 guide 主题；官网入口和发布包会在每次部署时同步更新。",
+            "推荐先阅读安装与第一次运行，再按需求进入 Provider、Pi package、扩展或 SDK 集成章节。"
+          ],
+          "links": [
+            {"label": "打开在线完整手册", "url": "https://rpi.laofu.online/user-guide.md"}
+          ]
+        },
+        {
           "id": "quickstart",
           "kicker": "01 / FIRST RUN",
           "title": "快速开始",
