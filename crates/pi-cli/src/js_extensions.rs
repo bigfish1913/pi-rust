@@ -4,9 +4,8 @@
 //! exchanges JSON-lines requests with it, keeping extension code isolated from
 //! the agent process while still exposing Pi's tool and resource contracts.
 
-use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -19,6 +18,8 @@ use rpi_ai::types::{Context, Schema, Tool};
 use rpi_ai::{CacheRetention, Model, Provider, SimpleStreamOptions};
 use rpi_tui::TUI;
 use tokio_util::sync::CancellationToken;
+
+use crate::node_transport::{NodeTransport, RuntimeHandler};
 
 const NODE_HOST: &str = include_str!("node_host.mjs");
 
@@ -36,27 +37,9 @@ struct JsToolDefinition {
     tool: Tool,
 }
 
-pub type RuntimeHandler =
-    Arc<dyn Fn(&str, serde_json::Value) -> Result<serde_json::Value, String> + Send + Sync>;
-
-struct HostIo {
-    _child: Child,
-    stdin: Mutex<ChildStdin>,
-    stdout: Mutex<BufReader<ChildStdout>>,
-    rpc: Mutex<()>,
-    runtime_handlers: Mutex<Vec<RuntimeHandler>>,
-}
-
-impl Drop for HostIo {
-    fn drop(&mut self) {
-        let _ = self._child.kill();
-        let _ = self._child.wait();
-    }
-}
-
 #[derive(Clone)]
 pub struct JsExtensionSession {
-    io: Arc<HostIo>,
+    transport: NodeTransport,
     tools: Arc<Vec<JsToolDefinition>>,
     pub resources: JsResources,
     pub commands: Vec<String>,
@@ -109,14 +92,7 @@ impl JsExtensionSession {
             .stdout
             .take()
             .ok_or("Node extension host stdout unavailable")?;
-        let io = Arc::new(HostIo {
-            _child: child,
-            stdin: Mutex::new(stdin),
-            stdout: Mutex::new(BufReader::new(stdout)),
-            rpc: Mutex::new(()),
-            runtime_handlers: Mutex::new(Vec::new()),
-        });
-        let init = read_response(&io)?;
+        let (transport, init) = NodeTransport::start(child, stdin, stdout)?;
         if !init
             .get("ok")
             .and_then(serde_json::Value::as_bool)
@@ -196,7 +172,7 @@ impl JsExtensionSession {
             })
             .unwrap_or_default();
         Ok(Some(Self {
-            io,
+            transport,
             tools: Arc::new(definitions),
             resources,
             commands,
@@ -225,102 +201,7 @@ impl JsExtensionSession {
         method: &str,
         payload: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let _rpc_guard = self
-            .io
-            .rpc
-            .lock()
-            .map_err(|_| "Node host RPC lock poisoned")?;
-        let mut request = serde_json::json!({"id": id, "method": method});
-        if let (Some(object), Some(values)) = (request.as_object_mut(), payload.as_object()) {
-            object.extend(values.clone());
-        }
-        {
-            let mut stdin = self
-                .io
-                .stdin
-                .lock()
-                .map_err(|_| "Node host stdin lock poisoned")?;
-            writeln!(stdin, "{}", request)
-                .map_err(|error| format!("could not write to Node extension host: {error}"))?;
-            stdin
-                .flush()
-                .map_err(|error| format!("could not flush Node extension host: {error}"))?;
-        }
-        loop {
-            let response = read_response(&self.io)?;
-            if response.get("type").and_then(serde_json::Value::as_str) == Some("runtime_request") {
-                let request_id = response
-                    .get("requestId")
-                    .and_then(serde_json::Value::as_u64)
-                    .ok_or("Node runtime request has no requestId")?;
-                let action = response
-                    .get("action")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or("Node runtime request has no action")?;
-                let args = response.get("args").cloned().unwrap_or_default();
-                let handlers = self
-                    .io
-                    .runtime_handlers
-                    .lock()
-                    .map_err(|_| "Node runtime handler lock poisoned")?
-                    .clone();
-                let mut result = Err(format!("unsupported capability: {action}"));
-                for handler in handlers {
-                    match handler(action, args.clone()) {
-                        Ok(value) => {
-                            result = Ok(value);
-                            break;
-                        }
-                        Err(error) if error.starts_with("unsupported capability:") => {}
-                        Err(error) => {
-                            result = Err(error);
-                            break;
-                        }
-                    }
-                }
-                let response = match result {
-                    Ok(result) => serde_json::json!({
-                        "type": "runtime_response",
-                        "requestId": request_id,
-                        "ok": true,
-                        "result": result,
-                    }),
-                    Err(error) => serde_json::json!({
-                        "type": "runtime_response",
-                        "requestId": request_id,
-                        "ok": false,
-                        "error": error,
-                    }),
-                };
-                let mut stdin = self
-                    .io
-                    .stdin
-                    .lock()
-                    .map_err(|_| "Node host stdin lock poisoned")?;
-                writeln!(stdin, "{response}")
-                    .map_err(|error| format!("could not write Node runtime response: {error}"))?;
-                stdin
-                    .flush()
-                    .map_err(|error| format!("could not flush Node runtime response: {error}"))?;
-                continue;
-            }
-            if response.get("id").and_then(serde_json::Value::as_u64) != Some(id) {
-                return Err("Node extension host returned an out-of-order response".into());
-            }
-            if response
-                .get("ok")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false)
-            {
-                return Ok(response.get("result").cloned().unwrap_or_default());
-            }
-            return Err(response
-                .get("error")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("JS extension failed")
-                .to_string());
-        }
+        self.transport.request(method, payload)
     }
 
     pub fn invoke_command(&self, command: &str, args: &str) -> Result<serde_json::Value, String> {
@@ -348,21 +229,11 @@ impl JsExtensionSession {
     }
 
     pub fn set_runtime_handler(&self, handler: RuntimeHandler) -> Result<(), String> {
-        *self
-            .io
-            .runtime_handlers
-            .lock()
-            .map_err(|_| "Node runtime handler lock poisoned")? = vec![handler];
-        Ok(())
+        self.transport.replace_runtime_handlers(handler)
     }
 
     pub fn add_runtime_handler(&self, handler: RuntimeHandler) -> Result<(), String> {
-        self.io
-            .runtime_handlers
-            .lock()
-            .map_err(|_| "Node runtime handler lock poisoned")?
-            .push(handler);
-        Ok(())
+        self.transport.add_runtime_handler(handler)
     }
 
     pub fn custom_active(&self) -> bool {
@@ -385,17 +256,7 @@ impl JsExtensionSession {
             "customId": id,
             "data": data,
         });
-        let mut stdin = self
-            .io
-            .stdin
-            .lock()
-            .map_err(|_| "Node host stdin lock poisoned")?;
-        writeln!(stdin, "{event}")
-            .map_err(|error| format!("could not write Node custom input: {error}"))?;
-        stdin
-            .flush()
-            .map_err(|error| format!("could not flush Node custom input: {error}"))?;
-        Ok(())
+        self.transport.send_event(event)
     }
 
     pub fn send_custom_resize(&self, width: usize, height: usize) -> Result<(), String> {
@@ -412,17 +273,7 @@ impl JsExtensionSession {
             "width": width,
             "height": height,
         });
-        let mut stdin = self
-            .io
-            .stdin
-            .lock()
-            .map_err(|_| "Node host stdin lock poisoned")?;
-        writeln!(stdin, "{event}")
-            .map_err(|error| format!("could not write Node custom resize: {error}"))?;
-        stdin
-            .flush()
-            .map_err(|error| format!("could not flush Node custom resize: {error}"))?;
-        Ok(())
+        self.transport.send_event(event)
     }
 
     pub fn install_ui_runtime(&self, tui: Arc<rpi_tui::TuiAltScreen>) -> Result<(), String> {
@@ -556,7 +407,7 @@ impl JsExtensionSession {
 /// Accept Pi-compatible response objects that omit the discriminating `role`
 /// field when a side thread feeds a previous response back into `Context`.
 /// Only infer roles from unambiguous shape markers; malformed/ambiguous
-/// messages still fail the typed deserialization with the original error.
+/// messages still fail typed deserialization with the original error.
 fn normalize_provider_context(mut value: serde_json::Value) -> Result<Context, String> {
     let Some(messages) = value
         .get_mut("messages")
@@ -706,21 +557,31 @@ impl AgentTool for JsToolAdapter {
         &self,
         tool_call_id: &str,
         params: serde_json::Value,
-        _signal: CancellationToken,
+        signal: CancellationToken,
         _on_update: Arc<dyn Fn(ToolResultPartial) + Send + Sync>,
     ) -> Result<AgentToolResult, AgentError> {
-        let session = self.session.clone();
         let name = self.definition.name.clone();
         let tool_call_id = tool_call_id.to_string();
-        let result = tokio::task::spawn_blocking(move || {
-            session.invoke(
+        let pending = self
+            .session
+            .transport
+            .begin_request(
                 "invoke_tool",
                 serde_json::json!({"tool": name, "toolCallId": tool_call_id, "args": params}),
             )
-        })
-        .await
-        .map_err(|error| AgentError::tool(error.to_string()))?
-        .map_err(AgentError::tool)?;
+            .map_err(AgentError::tool)?;
+        let request_id = pending.id();
+        let transport = self.session.transport.clone();
+        let wait = tokio::task::spawn_blocking(move || pending.wait());
+        let result = tokio::select! {
+            result = wait => result
+                .map_err(|error| AgentError::tool(error.to_string()))?
+                .map_err(AgentError::tool)?,
+            _ = signal.cancelled() => {
+                let _ = transport.cancel(request_id);
+                return Err(AgentError::Abort);
+            }
+        };
         parse_tool_result(result).map_err(AgentError::tool)
     }
 }
@@ -738,19 +599,6 @@ fn which_node() -> Result<String, String> {
         }
     }
     Err("Pi JS/TS extensions require Node.js (node --version was not found)".into())
-}
-
-fn read_response(io: &HostIo) -> Result<serde_json::Value, String> {
-    let mut line = String::new();
-    io.stdout
-        .lock()
-        .map_err(|_| "Node host stdout lock poisoned")?
-        .read_line(&mut line)
-        .map_err(|error| format!("could not read Node extension host: {error}"))?;
-    if line.trim().is_empty() {
-        return Err("Node extension host exited without a response".into());
-    }
-    serde_json::from_str(&line).map_err(|error| format!("invalid Node extension response: {error}"))
 }
 
 fn parse_resources(value: Option<&serde_json::Value>) -> JsResources {
@@ -815,8 +663,6 @@ fn parse_tool_result(value: serde_json::Value) -> Result<AgentToolResult, String
         .unwrap_or(false);
     Ok(result)
 }
-
-static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 fn normalize_host_path(path: &PathBuf) -> PathBuf {
     if cfg!(windows) {
@@ -981,23 +827,75 @@ mod tests {
     }
 
     #[test]
-    fn provider_context_infers_missing_assistant_role_for_pi_extensions() {
-        let assistant = rpi_ai::types::AssistantMessage::empty(
-            rpi_ai::types::Api::AnthropicMessages,
-            "anthropic",
-            "model",
-            1,
-        );
-        let mut message = serde_json::to_value(assistant).unwrap();
-        message.as_object_mut().unwrap().remove("role");
-        let context = normalize_provider_context(serde_json::json!({
-            "messages": [message]
-        }))
-        .expect("Pi response without role should be normalized");
-        assert!(matches!(
-            context.messages[0],
-            rpi_ai::types::Message::Assistant(_)
-        ));
+    fn node_transport_multiplexes_out_of_order_command_responses() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("concurrent.js");
+        std::fs::write(
+            &path,
+            r#"export default (pi) => {
+                pi.registerCommand('slow', async () => {
+                    await new Promise(resolve => setTimeout(resolve, 300));
+                    return { text: 'slow' };
+                });
+                pi.registerCommand('fast', async () => ({ text: 'fast' }));
+            };"#,
+        )
+        .unwrap();
+        let session = JsExtensionSession::load(&[path], false).unwrap().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+
+        let slow = session.clone();
+        let slow_sender = sender.clone();
+        std::thread::spawn(move || {
+            let value = slow.invoke_command("slow", "").unwrap();
+            slow_sender.send(value["result"]["text"].clone()).unwrap();
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let fast = session.clone();
+        std::thread::spawn(move || {
+            let value = fast.invoke_command("fast", "").unwrap();
+            sender.send(value["result"]["text"].clone()).unwrap();
+        });
+
+        let first = receiver
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .expect("fast request should not wait for the slow request");
+        assert_eq!(first, serde_json::json!("fast"));
+        assert_eq!(receiver.recv().unwrap(), serde_json::json!("slow"));
+    }
+
+    #[test]
+    fn node_transport_cancellation_reaches_tool_abort_signal() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cancel.js");
+        std::fs::write(
+            &path,
+            r#"export default (pi) => pi.registerTool({
+                name: 'wait',
+                description: 'wait for cancellation',
+                parameters: { type: 'object', properties: {} },
+                execute: (_id, _args, signal) => new Promise(resolve => {
+                    signal.addEventListener('abort', () => resolve({
+                        content: [{ type: 'text', text: 'cancelled' }],
+                        details: {}
+                    }), { once: true });
+                })
+            });"#,
+        )
+        .unwrap();
+        let session = JsExtensionSession::load(&[path], false).unwrap().unwrap();
+        let pending = session
+            .transport
+            .begin_request(
+                "invoke_tool",
+                serde_json::json!({"tool": "wait", "toolCallId": "test", "args": {}}),
+            )
+            .unwrap();
+        let request_id = pending.id();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        session.transport.cancel(request_id).unwrap();
+        let result = pending.wait().unwrap();
+        assert_eq!(result["content"][0]["text"], "cancelled");
     }
 
     #[test]

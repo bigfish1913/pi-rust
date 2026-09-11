@@ -30,11 +30,31 @@ extensions see the same contract without moving HTTP/authentication into Node.
 Fullscreen `ui.custom` components use the same bridge: Node retains the
 component and Rust owns terminal writes, focus, input, resize, and cleanup.
 
-The host now has a bidirectional `runtime_request`/`runtime_response` channel:
-Rust can install a runtime handler, and a Node extension can await
-`pi.runtimeRequest(action, args)`. Capabilities are only advertised when their
-handler is actually installed, so unsupported provider/UI features cannot be
-mistaken for working APIs.
+The host now has a bidirectional, multiplexed
+`runtime_request`/`runtime_response` channel. Rust keeps a pending-request table
+and dispatches replies by id, so a long-running package command does not block
+unrelated tool or UI traffic. Rust can install a runtime handler, and a Node
+extension can await `pi.runtimeRequest(action, args)`. Capabilities are only
+advertised when their handler is actually installed, so unsupported provider/UI
+features cannot be mistaken for working APIs.
+
+Rust may send a `cancel_request` host event for an in-flight call. The Node host
+maps it to the `AbortSignal` passed to Pi tools and command contexts. Package
+code should stop promptly when that signal is aborted.
+
+## Persistent packages and PTC
+
+The multiplexed transport is shared infrastructure for two execution policies:
+
+- Pi-compatible packages use a persistent Node process because registrations,
+  event handlers, and package state live for the session.
+- A future PTC executor should use an isolated worker or child process per run,
+  expose only capability-checked host calls, and terminate the worker on
+  completion, timeout, or cancellation.
+
+PTC is therefore an execution policy, not a replacement for the Pi package
+adapter. Both should speak the same request-id protocol and use the same Rust
+capability handlers.
 
 When adding a capability, prefer a small optional contract over expanding one
 large trait. This keeps the native backend complete while allowing Node and
