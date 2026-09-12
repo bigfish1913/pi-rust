@@ -8,7 +8,7 @@ use std::sync::Mutex;
 
 use super::component::Component;
 use crate::ansi::{bold, strip_ansi};
-use crate::theme::theme;
+use crate::theme::{theme, ThemeColors};
 use crate::utils::{apply_background_to_line, truncate_to_width, wrap_text_with_ansi};
 
 /// Maximum diff lines rendered inline when expanded before collapsing the rest.
@@ -44,6 +44,11 @@ pub struct ToolExecutionComponent {
     /// Optional display title. The raw name is retained for argument parsing
     /// while extensions such as skill loading can provide a clearer label.
     display_title: Mutex<Option<String>>,
+    /// When set, the component renders in the native-Pi skill-invocation
+    /// style: a `[skill] <name>` box on the custom-message background that
+    /// collapses to a single line and expands to the full skill markdown
+    /// content (the `read` result). Mirrors pi's `SkillInvocationMessageComponent`.
+    skill_name: Mutex<Option<String>>,
     /// Tool arguments (displayed)
     args: Mutex<String>,
     /// Tool result (displayed after execution)
@@ -64,6 +69,7 @@ impl ToolExecutionComponent {
         Self {
             name: Mutex::new(name.to_string()),
             display_title: Mutex::new(None),
+            skill_name: Mutex::new(None),
             args: Mutex::new(args.to_string()),
             result: Mutex::new(None),
             status: Mutex::new(ToolStatus::Pending),
@@ -133,6 +139,26 @@ impl ToolExecutionComponent {
         }
     }
 
+    /// Mark this component as a skill-invocation read: it renders in the
+    /// native-Pi `[skill] <name>` box style (custom-message background,
+    /// collapsible to the full skill markdown). Pass the skill name.
+    pub fn set_skill_name(&self, name: impl Into<String>) {
+        if let Ok(mut skill_name) = self.skill_name.lock() {
+            *skill_name = Some(name.into());
+        }
+    }
+
+    /// Whether this component displays a skill invocation (see
+    /// [`Self::set_skill_name`]).
+    pub fn is_skill(&self) -> bool {
+        self.skill_name.lock().map(|s| s.is_some()).unwrap_or(false)
+    }
+
+    /// The skill name when this component is a skill invocation.
+    pub fn skill_name(&self) -> Option<String> {
+        self.skill_name.lock().unwrap().clone()
+    }
+
     /// Attach a pre-rendered colored diff (from [`crate::diff::render_diff`]).
     /// When set, the diff lines are always shown (regardless of `expanded`)
     /// so an edit's changes are visible directly in the transcript.
@@ -156,11 +182,23 @@ impl Component for ToolExecutionComponent {
 
         let name = self.name.lock().unwrap();
         let display_title = self.display_title.lock().unwrap();
+        let skill_name = self.skill_name.lock().unwrap();
         let status = self.status.lock().unwrap();
         let args = self.args.lock().unwrap();
         let result = self.result.lock().unwrap();
         let expanded = self.expanded.lock().unwrap();
         let diff_lines = self.diff_lines.lock().unwrap();
+
+        // Skill invocation mode: render as native-Pi's `[skill]` box rather
+        // than a generic tool panel — custom-message background, collapsed to
+        // a single `[skill] <name> (Ctrl+T to expand)` line, expanded to the
+        // full skill markdown (the `read` result). Mirrors pi's
+        // `SkillInvocationMessageComponent` while reusing the tool panel's
+        // result streaming + Ctrl+T expand plumbing.
+        if let Some(skill) = skill_name.as_deref() {
+            let content = result.as_deref().unwrap_or("");
+            return render_skill(&colors, skill, content, *expanded, width);
+        }
 
         // Status indicator — a colored glyph (no emoji), pi style.
         let (status_icon, status_color) = match *status {
@@ -307,6 +345,93 @@ impl Component for ToolExecutionComponent {
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+/// Render a skill-invocation box in native-Pi style.
+///
+/// Mirrors pi's `SkillInvocationMessageComponent`: a `[skill]` box on the
+/// custom-message background. Collapsed it is a single line
+/// `[skill] <name> (Ctrl+T to expand)`; expanded it shows the `[skill]` label,
+/// the bold skill name, then the full skill markdown content (the `read`
+/// result) rendered with the standard markdown component.
+fn render_skill(
+    colors: &ThemeColors,
+    name: &str,
+    content: &str,
+    expanded: bool,
+    width: usize,
+) -> Vec<String> {
+    let bg = colors.custom_message_bg;
+    let label = crate::ansi::bold("[skill]");
+    // Native Pi's `Box(1, 1, bg)` — one column of horizontal padding on each
+    // side, one blank background row top and bottom.
+    let pad = " ";
+    let mut out: Vec<String> = Vec::new();
+
+    // Box top padding (pi Box(1,1)).
+    out.push(apply_background_to_line("", width, |s| bg.bg(s)));
+
+    if !expanded {
+        // Single collapsed line: `[skill] <name> (Ctrl+T to expand)`.
+        let line = format!(
+            "{pad}{} {} {}",
+            colors.custom_message_label.fg(&label),
+            colors.custom_message_text.fg(name),
+            colors.dim.fg("(Ctrl+T to expand)"),
+        );
+        out.push(apply_background_to_line(&line, width, |s| bg.bg(s)));
+        out.push(apply_background_to_line("", width, |s| bg.bg(s)));
+        return out;
+    }
+
+    // Expanded: `[skill]` label, then a single markdown block whose first
+    // paragraph is the bold skill name (native Pi renders
+    // `**${name}**\n\n${content}` as one Markdown child), so the body keeps
+    // its normal markdown colors on the custom-message background.
+    out.push(apply_background_to_line(
+        &format!("{pad}{}", colors.custom_message_label.fg(&label)),
+        width,
+        |s| bg.bg(s),
+    ));
+
+    let header = format!("{pad}{}", colors.custom_message_text.fg(&bold(name)));
+    out.push(apply_background_to_line(&header, width, |s| bg.bg(s)));
+    out.push(apply_background_to_line("", width, |s| bg.bg(s)));
+
+    let body = strip_frontmatter(content);
+    if !body.is_empty() {
+        // Render the skill body with the shared markdown component. The
+        // markdown component handles code blocks / tables / headings; each
+        // line is re-tinted onto the custom-message background so the box
+        // reads as a single panel.
+        let body_width = width.saturating_sub(2).max(1);
+        let md = crate::markdown::Markdown::new(body.to_string(), 0, 0);
+        for md_line in md.render(body_width) {
+            let line = format!("{pad}{md_line}");
+            out.push(apply_background_to_line(&line, width, |s| bg.bg(s)));
+        }
+    }
+
+    // Box bottom padding (pi Box(1,1)).
+    out.push(apply_background_to_line("", width, |s| bg.bg(s)));
+    out
+}
+
+/// Strip a leading YAML frontmatter block (`---\n...\n---`) from skill file
+/// content. Native Pi's skill block carries the frontmatter-stripped body
+/// (`parseSkillBlock` reads the `<skill>` payload, not the raw file), so the
+/// expanded box shows the same instructions the model received.
+fn strip_frontmatter(content: &str) -> &str {
+    let Some(rest) = content.strip_prefix("---\n") else {
+        return content;
+    };
+    let Some(end) = rest.find("\n---") else {
+        return content;
+    };
+    let after = &rest[end + 4..];
+    // Drop the blank line the closing delimiter is conventionally followed by
+    // so the markdown body starts on its first heading/paragraph.
+    after.strip_prefix('\n').unwrap_or(after)
 }
 
 /// Normalize tool output for display. Tool payloads are not guaranteed to use
@@ -750,6 +875,56 @@ mod tests {
     /// The header summarizes the args JSON into a compact signature instead
     /// of dumping the raw `{"path":"..."}` blob. Each builtin tool maps its
     /// key fields to a one-liner.
+    /// A `read` of a `SKILL.md` renders as native Pi's `[skill] <name>`
+    /// invocation box: custom-message background, one collapsed line with an
+    /// expand hint, and (when expanded) the frontmatter-stripped skill body.
+    #[test]
+    fn skill_invocation_renders_native_style_box() {
+        let tool = ToolExecutionComponent::new("read", r#"{"path":"/skills/release/SKILL.md"}"#);
+        tool.set_skill_name("release");
+        tool.set_result(
+            "---\nname: release\ndescription: cut a release\n---\n\n# Steps\n\nDo the thing.",
+            false,
+        );
+
+        let collapsed = tool.render(80);
+        let plain = crate::ansi::strip_ansi(&collapsed.join("\n"));
+        assert!(
+            plain.contains("[skill] release"),
+            "collapsed label: {plain}"
+        );
+        assert!(plain.contains("(Ctrl+T to expand)"), "expand hint: {plain}");
+        assert!(!plain.contains("Steps"), "collapsed hides body: {plain}");
+        // Uses the custom-message background (dark: #2d2838), not a tool tint.
+        assert!(
+            collapsed.iter().any(|l| l.contains("\x1b[48;2;45;40;56m")),
+            "custom-message bg missing: {collapsed:?}"
+        );
+
+        tool.set_expanded(true);
+        let expanded = tool.render(80);
+        let plain = crate::ansi::strip_ansi(&expanded.join("\n"));
+        assert!(plain.contains("[skill]"), "expanded label: {plain}");
+        assert!(plain.contains("release"), "expanded name: {plain}");
+        assert!(
+            plain.contains("Do the thing."),
+            "expanded body missing: {plain}"
+        );
+        // Frontmatter is stripped (native Pi shows the parsed skill body only).
+        assert!(
+            !plain.contains("name: release"),
+            "frontmatter leaked: {plain}"
+        );
+    }
+
+    #[test]
+    fn strip_frontmatter_only_strips_a_leading_block() {
+        assert_eq!(strip_frontmatter("plain"), "plain");
+        assert_eq!(strip_frontmatter("---\nname: x\n---\nbody"), "body");
+        // No opening delimiter → untouched.
+        assert_eq!(strip_frontmatter("a\n---\nb"), "a\n---\nb");
+    }
+
     #[test]
     fn test_tool_header_args_summary() {
         // `read` → just the path.

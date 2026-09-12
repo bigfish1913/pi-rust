@@ -88,6 +88,14 @@ pub struct ThemeColors {
     /// Bash mode accent color (pi `bashMode`).
     pub bash_mode: Color,
 
+    // -- Custom messages / skill invocation (pi customMessage*) --
+    /// Skill-invocation / custom-message background (pi `customMessageBg`).
+    pub custom_message_bg: Color,
+    /// Skill-invocation `[skill]` label color (pi `customMessageLabel`).
+    pub custom_message_label: Color,
+    /// Skill-invocation body text color (pi `customMessageText`).
+    pub custom_message_text: Color,
+
     // -- Tool diffs (pi toolDiff*) --
     /// Added-line color.
     pub tool_diff_added: Color,
@@ -147,6 +155,12 @@ impl Default for ThemeColors {
             tool_title: Color::Default,
             tool_output: Color::Ansi256(244),
             bash_mode: Color::Ansi256(107), // green
+
+            // Custom messages / skill invocation (pi dark.json):
+            // customMsgBg #2d2838, customMessageLabel #9575cd, text #d4d4d4.
+            custom_message_bg: Color::Rgb(45, 40, 56),
+            custom_message_label: Color::Rgb(149, 117, 205),
+            custom_message_text: Color::Default,
 
             // Tool diffs
             tool_diff_added: Color::Ansi256(107),   // green
@@ -379,6 +393,11 @@ fn theme_for_preset(preset: ThemePreset) -> Theme {
             colors.tool_title = Color::Default;
             colors.tool_output = Color::Ansi256(241);
             colors.bash_mode = Color::Ansi256(65);
+            // Custom messages / skill invocation (pi light.json):
+            // customMsgBg #ede7f6, customMessageLabel #7e57c2, text #1f2328.
+            colors.custom_message_bg = Color::Rgb(237, 231, 246);
+            colors.custom_message_label = Color::Rgb(126, 87, 194);
+            colors.custom_message_text = Color::Ansi256(237);
             colors.tool_diff_added = Color::Ansi256(65);
             colors.tool_diff_removed = Color::Ansi256(131);
             colors.tool_diff_context = Color::Ansi256(241);
@@ -420,6 +439,9 @@ fn theme_for_preset(preset: ThemePreset) -> Theme {
             colors.md_quote = Color::Ansi256(244);
             colors.md_quote_border = Color::Ansi256(244);
             colors.md_hr = Color::Ansi256(244);
+            colors.custom_message_bg = Color::Ansi256(236);
+            colors.custom_message_label = Color::Ansi256(15);
+            colors.custom_message_text = Color::Ansi256(244);
             colors.tool_title = Color::Default;
             colors.tool_output = Color::Ansi256(244);
             colors.tool_diff_added = Color::Ansi256(15);
