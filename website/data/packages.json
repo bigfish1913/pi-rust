@@ -135,7 +135,7 @@
     "name": "rpi-todo",
     "type": "extension",
     "age": 12,
-    "ageLabel": "v0.1.2 · published",
+    "ageLabel": "v0.1.3 · published",
     "description": "持久化项目 todo 工具扩展。",
     "author": "rpi-packages / crates.io",
     "downloads": 0,
