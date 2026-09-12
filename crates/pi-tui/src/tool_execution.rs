@@ -41,6 +41,9 @@ pub enum ToolStatus {
 pub struct ToolExecutionComponent {
     /// Tool name
     name: Mutex<String>,
+    /// Optional display title. The raw name is retained for argument parsing
+    /// while extensions such as skill loading can provide a clearer label.
+    display_title: Mutex<Option<String>>,
     /// Tool arguments (displayed)
     args: Mutex<String>,
     /// Tool result (displayed after execution)
@@ -60,6 +63,7 @@ impl ToolExecutionComponent {
     pub fn new(name: &str, args: &str) -> Self {
         Self {
             name: Mutex::new(name.to_string()),
+            display_title: Mutex::new(None),
             args: Mutex::new(args.to_string()),
             result: Mutex::new(None),
             status: Mutex::new(ToolStatus::Pending),
@@ -121,6 +125,14 @@ impl ToolExecutionComponent {
         self.name.lock().unwrap().clone()
     }
 
+    /// Override the title shown in the header without changing the underlying
+    /// tool name used to summarize arguments and route updates.
+    pub fn set_display_title(&self, title: impl Into<String>) {
+        if let Ok(mut display_title) = self.display_title.lock() {
+            *display_title = Some(title.into());
+        }
+    }
+
     /// Attach a pre-rendered colored diff (from [`crate::diff::render_diff`]).
     /// When set, the diff lines are always shown (regardless of `expanded`)
     /// so an edit's changes are visible directly in the transcript.
@@ -143,6 +155,7 @@ impl Component for ToolExecutionComponent {
         lines.push(String::new());
 
         let name = self.name.lock().unwrap();
+        let display_title = self.display_title.lock().unwrap();
         let status = self.status.lock().unwrap();
         let args = self.args.lock().unwrap();
         let result = self.result.lock().unwrap();
@@ -169,7 +182,10 @@ impl Component for ToolExecutionComponent {
         // instead of the raw `{"path":"..."}` blob — see `parse_args_summary`.
         // The verbose JSON still shows in the expanded args block below.
         let chevron = if *expanded { "▾" } else { "▸" };
-        let label = tools::tool_label(&name);
+        let label = display_title
+            .as_deref()
+            .map(str::to_string)
+            .unwrap_or_else(|| tools::tool_label(&name));
         let summary = tools::parse_args_summary(&name, &args);
         let head_parts = if summary.is_empty() {
             format!(

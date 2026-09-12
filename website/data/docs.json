@@ -13,7 +13,7 @@
           "title": "完整使用手册",
           "summary": "从安装、模型配置、.rpi 资源和 Pi package，到 JS/TS 扩展、Rust 插件、SDK、排错和发布的完整路径。",
           "body": [
-            "CLI 内置 docs 工具和线上 /user-guide.md 使用同一份内容。安装后的 rpi 可以离线查询 guide 主题；官网入口和发布包会在每次部署时同步更新。",
+            "官网文档与仓库内 /user-guide.md 保持同步。安装后的 rpi 默认只提供 Pi 的四个核心工具；需要了解扩展和配置时请查阅在线文档或仓库文档。",
             "推荐先阅读安装与第一次运行，再按需求进入 Provider、Pi package、扩展或 SDK 集成章节。"
           ],
           "links": [
@@ -63,7 +63,7 @@
           "title": "接入工具",
           "summary": "把 AgentTool 加入 builder；内置工具通过 ExecutionEnv 隔离文件系统和命令执行。",
           "body": [
-            "rpi-tools 提供 read、write、edit、bash、grep、find、ls 七个基础工具。读操作可以直接执行，写操作通过 MutationQueue 串行化。",
+            "rpi-tools 提供与 Pi 对齐的 read、write、edit、bash 四个基础工具，写操作通过 MutationQueue 串行化。",
             "在测试中使用 InMemoryExecutionEnv 可以避免触碰真实文件系统；需要自定义工具时，实现 rpi-agent 的 AgentTool trait。"
           ],
           "code": {"language": "rust", "file": "crates/pi-tools/src/lib.rs", "content": "use rpi_tools::{create_read_tool, InMemoryExecutionEnv};\n\nlet env = InMemoryExecutionEnv::default();\nlet read = create_read_tool(env.clone());\nlet mut agent = Agent::builder(model)\n    .tool(read)\n    .build();"},

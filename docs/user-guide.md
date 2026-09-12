@@ -147,30 +147,14 @@ rpi uninstall-pi <spec>
 rpi update
 ```
 
-## 4. 内置工具和文档查询
+## 4. 内置工具
 
-默认工具为 `docs`、`read`、`bash`、`edit`、`write`、`grep`、`find`、`ls`。其中 `docs` 是只读工具，文档在编译时嵌入二进制，安装后无需联网也能使用。
+默认工具与 Pi 保持一致，仅包含 `read`、`bash`、`edit`、`write`。此前 rpi 增加的 `docs`、`grep`、`find`、`ls`、`powershell` 工具暂不由 CLI 注册；对应 `rpi-tools` 库实现仍保留，避免破坏已有嵌入式调用者。
 
-模型遇到 rpi 命令、扩展 API、Pi package 或 `.rpi` 配置不确定时，应先调用 `docs`：
-
-```json
-{}
-```
-
-列出主题；或者：
-
-```json
-{"topic":"guide"}
-{"topic":"extensions","query":"ctx.ui.custom"}
-{"topic":"guide","query":"install-pi"}
-```
-
-当前主题包括 `guide`、`authoring`、`overview`、`extensions`、`architecture`、`compatibility`。创建 package 或扩展前优先查询 `authoring`；`plugin`、`plugins`、`js`、`ts`、`pi` 等常用别名也可以使用。普通 `read` 仍然适合读取项目中的任意文件。
-
-限制工具范围时请显式列出 `docs`：
+需要限制工具范围时，显式列出 Pi 的四个工具：
 
 ```bash
-rpi --tools docs,read -p "查一下 Pi package 的安装方式"
+rpi --tools read,bash,edit,write -p "检查并修改项目文件"
 ```
 
 ## 5. 项目目录和资源优先级
@@ -379,7 +363,7 @@ rpi-telemetry → rpi-ai → rpi-agent → rpi-tools → rpi-harness →
 rpi-plugin-sdk → rpi-extensions → rpi-tui → rpi-cli
 ```
 
-发布前更新版本号和 `docs/release-vX.Y.Z.md`，确认 README、官网 `website/data/docs.json` 和本手册中的命令一致。官网是静态站点，文档文件提交到仓库后仍需按项目部署流程重新部署；CLI 内置文档则会随新二进制一起发布。
+发布前更新版本号和 `docs/release-vX.Y.Z.md`，确认 README、官网 `website/data/docs.json` 和本手册中的命令一致。官网是静态站点，文档文件提交到仓库后仍需按项目部署流程重新部署。
 
 ## 11. 文档查询入口
 
@@ -389,4 +373,4 @@ rpi-plugin-sdk → rpi-extensions → rpi-tui → rpi-cli
 - Pi 参考实现：<https://github.com/earendil-works/pi>
 - Package 与扩展作者指南：<https://rpi.laofu.online/extension-authoring.md>
 
-当在线文档和已安装版本不一致时，以当前二进制中的 `docs` 工具和对应版本的 Git tag 为准。
+当在线文档和已安装版本不一致时，以对应版本的 Git tag 和仓库内文档为准。

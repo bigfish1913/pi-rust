@@ -19,10 +19,10 @@
 //!   unconditionally (a copied `.rpi/` or legacy `.pi/` drops in and works).
 //! - **No `--models` cycling, no `ModelRuntime`/multi-provider.** One model,
 //!   one provider (Anthropic), resolved up-front by [`crate::provider`].
-//! - **Built-in tools**: `read`, `bash`, `edit`, `write` plus the read-only
-//!   `grep`/`find`/`ls` (the TS `createCodingTools` default set). `grep`/`find`
-//!   use an in-process `FileSystem`+`regex`/`globset` implementation (documented
-//!   divergence from the TS `rg`/`fd` shell-out; see `docs/m4-tools-open-questions.md`).
+//! - **Built-in tools**: `read`, `bash`, `edit`, and `write`, matching Pi's
+//!   default `createCodingTools` set. The former rpi-only `docs`, `grep`,
+//!   `find`, `ls`, and `powershell` tools remain library modules but are no
+//!   longer registered by the CLI.
 //! - **Session restore (`-c`/`-r`/`--session`)** is *partially* supported: a
 //!   fresh session is always created. The harness's `create` rejects sessions
 //!   that already have records unless `allow_existing_session` is enabled.
@@ -47,13 +47,11 @@ use rpi_harness::types::{
     HarnessToolExecution, RetryPolicy, ToolReplay,
 };
 use rpi_tools::{
-    create_bash_tool, create_edit_tool, create_find_tool, create_grep_tool, create_ls_tool,
-    create_powershell_tool, create_read_tool, create_write_tool, ExecutionToolContext,
+    create_bash_tool, create_edit_tool, create_read_tool, create_write_tool, ExecutionToolContext,
     MutationQueueRegistry, OsExecutionEnv,
 };
 
 use crate::args::Args;
-use crate::docs_tool::create_docs_tool;
 use crate::extension_api::ExtensionBackend;
 use crate::provider::ResolvedModel;
 use crate::resource_dirs::{
@@ -66,48 +64,27 @@ use rpi_extensions::{
     PluginDiagnostics, PluginToolAdapter, TeeEmitter,
 };
 
-/// The subdirectory (under project `.rpi/`, legacy `.pi/`, and global
-/// `agent_dir()`) where rpi scans for cdylib plugins.
-/// The built-in tool names v1 ships, in the order the TS `createCodingTools`
-/// registers them: the mutating set (`read`/`bash`/`edit`/`write`) followed by
-/// the read-only search set (`grep`/`find`/`ls`).
-pub const BUILTIN_TOOL_NAMES: &[&str] = &[
-    "docs",
-    "read",
-    "bash",
-    "edit",
-    "write",
-    "grep",
-    "find",
-    "ls",
-    "powershell",
-];
+/// The Pi-compatible coding tools registered by the CLI by default.
+pub const BUILTIN_TOOL_NAMES: &[&str] = &["read", "bash", "edit", "write"];
 
 /// The default coding system prompt. A condensed port of the TS
-/// `packages/coding-agent/src/core/system-prompt.ts` base prompt. The
-/// `docs` tool is the installed-binary equivalent of Pi's bundled docs lookup.
+/// `packages/coding-agent/src/core/system-prompt.ts` base prompt.
 pub fn default_system_prompt(cwd: &str) -> String {
     format!(
         "You are an expert coding assistant operating inside rpi, a coding agent harness. \
 You help users by reading files, executing commands, editing code, and writing new files.
 
 Available tools:
-- docs  — Look up rpi usage, package, plugin, and compatibility documentation
 - read  — Read file contents
 - bash  — Execute shell commands
 - edit  — Find/replace edits to existing files
 - write — Create or overwrite files
-- grep  — Search file contents for a pattern
-- find  — Search for files by glob pattern
-- ls    — List directory contents
-- powershell — Execute PowerShell commands on Windows
 
 Guidelines:
 - Be concise in your responses
 - Show file paths clearly when working with files
 - Prefer the smallest change that solves the problem
-- When unsure about rpi commands, extensions, Pi package compatibility, or .rpi configuration, use the docs tool before guessing
-- Before creating an rpi package or extension, query the docs authoring topic and follow its backend-specific templates and verification checklist
+- When unsure about rpi commands, extensions, Pi package compatibility, or .rpi configuration, consult the project documentation before guessing
 
 Current working directory: {cwd}"
     )
@@ -1351,11 +1328,8 @@ fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
     if args.no_tools {
         return Vec::new();
     }
-    // Construct every built-in once (cheap; the allowlist filters below).
-    // Read-only search tools (grep/find/ls) take the same context and need no
-    // mutation queue — they go through the `FileSystem` trait only.
+    // Keep the default set aligned with Pi's createCodingTools.
     let mut all: Vec<(&'static str, HarnessTool)> = vec![
-        ("docs", HarnessTool::new(create_docs_tool())),
         ("read", HarnessTool::new(create_read_tool(ctx, None))),
         (
             "bash",
@@ -1363,10 +1337,6 @@ fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
         ),
         ("edit", HarnessTool::new(create_edit_tool(ctx))),
         ("write", HarnessTool::new(create_write_tool(ctx))),
-        ("grep", HarnessTool::new(create_grep_tool(ctx, None))),
-        ("find", HarnessTool::new(create_find_tool(ctx, None))),
-        ("ls", HarnessTool::new(create_ls_tool(ctx, None))),
-        ("powershell", HarnessTool::new(create_powershell_tool(ctx))),
     ];
 
     // `--no-builtin-tools` disables the built-in set but would keep
@@ -1754,9 +1724,10 @@ mod tests {
         assert!(p.contains("bash"));
         assert!(p.contains("edit"));
         assert!(p.contains("write"));
-        assert!(p.contains("grep"));
-        assert!(p.contains("find"));
-        assert!(p.contains("ls"));
+        assert!(!p.contains("- grep"));
+        assert!(!p.contains("- find"));
+        assert!(!p.contains("- ls"));
+        assert!(!p.contains("powershell"));
     }
 
     #[test]

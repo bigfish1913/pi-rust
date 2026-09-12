@@ -20,7 +20,7 @@ agents in Rust, plus an `rpi` CLI built on top.
 | `rpi-telemetry`   | `pi-telemetry/`  | Telemetry span/event contracts (noop default).                      |
 | `rpi-ai`          | `pi-ai/`         | Unified multi-provider LLM types + streaming (Anthropic + faux).    |
 | `rpi-agent`       | `pi-agent/`      | Agent runtime + loop, `AgentTool` trait, events, hooks, queues.     |
-| `rpi-tools`       | `pi-tools/`      | Built-in tools (`read`/`write`/`edit`/`bash`/`grep`/`find`/`ls`) + `ExecutionEnv`. |
+| `rpi-tools`       | `pi-tools/`      | Pi-compatible coding tools (`read`/`write`/`edit`/`bash`) + `ExecutionEnv`. |
 | `rpi-harness`     | `pi-harness/`    | `AgentHarness`: session tree, JSONL persistence, compaction, run loop. |
 | `rpi-cli`         | `pi-cli/`        | Terminal coding-agent CLI (`rpi` binary) on top of the library crates. |
 | `rpi-plugin-sdk`   | `rpi-plugin-sdk/` | Stable C ABI for Rust-native plugins and extension discovery.        |
@@ -206,9 +206,9 @@ global resources, so `.rpi`/`.pi` and `~/.rpi/agent` always win collisions.
   `rpi auth login`) → `~/.rpi/agent/models.json` `apiKey` → provider environment
   variables (`OPENAI_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`). `rpi auth
   login`/`check`/`logout` manage the stored credential.
-- **Tools:** `read`, `write`, `edit`, `bash` (mutating, run through a
-  `MutationQueue`) + `grep`, `find`, `ls` (read-only, in-process via the
-  `FileSystem` trait — no `rg`/`fd` shell-out).
+- **Tools:** the CLI defaults to Pi's `read`, `write`, `edit`, and `bash`
+  tools. The former rpi-only `grep`, `find`, `ls`, `docs`, and `powershell`
+  implementations remain library code but are not loaded by default.
 - **Extensions:** Rust `cdylib` plugins can be installed with `rpi install` and
   are discovered from project `.rpi/extensions`, legacy `.pi/extensions`,
   global `~/.rpi/agent/extensions`, and `--extensions-dir`.

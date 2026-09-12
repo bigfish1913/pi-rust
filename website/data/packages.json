@@ -28,7 +28,7 @@
     "type": "crate",
     "age": 3,
     "ageLabel": "v0.1.10 · current",
-    "description": "开箱即用的 read、write、edit、bash、grep、find、ls 工具和 ExecutionEnv。",
+    "description": "与 Pi 对齐的 read、write、edit、bash 工具和 ExecutionEnv。",
     "author": "rpi / crates.io",
     "downloads": 138,
     "downloadsLabel": "138",

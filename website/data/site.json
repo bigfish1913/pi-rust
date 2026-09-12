@@ -19,7 +19,7 @@
   "architecture": [
     { "name": "rpi-ai", "label": "Models + streaming", "description": "统一消息类型、Provider 和流式事件", "tone": "orange" },
     { "name": "rpi-agent", "label": "Agent loop", "description": "工具调用、事件、Hook、steering", "tone": "mint" },
-    { "name": "rpi-tools", "label": "Built-in tools", "description": "read / write / edit / bash / grep", "tone": "blue" },
+    { "name": "rpi-tools", "label": "Built-in tools", "description": "read / write / edit / bash", "tone": "blue" },
     { "name": "rpi-harness", "label": "Sessions", "description": "会话树、JSONL、compaction", "tone": "violet" },
     { "name": "rpi-cli", "label": "Your interface", "description": "CLI、TUI、配置和插件", "tone": "cream" }
   ],

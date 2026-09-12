@@ -4455,6 +4455,10 @@ async fn handle_agent_event(
                     bash_map.insert(tool_call_id.clone(), comp);
                 }
             } else {
+                if let Some(title) = skill_tool_display_title(&tool_name, &args) {
+                    let skill_name = title.strip_prefix("SKILL ").unwrap_or(&title);
+                    add_note_message(chat, &format!("Using skill: {skill_name}"));
+                }
                 let comp = {
                     let mut tools = state.tool_components.lock().unwrap();
                     if let Some(existing) = tools.get(&tool_call_id) {
@@ -4463,6 +4467,9 @@ async fn handle_agent_event(
                     } else {
                         let comp =
                             Arc::new(ToolExecutionComponent::new(&tool_name, &args.to_string()));
+                        if let Some(title) = skill_tool_display_title(&tool_name, &args) {
+                            comp.set_display_title(title);
+                        }
                         comp.set_running();
                         chat.add_child(comp.clone());
                         tools.insert(tool_call_id.clone(), comp.clone());
@@ -4478,8 +4485,8 @@ async fn handle_agent_event(
         AgentEvent::ToolExecutionUpdate {
             tool_call_id,
             tool_name,
+            args,
             partial_result,
-            ..
         } => {
             if tool_name == "bash" {
                 // Append the streamed chunk to the bash component's preview.
@@ -4502,6 +4509,9 @@ async fn handle_agent_event(
                         .insert(tool_call_id.clone(), comp);
                 }
             } else if let Some(comp) = state.tool_components.lock().unwrap().get(&tool_call_id) {
+                if let Some(title) = skill_tool_display_title(&tool_name, &args) {
+                    comp.set_display_title(title);
+                }
                 // Raw multi-line text — read/ls-style tools must show their
                 // full content, not the single-line ⏎-folded summary.
                 comp.set_result(&tool_result_text(&partial_result), false);
@@ -4510,6 +4520,9 @@ async fn handle_agent_event(
             } else {
                 // No component yet — create a running one so the partial shows.
                 let comp = Arc::new(ToolExecutionComponent::new(&tool_name, ""));
+                if let Some(title) = skill_tool_display_title(&tool_name, &args) {
+                    comp.set_display_title(title);
+                }
                 comp.set_running();
                 comp.set_result(&tool_result_text(&partial_result), false);
                 apply_edit_diff(&comp, &tool_name, &partial_result.details, &tui);
@@ -4639,6 +4652,28 @@ fn apply_edit_diff(
     let width = tui.width();
     let lines = render_diff(diff_text, width);
     comp.set_diff(lines);
+}
+
+/// Return the Pi-style display title for a read that loads a skill definition.
+/// Skill files are conventionally named `SKILL.md` and live below a directory
+/// whose basename is the skill name. Ordinary markdown/document reads remain
+/// regular `READ` tool panels.
+fn skill_tool_display_title(tool_name: &str, args: &serde_json::Value) -> Option<String> {
+    if tool_name != "read" {
+        return None;
+    }
+    let path = args.get("path").and_then(|value| value.as_str())?;
+    let normalized = path.replace('\\', "/");
+    let file_name = normalized.rsplit('/').next()?;
+    if !file_name.eq_ignore_ascii_case("SKILL.md") {
+        return None;
+    }
+    let skill_name = normalized
+        .trim_end_matches('/')
+        .rsplit('/')
+        .nth(1)
+        .filter(|name| !name.is_empty())?;
+    Some(format!("SKILL {skill_name}"))
 }
 
 /// Render an `AgentToolResult` as a single-line summary for the
@@ -5831,6 +5866,19 @@ mod tests {
             plain.contains("rust-review · release"),
             "Skill names missing: {plain}"
         );
+    }
+
+    #[test]
+    fn skill_reads_get_a_distinct_tool_title() {
+        let title = skill_tool_display_title(
+            "read",
+            &serde_json::json!({"path": "C:/work/.rpi/skills/release/SKILL.md"}),
+        );
+        assert_eq!(title.as_deref(), Some("SKILL release"));
+
+        let title =
+            skill_tool_display_title("read", &serde_json::json!({"path": "/docs/README.md"}));
+        assert!(title.is_none());
     }
 
     #[test]
