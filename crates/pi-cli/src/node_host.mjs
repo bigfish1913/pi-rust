@@ -457,13 +457,19 @@ const toolSummaries = [...tools.values()].map(t => ({
   description: t.description || '',
   parameters: t.parameters || { type: 'object', properties: {} }
 }));
-write({ id: 0, ok: true, result: {
+const initMessage = { id: 0, ok: true, result: {
   apiVersion: 1,
   capabilities: hostCapabilities,
   tools: toolSummaries,
   commands: [...commands.keys()],
   resources
-} });
+} };
+write(initMessage);
+if (process.env.RPI_JS_EXTENSION_ONESHOT === '1') {
+  // Discovery only needs registrations. Do not enter the persistent request
+  // loop, which keeps startup free of a long-lived Node runtime.
+  setImmediate(() => process.exit(0));
+}
 const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 async function handleLine(line) {
   if (!line.trim()) return;
@@ -518,4 +524,10 @@ async function handleLine(line) {
   }
 }
 rl.on('line', line => { void handleLine(line); });
-await new Promise(() => {});
+rl.on('close', () => process.exit(0));
+// Keep the persistent host alive without an unresolved top-level await. Node
+// can now terminate cleanly on signals/stdin close instead of warning about an
+// unsettled promise during normal shutdown.
+const keepAlive = setInterval(() => {}, 0x7fffffff);
+process.once('SIGINT', () => { clearInterval(keepAlive); process.exit(0); });
+process.once('SIGTERM', () => { clearInterval(keepAlive); process.exit(0); });

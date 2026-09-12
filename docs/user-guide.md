@@ -228,6 +228,11 @@ rpi install-pi ./my-pi-package
 rpi install-pi --global npm:@scope/package
 ```
 
+Pi package 不一定会贡献模型工具：有些包只注册斜杠命令、状态栏或消息渲染器。
+例如 `@narumitw/pi-usage` 注册的是 `/usage` 和 `/fast`，应在交互界面的命令补全中查找，
+不会出现在欢迎页的 tools 列表里。rpi 启动时只做一次轻量注册发现；真正的 Node runtime
+会在第一次调用这些命令或 JS tool 时按需启动。
+
 卸载时，Rust 扩展使用：
 
 ```bash

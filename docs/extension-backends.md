@@ -9,10 +9,13 @@ adapts each backend to it.
 - `native-rust` loads the existing Rust `cdylib` plugin ABI and exposes the
   complete native registry, event, provider, renderer, and runtime-action
   capabilities.
-- `node` runs Pi JavaScript/TypeScript packages in a long-lived Node process.
-  The Node host is kept in `crates/pi-cli/src/node_host.mjs` and embedded into
-  the binary with `include_str!`, so installed binaries do not depend on a
-  neighboring script file.
+- `node` runs Pi JavaScript/TypeScript packages in a long-lived Node process
+  only when a tool or command is first invoked. Startup performs a short,
+  one-shot registration discovery pass so `/usage`-style commands and tool
+  schemas remain visible without keeping Node resident. The Node host is kept
+  in `crates/pi-cli/src/node_host.mjs` and embedded into the binary with
+  `include_str!`, so installed binaries do not depend on a neighboring script
+  file.
 
 Every backend reports an API version and explicit capabilities. Unsupported
 capabilities should be reported as structured `unsupported_capability` errors;

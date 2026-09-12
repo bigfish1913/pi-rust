@@ -5,7 +5,7 @@
 //! the agent process while still exposing Pi's tool and resource contracts.
 
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -39,7 +39,7 @@ struct JsToolDefinition {
 
 #[derive(Clone)]
 pub struct JsExtensionSession {
-    transport: NodeTransport,
+    transport: LazyNodeTransport,
     tools: Arc<Vec<JsToolDefinition>>,
     pub resources: JsResources,
     pub commands: Vec<String>,
@@ -66,33 +66,8 @@ impl JsExtensionSession {
         if paths.is_empty() {
             return Ok(None);
         }
-        let node = which_node()?;
-        let mut child = Command::new(node)
-            .args(["--input-type=module", "-e", NODE_HOST])
-            .env(
-                "RPI_JS_EXTENSION_PATHS",
-                serde_json::to_string(&paths).unwrap_or_else(|_| "[]".into()),
-            )
-            .env(
-                "RPI_JS_EXTENSION_CONTEXT",
-                serde_json::to_string(&context).unwrap_or_else(|_| "{}".into()),
-            )
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            // Extension diagnostics belong on stderr; keeping it inherited
-            // prevents an undrained pipe from blocking a noisy extension.
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|error| format!("could not start Node JS extension host: {error}"))?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or("Node extension host stdin unavailable")?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or("Node extension host stdout unavailable")?;
-        let (transport, init) = NodeTransport::start(child, stdin, stdout)?;
+        let (discovery_transport, init) = start_node_transport(&paths, &context, true)?;
+        drop(discovery_transport);
         if !init
             .get("ok")
             .and_then(serde_json::Value::as_bool)
@@ -172,7 +147,7 @@ impl JsExtensionSession {
             })
             .unwrap_or_default();
         Ok(Some(Self {
-            transport,
+            transport: LazyNodeTransport::new(paths, context),
             tools: Arc::new(definitions),
             resources,
             commands,
@@ -221,11 +196,7 @@ impl JsExtensionSession {
     }
 
     pub fn set_runtime_context(&self, context: serde_json::Value) -> Result<(), String> {
-        self.invoke(
-            "set_runtime_context",
-            serde_json::json!({"context": context}),
-        )
-        .map(|_| ())
+        self.transport.set_runtime_context(context)
     }
 
     pub fn set_runtime_handler(&self, handler: RuntimeHandler) -> Result<(), String> {
@@ -401,6 +372,152 @@ impl JsExtensionSession {
         self.set_runtime_context(serde_json::json!({
             "capabilities": ["provider_calls"],
         }))
+    }
+}
+
+/// Holds registrations discovered at startup while deferring the persistent
+/// Node runtime until the first request needs it.
+#[derive(Clone)]
+struct LazyNodeTransport {
+    paths: Arc<Vec<PathBuf>>,
+    context: Arc<serde_json::Value>,
+    transport: Arc<Mutex<Option<NodeTransport>>>,
+    handlers: Arc<Mutex<Vec<RuntimeHandler>>>,
+    pending_context: Arc<Mutex<Option<serde_json::Value>>>,
+}
+
+impl LazyNodeTransport {
+    fn new(paths: Vec<PathBuf>, context: serde_json::Value) -> Self {
+        Self {
+            paths: Arc::new(paths),
+            context: Arc::new(context),
+            transport: Arc::new(Mutex::new(None)),
+            handlers: Arc::new(Mutex::new(Vec::new())),
+            pending_context: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn ensure(&self) -> Result<NodeTransport, String> {
+        let mut slot = self
+            .transport
+            .lock()
+            .map_err(|_| "Node transport lock poisoned")?;
+        if let Some(transport) = slot.as_ref() {
+            return Ok(transport.clone());
+        }
+        let (transport, init) = start_node_transport(&self.paths, &self.context, false)?;
+        if !init
+            .get("ok")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Err(init
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("Node extension load failed")
+                .to_string());
+        }
+        let handlers = self
+            .handlers
+            .lock()
+            .map_err(|_| "Node runtime handler lock poisoned")?
+            .clone();
+        if let Some(first) = handlers.first() {
+            transport.replace_runtime_handlers(first.clone())?;
+            for handler in handlers.iter().skip(1).cloned() {
+                transport.add_runtime_handler(handler)?;
+            }
+        }
+        if let Some(context) = self
+            .pending_context
+            .lock()
+            .map_err(|_| "Node runtime context lock poisoned")?
+            .take()
+        {
+            transport.request(
+                "set_runtime_context",
+                serde_json::json!({"context": context}),
+            )?;
+        }
+        *slot = Some(transport.clone());
+        Ok(transport)
+    }
+
+    fn request(
+        &self,
+        method: &str,
+        payload: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        self.ensure()?.request(method, payload)
+    }
+
+    fn begin_request(
+        &self,
+        method: &str,
+        payload: serde_json::Value,
+    ) -> Result<crate::node_transport::PendingRequest, String> {
+        self.ensure()?.begin_request(method, payload)
+    }
+
+    fn send_event(&self, event: serde_json::Value) -> Result<(), String> {
+        self.ensure()?.send_event(event)
+    }
+
+    fn cancel(&self, id: u64) -> Result<(), String> {
+        self.ensure()?.cancel(id)
+    }
+
+    fn replace_runtime_handlers(&self, handler: RuntimeHandler) -> Result<(), String> {
+        *self
+            .handlers
+            .lock()
+            .map_err(|_| "Node runtime handler lock poisoned")? = vec![handler.clone()];
+        if let Some(transport) = self
+            .transport
+            .lock()
+            .map_err(|_| "Node transport lock poisoned")?
+            .as_ref()
+        {
+            transport.replace_runtime_handlers(handler)?;
+        }
+        Ok(())
+    }
+
+    fn add_runtime_handler(&self, handler: RuntimeHandler) -> Result<(), String> {
+        self.handlers
+            .lock()
+            .map_err(|_| "Node runtime handler lock poisoned")?
+            .push(handler.clone());
+        if let Some(transport) = self
+            .transport
+            .lock()
+            .map_err(|_| "Node transport lock poisoned")?
+            .as_ref()
+        {
+            transport.add_runtime_handler(handler)?;
+        }
+        Ok(())
+    }
+
+    fn set_runtime_context(&self, context: serde_json::Value) -> Result<(), String> {
+        let mut pending = self
+            .pending_context
+            .lock()
+            .map_err(|_| "Node runtime context lock poisoned")?;
+        *pending = Some(context.clone());
+        drop(pending);
+        if let Some(transport) = self
+            .transport
+            .lock()
+            .map_err(|_| "Node transport lock poisoned")?
+            .as_ref()
+        {
+            transport.request(
+                "set_runtime_context",
+                serde_json::json!({"context": context}),
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -586,6 +703,45 @@ impl AgentTool for JsToolAdapter {
     }
 }
 
+fn start_node_transport(
+    paths: &[PathBuf],
+    context: &serde_json::Value,
+    discovery_only: bool,
+) -> Result<(NodeTransport, serde_json::Value), String> {
+    let node = which_node()?;
+    let mut command = Command::new(node);
+    command
+        .args(["--input-type=module", "-e", NODE_HOST])
+        .env(
+            "RPI_JS_EXTENSION_PATHS",
+            serde_json::to_string(paths).unwrap_or_else(|_| "[]".into()),
+        )
+        .env(
+            "RPI_JS_EXTENSION_CONTEXT",
+            serde_json::to_string(context).unwrap_or_else(|_| "{}".into()),
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        // Extension diagnostics belong on stderr; keeping it inherited
+        // prevents an undrained pipe from blocking a noisy extension.
+        .stderr(Stdio::inherit());
+    if discovery_only {
+        command.env("RPI_JS_EXTENSION_ONESHOT", "1");
+    }
+    let mut child: Child = command
+        .spawn()
+        .map_err(|error| format!("could not start Node JS extension host: {error}"))?;
+    let stdin: ChildStdin = child
+        .stdin
+        .take()
+        .ok_or("Node extension host stdin unavailable")?;
+    let stdout: ChildStdout = child
+        .stdout
+        .take()
+        .ok_or("Node extension host stdout unavailable")?;
+    NodeTransport::start(child, stdin, stdout)
+}
+
 fn which_node() -> Result<String, String> {
     for candidate in ["node", "nodejs"] {
         if Command::new(candidate)
@@ -732,11 +888,13 @@ mod tests {
         )
         .unwrap()
         .unwrap();
+        assert!(session.transport.transport.lock().unwrap().is_none());
         session
             .set_runtime_context(serde_json::json!({
                 "session":{"id":"session-1","leafId":"leaf-1","entries":[{"id":"entry-1"}]}
             }))
             .unwrap();
+        assert!(session.transport.transport.lock().unwrap().is_none());
         let value = session
             .invoke_command_with_context("edit", "", serde_json::json!({"editorText":"draft"}))
             .unwrap();
@@ -842,6 +1000,7 @@ mod tests {
         )
         .unwrap();
         let session = JsExtensionSession::load(&[path], false).unwrap().unwrap();
+        assert!(session.transport.transport.lock().unwrap().is_none());
         let (sender, receiver) = std::sync::mpsc::channel();
 
         let slow = session.clone();
@@ -858,7 +1017,7 @@ mod tests {
         });
 
         let first = receiver
-            .recv_timeout(std::time::Duration::from_millis(200))
+            .recv_timeout(std::time::Duration::from_secs(2))
             .expect("fast request should not wait for the slow request");
         assert_eq!(first, serde_json::json!("fast"));
         assert_eq!(receiver.recv().unwrap(), serde_json::json!("slow"));
