@@ -441,7 +441,10 @@ already accepts `Vec<ImageContent>`; this is purely CLI-side wiring.
   base → append → context → skills.
 - **Flags**: `--no-skills`/`-ns`, `--no-prompt-templates`/`-np`,
   `--no-context-files`/`-nc` each suppress one channel independently;
-  `--no-extensions`/`-ne` is parsed (no-op until Part B).
+  `--no-extensions`/`-ne` controls Rust extension loading and is the final
+  kill switch for Pi JS/TS packages;
+  `--enable-pi-packages` explicitly opts into configured Pi package discovery
+  and loading; without it, package settings are not parsed.
 - **`/context` (TUI)**: lists discovered skills, prompt templates, and a note on
   context/system/append sources (`interactive_tui::show_context_panel`).
 

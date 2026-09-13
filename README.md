@@ -164,8 +164,13 @@ rpi uninstall-pi npm:@scope/my-package
 
 The installer stores project packages under `.rpi/packages` (use `--global`
 for `~/.rpi/agent/packages`), runs `npm install --omit=dev`, and enables the
-resolved package in settings. Pi extensions are loaded by a long-lived Node.js
-host; `registerTool`, `registerCommand`, and `resources_discover` are supported.
+resolved package in settings. Package discovery and loading are disabled by
+default; start rpi with `--enable-pi-packages` to opt in. That startup performs
+a short one-shot Node.js discovery pass. In the interactive TUI, a long-lived
+Node.js host starts immediately before the first submitted prompt (or earlier
+when a package command or tool is used), so an idle TUI does not keep Node
+resident.
+`registerTool`, `registerCommand`, and `resources_discover` are supported.
 TypeScript uses Node's native type stripping when available, or a package-local
 `jiti` dependency. Pi peer/runtime packages are installed and aliased from
 nested `node_modules` when npm does not hoist them. Node.js is required, and
@@ -194,7 +199,9 @@ The package may provide `skills/`, `prompts/`, `themes/`, `SYSTEM.md`, and
 `APPEND_SYSTEM.md`. An optional `rpi` (or legacy `pi`) object in `package.json`
 can override those resource paths; `rpi` wins when both are present. Package resources are loaded after project and
 global resources, so `.rpi`/`.pi` and `~/.rpi/agent` always win collisions.
-`--theme <name-or-path>` selects a package theme in the interactive TUI.
+`--theme <name-or-path>` selects a package theme in the interactive TUI when
+startup also includes `--enable-pi-packages`; an explicit JSON path does not
+require package discovery.
 
 ## Status (v1)
 
@@ -218,11 +225,12 @@ global resources, so `.rpi`/`.pi` and `~/.rpi/agent` always win collisions.
   compatibility fallback. When both contain the same skill or prompt name,
   `.rpi/` wins. Project `.rpi/settings.json` can add `skillDirs`, `promptDirs`,
   `extensionDirs`, and `packages` (with `.pi/settings.json` as fallback).
-- **Pi packages:** static package resources are loaded from the package specs in
-  `~/.rpi/agent/settings.json` (`packages` array). Skills, prompt templates,
-  themes, system prompt fragments, and JavaScript/TypeScript extensions are
-  supported through the Node host; Rust `cdylib` extensions remain available
-  for native integrations.
+- **Pi packages:** package specs in `~/.rpi/agent/settings.json` (`packages`
+  array) are loaded only when startup includes `--enable-pi-packages`. Skills,
+  prompt templates, themes, system prompt fragments, and JavaScript/TypeScript
+  extensions are supported through the Node host; without the flag, configured
+  Pi packages are not discovered or executed. Rust `cdylib` extensions remain
+  available for native integrations unless `--no-extensions` is supplied.
 - **Sessions:** JSONL v4 durable backend + in-memory ephemeral; compaction + a
   split-turn two-LLM-call invariant.
 

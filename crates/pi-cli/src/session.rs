@@ -67,6 +67,23 @@ use rpi_extensions::{
 /// The Pi-compatible coding tools registered by the CLI by default.
 pub const BUILTIN_TOOL_NAMES: &[&str] = &["read", "bash", "edit", "write"];
 
+/// Package-backed JS/TS loading is opt-in. `--no-extensions` remains a final
+/// kill switch even when package loading was explicitly enabled.
+pub(crate) fn should_load_js_packages(args: &Args) -> bool {
+    args.enable_pi_packages && !args.no_extensions
+}
+
+/// Resolve configured package resources once for this session. Keeping the
+/// boundary here ensures disabled package loading never parses settings or
+/// starts the Node host, including during reload.
+pub(crate) fn package_resources_for(args: &Args, cwd: &Path) -> crate::packages::PackageResources {
+    if should_load_js_packages(args) {
+        crate::packages::discover_from_settings(cwd)
+    } else {
+        crate::packages::PackageResources::default()
+    }
+}
+
 /// The default coding system prompt. A condensed port of the TS
 /// `packages/coding-agent/src/core/system-prompt.ts` base prompt.
 pub fn default_system_prompt(cwd: &str) -> String {
@@ -185,7 +202,10 @@ pub async fn build(
     BuildError,
 > {
     let cwd_str = cwd.to_string_lossy().to_string();
-    let package_resources = crate::packages::discover_from_settings(cwd);
+    // Pi packages are explicitly opt-in because discovery can start Node and
+    // execute package code. Rust cdylib extensions retain their own
+    // --no-extensions gate below.
+    let package_resources = package_resources_for(args, cwd);
 
     // ---- B5a: build the action bridge BEFORE extension load ----
     // Extensions load before `AgentHarness::create` (extensions provide tools the
@@ -251,7 +271,7 @@ pub async fn build(
     } else {
         load_extensions(args, cwd, Some(Arc::clone(&action_bridge)))
     };
-    let js_extension_session = if args.no_extensions {
+    let js_extension_session = if !should_load_js_packages(args) {
         None
     } else {
         let paths = js_extension_paths(args, cwd, &package_resources);
@@ -310,7 +330,21 @@ pub async fn build(
             eprintln!("JS extension commands: {}", session.commands.join(", "));
         }
     }
-    let active = active_tool_names(&tools, args);
+    let mut active = active_tool_names(&tools, args);
+    // JS extensions reconcile their own tools during the initial
+    // `before_agent_start` event. Merge that Node-side subset into the full
+    // Rust tool list so a headless launch can hide UI-only tools such as
+    // ask_user_question without dropping built-ins.
+    if let Some(session) = &js_extension_session {
+        let js_names = session.tool_names();
+        if let Some(js_active) = session.active_tools() {
+            active.retain(|name| !js_names.iter().any(|js| js == name));
+            active.extend(js_active.into_iter().filter(|name| {
+                js_names.iter().any(|js| js == name) && tool_name_allowed(name, args)
+            }));
+        }
+    }
+    active = filter_active_tool_names(active, args);
 
     // ---- Session storage ----
     let selection = select_session(args, cwd);
@@ -825,6 +859,24 @@ pub struct ReloadOutcome {
     pub had_warnings: bool,
 }
 
+/// Append the resource sources that are specific to a reload after the
+/// conventional project/global directories. Keep this order aligned with the
+/// initial build: explicit CLI paths must remain available after `/reload`,
+/// while discovered and package resources retain their lower precedence.
+fn append_reload_resource_paths(
+    mut paths: Vec<PathBuf>,
+    explicit: &[PathBuf],
+    discovered: &[String],
+    js_paths: &[PathBuf],
+    package_paths: &[PathBuf],
+) -> Vec<PathBuf> {
+    paths.extend(explicit.iter().cloned());
+    paths.extend(discovered.iter().map(PathBuf::from));
+    paths.extend(js_paths.iter().cloned());
+    paths.extend(package_paths.iter().cloned());
+    paths
+}
+
 /// Re-run extension + resource discovery and push the rebuilt state into the
 /// live `harness` via the B5d setters. The old `ExtensionSession` +
 /// `ActionBridge` are invalidated + swapped in [`ReloadContext`]'s cells. This
@@ -840,11 +892,15 @@ pub async fn reload_extension_resources(
     harness: &AgentHarness,
     ctx: &ReloadContext,
 ) -> ReloadOutcome {
-    let mut load_args = ctx.args.clone();
+    // Resolve the arguments once for this reload. `rpi dev` may append its
+    // freshly staged extension directory; every subsequent loader and policy
+    // decision must observe that same effective set rather than falling back
+    // to the pre-dev snapshot held in `ctx.args`.
+    let mut effective_args = ctx.args.clone();
     if let Some(dev) = &ctx.dev_extension {
         if let Err(error) = dev
             .rebuild()
-            .and_then(|_| dev.apply_to_args(&mut load_args))
+            .and_then(|_| dev.apply_to_args(&mut effective_args))
         {
             return ReloadOutcome {
                 summary: format!(
@@ -856,7 +912,7 @@ pub async fn reload_extension_resources(
         }
     }
     let cwd_str = ctx.cwd.to_string_lossy().to_string();
-    let package_resources = crate::packages::discover_from_settings(&ctx.cwd);
+    let package_resources = package_resources_for(&effective_args, &ctx.cwd);
     let mut warnings = false;
 
     // ---- 1. Build a fresh ActionBridge + ExtensionSession ----
@@ -888,16 +944,16 @@ pub async fn reload_extension_resources(
     let fresh_bridge =
         rpi_extensions::ActionBridge::with_reload(ctx.runtime.clone(), host, reload_cb);
 
-    let extension_session = if load_args.no_extensions {
+    let extension_session = if effective_args.no_extensions {
         rpi_extensions::ExtensionSession::none()
     } else {
-        load_extensions(&load_args, &ctx.cwd, Some(Arc::clone(&fresh_bridge)))
+        load_extensions(&effective_args, &ctx.cwd, Some(Arc::clone(&fresh_bridge)))
     };
-    if extension_session.is_empty() && !ctx.args.no_extensions {
+    if extension_session.is_empty() && !effective_args.no_extensions {
         // The fresh session may be empty if no cdylibs are present — not a
         // warning per se, but note it.
     }
-    if ctx.args.verbose {
+    if effective_args.verbose {
         if let Some(s) = extension_session.summary() {
             eprintln!("reload: {s}");
         }
@@ -954,10 +1010,23 @@ pub async fn reload_extension_resources(
 
     let mut skills: Vec<rpi_harness::types::Skill> = Vec::new();
     let mut skill_diags: Vec<rpi_harness::skills::SkillDiagnostic> = Vec::new();
-    if !ctx.args.no_skills {
-        let mut dirs = skill_dirs(&ctx.cwd);
-        dirs.extend(discovered.skill_paths.iter().map(PathBuf::from));
-        dirs.extend(package_resources.skill_dirs());
+    if !effective_args.no_skills {
+        // JS discovery is backed by the session-long lazy Node host. Until
+        // that host is swapped as part of a future full JS reload, preserve
+        // the paths it contributed at startup across `/reload`.
+        let js_paths: &[PathBuf] = ctx
+            .js_extension_session
+            .as_ref()
+            .map(|js| js.resources.skill_paths.as_slice())
+            .unwrap_or(&[]);
+        let package_paths = package_resources.skill_dirs();
+        let dirs = append_reload_resource_paths(
+            skill_dirs(&ctx.cwd),
+            &effective_args.skill,
+            &discovered.skill_paths,
+            js_paths,
+            &package_paths,
+        );
         let result = load_skills_with_precedence(&env_dyn, &dirs).await;
         skills = result.skills;
         skill_diags = result.diagnostics;
@@ -965,16 +1034,26 @@ pub async fn reload_extension_resources(
 
     let mut prompt_templates: Vec<rpi_harness::types::PromptTemplate> = Vec::new();
     let mut prompt_diags: Vec<rpi_harness::prompt_templates::PromptTemplateDiagnostic> = Vec::new();
-    if !ctx.args.no_prompt_templates {
-        let mut dirs = prompt_template_dirs(&ctx.cwd);
-        dirs.extend(discovered.prompt_paths.iter().map(PathBuf::from));
-        dirs.extend(package_resources.prompt_dirs());
+    if !effective_args.no_prompt_templates {
+        let js_paths: &[PathBuf] = ctx
+            .js_extension_session
+            .as_ref()
+            .map(|js| js.resources.prompt_paths.as_slice())
+            .unwrap_or(&[]);
+        let package_paths = package_resources.prompt_dirs();
+        let dirs = append_reload_resource_paths(
+            prompt_template_dirs(&ctx.cwd),
+            &effective_args.prompt_template,
+            &discovered.prompt_paths,
+            js_paths,
+            &package_paths,
+        );
         let result = load_prompt_templates_with_precedence(&env_dyn, &dirs).await;
         prompt_templates = result.prompt_templates;
         prompt_diags = result.diagnostics;
     }
 
-    let context_block = if ctx.args.no_context_files {
+    let context_block = if effective_args.no_context_files {
         String::new()
     } else {
         let agent_dir = crate::config::agent_dir().ok();
@@ -988,7 +1067,7 @@ pub async fn reload_extension_resources(
         || !package_resources.diagnostics.is_empty()
     {
         warnings = true;
-        if ctx.args.verbose {
+        if effective_args.verbose {
             for d in &package_resources.diagnostics {
                 eprintln!("warning: package {}: {}", d.spec, d.message);
             }
@@ -1012,7 +1091,7 @@ pub async fn reload_extension_resources(
     }
 
     // ---- Re-compose the system prompt (same precedence as build) ----
-    let base_prompt = match ctx.args.system_prompt.as_deref() {
+    let base_prompt = match effective_args.system_prompt.as_deref() {
         Some(explicit) => explicit.to_string(),
         None => match discover_system_prompt_file_with_packages(&ctx.cwd, &package_resources) {
             Some(path) => {
@@ -1022,11 +1101,11 @@ pub async fn reload_extension_resources(
         },
     };
     let mut append_texts: Vec<String> = Vec::new();
-    for extra in &ctx.args.append_system_prompt {
+    for extra in &effective_args.append_system_prompt {
         let text = read_append_target(extra).unwrap_or_else(|| extra.clone());
         append_texts.push(text);
     }
-    if ctx.args.append_system_prompt.is_empty() {
+    if effective_args.append_system_prompt.is_empty() {
         if let Some(path) =
             discover_append_system_prompt_file_with_packages(&ctx.cwd, &package_resources)
         {
@@ -1095,9 +1174,26 @@ pub async fn reload_extension_resources(
     // on top, mirroring `build`.
     let mut_env: Arc<dyn rpi_tools::MutatingEnv> = env.clone();
     let tool_ctx = rpi_tools::ExecutionToolContext::new(env_dyn.clone(), Some(mut_env));
-    let mut tools = build_tools(&tool_ctx, &ctx.args);
-    merge_extension_tools(&mut tools, &extension_session, &ctx.args);
-    let active = active_tool_names(&tools, &ctx.args);
+    let mut tools = build_tools(&tool_ctx, &effective_args);
+    merge_extension_tools(&mut tools, &extension_session, &effective_args);
+    if let Some(js) = &ctx.js_extension_session {
+        merge_js_extension_tools(&mut tools, js, &effective_args);
+    }
+    let mut active = active_tool_names(&tools, &effective_args);
+    if let Some(js) = &ctx.js_extension_session {
+        let js_names = js.tool_names();
+        if let Some(js_active) = js.active_tools() {
+            active.retain(|name| {
+                tool_name_allowed(name, &effective_args)
+                    && !js_names.iter().any(|js_name| js_name == name)
+            });
+            active.extend(js_active.into_iter().filter(|name| {
+                js_names.iter().any(|js_name| js_name == name)
+                    && tool_name_allowed(name, &effective_args)
+            }));
+        }
+    }
+    active = filter_active_tool_names(active, &effective_args);
     let _ = harness.set_tools(tools, Some(active)).await;
 
     let summary = format!(
@@ -1258,15 +1354,8 @@ fn merge_extension_tools(tools: &mut Vec<HarnessTool>, session: &ExtensionSessio
     };
     for et in snapshot.tools() {
         let name = &et.tool.name;
-        if let Some(allow) = &args.tools {
-            if !allow.iter().any(|a| a == name) {
-                continue;
-            }
-        }
-        if let Some(deny) = &args.exclude_tools {
-            if deny.iter().any(|d| d == name) {
-                continue;
-            }
+        if !tool_name_allowed(name, args) {
+            continue;
         }
         let adapter = PluginToolAdapter::new(et.tool.clone(), et.handle(), session.keepalive());
         let harness_tool = HarnessTool::new(Arc::new(adapter));
@@ -1284,15 +1373,7 @@ fn merge_js_extension_tools(
 ) {
     for adapter in session.tools() {
         let name = adapter.schema().name.clone();
-        if args
-            .tools
-            .as_ref()
-            .is_some_and(|allow| !allow.iter().any(|value| value == &name))
-            || args
-                .exclude_tools
-                .as_ref()
-                .is_some_and(|deny| deny.iter().any(|value| value == &name))
-        {
+        if !tool_name_allowed(&name, args) {
             continue;
         }
         let harness_tool = HarnessTool::new(Arc::new(adapter));
@@ -1364,22 +1445,44 @@ fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
 /// `--tools` allowlist was given. Mirrors the TS default: all registered tools
 /// active.
 fn active_tool_names(tools: &[HarnessTool], args: &Args) -> Vec<String> {
+    filter_active_tool_names(
+        tools.iter().map(|tool| tool.tool.schema().name.clone()),
+        args,
+    )
+}
+
+/// Whether a tool name survives the command-line tool policy. Keep this check
+/// centralized because JS extensions can mutate the active set after the
+/// initial Rust tool list has been built.
+pub(crate) fn tool_name_allowed(name: &str, args: &Args) -> bool {
     if args.no_tools {
-        return Vec::new();
+        return false;
     }
-    if let Some(allow) = &args.tools {
-        // The allowlist IS the active set (TS: `tools` doubles as the active
-        // set when provided). Keep order + only those that exist.
-        let names: Vec<String> = tools.iter().map(|t| t.tool.schema().name.clone()).collect();
-        return allow
-            .iter()
-            .filter(|a| names.iter().any(|n| n == *a))
-            .cloned()
-            .collect();
+    if args
+        .tools
+        .as_ref()
+        .is_some_and(|allow| !allow.iter().any(|value| value == name))
+    {
+        return false;
     }
-    // Default: every constructed tool is active. If `--exclude-tools` dropped
-    // some, they're simply absent from `tools`, so this lands right.
-    tools.iter().map(|t| t.tool.schema().name.clone()).collect()
+    if args
+        .exclude_tools
+        .as_ref()
+        .is_some_and(|deny| deny.iter().any(|value| value == name))
+    {
+        return false;
+    }
+    true
+}
+
+pub(crate) fn filter_active_tool_names<I>(names: I, args: &Args) -> Vec<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    names
+        .into_iter()
+        .filter(|name| tool_name_allowed(name, args))
+        .collect()
 }
 
 /// Build the `Session` facade for the chosen selection.
@@ -1728,6 +1831,104 @@ mod tests {
         assert!(!p.contains("- find"));
         assert!(!p.contains("- ls"));
         assert!(!p.contains("powershell"));
+    }
+
+    #[test]
+    fn pi_package_loading_is_opt_in_and_respects_no_extensions() {
+        let args = Args::default();
+        assert!(!should_load_js_packages(&args));
+        let resources = package_resources_for(&args, Path::new("."));
+        assert!(resources.packages.is_empty());
+
+        let args = Args {
+            enable_pi_packages: true,
+            ..Args::default()
+        };
+        assert!(should_load_js_packages(&args));
+
+        let args = Args {
+            enable_pi_packages: true,
+            no_extensions: true,
+            ..Args::default()
+        };
+        assert!(!should_load_js_packages(&args));
+        assert!(package_resources_for(&args, Path::new("."))
+            .packages
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn reload_resource_paths_include_explicit_skill_and_prompt_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_path = tmp.path().join("explicit-skill.md");
+        std::fs::write(
+            &skill_path,
+            "---\nname: explicit-skill\ndescription: Explicit skill\n---\nSkill body",
+        )
+        .unwrap();
+        let prompt_path = tmp.path().join("explicit-prompt.md");
+        std::fs::write(
+            &prompt_path,
+            "---\ndescription: Explicit prompt\n---\nPrompt body",
+        )
+        .unwrap();
+
+        let args = Args {
+            skill: vec![skill_path.clone()],
+            prompt_template: vec![prompt_path.clone()],
+            ..Args::default()
+        };
+        let skill_paths = append_reload_resource_paths(Vec::new(), &args.skill, &[], &[], &[]);
+        let prompt_paths =
+            append_reload_resource_paths(Vec::new(), &args.prompt_template, &[], &[], &[]);
+        let env = Arc::new(OsExecutionEnv::with_cwd(tmp.path().to_path_buf()));
+        let env_dyn: Arc<dyn rpi_tools::ExecutionEnv> = env;
+
+        let skills = load_skills_with_precedence(&env_dyn, &skill_paths).await;
+        assert_eq!(skills.skills.len(), 1, "{:?}", skills.diagnostics);
+        assert_eq!(skills.skills[0].name, "explicit-skill");
+
+        let prompts = load_prompt_templates_with_precedence(&env_dyn, &prompt_paths).await;
+        assert_eq!(
+            prompts.prompt_templates.len(),
+            1,
+            "{:?}",
+            prompts.diagnostics
+        );
+        assert_eq!(prompts.prompt_templates[0].name, "explicit-prompt");
+    }
+
+    #[test]
+    fn tool_policy_applies_to_rust_and_js_active_names() {
+        let names = vec![
+            "read".to_string(),
+            "ask_user_question".to_string(),
+            "write".to_string(),
+        ];
+
+        let args = Args {
+            tools: Some(vec!["read".into(), "ask_user_question".into()]),
+            ..Args::default()
+        };
+        assert_eq!(
+            filter_active_tool_names(names.clone(), &args),
+            vec!["read", "ask_user_question"]
+        );
+
+        let args = Args {
+            exclude_tools: Some(vec!["ask_user_question".into()]),
+            ..Args::default()
+        };
+        assert_eq!(
+            filter_active_tool_names(names.clone(), &args),
+            vec!["read", "write"]
+        );
+
+        let args = Args {
+            no_tools: true,
+            ..Args::default()
+        };
+        assert!(filter_active_tool_names(names, &args).is_empty());
     }
 
     #[test]

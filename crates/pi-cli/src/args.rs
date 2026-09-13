@@ -89,10 +89,15 @@ pub struct Args {
     /// `--no-context-files`/`-nc`: skip context-file (`AGENTS.md`/`CLAUDE.md`)
     /// discovery + the `<project_context>` system-prompt block.
     pub no_context_files: bool,
-    /// `--no-extensions`/`-ne`: skip Rust cdylib and JS/TS extension loading.
+    /// `--no-extensions`/`-ne`: skip Rust cdylib extension loading and act
+    /// as a final kill switch for Pi JS/TS packages when enabled.
     /// Honored by `session.rs` (Part B2): when set, no extension directory is
     /// scanned and no plugin tools/handlers are registered.
     pub no_extensions: bool,
+    /// `--enable-pi-packages`: opt into discovery and loading of configured
+    /// Pi JavaScript/TypeScript packages. This is intentionally opt-in because
+    /// loading a package may start a Node runtime and execute package code.
+    pub enable_pi_packages: bool,
     /// `--extensions-dir`/`-ed`: an extra directory to scan for cdylib plugins
     /// (`.dll`/`.so`/`.dylib`), in addition to project `.rpi/extensions`
     /// (with legacy `.pi/extensions` compatibility) and global
@@ -265,6 +270,7 @@ pub fn parse_args(args: &[String]) -> Args {
             "--no-prompt-templates" | "-np" => result.no_prompt_templates = true,
             "--no-context-files" | "-nc" => result.no_context_files = true,
             "--no-extensions" | "-ne" => result.no_extensions = true,
+            "--enable-pi-packages" => result.enable_pi_packages = true,
             "--extensions-dir" | "-ed" => {
                 if let Some(v) = take_value(&mut result, &flag_key) {
                     result.extensions_dir.push(PathBuf::from(v));
@@ -337,11 +343,11 @@ pub fn parse_args(args: &[String]) -> Args {
             // bare flag name even when the user wrote `--offline=1`.
             //
             // NOTE: `--no-skills`/`-ns`, `--no-prompt-templates`/`-np`,
-            // `--no-context-files`/`-nc`, and `--no-extensions`/`-ne` are now
-            // HONORED (parsed into real fields above), so they no longer reach
-            // this arm. The skill/prompt/context flags gate resource discovery
-            // (`session.rs`); `--no-extensions` is a no-op acceptance until the
-            // Part-B plugin system lands.
+            // `--no-context-files`/`-nc`, `--no-extensions`/`-ne`, and
+            // `--enable-pi-packages` are honored (parsed into real fields
+            // above), so they no longer reach this arm. The skill/prompt/context
+            // flags gate resource discovery (`session.rs`); package loading is
+            // separately opt-in.
             other
                 if matches!(
                     other,
@@ -493,6 +499,7 @@ pub fn print_help() {
   --no-prompt-templates, -np     Skip prompt-template discovery (/expand templates)
   --no-context-files, -nc        Skip AGENTS.md/CLAUDE.md discovery (no <project_context>)
   --no-extensions, -ne           Skip Rust cdylib and JS/TS extension loading
+  --enable-pi-packages            Enable configured Pi JS/TS packages (starts Node)
   --extensions-dir, -ed <dir>    Extra dir to scan for plugins (.dll/.so/.dylib); repeatable
                                  (also via RPI_EXTENSIONS_DIR env: ';' on Windows, ':' on Unix)
   --debug-system-prompt          Print the resolved system-prompt sections to stderr (verification)
@@ -553,7 +560,7 @@ pub fn print_help() {
   Supported HTTP protocols are Anthropic Messages and OpenAI Chat Completions.
   Define custom model catalogs and provider apiKey values in
   ~/.rpi/agent/models.json. The interactive TUI, Rust and JS/TS extensions,
-  Pi package resources, skills, prompt templates, themes, model cycling, session
+  opt-in Pi package resources, skills, prompt templates, themes, model cycling, session
   fork/export, and trust commands are
   available in the current build. OAuth and HTML export remain
   outside the current implementation.
@@ -701,10 +708,20 @@ mod tests {
 
     #[test]
     fn no_extensions_flag_honored() {
-        // `--no-extensions` is now parsed (no-op acceptance until Part B), no
-        // longer a warn-ignored v1 scope cut.
+        // `--no-extensions` is parsed and disables both extension backends.
         let a = parse_args(&s(&["--no-extensions"]));
         assert!(a.no_extensions);
+        assert!(a.ignored.is_empty());
+    }
+
+    #[test]
+    fn pi_packages_are_disabled_by_default_and_explicitly_enabled() {
+        let a = parse_args(&s(&[]));
+        assert!(!a.enable_pi_packages);
+        assert!(a.ignored.is_empty());
+
+        let a = parse_args(&s(&["--enable-pi-packages"]));
+        assert!(a.enable_pi_packages);
         assert!(a.ignored.is_empty());
     }
 

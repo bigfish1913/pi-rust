@@ -169,7 +169,11 @@ pub async fn run() -> i32 {
     // stderr so print/JSON modes remain machine-readable, and the checker
     // itself uses a short timeout plus a cache.
     if !parsed.print && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-        let report = crate::updates::check_startup(&cwd).await;
+        let report = crate::updates::check_startup_with_packages(
+            &cwd,
+            crate::session::should_load_js_packages(&parsed),
+        )
+        .await;
         crate::updates::print_startup_notices(&report);
     }
 

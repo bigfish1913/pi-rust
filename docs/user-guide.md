@@ -132,6 +132,7 @@ ANTHROPIC_AUTH_TOKEN=token
 --exclude-tools <list>  禁用指定工具
 --no-tools              禁用所有工具
 --no-extensions         禁用扩展加载
+--enable-pi-packages    启用配置中的 Pi JS/TS package（会启动 Node）
 --extensions-dir <dir>  额外扫描 Rust 扩展目录
 ```
 
@@ -214,8 +215,9 @@ rpi install-pi --global npm:@scope/package
 
 Pi package 不一定会贡献模型工具：有些包只注册斜杠命令、状态栏或消息渲染器。
 例如 `@narumitw/pi-usage` 注册的是 `/usage` 和 `/fast`，应在交互界面的命令补全中查找，
-不会出现在欢迎页的 tools 列表里。rpi 启动时只做一次轻量注册发现；真正的 Node runtime
-会在第一次调用这些命令或 JS tool 时按需启动。
+不会出现在欢迎页的 tools 列表里。rpi 只有在启动时带 `--enable-pi-packages` 才会按
+settings 中的 packages 配置进行注册发现并启用 Node runtime；未带该参数时不会加载 Pi package。
+`--no-extensions` 仍是最终关闭开关。
 
 卸载时，Rust 扩展使用：
 
@@ -244,7 +246,7 @@ rpi package remove ../my-pi-package
 rpi package update
 ```
 
-项目 package 默认存放在 `.rpi/packages`，全局 package 存放在 `~/.rpi/agent/packages`。rpi 也兼容 Pi 原生 npm store：读取 Pi 写入的 `npm:` package spec 时，会搜索 `~/.pi/agent/npm/node_modules/<package>`（以及 rpi agent 下对应的 `npm/node_modules`）。安装过程执行 `npm install --omit=dev`；Node.js 是运行 JS/TS extension 的必要条件。
+项目 package 默认存放在 `.rpi/packages`，全局 package 存放在 `~/.rpi/agent/packages`。rpi 也兼容 Pi 原生 npm store：读取 Pi 写入的 `npm:` package spec 时，会搜索 `~/.pi/agent/npm/node_modules/<package>`（以及 rpi agent 下对应的 `npm/node_modules`）。安装过程执行 `npm install --omit=dev`；Node.js 是运行 JS/TS extension 的必要条件。运行普通 rpi 命令不会加载这些 package，需显式传 `--enable-pi-packages`。
 
 ### 静态资源
 
@@ -344,7 +346,7 @@ while let Some(event) = events.recv().await {
 
 ### 资源没有出现在欢迎页
 
-确认文件位于 `.rpi`（或兼容的 `.pi`）、全局 `~/.rpi/agent` 或已启用 package 的资源目录。使用 `rpi --debug-system-prompt` 查看最终系统提示词、skills 和资源计数；同名资源优先检查 `.rpi` 是否覆盖了 `.pi`。
+确认文件位于 `.rpi`（或兼容的 `.pi`）、全局 `~/.rpi/agent` 或已启用 package 的资源目录。排查 package 资源时，使用 `rpi --enable-pi-packages --debug-system-prompt` 查看最终系统提示词、skills 和资源计数；同名资源优先检查 `.rpi` 是否覆盖了 `.pi`。
 
 ## 10. 开发、测试和发布
 

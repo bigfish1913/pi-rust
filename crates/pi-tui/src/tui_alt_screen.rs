@@ -284,6 +284,12 @@ impl TuiAltScreen {
         let Ok(_render_guard) = self.render_lock.lock() else {
             return;
         };
+        // A render request may have passed the public suspension check while
+        // a custom UI was opening. Re-check after taking the render lock so an
+        // already queued outer frame cannot overwrite the foreign screen.
+        if self.is_render_suspended() {
+            return;
+        }
         let Ok(terminal) = self.terminal.lock() else {
             return;
         };
@@ -418,6 +424,9 @@ impl TuiAltScreen {
         let Ok(_render_guard) = self.render_lock.lock() else {
             return;
         };
+        if self.is_render_suspended() {
+            return;
+        }
 
         let (width, height) = if let Ok(terminal) = self.terminal.lock() {
             (terminal.columns(), terminal.rows())
@@ -787,7 +796,7 @@ impl TuiAltScreen {
     /// when only the viewport or bottom dock changed. A missing cache or width
     /// change falls back to rendering fresh content automatically.
     pub fn request_render_reusing_scroll_content(&self) {
-        if self.is_running() {
+        if self.is_running() && !self.is_render_suspended() {
             self.do_render(true);
         }
     }
@@ -1009,5 +1018,25 @@ mod tests {
             .rfind("\x1b[?1049l\x1b[2J\x1b[H\x1b[?25h")
             .expect("stop should leave alt screen and clear the restored main screen");
         assert!(clear_position > content_position);
+    }
+
+    #[test]
+    fn cached_redraw_is_suppressed_while_rendering_is_suspended() {
+        let output = Arc::new(Mutex::new(String::new()));
+        let terminal = RecordingTerminal {
+            output: output.clone(),
+        };
+        let tui = TuiAltScreen::new(Box::new(terminal), true, None);
+        tui.set_layout_root(Some(Arc::new(Text::new("outer frame", 0, 0))));
+        tui.start_readerless();
+
+        tui.set_render_suspended(true);
+        let before = output.lock().unwrap().len();
+        tui.request_render_reusing_scroll_content();
+        assert_eq!(output.lock().unwrap().len(), before);
+
+        tui.set_render_suspended(false);
+        tui.set_layout_root(Some(Arc::new(Text::new("new frame", 0, 0))));
+        assert!(output.lock().unwrap().len() > before);
     }
 }

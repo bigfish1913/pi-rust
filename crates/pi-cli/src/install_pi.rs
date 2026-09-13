@@ -605,7 +605,7 @@ fn looks_like_npm(spec: &str) -> bool {
 }
 
 pub fn print_help() {
-    println!("Usage: rpi install-pi [options] <spec>\n\nInstall a Pi npm/git/local package and enable its static resources and JS/TS extensions.\n\nSpecs:\n  npm:@scope/package@1.0.0\n  git:github.com/user/repo@v1\n  ./local-package\n\nOptions:\n  --global, -g  Install into ~/.rpi/agent/packages\n  --force, -f   Replace an existing package\n  --help, -h    Show this help");
+    println!("Usage: rpi install-pi [options] <spec>\n\nInstall a Pi npm/git/local package.\n\nSpecs:\n  npm:@scope/package@1.0.0\n  git:github.com/user/repo@v1\n  ./local-package\n\nOptions:\n  --global, -g  Install into ~/.rpi/agent/packages\n  --force, -f   Replace an existing package\n  --help, -h    Show this help");
 }
 
 fn print_uninstall_help() {

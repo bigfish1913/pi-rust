@@ -101,13 +101,16 @@ pub fn global_config_file(name: &str) -> Option<PathBuf> {
 /// `resource-loader.ts:1022-1034`). Returns the first existing file in that
 /// order, or `None`.
 ///
+/// This convenience entry point intentionally excludes Pi package resources.
+/// Startup code that has passed the package gate supplies its resolved resource
+/// set to [`discover_system_prompt_file_with_packages`].
+///
 /// **Trust gate (v1 divergence):** pi gates the **project** `SYSTEM.md` behind
 /// `settingsManager.isProjectTrusted()` (global is always honored). rpi v1 has
 /// no trust prompt (`config.rs:349`), so project files are read unconditionally
 /// — a copied `.rpi/` or `.pi/` drops in and works. Full trust gating is deferred.
 pub fn discover_system_prompt_file(cwd: &Path) -> Option<PathBuf> {
-    let packages = crate::packages::discover_from_settings(cwd);
-    discover_system_prompt_file_with_packages(cwd, &packages)
+    discover_system_prompt_file_with_packages(cwd, &crate::packages::PackageResources::default())
 }
 
 /// Discover `SYSTEM.md` with already-resolved package resources. Package files
@@ -139,11 +142,17 @@ pub fn discover_system_prompt_file_with_packages(
 /// content is appended to the system prompt (pi `appendSystemPrompt`
 /// `:525-542`).
 ///
+/// This convenience entry point intentionally excludes Pi package resources.
+/// Startup code that has passed the package gate supplies its resolved resource
+/// set to [`discover_append_system_prompt_file_with_packages`].
+///
 /// **Trust gate (v1 divergence):** same as [`discover_system_prompt_file`] —
 /// pi gates the project file on trust, rpi v1 reads it unconditionally.
 pub fn discover_append_system_prompt_file(cwd: &Path) -> Option<PathBuf> {
-    let packages = crate::packages::discover_from_settings(cwd);
-    discover_append_system_prompt_file_with_packages(cwd, &packages)
+    discover_append_system_prompt_file_with_packages(
+        cwd,
+        &crate::packages::PackageResources::default(),
+    )
 }
 
 /// Discover `APPEND_SYSTEM.md` with already-resolved package resources.

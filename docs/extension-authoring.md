@@ -8,7 +8,7 @@
 | --- | --- | --- |
 | 安装 | `rpi install-pi npm:...` | `rpi install crate-name` |
 | 入口 | `package.json` 的 `pi.extensions` / `rpi.extensions` | `rpi_plugin_register` C ABI 符号 |
-| 开发反馈 | 重启或 `/reload` | `rpi dev` watch + 热重载 |
+| 开发反馈 | 退出并重新启动 rpi | `rpi dev` watch + 热重载 |
 | 静态资源 | skills、prompts、themes、SYSTEM.md | `resources_discover` 或随项目放入 `.rpi` |
 | 运行环境 | Node.js，当前用户权限 | 本机动态库，当前用户权限 |
 | 适用场景 | 兼容现有 Pi package、UI/命令扩展、快速交付 | 本地工具、系统集成、性能敏感或纯 Rust 项目 |
@@ -108,10 +108,10 @@ export default function setup(pi: any) {
 npm run build
 rpi install-pi ./my-pi-package --force
 rpi package list
-rpi
+rpi --enable-pi-packages
 ```
 
-进入 TUI 后确认欢迎页显示新增 tool/skill，调用 slash command 和工具，然后使用 `/reload` 验证重新加载。发布前再测试真实安装形式：
+进入 TUI 后确认欢迎页显示新增 tool/skill，并调用 slash command 和工具。修改 JS/TS package 后，退出并重新使用 `rpi --enable-pi-packages` 启动来验证重新加载；当前 `/reload` 不会重建 JS/TS package session。发布前再测试真实安装形式：
 
 ```bash
 npm pack
@@ -270,7 +270,8 @@ rpi --extensions-dir ./target/debug
 - `npm run build` 和测试通过。
 - `npm pack --dry-run` 只包含必要产物，不包含密钥、缓存和本地配置。
 - 从生成的 tarball 或指定 npm 版本执行一次 `rpi install-pi`。
-- 工具、命令、skills、themes 在干净目录可发现。
+- 使用 `rpi --enable-pi-packages` 启动后，settings 中启用的 package 的工具、命令、skills、themes
+  在干净目录可发现；未带该参数时 package 不会被加载，`--no-extensions` 可作为最终关闭开关。
 - Node 最低版本、权限和兼容能力写入 README。
 
 ### Rust 扩展

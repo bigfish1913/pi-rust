@@ -653,6 +653,16 @@ pub async fn run_mapper<F>(
                     emit_terminal_error(prod, state, err.to_string(), false);
                     return;
                 }
+                // `message_stop` is Anthropic's protocol-level terminal
+                // marker.  A few proxies leave the HTTP body open or emit an
+                // invalid trailing chunk after this frame; waiting for EOF
+                // would turn an otherwise complete answer into an SSE/body
+                // error.  The event has already carried the final stop/usage
+                // state, so finalize immediately and drop the body stream.
+                if event.event_type() == Some("message_stop") {
+                    finalize_mapper(prod, state, cost_fn);
+                    return;
+                }
             }
             Err(err) => {
                 let aborted = matches!(err, AiError::Abort { .. });

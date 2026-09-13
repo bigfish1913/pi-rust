@@ -90,6 +90,10 @@ impl SseDecoderState {
     /// Flush the pending event, if any. Mirrors `flushSseEvent`.
     pub fn flush(&mut self) -> Option<ServerSentEvent> {
         if self.event.is_none() && self.data.is_empty() {
+            // Comment-only frames (for example keepalives) do not produce an
+            // event, but their raw lines must not accumulate for the lifetime
+            // of a long-lived stream.
+            self.raw.clear();
             return None;
         }
         let event = ServerSentEvent {
@@ -116,15 +120,63 @@ fn next_line_break_index(text: &str) -> Option<usize> {
 }
 
 /// Split the first complete line off `text`, consuming a trailing `\r\n` or
-/// single `\r`/`\n`. Returns `None` when no line boundary is present (so the
-/// caller can buffer more bytes). Mirrors `consumeLine`.
-fn consume_line(text: &str) -> Option<(&str, &str)> {
+/// single `\r`/`\n`. A `\r` at the end of a body chunk is ambiguous: it may be
+/// the first half of `\r\n`, so it stays buffered until the next chunk unless
+/// `allow_trailing_cr` is set for EOF processing. Mirrors `consumeLine` while
+/// preserving line boundaries across HTTP chunks.
+fn consume_line(text: &str, allow_trailing_cr: bool) -> Option<(&str, &str)> {
     let idx = next_line_break_index(text)?;
+    if !allow_trailing_cr && idx + 1 == text.len() && text.as_bytes().get(idx) == Some(&b'\r') {
+        return None;
+    }
     let mut next = idx + 1;
     if text.as_bytes().get(idx) == Some(&b'\r') && text.as_bytes().get(next) == Some(&b'\n') {
         next += 1;
     }
     Some((&text[..idx], &text[next..]))
+}
+
+/// Append one HTTP body chunk to the line buffer using TextDecoder-like UTF-8
+/// handling.  A partial code point is retained for the next chunk, while an
+/// actually malformed sequence is replaced immediately so it cannot pin all
+/// following bytes in `utf8_buffer` until the response ends.
+fn append_utf8_chunk(buffer: &mut String, utf8_buffer: &mut Vec<u8>, chunk: &[u8]) {
+    utf8_buffer.extend_from_slice(chunk);
+
+    loop {
+        match std::str::from_utf8(utf8_buffer) {
+            Ok(text) => {
+                buffer.push_str(text);
+                utf8_buffer.clear();
+                break;
+            }
+            Err(error) => {
+                let valid = error.valid_up_to();
+                if valid > 0 {
+                    // `valid_up_to` always ends at a UTF-8 code-point boundary.
+                    let text = std::str::from_utf8(&utf8_buffer[..valid])
+                        .expect("valid_up_to must identify valid UTF-8");
+                    buffer.push_str(text);
+                    utf8_buffer.drain(..valid);
+                    continue;
+                }
+
+                if let Some(error_len) = error.error_len() {
+                    // Match the replacement behavior of the Web TextDecoder
+                    // used by the reference implementation.  Consume only the
+                    // malformed sequence; valid bytes after it remain usable.
+                    buffer.push('\u{FFFD}');
+                    utf8_buffer.drain(..error_len);
+                    continue;
+                }
+
+                // No error length means the suffix is an incomplete code point.
+                // Keep it until the next HTTP chunk (or the EOF lossily-flushed
+                // tail below).
+                break;
+            }
+        }
+    }
 }
 
 /// Pull-based SSE event stream over a `reqwest` response body. Mirrors the
@@ -139,6 +191,7 @@ pub struct SseEventStream {
     bytes_stream: futures::stream::BoxStream<'static, Result<Bytes, reqwest::Error>>,
     state: SseDecoderState,
     buffer: String,
+    utf8_buffer: Vec<u8>,
     signal: CancellationToken,
     done: bool,
 }
@@ -149,6 +202,7 @@ impl SseEventStream {
             bytes_stream: response.bytes_stream().boxed(),
             state: SseDecoderState::new(),
             buffer: String::new(),
+            utf8_buffer: Vec::new(),
             signal,
             done: false,
         }
@@ -164,7 +218,7 @@ impl SseEventStream {
             let buffer = std::mem::take(&mut self.buffer);
             let mut leftover = buffer;
             let mut produced = None;
-            while let Some((line, rest)) = consume_line(&leftover) {
+            while let Some((line, rest)) = consume_line(&leftover, self.done) {
                 let line_owned = line.to_string();
                 leftover = rest.to_string();
                 if let Some(event) = self.state.decode_line(&line_owned) {
@@ -178,6 +232,11 @@ impl SseEventStream {
             }
 
             if self.done {
+                if !self.utf8_buffer.is_empty() {
+                    self.buffer
+                        .push_str(&String::from_utf8_lossy(&self.utf8_buffer));
+                    self.utf8_buffer.clear();
+                }
                 // Tail flush: the last partial line (no terminator) then the
                 // trailing event. Mirrors the post-loop decode + final flush.
                 let mut buffer = std::mem::take(&mut self.buffer);
@@ -212,13 +271,35 @@ impl SseEventStream {
                     continue;
                 }
                 Some(Err(e)) => {
+                    // A transport error can race cancellation (for example a
+                    // peer closes the socket as the caller aborts). Preserve
+                    // the cancellation contract instead of surfacing a
+                    // misleading SSE/body failure in that case.
+                    if self.signal.is_cancelled() {
+                        return Err(AiError::Abort {
+                            message: "Request was aborted".to_string(),
+                        });
+                    }
+                    let mut source = String::new();
+                    let mut current: &(dyn std::error::Error + 'static) = &e;
+                    while let Some(next) = current.source() {
+                        if !source.is_empty() {
+                            source.push_str("; ");
+                        }
+                        source.push_str(&next.to_string());
+                        current = next;
+                    }
+                    let detail = if source.is_empty() {
+                        e.to_string()
+                    } else {
+                        format!("{} (caused by: {source})", e)
+                    };
                     return Err(AiError::Sse {
-                        message: format!("error reading sse body: {e}"),
+                        message: format!("error reading sse body: {detail}"),
                     });
                 }
                 Some(Ok(chunk)) => {
-                    self.buffer
-                        .push_str(std::str::from_utf8(&chunk).unwrap_or(""));
+                    append_utf8_chunk(&mut self.buffer, &mut self.utf8_buffer, &chunk);
                 }
             }
         }
@@ -403,6 +484,60 @@ mod tests {
     }
 
     #[test]
+    fn keeps_trailing_cr_until_the_next_chunk() {
+        assert!(consume_line("data: value\r", false).is_none());
+
+        let (line, rest) = consume_line("data: value\r\n", false).unwrap();
+        assert_eq!(line, "data: value");
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn eof_consumes_a_standalone_cr_and_flushes_the_last_event() {
+        let mut state = SseDecoderState::new();
+        let mut buffer = "event: message_start\rdata: {}\r".to_string();
+        let mut events = Vec::new();
+        while let Some((line, rest)) = consume_line(&buffer, true) {
+            let line = line.to_string();
+            buffer = rest.to_string();
+            if let Some(event) = state.decode_line(&line) {
+                events.push(event);
+            }
+        }
+        assert!(buffer.is_empty());
+        if let Some(event) = state.flush() {
+            events.push(event);
+        }
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event.as_deref(), Some("message_start"));
+        assert_eq!(events[0].data, "{}");
+    }
+
+    #[test]
+    fn split_utf8_code_point_is_reassembled_across_chunks() {
+        let mut buffer = String::new();
+        let mut pending = Vec::new();
+        append_utf8_chunk(&mut buffer, &mut pending, b"data: \xe4");
+        assert_eq!(buffer, "data: ");
+        assert_eq!(pending, vec![0xe4]);
+
+        append_utf8_chunk(&mut buffer, &mut pending, b"\xb8\xad\n\n");
+        assert_eq!(buffer, "data: \u{4e2d}\n\n");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn malformed_utf8_does_not_block_following_sse_bytes() {
+        let mut buffer = String::new();
+        let mut pending = Vec::new();
+        append_utf8_chunk(&mut buffer, &mut pending, b"data: \xff");
+        append_utf8_chunk(&mut buffer, &mut pending, b"ok\n\n");
+
+        assert_eq!(buffer, "data: \u{fffd}ok\n\n");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
     fn nameless_event_has_none_event_field() {
         let sse = "data: only-data\n\n";
         let events = decode_all(sse);
@@ -480,6 +615,81 @@ mod tests {
             .await
             .expect("cancellation must wake a pending response body read");
         assert!(matches!(result, Err(AiError::Abort { .. })));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn body_decode_error_keeps_underlying_transport_detail() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                      Transfer-Encoding: chunked\r\nConnection: close\r\n\r\nZZ\r\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .unwrap();
+        let mut stream = SseEventStream::new(response, CancellationToken::new());
+        let error = stream.next_event().await.unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("error reading sse body"));
+        assert!(message.contains("error decoding response body"));
+        assert!(message.contains("missing size digit"), "{message}");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn body_timeout_is_reported_with_timeout_detail() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                      Transfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+
+        let response = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(30))
+            .build()
+            .unwrap()
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .unwrap();
+        let mut stream = SseEventStream::new(response, CancellationToken::new());
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next_event())
+            .await
+            .unwrap()
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("error decoding response body"),
+            "{message}"
+        );
+        assert!(message.to_lowercase().contains("timed out"), "{message}");
         server.abort();
     }
 }

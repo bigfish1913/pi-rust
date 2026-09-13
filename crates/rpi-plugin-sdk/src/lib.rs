@@ -778,9 +778,10 @@ pub type RuntimeActionFn = extern "C" fn(
 /// A generic command-handler fn (for `register_command`). `args_json` is a
 /// borrowed `{"args":"...","command":"/..."}` envelope; `out` is owning
 /// JSON output reclaimed with the host `free_string`. The TUI understands
-/// `{kind:"message",text}`, `{kind:"selector",items:[...]}`, and
-/// `{kind:"editor",initialText}` responses; selector/editor submissions call
-/// the same handler with an `action` field in `args`.
+/// `{kind:"message",text}`, `{kind:"selector",items:[...]}`,
+/// `{kind:"editor",initialText}`, and `{kind:"input",title,placeholder}`
+/// responses; selector/editor/input submissions call the same handler with an
+/// `action` field in `args`.
 pub type CommandHandlerFn =
     extern "C" fn(args_json: StbStringRef, out: *mut StbString, user_data: *mut c_void) -> i32;
 

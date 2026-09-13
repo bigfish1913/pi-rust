@@ -23,13 +23,14 @@
 //!   while it is `Some` the key loop routes to it first and restores the editor
 //!   on done/cancel.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::IsTerminal;
-use std::sync::Arc;
+use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 
 use base64::Engine;
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tokio::sync::{broadcast, mpsc};
+use tokio_util::sync::CancellationToken;
 
 use rpi_agent::{AgentEvent, AgentMessage};
 use rpi_ai::types::{AssistantMessage, Content, UserMessage};
@@ -41,11 +42,11 @@ use rpi_tui::strip_ansi;
 use rpi_tui::{
     apply_theme_preset, render_diff, AssistantBlock, AssistantMessageComponent,
     AssistantMessageOptions, AutocompleteManager, AutocompleteSuggestions, BashExecutionComponent,
-    BashTruncation, CombinedAutocompleteProvider, Container, DynamicBorder, Editor, EditorOptions,
-    EditorStyle, FilePathAutocompleteProvider, Focusable, FollowMode, FooterComponent, Loader,
-    ProcessTerminal, ScrollView, ScrollViewOptions, SelectItem, SelectList,
-    SlashCommand as SlashCommandEntry, SlashCommandAutocompleteProvider, Spacer, StackChild,
-    StackEntry, Text, ThemeManager, ThemePreset, ToolExecutionComponent, TuiAltScreen,
+    BashTruncation, CombinedAutocompleteProvider, Component, Container, DynamicBorder, Editor,
+    EditorOptions, EditorStyle, FilePathAutocompleteProvider, Focusable, FollowMode,
+    FooterComponent, Input, Loader, ProcessTerminal, ScrollView, ScrollViewOptions, SelectItem,
+    SelectList, SlashCommand as SlashCommandEntry, SlashCommandAutocompleteProvider, Spacer,
+    StackChild, StackEntry, Text, ThemeManager, ThemePreset, ToolExecutionComponent, TuiAltScreen,
     UserMessageComponent, VStack, TUI,
 };
 use rpi_tui::{bold as tui_bold, theme as current_theme};
@@ -62,6 +63,317 @@ use crate::args::Args;
 /// `rpi-extensions`) builds the closure from the live `RegistrySnapshot` and
 /// hands the trait object to `AssistantMessageComponent::set_markdown_transformer`.
 type MarkdownTransformer = Arc<dyn Fn(&str) -> String + Send + Sync>;
+
+/// A synchronous rendezvous between the Node runtime-request thread and the
+/// blocking TUI key loop. Node's `ctx.ui.*` methods are promises, so the host
+/// request must remain pending while the user interacts with the native
+/// component. The key loop owns opening/closing components; this bridge only
+/// carries JSON results and cancellation state across the threads.
+#[derive(Clone, Default)]
+struct JsDialogBridge {
+    pending: Arc<Mutex<VecDeque<JsDialogPending>>>,
+    active: Arc<Mutex<HashMap<String, JsDialogActive>>>,
+    /// The one dialog currently installed in the TUI input slot. Other
+    /// requests may remain active while a command is waiting, but a cancel
+    /// notification must never close whichever dialog happens to be visible.
+    visible: Arc<Mutex<Option<String>>>,
+    cancelled_before_open: Arc<Mutex<HashSet<String>>>,
+    closed: Arc<Mutex<bool>>,
+}
+
+struct JsDialogPending {
+    request: JsDialogRequest,
+    result: std_mpsc::Sender<serde_json::Value>,
+}
+
+struct JsDialogActive {
+    result: std_mpsc::Sender<serde_json::Value>,
+    cancel_requested: bool,
+}
+
+#[derive(Clone, Debug)]
+struct JsDialogRequest {
+    id: String,
+    method: String,
+    title: String,
+    message: String,
+    options: Vec<String>,
+    placeholder: Option<String>,
+    prefill: Option<String>,
+}
+
+impl JsDialogRequest {
+    fn parse(args: &serde_json::Value) -> Result<Self, String> {
+        let id = args
+            .get("dialogId")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or("ui.dialog missing dialogId")?
+            .to_string();
+        let method = args
+            .get("method")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("ui.dialog missing method")?
+            .to_string();
+        if !matches!(method.as_str(), "select" | "confirm" | "input" | "editor") {
+            return Err(format!("unsupported UI dialog method: {method}"));
+        }
+        let options = args
+            .get("options")
+            .and_then(serde_json::Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Self {
+            id,
+            method,
+            title: args
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            message: args
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            options,
+            placeholder: args
+                .get("placeholder")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned),
+            prefill: args
+                .get("prefill")
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned),
+        })
+    }
+}
+
+impl JsDialogBridge {
+    fn handle_runtime_request(
+        &self,
+        action: &str,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        match action {
+            "ui.dialog" => self.wait_for_dialog(args),
+            "ui.dialog.cancel" => {
+                let id = args
+                    .get("dialogId")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or("ui.dialog.cancel missing dialogId")?;
+                self.cancel(id);
+                Ok(serde_json::json!(true))
+            }
+            _ => Err(format!("unsupported capability: {action}")),
+        }
+    }
+
+    fn wait_for_dialog(&self, args: serde_json::Value) -> Result<serde_json::Value, String> {
+        let request = JsDialogRequest::parse(&args)?;
+        let (sender, receiver) = std_mpsc::channel();
+        // Hold the closed flag while enqueueing. `cancel_all` takes this same
+        // lock before draining pending requests, so shutdown cannot observe
+        // an empty queue and then have this request arrive behind the drain.
+        let _closed = self
+            .closed
+            .lock()
+            .map_err(|_| "JS dialog bridge poisoned")?;
+        if *_closed {
+            return Ok(serde_json::json!({ "cancelled": true }));
+        }
+        let cancelled_before_open = self
+            .cancelled_before_open
+            .lock()
+            .map_err(|_| "JS dialog cancellation state poisoned")?
+            .remove(&request.id);
+        if cancelled_before_open {
+            return Ok(serde_json::json!({ "cancelled": true }));
+        }
+        // Do not hold the cancellation-state lock while taking `pending`:
+        // `take_pending` takes those locks in the opposite order.
+        self.pending
+            .lock()
+            .map_err(|_| "JS dialog pending state poisoned")?
+            .push_back(JsDialogPending {
+                request,
+                result: sender,
+            });
+        drop(_closed);
+        receiver
+            .recv()
+            .map_err(|_| "JS dialog closed before it received an answer".to_string())
+    }
+
+    /// Move one request to the active set. The caller invokes this only when
+    /// the TUI has no other modal occupying the editor slot.
+    fn take_pending(&self) -> Option<JsDialogRequest> {
+        loop {
+            let pending = self.pending.lock().ok()?.pop_front()?;
+            let mut active = self.active.lock().ok()?;
+            // Check cancellation while holding the active lock and insert the
+            // entry in the same critical section. `cancel()` checks `active`
+            // before recording a pre-open cancellation, so it will either see
+            // this entry or leave a marker that we consume here. Checking the
+            // marker before acquiring `active` had a small race where a cancel
+            // could land between the check and insertion and strand the dialog.
+            if self
+                .cancelled_before_open
+                .lock()
+                .ok()?
+                .remove(&pending.request.id)
+            {
+                drop(active);
+                let _ = pending
+                    .result
+                    .send(serde_json::json!({ "cancelled": true }));
+                continue;
+            }
+            active.insert(
+                pending.request.id.clone(),
+                JsDialogActive {
+                    result: pending.result,
+                    cancel_requested: false,
+                },
+            );
+            if let Ok(mut visible) = self.visible.lock() {
+                *visible = Some(pending.request.id.clone());
+            }
+            return Some(pending.request);
+        }
+    }
+
+    fn respond(&self, id: &str, result: serde_json::Value) {
+        if let Ok(mut active) = self.active.lock() {
+            if let Some(entry) = active.remove(id) {
+                let _ = entry.result.send(result);
+            }
+        }
+        if let Ok(mut visible) = self.visible.lock() {
+            if visible.as_deref() == Some(id) {
+                *visible = None;
+            }
+        }
+    }
+
+    fn cancel(&self, id: &str) {
+        if let Ok(mut pending) = self.pending.lock() {
+            if let Some(index) = pending.iter().position(|item| item.request.id == id) {
+                if let Some(item) = pending.remove(index) {
+                    let _ = item.result.send(serde_json::json!({ "cancelled": true }));
+                    return;
+                }
+            }
+        }
+        if let Ok(mut active) = self.active.lock() {
+            if let Some(entry) = active.get_mut(id) {
+                if !entry.cancel_requested {
+                    entry.cancel_requested = true;
+                    let _ = entry.result.send(serde_json::json!({ "cancelled": true }));
+                }
+                return;
+            }
+        }
+        if let Ok(mut cancelled) = self.cancelled_before_open.lock() {
+            cancelled.insert(id.to_string());
+        }
+    }
+
+    fn cancelled_active_ids(&self) -> Vec<String> {
+        self.active
+            .lock()
+            .map(|active| {
+                active
+                    .iter()
+                    .filter_map(|(id, entry)| entry.cancel_requested.then_some(id.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn is_visible(&self, id: &str) -> bool {
+        self.visible
+            .lock()
+            .map(|visible| visible.as_deref() == Some(id))
+            .unwrap_or(false)
+    }
+
+    fn finish(&self, id: &str) {
+        if let Ok(mut active) = self.active.lock() {
+            active.remove(id);
+        }
+        if let Ok(mut visible) = self.visible.lock() {
+            if visible.as_deref() == Some(id) {
+                *visible = None;
+            }
+        }
+    }
+
+    fn cancel_all(&self) {
+        // Keep the closed lock through the queue drains. `wait_for_dialog`
+        // holds it while enqueueing, making the shutdown check + enqueue an
+        // atomic operation with respect to this drain.
+        let Ok(mut closed) = self.closed.lock() else {
+            return;
+        };
+        *closed = true;
+        if let Ok(mut pending) = self.pending.lock() {
+            for item in pending.drain(..) {
+                let _ = item.result.send(serde_json::json!({ "cancelled": true }));
+            }
+        }
+        if let Ok(mut active) = self.active.lock() {
+            for (_, entry) in active.drain() {
+                let _ = entry.result.send(serde_json::json!({ "cancelled": true }));
+            }
+        }
+        if let Ok(mut visible) = self.visible.lock() {
+            *visible = None;
+        }
+        drop(closed);
+    }
+
+    /// Cancel requests owned by one interrupted prompt preparation while
+    /// keeping the bridge available to a replacement Node host.
+    fn cancel_open_requests(&self) {
+        // Keep enqueueing closed until the old host and its preparation
+        // worker have stopped. Otherwise a late runtime request can land just
+        // after the drain and strand its handler thread.
+        let Ok(mut closed) = self.closed.lock() else {
+            return;
+        };
+        *closed = true;
+        if let Ok(mut pending) = self.pending.lock() {
+            for item in pending.drain(..) {
+                let _ = item.result.send(serde_json::json!({ "cancelled": true }));
+            }
+        }
+        if let Ok(mut active) = self.active.lock() {
+            for (_, entry) in active.drain() {
+                let _ = entry.result.send(serde_json::json!({ "cancelled": true }));
+            }
+        }
+        if let Ok(mut visible) = self.visible.lock() {
+            *visible = None;
+        }
+        if let Ok(mut cancelled) = self.cancelled_before_open.lock() {
+            cancelled.clear();
+        }
+        drop(closed);
+    }
+
+    fn reopen(&self) {
+        if let Ok(mut closed) = self.closed.lock() {
+            *closed = false;
+        }
+    }
+}
 
 /// B5e: build the `AssistantMessageComponent` markdown-transformer closure the
 /// render path applies to raw assistant text before styling. Wraps any plugin
@@ -216,6 +528,10 @@ struct CommandContext {
     /// this owned string instead. Semantically unchanged from pre-refactor.
     lane_model_id: String,
     cwd: std::path::PathBuf,
+    /// Package resources resolved at startup. An empty set means Pi package
+    /// loading was not explicitly enabled and must remain disabled for all
+    /// interactive theme selectors.
+    package_resources: Arc<crate::packages::PackageResources>,
     /// Harness resources snapshot (skills + prompt templates) for `/context`.
     /// Captured once at TUI startup because the blocking submit thread can't
     /// `.await get_resources()`.
@@ -336,33 +652,169 @@ fn dispatch_slash(text: &str, ctx: &CommandContext, registry: &CommandRegistry) 
     }
 }
 
+/// Encode a crossterm key into the raw key data consumed by the Node TUI
+/// compatibility layer. Plain keys retain the usual terminal sequences;
+/// modified functional keys use Kitty CSI-u so Shift/Alt/Ctrl combinations are
+/// not collapsed into their unmodified equivalent (notably Shift+Enter).
 fn key_event_to_input(key: crossterm::event::KeyEvent) -> String {
     use crossterm::event::{KeyCode, KeyModifiers};
-    if key.modifiers.contains(KeyModifiers::CONTROL) {
+
+    let modifiers = key.modifiers;
+    let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+    let shift = modifiers.contains(KeyModifiers::SHIFT);
+    let alt = modifiers.contains(KeyModifiers::ALT);
+    let super_key = modifiers.contains(KeyModifiers::SUPER);
+
+    if modifiers == KeyModifiers::NONE {
+        return match key.code {
+            KeyCode::Char(ch) => ch.to_string(),
+            KeyCode::Enter => "\r".into(),
+            KeyCode::Esc => "\x1b".into(),
+            KeyCode::Backspace => "\x7f".into(),
+            KeyCode::Tab => "\t".into(),
+            // Crossterm represents Shift+Tab as `BackTab` on both Unix
+            // (`ESC[Z`) and Windows. Preserve the canonical terminal form
+            // so the Node keybinding matcher sees `shift+tab`.
+            KeyCode::BackTab => "\x1b[Z".into(),
+            KeyCode::Up => "\x1b[A".into(),
+            KeyCode::Down => "\x1b[B".into(),
+            KeyCode::Right => "\x1b[C".into(),
+            KeyCode::Left => "\x1b[D".into(),
+            KeyCode::Home => "\x1b[H".into(),
+            KeyCode::End => "\x1b[F".into(),
+            KeyCode::PageUp => "\x1b[5~".into(),
+            KeyCode::PageDown => "\x1b[6~".into(),
+            KeyCode::Delete => "\x1b[3~".into(),
+            KeyCode::Insert => "\x1b[2~".into(),
+            KeyCode::F(n) => format!("\x1b[{}~", 10 + n as u16),
+            _ => String::new(),
+        };
+    }
+
+    // Legacy control bytes are what the native `matchesKey` implementation
+    // expects for the common Ctrl+letter actions (Ctrl+C, Ctrl+O, Ctrl+J...).
+    if ctrl && !shift && !alt && !super_key {
         if let KeyCode::Char(ch) = key.code {
-            let code = (ch.to_ascii_lowercase() as u8) & 0x1f;
-            return char::from(code).to_string();
+            if let Some(code) = control_code(ch) {
+                return char::from(code).to_string();
+            }
         }
     }
-    match key.code {
-        KeyCode::Char(ch) => ch.to_string(),
-        KeyCode::Enter => "\r".into(),
-        KeyCode::Esc => "\x1b".into(),
-        KeyCode::Backspace => "\x7f".into(),
-        KeyCode::Tab => "\t".into(),
-        KeyCode::Up => "\x1b[A".into(),
-        KeyCode::Down => "\x1b[B".into(),
-        KeyCode::Right => "\x1b[C".into(),
-        KeyCode::Left => "\x1b[D".into(),
-        KeyCode::Home => "\x1b[H".into(),
-        KeyCode::End => "\x1b[F".into(),
-        KeyCode::PageUp => "\x1b[5~".into(),
-        KeyCode::PageDown => "\x1b[6~".into(),
-        KeyCode::Delete => "\x1b[3~".into(),
-        KeyCode::Insert => "\x1b[2~".into(),
-        KeyCode::F(n) => format!("\x1b[{}~", 10 + n as u16),
-        _ => String::new(),
+
+    // Legacy Alt+character input is unambiguous when no other modifier is
+    // present and is accepted by pi's `matchesKey` fallback parser.
+    if alt && !ctrl && !shift && !super_key {
+        if let KeyCode::Char(ch) = key.code {
+            return format!("\x1b{ch}");
+        }
     }
+
+    // Crossterm has already resolved the keyboard layout for character events
+    // (for example, Windows reports Shift+1 as `Char('!')`). Pass that actual
+    // character through unchanged so custom components receive text instead
+    // of a CSI-u escape sequence. Functional keys and combined modifiers use
+    // CSI-u below so their modifier identity remains available to keybindings.
+    if shift && !ctrl && !alt && !super_key {
+        if let KeyCode::Char(ch) = key.code {
+            return ch.to_string();
+        }
+    }
+
+    if let Some(sequence) = modified_functional_sequence(key.code, modifiers) {
+        return sequence;
+    }
+    let Some(codepoint) = key_codepoint(key.code, ctrl) else {
+        return String::new();
+    };
+    kitty_key_sequence(codepoint, modifiers)
+}
+
+fn control_code(ch: char) -> Option<u8> {
+    let ch = ch.to_ascii_lowercase();
+    Some(match ch {
+        '@' | ' ' => 0,
+        'a'..='z' => (ch as u8) & 0x1f,
+        '[' => 0x1b,
+        '\\' => 0x1c,
+        ']' => 0x1d,
+        '^' => 0x1e,
+        '_' | '-' => 0x1f,
+        _ => return None,
+    })
+}
+
+fn key_codepoint(code: crossterm::event::KeyCode, ctrl: bool) -> Option<u32> {
+    use crossterm::event::KeyCode;
+    Some(match code {
+        KeyCode::Char(ch) => {
+            if ctrl {
+                ch.to_ascii_lowercase() as u32
+            } else {
+                ch as u32
+            }
+        }
+        KeyCode::Enter => 13,
+        KeyCode::Esc => 27,
+        KeyCode::Backspace => 127,
+        KeyCode::Tab => 9,
+        // Keep modified BackTab combinations representable through CSI-u;
+        // the unmodified/SHIFT form is handled as the legacy `ESC[Z` above.
+        KeyCode::BackTab => 9,
+        _ => return None,
+    })
+}
+
+fn modified_functional_sequence(
+    code: crossterm::event::KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+) -> Option<String> {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    // `BackTab` is already a semantic Shift+Tab event. Crossterm normally
+    // includes SHIFT in its modifier bits, but preserving the legacy sequence
+    // for a synthetic event without that bit keeps the adapter portable.
+    if code == KeyCode::BackTab
+        && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+    {
+        return Some("\x1b[Z".into());
+    }
+    let modifier = kitty_modifier(modifiers);
+    let sequence = match code {
+        KeyCode::Up => format!("\x1b[1;{modifier}A"),
+        KeyCode::Down => format!("\x1b[1;{modifier}B"),
+        KeyCode::Right => format!("\x1b[1;{modifier}C"),
+        KeyCode::Left => format!("\x1b[1;{modifier}D"),
+        KeyCode::Home => format!("\x1b[1;{modifier}H"),
+        KeyCode::End => format!("\x1b[1;{modifier}F"),
+        KeyCode::Insert => format!("\x1b[2;{modifier}~"),
+        KeyCode::Delete => format!("\x1b[3;{modifier}~"),
+        KeyCode::PageUp => format!("\x1b[5;{modifier}~"),
+        KeyCode::PageDown => format!("\x1b[6;{modifier}~"),
+        _ => return None,
+    };
+    Some(sequence)
+}
+
+fn kitty_modifier(modifiers: crossterm::event::KeyModifiers) -> u8 {
+    use crossterm::event::KeyModifiers;
+    let mut modifier = 1u8;
+    if modifiers.contains(KeyModifiers::SHIFT) {
+        modifier += 1;
+    }
+    if modifiers.contains(KeyModifiers::ALT) {
+        modifier += 2;
+    }
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        modifier += 4;
+    }
+    if modifiers.contains(KeyModifiers::SUPER) {
+        modifier += 8;
+    }
+    modifier
+}
+
+fn kitty_key_sequence(codepoint: u32, modifiers: crossterm::event::KeyModifiers) -> String {
+    let modifier = kitty_modifier(modifiers);
+    format!("\x1b[{codepoint};{modifier}u")
 }
 
 /// A slash command registered by a native extension. The command metadata is
@@ -399,15 +851,21 @@ impl SlashCommand for JsExtensionCommand {
         let command = self.name.trim_start_matches('/').to_string();
         let args = args.to_string();
         let ctx = ctx.clone();
+        // The command runs off the key thread. Keep the startup snapshot so a
+        // late editorText result cannot overwrite text typed while the command
+        // was in flight.
+        let initial_editor_text = ctx.editor.get_text();
         tokio::task::spawn_blocking(move || {
             match session.invoke_command_with_context(
                 &command,
                 &args,
-                serde_json::json!({"editorText": ctx.editor.get_text()}),
+                serde_json::json!({"editorText": initial_editor_text}),
             ) {
                 Ok(value) => {
                     if let Some(editor_text) = value.get("editorText").and_then(|v| v.as_str()) {
-                        if editor_text != ctx.editor.get_text() {
+                        if ctx.editor.get_text() == initial_editor_text
+                            && editor_text != initial_editor_text
+                        {
                             let cursor = editor_text.chars().count();
                             ctx.editor.set_text(editor_text);
                             ctx.editor.set_cursor(0, cursor);
@@ -517,6 +975,13 @@ fn handle_extension_ui_result(
         ctx.tui.request_render(false);
         return;
     };
+    // A cancellation continuation may intentionally return JSON null. Native
+    // pi resolves the pending promise with `undefined` and does not add a
+    // visible "null" message to the transcript.
+    if value.is_null() {
+        ctx.tui.request_render(false);
+        return;
+    }
     match value.get("kind").and_then(|v| v.as_str()) {
         Some("message") | None => {
             let fallback = value.to_string();
@@ -532,11 +997,137 @@ fn handle_extension_ui_result(
         }
         Some("selector") => open_extension_selector(ctx, session, command_name, value),
         Some("editor") => open_extension_editor(ctx, session, command_name, value),
+        // Native pi exposes `ctx.ui.input(title, placeholder)` separately
+        // from the multiline editor. Render it as a focused single-line
+        // dialog in the swapped input slot.
+        Some("input") => open_extension_input(ctx, session, command_name, value),
         Some(other) => {
             add_error_message(&ctx.chat, &format!("Unsupported extension UI: {other}"));
             ctx.tui.request_render(false);
         }
     }
+}
+
+/// Render the title used by the native pi extension dialogs.  Keeping it in
+/// the swapped editor container makes the question stay visible while the
+/// extension waits for the answer, instead of adding a transient chat note.
+fn extension_dialog_title(title: &str, bold: bool) -> Arc<Text> {
+    let colors = current_theme().colors;
+    let text = if bold {
+        tui_bold(title)
+    } else {
+        title.to_string()
+    };
+    Arc::new(Text::new(colors.accent.fg(&text), 1, 0))
+}
+
+fn extension_dialog_hint(label: &str) -> Arc<Text> {
+    Arc::new(Text::new(current_theme().colors.muted.fg(label), 1, 0))
+}
+
+/// Take and run the cancellation callback for the active extension dialog.
+/// Taking it before invoking the callback breaks the temporary Arc cycle: the
+/// callback owns the command context so it can process a follow-up result.
+fn run_extension_cancel(state: &Arc<TuiState>) -> bool {
+    let callback = state.active_extension_cancel.lock().unwrap().take();
+    if let Some(callback) = callback {
+        callback();
+        true
+    } else {
+        false
+    }
+}
+
+fn open_extension_input(
+    ctx: &CommandContext,
+    session: crate::session::ExtensionSessionCell,
+    command_name: String,
+    value: serde_json::Value,
+) {
+    let title = value
+        .get("title")
+        .and_then(|v| v.as_str())
+        .filter(|title| !title.is_empty())
+        .unwrap_or("Input");
+    let input = value
+        .get("placeholder")
+        .and_then(|v| v.as_str())
+        .map(Input::with_placeholder)
+        .unwrap_or_default();
+    let input = Arc::new(input);
+    if let Some(initial) = value
+        .get("initialText")
+        .or_else(|| value.get("text"))
+        .and_then(|v| v.as_str())
+    {
+        input.set_value(initial);
+    }
+    input.set_focused(true);
+
+    let frame = Arc::new(Container::new());
+    frame.add_child(Arc::new(DynamicBorder::new()));
+    frame.add_child(Arc::new(Spacer::new(1)));
+    frame.add_child(extension_dialog_title(title, false));
+    frame.add_child(Arc::new(Spacer::new(1)));
+    frame.add_child(input.clone());
+    frame.add_child(Arc::new(Spacer::new(1)));
+    frame.add_child(extension_dialog_hint("Enter submit · Esc/Ctrl+C cancel"));
+    frame.add_child(Arc::new(Spacer::new(1)));
+    frame.add_child(Arc::new(DynamicBorder::new()));
+
+    *ctx.state.active_extension_editor.lock().unwrap() = None;
+    *ctx.state.active_extension_input.lock().unwrap() = Some(input.clone());
+    ctx.editor_container.clear();
+    ctx.editor_container.add_child(frame);
+
+    let state = ctx.state.clone();
+    let ec = ctx.editor_container.clone();
+    let original = ctx.editor.clone();
+    let tui = ctx.tui.clone();
+    let session_submit = session.clone();
+    let command_submit = command_name.clone();
+    let ctx_submit = ctx.clone();
+    input.on_submit(Arc::new(move |text| {
+        let args = serde_json::json!({ "action": "input", "value": text, "text": text });
+        let result = invoke_extension_command(
+            &session_submit,
+            &command_submit,
+            &serde_json::to_string(&args).unwrap_or_default(),
+        );
+        close_extension_editor(&state, &ec, &original, &tui);
+        handle_extension_ui_result(
+            result,
+            &ctx_submit,
+            session_submit.clone(),
+            command_submit.clone(),
+        );
+    }));
+
+    let state_cancel = ctx.state.clone();
+    let ec_cancel = ctx.editor_container.clone();
+    let original_cancel = ctx.editor.clone();
+    let tui_cancel = ctx.tui.clone();
+    let session_cancel = session.clone();
+    let command_cancel = command_name.clone();
+    let ctx_cancel = ctx.clone();
+    *ctx.state.active_extension_cancel.lock().unwrap() = Some(Arc::new(move || {
+        let args = serde_json::json!({ "action": "cancel" });
+        let result = invoke_extension_command(
+            &session_cancel,
+            &command_cancel,
+            &serde_json::to_string(&args).unwrap_or_default(),
+        );
+        close_extension_editor(&state_cancel, &ec_cancel, &original_cancel, &tui_cancel);
+        handle_extension_ui_result(
+            result,
+            &ctx_cancel,
+            session_cancel.clone(),
+            command_cancel.clone(),
+        );
+    }));
+
+    ctx.tui.set_focus(Some(input));
+    ctx.tui.request_render(false);
 }
 
 fn open_extension_selector(
@@ -552,7 +1143,13 @@ fn open_extension_selector(
             items
                 .iter()
                 .filter_map(|item| {
-                    let value = item.get("value")?.as_str()?;
+                    // Native pi's selector accepts `string[]`; the Rust ABI
+                    // also permits `{value,label,description}` objects.
+                    let value = if let Some(value) = item.as_str() {
+                        value
+                    } else {
+                        item.get("value")?.as_str()?
+                    };
                     let label = item.get("label").and_then(|v| v.as_str()).unwrap_or(value);
                     let mut out = SelectItem::new(value, label);
                     if let Some(desc) = item.get("description").and_then(|v| v.as_str()) {
@@ -569,6 +1166,24 @@ fn open_extension_selector(
         return;
     }
     let list = Arc::new(SelectList::new(items, 10));
+    let title = value
+        .get("title")
+        .and_then(|v| v.as_str())
+        .filter(|title| !title.is_empty())
+        .unwrap_or("Select");
+    let frame = Arc::new(Container::new());
+    frame.add_child(Arc::new(DynamicBorder::new()));
+    frame.add_child(Arc::new(Spacer::new(1)));
+    frame.add_child(extension_dialog_title(title, true));
+    frame.add_child(Arc::new(Spacer::new(1)));
+    frame.add_child(list.clone());
+    frame.add_child(Arc::new(Spacer::new(1)));
+    frame.add_child(extension_dialog_hint(
+        "↑↓ navigate · Enter select · Esc/Ctrl+C cancel",
+    ));
+    frame.add_child(Arc::new(Spacer::new(1)));
+    frame.add_child(Arc::new(DynamicBorder::new()));
+
     let state = ctx.state.clone();
     let ec = ctx.editor_container.clone();
     let editor = ctx.editor.clone();
@@ -596,14 +1211,39 @@ fn open_extension_selector(
     let editor_cancel = ctx.editor.clone();
     let tui_cancel = ctx.tui.clone();
     list.on_cancel(Arc::new(move || {
-        close_selector(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
+        if !run_extension_cancel(&state_cancel) {
+            close_selector(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
+        }
     }));
-    open_selector(
+    let state_cancel = ctx.state.clone();
+    let ec_cancel = ctx.editor_container.clone();
+    let editor_cancel = ctx.editor.clone();
+    let tui_cancel = ctx.tui.clone();
+    let session_cancel = session.clone();
+    let command_cancel = command_name.clone();
+    let ctx_cancel = ctx.clone();
+    *ctx.state.active_extension_cancel.lock().unwrap() = Some(Arc::new(move || {
+        let args = serde_json::json!({ "action": "cancel" });
+        let result = invoke_extension_command(
+            &session_cancel,
+            &command_cancel,
+            &serde_json::to_string(&args).unwrap_or_default(),
+        );
+        close_selector(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
+        handle_extension_ui_result(
+            result,
+            &ctx_cancel,
+            session_cancel.clone(),
+            command_cancel.clone(),
+        );
+    }));
+    open_selector_with_view(
         &ctx.state,
         &ctx.editor_container,
         &ctx.editor,
         &ctx.tui,
         list,
+        frame,
         SelectorKind::Extension,
     );
 }
@@ -620,6 +1260,11 @@ fn open_extension_editor(
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
+    let title = value
+        .get("title")
+        .and_then(|v| v.as_str())
+        .filter(|title| !title.is_empty())
+        .unwrap_or("Editor");
     let editor = Arc::new(Editor::new(
         EditorOptions {
             padding_x: 1,
@@ -637,13 +1282,28 @@ fn open_extension_editor(
         Arc::new(rpi_tui::Keybindings::new()),
     ));
     editor.set_focused(true);
+    let frame = Arc::new(Container::new());
+    frame.add_child(Arc::new(DynamicBorder::new()));
+    frame.add_child(Arc::new(Spacer::new(1)));
+    frame.add_child(extension_dialog_title(title, false));
+    frame.add_child(Arc::new(Spacer::new(1)));
+    frame.add_child(editor.clone());
+    frame.add_child(Arc::new(Spacer::new(1)));
+    frame.add_child(extension_dialog_hint(
+        "Enter submit · Shift+Enter newline · Esc/Ctrl+C cancel",
+    ));
+    frame.add_child(Arc::new(Spacer::new(1)));
+    frame.add_child(Arc::new(DynamicBorder::new()));
+
     *ctx.state.active_extension_editor.lock().unwrap() = Some(editor.clone());
+    *ctx.state.active_extension_input.lock().unwrap() = None;
     ctx.editor_container.clear();
-    ctx.editor_container.add_child(editor.clone());
+    ctx.editor_container.add_child(frame);
 
     let state = ctx.state.clone();
     let ec = ctx.editor_container.clone();
     let original = ctx.editor.clone();
+    let tui = ctx.tui.clone();
     let session_submit = session.clone();
     let command_submit = command_name.clone();
     let ctx_submit = ctx.clone();
@@ -654,7 +1314,7 @@ fn open_extension_editor(
             &command_submit,
             &serde_json::to_string(&args).unwrap_or_default(),
         );
-        close_extension_editor(&state, &ec, &original);
+        close_extension_editor(&state, &ec, &original, &tui);
         handle_extension_ui_result(
             result,
             &ctx_submit,
@@ -662,6 +1322,30 @@ fn open_extension_editor(
             command_submit.clone(),
         );
     }));
+
+    let state_cancel = ctx.state.clone();
+    let ec_cancel = ctx.editor_container.clone();
+    let original_cancel = ctx.editor.clone();
+    let tui_cancel = ctx.tui.clone();
+    let session_cancel = session.clone();
+    let command_cancel = command_name.clone();
+    let ctx_cancel = ctx.clone();
+    *ctx.state.active_extension_cancel.lock().unwrap() = Some(Arc::new(move || {
+        let args = serde_json::json!({ "action": "cancel" });
+        let result = invoke_extension_command(
+            &session_cancel,
+            &command_cancel,
+            &serde_json::to_string(&args).unwrap_or_default(),
+        );
+        close_extension_editor(&state_cancel, &ec_cancel, &original_cancel, &tui_cancel);
+        handle_extension_ui_result(
+            result,
+            &ctx_cancel,
+            session_cancel.clone(),
+            command_cancel.clone(),
+        );
+    }));
+
     ctx.tui.set_focus(Some(editor));
     ctx.tui.request_render(false);
 }
@@ -670,11 +1354,274 @@ fn close_extension_editor(
     state: &Arc<TuiState>,
     editor_container: &Arc<Container>,
     editor: &Arc<Editor>,
+    tui: &Arc<TuiAltScreen>,
 ) {
     editor_container.clear();
     editor_container.add_child(editor.clone());
     *state.active_extension_editor.lock().unwrap() = None;
+    *state.active_extension_input.lock().unwrap() = None;
+    *state.active_extension_cancel.lock().unwrap() = None;
     editor.set_focused(true);
+    tui.set_focus(Some(editor.clone()));
+    tui.request_render(false);
+}
+
+/// Open one Node `ctx.ui.*` request in the native editor slot. The Node host
+/// waits on the runtime response while these callbacks resolve the bridge on
+/// Enter, selection, or cancellation.
+fn open_js_dialog(ctx: &CommandContext, bridge: Arc<JsDialogBridge>, request: JsDialogRequest) {
+    match request.method.as_str() {
+        "select" => open_js_selector(ctx, bridge, request, false),
+        "confirm" => open_js_selector(ctx, bridge, request, true),
+        "input" => open_js_input(ctx, bridge, request),
+        "editor" => open_js_editor(ctx, bridge, request),
+        _ => {
+            bridge.respond(&request.id, serde_json::json!({ "cancelled": true }));
+        }
+    }
+}
+
+fn open_js_selector(
+    ctx: &CommandContext,
+    bridge: Arc<JsDialogBridge>,
+    request: JsDialogRequest,
+    confirm: bool,
+) {
+    let values = if confirm {
+        vec!["Yes".to_string(), "No".to_string()]
+    } else {
+        request.options.clone()
+    };
+    if values.is_empty() {
+        bridge.respond(&request.id, serde_json::json!({ "cancelled": true }));
+        return;
+    }
+    let items = values
+        .iter()
+        .map(|value| SelectItem::new(value, value))
+        .collect::<Vec<_>>();
+    let list = Arc::new(SelectList::new(items, 10));
+    let frame = Arc::new(Container::new());
+    frame.add_child(Arc::new(DynamicBorder::new()));
+    frame.add_child(Arc::new(Spacer::new(1)));
+    frame.add_child(extension_dialog_title(
+        if request.title.is_empty() {
+            if confirm {
+                "Confirm"
+            } else {
+                "Select"
+            }
+        } else {
+            request.title.as_str()
+        },
+        true,
+    ));
+    if !request.message.is_empty() {
+        frame.add_child(Arc::new(Spacer::new(1)));
+        frame.add_child(Arc::new(Text::new(request.message.clone(), 1, 0)));
+    }
+    frame.add_child(Arc::new(Spacer::new(1)));
+    frame.add_child(list.clone());
+    frame.add_child(Arc::new(Spacer::new(1)));
+    frame.add_child(extension_dialog_hint(
+        "↑↓ navigate · Enter select · Esc/Ctrl+C cancel",
+    ));
+    frame.add_child(Arc::new(Spacer::new(1)));
+    frame.add_child(Arc::new(DynamicBorder::new()));
+
+    let id = request.id.clone();
+    let bridge_select = bridge.clone();
+    let state_select = ctx.state.clone();
+    let ec_select = ctx.editor_container.clone();
+    let editor_select = ctx.editor.clone();
+    let tui_select = ctx.tui.clone();
+    list.on_select(Arc::new(move |item| {
+        let result = if confirm {
+            serde_json::json!({ "confirmed": item.value == "Yes" })
+        } else {
+            serde_json::json!({ "value": item.value })
+        };
+        bridge_select.respond(&id, result);
+        close_selector(&state_select, &ec_select, &editor_select, &tui_select);
+    }));
+
+    let id_cancel = request.id.clone();
+    let bridge_cancel = bridge.clone();
+    let state_cancel = ctx.state.clone();
+    let ec_cancel = ctx.editor_container.clone();
+    let editor_cancel = ctx.editor.clone();
+    let tui_cancel = ctx.tui.clone();
+    list.on_cancel(Arc::new(move || {
+        bridge_cancel.respond(&id_cancel, serde_json::json!({ "cancelled": true }));
+        close_selector(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
+    }));
+
+    let id_abort = request.id.clone();
+    let bridge_abort = bridge.clone();
+    let state_abort = ctx.state.clone();
+    let ec_abort = ctx.editor_container.clone();
+    let editor_abort = ctx.editor.clone();
+    let tui_abort = ctx.tui.clone();
+    *ctx.state.active_extension_cancel.lock().unwrap() = Some(Arc::new(move || {
+        bridge_abort.respond(&id_abort, serde_json::json!({ "cancelled": true }));
+        close_selector(&state_abort, &ec_abort, &editor_abort, &tui_abort);
+    }));
+
+    open_selector_with_view(
+        &ctx.state,
+        &ctx.editor_container,
+        &ctx.editor,
+        &ctx.tui,
+        list,
+        frame,
+        SelectorKind::Extension,
+    );
+}
+
+fn open_js_input(ctx: &CommandContext, bridge: Arc<JsDialogBridge>, request: JsDialogRequest) {
+    let input = request
+        .placeholder
+        .as_deref()
+        .map(Input::with_placeholder)
+        .unwrap_or_default();
+    let input = Arc::new(input);
+    input.set_focused(true);
+
+    let frame = Arc::new(Container::new());
+    frame.add_child(Arc::new(DynamicBorder::new()));
+    frame.add_child(Arc::new(Spacer::new(1)));
+    frame.add_child(extension_dialog_title(
+        if request.title.is_empty() {
+            "Input"
+        } else {
+            &request.title
+        },
+        false,
+    ));
+    frame.add_child(Arc::new(Spacer::new(1)));
+    frame.add_child(input.clone());
+    frame.add_child(Arc::new(Spacer::new(1)));
+    frame.add_child(extension_dialog_hint("Enter submit · Esc/Ctrl+C cancel"));
+    frame.add_child(Arc::new(Spacer::new(1)));
+    frame.add_child(Arc::new(DynamicBorder::new()));
+
+    *ctx.state.active_extension_editor.lock().unwrap() = None;
+    *ctx.state.active_extension_input.lock().unwrap() = Some(input.clone());
+    ctx.editor_container.clear();
+    ctx.editor_container.add_child(frame);
+
+    let id = request.id.clone();
+    let bridge_submit = bridge.clone();
+    let state_submit = ctx.state.clone();
+    let ec_submit = ctx.editor_container.clone();
+    let editor_submit = ctx.editor.clone();
+    let tui_submit = ctx.tui.clone();
+    input.on_submit(Arc::new(move |value| {
+        bridge_submit.respond(&id, serde_json::json!({ "value": value }));
+        close_extension_editor(&state_submit, &ec_submit, &editor_submit, &tui_submit);
+    }));
+
+    let id_cancel = request.id.clone();
+    let bridge_cancel = bridge.clone();
+    let state_cancel = ctx.state.clone();
+    let ec_cancel = ctx.editor_container.clone();
+    let editor_cancel = ctx.editor.clone();
+    let tui_cancel = ctx.tui.clone();
+    *ctx.state.active_extension_cancel.lock().unwrap() = Some(Arc::new(move || {
+        bridge_cancel.respond(&id_cancel, serde_json::json!({ "cancelled": true }));
+        close_extension_editor(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
+    }));
+    ctx.tui.set_focus(Some(input));
+    ctx.tui.request_render(false);
+}
+
+fn open_js_editor(ctx: &CommandContext, bridge: Arc<JsDialogBridge>, request: JsDialogRequest) {
+    let editor = Arc::new(Editor::new(
+        EditorOptions {
+            padding_x: 1,
+            autocomplete_max_visible: 0,
+            initial_text: request.prefill.clone(),
+            ..Default::default()
+        },
+        EditorStyle {
+            prompt: "> ".to_string(),
+            placeholder: String::new(),
+        },
+        Arc::new(rpi_tui::Keybindings::new()),
+    ));
+    editor.set_focused(true);
+
+    let frame = Arc::new(Container::new());
+    frame.add_child(Arc::new(DynamicBorder::new()));
+    frame.add_child(Arc::new(Spacer::new(1)));
+    frame.add_child(extension_dialog_title(
+        if request.title.is_empty() {
+            "Editor"
+        } else {
+            &request.title
+        },
+        false,
+    ));
+    frame.add_child(Arc::new(Spacer::new(1)));
+    frame.add_child(editor.clone());
+    frame.add_child(Arc::new(Spacer::new(1)));
+    frame.add_child(extension_dialog_hint(
+        "Enter submit · Shift+Enter newline · Esc/Ctrl+C cancel",
+    ));
+    frame.add_child(Arc::new(Spacer::new(1)));
+    frame.add_child(Arc::new(DynamicBorder::new()));
+
+    *ctx.state.active_extension_editor.lock().unwrap() = Some(editor.clone());
+    *ctx.state.active_extension_input.lock().unwrap() = None;
+    ctx.editor_container.clear();
+    ctx.editor_container.add_child(frame);
+
+    let id = request.id.clone();
+    let bridge_submit = bridge.clone();
+    let state_submit = ctx.state.clone();
+    let ec_submit = ctx.editor_container.clone();
+    let editor_submit = ctx.editor.clone();
+    let tui_submit = ctx.tui.clone();
+    editor.on_submit(Arc::new(move |value| {
+        bridge_submit.respond(&id, serde_json::json!({ "value": value }));
+        close_extension_editor(&state_submit, &ec_submit, &editor_submit, &tui_submit);
+    }));
+
+    let id_cancel = request.id.clone();
+    let bridge_cancel = bridge.clone();
+    let state_cancel = ctx.state.clone();
+    let ec_cancel = ctx.editor_container.clone();
+    let editor_cancel = ctx.editor.clone();
+    let tui_cancel = ctx.tui.clone();
+    *ctx.state.active_extension_cancel.lock().unwrap() = Some(Arc::new(move || {
+        bridge_cancel.respond(&id_cancel, serde_json::json!({ "cancelled": true }));
+        close_extension_editor(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
+    }));
+    ctx.tui.set_focus(Some(editor));
+    ctx.tui.request_render(false);
+}
+
+fn cancel_js_dialog_ui(ctx: &CommandContext, bridge: &Arc<JsDialogBridge>) {
+    for id in bridge.cancelled_active_ids() {
+        // Several commands can ask for a dialog concurrently. Only the id
+        // currently occupying the TUI slot may close the visible component;
+        // an older cancellation must leave a newer ask dialog untouched.
+        if !bridge.is_visible(&id) {
+            bridge.finish(&id);
+            continue;
+        }
+        if let Some((selector, _)) = ctx.state.active_selector.lock().unwrap().clone() {
+            selector.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        } else if ctx.state.extension_dialog_open() {
+            if !run_extension_cancel(&ctx.state) {
+                close_extension_editor(&ctx.state, &ctx.editor_container, &ctx.editor, &ctx.tui);
+            }
+        }
+        // `respond` normally removes the active entry from the callback. The
+        // fallback path above can run before a callback was installed, so
+        // always discard the id after routing the cancellation.
+        bridge.finish(&id);
+    }
 }
 
 // ---- Built-in command implementations ----
@@ -732,6 +1679,7 @@ impl SlashCommand for ExitCommand {
         "Exit the application"
     }
     fn execute(&self, ctx: &CommandContext, _args: &str) {
+        ctx.state.cancel_js_preparation();
         let _ = ctx.tx.send(TuiMessage::Exit);
     }
 }
@@ -964,7 +1912,13 @@ impl SlashCommand for ThemeCommand {
             ctx.tui.render_now(true);
             return;
         }
-        open_theme_selector(&ctx.state, &ctx.editor_container, &ctx.editor, &ctx.tui);
+        open_theme_selector(
+            &ctx.state,
+            &ctx.editor_container,
+            &ctx.editor,
+            &ctx.tui,
+            &ctx.package_resources,
+        );
     }
 }
 
@@ -1200,6 +2154,7 @@ impl SlashCommand for SettingsCommand {
             &ctx.model_catalog,
             &ctx.lane_model_id,
             &ctx.chat,
+            &ctx.package_resources,
         );
     }
 }
@@ -1540,6 +2495,7 @@ fn open_settings_selector(
     catalog: &[rpi_ai::Model],
     lane_model_id: &str,
     chat: &Arc<Container>,
+    package_resources: &Arc<crate::packages::PackageResources>,
 ) {
     let settings = crate::settings::load_settings().unwrap_or_default();
     let mut items: Vec<SelectItem> = Vec::new();
@@ -1579,13 +2535,19 @@ fn open_settings_selector(
     let chat_sel = chat.clone();
     let catalog_sel = catalog.to_vec();
     let lane_model_sel = lane_model_id.to_string();
+    let package_resources_sel = package_resources.clone();
     list.on_select(Arc::new(move |item| {
         // Swap this menu for the sub-selector; each sub-selector saves its
         // choice to settings.json on select.
         match item.value.as_str() {
-            "theme" => {
-                open_settings_theme_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel, &chat_sel)
-            }
+            "theme" => open_settings_theme_selector(
+                &state_sel,
+                &ec_sel,
+                &editor_sel,
+                &tui_sel,
+                &chat_sel,
+                &package_resources_sel,
+            ),
             "model" => open_settings_model_selector(
                 &state_sel,
                 &ec_sel,
@@ -1642,17 +2604,16 @@ fn open_settings_theme_selector(
     editor: &Arc<Editor>,
     tui: &Arc<TuiAltScreen>,
     chat: &Arc<Container>,
+    package_resources: &Arc<crate::packages::PackageResources>,
 ) {
     let mut items = vec![
         SelectItem::new("dark", "Dark").with_description("Default dark theme"),
         SelectItem::new("light", "Light").with_description("Light background"),
         SelectItem::new("monochrome", "Monochrome").with_description("No color accents"),
     ];
-    if let Ok(cwd) = std::env::current_dir() {
-        for path in crate::packages::discover_from_settings(&cwd).theme_files() {
-            if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
-                items.push(SelectItem::new(name, name).with_description("Package theme"));
-            }
+    for path in package_resources.theme_files() {
+        if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
+            items.push(SelectItem::new(name, name).with_description("Package theme"));
         }
     }
     let list = Arc::new(SelectList::new(items, 10));
@@ -1662,6 +2623,7 @@ fn open_settings_theme_selector(
     let editor_sel = editor.clone();
     let tui_sel = tui.clone();
     let chat_sel = chat.clone();
+    let package_resources_sel = package_resources.clone();
     list.on_select(Arc::new(move |item| {
         let preset = match item.value.as_str() {
             "light" => Some(ThemePreset::Light),
@@ -1669,7 +2631,11 @@ fn open_settings_theme_selector(
             "dark" => Some(ThemePreset::Dark),
             name => {
                 if let Ok(cwd) = std::env::current_dir() {
-                    if let Ok(custom) = crate::packages::load_theme(&cwd, name) {
+                    if let Ok(custom) = crate::packages::load_theme_with_resources(
+                        &cwd,
+                        name,
+                        &package_resources_sel,
+                    ) {
                         rpi_tui::global_theme_manager().set(custom.clone());
                         state_sel.theme_manager.set(custom);
                     }
@@ -2693,6 +3659,10 @@ struct TuiState {
     last_tool_comp: std::sync::Mutex<Option<Arc<ToolExecutionComponent>>>,
     /// Run status for the status indicator + interrupt routing.
     status: std::sync::Mutex<RunStatus>,
+    /// Cancellation signal for the short phase that starts the persistent JS
+    /// host and runs `before_agent_start`. The key thread can trigger this
+    /// directly while the async message loop is awaiting the blocking worker.
+    js_preparation_cancel: std::sync::Mutex<Option<CancellationToken>>,
     /// The footer, updated live by the drain task.
     footer: Arc<FooterComponent>,
     /// The status-container (status slot in the dock) — cleared/filled with a
@@ -2711,6 +3681,10 @@ struct TuiState {
     active_selector: std::sync::Mutex<Option<(Arc<SelectList>, SelectorKind)>>,
     /// Extension-provided editor currently occupying the input slot.
     active_extension_editor: std::sync::Mutex<Option<Arc<Editor>>>,
+    /// Single-line input currently occupying the input slot for an extension.
+    active_extension_input: std::sync::Mutex<Option<Arc<Input>>>,
+    /// Callback used to resolve an extension dialog with a cancellation action.
+    active_extension_cancel: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// The autocomplete manager (slash + @file providers) consulted on every
     /// editor keystroke.
     autocomplete: AutocompleteManager,
@@ -2859,6 +3833,33 @@ fn navigate_history(state: &Arc<TuiState>, editor: &Arc<Editor>, direction: i32)
 }
 
 impl TuiState {
+    fn begin_js_preparation(&self) -> CancellationToken {
+        let cancellation = CancellationToken::new();
+        if let Some(previous) = self
+            .js_preparation_cancel
+            .lock()
+            .unwrap()
+            .replace(cancellation.clone())
+        {
+            previous.cancel();
+        }
+        cancellation
+    }
+
+    fn finish_js_preparation(&self) {
+        self.js_preparation_cancel.lock().unwrap().take();
+    }
+
+    fn cancel_js_preparation(&self) -> bool {
+        let cancellation = self.js_preparation_cancel.lock().unwrap().take();
+        if let Some(cancellation) = cancellation {
+            cancellation.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
     fn set_status(&self, status: RunStatus) {
         *self.status.lock().unwrap() = status;
         self.apply_status(status);
@@ -2931,6 +3932,14 @@ impl TuiState {
 
     fn extension_editor_open(&self) -> bool {
         self.active_extension_editor.lock().unwrap().is_some()
+    }
+
+    fn extension_input_open(&self) -> bool {
+        self.active_extension_input.lock().unwrap().is_some()
+    }
+
+    fn extension_dialog_open(&self) -> bool {
+        self.extension_editor_open() || self.extension_input_open()
     }
 
     /// Record a freshly created tool component as the "most recent" so Ctrl+T
@@ -3027,7 +4036,7 @@ pub async fn interactive_tui(
     // Snapshot startup capabilities for the welcome screen. Both accessors
     // return defensive clones, so rendering this summary does not retain a
     // harness lock or trigger a second resource scan.
-    let active_tool_names = lane.get_active_tools().await.unwrap_or_default();
+    let mut active_tool_names = lane.get_active_tools().await.unwrap_or_default();
     let resources_snapshot = harness.get_resources().await.unwrap_or_default();
     let skill_names: Vec<String> = resources_snapshot
         .skills
@@ -3041,6 +4050,7 @@ pub async fn interactive_tui(
     let cwd = std::env::current_dir()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let package_resources = Arc::new(crate::session::package_resources_for(args, &cwd));
 
     // Channel between the key/callback threads and the main async loop.
     let (tx, mut rx) = mpsc::unbounded_channel::<TuiMessage>();
@@ -3057,14 +4067,16 @@ pub async fn interactive_tui(
     } {
         apply_theme_preset(preset);
         theme_manager.apply_preset(preset);
-    } else if let Some(name) = theme {
-        match crate::packages::load_theme(&cwd, name) {
-            Ok(custom) => {
-                rpi_tui::global_theme_manager().set(custom.clone());
-                theme_manager.set(custom);
-            }
-            Err(error) => {
-                eprintln!("warning: could not load package theme `{name}`: {error}");
+    } else {
+        if let Some(name) = theme {
+            match crate::packages::load_theme_with_resources(&cwd, name, &package_resources) {
+                Ok(custom) => {
+                    rpi_tui::global_theme_manager().set(custom.clone());
+                    theme_manager.set(custom);
+                }
+                Err(error) => {
+                    eprintln!("warning: could not load package theme `{name}`: {error}");
+                }
             }
         }
     }
@@ -3072,14 +4084,61 @@ pub async fn interactive_tui(
     // ---- TUI + containers ----
     let terminal = Box::new(ProcessTerminal::new());
     let tui = Arc::new(TuiAltScreen::new(terminal, true, None));
+    let js_dialog_bridge = Arc::new(JsDialogBridge::default());
 
     if let Some(js) = &reload_context.js_extension_session {
         if let Err(error) = js.install_ui_runtime(tui.clone()) {
             eprintln!("warning: could not enable JS custom UI bridge: {error}");
+        } else if let Some(js_active) = js.active_tools() {
+            // Apply the discovery-time JS subset while preserving Rust
+            // built-ins already active in the harness lane. The real TUI
+            // lifecycle reconciliation runs after the key worker starts below.
+            let js_names = js.tool_names();
+            let mut active = lane.get_active_tools().await.unwrap_or_default();
+            active.retain(|name| {
+                crate::session::tool_name_allowed(name, args)
+                    && !js_names.iter().any(|js_name| js_name == name)
+            });
+            active.extend(js_active.into_iter().filter(|name| {
+                js_names.iter().any(|js_name| js_name == name)
+                    && crate::session::tool_name_allowed(name, args)
+            }));
+            active = crate::session::filter_active_tool_names(active, args);
+            let _ = lane.set_active_tools(active).await;
+            active_tool_names = lane.get_active_tools().await.unwrap_or_default();
         }
     }
 
     let chat_container = Arc::new(Container::new());
+    if let Some(js) = &reload_context.js_extension_session {
+        // Tool contexts do not have a command-result envelope. Route
+        // `ctx.ui.notify()` through the live transcript so notifications from
+        // tools such as ask_user_question are visible immediately.
+        let chat_notify = chat_container.clone();
+        let tui_notify = tui.clone();
+        if let Err(error) = js.add_runtime_handler(Arc::new(move |action, args| {
+            if action != "ui.notify" {
+                return Err(format!("unsupported capability: {action}"));
+            }
+            let message = args
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if !message.is_empty() {
+                if args.get("level").and_then(serde_json::Value::as_str) == Some("error") {
+                    add_error_message(&chat_notify, message);
+                } else {
+                    add_note_message(&chat_notify, message);
+                }
+                tui_notify.request_render(false);
+            }
+            Ok(serde_json::json!(true))
+        })) {
+            if args.verbose {
+                eprintln!("warning: could not enable JS notification bridge: {error}");
+            }
+        }
+    }
     add_welcome_message_with_capabilities(&chat_container, &active_tool_names, &skill_names);
 
     // First-launch gate: if `~/.rpi/.setup_done` is absent, show the welcome
@@ -3217,6 +4276,7 @@ pub async fn interactive_tui(
         bash_components: std::sync::Mutex::new(HashMap::new()),
         last_tool_comp: std::sync::Mutex::new(None),
         status: std::sync::Mutex::new(RunStatus::Idle),
+        js_preparation_cancel: std::sync::Mutex::new(None),
         footer: footer.clone(),
         status_container: status_container.clone(),
         chat_container: chat_container.clone(),
@@ -3224,6 +4284,8 @@ pub async fn interactive_tui(
         last_assistant_text: std::sync::Mutex::new(String::new()),
         active_selector: std::sync::Mutex::new(None),
         active_extension_editor: std::sync::Mutex::new(None),
+        active_extension_input: std::sync::Mutex::new(None),
+        active_extension_cancel: std::sync::Mutex::new(None),
         autocomplete,
         autocomplete_container: autocomplete_container.clone(),
         theme_manager,
@@ -3305,9 +4367,20 @@ pub async fn interactive_tui(
         model_catalog: model_catalog_arc.clone(),
         lane_model_id: lane_model_id.clone(),
         cwd: cwd.clone(),
+        package_resources: package_resources.clone(),
         resources: resources_arc.clone(),
         reload_context: Arc::new(reload_context.clone()),
     };
+
+    if let Some(js) = &reload_context.js_extension_session {
+        let bridge = js_dialog_bridge.clone();
+        if let Err(error) = js.install_ui_dialog_runtime(Arc::new(move |action, args| {
+            bridge.handle_runtime_request(action, args)
+        })) {
+            eprintln!("warning: could not enable JS dialog UI bridge: {error}");
+        }
+    }
+
     let ctx_for_cb = ctx.clone();
     let registry_for_cb = registry.clone();
     editor.on_submit(Arc::new(move |text: &str| {
@@ -3446,6 +4519,7 @@ pub async fn interactive_tui(
     let lane_for_key = lane.clone();
     let state_for_key = state.clone();
     let js_for_key = reload_context.js_extension_session.clone();
+    let js_dialog_for_key = js_dialog_bridge.clone();
     // Ctrl+L routes through the same registry as `/model` (one path, not two),
     // so the key loop needs the same `CommandContext` + registry the submit
     // handler uses. All fields are `Arc`/cheap, so this clone is free.
@@ -3457,17 +4531,28 @@ pub async fn interactive_tui(
             if !*running_key.lock().unwrap() {
                 break;
             }
+            if !state_for_key.selector_open()
+                && !state_for_key.extension_dialog_open()
+                && js_for_key.as_ref().map_or(true, |js| !js.custom_active())
+            {
+                if let Some(request) = js_dialog_for_key.take_pending() {
+                    open_js_dialog(&ctx_for_key, js_dialog_for_key.clone(), request);
+                }
+            }
+            cancel_js_dialog_ui(&ctx_for_key, &js_dialog_for_key);
             // `event::read()` blocks indefinitely. Poll first so shutdown can
             // stop and join this worker even when no further key arrives.
             match crossterm::event::poll(std::time::Duration::from_millis(50)) {
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(_) => {
+                    state_for_key.cancel_js_preparation();
                     let _ = tx_for_key.send(TuiMessage::Exit);
                     break;
                 }
             }
             let Ok(ev) = crossterm::event::read() else {
+                state_for_key.cancel_js_preparation();
                 let _ = tx_for_key.send(TuiMessage::Exit);
                 break;
             };
@@ -3480,6 +4565,7 @@ pub async fn interactive_tui(
                 if let Some(js) = &js_for_key {
                     if js.custom_active() {
                         let _ = js.send_custom_resize(_cols as usize, _rows as usize);
+                        tui_for_key.request_render(false);
                     }
                 }
                 continue;
@@ -3517,33 +4603,109 @@ pub async fn interactive_tui(
                 continue;
             }
 
+            // Prompt preparation runs on a blocking worker before the agent
+            // lane owns the turn. Cancel it directly: an abort queued only to
+            // the lane cannot wake a JS factory or lifecycle hook that never
+            // resolves. This check precedes custom/dialog routing because
+            // those components may themselves have been opened by the hook.
+            let prompt_abort = (key.modifiers == KeyModifiers::CONTROL
+                && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d')))
+                || (key.modifiers == KeyModifiers::NONE && key.code == KeyCode::Esc);
+            if prompt_abort && state_for_key.cancel_js_preparation() {
+                state_for_key.set_status(RunStatus::Aborting);
+                if !run_extension_cancel(&state_for_key) && state_for_key.extension_dialog_open() {
+                    close_extension_editor(
+                        &state_for_key,
+                        &ctx_for_key.editor_container,
+                        &editor_for_key,
+                        &tui_for_key,
+                    );
+                }
+                js_dialog_for_key.cancel_open_requests();
+                tui_for_key.set_render_suspended(false);
+                tui_for_key.request_render(false);
+                continue;
+            }
+
             if let Some(js) = &js_for_key {
                 if js.custom_active() {
+                    let visible = js.custom_accepts_input();
                     let data = key_event_to_input(key);
                     if !data.is_empty() {
-                        let _ = js.send_custom_input(&data);
+                        // A visible custom owns the whole key stream, so its
+                        // acknowledgement is unnecessary and would add a
+                        // synchronous round-trip to every keystroke. Hidden
+                        // overlays need the consume result to decide whether the
+                        // outer editor should see the key.
+                        if visible {
+                            let _ = js.send_custom_input(&data);
+                            continue;
+                        }
+                        let consumed = js.send_custom_input_with_consumed(&data).unwrap_or(false);
+                        // A hidden component only keeps raw listeners alive (for
+                        // example ask_user_question's reopen shortcut); an
+                        // unconsumed key continues through the outer editor.
+                        if consumed {
+                            tui_for_key.request_render_reusing_scroll_content();
+                            continue;
+                        }
                     }
-                    continue;
                 }
             }
 
-            if state_for_key.extension_editor_open()
-                && key.modifiers == KeyModifiers::CONTROL
+            // Ctrl+C cancels an open selector before it reaches the global
+            // abort/exit handler. Route through Esc so selector callbacks run.
+            if key.modifiers == KeyModifiers::CONTROL
                 && key.code == KeyCode::Char('c')
+                && state_for_key.selector_open()
             {
-                close_extension_editor(
-                    &state_for_key,
-                    &ctx_for_key.editor_container,
-                    &editor_for_key,
-                );
+                let selector = state_for_key
+                    .active_selector
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .expect("selector_open guaranteed Some")
+                    .0;
+                selector.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+                tui_for_key.request_render_reusing_scroll_content();
+                continue;
+            }
+
+            // Extension dialogs own the input slot while awaiting a result.
+            // Esc and Ctrl+C both resolve the pending command with cancel;
+            // all other keys go to the active native editor/input widget.
+            if state_for_key.extension_dialog_open() {
+                let cancel = key.code == KeyCode::Esc
+                    || (key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c'));
+                if cancel {
+                    if !run_extension_cancel(&state_for_key) {
+                        close_extension_editor(
+                            &state_for_key,
+                            &ctx_for_key.editor_container,
+                            &editor_for_key,
+                            &tui_for_key,
+                        );
+                    }
+                } else if let Some(extension_editor) = state_for_key
+                    .active_extension_editor
+                    .lock()
+                    .unwrap()
+                    .clone()
+                {
+                    extension_editor.handle_key(key);
+                } else if let Some(extension_input) =
+                    state_for_key.active_extension_input.lock().unwrap().clone()
+                {
+                    extension_input.handle_key(key);
+                }
                 tui_for_key.request_render_reusing_scroll_content();
                 continue;
             }
 
             // 0. Ctrl+C: copy the selection when the editor has one (pi
-            //    `tui.input.copy`); otherwise it's the escape hatch — even
-            //    with a selector open (a stuck run or a mis-open selector must
-            //    never trap the user): abort an active run, else exit.
+            //    `tui.input.copy`); otherwise abort an active run, or exit
+            //    when idle. Open selectors and extension dialogs are handled
+            //    above so their cancellation callbacks get first chance.
             if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
                 if !state_for_key.selector_open() && editor_for_key.has_selection() {
                     editor_for_key.copy_selection();
@@ -3596,29 +4758,6 @@ pub async fn interactive_tui(
                     .clone()
                     .expect("selector_open guaranteed Some");
                 selector.handle_key(key);
-                tui_for_key.request_render_reusing_scroll_content();
-                continue;
-            }
-
-            // Extension editor occupies the same input slot as the native
-            // editor. Esc cancels it; every other key is delivered to the
-            // extension-owned editor instance.
-            if state_for_key.extension_editor_open() {
-                let extension_editor = state_for_key
-                    .active_extension_editor
-                    .lock()
-                    .unwrap()
-                    .clone()
-                    .expect("extension_editor_open guaranteed Some");
-                if key.code == KeyCode::Esc {
-                    close_extension_editor(
-                        &state_for_key,
-                        &ctx_for_key.editor_container,
-                        &editor_for_key,
-                    );
-                } else {
-                    extension_editor.handle_key(key);
-                }
                 tui_for_key.request_render_reusing_scroll_content();
                 continue;
             }
@@ -3827,7 +4966,17 @@ pub async fn interactive_tui(
         }
         add_user_message(&chat_container, &prompt);
         tui.request_render(false);
-        run_prompt_streaming(&lane, &prompt, &tui, &state, drain_handle.is_some()).await;
+        run_prompt_streaming(
+            &lane,
+            &prompt,
+            &tui,
+            &state,
+            drain_handle.is_some(),
+            reload_context.js_extension_session.as_ref(),
+            &js_dialog_bridge,
+            args,
+        )
+        .await;
     }
 
     // ---- Main loop: process submitted input + lifecycle messages ----
@@ -3842,7 +4991,17 @@ pub async fn interactive_tui(
                 // editor state safely there; clearing here, on the async loop,
                 // keeps it on one thread).
                 editor.clear();
-                run_prompt_streaming(&lane, &prompt, &tui, &state, drain_handle.is_some()).await;
+                run_prompt_streaming(
+                    &lane,
+                    &prompt,
+                    &tui,
+                    &state,
+                    drain_handle.is_some(),
+                    reload_context.js_extension_session.as_ref(),
+                    &js_dialog_bridge,
+                    args,
+                )
+                .await;
             }
             Some(TuiMessage::OpenTree) => {
                 if *state.status.lock().unwrap() != RunStatus::Idle {
@@ -3989,7 +5148,16 @@ pub async fn interactive_tui(
     }
 
     // ---- Shutdown ----
+    // Wake any Node `ctx.ui.*` request that is still waiting on the dialog
+    // bridge before joining the key worker and restoring the terminal.
+    js_dialog_bridge.cancel_all();
     *running.lock().unwrap() = false;
+    // A hidden custom input listener can leave the key worker blocked on a
+    // synchronous Node response. Stop the host first so transport shutdown
+    // wakes that request before we join the worker.
+    if let Some(js) = &reload_context.js_extension_session {
+        js.shutdown();
+    }
     // The input worker checks `running` at least every 50ms. Join it before
     // restoring cooked mode so no late event read races terminal cleanup.
     let _ = key_handle.await;
@@ -4013,6 +5181,85 @@ pub async fn interactive_tui(
 // Run a single prompt (streaming or blocking)
 // ===========================================================================
 
+/// Prepare the session's persistent Node host immediately before a real prompt
+/// enters the agent loop. The first call starts the lazy host; later calls run
+/// `before_agent_start` again on that host so each prompt sees current state.
+/// Keeping startup here leaves an idle TUI free of a Node child while still
+/// giving the lifecycle hook the fully installed UI bridge.
+async fn ensure_js_runtime_before_prompt(
+    js: Option<&crate::js_extensions::JsExtensionSession>,
+    lane: &Arc<dyn AgentLane>,
+    state: &Arc<TuiState>,
+    dialog_bridge: &JsDialogBridge,
+    args: &Args,
+) -> bool {
+    let Some(js) = js else {
+        return true;
+    };
+    let cancellation = state.begin_js_preparation();
+    let worker_cancellation = cancellation.clone();
+    let js_for_start = js.clone();
+    let mut worker = tokio::task::spawn_blocking(move || {
+        js_for_start.prepare_for_prompt_with_cancellation(&worker_cancellation)
+    });
+    let result = tokio::select! {
+        result = &mut worker => result,
+        _ = cancellation.cancelled() => {
+            dialog_bridge.cancel_open_requests();
+            let js_for_cancel = js.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                js_for_cancel.cancel_prompt_preparation();
+            }).await;
+            worker.await
+        }
+    };
+    let was_cancelled = cancellation.is_cancelled();
+    if was_cancelled {
+        dialog_bridge.cancel_open_requests();
+        let js_for_cancel = js.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            js_for_cancel.cancel_prompt_preparation();
+        })
+        .await;
+        state.finish_js_preparation();
+        dialog_bridge.reopen();
+        return false;
+    }
+    state.finish_js_preparation();
+    match result {
+        Ok(Ok(())) => {
+            // The lifecycle hook can change the JS-only active tool set once
+            // it sees the real TUI context. Merge that subset with the Rust
+            // built-ins while applying the command-line tool policy.
+            if let Some(js_active) = js.active_tools() {
+                let js_names = js.tool_names();
+                let mut active = lane.get_active_tools().await.unwrap_or_default();
+                active.retain(|name| {
+                    crate::session::tool_name_allowed(name, args)
+                        && !js_names.iter().any(|js_name| js_name == name)
+                });
+                active.extend(js_active.into_iter().filter(|name| {
+                    js_names.iter().any(|js_name| js_name == name)
+                        && crate::session::tool_name_allowed(name, args)
+                }));
+                active = crate::session::filter_active_tool_names(active, args);
+                let _ = lane.set_active_tools(active).await;
+            }
+        }
+        Ok(Err(error)) => {
+            if args.verbose {
+                eprintln!("warning: could not start JS extension runtime: {error}");
+            }
+        }
+        Err(error) => {
+            if args.verbose {
+                eprintln!("warning: JS extension runtime worker failed: {error}");
+            }
+        }
+    }
+    true
+}
+
 /// Drive a single prompt through the lane. When `streaming` is true, the
 /// `AgentEvent` drain task renders the response live and this function only
 /// awaits completion (to surface hard errors). When false (no `event_rx`),
@@ -4023,10 +5270,25 @@ async fn run_prompt_streaming(
     tui: &Arc<TuiAltScreen>,
     state: &Arc<TuiState>,
     streaming: bool,
+    js: Option<&crate::js_extensions::JsExtensionSession>,
+    dialog_bridge: &JsDialogBridge,
+    args: &Args,
 ) {
-    // Ensure the run starts in a clean streaming state.
+    // The persistent Node host is intentionally started at the first real
+    // prompt. By this point the TUI key worker and all UI/runtime handlers are
+    // live, so a `before_agent_start` hook may safely open a native dialog. A
+    // session with no prompt never starts Node merely to render its welcome
+    // screen; JS commands/tools still trigger the same lazy ensure path.
+    // Preparation is part of the active turn. Mark it working before Node can
+    // block so Ctrl+C, Ctrl+D, and Esc all retain their documented abort
+    // semantics for initial argv prompts as well as editor submissions.
     state.set_status(RunStatus::Working);
     tui.request_render(false);
+    if !ensure_js_runtime_before_prompt(js, lane, state, dialog_bridge, args).await {
+        state.set_status(RunStatus::Idle);
+        tui.request_render(false);
+        return;
+    }
 
     let outcome = lane.prompt_text(prompt, Vec::new()).await;
 
@@ -4727,12 +5989,37 @@ fn open_selector(
     list: Arc<SelectList>,
     kind: SelectorKind,
 ) {
+    open_selector_with_view(
+        state,
+        editor_container,
+        editor,
+        tui,
+        list.clone(),
+        list,
+        kind,
+    );
+}
+
+/// Open a selector with an optional framed view. Native extension selectors
+/// wrap the list with a title and hint while built-in selectors keep the list
+/// as the complete view.
+fn open_selector_with_view<C: Component + 'static>(
+    state: &Arc<TuiState>,
+    editor_container: &Arc<Container>,
+    editor: &Arc<Editor>,
+    tui: &Arc<TuiAltScreen>,
+    list: Arc<SelectList>,
+    view: Arc<C>,
+    kind: SelectorKind,
+) {
     // Unfocus the editor so its cursor marker doesn't render behind the list.
     editor.set_focused(false);
-    // Swap: clear the container and add just the list.
+    // Swap: clear the container and add the selector view.
     editor_container.clear();
-    editor_container.add_child(list.clone());
+    editor_container.add_child(view.clone());
     *state.active_selector.lock().unwrap() = Some((list, kind));
+    let focused: Arc<dyn Component> = view;
+    tui.set_focus(Some(focused));
     tui.request_render(false);
 }
 
@@ -4748,6 +6035,8 @@ fn close_selector(
     editor_container.add_child(editor.clone());
     editor.set_focused(true);
     *state.active_selector.lock().unwrap() = None;
+    *state.active_extension_cancel.lock().unwrap() = None;
+    tui.set_focus(Some(editor.clone()));
     tui.request_render(false);
 }
 
@@ -5025,17 +6314,16 @@ fn open_theme_selector(
     editor_container: &Arc<Container>,
     editor: &Arc<Editor>,
     tui: &Arc<TuiAltScreen>,
+    package_resources: &Arc<crate::packages::PackageResources>,
 ) {
     let mut items = vec![
         SelectItem::new("dark", "Dark").with_description("Default dark theme"),
         SelectItem::new("light", "Light").with_description("Light background"),
         SelectItem::new("monochrome", "Monochrome").with_description("No color accents"),
     ];
-    if let Ok(cwd) = std::env::current_dir() {
-        for path in crate::packages::discover_from_settings(&cwd).theme_files() {
-            if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
-                items.push(SelectItem::new(name, name).with_description("Package theme"));
-            }
+    for path in package_resources.theme_files() {
+        if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
+            items.push(SelectItem::new(name, name).with_description("Package theme"));
         }
     }
     let list = Arc::new(SelectList::new(items, 10));
@@ -5045,6 +6333,7 @@ fn open_theme_selector(
     let editor_sel = editor.clone();
     let tui_sel = tui.clone();
     let chat_sel = state.chat_container.clone();
+    let package_resources_sel = package_resources.clone();
     list.on_select(Arc::new(move |item| {
         let preset = match item.value.as_str() {
             "light" => Some(ThemePreset::Light),
@@ -5052,7 +6341,11 @@ fn open_theme_selector(
             "dark" => Some(ThemePreset::Dark),
             name => {
                 if let Ok(cwd) = std::env::current_dir() {
-                    if let Ok(custom) = crate::packages::load_theme(&cwd, name) {
+                    if let Ok(custom) = crate::packages::load_theme_with_resources(
+                        &cwd,
+                        name,
+                        &package_resources_sel,
+                    ) {
                         rpi_tui::global_theme_manager().set(custom.clone());
                         state_sel.theme_manager.set(custom);
                     }
@@ -5790,6 +7083,75 @@ mod tests {
     }
 
     #[test]
+    fn key_event_encoding_matches_pi_keybinding_protocol() {
+        let key = |code, modifiers| KeyEvent::new(code, modifiers);
+        assert_eq!(
+            key_event_to_input(key(KeyCode::Enter, KeyModifiers::NONE)),
+            "\r"
+        );
+        assert_eq!(
+            key_event_to_input(key(KeyCode::Enter, KeyModifiers::SHIFT)),
+            "\x1b[13;2u"
+        );
+        assert_eq!(
+            key_event_to_input(key(KeyCode::Tab, KeyModifiers::SHIFT)),
+            "\x1b[9;2u"
+        );
+        assert_eq!(
+            key_event_to_input(key(KeyCode::BackTab, KeyModifiers::SHIFT)),
+            "\x1b[Z"
+        );
+        assert_eq!(
+            key_event_to_input(key(KeyCode::BackTab, KeyModifiers::NONE)),
+            "\x1b[Z"
+        );
+        assert_eq!(
+            key_event_to_input(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            "\x03"
+        );
+        assert_eq!(
+            key_event_to_input(key(KeyCode::Char('o'), KeyModifiers::CONTROL)),
+            "\x0f"
+        );
+        assert_eq!(
+            key_event_to_input(key(KeyCode::Char('!'), KeyModifiers::SHIFT)),
+            "!"
+        );
+        assert_eq!(
+            key_event_to_input(key(KeyCode::Char('1'), KeyModifiers::SHIFT)),
+            "1"
+        );
+    }
+
+    #[test]
+    fn dialog_cancel_before_open_is_consumed_without_stranding_request() {
+        let bridge = JsDialogBridge::default();
+        let (sender, receiver) = std_mpsc::channel();
+        bridge.pending.lock().unwrap().push_back(JsDialogPending {
+            request: JsDialogRequest {
+                id: "dialog-1".into(),
+                method: "input".into(),
+                title: String::new(),
+                message: String::new(),
+                options: Vec::new(),
+                placeholder: None,
+                prefill: None,
+            },
+            result: sender,
+        });
+
+        // Model the cancellation arriving after the queue entry has been
+        // removed but before the TUI has installed the native widget.
+        bridge.cancel("dialog-1");
+        assert!(bridge.take_pending().is_none());
+        assert_eq!(
+            receiver.recv().unwrap(),
+            serde_json::json!({ "cancelled": true })
+        );
+        assert!(bridge.cancelled_before_open.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn test_layout_renders_welcome_message() {
         let chat = Arc::new(Container::new());
         add_welcome_message(&chat);
@@ -6101,6 +7463,7 @@ mod tests {
             bash_components: std::sync::Mutex::new(HashMap::new()),
             last_tool_comp: std::sync::Mutex::new(None),
             status: std::sync::Mutex::new(RunStatus::Idle),
+            js_preparation_cancel: std::sync::Mutex::new(None),
             footer: Arc::new(FooterComponent::new()),
             status_container: Arc::new(Container::new()),
             chat_container: Arc::new(Container::new()),
@@ -6108,6 +7471,8 @@ mod tests {
             last_assistant_text: std::sync::Mutex::new(String::new()),
             active_selector: std::sync::Mutex::new(None),
             active_extension_editor: std::sync::Mutex::new(None),
+            active_extension_input: std::sync::Mutex::new(None),
+            active_extension_cancel: std::sync::Mutex::new(None),
             autocomplete: AutocompleteManager::new(),
             autocomplete_container: Arc::new(Container::new()),
             theme_manager: Arc::new(ThemeManager::new()),
@@ -6417,6 +7782,7 @@ mod tests {
             bash_components: std::sync::Mutex::new(HashMap::new()),
             last_tool_comp: std::sync::Mutex::new(None),
             status: std::sync::Mutex::new(RunStatus::Idle),
+            js_preparation_cancel: std::sync::Mutex::new(None),
             footer: Arc::new(FooterComponent::new()),
             status_container: Arc::new(Container::new()),
             chat_container: Arc::new(Container::new()),
@@ -6424,6 +7790,8 @@ mod tests {
             last_assistant_text: std::sync::Mutex::new(String::new()),
             active_selector: std::sync::Mutex::new(None),
             active_extension_editor: std::sync::Mutex::new(None),
+            active_extension_input: std::sync::Mutex::new(None),
+            active_extension_cancel: std::sync::Mutex::new(None),
             autocomplete: AutocompleteManager::new(),
             autocomplete_container: Arc::new(Container::new()),
             theme_manager: Arc::new(ThemeManager::new()),
@@ -6477,6 +7845,7 @@ mod tests {
             bash_components: std::sync::Mutex::new(HashMap::new()),
             last_tool_comp: std::sync::Mutex::new(None),
             status: std::sync::Mutex::new(RunStatus::Idle),
+            js_preparation_cancel: std::sync::Mutex::new(None),
             footer: Arc::new(FooterComponent::new()),
             status_container: Arc::new(Container::new()),
             chat_container: Arc::new(Container::new()),
@@ -6484,6 +7853,8 @@ mod tests {
             last_assistant_text: std::sync::Mutex::new(String::new()),
             active_selector: std::sync::Mutex::new(None),
             active_extension_editor: std::sync::Mutex::new(None),
+            active_extension_input: std::sync::Mutex::new(None),
+            active_extension_cancel: std::sync::Mutex::new(None),
             autocomplete: AutocompleteManager::new(),
             autocomplete_container: Arc::new(Container::new()),
             theme_manager: Arc::new(ThemeManager::new()),
@@ -6540,6 +7911,7 @@ mod tests {
             bash_components: std::sync::Mutex::new(HashMap::new()),
             last_tool_comp: std::sync::Mutex::new(None),
             status: std::sync::Mutex::new(RunStatus::Idle),
+            js_preparation_cancel: std::sync::Mutex::new(None),
             footer: Arc::new(FooterComponent::new()),
             status_container: Arc::new(Container::new()),
             chat_container: Arc::new(Container::new()),
@@ -6547,6 +7919,8 @@ mod tests {
             last_assistant_text: std::sync::Mutex::new(String::new()),
             active_selector: std::sync::Mutex::new(None),
             active_extension_editor: std::sync::Mutex::new(None),
+            active_extension_input: std::sync::Mutex::new(None),
+            active_extension_cancel: std::sync::Mutex::new(None),
             autocomplete: AutocompleteManager::new(),
             autocomplete_container: Arc::new(Container::new()),
             theme_manager: Arc::new(ThemeManager::new()),
@@ -6606,6 +7980,7 @@ mod tests {
             bash_components: std::sync::Mutex::new(HashMap::new()),
             last_tool_comp: std::sync::Mutex::new(None),
             status: std::sync::Mutex::new(RunStatus::Idle),
+            js_preparation_cancel: std::sync::Mutex::new(None),
             footer: Arc::new(FooterComponent::new()),
             status_container: Arc::new(Container::new()),
             chat_container: Arc::new(Container::new()),
@@ -6613,6 +7988,8 @@ mod tests {
             last_assistant_text: std::sync::Mutex::new(String::new()),
             active_selector: std::sync::Mutex::new(None),
             active_extension_editor: std::sync::Mutex::new(None),
+            active_extension_input: std::sync::Mutex::new(None),
+            active_extension_cancel: std::sync::Mutex::new(None),
             autocomplete: AutocompleteManager::new(),
             autocomplete_container: Arc::new(Container::new()),
             theme_manager: Arc::new(ThemeManager::new()),

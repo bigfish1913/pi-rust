@@ -257,7 +257,16 @@ async fn run_anthropic_stream(
                     let code = status.as_u16();
                     // Read the error body for a diagnostic message; the retry
                     // predicate only needs the status code.
-                    let text = resp.text().await.unwrap_or_default();
+                    let text = tokio::select! {
+                        biased;
+                        _ = signal.cancelled() => return Err(AiError::Abort {
+                            message: "Request aborted".to_string(),
+                        }),
+                        result = resp.text() => result.map_err(|error| AiError::Http {
+                            status: Some(code),
+                            message: format!("error reading HTTP error body: {error}"),
+                        })?,
+                    };
                     return Err(AiError::Http {
                         status: Some(code),
                         message: text,
@@ -283,15 +292,20 @@ async fn run_anthropic_stream(
     };
 
     if non_stream {
-        let response_body = match response.text().await {
+        let response_body = match tokio::select! {
+            biased;
+            _ = opts.signal.cancelled() => Err(AiError::Abort {
+                message: "Request aborted".to_string(),
+            }),
+            result = response.text() => result.map_err(|error| AiError::Http {
+                status: None,
+                message: format!("failed to read non-stream response: {error}"),
+            }),
+        } {
             Ok(body) => body,
             Err(error) => {
-                emit_terminal_error(
-                    prod,
-                    &mut state,
-                    format!("failed to read non-stream response: {error}"),
-                    false,
-                );
+                let aborted = error.is_abort();
+                emit_terminal_error(prod, &mut state, error.to_string(), aborted);
                 return;
             }
         };

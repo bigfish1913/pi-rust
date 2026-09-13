@@ -98,6 +98,11 @@ pub struct OpenaiResponsesCompat {
     pub supports_developer_role: Option<bool>,
     pub supports_long_cache_retention: Option<bool>,
     pub supports_strict_mode: Option<bool>,
+    /// Whether this endpoint accepts OpenAI custom tools with Lark/regex
+    /// grammar formats. Grammar tools fall back to ordinary function tools
+    /// when this is unset or false.
+    #[serde(rename = "supportsOpenAIGrammarTools")]
+    pub supports_openai_grammar_tools: Option<bool>,
 }
 
 /// Compatibility flags for Bedrock.

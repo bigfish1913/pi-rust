@@ -173,11 +173,21 @@ pub fn resolve_package(cwd: &Path, spec: &str) -> Result<PackageRoot, String> {
     load_package(root, spec)
 }
 
-/// Load a package-provided theme by name or JSON path. The parser accepts Pi's
-/// `colors` object with hex/RGB values and maps the semantic tokens that rpi's
-/// TUI exposes; missing fields keep the built-in dark defaults.
+/// Load a theme from an explicit JSON path without discovering configured Pi
+/// packages. Startup code that has passed the package gate uses
+/// [`load_theme_with_resources`] to resolve package theme names.
 pub fn load_theme(cwd: &Path, name_or_path: &str) -> Result<rpi_tui::Theme, String> {
-    let resources = discover_from_settings(cwd);
+    load_theme_with_resources(cwd, name_or_path, &PackageResources::default())
+}
+
+/// Load a package theme from an already-resolved resource set. Startup callers
+/// use this variant so a disabled package configuration cannot be re-discovered
+/// indirectly from a TUI theme selector.
+pub fn load_theme_with_resources(
+    _cwd: &Path,
+    name_or_path: &str,
+    resources: &PackageResources,
+) -> Result<rpi_tui::Theme, String> {
     let path = {
         let direct = PathBuf::from(name_or_path);
         if direct.is_file() {
@@ -534,70 +544,68 @@ impl PackageRoot {
 }
 
 fn resolve_spec(cwd: &Path, spec: &str) -> Option<PathBuf> {
-    let raw = spec.strip_prefix("file:").unwrap_or(spec);
+    let file_spec = spec.strip_prefix("file:");
+    let raw = file_spec.unwrap_or(spec);
+    // `npm:` is a package-source prefix, not part of the on-disk package
+    // name. Keeping it in the candidates makes installed npm packages look
+    // like directories literally named `npm:...`.
     let npm_name = raw.strip_prefix("npm:").unwrap_or(raw);
-    let package_name = if npm_name.starts_with('@') {
-        npm_name
-            .get(1..)
-            .and_then(|value| value.find('@').map(|index| &npm_name[..index + 1]))
-            .unwrap_or(npm_name)
-    } else {
-        npm_name.split('@').next().unwrap_or(npm_name)
-    };
+    let package_name = package_name_without_version(npm_name);
     let package_key = package_name
         .strip_prefix('@')
         .unwrap_or(package_name)
         .replace('/', "__");
-    let direct = PathBuf::from(raw);
+    let direct = PathBuf::from(npm_name);
     let mut candidates = Vec::new();
     if direct.is_absolute() {
         candidates.push(direct);
     } else {
-        let explicit_relative_path = raw.starts_with('.') || raw.starts_with("./");
+        let explicit_relative_path =
+            file_spec.is_some() || npm_name.starts_with('.') || npm_name.starts_with("./");
         if explicit_relative_path {
             candidates.push(cwd.join(&direct));
         }
         // Prefer rpi-owned package stores over native Pi stores and generic
         // node_modules when a bare package name resolves in more than one
         // place.
-        candidates.push(cwd.join(".rpi/packages").join(raw));
-        if package_key != raw {
+        candidates.push(cwd.join(".rpi/packages").join(package_name));
+        if package_key != package_name {
             candidates.push(cwd.join(".rpi/packages").join(&package_key));
         }
-        candidates.push(cwd.join(".pi/packages").join(raw));
-        if package_key != raw {
+        candidates.push(cwd.join(".pi/packages").join(package_name));
+        if package_key != package_name {
             candidates.push(cwd.join(".pi/packages").join(&package_key));
         }
         for ancestor in cwd.ancestors() {
-            candidates.push(ancestor.join("node_modules").join(raw));
+            candidates.push(ancestor.join("node_modules").join(package_name));
         }
         if let Ok(agent) = config::agent_dir() {
-            candidates.push(agent.join("packages").join(raw));
-            if package_key != raw {
+            candidates.push(agent.join("packages").join(package_name));
+            if package_key != package_name {
                 candidates.push(agent.join("packages").join(&package_key));
             }
             // Pi's native npm installer keeps packages under
             // ~/.pi/agent/npm/node_modules rather than ~/.pi/agent/packages.
             // Keep the same layout usable when rpi reads Pi's settings.json.
-            candidates.push(agent.join("npm/node_modules").join(raw));
-            if package_key != raw {
+            candidates.push(agent.join("npm/node_modules").join(package_name));
+            if package_key != package_name {
                 candidates.push(agent.join("npm/node_modules").join(&package_key));
             }
         }
         if let Some(home) = dirs::home_dir() {
             // Keep native Pi's installed package store usable when the user
             // has not copied it into the rpi-owned config directory yet.
-            candidates.push(home.join(".pi/agent/packages").join(raw));
-            if package_key != raw {
+            candidates.push(home.join(".pi/agent/packages").join(package_name));
+            if package_key != package_name {
                 candidates.push(home.join(".pi/agent/packages").join(&package_key));
             }
-            candidates.push(home.join(".pi/agent/npm/node_modules").join(raw));
-            if package_key != raw {
+            candidates.push(home.join(".pi/agent/npm/node_modules").join(package_name));
+            if package_key != package_name {
                 candidates.push(home.join(".pi/agent/npm/node_modules").join(&package_key));
             }
         }
         if !explicit_relative_path {
-            candidates.push(cwd.join(&direct));
+            candidates.push(cwd.join(package_name));
         }
     }
     for candidate in candidates {
@@ -611,6 +619,17 @@ fn resolve_spec(cwd: &Path, spec: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Strip an npm version suffix while preserving the `@scope/name` portion.
+fn package_name_without_version(name: &str) -> &str {
+    if let Some(rest) = name.strip_prefix('@') {
+        rest.find('@')
+            .map(|index| &name[..index + 1])
+            .unwrap_or(name)
+    } else {
+        name.split('@').next().unwrap_or(name)
+    }
 }
 
 fn load_package(root: PathBuf, spec: &str) -> Result<PackageRoot, String> {
@@ -827,5 +846,23 @@ mod tests {
         assert_eq!(resources.packages.len(), 1);
         assert!(resources.diagnostics.is_empty());
         assert_eq!(resources.packages[0].name, "@narumitw/pi-btw");
+    }
+
+    #[test]
+    fn npm_scoped_spec_resolves_project_store_and_versioned_spec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join(".pi/packages/@scope/demo");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"@scope/demo","version":"1.2.3"}"#,
+        )
+        .unwrap();
+
+        for spec in ["npm:@scope/demo", "npm:@scope/demo@1.2.3"] {
+            let resources = discover(tmp.path(), &[spec.to_string()]);
+            assert!(resources.diagnostics.is_empty(), "spec={spec}");
+            assert_eq!(resources.packages[0].root, root, "spec={spec}");
+        }
     }
 }
