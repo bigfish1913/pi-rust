@@ -73,7 +73,12 @@ tokio::spawn(async move {
 agent.prompt("Hello!").await.unwrap();
 ```
 
-See [docs/architecture.md](docs/architecture.md) for the full design.
+See [docs/architecture.md](docs/architecture.md) for the design and
+[docs/code-organization.md](docs/code-organization.md) for the functional
+source layout, module ownership, project resources, and verification commands.
+
+The project-local interactive-content agent and its skills are documented in
+[README-INTERACTIVE-CONTENT.md](README-INTERACTIVE-CONTENT.md).
 
 ## Build a plugin
 

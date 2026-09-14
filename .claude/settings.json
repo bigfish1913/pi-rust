@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(git commit -m ' *)",
-      "Bash(taskkill //PID 47232 //F)"
-    ]
-  }
-}

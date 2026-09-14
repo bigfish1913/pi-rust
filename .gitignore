@@ -3,8 +3,19 @@
 .vscode/
 .gitignore
 
-# Locally-created pi sessions (from running the `pi` binary against this repo)
-.pi/
+# Locally-created pi sessions (project resources under .pi remain versioned)
+.pi/sessions/
+
+# RPI runtime state and compiled extensions. Keep project instructions in
+# `.pi/`; these directories are reproducible local state, not source.
+.rpi/agent/
+.rpi/extensions/
+.rpi/sessions/
+
+# Interactive-content output and local package installs.
+artifacts/
+output/
+node_modules/
 
 # Release/publish run logs (stdouts captured during `task publish` etc.)
 *-publish.log

@@ -44,6 +44,7 @@ pub mod app;
 pub mod args;
 pub mod auth;
 pub mod config;
+pub mod content_tools;
 pub mod extensions_actions;
 pub mod extras;
 pub mod install;

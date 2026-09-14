@@ -1025,6 +1025,10 @@ mod tests {
     // A test allocator + free fn so we can verify the own/free contract
     // without a real plugin's free_string.
     static FREED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    // The counter is process-global, while Rust runs unit tests in parallel.
+    // Serialize the tests that reset and inspect it so the ownership contract
+    // is tested deterministically.
+    static FREE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     extern "C" fn test_free(s: StbString) {
         if s.is_empty() || s.ptr.is_null() {
@@ -1055,6 +1059,7 @@ mod tests {
 
     #[test]
     fn stbstring_round_trip_and_free_once() {
+        let _guard = FREE_TEST_LOCK.lock().unwrap();
         let prev = reset_freed();
         let _ = prev;
         let s = StbString::from_string("hello, pi".to_string());
@@ -1066,6 +1071,7 @@ mod tests {
 
     #[test]
     fn empty_stbstring_free_is_noop() {
+        let _guard = FREE_TEST_LOCK.lock().unwrap();
         let _ = reset_freed();
         StbString::empty().free_with(Some(test_free));
         assert_eq!(FREED.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -1073,6 +1079,7 @@ mod tests {
 
     #[test]
     fn json_round_trip_preserves_structure() {
+        let _guard = FREE_TEST_LOCK.lock().unwrap();
         let val = serde_json::json!({ "name": "echo", "args": [1, 2, 3], "ok": true });
         let stb = json::to_stable(&val, None);
         let back = json::from_stable(&stb);
@@ -1083,6 +1090,7 @@ mod tests {
 
     #[test]
     fn step_result_done_round_trip() {
+        let _guard = FREE_TEST_LOCK.lock().unwrap();
         let result_json = StbString::from_string(r#"{"content":[{"text":"hi"}]}"#.to_string());
         let sr = StepResult::done(result_json);
         assert_eq!(sr.tag, StepResultTag::Done);
@@ -1098,6 +1106,7 @@ mod tests {
 
     #[test]
     fn step_result_pending_and_err() {
+        let _guard = FREE_TEST_LOCK.lock().unwrap();
         let prog = StbString::from_string("...".to_string());
         let srp = StepResult::pending(prog);
         assert_eq!(srp.tag, StepResultTag::Pending);
@@ -1167,6 +1176,7 @@ mod tests {
 
     #[test]
     fn event_payloads_construct_and_free() {
+        let _guard = FREE_TEST_LOCK.lock().unwrap();
         let m = StbString::from_string("msg".to_string());
         let ev = StablePluginEvent::message(EventTag::MessageEnd, m);
         assert_eq!(ev.tag, EventTag::MessageEnd);
@@ -1230,6 +1240,7 @@ mod tests {
 
     #[test]
     fn register_entrypoint_version_mismatch_refuses() {
+        let _guard = FREE_TEST_LOCK.lock().unwrap();
         let vt = PluginApiVt {
             free_string: test_free,
             register_tool: None,

@@ -35,6 +35,7 @@ rpassword = { workspace = true }
 tempfile = { workspace = true }
 crossterm = { version = "0.27", features = ["events"] }
 base64 = { workspace = true }
+urlencoding = { workspace = true }
 arboard = { version = "3", optional = true }
 
 [features]

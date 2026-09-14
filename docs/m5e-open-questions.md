@@ -16,9 +16,10 @@ package. This port uses a hand-rolled minimal YAML-subset parser
 `serde_yaml` dependency, consistent with the workspace's minimal-dep posture
 (already established in M4/M5c: no `serde_yaml`, no `regex`, no `ignore`).
 
-**Coverage.** The subset handles exactly the frontmatter shapes that occur in
-practice:
-- `key: value` lines (top-level mapping only — no nested block mappings);
+**Coverage.** The subset handles the common frontmatter shapes used by the
+project and the external skill collections tested against this loader:
+- `key: value` lines plus indentation-based nested mappings and block
+  sequences (including `- key: value` sequence mappings);
 - scalar values: string, `true|True|TRUE`/`false|…` bools, `null|Null|NULL|~`,
   integers, floats-with-`.`;
 - flow collections `[a, b, c]` and `{k: v, k2: v2}`;
@@ -26,11 +27,6 @@ practice:
   strings (`''` escaped quote); plain scalars otherwise.
 
 **Divergences / limitations (NOT handled):**
-- **Block sequences** (`- item` indented lines) — not parsed; would need a
-  recursion level the subset doesn't model. No skill/template frontmatter in the
-  reference uses them.
-- **Block mappings** (nested indented `key: value`) — flat only. Again unused by
-  the reference frontmatter.
 - **Anchors / aliases / multi-document** — out of scope.
 - **Inline trailing comments are NOT stripped.** A line `description: See http://x/#frag`
   keeps the full URL. The TS `yaml` parser strips `# …` inline comments; our
@@ -47,11 +43,11 @@ diagnostic — matching the TS behavior for the common malformed-frontmatter cas
 errors the full `yaml` parser would catch (e.g. a tab-indentation error) are not
 flagged here; they'd parse as a flat scalar or a missing-colon error.
 
-**Resolution for review:** acceptable for v1. If real-world skill/template
-frontmatter ever needs block sequences or nested mappings, either (a) pull
-`serde_yaml` (one-line dep, well-maintained) or (b) extend the subset. The
-hand-rolled parser was chosen to keep the dep surface minimal and because the
-reference frontmatter is uniformly flat.
+**Resolution for review:** block sequences and nested mappings are supported by
+the indentation-aware subset without adding a dependency. The remaining YAML
+features above are still intentionally out of scope; if they become required,
+prefer either adding focused parser coverage or replacing the subset with
+`serde_yaml` after measuring the dependency trade-off.
 
 ## 2. `load_sourced_skills` / `load_sourced_prompt_templates` lose the `mapSkill` hook
 

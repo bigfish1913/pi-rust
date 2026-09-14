@@ -407,9 +407,16 @@ The harness is genuinely complex (the 2941-line spec exists precisely because th
 
 Minimal: `TelemetryContext` trait with a `Noop` impl (mirrors `NOOP_TELEMETRY_CONTEXT`) and an `InMemory` impl for tests. `start_span`/`start_event` return RAII guards. The TS telemetry schemas (`AiSpan`, `HarnessSpan`) become typed newtypes in `pi-agent`/`pi-harness` that call into the context. Full OTLP export is out of scope.
 
-## 8. `pi-cli` (future, reserved)
+## 8. `pi-cli` and `pi-tui`
 
-Empty crate with a `Cargo.toml` and a stub `main.rs` so the workspace compiles. When built, it will depend on `pi-harness` + `pi-tools` and provide the interactive coding agent. Library crates never depend on it.
+`pi-cli` is now the application layer over `pi-harness` + `pi-tools`: it owns
+argument/config parsing, provider and session resolution, output modes,
+resource discovery, extension actions, and the `rpi` binary. `pi-tui` remains
+an independent presentation crate used by the interactive mode. Neither crate
+is a dependency of the reusable model, agent, tools, or harness layers.
+
+See [code-organization.md](code-organization.md) for the current file/module
+map and the extension boundary.
 
 ## 9. Build order
 
@@ -435,7 +442,9 @@ Empty crate with a `Cargo.toml` and a stub `main.rs` so the workspace compiles. 
 
 **Phase 5 — more providers:** openai family, google, bedrock. Each is additive behind the `Provider` trait.
 
-**Phase 6 — `pi-cli`:** the interactive binary.
+**Phase 6 — `pi-cli`:** the interactive binary (implemented in the current
+workspace; this phase now describes the application-layer ownership rather than
+a future stub).
 
 ## 10. Conventions
 

@@ -59,6 +59,7 @@ uuid = { version = "1", features = ["v4", "v7"] }
 base64 = "0.22"
 tempfile = "3"
 regex = "1"
+urlencoding = "2"
 globset = "0.4"
 dirs = "5"
 rpassword = "7"

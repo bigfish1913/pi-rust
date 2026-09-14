@@ -51,6 +51,7 @@ use rpi_tools::{
 };
 
 use crate::args::Args;
+use crate::content_tools::create_content_tools;
 use crate::provider::ResolvedModel;
 use crate::resource_dirs::{
     discover_append_system_prompt_file, discover_system_prompt_file, global_dir,
@@ -1147,6 +1148,15 @@ fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
         ("find", HarnessTool::new(create_find_tool(ctx, None))),
         ("ls", HarnessTool::new(create_ls_tool(ctx, None))),
     ];
+
+    // Project-local interactive-content tools. They are registered alongside
+    // the coding tools so the same RPI TUI session can plan, generate, inspect,
+    // preview, and deliver a complete React/web-ready storyboard.
+    let content_tools = create_content_tools();
+    for tool in content_tools {
+        let name = tool.schema().name.clone();
+        all.push((Box::leak(name.into_boxed_str()), HarnessTool::new(tool)));
+    }
 
     // `--no-builtin-tools` disables the built-in set but would keep
     // extension/custom tools — v1 has none, so it's equivalent to `--no-tools`
