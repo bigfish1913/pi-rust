@@ -562,9 +562,9 @@ pub enum RunMode {
 
 /// Print the help text to stdout. Mirrors TS `printHelp`, scoped to v1 flags.
 pub fn print_help() {
-    let builtin = "read, bash, edit, write";
+    let builtin = "read, bash, edit, write, docs";
     println!(
-        "{name} - AI coding assistant with read, bash, edit, write tools
+        "{name} - AI coding assistant with read, bash, edit, write, docs tools
 
 {u}Usage:{r}
   {name} [options] [@files...] [messages...]
@@ -594,7 +594,7 @@ pub fn print_help() {
   --tools, -t <list>             Comma-separated allowlist of tool names to enable
   --exclude-tools, -xt <list>    Comma-separated denylist of tool names to disable
   --no-tools, -nt                Disable all tools
-  --no-builtin-tools, -nbt       Disable the built-in tools (read, bash, edit, write)
+  --no-builtin-tools, -nbt       Disable the built-in tools (read, bash, edit, write, docs)
   --no-skills, -ns               Skip skill discovery (no <available_skills> block)
   --no-prompt-templates, -np     Skip prompt-template discovery (/expand templates)
   --no-context-files, -nc        Skip AGENTS.md/CLAUDE.md discovery (no <project_context>)
@@ -629,7 +629,7 @@ pub fn print_help() {
                                 (shortcut for `rpi dev --local-only`)
 
 {u}Built-in Tools:{r}
-  {builtin}  (enabled by default; Pi-compatible default set)
+  {builtin}  (enabled by default)
 
 {u}Examples:{r}
   # Interactive with an initial prompt

@@ -6240,6 +6240,12 @@ async fn handle_agent_event(
                 // already exists).
                 for c in &a.content {
                     if let Content::ToolCall(tc) = c {
+                        // Streaming providers may expose a placeholder tool
+                        // call before its name has arrived. It is not a real
+                        // tool panel and must not leave an empty first row.
+                        if tc.name.trim().is_empty() {
+                            continue;
+                        }
                         if tc.name == "bash" {
                             // Bash has a dedicated component. Create it here as
                             // well as on ToolExecutionStart because the tool
@@ -6351,6 +6357,11 @@ async fn handle_agent_event(
             tool_name,
             args,
         } => {
+            // Ignore placeholder lifecycle events emitted before the
+            // provider has supplied a tool name.
+            if tool_name.trim().is_empty() {
+                return;
+            }
             if tool_name == "bash" {
                 // Bash streams into a dedicated BashExecutionComponent (command
                 // header + live preview + exit/truncation status) rather than a
@@ -6361,6 +6372,12 @@ async fn handle_agent_event(
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
+                // Bash arguments can still be `{}` when the lifecycle event
+                // races the streamed tool-call argument finalization. Defer
+                // the panel until a later start event carries the command.
+                if command.trim().is_empty() {
+                    return;
+                }
                 let mut bash_map = state.bash_components.lock().unwrap();
                 if let Some(existing) = bash_map.get(&tool_call_id) {
                     // A ToolExecutionUpdate already created the panel (fast
@@ -6408,6 +6425,9 @@ async fn handle_agent_event(
             args,
             partial_result,
         } => {
+            if tool_name.trim().is_empty() {
+                return;
+            }
             let partial_text = tool_result_text(&partial_result);
             let has_partial_payload = tool_update_has_payload(&partial_text, &partial_result);
             if tool_name == "bash" {
@@ -6467,6 +6487,9 @@ async fn handle_agent_event(
             result,
             is_error,
         } => {
+            if tool_name.trim().is_empty() {
+                return;
+            }
             if tool_name == "bash" {
                 let bash = state.bash_components.lock().unwrap().remove(&tool_call_id);
                 if let Some(bash) = bash {
@@ -6480,6 +6503,11 @@ async fn handle_agent_event(
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
+                    if command.trim().is_empty() && tool_result_text(&result).trim().is_empty() {
+                        state.sync_working_loader_with_bash();
+                        tui.request_render(false);
+                        return;
+                    }
                     let comp = Arc::new(BashExecutionComponent::new(command));
                     comp.set_expanded(*state.tool_outputs_expanded.lock().unwrap());
                     comp.append_output(&tool_result_text(&result));

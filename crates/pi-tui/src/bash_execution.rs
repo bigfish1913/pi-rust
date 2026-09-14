@@ -74,12 +74,12 @@ impl BashExecutionComponent {
         }
     }
 
-    /// Backfill the command header when the panel was created from a
-    /// ToolExecutionUpdate (command unknown at that point) and the
-    /// ToolExecutionStart arrives later — replaces the empty `$ ` header.
+    /// Apply the authoritative command from `ToolExecutionStart`. A panel may
+    /// have been created from an earlier streaming snapshot, so this must
+    /// replace a partial command as well as an empty one.
     pub fn set_command(&self, command: &str) {
-        let mut c = self.command.lock().unwrap();
-        if c.is_empty() {
+        if !command.trim().is_empty() {
+            let mut c = self.command.lock().unwrap();
             *c = command.to_string();
         }
     }
@@ -303,6 +303,15 @@ mod tests {
         c.append_output("one\n");
         c.append_output("one\ntwo\n");
         assert_eq!(c.get_output(), "one\ntwo\n");
+    }
+
+    #[test]
+    fn authoritative_start_command_replaces_partial_streamed_command() {
+        let c = BashExecutionComponent::new("printf");
+        c.set_command("printf '\\n--- agent skills ---\\n' && find skills");
+        let rendered = strip_ansi(&c.render(120).join("\n"));
+        assert!(rendered.contains("printf '\\n--- agent skills ---\\n' && find skills"));
+        assert!(!rendered.contains("$ printf\n"));
     }
 
     #[test]
