@@ -34,3 +34,6 @@ pub use session::{DefaultIdGenerator, Session};
 pub use sqlite::{SqliteSessionRepo, SqliteSessionStorage};
 pub use state::{ApplyOutcome, SessionState};
 pub use values::{SessionValueWriter, SessionValues, VALUE_CUSTOM_TYPE};
+pub mod keyed_queue;
+pub mod resources;
+pub mod search;

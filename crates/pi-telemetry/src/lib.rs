@@ -11,6 +11,7 @@
 
 pub mod context;
 pub mod noop;
+pub mod production;
 pub mod types;
 
 #[cfg(any(test, feature = "testing"))]
@@ -18,6 +19,7 @@ pub mod testing;
 
 pub use context::{SpanGuard, TelemetryContext};
 pub use noop::{NoopTelemetryContext, NOOP_TELEMETRY_CONTEXT};
+pub use production::ProductionTelemetryContext;
 pub use types::{AttributeValue, SpanAttributes, SpanOptions, SpanStatus};
 
 /// Error returned by span operations.

@@ -13,11 +13,17 @@ pub mod env;
 pub mod error;
 pub mod file_mutation_queue;
 pub mod image;
+pub mod image_processing;
 pub mod in_memory;
 pub mod os_env;
 pub mod path_utils;
 pub mod shell_output;
 pub mod truncate;
+
+pub mod utils {
+    pub mod git;
+    pub mod open_browser;
+}
 
 pub mod tools;
 pub use tools::{

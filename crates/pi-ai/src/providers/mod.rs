@@ -15,3 +15,15 @@ pub mod openai_completions;
 
 #[cfg(feature = "providers")]
 pub mod openai_responses;
+
+#[cfg(feature = "providers")]
+pub mod proxy;
+
+#[cfg(feature = "providers")]
+pub mod openrouter;
+
+#[cfg(feature = "providers")]
+pub mod deepseek;
+
+#[cfg(feature = "providers")]
+pub mod llama_cpp;

@@ -58,9 +58,12 @@ pub mod install;
 pub mod install_pi;
 pub mod interactive_tui;
 pub mod js_extensions;
+pub mod llama_command;
 pub mod modes;
+pub mod model_registry;
 pub mod node_transport;
 pub mod npm;
+pub mod oauth;
 pub mod packages;
 pub mod provider;
 pub mod remote;
@@ -68,6 +71,7 @@ pub mod resource_dirs;
 pub mod resume_picker;
 pub mod session;
 pub mod settings;
+pub mod trust;
 pub mod updates;
 
 /// Crate version, surfaced by `rpi --version`. Mirrors the TS `VERSION` export

@@ -105,12 +105,35 @@ pub fn global_config_file(name: &str) -> Option<PathBuf> {
 /// Startup code that has passed the package gate supplies its resolved resource
 /// set to [`discover_system_prompt_file_with_packages`].
 ///
-/// **Trust gate (v1 divergence):** pi gates the **project** `SYSTEM.md` behind
-/// `settingsManager.isProjectTrusted()` (global is always honored). rpi v1 has
-/// no trust prompt (`config.rs:349`), so project files are read unconditionally
-/// — a copied `.rpi/` or `.pi/` drops in and works. Full trust gating is deferred.
+/// **Trust gate:** When `project_trusted` is `false`, project-level files are
+/// skipped and only global files are considered. This prevents untrusted
+/// projects from injecting system prompts.
 pub fn discover_system_prompt_file(cwd: &Path) -> Option<PathBuf> {
-    discover_system_prompt_file_with_packages(cwd, &crate::packages::PackageResources::default())
+    discover_system_prompt_file_with_trust(cwd, true, &crate::packages::PackageResources::default())
+}
+
+/// Discover `SYSTEM.md` with explicit trust control.
+///
+/// When `project_trusted` is `false`, project-level files are skipped.
+pub fn discover_system_prompt_file_with_trust(
+    cwd: &Path,
+    project_trusted: bool,
+    packages: &crate::packages::PackageResources,
+) -> Option<PathBuf> {
+    if project_trusted {
+        for project in project_config_files(cwd, "SYSTEM.md") {
+            if project.is_file() {
+                return Some(project);
+            }
+        }
+    }
+    if let Some(global) = global_config_file("SYSTEM.md").filter(|p| p.is_file()) {
+        return Some(global);
+    }
+    packages
+        .system_prompt_files()
+        .into_iter()
+        .find(|path| path.is_file())
 }
 
 /// Discover `SYSTEM.md` with already-resolved package resources. Package files

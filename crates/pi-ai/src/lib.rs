@@ -18,6 +18,7 @@ pub mod providers;
 pub mod schema;
 pub(crate) mod strict_schema;
 pub mod types;
+pub mod constrained;
 
 // Flat re-exports — consumers do `use rpi_ai::Message` not `rpi_ai::types::Message`.
 pub use error::AiError;
