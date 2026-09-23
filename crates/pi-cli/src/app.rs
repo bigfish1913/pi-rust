@@ -81,6 +81,15 @@ fn resolve_connect_token(argv: &[String]) -> Option<String> {
 /// ([`crate::bin`] / `src/bin/pi.rs`) calls this under a tokio runtime and
 /// `std::process::exit`s with the returned code.
 pub async fn run() -> i32 {
+    // Startup profiling wrapper: PI_TIMING=1 records namespace timings and
+    // flushes them to stderr once the run completes, regardless of exit path.
+    crate::timings::reset(crate::timings::TimingNamespace::Main);
+    let code = run_inner().await;
+    crate::timings::print_timings();
+    code
+}
+
+async fn run_inner() -> i32 {
     // argv[0] is the program name; skip it (TS `main(args)` receives the same,
     // already sliced by the Node CLI entry).
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
@@ -180,6 +189,7 @@ pub async fn run() -> i32 {
     }
 
     let mut parsed = parse_args(&argv);
+    crate::timings::time("args parsed", crate::timings::TimingNamespace::Main);
 
     // ---- --help / --version short-circuit (before any heavy work) ----
     if parsed.help {
@@ -214,6 +224,7 @@ pub async fn run() -> i32 {
     // Best-effort; never blocks startup. Skipped when RPI_CODING_AGENT_DIR is
     // set (an explicit override is its own layout).
     let _ = crate::config::migrate_legacy_layout();
+    crate::timings::time("config migrated", crate::timings::TimingNamespace::Main);
 
     if let Some(input) = parsed.export.as_deref() {
         let output = parsed

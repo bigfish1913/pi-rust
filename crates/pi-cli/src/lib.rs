@@ -54,6 +54,7 @@ pub mod export;
 pub mod extension_api;
 pub mod extensions_actions;
 pub mod extras;
+pub mod experimental;
 pub mod install;
 pub mod install_pi;
 pub mod interactive_tui;
@@ -70,7 +71,9 @@ pub mod remote;
 pub mod resource_dirs;
 pub mod resume_picker;
 pub mod session;
+pub mod session_cwd;
 pub mod settings;
+pub mod timings;
 pub mod trust;
 pub mod updates;
 

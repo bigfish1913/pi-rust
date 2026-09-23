@@ -4237,10 +4237,10 @@ struct TuiState {
     /// The editor text captured when entering browse mode, restored when the
     /// user navigates back past the newest entry (TS `historyDraft`).
     history_draft: std::sync::Mutex<Option<String>>,
-    /// The previous turn's input token count, used by the cache-miss notice:
-    /// a large input that reads nothing from cache after an established prefix
-    /// means the prefix was re-billed (simplified `maybeShowCacheMissNotice`).
-    last_input_tokens: std::sync::Mutex<i64>,
+    /// Full cache-waste tracker (pi `detectCacheMiss`/`cache-stats.ts`):
+    /// counts and prices prompt-cache misses across turns using the same
+    /// noise floor, idle-gap, and model-change logic as the batch scan.
+    cache_tracker: std::sync::Mutex<rpi_harness::cache_stats::CacheMissTracker>,
     /// The in-progress scoped-models selection while the `/scoped-models`
     /// selector is open (toggle per item, Esc saves). `None` when not editing.
     scoped_edit: std::sync::Mutex<Option<Vec<String>>>,
@@ -4268,10 +4268,6 @@ struct TuiState {
 /// How many submitted messages are kept for ↑ recall (mirrors the TS
 /// editor's 100-entry cap).
 const HISTORY_LIMIT: usize = 100;
-
-/// A turn with at least this many input tokens is worth a cache-miss notice
-/// when nothing was read from cache (matches the TS 20k threshold).
-const CACHE_MISS_MIN_INPUT_TOKENS: i64 = 20_000;
 
 /// Keep a few rows of overlap so page scrolling preserves visual context,
 /// matching the upstream fullscreen viewport behavior.
@@ -5172,7 +5168,7 @@ pub async fn interactive_tui(
         history: std::sync::Mutex::new(Vec::new()),
         history_index: std::sync::Mutex::new(-1),
         history_draft: std::sync::Mutex::new(None),
-        last_input_tokens: std::sync::Mutex::new(0),
+        cache_tracker: std::sync::Mutex::new(rpi_harness::cache_stats::CacheMissTracker::new()),
         scoped_edit: std::sync::Mutex::new(None),
         markdown_transformer: std::sync::Mutex::new(initial_transformer),
         extension_session: reload_context.extension_session.clone(),
@@ -7318,22 +7314,29 @@ async fn handle_agent_event(
                 if !text.is_empty() {
                     *state.last_assistant_text.lock().unwrap() = text;
                 }
-                // Cache-miss notice (simplified `maybeShowCacheMissNotice`):
-                // the previous turn's input established a cacheable prefix; a
-                // large input this turn that read nothing from cache means the
-                // prefix was re-billed. No cost display — v1 has no per-run
-                // cost tracking here.
+                // Cache-miss notice (`maybeShowCacheMissNotice`): the previous
+                // turn's input established a cacheable prefix; a prompt that
+                // re-reads less than it should means the prefix was re-billed.
+                // Uses the shared cache-stats logic (noise floor, idle gap,
+                // model change) and prices the miss when known.
                 let usage = &a.usage;
-                let prev_input = *state.last_input_tokens.lock().unwrap();
-                if prev_input > 0
-                    && usage.input >= CACHE_MISS_MIN_INPUT_TOKENS
-                    && usage.cache_read == 0
-                {
+                let miss = state
+                    .cache_tracker
+                    .lock()
+                    .unwrap()
+                    .observe(a, &rpi_harness::cache_stats::NoPrices);
+                if let Some(miss) = miss {
+                    let cost = if miss.missed_cost > 0.0 {
+                        format!(" (~${:.4})", miss.missed_cost)
+                    } else {
+                        String::new()
+                    };
                     add_note_message(
                         &state.chat_container,
                         &format!(
-                            "Cache miss: {} tokens re-billed",
-                            format_tokens(usage.input)
+                            "Cache miss: {} tokens re-billed{}",
+                            format_tokens(miss.missed_tokens),
+                            cost
                         ),
                     );
                 }
@@ -7347,7 +7350,6 @@ async fn handle_agent_event(
                 if let Some(error) = assistant_error_text(a) {
                     add_error_message(chat, &error);
                 }
-                *state.last_input_tokens.lock().unwrap() = usage.input;
             }
             tui.request_render(false);
         }
@@ -9904,7 +9906,7 @@ mod tests {
             history: std::sync::Mutex::new(Vec::new()),
             history_index: std::sync::Mutex::new(-1),
             history_draft: std::sync::Mutex::new(None),
-            last_input_tokens: std::sync::Mutex::new(0),
+            cache_tracker: std::sync::Mutex::new(rpi_harness::cache_stats::CacheMissTracker::new()),
             scoped_edit: std::sync::Mutex::new(None),
             markdown_transformer: std::sync::Mutex::new(None),
             extension_session: Arc::new(std::sync::Mutex::new(
@@ -10265,7 +10267,7 @@ mod tests {
             history: std::sync::Mutex::new(Vec::new()),
             history_index: std::sync::Mutex::new(-1),
             history_draft: std::sync::Mutex::new(None),
-            last_input_tokens: std::sync::Mutex::new(0),
+            cache_tracker: std::sync::Mutex::new(rpi_harness::cache_stats::CacheMissTracker::new()),
             scoped_edit: std::sync::Mutex::new(None),
             markdown_transformer: std::sync::Mutex::new(None),
             extension_session: Arc::new(std::sync::Mutex::new(
@@ -10337,7 +10339,7 @@ mod tests {
             history: std::sync::Mutex::new(Vec::new()),
             history_index: std::sync::Mutex::new(-1),
             history_draft: std::sync::Mutex::new(None),
-            last_input_tokens: std::sync::Mutex::new(0),
+            cache_tracker: std::sync::Mutex::new(rpi_harness::cache_stats::CacheMissTracker::new()),
             scoped_edit: std::sync::Mutex::new(None),
             markdown_transformer: std::sync::Mutex::new(None),
             extension_session: Arc::new(std::sync::Mutex::new(
@@ -10412,7 +10414,7 @@ mod tests {
             history: std::sync::Mutex::new(Vec::new()),
             history_index: std::sync::Mutex::new(-1),
             history_draft: std::sync::Mutex::new(None),
-            last_input_tokens: std::sync::Mutex::new(0),
+            cache_tracker: std::sync::Mutex::new(rpi_harness::cache_stats::CacheMissTracker::new()),
             scoped_edit: std::sync::Mutex::new(None),
             markdown_transformer: std::sync::Mutex::new(None),
             extension_session: Arc::new(std::sync::Mutex::new(
@@ -10490,7 +10492,7 @@ mod tests {
             history: std::sync::Mutex::new(Vec::new()),
             history_index: std::sync::Mutex::new(-1),
             history_draft: std::sync::Mutex::new(None),
-            last_input_tokens: std::sync::Mutex::new(0),
+            cache_tracker: std::sync::Mutex::new(rpi_harness::cache_stats::CacheMissTracker::new()),
             scoped_edit: std::sync::Mutex::new(None),
             markdown_transformer: std::sync::Mutex::new(None),
             extension_session: Arc::new(std::sync::Mutex::new(

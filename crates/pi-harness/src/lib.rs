@@ -7,8 +7,10 @@
 //! `messages`, `events`, `skills`, `agent_harness`) are added as M5 progresses.
 
 pub mod agent_harness;
+pub mod cache_stats;
 pub mod compaction;
 pub mod context_files;
+pub mod diagnostics;
 pub mod error;
 pub mod events;
 pub mod frontmatter;

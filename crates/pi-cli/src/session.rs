@@ -515,6 +515,7 @@ pub async fn build(
 
     let mut skills: Vec<rpi_harness::types::Skill> = Vec::new();
     let mut skill_diags: Vec<rpi_harness::skills::SkillDiagnostic> = Vec::new();
+    let mut resource_diags: Vec<rpi_harness::diagnostics::ResourceDiagnostic> = Vec::new();
     if !args.no_skills {
         let mut dirs = if args.dev_local_only {
             project_skill_dirs(cwd)
@@ -532,6 +533,7 @@ pub async fn build(
         let result = load_skills_with_precedence(&env_dyn, &dirs).await;
         skills = result.skills;
         skill_diags = result.diagnostics;
+        resource_diags.extend(result.resource_diagnostics);
     }
 
     let mut prompt_templates: Vec<rpi_harness::types::PromptTemplate> = Vec::new();
@@ -553,6 +555,7 @@ pub async fn build(
         let result = load_prompt_templates_with_precedence(&env_dyn, &dirs).await;
         prompt_templates = result.prompt_templates;
         prompt_diags = result.diagnostics;
+        resource_diags.extend(result.resource_diagnostics);
     }
 
     let context_block = if args.no_context_files || !project_trusted {
@@ -587,6 +590,18 @@ pub async fn build(
                 d.code.as_str(),
                 d.message
             );
+        }
+        // Structured collisions: make the winner/loser explicit.
+        for d in &resource_diags {
+            if let rpi_harness::diagnostics::ResourceDiagnostic::Collision(c) = d {
+                eprintln!(
+                    "warning: {} name \"{}\" collision: keeping {} (shadowed {})",
+                    c.resource_type.as_str(),
+                    c.name,
+                    c.winner_path,
+                    c.loser_path
+                );
+            }
         }
     }
 
@@ -1236,6 +1251,7 @@ where
 
     let mut skills: Vec<rpi_harness::types::Skill> = Vec::new();
     let mut skill_diags: Vec<rpi_harness::skills::SkillDiagnostic> = Vec::new();
+    let mut resource_diags: Vec<rpi_harness::diagnostics::ResourceDiagnostic> = Vec::new();
     if !effective_args.no_skills {
         // JS discovery is backed by the session-long lazy Node host. Until
         // that host is swapped as part of a future full JS reload, preserve
@@ -1256,6 +1272,7 @@ where
         let result = load_skills_with_precedence(&env_dyn, &dirs).await;
         skills = result.skills;
         skill_diags = result.diagnostics;
+        resource_diags.extend(result.resource_diagnostics);
     }
 
     let mut prompt_templates: Vec<rpi_harness::types::PromptTemplate> = Vec::new();
@@ -1277,6 +1294,7 @@ where
         let result = load_prompt_templates_with_precedence(&env_dyn, &dirs).await;
         prompt_templates = result.prompt_templates;
         prompt_diags = result.diagnostics;
+        resource_diags.extend(result.resource_diagnostics);
     }
 
     let context_block = if effective_args.no_context_files {
@@ -1292,6 +1310,7 @@ where
     if !skill_diags.is_empty()
         || !prompt_diags.is_empty()
         || !package_resources.diagnostics.is_empty()
+        || !resource_diags.is_empty()
     {
         warnings = true;
         // Collect formatted diagnostics for the caller to surface in its UI
@@ -1316,6 +1335,18 @@ where
                 d.code.as_str(),
                 d.message
             ));
+        }
+        // Structured collisions: winner (kept) · loser (shadowed).
+        for d in &resource_diags {
+            if let rpi_harness::diagnostics::ResourceDiagnostic::Collision(c) = d {
+                details.push(format!(
+                    "warning: {} name \"{}\" collision: keeping {} (shadowed {})",
+                    c.resource_type.as_str(),
+                    c.name,
+                    c.winner_path,
+                    c.loser_path
+                ));
+            }
         }
     }
 
@@ -2156,6 +2187,19 @@ async fn open_session(
         .open_by_jsonl_metadata(meta)
         .await
         .map_err(|e| BuildError::SessionDir(format!("open {}: {e}", meta.path)))?;
+    // A session records the cwd it was created in. When that directory has
+    // since been removed, continuing silently in it is confusing; warn the
+    // user that we fell back to the process cwd (pi `getMissingSessionCwdIssue`).
+    if let Some(issue) = crate::session_cwd::get_missing_session_cwd_issue(
+        Some(Path::new(&meta.path)),
+        Path::new(&meta.cwd),
+        Path::new(cwd),
+    ) {
+        eprintln!(
+            "warning: {}",
+            crate::session_cwd::format_missing_session_cwd_error(&issue)
+        );
+    }
     let storage_arc: Arc<dyn SessionStorage> = Arc::new(storage);
     Ok(Session::new(storage_arc, None))
 }

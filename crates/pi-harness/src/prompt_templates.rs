@@ -53,6 +53,9 @@ pub struct PromptTemplateDiagnostic {
 pub struct LoadPromptTemplatesResult {
     pub prompt_templates: Vec<PromptTemplate>,
     pub diagnostics: Vec<PromptTemplateDiagnostic>,
+    /// Structured winner/loser collision diagnostics (native
+    /// `ResourceDiagnostic`).
+    pub resource_diagnostics: Vec<crate::diagnostics::ResourceDiagnostic>,
 }
 
 /// Load prompt templates from one or more paths. Mirrors TS `loadPromptTemplates`.
@@ -98,6 +101,7 @@ pub async fn load_prompt_templates(
     LoadPromptTemplatesResult {
         prompt_templates,
         diagnostics,
+        ..Default::default()
     }
 }
 
@@ -176,6 +180,7 @@ async fn load_templates_from_dir(
             return LoadPromptTemplatesResult {
                 prompt_templates,
                 diagnostics,
+                ..Default::default()
             };
         }
     };
@@ -197,6 +202,7 @@ async fn load_templates_from_dir(
     LoadPromptTemplatesResult {
         prompt_templates,
         diagnostics,
+        ..Default::default()
     }
 }
 
