@@ -324,7 +324,11 @@ async fn run_anthropic_stream(
         Ok(r) => r,
         Err(err) => {
             let aborted = err.is_abort();
-            eprintln!("anthropic request failed: {err}");
+            // Deliberately NO eprintln! here: in fullscreen TUI mode a raw
+            // stderr write lands at the cursor (the input editor row), corrupting
+            // the alt-screen. The error is propagated to the UI via
+            // `emit_terminal_error` → `AssistantMessageEvent::Error`, which the
+            // TUI renders as a `✗` line in the transcript.
             emit_terminal_error(prod, &mut state, err.to_string(), aborted);
             return;
         }
