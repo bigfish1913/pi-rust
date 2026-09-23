@@ -157,6 +157,10 @@ impl Markdown {
         let mut in_code_block = false;
         let mut code_fence_char = '`';
         let mut code_language = String::new();
+        // Syntax highlighter for the current fenced block (highlight.js
+        // analogue; see `syntax_highlight`). Carries block-comment state
+        // across lines. `None` outside a code block.
+        let mut code_highlighter: Option<crate::syntax_highlight::Highlighter> = None;
         let mut mermaid_source: Vec<String> = Vec::new();
         while i < raw_lines.len() {
             let line = raw_lines[i];
@@ -182,6 +186,7 @@ impl Markdown {
                     in_code_block = true;
                     code_fence_char = fence_char;
                     code_language = lang.to_ascii_lowercase();
+                    code_highlighter = Some(crate::syntax_highlight::Highlighter::new(&code_language));
                     mermaid_source.clear();
                     // Fence language names (for example `text`, `rust`, or
                     // `bash`) are metadata, not code content. Keep ordinary
@@ -195,12 +200,20 @@ impl Markdown {
                     }
                     in_code_block = false;
                     code_language.clear();
+                    code_highlighter = None;
                     mermaid_source.clear();
                     // The closing fence is structural only; do not draw a
                     // bottom border around the code surface.
                 } else {
                     // A non-matching fence is code content.
-                    push_code_line(line, &pad, &indent, cwidth, &mut lines);
+                    push_code_line(
+                        line,
+                        &pad,
+                        &indent,
+                        cwidth,
+                        &mut lines,
+                        code_highlighter.as_mut(),
+                    );
                 }
                 i += 1;
                 continue;
@@ -216,7 +229,14 @@ impl Markdown {
                 // Code is never reflowed: wrapping destroys indentation and
                 // makes copied snippets invalid. Tabs are normalized and long
                 // physical lines are clipped with an ellipsis.
-                push_code_line(line, &pad, &indent, cwidth, &mut lines);
+                push_code_line(
+                    line,
+                    &pad,
+                    &indent,
+                    cwidth,
+                    &mut lines,
+                    code_highlighter.as_mut(),
+                );
                 i += 1;
                 continue;
             }
@@ -595,7 +615,14 @@ fn fence_info(line: &str) -> Option<(char, String)> {
 }
 
 /// Render one physical code line on a subtle surface, without an outer frame.
-fn push_code_line(line: &str, pad: &str, indent: &str, cwidth: usize, out: &mut Vec<String>) {
+fn push_code_line(
+    line: &str,
+    pad: &str,
+    indent: &str,
+    cwidth: usize,
+    out: &mut Vec<String>,
+    highlighter: Option<&mut crate::syntax_highlight::Highlighter>,
+) {
     let colors = theme().colors;
     // `cwidth` excludes Markdown padding. The code surface starts after the
     // configured indent and fills the remaining width, including blank rows.
@@ -603,7 +630,12 @@ fn push_code_line(line: &str, pad: &str, indent: &str, cwidth: usize, out: &mut 
     let body_width = panel_width.saturating_sub(2).max(1);
     let expanded = line.replace('\t', "    ");
     let clipped = truncate_to_width(&expanded, body_width, "…");
-    let body = format!(" {}", colors.md_code_block.fg(&clipped));
+    // Syntax-highlight the clipped plain text, then apply the panel background.
+    let styled = match highlighter {
+        Some(h) => h.highlight(&clipped, &colors),
+        None => colors.md_code_block.fg(&clipped),
+    };
+    let body = format!(" {styled}");
     let body =
         apply_background_to_line(&body, panel_width, |text| colors.md_code_block_bg.bg(text));
     out.push(format!("{pad}{indent}{body}"));

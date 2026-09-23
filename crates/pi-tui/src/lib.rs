@@ -48,6 +48,7 @@ pub mod settings_list;
 pub mod spacer;
 pub mod status_indicator;
 pub mod stdin_buffer;
+pub mod syntax_highlight;
 pub mod terminal;
 pub mod terminal_colors;
 pub mod terminal_image;
