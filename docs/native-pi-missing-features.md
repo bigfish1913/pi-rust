@@ -20,8 +20,15 @@
 | §11 已识别但未生效的 CLI 功能 | 已实现 | `--offline`、`--approve`/`--no-approve`、`--tui-mode`、`--no-themes`、`--theme`、`--list-models [search]`、`--export` 均已接入行为（`pi-cli/src/app.rs`、`session.rs`、`interactive_tui.rs`）。
 | §12 交互快捷键与编辑器工作流 | 已实现 | `interactive_tui.rs` 键循环：Ctrl+G 外部编辑器、Ctrl+O 输出展开、Ctrl+T thinking 折叠、Ctrl+M 模型循环、Shift+Tab thinking 档位循环；`pi-tui/src/keybindings.rs` 可配置键位。
 | §15 TUI 基础组件 | 已实现 | `pi-tui/src/`：`ArminComponent`、`BorderedLoader`、`MouseRegion` 等价事件处理、`Editor` 全量接口。
+| §1 Provider 覆盖 | 部分实现（实用子集） | 新增 `pi-ai/src/providers/{deepseek,openrouter,llama_cpp,proxy}.rs`，复用 anthropic SSE 解析；未追求覆盖原生全部 ~40 个 provider。`pi-ai/src/constrained.rs` 提供约束采样（JSON schema/grammar/regex）。 |
+| §2 OAuth 与 credential 工具 | 已实现（基础） | `pi-cli/src/oauth.rs`：device-code 登录、token 刷新/过期、token store。 |
+| §5 ModelRegistry/ModelRuntime | 已实现 | `pi-cli/src/model_registry.rs`：`models.json` 运行时刷新、`ModelDefinition`→`Model` 转换、查询与重载。 |
+| §13 `/llama` 集成 | 已实现 | `pi-cli/src/llama_command.rs`：`rpi llama start|stop|list|status|download`（手工参数解析，无 clap）；`pi-ai/src/providers/llama_cpp.rs` 运行时。 |
+| §14 Trust gate 细节 | 已实现（基础） | `pi-cli/src/trust.rs`（`TrustStore`/`TrustDecision`）；`pi-cli/src/resource_dirs.rs` 的 `discover_system_prompt_file_with_trust` 按信任策略门控。 |
+| §18 生产 telemetry schema | 已实现 | `pi-telemetry/src/production.rs`：`ProductionTelemetryContext` 输出 JSON span 记录。 |
+| 基础设施（会话/工具） | 已实现 | `pi-harness/src/session/{keyed_queue,resources,search}.rs`（按 key 操作队列、资源清理注册表、会话全文检索）；`pi-tools/src/{image_processing.rs,tools/image.rs,utils/{git,open_browser}.rs}`（图片缩放/转码/EXIF、图片工具、Git URL 解析、跨平台打开浏览器）。 |
 
-仍待实现（保留在原文，未在本轮落地）：§1 provider 覆盖、§2 OAuth、§5 ModelRegistry 运行时、§13 `/llama`、§14 trust gate 细节、§16 JS bridge 剩余接口、§18 telemetry schema。§7 的 provider 端 deferred 长轮询续跑（`resume_deferred`）当前显式返回 `NotImplemented`，不静默假装完成。
+仍待实现（保留在原文，未在本轮落地）：§1 的**全量** provider 覆盖（按约定只落地 OpenRouter/DeepSeek/LLaMA.cpp/Proxy 子集）、§16 JS bridge 剩余接口（本轮明确放弃）。§7 的 provider 端 deferred 长轮询续跑（`resume_deferred`）当前显式返回 `NotImplemented`，不静默假装完成。
 
 ## 判定标准
 
@@ -41,7 +48,7 @@
 | P1 | Trust/resource gate 细节（§14）、Settings 未消费字段（§15） | 项目安全策略与部分配置面不完整 |
 | P2 | JS/TS 扩展桥接剩余接口（§16）、telemetry schema（§18） | 扩展生态和低层 SDK 兼容性受限 |
 
-已从本表移除（本轮实现）：§6 AgentHarness/AgentLane API、§7 durable runtime/value store、§8 AgentSession、§9 JSON 细粒度事件、§10 导出格式、§11 CLI 功能开关、§12 交互快捷键、§17 TUI 基础组件。
+已从本表移除（本轮实现）：§2 OAuth、§5 ModelRegistry 运行时、§6 AgentHarness/AgentLane API、§7 durable runtime/value store、§8 AgentSession、§9 JSON 细粒度事件、§10 导出格式、§11 CLI 功能开关、§12 交互快捷键、§13 `/llama`、§14 trust gate 细节、§17 TUI 基础组件、§18 telemetry schema。仍保留：§1 provider **全量**覆盖（仅落地实用子集）、§15 settings 其余未消费字段、§16 JS bridge 剩余接口（已决定不做）。
 
 ## P0：模型、认证和传输
 
