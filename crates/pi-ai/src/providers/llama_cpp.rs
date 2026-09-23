@@ -9,12 +9,12 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
+use crate::event_stream::AssistantMessageEventStream;
 use crate::error::AiError;
-use crate::event_stream::{create_assistant_message_event_stream, AssistantMessageEventStream, AssistantMessageEventStreamProducer};
 use crate::model::Model;
 use crate::provider::{Provider, SimpleStreamOptions};
 use crate::providers::anthropic::sse::SseEventStream;
-use crate::types::{AssistantMessage, AssistantMessageEvent, AssistantRole, Content, Context, DoneReason, ErrorReason, StopReason, TextContent, TextContentType, Usage};
+use crate::types::{AssistantMessage, AssistantMessageEvent, AssistantRole, Content, Context, DoneReason, TextContent, TextContentType, Usage};
 
 /// LLaMA.cpp server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,7 +170,7 @@ impl Provider for LlamaCppProvider {
             }
         }
         
-        let client = self.client.clone();
+        let _client = self.client.clone();
         let model_id = model.id.clone();
         let api = model.api.clone();
         let opts = opts.clone();

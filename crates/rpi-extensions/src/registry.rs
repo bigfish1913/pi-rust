@@ -690,6 +690,7 @@ pub fn assert_active(active: &Arc<AtomicBool>) -> bool {
 }
 
 /// Build an `AgentError` for a stale-registry access.
+#[allow(dead_code)]
 pub(crate) fn stale_error() -> AgentError {
     AgentError::State("extensions registry is stale (session swapped/reloaded)".into())
 }

@@ -246,7 +246,7 @@ impl CacheMissTracker {
 mod tests {
     use super::*;
     use rpi_ai::types::{
-        Api, AssistantRole, ModelCost, ProviderId, StopReason, Usage, UsageCost,
+        Api, AssistantRole, ProviderId, StopReason, Usage, UsageCost,
     };
 
     fn msg(provider: &str, model: &str, input: i64, cache_read: i64, cache_write: i64, ts: i64) -> AssistantMessage {

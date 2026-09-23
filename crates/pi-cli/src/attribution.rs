@@ -111,7 +111,7 @@ pub fn merge_provider_attribution_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rpi_ai::types::{Api, ModelCost, ProviderId};
+    use rpi_ai::types::{Api, ModelCost};
 
     fn model(provider: &str, base_url: &str) -> Model {
         let mut m = Model::new("id", "id", Api::AnthropicMessages, provider, base_url);

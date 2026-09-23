@@ -219,7 +219,7 @@ mod tests {
 
     #[test]
     fn test_box_padding() {
-        let mut box_component = Box::new(2, 1);
+        let box_component = Box::new(2, 1);
         let text = Arc::new(Text::new("Hello", 1, 0));
         box_component.add_child(text);
 
@@ -239,7 +239,7 @@ mod tests {
 
     #[test]
     fn test_box_clear() {
-        let mut box_component = Box::new(1, 1);
+        let box_component = Box::new(1, 1);
         let text = Arc::new(Text::new("Hello", 1, 0));
         box_component.add_child(text);
         box_component.clear();

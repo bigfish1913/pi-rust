@@ -2971,37 +2971,6 @@ fn user_message_text(msg: &rpi_ai::types::UserMessage) -> String {
     }
 }
 
-/// Render the `/settings` panel: the saved settings.json values the session
-/// honors, plus pointers to the commands that edit them (theme via `/theme`,
-/// defaults via flags, cycle scope via `/scoped-models`). Kept for the
-/// read-only summary; the interactive menu is [`open_settings_selector`].
-fn show_settings_panel(chat: &Arc<Container>) {
-    let s = crate::settings::load_settings().unwrap_or_default();
-    let mut lines: Vec<String> = Vec::new();
-    lines.push("⚙️  Saved settings:".into());
-    lines.push(format!(
-        "  Theme: {} (edit with /theme)",
-        s.theme.as_deref().unwrap_or("(default)")
-    ));
-    lines.push(format!(
-        "  Default model: {} (set at launch with --model)",
-        s.default_model.as_deref().unwrap_or("(none)")
-    ));
-    lines.push(format!(
-        "  Default thinking: {} (set at launch with --thinking)",
-        s.default_thinking_level.as_deref().unwrap_or("(default)")
-    ));
-    match &s.scoped_models {
-        Some(list) if !list.is_empty() => lines.push(format!(
-            "  Ctrl+M cycle scope: {} (edit with /scoped-models)",
-            list.join(", ")
-        )),
-        _ => lines.push("  Ctrl+M cycle scope: all models (edit with /scoped-models)".into()),
-    }
-    let body = lines.join("\n");
-    container_note_block(chat, &body);
-}
-
 /// The catalog allowed in the Ctrl+M cycle: the `/scoped-models` set from
 /// settings.json when present, otherwise every model. The current model is
 /// always included (fallback) so cycling can never strand the user off-scope.
@@ -7775,27 +7744,6 @@ fn skill_tool_name(tool_name: &str, args: &serde_json::Value) -> Option<String> 
         .map(str::to_string)
 }
 
-/// Render an `AgentToolResult` as a single-line summary for the
-/// `ToolExecutionComponent` (joins text blocks; truncates for compactness).
-fn summarize_tool_result(result: &rpi_agent::AgentToolResult) -> String {
-    use rpi_agent::TextContentOrImage;
-    let mut parts: Vec<String> = Vec::new();
-    for c in &result.content {
-        if let TextContentOrImage::Text(t) = c {
-            parts.push(t.text.clone());
-        }
-    }
-    let joined = parts.join("\n");
-    // Keep the tool line compact: collapse to a single line, trim length.
-    let one_line: String = joined.lines().collect::<Vec<_>>().join(" ⏎ ");
-    if one_line.chars().count() > 200 {
-        let truncated: String = one_line.chars().take(200).collect();
-        format!("{truncated}…")
-    } else {
-        one_line
-    }
-}
-
 /// The raw multi-line text of a tool result (no single-line collapsing). The
 /// bash panel needs the original line structure — the old path fed it through
 /// [`summarize_tool_result`], which folded every newline into a `⏎` glyph and
@@ -9756,7 +9704,7 @@ mod tests {
         ]));
 
         // Simulate the user typing "/mo" (the popup shows suggestions).
-        let mut manager = AutocompleteManager::new();
+        let manager = AutocompleteManager::new();
         let mut combined = CombinedAutocompleteProvider::new();
         combined.add_provider(Arc::new(
             SlashCommandAutocompleteProvider::with_default_commands(),

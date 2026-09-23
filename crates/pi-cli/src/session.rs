@@ -1533,6 +1533,7 @@ fn load_reload_settings_snapshot(
 
 /// Validate every settings document that this reload will consume before
 /// replacing any live extension, bridge, or harness resource.
+#[cfg(test)]
 fn validate_settings_for_reload(
     args: &Args,
     cwd: &Path,

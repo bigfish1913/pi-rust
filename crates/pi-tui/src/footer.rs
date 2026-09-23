@@ -300,7 +300,7 @@ impl FooterComponent {
         if usage.cache_write > 0 {
             parts.push(format!("W{}", format_tokens(usage.cache_write)));
         }
-        if (usage.cache_read > 0 || usage.cache_write > 0) {
+        if usage.cache_read > 0 || usage.cache_write > 0 {
             if let Some(rate) = cache_hit {
                 parts.push(format!("CH{rate:.1}%"));
             }

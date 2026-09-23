@@ -83,6 +83,7 @@ pub fn is_focusable(component: &ComponentRef) -> bool {
 mod tests {
     use super::*;
 
+#[allow(dead_code)]
     struct TestComponent {
         content: String,
     }

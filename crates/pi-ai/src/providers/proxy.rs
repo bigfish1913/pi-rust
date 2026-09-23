@@ -42,7 +42,7 @@ use crate::event_stream::AssistantMessageEventStream;
 use crate::model::Model;
 use crate::provider::{Provider, SimpleStreamOptions};
 use crate::providers::anthropic::sse::SseEventStream;
-use crate::types::{AssistantMessage, AssistantRole, Content, Context, DoneReason, StopReason, TextContent, TextContentType, Usage};
+use crate::types::{AssistantRole, Content, Context, DoneReason, TextContent, TextContentType, Usage};
 
 /// Configuration for a proxy provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]

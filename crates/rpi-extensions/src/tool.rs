@@ -59,6 +59,7 @@ pub struct PluginToolHandle {
 /// Serialize an `AgentToolResult` to a JSON string. Used for partials the host
 /// hands to the plugin's partial callback (host-produced → plugin frees via
 /// host `free_string`) and is also the shape the plugin returns for `Done`.
+#[allow(dead_code)]
 fn result_to_json(result: &AgentToolResult) -> String {
     let mut txt = String::new();
     txt.push('{');
