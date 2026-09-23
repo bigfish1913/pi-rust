@@ -573,6 +573,10 @@ async fn list_models(search: &str) -> i32 {
             Vec::new()
         }
     };
+    // Overlay the pi.dev provider catalogs (native `withRemoteCatalog`).
+    // Offline (`PI_OFFLINE`/`--offline`) serves the persisted cache only.
+    let allow_network = !crate::args::offline_mode_enabled(false);
+    let catalog = crate::remote_catalog::merge_into_catalog(catalog, allow_network, None).await;
     let needle = search.trim().to_ascii_lowercase();
     let mut models: Vec<_> = catalog
         .into_iter()

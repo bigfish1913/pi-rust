@@ -69,6 +69,7 @@ pub mod oauth;
 pub mod packages;
 pub mod provider;
 pub mod remote;
+pub mod remote_catalog;
 pub mod resource_dirs;
 pub mod resume_picker;
 pub mod session;
