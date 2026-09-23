@@ -55,6 +55,7 @@ pub mod extension_api;
 pub mod extensions_actions;
 pub mod extras;
 pub mod experimental;
+pub mod fs_watch;
 pub mod install;
 pub mod install_pi;
 pub mod interactive_tui;
