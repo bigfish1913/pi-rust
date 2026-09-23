@@ -639,10 +639,18 @@ pub extern "C" fn trampoline_runtime_action(
     match outcome {
         Ok(rc) => rc,
         Err(_) => {
-            tracing::error!(
-                "runtime_action trampoline panicked — aborting (cannot unwind across FFI)"
-            );
-            std::process::abort();
+            // A panic in the host-side dispatch was caught. Do not abort the
+            // process: report a host-level error to the caller (documented
+            // code `1`) with a structured payload when `out` is writable.
+            tracing::error!("runtime_action trampoline panicked — reporting host error");
+            if !out.is_null() {
+                unsafe {
+                    *out = StbString::from_string(
+                        r#"{"error":"runtime_action panicked"}"#.to_string(),
+                    );
+                }
+            }
+            1
         }
     }
 }
@@ -667,10 +675,15 @@ pub extern "C" fn trampoline_runtime_action_v1(
     match outcome {
         Ok(rc) => rc,
         Err(_) => {
-            tracing::error!(
-                "ABI v1 runtime_action trampoline panicked - aborting (cannot unwind across FFI)"
-            );
-            std::process::abort();
+            tracing::error!("ABI v1 runtime_action trampoline panicked - reporting host error");
+            if !out.is_null() {
+                unsafe {
+                    *out = StbString::from_string(
+                        r#"{"error":"runtime_action panicked"}"#.to_string(),
+                    );
+                }
+            }
+            1
         }
     }
 }

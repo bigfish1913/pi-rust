@@ -236,8 +236,11 @@ extern "C" fn partial_cb_trampoline(partial: StbString, user_data: *mut c_void) 
         let _ = sender.send(result);
     }));
     if outcome.is_err() {
-        tracing::error!("plugin partial callback panicked — aborting (cannot unwind across FFI)");
-        std::process::abort();
+        // A panic inside the *host-side* closure (e.g. a malformed partial that
+        // made `stb_to_result` panic) was caught above. Do NOT abort the
+        // process: log it and move on. The partial StbString may leak on this
+        // rare path, which is preferable to taking the host down.
+        tracing::error!("plugin partial callback panicked — dropped (host continues)");
     }
 }
 
@@ -323,8 +326,15 @@ impl AgentTool for PluginToolAdapter {
                         return;
                     }
                     Err(_) => {
-                        tracing::error!("plugin execute panicked — aborting");
-                        std::process::abort();
+                        // Reached only when the panic unwound into the host
+                        // (plugin `extern "C"` panics abort at the plugin frame
+                        // before we get here). Report a tool error instead of
+                        // aborting the process.
+                        tracing::error!("plugin execute panicked — reporting tool error");
+                        let _ = done_tx.send(Err(AgentError::Tool(format!(
+                            "plugin tool '{schema_name}' panicked during execute"
+                        ))));
+                        return;
                     }
                 }
             };
@@ -345,8 +355,10 @@ impl AgentTool for PluginToolAdapter {
                 })) {
                     Ok(r) => r,
                     Err(_) => {
-                        tracing::error!("plugin poll panicked — aborting");
-                        std::process::abort();
+                        tracing::error!("plugin poll panicked — reporting tool error");
+                        break Err(AgentError::Tool(format!(
+                            "plugin tool '{schema_name}' panicked during poll"
+                        )));
                     }
                 };
                 match step_result.tag {

@@ -1244,6 +1244,35 @@ impl PluginApiVt3Ext {
 pub type RpiPluginRegisterV3 =
     extern "C" fn(api: *const PluginApiVt, ext: *const PluginApiVt3Ext, abi_version: u32) -> i32;
 
+// ===========================================================================
+// Panic containment
+// ===========================================================================
+
+/// Status code a plugin's register entrypoint returns when its body panicked.
+///
+/// A panic must never unwind past the plugin's `extern "C"` entrypoint: Rust
+/// turns such an unwind into a **process abort** (`panic in a function that
+/// cannot unwind`), which would take down the whole host. The SDK catches the
+/// panic and returns this code instead, so the host can skip the plugin with a
+/// diagnostic.
+pub const REGISTER_PANIC_STATUS: i32 = 70;
+
+/// Run `body`, converting a panic into [`Err`] instead of letting it unwind.
+///
+/// Plugin authors must wrap the body of **every** `extern "C"` entrypoint they
+/// export (tool `execute`/`poll`/`cancel`, event handlers, provider/render
+/// callbacks, runtime actions) with this (or an equivalent `catch_unwind`).
+/// Unwinding out of an `extern "C"` function aborts the process.
+pub fn guard<R>(body: impl FnOnce() -> R) -> Result<R, Box<dyn std::any::Any + Send>> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(body))
+}
+
+/// Like [`guard`], but returns `fallback` on panic. Handy for entrypoints that
+/// must return a value rather than a `Result`.
+pub fn guard_or<R>(fallback: R, body: impl FnOnce() -> R) -> R {
+    guard(body).unwrap_or(fallback)
+}
+
 /// Export an ABI v3 plugin entrypoint under `rpi_plugin_register_v3`.
 ///
 /// The expression receives `(&PluginApiVt, &PluginApiVt3Ext)` and returns the
@@ -1302,7 +1331,12 @@ pub unsafe fn register_entrypoint_v3(
     // SAFETY: caller guarantees both pointers are valid; we checked null.
     let api = &*api;
     let ext = &*ext;
-    body(api, ext)
+    // Contain panics: unwinding out of the plugin's `extern "C"` shim aborts
+    // the process, so convert a panic into a status code the host can report.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(api, ext))) {
+        Ok(code) => code,
+        Err(_) => REGISTER_PANIC_STATUS,
+    }
 }
 
 /// Export an ABI v2 plugin entrypoint under `rpi_plugin_register_v2`.
@@ -1364,7 +1398,12 @@ pub unsafe fn register_entrypoint(
     }
     // SAFETY: caller guarantees `api` is valid; we additionally check for null.
     let api = &*api;
-    body(api)
+    // Contain panics (see `REGISTER_PANIC_STATUS`): a panic in the plugin body
+    // must not unwind out of the `extern "C"` entrypoint.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(api))) {
+        Ok(code) => code,
+        Err(_) => REGISTER_PANIC_STATUS,
+    }
 }
 
 // ===========================================================================
@@ -1374,6 +1413,31 @@ pub unsafe fn register_entrypoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A panicking `register` body must NOT unwind out of the entrypoint shim;
+    /// it must come back as `REGISTER_PANIC_STATUS` so the host can skip the
+    /// plugin instead of the process aborting.
+    #[test]
+    fn register_entrypoint_contains_panics() {
+        // The body panics before touching the vtable, so an uninitialized (but
+        // aligned, non-null) pointer is sufficient — it is only dereferenced to
+        // build `&PluginApiVt`, never read.
+        let mut vt = std::mem::MaybeUninit::<PluginApiVt>::uninit();
+        let vt_ptr = vt.as_mut_ptr();
+        let rc = unsafe {
+            register_entrypoint(vt_ptr, RPI_PLUGIN_ABI_VERSION, |_api| {
+                panic!("plugin register exploded");
+            })
+        };
+        assert_eq!(rc, REGISTER_PANIC_STATUS);
+    }
+
+    #[test]
+    fn guard_returns_value_and_contains_panic() {
+        assert_eq!(guard(|| 41 + 1).ok(), Some(42));
+        assert!(guard(|| -> i32 { panic!("nope") }).is_err());
+        assert_eq!(guard_or(-1, || -> i32 { panic!("nope") }), -1);
+    }
 
     // A test allocator + free fn so we can verify the own/free contract
     // without a real plugin's free_string.

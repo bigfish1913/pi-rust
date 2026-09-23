@@ -116,7 +116,29 @@ v2/v3 允许当前定义的 `0..=17`（含 `GetCliFlag`、`UiDialog`）。
   `free_string` 释放。
 - 插件产生的 `StbString`（done 结果、partial 进度、resources_discover 的 out）
   由宿主通过插件注册时提供的 `plugin_free_string` 释放。
-- 每个 `extern "C"` 边界都不能 unwind；插件内部捕获 panic 并转换为错误结果。
+- 每个 `extern "C"` 边界都不能 unwind：**插件内部必须捕获 panic**，否则 Rust
+  会以 `panic in a function that cannot unwind` **终止整个宿主进程**（不是只跳过
+  该扩展）。用 SDK 提供的 `rpi_plugin_sdk::guard` / `guard_or` 包裹每个入口的
+  body（execute/poll/cancel/destroy、事件处理器、resources_discover、provider/
+  render、runtime action）。register 入口由 `export_plugin_v2!` / `export_plugin_v3!`
+  自动包裹：panic 会被转换成 `REGISTER_PANIC_STATUS`，宿主据此跳过该插件并给出
+  诊断，而不是崩溃。
+
+  反例（会拖垮宿主）：
+
+  ```rust,ignore
+  extern "C" fn my_execute(..) -> StepHandle {
+      do_work()          // 若这里 panic，整个 rpi 进程 abort
+  }
+  ```
+
+  正确写法：
+
+  ```rust,ignore
+  extern "C" fn my_execute(..) -> StepHandle {
+      rpi_plugin_sdk::guard_or(std::ptr::null_mut(), || do_work())
+  }
+  ```
 
 完整、可运行的 ABI 模板位于 `examples/plugin-stub/src/lib.rs`。创建新工具时先
 复制生命周期骨架，再替换参数 schema 和领域逻辑，不要重新设计所有权协议。

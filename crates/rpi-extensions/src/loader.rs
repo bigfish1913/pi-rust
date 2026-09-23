@@ -129,7 +129,14 @@ fn call_register(entrypoint: RegisterEntrypoint, host_api: &Arc<HostApi>) -> i32
     // the table valid is consistent with that contract and prevents a
     // use-after-free for plugins that hold the pointer. Bounded: one table per
     // plugin load (a leak of a few dozen bytes per load/reload).
-    match entrypoint {
+    //
+    // Defense in depth: the SDK's `export_plugin_v2!`/`export_plugin_v3!` (and
+    // `register_entrypoint*`) already convert a plugin panic into
+    // `REGISTER_PANIC_STATUS` before it can reach the `extern "C"` boundary.
+    // We still wrap the call so a plugin built against a *newer* `C-unwind`
+    // entrypoint, or a panic raised by host vtable construction, is contained
+    // rather than unwinding through the loader.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match entrypoint {
         RegisterEntrypoint::V3(register) => {
             let vtable: &'static PluginApiVt = Box::leak(Box::new(host_api.build_vtable()));
             let ext: &'static PluginApiVt3Ext =
@@ -152,6 +159,12 @@ fn call_register(entrypoint: RegisterEntrypoint, host_api: &Arc<HostApi>) -> i32
                 LEGACY_PLUGIN_ABI_VERSION,
             )
         }
+    })) {
+        Ok(code) => code,
+        // Reaching here means the panic unwound *into the host* rather than
+        // aborting at the plugin's `extern "C"` frame (e.g. a future
+        // `C-unwind` entrypoint). Report it the same way the SDK does.
+        Err(_) => rpi_plugin_sdk::REGISTER_PANIC_STATUS,
     }
 }
 
@@ -248,16 +261,24 @@ pub fn load_one(
 
     if rc != 0 {
         // The plugin refused (its register returned nonzero — e.g. it saw an
-        // ABI version it didn't like). Skip + diag. The registry may have
-        // partial registrations; we drop it (no harm — the tools registered so
-        // far would reference a plugin that "failed", so we honor the plugin's
-        // refusal and discard).
-        diagnostics.warn(&format!(
-            "plugin {} ABI v{} register returned code {} — skipped",
-            path.display(),
-            abi_version,
-            rc
-        ));
+        // ABI version it didn't like), or its body panicked and the SDK
+        // converted that into `REGISTER_PANIC_STATUS`. Skip + diag. The
+        // registry may have partial registrations; we drop it (no harm — the
+        // tools registered so far would reference a plugin that "failed", so
+        // we honor the refusal and discard).
+        if rc == rpi_plugin_sdk::REGISTER_PANIC_STATUS {
+            diagnostics.warn(&format!(
+                "plugin {} panicked during registration — skipped (the host is unaffected)",
+                path.display()
+            ));
+        } else {
+            diagnostics.warn(&format!(
+                "plugin {} ABI v{} register returned code {} — skipped",
+                path.display(),
+                abi_version,
+                rc
+            ));
+        }
         return Err(PluginLoadError::RegisterReturned { path, code: rc });
     }
 
@@ -1147,6 +1168,54 @@ pub extern "C" fn rpi_plugin_register_v3(
             PluginLoadError::RegisterReturned { code: 73, .. }
         ));
         drop(failed_v2);
+    }
+
+    /// A plugin whose `extern "C"` register body panics must be skipped, not
+    /// crash the host. This mirrors what the SDK's `export_plugin_v2!` /
+    /// `register_entrypoint` do: catch the panic *inside* the plugin and return
+    /// `REGISTER_PANIC_STATUS` so the unwind never reaches the `extern "C"`
+    /// boundary (which would abort the process).
+    #[test]
+    fn panicking_register_body_is_contained_and_skipped() {
+        let diag = Arc::new(CapturingDiag::default());
+        let diag_dyn: Arc<dyn PluginDiagnostics> = diag.clone();
+        let panic_status = rpi_plugin_sdk::REGISTER_PANIC_STATUS;
+        const PREFIX: &str = "use std::ffi::c_void;\n";
+        // The fixture reproduces the SDK shim: an `extern "C"` entrypoint that
+        // runs the (panicking) body behind `catch_unwind`.
+        let source = format!(
+            r#"{PREFIX}
+fn body() -> i32 {{ panic!("register body exploded"); }}
+#[no_mangle]
+pub extern "C" fn rpi_plugin_register_v2(_: *const c_void, abi: u32) -> i32 {{
+    if abi != 2 {{ return 1; }}
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {{
+        Ok(code) => code,
+        Err(_) => {panic_status},
+    }}
+}}
+"#
+        );
+        let fixture = build_cdylib_fixture("abi_v2_panic", &source);
+        // Suppress the default panic message noise from the child's hook.
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = load_one(&fixture.path, diag_dyn, None);
+        std::panic::set_hook(prev_hook);
+
+        match result {
+            Ok(_) => panic!("a panicking register must be skipped, not loaded"),
+            Err(PluginLoadError::RegisterReturned { code, .. }) => {
+                assert_eq!(code, panic_status);
+            }
+            Err(other) => panic!("expected RegisterReturned, got {other:?}"),
+        }
+        let warns = diag.warns.lock().unwrap().clone();
+        assert!(
+            warns.iter().any(|w| w.contains("panicked during registration")),
+            "diagnostic should mention the panic: {warns:?}"
+        );
+        drop(fixture);
     }
 
     #[test]
