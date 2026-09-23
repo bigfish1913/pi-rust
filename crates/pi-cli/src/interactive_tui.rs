@@ -4108,6 +4108,48 @@ fn custom_message_fallback(custom: &rpi_agent::CustomMessage) -> String {
     }
 }
 
+/// Path to the enclosing repository's `.git/HEAD`, if any.
+fn find_git_head_path(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut dir = Some(cwd);
+    while let Some(current) = dir {
+        let head = current.join(".git").join("HEAD");
+        if head.exists() {
+            return Some(head);
+        }
+        dir = current.parent();
+    }
+    None
+}
+
+/// Current git branch for `cwd`, or `None` outside a repository / on error.
+/// Reads `.git/HEAD` directly (no `git` subprocess) so the footer can call it
+/// cheaply at startup.
+fn git_branch_for(cwd: &std::path::Path) -> Option<String> {
+    let mut dir = Some(cwd);
+    while let Some(current) = dir {
+        let head = current.join(".git").join("HEAD");
+        if let Ok(contents) = std::fs::read_to_string(&head) {
+            let trimmed = contents.trim();
+            if let Some(reference) = trimmed.strip_prefix("ref: ") {
+                let branch = reference
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(reference)
+                    .trim()
+                    .to_string();
+                if !branch.is_empty() {
+                    return Some(branch);
+                }
+            }
+            if !trimmed.is_empty() {
+                return Some(trimmed.chars().take(7).collect());
+            }
+        }
+        dir = current.parent();
+    }
+    None
+}
+
 /// The name displayed for a model id (last path segment / after the final
 /// `:`), to keep the footer compact.
 fn short_model_name(id: &str) -> String {
@@ -5072,7 +5114,22 @@ pub async fn interactive_tui(
     // ---- Footer + status ----
     let footer = Arc::new(FooterComponent::new());
     footer.set_model(&model_name);
+    footer.set_cwd(&cwd.to_string_lossy());
+    footer.set_git_branch(git_branch_for(&cwd).as_deref());
+    if let Some(m) = model_catalog.iter().find(|m| m.id == lane_model_id) {
+        footer.set_context_usage(None, m.context_window as i64);
+    }
     footer.set_hints("Enter: Send | Shift+Enter: New line | Ctrl+C: Abort/Exit | Esc: Abort | Ctrl+L: Model | Ctrl+M: Cycle | Ctrl+T: Expand tool | /help");
+
+    // Live git-branch refresh (native fs-watch on `.git/HEAD`): a checkout or
+    // commit updates the footer's branch without a manual refresh.
+    let _branch_watcher = find_git_head_path(&cwd).map(|head| {
+        let footer_ref = footer.clone();
+        let cwd_ref = cwd.clone();
+        crate::fs_watch::watch_path(head, move || {
+            footer_ref.set_git_branch(git_branch_for(&cwd_ref).as_deref());
+        })
+    });
 
     let status_container = Arc::new(Container::new());
     let loader = Arc::new(Loader::with_text("Working…"));
@@ -7320,6 +7377,20 @@ async fn handle_agent_event(
                 // Uses the shared cache-stats logic (noise floor, idle gap,
                 // model change) and prices the miss when known.
                 let usage = &a.usage;
+                // Footer usage totals + cache hit rate (pi footer.ts).
+                state.footer.add_usage(
+                    usage.input,
+                    usage.output,
+                    usage.cache_read,
+                    usage.cache_write,
+                    usage.cost.total,
+                );
+                let denom = usage.input + usage.cache_read + usage.cache_write;
+                if denom > 0 && (usage.cache_read + usage.cache_write) > 0 {
+                    state
+                        .footer
+                        .set_cache_hit_rate(Some(usage.cache_read as f64 / denom as f64 * 100.0));
+                }
                 let miss = state
                     .cache_tracker
                     .lock()
