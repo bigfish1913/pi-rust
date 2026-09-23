@@ -27,8 +27,17 @@
 | §14 Trust gate 细节 | 已实现（基础） | `pi-cli/src/trust.rs`（`TrustStore`/`TrustDecision`）；`pi-cli/src/resource_dirs.rs` 的 `discover_system_prompt_file_with_trust` 按信任策略门控。 |
 | §18 生产 telemetry schema | 已实现 | `pi-telemetry/src/production.rs`：`ProductionTelemetryContext` 输出 JSON span 记录。 |
 | 基础设施（会话/工具） | 已实现 | `pi-harness/src/session/{keyed_queue,resources,search}.rs`（按 key 操作队列、资源清理注册表、会话全文检索）；`pi-tools/src/{image_processing.rs,tools/image.rs,utils/{git,open_browser}.rs}`（图片缩放/转码/EXIF、图片工具、Git URL 解析、跨平台打开浏览器）。 |
+| 基础设施（本轮） | 已实现 | `pi-cli/timings.rs`（PI_TIMING 启动计时）、`pi-cli/experimental.rs`（PI_EXPERIMENTAL）、`pi-cli/session_cwd.rs`（会话 cwd 丢失恢复）、`pi-cli/fs_watch.rs`（文件监听，含错误重试）、`pi-cli/source_info.rs`（资源来源）、`pi-cli/auth_guidance.rs`（登录指引）、`pi-cli/changelog.rs`（远程 changelog）、`pi-cli/attribution.rs`（provider 归因头）。 |
+| §7 缓存统计（cache-stats） | 已实现 | `pi-harness/cache_stats.rs`：提示缓存浪费统计（噪声下限/idle/模型切换/漏读计价），TUI cache-miss notice 改用该逻辑。 |
+| §4 传输：HTTP 代理 + 空闲超时 | 已实现 | `pi-ai/http.rs`：HTTP(S)_PROXY/ALL_PROXY/NO_PROXY 解析（含通配/host:port，拒绝 SOCKS/PAC）、池化 idle timeout、UA；provider 构造统一接入；settings 新增 `httpIdleTimeout`。 |
+| 语法高亮 | 已实现 | `pi-tui/syntax_highlight.rs`（无依赖轻量高亮，块注释跨行），markdown 代码块接入。 |
+| 富 footer | 已实现 | `pi-tui/footer.rs` 两行状态栏（pwd(分支)•会话 / ↑↓RWCH$ 用量 + 上下文占比 + 模型右对齐）；`.git/HEAD` 经 fs_watch 实时刷新。 |
+| §5 远程模型目录 | 已实现 | `pi-cli/remote_catalog.rs`：pi.dev `/api/models/providers/<id>` 拉取 + ETag/Last-Modified + 4h 窗口 + 覆盖合并 + 缓存；`--list-models` 接入。 |
+| 图片生成（SDK） | 已实现 | `pi-ai/images.rs`：ImagesApi/ImagesModel/AssistantImages + registry + `generate_images`；内置 openrouter-images provider。 |
+| §3 二进制协议（CBOR） | 已实现 | `pi-cli/remote/{framing,cbor,codec}.rs`：4 字节分帧 + 严格 CBOR + 流式 MessageDecoder。 |
+| §1 自定义 provider / UA / 归因 | 已实现 | `model_registry` 注册 models.json 新 provider；`http::user_agent`/`ensure_user_agent` 接入 openai-completions/deepseek/openrouter；`attribution.rs` 归因头并入模型头。 |
 
-仍待实现（保留在原文，未在本轮落地）：§1 的**全量** provider 覆盖（按约定只落地 OpenRouter/DeepSeek/LLaMA.cpp/Proxy 子集）、§16 JS bridge 剩余接口（本轮明确放弃）。§7 的 provider 端 deferred 长轮询续跑（`resume_deferred`）当前显式返回 `NotImplemented`，不静默假装完成。
+仍待实现（保留在原文，未在本轮落地）：§1 的**全量** provider 覆盖（按约定只落地 OpenRouter/DeepSeek/LLaMA.cpp/Proxy 子集）、§16 JS bridge 剩余接口 `pi.sendMessage`/`pi.sendUserMessage`（已决定不做）。其余审计项（含 §2/§5/§7/§13/§14/§18、图片生成、CBOR 协议、HTTP 代理、语法高亮、富 footer、远程目录、fs-watch、缓存统计、环境开关、session cwd、结构化诊断、自定义 provider/UA/归因/指引/changelog）均已落地。
 
 ## 判定标准
 
