@@ -55,6 +55,8 @@ impl OpenRouterProvider {
         // X-Title header
         headers.push(("X-Title".to_string(), "Pi Rust".to_string()));
 
+        headers.push(("User-Agent".to_string(), crate::http::user_agent()));
+
         headers
     }
 

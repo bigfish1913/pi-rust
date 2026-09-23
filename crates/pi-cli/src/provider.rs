@@ -629,6 +629,19 @@ fn resolve_with_settings(
             merge_auth_headers(candidate, &headers);
         }
     }
+    // Provider attribution headers (native `mergeProviderAttributionHeaders`):
+    // app-identifying defaults that never clobber user/model headers.
+    for candidate in &mut provider_models {
+        let attribution = crate::attribution::default_attribution_headers(candidate);
+        if attribution.is_empty() {
+            continue;
+        }
+        let mut headers = candidate.headers.clone().unwrap_or_default();
+        for (key, value) in attribution {
+            headers.entry(key).or_insert(value);
+        }
+        candidate.headers = Some(headers);
+    }
     let (provider, has_provider_key): (Arc<dyn Provider>, bool) = match selected_api {
         rpi_ai::Api::AnthropicMessages => {
             let provider_key = selected_anthropic_credential

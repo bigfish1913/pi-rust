@@ -589,7 +589,7 @@ async fn list_models(search: &str) -> i32 {
         .collect();
     if models.is_empty() {
         if needle.is_empty() {
-            println!("No models available");
+            println!("{}", crate::auth_guidance::no_models_available_message());
         } else {
             println!("No models matching \"{search}\"");
         }

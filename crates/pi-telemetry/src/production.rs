@@ -213,25 +213,44 @@ mod tests {
 
     #[test]
     fn test_span_recording() {
-        let mut output = Vec::new();
-        let writer = Arc::new(Mutex::new(Box::new(&mut output) as Box<dyn Write + Send>));
-        
+        // The context owns a `'static` writer, so capture into a shared buffer
+        // rather than borrowing a local `Vec`.
+        let buffer: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> = {
+            let buffer = buffer.clone();
+            Arc::new(Mutex::new(Box::new(SharedBuffer(buffer))))
+        };
+
         let ctx = ProductionTelemetryContext {
             writer,
             session_id: "test_session".to_string(),
             enabled: true,
         };
 
-        let options = SpanOptions::new("test_span")
-            .with_attribute("key", "value");
-        
+        let options = SpanOptions::new("test_span").with_attribute("key", "value");
+
         {
             let _guard = ctx.start_span(options);
         }
 
-        let output_str = String::from_utf8(output).unwrap();
+        let bytes = buffer.lock().unwrap().clone();
+        let output_str = String::from_utf8(bytes).unwrap();
         assert!(output_str.contains("span_start"));
         assert!(output_str.contains("span_end"));
         assert!(output_str.contains("test_span"));
+    }
+
+    /// A `Write` that appends into a shared buffer, so a telemetry context can
+    /// own it for `'static` while the test still reads the bytes back.
+    struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 }

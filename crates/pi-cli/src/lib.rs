@@ -45,7 +45,10 @@
 pub mod agent_session;
 pub mod app;
 pub mod args;
+pub mod attribution;
 pub mod auth;
+pub mod auth_guidance;
+pub mod changelog;
 pub mod config;
 pub mod dev_extension;
 pub mod docs_tool;
@@ -75,6 +78,7 @@ pub mod resume_picker;
 pub mod session;
 pub mod session_cwd;
 pub mod settings;
+pub mod source_info;
 pub mod timings;
 pub mod trust;
 pub mod updates;

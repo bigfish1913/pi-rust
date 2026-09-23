@@ -33,6 +33,26 @@ pub const HTTP_IDLE_TIMEOUT_CHOICES: &[(&str, i64)] = &[
 pub const UNSUPPORTED_PROXY_PROTOCOL_MESSAGE: &str =
     "Unsupported proxy protocol. SOCKS and PAC proxy URLs are not supported; use an HTTP or HTTPS proxy URL.";
 
+/// The User-Agent rpi sends on provider requests (native `getPiUserAgent`).
+pub fn user_agent() -> String {
+    format!(
+        "rpi/{} ({}; {})",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    )
+}
+
+/// Insert a default `user-agent` header unless one is already present
+/// (case-insensitively). Returns true when a header was added.
+pub fn ensure_user_agent(headers: &mut std::collections::BTreeMap<String, String>) -> bool {
+    if headers.keys().any(|k| k.eq_ignore_ascii_case("user-agent")) {
+        return false;
+    }
+    headers.insert("user-agent".to_string(), user_agent());
+    true
+}
+
 fn default_proxy_port(protocol: &str) -> Option<u16> {
     match protocol {
         "ftp" => Some(21),

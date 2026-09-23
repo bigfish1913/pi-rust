@@ -225,32 +225,33 @@ impl ModelRegistry {
         // Parse and validate models
         let mut providers = self.providers.write().map_err(|_| RegistryError::LockPoisoned)?;
         
-        // Update provider models from config
+        // Update existing providers and register providers that appear only in
+        // models.json (native `models.json` custom providers). Previously only
+        // pre-registered providers were updated, so a user-defined provider was
+        // silently ignored.
         for (provider_id, provider_config) in &config.providers {
-            if let Some(info) = providers.get_mut(provider_id) {
-                // Convert ModelDefinition to Model
-                let models: Vec<Model> = provider_config.models.iter().map(|def| {
-                    Model {
-                        id: def.id.clone(),
-                        name: def.name.clone().unwrap_or_else(|| def.id.clone()),
-                        api: rpi_ai::Api::AnthropicMessages, // Default API
-                        provider: provider_id.clone(),
-                        base_url: def.base_url.clone().unwrap_or_default(),
-                        reasoning: def.reasoning.unwrap_or(false),
-                        thinking_level_map: None,
-                        input: vec![],
-                        cost: rpi_ai::types::ModelCost::default(),
-                        context_window: def.context_window.unwrap_or(0),
-                        max_tokens: def.max_tokens.unwrap_or(0),
-                        sampling_params: None,
-                        headers: def.headers.clone(),
-                        compat: None,
-                    }
-                }).collect();
-                
-                // Update models for this provider
-                info.models = models;
+            if let Some(models) = crate::config::provider_to_models(provider_id, provider_config) {
+                if let Some(info) = providers.get_mut(provider_id) {
+                    info.models = models;
+                    continue;
+                }
             }
+            // New provider: register it from models.json.
+            let models = crate::config::provider_to_models(provider_id, provider_config)
+                .unwrap_or_default();
+            providers.insert(
+                provider_id.clone(),
+                ProviderInfo {
+                    id: provider_id.clone(),
+                    name: provider_config
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| provider_id.clone()),
+                    builtin: false,
+                    auth_status: AuthStatus::Unknown,
+                    models,
+                },
+            );
         }
         
         drop(providers);

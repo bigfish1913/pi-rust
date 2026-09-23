@@ -131,6 +131,9 @@ async fn run_stream(
         }
     }
     apply_api_key(&mut headers, api_key);
+    // Identify rpi on provider requests (native `getPiUserAgent`), unless the
+    // caller/model already set a User-Agent.
+    crate::http::ensure_user_agent(&mut headers);
     if !has_auth_header(&headers) {
         state.error(
             producer,

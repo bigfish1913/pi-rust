@@ -49,6 +49,8 @@ impl DeepSeekProvider {
             headers.push(("Authorization".to_string(), format!("Bearer {}", key)));
         }
 
+        headers.push(("User-Agent".to_string(), crate::http::user_agent()));
+
         headers
     }
 
