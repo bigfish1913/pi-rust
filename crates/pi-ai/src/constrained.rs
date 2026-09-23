@@ -26,25 +26,12 @@
 //! ```rust
 //! use rpi_ai::constrained::{GrammarConstraint, GrammarFormat};
 //!
-//! // Define a constraint: output must match this regex
-//! let constraint = GrammarConstraint {
-//!     format: GrammarFormat::Regex,
-//!     definition: r"^\d{3}-\d{2}-\d{4}$".to_string(), // SSN format
-//!     input_property: Some("value".to_string()),
-//! };
+//! // Define a constraint: output must match this SSN-shaped regex.
+//! let constraint = GrammarConstraint::regex(r"^\d{3}-\d{2}-\d{4}$")
+//!     .with_input_property("value");
 //!
-//! // Apply to a tool definition
-//! let tool = ToolDefinition {
-//!     name: "extract_ssn".to_string(),
-//!     description: "Extract Social Security Number".to_string(),
-//!     input_schema: json!({
-//!         "type": "object",
-//!         "properties": {
-//!             "value": {"type": "string"}
-//!         }
-//!     }),
-//!     constraint: Some(constraint),
-//! };
+//! assert_eq!(constraint.format, GrammarFormat::Regex);
+//! assert_eq!(constraint.input_property.as_deref(), Some("value"));
 //! ```
 
 use serde::{Deserialize, Serialize};
