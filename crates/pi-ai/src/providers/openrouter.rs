@@ -31,10 +31,10 @@ pub struct OpenRouterProvider {
 impl OpenRouterProvider {
     /// Create a new OpenRouter provider
     pub fn new(api_key: Option<String>) -> Self {
-        Self {
-            client: Client::new(),
-            api_key,
-        }
+        // Shared HTTP builder: HTTP_PROXY/NO_PROXY + pooled idle timeout.
+        let client = crate::http::build_client(OPENROUTER_API_BASE, None, None)
+            .unwrap_or_else(|_| Client::new());
+        Self { client, api_key }
     }
 
     /// Build request headers

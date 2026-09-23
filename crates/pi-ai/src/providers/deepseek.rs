@@ -30,10 +30,11 @@ pub struct DeepSeekProvider {
 impl DeepSeekProvider {
     /// Create a new DeepSeek provider
     pub fn new(api_key: Option<String>) -> Self {
-        Self {
-            client: Client::new(),
-            api_key,
-        }
+        // Route through the shared HTTP builder so HTTP_PROXY/NO_PROXY and the
+        // pooled-connection idle timeout apply uniformly.
+        let client = crate::http::build_client(DEEPSEEK_API_BASE, None, None)
+            .unwrap_or_else(|_| Client::new());
+        Self { client, api_key }
     }
 
     /// Build request headers

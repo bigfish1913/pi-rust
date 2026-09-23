@@ -110,7 +110,13 @@ impl AnthropicProvider {
     /// `ANTHROPIC_API_KEY` env). Mirrors how the smoke test constructs a
     /// provider without a pre-resolved key.
     pub fn from_env() -> Self {
-        let http = reqwest::Client::new();
+        // httpx-style: honor HTTP_PROXY/HTTPS_PROXY/NO_PROXY + idle timeout.
+        let http = crate::http::build_client(
+            "https://api.anthropic.com",
+            None,
+            None,
+        )
+        .unwrap_or_else(|_| reqwest::Client::new());
         Self::new(None, http)
     }
 

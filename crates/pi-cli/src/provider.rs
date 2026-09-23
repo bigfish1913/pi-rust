@@ -267,6 +267,23 @@ pub enum ResolveError {
 /// `--api-key` value (optional; highest-priority `x-api-key` source).
 /// `cli_base_url` is the `--base-url` value (optional; overrides
 /// `ANTHROPIC_BASE_URL` + each model's `base_url`).
+/// Build the provider HTTP client honoring system proxy settings and the
+/// `httpIdleTimeout` setting. Uses the model's own `base_url` when present (so
+/// `NO_PROXY` matches the real host), else `default_base_url`.
+fn provider_http_client(
+    models: &[Model],
+    default_base_url: &str,
+    settings: &settings::Settings,
+) -> reqwest::Client {
+    let base_url = models
+        .iter()
+        .map(|m| m.base_url.as_str())
+        .find(|u| !u.is_empty())
+        .unwrap_or(default_base_url);
+    rpi_ai::http::build_client(base_url, settings.http_idle_timeout_ms(), None)
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 pub fn resolve(
     cli_provider: Option<&str>,
     cli_model: Option<&str>,
@@ -619,22 +636,15 @@ fn resolve_with_settings(
                 .and_then(AnthropicCredential::provider_key)
                 .map(str::to_string);
             let has_key = provider_key.is_some();
+            let http = provider_http_client(&provider_models, "https://api.anthropic.com", &settings);
             let inner = if selected_provider == DEFAULT_PROVIDER_ID
                 && !matches!(
                     selected_anthropic_credential,
                     Some(AnthropicCredential::Headers(_))
                 ) {
-                AnthropicProvider::with_models(
-                    provider_key,
-                    reqwest::Client::new(),
-                    provider_models,
-                )
+                AnthropicProvider::with_models(provider_key, http, provider_models)
             } else {
-                AnthropicProvider::with_models_without_env_api_key(
-                    provider_key,
-                    reqwest::Client::new(),
-                    provider_models,
-                )
+                AnthropicProvider::with_models_without_env_api_key(provider_key, http, provider_models)
             };
             (
                 Arc::new(NamedAnthropicProvider {
@@ -646,18 +656,19 @@ fn resolve_with_settings(
         }
         rpi_ai::Api::OpenaiCompletions => {
             let has_key = selected_openai_key.is_some();
+            let http = provider_http_client(&provider_models, "https://api.openai.com/v1", &settings);
             let inner = if selected_provider == "openai" {
                 OpenAiCompletionsProvider::with_models(
                     selected_provider,
                     selected_openai_key,
-                    reqwest::Client::new(),
+                    http,
                     provider_models,
                 )
             } else {
                 OpenAiCompletionsProvider::with_models_without_env_api_key(
                     selected_provider,
                     selected_openai_key,
-                    reqwest::Client::new(),
+                    http,
                     provider_models,
                 )
             };
@@ -665,18 +676,19 @@ fn resolve_with_settings(
         }
         rpi_ai::Api::OpenaiResponses => {
             let has_key = selected_openai_key.is_some();
+            let http = provider_http_client(&provider_models, "https://api.openai.com/v1", &settings);
             let inner = if selected_provider == "openai" {
                 OpenAiResponsesProvider::with_models(
                     selected_provider,
                     selected_openai_key,
-                    reqwest::Client::new(),
+                    http,
                     provider_models,
                 )
             } else {
                 OpenAiResponsesProvider::with_models_without_env_api_key(
                     selected_provider,
                     selected_openai_key,
-                    reqwest::Client::new(),
+                    http,
                     provider_models,
                 )
             };

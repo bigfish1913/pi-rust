@@ -146,6 +146,21 @@ pub struct Settings {
     /// When false, text selection requires explicit copy action.
     #[serde(default)]
     pub fullscreen_copy_on_select: Option<bool>,
+    /// How long idle pooled HTTP connections are kept before being closed.
+    /// Accepts a millisecond number or the string `"disabled"`. Native pi
+    /// `httpIdleTimeout`.
+    #[serde(default)]
+    pub http_idle_timeout: Option<serde_json::Value>,
+}
+
+impl Settings {
+    /// Resolved HTTP idle timeout in milliseconds (`None` ⇒ library default,
+    /// `Some(0)` ⇒ disabled). See [`rpi_ai::http::parse_http_idle_timeout_ms`].
+    pub fn http_idle_timeout_ms(&self) -> Option<i64> {
+        self.http_idle_timeout
+            .as_ref()
+            .and_then(rpi_ai::http::parse_http_idle_timeout_ms)
+    }
 }
 
 /// Load `~/.rpi/agent/settings.json`. Missing file ⇒ `Settings::default()`

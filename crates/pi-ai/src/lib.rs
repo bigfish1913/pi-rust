@@ -12,6 +12,8 @@
 
 pub mod error;
 pub mod event_stream;
+#[cfg(feature = "providers")]
+pub mod http;
 pub mod model;
 pub mod provider;
 pub mod providers;
