@@ -8,13 +8,16 @@
 //!
 //! ```text
 //! 2026-09-24T12:00:01.234Z code=Char('h') mods=NONE kind=Press
-//! 2026-09-24T12:00:01.235Z code=Enter mods=NONE kind=Press gap_ms=1 more_queued=false -> newline (paste burst)
+//! 2026-09-24T12:00:01.235Z code=Enter mods=NONE kind=Press gap_ms=1 more_queued=false -> newline (paste burst, Windows only)
 //! ```
 //!
-//! A remote client that sends LF for its Enter key shows up here as
-//! `code=Char('j') mods=CONTROL` — both `crossterm` (raw mode) and the Windows
-//! console translate `0x0A` into Ctrl+J, which the editor binds to "insert
-//! newline" (mirroring `tui.input.newLine`).
+//! What a remote client sends for Enter varies. A phone/RDP client that
+//! injects a real key event shows up as `code=Enter mods=NONE` (and
+//! `mods=SHIFT` when Shift is held), while one that encodes Enter as a bare LF
+//! shows up as `code=Char('j') mods=CONTROL` — in raw mode crossterm decodes the
+//! byte `0x0A` through its control-code table (`0x0A` is both LF and Ctrl+J).
+//! On Windows the paste-burst decision also prints `more_queued=`, which is why
+//! the probe ignores a key's own `Release` event.
 //!
 //! Tracing is off unless the env var is set: when disabled the cost is a single
 //! `OnceLock` lookup per key.

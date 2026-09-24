@@ -1108,7 +1108,7 @@ fn create_tool_result_message(
         usage: result.usage.clone(),
         added_tool_names: result.added_tool_names.clone(),
         is_error,
-        timestamp: now_ms(),
+        timestamp: crate::clock::now_ms(),
     }
 }
 
@@ -1220,14 +1220,6 @@ async fn should_stop_after_turn(
 /// Emit one event via the emitter.
 async fn emit_event(emit: &Arc<dyn AgentEmitter>, event: AgentEvent) {
     emit.emit(event).await;
-}
-
-/// Monotonic-ish ms timestamp. The loop only needs ordering + JSONL serializability,
-/// not wall-clock accuracy. Uses an atomic counter so tests are deterministic.
-fn now_ms() -> i64 {
-    use std::sync::atomic::{AtomicI64, Ordering};
-    static T: AtomicI64 = AtomicI64::new(1);
-    T.fetch_add(1, Ordering::Relaxed)
 }
 
 /// A placeholder tool call for the panic-recovery path.

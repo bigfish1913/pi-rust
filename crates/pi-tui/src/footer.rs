@@ -113,6 +113,10 @@ pub struct FooterComponent {
     cache_hit_rate: Mutex<Option<f64>>,
     /// Context usage percent (0..=100), when known.
     context_percent: Mutex<Option<f64>>,
+    /// Latest context-token count reported by an assistant response, when
+    /// known. The percent is derived from this against `context_window`; `None`
+    /// renders `?` (no post-compaction usage yet, or nothing reported).
+    context_tokens: Mutex<Option<i64>>,
     /// Model context window in tokens (0 ⇒ unknown).
     context_window: Mutex<i64>,
     /// Whether auto-compaction is enabled (renders the `(auto)` suffix).
@@ -138,6 +142,7 @@ impl FooterComponent {
             usage: Mutex::new(UsageTotals::default()),
             cache_hit_rate: Mutex::new(None),
             context_percent: Mutex::new(None),
+            context_tokens: Mutex::new(None),
             context_window: Mutex::new(0),
             auto_compact: Mutex::new(true),
         }
@@ -207,14 +212,7 @@ impl FooterComponent {
     }
 
     /// Add one turn's usage to the running totals (line 2).
-    pub fn add_usage(
-        &self,
-        input: i64,
-        output: i64,
-        cache_read: i64,
-        cache_write: i64,
-        cost: f64,
-    ) {
+    pub fn add_usage(&self, input: i64, output: i64, cache_read: i64, cache_write: i64, cost: f64) {
         if let Ok(mut u) = self.usage.lock() {
             u.add(input, output, cache_read, cache_write, cost);
         }
@@ -234,6 +232,39 @@ impl FooterComponent {
         }
         if let Ok(mut w) = self.context_window.lock() {
             *w = window;
+        }
+    }
+
+    /// Record the context-token count reported by the latest assistant
+    /// response and recompute the displayed `%`. Pass `None` to reset the
+    /// badge to `?` — e.g. after a compaction, when the last usage describes
+    /// the pre-compaction context (mirrors pi's `percent: null`).
+    pub fn set_context_tokens(&self, tokens: Option<i64>) {
+        if let Ok(mut t) = self.context_tokens.lock() {
+            *t = tokens;
+        }
+        self.recompute_context_percent();
+    }
+
+    /// Set the model's context window and recompute the `%` against the
+    /// tracked token count (a model switch changes the denominator).
+    pub fn set_context_window(&self, window: i64) {
+        if let Ok(mut w) = self.context_window.lock() {
+            *w = window;
+        }
+        self.recompute_context_percent();
+    }
+
+    /// Derive the context-usage percent from the tracked tokens/window.
+    fn recompute_context_percent(&self) {
+        let window = *self.context_window.lock().unwrap();
+        let tokens = *self.context_tokens.lock().unwrap();
+        let percent = match (tokens, window) {
+            (Some(t), w) if t > 0 && w > 0 => Some(t as f64 / w as f64 * 100.0),
+            _ => None,
+        };
+        if let Ok(mut p) = self.context_percent.lock() {
+            *p = percent;
         }
     }
 
@@ -312,10 +343,7 @@ impl FooterComponent {
         // Context usage: colorized by pressure like native pi.
         let auto_indicator = if auto { " (auto)" } else { "" };
         let context_display = match context_percent {
-            Some(p) => format!(
-                "{p:.1}%/{}{auto_indicator}",
-                format_tokens(context_window)
-            ),
+            Some(p) => format!("{p:.1}%/{}{auto_indicator}", format_tokens(context_window)),
             None if context_window > 0 => {
                 format!("?/{}{auto_indicator}", format_tokens(context_window))
             }
@@ -498,7 +526,11 @@ mod tests {
         footer.set_hints("Ctrl+C: Exit | Shift+Enter: Send | Ctrl+L: Clear | More hints here");
         let lines = footer.render(40);
         for line in &lines {
-            assert!(visible_width(line) <= 40, "row too wide: {}", visible_width(line));
+            assert!(
+                visible_width(line) <= 40,
+                "row too wide: {}",
+                visible_width(line)
+            );
         }
     }
 
@@ -537,6 +569,30 @@ mod tests {
     }
 
     #[test]
+    fn context_badge_derives_percent_from_reported_tokens() {
+        let footer = FooterComponent::new();
+        footer.set_context_window(512_000);
+        // No response yet → unknown, the `?` badge native pi shows.
+        let stats = strip_ansi(&footer.render(120).join("\n"));
+        assert!(stats.contains("?/512k"), "stats: {stats}");
+
+        // A reported token count fills in the percent against the window.
+        footer.set_context_tokens(Some(256_000));
+        let stats = strip_ansi(&footer.render(120).join("\n"));
+        assert!(stats.contains("50.0%/512k"), "stats: {stats}");
+
+        // Switching the model rescales the same token count.
+        footer.set_context_window(128_000);
+        let stats = strip_ansi(&footer.render(120).join("\n"));
+        assert!(stats.contains("200.0%/128k"), "stats: {stats}");
+
+        // `None` (e.g. right after a compaction) resets to `?`.
+        footer.set_context_tokens(None);
+        let stats = strip_ansi(&footer.render(120).join("\n"));
+        assert!(stats.contains("?/128k"), "stats: {stats}");
+    }
+
+    #[test]
     fn format_tokens_compacts() {
         assert_eq!(format_tokens(999), "999");
         assert_eq!(format_tokens(1_500), "1.5k");
@@ -546,7 +602,10 @@ mod tests {
 
     #[test]
     fn cwd_home_relative() {
-        assert_eq!(format_cwd_for_footer("/home/u/proj", Some("/home/u")), "~/proj");
+        assert_eq!(
+            format_cwd_for_footer("/home/u/proj", Some("/home/u")),
+            "~/proj"
+        );
         assert_eq!(format_cwd_for_footer("/home/u", Some("/home/u")), "~");
         assert_eq!(format_cwd_for_footer("/other", Some("/home/u")), "/other");
         assert_eq!(format_cwd_for_footer("/x", None), "/x");

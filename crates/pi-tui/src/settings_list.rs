@@ -1,9 +1,14 @@
 //! Settings list component.
 //!
-//! A list of settings with navigation and modification support.
+//! A list of settings with navigation and in-place value cycling. Port of
+//! native pi's `components/settings-list.ts`: Up/Down navigate, Enter (or
+//! Space) activates the row — cycling to the next value, or invoking the
+//! `submenu` callback for rows that open a nested selector — and Esc cancels.
 
 use std::any::Any;
 use std::sync::{Arc, Mutex};
+
+use crossterm::event::{KeyCode, KeyEvent};
 
 use super::component::Component;
 use super::fuzzy::fuzzy_filter;
@@ -22,6 +27,12 @@ pub struct SettingItem {
     pub description: Option<String>,
     /// Setting type.
     pub setting_type: SettingType,
+    /// Values cycled through by [`SettingsList::activate`]. Empty for submenu
+    /// triggers and read-only rows.
+    pub values: Vec<String>,
+    /// Whether activating the row should call `on_select` (open a submenu)
+    /// rather than cycle `values`.
+    pub has_submenu: bool,
 }
 
 impl SettingItem {
@@ -33,6 +44,8 @@ impl SettingItem {
             value: value.to_string(),
             description: None,
             setting_type: SettingType::String,
+            values: Vec::new(),
+            has_submenu: false,
         }
     }
 
@@ -45,6 +58,21 @@ impl SettingItem {
     /// Set setting type.
     pub fn with_type(mut self, setting_type: SettingType) -> Self {
         self.setting_type = setting_type;
+        self
+    }
+
+    /// The cycle order for this row. Activating the row advances to the next
+    /// value and fires `on_change`. Empty ⇒ the row is a submenu trigger or a
+    /// read-only display.
+    pub fn with_values(mut self, values: &[&str]) -> Self {
+        self.values = values.iter().map(|v| v.to_string()).collect();
+        self
+    }
+
+    /// Mark the row as a submenu trigger: activating it calls `on_select`
+    /// instead of cycling values.
+    pub fn with_submenu(mut self) -> Self {
+        self.has_submenu = true;
         self
     }
 }
@@ -94,6 +122,7 @@ pub struct SettingsList {
     filter: Mutex<String>,
     on_change: Mutex<Option<Arc<dyn Fn(&str, &str) + Send + Sync>>>,
     on_select: Mutex<Option<Arc<dyn Fn(&SettingItem) + Send + Sync>>>,
+    on_cancel: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl SettingsList {
@@ -108,6 +137,7 @@ impl SettingsList {
             filter: Mutex::new(String::new()),
             on_change: Mutex::new(None),
             on_select: Mutex::new(None),
+            on_cancel: Mutex::new(None),
         }
     }
 
@@ -122,6 +152,7 @@ impl SettingsList {
             filter: Mutex::new(String::new()),
             on_change: Mutex::new(None),
             on_select: Mutex::new(None),
+            on_cancel: Mutex::new(None),
         }
     }
 
@@ -130,17 +161,22 @@ impl SettingsList {
         if let Ok(mut f) = self.filter.lock() {
             *f = filter.to_string();
         }
+        self.refilter();
+        // A changed query resets the cursor to the first match.
+        if let Ok(mut idx) = self.selected_index.lock() {
+            *idx = 0;
+        }
+    }
 
+    /// Rebuild the visible rows from the current filter without moving the
+    /// cursor (a value change must not jump the selection back to the top).
+    fn refilter(&self) {
+        let filter = self.filter.lock().map(|f| f.clone()).unwrap_or_default();
         if let Ok(settings) = self.settings.lock() {
-            let filtered = fuzzy_filter(&*settings, filter, |item| item.key.as_str());
+            let filtered = fuzzy_filter(&*settings, &filter, |item| item.key.as_str());
             if let Ok(mut f) = self.filtered.lock() {
                 *f = filtered;
             }
-        }
-
-        // Reset selection
-        if let Ok(mut idx) = self.selected_index.lock() {
-            *idx = 0;
         }
     }
 
@@ -221,9 +257,12 @@ impl SettingsList {
             }
         }
 
-        // Update filtered list
-        if let Ok(filter) = self.filter.lock() {
-            self.set_filter(&filter);
+        // Refresh the visible rows but keep the cursor where the user was.
+        self.refilter();
+        if let Ok(mut idx) = self.selected_index.lock() {
+            if let Ok(filtered) = self.filtered.lock() {
+                *idx = (*idx).min(filtered.len().saturating_sub(1));
+            }
         }
     }
 
@@ -239,6 +278,90 @@ impl SettingsList {
         if let Ok(mut cb) = self.on_select.lock() {
             *cb = Some(callback);
         }
+    }
+
+    /// Set cancel callback (Esc). Native pi's `SettingsList.onCancel`.
+    pub fn on_cancel(&self, callback: Arc<dyn Fn() + Send + Sync>) {
+        if let Ok(mut cb) = self.on_cancel.lock() {
+            *cb = Some(callback);
+        }
+    }
+
+    /// Fire the cancel callback.
+    pub fn cancel(&self) {
+        if let Ok(cb) = self.on_cancel.lock() {
+            if let Some(callback) = cb.as_ref() {
+                callback();
+            }
+        }
+    }
+
+    /// Activate the selected row: open its submenu, or cycle to the next value.
+    /// Mirrors native pi's `SettingsList.activateItem`.
+    ///
+    /// Returns the new value when a value was cycled.
+    pub fn activate(&self) -> Option<(String, String)> {
+        let item = self.get_selected()?;
+        if item.has_submenu {
+            if let Ok(cb) = self.on_select.lock() {
+                if let Some(callback) = cb.as_ref() {
+                    callback(&item);
+                }
+            }
+            return None;
+        }
+        if item.values.is_empty() {
+            return None;
+        }
+        let current = item
+            .values
+            .iter()
+            .position(|value| value == &item.value)
+            .unwrap_or(item.values.len().saturating_sub(1));
+        let next = item.values[(current + 1) % item.values.len()].clone();
+        self.update_value(&item.key, &next);
+        if let Ok(cb) = self.on_change.lock() {
+            if let Some(callback) = cb.as_ref() {
+                callback(&item.key, &next);
+            }
+        }
+        Some((item.key, next))
+    }
+
+    /// Route a key: Up/Down navigate, Enter or Space activates, Esc cancels.
+    /// Mirrors native pi's `SettingsList.handleInput`.
+    pub fn handle_key(&self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Up => self.move_up(),
+            KeyCode::Down => self.move_down(),
+            KeyCode::Enter => {
+                self.activate();
+            }
+            KeyCode::Char(' ') => {
+                self.activate();
+            }
+            KeyCode::Esc => self.cancel(),
+            _ => {}
+        }
+    }
+
+    /// The current value of `key`, if the row exists.
+    pub fn value_of(&self, key: &str) -> Option<String> {
+        let settings = self.settings.lock().ok()?;
+        settings
+            .iter()
+            .find(|item| item.key == key)
+            .map(|item| item.value.clone())
+    }
+
+    /// Replace every row (used to rebuild after an external settings change
+    /// without reopening the selector).
+    pub fn set_items(&self, settings: Vec<SettingItem>) {
+        let filter = self.filter.lock().map(|f| f.clone()).unwrap_or_default();
+        if let Ok(mut guard) = self.settings.lock() {
+            *guard = settings;
+        }
+        self.set_filter(&filter);
     }
 
     /// Confirm selection.
@@ -387,5 +510,98 @@ mod tests {
         let selected = list.get_selected();
         assert!(selected.is_some());
         assert_eq!(selected.unwrap().key, "theme");
+    }
+
+    #[test]
+    fn activate_cycles_values_and_fires_change() {
+        let settings = vec![SettingItem::new("hide-thinking", "Hide thinking", "false")
+            .with_values(&["true", "false"])];
+        let list = SettingsList::new(settings);
+
+        let changes: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let changes_cb = changes.clone();
+        list.on_change(Arc::new(move |key, value| {
+            changes_cb
+                .lock()
+                .unwrap()
+                .push((key.to_string(), value.to_string()));
+        }));
+
+        // current "false" -> next in cycle is "true"
+        assert_eq!(
+            list.activate(),
+            Some(("hide-thinking".to_string(), "true".to_string()))
+        );
+        assert_eq!(list.value_of("hide-thinking").as_deref(), Some("true"));
+        // Cycling wraps back around.
+        list.activate();
+        assert_eq!(list.value_of("hide-thinking").as_deref(), Some("false"));
+        assert_eq!(changes.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn activating_a_value_preserves_the_cursor() {
+        let settings = vec![
+            SettingItem::new("a", "Auto-compact", "true").with_values(&["true", "false"]),
+            SettingItem::new("b", "Steering mode", "all").with_values(&["all", "one-at-a-time"]),
+            SettingItem::new("c", "Quiet startup", "false").with_values(&["true", "false"]),
+        ];
+        let list = SettingsList::new(settings);
+        list.move_down();
+        assert_eq!(list.get_selected().unwrap().key, "b");
+        list.activate();
+        // Native pi keeps the cursor on the row the user just changed.
+        assert_eq!(list.get_selected().unwrap().key, "b");
+        assert_eq!(
+            list.get_selected().unwrap().value,
+            "one-at-a-time",
+            "value should have cycled in place"
+        );
+    }
+
+    #[test]
+    fn submenu_row_calls_select_instead_of_cycling() {
+        let settings = vec![SettingItem::new("theme", "Theme", "dark").with_submenu()];
+        let list = SettingsList::new(settings);
+        let opened: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let opened_cb = opened.clone();
+        list.on_select(Arc::new(move |item| {
+            opened_cb.lock().unwrap().push(item.key.clone());
+        }));
+        assert_eq!(list.activate(), None);
+        assert_eq!(opened.lock().unwrap().as_slice(), ["theme"]);
+        // Value untouched.
+        assert_eq!(list.value_of("theme").as_deref(), Some("dark"));
+    }
+
+    #[test]
+    fn handle_key_routes_navigation_activation_and_cancel() {
+        use crossterm::event::{KeyCode, KeyEvent};
+        let settings = vec![
+            SettingItem::new("a", "Alpha", "1").with_values(&["1", "2"]),
+            SettingItem::new("b", "Beta", "x").with_values(&["x", "y"]),
+        ];
+        let list = SettingsList::new(settings);
+        let cancelled = Arc::new(Mutex::new(false));
+        let cancelled_cb = cancelled.clone();
+        list.on_cancel(Arc::new(move || {
+            *cancelled_cb.lock().unwrap() = true;
+        }));
+
+        list.handle_key(KeyEvent::new(
+            KeyCode::Down,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(list.get_selected().unwrap().key, "b");
+        list.handle_key(KeyEvent::new(
+            KeyCode::Char(' '),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(list.value_of("b").as_deref(), Some("y"));
+        list.handle_key(KeyEvent::new(
+            KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(*cancelled.lock().unwrap());
     }
 }

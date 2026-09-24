@@ -146,11 +146,46 @@ pub struct Settings {
     /// When false, text selection requires explicit copy action.
     #[serde(default)]
     pub fullscreen_copy_on_select: Option<bool>,
+    /// Horizontal padding in terminal columns added to each side of the chat
+    /// transcript (user/assistant messages and thinking). Native pi `outputPad`
+    /// (its only legal values are 0 and 1).
+    #[serde(default)]
+    pub output_pad: Option<usize>,
+    /// Show transcript notices for prompt-cache costs and provider recovery
+    /// diagnostics. Native pi `showCacheMissNotices` (default `false`).
+    #[serde(default)]
+    pub show_cache_miss_notices: Option<bool>,
+    /// Render images inline in the terminal. rpi stores this at the top level
+    /// under `showImages`; native pi nests it as `terminal.showImages`, which
+    /// [`TerminalSettings`] also accepts (see [`Settings::show_images`]).
+    #[serde(default)]
+    pub show_images: Option<bool>,
+    /// Native pi's nested `terminal` settings block. rpi keeps its own flat
+    /// keys for the settings it has always written, but reads this block so a
+    /// native `settings.json` is honored.
+    #[serde(default)]
+    pub terminal: Option<TerminalSettings>,
     /// How long idle pooled HTTP connections are kept before being closed.
     /// Accepts a millisecond number or the string `"disabled"`. Native pi
-    /// `httpIdleTimeout`.
+    /// `httpIdleTimeout`. rpi surface: `httpIdleTimeout`.
     #[serde(default)]
     pub http_idle_timeout: Option<serde_json::Value>,
+}
+
+/// Native pi's `terminal` settings block (`TerminalSettings`). Only the fields
+/// rpi can honor are modeled; unknown keys are ignored.
+#[derive(serde::Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalSettings {
+    /// `terminal.showImages` — render images inline.
+    #[serde(default)]
+    pub show_images: Option<bool>,
+    /// `terminal.showTerminalProgress` — OSC 9;4 terminal progress indicator.
+    #[serde(default)]
+    pub show_terminal_progress: Option<bool>,
+    /// `terminal.clearOnShrink` — clear empty rows when content shrinks.
+    #[serde(default)]
+    pub clear_on_shrink: Option<bool>,
 }
 
 impl Settings {
@@ -160,6 +195,23 @@ impl Settings {
         self.http_idle_timeout
             .as_ref()
             .and_then(rpi_ai::http::parse_http_idle_timeout_ms)
+    }
+
+    /// Render images inline. rpi's flat `showImages` wins; native pi's nested
+    /// `terminal.showImages` is the fallback.
+    pub fn show_images(&self) -> Option<bool> {
+        self.show_images
+            .or_else(|| self.terminal.as_ref().and_then(|t| t.show_images))
+    }
+
+    /// Terminal progress indicator. rpi's flat `showTerminalProgress` wins;
+    /// native pi's nested `terminal.showTerminalProgress` is the fallback.
+    pub fn show_terminal_progress(&self) -> Option<bool> {
+        self.show_terminal_progress.or_else(|| {
+            self.terminal
+                .as_ref()
+                .and_then(|t| t.show_terminal_progress)
+        })
     }
 }
 
@@ -505,9 +557,31 @@ fn save_settings_to_path(
             settings.show_terminal_progress.map(serde_json::Value::Bool),
         ),
         (
+            "showImages",
+            settings.show_images.map(serde_json::Value::Bool),
+        ),
+        (
+            "showCacheMissNotices",
+            settings
+                .show_cache_miss_notices
+                .map(serde_json::Value::Bool),
+        ),
+        (
+            "fullscreenCopyOnSelect",
+            settings
+                .fullscreen_copy_on_select
+                .map(serde_json::Value::Bool),
+        ),
+        (
             "editorPaddingX",
             settings
                 .editor_padding_x
+                .map(|v| serde_json::Value::Number(v.into())),
+        ),
+        (
+            "outputPad",
+            settings
+                .output_pad
                 .map(|v| serde_json::Value::Number(v.into())),
         ),
         (
@@ -516,6 +590,7 @@ fn save_settings_to_path(
                 .autocomplete_max_visible
                 .map(|v| serde_json::Value::Number(v.into())),
         ),
+        ("httpIdleTimeout", settings.http_idle_timeout.clone()),
     ] {
         match value {
             Some(value) => {
@@ -856,6 +931,69 @@ mod scoped_tests {
             path.file_name().and_then(|name| name.to_str()).unwrap()
         ));
         assert!(!temp.exists(), "atomic staging file should not remain");
+    }
+
+    #[test]
+    fn save_preserves_unknown_fields_and_writes_the_tui_settings() {
+        // Regression: `fullscreenCopyOnSelect` and `httpIdleTimeout` used to be
+        // read but never written back, so `/settings` changes silently
+        // vanished. The newer `/settings` rows (showImages,
+        // showCacheMissNotices, outputPad) must round-trip too.
+        let (_tmp, _guard) = with_temp_env();
+        let path = config::settings_path().unwrap();
+        let mut settings = Settings::default();
+        settings.show_images = Some(false);
+        settings.show_cache_miss_notices = Some(true);
+        settings.output_pad = Some(0);
+        settings.fullscreen_copy_on_select = Some(false);
+        settings.http_idle_timeout = Some(serde_json::json!(30_000));
+        settings.show_terminal_progress = Some(false);
+        save_settings(&settings).unwrap();
+
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw["showImages"], false);
+        assert_eq!(raw["showCacheMissNotices"], true);
+        assert_eq!(raw["outputPad"], 0);
+        assert_eq!(raw["fullscreenCopyOnSelect"], false);
+        assert_eq!(raw["httpIdleTimeout"], 30_000);
+        assert_eq!(raw["showTerminalProgress"], false);
+
+        // And they load back.
+        let reloaded = load_settings().unwrap();
+        assert_eq!(reloaded.show_images(), Some(false));
+        assert_eq!(reloaded.show_cache_miss_notices, Some(true));
+        assert_eq!(reloaded.output_pad, Some(0));
+        assert_eq!(reloaded.fullscreen_copy_on_select, Some(false));
+        assert_eq!(reloaded.http_idle_timeout_ms(), Some(30_000));
+        assert_eq!(reloaded.show_terminal_progress(), Some(false));
+    }
+
+    #[test]
+    fn nested_terminal_block_is_accepted_as_a_fallback() {
+        // Native pi nests `showImages` / `showTerminalProgress` under
+        // `terminal`; rpi's flat keys win when both are present.
+        let (_tmp, _guard) = with_temp_env();
+        let path = config::settings_path().unwrap();
+        std::fs::write(
+            &path,
+            r#"{ "terminal": { "showImages": false, "showTerminalProgress": false } }"#,
+        )
+        .unwrap();
+        let settings = load_settings().unwrap();
+        assert_eq!(settings.show_images(), Some(false));
+        assert_eq!(settings.show_terminal_progress(), Some(false));
+
+        std::fs::write(
+            &path,
+            r#"{
+                "showImages": true,
+                "terminal": { "showImages": false }
+            }"#,
+        )
+        .unwrap();
+        let settings = load_settings().unwrap();
+        assert_eq!(settings.show_images(), Some(true));
     }
 
     #[test]

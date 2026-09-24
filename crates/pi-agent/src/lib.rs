@@ -14,6 +14,7 @@ pub mod abort;
 pub mod agent;
 pub mod agent_loop;
 pub mod agent_tool;
+pub(crate) mod clock;
 pub mod error;
 pub mod events;
 pub mod hooks;

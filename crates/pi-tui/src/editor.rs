@@ -12,6 +12,7 @@ use super::component::{Component, Focusable};
 use super::keybindings::Keybindings;
 use crate::ansi::CURSOR_MARKER;
 use crate::kill_ring::{KillRing, PushOptions};
+use crate::theme::Color;
 use crate::undo_stack::UndoStack;
 
 /// Editor style configuration.
@@ -189,6 +190,25 @@ pub struct Editor {
     /// for the next printable char to jump forward to, `Some(-1)` backward.
     /// The next character input consumes it instead of inserting.
     jump_mode: Mutex<Option<i32>>,
+    /// Explicit top/bottom border color. `None` ⇒ the theme's default border
+    /// color. Native pi's `editor.borderColor` (used for bash mode and thinking
+    /// levels via `updateEditorBorderColor`).
+    border_color: Mutex<Option<Color>>,
+    /// Working indicator text shown inside the top border. `None` means idle.
+    /// When `Some`, the top border line renders the spinner + elapsed + message
+    /// instead of plain `─` characters (pi's working-inside-input-border style).
+    working: Mutex<Option<WorkingState>>,
+}
+
+/// State for the working indicator embedded in the editor's top border.
+#[derive(Debug, Clone)]
+pub struct WorkingState {
+    /// Spinner animation frame index.
+    pub frame: usize,
+    /// When the working state started (for elapsed time display).
+    pub started_at: std::time::Instant,
+    /// The message to display (e.g. "Working…").
+    pub message: String,
 }
 
 /// A restorable editor state snapshot (text + caret). Selection/scroll/focus
@@ -223,6 +243,8 @@ impl Editor {
             kill_ring: Mutex::new(KillRing::new()),
             last_action: Mutex::new(None),
             jump_mode: Mutex::new(None),
+            border_color: Mutex::new(None),
+            working: Mutex::new(None),
         }
     }
 
@@ -249,6 +271,8 @@ impl Editor {
             state.cursor_row = 0;
             state.cursor_col = 0;
         }
+        // Mirrors native `setTextInternal`: programmatic replacement is a change.
+        self.notify_change();
     }
 
     /// Get the text content.
@@ -267,6 +291,11 @@ impl Editor {
             state.cursor_col = 0;
             state.selection_anchor = None;
         }
+        // Native pi's editor notifies change observers for programmatic clears
+        // (`setTextInternal`), so derived UI state (bash-mode border color,
+        // autocomplete) drops the stale draft. `submit()` relies on this to
+        // reset the border after routing a `!command`.
+        self.notify_change();
     }
 
     /// Set callback for when text is submitted (Enter pressed).
@@ -851,6 +880,32 @@ impl Editor {
         }
     }
 
+    /// Set an explicit top/bottom border color. `None` restores the theme's
+    /// default border color. Mirrors native pi's `editor.borderColor`.
+    pub fn set_border_color(&self, color: Option<Color>) {
+        if let Ok(mut guard) = self.border_color.lock() {
+            *guard = color;
+        }
+    }
+
+    /// The current explicit border color, if any.
+    pub fn border_color(&self) -> Option<Color> {
+        self.border_color.lock().ok().and_then(|guard| *guard)
+    }
+
+    /// Set the working state. When Some, shows a spinner + elapsed time + message
+    /// inside the top border. When None, shows the normal border.
+    pub fn set_working(&self, working: Option<WorkingState>) {
+        if let Ok(mut guard) = self.working.lock() {
+            *guard = working;
+        }
+    }
+
+    /// Get the current working state, if any.
+    pub fn working(&self) -> Option<WorkingState> {
+        self.working.lock().ok().and_then(|guard| guard.clone())
+    }
+
     /// Submit current text (Enter).
     fn submit(&self) {
         let text = self.get_text();
@@ -939,8 +994,14 @@ impl Editor {
             // Editing
             (KeyModifiers::NONE, KeyCode::Backspace) => self.backspace(),
             (KeyModifiers::NONE, KeyCode::Delete) => self.delete(),
-            (KeyModifiers::NONE, KeyCode::Enter) => {
-                // Submit on Enter (mirrors TS `tui.input.submit`).
+            (KeyModifiers::NONE, KeyCode::Enter)
+            | (KeyModifiers::NONE, KeyCode::Char('\n'))
+            | (KeyModifiers::NONE, KeyCode::Char('\r')) => {
+                // Submit on Enter (mirrors TS `tui.input.submit`). The
+                // `Char('\n')`/`Char('\r')` forms cover a client whose terminal
+                // hands us the codepoint directly (e.g. the kitty keyboard
+                // protocol's CSI-u path); they used to fall through to the
+                // generic char arm and insert a literal newline.
                 self.submit();
             }
             // Shift+Enter inserts a newline (mirrors `tui.input.newLine`).
@@ -1156,14 +1217,70 @@ impl Component for Editor {
         // Full-width top + bottom border, colored via the theme border color
         // (mirrors editor.ts:494,530,587). The global `theme()` is read-only
         // after OnceLock init; `Color::fg` wraps the `─` run in the escape.
-        let border_color = crate::theme::theme().colors.border;
-        let horizontal = "─".repeat(width);
-        let border = border_color.fg(&horizontal);
+        // An explicit `border_color` (bash mode) wins over the theme default.
+        let border_color = self
+            .border_color
+            .lock()
+            .ok()
+            .and_then(|guard| *guard)
+            .unwrap_or(crate::theme::theme().colors.border);
+        // Check if we have a working state to display in the top border.
+        //
+        // The frame advances once per render, mirroring `Loader::render`: the
+        // spinner is therefore driven by *repaints*, so it visibly speeds up
+        // while the model is streaming (each token schedules a frame) and falls
+        // back to the render tick's cadence when nothing is being produced. A
+        // timer-only animation looked constant-speed and unrelated to output.
+        let working_state = self.working.lock().ok().and_then(|mut guard| {
+            guard.as_mut().map(|state| {
+                let snapshot = state.clone();
+                state.frame = state.frame.wrapping_add(1);
+                snapshot
+            })
+        });
+        let top_border = if let Some(ref working) = working_state {
+            // Working indicator embedded in the top border: spinner + message +
+            // elapsed time, with the remaining width filled by border glyphs.
+            // The frame set is shared with `Loader` so the two never drift.
+            let frames = crate::loader::SPINNER_FRAMES;
+            let spinner_char = frames[working.frame % frames.len()];
+            let colors = crate::theme::theme().colors;
+
+            let elapsed = working.started_at.elapsed();
+            let elapsed_str = if elapsed.as_secs() >= 60 {
+                format!("{}m{}s", elapsed.as_secs() / 60, elapsed.as_secs() % 60)
+            } else {
+                format!("{}s", elapsed.as_secs())
+            };
+
+            let plain = format!(" {} {} {} ", spinner_char, working.message, elapsed_str);
+            let indicator_width = crate::ansi::visible_width(&plain);
+
+            if width >= indicator_width + 1 {
+                let colored = format!(
+                    " {} {} {} ",
+                    colors.accent.fg(&spinner_char.to_string()),
+                    colors.muted.fg(&working.message),
+                    colors.muted.fg(&elapsed_str),
+                );
+                let right = border_color.fg(&"─".repeat(width - indicator_width - 1));
+                format!("{}{}{}", border_color.fg("─"), colored, right)
+            } else {
+                border_color.fg(&"─".repeat(width))
+            }
+        } else {
+            border_color.fg(&"─".repeat(width))
+        };
+
+        let bottom_border = {
+            let horizontal = "─".repeat(width);
+            border_color.fg(&horizontal)
+        };
 
         let mut lines = Vec::with_capacity(content_lines.len() + 2);
-        lines.push(border.clone());
+        lines.push(top_border);
         lines.extend(content_lines);
-        lines.push(border);
+        lines.push(bottom_border);
         lines
     }
 
@@ -1197,6 +1314,162 @@ impl Focusable for Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn working_spinner_advances_per_render_not_per_timer() {
+        use crate::component::Component;
+        let editor = Editor::simple();
+        editor.set_working(Some(WorkingState {
+            frame: 0,
+            started_at: std::time::Instant::now(),
+            message: "Working…".to_string(),
+        }));
+
+        // The indicator lives in the top border and reports the message.
+        let first = crate::strip_ansi(&editor.render(60)[0]);
+        assert!(first.contains("Working"), "top border: {first}");
+
+        // Each render steps the frame, so repaints driven by streamed output
+        // visibly advance the spinner; no timer is required for that.
+        let frame_after_first = editor.working().expect("working state").frame;
+        assert_eq!(frame_after_first, 1, "render must advance the frame once");
+        let _ = editor.render(60);
+        assert_eq!(editor.working().expect("working state").frame, 2);
+
+        // Two renders of the same state differ on screen (spinner char moves).
+        let a = crate::strip_ansi(&editor.render(60)[0]);
+        let b = crate::strip_ansi(&editor.render(60)[0]);
+        let spinner_of = |line: &str| line.chars().find(|c| "⠋⠘⠹⠸⠼⠴⠦⠧⠇⠏".contains(*c));
+        assert_ne!(
+            spinner_of(&a),
+            spinner_of(&b),
+            "consecutive renders must show different spinner frames: {a:?} vs {b:?}"
+        );
+
+        // Idle editors have no indicator.
+        editor.set_working(None);
+        let idle = crate::strip_ansi(&editor.render(60)[0]);
+        assert!(!idle.contains("Working"), "idle border: {idle}");
+    }
+
+    #[test]
+    fn working_spinner_uses_native_pi_frames_and_cadence() {
+        // The editor used to hand-copy the frame list and drifted (`⠘` where
+        // native pi has `⠙`), so the two indicators animated differently. Both
+        // now share `SPINNER_FRAMES`.
+        assert_eq!(crate::loader::SPINNER_FRAMES.len(), 10);
+        assert_eq!(
+            crate::loader::SPINNER_FRAMES.iter().collect::<String>(),
+            "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+        );
+        // 10 frames at 80ms = the 800ms full cycle native pi animates at.
+        assert_eq!(crate::loader::SPINNER_FRAME_MS, 80);
+
+        // The rendered indicator steps through exactly that list, in order.
+        use crate::component::Component;
+        let editor = Editor::simple();
+        editor.set_working(Some(WorkingState {
+            frame: 0,
+            started_at: std::time::Instant::now(),
+            message: "Working…".to_string(),
+        }));
+        let spinner_of = |line: &str| {
+            let plain = crate::strip_ansi(line);
+            crate::loader::SPINNER_FRAMES
+                .iter()
+                .copied()
+                .find(|c| plain.contains(*c))
+        };
+        let mut seen = Vec::new();
+        for _ in 0..10 {
+            seen.push(spinner_of(&editor.render(60)[0]).expect("a spinner glyph"));
+        }
+        // The snapshot is taken before the advance, so the first paint shows
+        // frame 0 — exactly native pi, whose `start()` paints frame 0 and then
+        // steps on each interval. Ten paints therefore cover the whole cycle in
+        // order and wrap back to the start.
+        let expected: Vec<char> = crate::loader::SPINNER_FRAMES.to_vec();
+        assert_eq!(seen, expected);
+        assert_eq!(
+            editor.working().expect("working").frame % crate::loader::SPINNER_FRAMES.len(),
+            0,
+            "ten paints must land back on the first frame"
+        );
+    }
+
+    #[test]
+    fn idle_cadence_matches_native_pi() {
+        // One frame per `SPINNER_FRAME_MS` of wall clock when nothing else is
+        // repainting. This is the property the tick task relies on: it only
+        // requests a repaint, and the repaint advances exactly one frame. The
+        // tick used to *also* advance the frame, which made the idle spinner
+        // run at 40ms/frame — twice native pi's rate.
+        use crate::component::Component;
+        assert_eq!(crate::loader::SPINNER_FRAME_MS, 80);
+        assert_eq!(
+            crate::loader::SPINNER_FRAME_MS * crate::loader::SPINNER_FRAMES.len() as u64,
+            800,
+            "a full cycle should take 800ms, like native pi"
+        );
+
+        let editor = Editor::simple();
+        editor.set_working(Some(WorkingState {
+            frame: 0,
+            started_at: std::time::Instant::now(),
+            message: "Working…".to_string(),
+        }));
+        // One repaint == one frame, i.e. one tick advances the spinner once.
+        let before = editor.working().expect("working").frame;
+        let _ = editor.render(60);
+        assert_eq!(editor.working().expect("working").frame, before + 1);
+    }
+
+    #[test]
+    fn explicit_border_color_overrides_the_theme_border() {
+        use crate::component::Component;
+        let editor = Editor::simple();
+        editor.set_focused(true);
+        editor.insert("echo hi");
+
+        let default_border = crate::theme::theme().colors.border.fg(&"─".repeat(20));
+        assert!(editor.render(20).contains(&default_border));
+        assert_eq!(editor.border_color(), None);
+
+        // Bash mode sets an explicit accent; the border line changes and the
+        // theme default is gone.
+        editor.set_border_color(Some(crate::theme::theme().colors.bash_mode));
+        let bash_border = crate::theme::theme().colors.bash_mode.fg(&"─".repeat(20));
+        assert_eq!(
+            editor.border_color(),
+            Some(crate::theme::theme().colors.bash_mode)
+        );
+        let rendered = editor.render(20);
+        assert!(rendered.contains(&bash_border), "{rendered:?}");
+        assert!(!rendered.contains(&default_border));
+
+        // Clearing restores the theme default (what `updateEditorBorderColor`
+        // does once the draft no longer starts with `!`).
+        editor.set_border_color(None);
+        assert!(editor.render(20).contains(&default_border));
+    }
+
+    #[test]
+    fn clear_and_set_text_notify_change_observers() {
+        // Native pi's `setTextInternal` fires onChange for programmatic edits;
+        // the bash-mode border and autocomplete rely on it to drop stale state.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_cb = calls.clone();
+        let editor = Editor::simple();
+        editor.on_change(Arc::new(move |_text: &str| {
+            calls_cb.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        editor.set_text("!ls");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        editor.clear();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
 
     #[test]
     fn snap_boundary_keeps_char_boundaries_including_end() {
@@ -1477,6 +1750,34 @@ l12",
             "",
             "submit clears undo so committed text stays committed"
         );
+    }
+
+    /// Regression: a remote/mobile client (SSH, soft keyboard) that encodes
+    /// its Enter key as LF (0x0A) or CR (0x0D) sends it as a bare character
+    /// event in raw mode. Those used to fall through to the generic char arm
+    /// and insert a literal newline — "回车变成了换行，无法发送内容". They must
+    /// submit just like `KeyCode::Enter`.
+    #[test]
+    fn test_remote_lf_cr_enter_submits() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for code in [
+            crossterm::event::KeyCode::Char('\n'),
+            crossterm::event::KeyCode::Char('\r'),
+        ] {
+            let editor = Editor::simple();
+            let submits = Arc::new(AtomicUsize::new(0));
+            let submits_for_cb = submits.clone();
+            editor.on_submit(Arc::new(move |_text: &str| {
+                submits_for_cb.fetch_add(1, Ordering::SeqCst);
+            }));
+            editor.insert("hello");
+            editor.handle_key(crossterm::event::KeyEvent::new(
+                code,
+                crossterm::event::KeyModifiers::NONE,
+            ));
+            assert_eq!(submits.load(Ordering::SeqCst), 1, "{code:?} must submit");
+            assert_eq!(editor.get_text(), "", "editor cleared after submit");
+        }
     }
     #[test]
     fn test_editor_text() {

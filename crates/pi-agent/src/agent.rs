@@ -370,7 +370,10 @@ impl Agent {
     /// Start a new prompt from text. Convenience for `prompt_message`.
     pub async fn prompt(&self, text: impl Into<String>) -> Result<(), crate::AgentError> {
         let message =
-            AgentMessage::User(UserMessage::new(UserContent::Text(text.into()), now_ms()));
+            AgentMessage::User(UserMessage::new(
+            UserContent::Text(text.into()),
+            crate::clock::now_ms(),
+        ));
         self.prompt_messages(vec![message]).await
     }
 
@@ -578,12 +581,6 @@ fn default_model() -> Model {
         "unknown",
         "",
     )
-}
-
-fn now_ms() -> i64 {
-    use std::sync::atomic::{AtomicI64, Ordering};
-    static T: AtomicI64 = AtomicI64::new(1);
-    T.fetch_add(1, Ordering::Relaxed)
 }
 
 #[cfg(test)]

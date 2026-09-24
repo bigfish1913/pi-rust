@@ -304,8 +304,8 @@ RPI_DEBUG_KEYS=1 rpi
 
 | 日志 | 含义 | 处理 |
 | --- | --- | --- |
-| `code=Char('j') mods=CONTROL`（或 `Char('\n')`） | 客户端把回车发成了 **LF (0x0A)**。crossterm 在 raw 模式下把 LF 当 Ctrl+J，而 Ctrl+J 绑定的是"插入换行"（对齐 pi 的 `tui.input.newLine`） | 让客户端改发 **CR (0x0D)**；或在客户端里把回车键显式绑定为 `\r` |
-| `code=Enter mods=NONE` + `enter-decision -> newline (paste burst)` | 收到的是正常 CR，但客户端把"文字 + 回车"合并成一批发送，粘贴启发式（20ms 突发窗口）误判为粘贴 | 见 `enter_is_paste_burst`：需要放宽/重写突发判定 |
+| `code=Char('j') mods=CONTROL`（或 `Char('\n')`） | 客户端把回车发成了 **LF (0x0A)**。crossterm 在 raw 模式下把 LF 当 Ctrl+J，而 Ctrl+J 绑定的是"插入换行"（对齐 pi 的 `tui.input.newLine`） | **已修复**：`Editor::handle_key` 现在把无修饰键的 `Char('\n')`/`Char('\r')` 当作提交，`Ctrl+J`（`Char('j') + CONTROL`）仍保持插入换行 |
+| `code=Enter mods=NONE` + `enter-decision -> newline (paste burst)` | 收到的是正常 CR，但客户端把"文字 + 回车"合并成一批发送，粘贴启发式（20ms 突发窗口）误判为粘贴 | **已修复**：粘贴启发式仅保留在 Windows（`cfg!(windows)`）。Unix 上括号粘贴用 `Event::Paste` 处理真实粘贴，普通回车直接提交 |
 | `code=Enter mods=NONE` + `enter-decision -> submit` | 输入路径正常，问题不在按键层 | 检查会话/网络层 |
 | 完全没有 `code=` 行 | 按键根本没到 TUI | 客户端没连上、窗口未聚焦，或 `RPI_SKIP_STDIN` 被设了 |
 
@@ -320,7 +320,8 @@ RPI_DEBUG_KEYS=1 rpi
 | `poll` 卡住 | `poll` 必须非阻塞；耗时工作放线程，handle 保存状态，取消标记限时结束 |
 | Windows 上热重载失败 | 已加载 DLL 无法覆盖；用 `rpi dev` 的版本化 staging，不要手工复制 |
 | 资源没出现在系统提示词 | `--debug-system-prompt` 查看最终组装结果；确认 skill 路径被发现 |
-| 手机/远程终端回车变换行 | `RPI_DEBUG_KEYS=1` 看按键：`Char('j') mods=CONTROL` = 客户端发的是 LF（当成 Ctrl+J=插入换行）；`Enter` + `paste burst` = 粘贴启发式误判 |
+| 手机/远程终端回车变换行 | `RPI_DEBUG_KEYS=1` 看按键：`Char('j') mods=CONTROL` = 客户端发的是 LF（已被 `Editor` 当提交处理）；`Enter` + `paste burst` = 粘贴启发式误判（已限定 Windows 平台） |
+| 粘贴内容不是系统剪贴板（而是 TUI 自己的文案） | 远程/手机客户端把粘贴映射成 `Ctrl+V` 时，`read_clipboard_text` 会读**服务器**剪贴板——可能被拖选复制（copy-on-select）写入了 TUI 文案（如欢迎语 `Skills (…): …`）。已限定该回退只在 Windows 生效；Unix 上真实粘贴走括号粘贴 `Event::Paste`，`Ctrl+V` 回退为编辑器 kill-ring yank |
 | panic / 段错误跨 ABI | `extern "C"` 边界不能 unwind；`StbString` 所有权遵守宿主/插件两侧规则 |
 | ABI 版本不匹配 | 宿主日志提示 mismatch 并跳过加载；确认 `rpi-plugin-sdk` 版本 |
 

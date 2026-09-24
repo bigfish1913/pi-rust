@@ -16,12 +16,17 @@ const MIN_DESCRIPTION_WIDTH: usize = 10;
 /// A select list item.
 #[derive(Debug, Clone)]
 pub struct SelectItem {
-    /// The value (used for filtering and returned on selection).
+    /// The value (returned on selection).
     pub value: String,
     /// Display label.
     pub label: String,
     /// Optional description.
     pub description: Option<String>,
+    /// Optional extra text used ONLY by fuzzy filtering. Lets a searchable
+    /// selector match on the display name, provider, or a qualified id while
+    /// `value` stays the stable selection key (native pi's
+    /// `getModelSelectorSearchText`). Falls back to `value` when unset.
+    pub search_text: Option<String>,
 }
 
 impl SelectItem {
@@ -31,6 +36,7 @@ impl SelectItem {
             value: value.to_string(),
             label: label.to_string(),
             description: None,
+            search_text: None,
         }
     }
 
@@ -38,6 +44,17 @@ impl SelectItem {
     pub fn with_description(mut self, description: &str) -> Self {
         self.description = Some(description.to_string());
         self
+    }
+
+    /// Add the text fuzzy filtering should match against (instead of `value`).
+    pub fn with_search_text(mut self, search_text: &str) -> Self {
+        self.search_text = Some(search_text.to_string());
+        self
+    }
+
+    /// The string fuzzy filtering matches against.
+    pub fn search_key(&self) -> &str {
+        self.search_text.as_deref().unwrap_or(&self.value)
     }
 
     /// Get the display value (label or value).
@@ -212,7 +229,7 @@ impl SelectList {
     /// Set the filter text.
     pub fn set_filter(&self, filter: &str) {
         if let Ok(items) = self.items.lock() {
-            let filtered = fuzzy_filter(&items, filter, |item| item.value.as_str());
+            let filtered = fuzzy_filter(&items, filter, |item| item.search_key());
             if let Ok(mut filtered_items) = self.filtered_items.lock() {
                 *filtered_items = filtered;
             }
@@ -432,7 +449,11 @@ impl SelectList {
         primary_column_width: usize,
     ) -> String {
         let prefix = if self.multi_select {
-            let marker = if self.is_selected_value(&item.value) { "x" } else { " " };
+            let marker = if self.is_selected_value(&item.value) {
+                "x"
+            } else {
+                " "
+            };
             if is_selected {
                 format!("→ [{}] ", marker)
             } else {

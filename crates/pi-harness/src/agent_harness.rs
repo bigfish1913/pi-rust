@@ -206,6 +206,44 @@ pub struct CancelQueuedResult {
     pub outcome: CancelQueuedOutcome,
 }
 
+/// A snapshot of the queued (not-yet-consumed) user messages on one lane,
+/// split by queue kind. Mirrors native pi's `getSteeringMessages()` /
+/// `getFollowUpMessages()` — the payload the pending-messages display renders
+/// (`Steering: <text>` / `Follow-up: <text>`) and the `app.message.dequeue`
+/// action restores into the editor.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QueuedMessages {
+    pub steering: Vec<String>,
+    pub follow_up: Vec<String>,
+}
+
+impl QueuedMessages {
+    /// True when nothing is queued on the lane.
+    pub fn is_empty(&self) -> bool {
+        self.steering.is_empty() && self.follow_up.is_empty()
+    }
+}
+
+/// The display text of a queued message. Steer / follow-up entries are always
+/// user content, so this is the text the user typed (image blocks are ignored,
+/// matching the single-line pending row).
+fn queued_message_text(message: &AgentMessage) -> String {
+    match message {
+        AgentMessage::User(user) => match &user.content {
+            rpi_ai::types::UserContent::Text(text) => text.clone(),
+            rpi_ai::types::UserContent::Blocks(blocks) => blocks
+                .iter()
+                .filter_map(|block| match block {
+                    rpi_ai::types::Content::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        },
+        _ => String::new(),
+    }
+}
+
 // ===========================================================================
 // Deferred-operation + inspection read models (TS `runtime/` surface). These
 // back the `AgentHarness` methods `drive`/`resume`/`inspectExecution`/
@@ -306,6 +344,16 @@ pub trait AgentLane: Send + Sync {
     async fn follow_up(&self, message: AgentMessage) -> HarnessResult<QueueResult>;
     async fn next_run(&self, message: AgentMessage) -> HarnessResult<QueueResult>;
     async fn cancel_queued(&self, entry_id: &str) -> HarnessResult<CancelQueuedResult>;
+
+    /// Snapshot the lane's queued (not-yet-consumed) steering + follow-up user
+    /// messages. Read-only; drives the pending-messages display. Mirrors native
+    /// pi's `getSteeringMessages()` / `getFollowUpMessages()`.
+    async fn queued_messages(&self) -> HarnessResult<QueuedMessages>;
+
+    /// Remove and return every queued steering + follow-up message on the lane.
+    /// Mirrors native pi's `clearQueue()` (the `app.message.dequeue` action
+    /// restores the returned text into the editor).
+    async fn clear_queue(&self) -> HarnessResult<QueuedMessages>;
     async fn record_usage(
         &self,
         usage: Usage,
@@ -431,6 +479,33 @@ impl MessageQueue {
         let before = self.pending.len();
         self.pending.retain(|item| item.entry_id != entry_id);
         self.pending.len() != before
+    }
+
+    /// The queued message texts for `lane`, in queue order, without touching
+    /// the queue. Used by the pending-messages display.
+    fn peek_for_lane(&self, lane: &str) -> Vec<String> {
+        self.pending
+            .iter()
+            .filter(|item| item.lane == lane)
+            .map(|item| queued_message_text(&item.message))
+            .collect()
+    }
+
+    /// Remove and return every queued message text for `lane`, regardless of
+    /// [`QueueMode`]. Used by the `app.message.dequeue` action (restore all
+    /// queued messages into the editor).
+    fn take_for_lane(&mut self, lane: &str) -> Vec<String> {
+        let mut selected = Vec::new();
+        let mut retained = VecDeque::new();
+        for item in self.pending.drain(..) {
+            if item.lane == lane {
+                selected.push(queued_message_text(&item.message));
+            } else {
+                retained.push_back(item);
+            }
+        }
+        self.pending = retained;
+        selected
     }
 }
 
@@ -2562,6 +2637,48 @@ impl AgentLane for AgentHarness {
         })
     }
 
+    async fn queued_messages(&self) -> HarnessResult<QueuedMessages> {
+        let inner = self.inner.lock().unwrap();
+        if inner.closed {
+            return Err(HarnessError::closed());
+        }
+        let steering = inner
+            .steering_queue
+            .lock()
+            .unwrap()
+            .peek_for_lane(&self.lane);
+        let follow_up = inner
+            .follow_up_queue
+            .lock()
+            .unwrap()
+            .peek_for_lane(&self.lane);
+        Ok(QueuedMessages {
+            steering,
+            follow_up,
+        })
+    }
+
+    async fn clear_queue(&self) -> HarnessResult<QueuedMessages> {
+        let inner = self.inner.lock().unwrap();
+        if inner.closed {
+            return Err(HarnessError::closed());
+        }
+        let steering = inner
+            .steering_queue
+            .lock()
+            .unwrap()
+            .take_for_lane(&self.lane);
+        let follow_up = inner
+            .follow_up_queue
+            .lock()
+            .unwrap()
+            .take_for_lane(&self.lane);
+        Ok(QueuedMessages {
+            steering,
+            follow_up,
+        })
+    }
+
     async fn record_usage(
         &self,
         usage: Usage,
@@ -2878,6 +2995,14 @@ impl AgentLane for LaneHandle {
         self.runner().cancel_queued(entry_id).await
     }
 
+    async fn queued_messages(&self) -> HarnessResult<QueuedMessages> {
+        self.runner().queued_messages().await
+    }
+
+    async fn clear_queue(&self) -> HarnessResult<QueuedMessages> {
+        self.runner().clear_queue().await
+    }
+
     async fn record_usage(
         &self,
         usage: Usage,
@@ -3185,6 +3310,54 @@ mod queue_tests {
         );
         assert_eq!(queue.drain_messages_for_lane("side").len(), 1);
         assert!(queue.pending.is_empty());
+    }
+
+    #[test]
+    fn queue_peek_reports_lane_messages_without_consuming() {
+        let mut queue = MessageQueue::new(QueueMode::All);
+        queue.pending.push_back(QueuedMessage {
+            entry_id: "a".into(),
+            lane: "main".into(),
+            message: user("first"),
+        });
+        queue.pending.push_back(QueuedMessage {
+            entry_id: "b".into(),
+            lane: "side".into(),
+            message: user("other"),
+        });
+        queue.pending.push_back(QueuedMessage {
+            entry_id: "c".into(),
+            lane: "main".into(),
+            message: user("second"),
+        });
+        assert_eq!(queue.peek_for_lane("main"), vec!["first", "second"]);
+        // Peeking must not change the queue.
+        assert_eq!(queue.pending.len(), 3);
+    }
+
+    #[test]
+    fn queue_take_for_lane_drains_every_lane_entry() {
+        let mut queue = MessageQueue::new(QueueMode::OneAtATime);
+        queue.pending.push_back(QueuedMessage {
+            entry_id: "a".into(),
+            lane: "main".into(),
+            message: user("first"),
+        });
+        queue.pending.push_back(QueuedMessage {
+            entry_id: "b".into(),
+            lane: "side".into(),
+            message: user("other"),
+        });
+        queue.pending.push_back(QueuedMessage {
+            entry_id: "c".into(),
+            lane: "main".into(),
+            message: user("second"),
+        });
+        // Unlike `drain_messages_for_lane` (which honours `QueueMode`), the
+        // dequeue action clears the lane completely regardless of mode.
+        assert_eq!(queue.take_for_lane("main"), vec!["first", "second"]);
+        assert_eq!(queue.pending.len(), 1);
+        assert_eq!(queue.pending[0].entry_id, "b");
     }
 }
 

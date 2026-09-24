@@ -3,19 +3,21 @@
 //! This is a **display-only** consumer of the bash tool's existing `on_update`
 //! stream: it renders a command header, a spinner while running, a tailed
 //! preview of captured output, and a status/truncation line on completion.
-//! There is no `!`-prefix direct shell mode (per the session scope) and no
-//! async/signal plumbing — the caller drives lifecycle via `append_output` /
-//! `set_complete`.
+//! There is no async/signal plumbing — the caller drives lifecycle via
+//! `append_output` / `set_complete`.
+//!
+//! It backs both the `bash` tool panels and the user-initiated `!command` /
+//! `!!command` shell mode. Commands submitted with `!!` are excluded from the
+//! model context; those panels render with the dim border/header color so the
+//! distinction is visible, matching `bash-execution.ts`.
 
 use std::any::Any;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::component::Component;
 use crate::ansi::bold;
 use crate::ansi::strip_ansi;
-use crate::dynamic_border::DynamicBorder;
-use crate::loader::Loader;
 use crate::spacer::Spacer;
 use crate::theme::theme;
 use crate::utils::{truncate_to_width, wrap_text_with_ansi};
@@ -55,14 +57,29 @@ pub struct BashExecutionComponent {
     exit_code: Mutex<Option<i32>>,
     expanded: Mutex<bool>,
     truncation: Mutex<BashTruncation>,
-    loader: Loader,
+    /// `true` for a `!!`-prefixed user command: render dim and keep out of the
+    /// model context (`bash-execution.ts` `excludeFromContext`).
+    exclude_from_context: Mutex<bool>,
+    /// When the command started / finished, for the live elapsed readout while
+    /// running and the total elapsed after completion.
+    started_at: Mutex<Option<Instant>>,
+    finished_at: Mutex<Option<Instant>>,
 }
 
 impl BashExecutionComponent {
     /// Create a new component for the given command (without the leading `$`).
     pub fn new(command: impl Into<String>) -> Self {
-        let loader = Loader::with_text("Running...");
-        loader.start();
+        Self::new_with_context(command, false)
+    }
+
+    /// Create a component whose command is excluded from the model context
+    /// (the `!!` prefix). Renders with the dim border/header color.
+    pub fn new_excluded(command: impl Into<String>) -> Self {
+        Self::new_with_context(command, true)
+    }
+
+    /// Shared constructor. `exclude_from_context` selects the dim color key.
+    pub fn new_with_context(command: impl Into<String>, exclude_from_context: bool) -> Self {
         Self {
             command: Mutex::new(command.into()),
             output_lines: Mutex::new(Vec::new()),
@@ -70,8 +87,35 @@ impl BashExecutionComponent {
             exit_code: Mutex::new(None),
             expanded: Mutex::new(false),
             truncation: Mutex::new(BashTruncation::default()),
-            loader,
+            exclude_from_context: Mutex::new(exclude_from_context),
+            started_at: Mutex::new(Some(Instant::now())),
+            finished_at: Mutex::new(None),
         }
+    }
+
+    /// Total elapsed time, or the elapsed time so far while still running.
+    fn elapsed(&self) -> Duration {
+        let started = self.started_at.lock().ok().and_then(|g| *g);
+        let Some(started) = started else {
+            return Duration::default();
+        };
+        match self.finished_at.lock().ok().and_then(|g| *g) {
+            Some(finished) => finished.saturating_duration_since(started),
+            None => started.elapsed(),
+        }
+    }
+
+    /// Set whether this command is excluded from the model context. The border
+    /// and header recolor on the next render.
+    pub fn set_exclude_from_context(&self, exclude: bool) {
+        if let Ok(mut e) = self.exclude_from_context.lock() {
+            *e = exclude;
+        }
+    }
+
+    /// Whether this command is excluded from the model context.
+    pub fn is_excluded_from_context(&self) -> bool {
+        *self.exclude_from_context.lock().unwrap()
     }
 
     /// Apply the authoritative command from `ToolExecutionStart`. A panel may
@@ -126,7 +170,9 @@ impl BashExecutionComponent {
         if let Ok(mut t) = self.truncation.lock() {
             *t = truncation;
         }
-        self.loader.stop();
+        if let Ok(mut f) = self.finished_at.lock() {
+            *f = Some(Instant::now());
+        }
     }
 
     /// Toggle expanded (full output) vs collapsed (preview) display.
@@ -158,6 +204,16 @@ impl BashExecutionComponent {
         let colors = theme().colors;
 
         let mut parts: Vec<String> = Vec::new();
+        // Total elapsed up front: it is the first thing a reader looks for on a
+        // finished command.
+        let elapsed = self.elapsed();
+        if elapsed > Duration::from_millis(100) {
+            parts.push(
+                colors
+                    .muted
+                    .fg(&crate::tool_execution::format_elapsed(elapsed)),
+            );
+        }
         if hidden > 0 {
             if expanded {
                 parts.push(colors.muted.fg("(Ctrl+T to collapse)"));
@@ -201,25 +257,36 @@ impl Component for BashExecutionComponent {
         let colors = theme().colors;
         let mut lines: Vec<String> = Vec::new();
 
-        // Spacer + a faint command separator (distinct from the editor border).
+        // `!!` commands are excluded from the model context, so they render
+        // dim instead of the normal bash color (mirrors `bash-execution.ts`).
+        let excluded = *self.exclude_from_context.lock().unwrap();
+        let color_key = if excluded {
+            colors.dim
+        } else {
+            colors.bash_mode
+        };
+
+        // Background tint for the bash panel — mirrors the tool execution
+        // panel backgrounds so bash blocks visually match tool blocks.
+        let bg = match *self.status.lock().unwrap() {
+            BashStatus::Running => colors.tool_pending_bg,
+            BashStatus::Error | BashStatus::Cancelled => colors.tool_error_bg,
+            BashStatus::Complete => colors.tool_success_bg,
+        };
+
+        // Spacer
         lines.extend(Spacer::new(1).render(width));
-        lines.extend(DynamicBorder::new().render(width));
 
         // Command header: "$ {command}" in accent.
         let command = self.command.lock().unwrap().clone();
         let header_text = format!("$ {command}");
-        // Commands can be far wider than a terminal (particularly generated
-        // PowerShell/Bash one-liners). Keep every character visible on wrapped
-        // rows instead of eliding the tail as soon as the running spinner is
-        // displayed below the header.
         let header_width = width.saturating_sub(2).max(1);
         for part in wrap_text_with_ansi(&header_text, header_width) {
-            lines.push(format!("  {}", colors.bash_mode.fg(&bold(&part))));
+            let line = format!("  {}", color_key.fg(&bold(&part)));
+            lines.push(crate::utils::apply_background_to_line(&line, width, |s| bg.bg(s)));
         }
 
-        // Output preview (collapsed: last PREVIEW_LINES visual lines;
-        // expanded: all wrapped lines). Built from the captured raw output,
-        // themed with the muted color and a leading newline for spacing.
+        // Output preview
         let (display_lines, hidden) = {
             let out = self.output_lines.lock().unwrap();
             let expanded = *self.expanded.lock().unwrap();
@@ -228,11 +295,13 @@ impl Component for BashExecutionComponent {
             } else {
                 let muted = colors.muted;
                 let styled = format!(
-                    "\n{}",
+                    "
+{}",
                     out.iter()
                         .map(|l| muted.fg(l))
                         .collect::<Vec<_>>()
-                        .join("\n")
+                        .join("
+")
                 );
                 if expanded {
                     let all = crate::text::Text::new(&styled, 1, 0).render(width);
@@ -243,36 +312,43 @@ impl Component for BashExecutionComponent {
                 }
             }
         };
-        lines.extend(display_lines);
+        for dl in &display_lines {
+            lines.push(crate::utils::apply_background_to_line(dl, width, |s| bg.bg(s)));
+        }
 
         // Spinner (while running) or status line (when complete)
         let status = *self.status.lock().unwrap();
         if status == BashStatus::Running {
-            lines.extend(self.loader.render(width));
-            // Long-running hint: after a minute, tell the user how to abort so
-            // a command without a tool-level timeout (model didn't pass one)
-            // never looks stuck with no recourse.
-            if self.loader.elapsed() > LONG_RUNNING_HINT_AFTER {
-                let colors = theme().colors;
+            // A live elapsed timer, not a spinner: tool panels report progress
+            // the same way (static status glyph + elapsed), so two concurrent
+            // operations never look like two different kinds of "busy".
+            let elapsed = self.elapsed();
+            let row = format!(
+                "  {} {}",
+                colors.accent.fg("●"),
+                colors.muted.fg(&crate::tool_execution::format_elapsed(elapsed)),
+            );
+            let row = truncate_to_width(&row, width, "…");
+            lines.push(crate::utils::apply_background_to_line(&row, width, |s| bg.bg(s)));
+            if elapsed > LONG_RUNNING_HINT_AFTER {
                 let hint = format!("  {} Esc / Ctrl+C 中止", colors.muted.fg("⏸"));
-                lines.push(truncate_to_width(&hint, width, "…"));
+                let hint = truncate_to_width(&hint, width, "…");
+                lines.push(crate::utils::apply_background_to_line(&hint, width, |s| bg.bg(s)));
             }
         } else {
             let sl = self.status_line(hidden);
             if !sl.is_empty() {
-                lines.push(String::new());
-                lines.extend(sl);
+                lines.push(crate::utils::apply_background_to_line("", width, |s| bg.bg(s)));
+                for sline in &sl {
+                    lines.push(crate::utils::apply_background_to_line(sline, width, |s| bg.bg(s)));
+                }
             }
         }
 
-        // Bottom command separator uses the same muted hierarchy.
-        lines.extend(DynamicBorder::new().render(width));
         lines
     }
 
-    fn invalidate(&self) {
-        self.loader.invalidate();
-    }
+    fn invalidate(&self) {}
 
     fn as_any(&self) -> &dyn Any {
         self
@@ -284,12 +360,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_new_renders_header_and_spinner() {
+    fn test_new_renders_header_and_live_elapsed() {
         let c = BashExecutionComponent::new("ls -la");
         let lines = c.render(40);
         let joined = lines.join("\n");
-        assert!(joined.contains("ls -la"));
-        assert!(joined.contains('─'));
+        assert!(joined.contains("$ ls -la"));
+        // A running panel reports a live elapsed timer and a static status
+        // glyph — no spinner, matching tool panels.
+        let plain = strip_ansi(&joined);
+        assert!(
+            plain.contains('●'),
+            "running panel needs the status glyph: {plain}"
+        );
+        assert!(
+            plain.contains('s'),
+            "running panel needs an elapsed readout: {plain}"
+        );
+        assert!(
+            !plain.contains("Running"),
+            "the `Running...` label was replaced by the elapsed timer: {plain}"
+        );
+    }
+
+    #[test]
+    fn completed_panel_reports_total_elapsed() {
+        let c = BashExecutionComponent::new("sleep 1");
+        c.append_output("done\n");
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        c.set_complete(Some(0), false, BashTruncation::default());
+        let plain = strip_ansi(&c.render(60).join("\n"));
+        // The completion line leads with the total elapsed time.
+        assert!(
+            plain.contains("0.1s") || plain.contains("0.2s"),
+            "total elapsed missing: {plain}"
+        );
+        // And it stops advancing once the command is finished.
+        let first = c.render(60).join("\n");
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert_eq!(first, c.render(60).join("\n"), "elapsed kept counting after completion");
     }
 
     #[test]
@@ -301,6 +409,35 @@ mod tests {
         let joined = lines.join("\n");
         // After completion the spinner is gone; output "hi" is visible.
         assert!(strip_ansi(&joined).contains("hi"), "joined: {joined}");
+    }
+
+    #[test]
+    fn excluded_from_context_uses_dim_border_and_header() {
+        // `!!cmd` renders dim rather than bashMode so the exclusion is visible
+        // (mirrors `bash-execution.ts` `excludeFromContext`).
+        let normal = BashExecutionComponent::new("echo hi");
+        let excluded = BashExecutionComponent::new_excluded("echo hi");
+        assert!(!normal.is_excluded_from_context());
+        assert!(excluded.is_excluded_from_context());
+
+        let colors = theme().colors;
+        // The command header uses the bash accent (or dim when excluded), so
+        // compare the foreground escape each color produces.
+        let bash_start = colors.bash_mode.fg("X").split('X').next().unwrap().to_string();
+        let dim_start = colors.dim.fg("X").split('X').next().unwrap().to_string();
+
+        let normal_out = normal.render(40).join("\n");
+        let excluded_out = excluded.render(40).join("\n");
+        assert!(normal_out.contains(&bash_start), "normal: {normal_out:?}");
+        assert!(excluded_out.contains(&dim_start), "excluded: {excluded_out:?}");
+
+        // Both still show the command itself.
+        assert!(strip_ansi(&excluded_out).contains("$ echo hi"));
+
+        // Flipping the flag in place recolors without recreating the component.
+        excluded.set_exclude_from_context(false);
+        assert!(!excluded.is_excluded_from_context());
+        assert!(excluded.render(40).join("\n").contains(&bash_start));
     }
 
     #[test]
@@ -328,8 +465,13 @@ mod tests {
         let rendered = strip_ansi(&lines.join("\n"));
         let compact: String = rendered.chars().filter(|ch| !ch.is_whitespace()).collect();
         let expected: String = command.chars().filter(|ch| !ch.is_whitespace()).collect();
-        assert!(compact.contains(&expected), "command was truncated: {rendered}");
-        assert!(lines.iter().all(|line| crate::utils::visible_width(line) <= 20));
+        assert!(
+            compact.contains(&expected),
+            "command was truncated: {rendered}"
+        );
+        assert!(lines
+            .iter()
+            .all(|line| crate::utils::visible_width(line) <= 20));
     }
 
     #[test]

@@ -300,6 +300,38 @@ async fn full_run_with_write_tool_call_completes_and_persists() {
         rpi_harness::session::types::Entry::Message(_)
     ));
 
+    // ---- persisted tool-result timestamps are real wall-clock -------------
+    //
+    // Regression: `agent_loop::create_tool_result_message` stamped every tool
+    // result from a bare atomic counter (`1, 2, 3, …`), so durable sessions
+    // carried nonsense tool-result times (29, 38, 55, …) next to real assistant
+    // times. Nothing asserted on them, so it survived.
+    //
+    // Only the tool result is checked here: its timestamp is produced by the
+    // shared agent loop, i.e. for every provider. Assistant timestamps come
+    // from the provider, and the faux test double deliberately uses a counter
+    // (see the note on `providers::anthropic::now_ms`).
+    let mut tool_result_timestamps = Vec::new();
+    for entry in &path {
+        let rpi_harness::session::types::Entry::Message(message_entry) = entry else {
+            continue;
+        };
+        if let rpi_agent::AgentMessage::ToolResult(t) = &message_entry.message {
+            tool_result_timestamps.push(t.timestamp);
+        }
+    }
+    assert!(
+        !tool_result_timestamps.is_empty(),
+        "expected a persisted toolResult to check its timestamp"
+    );
+    for timestamp in tool_result_timestamps {
+        assert!(
+            timestamp > 1_600_000_000_000,
+            "toolResult timestamp {timestamp} is not epoch milliseconds \
+             (the agent loop used to stamp tool results from a 1,2,3… counter)"
+        );
+    }
+
     // An operation_started (intent Run) + operation_finished (Completed) record
     // pair should be present on the lane, with matching run_id.
     let started = harness
@@ -713,5 +745,56 @@ async fn harness_fires_provider_hooks_before_request_per_call() {
         hook_fires.len(),
         2,
         "before_request must fire once per stream_simple call (per-call, not run-once)"
+    );
+}
+
+/// Regression: the harness persists prompts itself and drives
+/// `run_agent_loop` with an EMPTY prompts vec (to avoid double-counting them in
+/// the provider context), so the loop never emits `message_start`/`message_end`
+/// for the user's prompt.
+///
+/// The TUI renders user bubbles from `AgentEvent::MessageStart`, so this test
+/// pins the contract the TUI must compensate for: a directly-sent prompt
+/// produces NO user `MessageStart`, while a queued (steering) message DOES
+/// (that one is drained inside the loop).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn directly_sent_prompt_emits_no_user_message_start() {
+    let script = FauxScript::new();
+    script.set_responses(vec![FauxStep::text("Done.")]);
+    let (collector, events) = CollectorEmitter::new();
+    let (harness, _provider, _) =
+        harness_with_options(script, RetryPolicy::default(), Some(Arc::new(collector))).await;
+
+    harness
+        .prompt_text("hello there", vec![])
+        .await
+        .expect("prompt completes");
+
+    let events = events.lock().unwrap();
+    let user_starts = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                AgentEvent::MessageStart {
+                    message: rpi_agent::AgentMessage::User(_)
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        user_starts, 0,
+        "harness passes an empty prompts vec, so the loop emits no user MessageStart; \
+         the TUI must render the prompt itself. events: {events:#?}"
+    );
+    // The assistant still streams normally.
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::MessageStart {
+                message: rpi_agent::AgentMessage::Assistant(_)
+            }
+        )),
+        "assistant MessageStart must still fire"
     );
 }

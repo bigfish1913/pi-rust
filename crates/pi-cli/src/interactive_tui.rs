@@ -40,15 +40,15 @@ use rpi_tui::scroll_view::{OverscrollMode, ScrollbarMode};
 #[cfg(test)]
 use rpi_tui::strip_ansi;
 use rpi_tui::{
-    apply_theme_preset, render_diff, AssistantBlock, AssistantMessageComponent,
+    apply_theme_preset, render_diff, AltScreenSearch, AssistantBlock, AssistantMessageComponent,
     AssistantMessageOptions, AutocompleteManager, AutocompleteSuggestions, BashExecutionComponent,
     BashTruncation, CombinedAutocompleteProvider, Component, Container, DynamicBorder, Editor,
     EditorOptions, EditorStyle, FilePathAutocompleteProvider, Focusable, FollowMode,
     FooterComponent, Image, ImageOptions, Input, Loader, Markdown, ProcessTerminal, ScrollView,
-    ScrollViewOptions, SearchBar, SelectItem, SelectList, SlashCommand as SlashCommandEntry,
-    SlashCommandAutocompleteProvider, Spacer, StackChild, StackEntry, StatusIndicator, Text,
-    ThemeManager, ThemePreset, ToolExecutionComponent, TuiAltScreen, UserMessageComponent, VStack,
-    TUI, AltScreenSearch,
+    ScrollViewOptions, SearchBar, SearchableSelectList, SelectItem, SelectList, SettingItem,
+    SettingsList, SlashCommand as SlashCommandEntry, SlashCommandAutocompleteProvider, Spacer,
+    StackChild, StackEntry, StatusIndicator, Text, ThemeManager, ThemePreset,
+    ToolExecutionComponent, TuiAltScreen, UserMessageComponent, VStack, WorkingState, TUI,
 };
 use rpi_tui::{bold as tui_bold, theme as current_theme};
 
@@ -641,7 +641,7 @@ impl CommandRegistry {
 /// Dispatch a ui_prompt_start event to extensions.
 fn dispatch_ui_prompt_event(state: &TuiState) {
     use rpi_plugin_sdk::EventTag;
-    
+
     if let Ok(session) = state.extension_session.lock() {
         if let Some(snapshot) = session.snapshot_arc() {
             rpi_extensions::dispatch_empty_event(&snapshot, EventTag::UiPromptStart);
@@ -652,7 +652,7 @@ fn dispatch_ui_prompt_event(state: &TuiState) {
 /// Dispatch a ui_prompt_end event to extensions.
 fn dispatch_ui_prompt_event_end(state: &TuiState) {
     use rpi_plugin_sdk::EventTag;
-    
+
     if let Ok(session) = state.extension_session.lock() {
         if let Some(snapshot) = session.snapshot_arc() {
             rpi_extensions::dispatch_empty_event(&snapshot, EventTag::UiPromptEnd);
@@ -677,6 +677,128 @@ fn dispatch_slash(text: &str, ctx: &CommandContext, registry: &CommandRegistry) 
             ctx.tui.request_render(false);
         }
     }
+}
+
+/// Current wall-clock time in milliseconds since the Unix epoch. Used for
+/// `bashExecution` message timestamps (agent-loop messages carry real times, so
+/// the transcript record must too).
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Parse a submitted line into a user shell command.
+///
+/// Mirrors native pi's `text.startsWith("!")` handling
+/// (`interactive-mode.ts:3225`): `!cmd` runs and is recorded in the session
+/// context, `!!cmd` is excluded from it. Returns `None` for a bare `!` / `!!`
+/// (or whitespace only), so the line falls through to the normal prompt path.
+fn parse_user_bash(text: &str) -> Option<(&str, bool)> {
+    let rest = text.strip_prefix('!')?;
+    let (command, exclude_from_context) = match rest.strip_prefix('!') {
+        Some(command) => (command, true),
+        None => (rest, false),
+    };
+    let command = command.trim();
+    if command.is_empty() {
+        return None;
+    }
+    Some((command, exclude_from_context))
+}
+
+/// Run a `!command` submitted from the editor.
+///
+/// The command executes out-of-band — it never reaches the model. Output
+/// streams into a [`BashExecutionComponent`] in the transcript and the
+/// terminal result is handed to the main loop, which persists it as a
+/// `bashExecution` message (skipped from context for `!!`). Mirrors
+/// `handleBashCommand` (`interactive-mode.ts:6729`).
+fn start_user_bash(ctx: &CommandContext, command: &str, exclude_from_context: bool) {
+    let comp = Arc::new(BashExecutionComponent::new_with_context(
+        command,
+        exclude_from_context,
+    ));
+    comp.set_expanded(*ctx.state.tool_outputs_expanded.lock().unwrap());
+    ctx.chat.add_child(comp.clone());
+
+    // Register the cancellation slot before spawning so an Esc arriving on the
+    // key thread can never miss the run (native pi's `_bashAbortControllers`).
+    let cancel = ctx.state.begin_user_bash();
+    ctx.tui.request_render(false);
+
+    let env: Arc<dyn rpi_tools::ExecutionEnv> =
+        Arc::new(rpi_tools::OsExecutionEnv::with_cwd(ctx.cwd.clone()));
+    let tui = ctx.tui.clone();
+    let tx = ctx.tx.clone();
+    let cwd = ctx.cwd.clone();
+    let command_owned = command.to_string();
+
+    tokio::spawn(async move {
+        let comp_chunk = comp.clone();
+        let tui_chunk = tui.clone();
+        let on_chunk: Box<
+            dyn FnMut(&str, &dyn Fn() -> rpi_tools::shell_output::ShellCaptureProgress) + Send,
+        > = Box::new(move |_chunk, get_progress| {
+            // The capture layer reports the complete tail captured so far, not
+            // a delta; `append_output` replaces its snapshot accordingly.
+            comp_chunk.append_output(&get_progress().output);
+            tui_chunk.request_render(false);
+        });
+        let options = rpi_tools::shell_output::ShellCaptureOptions {
+            cwd: Some(cwd),
+            cancel: Some(&cancel),
+            on_chunk: Some(on_chunk),
+            return_execution_errors: true,
+            ..Default::default()
+        };
+        let result =
+            rpi_tools::shell_output::execute_shell_with_capture(&env, &command_owned, options)
+                .await;
+
+        // `Ok` carries the real exit code/cancellation; `Err` is a transport
+        // level failure (spawn failure, invalid env) which we surface inline.
+        let (exit_code, cancelled, output, truncated, full_output_path) = match result {
+            Ok(capture) => (
+                capture.exit_code,
+                capture.cancelled,
+                capture.output.clone(),
+                capture.truncated,
+                capture
+                    .full_output_path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned()),
+            ),
+            Err(error) => (
+                None,
+                false,
+                format!("Bash command failed: {error}"),
+                false,
+                None,
+            ),
+        };
+        comp.append_output(&output);
+        comp.set_complete(
+            exit_code,
+            cancelled,
+            BashTruncation {
+                truncated,
+                full_output_path: full_output_path.clone(),
+            },
+        );
+        tui.render_now(false);
+
+        let _ = tx.send(TuiMessage::UserBashFinished(UserBashReport {
+            command: command_owned,
+            output,
+            exit_code,
+            cancelled,
+            truncated,
+            full_output_path,
+            exclude_from_context,
+        }));
+    });
 }
 
 /// Encode a crossterm key into the raw key data consumed by the Node TUI
@@ -1286,7 +1408,7 @@ fn open_extension_selector(
         &ctx.editor_container,
         &ctx.editor,
         &ctx.tui,
-        list,
+        SelectorView::List(list),
         frame,
         SelectorKind::Extension,
     );
@@ -1517,7 +1639,7 @@ fn open_js_selector(
         &ctx.editor_container,
         &ctx.editor,
         &ctx.tui,
-        list,
+        SelectorView::List(list),
         frame,
         SelectorKind::Extension,
     );
@@ -1797,7 +1919,9 @@ fn ask_user_options(value: &serde_json::Value) -> Vec<(String, Option<String>)> 
             }
             continue;
         }
-        let Some(object) = item.as_object() else { continue };
+        let Some(object) = item.as_object() else {
+            continue;
+        };
         let title = ["title", "label", "text", "value", "name"]
             .iter()
             .find_map(|key| object.get(*key).and_then(serde_json::Value::as_str))
@@ -1845,27 +1969,17 @@ fn parse_ask_user_prompt(request: &rpi_extensions::UiDialogRequest) -> AskUserPr
         options = ask_user_options(ui);
     }
     if kind == "confirm" && options.is_empty() {
-        options = vec![
-            ("Yes".to_string(), None),
-            ("No".to_string(), None),
-        ];
+        options = vec![("Yes".to_string(), None), ("No".to_string(), None)];
     }
     let allow_multiple = ask_user_bool(source, &["allowMultiple", "allow_multiple", "multiple"])
         .or_else(|| ask_user_bool(ui, &["allowMultiple", "allow_multiple", "multiple"]))
         .unwrap_or(false);
     // Freeform defaults on when there is nothing to pick from, matching the
     // "no options ⇒ free input" contract.
-    let allow_freeform = ask_user_bool(
-        source,
-        &["allowFreeform", "allow_freeform", "allow_custom"],
-    )
-    .or_else(|| {
-        ask_user_bool(
-            ui,
-            &["allowFreeform", "allow_freeform", "allow_custom"],
-        )
-    })
-    .unwrap_or(options.is_empty());
+    let allow_freeform =
+        ask_user_bool(source, &["allowFreeform", "allow_freeform", "allow_custom"])
+            .or_else(|| ask_user_bool(ui, &["allowFreeform", "allow_freeform", "allow_custom"]))
+            .unwrap_or(options.is_empty());
     let suggest = ask_user_str(source, &["suggest", "placeholder"])
         .or_else(|| ask_user_str(ui, &["suggest", "placeholder"]));
 
@@ -1884,11 +1998,7 @@ fn parse_ask_user_prompt(request: &rpi_extensions::UiDialogRequest) -> AskUserPr
 
 /// Build the shared header frame for an ask-user prompt.
 /// Uses markdown-aware rendering for question and context content.
-fn ask_user_frame(
-    prompt: &AskUserPrompt,
-    body: Arc<dyn Component>,
-    hint: &str,
-) -> Arc<Container> {
+fn ask_user_frame(prompt: &AskUserPrompt, body: Arc<dyn Component>, hint: &str) -> Arc<Container> {
     let frame = Arc::new(Container::new());
     frame.add_child(Arc::new(DynamicBorder::new()));
     frame.add_child(Arc::new(Spacer::new(1)));
@@ -2043,7 +2153,7 @@ fn open_ask_user_selector(
         &editor_container,
         &editor,
         &tui,
-        list,
+        SelectorView::List(list),
         frame,
         SelectorKind::Extension,
     );
@@ -2221,29 +2331,27 @@ impl SlashCommand for ModelCommand {
         let term = args.trim();
         if !term.is_empty() {
             // /model <name> — direct switch by id (pi handleModelCommand).
-            let Some(model) = find_model_selector_match(&ctx.model_catalog, term) else {
-                add_error_message(
+            //
+            // Native pi only switches on an EXACT match; a term that matches
+            // nothing falls through to the selector with the query prefilled
+            // instead of erroring out (`showModelSelector(searchTerm)`).
+            if let Some(model) = find_model_selector_match(&ctx.model_catalog, term) {
+                let model_id = model.id.clone();
+                ctx.state.set_current_model(&model);
+                let lane = ctx.lane.clone();
+                tokio::spawn(async move {
+                    let _ = lane.set_model(model).await;
+                });
+                add_note_message(
                     &ctx.chat,
-                    &format!("No model matches \"{term}\". Try /model for the list."),
+                    &format!(
+                        "Model set to {} — applies to the next message.",
+                        short_model_name(&model_id)
+                    ),
                 );
                 ctx.tui.request_render(false);
                 return;
-            };
-            let model_id = model.id.clone();
-            ctx.state.set_current_model(&model);
-            let lane = ctx.lane.clone();
-            tokio::spawn(async move {
-                let _ = lane.set_model(model).await;
-            });
-            add_note_message(
-                &ctx.chat,
-                &format!(
-                    "Model set to {} — applies to the next message.",
-                    short_model_name(&model_id)
-                ),
-            );
-            ctx.tui.request_render(false);
-            return;
+            }
         }
         open_model_selector(
             &ctx.state,
@@ -2254,6 +2362,7 @@ impl SlashCommand for ModelCommand {
             &ctx.lane,
             &ctx.lane_model_id,
             &ctx.chat,
+            (!term.is_empty()).then_some(term),
         );
     }
 }
@@ -2453,12 +2562,22 @@ impl SlashCommand for ExportCommand {
         if format.is_empty() || format == "md" || format == "markdown" {
             let _ = ctx.tx.send(TuiMessage::ExportSession);
         } else if format == "html" {
-            let _ = ctx.tx.send(TuiMessage::ExportSessionWithFormat(crate::export::ExportFormat::Html));
+            let _ = ctx.tx.send(TuiMessage::ExportSessionWithFormat(
+                crate::export::ExportFormat::Html,
+            ));
         } else if format == "jsonl" {
-            let _ = ctx.tx.send(TuiMessage::ExportSessionWithFormat(crate::export::ExportFormat::Jsonl));
+            let _ = ctx.tx.send(TuiMessage::ExportSessionWithFormat(
+                crate::export::ExportFormat::Jsonl,
+            ));
         } else {
             // Invalid format, show error
-            add_error_message(&ctx.chat, &format!("Unknown export format: {}. Supported: md, html, jsonl", args.trim()));
+            add_error_message(
+                &ctx.chat,
+                &format!(
+                    "Unknown export format: {}. Supported: md, html, jsonl",
+                    args.trim()
+                ),
+            );
             ctx.tui.request_render(false);
         }
     }
@@ -2931,6 +3050,28 @@ enum TuiMessage {
     /// editor. Handling it on the async loop keeps editor mutation single-
     /// threaded with the rest of the TUI state.
     ExternalEditorResult(Result<String, String>),
+    /// Restore all queued steering/follow-up messages into the editor (the
+    /// `app.message.dequeue` action — native pi's "edit all queued messages").
+    Dequeue,
+    /// A user-initiated `!command` / `!!command` shell run finished. Routed to
+    /// the main loop so the `bashExecution` transcript record is persisted in
+    /// order relative to agent runs (native pi's `recordBashResult` /
+    /// `_pendingBashMessages`).
+    UserBashFinished(UserBashReport),
+}
+
+/// Terminal result of a user-initiated `!command` shell run.
+///
+/// Carries everything needed to build the persisted `bashExecution` message
+/// plus the `!!` context-exclusion flag. See `start_user_bash`.
+struct UserBashReport {
+    command: String,
+    output: String,
+    exit_code: Option<i32>,
+    cancelled: bool,
+    truncated: bool,
+    full_output_path: Option<String>,
+    exclude_from_context: bool,
 }
 
 /// Extract the concatenated text content from an assistant message (mirrors
@@ -2999,12 +3140,14 @@ fn scoped_catalog(catalog: &[rpi_ai::Model], current_id: &str) -> Vec<rpi_ai::Mo
     out
 }
 
-/// Interactive `/settings` menu: a top-level selector over the editable
-/// settings, each opening a sub-selector that applies the choice AND persists
-/// it to settings.json (theme / default model / default thinking / cycle
-/// scope). Selecting a menu item swaps the current selector for the
-/// sub-selector (the `active_selector` slot is single, so each open replaces
-/// the previous list); the sub-selector's cancel restores the editor.
+/// Interactive `/settings` menu.
+///
+/// A [`SettingsList`] of editable settings (native pi's `SettingsSelectorComponent`):
+/// Enter/Space cycles a row's value in place, and the theme/model/thinking/scope
+/// rows open a sub-selector that replaces the active selector (the
+/// `active_selector` slot is single). Value changes apply immediately where the
+/// running TUI can honor them and are always persisted to `settings.json`, so
+/// rows marked "applies on restart" take effect next launch.
 fn open_settings_selector(
     state: &Arc<TuiState>,
     editor_container: &Arc<Container>,
@@ -3018,89 +3161,80 @@ fn open_settings_selector(
     package_resources: &Arc<crate::packages::PackageResources>,
 ) {
     let settings = crate::settings::load_settings().unwrap_or_default();
-    let mut items: Vec<SelectItem> = Vec::new();
-    items.push(
-        SelectItem::new("theme", "Theme")
-            .with_description(&settings.theme.clone().unwrap_or_else(|| "(default)".into())),
-    );
-    items.push(
-        SelectItem::new("model", "Default model").with_description(
-            &settings
-                .default_model
-                .clone()
-                .unwrap_or_else(|| "(none)".into()),
-        ),
-    );
-    items.push(
-        SelectItem::new("thinking", "Default thinking").with_description(
-            &settings
-                .default_thinking_level
-                .clone()
-                .unwrap_or_else(|| "(default)".into()),
-        ),
-    );
-    let scope_desc = match &settings.scoped_models {
-        Some(list) if !list.is_empty() => format!("{}", list.join(", ")),
-        _ => "all models".to_string(),
-    };
-    items
-        .push(SelectItem::new("scoped-models", "Ctrl+M cycle scope").with_description(&scope_desc));
-    let list = Arc::new(SelectList::new(items, 10));
+    let items = settings_menu_items(&settings, state, lane_model_id);
+    let list = Arc::new(SettingsList::new(items));
 
+    // ---- submenu rows ----
+    // These reuse the existing sub-selectors, which already persist their own
+    // choices. The settings menu is replaced by the sub-selector (single
+    // `active_selector` slot); cancelling the sub-selector returns to the editor.
     let state_sel = state.clone();
     let ec_sel = editor_container.clone();
     let editor_sel = editor.clone();
     let tui_sel = tui.clone();
     let lane_sel = lane.clone();
-    let chat_sel = chat.clone();
     let catalog_sel = catalog.to_vec();
     let lane_model_sel = lane_model_id.to_string();
+    let chat_sel = chat.clone();
     let cwd_sel = cwd.to_path_buf();
     let package_resources_sel = package_resources.clone();
-    list.on_select(Arc::new(move |item| {
-        // Swap this menu for the sub-selector; each sub-selector saves its
-        // choice to settings.json on select.
-        match item.value.as_str() {
-            "theme" => open_settings_theme_selector(
-                &state_sel,
-                &ec_sel,
-                &editor_sel,
-                &tui_sel,
-                &chat_sel,
-                &cwd_sel,
-                &package_resources_sel,
-            ),
-            "model" => open_settings_model_selector(
-                &state_sel,
-                &ec_sel,
-                &editor_sel,
-                &tui_sel,
-                &lane_sel,
-                &catalog_sel,
-                &lane_model_sel,
-                &chat_sel,
-            ),
-            "thinking" => open_settings_thinking_selector(
-                &state_sel,
-                &ec_sel,
-                &editor_sel,
-                &tui_sel,
-                &lane_sel,
-                &catalog_sel,
-                &lane_model_sel,
-                &chat_sel,
-            ),
-            "scoped-models" => open_scoped_models_selector(
-                &state_sel,
-                &ec_sel,
-                &editor_sel,
-                &tui_sel,
-                &catalog_sel,
-                &chat_sel,
-            ),
-            _ => close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel),
-        }
+    list.on_select(Arc::new(move |item| match item.key.as_str() {
+        "theme" => open_settings_theme_selector(
+            &state_sel,
+            &ec_sel,
+            &editor_sel,
+            &tui_sel,
+            &chat_sel,
+            &cwd_sel,
+            &package_resources_sel,
+        ),
+        "model" => open_settings_model_selector(
+            &state_sel,
+            &ec_sel,
+            &editor_sel,
+            &tui_sel,
+            &lane_sel,
+            &catalog_sel,
+            &lane_model_sel,
+            &chat_sel,
+        ),
+        "thinking" => open_settings_thinking_selector(
+            &state_sel,
+            &ec_sel,
+            &editor_sel,
+            &tui_sel,
+            &lane_sel,
+            &catalog_sel,
+            &lane_model_sel,
+            &chat_sel,
+        ),
+        "scoped-models" => open_scoped_models_selector(
+            &state_sel,
+            &ec_sel,
+            &editor_sel,
+            &tui_sel,
+            &catalog_sel,
+            &chat_sel,
+        ),
+        _ => close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel),
     }));
+
+    // ---- value rows ----
+    // Apply live where possible, then persist so the choice survives a restart.
+    let state_change = state.clone();
+    let chat_change = chat.clone();
+    let tui_change = tui.clone();
+    list.on_change(Arc::new(move |key, value| {
+        let mut settings = crate::settings::load_settings().unwrap_or_default();
+        let applied = apply_setting_change(&state_change, key, value, &mut settings);
+        let saved = crate::settings::save_settings(&settings);
+        if let Some(note) = applied {
+            let suffix = if saved.is_ok() { "" } else { " (not saved)" };
+            add_note_message(&chat_change, &format!("{note}{suffix}"));
+        }
+        tui_change.request_render(false);
+    }));
+
     let state_cancel = state.clone();
     let ec_cancel = editor_container.clone();
     let editor_cancel = editor.clone();
@@ -3109,14 +3243,236 @@ fn open_settings_selector(
         close_selector(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
     }));
 
-    open_selector(
+    open_selector_with_view(
         state,
         editor_container,
         editor,
         tui,
+        SelectorView::Settings(list.clone()),
         list,
         SelectorKind::Settings,
     );
+}
+
+/// Build the `/settings` rows from the loaded settings plus the live TUI state.
+///
+/// Descriptions carry "(applies on restart)" for values resolved once at
+/// startup, so the menu never implies an effect the running session cannot
+/// apply.
+fn settings_menu_items(
+    settings: &crate::settings::Settings,
+    state: &Arc<TuiState>,
+    lane_model_id: &str,
+) -> Vec<SettingItem> {
+    let current_theme = settings.theme.clone().unwrap_or_else(|| "dark".to_string());
+    let current_model = settings
+        .default_model
+        .clone()
+        .unwrap_or_else(|| lane_model_id.to_string());
+    let current_thinking = settings
+        .default_thinking_level
+        .clone()
+        .unwrap_or_else(|| "(default)".to_string());
+    let scoped_desc = match &settings.scoped_models {
+        Some(list) if !list.is_empty() => format!("{} model(s)", list.len()),
+        _ => "all models".to_string(),
+    };
+    let hide_thinking = state.hide_thinking();
+    let show_images = state.show_images.lock().map(|guard| *guard).unwrap_or(true);
+    let show_cache_miss = settings.show_cache_miss_notices.unwrap_or(false);
+    let http_idle = settings
+        .http_idle_timeout_ms()
+        .map(|ms| {
+            if ms == 0 {
+                "disabled".to_string()
+            } else {
+                format!("{}s", ms / 1000)
+            }
+        })
+        .unwrap_or_else(|| "5m".to_string());
+
+    vec![
+        SettingItem::new("theme", "Theme", &current_theme)
+            .with_description("Color theme for the interface")
+            .with_submenu(),
+        SettingItem::new("model", "Default model", &current_model)
+            .with_description("Saved default model for new sessions")
+            .with_submenu(),
+        SettingItem::new("thinking", "Default thinking", &current_thinking)
+            .with_description("Saved default thinking level")
+            .with_submenu(),
+        SettingItem::new("scoped-models", "Cycle scope", &scoped_desc)
+            .with_description("Models enabled for Ctrl+M cycling")
+            .with_submenu(),
+        SettingItem::new(
+            "hide-thinking",
+            "Hide thinking",
+            bool_setting_value(hide_thinking),
+        )
+        .with_description("Hide thinking blocks in assistant responses")
+        .with_values(&["true", "false"]),
+        SettingItem::new(
+            "show-images",
+            "Show images",
+            bool_setting_value(show_images),
+        )
+        .with_description("Render images inline in the terminal")
+        .with_values(&["true", "false"]),
+        SettingItem::new(
+            "cache-miss-notices",
+            "Cache miss notices",
+            bool_setting_value(show_cache_miss),
+        )
+        .with_description("Transcript notices for prompt-cache costs")
+        .with_values(&["true", "false"]),
+        SettingItem::new(
+            "quiet-startup",
+            "Quiet startup",
+            bool_setting_value(settings.quiet_startup.unwrap_or(false)),
+        )
+        .with_description("Disable the verbose startup listing (applies on restart)")
+        .with_values(&["true", "false"]),
+        SettingItem::new(
+            "terminal-progress",
+            "Terminal progress",
+            bool_setting_value(settings.show_terminal_progress().unwrap_or(true)),
+        )
+        .with_description("OSC 9;4 progress in the terminal tab bar (applies on restart)")
+        .with_values(&["true", "false"]),
+        SettingItem::new(
+            "fullscreen-copy-on-select",
+            "Fullscreen copy on select",
+            bool_setting_value(settings.fullscreen_copy_on_select.unwrap_or(true)),
+        )
+        .with_description("Copy selected text automatically in fullscreen mode")
+        .with_values(&["true", "false"]),
+        SettingItem::new(
+            "double-escape-action",
+            "Double-escape action",
+            settings
+                .double_escape_action
+                .clone()
+                .unwrap_or_else(|| "tree".to_string())
+                .as_str(),
+        )
+        .with_description("Esc Esc with an empty editor (applies on restart)")
+        .with_values(&["tree", "fork", "none"]),
+        SettingItem::new(
+            "editor-padding",
+            "Editor padding",
+            settings.editor_padding_x.unwrap_or(1).to_string().as_str(),
+        )
+        .with_description("Horizontal editor padding, 0-3 (applies on restart)")
+        .with_values(&["0", "1", "2", "3"]),
+        SettingItem::new(
+            "autocomplete-max-items",
+            "Autocomplete max items",
+            settings
+                .autocomplete_max_visible
+                .unwrap_or(5)
+                .to_string()
+                .as_str(),
+        )
+        .with_description("Max autocomplete rows, 3-20 (applies on restart)")
+        .with_values(&["3", "5", "7", "10", "15", "20"]),
+        SettingItem::new("http-idle-timeout", "HTTP idle timeout", &http_idle)
+            .with_description("Idle gap allowed while awaiting HTTP data (applies on restart)")
+            .with_values(&["30s", "1m", "5m", "disabled"]),
+    ]
+}
+
+/// `"true"` / `"false"` for a settings row value.
+fn bool_setting_value(value: bool) -> &'static str {
+    if value {
+        "true"
+    } else {
+        "false"
+    }
+}
+
+/// Apply one `/settings` value change to the running TUI and to `settings`.
+///
+/// Returns a note to show in the transcript when the change is user-visible;
+/// `None` for changes that only take effect on the next launch.
+fn apply_setting_change(
+    state: &Arc<TuiState>,
+    key: &str,
+    value: &str,
+    settings: &mut crate::settings::Settings,
+) -> Option<String> {
+    let as_bool = || value == "true";
+    match key {
+        // Live: hide/show thinking blocks in the transcript immediately.
+        "hide-thinking" => {
+            state.set_hide_thinking(as_bool());
+            settings.hide_thinking_block = Some(as_bool());
+            Some(format!(
+                "Thinking blocks {}.",
+                if as_bool() { "hidden" } else { "shown" }
+            ))
+        }
+        // Live: the image flag is consulted when images would be rendered.
+        "show-images" => {
+            if let Ok(mut guard) = state.show_images.lock() {
+                *guard = as_bool();
+            }
+            settings.show_images = Some(as_bool());
+            Some(format!(
+                "Inline images {}.",
+                if as_bool() { "enabled" } else { "disabled" }
+            ))
+        }
+        // Live: read from `state` once per cache-miss notice.
+        "cache-miss-notices" => {
+            if let Ok(mut guard) = state.cache_miss_notices.lock() {
+                *guard = as_bool();
+            }
+            settings.show_cache_miss_notices = Some(as_bool());
+            Some(format!(
+                "Cache miss notices {}.",
+                if as_bool() { "enabled" } else { "disabled" }
+            ))
+        }
+        // Live: read from settings on each selection mouse-up.
+        "fullscreen-copy-on-select" => {
+            settings.fullscreen_copy_on_select = Some(as_bool());
+            Some(format!(
+                "Copy on select {}.",
+                if as_bool() { "enabled" } else { "disabled" }
+            ))
+        }
+        // Persisted only: resolved once at startup.
+        "quiet-startup" => {
+            settings.quiet_startup = Some(as_bool());
+            None
+        }
+        "terminal-progress" => {
+            settings.show_terminal_progress = Some(as_bool());
+            None
+        }
+        "double-escape-action" => {
+            settings.double_escape_action = Some(value.to_string());
+            None
+        }
+        "editor-padding" => {
+            settings.editor_padding_x = value.parse().ok();
+            None
+        }
+        "autocomplete-max-items" => {
+            settings.autocomplete_max_visible = value.parse().ok();
+            None
+        }
+        "http-idle-timeout" => {
+            settings.http_idle_timeout = Some(match value {
+                "disabled" => serde_json::Value::String("disabled".to_string()),
+                "30s" => serde_json::json!(30_000),
+                "1m" => serde_json::json!(60_000),
+                _ => serde_json::json!(300_000),
+            });
+            None
+        }
+        _ => None,
+    }
 }
 
 /// Apply a theme choice AND persist it to settings.json (`/settings` → Theme).
@@ -3267,11 +3623,13 @@ fn open_settings_model_selector(
         close_selector(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
     }));
 
-    open_selector(
+    open_searchable_selector(
         state,
         editor_container,
         editor,
         tui,
+        Some("Default model"),
+        Some("Type to filter by name, provider, or id"),
         list,
         SelectorKind::Settings,
     );
@@ -3310,7 +3668,20 @@ fn model_selector_items(catalog: &[rpi_ai::Model], lane_model_id: &str) -> Vec<S
             } else {
                 ""
             };
-            SelectItem::new(&m.id, &label).with_description(&format!("{identity}{marker}"))
+            // Native pi ranks provider-prefixed queries first, so the bare id
+            // is not the leading token (`getModelSelectorSearchText`).
+            let name = if m.name.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", m.name)
+            };
+            let search_text = format!(
+                "{} {}/{} {} {}{}",
+                m.provider, m.provider, m.id, m.provider, m.id, name
+            );
+            SelectItem::new(&m.id, &label)
+                .with_description(&format!("{identity}{marker}"))
+                .with_search_text(&search_text)
         })
         .collect()
 }
@@ -3822,10 +4193,7 @@ async fn render_session_history(
                     // not as part of the assistant text. Restore them as
                     // completed tool panels so resumed sessions show the
                     // command output as well as the user's prompts.
-                    let comp = Arc::new(ToolExecutionComponent::new(
-                        &result.tool_name,
-                        "",
-                    ));
+                    let comp = Arc::new(ToolExecutionComponent::new(&result.tool_name, ""));
                     comp.set_result(&tool_result_message_text(result), result.is_error);
                     chat.add_child(comp);
                     chat.add_child(Arc::new(Spacer::new(1)));
@@ -4166,6 +4534,34 @@ enum SelectorKind {
     Extension,
 }
 
+/// The component receiving keys while a selector is open.
+///
+/// Plain selectors route straight to the [`SelectList`]; searchable ones route
+/// through [`SearchableSelectList`] so typing filters instead of being ignored.
+/// Both variants expose the underlying list for callback registration and
+/// selection inspection.
+#[derive(Clone)]
+enum SelectorView {
+    /// A bare `SelectList` (no search box).
+    List(Arc<SelectList>),
+    /// A `SelectList` wrapped with a fuzzy-filter input.
+    Searchable(Arc<SearchableSelectList>),
+    /// The `/settings` menu: value rows cycle in place, submenu rows open a
+    /// nested selector.
+    Settings(Arc<SettingsList>),
+}
+
+impl SelectorView {
+    /// Route a key to the appropriate child.
+    fn handle_key(&self, key: KeyEvent) {
+        match self {
+            Self::List(list) => list.handle_key(key),
+            Self::Searchable(searchable) => searchable.handle_key(key),
+            Self::Settings(settings) => settings.handle_key(key),
+        }
+    }
+}
+
 /// Shared mutable TUI state, `Arc`-cloned into the drain task, the key loop,
 /// and the render-tick task.
 struct TuiState {
@@ -4191,6 +4587,14 @@ struct TuiState {
     /// host and runs `before_agent_start`. The key thread can trigger this
     /// directly while the async message loop is awaiting the blocking worker.
     js_preparation_cancel: std::sync::Mutex<Option<CancellationToken>>,
+    /// Cancellation signal for a user-initiated `!command` / `!!command` shell
+    /// run. `Some` while the command executes; Esc/Ctrl+C cancels it. `None`
+    /// when no user bash is running.
+    user_bash_cancel: std::sync::Mutex<Option<CancellationToken>>,
+    /// `bashExecution` messages produced by `!command` while an agent run was
+    /// in flight. Flushed to the lane on `AgentEnd` so transcript order matches
+    /// native pi's `_pendingBashMessages` (never spliced mid-turn).
+    pending_bash_messages: std::sync::Mutex<Vec<AgentMessage>>,
     /// The footer, updated live by the drain task.
     footer: Arc<FooterComponent>,
     /// The status-container (status slot in the dock) — cleared/filled with a
@@ -4200,13 +4604,16 @@ struct TuiState {
     chat_container: Arc<Container>,
     /// The active loader shown while `Working`.
     loader: Arc<Loader>,
+    /// The editor, so status changes can drive its top-border working
+    /// indicator (the spinner + elapsed time shown inside the input box border).
+    editor: Arc<Editor>,
     /// The last finalized assistant text (for `/copy`). Updated by the drain
     /// task on `MessageEnd` / `AgentEnd`.
     last_assistant_text: std::sync::Mutex<String>,
     /// The active selector overlay, swapped into the editor slot. `Some` while
     /// a selector is open; the key loop routes to it first and restores the
     /// editor on done/cancel.
-    active_selector: std::sync::Mutex<Option<(Arc<SelectList>, SelectorKind)>>,
+    active_selector: std::sync::Mutex<Option<(SelectorView, SelectorKind)>>,
     /// Extension-provided editor currently occupying the input slot.
     active_extension_editor: std::sync::Mutex<Option<Arc<Editor>>>,
     /// Single-line input currently occupying the input slot for an extension.
@@ -4239,6 +4646,9 @@ struct TuiState {
     /// even though image wiring is minimal this pass — the flag is consulted
     /// where images would be shown and echoed back by `/images`.
     show_images: std::sync::Mutex<bool>,
+    /// Transcript notices for prompt-cache costs and provider recovery
+    /// diagnostics (native pi `showCacheMissNotices`, default `false`).
+    cache_miss_notices: std::sync::Mutex<bool>,
     /// Submitted-message history for ↑/↓ recall, most recent first (mirrors
     /// the TS editor `history` array). Bounded at [`HISTORY_LIMIT`].
     history: std::sync::Mutex<Vec<String>>,
@@ -4271,6 +4681,17 @@ struct TuiState {
     search: Arc<AltScreenSearch>,
     /// Search bar component shown when search is active.
     search_bar: Arc<SearchBar>,
+    /// Dock slot listing queued steering/follow-up messages while a run is
+    /// active (native pi's `pendingMessagesContainer`). Empty when nothing is
+    /// queued, so it renders zero rows and never affects the layout.
+    pending_container: Arc<Container>,
+    /// Display text for the `app.message.dequeue` binding (e.g. `Alt+Q`),
+    /// shown in the pending-messages hint row.
+    dequeue_hint: String,
+    /// Last queue snapshot rendered into `pending_container`. Lets
+    /// `set_pending_queue` skip redundant rebuilds + frame requests when the
+    /// polled queue is unchanged.
+    pending_snapshot: std::sync::Mutex<rpi_harness::agent_harness::QueuedMessages>,
     /// Fullscreen selection tracking for auto-copy.
     selection_start: std::sync::Mutex<Option<(u16, u16)>>,
     selection_end: std::sync::Mutex<Option<(u16, u16)>>,
@@ -4379,6 +4800,7 @@ fn configured_keybindings() -> Arc<rpi_tui::Keybindings> {
             "app.clipboard.pasteImage",
             rpi_tui::keybindings::keys::PASTE_IMAGE,
         ),
+        ("app.message.dequeue", rpi_tui::keybindings::keys::DEQUEUE),
     ];
     for (name, id) in known {
         let Some(value) = overrides.get(*name) else {
@@ -4424,6 +4846,20 @@ fn keybinding_matches(
     }
 }
 
+/// Display text for the `app.message.dequeue` binding (e.g. `Alt+Q`), used in
+/// the pending-messages hint row. Mirrors native pi's `getAppKeyDisplay`;
+/// falls back to native pi's platform default when nothing is configured.
+fn pending_dequeue_hint(bindings: &rpi_tui::Keybindings) -> String {
+    let keys = bindings.get_keys(rpi_tui::keybindings::keys::DEQUEUE);
+    if keys.is_empty() {
+        return if cfg!(windows) { "Alt+Q" } else { "Alt+Up" }.to_string();
+    }
+    keys.iter()
+        .map(|combo| combo.display())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 fn double_escape_trigger(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
     last.is_some_and(|previous| {
         now.duration_since(previous) <= std::time::Duration::from_millis(500)
@@ -4447,11 +4883,18 @@ const PASTE_BURST_GAP: std::time::Duration = std::time::Duration::from_millis(20
 /// arrives as plain key events with a bare Enter per line. Two timing signals
 /// separate a pasted Enter from a typed one:
 ///
-/// - `more_queued`: the paste's remaining characters are already sitting in the
-///   console input queue, so a non-blocking poll finds them immediately.
+/// - `more_queued`: real key input is already sitting in the console input
+///   queue. Callers must feed this through [`probe_paste_input`], which drops
+///   the key's own Release events — Windows queues press+release together over
+///   RDP, and a bare poll cannot tell that Release apart from paste content.
 /// - `last_text_key_at`: the Enter lands within [`PASTE_BURST_GAP`] of the
 ///   preceding pasted character, which also catches a paste that *ends* with a
 ///   newline (nothing queued behind it, but it was not typed by hand).
+///
+/// NOTE: the caller gates this on `cfg!(windows)`. On Unix, bracketed paste
+/// delivers real pastes as `Event::Paste`, and the timing heuristic would
+/// misclassify a remote/mobile client's coalesced text+Enter burst as paste
+/// ("回车变成了换行").
 fn enter_is_paste_burst(
     last_text_key_at: Option<std::time::Instant>,
     now: std::time::Instant,
@@ -4461,6 +4904,35 @@ fn enter_is_paste_burst(
         return true;
     }
     last_text_key_at.is_some_and(|previous| now.duration_since(previous) < PASTE_BURST_GAP)
+}
+
+/// Decide whether more *real* input is queued behind the current key, for the
+/// Windows paste-burst check.
+///
+/// Windows emits a `KeyEventKind::Release` for every press, usually queued
+/// right behind the `Press`. A bare non-blocking poll therefore reports "more
+/// input" for a lone Enter — which made a remote/RDP Enter look like a paste
+/// burst. This drains and discards release events and returns the first
+/// *meaningful* event it read (stashed so the caller's loop still processes it)
+/// plus whether any real input was queued. `next_event` returns `None` when
+/// nothing is available within the probe window.
+fn probe_paste_input(
+    pending: Option<Event>,
+    mut next_event: impl FnMut() -> Option<Event>,
+) -> (bool, Option<Event>) {
+    let mut pending = pending;
+    let mut more_queued = pending.is_some();
+    while !more_queued {
+        match next_event() {
+            Some(Event::Key(key)) if key.kind == KeyEventKind::Release => continue,
+            Some(ev) => {
+                pending = Some(ev);
+                more_queued = true;
+            }
+            None => break,
+        }
+    }
+    (more_queued, pending)
 }
 
 /// Milliseconds since the last text key, for the [`enter_is_paste_burst`] trace
@@ -4484,6 +4956,24 @@ fn transcript_page_size(viewport_height: usize) -> i32 {
 
 fn should_dispatch_key(kind: KeyEventKind) -> bool {
     kind != KeyEventKind::Release
+}
+
+/// Last-resort quit, run on the key worker thread.
+///
+/// The async loop owns `run_prompt_streaming(..).await` for the whole run, so a
+/// queued [`TuiMessage::Exit`] is not read while a run is in flight. When the
+/// user asks to quit a second time — the first Ctrl+C only reached `Aborting` —
+/// treat the run as wedged, restore the terminal, and exit.
+///
+/// `130` is the conventional `128 + SIGINT` status, so a wrapper script can tell
+/// a forced quit from a clean one.
+fn emergency_exit(tui: &Arc<TuiAltScreen>) -> ! {
+    // Best effort: leave the alternate buffer and restore cooked mode so the
+    // user's shell is usable afterwards. `stop` also joins the render
+    // scheduler, so no in-flight frame can repaint over the restored screen.
+    tui.stop(Default::default());
+    eprintln!("\n\x1b[2mrpi: aborted (forced quit).\x1b[0m");
+    std::process::exit(130);
 }
 
 /// Compact token count for the cache-miss notice: 1.2M / 34.5K / 900.
@@ -4581,9 +5071,98 @@ impl TuiState {
         }
     }
 
+    /// Whether a user-initiated `!command` shell run is currently active.
+    fn user_bash_running(&self) -> bool {
+        self.user_bash_cancel.lock().unwrap().is_some()
+    }
+
+    /// Register a cancellation token for a new user bash run, cancelling any
+    /// previous one (mirrors `begin_js_preparation`).
+    fn begin_user_bash(&self) -> CancellationToken {
+        let cancellation = CancellationToken::new();
+        if let Some(previous) = self
+            .user_bash_cancel
+            .lock()
+            .unwrap()
+            .replace(cancellation.clone())
+        {
+            previous.cancel();
+        }
+        cancellation
+    }
+
+    /// Clear the user-bash slot. Called when the command finishes so the
+    /// running guard and the Esc router both see idle state.
+    fn finish_user_bash(&self) {
+        self.user_bash_cancel.lock().unwrap().take();
+    }
+
+    /// Cancel a running user bash command. Returns `true` when one was active
+    /// (mirrors `cancel_js_preparation`). The spawned task clears the slot
+    /// itself once `execute_shell_with_capture` returns.
+    fn cancel_user_bash(&self) -> bool {
+        let cancellation = self.user_bash_cancel.lock().unwrap().as_ref().cloned();
+        if let Some(cancellation) = cancellation {
+            cancellation.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
     fn set_status(&self, status: RunStatus) {
         *self.status.lock().unwrap() = status;
         self.apply_status(status);
+    }
+
+    /// The dock container listing queued messages (native pi's
+    /// `pendingMessagesContainer`).
+    fn pending_container(&self) -> &Arc<Container> {
+        &self.pending_container
+    }
+
+    /// Render the current queue into the pending dock slot. Mirrors native
+    /// pi's `updatePendingMessagesDisplay`: `Steering: <text>` /
+    /// `Follow-up: <text>` rows (dim) plus a `↳ <key> to edit all queued
+    /// messages` hint. A no-op when the snapshot is unchanged, so the poll
+    /// caller can invoke it freely without forcing frames.
+    fn set_pending_queue(&self, messages: rpi_harness::agent_harness::QueuedMessages) {
+        {
+            let mut current = self.pending_snapshot.lock().unwrap();
+            if *current == messages {
+                return;
+            }
+            *current = messages.clone();
+        }
+        let container = &self.pending_container;
+        container.clear();
+        if messages.is_empty() {
+            return;
+        }
+        let colors = current_theme().colors;
+        container.add_child(Arc::new(Spacer::new(1)));
+        for text in &messages.steering {
+            container.add_child(Arc::new(Text::new(
+                colors.muted.fg(&format!("Steering: {text}")),
+                1,
+                0,
+            )));
+        }
+        for text in &messages.follow_up {
+            container.add_child(Arc::new(Text::new(
+                colors.muted.fg(&format!("Follow-up: {text}")),
+                1,
+                0,
+            )));
+        }
+        container.add_child(Arc::new(Text::new(
+            colors.muted.fg(&format!(
+                "↳ {} to edit all queued messages",
+                self.dequeue_hint
+            )),
+            1,
+            0,
+        )));
     }
 
     /// Atomically reserve the single interactive run slot. The editor callback
@@ -4614,9 +5193,16 @@ impl TuiState {
                     tui.set_title("rpi — working");
                 }
                 self.status_container.clear();
+                // The working indicator renders inside the editor's top border.
+                // `show_terminal_progress` disables it entirely.
                 if self.show_terminal_progress {
-                    self.loader.start();
-                    self.status_container.add_child(self.loader.clone());
+                    self.editor.set_working(Some(WorkingState {
+                        frame: 0,
+                        started_at: std::time::Instant::now(),
+                        message: "Working…".to_string(),
+                    }));
+                } else {
+                    self.editor.set_working(None);
                 }
             }
             RunStatus::Aborting => {
@@ -4625,6 +5211,7 @@ impl TuiState {
                 // render tick intentionally stops advancing in this state.
                 self.loader.stop();
                 self.status_container.clear();
+                self.editor.set_working(None);
             }
             RunStatus::Idle => {
                 self.footer.set_status("");
@@ -4633,6 +5220,7 @@ impl TuiState {
                 }
                 self.loader.stop();
                 self.status_container.clear();
+                self.editor.set_working(None);
             }
         }
     }
@@ -4645,10 +5233,11 @@ impl TuiState {
             return;
         }
 
+        // The working indicator now lives inside the editor's top border and
+        // stays visible for the whole Working state, so no status-slot swap is
+        // needed when bash panels (which render their own spinner in the
+        // transcript) appear or disappear.
         self.status_container.clear();
-        if self.show_terminal_progress && self.bash_components.lock().unwrap().is_empty() {
-            self.status_container.add_child(self.loader.clone());
-        }
     }
 
     fn show_retry(&self, attempt: u32, max_retries: u32, delay_ms: u64) {
@@ -4723,6 +5312,9 @@ impl TuiState {
     fn set_current_model(&self, model: &rpi_ai::Model) {
         *self.current_model_id.lock().unwrap() = model.id.clone();
         self.footer.set_model(&short_model_name(&model.id));
+        // A model switch changes the context window, so the `%/{window}` badge
+        // must rescale against the same last-reported token count.
+        self.footer.set_context_window(model.context_window as i64);
     }
 
     /// B5e: read a clone of the current assistant-markdown transformer (if any).
@@ -4767,6 +5359,10 @@ struct TuiStartupSettings {
     hide_thinking: bool,
     quiet_startup: bool,
     show_terminal_progress: bool,
+    /// Render images inline (`terminal.showImages` / flat `showImages`).
+    show_images: bool,
+    /// Transcript notices for prompt-cache costs (`showCacheMissNotices`).
+    cache_miss_notices: bool,
 }
 
 fn preferred_project_setting<T>(
@@ -4821,10 +5417,20 @@ fn resolve_tui_startup_settings(
         preferred_project_setting(project_settings, |settings| settings.quiet_startup)
             .or(global.quiet_startup)
             .unwrap_or(false);
-    let show_terminal_progress =
-        preferred_project_setting(project_settings, |settings| settings.show_terminal_progress)
-            .or(global.show_terminal_progress)
+    let show_terminal_progress = preferred_project_setting(project_settings, |settings| {
+        settings.show_terminal_progress()
+    })
+    .or_else(|| global.show_terminal_progress())
+    .unwrap_or(true);
+    let show_images =
+        preferred_project_setting(project_settings, |settings| settings.show_images())
+            .or_else(|| global.show_images())
             .unwrap_or(true);
+    let cache_miss_notices = preferred_project_setting(project_settings, |settings| {
+        settings.show_cache_miss_notices
+    })
+    .or(global.show_cache_miss_notices)
+    .unwrap_or(false);
 
     TuiStartupSettings {
         editor_padding_x,
@@ -4832,6 +5438,8 @@ fn resolve_tui_startup_settings(
         hide_thinking,
         quiet_startup,
         show_terminal_progress,
+        show_images,
+        cache_miss_notices,
     }
 }
 
@@ -4878,6 +5486,8 @@ pub async fn interactive_tui(
     let autocomplete_max_visible = tui_settings.autocomplete_max_visible;
     let mut hide_thinking = tui_settings.hide_thinking;
     let show_terminal_progress = tui_settings.show_terminal_progress;
+    let show_images = tui_settings.show_images;
+    let cache_miss_notices = tui_settings.cache_miss_notices;
     let quiet_startup = tui_settings.quiet_startup;
     let update_checks_enabled =
         !args.offline && std::env::var_os("RPI_DISABLE_UPDATE_CHECK").is_none();
@@ -5092,13 +5702,30 @@ pub async fn interactive_tui(
         keybindings.clone(),
     ));
 
+    // Bash-mode border: a `!`-prefixed draft recolors the editor border to the
+    // bash accent (native pi's `updateEditorBorderColor` / `isBashMode`). The
+    // editor fires `on_change` for keystrokes and for programmatic
+    // `clear`/`set_text`, so the color also resets after a `!command` submits.
+    {
+        let editor_for_change = editor.clone();
+        editor.on_change(Arc::new(move |text: &str| {
+            let colors = current_theme().colors;
+            let is_bash = text.trim_start().starts_with('!');
+            editor_for_change.set_border_color(if is_bash {
+                Some(colors.bash_mode)
+            } else {
+                None
+            });
+        }));
+    }
+
     // ---- Footer + status ----
     let footer = Arc::new(FooterComponent::new());
     footer.set_model(&model_name);
     footer.set_cwd(&cwd.to_string_lossy());
     footer.set_git_branch(git_branch_for(&cwd).as_deref());
     if let Some(m) = model_catalog.iter().find(|m| m.id == lane_model_id) {
-        footer.set_context_usage(None, m.context_window as i64);
+        footer.set_context_window(m.context_window as i64);
     }
     footer.set_hints("Enter: Send | Shift+Enter: New line | Ctrl+C: Abort/Exit | Esc: Abort | Ctrl+L: Model | Ctrl+M: Cycle | Ctrl+T: Expand tool | /help");
 
@@ -5186,10 +5813,13 @@ pub async fn interactive_tui(
         show_terminal_progress,
         status: std::sync::Mutex::new(RunStatus::Idle),
         js_preparation_cancel: std::sync::Mutex::new(None),
+        user_bash_cancel: std::sync::Mutex::new(None),
+        pending_bash_messages: std::sync::Mutex::new(Vec::new()),
         footer: footer.clone(),
         status_container: status_container.clone(),
         chat_container: chat_container.clone(),
         loader: loader.clone(),
+        editor: editor.clone(),
         last_assistant_text: std::sync::Mutex::new(String::new()),
         active_selector: std::sync::Mutex::new(None),
         active_extension_editor: std::sync::Mutex::new(None),
@@ -5202,7 +5832,8 @@ pub async fn interactive_tui(
         theme_manager,
         tui: Some(tui.clone()),
         current_model_id: std::sync::Mutex::new(lane_model_id.clone()),
-        show_images: std::sync::Mutex::new(true),
+        show_images: std::sync::Mutex::new(show_images),
+        cache_miss_notices: std::sync::Mutex::new(cache_miss_notices),
         history: std::sync::Mutex::new(Vec::new()),
         history_index: std::sync::Mutex::new(-1),
         history_draft: std::sync::Mutex::new(None),
@@ -5212,6 +5843,11 @@ pub async fn interactive_tui(
         extension_session: reload_context.extension_session.clone(),
         search: Arc::new(AltScreenSearch::new()),
         search_bar: Arc::new(SearchBar::new()),
+        pending_container: Arc::new(Container::new()),
+        dequeue_hint: pending_dequeue_hint(&keybindings),
+        pending_snapshot: std::sync::Mutex::new(
+            rpi_harness::agent_harness::QueuedMessages::default(),
+        ),
         selection_start: std::sync::Mutex::new(None),
         selection_end: std::sync::Mutex::new(None),
     });
@@ -5235,6 +5871,7 @@ pub async fn interactive_tui(
     editor_container.add_child(editor.clone());
 
     let dock = Arc::new(VStack::from_children(vec![
+        StackChild::Entry(StackEntry::new(state.pending_container().clone())),
         StackChild::Entry(StackEntry::new(status_container.clone())),
         StackChild::Entry(StackEntry::new(autocomplete_container.clone())),
         StackChild::Entry(
@@ -5327,12 +5964,30 @@ pub async fn interactive_tui(
             return;
         }
 
+        // User-initiated shell mode: `!command` runs in the background and is
+        // recorded in the session context; `!!command` is excluded from it.
+        // Handled before the agent prompt path so it never reaches the model.
+        // Mirrors `interactive-mode.ts:3225`.
+        if let Some((command, exclude_from_context)) = parse_user_bash(text) {
+            if ctx_for_cb.state.user_bash_running() {
+                add_error_message(
+                    &ctx_for_cb.chat,
+                    "A bash command is already running. Press Esc to cancel it first.",
+                );
+                ctx_for_cb.tui.request_render(false);
+                return;
+            }
+            start_user_bash(&ctx_for_cb, command, exclude_from_context);
+            return;
+        }
+
         let run_status = *ctx_for_cb.state.status.lock().unwrap();
         if run_status != RunStatus::Idle {
             let message = AgentMessage::User(UserMessage::new(text.to_string(), 0));
             let lane = ctx_for_cb.lane.clone();
             let chat = ctx_for_cb.chat.clone();
             let tui = ctx_for_cb.tui.clone();
+            let state = ctx_for_cb.state.clone();
             tokio::spawn(async move {
                 // Queue immediately while the agent loop is still running.
                 // Routing this through the TUI's main channel delayed it until
@@ -5346,13 +6001,18 @@ pub async fn interactive_tui(
                 if let Err(error) = lane.steer(message).await {
                     add_error_message(&chat, &format!("Could not queue message: {error}"));
                     tui.render_now(false);
+                    return;
                 }
+                // Surface the queued entry in the pending dock immediately;
+                // the drain-time refresh only fires on the next agent event.
+                refresh_pending_messages(&state, &lane).await;
+                tui.request_render(false);
             });
-            // A queued prompt is still the user's message. Render it through
-            // the same transcript path as an immediately sent prompt rather
-            // than as a system-note row, so its bubble/markdown presentation
-            // stays consistent while the agent is busy.
-            add_user_message(&ctx_for_cb.chat, text);
+            // A queued prompt is echoed only once the loop actually consumes
+            // it: the run's `AgentEvent::MessageStart` renders the user bubble
+            // (native pi renders `message_start` for user messages). Until
+            // then it is surfaced by the pending-messages display, so the
+            // transcript never shows a message that is still waiting.
             ctx_for_cb.tui.request_render(false);
             return;
         }
@@ -5361,6 +6021,16 @@ pub async fn interactive_tui(
             return;
         }
 
+        // Render the user bubble here, NOT from `AgentEvent::MessageStart`.
+        //
+        // The harness persists the prompt itself and then drives
+        // `run_agent_loop` with an EMPTY prompts vec (so the prompt is not
+        // double-counted in the provider context), which means the loop emits
+        // no `message_start` for it — see
+        // `directly_sent_prompt_emits_no_user_message_start` in
+        // `crates/pi-harness/tests/harness_run_e2e.rs`. Queued steering /
+        // follow-up prompts DO get a `message_start` (the loop drains those
+        // itself), so those are deliberately rendered from the event instead.
         add_user_message(&ctx_for_cb.chat, text);
         // A new prompt starts a fresh interaction at the tail even when the
         // user had scrolled up to inspect older output.
@@ -5447,8 +6117,9 @@ pub async fn interactive_tui(
         let tui_drain = tui.clone();
         let state_drain = state.clone();
         let chat_drain = chat_container.clone();
+        let lane_drain = lane.clone();
         Some(tokio::spawn(async move {
-            drain_agent_events(rx, tui_drain, state_drain, chat_drain).await;
+            drain_agent_events(rx, tui_drain, state_drain, chat_drain, lane_drain).await;
         }))
     } else {
         None
@@ -5481,9 +6152,17 @@ pub async fn interactive_tui(
     let tui_tick = tui.clone();
     let state_tick = state.clone();
     let tick_handle = tokio::spawn(async move {
-        // 80ms — pi's loader DEFAULT_INTERVAL_MS (the spinner would visibly
-        // stutter at the old 120ms).
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(80));
+        // 80ms per frame — native pi's `DEFAULT_INTERVAL_MS`, i.e. a full
+        // 10-frame cycle every 800ms. The tick only *requests a repaint*; the
+        // frame is advanced by `Editor::render` (mirroring `Loader::render`),
+        // so streaming output — which schedules a frame per token — spins it
+        // faster, and this interval is the floor when the model is silent.
+        //
+        // Advancing here as well would double-step every tick and make the idle
+        // spinner run at 40ms/frame, twice native pi's rate.
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(
+            rpi_tui::loader::SPINNER_FRAME_MS,
+        ));
         interval.tick().await; // discard immediate
         loop {
             interval.tick().await;
@@ -5532,6 +6211,10 @@ pub async fn interactive_tui(
         // Paste-burst tracking (see the bare-Enter guard below): the instant of
         // the most recent key event that could have been pasted text.
         let mut last_text_key_at: Option<std::time::Instant> = None;
+        // One event peeked at by the paste-burst probe (which must discard a
+        // key's Release but never lose a meaningful event it read). Restored
+        // at the top of the next loop iteration.
+        let mut pending_event: Option<Event> = None;
         if crate::key_trace::enabled() {
             crate::key_trace::note(&format!(
                 "--- rpi TUI key trace start pid={} TERM={} raw_mode={} ---",
@@ -5555,21 +6238,26 @@ pub async fn interactive_tui(
                 }
             }
             cancel_js_dialog_ui(&ctx_for_key, &js_dialog_for_key);
-            // `event::read()` blocks indefinitely. Poll first so shutdown can
-            // stop and join this worker even when no further key arrives.
-            match crossterm::event::poll(std::time::Duration::from_millis(50)) {
-                Ok(true) => {}
-                Ok(false) => continue,
-                Err(_) => {
+            let ev = if let Some(ev) = pending_event.take() {
+                ev
+            } else {
+                // `event::read()` blocks indefinitely. Poll first so shutdown can
+                // stop and join this worker even when no further key arrives.
+                match crossterm::event::poll(std::time::Duration::from_millis(50)) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(_) => {
+                        state_for_key.cancel_js_preparation();
+                        let _ = tx_for_key.send(TuiMessage::Exit);
+                        break;
+                    }
+                }
+                let Ok(ev) = crossterm::event::read() else {
                     state_for_key.cancel_js_preparation();
                     let _ = tx_for_key.send(TuiMessage::Exit);
                     break;
-                }
-            }
-            let Ok(ev) = crossterm::event::read() else {
-                state_for_key.cancel_js_preparation();
-                let _ = tx_for_key.send(TuiMessage::Exit);
-                break;
+                };
+                ev
             };
             // `Event::Resize` is delivered as its own event (not a Key). With
             // `start_readerless` there is no competing terminal-reader thread to
@@ -5604,28 +6292,47 @@ pub async fn interactive_tui(
                         }
                     }
                     MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-                        // Start selection tracking
+                        // Start selection tracking. `selection_end` doubles as the
+                        // "a real drag happened" marker: a plain tap never sets
+                        // it, so it can never overwrite the clipboard.
                         *state_for_key.selection_start.lock().unwrap() = Some((m.column, m.row));
                         *state_for_key.selection_end.lock().unwrap() = None;
+                    }
+                    MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                        // Motion with the button held = a genuine selection drag.
+                        // (Terminals only report this with button-event mouse
+                        // tracking, which `ProcessTerminal` enables.)
+                        if state_for_key.selection_start.lock().unwrap().is_some() {
+                            *state_for_key.selection_end.lock().unwrap() = Some((m.column, m.row));
+                        }
                     }
                     MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
                         // End selection and auto-copy if enabled
                         if let Some(start) = *state_for_key.selection_start.lock().unwrap() {
-                            *state_for_key.selection_end.lock().unwrap() = Some((m.column, m.row));
-                            
+                            let end = (m.column, m.row);
+
+                            // Only auto-copy when the pointer actually MOVED with
+                            // the button held (`Drag` set `selection_end`). A plain
+                            // click/tap — even one whose Down/Up cells differ by a
+                            // pixel over RDP — must not touch the clipboard: it used
+                            // to fire `extract_selected_text`, which copies whatever
+                            // rendered TUI line sat under the pointer, silently
+                            // clobbering the user's real clipboard so the next paste
+                            // returned that stale text.
+                            let is_drag = state_for_key.selection_end.lock().unwrap().is_some();
+                            *state_for_key.selection_end.lock().unwrap() = Some(end);
+
                             // Check if auto-copy is enabled
                             let auto_copy = crate::settings::load_settings()
                                 .ok()
                                 .and_then(|s| s.fullscreen_copy_on_select)
                                 .unwrap_or(true);
-                            
-                            if auto_copy {
+
+                            if auto_copy && is_drag {
                                 // Try to extract selected text from chat container
-                                if let Some(selected_text) = extract_selected_text(
-                                    &state_for_key.chat_container,
-                                    start,
-                                    (m.column, m.row),
-                                ) {
+                                if let Some(selected_text) =
+                                    extract_selected_text(&state_for_key.chat_container, start, end)
+                                {
                                     if !selected_text.trim().is_empty() {
                                         let _ = copy_to_clipboard(&selected_text);
                                     }
@@ -5814,7 +6521,23 @@ pub async fn interactive_tui(
                     // A held Ctrl+C can emit Repeat immediately after Press.
                     // Keep waiting for the in-flight cancellation instead of
                     // treating that repeat as a request to exit the process.
-                    RunStatus::Aborting => {}
+                    RunStatus::Aborting => {
+                        // A second, *deliberate* Ctrl+C. The first press only
+                        // got as far as `Aborting`, which means the abort has
+                        // not landed yet — and the async loop is still inside
+                        // `run_prompt_streaming(..).await`, so a queued
+                        // `TuiMessage::Exit` would not be read until the run
+                        // returns, which is exactly what is not happening.
+                        //
+                        // Exit here instead: the TUI must never be unquittable
+                        // (a provider request or tool that never returns would
+                        // otherwise trap the user forever). Auto-repeat is
+                        // filtered out, so holding the key through a slow abort
+                        // cannot kill the process by accident.
+                        if key.kind != KeyEventKind::Repeat {
+                            emergency_exit(&tui_for_key);
+                        }
+                    }
                     RunStatus::Idle => {
                         let _ = tx_for_key.send(TuiMessage::Exit);
                     }
@@ -5922,6 +6645,16 @@ pub async fn interactive_tui(
                     });
                     continue;
                 }
+                // A running `!command` takes Esc next (native pi's `onEscape`
+                // precedence: streaming → bash → bash-mode editor →
+                // double-escape). The run slot stays occupied until the capture
+                // resolves, so a second Esc is a no-op rather than a
+                // double-escape trigger.
+                if state_for_key.user_bash_running() {
+                    state_for_key.cancel_user_bash();
+                    tui_for_key.request_render(false);
+                    continue;
+                }
                 if status == RunStatus::Idle
                     && editor_for_key.get_text().trim().is_empty()
                     && double_escape_action != "none"
@@ -5968,10 +6701,7 @@ pub async fn interactive_tui(
                 let session = ctx_for_key.session.clone();
                 tokio::spawn(async move {
                     let _ = session
-                        .set_value(
-                            "display.tool_outputs_expanded",
-                            serde_json::json!(expanded),
-                        )
+                        .set_value("display.tool_outputs_expanded", serde_json::json!(expanded))
                         .await;
                 });
                 tui_for_key.request_render(false);
@@ -6064,9 +6794,15 @@ pub async fn interactive_tui(
                 continue;
             }
 
-            // Ctrl+V (or a configured paste-image key) keeps normal text yank
-            // behavior when the clipboard has no bitmap, but queues an image
-            // for the next prompt when one is available.
+            // Ctrl+V (or a configured paste-image key): if the system
+            // clipboard holds an image, queue it for the next prompt;
+            // otherwise paste the clipboard TEXT into the editor. Previously
+            // a text-only clipboard fell through to the editor's Ctrl+V,
+            // which yanks from the internal KILL RING — not the system
+            // clipboard. On platforms without bracketed-paste `Event::Paste`
+            // (Windows console, some remote clients) that meant Ctrl+V pasted
+            // stale/other content instead of the user's real clipboard
+            // ("不是系统的粘贴的内容").
             if keybinding_matches(
                 &keybindings_for_key,
                 &key,
@@ -6085,10 +6821,32 @@ pub async fn interactive_tui(
                     }
                     Ok(None) | Err(_) => {}
                 }
+                // The arboard text fallback is Windows-only. On Unix a real
+                // paste arrives as `Event::Paste` (bracketed paste is enabled
+                // by `ProcessTerminal::enter_raw_mode`), so reading the
+                // SERVER's clipboard here would paste stale TUI content on a
+                // remote/mobile client — copy-on-select can have written the
+                // welcome "Skills (…)" line into the server clipboard, and
+                // Ctrl+V on the client returns that instead of the user's own
+                // clipboard ("不是系统的粘贴的内容"). On Windows the console
+                // never emits `Event::Paste`, so the arboard read is the only
+                // paste source and must stay.
+                if cfg!(windows) {
+                    if let Some(text) = read_clipboard_text() {
+                        if !text.is_empty() {
+                            editor_for_key.insert(&text);
+                            refresh_autocomplete(&state_for_key, &editor_for_key);
+                            tui_for_key.request_render_reusing_scroll_content();
+                            continue;
+                        }
+                    }
+                }
             }
 
             // 3. Ctrl+Shift+F: open transcript search
-            if key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+            if key
+                .modifiers
+                .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
                 && key.code == KeyCode::Char('F')
             {
                 state_for_key.search.activate();
@@ -6227,6 +6985,21 @@ pub async fn interactive_tui(
                 }
             }
 
+            // `app.message.dequeue` (Alt+Q on Windows, Alt+Up elsewhere):
+            // restore every queued steering/follow-up message into the editor
+            // so it can be edited before resending. Mirrors native pi's
+            // `handleDequeue`; the pending-messages display shows the hint.
+            if keybinding_matches(
+                &keybindings_for_key,
+                &key,
+                rpi_tui::keybindings::keys::DEQUEUE,
+            ) {
+                // The main loop is the source of truth: it clears the lane's
+                // queue and restores whatever was there (a no-op when empty).
+                let _ = tx_for_key.send(TuiMessage::Dequeue);
+                continue;
+            }
+
             // Alt+Enter queues a follow-up while a run is active. It is
             // handled here because Editor treats only a bare Enter as submit;
             // idle Alt+Enter keeps the normal prompt behavior.
@@ -6239,43 +7012,74 @@ pub async fn interactive_tui(
                 let status = *state_for_key.status.lock().unwrap();
                 if status == RunStatus::Idle {
                     if state_for_key.try_start_working() {
+                        // Direct send: the harness emits no user `message_start`
+                        // for it, so render the bubble here (see the submit
+                        // handler in `interactive_tui`).
                         add_user_message(&state_for_key.chat_container, &prompt);
                         push_history(&state_for_key, &prompt);
                         let _ = tx_for_key.send(TuiMessage::UserInput(prompt));
                     }
                 } else {
-                    // Follow-ups are user prompts too; retain the normal
-                    // submitted-message rendering while they wait in queue.
-                    add_user_message(&state_for_key.chat_container, &prompt);
+                    // Follow-ups are echoed by the loop's
+                    // `AgentEvent::MessageStart` once they are consumed; while
+                    // they wait, the pending-messages display shows them.
                     let message = AgentMessage::User(UserMessage::new(prompt, 0));
                     let lane = lane_for_key.clone();
                     let chat = state_for_key.chat_container.clone();
                     let tui = tui_for_key.clone();
+                    let state = state_for_key.clone();
                     tokio::spawn(async move {
                         if let Err(error) = lane.follow_up(message).await {
                             add_error_message(&chat, &format!("Could not queue message: {error}"));
                             tui.request_render(false);
+                            return;
                         }
+                        refresh_pending_messages(&state, &lane).await;
+                        tui.request_render(false);
                     });
                 }
                 tui_for_key.request_render(false);
                 continue;
             }
 
-            // ---- Paste-burst coalescing --------------------------------------
+            // ---- Paste-burst coalescing (Windows only) ----------------------
             // `crossterm` 0.27 implements bracketed paste ONLY on Unix: its
             // Windows console event source (`ReadConsoleInputW`) never emits
             // `Event::Paste`, so `?2004h` buys nothing there and a pasted block
             // arrives as ordinary key events with a bare Enter per line. The
             // editor treats a bare Enter as "submit", so one paste became N
             // messages. See [`enter_is_paste_burst`] for the discriminator.
-            if key.code == KeyCode::Enter && key.modifiers.is_empty() {
-                let more_queued = crossterm::event::poll(PASTE_PROBE).unwrap_or(false);
-                if enter_is_paste_burst(
-                    last_text_key_at,
-                    std::time::Instant::now(),
-                    more_queued,
-                ) {
+            //
+            // On Unix the timing heuristic is both unnecessary AND harmful: a
+            // remote/mobile client (SSH, soft keyboard) coalesces typed text +
+            // Enter into one network burst, so the Enter lands within
+            // [`PASTE_BURST_GAP`] of the last character and the heuristic
+            // misclassifies it as pasted content — "回车变成了换行". Real pastes
+            // on Unix arrive as `Event::Paste` (bracketed paste is enabled by
+            // `ProcessTerminal::enter_raw_mode`), so gating to Windows restores
+            // remote Enter without losing the Windows paste fix.
+            if cfg!(windows)
+                && key.modifiers.is_empty()
+                && matches!(
+                    key.code,
+                    KeyCode::Enter | KeyCode::Char('\n') | KeyCode::Char('\r')
+                )
+            {
+                // Probe for a *real* queued key. Windows queues each key's
+                // Release event directly behind its Press, and a bare
+                // non-blocking poll cannot tell the two apart — treating that
+                // Release as "more input" made every Enter on a remote/RDP
+                // console look like a paste burst ("回车变成了换行"). See
+                // [`probe_paste_input`].
+                let (more_queued, stashed) = probe_paste_input(pending_event.take(), || {
+                    if crossterm::event::poll(PASTE_PROBE).unwrap_or(false) {
+                        crossterm::event::read().ok()
+                    } else {
+                        None
+                    }
+                });
+                pending_event = stashed;
+                if enter_is_paste_burst(last_text_key_at, std::time::Instant::now(), more_queued) {
                     crate::key_trace::note(&format!(
                         "enter-decision -> newline (paste burst) gap_ms={} more_queued={more_queued}",
                         gap_ms(last_text_key_at),
@@ -6311,7 +7115,11 @@ pub async fn interactive_tui(
                 last_text_key_at = None;
             }
 
-            // 6. Otherwise forward to the editor + refresh autocomplete.
+            // 6. Otherwise forward to the editor + refresh autocomplete. The
+            //    editor maps unmodified Enter and the encodings a remote client
+            //    may send for it (`Char('\n')`/`Char('\r')`, and the raw LF
+            //    crossterm reports as `Ctrl+J`) to submit, so a remote Enter
+            //    sends instead of inserting a newline.
             editor_for_key.handle_key(key);
             refresh_autocomplete(&state_for_key, &editor_for_key);
             tui_for_key.request_render_reusing_scroll_content();
@@ -6345,6 +7153,9 @@ pub async fn interactive_tui(
         if !*running.lock().unwrap() {
             break;
         }
+        // The harness emits no user `message_start` for a directly-sent prompt
+        // (it drives the loop with an empty prompts vec), so the initial
+        // `-p` / `--prompt` bubbles are rendered here.
         add_user_message(&chat_container, &prompt);
         tui.request_render(false);
         run_prompt_streaming(
@@ -6404,6 +7215,75 @@ pub async fn interactive_tui(
                     Err(error) => add_error_message(&chat_container, &error),
                 }
                 tui.request_render(false);
+            }
+            Some(TuiMessage::Dequeue) => {
+                // `app.message.dequeue`: pull every queued steering/follow-up
+                // message out of the lane and restore it to the editor so the
+                // user can edit before resending (native pi's
+                // `restoreQueuedMessagesToEditor`). The pending display is
+                // cleared to match.
+                match lane.clear_queue().await {
+                    Ok(queued) => {
+                        let all: Vec<String> = queued
+                            .steering
+                            .iter()
+                            .chain(queued.follow_up.iter())
+                            .cloned()
+                            .collect();
+                        if !all.is_empty() {
+                            let queued_text = all.join("\n\n");
+                            let current = editor.get_text();
+                            let combined = if current.trim().is_empty() {
+                                queued_text
+                            } else {
+                                format!("{queued_text}\n\n{current}")
+                            };
+                            let cursor = combined.chars().count();
+                            editor.set_text(&combined);
+                            editor.set_cursor(0, cursor);
+                        }
+                        state.set_pending_queue(
+                            rpi_harness::agent_harness::QueuedMessages::default(),
+                        );
+                        tui.request_render(false);
+                    }
+                    Err(error) => {
+                        add_error_message(
+                            &chat_container,
+                            &format!("Could not restore queued messages: {error}"),
+                        );
+                        tui.request_render(false);
+                    }
+                }
+            }
+            Some(TuiMessage::UserBashFinished(report)) => {
+                // Free the run slot first: the guard and the Esc router both
+                // read it, so a finished command must never block the next one.
+                state.finish_user_bash();
+                let message = rpi_harness::messages::bash_execution_message(
+                    report.command,
+                    report.output,
+                    report.exit_code,
+                    report.cancelled,
+                    report.truncated,
+                    report.full_output_path,
+                    Some(report.exclude_from_context),
+                    now_ms(),
+                );
+                // While a run is in flight the message is deferred so it is not
+                // spliced into the middle of a turn's tool sequence; it is
+                // flushed at `AgentEnd` (native pi `_pendingBashMessages`).
+                if *state.status.lock().unwrap() == RunStatus::Idle {
+                    if let Err(error) = lane.append_message(message).await {
+                        add_error_message(
+                            &chat_container,
+                            &format!("Could not record bash result: {error}"),
+                        );
+                        tui.request_render(false);
+                    }
+                } else {
+                    state.pending_bash_messages.lock().unwrap().push(message);
+                }
             }
             Some(TuiMessage::OpenTree) => {
                 if *state.status.lock().unwrap() != RunStatus::Idle {
@@ -6510,10 +7390,9 @@ pub async fn interactive_tui(
                         &chat_container,
                         &format!("Exported session to {}", path.display()),
                     ),
-                    Err(e) => add_error_message(
-                        &chat_container,
-                        &format!("Could not write export: {e}"),
-                    ),
+                    Err(e) => {
+                        add_error_message(&chat_container, &format!("Could not write export: {e}"))
+                    }
                 }
                 tui.request_render(false);
             }
@@ -6525,10 +7404,9 @@ pub async fn interactive_tui(
                         &chat_container,
                         &format!("Exported session to {}", path.display()),
                     ),
-                    Err(e) => add_error_message(
-                        &chat_container,
-                        &format!("Could not write export: {e}"),
-                    ),
+                    Err(e) => {
+                        add_error_message(&chat_container, &format!("Could not write export: {e}"))
+                    }
                 }
                 tui.request_render(false);
             }
@@ -6548,8 +7426,9 @@ pub async fn interactive_tui(
                             format!("- cost: ${:.4}", stats.cost_total),
                         ];
                         match stats.cache_hit_ratio() {
-                            Some(ratio) => lines
-                                .push(format!("- cache hit ratio: {:.1}%", ratio * 100.0)),
+                            Some(ratio) => {
+                                lines.push(format!("- cache hit ratio: {:.1}%", ratio * 100.0))
+                            }
                             None => lines.push("- cache hit ratio: n/a (no input yet)".to_string()),
                         }
                         if let Some(total) = total {
@@ -6576,10 +7455,9 @@ pub async fn interactive_tui(
                         }
                         add_note_message(&chat_container, &lines.join("\n"));
                     }
-                    None => add_error_message(
-                        &chat_container,
-                        "Could not read session usage stats.",
-                    ),
+                    None => {
+                        add_error_message(&chat_container, "Could not read session usage stats.")
+                    }
                 }
                 tui.request_render(false);
             }
@@ -6666,6 +7544,14 @@ pub async fn interactive_tui(
     reload_context.mailbox.clear();
     reload_bridge_handle.abort();
     tui.stop(Default::default());
+
+    // Native pi prints how to resume the session after an interactive exit so
+    // a terminal that scrolled away can be recovered. Mirrors
+    // `formatResumeCommand` (id + `--session-dir` only when non-default).
+    let session_id = harness.session().storage().metadata().id;
+    if let Some(command) = format_resume_command(&session_id, &cwd, args.session_dir.as_deref()) {
+        println!("\x1b[2mTo resume this session:\x1b[0m {command}");
+    }
     println!("\nGoodbye!");
     let _ = args;
 
@@ -6881,6 +7767,26 @@ async fn run_prompt_streaming(
     }
 
     state.set_status(RunStatus::Idle);
+    // Guarantee the pending-messages display reconciles at the end of every
+    // run/prompt — covers aborts and the non-streaming path, where no
+    // `AgentEnd` event necessarily reaches the drain task.
+    refresh_pending_messages(state, lane).await;
+
+    // Authoritative context-badge fallback. The streaming drain normally
+    // updates it from `MessageEnd`, but a `Lagged` broadcast or the blocking
+    // path can skip that event; reconcile from the run outcome so the badge
+    // always reflects the newest real response.
+    if let Ok(result) = &outcome {
+        let final_message: Option<&AssistantMessage> = match &result.outcome {
+            HarnessRunOutcome::Completed { final_message, .. }
+            | HarnessRunOutcome::Aborted { final_message, .. } => Some(final_message),
+            HarnessRunOutcome::Failed { final_message, .. } => final_message.as_ref(),
+            HarnessRunOutcome::Suspended { .. } => None,
+        };
+        if let Some(a) = final_message {
+            record_context_usage(&state.footer, a);
+        }
+    }
 
     match outcome {
         Ok(result) => match &result.outcome {
@@ -6951,6 +7857,10 @@ async fn run_compact(lane: &Arc<dyn AgentLane>, tui: &Arc<TuiAltScreen>, state: 
     match lane.compact(None).await {
         Ok(_) => {
             add_note_message(&state.chat_container, "Conversation compacted.");
+            // The last assistant usage describes the pre-compaction context;
+            // reset the badge to `?` until the next response reports the new
+            // (much smaller) prompt size — mirrors pi's `percent: null`.
+            state.footer.set_context_tokens(None);
         }
         Err(e) => {
             add_error_message(&state.chat_container, &format!("Compact failed: {e}"));
@@ -6997,40 +7907,40 @@ fn extract_selected_text(
     end: (u16, u16),
 ) -> Option<String> {
     use rpi_tui::Component;
-    
+
     // Get the rendered lines from the chat container
     let lines = chat_container.render(80); // Use a reasonable width
     if lines.is_empty() {
         return None;
     }
-    
+
     // Normalize coordinates (ensure start is before end)
     let (start_row, end_row) = if start.1 <= end.1 {
         (start.1 as usize, end.1 as usize)
     } else {
         (end.1 as usize, start.1 as usize)
     };
-    
+
     // Clamp to valid range
     let start_row = start_row.min(lines.len().saturating_sub(1));
     let end_row = end_row.min(lines.len().saturating_sub(1));
-    
+
     if start_row > end_row {
         return None;
     }
-    
+
     // Extract the selected lines
     let selected_lines: Vec<String> = lines[start_row..=end_row].to_vec();
-    
+
     if selected_lines.is_empty() {
         return None;
     }
-    
+
     Some(selected_lines.join("\n"))
 }
 
 /// Best-effort clipboard write. Enabled only with the `clipboard` feature
-/// (`arboard`) on non-Android platforms; otherwise returns `false` so the 
+/// (`arboard`) on non-Android platforms; otherwise returns `false` so the
 /// caller degrades to a hint.
 #[cfg(all(feature = "clipboard", not(target_os = "android")))]
 fn copy_to_clipboard(text: &str) -> bool {
@@ -7043,6 +7953,20 @@ fn copy_to_clipboard(text: &str) -> bool {
 #[cfg(any(not(feature = "clipboard"), target_os = "android"))]
 fn copy_to_clipboard(_text: &str) -> bool {
     false
+}
+
+/// Best-effort clipboard text read for Ctrl+V paste. The optional `clipboard`
+/// feature keeps headless builds free of platform clipboard dependencies;
+/// on Android the OS owns clipboard access so this degrades to `None`.
+#[cfg(all(feature = "clipboard", not(target_os = "android")))]
+fn read_clipboard_text() -> Option<String> {
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    clipboard.get_text().ok()
+}
+
+#[cfg(any(not(feature = "clipboard"), target_os = "android"))]
+fn read_clipboard_text() -> Option<String> {
+    None
 }
 
 /// Read a clipboard bitmap and normalize it to PNG for the provider-neutral
@@ -7126,15 +8050,25 @@ fn add_assistant_message_blocking(
 /// Drain `AgentEvent`s from the broadcast receiver and apply the TS
 /// `handleEvent` event→UI mapping. Runs on a `tokio::spawn`'d task for the
 /// lifetime of the TUI.
+/// Re-read the lane's queue and update the pending-messages dock slot.
+/// Cheap (two short mutex locks) and a no-op when the snapshot is unchanged,
+/// so it is safe to call on every relevant event.
+async fn refresh_pending_messages(state: &Arc<TuiState>, lane: &Arc<dyn AgentLane>) {
+    if let Ok(queued) = lane.queued_messages().await {
+        state.set_pending_queue(queued);
+    }
+}
+
 async fn drain_agent_events(
     mut rx: broadcast::Receiver<AgentEvent>,
     tui: Arc<TuiAltScreen>,
     state: Arc<TuiState>,
     chat: Arc<Container>,
+    lane: Arc<dyn AgentLane>,
 ) {
     loop {
         match rx.recv().await {
-            Ok(event) => handle_agent_event(event, &tui, &state, &chat).await,
+            Ok(event) => handle_agent_event(event, &tui, &state, &chat, &lane).await,
             Err(broadcast::error::RecvError::Lagged(_)) => {
                 // We dropped some intermediate deltas; the next MessageUpdate/
                 // MessageEnd carries a full partial snapshot so the UI re-syncs.
@@ -7152,6 +8086,7 @@ async fn handle_agent_event(
     tui: &Arc<TuiAltScreen>,
     state: &Arc<TuiState>,
     chat: &Arc<Container>,
+    lane: &Arc<dyn AgentLane>,
 ) {
     match event {
         AgentEvent::AgentStart => {
@@ -7165,6 +8100,19 @@ async fn handle_agent_event(
                 comp.set_streaming(false);
             }
             state.set_status(RunStatus::Idle);
+            // Flush any `!command` results that completed mid-run: the run's
+            // tool sequence is closed, so appending now keeps transcript order
+            // intact (native pi's `flushPendingBashMessages`).
+            let pending: Vec<AgentMessage> =
+                std::mem::take(&mut *state.pending_bash_messages.lock().unwrap());
+            for message in pending {
+                if let Err(error) = lane.append_message(message).await {
+                    add_error_message(chat, &format!("Could not record bash result: {error}"));
+                }
+            }
+            // The run drained the queue; refresh so consumed entries drop out
+            // of the pending-messages display.
+            refresh_pending_messages(state, lane).await;
             tui.request_render(false);
         }
 
@@ -7259,8 +8207,23 @@ async fn handle_agent_event(
                     tui.request_render(false);
                 }
             }
-            // User / ToolResult / Custom starts are echoed at submit time or
-            // via the tool-execution components; ignore user/tool dupes.
+            // Queued (steering / follow-up) user messages are rendered here,
+            // not at queue time, so a message that is still waiting never looks
+            // delivered. The loop drains those itself and emits
+            // `message_start` for them (`agent_loop.rs` pending-message drain).
+            //
+            // A DIRECTLY-sent prompt does NOT reach this arm: the harness
+            // persists it up front and runs the loop with an empty prompts vec,
+            // so no `message_start` is emitted for it — the submit handler
+            // renders that bubble instead.
+            AgentMessage::User(user) => {
+                add_user_message(chat, &user_message_text(&user));
+                // A consumed entry must drop out of the pending display.
+                refresh_pending_messages(state, lane).await;
+                tui.request_render(false);
+            }
+            // ToolResult / other starts are echoed via the tool-execution
+            // components; ignore the dupes.
             _ => {}
         },
 
@@ -7332,10 +8295,8 @@ async fn handle_agent_event(
                                     existing.set_args(&display_args);
                                 }
                             } else {
-                                let comp = Arc::new(ToolExecutionComponent::new(
-                                    &tc.name,
-                                    &display_args,
-                                ));
+                                let comp =
+                                    Arc::new(ToolExecutionComponent::new(&tc.name, &display_args));
                                 if is_ask_user_tool(&tc.name) {
                                     comp.set_display_title("ASK USER");
                                 }
@@ -7396,12 +8357,20 @@ async fn handle_agent_event(
                         .footer
                         .set_cache_hit_rate(Some(usage.cache_read as f64 / denom as f64 * 100.0));
                 }
+                // Context-window badge (`?/512k` → `63.2%/512k`): the provider
+                // reports the prompt token count for this request, which is the
+                // context size the footer displays.
+                record_context_usage(&state.footer, a);
                 let miss = state
                     .cache_tracker
                     .lock()
                     .unwrap()
                     .observe(a, &rpi_harness::cache_stats::NoPrices);
-                if let Some(miss) = miss {
+                // Native pi gates these behind `showCacheMissNotices`
+                // (default `false`); the tracker still runs so the footer's
+                // cache-hit rate stays accurate either way.
+                let cache_miss_notices = *state.cache_miss_notices.lock().unwrap();
+                if let Some(miss) = miss.filter(|_| cache_miss_notices) {
                     let cost = if miss.missed_cost > 0.0 {
                         format!(" (~${:.4})", miss.missed_cost)
                     } else {
@@ -7679,6 +8648,25 @@ async fn handle_agent_event(
     }
 }
 
+/// Update the footer's context-window badge from one assistant response.
+///
+/// `Usage::context_tokens()` is the prompt size the provider reported for that
+/// request — the value pi's footer renders as `{percent}%/{window}`. Aborted
+/// and errored turns are skipped (their usage is not a real context
+/// measurement, mirroring pi's `lastAssistantUsageInfo`) so the last valid
+/// count stays on screen instead of flickering to `?`.
+fn record_context_usage(footer: &rpi_tui::FooterComponent, message: &rpi_ai::AssistantMessage) {
+    if message.stop_reason == rpi_ai::StopReason::Aborted
+        || message.stop_reason == rpi_ai::StopReason::Error
+    {
+        return;
+    }
+    let tokens = message.usage.context_tokens();
+    if tokens > 0 {
+        footer.set_context_tokens(Some(tokens));
+    }
+}
+
 /// Return the diagnostic carried by a failed or aborted provider request.
 /// Providers may omit `error_message`; keep a stable fallback so a terminal
 /// request failure can never render as an empty transcript turn.
@@ -7835,10 +8823,7 @@ fn ask_user_args_display(args: &serde_json::Value) -> String {
         let prompt = question
             .get("question")
             .and_then(serde_json::Value::as_str)
-            .or_else(|| {
-                args.get("question")
-                    .and_then(serde_json::Value::as_str)
-            })
+            .or_else(|| args.get("question").and_then(serde_json::Value::as_str))
             .map(str::trim)
             .unwrap_or_default();
         if prompt.is_empty() {
@@ -7944,27 +8929,62 @@ fn open_selector(
         editor_container,
         editor,
         tui,
-        list.clone(),
+        SelectorView::List(list.clone()),
         list,
         kind,
     );
 }
 
-/// Open a selector with an optional framed view. Native extension selectors
-/// wrap the list with a title and hint while built-in selectors keep the list
-/// as the complete view.
-fn open_selector_with_view<C: Component + 'static>(
+/// Open a searchable selector: the list plus a fuzzy-filter search box.
+///
+/// Returns the wrapper so callers can prefill the query (native pi's
+/// `initialSearchInput`). Mirrors `SelectSubmenu` with `searchable: true`.
+fn open_searchable_selector(
     state: &Arc<TuiState>,
     editor_container: &Arc<Container>,
     editor: &Arc<Editor>,
     tui: &Arc<TuiAltScreen>,
+    title: Option<&str>,
+    description: Option<&str>,
     list: Arc<SelectList>,
-    view: Arc<C>,
+    kind: SelectorKind,
+) -> Arc<SearchableSelectList> {
+    let searchable = Arc::new(SearchableSelectList::new(title, description, list));
+    open_selector_with_view(
+        state,
+        editor_container,
+        editor,
+        tui,
+        SelectorView::Searchable(searchable.clone()),
+        searchable.clone(),
+        kind,
+    );
+    // `TuiAltScreen::set_focus` only records the focused component; components
+    // manage their own focus flag. Without this the search caret never renders
+    // (and IME candidate positioning stays on the editor's old caret).
+    searchable.set_focused(true);
+    searchable
+}
+
+/// Open a selector with an optional framed view. Native extension selectors
+/// wrap the list with a title and hint while built-in selectors keep the list
+/// as the complete view.
+///
+/// `view_router` receives keys (a bare list, or a searchable wrapper) while
+/// `view` is what renders — the two are the same object for every built-in
+/// selector, but extension selectors frame a plain list.
+fn open_selector_with_view<V: Component + 'static>(
+    state: &Arc<TuiState>,
+    editor_container: &Arc<Container>,
+    editor: &Arc<Editor>,
+    tui: &Arc<TuiAltScreen>,
+    view_router: SelectorView,
+    view: Arc<V>,
     kind: SelectorKind,
 ) {
     // Dispatch ui_prompt_start event
     dispatch_ui_prompt_event(state);
-    
+
     // Unfocus the editor so its cursor marker doesn't render behind the list.
     editor.set_focused(false);
     // A selector replaces the editor slot. Drop stale slash/@file
@@ -7973,7 +8993,7 @@ fn open_selector_with_view<C: Component + 'static>(
     // Swap: clear the container and add the selector view.
     editor_container.clear();
     editor_container.add_child(view.clone());
-    *state.active_selector.lock().unwrap() = Some((list, kind));
+    *state.active_selector.lock().unwrap() = Some((view_router, kind));
     let focused: Arc<dyn Component> = view;
     tui.set_focus(Some(focused));
     tui.request_render(false);
@@ -7989,7 +9009,7 @@ fn close_selector(
 ) {
     // Dispatch ui_prompt_end event
     dispatch_ui_prompt_event_end(state);
-    
+
     editor_container.clear();
     editor_container.add_child(editor.clone());
     state.autocomplete_container.clear();
@@ -8014,7 +9034,8 @@ fn open_model_selector(
     lane: &Arc<dyn AgentLane>,
     lane_model_id: &str,
     chat: &Arc<Container>,
-) {
+    initial_search: Option<&str>,
+) -> Option<Arc<SearchableSelectList>> {
     let items = model_selector_items(catalog, lane_model_id);
     if items.is_empty() {
         add_note_message(
@@ -8022,7 +9043,7 @@ fn open_model_selector(
             "No models in the catalog. Use --model at startup to select one.",
         );
         tui.request_render(false);
-        return;
+        return None;
     }
     let list = Arc::new(SelectList::new(items, 10));
 
@@ -8067,14 +9088,20 @@ fn open_model_selector(
         close_selector(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
     }));
 
-    open_selector(
+    let searchable = open_searchable_selector(
         state,
         editor_container,
         editor,
         tui,
+        Some("Select model"),
+        Some("Type to filter by name, provider, or id"),
         list,
         SelectorKind::Model,
     );
+    if let Some(term) = initial_search {
+        searchable.set_search_text(term);
+    }
+    Some(searchable)
 }
 
 /// Cycle to the next catalog entry after `current_id`, wrapping to the first.
@@ -8161,11 +9188,13 @@ fn open_session_selector(
         close_selector(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
     }));
 
-    open_selector(
+    open_searchable_selector(
         state,
         editor_container,
         editor,
         tui,
+        Some("Resume session"),
+        Some("Type to filter by session id"),
         list,
         SelectorKind::Session,
     );
@@ -8223,16 +9252,18 @@ async fn open_tree_selector(
     let items: Vec<SelectItem> = entries
         .iter()
         .map(|entry| {
-            let marker = if current.as_deref() == Some(entry.id()) {
-                " (current)"
+            let label = if current.as_deref() == Some(entry.id()) {
+                format!("{} #{} (current)", entry.entry_type(), entry.seq())
             } else {
-                ""
+                format!("{} #{}", entry.entry_type(), entry.seq())
             };
-            SelectItem::new(
-                entry.id(),
-                &format!("{} #{}{}", entry.entry_type(), entry.seq(), marker),
-            )
-            .with_description(&entry.id()[..entry.id().len().min(12)])
+            let short_id = &entry.id()[..entry.id().len().min(12)];
+            // Search on the entry type, sequence, and id so `/tree` stays
+            // usable in long sessions.
+            let search_text = format!("{} {} {}", entry.entry_type(), entry.seq(), entry.id());
+            SelectItem::new(entry.id(), &label)
+                .with_description(short_id)
+                .with_search_text(&search_text)
         })
         .collect();
     if items.is_empty() {
@@ -8257,11 +9288,13 @@ async fn open_tree_selector(
     list.on_cancel(Arc::new(move || {
         close_selector(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
     }));
-    open_selector(
+    open_searchable_selector(
         state,
         editor_container,
         editor,
         tui,
+        Some("Session tree"),
+        Some("Type to filter by entry type, sequence, or id"),
         list,
         SelectorKind::Tree,
     );
@@ -9084,6 +10117,45 @@ fn collect_transcript_lines(chat_container: &Arc<Container>) -> Vec<String> {
     chat_container.render(width)
 }
 
+/// Build the shell command that resumes `session_id` in this project, or
+/// `None` when there is nothing to resume. Mirrors native pi's
+/// `formatResumeCommand`: `rpi --session <id>`, prefixing
+/// `--session-dir <dir>` only when a non-default directory was requested.
+fn format_resume_command(
+    session_id: &str,
+    cwd: &std::path::Path,
+    session_dir: Option<&std::path::Path>,
+) -> Option<String> {
+    if session_id.is_empty() {
+        return None;
+    }
+    let mut args = vec![crate::APP_NAME.to_string()];
+    if let Some(dir) = session_dir {
+        let default = crate::session::default_session_dir(cwd);
+        if dir != default.as_path() {
+            args.push("--session-dir".to_string());
+            args.push(quote_shell_arg(&dir.to_string_lossy()));
+        }
+    }
+    args.push("--session".to_string());
+    args.push(session_id.to_string());
+    Some(args.join(" "))
+}
+
+/// Quote a shell argument when it contains whitespace or shell metacharacters
+/// (mirrors native pi's `quoteIfNeeded`).
+fn quote_shell_arg(value: &str) -> String {
+    let needs_quoting = value.is_empty()
+        || value
+            .chars()
+            .any(|c| c.is_whitespace() || "\"'`$&|;<>()*?[]{}!~#\\".contains(c));
+    if needs_quoting {
+        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        value.to_string()
+    }
+}
+
 fn add_error_message(container: &Arc<Container>, text: &str) {
     let c = current_theme().colors;
     let text = sanitize_error_message(text);
@@ -9243,12 +10315,207 @@ mod tests {
     use super::*;
     use rpi_tui::Component;
 
+    /// Minimal `TuiState` for unit tests that only touch state flags. Mirrors
+    /// the explicit literals other tests build, but keeps one copy in sync.
+    fn test_tui_state() -> Arc<TuiState> {
+        Arc::new(TuiState {
+            current_assistant: std::sync::Mutex::new(None),
+            tool_components: std::sync::Mutex::new(HashMap::new()),
+            bash_components: std::sync::Mutex::new(HashMap::new()),
+            themes_enabled: true,
+            hide_thinking: std::sync::Mutex::new(false),
+            tool_outputs_expanded: std::sync::Mutex::new(false),
+            show_terminal_progress: true,
+            status: std::sync::Mutex::new(RunStatus::Idle),
+            js_preparation_cancel: std::sync::Mutex::new(None),
+            user_bash_cancel: std::sync::Mutex::new(None),
+            pending_bash_messages: std::sync::Mutex::new(Vec::new()),
+            footer: Arc::new(FooterComponent::new()),
+            status_container: Arc::new(Container::new()),
+            chat_container: Arc::new(Container::new()),
+            loader: Arc::new(Loader::new()),
+            editor: Arc::new(Editor::simple()),
+            last_assistant_text: std::sync::Mutex::new(String::new()),
+            active_selector: std::sync::Mutex::new(None),
+            active_extension_editor: std::sync::Mutex::new(None),
+            active_extension_input: std::sync::Mutex::new(None),
+            active_extension_cancel: std::sync::Mutex::new(None),
+            autocomplete: AutocompleteManager::new(),
+            autocomplete_container: Arc::new(Container::new()),
+            autocomplete_max_visible: 5,
+            pending_images: std::sync::Mutex::new(Vec::new()),
+            theme_manager: Arc::new(ThemeManager::new()),
+            tui: None,
+            current_model_id: std::sync::Mutex::new(String::new()),
+            show_images: std::sync::Mutex::new(true),
+            cache_miss_notices: std::sync::Mutex::new(false),
+            history: std::sync::Mutex::new(Vec::new()),
+            history_index: std::sync::Mutex::new(-1),
+            history_draft: std::sync::Mutex::new(None),
+            cache_tracker: std::sync::Mutex::new(rpi_harness::cache_stats::CacheMissTracker::new()),
+            scoped_edit: std::sync::Mutex::new(None),
+            markdown_transformer: std::sync::Mutex::new(None),
+            extension_session: Arc::new(std::sync::Mutex::new(
+                rpi_extensions::ExtensionSession::none(),
+            )),
+            search: Arc::new(AltScreenSearch::new()),
+            search_bar: Arc::new(SearchBar::new()),
+            pending_container: Arc::new(Container::new()),
+            dequeue_hint: String::new(),
+            pending_snapshot: std::sync::Mutex::new(
+                rpi_harness::agent_harness::QueuedMessages::default(),
+            ),
+            selection_start: std::sync::Mutex::new(None),
+            selection_end: std::sync::Mutex::new(None),
+        })
+    }
+
+    #[test]
+    fn settings_menu_covers_the_wired_settings_surface() {
+        let state = test_tui_state();
+        let settings = crate::settings::Settings::default();
+        let items = settings_menu_items(&settings, &state, "claude-sonnet-5");
+        let keys: Vec<&str> = items.iter().map(|item| item.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "theme",
+                "model",
+                "thinking",
+                "scoped-models",
+                "hide-thinking",
+                "show-images",
+                "cache-miss-notices",
+                "quiet-startup",
+                "terminal-progress",
+                "fullscreen-copy-on-select",
+                "double-escape-action",
+                "editor-padding",
+                "autocomplete-max-items",
+                "http-idle-timeout",
+            ]
+        );
+        // Submenu rows must not cycle their displayed value.
+        for item in items.iter().filter(|item| item.has_submenu) {
+            assert!(
+                item.values.is_empty(),
+                "{} should be submenu-only",
+                item.key
+            );
+        }
+        // Value rows advertise a cycle that contains the current value.
+        for item in items.iter().filter(|item| !item.has_submenu) {
+            assert!(!item.values.is_empty(), "{} has no values", item.key);
+            assert!(
+                item.values.iter().any(|value| value == &item.value),
+                "{} current value {} not in {:?}",
+                item.key,
+                item.value,
+                item.values
+            );
+        }
+        // The default model row falls back to the running lane's model.
+        assert_eq!(items[1].value, "claude-sonnet-5");
+        // Native defaults: cache-miss notices off, terminal progress on.
+        assert_eq!(items[6].value, "false");
+        assert_eq!(items[8].value, "true");
+    }
+
+    #[test]
+    fn apply_setting_change_updates_settings_and_live_state() {
+        let state = test_tui_state();
+        let mut settings = crate::settings::Settings::default();
+
+        // Live: hide-thinking flips both the runtime flag and the persisted one.
+        let note = apply_setting_change(&state, "hide-thinking", "true", &mut settings);
+        assert!(state.hide_thinking());
+        assert_eq!(settings.hide_thinking_block, Some(true));
+        assert!(note.expect("user-visible note").contains("hidden"));
+
+        // Live: show-images writes the runtime mutex.
+        apply_setting_change(&state, "show-images", "false", &mut settings);
+        assert!(!*state.show_images.lock().unwrap());
+        assert_eq!(settings.show_images, Some(false));
+
+        // Live: cache-miss notices.
+        apply_setting_change(&state, "cache-miss-notices", "true", &mut settings);
+        assert!(*state.cache_miss_notices.lock().unwrap());
+        assert_eq!(settings.show_cache_miss_notices, Some(true));
+
+        // Persist-only rows change settings without a transcript note.
+        assert_eq!(
+            apply_setting_change(&state, "editor-padding", "3", &mut settings),
+            None
+        );
+        assert_eq!(settings.editor_padding_x, Some(3));
+        apply_setting_change(&state, "double-escape-action", "none", &mut settings);
+        assert_eq!(settings.double_escape_action.as_deref(), Some("none"));
+        apply_setting_change(&state, "autocomplete-max-items", "20", &mut settings);
+        assert_eq!(settings.autocomplete_max_visible, Some(20));
+
+        // HTTP idle timeout maps labels onto the numeric/`disabled` forms.
+        apply_setting_change(&state, "http-idle-timeout", "disabled", &mut settings);
+        assert_eq!(settings.http_idle_timeout_ms(), Some(0));
+        apply_setting_change(&state, "http-idle-timeout", "1m", &mut settings);
+        assert_eq!(settings.http_idle_timeout_ms(), Some(60_000));
+
+        // Unknown keys are ignored rather than panicking.
+        assert_eq!(
+            apply_setting_change(&state, "nope", "x", &mut settings),
+            None
+        );
+    }
+
+    #[test]
+    fn add_user_message_renders_a_visible_user_bubble() {
+        // The submit handler renders directly-sent prompts through this helper
+        // (the harness emits no user `message_start` for them), so a silent
+        // failure here would make every prompt vanish from the transcript.
+        let chat = Arc::new(Container::new());
+        add_user_message(&chat, "hello from the user");
+        let rendered = crate::interactive_tui::collect_transcript_lines(&chat);
+        let plain = strip_ansi(&rendered.join("\n"));
+        assert!(
+            plain.contains("hello from the user"),
+            "user bubble must show the prompt text; got: {plain:?}"
+        );
+    }
+
     #[test]
     fn verbose_overrides_quiet_startup_listing() {
         assert!(should_show_startup_listing(false, false));
         assert!(should_show_startup_listing(true, false));
         assert!(should_show_startup_listing(true, true));
         assert!(!should_show_startup_listing(false, true));
+    }
+
+    #[test]
+    fn resume_command_omits_the_default_session_dir() {
+        let cwd = std::path::Path::new("/proj/demo");
+        assert_eq!(format_resume_command("", cwd, None), None);
+        assert_eq!(
+            format_resume_command("abc-123", cwd, None).as_deref(),
+            Some("rpi --session abc-123")
+        );
+        // The default dir carries no flag (mirrors native pi).
+        let default = crate::session::default_session_dir(cwd);
+        assert_eq!(
+            format_resume_command("abc-123", cwd, Some(default.as_path())).as_deref(),
+            Some("rpi --session abc-123")
+        );
+        // A custom dir is echoed, quoting when needed.
+        let custom = std::path::Path::new("/tmp/my sessions");
+        assert_eq!(
+            format_resume_command("abc-123", cwd, Some(custom)).as_deref(),
+            Some("rpi --session-dir \"/tmp/my sessions\" --session abc-123")
+        );
+    }
+
+    #[test]
+    fn quote_shell_arg_quotes_only_when_needed() {
+        assert_eq!(quote_shell_arg("plain"), "plain");
+        assert_eq!(quote_shell_arg("with space"), "\"with space\"");
+        assert_eq!(quote_shell_arg("a&b"), "\"a&b\"");
     }
 
     #[test]
@@ -9366,6 +10633,8 @@ mod tests {
                 hide_thinking: true,
                 quiet_startup: false,
                 show_terminal_progress: false,
+                show_images: true,
+                cache_miss_notices: false,
             }
         );
     }
@@ -9395,6 +10664,8 @@ mod tests {
             hide_thinking_block: Some(true),
             quiet_startup: Some(true),
             show_terminal_progress: Some(false),
+            show_images: Some(false),
+            show_cache_miss_notices: Some(true),
             ..Default::default()
         };
 
@@ -9406,8 +10677,44 @@ mod tests {
                 hide_thinking: true,
                 quiet_startup: true,
                 show_terminal_progress: false,
+                show_images: false,
+                cache_miss_notices: true,
             }
         );
+    }
+
+    #[test]
+    fn tui_startup_settings_read_native_nested_terminal_block() {
+        // Native pi nests these under `terminal`; rpi's flat keys stay
+        // compatible and the nested block is the fallback.
+        let global = crate::settings::Settings {
+            terminal: Some(crate::settings::TerminalSettings {
+                show_images: Some(false),
+                show_terminal_progress: Some(false),
+                clear_on_shrink: None,
+            }),
+            ..Default::default()
+        };
+        let resolved =
+            resolve_tui_startup_settings(&global, &[crate::settings::Settings::default()], true);
+        assert!(!resolved.show_images);
+        assert!(!resolved.show_terminal_progress);
+    }
+
+    #[test]
+    fn tui_startup_settings_flat_keys_win_over_nested_terminal_block() {
+        let global = crate::settings::Settings {
+            show_images: Some(true),
+            terminal: Some(crate::settings::TerminalSettings {
+                show_images: Some(false),
+                show_terminal_progress: None,
+                clear_on_shrink: None,
+            }),
+            ..Default::default()
+        };
+        let resolved =
+            resolve_tui_startup_settings(&global, &[crate::settings::Settings::default()], true);
+        assert!(resolved.show_images);
     }
 
     #[test]
@@ -9434,6 +10741,47 @@ mod tests {
         assert_eq!(transcript_page_size(24), 20);
         assert_eq!(transcript_page_size(4), 1);
         assert_eq!(transcript_page_size(0), 1);
+    }
+
+    #[test]
+    fn parse_user_bash_distinguishes_single_and_double_bang() {
+        // `!cmd` runs and stays in context.
+        assert_eq!(parse_user_bash("!ls -la"), Some(("ls -la", false)));
+        // `!!cmd` runs but is excluded from context.
+        assert_eq!(parse_user_bash("!!ls -la"), Some(("ls -la", true)));
+        // Surrounding whitespace on the command is trimmed, the `!` prefix is not.
+        assert_eq!(parse_user_bash("!  echo hi  "), Some(("echo hi", false)));
+        assert_eq!(parse_user_bash("!!  echo hi"), Some(("echo hi", true)));
+    }
+
+    #[test]
+    fn parse_user_bash_ignores_bare_bang_and_plain_text() {
+        // A bare `!` / `!!` has no command: fall through to the prompt path
+        // instead of executing an empty shell line.
+        assert_eq!(parse_user_bash("!"), None);
+        assert_eq!(parse_user_bash("!!"), None);
+        assert_eq!(parse_user_bash("!   "), None);
+        assert_eq!(parse_user_bash("hello"), None);
+        assert_eq!(parse_user_bash(""), None);
+        // `/` keeps routing to the slash-command registry.
+        assert_eq!(parse_user_bash("/model"), None);
+    }
+
+    #[test]
+    fn user_bash_run_slot_guards_and_cancels() {
+        let state = test_tui_state();
+        assert!(!state.user_bash_running());
+        let cancel = state.begin_user_bash();
+        assert!(state.user_bash_running());
+        // Esc cancels without freeing the slot; the spawned task clears it when
+        // the capture resolves (native pi's `isBashRunning`).
+        assert!(state.cancel_user_bash());
+        assert!(state.user_bash_running());
+        assert!(cancel.is_cancelled());
+        state.finish_user_bash();
+        assert!(!state.user_bash_running());
+        // Nothing to cancel once idle.
+        assert!(!state.cancel_user_bash());
     }
 
     #[test]
@@ -9941,10 +11289,13 @@ mod tests {
             show_terminal_progress: true,
             status: std::sync::Mutex::new(RunStatus::Idle),
             js_preparation_cancel: std::sync::Mutex::new(None),
+            user_bash_cancel: std::sync::Mutex::new(None),
+            pending_bash_messages: std::sync::Mutex::new(Vec::new()),
             footer: Arc::new(FooterComponent::new()),
             status_container: Arc::new(Container::new()),
             chat_container: Arc::new(Container::new()),
             loader: Arc::new(Loader::new()),
+            editor: Arc::new(Editor::simple()),
             last_assistant_text: std::sync::Mutex::new(String::new()),
             active_selector: std::sync::Mutex::new(None),
             active_extension_editor: std::sync::Mutex::new(None),
@@ -9958,6 +11309,7 @@ mod tests {
             tui: None,
             current_model_id: std::sync::Mutex::new(String::new()),
             show_images: std::sync::Mutex::new(true),
+            cache_miss_notices: std::sync::Mutex::new(false),
             history: std::sync::Mutex::new(Vec::new()),
             history_index: std::sync::Mutex::new(-1),
             history_draft: std::sync::Mutex::new(None),
@@ -9969,6 +11321,11 @@ mod tests {
             )),
             search: Arc::new(AltScreenSearch::new()),
             search_bar: Arc::new(SearchBar::new()),
+            pending_container: Arc::new(Container::new()),
+            dequeue_hint: String::new(),
+            pending_snapshot: std::sync::Mutex::new(
+                rpi_harness::agent_harness::QueuedMessages::default(),
+            ),
             selection_start: std::sync::Mutex::new(None),
             selection_end: std::sync::Mutex::new(None),
         });
@@ -10071,7 +11428,9 @@ mod tests {
         );
         state.set_status(RunStatus::Idle);
         state.set_status(RunStatus::Working);
-        assert_eq!(state.status_container.child_count(), 1);
+        // The active loader now renders inside the editor's top border.
+        assert!(state.editor.working().is_some());
+        assert_eq!(state.status_container.child_count(), 0);
         assert!(state.footer.get_status().is_empty());
         state.show_retry(3, 10, 8_000);
         let retry_status = strip_ansi(&state.status_container.render(80).join("\n"));
@@ -10095,7 +11454,10 @@ mod tests {
         assert_eq!(state.status_container.child_count(), 0);
         state.bash_components.lock().unwrap().remove("bash-2");
         state.sync_working_loader_with_bash();
-        assert_eq!(state.status_container.child_count(), 1);
+        // The editor-border indicator stays visible across bash panels, so the
+        // status container stays empty.
+        assert_eq!(state.status_container.child_count(), 0);
+        assert!(state.editor.working().is_some());
 
         state.set_status(RunStatus::Aborting);
         assert_eq!(state.status_container.child_count(), 0);
@@ -10118,6 +11480,49 @@ mod tests {
             ..Args::default()
         };
         assert!(launch_restores_history(&selected));
+    }
+
+    #[test]
+    fn context_badge_ignores_aborted_and_error_turns() {
+        use rpi_ai::types::{Api, StopReason, Usage};
+
+        let footer = Arc::new(FooterComponent::new());
+        footer.set_context_window(100_000);
+
+        // A real response fills in the percent (`?` -> `25.0%/100k`).
+        let mut ok = rpi_ai::AssistantMessage::empty(Api::AnthropicMessages, "anthropic", "m", 0);
+        ok.stop_reason = StopReason::Stop;
+        ok.usage = Usage {
+            input: 25_000,
+            ..Usage::zero()
+        };
+        record_context_usage(&footer, &ok);
+        let stats = strip_ansi(&footer.render(120).join("\n"));
+        assert!(stats.contains("25.0%/100k"), "stats: {stats}");
+
+        // An aborted turn must not clobber the last good value.
+        let mut aborted =
+            rpi_ai::AssistantMessage::empty(Api::AnthropicMessages, "anthropic", "m", 0);
+        aborted.stop_reason = StopReason::Aborted;
+        aborted.usage = Usage {
+            input: 90_000,
+            ..Usage::zero()
+        };
+        record_context_usage(&footer, &aborted);
+        let stats = strip_ansi(&footer.render(120).join("\n"));
+        assert!(stats.contains("25.0%/100k"), "stats: {stats}");
+
+        // An errored turn likewise (its usage is not a real measurement).
+        let mut errored =
+            rpi_ai::AssistantMessage::empty(Api::AnthropicMessages, "anthropic", "m", 0);
+        errored.stop_reason = StopReason::Error;
+        errored.usage = Usage {
+            input: 90_000,
+            ..Usage::zero()
+        };
+        record_context_usage(&footer, &errored);
+        let stats = strip_ansi(&footer.render(120).join("\n"));
+        assert!(stats.contains("25.0%/100k"), "stats: {stats}");
     }
 
     #[test]
@@ -10162,6 +11567,33 @@ mod tests {
             Some("routeryo-copy/gpt-5.6-sol (current)")
         );
         assert_eq!(items[1].description.as_deref(), Some("claude-sonnet-5"));
+    }
+
+    #[test]
+    fn model_selector_search_text_covers_provider_name_and_qualified_id() {
+        use rpi_ai::{Api, Model};
+
+        let anthropic = Model::new(
+            "claude-sonnet-5",
+            "Claude Sonnet 5",
+            Api::AnthropicMessages,
+            "anthropic",
+            "https://api.anthropic.com",
+        );
+        let items = model_selector_items(&[anthropic], "");
+        let search = items[0].search_key();
+        // Mirrors native `getModelSelectorSearchText`: provider-prefixed first,
+        // then the display name.
+        assert!(search.starts_with("anthropic anthropic/claude-sonnet-5"));
+        assert!(search.contains("Claude Sonnet 5"), "{search}");
+
+        // A provider query and a display-name query both match through the
+        // real fuzzy filter used by the searchable selector.
+        use rpi_tui::fuzzy_filter;
+        for query in ["anthropic", "sonnet", "Claude Sonnet", "claude-sonnet-5"] {
+            let matched = fuzzy_filter(&items, query, |item| item.search_key());
+            assert_eq!(matched.len(), 1, "query {query:?} matched nothing");
+        }
     }
 
     #[test]
@@ -10302,10 +11734,13 @@ mod tests {
             show_terminal_progress: true,
             status: std::sync::Mutex::new(RunStatus::Idle),
             js_preparation_cancel: std::sync::Mutex::new(None),
+            user_bash_cancel: std::sync::Mutex::new(None),
+            pending_bash_messages: std::sync::Mutex::new(Vec::new()),
             footer: Arc::new(FooterComponent::new()),
             status_container: Arc::new(Container::new()),
             chat_container: Arc::new(Container::new()),
             loader: Arc::new(Loader::new()),
+            editor: Arc::new(Editor::simple()),
             last_assistant_text: std::sync::Mutex::new(String::new()),
             active_selector: std::sync::Mutex::new(None),
             active_extension_editor: std::sync::Mutex::new(None),
@@ -10319,6 +11754,7 @@ mod tests {
             tui: None,
             current_model_id: std::sync::Mutex::new(String::new()),
             show_images: std::sync::Mutex::new(true),
+            cache_miss_notices: std::sync::Mutex::new(false),
             history: std::sync::Mutex::new(Vec::new()),
             history_index: std::sync::Mutex::new(-1),
             history_draft: std::sync::Mutex::new(None),
@@ -10330,6 +11766,11 @@ mod tests {
             )),
             search: Arc::new(AltScreenSearch::new()),
             search_bar: Arc::new(SearchBar::new()),
+            pending_container: Arc::new(Container::new()),
+            dequeue_hint: String::new(),
+            pending_snapshot: std::sync::Mutex::new(
+                rpi_harness::agent_harness::QueuedMessages::default(),
+            ),
             selection_start: std::sync::Mutex::new(None),
             selection_end: std::sync::Mutex::new(None),
         });
@@ -10374,10 +11815,13 @@ mod tests {
             show_terminal_progress: true,
             status: std::sync::Mutex::new(RunStatus::Idle),
             js_preparation_cancel: std::sync::Mutex::new(None),
+            user_bash_cancel: std::sync::Mutex::new(None),
+            pending_bash_messages: std::sync::Mutex::new(Vec::new()),
             footer: Arc::new(FooterComponent::new()),
             status_container: Arc::new(Container::new()),
             chat_container: Arc::new(Container::new()),
             loader: Arc::new(Loader::new()),
+            editor: Arc::new(Editor::simple()),
             last_assistant_text: std::sync::Mutex::new(String::new()),
             active_selector: std::sync::Mutex::new(None),
             active_extension_editor: std::sync::Mutex::new(None),
@@ -10391,6 +11835,7 @@ mod tests {
             tui: None,
             current_model_id: std::sync::Mutex::new(String::new()),
             show_images: std::sync::Mutex::new(true),
+            cache_miss_notices: std::sync::Mutex::new(false),
             history: std::sync::Mutex::new(Vec::new()),
             history_index: std::sync::Mutex::new(-1),
             history_draft: std::sync::Mutex::new(None),
@@ -10402,6 +11847,11 @@ mod tests {
             )),
             search: Arc::new(AltScreenSearch::new()),
             search_bar: Arc::new(SearchBar::new()),
+            pending_container: Arc::new(Container::new()),
+            dequeue_hint: String::new(),
+            pending_snapshot: std::sync::Mutex::new(
+                rpi_harness::agent_harness::QueuedMessages::default(),
+            ),
             selection_start: std::sync::Mutex::new(None),
             selection_end: std::sync::Mutex::new(None),
         });
@@ -10449,10 +11899,13 @@ mod tests {
             show_terminal_progress: true,
             status: std::sync::Mutex::new(RunStatus::Idle),
             js_preparation_cancel: std::sync::Mutex::new(None),
+            user_bash_cancel: std::sync::Mutex::new(None),
+            pending_bash_messages: std::sync::Mutex::new(Vec::new()),
             footer: Arc::new(FooterComponent::new()),
             status_container: Arc::new(Container::new()),
             chat_container: Arc::new(Container::new()),
             loader: Arc::new(Loader::new()),
+            editor: Arc::new(Editor::simple()),
             last_assistant_text: std::sync::Mutex::new(String::new()),
             active_selector: std::sync::Mutex::new(None),
             active_extension_editor: std::sync::Mutex::new(None),
@@ -10466,6 +11919,7 @@ mod tests {
             tui: None,
             current_model_id: std::sync::Mutex::new(String::new()),
             show_images: std::sync::Mutex::new(true),
+            cache_miss_notices: std::sync::Mutex::new(false),
             history: std::sync::Mutex::new(Vec::new()),
             history_index: std::sync::Mutex::new(-1),
             history_draft: std::sync::Mutex::new(None),
@@ -10477,6 +11931,11 @@ mod tests {
             )),
             search: Arc::new(AltScreenSearch::new()),
             search_bar: Arc::new(SearchBar::new()),
+            pending_container: Arc::new(Container::new()),
+            dequeue_hint: String::new(),
+            pending_snapshot: std::sync::Mutex::new(
+                rpi_harness::agent_harness::QueuedMessages::default(),
+            ),
             selection_start: std::sync::Mutex::new(None),
             selection_end: std::sync::Mutex::new(None),
         });
@@ -10527,10 +11986,13 @@ mod tests {
             show_terminal_progress: true,
             status: std::sync::Mutex::new(RunStatus::Idle),
             js_preparation_cancel: std::sync::Mutex::new(None),
+            user_bash_cancel: std::sync::Mutex::new(None),
+            pending_bash_messages: std::sync::Mutex::new(Vec::new()),
             footer: Arc::new(FooterComponent::new()),
             status_container: Arc::new(Container::new()),
             chat_container: Arc::new(Container::new()),
             loader: Arc::new(Loader::new()),
+            editor: Arc::new(Editor::simple()),
             last_assistant_text: std::sync::Mutex::new(String::new()),
             active_selector: std::sync::Mutex::new(None),
             active_extension_editor: std::sync::Mutex::new(None),
@@ -10544,6 +12006,7 @@ mod tests {
             tui: None,
             current_model_id: std::sync::Mutex::new(String::new()),
             show_images: std::sync::Mutex::new(true),
+            cache_miss_notices: std::sync::Mutex::new(false),
             history: std::sync::Mutex::new(Vec::new()),
             history_index: std::sync::Mutex::new(-1),
             history_draft: std::sync::Mutex::new(None),
@@ -10555,6 +12018,11 @@ mod tests {
             )),
             search: Arc::new(AltScreenSearch::new()),
             search_bar: Arc::new(SearchBar::new()),
+            pending_container: Arc::new(Container::new()),
+            dequeue_hint: String::new(),
+            pending_snapshot: std::sync::Mutex::new(
+                rpi_harness::agent_harness::QueuedMessages::default(),
+            ),
             selection_start: std::sync::Mutex::new(None),
             selection_end: std::sync::Mutex::new(None),
         });
@@ -10648,7 +12116,11 @@ mod tests {
             KeyCode::Enter,
             KeyModifiers::NONE,
         ));
-        assert_eq!(submits.load(Ordering::SeqCst), 1, "typed Enter submits once");
+        assert_eq!(
+            submits.load(Ordering::SeqCst),
+            1,
+            "typed Enter submits once"
+        );
     }
 
     #[test]
@@ -10695,6 +12167,40 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn paste_probe_ignores_the_enter_keys_own_release() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+        let release =
+            KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Release);
+
+        // Windows queues press+release together over RDP: the release behind a
+        // lone Enter must NOT count as queued paste content.
+        let mut queued = vec![Event::Key(release)].into_iter();
+        let (more, stashed) = probe_paste_input(None, || queued.next());
+        assert!(!more, "a key release alone is not queued paste input");
+        assert!(stashed.is_none());
+
+        // A real follow-up key (the next pasted line) IS queued input and is
+        // stashed for the caller instead of being lost.
+        let next = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+        let mut queued = vec![Event::Key(release), Event::Key(next)].into_iter();
+        let (more, stashed) = probe_paste_input(None, || queued.next());
+        assert!(more, "a queued key press is paste continuation");
+        assert!(matches!(stashed, Some(Event::Key(_))));
+
+        // Nothing queued at all.
+        let (more, stashed) = probe_paste_input(None, || None);
+        assert!(!more);
+        assert!(stashed.is_none());
+
+        // An already-stashed event counts as queued input, without reading more.
+        let (more, stashed) = probe_paste_input(Some(Event::Key(next)), || {
+            panic!("must not read when an event is already stashed")
+        });
+        assert!(more);
+        assert!(matches!(stashed, Some(Event::Key(_))));
+    }
+
     // ---- ask_user TUI bridge ----
 
     #[test]
@@ -10737,8 +12243,10 @@ mod tests {
     #[test]
     fn ask_user_result_and_progress_prefer_readable_content() {
         let waiting = rpi_agent::AgentToolResult::text("Waiting for your answer\n端口?");
-        assert!(ask_user_progress_text(&serde_json::json!({"question": "端口?"}), &waiting)
-            .contains("端口?"));
+        assert!(
+            ask_user_progress_text(&serde_json::json!({"question": "端口?"}), &waiting)
+                .contains("端口?")
+        );
         let empty = rpi_agent::AgentToolResult::default();
         assert!(
             ask_user_progress_text(&serde_json::json!({"question": "端口?"}), &empty)
