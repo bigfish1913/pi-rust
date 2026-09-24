@@ -4463,6 +4463,18 @@ fn enter_is_paste_burst(
     last_text_key_at.is_some_and(|previous| now.duration_since(previous) < PASTE_BURST_GAP)
 }
 
+/// Milliseconds since the last text key, for the [`enter_is_paste_burst`] trace
+/// line (`-` when there was no preceding text key).
+fn gap_ms(last_text_key_at: Option<std::time::Instant>) -> String {
+    match last_text_key_at {
+        Some(previous) => std::time::Instant::now()
+            .duration_since(previous)
+            .as_millis()
+            .to_string(),
+        None => "-".to_string(),
+    }
+}
+
 fn transcript_page_size(viewport_height: usize) -> i32 {
     viewport_height
         .saturating_sub(PAGE_SCROLL_OVERLAP)
@@ -5520,6 +5532,14 @@ pub async fn interactive_tui(
         // Paste-burst tracking (see the bare-Enter guard below): the instant of
         // the most recent key event that could have been pasted text.
         let mut last_text_key_at: Option<std::time::Instant> = None;
+        if crate::key_trace::enabled() {
+            crate::key_trace::note(&format!(
+                "--- rpi TUI key trace start pid={} TERM={} raw_mode={} ---",
+                std::process::id(),
+                std::env::var("TERM").unwrap_or_else(|_| "(unset)".to_string()),
+                crossterm::terminal::is_raw_mode_enabled().unwrap_or(false),
+            ));
+        }
         loop {
             if !*running_key.lock().unwrap() {
                 break;
@@ -5621,6 +5641,10 @@ pub async fn interactive_tui(
             }
             let Event::Key(key) = ev else {
                 if let Event::Paste(text) = ev {
+                    crate::key_trace::note(&format!(
+                        "paste event ({} bytes, bracketed paste supported)",
+                        text.len()
+                    ));
                     let candidate = text.trim().trim_matches(['\"', '\'']);
                     let path = std::path::PathBuf::from(candidate);
                     if !candidate.chars().any(|c| c == '\n' || c == '\r') && path.is_file() {
@@ -5648,6 +5672,10 @@ pub async fn interactive_tui(
             if !should_dispatch_key(key.kind) {
                 continue;
             }
+            // Diagnostic trace (off unless RPI_DEBUG_KEYS is set): records what
+            // actually arrived before any routing decision, so a client that
+            // sends LF for Enter is visible as `Char('j') mods=CONTROL`.
+            crate::key_trace::key(&key, "");
 
             // Prompt preparation runs on a blocking worker before the agent
             // lane owns the turn. Cancel it directly: an abort queued only to
@@ -6248,6 +6276,10 @@ pub async fn interactive_tui(
                     std::time::Instant::now(),
                     more_queued,
                 ) {
+                    crate::key_trace::note(&format!(
+                        "enter-decision -> newline (paste burst) gap_ms={} more_queued={more_queued}",
+                        gap_ms(last_text_key_at),
+                    ));
                     // Pasted newline: insert it and keep the remaining queued
                     // events flowing through this same path.
                     editor_for_key.insert("\n");
@@ -6256,6 +6288,10 @@ pub async fn interactive_tui(
                     tui_for_key.request_render_reusing_scroll_content();
                     continue;
                 }
+                crate::key_trace::note(&format!(
+                    "enter-decision -> submit gap_ms={} more_queued={more_queued}",
+                    gap_ms(last_text_key_at),
+                ));
                 // A real submit ends the burst so a follow-up Enter is not
                 // mistaken for paste continuation.
                 last_text_key_at = None;

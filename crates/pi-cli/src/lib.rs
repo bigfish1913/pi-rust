@@ -63,6 +63,7 @@ pub mod install;
 pub mod install_pi;
 pub mod interactive_tui;
 pub mod js_extensions;
+pub mod key_trace;
 pub mod llama_command;
 pub mod modes;
 pub mod model_registry;

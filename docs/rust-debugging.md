@@ -274,6 +274,41 @@ rpi --connect 127.0.0.1:9899 --token <token>   # 远程 TUI 客户端
 - 远程模式下 `/tree`、`/fork`、`/switch`、`/export`、`/name`、`/reload` 不可用
   （依赖本地 harness），会得到明确的"不支持"提示。
 
+### 按键诊断（手机 / 远程终端）
+
+手机客户端、IME、SSH 网关对"回车"的编码各不相同，出问题时先看**到达 TUI 的原始
+按键事件**，不要猜。设置 `RPI_DEBUG_KEYS` 即可把所有按键事件（含 Enter 的判定结果）
+追加到日志：
+
+```powershell
+# Windows：在手机 SSH 进来的那个会话里
+$env:RPI_DEBUG_KEYS=1; rpi
+```
+
+```bash
+# Unix / Termux
+RPI_DEBUG_KEYS=1 rpi
+```
+
+默认写到 `<临时目录>/rpi-keys.log`（Windows 为 `%TEMP%\rpi-keys.log`），也可用
+`RPI_DEBUG_KEYS=<路径>` 指定文件。格式：
+
+```text
+2026-09-24T12:00:01.234Z --- rpi TUI key trace start pid=4321 TERM=xterm-256color raw_mode=true ---
+2026-09-24T12:00:01.235Z code=Char('h') mods=NONE kind=Press
+2026-09-24T12:00:01.236Z code=Enter mods=NONE kind=Press
+2026-09-24T12:00:01.236Z enter-decision -> newline (paste burst) gap_ms=1 more_queued=false
+```
+
+按这两条线索判断：
+
+| 日志 | 含义 | 处理 |
+| --- | --- | --- |
+| `code=Char('j') mods=CONTROL`（或 `Char('\n')`） | 客户端把回车发成了 **LF (0x0A)**。crossterm 在 raw 模式下把 LF 当 Ctrl+J，而 Ctrl+J 绑定的是"插入换行"（对齐 pi 的 `tui.input.newLine`） | 让客户端改发 **CR (0x0D)**；或在客户端里把回车键显式绑定为 `\r` |
+| `code=Enter mods=NONE` + `enter-decision -> newline (paste burst)` | 收到的是正常 CR，但客户端把"文字 + 回车"合并成一批发送，粘贴启发式（20ms 突发窗口）误判为粘贴 | 见 `enter_is_paste_burst`：需要放宽/重写突发判定 |
+| `code=Enter mods=NONE` + `enter-decision -> submit` | 输入路径正常，问题不在按键层 | 检查会话/网络层 |
+| 完全没有 `code=` 行 | 按键根本没到 TUI | 客户端没连上、窗口未聚焦，或 `RPI_SKIP_STDIN` 被设了 |
+
 ## 8. 常见失败定位
 
 | 症状 | 检查项 |
@@ -285,6 +320,7 @@ rpi --connect 127.0.0.1:9899 --token <token>   # 远程 TUI 客户端
 | `poll` 卡住 | `poll` 必须非阻塞；耗时工作放线程，handle 保存状态，取消标记限时结束 |
 | Windows 上热重载失败 | 已加载 DLL 无法覆盖；用 `rpi dev` 的版本化 staging，不要手工复制 |
 | 资源没出现在系统提示词 | `--debug-system-prompt` 查看最终组装结果；确认 skill 路径被发现 |
+| 手机/远程终端回车变换行 | `RPI_DEBUG_KEYS=1` 看按键：`Char('j') mods=CONTROL` = 客户端发的是 LF（当成 Ctrl+J=插入换行）；`Enter` + `paste burst` = 粘贴启发式误判 |
 | panic / 段错误跨 ABI | `extern "C"` 边界不能 unwind；`StbString` 所有权遵守宿主/插件两侧规则 |
 | ABI 版本不匹配 | 宿主日志提示 mismatch 并跳过加载；确认 `rpi-plugin-sdk` 版本 |
 

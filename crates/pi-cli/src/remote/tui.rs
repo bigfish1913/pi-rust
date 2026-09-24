@@ -217,6 +217,7 @@ async fn run_loop(
                         tui.request_render(false);
                     }
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
+                        crate::key_trace::key(&key, "remote-client");
                         if is_ctrl(&key, 'c') {
                             if session.streaming {
                                 session.push_notice("aborting…");
@@ -230,7 +231,9 @@ async fn run_loop(
                         }
                         tui.request_render(false);
                     }
-                    _ => {}
+                    other => {
+                        crate::key_trace::note(&format!("remote client event {other:?}"));
+                    }
                 }
             }
             maybe_text = submit_rx.recv() => {
