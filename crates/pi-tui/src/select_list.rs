@@ -170,6 +170,13 @@ impl SelectList {
         }
     }
 
+    /// Override the primary/description column layout. The session picker uses
+    /// this to widen the primary column so a preview is not clipped to the
+    /// 32-column default.
+    pub fn set_layout(&mut self, layout: SelectListLayoutOptions) {
+        self.layout = layout;
+    }
+
     /// Create a selector that permits selecting several options with Space
     /// before submitting with Enter. Existing single-select selectors should
     /// continue using [`Self::new`].

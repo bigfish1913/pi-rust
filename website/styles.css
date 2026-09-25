@@ -88,6 +88,9 @@ a { color: inherit; text-decoration: none; } button { font: inherit; } .site-she
 .blog-body pre code { padding: 0; background: transparent; color: inherit; font: 11px/1.8 var(--mono); }
 .blog-body ul { margin: 0 0 14px; padding-left: 22px; }
 .blog-body li { margin-bottom: 6px; color: #464844; font-size: 13px; line-height: 1.75; }
+.blog-body table { width: 100%; margin: 20px 0; border-collapse: collapse; font-size: 12px; }
+.blog-body th, .blog-body td { padding: 9px 12px; border-bottom: 1px solid var(--line); text-align: left; }
+.blog-body th { background: var(--paper); color: var(--ink); font-weight: 700; }
 .blog-body strong { font-weight: 700; color: var(--ink); }
 .blog-body a { color: var(--orange-deep); text-decoration: underline; text-underline-offset: 2px; }
 .blog-body a:hover { color: var(--orange); }

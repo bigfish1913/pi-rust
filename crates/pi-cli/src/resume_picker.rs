@@ -6,7 +6,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 use rpi_tui::{
-    Container, ProcessTerminal, SelectItem, SelectList, Spacer, Text, TuiAltScreen, TUI,
+    Container, ProcessTerminal, SelectItem, SelectList, SelectListLayoutOptions, Spacer, Text,
+    TuiAltScreen, TUI,
 };
 
 /// Select a project session before the main harness is built.
@@ -24,24 +25,67 @@ pub async fn select(cwd: &Path) -> Result<Option<String>, String> {
         ));
     }
 
+    // Each summary opens + reads a (bounded) slice of the session file. That is
+    // blocking file I/O over every saved session, so keep it off the async
+    // runtime the TUI will later run on.
+    let metas_for_summary = metadata.clone();
+    let summaries = tokio::task::spawn_blocking(move || {
+        metas_for_summary
+            .iter()
+            .map(|meta| crate::session::summarize_session_file(Path::new(&meta.path)))
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|e| format!("session summary task failed: {e}"))?;
+
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
         .min(i64::MAX as u128) as i64;
-    let items = metadata
-        .iter()
-        .map(|meta| {
-            let file_name = Path::new(&meta.path)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or(&meta.id);
-            SelectItem::new(&meta.id, file_name)
-                .with_description(&format_modified_age(now_ms, meta.modified_at))
-        })
-        .collect();
+    let mut items: Vec<SelectItem> = Vec::new();
+    for (meta, summary) in metadata.iter().zip(summaries.iter()) {
+        // A header-only session has nothing to restore; offering it is how a
+        // resume lands on an empty transcript. Skip them so every listed row is
+        // resumable.
+        if summary.empty {
+            continue;
+        }
+        let file_name = Path::new(&meta.path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(&meta.id);
+        let label = crate::session::session_display_label(summary);
+        let short_id = crate::session::short_session_id(&meta.id);
+        let description = format!(
+            "{} · {} · {}",
+            format_modified_age(now_ms, meta.modified_at),
+            crate::session::format_session_bytes(summary.bytes),
+            short_id,
+        );
+        items.push(
+            SelectItem::new(&meta.id, &label)
+                .with_description(&description)
+                .with_search_text(&format!("{label} {short_id} {file_name}")),
+        );
+    }
+    if items.is_empty() {
+        return Err(format!(
+            "no resumable sessions with messages in {}",
+            crate::session::default_session_dir(cwd).display()
+        ));
+    }
 
-    let list = Arc::new(SelectList::new(items, 12));
+    // A wide primary column so the name/preview label is not clipped to the
+    // 32-column default (which showed only the timestamp prefix of the file
+    // name and made sessions indistinguishable).
+    let mut list = SelectList::new(items, 12);
+    list.set_layout(SelectListLayoutOptions {
+        min_primary_column_width: Some(56),
+        max_primary_column_width: Some(72),
+        truncate_primary: None,
+    });
+    let list = Arc::new(list);
     let search = Arc::new(Text::new("  Filter: ", 0, 0));
     let root = Arc::new(Container::new());
     root.add_child(Arc::new(Text::new("Resume session", 1, 1)));
@@ -159,5 +203,39 @@ mod tests {
         assert_eq!(format_modified_age(now, now - 5 * 60_000), "5m ago");
         assert_eq!(format_modified_age(now, now - 3 * 3_600_000), "3h ago");
         assert_eq!(format_modified_age(now, now - 2 * 86_400_000), "2d ago");
+    }
+
+    #[test]
+    fn label_falls_back_from_name_to_preview_to_marker() {
+        use crate::session::{session_display_label, SessionSummary};
+        let named = SessionSummary {
+            name: Some("fix resume picker".into()),
+            preview: Some("a different prompt".into()),
+            ..Default::default()
+        };
+        assert_eq!(session_display_label(&named), "fix resume picker");
+
+        let preview = SessionSummary {
+            name: Some("   ".into()),
+            preview: Some("读取下当前 rpi -r 命令".into()),
+            ..Default::default()
+        };
+        assert_eq!(session_display_label(&preview), "读取下当前 rpi -r 命令");
+
+        let bare = SessionSummary::default();
+        assert_eq!(session_display_label(&bare), "(no messages)");
+    }
+
+    #[test]
+    fn byte_and_id_formatting_is_compact() {
+        use crate::session::{format_session_bytes, short_session_id};
+        assert_eq!(format_session_bytes(512), "512B");
+        assert_eq!(format_session_bytes(34 * 1024), "34KB");
+        assert_eq!(format_session_bytes(1_258_291), "1.2MB");
+        assert_eq!(
+            short_session_id("01a0d919-6742-70db-a206-9f5ed4cf665a"),
+            "01a0d919"
+        );
+        assert_eq!(short_session_id("abc"), "abc");
     }
 }

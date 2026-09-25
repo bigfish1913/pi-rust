@@ -3,81 +3,174 @@
     "id": "v0-3-1-crates-io-and-performance",
     "date": "2026-09-25",
     "tag": "Release",
-    "title": "rpi 0.3.1：修好 main 的构建，并给出与原生 pi 的实测对比",
-    "summary": "0.3.1 是补丁版本：修复了 main 上持续失败的编译错误，让每个 crate 在 crates.io 和 docs.rs 上正确展示，并首次给出与原生 TypeScript pi 的同机性能对比。",
-    "body": [
-      "0.3.1 不改变 agent、工具或 CLI 的行为。它修的是「别人第一次接触这个项目时会看到什么」。",
-      "## main 其实编译不过\n自从 `c40094a` 起，`rpi-plugin-sdk` 里同时存在 `PluginApi` 结构体和指向它的 `pub type` 别名，以及两份 `register_entrypoint_unified` 定义。结果是 `cargo test --workspace` 直接以 `E0428` / `E0119` / `E0609` 失败——也就是说，任何人 clone `main` 都构建不起来，CI 徽章已经连续三次 push 是红的。已发布到 crates.io 的 0.3.0 不受影响：它是在这些问题引入之前构建的。",
-      "## crates.io 和 docs.rs 上的展示\n此前九个 crate 都引用工作区根目录的同一份 README，其中的相对链接（`docs/architecture.md`、`LICENSE`、`examples/plugin-stub`）在 crates.io 与 docs.rs 上全部 404；页面上也没有指向官网的链接。现在每个 crate 有自己的 README，都声明了 `homepage` 与 `documentation`。",
-      "## 与原生 pi 的同机对比\n这是第一次给出可复现的实测数字。两个工具用完全相同的 JSONL RPC 端点、同一台机器、每轮全新的空配置目录、双方均离线：",
-      "| 指标 | rpi | pi 0.87.1 | 差距 |\n| --- | --: | --: | --- |\n| `--version` | **17.9 ms** | 172.9 ms | 9.7× |\n| 到可用 agent（RPC ready） | **103.6 ms** | 176.4 ms | 1.7× |\n| 常驻内存 | **18.6 MiB** | 91.6 MiB | 4.9× |\n| 安装体积 | **23.9 MiB** | 约 513 MiB | ~21× |",
-      "真正有意思的不是倍数，而是时间花在哪：原生 pi 的开销几乎全在 Node 启动（`--version` 与完整 agent 只差约 3 ms），而 rpi 的 103.6 ms 里有 86 ms 是自身的运行时初始化。所以下一步的优化方向是惰性初始化，而不是把二进制做小。",
-      "基准脚本在 `scripts/bench-vs-pi.mjs`，方法和未测范围写在 `docs/performance-vs-pi.md`。未测的部分包括 LLM 延迟、工具循环吞吐、长会话内存增长和 TUI 帧开销。",
-      "## 不用装 Rust 也能试\n每个 release 现在附带 Linux（x86_64 / aarch64）、macOS（aarch64）和 Windows（x86_64）预编译二进制，附 SHA-256 校验。"
-    ],
-    "highlights": [
-      "修复 main 上的编译错误，CI 恢复绿色",
-      "每个 crate 独立的 README 与官网链接",
-      "与原生 pi 的同机基准：启动 9.7×、内存 4.9×、体积 ~21×",
-      "预编译二进制 + 校验和，免 Rust 工具链安装",
-      "内嵌文档快照加入 CI 校验，不再静默过期"
-    ]
+    "title": {
+      "zh": "rpi 0.3.1：同机实测——启动快 9.7×、内存小 4.9×",
+      "en": "rpi 0.3.1: Same-machine benchmark — 9.7× faster startup, 4.9× less memory"
+    },
+    "summary": {
+      "zh": "0.3.1 不改变 agent、工具或 CLI 的行为。本篇给出第一份可复现的同机实测：同一套 JSONL RPC 协议、同一台机器，rpi 启动快 9.7×、内存小 4.9×；同时修复了 main 的构建，并让每个 crate 在 crates.io 与 docs.rs 上正确展示。",
+      "en": "0.3.1 changes nothing in the agent, tools or CLI. This post gives the first reproducible same-machine benchmark — same JSONL RPC protocol, same machine — with rpi 9.7× faster to start and 4.9× smaller in memory, alongside the build fix on main and correct crates.io / docs.rs pages for every crate."
+    },
+    "body": {
+      "zh": [
+        "0.3.1 不改变 agent、工具或 CLI 的行为。它修的是「别人第一次接触这个项目时会看到什么」。",
+        "## main 其实编译不过\n自从 `c40094a` 起，`rpi-plugin-sdk` 里同时存在 `PluginApi` 结构体和指向它的 `pub type` 别名，以及两份 `register_entrypoint_unified` 定义。结果是 `cargo test --workspace` 直接以 `E0428` / `E0119` / `E0609` 失败——任何人 clone `main` 都构建不起来，CI 徽章已经连续三次 push 是红的。已发布到 crates.io 的 0.3.0 不受影响：它是在这些问题引入之前构建的。",
+        "## crates.io 和 docs.rs 上的展示\n此前九个 crate 都引用工作区根目录的同一份 README，其中的相对链接（`docs/architecture.md`、`LICENSE`、`examples/plugin-stub`）在 crates.io 与 docs.rs 上全部 404，页面上也没有指向官网的链接。现在每个 crate 有自己的 README，并声明了 `homepage` 与 `documentation`；docs.rs 对除 `rpi-cli` 外的所有 crate 以 `all-features` 构建（`rpi-cli` 的剪贴板特性需要 docs.rs 上不存在的平台库）。内嵌到 `rpi` 二进制里的文档快照也一并刷新，并纳入 CI 校验，不再静默过期。",
+        "## 与原生 pi 的同机实测\n这是第一次给出可复现的数字。两个工具用同一套 JSONL RPC 协议、同一台机器、每轮全新的空配置目录，且双方离线；2 轮预热后测 9 轮，取中位数（数字取自 0.3.0 构建，0.3.1 不含功能性改动，故原样适用）：",
+        "- **启动（`--version`）**：rpi 17.9 ms，pi 172.9 ms，快 9.7×\n- **到可用 agent（RPC ready）**：rpi 103.6 ms，pi 176.4 ms，快 1.7×\n- **常驻内存**：rpi 18.6 MiB，pi 91.6 MiB，小 4.9×\n- **安装体积**：rpi 23.9 MiB，pi 约 513 MiB，小约 21×",
+        "真正有意思的不是倍数，而是时间花在哪：pi 的开销几乎全在 Node 启动（`--version` 与完整 agent 只差约 3 ms），而 rpi 的 103.6 ms 里有 86 ms 是自身的运行时初始化。所以下一步的优化方向是惰性初始化，而不是把二进制做小。",
+        "完整方法、原始数据与未测范围（LLM 延迟、工具循环吞吐、长会话内存增长、TUI 帧开销）都在 `docs/performance-vs-pi.md`，基准脚本是 `scripts/bench-vs-pi.mjs`。",
+        "## 不用装 Rust 也能试\n每个 release 现在附带 Linux（x86_64 / aarch64）、macOS（aarch64）和 Windows（x86_64）预编译二进制，附 SHA-256 校验。"
+      ],
+      "en": [
+        "0.3.1 does not change agent, tool, or CLI behavior. It fixes what others see when they first encounter the project.",
+        "## main didn't actually compile\nSince `c40094a`, `rpi-plugin-sdk` had both a `PluginApi` struct and a `pub type` alias pointing to it, plus two definitions of `register_entrypoint_unified`. The result: `cargo test --workspace` failed with `E0428` / `E0119` / `E0609` — anyone cloning `main` couldn't build, and the CI badge was red for three consecutive pushes. The published 0.3.0 on crates.io is unaffected: it was built before these issues were introduced.",
+        "## Presentation on crates.io and docs.rs\nPreviously all nine crates referenced the same README in the workspace root, and relative links (`docs/architecture.md`, `LICENSE`, `examples/plugin-stub`) all 404'd on crates.io and docs.rs; the pages also lacked links to the official site. Now each crate has its own README and declares `homepage` and `documentation`; docs.rs builds every crate with `all-features` except `rpi-cli`, whose clipboard feature needs platform libraries that docs.rs does not provide. The documentation snapshot embedded in the `rpi` binary is refreshed too, and CI now guards it so it cannot silently go stale.",
+        "## Same-machine comparison with native pi\nThis is the first reproducible measurement. Both tools use the same JSONL RPC protocol, the same machine, a fresh empty config directory per run, and both are offline; 2 warmup runs followed by 9 measured runs, medians reported (taken on the 0.3.0 build; 0.3.1 has no functional change, so the numbers carry over):",
+        "- **Startup (`--version`)**: rpi 17.9 ms, pi 172.9 ms — 9.7× faster\n- **To a usable agent (RPC ready)**: rpi 103.6 ms, pi 176.4 ms — 1.7× faster\n- **Resident memory**: rpi 18.6 MiB, pi 91.6 MiB — 4.9× smaller\n- **Install size**: rpi 23.9 MiB, pi ~513 MiB — ~21× smaller",
+        "The interesting part isn't the multiplier, it's where the time goes: pi's overhead is almost entirely Node startup (`--version` and the full agent differ by ~3 ms), while 86 ms of rpi's 103.6 ms is its own runtime initialization. So the next optimization direction is lazy initialization, not smaller binaries.",
+        "Full methodology, raw runs and untested scope (LLM latency, tool-loop throughput, long-session memory growth, TUI frame cost) live in `docs/performance-vs-pi.md`; the harness is `scripts/bench-vs-pi.mjs`.",
+        "## Try it without installing Rust\nEvery release now ships with prebuilt binaries for Linux (x86_64 / aarch64), macOS (aarch64), and Windows (x86_64), with SHA-256 checksums."
+      ]
+    },
+    "highlights": {
+      "zh": [
+        "同机实测：启动快 9.7×、内存小 4.9×、体积小约 21×",
+        "完整方法与未测范围公开，一条命令可复现",
+        "每个 crate 独立 README，crates.io / docs.rs 链接修复",
+        "main 恢复可编译，CI 转绿",
+        "预编译二进制 + SHA-256，免 Rust 工具链"
+      ],
+      "en": [
+        "Same-machine benchmark: 9.7× faster startup, 4.9× less memory, ~21× smaller install",
+        "Full methodology and untested scope published, reproducible in one command",
+        "Per-crate READMEs, crates.io / docs.rs links fixed",
+        "main builds again, CI back to green",
+        "Prebuilt binaries + SHA-256, no Rust toolchain required"
+      ]
+    }
   },
   {
     "id": "v0-1-22-headless-rpc",
     "date": "2026-09-21",
     "tag": "Release",
-    "title": "rpi 0.1.22：无头 RPC 模式与插件安全",
-    "summary": "新增 --server 无头模式，让 rpi 以 JSONL RPC 服务运行而不启动 TUI；同时修复了插件入口函数的安全性标注。",
-    "body": [
-      "rpi 0.1.22 带来了两项重要改进：",
-      "## 无头 RPC 模式\n通过 `rpi --server` 启动后，rpi 不再打开 TUI 界面，而是以 JSONL RPC 服务的形式监听请求。这让外部编辑器、IDE 插件或自动化流水线可以直接与 Agent 通信，无需终端交互。",
-      "## 插件安全性\n`register_entrypoint` 现在被标记为 `unsafe fn`，明确了插件与宿主之间的安全边界。这是一个 breaking change，但让 ABI 合约的安全性更加清晰。",
-      "## 其他修复\n- 恢复渲染调度器和重载错误报告\n- 中止操作时恢复编辑器状态，防止错误信息进入输入框\n- ask_user 对话框支持 Markdown 内容渲染\n- 本地开发模式下无 Cargo cdylib 时优雅降级为 skills-only 模式"
-    ],
-    "highlights": [
-      "--server 无头 RPC 模式",
-      "register_entrypoint 标记为 unsafe",
-      "ask_user 支持 Markdown",
-      "dev-local 优雅降级"
-    ]
+    "title": {
+      "zh": "rpi 0.1.22：无头 RPC 模式与插件安全",
+      "en": "rpi 0.1.22: Headless RPC mode and plugin safety"
+    },
+    "summary": {
+      "zh": "新增 --server 无头模式，让 rpi 以 JSONL RPC 服务运行而不启动 TUI；同时修复了插件入口函数的安全性标注。",
+      "en": "Adds --server headless mode, letting rpi run as a JSONL RPC service without launching the TUI; also fixes the safety annotation on the plugin entry function."
+    },
+    "body": {
+      "zh": [
+        "rpi 0.1.22 带来了两项重要改进：",
+        "## 无头 RPC 模式\n通过 `rpi --server` 启动后，rpi 不再打开 TUI 界面，而是以 JSONL RPC 服务的形式监听请求。这让外部编辑器、IDE 插件或自动化流水线可以直接与 Agent 通信，无需终端交互。",
+        "## 插件安全性\n`register_entrypoint` 现在被标记为 `unsafe fn`，明确了插件与宿主之间的安全边界。这是一个 breaking change，但让 ABI 合约的安全性更加清晰。",
+        "## 其他修复\n- 恢复渲染调度器和重载错误报告\n- 中止操作时恢复编辑器状态，防止错误信息进入输入框\n- ask_user 对话框支持 Markdown 内容渲染\n- 本地开发模式下无 Cargo cdylib 时优雅降级为 skills-only 模式"
+      ],
+      "en": [
+        "rpi 0.1.22 brings two important improvements:",
+        "## Headless RPC mode\nWhen launched with `rpi --server`, rpi no longer opens the TUI interface, but instead listens for requests as a JSONL RPC service. This lets external editors, IDE plugins, or automation pipelines communicate directly with the Agent without terminal interaction.",
+        "## Plugin safety\n`register_entrypoint` is now marked as `unsafe fn`, clarifying the safety boundary between plugins and the host. This is a breaking change, but makes the ABI contract's safety properties clearer.",
+        "## Other fixes\n- Restored render scheduler and reload error reporting\n- Restore editor state on abort, preventing error messages from entering the input box\n- ask_user dialog supports Markdown content rendering\n- Graceful degradation to skills-only mode when no Cargo cdylib is present in local dev mode"
+      ]
+    },
+    "highlights": {
+      "zh": [
+        "--server 无头 RPC 模式",
+        "register_entrypoint 标记为 unsafe",
+        "ask_user 支持 Markdown",
+        "dev-local 优雅降级"
+      ],
+      "en": [
+        "--server headless RPC mode",
+        "register_entrypoint marked as unsafe",
+        "ask_user supports Markdown",
+        "dev-local graceful degradation"
+      ]
+    }
   },
   {
     "id": "v0-1-21-tui-crates-io",
     "date": "2026-09-19",
     "tag": "Release",
-    "title": "rpi 0.1.21：TUI 工具渲染与 crates.io 自动发布",
-    "summary": "TUI 现在可以渲染工具执行结果消息并恢复会话历史；CI 流水线接通 crates.io 自动发布。",
-    "body": [
-      "0.1.21 聚焦在终端体验的提升和发布流程的自动化。",
-      "## TUI 工具结果渲染\n交互式 TUI 现在能完整展示工具执行的结果消息，并在重启后恢复会话历史。这意味着你可以中断一个长时间运行的 Agent，重新打开后继续之前的工作。",
-      "## crates.io 自动发布\nCI 流水线现在支持在 main 分支推送时自动发布 crate 到 crates.io，使用 trusted publishing 机制确保安全性。",
-      "## UI 对话框扩展\nrpi-extensions 添加了对 UI 对话框操作 17 的支持，让插件可以触发更丰富的交互界面。"
-    ],
-    "highlights": [
-      "TUI 工具结果渲染",
-      "会话历史恢复",
-      "crates.io 自动发布",
-      "UI 对话框操作 17"
-    ]
+    "title": {
+      "zh": "rpi 0.1.21：TUI 工具渲染与 crates.io 自动发布",
+      "en": "rpi 0.1.21: TUI tool rendering and crates.io auto-publish"
+    },
+    "summary": {
+      "zh": "TUI 现在可以渲染工具执行结果消息并恢复会话历史；CI 流水线接通 crates.io 自动发布。",
+      "en": "The TUI can now render tool execution result messages and restore session history; CI pipeline connected to crates.io auto-publish."
+    },
+    "body": {
+      "zh": [
+        "0.1.21 聚焦在终端体验的提升和发布流程的自动化。",
+        "## TUI 工具结果渲染\n交互式 TUI 现在能完整展示工具执行的结果消息，并在重启后恢复会话历史。这意味着你可以中断一个长时间运行的 Agent，重新打开后继续之前的工作。",
+        "## crates.io 自动发布\nCI 流水线现在支持在 main 分支推送时自动发布 crate 到 crates.io，使用 trusted publishing 机制确保安全性。",
+        "## UI 对话框扩展\nrpi-extensions 添加了对 UI 对话框操作 17 的支持，让插件可以触发更丰富的交互界面。"
+      ],
+      "en": [
+        "0.1.21 focuses on terminal experience improvements and release automation.",
+        "## TUI tool result rendering\nThe interactive TUI can now fully display tool execution result messages and restore session history after restart. This means you can interrupt a long-running Agent, reopen it, and continue where you left off.",
+        "## crates.io auto-publish\nThe CI pipeline now supports automatically publishing crates to crates.io on main branch pushes, using the trusted publishing mechanism for security.",
+        "## UI dialog extension\nrpi-extensions added support for UI dialog operation 17, allowing plugins to trigger richer interactive interfaces."
+      ]
+    },
+    "highlights": {
+      "zh": [
+        "TUI 工具结果渲染",
+        "会话历史恢复",
+        "crates.io 自动发布",
+        "UI 对话框操作 17"
+      ],
+      "en": [
+        "TUI tool result rendering",
+        "Session history restoration",
+        "crates.io auto-publish",
+        "UI dialog operation 17"
+      ]
+    }
   },
   {
     "id": "v0-1-19-stability",
     "date": "2026-09-16",
     "tag": "Release",
-    "title": "rpi 0.1.19：中止安全与多行输入稳定",
-    "summary": "修复了中止阻塞工具时消息丢失的问题，TUI 多行输入和 Provider 错误处理更加稳定。",
-    "body": [
-      "0.1.19 是一个稳定性版本，解决了几个影响日常使用的边界情况。",
-      "## 中止安全\n当你中止一个正在执行阻塞工具的 Agent 时，队列中等待的用户消息不再丢失。`PendingMessageQueue` 在中止流程中得到了正确的保留。",
-      "## TUI 稳定性\n多行输入在快速编辑和粘贴场景下不再出现错位；Provider 错误信息现在被正确分类和展示，而不是混入普通输出流。",
-      "## 清理\n移除了过时的 model catalog helper，减少维护负担。"
-    ],
-    "highlights": [
-      "中止时保留队列消息",
-      "多行输入稳定",
-      "Provider 错误分类",
-      "移除过时 helper"
-    ]
+    "title": {
+      "zh": "rpi 0.1.19：中止安全与多行输入稳定",
+      "en": "rpi 0.1.19: Abort safety and multi-line input stability"
+    },
+    "summary": {
+      "zh": "修复了中止阻塞工具时消息丢失的问题，TUI 多行输入和 Provider 错误处理更加稳定。",
+      "en": "Fixed message loss when aborting blocking tools, TUI multi-line input and Provider error handling are more stable."
+    },
+    "body": {
+      "zh": [
+        "0.1.19 是一个稳定性版本，解决了几个影响日常使用的边界情况。",
+        "## 中止安全\n当你中止一个正在执行阻塞工具的 Agent 时，队列中等待的用户消息不再丢失。`PendingMessageQueue` 在中止流程中得到了正确的保留。",
+        "## TUI 稳定性\n多行输入在快速编辑和粘贴场景下不再出现错位；Provider 错误信息现在被正确分类和展示，而不是混入普通输出流。",
+        "## 清理\n移除了过时的 model catalog helper，减少维护负担。"
+      ],
+      "en": [
+        "0.1.19 is a stability release, addressing several edge cases that affected daily use.",
+        "## Abort safety\nWhen you abort an Agent executing a blocking tool, queued user messages are no longer lost. `PendingMessageQueue` is now correctly preserved during abort.",
+        "## TUI stability\nMulti-line input no longer misaligns during fast editing and paste scenarios; Provider error messages are now correctly classified and displayed instead of being mixed into the normal output stream.",
+        "## Cleanup\nRemoved outdated model catalog helper, reducing maintenance burden."
+      ]
+    },
+    "highlights": {
+      "zh": [
+        "中止时保留队列消息",
+        "多行输入稳定",
+        "Provider 错误分类",
+        "移除过时 helper"
+      ],
+      "en": [
+        "Queue messages preserved on abort",
+        "Multi-line input stability",
+        "Provider error classification",
+        "Removed outdated helper"
+      ]
+    }
   }
 ]

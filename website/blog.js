@@ -12,41 +12,72 @@ function formatDate(dateStr) {
 }
 
 function renderMarkdown(text) {
-  // 处理代码块
+  // 先把代码块抽成占位符，避免标题/列表/加粗/段落处理污染代码内容
+  const codeBlocks = [];
   text = text.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
-    return `<pre><code class="language-${lang}">${escapeHtml(code.trim())}</code></pre>`;
+    const token = `\u0000CODE${codeBlocks.length}\u0000`;
+    codeBlocks.push(
+      `<pre><code class="language-${lang}">${escapeHtml(code.trim())}</code></pre>`
+    );
+    return token;
   });
-  
+  // 占位符前后补空行，让代码块自成一块
+  text = text.replace(/(\u0000CODE\d+\u0000)/g, '\n\n$1\n\n');
+
   // 处理标题
   text = text.replace(/^### (.+)$/gm, '<h4>$1</h4>');
   text = text.replace(/^## (.+)$/gm, '<h3>$1</h3>');
   text = text.replace(/^# (.+)$/gm, '<h2>$1</h2>');
-  
+
+  // 处理表格（必须在列表/加粗之前，单元格里的 ** 与反引号交给后续步骤）
+  text = text.replace(
+    /^\|(.+)\|\r?\n\|[ :\-|]+\|\r?\n((?:\|.*\|\r?\n?)*)/gm,
+    (_, header, body) => {
+      const cells = (line) => line.split('|').slice(1, -1).map((cell) => cell.trim());
+      const head = cells(`|${header}|`);
+      const rows = body
+        .split('\n')
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .map(cells);
+      const thead = `<tr>${head.map((cell) => `<th>${cell}</th>`).join('')}</tr>`;
+      const tbody = rows
+        .map((row) => `<tr>${row.map((cell) => `<td>${cell}</td>`).join('')}</tr>`)
+        .join('');
+      return `<table><thead>${thead}</thead><tbody>${tbody}</tbody></table>\n`;
+    }
+  );
+
   // 处理无序列表
   text = text.replace(/^- (.+)$/gm, '<li>$1</li>');
   text = text.replace(/(<li>.*<\/li>\n?)+/g, '<ul>$&</ul>');
-  
+
   // 处理加粗
   text = text.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-  
+
   // 处理行内代码
   text = text.replace(/`([^`]+)`/g, '<code>$1</code>');
-  
-  // 处理段落
-  text = text.replace(/\n\n/g, '</p><p>');
-  text = text.replace(/^/, '<p>');
-  text = text.replace(/$/, '</p>');
-  
-  // 清理空段落
-  text = text.replace(/<p><\/p>/g, '');
-  text = text.replace(/<p>(<h[234]>)/g, '$1');
-  text = text.replace(/(<\/h[234]>)<\/p>/g, '$1');
-  text = text.replace(/<p>(<pre>)/g, '$1');
-  text = text.replace(/(<\/pre>)<\/p>/g, '$1');
-  text = text.replace(/<p>(<ul>)/g, '$1');
-  text = text.replace(/(<\/ul>)<\/p>/g, '$1');
-  
-  return text;
+
+  // 块级元素前后补空行，保证按空行切块时它们各自独立（含紧跟标题的正文、夹在正文中的列表/表格）
+  text = text.replace(/(<h[234]>)/g, '\n\n$1');
+  text = text.replace(/(<\/h[234]>)/g, '$1\n\n');
+  text = text.replace(/(<ul>[\s\S]*?<\/ul>)/g, '\n\n$1\n\n');
+  text = text.replace(/(<table>[\s\S]*?<\/table>)/g, '\n\n$1\n\n');
+
+  // 处理段落：按空行切块；块级元素不包 <p>，其余段落包一层
+  const html = text
+    .split(/\n{2,}/)
+    .map((block) => block.trim())
+    .filter(Boolean)
+    .map((block) =>
+      /^(?:<(?:h[234]|pre|table|ul)\b|\u0000CODE\d+\u0000)/.test(block)
+        ? block
+        : `<p>${block}</p>`
+    )
+    .join('\n');
+
+  // 还原代码块
+  return html.replace(/\u0000CODE(\d+)\u0000/g, (_, i) => codeBlocks[Number(i)]);
 }
 
 function escapeHtml(text) {

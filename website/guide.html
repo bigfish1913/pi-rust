@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="rpi 使用指南与扩展开发文档" />
+
+    <link rel="canonical" href="https://rpi.laofu.online/guide.html" />
+    <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
+    <link rel="apple-touch-icon" href="./apple-touch-icon.png" />
+    <meta name="theme-color" content="#101113" />
+    <meta name="robots" content="index, follow" />
+
+    <meta property="og:type" content="Article" />
+    <meta property="og:site_name" content="rpi" />
+    <meta property="og:url" content="https://rpi.laofu.online/guide.html" />
+    <meta property="og:title" content="Guide · rpi" />
+    <meta property="og:description" content="rpi 使用指南与扩展开发文档" />
+    <meta property="og:image" content="https://rpi.laofu.online/og-image.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:locale:alternate" content="en_US" />
+
+    <title data-guide-title>使用指南 · rpi</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="./styles.css" />
+    <style>
+      .guide-page { background: var(--paper); }
+      .guide-hero {
+        padding-top: clamp(90px, 12vw, 155px);
+        padding-bottom: clamp(35px, 5vw, 60px);
+        border-bottom: 1px solid var(--line);
+      }
+      .guide-hero h1 {
+        margin: 0 0 12px;
+        font-size: clamp(32px, 5vw, 56px);
+        line-height: 1.05;
+        letter-spacing: -.06em;
+        font-weight: 800;
+      }
+      .guide-hero > p {
+        max-width: 610px;
+        margin: 0;
+        color: var(--muted);
+        font-size: 14px;
+        line-height: 1.75;
+      }
+      .guide-selector {
+        display: flex;
+        gap: 8px;
+        margin-top: 24px;
+        flex-wrap: wrap;
+      }
+      .guide-selector button {
+        padding: 8px 16px;
+        border: 1px solid var(--line);
+        background: var(--white);
+        font: 11px var(--mono);
+        font-weight: 500;
+        letter-spacing: .02em;
+        cursor: pointer;
+        transition: all .2s;
+      }
+      .guide-selector button:hover {
+        border-color: var(--orange);
+        color: var(--orange-deep);
+      }
+      .guide-selector button.is-active {
+        background: var(--ink);
+        color: var(--white);
+        border-color: var(--ink);
+      }
+      .guide-workspace {
+        padding-top: clamp(40px, 6vw, 70px);
+        padding-bottom: clamp(80px, 10vw, 130px);
+      }
+      .guide-layout {
+        display: grid;
+        grid-template-columns: 240px 1fr;
+        gap: clamp(30px, 5vw, 60px);
+        align-items: start;
+      }
+      .guide-toc {
+        position: sticky;
+        top: 100px;
+        max-height: calc(100vh - 140px);
+        overflow-y: auto;
+        padding-right: 12px;
+      }
+      .guide-toc-label {
+        display: block;
+        margin-bottom: 14px;
+        color: var(--muted);
+        font: 9px var(--mono);
+        font-weight: 500;
+        letter-spacing: .12em;
+        text-transform: uppercase;
+      }
+      .guide-toc nav {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+      }
+      .guide-toc a {
+        display: block;
+        padding: 6px 10px;
+        color: var(--muted);
+        font: 11px var(--mono);
+        text-decoration: none;
+        border-left: 2px solid transparent;
+        transition: all .15s;
+        line-height: 1.5;
+      }
+      .guide-toc a:hover {
+        color: var(--ink);
+        border-left-color: var(--line);
+      }
+      .guide-toc a.is-active {
+        color: var(--orange-deep);
+        border-left-color: var(--orange);
+      }
+      .guide-toc a.level-3 {
+        padding-left: 22px;
+        font-size: 10px;
+      }
+      .guide-content {
+        min-width: 0;
+      }
+      .guide-body {
+        color: #464844;
+        font-size: 13px;
+        line-height: 1.9;
+        max-width: 760px;
+      }
+      .guide-body p {
+        margin: 0 0 14px;
+      }
+      .guide-body h1 {
+        margin: 40px 0 16px;
+        font-size: 32px;
+        letter-spacing: -.05em;
+        font-weight: 800;
+      }
+      .guide-body h2 {
+        margin: 48px 0 14px;
+        font-size: 24px;
+        letter-spacing: -.04em;
+        font-weight: 700;
+        padding-bottom: 8px;
+        border-bottom: 1px solid var(--line);
+      }
+      .guide-body h3 {
+        margin: 36px 0 12px;
+        font-size: 18px;
+        letter-spacing: -.04em;
+        font-weight: 700;
+      }
+      .guide-body h4 {
+        margin: 28px 0 10px;
+        font-size: 15px;
+        letter-spacing: -.03em;
+        font-weight: 700;
+      }
+      .guide-body code {
+        padding: 2px 6px;
+        background: var(--paper);
+        color: var(--orange-deep);
+        font: 11px var(--mono);
+        border-radius: 2px;
+      }
+      .guide-body pre {
+        margin: 20px 0;
+        padding: 18px 20px;
+        background: var(--ink);
+        color: #d7dcd0;
+        overflow: auto;
+        border-radius: 0;
+      }
+      .guide-body pre code {
+        padding: 0;
+        background: transparent;
+        color: inherit;
+        font: 11px/1.8 var(--mono);
+      }
+      .guide-body ul, .guide-body ol {
+        margin: 0 0 14px;
+        padding-left: 22px;
+      }
+      .guide-body li {
+        margin-bottom: 6px;
+        color: #464844;
+        font-size: 13px;
+        line-height: 1.75;
+      }
+      .guide-body strong {
+        font-weight: 700;
+        color: var(--ink);
+      }
+      .guide-body a {
+        color: var(--orange-deep);
+        text-decoration: underline;
+        text-underline-offset: 2px;
+      }
+      .guide-body a:hover {
+        color: var(--orange);
+      }
+      .guide-body table {
+        width: 100%;
+        margin: 20px 0;
+        border-collapse: collapse;
+        font-size: 12px;
+      }
+      .guide-body th, .guide-body td {
+        padding: 10px 12px;
+        text-align: left;
+        border: 1px solid var(--line);
+      }
+      .guide-body th {
+        background: var(--paper);
+        font-weight: 600;
+        font-size: 11px;
+        letter-spacing: .02em;
+      }
+      .guide-body blockquote {
+        margin: 20px 0;
+        padding: 12px 20px;
+        border-left: 3px solid var(--orange);
+        background: var(--paper);
+        color: var(--muted);
+      }
+      .guide-body blockquote p {
+        margin: 0;
+      }
+      .guide-loading {
+        padding: 60px 20px;
+        text-align: center;
+        color: var(--muted);
+        font: 12px var(--mono);
+      }
+      .guide-error {
+        padding: 60px 20px;
+        text-align: center;
+        color: var(--muted);
+        font: 12px var(--mono);
+        border: 1px dashed var(--line);
+      }
+      @media (max-width: 900px) {
+        .guide-layout {
+          grid-template-columns: 1fr;
+        }
+        .guide-toc {
+          position: static;
+          max-height: none;
+          margin-bottom: 30px;
+          padding-right: 0;
+          border-bottom: 1px solid var(--line);
+          padding-bottom: 20px;
+        }
+      }
+    </style>
+  </head>
+  <body class="guide-page">
+    <div class="site-shell">
+      <header class="topbar" data-sticky-header>
+        <a class="brand" href="./index.html#top" aria-label="rpi home"><span class="brand-mark"><span></span><span></span><span></span></span><span>rpi</span></a>
+        <nav class="desktop-nav" aria-label="主导航"><a href="./index.html#top" data-i18n="nav.home">首页</a><a class="is-current" href="./docs.html" data-i18n="nav.documentation">文档</a><a href="./packages.html" data-i18n="nav.packages">软件包</a><a href="./blog.html" data-i18n="nav.blog">博客</a></nav>
+        <div class="topbar-actions"><button class="language-switcher" type="button" data-language-toggle>EN</button><a class="text-link desktop-only" href="https://github.com/bigfish1913/pi-rust" target="_blank" rel="noreferrer">GitHub <span aria-hidden="true">↗</span></a><a class="button button-small desktop-only" href="./index.html#get-started" data-i18n="nav.start">开始使用 <span aria-hidden="true">→</span></a><button class="menu-toggle" type="button" aria-label="打开导航" data-i18n-attr="aria-label|nav.open" aria-expanded="false" data-menu-toggle><span></span><span></span></button></div>
+      </header>
+      <div class="mobile-menu" data-mobile-menu><a href="./index.html#top" data-i18n="nav.home">首页</a><a href="./docs.html" data-i18n="nav.documentation">文档</a><a href="./packages.html" data-i18n="nav.packages">软件包</a><a href="./blog.html" data-i18n="nav.blog">博客</a><a href="https://github.com/bigfish1913/pi-rust" target="_blank" rel="noreferrer">GitHub ↗</a></div>
+
+      <main>
+        <section class="guide-hero page-section">
+          <div class="eyebrow eyebrow-dark">RPI / GUIDES</div>
+          <h1 data-guide-title>使用指南</h1>
+          <p data-guide-description>详细的使用手册、扩展开发指南与项目结构说明。</p>
+          <div class="guide-selector" data-guide-selector></div>
+        </section>
+        <section class="guide-workspace page-section">
+          <div class="guide-layout">
+            <aside class="guide-toc">
+              <span class="guide-toc-label" data-i18n="docs.onThisPage">ON THIS PAGE</span>
+              <nav data-guide-toc></nav>
+            </aside>
+            <div class="guide-content">
+              <div class="guide-body" data-guide-body>
+                <div class="guide-loading">加载中...</div>
+              </div>
+            </div>
+          </div>
+        </section>
+      </main>
+      <footer class="footer"><div class="footer-brand"><span class="brand-mark"><span></span><span></span><span></span></span><span>rpi</span><span class="footer-tagline">Rust Agent Toolkit</span></div><div class="footer-links"><a href="./index.html" data-i18n="footer.home">首页</a><a href="./docs.html" data-i18n="nav.documentation">文档</a><a href="./packages.html" data-i18n="nav.packages">软件包</a><a href="https://github.com/bigfish1913/pi-rust" target="_blank" rel="noreferrer">GitHub ↗</a><span>MIT License</span></div></footer>
+      <div class="toast" role="status" aria-live="polite" data-toast></div>
+    </div>
+    <script src="./guide.js" type="module"></script>
+  </body>
+</html>
