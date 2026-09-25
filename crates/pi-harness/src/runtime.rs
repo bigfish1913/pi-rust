@@ -31,10 +31,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use rpi_agent::message::AgentMessage;
+
 use crate::error::{SessionError, SessionResult};
 use crate::events::{HarnessEvent, HarnessEventBus};
 use crate::session::session::Session;
-use crate::session::types::{EntryOrder, LaneRecord, OperationIntent, RecordQuery};
+use crate::session::types::{
+    Entry, EntryOrder, EntryQuery, LaneRecord, OperationIntent, RecordQuery,
+};
 
 /// How many open operations constitute corruption (mirrors the TS
 /// `find_open_operations(limit: 2)` rule).
@@ -87,7 +91,10 @@ pub enum RecoveryFinding {
     /// A deferred write exists for a run with no matching open operation.
     DanglingWrite { run_id: String },
     /// A tool frame exists for a run with no matching open operation.
-    DanglingToolFrame { run_id: String, tool_call_id: String },
+    DanglingToolFrame {
+        run_id: String,
+        tool_call_id: String,
+    },
 }
 
 impl RecoveryFinding {
@@ -196,10 +203,7 @@ impl SessionRuntime {
     /// `admit(lane)` — the precondition for starting a new operation: refuse
     /// when one is already open. Mirrors the TS admission check.
     pub async fn admit(&self, lane: &str) -> SessionResult<()> {
-        let open = self
-            .session
-            .find_open_operations(lane, Some(1))
-            .await?;
+        let open = self.session.find_open_operations(lane, Some(1)).await?;
         if let Some(op) = open.first() {
             return Err(SessionError::invalid_lane(format!(
                 "lane '{lane}' already has an open operation ({})",
@@ -211,13 +215,7 @@ impl SessionRuntime {
 
     /// `recoverLane(lane)` — read-only recovery report for one lane.
     pub async fn recover_lane(&self, lane: &str) -> SessionResult<LaneRecovery> {
-        let leaf_id = self
-            .session
-            .view(lane)
-            .get_leaf_id()
-            .await
-            .ok()
-            .flatten();
+        let leaf_id = self.session.view(lane).get_leaf_id().await.ok().flatten();
 
         let open_records = self.session.find_open_operations(lane, None).await?;
         let open_ids: BTreeSet<String> = open_records.iter().map(|r| r.base.id.clone()).collect();
@@ -245,6 +243,35 @@ impl SessionRuntime {
         let mut tool_frames = Vec::new();
         let mut findings = Vec::new();
 
+        // Whether a deferred write or a tool frame is *settled* is a property of
+        // the entries, not of whether its run is still open: a run that
+        // completed normally also has no open operation. Classifying on
+        // `open_ids` alone flagged every settled frame of every successful run,
+        // which made `is_clean()` permanently false and buried the real signal
+        // (a frame that never landed because the process died).
+        //
+        // Settled means the referenced entry exists: for a deferred write, the
+        // provisioned id was committed; for a tool frame, the result for that
+        // `tool_call_id` landed.
+        let entries = self
+            .session
+            .find_entries(&EntryQuery {
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            })
+            .await?;
+        let entry_ids: BTreeSet<&str> = entries.iter().map(|entry| entry.id()).collect();
+        let landed_tool_results: BTreeSet<&str> = entries
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Message(message) => match &message.message {
+                    AgentMessage::ToolResult(result) => Some(result.tool_call_id.as_str()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+
         for record in records {
             match record {
                 LaneRecord::WriteDeferred(w) => {
@@ -253,6 +280,14 @@ impl SessionRuntime {
                         .get("id")
                         .and_then(|v| v.as_str())
                         .map(str::to_string);
+                    // The commit landed: this write is history, not a pending
+                    // frame, whatever happened to the operation afterwards.
+                    if provisioned_id
+                        .as_deref()
+                        .is_some_and(|id| entry_ids.contains(id))
+                    {
+                        continue;
+                    }
                     if !open_ids.contains(&w.run_id) {
                         findings.push(RecoveryFinding::DanglingWrite {
                             run_id: w.run_id.clone(),
@@ -265,6 +300,10 @@ impl SessionRuntime {
                     });
                 }
                 LaneRecord::ToolStarted(t) => {
+                    // The tool's result landed: the invocation is settled.
+                    if landed_tool_results.contains(t.tool_call_id.as_str()) {
+                        continue;
+                    }
                     if !open_ids.contains(&t.run_id) {
                         findings.push(RecoveryFinding::DanglingToolFrame {
                             run_id: t.run_id.clone(),
@@ -327,10 +366,9 @@ impl SessionRuntime {
             if let RecoveryFinding::DanglingWrite { run_id }
             | RecoveryFinding::DanglingToolFrame { run_id, .. } = finding
             {
-                if !decisions
-                    .iter()
-                    .any(|d| matches!(d, RecoveryDecision::DropDangling { run_id: r } if r == run_id))
-                {
+                if !decisions.iter().any(
+                    |d| matches!(d, RecoveryDecision::DropDangling { run_id: r } if r == run_id),
+                ) {
                     decisions.push(RecoveryDecision::DropDangling {
                         run_id: run_id.clone(),
                     });
@@ -342,13 +380,7 @@ impl SessionRuntime {
 
     /// `checkpoint(lane)` — capture a progress marker.
     pub async fn checkpoint(&self, lane: &str) -> SessionResult<LaneCheckpoint> {
-        let leaf_id = self
-            .session
-            .view(lane)
-            .get_leaf_id()
-            .await
-            .ok()
-            .flatten();
+        let leaf_id = self.session.view(lane).get_leaf_id().await.ok().flatten();
         let entries = self
             .session
             .view(lane)
@@ -401,7 +433,9 @@ impl SessionRuntime {
 
 /// Convenience: run recovery for every known lane. Mirrors the TS runtime's
 /// startup sweep.
-pub async fn recover_all_lanes(runtime: &SessionRuntime) -> SessionResult<BTreeMap<String, LaneRecovery>> {
+pub async fn recover_all_lanes(
+    runtime: &SessionRuntime,
+) -> SessionResult<BTreeMap<String, LaneRecovery>> {
     let lanes = runtime.session.get_lanes().await?;
     let mut out = BTreeMap::new();
     for pointer in lanes {
@@ -417,8 +451,56 @@ mod tests {
     use crate::session::memory::{InMemorySessionStorage, SystemClock};
     use crate::session::session::{DefaultIdGenerator, Session};
     use crate::session::types::{
-        LaneRecord, OperationStartedRecord, ProvisionedEntryJSON, RecordBase, WriteDeferredRecord,
-    };    use std::sync::Arc;
+        LaneRecord, OperationFinishedRecord, OperationOutcome, OperationStartedRecord,
+        ProvisionedEntry, ProvisionedEntryJSON, ProvisionedKind, RecordBase, ToolReplay,
+        ToolStartedRecord, WriteDeferredRecord,
+    };
+    use rpi_ai::types::{ToolResultMessage, ToolResultRole};
+    use std::sync::Arc;
+
+    /// An assistant message whose only content is one tool call, so a
+    /// `tool_started` record can reference it by ordinal.
+    fn assistant_with_tool_call(call_id: &str, name: &str) -> rpi_ai::types::AssistantMessage {
+        let mut message =
+            rpi_ai::types::AssistantMessage::empty(rpi_ai::types::Api::Faux, "faux", "faux", 0);
+        message
+            .content
+            .push(rpi_ai::types::Content::ToolCall(rpi_ai::types::ToolCall {
+                kind: rpi_ai::types::ToolCallType,
+                id: call_id.to_string(),
+                name: name.to_string(),
+                arguments: serde_json::json!({ "path": "a.txt" }),
+                thought_signature: None,
+                namespace: None,
+            }));
+        message
+    }
+
+    fn tool_result(call_id: &str, name: &str) -> ToolResultMessage {
+        ToolResultMessage {
+            role: ToolResultRole,
+            tool_call_id: call_id.to_string(),
+            tool_name: name.to_string(),
+            content: Vec::new(),
+            details: None,
+            usage: None,
+            added_tool_names: Vec::new(),
+            is_error: false,
+            timestamp: 0,
+        }
+    }
+
+    async fn finish_operation(session: &Session, run_id: &str, lane: &str) {
+        session
+            .append_record(LaneRecord::OperationFinished(OperationFinishedRecord {
+                base: record_base(&format!("{run_id}-fin"), lane),
+                run_id: run_id.to_string(),
+                outcome: OperationOutcome::Completed,
+                error: None,
+            }))
+            .await
+            .unwrap();
+    }
 
     fn session() -> Session {
         let metadata = crate::session::types::SessionMetadata {
@@ -481,10 +563,9 @@ mod tests {
             report.sole_open_operation().map(|o| o.run_id.as_str()),
             Some("run-1")
         );
-        assert!(report
-            .findings
-            .iter()
-            .any(|f| matches!(f, RecoveryFinding::OrphanedOperation { run_id } if run_id == "run-1")));
+        assert!(report.findings.iter().any(
+            |f| matches!(f, RecoveryFinding::OrphanedOperation { run_id } if run_id == "run-1")
+        ));
 
         let decisions = runtime.reconcile(&report);
         assert_eq!(
@@ -573,17 +654,324 @@ mod tests {
 
         let report = runtime.recover_lane("main").await.unwrap();
         assert_eq!(report.pending_writes.len(), 1);
-        assert_eq!(report.pending_writes[0].provisioned_id.as_deref(), Some("prov-1"));
-        assert!(report
-            .findings
-            .iter()
-            .any(|f| matches!(f, RecoveryFinding::DanglingWrite { run_id } if run_id == "ghost-run")));
+        assert_eq!(
+            report.pending_writes[0].provisioned_id.as_deref(),
+            Some("prov-1")
+        );
+        assert!(report.findings.iter().any(
+            |f| matches!(f, RecoveryFinding::DanglingWrite { run_id } if run_id == "ghost-run")
+        ));
         assert_eq!(
             runtime.reconcile(&report),
             vec![RecoveryDecision::DropDangling {
                 run_id: "ghost-run".to_string()
             }]
         );
+    }
+
+    /// A settled deferred write must not be flagged once its run has closed.
+    ///
+    /// Regression: the old check classified on "is the run still open", so a run
+    /// that completed normally also had no open operation and every one of its
+    /// settled frames was reported as dangling — `is_clean()` could never be
+    /// true for a healthy session, and the real signal (a frame that never
+    /// landed because the process died) was buried in the noise.
+    #[tokio::test]
+    async fn a_settled_write_is_not_flagged_when_its_run_closed() {
+        let session = session();
+        let target: ProvisionedEntryJSON = serde_json::json!({
+            "id": "prov-1",
+            "type": "custom",
+            "customType": "note",
+        });
+        session
+            .append_record(LaneRecord::WriteDeferred(WriteDeferredRecord {
+                base: record_base("wd-1", "main"),
+                run_id: "run-1".to_string(),
+                target: target.clone(),
+            }))
+            .await
+            .unwrap();
+        // The commit landed: the provisioned entry exists.
+        session
+            .append_entry(
+                ProvisionedEntry {
+                    id: "prov-1".to_string(),
+                    kind: ProvisionedKind::Custom {
+                        custom_type: "note".to_string(),
+                        data: None,
+                    },
+                },
+                "main",
+            )
+            .await
+            .unwrap();
+        // The run then closed normally.
+        finish_operation(&session, "run-1", "main").await;
+
+        let runtime = SessionRuntime::new(session);
+        let report = runtime.recover_lane("main").await.unwrap();
+        assert!(
+            report.pending_writes.is_empty(),
+            "a committed write is not pending: {:?}",
+            report.pending_writes
+        );
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| matches!(f, RecoveryFinding::DanglingWrite { .. })),
+            "a committed write must not be reported dangling: {:?}",
+            report.findings
+        );
+        assert!(
+            report.is_clean(),
+            "a healthy completed session must recover clean: {report:?}"
+        );
+    }
+
+    /// The same rule for tool frames: a tool whose result landed is settled.
+    #[tokio::test]
+    async fn a_settled_tool_frame_is_not_flagged_when_its_run_closed() {
+        let session = session();
+        let assistant_id = session
+            .view("main")
+            .append_message(AgentMessage::Assistant(Box::new(assistant_with_tool_call(
+                "call-1", "write",
+            ))))
+            .await
+            .unwrap();
+        session
+            .append_record(LaneRecord::ToolStarted(ToolStartedRecord {
+                base: record_base("ts-1", "main"),
+                run_id: "run-1".to_string(),
+                assistant_entry_id: assistant_id,
+                tool_index: 0,
+                tool_call_id: "call-1".to_string(),
+                tool_name: "write".to_string(),
+                effective_args: serde_json::json!({ "path": "a.txt" }),
+                result_entry_id: "result-1".to_string(),
+                replay: ToolReplay::Never,
+            }))
+            .await
+            .unwrap();
+        // The tool's result landed, then the run closed.
+        session
+            .view("main")
+            .append_message(AgentMessage::ToolResult(Box::new(tool_result(
+                "call-1", "write",
+            ))))
+            .await
+            .unwrap();
+        finish_operation(&session, "run-1", "main").await;
+
+        let runtime = SessionRuntime::new(session);
+        let report = runtime.recover_lane("main").await.unwrap();
+        assert!(
+            report.tool_frames.is_empty(),
+            "a tool whose result landed is not pending: {:?}",
+            report.tool_frames
+        );
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| matches!(f, RecoveryFinding::DanglingToolFrame { .. })),
+            "a settled tool frame must not be reported dangling: {:?}",
+            report.findings
+        );
+        assert!(report.is_clean(), "healthy session: {report:?}");
+    }
+
+    /// A tool frame whose result never landed, for a run that is closed, is the
+    /// real crash signal — and it names the tool so a caller can tell the user
+    /// which side effect is unknown.
+    #[tokio::test]
+    async fn an_unlanded_tool_frame_names_the_tool() {
+        let session = session();
+        let assistant_id = session
+            .view("main")
+            .append_message(AgentMessage::Assistant(Box::new(assistant_with_tool_call(
+                "call-1", "write",
+            ))))
+            .await
+            .unwrap();
+        session
+            .append_record(LaneRecord::ToolStarted(ToolStartedRecord {
+                base: record_base("ts-1", "main"),
+                run_id: "run-1".to_string(),
+                assistant_entry_id: assistant_id,
+                tool_index: 0,
+                tool_call_id: "call-1".to_string(),
+                tool_name: "write".to_string(),
+                effective_args: serde_json::json!({ "path": "a.txt" }),
+                result_entry_id: "result-1".to_string(),
+                replay: ToolReplay::Never,
+            }))
+            .await
+            .unwrap();
+        // No result was ever appended; the run then closed (crash recovery
+        // closes the operation).
+        finish_operation(&session, "run-1", "main").await;
+
+        let runtime = SessionRuntime::new(session);
+        let report = runtime.recover_lane("main").await.unwrap();
+        assert_eq!(report.tool_frames.len(), 1);
+        assert_eq!(
+            report.tool_frames[0].tool_name, "write",
+            "recovery must know which tool's outcome is unknown"
+        );
+        assert!(report.findings.iter().any(|f| matches!(
+            f,
+            RecoveryFinding::DanglingToolFrame { tool_call_id, .. } if tool_call_id == "call-1"
+        )));
+        assert!(!report.is_clean());
+        assert!(
+            !report.is_corrupt(),
+            "an interrupted tool is not corruption"
+        );
+    }
+
+    /// An in-flight tool frame on a still-open run is ordinary progress, not a
+    /// finding: the doctor should only speak up about a run that died.
+    #[tokio::test]
+    async fn an_in_flight_tool_frame_is_not_a_finding() {
+        let session = session();
+        let assistant_id = session
+            .view("main")
+            .append_message(AgentMessage::Assistant(Box::new(assistant_with_tool_call(
+                "call-1", "write",
+            ))))
+            .await
+            .unwrap();
+        open_operation(&session, "run-1", "main").await;
+        session
+            .append_record(LaneRecord::ToolStarted(ToolStartedRecord {
+                base: record_base("ts-1", "main"),
+                run_id: "run-1".to_string(),
+                assistant_entry_id: assistant_id,
+                tool_index: 0,
+                tool_call_id: "call-1".to_string(),
+                tool_name: "write".to_string(),
+                effective_args: serde_json::json!({ "path": "a.txt" }),
+                result_entry_id: "result-1".to_string(),
+                replay: ToolReplay::Never,
+            }))
+            .await
+            .unwrap();
+
+        let runtime = SessionRuntime::new(session);
+        let report = runtime.recover_lane("main").await.unwrap();
+        assert_eq!(report.tool_frames.len(), 1, "still tracked as in flight");
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| matches!(f, RecoveryFinding::DanglingToolFrame { .. })),
+            "a running tool is not dangling: {:?}",
+            report.findings
+        );
+    }
+
+    /// The intent records a compaction step writes must be a legal record log.
+    ///
+    /// This is the invariant that matters for the write side: the reducer
+    /// deep-compares a committed entry against the `write_deferred` target it was
+    /// provisioned with, and rejects a `step_attempt` whose series or result are
+    /// inconsistent. Writing records the validator would reject would be worse
+    /// than writing none, because a corrupt log blocks recovery outright.
+    #[tokio::test]
+    async fn compaction_intent_records_validate_against_the_reducer() {
+        use crate::session::reducer::{validate_record_log, RecordLogSlice};
+        use crate::session::types::{
+            provisioned_into_entry, CompactionReason, OperationStartedRecord, ProvisionedEntry,
+            ProvisionedKind, StepAttemptRecord, StepKind,
+        };
+
+        let session = session();
+        let lane = "main";
+        let run_id = "run-1";
+        open_operation(&session, run_id, lane).await;
+
+        // Exactly what `AgentHarness::persist_compaction_entry` builds.
+        let entry = ProvisionedEntry {
+            id: "compaction-1".to_string(),
+            kind: ProvisionedKind::Compaction {
+                summary: "summarized".to_string(),
+                retained_tail: Vec::new(),
+                tokens_before: 1234,
+                details: None,
+                usage: None,
+            },
+        };
+        let target = crate::session::reducer::entry_provisioned_json(&provisioned_into_entry(
+            entry.clone(),
+            0,
+            None,
+            0,
+        ));
+        session
+            .append_record(LaneRecord::WriteDeferred(WriteDeferredRecord {
+                base: record_base("wd-1", lane),
+                run_id: run_id.to_string(),
+                target,
+            }))
+            .await
+            .unwrap();
+        session.append_entry(entry, lane).await.unwrap();
+        session
+            .append_record(LaneRecord::StepAttempt(StepAttemptRecord {
+                base: record_base("sa-1", lane),
+                run_id: run_id.to_string(),
+                step: StepKind::Compaction,
+                attempt: 1,
+                result_entry_id: "compaction-1".to_string(),
+                compaction_reason: Some(CompactionReason::Threshold),
+            }))
+            .await
+            .unwrap();
+
+        // The reducer accepts the log as a legal product of the record protocol.
+        let slice = RecordLogSlice {
+            lane: lane.to_string(),
+            open_operations: vec![OperationStartedRecord {
+                base: record_base(run_id, lane),
+                source_leaf_id: None,
+                intent: OperationIntent::Run {
+                    original_prompt: Vec::new(),
+                    initial_messages: Vec::new(),
+                    system_prompt_override: None,
+                    resume_data: None,
+                },
+            }],
+            records: session
+                .find_records(&RecordQuery {
+                    lane: Some(lane.to_string()),
+                    order: Some(EntryOrder::OldestFirst),
+                    ..Default::default()
+                })
+                .await
+                .unwrap(),
+            entries: session
+                .find_entries(&EntryQuery {
+                    order: Some(EntryOrder::OldestFirst),
+                    ..Default::default()
+                })
+                .await
+                .unwrap(),
+        };
+        validate_record_log(&slice).expect("the intent records must form a legal record log");
+
+        // And recovery sees the write as settled, not as a dangling frame.
+        finish_operation(&session, run_id, lane).await;
+        let runtime = SessionRuntime::new(session);
+        let report = runtime.recover_lane(lane).await.unwrap();
+        assert!(
+            report.pending_writes.is_empty(),
+            "a committed deferred write is settled: {:?}",
+            report.pending_writes
+        );
+        assert!(report.is_clean(), "healthy session: {report:?}");
     }
 
     #[tokio::test]

@@ -117,7 +117,11 @@ impl SessionSearch {
         }
 
         // Sort by score (highest first)
-        hits.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         // Apply limit
         if let Some(limit) = options.limit {
@@ -207,9 +211,7 @@ impl SessionSearch {
                 }
                 parts.join("\n")
             }
-            AgentMessage::Custom(c) => {
-                serde_json::to_string(&c.data).unwrap_or_default()
-            }
+            AgentMessage::Custom(c) => serde_json::to_string(&c.data).unwrap_or_default(),
         }
     }
 
@@ -274,8 +276,8 @@ impl Default for SessionSearch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rpi_ai::types::{AssistantMessage, TextContent, UserContent, UserMessage};
     use rpi_ai::types::TextContentType;
+    use rpi_ai::types::{AssistantMessage, TextContent, UserContent, UserMessage};
 
     use crate::session::types::{EntryBase, MessageEntry};
 

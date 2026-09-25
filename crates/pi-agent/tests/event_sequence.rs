@@ -273,3 +273,90 @@ async fn emits_message_update_events_on_streaming_deltas() {
         "expected at least 4 message_update events (text_start + 2 deltas + text_end), got {update_count}"
     );
 }
+
+/// `MessageUpdate` carries the streaming partial as a *shared* snapshot, so the
+/// loop must forward the provider's `Arc` rather than deep-cloning the whole
+/// growing message once per delta. That clone (plus one in the loop's context
+/// update, plus one per consumer) is what made a long stream quadratic in the
+/// output length — see `docs/llm-repetition-forensics.md` §十.
+///
+/// Pointer identity is the precise assertion: it can only hold if no copy
+/// happened anywhere between the provider and the event.
+#[tokio::test]
+async fn message_update_forwards_the_provider_snapshot_without_copying() {
+    use rpi_ai::event_stream::create_assistant_message_event_stream;
+    use rpi_ai::types::{AssistantMessage, AssistantMessageEvent, DoneReason};
+
+    let stream_fn = rpi_agent::stream_fn(move |_model, _ctx, _opts| {
+        let (mut prod, stream) = create_assistant_message_event_stream();
+        tokio::spawn(async move {
+            let mut partial = AssistantMessage::empty(
+                rpi_ai::types::Api::Other("openai-responses".into()),
+                "mock",
+                "mock",
+                0,
+            );
+            partial.content.push(rpi_ai::types::Content::text(""));
+            // One allocation reused for every event, exactly like a provider
+            // that builds the snapshot once per emitted (batched) delta.
+            let snapshot = Arc::new(partial.clone());
+            prod.push(AssistantMessageEvent::Start {
+                partial: Arc::clone(&snapshot),
+            });
+            for delta in ["Hi ", "there!"] {
+                prod.push(AssistantMessageEvent::TextDelta {
+                    content_index: 0,
+                    delta: delta.into(),
+                    partial: Arc::clone(&snapshot),
+                });
+            }
+            let mut final_msg = (*snapshot).clone();
+            final_msg.stop_reason = StopReason::Stop;
+            final_msg.content.clear();
+            final_msg
+                .content
+                .push(rpi_ai::types::Content::text("Hi there!"));
+            prod.push(AssistantMessageEvent::Done {
+                reason: DoneReason::Stop,
+                message: final_msg,
+            });
+        });
+        stream
+    });
+
+    let (events, _new_messages) = run_and_collect(
+        vec![user_message("Hello")],
+        AgentContext::default(),
+        base_config(),
+        stream_fn,
+    )
+    .await;
+
+    let mut checked = 0usize;
+    for event in &events {
+        let AgentEvent::MessageUpdate {
+            message,
+            assistant_message_event,
+        } = event
+        else {
+            continue;
+        };
+        let partial = match assistant_message_event {
+            AssistantMessageEvent::TextDelta { partial, .. }
+            | AssistantMessageEvent::TextStart { partial, .. }
+            | AssistantMessageEvent::TextEnd { partial, .. }
+            | AssistantMessageEvent::ThinkingDelta { partial, .. }
+            | AssistantMessageEvent::ToolCallDelta { partial, .. } => partial,
+            _ => continue,
+        };
+        assert!(
+            Arc::ptr_eq(message, partial),
+            "MessageUpdate must forward the provider's snapshot, not copy it"
+        );
+        checked += 1;
+    }
+    assert!(
+        checked >= 2,
+        "expected at least the two text deltas to be checked, got {checked}"
+    );
+}

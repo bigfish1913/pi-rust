@@ -1,0 +1,201 @@
+    /// A settled deferred write must not be flagged once its run has closed.
+    ///
+    /// Regression: the old check classified on "is the run still open", so a run
+    /// that completed normally also had no open operation and every one of its
+    /// settled frames was reported as dangling — `is_clean()` could never be
+    /// true for a healthy session, and the real signal (a frame that never
+    /// landed because the process died) was buried in the noise.
+    #[tokio::test]
+    async fn a_settled_write_is_not_flagged_when_its_run_closed() {
+        let session = session();
+        let target: ProvisionedEntryJSON = serde_json::json!({
+            "id": "prov-1",
+            "type": "custom",
+            "customType": "note",
+        });
+        session
+            .append_record(LaneRecord::WriteDeferred(WriteDeferredRecord {
+                base: record_base("wd-1", "main"),
+                run_id: "run-1".to_string(),
+                target: target.clone(),
+            }))
+            .await
+            .unwrap();
+        // The commit landed: the provisioned entry exists.
+        session
+            .append_entry(
+                ProvisionedEntry {
+                    id: "prov-1".to_string(),
+                    kind: ProvisionedKind::Custom {
+                        custom_type: "note".to_string(),
+                        data: None,
+                    },
+                },
+                "main",
+            )
+            .await
+            .unwrap();
+        // The run then closed normally.
+        finish_operation(&session, "run-1", "main").await;
+
+        let runtime = SessionRuntime::new(session);
+        let report = runtime.recover_lane("main").await.unwrap();
+        assert!(
+            report.pending_writes.is_empty(),
+            "a committed write is not pending: {:?}",
+            report.pending_writes
+        );
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| matches!(f, RecoveryFinding::DanglingWrite { .. })),
+            "a committed write must not be reported dangling: {:?}",
+            report.findings
+        );
+        assert!(
+            report.is_clean(),
+            "a healthy completed session must recover clean: {report:?}"
+        );
+    }
+
+    /// The same rule for tool frames: a tool whose result landed is settled.
+    #[tokio::test]
+    async fn a_settled_tool_frame_is_not_flagged_when_its_run_closed() {
+        let session = session();
+        let assistant_id = session
+            .view("main")
+            .append_message(AgentMessage::Assistant(Box::new(assistant_with_tool_call(
+                "call-1", "write",
+            ))))
+            .await
+            .unwrap();
+        session
+            .append_record(LaneRecord::ToolStarted(ToolStartedRecord {
+                base: record_base("ts-1", "main"),
+                run_id: "run-1".to_string(),
+                assistant_entry_id: assistant_id,
+                tool_index: 0,
+                tool_call_id: "call-1".to_string(),
+                tool_name: "write".to_string(),
+                effective_args: serde_json::json!({ "path": "a.txt" }),
+                result_entry_id: "result-1".to_string(),
+                replay: ToolReplay::Never,
+            }))
+            .await
+            .unwrap();
+        // The tool's result landed, then the run closed.
+        session
+            .view("main")
+            .append_message(AgentMessage::ToolResult(Box::new(tool_result(
+                "call-1", "write",
+            ))))
+            .await
+            .unwrap();
+        finish_operation(&session, "run-1", "main").await;
+
+        let runtime = SessionRuntime::new(session);
+        let report = runtime.recover_lane("main").await.unwrap();
+        assert!(
+            report.tool_frames.is_empty(),
+            "a tool whose result landed is not pending: {:?}",
+            report.tool_frames
+        );
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| matches!(f, RecoveryFinding::DanglingToolFrame { .. })),
+            "a settled tool frame must not be reported dangling: {:?}",
+            report.findings
+        );
+        assert!(report.is_clean(), "healthy session: {report:?}");
+    }
+
+    /// A tool frame whose result never landed, for a run that is closed, is the
+    /// real crash signal — and it names the tool so a caller can tell the user
+    /// which side effect is unknown.
+    #[tokio::test]
+    async fn an_unlanded_tool_frame_names_the_tool() {
+        let session = session();
+        let assistant_id = session
+            .view("main")
+            .append_message(AgentMessage::Assistant(Box::new(assistant_with_tool_call(
+                "call-1", "write",
+            ))))
+            .await
+            .unwrap();
+        session
+            .append_record(LaneRecord::ToolStarted(ToolStartedRecord {
+                base: record_base("ts-1", "main"),
+                run_id: "run-1".to_string(),
+                assistant_entry_id: assistant_id,
+                tool_index: 0,
+                tool_call_id: "call-1".to_string(),
+                tool_name: "write".to_string(),
+                effective_args: serde_json::json!({ "path": "a.txt" }),
+                result_entry_id: "result-1".to_string(),
+                replay: ToolReplay::Never,
+            }))
+            .await
+            .unwrap();
+        // No result was ever appended; the run then closed (crash recovery
+        // closes the operation).
+        finish_operation(&session, "run-1", "main").await;
+
+        let runtime = SessionRuntime::new(session);
+        let report = runtime.recover_lane("main").await.unwrap();
+        assert_eq!(report.tool_frames.len(), 1);
+        assert_eq!(
+            report.tool_frames[0].tool_name, "write",
+            "recovery must know which tool's outcome is unknown"
+        );
+        assert!(report.findings.iter().any(|f| matches!(
+            f,
+            RecoveryFinding::DanglingToolFrame { tool_call_id, .. } if tool_call_id == "call-1"
+        )));
+        assert!(!report.is_clean());
+        assert!(!report.is_corrupt(), "an interrupted tool is not corruption");
+    }
+
+    /// An in-flight tool frame on a still-open run is ordinary progress, not a
+    /// finding: the doctor should only speak up about a run that died.
+    #[tokio::test]
+    async fn an_in_flight_tool_frame_is_not_a_finding() {
+        let session = session();
+        let assistant_id = session
+            .view("main")
+            .append_message(AgentMessage::Assistant(Box::new(assistant_with_tool_call(
+                "call-1", "write",
+            ))))
+            .await
+            .unwrap();
+        open_operation(&session, "run-1", "main").await;
+        session
+            .append_record(LaneRecord::ToolStarted(ToolStartedRecord {
+                base: record_base("ts-1", "main"),
+                run_id: "run-1".to_string(),
+                assistant_entry_id: assistant_id,
+                tool_index: 0,
+                tool_call_id: "call-1".to_string(),
+                tool_name: "write".to_string(),
+                effective_args: serde_json::json!({ "path": "a.txt" }),
+                result_entry_id: "result-1".to_string(),
+                replay: ToolReplay::Never,
+            }))
+            .await
+            .unwrap();
+
+        let runtime = SessionRuntime::new(session);
+        let report = runtime.recover_lane("main").await.unwrap();
+        assert_eq!(report.tool_frames.len(), 1, "still tracked as in flight");
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| matches!(f, RecoveryFinding::DanglingToolFrame { .. })),
+            "a running tool is not dangling: {:?}",
+            report.findings
+        );
+    }
+

@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use serde_json::{json, Map, Value};
@@ -19,6 +20,7 @@ use crate::providers::anthropic::cost::calculate_cost;
 use crate::providers::anthropic::json_parse::parse_streaming_json;
 use crate::providers::anthropic::retry::retry_provider_request;
 use crate::providers::anthropic::sse::SseEventStream;
+use crate::providers::{DELTA_FLUSH_BYTES, DELTA_FLUSH_INTERVAL};
 use crate::types::{
     Api, AssistantMessage, AssistantMessageEvent, Content, Context, DoneReason, ErrorReason,
     InputModality, Message, StopReason, ThinkingContent, ThinkingContentType, ThinkingLevel,
@@ -619,6 +621,11 @@ struct StreamState {
     finish_reason: Option<DoneReason>,
     finish_error: Option<String>,
     started: bool,
+    /// Text/thinking deltas accumulated but not yet emitted as one event.
+    pending_text: String,
+    pending_thinking: String,
+    /// When a batched delta was last emitted, for [`DELTA_FLUSH_INTERVAL`].
+    last_flush: Instant,
 }
 
 impl StreamState {
@@ -636,7 +643,57 @@ impl StreamState {
             finish_reason: None,
             finish_error: None,
             started: false,
+            pending_text: String::new(),
+            pending_thinking: String::new(),
+            last_flush: Instant::now(),
         }
+    }
+
+    /// Whether a pending batch should be emitted now: either it has grown past
+    /// [`DELTA_FLUSH_BYTES`], or it has been waiting [`DELTA_FLUSH_INTERVAL`].
+    fn should_flush(&self, pending: &str) -> bool {
+        pending.len() >= DELTA_FLUSH_BYTES || self.last_flush.elapsed() >= DELTA_FLUSH_INTERVAL
+    }
+
+    /// Emit whatever text/thinking is batched. Called at every channel boundary
+    /// so no delta is ever dropped or reordered.
+    fn flush_pending(&mut self, producer: &mut AssistantMessageEventStreamProducer) {
+        self.flush_text(producer);
+        self.flush_thinking(producer);
+    }
+
+    fn flush_text(&mut self, producer: &mut AssistantMessageEventStreamProducer) {
+        if self.pending_text.is_empty() {
+            return;
+        }
+        let Some(index) = self.text_index else {
+            self.pending_text.clear();
+            return;
+        };
+        let delta = std::mem::take(&mut self.pending_text);
+        self.last_flush = Instant::now();
+        producer.push(AssistantMessageEvent::TextDelta {
+            content_index: index,
+            delta,
+            partial: Arc::new(self.output.clone()),
+        });
+    }
+
+    fn flush_thinking(&mut self, producer: &mut AssistantMessageEventStreamProducer) {
+        if self.pending_thinking.is_empty() {
+            return;
+        }
+        let Some(index) = self.thinking_index else {
+            self.pending_thinking.clear();
+            return;
+        };
+        let delta = std::mem::take(&mut self.pending_thinking);
+        self.last_flush = Instant::now();
+        producer.push(AssistantMessageEvent::ThinkingDelta {
+            content_index: index,
+            delta,
+            partial: Arc::new(self.output.clone()),
+        });
     }
 
     fn start(&mut self, producer: &mut AssistantMessageEventStreamProducer) {
@@ -723,14 +780,18 @@ impl StreamState {
         if let Some(Content::Text(text)) = self.output.content.get_mut(index) {
             text.text.push_str(delta);
         }
-        producer.push(AssistantMessageEvent::TextDelta {
-            content_index: index,
-            delta: delta.to_string(),
-            partial: Arc::new(self.output.clone()),
-        });
+        // Batch: `partial` is a full message clone per event, so one event per
+        // SSE chunk makes a long stream quadratic. See `DELTA_FLUSH_BYTES`.
+        self.pending_text.push_str(delta);
+        if self.should_flush(&self.pending_text) {
+            self.flush_text(producer);
+        }
     }
 
     fn push_thinking(&mut self, producer: &mut AssistantMessageEventStreamProducer, delta: &str) {
+        // Keep channel order strict: text already streamed must be emitted before
+        // the first thinking delta of a new block.
+        self.flush_text(producer);
         let index = match self.thinking_index {
             Some(index) => index,
             None => {
@@ -752,11 +813,10 @@ impl StreamState {
         if let Some(Content::Thinking(thinking)) = self.output.content.get_mut(index) {
             thinking.thinking.push_str(delta);
         }
-        producer.push(AssistantMessageEvent::ThinkingDelta {
-            content_index: index,
-            delta: delta.to_string(),
-            partial: Arc::new(self.output.clone()),
-        });
+        self.pending_thinking.push_str(delta);
+        if self.should_flush(&self.pending_thinking) {
+            self.flush_thinking(producer);
+        }
     }
 
     fn push_tool_delta(
@@ -764,6 +824,9 @@ impl StreamState {
         producer: &mut AssistantMessageEventStreamProducer,
         value: &Value,
     ) {
+        // A tool-call block starts a new channel; flush what is batched so the
+        // consumer never sees tool events before the text that preceded them.
+        self.flush_pending(producer);
         let wire_index = value.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
         if !self.tools.contains_key(&wire_index) {
             let content_index = self.output.content.len();
@@ -825,6 +888,10 @@ impl StreamState {
     }
 
     fn finish(&mut self, producer: &mut AssistantMessageEventStreamProducer, model: &Model) {
+        // Terminal boundary: emit the last batched delta before the `*End`
+        // events, otherwise the tail of a short final chunk would be visible in
+        // the final message but never in the delta stream.
+        self.flush_pending(producer);
         if let Some(index) = self.text_index {
             let content = match self.output.content.get(index) {
                 Some(Content::Text(text)) => text.text.clone(),
@@ -904,6 +971,9 @@ impl StreamState {
             StopReason::Error
         };
         self.output.error_message = Some(message);
+        // Surface whatever streamed before the failure; the batched tail would
+        // otherwise be lost from the delta stream.
+        self.flush_pending(producer);
         producer.push(AssistantMessageEvent::Error {
             reason: if aborted {
                 ErrorReason::Aborted
@@ -966,9 +1036,236 @@ mod tests {
     use super::*;
     use crate::model::OpenaiCompletionsCompat;
     use crate::types::{
-        AssistantMessage, ImageContent, ImageContentType, Message, StopReason, Tool,
-        ToolResultMessage, ToolResultRole, UserMessage,
+        AssistantMessage, AssistantMessageEvent, ImageContent, ImageContentType, Message,
+        StopReason, Tool, ToolResultMessage, ToolResultRole, UserMessage,
     };
+    use std::time::Duration;
+
+    /// Drive `apply_chunk` with a plain content delta, the shape the SSE mapper
+    /// produces for a mid-stream text chunk.
+    fn text_chunk(delta: &str) -> Value {
+        json!({ "choices": [{ "delta": { "content": delta }, "finish_reason": null }] })
+    }
+
+    fn thinking_chunk(delta: &str) -> Value {
+        json!({ "choices": [{ "delta": { "reasoning_content": delta }, "finish_reason": null }] })
+    }
+
+    /// The final chunk the provider sends before `[DONE]`. Without a
+    /// `finish_reason`, `finish()` synthesizes an error ("Stream ended without
+    /// finish_reason") rather than a `Done`.
+    fn stop_chunk() -> Value {
+        json!({ "choices": [{ "delta": {}, "finish_reason": "stop" }] })
+    }
+
+    /// Drain every event the producer pushed. `next()` yields `None` after the
+    /// terminal `Done`/`Error`, so this always terminates.
+    fn drain(stream: &mut AssistantMessageEventStream) -> Vec<AssistantMessageEvent> {
+        let mut events = Vec::new();
+        while let Some(event) = futures::executor::block_on(stream.next()) {
+            events.push(event);
+        }
+        events
+    }
+
+    fn text_deltas(events: &[AssistantMessageEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AssistantMessageEvent::TextDelta { delta, .. } => Some(delta.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_slow_stream_flushes_on_the_interval_not_the_byte_count() {
+        // A pure byte threshold would hide output for
+        // `DELTA_FLUSH_BYTES / rate`; a model emitting one character per 100ms
+        // would show nothing for six seconds. Ageing `last_flush` by more than
+        // the interval stands in for that elapsed time, so this stays
+        // deterministic instead of sleeping.
+        //
+        // `drain` is not used mid-test on purpose: `next()` only yields `None`
+        // after a terminal event, so draining before `finish` would block.
+        let model = model();
+        let (mut producer, mut stream) = create_assistant_message_event_stream();
+        let mut state = StreamState::new(&model);
+        state.start(&mut producer);
+
+        state.apply_chunk(&mut producer, &text_chunk("a"));
+        assert_eq!(
+            state.pending_text, "a",
+            "a single byte well inside the interval must stay batched (no event)"
+        );
+
+        // Same single byte, but the batch is now older than the interval.
+        state.last_flush = Instant::now()
+            .checked_sub(DELTA_FLUSH_INTERVAL + Duration::from_millis(5))
+            .expect("instant arithmetic");
+        state.apply_chunk(&mut producer, &text_chunk("b"));
+        assert!(
+            state.pending_text.is_empty(),
+            "an aged batch must be emitted even though it is under the byte threshold"
+        );
+
+        state.apply_chunk(&mut producer, &stop_chunk());
+        state.finish(&mut producer, &model);
+        // Flushing early must not lose or duplicate anything.
+        assert_eq!(text_deltas(&drain(&mut stream)), vec!["ab".to_string()]);
+    }
+
+    #[test]
+    fn event_count_is_bounded_by_the_batch_size_not_the_message_length() {
+        // The regression this guards: every event carries a full
+        // `Arc<AssistantMessage>` snapshot, so one event per SSE chunk made a
+        // long stream quadratic (measured 500 deltas 1.1ms → 8000 deltas 105ms).
+        // The event count is the cost driver, so bound *it* deterministically
+        // rather than asserting on wall-clock time.
+        let model = model();
+        let (mut producer, mut stream) = create_assistant_message_event_stream();
+        let mut state = StreamState::new(&model);
+        state.start(&mut producer);
+
+        let total = 8000usize;
+        for _ in 0..total {
+            state.apply_chunk(&mut producer, &text_chunk("x"));
+        }
+        state.finish(&mut producer, &model);
+
+        let events = drain(&mut stream);
+        let batches = text_deltas(&events).len();
+        assert!(
+            batches <= total / DELTA_FLUSH_BYTES + 5,
+            "{total} deltas of 1 byte must coalesce into ~{}/{DELTA_FLUSH_BYTES} events, got {batches}",
+            total
+        );
+        // …and the batching must not drop a single byte.
+        assert_eq!(text_deltas(&events).join("").len(), total);
+    }
+
+    #[test]
+    fn batched_text_is_flushed_before_text_end_and_matches_the_final_message() {
+        let model = model();
+        let (mut producer, mut stream) = create_assistant_message_event_stream();
+        let mut state = StreamState::new(&model);
+        state.start(&mut producer);
+
+        // Deliberately shorter than the flush threshold: the tail must still
+        // reach the consumer, via the boundary flush in `finish`.
+        let short = "hi";
+        assert!(short.len() < DELTA_FLUSH_BYTES);
+        state.apply_chunk(&mut producer, &text_chunk(short));
+        state.apply_chunk(&mut producer, &stop_chunk());
+        state.finish(&mut producer, &model);
+
+        let events = drain(&mut stream);
+        let deltas = text_deltas(&events);
+        assert_eq!(deltas, vec![short.to_string()]);
+
+        // Ordering: the delta precedes the `TextEnd` that closes the block.
+        let delta_at = events
+            .iter()
+            .position(|e| matches!(e, AssistantMessageEvent::TextDelta { .. }))
+            .expect("a TextDelta was emitted");
+        let end_at = events
+            .iter()
+            .position(|e| matches!(e, AssistantMessageEvent::TextEnd { .. }))
+            .expect("a TextEnd was emitted");
+        assert!(delta_at < end_at, "delta must precede TextEnd");
+
+        // And the delta stream agrees with the finalized message.
+        assert!(
+            matches!(&state.output.content[0], Content::Text(t) if t.text == short),
+            "final message must hold the same text"
+        );
+        assert!(matches!(
+            events.last(),
+            Some(AssistantMessageEvent::Done { .. })
+        ));
+    }
+
+    #[test]
+    fn channel_switch_flushes_text_before_the_thinking_block() {
+        let model = model();
+        let (mut producer, mut stream) = create_assistant_message_event_stream();
+        let mut state = StreamState::new(&model);
+        state.start(&mut producer);
+
+        state.apply_chunk(&mut producer, &text_chunk("abc"));
+        state.apply_chunk(&mut producer, &thinking_chunk("reasoning"));
+        state.finish(&mut producer, &model);
+
+        let events = drain(&mut stream);
+        let delta_at = events
+            .iter()
+            .position(|e| matches!(e, AssistantMessageEvent::TextDelta { .. }))
+            .expect("text must be flushed when the channel switches");
+        let thinking_at = events
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    AssistantMessageEvent::ThinkingStart { .. }
+                        | AssistantMessageEvent::ThinkingDelta { .. }
+                )
+            })
+            .expect("a thinking event was emitted");
+        assert!(
+            delta_at < thinking_at,
+            "buffered text must be emitted before the first thinking event"
+        );
+    }
+
+    #[test]
+    fn thinking_deltas_are_batched_losslessly_too() {
+        let model = model();
+        let (mut producer, mut stream) = create_assistant_message_event_stream();
+        let mut state = StreamState::new(&model);
+        state.start(&mut producer);
+
+        let total = 500usize;
+        for _ in 0..total {
+            state.apply_chunk(&mut producer, &thinking_chunk("y"));
+        }
+        state.finish(&mut producer, &model);
+
+        let events = drain(&mut stream);
+        let joined: String = events
+            .iter()
+            .filter_map(|event| match event {
+                AssistantMessageEvent::ThinkingDelta { delta, .. } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(joined.len(), total, "no thinking byte may be dropped");
+        let thinking_events = events
+            .iter()
+            .filter(|e| matches!(e, AssistantMessageEvent::ThinkingDelta { .. }))
+            .count();
+        assert!(
+            thinking_events <= total / DELTA_FLUSH_BYTES + 5,
+            "thinking deltas must coalesce too, got {thinking_events}"
+        );
+    }
+
+    #[test]
+    fn an_error_flushes_batched_text_before_the_terminal_event() {
+        let model = model();
+        let (mut producer, mut stream) = create_assistant_message_event_stream();
+        let mut state = StreamState::new(&model);
+        state.start(&mut producer);
+
+        state.apply_chunk(&mut producer, &text_chunk("partial"));
+        state.error(&mut producer, "boom".to_string(), false);
+
+        let events = drain(&mut stream);
+        assert_eq!(text_deltas(&events), vec!["partial".to_string()]);
+        assert!(matches!(
+            events.last(),
+            Some(AssistantMessageEvent::Error { .. })
+        ));
+    }
 
     fn model() -> Model {
         let mut model = Model::new(

@@ -438,14 +438,19 @@ async fn stream_assistant_response(
             | AssistantMessageEvent::ToolCallDelta { partial, .. }
             | AssistantMessageEvent::ToolCallEnd { partial, .. } => {
                 if added_partial {
-                    let am = AgentMessage::Assistant(Box::new((**partial).clone()));
-                    if let Some(last) = context.messages.last_mut() {
-                        *last = am.clone();
-                    }
+                    // No `context.messages` update here: nothing reads it between
+                    // deltas (`transform_context`/`convert_to_llm` ran before this
+                    // loop), and `Start` already pushed the slot while the
+                    // terminal arm replaces it with the finalized message. Keeping
+                    // the old `*last = am.clone()` copied the whole growing message
+                    // once per delta for no observable effect.
                     emit_event(
                         emit,
                         AgentEvent::MessageUpdate {
-                            message: am,
+                            // `Arc` bump, not a deep clone: this fires once per
+                            // streaming delta, and the provider already built the
+                            // snapshot it hands us.
+                            message: Arc::clone(partial),
                             assistant_message_event: event.clone(),
                         },
                     )

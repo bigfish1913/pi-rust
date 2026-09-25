@@ -192,20 +192,24 @@ mod tests {
         let s1 = Arc::clone(&started);
         let b1 = Arc::clone(&barrier);
         let op1 = tokio::spawn(async move {
-            queue1.enqueue("key-a".to_string(), move || async move {
-                s1.fetch_add(1, Ordering::SeqCst);
-                b1.wait().await;
-            }).await
+            queue1
+                .enqueue("key-a".to_string(), move || async move {
+                    s1.fetch_add(1, Ordering::SeqCst);
+                    b1.wait().await;
+                })
+                .await
         });
 
         let queue2 = queue.clone();
         let s2 = Arc::clone(&started);
         let b2 = Arc::clone(&barrier);
         let op2 = tokio::spawn(async move {
-            queue2.enqueue("key-b".to_string(), move || async move {
-                s2.fetch_add(1, Ordering::SeqCst);
-                b2.wait().await;
-            }).await
+            queue2
+                .enqueue("key-b".to_string(), move || async move {
+                    s2.fetch_add(1, Ordering::SeqCst);
+                    b2.wait().await;
+                })
+                .await
         });
 
         // Both should complete (they run concurrently on different keys)

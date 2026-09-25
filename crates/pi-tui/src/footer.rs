@@ -345,7 +345,7 @@ impl FooterComponent {
         let context_display = match context_percent {
             Some(p) => format!("{p:.1}%/{}{auto_indicator}", format_tokens(context_window)),
             None if context_window > 0 => {
-                format!("?/{}{auto_indicator}", format_tokens(context_window))
+                format!("0.0%/{}{auto_indicator}", format_tokens(context_window))
             }
             None => String::new(),
         };
@@ -572,9 +572,9 @@ mod tests {
     fn context_badge_derives_percent_from_reported_tokens() {
         let footer = FooterComponent::new();
         footer.set_context_window(512_000);
-        // No response yet → unknown, the `?` badge native pi shows.
+        // No response yet → shows 0.0% initially.
         let stats = strip_ansi(&footer.render(120).join("\n"));
-        assert!(stats.contains("?/512k"), "stats: {stats}");
+        assert!(stats.contains("0.0%/512k"), "stats: {stats}");
 
         // A reported token count fills in the percent against the window.
         footer.set_context_tokens(Some(256_000));
@@ -586,10 +586,10 @@ mod tests {
         let stats = strip_ansi(&footer.render(120).join("\n"));
         assert!(stats.contains("200.0%/128k"), "stats: {stats}");
 
-        // `None` (e.g. right after a compaction) resets to `?`.
+        // `None` (e.g. right after a compaction) resets to 0.0%.
         footer.set_context_tokens(None);
         let stats = strip_ansi(&footer.render(120).join("\n"));
-        assert!(stats.contains("?/128k"), "stats: {stats}");
+        assert!(stats.contains("0.0%/128k"), "stats: {stats}");
     }
 
     #[test]

@@ -32,7 +32,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use rpi_agent::{AgentEmitter, AgentEvent, CollectorEmitter};
+use rpi_agent::{AgentEmitter, AgentEvent, AgentMessage, CollectorEmitter};
 use rpi_ai::providers::faux::{faux_assistant_message, FauxProvider, FauxScript, FauxStep};
 use rpi_ai::Provider;
 use rpi_harness::agent_harness::{AgentHarness, AgentLane, HarnessRunOutcome};
@@ -796,5 +796,905 @@ async fn directly_sent_prompt_emits_no_user_message_start() {
             }
         )),
         "assistant MessageStart must still fire"
+    );
+}
+
+/// The loop's only other exit is "the model stopped asking for tools", which
+/// nothing bounds — one observed session ran 112 turns / 867 s in a single run
+/// (`docs/llm-repetition-forensics.md` §二). The run budget is the backstop:
+/// when a model keeps emitting tool calls forever, the run must end on a known
+/// ceiling and say so, so a truncated task is never mistaken for a finished one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn run_budget_stops_a_looping_run_and_records_why() {
+    // A model that never stops asking for tools: far more scripted turns than
+    // the ceiling, so only the guard can end this run.
+    let script = FauxScript::new();
+    let step = || FauxStep::tool_call("bash", serde_json::json!({ "command": "echo tick" }));
+    script.set_responses((0..200).map(|_| step()).collect());
+    let (harness, provider, _env) = harness_with(script).await;
+
+    let result = harness
+        .prompt_text("loop until the budget stops you", vec![])
+        .await
+        .expect("the run must terminate, not spin");
+
+    // It terminated "Completed" (the loop's normal exit path) — which is exactly
+    // why the reason has to be recorded separately.
+    assert!(
+        matches!(result.outcome, HarnessRunOutcome::Completed { .. }),
+        "expected a Completed outcome, got {:?}",
+        result.outcome
+    );
+
+    let calls = provider
+        .state()
+        .call_count
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let ceiling = rpi_harness::run_budget::DEFAULT_MAX_TURNS_PER_RUN as usize;
+    assert_eq!(
+        calls, ceiling,
+        "the run must stop exactly at the turn ceiling, not run on"
+    );
+
+    // The stop reason is on the lane, rendered like any other custom message.
+    let leaf = harness
+        .session()
+        .get_leaf_id()
+        .await
+        .expect("leaf")
+        .expect("leaf present");
+    let path = harness
+        .session()
+        .find_entries_on_branch(
+            &EntryQuery {
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            },
+            &BranchBounds {
+                start: Some(leaf),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("branch path");
+    let notices: Vec<String> = path
+        .iter()
+        .filter_map(|entry| match entry {
+            rpi_harness::session::types::Entry::Message(message_entry) => {
+                match &message_entry.message {
+                    rpi_agent::AgentMessage::Custom(custom)
+                        if custom.role == rpi_harness::messages::CUSTOM_ROLE =>
+                    {
+                        Some(
+                            custom
+                                .content
+                                .iter()
+                                .filter_map(|content| match content {
+                                    rpi_ai::types::Content::Text(text) => Some(text.text.clone()),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        )
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .filter(|text| text.contains("Stopped after"))
+        .collect();
+    assert_eq!(
+        notices.len(),
+        1,
+        "exactly one budget notice must be recorded; got {notices:?}"
+    );
+    assert!(
+        notices[0].contains(&ceiling.to_string()) && notices[0].contains("unfinished"),
+        "the notice must name the budget and warn the work may be incomplete: {}",
+        notices[0]
+    );
+}
+
+/// A crash mid-stream must not cost the whole run.
+///
+/// Before frame progress, a run persisted nothing until it finished, so killing
+/// the process after minutes of work left only the user's prompt
+/// (`docs/llm-repetition-forensics.md` §十一). Frames are appended to the record
+/// stream as they arrive, so the committed prefix can be replayed.
+///
+/// The crash is simulated faithfully: the run future is dropped mid-stream by
+/// aborting its task, which is exactly what process death does to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crashed_run_can_be_salvaged_from_its_committed_frames() {
+    // A deliberately slow stream: enough tokens that the run is still streaming
+    // when we abort it, so the crash lands mid-message.
+    let long = "the quick brown fox jumps over the lazy dog ".repeat(60);
+    let script = FauxScript::new()
+        .with_tokens_per_second(20.0)
+        .with_text(long.clone());
+    let (harness, _provider, _env) = harness_with(script).await;
+
+    let run = {
+        let harness = harness.clone();
+        tokio::spawn(async move { harness.prompt_text("do something long", vec![]).await })
+    };
+
+    // Wait until the frames are durable, then kill the run.
+    let session = harness.session().clone();
+    let mut committed = 0usize;
+    for _ in 0..200 {
+        let records = session
+            .find_records(&RecordQuery {
+                record_type: Some(rpi_harness::frame_progress::ASSISTANT_FRAME_RECORD_TYPE),
+                ..Default::default()
+            })
+            .await
+            .expect("frame records readable");
+        committed = records.len();
+        if committed >= 3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        committed >= 3,
+        "expected the start/text_start/text_delta frames to be durable before the crash, got {committed}"
+    );
+    // Nothing was persisted as history yet — this is the pre-fix failure mode.
+    let branch = harness
+        .session()
+        .view("main")
+        .find_entries(&EntryQuery {
+            order: Some(EntryOrder::OldestFirst),
+            ..Default::default()
+        })
+        .await
+        .expect("branch readable");
+    assert_eq!(
+        branch
+            .iter()
+            .filter(|entry| matches!(entry, rpi_harness::session::types::Entry::Message(_)))
+            .count(),
+        1,
+        "only the prompt is history at this point"
+    );
+
+    run.abort();
+    let _ = run.await;
+
+    // Recover: the committed prefix becomes an interrupted message instead of
+    // vanishing.
+    let salvaged = rpi_harness::frame_progress::salvage_run_frames(&session, "unknown-run")
+        .await
+        .expect("salvage runs");
+    assert!(salvaged.is_empty(), "a different run id salvages nothing");
+
+    // Read the run id that actually wrote the frames.
+    let records = session
+        .find_records(&RecordQuery {
+            record_type: Some(rpi_harness::frame_progress::ASSISTANT_FRAME_RECORD_TYPE),
+            ..Default::default()
+        })
+        .await
+        .expect("frame records readable");
+    let run_id = records
+        .iter()
+        .filter_map(|record| record.run_id().map(str::to_string))
+        .next()
+        .expect("frames carry a run id");
+
+    let salvaged = rpi_harness::frame_progress::salvage_run_frames(&session, &run_id)
+        .await
+        .expect("salvage runs");
+    assert_eq!(salvaged.len(), 1, "one stream was committed");
+    let message = &salvaged[0];
+    assert_eq!(
+        message.stop_reason,
+        rpi_ai::types::StopReason::Error,
+        "a salvaged message is marked as an error, not a normal stop"
+    );
+    assert_eq!(
+        message.error_message.as_deref(),
+        Some(rpi_harness::frame_progress::INTERRUPTED_NOTICE)
+    );
+    let salvaged_text = match message.content.first() {
+        Some(rpi_ai::types::Content::Text(text)) => text.text.clone(),
+        other => panic!("expected salvaged text content, got {other:?}"),
+    };
+    assert!(
+        !salvaged_text.is_empty() && long.starts_with(&salvaged_text),
+        "the content streamed before the crash must survive as a prefix of the full reply; \
+         salvaged {salvaged_text:?}"
+    );
+    assert!(
+        salvaged_text.len() < long.len(),
+        "the crash landed mid-stream, so the salvage must be partial"
+    );
+    assert!(
+        message.usage == rpi_ai::types::Usage::zero(),
+        "a salvaged partial must not bill usage a retry would bill again"
+    );
+}
+
+/// A run that finishes normally retires its frames: they were progress, not
+/// history, so a later recovery must find nothing to salvage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_completed_run_leaves_no_frames_to_salvage() {
+    let script = FauxScript::new().with_text("all done");
+    let (harness, _provider, _env) = harness_with(script).await;
+
+    let result = harness
+        .prompt_text("finish cleanly", vec![])
+        .await
+        .expect("prompt completes");
+    assert!(matches!(
+        result.outcome,
+        HarnessRunOutcome::Completed { .. }
+    ));
+
+    let records = harness
+        .session()
+        .find_records(&RecordQuery {
+            record_type: Some(rpi_harness::frame_progress::ASSISTANT_FRAME_RECORD_TYPE),
+            ..Default::default()
+        })
+        .await
+        .expect("frame records readable");
+    assert!(
+        !records.is_empty(),
+        "frames were recorded while the run was in flight"
+    );
+
+    let salvaged =
+        rpi_harness::frame_progress::salvage_run_frames(harness.session(), &result.run_id)
+            .await
+            .expect("salvage runs");
+    assert!(
+        salvaged.is_empty(),
+        "a committed run must not be salvaged: {salvaged:?}"
+    );
+}
+
+/// Reopen an existing session in a fresh harness.
+///
+/// This is what a user does after a crash (`rpi` again on the same session), and
+/// opening the harness is what runs `finish_interrupted_operation`.
+async fn reopen_harness(session: rpi_harness::session::session::Session) -> AgentHarness {
+    let provider = FauxProvider::new(FauxScript::new().with_text("unused"));
+    let model = provider.default_model().clone();
+    let options = AgentHarnessOptions {
+        model,
+        thinking_level: Default::default(),
+        active_tool_names: Vec::new(),
+        tools: Vec::new(),
+        system_prompt: None,
+        resources: Default::default(),
+        stream_options: Default::default(),
+        retry: RetryPolicy::default(),
+        compaction: Default::default(),
+        steering_mode: Default::default(),
+        follow_up_mode: Default::default(),
+        tool_execution: Default::default(),
+        drive: Default::default(),
+        session,
+        models: vec![provider as Arc<dyn Provider>],
+        to_provider_messages: None,
+        entry_projectors: Default::default(),
+        agent_emitter: None,
+        before_tool_call: None,
+        after_tool_call: None,
+        transform_context: None,
+        entry_transforms: Vec::new(),
+        provider_hooks: None,
+        allow_existing_session: true,
+    };
+    AgentHarness::create(options)
+        .await
+        .expect("reopen harness on the crashed session")
+}
+
+/// The whole point of frame progress, end to end: crash mid-stream, reopen the
+/// session, and get the committed prefix back as an interrupted message instead
+/// of an empty run.
+///
+/// Exercises the real recovery entry point (`finish_interrupted_operation`, run
+/// by `AgentHarness::create`) rather than calling salvage directly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reopening_a_crashed_session_restores_the_committed_prefix() {
+    let long = "the quick brown fox jumps over the lazy dog ".repeat(60);
+    let script = FauxScript::new()
+        .with_tokens_per_second(20.0)
+        .with_text(long.clone());
+    let (harness, _provider, _env) = harness_with(script).await;
+
+    let run = {
+        let harness = harness.clone();
+        tokio::spawn(async move { harness.prompt_text("do something long", vec![]).await })
+    };
+    let session = harness.session().clone();
+    for _ in 0..200 {
+        let records = session
+            .find_records(&RecordQuery {
+                record_type: Some(rpi_harness::frame_progress::ASSISTANT_FRAME_RECORD_TYPE),
+                ..Default::default()
+            })
+            .await
+            .expect("frame records readable");
+        if records.len() >= 3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    run.abort();
+    let _ = run.await;
+
+    // The crash left the operation dangling: nothing closed it.
+    let open = session
+        .find_open_operations("main", None)
+        .await
+        .expect("open operations readable");
+    assert_eq!(
+        open.len(),
+        1,
+        "a crashed run leaves exactly one open operation"
+    );
+
+    drop(harness);
+    let recovered = reopen_harness(session).await;
+
+    // Recovery closed the operation and preserved the output.
+    let open = recovered
+        .session()
+        .find_open_operations("main", None)
+        .await
+        .expect("open operations readable");
+    assert!(
+        open.is_empty(),
+        "reopening the session must close the interrupted operation, still open: {open:?}"
+    );
+
+    let entries = recovered
+        .session()
+        .view("main")
+        .find_entries(&EntryQuery {
+            order: Some(EntryOrder::OldestFirst),
+            ..Default::default()
+        })
+        .await
+        .expect("branch readable");
+    let messages: Vec<_> = entries
+        .iter()
+        .filter_map(|entry| match entry {
+            rpi_harness::session::types::Entry::Message(message) => Some(message),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(messages.len(), 2, "prompt + recovered assistant message");
+
+    let assistant = match &messages[1].message {
+        AgentMessage::Assistant(assistant) => assistant.clone(),
+        other => panic!("expected an assistant message, got {other:?}"),
+    };
+    assert_eq!(
+        assistant.stop_reason,
+        rpi_ai::types::StopReason::Error,
+        "the recovered message is marked as interrupted"
+    );
+    assert_eq!(
+        assistant.error_message.as_deref(),
+        Some(rpi_harness::frame_progress::INTERRUPTED_NOTICE)
+    );
+    let text = match assistant.content.first() {
+        Some(rpi_ai::types::Content::Text(text)) => text.text.clone(),
+        other => panic!("expected recovered text content, got {other:?}"),
+    };
+    assert!(
+        !text.is_empty() && long.starts_with(&text) && text.len() < long.len(),
+        "the recovered text must be the partial prefix committed before the crash, got {text:?}"
+    );
+}
+
+/// Recovery must be idempotent: opening the same crashed session again must not
+/// append a second copy of the salvaged message.
+///
+/// The early return in `finish_interrupted_operation` (no open operation → do
+/// nothing) is what guarantees this, and nothing else in the recovery path
+/// writes a `ClearRun`, so this is the invariant worth pinning.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recovering_the_same_crashed_session_twice_does_not_duplicate() {
+    let long = "the quick brown fox jumps over the lazy dog ".repeat(60);
+    let script = FauxScript::new()
+        .with_tokens_per_second(20.0)
+        .with_text(long);
+    let (harness, _provider, _env) = harness_with(script).await;
+
+    let run = {
+        let harness = harness.clone();
+        tokio::spawn(async move { harness.prompt_text("do something long", vec![]).await })
+    };
+    let session = harness.session().clone();
+    for _ in 0..200 {
+        let records = session
+            .find_records(&RecordQuery {
+                record_type: Some(rpi_harness::frame_progress::ASSISTANT_FRAME_RECORD_TYPE),
+                ..Default::default()
+            })
+            .await
+            .expect("frame records readable");
+        if records.len() >= 3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    run.abort();
+    let _ = run.await;
+    drop(harness);
+
+    let count_messages = |harness: &AgentHarness| {
+        let session = harness.session().clone();
+        async move {
+            session
+                .view("main")
+                .find_entries(&EntryQuery {
+                    order: Some(EntryOrder::OldestFirst),
+                    ..Default::default()
+                })
+                .await
+                .expect("branch readable")
+                .iter()
+                .filter(|entry| matches!(entry, rpi_harness::session::types::Entry::Message(_)))
+                .count()
+        }
+    };
+
+    let first = reopen_harness(session).await;
+    assert_eq!(
+        count_messages(&first).await,
+        2,
+        "first recovery: prompt + interrupted message"
+    );
+
+    // Open the recovered session a second time.
+    let second = reopen_harness(first.session().clone()).await;
+    assert_eq!(
+        count_messages(&second).await,
+        2,
+        "second recovery must not append the salvaged message again"
+    );
+}
+/// A tool that never returns, so a run can be killed *during* tool execution —
+/// the common crash case, and the one that produces an assistant message whose
+/// tool calls have no results.
+struct HangingTool {
+    schema: rpi_ai::types::Tool,
+}
+
+impl HangingTool {
+    fn new() -> Self {
+        Self {
+            schema: rpi_ai::types::Tool {
+                name: "slow_tool".to_string(),
+                description: "never returns".to_string(),
+                parameters: rpi_ai::types::Schema::new(
+                    serde_json::json!({ "type": "object", "properties": {} }),
+                ),
+                constrained_sampling: None,
+            },
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl rpi_agent::AgentTool for HangingTool {
+    fn schema(&self) -> &rpi_ai::types::Tool {
+        &self.schema
+    }
+    fn label(&self) -> &str {
+        "slow_tool"
+    }
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        _params: serde_json::Value,
+        _signal: tokio_util::sync::CancellationToken,
+        _on_update: Arc<dyn Fn(rpi_agent::ToolResultPartial) + Send + Sync>,
+    ) -> Result<rpi_agent::AgentToolResult, rpi_agent::AgentError> {
+        // Never resolves: the run is stuck inside tool execution.
+        std::future::pending::<()>().await;
+        unreachable!()
+    }
+}
+
+/// Build a harness whose only tool hangs.
+async fn harness_with_hanging_tool(script: FauxScript) -> (AgentHarness, Arc<FauxProvider>) {
+    let provider = FauxProvider::new(script);
+    let model = provider.default_model().clone();
+    let env = Arc::new(InMemoryExecutionEnv::new());
+    let env_dyn: Arc<dyn rpi_tools::ExecutionEnv> = env.clone();
+    let mut_env: Arc<dyn rpi_tools::MutatingEnv> = env.clone();
+    let _registry = Arc::new(MutationQueueRegistry::new());
+    let ctx = ExecutionToolContext::new(env_dyn, Some(mut_env));
+    let tools: Vec<HarnessTool> = vec![
+        HarnessTool::new(Arc::new(HangingTool::new())),
+        HarnessTool::new(create_read_tool(&ctx, None)),
+    ];
+    let active: Vec<String> = tools.iter().map(|t| t.tool.schema().name.clone()).collect();
+
+    let metadata = SessionMetadata {
+        id: "crash-tool".into(),
+        created_at: 0,
+        parent_session_id: None,
+    };
+    let storage = Arc::new(InMemorySessionStorage::new(
+        metadata,
+        Arc::new(SystemClock),
+        Arc::new(DefaultIdGenerator::new()),
+    ));
+    let session = Session::new(storage, None);
+    let options = AgentHarnessOptions {
+        model,
+        thinking_level: Default::default(),
+        active_tool_names: active,
+        tools,
+        system_prompt: None,
+        resources: Default::default(),
+        stream_options: Default::default(),
+        retry: RetryPolicy::default(),
+        compaction: Default::default(),
+        steering_mode: Default::default(),
+        follow_up_mode: Default::default(),
+        tool_execution: Default::default(),
+        drive: Default::default(),
+        session,
+        models: vec![provider.clone() as Arc<dyn Provider>],
+        to_provider_messages: None,
+        entry_projectors: Default::default(),
+        agent_emitter: None,
+        before_tool_call: None,
+        after_tool_call: None,
+        transform_context: None,
+        entry_transforms: Vec::new(),
+        provider_hooks: None,
+        allow_existing_session: false,
+    };
+    let harness = AgentHarness::create(options).await.expect("create harness");
+    (harness, provider)
+}
+
+/// Crashing *during* tool execution must not leave a transcript the next
+/// request cannot be built from.
+///
+/// This is the failure mode of salvaging an assistant message verbatim: the
+/// committed partial carries the tool call, its result never landed, and every
+/// provider rejects an assistant message whose tool calls have no results
+/// (Anthropic: "`tool_use` ids were found without `tool_result` blocks"). The
+/// salvage therefore pairs each unresolved call with a synthetic error result,
+/// which also tells the model and the user that the outcome is unknown rather
+/// than "not applied".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn crashing_during_a_tool_call_leaves_a_valid_transcript() {
+    let script = FauxScript::new().with_tool_call("slow_tool", serde_json::json!({}));
+    let (harness, _provider) = harness_with_hanging_tool(script).await;
+
+    let run = {
+        let harness = harness.clone();
+        tokio::spawn(async move { harness.prompt_text("run the slow tool", vec![]).await })
+    };
+    let session = harness.session().clone();
+
+    // Wait until the tool call itself is committed in the frames.
+    let mut saw_tool_call = false;
+    for _ in 0..300 {
+        let records = session
+            .find_records(&RecordQuery {
+                record_type: Some(rpi_harness::frame_progress::ASSISTANT_FRAME_RECORD_TYPE),
+                ..Default::default()
+            })
+            .await
+            .expect("frame records readable");
+        saw_tool_call = records.iter().any(|record| {
+            matches!(record, LaneRecord::AssistantFrame(f)
+                if f.frame.as_ref().and_then(|v| v.get("type")).and_then(|v| v.as_str())
+                    == Some("toolcall_end"))
+        });
+        if saw_tool_call {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        saw_tool_call,
+        "the tool call must be committed before the crash for this test to mean anything"
+    );
+
+    // Kill the run inside tool execution: no tool result will ever exist.
+    run.abort();
+    let _ = run.await;
+
+    // The write side closes the loop with the read side: the running tool is
+    // recorded *before* it runs, so recovery can name the tool whose side effect
+    // is unknown instead of reporting a generic "a tool might have run".
+    let records = session
+        .find_records(&RecordQuery {
+            lane: Some("main".to_string()),
+            order: Some(EntryOrder::OldestFirst),
+            ..Default::default()
+        })
+        .await
+        .expect("records readable");
+    let started = records
+        .iter()
+        .find_map(|record| match record {
+            LaneRecord::ToolStarted(started) if started.tool_name == "slow_tool" => Some(started),
+            _ => None,
+        })
+        .expect("the running tool must be recorded before it runs");
+    assert_eq!(
+        started.effective_args,
+        serde_json::json!({}),
+        "the record must carry the arguments the tool was called with"
+    );
+
+    let report = rpi_harness::runtime::SessionRuntime::new(session.clone())
+        .recover_lane("main")
+        .await
+        .expect("lane recovery runs");
+    assert!(
+        report
+            .tool_frames
+            .iter()
+            .any(|frame| frame.tool_name == "slow_tool"),
+        "recovery must track the in-flight tool: {:?}",
+        report.tool_frames
+    );
+    // While the run is still open the recorded tool is ordinary in-flight work,
+    // not yet a finding: only a run that *died* is worth reporting, and at this
+    // point nothing has closed the operation. The finding (`DanglingToolFrame`)
+    // appears once the operation is closed without its result landing, which is
+    // covered by `runtime`'s `an_unlanded_tool_frame_names_the_tool`.
+    assert!(
+        !report.findings.iter().any(|finding| matches!(
+            finding,
+            rpi_harness::runtime::RecoveryFinding::DanglingToolFrame { .. }
+        )),
+        "an open run's tool is in flight, not dangling: {:?}",
+        report.findings
+    );
+    assert!(
+        report.findings.iter().any(|finding| matches!(
+            finding,
+            rpi_harness::runtime::RecoveryFinding::OrphanedOperation { .. }
+        )),
+        "the crash left the operation open: {:?}",
+        report.findings
+    );
+    assert!(
+        !report.is_corrupt(),
+        "an interrupted tool is not log corruption: {report:?}"
+    );
+
+    drop(harness);
+
+    let recovered = reopen_harness(session).await;
+    // Read the *branch path* specifically: the repaired sequence has to be
+    // reachable from the leaf, because that is what the next request is built
+    // from. Asserting on all entries would pass even if the results were
+    // orphaned off the branch.
+    let entries = recovered
+        .session()
+        .find_entries_on_branch(
+            &EntryQuery {
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            },
+            &BranchBounds::default(),
+        )
+        .await
+        .expect("branch readable");
+
+    let mut tool_call_ids: Vec<String> = Vec::new();
+    let mut result_ids: Vec<String> = Vec::new();
+    for entry in &entries {
+        if let rpi_harness::session::types::Entry::Message(message) = entry {
+            match &message.message {
+                AgentMessage::Assistant(assistant) => {
+                    for block in &assistant.content {
+                        if let rpi_ai::types::Content::ToolCall(call) = block {
+                            tool_call_ids.push(call.id.clone());
+                        }
+                    }
+                }
+                AgentMessage::ToolResult(result) => {
+                    assert!(
+                        result.is_error,
+                        "the stand-in result must be marked as an error"
+                    );
+                    let text = match result.content.first() {
+                        Some(rpi_ai::types::Content::Text(text)) => text.text.clone(),
+                        other => panic!("expected text in the stand-in result, got {other:?}"),
+                    };
+                    assert!(
+                        text.contains("unknown"),
+                        "the stand-in result must say the outcome is unknown, got {text:?}"
+                    );
+                    result_ids.push(result.tool_call_id.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    assert!(
+        !tool_call_ids.is_empty(),
+        "the recovered transcript must still carry the interrupted tool call"
+    );
+    for id in &tool_call_ids {
+        assert!(
+            result_ids.contains(id),
+            "every recovered tool call needs a result or the next request is invalid; \
+             {id} has none (calls={tool_call_ids:?}, results={result_ids:?})"
+        );
+    }
+}
+
+/// A real run's record log must be a legal product of the record protocol.
+///
+/// This is the end-to-end check on the write side: commit-on-settle commits an
+/// assistant message carrying tool calls *before* its tools run, and records a
+/// `step_attempt` naming that entry. The reducer then deep-checks the log —
+/// `step_attempt` series/result consistency, `write_deferred` targets, and the
+/// `tool_started` ↔ assistant-ordinal match. Writing records the validator would
+/// reject is worse than writing none, because a corrupt log blocks recovery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_real_run_leaves_a_valid_record_log() {
+    let script = FauxScript::new()
+        .with_tool_call(
+            "write",
+            serde_json::json!({ "path": "out.txt", "content": "hello" }),
+        )
+        .with_text("done");
+    let (harness, _provider, _env) = harness_with(script).await;
+
+    let result = harness
+        .prompt_text("write a file", vec![])
+        .await
+        .expect("run completes");
+    assert!(matches!(
+        result.outcome,
+        HarnessRunOutcome::Completed { .. }
+    ));
+
+    let session = harness.session();
+    let records = session
+        .find_records(&RecordQuery {
+            lane: Some("main".to_string()),
+            order: Some(EntryOrder::OldestFirst),
+            ..Default::default()
+        })
+        .await
+        .expect("records readable");
+    let entries = session
+        .find_entries(&EntryQuery {
+            order: Some(EntryOrder::OldestFirst),
+            ..Default::default()
+        })
+        .await
+        .expect("entries readable");
+    let open_operations = session
+        .find_open_operations("main", None)
+        .await
+        .expect("open operations readable");
+
+    // The settled assistant step must be recorded, and its `result_entry_id`
+    // must name an entry that really landed with that message's content.
+    let attempts: Vec<_> = records
+        .iter()
+        .filter_map(|record| match record {
+            LaneRecord::StepAttempt(attempt) => Some(attempt),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !attempts.is_empty(),
+        "a run that streamed an assistant message must record its step"
+    );
+    for attempt in &attempts {
+        let landed = entries.iter().any(|entry| {
+            entry.id() == attempt.result_entry_id
+                && matches!(
+                    entry,
+                    rpi_harness::session::types::Entry::Message(message)
+                        if message.message.is_assistant()
+                )
+        });
+        assert!(
+            landed,
+            "step attempt {} names result entry {} which did not land as an assistant message",
+            attempt.base.id, attempt.result_entry_id
+        );
+    }
+
+    // And the log as a whole is legal.
+    let slice = rpi_harness::session::RecordLogSlice {
+        lane: "main".to_string(),
+        open_operations,
+        records,
+        entries,
+    };
+    rpi_harness::session::validate_record_log(&slice)
+        .expect("a completed run must leave a legal record log");
+}
+
+/// A retried attempt must not be committed: the harness re-runs the whole loop,
+/// so persisting the failed attempt would leave a dead assistant message in
+/// history and put two assistant turns in a row in front of the provider.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retried_attempt_is_not_committed() {
+    let mut transient = faux_assistant_message("", rpi_ai::types::StopReason::Error);
+    transient.error_message = Some("503 service unavailable".into());
+    let script = FauxScript::new();
+    script.set_responses(vec![
+        FauxStep::message(transient),
+        FauxStep::text("Recovered after retry."),
+    ]);
+    let (harness, provider, _env) = harness_with_options(
+        script,
+        RetryPolicy {
+            enabled: true,
+            max_retries: 3,
+            ..RetryPolicy::default()
+        },
+        None,
+    )
+    .await;
+
+    let result = harness
+        .prompt_text("do the thing", vec![])
+        .await
+        .expect("run completes");
+    assert!(matches!(
+        result.outcome,
+        HarnessRunOutcome::Completed { .. }
+    ));
+    assert_eq!(
+        provider
+            .state()
+            .call_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        2,
+        "the provider should have been retried once"
+    );
+
+    // Exactly one assistant message in history: the recovered one. The failed
+    // attempt's message must not be present.
+    let entries = harness
+        .session()
+        .find_entries(&EntryQuery {
+            order: Some(EntryOrder::OldestFirst),
+            ..Default::default()
+        })
+        .await
+        .expect("entries readable");
+    let assistants: Vec<_> = entries
+        .iter()
+        .filter_map(|entry| match entry {
+            rpi_harness::session::types::Entry::Message(message) => match &message.message {
+                AgentMessage::Assistant(assistant) => Some(assistant.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        assistants.len(),
+        1,
+        "the failed attempt must not be committed, got {} assistant messages",
+        assistants.len()
+    );
+    assert_eq!(assistants[0].stop_reason, rpi_ai::types::StopReason::Stop);
+    assert!(
+        assistants[0].error_message.is_none(),
+        "the committed message must be the recovered one, not the failed attempt"
     );
 }

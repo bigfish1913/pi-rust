@@ -213,7 +213,9 @@ pub struct AgentState {
     pub tools: Vec<Arc<dyn crate::agent_tool::AgentTool>>,
     pub messages: Vec<AgentMessage>,
     pub is_streaming: bool,
-    pub streaming_message: Option<AgentMessage>,
+    /// The in-flight assistant message, shared so the per-delta `MessageUpdate`
+    /// does not deep-clone it. `None` unless an assistant message is streaming.
+    pub streaming_message: Option<std::sync::Arc<AssistantMessage>>,
     pub pending_tool_calls: HashSet<String>,
     pub error_message: Option<String>,
 }

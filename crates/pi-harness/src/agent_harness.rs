@@ -66,12 +66,12 @@ use crate::session::context::{
     SessionContextBuildOptions,
 };
 use crate::session::session::Session;
-use crate::watcher::{watch_listener, HarnessWatcher};
 use crate::session::types::{
-    BranchBounds, Entry, EntryOrder, EntryQuery, JsonValue, LaneRecord, OperationError,
-    OperationFinishedRecord, OperationIntent, OperationOutcome, OperationStartedRecord,
-    ProvisionedEntry, ProvisionedKind, QueueKind, RecordBase, RecordQuery, SessionStats,
-    SessionTree, UsageCause, UsageRecord,
+    BranchBounds, CompactionReason, Entry, EntryOrder, EntryQuery, JsonValue, LaneRecord,
+    OperationError, OperationFinishedRecord, OperationIntent, OperationOutcome,
+    OperationStartedRecord, ProvisionedEntry, ProvisionedKind, QueueKind, RecordBase, RecordQuery,
+    SessionStats, SessionTree, StepAttemptRecord, StepKind, ToolReplay, ToolStartedRecord,
+    UsageCause, UsageRecord, WriteDeferredRecord,
 };
 use crate::skills::format_skill_invocation;
 use crate::system_prompt::compose_system_prompt;
@@ -79,6 +79,7 @@ use crate::types::{
     AgentHarnessOptions, AgentHarnessResources, AgentHarnessStreamOptions, CompactionSettings,
     DrivingMode, HarnessTool, HarnessToolExecution, PromptTemplate, RetryPolicy, Skill,
 };
+use crate::watcher::{watch_listener, HarnessWatcher};
 
 // ===========================================================================
 // Outcomes — mirror the TS RunOutcome / CompactionOutcome / NavigationOutcome
@@ -782,7 +783,10 @@ impl AgentHarness {
 
     /// `getStats()` — rolled-up token/cost/message counters.
     pub async fn get_stats(&self) -> HarnessResult<SessionStats> {
-        self.view().get_stats().await.map_err(session_to_harness_err)
+        self.view()
+            .get_stats()
+            .await
+            .map_err(session_to_harness_err)
     }
 
     /// `snapshot()` — the lane read model (leaf, name, stats, active op).
@@ -892,12 +896,7 @@ impl AgentHarness {
                 .flatten()
                 .unwrap_or_default();
             let final_message = self.last_assistant_message().await.unwrap_or_else(|| {
-                rpi_ai::types::AssistantMessage::empty(
-                    rpi_ai::Api::AnthropicMessages,
-                    "",
-                    "",
-                    0,
-                )
+                rpi_ai::types::AssistantMessage::empty(rpi_ai::Api::AnthropicMessages, "", "", 0)
             });
             let outcome = match fin.outcome {
                 OperationOutcome::Completed => HarnessRunOutcome::Completed {
@@ -977,9 +976,7 @@ impl AgentHarness {
         Ok(DriveResult {
             operation_id: operation_id.to_string(),
             outcome: match result.outcome {
-                HarnessRunOutcome::Suspended { deferred, .. } => {
-                    DriveOutcome::Suspended(deferred)
-                }
+                HarnessRunOutcome::Suspended { deferred, .. } => DriveOutcome::Suspended(deferred),
                 _ => DriveOutcome::Completed(Box::new(result)),
             },
         })
@@ -1374,6 +1371,7 @@ impl AgentHarness {
         let Some(operation) = open.first() else {
             return Ok(());
         };
+        let run_id = operation.base.id.clone();
 
         session
             .append_record(LaneRecord::OperationFinished(OperationFinishedRecord {
@@ -1383,7 +1381,7 @@ impl AgentHarness {
                     lane: lane.to_string(),
                     timestamp: 0,
                 },
-                run_id: operation.base.id.clone(),
+                run_id: run_id.clone(),
                 outcome: OperationOutcome::Aborted,
                 error: Some(OperationError {
                     code: "interrupted".to_string(),
@@ -1392,6 +1390,38 @@ impl AgentHarness {
             }))
             .await
             .map_err(session_to_harness_err)?;
+
+        // The run never got to persist its messages, so replay whatever
+        // assistant frames committed before the process died and record them as
+        // interrupted. Without this the whole run's output is lost and only the
+        // user's prompt remains — see `docs/llm-repetition-forensics.md` §十一.
+        // Mirrors native pi's `recoverAssistantGeneration`.
+        //
+        // `salvage_run_messages` also pairs every unresolved tool call with a
+        // synthetic error result. That is required, not cosmetic: a crash most
+        // often lands *during* tool execution, so the committed partial usually
+        // carries tool calls, and an assistant message whose tool calls have no
+        // results is rejected by every provider on the next request.
+        match crate::frame_progress::salvage_run_messages(session, lane, &run_id).await {
+            Ok(salvaged) => {
+                for message in salvaged {
+                    if let Err(error) = session.view(lane).append_message(message).await {
+                        tracing::warn!(
+                            lane,
+                            %error,
+                            "could not persist a salvaged assistant message after an interrupted run"
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    lane,
+                    %error,
+                    "could not salvage assistant frames for an interrupted run"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -1609,10 +1639,89 @@ impl AgentHarness {
         compose_system_prompt(base, skills, None, None)
     }
 
+    /// Reserve an entry id. Exposed so a settle observer can name an entry in a
+    /// `step_attempt` record *before* committing it, which is what makes the
+    /// record's `result_entry_id` checkable at recovery.
+    pub(crate) fn next_entry_id(&self) -> String {
+        self.session.id_generator().next()
+    }
+
+    /// Write a `tool_started` record on this harness's lane.
+    ///
+    /// This is the record that lets recovery name the tool whose side effect is
+    /// unknown after a crash. It is only writable *after* the assistant message
+    /// carrying the call is an entry, which is what commit-on-settle buys.
+    pub(crate) async fn write_tool_started_record(
+        &self,
+        run_id: &str,
+        assistant_entry_id: &str,
+        tool_index: u32,
+        tool_call_id: &str,
+        tool_name: &str,
+        effective_args: serde_json::Value,
+        result_entry_id: &str,
+        replay: ToolReplay,
+    ) -> HarnessResult<()> {
+        self.session
+            .append_record(LaneRecord::ToolStarted(ToolStartedRecord {
+                base: RecordBase {
+                    id: self.session.id_generator().next(),
+                    seq: 0,
+                    lane: self.lane.clone(),
+                    timestamp: 0,
+                },
+                run_id: run_id.to_string(),
+                assistant_entry_id: assistant_entry_id.to_string(),
+                tool_index,
+                tool_call_id: tool_call_id.to_string(),
+                tool_name: tool_name.to_string(),
+                effective_args,
+                result_entry_id: result_entry_id.to_string(),
+                replay,
+            }))
+            .await
+            .map_err(session_to_harness_err)?;
+        Ok(())
+    }
+
+    /// Commit a provisioned entry on this harness's lane.
+    pub(crate) async fn append_provisioned(&self, entry: ProvisionedEntry) -> HarnessResult<Entry> {
+        self.session
+            .append_entry(entry, &self.lane)
+            .await
+            .map_err(session_to_harness_err)
+    }
+
+    /// Write a `step_attempt` record on this harness's lane.
+    pub(crate) async fn write_step_attempt_record(
+        &self,
+        run_id: &str,
+        step: StepKind,
+        attempt: u32,
+        result_entry_id: &str,
+        compaction_reason: Option<CompactionReason>,
+    ) -> HarnessResult<()> {
+        self.write_step_attempt(run_id, step, attempt, result_entry_id, compaction_reason)
+            .await
+    }
+
     /// Persist a `Compaction` entry and return the stamped `Entry`.
+    ///
+    /// Writes the durable intent records around the commit:
+    ///
+    /// - `write_deferred` *before* the append, naming the entry this step means
+    ///   to commit. A compaction's content is known up front, so its target JSON
+    ///   is exact — which is what `validate_exact_provisioned_entry` demands
+    ///   (it deep-compares the committed entry against the recorded intent).
+    /// - `step_attempt` *after* the append, so `result_entry_id` names the entry
+    ///   that actually landed. `validate_attempt_result` accepts an absent entry,
+    ///   but a step record whose id never resolves is worse than none: recovery
+    ///   would appear to have information it cannot check.
     async fn persist_compaction_entry(
         &self,
+        run_id: &str,
         result: &crate::compaction::CompactResult,
+        reason: CompactionReason,
     ) -> HarnessResult<Entry> {
         let id = self.session.id_generator().next();
         let details = result
@@ -1620,7 +1729,7 @@ impl AgentHarness {
             .as_ref()
             .map(|d| serde_json::to_value(d).unwrap_or(JsonValue::Null));
         let entry = ProvisionedEntry {
-            id,
+            id: id.clone(),
             kind: ProvisionedKind::Compaction {
                 summary: result.summary.clone(),
                 retained_tail: result.retained_tail.clone(),
@@ -1629,10 +1738,77 @@ impl AgentHarness {
                 usage: result.usage.clone(),
             },
         };
-        self.session
+
+        self.write_write_deferred(run_id, &entry).await?;
+        let committed = self
+            .session
             .append_entry(entry, &self.lane)
             .await
-            .map_err(session_to_harness_err)
+            .map_err(session_to_harness_err)?;
+        // A compaction is a step series of its own, so its first attempt is 1
+        // (the reducer resets the series when `step` changes).
+        self.write_step_attempt(run_id, StepKind::Compaction, 1, &id, Some(reason))
+            .await?;
+        Ok(committed)
+    }
+
+    /// Record a `write_deferred`: an entry whose content is already known but
+    /// which has not been committed yet.
+    ///
+    /// `target` is the entry's *provisioned* JSON (its flat serialization minus
+    /// the storage-assigned `seq`/`parentId`/`timestamp`), built through the same
+    /// helper the reducer compares against, so the recorded intent and the
+    /// eventual commit cannot drift.
+    async fn write_write_deferred(
+        &self,
+        run_id: &str,
+        entry: &ProvisionedEntry,
+    ) -> HarnessResult<()> {
+        let placeholder = crate::session::types::provisioned_into_entry(entry.clone(), 0, None, 0);
+        let target = crate::session::reducer::entry_provisioned_json(&placeholder);
+        self.session
+            .append_record(LaneRecord::WriteDeferred(WriteDeferredRecord {
+                base: RecordBase {
+                    id: self.session.id_generator().next(),
+                    seq: 0,
+                    lane: self.lane.clone(),
+                    timestamp: 0,
+                },
+                run_id: run_id.to_string(),
+                target,
+            }))
+            .await
+            .map_err(session_to_harness_err)?;
+        Ok(())
+    }
+
+    /// Record a `step_attempt`: one durable step of a run, naming the entry that
+    /// will (or did) hold its result.
+    async fn write_step_attempt(
+        &self,
+        run_id: &str,
+        step: StepKind,
+        attempt: u32,
+        result_entry_id: &str,
+        compaction_reason: Option<CompactionReason>,
+    ) -> HarnessResult<()> {
+        self.session
+            .append_record(LaneRecord::StepAttempt(StepAttemptRecord {
+                base: RecordBase {
+                    id: self.session.id_generator().next(),
+                    seq: 0,
+                    lane: self.lane.clone(),
+                    timestamp: 0,
+                },
+                run_id: run_id.to_string(),
+                step,
+                attempt,
+                result_entry_id: result_entry_id.to_string(),
+                compaction_reason,
+            }))
+            .await
+            .map_err(session_to_harness_err)?;
+        Ok(())
     }
 
     /// Write an `operation_started` record. Returns the stamped record (its
@@ -1698,7 +1874,12 @@ impl AgentHarness {
     async fn persist_new_messages(
         &self,
         new_messages: &[AgentMessage],
+        start_index: usize,
+        committed: &std::collections::BTreeSet<usize>,
     ) -> HarnessResult<(Option<String>, Option<String>)> {
+        // `start_index` is where `new_messages[0]` sits in the loop's full message
+        // sequence, so a settle-committed index lines up with slice offsets.
+        // `committed` holds the indices the settle observer already persisted.
         let mut leaf_id = self
             .session
             .view(&self.lane)
@@ -1706,7 +1887,12 @@ impl AgentHarness {
             .await
             .map_err(session_to_harness_err)?;
         let mut final_entry_id: Option<String> = leaf_id.clone();
-        for msg in new_messages {
+        for (offset, msg) in new_messages.iter().enumerate() {
+            // A message the settle observer already committed is durable; writing
+            // it again would duplicate it in the branch.
+            if committed.contains(&(start_index + offset)) {
+                continue;
+            }
             let id = self
                 .session
                 .view(&self.lane)
@@ -1915,7 +2101,17 @@ impl AgentHarness {
                         };
                         match compact(&prep, &llm_opts).await {
                             Ok(result) => {
-                                let _ = self.persist_compaction_entry(&result).await?;
+                                let _ = self
+                                    .persist_compaction_entry(
+                                        &run_id,
+                                        &result,
+                                        // The pre-run check fires when the context
+                                        // crosses the configured threshold, i.e.
+                                        // proactively, not in reaction to a provider
+                                        // overflow error.
+                                        CompactionReason::Threshold,
+                                    )
+                                    .await?;
                             }
                             Err(e) => {
                                 // Compaction failed; abort the run.
@@ -1985,12 +2181,30 @@ impl AgentHarness {
             snap.stream_options.clone(),
         )?;
         let post_compaction_cut = Arc::new(AtomicUsize::new(0));
+        // Run-level turn ceiling shared with the post-loop notice below. The
+        // loop's only other exit is "the model stopped asking for tools", which
+        // nothing bounds — one observed session ran 112 turns / 867s in a single
+        // run (`docs/llm-repetition-forensics.md` §二). `0` disables it.
+        let run_budget = Arc::new(Mutex::new(crate::run_budget::RunBudget::default()));
+        let should_stop_after_turn: Option<rpi_agent::ShouldStopAfterTurn> =
+            if run_budget.lock().unwrap().is_enabled() {
+                let budget = Arc::clone(&run_budget);
+                Some(Arc::new(
+                    move |_ctx: ShouldStopAfterTurnContext<'_>| -> BoxFuture<'static, bool> {
+                        let budget = Arc::clone(&budget);
+                        Box::pin(async move { budget.lock().unwrap().observe_turn().is_some() })
+                    },
+                ))
+            } else {
+                None
+            };
+
         let config = AgentLoopConfig {
             model: snap.model.clone(),
             convert_to_llm: convert,
             transform_context: snap.transform_context.clone(),
             get_api_key: None,
-            should_stop_after_turn: None,
+            should_stop_after_turn,
             prepare_next_turn: None,
             after_tool_results: {
                 let harness = self.clone();
@@ -2003,6 +2217,7 @@ impl AgentHarness {
                     .find(|p| p.id() == model.provider)
                     .cloned();
                 let compaction_signal = signal.clone();
+                let compaction_run_id = run_id.clone();
                 if enabled && model.context_window > 0 && provider.is_some() {
                     let cut_for_hook = Arc::clone(&post_compaction_cut);
                     Some(Arc::new(move |ctx: ShouldStopAfterTurnContext<'_>| -> BoxFuture<'static, Option<rpi_agent::AgentLoopTurnUpdate>> {
@@ -2011,6 +2226,7 @@ impl AgentHarness {
                         let provider = provider.clone().expect("checked above");
                         let cut = Arc::clone(&cut_for_hook);
                         let compaction_signal = compaction_signal.clone();
+                        let compaction_run_id = compaction_run_id.clone();
                         let context = ctx.context.clone();
                         let new_messages_len = ctx.new_messages.len();
                         Box::pin(async move {
@@ -2025,7 +2241,9 @@ impl AgentHarness {
                             let prep = match prepare_compaction(&entries, settings) { Ok(Some(p)) => p, _ => return None };
                             let opts = CompactionLlmOptions { provider, model: model.clone(), api_key: None, signal: compaction_signal, thinking_level: None, retry: None, custom_instructions: None };
                             let result = match compact(&prep, &opts).await { Ok(r) => r, Err(_) => return None };
-                            if harness.persist_compaction_entry(&result).await.is_err() { return None; }
+                            // Mid-loop compaction fires because the turn pushed the
+                            // context over the threshold.
+                            if harness.persist_compaction_entry(&compaction_run_id, &result, CompactionReason::Threshold).await.is_err() { return None; }
                             cut.store(new_messages_len, Ordering::Release);
                             let mut messages = Vec::with_capacity(result.retained_tail.len() + 1);
                             messages.push(create_compaction_summary_message(&result.summary, result.tokens_before, 0));
@@ -2078,10 +2296,22 @@ impl AgentHarness {
         // installs a BroadcastEmitter so it can render AgentEvents live);
         // otherwise fall back to a collector that discards events (the harness
         // still surfaces RunStart/RunEnd via its own bus).
-        let emitter: Arc<dyn AgentEmitter> = snap
+        let base_emitter: Arc<dyn AgentEmitter> = snap
             .agent_emitter
             .clone()
             .unwrap_or_else(|| Arc::new(rpi_agent::CollectorEmitter::default()));
+        // Durable progress: every streamed assistant frame is appended to the
+        // session as it arrives, so a crash mid-run leaves a committed prefix
+        // that `salvage_run_frames` can replay instead of losing the whole run.
+        // Mirrors native pi's `openFrameProgress`. See
+        // `docs/llm-repetition-forensics.md` §十一.
+        let frame_recorder = Arc::new(crate::frame_progress::FrameRecordingEmitter::new(
+            base_emitter,
+            self.session.clone(),
+            self.lane.clone(),
+            run_id.clone(),
+        ));
+        let emitter: Arc<dyn AgentEmitter> = frame_recorder.clone();
 
         // Drive the loop. We pass an EMPTY prompts vec to `run_agent_loop`
         // (NOT `prompts`): the prompts were already persisted to the session
@@ -2098,6 +2328,33 @@ impl AgentHarness {
         // dropped the first real assistant message.
         let retry_policy = snap.retry.clone();
         let mut retry_attempt = 0u32;
+        // Commit-on-settle: persist an assistant message carrying tool calls as
+        // soon as it is final, so the tools it calls can be recorded before they
+        // run (`tool_started` requires the assistant entry to exist).
+        let settle_state = Arc::new(crate::settle::SettleState::new(
+            run_id.clone(),
+            retry_policy.enabled,
+            retry_policy.max_retries,
+            snap.tools
+                .iter()
+                .map(|tool| {
+                    // `HarnessTool` carries the harness-level policy; a record
+                    // carries the persisted one. They are separate types with the
+                    // same two cases, so map explicitly rather than relying on
+                    // them staying in sync.
+                    let replay = match tool.replay {
+                        crate::types::ToolReplay::Never => ToolReplay::Never,
+                        crate::types::ToolReplay::Safe => ToolReplay::Safe,
+                    };
+                    (tool.tool.schema().name.clone(), replay)
+                })
+                .collect(),
+        ));
+        let emitter: Arc<dyn AgentEmitter> = Arc::new(crate::settle::SettlingEmitter::new(
+            Arc::clone(&emitter),
+            Arc::clone(&settle_state),
+            self.clone(),
+        ));
         let result = loop {
             let attempt_result = run_agent_loop(
                 Vec::new(),
@@ -2135,6 +2392,7 @@ impl AgentHarness {
             }
 
             retry_attempt += 1;
+            settle_state.set_attempt(retry_attempt);
             let delay_ms = retry_policy
                 .base_delay_ms
                 .saturating_mul(1u64 << retry_attempt.saturating_sub(1))
@@ -2157,10 +2415,43 @@ impl AgentHarness {
         let (leaf_id, _final_entry_id, outcome, op_outcome, op_error) = match result {
             Ok(new_messages) => {
                 let cut = post_compaction_cut.load(Ordering::Acquire);
+                let start = cut.min(new_messages.len());
+                let committed = settle_state.committed_indices();
                 let (leaf, final_id) = self
-                    .persist_new_messages(&new_messages[cut.min(new_messages.len())..])
+                    .persist_new_messages(&new_messages[start..], start, &committed)
                     .await?;
+                // A budget stop ends the run "Completed" (the loop's normal exit
+                // path), which would otherwise look like a finished task. Record
+                // *why* it stopped so the user sees it in the transcript and the
+                // next turn's context knows the work was cut short.
+                // Bind the reason before awaiting: the `MutexGuard` is not
+                // `Send`, and holding it across `append_message` would make the
+                // whole run future non-`Send`.
+                let budget_stop = run_budget.lock().unwrap().stop();
+                if let Some(stop) = budget_stop {
+                    let notice = crate::messages::create_custom_message(
+                        "runBudget",
+                        UserContent::Text(stop.message()),
+                        true,
+                        None,
+                        now_ms(),
+                    );
+                    if let Err(error) = self.session.view(&self.lane).append_message(notice).await {
+                        tracing::warn!(
+                            lane = %self.lane,
+                            %error,
+                            "could not record the run-budget stop notice"
+                        );
+                    }
+                }
                 let outcome = Self::derive_outcome(&new_messages, leaf.clone(), final_id.clone());
+                // The run's messages are durable now, so its frames are no
+                // longer needed as progress. Retiring them here (rather than at
+                // each `MessageEnd`) is what keeps a *failed retry attempt*'s
+                // frames from being salvaged as if they were real history.
+                if let Err(error) = frame_recorder.clear().await {
+                    tracing::warn!(lane = %self.lane, %error, "could not clear assistant frames");
+                }
                 let op_outcome = match &outcome {
                     HarnessRunOutcome::Completed { .. } => OperationOutcome::Completed,
                     HarnessRunOutcome::Aborted { .. } => OperationOutcome::Aborted,
@@ -2178,6 +2469,23 @@ impl AgentHarness {
                 (leaf, final_id, outcome, op_outcome, op_error)
             }
             Err(e) => {
+                // Nothing is persisted on this path, so replay whatever frames
+                // committed and record them as interrupted instead of throwing
+                // away everything the model produced. Mirrors native pi's
+                // `recoverAssistantGeneration`. The salvaged sequence pairs each
+                // partial with synthetic error results for its unresolved tool
+                // calls, so the transcript remains a valid request.
+                let salvaged = match frame_recorder.salvage(&self.session, &self.lane).await {
+                    Ok(salvaged) => salvaged,
+                    Err(salvage_error) => {
+                        tracing::warn!(
+                            lane = %self.lane,
+                            %salvage_error,
+                            "could not salvage assistant frames after a failed run"
+                        );
+                        Vec::new()
+                    }
+                };
                 let leaf = self
                     .session
                     .view(&self.lane)
@@ -2186,18 +2494,31 @@ impl AgentHarness {
                     .ok()
                     .flatten()
                     .unwrap_or_default();
+                let mut leaf_after_salvage = leaf.clone();
+                for message in salvaged {
+                    match self.session.view(&self.lane).append_message(message).await {
+                        Ok(id) => leaf_after_salvage = id,
+                        Err(append_error) => {
+                            tracing::warn!(
+                                lane = %self.lane,
+                                %append_error,
+                                "could not persist a salvaged assistant message"
+                            );
+                        }
+                    }
+                }
                 let error = OperationError {
                     code: "agent_error".into(),
                     message: e.to_string(),
                 };
                 let outcome = HarnessRunOutcome::Failed {
-                    leaf_id: leaf.clone(),
+                    leaf_id: leaf_after_salvage.clone(),
                     error: error.clone(),
                     final_entry_id: None,
                     final_message: None,
                 };
                 (
-                    Some(leaf),
+                    Some(leaf_after_salvage),
                     None,
                     outcome,
                     OperationOutcome::Failed,
@@ -2313,7 +2634,15 @@ impl AgentHarness {
                     };
                     match compact(&prep, &llm_opts).await {
                         Ok(result) => {
-                            let entry = self.persist_compaction_entry(&result).await?;
+                            let entry = self
+                                .persist_compaction_entry(
+                                    &run_id,
+                                    &result,
+                                    // `/compact` and the compaction command run when
+                                    // the user asks for them.
+                                    CompactionReason::Manual,
+                                )
+                                .await?;
                             let leaf = entry.base().id.clone();
                             let _ = self
                                 .write_operation_finished(

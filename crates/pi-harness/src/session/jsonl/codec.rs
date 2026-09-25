@@ -59,6 +59,7 @@ const RECORD_TYPES: &[&str] = &[
     "queue_cancelled",
     "write_deferred",
     "usage",
+    "assistant_frame",
 ];
 const OPERATION_KINDS: &[&str] = &["run", "compaction", "navigation"];
 

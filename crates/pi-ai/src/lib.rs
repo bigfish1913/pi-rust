@@ -11,11 +11,13 @@
 //! Every module's doc comment names the TS file it mirrors.
 
 pub mod error;
+pub mod frames;
 #[cfg(feature = "providers")]
 pub mod images;
 pub mod event_stream;
 #[cfg(feature = "providers")]
 pub mod http;
+pub mod json_parse;
 pub mod model;
 pub mod provider;
 pub mod providers;

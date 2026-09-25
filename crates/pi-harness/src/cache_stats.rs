@@ -88,9 +88,7 @@ fn detect_miss(
     let prompt_tokens = usage.input + usage.cache_read + usage.cache_write;
     // A zero-cache turn only counts when cache activity was reported before.
     let prev = prev?;
-    if prompt_tokens <= 0
-        || (usage.cache_read + usage.cache_write == 0 && !prev.reported_cache)
-    {
+    if prompt_tokens <= 0 || (usage.cache_read + usage.cache_write == 0 && !prev.reported_cache) {
         return None;
     }
 
@@ -169,14 +167,21 @@ fn scan<'a>(entries: &'a [Entry], models: &dyn ModelPriceSource) -> Scan<'a> {
                         totals.miss_count += 1;
                         misses.push((index, message, miss));
                     }
-                    prev = as_previous_request(message, prev.as_ref().map(|p| p.reported_cache).unwrap_or(false))
-                        .or(prev);
+                    prev = as_previous_request(
+                        message,
+                        prev.as_ref().map(|p| p.reported_cache).unwrap_or(false),
+                    )
+                    .or(prev);
                 }
             }
         }
     }
 
-    Scan { prev, totals, misses }
+    Scan {
+        prev,
+        totals,
+        misses,
+    }
 }
 
 /// Cumulative cache waste across a session: prompt tokens that should have been
@@ -234,7 +239,11 @@ impl CacheMissTracker {
         models: &dyn ModelPriceSource,
     ) -> Option<CacheMiss> {
         let miss = detect_miss(self.prev.as_ref(), message, models);
-        let reported = self.prev.as_ref().map(|p| p.reported_cache).unwrap_or(false);
+        let reported = self
+            .prev
+            .as_ref()
+            .map(|p| p.reported_cache)
+            .unwrap_or(false);
         if let Some(next) = as_previous_request(message, reported).or_else(|| self.prev.clone()) {
             self.prev = Some(next);
         }
@@ -245,11 +254,16 @@ impl CacheMissTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rpi_ai::types::{
-        Api, AssistantRole, ProviderId, StopReason, Usage, UsageCost,
-    };
+    use rpi_ai::types::{Api, AssistantRole, ProviderId, StopReason, Usage, UsageCost};
 
-    fn msg(provider: &str, model: &str, input: i64, cache_read: i64, cache_write: i64, ts: i64) -> AssistantMessage {
+    fn msg(
+        provider: &str,
+        model: &str,
+        input: i64,
+        cache_read: i64,
+        cache_write: i64,
+        ts: i64,
+    ) -> AssistantMessage {
         AssistantMessage {
             role: AssistantRole,
             content: vec![],

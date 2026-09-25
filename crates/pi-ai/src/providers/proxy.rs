@@ -20,17 +20,21 @@
 //!
 //! # Example
 //!
-//! ```rust
-//! use rpi_ai::proxy::{ProxyProvider, ProxyConfig};
+//! ```no_run
+//! use std::time::Duration;
+//!
+//! use rpi_ai::providers::proxy::{ProxyConfig, ProxyProvider};
 //!
 //! let config = ProxyConfig {
 //!     endpoint: "https://proxy.example.com/v1".to_string(),
 //!     api_key: Some("proxy-token".to_string()),
 //!     timeout: Some(Duration::from_secs(60)),
+//!     // `headers`/`api_key` are optional; the proxy holds the real provider key.
+//!     headers: None,
 //! };
 //!
-//! let provider = ProxyProvider::new(config);
-//! let stream = provider.stream_simple(&model, &ctx, &opts).await;
+//! let _provider = ProxyProvider::new(config);
+//! // Call `stream_simple(&model, &ctx, &opts)` from an async context to use it.
 //! ```
 
 use std::time::Duration;

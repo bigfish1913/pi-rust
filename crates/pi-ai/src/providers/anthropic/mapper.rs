@@ -20,6 +20,7 @@ use crate::error::AiError;
 use crate::event_stream::AssistantMessageEventStreamProducer;
 use crate::providers::anthropic::json_parse::parse_streaming_json;
 use crate::providers::anthropic::sse::{AnthropicEvent, SseEventStream};
+use crate::providers::{DELTA_FLUSH_BYTES, DELTA_FLUSH_INTERVAL};
 use crate::types::{
     AssistantMessage, AssistantMessageEvent, Content, DoneReason, ErrorReason, StopReason,
     TextContent, TextContentType, ThinkingContent, ThinkingContentType, ToolCall, ToolCallType,
@@ -69,6 +70,16 @@ pub struct MapperState {
     /// this to default a still-`Pending` stop reason to a normal stop instead
     /// of erroring (documented divergence — see `finalize_mapper`).
     saw_message_end: bool,
+    /// Text/thinking deltas batched but not yet emitted, with the content index
+    /// they belong to. Every event carries a full `partial: Arc<AssistantMessage>`
+    /// snapshot, so one event per wire delta made a long stream quadratic in the
+    /// message length — see [`DELTA_FLUSH_BYTES`] for the measured numbers.
+    pending_text: String,
+    pending_text_index: Option<usize>,
+    pending_thinking: String,
+    pending_thinking_index: Option<usize>,
+    /// When a batched delta was last emitted, for [`DELTA_FLUSH_INTERVAL`].
+    last_flush: std::time::Instant,
 }
 
 impl MapperState {
@@ -85,7 +96,60 @@ impl MapperState {
             blocks: Vec::new(),
             started: false,
             saw_message_end: false,
+            pending_text: String::new(),
+            pending_text_index: None,
+            pending_thinking: String::new(),
+            pending_thinking_index: None,
+            last_flush: std::time::Instant::now(),
         }
+    }
+
+    /// Whether a pending batch should be emitted now: past the byte threshold,
+    /// or older than the flush interval.
+    fn should_flush(&self, pending: &str) -> bool {
+        pending.len() >= DELTA_FLUSH_BYTES || self.last_flush.elapsed() >= DELTA_FLUSH_INTERVAL
+    }
+
+    /// Emit whatever text/thinking is batched. Called at every block boundary
+    /// (`content_block_stop`, `message_stop`, the terminal event) and whenever
+    /// the stream switches channel, so no delta is dropped or reordered.
+    fn flush_pending(&mut self, prod: &mut AssistantMessageEventStreamProducer) {
+        self.flush_text(prod);
+        self.flush_thinking(prod);
+    }
+
+    fn flush_text(&mut self, prod: &mut AssistantMessageEventStreamProducer) {
+        if self.pending_text.is_empty() {
+            return;
+        }
+        let Some(content_index) = self.pending_text_index else {
+            self.pending_text.clear();
+            return;
+        };
+        let delta = std::mem::take(&mut self.pending_text);
+        self.last_flush = std::time::Instant::now();
+        prod.push(AssistantMessageEvent::TextDelta {
+            content_index,
+            delta,
+            partial: Arc::new(self.output.clone()),
+        });
+    }
+
+    fn flush_thinking(&mut self, prod: &mut AssistantMessageEventStreamProducer) {
+        if self.pending_thinking.is_empty() {
+            return;
+        }
+        let Some(content_index) = self.pending_thinking_index else {
+            self.pending_thinking.clear();
+            return;
+        };
+        let delta = std::mem::take(&mut self.pending_thinking);
+        self.last_flush = std::time::Instant::now();
+        prod.push(AssistantMessageEvent::ThinkingDelta {
+            content_index,
+            delta,
+            partial: Arc::new(self.output.clone()),
+        });
     }
 
     fn ensure_started(&mut self, prod: &mut AssistantMessageEventStreamProducer) {
@@ -202,6 +266,10 @@ impl MapperState {
         payload: &serde_json::Value,
         prod: &mut AssistantMessageEventStreamProducer,
     ) {
+        // A new block implies the previous one is done. `content_block_stop`
+        // normally flushed already; this covers a stream that opens a block
+        // without closing the last one.
+        self.flush_pending(prod);
         self.ensure_started(prod);
         let anthropic_index = payload.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
         let Some(block) = payload.get("content_block") else {
@@ -348,10 +416,13 @@ impl MapperState {
             // rather than panic, matching the TS `if (block && ...)` guards.
             return Ok(());
         };
-        let scratch = &mut self.blocks[scratch_index];
-        let content_index = scratch.content_index;
+        // Only the tool-call arm needs the scratch buffer, and `flush_pending`
+        // needs `&mut self` — so read the two scalars here and take the buffer
+        // borrow inside that arm instead of holding one across the whole match.
+        let content_index = self.blocks[scratch_index].content_index;
+        let block_kind = self.blocks[scratch_index].kind;
 
-        match (scratch.kind, delta_type) {
+        match (block_kind, delta_type) {
             (BlockKind::Text, "text_delta") => {
                 let text = delta
                     .get("text")
@@ -361,11 +432,12 @@ impl MapperState {
                 if let Some(Content::Text(slot)) = self.output.content.get_mut(content_index) {
                     slot.text.push_str(&text);
                 }
-                prod.push(AssistantMessageEvent::TextDelta {
-                    content_index,
-                    delta: text,
-                    partial: Arc::new(self.output.clone()),
-                });
+                // Batch: `partial` is a full message clone per event.
+                self.pending_text_index = Some(content_index);
+                self.pending_text.push_str(&text);
+                if self.should_flush(&self.pending_text) {
+                    self.flush_text(prod);
+                }
             }
             (BlockKind::Thinking { redacted: false }, "thinking_delta") => {
                 let thinking = delta
@@ -376,11 +448,14 @@ impl MapperState {
                 if let Some(Content::Thinking(slot)) = self.output.content.get_mut(content_index) {
                     slot.thinking.push_str(&thinking);
                 }
-                prod.push(AssistantMessageEvent::ThinkingDelta {
-                    content_index,
-                    delta: thinking,
-                    partial: Arc::new(self.output.clone()),
-                });
+                // Keep channel order strict: text already streamed must reach the
+                // consumer before the first thinking delta of a new block.
+                self.flush_text(prod);
+                self.pending_thinking_index = Some(content_index);
+                self.pending_thinking.push_str(&thinking);
+                if self.should_flush(&self.pending_thinking) {
+                    self.flush_thinking(prod);
+                }
             }
             (BlockKind::Thinking { redacted: false }, "signature_delta") => {
                 // Append to the existing signature (initializing empty to "").
@@ -400,12 +475,18 @@ impl MapperState {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
+                // A tool-call block is a new channel; flush what is batched so
+                // the consumer never sees tool events before the text that
+                // preceded them.
+                self.flush_pending(prod);
+                let scratch = &mut self.blocks[scratch_index];
                 scratch.partial_json.push_str(&partial);
                 // Re-parse the accumulated partial JSON on every delta so the
                 // partial assistant message renders args live. Mirrors the TS
                 // `block.arguments = parseStreamingJson(block.partialJson)`.
+                let arguments = parse_streaming_json(Some(&scratch.partial_json));
                 if let Some(Content::ToolCall(slot)) = self.output.content.get_mut(content_index) {
-                    slot.arguments = parse_streaming_json(Some(&scratch.partial_json));
+                    slot.arguments = arguments;
                 }
                 prod.push(AssistantMessageEvent::ToolCallDelta {
                     content_index,
@@ -429,6 +510,11 @@ impl MapperState {
         let Some(scratch_index) = self.find_block_by_anthropic_index(anthropic_index) else {
             return;
         };
+        // Block boundary: emit the batched tail before the `*End` event that
+        // closes the block, otherwise the tail would be visible in the final
+        // message but never in the delta stream. Must happen before `scratch`
+        // takes its mutable borrow of `self.blocks`.
+        self.flush_pending(prod);
         let scratch = &mut self.blocks[scratch_index];
         let content_index = scratch.content_index;
         match scratch.kind {
@@ -760,6 +846,9 @@ pub fn emit_terminal_error(
         StopReason::Error
     };
     state.output.error_message = Some(message);
+    // Surface whatever streamed before the failure; the batched tail would
+    // otherwise be lost from the delta stream.
+    state.flush_pending(prod);
     let reason = if aborted {
         ErrorReason::Aborted
     } else {
@@ -824,6 +913,116 @@ mod tests {
         }
         let result = stream.result().await.expect("terminal result");
         Run { tags, result }
+    }
+
+    /// Frame list for `count` one-byte text deltas on block 0, closed by a
+    /// normal stop. Used by the batching tests below.
+    fn text_delta_frames(count: usize) -> Vec<ServerSentEvent> {
+        let mut frames = vec![
+            frame(
+                "message_start",
+                &j(&json!({
+                    "type": "message_start",
+                    "message": {
+                        "id": "msg_batch",
+                        "usage": {
+                            "input_tokens": 1,
+                            "output_tokens": 0,
+                            "cache_read_input_tokens": 0,
+                            "cache_creation_input_tokens": 0,
+                        },
+                    },
+                })),
+            ),
+            frame(
+                "content_block_start",
+                &j(&json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": { "type": "text", "text": "" },
+                })),
+            ),
+        ];
+        for _ in 0..count {
+            frames.push(frame(
+                "content_block_delta",
+                &j(&json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": { "type": "text_delta", "text": "x" },
+                })),
+            ));
+        }
+        frames.push(frame(
+            "content_block_stop",
+            &j(&json!({ "type": "content_block_stop", "index": 0 })),
+        ));
+        frames.push(frame(
+            "message_delta",
+            &j(&json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": "end_turn" },
+                "usage": { "output_tokens": count },
+            })),
+        ));
+        frames.push(frame(
+            "message_stop",
+            &j(&json!({ "type": "message_stop" })),
+        ));
+        frames
+    }
+
+    /// The Anthropic mapper carried the same per-delta full-message clone as the
+    /// OpenAI one, so it had the same quadratic cost. Batching is shared policy
+    /// (`providers::DELTA_FLUSH_BYTES`), and the boundary flush at
+    /// `content_block_stop` must still deliver the tail.
+    #[tokio::test]
+    async fn text_deltas_are_batched_without_losing_the_tail() {
+        let count = 500usize;
+        let run = run_fixture(text_delta_frames(count)).await;
+
+        let deltas = run.tags.iter().filter(|tag| **tag == "text_delta").count();
+        assert!(
+            deltas <= count / DELTA_FLUSH_BYTES + 5,
+            "{count} one-byte deltas must coalesce into ~{}/{DELTA_FLUSH_BYTES} events, got {deltas}",
+            count
+        );
+        assert!(deltas >= 1, "at least one delta must be emitted");
+
+        // Lossless: the finalized message holds every byte.
+        assert!(
+            matches!(&run.result.content[0], Content::Text(t) if t.text.len() == count),
+            "final message must hold all {count} bytes"
+        );
+        // The block boundary flush ran before `TextEnd`.
+        let end_at = run
+            .tags
+            .iter()
+            .position(|tag| *tag == "text_end")
+            .expect("a text_end was emitted");
+        let last_delta_at = run
+            .tags
+            .iter()
+            .rposition(|tag| *tag == "text_delta")
+            .expect("a text_delta was emitted");
+        assert!(
+            last_delta_at < end_at,
+            "the batched tail must be flushed before text_end: {:?}",
+            run.tags
+        );
+    }
+
+    #[tokio::test]
+    async fn a_short_text_block_still_emits_its_delta() {
+        // Well under the byte threshold: only the boundary flush can deliver it.
+        let run = run_fixture(text_delta_frames(1)).await;
+        assert_eq!(
+            run.tags.iter().filter(|t| **t == "text_delta").count(),
+            1,
+            "a one-byte block must still produce one delta: {:?}",
+            run.tags
+        );
+        assert!(matches!(&run.result.content[0], Content::Text(t) if t.text == "x"));
     }
 
     // Mirrors `anthropic-sse-parsing.test.ts::repairs malformed SSE JSON and

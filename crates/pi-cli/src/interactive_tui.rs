@@ -5672,6 +5672,8 @@ pub async fn interactive_tui(
     // follows the whole transcript (mirrors TS `documentContainer`).
     let document_container = Arc::new(Container::new());
     document_container.add_child(chat_container.clone());
+    // Add bottom padding to the output area for visual breathing room.
+    document_container.add_child(Arc::new(Spacer::new(1)));
 
     let scroll_view = Arc::new(ScrollView::new(
         document_container.clone(),
@@ -5874,6 +5876,8 @@ pub async fn interactive_tui(
         StackChild::Entry(StackEntry::new(state.pending_container().clone())),
         StackChild::Entry(StackEntry::new(status_container.clone())),
         StackChild::Entry(StackEntry::new(autocomplete_container.clone())),
+        // Add top padding above the input box for visual breathing room.
+        StackChild::Entry(StackEntry::new(Arc::new(Spacer::new(1)))),
         StackChild::Entry(
             StackEntry::new(editor_container.clone())
                 .shrink(0)
@@ -8231,7 +8235,12 @@ async fn handle_agent_event(
             message,
             assistant_message_event,
         } => {
-            if let AgentMessage::Assistant(a) = &message {
+            {
+                // `message` is the shared partial snapshot
+                // (`Arc<AssistantMessage>`), so read through it instead of
+                // cloning the whole growing message once per delta. The bare
+                // block preserves the original nesting.
+                let a: &rpi_ai::types::AssistantMessage = &message;
                 let text = assistant_text(a);
                 let mut saw_bash_tool_call = false;
                 // Scan content for finalized tool calls → proactively create

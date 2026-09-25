@@ -137,6 +137,16 @@ Guidelines:
 - Be concise in your responses
 - Show file paths clearly when working with files
 - Prefer the smallest change that solves the problem
+- Keep your working state in your VISIBLE replies, not only in reasoning. Reasoning is not
+  carried into your next turn: only the text you write and the tool output you produce come
+  back. Before each batch of tool calls, write one short line naming the task you are on and
+  what remains. When you finish a step, say which one is done. If you keep the plan only in
+  your head you will re-derive it from scratch every turn.
+- Track multi-step work with the todo tool instead of re-listing the plan in prose: add the
+  steps once, then mark them done as you go. Re-stating the same plan without acting on it is
+  a bug, not progress.
+- Read only what you need. If a file or search result was already shown earlier in this
+  conversation, use it instead of fetching it again.
 - When unsure about rpi commands, extensions, Pi package compatibility, or .rpi configuration, consult the project documentation before guessing
 
 Current working directory: {cwd}"
@@ -2302,6 +2312,39 @@ mod tests {
         assert!(!p.contains("- find"));
         assert!(!p.contains("- ls"));
         assert!(!p.contains("powershell"));
+    }
+
+    #[test]
+    fn default_prompt_keeps_working_state_in_the_visible_channel() {
+        // Regression guard for the re-plan loop: on openai-compatible providers
+        // the assistant's `thinking` blocks are dropped when the next request is
+        // built (`providers/openai_completions.rs`: `Content::text_only`), so a
+        // plan that lives only in reasoning is re-derived every turn. One
+        // observed session paid for that 112 times in a single run, and twice
+        // hallucinated the user's input ("The user is greeting me with hello",
+        // with no such message). See `docs/llm-repetition-forensics.md` §八.
+        let p = default_system_prompt("/tmp/proj");
+        let lower = p.to_lowercase();
+        // The rule must state the mechanism, not just "be clear".
+        assert!(
+            lower.contains("reasoning is not") && lower.contains("carried into your next turn"),
+            "the prompt must explain that reasoning does not survive the turn: {p}"
+        );
+        // …and the remedy: keep state visible, use the todo tool.
+        assert!(
+            lower.contains("visible") && lower.contains("todo tool"),
+            "the prompt must point at visible text and the todo tool: {p}"
+        );
+        // …plus the anti-repetition rule itself.
+        assert!(
+            lower.contains("re-stating the same plan"),
+            "the prompt must call out plan re-statement as a bug: {p}"
+        );
+        // And the guidance must not instruct re-reading what is already shown.
+        assert!(
+            lower.contains("already shown earlier"),
+            "the prompt must discourage re-fetching known content: {p}"
+        );
     }
 
     #[test]

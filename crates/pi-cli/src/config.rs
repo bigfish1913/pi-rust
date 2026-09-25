@@ -1282,6 +1282,57 @@ mod tests {
     }
 
     #[test]
+    fn models_json_compat_reaches_the_model_for_openai_completions() {
+        // The `compat` block is what lets a custom openai-completions provider
+        // describe its quirks. `requiresThinkingAsText` is the one that decides
+        // whether the model's own reasoning is sent back or dropped — see
+        // `docs/llm-repetition-forensics.md` §八. If this hop ever breaks, the
+        // setting silently does nothing (the provider falls back to
+        // `Content::text_only`, which drops every thinking block).
+        let config: ModelsConfig = serde_json::from_str(
+            r#"{
+                "providers": {
+                    "qwen": {
+                        "api": "openai-completions",
+                        "baseUrl": "https://coding.example.com/v1",
+                        "apiKey": "secret",
+                        "models": [{
+                            "id": "qwen3.7-plus",
+                            "maxTokens": 131072,
+                            "compat": { "requiresThinkingAsText": true }
+                        }]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let models = provider_to_models("qwen", &config.providers["qwen"]).unwrap();
+        match models[0].compat.as_ref().expect("compat must survive") {
+            StreamingProtocolCompat::OpenaiCompletions(compat) => {
+                assert_eq!(compat.requires_thinking_as_text, Some(true));
+            }
+            other => panic!("expected OpenaiCompletions compat, got {other:?}"),
+        }
+
+        // An entry without `compat` stays on the default (thinking dropped).
+        let plain: ModelsConfig = serde_json::from_str(
+            r#"{
+                "providers": {
+                    "qwen": {
+                        "api": "openai-completions",
+                        "baseUrl": "https://coding.example.com/v1",
+                        "apiKey": "secret",
+                        "models": [{"id":"qwen3.7-plus"}]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let plain_models = provider_to_models("qwen", &plain.providers["qwen"]).unwrap();
+        assert!(plain_models[0].compat.is_none());
+    }
+
+    #[test]
     fn custom_openai_provider_resolves_explicit_api_key_environment_reference() {
         let _guard = env_lock().lock().unwrap();
         let env_name = "RPI_FAKE_PROVIDER_API_KEY";

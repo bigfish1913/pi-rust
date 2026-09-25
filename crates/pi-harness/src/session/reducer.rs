@@ -227,6 +227,11 @@ pub fn validate_record_log(input: &RecordLogSlice) -> Result<(), RecordLogCorrup
             LaneRecord::ToolStarted(r) => {
                 validate_tool_start(r, &entries_by_id, &mut tool_invocations)?;
             }
+            // Assistant frames are run *progress*, not branch history: they
+            // reference no entries and impose no invariants on the tree, so the
+            // reducer only has to accept them (recovery reads them directly via
+            // `frame_progress::salvage_run_frames`).
+            LaneRecord::AssistantFrame(_) => {}
             LaneRecord::QueueEnqueued(r) => {
                 // `queue !== "nextRun"` steering/follow-up after the op aborted.
                 if r.queue != QueueKind::NextRun {
@@ -285,7 +290,7 @@ pub fn validate_record_log(input: &RecordLogSlice) -> Result<(), RecordLogCorrup
 
 /// `matchesProvisionedEntry(entry, target)`: drop `parentId`/`seq`/`timestamp`
 /// from the entry's flat JSON and deep-compare to the provisioned target.
-fn matches_provisioned_entry(entry: &Entry, target: &serde_json::Value) -> bool {
+pub(crate) fn matches_provisioned_entry(entry: &Entry, target: &serde_json::Value) -> bool {
     entry_provisioned_json(entry) == *target
 }
 
@@ -294,7 +299,7 @@ fn matches_provisioned_entry(entry: &Entry, target: &serde_json::Value) -> bool 
 /// `Omit<Entry, "parentId"|"seq"|"timestamp">`). Reuses [`Entry::to_flat_json`]
 /// (which already omits `None` optionals via serde) then strips the three
 /// storage keys.
-fn entry_provisioned_json(entry: &Entry) -> serde_json::Value {
+pub(crate) fn entry_provisioned_json(entry: &Entry) -> serde_json::Value {
     let mut value = entry.to_flat_json();
     if let serde_json::Value::Object(map) = &mut value {
         map.remove("seq");

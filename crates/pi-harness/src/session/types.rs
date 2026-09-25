@@ -793,6 +793,40 @@ impl StepAttemptRecord {
     }
 }
 
+/// One durable step of a streamed assistant message.
+///
+/// Frames are **progress, not history**: they live on the record stream rather
+/// than the branch, so they can never appear in the branch path the model's
+/// context is built from. Mirrors native pi's `pendingAssistantFrames` list
+/// storage, adapted to rpi's append-only record log — see
+/// `docs/llm-repetition-forensics.md` §十一.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssistantFrameRecord {
+    #[serde(flatten)]
+    pub base: RecordBase,
+    pub run_id: String,
+    /// Which streamed message in the run this frame belongs to. A retried turn
+    /// opens a new index, so a run can carry several streams.
+    pub stream_index: usize,
+    pub op: AssistantFrameOp,
+    /// Present for [`AssistantFrameOp::Append`]: the encoded frame
+    /// (`rpi_ai::frames::AssistantMessageFrame` as JSON).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssistantFrameOp {
+    /// One frame to append to the stream.
+    Append,
+    /// Retire every frame of the run: the run's messages are now persisted, so
+    /// the frames were only progress.
+    ClearRun,
+}
+
+/// A tool invocation coming into existence.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolStartedRecord {
@@ -917,6 +951,9 @@ pub enum LaneRecord {
     QueueCancelled(QueueCancelledRecord),
     WriteDeferred(WriteDeferredRecord),
     Usage(UsageRecord),
+    /// Streamed assistant-message progress. On the record stream, **not** the
+    /// branch: frames must never enter the context the model is built from.
+    AssistantFrame(AssistantFrameRecord),
 }
 
 impl LaneRecord {
@@ -931,6 +968,7 @@ impl LaneRecord {
             LaneRecord::QueueCancelled(r) => &r.base,
             LaneRecord::WriteDeferred(r) => &r.base,
             LaneRecord::Usage(r) => &r.base,
+            LaneRecord::AssistantFrame(r) => &r.base,
         }
     }
     pub fn seq(&self) -> u64 {
@@ -953,6 +991,7 @@ impl LaneRecord {
             LaneRecord::QueueCancelled(_) => "queue_cancelled",
             LaneRecord::WriteDeferred(_) => "write_deferred",
             LaneRecord::Usage(_) => "usage",
+            LaneRecord::AssistantFrame(_) => "assistant_frame",
         }
     }
     /// `runId` property of operation-owned records (mirrors TS `hasRunId`). The
@@ -968,6 +1007,7 @@ impl LaneRecord {
             LaneRecord::QueueCancelled(r) => r.run_id.as_deref(),
             LaneRecord::WriteDeferred(r) => Some(&r.run_id),
             LaneRecord::Usage(r) => r.run_id.as_deref(),
+            LaneRecord::AssistantFrame(r) => Some(&r.run_id),
         }
     }
 }

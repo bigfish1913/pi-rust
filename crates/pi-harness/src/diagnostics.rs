@@ -46,8 +46,14 @@ pub struct ResourceCollision {
 /// A single resource-loading diagnostic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResourceDiagnostic {
-    Warning { message: String, path: Option<String> },
-    Error { message: String, path: Option<String> },
+    Warning {
+        message: String,
+        path: Option<String>,
+    },
+    Error {
+        message: String,
+        path: Option<String>,
+    },
     Collision(ResourceCollision),
 }
 

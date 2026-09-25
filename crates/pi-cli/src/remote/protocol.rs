@@ -184,7 +184,9 @@ impl RemoteEvent {
                     _ => (None, None),
                 };
                 RemoteEvent::MessageUpdate {
-                    message: serde_json::to_value(message).unwrap_or(Value::Null),
+                    // `assistant_json` keeps this identical to the
+                    // `AgentMessage` encoding without copying the message.
+                    message: rpi_agent::message::assistant_json(message),
                     assistant_message_event: serde_json::to_value(assistant_message_event)
                         .unwrap_or(Value::Null),
                     event_type: assistant_message_event.type_tag().to_string(),
