@@ -187,7 +187,7 @@
         },
         {
           "value": "9.7×",
-          "label": "faster startup (vs native pi)"
+          "label": "faster startup (vs pi)"
         },
         {
           "value": "0",
@@ -270,8 +270,8 @@
         {
           "version": "0.3.1",
           "status": "current",
-          "title": "Build fix and a measured comparison",
-          "description": "Repairs the broken build on main, fixes how every crate presents itself on crates.io, and adds the first same-machine benchmark against native TypeScript pi."
+          "title": "Same-machine benchmark: 9.7× faster startup",
+          "description": "Measured over the same JSONL RPC protocol on the same machine: rpi starts 9.7× faster and uses 4.9× less memory, alongside the build fix on main and correct crates.io / docs.rs pages."
         },
         {
           "version": "next",
