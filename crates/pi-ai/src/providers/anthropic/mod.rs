@@ -110,7 +110,13 @@ impl AnthropicProvider {
     /// `ANTHROPIC_API_KEY` env). Mirrors how the smoke test constructs a
     /// provider without a pre-resolved key.
     pub fn from_env() -> Self {
-        let http = reqwest::Client::new();
+        // httpx-style: honor HTTP_PROXY/HTTPS_PROXY/NO_PROXY + idle timeout.
+        let http = crate::http::build_client(
+            "https://api.anthropic.com",
+            None,
+            None,
+        )
+        .unwrap_or_else(|_| reqwest::Client::new());
         Self::new(None, http)
     }
 
@@ -318,7 +324,11 @@ async fn run_anthropic_stream(
         Ok(r) => r,
         Err(err) => {
             let aborted = err.is_abort();
-            eprintln!("anthropic request failed: {err}");
+            // Deliberately NO eprintln! here: in fullscreen TUI mode a raw
+            // stderr write lands at the cursor (the input editor row), corrupting
+            // the alt-screen. The error is propagated to the UI via
+            // `emit_terminal_error` → `AssistantMessageEvent::Error`, which the
+            // TUI renders as a `✗` line in the transcript.
             emit_terminal_error(prod, &mut state, err.to_string(), aborted);
             return;
         }

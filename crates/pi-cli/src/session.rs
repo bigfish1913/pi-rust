@@ -44,12 +44,12 @@ use rpi_harness::session::types::{BranchBounds, EntryQuery, SessionMetadata};
 use rpi_harness::session::Session;
 use rpi_harness::system_prompt::compose_system_prompt;
 use rpi_harness::types::{
-    AgentHarnessOptions, AgentHarnessResources, AgentHarnessStreamOptions, CompactionSettings,
-    DrivingMode, HarnessTool, HarnessToolExecution, RetryPolicy, ToolReplay,
+    AgentHarnessOptions, AgentHarnessResources, AgentHarnessStreamOptions, DrivingMode,
+    HarnessTool, HarnessToolExecution, ToolReplay,
 };
 use rpi_tools::{
-    create_bash_tool, create_edit_tool, create_powershell_tool, create_read_tool, create_write_tool, ExecutionToolContext,
-    MutationQueueRegistry, OsExecutionEnv,
+    create_bash_tool, create_edit_tool, create_powershell_tool, create_read_tool,
+    create_write_tool, ExecutionToolContext, MutationQueueRegistry, OsExecutionEnv,
 };
 
 use crate::args::Args;
@@ -121,7 +121,25 @@ pub(crate) fn package_resources_for_update_check(
 
 /// The default coding system prompt. A condensed port of the TS
 /// `packages/coding-agent/src/core/system-prompt.ts` base prompt.
-pub fn default_system_prompt(cwd: &str) -> String {
+pub fn default_system_prompt(cwd: &str, prior_reasoning_replayed: bool) -> String {
+    // The working-state rule must match what actually comes back on the next
+    // request. With `compat.requiresThinkingAsText` (or the native thinking
+    // channels of anthropic/responses) the model *does* see its own reasoning
+    // again, and claiming otherwise makes it re-derive and restate the plan
+    // every turn — the re-plan symptom in `docs/llm-repetition-forensics.md`.
+    let working_state_rule = if prior_reasoning_replayed {
+        "- Keep a SHORT working plan visible (a few bullets, or the todo tool) and update it as you go.  
+  Your own reasoning is carried back to you on the next turn, so do not re-derive it or restate  
+  the whole plan: continue from the last unfinished step, and when a step lands, say which one.  
+  Re-listing the same plan without acting on it is a bug, not progress."
+    } else {
+        "- Keep your working state in your VISIBLE replies, not only in reasoning. Reasoning is not  
+  carried into your next turn: only the text you write and the tool output you produce come  
+  back. Before each batch of tool calls, write one short line naming the task you are on and  
+  what remains. When you finish a step, say which one is done. If you keep the plan only in  
+  your head you will re-derive it from scratch every turn."
+    };
+
     format!(
         "You are an expert coding assistant operating inside rpi, a coding agent harness. \
 You help users by reading files, executing commands, editing code, and writing new files.
@@ -137,6 +155,12 @@ Guidelines:
 - Be concise in your responses
 - Show file paths clearly when working with files
 - Prefer the smallest change that solves the problem
+{working_state_rule}
+- Track multi-step work with the todo tool instead of re-listing the plan in prose: add the
+  steps once, then mark them done as you go. Re-stating the same plan without acting on it is
+  a bug, not progress.
+- Read only what you need. If a file or search result was already shown earlier in this
+  conversation, use it instead of fetching it again.
 - When unsure about rpi commands, extensions, Pi package compatibility, or .rpi configuration, consult the project documentation before guessing
 
 Current working directory: {cwd}"
@@ -185,9 +209,16 @@ pub fn select_session(args: &Args, cwd: &Path) -> SessionSelection {
     if let Some(s) = &args.session {
         return SessionSelection::ById { id: s.clone() };
     }
+    // `--session-dir` wins; then the saved `sessionDir` (native pi's key, same
+    // format as the flag); then the built-in default.
     let dir = args
         .session_dir
         .clone()
+        .or_else(|| {
+            crate::settings::load_settings()
+                .ok()
+                .and_then(|settings| settings.session_dir)
+        })
         .unwrap_or_else(|| default_session_dir(cwd));
     SessionSelection::New {
         dir,
@@ -294,11 +325,16 @@ pub async fn build(
     // instead of fabricating a user answer. The SAME mailbox is reused across
     // `/reload` so in-flight prompts + TUI attachment survive a plugin swap.
     let ui_dialog_mailbox = rpi_extensions::UiDialogMailbox::new();
+    // Session-scoped extension status registry (runtime action 18 / `SetStatus`).
+    // The bridge lets plugins write; the TUI polls the revision and repaints its
+    // footer. Reused across `/reload` so a plugin's status survives the swap.
+    let ext_status_mailbox = rpi_extensions::ExtensionStatusMailbox::new();
     let action_bridge = rpi_extensions::ActionBridge::with_reload_and_ui(
         runtime.clone(),
         host_arc,
         rpi_extensions::reload_callback_from_mailbox(reload_mailbox.clone()),
         ui_dialog_mailbox.clone(),
+        ext_status_mailbox.clone(),
     );
 
     // ---- Execution env + tools ----
@@ -441,16 +477,21 @@ pub async fn build(
     // `<agent_dir>/SYSTEM.md`.
     // (global); otherwise the built-in default. **Project-wins** — the same
     // direction as skills/prompts precedence.
+    // Whether this model sees its own prior reasoning again decides how the
+    // working-state rule is worded (see `default_system_prompt`).
+    let prior_reasoning_replayed = rpi_ai::model::prior_reasoning_is_replayed(&resolved.model);
     let base_prompt = match args.system_prompt.as_deref() {
         Some(explicit) => explicit.to_string(),
         None if project_trusted => {
             match discover_system_prompt_file_with_packages(cwd, &package_resources) {
                 Some(path) => std::fs::read_to_string(&path)
-                    .unwrap_or_else(|_| default_system_prompt(&cwd_str)),
-                None => default_system_prompt(&cwd_str),
+                    .unwrap_or_else(|_| {
+                        default_system_prompt(&cwd_str, prior_reasoning_replayed)
+                    }),
+                None => default_system_prompt(&cwd_str, prior_reasoning_replayed),
             }
         }
-        None => default_system_prompt(&cwd_str),
+        None => default_system_prompt(&cwd_str, prior_reasoning_replayed),
     };
 
     // ---- Append-text sources (precedence: --append-system-prompt > APPEND_SYSTEM.md) ----
@@ -515,6 +556,7 @@ pub async fn build(
 
     let mut skills: Vec<rpi_harness::types::Skill> = Vec::new();
     let mut skill_diags: Vec<rpi_harness::skills::SkillDiagnostic> = Vec::new();
+    let mut resource_diags: Vec<rpi_harness::diagnostics::ResourceDiagnostic> = Vec::new();
     if !args.no_skills {
         let mut dirs = if args.dev_local_only {
             project_skill_dirs(cwd)
@@ -532,6 +574,7 @@ pub async fn build(
         let result = load_skills_with_precedence(&env_dyn, &dirs).await;
         skills = result.skills;
         skill_diags = result.diagnostics;
+        resource_diags.extend(result.resource_diagnostics);
     }
 
     let mut prompt_templates: Vec<rpi_harness::types::PromptTemplate> = Vec::new();
@@ -553,6 +596,7 @@ pub async fn build(
         let result = load_prompt_templates_with_precedence(&env_dyn, &dirs).await;
         prompt_templates = result.prompt_templates;
         prompt_diags = result.diagnostics;
+        resource_diags.extend(result.resource_diagnostics);
     }
 
     let context_block = if args.no_context_files || !project_trusted {
@@ -587,6 +631,18 @@ pub async fn build(
                 d.code.as_str(),
                 d.message
             );
+        }
+        // Structured collisions: make the winner/loser explicit.
+        for d in &resource_diags {
+            if let rpi_harness::diagnostics::ResourceDiagnostic::Collision(c) = d {
+                eprintln!(
+                    "warning: {} name \"{}\" collision: keeping {} (shadowed {})",
+                    c.resource_type.as_str(),
+                    c.name,
+                    c.winner_path,
+                    c.loser_path
+                );
+            }
         }
     }
 
@@ -708,6 +764,23 @@ pub async fn build(
         None => broadcast_emitter,
     };
 
+    // Saved user defaults. Best-effort: a missing or malformed file must not stop
+    // a session from starting, and every accessor falls back to the harness
+    // default when its key is absent.
+    let saved_settings = crate::settings::load_settings().unwrap_or_default();
+
+    // `httpProxy` applies to rpi's own HTTP clients. Setting the environment is how
+    // they are configured (`pi-ai/src/http.rs`), and native pi does the same thing
+    // with this key — an explicit environment variable still wins, so a shell-level
+    // proxy override is not silently replaced by the setting.
+    if let Some(proxy) = &saved_settings.http_proxy {
+        for key in ["HTTP_PROXY", "HTTPS_PROXY"] {
+            if std::env::var_os(key).is_none() {
+                std::env::set_var(key, proxy);
+            }
+        }
+    }
+
     let options = AgentHarnessOptions {
         model: resolved.model.clone(),
         thinking_level: resolved.thinking_level,
@@ -739,10 +812,14 @@ pub async fn build(
             timeout: args.timeout,
             ..Default::default()
         },
-        retry: RetryPolicy::default(),
-        compaction: CompactionSettings::default(),
-        steering_mode: Default::default(),
-        follow_up_mode: Default::default(),
+        // Settings-backed harness options: native pi lets users tune retry,
+        // compaction and queue drain modes from settings.json. Global only,
+        // matching how `defaultTools` and the other settings-backed options in
+        // this file are read.
+        retry: saved_settings.retry_policy(),
+        compaction: saved_settings.compaction_settings(),
+        steering_mode: saved_settings.steering_mode(),
+        follow_up_mode: saved_settings.follow_up_mode(),
         tool_execution: HarnessToolExecution::default(),
         drive: DrivingMode::default(),
         session,
@@ -852,6 +929,7 @@ pub async fn build(
         broadcast: broadcast_for_context,
         mailbox: reload_mailbox,
         ui_dialog: ui_dialog_mailbox,
+        ext_status: ext_status_mailbox,
         dev_extension: None,
     };
 
@@ -929,6 +1007,9 @@ pub struct ReloadContext {
     pub package_resources: Arc<crate::packages::PackageResources>,
     /// The live action-bridge cell (swapped + old invalidated on reload).
     pub action_bridge: ActionBridgeCell,
+    /// The extension status registry the TUI renders in its footer (`SetStatus`).
+    /// Lives in the context (not the cell) so it survives a bridge swap.
+    pub ext_status: rpi_extensions::ExtensionStatusMailbox,
     /// The model catalog (read-only) the host uses to resolve `set_model(id)`.
     /// `available_catalog(resolved)` is captured once — reload does not re-resolve
     /// the provider (auth/provider resolution is a startup concern; reloading
@@ -1164,6 +1245,7 @@ where
         host,
         reload_cb,
         ctx.ui_dialog.clone(),
+        ctx.ext_status.clone(),
     );
 
     let extension_session = if effective_args.no_extensions {
@@ -1236,6 +1318,7 @@ where
 
     let mut skills: Vec<rpi_harness::types::Skill> = Vec::new();
     let mut skill_diags: Vec<rpi_harness::skills::SkillDiagnostic> = Vec::new();
+    let mut resource_diags: Vec<rpi_harness::diagnostics::ResourceDiagnostic> = Vec::new();
     if !effective_args.no_skills {
         // JS discovery is backed by the session-long lazy Node host. Until
         // that host is swapped as part of a future full JS reload, preserve
@@ -1256,6 +1339,7 @@ where
         let result = load_skills_with_precedence(&env_dyn, &dirs).await;
         skills = result.skills;
         skill_diags = result.diagnostics;
+        resource_diags.extend(result.resource_diagnostics);
     }
 
     let mut prompt_templates: Vec<rpi_harness::types::PromptTemplate> = Vec::new();
@@ -1277,6 +1361,7 @@ where
         let result = load_prompt_templates_with_precedence(&env_dyn, &dirs).await;
         prompt_templates = result.prompt_templates;
         prompt_diags = result.diagnostics;
+        resource_diags.extend(result.resource_diagnostics);
     }
 
     let context_block = if effective_args.no_context_files {
@@ -1292,6 +1377,7 @@ where
     if !skill_diags.is_empty()
         || !prompt_diags.is_empty()
         || !package_resources.diagnostics.is_empty()
+        || !resource_diags.is_empty()
     {
         warnings = true;
         // Collect formatted diagnostics for the caller to surface in its UI
@@ -1317,16 +1403,32 @@ where
                 d.message
             ));
         }
+        // Structured collisions: winner (kept) · loser (shadowed).
+        for d in &resource_diags {
+            if let rpi_harness::diagnostics::ResourceDiagnostic::Collision(c) = d {
+                details.push(format!(
+                    "warning: {} name \"{}\" collision: keeping {} (shadowed {})",
+                    c.resource_type.as_str(),
+                    c.name,
+                    c.winner_path,
+                    c.loser_path
+                ));
+            }
+        }
     }
 
     // ---- Re-compose the system prompt (same precedence as build) ----
+    // Same working-state wording rule as `build`; a mid-session `/model` switch
+    // re-composes the prompt on the next reload, which is the same staleness the
+    // rest of this path already has (provider resolution is a startup concern).
+    let prior_reasoning_replayed =
+        rpi_ai::model::prior_reasoning_is_replayed(&ctx.resolved_model);
     let base_prompt = match effective_args.system_prompt.as_deref() {
         Some(explicit) => explicit.to_string(),
         None => match discover_system_prompt_file_with_packages(&ctx.cwd, &package_resources) {
-            Some(path) => {
-                std::fs::read_to_string(&path).unwrap_or_else(|_| default_system_prompt(&cwd_str))
-            }
-            None => default_system_prompt(&cwd_str),
+            Some(path) => std::fs::read_to_string(&path)
+                .unwrap_or_else(|_| default_system_prompt(&cwd_str, prior_reasoning_replayed)),
+            None => default_system_prompt(&cwd_str, prior_reasoning_replayed),
         },
     };
     let mut append_texts: Vec<String> = Vec::new();
@@ -1502,6 +1604,7 @@ fn load_reload_settings_snapshot(
 
 /// Validate every settings document that this reload will consume before
 /// replacing any live extension, bridge, or harness resource.
+#[cfg(test)]
 fn validate_settings_for_reload(
     args: &Args,
     cwd: &Path,
@@ -1809,8 +1912,14 @@ pub fn bash_options() -> rpi_tools::tools::bash::BashToolOptions {
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(120.0);
+    // Saved user defaults, matching how `defaultTools` is read in `build_tools`.
+    // `shellCommandPrefix` is prepended to every command (native pi's key for
+    // alias/`shopt` setup). Native's `shellPath` is *not* wired: neither
+    // `BashToolOptions` nor `ShellCaptureOptions` carries a shell binary today, so
+    // honouring it means plumbing one through pi-tools first.
+    let settings = crate::settings::load_settings().unwrap_or_default();
     BashToolOptions {
-        command_prefix: None,
+        command_prefix: settings.shell_command_prefix.clone(),
         default_timeout: Some(default),
     }
 }
@@ -1821,15 +1930,27 @@ fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
     }
     // Keep the coding tools aligned with Pi and expose rpi's read-only docs
     // lookup as a default assistant capability.
+    //
+    // Replay policy (native `ToolDeclaration.replay`): only tools that are
+    // genuinely free of side effects may be re-run when a crash leaves their
+    // outcome unknown — everything else must stay `Never`, because replaying
+    // `bash`/`write`/`edit` would duplicate a side effect. `HarnessTool::new`
+    // already defaults to `Never`, so this is opt-in per read-only tool.
     let mut all: Vec<(&'static str, HarnessTool)> = vec![
-        ("read", HarnessTool::new(create_read_tool(ctx, None))),
+        (
+            "read",
+            HarnessTool::new(create_read_tool(ctx, None)).with_replay(ToolReplay::Safe),
+        ),
         (
             "bash",
             HarnessTool::new(create_bash_tool(ctx, Some(bash_options()))),
         ),
         ("edit", HarnessTool::new(create_edit_tool(ctx))),
         ("write", HarnessTool::new(create_write_tool(ctx))),
-        ("docs", HarnessTool::new(create_docs_tool())),
+        (
+            "docs",
+            HarnessTool::new(create_docs_tool()).with_replay(ToolReplay::Safe),
+        ),
     ];
 
     // Add PowerShell tool on Windows
@@ -1861,9 +1982,7 @@ fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
         all.retain(|(name, _)| !deny.iter().any(|d| d == name));
     }
 
-    all.into_iter()
-        .map(|(_, t)| t.with_replay(ToolReplay::Safe))
-        .collect()
+    all.into_iter().map(|(_, t)| t).collect()
 }
 
 /// Resolve the active tool names from the constructed tools when no explicit
@@ -2156,6 +2275,19 @@ async fn open_session(
         .open_by_jsonl_metadata(meta)
         .await
         .map_err(|e| BuildError::SessionDir(format!("open {}: {e}", meta.path)))?;
+    // A session records the cwd it was created in. When that directory has
+    // since been removed, continuing silently in it is confusing; warn the
+    // user that we fell back to the process cwd (pi `getMissingSessionCwdIssue`).
+    if let Some(issue) = crate::session_cwd::get_missing_session_cwd_issue(
+        Some(Path::new(&meta.path)),
+        Path::new(&meta.cwd),
+        Path::new(cwd),
+    ) {
+        eprintln!(
+            "warning: {}",
+            crate::session_cwd::format_missing_session_cwd_error(&issue)
+        );
+    }
     let storage_arc: Arc<dyn SessionStorage> = Arc::new(storage);
     Ok(Session::new(storage_arc, None))
 }
@@ -2246,7 +2378,7 @@ mod tests {
 
     #[test]
     fn default_prompt_mentions_cwd_and_tools() {
-        let p = default_system_prompt("/tmp/proj");
+        let p = default_system_prompt("/tmp/proj", false);
         assert!(p.contains("/tmp/proj"));
         assert!(p.contains("read"));
         assert!(p.contains("bash"));
@@ -2257,6 +2389,111 @@ mod tests {
         assert!(!p.contains("- find"));
         assert!(!p.contains("- ls"));
         assert!(!p.contains("powershell"));
+    }
+
+    #[test]
+    fn default_prompt_keeps_working_state_in_the_visible_channel() {
+        // Regression guard for the re-plan loop: on openai-compatible providers
+        // the assistant's `thinking` blocks are dropped when the next request is
+        // built (`providers/openai_completions.rs`: `Content::text_only`), so a
+        // plan that lives only in reasoning is re-derived every turn. One
+        // observed session paid for that 112 times in a single run, and twice
+        // hallucinated the user's input ("The user is greeting me with hello",
+        // with no such message). See `docs/llm-repetition-forensics.md` §八.
+        let p = default_system_prompt("/tmp/proj", false);
+        let lower = p.to_lowercase();
+        // The rule must state the mechanism, not just "be clear".
+        assert!(
+            lower.contains("reasoning is not") && lower.contains("carried into your next turn"),
+            "the prompt must explain that reasoning does not survive the turn: {p}"
+        );
+        // …and the remedy: keep state visible, use the todo tool.
+        assert!(
+            lower.contains("visible") && lower.contains("todo tool"),
+            "the prompt must point at visible text and the todo tool: {p}"
+        );
+        // …plus the anti-repetition rule itself.
+        assert!(
+            lower.contains("re-stating the same plan"),
+            "the prompt must call out plan re-statement as a bug: {p}"
+        );
+        // And the guidance must not instruct re-reading what is already shown.
+        assert!(
+            lower.contains("already shown earlier"),
+            "the prompt must discourage re-fetching known content: {p}"
+        );
+    }
+
+    #[test]
+    fn default_prompt_does_not_claim_reasoning_is_lost_when_it_is_replayed() {
+        // `compat.requiresThinkingAsText` (and the native thinking channels of
+        // anthropic-messages / openai-responses) DO carry the model's reasoning
+        // back on the next request. Telling such a model "reasoning is not
+        // carried into your next turn" is false, and the instruction to restate
+        // the plan every turn is exactly the busy-work the re-plan analysis
+        // measured. The wording must flip with the mechanism.
+        let p = default_system_prompt("/tmp/proj", true);
+        let lower = p.to_lowercase();
+        assert!(
+            lower.contains("carried back"),
+            "a replaying model must be told its reasoning survives: {p}"
+        );
+        assert!(
+            !lower.contains("reasoning is not"),
+            "the replayed variant must not claim reasoning is dropped: {p}"
+        );
+        assert!(
+            lower.contains("do not re-derive"),
+            "the replayed variant must forbid re-deriving the plan: {p}"
+        );
+        assert!(
+            lower.contains("do not re-derive") && lower.contains("re-listing the same plan"),
+            "the anti-repetition rule must survive the flip: {p}"
+        );
+        assert!(
+            lower.contains("already shown earlier"),
+            "the re-read rule must survive the flip: {p}"
+        );
+    }
+
+    /// Only side-effect-free tools may be replayed after a crash.
+    ///
+    /// Regression guard for an inverted default: `ToolReplay` used to default to
+    /// `Safe` and the CLI then marked *every* tool `Safe`, so the first time
+    /// recovery acted on the flag it would have re-run `bash`/`write`/`edit` and
+    /// duplicated their side effects. Native pi defaults to `"never"`
+    /// (`drive/tools.ts: tool.replay ?? "never"`).
+    #[test]
+    fn only_read_only_tools_are_replayable() {
+        let env = Arc::new(OsExecutionEnv::with_cwd(PathBuf::from(".")));
+        let env_dyn: Arc<dyn rpi_tools::ExecutionEnv> = env.clone();
+        let mut_env: Arc<dyn rpi_tools::MutatingEnv> = env.clone();
+        let context = ExecutionToolContext::new(env_dyn, Some(mut_env));
+        let tools = build_tools(&context, &Args::default());
+
+        let replay_of = |name: &str| {
+            tools
+                .iter()
+                .find(|tool| tool.tool.schema().name == name)
+                .map(|tool| tool.replay)
+        };
+
+        for read_only in ["read", "docs"] {
+            assert_eq!(
+                replay_of(read_only),
+                Some(ToolReplay::Safe),
+                "{read_only} is side-effect free, so recovery may re-run it"
+            );
+        }
+        for mutating in ["bash", "edit", "write", "powershell"] {
+            if let Some(replay) = replay_of(mutating) {
+                assert_eq!(
+                    replay,
+                    ToolReplay::Never,
+                    "{mutating} must never be replayed: re-running it would duplicate its effect"
+                );
+            }
+        }
     }
 
     #[test]

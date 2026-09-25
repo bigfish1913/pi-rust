@@ -421,6 +421,14 @@ pub(crate) fn stamp_record(
             r.base = stamp(r.base);
             LaneRecord::Usage(r)
         }
+        LaneRecord::AssistantFrame(mut r) => {
+            r.base = stamp(r.base);
+            LaneRecord::AssistantFrame(r)
+        }
+        LaneRecord::RetryPending(mut r) => {
+            r.base = stamp(r.base);
+            LaneRecord::RetryPending(r)
+        }
     }
 }
 

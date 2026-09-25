@@ -105,12 +105,35 @@ pub fn global_config_file(name: &str) -> Option<PathBuf> {
 /// Startup code that has passed the package gate supplies its resolved resource
 /// set to [`discover_system_prompt_file_with_packages`].
 ///
-/// **Trust gate (v1 divergence):** pi gates the **project** `SYSTEM.md` behind
-/// `settingsManager.isProjectTrusted()` (global is always honored). rpi v1 has
-/// no trust prompt (`config.rs:349`), so project files are read unconditionally
-/// — a copied `.rpi/` or `.pi/` drops in and works. Full trust gating is deferred.
+/// **Trust gate:** When `project_trusted` is `false`, project-level files are
+/// skipped and only global files are considered. This prevents untrusted
+/// projects from injecting system prompts.
 pub fn discover_system_prompt_file(cwd: &Path) -> Option<PathBuf> {
-    discover_system_prompt_file_with_packages(cwd, &crate::packages::PackageResources::default())
+    discover_system_prompt_file_with_trust(cwd, true, &crate::packages::PackageResources::default())
+}
+
+/// Discover `SYSTEM.md` with explicit trust control.
+///
+/// When `project_trusted` is `false`, project-level files are skipped.
+pub fn discover_system_prompt_file_with_trust(
+    cwd: &Path,
+    project_trusted: bool,
+    packages: &crate::packages::PackageResources,
+) -> Option<PathBuf> {
+    if project_trusted {
+        for project in project_config_files(cwd, "SYSTEM.md") {
+            if project.is_file() {
+                return Some(project);
+            }
+        }
+    }
+    if let Some(global) = global_config_file("SYSTEM.md").filter(|p| p.is_file()) {
+        return Some(global);
+    }
+    packages
+        .system_prompt_files()
+        .into_iter()
+        .find(|path| path.is_file())
 }
 
 /// Discover `SYSTEM.md` with already-resolved package resources. Package files
@@ -246,6 +269,49 @@ pub fn dedupe_prompt_templates(
     out
 }
 
+/// Structured variant of [`dedupe_skills`]: emits a [`ResourceDiagnostic`] per
+/// shadowed skill (winner/loser path) instead of a stringly-typed diagnostic.
+/// Callers that want to surface collisions in the UI (e.g. `/reload`) use this.
+pub fn dedupe_skills_structured(
+    skills: Vec<Skill>,
+    diagnostics: &mut Vec<rpi_harness::diagnostics::ResourceDiagnostic>,
+) -> Vec<Skill> {
+    use rpi_harness::diagnostics::{dedupe_by_name, ResourceType};
+    let keys: Vec<(String, String)> = skills
+        .iter()
+        .map(|s| (s.name.clone(), s.file_path.clone()))
+        .collect();
+    let refs: Vec<(&str, &str)> = keys.iter().map(|(n, p)| (n.as_str(), p.as_str())).collect();
+    let (winners, diags) = dedupe_by_name(ResourceType::Skill, refs);
+    diagnostics.extend(diags);
+    let winner_set: std::collections::HashSet<usize> = winners.into_iter().collect();
+    skills
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, skill)| winner_set.contains(&index).then_some(skill))
+        .collect()
+}
+
+/// Structured variant of [`dedupe_prompt_templates`]. `PromptTemplate` carries
+/// no file path, so the collision loser/winner paths fall back to the template
+/// name (documented divergence).
+pub fn dedupe_prompt_templates_structured(
+    templates: Vec<PromptTemplate>,
+    diagnostics: &mut Vec<rpi_harness::diagnostics::ResourceDiagnostic>,
+) -> Vec<PromptTemplate> {
+    use rpi_harness::diagnostics::{dedupe_by_name, ResourceType};
+    let keys: Vec<String> = templates.iter().map(|t| t.name.clone()).collect();
+    let refs: Vec<(&str, &str)> = keys.iter().map(|n| (n.as_str(), n.as_str())).collect();
+    let (winners, diags) = dedupe_by_name(ResourceType::Prompt, refs);
+    diagnostics.extend(diags);
+    let winner_set: std::collections::HashSet<usize> = winners.into_iter().collect();
+    templates
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, t)| winner_set.contains(&index).then_some(t))
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Precedence-aware loaders: project dir → global dir → dedupe (project wins)
 // ---------------------------------------------------------------------------
@@ -263,7 +329,13 @@ pub async fn load_skills_with_precedence(
         .map(|d| d.to_string_lossy().into_owned())
         .collect();
     let mut result = load_skills(env, &dir_strs).await;
-    result.skills = dedupe_skills(result.skills, &mut result.diagnostics);
+    // Collect structured collisions from the pre-dedupe list so the UI can
+    // show winner/loser paths (native `ResourceDiagnostic`), then dedupe.
+    let mut structured = Vec::new();
+    let raw = std::mem::take(&mut result.skills);
+    let _ = dedupe_skills_structured(raw.clone(), &mut structured);
+    result.skills = dedupe_skills(raw, &mut result.diagnostics);
+    result.resource_diagnostics = structured;
     result
 }
 
@@ -279,8 +351,11 @@ pub async fn load_prompt_templates_with_precedence(
         .map(|p| p.to_string_lossy().into_owned())
         .collect();
     let mut result = load_prompt_templates(env, &path_strs).await;
-    result.prompt_templates =
-        dedupe_prompt_templates(result.prompt_templates, &mut result.diagnostics);
+    let mut structured = Vec::new();
+    let raw = std::mem::take(&mut result.prompt_templates);
+    let _ = dedupe_prompt_templates_structured(raw.clone(), &mut structured);
+    result.prompt_templates = dedupe_prompt_templates(raw, &mut result.diagnostics);
+    result.resource_diagnostics = structured;
     result
 }
 

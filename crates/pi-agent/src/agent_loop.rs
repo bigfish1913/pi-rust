@@ -112,6 +112,7 @@ pub async fn run_agent_loop(
         &config,
         &emit,
         &stream_fn,
+        None,
     )
     .await?;
     Ok(new_messages)
@@ -149,6 +150,49 @@ pub async fn run_agent_loop_continue(
         &config,
         &emit,
         &stream_fn,
+        None,
+    )
+    .await?;
+    Ok(new_messages)
+}
+
+/// Continue a run whose last assistant message has **not had its tools run**.
+///
+/// This is the case a *deferred* (long-poll) provider creates: the turn's
+/// assistant message arrives from a poll rather than from the loop, so it is
+/// already in the transcript while its tool calls are still unanswered. The next
+/// provider request would be rejected (every provider refuses an assistant message
+/// whose tool calls have no results), so the tools must run first — which is
+/// exactly what this entry point does before continuing the loop normally.
+///
+/// Errors when the last message is not an assistant message: there would be
+/// nothing to resume, and silently calling the provider instead would be wrong.
+pub async fn run_agent_loop_from_assistant(
+    context: AgentContext,
+    config: AgentLoopConfig,
+    emit: Arc<dyn AgentEmitter>,
+    stream_fn: StreamFn,
+) -> Result<NewMessages, AgentError> {
+    let mut current_context = context;
+    let Some(AgentMessage::Assistant(assistant)) = current_context.messages.last().cloned() else {
+        return Err(AgentError::State(
+            "cannot continue from an assistant whose tools already ran: the last message is not an              assistant message"
+                .into(),
+        ));
+    };
+    let mut new_messages: Vec<AgentMessage> = Vec::new();
+
+    emit_event(&emit, AgentEvent::AgentStart).await;
+    // The turn whose tools are about to run is the current turn.
+    emit_event(&emit, AgentEvent::TurnStart).await;
+
+    run_loop(
+        &mut current_context,
+        &mut new_messages,
+        &config,
+        &emit,
+        &stream_fn,
+        Some(*assistant),
     )
     .await?;
     Ok(new_messages)
@@ -179,7 +223,14 @@ async fn run_loop(
     config: &AgentLoopConfig,
     emit: &Arc<dyn AgentEmitter>,
     stream_fn: &StreamFn,
+    // `pending_assistant`: an assistant message already sitting at the end of
+    // `current_context` whose tool calls have not run yet (see
+    // `run_agent_loop_from_assistant`). When set, the first iteration executes its
+    // tools instead of calling the provider — and does *not* push it into
+    // `new_messages`, because it is already in the transcript.
+    pending_assistant: Option<AssistantMessage>,
 ) -> Result<LoopOutcome, AgentError> {
+    let mut pending_assistant = pending_assistant;
     let mut first_turn = true;
     // Check for steering messages at start (user may have typed while waiting).
     let mut pending_messages = drain_steering(config).await;
@@ -219,10 +270,17 @@ async fn run_loop(
                 }
             }
 
-            // Stream the assistant response.
-            let message =
-                stream_assistant_response(current_context, config, emit, stream_fn).await?;
-            new_messages.push(AgentMessage::Assistant(Box::new(message.clone())));
+            // Stream the assistant response — unless the caller handed us one
+            // whose tools still have to run.
+            let message = match pending_assistant.take() {
+                Some(message) => message,
+                None => {
+                    let message =
+                        stream_assistant_response(current_context, config, emit, stream_fn).await?;
+                    new_messages.push(AgentMessage::Assistant(Box::new(message.clone())));
+                    message
+                }
+            };
 
             if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
                 let am = AgentMessage::Assistant(Box::new(message.clone()));
@@ -438,14 +496,19 @@ async fn stream_assistant_response(
             | AssistantMessageEvent::ToolCallDelta { partial, .. }
             | AssistantMessageEvent::ToolCallEnd { partial, .. } => {
                 if added_partial {
-                    let am = AgentMessage::Assistant(Box::new((**partial).clone()));
-                    if let Some(last) = context.messages.last_mut() {
-                        *last = am.clone();
-                    }
+                    // No `context.messages` update here: nothing reads it between
+                    // deltas (`transform_context`/`convert_to_llm` ran before this
+                    // loop), and `Start` already pushed the slot while the
+                    // terminal arm replaces it with the finalized message. Keeping
+                    // the old `*last = am.clone()` copied the whole growing message
+                    // once per delta for no observable effect.
                     emit_event(
                         emit,
                         AgentEvent::MessageUpdate {
-                            message: am,
+                            // `Arc` bump, not a deep clone: this fires once per
+                            // streaming delta, and the provider already built the
+                            // snapshot it hands us.
+                            message: Arc::clone(partial),
                             assistant_message_event: event.clone(),
                         },
                     )
@@ -1108,7 +1171,7 @@ fn create_tool_result_message(
         usage: result.usage.clone(),
         added_tool_names: result.added_tool_names.clone(),
         is_error,
-        timestamp: now_ms(),
+        timestamp: crate::clock::now_ms(),
     }
 }
 
@@ -1220,14 +1283,6 @@ async fn should_stop_after_turn(
 /// Emit one event via the emitter.
 async fn emit_event(emit: &Arc<dyn AgentEmitter>, event: AgentEvent) {
     emit.emit(event).await;
-}
-
-/// Monotonic-ish ms timestamp. The loop only needs ordering + JSONL serializability,
-/// not wall-clock accuracy. Uses an atomic counter so tests are deterministic.
-fn now_ms() -> i64 {
-    use std::sync::atomic::{AtomicI64, Ordering};
-    static T: AtomicI64 = AtomicI64::new(1);
-    T.fetch_add(1, Ordering::Relaxed)
 }
 
 /// A placeholder tool call for the panic-recovery path.

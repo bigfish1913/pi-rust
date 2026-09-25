@@ -13,7 +13,8 @@ use rpi_harness::session::jsonl::{
     JsonlDecodeErrorKind, JsonlSessionMetadata, JsonlSourceFormat, JsonlV4Header,
 };
 use rpi_harness::session::types::{
-    EntryBase, LaneRecord, OperationIntent, OperationStartedRecord, RecordBase, SessionMutation,
+    AssistantFrameOp, AssistantFrameRecord, EntryBase, LaneRecord, OperationIntent,
+    OperationStartedRecord, RecordBase, SessionMutation,
 };
 
 fn header_with_parent() -> JsonlV4Header {
@@ -242,6 +243,59 @@ fn mutation_round_trips_imported_entry_line_without_lane() {
 #[test]
 fn mutation_round_trips_record_line() {
     let record = operation_started_record(1, "main", "run-1");
+    assert_mutation_round_trip(&record_mutation(record));
+}
+
+/// Frame progress must survive a JSONL round trip, because that is the storage
+/// a real crashed session is recovered from — the in-memory tests would not
+/// catch a missing codec whitelist entry.
+#[test]
+fn mutation_round_trips_assistant_frame_record() {
+    let record = LaneRecord::AssistantFrame(AssistantFrameRecord {
+        base: RecordBase {
+            id: "frame-1".into(),
+            seq: 1,
+            lane: "main".into(),
+            timestamp: 7,
+        },
+        run_id: "run-1".into(),
+        stream_index: 0,
+        op: AssistantFrameOp::Append,
+        frame: Some(serde_json::json!({"type": "text_delta", "contentIndex": 0, "delta": "hi"})),
+    });
+    let line = encode_mutation(&record_mutation(record.clone()));
+    // Must be the camelCase wire form the codec whitelist expects.
+    assert!(
+        line.contains(r#""type":"assistant_frame""#),
+        "record line must carry its record type tag: {line}"
+    );
+    assert!(
+        line.contains(r#""runId":"run-1""#) && line.contains(r#""streamIndex":0"#),
+        "record fields must be camelCase like every sibling record: {line}"
+    );
+    assert_mutation_round_trip(&record_mutation(record));
+}
+
+/// The `ClearRun` marker is what retires a committed run's frames.
+#[test]
+fn mutation_round_trips_assistant_frame_clear_run_record() {
+    let record = LaneRecord::AssistantFrame(AssistantFrameRecord {
+        base: RecordBase {
+            id: "frame-2".into(),
+            seq: 2,
+            lane: "main".into(),
+            timestamp: 8,
+        },
+        run_id: "run-1".into(),
+        stream_index: 0,
+        op: AssistantFrameOp::ClearRun,
+        frame: None,
+    });
+    let line = encode_mutation(&record_mutation(record.clone()));
+    assert!(
+        line.contains(r#""op":"clear_run""#) && !line.contains(r#""frame""#),
+        "a clear marker carries no frame payload: {line}"
+    );
     assert_mutation_round_trip(&record_mutation(record));
 }
 

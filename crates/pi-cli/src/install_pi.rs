@@ -2883,6 +2883,7 @@ fn normalize_git_clone_url(repo: &str) -> Result<String, String> {
     Err(format!("invalid git repository source `{repo}`"))
 }
 
+#[cfg(test)]
 fn git_package_name(repo: &str) -> String {
     let leaf = repo
         .trim_end_matches('/')

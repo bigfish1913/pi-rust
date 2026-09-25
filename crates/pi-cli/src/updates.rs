@@ -616,6 +616,7 @@ fn merge_and_write_cache(
     cache
 }
 
+#[cfg(test)]
 fn git_results_with_cache_fallback(
     results: Vec<(String, GitLookup)>,
     cached: Option<&BTreeMap<String, GitUpdateCache>>,
@@ -644,6 +645,7 @@ fn git_results_with_cache_fallback(
     (values, used_fallback)
 }
 
+#[cfg(test)]
 fn results_with_cache_fallback(
     results: Vec<(String, RegistryLookup)>,
     cached: Option<&BTreeMap<String, String>>,
@@ -677,10 +679,12 @@ fn lookup_with_cache_fallback(
     }
 }
 
+#[cfg(test)]
 fn cache_fallback_is_fresh(cache: &UpdateCache, now: i64) -> bool {
     timestamp_is_fresh(cache.checked_at, now)
 }
 
+#[cfg(test)]
 fn report_from_cache(
     cache: &UpdateCache,
     package_resources: Option<&crate::packages::PackageResources>,

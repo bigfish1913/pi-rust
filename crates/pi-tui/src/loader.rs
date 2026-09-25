@@ -8,6 +8,19 @@ use std::time::{Duration, Instant};
 
 use super::component::Component;
 
+/// Canonical working-spinner frames, in order.
+///
+/// Shared by [`Loader`] and the editor's working indicator so both animate
+/// identically. Mirrors native pi's `DEFAULT_FRAMES`.
+///
+/// [`Loader`]: crate::loader::Loader
+pub const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// Frame interval for animated indicators. Mirrors native pi's
+/// `DEFAULT_INTERVAL_MS`: one frame per 80 ms, i.e. a full 10-frame cycle every
+/// 800 ms.
+pub const SPINNER_FRAME_MS: u64 = 80;
+
 /// Loader indicator options.
 #[derive(Debug, Clone)]
 pub struct LoaderIndicatorOptions {
@@ -22,8 +35,8 @@ pub struct LoaderIndicatorOptions {
 impl Default for LoaderIndicatorOptions {
     fn default() -> Self {
         Self {
-            spinner_chars: "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏".chars().collect(),
-            frame_duration_ms: 80,
+            spinner_chars: SPINNER_FRAMES.to_vec(),
+            frame_duration_ms: SPINNER_FRAME_MS,
             text: None,
         }
     }

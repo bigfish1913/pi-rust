@@ -14,6 +14,7 @@ pub mod abort;
 pub mod agent;
 pub mod agent_loop;
 pub mod agent_tool;
+pub(crate) mod clock;
 pub mod error;
 pub mod events;
 pub mod hooks;
@@ -24,7 +25,10 @@ pub mod types;
 
 pub use abort::AbortHandle;
 pub use agent::{Agent, AgentBuilder, AgentOptions};
-pub use agent_loop::{run_agent_loop, run_agent_loop_continue, LoopOutcome, NewMessages};
+pub use agent_loop::{
+    run_agent_loop, run_agent_loop_continue, run_agent_loop_from_assistant, LoopOutcome,
+    NewMessages,
+};
 pub use agent_tool::AgentTool;
 pub use error::AgentError;
 pub use events::{AgentEmitter, AgentEvent, CollectorEmitter};

@@ -72,6 +72,10 @@ pub struct SkillDiagnostic {
 pub struct LoadSkillsResult {
     pub skills: Vec<Skill>,
     pub diagnostics: Vec<SkillDiagnostic>,
+    /// Structured winner/loser collision diagnostics (native
+    /// `ResourceDiagnostic`). `diagnostics` keeps the stringly-typed view for
+    /// backwards compatibility; this is the machine-readable form.
+    pub resource_diagnostics: Vec<crate::diagnostics::ResourceDiagnostic>,
 }
 
 // ---------------------------------------------------------------------------
@@ -227,6 +231,7 @@ pub async fn load_skills(env: &Arc<dyn ExecutionEnv>, dirs: &[String]) -> LoadSk
     LoadSkillsResult {
         skills,
         diagnostics,
+        ..Default::default()
     }
 }
 
@@ -312,6 +317,7 @@ async fn load_skills_from_dir_internal(
             return LoadSkillsResult {
                 skills,
                 diagnostics,
+                ..Default::default()
             };
         }
     };
@@ -319,6 +325,7 @@ async fn load_skills_from_dir_internal(
         return LoadSkillsResult {
             skills,
             diagnostics,
+            ..Default::default()
         };
     }
 
@@ -336,6 +343,7 @@ async fn load_skills_from_dir_internal(
             return LoadSkillsResult {
                 skills,
                 diagnostics,
+                ..Default::default()
             };
         }
     };
@@ -362,6 +370,7 @@ async fn load_skills_from_dir_internal(
         return LoadSkillsResult {
             skills,
             diagnostics,
+            ..Default::default()
         };
     }
 
@@ -409,6 +418,7 @@ async fn load_skills_from_dir_internal(
     LoadSkillsResult {
         skills,
         diagnostics,
+        ..Default::default()
     }
 }
 

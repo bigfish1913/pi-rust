@@ -22,7 +22,7 @@ use crate::queue::PendingMessageQueue;
 use crate::stream_fn::{get_default_stream_fn, StreamFn};
 use crate::types::{AgentContext, AgentState, QueueMode, ToolExecutionMode};
 
-use rpi_ai::types::{UserContent, UserMessage};
+use rpi_ai::types::{AssistantMessage, UserContent, UserMessage};
 use rpi_ai::Model;
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -62,7 +62,9 @@ struct MutableAgentState {
     tools: Vec<Arc<dyn crate::agent_tool::AgentTool>>,
     messages: Vec<AgentMessage>,
     is_streaming: bool,
-    streaming_message: Option<AgentMessage>,
+    /// The in-flight assistant message. `Arc` so the per-delta `MessageUpdate`
+    /// does not deep-clone it into this field on every streaming chunk.
+    streaming_message: Option<Arc<AssistantMessage>>,
     pending_tool_calls: HashSet<String>,
     error_message: Option<String>,
 }
@@ -86,10 +88,14 @@ impl MutableAgentState {
     fn reduce(&mut self, event: &AgentEvent) {
         match event {
             AgentEvent::MessageStart { message } => {
-                self.streaming_message = Some(message.clone());
+                // One clone per message (not per delta): the state holds the
+                // partial as a shared snapshot from here on.
+                self.streaming_message = message
+                    .as_assistant()
+                    .map(|assistant| Arc::new(assistant.clone()));
             }
             AgentEvent::MessageUpdate { message, .. } => {
-                self.streaming_message = Some(message.clone());
+                self.streaming_message = Some(Arc::clone(message));
             }
             AgentEvent::MessageEnd { message } => {
                 self.streaming_message = None;
@@ -369,8 +375,10 @@ impl Agent {
 
     /// Start a new prompt from text. Convenience for `prompt_message`.
     pub async fn prompt(&self, text: impl Into<String>) -> Result<(), crate::AgentError> {
-        let message =
-            AgentMessage::User(UserMessage::new(UserContent::Text(text.into()), now_ms()));
+        let message = AgentMessage::User(UserMessage::new(
+            UserContent::Text(text.into()),
+            crate::clock::now_ms(),
+        ));
         self.prompt_messages(vec![message]).await
     }
 
@@ -578,12 +586,6 @@ fn default_model() -> Model {
         "unknown",
         "",
     )
-}
-
-fn now_ms() -> i64 {
-    use std::sync::atomic::{AtomicI64, Ordering};
-    static T: AtomicI64 = AtomicI64::new(1);
-    T.fetch_add(1, Ordering::Relaxed)
 }
 
 #[cfg(test)]

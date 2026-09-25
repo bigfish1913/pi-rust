@@ -141,7 +141,9 @@ impl SessionValueWriter {
             "key": key,
             "value": value.unwrap_or(Value::Null),
         });
-        self.session.append_custom_entry(VALUE_CUSTOM_TYPE, Some(data)).await
+        self.session
+            .append_custom_entry(VALUE_CUSTOM_TYPE, Some(data))
+            .await
     }
 }
 

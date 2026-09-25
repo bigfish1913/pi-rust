@@ -10,6 +10,7 @@ use crate::providers::anthropic::cost::calculate_cost;
 use crate::providers::anthropic::json_parse::parse_streaming_json;
 use crate::providers::anthropic::retry::retry_provider_request;
 use crate::providers::anthropic::sse::SseEventStream;
+use crate::providers::{DELTA_FLUSH_BYTES, DELTA_FLUSH_INTERVAL};
 use crate::strict_schema::strict_tool_parameters;
 use crate::types::{
     Api, AssistantMessage, AssistantMessageEvent, ConstrainedSamplingConfig, Content, Context,
@@ -147,7 +148,7 @@ struct ResponseSlot {
     ended: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ResponsesStreamState {
     slots: HashMap<usize, ResponseSlot>,
     next_index: usize,
@@ -165,6 +166,35 @@ struct ResponsesStreamState {
     sequence_numbers_reliable: bool,
     sequence_numbers_unreliable: bool,
     terminal: bool,
+    /// Text/thinking deltas batched but not yet emitted, with the content index
+    /// they belong to. Every event carries a full `partial: Arc<AssistantMessage>`
+    /// snapshot, so one event per wire delta made a long stream quadratic in the
+    /// message length — see [`DELTA_FLUSH_BYTES`] for the measured numbers.
+    pending_text: String,
+    pending_text_index: Option<usize>,
+    pending_thinking: String,
+    pending_thinking_index: Option<usize>,
+    /// When a batched delta was last emitted, for [`DELTA_FLUSH_INTERVAL`].
+    last_flush: std::time::Instant,
+}
+
+impl Default for ResponsesStreamState {
+    fn default() -> Self {
+        Self {
+            slots: HashMap::new(),
+            next_index: 0,
+            custom_tool_properties: HashMap::new(),
+            seen_sequences: HashMap::new(),
+            sequence_numbers_reliable: false,
+            sequence_numbers_unreliable: false,
+            terminal: false,
+            pending_text: String::new(),
+            pending_text_index: None,
+            pending_thinking: String::new(),
+            pending_thinking_index: None,
+            last_flush: std::time::Instant::now(),
+        }
+    }
 }
 
 impl ResponsesStreamState {
@@ -182,6 +212,67 @@ impl ResponsesStreamState {
             custom_tool_properties,
             ..Self::default()
         }
+    }
+
+    /// Whether a pending batch should be emitted now: past the byte threshold,
+    /// or older than the flush interval.
+    fn should_flush(&self, pending: &str) -> bool {
+        pending.len() >= DELTA_FLUSH_BYTES || self.last_flush.elapsed() >= DELTA_FLUSH_INTERVAL
+    }
+
+    /// Emit whatever text/thinking is batched. Called at every item boundary
+    /// (`finish_item` / `finish_open_slots`, i.e. before each `*End`) and
+    /// whenever the stream switches channel, so no delta is dropped or
+    /// reordered.
+    fn flush_pending(
+        &mut self,
+        out: &mut AssistantMessage,
+        p: &mut AssistantMessageEventStreamProducer,
+    ) {
+        self.flush_text(out, p);
+        self.flush_thinking(out, p);
+    }
+
+    fn flush_text(
+        &mut self,
+        out: &mut AssistantMessage,
+        p: &mut AssistantMessageEventStreamProducer,
+    ) {
+        if self.pending_text.is_empty() {
+            return;
+        }
+        let Some(content_index) = self.pending_text_index else {
+            self.pending_text.clear();
+            return;
+        };
+        let delta = std::mem::take(&mut self.pending_text);
+        self.last_flush = std::time::Instant::now();
+        p.push(AssistantMessageEvent::TextDelta {
+            content_index,
+            delta,
+            partial: Arc::new(out.clone()),
+        });
+    }
+
+    fn flush_thinking(
+        &mut self,
+        out: &mut AssistantMessage,
+        p: &mut AssistantMessageEventStreamProducer,
+    ) {
+        if self.pending_thinking.is_empty() {
+            return;
+        }
+        let Some(content_index) = self.pending_thinking_index else {
+            self.pending_thinking.clear();
+            return;
+        };
+        let delta = std::mem::take(&mut self.pending_thinking);
+        self.last_flush = std::time::Instant::now();
+        p.push(AssistantMessageEvent::ThinkingDelta {
+            content_index,
+            delta,
+            partial: Arc::new(out.clone()),
+        });
     }
 
     fn custom_property_for(&self, name: &str) -> String {
@@ -512,20 +603,24 @@ impl ResponsesStreamState {
             if let Some(Content::Thinking(block)) = out.content.get_mut(slot.content_index) {
                 block.thinking.push_str(delta);
             }
-            p.push(AssistantMessageEvent::ThinkingDelta {
-                content_index: slot.content_index,
-                delta: delta.to_string(),
-                partial: Arc::new(out.clone()),
-            });
+            // Keep channel order strict: text already streamed must reach the
+            // consumer before the first thinking delta of a new block.
+            self.flush_text(out, p);
+            self.pending_thinking_index = Some(slot.content_index);
+            self.pending_thinking.push_str(delta);
+            if self.should_flush(&self.pending_thinking) {
+                self.flush_thinking(out, p);
+            }
         } else {
             if let Some(Content::Text(block)) = out.content.get_mut(slot.content_index) {
                 block.text.push_str(delta);
             }
-            p.push(AssistantMessageEvent::TextDelta {
-                content_index: slot.content_index,
-                delta: delta.to_string(),
-                partial: Arc::new(out.clone()),
-            });
+            // Batch: `partial` is a full message clone per event.
+            self.pending_text_index = Some(slot.content_index);
+            self.pending_text.push_str(delta);
+            if self.should_flush(&self.pending_text) {
+                self.flush_text(out, p);
+            }
         }
     }
 
@@ -641,6 +736,10 @@ impl ResponsesStreamState {
         out: &mut AssistantMessage,
         p: &mut AssistantMessageEventStreamProducer,
     ) {
+        // Item boundary: the batched tail must be emitted before the `*End`
+        // event that closes this item, otherwise it would appear in the final
+        // message but never in the delta stream.
+        self.flush_pending(out, p);
         apply_message_phase(out, item);
         if let Some(slot) = self.slots.get_mut(&index) {
             update_slot_metadata(slot, item);
@@ -823,6 +922,7 @@ impl ResponsesStreamState {
         out: &mut AssistantMessage,
         p: &mut AssistantMessageEventStreamProducer,
     ) {
+        self.flush_pending(out, p);
         let mut indexes: Vec<usize> = self
             .slots
             .iter()
@@ -2483,6 +2583,64 @@ mod tests {
             },
         ));
         model
+    }
+
+    /// The Responses provider carried the same per-delta full-message clone as
+    /// the other two, so it had the same quadratic cost. Batching is shared
+    /// policy (`providers::DELTA_FLUSH_BYTES`), and the item boundary flush in
+    /// `finish_item` must still deliver the tail.
+    #[test]
+    fn text_deltas_are_batched_without_losing_the_tail() {
+        let count = 500usize;
+        let (mut producer, stream) = create_assistant_message_event_stream();
+        let mut state = ResponsesStreamState::default();
+        let mut output = AssistantMessage::empty(Api::OpenaiResponses, "openai", "gpt-test", 1);
+        state.add_item(
+            0,
+            &json!({ "type": "message", "id": "msg_1" }),
+            &mut output,
+            &mut producer,
+        );
+        for _ in 0..count {
+            state.append_text(0, "x", &mut output, &mut producer, false);
+        }
+        state.finish_item(
+            0,
+            &json!({ "type": "message", "id": "msg_1" }),
+            &mut output,
+            &mut producer,
+        );
+
+        let mut receiver = stream.split().0;
+        let mut tags: Vec<&'static str> = Vec::new();
+        let mut joined = String::new();
+        while let Ok(event) = receiver.try_recv() {
+            tags.push(event.type_tag());
+            if let AssistantMessageEvent::TextDelta { delta, .. } = &event {
+                joined.push_str(delta);
+            }
+        }
+
+        let deltas = tags.iter().filter(|tag| **tag == "text_delta").count();
+        assert!(
+            deltas <= count / DELTA_FLUSH_BYTES + 5,
+            "{count} one-byte deltas must coalesce into ~{}/{DELTA_FLUSH_BYTES} events, got {deltas}",
+            count
+        );
+        assert_eq!(joined.len(), count, "no byte may be dropped");
+        // The item boundary flush ran before `text_end`.
+        let end_at = tags
+            .iter()
+            .position(|tag| *tag == "text_end")
+            .expect("a text_end was emitted");
+        let last_delta_at = tags
+            .iter()
+            .rposition(|tag| *tag == "text_delta")
+            .expect("a text_delta was emitted");
+        assert!(
+            last_delta_at < end_at,
+            "the batched tail must be flushed before text_end: {tags:?}"
+        );
     }
 
     #[test]

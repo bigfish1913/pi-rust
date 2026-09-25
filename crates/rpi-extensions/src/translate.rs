@@ -56,10 +56,16 @@ fn message_to_stb(message: &rpi_agent::message::AgentMessage) -> StbString {
 pub fn translate(event: &AgentEvent) -> Option<StablePluginEvent> {
     let tag = event_tag_for(event)?;
     match event {
-        AgentEvent::MessageStart { message }
-        | AgentEvent::MessageUpdate { message, .. }
-        | AgentEvent::MessageEnd { message } => {
+        AgentEvent::MessageStart { message } | AgentEvent::MessageEnd { message } => {
             let stb = message_to_stb(message);
+            Some(StablePluginEvent::message(tag, stb))
+        }
+        AgentEvent::MessageUpdate { message, .. } => {
+            // The partial arrives as a shared `Arc<AssistantMessage>`; serialize it
+            // in the same `AgentMessage` shape the other two arms use, without
+            // materializing a copy of the growing message per delta.
+            let stb =
+                StbString::from_string(rpi_agent::message::assistant_json(message).to_string());
             Some(StablePluginEvent::message(tag, stb))
         }
 
@@ -653,7 +659,9 @@ mod tests {
                 message: am.clone(),
             },
             AgentEvent::MessageUpdate {
-                message: am.clone(),
+                // `MessageUpdate` carries the shared partial snapshot, so build
+                // the same `Arc` the provider would have handed over.
+                message: std::sync::Arc::new((*am.as_assistant().unwrap()).clone()),
                 assistant_message_event: rpi_ai::types::AssistantMessageEvent::Start {
                     partial: std::sync::Arc::new((*am.as_assistant().unwrap()).clone()),
                 },

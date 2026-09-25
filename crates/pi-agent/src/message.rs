@@ -66,6 +66,30 @@ impl AgentMessage {
     }
 }
 
+/// Serialize an `AssistantMessage` in the exact shape `AgentMessage::Assistant`
+/// produces (`{"kind":"assistant", …}`), without materializing an owned
+/// `AgentMessage` copy of it.
+///
+/// [`crate::AgentEvent::MessageUpdate`] carries the streaming partial as an
+/// `Arc<AssistantMessage>` so neither the loop nor its consumers deep-clone the
+/// whole growing message per delta. Consumers that need the message as JSON (the
+/// remote protocol, the extension bridge) use this to keep the wire/plugin shape
+/// byte-identical to a real `AgentMessage` — a deep clone here would reintroduce
+/// exactly the per-delta copy the `Arc` exists to avoid. The equivalence is
+/// pinned by `assistant_json_matches_the_agent_message_shape`.
+///
+/// [`crate::AgentEvent::MessageUpdate`]: crate::events::AgentEvent::MessageUpdate
+pub fn assistant_json(message: &AssistantMessage) -> serde_json::Value {
+    /// Internally tagged exactly like `AgentMessage`, so serde emits the same
+    /// `"kind"` discriminator first and then the message fields.
+    #[derive(serde::Serialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    enum Tagged<'a> {
+        Assistant(&'a AssistantMessage),
+    }
+    serde_json::to_value(Tagged::Assistant(message)).unwrap_or(serde_json::Value::Null)
+}
+
 impl From<UserMessage> for AgentMessage {
     fn from(m: UserMessage) -> Self {
         AgentMessage::User(m)
@@ -143,5 +167,26 @@ impl CustomMessage {
             data,
             timestamp,
         }
+    }
+}
+
+#[cfg(test)]
+mod assistant_json_tests {
+    use super::*;
+    use rpi_ai::types::{Api, AssistantMessage};
+
+    #[test]
+    fn assistant_json_matches_the_agent_message_shape() {
+        // The whole point of `assistant_json` is that consumers can keep
+        // serializing a `MessageUpdate` partial the way they always have, so it
+        // must be indistinguishable from the real `AgentMessage` encoding.
+        let mut assistant =
+            AssistantMessage::empty(Api::OpenaiCompletions, "gateway", "gpt-test", 7);
+        assistant.error_message = Some("boom".into());
+        let as_agent = AgentMessage::Assistant(Box::new(assistant.clone()));
+        assert_eq!(
+            assistant_json(&assistant),
+            serde_json::to_value(&as_agent).expect("AgentMessage serializes"),
+        );
     }
 }

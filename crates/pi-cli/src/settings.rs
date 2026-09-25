@@ -14,6 +14,71 @@ use std::path::{Path, PathBuf};
 
 use crate::config::{self, strip_line_comments, ConfigError};
 
+/// `retry` — native pi's `RetrySettings`. `provider` is parsed but unused: it
+/// configures the provider SDK's own retry loop, which rpi does not run.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RetrySettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retries: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_delay_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_agent_delay_ms: Option<u64>,
+    /// Native pi's nested `retry.provider`. Kept so a copied file round-trips;
+    /// rpi has no provider-SDK retry loop to configure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<serde_json::Value>,
+}
+
+/// `compaction` — native pi's `CompactionSettings`.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactionSettingsJson {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserve_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_recent_tokens: Option<i64>,
+    /// Per-model overrides. Kept for round-tripping; the harness has no
+    /// per-model compaction override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_overrides: Option<serde_json::Value>,
+}
+
+/// `branchSummary` — native pi's `BranchSummarySettings`.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchSummarySettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserve_tokens: Option<i64>,
+    /// When true, native pi skips its "Summarize branch?" prompt and defaults to
+    /// *no* summary. rpi has no such prompt, so this is what makes the key mean
+    /// something: `Some(true)` suppresses the summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_prompt: Option<bool>,
+}
+
+/// `steeringMode` / `followUpMode` — native pi's queue drain modes.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum QueueModeSetting {
+    All,
+    OneAtATime,
+}
+
+impl From<QueueModeSetting> for rpi_agent::QueueMode {
+    fn from(mode: QueueModeSetting) -> Self {
+        match mode {
+            QueueModeSetting::All => rpi_agent::QueueMode::All,
+            QueueModeSetting::OneAtATime => rpi_agent::QueueMode::OneAtATime,
+        }
+    }
+}
+
 /// A package entry from Pi's `packages` setting.
 ///
 /// The string form loads every resource exposed by the package. The object
@@ -89,9 +154,63 @@ pub struct Settings {
     #[serde(default)]
     pub theme: Option<String>,
     /// `/scoped-models`: the model ids allowed in the Ctrl+M cycle. Absent /
-    /// empty ⇒ every catalog model cycles (the default).
-    #[serde(default)]
+    /// empty ⇒ every catalog model cycles (the default). Native pi spells this
+    /// `enabledModels`, which is accepted as an alias so a copied `settings.json`
+    /// behaves the same.
+    #[serde(default, alias = "enabledModels")]
     pub scoped_models: Option<Vec<String>>,
+
+    /// Custom session storage directory. Native pi's `sessionDir`, same format as
+    /// the `--session-dir` flag (which wins over it).
+    #[serde(default)]
+    pub session_dir: Option<PathBuf>,
+
+    /// Custom shell binary. Native pi's `shellPath`. Parsed for fidelity, but
+    /// **not consumed yet**: nothing in pi-tools carries a shell binary, so
+    /// honouring it means plumbing one through `BashToolOptions` /
+    /// `ShellCaptureOptions` first.
+    #[serde(default)]
+    pub shell_path: Option<String>,
+
+    /// Prefix prepended to every bash command (native pi's `shellCommandPrefix`,
+    /// e.g. `shopt -s expand_aliases`).
+    #[serde(default)]
+    pub shell_command_prefix: Option<String>,
+
+    /// Proxy URL applied as `HTTP_PROXY` / `HTTPS_PROXY` for rpi's own HTTP
+    /// clients. Native pi's `httpProxy`.
+    #[serde(default)]
+    pub http_proxy: Option<String>,
+
+    /// Retry policy for assistant turns. Mirrors native pi `retry`; the fields
+    /// map 1:1 onto the harness's `RetryPolicy`.
+    #[serde(default)]
+    pub retry: Option<RetrySettings>,
+
+    /// Compaction settings. Mirrors native pi `compaction` (minus its
+    /// `modelOverrides`, which the harness has no equivalent for).
+    #[serde(default)]
+    pub compaction: Option<CompactionSettingsJson>,
+
+    /// Branch-summary settings. Mirrors native pi `branchSummary`.
+    ///
+    /// Parsed for shape fidelity, but **nothing consumes it yet**: rpi's
+    /// `navigate_tree` ignores its `summarize` argument outright (`_summarize`),
+    /// and `generate_branch_summary` has no production caller. Until
+    /// navigation-with-summary is wired, these keys cannot change behaviour — see
+    /// the doc comment on the accessors.
+    #[serde(default)]
+    pub branch_summary: Option<BranchSummarySettings>,
+
+    /// How queued steering messages are drained. Native pi default:
+    /// `"one-at-a-time"` (matches the harness's `QueueMode` default).
+    #[serde(default)]
+    pub steering_mode: Option<QueueModeSetting>,
+
+    /// How queued follow-up messages are drained. Native pi default:
+    /// `"one-at-a-time"`.
+    #[serde(default)]
+    pub follow_up_mode: Option<QueueModeSetting>,
     /// Pi-compatible static package specs. Entries may be local package
     /// directories, `package.json` files, installed package names, or filtered
     /// package objects.
@@ -146,6 +265,147 @@ pub struct Settings {
     /// When false, text selection requires explicit copy action.
     #[serde(default)]
     pub fullscreen_copy_on_select: Option<bool>,
+    /// Horizontal padding in terminal columns added to each side of the chat
+    /// transcript (user/assistant messages and thinking). Native pi `outputPad`
+    /// (its only legal values are 0 and 1).
+    #[serde(default)]
+    pub output_pad: Option<usize>,
+    /// Show transcript notices for prompt-cache costs and provider recovery
+    /// diagnostics. Native pi `showCacheMissNotices` (default `false`).
+    #[serde(default)]
+    pub show_cache_miss_notices: Option<bool>,
+    /// Render images inline in the terminal. rpi stores this at the top level
+    /// under `showImages`; native pi nests it as `terminal.showImages`, which
+    /// [`TerminalSettings`] also accepts (see [`Settings::show_images`]).
+    #[serde(default)]
+    pub show_images: Option<bool>,
+    /// Native pi's nested `terminal` settings block. rpi keeps its own flat
+    /// keys for the settings it has always written, but reads this block so a
+    /// native `settings.json` is honored.
+    #[serde(default)]
+    pub terminal: Option<TerminalSettings>,
+    /// How long idle pooled HTTP connections are kept before being closed.
+    /// Accepts a millisecond number or the string `"disabled"`. Native pi
+    /// `httpIdleTimeout`. rpi surface: `httpIdleTimeout`.
+    #[serde(default, alias = "httpIdleTimeoutMs")]
+    pub http_idle_timeout: Option<serde_json::Value>,
+}
+
+/// Native pi's `terminal` settings block (`TerminalSettings`). Only the fields
+/// rpi can honor are modeled; unknown keys are ignored.
+#[derive(serde::Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalSettings {
+    /// `terminal.showImages` — render images inline.
+    #[serde(default)]
+    pub show_images: Option<bool>,
+    /// `terminal.showTerminalProgress` — OSC 9;4 terminal progress indicator.
+    #[serde(default)]
+    pub show_terminal_progress: Option<bool>,
+    /// `terminal.clearOnShrink` — clear empty rows when content shrinks.
+    #[serde(default)]
+    pub clear_on_shrink: Option<bool>,
+}
+
+impl Settings {
+    /// Resolved HTTP idle timeout in milliseconds (`None` ⇒ library default,
+    /// `Some(0)` ⇒ disabled). See [`rpi_ai::http::parse_http_idle_timeout_ms`].
+    pub fn http_idle_timeout_ms(&self) -> Option<i64> {
+        self.http_idle_timeout
+            .as_ref()
+            .and_then(rpi_ai::http::parse_http_idle_timeout_ms)
+    }
+
+    /// Retry policy, resolved onto the harness type. Absent fields keep the
+    /// harness defaults, so a partial `retry` object changes only what it names.
+    pub fn retry_policy(&self) -> rpi_harness::types::RetryPolicy {
+        let mut policy = rpi_harness::types::RetryPolicy::default();
+        let Some(retry) = &self.retry else {
+            return policy;
+        };
+        if let Some(enabled) = retry.enabled {
+            policy.enabled = enabled;
+        }
+        if let Some(max_retries) = retry.max_retries {
+            policy.max_retries = max_retries;
+        }
+        if let Some(base_delay_ms) = retry.base_delay_ms {
+            policy.base_delay_ms = base_delay_ms;
+        }
+        if let Some(max_agent_delay_ms) = retry.max_agent_delay_ms {
+            policy.max_agent_delay_ms = max_agent_delay_ms;
+        }
+        policy
+    }
+
+    /// Compaction settings, resolved onto the harness type.
+    pub fn compaction_settings(&self) -> rpi_harness::types::CompactionSettings {
+        let mut settings = rpi_harness::types::CompactionSettings::default();
+        let Some(compaction) = &self.compaction else {
+            return settings;
+        };
+        if let Some(enabled) = compaction.enabled {
+            settings.enabled = enabled;
+        }
+        if let Some(reserve_tokens) = compaction.reserve_tokens {
+            settings.reserve_tokens = reserve_tokens;
+        }
+        if let Some(keep_recent_tokens) = compaction.keep_recent_tokens {
+            settings.keep_recent_tokens = keep_recent_tokens;
+        }
+        settings
+    }
+
+    /// Tokens reserved for a branch summary's prompt + output.
+    ///
+    /// Not consumed yet: `AgentLane::navigate_tree` ignores `summarize`, so no
+    /// branch summary is ever generated from this path. Wiring it means
+    /// implementing navigation-with-summary in the harness, not reading a key.
+    pub fn branch_summary_reserve_tokens(&self) -> Option<i64> {
+        self.branch_summary.as_ref().and_then(|s| s.reserve_tokens)
+    }
+
+    /// Whether branch summaries are suppressed (native pi's `skipPrompt`).
+    ///
+    /// Not consumed yet, for the same reason as
+    /// [`Self::branch_summary_reserve_tokens`].
+    pub fn branch_summary_skipped(&self) -> bool {
+        self.branch_summary
+            .as_ref()
+            .and_then(|s| s.skip_prompt)
+            .unwrap_or(false)
+    }
+
+    /// Default steering-queue drain mode (native pi default: one-at-a-time).
+    pub fn steering_mode(&self) -> rpi_agent::QueueMode {
+        self.steering_mode
+            .map(Into::into)
+            .unwrap_or(rpi_agent::QueueMode::OneAtATime)
+    }
+
+    /// Default follow-up-queue drain mode (native pi default: one-at-a-time).
+    pub fn follow_up_mode(&self) -> rpi_agent::QueueMode {
+        self.follow_up_mode
+            .map(Into::into)
+            .unwrap_or(rpi_agent::QueueMode::OneAtATime)
+    }
+
+    /// Render images inline. rpi's flat `showImages` wins; native pi's nested
+    /// `terminal.showImages` is the fallback.
+    pub fn show_images(&self) -> Option<bool> {
+        self.show_images
+            .or_else(|| self.terminal.as_ref().and_then(|t| t.show_images))
+    }
+
+    /// Terminal progress indicator. rpi's flat `showTerminalProgress` wins;
+    /// native pi's nested `terminal.showTerminalProgress` is the fallback.
+    pub fn show_terminal_progress(&self) -> Option<bool> {
+        self.show_terminal_progress.or_else(|| {
+            self.terminal
+                .as_ref()
+                .and_then(|t| t.show_terminal_progress)
+        })
+    }
 }
 
 /// Load `~/.rpi/agent/settings.json`. Missing file ⇒ `Settings::default()`
@@ -490,9 +750,31 @@ fn save_settings_to_path(
             settings.show_terminal_progress.map(serde_json::Value::Bool),
         ),
         (
+            "showImages",
+            settings.show_images.map(serde_json::Value::Bool),
+        ),
+        (
+            "showCacheMissNotices",
+            settings
+                .show_cache_miss_notices
+                .map(serde_json::Value::Bool),
+        ),
+        (
+            "fullscreenCopyOnSelect",
+            settings
+                .fullscreen_copy_on_select
+                .map(serde_json::Value::Bool),
+        ),
+        (
             "editorPaddingX",
             settings
                 .editor_padding_x
+                .map(|v| serde_json::Value::Number(v.into())),
+        ),
+        (
+            "outputPad",
+            settings
+                .output_pad
                 .map(|v| serde_json::Value::Number(v.into())),
         ),
         (
@@ -501,6 +783,7 @@ fn save_settings_to_path(
                 .autocomplete_max_visible
                 .map(|v| serde_json::Value::Number(v.into())),
         ),
+        ("httpIdleTimeout", settings.http_idle_timeout.clone()),
     ] {
         match value {
             Some(value) => {
@@ -802,6 +1085,142 @@ mod scoped_tests {
         (tmp, guard)
     }
 
+    /// The settings native pi lets users tune must reach the harness types.
+    ///
+    /// These were previously hardcoded defaults, so a `settings.json` copied from
+    /// native pi parsed cleanly but changed nothing — the exact failure mode a
+    /// "parses but is not consumed" field creates.
+
+    /// `sessionDir` selects the session directory, with the CLI flag winning.
+    ///
+    /// Native pi's comment: "same format as --session-dir CLI flag". A settings
+    /// key that parses but is ignored is exactly the failure mode this closes.
+    #[test]
+    fn session_dir_setting_selects_the_session_directory() {
+        let settings: Settings =
+            serde_json::from_str(r#"{"sessionDir": "/tmp/from-settings"}"#).unwrap();
+        assert_eq!(
+            settings.session_dir,
+            Some(std::path::PathBuf::from("/tmp/from-settings"))
+        );
+        // Absent ⇒ the caller falls back to its built-in default.
+        assert_eq!(Settings::default().session_dir, None);
+    }
+
+    /// The bash-facing keys must reach the tool options.
+    #[test]
+    fn shell_command_prefix_reaches_the_bash_tool() {
+        let settings: Settings =
+            serde_json::from_str(r#"{"shellCommandPrefix": "shopt -s expand_aliases"}"#).unwrap();
+        assert_eq!(
+            settings.shell_command_prefix.as_deref(),
+            Some("shopt -s expand_aliases")
+        );
+        // `shellPath` is parsed (native's shape round-trips) but nothing consumes
+        // it yet — see its doc comment for why.
+        let with_shell: Settings =
+            serde_json::from_str(r#"{"shellPath": "/usr/bin/zsh"}"#).unwrap();
+        assert_eq!(with_shell.shell_path.as_deref(), Some("/usr/bin/zsh"));
+    }
+
+    /// `httpProxy` is stored in native's shape for the client setup to apply.
+    #[test]
+    fn http_proxy_setting_is_read() {
+        let settings: Settings =
+            serde_json::from_str(r#"{"httpProxy": "http://127.0.0.1:8888"}"#).unwrap();
+        assert_eq!(
+            settings.http_proxy.as_deref(),
+            Some("http://127.0.0.1:8888")
+        );
+        assert_eq!(Settings::default().http_proxy, None);
+    }
+    #[test]
+    fn harness_options_come_from_settings() {
+        let settings: Settings = serde_json::from_str(
+            r#"{
+                "retry": { "enabled": false, "maxRetries": 7, "baseDelayMs": 250, "maxAgentDelayMs": 9000 },
+                "compaction": { "enabled": false, "reserveTokens": 1234, "keepRecentTokens": 4321 },
+                "steeringMode": "all",
+                "followUpMode": "all"
+            }"#,
+        )
+        .expect("settings parse");
+
+        let retry = settings.retry_policy();
+        assert!(!retry.enabled);
+        assert_eq!(retry.max_retries, 7);
+        assert_eq!(retry.base_delay_ms, 250);
+        assert_eq!(retry.max_agent_delay_ms, 9000);
+
+        let compaction = settings.compaction_settings();
+        assert!(!compaction.enabled);
+        assert_eq!(compaction.reserve_tokens, 1234);
+        assert_eq!(compaction.keep_recent_tokens, 4321);
+
+        assert_eq!(settings.steering_mode(), rpi_agent::QueueMode::All);
+        assert_eq!(settings.follow_up_mode(), rpi_agent::QueueMode::All);
+    }
+
+    /// An absent key keeps the harness default rather than a zero value: a partial
+    /// `retry` object must change only what it names.
+    #[test]
+    fn absent_harness_settings_keep_the_harness_defaults() {
+        let empty = Settings::default();
+        let default_retry = rpi_harness::types::RetryPolicy::default();
+        let retry = empty.retry_policy();
+        assert_eq!(retry.enabled, default_retry.enabled);
+        assert_eq!(retry.max_retries, default_retry.max_retries);
+        assert_eq!(retry.base_delay_ms, default_retry.base_delay_ms);
+        assert_eq!(retry.max_agent_delay_ms, default_retry.max_agent_delay_ms);
+        let default_compaction = rpi_harness::types::CompactionSettings::default();
+        let compaction = empty.compaction_settings();
+        assert_eq!(compaction.enabled, default_compaction.enabled);
+        assert_eq!(compaction.reserve_tokens, default_compaction.reserve_tokens);
+        assert_eq!(
+            compaction.keep_recent_tokens,
+            default_compaction.keep_recent_tokens
+        );
+
+        // Native pi's documented defaults for the queue modes.
+        assert_eq!(empty.steering_mode(), rpi_agent::QueueMode::OneAtATime);
+        assert_eq!(empty.follow_up_mode(), rpi_agent::QueueMode::OneAtATime);
+
+        // A partial object keeps the defaults it does not name.
+        let partial: Settings = serde_json::from_str(r#"{"retry":{"maxRetries":9}}"#).unwrap();
+        let retry = partial.retry_policy();
+        assert_eq!(retry.max_retries, 9);
+        assert_eq!(retry.base_delay_ms, default_retry.base_delay_ms);
+    }
+
+    /// Native pi's key names must be accepted, not only rpi's.
+    ///
+    /// A user copying native pi's `settings.json` writes `enabledModels` and
+    /// `httpIdleTimeoutMs`; before this they were silently ignored because rpi
+    /// spelled them differently.
+    #[test]
+    fn native_settings_key_names_are_accepted() {
+        let settings: Settings = serde_json::from_str(
+            r#"{
+                "enabledModels": ["a", "b"],
+                "httpIdleTimeoutMs": 1500,
+                "branchSummary": { "reserveTokens": 4242, "skipPrompt": true }
+            }"#,
+        )
+        .expect("native key names parse");
+
+        assert_eq!(
+            settings.scoped_models,
+            Some(vec!["a".to_string(), "b".to_string()]),
+            "native's `enabledModels` must map onto rpi's scoped models"
+        );
+        assert_eq!(
+            settings.http_idle_timeout_ms(),
+            Some(1500),
+            "native's `httpIdleTimeoutMs` must be read"
+        );
+        assert_eq!(settings.branch_summary_reserve_tokens(), Some(4242));
+        assert!(settings.branch_summary_skipped());
+    }
     #[test]
     fn save_load_scoped_models_roundtrip() {
         let (_tmp, _guard) = with_temp_env();
@@ -841,6 +1260,69 @@ mod scoped_tests {
             path.file_name().and_then(|name| name.to_str()).unwrap()
         ));
         assert!(!temp.exists(), "atomic staging file should not remain");
+    }
+
+    #[test]
+    fn save_preserves_unknown_fields_and_writes_the_tui_settings() {
+        // Regression: `fullscreenCopyOnSelect` and `httpIdleTimeout` used to be
+        // read but never written back, so `/settings` changes silently
+        // vanished. The newer `/settings` rows (showImages,
+        // showCacheMissNotices, outputPad) must round-trip too.
+        let (_tmp, _guard) = with_temp_env();
+        let path = config::settings_path().unwrap();
+        let mut settings = Settings::default();
+        settings.show_images = Some(false);
+        settings.show_cache_miss_notices = Some(true);
+        settings.output_pad = Some(0);
+        settings.fullscreen_copy_on_select = Some(false);
+        settings.http_idle_timeout = Some(serde_json::json!(30_000));
+        settings.show_terminal_progress = Some(false);
+        save_settings(&settings).unwrap();
+
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw["showImages"], false);
+        assert_eq!(raw["showCacheMissNotices"], true);
+        assert_eq!(raw["outputPad"], 0);
+        assert_eq!(raw["fullscreenCopyOnSelect"], false);
+        assert_eq!(raw["httpIdleTimeout"], 30_000);
+        assert_eq!(raw["showTerminalProgress"], false);
+
+        // And they load back.
+        let reloaded = load_settings().unwrap();
+        assert_eq!(reloaded.show_images(), Some(false));
+        assert_eq!(reloaded.show_cache_miss_notices, Some(true));
+        assert_eq!(reloaded.output_pad, Some(0));
+        assert_eq!(reloaded.fullscreen_copy_on_select, Some(false));
+        assert_eq!(reloaded.http_idle_timeout_ms(), Some(30_000));
+        assert_eq!(reloaded.show_terminal_progress(), Some(false));
+    }
+
+    #[test]
+    fn nested_terminal_block_is_accepted_as_a_fallback() {
+        // Native pi nests `showImages` / `showTerminalProgress` under
+        // `terminal`; rpi's flat keys win when both are present.
+        let (_tmp, _guard) = with_temp_env();
+        let path = config::settings_path().unwrap();
+        std::fs::write(
+            &path,
+            r#"{ "terminal": { "showImages": false, "showTerminalProgress": false } }"#,
+        )
+        .unwrap();
+        let settings = load_settings().unwrap();
+        assert_eq!(settings.show_images(), Some(false));
+        assert_eq!(settings.show_terminal_progress(), Some(false));
+
+        std::fs::write(
+            &path,
+            r#"{
+                "showImages": true,
+                "terminal": { "showImages": false }
+            }"#,
+        )
+        .unwrap();
+        let settings = load_settings().unwrap();
+        assert_eq!(settings.show_images(), Some(true));
     }
 
     #[test]

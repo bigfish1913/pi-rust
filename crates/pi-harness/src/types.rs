@@ -82,8 +82,17 @@ impl AgentHarnessResources {
 /// harness-specific *replay* flag the TS union adds (`replay?: "never"|"safe"`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ToolReplay {
-    Never,
+    /// The tool must not be re-run when a crash left its outcome unknown.
+    ///
+    /// This is the default, matching native pi (`tool.replay ?? "never"`,
+    /// `drive/tools.ts`). Defaulting the other way is a safety bug: the first
+    /// time recovery acts on this flag, every tool that never opted in —
+    /// `bash`, `write`, `edit` — would be replayed.
     #[default]
+    Never,
+    /// Re-running the call is harmless (read-only or idempotent), so recovery
+    /// may re-execute it instead of reporting an unknown outcome. Only tools
+    /// that are genuinely free of side effects should declare this.
     Safe,
 }
 

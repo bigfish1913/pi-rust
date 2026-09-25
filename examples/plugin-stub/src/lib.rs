@@ -2,7 +2,7 @@
 //!
 //! This is the Part B2 ABI smoke target. The host loads it via `rpi-extensions`
 //! (`--extensions-dir examples/plugin-stub`'), which looks up
-//! `rpi_plugin_register_v2` and calls it with the host vtable. In `register` this
+//! `rpi_plugin_register` (the unified ABI) and calls it with the host vtable. In `register` this
 //! plugin:
 //!
 //! 1. Registers an **`echo`** tool — params `{ "text": string }`, returns that
@@ -75,23 +75,26 @@ extern "C" fn echo_execute(
     params: StbString,
     free_params: Option<FreeStringFn>,
 ) -> StepHandle {
-    // Read + free the input params (host-produced → plugin frees via host fn).
-    let text = {
-        let s = params.to_string_lossy();
-        params.free_with(free_params);
-        s
-    };
-    let parsed: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
-    let value = parsed
-        .get("text")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let drive = Box::new(EchoDrive {
-        text: value,
-        polls: 0,
-    });
-    Box::into_raw(drive) as StepHandle
+    // Contain panics: unwinding out of this `extern "C"` fn would abort the
+    // whole host process. A null handle is reported by the host as "execute
+    // refused".
+    rpi_plugin_sdk::guard_or(std::ptr::null_mut(), || {
+        // Read + free the input params (host-produced → plugin frees via host fn).
+        let text = {
+            let s = params.to_string_lossy();
+            params.free_with(free_params);
+            s
+        };
+        let parsed: serde_json::Value =
+            serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+        let value = parsed
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let drive = Box::new(EchoDrive { text: value, polls: 0 });
+        Box::into_raw(drive) as StepHandle
+    })
 }
 
 /// `poll(handle, partial_cb, user_data) -> StepResult`. **Non-blocking.**
@@ -108,31 +111,41 @@ extern "C" fn echo_poll(
     partial_cb: Option<ToolPartialCb>,
     user_data: *mut c_void,
 ) -> StepResult {
-    // SAFETY: the host guarantees `handle` is the `*mut EchoDrive` we produced
-    // in execute(), valid until destroy().
-    let drive = unsafe { &mut *(handle as *mut EchoDrive) };
-    drive.polls += 1;
+    // Contain panics so a buggy poll reports a tool error instead of aborting
+    // the host process.
+    rpi_plugin_sdk::guard_or(
+        StepResult::err(StbString::from_string(
+            r#"{"error":"echo poll panicked"}"#.to_string(),
+        )),
+        || {
+            // SAFETY: the host guarantees `handle` is the `*mut EchoDrive` we produced
+            // in execute(), valid until destroy().
+            let drive = unsafe { &mut *(handle as *mut EchoDrive) };
+            drive.polls += 1;
 
-    if drive.polls == 1 {
-        // Emit a partial progress result through the callback path.
-        if let Some(cb) = partial_cb {
-            let progress =
-                StbString::from_string(r#"{"content":[{"type":"text","text":"..."}]}"#.to_string());
-            // The host frees the partial's StbString (it is plugin-produced here,
-            // but the host's partial_cb_trampoline reclaims via host_free_string).
-            cb(progress, user_data);
-        }
-        // Return Pending with empty inline progress (separate from the callback
-        // partial already sent). Empty StbString → the host skips it.
-        return StepResult::pending(StbString::empty());
-    }
+            if drive.polls == 1 {
+                // Emit a partial progress result through the callback path.
+                if let Some(cb) = partial_cb {
+                    let progress = StbString::from_string(
+                        r#"{"content":[{"type":"text","text":"..."}]}"#.to_string(),
+                    );
+                    // The host frees the partial's StbString (it is plugin-produced here,
+                    // but the host's partial_cb_trampoline reclaims via host_free_string).
+                    cb(progress, user_data);
+                }
+                // Return Pending with empty inline progress (separate from the callback
+                // partial already sent). Empty StbString → the host skips it.
+                return StepResult::pending(StbString::empty());
+            }
 
-    // Second poll: terminal Done with the echoed text.
-    let body = format!(
-        r#"{{"content":[{{"type":"text","text":"echo: {}"}}]}}"#,
-        escape_json_string(&drive.text)
-    );
-    StepResult::done(StbString::from_string(body))
+            // Second poll: terminal Done with the echoed text.
+            let body = format!(
+                r#"{{"content":[{{"type":"text","text":"echo: {}"}}]}}"#,
+                escape_json_string(&drive.text)
+            );
+            StepResult::done(StbString::from_string(body))
+        },
+    )
 }
 
 /// `cancel(handle)`. Idempotent + thread-safe + does NOT free. Echo has nothing
@@ -185,8 +198,12 @@ extern "C" fn on_message_end(
     _event: rpi_plugin_sdk::StablePluginEvent,
     _user_data: *mut c_void,
 ) -> i32 {
-    MESSAGE_END_HITS.fetch_add(1, Ordering::SeqCst);
-    0
+    // Contain panics: returning nonzero is logged by the host (it never aborts
+    // the fan-out), whereas unwinding would abort the host process.
+    rpi_plugin_sdk::guard_or(1, || {
+        MESSAGE_END_HITS.fetch_add(1, Ordering::SeqCst);
+        0
+    })
 }
 
 /// Read the `MessageEnd` hit counter (host smoke test uses this). Returns the
@@ -246,15 +263,17 @@ extern "C" fn on_resources_discover(
     out: *mut rpi_plugin_sdk::StbString,
     _user_data: *mut c_void,
 ) -> i32 {
-    DISCOVER_HITS.fetch_add(1, Ordering::SeqCst);
-    // Build the JSON payload the host parses. `skillPaths` only (prompt/theme
-    // omitted — lenient host treats missing fields as empty).
-    let path = std::str::from_utf8(DISCOVER_SKILL).unwrap_or("");
-    let json = format!(r#"{{"skillPaths":["{}"]}}"#, path);
-    unsafe {
-        *out = StbString::from_string(json);
-    }
-    0
+    rpi_plugin_sdk::guard_or(1, || {
+        DISCOVER_HITS.fetch_add(1, Ordering::SeqCst);
+        // Build the JSON payload the host parses. `skillPaths` only (prompt/theme
+        // omitted — lenient host treats missing fields as empty).
+        let path = std::str::from_utf8(DISCOVER_SKILL).unwrap_or("");
+        let json = format!(r#"{{"skillPaths":["{}"]}}"#, path);
+        unsafe {
+            *out = StbString::from_string(json);
+        }
+        0
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -286,12 +305,14 @@ extern "C" fn on_provider_request(
     out: *mut StbString,
     _user_data: *mut c_void,
 ) -> i32 {
-    PROVIDER_REQUEST_HITS.fetch_add(1, Ordering::SeqCst);
-    let json = r#"{"role":"assistant","content":[{"type":"text","text":"from-stub-provider"}],"api":"faux","provider":"stub-provider","model":"stub-model","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":0.0}},"stopReason":"stop","timestamp":0}"#;
-    unsafe {
-        *out = StbString::from_string(json.to_string());
-    }
-    0
+    rpi_plugin_sdk::guard_or(1, || {
+        PROVIDER_REQUEST_HITS.fetch_add(1, Ordering::SeqCst);
+        let json = r#"{"role":"assistant","content":[{"type":"text","text":"from-stub-provider"}],"api":"faux","provider":"stub-provider","model":"stub-model","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":0.0}},"stopReason":"stop","timestamp":0}"#;
+        unsafe {
+            *out = StbString::from_string(json.to_string());
+        }
+        0
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -319,30 +340,33 @@ extern "C" fn on_markdown_transform(
     out: *mut StbString,
     _user_data: *mut c_void,
 ) -> i32 {
-    MARKDOWN_TRANSFORM_HITS.fetch_add(1, Ordering::SeqCst);
-    // Parse the input (borrowed — must NOT free). lenient: missing `markdown` ⇒ "".
-    let input = unsafe { input_json.as_str() };
-    let parsed: serde_json::Value = serde_json::from_str(input).unwrap_or(serde_json::Value::Null);
-    let md = parsed
-        .get("markdown")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_uppercase();
-    let json = format!(r#"{{"markdown":"{}"}}"#, escape_json_string(&md));
-    unsafe {
-        *out = StbString::from_string(json);
-    }
-    0
+    rpi_plugin_sdk::guard_or(1, || {
+        MARKDOWN_TRANSFORM_HITS.fetch_add(1, Ordering::SeqCst);
+        // Parse the input (borrowed — must NOT free). lenient: missing `markdown` ⇒ "".
+        let input = unsafe { input_json.as_str() };
+        let parsed: serde_json::Value =
+            serde_json::from_str(input).unwrap_or(serde_json::Value::Null);
+        let md = parsed
+            .get("markdown")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_uppercase();
+        let json = format!(r#"{{"markdown":"{}"}}"#, escape_json_string(&md));
+        unsafe {
+            *out = StbString::from_string(json);
+        }
+        0
+    })
 }
 
 // ---------------------------------------------------------------------------
 // The register entrypoint
 // ---------------------------------------------------------------------------
 
-// The SDK macro exports the ABI v2 `rpi_plugin_register_v2` symbol and applies
+// The SDK macro exports the unified `rpi_plugin_register` symbol and applies
 // the version/null checks before running our registration body. Return 0 on
 // success; nonzero means the host logs and skips this plugin.
-rpi_plugin_sdk::export_plugin_v2!(|api| {
+rpi_plugin_sdk::export_plugin!(|api| {
     // Register the echo tool. Build an owning StableToolSchema (name +
     // description + parameters-as-JSON); the host frees the schema's strings
     // via our `plugin_free_string` after copying them out.

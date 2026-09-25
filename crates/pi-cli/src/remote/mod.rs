@@ -12,6 +12,10 @@
 //!   [`protocol::RemoteCommand`], [`protocol::RemoteResponse`]) used by both the
 //!   `--mode rpc` server and the `--connect` client, so the contract has a
 //!   single source of truth.
+//! - [`framing`] / [`cbor`] / [`codec`] — the **binary** transport: 4-byte
+//!   length-prefixed frames carrying CBOR-encoded protocol messages (port of
+//!   the TS `@earendil-works/pi-protocol` package). The JSONL transport remains
+//!   the default; the binary one is available for callers that want it.
 //! - [`client`] — the TCP JSON-RPC connection to a `rpi --server` endpoint.
 //! - [`session`] — the client-side transcript + state the UI renders.
 //!
@@ -20,7 +24,10 @@
 //! and a terminal UI that renders it. The client holds **no** local agent
 //! resources — no provider, tools, extensions, or session files.
 
+pub mod cbor;
 pub mod client;
+pub mod codec;
+pub mod framing;
 pub mod protocol;
 pub mod session;
 pub mod tui;

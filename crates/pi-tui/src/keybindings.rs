@@ -62,6 +62,46 @@ impl KeyCombo {
             ..self
         }
     }
+
+    /// Human-readable key text for hints (mirrors native pi's `formatKeyText`,
+    /// e.g. `Alt+Q`, `Ctrl+Shift+F`, `Enter`). Modifiers are ordered
+    /// Ctrl, Alt, Shift, Super.
+    pub fn display(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if self.modifiers.contains(KeyModifiers::CONTROL) {
+            parts.push("Ctrl".into());
+        }
+        if self.modifiers.contains(KeyModifiers::ALT) {
+            parts.push("Alt".into());
+        }
+        // `BackTab` already carries the shift; don't render it twice.
+        if self.modifiers.contains(KeyModifiers::SHIFT) && self.code != KeyCode::BackTab {
+            parts.push("Shift".into());
+        }
+        if self.modifiers.contains(KeyModifiers::SUPER) {
+            parts.push("Super".into());
+        }
+        let key = match self.code {
+            KeyCode::Char(c) => c.to_uppercase().to_string(),
+            KeyCode::Enter => "Enter".into(),
+            KeyCode::Esc => "Esc".into(),
+            KeyCode::Tab | KeyCode::BackTab => "Tab".into(),
+            KeyCode::Backspace => "Backspace".into(),
+            KeyCode::Delete => "Delete".into(),
+            KeyCode::Insert => "Insert".into(),
+            KeyCode::Up => "Up".into(),
+            KeyCode::Down => "Down".into(),
+            KeyCode::Left => "Left".into(),
+            KeyCode::Right => "Right".into(),
+            KeyCode::Home => "Home".into(),
+            KeyCode::End => "End".into(),
+            KeyCode::PageUp => "PageUp".into(),
+            KeyCode::PageDown => "PageDown".into(),
+            other => format!("{other:?}"),
+        };
+        parts.push(key);
+        parts.join("+")
+    }
 }
 
 /// Keybinding definition.
@@ -181,6 +221,18 @@ impl Keybindings {
             KeybindingDefinition {
                 default_keys: vec![KeyCombo::new(Char('v'), M::CONTROL)],
                 description: Some("Paste image from clipboard"),
+            },
+        );
+        map.insert(
+            "app.message.dequeue",
+            KeybindingDefinition {
+                // Native pi: `alt+q` on Windows, `alt+up` elsewhere.
+                default_keys: vec![if cfg!(windows) {
+                    KeyCombo::new(Char('q'), M::ALT)
+                } else {
+                    KeyCombo::new(Up, M::ALT)
+                }],
+                description: Some("Restore queued messages"),
             },
         );
 
@@ -693,6 +745,7 @@ pub mod keys {
     pub const EXTERNAL_EDITOR: KeybindingId = "app.editor.external";
     pub const THINKING_CYCLE: KeybindingId = "app.thinking.cycle";
     pub const PASTE_IMAGE: KeybindingId = "app.clipboard.pasteImage";
+    pub const DEQUEUE: KeybindingId = "app.message.dequeue";
 
     // Editor
     pub const CURSOR_UP: KeybindingId = "tui.editor.cursorUp";
@@ -766,5 +819,55 @@ mod tests {
         let kb = Keybindings::new();
         let keys = kb.get_keys(keys::CURSOR_LEFT);
         assert!(!keys.is_empty());
+    }
+
+    #[test]
+    fn key_combo_display_formats_hints() {
+        assert_eq!(
+            KeyCombo::new(KeyCode::Char('q'), KeyModifiers::ALT).display(),
+            "Alt+Q"
+        );
+        assert_eq!(
+            KeyCombo::new(
+                KeyCode::Char('f'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            )
+            .display(),
+            "Ctrl+Shift+F"
+        );
+        assert_eq!(
+            KeyCombo::new(KeyCode::Enter, KeyModifiers::NONE).display(),
+            "Enter"
+        );
+        assert_eq!(
+            KeyCombo::new(KeyCode::Up, KeyModifiers::ALT).display(),
+            "Alt+Up"
+        );
+    }
+
+    #[test]
+    fn dequeue_binding_has_a_platform_default() {
+        let kb = Keybindings::new();
+        let keys = kb.get_keys(keys::DEQUEUE);
+        assert_eq!(keys.len(), 1);
+        if cfg!(windows) {
+            assert_eq!(keys[0].display(), "Alt+Q");
+        } else {
+            assert_eq!(keys[0].display(), "Alt+Up");
+        }
+    }
+
+    #[test]
+    fn dequeue_matches_its_platform_default_event() {
+        // Guards the hotkey itself: a real Alt+Q (Windows) / Alt+Up (elsewhere)
+        // event must resolve to `app.message.dequeue`, since the TUI key loop
+        // routes the "edit queued messages" action solely through this match.
+        let kb = Keybindings::new();
+        let event = if cfg!(windows) {
+            crossterm::event::KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT)
+        } else {
+            crossterm::event::KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)
+        };
+        assert!(kb.matches(&event, keys::DEQUEUE));
     }
 }

@@ -5,6 +5,7 @@
 
 use std::any::Any;
 use std::sync::Mutex;
+use std::time::Instant;
 
 use super::component::Component;
 use crate::ansi::{bold, strip_ansi};
@@ -55,6 +56,10 @@ pub struct ToolExecutionComponent {
     result: Mutex<Option<String>>,
     /// Execution status
     status: Mutex<ToolStatus>,
+    /// When the tool started running (for elapsed time display)
+    started_at: Mutex<Option<Instant>>,
+    /// When the tool finished (for total elapsed time display)
+    finished_at: Mutex<Option<Instant>>,
     /// Whether expanded
     expanded: Mutex<bool>,
     /// Optional pre-rendered colored diff lines (from `render_diff`). When
@@ -73,6 +78,8 @@ impl ToolExecutionComponent {
             args: Mutex::new(args.to_string()),
             result: Mutex::new(None),
             status: Mutex::new(ToolStatus::Pending),
+            started_at: Mutex::new(None),
+            finished_at: Mutex::new(None),
             expanded: Mutex::new(false),
             diff_lines: Mutex::new(None),
         }
@@ -100,12 +107,18 @@ impl ToolExecutionComponent {
                 ToolStatus::Completed
             };
         }
+        if let Ok(mut f) = self.finished_at.lock() {
+            *f = Some(Instant::now());
+        }
     }
 
     /// Mark as running.
     pub fn set_running(&self) {
         if let Ok(mut s) = self.status.lock() {
             *s = ToolStatus::Running;
+        }
+        if let Ok(mut t) = self.started_at.lock() {
+            *t = Some(Instant::now());
         }
     }
 
@@ -188,6 +201,8 @@ impl Component for ToolExecutionComponent {
         let result = self.result.lock().unwrap();
         let expanded = self.expanded.lock().unwrap();
         let diff_lines = self.diff_lines.lock().unwrap();
+        let started_at = self.started_at.lock().unwrap();
+        let finished_at = self.finished_at.lock().unwrap();
 
         // Skill invocation mode: render as native-Pi's `[skill]` box rather
         // than a generic tool panel — custom-message background, collapsed to
@@ -225,19 +240,56 @@ impl Component for ToolExecutionComponent {
             .map(str::to_string)
             .unwrap_or_else(|| tools::tool_label(&name));
         let summary = tools::parse_args_summary(&name, &args);
-        let head_parts = if summary.is_empty() {
+        // Calculate elapsed time
+        let elapsed_str = if *status == ToolStatus::Running {
+            // Real-time elapsed while running
+            if let Some(started) = *started_at {
+                let elapsed = started.elapsed();
+                format_elapsed(elapsed)
+            } else {
+                String::new()
+            }
+        } else if *status == ToolStatus::Completed || *status == ToolStatus::Failed {
+            // Total elapsed after completion
+            if let (Some(started), Some(finished)) = (*started_at, *finished_at) {
+                let elapsed = finished.duration_since(started);
+                format_elapsed(elapsed)
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+        let head_parts = if summary.is_empty() && elapsed_str.is_empty() {
             format!(
                 "{} {} {}",
                 status_color.fg(status_icon),
                 colors.tool_title.fg(&bold(&label)),
                 colors.muted.fg(chevron),
             )
-        } else {
+        } else if summary.is_empty() {
+            format!(
+                "{} {} {} {}",
+                status_color.fg(status_icon),
+                colors.tool_title.fg(&bold(&label)),
+                colors.muted.fg(&elapsed_str),
+                colors.muted.fg(chevron),
+            )
+        } else if elapsed_str.is_empty() {
             format!(
                 "{} {} {} {}",
                 status_color.fg(status_icon),
                 colors.tool_title.fg(&bold(&label)),
                 colors.tool_output.fg(&summary),
+                colors.muted.fg(chevron),
+            )
+        } else {
+            format!(
+                "{} {} {} {} {}",
+                status_color.fg(status_icon),
+                colors.tool_title.fg(&bold(&label)),
+                colors.tool_output.fg(&summary),
+                colors.muted.fg(&elapsed_str),
                 colors.muted.fg(chevron),
             )
         };
@@ -438,6 +490,20 @@ fn strip_frontmatter(content: &str) -> &str {
     after.strip_prefix('\n').unwrap_or(after)
 }
 
+/// Format a duration as a human-readable elapsed time string.
+/// Shows seconds with one decimal place for short durations,
+/// or minutes and seconds for longer durations.
+pub(crate) fn format_elapsed(duration: std::time::Duration) -> String {
+    let secs = duration.as_secs_f64();
+    if secs < 60.0 {
+        format!("{:.1}s", secs)
+    } else {
+        let mins = (secs / 60.0).floor() as u64;
+        let remaining_secs = (secs % 60.0).floor() as u64;
+        format!("{}m{}s", mins, remaining_secs)
+    }
+}
+
 /// Normalize tool output for display. Tool payloads are not guaranteed to use
 /// Unix line endings and may contain tabs/control sequences from subprocesses.
 fn normalized_output_lines(output: &str) -> Vec<String> {
@@ -486,12 +552,11 @@ fn pretty_args(args: &str) -> String {
 /// standalone; the mapping is purely lexical over the known builtin tool
 /// arg shapes. Unknown tools fall back to the raw args.
 mod tools {
-    /// A short, uppercase label for the tool name in the header. The raw
-    /// `name` is already lowercase (`read`, `edit`, …); uppercasing it makes
-    /// the header read as a tag rather than a word, distinguishing it from
-    /// the path/argument summary that follows.
+    /// A short label for the tool name in the header. Pi displays tool
+    /// names in their natural lowercase form (`read`, `edit`, …) with bold
+    /// styling, matching the original casing from the tool definition.
     pub fn tool_label(name: &str) -> String {
-        name.to_ascii_uppercase()
+        name.to_string()
     }
 
     /// Parse a known builtin tool's args JSON into a compact arg summary.
@@ -1055,7 +1120,7 @@ mod tests {
         let t = ToolExecutionComponent::new("read", r#"{"path":"src/foo.rs"}"#);
         let joined = t.render(80).join("\n");
         let plain = crate::ansi::strip_ansi(&joined);
-        assert!(plain.contains("READ"), "tool label uppercase: {plain}");
+        assert!(plain.contains("read"), "tool label lowercase: {plain}");
         assert!(plain.contains("src/foo.rs"), "path in summary: {plain}");
         // The raw JSON must NOT leak into the header.
         assert!(!plain.contains("\"path\""), "raw JSON leaked: {plain}");

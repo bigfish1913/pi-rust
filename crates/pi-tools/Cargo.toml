@@ -33,6 +33,11 @@ similar = { version = "2", features = ["text"] }
 unicode-normalization = "0.1"
 regex = { workspace = true }
 globset = { workspace = true }
+image = "0.25"  # Image processing (resize, convert, EXIF)
+
+[features]
+default = []
+webp = ["image/webp"]
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }

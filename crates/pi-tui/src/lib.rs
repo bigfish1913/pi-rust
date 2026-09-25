@@ -43,11 +43,13 @@ pub mod overlay;
 pub mod render;
 pub mod scroll_view;
 pub mod search_bar;
+pub mod searchable_select;
 pub mod select_list;
 pub mod settings_list;
 pub mod spacer;
 pub mod status_indicator;
 pub mod stdin_buffer;
+pub mod syntax_highlight;
 pub mod terminal;
 pub mod terminal_colors;
 pub mod terminal_image;
@@ -84,7 +86,7 @@ pub use countdown_timer::CountdownTimer;
 pub use diff::render_diff;
 pub use dynamic_border::DynamicBorder;
 pub use earendil::EarendilAnnouncementComponent;
-pub use editor::{Editor, EditorOptions, EditorStyle};
+pub use editor::{Editor, EditorOptions, EditorStyle, WorkingState};
 pub use footer::FooterComponent;
 pub use fuzzy::{fuzzy_filter, fuzzy_match, FuzzyMatch};
 pub use hstack::HStack;
@@ -110,12 +112,16 @@ pub use layout::{
 pub use layout_node::{
     allocate_stack_sizes, LayoutNode, LayoutNodeProvider, LayoutViewport, StackLayoutEntry,
 };
-pub use loader::{CancellableLoader, Loader, LoaderIndicatorOptions, ProgressLoader};
+pub use loader::{
+    CancellableLoader, Loader, LoaderIndicatorOptions, ProgressLoader, SPINNER_FRAMES,
+    SPINNER_FRAME_MS,
+};
 pub use markdown::{Markdown, MarkdownOptions};
 pub use mermaid::Mermaid;
 pub use overlay::{Dialog, OverlayHandle, OverlayManager, Selector, SelectorItem};
 pub use scroll_view::{FollowMode, ScrollView, ScrollViewOptions};
 pub use search_bar::SearchBar;
+pub use searchable_select::SearchableSelectList;
 pub use select_list::{SelectItem, SelectList, SelectListLayoutOptions, SelectListTheme};
 pub use settings_list::{SettingItem, SettingType, SettingsList, SettingsListTheme};
 pub use spacer::Spacer;

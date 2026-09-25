@@ -13,15 +13,31 @@
 |---|---|---|
 | §4 图片输入链路 | 已实现 | `pi-cli/src/app.rs` (`process_file_args`/`image_content_from_path`)、`interactive_tui.rs` 的 `Event::Paste` 图片拖入/粘贴路径 |
 | §6 AgentHarness/AgentLane operation API | 已实现 | `pi-harness/src/agent_harness.rs`：`get_tip_id`/`find_entries`/`find_entry`/`get_entry`/`append_message`/`append_custom_entry`/`get_name`/`set_name`/`get_label`/`set_label`/`get_stats`/`snapshot`/`inspect_execution`/`get_result`/`accept`/`request_abort`/`drive`/`resume`（`AgentLane` trait + `AgentHarness`/`LaneHandle` 双实现），`watch`/`watch_session` + `HarnessWatcher`（`pi-harness/src/watcher.rs`） |
-| §7 Durable operation runtime / value store | 已实现（provider 长轮询续跑除外） | `pi-harness/src/runtime.rs`（`SessionRuntime`：`admit`/`recover_lane`/`reconcile`/`checkpoint`/`recover_all_lanes`，`LaneRecovery`+`RecoveryFinding`+`RecoveryDecision`）；`pi-harness/src/session/values.rs`（`SessionValues`/`SessionValueWriter`）。CLI 启动时对每条 lane 跑恢复扫描（`pi-cli/src/session.rs`）。
+| §7 Durable operation runtime / value store | 已实现 | `pi-harness/src/runtime.rs`（`SessionRuntime`：`admit`/`recover_lane`/`reconcile`/`checkpoint`/`recover_all_lanes`，`LaneRecovery`+`RecoveryFinding`+`RecoveryDecision`）；`pi-harness/src/session/values.rs`（`SessionValues`/`SessionValueWriter`）。CLI 启动时对每条 lane 跑恢复扫描（`pi-cli/src/session.rs`）。
 | §8 产品层 AgentSession | 已实现 | `pi-cli/src/agent_session.rs`（prompt/continue/steer/queue、model/thinking、scoped models、compact/retry、usage/context stats、HTML/JSONL/Markdown 导出、fork、value 持久化）。TUI `/usage`、`/export md\|html\|jsonl` 与 Ctrl+T/Ctrl+O 会话级偏好都走这一层。
 | §9 JSON 细粒度事件流 | 已实现 | `pi-cli/src/remote/protocol.rs`（`RemoteEvent::from_agent_event`，覆盖 agent/turn/message/delta/tool/retry）；`pi-cli/src/modes.rs` 的 json/rpc 模式逐条输出。
 | §10 导出格式与 CLI export | 已实现 | `pi-cli/src/export.rs`（`ExportFormat` + `export_session`/`export_file`，Markdown/HTML/JSONL）；`--export <in> [out]` 与 `/export <fmt>`。
 | §11 已识别但未生效的 CLI 功能 | 已实现 | `--offline`、`--approve`/`--no-approve`、`--tui-mode`、`--no-themes`、`--theme`、`--list-models [search]`、`--export` 均已接入行为（`pi-cli/src/app.rs`、`session.rs`、`interactive_tui.rs`）。
 | §12 交互快捷键与编辑器工作流 | 已实现 | `interactive_tui.rs` 键循环：Ctrl+G 外部编辑器、Ctrl+O 输出展开、Ctrl+T thinking 折叠、Ctrl+M 模型循环、Shift+Tab thinking 档位循环；`pi-tui/src/keybindings.rs` 可配置键位。
 | §15 TUI 基础组件 | 已实现 | `pi-tui/src/`：`ArminComponent`、`BorderedLoader`、`MouseRegion` 等价事件处理、`Editor` 全量接口。
+| §1 Provider 覆盖 | 部分实现（实用子集） | 新增 `pi-ai/src/providers/{deepseek,openrouter,llama_cpp,proxy}.rs`，复用 anthropic SSE 解析；未追求覆盖原生全部 ~40 个 provider。`pi-ai/src/constrained.rs` 提供约束采样（JSON schema/grammar/regex）。 |
+| §2 OAuth 与 credential 工具 | 已实现（基础） | `pi-cli/src/oauth.rs`：device-code 登录、token 刷新/过期、token store。 |
+| §5 ModelRegistry/ModelRuntime | 已实现 | `pi-cli/src/model_registry.rs`：`models.json` 运行时刷新、`ModelDefinition`→`Model` 转换、查询与重载。 |
+| §13 `/llama` 集成 | 已实现 | `pi-cli/src/llama_command.rs`：`rpi llama start|stop|list|status|download`（手工参数解析，无 clap）；`pi-ai/src/providers/llama_cpp.rs` 运行时。 |
+| §14 Trust gate 细节 | 已实现（基础） | `pi-cli/src/trust.rs`（`TrustStore`/`TrustDecision`）；`pi-cli/src/resource_dirs.rs` 的 `discover_system_prompt_file_with_trust` 按信任策略门控。 |
+| §18 生产 telemetry schema | 已实现 | `pi-telemetry/src/production.rs`：`ProductionTelemetryContext` 输出 JSON span 记录。 |
+| 基础设施（会话/工具） | 已实现 | `pi-harness/src/session/{keyed_queue,resources,search}.rs`（按 key 操作队列、资源清理注册表、会话全文检索）；`pi-tools/src/{image_processing.rs,tools/image.rs,utils/{git,open_browser}.rs}`（图片缩放/转码/EXIF、图片工具、Git URL 解析、跨平台打开浏览器）。 |
+| 基础设施（本轮） | 已实现 | `pi-cli/timings.rs`（PI_TIMING 启动计时）、`pi-cli/experimental.rs`（PI_EXPERIMENTAL）、`pi-cli/session_cwd.rs`（会话 cwd 丢失恢复）、`pi-cli/fs_watch.rs`（文件监听，含错误重试）、`pi-cli/source_info.rs`（资源来源）、`pi-cli/auth_guidance.rs`（登录指引）、`pi-cli/changelog.rs`（远程 changelog）、`pi-cli/attribution.rs`（provider 归因头）。 |
+| §7 缓存统计（cache-stats） | 已实现 | `pi-harness/cache_stats.rs`：提示缓存浪费统计（噪声下限/idle/模型切换/漏读计价），TUI cache-miss notice 改用该逻辑。 |
+| §4 传输：HTTP 代理 + 空闲超时 | 已实现 | `pi-ai/http.rs`：HTTP(S)_PROXY/ALL_PROXY/NO_PROXY 解析（含通配/host:port，拒绝 SOCKS/PAC）、池化 idle timeout、UA；provider 构造统一接入；settings 新增 `httpIdleTimeout`。 |
+| 语法高亮 | 已实现 | `pi-tui/syntax_highlight.rs`（无依赖轻量高亮，块注释跨行），markdown 代码块接入。 |
+| 富 footer | 已实现 | `pi-tui/footer.rs` 两行状态栏（pwd(分支)•会话 / ↑↓RWCH$ 用量 + 上下文占比 + 模型右对齐）；`.git/HEAD` 经 fs_watch 实时刷新。 |
+| §5 远程模型目录 | 已实现 | `pi-cli/remote_catalog.rs`：pi.dev `/api/models/providers/<id>` 拉取 + ETag/Last-Modified + 4h 窗口 + 覆盖合并 + 缓存；`--list-models` 接入。 |
+| 图片生成（SDK） | 已实现 | `pi-ai/images.rs`：ImagesApi/ImagesModel/AssistantImages + registry + `generate_images`；内置 openrouter-images provider。 |
+| §3 二进制协议（CBOR） | 已实现 | `pi-cli/remote/{framing,cbor,codec}.rs`：4 字节分帧 + 严格 CBOR + 流式 MessageDecoder。 |
+| §1 自定义 provider / UA / 归因 | 已实现 | `model_registry` 注册 models.json 新 provider；`http::user_agent`/`ensure_user_agent` 接入 openai-completions/deepseek/openrouter；`attribution.rs` 归因头并入模型头。 |
 
-仍待实现（保留在原文，未在本轮落地）：§1 provider 覆盖、§2 OAuth、§5 ModelRegistry 运行时、§13 `/llama`、§14 trust gate 细节、§16 JS bridge 剩余接口、§18 telemetry schema。§7 的 provider 端 deferred 长轮询续跑（`resume_deferred`）当前显式返回 `NotImplemented`，不静默假装完成。
+仍待实现（保留在原文，未在本轮落地）：§1 的**全量** provider 覆盖（按约定只落地 OpenRouter/DeepSeek/LLaMA.cpp/Proxy 子集）、§16 JS bridge 剩余接口 `pi.sendMessage`/`pi.sendUserMessage`（已决定不做）。其余审计项（含 §2/§5/§7/§13/§14/§18、图片生成、CBOR 协议、HTTP 代理、语法高亮、富 footer、远程目录、fs-watch、缓存统计、环境开关、session cwd、结构化诊断、自定义 provider/UA/归因/指引/changelog）均已落地。
 
 ## 判定标准
 
@@ -41,7 +57,7 @@
 | P1 | Trust/resource gate 细节（§14）、Settings 未消费字段（§15） | 项目安全策略与部分配置面不完整 |
 | P2 | JS/TS 扩展桥接剩余接口（§16）、telemetry schema（§18） | 扩展生态和低层 SDK 兼容性受限 |
 
-已从本表移除（本轮实现）：§6 AgentHarness/AgentLane API、§7 durable runtime/value store、§8 AgentSession、§9 JSON 细粒度事件、§10 导出格式、§11 CLI 功能开关、§12 交互快捷键、§17 TUI 基础组件。
+已从本表移除（本轮实现）：§2 OAuth、§5 ModelRegistry 运行时、§6 AgentHarness/AgentLane API、§7 durable runtime/value store、§8 AgentSession、§9 JSON 细粒度事件、§10 导出格式、§11 CLI 功能开关、§12 交互快捷键、§13 `/llama`、§14 trust gate 细节、§17 TUI 基础组件、§18 telemetry schema。仍保留：§1 provider **全量**覆盖（仅落地实用子集）、§15 settings 其余未消费字段、§16 JS bridge 剩余接口（已决定不做）。
 
 ## P0：模型、认证和传输
 
@@ -124,7 +140,13 @@ Rust 能识别 `Suspended`，但 CLI 明确输出“resume is not supported in v
 
 证据：Rust `crates/pi-harness/src/agent_harness.rs`、`crates/pi-cli/src/modes.rs:101`、`interactive_tui.rs:4067`；原生 `packages/agent/src/harness/agent-harness.ts`、`packages/agent/src/harness/runtime/`。
 
-### 7. Durable operation runtime/recovery/value store 缺失 —— 已实现（provider 端长轮询续跑除外，见「实现进展」）
+### 7. Durable operation runtime/recovery/value store 缺失 —— 已实现
+
+provider 端长轮询续跑（`resume_deferred`）也已接通：`pi-ai/src/provider.rs` 的
+`DeferredProvider` + 默认的 `Provider::deferred()`、`pi-agent` 的
+`run_agent_loop_from_assistant`、`pi-harness` 的 `resume_deferred`。
+仍未做的只是「哪个**真实** provider 去实现 long-poll API」——目前只有 faux 驱动。
+细节见 `docs/llm-repetition-forensics.md` §11.7.18。
 
 Rust 有 JSONL、内存和 SQLite session 存储，但没有原生新增的 durable operation 分层：admission/drive/recovery/reconcile/checkpoint、deferred polling/resume、operation state/value store、pending assistant/tool frame 持久化、lane snapshots 和 recovery events。原生 `packages/agent/src/harness/runtime/` 及 `packages/coding-agent/src/core/session/{commit,fork,fork-policy,values}.ts` 均有对应实现，Rust session 目录没有 `values` 和 operation runtime 层。
 
@@ -201,7 +223,36 @@ Rust 代码明确说明项目资源当前无条件加载，`trust.json` 只做�
 
 证据：Rust `crates/pi-cli/src/resource_dirs.rs:20-29,106-107,212`、`session.rs:402`、`config.rs:364-366`；原生 `packages/coding-agent/src/core/resource-loader.ts`、`project-trust.ts`、`trust-manager.ts`。
 
-### 15. Settings 可控功能面明显缺失 —— TUI/编辑器侧已实现（见「实现进展」）；其余 settings 字段仍未被消费
+### 15. Settings 可控功能面缺失 —— 已大幅收窄（2026-09-25 复核）
+
+**复核结论（逐字段 grep 过）**：rpi 的 `Settings`（`pi-cli/src/settings.rs`）里
+**24 个字段全部有读取点，没有一个"建模了但没人读"**。下面原文里点名的那批
+（hide thinking、external editor、quiet startup、trust、terminal progress、
+image resize、default tools、doubleEscapeAction、tree filters、UI padding/autocomplete、
+markdown/http timeout 等）**多数已经落地并接线**。
+
+仍然剩下的分三类（键名对照原生 `settings-manager.ts` 的 52 个键）：
+
+**A. 同一能力、键名不同**（写原生的键名不生效）：
+`enabledModels`→rpi `scopedModels`；`httpIdleTimeoutMs`→`httpIdleTimeout`；
+`images`→`showImages`（只覆盖布尔，原生的 `images` 是对象）。
+
+**B. 能力在别处有，但 settings.json 里写了不生效**：
+`retry`/`compaction`/`branchSummary`（harness 有对应类型，构造时硬编码默认）；
+`steeringMode`/`followUpMode`（同）；`sessionDir`（有 CLI `--session-dir`）；
+`httpProxy`（只读 `HTTP_PROXY` 等环境变量，见 `pi-ai/src/http.rs`）；
+`tuiMode`（有 CLI `--tui-mode`）；`externalEditor`（只读 `EDITOR`/`VISUAL`）；
+`showHardwareCursor`、`fullscreenExitOutput`、`fullscreenScrollbar`、
+`thinkingBudgets`（类型有、无设置项）；`shellPath`/`shellCommandPrefix`
+（bash 工具有 `command_prefix`，但 `bash_options()` 里是 `None`，未接线）；
+`markdown`/`warnings` 子设置。
+
+**C. rpi 完全没有**：`modelThinkingLevels`、`defaultProjectTrust`（有 `TrustStore`，
+但没有这个全局设置项）、`collapseChangelog`、`enableInstallTelemetry`、
+`enableAnalytics`、`trackingId`（`extras.rs` 里只有一句"v1 简化为一次性 banner"）、
+`enableSkillCommands`、`treeFilterMode`、`cacheWarming`、`websocketConnectTimeoutMs`。
+
+（以下为 2026-09-12 的原始审计，保留以便对照当时判定依据。）
 
 Rust `crates/pi-cli/src/settings.rs:19` 只真正建模并使用 provider/model/thinking/theme、scopedModels、packages 和 resource dirs；未知字段虽会保留，但不会产生行为。原生 settings 中以下功能因此不可用：retry、compaction、branch summary、steering/follow-up mode、transport（SSE/WebSocket/auto）、hide thinking、external editor、shell path/prefix、quiet startup、project trust、terminal image/progress/hyperlink/trueColor、image resize/block、enabled models/default tools、doubleEscapeAction、tree filters、thinking budgets、UI padding/autocomplete、markdown/mermaid/warning/http timeout 等。
 

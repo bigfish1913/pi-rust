@@ -9,15 +9,16 @@
 //! tests compare event sequences via `Debug`. This avoids requiring
 //! `Deserialize` on `AssistantMessageEvent` (which is stream-protocol-only).
 
-use rpi_ai::types::{AssistantMessageEvent, ToolResultMessage};
+use rpi_ai::types::{AssistantMessage, AssistantMessageEvent, ToolResultMessage};
 use std::sync::Arc;
 
 use crate::message::AgentMessage;
 use crate::types::AgentToolResult;
 
 /// An event emitted by the agent loop. Mirrors TS `AgentEvent` (tagged on
-/// `type`). All `AgentMessage` payloads are owned (cloned) so broadcast
-/// subscribers get independent copies.
+/// `type`). `AgentMessage` payloads are owned (cloned) so broadcast subscribers
+/// get independent copies — except [`AgentEvent::MessageUpdate`], which carries
+/// the streaming partial as a cheap `Arc` because it fires once per delta.
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     /// Emitted once at the start of a run, before `turn_start`.
@@ -49,10 +50,16 @@ pub enum AgentEvent {
     /// custom) is appended to the transcript.
     MessageStart { message: AgentMessage },
     /// Emitted only for assistant messages, on each streaming delta. Carries
-    /// the underlying `AssistantMessageEvent` plus a snapshot of the partial
-    /// assistant message.
+    /// the underlying `AssistantMessageEvent` plus a **shared** snapshot of the
+    /// partial assistant message.
+    ///
+    /// The snapshot is an `Arc`, not an owned message: a delta used to deep-clone
+    /// the whole growing message here, again in the loop's context update, and
+    /// again in each consumer — quadratic in the output length. Consumers that
+    /// need it as JSON use [`crate::message::assistant_json`] to keep the wire
+    /// shape identical without copying.
     MessageUpdate {
-        message: AgentMessage,
+        message: Arc<AssistantMessage>,
         assistant_message_event: AssistantMessageEvent,
     },
     /// Emitted when a message finishes (complement of `MessageStart`).
