@@ -11,6 +11,14 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+### Changed
+
+- The interactive header now shows the three-bar brand mark from the site
+  favicon, labelled `rpi · rust`, in place of the previous emoji crab-and-π logo.
+  The old mark mixed an emoji with a box-drawing glyph, whose east-asian width is
+  ambiguous, so the header rendered inconsistently depending on the terminal.
+  The mark follows the active theme's accent colour for its middle bar.
+
 ## [0.3.1] - 2026-09-25
 
 No functional change to the agent, tools or CLI. This release repairs the build

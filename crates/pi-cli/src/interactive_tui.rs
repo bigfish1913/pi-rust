@@ -9954,24 +9954,31 @@ fn add_welcome_message_with_capabilities(
     skills: &[String],
 ) {
     let c = current_theme().colors;
-    // ASCII art logo combining Rust crab and Pi
+    // The three-bar brand mark, matching the site favicon
+    // (website/favicon.svg): two dim outer bars flanking a taller accent bar,
+    // bottom-aligned. The SVG's heights (13/19/9) are rounded to the five rows
+    // a terminal header can afford. Using block characters rather than the
+    // previous emoji avoids the east-asian-width ambiguity that made the old
+    // crab-and-box logo render inconsistently across terminals.
+    let bar = c.dim.fg("██");
+    let bar_accent = c.accent.fg("██");
     let logo = format!(
-        "{}\n{}\n{}\n{}",
-        c.accent.fg("    🦀"),
-        c.accent.fg("  ╭─π─╮"),
-        c.accent.fg("  │") + &c.accent.fg(&tui_bold("rpi")) + &c.accent.fg("│"),
-        c.accent.fg("  ╰───╯")
+        "{}\n{}\n{}\n{}\n{}",
+        format!("     {bar_accent}"),
+        format!("     {bar_accent}"),
+        format!("  {bar} {bar_accent}"),
+        format!("  {bar} {bar_accent} {bar}"),
+        format!(
+            "  {bar} {bar_accent} {bar}   {} {}",
+            c.accent.fg(&tui_bold("rpi")),
+            c.muted.fg("· rust")
+        ),
     );
     container.add_child(Arc::new(Text::new(logo, 1, 0)));
     container.add_child(Arc::new(Spacer::new(1)));
-    // Accent logotype + a dim tagline, separated from the rest by a thin
-    // themed rule. Plain `Text("rpi interactive TUI")` was visually identical
-    // to the body text, so the header didn't read as a header.
-    let title = format!(
-        "{} {}",
-        c.accent.fg(&tui_bold("rpi")),
-        c.muted.fg("interactive TUI")
-    );
+    // The mark carries the product name, so the line under it is the tagline
+    // rather than a second logotype.
+    let title = c.muted.fg("interactive TUI · library-first agent runtime");
     container.add_child(Arc::new(Text::new(title, 1, 0)));
     container.add_child(Arc::new(Spacer::new(1)));
     container.add_child(Arc::new(Text::new(
@@ -11111,6 +11118,33 @@ mod tests {
         assert!(
             plain.contains("rust-review · release"),
             "Skill names missing: {plain}"
+        );
+    }
+
+    #[test]
+    fn welcome_header_renders_the_brand_mark() {
+        let chat = Arc::new(Container::new());
+        add_welcome_message(&chat);
+        let lines: Vec<String> = chat.render(80).iter().map(|l| strip_ansi(l)).collect();
+        let all = lines.join("\n");
+
+        // The three-bar mark: the bottom row carries all three bars, and the
+        // wordmark sits on its baseline next to the middle bar.
+        assert!(
+            lines.iter().any(|l| l.contains("██ ██ ██")),
+            "brand mark missing: {all}"
+        );
+        assert!(
+            all.contains("rpi · rust"),
+            "the mark must be labelled with the Rust wordmark: {all}"
+        );
+
+        // Regression guard: the previous logo used an emoji plus a π glyph,
+        // whose east-asian width is ambiguous and made the header render
+        // inconsistently across terminals.
+        assert!(
+            !all.contains('🍣') && !all.contains('π'),
+            "the header must stay within unambiguous single-width characters: {all}"
         );
     }
 
