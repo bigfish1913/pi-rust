@@ -37,15 +37,19 @@ cargo build --workspace --locked
 cargo test  --workspace --locked
 ```
 
-Before opening a PR, run exactly what CI runs:
+Before opening a PR, run what CI enforces:
 
 ```bash
-cargo fmt --all -- --check
 cargo check --workspace --all-targets --locked
 cargo test  --workspace --locked
 ```
 
-Please also run Clippy locally; warnings are treated as review feedback:
+Formatting: run `cargo fmt` on the files you touch, but do **not** run
+`cargo fmt --all` in a feature PR. The workspace has pre-existing rustfmt drift
+that has not been swept yet (#15), and a repo-wide reformat would bury the actual
+change. CI does not enforce `cargo fmt --check` until that sweep lands.
+
+Clippy is not part of CI either, so keep new code warning-free by hand:
 
 ```bash
 cargo clippy --workspace --all-targets --locked
