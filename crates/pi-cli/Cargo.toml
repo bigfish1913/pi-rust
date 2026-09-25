@@ -11,7 +11,12 @@ documentation = "https://docs.rs/rpi-cli"
 description = "Terminal coding-agent CLI (the `rpi` binary) built on the rpi-* library crates — a Rust port of @earendil-works/pi-coding-agent's CLI surface"
 readme = "README.md"
 keywords = ["agent", "llm", "ai", "claude", "cli"]
-categories = ["command-line-interface", "api-bindings", "development-tools"]
+categories = [
+    "command-line-interface",
+    "api-bindings",
+    "development-tools",
+    "artificial-intelligence",
+]
 
 [dependencies]
 rpi-telemetry = { workspace = true }

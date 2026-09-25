@@ -11,7 +11,7 @@ documentation = "https://docs.rs/rpi-agent"
 description = "Agent runtime + loop, Rust port of pi-agent-core core layer"
 readme = "README.md"
 keywords = ["agent", "llm", "ai", "claude", "sdk"]
-categories = ["api-bindings", "asynchronous"]
+categories = ["api-bindings", "asynchronous", "artificial-intelligence"]
 
 [dependencies]
 rpi-telemetry = { workspace = true }

@@ -11,7 +11,7 @@ documentation = "https://docs.rs/rpi-ai"
 description = "Unified multi-provider LLM types + streaming, Rust port of pi-ai"
 readme = "README.md"
 keywords = ["agent", "llm", "ai", "anthropic", "openai"]
-categories = ["api-bindings", "asynchronous"]
+categories = ["api-bindings", "asynchronous", "artificial-intelligence"]
 
 [dependencies]
 rpi-telemetry = { workspace = true }

@@ -11,7 +11,7 @@ documentation = "https://docs.rs/rpi-harness"
 description = "Session tree + JSONL persistence + compaction + AgentHarness loop, Rust port of pi harness layer"
 readme = "README.md"
 keywords = ["agent", "llm", "ai", "claude", "harness"]
-categories = ["api-bindings", "asynchronous"]
+categories = ["api-bindings", "asynchronous", "artificial-intelligence"]
 
 [dependencies]
 rpi-telemetry = { workspace = true }

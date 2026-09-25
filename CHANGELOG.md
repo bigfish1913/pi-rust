@@ -11,14 +11,19 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
-### Fixed
+## [0.3.2] - 2026-09-25
 
-- A superseded runtime-context update could publish its `activeTools` list after
-  a newer one had already been applied. Concurrent `set_runtime_context` calls
-  run on separate threads, and the thread holding the older response could reach
-  the recording step last, resurrecting a tool list the newer context had
-  replaced. The result is now discarded unless its revision is still the newest,
-  matching the rule Node already applies to the request itself.
+### Added
+
+- Session pickers (`rpi -r` and `/session`) show readable rows instead of a wall
+  of near-identical timestamped file names. Each row comes from a cheap
+  head/tail summary of the session file — display name, first user prompt
+  (single-lined and truncated to a label), and on-disk size — so saved sessions
+  can be told apart without parsing logs that can run to tens of megabytes.
+  Search matches the label, the short id and the file name, and the primary
+  column is wide enough that a long label is not clipped.
+- `--name` / `-n` records a session's display name durably, for a fresh session
+  as well as a restored one; an empty value clears a name set earlier.
 
 ### Changed
 
@@ -30,6 +35,25 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
   The mark follows the active theme's accent colour for its middle bar.
   `RPI_NO_EMOJI=1` renders the lockup without the crab (and without the
   separator that would otherwise dangle).
+- The workspace is now `rustfmt`-clean. The sweep is listed in
+  `.git-blame-ignore-revs` so `git blame` skips it.
+- `rpi-ai`, `rpi-agent`, `rpi-tools`, `rpi-harness` and `rpi-cli` now carry the
+  crates.io `artificial-intelligence` category, so they are reachable by
+  browsing that category and not only by keyword search.
+
+### Fixed
+
+- A superseded runtime-context update could publish its `activeTools` list after
+  a newer one had already been applied. Concurrent `set_runtime_context` calls
+  run on separate threads, and the thread holding the older response could reach
+  the recording step last, resurrecting a tool list the newer context had
+  replaced. The result is now discarded unless its revision is still the newest,
+  matching the rule Node already applies to the request itself.
+- `-c` / `--continue` and `-r` / `/session` no longer offer sessions that hold
+  only their header, the leftovers an abandoned launch leaves behind. Resuming
+  one of them previously opened an empty transcript; `-c` now picks the newest
+  session that has content, falling back to the newest overall only when every
+  session is empty.
 
 ## [0.3.1] - 2026-09-25
 
@@ -456,7 +480,8 @@ on `main` and fixes how every crate presents itself on crates.io and docs.rs.
 Early crates.io publications while the workspace layout, provider layer and
 agent loop were being established. See `git log` for details.
 
-[Unreleased]: https://github.com/bigfish1913/pi-rust/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/bigfish1913/pi-rust/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/bigfish1913/pi-rust/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/bigfish1913/pi-rust/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/bigfish1913/pi-rust/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/bigfish1913/pi-rust/compare/v0.1.28...v0.2.0
