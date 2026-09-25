@@ -6200,15 +6200,6 @@ pub async fn interactive_tui(
             if state_tick.sync_extension_status() {
                 tui_tick.request_render(false);
             }
-            // The startup crab is the only other reason an idle session paints.
-            // It is bounded (see `crate::brand`), so this stops asking for
-            // frames the moment the crab has settled.
-            if crate::brand::brand_animation_active() {
-                // A full rebuild rather than reusing the scroll content: the
-                // lockup lives in the transcript, so a reused frame would keep
-                // painting the old crab position.
-                tui_tick.request_render(false);
-            }
             let working = *state_tick.status.lock().unwrap() == RunStatus::Working;
             if working {
                 // A live transcript panel — a running bash command *or* a
@@ -9963,10 +9954,8 @@ fn add_welcome_message_with_capabilities(
     skills: &[String],
 ) {
     let c = current_theme().colors;
-    // The mark, wordmark and animated crab live in `crate::brand`: the crab
-    // walks in once and then stops, so nothing repaints while the session is
-    // idle. See that module for why the layout is built from single-width
-    // characters only.
+    // The mark, wordmark and language mark live in `crate::brand`. See that
+    // module for why the layout is built from single-width characters only.
     container.add_child(Arc::new(crate::brand::BrandLockup::new()));
     container.add_child(Arc::new(Spacer::new(1)));
     // The mark carries the product name, so the line under it is the tagline
@@ -11128,8 +11117,8 @@ mod tests {
             "brand mark missing: {all}"
         );
         assert!(
-            all.contains("rpi · rust"),
-            "the mark must be labelled with the Rust wordmark: {all}"
+            all.contains("rpi"),
+            "the mark must carry the product name: {all}"
         );
 
         // Regression guard for the layout bug this replaced: `π` is East-Asian

@@ -11,23 +11,16 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
-### Added
-
-- A Rust crab walks in beside the `rpi · rust` wordmark on startup, then stops.
-  The animation is deliberately bounded rather than looping: the render
-  scheduler is parked on a condvar when no frame is owed, so an endless
-  animation would force an idle session to repaint forever for a decoration. It
-  starts on the first paint rather than when the header is built, so a slow
-  startup cannot eat the walk before the user sees it. `RPI_NO_EMOJI=1` renders
-  the lockup without the crab.
-
 ### Changed
 
 - The interactive header now shows the three-bar brand mark from the site
-  favicon, labelled `rpi · rust`, in place of the previous emoji crab-and-π logo.
+  favicon, labelled with the crab in place of the language name, instead of the
+  previous crab-and-π logo.
   The old mark mixed an emoji with a box-drawing glyph, whose east-asian width is
   ambiguous, so the header rendered inconsistently depending on the terminal.
   The mark follows the active theme's accent colour for its middle bar.
+  `RPI_NO_EMOJI=1` renders the lockup without the crab (and without the
+  separator that would otherwise dangle).
 
 ## [0.3.1] - 2026-09-25
 
