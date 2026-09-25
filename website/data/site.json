@@ -14,8 +14,8 @@
       "label": "个可安装扩展"
     },
     {
-      "value": "7",
-      "label": "种内置 Provider"
+      "value": "9.7×",
+      "label": "启动速度（vs 原生 pi）"
     },
     {
       "value": "0",
@@ -98,10 +98,10 @@
   ],
   "releases": [
     {
-      "version": "0.3.0",
+      "version": "0.3.1",
       "status": "current",
-      "title": "统一的插件 ABI 与崩溃恢复",
-      "description": "插件入口统一到单一 ABI，会话在崩溃后可续跑，延迟响应与设置项对齐原生 Pi。"
+      "title": "构建修复与实测性能对比",
+      "description": "修复 main 上持续失败的编译、让每个 crate 在 crates.io 正确展示，并首次给出与原生 TypeScript pi 的同机基准对比。"
     },
     {
       "version": "next",

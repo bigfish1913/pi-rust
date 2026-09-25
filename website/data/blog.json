@@ -1,5 +1,29 @@
 [
   {
+    "id": "v0-3-1-crates-io-and-performance",
+    "date": "2026-09-25",
+    "tag": "Release",
+    "title": "rpi 0.3.1：修好 main 的构建，并给出与原生 pi 的实测对比",
+    "summary": "0.3.1 是补丁版本：修复了 main 上持续失败的编译错误，让每个 crate 在 crates.io 和 docs.rs 上正确展示，并首次给出与原生 TypeScript pi 的同机性能对比。",
+    "body": [
+      "0.3.1 不改变 agent、工具或 CLI 的行为。它修的是「别人第一次接触这个项目时会看到什么」。",
+      "## main 其实编译不过\n自从 `c40094a` 起，`rpi-plugin-sdk` 里同时存在 `PluginApi` 结构体和指向它的 `pub type` 别名，以及两份 `register_entrypoint_unified` 定义。结果是 `cargo test --workspace` 直接以 `E0428` / `E0119` / `E0609` 失败——也就是说，任何人 clone `main` 都构建不起来，CI 徽章已经连续三次 push 是红的。已发布到 crates.io 的 0.3.0 不受影响：它是在这些问题引入之前构建的。",
+      "## crates.io 和 docs.rs 上的展示\n此前九个 crate 都引用工作区根目录的同一份 README，其中的相对链接（`docs/architecture.md`、`LICENSE`、`examples/plugin-stub`）在 crates.io 与 docs.rs 上全部 404；页面上也没有指向官网的链接。现在每个 crate 有自己的 README，都声明了 `homepage` 与 `documentation`。",
+      "## 与原生 pi 的同机对比\n这是第一次给出可复现的实测数字。两个工具用完全相同的 JSONL RPC 端点、同一台机器、每轮全新的空配置目录、双方均离线：",
+      "| 指标 | rpi | pi 0.87.1 | 差距 |\n| --- | --: | --: | --- |\n| `--version` | **17.9 ms** | 172.9 ms | 9.7× |\n| 到可用 agent（RPC ready） | **103.6 ms** | 176.4 ms | 1.7× |\n| 常驻内存 | **18.6 MiB** | 91.6 MiB | 4.9× |\n| 安装体积 | **23.9 MiB** | 约 513 MiB | ~21× |",
+      "真正有意思的不是倍数，而是时间花在哪：原生 pi 的开销几乎全在 Node 启动（`--version` 与完整 agent 只差约 3 ms），而 rpi 的 103.6 ms 里有 86 ms 是自身的运行时初始化。所以下一步的优化方向是惰性初始化，而不是把二进制做小。",
+      "基准脚本在 `scripts/bench-vs-pi.mjs`，方法和未测范围写在 `docs/performance-vs-pi.md`。未测的部分包括 LLM 延迟、工具循环吞吐、长会话内存增长和 TUI 帧开销。",
+      "## 不用装 Rust 也能试\n每个 release 现在附带 Linux（x86_64 / aarch64）、macOS（aarch64）和 Windows（x86_64）预编译二进制，附 SHA-256 校验。"
+    ],
+    "highlights": [
+      "修复 main 上的编译错误，CI 恢复绿色",
+      "每个 crate 独立的 README 与官网链接",
+      "与原生 pi 的同机基准：启动 9.7×、内存 4.9×、体积 ~21×",
+      "预编译二进制 + 校验和，免 Rust 工具链安装",
+      "内嵌文档快照加入 CI 校验，不再静默过期"
+    ]
+  },
+  {
     "id": "v0-1-22-headless-rpc",
     "date": "2026-09-21",
     "tag": "Release",
@@ -11,7 +35,12 @@
       "## 插件安全性\n`register_entrypoint` 现在被标记为 `unsafe fn`，明确了插件与宿主之间的安全边界。这是一个 breaking change，但让 ABI 合约的安全性更加清晰。",
       "## 其他修复\n- 恢复渲染调度器和重载错误报告\n- 中止操作时恢复编辑器状态，防止错误信息进入输入框\n- ask_user 对话框支持 Markdown 内容渲染\n- 本地开发模式下无 Cargo cdylib 时优雅降级为 skills-only 模式"
     ],
-    "highlights": ["--server 无头 RPC 模式", "register_entrypoint 标记为 unsafe", "ask_user 支持 Markdown", "dev-local 优雅降级"]
+    "highlights": [
+      "--server 无头 RPC 模式",
+      "register_entrypoint 标记为 unsafe",
+      "ask_user 支持 Markdown",
+      "dev-local 优雅降级"
+    ]
   },
   {
     "id": "v0-1-21-tui-crates-io",
@@ -25,7 +54,12 @@
       "## crates.io 自动发布\nCI 流水线现在支持在 main 分支推送时自动发布 crate 到 crates.io，使用 trusted publishing 机制确保安全性。",
       "## UI 对话框扩展\nrpi-extensions 添加了对 UI 对话框操作 17 的支持，让插件可以触发更丰富的交互界面。"
     ],
-    "highlights": ["TUI 工具结果渲染", "会话历史恢复", "crates.io 自动发布", "UI 对话框操作 17"]
+    "highlights": [
+      "TUI 工具结果渲染",
+      "会话历史恢复",
+      "crates.io 自动发布",
+      "UI 对话框操作 17"
+    ]
   },
   {
     "id": "v0-1-19-stability",
@@ -39,6 +73,11 @@
       "## TUI 稳定性\n多行输入在快速编辑和粘贴场景下不再出现错位；Provider 错误信息现在被正确分类和展示，而不是混入普通输出流。",
       "## 清理\n移除了过时的 model catalog helper，减少维护负担。"
     ],
-    "highlights": ["中止时保留队列消息", "多行输入稳定", "Provider 错误分类", "移除过时 helper"]
+    "highlights": [
+      "中止时保留队列消息",
+      "多行输入稳定",
+      "Provider 错误分类",
+      "移除过时 helper"
+    ]
   }
 ]
