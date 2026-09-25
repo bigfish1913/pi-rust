@@ -1,0 +1,164 @@
+name: Release binaries
+
+# Builds prebuilt `rpi` binaries and attaches them to the GitHub Release for a
+# tag. This is what makes `curl -fsSL .../install.sh | sh` work and what removes
+# the "you need a Rust toolchain and a C linker" barrier to trying the CLI.
+#
+# crates.io publishing is handled separately by ci.yml (push to main).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build and attach binaries to (e.g. v0.3.0)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          # GitHub-hosted arm64 Linux runners; available for public repos.
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 --locked \
+            | jq -r '.packages[] | select(.name == "rpi-cli") | .version' | head -n 1)"
+          if [[ -z "${version}" || "${version}" == "null" ]]; then
+            echo "Could not determine the rpi-cli workspace version." >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "Building rpi ${version} for ${{ matrix.target }}"
+
+      - name: Build release binary
+        run: cargo build -p rpi-cli --release --locked --target ${{ matrix.target }}
+
+      - name: Stage artifact
+        id: stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          target="${{ matrix.target }}"
+          name="rpi-v${version}-${target}"
+          mkdir -p dist
+
+          if [[ "${target}" == *windows* ]]; then
+            bin="target/${target}/release/rpi.exe"
+          else
+            bin="target/${target}/release/rpi"
+          fi
+
+          if [[ ! -f "${bin}" ]]; then
+            echo "expected binary at ${bin} but it is missing" >&2
+            exit 1
+          fi
+
+          cp "${bin}" dist/
+          cp LICENSE dist/ 2>/dev/null || true
+          cp NOTICE dist/ 2>/dev/null || true
+          cp README.md dist/ 2>/dev/null || true
+
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            (cd dist && 7z a -tzip "../${name}.zip" . >/dev/null)
+            asset="${name}.zip"
+          else
+            tar -czf "${name}.tar.gz" -C dist .
+            asset="${name}.tar.gz"
+          fi
+
+          # Publish a checksum next to every archive so install.sh can verify it.
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${asset}" > "${asset}.sha256"
+          else
+            shasum -a 256 "${asset}" > "${asset}.sha256"
+          fi
+
+          echo "asset=${asset}" >> "${GITHUB_OUTPUT}"
+          echo "checksum=${asset}.sha256" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            ${{ steps.stage.outputs.asset }}
+            ${{ steps.stage.outputs.checksum }}
+          if-no-files-found: error
+
+  release:
+    name: Attach binaries to the release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la dist
+
+      - name: Publish to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" dist/* --clobber
+          else
+            gh release create "${TAG}" dist/* \
+              --title "rpi ${TAG}" \
+              --generate-notes
+          fi
