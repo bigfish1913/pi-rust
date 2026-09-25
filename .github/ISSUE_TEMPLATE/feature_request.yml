@@ -1,0 +1,76 @@
+name: Feature request
+description: Propose a capability or a change in behaviour
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please describe the problem before the solution. A request that starts
+        from a real workflow is much easier to act on than one that starts from
+        an API shape. Check [ROADMAP.md](https://github.com/bigfish1913/pi-rust/blob/main/ROADMAP.md)
+        first — if it is already listed, comment on the tracking issue instead.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - rpi-cli (the `rpi` binary, CLI flags)
+        - rpi-tui (interactive terminal UI)
+        - rpi-agent (agent loop, events, hooks)
+        - rpi-ai (providers, streaming)
+        - rpi-tools (read/write/edit/bash and friends)
+        - rpi-harness (sessions, persistence, compaction)
+        - rpi-plugin-sdk / rpi-extensions (plugins)
+        - Remote mode (--server / --connect)
+        - Website or documentation
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do, and where does rpi get in the way today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What should rpi do instead? Include the interface you would like to use if you have one in mind.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you tried, other tools that solve this, and why they are not enough.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: contribution
+    attributes:
+      label: Would you be willing to work on this?
+      options:
+        - "Yes, I can open a PR"
+        - "Yes, but I would need guidance on the design"
+        - "No, reporting only"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: I read the roadmap and this is not already planned.
+          required: true

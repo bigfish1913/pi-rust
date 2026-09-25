@@ -1,0 +1,107 @@
+name: Bug report
+description: Something in rpi does not work as documented
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Please do not paste API keys, tokens, or the
+        contents of `~/.rpi/agent/auth.json` — redact them first.
+
+        For security vulnerabilities, stop here and follow
+        [SECURITY.md](https://github.com/bigfish1913/pi-rust/blob/main/SECURITY.md)
+        instead of opening a public issue.
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected component
+      description: Which crate or surface is involved?
+      multiple: true
+      options:
+        - rpi-cli (the `rpi` binary, CLI flags)
+        - rpi-tui (interactive terminal UI)
+        - rpi-agent (agent loop, events, hooks)
+        - rpi-ai (providers, streaming)
+        - rpi-tools (read/write/edit/bash and friends)
+        - rpi-harness (sessions, persistence, compaction)
+        - rpi-plugin-sdk / rpi-extensions (plugins)
+        - Remote mode (--server / --connect)
+        - Website or documentation
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: rpi version
+      description: "Output of `rpi --version`."
+      placeholder: "rpi 0.3.0"
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: OS, architecture, and where relevant the terminal emulator.
+      placeholder: "Windows 11 24H2 (x86_64), Windows Terminal 1.22"
+    validations:
+      required: true
+
+  - type: input
+    id: install
+    attributes:
+      label: How did you install rpi?
+      placeholder: "cargo install rpi-cli / cargo install --path crates/pi-cli / prebuilt binary"
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you observe, and what did you expect instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: |
+        The exact command line, plus the smallest config that triggers it.
+        If it only happens with a particular provider, say which one and how it
+        is configured (redact the key).
+      value: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      description: |
+        Paste the error output or a transcript excerpt. `RPI_EVENT_LOG=1` plus
+        `rpi events tail` can help for agent-loop problems. Long logs: attach a
+        file instead of pasting.
+      render: shell
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: I am running the latest published version (or `main`).
+          required: true
+        - label: I removed any API keys, tokens, or private data from this report.
+          required: true

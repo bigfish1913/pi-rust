@@ -1,0 +1,14 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/bigfish1913/pi-rust/security/advisories/new
+    about: Report privately. Do not open a public issue for security problems.
+  - name: Question or usage help
+    url: https://github.com/bigfish1913/pi-rust/discussions
+    about: Ask in Discussions — bug reports and feature requests use the forms above.
+  - name: Documentation
+    url: https://rpi.laofu.online/docs.html
+    about: User guide, SDK docs, and the extension authoring guide.
+  - name: Extension packages
+    url: https://github.com/pi-rust/rpi-package
+    about: Report problems with a published extension in the package repository.
