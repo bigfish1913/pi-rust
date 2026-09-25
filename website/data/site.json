@@ -5,23 +5,80 @@
     "description": "rpi 是一个 library-first 的 Rust SDK。用清晰的分层、可替换的模型 Provider 和真正可测试的工具循环，构建属于你的 coding agent。"
   },
   "stats": [
-    { "value": "26", "label": "个可组合软件包" },
-    { "value": "2", "label": "种内置 Provider" },
-    { "value": "4", "label": "个 Pi 兼容工具" },
-    { "value": "0", "label": "网络依赖的测试" }
+    {
+      "value": "9",
+      "label": "个核心 crate"
+    },
+    {
+      "value": "20",
+      "label": "个可安装扩展"
+    },
+    {
+      "value": "7",
+      "label": "种内置 Provider"
+    },
+    {
+      "value": "0",
+      "label": "网络依赖的测试"
+    }
   ],
   "features": [
-    { "number": "01", "title": "Library-first", "description": "核心能力不依赖 CLI。只引入你需要的 crate，从一个 Agent loop 开始。", "tag": "可组合" },
-    { "number": "02", "title": "Provider agnostic", "description": "Anthropic、OpenAI-compatible 或你自己的服务，都落在同一个 Provider 边界后面。", "tag": "可替换" },
-    { "number": "03", "title": "Tool loop ready", "description": "工具参数校验、并行执行、流式事件、取消和 follow-up 都是循环的一部分。", "tag": "可观测" },
-    { "number": "04", "title": "Durable by choice", "description": "需要时再接入 Session、JSONL、分支和上下文压缩，不为简单实验提前付复杂度。", "tag": "可持久化" }
+    {
+      "number": "01",
+      "title": "Library-first",
+      "description": "核心能力不依赖 CLI。只引入你需要的 crate，从一个 Agent loop 开始。",
+      "tag": "可组合"
+    },
+    {
+      "number": "02",
+      "title": "Provider agnostic",
+      "description": "Anthropic、OpenAI-compatible 或你自己的服务，都落在同一个 Provider 边界后面。",
+      "tag": "可替换"
+    },
+    {
+      "number": "03",
+      "title": "Tool loop ready",
+      "description": "工具参数校验、并行执行、流式事件、取消和 follow-up 都是循环的一部分。",
+      "tag": "可观测"
+    },
+    {
+      "number": "04",
+      "title": "Durable by choice",
+      "description": "需要时再接入 Session、JSONL、分支和上下文压缩，不为简单实验提前付复杂度。",
+      "tag": "可持久化"
+    }
   ],
   "architecture": [
-    { "name": "rpi-ai", "label": "Models + streaming", "description": "统一消息类型、Provider 和流式事件", "tone": "orange" },
-    { "name": "rpi-agent", "label": "Agent loop", "description": "工具调用、事件、Hook、steering", "tone": "mint" },
-    { "name": "rpi-tools", "label": "Built-in tools", "description": "read / write / edit / bash", "tone": "blue" },
-    { "name": "rpi-harness", "label": "Sessions", "description": "会话树、JSONL、compaction", "tone": "violet" },
-    { "name": "rpi-cli", "label": "Your interface", "description": "CLI、TUI、配置和插件", "tone": "cream" }
+    {
+      "name": "rpi-ai",
+      "label": "Models + streaming",
+      "description": "统一消息类型、Provider 和流式事件",
+      "tone": "orange"
+    },
+    {
+      "name": "rpi-agent",
+      "label": "Agent loop",
+      "description": "工具调用、事件、Hook、steering",
+      "tone": "mint"
+    },
+    {
+      "name": "rpi-tools",
+      "label": "Built-in tools",
+      "description": "read / write / edit / bash",
+      "tone": "blue"
+    },
+    {
+      "name": "rpi-harness",
+      "label": "Sessions",
+      "description": "会话树、JSONL、compaction",
+      "tone": "violet"
+    },
+    {
+      "name": "rpi-cli",
+      "label": "Your interface",
+      "description": "CLI、TUI、配置和插件",
+      "tone": "cream"
+    }
   ],
   "examples": [
     {
@@ -40,8 +97,23 @@
     }
   ],
   "releases": [
-    { "version": "0.1.11", "status": "current", "title": "Native Pi parity and streaming", "description": "模型选择、流式协议、TUI 控制和 Pi package 加载行为进一步与原生 Pi 对齐。" },
-    { "version": "next", "status": "building", "title": "More surfaces", "description": "扩展 package manifest、更多 Provider 和更完整的插件资源协议。" },
-    { "version": "future", "status": "exploring", "title": "Your ideas", "description": "把 rpi 接进你的产品、工作流和自己的运行环境。" }
+    {
+      "version": "0.3.0",
+      "status": "current",
+      "title": "统一的插件 ABI 与崩溃恢复",
+      "description": "插件入口统一到单一 ABI，会话在崩溃后可续跑，延迟响应与设置项对齐原生 Pi。"
+    },
+    {
+      "version": "next",
+      "status": "building",
+      "title": "更多分发方式",
+      "description": "预编译二进制、更多 Provider 适配器，以及更完整的扩展资源协议。"
+    },
+    {
+      "version": "future",
+      "status": "exploring",
+      "title": "你的想法",
+      "description": "把 rpi 接进你的产品、工作流和自己的运行环境。"
+    }
   ]
 }
