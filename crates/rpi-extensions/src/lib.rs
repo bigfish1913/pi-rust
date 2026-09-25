@@ -71,13 +71,13 @@ pub use actions::{
     reload_callback_from_mailbox, trampoline_runtime_action, ActionBridge, ReloadMailbox,
     RuntimeActionHost, UiDialogMailbox, UiDialogRequest,
 };
+pub use event_log::{event_log_path, log_handler_invocation, EventLogger};
 pub use loader::{
     load_dir, load_one, load_session, load_session_mixed, merge_registries, ExtensionSession,
     LoadedPlugin, PluginKeepalive, PluginLoadError,
 };
 pub use provider::PluggableProvider;
 pub use provider_hooks::ExtensionProviderHooks;
-pub use event_log::{event_log_path, log_handler_invocation, EventLogger};
 pub use registry::{
     assert_active, current_platform, platform_allows, ExtensionRegistry, ExtensionTool,
     RegisteredFlag, RegisteredHandler, RegisteredProvider, RegisteredRenderer,

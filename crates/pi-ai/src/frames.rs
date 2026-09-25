@@ -687,7 +687,8 @@ pub fn reduce_frames(
                 content_index,
                 delta,
             } => {
-                let (block, _) = active_block(message, &mut states, *content_index, "text", "text_delta")?;
+                let (block, _) =
+                    active_block(message, &mut states, *content_index, "text", "text_delta")?;
                 if let Content::Text(text) = block {
                     text.text.push_str(delta);
                 }
@@ -722,8 +723,13 @@ pub fn reduce_frames(
                 content_index,
                 delta,
             } => {
-                let (block, _) =
-                    active_block(message, &mut states, *content_index, "thinking", "thinking_delta")?;
+                let (block, _) = active_block(
+                    message,
+                    &mut states,
+                    *content_index,
+                    "thinking",
+                    "thinking_delta",
+                )?;
                 if let Content::Thinking(thinking) = block {
                     thinking.thinking.push_str(delta);
                 }
@@ -734,8 +740,13 @@ pub fn reduce_frames(
                 thinking_signature,
                 redacted,
             } => {
-                let (block, state) =
-                    active_block(message, &mut states, *content_index, "thinking", "thinking_end")?;
+                let (block, state) = active_block(
+                    message,
+                    &mut states,
+                    *content_index,
+                    "thinking",
+                    "thinking_end",
+                )?;
                 if let Content::Thinking(thinking) = block {
                     thinking.thinking = content.clone();
                     thinking.thinking_signature = thinking_signature.clone();
@@ -760,8 +771,13 @@ pub fn reduce_frames(
                 content_index,
                 json,
             } => {
-                let (block, state) =
-                    active_block(message, &mut states, *content_index, "toolCall", "toolcall_checkpoint")?;
+                let (block, state) = active_block(
+                    message,
+                    &mut states,
+                    *content_index,
+                    "toolCall",
+                    "toolcall_checkpoint",
+                )?;
                 state.json = json.clone();
                 if let Content::ToolCall(call) = block {
                     call.arguments = parse_streaming_json(Some(json));
@@ -771,8 +787,13 @@ pub fn reduce_frames(
                 content_index,
                 delta,
             } => {
-                let (_, state) =
-                    active_block(message, &mut states, *content_index, "toolCall", "toolcall_delta")?;
+                let (_, state) = active_block(
+                    message,
+                    &mut states,
+                    *content_index,
+                    "toolCall",
+                    "toolcall_delta",
+                )?;
                 state.json.push_str(delta);
             }
             AssistantMessageFrame::ToolcallEnd {
@@ -783,8 +804,13 @@ pub fn reduce_frames(
                 thought_signature,
                 namespace,
             } => {
-                let (block, state) =
-                    active_block(message, &mut states, *content_index, "toolCall", "toolcall_end")?;
+                let (block, state) = active_block(
+                    message,
+                    &mut states,
+                    *content_index,
+                    "toolCall",
+                    "toolcall_end",
+                )?;
                 if let Content::ToolCall(call) = block {
                     call.id = id.clone();
                     call.name = name.clone();
@@ -961,7 +987,13 @@ mod tests {
         let frames = encode_all(&events);
         assert_eq!(
             frames.iter().map(|f| f.type_tag()).collect::<Vec<_>>(),
-            vec!["start", "text_start", "text_delta", "text_delta", "text_end"]
+            vec![
+                "start",
+                "text_start",
+                "text_delta",
+                "text_delta",
+                "text_end"
+            ]
         );
         let reduced = reduce_frames(&frames).unwrap().expect("a message");
         assert_eq!(
@@ -1041,9 +1073,7 @@ mod tests {
         ]);
         let reduced = reduce_frames(&frames).unwrap().expect("a message");
         assert_eq!(reduced.content.len(), 2, "{:?}", reduced.content);
-        assert!(
-            matches!(&reduced.content[0], Content::Thinking(t) if t.thinking == "weighing it")
-        );
+        assert!(matches!(&reduced.content[0], Content::Thinking(t) if t.thinking == "weighing it"));
         assert!(matches!(&reduced.content[1], Content::Text(t) if t.text == "Answer"));
     }
 

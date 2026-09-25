@@ -92,7 +92,10 @@ extern "C" fn echo_execute(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let drive = Box::new(EchoDrive { text: value, polls: 0 });
+        let drive = Box::new(EchoDrive {
+            text: value,
+            polls: 0,
+        });
         Box::into_raw(drive) as StepHandle
     })
 }

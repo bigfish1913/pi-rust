@@ -14,7 +14,11 @@ use std::time::Instant;
 /// True when `PI_TIMING=1`. Evaluated once.
 pub fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("PI_TIMING").map(|v| v == "1").unwrap_or(false))
+    *ENABLED.get_or_init(|| {
+        std::env::var("PI_TIMING")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

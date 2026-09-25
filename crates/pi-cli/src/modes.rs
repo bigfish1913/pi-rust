@@ -460,9 +460,10 @@ async fn rpc_set_thinking_level(
         .get("level")
         .or_else(|| msg.get("thinkingLevel"))
         .ok_or("set_thinking_level requires `level`")?;
-    let level: rpi_ai::types::ThinkingLevel = serde_json::from_value(value.clone()).map_err(|_| {
-        "invalid thinking level (off|minimal|low|medium|high|xhigh|max)".to_string()
-    })?;
+    let level: rpi_ai::types::ThinkingLevel =
+        serde_json::from_value(value.clone()).map_err(|_| {
+            "invalid thinking level (off|minimal|low|medium|high|xhigh|max)".to_string()
+        })?;
     lane.set_thinking_level(level)
         .await
         .map_err(|e| e.to_string())?;
@@ -493,8 +494,10 @@ async fn rpc_set_active_tools(
 /// Delegates to the shared [`crate::remote::protocol::RemoteEvent`] so the
 /// server and the `--connect` client agree on the wire shape by construction.
 fn agent_event_json(event: &AgentEvent) -> serde_json::Value {
-    serde_json::to_value(crate::remote::protocol::RemoteEvent::from_agent_event(event))
-        .unwrap_or(serde_json::Value::Null)
+    serde_json::to_value(crate::remote::protocol::RemoteEvent::from_agent_event(
+        event,
+    ))
+    .unwrap_or(serde_json::Value::Null)
 }
 
 /// Emit a single harness event as a JSON line on stdout. Mirrors the TS
@@ -597,7 +600,9 @@ pub async fn interactive(
     )
     .await
     {
-        tracing::warn!("[rpi] extension vetoed SessionShutdown (ignored, session closing): {reason}");
+        tracing::warn!(
+            "[rpi] extension vetoed SessionShutdown (ignored, session closing): {reason}"
+        );
     }
 
     code

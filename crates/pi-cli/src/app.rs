@@ -329,8 +329,8 @@ async fn run_inner() -> i32 {
     // JSONL command channel there (a spawned `rpi --mode rpc` child reads its
     // commands from stdin), so consuming it up-front would leave the protocol
     // loop nothing to read. `--mode rpc` and `--server` both select RunMode::Rpc.
-    let wants_rpc_channel = parsed.mode == crate::args::Mode::Rpc
-        || parsed.unknown_flags.contains_key("server");
+    let wants_rpc_channel =
+        parsed.mode == crate::args::Mode::Rpc || parsed.unknown_flags.contains_key("server");
     let stdin_text = if wants_rpc_channel {
         None
     } else {
@@ -522,9 +522,7 @@ async fn run_inner() -> i32 {
                     // Server mode: the rpi-server extension owns the TCP server;
                     // the core just stays alive and tears the session down on
                     // Ctrl+C (firing SessionShutdown so the extension stops it).
-                    eprintln!(
-                        "[rpi] running in headless server mode (no TUI); Ctrl+C to stop"
-                    );
+                    eprintln!("[rpi] running in headless server mode (no TUI); Ctrl+C to stop");
                     let _ = tokio::signal::ctrl_c().await;
                     0
                 } else {

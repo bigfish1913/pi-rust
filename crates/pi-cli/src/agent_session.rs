@@ -28,7 +28,9 @@ use std::sync::Arc;
 use rpi_agent::AgentMessage;
 use rpi_ai::types::{AssistantMessage, Content, ImageContent, Usage};
 use rpi_ai::{Model, ThinkingLevel};
-use rpi_harness::agent_harness::{AgentHarness, AgentLane, HarnessRunOutcome, LaneSnapshot, RunResult};
+use rpi_harness::agent_harness::{
+    AgentHarness, AgentLane, HarnessRunOutcome, LaneSnapshot, RunResult,
+};
 use rpi_harness::result::{HarnessError, HarnessResult};
 use rpi_harness::session::types::{Entry, EntryOrder, EntryQuery};
 
@@ -151,11 +153,7 @@ impl AgentSession {
 
     /// Send a prompt with optional image attachments. Mirrors TS
     /// `AgentSession.prompt`.
-    pub async fn prompt(
-        &self,
-        text: &str,
-        images: Vec<ImageContent>,
-    ) -> HarnessResult<RunResult> {
+    pub async fn prompt(&self, text: &str, images: Vec<ImageContent>) -> HarnessResult<RunResult> {
         self.harness.prompt_text(text, images).await
     }
 
@@ -402,9 +400,7 @@ impl AgentSession {
     /// navigation machinery creates the branch; the label tags its tip.
     /// Mirrors TS `AgentSession.fork`.
     pub async fn fork(&self, label: Option<&str>) -> HarnessResult<()> {
-        self.harness
-            .navigate_tree(None, false, None, label)
-            .await?;
+        self.harness.navigate_tree(None, false, None, label).await?;
         Ok(())
     }
 
@@ -457,8 +453,7 @@ mod tests {
     use rpi_harness::session::session::{DefaultIdGenerator, Session};
     use rpi_harness::session::types::SessionMetadata;
     use rpi_harness::types::{
-        AgentHarnessOptions, AgentHarnessResources, DrivingMode, HarnessToolExecution,
-        RetryPolicy,
+        AgentHarnessOptions, AgentHarnessResources, DrivingMode, HarnessToolExecution, RetryPolicy,
     };
 
     fn test_session() -> Session {
@@ -532,12 +527,8 @@ mod tests {
 
     #[test]
     fn assistant_text_joins_text_blocks_only() {
-        let mut msg = rpi_ai::types::AssistantMessage::empty(
-            rpi_ai::Api::AnthropicMessages,
-            "p",
-            "m",
-            0,
-        );
+        let mut msg =
+            rpi_ai::types::AssistantMessage::empty(rpi_ai::Api::AnthropicMessages, "p", "m", 0);
         msg.content = vec![
             Content::Thinking(rpi_ai::types::ThinkingContent {
                 kind: rpi_ai::types::ThinkingContentType,
@@ -562,7 +553,11 @@ mod tests {
     #[tokio::test]
     async fn session_values_round_trip_through_the_product_layer() {
         let session = AgentSession::new(test_harness().await, Vec::new(), Vec::new(), ".");
-        assert!(session.value("display.hide_thinking").await.unwrap().is_none());
+        assert!(session
+            .value("display.hide_thinking")
+            .await
+            .unwrap()
+            .is_none());
 
         session
             .set_value("display.hide_thinking", serde_json::json!(true))

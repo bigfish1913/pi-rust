@@ -210,7 +210,9 @@ impl SelectList {
         if !self.multi_select {
             return;
         }
-        let Some(item) = self.get_selected_item() else { return };
+        let Some(item) = self.get_selected_item() else {
+            return;
+        };
         if let Ok(mut selected) = self.selected_values.lock() {
             if !selected.insert(item.value.clone()) {
                 selected.remove(&item.value);

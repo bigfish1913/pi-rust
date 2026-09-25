@@ -147,7 +147,8 @@ pub fn resolve_http_proxy_url_for_target(
     target_url: &str,
     env: Option<&HashMap<String, String>>,
 ) -> Result<Option<Url>, String> {
-    let parsed = Url::parse(target_url).map_err(|e| format!("invalid target URL {target_url:?}: {e}"))?;
+    let parsed =
+        Url::parse(target_url).map_err(|e| format!("invalid target URL {target_url:?}: {e}"))?;
     let protocol = parsed.scheme();
     if protocol.is_empty() || parsed.host_str().is_none() {
         return Ok(None);
@@ -217,7 +218,10 @@ mod tests {
     use super::*;
 
     fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     #[test]
@@ -232,20 +236,26 @@ mod tests {
     #[test]
     fn no_proxy_star_disables() {
         let e = env(&[("https_proxy", "http://proxy:8080"), ("no_proxy", "*")]);
-        assert!(resolve_http_proxy_url_for_target("https://x.test", Some(&e))
-            .unwrap()
-            .is_none());
+        assert!(
+            resolve_http_proxy_url_for_target("https://x.test", Some(&e))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn no_proxy_host_match() {
         let e = env(&[("https_proxy", "http://proxy:8080"), ("no_proxy", "x.test")]);
-        assert!(resolve_http_proxy_url_for_target("https://x.test", Some(&e))
-            .unwrap()
-            .is_none());
-        assert!(resolve_http_proxy_url_for_target("https://y.test", Some(&e))
-            .unwrap()
-            .is_some());
+        assert!(
+            resolve_http_proxy_url_for_target("https://x.test", Some(&e))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            resolve_http_proxy_url_for_target("https://y.test", Some(&e))
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

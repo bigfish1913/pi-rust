@@ -529,14 +529,20 @@ mod tests {
         footer.set_extension_status("langfuse ✓ (trace sent)");
         let row = strip_ansi(&footer.render(120).join(" "));
         assert!(row.contains("Aborting…"), "run status lost: {row}");
-        assert!(row.contains("langfuse ✓ (trace sent)"), "ext status lost: {row}");
+        assert!(
+            row.contains("langfuse ✓ (trace sent)"),
+            "ext status lost: {row}"
+        );
 
         // A run-status transition that clears the run status keeps the
         // extension line (the two are separate slots).
         footer.set_status("");
         let row = strip_ansi(&footer.render(120).join(" "));
         assert!(!row.contains("Aborting…"));
-        assert!(row.contains("langfuse ✓ (trace sent)"), "ext status lost: {row}");
+        assert!(
+            row.contains("langfuse ✓ (trace sent)"),
+            "ext status lost: {row}"
+        );
 
         // Clearing the extension status removes it again.
         footer.set_extension_status("");

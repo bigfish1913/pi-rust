@@ -89,7 +89,9 @@ pub fn parse_catalog(provider_id: &str, value: &serde_json::Value) -> Result<Vec
     } else if let Some(object) = value.as_object() {
         object.values().cloned().collect()
     } else {
-        return Err(format!("Invalid model catalog for provider \"{provider_id}\""));
+        return Err(format!(
+            "Invalid model catalog for provider \"{provider_id}\""
+        ));
     };
 
     let mut out = Vec::with_capacity(entries.len());
@@ -210,7 +212,9 @@ pub async fn refresh_provider_catalog(
                 );
                 let _ = store.save();
             }
-            return Err(format!("Model catalog request failed for {provider_id}: {error}"));
+            return Err(format!(
+                "Model catalog request failed for {provider_id}: {error}"
+            ));
         }
     };
 
@@ -220,7 +224,9 @@ pub async fn refresh_provider_catalog(
     if status.as_u16() == 304 {
         if let Some(mut entry) = stored.clone() {
             entry.checked_at = checked_at;
-            store.providers.insert(provider_id.to_string(), entry.clone());
+            store
+                .providers
+                .insert(provider_id.to_string(), entry.clone());
             let _ = store.save();
             return Ok(remote_models(Some(&entry), local_generated_at));
         }
@@ -431,7 +437,10 @@ mod tests {
         let overlay = vec![model("b", "p"), model("c", "p")];
         let merged = merge_models(&base, &overlay);
         assert_eq!(merged.len(), 3);
-        assert_eq!(merged.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), vec!["a", "b", "c"]);
+        assert_eq!(
+            merged.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
     }
 
     #[test]
@@ -451,7 +460,10 @@ mod tests {
     #[test]
     fn http_date_parses_imf_fixdate() {
         // 1994-11-06T08:49:37Z == 784111777 s
-        assert_eq!(parse_http_date_ms("Sun, 06 Nov 1994 08:49:37 GMT"), 784_111_777_000);
+        assert_eq!(
+            parse_http_date_ms("Sun, 06 Nov 1994 08:49:37 GMT"),
+            784_111_777_000
+        );
         assert_eq!(parse_http_date_ms("not a date"), 0);
     }
 }
