@@ -701,6 +701,7 @@ pub fn print_help() {
   OPENAI_API_KEY                 Bearer token for openai-completions/responses
   PI_OFFLINE                     Disable startup network operations when set to 1/true/yes
   RPI_CODING_AGENT_DIR           Override the ~/.rpi config directory (auth.json + models.json)
+  RPI_NO_EMOJI                   Omit the startup crab from the welcome header (1/true/yes)
 
 {u}Notes:{r}
   Supported HTTP protocols are Anthropic Messages and OpenAI Chat Completions.

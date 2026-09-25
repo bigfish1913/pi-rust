@@ -11,6 +11,16 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+### Added
+
+- A Rust crab walks in beside the `rpi · rust` wordmark on startup, then stops.
+  The animation is deliberately bounded rather than looping: the render
+  scheduler is parked on a condvar when no frame is owed, so an endless
+  animation would force an idle session to repaint forever for a decoration. It
+  starts on the first paint rather than when the header is built, so a slow
+  startup cannot eat the walk before the user sees it. `RPI_NO_EMOJI=1` renders
+  the lockup without the crab.
+
 ### Changed
 
 - The interactive header now shows the three-bar brand mark from the site

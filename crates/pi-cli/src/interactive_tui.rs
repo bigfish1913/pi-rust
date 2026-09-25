@@ -6200,6 +6200,15 @@ pub async fn interactive_tui(
             if state_tick.sync_extension_status() {
                 tui_tick.request_render(false);
             }
+            // The startup crab is the only other reason an idle session paints.
+            // It is bounded (see `crate::brand`), so this stops asking for
+            // frames the moment the crab has settled.
+            if crate::brand::brand_animation_active() {
+                // A full rebuild rather than reusing the scroll content: the
+                // lockup lives in the transcript, so a reused frame would keep
+                // painting the old crab position.
+                tui_tick.request_render(false);
+            }
             let working = *state_tick.status.lock().unwrap() == RunStatus::Working;
             if working {
                 // A live transcript panel — a running bash command *or* a
@@ -9954,27 +9963,11 @@ fn add_welcome_message_with_capabilities(
     skills: &[String],
 ) {
     let c = current_theme().colors;
-    // The three-bar brand mark, matching the site favicon
-    // (website/favicon.svg): two dim outer bars flanking a taller accent bar,
-    // bottom-aligned. The SVG's heights (13/19/9) are rounded to the five rows
-    // a terminal header can afford. Using block characters rather than the
-    // previous emoji avoids the east-asian-width ambiguity that made the old
-    // crab-and-box logo render inconsistently across terminals.
-    let bar = c.dim.fg("██");
-    let bar_accent = c.accent.fg("██");
-    let logo = format!(
-        "{}\n{}\n{}\n{}\n{}",
-        format!("     {bar_accent}"),
-        format!("     {bar_accent}"),
-        format!("  {bar} {bar_accent}"),
-        format!("  {bar} {bar_accent} {bar}"),
-        format!(
-            "  {bar} {bar_accent} {bar}   {} {}",
-            c.accent.fg(&tui_bold("rpi")),
-            c.muted.fg("· rust")
-        ),
-    );
-    container.add_child(Arc::new(Text::new(logo, 1, 0)));
+    // The mark, wordmark and animated crab live in `crate::brand`: the crab
+    // walks in once and then stops, so nothing repaints while the session is
+    // idle. See that module for why the layout is built from single-width
+    // characters only.
+    container.add_child(Arc::new(crate::brand::BrandLockup::new()));
     container.add_child(Arc::new(Spacer::new(1)));
     // The mark carries the product name, so the line under it is the tagline
     // rather than a second logotype.
@@ -11139,12 +11132,14 @@ mod tests {
             "the mark must be labelled with the Rust wordmark: {all}"
         );
 
-        // Regression guard: the previous logo used an emoji plus a π glyph,
-        // whose east-asian width is ambiguous and made the header render
-        // inconsistently across terminals.
+        // Regression guard for the layout bug this replaced: `π` is East-Asian
+        // Ambiguous — width 1 normally, width 2 under a CJK locale — which
+        // walked the old box borders out of alignment depending on the user's
+        // system. The crab is deliberately wide but unambiguous, and `crate::brand`
+        // tests pin its width so the padding cannot silently drift.
         assert!(
-            !all.contains('🍣') && !all.contains('π'),
-            "the header must stay within unambiguous single-width characters: {all}"
+            !all.contains('π'),
+            "the header must not use east-asian-ambiguous glyphs: {all}"
         );
     }
 

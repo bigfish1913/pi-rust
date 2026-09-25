@@ -48,6 +48,7 @@ pub mod args;
 pub mod attribution;
 pub mod auth;
 pub mod auth_guidance;
+pub mod brand;
 pub mod changelog;
 pub mod config;
 pub mod dev_extension;
