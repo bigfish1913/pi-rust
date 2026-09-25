@@ -6,8 +6,10 @@ license.workspace = true
 version.workspace = true
 authors.workspace = true
 repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/rpi-cli"
 description = "Terminal coding-agent CLI (the `rpi` binary) built on the rpi-* library crates — a Rust port of @earendil-works/pi-coding-agent's CLI surface"
-readme = "../../README.md"
+readme = "README.md"
 keywords = ["agent", "llm", "ai", "claude", "cli"]
 categories = ["command-line-interface", "api-bindings", "development-tools"]
 
@@ -56,6 +58,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }
+
+[package.metadata.docs.rs]
+rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = ["clipboard"]

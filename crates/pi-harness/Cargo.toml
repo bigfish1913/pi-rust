@@ -6,8 +6,10 @@ license.workspace = true
 version.workspace = true
 authors.workspace = true
 repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/rpi-harness"
 description = "Session tree + JSONL persistence + compaction + AgentHarness loop, Rust port of pi harness layer"
-readme = "../../README.md"
+readme = "README.md"
 keywords = ["agent", "llm", "ai", "claude", "harness"]
 categories = ["api-bindings", "asynchronous"]
 
@@ -34,3 +36,7 @@ tempfile = { workspace = true }
 rpi-telemetry = { workspace = true }
 rpi-ai = { workspace = true }
 rpi-agent = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

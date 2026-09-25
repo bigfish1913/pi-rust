@@ -6,8 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/rpi-tui"
 description = "Terminal User Interface for pi-rust"
-readme = "../../README.md"
+readme = "README.md"
 keywords = ["agent", "llm", "ai", "terminal", "tui"]
 categories = ["command-line-interface", "api-bindings"]
 
@@ -21,6 +23,10 @@ regex = "1"
 base64 = "0.22"
 similar = { version = "2", features = ["text", "unicode"] }
 pulldown-cmark = { version = "0.12", default-features = false }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = []

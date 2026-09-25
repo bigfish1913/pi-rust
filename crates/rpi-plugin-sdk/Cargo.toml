@@ -6,8 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/rpi-plugin-sdk"
 description = "Stable #[repr(C)] ABI contract for rpi Rust-native (cdylib) plugins — no rpi-* deps"
-readme = "../../README.md"
+readme = "README.md"
 keywords = ["agent", "llm", "ai", "plugin", "ffi"]
 categories = ["api-bindings", "development-tools::ffi"]
 
@@ -17,6 +19,10 @@ categories = ["api-bindings", "development-tools::ffi"]
 # the `json` feature (default on). A plugin that wants to avoid the dep can
 # disable default features and do its own (de)serialization.
 serde_json = { workspace = true, optional = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = ["json"]

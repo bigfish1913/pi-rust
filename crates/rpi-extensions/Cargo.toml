@@ -6,8 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/rpi-extensions"
 description = "Rust-native (cdylib) plugin loader + AgentTool adapter for rpi — libloading + spawn_blocking ABI bridge"
-readme = "../../README.md"
+readme = "README.md"
 keywords = ["agent", "llm", "ai", "plugin", "ffi"]
 categories = ["api-bindings", "development-tools::ffi"]
 
@@ -29,6 +31,10 @@ tracing = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
 tempfile = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = []

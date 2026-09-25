@@ -6,8 +6,10 @@ license.workspace = true
 version.workspace = true
 authors.workspace = true
 repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/rpi-agent"
 description = "Agent runtime + loop, Rust port of pi-agent-core core layer"
-readme = "../../README.md"
+readme = "README.md"
 keywords = ["agent", "llm", "ai", "claude", "sdk"]
 categories = ["api-bindings", "asynchronous"]
 
@@ -23,3 +25,7 @@ serde_json = { workspace = true }
 schemars = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

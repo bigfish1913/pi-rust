@@ -6,8 +6,10 @@ license.workspace = true
 version.workspace = true
 authors.workspace = true
 repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/rpi-tools"
 description = "Built-in agent tools (read/write/edit/bash/grep/find/ls) + ExecutionEnv, Rust port of pi harness tools"
-readme = "../../README.md"
+readme = "README.md"
 keywords = ["agent", "llm", "ai", "claude", "tools"]
 categories = ["api-bindings", "asynchronous", "development-tools"]
 
@@ -34,6 +36,10 @@ unicode-normalization = "0.1"
 regex = { workspace = true }
 globset = { workspace = true }
 image = "0.25"  # Image processing (resize, convert, EXIF)
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = []
