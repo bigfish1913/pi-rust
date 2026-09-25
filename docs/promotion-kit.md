@@ -29,7 +29,12 @@
 - Session：JSONL 持久化、分支、上下文压缩，以及**崩溃恢复**——按流式帧记录进度，进程中途死亡后可续跑；排队的 steering / follow-up 消息不会随进程丢失。
 - 远程模式：`rpi --server` 无头 TCP 服务 + `rpi --connect` 零本地资源 TUI 客户端，连接级 token 认证。
 - 插件：`rpi-plugin-sdk` 提供稳定 `#[repr(C)]` ABI（含 panic 隔离、版本协商），`rpi-extensions` 是宿主侧加载器；`rpi install` / `rpi dev` 覆盖安装与热重载。
-- 性能：release 二进制 23.9 MiB，`rpi --version` 中位 17.5 ms（Windows 11 / rustc 1.97.1，`sh scripts/bench.sh` 可复现）。
+- 性能（同机实测，`node scripts/bench-vs-pi.mjs --pi <path>` 可复现，方法见 `docs/performance-vs-pi.md`）：
+  - `--version` **17.9 ms** vs 原生 pi 172.9 ms（**9.7×**）
+  - 到可用 agent（RPC ready）**103.6 ms** vs 176.4 ms（**1.7×**）
+  - 常驻内存 **18.6 MiB** vs 91.6 MiB（**4.9×**）
+  - 安装体积 **23.9 MiB 单二进制** vs 约 513 MiB（**~21×**）
+  - 引用时必须同时说明：本机实测、单一版本对、未测 LLM 延迟/工具循环吞吐/长会话内存。
 
 ### 必须标注为实验性的部分
 
@@ -37,7 +42,7 @@
 
 - **Node/TypeScript 扩展桥接**：需要 `--enable-pi-packages` 显式开启，且接口面不完整——`ui.select` / `ui.confirm` / `ui.input` / `ui.editor` 与 `session.sendMessage` 目前直接抛 `unsupported capability`，事件面只覆盖 `resources_discover`。描述为「实验性、仅本地评估」。
 - **插件 ABI 统一**：0.3.0 把入口统一到单一 `rpi_plugin_register`（版本号移入 `PluginApi` 结构体），宿主仍会回退解析 `_v3` / `_v2`，老插件可继续加载；但扩展作者应重新构建。
-- **benchmark 对比**：目前只有 rpi 自己的数字，没有与其他 agent 的同机对比。不要编造对比数据。
+- **benchmark 对比**：现在**可以**引用 `docs/performance-vs-pi.md` 的数字（rpi vs 原生 pi，同机同协议），但必须一并给出「本机实测、单一版本对」的前提，以及未测的范围。不要编造与 Claude Code / Codex / aider 的对比——那些没有测过。
 
 ## 中文短文案
 
@@ -104,7 +109,7 @@
 > rpi -p "hello"
 > ```
 >
-> Measured on Windows 11 / rustc 1.97.1: 23.9 MiB release binary, 17.5 ms median for `rpi --version`. I have not benchmarked it against other agents yet, so I am not claiming a comparison.
+> Measured on Windows 11 / rustc 1.97.1 against the published TypeScript pi 0.87.1, same machine, same RPC endpoint, both offline with an isolated config dir: 17.9 ms vs 172.9 ms for `--version` (9.7×), 103.6 ms vs 176.4 ms to a usable agent (1.7×), 18.6 MiB vs 91.6 MiB resident (4.9×). The script is in the repo so you can re-run it. The honest caveat: most of rpi's remaining 103 ms is its *own* init, not process startup, and I have not measured tool-loop throughput or long-session memory for either tool.
 >
 > Known gaps, stated up front: the Node/TypeScript extension bridge is experimental and incomplete, and Intel macOS prebuilt binaries are not built yet. There is a `docs/native-pi-missing-features.md` in the repo that tracks compatibility honestly.
 >
@@ -128,6 +133,7 @@
 > - 工具参数用 `schemars` 从类型派生 schema，再用一层 coercion 修复模型略写错的 JSON。
 > - 插件是手写的 `#[repr(C)]` ABI：不能有 `Drop` 类型跨界、字符串用 ptr+len 加显式 `free_string`、两边都 `catch_unwind`。文档里逐条写了为什么。
 > - 默认构建不含 HTTP 依赖，测试离线可跑。
+> - 与原生 TypeScript pi 的同机对比：`--version` 9.7×、到可用 agent 1.7×、内存 4.9×、安装体积 ~21×。有意思的是原生 pi 的开销几乎全在 Node 启动（约 3 ms 是 agent 初始化），而 rpi 的 86/104 ms 是自身运行时初始化——所以下一步优化方向是惰性初始化，不是把二进制做小。
 >
 > 可以先 `cargo run -p minimal` 跑通一个不联网的 agent。
 
@@ -304,7 +310,7 @@ RustCC 已发布过项目介绍，不再重复投放同一篇文章。后续按�
 - [ ] 链接统一使用 `https://github.com/bigfish1913/pi-rust`，不要用旧仓库地址。
 - [ ] 安装命令二选一，且**确认预编译二进制真的存在于该 Release**：
       `curl -fsSL .../scripts/install.sh | sh` 或 `cargo install rpi-cli`。
-- [ ] 不要承诺 benchmark 对比——目前只有 rpi 自身的启动时间和二进制体积。
+- [ ] 引用 benchmark 时带上前提：本机（Windows 11 / rustc 1.97.1）实测、与原生 pi 0.87.1 单一版本对，且未测 LLM 延迟与工具循环吞吐。基准脚本：`node scripts/bench-vs-pi.mjs --pi <path>`。
 - [ ] Node/TypeScript 扩展桥接必须标注为实验性、需要 `--enable-pi-packages`。
 - [ ] 每个平台使用一张最相关的截图：`docs/images/rpi-interactive.png` 或 `docs/images/rpi-working.png`。
 - [ ] Hacker News / Reddit 用英文；中文社区用中文，并按版规选择分类。

@@ -183,25 +183,38 @@ If you want the most polished single-vendor experience, use the vendor's tool.
 
 ## Performance
 
-Measured on Windows 11 (x86_64), rustc 1.97.1, `--release`. Rebuild and re-measure
-on your own machine with:
+Measured on Windows 11 (x86_64), rustc 1.97.1, `--release`. Both scripts
+rebuild and re-measure on your own machine.
 
-```bash
-sh scripts/bench.sh
-```
+`sh scripts/bench.sh` — standalone numbers:
 
 | Metric | Value |
 | ------ | ----- |
 | Release binary size | **23.9 MiB** |
-| `rpi --version` wall time | **17.5 ms** median (16.6–19.9 ms over 7 runs) |
+| `rpi --version` wall time | **~18 ms** median |
+| RSS once the agent is ready | **18.6 MiB** |
 
-A Rust runtime starting in tens of milliseconds is the reason the CLI feels
-instant, and it is what makes `rpi` viable as a subprocess inside an editor
-plugin or a CI job.
+`node scripts/bench-vs-pi.mjs --pi <path-to-pi>` — measured against native Pi on
+the same machine, over the same RPC endpoint, with an isolated config directory
+and both tools offline:
 
-> Comparison against other agents is not published yet, because the number would
-> have to be measured on the same machine under the same conditions to mean
-> anything. Extending this table is on the [roadmap](ROADMAP.md).
+| Metric | rpi (Rust) | pi (TypeScript) | Difference |
+| ------ | ---------: | --------------: | ---------- |
+| `--version` | **17.9 ms** | 172.9 ms | **9.7× faster** |
+| Time to a usable agent (RPC ready) | **103.6 ms** | 176.4 ms | **1.7× faster** |
+| RSS at ready | **18.6 MiB** | 91.6 MiB | **4.9× smaller** |
+| Install footprint | **23.9 MiB** (one binary) | ~513 MiB | **~21× smaller** |
+
+The interesting part is where the time goes. Pi's cost is almost entirely Node
+startup — its `--version` and its fully-initialised agent differ by about 3 ms.
+rpi's process start is 17.9 ms, but reaching a usable agent takes 103.6 ms, so
+~86 ms (83% of its startup) is its own runtime initialisation rather than process
+or loader overhead. Further startup wins for rpi therefore have to come from lazy
+initialisation, not from a smaller binary — see the [roadmap](ROADMAP.md).
+
+The full method, raw per-run numbers, and an explicit list of what is *not*
+measured (LLM latency, tool-loop throughput, long sessions, TUI frame cost) are
+in [`docs/performance-vs-pi.md`](docs/performance-vs-pi.md).
 
 ## Plugins
 
@@ -259,7 +272,7 @@ machine. See [`docs/remote-mode.md`](docs/remote-mode.md).
 | Stability | `rpi-ai`, `rpi-agent`, `rpi-tools`, `rpi-harness`, `rpi-plugin-sdk` are the intended stable surface |
 | MSRV | 1.78 |
 | Platforms | Linux, macOS, Windows (CI runs the suite on Linux) |
-| Not yet | Intel macOS prebuilt binaries; a benchmark comparison against other agents |
+| Not yet | Intel macOS prebuilt binaries |
 
 `rpi` is a Rust port of the MIT-licensed TypeScript
 [`pi`](https://github.com/earendil-works/pi) SDK, not a fork of its runtime — no

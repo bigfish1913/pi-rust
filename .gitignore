@@ -13,6 +13,10 @@ release-*.log
 .claude/*
 target/*
 
+# Benchmark scratch: the npm-installed native pi that scripts/bench-vs-pi.mjs
+# compares against (~400 MiB of node_modules).
+.bench/
+
 # Static frontend deployment bundle
 .deploy/
 .codegraph

@@ -10,7 +10,7 @@
 | 项目 | Rust 原生扩展 |
 | --- | --- |
 | 安装 | `rpi install crate-name`（crates.io 或 `--path`） |
-| 入口 | `rpi_plugin_register` (统一 ABI) C ABI 符号，临时兼容 `rpi_plugin_register_v2` / `rpi_plugin_register_v3` |
+| 入口 | `rpi_plugin_register_v2` / `rpi_plugin_register_v3` C ABI 符号 |
 | 开发反馈 | `rpi dev` watch + 热重载；`rpi dev-local` 隔离调试 |
 | 静态资源 | `resources_discover` 或随项目放入 `.rpi` |
 | 运行环境 | 本机动态库，当前用户权限 |
@@ -96,7 +96,7 @@ rpi_plugin_sdk::export_plugin_v3!(|api, ext| {
 
 每个注册槽位都是 `Option`。注册前检查 vtable slot 是否为 `Some`，缺失时返回
 清晰错误；不要依赖空指针或 panic 表达不支持。宿主对未知 runtime action ID
-返回结构化错误，不会进入分发。旧版 ABI v1 的 runtime action 仅允许 ID `0..=15`（已废弃），
+返回结构化错误，不会进入分发。ABI v1 的 runtime action 仅允许 ID `0..=15`，
 v2/v3 允许当前定义的 `0..=17`（含 `GetCliFlag`、`UiDialog`）。
 
 ## 4. 工具生命周期：execute → poll → cancel → destroy
@@ -116,29 +116,7 @@ v2/v3 允许当前定义的 `0..=17`（含 `GetCliFlag`、`UiDialog`）。
   `free_string` 释放。
 - 插件产生的 `StbString`（done 结果、partial 进度、resources_discover 的 out）
   由宿主通过插件注册时提供的 `plugin_free_string` 释放。
-- 每个 `extern "C"` 边界都不能 unwind：**插件内部必须捕获 panic**，否则 Rust
-  会以 `panic in a function that cannot unwind` **终止整个宿主进程**（不是只跳过
-  该扩展）。用 SDK 提供的 `rpi_plugin_sdk::guard` / `guard_or` 包裹每个入口的
-  body（execute/poll/cancel/destroy、事件处理器、resources_discover、provider/
-  render、runtime action）。register 入口由 `export_plugin_v2!` / `export_plugin_v3!`
-  自动包裹：panic 会被转换成 `REGISTER_PANIC_STATUS`，宿主据此跳过该插件并给出
-  诊断，而不是崩溃。
-
-  反例（会拖垮宿主）：
-
-  ```rust,ignore
-  extern "C" fn my_execute(..) -> StepHandle {
-      do_work()          // 若这里 panic，整个 rpi 进程 abort
-  }
-  ```
-
-  正确写法：
-
-  ```rust,ignore
-  extern "C" fn my_execute(..) -> StepHandle {
-      rpi_plugin_sdk::guard_or(std::ptr::null_mut(), || do_work())
-  }
-  ```
+- 每个 `extern "C"` 边界都不能 unwind；插件内部捕获 panic 并转换为错误结果。
 
 完整、可运行的 ABI 模板位于 `examples/plugin-stub/src/lib.rs`。创建新工具时先
 复制生命周期骨架，再替换参数 schema 和领域逻辑，不要重新设计所有权协议。
@@ -284,7 +262,7 @@ Linux/macOS 使用冒号分隔。命令行和环境变量适合本机开发、CI
 
 - `cargo fmt --check`、`cargo clippy --all-targets`、`cargo test` 通过。
 - `crate-type` 包含 `cdylib`，使用 `export_plugin_v2!` / `export_plugin_v3!` 导出
-  `rpi_plugin_register`（统一 ABI）。临时兼容 `rpi_plugin_register_v2` / `rpi_plugin_register_v3`。
+  `rpi_plugin_register_v2` / `rpi_plugin_register_v3`。
 - 依赖已发布的 `rpi-plugin-sdk` 兼容版本，不链接宿主私有 crate。
 - `rpi dev --no-watch` 能编译、加载并注册预期工具。
 - `rpi install <crate> --force` 的干净安装路径通过。
