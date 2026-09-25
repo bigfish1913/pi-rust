@@ -89,6 +89,11 @@ tasks:
     cmds:
       - '"{{.RPI_RELEASE_HELPER}}" publish "{{.RELEASE_VERSION}}"'
 
+  docs:sync:
+    desc: 同步仓库文档到 pi-cli 的 embedded-docs（include_str! 快照，CI 会校验）
+    cmds:
+      - sh scripts/sync-embedded-docs.sh
+
   test:
     desc: Run the locked workspace test suite
     cmds:

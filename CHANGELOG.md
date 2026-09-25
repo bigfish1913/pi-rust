@@ -11,6 +11,45 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-09-25
+
+No functional change to the agent, tools or CLI. This release repairs the build
+on `main` and fixes how every crate presents itself on crates.io and docs.rs.
+
+### Fixed
+
+- **`rpi-plugin-sdk` did not compile on `main`.** Duplicate definitions added
+  after 0.3.0 shipped — a `pub type PluginApi = PluginApiVt` alias beside the
+  `PluginApi` struct, and a second `register_entrypoint_unified` — produced
+  `E0428`, `E0119` and `E0609`, so `cargo test --workspace` failed immediately
+  for anyone cloning the repository. The duplicates are removed and the build is
+  green again. The published 0.3.0 artifacts were built before they landed and
+  were never affected.
+
+### Changed
+
+- Every crate declares `homepage` and `documentation`, and ships its own
+  `README.md` instead of the workspace README. Previously all nine crates.io and
+  docs.rs pages showed the same generic document, and its relative links
+  (`docs/architecture.md`, `LICENSE`, `examples/plugin-stub`) resolved to 404 on
+  those sites.
+- docs.rs now builds with `all-features` for every crate except `rpi-cli`, whose
+  clipboard feature needs platform libraries that are not present there.
+
+### Docs
+
+- Added `docs/performance-vs-pi.md` and `scripts/bench-vs-pi.mjs` — a reproducible,
+  same-machine comparison against native Pi over the same JSONL RPC endpoint,
+  with isolated config directories and both tools offline. rpi is 9.7× faster to
+  start, 1.7× faster to a usable agent, 4.9× smaller in memory and ~21× smaller
+  installed. The same measurement shows 83% of rpi's startup is its own runtime
+  initialisation rather than process overhead, which is now the roadmap's
+  optimisation target.
+- `crates/pi-cli/embedded-docs/` — the documentation snapshot compiled into the
+  `rpi` binary for the `docs` tool — is refreshed and now guarded: CI runs
+  `scripts/sync-embedded-docs.sh` and fails if the snapshot drifts from the
+  repository documents. It had fallen behind by several releases.
+
 ## [0.3.0] - 2026-09-25
 
 ### Changed
@@ -397,6 +436,7 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 Early crates.io publications while the workspace layout, provider layer and
 agent loop were being established. See `git log` for details.
 
-[Unreleased]: https://github.com/bigfish1913/pi-rust/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/bigfish1913/pi-rust/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/bigfish1913/pi-rust/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/bigfish1913/pi-rust/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/bigfish1913/pi-rust/compare/v0.1.28...v0.2.0
