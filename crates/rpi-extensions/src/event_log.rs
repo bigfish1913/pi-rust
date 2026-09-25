@@ -204,7 +204,13 @@ mod tests {
         // An explicit logger appends one JSON line per record.
         let logger = EventLogger::open(path.clone());
         assert!(logger.enabled());
-        logger.record("BeforeTuiStart", "rpc-ext", "Abort", 42, Some("connect failed".into()));
+        logger.record(
+            "BeforeTuiStart",
+            "rpc-ext",
+            "Abort",
+            42,
+            Some("connect failed".into()),
+        );
         logger.record("MessageEnd", "logger-ext", "Continue", 1, None);
 
         let text = std::fs::read_to_string(&path).unwrap();

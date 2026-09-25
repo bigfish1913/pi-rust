@@ -2,8 +2,8 @@
 //!
 //! Provides CLI commands for managing local LLM inference using llama.cpp server.
 
-use std::path::PathBuf;
 use rpi_ai::providers::llama_cpp::{LlamaCppConfig, LlamaCppModelManager};
+use std::path::PathBuf;
 
 /// LLaMA subcommand
 #[derive(Debug)]
@@ -18,13 +18,9 @@ pub enum LlamaCommand {
     /// Stop llama.cpp server
     Stop,
     /// List available models
-    List {
-        server_url: String,
-    },
+    List { server_url: String },
     /// Show server status
-    Status {
-        server_url: String,
-    },
+    Status { server_url: String },
     /// Download a model
     Download {
         model: String,
@@ -37,10 +33,10 @@ pub fn parse_llama_command(args: &[String]) -> Result<LlamaCommand, String> {
     if args.is_empty() {
         return Err("Usage: rpi llama <start|stop|list|status|download> [options]".to_string());
     }
-    
+
     let subcommand = &args[0];
     let sub_args = &args[1..];
-    
+
     match subcommand.as_str() {
         "start" => parse_start_command(sub_args),
         "stop" => Ok(LlamaCommand::Stop),
@@ -56,7 +52,7 @@ fn parse_start_command(args: &[String]) -> Result<LlamaCommand, String> {
     let mut port = 8080u16;
     let mut ctx_size = 2048usize;
     let mut threads = None;
-    
+
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -94,9 +90,9 @@ fn parse_start_command(args: &[String]) -> Result<LlamaCommand, String> {
         }
         i += 1;
     }
-    
+
     let model = model.ok_or("--model is required")?;
-    
+
     Ok(LlamaCommand::Start {
         model,
         port,
@@ -107,7 +103,7 @@ fn parse_start_command(args: &[String]) -> Result<LlamaCommand, String> {
 
 fn parse_list_command(args: &[String]) -> Result<LlamaCommand, String> {
     let mut server_url = "http://localhost:8080".to_string();
-    
+
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -124,13 +120,13 @@ fn parse_list_command(args: &[String]) -> Result<LlamaCommand, String> {
         }
         i += 1;
     }
-    
+
     Ok(LlamaCommand::List { server_url })
 }
 
 fn parse_status_command(args: &[String]) -> Result<LlamaCommand, String> {
     let mut server_url = "http://localhost:8080".to_string();
-    
+
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -147,7 +143,7 @@ fn parse_status_command(args: &[String]) -> Result<LlamaCommand, String> {
         }
         i += 1;
     }
-    
+
     Ok(LlamaCommand::Status { server_url })
 }
 
@@ -155,10 +151,10 @@ fn parse_download_command(args: &[String]) -> Result<LlamaCommand, String> {
     if args.is_empty() {
         return Err("Usage: rpi llama download <model> [--output <path>]".to_string());
     }
-    
+
     let model = args[0].clone();
     let mut output = None;
-    
+
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -175,28 +171,23 @@ fn parse_download_command(args: &[String]) -> Result<LlamaCommand, String> {
         }
         i += 1;
     }
-    
+
     Ok(LlamaCommand::Download { model, output })
 }
 
 /// Execute llama command
 pub async fn run_llama_command(cmd: LlamaCommand) -> Result<(), String> {
     match cmd {
-        LlamaCommand::Start { model, port, ctx_size, threads } => {
-            start_server(model, port, ctx_size, threads).await
-        }
-        LlamaCommand::Stop => {
-            stop_server().await
-        }
-        LlamaCommand::List { server_url } => {
-            list_models(server_url).await
-        }
-        LlamaCommand::Status { server_url } => {
-            show_status(server_url).await
-        }
-        LlamaCommand::Download { model, output } => {
-            download_model(model, output).await
-        }
+        LlamaCommand::Start {
+            model,
+            port,
+            ctx_size,
+            threads,
+        } => start_server(model, port, ctx_size, threads).await,
+        LlamaCommand::Stop => stop_server().await,
+        LlamaCommand::List { server_url } => list_models(server_url).await,
+        LlamaCommand::Status { server_url } => show_status(server_url).await,
+        LlamaCommand::Download { model, output } => download_model(model, output).await,
     }
 }
 
@@ -210,42 +201,47 @@ async fn start_server(
     println!("  Model: {}", model.display());
     println!("  Port: {}", port);
     println!("  Context size: {}", ctx_size);
-    
+
     if let Some(threads) = threads {
         println!("  Threads: {}", threads);
     }
-    
+
     // Check if model file exists
     if !model.exists() {
         return Err(format!("Model file not found: {}", model.display()));
     }
-    
+
     // Build llama-server command
     let mut cmd = tokio::process::Command::new("llama-server");
-    cmd.arg("--model").arg(&model)
-       .arg("--port").arg(port.to_string())
-       .arg("--ctx-size").arg(ctx_size.to_string());
-    
+    cmd.arg("--model")
+        .arg(&model)
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--ctx-size")
+        .arg(ctx_size.to_string());
+
     if let Some(threads) = threads {
         cmd.arg("--threads").arg(threads.to_string());
     }
-    
+
     // Start server in background
-    let child = cmd.spawn().map_err(|e| format!("Failed to start llama-server: {}", e))?;
-    
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to start llama-server: {}", e))?;
+
     println!("Server started (PID: {:?})", child.id());
     println!("Server URL: http://localhost:{}", port);
-    
+
     // Wait a bit for server to initialize
     tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-    
+
     // Check if server is responding
     let config = LlamaCppConfig {
         server_url: format!("http://localhost:{}", port),
         timeout: std::time::Duration::from_secs(5),
         api_key: None,
     };
-    
+
     let manager = LlamaCppModelManager::new(config);
     match manager.is_healthy().await {
         Ok(true) => {
@@ -265,7 +261,7 @@ async fn start_server(
 
 async fn stop_server() -> Result<(), String> {
     println!("Stopping llama.cpp server...");
-    
+
     // Try to find and kill llama-server process
     #[cfg(unix)]
     {
@@ -275,14 +271,14 @@ async fn stop_server() -> Result<(), String> {
             .output()
             .await
             .map_err(|e| format!("Failed to stop server: {}", e))?;
-        
+
         if output.status.success() {
             println!("Server stopped");
         } else {
             println!("No running server found");
         }
     }
-    
+
     #[cfg(windows)]
     {
         let output = tokio::process::Command::new("taskkill")
@@ -292,14 +288,14 @@ async fn stop_server() -> Result<(), String> {
             .output()
             .await
             .map_err(|e| format!("Failed to stop server: {}", e))?;
-        
+
         if output.status.success() {
             println!("Server stopped");
         } else {
             println!("No running server found");
         }
     }
-    
+
     Ok(())
 }
 
@@ -309,11 +305,11 @@ async fn list_models(server_url: String) -> Result<(), String> {
         timeout: std::time::Duration::from_secs(10),
         api_key: None,
     };
-    
+
     let manager = LlamaCppModelManager::new(config);
-    
+
     println!("Fetching model list...");
-    
+
     match manager.list_models().await {
         Ok(models) => {
             if models.is_empty() {
@@ -326,9 +322,7 @@ async fn list_models(server_url: String) -> Result<(), String> {
             }
             Ok(())
         }
-        Err(e) => {
-            Err(format!("Failed to list models: {}", e))
-        }
+        Err(e) => Err(format!("Failed to list models: {}", e)),
     }
 }
 
@@ -338,15 +332,15 @@ async fn show_status(server_url: String) -> Result<(), String> {
         timeout: std::time::Duration::from_secs(5),
         api_key: None,
     };
-    
+
     let manager = LlamaCppModelManager::new(config);
-    
+
     println!("Checking server status at {}...", server_url);
-    
+
     match manager.is_healthy().await {
         Ok(true) => {
             println!("✓ Server is running and healthy");
-            
+
             // Try to get model info
             if let Ok(models) = manager.list_models().await {
                 if !models.is_empty() {
@@ -356,7 +350,7 @@ async fn show_status(server_url: String) -> Result<(), String> {
                     }
                 }
             }
-            
+
             Ok(())
         }
         Ok(false) => {
@@ -372,49 +366,59 @@ async fn show_status(server_url: String) -> Result<(), String> {
 
 async fn download_model(model: String, output: Option<PathBuf>) -> Result<(), String> {
     println!("Downloading model: {}", model);
-    
+
     // Determine output path
     let output_path = output.unwrap_or_else(|| {
         let home = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
             .unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(home).join(".cache").join("llama-cpp").join("models")
+        PathBuf::from(home)
+            .join(".cache")
+            .join("llama-cpp")
+            .join("models")
     });
-    
+
     // Create output directory
     std::fs::create_dir_all(&output_path)
         .map_err(|e| format!("Failed to create output directory: {}", e))?;
-    
+
     println!("Output directory: {}", output_path.display());
-    
+
     // Check if it's a URL
     if model.starts_with("http://") || model.starts_with("https://") {
         println!("Downloading from URL...");
-        
+
         let output_file = output_path.join("model.gguf");
-        
+
         let response = reqwest::get(&model)
             .await
             .map_err(|e| format!("Failed to download model: {}", e))?;
-        
+
         if !response.status().is_success() {
-            return Err(format!("Download failed with status: {}", response.status()));
+            return Err(format!(
+                "Download failed with status: {}",
+                response.status()
+            ));
         }
-        
-        let bytes = response.bytes()
+
+        let bytes = response
+            .bytes()
             .await
             .map_err(|e| format!("Failed to read response: {}", e))?;
-        
+
         std::fs::write(&output_file, bytes)
             .map_err(|e| format!("Failed to write model file: {}", e))?;
-        
+
         println!("Model downloaded to: {}", output_file.display());
     } else {
         // Assume it's a Hugging Face model ID
         println!("Downloading from Hugging Face...");
         println!("Note: Hugging Face download not yet implemented");
-        println!("Please download manually from: https://huggingface.co/{}", model);
+        println!(
+            "Please download manually from: https://huggingface.co/{}",
+            model
+        );
     }
-    
+
     Ok(())
 }

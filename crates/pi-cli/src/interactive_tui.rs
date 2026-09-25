@@ -48,7 +48,8 @@ use rpi_tui::{
     ScrollViewOptions, SearchBar, SearchableSelectList, SelectItem, SelectList, SettingItem,
     SettingsList, SlashCommand as SlashCommandEntry, SlashCommandAutocompleteProvider, Spacer,
     StackChild, StackEntry, StatusIndicator, Text, ThemeManager, ThemePreset,
-    ToolExecutionComponent, ToolStatus, TuiAltScreen, UserMessageComponent, VStack, WorkingState, TUI,
+    ToolExecutionComponent, ToolStatus, TuiAltScreen, UserMessageComponent, VStack, WorkingState,
+    TUI,
 };
 use rpi_tui::{bold as tui_bold, theme as current_theme};
 

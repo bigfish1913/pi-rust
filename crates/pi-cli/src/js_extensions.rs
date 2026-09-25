@@ -815,6 +815,23 @@ impl LazyNodeTransport {
         }
     }
 
+    /// Publish a `set_runtime_context` tool projection only while it still
+    /// belongs to the newest revision.
+    ///
+    /// Node serializes runtime-context requests, so responses are produced in
+    /// revision order. The two Rust callers are separate threads, though, and
+    /// nothing stops the one holding the *older* response from reaching this
+    /// point last; writing unconditionally then resurrects a tool list that a
+    /// newer context had already replaced. Node refuses a superseded request on
+    /// the request side for the same reason, so this mirrors that rule for the
+    /// result.
+    fn record_active_tools_for_revision(&self, revision: u64, value: Option<&serde_json::Value>) {
+        if self.context_revision.load(Ordering::Acquire) != revision {
+            return;
+        }
+        self.record_active_tools(value);
+    }
+
     /// Put a context snapshot back into the pre-start queue after a failed
     /// startup. `ensure` temporarily removes the snapshot so the Node host can
     /// receive it in its environment; if that host exits before becoming the
@@ -1099,7 +1116,7 @@ impl LazyNodeTransport {
                         return Err(error);
                     }
                 };
-                self.record_active_tools(result.get("activeTools"));
+                self.record_active_tools_for_revision(revision, result.get("activeTools"));
             }
         })();
 
@@ -1241,7 +1258,7 @@ impl LazyNodeTransport {
                 "set_runtime_context",
                 serde_json::json!({"context": merged, "revision": revision}),
             )?;
-            self.record_active_tools(result.get("activeTools"));
+            self.record_active_tools_for_revision(revision, result.get("activeTools"));
         }
         Ok(())
     }
@@ -2273,6 +2290,24 @@ mod tests {
         second_worker.join().unwrap().unwrap();
 
         assert_eq!(session.active_tools().unwrap(), ["v2"]);
+    }
+
+    /// Only the newest revision may publish the tool projection it was
+    /// answered with. Two threads can enter `set_runtime_context` at once, and
+    /// the one holding the older response can reach the recording step last.
+    #[test]
+    fn superseded_revision_cannot_publish_its_tool_projection() {
+        let transport = LazyNodeTransport::new(Vec::new(), serde_json::json!({}));
+        let newest = std::sync::atomic::Ordering::Release;
+        transport.context_revision.store(2, newest);
+
+        transport.record_active_tools_for_revision(2, Some(&serde_json::json!(["v2"])));
+        assert_eq!(transport.active_tools().unwrap(), ["v2"]);
+
+        // A response from the superseded revision arrives last: it must not
+        // resurrect the tool list the newer context already replaced.
+        transport.record_active_tools_for_revision(1, Some(&serde_json::json!(["v1"])));
+        assert_eq!(transport.active_tools().unwrap(), ["v2"]);
     }
 
     #[test]

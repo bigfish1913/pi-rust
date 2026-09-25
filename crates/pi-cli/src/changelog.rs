@@ -100,7 +100,10 @@ pub async fn fetch_changelog(allow_network: bool) -> Result<Option<String>, Stri
         .await
         .map_err(|e| format!("changelog request failed: {e}"))?;
     if !response.status().is_success() {
-        return Err(format!("changelog request failed: {}", response.status().as_u16()));
+        return Err(format!(
+            "changelog request failed: {}",
+            response.status().as_u16()
+        ));
     }
     let text = response.text().await.map_err(|e| e.to_string())?;
     Ok(Some(text))
@@ -135,9 +138,15 @@ mod tests {
 ";
         let entries = parse_changelog(text);
         assert_eq!(entries.len(), 3);
-        assert_eq!((entries[0].major, entries[0].minor, entries[0].patch), (1, 2, 3));
+        assert_eq!(
+            (entries[0].major, entries[0].minor, entries[0].patch),
+            (1, 2, 3)
+        );
         assert!(entries[0].content.contains("fixed a thing"));
-        assert_eq!((entries[2].major, entries[2].minor, entries[2].patch), (2, 0, 0));
+        assert_eq!(
+            (entries[2].major, entries[2].minor, entries[2].patch),
+            (2, 0, 0)
+        );
     }
 
     #[test]
@@ -150,7 +159,10 @@ mod tests {
 
     #[test]
     fn offline_is_empty() {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let entries = rt.block_on(load_entries(false));
         assert!(entries.is_empty());
     }

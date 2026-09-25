@@ -504,9 +504,7 @@ pub async fn build(
         None if project_trusted => {
             match discover_system_prompt_file_with_packages(cwd, &package_resources) {
                 Some(path) => std::fs::read_to_string(&path)
-                    .unwrap_or_else(|_| {
-                        default_system_prompt(&cwd_str, prior_reasoning_replayed)
-                    }),
+                    .unwrap_or_else(|_| default_system_prompt(&cwd_str, prior_reasoning_replayed)),
                 None => default_system_prompt(&cwd_str, prior_reasoning_replayed),
             }
         }
@@ -1440,8 +1438,7 @@ where
     // Same working-state wording rule as `build`; a mid-session `/model` switch
     // re-composes the prompt on the next reload, which is the same staleness the
     // rest of this path already has (provider resolution is a startup concern).
-    let prior_reasoning_replayed =
-        rpi_ai::model::prior_reasoning_is_replayed(&ctx.resolved_model);
+    let prior_reasoning_replayed = rpi_ai::model::prior_reasoning_is_replayed(&ctx.resolved_model);
     let base_prompt = match effective_args.system_prompt.as_deref() {
         Some(explicit) => explicit.to_string(),
         None => match discover_system_prompt_file_with_packages(&ctx.cwd, &package_resources) {

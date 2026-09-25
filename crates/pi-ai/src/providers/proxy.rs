@@ -46,7 +46,9 @@ use crate::event_stream::AssistantMessageEventStream;
 use crate::model::Model;
 use crate::provider::{Provider, SimpleStreamOptions};
 use crate::providers::anthropic::sse::SseEventStream;
-use crate::types::{AssistantRole, Content, Context, DoneReason, TextContent, TextContentType, Usage};
+use crate::types::{
+    AssistantRole, Content, Context, DoneReason, TextContent, TextContentType, Usage,
+};
 
 /// Configuration for a proxy provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,7 +190,10 @@ impl Provider for ProxyProvider {
         let (mut prod, stream) = create_assistant_message_event_stream();
 
         // Build the request URL
-        let url = format!("{}/chat/completions", self.config.endpoint.trim_end_matches('/'));
+        let url = format!(
+            "{}/chat/completions",
+            self.config.endpoint.trim_end_matches('/')
+        );
 
         // Build headers
         let headers = self.build_headers(opts);
@@ -208,18 +213,16 @@ impl Provider for ProxyProvider {
 
         tokio::spawn(async move {
             // Make the request
-            let response = client
-                .post(&url)
-                .headers(headers)
-                .json(&body)
-                .send()
-                .await;
+            let response = client.post(&url).headers(headers).json(&body).send().await;
 
             match response {
                 Ok(resp) => {
                     if !resp.status().is_success() {
                         let status = resp.status();
-                        let error_text = resp.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+                        let error_text = resp
+                            .text()
+                            .await
+                            .unwrap_or_else(|_| "Unknown error".to_string());
                         let error_msg = AssistantMessage::terminal(
                             model.api.clone(),
                             "proxy".to_string(),
@@ -239,22 +242,30 @@ impl Provider for ProxyProvider {
                     let mut events = SseEventStream::new(resp, opts.signal.clone());
                     let mut content = String::new();
                     let mut finish_reason = None;
-                    
+
                     loop {
                         match events.next_event().await {
                             Ok(Some(event)) if event.data.trim() == "[DONE]" => {
                                 break;
                             }
                             Ok(Some(event)) => {
-                                if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(&event.data) {
-                                    if let Some(choices) = chunk.get("choices").and_then(|c| c.as_array()) {
+                                if let Ok(chunk) =
+                                    serde_json::from_str::<serde_json::Value>(&event.data)
+                                {
+                                    if let Some(choices) =
+                                        chunk.get("choices").and_then(|c| c.as_array())
+                                    {
                                         if let Some(choice) = choices.first() {
                                             if let Some(delta) = choice.get("delta") {
-                                                if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
+                                                if let Some(text) =
+                                                    delta.get("content").and_then(|c| c.as_str())
+                                                {
                                                     content.push_str(text);
                                                 }
                                             }
-                                            if let Some(reason) = choice.get("finish_reason").and_then(|r| r.as_str()) {
+                                            if let Some(reason) =
+                                                choice.get("finish_reason").and_then(|r| r.as_str())
+                                            {
                                                 finish_reason = Some(reason.to_string());
                                             }
                                         }
@@ -279,14 +290,14 @@ impl Provider for ProxyProvider {
                             }
                         }
                     }
-                    
+
                     let stop_reason = match finish_reason.as_deref() {
                         Some("stop") => StopReason::Stop,
                         Some("length") => StopReason::Length,
                         Some("tool_calls") => StopReason::ToolUse,
                         _ => StopReason::Stop,
                     };
-                    
+
                     let message = AssistantMessage {
                         role: AssistantRole,
                         content: vec![Content::Text(TextContent {
@@ -307,14 +318,14 @@ impl Provider for ProxyProvider {
                         end_turn: None,
                         timestamp: 0,
                     };
-                    
+
                     let done_reason = match stop_reason {
                         StopReason::Stop => DoneReason::Stop,
                         StopReason::Length => DoneReason::Length,
                         StopReason::ToolUse => DoneReason::ToolUse,
                         _ => DoneReason::Stop,
                     };
-                    
+
                     prod.push(AssistantMessageEvent::Done {
                         reason: done_reason,
                         message,

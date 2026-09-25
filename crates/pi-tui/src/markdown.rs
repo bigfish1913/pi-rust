@@ -186,7 +186,8 @@ impl Markdown {
                     in_code_block = true;
                     code_fence_char = fence_char;
                     code_language = lang.to_ascii_lowercase();
-                    code_highlighter = Some(crate::syntax_highlight::Highlighter::new(&code_language));
+                    code_highlighter =
+                        Some(crate::syntax_highlight::Highlighter::new(&code_language));
                     mermaid_source.clear();
                     // Fence language names (for example `text`, `rust`, or
                     // `bash`) are metadata, not code content. Keep ordinary

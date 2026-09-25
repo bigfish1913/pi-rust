@@ -23,7 +23,11 @@ async fn write_line(writer: &mut OwnedWriteHalf, value: &Value) {
 }
 
 async fn respond(writer: &mut OwnedWriteHalf, id: Value, result: Value) {
-    write_line(writer, &json!({"jsonrpc": "2.0", "id": id, "result": result})).await;
+    write_line(
+        writer,
+        &json!({"jsonrpc": "2.0", "id": id, "result": result}),
+    )
+    .await;
 }
 
 async fn notify(writer: &mut OwnedWriteHalf, sub_id: u64, event: Value) {
@@ -98,15 +102,23 @@ async fn fake_server(listener: TcpListener) {
                 notify(&mut writer, sub_id, json!({"type": "ready"})).await;
             }
             "send" => {
-                respond(&mut writer, id, json!({"sessionId": "session-1", "status": "sent"}))
-                    .await;
+                respond(
+                    &mut writer,
+                    id,
+                    json!({"sessionId": "session-1", "status": "sent"}),
+                )
+                .await;
                 for event in canned_run() {
                     notify(&mut writer, sub_id, event).await;
                 }
             }
             "stop_session" => {
-                respond(&mut writer, id, json!({"sessionId": "session-1", "status": "stopped"}))
-                    .await;
+                respond(
+                    &mut writer,
+                    id,
+                    json!({"sessionId": "session-1", "status": "stopped"}),
+                )
+                .await;
                 break;
             }
             _ => {}
@@ -146,9 +158,7 @@ async fn client_handshakes_and_folds_a_remote_run() {
         .unwrap();
 
     let mut saw_terminal = false;
-    while let Ok(Some(line)) =
-        tokio::time::timeout(Duration::from_secs(5), events.recv()).await
-    {
+    while let Ok(Some(line)) = tokio::time::timeout(Duration::from_secs(5), events.recv()).await {
         session.apply_line(&line);
         if line.get("type").and_then(Value::as_str) == Some("agent_end") {
             saw_terminal = true;
@@ -339,7 +349,10 @@ async fn real_server_roundtrip_if_configured() {
         }
     }
 
-    println!("--- remote transcript ---\n{}", session.transcript.to_text());
+    println!(
+        "--- remote transcript ---\n{}",
+        session.transcript.to_text()
+    );
     assert!(session.ready, "server readiness line was never observed");
     assert!(!session.streaming, "run never reached agent_end");
     let assistant: String = session

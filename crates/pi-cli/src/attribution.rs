@@ -46,8 +46,10 @@ fn is_nvidia_nim(model: &Model) -> bool {
 }
 
 fn is_cloudflare(model: &Model) -> bool {
-    matches!(model.provider.as_str(), "cloudflare-workers-ai" | "cloudflare-ai-gateway")
-        || matches_host(&model.base_url, CLOUDFLARE_API_HOST)
+    matches!(
+        model.provider.as_str(),
+        "cloudflare-workers-ai" | "cloudflare-ai-gateway"
+    ) || matches_host(&model.base_url, CLOUDFLARE_API_HOST)
         || matches_host(&model.base_url, CLOUDFLARE_AI_GATEWAY_HOST)
 }
 
@@ -121,8 +123,12 @@ mod tests {
 
     #[test]
     fn openrouter_gets_headers() {
-        let headers = default_attribution_headers(&model("openrouter", "https://openrouter.ai/api/v1"));
-        assert_eq!(headers.get("X-OpenRouter-Title").map(String::as_str), Some("pi"));
+        let headers =
+            default_attribution_headers(&model("openrouter", "https://openrouter.ai/api/v1"));
+        assert_eq!(
+            headers.get("X-OpenRouter-Title").map(String::as_str),
+            Some("pi")
+        );
     }
 
     #[test]
@@ -140,14 +146,20 @@ mod tests {
     #[test]
     fn opencode_session_headers() {
         let headers = session_headers(&model("opencode", "https://opencode.ai/x"), Some("s1"));
-        assert_eq!(headers.get("x-opencode-session").map(String::as_str), Some("s1"));
+        assert_eq!(
+            headers.get("x-opencode-session").map(String::as_str),
+            Some("s1")
+        );
         let none = session_headers(&model("anthropic", "https://api.anthropic.com"), Some("s1"));
         assert!(none.is_empty());
     }
 
     #[test]
     fn host_parsing() {
-        assert_eq!(host_of("https://user:pw@openrouter.ai:443/api").as_deref(), Some("openrouter.ai"));
+        assert_eq!(
+            host_of("https://user:pw@openrouter.ai:443/api").as_deref(),
+            Some("openrouter.ai")
+        );
         assert_eq!(host_of("not a url"), None);
     }
 }

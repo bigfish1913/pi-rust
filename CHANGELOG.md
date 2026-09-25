@@ -11,6 +11,15 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+### Fixed
+
+- A superseded runtime-context update could publish its `activeTools` list after
+  a newer one had already been applied. Concurrent `set_runtime_context` calls
+  run on separate threads, and the thread holding the older response could reach
+  the recording step last, resurrecting a tool list the newer context had
+  replaced. The result is now discarded unless its revision is still the newest,
+  matching the rule Node already applies to the request itself.
+
 ### Changed
 
 - The interactive header now shows the three-bar brand mark from the site

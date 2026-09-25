@@ -145,8 +145,7 @@ fn call_register(entrypoint: RegisterEntrypoint, host_api: &Arc<HostApi>) -> i32
         }
         RegisterEntrypoint::V3(register) => {
             let vtable: &'static PluginApiVt = Box::leak(Box::new(host_api.build_vtable()));
-            let ext: &'static PluginApiVt3Ext =
-                Box::leak(Box::new(host_api.build_vtable_v3_ext()));
+            let ext: &'static PluginApiVt3Ext = Box::leak(Box::new(host_api.build_vtable_v3_ext()));
             register(
                 vtable as *const PluginApiVt,
                 ext as *const PluginApiVt3Ext,
@@ -218,12 +217,14 @@ pub fn load_one(
             },
         )
     }
-    .map_err(|(unified_error, v3_error, v2_error)| PluginLoadError::Symbol {
-        path: path.clone(),
-        unified_error: unified_error.to_string(),
-        v3_error: v3_error.to_string(),
-        v2_error: v2_error.to_string(),
-    })?;
+    .map_err(
+        |(unified_error, v3_error, v2_error)| PluginLoadError::Symbol {
+            path: path.clone(),
+            unified_error: unified_error.to_string(),
+            v3_error: v3_error.to_string(),
+            v2_error: v2_error.to_string(),
+        },
+    )?;
     let abi_version = entrypoint.abi_version();
 
     // Plugin display name (file stem) — stamped onto every registration the
@@ -906,7 +907,8 @@ pub extern "C" fn rpi_plugin_register_v3(
                 "{PREFIX}#[no_mangle]\npub extern \"C\" fn rpi_plugin_register(api: *const c_void) -> i32 {{ if !api.is_null() {{ 0 }} else {{ 91 }} }}\n"
             ),
         );
-        let loaded_unified = load_one(&unified.path, Arc::clone(&diag), None).expect("load unified plugin");
+        let loaded_unified =
+            load_one(&unified.path, Arc::clone(&diag), None).expect("load unified plugin");
         assert_eq!(loaded_unified.abi_version, 4);
         drop(loaded_unified);
         drop(unified);
@@ -1008,7 +1010,9 @@ pub extern "C" fn rpi_plugin_register_v2(_: *const c_void, abi: u32) -> i32 {{
         }
         let warns = diag.warns.lock().unwrap().clone();
         assert!(
-            warns.iter().any(|w| w.contains("panicked during registration")),
+            warns
+                .iter()
+                .any(|w| w.contains("panicked during registration")),
             "diagnostic should mention the panic: {warns:?}"
         );
         drop(fixture);

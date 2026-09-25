@@ -97,7 +97,8 @@ impl Default for ImageProcessingOptions {
 /// ```
 pub fn process_image(input: &[u8], options: ImageProcessingOptions) -> Result<Vec<u8>, String> {
     // Load the image
-    let mut img = image::load_from_memory(input).map_err(|e| format!("Failed to load image: {}", e))?;
+    let mut img =
+        image::load_from_memory(input).map_err(|e| format!("Failed to load image: {}", e))?;
 
     // Resize if needed
     if options.max_width.is_some() || options.max_height.is_some() {
@@ -159,7 +160,10 @@ fn encode_image(img: &DynamicImage, format: Option<OutputFormat>) -> Result<Vec<
             // WebP encoding requires the webp feature
             #[cfg(feature = "webp")]
             {
-                let encoder = image::codecs::webp::WebPEncoder::new_with_quality(&mut cursor, image::codecs::webp::WebPQuality::lossy(quality));
+                let encoder = image::codecs::webp::WebPEncoder::new_with_quality(
+                    &mut cursor,
+                    image::codecs::webp::WebPQuality::lossy(quality),
+                );
                 img.write_with_encoder(encoder)
                     .map_err(|e| format!("Failed to encode WebP: {}", e))?;
             }

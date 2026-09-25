@@ -628,9 +628,7 @@ mod tools {
     /// We use regex-like pattern matching to extract key fields like "path".
     fn extract_incomplete_args(tool: &str, args_json: &str) -> String {
         match tool {
-            "read" | "write" | "edit" | "ls" => {
-                extract_string_field(args_json, "path")
-            }
+            "read" | "write" | "edit" | "ls" => extract_string_field(args_json, "path"),
             "find" => {
                 let pattern = extract_string_field(args_json, "pattern");
                 let path = extract_string_field(args_json, "path");
@@ -1015,8 +1013,13 @@ mod tests {
         let rendered = crate::ansi::strip_ansi(&lines.join("\n"));
         let compact: String = rendered.chars().filter(|ch| !ch.is_whitespace()).collect();
         let expected: String = title.chars().filter(|ch| !ch.is_whitespace()).collect();
-        assert!(compact.contains(&expected), "header was truncated: {rendered}");
-        assert!(lines.iter().all(|line| crate::utils::visible_width(line) <= 16));
+        assert!(
+            compact.contains(&expected),
+            "header was truncated: {rendered}"
+        );
+        assert!(lines
+            .iter()
+            .all(|line| crate::utils::visible_width(line) <= 16));
     }
 
     #[test]

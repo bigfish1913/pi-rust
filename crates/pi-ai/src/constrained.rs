@@ -317,8 +317,7 @@ mod tests {
 
     #[test]
     fn test_grammar_constraint_with_property() {
-        let constraint = GrammarConstraint::regex(r"\d+")
-            .with_input_property("value");
+        let constraint = GrammarConstraint::regex(r"\d+").with_input_property("value");
         assert_eq!(constraint.input_property, Some("value".to_string()));
     }
 }

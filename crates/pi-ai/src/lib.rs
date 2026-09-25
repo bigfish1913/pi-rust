@@ -10,13 +10,14 @@
 //!
 //! Every module's doc comment names the TS file it mirrors.
 
+pub mod constrained;
 pub mod error;
+pub mod event_stream;
 pub mod frames;
 #[cfg(feature = "providers")]
-pub mod images;
-pub mod event_stream;
-#[cfg(feature = "providers")]
 pub mod http;
+#[cfg(feature = "providers")]
+pub mod images;
 pub mod json_parse;
 pub mod model;
 pub mod provider;
@@ -24,7 +25,6 @@ pub mod providers;
 pub mod schema;
 pub(crate) mod strict_schema;
 pub mod types;
-pub mod constrained;
 
 // Flat re-exports — consumers do `use rpi_ai::Message` not `rpi_ai::types::Message`.
 pub use error::AiError;

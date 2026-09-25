@@ -283,7 +283,9 @@ impl Component for BashExecutionComponent {
         let header_width = width.saturating_sub(2).max(1);
         for part in wrap_text_with_ansi(&header_text, header_width) {
             let line = format!("  {}", color_key.fg(&bold(&part)));
-            lines.push(crate::utils::apply_background_to_line(&line, width, |s| bg.bg(s)));
+            lines.push(crate::utils::apply_background_to_line(&line, width, |s| {
+                bg.bg(s)
+            }));
         }
 
         // Output preview
@@ -297,11 +299,10 @@ impl Component for BashExecutionComponent {
                 let styled = format!(
                     "
 {}",
-                    out.iter()
-                        .map(|l| muted.fg(l))
-                        .collect::<Vec<_>>()
-                        .join("
-")
+                    out.iter().map(|l| muted.fg(l)).collect::<Vec<_>>().join(
+                        "
+"
+                    )
                 );
                 if expanded {
                     let all = crate::text::Text::new(&styled, 1, 0).render(width);
@@ -313,7 +314,9 @@ impl Component for BashExecutionComponent {
             }
         };
         for dl in &display_lines {
-            lines.push(crate::utils::apply_background_to_line(dl, width, |s| bg.bg(s)));
+            lines.push(crate::utils::apply_background_to_line(dl, width, |s| {
+                bg.bg(s)
+            }));
         }
 
         // Spinner (while running) or status line (when complete)
@@ -326,21 +329,31 @@ impl Component for BashExecutionComponent {
             let row = format!(
                 "  {} {}",
                 colors.accent.fg("●"),
-                colors.muted.fg(&crate::tool_execution::format_elapsed(elapsed)),
+                colors
+                    .muted
+                    .fg(&crate::tool_execution::format_elapsed(elapsed)),
             );
             let row = truncate_to_width(&row, width, "…");
-            lines.push(crate::utils::apply_background_to_line(&row, width, |s| bg.bg(s)));
+            lines.push(crate::utils::apply_background_to_line(&row, width, |s| {
+                bg.bg(s)
+            }));
             if elapsed > LONG_RUNNING_HINT_AFTER {
                 let hint = format!("  {} Esc / Ctrl+C 中止", colors.muted.fg("⏸"));
                 let hint = truncate_to_width(&hint, width, "…");
-                lines.push(crate::utils::apply_background_to_line(&hint, width, |s| bg.bg(s)));
+                lines.push(crate::utils::apply_background_to_line(&hint, width, |s| {
+                    bg.bg(s)
+                }));
             }
         } else {
             let sl = self.status_line(hidden);
             if !sl.is_empty() {
-                lines.push(crate::utils::apply_background_to_line("", width, |s| bg.bg(s)));
+                lines.push(crate::utils::apply_background_to_line("", width, |s| {
+                    bg.bg(s)
+                }));
                 for sline in &sl {
-                    lines.push(crate::utils::apply_background_to_line(sline, width, |s| bg.bg(s)));
+                    lines.push(crate::utils::apply_background_to_line(sline, width, |s| {
+                        bg.bg(s)
+                    }));
                 }
             }
         }
@@ -397,7 +410,11 @@ mod tests {
         // And it stops advancing once the command is finished.
         let first = c.render(60).join("\n");
         std::thread::sleep(std::time::Duration::from_millis(60));
-        assert_eq!(first, c.render(60).join("\n"), "elapsed kept counting after completion");
+        assert_eq!(
+            first,
+            c.render(60).join("\n"),
+            "elapsed kept counting after completion"
+        );
     }
 
     #[test]
@@ -423,13 +440,22 @@ mod tests {
         let colors = theme().colors;
         // The command header uses the bash accent (or dim when excluded), so
         // compare the foreground escape each color produces.
-        let bash_start = colors.bash_mode.fg("X").split('X').next().unwrap().to_string();
+        let bash_start = colors
+            .bash_mode
+            .fg("X")
+            .split('X')
+            .next()
+            .unwrap()
+            .to_string();
         let dim_start = colors.dim.fg("X").split('X').next().unwrap().to_string();
 
         let normal_out = normal.render(40).join("\n");
         let excluded_out = excluded.render(40).join("\n");
         assert!(normal_out.contains(&bash_start), "normal: {normal_out:?}");
-        assert!(excluded_out.contains(&dim_start), "excluded: {excluded_out:?}");
+        assert!(
+            excluded_out.contains(&dim_start),
+            "excluded: {excluded_out:?}"
+        );
 
         // Both still show the command itself.
         assert!(strip_ansi(&excluded_out).contains("$ echo hi"));

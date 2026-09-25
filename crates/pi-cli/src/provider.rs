@@ -649,7 +649,8 @@ fn resolve_with_settings(
                 .and_then(AnthropicCredential::provider_key)
                 .map(str::to_string);
             let has_key = provider_key.is_some();
-            let http = provider_http_client(&provider_models, "https://api.anthropic.com", &settings);
+            let http =
+                provider_http_client(&provider_models, "https://api.anthropic.com", &settings);
             let inner = if selected_provider == DEFAULT_PROVIDER_ID
                 && !matches!(
                     selected_anthropic_credential,
@@ -657,7 +658,11 @@ fn resolve_with_settings(
                 ) {
                 AnthropicProvider::with_models(provider_key, http, provider_models)
             } else {
-                AnthropicProvider::with_models_without_env_api_key(provider_key, http, provider_models)
+                AnthropicProvider::with_models_without_env_api_key(
+                    provider_key,
+                    http,
+                    provider_models,
+                )
             };
             (
                 Arc::new(NamedAnthropicProvider {
@@ -669,7 +674,8 @@ fn resolve_with_settings(
         }
         rpi_ai::Api::OpenaiCompletions => {
             let has_key = selected_openai_key.is_some();
-            let http = provider_http_client(&provider_models, "https://api.openai.com/v1", &settings);
+            let http =
+                provider_http_client(&provider_models, "https://api.openai.com/v1", &settings);
             let inner = if selected_provider == "openai" {
                 OpenAiCompletionsProvider::with_models(
                     selected_provider,
@@ -689,7 +695,8 @@ fn resolve_with_settings(
         }
         rpi_ai::Api::OpenaiResponses => {
             let has_key = selected_openai_key.is_some();
-            let http = provider_http_client(&provider_models, "https://api.openai.com/v1", &settings);
+            let http =
+                provider_http_client(&provider_models, "https://api.openai.com/v1", &settings);
             let inner = if selected_provider == "openai" {
                 OpenAiResponsesProvider::with_models(
                     selected_provider,

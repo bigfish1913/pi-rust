@@ -40,7 +40,10 @@ pub fn no_api_key_found_message(provider: &str) -> String {
     } else {
         provider.to_string()
     };
-    format!("No API key found for {display}.\n\n{}", provider_login_help())
+    format!(
+        "No API key found for {display}.\n\n{}",
+        provider_login_help()
+    )
 }
 
 #[cfg(test)]

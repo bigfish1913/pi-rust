@@ -375,7 +375,11 @@ impl ExtensionRegistry {
     /// ignored; malformed values leave the corresponding field unchanged.
     /// Retro-updates any handlers already registered (so declare order doesn't
     /// matter). Returns the number of fields applied.
-    pub fn apply_declaration(&mut self, priority: Option<i32>, platforms: Option<Vec<String>>) -> usize {
+    pub fn apply_declaration(
+        &mut self,
+        priority: Option<i32>,
+        platforms: Option<Vec<String>>,
+    ) -> usize {
         let mut applied = 0;
         if let Some(priority) = priority {
             self.priority = priority;
@@ -406,12 +410,18 @@ impl ExtensionRegistry {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
             return false;
         };
-        let priority = value.get("priority").and_then(|v| v.as_i64()).map(|v| v as i32);
-        let platforms = value.get("platforms").and_then(|v| v.as_array()).map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect::<Vec<String>>()
-        });
+        let priority = value
+            .get("priority")
+            .and_then(|v| v.as_i64())
+            .map(|v| v as i32);
+        let platforms = value
+            .get("platforms")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect::<Vec<String>>()
+            });
         self.apply_declaration(priority, platforms);
         true
     }
@@ -781,12 +791,18 @@ mod tests {
         let tag = EventTag::SessionStart;
         let mut reg = ExtensionRegistry::new();
         reg.register_event_handler("p".into(), tag, noop_handler, std::ptr::null_mut());
-        assert_eq!(handler_of(&reg.snapshot(), tag, 0).priority, DEFAULT_PRIORITY);
+        assert_eq!(
+            handler_of(&reg.snapshot(), tag, 0).priority,
+            DEFAULT_PRIORITY
+        );
 
         assert!(reg.apply_declaration_json(r#"{"priority":7,"platforms":["linux"]}"#));
         let snap = reg.snapshot();
         assert_eq!(handler_of(&snap, tag, 0).priority, 7);
-        assert_eq!(handler_of(&snap, tag, 0).platforms, vec!["linux".to_string()]);
+        assert_eq!(
+            handler_of(&snap, tag, 0).platforms,
+            vec!["linux".to_string()]
+        );
     }
 
     /// Malformed declaration JSON is rejected (returns `false`); recognised keys
@@ -808,8 +824,6 @@ mod tests {
         assert!(platform_allows(&[current_platform().to_string()]));
         assert!(!platform_allows(&["nonexistent-os".to_string()]));
         // Empty host subset is fine; a non-matching list is not.
-        assert!(!platform_allows(&[
-            "definitely-not-this-host".to_string()
-        ]));
+        assert!(!platform_allows(&["definitely-not-this-host".to_string()]));
     }
 }
