@@ -1,0 +1,10 @@
+User-agent: *
+Allow: /
+
+# Local state must never be published into this web root. If either path is
+# reachable, the deploy is broken -- see the leak check in Taskfile.yml
+# (rpi-verify) and the cleanup step in rpi-upload-frontend.
+Disallow: /.rpi/
+Disallow: /.deploy/
+
+Sitemap: https://rpi.laofu.online/sitemap.xml

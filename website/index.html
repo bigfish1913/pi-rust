@@ -3,12 +3,59 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="description" content="rpi 是一个用 Rust 构建可组合 LLM Agent 的开源 SDK。" />
+    <meta name="description" content="rpi 是一个 Rust 原生、library-first 的 coding-agent runtime：九个可组合 crate、稳定的插件 ABI、崩溃后可续跑的会话，以及免 Rust 工具链的预编译 CLI。实测启动速度是原生 TypeScript pi 的 9.7 倍，内存占用 1/4.9。" />
+
+    <link rel="canonical" href="https://rpi.laofu.online/" />
+    <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
+    <link rel="apple-touch-icon" href="./apple-touch-icon.png" />
+    <meta name="theme-color" content="#101113" />
+    <meta name="robots" content="index, follow" />
+
+    <meta property="og:type" content="WebSite" />
+    <meta property="og:site_name" content="rpi" />
+    <meta property="og:url" content="https://rpi.laofu.online/" />
+    <meta property="og:title" content="rpi — Rust Agent Toolkit" />
+    <meta property="og:description" content="rpi 是一个 Rust 原生、library-first 的 coding-agent runtime：九个可组合 crate、稳定的插件 ABI、崩溃后可续跑的会话，以及免 Rust 工具链的预编译 CLI。实测启动速度是原生 TypeScript pi 的 9.7 倍，内存占用 1/4.9。" />
+    <meta property="og:image" content="https://rpi.laofu.online/og-image.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="rpi interactive terminal session" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:locale:alternate" content="en_US" />
+
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="rpi — Rust Agent Toolkit" />
+    <meta name="twitter:description" content="rpi 是一个 Rust 原生、library-first 的 coding-agent runtime：九个可组合 crate、稳定的插件 ABI、崩溃后可续跑的会话，以及免 Rust 工具链的预编译 CLI。实测启动速度是原生 TypeScript pi 的 9.7 倍，内存占用 1/4.9。" />
+    <meta name="twitter:image" content="https://rpi.laofu.online/og-image.png" />
     <title>rpi — Rust Agent Toolkit</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.googleapis.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
     <link rel="stylesheet" href="./styles.css" />
+    <script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareSourceCode",
+  "name": "rpi",
+  "alternateName": "pi-rust",
+  "description": "Rust-native, library-first coding-agent runtime: nine composable crates, a stable plugin ABI, crash-resumable sessions, and a terminal agent built on them.",
+  "url": "https://rpi.laofu.online/",
+  "codeRepository": "https://github.com/bigfish1913/pi-rust",
+  "programmingLanguage": "Rust",
+  "runtimePlatform": "Linux, macOS, Windows",
+  "license": "https://github.com/bigfish1913/pi-rust/blob/main/LICENSE",
+  "keywords": "rust, coding agent, llm agent, agent framework, cli, plugin abi, mcp",
+  "author": {
+    "@type": "Person",
+    "name": "BigFish"
+  },
+  "offers": {
+    "@type": "Offer",
+    "price": "0",
+    "priceCurrency": "USD"
+  }
+}
+    </script>
   </head>
   <body>
     <div class="site-shell">
