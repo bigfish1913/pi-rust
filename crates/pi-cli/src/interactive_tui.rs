@@ -5190,7 +5190,7 @@ impl TuiState {
                 // Reflect the in-flight turn in the terminal window/tab title
                 // (OSC 2). No-op when `tui` is absent (unit tests).
                 if let Some(tui) = &self.tui {
-                    tui.set_title("rpi — working");
+                    tui.set_title("🦀π rpi ⟳");
                 }
                 self.status_container.clear();
                 // The working indicator renders inside the editor's top border.
@@ -5216,7 +5216,7 @@ impl TuiState {
             RunStatus::Idle => {
                 self.footer.set_status("");
                 if let Some(tui) = &self.tui {
-                    tui.set_title("rpi");
+                    tui.set_title("🦀π rpi");
                 }
                 self.loader.stop();
                 self.status_container.clear();
@@ -5244,7 +5244,7 @@ impl TuiState {
         *self.status.lock().unwrap() = RunStatus::Working;
         self.footer.set_status("");
         if let Some(tui) = &self.tui {
-            tui.set_title("rpi — retrying");
+            tui.set_title("🦀π rpi ↻");
         }
         self.loader.stop();
         self.status_container.clear();
@@ -7152,6 +7152,28 @@ pub async fn interactive_tui(
     for m in extra_messages {
         prompts.push(m.clone());
     }
+    // ---- Continue a run that recovery repaired, the way native pi does ----
+    // This happens before any user input, and only when nothing was passed on the
+    // command line: an explicit `-p` means the user has already said what they
+    // want next. Driven here rather than inside the harness so the run's output
+    // goes through the same streaming/render path as any other run, and so
+    // startup is never blocked by a run the user cannot see.
+    if prompts.is_empty() && lane.has_pending_resume().await {
+        run_prompt_streaming(
+            &lane,
+            "",
+            true,
+            &tui,
+            &state,
+            drain_handle.is_some(),
+            reload_context.js_extension_session.as_ref(),
+            &js_dialog_bridge,
+            args,
+            Vec::new(),
+        )
+        .await;
+    }
+
     let mut images = initial_images;
     for prompt in prompts {
         if !*running.lock().unwrap() {
@@ -7165,6 +7187,7 @@ pub async fn interactive_tui(
         run_prompt_streaming(
             &lane,
             &prompt,
+            false,
             &tui,
             &state,
             drain_handle.is_some(),
@@ -7198,6 +7221,7 @@ pub async fn interactive_tui(
                 run_prompt_streaming(
                     &lane,
                     &prompt,
+                    false,
                     &tui,
                     &state,
                     drain_handle.is_some(),
@@ -7723,6 +7747,7 @@ fn reconcile_streamed_assistant_completion(
 async fn run_prompt_streaming(
     lane: &Arc<dyn AgentLane>,
     prompt: &str,
+    resume: bool,
     tui: &Arc<TuiAltScreen>,
     state: &Arc<TuiState>,
     streaming: bool,
@@ -7747,7 +7772,23 @@ async fn run_prompt_streaming(
         return;
     }
 
-    let outcome = lane.prompt_text(prompt, images).await;
+    let outcome = if resume {
+        // Continuing an interrupted run: no new user turn, just the provider call
+        // the interrupted run never reached. Native pi behaves the same way.
+        match lane.resume_pending().await {
+            Ok(Some(result)) => Ok(result),
+            // Nothing to resume after all: leave the status alone and let the
+            // normal prompt path take over.
+            Ok(None) => {
+                state.set_status(RunStatus::Idle);
+                tui.request_render(false);
+                return;
+            }
+            Err(error) => Err(error),
+        }
+    } else {
+        lane.prompt_text(prompt, images).await
+    };
 
     if streaming {
         // Broadcast delivery is asynchronous: the harness result can resolve
@@ -9832,6 +9873,16 @@ fn add_welcome_message_with_capabilities(
     skills: &[String],
 ) {
     let c = current_theme().colors;
+    // ASCII art logo combining Rust crab and Pi
+    let logo = format!(
+        "{}\n{}\n{}\n{}",
+        c.accent.fg("    🦀"),
+        c.accent.fg("  ╭─π─╮"),
+        c.accent.fg("  │") + &c.accent.fg(&tui_bold("rpi")) + &c.accent.fg("│"),
+        c.accent.fg("  ╰───╯")
+    );
+    container.add_child(Arc::new(Text::new(logo, 1, 0)));
+    container.add_child(Arc::new(Spacer::new(1)));
     // Accent logotype + a dim tagline, separated from the rest by a thin
     // themed rule. Plain `Text("rpi interactive TUI")` was visually identical
     // to the body text, so the header didn't read as a header.

@@ -8,12 +8,12 @@
 //! throttling, abort via `CancellationToken`, usage estimate, and error-on-empty.
 //! Deferred responses (long-poll) are out of scope for v1 — left as a TODO.
 
-use crate::event_stream::create_assistant_message_event_stream;
+use crate::event_stream::{create_assistant_message_event_stream, AssistantMessageEventStream};
 use crate::model::Model;
-use crate::provider::{Provider, SimpleStreamOptions};
+use crate::provider::{DeferredProvider, Provider, SimpleStreamOptions};
 use crate::types::{
-    Api, AssistantMessage, AssistantMessageEvent, Content, Context, DoneReason, ErrorReason,
-    InputModality, StopReason, TextContent, ThinkingContent, ToolCall,
+    Api, AssistantMessage, AssistantMessageEvent, Content, Context, DeferredHandle, DoneReason,
+    ErrorReason, InputModality, StopReason, TextContent, ThinkingContent, ToolCall,
 };
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicUsize, Ordering};
@@ -338,9 +338,29 @@ pub struct FauxProvider {
     models: Vec<Model>,
     state: Arc<FauxProviderState>,
     script: FauxScript,
+    /// Scripted answers to `poll_deferred`, consumed in order. Empty means the
+    /// poll is unsupported, which is what a provider without a long-poll API
+    /// should behave like.
+    deferred_polls: Arc<Mutex<Vec<DeferredPoll>>>,
+}
+
+/// One scripted deferred poll result.
+#[derive(Clone)]
+pub enum DeferredPoll {
+    /// The generation is ready.
+    Message(AssistantMessage),
+    /// Still not ready: another handle to poll.
+    StillDeferred(DeferredHandle),
+    /// The poll failed.
+    Error(String),
 }
 
 impl FauxProvider {
+    /// Queue one scripted deferred-poll result.
+    pub fn push_deferred_poll(&self, poll: DeferredPoll) {
+        self.deferred_polls.lock().unwrap().push(poll);
+    }
+
     /// Build a faux provider carrying a single default model, sharing `script`.
     pub fn new(script: FauxScript) -> Arc<Self> {
         Self::with_models(script, vec![default_faux_model()])
@@ -353,6 +373,7 @@ impl FauxProvider {
             models,
             state: Arc::new(FauxProviderState::default()),
             script,
+            deferred_polls: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -368,7 +389,85 @@ impl FauxProvider {
 }
 
 #[async_trait]
+impl DeferredProvider for FauxProvider {
+    /// Answer a poll from the scripted queue. An empty queue yields an `Error`
+    /// event rather than a panic: a provider without deferred support must look
+    /// like a failed poll, which is exactly what the caller has to handle.
+    async fn stream_deferred(
+        &self,
+        _model: &Model,
+        handle: &DeferredHandle,
+        _opts: &SimpleStreamOptions,
+    ) -> AssistantMessageEventStream {
+        let poll = {
+            let mut queue = self.deferred_polls.lock().unwrap();
+            if queue.is_empty() {
+                None
+            } else {
+                Some(queue.remove(0))
+            }
+        };
+        let (mut producer, stream) = create_assistant_message_event_stream();
+        let placeholder = faux_assistant_message("", StopReason::Stop);
+        producer.push(AssistantMessageEvent::Start {
+            partial: Arc::new(placeholder.clone()),
+        });
+        let message = match poll {
+            Some(DeferredPoll::Message(mut message)) => {
+                message.deferred = None;
+                message
+            }
+            Some(DeferredPoll::StillDeferred(next)) => {
+                let mut message = placeholder;
+                message.deferred = Some(next);
+                message.stop_reason = StopReason::Deferred;
+                message
+            }
+            Some(DeferredPoll::Error(error)) => faux_assistant_message(error, StopReason::Error),
+            None => faux_assistant_message(
+                format!("no scripted deferred poll for handle {}", handle.id),
+                StopReason::Error,
+            ),
+        };
+        // Terminal event, mirroring `stream_with_deltas`: failures are reported as
+        // `Error` events so the caller handles both kinds of provider call alike.
+        match message.stop_reason {
+            StopReason::Error | StopReason::Aborted => {
+                let reason = if matches!(message.stop_reason, StopReason::Aborted) {
+                    ErrorReason::Aborted
+                } else {
+                    ErrorReason::Error
+                };
+                producer.push(AssistantMessageEvent::Error {
+                    reason,
+                    error: message.clone(),
+                });
+            }
+            other => {
+                let reason = match other {
+                    StopReason::Length => DoneReason::Length,
+                    StopReason::ToolUse => DoneReason::ToolUse,
+                    StopReason::Deferred => DoneReason::Deferred,
+                    _ => DoneReason::Stop,
+                };
+                producer.push(AssistantMessageEvent::Done {
+                    reason,
+                    message: message.clone(),
+                });
+            }
+        }
+        producer.close();
+        stream
+    }
+}
+
+#[async_trait]
 impl Provider for FauxProvider {
+    /// Advertise the deferred capability, so `resume_deferred` can find it.
+    fn deferred(&self) -> Option<&dyn DeferredProvider> {
+        Some(self)
+    }
+
     fn id(&self) -> &str {
         &self.id
     }

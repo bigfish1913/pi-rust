@@ -41,8 +41,8 @@ use tokio_util::sync::CancellationToken;
 
 use rpi_agent::message::AgentMessage;
 use rpi_agent::{
-    run_agent_loop, AfterToolCall, AfterToolResults, AgentContext, AgentEmitter, AgentEvent,
-    AgentLoopConfig, AgentTool, BeforeToolCall, ConvertToLlm, QueueMode,
+    run_agent_loop, run_agent_loop_from_assistant, AfterToolCall, AfterToolResults, AgentContext,
+    AgentEmitter, AgentEvent, AgentLoopConfig, AgentTool, BeforeToolCall, ConvertToLlm, QueueMode,
     ShouldStopAfterTurnContext, StreamFn, TransformContext,
 };
 use rpi_ai::types::{
@@ -69,9 +69,10 @@ use crate::session::session::Session;
 use crate::session::types::{
     BranchBounds, CompactionReason, Entry, EntryOrder, EntryQuery, JsonValue, LaneRecord,
     OperationError, OperationFinishedRecord, OperationIntent, OperationOutcome,
-    OperationStartedRecord, ProvisionedEntry, ProvisionedKind, QueueKind, RecordBase, RecordQuery,
-    SessionStats, SessionTree, StepAttemptRecord, StepKind, ToolReplay, ToolStartedRecord,
-    UsageCause, UsageRecord, WriteDeferredRecord,
+    OperationStartedRecord, ProvisionedEntry, ProvisionedKind, QueueCancelledRecord,
+    QueueEnqueuedRecord, QueueKind, RecordBase, RecordQuery, RetryPendingRecord, SessionStats,
+    SessionTree, StepAttemptRecord, StepKind, ToolReplay, ToolStartedRecord, UsageCause,
+    UsageRecord, WriteDeferredRecord,
 };
 use crate::skills::format_skill_invocation;
 use crate::system_prompt::compose_system_prompt;
@@ -316,6 +317,18 @@ pub trait AgentLane: Send + Sync {
     fn name(&self) -> &str;
     async fn get_leaf_id(&self) -> HarnessResult<Option<String>>;
 
+    /// Whether recovery left an interrupted run that should be continued.
+    ///
+    /// The caller (the TUI) decides *when* to continue: driving a run has to
+    /// happen somewhere the output is rendered, and the harness cannot know that.
+    async fn has_pending_resume(&self) -> bool;
+
+    /// Continue the interrupted run, if there is one to continue.
+    ///
+    /// `Ok(None)` means there was nothing to resume; the caller should carry on
+    /// with a normal prompt.
+    async fn resume_pending(&self) -> HarnessResult<Option<RunResult>>;
+
     async fn prompt_text(
         &self,
         text: &str,
@@ -451,7 +464,13 @@ impl MessageQueue {
         }
     }
 
-    fn drain_messages_for_lane(&mut self, lane: &str) -> Vec<AgentMessage> {
+    /// Take every queued item for `lane`, keeping each item's id.
+    ///
+    /// The id matters: it is what the durable `queue_enqueued` record named, so
+    /// the caller can record the consumption against it. Dropping the ids here
+    /// (as this used to) is what would make a consumed message come back to life
+    /// on the next start.
+    fn drain_for_lane(&mut self, lane: &str) -> Vec<QueuedMessage> {
         let items: Vec<QueuedMessage> = match self.mode {
             QueueMode::All => {
                 let mut selected = Vec::new();
@@ -473,7 +492,24 @@ impl MessageQueue {
                 self.pending.remove(index).into_iter().collect()
             }
         };
-        items.into_iter().map(|item| item.message).collect()
+        items
+    }
+
+    /// Remove and return every queued item for `lane`, regardless of
+    /// [`QueueMode`]. Used by the `app.message.dequeue` action (restore all
+    /// queued messages into the editor), which also cancels them durably.
+    fn take_items_for_lane(&mut self, lane: &str) -> Vec<QueuedMessage> {
+        let mut selected = Vec::new();
+        let mut retained = VecDeque::new();
+        for item in self.pending.drain(..) {
+            if item.lane == lane {
+                selected.push(item);
+            } else {
+                retained.push_back(item);
+            }
+        }
+        self.pending = retained;
+        selected
     }
 
     fn remove(&mut self, entry_id: &str) -> bool {
@@ -491,23 +527,6 @@ impl MessageQueue {
             .map(|item| queued_message_text(&item.message))
             .collect()
     }
-
-    /// Remove and return every queued message text for `lane`, regardless of
-    /// [`QueueMode`]. Used by the `app.message.dequeue` action (restore all
-    /// queued messages into the editor).
-    fn take_for_lane(&mut self, lane: &str) -> Vec<String> {
-        let mut selected = Vec::new();
-        let mut retained = VecDeque::new();
-        for item in self.pending.drain(..) {
-            if item.lane == lane {
-                selected.push(queued_message_text(&item.message));
-            } else {
-                retained.push_back(item);
-            }
-        }
-        self.pending = retained;
-        selected
-    }
 }
 
 /// Releases the in-memory active-run slot on every exit path, including an
@@ -521,6 +540,35 @@ impl Drop for ActiveRunLease<'_> {
         self.harness.release_run();
     }
 }
+
+/// A run that recovery repaired and that can be continued without the user
+/// restating their request.
+///
+/// Native pi resumes the interrupted operation in place (`driveOperation`
+/// re-enters at `state.at`). rpi's run has no durable re-entry point, so the
+/// equivalent is to start a run with **no new prompt**: the branch already
+/// ends with the resolved tool results, so the next thing the loop does is
+/// exactly what the interrupted run would have done next — ask the provider
+/// to continue.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingResume {
+    /// The run that just died. Names the notice and the log entry.
+    pub interrupted_run_id: String,
+    /// The run the whole resume chain starts from. Every resumed run points back
+    /// at this one, so the attempt count is a property of the chain rather than
+    /// of whichever run happens to have died last.
+    pub chain_origin_run_id: String,
+    /// How many resumes this chain has already had. Bounds a run that keeps dying
+    /// from restarting the process's work forever.
+    pub attempt: u32,
+}
+
+/// How many times one interrupted run may be resumed automatically.
+///
+/// Without a bound, a run that crashes deterministically would be re-driven on
+/// every startup: an unbounded loop that spends tokens and repeats side
+/// effects while the user only ever sees a crash.
+pub const MAX_RESUME_ATTEMPTS: u32 = 3;
 
 /// Shared mutable state. Cloned out (field-by-field) at the start of each
 /// operation so the loop sees a consistent snapshot; setters replace fields
@@ -551,6 +599,9 @@ struct HarnessInner {
     entry_transforms: Vec<ContextEntryTransform>,
     /// Optional emitter override; see [`AgentHarnessOptions::agent_emitter`].
     agent_emitter: Option<Arc<dyn AgentEmitter>>,
+    /// Set by `create` when recovery repaired a run that can be continued, and
+    /// consumed by [`AgentHarness::resume_pending`]. See [`PendingResume`].
+    pending_resume: Option<PendingResume>,
     // ---- B3b: the three exists-but-`None` AgentLoopConfig hooks -----------
     before_tool_call: Option<BeforeToolCall>,
     after_tool_call: Option<AfterToolCall>,
@@ -604,8 +655,57 @@ impl AgentHarness {
             }
         }
 
+        // Recovery repaired whatever the previous process left behind. If that
+        // repair left the branch mid-loop (a tool result as the tip), the run can
+        // be continued instead of waiting for the user to restate the request.
+        // Anything still queued when the previous process died is restored here.
+        // For a fresh session this is empty, and for the non-restore path there is
+        // nothing to read.
+        let rebuilt_queue = if options.allow_existing_session {
+            Self::rebuild_queues(&options.session, "main").await
+        } else {
+            Vec::new()
+        };
+
+        let mut pending_resume = None;
         if options.allow_existing_session {
-            Self::finish_interrupted_operation(&options.session, "main").await?;
+            let interrupted = options
+                .session
+                .find_open_operations("main", Some(1))
+                .await
+                .map_err(session_to_harness_err)?
+                .first()
+                .cloned();
+            // A run that died waiting to retry is continued too, and its failed
+            // attempt is not salvaged. Decided before recovery so the salvage and
+            // the resume gate agree.
+            let died_awaiting_retry = match &interrupted {
+                Some(dead) => Self::died_awaiting_retry(&options.session, &dead.base.id).await,
+                None => false,
+            };
+            Self::finish_interrupted_operation(
+                &options.session,
+                "main",
+                &options.tools,
+                &CancellationToken::new(),
+                !died_awaiting_retry,
+            )
+            .await?;
+            if let Some(dead) = interrupted {
+                let died_before_any_output =
+                    Self::tip_is_user_message(&options.session, "main").await;
+                if died_awaiting_retry
+                    || died_before_any_output
+                    || Self::lane_is_resumable(&options.session, "main").await
+                {
+                    let (chain_origin_run_id, attempt) = Self::resume_chain(&dead);
+                    pending_resume = Some(PendingResume {
+                        interrupted_run_id: dead.base.id.clone(),
+                        chain_origin_run_id,
+                        attempt,
+                    });
+                }
+            }
         }
 
         let inner = HarnessInner {
@@ -625,6 +725,7 @@ impl AgentHarness {
             entry_projectors: options.entry_projectors,
             entry_transforms: options.entry_transforms,
             agent_emitter: options.agent_emitter,
+            pending_resume,
             before_tool_call: options.before_tool_call,
             after_tool_call: options.after_tool_call,
             transform_context: options.transform_context,
@@ -635,6 +736,14 @@ impl AgentHarness {
             follow_up_queue: Arc::new(Mutex::new(MessageQueue::new(options.follow_up_mode))),
             next_run_queue: Arc::new(Mutex::new(MessageQueue::new(QueueMode::All))),
         };
+        for (kind, item) in rebuilt_queue {
+            let queue = match kind {
+                QueueKind::Steer => &inner.steering_queue,
+                QueueKind::FollowUp => &inner.follow_up_queue,
+                QueueKind::NextRun => &inner.next_run_queue,
+            };
+            queue.lock().unwrap().pending.push_back(item);
+        }
 
         Ok(Self {
             session: options.session,
@@ -644,6 +753,183 @@ impl AgentHarness {
         })
     }
 
+    /// Whether the run died waiting to retry a retryable failure.
+    ///
+    /// Reads the durable `retry_pending` record: the frames cannot answer this
+    /// (a failed attempt leaves no terminal frame, so its reduced message looks
+    /// merely `pending`), and a failed attempt leaves no other trace because a
+    /// `step_attempt` is only written when a message commits.
+    ///
+    /// "Waiting" means the attempt it scheduled never landed: once that attempt's
+    /// entry exists, the retry succeeded and there is nothing to redo.
+    async fn died_awaiting_retry(session: &Session, run_id: &str) -> bool {
+        let records = match session
+            .find_records(&RecordQuery {
+                record_type: Some("retry_pending"),
+                run_id: Some(run_id.to_string()),
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(records) => records,
+            Err(_) => return false,
+        };
+        let entries = match session
+            .find_entries(&EntryQuery {
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(entries) => entries,
+            Err(_) => return false,
+        };
+        let landed: std::collections::BTreeSet<&str> =
+            entries.iter().map(|entry| entry.id()).collect();
+        records.into_iter().any(|record| match record {
+            LaneRecord::RetryPending(pending) => !landed.contains(pending.result_entry_id.as_str()),
+            _ => false,
+        })
+    }
+
+    /// Whether the lane's branch ends in a state a run can continue from.
+    ///
+    /// True when the last entry is a tool result: a run that reaches its tool
+    /// results always goes on to ask the provider for the next assistant message,
+    /// so a tool result as the tip means the run died before it could. A tool that
+    /// set `terminate` legitimately ends the run there, so it is excluded.
+    async fn lane_is_resumable(session: &Session, lane: &str) -> bool {
+        // Lane-scoped branch read (the session-wide one is hardcoded to "main").
+        let entries = match session
+            .view(lane)
+            .find_entries_on_branch(
+                &EntryQuery {
+                    order: Some(EntryOrder::OldestFirst),
+                    ..Default::default()
+                },
+                &BranchBounds::default(),
+            )
+            .await
+        {
+            Ok(entries) => entries,
+            Err(_) => return false,
+        };
+        match entries.last() {
+            Some(Entry::Message(message)) => {
+                matches!(message.message, AgentMessage::ToolResult(_))
+                    && message.terminate != Some(true)
+            }
+            _ => false,
+        }
+    }
+
+    /// The resume chain a run belongs to: `(origin run id, resumes so far)`.
+    ///
+    /// Read from the run's own durable intent. The count has to be durable,
+    /// because the crash that makes it matter also destroys any in-memory counter
+    /// that could have held it — and a run that crashes deterministically would
+    /// otherwise be re-driven on every startup, spending tokens and repeating side
+    /// effects while the user only ever sees a crash.
+    fn resume_chain(started: &OperationStartedRecord) -> (String, u32) {
+        match &started.intent {
+            OperationIntent::Run {
+                resume_data: Some(data),
+                ..
+            } => {
+                let origin = data
+                    .get("resumedFrom")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| started.base.id.clone());
+                let prior = data
+                    .get("resumeAttempt")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0) as u32;
+                (origin, prior)
+            }
+            // A run with no resume data is the chain's origin.
+            _ => (started.base.id.clone(), 0),
+        }
+    }
+
+    /// The run recovery repaired and that is waiting to be continued, if any.
+    pub fn pending_resume(&self) -> Option<PendingResume> {
+        self.inner
+            .lock()
+            .unwrap()
+            .pending_resume
+            .clone()
+            .filter(|pending| pending.attempt < MAX_RESUME_ATTEMPTS)
+    }
+
+    /// Continue the interrupted run, if recovery left one to continue.
+    ///
+    /// Returns `Ok(None)` when there is nothing to resume, when the resume budget
+    /// is exhausted, or when the branch is not in a continuable state — in all of
+    /// those cases the caller should simply carry on with a normal prompt.
+    ///
+    /// This is a *product-visible* action: it spends tokens and runs tools without
+    /// the user asking a question, which is why it is bounded and why it announces
+    /// itself in the transcript.
+    pub async fn resume_pending(&self) -> HarnessResult<Option<RunResult>> {
+        let Some(pending) = self.inner.lock().unwrap().pending_resume.take() else {
+            return Ok(None);
+        };
+        if pending.attempt >= MAX_RESUME_ATTEMPTS {
+            tracing::warn!(
+                run_id = %pending.interrupted_run_id,
+                attempts = pending.attempt,
+                "not resuming the interrupted run again: its resume budget is exhausted"
+            );
+            self.record_resume_notice(&format!(
+                "The interrupted run was not resumed again: it has already been resumed {} times, \
+                 and resuming it again could repeat its side effects without making progress.",
+                pending.attempt
+            ))
+            .await;
+            return Ok(None);
+        }
+        // The one hard requirement is that the continuation is a *valid request*:
+        // a trailing assistant message is rejected by providers (and by
+        // `run_agent_loop_continue`), so that case must not be resumed even if a
+        // pending resume was recorded. Whether a resume is *offered* in the first
+        // place is decided in `create`; this is the last-line check.
+        if Self::tip_is_assistant(&self.session, &self.lane).await {
+            tracing::warn!(
+                lane = %self.lane,
+                "not continuing the interrupted run: the branch ends at an assistant message"
+            );
+            return Ok(None);
+        }
+        self.record_resume_notice(&format!(
+            "Continuing the run that was interrupted (resume {} of {}).",
+            pending.attempt + 1,
+            MAX_RESUME_ATTEMPTS
+        ))
+        .await;
+        // An empty prompt is exactly a continuation: the loop's next action is the
+        // provider call the interrupted run never reached.
+        self.run_core(Vec::new()).await.map(Some)
+    }
+
+    /// Record the user-visible "why is a run starting by itself" notice.
+    async fn record_resume_notice(&self, text: &str) {
+        let notice = crate::messages::create_custom_message(
+            "runResume",
+            UserContent::Text(text.to_string()),
+            true,
+            None,
+            now_ms(),
+        );
+        if let Err(error) = self.session.view(&self.lane).append_message(notice).await {
+            tracing::warn!(
+                lane = %self.lane,
+                %error,
+                "could not record the run-resume notice"
+            );
+        }
+    }
     /// The event bus. Callers register `RunStart`/`RunEnd` listeners here.
     pub fn events(&self) -> &HarnessEventBus {
         &self.bus
@@ -1075,12 +1361,132 @@ impl AgentHarness {
     }
 
     /// Drive a reconstructed deferred handle to a terminal outcome. Kept
-    /// separate so `drive`/`resume` share one path. The provider-side
-    /// long-poll continuation is not yet ported, so this reports
-    /// `NotImplemented` rather than silently pretending the run finished.
+    /// separate so `drive`/`resume` share one path.
+    ///
+    /// Mirrors native pi's `readDeferredSourceHandle` + `publishResponse`: poll
+    /// the provider, record what it returned, and then either stay suspended (the
+    /// provider handed back another handle) or carry on with the run. "Carry on"
+    /// means the whole reason this is not a plain continuation: a polled assistant
+    /// message arrives from outside the loop, so its tool calls have **not** been
+    /// executed, and the next provider request would be rejected while they are
+    /// unanswered — hence the run is entered *from that assistant*.
     async fn resume_deferred(&self, deferred: DeferredHandle) -> HarnessResult<RunResult> {
-        let _ = deferred;
-        Err(HarnessError::not_implemented("resume_deferred"))
+        let snap = self.snapshot_config()?;
+        // The operation the previous process left parked, if any: it stays open
+        // while suspended, so it is the lane's open operation.
+        let parked_run_id = self
+            .session
+            .find_open_operations(&self.lane, Some(1))
+            .await
+            .map_err(session_to_harness_err)?
+            .first()
+            .map(|operation| operation.base.id.clone());
+
+        let provider = snap
+            .models
+            .iter()
+            .find(|provider| provider.id() == deferred.provider)
+            .cloned()
+            .ok_or_else(|| {
+                HarnessError::agent(format!(
+                    "no provider '{}' is registered for the deferred handle the run parked on",
+                    deferred.provider
+                ))
+            })?;
+        let Some(capability) = provider.deferred() else {
+            // Not silently "finished": a provider that cannot poll cannot answer,
+            // and pretending otherwise would record a result nobody produced.
+            return Err(HarnessError::not_implemented(
+                "resume_deferred: this provider has no long-poll continuation",
+            ));
+        };
+        let model = provider
+            .models()
+            .iter()
+            .find(|model| model.id == deferred.model_id)
+            .cloned()
+            .unwrap_or_else(|| snap.model.clone());
+        let options = self.deferred_stream_options(&snap);
+
+        let message = capability
+            .stream_deferred(&model, &deferred, &options)
+            .await
+            .result()
+            .await
+            .map_err(|error| {
+                HarnessError::agent(format!("the deferred poll produced no message: {error}"))
+            })?;
+
+        // Record the polled message: it is real history (the model wrote it), and
+        // a *new* handle it carries has to be discoverable, which is what
+        // `find_deferred_handle` reads.
+        let entry_id = self
+            .session
+            .view(&self.lane)
+            .append_message(AgentMessage::Assistant(Box::new(message.clone())))
+            .await
+            .map_err(session_to_harness_err)?;
+        let leaf_id = self
+            .session
+            .view(&self.lane)
+            .get_leaf_id()
+            .await
+            .map_err(session_to_harness_err)?
+            .unwrap_or_else(|| entry_id.clone());
+
+        // Still not ready: stay suspended. The operation stays open, so the next
+        // start (or the next `drive`) polls the new handle in turn.
+        if message.stop_reason == StopReason::Deferred {
+            return Ok(RunResult {
+                run_id: parked_run_id.unwrap_or_default(),
+                outcome: HarnessRunOutcome::Suspended {
+                    leaf_id,
+                    final_entry_id: entry_id,
+                    deferred: message.deferred.clone().unwrap_or(deferred),
+                },
+            });
+        }
+
+        // Ready: the parked operation is done — the poll answered it.
+        if let Some(run_id) = &parked_run_id {
+            self.write_operation_finished(run_id, OperationOutcome::Completed, None)
+                .await?;
+        }
+
+        // Anything left to do? A polled message that carries tool calls needs them
+        // executed before the next provider request.
+        let has_tool_calls = message
+            .content
+            .iter()
+            .any(|block| matches!(block, Content::ToolCall(_)));
+        if has_tool_calls {
+            return self.run_core_from_assistant().await;
+        }
+
+        Ok(RunResult {
+            run_id: parked_run_id.unwrap_or_default(),
+            outcome: HarnessRunOutcome::Completed {
+                leaf_id,
+                final_entry_id: entry_id,
+                final_message: message,
+            },
+        })
+    }
+
+    /// The options a deferred poll runs with. Built from the harness snapshot so a
+    /// poll sees the same timeout/thinking settings as an ordinary request; it
+    /// gets a fresh cancellation token because no run is in flight while parked.
+    fn deferred_stream_options(&self, snap: &ConfigSnapshot) -> rpi_ai::SimpleStreamOptions {
+        rpi_ai::SimpleStreamOptions {
+            timeout: snap.stream_options.timeout,
+            session_id: None,
+            signal: CancellationToken::new(),
+            reasoning: match snap.thinking_level {
+                ThinkingLevel::Off => None,
+                other => Some(other),
+            },
+            ..Default::default()
+        }
     }
 
     // -- harness-level config accessors (TS `AgentHarness` class surface, not
@@ -1316,49 +1722,535 @@ impl AgentHarness {
     /// clearing and the TUI status check. The function is kept for reference
     /// and for potential future queue kinds that may need the active-run guard.
     #[allow(dead_code)]
-    async fn enqueue_active(
+    /// Provisioned JSON for an entry — the shape a queue record stores as its
+    /// `target`. Built through the reducer's own helper so the recorded intent
+    /// and the eventual commit cannot drift.
+    fn provisioned_target(entry: &ProvisionedEntry) -> JsonValue {
+        let placeholder = crate::session::types::provisioned_into_entry(entry.clone(), 0, None, 0);
+        crate::session::reducer::entry_provisioned_json(&placeholder)
+    }
+
+    /// Recover the queued message from a recorded `target`.
+    ///
+    /// The target is the entry's flat JSON minus the storage-assigned fields, so
+    /// those three are put back with placeholders before deserializing.
+    fn message_from_target(target: &JsonValue) -> Option<AgentMessage> {
+        let mut object = target.as_object()?.clone();
+        object.insert("seq".to_string(), JsonValue::from(0));
+        object.insert("parentId".to_string(), JsonValue::Null);
+        object.insert("timestamp".to_string(), JsonValue::from(0));
+        let entry: Entry = serde_json::from_value(JsonValue::Object(object)).ok()?;
+        match crate::session::types::provisioned_from_entry(&entry).kind {
+            ProvisionedKind::Message { message, .. } => Some(message),
+            _ => None,
+        }
+    }
+
+    /// The entry id a queue record's `target` names.
+    fn target_entry_id(target: &JsonValue) -> Option<&str> {
+        target.get("id").and_then(|value| value.as_str())
+    }
+
+    /// Enqueue a message and record the intent durably.
+    ///
+    /// The record is what lets a queued message survive a crash: the in-memory
+    /// queue is rebuilt from these records on the next start. Without it the
+    /// queue is purely process-local, so a steer typed while the agent works is
+    /// simply lost.
+    async fn enqueue_message(
         &self,
         message: AgentMessage,
         kind: QueueKind,
     ) -> HarnessResult<QueueResult> {
-        let (entry_id, queue) = {
+        let (entry_id, queue, run_id) = {
             let inner = self.inner.lock().unwrap();
             if inner.closed {
                 return Err(HarnessError::closed());
             }
-            if inner
-                .active_run
-                .as_ref()
-                .map(|active| active.lane != self.lane)
-                .unwrap_or(true)
-            {
-                return Err(HarnessError::no_active_run(
-                    &self.lane,
-                    format!(
-                        "Cannot enqueue {} message while the lane is idle",
-                        kind.as_str()
-                    ),
-                ));
-            }
+            let active = inner.active_run.as_ref().filter(|a| a.lane == self.lane);
             let queue = match kind {
                 QueueKind::Steer => Arc::clone(&inner.steering_queue),
                 QueueKind::FollowUp => Arc::clone(&inner.follow_up_queue),
                 QueueKind::NextRun => Arc::clone(&inner.next_run_queue),
             };
-            (self.session.id_generator().next(), queue)
+            // The run the item belongs to. A cancellation must carry the same run
+            // id (the reducer matches on it), so it is recorded with the item.
+            let run_id = active.map(|active| active.run_id.clone());
+            (self.session.id_generator().next(), queue, run_id)
         };
         queue.lock().unwrap().pending.push_back(QueuedMessage {
             entry_id: entry_id.clone(),
             lane: self.lane.clone(),
-            message,
+            message: message.clone(),
         });
+        self.write_queue_enqueued(kind, run_id.as_deref(), &entry_id, &message)
+            .await?;
         Ok(QueueResult { entry_id })
     }
 
-    /// Close an operation left open by a suspended run or an interrupted
-    /// process. Resume is not implemented yet, so leaving it open would make
-    /// every future operation on the lane fail permanently.
-    async fn finish_interrupted_operation(session: &Session, lane: &str) -> HarnessResult<()> {
+    /// Record that `entry_id` is queued.
+    async fn write_queue_enqueued(
+        &self,
+        kind: QueueKind,
+        run_id: Option<&str>,
+        entry_id: &str,
+        message: &AgentMessage,
+    ) -> HarnessResult<()> {
+        let target = Self::provisioned_target(&ProvisionedEntry {
+            id: entry_id.to_string(),
+            kind: ProvisionedKind::Message {
+                message: message.clone(),
+                terminate: None,
+            },
+        });
+        self.session
+            .append_record(LaneRecord::QueueEnqueued(QueueEnqueuedRecord {
+                base: self.record_base(),
+                queue: kind,
+                run_id: run_id.map(str::to_string),
+                target,
+            }))
+            .await
+            .map_err(session_to_harness_err)?;
+        Ok(())
+    }
+
+    /// Record that a queued item is no longer queued.
+    ///
+    /// `run_id` must be the value the matching enqueue carried: the reducer
+    /// matches a cancellation against its enqueue on `run_id`, so using the
+    /// *current* run (or `None`) would be rejected as log corruption whenever the
+    /// item was queued under a different run.
+    async fn write_queue_cancelled(
+        &self,
+        entry_id: &str,
+        run_id: Option<&str>,
+    ) -> HarnessResult<()> {
+        self.session
+            .append_record(LaneRecord::QueueCancelled(QueueCancelledRecord {
+                base: self.record_base(),
+                run_id: run_id.map(str::to_string),
+                entry_id: entry_id.to_string(),
+            }))
+            .await
+            .map_err(session_to_harness_err)?;
+        Ok(())
+    }
+
+    /// The enqueue record for `entry_id`, if this lane has one.
+    ///
+    /// A cancellation is only written when the enqueue exists: writing one
+    /// without it is exactly the "cancellation has no pending matching enqueue"
+    /// corruption the reducer checks for.
+    async fn find_enqueue(&self, entry_id: &str) -> Option<QueueEnqueuedRecord> {
+        let records = self
+            .session
+            .find_records(&RecordQuery {
+                lane: Some(self.lane.clone()),
+                record_type: Some("queue_enqueued"),
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            })
+            .await
+            .ok()?;
+        records.into_iter().find_map(|record| match record {
+            LaneRecord::QueueEnqueued(enqueued)
+                if Self::target_entry_id(&enqueued.target) == Some(entry_id) =>
+            {
+                Some(enqueued)
+            }
+            _ => None,
+        })
+    }
+
+    /// Take every queued item for this lane the way the loop's injection
+    /// callbacks need: record the consumption, and hand the reserved entry id to
+    /// the settle observer so the injected message is committed when it settles
+    /// rather than surviving only until the run ends.
+    async fn drain_injected(
+        &self,
+        queue: SharedMessageQueue,
+        settle: &Arc<crate::settle::SettleState>,
+    ) -> Vec<AgentMessage> {
+        let items = queue.lock().unwrap().drain_for_lane(&self.lane);
+        let mut messages = Vec::with_capacity(items.len());
+        for item in items {
+            if let Some(enqueued) = self.find_enqueue(&item.entry_id).await {
+                if let Err(error) = self
+                    .write_queue_cancelled(&item.entry_id, enqueued.run_id.as_deref())
+                    .await
+                {
+                    tracing::warn!(
+                        entry_id = %item.entry_id,
+                        %error,
+                        "could not record a queue consumption"
+                    );
+                }
+            }
+            settle.push_injected(item.entry_id.clone(), item.message.clone());
+            messages.push(item.message);
+        }
+        messages
+    }
+
+    /// Take every queued item for this lane, recording each consumption.
+    async fn drain_queue(&self, kind: QueueKind) -> Vec<AgentMessage> {
+        let queue = {
+            let inner = self.inner.lock().unwrap();
+            match kind {
+                QueueKind::Steer => Arc::clone(&inner.steering_queue),
+                QueueKind::FollowUp => Arc::clone(&inner.follow_up_queue),
+                QueueKind::NextRun => Arc::clone(&inner.next_run_queue),
+            }
+        };
+        self.drain_shared_queue(queue).await
+    }
+
+    /// Consumption is recorded *before* the message can become an entry, because
+    /// the reducer requires the cancelled target to not exist yet.
+    async fn drain_shared_queue(&self, queue: SharedMessageQueue) -> Vec<AgentMessage> {
+        let items = queue.lock().unwrap().drain_for_lane(&self.lane);
+        let mut messages = Vec::with_capacity(items.len());
+        for item in items {
+            if let Some(enqueued) = self.find_enqueue(&item.entry_id).await {
+                if let Err(error) = self
+                    .write_queue_cancelled(&item.entry_id, enqueued.run_id.as_deref())
+                    .await
+                {
+                    tracing::warn!(
+                        entry_id = %item.entry_id,
+                        %error,
+                        "could not record a queue consumption"
+                    );
+                }
+            }
+            messages.push(item.message);
+        }
+        messages
+    }
+
+    /// Rebuild the in-memory queues from the durable records.
+    ///
+    /// An item is still queued when its enqueue has no matching cancellation.
+    /// Reconstructed in recorded order, so a restart delivers what was pending in
+    /// the order the user wrote it.
+    async fn rebuild_queues(session: &Session, lane: &str) -> Vec<(QueueKind, QueuedMessage)> {
+        let records = match session
+            .find_records(&RecordQuery {
+                lane: Some(lane.to_string()),
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(records) => records,
+            Err(error) => {
+                tracing::warn!(lane, %error, "could not read the queue records");
+                return Vec::new();
+            }
+        };
+        let mut cancelled: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut pending: Vec<QueueEnqueuedRecord> = Vec::new();
+        for record in records {
+            match record {
+                LaneRecord::QueueEnqueued(enqueued) => pending.push(enqueued),
+                LaneRecord::QueueCancelled(cancelled_record) => {
+                    cancelled.insert(cancelled_record.entry_id);
+                }
+                _ => {}
+            }
+        }
+        pending
+            .into_iter()
+            .filter_map(|enqueued| {
+                let entry_id = Self::target_entry_id(&enqueued.target)?;
+                if cancelled.contains(entry_id) {
+                    return None;
+                }
+                let message = Self::message_from_target(&enqueued.target)?;
+                Some((
+                    enqueued.queue,
+                    QueuedMessage {
+                        entry_id: entry_id.to_string(),
+                        lane: lane.to_string(),
+                        message,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    /// A record base for this lane. The store re-stamps `seq`/`lane`/`timestamp`,
+    /// but the lane must still name a real one: it is how the store routes the
+    /// append.
+    fn record_base(&self) -> RecordBase {
+        RecordBase {
+            id: self.session.id_generator().next(),
+            seq: 0,
+            lane: self.lane.clone(),
+            timestamp: 0,
+        }
+    }
+
+    /// Turn an interrupted run's committed frames into the exact sequence of
+    /// messages to append: each partial assistant message followed by one result
+    /// per tool call whose result never landed.
+    ///
+    /// Each unresolved call is either **replayed** (when both the recorded policy
+    /// and the current tool declaration say `Safe`) or recorded as an
+    /// unknown-outcome stand-in. Never appending a result at all is not an
+    /// option: an assistant message whose tool calls have no results is an
+    /// invalid request for every provider.
+    ///
+    /// Mirrors native pi's `recoverToolInvocation` (`drive/tools.ts`).
+    async fn resolve_interrupted_run(
+        session: &Session,
+        lane: &str,
+        run_id: &str,
+        tools: &[HarnessTool],
+        signal: &CancellationToken,
+        salvage_failed_attempts: bool,
+    ) -> HarnessResult<Vec<AgentMessage>> {
+        // The `tool_started` records hold what a replay needs and the frames do
+        // not: the arguments the call was made with, and the policy declared at
+        // the time. The in-memory copy died with the process.
+        let records = session
+            .find_records(&RecordQuery {
+                record_type: Some("tool_started"),
+                run_id: Some(run_id.to_string()),
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            })
+            .await
+            .map_err(session_to_harness_err)?;
+        let mut recorded: std::collections::BTreeMap<String, ToolStartedRecord> =
+            std::collections::BTreeMap::new();
+        for record in records {
+            if let LaneRecord::ToolStarted(frame) = record {
+                recorded.insert(frame.tool_call_id.clone(), frame);
+            }
+        }
+
+        let mut messages = Vec::new();
+        let mut resolved: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+        // (1) Streams that never became entries: salvage them as interrupted
+        //     assistant messages, each followed by its unresolved tool results.
+        for partial in crate::frame_progress::replay_run_frames(session, run_id).await? {
+            // When the run is about to be retried, none of its uncommitted
+            // streams is worth keeping: they are the failed attempts of the retry
+            // chain, and recording one would leave a dead assistant message in the
+            // transcript as if it were history.
+            //
+            // The check is deliberately run-level rather than per-partial. It
+            // *cannot* be per-partial: frames carry no terminal frame, so
+            // `reduce_frames` yields `stop_reason: Pending` and the reduced
+            // message never looks like the error it actually was.
+            if !salvage_failed_attempts {
+                continue;
+            }
+            let unresolved =
+                crate::frame_progress::unknown_tool_outcomes(session, lane, &partial).await?;
+            let timestamp = partial.timestamp;
+            messages.push(AgentMessage::Assistant(Box::new(
+                crate::frame_progress::interrupted_message(partial),
+            )));
+            for outcome in unresolved {
+                resolved.insert(outcome.tool_call_id.clone());
+                messages.push(
+                    Self::resolve_tool_call(tools, signal, &recorded, &outcome, timestamp).await,
+                );
+            }
+        }
+
+        // (2) A *committed* assistant message whose tools never finished.
+        //
+        // Commit-on-settle commits an assistant message as soon as it settles and
+        // retires that stream, so its calls are not in (1) — but they still need
+        // results, or the next request carries an assistant message with tool
+        // calls and nothing answering them. This also covers the window between
+        // the message settling and its first tool starting, where no
+        // `tool_started` record exists yet.
+        //
+        // Appending at the tip is order-correct: the loop runs a whole tool batch
+        // before the next assistant message, so the only assistant whose calls can
+        // be outstanding is the last one.
+        if let Some(partial) = Self::tip_assistant(session, lane).await {
+            let unresolved =
+                crate::frame_progress::unknown_tool_outcomes(session, lane, &partial).await?;
+            let timestamp = partial.timestamp;
+            for outcome in unresolved {
+                if resolved.insert(outcome.tool_call_id.clone()) {
+                    messages.push(
+                        Self::resolve_tool_call(tools, signal, &recorded, &outcome, timestamp)
+                            .await,
+                    );
+                }
+            }
+        }
+        Ok(messages)
+    }
+
+    /// Whether the branch tip is a user message the run died on.
+    ///
+    /// That is the `starting` crash: the operation opened, the prompt was
+    /// persisted, and the process died before the first provider call. Nothing
+    /// was produced, so the tip is still the prompt — and the run should simply
+    /// continue, which is what native pi does by re-entering its `starting` state.
+    async fn tip_is_user_message(session: &Session, lane: &str) -> bool {
+        let entries = match session
+            .view(lane)
+            .find_entries_on_branch(
+                &EntryQuery {
+                    order: Some(EntryOrder::OldestFirst),
+                    ..Default::default()
+                },
+                &BranchBounds::default(),
+            )
+            .await
+        {
+            Ok(entries) => entries,
+            Err(_) => return false,
+        };
+        matches!(
+            entries.last(),
+            Some(Entry::Message(message)) if matches!(message.message, AgentMessage::User(_))
+        )
+    }
+
+    /// Whether the branch tip is an assistant message.
+    async fn tip_is_assistant(session: &Session, lane: &str) -> bool {
+        let entries = match session
+            .view(lane)
+            .find_entries_on_branch(
+                &EntryQuery {
+                    order: Some(EntryOrder::OldestFirst),
+                    ..Default::default()
+                },
+                &BranchBounds::default(),
+            )
+            .await
+        {
+            Ok(entries) => entries,
+            Err(_) => return true,
+        };
+        matches!(
+            entries.last(),
+            Some(Entry::Message(message)) if matches!(message.message, AgentMessage::Assistant(_))
+        )
+    }
+
+    /// The assistant message at the branch tip, when the tip is one.
+    ///
+    /// A committed assistant message sitting at the tip is how a run that died
+    /// during its tools looks once commit-on-settle has persisted the message.
+    async fn tip_assistant(session: &Session, lane: &str) -> Option<AssistantMessage> {
+        let entries = session
+            .view(lane)
+            .find_entries_on_branch(
+                &EntryQuery {
+                    order: Some(EntryOrder::OldestFirst),
+                    ..Default::default()
+                },
+                &BranchBounds::default(),
+            )
+            .await
+            .ok()?;
+        match entries.last() {
+            Some(Entry::Message(message)) => match &message.message {
+                AgentMessage::Assistant(assistant) => Some((**assistant).clone()),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Resolve one unresolved tool call: replay it when that is safe, otherwise
+    /// record that its outcome is unknown.
+    async fn resolve_tool_call(
+        tools: &[HarnessTool],
+        signal: &CancellationToken,
+        recorded: &std::collections::BTreeMap<String, ToolStartedRecord>,
+        outcome: &crate::frame_progress::UnknownToolOutcome,
+        timestamp: i64,
+    ) -> AgentMessage {
+        let frame = recorded.get(&outcome.tool_call_id);
+        let tool = tools
+            .iter()
+            .find(|tool| tool.tool.schema().name == outcome.tool_name);
+        // Dual confirmation, exactly like native: the call must have been
+        // recorded as safe *and* the tool must still declare itself safe.
+        // Either alone would replay calls that are not safe to repeat.
+        let may_replay = frame.is_some_and(|frame| frame.replay == ToolReplay::Safe)
+            && tool.is_some_and(|tool| tool.replay == crate::types::ToolReplay::Safe);
+        if !may_replay {
+            return crate::frame_progress::interrupted_tool_result(outcome, timestamp);
+        }
+        let (Some(frame), Some(tool)) = (frame, tool) else {
+            return crate::frame_progress::interrupted_tool_result(outcome, timestamp);
+        };
+
+        let replayed = tool
+            .tool
+            .execute(
+                &outcome.tool_call_id,
+                frame.effective_args.clone(),
+                signal.child_token(),
+                Arc::new(|_| {}),
+            )
+            .await
+            .map_err(|error| error.to_string());
+        match replayed {
+            Ok(result) => {
+                // The tool's own output first, then the marker: mirrors native pi's
+                // `interruptedOutcome`, which appends its marker after the content
+                // the tool had already produced, and keeps the result readable —
+                // the reader sees the output before the note about it.
+                let mut content = result.clone().into_content();
+                content.push(Content::text(crate::tool_recovery::REPLAYED_TOOL_RESULT));
+                AgentMessage::ToolResult(Box::new(rpi_ai::types::ToolResultMessage {
+                    role: rpi_ai::types::ToolResultRole,
+                    tool_call_id: outcome.tool_call_id.clone(),
+                    tool_name: outcome.tool_name.clone(),
+                    content,
+                    details: Some(result.details.clone()),
+                    usage: result.usage.clone(),
+                    added_tool_names: result.added_tool_names.clone(),
+                    is_error: false,
+                    timestamp,
+                }))
+            }
+            Err(error) => AgentMessage::ToolResult(Box::new(rpi_ai::types::ToolResultMessage {
+                role: rpi_ai::types::ToolResultRole,
+                tool_call_id: outcome.tool_call_id.clone(),
+                tool_name: outcome.tool_name.clone(),
+                content: vec![Content::text(format!(
+                    "{}\n\nThe re-run failed: {error}",
+                    crate::tool_recovery::REPLAYED_TOOL_RESULT
+                ))],
+                details: None,
+                usage: None,
+                added_tool_names: Vec::new(),
+                is_error: true,
+                timestamp,
+            })),
+        }
+    }
+
+    /// Settle an operation left open by a process that died, repairing what it
+    /// left behind.
+    ///
+    /// Leaves the lane with no open operation — otherwise every future operation
+    /// on it would fail permanently. When the repair leaves the branch
+    /// continuable, `create` records a [`PendingResume`] so the run can be picked
+    /// up again; the settlement itself deliberately does not start any work.
+    async fn finish_interrupted_operation(
+        session: &Session,
+        lane: &str,
+        tools: &[HarnessTool],
+        signal: &CancellationToken,
+        salvage_failed_attempts: bool,
+    ) -> HarnessResult<()> {
         let open = session
             .find_open_operations(lane, Some(2))
             .await
@@ -1397,12 +2289,22 @@ impl AgentHarness {
         // user's prompt remains — see `docs/llm-repetition-forensics.md` §十一.
         // Mirrors native pi's `recoverAssistantGeneration`.
         //
-        // `salvage_run_messages` also pairs every unresolved tool call with a
-        // synthetic error result. That is required, not cosmetic: a crash most
-        // often lands *during* tool execution, so the committed partial usually
-        // carries tool calls, and an assistant message whose tool calls have no
-        // results is rejected by every provider on the next request.
-        match crate::frame_progress::salvage_run_messages(session, lane, &run_id).await {
+        // Every unresolved tool call gets a result: a real one when the call may
+        // be replayed, otherwise the unknown-outcome stand-in. That pairing is
+        // required, not cosmetic — a crash most often lands *during* tool
+        // execution, so the committed partial usually carries tool calls, and an
+        // assistant message whose tool calls have no results is rejected by every
+        // provider on the next request.
+        match Self::resolve_interrupted_run(
+            session,
+            lane,
+            &run_id,
+            tools,
+            signal,
+            salvage_failed_attempts,
+        )
+        .await
+        {
             Ok(salvaged) => {
                 for message in salvaged {
                     if let Err(error) = session.view(lane).append_message(message).await {
@@ -1651,34 +2553,13 @@ impl AgentHarness {
     /// This is the record that lets recovery name the tool whose side effect is
     /// unknown after a crash. It is only writable *after* the assistant message
     /// carrying the call is an entry, which is what commit-on-settle buys.
-    pub(crate) async fn write_tool_started_record(
-        &self,
-        run_id: &str,
-        assistant_entry_id: &str,
-        tool_index: u32,
-        tool_call_id: &str,
-        tool_name: &str,
-        effective_args: serde_json::Value,
-        result_entry_id: &str,
-        replay: ToolReplay,
-    ) -> HarnessResult<()> {
+    /// Takes a fully-formed record rather than its fields: the caller already
+    /// assembles the parts (assistant entry, ordinal, reserved result id), and a
+    /// nine-parameter signature would only split one construction across two
+    /// places.
+    pub(crate) async fn write_tool_started(&self, record: ToolStartedRecord) -> HarnessResult<()> {
         self.session
-            .append_record(LaneRecord::ToolStarted(ToolStartedRecord {
-                base: RecordBase {
-                    id: self.session.id_generator().next(),
-                    seq: 0,
-                    lane: self.lane.clone(),
-                    timestamp: 0,
-                },
-                run_id: run_id.to_string(),
-                assistant_entry_id: assistant_entry_id.to_string(),
-                tool_index,
-                tool_call_id: tool_call_id.to_string(),
-                tool_name: tool_name.to_string(),
-                effective_args,
-                result_entry_id: result_entry_id.to_string(),
-                replay,
-            }))
+            .append_record(LaneRecord::ToolStarted(record))
             .await
             .map_err(session_to_harness_err)?;
         Ok(())
@@ -1690,6 +2571,30 @@ impl AgentHarness {
             .append_entry(entry, &self.lane)
             .await
             .map_err(session_to_harness_err)
+    }
+
+    /// Record that another attempt is scheduled for `run_id`.
+    ///
+    /// Written before the backoff wait, so a crash during the wait is
+    /// recognisable as "this run was about to retry" rather than looking like an
+    /// interrupted run. The reserved id is that attempt's assistant entry: once it
+    /// lands, the retry succeeded and nothing is pending.
+    async fn write_retry_pending(
+        &self,
+        run_id: &str,
+        attempt: u32,
+        result_entry_id: &str,
+    ) -> HarnessResult<()> {
+        self.session
+            .append_record(LaneRecord::RetryPending(RetryPendingRecord {
+                base: self.record_base(),
+                run_id: run_id.to_string(),
+                attempt,
+                result_entry_id: result_entry_id.to_string(),
+            }))
+            .await
+            .map_err(session_to_harness_err)?;
+        Ok(())
     }
 
     /// Write a `step_attempt` record on this harness's lane.
@@ -1983,19 +2888,46 @@ impl AgentHarness {
 
     /// The core run loop shared by all prompt overloads + skill + template.
     async fn run_core(&self, prompts: Vec<AgentMessage>) -> HarnessResult<RunResult> {
+        self.run_core_with_entry(prompts, false).await
+    }
+
+    /// Continue a run from the assistant message at the branch tip.
+    ///
+    /// The deferred case: that message came from a poll, so its tool calls have
+    /// not run. Entering the loop *from* it executes them before the next
+    /// provider request instead of sending unanswered tool calls.
+    async fn run_core_from_assistant(&self) -> HarnessResult<RunResult> {
+        self.run_core_with_entry(Vec::new(), true).await
+    }
+
+    async fn run_core_with_entry(
+        &self,
+        prompts: Vec<AgentMessage>,
+        from_assistant: bool,
+    ) -> HarnessResult<RunResult> {
         let (run_id, signal, _idle) = self.acquire_run(OperationKind::Run)?;
 
         // `nextRun` messages are consumed when a new run starts, before the
         // caller's prompt. This matches pi's ordering and keeps them durable
         // through the normal prompt persistence path below.
-        let prompts = {
-            let inner = self.inner.lock().unwrap();
-            let mut queue = inner.next_run_queue.lock().unwrap();
-            let queued = queue.drain_messages_for_lane(&self.lane);
-            queued.into_iter().chain(prompts).collect::<Vec<_>>()
-        };
+        // The in-memory queue is drained through the recording path, so the
+        // consumed items are durably un-queued rather than reappearing next start.
+        let queued = self.drain_queue(QueueKind::NextRun).await;
+        let prompts: Vec<AgentMessage> = queued.into_iter().chain(prompts).collect();
         let _run_lease = ActiveRunLease { harness: self };
-        Self::finish_interrupted_operation(&self.session, &self.lane).await?;
+        // Recovery runs before the source leaf is snapshotted, so the salvaged
+        // messages are part of the base history this run builds on.
+        let recovery_tools = self.get_tools().await?;
+        // `true`: a run starting here retries through its own retry loop, so a
+        // leftover failed attempt is settled the ordinary way.
+        Self::finish_interrupted_operation(
+            &self.session,
+            &self.lane,
+            &recovery_tools,
+            &signal,
+            true,
+        )
+        .await?;
 
         // Snapshot the source leaf (before persisting prompts) for the
         // operation_started record.
@@ -2013,11 +2945,34 @@ impl AgentHarness {
         }));
 
         // Write operation_started.
+        // A resumed run records the chain it belongs to. `resume_data` was an
+        // unused placeholder until now; the attempt budget has to be durable,
+        // because the crash that makes it matter also destroys every in-memory
+        // counter that could have held it.
+        let resume_data = self
+            .inner
+            .lock()
+            .unwrap()
+            .pending_resume
+            .clone()
+            .filter(|pending| pending.attempt < MAX_RESUME_ATTEMPTS)
+            .map(|pending| {
+                let mut data = std::collections::BTreeMap::new();
+                data.insert(
+                    "resumedFrom".to_string(),
+                    JsonValue::String(pending.chain_origin_run_id),
+                );
+                data.insert(
+                    "resumeAttempt".to_string(),
+                    JsonValue::from(pending.attempt + 1),
+                );
+                data
+            });
         let intent = OperationIntent::Run {
             original_prompt: prompts.clone(),
             initial_messages: Vec::new(),
             system_prompt_override: None,
-            resume_data: None,
+            resume_data,
         };
         self.write_operation_started(&run_id, source_leaf.clone(), intent)
             .await?;
@@ -2199,6 +3154,30 @@ impl AgentHarness {
                 None
             };
 
+        let retry_policy = snap.retry.clone();
+        let mut retry_attempt = 0u32;
+        // Commit-on-settle: persist an assistant message carrying tool calls as
+        // soon as it is final, so the tools it calls can be recorded before they
+        // run (`tool_started` requires the assistant entry to exist).
+        let settle_state = Arc::new(crate::settle::SettleState::new(
+            run_id.clone(),
+            retry_policy.enabled,
+            retry_policy.max_retries,
+            snap.tools
+                .iter()
+                .map(|tool| {
+                    // `HarnessTool` carries the harness-level policy; a record
+                    // carries the persisted one. They are separate types with the
+                    // same two cases, so map explicitly rather than relying on
+                    // them staying in sync.
+                    let replay = match tool.replay {
+                        crate::types::ToolReplay::Never => ToolReplay::Never,
+                        crate::types::ToolReplay::Safe => ToolReplay::Safe,
+                    };
+                    (tool.tool.schema().name.clone(), replay)
+                })
+                .collect(),
+        ));
         let config = AgentLoopConfig {
             model: snap.model.clone(),
             convert_to_llm: convert,
@@ -2257,20 +3236,24 @@ impl AgentHarness {
             },
             get_steering_messages: Some({
                 let queue = Arc::clone(&snap.steering_queue);
-                let lane = self.lane.clone();
+                let harness = self.clone();
+                let settle = Arc::clone(&settle_state);
                 Arc::new(move || {
+                    let harness = harness.clone();
                     let queue = Arc::clone(&queue);
-                    let lane = lane.clone();
-                    Box::pin(async move { queue.lock().unwrap().drain_messages_for_lane(&lane) })
+                    let settle = Arc::clone(&settle);
+                    Box::pin(async move { harness.drain_injected(queue, &settle).await })
                 })
             }),
             get_follow_up_messages: Some({
                 let queue = Arc::clone(&snap.follow_up_queue);
-                let lane = self.lane.clone();
+                let harness = self.clone();
+                let settle = Arc::clone(&settle_state);
                 Arc::new(move || {
+                    let harness = harness.clone();
                     let queue = Arc::clone(&queue);
-                    let lane = lane.clone();
-                    Box::pin(async move { queue.lock().unwrap().drain_messages_for_lane(&lane) })
+                    let settle = Arc::clone(&settle);
+                    Box::pin(async move { harness.drain_injected(queue, &settle).await })
                 })
             }),
             before_tool_call: snap.before_tool_call.clone(),
@@ -2326,44 +3309,33 @@ impl AgentHarness {
         // therefore persist ALL of them (skip 0). The old `skip(prompts_len)`
         // was a leftover from a design that passed `prompts` in; it wrongly
         // dropped the first real assistant message.
-        let retry_policy = snap.retry.clone();
-        let mut retry_attempt = 0u32;
-        // Commit-on-settle: persist an assistant message carrying tool calls as
-        // soon as it is final, so the tools it calls can be recorded before they
-        // run (`tool_started` requires the assistant entry to exist).
-        let settle_state = Arc::new(crate::settle::SettleState::new(
-            run_id.clone(),
-            retry_policy.enabled,
-            retry_policy.max_retries,
-            snap.tools
-                .iter()
-                .map(|tool| {
-                    // `HarnessTool` carries the harness-level policy; a record
-                    // carries the persisted one. They are separate types with the
-                    // same two cases, so map explicitly rather than relying on
-                    // them staying in sync.
-                    let replay = match tool.replay {
-                        crate::types::ToolReplay::Never => ToolReplay::Never,
-                        crate::types::ToolReplay::Safe => ToolReplay::Safe,
-                    };
-                    (tool.tool.schema().name.clone(), replay)
-                })
-                .collect(),
-        ));
         let emitter: Arc<dyn AgentEmitter> = Arc::new(crate::settle::SettlingEmitter::new(
             Arc::clone(&emitter),
+            Arc::clone(&frame_recorder),
             Arc::clone(&settle_state),
             self.clone(),
         ));
         let result = loop {
-            let attempt_result = run_agent_loop(
-                Vec::new(),
-                agent_context.clone(),
-                config.clone(),
-                Arc::clone(&emitter),
-                Arc::clone(&stream_fn),
-            )
-            .await;
+            // Entering from an assistant runs that message's tools as its very
+            // first action, which is exactly why it is never retried (see below).
+            let attempt_result = if from_assistant {
+                run_agent_loop_from_assistant(
+                    agent_context.clone(),
+                    config.clone(),
+                    Arc::clone(&emitter),
+                    Arc::clone(&stream_fn),
+                )
+                .await
+            } else {
+                run_agent_loop(
+                    Vec::new(),
+                    agent_context.clone(),
+                    config.clone(),
+                    Arc::clone(&emitter),
+                    Arc::clone(&stream_fn),
+                )
+                .await
+            };
 
             let retry_error = attempt_result
                 .as_ref()
@@ -2387,12 +3359,26 @@ impl AgentHarness {
             if !retry_policy.enabled
                 || retry_attempt >= retry_policy.max_retries
                 || retry_error.is_none()
+                // A from-assistant attempt already ran the polled message's tools,
+                // so retrying would run them a second time. One attempt only.
+                || from_assistant
             {
                 break attempt_result;
             }
 
             retry_attempt += 1;
             settle_state.set_attempt(retry_attempt);
+            // Record the retry before waiting, so a crash during the wait is
+            // recognised as "this run was about to retry" rather than looking like
+            // an interrupted run. The reserved id is that attempt's assistant
+            // entry: if it ever lands, the retry succeeded and nothing is pending.
+            let retry_result_id = self.next_entry_id();
+            if let Err(error) = self
+                .write_retry_pending(&run_id, retry_attempt + 1, &retry_result_id)
+                .await
+            {
+                tracing::warn!(%error, "could not record a scheduled retry");
+            }
             let delay_ms = retry_policy
                 .base_delay_ms
                 .saturating_mul(1u64 << retry_attempt.saturating_sub(1))
@@ -2475,7 +3461,17 @@ impl AgentHarness {
                 // `recoverAssistantGeneration`. The salvaged sequence pairs each
                 // partial with synthetic error results for its unresolved tool
                 // calls, so the transcript remains a valid request.
-                let salvaged = match frame_recorder.salvage(&self.session, &self.lane).await {
+                let salvaged = match Self::resolve_interrupted_run(
+                    &self.session,
+                    &self.lane,
+                    frame_recorder.run_id(),
+                    &snap.tools,
+                    &signal,
+                    // The retry loop just finished; anything left is settled.
+                    true,
+                )
+                .await
+                {
                     Ok(salvaged) => salvaged,
                     Err(salvage_error) => {
                         tracing::warn!(
@@ -2562,7 +3558,17 @@ impl AgentHarness {
     ) -> HarnessResult<CompactionResult> {
         let (run_id, signal, _idle) = self.acquire_run(OperationKind::Compaction)?;
         let _run_lease = ActiveRunLease { harness: self };
-        Self::finish_interrupted_operation(&self.session, &self.lane).await?;
+        let recovery_tools = self.get_tools().await?;
+        // `true`: a run starting here retries through its own retry loop, so a
+        // leftover failed attempt is settled the ordinary way.
+        Self::finish_interrupted_operation(
+            &self.session,
+            &self.lane,
+            &recovery_tools,
+            &signal,
+            true,
+        )
+        .await?;
 
         let source_leaf = self
             .session
@@ -2730,6 +3736,14 @@ struct ConfigSnapshot {
 
 #[async_trait::async_trait]
 impl AgentLane for AgentHarness {
+    async fn has_pending_resume(&self) -> bool {
+        self.pending_resume().is_some()
+    }
+
+    async fn resume_pending(&self) -> HarnessResult<Option<RunResult>> {
+        AgentHarness::resume_pending(self).await
+    }
+
     fn name(&self) -> &str {
         &self.lane
     }
@@ -2891,72 +3905,55 @@ impl AgentLane for AgentHarness {
         // stays queued for the next explicit run. This avoids the race between
         // `activeRun` clearing and the TUI's status check that used to send
         // messages to `next_run_queue` (which never auto-wakes).
-        let (entry_id, queue) = {
-            let inner = self.inner.lock().unwrap();
-            if inner.closed {
-                return Err(HarnessError::closed());
-            }
-            (
-                self.session.id_generator().next(),
-                Arc::clone(&inner.steering_queue),
-            )
-        };
-        queue.lock().unwrap().pending.push_back(QueuedMessage {
-            entry_id: entry_id.clone(),
-            lane: self.lane.clone(),
-            message,
-        });
-        Ok(QueueResult { entry_id })
+        self.enqueue_message(message, QueueKind::Steer).await
     }
 
     async fn follow_up(&self, message: AgentMessage) -> HarnessResult<QueueResult> {
         // Same as steer: unconditional enqueue, drained by `getFollowUpMessages`
         // after the loop would otherwise stop.
-        let (entry_id, queue) = {
-            let inner = self.inner.lock().unwrap();
-            if inner.closed {
-                return Err(HarnessError::closed());
-            }
-            (
-                self.session.id_generator().next(),
-                Arc::clone(&inner.follow_up_queue),
-            )
-        };
-        queue.lock().unwrap().pending.push_back(QueuedMessage {
-            entry_id: entry_id.clone(),
-            lane: self.lane.clone(),
-            message,
-        });
-        Ok(QueueResult { entry_id })
+        self.enqueue_message(message, QueueKind::FollowUp).await
     }
 
     async fn next_run(&self, message: AgentMessage) -> HarnessResult<QueueResult> {
-        let (entry_id, queue) = {
+        self.enqueue_message(message, QueueKind::NextRun).await
+    }
+
+    async fn cancel_queued(&self, entry_id: &str) -> HarnessResult<CancelQueuedResult> {
+        // Scoped: the guard must not live into the awaits below (it is not
+        // `Send`, and holding it across one makes the whole run future non-Send).
+        let removed = {
             let inner = self.inner.lock().unwrap();
             if inner.closed {
                 return Err(HarnessError::closed());
             }
-            (
-                self.session.id_generator().next(),
-                Arc::clone(&inner.next_run_queue),
-            )
+            inner.steering_queue.lock().unwrap().remove(entry_id)
+                || inner.follow_up_queue.lock().unwrap().remove(entry_id)
+                || inner.next_run_queue.lock().unwrap().remove(entry_id)
         };
-        queue.lock().unwrap().pending.push_back(QueuedMessage {
-            entry_id: entry_id.clone(),
-            lane: self.lane.clone(),
-            message,
-        });
-        Ok(QueueResult { entry_id })
-    }
-
-    async fn cancel_queued(&self, entry_id: &str) -> HarnessResult<CancelQueuedResult> {
-        let inner = self.inner.lock().unwrap();
-        if inner.closed {
-            return Err(HarnessError::closed());
+        if removed {
+            // Record it, or the item would come back on the next start. The run id
+            // comes from the enqueue, not from the current state: the reducer
+            // matches them, and an item queued during a run is often cancelled
+            // after that run has ended.
+            match self.find_enqueue(entry_id).await {
+                Some(enqueued) => {
+                    if let Err(error) = self
+                        .write_queue_cancelled(entry_id, enqueued.run_id.as_deref())
+                        .await
+                    {
+                        tracing::warn!(
+                            entry_id,
+                            %error,
+                            "could not record a queue cancellation"
+                        );
+                    }
+                }
+                None => tracing::warn!(
+                    entry_id,
+                    "not recording a queue cancellation: the item has no enqueue record"
+                ),
+            }
         }
-        let removed = inner.steering_queue.lock().unwrap().remove(entry_id)
-            || inner.follow_up_queue.lock().unwrap().remove(entry_id)
-            || inner.next_run_queue.lock().unwrap().remove(entry_id);
         Ok(CancelQueuedResult {
             outcome: if removed {
                 CancelQueuedOutcome::Cancelled
@@ -2988,20 +3985,49 @@ impl AgentLane for AgentHarness {
     }
 
     async fn clear_queue(&self) -> HarnessResult<QueuedMessages> {
-        let inner = self.inner.lock().unwrap();
-        if inner.closed {
-            return Err(HarnessError::closed());
+        let (steering_items, follow_up_items) = {
+            let inner = self.inner.lock().unwrap();
+            if inner.closed {
+                return Err(HarnessError::closed());
+            }
+            // Bound to locals: the guards are temporaries of the tuple
+            // expression otherwise, and they must not outlive this block.
+            let steering = inner
+                .steering_queue
+                .lock()
+                .unwrap()
+                .take_items_for_lane(&self.lane);
+            let follow_up = inner
+                .follow_up_queue
+                .lock()
+                .unwrap()
+                .take_items_for_lane(&self.lane);
+            (steering, follow_up)
+        };
+        let mut steering = Vec::with_capacity(steering_items.len());
+        let mut follow_up = Vec::with_capacity(follow_up_items.len());
+        // Un-queuing is a cancellation: without the record these messages would
+        // come back on the next start, even though they are in the editor now.
+        for (items, out) in [
+            (steering_items, &mut steering),
+            (follow_up_items, &mut follow_up),
+        ] {
+            for item in items {
+                if let Some(enqueued) = self.find_enqueue(&item.entry_id).await {
+                    if let Err(error) = self
+                        .write_queue_cancelled(&item.entry_id, enqueued.run_id.as_deref())
+                        .await
+                    {
+                        tracing::warn!(
+                            entry_id = %item.entry_id,
+                            %error,
+                            "could not record a queue clear"
+                        );
+                    }
+                }
+                out.push(queued_message_text(&item.message));
+            }
         }
-        let steering = inner
-            .steering_queue
-            .lock()
-            .unwrap()
-            .take_for_lane(&self.lane);
-        let follow_up = inner
-            .follow_up_queue
-            .lock()
-            .unwrap()
-            .take_for_lane(&self.lane);
         Ok(QueuedMessages {
             steering,
             follow_up,
@@ -3249,6 +4275,14 @@ impl LaneHandle {
 
 #[async_trait::async_trait]
 impl AgentLane for LaneHandle {
+    async fn has_pending_resume(&self) -> bool {
+        self.runner().pending_resume().is_some()
+    }
+
+    async fn resume_pending(&self) -> HarnessResult<Option<RunResult>> {
+        self.runner().resume_pending().await
+    }
+
     fn name(&self) -> &str {
         &self.lane
     }
@@ -3591,7 +4625,7 @@ mod queue_tests {
             lane: "main".into(),
             message: user("second"),
         });
-        assert_eq!(queue.drain_messages_for_lane("main").len(), 1);
+        assert_eq!(queue.drain_for_lane("main").len(), 1);
         assert_eq!(
             queue.pending.front().map(|item| item.entry_id.as_str()),
             Some("b")
@@ -3632,12 +4666,12 @@ mod queue_tests {
             lane: "side".into(),
             message: user("side"),
         });
-        assert_eq!(queue.drain_messages_for_lane("main").len(), 1);
+        assert_eq!(queue.drain_for_lane("main").len(), 1);
         assert_eq!(
             queue.pending.front().map(|item| item.entry_id.as_str()),
             Some("side-1")
         );
-        assert_eq!(queue.drain_messages_for_lane("side").len(), 1);
+        assert_eq!(queue.drain_for_lane("side").len(), 1);
         assert!(queue.pending.is_empty());
     }
 
@@ -3682,9 +4716,15 @@ mod queue_tests {
             lane: "main".into(),
             message: user("second"),
         });
-        // Unlike `drain_messages_for_lane` (which honours `QueueMode`), the
-        // dequeue action clears the lane completely regardless of mode.
-        assert_eq!(queue.take_for_lane("main"), vec!["first", "second"]);
+        // Unlike `drain_for_lane` (which honours `QueueMode`), the dequeue
+        // action clears the lane completely regardless of mode. It returns items
+        // (ids included) so the caller can record each cancellation.
+        let taken: Vec<String> = queue
+            .take_items_for_lane("main")
+            .into_iter()
+            .map(|item| queued_message_text(&item.message))
+            .collect();
+        assert_eq!(taken, vec!["first", "second"]);
         assert_eq!(queue.pending.len(), 1);
         assert_eq!(queue.pending[0].entry_id, "b");
     }

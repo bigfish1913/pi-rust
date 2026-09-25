@@ -60,6 +60,7 @@ const RECORD_TYPES: &[&str] = &[
     "write_deferred",
     "usage",
     "assistant_frame",
+    "retry_pending",
 ];
 const OPERATION_KINDS: &[&str] = &["run", "compaction", "navigation"];
 

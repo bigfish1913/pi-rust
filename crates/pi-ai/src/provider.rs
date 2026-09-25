@@ -5,7 +5,7 @@
 
 use crate::event_stream::AssistantMessageEventStream;
 use crate::model::Model;
-use crate::types::{AssistantMessage, Context, ThinkingBudgets, ThinkingLevel};
+use crate::types::{AssistantMessage, Context, DeferredHandle, ThinkingBudgets, ThinkingLevel};
 use std::collections::BTreeMap;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -161,6 +161,46 @@ pub trait Provider: Send + Sync {
         ctx: &Context,
         opts: &SimpleStreamOptions,
     ) -> AssistantMessageEventStream;
+
+    /// This provider's deferred-response capability, if it has one.
+    ///
+    /// Defaulted rather than required, and returned as an optional sidecar:
+    /// only providers whose API actually has a long-poll continuation can
+    /// answer, and the rest should not carry a stub. This is the same reasoning
+    /// that put [`ProviderHooks`] in its own trait, except a default body also
+    /// spares every existing implementation.
+    fn deferred(&self) -> Option<&dyn DeferredProvider> {
+        None
+    }
+}
+
+/// Continue a response the provider deferred (a long-poll or batch API).
+///
+/// Mirrors the optional `streamDeferred` / `cancelDeferred` on native pi's models
+/// interface. Same contract as [`Provider::stream_simple`]: returns the consumer
+/// end of a stream and reports failures as `Error` events rather than `Err`, so
+/// the harness handles both kinds of provider call uniformly.
+#[async_trait::async_trait]
+pub trait DeferredProvider: Send + Sync {
+    /// Poll a handle this provider previously issued: either the finished
+    /// assistant message, or another `Deferred` handle to poll again.
+    async fn stream_deferred(
+        &self,
+        model: &Model,
+        handle: &DeferredHandle,
+        opts: &SimpleStreamOptions,
+    ) -> AssistantMessageEventStream;
+
+    /// Best-effort remote cancellation. Defaulting to `Ok` is right because most
+    /// long-poll APIs cannot be cancelled, and a caller must never be blocked by
+    /// that.
+    async fn cancel_deferred(
+        &self,
+        _model: &Model,
+        _handle: &DeferredHandle,
+    ) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

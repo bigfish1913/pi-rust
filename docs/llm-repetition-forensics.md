@@ -1311,35 +1311,562 @@ assistant 步定稿时刻**。原因：
 状态机 / `settleOperation`，属于架构重写）与 `WriteDeferred` 在消息路径上的使用
 （目前只用于 compaction；消息走的是 `step_attempt` + 预留 id，而非 `write_deferred`）。
 
-### 11.8 验收标准（无论选哪条）
+> **§11.7.8 修正了这段结论里的一处措辞错误**，请以 §11.7.8 为准。
 
-括号里是 §11.7.1 实现后的状态。
+### 11.7.8 `ToolReplay`：修正反转的默认值，并让它真的被消费
 
-1. 在 run 进行中 kill -9，重新进入后能看到**崩溃前已提交的内容**（哪怕只到最近一轮）
-   —— **已满足**（端到端恢复测试）；
-2. 崩溃会话**不再留下未关闭的 operation**（或恢复时自动结清）—— **已满足**
-   （`finish_interrupted_operation`，测试里显式断言 open operations 归零）；
-3. 正常 / 中止 / 重试成功三种路径下，会话里**不出现重复条目**
-   （现有测试 `m5c_jsonl_atomic_publish`、`harness_run_e2e` 的条目链断言必须继续通过）
-   —— **已满足**。这条在实现中真起了作用：帧一度被写成 custom entry，
-   正是这两条条目数断言把它拦下来的（详见 §11.7.1）；
-4. 重试成功后的历史里**不出现非法输入**（`stop_reason: Error` 的 assistant 消息不得被当成正常上下文回传）
-   —— **已满足**：失败/被打断的 run 会留下 interrupted assistant 消息，
-   而 `salvage_run_messages` 会给它每个未落盘的 tool call 补一条合成 error tool result，
-   所以历史对 provider 始终合法（§11.7.2 修掉了这条最初不成立的问题）。
-   但「重试从落盘 tip 重建上下文」那一步仍未做 —— 重试语义本身没改；
-5. 有一条真实 kill 进程的集成测试，而不是只测 `persist_new_messages` 被调用
-   —— **已满足**：`a_crashed_run_can_be_salvaged_from_its_committed_frames` 在流的中途
-   `abort` 掉 run task，落盘的是真实的中间前缀。
+复查时发现两个问题，都是真 bug：
 
-### 11.9 一句话总结
+**（1）默认值是反的。** 原生：
 
-rpi 的记录类型和恢复**读取**侧基本齐了（`StepAttempt` / `ToolStarted` / `WriteDeferred` 都有定义，
-reducer 也能读，甚至能识别 `DanglingToolFrame`），但 **run 路径从不写这些记录**，
-产物只在 `:2179` 一次性落盘。原生 pi 则每帧 `appendList` 提交、崩溃后按帧前缀重建并标注
-`recovery: true`。所以差距不是「flush 得不够勤」，而是**run 的写侧进度持久化整体缺失**。
+```ts
+// packages/agent/src/types.ts
+tool.replay ?? "never"            // 默认 never
+// harness/pico3/types.ts
+readonly replay?: "safe" | "unsafe"; // default unsafe
+```
 
-现在**帧这一半已经补上了**（§11.7.1）：assistant 消息的每一帧都即时落成记录，
-崩溃后重开会话能拿回已提交前缀，并标成 interrupted。剩下的差距在
-`StepAttempt` / `ToolStarted` / `WriteDeferred` 的写侧与 `RecoveryDecision::Resume` ——
-即「崩在工具执行中间」还恢复不了。
+rpi：
+
+```rust
+pub enum ToolReplay {
+    Never,
+    #[default]
+    Safe,        // ← 反了
+}
+```
+
+因为 `HarnessTool::new` 用的是 `ToolReplay::default()`，所以**所有没显式声明的工具都是
+`Safe`**；而 `pi-cli` 又用 `.map(|(_, t)| t.with_replay(ToolReplay::Safe))` 把**每一个**
+内置工具（含 `bash`/`edit`/`write`）都标成了 `Safe`。
+今天无害（没人读它），但一旦恢复开始按它重跑，副作用会被重复施加。
+
+**修法**：`#[default]` 移到 `Never`；`pi-cli` 改成显式策略——只有 `read` 与 `docs`
+这两个真正无副作用的工具是 `Safe`，其余保持 `Never`（扩展工具也默认 `Never`，
+因为扩展工具的 `read` 不一定只读）。新增测试 `only_read_only_tools_are_replayable` 钉住这个名单。
+
+**（2）没有任何决策方消费它。** 全仓搜 `.replay` 只有「设置」和「映射进记录」。
+
+**实现（原生 `drive/tools.ts::recoverToolInvocation` 的移植）**：
+
+```ts
+if (!cancelled && call.replay === "safe" && tool?.replay === "safe") {
+    const args = await clearReplayCheckpoint(...);   // 取回原始 args
+    return performToolInvocation(..., cleared, ..., true);
+}
+const checkpoint = await readCheckpoint(...);
+return publishToolOutcome(..., interruptedOutcome(toolCall, checkpoint), true);
+```
+
+rpi 侧新增 `AgentHarness::resolve_interrupted_run` / `resolve_tool_call`：
+每个未落盘的 tool call ——
+
+- **双重确认**同时成立（`tool_started.replay == Safe` **且**当前工具声明 == Safe）
+  → 用**记录里的 `effective_args`**（内存里那份已随进程死亡）重新执行，真实结果落盘，
+  并在结果末尾附上 `[recovered]` 标记（原生也是在内容**之后**追加标记）；
+- 否则 → 保持原行为，写合成 error result（"outcome is unknown"）。
+
+为了做这个，`ToolFrame` 增加了两个字段（`effective_args` / `replay`）——
+recovery 需要的这两样只在 `tool_started` 记录里，帧里没有。
+
+**双重确认为何必须两边都要**（新增测试覆盖的方向）：
+
+- 只看记录 → 会把调用重跑进一个**已经被改成不安全**的工具；
+- 只看声明 → 会把声明之前发出的调用当成 safe 重跑。
+
+`a_recorded_safe_call_is_not_replayed_into_a_now_unsafe_tool` 钉住了第一种：
+记录是 `Safe`、恢复时工具是 `Never` ⇒ 工具调用次数必须仍是 **1**。
+
+**这一步的收益**：以前崩在工具执行中，**每个**工具都变"结果未知"，模型丢掉真实输入，
+用户要重新提。现在只读工具直接重跑，真实结果落盘，对话保持可用；
+只有**真正不确定的副作用**才标 "unknown"。
+
+**这一步没做到什么**（重要）：**run 仍然不会继续跑**。
+rpi 的 run 是直线函数，状态在栈帧里，崩溃后没有可重入的落点
+（原生 `driveOperation` 从 `state.at` 重入）。变的是「留下的转录完整且正确」，
+不是「带着状态继续执行」。要后者仍需 §11.7.6 / §11.7.4 说的可重入状态机。
+
+### 11.7.9 三处需要更正的说法
+
+复查时把整个 `.reference/pi` 搜了一遗，必须更正之前文档里不准的表述：
+
+1. **`step_attempt` / `write_deferred` / `danglingWrite` 在原生里根本不存在。**
+   它们不是原生特性，是 rpi 自己那套「持久化意图记录」的设计。有真实用途
+   （让 `recover_lane` 能指名哪个工具结果未知），但不是 parity 缺口。
+2. **原生没有 `RecoveryDecision` 这个类型，也没有 `Resume` 变体。**
+   它的恢复不是「决策」，是可重入状态机（`driveOperation` + `OperationState`）。
+   所以「加一个 `RecoveryDecision::Resume`」这个说法本身就是误导。
+3. **「消息路径应该用 `write_deferred`」是错的。** `write_deferred` 的语义是
+   「内容已确定、只差提交」，reducer 会用 `validate_exact_provisioned_entry` 把最终 entry
+   与 target **深度比对**；assistant 消息的内容在流式结束前根本不存在，硬填只会判损坏。
+   原生对应的做法就是**纯 id 预留**（状态叶里的 `responseEntryId`）——
+   也就是 rpi 现在用 `step_attempt` + 预留 id 做的事。**这条不是欠账，反而已经比原方案更接近原生。**
+
+
+### 11.7.10 启动时自动续跑（对齐原生的 resume）
+
+R1 把转录修对了，但 run 仍然结束。这一步补上「**继续跑**」。
+
+#### 为什么不能靠加一个枚举
+
+原生的 resume 是架构：`driveOperation`（`runtime/drive.ts:33`）是一个
+**按 `state.at` 分派的循环**，状态从 lane 里读、不在栈帧里，所以重启后能从同一状态继续。
+
+```ts
+export async function driveOperation(lane, drive) {
+	for (;;) {
+		const state = operation.state;        // ← 从 lane 读，不是局部变量
+		switch (state.at) { case "tools": result = await runTools(...); ... }
+	}
+}
+```
+
+rpi 的 `run_core` 是直线 `async fn`，状态全在栈帧；而 `run_agent_loop`
+（`pi-agent/src/agent_loop.rs:72`）**一次调用就拥有整个多轮循环**，
+所以崩溃后手上只有「日志里有什么」，没有「跑到哪一步」。
+
+#### 用「空 prompt 的 run」实现同样效果
+
+关键观察：`run_core` 本来就是以 `run_agent_loop(Vec::new(), context, ...)` 驱动的，
+prompt 是单独落盘的。所以**一次没有新 prompt 的 run，就是「接着上次继续」** ——
+分支已经以 tool 结果结尾，循环的下一件事正好就是被打断的那个 provider 调用。
+
+新增：
+
+- `PendingResume { interrupted_run_id, chain_origin_run_id, attempt }`。
+- `create`（`allow_existing_session`）：先记下未关闭的 operation，
+  跑 `finish_interrupted_operation` 修复，然后用 `lane_is_resumable` 判断
+  分支是否处在可续跑状态（**末尾是 tool result**；带 `terminate` 的 tool 自己就是终点，排除）。
+- `resume_pending()`：发一条 `runResume` custom notice（说清楚为什么自己跑起来了），
+  然后 `run_core(Vec::new())`。
+- `AgentLane` trait 加 `has_pending_resume()` / `resume_pending()`（2 个实现，同一文件）。
+- **TUI 侧**：在「跑初始 prompt」之前调用，仅当命令行没给 prompt（`-p` 意味着用户
+  已经说了下一步想干什么）。放在 TUI 而不是 harness 里，是因为 run 的输出去向必须
+  和普通 run 走同一条 streaming/render 路径，且启动不能被一个用户看不见的 run 阻塞。
+
+#### 崩溃循环的护栏（这一条是我加的，不是原生的）
+
+一个确定性崩溃的 run 会在每次启动时被重新驱动 —— 花 token、重复副作用，
+而用户只看到一次崩溃。所以续跑有预算上限 `MAX_RESUME_ATTEMPTS = 3`，
+并用 **`OperationIntent::Run.resume_data`** 持久化（这个字段之前是纯占位，从没人写过）：
+
+```json
+{ "resumedFrom": "<chain 起始 run id>", "resumeAttempt": 2 }
+```
+
+链的**起点**一路传递（不在每步改指前一个 run），这样次数是「这条链」的属性，
+而 `resume_chain()` 只需读一个 run 自己的 intent 就能算出下次是第几次 ——
+不需要跨记录求 max。预算用尽时不再续跑，而是在转录里说明原因。
+
+#### 验证
+
+- `an_interrupted_run_is_continued_without_a_new_prompt`：崩在工具执行中 → 重开会话
+  → 断言有 pending resume → `resume_pending()` 产出了下一个 assistant 轮次（
+  无需新 prompt）→ 转录里有 `runResume` notice → 且不会重复提供。
+- `a_run_that_keeps_dying_is_not_resumed_forever`：手工构造一条已耗进 3 次续跑的链
+  （storage 限制每 lane 只能有一个 open operation，所以早期的都要先结清），
+  断言 `pending_resume()` 为 `None` 且 `resume_pending()` 不做事。
+
+#### 仍然不是完整的状态机
+
+这一步做到的是「**从分支继续下一轮 provider 调用**」，
+不是原生那种「恢复到精确状态」（例如崩在 `deferred.suspended` 里能接着轮询）。
+真正的可重入状态机仍需拆开 `run_agent_loop`（turn 边界必须变成持久状态）。
+但对于**绝大多数崩溃**（工具执行中，长任务的主要时间就在那里），行为已经与原生一致：
+用户不用重新描述需求，run 自己跑完。
+
+### 11.7.11 续跑决策矩阵（何时 *不* 该续跑）
+
+实现续跑时最容易做错的是「什么时候不该续」。矩阵已用测试钉住：
+
+| 崩在哪 / 状态 | 分支末尾 | 是否续跑 | 为什么 |
+|---|---|---|---|
+| provider 流式中（还没 tool call） | interrupted **assistant** 消息 | **否** | 续跑会把「以 assistant 结尾」的请求交给 provider，Anthropic 直接拒。`pi-agent` 自己的 `run_agent_loop_continue` 就为此报错（`agent_loop.rs`：「cannot continue from message role: assistant」）。原生也如此：出错的 assistant 响应是**终结**该轮，不是再要一轮。 |
+| 工具执行中 | tool result | **是** | 分支正好停在「下一步就是给 provider 要下一个 assistant」的位置。 |
+| 工具跑完、下一次 provider 调用前 | tool result | **是** | 同上。 |
+| run 正常完成 | assistant 消息 | 否 | 没东西可续。 |
+| **用户主动 abort** | —— | **否** | 这是构造上保证的：续跑要求存在 **open operation**，而 abort 会把它关闭。否则 agent 会自动重启用户刻意停下的活。 |
+| 已续跑 3 次 | —— | 否 | 预算用尽（§11.7.10）。 |
+
+三条测试：`a_crash_mid_stream_is_not_auto_resumed`、
+`an_explicitly_aborted_run_is_not_resumed`、`a_completed_run_is_not_resumed`。
+
+### 11.7.12 两处需要更正的说法（第三轮复查）
+
+1. **「崩在 `deferred.suspended` 里不能接着轮询」是错的说法。**
+   rpi 的 `resume_deferred` 直接返回 `HarnessError::not_implemented`
+   （`agent_harness.rs:1281`）——当时 rpi **根本没有 deferred operation 这个功能**。
+   所以那不是「恢复路径缺失」，而是「功能本身不存在」；恢复不会丢一个从未实现的特性。
+   （**这条现在已经过时了**：deferred 已实现，见 §11.7.18 —— 保留是因为它当时的推理是对的。）
+2. **崩在流式中不续跑不是漏洞，是正确行为**（见 §11.7.11）。
+   我一度以为 `lane_is_resumable` 只接受 tool result 是个漏洞，读完 `run_agent_loop_continue`
+   的前置校验后才确认：在那里续跑会构造出非法请求。
+
+### 11.7.13 steering / follow-up 队列的持久化（已实现）
+
+这是同一个形状的缺口（记录类型存在 + 读侧存在 + **写侧从不写**）：
+
+- `QueueEnqueuedRecord` / `QueueCancelledRecord` 有完整定义（`session/types.rs:874`），
+  reducer 也有校验；
+- 之前全仓搜 `QueueEnqueued(` 只命中 `memory.rs` 的 stamping 和**测试构造**；
+- `steering_queue` / `follow_up_queue` 是 `HarnessInner` 里的
+  `Arc<Mutex<MessageQueue>>`，纯内存。
+
+**后果**：agent 干活时你敲进去的 steer 消息（以及 follow-up / nextRun），
+一崩就丢。原生对应的是 lane 级持久 inbox（`LaneState.inbox`）。
+
+#### 设计：用「消费时就写 cancel」代替「让预留 id 落地」
+
+两种可选做法：
+
+- **A（未采用）**：消费时用**预留 id** 把消息落盘，重建规则为「enqueue 的 entry 未落地」。
+  难点：steering/follow-up 是在 `pi-agent` 的循环**内部**被抽走的
+  （`get_steering_messages` 回调），此时消息已经进了 `new_messages`，
+  最终由 `persist_new_messages` **新铸 id** 落盘 ——
+  预留 id 永远不落地，重建时会把**已消费**的消息复活成幽灵重复消息。
+  要修就得把「已持久化下标」的关联穿过循环传出去，很难且易错。
+- **B（采用）**：抽走时就写一条 `QueueCancelled`（消费即取消）。
+  重建规则变成简单的「enqueue 无后继 cancel」：
+  已消费的被 cancel 排除，未消费的保留。预留 id 从不需要落地。
+
+B 的关键约束：cancel **必须在消息成为 entry 之前**写 ——
+reducer 的校验是 `!entry_exists`（被取消的目标 entry 不能已存在）。
+因为在 B 里消息始终用新 id 落盘，预留 id 永远不存在，所以这个条件始终成立。
+
+代价（已记录）：抽走后到消息真正落盘之间有一个窗口（对 steer/follow-up 而言
+是「抽走 → run 结束」，可能很长），在这个窗口崩溃会丢这条消息。
+但这与改动前的行为**相同**（改动前整个队列都丢），而赢下的是
+**未消费队列的持久化** —— 那才是「agent 干活时你敲的话」的大头。
+
+#### 实现
+
+1. **写侧**：`enqueue_message`（`steer`/`follow_up`/`next_run` 共用的唯一路径，
+   顺带消除了原先三份重复的方法体）在入内存队列后写 `QueueEnqueued`，
+   `target` 用 `provisioned_target()` 构造 —— 和 reducer 比较用的是**同一个函数**。
+   `run_id` 与条目一起记录，因为 cancel 必须带上它。
+2. **消费**：`drain_for_lane` 不再丢掉 `QueuedMessage.entry_id`（这是关键），
+   `drain_queue` / `drain_shared_queue` 在抽走每条时写 `QueueCancelled`；
+   `clear_queue`（把队列退回编辑器）同样算取消。
+   用户主动 `cancel_queued` 也会写 —— 而且带的是**从 enqueue 记录里查出来的** run_id：
+   reducer 用 run_id 配对，而「run 中入队、run 结束后取消」在两边不一致时会被判日志损坏。
+   只有在 enqueue 记录存在时才写 cancel，否则就撞上「cancellation 没有匹配的 enqueue」那条损坏检查。
+3. **重建**：`create` 调 `rebuild_queues`，按记录顺序把「无 cancel 的 enqueue」
+   还原成 `QueuedMessage` 并推回对应对列；
+   消息从记录的 `target` 反序列化（补回 seq/parentId/timestamp 占位再走 `Entry` 的反序列化）。
+
+#### 验证
+
+- `a_steer_message_survives_a_restart`：跑一个长流，等它**开始流式输出**后 steer
+  （必须等 —— 循环开头就会抽一次 steering，早于那一刻发的消息会被 run 自己消费掉，
+  这是正确行为但不是这个测试要测的），
+  断言 enqueue 已落盘 → 杀进程 → 重开 → 消息**仍然在队列里**，
+  并且能用**原 id** 取消。
+- `a_cancelled_queued_message_does_not_come_back`：取消后重启，不得复活。
+- `queue_records_validate_against_the_reducer`：整份 record log 过 `validate_record_log`
+  —— 包括「cancel 的 run_id 必须与 enqueue 相同」这条容易踩的校验。
+
+### 11.7.14 多轮 run 的崩溃：一个被单轮测试掩盖的真 bug
+
+前面的恢复测试全部基于**单轮** run（assistant → tools → assistant）。
+补上多轮（assistant → tools → assistant → tools → assistant）后发现两个串在一起的 bug，
+两个都是 commit-on-settle（§11.7.7）引入的，且都被单轮测试掩盖：
+
+**bug 1：打捞会把已提交的流重放一遍，造出重复的 assistant 消息。**
+
+commit-on-settle 在每条 assistant 消息定稿时就把它提交为 entry，但
+`ClearRun`（退掉整轮帧）只在整个 run 结束时才写。所以在**第二轮工具执行中**崩溃时：
+
+- assistant#1 已是 entry（真实条目）、assistant#2 已是 entry；
+- 而帧记录里 **两路流都还在**（stream 0 与 stream 1）；
+- 打捞于是把 **两路都重放**，把 assistant#1 又当成 interrupted 消息追加一遍。
+
+实测：3 个 assistant 消息的 run 崩在第二轮后，分支上出现 **4** 条 assistant 消息。
+
+修法：新增 `AssistantFrameOp::ClearStream` —— 提交一条 assistant 消息时
+**同时退掉它自己那一路流**。打捞时跳过已退掉的流。
+流序号靠事件顺序对应：第 n 条定稿的 assistant 消息就是记录器的第 n 路流
+（只有 assistant 消息会开流，两者都在同一事件序上分配）。
+
+**bug 2：修 bug 1 把工具解析也一起跳过了。**
+
+原来未落盘的 tool call 是从**打捞出来的 partial**里取的。一旦跳过已提交的流，
+那条流里的 tool call 就再也不会被解析 —— 于是分支上留下一个
+「assistant 带 tool call、但没有任何 result」的消息，**下一个请求依然是非法**。
+实测：期望 2 条 tool result，只得到 1 条。
+
+修法：**工具解析不再依赖「哪一路被打了捞」**，分两个来源合并（按 `tool_call_id` 去重）：
+
+1. 未提交流的 partial（同上）；
+2. **分支末尾的 assistant 消息** —— 它是一个已提交、但工具还没跑完的消息。
+   这一条还顺带盖住了另一个极小窗口：消息已提交、但 `tool_started` 还没写
+   （两个事件之间崩溃）—— 那种情况从记录里根本查不到。
+
+在末尾追加结果是**顺序正确**的：循环会先跑完整批工具才会产生下一条 assistant 消息，
+所以可能存在未完成工具调用的只可能是**最后那条** assistant。
+
+#### 验证
+
+- `a_multi_turn_run_resumes_after_a_crash_in_a_later_tool_call`：
+  脚本两个 tool call（第三个是文本）；测试工具在第 **2** 次调用时挂住（`hang_at = 2`），
+  所以第一轮真实完成、第二轮死掉。断言：崩溃后分支上**恰好 2 条** assistant、
+  **恰好 2 条** tool result（第二条是「结果未知」）、能从 tool result 继续跑完、
+  且整份日志仍然合法。
+- `a_multi_turn_run_leaves_a_valid_record_log`：不崩溃的多轮 run，
+  断两个 `step_attempt` 的 attempt 都是 **1** —— 这看上去像违规，其实是正确的：
+  reducer 的「连续 attempt」规则只适用于**结果尚未落盘**的活系列，
+  已落盘的结果**终结**该系列（详见测试注释）。
+
+### 11.7.15 崩在重试退避中：已实现（用一条自己的记录绕开 reducer 的序列规则）
+
+这是最后一个“崩溃导致 run 结束”的情形。一次 attempt 以可重试的 provider 错误失败后，
+harness 在 sleep 等重试，而这个窗口里**什么都没落盘**（失败 attempt 的消息刻意不提交），
+所以重启后分支末尾还是用户的 prompt。它本来是**要重试**的。
+
+#### 第一次尝试失败的原因（值得记下来）
+
+我原本想用帧判定“这是在等重试”，**做不到**，而且原因很具体：
+
+- 帧记录里**没有“终止帧”**；失败 attempt 归约出的消息 `stop_reason` 是 `Pending`
+  （`reduce_frames` 开头就设 Pending，之后没有帧去改它）；
+- 所以“这是一次可重试失败”**无法从帧里读回来**；
+- 失败 attempt **没有其他任何痕迹**：`step_attempt` 只在提交时写。
+
+**我接着又踩了同一个坑一次**：修的时候我先写了
+“按 partial 判断 `stop_reason == Error && is_retryable` 就跳过打捞”，
+而那个条件**永远为假**（同一个 Pending 原因）—— 测试直接把它抓出来了
+（分支上多出一条 interrupted 消息）。最终改成**run 级判断**：既然
+`retry_pending` 已经说明“这条 run 在等重试”，那么它未提交的流就都是这条重试链的失败尝试，
+不需要（也无法）逐个辨认。
+
+#### 为什么不用 `step_attempt`（这是关键设计决定）
+
+看起来最自然的是复用 `step_attempt` 的 `attempt` 字段。但 reducer 的
+`validate_attempt_sequence` 把 `attempt` 当作**序列内序号**，而“已落盘的结果会终结序列”
+（§11.7.14：多轮 run 的两条 assistant 消息是两个独立系列，各自 attempt 1）。
+于是多轮 run 里“重试第 ≥2 次”的那个 attempt 的第二条 assistant 无法取号 ——
+写 2 会被期待 1 → **判日志损坏**。
+
+所以新增了 `LaneRecord::RetryPending`（`RetryPendingRecord { run_id, attempt, result_entry_id }`）：
+
+- 在**退避 sleep 之前**写，所以等待期间崩溃能被识别；
+- `result_entry_id` 是**为该 attempt 预留的 assistant entry id**：
+  它一旦落地就说明重试成功了，没有待续之事 —— 这就是“跳过打捞”与“提供续跑”
+  两个判断共用的同一个依据；
+- reducer 侧是**无校验接受**（和 `AssistantFrame` 一样：它引用任何 entry、
+  不施加树不变量），所以**完全不动 attempt 序列规则**。
+
+新增记录类型要同步的地方（和 §11.7.1 加帧记录时一样四处）：
+`types.rs` 的变体 + `base()`/`record_type()`/`run_id()`、`memory.rs` 的 stamping、
+`reducer.rs` 的接受、`jsonl/codec.rs` 的 `RECORD_TYPES` 白名单。
+
+#### 另外修正的一处判断
+
+`resume_pending()` 原来复用了 `lane_is_resumable()`（要求分支末尾是 tool result）。
+这对“等待重试”的情形是错的（此时末尾是用户 prompt），会把刚记录好的续跑机会丢掉。
+改成检查**真正的那条约束**：**分支末尾不能是 assistant 消息**
+（provider 会拒，`run_agent_loop_continue` 也正因此报错）。
+“是否**提供**续跑”仍由 `create` 决定，这里只是最后一道防线。
+
+#### 验证
+
+- `a_crash_during_retry_backoff_still_retries`：退避 30s 给足窗口 →
+  等 `retry_pending` 落盘 → kill → 重开 → 断言：**没有** interrupted 消息、
+  有 pending resume、续跑后拿到成功那次 attempt 的输出。
+- `a_successful_retry_leaves_nothing_pending`：
+  重试在**同一进程内**成功时，`retry_pending` 记录仍在日志里，
+  唯一阻止它再次触发的是**预留 entry 已落地** —— 这条测试专门钉住这一点。
+
+### 11.7.16 注入的 steer 消息：改为在它自己定稿时落盘
+
+§11.7.13 里我给队列持久化记了一个「代价」：抽走（=取消）之后到消息真正落盘之间有个窗口，
+在那里崩溃会丢掉这条消息 —— 当时判断「与改动前相同，可接受」。做完 §11.7.15 后回头看，
+这个代价其实**可以直接消掉**，而且它丢的是用户**亲手敲进去的那句话**：
+
+- 注入的消息是循环**内部**唯一的 user 消息（`run_core` 用空 prompt 驱动，
+  调用方的 prompt 由自己落盘）；
+- 而 user 消息**不在** commit-on-settle 的范围内（那时只提交带 tool call 的 assistant
+  与 tool result），所以它一直要等到 **run 结束**才落盘；
+- 但队列项在抽走时就已经被 cancel —— 于是「模型已经看到、转录里却没有、队列里也没了」：
+  不可恢复。
+
+**修法**：让注入的消息也走 settle 提交。`SettleState` 增加
+`injected: VecDeque<(entry_id, message)>`：
+
+- `drain_injected`（两个注入回调走的路）在抽走每条时把 `(预留 id, 消息)` 登记进 settle 观察者；
+- `MessageEnd{User}` 时从队首取出一条，**比较内容一致**后用那个预留 id 提交，
+  并把下标记进 `committed`（run 末尾的 `persist_new_messages` 于是跳过它，不重复）；
+- 内容比较是刻意的保守做法：万一两者不一致（未来循环改写消息），
+  宁可不提交，也不要往那个 id 里写错文本。
+
+这需要把 `settle_state` 的创建**提到 `config` 构建之前**（两个注入回调要能捕获它）。
+
+**验证**：`an_injected_steering_message_survives_a_crash` ——
+steer 在 run 开始**之前**入队（于是它会在循环第一个边界被稳定抽走并注入），
+然后 run 死在**第二次**工具调用里（脚本 tool_call → tool_call → text，工具第 2 次调用挂住），
+即远早于 run 结束。断言：注入的文本**在 run 还在跑的时候**就已经是 entry
+（证明它来自 settle 提交，而不是不可达的 run 末尾）；崩溃重开后它**仍然在**。
+
+这条测试我用「临时把新提交路径改成直接 `return`」验证过**不是空跑** —— 会失败。
+
+### 11.7.17 R2 判定：逐 state 对照原生「结果」，结论是不需要状态机
+
+我前几轮一直把 R2（移植原生那套可重入的 13 状态机）当作「剩下的架构工作」。
+在补完前面那些之后，我把它逐 state 对了一遍 —— **对照的是每个状态的「结果」，
+不是实现方式**。结论是：在 rpi 已建模的每个状态上，结果都已经一致。
+
+| 原生 `state.at` | 崩在这里时 rpi 的结果 | 测试 |
+|---|---|---|
+| `starting` | 操作已开、prompt 已落盘、还没请求 → 重启**续跑**（§11.7.17 新增） | `a_crash_before_the_first_request_still_continues` |
+| `checkpoint` | 无显式对应状态；「下一步要做什么」由**分支末尾**决定（tool result / user message） → 恢复后重新走到同一决策 | 同上 / `a_multi_turn_run_resumes_...` |
+| `assistant.ready` | 同上（还没产生任何东西，末尾未变） | `a_multi_turn_run_resumes_...` |
+| `assistant.effect_pending` | 已提交前缀打捞成 interrupted 消息，run 结束 | `a_crashed_run_can_be_salvaged_...`、`a_crash_mid_stream_is_not_auto_resumed` |
+| `assistant.retry_wait` | `retry_pending` 记录 → 重启**重试** | `a_crash_during_retry_backoff_still_retries` |
+| `tools` | `tool_started` + 双重确认重放或标「未知」 → **续跑** | `crashing_during_a_tool_call_...`、两条 replay 测试、`a_partially_completed_tool_batch_...` |
+| `deferred.suspended` / `deferred.effect_pending` | 已接通（§11.7.18）：轮询 → 落盘 → 仍 Deferred 则继续挂起，否则结清并从 assistant 进入循环（先跑工具） | `a_deferred_response_suspends_and_then_resumes_through_its_tools`、`a_still_deferred_poll_keeps_the_run_parked` |
+| `summary.deciding` / `summary.ready` | 压缩决策在下次 run **重评估**（重评估即幂等） | `a_crash_during_compaction_leaves_a_usable_session` |
+| `summary.effect_pending` | 同上；且 `write_deferred` 已写，提交与否都能正确分类 | 同上 + `compaction_intent_records_validate_...` |
+| `summary.retry_wait` | 压缩调用有自己的 retry 策略；崩了则整个压缩重评估重做 —— 结果同为「压缩最终完成」 | 同上 |
+| `navigation.ready_to_commit` | 导航是用户动作；崩在提交前则未生效，用户重做一次（**唯一一处结果略有差异**，见下） | —— |
+
+**所以 R2 的价值不是「多一层保证」，而是原生**实现**这些保证的方式。** 原生的可重入状态机与
+rpi 的「从分支推导状态 + 把进度写进记录流」在已建模的状态上给出**相同的可观察结果**。
+差别只在实现：原生存「我在哪一步」，rpi 存「已经产出什么」并从它推出「下一步」。
+
+因此**不做那个重写**：它会动 `run_agent_loop`（拆出持久 turn 边界）、
+`persist_new_messages`、压缩 cut 逻辑与一批断言当前语义的测试，而换不来行为差异。
+`§11.7.4/§11.7.6` 当初把 R2 列为剩余工作，是因为当时还不知道「分支＋记录」能否覆盖全部状态 ——
+现在可以了，这一节就是那个证据。
+
+两处**确实**的差异，都不值得为它们重写：
+
+1. **`navigation.ready_to_commit`**：崩在导航提交前，rpi 不会自动补提交（用户重做 `/tree`）。
+   但导航是**用户当场发起的动作**，在用户不在时替他把分支移走，弊大于利。
+2. **`deferred.*`**：见 §11.7.18 —— 那是**功能未实现**，不是恢复缺口。
+
+### 11.7.18 deferred operation：已实现（缺的那三件都补上了）
+
+我一开始以为这是从零开始的大特性。读代码后发现 **suspend 管道已经现成大半**，
+只缺最后一环 —— 这也是为什么它值得做：不是造新机制，而是接通已有机制。
+
+**原本就有的**（逐条核过）：`StopReason::Deferred`、`AssistantMessage.deferred`、
+`DeferredHandle`；`derive_outcome` 把 Deferred+handle 映射成 `HarnessRunOutcome::Suspended`
+（缺 handle 时给 `deferred_no_handle` 失败）；run 尾部对 `Suspended` 跳过
+`operation_finished`/`run_end`（操作保持打开）；`find_deferred_handle(suspended_id)`
+从分支取回 handle；`drive(operation_id)` 与 `resume(suspended_id)` 两个入口。
+
+**补上的三件**：
+
+1. **provider 能力**（`pi-ai/src/provider.rs`）：新增 `DeferredProvider` trait
+   （`stream_deferred` + 默认 `cancel_deferred`），并在 `Provider` 上加**带默认实现**的
+   `fn deferred(&self) -> Option<&dyn DeferredProvider> { None }`。
+   这样另外 **10 个** `Provider` 实现一行都不用改 —— 与 `ProviderHooks` 那段注释的顾虑同源，
+   默认实现把顾虑消掉了。faux 实现它（脚本化的 poll 队列），于是特性可以端到端测。
+2. **`pi-agent` 的「从末尾 assistant 开始」入口**（关键的一件）：
+   `run_agent_loop_from_assistant`。`run_loop` 增加一个可选的
+   `pending_assistant`：设了它，第一轮就**执行这条消息的工具**而不是去请求 provider，
+   并且**不**把它再 push 进 `new_messages`（它已经是转录的一部分）。
+   之所以必须有它：轮询拿回的 assistant 消息的工具**从未跑过**，
+   而带着「没有结果的 tool call」去请求会被任何 provider 拒绝 ——
+   用现成的「空 prompt 继续」会让 provider 再答一次，那是**非法请求**。
+3. **`resume_deferred`**（harness）：取回 provider 能力 → 用快照里的超时/thinking
+   构造 `SimpleStreamOptions` → 轮询 → **把轮询结果落盘**（它既是真实历史，
+   也是新 handle 的发现来源）→ 若仍是 `Deferred` 则**继续挂起**（操作保持打开），
+   否则结清被挂起的操作并继续：**若该消息带 tool call，就从它进入循环**（第 2 件）。
+
+**一个刻意的安全选择**：从 assistant 进入的那次循环**只做一次尝试，不重试**。
+因为它的第一个动作就是执行那条消息的工具，而重试会把工具**再跑一遍**。
+失败就直接上报，不重试。这是我在接线时发现的真实危险（不是理论）。
+
+**provider 缺失时如实报错**：没有 long-poll 能力的 provider 返回
+`not_implemented`，而不是假装 run 完成 —— 后者会记录一个没人产生过的结果。
+
+#### 验证（3 条）
+
+- `a_deferred_response_suspends_and_then_resumes_through_its_tools`：
+  挂起一条带 handle 的 assistant 消息 → `resume` → 轮询返回一条**带 tool call** 的消息
+  → 断言 run 完成、且那个 tool call **真的被执行了**（分支上有它的结果，
+  不是「未知」占位）。这是第 2 件存在的理由。
+- `a_still_deferred_poll_keeps_the_run_parked`：轮询返回**新 handle** →
+  断言仍是 `Suspended` 且带上了新 handle，并且新 handle 可被 `drive` 继续轮询。
+- `resuming_through_a_provider_without_the_capability_is_an_error`：
+  handle 指向未注册的 provider → 断言报错而不是假完成。
+
+**仍未做的**：`pi-ai` 里**没有任何真实 provider 实现** long-poll deferred API，
+所以这条链目前只由 faux 驱动。接一个真实 provider（如某个 batch/long-poll 接口）
+是它各自的小活，不再是机制问题。
+
+### 11.8 验收标准
+### 11.8 验收标准
+### 11.8 验收标准
+
+
+§4.6 最初提的五条，逐条对照现在的测试（每条都有测试，无一条是推定）：
+
+1. **在 run 进行中 kill -9，重新进入后能看到崩溃前已提交的内容**
+   —— 满足。`a_crashed_run_can_be_salvaged_from_its_committed_frames`（内存）与
+   `frames_survive_a_reload_from_disk` / `reloaded_frames_reduce_to_an_interrupted_message`
+   （JSONL 真实落盘往返）；`reopening_a_crashed_session_restores_the_committed_prefix`
+   走的是真实恢复入口。
+2. **崩溃会话不再留下未关闭的 operation** —— 满足。
+   `reopening_a_crashed_session_restores_the_committed_prefix` 与
+   `a_crash_during_compaction_leaves_a_usable_session` 都显式断言 open operations 归零。
+3. **正常 / 中止 / 重试成功三种路径下不出现重复条目** —— 满足。
+   `run_with_no_tool_calls_completes_in_single_turn`、
+   `full_run_with_write_tool_call_completes_and_persists`（条目链断言）、
+   `a_retried_attempt_is_not_committed`、
+   `recovering_the_same_crashed_session_twice_does_not_duplicate`。
+   这条在实现中真起了作用：帧一度被写成 custom entry，正是这两条条目数断言把它拦下的（§11.7.1）。
+4. **历史里不出现非法输入**（不能把非法/半成品消息当正常上下文回传）—— 满足。
+   两个面：被打断的 assistant 消息会配齐合成 error tool result
+   （`crashing_during_a_tool_call_leaves_a_valid_transcript`）；
+   而「以 assistant 结尾」的情形干脆**不续跑**（`a_crash_mid_stream_is_not_auto_resumed`）。
+   另有 `a_real_run_leaves_a_valid_record_log` 拿整份日志过 `validate_record_log`。
+   （重试语义本身未改：仍是重做整轮。）
+5. **有一条真实 kill 进程的集成测试** —— 满足，且不止一条：
+   那些 `abort()` 掉 run task 的测试落盘的都是真实的中间前缀；
+   另有 `a_replayable_tool_is_re_run_and_its_real_result_recovered` /
+   `an_unreplayable_tool_is_not_re_run` / `a_steer_message_survives_a_restart`
+   覆盖崩溃后的各种处置。
+
+### 11.9 最终小结
+
+这个缺口从头到尾只有一个根因：**rpi 的 run 写侧不持久化进度，而原生把「操作状态」
+本身当成持久对象**。修的过程是把这个根因拆成能分别验证的几层：
+
+| 层 | 做了什么 | 关键实现 |
+|---|---|---|
+| 进度落盘 | assistant 每帧即时写入记录流（不是 entry） | `frame_progress.rs` |
+| 崩溃打捞 | 重放已提交前缀；每个未落盘 tool call 补一个结果 | `resolve_interrupted_run` |
+| 写侧意图 | 消息定稿即提交（含**注入的 steer 消息**）+ `step_attempt`/`tool_started`；compaction 的 `write_deferred` | `settle.rs` |
+| 工具重放 | 双重确认后安全重跑，否则标「结果未知」 | `resolve_tool_call` |
+| 启动续跑 | 空 prompt 的 run = 继续；含 `starting`/工具中/等待重试三种入口 + 崩溃循环护栏 | `resume_pending` |
+| 重试意图 | 退避前写 `retry_pending`，重启改为**重试**而非打捞失败尝试 | `RetryPendingRecord` |
+| 队列持久化 | steering/follow-up/nextRun 不再只存内存 | `enqueue_message` / `rebuild_queues` |
+
+**覆盖的崩溃点**（每个都有测试）：流式中、工具执行中（单轮 / 多轮 / 并行批量）、
+工具跑完待下次调用、压缩中、重试退避中、队列有未消费消息、注入消息、
+以及**第一次 provider 调用之前**。
+
+三处我中途说错、后来自己推翻并更正的（都留在文档里，不抹掉）：
+
+1. `step_attempt` / `write_deferred` / `danglingWrite` **在原生里不存在** ——
+   它们是 rpi 自己的设计，不是 parity 缺口；
+2. 原生**没有** `RecoveryDecision::Resume`（它的恢复是可重入状态机）；
+3. 「消息路径应该用 `write_deferred`」是错的 —— 流式消息的内容无法提前钉死，
+   原生用的也是纯 id 预留。
+
+还有一处**同一个坑踩了两次**：我两次试图用「帧归约出的消息 `stop_reason`」判断
+「这是一次可重试失败」，而它在两种情况下都不成立（帧里没有终止帧，
+归约结果永远是 `Pending`；失败 attempt 也没有任何其他痕迹）。最终用一条
+自己的记录解决，见 §11.7.15。
+
+**不做的事**（§11.7.17 有逐 state 对照的证据）：
+
+- **可重入状态机（R2）不做。** 逐 state 对照原生后，rpi 在已建模的每个状态上
+  **可观察结果一致** —— 那两个机制（原生存「我在哪一步」、rpi 存「已产出什么」
+  并推出下一步）是同一组保证的两种实现。为此重写 `run_agent_loop` 与持久化主干
+  换不来行为差异。
+- **deferred operation 已实现**（§11.7.18）：补上了 provider 能力
+  （`DeferredProvider` + 默认的 `Provider::deferred()`）、`pi-agent` 的
+  `run_agent_loop_from_assistant` 入口、以及 `resume_deferred`。
+  仍未做的只是「哪个真实 provider 去实现 long-poll」——按 provider 各自的小活。

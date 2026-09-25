@@ -821,9 +821,43 @@ pub struct AssistantFrameRecord {
 pub enum AssistantFrameOp {
     /// One frame to append to the stream.
     Append,
+    /// Retire one stream: its message has been committed as an entry, so salvage
+    /// must not replay it.
+    ///
+    /// Needed *mid-run*, because commit-on-settle commits an assistant message as
+    /// soon as it settles and `ClearRun` only arrives when the whole run is done.
+    /// Without this, a crash in a later turn made salvage replay the earlier
+    /// turns too, duplicating them in the transcript.
+    ClearStream,
     /// Retire every frame of the run: the run's messages are now persisted, so
     /// the frames were only progress.
     ClearRun,
+}
+
+/// `RetryPendingRecord` — a retryable attempt failed and another is scheduled.
+///
+/// Exists because the frames cannot say *why* a stream ended: a failed attempt
+/// leaves `start`/content frames and no terminal frame, so `reduce_frames` yields
+/// `stop_reason: pending` and "this was a retryable failure" is unreadable from
+/// the frames. Nothing else about a failed attempt is persisted either (a
+/// `step_attempt` is only written when a message commits).
+///
+/// So the retry intent gets its own record rather than reusing `step_attempt`:
+/// that record's `attempt` field is validated as a *series* (a landed result ends
+/// the series, so a multi-turn run's messages are independent series each at
+/// attempt 1), which collides with numbering retry chains. A separate record
+/// leaves the reducer's attempt rule untouched.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetryPendingRecord {
+    #[serde(flatten)]
+    pub base: RecordBase,
+    pub run_id: String,
+    /// The attempt that is about to start (1-based within the retry chain).
+    pub attempt: u32,
+    /// The entry id reserved for the attempt's assistant message. Recovery retries
+    /// only while this never landed — once it exists, that attempt succeeded.
+    pub result_entry_id: String,
 }
 
 /// A tool invocation coming into existence.
@@ -954,6 +988,8 @@ pub enum LaneRecord {
     /// Streamed assistant-message progress. On the record stream, **not** the
     /// branch: frames must never enter the context the model is built from.
     AssistantFrame(AssistantFrameRecord),
+    /// Scheduled retry: an attempt failed retryably and another is about to start.
+    RetryPending(RetryPendingRecord),
 }
 
 impl LaneRecord {
@@ -969,6 +1005,7 @@ impl LaneRecord {
             LaneRecord::WriteDeferred(r) => &r.base,
             LaneRecord::Usage(r) => &r.base,
             LaneRecord::AssistantFrame(r) => &r.base,
+            LaneRecord::RetryPending(r) => &r.base,
         }
     }
     pub fn seq(&self) -> u64 {
@@ -992,6 +1029,7 @@ impl LaneRecord {
             LaneRecord::WriteDeferred(_) => "write_deferred",
             LaneRecord::Usage(_) => "usage",
             LaneRecord::AssistantFrame(_) => "assistant_frame",
+            LaneRecord::RetryPending(_) => "retry_pending",
         }
     }
     /// `runId` property of operation-owned records (mirrors TS `hasRunId`). The
@@ -1008,6 +1046,7 @@ impl LaneRecord {
             LaneRecord::WriteDeferred(r) => Some(&r.run_id),
             LaneRecord::Usage(r) => r.run_id.as_deref(),
             LaneRecord::AssistantFrame(r) => Some(&r.run_id),
+            LaneRecord::RetryPending(r) => Some(&r.run_id),
         }
     }
 }

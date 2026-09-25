@@ -36,7 +36,7 @@
 //! building starts after the last compaction via the cut-point scan) and is the
 //! reason this is a deliberate trade rather than an oversight.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -45,7 +45,9 @@ use rpi_agent::{AgentEmitter, AgentEvent, AgentMessage};
 use rpi_ai::types::{AssistantMessage, StopReason};
 
 use crate::agent_harness::AgentHarness;
-use crate::session::types::{ProvisionedEntry, ProvisionedKind, StepKind, ToolReplay};
+use crate::session::types::{
+    ProvisionedEntry, ProvisionedKind, RecordBase, StepKind, ToolReplay, ToolStartedRecord,
+};
 
 /// Whether a settled assistant message is part of the run's final history.
 /// Mirrors the retry loop's own eligibility test so the two cannot disagree
@@ -88,6 +90,10 @@ pub struct SettleState {
     /// Per-tool replay policy, from the run's tool snapshot. A `ToolStarted`
     /// record has to carry it, and the settle observer sees only the event.
     tool_replays: BTreeMap<String, ToolReplay>,
+    /// How many assistant messages have settled. The n-th settled assistant
+    /// message is the recorder's stream n: both are assigned in event order, and
+    /// only assistant messages create streams.
+    assistant_settled: AtomicUsize,
     /// Indices already committed, so the run-end pass does not duplicate them.
     committed: Mutex<BTreeSet<usize>>,
     /// The assistant entry each settled message produced, by index.
@@ -98,6 +104,12 @@ pub struct SettleState {
     /// `tool_call_id` → reserved result entry id, so the tool result is committed
     /// under the id its `tool_started` record already named.
     reserved_results: Mutex<BTreeMap<String, String>>,
+    /// Queued messages handed to the loop for injection, in the order they will be
+    /// emitted. Injected user messages are *not* committed by the run-end pass
+    /// until the whole run finishes, so without committing them at their own
+    /// settle a crash mid-run would lose the text the model was already given —
+    /// while the queue item was already cancelled, making it unrecoverable.
+    injected: Mutex<VecDeque<(String, AgentMessage)>>,
 }
 
 impl SettleState {
@@ -114,11 +126,22 @@ impl SettleState {
             max_retries,
             run_id: run_id.into(),
             tool_replays,
+            assistant_settled: AtomicUsize::new(0),
             committed: Mutex::new(BTreeSet::new()),
             assistant_entries: Mutex::new(BTreeMap::new()),
             pending_calls: Mutex::new(BTreeMap::new()),
             reserved_results: Mutex::new(BTreeMap::new()),
+            injected: Mutex::new(VecDeque::new()),
         }
+    }
+
+    /// Register a message the run is about to inject, with the entry id its
+    /// `queue_enqueued` record reserved for it.
+    pub fn push_injected(&self, entry_id: impl Into<String>, message: AgentMessage) {
+        self.injected
+            .lock()
+            .unwrap()
+            .push_back((entry_id.into(), message));
     }
 
     /// Advance the attempt counter; called by the retry loop so the settle
@@ -163,6 +186,9 @@ impl SettleState {
 /// "committed" is then still recoverable from the frames.
 pub struct SettlingEmitter {
     inner: Arc<dyn AgentEmitter>,
+    /// The frame recorder, kept as a concrete handle so a committed message can
+    /// retire its own stream. Forwarding still goes through `inner`.
+    recorder: Arc<crate::frame_progress::FrameRecordingEmitter>,
     state: Arc<SettleState>,
     harness: AgentHarness,
 }
@@ -170,18 +196,25 @@ pub struct SettlingEmitter {
 impl SettlingEmitter {
     pub fn new(
         inner: Arc<dyn AgentEmitter>,
+        recorder: Arc<crate::frame_progress::FrameRecordingEmitter>,
         state: Arc<SettleState>,
         harness: AgentHarness,
     ) -> Self {
         Self {
             inner,
+            recorder,
             state,
             harness,
         }
     }
 
     /// Commit one settled assistant message and record its `step_attempt`.
-    async fn settle_assistant(&self, index: usize, message: &AssistantMessage) {
+    async fn settle_assistant(
+        &self,
+        index: usize,
+        stream_index: usize,
+        message: &AssistantMessage,
+    ) {
         let entry = ProvisionedEntry {
             id: self.harness.next_entry_id(),
             kind: ProvisionedKind::Message {
@@ -194,6 +227,16 @@ impl SettlingEmitter {
             Ok(_) => {
                 self.state.record_commit(index, &entry_id);
                 self.state.record_tool_calls(&entry_id, message);
+                // The message is an entry now, so its frames are no longer
+                // progress. Retiring the stream is what stops a crash in a *later*
+                // turn from replaying this one and duplicating it.
+                if let Err(error) = self.recorder.clear_stream(stream_index).await {
+                    tracing::warn!(
+                        stream_index,
+                        %error,
+                        "could not retire a committed assistant stream"
+                    );
+                }
                 // One assistant generation = one step attempt. The entry id is
                 // the one just committed, so recovery can check whether the step
                 // actually landed.
@@ -251,21 +294,62 @@ impl SettlingEmitter {
             .get(tool_name)
             .copied()
             .unwrap_or(ToolReplay::Never);
-        if let Err(error) = self
-            .harness
-            .write_tool_started_record(
-                &self.state.run_id,
-                &assistant_entry_id,
-                tool_index,
-                tool_call_id,
-                tool_name,
-                args.clone(),
-                &result_entry_id,
-                replay,
-            )
-            .await
-        {
+        let record = ToolStartedRecord {
+            base: RecordBase {
+                id: self.harness.next_entry_id(),
+                seq: 0,
+                // The store re-stamps the lane; it must still name a real one,
+                // since the lane is how the store routes the append.
+                lane: self.harness.lane_name().to_string(),
+                timestamp: 0,
+            },
+            run_id: self.state.run_id.clone(),
+            assistant_entry_id,
+            tool_index,
+            tool_call_id: tool_call_id.to_string(),
+            tool_name: tool_name.to_string(),
+            effective_args: args.clone(),
+            result_entry_id,
+            replay,
+        };
+        if let Err(error) = self.harness.write_tool_started(record).await {
             tracing::warn!(%error, tool_call_id, "could not record a tool_started frame");
+        }
+    }
+
+    /// Commit an injected user message under the id its queue record reserved.
+    ///
+    /// Injected messages are the only user messages that appear inside the loop
+    /// (`run_core` drives it with an empty prompt list and persists the caller's
+    /// prompts itself), so the queue of registered injections lines up with the
+    /// `MessageEnd` events in order. The content is compared before committing: if
+    /// they ever diverge, committing the wrong text under that id would be worse
+    /// than dropping the optimisation.
+    async fn settle_injected(&self, index: usize, message: &AgentMessage) {
+        let pending = {
+            let mut injected = self.state.injected.lock().unwrap();
+            match injected.front() {
+                Some((_, queued)) if queued == message => injected.pop_front(),
+                _ => None,
+            }
+        };
+        let Some((entry_id, _)) = pending else {
+            return;
+        };
+        let entry = ProvisionedEntry {
+            id: entry_id,
+            kind: ProvisionedKind::Message {
+                message: message.clone(),
+                terminate: None,
+            },
+        };
+        match self.harness.append_provisioned(entry).await {
+            Ok(_) => {
+                self.state.committed.lock().unwrap().insert(index);
+            }
+            Err(error) => {
+                tracing::warn!(%error, "could not commit an injected message");
+            }
         }
     }
 
@@ -323,12 +407,18 @@ impl SettlingEmitter {
                 }
                 let emitter = SettlingEmitter {
                     inner: Arc::clone(&self.inner),
+                    recorder: Arc::clone(&self.recorder),
                     state: Arc::clone(&self.state),
                     harness: self.harness.clone(),
                 };
+                // Ordinal first, then increment: the message that just settled is
+                // stream `ordinal`.
+                let stream_index = self.state.assistant_settled.fetch_add(1, Ordering::AcqRel);
                 let message = (**assistant).clone();
                 Some(Box::pin(async move {
-                    emitter.settle_assistant(index, &message).await;
+                    emitter
+                        .settle_assistant(index, stream_index, &message)
+                        .await;
                 }))
             }
             AgentEvent::MessageEnd {
@@ -337,12 +427,28 @@ impl SettlingEmitter {
                 let index = self.state.seen.load(Ordering::Acquire).saturating_sub(1);
                 let emitter = SettlingEmitter {
                     inner: Arc::clone(&self.inner),
+                    recorder: Arc::clone(&self.recorder),
                     state: Arc::clone(&self.state),
                     harness: self.harness.clone(),
                 };
                 let result = (**result).clone();
                 Some(Box::pin(async move {
                     emitter.settle_tool_result(index, &result).await;
+                }))
+            }
+            AgentEvent::MessageEnd {
+                message: message @ AgentMessage::User(_),
+            } => {
+                let index = self.state.seen.load(Ordering::Acquire).saturating_sub(1);
+                let emitter = SettlingEmitter {
+                    inner: Arc::clone(&self.inner),
+                    recorder: Arc::clone(&self.recorder),
+                    state: Arc::clone(&self.state),
+                    harness: self.harness.clone(),
+                };
+                let message = message.clone();
+                Some(Box::pin(async move {
+                    emitter.settle_injected(index, &message).await;
                 }))
             }
             AgentEvent::ToolExecutionStart {
@@ -352,6 +458,7 @@ impl SettlingEmitter {
             } => {
                 let emitter = SettlingEmitter {
                     inner: Arc::clone(&self.inner),
+                    recorder: Arc::clone(&self.recorder),
                     state: Arc::clone(&self.state),
                     harness: self.harness.clone(),
                 };

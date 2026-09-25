@@ -232,6 +232,10 @@ pub fn validate_record_log(input: &RecordLogSlice) -> Result<(), RecordLogCorrup
             // reducer only has to accept them (recovery reads them directly via
             // `frame_progress::salvage_run_frames`).
             LaneRecord::AssistantFrame(_) => {}
+            // A scheduled retry is run *progress* like the frames: it references no
+            // entries and imposes no tree invariant. Recovery reads it directly to
+            // decide whether to retry rather than salvage a failed attempt.
+            LaneRecord::RetryPending(_) => {}
             LaneRecord::QueueEnqueued(r) => {
                 // `queue !== "nextRun"` steering/follow-up after the op aborted.
                 if r.queue != QueueKind::NextRun {

@@ -156,40 +156,12 @@ pub fn interrupted_tool_result(outcome: &UnknownToolOutcome, timestamp: i64) -> 
     }))
 }
 
-/// Replay a run's committed frames into the exact message sequence to persist.
-///
-/// Each committed partial assistant message is followed by a synthetic error
-/// tool-result for every tool call whose result never landed. That pairing is
-/// not cosmetic: an assistant message carrying tool calls with no matching
-/// results is an **invalid** request for every provider (Anthropic rejects
-/// `tool_use` ids without `tool_result`), so appending the partial alone would
-/// make the very next turn fail. It also tells the model and the user that the
-/// tool's effect is unknown rather than "not applied".
-pub async fn salvage_run_messages(
-    session: &Session,
-    lane: &str,
-    run_id: &str,
-) -> HarnessResult<Vec<AgentMessage>> {
-    let mut messages = Vec::new();
-    for partial in replay_run_frames(session, run_id).await? {
-        let unknown = unknown_tool_outcomes(session, lane, &partial).await?;
-        let timestamp = partial.timestamp;
-        messages.push(AgentMessage::Assistant(Box::new(interrupted_message(
-            partial,
-        ))));
-        for outcome in &unknown {
-            messages.push(interrupted_tool_result(outcome, timestamp));
-        }
-    }
-    Ok(messages)
-}
-
 /// Reduce the committed frames of every stream in `run_id`, in stream order.
 ///
 /// A run that was cleared (i.e. it committed) yields nothing. Unreadable frame
 /// sequences are skipped rather than failing the caller — recovery must never
 /// make a session unreadable.
-async fn replay_run_frames(
+pub(crate) async fn replay_run_frames(
     session: &Session,
     run_id: &str,
 ) -> HarnessResult<Vec<AssistantMessage>> {
@@ -204,6 +176,9 @@ async fn replay_run_frames(
         .map_err(|error| HarnessError::io(error.to_string()))?;
 
     let mut streams: BTreeMap<usize, Vec<AssistantMessageFrame>> = BTreeMap::new();
+    // Streams whose message is already an entry (committed mid-run by
+    // commit-on-settle). Replaying one would duplicate it in the transcript.
+    let mut cleared: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
     for record in records {
         let LaneRecord::AssistantFrame(frame) = record else {
             continue;
@@ -212,6 +187,9 @@ async fn replay_run_frames(
             // The run committed after this point, so its frames were only
             // progress and nothing needs salvaging.
             AssistantFrameOp::ClearRun => return Ok(Vec::new()),
+            AssistantFrameOp::ClearStream => {
+                cleared.insert(frame.stream_index);
+            }
             AssistantFrameOp::Append => {
                 let Some(value) = frame.frame else {
                     continue;
@@ -229,7 +207,10 @@ async fn replay_run_frames(
     }
 
     let mut replayed = Vec::new();
-    for frames in streams.into_values() {
+    for (index, frames) in streams {
+        if cleared.contains(&index) {
+            continue;
+        }
         match reduce_frames(&frames) {
             Ok(Some(partial)) => replayed.push(partial),
             Ok(None) => {}
@@ -283,16 +264,13 @@ struct RecorderState {
 }
 
 impl RecorderShared {
-    /// Append one `AssistantFrame` record. `payload: None` writes the
-    /// [`AssistantFrameOp::ClearRun`] marker that retires the run's frames.
+    /// Append one `AssistantFrame` record.
     async fn append_frame_record(
         &self,
-        payload: Option<(usize, serde_json::Value)>,
+        stream_index: usize,
+        op: AssistantFrameOp,
+        frame: Option<serde_json::Value>,
     ) -> HarnessResult<()> {
-        let (stream_index, op, frame) = match payload {
-            Some((index, value)) => (index, AssistantFrameOp::Append, Some(value)),
-            None => (0, AssistantFrameOp::ClearRun, None),
-        };
         let record = LaneRecord::AssistantFrame(AssistantFrameRecord {
             base: RecordBase {
                 id: self.session.id_generator().next(),
@@ -372,19 +350,26 @@ impl FrameRecordingEmitter {
         }
     }
 
-    /// Retire this run's frames — called once its messages are persisted.
-    ///
-    /// A single `ClearRun` record is enough because rpi persists a run's
-    /// messages together; native clears per response entry, which only matters
-    /// when messages commit one at a time.
-    pub async fn clear(&self) -> HarnessResult<()> {
-        self.shared.append_frame_record(None).await
+    /// The run this recorder is following.
+    pub fn run_id(&self) -> &str {
+        &self.shared.run_id
     }
 
-    /// Reduce this run's committed frames into interrupted messages, paired
-    /// with synthetic error results so the transcript stays a valid request.
-    pub async fn salvage(&self, session: &Session, lane: &str) -> HarnessResult<Vec<AgentMessage>> {
-        crate::frame_progress::salvage_run_messages(session, lane, &self.shared.run_id).await
+    /// Retire this run's frames — called once its messages are persisted.
+    pub async fn clear(&self) -> HarnessResult<()> {
+        self.shared
+            .append_frame_record(0, AssistantFrameOp::ClearRun, None)
+            .await
+    }
+
+    /// Retire one stream, whose message has just been committed as an entry.
+    ///
+    /// Without this, salvage would replay it again on a crash and duplicate the
+    /// message: the run-wide `ClearRun` marker only arrives at the end of the run.
+    pub async fn clear_stream(&self, stream_index: usize) -> HarnessResult<()> {
+        self.shared
+            .append_frame_record(stream_index, AssistantFrameOp::ClearStream, None)
+            .await
     }
 
     /// Record one event's frame durably. Failures are logged, never fatal: a
@@ -400,7 +385,10 @@ impl FrameRecordingEmitter {
                 return;
             }
         };
-        if let Err(error) = shared.append_frame_record(Some((index, value))).await {
+        if let Err(error) = shared
+            .append_frame_record(index, AssistantFrameOp::Append, Some(value))
+            .await
+        {
             tracing::warn!(stream_index = index, %error, "could not append an assistant frame");
         }
     }

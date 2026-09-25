@@ -44,12 +44,12 @@ use rpi_harness::session::types::{BranchBounds, EntryQuery, SessionMetadata};
 use rpi_harness::session::Session;
 use rpi_harness::system_prompt::compose_system_prompt;
 use rpi_harness::types::{
-    AgentHarnessOptions, AgentHarnessResources, AgentHarnessStreamOptions, CompactionSettings,
-    DrivingMode, HarnessTool, HarnessToolExecution, RetryPolicy, ToolReplay,
+    AgentHarnessOptions, AgentHarnessResources, AgentHarnessStreamOptions, DrivingMode,
+    HarnessTool, HarnessToolExecution, ToolReplay,
 };
 use rpi_tools::{
-    create_bash_tool, create_edit_tool, create_powershell_tool, create_read_tool, create_write_tool, ExecutionToolContext,
-    MutationQueueRegistry, OsExecutionEnv,
+    create_bash_tool, create_edit_tool, create_powershell_tool, create_read_tool,
+    create_write_tool, ExecutionToolContext, MutationQueueRegistry, OsExecutionEnv,
 };
 
 use crate::args::Args;
@@ -195,9 +195,16 @@ pub fn select_session(args: &Args, cwd: &Path) -> SessionSelection {
     if let Some(s) = &args.session {
         return SessionSelection::ById { id: s.clone() };
     }
+    // `--session-dir` wins; then the saved `sessionDir` (native pi's key, same
+    // format as the flag); then the built-in default.
     let dir = args
         .session_dir
         .clone()
+        .or_else(|| {
+            crate::settings::load_settings()
+                .ok()
+                .and_then(|settings| settings.session_dir)
+        })
         .unwrap_or_else(|| default_session_dir(cwd));
     SessionSelection::New {
         dir,
@@ -733,6 +740,23 @@ pub async fn build(
         None => broadcast_emitter,
     };
 
+    // Saved user defaults. Best-effort: a missing or malformed file must not stop
+    // a session from starting, and every accessor falls back to the harness
+    // default when its key is absent.
+    let saved_settings = crate::settings::load_settings().unwrap_or_default();
+
+    // `httpProxy` applies to rpi's own HTTP clients. Setting the environment is how
+    // they are configured (`pi-ai/src/http.rs`), and native pi does the same thing
+    // with this key — an explicit environment variable still wins, so a shell-level
+    // proxy override is not silently replaced by the setting.
+    if let Some(proxy) = &saved_settings.http_proxy {
+        for key in ["HTTP_PROXY", "HTTPS_PROXY"] {
+            if std::env::var_os(key).is_none() {
+                std::env::set_var(key, proxy);
+            }
+        }
+    }
+
     let options = AgentHarnessOptions {
         model: resolved.model.clone(),
         thinking_level: resolved.thinking_level,
@@ -764,10 +788,14 @@ pub async fn build(
             timeout: args.timeout,
             ..Default::default()
         },
-        retry: RetryPolicy::default(),
-        compaction: CompactionSettings::default(),
-        steering_mode: Default::default(),
-        follow_up_mode: Default::default(),
+        // Settings-backed harness options: native pi lets users tune retry,
+        // compaction and queue drain modes from settings.json. Global only,
+        // matching how `defaultTools` and the other settings-backed options in
+        // this file are read.
+        retry: saved_settings.retry_policy(),
+        compaction: saved_settings.compaction_settings(),
+        steering_mode: saved_settings.steering_mode(),
+        follow_up_mode: saved_settings.follow_up_mode(),
         tool_execution: HarnessToolExecution::default(),
         drive: DrivingMode::default(),
         session,
@@ -1851,8 +1879,14 @@ pub fn bash_options() -> rpi_tools::tools::bash::BashToolOptions {
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(120.0);
+    // Saved user defaults, matching how `defaultTools` is read in `build_tools`.
+    // `shellCommandPrefix` is prepended to every command (native pi's key for
+    // alias/`shopt` setup). Native's `shellPath` is *not* wired: neither
+    // `BashToolOptions` nor `ShellCaptureOptions` carries a shell binary today, so
+    // honouring it means plumbing one through pi-tools first.
+    let settings = crate::settings::load_settings().unwrap_or_default();
     BashToolOptions {
-        command_prefix: None,
+        command_prefix: settings.shell_command_prefix.clone(),
         default_timeout: Some(default),
     }
 }
@@ -1863,15 +1897,27 @@ fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
     }
     // Keep the coding tools aligned with Pi and expose rpi's read-only docs
     // lookup as a default assistant capability.
+    //
+    // Replay policy (native `ToolDeclaration.replay`): only tools that are
+    // genuinely free of side effects may be re-run when a crash leaves their
+    // outcome unknown — everything else must stay `Never`, because replaying
+    // `bash`/`write`/`edit` would duplicate a side effect. `HarnessTool::new`
+    // already defaults to `Never`, so this is opt-in per read-only tool.
     let mut all: Vec<(&'static str, HarnessTool)> = vec![
-        ("read", HarnessTool::new(create_read_tool(ctx, None))),
+        (
+            "read",
+            HarnessTool::new(create_read_tool(ctx, None)).with_replay(ToolReplay::Safe),
+        ),
         (
             "bash",
             HarnessTool::new(create_bash_tool(ctx, Some(bash_options()))),
         ),
         ("edit", HarnessTool::new(create_edit_tool(ctx))),
         ("write", HarnessTool::new(create_write_tool(ctx))),
-        ("docs", HarnessTool::new(create_docs_tool())),
+        (
+            "docs",
+            HarnessTool::new(create_docs_tool()).with_replay(ToolReplay::Safe),
+        ),
     ];
 
     // Add PowerShell tool on Windows
@@ -1903,9 +1949,7 @@ fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
         all.retain(|(name, _)| !deny.iter().any(|d| d == name));
     }
 
-    all.into_iter()
-        .map(|(_, t)| t.with_replay(ToolReplay::Safe))
-        .collect()
+    all.into_iter().map(|(_, t)| t).collect()
 }
 
 /// Resolve the active tool names from the constructed tools when no explicit
@@ -2345,6 +2389,46 @@ mod tests {
             lower.contains("already shown earlier"),
             "the prompt must discourage re-fetching known content: {p}"
         );
+    }
+
+    /// Only side-effect-free tools may be replayed after a crash.
+    ///
+    /// Regression guard for an inverted default: `ToolReplay` used to default to
+    /// `Safe` and the CLI then marked *every* tool `Safe`, so the first time
+    /// recovery acted on the flag it would have re-run `bash`/`write`/`edit` and
+    /// duplicated their side effects. Native pi defaults to `"never"`
+    /// (`drive/tools.ts: tool.replay ?? "never"`).
+    #[test]
+    fn only_read_only_tools_are_replayable() {
+        let env = Arc::new(OsExecutionEnv::with_cwd(PathBuf::from(".")));
+        let env_dyn: Arc<dyn rpi_tools::ExecutionEnv> = env.clone();
+        let mut_env: Arc<dyn rpi_tools::MutatingEnv> = env.clone();
+        let context = ExecutionToolContext::new(env_dyn, Some(mut_env));
+        let tools = build_tools(&context, &Args::default());
+
+        let replay_of = |name: &str| {
+            tools
+                .iter()
+                .find(|tool| tool.tool.schema().name == name)
+                .map(|tool| tool.replay)
+        };
+
+        for read_only in ["read", "docs"] {
+            assert_eq!(
+                replay_of(read_only),
+                Some(ToolReplay::Safe),
+                "{read_only} is side-effect free, so recovery may re-run it"
+            );
+        }
+        for mutating in ["bash", "edit", "write", "powershell"] {
+            if let Some(replay) = replay_of(mutating) {
+                assert_eq!(
+                    replay,
+                    ToolReplay::Never,
+                    "{mutating} must never be replayed: re-running it would duplicate its effect"
+                );
+            }
+        }
     }
 
     #[test]

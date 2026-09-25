@@ -34,6 +34,7 @@ use std::sync::{Arc, Mutex};
 
 use rpi_agent::{AgentEmitter, AgentEvent, AgentMessage, CollectorEmitter};
 use rpi_ai::providers::faux::{faux_assistant_message, FauxProvider, FauxScript, FauxStep};
+use rpi_ai::types::{UserContent, UserMessage};
 use rpi_ai::Provider;
 use rpi_harness::agent_harness::{AgentHarness, AgentLane, HarnessRunOutcome};
 use rpi_harness::events::{HarnessEvent, RunEndOutcome};
@@ -41,7 +42,7 @@ use rpi_harness::session::memory::{InMemorySessionStorage, SystemClock};
 use rpi_harness::session::types::SessionMetadata;
 use rpi_harness::session::types::{BranchBounds, EntryOrder, EntryQuery, LaneRecord, RecordQuery};
 use rpi_harness::session::{DefaultIdGenerator, Session};
-use rpi_harness::types::{AgentHarnessOptions, HarnessTool, RetryPolicy};
+use rpi_harness::types::{AgentHarnessOptions, HarnessTool, RetryPolicy, ToolReplay};
 use rpi_tools::{
     create_bash_tool, create_read_tool, create_write_tool, ExecutionToolContext, FileSystem,
     InMemoryExecutionEnv, MutationQueueRegistry,
@@ -1696,5 +1697,2140 @@ async fn a_retried_attempt_is_not_committed() {
     assert!(
         assistants[0].error_message.is_none(),
         "the committed message must be the recovered one, not the failed attempt"
+    );
+}
+
+/// A tool that hangs on its first invocation and answers on any later one.
+///
+/// This is what makes a replay observable: the first call is killed mid-flight
+/// (leaving its outcome unknown), and a re-run returns a real result. The call
+/// count proves which happened.
+struct ReplayableTool {
+    schema: rpi_ai::types::Tool,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    /// Which invocation hangs. `1` makes the tool a one-shot trap (crash on the
+    /// first call); `2` lets a first call succeed so a *later* turn can be the one
+    /// that dies, which is what a multi-turn crash looks like.
+    hang_at: usize,
+}
+
+impl ReplayableTool {
+    /// Shares `calls` with any other instance built from the same counter, so a
+    /// reopened harness replays into the same counter the crashed one used.
+    fn with_hang_at(calls: Arc<std::sync::atomic::AtomicUsize>, hang_at: usize) -> Self {
+        Self {
+            schema: rpi_ai::types::Tool {
+                name: "flaky_read".to_string(),
+                description: "hangs on a chosen call".to_string(),
+                parameters: rpi_ai::types::Schema::new(
+                    serde_json::json!({ "type": "object", "properties": {} }),
+                ),
+                constrained_sampling: None,
+            },
+            calls,
+            hang_at,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl rpi_agent::AgentTool for ReplayableTool {
+    fn schema(&self) -> &rpi_ai::types::Tool {
+        &self.schema
+    }
+    fn label(&self) -> &str {
+        "flaky_read"
+    }
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        _params: serde_json::Value,
+        _signal: tokio_util::sync::CancellationToken,
+        _on_update: Arc<dyn Fn(rpi_agent::ToolResultPartial) + Send + Sync>,
+    ) -> Result<rpi_agent::AgentToolResult, rpi_agent::AgentError> {
+        use std::sync::atomic::Ordering;
+        if self.calls.fetch_add(1, Ordering::SeqCst) + 1 == self.hang_at {
+            // This invocation never returns: the run is killed inside it.
+            std::future::pending::<()>().await;
+        }
+        Ok(rpi_agent::AgentToolResult::text("REAL RESULT FROM RE-RUN"))
+    }
+}
+
+/// Build a harness whose meaningful tool is replayable-or-not per policy.
+///
+/// `calls` is threaded through so the *reopened* harness can share the counter
+/// with the crashed one: that is how "was the tool re-run?" becomes observable,
+/// and the shared counter makes a re-run answer instead of hanging again.
+async fn replayable_harness(
+    session: Session,
+    replay: ToolReplay,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    allow_existing_session: bool,
+    provider: Arc<FauxProvider>,
+) -> AgentHarness {
+    replayable_harness_hanging_at(session, replay, calls, allow_existing_session, provider, 1).await
+}
+
+/// Same, but with an explicit retry policy.
+async fn replayable_harness_with_retry(
+    session: Session,
+    replay: ToolReplay,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    allow_existing_session: bool,
+    provider: Arc<FauxProvider>,
+    retry: RetryPolicy,
+) -> AgentHarness {
+    replayable_harness_full(
+        session,
+        replay,
+        calls,
+        allow_existing_session,
+        provider,
+        1,
+        retry,
+    )
+    .await
+}
+
+/// Same, but the flaky tool hangs on invocation `hang_at` instead of the first.
+async fn replayable_harness_hanging_at(
+    session: Session,
+    replay: ToolReplay,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    allow_existing_session: bool,
+    provider: Arc<FauxProvider>,
+    hang_at: usize,
+) -> AgentHarness {
+    replayable_harness_full(
+        session,
+        replay,
+        calls,
+        allow_existing_session,
+        provider,
+        hang_at,
+        RetryPolicy::default(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn replayable_harness_full(
+    session: Session,
+    replay: ToolReplay,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    allow_existing_session: bool,
+    provider: Arc<FauxProvider>,
+    hang_at: usize,
+    retry: RetryPolicy,
+) -> AgentHarness {
+    let model = provider.default_model().clone();
+    let env = Arc::new(InMemoryExecutionEnv::new());
+    let env_dyn: Arc<dyn rpi_tools::ExecutionEnv> = env.clone();
+    let mut_env: Arc<dyn rpi_tools::MutatingEnv> = env.clone();
+    let _registry = Arc::new(MutationQueueRegistry::new());
+    let ctx = ExecutionToolContext::new(env_dyn, Some(mut_env));
+    let replayable = ReplayableTool::with_hang_at(calls, hang_at);
+    let tools: Vec<HarnessTool> = vec![
+        HarnessTool::new(Arc::new(replayable)).with_replay(replay),
+        HarnessTool::new(create_read_tool(&ctx, None)),
+    ];
+    let active: Vec<String> = tools.iter().map(|t| t.tool.schema().name.clone()).collect();
+
+    let options = AgentHarnessOptions {
+        model,
+        thinking_level: Default::default(),
+        active_tool_names: active,
+        tools,
+        system_prompt: None,
+        resources: Default::default(),
+        stream_options: Default::default(),
+        retry,
+        compaction: Default::default(),
+        steering_mode: Default::default(),
+        follow_up_mode: Default::default(),
+        tool_execution: Default::default(),
+        drive: Default::default(),
+        session,
+        models: vec![provider.clone() as Arc<dyn Provider>],
+        to_provider_messages: None,
+        entry_projectors: Default::default(),
+        agent_emitter: None,
+        before_tool_call: None,
+        after_tool_call: None,
+        transform_context: None,
+        entry_transforms: Vec::new(),
+        provider_hooks: None,
+        allow_existing_session,
+    };
+    AgentHarness::create(options).await.expect("create harness")
+}
+
+/// A fresh in-memory session for the replay tests.
+fn replay_session() -> Session {
+    let metadata = SessionMetadata {
+        id: "replay-tool".into(),
+        created_at: 0,
+        parent_session_id: None,
+    };
+    let storage = Arc::new(InMemorySessionStorage::new(
+        metadata,
+        Arc::new(SystemClock),
+        Arc::new(DefaultIdGenerator::new()),
+    ));
+    Session::new(storage, None)
+}
+
+/// Crash a run inside a tool call, recover, and report the recovered tool
+/// results plus how many times the tool was invoked in total.
+async fn crash_inside_tool(replay: ToolReplay) -> (Vec<rpi_ai::types::ToolResultMessage>, usize) {
+    crash_inside_tool_with(replay, replay).await
+}
+
+/// Same, but the tool may be declared differently at recovery time than it was
+/// when the call was recorded — which is what the dual-confirmation rule is for.
+async fn crash_inside_tool_with(
+    recorded_replay: ToolReplay,
+    recovery_replay: ToolReplay,
+) -> (Vec<rpi_ai::types::ToolResultMessage>, usize) {
+    let script = FauxScript::new().with_tool_call("flaky_read", serde_json::json!({}));
+    let session = replay_session();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let harness = replayable_harness(
+        session.clone(),
+        recorded_replay,
+        Arc::clone(&calls),
+        false,
+        FauxProvider::new(script),
+    )
+    .await;
+
+    let run = {
+        let harness = harness.clone();
+        tokio::spawn(async move { harness.prompt_text("read the flaky thing", vec![]).await })
+    };
+    let session = harness.session().clone();
+    for _ in 0..300 {
+        let records = session
+            .find_records(&RecordQuery {
+                lane: Some("main".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("records readable");
+        let started = records.iter().any(|record| {
+            matches!(record, LaneRecord::ToolStarted(frame) if frame.tool_name == "flaky_read")
+        });
+        if started {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    run.abort();
+    let _ = run.await;
+    drop(harness);
+
+    // Reopen with the tool registered: recovery can only replay a call whose
+    // tool it knows about.
+    let recovered = replayable_harness(
+        session,
+        recovery_replay,
+        Arc::clone(&calls),
+        true,
+        FauxProvider::new(FauxScript::new().with_text("unused")),
+    )
+    .await;
+    let entries = recovered
+        .session()
+        .find_entries_on_branch(
+            &EntryQuery {
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            },
+            &BranchBounds::default(),
+        )
+        .await
+        .expect("branch readable");
+    let results = entries
+        .iter()
+        .filter_map(|entry| match entry {
+            rpi_harness::session::types::Entry::Message(message) => match &message.message {
+                AgentMessage::ToolResult(result) => Some((**result).clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    let calls = calls.load(std::sync::atomic::Ordering::SeqCst);
+    (results, calls)
+}
+
+/// A tool declared `Safe` is re-run, so recovery recovers its **real** result
+/// instead of downgrading the call to "outcome unknown".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replayable_tool_is_re_run_and_its_real_result_recovered() {
+    let (results, calls) = crash_inside_tool(ToolReplay::Safe).await;
+    assert_eq!(
+        calls, 2,
+        "the tool must have been invoked twice: the killed call and the replay"
+    );
+    let result = results.first().expect("a tool result must be recorded");
+    assert!(!result.is_error, "a successful replay is not an error");
+    let joined = result
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            rpi_ai::types::Content::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(
+            "
+",
+        );
+    assert!(
+        joined.contains("REAL RESULT FROM RE-RUN"),
+        "the replayed result must carry the tool's real output, got {joined:?}"
+    );
+    assert!(
+        joined.contains("[recovered]"),
+        "the result must say it came from a re-run, got {joined:?}"
+    );
+    assert!(
+        joined.find("REAL RESULT").unwrap() < joined.find("[recovered]").unwrap(),
+        "the tool's own output must come first, with the marker after it: {joined:?}"
+    );
+}
+
+/// A tool declared `Never` must not be re-run: its side effect is unknown, and
+/// re-running it could duplicate that effect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unreplayable_tool_is_not_re_run() {
+    let (results, calls) = crash_inside_tool(ToolReplay::Never).await;
+    assert_eq!(
+        calls, 1,
+        "an unreplayable tool must never be invoked a second time"
+    );
+    let result = results.first().expect("a tool result must be recorded");
+    assert!(result.is_error, "the stand-in is marked as an error");
+    let text = match result.content.first() {
+        Some(rpi_ai::types::Content::Text(text)) => text.text.clone(),
+        other => panic!("expected text content, got {other:?}"),
+    };
+    assert!(
+        text.contains("unknown"),
+        "the stand-in must say the outcome is unknown, got {text:?}"
+    );
+    assert!(
+        !text.contains("REAL RESULT"),
+        "an unreplayable tool's result must not be fabricated, got {text:?}"
+    );
+}
+/// A call recorded as safe must NOT be replayed when the tool no longer declares
+/// itself safe.
+///
+/// Mirrors native's `call.replay === "safe" && tool?.replay === "safe"`. Believing
+/// only the record would replay a call into a tool that has since been redefined
+/// as unsafe — the exact case where a duplicate side effect would be invisible,
+/// because the tool's own declaration is what says it can happen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recorded_safe_call_is_not_replayed_into_a_now_unsafe_tool() {
+    let (results, calls) = crash_inside_tool_with(ToolReplay::Safe, ToolReplay::Never).await;
+    assert_eq!(
+        calls, 1,
+        "the tool must not be re-run: its current declaration says Never"
+    );
+    let joined = results
+        .first()
+        .expect("a tool result must be recorded")
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            rpi_ai::types::Content::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(
+            "
+",
+        );
+    assert!(
+        joined.contains("unknown"),
+        "an unreplayed call must be recorded as unknown, got {joined:?}"
+    );
+}
+
+/// Local helpers: an assistant message carrying one tool call, and its result.
+fn assistant_with_one_tool_call(call_id: &str, name: &str) -> rpi_ai::types::AssistantMessage {
+    let mut message =
+        rpi_ai::types::AssistantMessage::empty(rpi_ai::types::Api::Faux, "faux", "faux", 0);
+    message
+        .content
+        .push(rpi_ai::types::Content::ToolCall(rpi_ai::types::ToolCall {
+            kind: rpi_ai::types::ToolCallType,
+            id: call_id.to_string(),
+            name: name.to_string(),
+            arguments: serde_json::json!({}),
+            thought_signature: None,
+            namespace: None,
+        }));
+    message
+}
+
+fn tool_result_of(call_id: &str, name: &str) -> rpi_ai::types::ToolResultMessage {
+    rpi_ai::types::ToolResultMessage {
+        role: rpi_ai::types::ToolResultRole,
+        tool_call_id: call_id.to_string(),
+        tool_name: name.to_string(),
+        content: Vec::new(),
+        details: None,
+        usage: None,
+        added_tool_names: Vec::new(),
+        is_error: false,
+        timestamp: 0,
+    }
+}
+
+/// Crash a run inside a tool call, then reopen with `resume_script` available for
+/// the run that continues afterwards.
+async fn crashed_run_awaiting_resume(
+    resume_script: FauxScript,
+) -> (AgentHarness, Arc<std::sync::atomic::AtomicUsize>) {
+    let script = FauxScript::new().with_tool_call("flaky_read", serde_json::json!({}));
+    let session = replay_session();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let harness = replayable_harness(
+        session.clone(),
+        ToolReplay::Never,
+        Arc::clone(&calls),
+        false,
+        FauxProvider::new(script),
+    )
+    .await;
+
+    let run = {
+        let harness = harness.clone();
+        tokio::spawn(async move { harness.prompt_text("read the flaky thing", vec![]).await })
+    };
+    for _ in 0..300 {
+        let records = session
+            .find_records(&RecordQuery {
+                lane: Some("main".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("records readable");
+        if records.iter().any(|record| {
+            matches!(record, LaneRecord::ToolStarted(frame) if frame.tool_name == "flaky_read")
+        }) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    run.abort();
+    let _ = run.await;
+    drop(harness);
+
+    let reopened = replayable_harness(
+        session,
+        ToolReplay::Never,
+        Arc::clone(&calls),
+        true,
+        FauxProvider::new(resume_script),
+    )
+    .await;
+    (reopened, calls)
+}
+
+/// Every assistant text block on the branch, joined.
+async fn branch_assistant_text(harness: &AgentHarness) -> String {
+    harness
+        .session()
+        .view("main")
+        .find_entries_on_branch(
+            &EntryQuery {
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            },
+            &BranchBounds::default(),
+        )
+        .await
+        .expect("branch readable")
+        .iter()
+        .filter_map(|entry| match entry {
+            rpi_harness::session::types::Entry::Message(message) => match &message.message {
+                AgentMessage::Assistant(assistant) => Some(
+                    assistant
+                        .content
+                        .iter()
+                        .filter_map(|block| match block {
+                            rpi_ai::types::Content::Text(text) => Some(text.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(""),
+                ),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Reopening a session whose run died mid-tool must offer to continue it, and
+/// continuing must produce the next assistant turn **without a new user prompt**.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_interrupted_run_is_continued_without_a_new_prompt() {
+    let (recovered, _calls) =
+        crashed_run_awaiting_resume(FauxScript::new().with_text("continued after resume")).await;
+
+    let pending = recovered
+        .pending_resume()
+        .expect("recovery repaired a mid-loop run, so there is something to continue");
+    assert_eq!(pending.attempt, 0, "this is the first resume");
+
+    let resumed = recovered
+        .resume_pending()
+        .await
+        .expect("resume runs")
+        .expect("a run was continued");
+    assert!(
+        matches!(resumed.outcome, HarnessRunOutcome::Completed { .. }),
+        "the continued run must complete: {:?}",
+        resumed.outcome
+    );
+    let joined = branch_assistant_text(&recovered).await;
+    assert!(
+        joined.contains("continued after resume"),
+        "the continued run's output must be in the transcript, got {joined:?}"
+    );
+    // The resume announces itself, so a run starting without the user asking is
+    // never a mystery.
+    let notices: Vec<String> = recovered
+        .session()
+        .view("main")
+        .find_entries_on_branch(
+            &EntryQuery {
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            },
+            &BranchBounds::default(),
+        )
+        .await
+        .expect("branch readable")
+        .iter()
+        .filter_map(|entry| match entry {
+            rpi_harness::session::types::Entry::Message(message) => {
+                rpi_harness::messages::custom_data(&message.message).map(|data| data.custom_type)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        notices.iter().any(|kind| kind == "runResume"),
+        "the resume must record a `runResume` notice so a self-started run is explained, got {notices:?}"
+    );
+
+    assert!(
+        recovered.pending_resume().is_none(),
+        "a resumed run must not be offered again"
+    );
+}
+
+/// A run that keeps dying must not be resumed forever: the attempt budget is
+/// durable, because the crash that makes it matter destroys any in-memory
+/// counter that could have held it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_that_keeps_dying_is_not_resumed_forever() {
+    use rpi_harness::session::types::{
+        OperationFinishedRecord, OperationIntent, OperationOutcome, OperationStartedRecord,
+        RecordBase,
+    };
+    use std::collections::BTreeMap;
+
+    let session = replay_session();
+    // A branch that ends mid-loop: the interrupted run's tool result is the tip.
+    session
+        .view("main")
+        .append_message(AgentMessage::Assistant(Box::new(
+            assistant_with_one_tool_call("call-1", "flaky_read"),
+        )))
+        .await
+        .expect("append assistant");
+    session
+        .view("main")
+        .append_message(AgentMessage::ToolResult(Box::new(tool_result_of(
+            "call-1",
+            "flaky_read",
+        ))))
+        .await
+        .expect("append tool result");
+
+    let base = |id: &str| RecordBase {
+        id: id.to_string(),
+        seq: 0,
+        lane: "main".to_string(),
+        timestamp: 0,
+    };
+    let run_intent =
+        |resume_data: Option<BTreeMap<String, serde_json::Value>>| OperationIntent::Run {
+            original_prompt: Vec::new(),
+            initial_messages: Vec::new(),
+            system_prompt_override: None,
+            resume_data,
+        };
+
+    // The chain so far: the original run, then three resumes, each of which died
+    // the same way. Storage allows only one open operation per lane, so every
+    // earlier one is closed and only the newest is left open — that newest run is
+    // the one recovery repairs and would otherwise continue a fourth time.
+    session
+        .append_record(LaneRecord::OperationStarted(OperationStartedRecord {
+            base: base("orig-run"),
+            source_leaf_id: None,
+            intent: run_intent(None),
+        }))
+        .await
+        .expect("append original run");
+    session
+        .append_record(LaneRecord::OperationFinished(OperationFinishedRecord {
+            base: base("orig-run-done"),
+            run_id: "orig-run".to_string(),
+            outcome: OperationOutcome::Aborted,
+            error: None,
+        }))
+        .await
+        .expect("close original run");
+
+    for attempt in 1..=3u64 {
+        let run_id = format!("resume-{attempt}");
+        session
+            .append_record(LaneRecord::OperationStarted(OperationStartedRecord {
+                base: base(&run_id),
+                source_leaf_id: None,
+                intent: run_intent(Some(BTreeMap::from([
+                    (
+                        "resumedFrom".to_string(),
+                        serde_json::Value::String("orig-run".to_string()),
+                    ),
+                    (
+                        "resumeAttempt".to_string(),
+                        serde_json::Value::from(attempt),
+                    ),
+                ]))),
+            }))
+            .await
+            .expect("append resume run");
+        // Only the last resume is left open; the earlier ones settled.
+        if attempt < 3 {
+            session
+                .append_record(LaneRecord::OperationFinished(OperationFinishedRecord {
+                    base: base(&format!("{run_id}-done")),
+                    run_id: run_id.clone(),
+                    outcome: OperationOutcome::Aborted,
+                    error: None,
+                }))
+                .await
+                .expect("close resume run");
+        }
+    }
+
+    let recovered = replayable_harness(
+        session,
+        ToolReplay::Never,
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        true,
+        FauxProvider::new(FauxScript::new().with_text("unused")),
+    )
+    .await;
+
+    assert!(
+        recovered.pending_resume().is_none(),
+        "a run whose resume budget is spent must not be offered again"
+    );
+    assert!(
+        recovered
+            .resume_pending()
+            .await
+            .expect("resume is a no-op")
+            .is_none(),
+        "nothing may be resumed once the budget is spent"
+    );
+}
+
+/// Resume-decision matrix, part 1: a crash **while streaming the answer** must
+/// NOT be auto-resumed.
+///
+/// The salvaged partial is an assistant message, so the branch tip is an
+/// assistant turn. Continuing from it would hand the provider a trailing
+/// assistant message — which Anthropic rejects outright (and `pi-agent`'s own
+/// `run_agent_loop_continue` refuses for the same reason, see `agent_loop.rs`).
+/// The run therefore ends with the salvaged partial and the user decides what is
+/// next; that is also what native pi does, because an errored assistant response
+/// finishes the turn rather than asking for another one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crash_mid_stream_is_not_auto_resumed() {
+    let long = "the quick brown fox jumps over the lazy dog ".repeat(60);
+    let script = FauxScript::new()
+        .with_tokens_per_second(20.0)
+        .with_text(long);
+    let (harness, _provider, _env) = harness_with(script).await;
+
+    let run = {
+        let harness = harness.clone();
+        tokio::spawn(async move { harness.prompt_text("a long answer please", vec![]).await })
+    };
+    let session = harness.session().clone();
+    for _ in 0..200 {
+        let records = session
+            .find_records(&RecordQuery {
+                record_type: Some(rpi_harness::frame_progress::ASSISTANT_FRAME_RECORD_TYPE),
+                ..Default::default()
+            })
+            .await
+            .expect("frame records readable");
+        if !records.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    run.abort();
+    let _ = run.await;
+    drop(harness);
+
+    let recovered = reopen_harness(session).await;
+
+    // The partial was salvaged, so the tip is the interrupted assistant turn…
+    let entries = recovered
+        .session()
+        .view("main")
+        .find_entries_on_branch(
+            &EntryQuery {
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            },
+            &BranchBounds::default(),
+        )
+        .await
+        .expect("branch readable");
+    let tip = entries.last().expect("the prompt is at least there");
+    let rpi_harness::session::types::Entry::Message(tip) = tip else {
+        panic!("expected a message at the tip, got {tip:?}");
+    };
+    let tip_assistant = match &tip.message {
+        AgentMessage::Assistant(assistant) => (**assistant).clone(),
+        other => panic!("expected the salvaged assistant message, got {other:?}"),
+    };
+    assert_eq!(
+        tip_assistant.error_message.as_deref(),
+        Some(rpi_harness::frame_progress::INTERRUPTED_NOTICE),
+        "the tip must be the salvaged partial"
+    );
+
+    // …and that is precisely why there is nothing to resume.
+    assert!(
+        recovered.pending_resume().is_none(),
+        "a trailing assistant turn cannot be continued: the provider would reject it"
+    );
+    assert!(recovered
+        .resume_pending()
+        .await
+        .expect("resume is a no-op")
+        .is_none());
+}
+
+/// Resume-decision matrix, part 2: an explicit user abort must NOT be resumed.
+///
+/// This holds by construction — a resume requires an *open* operation, and an
+/// abort closes it — so the test is here to keep it that way. Getting this wrong
+/// would mean the agent restarting work the user deliberately stopped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_explicitly_aborted_run_is_not_resumed() {
+    let long = "the quick brown fox jumps over the lazy dog ".repeat(60);
+    let script = FauxScript::new()
+        .with_tokens_per_second(20.0)
+        .with_text(long);
+    let (harness, _provider, _env) = harness_with(script).await;
+
+    let run = {
+        let harness = harness.clone();
+        tokio::spawn(async move { harness.prompt_text("a long answer please", vec![]).await })
+    };
+    // Let the run actually start before aborting it.
+    let mut started = false;
+    for _ in 0..200 {
+        let records = harness
+            .session()
+            .find_records(&RecordQuery {
+                record_type: Some("operation_started"),
+                ..Default::default()
+            })
+            .await
+            .expect("records readable");
+        if !records.is_empty() {
+            started = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        started,
+        "the run must have started before it can be aborted"
+    );
+
+    harness.lane("main").abort().await.expect("abort succeeds");
+    let outcome = run.await.expect("the run task finished");
+    assert!(
+        outcome.is_ok(),
+        "an aborted run settles normally: {outcome:?}"
+    );
+
+    let session = harness.session().clone();
+    drop(harness);
+
+    // The abort closed the operation, so recovery finds nothing to repair and
+    // nothing to continue.
+    let open = session
+        .find_open_operations("main", None)
+        .await
+        .expect("open operations readable");
+    assert!(
+        open.is_empty(),
+        "a user abort must close the operation, got {open:?}"
+    );
+    let recovered = reopen_harness(session).await;
+    assert!(
+        recovered.pending_resume().is_none(),
+        "work the user stopped must stay stopped"
+    );
+}
+
+/// Resume-decision matrix, part 3: a run that completed normally is not resumed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_completed_run_is_not_resumed() {
+    let script = FauxScript::new().with_text("all done");
+    let (harness, _provider, _env) = harness_with(script).await;
+    let result = harness
+        .prompt_text("finish cleanly", vec![])
+        .await
+        .expect("prompt completes");
+    assert!(matches!(
+        result.outcome,
+        HarnessRunOutcome::Completed { .. }
+    ));
+    assert!(
+        harness.pending_resume().is_none(),
+        "a completed run has nothing to continue"
+    );
+}
+
+/// Wait until the run has started streaming, i.e. until it is past the loop's
+/// steering-drain point at the top of the run.
+///
+/// Steering is delivered at loop boundaries, so a message typed before that point
+/// is consumed by the run itself — realistic, but not what these tests are about:
+/// they are about what happens to a message that is still *queued* when the
+/// process dies.
+async fn wait_until_streaming(session: &rpi_harness::session::Session) {
+    for _ in 0..300 {
+        let records = session
+            .find_records(&RecordQuery {
+                record_type: Some(rpi_harness::frame_progress::ASSISTANT_FRAME_RECORD_TYPE),
+                ..Default::default()
+            })
+            .await
+            .expect("frame records readable");
+        if !records.is_empty() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("the run never started streaming");
+}
+
+/// A steer message typed while the agent is working must survive a crash.
+///
+/// The queue used to be purely process-local (`Arc<Mutex<MessageQueue>>` in the
+/// harness), so anything the user typed while the agent worked was lost if the
+/// process died — and the `queue_enqueued` / `queue_cancelled` records that exist
+/// to prevent exactly that were never written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_steer_message_survives_a_restart() {
+    let long = "the quick brown fox jumps over the lazy dog ".repeat(60);
+    let script = FauxScript::new()
+        .with_tokens_per_second(20.0)
+        .with_text(long);
+    let (harness, _provider, _env) = harness_with(script).await;
+
+    let run = {
+        let harness = harness.clone();
+        tokio::spawn(async move { harness.prompt_text("start something long", vec![]).await })
+    };
+
+    // Only meaningful once the run is past its steering drain point.
+    wait_until_streaming(harness.session()).await;
+    // Wait for the run to be in flight, then type a steer message into it.
+    let mut queued = None;
+    for _ in 0..300 {
+        if let Ok(result) = harness
+            .lane("main")
+            .steer(AgentMessage::User(UserMessage::new(
+                UserContent::Text("also check the tests".into()),
+                0,
+            )))
+            .await
+        {
+            queued = Some(result.entry_id);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let queued_id = queued.expect("the steer must be accepted while the run is in flight");
+
+    // The enqueue is durable immediately, before anything consumes it.
+    let records = harness
+        .session()
+        .find_records(&RecordQuery {
+            lane: Some("main".to_string()),
+            record_type: Some("queue_enqueued"),
+            ..Default::default()
+        })
+        .await
+        .expect("records readable");
+    assert_eq!(
+        records.len(),
+        1,
+        "the enqueue must be recorded when the message is queued, got {records:?}"
+    );
+
+    // Kill the process mid-run, before the queue could be drained.
+    run.abort();
+    let _ = run.await;
+    let session = harness.session().clone();
+    drop(harness);
+
+    // Reopening restores the message as still-queued.
+    let recovered = reopen_harness(session).await;
+    let queued_now = recovered
+        .lane("main")
+        .queued_messages()
+        .await
+        .expect("queued messages readable");
+    assert_eq!(
+        queued_now.steering,
+        vec!["also check the tests".to_string()],
+        "a steer typed before the crash must come back queued"
+    );
+
+    // And it can still be cancelled by the id it was given.
+    let cancellation = recovered
+        .lane("main")
+        .cancel_queued(&queued_id)
+        .await
+        .expect("cancel succeeds");
+    assert_eq!(
+        cancellation.outcome,
+        rpi_harness::agent_harness::CancelQueuedOutcome::Cancelled,
+        "the restored item must be cancellable under its original id"
+    );
+    let after_cancel = recovered.lane("main").cancel_queued(&queued_id).await;
+    assert!(
+        after_cancel.is_ok(),
+        "cancelling an already-cancelled item is not an error"
+    );
+}
+
+/// A cancelled queued message must NOT come back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancelled_queued_message_does_not_come_back() {
+    let long = "the quick brown fox jumps over the lazy dog ".repeat(60);
+    let script = FauxScript::new()
+        .with_tokens_per_second(20.0)
+        .with_text(long);
+    let (harness, _provider, _env) = harness_with(script).await;
+
+    let run = {
+        let harness = harness.clone();
+        tokio::spawn(async move { harness.prompt_text("start something long", vec![]).await })
+    };
+
+    // Only meaningful once the run is past its steering drain point.
+    wait_until_streaming(harness.session()).await;
+    let mut queued_id = None;
+    for _ in 0..300 {
+        if let Ok(result) = harness
+            .lane("main")
+            .steer(AgentMessage::User(UserMessage::new(
+                UserContent::Text("never mind".into()),
+                0,
+            )))
+            .await
+        {
+            queued_id = Some(result.entry_id);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let queued_id = queued_id.expect("the steer must be accepted");
+    harness
+        .lane("main")
+        .cancel_queued(&queued_id)
+        .await
+        .expect("cancel succeeds");
+
+    run.abort();
+    let _ = run.await;
+    let session = harness.session().clone();
+    drop(harness);
+
+    let recovered = reopen_harness(session).await;
+    let queued_now = recovered
+        .lane("main")
+        .queued_messages()
+        .await
+        .expect("queued messages readable");
+    assert!(
+        queued_now.steering.is_empty(),
+        "a cancelled message must not be restored, got {:?}",
+        queued_now.steering
+    );
+}
+
+/// The queue records must be a legal record log — the reducer matches a
+/// cancellation against its enqueue on the run id, so a mismatch would surface
+/// as corruption rather than as a lost message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queue_records_validate_against_the_reducer() {
+    let long = "the quick brown fox jumps over the lazy dog ".repeat(60);
+    let script = FauxScript::new()
+        .with_tokens_per_second(20.0)
+        .with_text(long);
+    let (harness, _provider, _env) = harness_with(script).await;
+
+    let run = {
+        let harness = harness.clone();
+        tokio::spawn(async move { harness.prompt_text("start something long", vec![]).await })
+    };
+
+    // Only meaningful once the run is past its steering drain point.
+    wait_until_streaming(harness.session()).await;
+    let mut queued_id = None;
+    for _ in 0..300 {
+        if let Ok(result) = harness
+            .lane("main")
+            .steer(AgentMessage::User(UserMessage::new(
+                UserContent::Text("queued then cancelled".into()),
+                0,
+            )))
+            .await
+        {
+            queued_id = Some(result.entry_id);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let queued_id = queued_id.expect("the steer must be accepted");
+    harness
+        .lane("main")
+        .cancel_queued(&queued_id)
+        .await
+        .expect("cancel succeeds");
+
+    run.abort();
+    let _ = run.await;
+    let session = harness.session().clone();
+    drop(harness);
+
+    // Reopening settles the interrupted operation, then the whole log must be
+    // legal: the reducer matches a cancellation against its enqueue on the run
+    // id, so a mismatch would show up here as corruption.
+    let recovered = reopen_harness(session).await;
+    let session = recovered.session();
+    let slice = rpi_harness::session::RecordLogSlice {
+        lane: "main".to_string(),
+        open_operations: session
+            .find_open_operations("main", None)
+            .await
+            .expect("open operations readable"),
+        records: session
+            .find_records(&RecordQuery {
+                lane: Some("main".to_string()),
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            })
+            .await
+            .expect("records readable"),
+        entries: session
+            .find_entries(&EntryQuery {
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            })
+            .await
+            .expect("entries readable"),
+    };
+    rpi_harness::session::validate_record_log(&slice)
+        .expect("queue records must form a legal record log");
+}
+
+/// A crash *during* compaction must leave a session that is valid, correctly
+/// reported, and still usable.
+///
+/// Compaction needs no resume machinery, and this test is what pins that claim.
+/// The pre-run `should_compact` check re-evaluates on the next run, so a
+/// compaction that never landed is simply decided again — native relies on the
+/// same property ("a committed threshold compaction is its own durable marker —
+/// any crash re-entry sees the newer compaction and skips").
+///
+/// What has to be true is that the half-finished attempt leaves nothing broken:
+/// the `write_deferred` it recorded is reported (the entry it promised never
+/// landed), the record log stays legal, and the lane still runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crash_during_compaction_leaves_a_usable_session() {
+    use rpi_harness::runtime::{RecoveryDecision, RecoveryFinding, SessionRuntime};
+    use rpi_harness::session::types::{
+        CompactionReason, OperationIntent, OperationStartedRecord, ProvisionedEntryJSON,
+        RecordBase, StepAttemptRecord, StepKind, WriteDeferredRecord,
+    };
+
+    let session = replay_session();
+    session
+        .view("main")
+        .append_message(AgentMessage::User(UserMessage::new(
+            UserContent::Text("summarize this".into()),
+            0,
+        )))
+        .await
+        .expect("append a message");
+
+    let base = |id: &str| RecordBase {
+        id: id.to_string(),
+        seq: 0,
+        lane: "main".to_string(),
+        timestamp: 0,
+    };
+
+    // The run that died mid-compaction.
+    session
+        .append_record(LaneRecord::OperationStarted(OperationStartedRecord {
+            base: base("run-1"),
+            source_leaf_id: None,
+            intent: OperationIntent::Run {
+                original_prompt: Vec::new(),
+                initial_messages: Vec::new(),
+                system_prompt_override: None,
+                resume_data: None,
+            },
+        }))
+        .await
+        .expect("append the run");
+
+    // What `persist_compaction_entry` writes before committing: the intent to
+    // commit entry `compaction-1`. Only `id` matters for this test — the entry
+    // never landed, and the reducer's deep comparison only runs when it exists.
+    let target: ProvisionedEntryJSON = serde_json::json!({
+        "type": "compaction",
+        "id": "compaction-1",
+        "summary": "a summary that was never committed",
+    });
+    session
+        .append_record(LaneRecord::WriteDeferred(WriteDeferredRecord {
+            base: base("wd-1"),
+            run_id: "run-1".to_string(),
+            target,
+        }))
+        .await
+        .expect("append the deferred write");
+    session
+        .append_record(LaneRecord::StepAttempt(StepAttemptRecord {
+            base: base("sa-1"),
+            run_id: "run-1".to_string(),
+            step: StepKind::Compaction,
+            attempt: 1,
+            result_entry_id: "compaction-1".to_string(),
+            compaction_reason: Some(CompactionReason::Threshold),
+        }))
+        .await
+        .expect("append the step attempt");
+
+    // Reopen: recovery settles the dead run.
+    let recovered = reopen_harness(session.clone()).await;
+    assert!(
+        recovered
+            .session()
+            .find_open_operations("main", None)
+            .await
+            .expect("open operations readable")
+            .is_empty(),
+        "recovery must settle the operation that died mid-compaction"
+    );
+
+    // The half-finished intent is reported rather than silently dropped: the
+    // entry it promised never landed.
+    let runtime = SessionRuntime::new(recovered.session().clone());
+    let report = runtime.recover_lane("main").await.expect("recovery runs");
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|finding| matches!(finding, RecoveryFinding::DanglingWrite { run_id } if run_id == "run-1")),
+        "a deferred write whose entry never landed must be reported: {:?}",
+        report.findings
+    );
+    assert!(
+        runtime
+            .reconcile(&report)
+            .contains(&RecoveryDecision::DropDangling {
+                run_id: "run-1".to_string()
+            }),
+        "and reconciled to a drop, not to corruption"
+    );
+
+    // The log as a whole is still legal: a compaction step whose result is absent
+    // is exactly the deferred semantics the reducer allows.
+    let slice = rpi_harness::session::RecordLogSlice {
+        lane: "main".to_string(),
+        open_operations: recovered
+            .session()
+            .find_open_operations("main", None)
+            .await
+            .expect("open operations readable"),
+        records: recovered
+            .session()
+            .find_records(&RecordQuery {
+                lane: Some("main".to_string()),
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            })
+            .await
+            .expect("records readable"),
+        entries: recovered
+            .session()
+            .find_entries(&EntryQuery {
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            })
+            .await
+            .expect("entries readable"),
+    };
+    rpi_harness::session::validate_record_log(&slice)
+        .expect("a crash during compaction must leave a legal record log");
+
+    // And the lane still works: a fresh run completes normally.
+    let script = FauxScript::new().with_text("running fine");
+    let harness = replayable_harness(
+        recovered.session().clone(),
+        ToolReplay::Never,
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        true,
+        FauxProvider::new(script),
+    )
+    .await;
+    let result = harness
+        .prompt_text("carry on", vec![])
+        .await
+        .expect("a fresh run completes");
+    assert!(
+        matches!(result.outcome, HarnessRunOutcome::Completed { .. }),
+        "the lane must be usable after a compaction crash: {:?}",
+        result.outcome
+    );
+}
+
+/// A multi-turn run records one `step_attempt` per settled assistant message, and
+/// the numbers legitimately restart at 1 for each of them.
+///
+/// The reducer's "consecutive attempts" rule applies to a *live* series, i.e. one
+/// whose previous result has not landed yet (`validate_attempt_sequence` treats a
+/// previous result with an earlier sequence as ending the series). Two assistant
+/// messages in one run are therefore two independent series, each starting at 1 —
+/// `[1, 1]` is correct, not corruption. This test pins that, because it is the
+/// opposite of what a reader would guess.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_multi_turn_run_leaves_a_valid_record_log() {
+    let script = FauxScript::new()
+        .with_tool_call("read", serde_json::json!({ "path": "a.txt" }))
+        .with_tool_call("read", serde_json::json!({ "path": "b.txt" }))
+        .with_text("done");
+    let (harness, _provider, _env) = harness_with(script).await;
+
+    let result = harness
+        .prompt_text("read two files", vec![])
+        .await
+        .expect("run completes");
+    assert!(matches!(
+        result.outcome,
+        HarnessRunOutcome::Completed { .. }
+    ));
+
+    let session = harness.session();
+    let records = session
+        .find_records(&RecordQuery {
+            lane: Some("main".to_string()),
+            order: Some(EntryOrder::OldestFirst),
+            ..Default::default()
+        })
+        .await
+        .expect("records readable");
+    let attempts: Vec<u32> = records
+        .iter()
+        .filter_map(|record| match record {
+            LaneRecord::StepAttempt(attempt) => Some(attempt.attempt),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        attempts,
+        vec![1, 1],
+        "each settled assistant message starts its own attempt series"
+    );
+
+    let slice = rpi_harness::session::RecordLogSlice {
+        lane: "main".to_string(),
+        open_operations: session
+            .find_open_operations("main", None)
+            .await
+            .expect("open operations readable"),
+        records,
+        entries: session
+            .find_entries(&EntryQuery {
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            })
+            .await
+            .expect("entries readable"),
+    };
+    rpi_harness::session::validate_record_log(&slice)
+        .expect("a multi-turn run must leave a legal record log");
+}
+
+/// A crash in the middle of a **multi-turn** run must be resumed with the whole
+/// committed prefix intact and the rest of the work finished.
+///
+/// Every recovery test so far used a single-turn run. A long task is multi-turn —
+/// assistant, tools, assistant, tools — so this is the realistic case, and it
+/// exercises several things at once: one entry per settled assistant message, one
+/// result per tool call, the salvage of only the *last* stream, and the resume
+/// gate seeing a tool result at the tip.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_multi_turn_run_resumes_after_a_crash_in_a_later_tool_call() {
+    let script = FauxScript::new()
+        .with_tool_call("flaky_read", serde_json::json!({}))
+        .with_tool_call("flaky_read", serde_json::json!({}))
+        .with_text("all done");
+    let session = replay_session();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // The first call answers; the second hangs, so the run dies on turn 2.
+    let harness = replayable_harness_hanging_at(
+        session.clone(),
+        ToolReplay::Never,
+        Arc::clone(&calls),
+        false,
+        FauxProvider::new(script),
+        2,
+    )
+    .await;
+
+    let run = {
+        let harness = harness.clone();
+        tokio::spawn(async move { harness.prompt_text("read it twice", vec![]).await })
+    };
+    // Wait until the second tool call is the one in flight.
+    let mut in_second = false;
+    for _ in 0..500 {
+        if calls.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
+            in_second = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(in_second, "the run must have reached its second tool call");
+    run.abort();
+    let _ = run.await;
+    drop(harness);
+
+    let recovered = replayable_harness(
+        session,
+        ToolReplay::Never,
+        Arc::clone(&calls),
+        true,
+        FauxProvider::new(FauxScript::new().with_text("carried on to the end")),
+    )
+    .await;
+
+    // The committed prefix is intact: two assistant turns, two tool results (the
+    // second recorded as unknown, since the tool never returned).
+    let entries = recovered
+        .session()
+        .view("main")
+        .find_entries_on_branch(
+            &EntryQuery {
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            },
+            &BranchBounds::default(),
+        )
+        .await
+        .expect("branch readable");
+    let assistants = entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry,
+                rpi_harness::session::types::Entry::Message(message)
+                    if matches!(message.message, AgentMessage::Assistant(_))
+            )
+        })
+        .count();
+    let results = entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry,
+                rpi_harness::session::types::Entry::Message(message)
+                    if matches!(message.message, AgentMessage::ToolResult(_))
+            )
+        })
+        .count();
+    assert_eq!(assistants, 2, "both assistant turns must survive");
+    assert_eq!(
+        results, 2,
+        "every recorded tool call needs a result, or the next request is invalid"
+    );
+
+    // And the run continues from there.
+    let pending = recovered
+        .pending_resume()
+        .expect("the branch ends at a tool result, so the run can continue");
+    assert_eq!(pending.attempt, 0);
+    let resumed = recovered
+        .resume_pending()
+        .await
+        .expect("resume runs")
+        .expect("the run continues");
+    assert!(matches!(
+        resumed.outcome,
+        HarnessRunOutcome::Completed { .. }
+    ));
+
+    let joined = branch_assistant_text(&recovered).await;
+    assert!(
+        joined.contains("carried on to the end"),
+        "the resumed run's output must be in the transcript, got {joined:?}"
+    );
+
+    // The log is still legal after all of that.
+    let session = recovered.session();
+    let slice = rpi_harness::session::RecordLogSlice {
+        lane: "main".to_string(),
+        open_operations: session
+            .find_open_operations("main", None)
+            .await
+            .expect("open operations readable"),
+        records: session
+            .find_records(&RecordQuery {
+                lane: Some("main".to_string()),
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            })
+            .await
+            .expect("records readable"),
+        entries: session
+            .find_entries(&EntryQuery {
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            })
+            .await
+            .expect("entries readable"),
+    };
+    rpi_harness::session::validate_record_log(&slice)
+        .expect("a multi-turn crash and resume must leave a legal record log");
+}
+
+/// A crash during a **parallel tool batch** must still leave a result for every
+/// call in it.
+///
+/// The batch is all-or-nothing in the transcript, and that is what makes the
+/// recovery rule ("resolve the unresolved calls of the assistant at the tip")
+/// sufficient: `execute_tool_calls_parallel` emits tool-result messages only
+/// *after every call in the batch has settled*, in source order
+/// (`pi-agent/src/agent_loop.rs`). So the fast call's result cannot land while a
+/// sibling is still running — either the batch emitted results, or none did and
+/// the assistant message is still the tip.
+///
+/// This test pins that reliance: if result emission ever became incremental, the
+/// tip would be a tool result while the assistant holding the unfinished call sat
+/// one entry back, and recovery would leave that call with no result — an invalid
+/// request. It would fail here rather than in production.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_partially_completed_tool_batch_is_repaired() {
+    use rpi_ai::providers::faux::{faux_assistant_message, FauxBlock};
+
+    // One assistant message carrying two calls, so they form a single batch.
+    let script = FauxScript::new();
+    script.set_responses(vec![
+        FauxStep::Message(faux_assistant_message(
+            vec![
+                FauxBlock::tool_call("flaky_read", serde_json::json!({})),
+                FauxBlock::tool_call("flaky_read", serde_json::json!({})),
+            ],
+            rpi_ai::types::StopReason::ToolUse,
+        )),
+        FauxStep::text("batch finished"),
+    ]);
+
+    let session = replay_session();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let harness = replayable_harness_hanging_at(
+        session.clone(),
+        ToolReplay::Never,
+        Arc::clone(&calls),
+        false,
+        FauxProvider::new(script),
+        2,
+    )
+    .await;
+
+    let run = {
+        let harness = harness.clone();
+        tokio::spawn(async move { harness.prompt_text("run both", vec![]).await })
+    };
+    let mut second_in_flight = false;
+    for _ in 0..500 {
+        if calls.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
+            second_in_flight = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        second_in_flight,
+        "the batch must have reached its second call"
+    );
+    run.abort();
+    let _ = run.await;
+    drop(harness);
+
+    let recovered = replayable_harness(
+        session,
+        ToolReplay::Never,
+        Arc::clone(&calls),
+        true,
+        FauxProvider::new(FauxScript::new().with_text("continued after the batch")),
+    )
+    .await;
+
+    let entries = recovered
+        .session()
+        .view("main")
+        .find_entries_on_branch(
+            &EntryQuery {
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            },
+            &BranchBounds::default(),
+        )
+        .await
+        .expect("branch readable");
+    let mut call_ids: Vec<String> = Vec::new();
+    let mut result_ids: Vec<String> = Vec::new();
+    for entry in &entries {
+        if let rpi_harness::session::types::Entry::Message(message) = entry {
+            match &message.message {
+                AgentMessage::Assistant(assistant) => {
+                    for block in &assistant.content {
+                        if let rpi_ai::types::Content::ToolCall(call) = block {
+                            call_ids.push(call.id.clone());
+                        }
+                    }
+                }
+                AgentMessage::ToolResult(result) => result_ids.push(result.tool_call_id.clone()),
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(call_ids.len(), 2, "the batch must survive as one message");
+    for id in &call_ids {
+        assert!(
+            result_ids.contains(id),
+            "every call in the batch needs a result; {id} has none \
+             (calls={call_ids:?}, results={result_ids:?})"
+        );
+    }
+
+    let session = recovered.session();
+    let slice = rpi_harness::session::RecordLogSlice {
+        lane: "main".to_string(),
+        open_operations: session
+            .find_open_operations("main", None)
+            .await
+            .expect("open operations readable"),
+        records: session
+            .find_records(&RecordQuery {
+                lane: Some("main".to_string()),
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            })
+            .await
+            .expect("records readable"),
+        entries: session
+            .find_entries(&EntryQuery {
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            })
+            .await
+            .expect("entries readable"),
+    };
+    rpi_harness::session::validate_record_log(&slice)
+        .expect("a repaired batch must leave a legal record log");
+}
+
+/// A crash during retry backoff must not silently end the run.
+///
+/// When an attempt fails with a retryable provider error the harness sleeps
+/// before retrying, and nothing is persisted in that window (the failed attempt's
+/// message is deliberately not committed). The run was *going* to retry and the
+/// user asked for a result, so recovery must retry rather than leave an
+/// "interrupted" message and make the user ask again.
+///
+/// Recognising that relies on the durable `retry_pending` record: the frames
+/// cannot answer it, because a failed attempt leaves no terminal frame and so its
+/// reduced message looks merely `pending`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crash_during_retry_backoff_still_retries() {
+    let mut transient = faux_assistant_message("", rpi_ai::types::StopReason::Error);
+    transient.error_message = Some("503 service unavailable".into());
+    let script = FauxScript::new();
+    script.set_responses(vec![
+        FauxStep::message(transient),
+        FauxStep::text("recovered after the restart"),
+    ]);
+
+    // A long base delay opens the window: the run sleeps here, which is where the
+    // crash lands.
+    let session = replay_session();
+    let harness = replayable_harness_with_retry(
+        session.clone(),
+        ToolReplay::Never,
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        false,
+        FauxProvider::new(script),
+        RetryPolicy {
+            enabled: true,
+            max_retries: 3,
+            base_delay_ms: 30_000,
+            ..RetryPolicy::default()
+        },
+    )
+    .await;
+
+    let run = {
+        let harness = harness.clone();
+        tokio::spawn(async move { harness.prompt_text("ask something", vec![]).await })
+    };
+    // Wait for the scheduled retry to be recorded: that is the marker recovery
+    // reads, and it is written immediately before the backoff sleep.
+    let mut scheduled = false;
+    for _ in 0..300 {
+        let records = session
+            .find_records(&RecordQuery {
+                record_type: Some("retry_pending"),
+                ..Default::default()
+            })
+            .await
+            .expect("records readable");
+        if !records.is_empty() {
+            scheduled = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(scheduled, "the retry must be recorded before the backoff");
+    run.abort();
+    let _ = run.await;
+    drop(harness);
+
+    let recovered = replayable_harness_with_retry(
+        session,
+        ToolReplay::Never,
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        true,
+        FauxProvider::new(FauxScript::new().with_text("recovered after the restart")),
+        RetryPolicy {
+            enabled: true,
+            max_retries: 3,
+            base_delay_ms: 10,
+            ..RetryPolicy::default()
+        },
+    )
+    .await;
+
+    // The failed attempt is not dressed up as salvaged content, and the run is
+    // offered for continuation.
+    let joined = branch_assistant_text(&recovered).await;
+    assert!(
+        !joined.contains(rpi_harness::frame_progress::INTERRUPTED_NOTICE),
+        "a retryable failure is not salvaged content, got {joined:?}"
+    );
+    let pending = recovered
+        .pending_resume()
+        .expect("the run was about to retry, so it must be continued");
+    assert_eq!(pending.attempt, 0);
+
+    let resumed = recovered
+        .resume_pending()
+        .await
+        .expect("resume runs")
+        .expect("the run continues");
+    assert!(matches!(
+        resumed.outcome,
+        HarnessRunOutcome::Completed { .. }
+    ));
+    let joined = branch_assistant_text(&recovered).await;
+    assert!(
+        joined.contains("recovered after the restart"),
+        "the retry must produce the successful attempt, got {joined:?}"
+    );
+}
+
+/// A retry that *succeeded* must not leave a pending resume behind.
+///
+/// The `retry_pending` record stays in the log after the retry succeeds, so the
+/// only thing that may keep it from re-triggering is the reserved entry actually
+/// landing. This test is what pins that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_successful_retry_leaves_nothing_pending() {
+    let mut transient = faux_assistant_message("", rpi_ai::types::StopReason::Error);
+    transient.error_message = Some("503 service unavailable".into());
+    let script = FauxScript::new();
+    script.set_responses(vec![
+        FauxStep::message(transient),
+        FauxStep::text("recovered without a restart"),
+    ]);
+    let session = replay_session();
+    let harness = replayable_harness_with_retry(
+        session,
+        ToolReplay::Never,
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        false,
+        FauxProvider::new(script),
+        RetryPolicy {
+            enabled: true,
+            max_retries: 3,
+            base_delay_ms: 1,
+            ..RetryPolicy::default()
+        },
+    )
+    .await;
+
+    let result = harness
+        .prompt_text("ask something", vec![])
+        .await
+        .expect("the retry recovers in-process");
+    assert!(matches!(
+        result.outcome,
+        HarnessRunOutcome::Completed { .. }
+    ));
+    assert!(
+        harness.pending_resume().is_none(),
+        "a retry that succeeded in-process leaves nothing to continue"
+    );
+}
+
+/// A steering message the model was already given must survive a crash.
+///
+/// Injected messages are the only user messages that appear *inside* the loop, and
+/// the run-end pass is what used to persist them. So a crash after injection and
+/// before the run ended lost the text the model had already been given — and the
+/// queue item was cancelled at drain time, so it was gone for good. Committing it
+/// at its own settle is what closes that.
+///
+/// The steering message is queued *before* the run starts, so it is drained at the
+/// loop's first boundary and injected deterministically. Afterwards the run dies
+/// inside its second tool call, i.e. long before the run-end pass could persist
+/// anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_injected_steering_message_survives_a_crash() {
+    // Two tool-call turns and then text: the second turn's call hangs, so the run
+    // really is still working (not finished) when it is killed.
+    let script = FauxScript::new()
+        .with_tool_call("flaky_read", serde_json::json!({}))
+        .with_tool_call("flaky_read", serde_json::json!({}))
+        .with_text("done");
+    let session = replay_session();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // Hang on the *second* invocation: the first turn's call completes, the second
+    // turn's never does, so the run has a long tail to die in.
+    let harness = replayable_harness_hanging_at(
+        session.clone(),
+        ToolReplay::Never,
+        Arc::clone(&calls),
+        false,
+        FauxProvider::new(script),
+        2,
+    )
+    .await;
+
+    harness
+        .lane("main")
+        .steer(AgentMessage::User(UserMessage::new(
+            UserContent::Text("also do the other thing".into()),
+            0,
+        )))
+        .await
+        .expect("steer is accepted while idle");
+
+    let run = {
+        let harness = harness.clone();
+        tokio::spawn(async move { harness.prompt_text("start something", vec![]).await })
+    };
+
+    // Wait until the injected text is an entry. This must happen at its own
+    // settle; the run has not ended (it is still working towards the hanging
+    // tool), so the run-end pass cannot be the reason it is there.
+    let has_steer = |entries: &[rpi_harness::session::types::Entry]| {
+        entries.iter().any(|entry| match entry {
+            rpi_harness::session::types::Entry::Message(message) => match &message.message {
+                AgentMessage::User(user) => matches!(
+                    &user.content,
+                    UserContent::Text(text) if text.contains("also do the other thing")
+                ),
+                _ => false,
+            },
+            _ => false,
+        })
+    };
+    let mut injected = false;
+    for _ in 0..500 {
+        let entries = harness
+            .session()
+            .view("main")
+            .find_entries_on_branch(
+                &EntryQuery {
+                    order: Some(EntryOrder::OldestFirst),
+                    ..Default::default()
+                },
+                &BranchBounds::default(),
+            )
+            .await
+            .expect("branch readable");
+        if has_steer(&entries) {
+            injected = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        injected,
+        "the injected steering message must be committed when it settles, not at run end"
+    );
+
+    // The run must actually be mid-flight when it dies: wait for the hanging
+    // second call, which only its second tool-call turn reaches.
+    let mut reached_hang = false;
+    for _ in 0..500 {
+        if calls.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
+            reached_hang = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        reached_hang,
+        "the run must reach its second tool call before it is killed"
+    );
+    run.abort();
+    let _ = run.await;
+    drop(harness);
+
+    // The text is still there after recovery.
+    let recovered = replayable_harness(
+        session,
+        ToolReplay::Never,
+        Arc::clone(&calls),
+        true,
+        FauxProvider::new(FauxScript::new().with_text("continued")),
+    )
+    .await;
+    let entries = recovered
+        .session()
+        .view("main")
+        .find_entries_on_branch(
+            &EntryQuery {
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            },
+            &BranchBounds::default(),
+        )
+        .await
+        .expect("branch readable");
+    assert!(
+        has_steer(&entries),
+        "the steering text the model was given must survive the crash"
+    );
+}
+
+/// A crash before the first provider call must still continue the run.
+///
+/// This is native pi's `starting` state: the operation opened and the prompt was
+/// persisted, then the process died before anything was asked. The branch tip is
+/// still the prompt, so the run has produced nothing and should simply continue —
+/// the user does not need to retype what they already sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crash_before_the_first_request_still_continues() {
+    use rpi_harness::session::types::{OperationIntent, OperationStartedRecord, RecordBase};
+
+    let session = replay_session();
+    // The prompt the run persisted, then died on.
+    session
+        .view("main")
+        .append_message(AgentMessage::User(UserMessage::new(
+            UserContent::Text("what I asked for".into()),
+            0,
+        )))
+        .await
+        .expect("append the prompt");
+
+    // The run that died before calling the provider: opened, never finished.
+    session
+        .append_record(LaneRecord::OperationStarted(OperationStartedRecord {
+            base: RecordBase {
+                id: "run-1".to_string(),
+                seq: 0,
+                lane: "main".to_string(),
+                timestamp: 0,
+            },
+            source_leaf_id: None,
+            intent: OperationIntent::Run {
+                original_prompt: Vec::new(),
+                initial_messages: Vec::new(),
+                system_prompt_override: None,
+                resume_data: None,
+            },
+        }))
+        .await
+        .expect("append the run");
+
+    let recovered = replayable_harness(
+        session,
+        ToolReplay::Never,
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        true,
+        FauxProvider::new(FauxScript::new().with_text("answered on the restart")),
+    )
+    .await;
+
+    let pending = recovered
+        .pending_resume()
+        .expect("a run that produced nothing should be continued");
+    assert_eq!(pending.attempt, 0);
+
+    let resumed = recovered
+        .resume_pending()
+        .await
+        .expect("resume runs")
+        .expect("the run continues");
+    assert!(matches!(
+        resumed.outcome,
+        HarnessRunOutcome::Completed { .. }
+    ));
+    let joined = branch_assistant_text(&recovered).await;
+    assert!(
+        joined.contains("answered on the restart"),
+        "the continued run must answer, got {joined:?}"
+    );
+}
+
+/// A deferred provider response suspends the run, and resuming it finishes the
+/// work — including executing tool calls that arrived *from the poll*.
+///
+/// This is the shape native pi's `assistant.effect_pending` / `deferred.*` states
+/// cover: the provider answers "not yet, poll this handle later" instead of a
+/// message. The run must stay suspended (its operation open) rather than be
+/// reported as finished, and on resume the polled assistant message's tool calls
+/// have to run **before** the next provider request — a request carrying
+/// unanswered tool calls is rejected by every provider. That is why resuming is
+/// entered *from* the assistant message rather than by asking again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_deferred_response_suspends_and_then_resumes_through_its_tools() {
+    use rpi_ai::providers::faux::{faux_assistant_message, DeferredPoll};
+    use rpi_ai::types::{DeferredHandle, StopReason};
+
+    // Turn 1 calls a tool; turn 2's answer arrives through a poll.
+    let script = FauxScript::new()
+        .with_tool_call("read", serde_json::json!({ "path": "a.txt" }))
+        .with_text("done");
+    let (harness, provider, _env) = harness_with(script).await;
+
+    // What the poll returns: an assistant message with a tool call. Its tools were
+    // never run (they came from outside the loop), which is the case this test
+    // exists for.
+    let mut polled = faux_assistant_message("", StopReason::ToolUse);
+    polled.content = vec![rpi_ai::types::Content::ToolCall(rpi_ai::types::ToolCall {
+        kind: rpi_ai::types::ToolCallType,
+        id: "polled-call".to_string(),
+        name: "read".to_string(),
+        arguments: serde_json::json!({ "path": "b.txt" }),
+        thought_signature: None,
+        namespace: None,
+    })];
+    provider.push_deferred_poll(DeferredPoll::Message(polled));
+
+    // A handle the run can park on. The provider id/model must match the registered
+    // provider so `resume_deferred` resolves its capability.
+    let handle = DeferredHandle {
+        provider: provider.id().to_string(),
+        model_id: provider.default_model().id.clone(),
+        api: provider.default_model().api.as_str().to_string(),
+        id: "deferred-1".to_string(),
+        expires_at: None,
+        poll_after_ms: None,
+        data: None,
+    };
+
+    // Suspend: record the parked assistant message carrying the handle. This is
+    // what `find_deferred_handle` reads.
+    let mut parked = faux_assistant_message("", StopReason::Deferred);
+    parked.deferred = Some(handle.clone());
+    harness
+        .session()
+        .view("main")
+        .append_message(AgentMessage::Assistant(Box::new(parked)))
+        .await
+        .expect("park the deferred message");
+
+    // The suspended operation stays open, which is what makes it resumable.
+    let _ = StopReason::Deferred;
+
+    let result = harness
+        .resume(&handle.id)
+        .await
+        .expect("resume drives the deferred handle");
+    assert!(
+        matches!(result.outcome, HarnessRunOutcome::Completed { .. }),
+        "the resumed run must finish, got {:?}",
+        result.outcome
+    );
+
+    // The polled message's tool call really ran: a result for it is on the branch,
+    // not just an "unknown" stand-in.
+    let entries = harness
+        .session()
+        .view("main")
+        .find_entries_on_branch(
+            &EntryQuery {
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            },
+            &BranchBounds::default(),
+        )
+        .await
+        .expect("branch readable");
+    let polled_result = entries.iter().find_map(|entry| match entry {
+        rpi_harness::session::types::Entry::Message(message) => match &message.message {
+            AgentMessage::ToolResult(result) if result.tool_call_id == "polled-call" => {
+                Some((**result).clone())
+            }
+            _ => None,
+        },
+        _ => None,
+    });
+    let polled_result = polled_result.expect("the polled tool call must have been executed");
+    assert!(
+        !polled_result.is_error || !polled_result.content.is_empty(),
+        "the tool must actually have run, got {polled_result:?}"
+    );
+}
+
+/// A poll that hands back another handle must keep the run parked.
+///
+/// The provider is allowed to answer "still not ready" indefinitely, so resuming
+/// must loop rather than treat the poll as a finished turn: the run stays
+/// suspended, its operation stays open, and the *new* handle is what the next
+/// resume polls.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_still_deferred_poll_keeps_the_run_parked() {
+    use rpi_ai::providers::faux::{faux_assistant_message, DeferredPoll};
+    use rpi_ai::types::{DeferredHandle, StopReason};
+
+    let script = FauxScript::new().with_text("unused");
+    let (harness, provider, _env) = harness_with(script).await;
+
+    let handle = DeferredHandle {
+        provider: provider.id().to_string(),
+        model_id: provider.default_model().id.clone(),
+        api: provider.default_model().api.as_str().to_string(),
+        id: "deferred-1".to_string(),
+        expires_at: None,
+        poll_after_ms: None,
+        data: None,
+    };
+    let next_handle = DeferredHandle {
+        id: "deferred-2".to_string(),
+        ..handle.clone()
+    };
+    // First poll: still deferred, with a fresh handle.
+    provider.push_deferred_poll(DeferredPoll::StillDeferred(next_handle.clone()));
+
+    let mut parked = faux_assistant_message("", StopReason::Deferred);
+    parked.deferred = Some(handle.clone());
+    harness
+        .session()
+        .view("main")
+        .append_message(AgentMessage::Assistant(Box::new(parked)))
+        .await
+        .expect("park the deferred message");
+
+    let result = harness.resume(&handle.id).await.expect("resume polls once");
+    match result.outcome {
+        HarnessRunOutcome::Suspended { deferred, .. } => assert_eq!(
+            deferred.id, next_handle.id,
+            "a still-deferred poll must carry the new handle forward"
+        ),
+        other => panic!("a still-deferred poll must stay suspended, got {other:?}"),
+    }
+    // The new handle is discoverable, so the next resume polls it in turn.
+    assert!(
+        harness.drive(&next_handle.id).await.is_ok(),
+        "the follow-up handle must be drivable"
+    );
+}
+
+/// A provider with no long-poll continuation must report that, not pretend the
+/// run finished.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resuming_through_a_provider_without_the_capability_is_an_error() {
+    use rpi_ai::providers::faux::faux_assistant_message;
+    use rpi_ai::types::{DeferredHandle, StopReason};
+
+    let script = FauxScript::new().with_text("unused");
+    let (harness, provider, _env) = harness_with(script).await;
+
+    // A handle naming a provider that is not registered at all.
+    let handle = DeferredHandle {
+        provider: "some-other-provider".to_string(),
+        model_id: provider.default_model().id.clone(),
+        api: provider.default_model().api.as_str().to_string(),
+        id: "deferred-1".to_string(),
+        expires_at: None,
+        poll_after_ms: None,
+        data: None,
+    };
+    let mut parked = faux_assistant_message("", StopReason::Deferred);
+    parked.deferred = Some(handle.clone());
+    harness
+        .session()
+        .view("main")
+        .append_message(AgentMessage::Assistant(Box::new(parked)))
+        .await
+        .expect("park the deferred message");
+
+    let error = harness
+        .resume(&handle.id)
+        .await
+        .expect_err("an unresolvable handle must be an error, not a fake finish");
+    assert!(
+        format!("{error:?}").contains("no provider"),
+        "the error must say which provider is missing, got {error:?}"
     );
 }

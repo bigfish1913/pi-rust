@@ -112,6 +112,7 @@ pub async fn run_agent_loop(
         &config,
         &emit,
         &stream_fn,
+        None,
     )
     .await?;
     Ok(new_messages)
@@ -149,6 +150,49 @@ pub async fn run_agent_loop_continue(
         &config,
         &emit,
         &stream_fn,
+        None,
+    )
+    .await?;
+    Ok(new_messages)
+}
+
+/// Continue a run whose last assistant message has **not had its tools run**.
+///
+/// This is the case a *deferred* (long-poll) provider creates: the turn's
+/// assistant message arrives from a poll rather than from the loop, so it is
+/// already in the transcript while its tool calls are still unanswered. The next
+/// provider request would be rejected (every provider refuses an assistant message
+/// whose tool calls have no results), so the tools must run first — which is
+/// exactly what this entry point does before continuing the loop normally.
+///
+/// Errors when the last message is not an assistant message: there would be
+/// nothing to resume, and silently calling the provider instead would be wrong.
+pub async fn run_agent_loop_from_assistant(
+    context: AgentContext,
+    config: AgentLoopConfig,
+    emit: Arc<dyn AgentEmitter>,
+    stream_fn: StreamFn,
+) -> Result<NewMessages, AgentError> {
+    let mut current_context = context;
+    let Some(AgentMessage::Assistant(assistant)) = current_context.messages.last().cloned() else {
+        return Err(AgentError::State(
+            "cannot continue from an assistant whose tools already ran: the last message is not an              assistant message"
+                .into(),
+        ));
+    };
+    let mut new_messages: Vec<AgentMessage> = Vec::new();
+
+    emit_event(&emit, AgentEvent::AgentStart).await;
+    // The turn whose tools are about to run is the current turn.
+    emit_event(&emit, AgentEvent::TurnStart).await;
+
+    run_loop(
+        &mut current_context,
+        &mut new_messages,
+        &config,
+        &emit,
+        &stream_fn,
+        Some(*assistant),
     )
     .await?;
     Ok(new_messages)
@@ -179,7 +223,14 @@ async fn run_loop(
     config: &AgentLoopConfig,
     emit: &Arc<dyn AgentEmitter>,
     stream_fn: &StreamFn,
+    // `pending_assistant`: an assistant message already sitting at the end of
+    // `current_context` whose tool calls have not run yet (see
+    // `run_agent_loop_from_assistant`). When set, the first iteration executes its
+    // tools instead of calling the provider — and does *not* push it into
+    // `new_messages`, because it is already in the transcript.
+    pending_assistant: Option<AssistantMessage>,
 ) -> Result<LoopOutcome, AgentError> {
+    let mut pending_assistant = pending_assistant;
     let mut first_turn = true;
     // Check for steering messages at start (user may have typed while waiting).
     let mut pending_messages = drain_steering(config).await;
@@ -219,10 +270,17 @@ async fn run_loop(
                 }
             }
 
-            // Stream the assistant response.
-            let message =
-                stream_assistant_response(current_context, config, emit, stream_fn).await?;
-            new_messages.push(AgentMessage::Assistant(Box::new(message.clone())));
+            // Stream the assistant response — unless the caller handed us one
+            // whose tools still have to run.
+            let message = match pending_assistant.take() {
+                Some(message) => message,
+                None => {
+                    let message =
+                        stream_assistant_response(current_context, config, emit, stream_fn).await?;
+                    new_messages.push(AgentMessage::Assistant(Box::new(message.clone())));
+                    message
+                }
+            };
 
             if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
                 let am = AgentMessage::Assistant(Box::new(message.clone()));

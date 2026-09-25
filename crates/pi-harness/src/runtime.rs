@@ -77,6 +77,13 @@ pub struct ToolFrame {
     pub tool_call_id: String,
     pub tool_name: String,
     pub result_entry_id: String,
+    /// The arguments the call was recorded with. Recovery needs them to re-run a
+    /// replayable call: the in-memory arguments died with the process, and the
+    /// recorded ones are the only faithful copy.
+    pub effective_args: serde_json::Value,
+    /// The replay policy recorded when the call started. Recovery requires this
+    /// **and** the current tool declaration to say `Safe` before re-running.
+    pub replay: crate::session::types::ToolReplay,
 }
 
 /// A structural problem found while reconciling a lane.
@@ -315,6 +322,8 @@ impl SessionRuntime {
                         tool_call_id: t.tool_call_id,
                         tool_name: t.tool_name,
                         result_entry_id: t.result_entry_id,
+                        effective_args: t.effective_args,
+                        replay: t.replay,
                     });
                 }
                 _ => {}
