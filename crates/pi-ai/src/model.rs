@@ -64,6 +64,32 @@ impl AnthropicMessagesCompat {
     }
 }
 
+/// Whether the next request carries the model's own prior reasoning back to it.
+///
+/// This decides what the system prompt may claim about the working-state
+/// channel: when reasoning *is* replayed, telling the model "reasoning is not
+/// carried into your next turn" is simply false, and the instruction to restate
+/// the plan every turn becomes busy-work (the re-plan symptom in
+/// `docs/llm-repetition-forensics.md`).
+///
+/// - `openai-completions`: only with `compat.requiresThinkingAsText`, which
+///   flattens thinking blocks into `text` parts (`providers/openai_completions.rs`).
+/// - `openai-responses`: visible thinking is replayed as input content.
+/// - `anthropic-messages`: thinking blocks are echoed back with their signature.
+/// - everything else: reasoning is dropped, so the model cannot see it again.
+pub fn prior_reasoning_is_replayed(model: &Model) -> bool {
+    match model.api {
+        Api::OpenaiCompletions => matches!(
+            model.compat.as_ref(),
+            Some(StreamingProtocolCompat::OpenaiCompletions(compat))
+                if compat.requires_thinking_as_text == Some(true)
+        ),
+        Api::OpenaiResponses | Api::AzureOpenaiResponses | Api::OpenaiCodexResponses => true,
+        Api::AnthropicMessages => true,
+        _ => false,
+    }
+}
+
 /// Compatibility flags for OpenAI Completions-compat APIs. Only a subset is
 /// modeled for v1 (we have no OpenAI provider yet); the rest live here as
 /// `Option`s for forward-compat.

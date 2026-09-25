@@ -121,7 +121,25 @@ pub(crate) fn package_resources_for_update_check(
 
 /// The default coding system prompt. A condensed port of the TS
 /// `packages/coding-agent/src/core/system-prompt.ts` base prompt.
-pub fn default_system_prompt(cwd: &str) -> String {
+pub fn default_system_prompt(cwd: &str, prior_reasoning_replayed: bool) -> String {
+    // The working-state rule must match what actually comes back on the next
+    // request. With `compat.requiresThinkingAsText` (or the native thinking
+    // channels of anthropic/responses) the model *does* see its own reasoning
+    // again, and claiming otherwise makes it re-derive and restate the plan
+    // every turn — the re-plan symptom in `docs/llm-repetition-forensics.md`.
+    let working_state_rule = if prior_reasoning_replayed {
+        "- Keep a SHORT working plan visible (a few bullets, or the todo tool) and update it as you go.  
+  Your own reasoning is carried back to you on the next turn, so do not re-derive it or restate  
+  the whole plan: continue from the last unfinished step, and when a step lands, say which one.  
+  Re-listing the same plan without acting on it is a bug, not progress."
+    } else {
+        "- Keep your working state in your VISIBLE replies, not only in reasoning. Reasoning is not  
+  carried into your next turn: only the text you write and the tool output you produce come  
+  back. Before each batch of tool calls, write one short line naming the task you are on and  
+  what remains. When you finish a step, say which one is done. If you keep the plan only in  
+  your head you will re-derive it from scratch every turn."
+    };
+
     format!(
         "You are an expert coding assistant operating inside rpi, a coding agent harness. \
 You help users by reading files, executing commands, editing code, and writing new files.
@@ -137,11 +155,7 @@ Guidelines:
 - Be concise in your responses
 - Show file paths clearly when working with files
 - Prefer the smallest change that solves the problem
-- Keep your working state in your VISIBLE replies, not only in reasoning. Reasoning is not
-  carried into your next turn: only the text you write and the tool output you produce come
-  back. Before each batch of tool calls, write one short line naming the task you are on and
-  what remains. When you finish a step, say which one is done. If you keep the plan only in
-  your head you will re-derive it from scratch every turn.
+{working_state_rule}
 - Track multi-step work with the todo tool instead of re-listing the plan in prose: add the
   steps once, then mark them done as you go. Re-stating the same plan without acting on it is
   a bug, not progress.
@@ -463,16 +477,21 @@ pub async fn build(
     // `<agent_dir>/SYSTEM.md`.
     // (global); otherwise the built-in default. **Project-wins** — the same
     // direction as skills/prompts precedence.
+    // Whether this model sees its own prior reasoning again decides how the
+    // working-state rule is worded (see `default_system_prompt`).
+    let prior_reasoning_replayed = rpi_ai::model::prior_reasoning_is_replayed(&resolved.model);
     let base_prompt = match args.system_prompt.as_deref() {
         Some(explicit) => explicit.to_string(),
         None if project_trusted => {
             match discover_system_prompt_file_with_packages(cwd, &package_resources) {
                 Some(path) => std::fs::read_to_string(&path)
-                    .unwrap_or_else(|_| default_system_prompt(&cwd_str)),
-                None => default_system_prompt(&cwd_str),
+                    .unwrap_or_else(|_| {
+                        default_system_prompt(&cwd_str, prior_reasoning_replayed)
+                    }),
+                None => default_system_prompt(&cwd_str, prior_reasoning_replayed),
             }
         }
-        None => default_system_prompt(&cwd_str),
+        None => default_system_prompt(&cwd_str, prior_reasoning_replayed),
     };
 
     // ---- Append-text sources (precedence: --append-system-prompt > APPEND_SYSTEM.md) ----
@@ -1399,13 +1418,17 @@ where
     }
 
     // ---- Re-compose the system prompt (same precedence as build) ----
+    // Same working-state wording rule as `build`; a mid-session `/model` switch
+    // re-composes the prompt on the next reload, which is the same staleness the
+    // rest of this path already has (provider resolution is a startup concern).
+    let prior_reasoning_replayed =
+        rpi_ai::model::prior_reasoning_is_replayed(&ctx.resolved_model);
     let base_prompt = match effective_args.system_prompt.as_deref() {
         Some(explicit) => explicit.to_string(),
         None => match discover_system_prompt_file_with_packages(&ctx.cwd, &package_resources) {
-            Some(path) => {
-                std::fs::read_to_string(&path).unwrap_or_else(|_| default_system_prompt(&cwd_str))
-            }
-            None => default_system_prompt(&cwd_str),
+            Some(path) => std::fs::read_to_string(&path)
+                .unwrap_or_else(|_| default_system_prompt(&cwd_str, prior_reasoning_replayed)),
+            None => default_system_prompt(&cwd_str, prior_reasoning_replayed),
         },
     };
     let mut append_texts: Vec<String> = Vec::new();
@@ -2355,7 +2378,7 @@ mod tests {
 
     #[test]
     fn default_prompt_mentions_cwd_and_tools() {
-        let p = default_system_prompt("/tmp/proj");
+        let p = default_system_prompt("/tmp/proj", false);
         assert!(p.contains("/tmp/proj"));
         assert!(p.contains("read"));
         assert!(p.contains("bash"));
@@ -2377,7 +2400,7 @@ mod tests {
         // observed session paid for that 112 times in a single run, and twice
         // hallucinated the user's input ("The user is greeting me with hello",
         // with no such message). See `docs/llm-repetition-forensics.md` §八.
-        let p = default_system_prompt("/tmp/proj");
+        let p = default_system_prompt("/tmp/proj", false);
         let lower = p.to_lowercase();
         // The rule must state the mechanism, not just "be clear".
         assert!(
@@ -2398,6 +2421,38 @@ mod tests {
         assert!(
             lower.contains("already shown earlier"),
             "the prompt must discourage re-fetching known content: {p}"
+        );
+    }
+
+    #[test]
+    fn default_prompt_does_not_claim_reasoning_is_lost_when_it_is_replayed() {
+        // `compat.requiresThinkingAsText` (and the native thinking channels of
+        // anthropic-messages / openai-responses) DO carry the model's reasoning
+        // back on the next request. Telling such a model "reasoning is not
+        // carried into your next turn" is false, and the instruction to restate
+        // the plan every turn is exactly the busy-work the re-plan analysis
+        // measured. The wording must flip with the mechanism.
+        let p = default_system_prompt("/tmp/proj", true);
+        let lower = p.to_lowercase();
+        assert!(
+            lower.contains("carried back"),
+            "a replaying model must be told its reasoning survives: {p}"
+        );
+        assert!(
+            !lower.contains("reasoning is not"),
+            "the replayed variant must not claim reasoning is dropped: {p}"
+        );
+        assert!(
+            lower.contains("do not re-derive"),
+            "the replayed variant must forbid re-deriving the plan: {p}"
+        );
+        assert!(
+            lower.contains("do not re-derive") && lower.contains("re-listing the same plan"),
+            "the anti-repetition rule must survive the flip: {p}"
+        );
+        assert!(
+            lower.contains("already shown earlier"),
+            "the re-read rule must survive the flip: {p}"
         );
     }
 
