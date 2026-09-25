@@ -9258,9 +9258,9 @@ fn cycle_next_model(catalog: &[rpi_ai::Model], current_id: &str) -> Option<rpi_a
 
 /// Build + open the `/session` selector. Lists JSONL session files under the
 /// default session dir (`<cwd>/.rpi/sessions`, with legacy `.pi/sessions`
-/// fallback). Selecting reports "restore not
-/// implemented in v1" (existing constraint) but shows the list for
-/// discoverability.
+/// fallback), newest-first, labelled with the session name or first prompt so
+/// two sessions are distinguishable. Header-only sessions are skipped: there is
+/// nothing to switch to.
 fn open_session_selector(
     state: &Arc<TuiState>,
     editor_container: &Arc<Container>,
@@ -9271,24 +9271,31 @@ fn open_session_selector(
 ) {
     let dir = crate::session::default_session_dir(cwd);
     let mut items: Vec<SelectItem> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("(unnamed)")
-                .to_string();
-            let display = path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or(&stem)
-                .to_string();
-            items.push(SelectItem::new(&stem, &display));
+    for path in crate::session::list_session_files_sync(&dir) {
+        let summary = crate::session::summarize_session_file(&path);
+        if summary.empty {
+            continue;
         }
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("(unnamed)")
+            .to_string();
+        let label = crate::session::session_display_label(&summary);
+        // The file stem is `<timestamp>_<uuid>`; the id tail disambiguates rows
+        // that share a timestamp.
+        let id_tail = stem.rsplit('_').next().unwrap_or(&stem);
+        let short_id = crate::session::short_session_id(id_tail);
+        let description = format!(
+            "{} · {}",
+            crate::session::format_session_bytes(summary.bytes),
+            short_id,
+        );
+        items.push(
+            SelectItem::new(&stem, &label)
+                .with_description(&description)
+                .with_search_text(&format!("{label} {short_id} {stem}")),
+        );
     }
     if items.is_empty() {
         add_note_message(
@@ -9298,7 +9305,13 @@ fn open_session_selector(
         tui.request_render(false);
         return;
     }
-    let list = Arc::new(SelectList::new(items, 10));
+    let mut list = SelectList::new(items, 10);
+    list.set_layout(rpi_tui::SelectListLayoutOptions {
+        min_primary_column_width: Some(56),
+        max_primary_column_width: Some(72),
+        truncate_primary: None,
+    });
+    let list = Arc::new(list);
 
     let state_sel = state.clone();
     let ec_sel = editor_container.clone();
@@ -9326,7 +9339,7 @@ fn open_session_selector(
         editor,
         tui,
         Some("Resume session"),
-        Some("Type to filter by session id"),
+        Some("Type to filter sessions"),
         list,
         SelectorKind::Session,
     );

@@ -15,7 +15,7 @@
     },
     {
       "value": "9.7×",
-      "label": "启动速度（vs 原生 pi）"
+      "label": "启动速度（vs pi）"
     },
     {
       "value": "0",
@@ -100,8 +100,8 @@
     {
       "version": "0.3.1",
       "status": "current",
-      "title": "构建修复与实测性能对比",
-      "description": "修复 main 上持续失败的编译、让每个 crate 在 crates.io 正确展示，并首次给出与原生 TypeScript pi 的同机基准对比。"
+      "title": "同机实测：启动快 9.7×、内存小 4.9×",
+      "description": "以同一套 JSONL RPC 协议、同一台机器实测：rpi 启动快 9.7×、内存小 4.9×；并让每个 crate 在 crates.io 与 docs.rs 上正确展示。"
     },
     {
       "version": "next",

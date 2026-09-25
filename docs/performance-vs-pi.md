@@ -28,6 +28,11 @@ node scripts/bench-vs-pi.mjs --pi .bench/node_modules/.bin/pi --runs 9 --warmup 
 `{"type":"get_state"}` request on the JSONL RPC channel — i.e. from launch to a
 usable agent, not just a parsed argument list.
 
+These numbers were measured on the 0.3.0 build. 0.3.1 is a patch release with no
+functional change (it repairs the build on `main` and how the crates present
+on crates.io/docs.rs), so the results apply to it unchanged and were not
+re-measured.
+
 ## Environment
 
 | | |

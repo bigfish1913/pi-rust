@@ -13,6 +13,8 @@
       "blog.empty": "暂无文章，敬请期待。",
       "blog.intro": "版本更新、技术分享与项目动态。追踪 rpi 的每一步演进。",
       "blog.title": "博客",
+      "blog.readMore": "阅读全文",
+      "blog.backToList": "返回列表",
       "copy.codeSuccess": "代码已复制",
       "copy.commandSuccess": "命令已复制",
       "copy.failed": "复制失败，请手动选择文本",
@@ -97,6 +99,8 @@
       "blog.empty": "No posts yet. Stay tuned.",
       "blog.intro": "Release notes, technical insights and project updates. Track every step of rpi's evolution.",
       "blog.title": "Blog",
+      "blog.readMore": "Read more",
+      "blog.backToList": "Back to list",
       "copy.codeSuccess": "Code copied",
       "copy.commandSuccess": "Command copied",
       "copy.failed": "Copy failed; select the text manually",
@@ -183,7 +187,7 @@
         },
         {
           "value": "9.7×",
-          "label": "faster startup (vs native pi)"
+          "label": "faster startup (vs pi)"
         },
         {
           "value": "0",
@@ -266,8 +270,8 @@
         {
           "version": "0.3.1",
           "status": "current",
-          "title": "Build fix and a measured comparison",
-          "description": "Repairs the broken build on main, fixes how every crate presents itself on crates.io, and adds the first same-machine benchmark against native TypeScript pi."
+          "title": "Same-machine benchmark: 9.7× faster startup",
+          "description": "Measured over the same JSONL RPC protocol on the same machine: rpi starts 9.7× faster and uses 4.9× less memory, with correct crates.io / docs.rs pages for every crate."
         },
         {
           "version": "next",
@@ -320,6 +324,20 @@
           "eyebrow": "RPI / USER GUIDE",
           "description": "For developers new to rpi: install it, run it and connect an Agent to your own application.",
           "sections": {
+            "complete-guide": {
+              "kicker": "00 / COMPLETE GUIDE",
+              "title": "Complete user guide",
+              "summary": "The full path from install, model config, .rpi resources and Rust plugins to SDK integration, troubleshooting and release.",
+              "body": [
+                "The website docs stay in sync with /user-guide.md in the repository. A fresh rpi install ships the core tools by default and adds more through Rust cdylib extensions built with rpi-plugin-sdk.",
+                "Start with install and first run, then move on to Provider setup, Rust extensions, Agent project structure or SDK integration as needed."
+              ],
+              "links": [
+                "Open the full guide",
+                "Rust extension authoring guide",
+                "Agent project structure guide"
+              ]
+            },
             "quickstart": {
               "kicker": "01 / FIRST RUN",
               "title": "Quick start",

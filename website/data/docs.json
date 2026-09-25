@@ -19,19 +19,15 @@
           "links": [
             {
               "label": "打开在线完整手册",
-              "url": "https://rpi.laofu.online/user-guide.md"
+              "url": "./guide.html?doc=user-guide"
             },
             {
               "label": "Rust 扩展作者指南",
-              "url": "https://rpi.laofu.online/extension-authoring.md"
+              "url": "./guide.html?doc=extension-authoring"
             },
             {
               "label": "Agent 项目结构创建指南",
-              "url": "https://rpi.laofu.online/agent-project.md"
-            },
-            {
-              "label": "Rust 扩展与 agent 调试指引",
-              "url": "https://rpi.laofu.online/rust-debugging.md"
+              "url": "./guide.html?doc=agent-project"
             }
           ]
         },

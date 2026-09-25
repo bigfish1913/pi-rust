@@ -152,6 +152,11 @@ Available tools:
 - docs  — Look up rpi usage, extension, package, and compatibility documentation
 
 Guidelines:
+- Reply in the SAME language the user is writing in. Detect the language of the user's
+  latest message (and, when it is too short to be sure, the working language of the
+  conversation so far) and use it for your prose replies. Mirror it unless the user
+  explicitly asks for a different language; only fall back to English when the
+  user's language cannot be determined.
 - Be concise in your responses
 - Show file paths clearly when working with files
 - Prefer the smallest change that solves the problem
@@ -439,6 +444,20 @@ pub async fn build(
     // ---- Session storage ----
     let selection = select_session(args, cwd);
     let session = build_session(&selection, &cwd_str).await?;
+    // `--name`/`-n` sets the session display name durably (a `name` fact in the
+    // log). It applies to whichever session this launch works in — a fresh one
+    // or a restored one — and an empty value clears a previous name. This is the
+    // only place the flag is applied: `SessionSelection::New` carries it, but
+    // builds that do not create a session (restore/fork) must still honor it.
+    if let Some(requested) = args.name.as_deref() {
+        let name = requested.trim();
+        let name = if name.is_empty() { None } else { Some(name) };
+        if let Err(error) = session.set_name(name).await {
+            if args.verbose {
+                eprintln!("warning: could not set session name: {error}");
+            }
+        }
+    }
     if let Some(js) = &js_extension_session {
         let session_id = session
             .get_metadata()
@@ -1731,6 +1750,8 @@ fn report_deferred_renderers(session: &ExtensionSession) {
 pub enum BuildError {
     #[error("Could not create the session directory: {0}")]
     SessionDir(String),
+    #[error("Could not open the saved session: {0}")]
+    SessionOpen(String),
     #[error("No session found for {requested} in {dir}. Start a fresh session instead (drop --continue/--resume/--session).")]
     SessionNotFound { requested: String, dir: String },
     #[error("Could not build the harness: {0}")]
@@ -2059,7 +2080,7 @@ async fn restore_session(selection: &SessionSelection, cwd: &str) -> Result<Sess
     match selection {
         SessionSelection::Latest => {
             let metas = list_session_metadata(cwd).await?;
-            let Some(meta) = metas.first() else {
+            let Some(meta) = first_resumable_session(&metas) else {
                 return Err(BuildError::SessionNotFound {
                     requested: "the most recent session".to_string(),
                     dir: default_session_dir(Path::new(cwd)).display().to_string(),
@@ -2072,7 +2093,7 @@ async fn restore_session(selection: &SessionSelection, cwd: &str) -> Result<Sess
                 requested,
                 dir: default_session_dir(Path::new(cwd)).display().to_string(),
             },
-            OpenError::Other(msg) => BuildError::SessionDir(msg),
+            OpenError::Other(msg) => BuildError::SessionOpen(msg),
         }),
         SessionSelection::ByExactId { id } => {
             // Exact id match only (pi `--session-id`): restore when the
@@ -2182,6 +2203,257 @@ pub async fn list_session_metadata(
         .map_err(|e| BuildError::SessionDir(format!("list sessions: {e}")))
 }
 
+/// A cheap, display-oriented summary of one JSONL session file.
+///
+/// The session pickers (`-r` and `/session`) need enough context to tell saved
+/// sessions apart. The header-only [`JsonlSessionMetadata`] carries no name and
+/// no transcript, so a list built from it renders as a wall of identical
+/// `2026-09-25T15-05-15-847Z_…` file names — including the many header-only
+/// sessions an abandoned launch leaves behind. This reads just the head (and a
+/// small tail, for a late `--name`/`/name` fact) of the file to recover:
+///
+/// - the session display name, when one was recorded;
+/// - the first user prompt, single-lined and truncated, for a readable label;
+/// - whether the file is header-only (nothing to resume).
+///
+/// It intentionally does **not** parse the whole log: sessions can be tens of
+/// megabytes, and the picker runs over every session at startup.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionSummary {
+    /// The session display name (`--name` / `/name`), if one was recorded.
+    pub name: Option<String>,
+    /// The first user prompt, single-lined and trimmed to a label-sized length.
+    pub preview: Option<String>,
+    /// True when the file holds only its header (a session with no content).
+    pub empty: bool,
+    /// On-disk size in bytes (a rough content-volume hint for the picker).
+    pub bytes: u64,
+}
+
+/// Bytes read from the head of a session file to recover a name + first prompt.
+const SUMMARY_HEAD_BYTES: u64 = 256 * 1024;
+/// Bytes read from the tail of a session file to recover a late name fact.
+const SUMMARY_TAIL_BYTES: u64 = 8 * 1024;
+/// Longest preview retained (characters, not bytes).
+const SUMMARY_PREVIEW_CHARS: usize = 80;
+
+/// Summarize one session file for the pickers. Best-effort: an unreadable or
+/// malformed file yields a summary with `empty: false` and no label, so it is
+/// still selectable rather than silently dropped.
+pub fn summarize_session_file(path: &Path) -> SessionSummary {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return SessionSummary::default();
+    };
+    let Ok(size) = file.metadata().map(|m| m.len()) else {
+        return SessionSummary::default();
+    };
+    if size == 0 {
+        return SessionSummary {
+            name: None,
+            preview: None,
+            empty: true,
+            bytes: 0,
+        };
+    }
+
+    // Head: the header line (for the empty check) + a name fact + the first user
+    // prompt. The whole window is scanned; it is already in memory.
+    let mut head = vec![0u8; SUMMARY_HEAD_BYTES.min(size) as usize];
+    let head_len = file.read(&mut head).unwrap_or(0);
+    head.truncate(head_len);
+    let head = String::from_utf8_lossy(&head);
+    let mut lines: Vec<&str> = head.lines().collect();
+    let header_len = lines.first().map(|line| line.len()).unwrap_or(0);
+    // A header-only file is exactly the header plus an optional trailing `\n`.
+    let empty = (size as usize) <= header_len + 1;
+    // When the window stopped short of the file end, its final line is partial:
+    // drop it so a half-read message can never be mistaken for a complete one.
+    if (head_len as u64) < size && !lines.is_empty() {
+        lines.pop();
+    }
+
+    let mut summary = SessionSummary {
+        name: None,
+        preview: None,
+        empty,
+        bytes: size,
+    };
+    for line in lines {
+        apply_summary_line(line, &mut summary);
+    }
+
+    // Tail: a name set late in the session lives after the head window. Read the
+    // last window and scan only complete lines so a torn/partial first line is
+    // ignored. Only do this when the file is larger than the head window.
+    if size > SUMMARY_HEAD_BYTES
+        && file
+            .seek(SeekFrom::End(-(SUMMARY_TAIL_BYTES as i64)))
+            .is_ok()
+    {
+        let mut tail = Vec::new();
+        if file.read_to_end(&mut tail).is_ok() {
+            let tail = String::from_utf8_lossy(&tail);
+            let mut tail_lines = tail.lines();
+            // Drop the possibly-partial first line of the window.
+            tail_lines.next();
+            for line in tail_lines {
+                if let Some(name) = name_from_line(line) {
+                    summary.name = name;
+                }
+            }
+        }
+    }
+    summary
+}
+
+/// Extract the name from a `{"kind":"fact","fact":"name","name":…}` line.
+/// Returns `Some(None)` for an explicit `name: null` (the fact was cleared).
+fn name_from_line(line: &str) -> Option<Option<String>> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    if value.get("kind").and_then(|v| v.as_str()) != Some("fact") {
+        return None;
+    }
+    if value.get("fact").and_then(|v| v.as_str()) != Some("name") {
+        return None;
+    }
+    Some(match value.get("name") {
+        Some(serde_json::Value::String(name)) => Some(name.clone()),
+        _ => None,
+    })
+}
+
+/// Fold one JSONL line into `summary`: record a name fact, or capture the first
+/// user prompt as the preview.
+fn apply_summary_line(line: &str, summary: &mut SessionSummary) {
+    if let Some(name) = name_from_line(line) {
+        summary.name = name;
+        return;
+    }
+    if summary.preview.is_some() {
+        return;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return;
+    };
+    if value.get("kind").and_then(|v| v.as_str()) != Some("entry") {
+        return;
+    }
+    if value.get("type").and_then(|v| v.as_str()) != Some("message") {
+        return;
+    }
+    let Some(message) = value.get("message") else {
+        return;
+    };
+    if message.get("role").and_then(|v| v.as_str()) != Some("user") {
+        return;
+    }
+    let text = match message.get("content") {
+        Some(serde_json::Value::String(text)) => Some(text.as_str()),
+        Some(serde_json::Value::Array(blocks)) => blocks.iter().find_map(|block| {
+            (block.get("type").and_then(|v| v.as_str()) == Some("text"))
+                .then(|| block.get("text").and_then(|v| v.as_str()))
+                .flatten()
+        }),
+        _ => None,
+    };
+    let Some(text) = text else { return };
+    let collapsed = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if collapsed.is_empty() {
+        return;
+    }
+    summary.preview = Some(collapsed.chars().take(SUMMARY_PREVIEW_CHARS).collect());
+}
+
+/// The human label for a session row: its recorded name, else the first user
+/// prompt, else a marker that says the file has no transcript to show. Shared
+/// by the startup picker and the in-TUI `/session` selector.
+pub fn session_display_label(summary: &SessionSummary) -> String {
+    if let Some(name) = summary.name.as_deref().map(str::trim) {
+        if !name.is_empty() {
+            return name.to_string();
+        }
+    }
+    match summary.preview.as_deref().map(str::trim) {
+        Some(preview) if !preview.is_empty() => preview.to_string(),
+        _ => "(no messages)".to_string(),
+    }
+}
+
+/// Compact byte count (1.2MB / 34KB / 512B), shared by the startup picker and
+/// the in-TUI `/session` selector.
+pub fn format_session_bytes(bytes: u64) -> String {
+    if bytes >= 1_048_576 {
+        format!("{:.1}MB", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1024 {
+        format!("{}KB", bytes / 1024)
+    } else {
+        format!("{bytes}B")
+    }
+}
+
+/// The first 8 characters of a session id, enough to disambiguate two rows that
+/// share a timestamp without shouting the whole UUID.
+pub fn short_session_id(id: &str) -> &str {
+    &id[..id.len().min(8)]
+}
+
+/// Synchronously list every JSONL session file under `dir`, newest-first by
+/// modification time.
+///
+/// The repo's [`list_session_metadata`] is async and scans one cwd-encoded
+/// subdirectory level; the in-TUI `/session` selector runs on the blocking key
+/// thread and cannot await it, so this walks the same layout directly. Both
+/// `.jsonl` files directly under `dir` and one level of subdirectories are
+/// accepted.
+pub fn list_session_files_sync(dir: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+    let mut visit = |path: PathBuf| {
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            return;
+        }
+        let modified = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        files.push((path, modified));
+    };
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Ok(inner) = std::fs::read_dir(&path) {
+                    for child in inner.flatten() {
+                        visit(child.path());
+                    }
+                }
+            } else {
+                visit(path);
+            }
+        }
+    }
+    files.sort_by(|a, b| b.1.cmp(&a.1));
+    files.into_iter().map(|(path, _)| path).collect()
+}
+
+/// Pick the session `--continue`/`-c` should open: the newest session that has
+/// content (a header-only session resumes to an empty transcript). Falls back to
+/// the newest overall when every session is empty, and `None` only when the
+/// list is empty.
+fn first_resumable_session<'a>(
+    metas: &'a [rpi_harness::session::jsonl::JsonlSessionMetadata],
+) -> Option<&'a rpi_harness::session::jsonl::JsonlSessionMetadata> {
+    metas
+        .iter()
+        .find(|meta| !summarize_session_file(Path::new(&meta.path)).empty)
+        .or_else(|| metas.first())
+}
+
 /// Open a session whose id matches exactly or by file-name containment
 /// (so `--session 01a02…` / a partial id / a full file name all work). The
 /// TUI `/session` hot-switch calls this with the selector's item value.
@@ -2271,7 +2543,7 @@ async fn open_session(
     let storage = repo
         .open_by_jsonl_metadata(meta)
         .await
-        .map_err(|e| BuildError::SessionDir(format!("open {}: {e}", meta.path)))?;
+        .map_err(|e| BuildError::SessionOpen(format!("open {}: {e}", meta.path)))?;
     // A session records the cwd it was created in. When that directory has
     // since been removed, continuing silently in it is confusing; warn the
     // user that we fell back to the process cwd (pi `getMissingSessionCwdIssue`).
@@ -2373,6 +2645,123 @@ mod tests {
     use super::*;
     use crate::args::Args;
 
+    /// A unique scratch file for one summary test.
+    fn scratch(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "rpi-summary-{}-{nanos}-{name}.jsonl",
+            std::process::id()
+        ));
+        path
+    }
+
+    #[test]
+    fn summary_marks_a_header_only_session_empty() {
+        let path = scratch("empty");
+        std::fs::write(
+            &path,
+            "{\"kind\":\"header\",\"version\":4,\"id\":\"abc\",\"createdAt\":1,\"cwd\":\"x\"}\n",
+        )
+        .unwrap();
+        let summary = summarize_session_file(&path);
+        assert!(summary.empty, "a header-only file has nothing to resume");
+        assert!(summary.preview.is_none());
+        assert_eq!(summary.bytes, std::fs::metadata(&path).unwrap().len());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn summary_reads_the_first_user_prompt_and_name() {
+        let path = scratch("content");
+        let body = concat!(
+            "{\"kind\":\"header\",\"version\":4,\"id\":\"abc\",\"createdAt\":1,\"cwd\":\"x\"}\n",
+            "{\"kind\":\"fact\",\"seq\":1,\"fact\":\"name\",\"name\":\"fix resume picker\"}\n",
+            "{\"kind\":\"record\",\"type\":\"operation_started\",\"id\":\"r1\"}\n",
+            "{\"kind\":\"entry\",\"lane\":\"main\",\"type\":\"message\",\"id\":\"e1\",\"message\":{\"kind\":\"user\",\"role\":\"user\",\"content\":\"read the rpi -r picker\"}}\n",
+            "{\"kind\":\"entry\",\"lane\":\"main\",\"type\":\"message\",\"id\":\"e2\",\"message\":{\"kind\":\"assistant\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"second\"}]}}\n",
+        );
+        std::fs::write(&path, body).unwrap();
+        let summary = summarize_session_file(&path);
+        assert!(!summary.empty);
+        assert_eq!(summary.name.as_deref(), Some("fix resume picker"));
+        assert_eq!(summary.preview.as_deref(), Some("read the rpi -r picker"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn summary_extracts_a_block_style_user_prompt() {
+        let path = scratch("blocks");
+        let body = concat!(
+            "{\"kind\":\"header\",\"version\":4,\"id\":\"abc\",\"createdAt\":1,\"cwd\":\"x\"}\n",
+            "{\"kind\":\"entry\",\"type\":\"message\",\"id\":\"e1\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"line one\\nline two\"}]}}\n",
+        );
+        std::fs::write(&path, body).unwrap();
+        let summary = summarize_session_file(&path);
+        assert_eq!(summary.preview.as_deref(), Some("line one line two"));
+        assert_eq!(session_display_label(&summary), "line one line two");
+        std::fs::remove_file(&path).ok();
+    }
+
+    fn meta_for(path: &Path, id: &str) -> rpi_harness::session::jsonl::JsonlSessionMetadata {
+        rpi_harness::session::jsonl::JsonlSessionMetadata {
+            id: id.to_string(),
+            created_at: 0,
+            cwd: ".".to_string(),
+            path: path.to_string_lossy().into_owned(),
+            modified_at: 0,
+            source_format: rpi_harness::session::jsonl::JsonlSourceFormat::V4,
+            parent_session_id: None,
+            legacy_parent_session_path: None,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn continue_skips_newer_empty_sessions() {
+        let empty = scratch("newest-empty");
+        std::fs::write(
+            &empty,
+            "{\"kind\":\"header\",\"version\":4,\"id\":\"empty\",\"createdAt\":1,\"cwd\":\"x\"}\n",
+        )
+        .unwrap();
+        let content = scratch("older-content");
+        std::fs::write(
+            &content,
+            concat!(
+                "{\"kind\":\"header\",\"version\":4,\"id\":\"old\",\"createdAt\":1,\"cwd\":\"x\"}\n",
+                "{\"kind\":\"entry\",\"type\":\"message\",\"id\":\"e1\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n",
+            ),
+        )
+        .unwrap();
+
+        let metas = vec![meta_for(&empty, "empty"), meta_for(&content, "old")];
+        let picked = first_resumable_session(&metas).expect("a resumable session");
+        assert_eq!(picked.id, "old");
+
+        // When every session is empty, fall back to the newest rather than
+        // erroring.
+        let all_empty = vec![meta_for(&empty, "empty")];
+        assert_eq!(first_resumable_session(&all_empty).unwrap().id, "empty");
+
+        std::fs::remove_file(&empty).ok();
+        std::fs::remove_file(&content).ok();
+    }
+
+    #[test]
+    fn list_session_files_sync_walks_the_cwd_subdirectory() {
+        let root = std::env::temp_dir().join(format!("rpi-summary-{}-dir", std::process::id()));
+        let nested = root.join("--proj--");
+        std::fs::create_dir_all(&nested).unwrap();
+        let file = nested.join("2026-01-01_a.jsonl");
+        std::fs::write(&file, "{}\n").unwrap();
+        let found = list_session_files_sync(&root);
+        assert!(found.iter().any(|p| p == &file));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn default_prompt_mentions_cwd_and_tools() {
         let p = default_system_prompt("/tmp/proj", false);
@@ -2386,6 +2775,19 @@ mod tests {
         assert!(!p.contains("- find"));
         assert!(!p.contains("- ls"));
         assert!(!p.contains("powershell"));
+    }
+
+    #[test]
+    fn default_prompt_instructs_language_matching() {
+        // The model must detect the user's language and answer in it, so a
+        // Chinese (or any non-English) user gets a same-language reply without
+        // having to ask every turn.
+        let p = default_system_prompt("/tmp/proj", false);
+        let lower = p.to_lowercase();
+        assert!(
+            lower.contains("same language") && lower.contains("detect"),
+            "the prompt must tell the model to detect and mirror the user's language: {p}"
+        );
     }
 
     #[test]
@@ -3074,6 +3476,56 @@ mod tests {
 
         assert_eq!(context.cwd, cwd);
         assert!(context.project_trusted);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_applies_the_name_flag_to_the_session() {
+        struct RestoreConfigDir(Option<std::ffi::OsString>);
+
+        impl Drop for RestoreConfigDir {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var(crate::config::CONFIG_DIR_ENV, value),
+                    None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
+                }
+            }
+        }
+
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        let _restore = RestoreConfigDir(std::env::var_os(crate::config::CONFIG_DIR_ENV));
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = tmp.path().join("agent");
+        let cwd = tmp.path().join("project");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
+
+        let resolved = crate::provider::resolve(
+            Some("anthropic"),
+            Some(crate::provider::DEFAULT_MODEL_ID),
+            None,
+            Some("test-key"),
+            None,
+        )
+        .unwrap();
+        let args = Args {
+            trust_override: Some(false),
+            no_tools: true,
+            no_extensions: true,
+            no_skills: true,
+            no_prompt_templates: true,
+            no_context_files: true,
+            system_prompt: Some("test prompt".into()),
+            name: Some("smoke name".into()),
+            session_dir: Some(cwd.join("sessions")),
+            ..Args::default()
+        };
+
+        let (harness, _, _) = build(&resolved, &args, &cwd, true).await.unwrap();
+        assert_eq!(
+            harness.get_name().await.unwrap().as_deref(),
+            Some("smoke name")
+        );
     }
 
     #[test]
