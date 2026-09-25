@@ -649,6 +649,21 @@ prepare_next_turn: None,
 
 规则里写出了**机制**（"reasoning 不会带到下一轮"），不只是"要写清楚"——否则模型没理由改行为。
 
+> **后续修正（同一原则的反面）**：这条规则的"机制"叙述必须与**实际配置**一致。
+> 对开了 `compat.requiresThinkingAsText` 的模型（以及 anthropic-messages / openai-responses
+> 这两条原生回传 thinking 的通道），reasoning **是**会带回来的 —— 此时再告诉模型
+> "reasoning 不会带到下一轮 + 每轮都要重述计划"，等于让它做无用功，正是本文要治的
+> 重复/空转的来源。因此 `default_system_prompt(cwd, prior_reasoning_replayed)` 现在按
+> `rpi_ai::model::prior_reasoning_is_replayed(model)` 两套措辞：
+>
+> | 场景 | 文案 |
+> |---|---|
+> | 会回传（openai-completions + 该 flag、openai-responses、anthropic-messages） | "Your own reasoning is carried back… do not re-derive it or restate the whole plan" |
+> | 不回传（openai-completions 默认） | 原文案："Reasoning is not carried into your next turn…" |
+>
+> 验证：`rpi --debug-system-prompt -p x`（alicoding/qwen3.7-plus 走前者，routeryo-copy/gpt-5.6-sol
+> 走后者），另有单测 `default_prompt_does_not_claim_reasoning_is_lost_when_it_is_replayed`。
+
 验证（确定性）：
 - `cargo test -p rpi-cli --lib default_prompt` —— 新增
   `default_prompt_keeps_working_state_in_the_visible_channel`，逐条断言机制、补救手段、
