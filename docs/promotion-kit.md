@@ -1,4 +1,7 @@
-# rpi 投放素材（0.3.0）
+# rpi 投放素材（0.3.1）
+
+> 版本号会随发版过期。**发布前先核对 crates.io 与 GitHub Releases 页**，
+> 不一致就先更新本文件——这份文件已经因为版本脱节返工过一次。
 
 本文件用于发布 rpi 的开源推广内容。发布前请根据平台规则调整措辞，不要在多个社区原样重复发帖。
 
@@ -9,7 +12,7 @@
 | 项目 | 内容 |
 | --- | --- |
 | 项目 | rpi —— Rust 原生、library-first 的 coding-agent runtime + 终端 agent |
-| 稳定版本 | **0.3.0**（9 个 crate 同版本一起发布） |
+| 稳定版本 | **0.3.1**（9 个 crate 同版本一起发布，`CHANGELOG.md` 为准） |
 | MSRV | Rust 1.78 |
 | 许可 | MIT |
 | GitHub | https://github.com/bigfish1913/pi-rust |
@@ -21,7 +24,7 @@
 | 安装（Cargo） | `cargo install rpi-cli` |
 | 启动 | `rpi` 或 `rpi -p "hello"` |
 
-### 0.3.0 可以讲的稳定能力
+### 可以讲的稳定能力
 
 - 异步、流式的 agent loop；`AgentTool` trait、事件、hooks、队列、取消。
 - Provider：Anthropic Messages、OpenAI Chat Completions、OpenAI Responses，以及 OpenRouter / DeepSeek / llama.cpp 等 OpenAI 兼容网关；另有用于离线测试的 `faux` provider。
@@ -44,6 +47,17 @@
 - **插件 ABI 统一**：0.3.0 把入口统一到单一 `rpi_plugin_register`（版本号移入 `PluginApi` 结构体），宿主仍会回退解析 `_v3` / `_v2`，老插件可继续加载；但扩展作者应重新构建。
 - **benchmark 对比**：现在**可以**引用 `docs/performance-vs-pi.md` 的数字（rpi vs 原生 pi，同机同协议），但必须一并给出「本机实测、单一版本对」的前提，以及未测的范围。不要编造与 Claude Code / Codex / aider 的对比——那些没有测过。
 
+## 各渠道的完整文案
+
+本文件只放短文案和平台注意事项。长文和投稿规则的完整版本在 `docs/promotion/`：
+
+| 文件 | 内容 | 投哪里 |
+| --- | --- | --- |
+| `promotion/01-benchmark-vs-native-pi.md` | 与原生 pi 的实测对比（中英双版） | 掘金 / OSCHINA / HN |
+| `promotion/02-rust-agent-runtime-architecture.md` | 分层、provider 边界、插件 ABI、崩溃恢复的长文 | 掘金 / OSCHINA / 知乎 |
+| `promotion/03-english-showhn-devto-reddit.md` | 英文文案 | HN / DEV.to / r/rust / r/LocalLLaMA / Lobsters |
+| `promotion/04-submissions-twir-and-awesome-rust.md` | 第三方列表的核实过的规则 | TWiR / Awesome Rust |
+
 ## 中文短文案
 
 ### V2EX / Linux.do / Rust 中文社区
@@ -56,7 +70,7 @@
 
 > rpi 是一个 library-first 的 Rust coding-agent runtime，九个 crate 同版本发布，入口既可以是终端里的 `rpi` 命令，也可以是 `rpi-agent` 这个库。
 >
-> 0.3.0 里比较实在的部分：
+> 当前版本（0.3.1）里比较实在的部分：
 >
 > - 流式 agent loop，带工具调用、hooks、队列和取消
 > - Provider 抽象：Anthropic、OpenAI 兼容（含 OpenRouter / DeepSeek / llama.cpp 网关），以及不联网即可测试的 faux provider
@@ -151,11 +165,12 @@
 
 Release 标题：
 
-> rpi v0.3.0 — Rust-native coding-agent runtime
+> rpi v<version> — Rust-native coding-agent runtime
 
-Release 摘要（正文主体从 `CHANGELOG.md` 的 0.3.0 小节复制，不要重复粘贴 0.1.x 的内容）：
+Release 摘要：**正文主体直接取 `CHANGELOG.md` 里对应版本的小节**，不要重复粘贴更早版本的内容。
 
-> rpi v0.3.0 unifies the plugin ABI on a single `rpi_plugin_register` entrypoint and lands the crash-recovery work from 0.1.28.
+> 0.3.1 的例子（仅作格式参考）：0.3.0 unified the plugin ABI on a single
+> `rpi_plugin_register` entrypoint and landed the crash-recovery work from 0.1.28.
 >
 > Install without a Rust toolchain:
 >
@@ -175,51 +190,45 @@ Release 摘要（正文主体从 `CHANGELOG.md` 的 0.3.0 小节复制，不要�
 
 ## This Week in Rust
 
-标题：
+> ⚠️ 本节此前写错了，已更正。TWiR 已**不再接受** Project/Tooling Updates 的 PR
+> （rust-lang/this-week-in-rust#8575），编辑改为自行浏览 r/rust。
 
-> Project Submission: rpi — a Rust-native, library-first coding-agent runtime
+所以这里**没有「投稿」这个动作**。要做的是**在 r/rust 发帖**，文案见
+[`docs/promotion/03-english-showhn-devto-reddit.md`](promotion/03-english-showhn-devto-reddit.md)；
+是否被收录完全由 TWiR 编辑决定，**不要**为此开 issue 或 PR。
 
-正文：
+另外两点：
 
-> Hi TWiR team,
->
-> I would like to propose rpi for the Project/Crate of the Week.
->
-> rpi is a coding-agent runtime written in Rust, published as nine composable crates with a terminal agent on top. The design goal is that the agent loop is a library: `rpi-agent` + `rpi-ai` is enough to embed an agent in your own process.
->
-> Highlights:
-> - Streaming agent loop with tool calls, events, hooks, queues and cancellation.
-> - Provider-agnostic layer: Anthropic, OpenAI-compatible providers, and a deterministic `faux` provider so the test suite runs offline. HTTP providers are feature-gated; the default build has no network stack.
-> - Durable sessions: JSONL persistence, branching, compaction, and crash recovery driven by frame-level progress records.
-> - A stable `#[repr(C)]` plugin ABI (`rpi-plugin-sdk`) with version negotiation and panic containment across the boundary, and a host loader (`rpi-extensions`) that bridges plugin lifecycles into async tool implementations.
-> - One-way crate dependency direction: `rpi-telemetry → rpi-ai → rpi-agent → rpi-tools → rpi-harness → rpi-cli`.
->
-> Quick start:
->
-> ```bash
-> cargo install rpi-cli
-> rpi -p "hello"
-> ```
->
-> Links:
-> - Repository: https://github.com/bigfish1913/pi-rust
-> - Website: https://rpi.laofu.online/
-> - Crates.io: https://crates.io/crates/rpi-cli
-> - Docs.rs: https://docs.rs/rpi-cli
-> - Plugin SDK: https://crates.io/crates/rpi-plugin-sdk
-> - Architecture: https://github.com/bigfish1913/pi-rust/blob/main/docs/architecture.md
->
-> MIT licensed. Thanks for reading.
+- **Crate of the Week** 走论坛提名，不走 issue：
+  <https://users.rust-lang.org/t/crate-of-the-week/2704>。提名文案（很短，是论坛回帖不是文章）见
+  [`docs/promotion/04-submissions-twir-and-awesome-rust.md`](promotion/04-submissions-twir-and-awesome-rust.md)。
+- **LLM 署名**：TWiR 明确要求，如果投稿文章由 LLM 写成，必须在文章里披露。本目录的草稿是
+  AI 辅助产出的——要么由你自己重写并署自己的名，要么在文中披露。详见 04 那份文件。
+
+TWiR 真正想要的不是发布公告，而是「把工具更新写成长文或教程」。本目录里符合这个标准的
+是 [`docs/promotion/02-rust-agent-runtime-architecture.md`](promotion/02-rust-agent-runtime-architecture.md)。
 
 ## Awesome Rust
 
-建议条目（按列表维护者要求的分类和格式提交，只发一个 PR，不要同时开 issue）：
+> ⚠️ **当前不满足收录门槛，先别投。**
 
-> - [rpi](https://github.com/bigfish1913/pi-rust) - Rust-native, library-first coding-agent runtime with composable providers, tools, durable sessions and a stable plugin ABI.
+awesome-rust 的规则是 `stars > 50` **或** `downloads > 2000`。截至 2026-09-25 实测：
+
+| 指标 | 当前 | 门槛 |
+| --- | --: | --: |
+| GitHub stars | 32 | > 50 |
+| 最好的 crate 下载量（`rpi-telemetry`） | 1,112 | > 2,000 |
+| `rpi-cli` 下载量 | 469 | > 2,000 |
+
+维护者明确写了不会破例，硬投只会留下坏印象。等 `rpi-cli`（用户真正会执行安装命令的那个
+crate）过 2000 次下载，或仓库过 50 stars 再投。
+
+届时使用的条目、该插到哪一节、PR 里要说明什么，都写在
+[`docs/promotion/04-submissions-twir-and-awesome-rust.md`](promotion/04-submissions-twir-and-awesome-rust.md)。
 
 ## X / Bluesky / LinkedIn
 
-> Introducing rpi 0.3.0 — a Rust-native, library-first coding-agent runtime.
+> Introducing rpi 0.3.1 — a Rust-native, library-first coding-agent runtime.
 >
 > Nine composable crates: providers, agent loop, tools, durable sessions, plugin ABI, terminal CLI. Embed the loop in your own process, or just use the `rpi` command.
 >
@@ -243,7 +252,7 @@ RustCC 已发布过项目介绍，不再重复投放同一篇文章。后续按�
 
 - 角度：
 
-> `rpi --server` 无头运行 + `rpi --connect` 零本地资源客户端 + `--token` / `RPI_SERVER_TOKEN` 认证。强调「客户端不复制 agent 实现」，说明线协议分层，附远程 TUI 可用命令与限制。**发布前先核对 `docs/remote-mode.md`，把版本号和命令与 0.3.0 对齐。**
+> `rpi --server` 无头运行 + `rpi --connect` 零本地资源客户端 + `--token` / `RPI_SERVER_TOKEN` 认证。强调「客户端不复制 agent 实现」，说明线协议分层，附远程 TUI 可用命令与限制。**发布前先核对 `docs/remote-mode.md`，把版本号和命令与当前版本（0.3.1）对齐。**
 
 ### OSCHINA
 
@@ -302,11 +311,12 @@ RustCC 已发布过项目介绍，不再重复投放同一篇文章。后续按�
 - RustCC 已发布项目介绍，不在相邻几天内重复同类中文文章。
 - OSCHINA 和掘金间隔 3 至 5 天，使用不同标题和文章主体。
 - 知乎、DEV.to / Hashnode 作为技术跟进，间隔 5 至 7 天。
-- This Week in Rust 和 Awesome Rust 用项目提交 / PR 形式，不要当软文重复发布。
+- This Week in Rust **没有投稿入口**（已停止接受 PR，编辑自行扫 r/rust），Awesome Rust
+  **当前不满足收录门槛**——两者的核实过的规则见 `promotion/04-submissions-twir-and-awesome-rust.md`。
 
 ## 发布检查清单
 
-- [ ] 版本号写 **0.3.0**；如果已经发了新版本，先更新本文件再对外发。
+- [ ] 版本号写 **0.3.1**；如果已经发了新版本，先更新本文件再对外发。
 - [ ] 链接统一使用 `https://github.com/bigfish1913/pi-rust`，不要用旧仓库地址。
 - [ ] 安装命令二选一，且**确认预编译二进制真的存在于该 Release**：
       `curl -fsSL .../scripts/install.sh | sh` 或 `cargo install rpi-cli`。
