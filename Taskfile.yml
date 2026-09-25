@@ -105,12 +105,12 @@ tasks:
       - cargo check --workspace --all-targets --locked
 
   rpi-pack-frontend:
-    desc: 打包 rpi 静态官网
+    desc: 打包 rpi 静态官网（tar.gz；zip 在 Linux 侧解压会因反斜杠分隔符报错）
     cmds:
       - >-
-        powershell -NoProfile -Command "New-Item -ItemType Directory -Force -Path '{{.RPI_DEPLOY_DIR}}' | Out-Null; Compress-Archive -Path 'website\\*' -DestinationPath '{{.RPI_DEPLOY_DIR}}\\frontend.zip' -Force"
+        powershell -NoProfile -Command "New-Item -ItemType Directory -Force -Path '{{.RPI_DEPLOY_DIR}}' | Out-Null; tar -czf '{{.RPI_DEPLOY_DIR}}\frontend.tar.gz' -C website --exclude=./.rpi --exclude=./.deploy ."
       - >-
-        echo "前端包已生成: {{.RPI_DEPLOY_DIR}}/frontend.zip"
+        echo "前端包已生成: {{.RPI_DEPLOY_DIR}}/frontend.tar.gz"
 
   rpi-upload-frontend:
     desc: 上传 rpi 静态官网到公网服务器
@@ -118,8 +118,13 @@ tasks:
       - rpi-pack-frontend
     cmds:
       - ssh root@139.196.85.175 "mkdir -p /var/www/{{.RPI_SERVICE_NAME}} /tmp/deploy"
-      - scp "{{.RPI_DEPLOY_DIR}}/frontend.zip" root@139.196.85.175:/tmp/deploy/{{.RPI_SERVICE_NAME}}-frontend.zip
-      - ssh root@139.196.85.175 "unzip -o /tmp/deploy/{{.RPI_SERVICE_NAME}}-frontend.zip -d /var/www/{{.RPI_SERVICE_NAME}} >/dev/null && rm /tmp/deploy/{{.RPI_SERVICE_NAME}}-frontend.zip"
+      - scp "{{.RPI_DEPLOY_DIR}}/frontend.tar.gz" root@139.196.85.175:/tmp/deploy/{{.RPI_SERVICE_NAME}}-frontend.tar.gz
+      - ssh root@139.196.85.175 "tar -xzf /tmp/deploy/{{.RPI_SERVICE_NAME}}-frontend.tar.gz -C /var/www/{{.RPI_SERVICE_NAME}} && rm /tmp/deploy/{{.RPI_SERVICE_NAME}}-frontend.tar.gz"
+      # The web root is public and Caddy does not hide dotfiles, so local state
+      # that ever gets packaged (.rpi holds session transcripts, .deploy holds
+      # build tarballs) would be served over HTTP. Remove it on every deploy
+      # instead of relying on the packer's excludes alone.
+      - ssh root@139.196.85.175 "rm -rf /var/www/{{.RPI_SERVICE_NAME}}/.rpi /var/www/{{.RPI_SERVICE_NAME}}/.deploy"
       - >-
         echo "前端文件已上传到 /var/www/{{.RPI_SERVICE_NAME}}/"
 
@@ -173,6 +178,10 @@ tasks:
       - ssh root@139.196.85.175 "curl --fail --silent --show-error --head https://{{.RPI_DOMAIN}}/"
       - ssh root@139.196.85.175 "curl --fail --silent --show-error https://{{.RPI_DOMAIN}}/data/packages.json"
       - ssh root@139.196.85.175 "curl --fail --silent --show-error https://{{.RPI_DOMAIN}}/index.html | grep -F 'bigfish1913/pi-rust'"
+      # Fail the verify if local state is reachable, so a regression is caught here
+      # rather than by someone discovering a session transcript over HTTP.
+      - >-
+        ssh root@139.196.85.175 "for p in .rpi/todo.json .deploy/website.tar.gz; do code=\$(curl -s -o /dev/null -w '%{http_code}' https://{{.RPI_DOMAIN}}/\$p); if [ \"\$code\" != 404 ]; then echo \"LEAK: https://{{.RPI_DOMAIN}}/\$p returned \$code\" >&2; exit 1; fi; done; echo 'no local state exposed over HTTP'"
 
   rpi-diagnose:
     desc: 诊断 rpi 公网 HTTP 与 Caddy 状态
