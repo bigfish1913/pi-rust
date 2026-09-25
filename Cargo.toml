@@ -71,16 +71,16 @@ rpassword = "7"
 
 # pi-rust internal crates (published under the `rpi-` prefix; directories keep
 # the `pi-` name — package `name` is what crates.io + `extern crate` see).
-rpi-telemetry = { path = "crates/pi-telemetry", version = "0.1.28" }
-rpi-ai = { path = "crates/pi-ai", version = "0.1.28" }
-rpi-agent = { path = "crates/pi-agent", version = "0.1.28" }
-rpi-tools = { path = "crates/pi-tools", version = "0.1.28" }
-rpi-harness = { path = "crates/pi-harness", version = "0.1.28" }
+rpi-telemetry = { path = "crates/pi-telemetry", version = "0.2.0" }
+rpi-ai = { path = "crates/pi-ai", version = "0.2.0" }
+rpi-agent = { path = "crates/pi-agent", version = "0.2.0" }
+rpi-tools = { path = "crates/pi-tools", version = "0.2.0" }
+rpi-harness = { path = "crates/pi-harness", version = "0.2.0" }
 
-rpi-tui = { path = "crates/pi-tui", version = "0.1.28" }
+rpi-tui = { path = "crates/pi-tui", version = "0.2.0" }
 
-rpi-plugin-sdk = { path = "crates/rpi-plugin-sdk", version = "0.1.28" }
-rpi-extensions = { path = "crates/rpi-extensions", version = "0.1.28" }
+rpi-plugin-sdk = { path = "crates/rpi-plugin-sdk", version = "0.2.0" }
+rpi-extensions = { path = "crates/rpi-extensions", version = "0.2.0" }
 
 [profile.release]
 lto = "thin"
