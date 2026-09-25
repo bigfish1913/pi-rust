@@ -672,6 +672,19 @@ prepare_next_turn: None,
 （`should_stop_after_turn: None`），现在挂上 `RunBudget`。等价的清空说明——**不新增
 `ConfigSnapshot` / `AgentHarnessOptions` 字段**，先只给默认值，需要可配置时再加。
 
+**默认关闭（与原生 pi 对齐）**：原生 pi 的 loop 没有任何 turn/token 上限
+（`for(;;){ while(hasMoreToolCalls || pendingMessages>0){…} }`，只靠「模型不再要工具」/abort/报错退出），
+所以 rpi 也**默认不设上限**，闸门改为 per-process 显式开启：
+
+```bash
+RPI_MAX_TURNS_PER_RUN=120 rpi     # 单次 run 超过 120 轮就停，并追一条 runBudget 通知
+# 不设 / 空 / 非数字 / 0  →  无上限（= 原生行为）
+```
+
+`RunBudget::from_env()` 负责解析；关闭时 `should_stop_after_turn` 保持 `None`，loop 与原生完全一致。
+两条端到端测试钉住这个契约：`no_turn_ceiling_by_default_matches_native_pi`（默认跑满 200 轮、
+不产生通知）与 `run_budget_stops_a_looping_run_and_records_why`（显式开启时恰好停在 120）。
+
 **为什么必须显式记录原因**：护栏触发时循环走的是正常出口，run 的 outcome 是
 `Completed`。如果不记，用户看到的就是「任务做完了」，而实际上是**被截断**了。
 所以 `run_core` 在 `persist_new_messages` 之后会往 lane 追加一条
@@ -710,6 +723,10 @@ prepare_next_turn: None,
 护栏给了之前缺失的**可观测指标**：`BudgetStop` 触发次数。
 以后要验证 §九.1 的提示词改动是否真的减少了 re-plan，不必再跑不可比的长任务对比，
 而可以看「同一任务下，120 轮上限被触发的次数从 N 降到 M」。
+
+注意：该指标现在需要显式开启护栏才会产生（默认关闭，见 §9.2「默认关闭（与原生 pi 对齐）」），
+所以近期会话里 `BudgetStop` 触发次数恒为 0 —— 那是「没开闸」而不是「没有跑飞」。
+`run` 的单轮数上限（`max turns per run`）仍然可以从会话文件里直接统计，作为替代指标。
 
 ---
 

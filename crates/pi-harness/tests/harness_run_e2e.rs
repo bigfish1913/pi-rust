@@ -809,6 +809,17 @@ async fn directly_sent_prompt_emits_no_user_message_start() {
 async fn run_budget_stops_a_looping_run_and_records_why() {
     // A model that never stops asking for tools: far more scripted turns than
     // the ceiling, so only the guard can end this run.
+    //
+    // The guard is off by default (native pi parity), so this test opts in for
+    // its duration. `std::env` is process-global — this is an integration-test
+    // binary whose other tests never approach the ceiling, so a parallel
+    // harness picking it up is harmless; the value is restored at the end.
+    let previous = std::env::var(rpi_harness::run_budget::MAX_TURNS_ENV).ok();
+    std::env::set_var(
+        rpi_harness::run_budget::MAX_TURNS_ENV,
+        rpi_harness::run_budget::DEFAULT_MAX_TURNS_PER_RUN.to_string(),
+    );
+
     let script = FauxScript::new();
     let step = || FauxStep::tool_call("bash", serde_json::json!({ "command": "echo tick" }));
     script.set_responses((0..200).map(|_| step()).collect());
@@ -890,11 +901,105 @@ async fn run_budget_stops_a_looping_run_and_records_why() {
         1,
         "exactly one budget notice must be recorded; got {notices:?}"
     );
+
+    // Restore the process-wide switch (see the opt-in above).
+    match &previous {
+        Some(value) => std::env::set_var(rpi_harness::run_budget::MAX_TURNS_ENV, value),
+        None => std::env::remove_var(rpi_harness::run_budget::MAX_TURNS_ENV),
+    }
     assert!(
         notices[0].contains(&ceiling.to_string()) && notices[0].contains("unfinished"),
         "the notice must name the budget and warn the work may be incomplete: {}",
         notices[0]
     );
+}
+
+/// Native pi parity: with no `RPI_MAX_TURNS_PER_RUN`, a run has **no** turn
+/// ceiling — it ends only because the model stopped asking for tools. This is
+/// the counterpart of the opt-in test above: it fails if anyone re-enables the
+/// guard by default.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_turn_ceiling_by_default_matches_native_pi() {
+    let previous = std::env::var(rpi_harness::run_budget::MAX_TURNS_ENV).ok();
+    std::env::remove_var(rpi_harness::run_budget::MAX_TURNS_ENV);
+
+    // 199 tool-call turns, then a final plain answer so the loop's own exit
+    // condition ("the model stopped asking for tools") is what ends the run.
+    // That is 80 turns past the suggested ceiling, so an accidentally enabled
+    // guard would truncate it and record a notice.
+    let script = FauxScript::new();
+    let step = || FauxStep::tool_call("bash", serde_json::json!({ "command": "echo tick" }));
+    let mut steps: Vec<FauxStep> = (0..199).map(|_| step()).collect();
+    steps.push(FauxStep::text("done"));
+    script.set_responses(steps);
+    let (harness, provider, _env) = harness_with(script).await;
+
+    let result = harness
+        .prompt_text("run without a ceiling", vec![])
+        .await
+        .expect("the run must complete");
+    assert!(matches!(result.outcome, HarnessRunOutcome::Completed { .. }));
+
+    let calls = provider
+        .state()
+        .call_count
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        calls,
+        rpi_harness::run_budget::DEFAULT_MAX_TURNS_PER_RUN as usize + 80,
+        "the default must not truncate a long run"
+    );
+
+    // No budget notice on the lane.
+    let leaf = harness
+        .session()
+        .get_leaf_id()
+        .await
+        .expect("leaf")
+        .expect("leaf present");
+    let path = harness
+        .session()
+        .find_entries_on_branch(
+            &EntryQuery {
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            },
+            &BranchBounds {
+                start: Some(leaf),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("branch path");
+    // The budget notice is a `customType = "runBudget"` custom message; its
+    // absence is what proves no ceiling fired.
+    let notices: Vec<String> = path
+        .iter()
+        .filter_map(|entry| match entry {
+            rpi_harness::session::types::Entry::Message(message_entry) => {
+                match &message_entry.message {
+                    rpi_agent::AgentMessage::Custom(custom)
+                        if custom.role == rpi_harness::messages::CUSTOM_ROLE
+                            && custom.data.get("customType").and_then(|v| v.as_str())
+                                == Some("runBudget") =>
+                    {
+                        Some(custom.data.to_string())
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        notices.is_empty(),
+        "an unbounded run must not record a budget notice: {notices:?}"
+    );
+
+    match &previous {
+        Some(value) => std::env::set_var(rpi_harness::run_budget::MAX_TURNS_ENV, value),
+        None => std::env::remove_var(rpi_harness::run_budget::MAX_TURNS_ENV),
+    }
 }
 
 /// A crash mid-stream must not cost the whole run.

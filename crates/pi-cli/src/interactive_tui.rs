@@ -48,7 +48,7 @@ use rpi_tui::{
     ScrollViewOptions, SearchBar, SearchableSelectList, SelectItem, SelectList, SettingItem,
     SettingsList, SlashCommand as SlashCommandEntry, SlashCommandAutocompleteProvider, Spacer,
     StackChild, StackEntry, StatusIndicator, Text, ThemeManager, ThemePreset,
-    ToolExecutionComponent, TuiAltScreen, UserMessageComponent, VStack, WorkingState, TUI,
+    ToolExecutionComponent, ToolStatus, TuiAltScreen, UserMessageComponent, VStack, WorkingState, TUI,
 };
 use rpi_tui::{bold as tui_bold, theme as current_theme};
 
@@ -3050,9 +3050,6 @@ enum TuiMessage {
     /// editor. Handling it on the async loop keeps editor mutation single-
     /// threaded with the rest of the TUI state.
     ExternalEditorResult(Result<String, String>),
-    /// Restore all queued steering/follow-up messages into the editor (the
-    /// `app.message.dequeue` action — native pi's "edit all queued messages").
-    Dequeue,
     /// A user-initiated `!command` / `!!command` shell run finished. Routed to
     /// the main loop so the `bashExecution` transcript record is persisted in
     /// order relative to agent runs (native pi's `recordBashResult` /
@@ -4583,6 +4580,11 @@ struct TuiState {
     show_terminal_progress: bool,
     /// Run status for the status indicator + interrupt routing.
     status: std::sync::Mutex<RunStatus>,
+    /// Extension status registry (`SetStatus` runtime action). The render tick
+    /// repaints the footer only when `ext_status_revision` moved.
+    ext_status: rpi_extensions::ExtensionStatusMailbox,
+    /// Revision of `ext_status` as of the last footer write.
+    ext_status_revision: std::sync::atomic::AtomicU64,
     /// Cancellation signal for the short phase that starts the persistent JS
     /// host and runs `before_agent_start`. The key thread can trigger this
     /// directly while the async message loop is awaiting the blocking worker.
@@ -5225,6 +5227,24 @@ impl TuiState {
         }
     }
 
+    /// Push the extension status registry into the footer when it changed.
+    /// Returns `true` when the footer was rewritten (the caller then requests a
+    /// repaint — an idle session would otherwise never redraw).
+    fn sync_extension_status(&self) -> bool {
+        let revision = self.ext_status.revision();
+        if self
+            .ext_status_revision
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == revision
+        {
+            return false;
+        }
+        self.ext_status_revision
+            .store(revision, std::sync::atomic::Ordering::SeqCst);
+        self.footer.set_extension_status(&self.ext_status.text());
+        true
+    }
+
     /// The bash panel has its own `Running...` spinner. Keep the global
     /// `Working...` loader out of the status slot while any bash tool is active
     /// so the same operation is not presented as two simultaneous loaders.
@@ -5814,6 +5834,8 @@ pub async fn interactive_tui(
         tool_outputs_expanded: std::sync::Mutex::new(tool_outputs_expanded),
         show_terminal_progress,
         status: std::sync::Mutex::new(RunStatus::Idle),
+        ext_status: reload_context.ext_status.clone(),
+        ext_status_revision: std::sync::atomic::AtomicU64::new(u64::MAX),
         js_preparation_cancel: std::sync::Mutex::new(None),
         user_bash_cancel: std::sync::Mutex::new(None),
         pending_bash_messages: std::sync::Mutex::new(Vec::new()),
@@ -5876,8 +5898,11 @@ pub async fn interactive_tui(
         StackChild::Entry(StackEntry::new(state.pending_container().clone())),
         StackChild::Entry(StackEntry::new(status_container.clone())),
         StackChild::Entry(StackEntry::new(autocomplete_container.clone())),
-        // Add top padding above the input box for visual breathing room.
-        StackChild::Entry(StackEntry::new(Arc::new(Spacer::new(1)))),
+        // NOTE: no Spacer here. The scroll content already ends with a blank line
+        // (`document_container`), and a second one in the dock stacked into a
+        // two-row gap between the last message and the input box. One row of
+        // breathing room is the whole safe area now; the transcript keeps its
+        // own padding so a long message never touches the editor border.
         StackChild::Entry(
             StackEntry::new(editor_container.clone())
                 .shrink(0)
@@ -6170,16 +6195,32 @@ pub async fn interactive_tui(
         interval.tick().await; // discard immediate
         loop {
             interval.tick().await;
+            // Extension status (langfuse ✓ …, …) — cheap revision check, and the
+            // only reason an idle session repaints its footer.
+            if state_tick.sync_extension_status() {
+                tui_tick.request_render(false);
+            }
             let working = *state_tick.status.lock().unwrap() == RunStatus::Working;
             if working {
-                if state_tick.bash_components.lock().unwrap().is_empty() {
+                // A live transcript panel — a running bash command *or* a
+                // running tool call — computes its elapsed readout from
+                // `Instant::now()` at render time. A frame that reuses the
+                // cached scroll content never rebuilds it, so the readout
+                // froze at the second of the last full rebuild (reported: a
+                // `search` call stuck at "2.0s" with no way to tell it was
+                // still running). Rebuild while any such panel is live.
+                let bash_present = !state_tick.bash_components.lock().unwrap().is_empty();
+                let has_live_panel = {
+                    let tools = state_tick.tool_components.lock().unwrap();
+                    transcript_has_live_panel(bash_present, &tools)
+                };
+                if has_live_panel {
+                    tui_tick.request_render(false);
+                } else {
                     // Only the dock loader animates. Keep the already-rendered
                     // transcript instead of rebuilding a long history at 12.5
                     // frames per second.
                     tui_tick.request_render_reusing_scroll_content();
-                } else {
-                    // A running bash panel owns a loader inside the transcript.
-                    tui_tick.request_render(false);
                 }
             }
         }
@@ -6998,9 +7039,20 @@ pub async fn interactive_tui(
                 &key,
                 rpi_tui::keybindings::keys::DEQUEUE,
             ) {
-                // The main loop is the source of truth: it clears the lane's
-                // queue and restores whatever was there (a no-op when empty).
-                let _ = tx_for_key.send(TuiMessage::Dequeue);
+                // Handled here, on the key worker — NOT via the mailbox. The
+                // async main loop parks inside `run_prompt_streaming(..).await`
+                // for the whole run, and a queue only exists *while* a run is
+                // in flight, so a `TuiMessage::Dequeue` sat unread until the
+                // run finished (after the lane had already consumed the queue).
+                // Alt+Q therefore looked like a no-op while it was most needed.
+                // Spawn the drain so it lands while the user is still looking at
+                // the queue, exactly like the Alt+Enter `follow_up` path above.
+                tokio::spawn(restore_queued_messages_to_editor(
+                    lane_for_key.clone(),
+                    editor_for_key.clone(),
+                    state_for_key.clone(),
+                    tui_for_key.clone(),
+                ));
                 continue;
             }
 
@@ -7243,46 +7295,6 @@ pub async fn interactive_tui(
                     Err(error) => add_error_message(&chat_container, &error),
                 }
                 tui.request_render(false);
-            }
-            Some(TuiMessage::Dequeue) => {
-                // `app.message.dequeue`: pull every queued steering/follow-up
-                // message out of the lane and restore it to the editor so the
-                // user can edit before resending (native pi's
-                // `restoreQueuedMessagesToEditor`). The pending display is
-                // cleared to match.
-                match lane.clear_queue().await {
-                    Ok(queued) => {
-                        let all: Vec<String> = queued
-                            .steering
-                            .iter()
-                            .chain(queued.follow_up.iter())
-                            .cloned()
-                            .collect();
-                        if !all.is_empty() {
-                            let queued_text = all.join("\n\n");
-                            let current = editor.get_text();
-                            let combined = if current.trim().is_empty() {
-                                queued_text
-                            } else {
-                                format!("{queued_text}\n\n{current}")
-                            };
-                            let cursor = combined.chars().count();
-                            editor.set_text(&combined);
-                            editor.set_cursor(0, cursor);
-                        }
-                        state.set_pending_queue(
-                            rpi_harness::agent_harness::QueuedMessages::default(),
-                        );
-                        tui.request_render(false);
-                    }
-                    Err(error) => {
-                        add_error_message(
-                            &chat_container,
-                            &format!("Could not restore queued messages: {error}"),
-                        );
-                        tui.request_render(false);
-                    }
-                }
             }
             Some(TuiMessage::UserBashFinished(report)) => {
                 // Free the run slot first: the guard and the Esc router both
@@ -8102,6 +8114,75 @@ async fn refresh_pending_messages(state: &Arc<TuiState>, lane: &Arc<dyn AgentLan
     if let Ok(queued) = lane.queued_messages().await {
         state.set_pending_queue(queued);
     }
+}
+
+/// Whether the transcript holds a panel that repaints its elapsed readout from
+/// the clock on every frame: a running bash command, or a tool call still in
+/// [`ToolStatus::Running`]. Such a panel needs a real transcript rebuild each
+/// render tick — a frame that reuses the cached scroll content would leave its
+/// timer frozen at the second of the last full rebuild.
+fn transcript_has_live_panel(
+    bash_components_present: bool,
+    tool_components: &HashMap<String, Arc<ToolExecutionComponent>>,
+) -> bool {
+    bash_components_present
+        || tool_components
+            .values()
+            .any(|component| component.status() == ToolStatus::Running)
+}
+
+/// Prepend restored queued messages to the draft the user may already have
+/// typed (native pi's `restoreQueuedMessagesToEditor` places them first).
+fn merge_queued_into_draft(queued_text: &str, current: &str) -> String {
+    if current.trim().is_empty() {
+        queued_text.to_string()
+    } else {
+        format!("{queued_text}\n\n{current}")
+    }
+}
+
+/// `app.message.dequeue`: drain every queued steering/follow-up message out of
+/// the lane and restore it to the editor so the user can edit before resending
+/// (native pi's `restoreQueuedMessagesToEditor`).
+///
+/// Runs on a spawned task rather than through the [`TuiMessage`] mailbox: the
+/// async main loop owns `run_prompt_streaming(..).await` for the whole run, and
+/// a queue only exists *while* a run is in flight — so a `TuiMessage::Dequeue`
+/// was never serviced until the run ended, after the lane had already consumed
+/// the queue. That made Alt+Q a no-op while it was most needed.
+async fn restore_queued_messages_to_editor(
+    lane: Arc<dyn AgentLane>,
+    editor: Arc<Editor>,
+    state: Arc<TuiState>,
+    tui: Arc<TuiAltScreen>,
+) {
+    match lane.clear_queue().await {
+        Ok(queued) => {
+            let all: Vec<String> = queued
+                .steering
+                .iter()
+                .chain(queued.follow_up.iter())
+                .cloned()
+                .collect();
+            if !all.is_empty() {
+                let queued_text = all.join("\n\n");
+                let current = editor.get_text();
+                let combined = merge_queued_into_draft(&queued_text, &current);
+                let cursor = combined.chars().count();
+                editor.set_text(&combined);
+                editor.set_cursor(0, cursor);
+            }
+            // The lane drained the queue; refresh so the dock drops the rows.
+            refresh_pending_messages(&state, &lane).await;
+        }
+        Err(error) => {
+            add_error_message(
+                &state.chat_container,
+                &format!("Could not restore queued messages: {error}"),
+            );
+        }
+    }
+    tui.request_render(false);
 }
 
 async fn drain_agent_events(
@@ -10387,6 +10468,8 @@ mod tests {
             tool_outputs_expanded: std::sync::Mutex::new(false),
             show_terminal_progress: true,
             status: std::sync::Mutex::new(RunStatus::Idle),
+            ext_status: rpi_extensions::ExtensionStatusMailbox::new(),
+            ext_status_revision: std::sync::atomic::AtomicU64::new(u64::MAX),
             js_preparation_cancel: std::sync::Mutex::new(None),
             user_bash_cancel: std::sync::Mutex::new(None),
             pending_bash_messages: std::sync::Mutex::new(Vec::new()),
@@ -10428,6 +10511,38 @@ mod tests {
             selection_start: std::sync::Mutex::new(None),
             selection_end: std::sync::Mutex::new(None),
         })
+    }
+
+    #[test]
+    fn live_panel_repaints_while_a_tool_or_bash_is_running() {
+        // No panels → only the dock loader animates (reuse the cached
+        // transcript instead of rebuilding a long history).
+        let empty: HashMap<String, Arc<ToolExecutionComponent>> = HashMap::new();
+        assert!(!transcript_has_live_panel(false, &empty));
+
+        // A running tool call is a live panel: its elapsed readout is computed
+        // at render time, so it must force a transcript rebuild every tick.
+        let mut tools = HashMap::new();
+        let tool = Arc::new(ToolExecutionComponent::new("search", "{}"));
+        tool.set_running();
+        tools.insert("tc1".to_string(), tool);
+        assert!(transcript_has_live_panel(false, &tools));
+
+        // A finished tool no longer needs the repaint, but a running bash
+        // command still does.
+        tools.get("tc1").unwrap().set_result("done", false);
+        assert!(!transcript_has_live_panel(false, &tools));
+        assert!(transcript_has_live_panel(true, &tools));
+    }
+
+    #[test]
+    fn dequeue_merge_preserves_a_typed_draft() {
+        assert_eq!(merge_queued_into_draft("queued", ""), "queued");
+        assert_eq!(merge_queued_into_draft("queued", "   "), "queued");
+        assert_eq!(
+            merge_queued_into_draft("queued", "typed"),
+            "queued\n\ntyped"
+        );
     }
 
     #[test]
@@ -11348,6 +11463,8 @@ mod tests {
             tool_outputs_expanded: std::sync::Mutex::new(false),
             show_terminal_progress: true,
             status: std::sync::Mutex::new(RunStatus::Idle),
+            ext_status: rpi_extensions::ExtensionStatusMailbox::new(),
+            ext_status_revision: std::sync::atomic::AtomicU64::new(u64::MAX),
             js_preparation_cancel: std::sync::Mutex::new(None),
             user_bash_cancel: std::sync::Mutex::new(None),
             pending_bash_messages: std::sync::Mutex::new(Vec::new()),
@@ -11793,6 +11910,8 @@ mod tests {
             tool_outputs_expanded: std::sync::Mutex::new(false),
             show_terminal_progress: true,
             status: std::sync::Mutex::new(RunStatus::Idle),
+            ext_status: rpi_extensions::ExtensionStatusMailbox::new(),
+            ext_status_revision: std::sync::atomic::AtomicU64::new(u64::MAX),
             js_preparation_cancel: std::sync::Mutex::new(None),
             user_bash_cancel: std::sync::Mutex::new(None),
             pending_bash_messages: std::sync::Mutex::new(Vec::new()),
@@ -11874,6 +11993,8 @@ mod tests {
             tool_outputs_expanded: std::sync::Mutex::new(false),
             show_terminal_progress: true,
             status: std::sync::Mutex::new(RunStatus::Idle),
+            ext_status: rpi_extensions::ExtensionStatusMailbox::new(),
+            ext_status_revision: std::sync::atomic::AtomicU64::new(u64::MAX),
             js_preparation_cancel: std::sync::Mutex::new(None),
             user_bash_cancel: std::sync::Mutex::new(None),
             pending_bash_messages: std::sync::Mutex::new(Vec::new()),
@@ -11958,6 +12079,8 @@ mod tests {
             tool_outputs_expanded: std::sync::Mutex::new(false),
             show_terminal_progress: true,
             status: std::sync::Mutex::new(RunStatus::Idle),
+            ext_status: rpi_extensions::ExtensionStatusMailbox::new(),
+            ext_status_revision: std::sync::atomic::AtomicU64::new(u64::MAX),
             js_preparation_cancel: std::sync::Mutex::new(None),
             user_bash_cancel: std::sync::Mutex::new(None),
             pending_bash_messages: std::sync::Mutex::new(Vec::new()),
@@ -12045,6 +12168,8 @@ mod tests {
             tool_outputs_expanded: std::sync::Mutex::new(false),
             show_terminal_progress: true,
             status: std::sync::Mutex::new(RunStatus::Idle),
+            ext_status: rpi_extensions::ExtensionStatusMailbox::new(),
+            ext_status_revision: std::sync::atomic::AtomicU64::new(u64::MAX),
             js_preparation_cancel: std::sync::Mutex::new(None),
             user_bash_cancel: std::sync::Mutex::new(None),
             pending_bash_messages: std::sync::Mutex::new(Vec::new()),

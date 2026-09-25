@@ -16,6 +16,19 @@
 //! makes sure that when it *does* happen the run ends on a known budget instead
 //! of running away.
 //!
+//! # Off by default (native pi parity)
+//!
+//! Native pi's loop has no turn/token ceiling at all — it runs until the model
+//! stops asking for tools, an abort, or an error. `rpi` therefore ships the
+//! guard **disabled** so default behaviour is identical to native, and you opt
+//! in per process:
+//!
+//! ```text
+//! RPI_MAX_TURNS_PER_RUN=120 rpi      # stop a single run after 120 turns
+//! ```
+//!
+//! Unset, empty, non-numeric or `0` all mean "no ceiling", exactly like native.
+//!
 //! # Why only a turn cap
 //!
 //! A "no progress" detector was measured against the real session and rejected:
@@ -45,12 +58,18 @@ impl BudgetStop {
     }
 }
 
-/// Turn ceiling for one run.
+/// Suggested turn ceiling when the guard is switched on.
 ///
 /// Chosen well above real work but far below a runaway: the observed failing
 /// session needed 112 turns to do very little, while a large refactor
-/// legitimately uses a few dozen. `0` disables the guard.
+/// legitimately uses a few dozen. Not applied unless the operator enables the
+/// guard — see [`RunBudget::from_env`]. `0` means unlimited.
 pub const DEFAULT_MAX_TURNS_PER_RUN: u32 = 120;
+
+/// Environment variable that switches the guard on: `RPI_MAX_TURNS_PER_RUN=<n>`
+/// (`n > 0`). Anything else — unset, empty, non-numeric, `0` — leaves the run
+/// unbounded, matching native pi.
+pub const MAX_TURNS_ENV: &str = "RPI_MAX_TURNS_PER_RUN";
 
 /// Counts turns in one run and reports when the budget is exhausted.
 ///
@@ -66,8 +85,10 @@ pub struct RunBudget {
 }
 
 impl Default for RunBudget {
+    /// Disabled: native pi has no run-level ceiling, so neither does `rpi`
+    /// unless the operator asks for one (see [`RunBudget::from_env`]).
     fn default() -> Self {
-        Self::new(DEFAULT_MAX_TURNS_PER_RUN)
+        Self::new(0)
     }
 }
 
@@ -78,6 +99,26 @@ impl RunBudget {
             turns: 0,
             max_turns,
             stop: None,
+        }
+    }
+
+    /// Build from the environment: [`MAX_TURNS_ENV`] holds the ceiling, and
+    /// anything unparsable or non-positive disables the guard (native parity).
+    pub fn from_env() -> Self {
+        match std::env::var(MAX_TURNS_ENV) {
+            Ok(raw) => match raw.trim().parse::<u32>() {
+                Ok(n) => Self::new(n),
+                Err(_) if raw.trim().is_empty() => Self::new(0),
+                Err(_) => {
+                    tracing::warn!(
+                        value = %raw,
+                        "{} is not a number; running without a turn ceiling",
+                        MAX_TURNS_ENV
+                    );
+                    Self::new(0)
+                }
+            },
+            Err(_) => Self::new(0),
         }
     }
 
@@ -147,24 +188,44 @@ mod tests {
     }
 
     #[test]
-    fn default_allows_the_observed_bad_run_shape_but_not_far_beyond() {
-        // Regression shape: the failing session used 112 turns and still had not
-        // produced a usable result, so the default must stop at or below that
-        // order of magnitude instead of letting the loop run forever.
+    fn default_is_unbounded_like_native_pi() {
+        // Native pi's loop has no ceiling, so the default must not invent one:
+        // the guard is opt-in (RPI_MAX_TURNS_PER_RUN).
         let mut budget = RunBudget::default();
-        assert!(budget.is_enabled());
-        assert!(budget.max_turns() <= 200);
-        let mut stop = None;
-        for _ in 0..1_000 {
-            if let Some(s) = budget.observe_turn() {
-                stop = Some(s);
-                break;
-            }
+        assert!(!budget.is_enabled());
+        assert_eq!(budget.max_turns(), 0);
+        for _ in 0..5_000 {
+            assert_eq!(budget.observe_turn(), None);
         }
-        assert!(
-            stop.is_some(),
-            "the default budget must be finite: {stop:?}"
-        );
+    }
+
+    #[test]
+    fn from_env_enables_only_for_a_positive_number() {
+        // Env vars are process-global: one test owns this key, and it restores
+        // the previous value before returning.
+        let previous = std::env::var(MAX_TURNS_ENV).ok();
+        let restore = || match &previous {
+            Some(v) => std::env::set_var(MAX_TURNS_ENV, v),
+            None => std::env::remove_var(MAX_TURNS_ENV),
+        };
+
+        std::env::remove_var(MAX_TURNS_ENV);
+        assert!(!RunBudget::from_env().is_enabled(), "unset must be unbounded");
+
+        std::env::set_var(MAX_TURNS_ENV, "7");
+        let budget = RunBudget::from_env();
+        assert!(budget.is_enabled());
+        assert_eq!(budget.max_turns(), 7);
+
+        for raw in ["0", "", "  ", "on", "abc", "-3"] {
+            std::env::set_var(MAX_TURNS_ENV, raw);
+            assert!(
+                !RunBudget::from_env().is_enabled(),
+                "{raw:?} must leave the run unbounded"
+            );
+        }
+
+        restore();
     }
 
     #[test]

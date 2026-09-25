@@ -311,11 +311,16 @@ pub async fn build(
     // instead of fabricating a user answer. The SAME mailbox is reused across
     // `/reload` so in-flight prompts + TUI attachment survive a plugin swap.
     let ui_dialog_mailbox = rpi_extensions::UiDialogMailbox::new();
+    // Session-scoped extension status registry (runtime action 18 / `SetStatus`).
+    // The bridge lets plugins write; the TUI polls the revision and repaints its
+    // footer. Reused across `/reload` so a plugin's status survives the swap.
+    let ext_status_mailbox = rpi_extensions::ExtensionStatusMailbox::new();
     let action_bridge = rpi_extensions::ActionBridge::with_reload_and_ui(
         runtime.clone(),
         host_arc,
         rpi_extensions::reload_callback_from_mailbox(reload_mailbox.clone()),
         ui_dialog_mailbox.clone(),
+        ext_status_mailbox.clone(),
     );
 
     // ---- Execution env + tools ----
@@ -905,6 +910,7 @@ pub async fn build(
         broadcast: broadcast_for_context,
         mailbox: reload_mailbox,
         ui_dialog: ui_dialog_mailbox,
+        ext_status: ext_status_mailbox,
         dev_extension: None,
     };
 
@@ -982,6 +988,9 @@ pub struct ReloadContext {
     pub package_resources: Arc<crate::packages::PackageResources>,
     /// The live action-bridge cell (swapped + old invalidated on reload).
     pub action_bridge: ActionBridgeCell,
+    /// The extension status registry the TUI renders in its footer (`SetStatus`).
+    /// Lives in the context (not the cell) so it survives a bridge swap.
+    pub ext_status: rpi_extensions::ExtensionStatusMailbox,
     /// The model catalog (read-only) the host uses to resolve `set_model(id)`.
     /// `available_catalog(resolved)` is captured once — reload does not re-resolve
     /// the provider (auth/provider resolution is a startup concern; reloading
@@ -1217,6 +1226,7 @@ where
         host,
         reload_cb,
         ctx.ui_dialog.clone(),
+        ctx.ext_status.clone(),
     );
 
     let extension_session = if effective_args.no_extensions {

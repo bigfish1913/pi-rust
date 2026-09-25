@@ -806,6 +806,11 @@ pub enum RuntimeActionId {
     /// a JSON object with `op` (`open`, `poll`, or `cancel`) and a unique
     /// `requestId`; hosts without an attached TUI return an explicit error.
     UiDialog = 17,
+    /// Publish a short status string for the host's UI (TUI footer).
+    /// Args: `{"key":"langfuse","value":"langfuse ✓ (trace sent)"}`; an
+    /// empty/absent `value` clears that key. Result: `{"ok":true,"changed":bool}`.
+    /// Headless hosts accept the write but have nothing to render.
+    SetStatus = 18,
 }
 
 /// Error returned when a plugin passes a numeric runtime-action id that this
@@ -844,6 +849,7 @@ impl TryFrom<u32> for RuntimeActionId {
             15 => Ok(Self::Reload),
             16 => Ok(Self::GetCliFlag),
             17 => Ok(Self::UiDialog),
+            18 => Ok(Self::SetStatus),
             other => Err(UnknownRuntimeActionId(other)),
         }
     }
@@ -1244,6 +1250,129 @@ impl PluginApiVt3Ext {
 pub type RpiPluginRegisterV3 =
     extern "C" fn(api: *const PluginApiVt, ext: *const PluginApiVt3Ext, abi_version: u32) -> i32;
 
+// ---------------------------------------------------------------------------
+// Unified ABI — single unversioned symbol, version in struct
+// ---------------------------------------------------------------------------
+
+/// The unified ABI version. This is the *only* ABI going forward; the version
+/// lives inside the struct (first field) so future breaks can be detected by
+/// reading the pointer, independent of entrypoint arity.
+pub const RPI_PLUGIN_ABI_VERSION_UNIFIED: u32 = 4;
+
+/// The unversioned symbol for the unified ABI. Old v1 plugins also exported
+/// `rpi_plugin_register` with a different signature; repurposing the name
+/// means leftover v1 `.dll`s will be mis-called (accepted risk).
+pub const REGISTER_SYMBOL_UNIFIED: &[u8] = b"rpi_plugin_register\0";
+
+/// The unified host-provided API struct. The first two fields (`abi_version`
+/// and `struct_size`) are contract-identity markers that survive future
+/// signature changes: a plugin reads them from the pointer before anything
+/// else, so even if the entrypoint arity changes, the version check remains
+/// robust.
+///
+/// This struct folds in v3's `declare` slot (previously in `PluginApiVt3Ext`),
+/// so there's no side block — one struct, one entrypoint, forever.
+#[repr(C)]
+pub struct PluginApi {
+    /// Contract identity. First field so a plugin can validate before reading
+    /// anything else, independent of the entrypoint arity.
+    pub abi_version: u32,
+    /// `sizeof(PluginApi)` as the host built it. Lets a plugin detect a host
+    /// that predates slots it wants (host_struct_size < plugin's expected
+    /// offset). Future hosts may grow this struct; old plugins check
+    /// `struct_size` before accessing new fields.
+    pub struct_size: u32,
+
+    // --- All fields from PluginApiVt (same order, same types) ---
+    /// Host's `free_string` — the plugin calls this for every [`StbString`] it
+    /// *receives* from the host (outputs of actions, event payloads, inputs to
+    /// execute). Never null.
+    pub free_string: FreeStringFn,
+
+    // --- 8 registrars (plugin → host "register X into the host") ---
+    pub register_tool: Option<
+        extern "C" fn(
+            schema: *const StableToolSchema,
+            execute_fn: ToolExecuteFn,
+            poll_fn: ToolPollFn,
+            cancel_fn: ToolCancelFn,
+            destroy_fn: ToolDestroyFn,
+            plugin_free_string: FreeStringFn,
+        ) -> i32,
+    >,
+    pub register_command: Option<
+        extern "C" fn(
+            name: StbStringRef,
+            description: StbStringRef,
+            handler: CommandHandlerFn,
+        ) -> i32,
+    >,
+    pub register_shortcut:
+        Option<extern "C" fn(key: StbStringRef, description: StbStringRef) -> i32>,
+    pub register_flag: Option<extern "C" fn(name: StbStringRef, description: StbStringRef) -> i32>,
+    pub register_provider: Option<
+        extern "C" fn(
+            provider_id: StbStringRef,
+            base_url: StbStringRef,
+            api_style: StbStringRef,
+            request_fn: ProviderRequestFn,
+            plugin_free_string: FreeStringFn,
+            user_data: *mut c_void,
+        ) -> i32,
+    >,
+    pub register_message_renderer: Option<
+        extern "C" fn(
+            name: StbStringRef,
+            render_fn: RenderFn,
+            plugin_free_string: FreeStringFn,
+            user_data: *mut c_void,
+        ) -> i32,
+    >,
+    pub register_markdown_transformer: Option<
+        extern "C" fn(
+            name: StbStringRef,
+            render_fn: RenderFn,
+            plugin_free_string: FreeStringFn,
+            user_data: *mut c_void,
+        ) -> i32,
+    >,
+    pub register_entry_renderer: Option<
+        extern "C" fn(
+            name: StbStringRef,
+            render_fn: RenderFn,
+            plugin_free_string: FreeStringFn,
+            user_data: *mut c_void,
+        ) -> i32,
+    >,
+    pub register_event_handler: Option<
+        extern "C" fn(tag: EventTag, handler: EventHandlerFn, user_data: *mut c_void) -> i32,
+    >,
+    pub register_resources_discover: Option<
+        extern "C" fn(
+            handler: ResourcesDiscoverFn,
+            plugin_free_string: FreeStringFn,
+            user_data: *mut c_void,
+        ) -> i32,
+    >,
+    pub runtime_action: RuntimeActionFn,
+    pub dispatch_event:
+        Option<extern "C" fn(event: StablePluginEvent, user_data: *mut c_void) -> i32>,
+    pub user_data: *mut c_void,
+
+    // --- v3's declare slot, folded in ---
+    /// Declare this plugin's host-side preferences as a JSON object, e.g.
+    /// `{"priority":60,"platforms":["linux","macos"]}`. Nullable: host does
+    /// not support declarations yet (plugin skips the call; host applies
+    /// defaults: priority `100`, all platforms).
+    pub declare: Option<extern "C" fn(json: StbStringRef) -> i32>,
+}
+unsafe impl Send for PluginApi {}
+unsafe impl Sync for PluginApi {}
+
+/// Unified ABI plugin entrypoint signature: `(api)`. The version is read from
+/// `api->abi_version`; no positional arg.
+pub type RpiPluginRegisterUnified = extern "C" fn(api: *const PluginApi) -> i32;
+
 // ===========================================================================
 // Panic containment
 // ===========================================================================
@@ -1334,6 +1463,76 @@ pub unsafe fn register_entrypoint_v3(
     // Contain panics: unwinding out of the plugin's `extern "C"` shim aborts
     // the process, so convert a panic into a status code the host can report.
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(api, ext))) {
+        Ok(code) => code,
+        Err(_) => REGISTER_PANIC_STATUS,
+    }
+}
+
+/// Export a unified ABI plugin entrypoint under `rpi_plugin_register`.
+///
+/// The unified ABI has no version suffix in the symbol name; the version lives
+/// inside the [`PluginApi`] struct (first field `abi_version`). This is the
+/// *only* ABI going forward; old versioned symbols (`rpi_plugin_register_v2`,
+/// `_v3`) are kept temporarily for migration but are deprecated.
+///
+/// The expression receives `&PluginApi` and returns the plugin-defined
+/// registration status code.
+///
+/// ```ignore
+/// rpi_plugin_sdk::export_plugin!(|api| {
+///     if let Some(declare) = api.declare {
+///         declare(rpi_plugin_sdk::StbStringRef::from_str(
+///             r#"{"priority":60,"platforms":["linux"]}"#,
+///         ));
+///     }
+///     // ... register tools and handlers through `api` ...
+///     0
+/// });
+/// ```
+#[macro_export]
+macro_rules! export_plugin {
+    ($body:expr) => {
+        #[no_mangle]
+        pub extern "C" fn rpi_plugin_register(api: *const $crate::PluginApi) -> i32 {
+            // SAFETY: host guarantees `api` is valid for this call.
+            unsafe { $crate::register_entrypoint_unified(api, $body) }
+        }
+    };
+}
+
+/// Unified ABI entrypoint helper: reads `abi_version` and `struct_size` from
+/// the struct pointer before dereferencing anything else. This survives future
+/// signature changes because the pointer is always the first argument.
+///
+/// # Safety
+///
+/// `api` must be a valid, properly aligned pointer to a [`PluginApi`] that
+/// remains valid for the duration of `body`.
+pub unsafe fn register_entrypoint_unified(
+    api: *const PluginApi,
+    body: impl FnOnce(&PluginApi) -> i32,
+) -> i32 {
+    if api.is_null() {
+        return 2;
+    }
+    // SAFETY: caller guarantees `api` is valid; we check null above.
+    // Read the version and size fields first — they're at known offsets
+    // regardless of future struct growth.
+    let abi_version = (*api).abi_version;
+    let struct_size = (*api).struct_size;
+    if abi_version != RPI_PLUGIN_ABI_VERSION_UNIFIED {
+        // Mismatch: refuse to register. The host logs "ABI version mismatch"
+        // and skips loading this plugin.
+        return 1;
+    }
+    if (struct_size as usize) < core::mem::size_of::<PluginApi>() {
+        // Host predates a field the plugin expects; degrade gracefully.
+        return 3;
+    }
+    let api = &*api;
+    // Contain panics: unwinding out of the plugin's `extern "C"` shim aborts
+    // the process, so convert a panic into a status code the host can report.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(api))) {
         Ok(code) => code,
         Err(_) => REGISTER_PANIC_STATUS,
     }
@@ -1718,13 +1917,16 @@ mod tests {
             RuntimeActionId::Reload,
             RuntimeActionId::GetCliFlag,
             RuntimeActionId::UiDialog,
+            RuntimeActionId::SetStatus,
         ];
 
         for (raw, expected) in ids.into_iter().enumerate() {
             assert_eq!(RuntimeActionId::try_from(raw as u32), Ok(expected));
             assert_eq!(u32::from(expected), raw as u32);
         }
-        assert_eq!(RuntimeActionId::try_from(18), Err(UnknownRuntimeActionId(18)));
+        // One past the highest defined id is rejected (nothing is silently
+        // accepted), and so is the u32 ceiling.
+        assert_eq!(RuntimeActionId::try_from(19), Err(UnknownRuntimeActionId(19)));
         assert_eq!(
             RuntimeActionId::try_from(u32::MAX),
             Err(UnknownRuntimeActionId(u32::MAX))

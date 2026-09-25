@@ -2,7 +2,7 @@
 //!
 //! This is the Part B2 ABI smoke target. The host loads it via `rpi-extensions`
 //! (`--extensions-dir examples/plugin-stub`'), which looks up
-//! `rpi_plugin_register_v2` and calls it with the host vtable. In `register` this
+//! `rpi_plugin_register` (the unified ABI) and calls it with the host vtable. In `register` this
 //! plugin:
 //!
 //! 1. Registers an **`echo`** tool — params `{ "text": string }`, returns that
@@ -363,10 +363,10 @@ extern "C" fn on_markdown_transform(
 // The register entrypoint
 // ---------------------------------------------------------------------------
 
-// The SDK macro exports the ABI v2 `rpi_plugin_register_v2` symbol and applies
+// The SDK macro exports the unified `rpi_plugin_register` symbol and applies
 // the version/null checks before running our registration body. Return 0 on
 // success; nonzero means the host logs and skips this plugin.
-rpi_plugin_sdk::export_plugin_v2!(|api| {
+rpi_plugin_sdk::export_plugin!(|api| {
     // Register the echo tool. Build an owning StableToolSchema (name +
     // description + parameters-as-JSON); the host frees the schema's strings
     // via our `plugin_free_string` after copying them out.

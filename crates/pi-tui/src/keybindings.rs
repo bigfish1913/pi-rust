@@ -856,4 +856,18 @@ mod tests {
             assert_eq!(keys[0].display(), "Alt+Up");
         }
     }
+
+    #[test]
+    fn dequeue_matches_its_platform_default_event() {
+        // Guards the hotkey itself: a real Alt+Q (Windows) / Alt+Up (elsewhere)
+        // event must resolve to `app.message.dequeue`, since the TUI key loop
+        // routes the "edit queued messages" action solely through this match.
+        let kb = Keybindings::new();
+        let event = if cfg!(windows) {
+            crossterm::event::KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT)
+        } else {
+            crossterm::event::KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)
+        };
+        assert!(kb.matches(&event, keys::DEQUEUE));
+    }
 }

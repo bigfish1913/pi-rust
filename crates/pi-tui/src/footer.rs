@@ -92,6 +92,9 @@ fn sanitize(text: &str) -> String {
 pub struct FooterComponent {
     /// Current status text (transient run state).
     status: Mutex<String>,
+    /// Extension-provided status text (e.g. `langfuse ✓ (trace sent)`), driven
+    /// by the host's `SetStatus` runtime action. Rendered after the run status.
+    extension_status: Mutex<String>,
     /// Model name.
     model: Mutex<String>,
     /// Keybinding hints (shown only when there is no stats content).
@@ -128,6 +131,7 @@ impl FooterComponent {
     pub fn new() -> Self {
         Self {
             status: Mutex::new(String::new()),
+            extension_status: Mutex::new(String::new()),
             model: Mutex::new("claude-sonnet-5".to_string()),
             hints: Mutex::new("Enter send · Ctrl+C abort · /help".to_string()),
             thinking_level: Mutex::new(None),
@@ -151,6 +155,15 @@ impl FooterComponent {
     /// Set the status text.
     pub fn set_status(&self, status: &str) {
         if let Ok(mut s) = self.status.lock() {
+            *s = status.to_string();
+        }
+    }
+
+    /// Set the extension status text (empty clears it). Kept separate from
+    /// [`set_status`](Self::set_status) so a run-state transition that clears
+    /// the run status does not wipe what an extension reported.
+    pub fn set_extension_status(&self, status: &str) {
+        if let Ok(mut s) = self.extension_status.lock() {
             *s = status.to_string();
         }
     }
@@ -390,6 +403,7 @@ impl Component for FooterComponent {
     fn render(&self, width: usize) -> Vec<String> {
         let colors = theme().colors;
         let status = self.status.lock().unwrap().clone();
+        let extension_status = self.extension_status.lock().unwrap().clone();
         let model = self.model.lock().unwrap().clone();
         let hints = self.hints.lock().unwrap().clone();
         let thinking_level = self.thinking_level.lock().unwrap().clone();
@@ -438,15 +452,23 @@ impl Component for FooterComponent {
             format!(" {}", color.fg(&sanitized))
         };
 
+        // Extension status (e.g. the langfuse plugin) sits after the run status
+        // and is dimmed so it never competes with `Aborting…`/hints.
+        let extension_word = if extension_status.trim().is_empty() {
+            String::new()
+        } else {
+            format!(" {}", colors.dim.fg(&sanitize(&extension_status)))
+        };
+
         let (stats_plain, stats_styled) = self.stats_line();
         let has_stats = !stats_plain.is_empty();
 
         // Left = usage stats (or keybinding hints on a fresh session) + status;
         // right = the model, right-aligned (pi layout).
         let left_styled = if has_stats {
-            format!("{stats_styled}{status_word}")
+            format!("{stats_styled}{status_word}{extension_word}")
         } else {
-            format!("{}{status_word}", colors.dim.fg(&hints))
+            format!("{}{status_word}{extension_word}", colors.dim.fg(&hints))
         };
         let right_styled = model_label;
 
@@ -497,6 +519,30 @@ impl Component for FooterComponent {
 mod tests {
     use super::*;
     use crate::ansi::strip_ansi;
+
+    /// The extension status (langfuse ✓ …) renders after the run status and is
+    /// independent of it: clearing the run status must not clear it.
+    #[test]
+    fn test_footer_with_extension_status() {
+        let footer = FooterComponent::new();
+        footer.set_status("Aborting…");
+        footer.set_extension_status("langfuse ✓ (trace sent)");
+        let row = strip_ansi(&footer.render(120).join(" "));
+        assert!(row.contains("Aborting…"), "run status lost: {row}");
+        assert!(row.contains("langfuse ✓ (trace sent)"), "ext status lost: {row}");
+
+        // A run-status transition that clears the run status keeps the
+        // extension line (the two are separate slots).
+        footer.set_status("");
+        let row = strip_ansi(&footer.render(120).join(" "));
+        assert!(!row.contains("Aborting…"));
+        assert!(row.contains("langfuse ✓ (trace sent)"), "ext status lost: {row}");
+
+        // Clearing the extension status removes it again.
+        footer.set_extension_status("");
+        let row = strip_ansi(&footer.render(120).join(" "));
+        assert!(!row.contains("langfuse"), "ext status not cleared: {row}");
+    }
 
     #[test]
     fn test_footer_basic() {

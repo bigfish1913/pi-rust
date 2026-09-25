@@ -397,6 +397,10 @@ pub struct ActionBridge {
     /// Session-scoped UI mailbox. It is cloned into reload-created bridges so
     /// a TUI attachment and in-flight requests survive extension reloads.
     ui_dialog: UiDialogMailbox,
+    /// Session-scoped extension status registry (`SetStatus` runtime action).
+    /// Shared with the TUI, which polls [`ExtensionStatusMailbox::revision`]
+    /// and repaints the footer only when an extension actually wrote.
+    ext_status: crate::status::ExtensionStatusMailbox,
     /// B5d staleness flag. Shared so [`invalidate`] flips it for every clone.
     /// `true` while this bridge is the live session's bridge.
     active: Arc<AtomicBool>,
@@ -411,6 +415,7 @@ impl ActionBridge {
             host,
             reload: None,
             ui_dialog: UiDialogMailbox::new(),
+            ext_status: crate::status::ExtensionStatusMailbox::new(),
             active: Arc::new(AtomicBool::new(true)),
         })
     }
@@ -422,7 +427,13 @@ impl ActionBridge {
         host: Arc<dyn RuntimeActionHost>,
         reload: Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>,
     ) -> Arc<Self> {
-        Self::with_reload_and_ui(runtime, host, reload, UiDialogMailbox::new())
+        Self::with_reload_and_ui(
+            runtime,
+            host,
+            reload,
+            UiDialogMailbox::new(),
+            crate::status::ExtensionStatusMailbox::new(),
+        )
     }
 
     /// Build a bridge with an explicit session-scoped UI mailbox.
@@ -436,6 +447,7 @@ impl ActionBridge {
             host,
             reload: None,
             ui_dialog,
+            ext_status: crate::status::ExtensionStatusMailbox::new(),
             active: Arc::new(AtomicBool::new(true)),
         })
     }
@@ -446,12 +458,14 @@ impl ActionBridge {
         host: Arc<dyn RuntimeActionHost>,
         reload: Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>,
         ui_dialog: UiDialogMailbox,
+        ext_status: crate::status::ExtensionStatusMailbox,
     ) -> Arc<Self> {
         Arc::new(Self {
             runtime,
             host,
             reload: Some(reload),
             ui_dialog,
+            ext_status,
             active: Arc::new(AtomicBool::new(true)),
         })
     }
@@ -459,6 +473,11 @@ impl ActionBridge {
     /// Clone the session mailbox for TUI attachment or a reload-created bridge.
     pub fn ui_dialog_mailbox(&self) -> UiDialogMailbox {
         self.ui_dialog.clone()
+    }
+
+    /// Clone the session status registry (TUI rendering + reload-created bridges).
+    pub fn extension_status_mailbox(&self) -> crate::status::ExtensionStatusMailbox {
+        self.ext_status.clone()
     }
 
     /// Mark this bridge stale (B5d). A `/reload` that swaps in a fresh bridge
@@ -574,6 +593,7 @@ pub fn reload_callback_from_mailbox(
 async fn dispatch(
     host: &Arc<dyn RuntimeActionHost>,
     ui_dialog: &UiDialogMailbox,
+    ext_status: &crate::status::ExtensionStatusMailbox,
     action: RuntimeActionId,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
@@ -596,6 +616,9 @@ async fn dispatch(
         RuntimeActionId::Reload => host.reload(args).await,
         RuntimeActionId::GetCliFlag => host.get_cli_flag(args).await,
         RuntimeActionId::UiDialog => ui_dialog.handle(args),
+        // UI-only action: handled by the bridge (no harness call), exactly like
+        // `UiDialog`. Written straight into the shared registry the TUI polls.
+        RuntimeActionId::SetStatus => ext_status.handle(args),
     }
 }
 
@@ -630,7 +653,8 @@ pub extern "C" fn trampoline_runtime_action(
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_action(
             action_id,
-            u32::from(RuntimeActionId::UiDialog),
+            // Highest id this ABI defines — bump when adding an action.
+            u32::from(RuntimeActionId::SetStatus),
             args_json,
             out,
             user_data,
@@ -643,39 +667,6 @@ pub extern "C" fn trampoline_runtime_action(
             // process: report a host-level error to the caller (documented
             // code `1`) with a structured payload when `out` is writable.
             tracing::error!("runtime_action trampoline panicked — reporting host error");
-            if !out.is_null() {
-                unsafe {
-                    *out = StbString::from_string(
-                        r#"{"error":"runtime_action panicked"}"#.to_string(),
-                    );
-                }
-            }
-            1
-        }
-    }
-}
-
-/// ABI v1 runtime-action trampoline. The legacy vtable has the same physical
-/// slot shape, but only the historical action ids `0..=15` are valid.
-pub extern "C" fn trampoline_runtime_action_v1(
-    action_id: u32,
-    args_json: StbStringRef,
-    out: *mut StbString,
-    user_data: *mut c_void,
-) -> i32 {
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_action(
-            action_id,
-            u32::from(RuntimeActionId::Reload),
-            args_json,
-            out,
-            user_data,
-        )
-    }));
-    match outcome {
-        Ok(rc) => rc,
-        Err(_) => {
-            tracing::error!("ABI v1 runtime_action trampoline panicked - reporting host error");
             if !out.is_null() {
                 unsafe {
                     *out = StbString::from_string(
@@ -768,8 +759,17 @@ fn run_action(
     // `dispatch` helper has everything it needs without borrowing `bridge`.
     let host = Arc::clone(&bridge.host);
     let ui_dialog = bridge.ui_dialog.clone();
+    let ext_status = bridge.ext_status.clone();
     let reload_cb = bridge.reload.clone();
-    if action == RuntimeActionId::UiDialog {
+    if action == RuntimeActionId::SetStatus {
+        // Same reasoning as `UiDialog`: this action never touches the harness,
+        // so it must not need a Tokio worker. A plugin calling it from inside a
+        // single-threaded runtime (a tool poll callback, say) would otherwise
+        // park that executor and deadlock.
+        std::thread::spawn(move || {
+            let _ = tx.send(ext_status.handle(args));
+        });
+    } else if action == RuntimeActionId::UiDialog {
         // UiDialog is intentionally synchronous at the plugin ABI boundary:
         // `open` waits until the TUI answers. Never park that wait inside the
         // Tokio worker that services the bridge. A SEARCH/extension tool that
@@ -788,7 +788,7 @@ fn run_action(
                     host.reload(args).await
                 }
             } else {
-                dispatch(&host, &ui_dialog, action, args).await
+                dispatch(&host, &ui_dialog, &ext_status, action, args).await
             };
             // If the plugin thread already moved on (dropped rx), discard — a
             // send error is NOT a host fault.
@@ -1112,55 +1112,16 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn legacy_trampoline_rejects_v2_action_without_dispatch() {
-        let host = Arc::new(MockHost {
-            prompt: String::new(),
-            saw: Mutex::new(Vec::new()),
-        });
-        let host_for_assert = Arc::clone(&host);
-        let host_dyn: Arc<dyn RuntimeActionHost> = host;
-        let bridge = ActionBridge::new(tokio::runtime::Handle::current(), host_dyn);
-        let user_data = Arc::as_ptr(&bridge) as *mut c_void;
-
-        let mut out = StbString::empty();
-        let rc = trampoline_runtime_action_v1(
-            RuntimeActionId::GetCliFlag.into(),
-            StbStringRef::from_str("{}"),
-            &mut out,
-            user_data,
-        );
-
-        assert_eq!(rc, 2);
-        let payload: serde_json::Value =
-            serde_json::from_str(&out.to_string_lossy()).expect("structured error JSON");
-        assert_eq!(payload["error"], "unknown runtime action id 16");
-        crate::host_free_string(out);
-        assert!(host_for_assert.saw.lock().unwrap().is_empty());
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn legacy_accepts_v1_action_and_v2_accepts_new_action() {
+    async fn v2_trampoline_accepts_new_action() {
         let host = Arc::new(MockHost {
-            prompt: "legacy".to_string(),
+            prompt: "v2".to_string(),
             saw: Mutex::new(Vec::new()),
         });
         let host_for_assert = Arc::clone(&host);
         let host_dyn: Arc<dyn RuntimeActionHost> = host;
         let bridge = ActionBridge::new(tokio::runtime::Handle::current(), host_dyn);
         let user_data = Arc::as_ptr(&bridge) as *mut c_void;
-
-        let mut legacy_out = StbString::empty();
-        assert_eq!(
-            trampoline_runtime_action_v1(
-                RuntimeActionId::GetSystemPrompt.into(),
-                StbStringRef::from_str("{}"),
-                &mut legacy_out,
-                user_data,
-            ),
-            0
-        );
-        crate::host_free_string(legacy_out);
 
         let mut v2_out = StbString::empty();
         assert_eq!(
@@ -1176,10 +1137,7 @@ mod tests {
 
         assert_eq!(
             *host_for_assert.saw.lock().unwrap(),
-            vec![
-                RuntimeActionId::GetSystemPrompt,
-                RuntimeActionId::GetCliFlag
-            ]
+            vec![RuntimeActionId::GetCliFlag]
         );
     }
 
@@ -1344,11 +1302,63 @@ mod tests {
         );
         crate::host_free_string(out);
 
-        // The next id remains unknown (no silent acceptance of arbitrary ids).
+        // A genuinely unknown id is still rejected (no silent acceptance).
+        let mut out = StbString::empty();
+        assert_eq!(
+            trampoline_runtime_action(19, StbStringRef::from_str("{}"), &mut out, user_data),
+            2
+        );
+        crate::host_free_string(out);
+    }
+
+    /// Action 18 (`SetStatus`) is bridge-local, like `UiDialog`: it writes the
+    /// shared registry the TUI polls and never touches the harness.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn v2_dispatch_routes_set_status_action_18() {
+        let host: Arc<dyn RuntimeActionHost> = Arc::new(MockHost {
+            prompt: String::new(),
+            saw: Mutex::new(Vec::new()),
+        });
+        let status = crate::status::ExtensionStatusMailbox::new();
+        let bridge = ActionBridge::with_reload_and_ui(
+            tokio::runtime::Handle::current(),
+            host,
+            Arc::new(|| Box::pin(async {})),
+            UiDialogMailbox::new(),
+            status.clone(),
+        );
+        let user_data = Arc::as_ptr(&bridge) as *mut c_void;
+
+        let mut out = StbString::empty();
+        let rc = trampoline_runtime_action(
+            18,
+            StbStringRef::from_str(r#"{"key":"langfuse","value":"langfuse ✓ (trace sent)"}"#),
+            &mut out,
+            user_data,
+        );
+        assert_eq!(rc, 0);
+        assert_eq!(status.text(), "langfuse ✓ (trace sent)");
+        crate::host_free_string(out);
+
+        // Clearing through the same action empties the line again.
+        let mut out = StbString::empty();
+        assert_eq!(
+            trampoline_runtime_action(
+                18,
+                StbStringRef::from_str(r#"{"key":"langfuse","value":""}"#),
+                &mut out,
+                user_data
+            ),
+            0
+        );
+        assert_eq!(status.text(), "");
+        crate::host_free_string(out);
+
+        // A missing key is a host-level error (rc=1), not an unknown action.
         let mut out = StbString::empty();
         assert_eq!(
             trampoline_runtime_action(18, StbStringRef::from_str("{}"), &mut out, user_data),
-            2
+            1
         );
         crate::host_free_string(out);
     }

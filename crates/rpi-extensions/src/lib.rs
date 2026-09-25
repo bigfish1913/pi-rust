@@ -61,16 +61,15 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
 use rpi_plugin_sdk::{
-    EventHandlerFn, EventTag, FreeStringFn, LegacyPluginApiV1, LegacyRuntimeActionFn, PluginApiVt,
-    PluginApiVt3Ext, ProviderRequestFn, RenderFn, ResourcesDiscoverFn, RuntimeActionFn,
-    StablePluginEvent, StableToolSchema, StbString, StbStringRef, ToolCancelFn, ToolDestroyFn,
-    ToolExecuteFn, ToolPollFn,
+    EventHandlerFn, EventTag, FreeStringFn, PluginApiVt, PluginApiVt3Ext, ProviderRequestFn,
+    RenderFn, ResourcesDiscoverFn, RuntimeActionFn, StablePluginEvent, StableToolSchema, StbString,
+    StbStringRef, ToolCancelFn, ToolDestroyFn, ToolExecuteFn, ToolPollFn,
 };
 use thiserror::Error;
 
 pub use actions::{
-    reload_callback_from_mailbox, trampoline_runtime_action, trampoline_runtime_action_v1,
-    ActionBridge, ReloadMailbox, RuntimeActionHost, UiDialogMailbox, UiDialogRequest,
+    reload_callback_from_mailbox, trampoline_runtime_action, ActionBridge, ReloadMailbox,
+    RuntimeActionHost, UiDialogMailbox, UiDialogRequest,
 };
 pub use loader::{
     load_dir, load_one, load_session, load_session_mixed, merge_registries, ExtensionSession,
@@ -86,6 +85,7 @@ pub use registry::{
     DEFAULT_PRIORITY,
 };
 pub use resources::{emit_resources_discover, DiscoveredResources};
+pub use status::ExtensionStatusMailbox;
 pub use tool::{PluginToolAdapter, PluginToolHandle};
 pub use translate::{
     dispatch_data_event, dispatch_empty_event, dispatch_lifecycle_event, ExtensionEmitter,
@@ -99,6 +99,7 @@ mod provider;
 mod provider_hooks;
 mod registry;
 mod resources;
+mod status;
 mod tool;
 mod translate;
 
@@ -291,29 +292,21 @@ impl HostApi {
         }
     }
 
-    /// P2: build the ABI v3 **extension block** passed alongside the frozen v2
-    /// [`PluginApiVt`] to `rpi_plugin_register_v3`. Today it exposes only
-    /// `declare` (priority / platforms); the reserved slots are null. A plugin
-    /// that never calls `declare` keeps the host defaults (priority 100, all
-    /// platforms).
-    pub fn build_vtable_v3_ext(self: &Arc<Self>) -> PluginApiVt3Ext {
-        PluginApiVt3Ext {
-            declare: Some(trampoline_declare),
-            _reserved: [std::ptr::null_mut(); 3],
-        }
-    }
-
-    /// Build the frozen ABI v1 view used only for a plugin exporting the legacy
-    /// `rpi_plugin_register` symbol. Its runtime-action slot rejects ids above
-    /// the v1 range before dispatch.
-    pub fn build_legacy_vtable(self: &Arc<Self>) -> LegacyPluginApiV1 {
+    /// Build the unified ABI struct passed to `rpi_plugin_register`.
+    ///
+    /// The unified ABI has no version suffix in the symbol name; the version
+    /// lives inside the struct (first field `abi_version`). This is the *only*
+    /// ABI going forward; old versioned symbols are kept temporarily for
+    /// migration but are deprecated.
+    ///
+    /// The struct includes `abi_version` and `struct_size` prefix fields for
+    /// robust version checking that survives future signature changes. The
+    /// `declare` slot (previously in `PluginApiVt3Ext`) is folded in.
+    pub fn build_vtable_unified(self: &Arc<Self>) -> rpi_plugin_sdk::PluginApi {
         let v2 = self.build_vtable();
-        let legacy_runtime_action = if self.action_bridge.is_some() {
-            trampoline_runtime_action_v1 as LegacyRuntimeActionFn
-        } else {
-            stub_runtime_action as LegacyRuntimeActionFn
-        };
-        LegacyPluginApiV1 {
+        rpi_plugin_sdk::PluginApi {
+            abi_version: rpi_plugin_sdk::RPI_PLUGIN_ABI_VERSION_UNIFIED,
+            struct_size: std::mem::size_of::<rpi_plugin_sdk::PluginApi>() as u32,
             free_string: v2.free_string,
             register_tool: v2.register_tool,
             register_command: v2.register_command,
@@ -325,9 +318,22 @@ impl HostApi {
             register_entry_renderer: v2.register_entry_renderer,
             register_event_handler: v2.register_event_handler,
             register_resources_discover: v2.register_resources_discover,
-            runtime_action: legacy_runtime_action,
+            runtime_action: v2.runtime_action,
             dispatch_event: v2.dispatch_event,
             user_data: v2.user_data,
+            declare: Some(trampoline_declare),
+        }
+    }
+
+    /// P2: build the ABI v3 **extension block** passed alongside the frozen v2
+    /// [`PluginApiVt`] to `rpi_plugin_register_v3`. Today it exposes only
+    /// `declare` (priority / platforms); the reserved slots are null. A plugin
+    /// that never calls `declare` keeps the host defaults (priority 100, all
+    /// platforms).
+    pub fn build_vtable_v3_ext(self: &Arc<Self>) -> PluginApiVt3Ext {
+        PluginApiVt3Ext {
+            declare: Some(trampoline_declare),
+            _reserved: [std::ptr::null_mut(); 3],
         }
     }
 }

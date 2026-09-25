@@ -10,7 +10,7 @@
 | 项目 | Rust 原生扩展 |
 | --- | --- |
 | 安装 | `rpi install crate-name`（crates.io 或 `--path`） |
-| 入口 | `rpi_plugin_register_v2` / `rpi_plugin_register_v3` C ABI 符号 |
+| 入口 | `rpi_plugin_register` (统一 ABI) C ABI 符号，临时兼容 `rpi_plugin_register_v2` / `rpi_plugin_register_v3` |
 | 开发反馈 | `rpi dev` watch + 热重载；`rpi dev-local` 隔离调试 |
 | 静态资源 | `resources_discover` 或随项目放入 `.rpi` |
 | 运行环境 | 本机动态库，当前用户权限 |
@@ -96,7 +96,7 @@ rpi_plugin_sdk::export_plugin_v3!(|api, ext| {
 
 每个注册槽位都是 `Option`。注册前检查 vtable slot 是否为 `Some`，缺失时返回
 清晰错误；不要依赖空指针或 panic 表达不支持。宿主对未知 runtime action ID
-返回结构化错误，不会进入分发。ABI v1 的 runtime action 仅允许 ID `0..=15`，
+返回结构化错误，不会进入分发。旧版 ABI v1 的 runtime action 仅允许 ID `0..=15`（已废弃），
 v2/v3 允许当前定义的 `0..=17`（含 `GetCliFlag`、`UiDialog`）。
 
 ## 4. 工具生命周期：execute → poll → cancel → destroy
@@ -284,7 +284,7 @@ Linux/macOS 使用冒号分隔。命令行和环境变量适合本机开发、CI
 
 - `cargo fmt --check`、`cargo clippy --all-targets`、`cargo test` 通过。
 - `crate-type` 包含 `cdylib`，使用 `export_plugin_v2!` / `export_plugin_v3!` 导出
-  `rpi_plugin_register_v2` / `rpi_plugin_register_v3`。
+  `rpi_plugin_register`（统一 ABI）。临时兼容 `rpi_plugin_register_v2` / `rpi_plugin_register_v3`。
 - 依赖已发布的 `rpi-plugin-sdk` 兼容版本，不链接宿主私有 crate。
 - `rpi dev --no-watch` 能编译、加载并注册预期工具。
 - `rpi install <crate> --force` 的干净安装路径通过。
