@@ -210,7 +210,10 @@ mod tests {
         };
 
         std::env::remove_var(MAX_TURNS_ENV);
-        assert!(!RunBudget::from_env().is_enabled(), "unset must be unbounded");
+        assert!(
+            !RunBudget::from_env().is_enabled(),
+            "unset must be unbounded"
+        );
 
         std::env::set_var(MAX_TURNS_ENV, "7");
         let budget = RunBudget::from_env();

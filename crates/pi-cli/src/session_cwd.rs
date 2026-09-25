@@ -100,7 +100,10 @@ mod tests {
 
     #[test]
     fn no_session_file_is_ok() {
-        assert!(get_missing_session_cwd_issue(None, Path::new("/whatever"), Path::new("/cwd")).is_none());
+        assert!(
+            get_missing_session_cwd_issue(None, Path::new("/whatever"), Path::new("/cwd"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -111,17 +114,28 @@ mod tests {
 
     #[test]
     fn empty_stored_cwd_is_ok() {
-        assert!(get_missing_session_cwd_issue(Some(Path::new("/s.jsonl")), Path::new(""), Path::new("/cwd")).is_none());
+        assert!(get_missing_session_cwd_issue(
+            Some(Path::new("/s.jsonl")),
+            Path::new(""),
+            Path::new("/cwd")
+        )
+        .is_none());
     }
 
     #[test]
     fn missing_dir_reports_issue() {
         let missing = PathBuf::from("/definitely/not/here/xyzzy-1234");
-        let issue = get_missing_session_cwd_issue(Some(Path::new("/s.jsonl")), &missing, Path::new("/cwd"))
-            .expect("issue");
+        let issue =
+            get_missing_session_cwd_issue(Some(Path::new("/s.jsonl")), &missing, Path::new("/cwd"))
+                .expect("issue");
         assert_eq!(issue.session_cwd, missing);
         assert!(format_missing_session_cwd_error(&issue).contains("does not exist"));
         assert!(format_missing_session_cwd_prompt(&issue).contains("continue in current cwd"));
-        assert!(assert_session_cwd_exists(Some(Path::new("/s.jsonl")), &missing, Path::new("/cwd")).is_err());
+        assert!(assert_session_cwd_exists(
+            Some(Path::new("/s.jsonl")),
+            &missing,
+            Path::new("/cwd")
+        )
+        .is_err());
     }
 }

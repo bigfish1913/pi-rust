@@ -34,8 +34,8 @@
 //! carries the async surface. This preserves the documented DAG
 //! (`lib.rs:10-16`: `rpi-extensions` does NOT depend on `rpi-harness`).
 
-use std::ffi::c_void;
 use std::collections::{HashMap, VecDeque};
+use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
@@ -95,7 +95,10 @@ impl UiDialogMailbox {
 
     /// Mark an interactive consumer as available. Re-attaching is idempotent.
     pub fn attach(&self) {
-        self.state.lock().expect("ui dialog mailbox poisoned").attached = true;
+        self.state
+            .lock()
+            .expect("ui dialog mailbox poisoned")
+            .attached = true;
     }
 
     /// Detach the consumer and cancel every outstanding request. This prevents
@@ -143,7 +146,10 @@ impl UiDialogMailbox {
     /// Supply an answer for a request. Repeating the same operation is
     /// idempotent; answering a cancelled/unknown request is an explicit error.
     pub fn respond(&self, request_id: &str, answer: serde_json::Value) -> Result<(), String> {
-        let mut state = self.state.lock().map_err(|_| "ui dialog mailbox poisoned".to_string())?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "ui dialog mailbox poisoned".to_string())?;
         let entry = state
             .active
             .get_mut(request_id)
@@ -160,7 +166,10 @@ impl UiDialogMailbox {
     /// Mark one request cancelled. The terminal state remains visible to the
     /// plugin's next `poll`, then is reclaimed by that poll.
     pub fn cancel(&self, request_id: &str) -> Result<(), String> {
-        let mut state = self.state.lock().map_err(|_| "ui dialog mailbox poisoned".to_string())?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "ui dialog mailbox poisoned".to_string())?;
         let entry = state
             .active
             .get_mut(request_id)
@@ -184,7 +193,10 @@ impl UiDialogMailbox {
     /// Poll a request and consume a terminal answer/cancellation. Pending
     /// polls are cheap and preserve the request for subsequent calls.
     pub fn poll(&self, request_id: &str) -> Result<serde_json::Value, String> {
-        let mut state = self.state.lock().map_err(|_| "ui dialog mailbox poisoned".to_string())?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "ui dialog mailbox poisoned".to_string())?;
         let terminal = match state.active.get(request_id) {
             Some(entry) if entry.cancelled => Some(serde_json::json!({
                 "status": "cancelled",
@@ -217,7 +229,10 @@ impl UiDialogMailbox {
     /// Supported operations are `open`, `poll`, `cancel`; `response` is also
     /// accepted as a convenience for hosts that proxy answers through JSON.
     pub fn handle(&self, args: serde_json::Value) -> Result<serde_json::Value, String> {
-        let op = args.get("op").and_then(serde_json::Value::as_str).unwrap_or("open");
+        let op = args
+            .get("op")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("open");
         let request_id = || {
             args.get("requestId")
                 .or_else(|| args.get("request_id"))
@@ -229,7 +244,10 @@ impl UiDialogMailbox {
         match op {
             "open" => {
                 let id = request_id()?;
-                let mut state = self.state.lock().map_err(|_| "ui dialog mailbox poisoned".to_string())?;
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| "ui dialog mailbox poisoned".to_string())?;
                 if !state.attached {
                     return Err("ask_user requires an interactive UI".to_string());
                 }
@@ -1234,7 +1252,9 @@ mod tests {
         assert_ne!(first, second);
 
         // Answer the SECOND request first; the first must stay pending.
-        mailbox.respond(&second, serde_json::json!("second")).unwrap();
+        mailbox
+            .respond(&second, serde_json::json!("second"))
+            .unwrap();
         assert_eq!(mailbox.poll(&first).unwrap()["status"], "pending");
         let second_answer = mailbox.poll(&second).unwrap();
         assert_eq!(second_answer["answer"], "second");

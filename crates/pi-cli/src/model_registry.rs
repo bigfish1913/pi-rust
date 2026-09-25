@@ -24,7 +24,10 @@ pub enum ModelRegistryEvent {
     /// Model catalog was refreshed
     CatalogRefreshed,
     /// Provider auth status changed
-    AuthStatusChanged { provider_id: String, authenticated: bool },
+    AuthStatusChanged {
+        provider_id: String,
+        authenticated: bool,
+    },
 }
 
 /// Provider authentication status
@@ -94,12 +97,15 @@ impl ModelRegistry {
             models,
         };
 
-        let mut providers = self.providers.write().map_err(|_| RegistryError::LockPoisoned)?;
+        let mut providers = self
+            .providers
+            .write()
+            .map_err(|_| RegistryError::LockPoisoned)?;
         providers.insert(id.clone(), info);
 
-        let _ = self.event_tx.send(ModelRegistryEvent::ProviderRegistered {
-            provider_id: id,
-        });
+        let _ = self
+            .event_tx
+            .send(ModelRegistryEvent::ProviderRegistered { provider_id: id });
 
         Ok(())
     }
@@ -111,7 +117,7 @@ impl ModelRegistry {
     ) -> Result<(), RegistryError> {
         let id = provider.id().to_string();
         let models = provider.models().to_vec();
-        
+
         let info = ProviderInfo {
             id: id.clone(),
             name: id.clone(), // Extension providers use id as name
@@ -120,29 +126,43 @@ impl ModelRegistry {
             models,
         };
 
-        let mut providers = self.providers.write().map_err(|_| RegistryError::LockPoisoned)?;
+        let mut providers = self
+            .providers
+            .write()
+            .map_err(|_| RegistryError::LockPoisoned)?;
         providers.insert(id.clone(), info);
 
-        let mut instances = self.provider_instances.write().map_err(|_| RegistryError::LockPoisoned)?;
+        let mut instances = self
+            .provider_instances
+            .write()
+            .map_err(|_| RegistryError::LockPoisoned)?;
         instances.insert(id.clone(), provider);
 
-        let _ = self.event_tx.send(ModelRegistryEvent::ProviderRegistered {
-            provider_id: id,
-        });
+        let _ = self
+            .event_tx
+            .send(ModelRegistryEvent::ProviderRegistered { provider_id: id });
 
         Ok(())
     }
 
     /// Unregister a provider
     pub fn unregister_provider(&self, provider_id: &str) -> Result<(), RegistryError> {
-        let mut providers = self.providers.write().map_err(|_| RegistryError::LockPoisoned)?;
-        let mut instances = self.provider_instances.write().map_err(|_| RegistryError::LockPoisoned)?;
-        
+        let mut providers = self
+            .providers
+            .write()
+            .map_err(|_| RegistryError::LockPoisoned)?;
+        let mut instances = self
+            .provider_instances
+            .write()
+            .map_err(|_| RegistryError::LockPoisoned)?;
+
         if providers.remove(provider_id).is_some() {
             instances.remove(provider_id);
-            let _ = self.event_tx.send(ModelRegistryEvent::ProviderUnregistered {
-                provider_id: provider_id.to_string(),
-            });
+            let _ = self
+                .event_tx
+                .send(ModelRegistryEvent::ProviderUnregistered {
+                    provider_id: provider_id.to_string(),
+                });
             Ok(())
         } else {
             Err(RegistryError::ProviderNotFound(provider_id.to_string()))
@@ -157,7 +177,11 @@ impl ModelRegistry {
 
     /// Get all providers
     pub fn list_providers(&self) -> Vec<ProviderInfo> {
-        let providers = self.providers.read().ok().map(|p| p.values().cloned().collect());
+        let providers = self
+            .providers
+            .read()
+            .ok()
+            .map(|p| p.values().cloned().collect());
         providers.unwrap_or_default()
     }
 
@@ -193,17 +217,20 @@ impl ModelRegistry {
         provider_id: &str,
         status: AuthStatus,
     ) -> Result<(), RegistryError> {
-        let mut providers = self.providers.write().map_err(|_| RegistryError::LockPoisoned)?;
-        
+        let mut providers = self
+            .providers
+            .write()
+            .map_err(|_| RegistryError::LockPoisoned)?;
+
         if let Some(info) = providers.get_mut(provider_id) {
             info.auth_status = status.clone();
-            
+
             let authenticated = matches!(status, AuthStatus::Authenticated);
             let _ = self.event_tx.send(ModelRegistryEvent::AuthStatusChanged {
                 provider_id: provider_id.to_string(),
                 authenticated,
             });
-            
+
             Ok(())
         } else {
             Err(RegistryError::ProviderNotFound(provider_id.to_string()))
@@ -213,7 +240,9 @@ impl ModelRegistry {
     /// Get provider authentication status
     pub fn get_auth_status(&self, provider_id: &str) -> Option<AuthStatus> {
         let providers = self.providers.read().ok()?;
-        providers.get(provider_id).map(|info| info.auth_status.clone())
+        providers
+            .get(provider_id)
+            .map(|info| info.auth_status.clone())
     }
 
     /// Refresh model catalog from models.json
@@ -221,10 +250,13 @@ impl ModelRegistry {
         // Read models.json from config directory
         let config = crate::config::load_models_config()
             .map_err(|e| RegistryError::InvalidConfiguration(e.to_string()))?;
-        
+
         // Parse and validate models
-        let mut providers = self.providers.write().map_err(|_| RegistryError::LockPoisoned)?;
-        
+        let mut providers = self
+            .providers
+            .write()
+            .map_err(|_| RegistryError::LockPoisoned)?;
+
         // Update existing providers and register providers that appear only in
         // models.json (native `models.json` custom providers). Previously only
         // pre-registered providers were updated, so a user-defined provider was
@@ -237,8 +269,8 @@ impl ModelRegistry {
                 }
             }
             // New provider: register it from models.json.
-            let models = crate::config::provider_to_models(provider_id, provider_config)
-                .unwrap_or_default();
+            let models =
+                crate::config::provider_to_models(provider_id, provider_config).unwrap_or_default();
             providers.insert(
                 provider_id.clone(),
                 ProviderInfo {
@@ -253,13 +285,16 @@ impl ModelRegistry {
                 },
             );
         }
-        
+
         drop(providers);
-        
+
         // Update last refresh time
-        let mut last_refresh = self.last_refresh.write().map_err(|_| RegistryError::LockPoisoned)?;
+        let mut last_refresh = self
+            .last_refresh
+            .write()
+            .map_err(|_| RegistryError::LockPoisoned)?;
         *last_refresh = Some(std::time::Instant::now());
-        
+
         // Broadcast CatalogRefreshed event
         let _ = self.event_tx.send(ModelRegistryEvent::CatalogRefreshed);
 
@@ -317,13 +352,13 @@ impl Default for ModelRegistry {
 pub enum RegistryError {
     #[error("Lock poisoned")]
     LockPoisoned,
-    
+
     #[error("Provider not found: {0}")]
     ProviderNotFound(String),
-    
+
     #[error("Provider already registered: {0}")]
     ProviderAlreadyRegistered(String),
-    
+
     #[error("Invalid provider configuration: {0}")]
     InvalidConfiguration(String),
 }
@@ -342,12 +377,10 @@ mod tests {
     #[test]
     fn test_provider_registration() {
         let registry = ModelRegistry::new();
-        
-        assert!(registry.register_builtin_provider(
-            "test".to_string(),
-            "Test Provider".to_string(),
-            vec![]
-        ).is_ok());
+
+        assert!(registry
+            .register_builtin_provider("test".to_string(), "Test Provider".to_string(), vec![])
+            .is_ok());
         assert_eq!(registry.provider_count(), 1);
         assert!(registry.has_provider("test"));
     }
@@ -355,12 +388,10 @@ mod tests {
     #[test]
     fn test_provider_unregistration() {
         let registry = ModelRegistry::new();
-        
-        registry.register_builtin_provider(
-            "test".to_string(),
-            "Test Provider".to_string(),
-            vec![]
-        ).unwrap();
+
+        registry
+            .register_builtin_provider("test".to_string(), "Test Provider".to_string(), vec![])
+            .unwrap();
         assert!(registry.unregister_provider("test").is_ok());
         assert_eq!(registry.provider_count(), 0);
     }
@@ -368,14 +399,14 @@ mod tests {
     #[test]
     fn test_auth_status_update() {
         let registry = ModelRegistry::new();
-        
-        registry.register_builtin_provider(
-            "test".to_string(),
-            "Test Provider".to_string(),
-            vec![]
-        ).unwrap();
-        
-        assert!(registry.update_auth_status("test", AuthStatus::Authenticated).is_ok());
+
+        registry
+            .register_builtin_provider("test".to_string(), "Test Provider".to_string(), vec![])
+            .unwrap();
+
+        assert!(registry
+            .update_auth_status("test", AuthStatus::Authenticated)
+            .is_ok());
         assert_eq!(
             registry.get_auth_status("test"),
             Some(AuthStatus::Authenticated)

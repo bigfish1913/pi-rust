@@ -417,7 +417,13 @@ pub async fn dispatch_lifecycle_event(
                     plugin = %plugin_name,
                     "extension handler vetoed lifecycle event"
                 );
-                crate::event_log::log_handler_invocation(tag, &plugin_name, "Abort", duration_ms, None);
+                crate::event_log::log_handler_invocation(
+                    tag,
+                    &plugin_name,
+                    "Abort",
+                    duration_ms,
+                    None,
+                );
                 return Some(format!("extension `{plugin_name}` vetoed {tag:?}"));
             }
             Ok(Ok(Ok(rc))) => {
@@ -427,12 +433,22 @@ pub async fn dispatch_lifecycle_event(
                     &plugin_name,
                     result,
                     duration_ms,
-                    if rc == 0 { None } else { Some(format!("rc={rc}")) },
+                    if rc == 0 {
+                        None
+                    } else {
+                        Some(format!("rc={rc}"))
+                    },
                 );
             }
             Ok(Ok(Err(_))) => {
                 tracing::error!(tag = ?tag, "extension handler panicked — skipped");
-                crate::event_log::log_handler_invocation(tag, &plugin_name, "Panic", duration_ms, None);
+                crate::event_log::log_handler_invocation(
+                    tag,
+                    &plugin_name,
+                    "Panic",
+                    duration_ms,
+                    None,
+                );
             }
             Ok(Err(join_err)) => {
                 tracing::error!(
@@ -1019,7 +1035,9 @@ mod tests {
         HANDLER_HITS.store(0, Ordering::SeqCst);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.jsonl");
-        crate::event_log::set_event_logger_for_test(crate::event_log::EventLogger::open(path.clone()));
+        crate::event_log::set_event_logger_for_test(crate::event_log::EventLogger::open(
+            path.clone(),
+        ));
 
         let mut reg = crate::registry::ExtensionRegistry::new();
         reg.register_event_handler(
@@ -1029,8 +1047,10 @@ mod tests {
             std::ptr::null_mut(),
         );
         let snap = Arc::new(reg.snapshot());
-        let event =
-            StablePluginEvent::message(EventTag::MessageEnd, StbString::from_string("m".to_string()));
+        let event = StablePluginEvent::message(
+            EventTag::MessageEnd,
+            StbString::from_string("m".to_string()),
+        );
         dispatch_to_handlers(&snap, &event);
 
         // Restore the disabled default so later tests don't write into the

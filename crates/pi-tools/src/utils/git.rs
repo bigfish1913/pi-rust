@@ -207,7 +207,10 @@ impl GitUrl {
         url.push_str(&self.repo);
 
         if let Some(port) = self.port {
-            url = format!("https://{}:{}/{}/{}", self.host, port, self.owner, self.repo);
+            url = format!(
+                "https://{}:{}/{}/{}",
+                self.host, port, self.owner, self.repo
+            );
         }
 
         if let Some(ref reference) = self.reference {

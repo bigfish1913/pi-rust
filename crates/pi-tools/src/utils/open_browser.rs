@@ -57,7 +57,11 @@ pub fn open_browser(url: &str) -> Result<(), String> {
         ("open", vec![url])
     } else if cfg!(target_os = "windows") {
         ("rundll32", vec!["url.dll,FileProtocolHandler", url])
-    } else if cfg!(target_os = "linux") || cfg!(target_os = "freebsd") || cfg!(target_os = "openbsd") || cfg!(target_os = "netbsd") {
+    } else if cfg!(target_os = "linux")
+        || cfg!(target_os = "freebsd")
+        || cfg!(target_os = "openbsd")
+        || cfg!(target_os = "netbsd")
+    {
         ("xdg-open", vec![url])
     } else {
         return Err(format!("Unsupported platform for opening browser"));
@@ -98,7 +102,11 @@ pub fn open_file(path: &str) -> Result<(), String> {
         // On Windows, we can use `start` but need to be careful about shells.
         // Using rundll32 with FileProtocolHandler works for files too.
         ("rundll32", vec!["url.dll,FileProtocolHandler", path])
-    } else if cfg!(target_os = "linux") || cfg!(target_os = "freebsd") || cfg!(target_os = "openbsd") || cfg!(target_os = "netbsd") {
+    } else if cfg!(target_os = "linux")
+        || cfg!(target_os = "freebsd")
+        || cfg!(target_os = "openbsd")
+        || cfg!(target_os = "netbsd")
+    {
         ("xdg-open", vec![path])
     } else {
         return Err(format!("Unsupported platform for opening file"));

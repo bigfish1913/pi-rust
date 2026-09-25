@@ -160,7 +160,12 @@ fn parse_flow_edge(line: &str) -> Option<(&str, &'static str, Option<String>, &s
     // Standard Mermaid syntax: `A -->|approved| B`.
     if let Some(rest) = raw_right.strip_prefix('|') {
         let (label, right) = rest.split_once('|')?;
-        return Some((left, arrow, Some(label.trim().trim_matches('"').to_string()), right));
+        return Some((
+            left,
+            arrow,
+            Some(label.trim().trim_matches('"').to_string()),
+            right,
+        ));
     }
     // Retain compatibility with the original compact renderer's `B: label`
     // notation as it is useful in hand-authored terminal diagrams.
@@ -273,9 +278,11 @@ mod tests {
     #[test]
     fn long_flowchart_edges_wrap_instead_of_eliding() {
         let output = strip_ansi(
-            &Mermaid::new("flowchart LR\nA[Very long source node] --> B[Very long destination node]")
-                .render(20)
-                .join("\n"),
+            &Mermaid::new(
+                "flowchart LR\nA[Very long source node] --> B[Very long destination node]",
+            )
+            .render(20)
+            .join("\n"),
         );
         let compact: String = output.chars().filter(|ch| !ch.is_whitespace()).collect();
         assert!(compact.contains("Verylongsourcenode"), "{output}");

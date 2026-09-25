@@ -938,7 +938,10 @@ async fn no_turn_ceiling_by_default_matches_native_pi() {
         .prompt_text("run without a ceiling", vec![])
         .await
         .expect("the run must complete");
-    assert!(matches!(result.outcome, HarnessRunOutcome::Completed { .. }));
+    assert!(matches!(
+        result.outcome,
+        HarnessRunOutcome::Completed { .. }
+    ));
 
     let calls = provider
         .state()

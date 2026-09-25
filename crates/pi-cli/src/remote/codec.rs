@@ -117,7 +117,8 @@ mod tests {
     fn round_trip_message() {
         let message = json!({ "type": "hello", "version": 1, "tools": ["read", "write"] });
         let frame = encode_message(&message).unwrap();
-        let decoded = decode_message(&frame, &CborOptions::default(), DEFAULT_MAX_FRAME_LENGTH).unwrap();
+        let decoded =
+            decode_message(&frame, &CborOptions::default(), DEFAULT_MAX_FRAME_LENGTH).unwrap();
         assert_eq!(decoded, message);
     }
 

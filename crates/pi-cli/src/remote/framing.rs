@@ -30,7 +30,9 @@ impl std::error::Error for FrameError {}
 /// Prefix `payload` with its 4-byte big-endian length.
 pub fn encode_frame(payload: &[u8]) -> Result<Vec<u8>, FrameError> {
     if payload.len() > u32::MAX as usize {
-        return Err(FrameError("Frame payload exceeds the unsigned 32-bit length limit".into()));
+        return Err(FrameError(
+            "Frame payload exceeds the unsigned 32-bit length limit".into(),
+        ));
     }
     let mut frame = Vec::with_capacity(FRAME_HEADER_LENGTH + payload.len());
     frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
@@ -41,7 +43,9 @@ pub fn encode_frame(payload: &[u8]) -> Result<Vec<u8>, FrameError> {
 /// Validate that `frame` contains exactly one complete frame within `max`.
 pub fn assert_complete_frame(frame: &[u8], max_frame_length: usize) -> Result<(), FrameError> {
     if frame.len() < FRAME_HEADER_LENGTH {
-        return Err(FrameError("Frame does not contain a complete length prefix".into()));
+        return Err(FrameError(
+            "Frame does not contain a complete length prefix".into(),
+        ));
     }
     let length = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
     if length > max_frame_length {
@@ -50,7 +54,9 @@ pub fn assert_complete_frame(frame: &[u8], max_frame_length: usize) -> Result<()
         )));
     }
     if frame.len() != FRAME_HEADER_LENGTH + length {
-        return Err(FrameError("Frame must contain exactly one complete payload".into()));
+        return Err(FrameError(
+            "Frame must contain exactly one complete payload".into(),
+        ));
     }
     Ok(())
 }
@@ -108,8 +114,7 @@ impl FrameDecoder {
                 if self.header_len < FRAME_HEADER_LENGTH {
                     continue;
                 }
-                let frame_length =
-                    u32::from_be_bytes(self.header) as usize;
+                let frame_length = u32::from_be_bytes(self.header) as usize;
                 self.header_len = 0;
                 if frame_length > self.max_frame_length {
                     self.state = State::Failed;
@@ -129,7 +134,8 @@ impl FrameDecoder {
             let expected = self.expected_payload_len.unwrap();
             let want = expected - self.payload.len();
             let take = want.min(chunk.len() - offset);
-            self.payload.extend_from_slice(&chunk[offset..offset + take]);
+            self.payload
+                .extend_from_slice(&chunk[offset..offset + take]);
             offset += take;
 
             if self.payload.len() == expected {

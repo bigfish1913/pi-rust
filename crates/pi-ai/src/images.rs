@@ -150,8 +150,11 @@ type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 #[derive(Clone)]
 pub struct ImagesApiProvider {
     pub api: ImagesApi,
-    pub generate:
-        Arc<dyn Fn(ImagesModel, ImagesContext, ImagesOptions) -> BoxFuture<AssistantImages> + Send + Sync>,
+    pub generate: Arc<
+        dyn Fn(ImagesModel, ImagesContext, ImagesOptions) -> BoxFuture<AssistantImages>
+            + Send
+            + Sync,
+    >,
 }
 
 fn registry() -> &'static RwLock<HashMap<String, ImagesApiProvider>> {
@@ -201,10 +204,7 @@ pub async fn generate_images(
             response_id: None,
             usage: None,
             stop_reason: ImagesStopReason::Error,
-            error_message: Some(format!(
-                "No API provider registered for api: {}",
-                model.api
-            )),
+            error_message: Some(format!("No API provider registered for api: {}", model.api)),
             timestamp: now_ms(),
         },
     }
@@ -300,20 +300,26 @@ async fn openrouter_generate_images(
 
     if let Some(choice) = body.get("choices").and_then(|c| c.get(0)) {
         let message = choice.get("message");
-        if let Some(content) = message.and_then(|m| m.get("content")).and_then(|c| c.as_str()) {
+        if let Some(content) = message
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+        {
             if !content.is_empty() {
                 out.output.push(ImagesOutputContent::Text {
                     text: content.to_string(),
                 });
             }
         }
-        if let Some(images) = message.and_then(|m| m.get("images")).and_then(|i| i.as_array()) {
+        if let Some(images) = message
+            .and_then(|m| m.get("images"))
+            .and_then(|i| i.as_array())
+        {
             for image in images {
-                let url = image
-                    .get("image_url")
-                    .and_then(|u| u.as_str().map(str::to_string).or_else(|| {
-                        u.get("url").and_then(|v| v.as_str()).map(str::to_string)
-                    }));
+                let url = image.get("image_url").and_then(|u| {
+                    u.as_str()
+                        .map(str::to_string)
+                        .or_else(|| u.get("url").and_then(|v| v.as_str()).map(str::to_string))
+                });
                 if let Some(data_url) = url {
                     if let Some((mime, data)) = parse_data_url(&data_url) {
                         out.output.push(ImagesOutputContent::Image {
@@ -370,8 +376,14 @@ fn parse_data_url(url: &str) -> Option<(String, String)> {
 }
 
 fn parse_openrouter_usage(raw: &serde_json::Value, model: &ImagesModel) -> Usage {
-    let prompt = raw.get("prompt_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-    let completion = raw.get("completion_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+    let prompt = raw
+        .get("prompt_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let completion = raw
+        .get("completion_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
     let details = raw.get("prompt_tokens_details");
     let cached = details
         .and_then(|d| d.get("cached_tokens"))
@@ -433,8 +445,14 @@ mod tests {
 
     #[test]
     fn api_ids_round_trip() {
-        assert_eq!(ImagesApi::from_id("openrouter-images"), ImagesApi::OpenrouterImages);
-        assert_eq!(ImagesApi::from_id("openrouter-images").as_str(), "openrouter-images");
+        assert_eq!(
+            ImagesApi::from_id("openrouter-images"),
+            ImagesApi::OpenrouterImages
+        );
+        assert_eq!(
+            ImagesApi::from_id("openrouter-images").as_str(),
+            "openrouter-images"
+        );
         assert_eq!(ImagesApi::from_id("custom").as_str(), "custom");
     }
 
@@ -475,13 +493,18 @@ mod tests {
 
     #[test]
     fn unknown_api_reports_error() {
-        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
         let result = rt.block_on(async {
             let mut model = ImagesModel::openrouter("m");
             model.api = ImagesApi::Other("nope".into());
             generate_images(model, ImagesContext::text("x"), ImagesOptions::default()).await
         });
         assert_eq!(result.stop_reason, ImagesStopReason::Error);
-        assert!(result.error_message.unwrap().contains("No API provider registered"));
+        assert!(result
+            .error_message
+            .unwrap()
+            .contains("No API provider registered"));
     }
 }

@@ -4,8 +4,8 @@
 
 use std::path::Path;
 
-use rpi_harness::session::types::{Entry, EntryOrder, EntryQuery};
 use rpi_harness::agent_harness::AgentHarness;
+use rpi_harness::session::types::{Entry, EntryOrder, EntryQuery};
 
 /// Export format options.
 #[derive(Debug, Clone, PartialEq)]
@@ -135,12 +135,12 @@ fn export_markdown(entries: &[Entry], output_path: &Path) -> Result<(), String> 
             }
         }
     }
-    std::fs::write(output_path, md)
-        .map_err(|e| format!("Could not write markdown export: {e}"))
+    std::fs::write(output_path, md).map_err(|e| format!("Could not write markdown export: {e}"))
 }
 
 fn export_html(entries: &[Entry], output_path: &Path) -> Result<(), String> {
-    let mut html = String::from(r#"<!DOCTYPE html>
+    let mut html = String::from(
+        r#"<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -158,7 +158,8 @@ fn export_html(entries: &[Entry], output_path: &Path) -> Result<(), String> {
 </head>
 <body>
     <h1>Session Export</h1>
-"#);
+"#,
+    );
 
     for e in entries {
         if let Entry::Message(me) = e {
@@ -192,8 +193,7 @@ fn export_html(entries: &[Entry], output_path: &Path) -> Result<(), String> {
 
     html.push_str("\n</body>\n</html>");
 
-    std::fs::write(output_path, html)
-        .map_err(|e| format!("Could not write HTML export: {e}"))
+    std::fs::write(output_path, html).map_err(|e| format!("Could not write HTML export: {e}"))
 }
 
 fn export_jsonl(entries: &[Entry], output_path: &Path) -> Result<(), String> {
@@ -204,8 +204,7 @@ fn export_jsonl(entries: &[Entry], output_path: &Path) -> Result<(), String> {
         jsonl.push_str(&json);
         jsonl.push('\n');
     }
-    std::fs::write(output_path, jsonl)
-        .map_err(|e| format!("Could not write JSONL export: {e}"))
+    std::fs::write(output_path, jsonl).map_err(|e| format!("Could not write JSONL export: {e}"))
 }
 
 fn user_message_text(user: &rpi_ai::types::UserMessage) -> String {
@@ -224,11 +223,14 @@ fn user_message_text(user: &rpi_ai::types::UserMessage) -> String {
 }
 
 fn assistant_text(assistant: &rpi_ai::types::AssistantMessage) -> String {
-    assistant.content
+    assistant
+        .content
         .iter()
         .filter_map(|c| match c {
             rpi_ai::types::Content::Text(t) => Some(t.text.clone()),
-            rpi_ai::types::Content::Thinking(t) => Some(format!("<thinking>{}</thinking>", t.thinking)),
+            rpi_ai::types::Content::Thinking(t) => {
+                Some(format!("<thinking>{}</thinking>", t.thinking))
+            }
             rpi_ai::types::Content::ToolCall(tc) => Some(format!("[Tool Call: {}]", tc.name)),
             rpi_ai::types::Content::Image(_) => Some("[Image]".to_string()),
         })

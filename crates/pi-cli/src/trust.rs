@@ -78,8 +78,8 @@ impl TrustStore {
         let content = std::fs::read_to_string(&self.store_path)
             .map_err(|e| TrustError::IoError(e.to_string()))?;
 
-        let decisions: HashMap<String, ProjectTrust> = serde_json::from_str(&content)
-            .map_err(|e| TrustError::ParseError(e.to_string()))?;
+        let decisions: HashMap<String, ProjectTrust> =
+            serde_json::from_str(&content).map_err(|e| TrustError::ParseError(e.to_string()))?;
 
         let mut store = self.decisions.write().map_err(|_| TrustError::LockError)?;
         *store = decisions;
@@ -95,8 +95,7 @@ impl TrustStore {
 
         // Create parent directories if they don't exist
         if let Some(parent) = self.store_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| TrustError::IoError(e.to_string()))?;
+            std::fs::create_dir_all(parent).map_err(|e| TrustError::IoError(e.to_string()))?;
         }
 
         std::fs::write(&self.store_path, content)
@@ -109,7 +108,7 @@ impl TrustStore {
     pub fn get_decision(&self, project_path: &Path) -> TrustDecision {
         let normalized = normalize_path(project_path);
         let decisions = self.decisions.read().unwrap_or_else(|e| e.into_inner());
-        
+
         decisions
             .get(&normalized)
             .map(|t| t.decision)
@@ -256,7 +255,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let store_path = temp_dir.path().join("trust.json");
         let store = TrustStore::new(store_path);
-        
+
         assert_eq!(store.all_decisions().len(), 0);
     }
 
@@ -265,19 +264,27 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let store_path = temp_dir.path().join("trust.json");
         let store = TrustStore::new(store_path);
-        
+
         let project_path = Path::new("/test/project");
-        
+
         // Initially undecided
         assert_eq!(store.get_decision(project_path), TrustDecision::Undecided);
-        
+
         // Set to trusted
-        store.set_decision(project_path, TrustDecision::Trusted, Some("test".to_string())).unwrap();
+        store
+            .set_decision(
+                project_path,
+                TrustDecision::Trusted,
+                Some("test".to_string()),
+            )
+            .unwrap();
         assert_eq!(store.get_decision(project_path), TrustDecision::Trusted);
         assert!(store.is_trusted(project_path));
-        
+
         // Set to not trusted
-        store.set_decision(project_path, TrustDecision::NotTrusted, None).unwrap();
+        store
+            .set_decision(project_path, TrustDecision::NotTrusted, None)
+            .unwrap();
         assert_eq!(store.get_decision(project_path), TrustDecision::NotTrusted);
         assert!(!store.is_trusted(project_path));
     }
@@ -286,20 +293,24 @@ mod tests {
     fn test_trust_store_save_and_load() {
         let temp_dir = TempDir::new().unwrap();
         let store_path = temp_dir.path().join("trust.json");
-        
+
         // Create and populate store
         let store1 = TrustStore::new(store_path.clone());
         let project1 = Path::new("/test/project1");
         let project2 = Path::new("/test/project2");
-        
-        store1.set_decision(project1, TrustDecision::Trusted, Some("user".to_string())).unwrap();
-        store1.set_decision(project2, TrustDecision::NotTrusted, None).unwrap();
+
+        store1
+            .set_decision(project1, TrustDecision::Trusted, Some("user".to_string()))
+            .unwrap();
+        store1
+            .set_decision(project2, TrustDecision::NotTrusted, None)
+            .unwrap();
         store1.save().unwrap();
-        
+
         // Load into new store
         let store2 = TrustStore::new(store_path);
         store2.load().unwrap();
-        
+
         assert_eq!(store2.get_decision(project1), TrustDecision::Trusted);
         assert_eq!(store2.get_decision(project2), TrustDecision::NotTrusted);
     }
@@ -308,7 +319,7 @@ mod tests {
     fn test_normalize_path() {
         let path1 = Path::new("/test/project");
         let path2 = Path::new("/test/project/");
-        
+
         assert_eq!(normalize_path(path1), normalize_path(path2));
     }
 
@@ -318,7 +329,7 @@ mod tests {
         let store_path = temp_dir.path().join("trust.json");
         let store = TrustStore::new(store_path);
         let project_path = Path::new("/test/project");
-        
+
         // CLI flag overrides everything
         assert!(should_trust_project(project_path, &store, Some(true)));
         assert!(!should_trust_project(project_path, &store, Some(false)));
@@ -330,12 +341,16 @@ mod tests {
         let store_path = temp_dir.path().join("trust.json");
         let store = TrustStore::new(store_path);
         let project_path = Path::new("/test/project");
-        
+
         // Store decision overrides default
-        store.set_decision(project_path, TrustDecision::Trusted, None).unwrap();
+        store
+            .set_decision(project_path, TrustDecision::Trusted, None)
+            .unwrap();
         assert!(should_trust_project(project_path, &store, None));
-        
-        store.set_decision(project_path, TrustDecision::NotTrusted, None).unwrap();
+
+        store
+            .set_decision(project_path, TrustDecision::NotTrusted, None)
+            .unwrap();
         assert!(!should_trust_project(project_path, &store, None));
     }
 }

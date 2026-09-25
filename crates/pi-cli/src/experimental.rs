@@ -20,7 +20,9 @@ mod tests {
 
     #[test]
     fn gate_matches_env() {
-        let expected = std::env::var("PI_EXPERIMENTAL").map(|v| v == "1").unwrap_or(false);
+        let expected = std::env::var("PI_EXPERIMENTAL")
+            .map(|v| v == "1")
+            .unwrap_or(false);
         assert_eq!(enabled(), expected);
     }
 }

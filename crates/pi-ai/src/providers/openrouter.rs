@@ -12,7 +12,10 @@ use crate::event_stream::AssistantMessageEventStream;
 use crate::model::Model;
 use crate::provider::{Provider, SimpleStreamOptions};
 use crate::providers::anthropic::sse::SseEventStream;
-use crate::types::{AssistantMessage, AssistantMessageEvent, AssistantRole, Content, Context, DoneReason, TextContent, TextContentType, Usage};
+use crate::types::{
+    AssistantMessage, AssistantMessageEvent, AssistantRole, Content, Context, DoneReason,
+    TextContent, TextContentType, Usage,
+};
 
 /// OpenRouter API endpoint
 const OPENROUTER_API_BASE: &str = "https://openrouter.ai/api/v1";
@@ -35,9 +38,7 @@ impl OpenRouterProvider {
 
     /// Build request headers
     fn build_headers(&self, opts: &SimpleStreamOptions) -> Vec<(String, String)> {
-        let mut headers = vec![
-            ("Content-Type".to_string(), "application/json".to_string()),
-        ];
+        let mut headers = vec![("Content-Type".to_string(), "application/json".to_string())];
 
         // API key from opts or stored
         let api_key = opts.api_key.as_ref().or(self.api_key.as_ref());
@@ -46,8 +47,11 @@ impl OpenRouterProvider {
         }
 
         // HTTP-Referer header (required by OpenRouter)
-        headers.push(("HTTP-Referer".to_string(), "https://github.com/anthropics/pi-rust".to_string()));
-        
+        headers.push((
+            "HTTP-Referer".to_string(),
+            "https://github.com/anthropics/pi-rust".to_string(),
+        ));
+
         // X-Title header
         headers.push(("X-Title".to_string(), "Pi Rust".to_string()));
 
@@ -102,9 +106,9 @@ impl Provider for OpenRouterProvider {
     ) -> AssistantMessageEventStream {
         use crate::event_stream::create_assistant_message_event_stream;
         use crate::types::{ErrorReason, StopReason};
-        
+
         let (mut producer, stream) = create_assistant_message_event_stream();
-        
+
         let url = format!("{}/chat/completions", OPENROUTER_API_BASE);
         let headers = self.build_headers(opts);
         let body = self.build_request_body(model, ctx, opts);
@@ -113,7 +117,7 @@ impl Provider for OpenRouterProvider {
         let model_id = model.id.clone();
         let api = model.api.clone();
         let opts = opts.clone();
-        
+
         tokio::spawn(async move {
             let mut request = client.post(&url).json(&body);
 
@@ -122,14 +126,17 @@ impl Provider for OpenRouterProvider {
             }
 
             let result = request.send().await;
-            
+
             match result {
                 Ok(response) => {
                     if !response.status().is_success() {
                         let status = response.status();
-                        let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+                        let error_text = response
+                            .text()
+                            .await
+                            .unwrap_or_else(|_| "Unknown error".to_string());
                         let error_msg = format!("HTTP {}: {}", status.as_u16(), error_text);
-                        
+
                         let error_message = AssistantMessage::terminal(
                             api,
                             "openrouter".to_string(),
@@ -138,7 +145,7 @@ impl Provider for OpenRouterProvider {
                             error_msg,
                             0,
                         );
-                        
+
                         producer.push(AssistantMessageEvent::Error {
                             reason: ErrorReason::Error,
                             error: error_message,
@@ -150,22 +157,30 @@ impl Provider for OpenRouterProvider {
                     let mut events = SseEventStream::new(response, opts.signal.clone());
                     let mut content = String::new();
                     let mut finish_reason = None;
-                    
+
                     loop {
                         match events.next_event().await {
                             Ok(Some(event)) if event.data.trim() == "[DONE]" => {
                                 break;
                             }
                             Ok(Some(event)) => {
-                                if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(&event.data) {
-                                    if let Some(choices) = chunk.get("choices").and_then(|c| c.as_array()) {
+                                if let Ok(chunk) =
+                                    serde_json::from_str::<serde_json::Value>(&event.data)
+                                {
+                                    if let Some(choices) =
+                                        chunk.get("choices").and_then(|c| c.as_array())
+                                    {
                                         if let Some(choice) = choices.first() {
                                             if let Some(delta) = choice.get("delta") {
-                                                if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
+                                                if let Some(text) =
+                                                    delta.get("content").and_then(|c| c.as_str())
+                                                {
                                                     content.push_str(text);
                                                 }
                                             }
-                                            if let Some(reason) = choice.get("finish_reason").and_then(|r| r.as_str()) {
+                                            if let Some(reason) =
+                                                choice.get("finish_reason").and_then(|r| r.as_str())
+                                            {
                                                 finish_reason = Some(reason.to_string());
                                             }
                                         }
@@ -190,14 +205,14 @@ impl Provider for OpenRouterProvider {
                             }
                         }
                     }
-                    
+
                     let stop_reason = match finish_reason.as_deref() {
                         Some("stop") => StopReason::Stop,
                         Some("length") => StopReason::Length,
                         Some("tool_calls") => StopReason::ToolUse,
                         _ => StopReason::Stop,
                     };
-                    
+
                     let message = AssistantMessage {
                         role: AssistantRole,
                         content: vec![Content::Text(TextContent {
@@ -218,14 +233,14 @@ impl Provider for OpenRouterProvider {
                         end_turn: None,
                         timestamp: 0,
                     };
-                    
+
                     let done_reason = match stop_reason {
                         StopReason::Stop => DoneReason::Stop,
                         StopReason::Length => DoneReason::Length,
                         StopReason::ToolUse => DoneReason::ToolUse,
                         _ => DoneReason::Stop,
                     };
-                    
+
                     producer.push(AssistantMessageEvent::Done {
                         reason: done_reason,
                         message,
@@ -240,7 +255,7 @@ impl Provider for OpenRouterProvider {
                         format!("Request failed: {}", e),
                         0,
                     );
-                    
+
                     producer.push(AssistantMessageEvent::Error {
                         reason: ErrorReason::Error,
                         error: error_message,

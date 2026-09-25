@@ -44,10 +44,13 @@ cargo check --workspace --all-targets --locked
 cargo test  --workspace --locked
 ```
 
-Formatting: run `cargo fmt` on the files you touch, but do **not** run
-`cargo fmt --all` in a feature PR. The workspace has pre-existing rustfmt drift
-that has not been swept yet (#15), and a repo-wide reformat would bury the actual
-change. CI does not enforce `cargo fmt --check` until that sweep lands.
+Formatting: run `cargo fmt --all -- --check` before opening a PR. CI runs the
+same check. The repo-wide formatting sweep is listed in
+`.git-blame-ignore-revs`; to hide it in local blame, run:
+
+```bash
+git config blame.ignoreRevsFile .git-blame-ignore-revs
+```
 
 Clippy is not part of CI either, so keep new code warning-free by hand:
 

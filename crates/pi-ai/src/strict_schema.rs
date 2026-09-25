@@ -84,7 +84,8 @@ fn is_structured(schema: &Value) -> bool {
 /// and OpenAI accept. Mirrors `makeJsonSchemaNodeStrict`. Returns `Err(())`
 /// when a construct the strict mode rejects is present (the caller falls back
 /// to the non-strict schema).
-pub(crate) fn make_strict_json_schema(schema: &Value) -> Result<Value, ()> {    let mut cloned = schema.clone();
+pub(crate) fn make_strict_json_schema(schema: &Value) -> Result<Value, ()> {
+    let mut cloned = schema.clone();
     make_strict_node(&mut cloned)?;
     if !matches!(cloned.get("type"), Some(Value::String(s)) if s == "object") {
         return Err(());

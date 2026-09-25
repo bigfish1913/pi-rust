@@ -118,7 +118,10 @@ impl ImageTool {
         Ok(AgentToolResult {
             content: vec![TextContentOrImage::text(format!(
                 "Image info: {}x{} {} ({} bytes)",
-                width, height, mime, bytes.len()
+                width,
+                height,
+                mime,
+                bytes.len()
             ))],
             details: output,
             usage: None,
@@ -154,7 +157,9 @@ impl ImageTool {
         Ok(AgentToolResult {
             content: vec![TextContentOrImage::text(format!(
                 "Image resized to {}x{} ({} bytes)",
-                width, height, processed.len()
+                width,
+                height,
+                processed.len()
             ))],
             details: output,
             usage: None,
@@ -236,7 +241,10 @@ impl ImageTool {
         Ok(AgentToolResult {
             content: vec![TextContentOrImage::text(format!(
                 "Image processed: {}x{} {} ({} bytes)",
-                width, height, mime, processed.len()
+                width,
+                height,
+                mime,
+                processed.len()
             ))],
             details: output,
             usage: None,
@@ -284,7 +292,10 @@ pub fn create_image_tool() -> Arc<dyn AgentTool> {
 }
 
 /// Create an image tool with custom settings.
-pub fn create_image_tool_with_config(max_dimension: u32, default_format: &str) -> Arc<dyn AgentTool> {
+pub fn create_image_tool_with_config(
+    max_dimension: u32,
+    default_format: &str,
+) -> Arc<dyn AgentTool> {
     Arc::new(ImageTool::new(max_dimension, default_format))
 }
 

@@ -23,8 +23,8 @@ pub struct Highlighter {
 enum Profile {
     #[default]
     Plain,
-    SlashSlash,   // rust, js, ts, go, c-family, java
-    Hash,         // python, ruby, shell, yaml, toml
+    SlashSlash, // rust, js, ts, go, c-family, java
+    Hash,       // python, ruby, shell, yaml, toml
     Json,
     Sql,
 }
@@ -79,27 +79,129 @@ fn keywords(language: &str) -> &'static [&'static str] {
             "while", "with", "yield",
         ],
         "javascript" | "js" | "jsx" | "typescript" | "ts" | "tsx" => &[
-            "async", "await", "break", "case", "catch", "class", "const", "continue", "default",
-            "delete", "do", "else", "export", "extends", "false", "finally", "for", "function",
-            "if", "import", "in", "instanceof", "let", "new", "null", "return", "super", "switch",
-            "this", "throw", "true", "try", "typeof", "undefined", "var", "void", "while", "yield",
-            "interface", "type", "enum", "implements", "private", "public", "readonly",
+            "async",
+            "await",
+            "break",
+            "case",
+            "catch",
+            "class",
+            "const",
+            "continue",
+            "default",
+            "delete",
+            "do",
+            "else",
+            "export",
+            "extends",
+            "false",
+            "finally",
+            "for",
+            "function",
+            "if",
+            "import",
+            "in",
+            "instanceof",
+            "let",
+            "new",
+            "null",
+            "return",
+            "super",
+            "switch",
+            "this",
+            "throw",
+            "true",
+            "try",
+            "typeof",
+            "undefined",
+            "var",
+            "void",
+            "while",
+            "yield",
+            "interface",
+            "type",
+            "enum",
+            "implements",
+            "private",
+            "public",
+            "readonly",
         ],
         "go" | "golang" => &[
-            "break", "case", "chan", "const", "continue", "default", "defer", "else", "fallthrough",
-            "for", "func", "go", "goto", "if", "import", "interface", "map", "package", "range",
-            "return", "select", "struct", "switch", "type", "var", "nil", "true", "false",
+            "break",
+            "case",
+            "chan",
+            "const",
+            "continue",
+            "default",
+            "defer",
+            "else",
+            "fallthrough",
+            "for",
+            "func",
+            "go",
+            "goto",
+            "if",
+            "import",
+            "interface",
+            "map",
+            "package",
+            "range",
+            "return",
+            "select",
+            "struct",
+            "switch",
+            "type",
+            "var",
+            "nil",
+            "true",
+            "false",
         ],
         "bash" | "sh" | "shell" | "zsh" | "fish" => &[
             "if", "then", "else", "elif", "fi", "for", "while", "do", "done", "case", "esac",
             "function", "return", "export", "local", "in",
         ],
         "c" | "cpp" | "c++" | "h" | "hpp" | "java" | "csharp" | "cs" => &[
-            "auto", "bool", "break", "case", "catch", "char", "class", "const", "continue",
-            "default", "do", "double", "else", "enum", "extern", "false", "float", "for", "if",
-            "int", "long", "namespace", "new", "private", "protected", "public", "return", "short",
-            "static", "struct", "switch", "template", "this", "throw", "true", "try", "typedef",
-            "void", "while", "using", "override", "virtual",
+            "auto",
+            "bool",
+            "break",
+            "case",
+            "catch",
+            "char",
+            "class",
+            "const",
+            "continue",
+            "default",
+            "do",
+            "double",
+            "else",
+            "enum",
+            "extern",
+            "false",
+            "float",
+            "for",
+            "if",
+            "int",
+            "long",
+            "namespace",
+            "new",
+            "private",
+            "protected",
+            "public",
+            "return",
+            "short",
+            "static",
+            "struct",
+            "switch",
+            "template",
+            "this",
+            "throw",
+            "true",
+            "try",
+            "typedef",
+            "void",
+            "while",
+            "using",
+            "override",
+            "virtual",
         ],
         _ => &[
             "true", "false", "null", "if", "else", "for", "while", "return", "function", "class",
@@ -154,7 +256,11 @@ impl Highlighter {
         while i < chars.len() {
             // Continue a block comment started on a previous line.
             if self.in_block_comment {
-                let close = if self.profile == Profile::Sql { "*/" } else { "*/" };
+                let close = if self.profile == Profile::Sql {
+                    "*/"
+                } else {
+                    "*/"
+                };
                 if let Some(off) = find_seq(&chars, i, close) {
                     let end = off + 2;
                     let text: String = chars[i..end].iter().collect();
@@ -239,7 +345,9 @@ impl Highlighter {
             // Number.
             if c.is_ascii_digit() && (i == 0 || !is_ident_char(chars[i - 1])) {
                 let mut j = i;
-                while j < chars.len() && (chars[j].is_ascii_alphanumeric() || chars[j] == '.' || chars[j] == '_') {
+                while j < chars.len()
+                    && (chars[j].is_ascii_alphanumeric() || chars[j] == '.' || chars[j] == '_')
+                {
                     j += 1;
                 }
                 flush!();

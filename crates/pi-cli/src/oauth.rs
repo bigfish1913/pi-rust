@@ -16,19 +16,19 @@ use thiserror::Error;
 pub enum OAuthError {
     #[error("HTTP request failed: {0}")]
     HttpError(String),
-    
+
     #[error("Invalid response: {0}")]
     InvalidResponse(String),
-    
+
     #[error("Authentication timeout")]
     Timeout,
-    
+
     #[error("User denied authorization")]
     Denied,
-    
+
     #[error("Token expired")]
     TokenExpired,
-    
+
     #[error("Unsupported provider: {0}")]
     UnsupportedProvider(String),
 }
@@ -81,7 +81,7 @@ impl OAuthToken {
             false
         }
     }
-    
+
     /// Check if the token will expire soon (within the given duration)
     pub fn expires_soon(&self, within: Duration) -> bool {
         if let Some(expires_at) = self.expires_at {
@@ -136,7 +136,7 @@ impl OAuthClient {
             http_client: reqwest::Client::new(),
         }
     }
-    
+
     /// Create an OAuth client with default configuration for a provider
     pub fn with_defaults(provider: OAuthProvider) -> Result<Self, OAuthError> {
         let config = match provider {
@@ -178,54 +178,54 @@ impl OAuthClient {
                 auth_url: "https://accounts.google.com/o/oauth2/v2/auth".to_string(),
                 token_url: "https://oauth2.googleapis.com/token".to_string(),
                 redirect_uri: Some("http://localhost:8080/callback".to_string()),
-                scopes: vec![
-                    "https://www.googleapis.com/auth/generative-language".to_string(),
-                ],
+                scopes: vec!["https://www.googleapis.com/auth/generative-language".to_string()],
             },
             OAuthProvider::Azure => OAuthConfig {
                 client_id: "pi-cli".to_string(),
                 client_secret: None,
-                auth_url: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize".to_string(),
+                auth_url: "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+                    .to_string(),
                 token_url: "https://login.microsoftonline.com/common/oauth2/v2.0/token".to_string(),
                 redirect_uri: Some("http://localhost:8080/callback".to_string()),
                 scopes: vec!["https://cognitiveservices.azure.com/.default".to_string()],
             },
         };
-        
+
         Ok(Self::new(provider, config))
     }
-    
+
     /// Start device code flow
     pub async fn start_device_code_flow(&self) -> Result<DeviceCodeResponse, OAuthError> {
         let mut params = HashMap::new();
         params.insert("client_id", self.config.client_id.as_str());
-        
+
         let scope_str = self.config.scopes.join(" ");
         if !scope_str.is_empty() {
             params.insert("scope", scope_str.as_str());
         }
-        
-        let response = self.http_client
+
+        let response = self
+            .http_client
             .post(&self.config.auth_url)
             .form(&params)
             .send()
             .await
             .map_err(|e| OAuthError::HttpError(e.to_string()))?;
-        
+
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
             return Err(OAuthError::HttpError(format!("{}: {}", status, text)));
         }
-        
+
         let device_code: DeviceCodeResponse = response
             .json()
             .await
             .map_err(|e| OAuthError::InvalidResponse(e.to_string()))?;
-        
+
         Ok(device_code)
     }
-    
+
     /// Poll for token completion (device code flow)
     pub async fn poll_for_token(
         &self,
@@ -234,62 +234,59 @@ impl OAuthClient {
         timeout: Duration,
     ) -> Result<OAuthToken, OAuthError> {
         let start = std::time::Instant::now();
-        
+
         loop {
             if start.elapsed() > timeout {
                 return Err(OAuthError::Timeout);
             }
-            
+
             tokio::time::sleep(interval).await;
-            
+
             let mut params = HashMap::new();
             params.insert("client_id", self.config.client_id.as_str());
             params.insert("device_code", device_code);
             params.insert("grant_type", "urn:ietf:params:oauth:grant-type:device_code");
-            
-            let response = self.http_client
+
+            let response = self
+                .http_client
                 .post(&self.config.token_url)
                 .form(&params)
                 .send()
                 .await
                 .map_err(|e| OAuthError::HttpError(e.to_string()))?;
-            
+
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
-            
+
             if status.is_success() {
                 // Parse successful token response
                 let token_response: serde_json::Value = serde_json::from_str(&text)
                     .map_err(|e| OAuthError::InvalidResponse(e.to_string()))?;
-                
+
                 let access_token = token_response["access_token"]
                     .as_str()
                     .ok_or_else(|| OAuthError::InvalidResponse("missing access_token".to_string()))?
                     .to_string();
-                
+
                 let refresh_token = token_response["refresh_token"]
                     .as_str()
                     .map(|s| s.to_string());
-                
+
                 let token_type = token_response["token_type"]
                     .as_str()
                     .unwrap_or("Bearer")
                     .to_string();
-                
-                let expires_at = token_response["expires_in"]
-                    .as_u64()
-                    .map(|expires_in| {
-                        SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs()
-                            + expires_in
-                    });
-                
-                let scope = token_response["scope"]
-                    .as_str()
-                    .map(|s| s.to_string());
-                
+
+                let expires_at = token_response["expires_in"].as_u64().map(|expires_in| {
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs()
+                        + expires_in
+                });
+
+                let scope = token_response["scope"].as_str().map(|s| s.to_string());
+
                 return Ok(OAuthToken {
                     access_token,
                     refresh_token,
@@ -298,7 +295,7 @@ impl OAuthClient {
                     scope,
                 });
             }
-            
+
             // Check for specific error codes
             if let Ok(error_response) = serde_json::from_str::<serde_json::Value>(&text) {
                 if let Some(error) = error_response["error"].as_str() {
@@ -310,71 +307,73 @@ impl OAuthClient {
                         }
                         "access_denied" => return Err(OAuthError::Denied),
                         "expired_token" => return Err(OAuthError::Timeout),
-                        _ => return Err(OAuthError::InvalidResponse(format!("unknown error: {}", error))),
+                        _ => {
+                            return Err(OAuthError::InvalidResponse(format!(
+                                "unknown error: {}",
+                                error
+                            )))
+                        }
                     }
                 }
             }
         }
     }
-    
+
     /// Refresh an expired token
     pub async fn refresh_token(&self, refresh_token: &str) -> Result<OAuthToken, OAuthError> {
         let mut params = HashMap::new();
         params.insert("client_id", self.config.client_id.as_str());
         params.insert("refresh_token", refresh_token);
         params.insert("grant_type", "refresh_token");
-        
+
         if let Some(secret) = &self.config.client_secret {
             params.insert("client_secret", secret.as_str());
         }
-        
-        let response = self.http_client
+
+        let response = self
+            .http_client
             .post(&self.config.token_url)
             .form(&params)
             .send()
             .await
             .map_err(|e| OAuthError::HttpError(e.to_string()))?;
-        
+
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
             return Err(OAuthError::HttpError(format!("{}: {}", status, text)));
         }
-        
+
         let token_response: serde_json::Value = response
             .json()
             .await
             .map_err(|e| OAuthError::InvalidResponse(e.to_string()))?;
-        
+
         let access_token = token_response["access_token"]
             .as_str()
             .ok_or_else(|| OAuthError::InvalidResponse("missing access_token".to_string()))?
             .to_string();
-        
+
         let new_refresh_token = token_response["refresh_token"]
             .as_str()
             .map(|s| s.to_string())
             .unwrap_or_else(|| refresh_token.to_string());
-        
+
         let token_type = token_response["token_type"]
             .as_str()
             .unwrap_or("Bearer")
             .to_string();
-        
-        let expires_at = token_response["expires_in"]
-            .as_u64()
-            .map(|expires_in| {
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs()
-                    + expires_in
-            });
-        
-        let scope = token_response["scope"]
-            .as_str()
-            .map(|s| s.to_string());
-        
+
+        let expires_at = token_response["expires_in"].as_u64().map(|expires_in| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + expires_in
+        });
+
+        let scope = token_response["scope"].as_str().map(|s| s.to_string());
+
         Ok(OAuthToken {
             access_token,
             refresh_token: Some(new_refresh_token),
@@ -383,7 +382,7 @@ impl OAuthClient {
             scope,
         })
     }
-    
+
     /// Get the provider type
     pub fn provider(&self) -> OAuthProvider {
         self.provider
@@ -402,22 +401,22 @@ impl OAuthTokenStore {
             tokens: HashMap::new(),
         }
     }
-    
+
     /// Store a token
     pub fn store(&mut self, provider: OAuthProvider, token: OAuthToken) {
         self.tokens.insert(provider, token);
     }
-    
+
     /// Retrieve a token
     pub fn get(&self, provider: OAuthProvider) -> Option<&OAuthToken> {
         self.tokens.get(&provider)
     }
-    
+
     /// Remove a token
     pub fn remove(&mut self, provider: OAuthProvider) -> Option<OAuthToken> {
         self.tokens.remove(&provider)
     }
-    
+
     /// Check if a token exists and is valid
     pub fn is_valid(&self, provider: OAuthProvider) -> bool {
         self.tokens
@@ -436,7 +435,7 @@ impl Default for OAuthTokenStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_oauth_token_expiry() {
         let token = OAuthToken {
@@ -452,12 +451,12 @@ mod tests {
             ),
             scope: None,
         };
-        
+
         assert!(!token.is_expired());
         assert!(!token.expires_soon(Duration::from_secs(1800)));
         assert!(token.expires_soon(Duration::from_secs(7200)));
     }
-    
+
     #[test]
     fn test_oauth_token_store() {
         let mut store = OAuthTokenStore::new();
@@ -468,14 +467,14 @@ mod tests {
             expires_at: None,
             scope: None,
         };
-        
+
         store.store(OAuthProvider::Anthropic, token.clone());
         assert!(store.is_valid(OAuthProvider::Anthropic));
         assert!(!store.is_valid(OAuthProvider::OpenAI));
-        
+
         let retrieved = store.get(OAuthProvider::Anthropic).unwrap();
         assert_eq!(retrieved.access_token, "test");
-        
+
         store.remove(OAuthProvider::Anthropic);
         assert!(!store.is_valid(OAuthProvider::Anthropic));
     }

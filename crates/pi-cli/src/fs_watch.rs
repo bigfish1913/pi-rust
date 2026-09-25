@@ -104,7 +104,11 @@ pub fn watch_path<F>(path: PathBuf, on_change: F) -> WatchHandle
 where
     F: Fn() + Send + Sync + 'static,
 {
-    watch_paths(vec![path], Duration::from_millis(DEFAULT_POLL_INTERVAL_MS), on_change)
+    watch_paths(
+        vec![path],
+        Duration::from_millis(DEFAULT_POLL_INTERVAL_MS),
+        on_change,
+    )
 }
 
 #[cfg(test)]
@@ -125,20 +129,19 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let handle = watch_paths(
-                vec![file.clone()],
-                Duration::from_millis(20),
-                move || {
-                    hits_task.fetch_add(1, Ordering::SeqCst);
-                },
-            );
+            let handle = watch_paths(vec![file.clone()], Duration::from_millis(20), move || {
+                hits_task.fetch_add(1, Ordering::SeqCst);
+            });
             tokio::time::sleep(Duration::from_millis(60)).await;
             std::fs::write(&file, "bb").unwrap();
             // mtime resolution: ensure a visible change.
             tokio::time::sleep(Duration::from_millis(120)).await;
             handle.close();
         });
-        assert!(hits.load(Ordering::SeqCst) >= 1, "expected at least one change");
+        assert!(
+            hits.load(Ordering::SeqCst) >= 1,
+            "expected at least one change"
+        );
     }
 
     #[test]

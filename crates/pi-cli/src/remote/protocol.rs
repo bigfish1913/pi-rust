@@ -68,7 +68,11 @@ pub enum RemoteEvent {
         /// Convenience mirror of the delta's content index (text/thinking/tool-call
         /// deltas only), so the client can apply deltas without re-parsing the
         /// nested event.
-        #[serde(rename = "contentIndex", default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            rename = "contentIndex",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
         content_index: Option<u64>,
         /// Convenience mirror of the appended text for text/thinking deltas.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -398,15 +402,14 @@ mod tests {
         assert_eq!(tool["result"]["content"][0]["text"], "hello");
         assert_eq!(tool["result"]["terminate"], false);
 
-        let retry = serde_json::to_value(RemoteEvent::from_agent_event(
-            &AgentEvent::RetryScheduled {
+        let retry =
+            serde_json::to_value(RemoteEvent::from_agent_event(&AgentEvent::RetryScheduled {
                 attempt: 3,
                 max_retries: 10,
                 delay_ms: 8_000,
                 error: "503 service unavailable".into(),
-            },
-        ))
-        .unwrap();
+            }))
+            .unwrap();
         assert_eq!(retry["type"], "retry_scheduled");
         assert_eq!(retry["attempt"], 3);
         assert_eq!(retry["maxRetries"], 10);
@@ -447,7 +450,8 @@ mod tests {
         assert_eq!(value["content"], "hi");
         assert_eq!(value["id"], "r1");
 
-        let response = RemoteResponse::ok(serde_json::json!("r1"), serde_json::json!({"pong": true}));
+        let response =
+            RemoteResponse::ok(serde_json::json!("r1"), serde_json::json!({"pong": true}));
         let json = response.to_json();
         assert_eq!(json["type"], "response");
         assert_eq!(json["id"], "r1");

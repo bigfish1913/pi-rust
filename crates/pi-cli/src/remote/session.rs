@@ -421,7 +421,9 @@ mod tests {
             "type": "message_end",
             "message": {"kind": "assistant", "content": [{"type": "text", "text": "Hello!"}]}
         })));
-        session.apply_event(&event(json!({"type": "agent_end", "messageCount": 1, "messages": []})));
+        session.apply_event(&event(
+            json!({"type": "agent_end", "messageCount": 1, "messages": []}),
+        ));
 
         assert!(!session.streaming);
         assert_eq!(session.transcript.items.len(), 2); // user + assistant

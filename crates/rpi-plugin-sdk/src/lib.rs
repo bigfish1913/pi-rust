@@ -1926,7 +1926,10 @@ mod tests {
         }
         // One past the highest defined id is rejected (nothing is silently
         // accepted), and so is the u32 ceiling.
-        assert_eq!(RuntimeActionId::try_from(19), Err(UnknownRuntimeActionId(19)));
+        assert_eq!(
+            RuntimeActionId::try_from(19),
+            Err(UnknownRuntimeActionId(19))
+        );
         assert_eq!(
             RuntimeActionId::try_from(u32::MAX),
             Err(UnknownRuntimeActionId(u32::MAX))
@@ -1959,15 +1962,19 @@ mod tests {
         // An ABI v1 plugin/host mixture is refused before the v2 vtable is read.
         // A null pointer makes the ordering observable: checking `api` first
         // would return 2, while the required version-first path returns 1.
-        let rc = unsafe { register_entrypoint(core::ptr::null(), 1, |_| {
-            panic!("body must not run on version mismatch");
-        }) };
+        let rc = unsafe {
+            register_entrypoint(core::ptr::null(), 1, |_| {
+                panic!("body must not run on version mismatch");
+            })
+        };
         assert_eq!(rc, 1);
 
         // A future version is rejected by the same pre-dereference check.
-        let rc = unsafe { register_entrypoint(&vt, RPI_PLUGIN_ABI_VERSION + 1, |_| {
-            panic!("body must not run on version mismatch");
-        }) };
+        let rc = unsafe {
+            register_entrypoint(&vt, RPI_PLUGIN_ABI_VERSION + 1, |_| {
+                panic!("body must not run on version mismatch");
+            })
+        };
         assert_ne!(rc, 0);
 
         // Right version → body runs, rc propagated.

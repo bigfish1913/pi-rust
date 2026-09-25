@@ -221,7 +221,10 @@ fn decode_value(
             }
             let bytes = reader.take(len)?;
             Ok(Value::Array(
-                bytes.iter().map(|b| Value::Number(Number::from(*b))).collect(),
+                bytes
+                    .iter()
+                    .map(|b| Value::Number(Number::from(*b)))
+                    .collect(),
             ))
         }
         3 => {
@@ -282,12 +285,16 @@ fn decode_value(
             26 => {
                 let b = reader.take(4)?;
                 let f = f32::from_be_bytes([b[0], b[1], b[2], b[3]]) as f64;
-                Ok(Number::from_f64(f).map(Value::Number).unwrap_or(Value::Null))
+                Ok(Number::from_f64(f)
+                    .map(Value::Number)
+                    .unwrap_or(Value::Null))
             }
             27 => {
                 let b = reader.take(8)?;
                 let f = f64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
-                Ok(Number::from_f64(f).map(Value::Number).unwrap_or(Value::Null))
+                Ok(Number::from_f64(f)
+                    .map(Value::Number)
+                    .unwrap_or(Value::Null))
             }
             _ => Err(CborError("unsupported CBOR simple value".into())),
         },

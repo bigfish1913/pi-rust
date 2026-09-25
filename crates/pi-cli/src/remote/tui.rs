@@ -66,16 +66,17 @@ async fn connect_and_run(addr: &str, token: Option<&str>) -> Result<(), String> 
 
     // Seed the state (model / thinking / tools) for the header.
     client
-        .send_command(
-            &session_id,
-            RemoteCommand::GetState.with_id(next_id),
-        )
+        .send_command(&session_id, RemoteCommand::GetState.with_id(next_id))
         .await?;
     next_id += 1;
 
     // ---- Build the UI ----
     let mut session = RemoteSession::new();
-    let header = Arc::new(Text::new(format!("rpi remote · {addr} · connecting…"), 1, 0));
+    let header = Arc::new(Text::new(
+        format!("rpi remote · {addr} · connecting…"),
+        1,
+        0,
+    ));
     let document = Arc::new(Container::new());
     document.add_child(header.clone());
     let transcript_container = Arc::new(Container::new());
@@ -94,21 +95,9 @@ async fn connect_and_run(addr: &str, token: Option<&str>) -> Result<(), String> 
                 .shrink(1)
                 .min_size(1),
         ),
-        StackChild::Entry(
-            StackEntry::new(status.clone())
-                .shrink(0)
-                .min_size(1),
-        ),
-        StackChild::Entry(
-            StackEntry::new(editor.clone())
-                .shrink(0)
-                .min_size(1),
-        ),
-        StackChild::Entry(
-            StackEntry::new(footer.clone())
-                .shrink(0)
-                .min_size(1),
-        ),
+        StackChild::Entry(StackEntry::new(status.clone()).shrink(0).min_size(1)),
+        StackChild::Entry(StackEntry::new(editor.clone()).shrink(0).min_size(1)),
+        StackChild::Entry(StackEntry::new(footer.clone()).shrink(0).min_size(1)),
     ]);
     let root: Arc<dyn Component> = Arc::new(root);
 
