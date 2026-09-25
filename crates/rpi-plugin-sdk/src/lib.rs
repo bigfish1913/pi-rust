@@ -1150,12 +1150,6 @@ pub struct PluginApiVt {
 unsafe impl Send for PluginApiVt {}
 unsafe impl Sync for PluginApiVt {}
 
-/// Type alias for the unified plugin API.
-///
-/// This is an alias for [`PluginApiVt`] to simplify the entrypoint signature.
-/// New plugins should use [`register_entrypoint_unified`] with this type.
-pub type PluginApi = PluginApiVt;
-
 // ---------------------------------------------------------------------------
 // Register contract
 // ---------------------------------------------------------------------------
@@ -1609,23 +1603,6 @@ pub unsafe fn register_entrypoint(
         Ok(code) => code,
         Err(_) => REGISTER_PANIC_STATUS,
     }
-}
-
-/// Unified entrypoint registration function.
-///
-/// This is a simplified version of [`register_entrypoint`] that doesn't require
-/// an explicit ABI version parameter. It uses the current SDK's ABI version
-/// internally.
-///
-/// # Safety
-///
-/// `api` must be a valid, properly aligned pointer to a [`PluginApi`] that
-/// remains valid for the duration of the `body` call.
-pub unsafe fn register_entrypoint_unified(
-    api: *const PluginApi,
-    body: impl FnOnce(&PluginApi) -> i32,
-) -> i32 {
-    register_entrypoint(api, RPI_PLUGIN_ABI_VERSION, body)
 }
 
 // ===========================================================================
