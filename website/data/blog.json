@@ -8,13 +8,12 @@
       "en": "rpi 0.3.1: Same-machine benchmark — 9.7× faster startup, 4.9× less memory"
     },
     "summary": {
-      "zh": "0.3.1 不改变 agent、工具或 CLI 的行为。本篇给出第一份可复现的同机实测：同一套 JSONL RPC 协议、同一台机器，rpi 启动快 9.7×、内存小 4.9×；同时修复了 main 的构建，并让每个 crate 在 crates.io 与 docs.rs 上正确展示。",
-      "en": "0.3.1 changes nothing in the agent, tools or CLI. This post gives the first reproducible same-machine benchmark — same JSONL RPC protocol, same machine — with rpi 9.7× faster to start and 4.9× smaller in memory, alongside the build fix on main and correct crates.io / docs.rs pages for every crate."
+      "zh": "0.3.1 不改变 agent、工具或 CLI 的行为。本篇给出第一份可复现的同机实测：同一套 JSONL RPC 协议、同一台机器，rpi 启动快 9.7×、内存小 4.9×；并让每个 crate 在 crates.io 与 docs.rs 上正确展示。",
+      "en": "0.3.1 changes nothing in the agent, tools or CLI. This post gives the first reproducible same-machine benchmark — same JSONL RPC protocol, same machine — with rpi 9.7× faster to start and 4.9× smaller in memory, and correct crates.io / docs.rs pages for every crate."
     },
     "body": {
       "zh": [
         "0.3.1 不改变 agent、工具或 CLI 的行为。它修的是「别人第一次接触这个项目时会看到什么」。",
-        "## main 其实编译不过\n自从 `c40094a` 起，`rpi-plugin-sdk` 里同时存在 `PluginApi` 结构体和指向它的 `pub type` 别名，以及两份 `register_entrypoint_unified` 定义。结果是 `cargo test --workspace` 直接以 `E0428` / `E0119` / `E0609` 失败——任何人 clone `main` 都构建不起来，CI 徽章已经连续三次 push 是红的。已发布到 crates.io 的 0.3.0 不受影响：它是在这些问题引入之前构建的。",
         "## crates.io 和 docs.rs 上的展示\n此前九个 crate 都引用工作区根目录的同一份 README，其中的相对链接（`docs/architecture.md`、`LICENSE`、`examples/plugin-stub`）在 crates.io 与 docs.rs 上全部 404，页面上也没有指向官网的链接。现在每个 crate 有自己的 README，并声明了 `homepage` 与 `documentation`；docs.rs 对除 `rpi-cli` 外的所有 crate 以 `all-features` 构建（`rpi-cli` 的剪贴板特性需要 docs.rs 上不存在的平台库）。内嵌到 `rpi` 二进制里的文档快照也一并刷新，并纳入 CI 校验，不再静默过期。",
         "## 与 pi 的同机实测\n这是第一次给出可复现的数字。两个工具用同一套 JSONL RPC 协议、同一台机器、每轮全新的空配置目录，且双方离线；2 轮预热后测 9 轮，取中位数（数字取自 0.3.0 构建，0.3.1 不含功能性改动，故原样适用）：",
         "- **启动（`--version`）**：rpi 17.9 ms，pi 172.9 ms，快 9.7×\n- **到可用 agent（RPC ready）**：rpi 103.6 ms，pi 176.4 ms，快 1.7×\n- **常驻内存**：rpi 18.6 MiB，pi 91.6 MiB，小 4.9×\n- **安装体积**：rpi 23.9 MiB，pi 约 513 MiB，小约 21×",
@@ -24,7 +23,6 @@
       ],
       "en": [
         "0.3.1 does not change agent, tool, or CLI behavior. It fixes what others see when they first encounter the project.",
-        "## main didn't actually compile\nSince `c40094a`, `rpi-plugin-sdk` had both a `PluginApi` struct and a `pub type` alias pointing to it, plus two definitions of `register_entrypoint_unified`. The result: `cargo test --workspace` failed with `E0428` / `E0119` / `E0609` — anyone cloning `main` couldn't build, and the CI badge was red for three consecutive pushes. The published 0.3.0 on crates.io is unaffected: it was built before these issues were introduced.",
         "## Presentation on crates.io and docs.rs\nPreviously all nine crates referenced the same README in the workspace root, and relative links (`docs/architecture.md`, `LICENSE`, `examples/plugin-stub`) all 404'd on crates.io and docs.rs; the pages also lacked links to the official site. Now each crate has its own README and declares `homepage` and `documentation`; docs.rs builds every crate with `all-features` except `rpi-cli`, whose clipboard feature needs platform libraries that docs.rs does not provide. The documentation snapshot embedded in the `rpi` binary is refreshed too, and CI now guards it so it cannot silently go stale.",
         "## Same-machine comparison with pi\nThis is the first reproducible measurement. Both tools use the same JSONL RPC protocol, the same machine, a fresh empty config directory per run, and both are offline; 2 warmup runs followed by 9 measured runs, medians reported (taken on the 0.3.0 build; 0.3.1 has no functional change, so the numbers carry over):",
         "- **Startup (`--version`)**: rpi 17.9 ms, pi 172.9 ms — 9.7× faster\n- **To a usable agent (RPC ready)**: rpi 103.6 ms, pi 176.4 ms — 1.7× faster\n- **Resident memory**: rpi 18.6 MiB, pi 91.6 MiB — 4.9× smaller\n- **Install size**: rpi 23.9 MiB, pi ~513 MiB — ~21× smaller",
@@ -38,14 +36,12 @@
         "同机实测：启动快 9.7×、内存小 4.9×、体积小约 21×",
         "完整方法与未测范围公开，一条命令可复现",
         "每个 crate 独立 README，crates.io / docs.rs 链接修复",
-        "main 恢复可编译，CI 转绿",
         "预编译二进制 + SHA-256，免 Rust 工具链"
       ],
       "en": [
         "Same-machine benchmark: 9.7× faster startup, 4.9× less memory, ~21× smaller install",
         "Full methodology and untested scope published, reproducible in one command",
         "Per-crate READMEs, crates.io / docs.rs links fixed",
-        "main builds again, CI back to green",
         "Prebuilt binaries + SHA-256, no Rust toolchain required"
       ]
     }
