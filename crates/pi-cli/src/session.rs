@@ -1540,7 +1540,12 @@ where
     let mut_env: Arc<dyn rpi_tools::MutatingEnv> = env.clone();
     let tool_ctx = rpi_tools::ExecutionToolContext::new(env_dyn.clone(), Some(mut_env));
     let mut tools = build_tools(&tool_ctx, &effective_args);
-    merge_extension_tools(&mut tools, &extension_session, &effective_args, &ctx.tool_context);
+    merge_extension_tools(
+        &mut tools,
+        &extension_session,
+        &effective_args,
+        &ctx.tool_context,
+    );
     if let Some(js) = &ctx.js_extension_session {
         merge_js_extension_tools(&mut tools, js, &effective_args);
     }

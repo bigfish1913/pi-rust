@@ -22,7 +22,14 @@ fn user_msg(text: &str) -> AgentMessage {
 }
 
 fn header() -> JsonlV4Header {
-    JsonlV4Header::new("sess-1".into(), 1_700_000_000_000, "/cwd".into(), None, None, None)
+    JsonlV4Header::new(
+        "sess-1".into(),
+        1_700_000_000_000,
+        "/cwd".into(),
+        None,
+        None,
+        None,
+    )
 }
 
 type Fixture = (Arc<dyn FileSystem>, Arc<FakeClock>, Arc<CounterIdGenerator>);
@@ -116,14 +123,21 @@ async fn duplicate_seq_is_dropped_gap_is_accepted_and_file_is_republished() {
 
     // The healed file no longer carries the duplicate.
     let content = fs.read_text_file(path, None).await.unwrap();
-    assert!(!content.contains("e2dup"), "duplicate should be republished away");
+    assert!(
+        !content.contains("e2dup"),
+        "duplicate should be republished away"
+    );
 
     // Appends resume consistently after the highest surviving seq (10).
     let next = storage
         .append_entry(message_provisioned("e5", "e5"), "main")
         .await
         .unwrap();
-    assert_eq!(next.seq(), 11, "next append continues from the resynced seq");
+    assert_eq!(
+        next.seq(),
+        11,
+        "next append continues from the resynced seq"
+    );
 }
 
 #[tokio::test]
