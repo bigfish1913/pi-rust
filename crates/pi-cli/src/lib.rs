@@ -85,6 +85,7 @@ pub mod source_info;
 pub mod timings;
 pub mod transcript_view;
 pub mod trust;
+pub mod tui_shell;
 pub mod updates;
 
 /// Crate version, surfaced by `rpi --version`. Mirrors the TS `VERSION` export
