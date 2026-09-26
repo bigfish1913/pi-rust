@@ -11,6 +11,52 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-09-26
+
+### Added
+
+- **Plugin tools now receive the session they run in.** The host merges a
+  reserved `__rpi` object — `{"cwd", "sessionId"}` — into every plugin tool
+  call's arguments, in the tool adapter's `execute` rather than in the agent loop
+  or `prepare_arguments`, so the field reaches the plugin and nothing else: not
+  the model, not the `ToolExecutionStart`/`Update` events, not the session log.
+  A model cannot forge it either — the host's value overrides one that matches.
+  Built-in tools are unaffected; they already receive an
+  `ExecutionToolContext`. This is what lets a plugin keep per-session state
+  without asking the model to guess an identity. `docs/extension-authoring.md`
+  documents the contract, including the one failure mode worth naming: a
+  `#[serde(deny_unknown_fields)]` parameter struct will reject the injected key.
+- `cargo binstall rpi-cli` works: `[package.metadata.binstall]` points at the
+  release assets, which are named after the binary (`rpi`) rather than the crate,
+  so the URL template uses `{ bin }`.
+
+### Changed
+
+- A tool result can ask to be rendered as markdown by returning
+  `details.markdown = true`. The TUI renders those bodies with its markdown
+  component — real table borders, list markers, inline code — instead of printing
+  the source literally; every other tool is untouched. Markdown rows are not
+  re-wrapped (the panel already wraps) and drop the `│` gutter so table borders
+  stay clean.
+
+### Fixed
+
+- **A session log written by two processes at once can be opened again.** Two
+  writers diverged their sequence counters: a mutation landed with an
+  already-consumed seq, a later writer's seqs jumped forward, and an entry
+  chained to a leaf the local state never reached — at which point the v4 loader
+  rejected the whole session, so it could not be opened at all. Loading now drops
+  a stale-seq append, resyncs the counter across a divergent writer's forward gap
+  (raw seqs untouched, so later appends stay consistent), and re-chains an entry
+  onto the lane leaf; when it dropped anything the file is republished
+  atomically.
+- A session already open in another `rpi` process is refused with `session … is
+  already open in another rpi process` instead of being written to by both. The
+  host holds an exclusive OS advisory lock per session (`<path>.lock`) for its
+  lifetime.
+- `Could not open the saved session:` was printed twice when a session could not
+  be opened.
+
 ## [0.3.2] - 2026-09-25
 
 ### Added
@@ -480,7 +526,8 @@ on `main` and fixes how every crate presents itself on crates.io and docs.rs.
 Early crates.io publications while the workspace layout, provider layer and
 agent loop were being established. See `git log` for details.
 
-[Unreleased]: https://github.com/bigfish1913/pi-rust/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/bigfish1913/pi-rust/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/bigfish1913/pi-rust/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/bigfish1913/pi-rust/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/bigfish1913/pi-rust/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/bigfish1913/pi-rust/compare/v0.2.0...v0.3.0
