@@ -66,6 +66,11 @@ pub struct ToolExecutionComponent {
     /// present the diff is always shown regardless of `expanded` — the diff
     /// IS the useful content for an `edit` tool.
     diff_lines: Mutex<Option<Vec<String>>>,
+    /// Render the result body as markdown (tables, bold, lists) instead of
+    /// plain text. Tools opt in by setting `details.markdown = true` on their
+    /// result; the interactive host calls [`Self::set_result_markdown`] when
+    /// it sees that flag. See [`Self::set_result_markdown`].
+    result_markdown: Mutex<bool>,
 }
 
 impl ToolExecutionComponent {
@@ -82,6 +87,7 @@ impl ToolExecutionComponent {
             finished_at: Mutex::new(None),
             expanded: Mutex::new(false),
             diff_lines: Mutex::new(None),
+            result_markdown: Mutex::new(false),
         }
     }
 
@@ -180,6 +186,19 @@ impl ToolExecutionComponent {
             *d = Some(lines);
         }
     }
+
+    /// Render the result body as markdown instead of plain indented text.
+    ///
+    /// The host turns this on when a tool result carries `details.markdown =
+    /// true`, so a tool whose payload is markdown (a todo table, a report)
+    /// gets its tables/lists/bold rendered by the shared markdown component
+    /// rather than printed literally. Markdown rows already wrap themselves to
+    /// the panel width, so they are not re-wrapped here.
+    pub fn set_result_markdown(&self, enabled: bool) {
+        if let Ok(mut markdown) = self.result_markdown.lock() {
+            *markdown = enabled;
+        }
+    }
 }
 
 impl Component for ToolExecutionComponent {
@@ -201,6 +220,7 @@ impl Component for ToolExecutionComponent {
         let result = self.result.lock().unwrap();
         let expanded = self.expanded.lock().unwrap();
         let diff_lines = self.diff_lines.lock().unwrap();
+        let result_markdown = self.result_markdown.lock().unwrap();
         let started_at = self.started_at.lock().unwrap();
         let finished_at = self.finished_at.lock().unwrap();
 
@@ -322,18 +342,31 @@ impl Component for ToolExecutionComponent {
         // inside the panel instead of overflowing into the next terminal row.
         if let Some(ref r) = *result {
             let body_width = width.saturating_sub(4).max(1);
-            let visual_lines: Vec<String> = normalized_output_lines(r)
-                .into_iter()
-                .flat_map(|line| wrap_text_with_ansi(&line, body_width))
-                .collect();
+            // Markdown results are rendered by the markdown component, which
+            // wraps and styles its own rows (tables, lists, inline code). The
+            // plain path keeps the existing naive wrap so non-markdown tool
+            // output is unchanged.
+            let visual_lines: Vec<String> = if *result_markdown {
+                crate::markdown::Markdown::new(r.clone(), 0, 0).render(body_width)
+            } else {
+                normalized_output_lines(r)
+                    .into_iter()
+                    .flat_map(|line| wrap_text_with_ansi(&line, body_width))
+                    .collect()
+            };
             let shown = if *expanded {
                 visual_lines.len()
             } else {
                 visual_lines.len().min(OUTPUT_PREVIEW_LINES)
             };
             for part in visual_lines.iter().take(shown) {
-                let result_line =
-                    format!("  {} {}", colors.dim.fg("│"), colors.tool_output.fg(part));
+                let result_line = if *result_markdown {
+                    // Markdown carries its own styling; drop the `│` gutter so
+                    // tables keep clean box-drawing edges.
+                    format!("  {part}")
+                } else {
+                    format!("  {} {}", colors.dim.fg("│"), colors.tool_output.fg(part))
+                };
                 let result_line = apply_background_to_line(&result_line, width, |s| bg.bg(s));
                 lines.push(result_line);
             }
@@ -1041,6 +1074,42 @@ mod tests {
         assert!(rendered
             .iter()
             .any(|line| line.matches("\x1b[48;2;38;48;52m").count() > 1));
+    }
+
+    #[test]
+    fn markdown_result_renders_tables_instead_of_literal_pipes() {
+        let tool = ToolExecutionComponent::new("todo", r#"{"action":"list"}"#);
+        tool.set_result_markdown(true);
+        tool.set_result(
+            "**Todos** | 1 done\n\n| ID | Task |\n|----|------|\n| #1 | ship |",
+            false,
+        );
+        let rendered = crate::ansi::strip_ansi(&tool.render(60).join("\n"));
+        // The markdown component lays the table out with box-drawing borders
+        // instead of the raw `| a | b |` source.
+        assert!(
+            rendered.contains('┌') && rendered.contains('│'),
+            "table not rendered: {rendered}"
+        );
+        assert!(
+            !rendered.contains("| ID |"),
+            "raw markdown table leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("**Todos**"),
+            "raw bold marker leaked: {rendered}"
+        );
+        assert!(rendered.contains("Todos"), "text missing: {rendered}");
+
+        // The default (non-markdown) mode must keep rendering the same body as
+        // plain text with the `│` gutter.
+        let plain = ToolExecutionComponent::new("todo", r#"{"action":"list"}"#);
+        plain.set_result("| ID | Task |", false);
+        let plain_rendered = crate::ansi::strip_ansi(&plain.render(60).join("\n"));
+        assert!(
+            plain_rendered.contains("| ID | Task |"),
+            "plain tools must not be markdown-rendered: {plain_rendered}"
+        );
     }
 
     #[test]

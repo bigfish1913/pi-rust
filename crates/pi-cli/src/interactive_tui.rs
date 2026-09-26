@@ -4193,6 +4193,9 @@ async fn render_session_history(
                     // command output as well as the user's prompts.
                     let comp = Arc::new(ToolExecutionComponent::new(&result.tool_name, ""));
                     comp.set_result(&tool_result_message_text(result), result.is_error);
+                    if tool_result_requests_markdown(result.details.as_ref()) {
+                        comp.set_result_markdown(true);
+                    }
                     chat.add_child(comp);
                     chat.add_child(Arc::new(Spacer::new(1)));
                     rendered_any = true;
@@ -8740,6 +8743,9 @@ async fn handle_agent_event(
                     };
                     comp.set_result(&result_text, is_error);
                     if !is_ask_user_tool(&tool_name) {
+                        if tool_result_requests_markdown(Some(&result.details)) {
+                            comp.set_result_markdown(true);
+                        }
                         apply_edit_diff(&comp, &tool_name, &result.details, &tui);
                     }
                 } else {
@@ -8764,6 +8770,9 @@ async fn handle_agent_event(
                     };
                     comp.set_result(&result_text, is_error);
                     if !is_ask_user_tool(&tool_name) {
+                        if tool_result_requests_markdown(Some(&result.details)) {
+                            comp.set_result_markdown(true);
+                        }
                         apply_edit_diff(&comp, &tool_name, &result.details, &tui);
                     }
                     chat.add_child(comp.clone());
@@ -8876,6 +8885,21 @@ fn apply_edit_diff(
     let width = tui.width();
     let lines = render_diff(diff_text, width);
     comp.set_diff(lines);
+}
+
+/// Whether a tool result opts into markdown rendering of its body.
+///
+/// A tool signals this by setting `details.markdown = true` on its result
+/// (the `rpi-todo` extension does this for its progress bar + table payload).
+/// The host then hands the body to the markdown renderer instead of printing
+/// it as plain text — see `ToolExecutionComponent::set_result_markdown`.
+/// Absent or non-`true` details keep the existing plain-text rendering, so
+/// every other tool is unaffected.
+fn tool_result_requests_markdown(details: Option<&serde_json::Value>) -> bool {
+    details
+        .and_then(|details| details.get("markdown"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
 }
 
 /// The skill name when `tool_name` is a `read` of a `SKILL.md` file, else
@@ -10458,6 +10482,26 @@ use rpi_tui::Color as _Color;
 mod tests {
     use super::*;
     use rpi_tui::Component;
+
+    #[test]
+    fn markdown_flag_only_comes_from_an_explicit_true() {
+        // Tools opt in by setting `details.markdown = true` (rpi-todo does).
+        assert!(tool_result_requests_markdown(Some(
+            &serde_json::json!({"kind": "todo", "markdown": true})
+        )));
+        // Absence, a false value, or a non-bool value keeps plain rendering,
+        // so every other tool is unaffected.
+        assert!(!tool_result_requests_markdown(None));
+        assert!(!tool_result_requests_markdown(Some(
+            &serde_json::json!({"kind": "todo"})
+        )));
+        assert!(!tool_result_requests_markdown(Some(
+            &serde_json::json!({"markdown": false})
+        )));
+        assert!(!tool_result_requests_markdown(Some(
+            &serde_json::json!({"markdown": "true"})
+        )));
+    }
 
     /// Minimal `TuiState` for unit tests that only touch state flags. Mirrors
     /// the explicit literals other tests build, but keeps one copy in sync.
