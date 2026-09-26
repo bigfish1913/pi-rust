@@ -21,6 +21,18 @@ repos are copies. Homebrew-in-`homebrew-core` and `winget` carry the real
 discovery weight — both index by name inside a package manager the user already
 has open, which is traffic the website cannot reach.
 
+## Cutting a release
+
+The whole pipeline — bump, tag, wait for the release binaries, refresh every
+manifest below, push the taps, open the winget PR, publish to crates.io, deploy
+the site — is one command; see [`docs/releasing.md`](../docs/releasing.md):
+
+```bash
+task release RELEASE_VERSION=0.3.4
+```
+
+Add `-- --dry-run` to print the plan without executing anything.
+
 ## The asset contract these manifests depend on
 
 `.github/workflows/release-binaries.yml` publishes one archive per target, **with
