@@ -300,6 +300,42 @@ unsafe impl Send for StableToolSchema {}
 unsafe impl Sync for StableToolSchema {}
 
 // ---------------------------------------------------------------------------
+// Host context injected into plugin tool arguments
+// ---------------------------------------------------------------------------
+
+/// Reserved key the host adds to a **plugin** tool call's arguments.
+///
+/// The model never writes this field and never sees it: the host injects it
+/// after the model's arguments are parsed and before the plugin's
+/// [`ToolExecuteFn`] runs, so a plugin can tell *which* project and *which*
+/// session it is serving without the model having to supply either. (Built-in
+/// tools do not need it — they receive the host's `ExecutionToolContext`
+/// directly. A plugin tool has no such channel.)
+///
+/// The value is an object; today:
+///
+/// ```json
+/// { "cwd": "D:\\Projects\\pi-rust",
+///   "sessionId": "01adb026-7230-708b-855b-91eab6b056b8" }
+/// ```
+///
+/// Both fields are optional and either may be absent: `cwd` when the host
+/// cannot resolve one, `sessionId` for a session that has no id (ephemeral
+/// sessions) and on hosts that predate this field. The key itself may be absent
+/// entirely. Treat everything under it as best-effort, and prefer a
+/// project-scoped fallback when `sessionId` is missing rather than refusing to
+/// work.
+///
+/// **Consequence for plugin parameter types:** a plugin must tolerate unknown
+/// top-level keys in its arguments. Reading them out of a `serde_json::Value`
+/// does that naturally; a `#[serde(deny_unknown_fields)]` parameter struct
+/// would reject this key, so do not use one for tool parameters.
+///
+/// The host's value wins if the model happens to send the same key: this is
+/// host truth, not a hint to be merged.
+pub const HOST_CONTEXT_KEY: &str = "__rpi";
+
+// ---------------------------------------------------------------------------
 // StepResult — the poll() return: Pending | Done | Err (explicit tag + union)
 // ---------------------------------------------------------------------------
 

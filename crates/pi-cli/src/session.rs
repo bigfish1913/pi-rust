@@ -276,6 +276,11 @@ pub async fn build(
     BuildError,
 > {
     let cwd_str = cwd.to_string_lossy().to_string();
+    // Plugin tools get the session's identity injected into every call's
+    // arguments (see `rpi_extensions::ToolCallContext`). It is created here,
+    // before the tools are built, and completed with the session id below once
+    // the session exists — the tool set has to exist before the harness does.
+    let tool_context = rpi_extensions::ToolCallContext::new(cwd_str.clone());
     if !project_trusted && args.verbose {
         eprintln!(
             "warning: current-project settings, resources, and discovered extensions are explicitly disabled (use --approve or /trust yes to re-enable)"
@@ -419,7 +424,7 @@ pub async fn build(
         }
         report_deferred_renderers(&extension_session);
     }
-    merge_extension_tools(&mut tools, &extension_session, args);
+    merge_extension_tools(&mut tools, &extension_session, args, &tool_context);
     if let Some(session) = &js_extension_session {
         merge_js_extension_tools(&mut tools, session, args);
         if args.verbose && !session.commands.is_empty() {
@@ -445,6 +450,12 @@ pub async fn build(
     // ---- Session storage ----
     let selection = select_session(args, cwd);
     let session = build_session(&selection, &cwd_str).await?;
+    // Plugin tools now know which session they serve: `todo` and friends key
+    // their per-session state off it. A session without an id (ephemeral) leaves
+    // the field unset and a plugin is expected to fall back to project scope.
+    if let Ok(metadata) = session.get_metadata().await {
+        tool_context.set_session_id(metadata.id);
+    }
     // `--name`/`-n` sets the session display name durably (a `name` fact in the
     // log). It applies to whichever session this launch works in — a fresh one
     // or a restored one — and an empty value clears a previous name. This is the
@@ -937,6 +948,7 @@ pub async fn build(
         js_extension_session: js_extension_session.clone(),
         package_resources: Arc::new(package_resources.clone()),
         action_bridge: Arc::new(Mutex::new(Some(Arc::clone(&action_bridge)))),
+        tool_context,
         catalog,
         gateway: resolved.provider.clone(),
         runtime: runtime.clone(),
@@ -1017,6 +1029,11 @@ pub type ActionBridgeCell = Arc<Mutex<Option<Arc<rpi_extensions::ActionBridge>>>
 pub struct ReloadContext {
     /// The live extension-session cell (swapped on reload).
     pub extension_session: ExtensionSessionCell,
+    /// The session's plugin-tool context (`cwd` + session id), reused — not
+    /// rebuilt — on reload so the rebuilt adapters keep serving the SAME
+    /// session. A reload that made a fresh context would leave every plugin
+    /// tool without a session id until the next launch.
+    pub tool_context: rpi_extensions::ToolCallContext,
     /// JS/TS Pi extension host kept alive for the interactive session.
     pub js_extension_session: Option<crate::js_extensions::JsExtensionSession>,
     /// The exact trust-gated package set resolved during initial build. The TUI
@@ -1523,7 +1540,7 @@ where
     let mut_env: Arc<dyn rpi_tools::MutatingEnv> = env.clone();
     let tool_ctx = rpi_tools::ExecutionToolContext::new(env_dyn.clone(), Some(mut_env));
     let mut tools = build_tools(&tool_ctx, &effective_args);
-    merge_extension_tools(&mut tools, &extension_session, &effective_args);
+    merge_extension_tools(&mut tools, &extension_session, &effective_args, &ctx.tool_context);
     if let Some(js) = &ctx.js_extension_session {
         merge_js_extension_tools(&mut tools, js, &effective_args);
     }
@@ -1880,7 +1897,12 @@ fn js_extension_paths(
 /// already guaranteed by the registry (`register_tool` keeps the prior). The
 /// explicit `--tools` allowlist / `--exclude-tools` denylist apply to the
 /// merged set (the built-ins were already filtered in [`build_tools`]).
-fn merge_extension_tools(tools: &mut Vec<HarnessTool>, session: &ExtensionSession, args: &Args) {
+fn merge_extension_tools(
+    tools: &mut Vec<HarnessTool>,
+    session: &ExtensionSession,
+    args: &Args,
+    tool_context: &rpi_extensions::ToolCallContext,
+) {
     let Some(snapshot) = session.snapshot() else {
         return;
     };
@@ -1889,7 +1911,8 @@ fn merge_extension_tools(tools: &mut Vec<HarnessTool>, session: &ExtensionSessio
         if !tool_name_allowed(name, args) {
             continue;
         }
-        let adapter = PluginToolAdapter::new(et.tool.clone(), et.handle(), session.keepalive());
+        let adapter = PluginToolAdapter::new(et.tool.clone(), et.handle(), session.keepalive())
+            .with_context(tool_context.clone());
         let harness_tool = HarnessTool::new(Arc::new(adapter));
         match tools.iter_mut().find(|t| t.tool.schema().name == *name) {
             Some(slot) => *slot = harness_tool,

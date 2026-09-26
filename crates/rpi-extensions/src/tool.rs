@@ -13,7 +13,7 @@
 use std::ffi::c_void;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use rpi_agent::agent_tool::AgentTool;
@@ -24,6 +24,7 @@ use rpi_plugin_sdk::{
     FreeStringFn, StbString, StbStringRef, StepHandle, StepResultTag, ToolCancelFn, ToolDestroyFn,
     ToolExecuteFn, ToolPollFn,
 };
+use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -170,6 +171,119 @@ fn stb_to_result(s: &StbString) -> AgentToolResult {
 }
 
 // ---------------------------------------------------------------------------
+// ToolCallContext — the per-session context a plugin tool is handed
+// ---------------------------------------------------------------------------
+
+/// Per-session context the host injects into plugin tool arguments under
+/// [`rpi_plugin_sdk::HOST_CONTEXT_KEY`].
+///
+/// A built-in tool gets an `ExecutionToolContext` from the harness and can
+/// resolve the working directory from it; a plugin tool has no such channel.
+/// Without this, a plugin that needs project (or session) identity has to ask
+/// the model for it — and the model does not know the session id, while any
+/// `cwd` it guesses is a silent way to split one store into two.
+///
+/// It is filled in two steps because the CLI assembles the tool set *before* the
+/// session it belongs to exists: [`ToolCallContext::new`] carries the `cwd`, and
+/// [`ToolCallContext::set_session_id`] completes it once the session does.
+/// Every adapter for one session shares one instance (`Arc` inside), so the late
+/// write is visible to all of them — including across an extension reload, which
+/// rebuilds the adapters from the same context.
+///
+/// Unknown fields are absent, not empty strings: a consumer should prefer a
+/// project-scoped fallback when [`ToolCallContext::session_id`] is `None`.
+#[derive(Clone, Debug, Default)]
+pub struct ToolCallContext {
+    inner: Arc<RwLock<ToolCallContextState>>,
+}
+
+#[derive(Debug, Default)]
+struct ToolCallContextState {
+    cwd: Option<String>,
+    session_id: Option<String>,
+}
+
+impl ToolCallContext {
+    /// A context that knows the project directory but not yet the session id.
+    /// An empty `cwd` is treated as unknown.
+    pub fn new(cwd: impl Into<String>) -> Self {
+        let cwd = cwd.into();
+        Self {
+            inner: Arc::new(RwLock::new(ToolCallContextState {
+                cwd: (!cwd.is_empty()).then_some(cwd),
+                session_id: None,
+            })),
+        }
+    }
+
+    /// Record the session id once the session exists. Safe to call again (a
+    /// reload re-derives it); a poisoned lock is ignored rather than panicking
+    /// inside a tool call.
+    pub fn set_session_id(&self, session_id: impl Into<String>) {
+        if let Ok(mut state) = self.inner.write() {
+            state.session_id = Some(session_id.into());
+        }
+    }
+
+    /// The project directory the session was launched in, when known.
+    pub fn cwd(&self) -> Option<String> {
+        self.inner.read().ok().and_then(|s| s.cwd.clone())
+    }
+
+    /// The session id, when the session has one and the host has recorded it.
+    pub fn session_id(&self) -> Option<String> {
+        self.inner.read().ok().and_then(|s| s.session_id.clone())
+    }
+
+    /// The object to inject, or `None` when nothing is known yet — in which
+    /// case arguments are passed through untouched rather than gaining an empty
+    /// `{}` that a plugin would have to special-case.
+    pub fn to_json(&self) -> Option<Value> {
+        let state = self.inner.read().ok()?;
+        if state.cwd.is_none() && state.session_id.is_none() {
+            return None;
+        }
+        let mut object = serde_json::Map::new();
+        if let Some(cwd) = &state.cwd {
+            object.insert("cwd".to_string(), Value::String(cwd.clone()));
+        }
+        if let Some(session_id) = &state.session_id {
+            object.insert("sessionId".to_string(), Value::String(session_id.clone()));
+        }
+        Some(Value::Object(object))
+    }
+}
+
+/// Add the host context to one plugin tool call's arguments.
+///
+/// Injected here — inside the adapter, on a copy — rather than in the agent loop
+/// or in `AgentTool::prepare_arguments`, so the field reaches the plugin and
+/// nothing else: not the model, not `ToolExecutionStart`/`Update` events, not
+/// the session log. It also means a model cannot forge it.
+///
+/// Only object-shaped arguments can carry the key. A plugin whose schema takes
+/// an array or a scalar gets its arguments untouched; `null` (the shape a
+/// no-parameter tool call arrives in) is promoted to an object so such a tool
+/// still receives the context.
+fn inject_tool_context(params: Value, context: &ToolCallContext) -> Value {
+    let Some(context_json) = context.to_json() else {
+        return params;
+    };
+    match params {
+        Value::Object(mut object) => {
+            object.insert(rpi_plugin_sdk::HOST_CONTEXT_KEY.to_string(), context_json);
+            Value::Object(object)
+        }
+        Value::Null => {
+            let mut object = serde_json::Map::new();
+            object.insert(rpi_plugin_sdk::HOST_CONTEXT_KEY.to_string(), context_json);
+            Value::Object(object)
+        }
+        other => other,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PluginToolAdapter — AgentTool impl driving the 4-fn handle
 // ---------------------------------------------------------------------------
 
@@ -187,6 +301,11 @@ pub struct PluginToolAdapter {
     schema: Tool,
     label: String,
     handle: PluginToolHandle,
+    /// Injected into every call's arguments under
+    /// [`rpi_plugin_sdk::HOST_CONTEXT_KEY`]. `Default` (nothing known) until the
+    /// CLI attaches the session's context, so an adapter built without one — as
+    /// the tests and the SDK smoke test do — behaves exactly as before.
+    context: ToolCallContext,
     // Drop order: `keepalive` is declared AFTER `handle` so the cdylib unloads
     // only after the fn-pointer bundle is itself dropped — though since both are
     // fine to drop in any order (fn pointers are Copy, the real call sites are
@@ -206,8 +325,17 @@ impl PluginToolAdapter {
             schema,
             label,
             handle,
+            context: ToolCallContext::default(),
             keepalive,
         }
+    }
+
+    /// Attach the session's context, so each call carries `cwd` + `sessionId`.
+    /// Builder-style so the three-argument [`PluginToolAdapter::new`] keeps
+    /// working for callers that have no session (tests, the SDK smoke test).
+    pub fn with_context(mut self, context: ToolCallContext) -> Self {
+        self.context = context;
+        self
     }
 }
 
@@ -288,7 +416,10 @@ impl AgentTool for PluginToolAdapter {
 
         // 3. Prepare plugin execute() inputs. `params` is an owning JSON string
         //    the host produced → the plugin frees it via the host's free_string.
-        //    `tool_call_id` is borrowed for the call.
+        //    `tool_call_id` is borrowed for the call. The host context is merged
+        //    into the arguments here — after the model's arguments were parsed,
+        //    before the plugin sees them, and never into the events or the log.
+        let params = inject_tool_context(params, &self.context);
         let params_json = serde_json::to_string(&params).unwrap_or_else(|_| "null".to_string());
         let params_stb = StbString::from_string(params_json);
         let id_ref = StbStringRef::from_str(tool_call_id);
@@ -450,6 +581,7 @@ impl AgentTool for PluginToolAdapter {
 mod tests {
     use super::*;
     use rpi_plugin_sdk::{StepResult, ToolPartialCb};
+    use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
@@ -464,6 +596,22 @@ mod tests {
     static DESTROY_COUNT: AtomicUsize = AtomicUsize::new(0);
     static CANCEL_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+    /// The raw arguments string the most recent `stub_execute` was handed. The
+    /// stub used to ignore its `params` entirely, which made it impossible to
+    /// assert that the host context actually crosses the FFI boundary — the one
+    /// thing about the injection that unit-testing the merge function cannot
+    /// prove.
+    static LAST_PARAMS: Mutex<Option<String>> = Mutex::new(None);
+
+    fn take_last_params() -> Value {
+        let raw = LAST_PARAMS
+            .lock()
+            .unwrap()
+            .take()
+            .expect("stub_execute should have recorded params");
+        serde_json::from_str(&raw).expect("params should be JSON")
+    }
+
     struct DriveState {
         cancelled: Arc<AtomicBool>,
         polls: usize,
@@ -472,9 +620,10 @@ mod tests {
 
     extern "C" fn stub_execute(
         _id: StbStringRef,
-        _params: StbString,
+        params: StbString,
         _free: Option<FreeStringFn>,
     ) -> StepHandle {
+        *LAST_PARAMS.lock().unwrap() = Some(params.to_string_lossy());
         let state = Box::new(DriveState {
             cancelled: Arc::new(AtomicBool::new(false)),
             polls: 0,
@@ -682,5 +831,90 @@ mod tests {
             1,
             "destroy once on cancel"
         );
+    }
+
+    // ---- host context injection ----
+
+    #[test]
+    fn injected_context_carries_cwd_and_session_only_when_known() {
+        // Nothing known yet → no key at all, rather than an empty object a
+        // plugin would have to special-case.
+        assert!(ToolCallContext::default().to_json().is_none());
+        assert!(ToolCallContext::new("").to_json().is_none());
+
+        let context = ToolCallContext::new("D:\\proj");
+        let json = context.to_json().expect("cwd alone is enough to inject");
+        assert_eq!(json["cwd"], "D:\\proj");
+        assert!(json.get("sessionId").is_none(), "not yet recorded");
+
+        context.set_session_id("sess-1");
+        let json = context.to_json().unwrap();
+        assert_eq!(json["cwd"], "D:\\proj");
+        assert_eq!(json["sessionId"], "sess-1");
+    }
+
+    #[test]
+    fn injection_targets_objects_and_leaves_other_shapes_alone() {
+        let context = ToolCallContext::new("/proj");
+        context.set_session_id("s");
+
+        let merged = inject_tool_context(json!({"action": "list"}), &context);
+        assert_eq!(merged["action"], "list", "model arguments survive");
+        assert_eq!(merged["__rpi"]["sessionId"], "s");
+
+        // A no-argument call arrives as `null`; it should still receive the
+        // context instead of being left unusable as an object.
+        let merged = inject_tool_context(Value::Null, &context);
+        assert_eq!(merged["__rpi"]["cwd"], "/proj");
+
+        // Array/scalar parameters cannot carry a key — pass through untouched.
+        let array = json!([1, 2]);
+        assert_eq!(inject_tool_context(array.clone(), &context), array);
+        assert_eq!(inject_tool_context(json!("raw"), &context), json!("raw"));
+    }
+
+    #[test]
+    fn host_context_overrides_a_forged_one() {
+        let context = ToolCallContext::new("/real");
+        context.set_session_id("real-session");
+        let merged = inject_tool_context(
+            json!({"action": "list", "__rpi": {"cwd": "/forged", "sessionId": "forged"}}),
+            &context,
+        );
+        assert_eq!(merged["__rpi"]["cwd"], "/real");
+        assert_eq!(merged["__rpi"]["sessionId"], "real-session");
+    }
+
+    #[test]
+    fn injection_is_a_no_op_without_a_context() {
+        let params = json!({"action": "list"});
+        let merged = inject_tool_context(params.clone(), &ToolCallContext::default());
+        assert_eq!(merged, params, "an unattached adapter behaves as before");
+    }
+
+    #[tokio::test]
+    async fn plugin_receives_the_host_context_across_the_ffi_boundary() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_counters();
+        *LAST_PARAMS.lock().unwrap() = None;
+
+        let context = ToolCallContext::new("D:\\proj");
+        context.set_session_id("sess-42");
+        let adapter = echo_adapter().with_context(context);
+        let on_update: Arc<dyn Fn(ToolResultPartial) + Send + Sync> = Arc::new(|_| {});
+        adapter
+            .execute(
+                "call_ctx",
+                json!({"action": "list"}),
+                CancellationToken::new(),
+                on_update,
+            )
+            .await
+            .expect("drive should succeed");
+
+        let seen = take_last_params();
+        assert_eq!(seen["action"], "list");
+        assert_eq!(seen["__rpi"]["cwd"], "D:\\proj");
+        assert_eq!(seen["__rpi"]["sessionId"], "sess-42");
     }
 }

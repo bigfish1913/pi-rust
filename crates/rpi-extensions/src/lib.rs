@@ -86,7 +86,7 @@ pub use registry::{
 };
 pub use resources::{emit_resources_discover, DiscoveredResources};
 pub use status::ExtensionStatusMailbox;
-pub use tool::{PluginToolAdapter, PluginToolHandle};
+pub use tool::{PluginToolAdapter, PluginToolHandle, ToolCallContext};
 pub use translate::{
     dispatch_data_event, dispatch_empty_event, dispatch_lifecycle_event, ExtensionEmitter,
     TeeEmitter,

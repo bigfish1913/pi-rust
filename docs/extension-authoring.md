@@ -121,6 +121,30 @@ v2/v3 允许当前定义的 `0..=17`（含 `GetCliFlag`、`UiDialog`）。
 完整、可运行的 ABI 模板位于 `examples/plugin-stub/src/lib.rs`。创建新工具时先
 复制生命周期骨架，再替换参数 schema 和领域逻辑，不要重新设计所有权协议。
 
+### 注入到工具参数里的宿主上下文
+
+宿主在把参数交给插件**之前**，会往这次调用的 JSON 参数里加一个保留键
+`__rpi`（`rpi_plugin_sdk::HOST_CONTEXT_KEY`）：
+
+```json
+{ "action": "add", "text": "…",
+  "__rpi": { "cwd": "D:\\Projects\\pi-rust",
+             "sessionId": "01adb026-7230-708b-855b-91eab6b056b8" } }
+```
+
+- **模型看不到、也写不了。** 注入发生在模型参数解析之后、`execute` 之前，不
+  会进 `ToolExecutionStart`/`Update` 事件，也不会进会话日志；模型若碰巧传了同
+  名键，宿主的值覆盖它。
+- **两个字段都可能是缺失的。** 拿不到工作目录时没有 `cwd`；ephemeral 会话以及
+  早于该注入的旧宿主没有 `sessionId`；整个键也可能不存在。
+- **所以 tool 的参数类型必须容忍未知的顶层字段。** 用 `serde_json::Value`
+  取值天然满足；给参数定义 `#[serde(deny_unknown_fields)]` 的结构体会直接失败。
+- 内置工具不走这条路——它们从 harness 直接拿到 `ExecutionToolContext`。
+
+需要"每个会话一份状态"的插件就用 `sessionId` 做键（`rpi-todo` 存
+`.rpi/todos/<sessionId>.json`，一条会话一个文件），取不到时退回项目级并**在
+回复里说明**，不要编一个共享的伪会话——那正是它要解决的问题。
+
 ## 5. 事件处理器、资源发现与 Provider
 
 ### 事件处理器
