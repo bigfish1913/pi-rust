@@ -1,0 +1,11 @@
+$ cargo run -q -p minimal
+minimal example: 2 messages after run
+  - user
+  - assistant
+assistant reply: Hello from the faux provider!
+AgentEnd observed.
+
+$ cargo run -q -p tools-example
+tools example: 4 messages after run
+wrote out.txt (28 bytes): "hello from the tools example"
+AgentEnd observed; tool ran against OsExecutionEnv.

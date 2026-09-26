@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="rpi 与 Claude Code、Codex CLI、aider、OpenHands 的对比：实现语言、许可证、分发方式、能否作为库嵌入你自己的程序、扩展模型。rpi 是九个可组合 Rust crate，可当 CLI 用，也可当 SDK 嵌。" />
+
+    <link rel="canonical" href="https://rpi.laofu.online/compare.html" />
+    <link rel="icon" type="image/svg+xml" href="./favicon.svg" />
+    <link rel="apple-touch-icon" href="./apple-touch-icon.png" />
+    <meta name="theme-color" content="#101113" />
+    <meta name="robots" content="index, follow" />
+
+    <meta property="og:type" content="article" />
+    <meta property="og:site_name" content="rpi" />
+    <meta property="og:url" content="https://rpi.laofu.online/compare.html" />
+    <meta property="og:title" content="rpi vs Claude Code · Codex CLI · aider · OpenHands" />
+    <meta property="og:description" content="什么时候该用 rpi，什么时候不该。rpi 是九个可组合 Rust crate：可以当终端 agent 用，也可以作为库嵌进你自己的程序。" />
+    <meta property="og:image" content="https://rpi.laofu.online/og-image.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="rpi interactive terminal session" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:locale:alternate" content="en_US" />
+
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="rpi vs Claude Code · Codex CLI · aider · OpenHands" />
+    <meta name="twitter:description" content="什么时候该用 rpi，什么时候不该。九个可组合 Rust crate：可以当终端 agent 用，也可以作为库嵌进你自己的程序。" />
+    <meta name="twitter:image" content="https://rpi.laofu.online/og-image.png" />
+    <title>对比 · rpi — Rust coding-agent runtime</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body class="compare-page">
+    <div class="site-shell">
+      <header class="topbar" data-sticky-header>
+        <a class="brand" href="./index.html#top" aria-label="rpi home"><span class="brand-mark"><span></span><span></span><span></span></span><span>rpi</span></a>
+        <nav class="desktop-nav" aria-label="主导航"><a href="./index.html#top" data-i18n="nav.home">首页</a><a href="./docs.html" data-i18n="nav.documentation">文档</a><a href="./packages.html" data-i18n="nav.packages">软件包</a><a class="is-current" href="./compare.html" data-i18n="nav.compare">对比</a><a href="./blog.html" data-i18n="nav.blog">博客</a></nav>
+        <div class="topbar-actions"><button class="language-switcher" type="button" data-language-toggle>EN</button><a class="text-link desktop-only" href="https://github.com/bigfish1913/pi-rust" target="_blank" rel="noreferrer">GitHub <span aria-hidden="true">↗</span></a><a class="button button-small desktop-only" href="./index.html#get-started" data-i18n="nav.start">开始使用 <span aria-hidden="true">→</span></a><button class="menu-toggle" type="button" aria-label="打开导航" data-i18n-attr="aria-label|nav.open" aria-expanded="false" data-menu-toggle><span></span><span></span></button></div>
+      </header>
+      <div class="mobile-menu" data-mobile-menu><a href="./index.html#top" data-i18n="nav.home">首页</a><a href="./docs.html" data-i18n="nav.documentation">文档</a><a href="./packages.html" data-i18n="nav.packages">软件包</a><a href="./compare.html" data-i18n="nav.compare">对比</a><a href="./blog.html" data-i18n="nav.blog">博客</a><a href="https://github.com/bigfish1913/pi-rust" target="_blank" rel="noreferrer">GitHub ↗</a></div>
+
+      <main>
+        <section class="compare-hero page-section">
+          <div class="eyebrow eyebrow-dark" data-i18n="compare.eyebrow">RPI / 对比</div>
+          <h1 data-i18n-html="compare.heroTitle">和别人比，<br /><em>差别在哪。</em></h1>
+          <p data-i18n="compare.heroBody">rpi 不是一个"更好用的终端 agent"。它是一个可以嵌进你自己程序的 agent runtime——顺带给你一个开箱可用的终端 CLI。下面对比的是结构差异，不是谁的功能更多。</p>
+          <p class="compare-note" data-i18n="compare.tableNote">语言与许可证取自各项目官方仓库（2026-09），分发方式以各自官方文档为准。对比会过时，请以官方为准。</p>
+        </section>
+
+        <section class="compare-table-section page-section">
+          <div class="compare-table-wrap">
+            <table class="compare-table">
+              <thead>
+                <tr>
+                  <th scope="col" data-i18n="compare.th.tool">工具</th>
+                  <th scope="col" data-i18n="compare.th.impl">实现</th>
+                  <th scope="col" data-i18n="compare.th.license">许可证</th>
+                  <th scope="col" data-i18n="compare.th.dist">分发</th>
+                  <th scope="col" data-i18n="compare.th.embed">当库嵌入</th>
+                  <th scope="col" data-i18n="compare.th.extend">扩展模型</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr class="is-rpi">
+                  <th scope="row">rpi</th>
+                  <td data-i18n="compare.rpi.impl">Rust（9 个 crate）</td>
+                  <td data-i18n="compare.rpi.license">MIT</td>
+                  <td data-i18n="compare.rpi.dist">cargo / 预编译二进制</td>
+                  <td data-i18n="compare.rpi.embed">✅ 就是库，CLI 只是其中一层</td>
+                  <td data-i18n="compare.rpi.extend">cdylib 插件（稳定 ABI）</td>
+                </tr>
+                <tr>
+                  <th scope="row">Claude Code</th>
+                  <td data-i18n="compare.claude.impl">TypeScript / Node</td>
+                  <td data-i18n="compare.claude.license">闭源（仓库未声明许可证）</td>
+                  <td data-i18n="compare.claude.dist">npm</td>
+                  <td data-i18n="compare.claude.embed">✖</td>
+                  <td data-i18n="compare.claude.extend">Hooks / MCP / 子代理</td>
+                </tr>
+                <tr>
+                  <th scope="row">Codex CLI</th>
+                  <td data-i18n="compare.codex.impl">Rust</td>
+                  <td data-i18n="compare.codex.license">Apache-2.0</td>
+                  <td data-i18n="compare.codex.dist">npm / Homebrew</td>
+                  <td data-i18n="compare.codex.embed">✖</td>
+                  <td data-i18n="compare.codex.extend">MCP / AGENTS.md</td>
+                </tr>
+                <tr>
+                  <th scope="row">aider</th>
+                  <td data-i18n="compare.aider.impl">Python</td>
+                  <td data-i18n="compare.aider.license">Apache-2.0</td>
+                  <td data-i18n="compare.aider.dist">pip / uv</td>
+                  <td data-i18n="compare.aider.embed">⚠️ 可 import，但不是 SDK 定位</td>
+                  <td data-i18n="compare.aider.extend">配置 / 脚本钩子</td>
+                </tr>
+                <tr>
+                  <th scope="row">OpenHands</th>
+                  <td data-i18n="compare.openhands.impl">Python / TypeScript</td>
+                  <td data-i18n="compare.openhands.license">MIT</td>
+                  <td data-i18n="compare.openhands.dist">Docker</td>
+                  <td data-i18n="compare.openhands.embed">✖</td>
+                  <td data-i18n="compare.openhands.extend">框架内插件</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="compare-verdict page-section">
+          <div class="compare-verdict-col">
+            <div class="eyebrow eyebrow-dark" data-i18n="compare.whenEyebrow">PICK RPI WHEN</div>
+            <h2 data-i18n="compare.whenTitle">什么时候选 rpi</h2>
+            <ul class="compare-list">
+              <li data-i18n="compare.when.0">你要把 agent loop 放进自己的 Rust 程序，而不是驱动一个别人的 CLI。</li>
+              <li data-i18n="compare.when.1">你关心进程边界：Rust 二进制、明确的 crate 分层、可替换的 Provider。</li>
+              <li data-i18n="compare.when.2">你需要在无网络、无 API key 的环境里对 agent 循环写确定性的测试。</li>
+              <li data-i18n="compare.when.3">你想要一个崩溃后可续跑、日志损坏能自愈的会话层。</li>
+            </ul>
+          </div>
+          <div class="compare-verdict-col">
+            <div class="eyebrow eyebrow-dark" data-i18n="compare.whenNotEyebrow">LOOK ELSEWHERE WHEN</div>
+            <h2 data-i18n="compare.whenNotTitle">什么时候别选 rpi</h2>
+            <ul class="compare-list compare-list-muted">
+              <li data-i18n="compare.whenNot.0">你只想装完就用，不想碰 Rust 工具链——直接用 Claude Code 或 Codex CLI。</li>
+              <li data-i18n="compare.whenNot.1">你要的是 IDE 里的补全和行内编辑，而不是一个 agent runtime。</li>
+              <li data-i18n="compare.whenNot.2">你需要成熟的云端沙箱和团队协作面板——OpenHands 更合适。</li>
+              <li data-i18n="compare.whenNot.3">你依赖某个特定厂商的账号额度与官方支持渠道。</li>
+            </ul>
+          </div>
+        </section>
+
+        <section class="compare-cta page-section">
+          <div class="compare-cta-inner">
+            <h2 data-i18n="compare.ctaTitle">先看它怎么分层，再决定要不要用。</h2>
+            <div class="get-started-links">
+              <a class="button" href="./docs.html" data-i18n="compare.ctaDocs">读文档 <span aria-hidden="true">→</span></a>
+              <a class="button button-ghost" href="https://github.com/bigfish1913/pi-rust" target="_blank" rel="noreferrer" data-i18n="compare.ctaGithub">GitHub 仓库 <span aria-hidden="true">↗</span></a>
+              <a class="button button-ghost" href="./packages.html" data-i18n="compare.ctaPackages">看软件包 <span aria-hidden="true">→</span></a>
+            </div>
+            <p class="compare-footnote" data-i18n="compare.footnote">对比信息取自各项目公开仓库，可能已变化；许可证与分发方式请以各自官方文档为准。</p>
+          </div>
+        </section>
+      </main>
+      <footer class="footer"><div class="footer-brand"><span class="brand-mark"><span></span><span></span><span></span></span><span>rpi</span><span class="footer-tagline">Rust Agent Toolkit</span></div><div class="footer-links"><a href="./index.html" data-i18n="footer.home">首页</a><a href="https://github.com/bigfish1913/pi-rust" target="_blank" rel="noreferrer">GitHub ↗</a><span>MIT License</span></div></footer>
+      <div class="toast" role="status" aria-live="polite" data-toast></div>
+    </div>
+    <script src="./compare.js" type="module"></script>
+  </body>
+</html>

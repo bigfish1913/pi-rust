@@ -20,6 +20,10 @@ Website: <https://rpi.laofu.online/> · Docs: <https://rpi.laofu.online/docs.htm
 
 <sub>Interactive TUI. See [`docs/user-guide.md`](docs/user-guide.md) for the full command surface.</sub>
 
+![rpi SDK demo — an agent loop and a real tool round-trip, offline with the faux provider](docs/images/rpi-sdk-demo.gif)
+
+<sub>The agent loop and a real `write` tool round-trip, recorded with no API key and no network — the same path the tests take. Source of truth is [`demo/sdk.tape`](demo/sdk.tape); regenerate with `task demo`.</sub>
+
 ## Three ways to use it
 
 | You want | Depend on | Start at |
@@ -51,11 +55,40 @@ cargo install rpi-cli
 rpi --version
 ```
 
+**Package managers:**
+
+```bash
+brew tap bigfish1913/tap && brew install rpi          # macOS (Apple silicon), Linux
+scoop bucket add bigfish1913 https://github.com/bigfish1913/scoop-bucket
+scoop install rpi                                     # Windows
+```
+
+The Homebrew formula omits Intel macOS because no `x86_64-apple-darwin` build is
+published — use `cargo install rpi-cli` there. A winget manifest is [open for
+review](https://github.com/microsoft/winget-pkgs/pull/441408).
+
 **From source:**
 
 ```bash
 git clone https://github.com/bigfish1913/pi-rust.git
 cd pi-rust && cargo run -p minimal   # offline agent, no API key required
+```
+
+Real output of the two offline examples — no credentials, no network, identical
+bytes every run. Regenerate with `task demo-transcript`:
+
+```text
+$ cargo run -q -p minimal
+minimal example: 2 messages after run
+  - user
+  - assistant
+assistant reply: Hello from the faux provider!
+AgentEnd observed.
+
+$ cargo run -q -p tools-example
+tools example: 4 messages after run
+wrote out.txt (28 bytes): "hello from the tools example"
+AgentEnd observed; tool ran against OsExecutionEnv.
 ```
 
 ## Quick start

@@ -104,6 +104,22 @@ tasks:
     cmds:
       - cargo check --workspace --all-targets --locked
 
+  metrics:
+    desc: 打印曝光指标基线（stars / crates.io 下载 / release 下载 / 仓库流量）
+    cmds:
+      - bash scripts/metrics.sh
+
+  demo-transcript:
+    desc: 重新生成 README 用的离线示例输出（demo/transcript.txt）
+    cmds:
+      - bash scripts/demo-transcript.sh
+
+  demo:
+    desc: 重新录制 README 用的离线确定性 GIF（需要 vhs + ttyd + ffmpeg）
+    cmds:
+      - cargo build -p minimal -p tools-example
+      - vhs demo/sdk.tape
+
   rpi-pack-frontend:
     desc: 打包 rpi 静态官网（tar.gz；zip 在 Linux 侧解压会因反斜杠分隔符报错）
     cmds:

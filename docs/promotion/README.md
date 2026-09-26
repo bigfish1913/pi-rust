@@ -10,10 +10,17 @@ verifiable against this repository.
 | [`03-english-showhn-devto-reddit.md`](03-english-showhn-devto-reddit.md) | English posts | Hacker News, DEV.to / Hashnode, r/rust, r/LocalLLaMA, Lobsters |
 | [`04-submissions-twir-and-awesome-rust.md`](04-submissions-twir-and-awesome-rust.md) | Verified submission rules for two third-party lists | This Week in Rust, Awesome Rust |
 | [`05-awesome-list-survey.md`](05-awesome-list-survey.md) | Five curated lists checked against their written rules, with the exact gate on each | Reference: which lists are open now, when the rest open |
+| [`06-directory-survey.md`](06-directory-survey.md) | Category-specific directories (terminal coding agents, agent harnesses) checked against their contributing rules, with two ready-to-submit entries | Submit now: `awesome-cli-coding-agents`, `awesome-harness-engineering` |
 
 The short posts, per-platform framing notes and the pre-post checklist live in
 [`../promotion-kit.md`](../promotion-kit.md). That file is the index; these are the
 long pieces.
+
+`06-directory-survey.md` is the follow-up to `05`: the earlier survey concluded
+that the curated lists were mostly popularity-gated, which is true of the general
+*awesome* lists but not of the two directories in `06`. Both are open to rpi
+today and each has a ready-to-submit entry — read `06` before assuming the
+integration channel is closed.
 
 ## Two things to read before publishing anything
 
