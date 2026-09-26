@@ -67,6 +67,20 @@ windows-sys = { version = "0.59", features = [
 [package.metadata.docs.rs]
 rustdoc-args = ["--cfg", "docsrs"]
 
+# `cargo binstall rpi-cli` support. The release workflow publishes
+# `rpi-v<version>-<target>.tar.gz` (`.zip` on Windows) with the `rpi` binary at
+# the archive root, plus a sibling `.sha256`. The URL has to be built from
+# `{ bin }` rather than `{ name }`, because the assets are named after the
+# binary (`rpi`) while the crate is `rpi-cli`. Default `pkg-fmt` is `tgz`; only
+# the Windows target needs the zip override.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ bin }-v{ version }-{ target }.{ archive-format }"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
+
 [features]
 default = ["clipboard"]
 # Enables real clipboard support for `/copy` and image paste (best-effort).
