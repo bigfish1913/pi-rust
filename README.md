@@ -65,7 +65,7 @@ scoop install rpi                                     # Windows
 
 The Homebrew formula omits Intel macOS because no `x86_64-apple-darwin` build is
 published — use `cargo install rpi-cli` there. A winget manifest is [open for
-review](https://github.com/microsoft/winget-pkgs/pull/441408).
+review](https://github.com/microsoft/winget-pkgs/pull/441442).
 
 **From source:**
 

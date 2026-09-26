@@ -374,16 +374,16 @@
       ],
       "releases": [
         {
-          "version": "0.3.1",
+          "version": "0.3.3",
           "status": "current",
-          "title": "Same-machine benchmark: 9.7× faster startup",
-          "description": "Measured over the same JSONL RPC protocol on the same machine: rpi starts 9.7× faster and uses 4.9× less memory, with correct crates.io / docs.rs pages for every crate."
+          "title": "A crashed session opens again",
+          "description": "Two writers on one session log used to make it unopenable; the loader now heals it and a second process is refused instead of double-writing. Plugin tools also receive the session they run in, so per-session state no longer has to be guessed."
         },
         {
           "version": "next",
           "status": "building",
-          "title": "More ways to install",
-          "description": "Prebuilt binaries, more provider adapters, and a complete extension resource protocol."
+          "title": "More provider adapters",
+          "description": "More provider adapters and a complete extension resource protocol."
         },
         {
           "version": "future",

@@ -11,13 +11,13 @@
 class Rpi < Formula
   desc "Rust-native, library-first coding-agent runtime and terminal CLI"
   homepage "https://rpi.laofu.online/"
-  version "0.3.2"
+  version "0.3.3"
   license "MIT"
 
   on_macos do
     on_arm do
-      url "https://github.com/bigfish1913/pi-rust/releases/download/v0.3.2/rpi-v0.3.2-aarch64-apple-darwin.tar.gz"
-      sha256 "92e1851f5987d99899653e52e120d21fa57f49d5ccd1c7d44e8bc7d9de5b1842"
+      url "https://github.com/bigfish1913/pi-rust/releases/download/v0.3.3/rpi-v0.3.3-aarch64-apple-darwin.tar.gz"
+      sha256 "1b79f294bec0bea18ff4191a9d255dc5b6402ddeed2323efbd4aaf752dc88691"
     end
     # No x86_64 macOS build is published (see .github/workflows/release-binaries.yml).
     # Intel Macs are covered by `cargo install rpi-cli`.
@@ -25,12 +25,12 @@ class Rpi < Formula
 
   on_linux do
     on_arm do
-      url "https://github.com/bigfish1913/pi-rust/releases/download/v0.3.2/rpi-v0.3.2-aarch64-unknown-linux-gnu.tar.gz"
-      sha256 "2a940c245ba029d47421e6adb7adafb4fd6018853d37fe9e8da07e53d1438f3f"
+      url "https://github.com/bigfish1913/pi-rust/releases/download/v0.3.3/rpi-v0.3.3-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "2eb3371d7aeadd6f6101fdfd3bc3369d5a8325ff8d1c86c99b979ce9e45069e1"
     end
     on_intel do
-      url "https://github.com/bigfish1913/pi-rust/releases/download/v0.3.2/rpi-v0.3.2-x86_64-unknown-linux-gnu.tar.gz"
-      sha256 "b943b36414decd5af9c6b94115ab5fb69ec1780ad60fe7533b8d985f7ec8fa23"
+      url "https://github.com/bigfish1913/pi-rust/releases/download/v0.3.3/rpi-v0.3.3-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "de161048f1426be41d891e5593d24c2aedb4500ecf5ea55e0f55bc2d2fad88fe"
     end
   end
 

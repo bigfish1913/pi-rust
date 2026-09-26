@@ -14,7 +14,7 @@ is a template with placeholders.
 | `cargo binstall rpi-cli` | [`crates/pi-cli/Cargo.toml`](../crates/pi-cli/Cargo.toml) | **configured** | none — takes effect with the next published crate version |
 | Homebrew | [`bigfish1913/homebrew-tap`](https://github.com/bigfish1913/homebrew-tap) | **live** | none — `brew tap bigfish1913/tap && brew install rpi` |
 | Scoop | [`bigfish1913/scoop-bucket`](https://github.com/bigfish1913/scoop-bucket) | **live** | none — `scoop bucket add bigfish1913 <bucket url>` |
-| winget | [open at `microsoft/winget-pkgs#441408`](https://github.com/microsoft/winget-pkgs/pull/441408) | **submitted** | review by the winget team; `winget install bigfish1913.rpi` does not work until it merges |
+| winget | [open at `microsoft/winget-pkgs#441442`](https://github.com/microsoft/winget-pkgs/pull/441442) | **submitted** | review by the winget team; `winget install bigfish1913.rpi` does not work until it merges |
 
 The files in this directory are the source of truth for the two taps; the tap
 repos are copies. Homebrew-in-`homebrew-core` and `winget` carry the real
@@ -72,12 +72,14 @@ installer entry. That is what the newest manifests merged into
 
 ### Submitting to winget
 
-Done once for 0.3.2 — [PR #441408](https://github.com/microsoft/winget-pkgs/pull/441408).
-For the next version, repeat it without cloning the 866 MB monorepo; every step
-below is a server-side API call:
+Done for 0.3.3 — [PR #441442](https://github.com/microsoft/winget-pkgs/pull/441442)
+(the 0.3.2 submission, #441408, was closed as superseded rather than left open:
+two open PRs for one package is duplicate work for a moderator, and the CLA
+signature carries over). For the next version, repeat it without cloning the
+866 MB monorepo; every step below is a server-side API call:
 
 ```bash
-V=0.3.3
+V=0.3.4
 winget validate packaging/winget                       # 1. validate what you will submit
 gh repo fork microsoft/winget-pkgs --clone=false       # 2. server-side fork, no download
 UP=$(gh api repos/microsoft/winget-pkgs/commits/master --jq .sha)
