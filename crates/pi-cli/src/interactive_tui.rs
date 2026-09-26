@@ -40,7 +40,7 @@ use rpi_tui::scroll_view::{OverscrollMode, ScrollbarMode};
 #[cfg(test)]
 use rpi_tui::strip_ansi;
 use rpi_tui::{
-    apply_theme_preset, render_diff, AltScreenSearch, AssistantBlock, AssistantMessageComponent,
+    apply_theme_preset, AltScreenSearch, AssistantBlock, AssistantMessageComponent,
     AssistantMessageOptions, AutocompleteManager, AutocompleteSuggestions, BashExecutionComponent,
     BashTruncation, CombinedAutocompleteProvider, Component, Container, DynamicBorder, Editor,
     EditorOptions, EditorStyle, FilePathAutocompleteProvider, Focusable, FollowMode,
@@ -57,6 +57,8 @@ use rpi_tui::{bold as tui_bold, theme as current_theme};
 use rpi_tui::BashStatus;
 
 use crate::args::Args;
+use crate::session_driver::{assistant_blocks, assistant_tool_calls};
+use crate::transcript_view::UiEvent;
 
 /// B5e: the markdown-transformer trait object the assistant-message render path
 /// applies to raw text BEFORE the [`Markdown`] renderer styles it. A plain
@@ -4413,22 +4415,6 @@ fn launch_restores_history(args: &Args) -> bool {
         || args.fork.is_some()
 }
 
-fn assistant_blocks(msg: &AssistantMessage) -> Vec<AssistantBlock> {
-    msg.content
-        .iter()
-        .filter_map(|c| match c {
-            Content::Text(t) => Some(AssistantBlock::Text(t.text.clone())),
-            Content::Thinking(t) => Some(AssistantBlock::Thinking(t.thinking.clone())),
-            Content::Image(image) => base64::engine::general_purpose::STANDARD
-                .decode(&image.data)
-                .ok()
-                .filter(|data| !data.is_empty())
-                .map(AssistantBlock::Image),
-            _ => None,
-        })
-        .collect()
-}
-
 fn custom_message_fallback(custom: &rpi_agent::CustomMessage) -> String {
     let content = custom
         .content
@@ -4567,19 +4553,22 @@ impl SelectorView {
 /// and the render-tick task.
 struct TuiState {
     /// The in-flight streaming assistant message (cleared on finalize).
-    current_assistant: std::sync::Mutex<Option<Arc<AssistantMessageComponent>>>,
-    /// Tool-execution components keyed by `tool_call_id`.
-    tool_components: std::sync::Mutex<HashMap<String, Arc<ToolExecutionComponent>>>,
+    /// `Arc`-shared with the [`TranscriptView`] the event drain renders through,
+    /// so the render-tick / reload / toggle paths keep direct access.
+    current_assistant: Arc<std::sync::Mutex<Option<Arc<AssistantMessageComponent>>>>,
+    /// Tool-execution components keyed by `tool_call_id` (shared with the view).
+    tool_components: Arc<std::sync::Mutex<HashMap<String, Arc<ToolExecutionComponent>>>>,
     /// Bash-execution components keyed by `tool_call_id` (kept separate from the
     /// generic tool map so bash output streams into a `BashExecutionComponent`
     /// rather than a plain `ToolExecutionComponent`). Phase 5 routing.
-    bash_components: std::sync::Mutex<HashMap<String, Arc<BashExecutionComponent>>>,
+    bash_components: Arc<std::sync::Mutex<HashMap<String, Arc<BashExecutionComponent>>>>,
     /// Whether package/custom themes may be selected in this session.
     themes_enabled: bool,
-    /// Persisted display preference toggled by Ctrl+T.
-    hide_thinking: std::sync::Mutex<bool>,
-    /// Global tool-output expansion preference toggled by Ctrl+O.
-    tool_outputs_expanded: std::sync::Mutex<bool>,
+    /// Persisted display preference toggled by Ctrl+T (shared with the view).
+    hide_thinking: Arc<std::sync::Mutex<bool>>,
+    /// Global tool-output expansion preference toggled by Ctrl+O (shared with
+    /// the view).
+    tool_outputs_expanded: Arc<std::sync::Mutex<bool>>,
     /// Whether the native-style terminal progress indicator is enabled.
     show_terminal_progress: bool,
     /// Run status for the status indicator + interrupt routing.
@@ -4680,7 +4669,7 @@ struct TuiState {
     /// transform takes effect on the visible streaming message immediately.
     /// New assistant components pick up whatever closure is current at
     /// construction time via [`install_markdown_transformer`].
-    markdown_transformer: std::sync::Mutex<Option<MarkdownTransformer>>,
+    markdown_transformer: Arc<std::sync::Mutex<Option<MarkdownTransformer>>>,
     /// Live extension registry used by message/entry renderer dispatch.
     extension_session: crate::session::ExtensionSessionCell,
     /// Transcript search handler (Ctrl+Shift+F).
@@ -5348,6 +5337,23 @@ impl TuiState {
         self.markdown_transformer.lock().unwrap().clone()
     }
 
+    /// Build a [`TranscriptView`] over the shared component maps. Cheap (clones
+    /// a handful of `Arc`s) and lets the event drain render the transcript
+    /// through the same code path as the remote client.
+    ///
+    /// [`TranscriptView`]: crate::transcript_view::TranscriptView
+    fn transcript_view(&self) -> crate::transcript_view::TranscriptView {
+        crate::transcript_view::TranscriptView::with_maps(
+            self.chat_container.clone(),
+            self.current_assistant.clone(),
+            self.tool_components.clone(),
+            self.bash_components.clone(),
+            self.hide_thinking.clone(),
+            self.tool_outputs_expanded.clone(),
+            self.markdown_transformer.clone(),
+        )
+    }
+
     /// B5e: swap the live transformer. Used at startup (install the first
     /// closure built from the initial `RegistrySnapshot`) and on `/reload`
     /// (rebuild from the fresh snapshot). On a reload the reloaded plugin's
@@ -5830,12 +5836,12 @@ pub async fn interactive_tui(
         .get_as::<bool>("display.tool_outputs_expanded")
         .unwrap_or(false);
     let state = Arc::new(TuiState {
-        current_assistant: std::sync::Mutex::new(None),
-        tool_components: std::sync::Mutex::new(HashMap::new()),
-        bash_components: std::sync::Mutex::new(HashMap::new()),
+        current_assistant: Arc::new(std::sync::Mutex::new(None)),
+        tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         themes_enabled: !no_themes,
-        hide_thinking: std::sync::Mutex::new(hide_thinking),
-        tool_outputs_expanded: std::sync::Mutex::new(tool_outputs_expanded),
+        hide_thinking: Arc::new(std::sync::Mutex::new(hide_thinking)),
+        tool_outputs_expanded: Arc::new(std::sync::Mutex::new(tool_outputs_expanded)),
         show_terminal_progress,
         status: std::sync::Mutex::new(RunStatus::Idle),
         ext_status: reload_context.ext_status.clone(),
@@ -5867,7 +5873,7 @@ pub async fn interactive_tui(
         history_draft: std::sync::Mutex::new(None),
         cache_tracker: std::sync::Mutex::new(rpi_harness::cache_stats::CacheMissTracker::new()),
         scoped_edit: std::sync::Mutex::new(None),
-        markdown_transformer: std::sync::Mutex::new(initial_transformer),
+        markdown_transformer: Arc::new(std::sync::Mutex::new(initial_transformer)),
         extension_session: reload_context.extension_session.clone(),
         search: Arc::new(AltScreenSearch::new()),
         search_bar: Arc::new(SearchBar::new()),
@@ -7736,7 +7742,7 @@ fn launch_external_editor(draft: String, tx: mpsc::UnboundedSender<TuiMessage>) 
 /// Apply the authoritative run result when it wins the race with the async
 /// event drain, then detach the live component from further partial updates.
 fn reconcile_streamed_assistant_completion(
-    current_assistant: &Mutex<Option<Arc<AssistantMessageComponent>>>,
+    current_assistant: &Arc<std::sync::Mutex<Option<Arc<AssistantMessageComponent>>>>,
     last_assistant_text: &Mutex<String>,
     final_message: Option<&AssistantMessage>,
 ) {
@@ -8226,9 +8232,7 @@ async fn handle_agent_event(
 
         AgentEvent::AgentEnd { .. } => {
             // Finalize any still-streaming assistant message.
-            if let Some(comp) = state.current_assistant.lock().unwrap().take() {
-                comp.set_streaming(false);
-            }
+            state.transcript_view().finalize_assistant();
             state.set_status(RunStatus::Idle);
             // Flush any `!command` results that completed mid-run: the run's
             // tool sequence is closed, so appending now keeps transcript order
@@ -8259,9 +8263,7 @@ async fn handle_agent_event(
         AgentEvent::TurnStart => {
             // A new turn: reset the streaming-assistant guard so the next
             // MessageStart creates a fresh component.
-            if let Some(comp) = state.current_assistant.lock().unwrap().take() {
-                comp.set_streaming(false);
-            }
+            state.transcript_view().finalize_assistant();
         }
 
         AgentEvent::TurnEnd {
@@ -8269,50 +8271,30 @@ async fn handle_agent_event(
             tool_results,
         } => {
             // Finalize the assistant message for this turn.
-            if let Some(comp) = state.current_assistant.lock().unwrap().take() {
-                if let AgentMessage::Assistant(a) = &message {
-                    comp.update_blocks(&assistant_blocks(a));
-                }
-                comp.set_streaming(false);
+            let view = state.transcript_view();
+            if let AgentMessage::Assistant(a) = &message {
+                view.finalize_assistant_blocks(&assistant_blocks(a));
+            } else {
+                view.finalize_assistant();
             }
-            // Any tool results whose components were never ended by a
-            // ToolExecutionEnd get a static rendering here (best-effort). The
-            // normal path removes the component via ToolExecutionEnd; this is
-            // just a no-op guard so a stray TurnEnd doesn't double-finalize.
-            let tools = state.tool_components.lock().unwrap();
-            for tr in &tool_results {
-                if tools.contains_key(&tr.tool_call_id) {
-                    // Will be removed below via ToolExecutionEnd in the normal
-                    // path; leave as-is if still present.
-                    let _ = tr;
-                }
-            }
-            drop(tools);
+            // Tool results whose components were never ended by a
+            // ToolExecutionEnd are handled by the normal path; there is nothing
+            // extra to finalize here.
+            let _ = tool_results;
             tui.request_render(false);
         }
 
         AgentEvent::MessageStart { message } => match message {
             AgentMessage::Assistant(a) => {
-                let comp = Arc::new(AssistantMessageComponent::new(
-                    AssistantMessageOptions::default(),
-                ));
-                // B5e: install the live markdown transformer so the plugin's
-                // `register_markdown_transformer` handlers apply from the very
-                // first streamed delta. `set_streaming` before the transform
-                // install is fine (transform fires on `update_blocks`, below).
-                if let Some(t) = state.markdown_transformer() {
-                    comp.set_markdown_transformer(Some(t));
-                }
-                comp.set_hide_thinking(state.hide_thinking());
-                comp.set_streaming(true);
-                // Render text AND thinking blocks in order (the old path fed
-                // only the concatenated text, so thinking blocks never showed).
-                comp.update_blocks(&assistant_blocks(&a));
-                chat.add_child(comp.clone());
-                // Spacer(1) separates this assistant turn from the next entry;
-                // the component itself adds no leading spacer.
-                chat.add_child(Arc::new(Spacer::new(1)));
-                *state.current_assistant.lock().unwrap() = Some(comp);
+                // The shared transcript view renders this through the same
+                // component path as the remote client. It installs the live
+                // markdown transformer + hide-thinking preference itself.
+                state.transcript_view().apply(
+                    &UiEvent::AssistantStart {
+                        blocks: assistant_blocks(&a),
+                    },
+                    tui.width(),
+                );
                 tui.request_render(false);
             }
             AgentMessage::Custom(custom) => {
@@ -8347,7 +8329,7 @@ async fn handle_agent_event(
             // so no `message_start` is emitted for it — the submit handler
             // renders that bubble instead.
             AgentMessage::User(user) => {
-                add_user_message(chat, &user_message_text(&user));
+                state.transcript_view().add_user(&user_message_text(&user));
                 // A consumed entry must drop out of the pending display.
                 refresh_pending_messages(state, lane).await;
                 tui.request_render(false);
@@ -8361,113 +8343,31 @@ async fn handle_agent_event(
             message,
             assistant_message_event,
         } => {
-            {
-                // `message` is the shared partial snapshot
-                // (`Arc<AssistantMessage>`), so read through it instead of
-                // cloning the whole growing message once per delta. The bare
-                // block preserves the original nesting.
-                let a: &rpi_ai::types::AssistantMessage = &message;
-                let text = assistant_text(a);
-                let mut saw_bash_tool_call = false;
-                // Scan content for finalized tool calls → proactively create
-                // tool components (TS shows the tool as soon as the assistant
-                // emits the ToolCall; ToolExecutionStart coalesces if it
-                // already exists).
-                for c in &a.content {
-                    if let Content::ToolCall(tc) = c {
-                        // Streaming providers may expose a placeholder tool
-                        // call before its name has arrived. It is not a real
-                        // tool panel and must not leave an empty first row.
-                        if tc.name.trim().is_empty() {
-                            continue;
-                        }
-                        if tc.name == "bash" {
-                            // Bash has a dedicated component. Create it here as
-                            // well as on ToolExecutionStart because the tool
-                            // call can become visible in a MessageUpdate first.
-                            // Keeping it in the bash map lets Start coalesce
-                            // with this panel instead of appending a second one.
-                            let command = tc
-                                .arguments
-                                .get("command")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            // Streaming tool-call arguments may still be `{}`
-                            // here. Do not create a running bash panel until
-                            // the lifecycle start event provides the command;
-                            // otherwise the spinner renders first and the
-                            // actual `$ command` header appears one frame
-                            // later.
-                            if command.trim().is_empty() {
-                                continue;
-                            }
-                            saw_bash_tool_call = true;
-                            let mut bash = state.bash_components.lock().unwrap();
-                            if let Some(existing) = bash.get(&tc.id) {
-                                // Tool-call arguments arrive incrementally.
-                                // Refresh the running panel from every full
-                                // assistant snapshot instead of leaving its
-                                // header on the first partial command.
-                                existing.set_command(command);
-                            } else {
-                                let comp = Arc::new(BashExecutionComponent::new(command));
-                                comp.set_expanded(*state.tool_outputs_expanded.lock().unwrap());
-                                chat.add_child(comp.clone());
-                                bash.insert(tc.id.clone(), comp);
-                            }
-                        } else {
-                            let mut tools = state.tool_components.lock().unwrap();
-                            let display_args = if is_ask_user_tool(&tc.name) {
-                                ask_user_args_display(&tc.arguments)
-                            } else {
-                                tc.arguments.to_string()
-                            };
-                            if let Some(existing) = tools.get(&tc.id) {
-                                // Regular tool arguments stream incrementally
-                                // too, so refresh their live header as soon as
-                                // a more complete snapshot arrives.
-                                if !display_args.trim().is_empty() && display_args.trim() != "{}" {
-                                    existing.set_args(&display_args);
-                                }
-                            } else {
-                                let comp =
-                                    Arc::new(ToolExecutionComponent::new(&tc.name, &display_args));
-                                if is_ask_user_tool(&tc.name) {
-                                    comp.set_display_title("ASK USER");
-                                }
-                                comp.set_expanded(*state.tool_outputs_expanded.lock().unwrap());
-                                comp.set_running();
-                                chat.add_child(comp.clone());
-                                tools.insert(tc.id.clone(), comp);
-                            }
-                        }
-                    }
-                }
-                // MessageUpdate can expose the finalized bash call before
-                // ToolExecutionStart arrives. Hide the global `Working…`
-                // loader immediately when creating that bash panel; otherwise
-                // it briefly appears alongside the panel's `Running…` spinner.
-                if saw_bash_tool_call {
-                    state.sync_working_loader_with_bash();
-                }
-                let _ = assistant_message_event; // snapshot already applied via `a`
-                if let Some(comp) = state.current_assistant.lock().unwrap().as_ref() {
-                    // Stream the full block list (text + thinking) each update
-                    // so thinking blocks render live as they arrive.
-                    comp.update_blocks(&assistant_blocks(a));
-                }
-                *state.last_assistant_text.lock().unwrap() = text;
-                tui.request_render(false);
-            }
+            let _ = assistant_message_event; // the snapshot is authoritative
+            let a: &rpi_ai::types::AssistantMessage = &message;
+            let text = assistant_text(a);
+            // The shared view creates/updates tool + bash panels from the
+            // snapshot's finalized tool calls and streams the block list, so a
+            // thinking block renders live exactly as the remote client does.
+            state.transcript_view().apply(
+                &UiEvent::AssistantUpdate {
+                    blocks: assistant_blocks(a),
+                    tool_calls: assistant_tool_calls(a),
+                },
+                tui.width(),
+            );
+            // A freshly-created bash panel hides the global `Working…` loader.
+            state.sync_working_loader_with_bash();
+            *state.last_assistant_text.lock().unwrap() = text;
+            tui.request_render(false);
         }
 
         AgentEvent::MessageEnd { message } => {
             if let AgentMessage::Assistant(a) = &message {
                 let text = assistant_text(a);
-                if let Some(comp) = state.current_assistant.lock().unwrap().take() {
-                    comp.update_blocks(&assistant_blocks(a));
-                    comp.set_streaming(false);
-                }
+                state
+                    .transcript_view()
+                    .finalize_assistant_blocks(&assistant_blocks(a));
                 // Cache the finalized text for `/copy`.
                 if !text.is_empty() {
                     *state.last_assistant_text.lock().unwrap() = text;
@@ -8539,76 +8439,14 @@ async fn handle_agent_event(
             tool_name,
             args,
         } => {
-            // Ignore placeholder lifecycle events emitted before the
-            // provider has supplied a tool name.
-            if tool_name.trim().is_empty() {
-                return;
-            }
-            if tool_name == "bash" {
-                // Bash streams into a dedicated BashExecutionComponent (command
-                // header + live preview + exit/truncation status) rather than a
-                // generic ToolExecutionComponent. The command comes from the
-                // `command` field of the bash tool args.
-                let command = args
-                    .get("command")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                // Bash arguments can still be `{}` when the lifecycle event
-                // races the streamed tool-call argument finalization. Defer
-                // the panel until a later start event carries the command.
-                if command.trim().is_empty() {
-                    return;
-                }
-                let mut bash_map = state.bash_components.lock().unwrap();
-                if let Some(existing) = bash_map.get(&tool_call_id) {
-                    // A ToolExecutionUpdate already created the panel (fast
-                    // command — Update can arrive before Start); backfill the
-                    // command header instead of adding a SECOND panel, which
-                    // used to stack an empty "$ " box above the real one.
-                    existing.set_command(&command);
-                } else {
-                    let comp = Arc::new(BashExecutionComponent::new(command));
-                    comp.set_expanded(*state.tool_outputs_expanded.lock().unwrap());
-                    chat.add_child(comp.clone());
-                    bash_map.insert(tool_call_id.clone(), comp);
-                }
-            } else {
-                let _comp = {
-                    let mut tools = state.tool_components.lock().unwrap();
-                    if let Some(existing) = tools.get(&tool_call_id) {
-                        if is_ask_user_tool(&tool_name) {
-                            existing.set_display_title("ASK USER");
-                            existing.set_args(&ask_user_args_display(&args));
-                        } else {
-                            existing.set_args(&args.to_string());
-                        }
-                        existing.clone()
-                    } else {
-                        let display_args = if is_ask_user_tool(&tool_name) {
-                            ask_user_args_display(&args)
-                        } else {
-                            args.to_string()
-                        };
-                        let comp = Arc::new(ToolExecutionComponent::new(&tool_name, &display_args));
-                        if is_ask_user_tool(&tool_name) {
-                            comp.set_display_title("ASK USER");
-                        }
-                        comp.set_expanded(*state.tool_outputs_expanded.lock().unwrap());
-                        // A `read` of a SKILL.md renders as native Pi's
-                        // `[skill] <name>` invocation box (custom-message
-                        // background, collapsed to one line, Ctrl+O expands the
-                        // skill markdown) instead of a generic READ tool panel.
-                        if let Some(skill) = skill_tool_name(&tool_name, &args) {
-                            comp.set_skill_name(skill);
-                        }
-                        comp.set_running();
-                        chat.add_child(comp.clone());
-                        tools.insert(tool_call_id.clone(), comp.clone());
-                        comp
-                    }
-                };
-            }
+            state.transcript_view().apply(
+                &UiEvent::ToolStart {
+                    id: tool_call_id,
+                    name: tool_name,
+                    args,
+                },
+                tui.width(),
+            );
             state.sync_working_loader_with_bash();
             tui.request_render(false);
         }
@@ -8619,81 +8457,15 @@ async fn handle_agent_event(
             args,
             partial_result,
         } => {
-            if tool_name.trim().is_empty() {
-                return;
-            }
-            let partial_text = if is_ask_user_tool(&tool_name) {
-                ask_user_progress_text(&args, &partial_result)
-            } else {
-                tool_result_text(&partial_result)
-            };
-            let has_partial_payload = tool_update_has_payload(&partial_text, &partial_result);
-            if tool_name == "bash" {
-                // Append the streamed chunk to the bash component's preview.
-                // RAW text (no single-line collapsing) — the old
-                // `summarize_tool_result` folded every newline into a `⏎`
-                // glyph, cramming e.g. `ls -la`'s listing onto one line.
-                let chunk = partial_text;
-                if let Some(bash) = state.bash_components.lock().unwrap().get(&tool_call_id) {
-                    // Lifecycle updates can contain a more complete args object
-                    // than the snapshot that created this running panel.
-                    if let Some(command) = args.get("command").and_then(|v| v.as_str()) {
-                        bash.set_command(command);
-                    }
-                    if has_partial_payload {
-                        bash.append_output(&chunk);
-                    }
-                } else if has_partial_payload {
-                    // ToolExecutionStart is emitted before a tool can run.
-                    // Ignore an out-of-order partial until that event gives us
-                    // the real command, rather than showing a spinner above an
-                    // empty `$ ` header. Normal updates are handled by the
-                    // component created in ToolExecutionStart.
-                }
-            } else if let Some(comp) = state.tool_components.lock().unwrap().get(&tool_call_id) {
-                if let Some(skill) = skill_tool_name(&tool_name, &args) {
-                    comp.set_skill_name(skill);
-                }
-                if is_ask_user_tool(&tool_name) {
-                    comp.set_display_title("ASK USER");
-                    comp.set_args(&ask_user_args_display(&args));
-                } else if args != serde_json::Value::Null && args != serde_json::json!({}) {
-                    comp.set_args(&args.to_string());
-                }
-                // Raw multi-line text — read/ls-style tools must show their
-                // full content, not the single-line ⏎-folded summary.
-                if has_partial_payload {
-                    comp.set_result(&partial_text, false);
-                    apply_edit_diff(comp, &tool_name, &partial_result.details, &tui);
-                }
-            } else if has_partial_payload {
-                // No component yet — create a running one so the partial shows.
-                // Empty callbacks are common before ToolExecutionStart; wait
-                // for Start so the first panel has the real arguments instead
-                // of an empty `TOOLS` box.
-                let display_args = if is_ask_user_tool(&tool_name) {
-                    ask_user_args_display(&args)
-                } else {
-                    args.to_string()
-                };
-                let comp = Arc::new(ToolExecutionComponent::new(&tool_name, &display_args));
-                if is_ask_user_tool(&tool_name) {
-                    comp.set_display_title("ASK USER");
-                }
-                comp.set_expanded(*state.tool_outputs_expanded.lock().unwrap());
-                if let Some(skill) = skill_tool_name(&tool_name, &args) {
-                    comp.set_skill_name(skill);
-                }
-                comp.set_running();
-                comp.set_result(&partial_text, false);
-                apply_edit_diff(&comp, &tool_name, &partial_result.details, &tui);
-                chat.add_child(comp.clone());
-                state
-                    .tool_components
-                    .lock()
-                    .unwrap()
-                    .insert(tool_call_id.clone(), comp.clone());
-            }
+            state.transcript_view().apply(
+                &UiEvent::ToolUpdate {
+                    id: tool_call_id,
+                    name: tool_name,
+                    args,
+                    result: crate::remote::protocol::tool_result_json(&partial_result),
+                },
+                tui.width(),
+            );
             state.sync_working_loader_with_bash();
             tui.request_render(false);
         }
@@ -8704,86 +8476,19 @@ async fn handle_agent_event(
             result,
             is_error,
         } => {
-            if tool_name.trim().is_empty() {
-                return;
-            }
-            if tool_name == "bash" {
-                let bash = state.bash_components.lock().unwrap().remove(&tool_call_id);
-                if let Some(bash) = bash {
-                    finalize_bash(&bash, &result, is_error);
-                } else {
-                    // Bash ended without a Start/Update — render a finalized
-                    // component directly from the result text.
-                    let command = result
-                        .details
-                        .get("command")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if command.trim().is_empty() && tool_result_text(&result).trim().is_empty() {
-                        state.sync_working_loader_with_bash();
-                        // Edge case: empty bash result. Still render immediately
-                        // to clear the panel state for the user.
-                        tui.render_now(false);
-                        return;
-                    }
-                    let comp = Arc::new(BashExecutionComponent::new(command));
-                    comp.set_expanded(*state.tool_outputs_expanded.lock().unwrap());
-                    comp.append_output(&tool_result_text(&result));
-                    finalize_bash(&comp, &result, is_error);
-                    chat.add_child(comp);
-                }
-            } else {
-                let comp = state.tool_components.lock().unwrap().remove(&tool_call_id);
-                if let Some(comp) = comp {
-                    let result_text = if is_ask_user_tool(&tool_name) {
-                        ask_user_result_text(&result)
-                    } else {
-                        tool_result_text(&result)
-                    };
-                    comp.set_result(&result_text, is_error);
-                    if !is_ask_user_tool(&tool_name) {
-                        if tool_result_requests_markdown(Some(&result.details)) {
-                            comp.set_result_markdown(true);
-                        }
-                        apply_edit_diff(&comp, &tool_name, &result.details, &tui);
-                    }
-                } else {
-                    // Tool ended without a Start/Update (e.g. a very fast tool):
-                    // render a finalized component directly.
-                    let comp = Arc::new(ToolExecutionComponent::new(
-                        &tool_name,
-                        &if is_ask_user_tool(&tool_name) {
-                            ask_user_args_display(&serde_json::Value::Null)
-                        } else {
-                            "".to_string()
-                        },
-                    ));
-                    if is_ask_user_tool(&tool_name) {
-                        comp.set_display_title("ASK USER");
-                    }
-                    comp.set_expanded(*state.tool_outputs_expanded.lock().unwrap());
-                    let result_text = if is_ask_user_tool(&tool_name) {
-                        ask_user_result_text(&result)
-                    } else {
-                        tool_result_text(&result)
-                    };
-                    comp.set_result(&result_text, is_error);
-                    if !is_ask_user_tool(&tool_name) {
-                        if tool_result_requests_markdown(Some(&result.details)) {
-                            comp.set_result_markdown(true);
-                        }
-                        apply_edit_diff(&comp, &tool_name, &result.details, &tui);
-                    }
-                    chat.add_child(comp.clone());
-                }
-            }
+            state.transcript_view().apply(
+                &UiEvent::ToolEnd {
+                    id: tool_call_id,
+                    name: tool_name,
+                    result: crate::remote::protocol::tool_result_json(&result),
+                    is_error,
+                },
+                tui.width(),
+            );
             state.sync_working_loader_with_bash();
             // Bash tool completion is user-visible: immediate render ensures the
             // result is displayed even when the scheduler thread is busy or the
-            // throttle window has not elapsed. This single immediate frame does
-            // not regress the streaming-output throttle that keeps CPU/GPU use
-            // low (bash completions are discrete events, not per-token bursts).
+            // throttle window has not elapsed.
             tui.render_now(false);
         }
     }
@@ -8827,66 +8532,6 @@ fn assistant_error_text(message: &rpi_ai::AssistantMessage) -> Option<String> {
     )
 }
 
-/// Extract `BashToolDetails` (`truncation`, `full_output_path`) from a bash
-/// tool result and mark the component complete. Mirrors the TS bash finalize
-/// path; only the fields `BashExecutionComponent` needs are read.
-fn finalize_bash(
-    comp: &Arc<BashExecutionComponent>,
-    result: &rpi_agent::AgentToolResult,
-    is_error: bool,
-) {
-    // The exit code isn't in details directly (TS carries it elsewhere); use
-    // `is_error` as the error signal and 0/1 as a best-effort exit code.
-    let exit_code = if is_error { Some(1) } else { Some(0) };
-    let truncated = result
-        .details
-        .get("truncation")
-        .and_then(|t| t.get("truncated"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let full_output_path = result
-        .details
-        .get("full_output_path")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let truncation = BashTruncation {
-        truncated,
-        full_output_path,
-    };
-    // Some tool backends attach the authoritative command to result details.
-    // Backfill it before completing so this is a fallback, never the first
-    // opportunity for the UI to show the whole command.
-    if let Some(command) = result.details.get("command").and_then(|v| v.as_str()) {
-        comp.set_command(command);
-    }
-    let cancelled = false; // cancellation surfaces via Abort/AgentEnd, not a bash detail
-    comp.set_complete(exit_code, cancelled, truncation);
-}
-
-/// If `tool_name` is an editing tool (`edit`) whose `details.diff` carries a
-/// display-diff string, render it with colors and attach to the component so
-/// the changes show in the transcript. `write` has no diff (details: Null) and
-/// stays a plain summary.
-fn apply_edit_diff(
-    comp: &Arc<ToolExecutionComponent>,
-    tool_name: &str,
-    details: &serde_json::Value,
-    tui: &Arc<TuiAltScreen>,
-) {
-    if tool_name != "edit" {
-        return;
-    }
-    let Some(diff_text) = details.get("diff").and_then(|v| v.as_str()) else {
-        return;
-    };
-    if diff_text.is_empty() {
-        return;
-    }
-    let width = tui.width();
-    let lines = render_diff(diff_text, width);
-    comp.set_diff(lines);
-}
-
 /// Whether a tool result opts into markdown rendering of its body.
 ///
 /// A tool signals this by setting `details.markdown = true` on its result
@@ -8900,169 +8545,6 @@ fn tool_result_requests_markdown(details: Option<&serde_json::Value>) -> bool {
         .and_then(|details| details.get("markdown"))
         .and_then(|value| value.as_bool())
         .unwrap_or(false)
-}
-
-/// The skill name when `tool_name` is a `read` of a `SKILL.md` file, else
-/// `None`. The name is the `SKILL.md` parent directory's basename (matching
-/// native Pi's skill-file convention). Ordinary markdown/document reads
-/// return `None` and remain regular `READ` tool panels.
-fn skill_tool_name(tool_name: &str, args: &serde_json::Value) -> Option<String> {
-    if tool_name != "read" {
-        return None;
-    }
-    let path = args.get("path").and_then(|value| value.as_str())?;
-    let normalized = path.replace('\\', "/");
-    let file_name = normalized.rsplit('/').next()?;
-    if !file_name.eq_ignore_ascii_case("SKILL.md") {
-        return None;
-    }
-    normalized
-        .trim_end_matches('/')
-        .rsplit('/')
-        .nth(1)
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
-}
-
-/// The raw multi-line text of a tool result (no single-line collapsing). The
-/// bash panel needs the original line structure — the old path fed it through
-/// [`summarize_tool_result`], which folded every newline into a `⏎` glyph and
-/// crammed e.g. `ls -la`'s whole listing onto one line.
-fn tool_result_text(result: &rpi_agent::AgentToolResult) -> String {
-    use rpi_agent::TextContentOrImage;
-    let mut parts: Vec<String> = Vec::new();
-    for c in &result.content {
-        if let TextContentOrImage::Text(t) = c {
-            parts.push(t.text.clone());
-        }
-    }
-    parts.join("\n")
-}
-
-/// Empty progress callbacks are valid (notably before a tool's start event),
-/// but they do not contain anything useful to render. Defer those callbacks so
-/// the first tool panel is created from `ToolExecutionStart` with real args.
-fn tool_update_has_payload(text: &str, result: &rpi_agent::AgentToolResult) -> bool {
-    !text.trim().is_empty() || !result.details.is_null()
-}
-
-/// Tool names rendered through the dedicated `ASK USER` panel instead of a
-/// generic tool box. Native `ask_user` plus the JS `ask_user_question` alias.
-fn is_ask_user_tool(tool_name: &str) -> bool {
-    matches!(tool_name, "ask_user" | "ask_user_question")
-}
-
-/// Render ask_user tool-call ARGUMENTS as a readable question. The raw
-/// transport JSON must never leak into the transcript.
-fn ask_user_args_display(args: &serde_json::Value) -> String {
-    if args.is_null() {
-        return String::new();
-    }
-    if let Some(summary) = args
-        .get("summary")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-    {
-        return format!("Confirmation requested: {summary}");
-    }
-
-    let mut lines: Vec<String> = Vec::new();
-    let questions: Vec<&serde_json::Value> = args
-        .get("questions")
-        .and_then(serde_json::Value::as_array)
-        .filter(|items| !items.is_empty())
-        .map(|items| items.iter().collect())
-        .unwrap_or_else(|| vec![args]);
-
-    for question in questions {
-        let prompt = question
-            .get("question")
-            .and_then(serde_json::Value::as_str)
-            .or_else(|| args.get("question").and_then(serde_json::Value::as_str))
-            .map(str::trim)
-            .unwrap_or_default();
-        if prompt.is_empty() {
-            continue;
-        }
-        if let Some(header) = question
-            .get("header")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
-        {
-            lines.push(format!("{header}: {prompt}"));
-        } else {
-            lines.push(prompt.to_string());
-        }
-        let context = question
-            .get("context")
-            .and_then(serde_json::Value::as_str)
-            .or_else(|| args.get("context").and_then(serde_json::Value::as_str))
-            .map(str::trim)
-            .filter(|text| !text.is_empty());
-        if let Some(context) = context {
-            lines.push(format!("  {context}"));
-        }
-        let options = question
-            .get("options")
-            .and_then(serde_json::Value::as_array)
-            .or_else(|| args.get("options").and_then(serde_json::Value::as_array));
-        if let Some(options) = options {
-            let labels: Vec<String> = options
-                .iter()
-                .filter_map(|option| {
-                    option
-                        .get("title")
-                        .and_then(serde_json::Value::as_str)
-                        .or_else(|| option.as_str())
-                        .map(str::trim)
-                        .filter(|label| !label.is_empty())
-                        .map(str::to_string)
-                })
-                .collect();
-            if !labels.is_empty() {
-                lines.push(format!("Choices: {}", labels.join(", ")));
-            }
-        }
-        if let Some(suggest) = question
-            .get("suggest")
-            .and_then(serde_json::Value::as_str)
-            .or_else(|| args.get("suggest").and_then(serde_json::Value::as_str))
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
-        {
-            lines.push(format!("Suggestions: {suggest}"));
-        }
-    }
-
-    lines.join("\n")
-}
-
-/// Progress text while an ask_user tool is pending. Prefer the plugin's own
-/// readable `content`, otherwise show the question so the panel is not blank.
-fn ask_user_progress_text(args: &serde_json::Value, result: &rpi_agent::AgentToolResult) -> String {
-    let text = tool_result_text(result);
-    if !text.trim().is_empty() {
-        return text;
-    }
-    let args_text = ask_user_args_display(args);
-    if args_text.trim().is_empty() {
-        "Waiting for your answer…".to_string()
-    } else {
-        args_text
-    }
-}
-
-/// Final result text for an ask_user tool. The plugin returns a human-readable
-/// answer summary in `content`; never surface the transport JSON.
-fn ask_user_result_text(result: &rpi_agent::AgentToolResult) -> String {
-    let text = tool_result_text(result);
-    if text.trim().is_empty() {
-        "Answer recorded.".to_string()
-    } else {
-        text
-    }
 }
 
 // ===========================================================================
@@ -10507,12 +9989,12 @@ mod tests {
     /// the explicit literals other tests build, but keeps one copy in sync.
     fn test_tui_state() -> Arc<TuiState> {
         Arc::new(TuiState {
-            current_assistant: std::sync::Mutex::new(None),
-            tool_components: std::sync::Mutex::new(HashMap::new()),
-            bash_components: std::sync::Mutex::new(HashMap::new()),
+            current_assistant: Arc::new(std::sync::Mutex::new(None)),
+            tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
             themes_enabled: true,
-            hide_thinking: std::sync::Mutex::new(false),
-            tool_outputs_expanded: std::sync::Mutex::new(false),
+            hide_thinking: Arc::new(std::sync::Mutex::new(false)),
+            tool_outputs_expanded: Arc::new(std::sync::Mutex::new(false)),
             show_terminal_progress: true,
             status: std::sync::Mutex::new(RunStatus::Idle),
             ext_status: rpi_extensions::ExtensionStatusMailbox::new(),
@@ -10544,7 +10026,7 @@ mod tests {
             history_draft: std::sync::Mutex::new(None),
             cache_tracker: std::sync::Mutex::new(rpi_harness::cache_stats::CacheMissTracker::new()),
             scoped_edit: std::sync::Mutex::new(None),
-            markdown_transformer: std::sync::Mutex::new(None),
+            markdown_transformer: Arc::new(std::sync::Mutex::new(None)),
             extension_session: Arc::new(std::sync::Mutex::new(
                 rpi_extensions::ExtensionSession::none(),
             )),
@@ -11241,39 +10723,9 @@ mod tests {
     }
 
     #[test]
-    fn skill_reads_are_detected_by_path() {
-        let name = skill_tool_name(
-            "read",
-            &serde_json::json!({"path": "C:/work/.rpi/skills/release/SKILL.md"}),
-        );
-        assert_eq!(name.as_deref(), Some("release"));
-
-        let name = skill_tool_name("read", &serde_json::json!({"path": "/docs/README.md"}));
-        assert!(name.is_none());
-
-        // Only `read` (not other tools) triggers the skill box.
-        assert!(skill_tool_name("grep", &serde_json::json!({"path": "/s/x/SKILL.md"})).is_none());
-    }
-
-    #[test]
     fn welcome_capabilities_show_empty_state() {
         let plain = strip_ansi(&welcome_capability_line("Skills", &[]));
         assert_eq!(plain, "Skills (0) none");
-    }
-
-    #[test]
-    fn empty_tool_progress_is_deferred_until_start() {
-        let empty = rpi_agent::AgentToolResult::default();
-        assert!(!tool_update_has_payload("", &empty));
-
-        let text = rpi_agent::AgentToolResult::text("partial output");
-        assert!(tool_update_has_payload("partial output", &text));
-
-        let details = rpi_agent::AgentToolResult {
-            details: serde_json::json!({"path": "src/lib.rs"}),
-            ..Default::default()
-        };
-        assert!(tool_update_has_payload("", &details));
     }
 
     #[test]
@@ -11284,7 +10736,7 @@ mod tests {
         component.set_streaming(true);
         component.update_blocks(&[AssistantBlock::Text("partial response".into())]);
 
-        let current = Mutex::new(Some(component.clone()));
+        let current = Arc::new(Mutex::new(Some(component.clone())));
         let cached = Mutex::new("partial response".to_string());
         let mut final_message = AssistantMessage::empty(rpi_ai::Api::Faux, "faux", "faux-model", 0);
         final_message.content = vec![Content::text(
@@ -11531,12 +10983,12 @@ mod tests {
         };
 
         let state = Arc::new(TuiState {
-            current_assistant: std::sync::Mutex::new(None),
-            tool_components: std::sync::Mutex::new(HashMap::new()),
-            bash_components: std::sync::Mutex::new(HashMap::new()),
+            current_assistant: Arc::new(std::sync::Mutex::new(None)),
+            tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
             themes_enabled: true,
-            hide_thinking: std::sync::Mutex::new(false),
-            tool_outputs_expanded: std::sync::Mutex::new(false),
+            hide_thinking: Arc::new(std::sync::Mutex::new(false)),
+            tool_outputs_expanded: Arc::new(std::sync::Mutex::new(false)),
             show_terminal_progress: true,
             status: std::sync::Mutex::new(RunStatus::Idle),
             ext_status: rpi_extensions::ExtensionStatusMailbox::new(),
@@ -11568,7 +11020,7 @@ mod tests {
             history_draft: std::sync::Mutex::new(None),
             cache_tracker: std::sync::Mutex::new(rpi_harness::cache_stats::CacheMissTracker::new()),
             scoped_edit: std::sync::Mutex::new(None),
-            markdown_transformer: std::sync::Mutex::new(None),
+            markdown_transformer: Arc::new(std::sync::Mutex::new(None)),
             extension_session: Arc::new(std::sync::Mutex::new(
                 rpi_extensions::ExtensionSession::none(),
             )),
@@ -11978,12 +11430,12 @@ mod tests {
         // The autocomplete container should render at least one suggestion
         // line when the editor holds a `/` prefix, and clear when it doesn't.
         let state = Arc::new(TuiState {
-            current_assistant: std::sync::Mutex::new(None),
-            tool_components: std::sync::Mutex::new(HashMap::new()),
-            bash_components: std::sync::Mutex::new(HashMap::new()),
+            current_assistant: Arc::new(std::sync::Mutex::new(None)),
+            tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
             themes_enabled: true,
-            hide_thinking: std::sync::Mutex::new(false),
-            tool_outputs_expanded: std::sync::Mutex::new(false),
+            hide_thinking: Arc::new(std::sync::Mutex::new(false)),
+            tool_outputs_expanded: Arc::new(std::sync::Mutex::new(false)),
             show_terminal_progress: true,
             status: std::sync::Mutex::new(RunStatus::Idle),
             ext_status: rpi_extensions::ExtensionStatusMailbox::new(),
@@ -12015,7 +11467,7 @@ mod tests {
             history_draft: std::sync::Mutex::new(None),
             cache_tracker: std::sync::Mutex::new(rpi_harness::cache_stats::CacheMissTracker::new()),
             scoped_edit: std::sync::Mutex::new(None),
-            markdown_transformer: std::sync::Mutex::new(None),
+            markdown_transformer: Arc::new(std::sync::Mutex::new(None)),
             extension_session: Arc::new(std::sync::Mutex::new(
                 rpi_extensions::ExtensionSession::none(),
             )),
@@ -12061,12 +11513,12 @@ mod tests {
         // child; closing restores it. Verify the container child count + the
         // active_selector flag round-trip.
         let state = Arc::new(TuiState {
-            current_assistant: std::sync::Mutex::new(None),
-            tool_components: std::sync::Mutex::new(HashMap::new()),
-            bash_components: std::sync::Mutex::new(HashMap::new()),
+            current_assistant: Arc::new(std::sync::Mutex::new(None)),
+            tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
             themes_enabled: true,
-            hide_thinking: std::sync::Mutex::new(false),
-            tool_outputs_expanded: std::sync::Mutex::new(false),
+            hide_thinking: Arc::new(std::sync::Mutex::new(false)),
+            tool_outputs_expanded: Arc::new(std::sync::Mutex::new(false)),
             show_terminal_progress: true,
             status: std::sync::Mutex::new(RunStatus::Idle),
             ext_status: rpi_extensions::ExtensionStatusMailbox::new(),
@@ -12098,7 +11550,7 @@ mod tests {
             history_draft: std::sync::Mutex::new(None),
             cache_tracker: std::sync::Mutex::new(rpi_harness::cache_stats::CacheMissTracker::new()),
             scoped_edit: std::sync::Mutex::new(None),
-            markdown_transformer: std::sync::Mutex::new(None),
+            markdown_transformer: Arc::new(std::sync::Mutex::new(None)),
             extension_session: Arc::new(std::sync::Mutex::new(
                 rpi_extensions::ExtensionSession::none(),
             )),
@@ -12147,12 +11599,12 @@ mod tests {
         // messages, browse older → newer → back past the newest restores the
         // draft the user was typing.
         let state = Arc::new(TuiState {
-            current_assistant: std::sync::Mutex::new(None),
-            tool_components: std::sync::Mutex::new(HashMap::new()),
-            bash_components: std::sync::Mutex::new(HashMap::new()),
+            current_assistant: Arc::new(std::sync::Mutex::new(None)),
+            tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
             themes_enabled: true,
-            hide_thinking: std::sync::Mutex::new(false),
-            tool_outputs_expanded: std::sync::Mutex::new(false),
+            hide_thinking: Arc::new(std::sync::Mutex::new(false)),
+            tool_outputs_expanded: Arc::new(std::sync::Mutex::new(false)),
             show_terminal_progress: true,
             status: std::sync::Mutex::new(RunStatus::Idle),
             ext_status: rpi_extensions::ExtensionStatusMailbox::new(),
@@ -12184,7 +11636,7 @@ mod tests {
             history_draft: std::sync::Mutex::new(None),
             cache_tracker: std::sync::Mutex::new(rpi_harness::cache_stats::CacheMissTracker::new()),
             scoped_edit: std::sync::Mutex::new(None),
-            markdown_transformer: std::sync::Mutex::new(None),
+            markdown_transformer: Arc::new(std::sync::Mutex::new(None)),
             extension_session: Arc::new(std::sync::Mutex::new(
                 rpi_extensions::ExtensionSession::none(),
             )),
@@ -12236,12 +11688,12 @@ mod tests {
     fn test_accept_top_suggestion_replaces_prefix() {
         // `/he` + Tab → `/help ` (slash command provider inserts a space).
         let state = Arc::new(TuiState {
-            current_assistant: std::sync::Mutex::new(None),
-            tool_components: std::sync::Mutex::new(HashMap::new()),
-            bash_components: std::sync::Mutex::new(HashMap::new()),
+            current_assistant: Arc::new(std::sync::Mutex::new(None)),
+            tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
             themes_enabled: true,
-            hide_thinking: std::sync::Mutex::new(false),
-            tool_outputs_expanded: std::sync::Mutex::new(false),
+            hide_thinking: Arc::new(std::sync::Mutex::new(false)),
+            tool_outputs_expanded: Arc::new(std::sync::Mutex::new(false)),
             show_terminal_progress: true,
             status: std::sync::Mutex::new(RunStatus::Idle),
             ext_status: rpi_extensions::ExtensionStatusMailbox::new(),
@@ -12273,7 +11725,7 @@ mod tests {
             history_draft: std::sync::Mutex::new(None),
             cache_tracker: std::sync::Mutex::new(rpi_harness::cache_stats::CacheMissTracker::new()),
             scoped_edit: std::sync::Mutex::new(None),
-            markdown_transformer: std::sync::Mutex::new(None),
+            markdown_transformer: Arc::new(std::sync::Mutex::new(None)),
             extension_session: Arc::new(std::sync::Mutex::new(
                 rpi_extensions::ExtensionSession::none(),
             )),
@@ -12463,60 +11915,6 @@ mod tests {
     }
 
     // ---- ask_user TUI bridge ----
-
-    #[test]
-    fn ask_user_tool_names_are_recognized() {
-        assert!(is_ask_user_tool("ask_user"));
-        assert!(is_ask_user_tool("ask_user_question"));
-        assert!(!is_ask_user_tool("bash"));
-    }
-
-    #[test]
-    fn ask_user_args_display_never_leaks_transport_json() {
-        let text = ask_user_args_display(&serde_json::json!({
-            "question": "你的代理端口是多少？",
-            "context": "本机",
-            "options": ["7890", {"title": "7897", "description": "clash"}],
-            "suggest": "1080"
-        }));
-        assert!(text.contains("你的代理端口是多少？"));
-        assert!(text.contains("本机"));
-        assert!(text.contains("Choices: 7890, 7897"));
-        assert!(text.contains("Suggestions: 1080"));
-        assert!(!text.trim_start().starts_with('{'));
-
-        let multi = ask_user_args_display(&serde_json::json!({
-            "questions": [
-                {"id": "a", "question": "Q1"},
-                {"id": "b", "header": "H", "question": "Q2"}
-            ]
-        }));
-        assert!(multi.contains("Q1"));
-        assert!(multi.contains("H: Q2"));
-
-        assert_eq!(
-            ask_user_args_display(&serde_json::json!({"type": "confirm", "summary": "Deploy?"})),
-            "Confirmation requested: Deploy?"
-        );
-        assert!(ask_user_args_display(&serde_json::Value::Null).is_empty());
-    }
-
-    #[test]
-    fn ask_user_result_and_progress_prefer_readable_content() {
-        let waiting = rpi_agent::AgentToolResult::text("Waiting for your answer\n端口?");
-        assert!(
-            ask_user_progress_text(&serde_json::json!({"question": "端口?"}), &waiting)
-                .contains("端口?")
-        );
-        let empty = rpi_agent::AgentToolResult::default();
-        assert!(
-            ask_user_progress_text(&serde_json::json!({"question": "端口?"}), &empty)
-                .contains("端口?")
-        );
-        let answered = rpi_agent::AgentToolResult::text("端口?: 7897");
-        assert_eq!(ask_user_result_text(&answered), "端口?: 7897");
-        assert_eq!(ask_user_result_text(&empty), "Answer recorded.");
-    }
 
     #[test]
     fn ask_user_prompt_parser_supports_flat_and_questions_shapes() {

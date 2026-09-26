@@ -79,9 +79,11 @@ pub mod resource_dirs;
 pub mod resume_picker;
 pub mod session;
 pub mod session_cwd;
+pub mod session_driver;
 pub mod settings;
 pub mod source_info;
 pub mod timings;
+pub mod transcript_view;
 pub mod trust;
 pub mod updates;
 

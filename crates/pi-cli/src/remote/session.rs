@@ -9,6 +9,10 @@ use serde_json::Value;
 
 use crate::remote::protocol::{RemoteEvent, RemoteResponse, SessionState};
 
+/// Re-exported from the shared render layer so the wire `Value` parsing lives in
+/// exactly one place (the session fold and the transcript view both use it).
+pub use crate::transcript_view::tool_result_text;
+
 /// A tool invocation as rendered in the transcript.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolItem {
@@ -158,20 +162,6 @@ pub fn message_role(message: &Value) -> &str {
 }
 
 /// Text out of a wire tool-result payload (`{content:[{type:"text",text}]}`).
-pub fn tool_result_text(result: &Value) -> String {
-    let mut out = String::new();
-    if let Some(blocks) = result.get("content").and_then(Value::as_array) {
-        for block in blocks {
-            if let Some(text) = block.get("text").and_then(Value::as_str) {
-                if !out.is_empty() {
-                    out.push('\n');
-                }
-                out.push_str(text);
-            }
-        }
-    }
-    out
-}
 
 /// Client-side session state: the transcript plus the latest server state.
 #[derive(Debug, Clone, Default)]
@@ -186,6 +176,8 @@ pub struct RemoteSession {
     pub last_error: Option<String>,
     /// Number of retries currently being waited on (0 when not retrying).
     pub retry_attempt: Option<(u32, u32)>,
+    /// Delay of the pending retry in milliseconds (drives the status countdown).
+    pub retry_delay_ms: Option<u64>,
     open_assistant: Option<usize>,
     open_thinking: Option<usize>,
 }
@@ -251,12 +243,14 @@ impl RemoteSession {
             RemoteEvent::AgentStart => {
                 self.streaming = true;
                 self.retry_attempt = None;
+                self.retry_delay_ms = None;
                 self.open_assistant = None;
                 self.open_thinking = None;
             }
             RemoteEvent::AgentEnd { .. } => {
                 self.streaming = false;
                 self.retry_attempt = None;
+                self.retry_delay_ms = None;
                 self.open_assistant = None;
                 self.open_thinking = None;
             }
@@ -267,6 +261,7 @@ impl RemoteSession {
                 error,
             } => {
                 self.retry_attempt = Some((*attempt, *max_retries));
+                self.retry_delay_ms = Some(*delay_ms);
                 self.transcript.push_notice(format!(
                     "retry {attempt}/{max_retries} in {delay_ms}ms: {error}"
                 ));
