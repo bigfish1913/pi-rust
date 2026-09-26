@@ -30,9 +30,10 @@
 //!   The interactive `-c`/`-r`/`--session` paths enable that mode and replay
 //!   the existing branch before appending new messages. See [`SessionSelection`].
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use rpi_agent::AgentTool;
 use rpi_ai::Provider;
@@ -2157,6 +2158,7 @@ async fn fork_session_at_launch(source: &str, cwd: &str) -> Result<Session, Buil
         )
         .await
         .map_err(|e| BuildError::SessionDir(format!("fork {}: {e}", source_meta.path)))?;
+    claim_session_lock(&fork_storage.jsonl_metadata().path).map_err(BuildError::SessionOpen)?;
     let storage_arc: Arc<dyn SessionStorage> = Arc::new(fork_storage);
     Ok(Session::new(storage_arc, None))
 }
@@ -2174,7 +2176,11 @@ impl std::fmt::Display for OpenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             OpenError::NotFound { requested } => write!(f, "no session matches {requested}"),
-            OpenError::Other(msg) => write!(f, "{msg}"),
+            // `Other` carries the bare reason (see `open_session_by_id`); the
+            // prefix lives here so the TUI and the CLI's
+            // `BuildError::SessionOpen` wrapper each render it exactly once
+            // (wrapping the already-prefixed `BuildError` string doubled it).
+            OpenError::Other(msg) => write!(f, "Could not open the saved session: {msg}"),
         }
     }
 }
@@ -2469,9 +2475,15 @@ pub async fn open_session_by_id(id: &str, cwd: &str) -> Result<Session, OpenErro
             requested: format!("session {id}"),
         });
     };
-    open_session(meta, cwd)
-        .await
-        .map_err(|e| OpenError::Other(e.to_string()))
+    open_session(meta, cwd).await.map_err(|e| {
+        OpenError::Other(match e {
+            // `open_session` renders as "Could not open the saved session:
+            // <reason>" via `BuildError`. Carry the bare reason so it is not
+            // prefixed twice (once here, once by the CLI/TUI).
+            BuildError::SessionOpen(reason) => reason,
+            other => other.to_string(),
+        })
+    })
 }
 
 /// Fork the harness's current session into a new JSONL session (new id, parent
@@ -2518,7 +2530,55 @@ pub(crate) async fn fork_session_storage(
         )
         .await
         .map_err(|e| e.to_string())?;
+    claim_session_lock(&fork_storage.jsonl_metadata().path)?;
     Ok(Session::new(Arc::new(fork_storage), None))
+}
+
+/// Session logs this process has claimed, so re-claiming is a no-op.
+static SESSION_LOCK_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+/// The held lock handles. Kept alive for the process lifetime — dropping the
+/// `File` would release the OS lock, so the guard is parked here.
+static SESSION_LOCKS: OnceLock<Mutex<Vec<std::fs::File>>> = OnceLock::new();
+
+/// Claim the exclusive lock for a session log.
+///
+/// Two rpi processes appending to one JSONL diverge their `sequence` counters
+/// (duplicate / gapped seqs) and corrupt it. The lock is an OS advisory lock on
+/// `<path>.lock`: the second process gets a clear "already open" error instead
+/// of corrupting the log, and the OS releases it automatically when the holder
+/// exits (no stale-lock cleanup). Re-claiming a path this process already holds
+/// is a no-op, so the TUI's session hot-switch can re-open freely.
+fn claim_session_lock(session_path: &str) -> Result<(), String> {
+    let lock_path = PathBuf::from(format!("{session_path}.lock"));
+    if SESSION_LOCK_PATHS
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap()
+        .contains(&lock_path)
+    {
+        return Ok(());
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| format!("open session lock {}: {e}", lock_path.display()))?;
+    if fs2::FileExt::try_lock_exclusive(&file).is_err() {
+        return Err(format!(
+            "session {session_path} is already open in another rpi process"
+        ));
+    }
+    SESSION_LOCKS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap()
+        .push(file);
+    SESSION_LOCK_PATHS
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap()
+        .insert(lock_path);
+    Ok(())
 }
 
 /// Wrap an opened [`JsonlSessionStorage`] in the `Session` facade (shared by
@@ -2540,6 +2600,7 @@ async fn open_session(
         clock: Arc::new(SystemClock),
         ids: Arc::new(DefaultIdGenerator::new()),
     });
+    claim_session_lock(&meta.path).map_err(BuildError::SessionOpen)?;
     let storage = repo
         .open_by_jsonl_metadata(meta)
         .await
@@ -2623,6 +2684,8 @@ pub(crate) async fn create_jsonl_session_with_id(
     let storage = repo
         .create_typed(&opts)
         .await
+        .map_err(|e| format!("create session: {e}"))?;
+    claim_session_lock(&storage.jsonl_metadata().path)
         .map_err(|e| format!("create session: {e}"))?;
     // `JsonlSessionStorage` implements `SessionStorage`; wrap in the facade.
     let storage_arc: Arc<dyn rpi_harness::session::types::SessionStorage> = Arc::new(storage);

@@ -21,6 +21,23 @@
 //! `tokio::Mutex<()>` on each storage handle (intra-handle; the repo additionally
 //! guards cross-handle create races).
 //!
+//! ### Duplicate-seq recovery (divergent writers)
+//!
+//! Two writers appending to one JSONL diverge their `sequence` counters, which
+//! used to make the whole session unopenable. `load` now heals the two shapes:
+//!
+//! - **A stale seq** (`seq <= sequence`): a duplicate/late append. The line is
+//!   dropped (its content already applied) instead of failing the load.
+//! - **A forward gap** (`seq > sequence + 1`): the other writer's counter was
+//!   ahead. The counter is resynced up to the gap, leaving raw seqs untouched so
+//!   future appends stay consistent with the file.
+//!
+//! An entry that no longer chains to the lane leaf (its parent was the other
+//! writer's leaf) is re-parented onto the current leaf. When any duplicate was
+//! dropped the file is atomically republished without it. The host additionally
+//! takes an OS advisory lock per session (see `pi-cli`'s `claim_session_lock`)
+//! so a second process is refused rather than allowed to write concurrently.
+//!
 //! ## Adaptation
 //!
 //! TS `appendEntr`/`appendRecord` take provisioned/new shapes and stamp inline;
@@ -141,11 +158,34 @@ impl JsonlSessionStorage {
         let metadata = metadata_from_header(&header, path, info.mtime_ms);
         let storage = Self::new(fs.clone(), metadata, clock, ids);
 
+        // Lines kept through the duplicate-seq recovery, so a healed file can
+        // be republished without the dropped duplicates (see after the loop).
+        let mut kept_lines: Vec<&str> = Vec::new();
+        let mut dropped_duplicates = false;
         for (idx, line) in physical_lines.iter().enumerate().skip(1) {
             let line_no = (idx + 1) as u32;
             match parse_mutation(line) {
                 Ok(mutation) => {
                     let mut state = storage.state.lock().await;
+                    // Self-heal a duplicated/late append. Two writers on one
+                    // JSONL (e.g. a session resumed while still open in another
+                    // process) diverge their `sequence` counters, so a mutation
+                    // lands with an already-consumed seq. Its content is a
+                    // duplicate of what already applied, so drop it rather than
+                    // refuse the whole session.
+                    if mutation.seq() <= state.sequence() {
+                        dropped_duplicates = true;
+                        drop(state);
+                        continue;
+                    }
+                    // A divergent writer's counter can leave a forward gap (its
+                    // seqs were consumed elsewhere). Accept the gap by moving
+                    // the counter up to it. Raw seqs stay untouched, so future
+                    // appends stay consistent with the file.
+                    if mutation.seq() > state.next_sequence() {
+                        state.resync_sequence(mutation.seq() - 1);
+                    }
+                    let mutation = chain_onto_lane_leaf(mutation, &state);
                     if let Err(e) = state.apply_mutation(mutation) {
                         if e.code == SessionErrorCode::InvalidEntry {
                             drop(state);
@@ -154,6 +194,7 @@ impl JsonlSessionStorage {
                         drop(state);
                         return Err(e);
                     }
+                    kept_lines.push(*line);
                 }
                 Err(err) => {
                     let is_last = idx == physical_lines.len() - 1;
@@ -182,6 +223,35 @@ impl JsonlSessionStorage {
                     return Err(invalid_file(path, line_no, &err));
                 }
             }
+        }
+        // Persist the duplicate-seq recovery: atomically republish the file
+        // without the dropped duplicates so the log no longer carries them.
+        // Seq values are untouched (no renumbering), so subsequent appends
+        // stay consistent with the file.
+        if dropped_duplicates {
+            let mut repaired = String::with_capacity(content.len());
+            repaired.push_str(physical_lines[0]);
+            repaired.push('\n');
+            for line in &kept_lines {
+                repaired.push_str(line);
+                repaired.push('\n');
+            }
+            let fs = storage.fs.clone();
+            let path_owned = path.to_string();
+            publish_file_atomically(&fs, &path_owned, |fs, temp_path| {
+                let repaired = repaired.clone();
+                let path_owned = path_owned.clone();
+                Box::pin(async move {
+                    file_result(
+                        fs.write_file(temp_path, FileContent::Text(repaired), None)
+                            .await,
+                        &format!("Failed to stage session repair {path_owned}"),
+                    )?;
+                    Ok(())
+                })
+            })
+            .await?;
+            return Ok(storage);
         }
         // Repair an unterminated tail (no trailing "\n") so future appends are
         // on their own line.
@@ -267,6 +337,39 @@ impl JsonlSessionStorage {
                 .await,
             &format!("Failed to append session {}", self.metadata.path),
         )
+    }
+}
+
+/// Normalize an entry's parent onto the lane's current leaf before applying.
+///
+/// A valid log always satisfies `entry.parent_id == lane.leaf` (the validator
+/// enforces it), so this is a no-op for well-formed sessions. When two writers
+/// diverge, an entry can land with a parent the local state never reached;
+/// re-chaining onto the leaf recovers the session instead of refusing to open
+/// it. Non-entry mutations and entries without a named lane pass through.
+fn chain_onto_lane_leaf(mutation: SessionMutation, state: &SessionState) -> SessionMutation {
+    if let SessionMutation::Entry {
+        seq,
+        timestamp,
+        lane,
+        mut entry,
+    } = mutation
+    {
+        if let Some(lane_name) = lane.clone() {
+            if let Ok(leaf) = state.require_lane(&lane_name) {
+                if entry.parent_id().map(str::to_string) != leaf {
+                    entry.base_mut().parent_id = leaf;
+                }
+            }
+        }
+        SessionMutation::Entry {
+            seq,
+            timestamp,
+            lane,
+            entry,
+        }
+    } else {
+        mutation
     }
 }
 

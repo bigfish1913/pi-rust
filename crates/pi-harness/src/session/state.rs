@@ -84,6 +84,22 @@ impl SessionState {
         self.sequence + 1
     }
 
+    /// The highest applied mutation seq (0 before any mutation). The JSONL
+    /// loader uses this to detect a duplicated/late append, where a mutation
+    /// arrives with an already-consumed seq.
+    pub(crate) fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    /// Advance the seq counter to `seq` (no-op when already at or past it).
+    /// The JSONL loader calls this when a divergent writer's counter leaves a
+    /// gap, so the next mutation is accepted instead of refused.
+    pub(crate) fn resync_sequence(&mut self, seq: u64) {
+        if seq > self.sequence {
+            self.sequence = seq;
+        }
+    }
+
     pub fn get_lanes(&self) -> Vec<LanePointer> {
         self.lanes
             .iter()
@@ -658,9 +674,6 @@ fn validate_limit(limit: Option<usize>) -> SessionResult<()> {
 #[cfg(test)]
 #[allow(dead_code)] // state introspection helpers for upcoming session_state tests
 impl SessionState {
-    pub(crate) fn sequence(&self) -> u64 {
-        self.sequence
-    }
     pub(crate) fn lanes(&self) -> &BTreeMap<String, Option<String>> {
         &self.lanes
     }
