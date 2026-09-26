@@ -838,15 +838,21 @@ impl Shell for OsExecutionEnv {
             self.active_pids.lock().await.insert(pid);
         }
 
-        // Stdin transport: write command then close.
+        // Stdin transport: write command then close. Closing happens on BOTH
+        // transports, and deliberately: anything that prompts (`npx` asking to
+        // install, `npm init`, a `read` in a script) must see EOF and fail fast,
+        // not block on a pipe that nothing will ever write to or close. tokio's
+        // `Child::wait` also drops stdin as a deadlock guard, but relying on that
+        // would make the guarantee a side effect of an implementation detail.
+        let mut stdin = child.stdin.take();
         if matches!(transport, CommandTransport::Stdin) {
-            if let Some(mut stdin) = child.stdin.take() {
+            if let Some(stdin) = stdin.as_mut() {
                 use tokio::io::AsyncWriteExt;
                 let _ = stdin.write_all(command.as_bytes()).await;
                 let _ = stdin.flush().await;
-                drop(stdin);
             }
         }
+        drop(stdin);
 
         // Collect stdout/stderr via separate read tasks, firing callbacks.
         let mut stdout_buf = String::new();
@@ -964,14 +970,34 @@ impl Shell for OsExecutionEnv {
                     (None, None) => child.wait().await,
                 }
             };
-            // Run stdio + status concurrently.
-            tokio::pin!(status_fut);
-            let (_, _, status_res) = tokio::join!(stdout_task, stderr_task, status_fut);
+            // Run stdio + status concurrently — but the CHILD is the driver:
+            // once it is reaped the command is over, and the call has to end even
+            // if something else still holds the stdout/stderr pipes open.
+            //
+            // This is the "`npm run` 卡住" shape. A script that starts a watcher,
+            // a dev-server or a background daemon leaves a grandchild running with
+            // the inherited pipes, so reading to EOF waits for a process the
+            // command no longer owns. No timeout rescues that: the timeout wraps
+            // `child.wait()` and the child already exited successfully.
+            tokio::pin!(status_fut, stdout_task, stderr_task);
+            let status_res = (&mut status_fut).await;
+            // Drain what is already in the pipe — a completed write is already in
+            // the pipe buffer, so this is not a race — then stop, without waiting
+            // for an EOF that may never come. A command whose own process is gone
+            // should not be able to hold the call open.
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(EXIT_STDIO_GRACE_MS),
+                async {
+                    let _ = tokio::join!(&mut stdout_task, &mut stderr_task);
+                },
+            )
+            .await;
             status_res
         };
 
-        // Give trailing stdio a brief grace period (the streams are already
-        // EOF-driven, so this is mostly belt-and-suspenders for late writes).
+        // Give trailing stdio a brief grace period. Only the timed-out and
+        // cancelled paths still owe a wait: on the normal path the drain above
+        // already capped it.
         if timed_out {
             let _ = tokio::time::sleep(std::time::Duration::from_millis(EXIT_STDIO_GRACE_MS)).await;
         }

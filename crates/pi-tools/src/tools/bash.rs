@@ -242,8 +242,14 @@ impl AgentTool for BashTool {
         }
         if let Some(ee) = &capture.execution_error {
             if ee.code == ExecutionErrorCode::Timeout {
+                // `timeout` is `Option<f64>` in seconds; `{timeout:?}` used to render
+                // `Some(2.0)`, so the message read "timed out after Some(2.0) seconds".
+                let limit = match timeout {
+                    Some(secs) => format!("after {secs}s"),
+                    None => "".to_string(),
+                };
                 return Err(AgentError::Tool(append_status(format!(
-                    "Command timed out after {timeout:?} seconds"
+                    "Command timed out {limit}"
                 ))));
             }
             return Err(AgentError::Tool(ee.to_string()));
