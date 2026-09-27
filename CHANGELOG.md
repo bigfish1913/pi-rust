@@ -11,6 +11,8 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-09-27
+
 ### Added
 
 - **Long pastes fold into a `[paste #N …]` marker instead of flooding the
