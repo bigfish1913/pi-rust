@@ -857,6 +857,12 @@ pub enum RuntimeActionId {
     /// empty/absent `value` clears that key. Result: `{"ok":true,"changed":bool}`.
     /// Headless hosts accept the write but have nothing to render.
     SetStatus = 18,
+    /// Put text into the interactive editor (the prompt input box) instead of
+    /// sending it. Args: `{"text":"...", "mode":"append"|"replace",
+    /// "autoSendMs": 3000}` (omit/`0` for manual send only). Result:
+    /// `{"ok":true,"chars":N}`. A headless host has no editor and accepts the
+    /// write without rendering it, mirroring [`RuntimeActionId::SetStatus`].
+    SetEditorText = 19,
 }
 
 /// Error returned when a plugin passes a numeric runtime-action id that this
@@ -896,6 +902,7 @@ impl TryFrom<u32> for RuntimeActionId {
             16 => Ok(Self::GetCliFlag),
             17 => Ok(Self::UiDialog),
             18 => Ok(Self::SetStatus),
+            19 => Ok(Self::SetEditorText),
             other => Err(UnknownRuntimeActionId(other)),
         }
     }
@@ -1964,6 +1971,7 @@ mod tests {
             RuntimeActionId::GetCliFlag,
             RuntimeActionId::UiDialog,
             RuntimeActionId::SetStatus,
+            RuntimeActionId::SetEditorText,
         ];
 
         for (raw, expected) in ids.into_iter().enumerate() {
@@ -1973,8 +1981,8 @@ mod tests {
         // One past the highest defined id is rejected (nothing is silently
         // accepted), and so is the u32 ceiling.
         assert_eq!(
-            RuntimeActionId::try_from(19),
-            Err(UnknownRuntimeActionId(19))
+            RuntimeActionId::try_from(20),
+            Err(UnknownRuntimeActionId(20))
         );
         assert_eq!(
             RuntimeActionId::try_from(u32::MAX),

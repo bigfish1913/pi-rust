@@ -663,6 +663,100 @@ fn dispatch_ui_prompt_event_end(state: &TuiState) {
     }
 }
 
+/// Canonical key name for a key event, matching the vocabulary
+/// [`parse_configured_key`] accepts (`"space"`, `"enter"`, `"f1"`, `"a"`).
+/// `None` for keys that cannot be named (media keys, unknown codes).
+fn key_shortcut_name(code: KeyCode) -> Option<&'static str> {
+    Some(match code {
+        KeyCode::Char(' ') => "space",
+        KeyCode::Enter => "enter",
+        KeyCode::Esc => "escape",
+        KeyCode::Tab => "tab",
+        KeyCode::BackTab => "backtab",
+        KeyCode::Backspace => "backspace",
+        KeyCode::Delete => "delete",
+        KeyCode::Up => "up",
+        KeyCode::Down => "down",
+        KeyCode::Left => "left",
+        KeyCode::Right => "right",
+        KeyCode::Home => "home",
+        KeyCode::End => "end",
+        KeyCode::PageUp => "pageup",
+        KeyCode::PageDown => "pagedown",
+        _ => return None,
+    })
+}
+
+/// Lower-case name for a printable ASCII key (`a`, `1`, `,`), or `None` when the
+/// key needs a dedicated name from [`key_shortcut_name`].
+fn char_shortcut_name(ch: char) -> Option<String> {
+    if ch.is_ascii_graphic() {
+        Some(ch.to_ascii_lowercase().to_string())
+    } else {
+        None
+    }
+}
+
+/// Route one key event to extension `Input` handlers when the key is claimed as
+/// a shortcut. Returns `true` when the key was claimed (the caller must then
+/// skip normal editor handling).
+///
+/// Only keys an extension explicitly claimed via `register_shortcut` are
+/// routed, and only while the editor is empty, so a claimed key never steals
+/// ordinary typing. Press **and** Release (and Repeat) are dispatched, which is
+/// what lets a push-to-talk extension measure how long a key was held — the
+/// normal editor path deliberately drops Release.
+fn dispatch_key_event(state: &TuiState, key: &KeyEvent, editor: &Editor) -> bool {
+    use rpi_plugin_sdk::EventTag;
+
+    let name = key_shortcut_name(key.code)
+        .map(str::to_string)
+        .or_else(|| match key.code {
+            KeyCode::Char(ch) => char_shortcut_name(ch),
+            KeyCode::F(n) => Some(format!("f{n}")),
+            _ => None,
+        });
+    let Some(name) = name else {
+        return false;
+    };
+
+    let Ok(session) = state.extension_session.lock() else {
+        return false;
+    };
+    let Some(snapshot) = session.snapshot_arc() else {
+        return false;
+    };
+    // Nothing claimed this key (or nobody subscribes to Input) — not ours.
+    if !snapshot.has_shortcut(&name) || snapshot.handlers_for(EventTag::Input).is_empty() {
+        return false;
+    }
+    // Only claim the key while the editor is empty: with a draft in progress the
+    // key belongs to typing (space especially).
+    if !editor.get_text().is_empty() {
+        return false;
+    }
+
+    let kind = match key.kind {
+        KeyEventKind::Press => "press",
+        KeyEventKind::Repeat => "repeat",
+        KeyEventKind::Release => "release",
+    };
+    let payload = serde_json::json!({
+        "type": "key",
+        "key": name,
+        "kind": kind,
+        "ctrl": key.modifiers.contains(KeyModifiers::CONTROL),
+        "alt": key.modifiers.contains(KeyModifiers::ALT),
+        "shift": key.modifiers.contains(KeyModifiers::SHIFT),
+    })
+    .to_string();
+    // The handler decides whether it actually wants the key: it returns the
+    // `CLAIMED` code while its feature is active and `CONTINUE` otherwise, so a
+    // registered-but-disabled shortcut (push-to-talk toggled off) still lets the
+    // key reach the editor normally.
+    rpi_extensions::dispatch_data_event_claiming(&snapshot, EventTag::Input, &payload)
+}
+
 /// Resolve the command for a `/`-prefixed input and run it, or emit the
 /// unknown-command error if nothing matches. Non-slash text never reaches here
 /// — callers route only `/`-prefixed inputs and send plain text directly.
@@ -5185,7 +5279,7 @@ impl TuiState {
                 // Reflect the in-flight turn in the terminal window/tab title
                 // (OSC 2). No-op when `tui` is absent (unit tests).
                 if let Some(tui) = &self.tui {
-                    tui.set_title("🦀π rpi ⟳");
+                    tui.set_title(&crate::brand::window_title("⟳"));
                 }
                 self.status_container.clear();
                 // The working indicator renders inside the editor's top border.
@@ -5211,7 +5305,7 @@ impl TuiState {
             RunStatus::Idle => {
                 self.footer.set_status("");
                 if let Some(tui) = &self.tui {
-                    tui.set_title("🦀π rpi");
+                    tui.set_title(&crate::brand::window_title(""));
                 }
                 self.loader.stop();
                 self.status_container.clear();
@@ -5257,7 +5351,7 @@ impl TuiState {
         *self.status.lock().unwrap() = RunStatus::Working;
         self.footer.set_status("");
         if let Some(tui) = &self.tui {
-            tui.set_title("🦀π rpi ↻");
+            tui.set_title(&crate::brand::window_title("↻"));
         }
         self.loader.stop();
         self.status_container.clear();
@@ -6421,12 +6515,23 @@ pub async fn interactive_tui(
                             continue;
                         }
                     }
-                    editor_for_key.insert(&text);
+                    editor_for_key.handle_paste(&text);
                     refresh_autocomplete(&state_for_key, &editor_for_key);
                     tui_for_key.request_render_reusing_scroll_content();
                 }
                 continue;
             };
+            // Diagnostic trace (off unless RPI_DEBUG_KEYS is set): records what
+            // actually arrived before any routing decision, so a client that
+            // sends LF for Enter is visible as `Char('j') mods=CONTROL`.
+            crate::key_trace::key(&key, "");
+            // Extension shortcuts see Press *and* Release (this is what lets a
+            // push-to-talk extension time a hold). Checked before the
+            // release-drop below; a claimed key with an empty editor is routed
+            // to the plugin's `Input` handler instead of the editor.
+            if dispatch_key_event(&state_for_key, &key, &editor_for_key) {
+                continue;
+            }
             // Drop releases but preserve Repeat so holding arrows, Backspace,
             // PageUp, etc. behaves naturally. Windows emits Press + Release
             // for a tap; terminals with keyboard enhancement may additionally
@@ -6434,10 +6539,6 @@ pub async fn interactive_tui(
             if !should_dispatch_key(key.kind) {
                 continue;
             }
-            // Diagnostic trace (off unless RPI_DEBUG_KEYS is set): records what
-            // actually arrived before any routing decision, so a client that
-            // sends LF for Enter is visible as `Char('j') mods=CONTROL`.
-            crate::key_trace::key(&key, "");
 
             // Prompt preparation runs on a blocking worker before the agent
             // lane owns the turn. Cancel it directly: an abort queued only to
@@ -6568,10 +6669,16 @@ pub async fn interactive_tui(
                                 &tui_for_key,
                             );
                         }
-                        let lane = lane_for_key.clone();
-                        tokio::spawn(async move {
-                            let _ = lane.abort().await;
-                        });
+                        // Pull queued steering/follow-up messages back into the
+                        // editor BEFORE aborting (native pi's
+                        // `restoreQueuedMessagesToEditor({abort:true})`), so a
+                        // cancel never silently swallows staged messages.
+                        abort_run_restoring_queue(
+                            lane_for_key.clone(),
+                            editor_for_key.clone(),
+                            state_for_key.clone(),
+                            tui_for_key.clone(),
+                        );
                     }
                     // A held Ctrl+C can emit Repeat immediately after Press.
                     // Keep waiting for the in-flight cancellation instead of
@@ -6651,10 +6758,12 @@ pub async fn interactive_tui(
                                 &tui_for_key,
                             );
                         }
-                        let lane = lane_for_key.clone();
-                        tokio::spawn(async move {
-                            let _ = lane.abort().await;
-                        });
+                        abort_run_restoring_queue(
+                            lane_for_key.clone(),
+                            editor_for_key.clone(),
+                            state_for_key.clone(),
+                            tui_for_key.clone(),
+                        );
                         continue;
                     }
                     RunStatus::Aborting => continue,
@@ -6694,10 +6803,14 @@ pub async fn interactive_tui(
                             &tui_for_key,
                         );
                     }
-                    let lane = lane_for_key.clone();
-                    tokio::spawn(async move {
-                        let _ = lane.abort().await;
-                    });
+                    // Native pi's `onEscape` restores the queue before it
+                    // aborts, so an interrupt hands the staged messages back.
+                    abort_run_restoring_queue(
+                        lane_for_key.clone(),
+                        editor_for_key.clone(),
+                        state_for_key.clone(),
+                        tui_for_key.clone(),
+                    );
                     continue;
                 }
                 // A running `!command` takes Esc next (native pi's `onEscape`
@@ -6740,7 +6853,7 @@ pub async fn interactive_tui(
                 &key,
                 rpi_tui::keybindings::keys::EXTERNAL_EDITOR,
             ) {
-                launch_external_editor(editor_for_key.get_text(), tx_for_key.clone());
+                launch_external_editor(editor_for_key.get_expanded_text(), tx_for_key.clone());
                 continue;
             }
 
@@ -6889,7 +7002,7 @@ pub async fn interactive_tui(
                 if cfg!(windows) {
                     if let Some(text) = read_clipboard_text() {
                         if !text.is_empty() {
-                            editor_for_key.insert(&text);
+                            editor_for_key.handle_paste(&text);
                             refresh_autocomplete(&state_for_key, &editor_for_key);
                             tui_for_key.request_render_reusing_scroll_content();
                             continue;
@@ -7057,7 +7170,10 @@ pub async fn interactive_tui(
                 // Alt+Q therefore looked like a no-op while it was most needed.
                 // Spawn the drain so it lands while the user is still looking at
                 // the queue, exactly like the Alt+Enter `follow_up` path above.
-                tokio::spawn(restore_queued_messages_to_editor(
+                // Routed through `handle_dequeue` (not the raw restore) so the
+                // `Restored N queued message(s)` status note fires, mirroring
+                // native pi's `handleDequeue`.
+                tokio::spawn(handle_dequeue(
                     lane_for_key.clone(),
                     editor_for_key.clone(),
                     state_for_key.clone(),
@@ -7070,7 +7186,7 @@ pub async fn interactive_tui(
             // handled here because Editor treats only a bare Enter as submit;
             // idle Alt+Enter keeps the normal prompt behavior.
             if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Enter {
-                let prompt = editor_for_key.get_text().trim().to_string();
+                let prompt = editor_for_key.get_expanded_text().trim().to_string();
                 if prompt.is_empty() {
                     continue;
                 }
@@ -8151,9 +8267,20 @@ fn merge_queued_into_draft(queued_text: &str, current: &str) -> String {
     }
 }
 
-/// `app.message.dequeue`: drain every queued steering/follow-up message out of
-/// the lane and restore it to the editor so the user can edit before resending
-/// (native pi's `restoreQueuedMessagesToEditor`).
+/// Place the caret at the END of `text` after `set_text`. `set_text` resets the
+/// caret to `(0, 0)`, and the last line's **byte** length is the right column:
+/// a char count was wrong for multibyte drafts, and row 0 was wrong for a
+/// multi-line one (native pi's `setTextInternal(text, "end")`).
+fn set_editor_text_caret_at_end(editor: &Arc<Editor>, text: &str) {
+    editor.set_text(text);
+    let last_row = text.split('\n').count().saturating_sub(1);
+    let last_len = text.split('\n').next_back().map(str::len).unwrap_or(0);
+    editor.set_cursor(last_row, last_len);
+}
+
+/// Drain every queued steering/follow-up message out of the lane and restore it
+/// to the editor (native pi's `restoreQueuedMessagesToEditor`). Returns how many
+/// were restored; the queue is consumed either way, so the dock drops its rows.
 ///
 /// Runs on a spawned task rather than through the [`TuiMessage`] mailbox: the
 /// async main loop owns `run_prompt_streaming(..).await` for the whole run, and
@@ -8165,7 +8292,7 @@ async fn restore_queued_messages_to_editor(
     editor: Arc<Editor>,
     state: Arc<TuiState>,
     tui: Arc<TuiAltScreen>,
-) {
+) -> usize {
     match lane.clear_queue().await {
         Ok(queued) => {
             let all: Vec<String> = queued
@@ -8176,23 +8303,77 @@ async fn restore_queued_messages_to_editor(
                 .collect();
             if !all.is_empty() {
                 let queued_text = all.join("\n\n");
-                let current = editor.get_text();
+                // Read the EXPANDED draft: `set_text` below clears the folded
+                // paste store, so any `[paste #id …]` marker still in the
+                // editor must be materialized first or it would be left behind
+                // as literal text.
+                let current = editor.get_expanded_text();
                 let combined = merge_queued_into_draft(&queued_text, &current);
-                let cursor = combined.chars().count();
-                editor.set_text(&combined);
-                editor.set_cursor(0, cursor);
+                set_editor_text_caret_at_end(&editor, &combined);
             }
             // The lane drained the queue; refresh so the dock drops the rows.
             refresh_pending_messages(&state, &lane).await;
+            tui.request_render(false);
+            all.len()
         }
         Err(error) => {
             add_error_message(
                 &state.chat_container,
                 &format!("Could not restore queued messages: {error}"),
             );
+            tui.request_render(false);
+            0
         }
     }
+}
+
+/// `app.message.dequeue`: restore the queued messages and report the count, like
+/// native pi's `handleDequeue` (`Restored N queued message(s)` / `No queued
+/// messages to restore`). The status is a dim transcript note (rpi's analog of
+/// native `showStatus`).
+async fn handle_dequeue(
+    lane: Arc<dyn AgentLane>,
+    editor: Arc<Editor>,
+    state: Arc<TuiState>,
+    tui: Arc<TuiAltScreen>,
+) {
+    let restored =
+        restore_queued_messages_to_editor(lane, editor, state.clone(), tui.clone()).await;
+    if restored == 0 {
+        add_note_message(&state.chat_container, "No queued messages to restore");
+    } else {
+        let plural = if restored > 1 { "s" } else { "" };
+        add_note_message(
+            &state.chat_container,
+            &format!("Restored {restored} queued message{plural} to editor"),
+        );
+    }
     tui.request_render(false);
+}
+
+/// Cancel the active run the native-pi way: pull every queued steering /
+/// follow-up message back into the editor FIRST, then abort. Native pi's
+/// `onEscape` does exactly this during streaming
+/// (`restoreQueuedMessagesToEditor({abort: true})`), so a cancel never silently
+/// swallows messages the user staged while the run was in flight — they land in
+/// the editor to be re-edited or resent.
+fn abort_run_restoring_queue(
+    lane: Arc<dyn AgentLane>,
+    editor: Arc<Editor>,
+    state: Arc<TuiState>,
+    tui: Arc<TuiAltScreen>,
+) {
+    tokio::spawn(async move {
+        let _ = restore_queued_messages_to_editor(
+            lane.clone(),
+            editor,
+            state,
+            tui.clone(),
+        )
+        .await;
+        let _ = lane.abort().await;
+        tui.request_render(false);
+    });
 }
 
 async fn drain_agent_events(

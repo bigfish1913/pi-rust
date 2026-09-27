@@ -85,6 +85,7 @@ pub use registry::{
     ResourcesDiscoverHandler, DEFAULT_PRIORITY,
 };
 pub use resources::{emit_resources_discover, DiscoveredResources};
+pub use editor_text::{EditorTextEdit, EditorTextMailbox, EditorTextMode};
 pub use status::ExtensionStatusMailbox;
 pub use tool::{PluginToolAdapter, PluginToolHandle, ToolCallContext};
 pub use translate::{
@@ -93,6 +94,7 @@ pub use translate::{
 };
 
 mod actions;
+mod editor_text;
 mod event_log;
 mod loader;
 mod provider;

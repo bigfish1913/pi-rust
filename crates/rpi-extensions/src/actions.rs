@@ -419,6 +419,10 @@ pub struct ActionBridge {
     /// Shared with the TUI, which polls [`ExtensionStatusMailbox::revision`]
     /// and repaints the footer only when an extension actually wrote.
     ext_status: crate::status::ExtensionStatusMailbox,
+    /// Session-scoped editor-text queue (`SetEditorText` runtime action). Shared
+    /// with the TUI, which drains it once per tick and writes the draft into the
+    /// prompt editor.
+    editor_text: crate::editor_text::EditorTextMailbox,
     /// B5d staleness flag. Shared so [`invalidate`] flips it for every clone.
     /// `true` while this bridge is the live session's bridge.
     active: Arc<AtomicBool>,
@@ -434,6 +438,7 @@ impl ActionBridge {
             reload: None,
             ui_dialog: UiDialogMailbox::new(),
             ext_status: crate::status::ExtensionStatusMailbox::new(),
+            editor_text: crate::editor_text::EditorTextMailbox::new(),
             active: Arc::new(AtomicBool::new(true)),
         })
     }
@@ -451,6 +456,7 @@ impl ActionBridge {
             reload,
             UiDialogMailbox::new(),
             crate::status::ExtensionStatusMailbox::new(),
+            crate::editor_text::EditorTextMailbox::new(),
         )
     }
 
@@ -466,6 +472,7 @@ impl ActionBridge {
             reload: None,
             ui_dialog,
             ext_status: crate::status::ExtensionStatusMailbox::new(),
+            editor_text: crate::editor_text::EditorTextMailbox::new(),
             active: Arc::new(AtomicBool::new(true)),
         })
     }
@@ -477,6 +484,7 @@ impl ActionBridge {
         reload: Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>,
         ui_dialog: UiDialogMailbox,
         ext_status: crate::status::ExtensionStatusMailbox,
+        editor_text: crate::editor_text::EditorTextMailbox,
     ) -> Arc<Self> {
         Arc::new(Self {
             runtime,
@@ -484,6 +492,7 @@ impl ActionBridge {
             reload: Some(reload),
             ui_dialog,
             ext_status,
+            editor_text,
             active: Arc::new(AtomicBool::new(true)),
         })
     }
@@ -496,6 +505,11 @@ impl ActionBridge {
     /// Clone the session status registry (TUI rendering + reload-created bridges).
     pub fn extension_status_mailbox(&self) -> crate::status::ExtensionStatusMailbox {
         self.ext_status.clone()
+    }
+
+    /// Clone the session editor-text queue (TUI drain + reload-created bridges).
+    pub fn editor_text_mailbox(&self) -> crate::editor_text::EditorTextMailbox {
+        self.editor_text.clone()
     }
 
     /// Mark this bridge stale (B5d). A `/reload` that swaps in a fresh bridge
@@ -603,7 +617,7 @@ pub fn reload_callback_from_mailbox(
 // naturally Send+Sync; no manual unsafe impl needed.
 
 /// Dispatch one action to the host. Async — runs on the bridge's runtime.
-/// Handles all 18 ids; `Reload` delegates to [`RuntimeActionHost::reload`]
+/// Handles all 19 ids; `Reload` delegates to [`RuntimeActionHost::reload`]
 /// (the "no callback configured" fallback). When the bridge has a reload
 /// callback, the spawn site intercepts `Reload` and awaits the callback
 /// instead (a CLI concern, not a harness op) — this helper is the plain
@@ -612,6 +626,7 @@ async fn dispatch(
     host: &Arc<dyn RuntimeActionHost>,
     ui_dialog: &UiDialogMailbox,
     ext_status: &crate::status::ExtensionStatusMailbox,
+    editor_text: &crate::editor_text::EditorTextMailbox,
     action: RuntimeActionId,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
@@ -637,6 +652,9 @@ async fn dispatch(
         // UI-only action: handled by the bridge (no harness call), exactly like
         // `UiDialog`. Written straight into the shared registry the TUI polls.
         RuntimeActionId::SetStatus => ext_status.handle(args),
+        // Editor-only action: served by the bridge (no harness call), exactly
+        // like `SetStatus`/`UiDialog`. The TUI drains the queue each tick.
+        RuntimeActionId::SetEditorText => editor_text.handle(args),
     }
 }
 
@@ -778,6 +796,7 @@ fn run_action(
     let host = Arc::clone(&bridge.host);
     let ui_dialog = bridge.ui_dialog.clone();
     let ext_status = bridge.ext_status.clone();
+    let editor_text = bridge.editor_text.clone();
     let reload_cb = bridge.reload.clone();
     if action == RuntimeActionId::SetStatus {
         // Same reasoning as `UiDialog`: this action never touches the harness,
@@ -786,6 +805,12 @@ fn run_action(
         // park that executor and deadlock.
         std::thread::spawn(move || {
             let _ = tx.send(ext_status.handle(args));
+        });
+    } else if action == RuntimeActionId::SetEditorText {
+        // Editor-only, like `SetStatus`: no harness call, so keep it off the
+        // Tokio worker for the same single-thread-runtime reason.
+        std::thread::spawn(move || {
+            let _ = tx.send(editor_text.handle(args));
         });
     } else if action == RuntimeActionId::UiDialog {
         // UiDialog is intentionally synchronous at the plugin ABI boundary:
@@ -806,7 +831,7 @@ fn run_action(
                     host.reload(args).await
                 }
             } else {
-                dispatch(&host, &ui_dialog, &ext_status, action, args).await
+                dispatch(&host, &ui_dialog, &ext_status, &editor_text, action, args).await
             };
             // If the plugin thread already moved on (dropped rx), discard — a
             // send error is NOT a host fault.
@@ -1346,6 +1371,7 @@ mod tests {
             Arc::new(|| Box::pin(async {})),
             UiDialogMailbox::new(),
             status.clone(),
+            crate::editor_text::EditorTextMailbox::new(),
         );
         let user_data = Arc::as_ptr(&bridge) as *mut c_void;
 

@@ -340,12 +340,18 @@ pub async fn build(
     // The bridge lets plugins write; the TUI polls the revision and repaints its
     // footer. Reused across `/reload` so a plugin's status survives the swap.
     let ext_status_mailbox = rpi_extensions::ExtensionStatusMailbox::new();
+    // Session-scoped editor-text queue (runtime action 19 / `SetEditorText`).
+    // The bridge lets a plugin drop a draft into the prompt editor; the TUI
+    // drains it each tick. Reused across `/reload` so a pending transcription
+    // survives a plugin swap.
+    let editor_text_mailbox = rpi_extensions::EditorTextMailbox::new();
     let action_bridge = rpi_extensions::ActionBridge::with_reload_and_ui(
         runtime.clone(),
         host_arc,
         rpi_extensions::reload_callback_from_mailbox(reload_mailbox.clone()),
         ui_dialog_mailbox.clone(),
         ext_status_mailbox.clone(),
+        editor_text_mailbox.clone(),
     );
 
     // ---- Execution env + tools ----
@@ -960,6 +966,7 @@ pub async fn build(
         mailbox: reload_mailbox,
         ui_dialog: ui_dialog_mailbox,
         ext_status: ext_status_mailbox,
+        editor_text: editor_text_mailbox,
         dev_extension: None,
     };
 
@@ -1045,6 +1052,13 @@ pub struct ReloadContext {
     /// The extension status registry the TUI renders in its footer (`SetStatus`).
     /// Lives in the context (not the cell) so it survives a bridge swap.
     pub ext_status: rpi_extensions::ExtensionStatusMailbox,
+    /// The extension editor-text queue the TUI drains into the prompt editor
+    /// (`SetEditorText`, runtime action 19). Lives in the context (not the cell)
+    /// so it survives a bridge swap — exactly like `ext_status`. A voice plugin
+    /// writes a transcription here as a *draft*; the TUI applies it, starts the
+    /// optional auto-send countdown, and submits through the normal path so the
+    /// user bubble renders as usual.
+    pub editor_text: rpi_extensions::EditorTextMailbox,
     /// The model catalog (read-only) the host uses to resolve `set_model(id)`.
     /// `available_catalog(resolved)` is captured once — reload does not re-resolve
     /// the provider (auth/provider resolution is a startup concern; reloading
@@ -1281,6 +1295,7 @@ where
         reload_cb,
         ctx.ui_dialog.clone(),
         ctx.ext_status.clone(),
+        ctx.editor_text.clone(),
     );
 
     let extension_session = if effective_args.no_extensions {

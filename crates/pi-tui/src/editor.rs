@@ -3,6 +3,8 @@
 //! Provides a text editor with cursor positioning, selection, and keyboard input.
 
 use std::any::Any;
+use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 
 use crossterm::event::{KeyCode, KeyModifiers};
@@ -111,6 +113,82 @@ fn snap_boundary(s: &str, idx: usize) -> usize {
         .unwrap_or(0)
 }
 
+/// A folded store of a large paste, keyed by the id rendered in its marker.
+/// The document (`EditorState::lines`) only ever carries the short
+/// `[paste #id …]` marker; the real text lives here until the draft is
+/// submitted, at which point [`Editor::get_expanded_text`] splices it back in.
+#[derive(Debug, Clone)]
+struct PasteEntry {
+    content: String,
+}
+
+/// Matches a whole `[paste #id …]` marker (group 1 = id).
+fn paste_marker_regex() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"\[paste #(\d+)( (\+\d+ lines|\d+ chars))?\]").unwrap())
+}
+
+/// The byte length of the `[paste #id …]` marker ending exactly at `end`
+/// (`end` is a byte offset in `line`), or `0` when no marker ends there.
+fn paste_marker_len_ending_at(line: &str, end: usize) -> usize {
+    for m in paste_marker_regex().find_iter(line) {
+        if m.end() == end {
+            return m.as_str().len();
+        }
+    }
+    0
+}
+
+/// A paste folds when it exceeds either threshold (native pi's `handlePaste`).
+const PASTE_FOLD_LINE_THRESHOLD: usize = 10;
+const PASTE_FOLD_CHAR_THRESHOLD: usize = 1000;
+
+/// Replace every `[paste #id …]` marker in `document` with its stashed body
+/// (native pi's `expandPasteMarkers`). Markers whose id is absent from
+/// `pastes` are left as-is so a stray marker never silently vanishes.
+fn expand_paste_markers(document: &str, pastes: &HashMap<u32, PasteEntry>) -> String {
+    if pastes.is_empty() || !document.contains("[paste #") {
+        return document.to_string();
+    }
+    paste_marker_regex()
+        .replace_all(document, |caps: &regex::Captures| {
+            let id: u32 = caps[1].parse().unwrap_or(0);
+            match pastes.get(&id) {
+                Some(entry) => entry.content.clone(),
+                None => caps[0].to_string(),
+            }
+        })
+        .into_owned()
+}
+
+/// Decode the kitty CSI-u form a client may emit for `Ctrl+<letter>`
+/// (`ESC[<code>;5u`), which native pi decodes before folding
+/// (`handlePaste`). Scalars that are not a `Ctrl+letter` chord are left as-is.
+fn decode_csi_u_ctrl(text: &str) -> String {
+    if !text.contains("\x1b[") {
+        return text.to_string();
+    }
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| regex::Regex::new(r"\x1b\[(\d+);5u").unwrap());
+    re.replace_all(text, |caps: &regex::Captures| {
+        let code: u32 = caps[1].parse().unwrap_or(0);
+        let lower = 0x61..=0x7a;
+        let upper = 0x41..=0x5a;
+        if lower.contains(&code) {
+            char::from_u32(code - 96)
+                .map(String::from)
+                .unwrap_or_default()
+        } else if upper.contains(&code) {
+            char::from_u32(code - 64)
+                .map(String::from)
+                .unwrap_or_default()
+        } else {
+            caps[0].to_string()
+        }
+    })
+    .into_owned()
+}
+
 /// Split a logical editor line into terminal-width chunks. The editor keeps
 /// logical lines for editing and cursor movement; wrapping is strictly a
 /// rendering concern so a long draft cannot escape the bordered input box.
@@ -198,6 +276,11 @@ pub struct Editor {
     /// When `Some`, the top border line renders the spinner + elapsed + message
     /// instead of plain `─` characters (pi's working-inside-input-border style).
     working: Mutex<Option<WorkingState>>,
+    /// Folded pastes: `id -> content`, referenced by a `[paste #id …]` marker
+    /// in `state.lines`. Mirrors native pi's `pastes` map.
+    pastes: Mutex<HashMap<u32, PasteEntry>>,
+    /// Monotonic id source for [`Self::pastes`] (native pi's `pasteCounter`).
+    paste_counter: Mutex<u32>,
 }
 
 /// State for the working indicator embedded in the editor's top border.
@@ -211,13 +294,16 @@ pub struct WorkingState {
     pub message: String,
 }
 
-/// A restorable editor state snapshot (text + caret). Selection/scroll/focus
-/// are not part of undo (mirrors the TS `EditorSnapshot` minus paste state).
+/// A restorable editor state snapshot (text + caret, plus the folded paste
+/// store so undo can resurrect a marker's content). Selection/scroll/focus
+/// are not part of undo (mirrors the TS `EditorSnapshot`).
 #[derive(Clone)]
 struct EditorSnapshot {
     lines: Vec<String>,
     cursor_row: usize,
     cursor_col: usize,
+    pastes: HashMap<u32, PasteEntry>,
+    paste_counter: u32,
 }
 
 impl Editor {
@@ -245,6 +331,8 @@ impl Editor {
             jump_mode: Mutex::new(None),
             border_color: Mutex::new(None),
             working: Mutex::new(None),
+            pastes: Mutex::new(HashMap::new()),
+            paste_counter: Mutex::new(0),
         }
     }
 
@@ -271,16 +359,150 @@ impl Editor {
             state.cursor_row = 0;
             state.cursor_col = 0;
         }
+        // A programmatic replacement discards any folded pastes: the new text
+        // is the whole truth (mirrors native pi's `setText` clearing `pastes`).
+        self.reset_pastes();
         // Mirrors native `setTextInternal`: programmatic replacement is a change.
         self.notify_change();
     }
 
-    /// Get the text content.
+    /// Get the text content **as shown**: folded large pastes appear as their
+    /// `[paste #id …]` marker, not their full body. This is the right source
+    /// for UI state that reasons about what is on screen (autocomplete,
+    /// empty-checks). Use [`Self::get_expanded_text`] for anything that must
+    /// see the user's real content.
     pub fn get_text(&self) -> String {
         self.state
             .lock()
             .map(|s| s.lines.join("\n"))
             .unwrap_or_default()
+    }
+
+    /// Get the text content **with folded pastes expanded** (native pi's
+    /// `getExpandedText`): every `[paste #id …]` marker is replaced by the full
+    /// pasted body. Submission, the external editor and extension reads all go
+    /// through here so a folded paste is never sent truncated.
+    pub fn get_expanded_text(&self) -> String {
+        let document = self.get_text();
+        let pastes = self.pastes.lock().map(|p| p.clone()).unwrap_or_default();
+        expand_paste_markers(&document, &pastes)
+    }
+
+    /// Clear the folded-paste store and reset the id counter.
+    fn reset_pastes(&self) {
+        if let Ok(mut pastes) = self.pastes.lock() {
+            pastes.clear();
+        }
+        if let Ok(mut counter) = self.paste_counter.lock() {
+            *counter = 0;
+        }
+    }
+
+    /// The folded-paste id whose marker starts exactly at byte offset
+    /// `start` on line `row`, if any.
+    fn paste_id_at_marker_start(&self, row: usize, start: usize) -> Option<u32> {
+        let state = self.state.lock().ok()?;
+        let line = state.lines.get(row)?;
+        paste_marker_regex()
+            .captures_iter(line)
+            .find(|caps| caps.get(0).unwrap().start() == start)
+            .and_then(|caps| caps[1].parse::<u32>().ok())
+    }
+
+    /// Drop a folded paste and renumber the higher ids down by one so the
+    /// markers left in the document stay contiguous (native pi renumbers in
+    /// `handleBackspace`). Also rewrites the surviving markers in place.
+    fn remove_paste(&self, id: u32) {
+        {
+            let mut pastes = self.pastes.lock().unwrap();
+            if pastes.remove(&id).is_none() {
+                return;
+            }
+            let higher: Vec<u32> = pastes.keys().copied().filter(|k| *k > id).collect();
+            for old in higher {
+                if let Some(entry) = pastes.remove(&old) {
+                    pastes.insert(old - 1, entry);
+                }
+            }
+        }
+        {
+            let mut counter = self.paste_counter.lock().unwrap();
+            *counter = counter.saturating_sub(1);
+        }
+        // Rewrite the markers still in the document: ids above the removed one
+        // shift down by one, matching the renumbered store.
+        if let Ok(mut state) = self.state.lock() {
+            for line in state.lines.iter_mut() {
+                *line = paste_marker_regex()
+                    .replace_all(line, |caps: &regex::Captures| {
+                        let n: u32 = caps[1].parse().unwrap_or(0);
+                        if n <= id {
+                            caps[0].to_string()
+                        } else {
+                            // Group 2 already carries the leading space + suffix.
+                            let suffix = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+                            format!("[paste #{}{suffix}]", n - 1)
+                        }
+                    })
+                    .into_owned();
+            }
+        }
+    }
+
+    /// Fold a pasted block: short pastes are inserted verbatim; a block over
+    /// the size threshold is stashed and replaced by a `[paste #id …]` marker
+    /// so the input box stays readable. Mirrors native pi's `handlePaste`
+    /// (fold when `>10` lines or `>1000` chars).
+    ///
+    /// A single-line pasted file path is special-cased by the caller (image
+    /// attachment), so this only handles text.
+    pub fn handle_paste(&self, text: &str) {
+        // Decode the CSI-u `Ctrl+<letter>` form a client may hand us, and
+        // normalize line endings + tabs (native pi's `normalizeText`).
+        let decoded = decode_csi_u_ctrl(text)
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .replace('\t', "    ");
+        // Drop control characters, keeping newlines (native pi filters
+        // `char === "\n" || char.charCodeAt(0) >= 32`).
+        let filtered: String = decoded
+            .chars()
+            .filter(|c| *c == '\n' || (*c as u32) >= 32)
+            .collect();
+        if filtered.is_empty() {
+            return;
+        }
+
+        let line_count = filtered.split('\n').count();
+        let char_count = filtered.chars().count();
+        if line_count > PASTE_FOLD_LINE_THRESHOLD || char_count > PASTE_FOLD_CHAR_THRESHOLD {
+            self.push_undo("insert");
+            if self.has_selection() {
+                self.delete_selection_no_undo();
+            }
+            let (id, by_lines, count) = {
+                let mut counter = self.paste_counter.lock().unwrap();
+                *counter += 1;
+                let id = *counter;
+                if line_count > PASTE_FOLD_LINE_THRESHOLD {
+                    (id, true, line_count)
+                } else {
+                    (id, false, char_count)
+                }
+            };
+            if let Ok(mut pastes) = self.pastes.lock() {
+                pastes.insert(id, PasteEntry { content: filtered });
+            }
+            let marker = if by_lines {
+                format!("[paste #{id} +{count} lines]")
+            } else {
+                format!("[paste #{id} {count} chars]")
+            };
+            self.insert_no_undo(&marker);
+            *self.last_action.lock().unwrap() = Some("insert");
+        } else {
+            self.insert(&filtered);
+        }
     }
 
     /// Clear the editor.
@@ -291,6 +513,7 @@ impl Editor {
             state.cursor_col = 0;
             state.selection_anchor = None;
         }
+        self.reset_pastes();
         // Native pi's editor notifies change observers for programmatic clears
         // (`setTextInternal`), so derived UI state (bash-mode border color,
         // autocomplete) drops the stale draft. `submit()` relies on this to
@@ -338,13 +561,16 @@ impl Editor {
         }
     }
 
-    /// Snapshot the current text + caret state (for undo/redo).
+    /// Snapshot the current text + caret state (for undo/redo), including the
+    /// folded-paste store so undo can bring a dropped paste back.
     fn snapshot_state(&self) -> EditorSnapshot {
         let state = self.state.lock().unwrap();
         EditorSnapshot {
             lines: state.lines.clone(),
             cursor_row: state.cursor_row,
             cursor_col: state.cursor_col,
+            pastes: self.pastes.lock().map(|p| p.clone()).unwrap_or_default(),
+            paste_counter: self.paste_counter.lock().map(|c| *c).unwrap_or(0),
         }
     }
 
@@ -356,6 +582,12 @@ impl Editor {
             state.cursor_col = snap.cursor_col;
             // Snapshots don't carry the selection; undo/redo ends it.
             state.selection_anchor = None;
+        }
+        if let Ok(mut pastes) = self.pastes.lock() {
+            *pastes = snap.pastes.clone();
+        }
+        if let Ok(mut counter) = self.paste_counter.lock() {
+            *counter = snap.paste_counter;
         }
         self.notify_change();
     }
@@ -631,6 +863,36 @@ impl Editor {
             self.delete_selection();
             return;
         }
+        // Backspacing over a `[paste #id …]` marker deletes the whole marker
+        // (and drops / renumbers the folded pastes). The marker is one atomic
+        // unit — the user cannot nibble it into an orphaned placeholder.
+        let deleted_marker = {
+            let state = self.state.lock().unwrap();
+            let row = state.cursor_row;
+            (state.cursor_col > 0)
+                .then(|| paste_marker_len_ending_at(&state.lines[row], state.cursor_col))
+                .filter(|len| *len > 0)
+                .map(|len| (row, state.cursor_col - len, len))
+        };
+        if let Some((row, start, len)) = deleted_marker {
+            // Snapshot FIRST: `remove_paste` mutates the paste store and
+            // renumbers the surviving markers, so undo must capture the
+            // pre-deletion state to be able to bring them all back.
+            self.push_undo("edit");
+            let id = self.paste_id_at_marker_start(row, start);
+            // Delete the marker text BEFORE renumbering, so the renumber pass
+            // (which can change a marker's byte length when an id crosses
+            // `#10 -> #9`) never has to keep a stale `start..start+len` valid.
+            if let Ok(mut state) = self.state.lock() {
+                state.lines[row].replace_range(start..start + len, "");
+                state.cursor_col = start;
+            }
+            if let Some(id) = id {
+                self.remove_paste(id);
+            }
+            self.notify_change();
+            return;
+        }
         self.push_undo("edit");
         if let Ok(mut state) = self.state.lock() {
             if state.cursor_col > 0 {
@@ -690,6 +952,12 @@ impl Editor {
             if state.cursor_col > 0 {
                 let row = state.cursor_row;
                 let line = &state.lines[row];
+                // A folded paste marker is atomic: step the whole marker.
+                let marker = paste_marker_len_ending_at(line, state.cursor_col);
+                if marker > 0 {
+                    state.cursor_col -= marker;
+                    return;
+                }
                 // Retrear by the byte length of the preceding char so the
                 // caret stays on a char boundary.
                 let prev_len = line[..state.cursor_col]
@@ -711,6 +979,13 @@ impl Editor {
             let row = state.cursor_row;
             let line = &state.lines[row];
             if state.cursor_col < line.len() {
+                // A folded paste marker is atomic: step the whole marker.
+                for m in paste_marker_regex().find_iter(line) {
+                    if m.start() == state.cursor_col {
+                        state.cursor_col = m.end();
+                        return;
+                    }
+                }
                 // Advance by the byte length of the char at the cursor.
                 let ch_len = line[state.cursor_col..]
                     .chars()
@@ -908,7 +1183,9 @@ impl Editor {
 
     /// Submit current text (Enter).
     fn submit(&self) {
-        let text = self.get_text();
+        // Send the EXPANDED draft: a folded `[paste #id …]` marker must reach
+        // the model as the user's real content, not the placeholder.
+        let text = self.get_expanded_text();
         if let Ok(mut state) = self.state.lock() {
             if !text.is_empty() {
                 state.history.push(text.clone());
@@ -1960,5 +2237,169 @@ l12",
         editor.insert("a\r\nb");
         assert_eq!(editor.get_text().matches('\n').count(), 1);
         assert_eq!(editor.get_text(), "a\nb");
+    }
+
+    // ---- Folded pastes (native pi `handlePaste` / `expandPasteMarkers`) ----
+
+    #[test]
+    fn short_paste_is_inserted_verbatim() {
+        let editor = Editor::simple();
+        editor.handle_paste("hello\nworld\nthird");
+        assert_eq!(editor.get_text(), "hello\nworld\nthird");
+        assert_eq!(editor.get_expanded_text(), "hello\nworld\nthird");
+    }
+
+    #[test]
+    fn many_line_paste_folds_to_a_marker() {
+        let editor = Editor::simple();
+        let payload = (1..=12)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        editor.handle_paste(&payload);
+
+        // The document shows only the marker; the body is stashed.
+        assert_eq!(editor.get_text(), "[paste #1 +12 lines]");
+        // Submitting reveals the real content.
+        assert_eq!(editor.get_expanded_text(), payload);
+    }
+
+    #[test]
+    fn long_single_line_paste_folds_by_char_count() {
+        let editor = Editor::simple();
+        let payload = "x".repeat(2000);
+        editor.handle_paste(&payload);
+        assert_eq!(editor.get_text(), "[paste #1 2000 chars]");
+        assert_eq!(editor.get_expanded_text(), payload);
+    }
+
+    #[test]
+    fn pasted_crlf_and_tabs_are_normalized_before_folding() {
+        let editor = Editor::simple();
+        let payload = (1..=12)
+            .map(|i| format!("a\tb{i}"))
+            .collect::<Vec<_>>()
+            .join("\r\n");
+        editor.handle_paste(&payload);
+        let expanded = editor.get_expanded_text();
+        assert!(!expanded.contains('\r'), "CR must be normalized away");
+        assert!(!expanded.contains('\t'), "tab must expand to spaces");
+        assert!(expanded.contains("a    b1"), "tab becomes four spaces");
+        assert_eq!(expanded.split('\n').count(), 12);
+    }
+
+    #[test]
+    fn two_folded_pastes_get_distinct_ids_and_both_expand() {
+        let editor = Editor::simple();
+        let first = "1\n".repeat(11);
+        let second = "2\n".repeat(11);
+        editor.handle_paste(&first);
+        editor.handle_paste(&second);
+        assert_eq!(
+            editor.get_text(),
+            "[paste #1 +12 lines][paste #2 +12 lines]"
+        );
+        assert_eq!(editor.get_expanded_text(), format!("{first}{second}"));
+    }
+
+    #[test]
+    fn backspace_over_a_folded_marker_drops_it_and_renumbers() {
+        let editor = Editor::simple();
+        let first = "a\n".repeat(11);
+        let second = "b\n".repeat(11);
+        editor.handle_paste(&first);
+        editor.handle_paste(&second);
+        assert_eq!(
+            editor.get_text(),
+            "[paste #1 +12 lines][paste #2 +12 lines]"
+        );
+
+        // Delete the FIRST marker: one step left lands the caret right after
+        // marker #1 (markers are adjacent), and Backspace eats it whole.
+        let _ = editor.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::Left,
+            KeyModifiers::NONE,
+        ));
+        let _ = editor.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::Backspace,
+            KeyModifiers::NONE,
+        ));
+
+        // Only the second survives, renumbered to #1, and it still expands.
+        assert_eq!(editor.get_text(), "[paste #1 +12 lines]");
+        assert_eq!(editor.get_expanded_text(), second);
+    }
+
+    #[test]
+    fn undo_restores_a_backspaced_folded_paste() {
+        let editor = Editor::simple();
+        let payload = "line\n".repeat(11);
+        editor.handle_paste(&payload);
+        assert_eq!(editor.get_text(), "[paste #1 +12 lines]");
+
+        let _ = editor.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::Backspace,
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(editor.get_text(), "", "marker deleted");
+
+        // Undo must resurrect both the marker AND its stashed body.
+        editor.undo();
+        assert_eq!(editor.get_text(), "[paste #1 +12 lines]");
+        assert_eq!(editor.get_expanded_text(), payload);
+    }
+
+    #[test]
+    fn cursor_arrows_step_over_a_marker_atomically() {
+        let editor = Editor::simple();
+        let payload = "z\n".repeat(11);
+        editor.handle_paste(&payload);
+        // Caret is after the marker; one step left must land BEFORE it.
+        let _ = editor.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::Left,
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(
+            editor.cursor_position(),
+            (0, 0),
+            "left jumps the whole marker"
+        );
+        // And one step right must jump back over the whole marker.
+        let _ = editor.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::Right,
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(
+            editor.cursor_position(),
+            (0, "[paste #1 +12 lines]".len()),
+            "right jumps the whole marker"
+        );
+    }
+
+    #[test]
+    fn clear_and_set_text_forget_folded_pastes() {
+        let editor = Editor::simple();
+        editor.handle_paste(&"m\n".repeat(11));
+        editor.clear();
+        assert_eq!(editor.get_text(), "");
+        assert_eq!(editor.get_expanded_text(), "");
+
+        editor.handle_paste(&"n\n".repeat(11));
+        editor.set_text("fresh");
+        // A programmatic replacement drops the store; a leftover marker would
+        // otherwise expand against a stale body.
+        assert_eq!(editor.get_text(), "fresh");
+        assert_eq!(editor.get_expanded_text(), "fresh");
+    }
+
+    #[test]
+    fn csi_u_ctrl_sequences_decode_then_drop_like_native_pi() {
+        // `ESC[104;5u` is kitty CSI-u for Ctrl+H. Native pi decodes it to the
+        // control char (104 - 96 = 8) and then its `charCode >= 32` filter
+        // drops it, so a stream of them folds to nothing.
+        let editor = Editor::simple();
+        editor.handle_paste(&"\x1b[104;5u".repeat(1200));
+        assert_eq!(editor.get_text(), "");
+        assert_eq!(editor.get_expanded_text(), "");
     }
 }
