@@ -11,6 +11,21 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+### Changed
+
+- **The terminal window/tab title now carries the startup mark.** An idle
+  session sets `▃ ▅ ▂ rpi · 🦀` instead of `🦀π rpi`, keeping the activity
+  suffix it had before (`⟳` in flight, `↻` retrying), so the tab and the startup
+  lockup read as one brand: the title's three eighth-blocks are the lockup's
+  3:5:2 bar silhouette flattened into a single row, and a test reads the bar
+  heights back out of the lockup so the two cannot drift apart. Each bar is one
+  cell wide — the first cut used `██` per bar and read as three fat slabs in a
+  tab strip. The title is built by `pi-cli`'s `brand` module, so it drops the
+  crab with `RPI_NO_EMOJI` exactly like the lockup — and it drops `π`, which is
+  East-Asian *Ambiguous* and therefore measured differently under a CJK locale.
+  Block elements share `█`'s width class, so the title is still single-width
+  everywhere.
+
 ## [0.3.3] - 2026-09-26
 
 ### Added

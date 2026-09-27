@@ -62,6 +62,20 @@ pub struct RegisteredCommand {
     pub user_data: *mut std::ffi::c_void,
 }
 
+/// A keyboard shortcut declared by a native extension (e.g. `"space"` for
+/// push-to-talk). The host records it so the TUI can route keys to it; the
+/// owning plugin receives the key via its `Input` event handler.
+///
+/// `key` is a normalized key name (`"space"`, `"enter"`, `"c"`, `"f1"`)
+/// matching the editor's keybinding vocabulary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegisteredShortcut {
+    pub key: String,
+    pub description: String,
+    /// The owning extension's display name (host-side only, for diagnostics).
+    pub plugin: String,
+}
+
 // SAFETY: the plugin owns the callback/context and promises they remain valid
 // for the loaded library lifetime, matching the other registered callbacks.
 unsafe impl Send for RegisteredCommand {}
@@ -249,6 +263,10 @@ pub struct ExtensionRegistry {
     tools: Vec<ExtensionTool>,
     commands: Vec<RegisteredCommand>,
     flags: Vec<RegisteredFlag>,
+    /// Keyboard shortcuts declared by plugins (first-wins by `key`). Recorded
+    /// so the TUI can route a key press/release to the owning plugin's `Input`
+    /// event handler instead of consuming it as editor text.
+    shortcuts: Vec<RegisteredShortcut>,
     /// `handlers[tag as usize]` — all handlers subscribed to that tag.
     handlers: [Vec<RegisteredHandler>; EVENT_TAG_COUNT],
     /// `resources_discover` handlers (B5b). Fan-out on discovery, in registration
@@ -288,6 +306,7 @@ impl ExtensionRegistry {
             tools: Vec::new(),
             commands: Vec::new(),
             flags: Vec::new(),
+            shortcuts: Vec::new(),
             handlers,
             resources_discover: Vec::new(),
             providers: Vec::new(),
@@ -341,6 +360,30 @@ impl ExtensionRegistry {
             return true;
         }
         self.flags.push(RegisteredFlag { name, description });
+        false
+    }
+
+    /// Declare a keyboard shortcut (first-wins by `key`). Returns `true` when an
+    /// earlier extension already claimed the same key.
+    ///
+    /// Recording a shortcut does **not** bind the key to a callback: the owning
+    /// plugin receives presses/releases through its `Input` event handler and
+    /// decides what to do. The host uses this list only to know which keys are
+    /// claimed, so it can route them to extensions instead of the editor.
+    pub fn register_shortcut(
+        &mut self,
+        plugin: String,
+        key: String,
+        description: String,
+    ) -> bool {
+        if self.shortcuts.iter().any(|s| s.key == key) {
+            return true;
+        }
+        self.shortcuts.push(RegisteredShortcut {
+            key,
+            description,
+            plugin,
+        });
         false
     }
 
@@ -495,6 +538,7 @@ impl ExtensionRegistry {
                 .collect(),
             commands: self.commands.clone(),
             flags: self.flags.clone(),
+            shortcuts: self.shortcuts.clone(),
             handlers,
             resources_discover: self.resources_discover.clone(),
             providers: self.providers.clone(),
@@ -551,6 +595,12 @@ impl ExtensionRegistry {
             }
             self.flags.push(flag);
         }
+        for shortcut in other.shortcuts.drain(..) {
+            if self.shortcuts.iter().any(|existing| existing.key == shortcut.key) {
+                continue;
+            }
+            self.shortcuts.push(shortcut);
+        }
         for (tag_idx, handlers) in other.handlers.iter_mut().enumerate() {
             self.handlers[tag_idx].append(handlers);
         }
@@ -594,6 +644,7 @@ pub struct RegistrySnapshot {
     tools: Vec<ExtensionTool>,
     commands: Vec<RegisteredCommand>,
     flags: Vec<RegisteredFlag>,
+    shortcuts: Vec<RegisteredShortcut>,
     handlers: [Vec<RegisteredHandler>; EVENT_TAG_COUNT],
     resources_discover: Vec<ResourcesDiscoverHandler>,
     providers: Vec<RegisteredProvider>,
@@ -620,6 +671,17 @@ impl RegistrySnapshot {
     /// The registered CLI flags, insertion order.
     pub fn flags(&self) -> &[RegisteredFlag] {
         &self.flags
+    }
+
+    /// Keyboard shortcuts declared by extensions, insertion order.
+    pub fn shortcuts(&self) -> &[RegisteredShortcut] {
+        &self.shortcuts
+    }
+
+    /// Whether any extension has claimed `key` as a shortcut. Used by the TUI
+    /// to route that key to extension `Input` events instead of the editor.
+    pub fn has_shortcut(&self, key: &str) -> bool {
+        self.shortcuts.iter().any(|s| s.key == key)
     }
 
     /// Handlers subscribed to `tag` (empty slice if none).
@@ -714,6 +776,30 @@ fn _ensure_handler_accessor_used(snap: &RegistrySnapshot) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shortcuts_first_wins_and_merge() {
+        let mut first = ExtensionRegistry::new();
+        assert!(!first.register_shortcut("voice".into(), "space".into(), "talk".into()));
+        // Second claim on the same key is rejected (first-wins).
+        assert!(first.register_shortcut("other".into(), "space".into(), "also".into()));
+        assert!(!first.register_shortcut("voice".into(), "enter".into(), "send".into()));
+
+        let mut second = ExtensionRegistry::new();
+        assert!(!second.register_shortcut("other".into(), "space".into(), "dup".into()));
+        assert!(!second.register_shortcut("other".into(), "f1".into(), "help".into()));
+
+        first.absorb(second);
+        let snap = first.snapshot();
+        assert_eq!(snap.shortcuts().len(), 3);
+        assert_eq!(snap.shortcuts()[0].key, "space");
+        assert_eq!(snap.shortcuts()[0].plugin, "voice");
+        assert_eq!(snap.shortcuts()[1].key, "enter");
+        assert_eq!(snap.shortcuts()[2].key, "f1");
+        // The claimed-key query the TUI routes on.
+        assert!(snap.has_shortcut("space"));
+        assert!(!snap.has_shortcut("tab"));
+    }
 
     #[test]
     fn cli_flags_snapshot_and_merge_first_wins() {

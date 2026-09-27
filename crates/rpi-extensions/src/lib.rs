@@ -81,15 +81,15 @@ pub use provider_hooks::ExtensionProviderHooks;
 pub use registry::{
     assert_active, current_platform, platform_allows, ExtensionRegistry, ExtensionTool,
     RegisteredFlag, RegisteredHandler, RegisteredProvider, RegisteredRenderer,
-    RegisteredRendererKind, RegistryEntry, RegistrySnapshot, ResourcesDiscoverHandler,
-    DEFAULT_PRIORITY,
+    RegisteredRendererKind, RegisteredShortcut, RegistryEntry, RegistrySnapshot,
+    ResourcesDiscoverHandler, DEFAULT_PRIORITY,
 };
 pub use resources::{emit_resources_discover, DiscoveredResources};
 pub use status::ExtensionStatusMailbox;
 pub use tool::{PluginToolAdapter, PluginToolHandle, ToolCallContext};
 pub use translate::{
-    dispatch_data_event, dispatch_empty_event, dispatch_lifecycle_event, ExtensionEmitter,
-    TeeEmitter,
+    dispatch_data_event, dispatch_data_event_claiming, dispatch_empty_event,
+    dispatch_lifecycle_event, ExtensionEmitter, TeeEmitter,
 };
 
 mod actions;
@@ -478,11 +478,31 @@ extern "C" fn trampoline_register_command(
     }
 }
 
-extern "C" fn trampoline_register_shortcut(_key: StbStringRef, _description: StbStringRef) -> i32 {
-    // v1: shortcuts are a TUI concern (B5). Record nothing; return ok so the
-    // plugin doesn't error, but note via diagnostics it's unsupported.
-    with_current_api(|api| api.diagnostics.unsupported("register_shortcut (TUI — B5)"));
-    0
+extern "C" fn trampoline_register_shortcut(key: StbStringRef, description: StbStringRef) -> i32 {
+    if !current_api_present() {
+        return -1;
+    }
+    // SAFETY: the plugin guarantees these borrowed refs are valid for the
+    // duration of the registration call; copy before returning.
+    let (key, description) =
+        unsafe { (key.as_str().to_string(), description.as_str().to_string()) };
+    // Record the claim. The key is NOT bound to a callback here: the owning
+    // plugin receives presses/releases through its `Input` event handler
+    // (dispatched by the TUI) and decides what to do. The host only needs to
+    // know the key is claimed so it can route it away from the editor.
+    let ok = with_current_api(|api| {
+        match api.with_registry(|reg| {
+            reg.register_shortcut(api.name().to_string(), key, description)
+        }) {
+            Some(_) => true,
+            None => false,
+        }
+    });
+    if ok == Some(true) {
+        0
+    } else {
+        -1
+    }
 }
 
 extern "C" fn trampoline_register_flag(name: StbStringRef, description: StbStringRef) -> i32 {

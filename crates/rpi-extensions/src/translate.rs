@@ -260,6 +260,18 @@ pub fn dispatch_to_handlers(snapshot: &RegistrySnapshot, event: &StablePluginEve
         let outcome = catch_unwind(AssertUnwindSafe(|| (h.handler)(*event, h.user_data)));
         let duration_ms = started.elapsed().as_millis() as u64;
         match outcome {
+            // `CLAIMED` from an ordinary observe dispatch is not an error — the
+            // handler simply consumed the event. Only routing dispatchers act on
+            // it (`dispatch_data_event_claiming`).
+            Ok(rc) if rc == rpi_plugin_sdk::EVENT_HANDLER_CLAIMED => {
+                crate::event_log::log_handler_invocation(
+                    event.tag,
+                    &h.plugin,
+                    "Claimed",
+                    duration_ms,
+                    None,
+                );
+            }
             Ok(rc) if rc != 0 => {
                 tracing::warn!(tag = ?event.tag, rc, "extension event handler returned nonzero");
                 crate::event_log::log_handler_invocation(
@@ -322,6 +334,54 @@ pub fn dispatch_empty_event(snapshot: &RegistrySnapshot, tag: EventTag) -> bool 
     let event = StablePluginEvent::empty(tag);
     dispatch_to_handlers(snapshot, &event);
     true
+}
+
+/// Like [`dispatch_data_event`], but reports whether a handler **claimed** the
+/// event by returning [`EVENT_HANDLER_CLAIMED`].
+///
+/// This exists for input routing: the TUI asks extensions "is this key yours?"
+/// and must know whether to swallow the key (skip the editor) or pass it
+/// through. A handler that subscribes but is currently inactive (e.g.
+/// push-to-talk toggled off) returns the ordinary continue code and the key
+/// falls through to normal editor handling.
+///
+/// Every handler is still invoked (fan-out is not short-circuited) so a later
+/// handler can disagree; the event is considered claimed if **any** returned
+/// [`EVENT_HANDLER_CLAIMED`].
+pub fn dispatch_data_event_claiming(
+    snapshot: &RegistrySnapshot,
+    tag: EventTag,
+    data: &str,
+) -> bool {
+    if !crate::registry::assert_active(snapshot.active_flag()) {
+        return false;
+    }
+    let handlers = snapshot.handlers_for(tag);
+    if handlers.is_empty() {
+        return false;
+    }
+    let event = StablePluginEvent::data(tag, StbString::from_string(data.to_string()));
+    let mut claimed = false;
+    for h in handlers {
+        if !crate::registry::platform_allows(&h.platforms) {
+            continue;
+        }
+        // SAFETY: as in `dispatch_to_handlers` — the plugin warrants the handler
+        // and its user_data are safe to call from this thread.
+        let outcome = catch_unwind(AssertUnwindSafe(|| (h.handler)(event, h.user_data)));
+        match outcome {
+            Ok(rc) if rc == rpi_plugin_sdk::EVENT_HANDLER_CLAIMED => claimed = true,
+            Ok(rc) if rc != 0 => {
+                tracing::warn!(tag = ?tag, rc, "extension event handler returned nonzero");
+            }
+            Err(_) => {
+                tracing::error!(tag = ?tag, "extension event handler panicked — skipped");
+            }
+            Ok(_) => {}
+        }
+    }
+    free_dispatched_event(&event);
+    claimed
 }
 
 /// Per-lifecycle-event handler timeout budget (mirrors lifescope §6.1):
@@ -604,15 +664,18 @@ fn free_dispatched_event(event: &StablePluginEvent) {
         | T::ModelSelect
         | T::ThinkingLevelSelect
         | T::UserBash
-        | T::Input
         | T::BeforeTuiStart
         | T::UiPromptStart
         | T::UiPromptEnd => {
             // no payload today.
         }
-        // The B4 provider-hook observer events carry a generic data payload
-        // (built by `dispatch_data_event`); free the single StbString.
-        T::BeforeProviderRequest | T::BeforeProviderHeaders | T::AfterProviderResponse => {
+        // The B4 provider-hook observer events, and the `Input` key-routing
+        // events dispatched by the TUI, carry a generic data payload (built by
+        // `dispatch_data_event`); free the single StbString.
+        T::BeforeProviderRequest
+        | T::BeforeProviderHeaders
+        | T::AfterProviderResponse
+        | T::Input => {
             // SAFETY: these tags are only ever constructed as data payloads.
             unsafe { host_free_string(event.payload.data.data) };
         }
@@ -1062,5 +1125,66 @@ mod tests {
         assert!(text.contains(r#""plugin":"log-ext""#), "log: {text}");
         assert!(text.contains(r#""result":"Continue""#), "log: {text}");
         assert_eq!(HANDLER_HITS.load(Ordering::SeqCst), 1);
+    }
+
+    // --- key-routing (`dispatch_data_event_claiming`) ----------------------
+
+    /// Handler that claims the event unless `CLAIM_ROUTING` says otherwise.
+    /// `CLAIM_ROUTING` is global because an `extern "C" fn` cannot capture.
+    static CLAIM_ROUTING: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(true);
+
+    extern "C" fn claiming_handler(ev: StablePluginEvent, _ud: *mut std::ffi::c_void) -> i32 {
+        // The payload must be readable as a data event (this is also what
+        // exercises the `Input` free path not leaking/aliasing).
+        let seen = unsafe { ev.payload.data.data.to_string_lossy() };
+        assert!(seen.contains("space"), "payload not delivered: {seen}");
+        if CLAIM_ROUTING.load(Ordering::SeqCst) {
+            rpi_plugin_sdk::EVENT_HANDLER_CLAIMED
+        } else {
+            rpi_plugin_sdk::EVENT_HANDLER_CONTINUE
+        }
+    }
+
+    fn input_snapshot(with_handler: bool) -> Arc<crate::registry::RegistrySnapshot> {
+        let mut reg = crate::registry::ExtensionRegistry::new();
+        if with_handler {
+            reg.register_event_handler(
+                "voice".to_string(),
+                EventTag::Input,
+                claiming_handler,
+                std::ptr::null_mut(),
+            );
+        }
+        Arc::new(reg.snapshot())
+    }
+
+    #[test]
+    fn claiming_dispatch_reports_claim_and_passthrough() {
+        let _guard = HANDLER_TEST_LOCK.lock().unwrap();
+        let snap = input_snapshot(true);
+
+        CLAIM_ROUTING.store(true, Ordering::SeqCst);
+        assert!(
+            dispatch_data_event_claiming(&snap, EventTag::Input, r#"{"key":"space"}"#),
+            "a CLAIMED handler must swallow the key"
+        );
+
+        CLAIM_ROUTING.store(false, Ordering::SeqCst);
+        assert!(
+            !dispatch_data_event_claiming(&snap, EventTag::Input, r#"{"key":"space"}"#),
+            "a CONTINUE handler must let the key reach the editor"
+        );
+        CLAIM_ROUTING.store(true, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn claiming_dispatch_without_subscribers_is_false() {
+        let snap = input_snapshot(false);
+        assert!(!dispatch_data_event_claiming(
+            &snap,
+            EventTag::Input,
+            r#"{"key":"space"}"#
+        ));
     }
 }

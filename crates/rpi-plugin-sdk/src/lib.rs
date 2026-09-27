@@ -782,6 +782,16 @@ pub const EVENT_HANDLER_ERROR: i32 = 1;
 /// lifecycle dispatch; the observe fan-out logs + continues (see the module
 /// docs on [`EVENT_HANDLER_CONTINUE`]).
 pub const EVENT_HANDLER_ABORT: i32 = 2;
+/// **Claim**: the handler consumed this event and the host should not fall back
+/// to its own default handling. Honored only by dispatch paths that ask
+/// extensions to arbitrate (currently `EventTag::Input` key routing, via
+/// [`EVENT_HANDLER_CLAIMED`]); the ordinary observe fan-out treats it like any
+/// other nonzero (log + continue).
+///
+/// Lets a handler subscribe to a key yet decline it while its feature is off:
+/// return [`EVENT_HANDLER_CONTINUE`] to pass the key through to normal editor
+/// handling, or this to swallow it.
+pub const EVENT_HANDLER_CLAIMED: i32 = 3;
 
 /// Handler fn pointer registered via `register_event_handler(tag, handler)`.
 /// `user_data` is the plugin's opaque context. Return `0` on success; nonzero
