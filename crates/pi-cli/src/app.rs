@@ -379,7 +379,7 @@ async fn run_inner() -> i32 {
     // v1 does not switch models mid-session, so this is display-only.
     let model_catalog = crate::provider::available_catalog(&resolved);
 
-    // `--models <patterns>`: persist the Ctrl+M cycle scope to settings.json
+    // `--models <patterns>`: persist the Ctrl+P cycle scope to settings.json
     // (the same set `/scoped-models` edits). Each pattern matches catalog ids
     // case-insensitively; unmatched patterns are reported so a typo doesn't
     // silently empty the cycle.

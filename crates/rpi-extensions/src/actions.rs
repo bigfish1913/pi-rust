@@ -690,7 +690,7 @@ pub extern "C" fn trampoline_runtime_action(
         run_action(
             action_id,
             // Highest id this ABI defines — bump when adding an action.
-            u32::from(RuntimeActionId::SetStatus),
+            u32::from(RuntimeActionId::SetEditorText),
             args_json,
             out,
             user_data,
@@ -1030,6 +1030,48 @@ mod tests {
         assert_eq!(saw, vec![RuntimeActionId::GetSystemPrompt]);
     }
 
+    /// The `SetEditorText` runtime action must reach the bridge's editor-text
+    /// mailbox through the ABI trampoline. This is the wiring a plugin relies on
+    /// (a voice extension writes a transcription draft here); a broken action id
+    /// or a dropped dispatch would be invisible to the plugin — it only sees
+    /// `ok: true` — so pin it here.
+    #[tokio::test]
+    async fn trampoline_routes_set_editor_text_into_the_mailbox() {
+        let host = Arc::new(MockHost {
+            prompt: String::new(),
+            saw: Mutex::new(Vec::new()),
+        });
+        let host_dyn: Arc<dyn RuntimeActionHost> = host;
+        let bridge = ActionBridge::new(tokio::runtime::Handle::current(), host_dyn);
+        let mailbox = bridge.editor_text_mailbox();
+        let user_data = Arc::as_ptr(&bridge) as *mut c_void;
+
+        let args_ref = StbStringRef::from_str(
+            r#"{"text":"from voice","mode":"append","autoSendMs":2000}"#,
+        );
+        let mut out = StbString::empty();
+        let rc = trampoline_runtime_action(
+            RuntimeActionId::SetEditorText.into(),
+            args_ref,
+            &mut out as *mut StbString,
+            user_data,
+        );
+        assert_eq!(rc, 0, "success return code");
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&out.to_string_lossy()).expect("valid json");
+        assert_eq!(parsed["ok"], serde_json::json!(true));
+        assert_eq!(parsed["chars"], serde_json::json!(10));
+        crate::host_free_string(out);
+
+        // The queued edit is what the host will apply to the prompt editor.
+        let edit = mailbox.take_pending().expect("queued edit");
+        assert_eq!(edit.text, "from voice");
+        assert_eq!(edit.mode, crate::EditorTextMode::Append);
+        assert_eq!(edit.auto_send_ms, Some(2000));
+        assert!(mailbox.take_pending().is_none());
+    }
+
     #[tokio::test]
     async fn trampoline_null_user_data_returns_minus_one() {
         let args_ref = StbStringRef::from_str("{}");
@@ -1348,9 +1390,10 @@ mod tests {
         crate::host_free_string(out);
 
         // A genuinely unknown id is still rejected (no silent acceptance).
+        // 20 is one past the highest defined action (`SetEditorText` = 19).
         let mut out = StbString::empty();
         assert_eq!(
-            trampoline_runtime_action(19, StbStringRef::from_str("{}"), &mut out, user_data),
+            trampoline_runtime_action(20, StbStringRef::from_str("{}"), &mut out, user_data),
             2
         );
         crate::host_free_string(out);

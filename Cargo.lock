@@ -2275,6 +2275,7 @@ dependencies = [
  "futures",
  "globset",
  "indexmap 2.14.2",
+ "nix",
  "png",
  "reqwest",
  "rpassword",

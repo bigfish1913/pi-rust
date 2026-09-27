@@ -102,6 +102,11 @@ pub trait Terminal: Send + Sync {
     /// spawning a competing reader — see `TuiAltScreen::start_readerless`.
     fn enter_raw_mode(&self);
 
+    /// Leave raw mode *without* stopping the terminal, so the shell gets a
+    /// working line discipline back. Pairs with [`Terminal::enter_raw_mode`];
+    /// a `Ctrl+Z` suspend uses it, then re-enters raw mode on resume.
+    fn exit_raw_mode(&self);
+
     /// Re-read the current terminal size into the cached [`TerminalInfo`].
     /// Called on `Event::Resize` so subsequent renders use the new dimensions.
     fn refresh_size(&self);
@@ -231,6 +236,14 @@ impl Terminal for ProcessTerminal {
         self.write("\x1b[?2004h");
         self.update_size();
         self.flush();
+    }
+
+    fn exit_raw_mode(&self) {
+        // Mirror `enter_raw_mode` without tearing the terminal down: drop the
+        // bracketed-paste mode it turned on and restore the line discipline.
+        self.write("\x1b[?2004l");
+        self.flush();
+        let _ = cterm::disable_raw_mode();
     }
 
     fn refresh_size(&self) {

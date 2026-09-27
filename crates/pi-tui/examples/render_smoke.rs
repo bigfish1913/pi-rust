@@ -85,7 +85,7 @@ fn main() {
     footer.set_status("Working…");
     footer.set_thinking_level(Some("medium"));
     footer.set_hints(
-        "Enter: Send | Shift+Enter: New line | Ctrl+C: Abort | Ctrl+M: Cycle | Ctrl+T: Expand",
+        "Enter: Send | Shift+Enter: New line | Ctrl+C: Clear/Exit | Ctrl+P: Cycle | Ctrl+T: Expand",
     );
     println!();
     println!("╔══ Footer (working + thinking) ════════════════════════════════════╗");

@@ -3114,7 +3114,7 @@ mod tests {
     /// "No API key for provider: anthropic"). Mirrors pi's
     /// `getAvailableSnapshot` filter (`available = all.filter(m =>
     /// configuredProviders.has(m.provider))`): only the gateway model is
-    /// loadable, so only it appears in the selector / Ctrl+M cycle.
+    /// loadable, so only it appears in the selector / Ctrl+P cycle.
     #[test]
     fn available_catalog_filters_to_authed_models_in_gateway_only_setup() {
         let _env = TestEnv::new();

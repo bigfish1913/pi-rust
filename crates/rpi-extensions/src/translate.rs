@@ -669,13 +669,14 @@ fn free_dispatched_event(event: &StablePluginEvent) {
         | T::UiPromptEnd => {
             // no payload today.
         }
-        // The B4 provider-hook observer events, and the `Input` key-routing
+        // The B4 provider-hook observer events, and the `Input` /`EditorChange`
         // events dispatched by the TUI, carry a generic data payload (built by
         // `dispatch_data_event`); free the single StbString.
         T::BeforeProviderRequest
         | T::BeforeProviderHeaders
         | T::AfterProviderResponse
-        | T::Input => {
+        | T::Input
+        | T::EditorChange => {
             // SAFETY: these tags are only ever constructed as data payloads.
             unsafe { host_free_string(event.payload.data.data) };
         }
@@ -1186,5 +1187,48 @@ mod tests {
             EventTag::Input,
             r#"{"key":"space"}"#
         ));
+    }
+
+    // --- editor-change (`dispatch_data_event`) -----------------------------
+
+    /// The `EditorChange` notification reaches subscribers with its payload
+    /// intact and returns "no veto" (it is an observer event: the draft change
+    /// has already happened and must never be blocked).
+    #[test]
+    fn editor_change_reaches_subscribers_with_its_payload() {
+        let _guard = HANDLER_TEST_LOCK.lock().unwrap();
+        let mut reg = crate::registry::ExtensionRegistry::new();
+        reg.register_event_handler(
+            "voice".to_string(),
+            EventTag::EditorChange,
+            editor_change_handler,
+            std::ptr::null_mut(),
+        );
+        let snap = Arc::new(reg.snapshot());
+
+        EDITOR_CHANGE_SEEN.store(false, Ordering::SeqCst);
+        assert!(
+            dispatch_data_event(&snap, EventTag::EditorChange, r#"{"chars":4,"empty":false}"#),
+            "a subscribed handler must be invoked"
+        );
+        assert!(
+            EDITOR_CHANGE_SEEN.load(Ordering::SeqCst),
+            "payload missing or handler not called"
+        );
+    }
+
+    /// Handler that records it saw a well-formed editor-change payload. The
+    /// flag is global because an `extern "C" fn` cannot capture.
+    static EDITOR_CHANGE_SEEN: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    extern "C" fn editor_change_handler(ev: StablePluginEvent, _ud: *mut std::ffi::c_void) -> i32 {
+        // Reading the data payload here also exercises the `EditorChange` free
+        // path (a wrong arm in `free_dispatched_event` would corrupt/leak).
+        let seen = unsafe { ev.payload.data.data.to_string_lossy() };
+        if seen.contains("chars") && seen.contains("empty") {
+            EDITOR_CHANGE_SEEN.store(true, Ordering::SeqCst);
+        }
+        rpi_plugin_sdk::EVENT_HANDLER_CONTINUE
     }
 }

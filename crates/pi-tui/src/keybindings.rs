@@ -150,9 +150,8 @@ impl Keybindings {
 
         let mut map = HashMap::new();
 
-        // Application-level actions. These IDs intentionally match native Pi
-        // so a copied settings.json can override them; rpi keeps its existing
-        // Ctrl+M model-cycle default for backward compatibility.
+        // Application-level actions. These IDs and their default keys match
+        // native Pi, so a copied settings.json overrides them the same way.
         map.insert(
             "app.interrupt",
             KeybindingDefinition {
@@ -184,8 +183,20 @@ impl Keybindings {
         map.insert(
             "app.model.cycleForward",
             KeybindingDefinition {
-                default_keys: vec![KeyCombo::new(Char('m'), M::CONTROL)],
+                default_keys: vec![KeyCombo::new(Char('p'), M::CONTROL)],
                 description: Some("Cycle to next model"),
+            },
+        );
+        map.insert(
+            "app.model.cycleBackward",
+            KeybindingDefinition {
+                // Native pi: `alt+p` on Windows, `shift+ctrl+p` elsewhere.
+                default_keys: vec![if cfg!(windows) {
+                    KeyCombo::new(Char('p'), M::ALT)
+                } else {
+                    KeyCombo::new(Char('p'), M::CONTROL | M::SHIFT)
+                }],
+                description: Some("Cycle to previous model"),
             },
         );
         map.insert(
@@ -219,8 +230,48 @@ impl Keybindings {
         map.insert(
             "app.clipboard.pasteImage",
             KeybindingDefinition {
-                default_keys: vec![KeyCombo::new(Char('v'), M::CONTROL)],
+                // Native pi: `alt+v` on Windows, `ctrl+v` elsewhere. rpi keeps
+                // `ctrl+v` on Windows too — its clipboard *text* fallback
+                // (crossterm never emits `Event::Paste` on the Windows console)
+                // rides the same binding, so native's key is added, not swapped.
+                default_keys: if cfg!(windows) {
+                    vec![
+                        KeyCombo::new(Char('v'), M::CONTROL),
+                        KeyCombo::new(Char('v'), M::ALT),
+                    ]
+                } else {
+                    vec![KeyCombo::new(Char('v'), M::CONTROL)]
+                },
                 description: Some("Paste image from clipboard"),
+            },
+        );
+        map.insert(
+            "app.suspend",
+            KeybindingDefinition {
+                // Native pi binds no key on Windows at all.
+                default_keys: if cfg!(windows) {
+                    vec![]
+                } else {
+                    vec![KeyCombo::new(Char('z'), M::CONTROL)]
+                },
+                description: Some("Suspend to background"),
+            },
+        );
+        map.insert(
+            "app.message.followUp",
+            KeybindingDefinition {
+                // Native pi: `ctrl+q` on Windows, `alt+enter` elsewhere. rpi
+                // keeps `alt+enter` on Windows as well (it already worked) and
+                // adds native's key alongside it.
+                default_keys: if cfg!(windows) {
+                    vec![
+                        KeyCombo::new(Char('q'), M::CONTROL),
+                        KeyCombo::new(Enter, M::ALT),
+                    ]
+                } else {
+                    vec![KeyCombo::new(Enter, M::ALT)]
+                },
+                description: Some("Queue follow-up message"),
             },
         );
         map.insert(
@@ -233,6 +284,13 @@ impl Keybindings {
                     KeyCombo::new(Up, M::ALT)
                 }],
                 description: Some("Restore queued messages"),
+            },
+        );
+        map.insert(
+            "app.message.copy",
+            KeybindingDefinition {
+                default_keys: vec![KeyCombo::new(Char('x'), M::CONTROL)],
+                description: Some("Copy selection or last assistant message"),
             },
         );
 
@@ -740,12 +798,16 @@ pub mod keys {
     pub const EXIT: KeybindingId = "app.exit";
     pub const MODEL_SELECT: KeybindingId = "app.model.select";
     pub const MODEL_CYCLE_FORWARD: KeybindingId = "app.model.cycleForward";
+    pub const MODEL_CYCLE_BACKWARD: KeybindingId = "app.model.cycleBackward";
     pub const TOOLS_EXPAND: KeybindingId = "app.tools.expand";
     pub const THINKING_TOGGLE: KeybindingId = "app.thinking.toggle";
     pub const EXTERNAL_EDITOR: KeybindingId = "app.editor.external";
     pub const THINKING_CYCLE: KeybindingId = "app.thinking.cycle";
     pub const PASTE_IMAGE: KeybindingId = "app.clipboard.pasteImage";
+    pub const SUSPEND: KeybindingId = "app.suspend";
+    pub const MESSAGE_FOLLOW_UP: KeybindingId = "app.message.followUp";
     pub const DEQUEUE: KeybindingId = "app.message.dequeue";
+    pub const MESSAGE_COPY: KeybindingId = "app.message.copy";
 
     // Editor
     pub const CURSOR_UP: KeybindingId = "tui.editor.cursorUp";

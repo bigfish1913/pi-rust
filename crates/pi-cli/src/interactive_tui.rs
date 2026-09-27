@@ -2891,7 +2891,7 @@ impl SlashCommand for ScopedModelsCommand {
         "/scoped-models"
     }
     fn description(&self) -> &'static str {
-        "Choose models for Ctrl+M cycling"
+        "Choose models for Ctrl+P cycling"
     }
     fn execute(&self, ctx: &CommandContext, _args: &str) {
         open_scoped_models_selector(
@@ -3206,7 +3206,7 @@ fn user_message_text(msg: &rpi_ai::types::UserMessage) -> String {
     }
 }
 
-/// The catalog allowed in the Ctrl+M cycle: the `/scoped-models` set from
+/// The catalog allowed in the Ctrl+P cycle: the `/scoped-models` set from
 /// settings.json when present, otherwise every model. The current model is
 /// always included (fallback) so cycling can never strand the user off-scope.
 fn scoped_catalog(catalog: &[rpi_ai::Model], current_id: &str) -> Vec<rpi_ai::Model> {
@@ -3396,7 +3396,7 @@ fn settings_menu_items(
             .with_description("Saved default thinking level")
             .with_submenu(),
         SettingItem::new("scoped-models", "Cycle scope", &scoped_desc)
-            .with_description("Models enabled for Ctrl+M cycling")
+            .with_description("Models enabled for Ctrl+P cycling")
             .with_submenu(),
         SettingItem::new(
             "hide-thinking",
@@ -3955,11 +3955,11 @@ fn open_scoped_models_selector(
         match crate::settings::save_settings(&settings) {
             Ok(()) => {
                 if set.is_empty() {
-                    add_note_message(&chat_cancel, "Ctrl+M cycles all models (scope cleared).");
+                    add_note_message(&chat_cancel, "Ctrl+P cycles all models (scope cleared).");
                 } else {
                     add_note_message(
                         &chat_cancel,
-                        &format!("Ctrl+M cycle scope: {}", set.join(", ")),
+                        &format!("Ctrl+P cycle scope: {}", set.join(", ")),
                     );
                 }
             }
@@ -4605,7 +4605,7 @@ enum SelectorKind {
     Session,
     /// `/theme` — dark / light / monochrome presets applied live.
     Theme,
-    /// `/scoped-models` — multi-toggle Ctrl+M cycle scope.
+    /// `/scoped-models` — multi-toggle Ctrl+P cycle scope.
     ScopedModels,
     /// `/settings` — interactive settings menu (and its sub-selectors).
     Settings,
@@ -4645,6 +4645,64 @@ impl SelectorView {
 
 /// Shared mutable TUI state, `Arc`-cloned into the drain task, the key loop,
 /// and the render-tick task.
+/// A draft injected by an extension via `SetEditorText` with `autoSendMs`:
+/// the TUI places it in the prompt editor and submits it once `deadline`
+/// passes, *unless the user touches the draft first*.
+///
+/// "Touching" is either a keystroke (the key loop clears this — the pressed
+/// key is still dispatched to the editor, so the user simply keeps typing) or
+/// any difference between the live editor text and `text` (the render tick's
+/// safety net for programmatic/`Paste` changes that bypass the key path).
+#[derive(Debug, Clone)]
+struct AutoSendPending {
+    /// When an untouched draft is submitted.
+    deadline: std::time::Instant,
+    /// The text as injected; a mismatch means the user edited it.
+    text: String,
+}
+
+/// What one tick of the auto-send countdown should do. Split out of
+/// [`poll_auto_send`] so the submit/cancel rules are unit-testable without a
+/// live TUI.
+#[derive(Debug, PartialEq, Eq)]
+enum AutoSendStep {
+    /// No countdown is running.
+    Idle,
+    /// Abandon the countdown and leave the draft alone: the user edited it, or
+    /// a run started underneath us.
+    Cancel,
+    /// The countdown elapsed untouched — submit the draft.
+    Submit,
+    /// Still counting down; the caller renders the remaining time.
+    Wait(std::time::Duration),
+}
+
+/// Pure decision for one tick of the auto-send countdown.
+fn auto_send_step(
+    pending: Option<&AutoSendPending>,
+    current_text: &str,
+    idle: bool,
+    now: std::time::Instant,
+) -> AutoSendStep {
+    let Some(pending) = pending else {
+        return AutoSendStep::Idle;
+    };
+    // Any divergence from the injected text is the user's own edit; an emptied
+    // editor (a slash command ran, Esc cleared it) has nothing left to send.
+    if current_text != pending.text || current_text.trim().is_empty() {
+        return AutoSendStep::Cancel;
+    }
+    if !idle {
+        return AutoSendStep::Cancel;
+    }
+    let remaining = pending.deadline.saturating_duration_since(now);
+    if remaining.is_zero() {
+        AutoSendStep::Submit
+    } else {
+        AutoSendStep::Wait(remaining)
+    }
+}
+
 struct TuiState {
     /// The in-flight streaming assistant message (cleared on finalize).
     /// `Arc`-shared with the [`TranscriptView`] the event drain renders through,
@@ -4672,6 +4730,21 @@ struct TuiState {
     ext_status: rpi_extensions::ExtensionStatusMailbox,
     /// Revision of `ext_status` as of the last footer write.
     ext_status_revision: std::sync::atomic::AtomicU64,
+    /// Session editor-text queue (`SetEditorText`, runtime action 19). The
+    /// render tick drains it into the prompt editor; a voice plugin drops a
+    /// transcription in as an editable draft rather than sending it.
+    editor_text: rpi_extensions::EditorTextMailbox,
+    /// Pending auto-send for an injected draft (see [`AutoSendPending`]).
+    /// `None` when no countdown is running.
+    auto_send: std::sync::Mutex<Option<AutoSendPending>>,
+    /// The editor text as of the last tick, used to detect `EditorChange`
+    /// events (see [`TuiState::sync_editor_change`]).
+    last_editor_text: std::sync::Mutex<String>,
+    /// Set by the TUI itself right before it writes the editor (an extension
+    /// draft injection, the auto-send clear). The next `EditorChange` is then
+    /// attributed to `extension` rather than to the user — without this a
+    /// plugin could not tell its own text from a human typing.
+    programmatic_editor_write: std::sync::atomic::AtomicBool,
     /// Cancellation signal for the short phase that starts the persistent JS
     /// host and runs `before_agent_start`. The key thread can trigger this
     /// directly while the async message loop is awaiting the blocking worker.
@@ -4727,8 +4800,8 @@ struct TuiState {
     /// terminal window title ("rpi — working" / "rpi"). `None` in unit tests
     /// that never call `set_status` with a title.
     tui: Option<Arc<TuiAltScreen>>,
-    /// The model id currently shown in the footer + used as the Ctrl+M
-    /// cycle anchor. Sync-tracked (updated on every `/model`/Ctrl+M switch) so
+    /// The model id currently shown in the footer + used as the Ctrl+P
+    /// cycle anchor. Sync-tracked (updated on every `/model`/Ctrl+P switch) so
     /// the blocking key loop can cycle without awaiting `lane.get_model()`.
     current_model_id: std::sync::Mutex<String>,
     /// Whether inline image rendering is enabled (`/images` toggle). Stored
@@ -4789,6 +4862,11 @@ struct TuiState {
 /// How many submitted messages are kept for ↑ recall (mirrors the TS
 /// editor's 100-entry cap).
 const HISTORY_LIMIT: usize = 100;
+
+/// Footer-status prefix used while a voice/extension draft counts down to an
+/// auto-send. Doubles as the marker that lets [`TuiState::clear_auto_send`]
+/// know the footer is showing *our* text before blanking it.
+const AUTO_SEND_PREFIX: &str = "Auto-send in ";
 
 /// Keep a few rows of overlap so page scrolling preserves visual context,
 /// matching the upstream fullscreen viewport behavior.
@@ -4949,10 +5027,32 @@ fn pending_dequeue_hint(bindings: &rpi_tui::Keybindings) -> String {
         .join("/")
 }
 
+/// Whether `last`/`now` fall inside the same 500ms double-press window. Native
+/// pi uses one window for both Esc's double-escape action and Ctrl+C's "press
+/// twice to exit", so this helper serves both.
 fn double_escape_trigger(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
     last.is_some_and(|previous| {
         now.duration_since(previous) <= std::time::Duration::from_millis(500)
     })
+}
+
+/// What one Ctrl+C press should do, per native pi's `handleCtrlC`.
+#[derive(Debug, PartialEq, Eq)]
+enum CtrlCAction {
+    /// First press: clear the editor and arm the double-press window.
+    Clear,
+    /// The window was already open → quit.
+    Exit,
+}
+
+/// Native pi's `handleCtrlC`: a press inside the 500ms window quits, otherwise
+/// it clears. It never aborts a run — cancelling is `app.interrupt` (Esc)'s job.
+fn ctrl_c_action(last_sigint: Option<std::time::Instant>, now: std::time::Instant) -> CtrlCAction {
+    if double_escape_trigger(last_sigint, now) {
+        CtrlCAction::Exit
+    } else {
+        CtrlCAction::Clear
+    }
 }
 
 /// How long to wait for queued console input before treating a bare Enter as a
@@ -5065,6 +5165,23 @@ fn emergency_exit(tui: &Arc<TuiAltScreen>) -> ! {
     std::process::exit(130);
 }
 
+/// Native pi's `handleCtrlZ` (`app.suspend`): hand the terminal back to the
+/// shell and stop the process. `raise(SIGTSTP)` returns once the user resumes
+/// us with `fg`/`bg`, at which point we re-enter the alternate screen.
+#[cfg(unix)]
+fn handle_suspend(tui: &Arc<TuiAltScreen>) {
+    tui.suspend();
+    // A `Result` here would mean the signal could not be raised; there is no
+    // useful recovery, so resume either way and let the user retry.
+    let _ = nix::sys::signal::raise(nix::sys::signal::Signal::SIGTSTP);
+    tui.resume();
+}
+
+/// Native pi binds no suspend key on Windows (`app.suspend`'s `defaultKeys` is
+/// empty there), so [`keys::SUSPEND`] never matches and this is unreachable.
+#[cfg(not(unix))]
+fn handle_suspend(_tui: &Arc<TuiAltScreen>) {}
+
 /// Compact token count for the cache-miss notice: 1.2M / 34.5K / 900.
 fn format_tokens(n: i64) -> String {
     if n >= 1_000_000 {
@@ -5092,6 +5209,72 @@ fn push_history(state: &Arc<TuiState>, text: &str) {
     history.truncate(HISTORY_LIMIT);
     *state.history_index.lock().unwrap() = -1;
     *state.history_draft.lock().unwrap() = None;
+}
+
+/// Submit a draft as a user prompt through the *same* path the Enter key takes:
+/// render the user bubble, record history, then hand the text to the main loop
+/// as [`TuiMessage::UserInput`]. Using the editor path (rather than a direct
+/// `SendUserMessage`) is what makes a voice transcription show up as a user
+/// message — the harness emits no user `message_start` for a directly-sent
+/// prompt.
+fn submit_draft(state: &Arc<TuiState>, tx: &mpsc::UnboundedSender<TuiMessage>, text: &str) {
+    if text.trim().is_empty() || !state.try_start_working() {
+        return;
+    }
+    add_user_message(&state.chat_container, text);
+    if let Some(tui) = &state.tui {
+        if let Some(scroll) = tui.get_primary_scroll_view() {
+            scroll.scroll_to_end();
+        }
+        tui.request_render(false);
+    }
+    push_history(state, text);
+    let _ = tx.send(TuiMessage::UserInput(text.to_string()));
+}
+
+/// Advance a pending auto-send countdown. Returns `true` when the caller needs
+/// to repaint.
+///
+/// The draft is abandoned — leaving the user's text in place and clearing the
+/// footer countdown — when the user edits it (the editor no longer matches the
+/// injected text), when a run has started, or when the editor was cleared.
+/// Otherwise the remaining time is written to the footer; once it reaches zero
+/// the draft is submitted.
+fn poll_auto_send(state: &Arc<TuiState>, tx: &mpsc::UnboundedSender<TuiMessage>) -> bool {
+    // Clone out of the lock before touching the editor/footer so no other
+    // thread can block behind this tick.
+    let pending = state.auto_send.lock().unwrap().clone();
+    let step = auto_send_step(
+        pending.as_ref(),
+        &state.editor.get_text(),
+        *state.status.lock().unwrap() == RunStatus::Idle,
+        std::time::Instant::now(),
+    );
+
+    match step {
+        AutoSendStep::Idle => false,
+        AutoSendStep::Cancel => {
+            state.clear_auto_send();
+            true
+        }
+        AutoSendStep::Submit => {
+            let text = state.editor.get_text();
+            state.clear_auto_send();
+            state.clear_editor_programmatically();
+            submit_draft(state, tx, &text);
+            true
+        }
+        AutoSendStep::Wait(remaining) => {
+            let secs = remaining.as_millis() as f64 / 1000.0;
+            let label = format!("{AUTO_SEND_PREFIX}{secs:.1}s · any key to edit");
+            if state.footer.get_status() != label {
+                state.footer.set_status(&label);
+                true
+            } else {
+                false
+            }
+        }
+    }
 }
 
 /// Navigate message history. `direction` is -1 (↑, older) or 1 (↓, newer).
@@ -5332,6 +5515,160 @@ impl TuiState {
         true
     }
 
+    /// Drain the extension editor-text queue (`SetEditorText`) into the prompt
+    /// editor. Returns `true` when at least one edit was applied (the caller
+    /// then repaints).
+    ///
+    /// An edit with an `autoSendMs` arms [`AutoSendPending`] so an *untouched*
+    /// draft is submitted without a keystroke; the user can still steal it back
+    /// by typing (see the key loop) or by any edit that diverges from the
+    /// injected text (see [`poll_auto_send`]). The injected text is the draft,
+    /// so submitting it goes through the normal prompt path and renders a user
+    /// bubble — unlike `SendUserMessage`, which emits no user `message_start`.
+    fn drain_editor_text(&self) -> bool {
+        let mut applied = false;
+        while let Some(edit) = self.editor_text.take_pending() {
+            let current = self.editor.get_text();
+            let text = match edit.mode {
+                rpi_extensions::EditorTextMode::Replace => edit.text,
+                rpi_extensions::EditorTextMode::Append => {
+                    if current.is_empty() {
+                        edit.text
+                    } else {
+                        // A blank separator keeps two dictations readable; an
+                        // existing trailing space is not doubled.
+                        let mut joined = current.trim_end().to_string();
+                        joined.push(' ');
+                        joined.push_str(&edit.text);
+                        joined
+                    }
+                }
+            };
+            set_editor_text_caret_at_end(&self.editor, &text);
+            // The `EditorChange` this produces is ours, not the user's.
+            self.programmatic_editor_write
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let pending = edit
+                .auto_send_ms
+                .filter(|ms| *ms > 0)
+                .map(|ms| AutoSendPending {
+                    deadline: std::time::Instant::now() + std::time::Duration::from_millis(ms),
+                    text: text.clone(),
+                });
+            *self.auto_send.lock().unwrap() = pending;
+            applied = true;
+        }
+        applied
+    }
+
+    /// Clear the editor as **host housekeeping**, not as a user edit.
+    ///
+    /// The clear that follows every submit is the important one: it is the host
+    /// tidying up, and reporting it as `source:"user"` told a hands-free voice
+    /// extension "the human just took the keyboard" — so `/voice auto` switched
+    /// itself off the instant it was enabled (the command's own editor clear
+    /// arrives on the next tick, ~80ms after the mode turned on) and the
+    /// microphone never stayed open. A real user clear (Esc, select-all +
+    /// delete) goes through the editor itself and is still `user`.
+    fn clear_editor_programmatically(&self) {
+        self.programmatic_editor_write
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.editor.clear();
+    }
+
+    /// Drop a pending auto-send, clearing the footer countdown when it still
+    /// shows ours (so an unrelated run status is never clobbered).
+    fn clear_auto_send(&self) {
+        if self.auto_send.lock().unwrap().take().is_some()
+            && self.footer.get_status().starts_with(AUTO_SEND_PREFIX)
+        {
+            self.footer.set_status("");
+        }
+    }
+
+    /// Cancel a pending auto-send because the user pressed a key. Returns
+    /// `true` when a countdown was running. The key is *still* dispatched
+    /// normally, so it lands in the draft as the user's first correction.
+    fn cancel_auto_send_on_key(&self) -> bool {
+        let had = self.auto_send.lock().unwrap().is_some();
+        if had {
+            self.clear_auto_send();
+        }
+        had
+    }
+
+    /// Notify extensions when the prompt draft changed since the last tick.
+    ///
+    /// This is how a voice extension learns the user is composing again, so it
+    /// can stop reading the previous answer aloud (barge-in) — the draft text
+    /// itself is not shipped, only `chars`/`empty`/`source`.
+    ///
+    /// `source` separates a human edit from one the TUI made on a plugin's
+    /// behalf (`SetEditorText`, or clearing the draft after an auto-send). A
+    /// hands-free extension needs that distinction: its own injected
+    /// transcription must not be mistaken for the user taking over the
+    /// keyboard, which would make it stop listening on every single turn.
+    ///
+    /// Polled from the render tick rather than pushed from [`Editor::on_change`]:
+    /// that callback slot already has an owner (the bash-mode border colour) and
+    /// runs while the editor's callback lock is held, where re-entering
+    /// extension code is needlessly risky.
+    fn sync_editor_change(&self) {
+        use rpi_plugin_sdk::EventTag;
+
+        let Some(payload) = self.take_editor_change() else {
+            return;
+        };
+        // Cheap pre-check so the common (no subscriber) case never touches a
+        // plugin: session lock + snapshot read only.
+        let Ok(session) = self.extension_session.lock() else {
+            return;
+        };
+        let Some(snapshot) = session.snapshot_arc() else {
+            return;
+        };
+        if snapshot.handlers_for(EventTag::EditorChange).is_empty() {
+            return;
+        }
+        rpi_extensions::dispatch_data_event(
+            &snapshot,
+            EventTag::EditorChange,
+            &payload.to_string(),
+        );
+    }
+
+    /// Build the `EditorChange` payload when the draft changed since the last
+    /// tick, or `None` when it did not. Split out of
+    /// [`Self::sync_editor_change`] so the attribution rule is unit-testable
+    /// without a live extension registry.
+    ///
+    /// The attribution is consumed here — even when the caller then finds no
+    /// subscriber — so a stale "programmatic" mark can never mislabel a later
+    /// real keystroke.
+    fn take_editor_change(&self) -> Option<serde_json::Value> {
+        let text = self.editor.get_text();
+        {
+            let mut last = self.last_editor_text.lock().unwrap();
+            if *last == text {
+                return None;
+            }
+            *last = text.clone();
+        }
+        let programmatic = self
+            .programmatic_editor_write
+            .swap(false, std::sync::atomic::Ordering::SeqCst);
+        Some(serde_json::json!({
+            "chars": text.chars().count(),
+            "empty": text.is_empty(),
+            "source": if programmatic {
+                // The TUI wrote it (an injected draft / the auto-send clear).
+                "extension"
+            } else {
+                "user"
+            },
+        }))
+    }
+
     /// The bash panel has its own `Running...` spinner. Keep the global
     /// `Working...` loader out of the status slot while any bash tool is active
     /// so the same operation is not presented as two simultaneous loaders.
@@ -5409,13 +5746,13 @@ impl TuiState {
         next
     }
 
-    /// The model id currently tracked as active (footer + Ctrl+M anchor).
+    /// The model id currently tracked as active (footer + Ctrl+P anchor).
     fn current_model_id(&self) -> String {
         self.current_model_id.lock().unwrap().clone()
     }
 
     /// Update the tracked model id + footer label after a switch (live or
-    /// cycle). Called from the `/model` on_select and the Ctrl+M handler.
+    /// cycle). Called from the `/model` on_select and the Ctrl+P handler.
     fn set_current_model(&self, model: &rpi_ai::Model) {
         *self.current_model_id.lock().unwrap() = model.id.clone();
         self.footer.set_model(&short_model_name(&model.id));
@@ -5853,7 +6190,7 @@ pub async fn interactive_tui(
     if let Some(m) = model_catalog.iter().find(|m| m.id == lane_model_id) {
         footer.set_context_window(m.context_window as i64);
     }
-    footer.set_hints("Enter: Send | Shift+Enter: New line | Ctrl+C: Abort/Exit | Esc: Abort | Ctrl+L: Model | Ctrl+M: Cycle | Ctrl+T: Expand tool | /help");
+    footer.set_hints("Enter: Send | Shift+Enter: New line | Ctrl+C: Clear/Exit | Esc: Abort | Ctrl+L: Model | Ctrl+P: Cycle | Ctrl+T: Expand tool | /help");
 
     // Live git-branch refresh (native fs-watch on `.git/HEAD`): a checkout or
     // commit updates the footer's branch without a manual refresh.
@@ -5940,6 +6277,10 @@ pub async fn interactive_tui(
         status: std::sync::Mutex::new(RunStatus::Idle),
         ext_status: reload_context.ext_status.clone(),
         ext_status_revision: std::sync::atomic::AtomicU64::new(u64::MAX),
+        editor_text: reload_context.editor_text.clone(),
+        auto_send: std::sync::Mutex::new(None),
+        last_editor_text: std::sync::Mutex::new(String::new()),
+        programmatic_editor_write: std::sync::atomic::AtomicBool::new(false),
         js_preparation_cancel: std::sync::Mutex::new(None),
         user_bash_cancel: std::sync::Mutex::new(None),
         pending_bash_messages: std::sync::Mutex::new(Vec::new()),
@@ -6284,6 +6625,9 @@ pub async fn interactive_tui(
     // `request_render` the spinner visibly freezes between events.
     let tui_tick = tui.clone();
     let state_tick = state.clone();
+    // The tick, not the key loop, drives the voice-draft auto-send: it must
+    // fire even when the user types nothing.
+    let tx_tick = tx.clone();
     let tick_handle = tokio::spawn(async move {
         // 80ms per frame — native pi's `DEFAULT_INTERVAL_MS`, i.e. a full
         // 10-frame cycle every 800ms. The tick only *requests a repaint*; the
@@ -6302,6 +6646,18 @@ pub async fn interactive_tui(
             // Extension status (langfuse ✓ …, …) — cheap revision check, and the
             // only reason an idle session repaints its footer.
             if state_tick.sync_extension_status() {
+                tui_tick.request_render(false);
+            }
+            // Extension editor-text injection (`SetEditorText`): a voice plugin
+            // drops a transcription in as an editable draft.
+            if state_tick.drain_editor_text() {
+                tui_tick.request_render(false);
+            }
+            // Tell extensions the draft changed (voice barge-in). Runs after the
+            // drain so an injected transcription also counts as a change.
+            state_tick.sync_editor_change();
+            // Advance a draft's auto-send countdown (submit / cancel / repaint).
+            if poll_auto_send(&state_tick, &tx_tick) {
                 tui_tick.request_render(false);
             }
             let working = *state_tick.status.lock().unwrap() == RunStatus::Working;
@@ -6357,6 +6713,9 @@ pub async fn interactive_tui(
 
     let key_handle = tokio::task::spawn_blocking(move || {
         let mut last_escape_time = None;
+        // Native pi's `handleCtrlC` "press twice to exit" window: the instant of
+        // the last lone Ctrl+C. Shares the 500ms with Esc's double-escape.
+        let mut last_sigint_time: Option<std::time::Instant> = None;
         // Paste-burst tracking (see the bare-Enter guard below): the instant of
         // the most recent key event that could have been pasted text.
         let mut last_text_key_at: Option<std::time::Instant> = None;
@@ -6525,6 +6884,12 @@ pub async fn interactive_tui(
             // actually arrived before any routing decision, so a client that
             // sends LF for Enter is visible as `Char('j') mods=CONTROL`.
             crate::key_trace::key(&key, "");
+            // A key press during a voice-draft auto-send countdown cancels the
+            // countdown — the user wants to edit, not send. The key still falls
+            // through to the editor, so it doubles as their first correction.
+            if key.kind != KeyEventKind::Release && state_for_key.cancel_auto_send_on_key() {
+                tui_for_key.request_render(false);
+            }
             // Extension shortcuts see Press *and* Release (this is what lets a
             // push-to-talk extension time a hold). Checked before the
             // release-drop below; a claimed key with an empty editor is routed
@@ -6639,71 +7004,77 @@ pub async fn interactive_tui(
                 continue;
             }
 
-            // 0. Ctrl+C: copy the selection when the editor has one (pi
-            //    `tui.input.copy`); otherwise abort an active run, or exit
-            //    when idle. Open selectors and extension dialogs are handled
-            //    above so their cancellation callbacks get first chance.
+            // 0. Ctrl+C: native pi's `handleCtrlC`. A second press inside the
+            //    double-press window quits; any other press only clears the
+            //    editor (text *and* selection — native `clearEditor`). It never
+            //    aborts — `app.interrupt` (Esc) owns cancelling a run — so a
+            //    stray Ctrl+C while streaming can no longer kill the turn.
+            //    Open selectors and extension dialogs are handled above so
+            //    their cancellation callbacks get first chance.
             if keybinding_matches(
                 &keybindings_for_key,
                 &key,
                 rpi_tui::keybindings::keys::CLEAR,
             ) {
-                if !state_for_key.selector_open() && editor_for_key.has_selection() {
-                    editor_for_key.copy_selection();
-                    continue;
-                }
-                let status = *state_for_key.status.lock().unwrap();
-                match status {
-                    RunStatus::Working => {
-                        state_for_key.set_status(RunStatus::Aborting);
-                        // Drop any outstanding ask_user prompt from this turn.
-                        ask_user_for_key.cancel_all();
-                        // Restore the editor if an extension dialog was occupying it.
-                        if !run_extension_cancel(&state_for_key)
-                            && state_for_key.extension_dialog_open()
-                        {
-                            close_extension_editor(
-                                &state_for_key,
-                                &ctx_for_key.editor_container,
-                                &editor_for_key,
-                                &tui_for_key,
-                            );
+                // A held key auto-repeats: only a fresh Press may arm or
+                // consume the window, so holding Ctrl+C cannot turn one tap
+                // into the quit.
+                if key.kind != KeyEventKind::Repeat {
+                    let now = std::time::Instant::now();
+                    match ctrl_c_action(last_sigint_time, now) {
+                        CtrlCAction::Exit => {
+                            last_sigint_time = None;
+                            // The async loop parks inside
+                            // `run_prompt_streaming(..).await` for the whole run,
+                            // so a queued `Exit` would not be read until the run
+                            // returns — force the quit while one is active. Either
+                            // way the TUI stays quittable.
+                            if *state_for_key.status.lock().unwrap() == RunStatus::Idle {
+                                let _ = tx_for_key.send(TuiMessage::Exit);
+                            } else {
+                                emergency_exit(&tui_for_key);
+                            }
                         }
-                        // Pull queued steering/follow-up messages back into the
-                        // editor BEFORE aborting (native pi's
-                        // `restoreQueuedMessagesToEditor({abort:true})`), so a
-                        // cancel never silently swallows staged messages.
-                        abort_run_restoring_queue(
-                            lane_for_key.clone(),
-                            editor_for_key.clone(),
-                            state_for_key.clone(),
-                            tui_for_key.clone(),
-                        );
-                    }
-                    // A held Ctrl+C can emit Repeat immediately after Press.
-                    // Keep waiting for the in-flight cancellation instead of
-                    // treating that repeat as a request to exit the process.
-                    RunStatus::Aborting => {
-                        // A second, *deliberate* Ctrl+C. The first press only
-                        // got as far as `Aborting`, which means the abort has
-                        // not landed yet — and the async loop is still inside
-                        // `run_prompt_streaming(..).await`, so a queued
-                        // `TuiMessage::Exit` would not be read until the run
-                        // returns, which is exactly what is not happening.
-                        //
-                        // Exit here instead: the TUI must never be unquittable
-                        // (a provider request or tool that never returns would
-                        // otherwise trap the user forever). Auto-repeat is
-                        // filtered out, so holding the key through a slow abort
-                        // cannot kill the process by accident.
-                        if key.kind != KeyEventKind::Repeat {
-                            emergency_exit(&tui_for_key);
+                        CtrlCAction::Clear => {
+                            editor_for_key.clear();
+                            refresh_autocomplete(&state_for_key, &editor_for_key);
+                            last_sigint_time = Some(now);
+                            tui_for_key.request_render(false);
                         }
                     }
-                    RunStatus::Idle => {
-                        let _ = tx_for_key.send(TuiMessage::Exit);
-                    }
                 }
+                continue;
+            }
+
+            // 0b. Ctrl+X: native pi's `app.message.copy` — copy the editor
+            //     selection, else the last assistant reply. Native's Ctrl+C no
+            //     longer copies, so selection-copy lives here now.
+            if !state_for_key.selector_open()
+                && keybinding_matches(
+                    &keybindings_for_key,
+                    &key,
+                    rpi_tui::keybindings::keys::MESSAGE_COPY,
+                )
+            {
+                if editor_for_key.has_selection() && editor_for_key.copy_selection() {
+                    add_note_message(&state_for_key.chat_container, "Copied!");
+                } else {
+                    copy_last_assistant(&state_for_key, &state_for_key.chat_container);
+                }
+                tui_for_key.request_render(false);
+                continue;
+            }
+
+            // 0c. Ctrl+Z (Unix only): native pi's `app.suspend` — hand the
+            //     terminal back to the shell and stop ourselves; `SIGTSTP`
+            //     returns when the user resumes with `fg`. Windows binds no key
+            //     here (native's `defaultKeys` is empty), so this never fires.
+            if keybinding_matches(
+                &keybindings_for_key,
+                &key,
+                rpi_tui::keybindings::keys::SUSPEND,
+            ) {
+                handle_suspend(&tui_for_key);
                 continue;
             }
 
@@ -6738,45 +7109,25 @@ pub async fn interactive_tui(
                 continue;
             }
 
-            // 2a. Ctrl+D: pi's deleteCharForward inside the editor (mirrors
-            //     `tui.editor.deleteCharForward`), and EOF-quit on an empty
-            //     editor. With a run active, abort it first (same as Ctrl+C)
-            //     so the key is never a no-op while a stuck command runs.
+            // 2a. Ctrl+D: native pi's `app.exit`. `handleCtrlD` only fires when
+            //     the editor is empty; with text present the key falls through to
+            //     the editor's deleteCharForward (`tui.editor.deleteCharForward`).
+            //     It never aborts — that is `app.interrupt` (Esc)'s job.
             if keybinding_matches(&keybindings_for_key, &key, rpi_tui::keybindings::keys::EXIT) {
-                let status = *state_for_key.status.lock().unwrap();
-                match status {
-                    RunStatus::Working => {
-                        state_for_key.set_status(RunStatus::Aborting);
-                        ask_user_for_key.cancel_all();
-                        if !run_extension_cancel(&state_for_key)
-                            && state_for_key.extension_dialog_open()
-                        {
-                            close_extension_editor(
-                                &state_for_key,
-                                &ctx_for_key.editor_container,
-                                &editor_for_key,
-                                &tui_for_key,
-                            );
-                        }
-                        abort_run_restoring_queue(
-                            lane_for_key.clone(),
-                            editor_for_key.clone(),
-                            state_for_key.clone(),
-                            tui_for_key.clone(),
-                        );
-                        continue;
-                    }
-                    RunStatus::Aborting => continue,
-                    RunStatus::Idle => {}
-                }
-                if !state_for_key.selector_open() && !editor_for_key.get_text().is_empty() {
+                if !editor_for_key.get_text().is_empty() {
                     // Editor holds text — delete the char forward (pi parity).
                     editor_for_key.handle_key(key);
                     refresh_autocomplete(&state_for_key, &editor_for_key);
                     tui_for_key.request_render_reusing_scroll_content();
                     continue;
                 }
-                let _ = tx_for_key.send(TuiMessage::Exit);
+                // Empty editor → quit. A parked run needs the forced path: a
+                // queued `Exit` is unread until the run returns.
+                if *state_for_key.status.lock().unwrap() == RunStatus::Idle {
+                    let _ = tx_for_key.send(TuiMessage::Exit);
+                } else {
+                    emergency_exit(&tui_for_key);
+                }
                 continue;
             }
 
@@ -6894,7 +7245,7 @@ pub async fn interactive_tui(
                 continue;
             }
 
-            // 2f. Ctrl+M: cycle to the next model in the catalog after the one
+            // 2f. Ctrl+P: cycle to the next model in the catalog after the one
             //     currently tracked in `current_model_id`, apply it live via
             //     `lane.set_model` (takes effect on the next user message — the
             //     in-flight run's config is already snapshotted), and update the
@@ -6913,6 +7264,26 @@ pub async fn interactive_tui(
                     let lane = lane_for_key.clone();
                     tokio::spawn(async move {
                         let _ = lane.set_model(next).await;
+                    });
+                    tui_for_key.request_render_reusing_scroll_content();
+                }
+                continue;
+            }
+
+            // 2f-bis. Shift+Ctrl+P (Alt+P on Windows): cycle to the *previous*
+            //     model, the mirror of the Ctrl+P hotkey above.
+            if keybinding_matches(
+                &keybindings_for_key,
+                &key,
+                rpi_tui::keybindings::keys::MODEL_CYCLE_BACKWARD,
+            ) {
+                let current = state_for_key.current_model_id();
+                let scope = scoped_catalog(&ctx_for_key.model_catalog, &current);
+                if let Some(prev) = cycle_prev_model(&scope, &current) {
+                    state_for_key.set_current_model(&prev);
+                    let lane = lane_for_key.clone();
+                    tokio::spawn(async move {
+                        let _ = lane.set_model(prev).await;
                     });
                     tui_for_key.request_render_reusing_scroll_content();
                 }
@@ -7182,10 +7553,15 @@ pub async fn interactive_tui(
                 continue;
             }
 
-            // Alt+Enter queues a follow-up while a run is active. It is
-            // handled here because Editor treats only a bare Enter as submit;
-            // idle Alt+Enter keeps the normal prompt behavior.
-            if key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Enter {
+            // `app.message.followUp` (Alt+Enter; Ctrl+Q and Alt+Enter on
+            // Windows) queues a follow-up while a run is active. It is handled
+            // here because Editor treats only a bare Enter as submit; when idle
+            // the same key keeps the normal prompt behavior.
+            if keybinding_matches(
+                &keybindings_for_key,
+                &key,
+                rpi_tui::keybindings::keys::MESSAGE_FOLLOW_UP,
+            ) {
                 let prompt = editor_for_key.get_expanded_text().trim().to_string();
                 if prompt.is_empty() {
                     continue;
@@ -7387,8 +7763,11 @@ pub async fn interactive_tui(
                 // Clear the editor so the next prompt starts fresh (the submit
                 // handler runs on the blocking key thread and can't mutate the
                 // editor state safely there; clearing here, on the async loop,
-                // keeps it on one thread).
-                editor.clear();
+                // keeps it on one thread). Marked programmatic: this is the host
+                // tidying up after a submit, not the user typing — reporting it
+                // as a user edit made a hands-free voice session switch itself
+                // off the moment it was started.
+                state.clear_editor_programmatically();
                 let prompt_images = state.take_pending_images();
                 if !prompt_images.is_empty() {
                     add_note_message(
@@ -7900,8 +8279,8 @@ async fn run_prompt_streaming(
     // session with no prompt never starts Node merely to render its welcome
     // screen; JS commands/tools still trigger the same lazy ensure path.
     // Preparation is part of the active turn. Mark it working before Node can
-    // block so Ctrl+C, Ctrl+D, and Esc all retain their documented abort
-    // semantics for initial argv prompts as well as editor submissions.
+    // block so Ctrl+D and Esc retain their documented abort semantics for
+    // initial argv prompts as well as editor submissions.
     state.set_status(RunStatus::Working);
     tui.request_render(false);
     if !ensure_js_runtime_before_prompt(js, lane, state, dialog_bridge, args).await {
@@ -8364,13 +8743,7 @@ fn abort_run_restoring_queue(
     tui: Arc<TuiAltScreen>,
 ) {
     tokio::spawn(async move {
-        let _ = restore_queued_messages_to_editor(
-            lane.clone(),
-            editor,
-            state,
-            tui.clone(),
-        )
-        .await;
+        let _ = restore_queued_messages_to_editor(lane.clone(), editor, state, tui.clone()).await;
         let _ = lane.abort().await;
         tui.request_render(false);
     });
@@ -8868,7 +9241,7 @@ fn open_model_selector(
 
     // Capture the catalog + lane so the on_select closure can resolve the
     // chosen Model and apply it. `on_select` fires on the blocking key thread,
-    // so the async `set_model` runs on a spawned task (matches Ctrl+M).
+    // so the async `set_model` runs on a spawned task (matches Ctrl+P).
     let catalog_arc = catalog.to_vec();
     let state_sel = state.clone();
     let ec_sel = editor_container.clone();
@@ -8926,7 +9299,7 @@ fn open_model_selector(
 /// Cycle to the next catalog entry after `current_id`, wrapping to the first.
 /// Returns `None` only when the catalog is empty or the current id isn't
 /// found (in which case the first entry is returned — a no-op if it IS the
-/// current). Used by the Ctrl+M model-cycle hotkey.
+/// current). Used by the Ctrl+P model-cycle hotkey.
 fn cycle_next_model(catalog: &[rpi_ai::Model], current_id: &str) -> Option<rpi_ai::Model> {
     if catalog.is_empty() {
         return None;
@@ -8938,6 +9311,24 @@ fn cycle_next_model(catalog: &[rpi_ai::Model], current_id: &str) -> Option<rpi_a
         Some(i) => {
             let next = (i + 1) % catalog.len();
             Some(catalog[next].clone())
+        }
+        None => Some(catalog[0].clone()),
+    }
+}
+
+/// Cycle to the catalog entry *before* `current_id`, wrapping to the last —
+/// the mirror of [`cycle_next_model`] for the previous-model hotkey.
+fn cycle_prev_model(catalog: &[rpi_ai::Model], current_id: &str) -> Option<rpi_ai::Model> {
+    if catalog.is_empty() {
+        return None;
+    }
+    let idx = catalog
+        .iter()
+        .position(|m| m.id.eq_ignore_ascii_case(current_id));
+    match idx {
+        Some(i) => {
+            let prev = (i + catalog.len() - 1) % catalog.len();
+            Some(catalog[prev].clone())
         }
         None => Some(catalog[0].clone()),
     }
@@ -9671,7 +10062,7 @@ fn add_welcome_message_with_capabilities(
     )));
     let hint = c
         .dim
-        .fg("Enter send · Shift+Enter newline · Ctrl+C abort · Esc abort · /help");
+        .fg("Enter send · Shift+Enter newline · Ctrl+C clear · Esc abort · /help");
     container.add_child(Arc::new(Text::new(hint, 1, 0)));
     container.add_child(Arc::new(Spacer::new(1)));
     container.add_child(Arc::new(Text::new(
@@ -9909,10 +10300,11 @@ fn add_hotkeys_message(container: &Arc<Container>) {
         ("Ctrl+- / Ctrl+R", "Undo / redo"),
         ("Ctrl+Y / Alt+Y", "Yank / yank-pop"),
         ("Alt+Backspace", "Kill previous word"),
-        ("Ctrl+C", "Abort a run, or exit when idle"),
+        ("Ctrl+C", "Clear the editor (press twice quickly to exit)"),
+        ("Ctrl+X", "Copy the editor selection or the last reply"),
         ("Esc", "Abort a running prompt"),
         ("Ctrl+L", "Open model selector"),
-        ("Ctrl+M", "Cycle to the next model (live)"),
+        ("Ctrl+P", "Cycle to the next model (live)"),
         ("Ctrl+O", "Expand/collapse all tool output"),
         ("Ctrl+T", "Show/hide reasoning blocks"),
         ("PageUp/Down", "Scroll transcript by one page"),
@@ -10146,6 +10538,83 @@ mod tests {
     use super::*;
     use rpi_tui::Component;
 
+    /// A draft injected from a voice transcription is submitted only when it is
+    /// still exactly what we put in the editor and no run has started; any
+    /// user edit (or a cleared editor) hands it back for editing instead.
+    #[test]
+    fn auto_send_cancels_when_the_user_edits_the_draft() {
+        let now = std::time::Instant::now();
+        let pending = AutoSendPending {
+            deadline: now + std::time::Duration::from_secs(2),
+            text: "hello world".to_string(),
+        };
+        // Untouched → still counting down.
+        assert!(matches!(
+            auto_send_step(Some(&pending), "hello world", true, now),
+            AutoSendStep::Wait(_)
+        ));
+        // One added character is the user's correction: never send a draft
+        // they are actively editing.
+        assert_eq!(
+            auto_send_step(Some(&pending), "hello worlds", true, now),
+            AutoSendStep::Cancel
+        );
+        // Cleared out from under us (a slash command, Esc).
+        assert_eq!(
+            auto_send_step(Some(&pending), "", true, now),
+            AutoSendStep::Cancel
+        );
+        // Whitespace is not content.
+        assert_eq!(
+            auto_send_step(Some(&pending), "   ", true, now),
+            AutoSendStep::Cancel
+        );
+    }
+
+    /// The countdown fires exactly at the deadline, and never injects a prompt
+    /// into a run that started while it was ticking.
+    #[test]
+    fn auto_send_submits_at_the_deadline_only_while_idle() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2000);
+        let pending = AutoSendPending {
+            deadline,
+            text: "go".to_string(),
+        };
+        assert!(matches!(
+            auto_send_step(
+                Some(&pending),
+                "go",
+                true,
+                deadline - std::time::Duration::from_millis(1)
+            ),
+            AutoSendStep::Wait(_)
+        ));
+        assert_eq!(
+            auto_send_step(Some(&pending), "go", true, deadline),
+            AutoSendStep::Submit
+        );
+        // A turn started underneath the countdown — keep the draft, do not
+        // queue a prompt mid-turn.
+        assert_eq!(
+            auto_send_step(Some(&pending), "go", false, deadline),
+            AutoSendStep::Cancel
+        );
+        // Nothing pending.
+        assert_eq!(
+            auto_send_step(None, "go", true, deadline),
+            AutoSendStep::Idle
+        );
+    }
+
+    /// The footer text the countdown writes is prefixed so `clear_auto_send`
+    /// can tell its own message from an unrelated run status.
+    #[test]
+    fn auto_send_footer_label_is_recognisable() {
+        let label = format!("{AUTO_SEND_PREFIX}2.0s · any key to edit");
+        assert!(label.starts_with(AUTO_SEND_PREFIX));
+        assert!(!"Working…".starts_with(AUTO_SEND_PREFIX));
+    }
+
     #[test]
     fn markdown_flag_only_comes_from_an_explicit_true() {
         // Tools opt in by setting `details.markdown = true` (rpi-todo does).
@@ -10180,6 +10649,10 @@ mod tests {
             status: std::sync::Mutex::new(RunStatus::Idle),
             ext_status: rpi_extensions::ExtensionStatusMailbox::new(),
             ext_status_revision: std::sync::atomic::AtomicU64::new(u64::MAX),
+            editor_text: rpi_extensions::EditorTextMailbox::new(),
+            auto_send: std::sync::Mutex::new(None),
+            last_editor_text: std::sync::Mutex::new(String::new()),
+            programmatic_editor_write: std::sync::atomic::AtomicBool::new(false),
             js_preparation_cancel: std::sync::Mutex::new(None),
             user_bash_cancel: std::sync::Mutex::new(None),
             pending_bash_messages: std::sync::Mutex::new(Vec::new()),
@@ -10223,6 +10696,125 @@ mod tests {
         })
     }
 
+    /// A `SetEditorText` injection — and the host's own auto-send clear — must be
+    /// attributed to `extension`, not to the user.
+    ///
+    /// A hands-free voice extension stands down whenever `source == "user"`
+    /// (the human took the keyboard), so mislabelling the plugin's own injected
+    /// transcription would cancel the whole conversation on its first turn.
+    #[test]
+    fn editor_change_source_separates_tui_writes_from_typing() {
+        use std::sync::atomic::Ordering;
+        let state = test_tui_state();
+
+        // Nothing changed yet → nothing to report.
+        assert!(state.take_editor_change().is_none());
+
+        // The render tick applies an extension's draft…
+        state.editor_text.push(rpi_extensions::EditorTextEdit {
+            text: "你好".to_string(),
+            mode: rpi_extensions::EditorTextMode::Replace,
+            auto_send_ms: Some(2000),
+        });
+        assert!(state.drain_editor_text(), "the queued draft must land");
+        assert!(
+            state.programmatic_editor_write.load(Ordering::SeqCst),
+            "a mailbox-applied edit must be marked programmatic"
+        );
+
+        // …so its change is ours, not the user's.
+        let payload = state
+            .take_editor_change()
+            .expect("draft applied ⇒ a change");
+        assert_eq!(payload["source"], serde_json::json!("extension"));
+        assert_eq!(payload["chars"], serde_json::json!(2));
+        assert_eq!(payload["empty"], serde_json::json!(false));
+
+        // The mark was consumed: the same text twice is not re-reported, and a
+        // genuine human edit is attributed to the user.
+        assert!(state.take_editor_change().is_none());
+        state.editor.set_text("你好啊");
+        let payload = state.take_editor_change().expect("typing ⇒ a change");
+        assert_eq!(payload["source"], serde_json::json!("user"));
+        assert_eq!(payload["chars"], serde_json::json!(3));
+    }
+
+    /// The attribution mark must not survive unrelated changes, or one injected
+    /// draft would make the *next* keystroke look programmatic too.
+    #[test]
+    fn programmatic_mark_is_consumed_even_with_no_subscriber() {
+        use std::sync::atomic::Ordering;
+        let state = test_tui_state();
+        assert!(
+            state
+                .extension_session
+                .lock()
+                .unwrap()
+                .snapshot_arc()
+                .is_none(),
+            "this test relies on nobody subscribing"
+        );
+
+        state.editor_text.push(rpi_extensions::EditorTextEdit {
+            text: "draft".to_string(),
+            mode: rpi_extensions::EditorTextMode::Replace,
+            auto_send_ms: None,
+        });
+        state.drain_editor_text();
+        // `sync_editor_change` bails out early (no subscriber)…
+        state.sync_editor_change();
+        // …but the mark is gone, so the next real edit is the user's.
+        assert!(!state.programmatic_editor_write.load(Ordering::SeqCst));
+        state.editor.set_text("draft +");
+        let payload = state.take_editor_change().expect("typing ⇒ a change");
+        assert_eq!(payload["source"], serde_json::json!("user"));
+    }
+
+    /// Regression: the editor clear that follows *every* submit is host
+    /// housekeeping, not the user typing.
+    ///
+    /// Reporting it as `source:"user"` switched a hands-free voice session off
+    /// the instant it was switched on: `/voice auto` turns the mode on, then the
+    /// render tick notices the cleared editor ~80ms later, stands the mode down
+    /// and aborts the listen it just started — so the microphone never stayed
+    /// open and the session looked like it "didn't hear anything".
+    #[test]
+    fn submit_clear_is_attributed_to_the_host_not_the_user() {
+        let state = test_tui_state();
+
+        // Typing the command is a genuine user edit.
+        state.editor.set_text("/voice auto");
+        assert_eq!(
+            state.take_editor_change().unwrap()["source"],
+            serde_json::json!("user")
+        );
+
+        // The submit path's clear is not.
+        state.clear_editor_programmatically();
+        let payload = state.take_editor_change().expect("clearing is a change");
+        assert_eq!(payload["empty"], serde_json::json!(true));
+        assert_eq!(
+            payload["source"],
+            serde_json::json!("extension"),
+            "a submit-clear must not be reported as the user typing"
+        );
+    }
+
+    /// A user-initiated clear (Esc, select-all + delete) still goes through the
+    /// editor itself and must stay `user` — only host writes are reattributed.
+    #[test]
+    fn user_initiated_clear_stays_a_user_change() {
+        let state = test_tui_state();
+        state.editor.set_text("draft");
+        assert_eq!(
+            state.take_editor_change().unwrap()["source"],
+            serde_json::json!("user")
+        );
+        state.editor.clear();
+        let payload = state.take_editor_change().expect("clearing is a change");
+        assert_eq!(payload["source"], serde_json::json!("user"));
+    }
+
     #[test]
     fn live_panel_repaints_while_a_tool_or_bash_is_running() {
         // No panels → only the dock loader animates (reuse the cached
@@ -10252,6 +10844,24 @@ mod tests {
         assert_eq!(
             merge_queued_into_draft("queued", "typed"),
             "queued\n\ntyped"
+        );
+    }
+
+    #[test]
+    fn dequeue_places_the_caret_at_the_end_of_the_last_line_in_bytes() {
+        // Restoring queued messages followed by the old `(0, char_count)` call
+        // parked the caret at the end of the FIRST line, and treated a char
+        // count as a byte offset (so any CJK draft landed mid-character).
+        let editor = Arc::new(Editor::simple());
+        // Multi-line + multibyte: the caret must be on the LAST row, after the
+        // final byte of that row.
+        let text = "排队\n第二行";
+        set_editor_text_caret_at_end(&editor, text);
+        assert_eq!(editor.get_text(), text);
+        assert_eq!(
+            editor.cursor_position(),
+            (1, "第二行".len()),
+            "caret must sit at the end of the last line, in bytes"
         );
     }
 
@@ -11174,6 +11784,10 @@ mod tests {
             status: std::sync::Mutex::new(RunStatus::Idle),
             ext_status: rpi_extensions::ExtensionStatusMailbox::new(),
             ext_status_revision: std::sync::atomic::AtomicU64::new(u64::MAX),
+            editor_text: rpi_extensions::EditorTextMailbox::new(),
+            auto_send: std::sync::Mutex::new(None),
+            last_editor_text: std::sync::Mutex::new(String::new()),
+            programmatic_editor_write: std::sync::atomic::AtomicBool::new(false),
             js_preparation_cancel: std::sync::Mutex::new(None),
             user_bash_cancel: std::sync::Mutex::new(None),
             pending_bash_messages: std::sync::Mutex::new(Vec::new()),
@@ -11607,6 +12221,29 @@ mod tests {
     }
 
     #[test]
+    fn test_cycle_prev_model_wraps_around() {
+        use rpi_ai::{Api, Model};
+        let mk = |id: &str| {
+            Model::new(
+                id,
+                id,
+                Api::AnthropicMessages,
+                "anthropic",
+                "https://api.anthropic.com",
+            )
+        };
+        let catalog = [mk("a"), mk("b"), mk("c")];
+        // Previous before "b" is "a"; before "a" wraps to "c".
+        assert_eq!(cycle_prev_model(&catalog, "b").unwrap().id, "a");
+        assert_eq!(cycle_prev_model(&catalog, "a").unwrap().id, "c");
+        // An unknown current id falls back to the first model.
+        assert_eq!(cycle_prev_model(&catalog, "zzz").unwrap().id, "a");
+        // Empty catalog yields None.
+        let empty: Vec<Model> = vec![];
+        assert!(cycle_prev_model(&empty, "a").is_none());
+    }
+
+    #[test]
     fn test_autocomplete_slash_suggestions_render() {
         // The autocomplete container should render at least one suggestion
         // line when the editor holds a `/` prefix, and clear when it doesn't.
@@ -11621,6 +12258,10 @@ mod tests {
             status: std::sync::Mutex::new(RunStatus::Idle),
             ext_status: rpi_extensions::ExtensionStatusMailbox::new(),
             ext_status_revision: std::sync::atomic::AtomicU64::new(u64::MAX),
+            editor_text: rpi_extensions::EditorTextMailbox::new(),
+            auto_send: std::sync::Mutex::new(None),
+            last_editor_text: std::sync::Mutex::new(String::new()),
+            programmatic_editor_write: std::sync::atomic::AtomicBool::new(false),
             js_preparation_cancel: std::sync::Mutex::new(None),
             user_bash_cancel: std::sync::Mutex::new(None),
             pending_bash_messages: std::sync::Mutex::new(Vec::new()),
@@ -11704,6 +12345,10 @@ mod tests {
             status: std::sync::Mutex::new(RunStatus::Idle),
             ext_status: rpi_extensions::ExtensionStatusMailbox::new(),
             ext_status_revision: std::sync::atomic::AtomicU64::new(u64::MAX),
+            editor_text: rpi_extensions::EditorTextMailbox::new(),
+            auto_send: std::sync::Mutex::new(None),
+            last_editor_text: std::sync::Mutex::new(String::new()),
+            programmatic_editor_write: std::sync::atomic::AtomicBool::new(false),
             js_preparation_cancel: std::sync::Mutex::new(None),
             user_bash_cancel: std::sync::Mutex::new(None),
             pending_bash_messages: std::sync::Mutex::new(Vec::new()),
@@ -11790,6 +12435,10 @@ mod tests {
             status: std::sync::Mutex::new(RunStatus::Idle),
             ext_status: rpi_extensions::ExtensionStatusMailbox::new(),
             ext_status_revision: std::sync::atomic::AtomicU64::new(u64::MAX),
+            editor_text: rpi_extensions::EditorTextMailbox::new(),
+            auto_send: std::sync::Mutex::new(None),
+            last_editor_text: std::sync::Mutex::new(String::new()),
+            programmatic_editor_write: std::sync::atomic::AtomicBool::new(false),
             js_preparation_cancel: std::sync::Mutex::new(None),
             user_bash_cancel: std::sync::Mutex::new(None),
             pending_bash_messages: std::sync::Mutex::new(Vec::new()),
@@ -11879,6 +12528,10 @@ mod tests {
             status: std::sync::Mutex::new(RunStatus::Idle),
             ext_status: rpi_extensions::ExtensionStatusMailbox::new(),
             ext_status_revision: std::sync::atomic::AtomicU64::new(u64::MAX),
+            editor_text: rpi_extensions::EditorTextMailbox::new(),
+            auto_send: std::sync::Mutex::new(None),
+            last_editor_text: std::sync::Mutex::new(String::new()),
+            programmatic_editor_write: std::sync::atomic::AtomicBool::new(false),
             js_preparation_cancel: std::sync::Mutex::new(None),
             user_bash_cancel: std::sync::Mutex::new(None),
             pending_bash_messages: std::sync::Mutex::new(Vec::new()),
@@ -11961,6 +12614,24 @@ mod tests {
             Some(now - std::time::Duration::from_millis(501)),
             now
         ));
+    }
+
+    #[test]
+    fn ctrl_c_clears_first_and_only_exits_inside_the_window() {
+        // Native pi's `handleCtrlC`: a lone press clears the editor and never
+        // quits by itself; only a second press within 500ms exits. It must not
+        // abort — Esc owns that.
+        let now = std::time::Instant::now();
+        assert_eq!(ctrl_c_action(None, now), CtrlCAction::Clear);
+        assert_eq!(
+            ctrl_c_action(Some(now - std::time::Duration::from_millis(500)), now),
+            CtrlCAction::Exit
+        );
+        // A slower second press is a fresh "clear", not a quit.
+        assert_eq!(
+            ctrl_c_action(Some(now - std::time::Duration::from_millis(501)), now),
+            CtrlCAction::Clear
+        );
     }
 
     #[test]

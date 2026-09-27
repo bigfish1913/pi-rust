@@ -287,7 +287,7 @@ impl ChatChrome {
     fn new(addr: &str) -> Self {
         let footer = Arc::new(FooterComponent::new());
         footer.set_hints(
-            "Enter: Send | Shift+Enter: New line | Ctrl+C: Abort/Exit | Esc: Abort | /help",
+            "Enter: Send | Shift+Enter: New line | Ctrl+C: Clear/Exit | Esc: Abort | /help",
         );
         Self {
             header: Arc::new(Text::new(format!("rpi · {addr} · connecting…"), 1, 0)),

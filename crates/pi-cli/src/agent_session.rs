@@ -103,7 +103,7 @@ pub struct AgentSession {
 impl AgentSession {
     /// Wrap an existing harness. `catalog` is the resolved model catalog the
     /// session may switch within; `scoped_models` is the (possibly empty)
-    /// settings-driven subset used by Ctrl+M / `/model`.
+    /// settings-driven subset used by Ctrl+P / `/model`.
     pub fn new(
         harness: AgentHarness,
         catalog: Vec<Model>,

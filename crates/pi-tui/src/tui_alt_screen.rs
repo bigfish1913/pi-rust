@@ -520,6 +520,41 @@ impl TuiAltScreen {
         }
     }
 
+    /// Hand the terminal back to the shell so the process can be stopped
+    /// (native pi's `handleCtrlZ`): pause the renderer, leave the alternate
+    /// buffer, and restore cooked mode. [`TuiAltScreen::resume`] reverses it
+    /// once `SIGTSTP` returns.
+    ///
+    /// Unlike the private `stop`, this keeps the render scheduler alive, so the
+    /// same TUI can be resumed in place.
+    pub fn suspend(&self) {
+        self.set_render_suspended(true);
+        if !self.uses_main_screen() {
+            // `preserve_screen`: leave the alt buffer without clearing the
+            // user's main-buffer scrollback (unlike a normal shutdown).
+            self.exit_alt_screen(true);
+        }
+        if let Ok(terminal) = self.terminal.lock() {
+            terminal.disable_mouse();
+            terminal.exit_raw_mode();
+            terminal.flush();
+        }
+    }
+
+    /// Re-enter raw mode and the alternate buffer after the process resumes
+    /// from `SIGTSTP`, then force a full repaint (the alt buffer came back
+    /// empty — `set_render_suspended` is what schedules it).
+    pub fn resume(&self) {
+        if let Ok(terminal) = self.terminal.lock() {
+            terminal.enter_raw_mode();
+            terminal.flush();
+        }
+        if !self.uses_main_screen() {
+            self.enter_alt_screen();
+        }
+        self.set_render_suspended(false);
+    }
+
     /// Render the complete component tree into the main terminal buffer. This
     /// follows native pi's regular-mode strategy: append growth with CRLF so
     /// the terminal creates real scrollback, and rewrite only the changed tail.
@@ -1210,6 +1245,10 @@ impl Terminal for TerminalProxy {
         let _ = self.with(|terminal| terminal.enter_raw_mode());
     }
 
+    fn exit_raw_mode(&self) {
+        let _ = self.with(|terminal| terminal.exit_raw_mode());
+    }
+
     fn refresh_size(&self) {
         let _ = self.with(|terminal| terminal.refresh_size());
     }
@@ -1270,6 +1309,7 @@ mod tests {
         fn enable_mouse(&self) {}
         fn disable_mouse(&self) {}
         fn enter_raw_mode(&self) {}
+        fn exit_raw_mode(&self) {}
         fn refresh_size(&self) {}
         fn start(
             &self,

@@ -153,7 +153,7 @@ pub struct Settings {
     /// Saved theme name. Surfaced for best-effort TUI theme application.
     #[serde(default)]
     pub theme: Option<String>,
-    /// `/scoped-models`: the model ids allowed in the Ctrl+M cycle. Absent /
+    /// `/scoped-models`: the model ids allowed in the Ctrl+P cycle. Absent /
     /// empty ⇒ every catalog model cycles (the default). Native pi spells this
     /// `enabledModels`, which is accepted as an alias so a copied `settings.json`
     /// behaves the same.

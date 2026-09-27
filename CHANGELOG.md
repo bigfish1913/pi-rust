@@ -11,6 +11,22 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+### Added
+
+- **Long pastes fold into a `[paste #N …]` marker instead of flooding the
+  editor.** A bracketed paste longer than 10 lines or 1000 characters collapses
+  to a single `[paste #N +M lines]` / `[paste #N M chars]` token, matching native
+  pi, so dropping a stack trace or a file into the prompt still leaves a readable
+  draft. The editor keeps the full text beside the marker — submit sends the
+  expansion — and the marker is atomic: one backspace or arrow press removes or
+  steps over the whole thing, and deleting an earlier marker renumbers the later
+  ones so `#N` stays gapless. Pastes under the threshold still insert verbatim,
+  and Windows' Ctrl+V clipboard fallback takes the same path.
+- **`Ctrl+X` copies the way native pi's `app.message.copy` does.** The editor
+  selection is copied when there is one, otherwise the last assistant reply.
+  Native pi binds the same action to the same key; this is where selection-copy
+  lives now that `Ctrl+C` clears.
+
 ### Changed
 
 - **The terminal window/tab title now carries the startup mark.** An idle
@@ -25,6 +41,46 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
   East-Asian *Ambiguous* and therefore measured differently under a CJK locale.
   Block elements share `█`'s width class, so the title is still single-width
   everywhere.
+- **`Ctrl+C` clears the editor instead of aborting the run, matching native pi's
+  `handleCtrlC`.** One press clears the draft — text *and* selection — and a
+  second press within 500ms quits. Aborting stays on `Esc` (`app.interrupt`), so
+  a stray `Ctrl+C` while a turn is streaming can no longer kill it, which is easy
+  to do while a half-typed steering message sits in the editor. Auto-repeat is
+  ignored, so holding the key cannot turn one tap into the quit; the quit still
+  forces the process out when the async loop is parked inside a run. The footer,
+  `/help`, and the remote-shell footer now read `Ctrl+C: Clear/Exit` and
+  `Esc: Abort` instead of `Ctrl+C: Abort/Exit`.
+- **`Ctrl+D` and the model-cycle keys now match native pi too.** `Ctrl+D` no
+  longer aborts a run: with text in the editor it deletes the character forward
+  (`tui.editor.deleteCharForward`), and on an empty editor it quits
+  (`app.exit`). Aborting is now `Esc` and nothing else. Model cycling moved from
+  `Ctrl+M` to native's `Ctrl+P`, joined by a new `Shift+Ctrl+P` (`Alt+P` on
+  Windows) for the previous model — every hint, selector description, and doc
+  comment that named the old key was updated with it.
+- **The last native-only keybindings are wired up.** `Ctrl+Z` suspends to the
+  background on Unix (`app.suspend` — native binds no key on Windows, so neither
+  does rpi): it stops the renderer, hands the terminal back to the shell, and
+  re-enters the alternate screen when the process is resumed with `fg`. On
+  Windows, `Ctrl+Q` joins `Alt+Enter` for follow-ups and `Alt+V` joins `Ctrl+V`
+  for image paste — native's Windows keys, added alongside rpi's rather than
+  replacing them, because the Windows clipboard-*text* fallback still rides
+  `Ctrl+V`. The registry now matches native's defaults for every app-level
+  action rpi implements.
+
+### Fixed
+
+- **Cancelling a run hands the messages you queued while it was in flight back
+  to the editor.** Esc / Ctrl+C / Ctrl+D aborted the lane, which drains its
+  steering and follow-up queues — and the helper meant to pull them into the
+  editor first existed but was never called, so anything staged during a run
+  vanished on cancel. The three cancel paths now drain the queue into the draft
+  (queued text first, then whatever you had typed, caret at the end of the last
+  line) *before* the abort, mirroring native pi's
+  `restoreQueuedMessagesToEditor({ abort: true })`. Dequeuing with Alt+Q / Alt+Up
+  reports `Restored N queued message(s) to editor` (or `No queued messages to
+  restore`) like native `handleDequeue`, and the restored draft's caret lands on
+  the last line at a byte offset — the old `(0, char_count)` call parked it at
+  the end of the first line and split multi-byte characters.
 
 ## [0.3.3] - 2026-09-26
 
