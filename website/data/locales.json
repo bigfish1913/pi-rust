@@ -374,7 +374,7 @@
       ],
       "releases": [
         {
-          "version": "0.3.3",
+          "version": "0.3.4",
           "status": "current",
           "title": "A crashed session opens again",
           "description": "Two writers on one session log used to make it unopenable; the loader now heals it and a second process is refused instead of double-writing. Plugin tools also receive the session they run in, so per-session state no longer has to be guessed."
