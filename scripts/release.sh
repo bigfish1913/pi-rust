@@ -141,7 +141,7 @@ phase_changelog() {
     return
   fi
   step perl -0pi -e \
-    "s/(## \[Unreleased\]\n)/\$1\n## [$release_version] - $RELEASE_DATE\n/" CHANGELOG.md
+    "s/(## \[Unreleased\])(\r?\n)/\$1\$2\$2## [$release_version] - $RELEASE_DATE\$2/" CHANGELOG.md
 }
 
 phase_docs() {
@@ -150,8 +150,11 @@ phase_docs() {
 }
 
 phase_validate() {
-  note "release-helper validate"
-  step task release:validate RELEASE_VERSION="$release_version"
+  note "release-helper validate (allowing the uncommitted bump)"
+  # The version bump is not committed until `phase_commit`, so the helper must
+  # tolerate a dirty tree here. `task publish` re-runs the strict clean-tree
+  # check after the commit.
+  step task release:validate-dirty RELEASE_VERSION="$release_version"
 }
 
 phase_commit() {

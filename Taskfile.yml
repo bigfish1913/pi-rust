@@ -82,6 +82,15 @@ tasks:
     cmds:
       - '"{{.RPI_RELEASE_HELPER}}" validate "{{.RELEASE_VERSION}}"'
 
+  release:validate-dirty:
+    desc: Validate the release state while the version bump is still uncommitted (pre-commit)
+    requires:
+      vars: [RELEASE_VERSION]
+    deps:
+      - release:build-helper
+    cmds:
+      - '"{{.RPI_RELEASE_HELPER}}" validate "{{.RELEASE_VERSION}}" --allow-dirty'
+
   release:build-helper:
     internal: true
     cmds:
