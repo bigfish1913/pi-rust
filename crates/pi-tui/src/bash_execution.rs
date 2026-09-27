@@ -12,6 +12,7 @@
 //! distinction is visible, matching `bash-execution.ts`.
 
 use std::any::Any;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -19,7 +20,7 @@ use super::component::Component;
 use crate::ansi::bold;
 use crate::ansi::strip_ansi;
 use crate::spacer::Spacer;
-use crate::theme::theme;
+use crate::theme::{theme, theme_revision};
 use crate::utils::{truncate_to_width, wrap_text_with_ansi};
 use crate::visual_truncate::truncate_to_visual_lines;
 
@@ -49,6 +50,16 @@ pub struct BashTruncation {
     pub full_output_path: Option<String>,
 }
 
+/// A finalized bash panel is immutable, so its rendered lines can be memoized
+/// by width. Mirrors native pi `bash-execution.ts` `cachedWidth/cachedLines`.
+#[derive(Clone)]
+struct BashRenderCache {
+    width: usize,
+    revision: u64,
+    theme_revision: u64,
+    lines: Vec<String>,
+}
+
 /// Component that displays a bash command execution with streaming output.
 pub struct BashExecutionComponent {
     command: Mutex<String>,
@@ -64,6 +75,10 @@ pub struct BashExecutionComponent {
     /// running and the total elapsed after completion.
     started_at: Mutex<Option<Instant>>,
     finished_at: Mutex<Option<Instant>>,
+    /// Bumped by every mutator so a completed panel's cached render is dropped
+    /// when the user expands it or a late update lands.
+    revision: AtomicU64,
+    cache: Mutex<Option<BashRenderCache>>,
 }
 
 impl BashExecutionComponent {
@@ -90,7 +105,14 @@ impl BashExecutionComponent {
             exclude_from_context: Mutex::new(exclude_from_context),
             started_at: Mutex::new(Some(Instant::now())),
             finished_at: Mutex::new(None),
+            revision: AtomicU64::new(0),
+            cache: Mutex::new(None),
         }
+    }
+
+    /// Invalidate the memoized render (state changed).
+    fn bump(&self) {
+        self.revision.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Total elapsed time, or the elapsed time so far while still running.
@@ -111,6 +133,7 @@ impl BashExecutionComponent {
         if let Ok(mut e) = self.exclude_from_context.lock() {
             *e = exclude;
         }
+        self.bump();
     }
 
     /// Whether this command is excluded from the model context.
@@ -125,6 +148,8 @@ impl BashExecutionComponent {
         if !command.trim().is_empty() {
             let mut c = self.command.lock().unwrap();
             *c = command.to_string();
+            drop(c);
+            self.bump();
         }
     }
 
@@ -145,6 +170,7 @@ impl BashExecutionComponent {
                     .collect()
             };
         }
+        self.bump();
     }
 
     /// Mark execution complete.
@@ -173,6 +199,7 @@ impl BashExecutionComponent {
         if let Ok(mut f) = self.finished_at.lock() {
             *f = Some(Instant::now());
         }
+        self.bump();
     }
 
     /// Toggle expanded (full output) vs collapsed (preview) display.
@@ -180,6 +207,7 @@ impl BashExecutionComponent {
         if let Ok(mut e) = self.expanded.lock() {
             *e = expanded;
         }
+        self.bump();
     }
 
     /// Whether currently expanded.
@@ -254,6 +282,26 @@ impl BashExecutionComponent {
 
 impl Component for BashExecutionComponent {
     fn render(&self, width: usize) -> Vec<String> {
+        let status = *self.status.lock().unwrap();
+        let revision = self.revision.load(Ordering::Acquire);
+        let theme_revision = theme_revision();
+
+        // A finished panel never changes (no live elapsed timer), so serve it
+        // from the cache. A running panel is skipped — its elapsed timer must
+        // keep advancing.
+        if status != BashStatus::Running {
+            if let Ok(cache) = self.cache.lock() {
+                if let Some(cached) = cache.as_ref() {
+                    if cached.width == width
+                        && cached.revision == revision
+                        && cached.theme_revision == theme_revision
+                    {
+                        return cached.lines.clone();
+                    }
+                }
+            }
+        }
+
         let colors = theme().colors;
         let mut lines: Vec<String> = Vec::new();
 
@@ -320,7 +368,6 @@ impl Component for BashExecutionComponent {
         }
 
         // Spinner (while running) or status line (when complete)
-        let status = *self.status.lock().unwrap();
         if status == BashStatus::Running {
             // A live elapsed timer, not a spinner: tool panels report progress
             // the same way (static status glyph + elapsed), so two concurrent
@@ -358,10 +405,25 @@ impl Component for BashExecutionComponent {
             }
         }
 
+        if status != BashStatus::Running {
+            if let Ok(mut cache) = self.cache.lock() {
+                *cache = Some(BashRenderCache {
+                    width,
+                    revision,
+                    theme_revision,
+                    lines: lines.clone(),
+                });
+            }
+        } else if let Ok(mut cache) = self.cache.lock() {
+            *cache = None;
+        }
+
         lines
     }
 
-    fn invalidate(&self) {}
+    fn invalidate(&self) {
+        self.bump();
+    }
 
     fn as_any(&self) -> &dyn Any {
         self

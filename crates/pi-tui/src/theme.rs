@@ -324,6 +324,19 @@ pub struct ThemeManager {
     current: Mutex<Theme>,
 }
 
+/// Monotonic revision bumped on every theme mutation.
+///
+/// Components that memoize rendered output (which bakes in theme colors) key
+/// their cache on this value, so a live theme switch invalidates them without
+/// every host having to walk the tree and call `invalidate` (native pi's
+/// `theme-controller.ts` does both: swap the palette and `ui.invalidate()`).
+static THEME_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Current theme revision. Cache the value at build time and compare on render.
+pub fn theme_revision() -> u64 {
+    THEME_REVISION.load(std::sync::atomic::Ordering::Acquire)
+}
+
 impl ThemeManager {
     /// Create a new theme manager.
     pub fn new() -> Self {
@@ -342,6 +355,7 @@ impl ThemeManager {
         if let Ok(mut current) = self.current.lock() {
             *current = theme;
         }
+        THEME_REVISION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// Apply a preset theme to this manager.

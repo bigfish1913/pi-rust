@@ -11,6 +11,18 @@ pub struct Text {
     content: Mutex<String>,
     padding_x: usize,
     padding_y: usize,
+    /// Render cache keyed by (content, width). A finalized `Text` row is
+    /// re-rendered on every repaint of a long transcript; caching the wrapped
+    /// lines keeps that cheap. Mirrors native pi `Text.cachedText/cachedLines`.
+    cache: Mutex<Option<TextCache>>,
+}
+
+#[derive(Clone)]
+struct TextCache {
+    content: String,
+    width: usize,
+    theme_revision: u64,
+    lines: Vec<String>,
 }
 
 impl Text {
@@ -20,6 +32,7 @@ impl Text {
             content: Mutex::new(content.into()),
             padding_x,
             padding_y,
+            cache: Mutex::new(None),
         }
     }
 
@@ -27,6 +40,9 @@ impl Text {
     pub fn set_text(&self, text: impl Into<String>) {
         if let Ok(mut content) = self.content.lock() {
             *content = text.into();
+        }
+        if let Ok(mut cache) = self.cache.lock() {
+            *cache = None;
         }
     }
 
@@ -39,6 +55,19 @@ impl Text {
 impl Component for Text {
     fn render(&self, width: usize) -> Vec<String> {
         let content = self.content.lock().map(|c| c.clone()).unwrap_or_default();
+        let theme_revision = crate::theme::theme_revision();
+
+        if let Ok(cache) = self.cache.lock() {
+            if let Some(cached) = cache.as_ref() {
+                if cached.width == width
+                    && cached.content == content
+                    && cached.theme_revision == theme_revision
+                {
+                    return cached.lines.clone();
+                }
+            }
+        }
+
         let mut lines = Vec::new();
 
         // Add top padding
@@ -73,11 +102,21 @@ impl Component for Text {
             lines.push(String::new());
         }
 
+        if let Ok(mut cache) = self.cache.lock() {
+            *cache = Some(TextCache {
+                content,
+                width,
+                theme_revision,
+                lines: lines.clone(),
+            });
+        }
         lines
     }
 
     fn invalidate(&self) {
-        // Text has no cached state to invalidate
+        if let Ok(mut cache) = self.cache.lock() {
+            *cache = None;
+        }
     }
 
     fn as_any(&self) -> &dyn Any {

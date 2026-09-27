@@ -10,11 +10,13 @@
 //! [OSC 133]: https://terminalguide.namepad.de/seq/osc-133/
 
 use std::any::Any;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use super::component::Component;
 use crate::box_component::Box;
 use crate::markdown::Markdown;
-use crate::theme::theme;
+use crate::theme::{theme, theme_revision};
 
 const OSC133_ZONE_START: &str = "\x1b]133;A\x07";
 const OSC133_ZONE_END: &str = "\x1b]133;B\x07";
@@ -24,6 +26,25 @@ const OSC133_ZONE_FINAL: &str = "\x1b]133;C\x07";
 pub struct UserMessageComponent {
     text: String,
     output_pad: usize,
+    /// Prebuilt inner box (background `Box` + `Markdown`).
+    ///
+    /// Native pi builds this **once** in the constructor (`user-message.ts`
+    /// `rebuild()`); rpi used to rebuild the `Box` + `Markdown` on every
+    /// `render`, so the inner caches could never hit and each frame re-parsed
+    /// every user message. Rebuild only on `invalidate` / `with_pad` / a theme
+    /// change (the background colour is baked into the box).
+    inner: Mutex<Box>,
+    /// Theme revision the current inner box was built against.
+    built_revision: AtomicU64,
+}
+
+fn build_box(text: &str, output_pad: usize) -> Box {
+    let bg = theme().colors.surface;
+    let content_box = Box::new(output_pad, 1);
+    content_box.set_bg_fn(Some(std::sync::Arc::new(move |s: &str| bg.bg(s))));
+    let md = Markdown::new(text.to_string(), 0, 0);
+    content_box.add_child(std::sync::Arc::new(md));
+    content_box
 }
 
 impl UserMessageComponent {
@@ -32,33 +53,44 @@ impl UserMessageComponent {
     /// `output_pad` is the horizontal+vertical padding inside the background
     /// box (mirrors the TS `outputPad`, default 1).
     pub fn new(text: impl Into<String>) -> Self {
+        let text = text.into();
+        let inner = build_box(&text, 1);
         Self {
-            text: text.into(),
+            text,
             output_pad: 1,
+            inner: Mutex::new(inner),
+            built_revision: AtomicU64::new(theme_revision()),
         }
     }
 
     /// Override the inner padding.
-    pub fn with_pad(mut self, pad: usize) -> Self {
-        self.output_pad = pad;
-        self
-    }
-
-    fn build_box(&self) -> Box {
-        let bg = theme().colors.surface;
-        let content_box = Box::new(self.output_pad, 1);
-        // Background function: apply the surface color as bg to each line.
-        content_box.set_bg_fn(Some(std::sync::Arc::new(move |s: &str| bg.bg(s))));
-        let md = Markdown::new(self.text.clone(), 0, 0);
-        content_box.add_child(std::sync::Arc::new(md));
-        content_box
+    pub fn with_pad(self, pad: usize) -> Self {
+        let inner = build_box(&self.text, pad);
+        Self {
+            text: self.text,
+            output_pad: pad,
+            inner: Mutex::new(inner),
+            built_revision: AtomicU64::new(theme_revision()),
+        }
     }
 }
 
 impl Component for UserMessageComponent {
     fn render(&self, width: usize) -> Vec<String> {
-        let inner = self.build_box();
-        let mut lines = inner.render(width);
+        // The background colour is baked into the inner box; rebuild it when
+        // the live theme has changed since it was built.
+        let revision = theme_revision();
+        if self.built_revision.load(Ordering::Acquire) != revision {
+            if let Ok(mut inner) = self.inner.lock() {
+                *inner = build_box(&self.text, self.output_pad);
+            }
+            self.built_revision.store(revision, Ordering::Release);
+        }
+
+        let mut lines = match self.inner.lock() {
+            Ok(inner) => inner.render(width),
+            Err(_) => return Vec::new(),
+        };
         if lines.is_empty() {
             return lines;
         }
@@ -72,7 +104,15 @@ impl Component for UserMessageComponent {
         lines
     }
 
-    fn invalidate(&self) {}
+    fn invalidate(&self) {
+        // Rebuild the inner box so a theme change is picked up by the baked-in
+        // background colour, and so the Markdown cache is dropped.
+        if let Ok(mut inner) = self.inner.lock() {
+            *inner = build_box(&self.text, self.output_pad);
+        }
+        self.built_revision
+            .store(theme_revision(), Ordering::Release);
+    }
 
     fn as_any(&self) -> &dyn Any {
         self

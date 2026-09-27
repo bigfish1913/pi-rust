@@ -47,6 +47,20 @@ pub struct Markdown {
     options: MarkdownOptions,
     padding_x: usize,
     padding_y: usize,
+    /// Render cache keyed by (content, width). Markdown parsing + inline
+    /// pulldown-cmark work is the dominant per-frame cost of a long transcript;
+    /// a finalized message is re-rendered on every frame the transcript is
+    /// repainted, so caching the parsed lines is what keeps that O(1) per
+    /// unchanged message. Mirrors native pi `Markdown.cachedText/cachedLines`.
+    cache: Mutex<Option<MarkdownCache>>,
+}
+
+#[derive(Clone)]
+struct MarkdownCache {
+    content: String,
+    width: usize,
+    theme_revision: u64,
+    lines: Vec<String>,
 }
 
 impl Markdown {
@@ -57,6 +71,7 @@ impl Markdown {
             options: MarkdownOptions::default(),
             padding_x,
             padding_y,
+            cache: Mutex::new(None),
         }
     }
 
@@ -72,6 +87,7 @@ impl Markdown {
             options,
             padding_x,
             padding_y,
+            cache: Mutex::new(None),
         }
     }
 
@@ -81,6 +97,7 @@ impl Markdown {
     /// for the remainder of the line.
     pub fn with_base_style(mut self, base_style: impl Into<String>) -> Self {
         self.options.base_style = base_style.into();
+        self.clear_cache();
         self
     }
 
@@ -112,6 +129,14 @@ impl Markdown {
     pub fn set_content(&self, content: impl Into<String>) {
         if let Ok(mut c) = self.content.lock() {
             *c = content.into();
+        }
+        self.clear_cache();
+    }
+
+    /// Drop the cached render output.
+    fn clear_cache(&self) {
+        if let Ok(mut cache) = self.cache.lock() {
+            *cache = None;
         }
     }
 
@@ -870,11 +895,34 @@ fn push_wrapped_with_prefix(
 
 impl Component for Markdown {
     fn render(&self, width: usize) -> Vec<String> {
-        self.render_markdown(width)
+        let content = self.content.lock().map(|c| c.clone()).unwrap_or_default();
+        let theme_revision = crate::theme::theme_revision();
+
+        if let Ok(cache) = self.cache.lock() {
+            if let Some(cached) = cache.as_ref() {
+                if cached.width == width
+                    && cached.content == content
+                    && cached.theme_revision == theme_revision
+                {
+                    return cached.lines.clone();
+                }
+            }
+        }
+
+        let lines = self.render_markdown(width);
+        if let Ok(mut cache) = self.cache.lock() {
+            *cache = Some(MarkdownCache {
+                content,
+                width,
+                theme_revision,
+                lines: lines.clone(),
+            });
+        }
+        lines
     }
 
     fn invalidate(&self) {
-        // Markdown caches content, no external cache to invalidate
+        self.clear_cache();
     }
 
     fn as_any(&self) -> &dyn Any {

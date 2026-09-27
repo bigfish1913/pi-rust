@@ -345,12 +345,36 @@ impl LayoutNodeProvider for VStack {
 ///
 /// Given a fixed height, distribute space among children based on their
 /// basis, grow, shrink, and min_size options.
+///
+/// Intrinsic heights come from [`Component::render`]; callers that already
+/// have a render cache should use [`layout_vstack_constrained_with`] so a
+/// component measured here is not rendered a second time when it is painted.
 pub fn layout_vstack_constrained(
     children: &[StackEntry],
     width: usize,
     height: usize,
     gap: usize,
 ) -> Vec<(Arc<dyn Component>, usize)> {
+    layout_vstack_constrained_with(children, width, height, gap, |component, width| {
+        component.render(width).len()
+    })
+}
+
+/// Like [`layout_vstack_constrained`], but measures auto-basis children through
+/// the supplied closure (usually a frame-local render cache).
+///
+/// Mirrors native pi routing every `measureHeight` through `renderCached`
+/// (`packages/tui/src/layout.ts`).
+pub(crate) fn layout_vstack_constrained_with<F>(
+    children: &[StackEntry],
+    width: usize,
+    height: usize,
+    gap: usize,
+    mut measure: F,
+) -> Vec<(Arc<dyn Component>, usize)>
+where
+    F: FnMut(&Arc<dyn Component>, usize) -> usize,
+{
     let n = children.len();
     if n == 0 {
         return Vec::new();
@@ -372,7 +396,7 @@ pub fn layout_vstack_constrained(
         let basis = entry
             .options
             .basis
-            .unwrap_or_else(|| entry.component.render(width).len());
+            .unwrap_or_else(|| measure(&entry.component, width));
         let min_size = entry.options.min_size;
         let max_size = entry.options.max_size.unwrap_or(usize::MAX);
 

@@ -29,6 +29,20 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ### Changed
 
+- **Transcript repaints are now O(1) per unchanged message, closing the
+  long-session lag against native pi.** rpi re-parsed every finished message's
+  markdown/layout on every frame, so a 400-message session cost ~18 ms per
+  frame (over the 16 ms budget) and got slower as it grew. It now mirrors
+  native pi's caching layers: `Markdown` and `Text` memoize
+  `(content, width) -> lines`, `UserMessageComponent` builds its `Box` +
+  `Markdown` once instead of per frame, finalized `ToolExecutionComponent` /
+  `BashExecutionComponent` panels cache their output, and the layout pass has a
+  frame-local `renderCached` map so a component measured for an auto basis is
+  not rendered again when painted. A live theme switch bumps a global revision
+  that every cache keys on, so `apply_theme_preset` cannot leave stale colours.
+  A 400-message transcript drops from ~18 ms to ~0.8 ms per frame (~22×) and
+  stays under budget past 3000 messages; `crates/pi-tui/examples/bench_transcript.rs`
+  reproduces the measurement.
 - **The terminal window/tab title now carries the startup mark.** An idle
   session sets `▃ ▅ ▂ rpi · 🦀` instead of `🦀π rpi`, keeping the activity
   suffix it had before (`⟳` in flight, `↻` retrying), so the tab and the startup

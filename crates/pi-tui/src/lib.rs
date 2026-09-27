@@ -142,8 +142,8 @@ pub use terminal_image::{
 };
 pub use text::Text;
 pub use theme::{
-    apply_theme_preset, global_theme_manager, theme, Color, Theme, ThemeColors, ThemeManager,
-    ThemePreset,
+    apply_theme_preset, global_theme_manager, theme, theme_revision, Color, Theme, ThemeColors,
+    ThemeManager, ThemePreset,
 };
 pub use tool_execution::{ToolExecutionComponent, ToolStatus};
 pub use truncated_text::TruncatedText;

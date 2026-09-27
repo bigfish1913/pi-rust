@@ -4,12 +4,13 @@
 //! packages/coding-agent/src/modes/interactive/components/tool-execution.ts
 
 use std::any::Any;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
 use super::component::Component;
 use crate::ansi::{bold, strip_ansi};
-use crate::theme::{theme, ThemeColors};
+use crate::theme::{theme, theme_revision, ThemeColors};
 use crate::utils::{apply_background_to_line, truncate_to_width, wrap_text_with_ansi};
 
 /// Maximum diff lines rendered inline when expanded before collapsing the rest.
@@ -71,6 +72,23 @@ pub struct ToolExecutionComponent {
     /// result; the interactive host calls [`Self::set_result_markdown`] when
     /// it sees that flag. See [`Self::set_result_markdown`].
     result_markdown: Mutex<bool>,
+    /// Bumped by every mutator. A finished tool panel is immutable (no live
+    /// elapsed timer), so its rendered lines are memoized by width; the
+    /// revision drops the cache when args/result/expand change.
+    revision: AtomicU64,
+    /// Memoized render of a `Completed`/`Failed` panel. Mirrors native pi's
+    /// per-component render cache (`tool-execution.ts` + `layout.ts
+    /// renderCached`), which is what keeps a transcript repaint from
+    /// re-rendering every finished tool panel.
+    cache: Mutex<Option<ToolRenderCache>>,
+}
+
+#[derive(Clone)]
+struct ToolRenderCache {
+    width: usize,
+    revision: u64,
+    theme_revision: u64,
+    lines: Vec<String>,
 }
 
 impl ToolExecutionComponent {
@@ -88,7 +106,14 @@ impl ToolExecutionComponent {
             expanded: Mutex::new(false),
             diff_lines: Mutex::new(None),
             result_markdown: Mutex::new(false),
+            revision: AtomicU64::new(0),
+            cache: Mutex::new(None),
         }
+    }
+
+    /// Invalidate the memoized render (state changed).
+    fn bump(&self) {
+        self.revision.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Set the tool arguments.
@@ -96,6 +121,7 @@ impl ToolExecutionComponent {
         if let Ok(mut a) = self.args.lock() {
             *a = args.to_string();
         }
+        self.bump();
     }
 
     /// Set the tool result.
@@ -116,6 +142,7 @@ impl ToolExecutionComponent {
         if let Ok(mut f) = self.finished_at.lock() {
             *f = Some(Instant::now());
         }
+        self.bump();
     }
 
     /// Mark as running.
@@ -126,6 +153,7 @@ impl ToolExecutionComponent {
         if let Ok(mut t) = self.started_at.lock() {
             *t = Some(Instant::now());
         }
+        self.bump();
     }
 
     /// Set expanded state.
@@ -133,6 +161,7 @@ impl ToolExecutionComponent {
         if let Ok(mut e) = self.expanded.lock() {
             *e = expanded;
         }
+        self.bump();
     }
 
     /// Whether the component is currently expanded (for toggle helpers).
@@ -156,6 +185,7 @@ impl ToolExecutionComponent {
         if let Ok(mut display_title) = self.display_title.lock() {
             *display_title = Some(title.into());
         }
+        self.bump();
     }
 
     /// Mark this component as a skill-invocation read: it renders in the
@@ -165,6 +195,7 @@ impl ToolExecutionComponent {
         if let Ok(mut skill_name) = self.skill_name.lock() {
             *skill_name = Some(name.into());
         }
+        self.bump();
     }
 
     /// Whether this component displays a skill invocation (see
@@ -185,6 +216,7 @@ impl ToolExecutionComponent {
         if let Ok(mut d) = self.diff_lines.lock() {
             *d = Some(lines);
         }
+        self.bump();
     }
 
     /// Render the result body as markdown instead of plain indented text.
@@ -198,11 +230,34 @@ impl ToolExecutionComponent {
         if let Ok(mut markdown) = self.result_markdown.lock() {
             *markdown = enabled;
         }
+        self.bump();
     }
 }
 
 impl Component for ToolExecutionComponent {
     fn render(&self, width: usize) -> Vec<String> {
+        let status = *self.status.lock().unwrap();
+        let revision = self.revision.load(Ordering::Acquire);
+        let theme_revision = theme_revision();
+
+        // A finished panel is immutable; a running/pending one has a live
+        // elapsed timer and may still stream, so only the finished states are
+        // memoized. (Mirrors native pi's width-keyed cache, gated on the
+        // elapsed readout no longer advancing.)
+        let finished = matches!(status, ToolStatus::Completed | ToolStatus::Failed);
+        if finished {
+            if let Ok(cache) = self.cache.lock() {
+                if let Some(cached) = cache.as_ref() {
+                    if cached.width == width
+                        && cached.revision == revision
+                        && cached.theme_revision == theme_revision
+                    {
+                        return cached.lines.clone();
+                    }
+                }
+            }
+        }
+
         let colors = theme().colors;
         let mut lines = Vec::new();
 
@@ -232,7 +287,18 @@ impl Component for ToolExecutionComponent {
         // result streaming + Ctrl+T expand plumbing.
         if let Some(skill) = skill_name.as_deref() {
             let content = result.as_deref().unwrap_or("");
-            return render_skill(&colors, skill, content, *expanded, width);
+            let lines = render_skill(&colors, skill, content, *expanded, width);
+            if finished {
+                if let Ok(mut cache) = self.cache.lock() {
+                    *cache = Some(ToolRenderCache {
+                        width,
+                        revision,
+                        theme_revision,
+                        lines: lines.clone(),
+                    });
+                }
+            }
+            return lines;
         }
 
         // Status indicator — a colored glyph (no emoji), pi style.
@@ -424,11 +490,24 @@ impl Component for ToolExecutionComponent {
             }
         }
 
+        if finished {
+            if let Ok(mut cache) = self.cache.lock() {
+                *cache = Some(ToolRenderCache {
+                    width,
+                    revision,
+                    theme_revision,
+                    lines: lines.clone(),
+                });
+            }
+        } else if let Ok(mut cache) = self.cache.lock() {
+            *cache = None;
+        }
+
         lines
     }
 
     fn invalidate(&self) {
-        // Tool has no cached state
+        self.bump();
     }
 
     fn as_any(&self) -> &dyn Any {

@@ -6,12 +6,13 @@
 //! - Painting visible rows with clipping
 //! - Hit testing for mouse events
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::component::Component;
 use super::layout_node::LayoutViewport;
 use super::scroll_view::ScrollView;
-use super::vstack::{layout_vstack_constrained, VStack};
+use super::vstack::{layout_vstack_constrained_with, VStack};
 use crate::ansi::{slice_by_column, visible_width, CURSOR_MARKER};
 
 /// A rectangle in the layout.
@@ -129,6 +130,15 @@ struct LayoutContext {
     viewport: LayoutViewport,
     primary_scroll_view: Option<Arc<ScrollView>>,
     reuse_scroll_content: bool,
+    /// Frame-local render cache: component pointer → width → rendered lines.
+    ///
+    /// Mirrors native pi `LayoutContext.renderCache` (`packages/tui/src/
+    /// layout.ts`): inside one layout pass a component renders at most once per
+    /// width, so measuring an auto-basis child does not re-render it when it is
+    /// painted. `reuse_scroll_content`/`invalidate` are handled by each
+    /// component's own cache; this only dedupes work within a frame, so it is
+    /// dropped at the end of the frame.
+    render_cache: HashMap<usize, HashMap<usize, Vec<String>>>,
 }
 
 impl LayoutContext {
@@ -138,6 +148,25 @@ impl LayoutContext {
         if sv.is_primary() && self.primary_scroll_view.is_none() {
             self.primary_scroll_view = Some(sv.clone());
         }
+    }
+
+    /// Render `component` at `width`, memoized for the current layout pass.
+    ///
+    /// The cache key is the `Arc` allocation address; every component is kept
+    /// alive by the tree for the whole pass, so the address is stable.
+    fn render_cached(&mut self, component: &Arc<dyn Component>, width: usize) -> Vec<String> {
+        let key = Arc::as_ptr(component) as *const () as usize;
+        if let Some(by_width) = self.render_cache.get(&key) {
+            if let Some(lines) = by_width.get(&width) {
+                return lines.clone();
+            }
+        }
+        let lines = component.render(width);
+        self.render_cache
+            .entry(key)
+            .or_default()
+            .insert(width, lines.clone());
+        lines
     }
 }
 
@@ -172,6 +201,7 @@ fn render_layout_frame_impl(
         },
         primary_scroll_view: None,
         reuse_scroll_content,
+        render_cache: HashMap::new(),
     };
 
     let root_box = layout_component(
@@ -227,7 +257,7 @@ fn layout_component(
     }
 
     // ---- Leaf (Container/Editor/Footer/Text/...) ----
-    let lines = component.render(safe_width);
+    let lines = context.render_cached(component, safe_width);
 
     let allocated_height = height.unwrap_or_else(|| lines.len());
 
@@ -276,7 +306,16 @@ fn layout_vstack(
 ) -> LayoutBox {
     let children = vstack.get_children();
     let gap = vstack.gap();
-    let allocated = layout_vstack_constrained(&children, width, height.unwrap_or(0), gap);
+    let allocated = {
+        let ctx = &mut *context;
+        layout_vstack_constrained_with(
+            &children,
+            width,
+            height.unwrap_or(0),
+            gap,
+            |component, w| ctx.render_cached(component, w).len(),
+        )
+    };
 
     // The box's own rect spans its full allocated height (or, when
     // unconstrained, the sum of child heights + gaps).
