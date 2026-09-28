@@ -1125,6 +1125,12 @@ impl TuiAltScreen {
                 // Give wheel/touchpad gestures back to the terminal emulator;
                 // it can now scroll its native history smoothly.
                 terminal.disable_mouse();
+            } else {
+                // On macOS enter_raw_mode intentionally leaves mouse tracking
+                // disabled so the main screen can use native scrollback. The
+                // alternate-screen transcript owns scrolling, however, so it
+                // must explicitly re-enable wheel/touchpad events here.
+                terminal.enable_mouse();
             }
         }
         if !self.uses_main_screen() {

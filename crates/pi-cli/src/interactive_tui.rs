@@ -757,22 +757,23 @@ fn dispatch_key_event(state: &TuiState, key: &KeyEvent, editor: &Editor) -> bool
     rpi_extensions::dispatch_data_event_claiming(&snapshot, EventTag::Input, &payload)
 }
 
-/// Resolve the command for a `/`-prefixed input and run it, or emit the
-/// unknown-command error if nothing matches. Non-slash text never reaches here
-/// — callers route only `/`-prefixed inputs and send plain text directly.
-fn dispatch_slash(text: &str, ctx: &CommandContext, registry: &CommandRegistry) {
+/// Resolve a command for a `/`-prefixed input and run it when one matches.
+///
+/// Unknown slash-prefixed input is deliberately left for the normal prompt
+/// path. In particular, the upstream skill-command behavior keeps an unknown
+/// `/skill:name` intact so the model can still handle it; it must not be
+/// converted into a local error before input handlers or the agent see it.
+/// Returns `true` only when a registered slash command handled the input.
+fn dispatch_slash(text: &str, ctx: &CommandContext, registry: &CommandRegistry) -> bool {
     let mut parts = text.split_whitespace();
     let token = parts.next().unwrap_or("");
     let args = parts.collect::<Vec<_>>().join(" ");
     match registry.find(token) {
-        Some(cmd) => cmd.execute(ctx, &args),
-        None => {
-            add_error_message(
-                &ctx.chat,
-                &format!("Unknown command: {text}. Type /help for available commands."),
-            );
-            ctx.tui.request_render(false);
+        Some(cmd) => {
+            cmd.execute(ctx, &args);
+            true
         }
+        None => false,
     }
 }
 
@@ -6433,8 +6434,7 @@ pub async fn interactive_tui(
             return;
         }
 
-        if text.starts_with('/') {
-            dispatch_slash(text, &ctx_for_cb, &registry_for_cb);
+        if text.starts_with('/') && dispatch_slash(text, &ctx_for_cb, &registry_for_cb) {
             return;
         }
 

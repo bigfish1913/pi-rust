@@ -2,9 +2,10 @@
 # Refresh the documentation snapshot that is compiled into the `rpi` binary.
 #
 # crates/pi-cli/src/docs_tool.rs pulls these files in with include_str!, so they
-# must be byte-copies of the repository documents -- otherwise `rpi` ships a
-# `docs` tool whose output disagrees with the repository, and the published
-# crate tarball cannot be regenerated from the source tree.
+# must be byte-copies of the dedicated docs/rpi-tool/ sources. Keep these
+# sources separate from docs/ ordinary user/developer documentation: the latter
+# may contain release notes, website-oriented pages, or implementation notes
+# that should not become part of the model-facing docs tool.
 #
 # CI runs this script and fails on any resulting diff, so drift is caught at the
 # point it is introduced rather than at release time.
@@ -14,12 +15,12 @@ set -eu
 DEST="crates/pi-cli/embedded-docs"
 
 # source -> destination file name
-FILES="README.md:README.md \
-docs/agent-project.md:agent-project.md \
-docs/architecture.md:architecture.md \
-docs/extension-authoring.md:extension-authoring.md \
-docs/rust-debugging.md:rust-debugging.md \
-docs/user-guide.md:user-guide.md"
+FILES="docs/rpi-tool/README.md:README.md \
+docs/rpi-tool/agent-project.md:agent-project.md \
+docs/rpi-tool/architecture.md:architecture.md \
+docs/rpi-tool/extension-authoring.md:extension-authoring.md \
+docs/rpi-tool/rust-debugging.md:rust-debugging.md \
+docs/rpi-tool/user-guide.md:user-guide.md"
 
 for entry in $FILES; do
   src="${entry%%:*}"
