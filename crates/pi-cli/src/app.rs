@@ -138,86 +138,62 @@ async fn run_inner() -> i32 {
         None
     };
 
-    // ---- `rpi auth …` subcommand dispatch (before flag parsing) ----
-    // `auth` is a top-level subcommand (mirrors TS `runAuthCommand` routing in
-    // `main.ts`); dispatching it here avoids it being misparsed as a prompt.
-    if argv.first().map(|s| s.as_str()) == Some("auth") {
-        return crate::auth::run(&argv[1..]).await;
-    }
-    if argv.first().map(|s| s.as_str()) == Some("events") {
-        return crate::events::run(&argv[1..]).await;
-    }
-    if argv.first().map(|s| s.as_str()) == Some("package") {
-        return crate::packages::run_cli(&argv[1..]);
-    }
-    if argv.first().map(|s| s.as_str()) == Some("update") {
-        return crate::updates::run_self_update(&argv[1..]);
-    }
-    if argv.first().map(String::as_str) == Some("pi-package") {
-        let subcommand = argv.get(1).map(String::as_str);
-        if matches!(subcommand, Some("--help" | "-h")) {
+    // ---- Top-level subcommand dispatch (before flag parsing) ----
+    // These are top-level subcommands (mirrors TS `runAuthCommand` / the
+    // `handlePackageCommand` / `handleConfigCommand` routing in `main.ts`);
+    // dispatching them here avoids them being misparsed as prompts. The set is
+    // fixed and each handler has a different shape (sync vs async, extra argv
+    // inspection), so a `match` on the first argument — not a trait registry —
+    // is the right level of abstraction (and matches the `match mode { .. }`
+    // dispatch at the end of this function).
+    match argv.first().map(String::as_str) {
+        Some("auth") => return crate::auth::run(&argv[1..]).await,
+        Some("events") => return crate::events::run(&argv[1..]).await,
+        Some("package") => return crate::packages::run_cli(&argv[1..]),
+        Some("update") => return crate::updates::run_self_update(&argv[1..]),
+        Some("pi-package") => {
+            // `--help`/`-h` and the only real subcommand (`update`) both land on
+            // the same entry point; anything else is a usage error.
+            let subcommand: Option<&str> = argv.get(1).map(String::as_str);
+            if !matches!(subcommand, Some("--help" | "-h" | "update")) {
+                eprintln!("error: usage is `rpi pi-package update`");
+                return EXIT_USAGE;
+            }
             return crate::packages::run_pi_package_update(&argv[1..]);
         }
-        if subcommand != Some("update") {
-            eprintln!("error: usage is `rpi pi-package update`");
+        Some("pi-update") => {
+            eprintln!("error: unknown command `pi-update`; use `rpi pi-package update`");
             return EXIT_USAGE;
         }
-        return crate::packages::run_pi_package_update(&argv[1..]);
-    }
-    if argv.first().map(String::as_str) == Some("pi-update") {
-        eprintln!("error: unknown command `pi-update`; use `rpi pi-package update`");
-        return EXIT_USAGE;
-    }
-    if argv.first().map(String::as_str) == Some("self-update") {
-        eprintln!("error: unknown command `self-update`; use `rpi update`");
-        return EXIT_USAGE;
-    }
-    if argv.first().map(|s| s.as_str()) == Some("install") {
-        return crate::install::run(&argv[1..]);
-    }
-    if argv.first().map(|s| s.as_str()) == Some("install-pi") {
-        return crate::install_pi::run(&argv[1..]);
-    }
-    if argv.first().map(|s| s.as_str()) == Some("uninstall") {
-        if argv.get(1).map(String::as_str) == Some("pi") {
-            return crate::install_pi::uninstall(&argv[2..]);
+        Some("self-update") => {
+            eprintln!("error: unknown command `self-update`; use `rpi update`");
+            return EXIT_USAGE;
         }
-        return crate::install::uninstall(&argv[1..]);
-    }
-    if argv.first().map(|s| s.as_str()) == Some("uninstall-pi") {
-        return crate::install_pi::uninstall(&argv[1..]);
+        Some("install") => return crate::install::run(&argv[1..]),
+        Some("install-pi") => return crate::install_pi::run(&argv[1..]),
+        Some("uninstall") => {
+            // `rpi uninstall pi` is an alias for `uninstall-pi`.
+            return if argv.get(1).map(String::as_str) == Some("pi") {
+                crate::install_pi::uninstall(&argv[2..])
+            } else {
+                crate::install::uninstall(&argv[1..])
+            };
+        }
+        Some("uninstall-pi") => return crate::install_pi::uninstall(&argv[1..]),
+        _ => {}
     }
 
     let mut parsed = parse_args(&argv);
     crate::timings::time("args parsed", crate::timings::TimingNamespace::Main);
 
-    // ---- --help / --version short-circuit (before any heavy work) ----
-    if parsed.help {
-        print_help();
-        return 0;
-    }
-    if parsed.version {
-        print_version();
-        return 0;
+    // ---- Parsed startup stages ----
+    if let Some(code) = handle_parse_short_circuits(&parsed) {
+        return code;
     }
 
-    // ---- Parse errors → help + usage exit ----
-    if !parsed.errors.is_empty() {
-        for err in &parsed.errors {
-            eprintln!("error: {err}");
-        }
-        eprintln!();
-        print_help();
-        return EXIT_USAGE;
-    }
-
-    // ---- cwd ----
-    let cwd = match std::env::current_dir() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("error: could not determine the current directory: {e}");
-            return EXIT_USAGE;
-        }
+    let cwd = match resolve_cwd() {
+        Ok(cwd) => cwd,
+        Err(code) => return code,
     };
 
     // ---- Legacy-layout migration (flat ~/.rpi → ~/.rpi/agent/) ----
@@ -226,29 +202,8 @@ async fn run_inner() -> i32 {
     let _ = crate::config::migrate_legacy_layout();
     crate::timings::time("config migrated", crate::timings::TimingNamespace::Main);
 
-    if let Some(input) = parsed.export.as_deref() {
-        let output = parsed
-            .messages
-            .first()
-            .map(Path::new)
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| {
-                let stem = input
-                    .file_stem()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or("session");
-                Path::new(&format!("rpi-session-{stem}.html")).to_path_buf()
-            });
-        match crate::export::export_file(input, &output) {
-            Ok(()) => {
-                println!("Exported to: {}", output.display());
-                return 0;
-            }
-            Err(error) => {
-                eprintln!("error: {error}");
-                return EXIT_RUNTIME;
-            }
-        }
+    if let Some(code) = export_if_requested(&parsed) {
+        return code;
     }
 
     // `--list-models` is intentionally handled before credentials, session
@@ -258,71 +213,22 @@ async fn run_inner() -> i32 {
     if let Some(search) = parsed.list_models.as_deref() {
         return list_models(search).await;
     }
+
     // Build before provider resolution so compiler errors do not require
     // valid model credentials. The staged directory joins normal discovery.
-    //
-    // When no Cargo cdylib is found, `rpi dev-local` falls back to skills-only
-    // mode (--no-extensions + local_only): project skills/prompts still load.
-    let dev_extension = if let Some(options) = &dev_options {
-        match crate::dev_extension::DevExtension::detect(&cwd, options) {
-            Ok(extension) => {
-                if let Err(error) = extension.rebuild() {
-                    eprintln!("error: initial extension build failed: {error}");
-                    return EXIT_RUNTIME;
-                }
-                if let Err(error) = extension.apply_to_args(&mut parsed) {
-                    eprintln!("error: {error}");
-                    return EXIT_RUNTIME;
-                }
-                Some(extension)
-            }
-            Err(error) => {
-                // No Cargo cdylib found: degrade to skills-only mode
-                eprintln!("dev: {error}");
-                eprintln!("dev: no Cargo cdylib found; running in skills-only mode");
-                parsed.no_extensions = true;
-                parsed.extensions_dir.clear();
-                parsed.extension.clear();
-                if options.local_only {
-                    parsed.dev_local_only = true;
-                }
-                None
-            }
-        }
-    } else {
-        None
+    let dev_extension = match prepare_dev_extension(dev_options.as_ref(), &cwd, &mut parsed) {
+        Ok(extension) => extension,
+        Err(code) => return code,
     };
 
     // `-r/--resume` is an interactive picker, unlike `-c/--continue` which
     // immediately opens the latest session. Resolve the picker result before
     // building the harness so cancelling does not create or modify a session.
-    if parsed.resume {
-        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-            eprintln!("error: --resume requires an interactive terminal");
-            return EXIT_USAGE;
-        }
-        match crate::resume_picker::select(&cwd).await {
-            Ok(Some(id)) => {
-                parsed.resume = false;
-                parsed.session = Some(id);
-            }
-            Ok(None) => return 0,
-            Err(e) => {
-                eprintln!("error: {e}");
-                return EXIT_RUNTIME;
-            }
-        }
+    if let Some(code) = resolve_resume(&mut parsed, &cwd).await {
+        return code;
     }
 
-    // ---- Startup warnings (ignored-but-recognized flags) ----
-    if parsed.verbose {
-        for warn in &parsed.ignored {
-            eprintln!("warning: {warn}");
-        }
-    }
-    if parsed.no_themes && parsed.theme.is_some() {
-        eprintln!("warning: --no-themes overrides --theme; using the built-in default theme");
-    }
+    emit_startup_warnings(&parsed);
 
     // ---- stdin (TS readPipedStdin: non-TTY stdin becomes initial prompt text) ----
     // Do NOT drain stdin when the run is an RPC/server session: stdin is the
@@ -559,6 +465,135 @@ async fn run_inner() -> i32 {
         dev.cleanup();
     }
     exit_code
+}
+
+fn handle_parse_short_circuits(parsed: &Args) -> Option<i32> {
+    // ---- --help / --version short-circuit (before any heavy work) ----
+    if parsed.help {
+        print_help();
+        return Some(0);
+    }
+    if parsed.version {
+        print_version();
+        return Some(0);
+    }
+
+    // ---- Parse errors → help + usage exit ----
+    if !parsed.errors.is_empty() {
+        for err in &parsed.errors {
+            eprintln!("error: {err}");
+        }
+        eprintln!();
+        print_help();
+        return Some(EXIT_USAGE);
+    }
+
+    None
+}
+
+fn resolve_cwd() -> Result<std::path::PathBuf, i32> {
+    std::env::current_dir().map_err(|error| {
+        eprintln!("error: could not determine the current directory: {error}");
+        EXIT_USAGE
+    })
+}
+
+fn export_if_requested(parsed: &Args) -> Option<i32> {
+    let input = parsed.export.as_deref()?;
+    let output = parsed
+        .messages
+        .first()
+        .map(Path::new)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| {
+            let stem = input
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or("session");
+            Path::new(&format!("rpi-session-{stem}.html")).to_path_buf()
+        });
+
+    match crate::export::export_file(input, &output) {
+        Ok(()) => {
+            println!("Exported to: {}", output.display());
+            Some(0)
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            Some(EXIT_RUNTIME)
+        }
+    }
+}
+
+fn prepare_dev_extension(
+    options: Option<&crate::dev_extension::DevOptions>,
+    cwd: &Path,
+    parsed: &mut Args,
+) -> Result<Option<std::sync::Arc<crate::dev_extension::DevExtension>>, i32> {
+    let Some(options) = options else {
+        return Ok(None);
+    };
+
+    match crate::dev_extension::DevExtension::detect(cwd, options) {
+        Ok(extension) => {
+            if let Err(error) = extension.rebuild() {
+                eprintln!("error: initial extension build failed: {error}");
+                return Err(EXIT_RUNTIME);
+            }
+            if let Err(error) = extension.apply_to_args(parsed) {
+                eprintln!("error: {error}");
+                return Err(EXIT_RUNTIME);
+            }
+            Ok(Some(extension))
+        }
+        Err(error) => {
+            // No Cargo cdylib found: degrade to skills-only mode.
+            eprintln!("dev: {error}");
+            eprintln!("dev: no Cargo cdylib found; running in skills-only mode");
+            parsed.no_extensions = true;
+            parsed.extensions_dir.clear();
+            parsed.extension.clear();
+            if options.local_only {
+                parsed.dev_local_only = true;
+            }
+            Ok(None)
+        }
+    }
+}
+
+async fn resolve_resume(parsed: &mut Args, cwd: &Path) -> Option<i32> {
+    if !parsed.resume {
+        return None;
+    }
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        eprintln!("error: --resume requires an interactive terminal");
+        return Some(EXIT_USAGE);
+    }
+
+    match crate::resume_picker::select(cwd).await {
+        Ok(Some(id)) => {
+            parsed.resume = false;
+            parsed.session = Some(id);
+            None
+        }
+        Ok(None) => Some(0),
+        Err(error) => {
+            eprintln!("error: {error}");
+            Some(EXIT_RUNTIME)
+        }
+    }
+}
+
+fn emit_startup_warnings(parsed: &Args) {
+    // ---- Startup warnings (ignored-but-recognized flags) ----
+    if parsed.verbose {
+        for warn in &parsed.ignored {
+            eprintln!("warning: {warn}");
+        }
+    }
+    if parsed.no_themes && parsed.theme.is_some() {
+        eprintln!("warning: --no-themes overrides --theme; using the built-in default theme");
+    }
 }
 
 /// Print the merged model catalog, optionally filtered by a case-insensitive
