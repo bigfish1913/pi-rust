@@ -6799,6 +6799,20 @@ pub async fn interactive_tui(
                             tui_for_key.request_render_reusing_scroll_content();
                         }
                     }
+                    MouseEventKind::Down(crossterm::event::MouseButton::Right) if cfg!(windows) => {
+                        // Native pi treats Windows right-click as a clipboard
+                        // paste, rather than letting the console deliver the
+                        // clipboard contents as individual key events. This is
+                        // what preserves the complete payload for
+                        // Editor::handle_paste and large-paste folding.
+                        if let Some(text) = read_clipboard_text() {
+                            if !text.is_empty() {
+                                editor_for_key.handle_paste(&text);
+                                refresh_autocomplete(&state_for_key, &editor_for_key);
+                                tui_for_key.request_render_reusing_scroll_content();
+                            }
+                        }
+                    }
                     MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
                         // Start selection tracking. `selection_end` doubles as the
                         // "a real drag happened" marker: a plain tap never sets
