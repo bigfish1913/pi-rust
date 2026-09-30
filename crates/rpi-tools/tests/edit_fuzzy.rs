@@ -64,6 +64,34 @@ fn text_output(r: &rpi_agent::types::AgentToolResult) -> String {
 }
 
 #[tokio::test]
+async fn accepts_single_edit_object_and_json_string_object() {
+    let (env, ctx) = fresh_context();
+    seed(&env, "single.txt", b"alpha\nbeta\n".to_vec()).await;
+    let tool = rpi_tools::create_edit_tool(&ctx);
+
+    run_edit(
+        tool.clone(),
+        serde_json::json!({
+            "path": "single.txt",
+            "edits": { "oldText": "alpha", "newText": "ALPHA" }
+        }),
+    )
+    .await
+    .expect("single edit object should be normalized");
+    assert_eq!(read_back(&env, "single.txt").await, "ALPHA\nbeta\n");
+
+    run_edit(
+        tool,
+        serde_json::json!({
+            "path": "single.txt",
+            "edits": "{\"oldText\":\"beta\",\"newText\":\"BETA\"}"
+        }),
+    )
+    .await
+    .expect("JSON-string edit object should be normalized");
+    assert_eq!(read_back(&env, "single.txt").await, "ALPHA\nBETA\n");
+}
+#[tokio::test]
 async fn applies_disjoint_edits_and_returns_diffs() {
     let (env, ctx) = fresh_context();
     let original = "alpha\nbeta\ngamma\ndelta\n";
@@ -90,7 +118,6 @@ async fn applies_disjoint_edits_and_returns_diffs() {
     let diff = result.details["diff"].as_str().expect("diff present");
     assert!(diff.contains("ALPHA"), "{diff}");
     assert!(diff.contains("GAMMA"), "{diff}");
-    // Patch reproduces the edited content when applied to the original.
     let patch = result.details["patch"].as_str().expect("patch present");
     assert!(patch.contains("ALPHA"), "patch should mention ALPHA");
     assert_eq!(

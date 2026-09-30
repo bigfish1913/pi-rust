@@ -74,12 +74,7 @@ impl EditTool {
         let params = schemars::schema_for!(EditInput);
         Tool {
             name: "edit".to_string(),
-            description: "Edit a single file using exact text replacement. Every edits[].oldText \
-                          must match a unique, non-overlapping region of the original file. If two \
-                          changes affect the same block or nearby lines, merge them into one edit \
-                          instead of emitting overlapping edits. Do not include large unchanged \
-                          regions just to connect distant changes."
-                .to_string(),
+            description: "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. Each edit is matched against the same original file snapshot, not incrementally after earlier edits. Do not include overlapping or nested edits. If two changes affect the same block or nearby lines, merge them into one edit. Keep oldText as small as possible while still being unique; do not use a short identifier that appears multiple times. Use camelCase oldText/newText fields.".to_string(),
             parameters: rpi_ai::types::Schema::new(
                 serde_json::to_value(params).unwrap_or_default(),
             ),
@@ -230,15 +225,35 @@ fn prepare_edit_arguments(input: serde_json::Value) -> serde_json::Value {
         serde_json::Value::Object(m) => m,
         other => return other,
     };
-    // Parse a JSON-string `edits`.
+    // Parse a JSON-string `edits`. Native Pi accepts either an array or one
+    // edit object here; normalize both forms before serde validation.
     if let Some(edits_val) = args.get("edits").cloned() {
-        if let serde_json::Value::String(s) = edits_val {
-            if let Ok(serde_json::Value::Array(arr)) = serde_json::from_str::<serde_json::Value>(&s)
-            {
-                args.insert("edits".to_string(), serde_json::Value::Array(arr));
+        match edits_val {
+            serde_json::Value::String(s) => {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&s) {
+                    if parsed.is_array() {
+                        args.insert("edits".to_string(), parsed);
+                    } else if is_single_edit_object(&parsed) {
+                        args.insert("edits".to_string(), serde_json::Value::Array(vec![parsed]));
+                    }
+                }
             }
+            value if is_single_edit_object(&value) => {
+                args.insert("edits".to_string(), serde_json::Value::Array(vec![value]));
+            }
+            _ => {}
         }
     }
+    fn is_single_edit_object(value: &serde_json::Value) -> bool {
+        value
+            .as_object()
+            .map(|object| {
+                matches!(object.get("oldText"), Some(serde_json::Value::String(_)))
+                    && matches!(object.get("newText"), Some(serde_json::Value::String(_)))
+            })
+            .unwrap_or(false)
+    }
+
     // Legacy oldText/newText.
     let has_legacy = matches!(args.get("oldText"), Some(serde_json::Value::String(_)))
         && matches!(args.get("newText"), Some(serde_json::Value::String(_)));

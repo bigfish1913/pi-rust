@@ -95,7 +95,6 @@ impl AgentTool for WriteTool {
             .await
             .map_err(file_err_to_agent)?;
         let abs_str = abs.clone();
-        let content_len = input.content.len();
         let path_for_msg = input.path.clone();
 
         // The mutation-queue closure. Abort does NOT unblock the queue: we still
@@ -132,7 +131,7 @@ impl AgentTool for WriteTool {
 
         Ok(AgentToolResult {
             content: vec![TextContentOrImage::text(format!(
-                "Successfully wrote {content_len} bytes to {path_for_msg}"
+                "Successfully wrote to {path_for_msg}"
             ))],
             details: serde_json::Value::Null,
             ..Default::default()

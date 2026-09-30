@@ -1685,6 +1685,7 @@ pub fn bash_options() -> rpi_tools::tools::bash::BashToolOptions {
     BashToolOptions {
         command_prefix: settings.shell_command_prefix.clone(),
         default_timeout: Some(default),
+        prepare: None,
     }
 }
 

@@ -220,12 +220,14 @@ on `main` and fixes how every crate presents itself on crates.io and docs.rs.
 ### Docs
 
 - Added `docs/performance-vs-pi.md` and `scripts/bench-vs-pi.mjs` — a reproducible,
-  same-machine comparison against native Pi over the same JSONL RPC endpoint,
+  same-machine comparison against native Pi over the same JSONL command channel,
   with isolated config directories and both tools offline. rpi is 9.7× faster to
-  start, 1.7× faster to a usable agent, 4.9× smaller in memory and ~21× smaller
-  installed. The same measurement shows 83% of rpi's startup is its own runtime
-  initialisation rather than process overhead, which is now the roadmap's
-  optimisation target.
+  start, 10.7× faster to cold start, 7.6× smaller in memory and ~18× smaller
+  installed. **Corrected after release:** an earlier run set only pi's `PI_*`
+  isolation variables, so rpi read the real `~/.rpi/agent` and loaded the
+  machine's global plugins (reported 103.6 ms / 1.7×); a second bug started the
+  cold-start stopwatch after `spawn()`. With both fixed, rpi's `--version` (17.5 ms) and
+  a cold start (17.7 ms) are effectively equal — the cost is process creation.
 - `crates/rpi-cli/embedded-docs/` — the documentation snapshot compiled into the
   `rpi` binary for the `docs` tool — is refreshed and now guarded: CI runs
   `scripts/sync-embedded-docs.sh` and fails if the snapshot drifts from the

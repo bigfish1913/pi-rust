@@ -10,9 +10,9 @@
 [![Latest release](https://img.shields.io/github/v/release/bigfish1913/pi-rust)](https://github.com/bigfish1913/pi-rust/releases/latest)
 
 `rpi` is a library-first coding-agent runtime written in Rust, plus a terminal
-agent built on top of it. Nine composable crates take you from provider
-adapters to a durable, crash-resumable agent loop with a stable plugin ABI —
-usable as an embedded SDK or as a ready-to-run `rpi` command.
+agent built on top of it. Nine composable crates span provider adapters, a
+durable crash-resumable agent loop, a terminal UI, and a stable plugin ABI — so
+the same code works as an embedded SDK or as a ready-to-run `rpi` command.
 
 Website: <https://rpi.laofu.online/> · Docs: <https://rpi.laofu.online/docs.html>
 
@@ -96,9 +96,9 @@ AgentEnd observed; tool ran against OsExecutionEnv.
 ### The CLI
 
 ```bash
-export ANTHROPIC_API_KEY=...        # or OPENAI_API_KEY, or ~/.rpi/agent/models.json
-rpi                                 # interactive TUI
-rpi -p "summarize the README"      # one-shot
+export ANTHROPIC_API_KEY=...          # or OPENAI_API_KEY, or ~/.rpi/agent/models.json
+rpi                                   # interactive TUI
+rpi -p "summarize the README"         # one-shot
 rpi --mode json -p "list the crates"  # machine-readable event stream
 ```
 
@@ -222,31 +222,32 @@ rebuild and re-measure on your own machine.
 
 | Metric | Value |
 | ------ | ----- |
-| Release binary size | **23.9 MiB** |
-| `rpi --version` wall time | **~18 ms** median |
-| RSS once the agent is ready | **18.6 MiB** |
+| Release binary size | **21.8 MiB** |
+| `rpi --version` wall time | **~17 ms** median |
+| RSS once the agent is ready | **12.0 MiB** |
 
-`node scripts/bench-vs-pi.mjs --pi <path-to-pi>` — measured against native Pi on
-the same machine, over the same RPC endpoint, with an isolated config directory
-and both tools offline:
+`node scripts/bench-vs-pi.mjs --pi <path-to-pi>` — against native Pi on the same
+machine, both offline, each with a fresh isolated config directory:
 
 | Metric | rpi (Rust) | pi (TypeScript) | Difference |
 | ------ | ---------: | --------------: | ---------- |
-| `--version` | **17.9 ms** | 172.9 ms | **9.7× faster** |
-| Time to a usable agent (RPC ready) | **103.6 ms** | 176.4 ms | **1.7× faster** |
-| RSS at ready | **18.6 MiB** | 91.6 MiB | **4.9× smaller** |
-| Install footprint | **23.9 MiB** (one binary) | ~513 MiB | **~21× smaller** |
+| `--version` | **17.5 ms** | 169.5 ms | **9.7× faster** |
+| Cold start | **17.7 ms** | 189.5 ms | **10.7× faster** |
+| RSS at ready | **12.0 MiB** | 91.5 MiB | **7.6× smaller** |
+| Install footprint | **21.8 MiB** (one binary) | ~385 MiB (+ ~91 MiB Node) | **~18–22× smaller** |
 
-The interesting part is where the time goes. Pi's cost is almost entirely Node
-startup — its `--version` and its fully-initialised agent differ by about 3 ms.
-rpi's process start is 17.9 ms, but reaching a usable agent takes 103.6 ms, so
-~86 ms (83% of its startup) is its own runtime initialisation rather than process
-or loader overhead. Further startup wins for rpi therefore have to come from lazy
-initialisation, not from a smaller binary — see the [roadmap](ROADMAP.md).
+**Cold start** is spawn → the agent answering its first command: process creation
+plus full initialisation, excluding teardown and any LLM work. rpi's `--version`
+(17.5 ms) and cold start (17.7 ms) are effectively equal, so startup is process
+creation, not initialisation; Pi is dominated by Node boot.
 
-The full method, raw per-run numbers, and an explicit list of what is *not*
-measured (LLM latency, tool-loop throughput, long sessions, TUI frame cost) are
-in [`docs/performance-vs-pi.md`](docs/performance-vs-pi.md).
+Isolation caveat: rpi reads `RPI_CODING_AGENT_DIR` / `RPI_OFFLINE`, native Pi reads
+`PI_CODING_AGENT_DIR` / `PI_OFFLINE`. Set the matching pair for each, or rpi
+silently loads the machine's global plugins.
+
+Method, raw per-run numbers, and what is *not* measured (LLM latency, tool-loop
+throughput, long sessions, TUI frame cost) are in
+[`docs/performance-vs-pi.md`](docs/performance-vs-pi.md).
 
 ## Plugins
 
@@ -299,7 +300,7 @@ machine. See [`docs/remote-mode.md`](docs/remote-mode.md).
 
 | | |
 | --- | --- |
-| Current release | **0.3.0** (nine crates, published together) |
+| Current release | **[0.3.6](https://github.com/bigfish1913/pi-rust/releases)** (nine crates, published together) |
 | Stability | `rpi-ai`, `rpi-agent`, `rpi-tools`, `rpi-harness`, `rpi-plugin-sdk` are the intended stable surface |
 | MSRV | 1.78 |
 | Platforms | Linux, macOS, Windows (CI runs the suite on Linux) |

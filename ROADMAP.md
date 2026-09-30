@@ -68,17 +68,22 @@ The ABI and loader work; the ecosystem is thin. Concretely:
 ### 5. Startup initialisation (measured)
 
 The benchmark in [`docs/performance-vs-pi.md`](docs/performance-vs-pi.md) puts rpi
-at 103.6 ms to a usable agent against 176.4 ms for native Pi. It also shows that
-~86 ms of rpi's 103.6 ms is rpi's own runtime initialisation, not process or
-loader overhead — so this is the largest remaining startup cost, and the only one
-still worth attacking:
+at **17.7 ms** from spawn to cold start (native Pi: 189.5 ms). Core startup is
+essentially just process creation — config, session store, tool registry and the
+harness are negligible (rpi's `--version` and its cold start differ by 0.2 ms).
 
-- profile that ~86 ms and split it across config, session store, tool registry
-  and resource/extension discovery;
-- make extension and provider discovery lazy, so a session that never calls a
-  tool does not pay for the full registry;
+The one real startup cost is **plugin loading**, and it scales with what the user
+installed: the same measurement reads ~100 ms on a machine whose
+`~/.rpi/agent/extensions` holds 25 plugin DLLs. So the work here is:
+
+- make extension discovery and loading lazy (or parallel) so startup does not
+  scale with the number of installed plugins;
 - keep the RPC `ready` marker honest — it must keep meaning "commands are being
   accepted", not "the work was deferred somewhere later".
+
+Reproduce with `node scripts/bench-vs-pi.mjs`. Set **both** tools' isolation
+variables (`RPI_*` for rpi, `PI_*` for pi) or the rpi number will include your
+global plugins.
 
 Still unmeasured and worth adding: tool-loop throughput, memory growth over a
 long session, compaction cost, and interactive TUI frame cost.
