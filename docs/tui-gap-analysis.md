@@ -1,6 +1,6 @@
 # pi TUI 完整差距分析报告
 
-> 状态说明（2026-09-05）：本文保留了最初的差距基线。当前 `interactive_tui.rs`
+> 状态说明（2026-09-27 更新）：本文保留了最初的差距基线。当前 `interactive_tui.rs`
 > 已经接入流式事件、工具/Bash 渲染、会话恢复、滚动、自动补全、steering/follow-up
 > 队列、图片 block、alternate-screen/regular-screen overlay、`/tree`、`/clone`、
 > `/trust` 和基础 `/login`/`/logout`。恢复历史也会显示 compaction、branch summary、
@@ -9,10 +9,16 @@
 > OAuth 登录对话框仍待补齐；Mermaid 专用终端渲染和扩展 editor/selector
 > 已完成接入。扩展 command、message renderer、entry renderer 都通过同一份
 > live registry 接到 TUI。
+>
+> 编辑器侧另已补齐两项：长粘贴折叠（>10 行或 >1000 字折成 `[paste #N …]`），
+> 以及取消/队列对齐（Esc/Ctrl+C/Ctrl+D 取消前先把队列消息回填编辑器，
+> 对齐原生 `restoreQueuedMessagesToEditor({abort:true})`；Alt+Q/Alt+Up 出队带
+> `Restored N …` 反馈）。因此下方 §三「键盘处理」/「信号处理」两行标注的 ❌
+> 已过时——完整快捷键、Ctrl+C 中断、Ctrl+D 退出、Esc 取消均已落地。
 
 ## 概述
 
-对比 TypeScript 版本的 pi TUI（`packages/coding-agent/src/modes/interactive/interactive-mode.ts`，6000+ 行）与 Rust 版本（`crates/pi-cli/src/interactive_tui.rs`，591 行），差距非常大。
+对比 TypeScript 版本的 pi TUI（`packages/coding-agent/src/modes/interactive/interactive-mode.ts`，6000+ 行）与 Rust 版本（`crates/rpi-cli/src/interactive_tui.rs`，591 行），差距非常大。
 
 ## 一、库层对比（pi-tui）
 
@@ -105,7 +111,6 @@
 | user-message-selector.ts | 用户消息选择器 |
 | visual-truncate.ts | 视觉截断 |
 | first-time-setup.ts | 首次设置 |
-| earendil-announcement.ts | 公告 |
 | extension-editor.ts | `register_command` 返回 `{"kind":"editor"}`，接入原生 Editor（已接入） |
 | extension-input.ts | 扩展 editor action 的 initialText/placeholder/submit 回传（已接入） |
 | extension-selector.ts | `register_command` 返回 `{"kind":"selector"}`，接入原生 SelectList（已接入） |

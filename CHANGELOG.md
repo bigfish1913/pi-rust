@@ -11,6 +11,97 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.3.6] - 2026-09-30
+
+## [0.3.5] - 2026-09-29
+
+## [0.3.4] - 2026-09-27
+
+### Added
+
+- **Long pastes fold into a `[paste #N …]` marker instead of flooding the
+  editor.** A bracketed paste longer than 10 lines or 1000 characters collapses
+  to a single `[paste #N +M lines]` / `[paste #N M chars]` token, matching native
+  pi, so dropping a stack trace or a file into the prompt still leaves a readable
+  draft. The editor keeps the full text beside the marker — submit sends the
+  expansion — and the marker is atomic: one backspace or arrow press removes or
+  steps over the whole thing, and deleting an earlier marker renumbers the later
+  ones so `#N` stays gapless. Pastes under the threshold still insert verbatim,
+  and Windows' Ctrl+V clipboard fallback takes the same path.
+- **`Ctrl+X` copies the way native pi's `app.message.copy` does.** The editor
+  selection is copied when there is one, otherwise the last assistant reply.
+  Native pi binds the same action to the same key; this is where selection-copy
+  lives now that `Ctrl+C` clears.
+
+### Changed
+
+- **Transcript repaints are now O(1) per unchanged message, closing the
+  long-session lag against native pi.** rpi re-parsed every finished message's
+  markdown/layout on every frame, so a 400-message session cost ~18 ms per
+  frame (over the 16 ms budget) and got slower as it grew. It now mirrors
+  native pi's caching layers: `Markdown` and `Text` memoize
+  `(content, width) -> lines`, `UserMessageComponent` builds its `Box` +
+  `Markdown` once instead of per frame, finalized `ToolExecutionComponent` /
+  `BashExecutionComponent` panels cache their output, and the layout pass has a
+  frame-local `renderCached` map so a component measured for an auto basis is
+  not rendered again when painted. A live theme switch bumps a global revision
+  that every cache keys on, so `apply_theme_preset` cannot leave stale colours.
+  A 400-message transcript drops from ~18 ms to ~0.8 ms per frame (~22×) and
+  stays under budget past 3000 messages; `crates/rpi-tui/examples/bench_transcript.rs`
+  reproduces the measurement.
+- **The terminal window/tab title now carries the startup mark.** An idle
+  session sets `▃ ▅ ▂ rpi · 🦀` instead of `🦀π rpi`, keeping the activity
+  suffix it had before (`⟳` in flight, `↻` retrying), so the tab and the startup
+  lockup read as one brand: the title's three eighth-blocks are the lockup's
+  3:5:2 bar silhouette flattened into a single row, and a test reads the bar
+  heights back out of the lockup so the two cannot drift apart. Each bar is one
+  cell wide — the first cut used `██` per bar and read as three fat slabs in a
+  tab strip. The title is built by `pi-cli`'s `brand` module, so it drops the
+  crab with `RPI_NO_EMOJI` exactly like the lockup — and it drops `π`, which is
+  East-Asian *Ambiguous* and therefore measured differently under a CJK locale.
+  Block elements share `█`'s width class, so the title is still single-width
+  everywhere.
+- **`Ctrl+C` clears the editor instead of aborting the run, matching native pi's
+  `handleCtrlC`.** One press clears the draft — text *and* selection — and a
+  second press within 500ms quits. Aborting stays on `Esc` (`app.interrupt`), so
+  a stray `Ctrl+C` while a turn is streaming can no longer kill it, which is easy
+  to do while a half-typed steering message sits in the editor. Auto-repeat is
+  ignored, so holding the key cannot turn one tap into the quit; the quit still
+  forces the process out when the async loop is parked inside a run. The footer,
+  `/help`, and the remote-shell footer now read `Ctrl+C: Clear/Exit` and
+  `Esc: Abort` instead of `Ctrl+C: Abort/Exit`.
+- **`Ctrl+D` and the model-cycle keys now match native pi too.** `Ctrl+D` no
+  longer aborts a run: with text in the editor it deletes the character forward
+  (`tui.editor.deleteCharForward`), and on an empty editor it quits
+  (`app.exit`). Aborting is now `Esc` and nothing else. Model cycling moved from
+  `Ctrl+M` to native's `Ctrl+P`, joined by a new `Shift+Ctrl+P` (`Alt+P` on
+  Windows) for the previous model — every hint, selector description, and doc
+  comment that named the old key was updated with it.
+- **The last native-only keybindings are wired up.** `Ctrl+Z` suspends to the
+  background on Unix (`app.suspend` — native binds no key on Windows, so neither
+  does rpi): it stops the renderer, hands the terminal back to the shell, and
+  re-enters the alternate screen when the process is resumed with `fg`. On
+  Windows, `Ctrl+Q` joins `Alt+Enter` for follow-ups and `Alt+V` joins `Ctrl+V`
+  for image paste — native's Windows keys, added alongside rpi's rather than
+  replacing them, because the Windows clipboard-*text* fallback still rides
+  `Ctrl+V`. The registry now matches native's defaults for every app-level
+  action rpi implements.
+
+### Fixed
+
+- **Cancelling a run hands the messages you queued while it was in flight back
+  to the editor.** Esc / Ctrl+C / Ctrl+D aborted the lane, which drains its
+  steering and follow-up queues — and the helper meant to pull them into the
+  editor first existed but was never called, so anything staged during a run
+  vanished on cancel. The three cancel paths now drain the queue into the draft
+  (queued text first, then whatever you had typed, caret at the end of the last
+  line) *before* the abort, mirroring native pi's
+  `restoreQueuedMessagesToEditor({ abort: true })`. Dequeuing with Alt+Q / Alt+Up
+  reports `Restored N queued message(s) to editor` (or `No queued messages to
+  restore`) like native `handleDequeue`, and the restored draft's caret lands on
+  the last line at a byte offset — the old `(0, char_count)` call parked it at
+  the end of the first line and split multi-byte characters.
+
 ## [0.3.3] - 2026-09-26
 
 ### Added
@@ -135,7 +226,7 @@ on `main` and fixes how every crate presents itself on crates.io and docs.rs.
   installed. The same measurement shows 83% of rpi's startup is its own runtime
   initialisation rather than process overhead, which is now the roadmap's
   optimisation target.
-- `crates/pi-cli/embedded-docs/` — the documentation snapshot compiled into the
+- `crates/rpi-cli/embedded-docs/` — the documentation snapshot compiled into the
   `rpi` binary for the `docs` tool — is refreshed and now guarded: CI runs
   `scripts/sync-embedded-docs.sh` and fails if the snapshot drifts from the
   repository documents. It had fallen behind by several releases.

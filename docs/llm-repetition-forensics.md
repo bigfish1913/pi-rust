@@ -1,7 +1,7 @@
 # 「LLM 一直在重复思考」问题复盘
 
 审计日期：2026-09-25
-涉及仓库：`pi-rust`（`crates/pi-agent`、`crates/pi-ai`、`crates/pi-harness`、`crates/pi-cli`、`crates/pi-tui`）
+涉及仓库：`pi-rust`（`crates/rpi-agent`、`crates/rpi-ai`、`crates/rpi-harness`、`crates/rpi-cli`、`crates/rpi-tui`）
 
 本文记录一次「模型看起来卡在重复思考 / 第二轮不回复」的排查过程、证据、完整代码链路，
 以及哪些断点被确认、哪些被排除。目的不是给结论，而是给一份**可复核的调用链**，
@@ -51,7 +51,7 @@
 
 ```
 用户按 Enter
-└─ crates/pi-cli/src/interactive_tui.rs:5956   editor.on_submit 闭包（阻塞在 key 线程）
+└─ crates/rpi-cli/src/interactive_tui.rs:5956   editor.on_submit 闭包（阻塞在 key 线程）
    ├─ text.starts_with('/')                 → dispatch_slash(..)
    ├─ parse_user_bash(text)                 → start_user_bash(..)     【! / !! 直连 shell】
    ├─ RunStatus != Idle                     → lane.steer(msg)
@@ -67,7 +67,7 @@
             └─ lane.prompt_text(prompt, images)      ──────────────┐
                                                                    │
 harness 层                                                         │
-└─ crates/pi-harness/src/agent_harness.rs:1799  run_core(prompts) ◄──┘
+└─ crates/rpi-harness/src/agent_harness.rs:1799  run_core(prompts) ◄──┘
    ├─ :1805  next_run_queue 取出排队 prompt，接到本次 prompts 前面
    ├─ :1812  finish_interrupted_operation(..)
    │          把上一次没写 operation_finished 的 run 记成 aborted/interrupted
@@ -84,7 +84,7 @@ harness 层                                                         │
 ### 3.2 agent loop
 
 ```
-crates/pi-agent/src/agent_loop.rs:72  run_agent_loop(prompts, context, config, emit, stream_fn)
+crates/rpi-agent/src/agent_loop.rs:72  run_agent_loop(prompts, context, config, emit, stream_fn)
   ├─ :79   new_messages = prompts.clone()            ← ★ 这里传入的是空 vec
   ├─ :80   current_context.messages = context.messages + prompts
   ├─ :90   emit AgentStart
@@ -112,7 +112,7 @@ crates/pi-agent/src/agent_loop.rs:72  run_agent_loop(prompts, context, config, e
 ### 3.3 单次 provider 请求
 
 ```
-crates/pi-agent/src/agent_loop.rs:383  stream_assistant_response(&mut context, ..)
+crates/rpi-agent/src/agent_loop.rs:383  stream_assistant_response(&mut context, ..)
   ├─ :390  transform_context(context.messages.clone())
   ├─ :397  convert_to_llm(messages)                      ← AgentMessage[] → Message[]
   ├─ :399  llm_context = { system_prompt, messages, tools }
@@ -126,12 +126,12 @@ crates/pi-agent/src/agent_loop.rs:383  stream_assistant_response(&mut context, .
 ### 3.4 provider 流式解码（以 openai-completions 为例）
 
 ```
-crates/pi-ai/src/providers/openai_completions.rs
+crates/rpi-ai/src/providers/openai_completions.rs
   ├─ :145  body = build_request(model, ctx, opts)     ← max_tokens / system / tools 在此成型
   ├─ :156  retry_provider_request(..)                 ← 可重试错误在此重试
-  │          crates/pi-ai/src/providers/anthropic/retry.rs:160
+  │          crates/rpi-ai/src/providers/anthropic/retry.rs:160
   ├─ :158  http.post(url).timeout(opts.request_timeout())
-  │          DEFAULT_LLM_API_TIMEOUT = 600s（crates/pi-ai/src/provider.rs:14）
+  │          DEFAULT_LLM_API_TIMEOUT = 600s（crates/rpi-ai/src/provider.rs:14）
   │          reqwest 语义：覆盖「连接 + 响应体读完」全程 ⇒ 整个流必须 10 分钟内结束
   ├─ :201  SseEventStream::new(response, signal)
   └─ :202  loop { events.next_event().await
@@ -150,7 +150,7 @@ crates/pi-ai/src/providers/openai_completions.rs
 SSE 解码器本体：
 
 ```
-crates/pi-ai/src/providers/anthropic/sse.rs
+crates/rpi-ai/src/providers/anthropic/sse.rs
   :213  next_event
     ├─ :221  while let Some((line, rest)) = consume_line(&leftover, self.done)
     ├─ :234  if self.done { …最后半行…; self.state.flush() }
@@ -168,7 +168,7 @@ crates/pi-ai/src/providers/anthropic/sse.rs
 ### 3.5 回到 TUI
 
 ```
-crates/pi-cli/src/interactive_tui.rs:8084  handle_agent_event（drain 任务，独立于主循环）
+crates/rpi-cli/src/interactive_tui.rs:8084  handle_agent_event（drain 任务，独立于主循环）
   ├─ :8092  AgentStart        → set_status(Working)
   ├─ :8097  AgentEnd          → set_status(Idle)
   │                            + flush pending_bash_messages
@@ -185,7 +185,7 @@ crates/pi-cli/src/interactive_tui.rs:8084  handle_agent_event（drain 任务，�
 ### 3.6 动画与耗时（与 §六、§七 相关）
 
 ```
-crates/pi-cli/src/interactive_tui.rs  render-tick 任务
+crates/rpi-cli/src/interactive_tui.rs  render-tick 任务
   interval = rpi_tui::loader::SPINNER_FRAME_MS (= 80ms，对齐原生 DEFAULT_INTERVAL_MS)
   只 request_render(..)，不推帧
         └─ TuiAltScreen::do_render(:689)
@@ -194,8 +194,8 @@ crates/pi-cli/src/interactive_tui.rs  render-tick 任务
                   · idle:   80ms tick 一帧 ⇒ 与原生 pi 同频
 
 工具/bash 耗时：
-  crates/pi-tui/src/tool_execution.rs   started_at / finished_at + format_elapsed
-  crates/pi-tui/src/bash_execution.rs   started_at / finished_at + format_elapsed
+  crates/rpi-tui/src/tool_execution.rs   started_at / finished_at + format_elapsed
+  crates/rpi-tui/src/bash_execution.rs   started_at / finished_at + format_elapsed
 ```
 
 ---
@@ -240,13 +240,13 @@ crates/pi-cli/src/interactive_tui.rs  render-tick 任务
 （`interactive_tui.rs` 提交处理器、Alt+Enter 空闲分支、启动 `-p` 循环）；
 排队（steer / follow-up）仍由 `agent_loop.rs:201` drain 时的 `MessageStart` 回显 —— 两者各渲染一次，不会重叠。
 
-回归保护：`crates/pi-harness/tests/harness_run_e2e.rs::directly_sent_prompt_emits_no_user_message_start`
+回归保护：`crates/rpi-harness/tests/harness_run_e2e.rs::directly_sent_prompt_emits_no_user_message_start`
 把这个「harness 不发用户 message_start」的契约钉住：如果哪天 harness 改成发，这个测试会红，
 提醒必须同时去掉 TUI 的提交时渲染，否则会出现两条气泡。
 
 ### 4.5 `now_ms()` 是不是真时钟？——**确认为真 bug（已修）**
 
-原实现（`crates/pi-agent/src/agent_loop.rs` 与 `crates/pi-agent/src/agent.rs` 各一份）：
+原实现（`crates/rpi-agent/src/agent_loop.rs` 与 `crates/rpi-agent/src/agent.rs` 各一份）：
 
 ```rust
 fn now_ms() -> i64 {
@@ -263,7 +263,7 @@ fn now_ms() -> i64 {
 影响面：目前排序用插入顺序（`EntryOrder::OldestFirst` 直接迭代数组，见 `session/state.rs:295`），
 所以上下文没被搞乱；但 JSONL 落盘的时间是垃圾，任何按时间戳的逻辑（cache idle 判定、导出、第三方读日志）都会错。
 
-**修复**：新增 `crates/pi-agent/src/clock.rs::now_ms()` —— 真实 `SystemTime` + 单调下限（CAS 保证严格递增），
+**修复**：新增 `crates/rpi-agent/src/clock.rs::now_ms()` —— 真实 `SystemTime` + 单调下限（CAS 保证严格递增），
 两处调用点改为 `crate::clock::now_ms()`。
 
 ### 4.6 一次 run 的消息何时落盘？——**确认为设计缺陷（未改，已展开为 §十一）**
@@ -328,7 +328,7 @@ deltas= 8000  elapsed=105ms     (4× 增量 → 7.8× 时间)
 - 已做：方案 B（provider 内按字节+时间窗合并 delta），见 §9.4；
 - 未做：方案 A（`partial` 改为共享，或让 `MessageUpdate` 只带 delta + index），
   这是唯一能去掉指数项的做法，需要动事件契约。
-- 参考：`crates/pi-ai/src/types.rs:1015` 已有 `AssistantMessageEvent::partial()` 辅助函数，可作为收敛点。
+- 参考：`crates/rpi-ai/src/types.rs:1015` 已有 `AssistantMessageEvent::partial()` 辅助函数，可作为收敛点。
 
 ### 4.8 todo 工具为什么会重复登记？——**确认为真 bug（已修）**
 
@@ -369,7 +369,7 @@ deltas= 8000  elapsed=105ms     (4× 增量 → 7.8× 时间)
 - tick 只 `request_render(..)`，推帧统一由 `Editor::render` 负责（先取快照再前进，
   首帧渲染 0，与原生 `start()` 行为一致）⇒ 空闲 **80ms/帧、10 帧 800ms 一轮**，与原生同频；
   有 token 时每次重绘都推一帧，仍保留「按 token 输出加速」的特性。
-- 帧集收敛为 `crates/pi-tui/src/loader.rs::SPINNER_FRAMES`（+ `SPINNER_FRAME_MS = 80`），
+- 帧集收敛为 `crates/rpi-tui/src/loader.rs::SPINNER_FRAMES`（+ `SPINNER_FRAME_MS = 80`），
   `Loader` 与编辑器顶栏共用，不再各抄一份。
 - 确认 `request_render_reusing_scroll_content()` 只缓存 transcript（`layout.rs:346` 的
   `sv.render_with_cached_content`），编辑器在 dock 中每帧都会真的走 `render`，空闲动画不会被缓存冻住。
@@ -472,7 +472,7 @@ curl -sS -N -X POST "$BASE_URL/chat/completions" \
 
 ### 8.2 第 1 层：openai-compat 组请求时丢弃 `thinking`（根因）
 
-`crates/pi-ai/src/providers/openai_completions.rs:272`：
+`crates/rpi-ai/src/providers/openai_completions.rs:272`：
 
 ```rust
 let assistant_content = if requires_thinking_as_text(model) {
@@ -483,7 +483,7 @@ let assistant_content = if requires_thinking_as_text(model) {
 };
 ```
 
-`Content::text_only`（`crates/pi-ai/src/types.rs:244`）只 filter `Content::Text`，
+`Content::text_only`（`crates/rpi-ai/src/types.rs:244`）只 filter `Content::Text`，
 `Content::Thinking` **整块丢弃**。开关 `requires_thinking_as_text`（同文件 `:545`）读
 `compat.requires_thinking_as_text`，**默认 `false`**。
 
@@ -499,7 +499,7 @@ qwen3.7-plus keys        : [id, name, reasoning, input, contextWindow, maxTokens
 它上一轮推导出的 5 条计划，对它自己不存在。
 
 **对照（同一仓库的另一条 provider 路径）**：Anthropic 路径**保留** thinking ——
-`crates/pi-ai/src/providers/anthropic/build_params.rs:771` 会把 `Content::Thinking`
+`crates/rpi-ai/src/providers/anthropic/build_params.rs:771` 会把 `Content::Thinking`
 连同 signature 一起发回去。
 
 ⇒ **这是 provider-specific 的**。用 Anthropic 模型时模型能看到自己上一轮推理，
@@ -538,13 +538,13 @@ tool_execution_end   agent_start
 
 ### 8.5 第 4 层：循环没有刹车
 
-`crates/pi-agent/src/agent_loop.rs:190`：
+`crates/rpi-agent/src/agent_loop.rs:190`：
 
 ```rust
 while has_more_tool_calls || !pending_messages.is_empty()
 ```
 
-配上 `crates/pi-harness/src/agent_harness.rs:1993-1994`：
+配上 `crates/rpi-harness/src/agent_harness.rs:1993-1994`：
 
 ```rust
 should_stop_after_turn: None,
@@ -632,7 +632,7 @@ prepare_next_turn: None,
 
 ### 9.1 修：把工作状态放进可见通道（§8.8 第 1 项）
 
-`crates/pi-cli/src/session.rs::default_system_prompt` 新增三条规则：
+`crates/rpi-cli/src/session.rs::default_system_prompt` 新增三条规则：
 
 ```
 - Keep your working state in your VISIBLE replies, not only in reasoning. Reasoning is not
@@ -673,7 +673,7 @@ prepare_next_turn: None,
 
 ### 9.2 修：run 级轮数护栏（§8.8 第 3 项）
 
-新增 `crates/pi-harness/src/run_budget.rs`：
+新增 `crates/rpi-harness/src/run_budget.rs`：
 
 | 项 | 值 / 说明 |
 |---|---|
@@ -759,7 +759,7 @@ RPI_MAX_TURNS_PER_RUN=120 rpi     # 单次 run 超过 120 轮就停，并追一�
 
 ### 10.2 修了什么：共享的 delta 合并策略
 
-新增共享策略（`crates/pi-ai/src/providers/mod.rs`）：
+新增共享策略（`crates/rpi-ai/src/providers/mod.rs`）：
 
 | 常量 | 值 | 作用 |
 |---|---|---|
@@ -848,7 +848,7 @@ payload 必须变成共享可变状态（`Arc<Mutex<..>>`），代价是语义�
 
 ### 10.6 顺带修掉的一个既有红测试
 
-`crates/pi-ai/src/providers/proxy.rs` 的文档示例本来就编译不过（`use rpi_ai::proxy::…`
+`crates/rpi-ai/src/providers/proxy.rs` 的文档示例本来就编译不过（`use rpi_ai::proxy::…`
 路径错误 + 缺 `headers` 字段 + 悬空的 `model`/`ctx`/`opts`），让 `cargo test --workspace`
 常年为红。已改为 `no_run` 且补全可见字段与正确的
 `rpi_ai::providers::proxy` 路径。该文件其余 11 处 rustfmt 差异是既有债，未动。
@@ -875,7 +875,7 @@ payload 必须变成共享可变状态（`Arc<Mutex<..>>`），代价是语义�
 
 ### 11.2 现在到底在什么时刻落盘（逐时间线）
 
-`crates/pi-harness/src/agent_harness.rs::run_core`（`:1799` 起）：
+`crates/rpi-harness/src/agent_harness.rs::run_core`（`:1799` 起）：
 
 ```
 :1799  run_core(prompts)
@@ -1086,7 +1086,7 @@ A/B 都会改重试语义或持久化不变量，值得单独一轮评审。
   模型上下文永远看不到它。这跟 §11.4 的判断是同一条：问题在写侧，而写侧的
   「写哪儿」决定了它会不会污染上下文。
 
-**写侧**（`crates/pi-harness/src/frame_progress.rs`）：
+**写侧**（`crates/rpi-harness/src/frame_progress.rs`）：
 
 - `FrameRecordingEmitter` 包住原来的 emitter，在 `MessageStart` / `MessageUpdate` 时把
   帧追加成 `LaneRecord::AssistantFrame { run_id, stream_index, op: Append, frame }`；
@@ -1114,7 +1114,7 @@ A/B 都会改重试语义或持久化不变量，值得单独一轮评审。
    以 interrupted assistant 消息形式追加到分支。这是**用户重开会话**时走的路径。
 2. `run_core` 的 `Err` 分支：该路径本来什么都不落盘，现在也打捞一次。
 
-**验证**（`crates/pi-harness/tests/harness_run_e2e.rs` 新增 3 条）：
+**验证**（`crates/rpi-harness/tests/harness_run_e2e.rs` 新增 3 条）：
 
 - `a_crashed_run_can_be_salvaged_from_its_committed_frames`：慢速流跑到一半 `abort`
   任务（等价于 kill -9 对 run future 的影响），断言帧已落盘、分支里**只有 prompt**、
@@ -1287,7 +1287,7 @@ assistant 步定稿时刻**。原因：
 
 ### 11.7.7 已落地：commit-on-settle（把落盘时刻提前到消息定稿）
 
-§11.7.6 说的那一步已经做了。新增 `crates/pi-harness/src/settle.rs`：
+§11.7.6 说的那一步已经做了。新增 `crates/rpi-harness/src/settle.rs`：
 
 - `SettlingEmitter` 包在帧记录器**外面**（所以每个 delta 的帧仍然先落盘，
   「已定稿但未提交」这个窗口仍然可用帧恢复）；

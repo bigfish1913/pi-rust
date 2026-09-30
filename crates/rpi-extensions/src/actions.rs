@@ -1,6 +1,6 @@
 //! B5a — the plugin→host `runtime_action` bridge (inverted FFI).
 //!
-//! A plugin invokes `PluginApiVt::runtime_action` to drive the harness (send a
+//! A plugin invokes `PluginApi::runtime_action` to drive the harness (send a
 //! message, switch models, fork a session, reload extensions, …). Unlike the
 //! register trampolines — which run synchronously inside the selected register
 //! entrypoint
@@ -10,7 +10,7 @@
 //! itself. Neither has the thread-local set, and the host cannot predict which
 //! threads a plugin will call from. Thread-local is the wrong tool here.
 //!
-//! The verified-correct recovery channel is [`PluginApiVt::user_data`]: it is
+//! The verified-correct recovery channel is [`PluginApi::user_data`]: it is
 //! `Send+Sync`, populated at vtable build, passed back unchanged on every call,
 //! and the SDK designates it "the host's opaque context". Today every register
 //! trampoline ignores `user_data` (the register path uses the thread-local), so
@@ -376,7 +376,7 @@ pub trait RuntimeActionHost: Send + Sync {
     }
 }
 
-/// The host-side bridge carried in [`PluginApiVt::user_data`] so
+/// The host-side bridge carried in [`PluginApi::user_data`] so
 /// [`trampoline_runtime_action`] can recover the harness state from any thread.
 ///
 /// `runtime: Handle` is captured at build time (the host is on the runtime when
@@ -419,6 +419,10 @@ pub struct ActionBridge {
     /// Shared with the TUI, which polls [`ExtensionStatusMailbox::revision`]
     /// and repaints the footer only when an extension actually wrote.
     ext_status: crate::status::ExtensionStatusMailbox,
+    /// Session-scoped editor-text queue (`SetEditorText` runtime action). Shared
+    /// with the TUI, which drains it once per tick and writes the draft into the
+    /// prompt editor.
+    editor_text: crate::editor_text::EditorTextMailbox,
     /// B5d staleness flag. Shared so [`invalidate`] flips it for every clone.
     /// `true` while this bridge is the live session's bridge.
     active: Arc<AtomicBool>,
@@ -434,6 +438,7 @@ impl ActionBridge {
             reload: None,
             ui_dialog: UiDialogMailbox::new(),
             ext_status: crate::status::ExtensionStatusMailbox::new(),
+            editor_text: crate::editor_text::EditorTextMailbox::new(),
             active: Arc::new(AtomicBool::new(true)),
         })
     }
@@ -451,6 +456,7 @@ impl ActionBridge {
             reload,
             UiDialogMailbox::new(),
             crate::status::ExtensionStatusMailbox::new(),
+            crate::editor_text::EditorTextMailbox::new(),
         )
     }
 
@@ -466,6 +472,7 @@ impl ActionBridge {
             reload: None,
             ui_dialog,
             ext_status: crate::status::ExtensionStatusMailbox::new(),
+            editor_text: crate::editor_text::EditorTextMailbox::new(),
             active: Arc::new(AtomicBool::new(true)),
         })
     }
@@ -477,6 +484,7 @@ impl ActionBridge {
         reload: Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>,
         ui_dialog: UiDialogMailbox,
         ext_status: crate::status::ExtensionStatusMailbox,
+        editor_text: crate::editor_text::EditorTextMailbox,
     ) -> Arc<Self> {
         Arc::new(Self {
             runtime,
@@ -484,6 +492,7 @@ impl ActionBridge {
             reload: Some(reload),
             ui_dialog,
             ext_status,
+            editor_text,
             active: Arc::new(AtomicBool::new(true)),
         })
     }
@@ -496,6 +505,11 @@ impl ActionBridge {
     /// Clone the session status registry (TUI rendering + reload-created bridges).
     pub fn extension_status_mailbox(&self) -> crate::status::ExtensionStatusMailbox {
         self.ext_status.clone()
+    }
+
+    /// Clone the session editor-text queue (TUI drain + reload-created bridges).
+    pub fn editor_text_mailbox(&self) -> crate::editor_text::EditorTextMailbox {
+        self.editor_text.clone()
     }
 
     /// Mark this bridge stale (B5d). A `/reload` that swaps in a fresh bridge
@@ -603,7 +617,7 @@ pub fn reload_callback_from_mailbox(
 // naturally Send+Sync; no manual unsafe impl needed.
 
 /// Dispatch one action to the host. Async — runs on the bridge's runtime.
-/// Handles all 18 ids; `Reload` delegates to [`RuntimeActionHost::reload`]
+/// Handles all 19 ids; `Reload` delegates to [`RuntimeActionHost::reload`]
 /// (the "no callback configured" fallback). When the bridge has a reload
 /// callback, the spawn site intercepts `Reload` and awaits the callback
 /// instead (a CLI concern, not a harness op) — this helper is the plain
@@ -612,6 +626,7 @@ async fn dispatch(
     host: &Arc<dyn RuntimeActionHost>,
     ui_dialog: &UiDialogMailbox,
     ext_status: &crate::status::ExtensionStatusMailbox,
+    editor_text: &crate::editor_text::EditorTextMailbox,
     action: RuntimeActionId,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
@@ -637,6 +652,9 @@ async fn dispatch(
         // UI-only action: handled by the bridge (no harness call), exactly like
         // `UiDialog`. Written straight into the shared registry the TUI polls.
         RuntimeActionId::SetStatus => ext_status.handle(args),
+        // Editor-only action: served by the bridge (no harness call), exactly
+        // like `SetStatus`/`UiDialog`. The TUI drains the queue each tick.
+        RuntimeActionId::SetEditorText => editor_text.handle(args),
     }
 }
 
@@ -672,7 +690,7 @@ pub extern "C" fn trampoline_runtime_action(
         run_action(
             action_id,
             // Highest id this ABI defines — bump when adding an action.
-            u32::from(RuntimeActionId::SetStatus),
+            u32::from(RuntimeActionId::SetEditorText),
             args_json,
             out,
             user_data,
@@ -778,6 +796,7 @@ fn run_action(
     let host = Arc::clone(&bridge.host);
     let ui_dialog = bridge.ui_dialog.clone();
     let ext_status = bridge.ext_status.clone();
+    let editor_text = bridge.editor_text.clone();
     let reload_cb = bridge.reload.clone();
     if action == RuntimeActionId::SetStatus {
         // Same reasoning as `UiDialog`: this action never touches the harness,
@@ -786,6 +805,12 @@ fn run_action(
         // park that executor and deadlock.
         std::thread::spawn(move || {
             let _ = tx.send(ext_status.handle(args));
+        });
+    } else if action == RuntimeActionId::SetEditorText {
+        // Editor-only, like `SetStatus`: no harness call, so keep it off the
+        // Tokio worker for the same single-thread-runtime reason.
+        std::thread::spawn(move || {
+            let _ = tx.send(editor_text.handle(args));
         });
     } else if action == RuntimeActionId::UiDialog {
         // UiDialog is intentionally synchronous at the plugin ABI boundary:
@@ -806,7 +831,7 @@ fn run_action(
                     host.reload(args).await
                 }
             } else {
-                dispatch(&host, &ui_dialog, &ext_status, action, args).await
+                dispatch(&host, &ui_dialog, &ext_status, &editor_text, action, args).await
             };
             // If the plugin thread already moved on (dropped rx), discard — a
             // send error is NOT a host fault.
@@ -1003,6 +1028,47 @@ mod tests {
         // the `Arc<MockHost>` kept before it was coerced to the trait object.
         let saw = host_for_assert.saw.lock().unwrap().clone();
         assert_eq!(saw, vec![RuntimeActionId::GetSystemPrompt]);
+    }
+
+    /// The `SetEditorText` runtime action must reach the bridge's editor-text
+    /// mailbox through the ABI trampoline. This is the wiring a plugin relies on
+    /// (a voice extension writes a transcription draft here); a broken action id
+    /// or a dropped dispatch would be invisible to the plugin — it only sees
+    /// `ok: true` — so pin it here.
+    #[tokio::test]
+    async fn trampoline_routes_set_editor_text_into_the_mailbox() {
+        let host = Arc::new(MockHost {
+            prompt: String::new(),
+            saw: Mutex::new(Vec::new()),
+        });
+        let host_dyn: Arc<dyn RuntimeActionHost> = host;
+        let bridge = ActionBridge::new(tokio::runtime::Handle::current(), host_dyn);
+        let mailbox = bridge.editor_text_mailbox();
+        let user_data = Arc::as_ptr(&bridge) as *mut c_void;
+
+        let args_ref =
+            StbStringRef::from_str(r#"{"text":"from voice","mode":"append","autoSendMs":2000}"#);
+        let mut out = StbString::empty();
+        let rc = trampoline_runtime_action(
+            RuntimeActionId::SetEditorText.into(),
+            args_ref,
+            &mut out as *mut StbString,
+            user_data,
+        );
+        assert_eq!(rc, 0, "success return code");
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&out.to_string_lossy()).expect("valid json");
+        assert_eq!(parsed["ok"], serde_json::json!(true));
+        assert_eq!(parsed["chars"], serde_json::json!(10));
+        crate::host_free_string(out);
+
+        // The queued edit is what the host will apply to the prompt editor.
+        let edit = mailbox.take_pending().expect("queued edit");
+        assert_eq!(edit.text, "from voice");
+        assert_eq!(edit.mode, crate::EditorTextMode::Append);
+        assert_eq!(edit.auto_send_ms, Some(2000));
+        assert!(mailbox.take_pending().is_none());
     }
 
     #[tokio::test]
@@ -1323,9 +1389,10 @@ mod tests {
         crate::host_free_string(out);
 
         // A genuinely unknown id is still rejected (no silent acceptance).
+        // 20 is one past the highest defined action (`SetEditorText` = 19).
         let mut out = StbString::empty();
         assert_eq!(
-            trampoline_runtime_action(19, StbStringRef::from_str("{}"), &mut out, user_data),
+            trampoline_runtime_action(20, StbStringRef::from_str("{}"), &mut out, user_data),
             2
         );
         crate::host_free_string(out);
@@ -1346,6 +1413,7 @@ mod tests {
             Arc::new(|| Box::pin(async {})),
             UiDialogMailbox::new(),
             status.clone(),
+            crate::editor_text::EditorTextMailbox::new(),
         );
         let user_data = Arc::as_ptr(&bridge) as *mut c_void;
 

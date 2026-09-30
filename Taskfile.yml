@@ -59,6 +59,20 @@ tasks:
       - task: release:validate
       - task: release:publish-crates
 
+  release:
+    desc: One-command release — bump, tag, wait for binaries, refresh every channel
+    requires:
+      vars: [RELEASE_VERSION]
+    cmds:
+      - bash scripts/release.sh "{{.RELEASE_VERSION}}"
+
+  release:channels:
+    desc: Refresh the install-channel manifests + site data for a released version
+    requires:
+      vars: [RELEASE_VERSION]
+    cmds:
+      - bash scripts/refresh-channels.sh "{{.RELEASE_VERSION}}"
+
   release:validate:
     desc: Require a clean tree and one consistent version across the nine release crates
     requires:
@@ -67,6 +81,15 @@ tasks:
       - release:build-helper
     cmds:
       - '"{{.RPI_RELEASE_HELPER}}" validate "{{.RELEASE_VERSION}}"'
+
+  release:validate-dirty:
+    desc: Validate the release state while the version bump is still uncommitted (pre-commit)
+    requires:
+      vars: [RELEASE_VERSION]
+    deps:
+      - release:build-helper
+    cmds:
+      - '"{{.RPI_RELEASE_HELPER}}" validate "{{.RELEASE_VERSION}}" --allow-dirty'
 
   release:build-helper:
     internal: true

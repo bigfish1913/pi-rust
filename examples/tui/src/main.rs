@@ -152,7 +152,7 @@ async fn run_interactive() {
     tui.set_focus(Some(editor.clone()));
     editor.set_focused(true);
     // Coalesce render requests into at most one frame per ~16 ms (the same
-    // throttle native pi applies in `TuiBase`).
+    // throttle upstream applies in `TuiBase`).
     tui.start_render_scheduler();
     tui.start_readerless();
 

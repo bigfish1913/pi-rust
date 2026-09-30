@@ -9,9 +9,9 @@
 
 ## 1. The `cwd`-carrying split: inherent typed methods vs. the `SessionRepo` trait
 
-**Where:** `crates/pi-harness/src/session/jsonl/repo.rs`,
-`crates/pi-harness/src/session/jsonl/types.rs`,
-`crates/pi-harness/src/session/types.rs`.
+**Where:** `crates/rpi-harness/src/session/jsonl/repo.rs`,
+`crates/rpi-harness/src/session/jsonl/types.rs`,
+`crates/rpi-harness/src/session/types.rs`.
 
 **The problem.** The TS `JsonlSessionRepo` takes cwd-load-bearing options on
 every call — `create(options: JsonlSessionCreateOptions & { cwd })`,
@@ -81,7 +81,7 @@ zero-scan path for callers that want it.
 
 ## 2. In-memory FS forward-slash normalization (cross-platform fix)
 
-**Where:** `crates/pi-tools/src/in_memory.rs`
+**Where:** `crates/rpi-tools/src/in_memory.rs`
 (`InMemoryExecutionEnv::norm` / `resolve_key`, and the rewritten
 `absolute_path` / `join_path`), with blast radius across all M5c repo tests.
 
@@ -129,7 +129,7 @@ development platform here.
 
 ## 3. Torn-tail `publish_file_atomically` cleanup on rename failure
 
-**Where:** `crates/pi-harness/src/session/jsonl/storage.rs`
+**Where:** `crates/rpi-harness/src/session/jsonl/storage.rs`
 (`publish_file_atomically`).
 
 **The problem.** The original port cleaned up the `.tmp` only on a *staging*

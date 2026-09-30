@@ -24,8 +24,7 @@ What is solid today:
   veto support.
 - Remote mode: a headless `--server` and a zero-local-resource `--connect`
   client.
-- Pi compatibility: `.pi/` resource layout, `settings.json` keys, Pi-compatible
-  managed package stores.
+- Resource layout: `.rpi/` project resources and `settings.json` keys.
 
 ## Near term
 

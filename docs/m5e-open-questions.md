@@ -7,7 +7,7 @@
 
 ## 1. YAML frontmatter parser (resolved)
 
-**Where:** `crates/pi-harness/src/frontmatter.rs` (used by `skills.rs` and
+**Where:** `crates/rpi-harness/src/frontmatter.rs` (used by `skills.rs` and
 `prompt_templates.rs`).
 
 **Resolution.** The hand-written YAML subset was replaced with `yaml_serde`
@@ -23,8 +23,8 @@ release that remains compatible with the workspace's Rust 1.78 MSRV.
 
 ## 2. `load_sourced_skills` / `load_sourced_prompt_templates` lose the `mapSkill` hook
 
-**Where:** `crates/pi-harness/src/skills.rs::load_sourced_skills`,
-`crates/pi-harness/src/prompt_templates.rs::load_sourced_prompt_templates`.
+**Where:** `crates/rpi-harness/src/skills.rs::load_sourced_skills`,
+`crates/rpi-harness/src/prompt_templates.rs::load_sourced_prompt_templates`.
 
 **What.** The TS `loadSourcedSkills<TSource, TSkill>` has an optional
 `mapSkill?: (skill, source) => TSkill` hook that lets the caller upcast/transform
@@ -46,8 +46,8 @@ post-map. If a hot path needs it inlined later, add an optional `mapper` param.
 
 ## 3. Symlinked skill/template directories deferred to an OS-env conformance test
 
-**Where:** `crates/pi-harness/tests/skills_loader.rs`,
-`crates/pi-harness/tests/prompt_templates.rs` (test-deferral notes).
+**Where:** `crates/rpi-harness/tests/skills_loader.rs`,
+`crates/rpi-harness/tests/prompt_templates.rs` (test-deferral notes).
 
 **What.** The TS skills suite has a "loads skills through symlinked
 directories" case and the prompt-templates suite has a "loads explicit markdown
@@ -72,8 +72,8 @@ symlink case to close the gap.
 
 ## 4. `format_skills_for_system_prompt` lives in `skills.rs`, not `system_prompt.rs`
 
-**Where:** `crates/pi-harness/src/skills.rs::format_skills_for_system_prompt`,
-`crates/pi-harness/src/system_prompt.rs`.
+**Where:** `crates/rpi-harness/src/skills.rs::format_skills_for_system_prompt`,
+`crates/rpi-harness/src/system_prompt.rs`.
 
 **What.** In the TS reference, `formatSkillsForSystemPrompt` is defined in
 `system-prompt.ts`. In this port it is defined in `skills.rs` (co-located with
@@ -93,7 +93,7 @@ from both `pi_harness::skills::format_skills_for_system_prompt` and (via
 
 ## 5. `WatchHandle` does not auto-unsubscribe on drop (matches TS)
 
-**Where:** `crates/pi-harness/src/events.rs::WatchHandle::drop`.
+**Where:** `crates/rpi-harness/src/events.rs::WatchHandle::drop`.
 
 **What.** The TS `WatchHandle` does NOT remove the watch from the bus when
 dropped — the caller must call `watch.unsubscribe()`. The Rust port mirrors this
@@ -112,8 +112,8 @@ wrapper rather than changing the default.
 
 ## 6. `HarnessEventBus` is not `Clone`; snapshot-closure emit needs a shared-inner handle (test-only)
 
-**Where:** `crates/pi-harness/src/events.rs` (inline `EmitterHandle` test helper),
-`crates/pi-harness/tests/events_watch.rs`.
+**Where:** `crates/rpi-harness/src/events.rs` (inline `EmitterHandle` test helper),
+`crates/rpi-harness/tests/events_watch.rs`.
 
 **What.** The TS `events.watch(() => { events.emit(...) })` captures `events`
 directly in the snapshot closure. The Rust `HarnessEventBus` is not `Clone`
@@ -135,7 +135,7 @@ anticipated.
 
 ## 7. `OnUnsubscribe` is `'static` (holds a `Weak`), drop-unregisters
 
-**Where:** `crates/pi-harness/src/events.rs::OnUnsubscribe`.
+**Where:** `crates/rpi-harness/src/events.rs::OnUnsubscribe`.
 
 **What.** `on(...)` returns an `OnUnsubscribe` guard carrying a `Weak<Mutex<BusInner>>`
 (+ type_tag + id), so it is `'static` and storable anywhere independent of the
@@ -164,5 +164,5 @@ cargo test -p pi-harness
 ```
 
 All M5e source modules (`frontmatter`, `skills`, `prompt_templates`,
-`system_prompt`, `events`) are wired into `crates/pi-harness/src/lib.rs` and
+`system_prompt`, `events`) are wired into `crates/rpi-harness/src/lib.rs` and
 green. Ready for M5f (AgentHarness run loop + Session/SessionTree facade).

@@ -223,7 +223,7 @@ impl StbStringRef {
 /// Idempotent: freeing an already-freed or empty `StbString` is a no-op.
 ///
 /// The host calls this for every [`StbString`] it receives from the plugin; the
-/// plugin calls the **host's** `free_string` (from [`PluginApiVt`]) for every
+/// plugin calls the **host's** `free_string` (from [`PluginApi`]) for every
 /// [`StbString`] it receives from the host.
 pub type FreeStringFn = extern "C" fn(s: StbString);
 
@@ -570,12 +570,20 @@ pub enum EventTag {
     UiPromptStart = 34,
     /// Pi `on()` category: dispatched when the TUI prompt is dismissed.
     UiPromptEnd = 35,
+    /// rpi-specific (not a Pi `on()` category): dispatched whenever the
+    /// interactive prompt editor's **text changes** — typing, pasting, deleting,
+    /// or a programmatic rewrite. Appended last so existing discriminants are
+    /// stable. The payload is `{"chars":N,"empty":bool}`; the draft text itself
+    /// is deliberately not shipped, because subscribers (a voice extension
+    /// barging in on playback) only need to know *that* the user is composing.
+    EditorChange = 36,
 }
 
-/// Number of event categories — `36` (33 Pi `on()` categories + 1 rpi-specific
-/// [`EventTag::BeforeTuiStart`] + 2 UI prompt events). A test asserts
-/// `EVENT_TAG_COUNT == 36` so a future edit that adds/removes a tag is caught.
-pub const EVENT_TAG_COUNT: usize = 36;
+/// Number of event categories — `37` (33 Pi `on()` categories + 1 rpi-specific
+/// [`EventTag::BeforeTuiStart`] + 2 UI prompt events + 1 rpi-specific
+/// [`EventTag::EditorChange`]). A test asserts
+/// `EVENT_TAG_COUNT == 37` so a future edit that adds/removes a tag is caught.
+pub const EVENT_TAG_COUNT: usize = 37;
 
 /// No-payload marker for events that carry none (e.g. `session_shutdown`).
 /// Carries a dummy byte so the empty-struct isn't flagged FFI-unsafe by
@@ -782,6 +790,16 @@ pub const EVENT_HANDLER_ERROR: i32 = 1;
 /// lifecycle dispatch; the observe fan-out logs + continues (see the module
 /// docs on [`EVENT_HANDLER_CONTINUE`]).
 pub const EVENT_HANDLER_ABORT: i32 = 2;
+/// **Claim**: the handler consumed this event and the host should not fall back
+/// to its own default handling. Honored only by dispatch paths that ask
+/// extensions to arbitrate (currently `EventTag::Input` key routing, via
+/// [`EVENT_HANDLER_CLAIMED`]); the ordinary observe fan-out treats it like any
+/// other nonzero (log + continue).
+///
+/// Lets a handler subscribe to a key yet decline it while its feature is off:
+/// return [`EVENT_HANDLER_CONTINUE`] to pass the key through to normal editor
+/// handling, or this to swallow it.
+pub const EVENT_HANDLER_CLAIMED: i32 = 3;
 
 /// Handler fn pointer registered via `register_event_handler(tag, handler)`.
 /// `user_data` is the plugin's opaque context. Return `0` on success; nonzero
@@ -812,7 +830,7 @@ pub type ResourcesDiscoverFn = extern "C" fn(
 // ---------------------------------------------------------------------------
 
 /// Identifier for a host runtime action the plugin may invoke via
-/// `PluginApiVt::runtime_action`. One slot dispatches all actions; the numeric
+/// `PluginApi::runtime_action`. One slot dispatches all actions; the numeric
 /// id crosses the FFI boundary as a `u32` and the host validates it with
 /// [`TryFrom<u32>`] before constructing this enum. Args/results cross as JSON
 /// strings.
@@ -847,6 +865,12 @@ pub enum RuntimeActionId {
     /// empty/absent `value` clears that key. Result: `{"ok":true,"changed":bool}`.
     /// Headless hosts accept the write but have nothing to render.
     SetStatus = 18,
+    /// Put text into the interactive editor (the prompt input box) instead of
+    /// sending it. Args: `{"text":"...", "mode":"append"|"replace",
+    /// "autoSendMs": 3000}` (omit/`0` for manual send only). Result:
+    /// `{"ok":true,"chars":N}`. A headless host has no editor and accepts the
+    /// write without rendering it, mirroring [`RuntimeActionId::SetStatus`].
+    SetEditorText = 19,
 }
 
 /// Error returned when a plugin passes a numeric runtime-action id that this
@@ -886,6 +910,7 @@ impl TryFrom<u32> for RuntimeActionId {
             16 => Ok(Self::GetCliFlag),
             17 => Ok(Self::UiDialog),
             18 => Ok(Self::SetStatus),
+            19 => Ok(Self::SetEditorText),
             other => Err(UnknownRuntimeActionId(other)),
         }
     }
@@ -912,7 +937,7 @@ pub type RuntimeActionFn = extern "C" fn(
 ) -> i32;
 
 // ---------------------------------------------------------------------------
-// PluginApiVt — host-provided vtable of fn pointers the plugin calls
+// PluginApi — host-provided API struct the plugin calls
 // ---------------------------------------------------------------------------
 
 /// A generic command-handler fn (for `register_command`). `args_json` is a
@@ -938,377 +963,23 @@ pub type RenderFn =
 pub type ProviderRequestFn =
     extern "C" fn(req_json: StbStringRef, out: *mut StbString, user_data: *mut c_void) -> i32;
 
-/// ABI v1 runtime-action signature. The original SDK exposed a `#[repr(u32)]`
-/// enum at this position; the legacy host view uses the ABI-equivalent raw
-/// integer so it can reject unknown values before constructing an enum.
-pub type LegacyRuntimeActionFn = extern "C" fn(
-    action_id: u32,
-    args_json: StbStringRef,
-    out: *mut StbString,
-    user_data: *mut c_void,
-) -> i32;
-
-/// Frozen host vtable layout used by plugins exporting
-/// [`LEGACY_REGISTER_SYMBOL`]. Do not add, remove, reorder, or retype fields in
-/// this struct. New plugins use [`PluginApiVt`] and [`REGISTER_SYMBOL_V2`].
-///
-/// The v1 action slot accepts only the historical ids `0..=15`. Hosts must
-/// validate the raw `u32` before dispatching it.
-#[repr(C)]
-pub struct LegacyPluginApiV1 {
-    pub free_string: FreeStringFn,
-    pub register_tool: Option<
-        extern "C" fn(
-            schema: *const StableToolSchema,
-            execute_fn: ToolExecuteFn,
-            poll_fn: ToolPollFn,
-            cancel_fn: ToolCancelFn,
-            destroy_fn: ToolDestroyFn,
-            plugin_free_string: FreeStringFn,
-        ) -> i32,
-    >,
-    pub register_command: Option<
-        extern "C" fn(
-            name: StbStringRef,
-            description: StbStringRef,
-            handler: CommandHandlerFn,
-        ) -> i32,
-    >,
-    pub register_shortcut:
-        Option<extern "C" fn(key: StbStringRef, description: StbStringRef) -> i32>,
-    pub register_flag: Option<extern "C" fn(name: StbStringRef, description: StbStringRef) -> i32>,
-    pub register_provider: Option<
-        extern "C" fn(
-            provider_id: StbStringRef,
-            base_url: StbStringRef,
-            api_style: StbStringRef,
-            request_fn: ProviderRequestFn,
-            plugin_free_string: FreeStringFn,
-            user_data: *mut c_void,
-        ) -> i32,
-    >,
-    pub register_message_renderer: Option<
-        extern "C" fn(
-            name: StbStringRef,
-            render_fn: RenderFn,
-            plugin_free_string: FreeStringFn,
-            user_data: *mut c_void,
-        ) -> i32,
-    >,
-    pub register_markdown_transformer: Option<
-        extern "C" fn(
-            name: StbStringRef,
-            render_fn: RenderFn,
-            plugin_free_string: FreeStringFn,
-            user_data: *mut c_void,
-        ) -> i32,
-    >,
-    pub register_entry_renderer: Option<
-        extern "C" fn(
-            name: StbStringRef,
-            render_fn: RenderFn,
-            plugin_free_string: FreeStringFn,
-            user_data: *mut c_void,
-        ) -> i32,
-    >,
-    pub register_event_handler: Option<
-        extern "C" fn(tag: EventTag, handler: EventHandlerFn, user_data: *mut c_void) -> i32,
-    >,
-    pub register_resources_discover: Option<
-        extern "C" fn(
-            handler: ResourcesDiscoverFn,
-            plugin_free_string: FreeStringFn,
-            user_data: *mut c_void,
-        ) -> i32,
-    >,
-    pub runtime_action: LegacyRuntimeActionFn,
-    pub dispatch_event:
-        Option<extern "C" fn(event: StablePluginEvent, user_data: *mut c_void) -> i32>,
-    pub user_data: *mut c_void,
-}
-
-unsafe impl Send for LegacyPluginApiV1 {}
-unsafe impl Sync for LegacyPluginApiV1 {}
-
-/// The ABI v2 host-provided vtable, passed to `rpi_plugin_register_v2` as a
-/// `*const`.
-///
-/// The plugin reads it during `register` and may copy fn pointers it needs (the
-/// struct is POD/Copy). **Every slot is nullable**: a null fn pointer means the
-/// host does not support that capability yet — the plugin MUST null-check
-/// before calling and degrade gracefully. This keeps the vtable forward-
-/// compatible across rpi versions without re-ABI bumps within one
-/// `RPI_PLUGIN_ABI_VERSION`.
-///
-/// `user_data` is the host's opaque context, passed back to every host-provided
-/// fn (so the host can recover its session/harness state). The plugin stores it
-/// and passes it through unchanged.
-#[repr(C)]
-pub struct PluginApiVt {
-    /// Host's `free_string` — the plugin calls this for every [`StbString`] it
-    /// *receives* from the host (outputs of actions, event payloads, inputs to
-    /// execute). Never null.
-    pub free_string: FreeStringFn,
-
-    // --- 8 registrars (plugin → host "register X into the host") ---
-    /// Register a tool. `schema` + the four lifecycle fns + the plugin's own
-    /// `free_string` (for the [`StbString`]s in `schema`). Returns `0` on
-    /// success. Nullable: host not yet wired for tool registration.
-    pub register_tool: Option<
-        extern "C" fn(
-            schema: *const StableToolSchema,
-            execute_fn: ToolExecuteFn,
-            poll_fn: ToolPollFn,
-            cancel_fn: ToolCancelFn,
-            destroy_fn: ToolDestroyFn,
-            plugin_free_string: FreeStringFn,
-        ) -> i32,
-    >,
-
-    /// Register a slash command. Nullable.
-    pub register_command: Option<
-        extern "C" fn(
-            name: StbStringRef,
-            description: StbStringRef,
-            handler: CommandHandlerFn,
-        ) -> i32,
-    >,
-
-    /// Register a keyboard shortcut. Nullable.
-    pub register_shortcut:
-        Option<extern "C" fn(key: StbStringRef, description: StbStringRef) -> i32>,
-
-    /// Register a CLI flag using its bare name (without leading `--`). The
-    /// parsed value is read later with [`RuntimeActionId::GetCliFlag`].
-    /// Nullable.
-    pub register_flag: Option<extern "C" fn(name: StbStringRef, description: StbStringRef) -> i32>,
-
-    /// Register a custom provider. The host stores `provider_id`/`base_url`/
-    /// `api_style` + the plugin's `request_fn` + the plugin's own
-    /// `plugin_free_string` (the `out` [`StbString`] `request_fn` *produces* is
-    /// plugin-owned and the host must reclaim it — same ownership rule as
-    /// `register_resources_discover`) + the plugin's `user_data` (which
-    /// `request_fn` receives back unmodified on every call). Nullable (B5c).
-    pub register_provider: Option<
-        extern "C" fn(
-            provider_id: StbStringRef,
-            base_url: StbStringRef,
-            api_style: StbStringRef,
-            request_fn: ProviderRequestFn,
-            plugin_free_string: FreeStringFn,
-            user_data: *mut c_void,
-        ) -> i32,
-    >,
-
-    /// Register a message renderer. `plugin_free_string` reclaims the `out`
-    /// [`StbString`] `render_fn` produces; `user_data` is passed back to it on
-    /// every render call. Nullable; interactive TUI consumption accepts the
-    /// host JSON component envelope (`text`/`lines`).
-    pub register_message_renderer: Option<
-        extern "C" fn(
-            name: StbStringRef,
-            render_fn: RenderFn,
-            plugin_free_string: FreeStringFn,
-            user_data: *mut c_void,
-        ) -> i32,
-    >,
-
-    /// Register a markdown transformer. Same ownership shape as
-    /// `register_message_renderer`. Nullable; markdown output is chained in
-    /// assistant rendering.
-    pub register_markdown_transformer: Option<
-        extern "C" fn(
-            name: StbStringRef,
-            render_fn: RenderFn,
-            plugin_free_string: FreeStringFn,
-            user_data: *mut c_void,
-        ) -> i32,
-    >,
-
-    /// Register an entry renderer. Same ownership shape as
-    /// `register_message_renderer`. Nullable; interactive TUI consumption
-    /// accepts the host JSON component envelope (`text`/`lines`).
-    pub register_entry_renderer: Option<
-        extern "C" fn(
-            name: StbStringRef,
-            render_fn: RenderFn,
-            plugin_free_string: FreeStringFn,
-            user_data: *mut c_void,
-        ) -> i32,
-    >,
-
-    // --- on() event handler registration (the 33-category subscription) ---
-    /// Subscribe a handler to one event `tag`. Nullable: host not yet wiring
-    /// events. The host dispatches [`StablePluginEvent`]s of that tag to the
-    /// handler (`catch_unwind`-wrapped).
-    pub register_event_handler: Option<
-        extern "C" fn(tag: EventTag, handler: EventHandlerFn, user_data: *mut c_void) -> i32,
-    >,
-
-    /// Register a `resources_discover` handler (B5b). The host stores `handler`
-    /// + the plugin's own `plugin_free_string` (the `out` [`StbString`] the
-    /// handler produces is plugin-owned and the host must reclaim it) +
-    /// `user_data`. On discovery (`startup`/`reload`) the host fans the event to
-    /// every registered handler in order, concatenating their returned
-    /// `{skillPaths, promptPaths, themePaths}` (errors per-handler do NOT abort
-    /// the fan-out). Nullable: a host without the resources-discover path leaves
-    /// this null and the plugin must degrade (no dynamic resource contribution).
-    pub register_resources_discover: Option<
-        extern "C" fn(
-            handler: ResourcesDiscoverFn,
-            plugin_free_string: FreeStringFn,
-            user_data: *mut c_void,
-        ) -> i32,
-    >,
-
-    // --- runtime actions (17, uniform dispatch) ---
-    /// Invoke a host runtime action. See [`RuntimeActionId`] / [`RuntimeActionFn`].
-    /// Always present; a host without an action bridge installs a nonzero-returning
-    /// stub so plugins can degrade gracefully.
-    pub runtime_action: RuntimeActionFn,
-
-    // --- event dispatch (plugin → host "emit an event upstream") ---
-    /// Emit an event upstream (e.g. a tool announcing a custom UI event). The
-    /// host forwards to interested subscribers. Ownership of the event's
-    /// [`StbString`]s passes to the host (freed via `free_string`). Nullable.
-    pub dispatch_event:
-        Option<extern "C" fn(event: StablePluginEvent, user_data: *mut c_void) -> i32>,
-
-    /// The host's opaque context, passed through to every host-provided fn.
-    /// The plugin stores this and hands it back unmodified on each call.
-    pub user_data: *mut c_void,
-}
-
-// SAFETY: the vtable is a POD struct of fn pointers + one raw `user_data`
-// pointer. It is `Send`+`Sync` so the host can hand it to the plugin's register
-// thread and the plugin can call its fns from the blocking driver thread; the
-// host guarantees the `user_data` is valid across those calls.
-unsafe impl Send for PluginApiVt {}
-unsafe impl Sync for PluginApiVt {}
-
 // ---------------------------------------------------------------------------
-// Register contract
+// Unified ABI — single struct, version inside
 // ---------------------------------------------------------------------------
 
-/// The ABI version this SDK publishes. ABI v2 adds the `GetCliFlag` runtime
-/// action and makes [`RuntimeActionFn`]'s action parameter an explicitly
-/// validated `u32`.
-///
-/// A host and plugin built for different ABI versions must never use each
-/// other's [`PluginApiVt`]. [`register_entrypoint`] compares the scalar version
-/// before dereferencing `api`, so an ABI v1 plugin presented to a v2 host (or a
-/// v2 plugin presented to a v1 host) returns nonzero and is safely skipped
-/// rather than reading a differently defined vtable.
-pub const RPI_PLUGIN_ABI_VERSION: u32 = 2;
-
-/// ABI version passed to the legacy `rpi_plugin_register` entrypoint.
-pub const LEGACY_PLUGIN_ABI_VERSION: u32 = 1;
-
-/// The ABI v2 symbol the host looks up first in each cdylib.
-/// Must be an `extern "C" fn(*const PluginApiVt, u32) -> i32`.
-pub const REGISTER_SYMBOL_V2: &[u8] = b"rpi_plugin_register_v2\0";
-
-/// Alias for the current SDK's register symbol.
-pub const REGISTER_SYMBOL: &[u8] = REGISTER_SYMBOL_V2;
-
-/// The ABI v1 symbol used only when [`REGISTER_SYMBOL_V2`] is absent.
-pub const LEGACY_REGISTER_SYMBOL: &[u8] = b"rpi_plugin_register\0";
-
-/// Plugin entrypoint signature. The host loads the cdylib, looks up
-/// `rpi_plugin_register_v2`, and calls it with the host `PluginApiVt` and the
-/// host's current `RPI_PLUGIN_ABI_VERSION`.
-///
-/// Return `0` on successful registration; nonzero is a plugin-defined error
-/// code (the host logs it and skips the plugin). The plugin must compare
-/// `abi_version` before reading `api`; [`register_entrypoint`] implements this
-/// ordering and safely rejects old/new ABI mixtures. A plugin should copy any
-/// needed function pointers only inside the callback this helper invokes.
-pub type RpiPluginRegister = extern "C" fn(api: *const PluginApiVt, abi_version: u32) -> i32;
-
-/// ABI v1 plugin entrypoint signature.
-pub type LegacyRpiPluginRegister =
-    extern "C" fn(api: *const LegacyPluginApiV1, abi_version: u32) -> i32;
-
-// ---------------------------------------------------------------------------
-// ABI v3 — plugin declarations (extension block beside the frozen v2 vtable)
-// ---------------------------------------------------------------------------
-
-/// The ABI version the v3 entrypoint advertises.
-pub const RPI_PLUGIN_ABI_VERSION_V3: u32 = 3;
-
-/// The ABI v3 symbol the host looks up before [`REGISTER_SYMBOL_V2`].
-pub const REGISTER_SYMBOL_V3: &[u8] = b"rpi_plugin_register_v3\0";
-
-/// The ABI v3 **extension block**, passed to `rpi_plugin_register_v3` *in
-/// addition to* the frozen v2 [`PluginApiVt`]. Keeping v3 as a separate side
-/// struct means the v2 vtable layout never changes: a v2 plugin is unaffected,
-/// a v3 plugin reads both.
-///
-/// Every slot is nullable. A null slot means the host does not support that
-/// declaration yet — the plugin must null-check and degrade (skip the
-/// declaration; the host applies defaults: priority `100`, all platforms).
-#[repr(C)]
-pub struct PluginApiVt3Ext {
-    /// Declare this plugin's host-side preferences as a JSON object, e.g.
-    /// `{"priority":60,"platforms":["linux","macos"]}`.
-    ///
-    /// - `priority` (integer, default `100`): dispatch order for this plugin's
-    ///   handlers — **smaller runs first** (stable; registration order breaks
-    ///   ties). Suggested bands: `0..=49` infrastructure, `50..=99`
-    ///   connection, `100..=199` normal, `200+` post/cleanup.
-    /// - `platforms` (array of strings, default all): platforms this plugin
-    ///   supports; the host skips the plugin's handlers on any other platform.
-    ///   Recognised: `"linux"`, `"macos"`, `"windows"`, `"android"`.
-    ///
-    /// Called during `register`. Returns `0` on success, nonzero on a handled
-    /// error (host logs it and keeps the defaults).
-    pub declare: Option<extern "C" fn(json: StbStringRef) -> i32>,
-    /// Reserved for future v3 declarations. MUST be null-filled today; the host
-    /// ignores these slots. Zeroing them lets a future host start using them
-    /// without another ABI bump.
-    pub _reserved: [*mut c_void; 3],
-}
-unsafe impl Send for PluginApiVt3Ext {}
-unsafe impl Sync for PluginApiVt3Ext {}
-
-impl PluginApiVt3Ext {
-    /// A v3 ext block with every slot null (no declarations). Useful for tests
-    /// and hosts that support no declarations yet.
-    pub const fn empty() -> Self {
-        Self {
-            declare: None,
-            _reserved: [ptr::null_mut(); 3],
-        }
-    }
-}
-
-/// ABI v3 plugin entrypoint signature: `(api, ext, abi_version)`.
-pub type RpiPluginRegisterV3 =
-    extern "C" fn(api: *const PluginApiVt, ext: *const PluginApiVt3Ext, abi_version: u32) -> i32;
-
-// ---------------------------------------------------------------------------
-// Unified ABI — single unversioned symbol, version in struct
-// ---------------------------------------------------------------------------
-
-/// The unified ABI version. This is the *only* ABI going forward; the version
-/// lives inside the struct (first field) so future breaks can be detected by
-/// reading the pointer, independent of entrypoint arity.
+/// The unified ABI version.
 pub const RPI_PLUGIN_ABI_VERSION_UNIFIED: u32 = 4;
 
-/// The unversioned symbol for the unified ABI. Old v1 plugins also exported
-/// `rpi_plugin_register` with a different signature; repurposing the name
-/// means leftover v1 `.dll`s will be mis-called (accepted risk).
+/// The unversioned symbol for the unified ABI.
 pub const REGISTER_SYMBOL_UNIFIED: &[u8] = b"rpi_plugin_register\0";
 
-/// The unified host-provided API struct. The first two fields (`abi_version`
+/// The host-provided API struct. The first two fields (`abi_version`
 /// and `struct_size`) are contract-identity markers that survive future
 /// signature changes: a plugin reads them from the pointer before anything
 /// else, so even if the entrypoint arity changes, the version check remains
 /// robust.
-///
-/// This struct folds in v3's `declare` slot (previously in `PluginApiVt3Ext`),
-/// so there's no side block — one struct, one entrypoint, forever.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct PluginApi {
     /// Contract identity. First field so a plugin can validate before reading
     /// anything else, independent of the entrypoint arity.
@@ -1319,13 +990,13 @@ pub struct PluginApi {
     /// `struct_size` before accessing new fields.
     pub struct_size: u32,
 
-    // --- All fields from PluginApiVt (same order, same types) ---
+    // --- Host API ---
     /// Host's `free_string` — the plugin calls this for every [`StbString`] it
     /// *receives* from the host (outputs of actions, event payloads, inputs to
     /// execute). Never null.
     pub free_string: FreeStringFn,
 
-    // --- 8 registrars (plugin → host "register X into the host") ---
+    // --- registrars (plugin → host "register X into the host") ---
     pub register_tool: Option<
         extern "C" fn(
             schema: *const StableToolSchema,
@@ -1395,7 +1066,7 @@ pub struct PluginApi {
         Option<extern "C" fn(event: StablePluginEvent, user_data: *mut c_void) -> i32>,
     pub user_data: *mut c_void,
 
-    // --- v3's declare slot, folded in ---
+    // --- declarations ---
     /// Declare this plugin's host-side preferences as a JSON object, e.g.
     /// `{"priority":60,"platforms":["linux","macos"]}`. Nullable: host does
     /// not support declarations yet (plugin skips the call; host applies
@@ -1406,7 +1077,7 @@ unsafe impl Send for PluginApi {}
 unsafe impl Sync for PluginApi {}
 
 /// Unified ABI plugin entrypoint signature: `(api)`. The version is read from
-/// `api->abi_version`; no positional arg.
+/// `api->abi_version`.
 pub type RpiPluginRegisterUnified = extern "C" fn(api: *const PluginApi) -> i32;
 
 // ===========================================================================
@@ -1438,78 +1109,10 @@ pub fn guard_or<R>(fallback: R, body: impl FnOnce() -> R) -> R {
     guard(body).unwrap_or(fallback)
 }
 
-/// Export an ABI v3 plugin entrypoint under `rpi_plugin_register_v3`.
-///
-/// The expression receives `(&PluginApiVt, &PluginApiVt3Ext)` and returns the
-/// plugin-defined registration status code. Use this when the plugin wants to
-/// declare a priority / supported platforms through [`PluginApiVt3Ext::declare`];
-/// otherwise prefer `export_plugin_v2!`.
-///
-/// ```ignore
-/// rpi_plugin_sdk::export_plugin_v3!(|api, ext| {
-///     if let Some(declare) = ext.declare {
-///         declare(rpi_plugin_sdk::StbStringRef::from_str(
-///             r#"{"priority":60,"platforms":["linux"]}"#,
-///         ));
-///     }
-///     // ... register tools and handlers through `api` ...
-///     0
-/// });
-/// ```
-#[macro_export]
-macro_rules! export_plugin_v3 {
-    ($body:expr) => {
-        #[no_mangle]
-        pub extern "C" fn rpi_plugin_register_v3(
-            api: *const $crate::PluginApiVt,
-            ext: *const $crate::PluginApiVt3Ext,
-            abi_version: u32,
-        ) -> i32 {
-            // SAFETY: host guarantees `api`/`ext` are valid for this call.
-            unsafe { $crate::register_entrypoint_v3(api, ext, abi_version, $body) }
-        }
-    };
-}
-
-/// v3 entrypoint helper: compares `abi_version` against
-/// [`RPI_PLUGIN_ABI_VERSION_V3`] before dereferencing `api`/`ext`.
-///
-/// # Safety
-///
-/// `api` and `ext` must be valid, properly aligned pointers that remain valid
-/// for the duration of `body`.
-pub unsafe fn register_entrypoint_v3(
-    api: *const PluginApiVt,
-    ext: *const PluginApiVt3Ext,
-    abi_version: u32,
-    body: impl FnOnce(&PluginApiVt, &PluginApiVt3Ext) -> i32,
-) -> i32 {
-    if abi_version != RPI_PLUGIN_ABI_VERSION_V3 {
-        return 1;
-    }
-    if api.is_null() {
-        return 2;
-    }
-    if ext.is_null() {
-        return 3;
-    }
-    // SAFETY: caller guarantees both pointers are valid; we checked null.
-    let api = &*api;
-    let ext = &*ext;
-    // Contain panics: unwinding out of the plugin's `extern "C"` shim aborts
-    // the process, so convert a panic into a status code the host can report.
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(api, ext))) {
-        Ok(code) => code,
-        Err(_) => REGISTER_PANIC_STATUS,
-    }
-}
-
 /// Export a unified ABI plugin entrypoint under `rpi_plugin_register`.
 ///
 /// The unified ABI has no version suffix in the symbol name; the version lives
-/// inside the [`PluginApi`] struct (first field `abi_version`). This is the
-/// *only* ABI going forward; old versioned symbols (`rpi_plugin_register_v2`,
-/// `_v3`) are kept temporarily for migration but are deprecated.
+/// inside the [`PluginApi`] struct (first field `abi_version`).
 ///
 /// The expression receives `&PluginApi` and returns the plugin-defined
 /// registration status code.
@@ -1531,7 +1134,7 @@ macro_rules! export_plugin {
         #[no_mangle]
         pub extern "C" fn rpi_plugin_register(api: *const $crate::PluginApi) -> i32 {
             // SAFETY: host guarantees `api` is valid for this call.
-            unsafe { $crate::register_entrypoint_unified(api, $body) }
+            unsafe { $crate::register_entrypoint(api, $body) }
         }
     };
 }
@@ -1544,7 +1147,7 @@ macro_rules! export_plugin {
 ///
 /// `api` must be a valid, properly aligned pointer to a [`PluginApi`] that
 /// remains valid for the duration of `body`.
-pub unsafe fn register_entrypoint_unified(
+pub unsafe fn register_entrypoint(
     api: *const PluginApi,
     body: impl FnOnce(&PluginApi) -> i32,
 ) -> i32 {
@@ -1574,73 +1177,6 @@ pub unsafe fn register_entrypoint_unified(
     }
 }
 
-/// Export an ABI v2 plugin entrypoint under `rpi_plugin_register_v2`.
-///
-/// The expression receives `&PluginApiVt` and returns the plugin-defined
-/// registration status code.
-///
-/// ```ignore
-/// rpi_plugin_sdk::export_plugin_v2!(|api| {
-///     // register tools and handlers through `api`
-///     0
-/// });
-/// ```
-#[macro_export]
-macro_rules! export_plugin_v2 {
-    ($body:expr) => {
-        #[no_mangle]
-        pub extern "C" fn rpi_plugin_register_v2(
-            api: *const $crate::PluginApiVt,
-            abi_version: u32,
-        ) -> i32 {
-            // SAFETY: host guarantees `api` is valid for this call.
-            unsafe { $crate::register_entrypoint(api, abi_version, $body) }
-        }
-    };
-}
-
-/// Convenience for host + plugin: declare the register entrypoint.
-///
-/// A plugin crate writes:
-/// ```ignore
-/// #[no_mangle]
-/// pub extern "C" fn rpi_plugin_register_v2(api: *const PluginApiVt, abi_version: u32) -> i32 {
-///     rpi_plugin_sdk::register_entrypoint(api, abi_version, |api| {
-///         // ... register tools / handlers using `api` ...
-///         0
-///     })
-/// }
-/// ```
-/// The helper performs the version check (return nonzero on mismatch) and
-/// null-checks `api` before invoking the plugin body.
-/// # Safety
-///
-/// `api` must be a valid, properly aligned pointer to a `PluginApiVt` that
-/// remains valid for the duration of the `body` call. The host is responsible
-/// for ensuring this invariant.
-pub unsafe fn register_entrypoint(
-    api: *const PluginApiVt,
-    abi_version: u32,
-    body: impl FnOnce(&PluginApiVt) -> i32,
-) -> i32 {
-    if abi_version != RPI_PLUGIN_ABI_VERSION {
-        // Mismatch: refuse to register. The host logs "ABI version mismatch"
-        // and skips loading this plugin.
-        return 1;
-    }
-    if api.is_null() {
-        return 2;
-    }
-    // SAFETY: caller guarantees `api` is valid; we additionally check for null.
-    let api = &*api;
-    // Contain panics (see `REGISTER_PANIC_STATUS`): a panic in the plugin body
-    // must not unwind out of the `extern "C"` entrypoint.
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(api))) {
-        Ok(code) => code,
-        Err(_) => REGISTER_PANIC_STATUS,
-    }
-}
-
 // ===========================================================================
 // Tests (need std + serde_json)
 // ===========================================================================
@@ -1654,13 +1190,16 @@ mod tests {
     /// plugin instead of the process aborting.
     #[test]
     fn register_entrypoint_contains_panics() {
-        // The body panics before touching the vtable, so an uninitialized (but
-        // aligned, non-null) pointer is sufficient — it is only dereferenced to
-        // build `&PluginApiVt`, never read.
-        let mut vt = std::mem::MaybeUninit::<PluginApiVt>::uninit();
-        let vt_ptr = vt.as_mut_ptr();
+        let mut api = std::mem::MaybeUninit::<PluginApi>::uninit();
+        let api_ptr = api.as_mut_ptr();
+        // Set the version/size fields so the entrypoint gets past the checks
+        // and into the body (which panics).
+        unsafe {
+            (*api_ptr).abi_version = RPI_PLUGIN_ABI_VERSION_UNIFIED;
+            (*api_ptr).struct_size = core::mem::size_of::<PluginApi>() as u32;
+        }
         let rc = unsafe {
-            register_entrypoint(vt_ptr, RPI_PLUGIN_ABI_VERSION, |_api| {
+            register_entrypoint(api_ptr, |_api| {
                 panic!("plugin register exploded");
             })
         };
@@ -1777,10 +1316,10 @@ mod tests {
     }
 
     #[test]
-    fn event_tag_count_is_36() {
+    fn event_tag_count_is_37() {
         // Enumerate every tag; a compile-time + runtime guarantee that the
-        // 36-category surface is intact (33 Pi on() categories + the
-        // rpi-specific BeforeTuiStart + 2 UI prompt events).
+        // 37-category surface is intact (33 Pi on() categories + the
+        // rpi-specific BeforeTuiStart + 2 UI prompt events + EditorChange).
         let tags = [
             EventTag::ProjectTrust,
             EventTag::ResourcesDiscover,
@@ -1818,13 +1357,14 @@ mod tests {
             EventTag::BeforeTuiStart,
             EventTag::UiPromptStart,
             EventTag::UiPromptEnd,
+            EventTag::EditorChange,
         ];
         assert_eq!(tags.len(), EVENT_TAG_COUNT);
-        assert_eq!(EVENT_TAG_COUNT, 36);
-        // Distinct discriminants 0..35.
+        assert_eq!(EVENT_TAG_COUNT, 37);
+        // Distinct discriminants 0..36.
         let mut discs: Vec<u32> = tags.iter().map(|t| *t as u32).collect();
         discs.sort();
-        assert_eq!(discs, (0..36).collect::<Vec<u32>>());
+        assert_eq!(discs, (0..37).collect::<Vec<u32>>());
     }
 
     #[test]
@@ -1855,11 +1395,12 @@ mod tests {
     }
 
     #[test]
-    fn plugin_api_vt_is_pod_and_sized() {
-        // The vtable must be a plain old data struct: every fn pointer is
-        // non-Drop, the struct has no Drop impl. We exercise that it can be
-        // zeroed and read without UB.
-        let vt = PluginApiVt {
+    fn plugin_api_is_pod_and_sized() {
+        // The API struct is a plain old data struct: every fn pointer is
+        // non-Drop, the struct has no Drop impl.
+        let api = PluginApi {
+            abi_version: RPI_PLUGIN_ABI_VERSION_UNIFIED,
+            struct_size: core::mem::size_of::<PluginApi>() as u32,
             free_string: test_free,
             register_tool: None,
             register_command: None,
@@ -1874,62 +1415,19 @@ mod tests {
             runtime_action: noop_runtime_action,
             dispatch_event: None,
             user_data: core::ptr::null_mut(),
+            declare: None,
         };
         // All optional slots are null → plugin must degrade.
-        assert!(vt.register_tool.is_none());
-        assert!(vt.register_event_handler.is_none());
-        assert!(vt.register_resources_discover.is_none());
+        assert!(api.register_tool.is_none());
+        assert!(api.register_event_handler.is_none());
+        assert!(api.register_resources_discover.is_none());
         // Copy (POD) — no UB from a plain copy.
-        let _copy = vt;
-        // `assert!(core::mem::needs_drop::<PluginApiVt>() == false)` — verified
-        // by the absence of a Drop impl + all-Copy fields.
-        assert!(!core::mem::needs_drop::<PluginApiVt>());
+        let _copy = api;
+        assert!(!core::mem::needs_drop::<PluginApi>());
         assert!(!core::mem::needs_drop::<StbString>());
         assert!(!core::mem::needs_drop::<StepResult>());
         assert!(!core::mem::needs_drop::<StablePluginEvent>());
         assert!(!core::mem::needs_drop::<StableToolSchema>());
-    }
-
-    #[test]
-    fn legacy_v1_layout_is_frozen_and_matches_v2_shared_slots() {
-        use core::mem::{align_of, offset_of, size_of};
-
-        let pointer_size = size_of::<*const ()>();
-        assert_eq!(size_of::<LegacyPluginApiV1>(), 14 * pointer_size);
-        assert_eq!(align_of::<LegacyPluginApiV1>(), align_of::<*const ()>());
-        assert_eq!(size_of::<PluginApiVt>(), size_of::<LegacyPluginApiV1>());
-        assert_eq!(align_of::<PluginApiVt>(), align_of::<LegacyPluginApiV1>());
-
-        macro_rules! assert_same_offset {
-            ($field:ident, $index:expr) => {
-                assert_eq!(
-                    offset_of!(LegacyPluginApiV1, $field),
-                    $index * pointer_size,
-                    concat!("unexpected ABI v1 offset for ", stringify!($field))
-                );
-                assert_eq!(
-                    offset_of!(PluginApiVt, $field),
-                    offset_of!(LegacyPluginApiV1, $field),
-                    concat!("v1/v2 shared field moved: ", stringify!($field))
-                );
-            };
-        }
-
-        assert_same_offset!(free_string, 0);
-        assert_same_offset!(register_tool, 1);
-        assert_same_offset!(register_command, 2);
-        assert_same_offset!(register_shortcut, 3);
-        assert_same_offset!(register_flag, 4);
-        assert_same_offset!(register_provider, 5);
-        assert_same_offset!(register_message_renderer, 6);
-        assert_same_offset!(register_markdown_transformer, 7);
-        assert_same_offset!(register_entry_renderer, 8);
-        assert_same_offset!(register_event_handler, 9);
-        assert_same_offset!(register_resources_discover, 10);
-        assert_same_offset!(runtime_action, 11);
-        assert_same_offset!(dispatch_event, 12);
-        assert_same_offset!(user_data, 13);
-        assert!(!core::mem::needs_drop::<LegacyPluginApiV1>());
     }
 
     #[test]
@@ -1954,6 +1452,7 @@ mod tests {
             RuntimeActionId::GetCliFlag,
             RuntimeActionId::UiDialog,
             RuntimeActionId::SetStatus,
+            RuntimeActionId::SetEditorText,
         ];
 
         for (raw, expected) in ids.into_iter().enumerate() {
@@ -1963,8 +1462,8 @@ mod tests {
         // One past the highest defined id is rejected (nothing is silently
         // accepted), and so is the u32 ceiling.
         assert_eq!(
-            RuntimeActionId::try_from(19),
-            Err(UnknownRuntimeActionId(19))
+            RuntimeActionId::try_from(20),
+            Err(UnknownRuntimeActionId(20))
         );
         assert_eq!(
             RuntimeActionId::try_from(u32::MAX),
@@ -1974,7 +1473,9 @@ mod tests {
 
     #[test]
     fn register_entrypoint_version_mismatch_refuses() {
-        let vt = PluginApiVt {
+        let api = PluginApi {
+            abi_version: RPI_PLUGIN_ABI_VERSION_UNIFIED,
+            struct_size: core::mem::size_of::<PluginApi>() as u32,
             free_string: test_free,
             register_tool: None,
             register_command: None,
@@ -1989,94 +1490,29 @@ mod tests {
             runtime_action: noop_runtime_action,
             dispatch_event: None,
             user_data: core::ptr::null_mut(),
+            declare: None,
         };
-        assert_eq!(RPI_PLUGIN_ABI_VERSION, 2);
-        assert_eq!(LEGACY_PLUGIN_ABI_VERSION, 1);
-        assert_eq!(REGISTER_SYMBOL, REGISTER_SYMBOL_V2);
-        assert_ne!(REGISTER_SYMBOL_V2, LEGACY_REGISTER_SYMBOL);
+        assert_eq!(RPI_PLUGIN_ABI_VERSION_UNIFIED, 4);
 
-        // An ABI v1 plugin/host mixture is refused before the v2 vtable is read.
-        // A null pointer makes the ordering observable: checking `api` first
-        // would return 2, while the required version-first path returns 1.
+        // A future version is rejected by the pre-dereference check.
+        let mut future_api = api;
+        future_api.abi_version = RPI_PLUGIN_ABI_VERSION_UNIFIED + 1;
         let rc = unsafe {
-            register_entrypoint(core::ptr::null(), 1, |_| {
+            register_entrypoint(&future_api, |_| {
                 panic!("body must not run on version mismatch");
             })
         };
         assert_eq!(rc, 1);
 
-        // A future version is rejected by the same pre-dereference check.
-        let rc = unsafe {
-            register_entrypoint(&vt, RPI_PLUGIN_ABI_VERSION + 1, |_| {
-                panic!("body must not run on version mismatch");
-            })
-        };
-        assert_ne!(rc, 0);
-
         // Right version → body runs, rc propagated.
-        let rc = unsafe { register_entrypoint(&vt, RPI_PLUGIN_ABI_VERSION, |_| 0) };
+        let rc = unsafe { register_entrypoint(&api, |_| 0) };
         assert_eq!(rc, 0);
-        let rc = unsafe { register_entrypoint(&vt, RPI_PLUGIN_ABI_VERSION, |_| 42) };
+        let rc = unsafe { register_entrypoint(&api, |_| 42) };
         assert_eq!(rc, 42);
 
         // Null api → refuse.
-        let rc = unsafe { register_entrypoint(core::ptr::null(), RPI_PLUGIN_ABI_VERSION, |_| 0) };
+        let rc = unsafe { register_entrypoint(core::ptr::null(), |_| 0) };
         assert_ne!(rc, 0);
-        let _ = reset_freed();
-    }
-
-    #[test]
-    fn v3_ext_is_pod_and_entrypoint_validates() {
-        // The v3 ext block is POD (fn pointer + reserved raw pointers, no Drop).
-        assert!(!core::mem::needs_drop::<PluginApiVt3Ext>());
-        assert_eq!(RPI_PLUGIN_ABI_VERSION_V3, 3);
-        assert_ne!(REGISTER_SYMBOL_V3, REGISTER_SYMBOL_V2);
-        let empty = PluginApiVt3Ext::empty();
-        assert!(empty.declare.is_none());
-        assert!(empty._reserved.iter().all(|p| p.is_null()));
-
-        let vt = PluginApiVt {
-            free_string: test_free,
-            register_tool: None,
-            register_command: None,
-            register_shortcut: None,
-            register_flag: None,
-            register_provider: None,
-            register_message_renderer: None,
-            register_markdown_transformer: None,
-            register_entry_renderer: None,
-            register_event_handler: None,
-            register_resources_discover: None,
-            runtime_action: noop_runtime_action,
-            dispatch_event: None,
-            user_data: core::ptr::null_mut(),
-        };
-        let ext = PluginApiVt3Ext::empty();
-
-        // Version mismatch → refused before the body runs (null api makes the
-        // ordering observable: version-first returns 1, not the null-api code).
-        let rc = unsafe {
-            register_entrypoint_v3(core::ptr::null(), &ext, 2, |_, _| {
-                panic!("body must not run on version mismatch");
-            })
-        };
-        assert_eq!(rc, 1);
-
-        // Null api / null ext → distinct refusals.
-        assert_eq!(
-            unsafe { register_entrypoint_v3(core::ptr::null(), &ext, 3, |_, _| 0) },
-            2
-        );
-        assert_eq!(
-            unsafe { register_entrypoint_v3(&vt, core::ptr::null(), 3, |_, _| 0) },
-            3
-        );
-
-        // Right version + non-null → body runs, rc propagated.
-        let rc = unsafe { register_entrypoint_v3(&vt, &ext, 3, |_, _| 0) };
-        assert_eq!(rc, 0);
-        let rc = unsafe { register_entrypoint_v3(&vt, &ext, 3, |_, _| 7) };
-        assert_eq!(rc, 7);
         let _ = reset_freed();
     }
 }

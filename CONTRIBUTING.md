@@ -63,20 +63,19 @@ provider to the default `cargo test` path.
 
 ## Repository layout
 
-The workspace directory names are historical (`crates/pi-*`), while the
-published crate names use the `rpi-` prefix. `package.name` in each
-`Cargo.toml` is the crate name; the directory name is not part of the public
-API.
+The workspace directories and the published crate names both use the `rpi-`
+prefix (`crates/rpi-ai` ↔ `rpi-ai`). `package.name` in each `Cargo.toml` is the
+crate name; the directory name is not part of the public API.
 
 | Directory                          | Crate            |
 | ---------------------------------- | ---------------- |
-| `crates/pi-telemetry`              | `rpi-telemetry`  |
-| `crates/pi-ai`                     | `rpi-ai`         |
-| `crates/pi-agent`                  | `rpi-agent`      |
-| `crates/pi-tools`                  | `rpi-tools`      |
-| `crates/pi-harness`                | `rpi-harness`    |
-| `crates/pi-cli`                    | `rpi-cli`        |
-| `crates/pi-tui`                    | `rpi-tui`        |
+| `crates/rpi-telemetry`              | `rpi-telemetry`  |
+| `crates/rpi-ai`                     | `rpi-ai`         |
+| `crates/rpi-agent`                  | `rpi-agent`      |
+| `crates/rpi-tools`                  | `rpi-tools`      |
+| `crates/rpi-harness`                | `rpi-harness`    |
+| `crates/rpi-cli`                    | `rpi-cli`        |
+| `crates/rpi-tui`                    | `rpi-tui`        |
 | `crates/rpi-plugin-sdk`            | `rpi-plugin-sdk` |
 | `crates/rpi-extensions`            | `rpi-extensions` |
 

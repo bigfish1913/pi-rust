@@ -6,15 +6,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const RELEASE_CRATES: &[(&str, &str)] = &[
-    ("rpi-telemetry", "crates/pi-telemetry/Cargo.toml"),
-    ("rpi-ai", "crates/pi-ai/Cargo.toml"),
-    ("rpi-agent", "crates/pi-agent/Cargo.toml"),
+    ("rpi-telemetry", "crates/rpi-telemetry/Cargo.toml"),
+    ("rpi-ai", "crates/rpi-ai/Cargo.toml"),
+    ("rpi-agent", "crates/rpi-agent/Cargo.toml"),
     ("rpi-plugin-sdk", "crates/rpi-plugin-sdk/Cargo.toml"),
     ("rpi-extensions", "crates/rpi-extensions/Cargo.toml"),
-    ("rpi-tools", "crates/pi-tools/Cargo.toml"),
-    ("rpi-harness", "crates/pi-harness/Cargo.toml"),
-    ("rpi-tui", "crates/pi-tui/Cargo.toml"),
-    ("rpi-cli", "crates/pi-cli/Cargo.toml"),
+    ("rpi-tools", "crates/rpi-tools/Cargo.toml"),
+    ("rpi-harness", "crates/rpi-harness/Cargo.toml"),
+    ("rpi-tui", "crates/rpi-tui/Cargo.toml"),
+    ("rpi-cli", "crates/rpi-cli/Cargo.toml"),
 ];
 
 const INTERNAL_DEPENDENCIES: &[&str] = &[
@@ -563,7 +563,7 @@ mod tests {
 
     #[test]
     fn parses_release_toml_shapes() {
-        let toml = "[workspace.package]\nversion = \"0.1.12\"\n\n[workspace.dependencies]\nrpi-ai = { path = \"crates/pi-ai\", version = \"0.1.12\" }\n";
+        let toml = "[workspace.package]\nversion = \"0.1.12\"\n\n[workspace.dependencies]\nrpi-ai = { path = \"crates/rpi-ai\", version = \"0.1.12\" }\n";
         let package = toml_section(toml, "workspace.package").unwrap();
         assert_eq!(toml_string(package, "version"), Some("0.1.12"));
         let dependencies = toml_section(toml, "workspace.dependencies").unwrap();
@@ -593,7 +593,7 @@ serde = { version = "1" }
                 "-p",
                 "rpi-ai",
                 "--config",
-                "patch.crates-io.rpi-telemetry.path=\"workspace/crates/pi-telemetry\"",
+                "patch.crates-io.rpi-telemetry.path=\"workspace/crates/rpi-telemetry\"",
                 "--config",
                 "patch.crates-io.rpi-plugin-sdk.path=\"workspace/crates/rpi-plugin-sdk\"",
             ]

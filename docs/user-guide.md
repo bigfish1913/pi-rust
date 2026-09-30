@@ -19,7 +19,7 @@ rpi --help
 ```bash
 git clone https://github.com/bigfish1913/pi-rust.git
 cd pi-rust
-cargo install --path crates/pi-cli --force
+cargo install --path crates/rpi-cli --force
 ```
 
 `cargo install` 安装的是可执行文件；它不等同于 `rpi install`。后者用于安装由 `rpi-plugin-sdk` 构建的 Rust 动态库扩展。
@@ -66,7 +66,7 @@ rpi auth login
 rpi auth logout
 ```
 
-不要把密钥写入 Git 仓库、项目文档或 package manifest。
+不要把密钥写入 Git 仓库或项目文档。
 
 ### 自定义 Provider
 
@@ -204,36 +204,33 @@ rpi --tools read,bash,edit,write,docs -p "检查并修改项目文件"
 
 ## 5. 项目目录和资源优先级
 
-rpi 会优先使用 rpi 自己的目录，同时兼容原 Pi 的 `.pi` 布局：
+rpi 使用自己的 `.rpi` 目录：
 
 ```text
 项目/
-├── .rpi/
-│   ├── settings.json
-│   ├── SYSTEM.md
-│   ├── APPEND_SYSTEM.md
-│   ├── skills/
-│   ├── prompts/
-│   ├── themes/
-│   ├── extensions/
-│   └── packages/
-└── .pi/                 # 兼容旧 Pi 项目
+└── .rpi/
+    ├── settings.json
+    ├── SYSTEM.md
+    ├── APPEND_SYSTEM.md
+    ├── skills/
+    ├── prompts/
+    ├── themes/
+    └── extensions/
 ```
 
-项目 `.rpi` 优先于项目 `.pi`。全局资源默认位于 `~/.rpi/agent/`，包括 `settings.json`、`models.json`、`skills/`、`prompts/`、`themes/`、`extensions/` 和 `packages/`。同名资源发生冲突时，项目资源优先于全局资源，`.rpi` 优先于 `.pi`。
+全局资源默认位于 `~/.rpi/agent/`，包括 `settings.json`、`models.json`、`skills/`、`prompts/`、`themes/` 和 `extensions/`。同名资源发生冲突时，项目资源优先于全局资源。
 
-项目级 `.rpi/settings.json`（兼容 `.pi/settings.json`）可以追加资源目录和 package：
+项目级 `.rpi/settings.json` 可以追加资源目录：
 
 ```json
 {
   "skillDirs": ["./team-skills"],
   "promptDirs": ["./prompts/shared"],
-  "extensionDirs": ["./target/debug"],
-  "packages": ["./packages/review-tools"]
+  "extensionDirs": ["./target/debug"]
 }
 ```
 
-路径相对于项目根目录；`skills`、`prompts`、`extensions` 是对应 `*Dirs` 字段的简写。自定义目录会与 `.rpi`、`.pi` 和全局约定目录一起加载，`.rpi` 优先。全局 `~/.rpi/agent/settings.json` 也支持这些字段，相对路径相对于 agent 目录。
+路径相对于项目根目录；`skills`、`prompts`、`extensions` 是对应 `*Dirs` 字段的简写。自定义目录会与 `.rpi` 和全局约定目录一起加载。全局 `~/.rpi/agent/settings.json` 也支持这些字段，相对路径相对于 agent 目录。
 
 配置目录可以重定位：
 
@@ -359,7 +356,7 @@ rpi-plugin-sdk → rpi-extensions → rpi-tui → rpi-cli
 - 在线文档：<https://rpi.laofu.online/docs.html>
 - 源码仓库：<https://github.com/bigfish1913/pi-rust>
 - Rust API：<https://docs.rs/rpi-agent>、<https://docs.rs/rpi-plugin-sdk>
-- Pi 参考实现：<https://github.com/earendil-works/pi>
+
 - Package 与扩展作者指南：<https://rpi.laofu.online/extension-authoring.md>
 - 远程模式：<docs/remote-mode.md>
 - Rust 扩展与 agent 调试：`rpi` 内 `docs` 工具的 `debugging` 主题

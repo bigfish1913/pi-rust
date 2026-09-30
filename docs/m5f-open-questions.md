@@ -3,7 +3,7 @@
 > Written per the user's instruction "中间有问题，写文档，我睡醒统一处理"
 > (if problems arise mid-way, write them to a doc; I'll review them on waking).
 > These are the design divergences from the TS reference that the M5f port
-> (`crates/pi-harness/src/agent_harness.rs`) introduced. None are blockers —
+> (`crates/rpi-harness/src/agent_harness.rs`) introduced. None are blockers —
 > all are recorded for review. The run loop builds and the M5 test suite stays
 > green; the items below are deliberate v1 simplifications, not defects.
 

@@ -3,7 +3,7 @@
 > Written per the user's instruction "中间有问题，写文档，我睡醒统一处理"
 > (if problems arise mid-way, write them to a doc; I'll review them on waking).
 > These are the design divergences from the TS reference that the pi-cli port
-> (`crates/pi-cli/`) introduced. None are blockers — all are recorded for
+> (`crates/rpi-cli/`) introduced. None are blockers — all are recorded for
 > review. The CLI builds, its 40 unit tests pass, the full workspace test
 > suite stays green, and the `pi` binary runs end-to-end (version/help/usage
 > errors + a real Anthropic-backed run fails cleanly at the network/auth layer
@@ -29,7 +29,7 @@ slots into the same review cadence.
 
 ## 1. CLI surface is a strict subset; ignored flags warn, not error
 
-**Where:** `crates/pi-cli/src/args.rs::parse_args` — the
+**Where:** `crates/rpi-cli/src/args.rs::parse_args` — the
 `recognized-but-ignored v1 scope cuts` arms.
 
 **What.** The TS `parseArgs` returns an `unknownFlags` map that extensions
@@ -52,7 +52,7 @@ the honest signal.
 
 ## 2. `--mode rpc` is parsed but not implemented
 
-**Where:** `crates/pi-cli/src/app.rs::run` — the `RunMode::Rpc` arm prints an
+**Where:** `crates/rpi-cli/src/app.rs::run` — the `RunMode::Rpc` arm prints an
 error and exits 2 (usage).
 
 **What.** TS `runRpcMode` drives a JSON-RPC session protocol over stdio (the
@@ -69,7 +69,7 @@ plumbing, not part of the SDK library layer this port targets).
 
 ## 3. Interactive mode is a minimal line REPL, not the TS TUI
 
-**Where:** `crates/pi-cli/src/modes.rs::interactive`.
+**Where:** `crates/rpi-cli/src/modes.rs::interactive`.
 
 **What.** The TS `modes/interactive/*` is a full terminal UI built on
 Ink/React: theme support, keyboard protocols, a rich prompt surface, command
@@ -89,8 +89,8 @@ navigation) already exist on `AgentLane`/`AgentHarness`; the gap is purely UI.
 
 ## 4. Anthropic-only; persistent config + Bearer/custom-endpoint support; no OAuth/Copilot
 
-**Where:** `crates/pi-cli/src/provider.rs::resolve`, `crates/pi-cli/src/config.rs`,
-`crates/pi-cli/src/auth.rs`.
+**Where:** `crates/rpi-cli/src/provider.rs::resolve`, `crates/rpi-cli/src/config.rs`,
+`crates/rpi-cli/src/auth.rs`.
 
 **What.** v1 is Anthropic-only (plan §5.16: "OAuth/Copilot skipped v1"). `--provider`
 must be `anthropic` (or absent); any other value is a hard `UnknownProvider` error.
@@ -138,30 +138,26 @@ The Rust port keeps auth headers on `model.headers` and merges them later in
 whether to demand an x-api-key — saw an empty `opts.headers` and errored
 "No API key for provider: anthropic" even when `model.headers` carried a Bearer.
 The fix consults *both*: `has_header_auth(&opts.headers) || has_header_auth(&model.headers)`
-(`crates/pi-ai/src/providers/anthropic/mod.rs`, `run_anthropic_stream`). This mirrors
+(`crates/rpi-ai/src/providers/anthropic/mod.rs`, `run_anthropic_stream`). This mirrors
 the TS net effect and lets a Bearer folded onto `model.headers` authenticate. A
 regression test (`header_auth_on_model_headers_counts_as_owned`) pins it.
 
-### 4a. ✅ RESOLVED — `~/.rpi/agent/` is nested (parity with upstream `~/.pi/agent/`)
+### 4a. ✅ RESOLVED — `~/.rpi/agent/` is nested
 
-**Status.** v1 now mirrors upstream `getAgentDir()`: config lives under
-`~/.rpi/agent/` (`auth.json`, `models.json`, `settings.json`, `trust.json`),
-matching `~/.pi/agent/`. `RPI_CODING_AGENT_DIR` (absolute path only) overrides
-the agent dir itself — same semantics as `PI_CODING_AGENT_DIR`. The goal
-(".pi 目录靠过来就能用" — drop a `.pi/agent/` dir at `~/.rpi/agent/` or point
-`RPI_CODING_AGENT_DIR` at it and it works) is met for the config layer: rpi
-reads the same `auth.json`/`models.json`/`settings.json`/`trust.json` pi
-writes, honors a saved `defaultModel`/`defaultThinkingLevel`/`theme`, and
-expands `$ENV`/`!command` config values (§4c).
+**Status.** Config lives under `~/.rpi/agent/` (`auth.json`, `models.json`,
+`settings.json`, `trust.json`). `RPI_CODING_AGENT_DIR` (absolute path only)
+overrides the agent dir itself. rpi honors a saved
+`defaultModel`/`defaultThinkingLevel`/`theme` and expands `$ENV`/`!command`
+config values (§4c).
 
 **Migration.** A one-shot `config::migrate_legacy_layout()` (called from
 `app::run` on startup, **only when `RPI_CODING_AGENT_DIR` is unset**) moves
-legacy flat `~/.rpi/{auth.json,models.json,.setup_done,.earendil_seen}` into
+legacy flat `~/.rpi/{auth.json,models.json,.setup_done}` into
 `~/.rpi/agent/`. It's idempotent, best-effort (rename with copy-fallback),
 no-ops when `agent/` already exists or no flat files are present, and never
 blocks startup. Existing flat installs upgrade transparently on the next run.
 
-**Sentinels.** `.setup_done` / `.earendil_seen` moved under `agent/` (the
+**Sentinels.** `.setup_done` moved under `agent/` (the
 `extras.rs` sentinels now delegate to `config::agent_dir()` instead of a
 private `rpi_dir()`, which also fixes an old bug where they ignored the env
 override).
@@ -192,11 +188,9 @@ override).
   prompt or gate project `.rpi`/`.pi` resources behind it — rpi doesn't load the
   resources pi gates there (skills/templates/context, §8). Deferred until
   resource discovery lands.
-- **Session dir.** v1's default session dir is `<cwd>/.rpi/sessions`, with an
-  existing `<cwd>/.pi/sessions` directory retained as a compatibility fallback
-  (see §6), **not** `<agentDir>/sessions`. pi encodes cwd into session
-  filenames; rpi's session layer is a separate design. Aligning the session
-  location is out of scope for this config-parity pass.
+- **Session dir.** The default session dir is `<cwd>/.rpi/sessions`, **not**
+  `<agentDir>/sessions`. rpi's session layer is a separate design from
+  cwd-encoded session filenames.
 
 ### 4b. No file lock; atomic rename instead
 
@@ -211,7 +205,7 @@ future daemon/TUI left open while a `rpi` one-shot runs).
 
 ### 4c. ✅ RESOLVED — `resolveConfigValue` (`$ENV` / `${ENV}` / `!command`) ported
 
-**Where:** `crates/pi-cli/src/config.rs::resolve_config_value` +
+**Where:** `crates/rpi-cli/src/config.rs::resolve_config_value` +
 `resolve_headers` + `resolve_command`, applied at the three consumption points
 that mirror upstream (`resolve-config-value.ts`):
 
@@ -249,7 +243,7 @@ needed; the `Credential::Oauth` shape is already there to hold it.
 
 ### 4e. `authHeader: true` Bearer synthesis is centralized, not per-model
 
-**Where:** `crates/pi-cli/src/provider.rs::resolve` (via `models_json_bearer_token`)
+**Where:** `crates/rpi-cli/src/provider.rs::resolve` (via `models_json_bearer_token`)
 vs `provider_to_models` (which deliberately does *not* synthesize it).
 
 **Divergence.** Upstream folds the `authHeader:true`-wrapped Bearer onto each model
@@ -263,7 +257,7 @@ above) *and* the value folded into the Bearer — one place, one decision.
 
 ### 4f. models.json provider id is config-namespacing only
 
-**Where:** `crates/pi-cli/src/config.rs::provider_to_models` stamps
+**Where:** `crates/rpi-cli/src/config.rs::provider_to_models` stamps
 `provider = "anthropic"` (not the models.json key) on every models.json model.
 
 **Divergence.** v1 has a **single** `AnthropicProvider` (its `id()` is hardcoded
@@ -292,7 +286,7 @@ documented).
 
 ## 5. Model matching is exact (case-insensitive), not fuzzy
 
-**Where:** `crates/pi-cli/src/provider.rs::find_model` + `split_model_pattern`.
+**Where:** `crates/rpi-cli/src/provider.rs::find_model` + `split_model_pattern`.
 
 **What.** `--model` accepts `provider/id[:thinking]` or `id[:thinking]` (a
 trailing `:level` is peeled only if it is a valid thinking level, else kept in
@@ -360,7 +354,7 @@ provider-level credential behavior and the pre-gateway v1 behavior.
 
 ## 6. Session restore (`-c`/`-r`/`--session`) is recognized but not wired
 
-**Where:** `crates/pi-cli/src/session.rs::select_session` + `build_session`
+**Where:** `crates/rpi-cli/src/session.rs::select_session` + `build_session`
 (the `SessionSelection::Existing` arm → `BuildError::RestoreNotImplemented`).
 
 **What.** `-c`/`--continue`, `-r`/`--resume`, and `--session <id|path>` are
@@ -373,24 +367,22 @@ records (restore is not implemented in the harness).
 **Divergence.** TS `SessionManager` resolves continue/resume/specific-session
 into an existing JSONL file and the harness replays it. v1 always creates a
 *fresh* session (ephemeral via `--no-session`, or a new JSONL file under
-`--session-dir`/the default `<cwd>/.pi/sessions`).
+`--session-dir`/the default `<cwd>/.rpi/sessions`).
 
 **To revisit.** Depends on harness restore (M5f #1/#3). Once `AgentHarness` can
 rehydrate a session from an existing JSONL file, wire `-c` (most-recent in the
 cwd's session dir), `-r` (a picker — needs a TUI), and `--session` (id/path
 resolution).
 
-**Note.** The v1 default session dir is `<cwd>/.rpi/sessions`; an existing
-`<cwd>/.pi/sessions` is used when no `.rpi/sessions` exists (TS uses
-`<agentDir>/sessions` under the home dir). This is a documented divergence so
-sessions live *with the project* rather than globally; revisit if a global
-location is preferred.
+**Note.** The default session dir is `<cwd>/.rpi/sessions`. This is a
+documented divergence so sessions live *with the project* rather than globally;
+revisit if a global location is preferred.
 
 ---
 
 ## 7. `@file` attachments: text-only; images refused
 
-**Where:** `crates/pi-cli/src/app.rs::process_file_args`.
+**Where:** `crates/rpi-cli/src/app.rs::process_file_args`.
 
 **What.** The TS `processFileArguments` has two branches: text files are
 wrapped in `<file name="…">…</file>`; image files are mime-detected, resized,
@@ -413,19 +405,19 @@ already accepts `Vec<ImageContent>`; this is purely CLI-side wiring.
 
 ## 8. ✅ RESOLVED — Skills / prompt-templates / context-files/packages discovery wired
 
-**Where:** `crates/pi-cli/src/session.rs::build` + `crates/pi-cli/src/resource_dirs.rs`
-+ `crates/pi-harness/src/context_files.rs` + `crates/pi-harness/src/system_prompt.rs`.
+**Where:** `crates/rpi-cli/src/session.rs::build` + `crates/rpi-cli/src/resource_dirs.rs`
++ `crates/rpi-harness/src/context_files.rs` + `crates/rpi-harness/src/system_prompt.rs`.
 
 **Status (Part A, done).** Resource discovery is wired end-to-end:
-- **Skills**: discovered from `<cwd>/.rpi/skills`, then legacy
-  `<cwd>/.pi/skills`, then `agent_dir()/skills`, project-wins-first dedupe
+- **Skills**: discovered from `<cwd>/.rpi/skills`, then
+  `agent_dir()/skills`, project-wins-first dedupe
   (`resource_dirs::dedupe_skills`, mirrors pi
   `addSkills` collision semantics). The `<available_skills>` listing is injected
   into the system prompt by `AgentHarness::compose_prompt`, gated on the `read`
   tool being active AND `disable_model_invocation` filtering (applied inside
   `format_skills_for_system_prompt`, mirroring pi `skills.ts:335-336`).
-- **Prompt-templates**: discovered from `<cwd>/.rpi/prompts`, then legacy
-  `<cwd>/.pi/prompts`, then `agent_dir()/prompts`, project-wins-first dedupe.
+- **Prompt-templates**: discovered from `<cwd>/.rpi/prompts`, then
+  `agent_dir()/prompts`, project-wins-first dedupe.
   On-demand only (never in the
   system prompt); surfaced as `/<name>` slash commands in the TUI autocomplete +
   expandable via the harness `prompt_from_template` lane call. `/context` lists
@@ -435,8 +427,8 @@ already accepts `Vec<ImageContent>`; this is purely CLI-side wiring.
   "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"]`, global agentDir first
   then ancestor-walk cwd→root with the **deepest (cwd) file concatenated last**).
   Rendered as a `<project_context>` block by `format_project_context`.
-- **SYSTEM.md / APPEND_SYSTEM.md**: project `<cwd>/.rpi/` wins, then legacy
-  `<cwd>/.pi/`, then global `<agent_dir>/` (mirrors pi
+- **SYSTEM.md / APPEND_SYSTEM.md**: project `<cwd>/.rpi/` wins, then global
+  `<agent_dir>/` (mirrors pi
   `discoverSystemPromptFile` with an rpi-owned project layer); the same
   precedence applies to `APPEND_SYSTEM.md`. Explicit `--system-prompt` wins over
   SYSTEM.md; `--append-system-prompt` wins over APPEND_SYSTEM.md (pi
@@ -444,25 +436,17 @@ already accepts `Vec<ImageContent>`; this is purely CLI-side wiring.
   base → append → context → skills.
 - **Flags**: `--no-skills`/`-ns`, `--no-prompt-templates`/`-np`,
   `--no-context-files`/`-nc` each suppress one channel independently;
-  `--no-extensions`/`-ne` controls Rust extension loading and is the final
-  kill switch for Pi JS/TS packages;
-  `--enable-pi-packages` explicitly opts into configured Pi package discovery
-  and loading; without it, package settings are not parsed.
+  `--no-extensions`/`-ne` controls Rust cdylib extension loading.
 - **`/context` (TUI)**: lists discovered skills, prompt templates, and a note on
   context/system/append sources (`interactive_tui::show_context_panel`).
 
 **Divergences (documented, deferred).**
 - **Trust gating**: pi gates project config files (+ some resources) behind
   `isProjectTrusted()`; rpi v1 has no trust prompt, so project resources are
-  read unconditionally (a copied `.rpi/` or `.pi/` drops in and works). Full
-  trust gating deferred.
-- **Discovery roots**: pi reads 4 roots (`.pi/skills`, `.agents/skills`,
-  `~/.pi/agent/skills`, `~/.agents/skills`) + installed packages; rpi reads
-  `<cwd>/.rpi/<sub>` first, then legacy `<cwd>/.pi/<sub>`, then
-  `agent_dir()/<sub>` plus enabled static package resources. rpi also resolves
-  Pi's native npm store (`~/.pi/agent/npm/node_modules/<package>`) when a copied
-  Pi `settings.json` contains an `npm:` package spec. `.agents/*` remains
+  read unconditionally (a copied `.rpi/` drops in and works). Full trust gating
   deferred.
+- **Discovery roots**: rpi reads `<cwd>/.rpi/<sub>`, then
+  `agent_dir()/<sub>`. `.agents/*` remains deferred.
 - **Worktree shadowed-context-file dedup** (`findShadowedContextFile`,
   `.reference/.../resource-loader.ts:100-116`): deferred (git-layout edge case).
 - **Full structured collision diagnostics**: pi carries `winnerPath`/`loserPath`
@@ -550,11 +534,11 @@ package skills, prompts, themes, and system prompt fragments are supported by
 
 ## 9. ✅ RESOLVED — Read-only `grep`/`find`/`ls` ported to `pi-tools` (in-process)
 
-**Where:** `crates/pi-cli/src/session.rs::BUILTIN_TOOL_NAMES` + the help text.
+**Where:** `crates/rpi-cli/src/session.rs::BUILTIN_TOOL_NAMES` + the help text.
 
 **Status.** `grep`/`find`/`ls` are now in `BUILTIN_TOOL_NAMES` and registered by
 `build_tools`. The CLI help lists them; `--tools grep` works. The tools live in
-`crates/pi-tools/src/tools/{grep,find,ls}.rs` with full test coverage
+`crates/rpi-tools/src/tools/{grep,find,ls}.rs` with full test coverage
 (`tests/{grep,find,ls}.rs`, 23 tests, all green) against `InMemoryExecutionEnv`.
 
 **Divergence from TS (documented).** The TS `grep` shells out to `rg`
@@ -585,7 +569,7 @@ exists on a real fs — you're in it), so tools that default their search path t
 
 ## 10. JSON event stream is a lossy but stable shape
 
-**Where:** `crates/pi-cli/src/modes.rs::emit_json_event`.
+**Where:** `crates/rpi-cli/src/modes.rs::emit_json_event`.
 
 **What.** `--mode json` emits one JSON object per line per harness event
 (`run_start`/`run_end`) plus a terminal `result` line. The TS `toJsonEvent`
@@ -607,7 +591,7 @@ Option (b) is cleaner and matches the TS layering.
 
 ## 11. Exit-code policy
 
-**Where:** `crates/pi-cli/src/app.rs` (`EXIT_USAGE = 2`, `EXIT_RUNTIME = 1`;
+**Where:** `crates/rpi-cli/src/app.rs` (`EXIT_USAGE = 2`, `EXIT_RUNTIME = 1`;
 `modes::outcome_exit_code` maps `Failed`/`Aborted` → 1).
 
 **What.** v1 distinguishes *usage* errors (parse errors, no API key, `--mode

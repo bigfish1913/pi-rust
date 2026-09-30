@@ -7,7 +7,7 @@
 
 ## 1. bash `on_chunk` uses `try_lock`, not `blocking_lock`
 
-**Where:** `crates/pi-tools/src/tools/bash.rs` (on_chunk closure passed to
+**Where:** `crates/rpi-tools/src/tools/bash.rs` (on_chunk closure passed to
 `execute_shell_with_capture`).
 
 **The problem.** The TS `bash.ts` throttles stdout/stderr chunks with a plain
@@ -54,7 +54,7 @@ current approach is the smallest sound change; I deferred a fancier design.
 
 ## 2. Windows path-absoluteness in tests
 
-**Where:** `crates/pi-tools/tests/{execution_env_conformance,read_truncation,...}.rs`.
+**Where:** `crates/rpi-tools/tests/{execution_env_conformance,read_truncation,...}.rs`.
 
 **The problem.** Tests that seeded `InMemoryExecutionEnv::with_cwd("/tmp/work")`
 failed on Windows because `Path::is_absolute()` requires a drive letter —
@@ -80,7 +80,7 @@ correctly on both platforms; only test fixtures needed adjustment.
 
 ## 3. `shell_output` spill timing (intentional v1 divergence, pre-dated this session)
 
-**Where:** `crates/pi-tools/src/shell_output.rs`.
+**Where:** `crates/rpi-tools/src/shell_output.rs`.
 
 Already documented in the plan (§5.4 area): the TS `shell-output.ts` spills to
 the temp file **mid-stream** from a synchronous `FnMut` callback; Rust spills
@@ -91,7 +91,7 @@ capture completes. Recorded here for completeness; not a new finding.
 
 ## 4. No `docs/m4-open-questions.md` test references left dangling
 
-The `crates/pi-tools/tests/bash.rs` module doc references this file. It now
+The `crates/rpi-tools/tests/bash.rs` module doc references this file. It now
 exists. No action needed beyond keeping this doc in tree.
 
 ---
@@ -101,8 +101,8 @@ exists. No action needed beyond keeping this doc in tree.
 The M4 pi-tools scope shipped `read`/`write`/`edit`/`bash` only. The read-only
 `grep`/`find`/`ls` trio is now ported (separate follow-on to M6, not a
 milestone). Sources:
-`crates/pi-tools/src/tools/{grep,find,ls}.rs`, tests
-`crates/pi-tools/tests/{grep,find,ls}.rs` (23 tests, all green against
+`crates/rpi-tools/src/tools/{grep,find,ls}.rs`, tests
+`crates/rpi-tools/tests/{grep,find,ls}.rs` (23 tests, all green against
 `InMemoryExecutionEnv`).
 
 **Divergence from TS.** The TS `grep` shells out to `rg` (ripgrep, JSON-stream
