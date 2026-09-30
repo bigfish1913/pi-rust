@@ -30,20 +30,18 @@
 //!   The interactive `-c`/`-r`/`--session` paths enable that mode and replay
 //!   the existing branch before appending new messages. See [`SessionSelection`].
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use rpi_agent::AgentMessage;
-use rpi_ai::types::UserMessage;
 use rpi_ai::Provider;
 use rpi_harness::agent_harness::AgentHarness;
 use rpi_harness::context_files::{format_project_context, load_project_context_files};
 use rpi_harness::session::memory::{InMemorySessionStorage, SystemClock};
 use rpi_harness::session::session::DefaultIdGenerator;
-use rpi_harness::session::types::{CustomEntry, Entry, SessionMetadata};
-use rpi_harness::session::{CustomEntryContextMessageProjector, Session};
+use rpi_harness::session::types::SessionMetadata;
+use rpi_harness::session::Session;
 use rpi_harness::system_prompt::compose_system_prompt;
 use rpi_harness::types::{
     AgentHarnessOptions, AgentHarnessResources, AgentHarnessStreamOptions, DrivingMode,
@@ -67,64 +65,6 @@ use rpi_extensions::{
     emit_resources_discover, ExtensionEmitter, ExtensionSession, NullDiagnostics,
     PluginDiagnostics, PluginToolAdapter, TeeEmitter,
 };
-
-/// Project the latest `goal` custom entry into a user-visible context message.
-///
-/// Goal entries are state snapshots. Only the newest snapshot on the branch is
-/// authoritative, so a terminal or paused state supersedes an older active
-/// state instead of accumulating stale instructions in the context.
-fn project_goal_entry(entry: &CustomEntry, _index: usize, entries: &[Entry]) -> Vec<AgentMessage> {
-    let is_latest = entries
-        .iter()
-        .rev()
-        .find_map(|candidate| match candidate {
-            Entry::Custom(custom) if custom.custom_type == "goal" => Some(custom.base.id.as_str()),
-            _ => None,
-        })
-        .map(|id| id == entry.base.id)
-        .unwrap_or(true);
-    if !is_latest {
-        return Vec::new();
-    }
-
-    let data = entry.data.as_ref();
-    let get = |key: &str| {
-        data.and_then(|value| value.get(key))
-            .and_then(|value| value.as_str())
-    };
-    let status = get("status").unwrap_or("active");
-    if status == "complete" {
-        return Vec::new();
-    }
-
-    let title = get("title").unwrap_or("(untitled goal)");
-    let notes = get("notes").unwrap_or("").trim();
-    let tag = if status == "paused" {
-        "⏸️ Paused goal"
-    } else {
-        "🎯 Active goal"
-    };
-    let text = if notes.is_empty() {
-        format!("{tag}: {title}. Keep advancing this goal.")
-    } else {
-        format!("{tag}: {title} — {notes}. Keep advancing this goal.")
-    };
-
-    vec![AgentMessage::User(UserMessage::new(
-        text,
-        entry.base.timestamp,
-    ))]
-}
-
-/// Projectors for extension-owned custom session entries.
-pub fn goal_entry_projectors() -> BTreeMap<String, CustomEntryContextMessageProjector> {
-    let mut projectors = BTreeMap::new();
-    projectors.insert(
-        "goal".to_string(),
-        Arc::new(project_goal_entry) as CustomEntryContextMessageProjector,
-    );
-    projectors
-}
 
 /// The coding tools registered by the CLI by default.
 pub const BUILTIN_TOOL_NAMES: &[&str] = &["read", "bash", "edit", "write", "docs"];
@@ -753,7 +693,7 @@ pub async fn build(
         // stays first-match for its own ids (first-wins on a `.find`).
         models: build_models_with_extensions(resolved, &extension_session, runtime.clone()),
         to_provider_messages: None,
-        entry_projectors: goal_entry_projectors(),
+        entry_projectors: Default::default(),
         agent_emitter: Some(emitter),
         // B3b: the three exists-but-`None` loop hooks — populated when an
         // extension session registers handlers for the matching pi `on()`
@@ -3326,56 +3266,6 @@ mod tests {
         let s = ephemeral_session();
         let leaf = s.get_leaf_id().await;
         assert!(leaf.is_ok());
-    }
-
-    #[test]
-    fn goal_entry_projects_active_and_skips_complete() {
-        use rpi_harness::session::types::EntryBase;
-
-        let mk = |id: &str, status: &str| {
-            Entry::Custom(CustomEntry {
-                base: EntryBase {
-                    entry_type: "custom".into(),
-                    id: id.into(),
-                    seq: 0,
-                    parent_id: None,
-                    timestamp: 1,
-                },
-                custom_type: "goal".into(),
-                data: Some(serde_json::json!({
-                    "title": "T",
-                    "status": status,
-                    "notes": "N"
-                })),
-            })
-        };
-
-        let active = mk("g1", "active");
-        let complete = mk("g2", "complete");
-
-        let out = match &active {
-            Entry::Custom(custom) => project_goal_entry(custom, 0, std::slice::from_ref(&active)),
-            _ => unreachable!(),
-        };
-        assert_eq!(out.len(), 1);
-        assert!(matches!(&out[0], AgentMessage::User(_)));
-
-        let out = match &complete {
-            Entry::Custom(custom) => {
-                project_goal_entry(custom, 1, &[active.clone(), complete.clone()])
-            }
-            _ => unreachable!(),
-        };
-        assert!(out.is_empty());
-
-        let paused = mk("g3", "paused");
-        let out = match &active {
-            Entry::Custom(custom) => {
-                project_goal_entry(custom, 0, &[active.clone(), paused.clone()])
-            }
-            _ => unreachable!(),
-        };
-        assert!(out.is_empty());
     }
 
     // NOTE: `build_tools`/`active_tool_names` integration is exercised by the
