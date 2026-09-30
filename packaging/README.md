@@ -28,7 +28,8 @@ manifest below, push the taps, open the winget PR, publish to crates.io, deploy
 the site — is one command; see [`docs/releasing.md`](../docs/releasing.md):
 
 ```bash
-task release RELEASE_VERSION=0.3.4
+task publish                 # auto-increments the version
+task release RELEASE_VERSION=0.3.4   # explicit version
 ```
 
 Add `-- --dry-run` to print the plan without executing anything.

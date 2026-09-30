@@ -160,6 +160,12 @@ phase_validate() {
 phase_commit() {
   note "commit the version bump"
   step git add -A
+  # Re-running a release whose bump already landed leaves an empty index;
+  # `git commit` would exit 1 there and abort the pipeline under `set -e`.
+  if [[ "$DRY_RUN" != "1" ]] && git diff --cached --quiet; then
+    note "  nothing to commit"
+    return
+  fi
   step git commit -m "chore(release): $release_version"
 }
 
@@ -211,6 +217,10 @@ phase_channels() {
 phase_commit_channels() {
   note "commit the channel refresh"
   step git add -A
+  if [[ "$DRY_RUN" != "1" ]] && git diff --cached --quiet; then
+    note "  nothing to commit"
+    return
+  fi
   step git commit -m "chore(release): refresh the install channels and the site for $release_version"
 }
 
@@ -227,7 +237,7 @@ phase_winget() {
 phase_crates() {
   note "publish nine crates to crates.io"
   confirm "Publish $release_version to crates.io (irreversible)?" || { note "  skipped"; return; }
-  step task publish RELEASE_VERSION="$release_version"
+  step task publish:crates RELEASE_VERSION="$release_version"
 }
 
 phase_site() {

@@ -1,7 +1,12 @@
 # Taskfile for the rpi-* crate family release.
 #
-# The release.ps1 / release.sh scripts were removed (commit 2e5fe54); the
-# dep-ordered publish is now driven directly by the targets below via plain
+# `task publish` is the one-command release: it computes the next version
+# automatically (scripts/next-version.sh), then hands the whole bump -> tag ->
+# push -> binaries -> channels -> crates.io -> site pipeline to
+# scripts/release.sh. `task release` is the same pipeline for an explicit
+# version; `task publish:crates` is the crates.io-only half.
+#
+# The dep-ordered publish itself is driven by release-helper.rs via plain
 # `cargo publish`. Keep this file as the ergonomic entry point so the
 # dependency order is encoded once and `cargo test` stays the pre-flight.
 #
@@ -12,13 +17,24 @@
 #
 # Usage:
 #   task              # list targets
+#   task publish      # 发布下一个版本：自动递增 + 跑完整流水线
+#   task publish RELEASE_VERSION=0.4.0
+#                     # 指定版本发布
+#   task publish RELEASE_BUMP=minor
+#                     # 递增 minor（默认 patch；也可 major / none）
+#   task publish -- --from push --yes
+#                     # 续跑中断的发布，额外参数原样传给 scripts/release.sh
+#   task publish:crates
+#                     # 只发 crates.io，用 Cargo.toml 里已准备好的版本
+#   task publish:fast RELEASE_VERSION=0.1.12
+#                     # 只发 crates.io，跳过 test/check（仍校验发布状态）
 #   task dry-run RELEASE_VERSION=0.1.12
 #                     # package all crates without uploading
-#   task publish RELEASE_VERSION=0.1.12
-#                     # idempotent crates.io publish with full pre-flight checks
-#   task publish:fast RELEASE_VERSION=0.1.12
-#                     # idempotent publish, skip test/check (still validates release state)
 #   task test         # cargo test --workspace --locked
+#
+# 版本自动递增以最高的 `vX.Y.Z` 标签为基准，但 Cargo.toml 里的 workspace 版本
+# 一旦已经领先于所有标签就原样沿用 —— 说明这一版已经 bump 过、只是还没发出去。
+# 所以续跑中断的发布用 `RELEASE_BUMP=none`（或直接给 RELEASE_VERSION）。
 #
 # Prerequisites for `task publish*`: `rustc` and `curl` on PATH, plus a one-time
 # `cargo login` so ~/.cargo/credentials.toml has a publish-scoped token.
@@ -33,6 +49,9 @@ vars:
   RPI_RELEASE_HELPER:
     sh: git rev-parse --git-path rpi-release-helper.exe
 
+  # 自动版本递增的默认部分（patch|minor|major|none）。CLI 传 RELEASE_BUMP 覆盖。
+  RELEASE_BUMP: patch
+
 tasks:
   default:
     desc: List available release targets
@@ -41,30 +60,61 @@ tasks:
 
   dry-run:
     desc: Package all rpi-* crates in release order without uploading
+    vars:
+      PREPARED_VERSION:
+        sh: bash scripts/next-version.sh none
+      VERSION: '{{.RELEASE_VERSION | default .PREPARED_VERSION}}'
     cmds:
       - task: release:validate
+        vars:
+          RELEASE_VERSION: '{{.VERSION}}'
       - task: release:dry-run-crates
 
   publish:
-    desc: Idempotently publish rpi-* crates to crates.io after full pre-flight checks
+    desc: 发布下一个版本 —— 自动递增版本号，然后跑完整发布流水线
+    vars:
+      AUTO_VERSION:
+        sh: bash scripts/next-version.sh {{.RELEASE_BUMP}}
+      VERSION: '{{.RELEASE_VERSION | default .AUTO_VERSION}}'
+    cmds:
+      - bash scripts/release.sh "{{.VERSION}}" {{.CLI_ARGS}}
+
+  publish:crates:
+    desc: 只发布 crates.io（默认用 Cargo.toml 里已准备好的版本）
+    vars:
+      PREPARED_VERSION:
+        sh: bash scripts/next-version.sh none
+      VERSION: '{{.RELEASE_VERSION | default .PREPARED_VERSION}}'
     cmds:
       - task: release:validate
+        vars:
+          RELEASE_VERSION: '{{.VERSION}}'
       - task: test
       - task: check
       - task: release:publish-crates
+        vars:
+          RELEASE_VERSION: '{{.VERSION}}'
 
   publish:fast:
-    desc: Idempotently publish in dependency order, skipping test/check only
+    desc: 只发 crates.io，跳过 test/check（仍校验发布状态）
+    vars:
+      PREPARED_VERSION:
+        sh: bash scripts/next-version.sh none
+      VERSION: '{{.RELEASE_VERSION | default .PREPARED_VERSION}}'
     cmds:
       - task: release:validate
+        vars:
+          RELEASE_VERSION: '{{.VERSION}}'
       - task: release:publish-crates
+        vars:
+          RELEASE_VERSION: '{{.VERSION}}'
 
   release:
-    desc: One-command release — bump, tag, wait for binaries, refresh every channel
+    desc: One-command release for an explicit version — bump, tag, wait for binaries, refresh every channel
     requires:
       vars: [RELEASE_VERSION]
     cmds:
-      - bash scripts/release.sh "{{.RELEASE_VERSION}}"
+      - bash scripts/release.sh "{{.RELEASE_VERSION}}" {{.CLI_ARGS}}
 
   release:channels:
     desc: Refresh the install-channel manifests + site data for a released version

@@ -3,17 +3,42 @@
 One command cuts a release and ships it to every channel:
 
 ```bash
-task release RELEASE_VERSION=0.3.4
+task publish                 # auto-increments the version (patch)
+task publish RELEASE_BUMP=minor
+task publish RELEASE_VERSION=0.4.0
+task release RELEASE_VERSION=0.4.0   # identical, explicit-version spelling
 ```
 
-Under the hood it runs `scripts/release.sh`, which walks the pipeline in order,
+`task publish` resolves the version with [`scripts/next-version.sh`](../scripts/next-version.sh)
+and then runs `scripts/release.sh`, which walks the pipeline in order,
 **printing each step before it runs**. Review the plan first with:
 
 ```bash
-task release RELEASE_VERSION=0.3.4 -- --dry-run
+task publish -- --dry-run
 # or directly:
-bash scripts/release.sh 0.3.4 --dry-run
+bash scripts/release.sh 0.4.0 --dry-run
 ```
+
+### Which version does `task publish` pick?
+
+`RELEASE_VERSION` wins when you pass it. Otherwise the version is derived from
+the highest released `vX.Y.Z` git tag, incremented per `RELEASE_BUMP`
+(`patch` by default, or `minor` / `major`).
+
+One exception: if the workspace version in `Cargo.toml` is **already ahead** of
+every tag, it is reused verbatim. That state means a bump was prepared but has
+not shipped, so incrementing again would skip a version. This is also how you
+resume an interrupted release:
+
+```bash
+# 0.3.8 was bumped/tagged but the push failed — keep 0.3.8, do not go to 0.3.9
+task publish RELEASE_BUMP=none -- --from push --yes
+# equivalently
+task publish RELEASE_VERSION=0.3.8 -- --from push --yes
+```
+
+Anything after `--` is forwarded to `scripts/release.sh`, so the phase flags
+below are available through `task publish` too.
 
 ## The pipeline
 
@@ -32,7 +57,7 @@ bash scripts/release.sh 0.3.4 --dry-run
 | `commit-channels` | `chore(release): refresh the install channels and the site for X.Y.Z` |
 | `taps` | pushes the formula/manifest into `homebrew-tap` + `scoop-bucket` |
 | `winget` | opens the `microsoft/winget-pkgs` PR (`scripts/winget-submit.sh`) |
-| `crates` | `task publish RELEASE_VERSION=X.Y.Z` (nine crates, dependency order) |
+| `crates` | `task publish:crates RELEASE_VERSION=X.Y.Z` (nine crates, dependency order) |
 | `site` | `task rpi-deploy` |
 
 ## Flags
@@ -50,9 +75,17 @@ Recovery is just a re-run from the failed phase — every phase is idempotent:
 
 ```bash
 # CI needed longer than the poll window:
-bash scripts/release.sh 0.3.4 --from channels
+task publish RELEASE_BUMP=none -- --from channels
 # channels are live; only crates.io + site left:
-bash scripts/release.sh 0.3.4 --only crates,site
+task publish RELEASE_VERSION=0.3.4 -- --only crates,site
+```
+
+Crates.io only, no bump/tag/push — for republishing a version whose tree is
+already prepared (it defaults to the `Cargo.toml` version):
+
+```bash
+task publish:crates
+task publish:crates RELEASE_VERSION=0.3.4
 ```
 
 ## Credentials
