@@ -53,7 +53,6 @@ the dependency graph stays acyclic.
 | Location | Scope |
 | -------- | ----- |
 | `.rpi/extensions` | Project (preferred) |
-| `.pi/extensions` | Project, Pi compatibility fallback |
 | `~/.rpi/agent/extensions` | Global |
 | `--extensions-dir <path>` | Explicit, added by the CLI |
 

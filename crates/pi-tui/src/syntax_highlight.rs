@@ -1,6 +1,6 @@
 //! Lightweight code syntax highlighting for terminal rendering.
 //!
-//! Native Pi highlights fenced code with highlight.js
+//! Upstream highlights fenced code with highlight.js
 //! (`utils/syntax-highlight.ts`). rpi ships no JS highlighter, so this is a
 //! small, dependency-free tokenizer covering the languages that show up most in
 //! agent transcripts (Rust, JS/TS, Python, Go, JSON, shell, C-family, Ruby).

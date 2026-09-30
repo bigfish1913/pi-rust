@@ -51,7 +51,7 @@ pub struct BashTruncation {
 }
 
 /// A finalized bash panel is immutable, so its rendered lines can be memoized
-/// by width. Mirrors native pi `bash-execution.ts` `cachedWidth/cachedLines`.
+/// by width. Mirrors upstream `bash-execution.ts` `cachedWidth/cachedLines`.
 #[derive(Clone)]
 struct BashRenderCache {
     width: usize,

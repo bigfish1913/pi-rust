@@ -84,7 +84,7 @@ impl AgentHarnessResources {
 pub enum ToolReplay {
     /// The tool must not be re-run when a crash left its outcome unknown.
     ///
-    /// This is the default, matching native pi (`tool.replay ?? "never"`,
+    /// This is the default, matching upstream (`tool.replay ?? "never"`,
     /// `drive/tools.ts`). Defaulting the other way is a safety bug: the first
     /// time recovery acts on this flag, every tool that never opted in —
     /// `bash`, `write`, `edit` — would be replayed.

@@ -63,7 +63,7 @@ impl KeyCombo {
         }
     }
 
-    /// Human-readable key text for hints (mirrors native pi's `formatKeyText`,
+    /// Human-readable key text for hints (mirrors upstream's `formatKeyText`,
     /// e.g. `Alt+Q`, `Ctrl+Shift+F`, `Enter`). Modifiers are ordered
     /// Ctrl, Alt, Shift, Super.
     pub fn display(&self) -> String {
@@ -151,7 +151,7 @@ impl Keybindings {
         let mut map = HashMap::new();
 
         // Application-level actions. These IDs and their default keys match
-        // native Pi, so a copied settings.json overrides them the same way.
+        // upstream, so a copied settings.json overrides them the same way.
         map.insert(
             "app.interrupt",
             KeybindingDefinition {
@@ -190,7 +190,7 @@ impl Keybindings {
         map.insert(
             "app.model.cycleBackward",
             KeybindingDefinition {
-                // Native pi: `alt+p` on Windows, `shift+ctrl+p` elsewhere.
+                // Upstream: `alt+p` on Windows, `shift+ctrl+p` elsewhere.
                 default_keys: vec![if cfg!(windows) {
                     KeyCombo::new(Char('p'), M::ALT)
                 } else {
@@ -230,7 +230,7 @@ impl Keybindings {
         map.insert(
             "app.clipboard.pasteImage",
             KeybindingDefinition {
-                // Native pi: `alt+v` on Windows, `ctrl+v` elsewhere. rpi keeps
+                // Upstream: `alt+v` on Windows, `ctrl+v` elsewhere. rpi keeps
                 // `ctrl+v` on Windows too — its clipboard *text* fallback
                 // (crossterm never emits `Event::Paste` on the Windows console)
                 // rides the same binding, so native's key is added, not swapped.
@@ -248,7 +248,7 @@ impl Keybindings {
         map.insert(
             "app.suspend",
             KeybindingDefinition {
-                // Native pi binds no key on Windows at all.
+                // Upstream binds no key on Windows at all.
                 default_keys: if cfg!(windows) {
                     vec![]
                 } else {
@@ -260,7 +260,7 @@ impl Keybindings {
         map.insert(
             "app.message.followUp",
             KeybindingDefinition {
-                // Native pi: `ctrl+q` on Windows, `alt+enter` elsewhere. rpi
+                // Upstream: `ctrl+q` on Windows, `alt+enter` elsewhere. rpi
                 // keeps `alt+enter` on Windows as well (it already worked) and
                 // adds native's key alongside it.
                 default_keys: if cfg!(windows) {
@@ -277,7 +277,7 @@ impl Keybindings {
         map.insert(
             "app.message.dequeue",
             KeybindingDefinition {
-                // Native pi: `alt+q` on Windows, `alt+up` elsewhere.
+                // Upstream: `alt+q` on Windows, `alt+up` elsewhere.
                 default_keys: vec![if cfg!(windows) {
                     KeyCombo::new(Char('q'), M::ALT)
                 } else {

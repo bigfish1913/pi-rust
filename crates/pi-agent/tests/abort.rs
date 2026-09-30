@@ -197,7 +197,7 @@ async fn abort_during_tool_unblocks_and_settles() {
 
     // A steering message entered while the blocking tool was active must be
     // drained after cancellation so it is retained in the returned context,
-    // matching native Pi's post-tool drain ordering.
+    // matching upstream's post-tool drain ordering.
     let delivered = Arc::new(AtomicBool::new(false));
     let delivered_for_hook = Arc::clone(&delivered);
     let token_for_hook = token.clone();

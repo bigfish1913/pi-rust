@@ -797,7 +797,7 @@ impl StepAttemptRecord {
 ///
 /// Frames are **progress, not history**: they live on the record stream rather
 /// than the branch, so they can never appear in the branch path the model's
-/// context is built from. Mirrors native pi's `pendingAssistantFrames` list
+/// context is built from. Mirrors upstream's `pendingAssistantFrames` list
 /// storage, adapted to rpi's append-only record log — see
 /// `docs/llm-repetition-forensics.md` §十一.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

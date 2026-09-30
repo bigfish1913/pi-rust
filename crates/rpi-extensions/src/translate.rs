@@ -1132,8 +1132,7 @@ mod tests {
 
     /// Handler that claims the event unless `CLAIM_ROUTING` says otherwise.
     /// `CLAIM_ROUTING` is global because an `extern "C" fn` cannot capture.
-    static CLAIM_ROUTING: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(true);
+    static CLAIM_ROUTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
     extern "C" fn claiming_handler(ev: StablePluginEvent, _ud: *mut std::ffi::c_void) -> i32 {
         // The payload must be readable as a data event (this is also what
@@ -1208,7 +1207,11 @@ mod tests {
 
         EDITOR_CHANGE_SEEN.store(false, Ordering::SeqCst);
         assert!(
-            dispatch_data_event(&snap, EventTag::EditorChange, r#"{"chars":4,"empty":false}"#),
+            dispatch_data_event(
+                &snap,
+                EventTag::EditorChange,
+                r#"{"chars":4,"empty":false}"#
+            ),
             "a subscribed handler must be invoked"
         );
         assert!(

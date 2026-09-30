@@ -1,7 +1,7 @@
 //! Image processing tool for the agent.
 //!
 //! Provides image processing capabilities: resize, convert, and get info.
-//! Mirrors the image processing utilities from native Pi.
+//! Mirrors the image processing utilities from upstream.
 
 use std::sync::Arc;
 

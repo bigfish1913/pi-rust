@@ -1,6 +1,6 @@
 //! Binary protocol codec: frame + CBOR encode/decode of protocol messages.
 //!
-//! Port of native Pi's `packages/protocol/src/codec.ts`. Wraps the framing and
+//! Port of the upstream `packages/protocol/` module.
 //! CBOR layers so callers send/receive `serde_json::Value` protocol messages
 //! over a length-prefixed CBOR stream.
 

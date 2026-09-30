@@ -370,12 +370,7 @@ impl ExtensionRegistry {
     /// plugin receives presses/releases through its `Input` event handler and
     /// decides what to do. The host uses this list only to know which keys are
     /// claimed, so it can route them to extensions instead of the editor.
-    pub fn register_shortcut(
-        &mut self,
-        plugin: String,
-        key: String,
-        description: String,
-    ) -> bool {
+    pub fn register_shortcut(&mut self, plugin: String, key: String, description: String) -> bool {
         if self.shortcuts.iter().any(|s| s.key == key) {
             return true;
         }
@@ -596,7 +591,11 @@ impl ExtensionRegistry {
             self.flags.push(flag);
         }
         for shortcut in other.shortcuts.drain(..) {
-            if self.shortcuts.iter().any(|existing| existing.key == shortcut.key) {
+            if self
+                .shortcuts
+                .iter()
+                .any(|existing| existing.key == shortcut.key)
+            {
                 continue;
             }
             self.shortcuts.push(shortcut);

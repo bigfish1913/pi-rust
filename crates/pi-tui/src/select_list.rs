@@ -24,7 +24,7 @@ pub struct SelectItem {
     pub description: Option<String>,
     /// Optional extra text used ONLY by fuzzy filtering. Lets a searchable
     /// selector match on the display name, provider, or a qualified id while
-    /// `value` stays the stable selection key (native pi's
+    /// `value` stays the stable selection key (upstream's
     /// `getModelSelectorSearchText`). Falls back to `value` when unset.
     pub search_text: Option<String>,
 }

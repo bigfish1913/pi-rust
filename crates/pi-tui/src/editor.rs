@@ -139,12 +139,12 @@ fn paste_marker_len_ending_at(line: &str, end: usize) -> usize {
     0
 }
 
-/// A paste folds when it exceeds either threshold (native pi's `handlePaste`).
+/// A paste folds when it exceeds either threshold (upstream's `handlePaste`).
 const PASTE_FOLD_LINE_THRESHOLD: usize = 10;
 const PASTE_FOLD_CHAR_THRESHOLD: usize = 1000;
 
 /// Replace every `[paste #id …]` marker in `document` with its stashed body
-/// (native pi's `expandPasteMarkers`). Markers whose id is absent from
+/// (upstream's `expandPasteMarkers`). Markers whose id is absent from
 /// `pastes` are left as-is so a stray marker never silently vanishes.
 fn expand_paste_markers(document: &str, pastes: &HashMap<u32, PasteEntry>) -> String {
     if pastes.is_empty() || !document.contains("[paste #") {
@@ -162,7 +162,7 @@ fn expand_paste_markers(document: &str, pastes: &HashMap<u32, PasteEntry>) -> St
 }
 
 /// Decode the kitty CSI-u form a client may emit for `Ctrl+<letter>`
-/// (`ESC[<code>;5u`), which native pi decodes before folding
+/// (`ESC[<code>;5u`), which upstream decodes before folding
 /// (`handlePaste`). Scalars that are not a `Ctrl+letter` chord are left as-is.
 fn decode_csi_u_ctrl(text: &str) -> String {
     if !text.contains("\x1b[") {
@@ -269,7 +269,7 @@ pub struct Editor {
     /// The next character input consumes it instead of inserting.
     jump_mode: Mutex<Option<i32>>,
     /// Explicit top/bottom border color. `None` ⇒ the theme's default border
-    /// color. Native pi's `editor.borderColor` (used for bash mode and thinking
+    /// color. Upstream's `editor.borderColor` (used for bash mode and thinking
     /// levels via `updateEditorBorderColor`).
     border_color: Mutex<Option<Color>>,
     /// Working indicator text shown inside the top border. `None` means idle.
@@ -277,9 +277,9 @@ pub struct Editor {
     /// instead of plain `─` characters (pi's working-inside-input-border style).
     working: Mutex<Option<WorkingState>>,
     /// Folded pastes: `id -> content`, referenced by a `[paste #id …]` marker
-    /// in `state.lines`. Mirrors native pi's `pastes` map.
+    /// in `state.lines`. Mirrors upstream's `pastes` map.
     pastes: Mutex<HashMap<u32, PasteEntry>>,
-    /// Monotonic id source for [`Self::pastes`] (native pi's `pasteCounter`).
+    /// Monotonic id source for [`Self::pastes`] (upstream's `pasteCounter`).
     paste_counter: Mutex<u32>,
 }
 
@@ -360,7 +360,7 @@ impl Editor {
             state.cursor_col = 0;
         }
         // A programmatic replacement discards any folded pastes: the new text
-        // is the whole truth (mirrors native pi's `setText` clearing `pastes`).
+        // is the whole truth (mirrors upstream's `setText` clearing `pastes`).
         self.reset_pastes();
         // Mirrors native `setTextInternal`: programmatic replacement is a change.
         self.notify_change();
@@ -378,7 +378,7 @@ impl Editor {
             .unwrap_or_default()
     }
 
-    /// Get the text content **with folded pastes expanded** (native pi's
+    /// Get the text content **with folded pastes expanded** (upstream's
     /// `getExpandedText`): every `[paste #id …]` marker is replaced by the full
     /// pasted body. Submission, the external editor and extension reads all go
     /// through here so a folded paste is never sent truncated.
@@ -410,7 +410,7 @@ impl Editor {
     }
 
     /// Drop a folded paste and renumber the higher ids down by one so the
-    /// markers left in the document stay contiguous (native pi renumbers in
+    /// markers left in the document stay contiguous (upstream renumbers in
     /// `handleBackspace`). Also rewrites the surviving markers in place.
     fn remove_paste(&self, id: u32) {
         {
@@ -451,19 +451,19 @@ impl Editor {
 
     /// Fold a pasted block: short pastes are inserted verbatim; a block over
     /// the size threshold is stashed and replaced by a `[paste #id …]` marker
-    /// so the input box stays readable. Mirrors native pi's `handlePaste`
+    /// so the input box stays readable. Mirrors upstream's `handlePaste`
     /// (fold when `>10` lines or `>1000` chars).
     ///
     /// A single-line pasted file path is special-cased by the caller (image
     /// attachment), so this only handles text.
     pub fn handle_paste(&self, text: &str) {
         // Decode the CSI-u `Ctrl+<letter>` form a client may hand us, and
-        // normalize line endings + tabs (native pi's `normalizeText`).
+        // normalize line endings + tabs (upstream's `normalizeText`).
         let decoded = decode_csi_u_ctrl(text)
             .replace("\r\n", "\n")
             .replace('\r', "\n")
             .replace('\t', "    ");
-        // Drop control characters, keeping newlines (native pi filters
+        // Drop control characters, keeping newlines (upstream filters
         // `char === "\n" || char.charCodeAt(0) >= 32`).
         let filtered: String = decoded
             .chars()
@@ -514,7 +514,7 @@ impl Editor {
             state.selection_anchor = None;
         }
         self.reset_pastes();
-        // Native pi's editor notifies change observers for programmatic clears
+        // Upstream's editor notifies change observers for programmatic clears
         // (`setTextInternal`), so derived UI state (bash-mode border color,
         // autocomplete) drops the stale draft. `submit()` relies on this to
         // reset the border after routing a `!command`.
@@ -1156,7 +1156,7 @@ impl Editor {
     }
 
     /// Set an explicit top/bottom border color. `None` restores the theme's
-    /// default border color. Mirrors native pi's `editor.borderColor`.
+    /// default border color. Mirrors upstream's `editor.borderColor`.
     pub fn set_border_color(&self, color: Option<Color>) {
         if let Ok(mut guard) = self.border_color.lock() {
             *guard = color;
@@ -1632,14 +1632,14 @@ mod tests {
     #[test]
     fn working_spinner_uses_native_pi_frames_and_cadence() {
         // The editor used to hand-copy the frame list and drifted (`⠘` where
-        // native pi has `⠙`), so the two indicators animated differently. Both
+        // upstream has `⠙`), so the two indicators animated differently. Both
         // now share `SPINNER_FRAMES`.
         assert_eq!(crate::loader::SPINNER_FRAMES.len(), 10);
         assert_eq!(
             crate::loader::SPINNER_FRAMES.iter().collect::<String>(),
             "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
         );
-        // 10 frames at 80ms = the 800ms full cycle native pi animates at.
+        // 10 frames at 80ms = the 800ms full cycle upstream animates at.
         assert_eq!(crate::loader::SPINNER_FRAME_MS, 80);
 
         // The rendered indicator steps through exactly that list, in order.
@@ -1662,7 +1662,7 @@ mod tests {
             seen.push(spinner_of(&editor.render(60)[0]).expect("a spinner glyph"));
         }
         // The snapshot is taken before the advance, so the first paint shows
-        // frame 0 — exactly native pi, whose `start()` paints frame 0 and then
+        // frame 0 — exactly upstream, whose `start()` paints frame 0 and then
         // steps on each interval. Ten paints therefore cover the whole cycle in
         // order and wrap back to the start.
         let expected: Vec<char> = crate::loader::SPINNER_FRAMES.to_vec();
@@ -1680,13 +1680,13 @@ mod tests {
         // repainting. This is the property the tick task relies on: it only
         // requests a repaint, and the repaint advances exactly one frame. The
         // tick used to *also* advance the frame, which made the idle spinner
-        // run at 40ms/frame — twice native pi's rate.
+        // run at 40ms/frame — twice upstream's rate.
         use crate::component::Component;
         assert_eq!(crate::loader::SPINNER_FRAME_MS, 80);
         assert_eq!(
             crate::loader::SPINNER_FRAME_MS * crate::loader::SPINNER_FRAMES.len() as u64,
             800,
-            "a full cycle should take 800ms, like native pi"
+            "a full cycle should take 800ms, like upstream"
         );
 
         let editor = Editor::simple();
@@ -1732,7 +1732,7 @@ mod tests {
 
     #[test]
     fn clear_and_set_text_notify_change_observers() {
-        // Native pi's `setTextInternal` fires onChange for programmatic edits;
+        // Upstream's `setTextInternal` fires onChange for programmatic edits;
         // the bash-mode border and autocomplete rely on it to drop stale state.
         use std::sync::atomic::{AtomicUsize, Ordering};
         let calls = Arc::new(AtomicUsize::new(0));
@@ -2239,7 +2239,7 @@ l12",
         assert_eq!(editor.get_text(), "a\nb");
     }
 
-    // ---- Folded pastes (native pi `handlePaste` / `expandPasteMarkers`) ----
+    // ---- Folded pastes (upstream `handlePaste` / `expandPasteMarkers`) ----
 
     #[test]
     fn short_paste_is_inserted_verbatim() {
@@ -2394,7 +2394,7 @@ l12",
 
     #[test]
     fn csi_u_ctrl_sequences_decode_then_drop_like_native_pi() {
-        // `ESC[104;5u` is kitty CSI-u for Ctrl+H. Native pi decodes it to the
+        // `ESC[104;5u` is kitty CSI-u for Ctrl+H. Upstream decodes it to the
         // control char (104 - 96 = 8) and then its `charCode >= 32` filter
         // drops it, so a stream of them folds to nothing.
         let editor = Editor::simple();

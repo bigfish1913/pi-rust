@@ -1046,9 +1046,8 @@ mod tests {
         let mailbox = bridge.editor_text_mailbox();
         let user_data = Arc::as_ptr(&bridge) as *mut c_void;
 
-        let args_ref = StbStringRef::from_str(
-            r#"{"text":"from voice","mode":"append","autoSendMs":2000}"#,
-        );
+        let args_ref =
+            StbStringRef::from_str(r#"{"text":"from voice","mode":"append","autoSendMs":2000}"#);
         let mut out = StbString::empty();
         let rc = trampoline_runtime_action(
             RuntimeActionId::SetEditorText.into(),

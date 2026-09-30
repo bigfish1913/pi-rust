@@ -135,7 +135,7 @@ impl Default for ThemeColors {
             md_heading: Color::Ansi256(179),  // gold (#f0c674) ≈ 179
             md_link: Color::Ansi256(110),     // blue (#81a2be) ≈ 110
             md_link_url: Color::Ansi256(242), // dimGray
-            md_code: Color::Rgb(138, 190, 183), // native pi accent #8abeb7
+            md_code: Color::Rgb(138, 190, 183), // upstream accent #8abeb7
             md_code_bg: Color::Rgb(48, 52, 59), // subtle inline chip
             md_code_block: Color::Rgb(212, 212, 212), // neutral code text
             md_code_block_bg: Color::Rgb(40, 44, 52), // One Dark #282c34
@@ -328,7 +328,7 @@ pub struct ThemeManager {
 ///
 /// Components that memoize rendered output (which bakes in theme colors) key
 /// their cache on this value, so a live theme switch invalidates them without
-/// every host having to walk the tree and call `invalidate` (native pi's
+/// every host having to walk the tree and call `invalidate` (upstream's
 /// `theme-controller.ts` does both: swap the palette and `ui.invalidate()`).
 static THEME_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 

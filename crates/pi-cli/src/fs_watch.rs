@@ -1,6 +1,6 @@
 //! Lightweight file watching for live reload.
 //!
-//! Port of native Pi's `packages/coding-agent/src/utils/fs-watch.ts`. Native pi
+//! Port of the upstream `packages/coding-agent/src/utils/fs-watch.ts`.
 //! uses Node's `fs.watch` with a retry-on-error wrapper to (a) keep the git
 //! footer's branch/status fresh and (b) hot-reload the active theme file.
 //!

@@ -810,7 +810,7 @@ async fn run_budget_stops_a_looping_run_and_records_why() {
     // A model that never stops asking for tools: far more scripted turns than
     // the ceiling, so only the guard can end this run.
     //
-    // The guard is off by default (native pi parity), so this test opts in for
+    // The guard is off by default (upstream parity), so this test opts in for
     // its duration. `std::env` is process-global — this is an integration-test
     // binary whose other tests never approach the ceiling, so a parallel
     // harness picking it up is harmless; the value is restored at the end.
@@ -914,7 +914,7 @@ async fn run_budget_stops_a_looping_run_and_records_why() {
     );
 }
 
-/// Native pi parity: with no `RPI_MAX_TURNS_PER_RUN`, a run has **no** turn
+/// Upstream parity: with no `RPI_MAX_TURNS_PER_RUN`, a run has **no** turn
 /// ceiling — it ends only because the model stopped asking for tools. This is
 /// the counterpart of the opt-in test above: it fails if anyone re-enables the
 /// guard by default.
@@ -2475,7 +2475,7 @@ async fn a_run_that_keeps_dying_is_not_resumed_forever() {
 /// assistant message — which Anthropic rejects outright (and `pi-agent`'s own
 /// `run_agent_loop_continue` refuses for the same reason, see `agent_loop.rs`).
 /// The run therefore ends with the salvaged partial and the user decides what is
-/// next; that is also what native pi does, because an errored assistant response
+/// next; that is also what upstream does, because an errored assistant response
 /// finishes the turn rather than asking for another one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_crash_mid_stream_is_not_auto_resumed() {
@@ -3680,7 +3680,7 @@ async fn an_injected_steering_message_survives_a_crash() {
 
 /// A crash before the first provider call must still continue the run.
 ///
-/// This is native pi's `starting` state: the operation opened and the prompt was
+/// This is upstream's `starting` state: the operation opened and the prompt was
 /// persisted, then the process died before anything was asked. The branch tip is
 /// still the prompt, so the run has produced nothing and should simply continue —
 /// the user does not need to retype what they already sent.
@@ -3752,7 +3752,7 @@ async fn a_crash_before_the_first_request_still_continues() {
 /// A deferred provider response suspends the run, and resuming it finishes the
 /// work — including executing tool calls that arrived *from the poll*.
 ///
-/// This is the shape native pi's `assistant.effect_pending` / `deferred.*` states
+/// This is the shape upstream's `assistant.effect_pending` / `deferred.*` states
 /// cover: the provider answers "not yet, poll this handle later" instead of a
 /// message. The run must stay suspended (its operation open) rather than be
 /// reported as finished, and on resume the polled assistant message's tool calls

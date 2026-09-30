@@ -1,6 +1,6 @@
 # pi-rust architecture
 
-A Rust port of [earendil-works/pi](https://github.com/earendil-works/pi)'s SDK layers. The goal stated by the user: **no CLI for now — a library that makes it easy to build your own agent in Rust.** A `pi-cli` crate is reserved for later (the user noted "后续也会构建 cli"), so the workspace is shaped to receive it as just another crate on top.
+A Rust coding-agent stack, layered so each crate stays small and testable. The workspace is shaped so a CLI crate can sit on top of the library crates without pulling the libraries toward CLI concerns.
 
 ## 1. What the TypeScript Pi SDK actually is
 

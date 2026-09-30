@@ -13,7 +13,7 @@ pub struct Text {
     padding_y: usize,
     /// Render cache keyed by (content, width). A finalized `Text` row is
     /// re-rendered on every repaint of a long transcript; caching the wrapped
-    /// lines keeps that cheap. Mirrors native pi `Text.cachedText/cachedLines`.
+    /// lines keeps that cheap. Mirrors upstream `Text.cachedText/cachedLines`.
     cache: Mutex<Option<TextCache>>,
 }
 

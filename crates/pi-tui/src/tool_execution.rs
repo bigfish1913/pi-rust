@@ -76,7 +76,7 @@ pub struct ToolExecutionComponent {
     /// elapsed timer), so its rendered lines are memoized by width; the
     /// revision drops the cache when args/result/expand change.
     revision: AtomicU64,
-    /// Memoized render of a `Completed`/`Failed` panel. Mirrors native pi's
+    /// Memoized render of a `Completed`/`Failed` panel. Mirrors upstream's
     /// per-component render cache (`tool-execution.ts` + `layout.ts
     /// renderCached`), which is what keeps a transcript repaint from
     /// re-rendering every finished tool panel.
@@ -242,7 +242,7 @@ impl Component for ToolExecutionComponent {
 
         // A finished panel is immutable; a running/pending one has a live
         // elapsed timer and may still stream, so only the finished states are
-        // memoized. (Mirrors native pi's width-keyed cache, gated on the
+        // memoized. (Mirrors upstream's width-keyed cache, gated on the
         // elapsed readout no longer advancing.)
         let finished = matches!(status, ToolStatus::Completed | ToolStatus::Failed);
         if finished {
@@ -531,7 +531,7 @@ fn render_skill(
 ) -> Vec<String> {
     let bg = colors.custom_message_bg;
     let label = crate::ansi::bold("[skill]");
-    // Native Pi's `Box(1, 1, bg)` — one column of horizontal padding on each
+    // Upstream's `Box(1, 1, bg)` — one column of horizontal padding on each
     // side, one blank background row top and bottom.
     let pad = " ";
     let mut out: Vec<String> = Vec::new();
@@ -553,7 +553,7 @@ fn render_skill(
     }
 
     // Expanded: `[skill]` label, then a single markdown block whose first
-    // paragraph is the bold skill name (native Pi renders
+    // paragraph is the bold skill name (upstream renders
     // `**${name}**\n\n${content}` as one Markdown child), so the body keeps
     // its normal markdown colors on the custom-message background.
     out.push(apply_background_to_line(
@@ -586,7 +586,7 @@ fn render_skill(
 }
 
 /// Strip a leading YAML frontmatter block (`---\n...\n---`) from skill file
-/// content. Native Pi's skill block carries the frontmatter-stripped body
+/// content. Upstream's skill block carries the frontmatter-stripped body
 /// (`parseSkillBlock` reads the `<skill>` payload, not the raw file), so the
 /// expanded box shows the same instructions the model received.
 fn strip_frontmatter(content: &str) -> &str {
@@ -1215,7 +1215,7 @@ mod tests {
     /// The header summarizes the args JSON into a compact signature instead
     /// of dumping the raw `{"path":"..."}` blob. Each builtin tool maps its
     /// key fields to a one-liner.
-    /// A `read` of a `SKILL.md` renders as native Pi's `[skill] <name>`
+    /// A `read` of a `SKILL.md` renders as upstream's `[skill] <name>`
     /// invocation box: custom-message background, one collapsed line with an
     /// expand hint, and (when expanded) the frontmatter-stripped skill body.
     #[test]
@@ -1250,7 +1250,7 @@ mod tests {
             plain.contains("Do the thing."),
             "expanded body missing: {plain}"
         );
-        // Frontmatter is stripped (native Pi shows the parsed skill body only).
+        // Frontmatter is stripped (upstream shows the parsed skill body only).
         assert!(
             !plain.contains("name: release"),
             "frontmatter leaked: {plain}"

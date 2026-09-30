@@ -1,6 +1,6 @@
 //! Changelog fetching and parsing.
 //!
-//! Port of native Pi's `packages/coding-agent/src/utils/changelog.ts`. Native pi
+//! Port of the upstream changelog utility.
 //! reads a local `CHANGELOG.md` when present and can otherwise fetch it from
 //! GitHub. rpi keeps the same split: parse a local/remote markdown changelog into
 //! versioned entries.
@@ -20,9 +20,9 @@ pub struct ChangelogEntry {
     pub content: String,
 }
 
-/// Default remote changelog URL (native `GITHUB_REPO`).
+/// Default remote changelog URL. Overridable via `RPI_CHANGELOG_URL`.
 pub const DEFAULT_CHANGELOG_URL: &str =
-    "https://raw.githubusercontent.com/earendil-works/pi/main/CHANGELOG.md";
+    "https://raw.githubusercontent.com/bigfish1913/pi-rust/main/CHANGELOG.md";
 
 /// The remote changelog URL to use, honoring `RPI_CHANGELOG_URL`.
 pub fn changelog_url() -> String {

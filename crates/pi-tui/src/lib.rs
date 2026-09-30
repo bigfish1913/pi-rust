@@ -11,7 +11,6 @@
 
 pub mod alt_screen_search;
 pub mod ansi;
-pub mod armin;
 pub mod assistant_message;
 pub mod autocomplete;
 pub mod bash_execution;
@@ -22,7 +21,6 @@ pub mod container;
 pub mod countdown_timer;
 pub mod diff;
 pub mod dynamic_border;
-pub mod earendil;
 pub mod editor;
 pub mod footer;
 pub mod fuzzy;
@@ -70,7 +68,6 @@ pub mod word_navigation;
 // Re-export main types
 pub use alt_screen_search::{AltScreenSearch, SearchMatch, SearchState};
 pub use ansi::{bold, strip_ansi, visible_width, CURSOR_MARKER};
-pub use armin::ArminComponent;
 pub use assistant_message::{AssistantBlock, AssistantMessageComponent, AssistantMessageOptions};
 pub use autocomplete::{
     AutocompleteItem, AutocompleteManager, AutocompleteProvider, AutocompleteSuggestions,
@@ -85,7 +82,6 @@ pub use container::Container;
 pub use countdown_timer::CountdownTimer;
 pub use diff::render_diff;
 pub use dynamic_border::DynamicBorder;
-pub use earendil::EarendilAnnouncementComponent;
 pub use editor::{Editor, EditorOptions, EditorStyle, WorkingState};
 pub use footer::FooterComponent;
 pub use fuzzy::{fuzzy_filter, fuzzy_match, FuzzyMatch};

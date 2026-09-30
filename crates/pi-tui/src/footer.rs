@@ -3,7 +3,7 @@
 //! Based on TypeScript implementation:
 //! `packages/coding-agent/src/modes/interactive/components/footer.ts`.
 //!
-//! Native pi's footer is a two-line status bar:
+//! Upstream's footer is a two-line status bar:
 //!
 //! ```text
 //! ~/proj/pi-rust (main) • my-session
@@ -353,7 +353,7 @@ impl FooterComponent {
             parts.push(format!("${:.3}", usage.cost));
         }
 
-        // Context usage: colorized by pressure like native pi.
+        // Context usage: colorized by pressure like upstream.
         let auto_indicator = if auto { " (auto)" } else { "" };
         let context_display = match context_percent {
             Some(p) => format!("{p:.1}%/{}{auto_indicator}", format_tokens(context_window)),

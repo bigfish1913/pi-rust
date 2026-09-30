@@ -1,57 +1,12 @@
-//! Extras & easter-egg wiring — thin host wrappers over the rpi-tui components.
+//! First-launch setup banner — thin host wrapper over the rpi-tui components.
 //!
-//! Hosts the chat-container push helpers for the armin XBM art and the earendil
-//! announcement, plus the first-time-setup sentinel logic. These are the
-//! `interactive_tui.rs`-side glue (`/armin`, `/earendil`, and the first-launch
-//! gate) that depend on `rpi_tui::Container` + `Arc` — kept out of the library
-//! crate so rpi-tui stays cli-free (project constraint).
+//! Kept out of the library crate so rpi-tui stays cli-free (project constraint).
 
 use std::sync::Arc;
 
-use rpi_tui::{ArminComponent, Container, EarendilAnnouncementComponent, Spacer};
+use rpi_tui::Container;
 
 use crate::config;
-
-/// Push the armin XBM art block (+ a trailing spacer) into the chat transcript.
-/// Triggered by `/armin`.
-pub fn add_armin(chat: &Arc<Container>) {
-    chat.add_child(Arc::new(ArminComponent::new()));
-    chat.add_child(Arc::new(Spacer::new(1)));
-}
-
-/// Push the earendil announcement block (+ a trailing spacer) into the chat
-/// transcript, and mark it seen via the `~/.rpi/agent/.earendil_seen` sentinel.
-/// Triggered by `/earendil` or the first-launch gate.
-pub fn add_earendil(chat: &Arc<Container>) {
-    chat.add_child(Arc::new(EarendilAnnouncementComponent::new()));
-    chat.add_child(Arc::new(Spacer::new(1)));
-    let _ = mark_earendil_seen();
-}
-
-/// Path of the "earendil announcement seen" sentinel, under the agent dir
-/// (`~/.rpi/agent/.earendil_seen`). Delegates to [`config::agent_dir`] so an
-/// `RPI_CODING_AGENT_DIR` override is honored (the old `rpi_dir()` ignored it).
-/// Returns `None` when the home dir can't be resolved.
-pub fn earendil_seen_path() -> Option<std::path::PathBuf> {
-    config::agent_dir().ok().map(|d| d.join(".earendil_seen"))
-}
-
-/// Whether the earendil announcement has already been shown (sentinel present).
-pub fn earendil_seen() -> bool {
-    earendil_seen_path().map(|p| p.exists()).unwrap_or(false)
-}
-
-/// Write the `~/.rpi/agent/.earendil_seen` sentinel so the announcement isn't
-/// shown again on later launches. Best-effort: a missing agent dir is created.
-fn mark_earendil_seen() -> std::io::Result<()> {
-    let path = earendil_seen_path().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "no home dir for .rpi/agent")
-    })?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&path, b"1")
-}
 
 /// Path of the "first-time setup done" sentinel, under the agent dir
 /// (`~/.rpi/agent/.setup_done`).
@@ -75,11 +30,8 @@ pub fn mark_setup_done() -> std::io::Result<()> {
     std::fs::write(&path, b"1")
 }
 
-/// If first-time setup hasn't run yet, show a brief setup note + the earendil
-/// announcement in the chat container. The TS original is a multi-step dialog
-/// (theme picker, analytics opt-in); this v1 simplifies to a one-shot banner
-/// + the theme remains pickable via `/theme`. Analytics is deferred (no
-/// telemetry wiring). Returns `true` if anything was shown.
+/// If first-time setup hasn't run yet, show a brief setup note in the chat
+/// container. Returns `true` if anything was shown.
 pub fn maybe_first_time_setup(chat: &Arc<Container>) -> bool {
     use rpi_tui::Component;
     use rpi_tui::{DynamicBorder, Spacer, Text};
@@ -89,7 +41,6 @@ pub fn maybe_first_time_setup(chat: &Arc<Container>) -> bool {
     let accent = rpi_tui::theme().colors.accent;
     let muted = rpi_tui::theme().colors.muted;
     let border = DynamicBorder::with_color(accent);
-    // Use the Component trait method explicitly for the border/Text render.
     let mut lines: Vec<String> = Vec::new();
     lines.extend(border.render(80));
     lines.push(format!(
@@ -109,7 +60,6 @@ pub fn maybe_first_time_setup(chat: &Arc<Container>) -> bool {
         chat.add_child(Arc::new(Text::new(line, 1, 0)));
     }
     chat.add_child(Arc::new(Spacer::new(1)));
-    add_earendil(chat);
     let _ = mark_setup_done();
     true
 }
@@ -123,38 +73,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_add_armin_pushes_component() {
-        let chat = Arc::new(Container::new());
-        let before = chat.child_count();
-        add_armin(&chat);
-        assert_eq!(chat.child_count(), before + 2); // component + spacer
-    }
-
-    #[test]
-    fn test_add_earendil_pushes_component() {
-        let chat = Arc::new(Container::new());
-        let before = chat.child_count();
-        add_earendil(&chat);
-        assert_eq!(chat.child_count(), before + 2);
-    }
-
-    #[test]
     fn test_sentinel_paths_under_agent_dir() {
-        // The sentinels live directly under the resolved agent dir and honor
+        // The sentinel lives directly under the resolved agent dir and honors
         // the `RPI_CODING_AGENT_DIR` override (delegated to `config::agent_dir`).
-        // With the override set, agent_dir() returns the override verbatim, so
-        // the sentinel's parent must equal agent_dir() — not end in a literal
-        // "agent" segment (that only holds for the default nested path).
         let _guard = crate::config::test_support::env_lock().lock().unwrap();
         let prev = std::env::var_os(crate::config::CONFIG_DIR_ENV);
         let tmp = tempfile::TempDir::new().unwrap();
         std::env::set_var(crate::config::CONFIG_DIR_ENV, tmp.path());
         let agent = crate::config::agent_dir().unwrap();
         assert_eq!(agent.as_path(), tmp.path());
-        if let Some(p) = earendil_seen_path() {
-            assert!(p.ends_with(".earendil_seen"));
-            assert_eq!(p.parent().unwrap(), agent);
-        }
         if let Some(p) = setup_done_path() {
             assert!(p.ends_with(".setup_done"));
             assert_eq!(p.parent().unwrap(), agent);

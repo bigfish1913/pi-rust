@@ -225,12 +225,12 @@ rpi 会优先使用 rpi 自己的目录，同时兼容原 Pi 的 `.pi` 布局：
 │   ├── themes/
 │   ├── extensions/
 │   └── packages/
-└── .pi/                 # 兼容旧 Pi 项目
+└── .rpi/                 # 项目资源目录
 ```
 
 项目 `.rpi` 优先于项目 `.pi`。全局资源默认位于 `~/.rpi/agent/`，包括 `settings.json`、`models.json`、`skills/`、`prompts/`、`themes/`、`extensions/` 和 `packages/`。同名资源发生冲突时，项目资源优先于全局资源，`.rpi` 优先于 `.pi`。
 
-项目级 `.rpi/settings.json`（兼容 `.pi/settings.json`）可以追加资源目录和 package：
+项目级 `.rpi/settings.json` 可以追加资源目录：
 
 ```json
 {
@@ -367,7 +367,7 @@ rpi-plugin-sdk → rpi-extensions → rpi-tui → rpi-cli
 - 在线文档：<https://rpi.laofu.online/docs.html>
 - 源码仓库：<https://github.com/bigfish1913/pi-rust>
 - Rust API：<https://docs.rs/rpi-agent>、<https://docs.rs/rpi-plugin-sdk>
-- Pi 参考实现：<https://github.com/earendil-works/pi>
+
 - Package 与扩展作者指南：<https://rpi.laofu.online/extension-authoring.md>
 - 远程模式：<docs/remote-mode.md>
 - Rust 扩展与 agent 调试：`rpi` 内 `docs` 工具的 `debugging` 主题

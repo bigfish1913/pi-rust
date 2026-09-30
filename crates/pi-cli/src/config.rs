@@ -1,8 +1,7 @@
 //! # Layout
 //!
-//! Mirrors upstream's nested layout, so a `~/.pi/agent/` directory can be
-//! copied to `~/.rpi/agent/` (or pointed at via `RPI_CODING_AGENT_DIR`) and
-//! "just works". The `agent/` layer matches pi's `getAgentDir()`:
+//! Uses a nested layout: a `~/.rpi/agent/` directory (or one pointed at via
+//! `RPI_CODING_AGENT_DIR`) "just works":
 //!
 //! ```text
 //! ~/.rpi/                 (RPI_CODING_AGENT_DIR env overrides the agent/ dir)
@@ -12,7 +11,6 @@
 //!     ├── settings.json   # saved default provider/model/thinking + theme
 //!     ├── trust.json      # per-cwd project trust decisions (read-only parity)
 //!     ├── .setup_done     # first-time-setup sentinel (extras.rs)
-//!     └── .earendil_seen  # earendil-announcement sentinel (extras.rs)
 //! ```
 //!
 //! Flat-installed `~/.rpi/{auth.json,models.json}` from older rpi releases are
@@ -41,12 +39,11 @@ use std::path::{Path, PathBuf};
 
 use rpi_ai::{Api, InputModality, Model, StreamingProtocolCompat};
 
-/// The config directory name under the home dir. Upstream is `.pi`; rpi uses
-/// `.rpi` to avoid colliding with a native `pi` install on the same machine.
+/// The config directory name under the home dir.
 pub const CONFIG_DIR_NAME: &str = ".rpi";
 
-/// Env var that overrides the whole config dir (mirrors upstream
-/// `PI_CODING_AGENT_DIR`). Absolute path; relative values are rejected.
+/// Env var that overrides the whole config dir. Absolute path; relative
+/// values are rejected.
 pub const CONFIG_DIR_ENV: &str = "RPI_CODING_AGENT_DIR";
 
 /// The provider id under which `rpi auth login` stores the Anthropic key.
@@ -91,9 +88,8 @@ pub enum ConfigError {
 
 /// The rpi config directory (`~/.rpi/agent` by default, `RPI_CODING_AGENT_DIR`
 /// override). Creates nothing — purely a path computation. The `agent/` layer
-/// mirrors upstream `getAgentDir()` (`join(homedir(), CONFIG_DIR_NAME, "agent")`)
-/// so a copied `~/.pi/agent/` directory reads in place. The env override points
-/// at the agent dir itself (same as pi's `PI_CODING_AGENT_DIR`).
+/// is `join(homedir(), CONFIG_DIR_NAME, "agent")`. The env override points at
+/// the agent dir itself.
 pub fn agent_dir() -> Result<PathBuf, ConfigError> {
     if let Some(val) = std::env::var_os(CONFIG_DIR_ENV) {
         let p = PathBuf::from(&val);
@@ -144,16 +140,6 @@ pub fn trust_path() -> Result<PathBuf, ConfigError> {
     Ok(agent_dir()?.join("trust.json"))
 }
 
-/// Native Pi's default agent file, used only as a read fallback when rpi's
-/// corresponding file is absent. An explicit rpi agent-dir override is an
-/// isolation boundary and therefore disables fallback reads.
-fn native_pi_agent_file(file_name: &str) -> Option<PathBuf> {
-    if std::env::var_os(CONFIG_DIR_ENV).is_some() {
-        return None;
-    }
-    dirs::home_dir().map(|home| home.join(".pi/agent").join(file_name))
-}
-
 fn read_text_with_fallback(
     primary: PathBuf,
     fallback: Option<PathBuf>,
@@ -181,7 +167,7 @@ fn read_text_with_fallback(
 }
 
 /// One-time best-effort migration of a pre-nesting flat layout
-/// (`~/.rpi/{auth.json,models.json,.setup_done,.earendil_seen}`) into the
+/// (`~/.rpi/{auth.json,models.json,.setup_done}`) into the
 /// nested `~/.rpi/agent/` layout. **No-op when `RPI_CODING_AGENT_DIR` is set**
 /// (never touch an explicit override), when the agent dir already exists, or
 /// when no flat files are present. Idempotent: a partial move resumes. Errors
@@ -201,7 +187,7 @@ pub fn migrate_legacy_layout() -> Result<usize, ConfigError> {
 }
 
 /// The core migration (no env gate): if `agent/` is absent but flat files exist
-/// under `root`, move `{auth.json,models.json,.setup_done,.earendil_seen}` into
+/// under `root`, move `{auth.json,models.json,.setup_done}` into
 /// `agent/`. Idempotent. Factored out so tests can drive it against a temp
 /// root/agent pair without touching the env (the public
 /// [`migrate_legacy_layout`] short-circuits on an env override, which tests
@@ -222,7 +208,7 @@ fn migrate_legacy_layout_in(root: &Path, agent: &Path) -> Result<usize, ConfigEr
         source: e,
     })?;
     let mut moved = 0usize;
-    for leaf in ["auth.json", "models.json", ".setup_done", ".earendil_seen"] {
+    for leaf in ["auth.json", "models.json", ".setup_done"] {
         let from = root.join(leaf);
         let to = agent.join(leaf);
         if from.exists() && !to.exists() {
@@ -274,7 +260,7 @@ pub type AuthStore = BTreeMap<String, Credential>;
 /// JSON ⇒ `ConfigError::Json` (we do not silently swallow a corrupt auth file).
 pub fn read_auth() -> Result<AuthStore, ConfigError> {
     let path = auth_path()?;
-    match read_text_with_fallback(path, native_pi_agent_file("auth.json"))? {
+    match read_text_with_fallback(path, None)? {
         Some((path, text)) => {
             serde_json::from_str(&text).map_err(|source| ConfigError::Json { path, source })
         }
@@ -325,7 +311,7 @@ pub fn delete_credential(provider_id: &str) -> Result<bool, ConfigError> {
 #[serde(rename_all = "camelCase")]
 pub struct ModelsConfig {
     #[serde(default)]
-    // Native Pi walks Object.entries(config.providers), so declaration order
+    // Provider entries are walked in declaration order, so declaration order
     // participates in the final available-model fallback.
     pub providers: indexmap::IndexMap<String, ProviderConfig>,
 }
@@ -382,7 +368,7 @@ pub struct ModelDefinition {
 /// Load `~/.rpi/models.json`. Missing file ⇒ empty config (no error).
 pub fn load_models_config() -> Result<ModelsConfig, ConfigError> {
     let path = models_path()?;
-    match read_text_with_fallback(path, native_pi_agent_file("models.json"))? {
+    match read_text_with_fallback(path, None)? {
         Some((path, text)) => {
             parse_models_json(&text).map_err(|source| ConfigError::Json { path, source })
         }
@@ -788,7 +774,7 @@ pub fn openai_provider_api_key(provider_id: &str, cfg: &ProviderConfig) -> Optio
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
-/// Native Pi's provider-id-to-environment-variable mapping. Provider ids are
+/// Provider-id-to-environment-variable mapping. Provider ids are
 /// identities, so aliases and case variants must not inherit another
 /// provider's credential.
 fn native_provider_api_key_env_var(provider_id: &str) -> Option<&'static str> {

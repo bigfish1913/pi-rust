@@ -28,7 +28,7 @@ pub struct UserMessageComponent {
     output_pad: usize,
     /// Prebuilt inner box (background `Box` + `Markdown`).
     ///
-    /// Native pi builds this **once** in the constructor (`user-message.ts`
+    /// Upstream builds this **once** in the constructor (`user-message.ts`
     /// `rebuild()`); rpi used to rebuild the `Box` + `Markdown` on every
     /// `render`, so the inner caches could never hit and each frame re-parsed
     /// every user message. Rebuild only on `invalidate` / `with_pad` / a theme

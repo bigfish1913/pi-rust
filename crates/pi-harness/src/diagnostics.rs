@@ -1,8 +1,8 @@
 //! Structured resource diagnostics.
 //!
-//! Port of native Pi's `packages/coding-agent/src/core/diagnostics.ts`.
+//! Port of upstream's `packages/coding-agent/src/core/diagnostics.ts`.
 //! Resource loading can surface soft problems (a skill/prompt/theme name is
-//! defined twice, a package fails to parse, …). Native Pi keeps these
+//! defined twice, a package fails to parse, …). Upstream keeps these
 //! **structured** — in particular a name collision carries both the winning and
 //! the losing path so the UI can explain *which* definition won.
 

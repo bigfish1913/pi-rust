@@ -1,8 +1,8 @@
 //! HTTP client construction: system-proxy resolution and pooled-connection
 //! idle timeout.
 //!
-//! Port of native Pi's `packages/ai/src/utils/node-http-proxy.ts` and
-//! `packages/coding-agent/src/core/http-dispatcher.ts`. Native pi routes every
+//! Port of upstream's `packages/ai/src/utils/node-http-proxy.ts` and
+//! `packages/coding-agent/src/core/http-dispatcher.ts`. Upstream routes every
 //! provider request through a shared dispatcher that:
 //!
 //! * resolves `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY` (with

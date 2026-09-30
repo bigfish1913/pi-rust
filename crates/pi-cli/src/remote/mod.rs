@@ -14,7 +14,7 @@
 //!   single source of truth.
 //! - [`framing`] / [`cbor`] / [`codec`] — the **binary** transport: 4-byte
 //!   length-prefixed frames carrying CBOR-encoded protocol messages (port of
-//!   the TS `@earendil-works/pi-protocol` package). The JSONL transport remains
+//!   the reference JSONL transport remains
 //!   the default; the binary one is available for callers that want it.
 //! - [`client`] — the TCP JSON-RPC connection to a `rpi --server` endpoint.
 //! - [`session`] — the client-side transcript + state the UI renders.

@@ -1,6 +1,6 @@
 //! Prompt-cache waste accounting.
 //!
-//! Port of native Pi's `packages/coding-agent/src/core/cache-stats.ts`.
+//! Port of upstream's `packages/coding-agent/src/core/cache-stats.ts`.
 //!
 //! Anthropic-style prompt caching is only a win when the previous turn's
 //! prompt is re-read from cache. When it isn't — because the cache expired, the

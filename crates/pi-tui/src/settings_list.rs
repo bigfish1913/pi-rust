@@ -1,7 +1,7 @@
 //! Settings list component.
 //!
 //! A list of settings with navigation and in-place value cycling. Port of
-//! native pi's `components/settings-list.ts`: Up/Down navigate, Enter (or
+//! upstream's `components/settings-list.ts`: Up/Down navigate, Enter (or
 //! Space) activates the row — cycling to the next value, or invoking the
 //! `submenu` callback for rows that open a nested selector — and Esc cancels.
 
@@ -280,7 +280,7 @@ impl SettingsList {
         }
     }
 
-    /// Set cancel callback (Esc). Native pi's `SettingsList.onCancel`.
+    /// Set cancel callback (Esc). Upstream's `SettingsList.onCancel`.
     pub fn on_cancel(&self, callback: Arc<dyn Fn() + Send + Sync>) {
         if let Ok(mut cb) = self.on_cancel.lock() {
             *cb = Some(callback);
@@ -297,7 +297,7 @@ impl SettingsList {
     }
 
     /// Activate the selected row: open its submenu, or cycle to the next value.
-    /// Mirrors native pi's `SettingsList.activateItem`.
+    /// Mirrors upstream's `SettingsList.activateItem`.
     ///
     /// Returns the new value when a value was cycled.
     pub fn activate(&self) -> Option<(String, String)> {
@@ -329,7 +329,7 @@ impl SettingsList {
     }
 
     /// Route a key: Up/Down navigate, Enter or Space activates, Esc cancels.
-    /// Mirrors native pi's `SettingsList.handleInput`.
+    /// Mirrors upstream's `SettingsList.handleInput`.
     pub fn handle_key(&self, key: KeyEvent) {
         match key.code {
             KeyCode::Up => self.move_up(),
@@ -550,7 +550,7 @@ mod tests {
         list.move_down();
         assert_eq!(list.get_selected().unwrap().key, "b");
         list.activate();
-        // Native pi keeps the cursor on the row the user just changed.
+        // Upstream keeps the cursor on the row the user just changed.
         assert_eq!(list.get_selected().unwrap().key, "b");
         assert_eq!(
             list.get_selected().unwrap().value,

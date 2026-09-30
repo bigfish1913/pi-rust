@@ -11,12 +11,12 @@ use super::component::Component;
 /// Canonical working-spinner frames, in order.
 ///
 /// Shared by [`Loader`] and the editor's working indicator so both animate
-/// identically. Mirrors native pi's `DEFAULT_FRAMES`.
+/// identically. Mirrors upstream's `DEFAULT_FRAMES`.
 ///
 /// [`Loader`]: crate::loader::Loader
 pub const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
-/// Frame interval for animated indicators. Mirrors native pi's
+/// Frame interval for animated indicators. Mirrors upstream's
 /// `DEFAULT_INTERVAL_MS`: one frame per 80 ms, i.e. a full 10-frame cycle every
 /// 800 ms.
 pub const SPINNER_FRAME_MS: u64 = 80;

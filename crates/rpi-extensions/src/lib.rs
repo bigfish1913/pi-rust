@@ -71,6 +71,7 @@ pub use actions::{
     reload_callback_from_mailbox, trampoline_runtime_action, ActionBridge, ReloadMailbox,
     RuntimeActionHost, UiDialogMailbox, UiDialogRequest,
 };
+pub use editor_text::{EditorTextEdit, EditorTextMailbox, EditorTextMode};
 pub use event_log::{event_log_path, log_handler_invocation, EventLogger};
 pub use loader::{
     load_dir, load_one, load_session, load_session_mixed, merge_registries, ExtensionSession,
@@ -85,7 +86,6 @@ pub use registry::{
     ResourcesDiscoverHandler, DEFAULT_PRIORITY,
 };
 pub use resources::{emit_resources_discover, DiscoveredResources};
-pub use editor_text::{EditorTextEdit, EditorTextMailbox, EditorTextMode};
 pub use status::ExtensionStatusMailbox;
 pub use tool::{PluginToolAdapter, PluginToolHandle, ToolCallContext};
 pub use translate::{
@@ -172,7 +172,6 @@ pub extern "C" fn host_free_string(s: StbString) {
 /// This struct is `Send + Sync` (registry is `Mutex`-guarded).
 pub struct HostApi {
     registry: Mutex<Option<ExtensionRegistry>>,
-    diagnostics: Arc<dyn PluginDiagnostics>,
     /// Display name of the plugin currently registering (from the cdylib file
     /// stem). Stamped onto every registration the plugin makes (e.g. event
     /// handlers) so host-side diagnostics can name the owning extension. Not
@@ -194,11 +193,10 @@ impl HostApi {
     pub fn new(
         name: impl Into<String>,
         registry: ExtensionRegistry,
-        diagnostics: Arc<dyn PluginDiagnostics>,
+        _diagnostics: Arc<dyn PluginDiagnostics>,
     ) -> Arc<Self> {
         Arc::new(Self {
             registry: Mutex::new(Some(registry)),
-            diagnostics,
             name: name.into(),
             action_bridge: None,
         })
@@ -219,12 +217,11 @@ impl HostApi {
     pub fn with_action_bridge(
         name: impl Into<String>,
         registry: ExtensionRegistry,
-        diagnostics: Arc<dyn PluginDiagnostics>,
+        _diagnostics: Arc<dyn PluginDiagnostics>,
         action_bridge: Arc<ActionBridge>,
     ) -> Arc<Self> {
         Arc::new(Self {
             registry: Mutex::new(Some(registry)),
-            diagnostics,
             name: name.into(),
             action_bridge: Some(action_bridge),
         })
@@ -493,9 +490,9 @@ extern "C" fn trampoline_register_shortcut(key: StbStringRef, description: StbSt
     // (dispatched by the TUI) and decides what to do. The host only needs to
     // know the key is claimed so it can route it away from the editor.
     let ok = with_current_api(|api| {
-        match api.with_registry(|reg| {
-            reg.register_shortcut(api.name().to_string(), key, description)
-        }) {
+        match api
+            .with_registry(|reg| reg.register_shortcut(api.name().to_string(), key, description))
+        {
             Some(_) => true,
             None => false,
         }

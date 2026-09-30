@@ -24,9 +24,9 @@ use crate::ansi::{visible_width, CURSOR_MARKER};
 use crate::terminal::{InputEvent, Terminal, TerminalInfo};
 
 /// Symbol for ViewportTUI capability check.
-pub const VIEWPORT_TUI: &[u8] = b"@earendil-works/pi-tui/viewport";
+pub const VIEWPORT_TUI: &[u8] = b"rpi-tui/viewport";
 
-/// Upper bound on the coalesced repaint rate, matching native pi's
+/// Upper bound on the coalesced repaint rate, matching upstream's
 /// `TuiBase.MIN_RENDER_INTERVAL_MS` (16 ms ≈ 60 fps).
 ///
 /// A provider streams one `MessageUpdate` per delta, and every delta used to
@@ -49,7 +49,7 @@ fn merge_pending_render(parked: Option<bool>, reuse_scroll_content: bool) -> Opt
     }
 }
 
-/// Coalescing render-scheduler state — the Rust port of native pi's
+/// Coalescing render-scheduler state — the Rust port of upstream's
 /// `TuiBase.{renderRequested, renderTimer, lastRenderAt}` trio.
 struct RenderSchedulerState {
     /// `None` = no frame is owed. `Some(reuse_scroll_content)` records which
@@ -57,7 +57,7 @@ struct RenderSchedulerState {
     pending: Option<bool>,
     /// Set by [`TuiAltScreen::stop`] to end the scheduler thread.
     shutdown: bool,
-    /// When the last frame was painted (native pi `lastRenderAt`).
+    /// When the last frame was painted (upstream `lastRenderAt`).
     last_render_at: Instant,
 }
 
@@ -140,7 +140,7 @@ pub struct TuiAltScreen {
     stick_to_bottom: Mutex<bool>,
     current_frame: Mutex<Option<LayoutFrame>>,
     /// When true, render into the terminal's main buffer and let the terminal
-    /// own scrollback (native pi's default `regular` mode).
+    /// own scrollback (upstream's default `regular` mode).
     main_screen_mode: Mutex<bool>,
     main_previous_width: Mutex<usize>,
     main_previous_height: Mutex<usize>,
@@ -154,7 +154,7 @@ pub struct TuiAltScreen {
     resize_handler: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     overlays: Arc<OverlayManager>,
     render_suspended: Mutex<bool>,
-    /// Coalescing render scheduler (native pi `TuiBase` frame throttle). While
+    /// Coalescing render scheduler (upstream `TuiBase` frame throttle). While
     /// it is active, `request_render(false)` and
     /// `request_render_reusing_scroll_content()` park a frame instead of
     /// repainting, and the scheduler thread paints at most one frame per
@@ -210,7 +210,7 @@ impl TuiAltScreen {
         }
     }
 
-    /// Start the coalescing render scheduler — the Rust port of native pi's
+    /// Start the coalescing render scheduler — the Rust port of upstream's
     /// `TuiBase.scheduleRender()` timer. Idempotent.
     ///
     /// Every `request_render(false)` / `request_render_reusing_scroll_content()`
@@ -521,7 +521,7 @@ impl TuiAltScreen {
     }
 
     /// Hand the terminal back to the shell so the process can be stopped
-    /// (native pi's `handleCtrlZ`): pause the renderer, leave the alternate
+    /// (upstream's `handleCtrlZ`): pause the renderer, leave the alternate
     /// buffer, and restore cooked mode. [`TuiAltScreen::resume`] reverses it
     /// once `SIGTSTP` returns.
     ///
@@ -556,7 +556,7 @@ impl TuiAltScreen {
     }
 
     /// Render the complete component tree into the main terminal buffer. This
-    /// follows native pi's regular-mode strategy: append growth with CRLF so
+    /// follows upstream's regular-mode strategy: append growth with CRLF so
     /// the terminal creates real scrollback, and rewrite only the changed tail.
     fn do_render_main_screen(&self) {
         let Ok(_render_guard) = self.render_lock.lock() else {
@@ -595,7 +595,7 @@ impl TuiAltScreen {
         let previous_cursor = *self.main_previous_cursor.lock().unwrap();
 
         // Size changes alter wrapping or viewport coordinates everywhere;
-        // mirror native pi and rebuild once. Normal streaming updates stay
+        // mirror upstream and rebuild once. Normal streaming updates stay
         // incremental and preserve terminal scrollback.
         if (previous_width != 0 && previous_width != width)
             || (previous_height != 0 && previous_height != height)
@@ -725,7 +725,7 @@ impl TuiAltScreen {
         if self.is_render_suspended() {
             return;
         }
-        // native pi stamps the frame time immediately before `doRender()`; the
+        // upstream stamps the frame time immediately before `doRender()`; the
         // scheduler reads it to hold the next request back for the remainder of
         // the throttle window.
         self.mark_frame_painted();
@@ -1073,7 +1073,7 @@ impl TUI for TuiAltScreen {
                 prev.clear();
             }
         }
-        // An immediate frame supersedes a parked coalesced one: native pi's
+        // An immediate frame supersedes a parked coalesced one: upstream's
         // `renderNow` clears `renderRequested` and cancels the render timer.
         self.scheduler.clear_pending();
         self.do_render(false);
@@ -1084,7 +1084,7 @@ impl TUI for TuiAltScreen {
             return;
         }
         if force {
-            // native pi `requestRender(true)`: reset the diff state and paint an
+            // upstream `requestRender(true)`: reset the diff state and paint an
             // immediate frame instead of waiting out the throttle window.
             self.render_now(true);
             return;
@@ -1092,7 +1092,7 @@ impl TUI for TuiAltScreen {
         if !self.is_running() {
             return;
         }
-        // Coalesced (native pi `requestRender(false)`): park the frame and let
+        // Coalesced (upstream `requestRender(false)`): park the frame and let
         // the scheduler paint it at most once per `MIN_RENDER_INTERVAL_MS`.
         self.park_render(false);
     }

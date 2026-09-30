@@ -111,7 +111,6 @@
 | user-message-selector.ts | 用户消息选择器 |
 | visual-truncate.ts | 视觉截断 |
 | first-time-setup.ts | 首次设置 |
-| earendil-announcement.ts | 公告 |
 | extension-editor.ts | `register_command` 返回 `{"kind":"editor"}`，接入原生 Editor（已接入） |
 | extension-input.ts | 扩展 editor action 的 initialText/placeholder/submit 回传（已接入） |
 | extension-selector.ts | `register_command` 返回 `{"kind":"selector"}`，接入原生 SelectList（已接入） |

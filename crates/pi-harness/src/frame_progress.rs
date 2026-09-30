@@ -1,7 +1,7 @@
 //! Durable assistant-message progress: record every streamed frame, and salvage
 //! what committed if the run dies.
 //!
-//! Ports the *write* and *recovery* halves of native pi's frame progress
+//! Ports the *write* and *recovery* halves of upstream's frame progress
 //! (`harness/runtime/progress.ts::openFrameProgress` +
 //! `harness/runtime/drive/recovery.ts::recoverAssistantGeneration`).
 //!
@@ -49,7 +49,7 @@ use crate::session::types::{
 /// The `record_type` tag for [`AssistantFrameRecord`].
 pub const ASSISTANT_FRAME_RECORD_TYPE: &str = "assistant_frame";
 
-/// The text native pi attaches to a message reconstructed from frames. Kept
+/// The text upstream attaches to a message reconstructed from frames. Kept
 /// verbatim so a reader (or a tool) can recognise the case.
 pub const INTERRUPTED_NOTICE: &str = "Assistant request was interrupted. The preceding content is \
 the latest committed partial; newer live output may be missing and the external outcome is unknown.";
@@ -69,7 +69,7 @@ pub fn interrupted_message(partial: AssistantMessage) -> AssistantMessage {
 }
 
 /// Text attached to the synthetic tool result that stands in for a tool call
-/// whose real result never landed. Mirrors the intent of native pi's
+/// whose real result never landed. Mirrors the intent of upstream's
 /// interrupted-operation notices: say plainly that the outcome is unknown, so
 /// neither the user nor the model assumes the tool had no effect.
 pub const INTERRUPTED_TOOL_RESULT: &str = "Tool execution was interrupted before its result was \

@@ -1,6 +1,6 @@
 //! Model registry runtime - dynamic model registration and refresh.
 //!
-//! Mirrors the native Pi `ModelRegistry` and `ModelRuntime` functionality:
+//! Mirrors the upstream `ModelRegistry` and `ModelRuntime` functionality:
 //! - Dynamic provider registration/unregistration
 //! - Runtime model catalog refresh
 //! - Provider authentication status tracking

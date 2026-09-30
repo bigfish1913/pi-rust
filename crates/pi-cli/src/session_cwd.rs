@@ -1,6 +1,6 @@
 //! Stored-session working-directory recovery.
 //!
-//! Port of native Pi's `packages/coding-agent/src/core/session-cwd.ts`. A
+//! Port of the upstream `packages/coding-agent/src/core/session-cwd.ts`. A
 //! session file records the cwd it was created in; when that directory has
 //! since been deleted, restoring the session must either fall back to the
 //! current cwd or fail with a clear, actionable message instead of silently

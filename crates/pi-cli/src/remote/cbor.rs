@@ -1,6 +1,6 @@
 //! Strict CBOR codec for protocol values.
 //!
-//! Port of native Pi's `packages/protocol/src/cbor/`. The protocol only ever
+//! Port of the upstream `packages/protocol/` module.
 //! carries JSON-shaped values (null, bool, number, string, array, object), so
 //! this codec implements exactly that subset of CBOR (RFC 8949) with the
 //! defensive limits native uses for untrusted payloads:

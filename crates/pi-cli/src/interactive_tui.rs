@@ -23,9 +23,9 @@
 //!   while it is `Some` the key loop routes to it first and restores the editor
 //!   on done/cancel.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
 use std::io::IsTerminal;
-use std::sync::{mpsc as std_mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex};
 
 use base64::Engine;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -71,314 +71,6 @@ type MarkdownTransformer = Arc<dyn Fn(&str) -> String + Send + Sync>;
 /// A synchronous rendezvous between the Node runtime-request thread and the
 /// blocking TUI key loop. Node's `ctx.ui.*` methods are promises, so the host
 /// request must remain pending while the user interacts with the native
-/// component. The key loop owns opening/closing components; this bridge only
-/// carries JSON results and cancellation state across the threads.
-#[derive(Clone, Default)]
-struct JsDialogBridge {
-    pending: Arc<Mutex<VecDeque<JsDialogPending>>>,
-    active: Arc<Mutex<HashMap<String, JsDialogActive>>>,
-    /// The one dialog currently installed in the TUI input slot. Other
-    /// requests may remain active while a command is waiting, but a cancel
-    /// notification must never close whichever dialog happens to be visible.
-    visible: Arc<Mutex<Option<String>>>,
-    cancelled_before_open: Arc<Mutex<HashSet<String>>>,
-    closed: Arc<Mutex<bool>>,
-}
-
-struct JsDialogPending {
-    request: JsDialogRequest,
-    result: std_mpsc::Sender<serde_json::Value>,
-}
-
-struct JsDialogActive {
-    result: std_mpsc::Sender<serde_json::Value>,
-    cancel_requested: bool,
-}
-
-#[derive(Clone, Debug)]
-struct JsDialogRequest {
-    id: String,
-    method: String,
-    title: String,
-    message: String,
-    options: Vec<String>,
-    placeholder: Option<String>,
-    prefill: Option<String>,
-}
-
-impl JsDialogRequest {
-    fn parse(args: &serde_json::Value) -> Result<Self, String> {
-        let id = args
-            .get("dialogId")
-            .and_then(serde_json::Value::as_str)
-            .filter(|value| !value.is_empty())
-            .ok_or("ui.dialog missing dialogId")?
-            .to_string();
-        let method = args
-            .get("method")
-            .and_then(serde_json::Value::as_str)
-            .ok_or("ui.dialog missing method")?
-            .to_string();
-        if !matches!(method.as_str(), "select" | "confirm" | "input" | "editor") {
-            return Err(format!("unsupported UI dialog method: {method}"));
-        }
-        let options = args
-            .get("options")
-            .and_then(serde_json::Value::as_array)
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(serde_json::Value::as_str)
-                    .map(ToOwned::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
-        Ok(Self {
-            id,
-            method,
-            title: args
-                .get("title")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            message: args
-                .get("message")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            options,
-            placeholder: args
-                .get("placeholder")
-                .and_then(serde_json::Value::as_str)
-                .map(ToOwned::to_owned),
-            prefill: args
-                .get("prefill")
-                .and_then(serde_json::Value::as_str)
-                .map(ToOwned::to_owned),
-        })
-    }
-}
-
-impl JsDialogBridge {
-    fn handle_runtime_request(
-        &self,
-        action: &str,
-        args: serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
-        match action {
-            "ui.dialog" => self.wait_for_dialog(args),
-            "ui.dialog.cancel" => {
-                let id = args
-                    .get("dialogId")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or("ui.dialog.cancel missing dialogId")?;
-                self.cancel(id);
-                Ok(serde_json::json!(true))
-            }
-            _ => Err(format!("unsupported capability: {action}")),
-        }
-    }
-
-    fn wait_for_dialog(&self, args: serde_json::Value) -> Result<serde_json::Value, String> {
-        let request = JsDialogRequest::parse(&args)?;
-        let (sender, receiver) = std_mpsc::channel();
-        // Hold the closed flag while enqueueing. `cancel_all` takes this same
-        // lock before draining pending requests, so shutdown cannot observe
-        // an empty queue and then have this request arrive behind the drain.
-        let _closed = self
-            .closed
-            .lock()
-            .map_err(|_| "JS dialog bridge poisoned")?;
-        if *_closed {
-            return Ok(serde_json::json!({ "cancelled": true }));
-        }
-        let cancelled_before_open = self
-            .cancelled_before_open
-            .lock()
-            .map_err(|_| "JS dialog cancellation state poisoned")?
-            .remove(&request.id);
-        if cancelled_before_open {
-            return Ok(serde_json::json!({ "cancelled": true }));
-        }
-        // Do not hold the cancellation-state lock while taking `pending`:
-        // `take_pending` takes those locks in the opposite order.
-        self.pending
-            .lock()
-            .map_err(|_| "JS dialog pending state poisoned")?
-            .push_back(JsDialogPending {
-                request,
-                result: sender,
-            });
-        drop(_closed);
-        receiver
-            .recv()
-            .map_err(|_| "JS dialog closed before it received an answer".to_string())
-    }
-
-    /// Move one request to the active set. The caller invokes this only when
-    /// the TUI has no other modal occupying the editor slot.
-    fn take_pending(&self) -> Option<JsDialogRequest> {
-        loop {
-            let pending = self.pending.lock().ok()?.pop_front()?;
-            let mut active = self.active.lock().ok()?;
-            // Check cancellation while holding the active lock and insert the
-            // entry in the same critical section. `cancel()` checks `active`
-            // before recording a pre-open cancellation, so it will either see
-            // this entry or leave a marker that we consume here. Checking the
-            // marker before acquiring `active` had a small race where a cancel
-            // could land between the check and insertion and strand the dialog.
-            if self
-                .cancelled_before_open
-                .lock()
-                .ok()?
-                .remove(&pending.request.id)
-            {
-                drop(active);
-                let _ = pending
-                    .result
-                    .send(serde_json::json!({ "cancelled": true }));
-                continue;
-            }
-            active.insert(
-                pending.request.id.clone(),
-                JsDialogActive {
-                    result: pending.result,
-                    cancel_requested: false,
-                },
-            );
-            if let Ok(mut visible) = self.visible.lock() {
-                *visible = Some(pending.request.id.clone());
-            }
-            return Some(pending.request);
-        }
-    }
-
-    fn respond(&self, id: &str, result: serde_json::Value) {
-        if let Ok(mut active) = self.active.lock() {
-            if let Some(entry) = active.remove(id) {
-                let _ = entry.result.send(result);
-            }
-        }
-        if let Ok(mut visible) = self.visible.lock() {
-            if visible.as_deref() == Some(id) {
-                *visible = None;
-            }
-        }
-    }
-
-    fn cancel(&self, id: &str) {
-        if let Ok(mut pending) = self.pending.lock() {
-            if let Some(index) = pending.iter().position(|item| item.request.id == id) {
-                if let Some(item) = pending.remove(index) {
-                    let _ = item.result.send(serde_json::json!({ "cancelled": true }));
-                    return;
-                }
-            }
-        }
-        if let Ok(mut active) = self.active.lock() {
-            if let Some(entry) = active.get_mut(id) {
-                if !entry.cancel_requested {
-                    entry.cancel_requested = true;
-                    let _ = entry.result.send(serde_json::json!({ "cancelled": true }));
-                }
-                return;
-            }
-        }
-        if let Ok(mut cancelled) = self.cancelled_before_open.lock() {
-            cancelled.insert(id.to_string());
-        }
-    }
-
-    fn cancelled_active_ids(&self) -> Vec<String> {
-        self.active
-            .lock()
-            .map(|active| {
-                active
-                    .iter()
-                    .filter_map(|(id, entry)| entry.cancel_requested.then_some(id.clone()))
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    fn is_visible(&self, id: &str) -> bool {
-        self.visible
-            .lock()
-            .map(|visible| visible.as_deref() == Some(id))
-            .unwrap_or(false)
-    }
-
-    fn finish(&self, id: &str) {
-        if let Ok(mut active) = self.active.lock() {
-            active.remove(id);
-        }
-        if let Ok(mut visible) = self.visible.lock() {
-            if visible.as_deref() == Some(id) {
-                *visible = None;
-            }
-        }
-    }
-
-    fn cancel_all(&self) {
-        // Keep the closed lock through the queue drains. `wait_for_dialog`
-        // holds it while enqueueing, making the shutdown check + enqueue an
-        // atomic operation with respect to this drain.
-        let Ok(mut closed) = self.closed.lock() else {
-            return;
-        };
-        *closed = true;
-        if let Ok(mut pending) = self.pending.lock() {
-            for item in pending.drain(..) {
-                let _ = item.result.send(serde_json::json!({ "cancelled": true }));
-            }
-        }
-        if let Ok(mut active) = self.active.lock() {
-            for (_, entry) in active.drain() {
-                let _ = entry.result.send(serde_json::json!({ "cancelled": true }));
-            }
-        }
-        if let Ok(mut visible) = self.visible.lock() {
-            *visible = None;
-        }
-        drop(closed);
-    }
-
-    /// Cancel requests owned by one interrupted prompt preparation while
-    /// keeping the bridge available to a replacement Node host.
-    fn cancel_open_requests(&self) {
-        // Keep enqueueing closed until the old host and its preparation
-        // worker have stopped. Otherwise a late runtime request can land just
-        // after the drain and strand its handler thread.
-        let Ok(mut closed) = self.closed.lock() else {
-            return;
-        };
-        *closed = true;
-        if let Ok(mut pending) = self.pending.lock() {
-            for item in pending.drain(..) {
-                let _ = item.result.send(serde_json::json!({ "cancelled": true }));
-            }
-        }
-        if let Ok(mut active) = self.active.lock() {
-            for (_, entry) in active.drain() {
-                let _ = entry.result.send(serde_json::json!({ "cancelled": true }));
-            }
-        }
-        if let Ok(mut visible) = self.visible.lock() {
-            *visible = None;
-        }
-        if let Ok(mut cancelled) = self.cancelled_before_open.lock() {
-            cancelled.clear();
-        }
-        drop(closed);
-    }
-
-    fn reopen(&self) {
-        if let Ok(mut closed) = self.closed.lock() {
-            *closed = false;
-        }
-    }
-}
-
 /// B5e: build the `AssistantMessageComponent` markdown-transformer closure the
 /// render path applies to raw assistant text before styling. Wraps any plugin
 /// `register_markdown_transformer` handlers registered in `snapshot` (chained
@@ -532,10 +224,6 @@ struct CommandContext {
     /// this owned string instead. Semantically unchanged from pre-refactor.
     lane_model_id: String,
     cwd: std::path::PathBuf,
-    /// Package resources resolved at startup. An empty set means Pi package
-    /// loading was not explicitly enabled and must remain disabled for all
-    /// interactive theme selectors.
-    package_resources: Arc<crate::packages::PackageResources>,
     /// Harness resources snapshot (skills + prompt templates) for `/context`.
     /// Captured once at TUI startup because the blocking submit thread can't
     /// `.await get_resources()`.
@@ -789,7 +477,7 @@ fn now_ms() -> i64 {
 
 /// Parse a submitted line into a user shell command.
 ///
-/// Mirrors native pi's `text.startsWith("!")` handling
+/// Mirrors upstream's `text.startsWith("!")` handling
 /// (`interactive-mode.ts:3225`): `!cmd` runs and is recorded in the session
 /// context, `!!cmd` is excluded from it. Returns `None` for a bare `!` / `!!`
 /// (or whitespace only), so the line falls through to the normal prompt path.
@@ -822,7 +510,7 @@ fn start_user_bash(ctx: &CommandContext, command: &str, exclude_from_context: bo
     ctx.chat.add_child(comp.clone());
 
     // Register the cancellation slot before spawning so an Esc arriving on the
-    // key thread can never miss the run (native pi's `_bashAbortControllers`).
+    // key thread can never miss the run (upstream's `_bashAbortControllers`).
     let cancel = ctx.state.begin_user_bash();
     ctx.tui.request_render(false);
 
@@ -903,256 +591,10 @@ fn start_user_bash(ctx: &CommandContext, command: &str, exclude_from_context: bo
 /// compatibility layer. Plain keys retain the usual terminal sequences;
 /// modified functional keys use Kitty CSI-u so Shift/Alt/Ctrl combinations are
 /// not collapsed into their unmodified equivalent (notably Shift+Enter).
-fn key_event_to_input(key: crossterm::event::KeyEvent) -> String {
-    use crossterm::event::{KeyCode, KeyModifiers};
-
-    let modifiers = key.modifiers;
-    let ctrl = modifiers.contains(KeyModifiers::CONTROL);
-    let shift = modifiers.contains(KeyModifiers::SHIFT);
-    let alt = modifiers.contains(KeyModifiers::ALT);
-    let super_key = modifiers.contains(KeyModifiers::SUPER);
-
-    if modifiers == KeyModifiers::NONE {
-        return match key.code {
-            KeyCode::Char(ch) => ch.to_string(),
-            KeyCode::Enter => "\r".into(),
-            KeyCode::Esc => "\x1b".into(),
-            KeyCode::Backspace => "\x7f".into(),
-            KeyCode::Tab => "\t".into(),
-            // Crossterm represents Shift+Tab as `BackTab` on both Unix
-            // (`ESC[Z`) and Windows. Preserve the canonical terminal form
-            // so the Node keybinding matcher sees `shift+tab`.
-            KeyCode::BackTab => "\x1b[Z".into(),
-            KeyCode::Up => "\x1b[A".into(),
-            KeyCode::Down => "\x1b[B".into(),
-            KeyCode::Right => "\x1b[C".into(),
-            KeyCode::Left => "\x1b[D".into(),
-            KeyCode::Home => "\x1b[H".into(),
-            KeyCode::End => "\x1b[F".into(),
-            KeyCode::PageUp => "\x1b[5~".into(),
-            KeyCode::PageDown => "\x1b[6~".into(),
-            KeyCode::Delete => "\x1b[3~".into(),
-            KeyCode::Insert => "\x1b[2~".into(),
-            KeyCode::F(n) => format!("\x1b[{}~", 10 + n as u16),
-            _ => String::new(),
-        };
-    }
-
-    // Legacy control bytes are what the native `matchesKey` implementation
-    // expects for the common Ctrl+letter actions (Ctrl+C, Ctrl+O, Ctrl+J...).
-    if ctrl && !shift && !alt && !super_key {
-        if let KeyCode::Char(ch) = key.code {
-            if let Some(code) = control_code(ch) {
-                return char::from(code).to_string();
-            }
-        }
-    }
-
-    // Legacy Alt+character input is unambiguous when no other modifier is
-    // present and is accepted by pi's `matchesKey` fallback parser.
-    if alt && !ctrl && !shift && !super_key {
-        if let KeyCode::Char(ch) = key.code {
-            return format!("\x1b{ch}");
-        }
-    }
-
-    // Crossterm has already resolved the keyboard layout for character events
-    // (for example, Windows reports Shift+1 as `Char('!')`). Pass that actual
-    // character through unchanged so custom components receive text instead
-    // of a CSI-u escape sequence. Functional keys and combined modifiers use
-    // CSI-u below so their modifier identity remains available to keybindings.
-    if shift && !ctrl && !alt && !super_key {
-        if let KeyCode::Char(ch) = key.code {
-            return ch.to_string();
-        }
-    }
-
-    if let Some(sequence) = modified_functional_sequence(key.code, modifiers) {
-        return sequence;
-    }
-    let Some(codepoint) = key_codepoint(key.code, ctrl) else {
-        return String::new();
-    };
-    kitty_key_sequence(codepoint, modifiers)
-}
-
-fn control_code(ch: char) -> Option<u8> {
-    let ch = ch.to_ascii_lowercase();
-    Some(match ch {
-        '@' | ' ' => 0,
-        'a'..='z' => (ch as u8) & 0x1f,
-        '[' => 0x1b,
-        '\\' => 0x1c,
-        ']' => 0x1d,
-        '^' => 0x1e,
-        '_' | '-' => 0x1f,
-        _ => return None,
-    })
-}
-
-fn key_codepoint(code: crossterm::event::KeyCode, ctrl: bool) -> Option<u32> {
-    use crossterm::event::KeyCode;
-    Some(match code {
-        KeyCode::Char(ch) => {
-            if ctrl {
-                ch.to_ascii_lowercase() as u32
-            } else {
-                ch as u32
-            }
-        }
-        KeyCode::Enter => 13,
-        KeyCode::Esc => 27,
-        KeyCode::Backspace => 127,
-        KeyCode::Tab => 9,
-        // Keep modified BackTab combinations representable through CSI-u;
-        // the unmodified/SHIFT form is handled as the legacy `ESC[Z` above.
-        KeyCode::BackTab => 9,
-        _ => return None,
-    })
-}
-
-fn modified_functional_sequence(
-    code: crossterm::event::KeyCode,
-    modifiers: crossterm::event::KeyModifiers,
-) -> Option<String> {
-    use crossterm::event::{KeyCode, KeyModifiers};
-    // `BackTab` is already a semantic Shift+Tab event. Crossterm normally
-    // includes SHIFT in its modifier bits, but preserving the legacy sequence
-    // for a synthetic event without that bit keeps the adapter portable.
-    if code == KeyCode::BackTab
-        && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
-    {
-        return Some("\x1b[Z".into());
-    }
-    let modifier = kitty_modifier(modifiers);
-    let sequence = match code {
-        KeyCode::Up => format!("\x1b[1;{modifier}A"),
-        KeyCode::Down => format!("\x1b[1;{modifier}B"),
-        KeyCode::Right => format!("\x1b[1;{modifier}C"),
-        KeyCode::Left => format!("\x1b[1;{modifier}D"),
-        KeyCode::Home => format!("\x1b[1;{modifier}H"),
-        KeyCode::End => format!("\x1b[1;{modifier}F"),
-        KeyCode::Insert => format!("\x1b[2;{modifier}~"),
-        KeyCode::Delete => format!("\x1b[3;{modifier}~"),
-        KeyCode::PageUp => format!("\x1b[5;{modifier}~"),
-        KeyCode::PageDown => format!("\x1b[6;{modifier}~"),
-        _ => return None,
-    };
-    Some(sequence)
-}
-
-fn kitty_modifier(modifiers: crossterm::event::KeyModifiers) -> u8 {
-    use crossterm::event::KeyModifiers;
-    let mut modifier = 1u8;
-    if modifiers.contains(KeyModifiers::SHIFT) {
-        modifier += 1;
-    }
-    if modifiers.contains(KeyModifiers::ALT) {
-        modifier += 2;
-    }
-    if modifiers.contains(KeyModifiers::CONTROL) {
-        modifier += 4;
-    }
-    if modifiers.contains(KeyModifiers::SUPER) {
-        modifier += 8;
-    }
-    modifier
-}
-
-fn kitty_key_sequence(codepoint: u32, modifiers: crossterm::event::KeyModifiers) -> String {
-    let modifier = kitty_modifier(modifiers);
-    format!("\x1b[{codepoint};{modifier}u")
-}
-
-/// A slash command registered by a native extension. The command metadata is
-/// captured for autocomplete, while the handler is looked up from the live
-/// session on every invocation so `/reload` takes effect without rebuilding
-/// the editor callback.
 struct ExtensionCommand {
     name: String,
     description: String,
     session: crate::session::ExtensionSessionCell,
-}
-
-struct JsExtensionCommand {
-    name: String,
-    session: crate::js_extensions::JsExtensionSession,
-}
-
-impl SlashCommand for JsExtensionCommand {
-    fn name(&self) -> &str {
-        &self.name
-    }
-    fn description(&self) -> &'static str {
-        "JS extension command"
-    }
-    fn description_owned(&self) -> String {
-        "JS extension command".to_string()
-    }
-    fn execute(&self, ctx: &CommandContext, args: &str) {
-        // JS commands may own the terminal for their entire lifetime (for
-        // example pi-btw's fullscreen side thread). Running them inline here
-        // would block the crossterm key thread, so no input could reach the
-        // extension while it is waiting for `ui.custom()` to complete.
-        let session = self.session.clone();
-        let command = self.name.trim_start_matches('/').to_string();
-        let args = args.to_string();
-        let ctx = ctx.clone();
-        // The command runs off the key thread. Keep the startup snapshot so a
-        // late editorText result cannot overwrite text typed while the command
-        // was in flight.
-        let initial_editor_text = ctx.editor.get_text();
-        tokio::task::spawn_blocking(move || {
-            match session.invoke_command_with_context(
-                &command,
-                &args,
-                serde_json::json!({"editorText": initial_editor_text}),
-            ) {
-                Ok(value) => {
-                    if let Some(editor_text) = value.get("editorText").and_then(|v| v.as_str()) {
-                        if ctx.editor.get_text() == initial_editor_text
-                            && editor_text != initial_editor_text
-                        {
-                            let cursor = editor_text.chars().count();
-                            ctx.editor.set_text(editor_text);
-                            ctx.editor.set_cursor(0, cursor);
-                        }
-                    }
-                    if let Some(notifications) =
-                        value.get("notifications").and_then(|v| v.as_array())
-                    {
-                        for notification in notifications {
-                            let message = notification
-                                .get("message")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_default();
-                            if message.is_empty() {
-                                continue;
-                            }
-                            match notification.get("level").and_then(|v| v.as_str()) {
-                                Some("error") => add_error_message(&ctx.chat, message),
-                                _ => add_note_message(&ctx.chat, message),
-                            }
-                        }
-                    }
-                    let result = value.get("result").unwrap_or(&value);
-                    let text = result
-                        .get("text")
-                        .and_then(|item| item.as_str())
-                        .map(str::to_string)
-                        .or_else(|| result.as_str().map(str::to_string))
-                        .filter(|text| !text.is_empty() && text != "null");
-                    if let Some(text) = text {
-                        add_note_message(&ctx.chat, &text);
-                    }
-                }
-                Err(error) => {
-                    add_error_message(&ctx.chat, &format!("JS extension command failed: {error}"))
-                }
-            }
-            ctx.tui.request_render(false);
-        });
-    }
 }
 
 impl SlashCommand for ExtensionCommand {
@@ -1244,7 +686,7 @@ fn handle_extension_ui_result(
         }
         Some("selector") => open_extension_selector(ctx, session, command_name, value),
         Some("editor") => open_extension_editor(ctx, session, command_name, value),
-        // Native pi exposes `ctx.ui.input(title, placeholder)` separately
+        // upstream exposes `ctx.ui.input(title, placeholder)` separately
         // from the multiline editor. Render it as a focused single-line
         // dialog in the swapped input slot.
         Some("input") => open_extension_input(ctx, session, command_name, value),
@@ -1255,7 +697,7 @@ fn handle_extension_ui_result(
     }
 }
 
-/// Render the title used by the native pi extension dialogs.  Keeping it in
+/// Render the title used by the upstream extension dialogs.  Keeping it in
 /// the swapped editor container makes the question stay visible while the
 /// extension waits for the answer, instead of adding a transient chat note.
 fn extension_dialog_title(title: &str, bold: bool) -> Arc<Text> {
@@ -1407,7 +849,7 @@ fn open_extension_selector(
             items
                 .iter()
                 .filter_map(|item| {
-                    // Native pi's selector accepts `string[]`; the Rust ABI
+                    // upstream's selector accepts `string[]`; the Rust ABI
                     // also permits `{value,label,description}` objects.
                     let value = if let Some(value) = item.as_str() {
                         value
@@ -1630,268 +1072,6 @@ fn close_extension_editor(
     tui.set_focus(Some(editor.clone()));
     tui.request_render(false);
 }
-
-/// Open one Node `ctx.ui.*` request in the native editor slot. The Node host
-/// waits on the runtime response while these callbacks resolve the bridge on
-/// Enter, selection, or cancellation.
-fn open_js_dialog(ctx: &CommandContext, bridge: Arc<JsDialogBridge>, request: JsDialogRequest) {
-    match request.method.as_str() {
-        "select" => open_js_selector(ctx, bridge, request, false),
-        "confirm" => open_js_selector(ctx, bridge, request, true),
-        "input" => open_js_input(ctx, bridge, request),
-        "editor" => open_js_editor(ctx, bridge, request),
-        _ => {
-            bridge.respond(&request.id, serde_json::json!({ "cancelled": true }));
-        }
-    }
-}
-
-fn open_js_selector(
-    ctx: &CommandContext,
-    bridge: Arc<JsDialogBridge>,
-    request: JsDialogRequest,
-    confirm: bool,
-) {
-    let values = if confirm {
-        vec!["Yes".to_string(), "No".to_string()]
-    } else {
-        request.options.clone()
-    };
-    if values.is_empty() {
-        bridge.respond(&request.id, serde_json::json!({ "cancelled": true }));
-        return;
-    }
-    let items = values
-        .iter()
-        .map(|value| SelectItem::new(value, value))
-        .collect::<Vec<_>>();
-    let list = Arc::new(SelectList::new(items, 10));
-    let frame = Arc::new(Container::new());
-    frame.add_child(Arc::new(DynamicBorder::new()));
-    frame.add_child(Arc::new(Spacer::new(1)));
-    frame.add_child(extension_dialog_title(
-        if request.title.is_empty() {
-            if confirm {
-                "Confirm"
-            } else {
-                "Select"
-            }
-        } else {
-            request.title.as_str()
-        },
-        true,
-    ));
-    if !request.message.is_empty() {
-        frame.add_child(Arc::new(Spacer::new(1)));
-        frame.add_child(Arc::new(Text::new(request.message.clone(), 1, 0)));
-    }
-    frame.add_child(Arc::new(Spacer::new(1)));
-    frame.add_child(list.clone());
-    frame.add_child(Arc::new(Spacer::new(1)));
-    frame.add_child(extension_dialog_hint(
-        "↑↓ navigate · Enter select · Esc/Ctrl+C cancel",
-    ));
-    frame.add_child(Arc::new(Spacer::new(1)));
-    frame.add_child(Arc::new(DynamicBorder::new()));
-
-    let id = request.id.clone();
-    let bridge_select = bridge.clone();
-    let state_select = ctx.state.clone();
-    let ec_select = ctx.editor_container.clone();
-    let editor_select = ctx.editor.clone();
-    let tui_select = ctx.tui.clone();
-    list.on_select(Arc::new(move |item| {
-        let result = if confirm {
-            serde_json::json!({ "confirmed": item.value == "Yes" })
-        } else {
-            serde_json::json!({ "value": item.value })
-        };
-        bridge_select.respond(&id, result);
-        close_selector(&state_select, &ec_select, &editor_select, &tui_select);
-    }));
-
-    let id_cancel = request.id.clone();
-    let bridge_cancel = bridge.clone();
-    let state_cancel = ctx.state.clone();
-    let ec_cancel = ctx.editor_container.clone();
-    let editor_cancel = ctx.editor.clone();
-    let tui_cancel = ctx.tui.clone();
-    list.on_cancel(Arc::new(move || {
-        bridge_cancel.respond(&id_cancel, serde_json::json!({ "cancelled": true }));
-        close_selector(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
-    }));
-
-    let id_abort = request.id.clone();
-    let bridge_abort = bridge.clone();
-    let state_abort = ctx.state.clone();
-    let ec_abort = ctx.editor_container.clone();
-    let editor_abort = ctx.editor.clone();
-    let tui_abort = ctx.tui.clone();
-    *ctx.state.active_extension_cancel.lock().unwrap() = Some(Arc::new(move || {
-        bridge_abort.respond(&id_abort, serde_json::json!({ "cancelled": true }));
-        close_selector(&state_abort, &ec_abort, &editor_abort, &tui_abort);
-    }));
-
-    open_selector_with_view(
-        &ctx.state,
-        &ctx.editor_container,
-        &ctx.editor,
-        &ctx.tui,
-        SelectorView::List(list),
-        frame,
-        SelectorKind::Extension,
-    );
-}
-
-fn open_js_input(ctx: &CommandContext, bridge: Arc<JsDialogBridge>, request: JsDialogRequest) {
-    let input = request
-        .placeholder
-        .as_deref()
-        .map(Input::with_placeholder)
-        .unwrap_or_default();
-    let input = Arc::new(input);
-    input.set_focused(true);
-
-    let frame = Arc::new(Container::new());
-    frame.add_child(Arc::new(DynamicBorder::new()));
-    frame.add_child(Arc::new(Spacer::new(1)));
-    frame.add_child(extension_dialog_title(
-        if request.title.is_empty() {
-            "Input"
-        } else {
-            &request.title
-        },
-        false,
-    ));
-    frame.add_child(Arc::new(Spacer::new(1)));
-    frame.add_child(input.clone());
-    frame.add_child(Arc::new(Spacer::new(1)));
-    frame.add_child(extension_dialog_hint("Enter submit · Esc/Ctrl+C cancel"));
-    frame.add_child(Arc::new(Spacer::new(1)));
-    frame.add_child(Arc::new(DynamicBorder::new()));
-
-    *ctx.state.active_extension_editor.lock().unwrap() = None;
-    *ctx.state.active_extension_input.lock().unwrap() = Some(input.clone());
-    ctx.editor_container.clear();
-    ctx.editor_container.add_child(frame);
-
-    let id = request.id.clone();
-    let bridge_submit = bridge.clone();
-    let state_submit = ctx.state.clone();
-    let ec_submit = ctx.editor_container.clone();
-    let editor_submit = ctx.editor.clone();
-    let tui_submit = ctx.tui.clone();
-    input.on_submit(Arc::new(move |value| {
-        bridge_submit.respond(&id, serde_json::json!({ "value": value }));
-        close_extension_editor(&state_submit, &ec_submit, &editor_submit, &tui_submit);
-    }));
-
-    let id_cancel = request.id.clone();
-    let bridge_cancel = bridge.clone();
-    let state_cancel = ctx.state.clone();
-    let ec_cancel = ctx.editor_container.clone();
-    let editor_cancel = ctx.editor.clone();
-    let tui_cancel = ctx.tui.clone();
-    *ctx.state.active_extension_cancel.lock().unwrap() = Some(Arc::new(move || {
-        bridge_cancel.respond(&id_cancel, serde_json::json!({ "cancelled": true }));
-        close_extension_editor(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
-    }));
-    ctx.tui.set_focus(Some(input));
-    ctx.tui.request_render(false);
-}
-
-fn open_js_editor(ctx: &CommandContext, bridge: Arc<JsDialogBridge>, request: JsDialogRequest) {
-    let editor = Arc::new(Editor::new(
-        EditorOptions {
-            padding_x: 1,
-            autocomplete_max_visible: 0,
-            initial_text: request.prefill.clone(),
-            ..Default::default()
-        },
-        EditorStyle {
-            prompt: "> ".to_string(),
-            placeholder: String::new(),
-        },
-        Arc::new(rpi_tui::Keybindings::new()),
-    ));
-    editor.set_focused(true);
-
-    let frame = Arc::new(Container::new());
-    frame.add_child(Arc::new(DynamicBorder::new()));
-    frame.add_child(Arc::new(Spacer::new(1)));
-    frame.add_child(extension_dialog_title(
-        if request.title.is_empty() {
-            "Editor"
-        } else {
-            &request.title
-        },
-        false,
-    ));
-    frame.add_child(Arc::new(Spacer::new(1)));
-    frame.add_child(editor.clone());
-    frame.add_child(Arc::new(Spacer::new(1)));
-    frame.add_child(extension_dialog_hint(
-        "Enter submit · Shift+Enter newline · Esc/Ctrl+C cancel",
-    ));
-    frame.add_child(Arc::new(Spacer::new(1)));
-    frame.add_child(Arc::new(DynamicBorder::new()));
-
-    *ctx.state.active_extension_editor.lock().unwrap() = Some(editor.clone());
-    *ctx.state.active_extension_input.lock().unwrap() = None;
-    ctx.editor_container.clear();
-    ctx.editor_container.add_child(frame);
-
-    let id = request.id.clone();
-    let bridge_submit = bridge.clone();
-    let state_submit = ctx.state.clone();
-    let ec_submit = ctx.editor_container.clone();
-    let editor_submit = ctx.editor.clone();
-    let tui_submit = ctx.tui.clone();
-    editor.on_submit(Arc::new(move |value| {
-        bridge_submit.respond(&id, serde_json::json!({ "value": value }));
-        close_extension_editor(&state_submit, &ec_submit, &editor_submit, &tui_submit);
-    }));
-
-    let id_cancel = request.id.clone();
-    let bridge_cancel = bridge.clone();
-    let state_cancel = ctx.state.clone();
-    let ec_cancel = ctx.editor_container.clone();
-    let editor_cancel = ctx.editor.clone();
-    let tui_cancel = ctx.tui.clone();
-    *ctx.state.active_extension_cancel.lock().unwrap() = Some(Arc::new(move || {
-        bridge_cancel.respond(&id_cancel, serde_json::json!({ "cancelled": true }));
-        close_extension_editor(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
-    }));
-    ctx.tui.set_focus(Some(editor));
-    ctx.tui.request_render(false);
-}
-
-fn cancel_js_dialog_ui(ctx: &CommandContext, bridge: &Arc<JsDialogBridge>) {
-    for id in bridge.cancelled_active_ids() {
-        // Several commands can ask for a dialog concurrently. Only the id
-        // currently occupying the TUI slot may close the visible component;
-        // an older cancellation must leave a newer ask dialog untouched.
-        if !bridge.is_visible(&id) {
-            bridge.finish(&id);
-            continue;
-        }
-        if let Some((selector, _)) = ctx.state.active_selector.lock().unwrap().clone() {
-            selector.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        } else if ctx.state.extension_dialog_open() {
-            if !run_extension_cancel(&ctx.state) {
-                close_extension_editor(&ctx.state, &ctx.editor_container, &ctx.editor, &ctx.tui);
-            }
-        }
-        // `respond` normally removes the active entry from the callback. The
-        // fallback path above can run before a callback was installed, so
-        // always discard the id after routing the cancellation.
-        bridge.finish(&id);
-    }
-}
-
-// ===========================================================================
-// ask_user — plugin UI-dialog bridge (runtime action 17)
-// ===========================================================================
 
 /// Sentinel option value that switches a freeform-capable selector into the
 /// single-line input slot (native `allowFreeform` affordance).
@@ -2430,7 +1610,7 @@ impl SlashCommand for ModelCommand {
         if !term.is_empty() {
             // /model <name> — direct switch by id (pi handleModelCommand).
             //
-            // Native pi only switches on an EXACT match; a term that matches
+            // upstream only switches on an EXACT match; a term that matches
             // nothing falls through to the selector with the query prefilled
             // instead of erroring out (`showModelSelector(searchTerm)`).
             if let Some(model) = find_model_selector_match(&ctx.model_catalog, term) {
@@ -2610,14 +1790,7 @@ impl SlashCommand for ThemeCommand {
             ctx.tui.render_now(true);
             return;
         }
-        open_theme_selector(
-            &ctx.state,
-            &ctx.editor_container,
-            &ctx.editor,
-            &ctx.tui,
-            &ctx.cwd,
-            &ctx.package_resources,
-        );
+        open_theme_selector(&ctx.state, &ctx.editor_container, &ctx.editor, &ctx.tui);
     }
 }
 
@@ -2694,7 +1867,7 @@ impl SlashCommand for ForkCommand {
     }
 }
 
-/// `/clone` is the native Pi spelling for duplicating the current session.
+/// `/clone` is the upstream spelling for duplicating the current session.
 /// Reuse the same durable fork path as `/fork`; both create a child session
 /// and rebind the live harness to it.
 struct CloneCommand;
@@ -2880,8 +2053,6 @@ impl SlashCommand for SettingsCommand {
             &ctx.model_catalog,
             &ctx.lane_model_id,
             &ctx.chat,
-            &ctx.cwd,
-            &ctx.package_resources,
         );
     }
 }
@@ -2916,34 +2087,6 @@ impl SlashCommand for ShareCommand {
     }
     fn execute(&self, ctx: &CommandContext, _args: &str) {
         let _ = ctx.tx.send(TuiMessage::ShareSession);
-    }
-}
-
-struct ArminCommand;
-impl SlashCommand for ArminCommand {
-    fn name(&self) -> &'static str {
-        "/armin"
-    }
-    fn description(&self) -> &'static str {
-        "??? (easter egg)"
-    }
-    fn execute(&self, ctx: &CommandContext, _args: &str) {
-        crate::extras::add_armin(&ctx.chat);
-        ctx.tui.request_render(false);
-    }
-}
-
-struct EarendilCommand;
-impl SlashCommand for EarendilCommand {
-    fn name(&self) -> &'static str {
-        "/earendil"
-    }
-    fn description(&self) -> &'static str {
-        "Announcement"
-    }
-    fn execute(&self, ctx: &CommandContext, _args: &str) {
-        crate::extras::add_earendil(&ctx.chat);
-        ctx.tui.request_render(false);
     }
 }
 
@@ -3031,8 +2174,6 @@ fn build_builtin_registry() -> CommandRegistry {
     r.register(Arc::new(CompactCommand));
     r.register(Arc::new(CopyCommand));
     r.register(Arc::new(HotkeysCommand));
-    r.register(Arc::new(ArminCommand));
-    r.register(Arc::new(EarendilCommand));
     r.register(Arc::new(ContextCommand));
     r.register(Arc::new(UsageCommand));
     // Recognized but inert in v1 (one struct backs them all). The TS builtins
@@ -3078,28 +2219,6 @@ fn register_extension_commands(
             description: command.description,
             session: session.clone(),
         }));
-    }
-}
-
-fn register_js_extension_commands(
-    registry: &mut CommandRegistry,
-    session: Option<crate::js_extensions::JsExtensionSession>,
-) {
-    let Some(session) = session else {
-        return;
-    };
-    for command in &session.commands {
-        let name = if command.starts_with('/') {
-            command.clone()
-        } else {
-            format!("/{command}")
-        };
-        if registry.find(&name).is_none() {
-            registry.register(Arc::new(JsExtensionCommand {
-                name,
-                session: session.clone(),
-            }));
-        }
     }
 }
 
@@ -3150,7 +2269,7 @@ enum TuiMessage {
     ExternalEditorResult(Result<String, String>),
     /// A user-initiated `!command` / `!!command` shell run finished. Routed to
     /// the main loop so the `bashExecution` transcript record is persisted in
-    /// order relative to agent runs (native pi's `recordBashResult` /
+    /// order relative to agent runs (upstream's `recordBashResult` /
     /// `_pendingBashMessages`).
     UserBashFinished(UserBashReport),
 }
@@ -3237,7 +2356,7 @@ fn scoped_catalog(catalog: &[rpi_ai::Model], current_id: &str) -> Vec<rpi_ai::Mo
 
 /// Interactive `/settings` menu.
 ///
-/// A [`SettingsList`] of editable settings (native pi's `SettingsSelectorComponent`):
+/// A [`SettingsList`] of editable settings (upstream's `SettingsSelectorComponent`):
 /// Enter/Space cycles a row's value in place, and the theme/model/thinking/scope
 /// rows open a sub-selector that replaces the active selector (the
 /// `active_selector` slot is single). Value changes apply immediately where the
@@ -3252,8 +2371,6 @@ fn open_settings_selector(
     catalog: &[rpi_ai::Model],
     lane_model_id: &str,
     chat: &Arc<Container>,
-    cwd: &std::path::Path,
-    package_resources: &Arc<crate::packages::PackageResources>,
 ) {
     let settings = crate::settings::load_settings().unwrap_or_default();
     let items = settings_menu_items(&settings, state, lane_model_id);
@@ -3271,18 +2388,10 @@ fn open_settings_selector(
     let catalog_sel = catalog.to_vec();
     let lane_model_sel = lane_model_id.to_string();
     let chat_sel = chat.clone();
-    let cwd_sel = cwd.to_path_buf();
-    let package_resources_sel = package_resources.clone();
     list.on_select(Arc::new(move |item| match item.key.as_str() {
-        "theme" => open_settings_theme_selector(
-            &state_sel,
-            &ec_sel,
-            &editor_sel,
-            &tui_sel,
-            &chat_sel,
-            &cwd_sel,
-            &package_resources_sel,
-        ),
+        "theme" => {
+            open_settings_theme_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel, &chat_sel)
+        }
         "model" => open_settings_model_selector(
             &state_sel,
             &ec_sel,
@@ -3577,21 +2686,12 @@ fn open_settings_theme_selector(
     editor: &Arc<Editor>,
     tui: &Arc<TuiAltScreen>,
     chat: &Arc<Container>,
-    cwd: &std::path::Path,
-    package_resources: &Arc<crate::packages::PackageResources>,
 ) {
-    let mut items = vec![
+    let items = vec![
         SelectItem::new("dark", "Dark").with_description("Default dark theme"),
         SelectItem::new("light", "Light").with_description("Light background"),
         SelectItem::new("monochrome", "Monochrome").with_description("No color accents"),
     ];
-    if state.themes_enabled {
-        for path in package_resources.theme_files() {
-            if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
-                items.push(SelectItem::new(name, name).with_description("Package theme"));
-            }
-        }
-    }
     let list = Arc::new(SelectList::new(items, 10));
 
     let state_sel = state.clone();
@@ -3599,25 +2699,13 @@ fn open_settings_theme_selector(
     let editor_sel = editor.clone();
     let tui_sel = tui.clone();
     let chat_sel = chat.clone();
-    let cwd_sel = cwd.to_path_buf();
-    let package_resources_sel = package_resources.clone();
     list.on_select(Arc::new(move |item| {
         let preset = match item.value.as_str() {
             "light" => Some(ThemePreset::Light),
             "monochrome" => Some(ThemePreset::Monochrome),
             "dark" => Some(ThemePreset::Dark),
             name => {
-                if state_sel.themes_enabled {
-                    if let Ok(custom) = crate::packages::load_theme_with_resources(
-                        &cwd_sel,
-                        name,
-                        &package_resources_sel,
-                    ) {
-                        rpi_tui::global_theme_manager().set(custom.clone());
-                        state_sel.theme_manager.set(custom);
-                    }
-                }
-                add_note_message(&chat_sel, &format!("Theme set to {}.", item.label));
+                add_error_message(&chat_sel, &format!("Unknown theme `{name}`."));
                 close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
                 tui_sel.render_now(true);
                 return;
@@ -3763,7 +2851,7 @@ fn model_selector_items(catalog: &[rpi_ai::Model], lane_model_id: &str) -> Vec<S
             } else {
                 ""
             };
-            // Native pi ranks provider-prefixed queries first, so the bare id
+            // upstream ranks provider-prefixed queries first, so the bare id
             // is not the leading token (`getModelSelectorSearchText`).
             let name = if m.name.is_empty() {
                 String::new()
@@ -4716,7 +3804,6 @@ struct TuiState {
     /// rather than a plain `ToolExecutionComponent`). Phase 5 routing.
     bash_components: Arc<std::sync::Mutex<HashMap<String, Arc<BashExecutionComponent>>>>,
     /// Whether package/custom themes may be selected in this session.
-    themes_enabled: bool,
     /// Persisted display preference toggled by Ctrl+T (shared with the view).
     hide_thinking: Arc<std::sync::Mutex<bool>>,
     /// Global tool-output expansion preference toggled by Ctrl+O (shared with
@@ -4756,7 +3843,7 @@ struct TuiState {
     user_bash_cancel: std::sync::Mutex<Option<CancellationToken>>,
     /// `bashExecution` messages produced by `!command` while an agent run was
     /// in flight. Flushed to the lane on `AgentEnd` so transcript order matches
-    /// native pi's `_pendingBashMessages` (never spliced mid-turn).
+    /// upstream's `_pendingBashMessages` (never spliced mid-turn).
     pending_bash_messages: std::sync::Mutex<Vec<AgentMessage>>,
     /// The footer, updated live by the drain task.
     footer: Arc<FooterComponent>,
@@ -4810,7 +3897,7 @@ struct TuiState {
     /// where images would be shown and echoed back by `/images`.
     show_images: std::sync::Mutex<bool>,
     /// Transcript notices for prompt-cache costs and provider recovery
-    /// diagnostics (native pi `showCacheMissNotices`, default `false`).
+    /// diagnostics (upstream `showCacheMissNotices`, default `false`).
     cache_miss_notices: std::sync::Mutex<bool>,
     /// Submitted-message history for ↑/↓ recall, most recent first (mirrors
     /// the TS editor `history` array). Bounded at [`HISTORY_LIMIT`].
@@ -4845,7 +3932,7 @@ struct TuiState {
     /// Search bar component shown when search is active.
     search_bar: Arc<SearchBar>,
     /// Dock slot listing queued steering/follow-up messages while a run is
-    /// active (native pi's `pendingMessagesContainer`). Empty when nothing is
+    /// active (upstream's `pendingMessagesContainer`). Empty when nothing is
     /// queued, so it renders zero rows and never affects the layout.
     pending_container: Arc<Container>,
     /// Display text for the `app.message.dequeue` binding (e.g. `Alt+Q`),
@@ -4873,12 +3960,12 @@ const AUTO_SEND_PREFIX: &str = "Auto-send in ";
 /// matching the upstream fullscreen viewport behavior.
 const PAGE_SCROLL_OVERLAP: usize = 4;
 
-/// Native pi scrolls a small chunk for each wheel notch rather than moving the
+/// upstream scrolls a small chunk for each wheel notch rather than moving the
 /// transcript one physical row at a time. Three lines stays precise while
 /// avoiding the sluggish feel of the previous implementation.
 const MOUSE_WHEEL_SCROLL_LINES: i32 = 3;
 
-/// Parse the compact key notation used by native Pi settings (for example
+/// Parse the compact key notation used by upstream settings (for example
 /// `ctrl+g`, `shift+tab`, or `escape`) into crossterm's representation.
 fn parse_configured_key(value: &str) -> Option<rpi_tui::KeyCombo> {
     let mut modifiers = KeyModifiers::NONE;
@@ -5015,8 +4102,8 @@ fn keybinding_matches(
 }
 
 /// Display text for the `app.message.dequeue` binding (e.g. `Alt+Q`), used in
-/// the pending-messages hint row. Mirrors native pi's `getAppKeyDisplay`;
-/// falls back to native pi's platform default when nothing is configured.
+/// the pending-messages hint row. Mirrors upstream's `getAppKeyDisplay`;
+/// falls back to upstream's platform default when nothing is configured.
 fn pending_dequeue_hint(bindings: &rpi_tui::Keybindings) -> String {
     let keys = bindings.get_keys(rpi_tui::keybindings::keys::DEQUEUE);
     if keys.is_empty() {
@@ -5037,7 +4124,7 @@ fn double_escape_trigger(last: Option<std::time::Instant>, now: std::time::Insta
     })
 }
 
-/// What one Ctrl+C press should do, per native pi's `handleCtrlC`.
+/// What one Ctrl+C press should do, per upstream's `handleCtrlC`.
 #[derive(Debug, PartialEq, Eq)]
 enum CtrlCAction {
     /// First press: clear the editor and arm the double-press window.
@@ -5046,7 +4133,7 @@ enum CtrlCAction {
     Exit,
 }
 
-/// Native pi's `handleCtrlC`: a press inside the 500ms window quits, otherwise
+/// upstream's `handleCtrlC`: a press inside the 500ms window quits, otherwise
 /// it clears. It never aborts a run — cancelling is `app.interrupt` (Esc)'s job.
 fn ctrl_c_action(last_sigint: Option<std::time::Instant>, now: std::time::Instant) -> CtrlCAction {
     if double_escape_trigger(last_sigint, now) {
@@ -5082,7 +4169,10 @@ impl WindowsPasteRun {
     }
 
     fn feed(&mut self, ch: char, now: std::time::Instant) {
-        if self.last_at.is_some_and(|at| now.duration_since(at) <= PASTE_BURST_GAP) {
+        if self
+            .last_at
+            .is_some_and(|at| now.duration_since(at) <= PASTE_BURST_GAP)
+        {
             self.burst = true;
         }
         self.text.push(ch);
@@ -5100,18 +4190,23 @@ impl WindowsPasteRun {
 /// Never turn a lone Enter into a newline. A queued next key proves this is
 /// an interior pasted newline. At the end of a paste, require clipboard
 /// corroboration before consuming Enter; otherwise preserve submit.
-fn windows_enter_in_paste(run: &WindowsPasteRun, more_queued: bool, clipboard: Option<&str>) -> bool {
+fn windows_enter_in_paste(
+    run: &WindowsPasteRun,
+    more_queued: bool,
+    clipboard: Option<&str>,
+) -> bool {
     if more_queued {
         return true;
     }
     if run.text.is_empty() {
         return false;
     }
-    run.burst && clipboard.is_some_and(|text| {
-        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-        let prefix = format!("{}\n", run.text);
-        normalized.starts_with(&prefix) && normalized.matches('\n').count() >= 10
-    })
+    run.burst
+        && clipboard.is_some_and(|text| {
+            let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+            let prefix = format!("{}\n", run.text);
+            normalized.starts_with(&prefix) && normalized.matches('\n').count() >= 10
+        })
 }
 
 /// Whether a bare Enter is pasted content (insert a newline) rather than a
@@ -5134,6 +4229,7 @@ fn windows_enter_in_paste(run: &WindowsPasteRun, more_queued: bool, clipboard: O
 /// delivers real pastes as `Event::Paste`, and the timing heuristic would
 /// misclassify a remote/mobile client's coalesced text+Enter burst as paste
 /// ("回车变成了换行").
+#[cfg(test)]
 fn enter_is_paste_burst(
     last_text_key_at: Option<std::time::Instant>,
     now: std::time::Instant,
@@ -5174,18 +4270,6 @@ fn probe_paste_input(
     (more_queued, pending)
 }
 
-/// Milliseconds since the last text key, for the [`enter_is_paste_burst`] trace
-/// line (`-` when there was no preceding text key).
-fn gap_ms(last_text_key_at: Option<std::time::Instant>) -> String {
-    match last_text_key_at {
-        Some(previous) => std::time::Instant::now()
-            .duration_since(previous)
-            .as_millis()
-            .to_string(),
-        None => "-".to_string(),
-    }
-}
-
 fn transcript_page_size(viewport_height: usize) -> i32 {
     viewport_height
         .saturating_sub(PAGE_SCROLL_OVERLAP)
@@ -5215,7 +4299,7 @@ fn emergency_exit(tui: &Arc<TuiAltScreen>) -> ! {
     std::process::exit(130);
 }
 
-/// Native pi's `handleCtrlZ` (`app.suspend`): hand the terminal back to the
+/// upstream's `handleCtrlZ` (`app.suspend`): hand the terminal back to the
 /// shell and stop the process. `raise(SIGTSTP)` returns once the user resumes
 /// us with `fg`/`bg`, at which point we re-enter the alternate screen.
 #[cfg(unix)]
@@ -5227,7 +4311,7 @@ fn handle_suspend(tui: &Arc<TuiAltScreen>) {
     tui.resume();
 }
 
-/// Native pi binds no suspend key on Windows (`app.suspend`'s `defaultKeys` is
+/// upstream binds no suspend key on Windows (`app.suspend`'s `defaultKeys` is
 /// empty there), so [`keys::SUSPEND`] never matches and this is unreachable.
 #[cfg(not(unix))]
 fn handle_suspend(_tui: &Arc<TuiAltScreen>) {}
@@ -5366,23 +4450,6 @@ fn navigate_history(state: &Arc<TuiState>, editor: &Arc<Editor>, direction: i32)
 }
 
 impl TuiState {
-    fn begin_js_preparation(&self) -> CancellationToken {
-        let cancellation = CancellationToken::new();
-        if let Some(previous) = self
-            .js_preparation_cancel
-            .lock()
-            .unwrap()
-            .replace(cancellation.clone())
-        {
-            previous.cancel();
-        }
-        cancellation
-    }
-
-    fn finish_js_preparation(&self) {
-        self.js_preparation_cancel.lock().unwrap().take();
-    }
-
     fn cancel_js_preparation(&self) -> bool {
         let cancellation = self.js_preparation_cancel.lock().unwrap().take();
         if let Some(cancellation) = cancellation {
@@ -5437,7 +4504,7 @@ impl TuiState {
         self.apply_status(status);
     }
 
-    /// The dock container listing queued messages (native pi's
+    /// The dock container listing queued messages (upstream's
     /// `pendingMessagesContainer`).
     fn pending_container(&self) -> &Arc<Container> {
         &self.pending_container
@@ -5887,17 +4954,7 @@ fn should_show_startup_listing(verbose: bool, quiet_startup: bool) -> bool {
     verbose || !quiet_startup
 }
 
-fn git_only_update_resources(
-    mut resources: crate::packages::PackageResources,
-) -> crate::packages::PackageResources {
-    resources
-        .packages
-        .retain(|package| matches!(package.source, crate::packages::PackageSource::Git));
-    resources
-}
-
-/// Resolve TUI-only settings with native Pi's project-over-global precedence.
-/// `project_settings` must be ordered `.rpi` then `.pi`; an explicit `Some`
+/// `project_settings` is ordered by precedence; an explicit `Some`
 /// wins even when the value is `false` or zero.
 fn resolve_tui_startup_settings(
     global: &crate::settings::Settings,
@@ -5976,7 +5033,7 @@ pub async fn interactive_tui(
     extra_messages: &[String],
     initial_images: Vec<rpi_ai::types::ImageContent>,
     theme: Option<&str>,
-    no_themes: bool,
+    _no_themes: bool,
     reload_context: &crate::session::ReloadContext,
 ) -> i32 {
     let lane: Arc<dyn AgentLane> = harness.lane("main");
@@ -6000,9 +5057,7 @@ pub async fn interactive_tui(
     let show_images = tui_settings.show_images;
     let cache_miss_notices = tui_settings.cache_miss_notices;
     let quiet_startup = tui_settings.quiet_startup;
-    let update_checks_enabled =
-        !args.offline && std::env::var_os("RPI_DISABLE_UPDATE_CHECK").is_none();
-
+    // rpi only checks its own update channel.
     // Session display preferences (durable, latest-wins) override the
     // settings-file defaults. These are per-session facts stored as custom
     // entries (see `rpi_harness::session::values`), so resuming a session with
@@ -6047,9 +5102,6 @@ pub async fn interactive_tui(
         .map(|skill| skill.name.clone())
         .collect();
 
-    // Resolve package resources for @file autocomplete + session discovery.
-    let package_resources = reload_context.package_resources.clone();
-
     // Channel between the key/callback threads and the main async loop.
     let (tx, mut rx) = mpsc::unbounded_channel::<TuiMessage>();
 
@@ -6065,24 +5117,11 @@ pub async fn interactive_tui(
     } {
         apply_theme_preset(preset);
         theme_manager.apply_preset(preset);
-    } else if !no_themes {
-        if let Some(name) = theme {
-            match crate::packages::load_theme_with_resources(&cwd, name, &package_resources) {
-                Ok(custom) => {
-                    rpi_tui::global_theme_manager().set(custom.clone());
-                    theme_manager.set(custom);
-                }
-                Err(error) => {
-                    eprintln!("warning: could not load package theme `{name}`: {error}");
-                }
-            }
-        }
     }
 
     // ---- TUI + containers ----
     let terminal = Box::new(ProcessTerminal::new());
     let tui = Arc::new(TuiAltScreen::new(terminal, true, None));
-    let js_dialog_bridge = Arc::new(JsDialogBridge::default());
     // Plugin `ask_user` prompts (runtime action 17). Attaching marks this
     // session as interactive so a detached/headless host fails loudly instead
     // of returning a fabricated answer. The mailbox is session-scoped (held in
@@ -6091,68 +5130,14 @@ pub async fn interactive_tui(
     ask_user_bridge.attach();
     tui.set_main_screen_mode(matches!(args.tui_mode, crate::args::TuiMode::Regular));
 
-    if let Some(js) = &reload_context.js_extension_session {
-        if let Err(error) = js.install_ui_runtime(tui.clone()) {
-            eprintln!("warning: could not enable JS custom UI bridge: {error}");
-        } else if let Some(js_active) = js.active_tools() {
-            // Apply the discovery-time JS subset while preserving Rust
-            // built-ins already active in the harness lane. The real TUI
-            // lifecycle reconciliation runs after the key worker starts below.
-            let js_names = js.tool_names();
-            let mut active = lane.get_active_tools().await.unwrap_or_default();
-            active.retain(|name| {
-                crate::session::tool_name_allowed(name, args)
-                    && !js_names.iter().any(|js_name| js_name == name)
-            });
-            active.extend(js_active.into_iter().filter(|name| {
-                js_names.iter().any(|js_name| js_name == name)
-                    && crate::session::tool_name_allowed(name, args)
-            }));
-            active = crate::session::filter_active_tool_names(active, args);
-            let _ = lane.set_active_tools(active).await;
-            active_tool_names = lane.get_active_tools().await.unwrap_or_default();
-        }
-    }
-
     let chat_container = Arc::new(Container::new());
-    if let Some(js) = &reload_context.js_extension_session {
-        // Tool contexts do not have a command-result envelope. Route
-        // `ctx.ui.notify()` through the live transcript so notifications from
-        // tools such as ask_user_question are visible immediately.
-        let chat_notify = chat_container.clone();
-        let tui_notify = tui.clone();
-        if let Err(error) = js.add_runtime_handler(Arc::new(move |action, args| {
-            if action != "ui.notify" {
-                return Err(format!("unsupported capability: {action}"));
-            }
-            let message = args
-                .get("message")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            if !message.is_empty() {
-                if args.get("level").and_then(serde_json::Value::as_str) == Some("error") {
-                    add_error_message(&chat_notify, message);
-                } else {
-                    add_note_message(&chat_notify, message);
-                }
-                tui_notify.request_render(false);
-            }
-            Ok(serde_json::json!(true))
-        })) {
-            if args.verbose {
-                eprintln!("warning: could not enable JS notification bridge: {error}");
-            }
-        }
-    }
     if should_show_startup_listing(args.verbose, quiet_startup) {
         add_welcome_message_with_capabilities(&chat_container, &active_tool_names, &skill_names);
     }
 
     // First-launch gate: if `~/.rpi/.setup_done` is absent, show the welcome
-    // banner + the earendil announcement once, then write the sentinel. The TS
-    // original is a multi-step dialog (theme picker + analytics opt-in); this
-    // v1 simplifies to a one-shot banner (theme still pickable via `/theme`,
-    // analytics deferred — no telemetry wiring). See `extras.rs`.
+    // banner once, then write the sentinel. The banner covers the theme hint;
+    // the theme stays pickable via `/theme`. See `extras.rs`.
     crate::extras::maybe_first_time_setup(&chat_container);
 
     // A --continue/--resume/--session launch opens on an existing JSONL
@@ -6192,7 +5177,7 @@ pub async fn interactive_tui(
             follow: FollowMode::End,
             primary: true,
             overscroll: OverscrollMode::Chain,
-            // Native pi keeps transcript chrome out of the way. Our Auto mode
+            // upstream keeps transcript chrome out of the way. Our Auto mode
             // has no hide timer yet and therefore became effectively permanent
             // after the first wheel event, unlike the upstream experience.
             scrollbar: ScrollbarMode::Hidden,
@@ -6201,7 +5186,7 @@ pub async fn interactive_tui(
     ));
 
     // ---- Editor ----
-    // Bordered box matching native pi: no `> ` prompt, no placeholder — the
+    // Bordered box matching upstream: no `> ` prompt, no placeholder — the
     // editor renders full-width `─` top/bottom borders with padding-only lines
     // (see Editor::render). padding_x:1 gives a 1-col inset inside the box.
     let keybindings = configured_keybindings();
@@ -6216,7 +5201,7 @@ pub async fn interactive_tui(
     ));
 
     // Bash-mode border: a `!`-prefixed draft recolors the editor border to the
-    // bash accent (native pi's `updateEditorBorderColor` / `isBashMode`). The
+    // bash accent (upstream's `updateEditorBorderColor` / `isBashMode`). The
     // editor fires `on_change` for keystrokes and for programmatic
     // `clear`/`set_text`, so the color also resets after a `!command` submits.
     {
@@ -6293,10 +5278,6 @@ pub async fn interactive_tui(
         &mut command_registry,
         reload_context.extension_session.clone(),
     );
-    register_js_extension_commands(
-        &mut command_registry,
-        reload_context.js_extension_session.clone(),
-    );
     let registry = Arc::new(command_registry);
     let mut all_slash_commands = registry.visible_entries();
     all_slash_commands.extend(template_slash_commands);
@@ -6320,7 +5301,6 @@ pub async fn interactive_tui(
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
-        themes_enabled: !no_themes,
         hide_thinking: Arc::new(std::sync::Mutex::new(hide_thinking)),
         tool_outputs_expanded: Arc::new(std::sync::Mutex::new(tool_outputs_expanded)),
         show_terminal_progress,
@@ -6460,20 +5440,10 @@ pub async fn interactive_tui(
         model_catalog: model_catalog_arc.clone(),
         lane_model_id: lane_model_id.clone(),
         cwd: cwd.clone(),
-        package_resources: package_resources.clone(),
         resources: resources_arc.clone(),
         reload_context: Arc::new(reload_context.clone()),
         session: agent_session.clone(),
     };
-
-    if let Some(js) = &reload_context.js_extension_session {
-        let bridge = js_dialog_bridge.clone();
-        if let Err(error) = js.install_ui_dialog_runtime(Arc::new(move |action, args| {
-            bridge.handle_runtime_request(action, args)
-        })) {
-            eprintln!("warning: could not enable JS dialog UI bridge: {error}");
-        }
-    }
 
     let ctx_for_cb = ctx.clone();
     let registry_for_cb = registry.clone();
@@ -6517,7 +5487,7 @@ pub async fn interactive_tui(
                 // `prompt_text()` returned, after the loop's drain points had
                 // passed, so the queued message appeared to disappear.
                 //
-                // Native pi's `steer()` enqueues unconditionally, even after
+                // upstream's `steer()` enqueues unconditionally, even after
                 // the run ends, and the message stays in the queue for the
                 // next run. This matches the TS design and avoids the race
                 // between `activeRun` clearing and the status check.
@@ -6533,7 +5503,7 @@ pub async fn interactive_tui(
             });
             // A queued prompt is echoed only once the loop actually consumes
             // it: the run's `AgentEvent::MessageStart` renders the user bubble
-            // (native pi renders `message_start` for user messages). Until
+            // (upstream renders `message_start` for user messages). Until
             // then it is surfaced by the pending-messages display, so the
             // transcript never shows a message that is still waiting.
             ctx_for_cb.tui.request_render(false);
@@ -6597,43 +5567,7 @@ pub async fn interactive_tui(
         rpi_tui.request_render(false);
     }));
 
-    if update_checks_enabled {
-        let update_args = args.clone();
-        let update_cwd = cwd.clone();
-        let update_project_trusted = project_trusted;
-        let chat = chat_container.clone();
-        let tui = tui.clone();
-        update_check_handles.push(tokio::spawn(async move {
-            let resources = crate::session::package_resources_for_update_check(
-                &update_args,
-                &update_cwd,
-                update_project_trusted,
-            );
-            let report = match crate::npm::NpmCommand::resolve(&update_cwd, update_project_trusted)
-            {
-                Ok(npm_command) => {
-                    crate::updates::check_package_startup_with_resources_and_npm_command_in_cwd(
-                        Some(&resources),
-                        &npm_command,
-                        update_project_trusted.then_some(update_cwd.as_path()),
-                    )
-                    .await
-                }
-                Err(error) => {
-                    add_error_message(
-                        &chat,
-                        &format!("npm package update checks disabled: {error}"),
-                    );
-                    let git_resources = git_only_update_resources(resources);
-                    crate::updates::check_package_startup_with_resources(Some(&git_resources)).await
-                }
-            };
-            if !report.is_empty() {
-                add_update_notices(&chat, &report);
-            }
-            tui.request_render(false);
-        }));
-    }
+    // Only the rpi self-update check runs.
 
     // ---- Streaming drain task ----
     let drain_handle = if let Some(rx) = event_rx {
@@ -6678,14 +5612,14 @@ pub async fn interactive_tui(
     // fire even when the user types nothing.
     let tx_tick = tx.clone();
     let tick_handle = tokio::spawn(async move {
-        // 80ms per frame — native pi's `DEFAULT_INTERVAL_MS`, i.e. a full
+        // 80ms per frame — upstream's `DEFAULT_INTERVAL_MS`, i.e. a full
         // 10-frame cycle every 800ms. The tick only *requests a repaint*; the
         // frame is advanced by `Editor::render` (mirroring `Loader::render`),
         // so streaming output — which schedules a frame per token — spins it
         // faster, and this interval is the floor when the model is silent.
         //
         // Advancing here as well would double-step every tick and make the idle
-        // spinner run at 40ms/frame, twice native pi's rate.
+        // spinner run at 40ms/frame, twice upstream's rate.
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(
             rpi_tui::loader::SPINNER_FRAME_MS,
         ));
@@ -6745,8 +5679,6 @@ pub async fn interactive_tui(
     let lane_for_key = lane.clone();
     let state_for_key = state.clone();
     let model_catalog_for_key = model_catalog_arc.clone();
-    let js_for_key = reload_context.js_extension_session.clone();
-    let js_dialog_for_key = js_dialog_bridge.clone();
     let ask_user_for_key = ask_user_bridge.clone();
     // Ctrl+L routes through the same registry as `/model` (one path, not two),
     // so the key loop needs the same `CommandContext` + registry the submit
@@ -6762,7 +5694,7 @@ pub async fn interactive_tui(
 
     let key_handle = tokio::task::spawn_blocking(move || {
         let mut last_escape_time = None;
-        // Native pi's `handleCtrlC` "press twice to exit" window: the instant of
+        // upstream's `handleCtrlC` "press twice to exit" window: the instant of
         // the last lone Ctrl+C. Shares the 500ms with Esc's double-escape.
         let mut last_sigint_time: Option<std::time::Instant> = None;
         // One event peeked at by the paste-burst probe (which must discard a
@@ -6782,27 +5714,23 @@ pub async fn interactive_tui(
             if !*running_key.lock().unwrap() {
                 break;
             }
-            if !state_for_key.selector_open()
-                && !state_for_key.extension_dialog_open()
-                && js_for_key.as_ref().map_or(true, |js| !js.custom_active())
-            {
-                if let Some(request) = js_dialog_for_key.take_pending() {
-                    open_js_dialog(&ctx_for_key, js_dialog_for_key.clone(), request);
-                } else if let Some(request) = ask_user_for_key.take_pending() {
+            if !state_for_key.selector_open() && !state_for_key.extension_dialog_open() {
+                if let Some(request) = ask_user_for_key.take_pending() {
                     open_ask_user_dialog(&ctx_for_key, ask_user_for_key.clone(), request);
                 }
             }
-            cancel_js_dialog_ui(&ctx_for_key, &js_dialog_for_key);
             let ev = if let Some(ev) = pending_event.take() {
                 ev
             } else {
                 // `event::read()` blocks indefinitely. Poll first so shutdown can
                 // stop and join this worker even when no further key arrives.
-                match crossterm::event::poll(if cfg!(windows) && !windows_paste_run.text.is_empty() {
-                    windows_paste_run.grace()
-                } else {
-                    std::time::Duration::from_millis(50)
-                }) {
+                match crossterm::event::poll(
+                    if cfg!(windows) && !windows_paste_run.text.is_empty() {
+                        windows_paste_run.grace()
+                    } else {
+                        std::time::Duration::from_millis(50)
+                    },
+                ) {
                     Ok(true) => {}
                     Ok(false) => {
                         if cfg!(windows) && !windows_paste_run.text.is_empty() {
@@ -6831,12 +5759,6 @@ pub async fn interactive_tui(
             // full redraw so the constrained layout re-fits the new dimensions.
             if let Event::Resize(_cols, _rows) = ev {
                 tui_for_key.refresh_size();
-                if let Some(js) = &js_for_key {
-                    if js.custom_active() {
-                        let _ = js.send_custom_resize(_cols as usize, _rows as usize);
-                        tui_for_key.request_render(false);
-                    }
-                }
                 continue;
             }
             // Mouse wheel scrolls the transcript (pi supports wheel
@@ -6858,7 +5780,7 @@ pub async fn interactive_tui(
                         }
                     }
                     MouseEventKind::Down(crossterm::event::MouseButton::Right) if cfg!(windows) => {
-                        // Native pi treats Windows right-click as a clipboard
+                        // upstream treats Windows right-click as a clipboard
                         // paste, rather than letting the console deliver the
                         // clipboard contents as individual key events. This is
                         // what preserves the complete payload for
@@ -6995,36 +5917,9 @@ pub async fn interactive_tui(
                         &tui_for_key,
                     );
                 }
-                js_dialog_for_key.cancel_open_requests();
                 tui_for_key.set_render_suspended(false);
                 tui_for_key.request_render(false);
                 continue;
-            }
-
-            if let Some(js) = &js_for_key {
-                if js.custom_active() {
-                    let visible = js.custom_accepts_input();
-                    let data = key_event_to_input(key);
-                    if !data.is_empty() {
-                        // A visible custom owns the whole key stream, so its
-                        // acknowledgement is unnecessary and would add a
-                        // synchronous round-trip to every keystroke. Hidden
-                        // overlays need the consume result to decide whether the
-                        // outer editor should see the key.
-                        if visible {
-                            let _ = js.send_custom_input(&data);
-                            continue;
-                        }
-                        let consumed = js.send_custom_input_with_consumed(&data).unwrap_or(false);
-                        // A hidden component only keeps raw listeners alive (for
-                        // example ask_user_question's reopen shortcut); an
-                        // unconsumed key continues through the outer editor.
-                        if consumed {
-                            tui_for_key.request_render_reusing_scroll_content();
-                            continue;
-                        }
-                    }
-                }
             }
 
             // Ctrl+C cancels an open selector before it reaches the global
@@ -7076,7 +5971,7 @@ pub async fn interactive_tui(
                 continue;
             }
 
-            // 0. Ctrl+C: native pi's `handleCtrlC`. A second press inside the
+            // 0. Ctrl+C: upstream's `handleCtrlC`. A second press inside the
             //    double-press window quits; any other press only clears the
             //    editor (text *and* selection — native `clearEditor`). It never
             //    aborts — `app.interrupt` (Esc) owns cancelling a run — so a
@@ -7118,7 +6013,7 @@ pub async fn interactive_tui(
                 continue;
             }
 
-            // 0b. Ctrl+X: native pi's `app.message.copy` — copy the editor
+            // 0b. Ctrl+X: upstream's `app.message.copy` — copy the editor
             //     selection, else the last assistant reply. Native's Ctrl+C no
             //     longer copies, so selection-copy lives here now.
             if !state_for_key.selector_open()
@@ -7137,7 +6032,7 @@ pub async fn interactive_tui(
                 continue;
             }
 
-            // 0c. Ctrl+Z (Unix only): native pi's `app.suspend` — hand the
+            // 0c. Ctrl+Z (Unix only): upstream's `app.suspend` — hand the
             //     terminal back to the shell and stop ourselves; `SIGTSTP`
             //     returns when the user resumes with `fg`. Windows binds no key
             //     here (native's `defaultKeys` is empty), so this never fires.
@@ -7181,7 +6076,7 @@ pub async fn interactive_tui(
                 continue;
             }
 
-            // 2a. Ctrl+D: native pi's `app.exit`. `handleCtrlD` only fires when
+            // 2a. Ctrl+D: upstream's `app.exit`. `handleCtrlD` only fires when
             //     the editor is empty; with text present the key falls through to
             //     the editor's deleteCharForward (`tui.editor.deleteCharForward`).
             //     It never aborts — that is `app.interrupt` (Esc)'s job.
@@ -7226,7 +6121,7 @@ pub async fn interactive_tui(
                             &tui_for_key,
                         );
                     }
-                    // Native pi's `onEscape` restores the queue before it
+                    // upstream's `onEscape` restores the queue before it
                     // aborts, so an interrupt hands the staged messages back.
                     abort_run_restoring_queue(
                         lane_for_key.clone(),
@@ -7236,7 +6131,7 @@ pub async fn interactive_tui(
                     );
                     continue;
                 }
-                // A running `!command` takes Esc next (native pi's `onEscape`
+                // A running `!command` takes Esc next (upstream's `onEscape`
                 // precedence: streaming → bash → bash-mode editor →
                 // double-escape). The run slot stays occupied until the capture
                 // resolves, so a second Esc is a no-op rather than a
@@ -7270,7 +6165,7 @@ pub async fn interactive_tui(
             }
 
             // 2c. Ctrl+G: edit the current draft in the user's external
-            // editor, matching native Pi's VISUAL/EDITOR fallback chain.
+            // editor, matching upstream's VISUAL/EDITOR fallback chain.
             if keybinding_matches(
                 &keybindings_for_key,
                 &key,
@@ -7281,7 +6176,7 @@ pub async fn interactive_tui(
             }
 
             // 2d. Ctrl+O: toggle all tool output panels between compact and
-            // expanded rendering (native Pi's global output toggle).
+            // expanded rendering (upstream's global output toggle).
             if keybinding_matches(
                 &keybindings_for_key,
                 &key,
@@ -7363,7 +6258,7 @@ pub async fn interactive_tui(
             }
 
             // 2f. Shift+Tab / BackTab: cycle the current model's supported
-            // thinking levels, matching native Pi's thinking-level shortcut.
+            // thinking levels, matching upstream's thinking-level shortcut.
             if keybinding_matches(
                 &keybindings_for_key,
                 &key,
@@ -7598,7 +6493,7 @@ pub async fn interactive_tui(
 
             // `app.message.dequeue` (Alt+Q on Windows, Alt+Up elsewhere):
             // restore every queued steering/follow-up message into the editor
-            // so it can be edited before resending. Mirrors native pi's
+            // so it can be edited before resending. Mirrors upstream's
             // `handleDequeue`; the pending-messages display shows the hint.
             if keybinding_matches(
                 &keybindings_for_key,
@@ -7615,7 +6510,7 @@ pub async fn interactive_tui(
                 // the queue, exactly like the Alt+Enter `follow_up` path above.
                 // Routed through `handle_dequeue` (not the raw restore) so the
                 // `Restored N queued message(s)` status note fires, mirroring
-                // native pi's `handleDequeue`.
+                // upstream's `handleDequeue`.
                 tokio::spawn(handle_dequeue(
                     lane_for_key.clone(),
                     editor_for_key.clone(),
@@ -7678,7 +6573,13 @@ pub async fn interactive_tui(
             // Enter must reach Editor::handle_key so it submits normally.
             if cfg!(windows) {
                 let text_key = match key.code {
-                    KeyCode::Char(c) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => Some(c),
+                    KeyCode::Char(c)
+                        if !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    {
+                        Some(c)
+                    }
                     _ => None,
                 };
                 if let Some(ch) = text_key {
@@ -7690,7 +6591,10 @@ pub async fn interactive_tui(
                     }
                 }
                 if key.modifiers.is_empty()
-                    && matches!(key.code, KeyCode::Enter | KeyCode::Char('\n') | KeyCode::Char('\r'))
+                    && matches!(
+                        key.code,
+                        KeyCode::Enter | KeyCode::Char('\n') | KeyCode::Char('\r')
+                    )
                 {
                     let (more_queued, stashed) = probe_paste_input(pending_event.take(), || {
                         if crossterm::event::poll(PASTE_PROBE).unwrap_or(false) {
@@ -7705,7 +6609,8 @@ pub async fn interactive_tui(
                     } else {
                         None
                     };
-                    if windows_enter_in_paste(&windows_paste_run, more_queued, clipboard.as_deref()) {
+                    if windows_enter_in_paste(&windows_paste_run, more_queued, clipboard.as_deref())
+                    {
                         windows_paste_run.feed('\n', std::time::Instant::now());
                         crate::key_trace::note("windows paste run -> newline");
                         continue;
@@ -7750,7 +6655,7 @@ pub async fn interactive_tui(
     for m in extra_messages {
         prompts.push(m.clone());
     }
-    // ---- Continue a run that recovery repaired, the way native pi does ----
+    // ---- Continue a run that recovery repaired, the way upstream does ----
     // This happens before any user input, and only when nothing was passed on the
     // command line: an explicit `-p` means the user has already said what they
     // want next. Driven here rather than inside the harness so the run's output
@@ -7764,9 +6669,6 @@ pub async fn interactive_tui(
             &tui,
             &state,
             drain_handle.is_some(),
-            reload_context.js_extension_session.as_ref(),
-            &js_dialog_bridge,
-            args,
             Vec::new(),
         )
         .await;
@@ -7789,9 +6691,6 @@ pub async fn interactive_tui(
             &tui,
             &state,
             drain_handle.is_some(),
-            reload_context.js_extension_session.as_ref(),
-            &js_dialog_bridge,
-            args,
             std::mem::take(&mut images),
         )
         .await;
@@ -7826,9 +6725,6 @@ pub async fn interactive_tui(
                     &tui,
                     &state,
                     drain_handle.is_some(),
-                    reload_context.js_extension_session.as_ref(),
-                    &js_dialog_bridge,
-                    args,
                     prompt_images,
                 )
                 .await;
@@ -7861,7 +6757,7 @@ pub async fn interactive_tui(
                 );
                 // While a run is in flight the message is deferred so it is not
                 // spliced into the middle of a turn's tool sequence; it is
-                // flushed at `AgentEnd` (native pi `_pendingBashMessages`).
+                // flushed at `AgentEnd` (upstream `_pendingBashMessages`).
                 if *state.status.lock().unwrap() == RunStatus::Idle {
                     if let Err(error) = lane.append_message(message).await {
                         add_error_message(
@@ -8105,20 +7001,11 @@ pub async fn interactive_tui(
     }
 
     // ---- Shutdown ----
-    // Wake any Node `ctx.ui.*` request that is still waiting on the dialog
-    // bridge before joining the key worker and restoring the terminal.
-    js_dialog_bridge.cancel_all();
     ask_user_bridge.shutdown();
     *running.lock().unwrap() = false;
     for handle in update_check_handles {
         handle.abort();
         let _ = handle.await;
-    }
-    // A hidden custom input listener can leave the key worker blocked on a
-    // synchronous Node response. Stop the host first so transport shutdown
-    // wakes that request before we join the worker.
-    if let Some(js) = &reload_context.js_extension_session {
-        js.shutdown();
     }
     // The input worker checks `running` at least every 50ms. Join it before
     // restoring cooked mode so no late event read races terminal cleanup.
@@ -8134,7 +7021,7 @@ pub async fn interactive_tui(
     reload_bridge_handle.abort();
     tui.stop(Default::default());
 
-    // Native pi prints how to resume the session after an interactive exit so
+    // upstream prints how to resume the session after an interactive exit so
     // a terminal that scrolled away can be recovered. Mirrors
     // `formatResumeCommand` (id + `--session-dir` only when non-default).
     let session_id = harness.session().storage().metadata().id;
@@ -8150,85 +7037,6 @@ pub async fn interactive_tui(
 // ===========================================================================
 // Run a single prompt (streaming or blocking)
 // ===========================================================================
-
-/// Prepare the session's persistent Node host immediately before a real prompt
-/// enters the agent loop. The first call starts the lazy host; later calls run
-/// `before_agent_start` again on that host so each prompt sees current state.
-/// Keeping startup here leaves an idle TUI free of a Node child while still
-/// giving the lifecycle hook the fully installed UI bridge.
-async fn ensure_js_runtime_before_prompt(
-    js: Option<&crate::js_extensions::JsExtensionSession>,
-    lane: &Arc<dyn AgentLane>,
-    state: &Arc<TuiState>,
-    dialog_bridge: &JsDialogBridge,
-    args: &Args,
-) -> bool {
-    let Some(js) = js else {
-        return true;
-    };
-    let cancellation = state.begin_js_preparation();
-    let worker_cancellation = cancellation.clone();
-    let js_for_start = js.clone();
-    let mut worker = tokio::task::spawn_blocking(move || {
-        js_for_start.prepare_for_prompt_with_cancellation(&worker_cancellation)
-    });
-    let result = tokio::select! {
-        result = &mut worker => result,
-        _ = cancellation.cancelled() => {
-            dialog_bridge.cancel_open_requests();
-            let js_for_cancel = js.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                js_for_cancel.cancel_prompt_preparation();
-            }).await;
-            worker.await
-        }
-    };
-    let was_cancelled = cancellation.is_cancelled();
-    if was_cancelled {
-        dialog_bridge.cancel_open_requests();
-        let js_for_cancel = js.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            js_for_cancel.cancel_prompt_preparation();
-        })
-        .await;
-        state.finish_js_preparation();
-        dialog_bridge.reopen();
-        return false;
-    }
-    state.finish_js_preparation();
-    match result {
-        Ok(Ok(())) => {
-            // The lifecycle hook can change the JS-only active tool set once
-            // it sees the real TUI context. Merge that subset with the Rust
-            // built-ins while applying the command-line tool policy.
-            if let Some(js_active) = js.active_tools() {
-                let js_names = js.tool_names();
-                let mut active = lane.get_active_tools().await.unwrap_or_default();
-                active.retain(|name| {
-                    crate::session::tool_name_allowed(name, args)
-                        && !js_names.iter().any(|js_name| js_name == name)
-                });
-                active.extend(js_active.into_iter().filter(|name| {
-                    js_names.iter().any(|js_name| js_name == name)
-                        && crate::session::tool_name_allowed(name, args)
-                }));
-                active = crate::session::filter_active_tool_names(active, args);
-                let _ = lane.set_active_tools(active).await;
-            }
-        }
-        Ok(Err(error)) => {
-            if args.verbose {
-                eprintln!("warning: could not start JS extension runtime: {error}");
-            }
-        }
-        Err(error) => {
-            if args.verbose {
-                eprintln!("warning: JS extension runtime worker failed: {error}");
-            }
-        }
-    }
-    true
-}
 
 fn launch_external_editor(draft: String, tx: mpsc::UnboundedSender<TuiMessage>) {
     std::thread::spawn(move || {
@@ -8305,6 +7113,11 @@ fn reconcile_streamed_assistant_completion(
 /// `AgentEvent` drain task renders the response live and the completed outcome
 /// reconciles its final snapshot. When false (no `event_rx`), this falls back
 /// to the blocking await-final-text path.
+
+/// Drive a single prompt through the lane. When `streaming` is true, the
+/// `AgentEvent` drain task renders the response live and the completed outcome
+/// reconciles its final snapshot. When false (no `event_rx`), this falls back
+/// to the blocking await-final-text path.
 async fn run_prompt_streaming(
     lane: &Arc<dyn AgentLane>,
     prompt: &str,
@@ -8312,30 +7125,14 @@ async fn run_prompt_streaming(
     tui: &Arc<TuiAltScreen>,
     state: &Arc<TuiState>,
     streaming: bool,
-    js: Option<&crate::js_extensions::JsExtensionSession>,
-    dialog_bridge: &JsDialogBridge,
-    args: &Args,
     images: Vec<rpi_ai::types::ImageContent>,
 ) {
-    // The persistent Node host is intentionally started at the first real
-    // prompt. By this point the TUI key worker and all UI/runtime handlers are
-    // live, so a `before_agent_start` hook may safely open a native dialog. A
-    // session with no prompt never starts Node merely to render its welcome
-    // screen; JS commands/tools still trigger the same lazy ensure path.
-    // Preparation is part of the active turn. Mark it working before Node can
-    // block so Ctrl+D and Esc retain their documented abort semantics for
-    // initial argv prompts as well as editor submissions.
     state.set_status(RunStatus::Working);
     tui.request_render(false);
-    if !ensure_js_runtime_before_prompt(js, lane, state, dialog_bridge, args).await {
-        state.set_status(RunStatus::Idle);
-        tui.request_render(false);
-        return;
-    }
 
     let outcome = if resume {
         // Continuing an interrupted run: no new user turn, just the provider call
-        // the interrupted run never reached. Native pi behaves the same way.
+        // the interrupted run never reached. upstream behaves the same way.
         match lane.resume_pending().await {
             Ok(Some(result)) => Ok(result),
             // Nothing to resume after all: leave the status alone and let the
@@ -8681,7 +7478,7 @@ fn transcript_has_live_panel(
 }
 
 /// Prepend restored queued messages to the draft the user may already have
-/// typed (native pi's `restoreQueuedMessagesToEditor` places them first).
+/// typed (upstream's `restoreQueuedMessagesToEditor` places them first).
 fn merge_queued_into_draft(queued_text: &str, current: &str) -> String {
     if current.trim().is_empty() {
         queued_text.to_string()
@@ -8693,7 +7490,7 @@ fn merge_queued_into_draft(queued_text: &str, current: &str) -> String {
 /// Place the caret at the END of `text` after `set_text`. `set_text` resets the
 /// caret to `(0, 0)`, and the last line's **byte** length is the right column:
 /// a char count was wrong for multibyte drafts, and row 0 was wrong for a
-/// multi-line one (native pi's `setTextInternal(text, "end")`).
+/// multi-line one (upstream's `setTextInternal(text, "end")`).
 fn set_editor_text_caret_at_end(editor: &Arc<Editor>, text: &str) {
     editor.set_text(text);
     let last_row = text.split('\n').count().saturating_sub(1);
@@ -8702,7 +7499,7 @@ fn set_editor_text_caret_at_end(editor: &Arc<Editor>, text: &str) {
 }
 
 /// Drain every queued steering/follow-up message out of the lane and restore it
-/// to the editor (native pi's `restoreQueuedMessagesToEditor`). Returns how many
+/// to the editor (upstream's `restoreQueuedMessagesToEditor`). Returns how many
 /// were restored; the queue is consumed either way, so the dock drops its rows.
 ///
 /// Runs on a spawned task rather than through the [`TuiMessage`] mailbox: the
@@ -8751,7 +7548,7 @@ async fn restore_queued_messages_to_editor(
 }
 
 /// `app.message.dequeue`: restore the queued messages and report the count, like
-/// native pi's `handleDequeue` (`Restored N queued message(s)` / `No queued
+/// upstream's `handleDequeue` (`Restored N queued message(s)` / `No queued
 /// messages to restore`). The status is a dim transcript note (rpi's analog of
 /// native `showStatus`).
 async fn handle_dequeue(
@@ -8775,7 +7572,7 @@ async fn handle_dequeue(
 }
 
 /// Cancel the active run the native-pi way: pull every queued steering /
-/// follow-up message back into the editor FIRST, then abort. Native pi's
+/// follow-up message back into the editor FIRST, then abort. upstream's
 /// `onEscape` does exactly this during streaming
 /// (`restoreQueuedMessagesToEditor({abort: true})`), so a cancel never silently
 /// swallows messages the user staged while the run was in flight — they land in
@@ -8834,7 +7631,7 @@ async fn handle_agent_event(
             state.set_status(RunStatus::Idle);
             // Flush any `!command` results that completed mid-run: the run's
             // tool sequence is closed, so appending now keeps transcript order
-            // intact (native pi's `flushPendingBashMessages`).
+            // intact (upstream's `flushPendingBashMessages`).
             let pending: Vec<AgentMessage> =
                 std::mem::take(&mut *state.pending_bash_messages.lock().unwrap());
             for message in pending {
@@ -8999,7 +7796,7 @@ async fn handle_agent_event(
                     .lock()
                     .unwrap()
                     .observe(a, &rpi_harness::cache_stats::NoPrices);
-                // Native pi gates these behind `showCacheMissNotices`
+                // upstream gates these behind `showCacheMissNotices`
                 // (default `false`); the tracker still runs so the footer's
                 // cache-hit rate stays accurate either way.
                 let cache_miss_notices = *state.cache_miss_notices.lock().unwrap();
@@ -9173,7 +7970,7 @@ fn open_selector(
 
 /// Open a searchable selector: the list plus a fuzzy-filter search box.
 ///
-/// Returns the wrapper so callers can prefill the query (native pi's
+/// Returns the wrapper so callers can prefill the query (upstream's
 /// `initialSearchInput`). Mirrors `SelectSubmenu` with `searchable: true`.
 fn open_searchable_selector(
     state: &Arc<TuiState>,
@@ -9379,7 +8176,7 @@ fn cycle_prev_model(catalog: &[rpi_ai::Model], current_id: &str) -> Option<rpi_a
 }
 
 /// Build + open the `/session` selector. Lists JSONL session files under the
-/// default session dir (`<cwd>/.rpi/sessions`, with legacy `.pi/sessions`
+/// default session dir (`<cwd>/.rpi/sessions`
 /// fallback), newest-first, labelled with the session name or first prompt so
 /// two sessions are distinguishable. Header-only sessions are skipped: there is
 /// nothing to switch to.
@@ -9574,21 +8371,12 @@ fn open_theme_selector(
     editor_container: &Arc<Container>,
     editor: &Arc<Editor>,
     tui: &Arc<TuiAltScreen>,
-    cwd: &std::path::Path,
-    package_resources: &Arc<crate::packages::PackageResources>,
 ) {
-    let mut items = vec![
+    let items = vec![
         SelectItem::new("dark", "Dark").with_description("Default dark theme"),
         SelectItem::new("light", "Light").with_description("Light background"),
         SelectItem::new("monochrome", "Monochrome").with_description("No color accents"),
     ];
-    if state.themes_enabled {
-        for path in package_resources.theme_files() {
-            if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
-                items.push(SelectItem::new(name, name).with_description("Package theme"));
-            }
-        }
-    }
     let list = Arc::new(SelectList::new(items, 10));
 
     let state_sel = state.clone();
@@ -9596,25 +8384,13 @@ fn open_theme_selector(
     let editor_sel = editor.clone();
     let tui_sel = tui.clone();
     let chat_sel = state.chat_container.clone();
-    let cwd_sel = cwd.to_path_buf();
-    let package_resources_sel = package_resources.clone();
     list.on_select(Arc::new(move |item| {
         let preset = match item.value.as_str() {
             "light" => Some(ThemePreset::Light),
             "monochrome" => Some(ThemePreset::Monochrome),
             "dark" => Some(ThemePreset::Dark),
             name => {
-                if state_sel.themes_enabled {
-                    if let Ok(custom) = crate::packages::load_theme_with_resources(
-                        &cwd_sel,
-                        name,
-                        &package_resources_sel,
-                    ) {
-                        rpi_tui::global_theme_manager().set(custom.clone());
-                        state_sel.theme_manager.set(custom);
-                    }
-                }
-                add_note_message(&chat_sel, &format!("Theme set to {}.", item.label));
+                add_error_message(&chat_sel, &format!("Unknown theme `{name}`."));
                 close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
                 tui_sel.render_now(true);
                 return;
@@ -10151,33 +8927,6 @@ fn add_update_notices(container: &Arc<Container>, report: &crate::updates::Updat
         add_update_panel(&group, "Update Available", &body, colors.warning);
     }
 
-    let package_notices = report
-        .notices
-        .iter()
-        .filter(|notice| notice.name != "rpi")
-        .collect::<Vec<_>>();
-    if !package_notices.is_empty() {
-        let command = package_notices[0].command.as_str();
-        let mut lines = vec![format!(
-            "{} {}{}",
-            colors.muted.fg("Package updates are available. Run"),
-            colors.accent.fg(command),
-            colors.muted.fg(".")
-        )];
-        lines.push(colors.muted.fg("Packages:"));
-        lines.extend(
-            package_notices
-                .into_iter()
-                .map(|notice| format!("- {} {} -> {}", notice.name, notice.current, notice.latest)),
-        );
-        add_update_panel(
-            &group,
-            "Package Updates Available",
-            &lines.join("\n"),
-            colors.warning,
-        );
-    }
-
     // Other transcript producers append concurrently. Add the fully built
     // group in one operation so card borders and content cannot interleave
     // with user, assistant, tool, or extension messages.
@@ -10239,8 +8988,6 @@ fn add_help_message(container: &Arc<Container>) {
         ("/compact", "Compact the conversation"),
         ("/copy", "Copy last reply to clipboard"),
         ("/hotkeys", "Show keyboard shortcuts"),
-        ("/armin", "🐾 Easter egg"),
-        ("/earendil", "Earendil announcement"),
     ];
     let cmd_w = cmds.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
     for (cmd, desc) in cmds {
@@ -10385,7 +9132,7 @@ fn collect_transcript_lines(chat_container: &Arc<Container>) -> Vec<String> {
 }
 
 /// Build the shell command that resumes `session_id` in this project, or
-/// `None` when there is nothing to resume. Mirrors native pi's
+/// `None` when there is nothing to resume. Mirrors upstream's
 /// `formatResumeCommand`: `rpi --session <id>`, prefixing
 /// `--session-dir <dir>` only when a non-default directory was requested.
 fn format_resume_command(
@@ -10410,7 +9157,7 @@ fn format_resume_command(
 }
 
 /// Quote a shell argument when it contains whitespace or shell metacharacters
-/// (mirrors native pi's `quoteIfNeeded`).
+/// (mirrors upstream's `quoteIfNeeded`).
 fn quote_shell_arg(value: &str) -> String {
     let needs_quoting = value.is_empty()
         || value
@@ -10514,7 +9261,7 @@ fn show_context_panel(
 
     if skills.is_empty() {
         lines.push(
-            "  Skills: (none discovered — create .rpi/skills/ (.pi/skills also works) or ~/.rpi/agent/skills/)".into(),
+            "  Skills: (none discovered — create .rpi/skills/ or ~/.rpi/agent/skills/)".into(),
         );
     } else {
         lines.push(format!("  Skills ({}):", skills.len()));
@@ -10531,7 +9278,7 @@ fn show_context_panel(
 
     if templates.is_empty() {
         lines.push(
-            "  Prompt templates: (none — create .rpi/prompts/ (.pi/prompts also works) or ~/.rpi/agent/prompts/)".into(),
+            "  Prompt templates: (none — create .rpi/prompts/ or ~/.rpi/agent/prompts/)".into(),
         );
     } else {
         lines.push(format!("  Prompt templates ({}):", templates.len()));
@@ -10686,7 +9433,6 @@ mod tests {
             current_assistant: Arc::new(std::sync::Mutex::new(None)),
             tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
             bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            themes_enabled: true,
             hide_thinking: Arc::new(std::sync::Mutex::new(false)),
             tool_outputs_expanded: Arc::new(std::sync::Mutex::new(false)),
             show_terminal_progress: true,
@@ -11036,7 +9782,7 @@ mod tests {
             format_resume_command("abc-123", cwd, None).as_deref(),
             Some("rpi --session abc-123")
         );
-        // The default dir carries no flag (mirrors native pi).
+        // The default dir carries no flag (mirrors upstream).
         let default = crate::session::default_session_dir(cwd);
         assert_eq!(
             format_resume_command("abc-123", cwd, Some(default.as_path())).as_deref(),
@@ -11055,41 +9801,6 @@ mod tests {
         assert_eq!(quote_shell_arg("plain"), "plain");
         assert_eq!(quote_shell_arg("with space"), "\"with space\"");
         assert_eq!(quote_shell_arg("a&b"), "\"a&b\"");
-    }
-
-    #[test]
-    fn invalid_npm_command_fallback_keeps_only_git_package_checks() {
-        let tmp = tempfile::tempdir().unwrap();
-        let git_root = tmp.path().join(".pi/git/github.com/example/repo");
-        let local_root = tmp.path().join("local-package");
-        std::fs::create_dir_all(git_root.join(".git")).unwrap();
-        std::fs::create_dir_all(&local_root).unwrap();
-        std::fs::write(
-            git_root.join("package.json"),
-            r#"{"name":"git-demo","version":"1.0.0"}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            local_root.join("package.json"),
-            r#"{"name":"local-demo","version":"1.0.0"}"#,
-        )
-        .unwrap();
-        let resources = crate::packages::discover(
-            tmp.path(),
-            &[
-                "git:github.com/example/repo".to_string(),
-                local_root.to_string_lossy().into_owned(),
-            ],
-        );
-        assert_eq!(resources.packages.len(), 2);
-
-        let filtered = git_only_update_resources(resources);
-
-        assert_eq!(filtered.packages.len(), 1);
-        assert!(matches!(
-            filtered.packages[0].source,
-            crate::packages::PackageSource::Git
-        ));
     }
 
     #[test]
@@ -11224,7 +9935,7 @@ mod tests {
 
     #[test]
     fn tui_startup_settings_read_native_nested_terminal_block() {
-        // Native pi nests these under `terminal`; rpi's flat keys stay
+        // upstream nests these under `terminal`; rpi's flat keys stay
         // compatible and the nested block is the fallback.
         let global = crate::settings::Settings {
             terminal: Some(crate::settings::TerminalSettings {
@@ -11313,7 +10024,7 @@ mod tests {
         let cancel = state.begin_user_bash();
         assert!(state.user_bash_running());
         // Esc cancels without freeing the slot; the spawned task clears it when
-        // the capture resolves (native pi's `isBashRunning`).
+        // the capture resolves (upstream's `isBashRunning`).
         assert!(state.cancel_user_bash());
         assert!(state.user_bash_running());
         assert!(cancel.is_cancelled());
@@ -11328,75 +10039,6 @@ mod tests {
         assert!(should_dispatch_key(KeyEventKind::Press));
         assert!(should_dispatch_key(KeyEventKind::Repeat));
         assert!(!should_dispatch_key(KeyEventKind::Release));
-    }
-
-    #[test]
-    fn key_event_encoding_matches_pi_keybinding_protocol() {
-        let key = |code, modifiers| KeyEvent::new(code, modifiers);
-        assert_eq!(
-            key_event_to_input(key(KeyCode::Enter, KeyModifiers::NONE)),
-            "\r"
-        );
-        assert_eq!(
-            key_event_to_input(key(KeyCode::Enter, KeyModifiers::SHIFT)),
-            "\x1b[13;2u"
-        );
-        assert_eq!(
-            key_event_to_input(key(KeyCode::Tab, KeyModifiers::SHIFT)),
-            "\x1b[9;2u"
-        );
-        assert_eq!(
-            key_event_to_input(key(KeyCode::BackTab, KeyModifiers::SHIFT)),
-            "\x1b[Z"
-        );
-        assert_eq!(
-            key_event_to_input(key(KeyCode::BackTab, KeyModifiers::NONE)),
-            "\x1b[Z"
-        );
-        assert_eq!(
-            key_event_to_input(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
-            "\x03"
-        );
-        assert_eq!(
-            key_event_to_input(key(KeyCode::Char('o'), KeyModifiers::CONTROL)),
-            "\x0f"
-        );
-        assert_eq!(
-            key_event_to_input(key(KeyCode::Char('!'), KeyModifiers::SHIFT)),
-            "!"
-        );
-        assert_eq!(
-            key_event_to_input(key(KeyCode::Char('1'), KeyModifiers::SHIFT)),
-            "1"
-        );
-    }
-
-    #[test]
-    fn dialog_cancel_before_open_is_consumed_without_stranding_request() {
-        let bridge = JsDialogBridge::default();
-        let (sender, receiver) = std_mpsc::channel();
-        bridge.pending.lock().unwrap().push_back(JsDialogPending {
-            request: JsDialogRequest {
-                id: "dialog-1".into(),
-                method: "input".into(),
-                title: String::new(),
-                message: String::new(),
-                options: Vec::new(),
-                placeholder: None,
-                prefill: None,
-            },
-            result: sender,
-        });
-
-        // Model the cancellation arriving after the queue entry has been
-        // removed but before the TUI has installed the native widget.
-        bridge.cancel("dialog-1");
-        assert!(bridge.take_pending().is_none());
-        assert_eq!(
-            receiver.recv().unwrap(),
-            serde_json::json!({ "cancelled": true })
-        );
-        assert!(bridge.cancelled_before_open.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -11511,20 +10153,12 @@ mod tests {
     fn update_notices_render_inside_the_transcript() {
         let chat = Arc::new(Container::new());
         let report = crate::updates::UpdateReport {
-            notices: vec![
-                crate::updates::UpdateNotice {
-                    name: "rpi".into(),
-                    current: "0.1.10".into(),
-                    latest: "0.1.11".into(),
-                    command: "rpi update".into(),
-                },
-                crate::updates::UpdateNotice {
-                    name: "rpi-search".into(),
-                    current: "0.1.0".into(),
-                    latest: "0.1.1".into(),
-                    command: "rpi pi-package update".into(),
-                },
-            ],
+            notices: vec![crate::updates::UpdateNotice {
+                name: "rpi".into(),
+                current: "0.1.10".into(),
+                latest: "0.1.11".into(),
+                command: "rpi update".into(),
+            }],
             warnings: vec![crate::updates::UpdateWarning {
                 message: "The previously scheduled rpi update failed: access denied".into(),
                 command: "rpi update".into(),
@@ -11543,9 +10177,6 @@ mod tests {
         assert!(plain.contains("Update Available"), "{plain}");
         assert!(plain.contains("New version 0.1.11 is available"), "{plain}");
         assert!(plain.contains("rpi update"), "{plain}");
-        assert!(plain.contains("Package Updates Available"), "{plain}");
-        assert!(plain.contains("rpi pi-package update"), "{plain}");
-        assert!(plain.contains("- rpi-search 0.1.0 -> 0.1.1"), "{plain}");
     }
 
     #[test]
@@ -11748,8 +10379,6 @@ mod tests {
         resolves_to("/think", "/thinking"); // alias
         resolves_to("/tools", "/tools");
         resolves_to("/images", "/images");
-        resolves_to("/armin", "/armin");
-        resolves_to("/earendil", "/earendil");
         resolves_to("/context", "/context");
         // Out-of-v1-scope commands resolve to their own UnsupportedCommand entry.
         resolves_to("/settings", "/settings");
@@ -11791,8 +10420,6 @@ mod tests {
             "/images",
             "/thinking",
             "/usage",
-            "/armin",
-            "/earendil",
         ] {
             assert!(
                 names.contains(&recognized.to_string()),
@@ -11821,7 +10448,6 @@ mod tests {
             current_assistant: Arc::new(std::sync::Mutex::new(None)),
             tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
             bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            themes_enabled: true,
             hide_thinking: Arc::new(std::sync::Mutex::new(false)),
             tool_outputs_expanded: Arc::new(std::sync::Mutex::new(false)),
             show_terminal_progress: true,
@@ -12295,7 +10921,6 @@ mod tests {
             current_assistant: Arc::new(std::sync::Mutex::new(None)),
             tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
             bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            themes_enabled: true,
             hide_thinking: Arc::new(std::sync::Mutex::new(false)),
             tool_outputs_expanded: Arc::new(std::sync::Mutex::new(false)),
             show_terminal_progress: true,
@@ -12382,7 +11007,6 @@ mod tests {
             current_assistant: Arc::new(std::sync::Mutex::new(None)),
             tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
             bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            themes_enabled: true,
             hide_thinking: Arc::new(std::sync::Mutex::new(false)),
             tool_outputs_expanded: Arc::new(std::sync::Mutex::new(false)),
             show_terminal_progress: true,
@@ -12472,7 +11096,6 @@ mod tests {
             current_assistant: Arc::new(std::sync::Mutex::new(None)),
             tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
             bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            themes_enabled: true,
             hide_thinking: Arc::new(std::sync::Mutex::new(false)),
             tool_outputs_expanded: Arc::new(std::sync::Mutex::new(false)),
             show_terminal_progress: true,
@@ -12565,7 +11188,6 @@ mod tests {
             current_assistant: Arc::new(std::sync::Mutex::new(None)),
             tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
             bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            themes_enabled: true,
             hide_thinking: Arc::new(std::sync::Mutex::new(false)),
             tool_outputs_expanded: Arc::new(std::sync::Mutex::new(false)),
             show_terminal_progress: true,
@@ -12662,7 +11284,7 @@ mod tests {
 
     #[test]
     fn ctrl_c_clears_first_and_only_exits_inside_the_window() {
-        // Native pi's `handleCtrlC`: a lone press clears the editor and never
+        // upstream's `handleCtrlC`: a lone press clears the editor and never
         // quits by itself; only a second press within 500ms exits. It must not
         // abort — Esc owns that.
         let now = std::time::Instant::now();

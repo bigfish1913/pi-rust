@@ -640,7 +640,7 @@ pub fn tool_result_requests_markdown(details: Option<&Value>) -> bool {
 
 /// The skill name when `tool_name` is a `read` of a `SKILL.md` file (the
 /// `SKILL.md` parent directory's basename), else `None`. A skill read renders
-/// as native Pi's `[skill] <name>` box.
+/// as upstream's `[skill] <name>` box.
 pub fn skill_tool_name(tool_name: &str, args: &Value) -> Option<String> {
     if tool_name != "read" {
         return None;

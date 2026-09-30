@@ -261,9 +261,8 @@ rpi install my-ext --path ../my-ext     # local, for development
 rpi dev                                 # build + watch + live reload
 ```
 
-The host loads project `.rpi/extensions` (with `.pi/extensions` as the Pi
-compatibility fallback), then global `~/.rpi/agent/extensions`, then any
-`--extensions-dir`.
+The host loads project `.rpi/extensions`, then global
+`~/.rpi/agent/extensions`, then any `--extensions-dir`.
 
 Ready-to-install extensions live in the companion
 [`pi-rust/rpi-package`](https://github.com/pi-rust/rpi-package) repository, with
@@ -307,11 +306,8 @@ machine. See [`docs/remote-mode.md`](docs/remote-mode.md).
 | Platforms | Linux, macOS, Windows (CI runs the suite on Linux) |
 | Not yet | Intel macOS prebuilt binaries |
 
-`rpi` is a Rust port of the MIT-licensed TypeScript
-[`pi`](https://github.com/earendil-works/pi) SDK, not a fork of its runtime — no
-Pi or Node component is required. Compatibility gaps are tracked honestly in
-[`docs/native-pi-missing-features.md`](docs/native-pi-missing-features.md); that
-file is a better answer to "is it really at parity?" than any claim here.
+`rpi` is a self-contained Rust coding-agent stack. No Node component is
+required and none is loaded.
 
 ## Documentation
 
@@ -336,9 +332,7 @@ The whole test suite runs offline: `cargo test --workspace --locked`.
 
 MIT. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
-This is a Rust port of [earendil-works/pi](https://github.com/earendil-works/pi)
-(© Mario Zechner, MIT). The `rpi-*` crates are a Rust-native reimplementation of
-the original MIT-licensed TypeScript SDK.
+The `rpi-*` crates are a Rust-native coding-agent stack.
 
 ## Star history
 

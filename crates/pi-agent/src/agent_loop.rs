@@ -393,7 +393,7 @@ async fn run_loop(
                 return Ok(LoopOutcome::Completed);
             }
 
-            // Keep the native Pi ordering here: steering is drained after the
+            // Keep the upstream ordering here: steering is drained after the
             // tool batch settles, even when the run was cancelled. This makes
             // messages queued while a blocking tool was active part of the
             // returned transcript/context instead of leaving them stranded in

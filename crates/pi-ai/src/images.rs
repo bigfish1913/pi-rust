@@ -1,10 +1,10 @@
 //! Image generation API.
 //!
-//! Port of native Pi's `packages/ai/src/images.ts`,
+//! Port of upstream's `packages/ai/src/images.ts`,
 //! `images-api-registry.ts`, `image-models.ts` and the built-in
 //! `api/openrouter-images.ts` provider.
 //!
-//! Native pi ships one built-in image API — OpenRouter's chat-completions
+//! Upstream ships one built-in image API — OpenRouter's chat-completions
 //! image modality (`openrouter-images`) — and a registry so extensions can
 //! register more. `generate_images` resolves the API for a model and dispatches
 //! to its provider.

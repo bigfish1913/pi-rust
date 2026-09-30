@@ -142,26 +142,22 @@ The fix consults *both*: `has_header_auth(&opts.headers) || has_header_auth(&mod
 the TS net effect and lets a Bearer folded onto `model.headers` authenticate. A
 regression test (`header_auth_on_model_headers_counts_as_owned`) pins it.
 
-### 4a. ✅ RESOLVED — `~/.rpi/agent/` is nested (parity with upstream `~/.pi/agent/`)
+### 4a. ✅ RESOLVED — `~/.rpi/agent/` is nested
 
-**Status.** v1 now mirrors upstream `getAgentDir()`: config lives under
-`~/.rpi/agent/` (`auth.json`, `models.json`, `settings.json`, `trust.json`),
-matching `~/.pi/agent/`. `RPI_CODING_AGENT_DIR` (absolute path only) overrides
-the agent dir itself — same semantics as `PI_CODING_AGENT_DIR`. The goal
-(".pi 目录靠过来就能用" — drop a `.pi/agent/` dir at `~/.rpi/agent/` or point
-`RPI_CODING_AGENT_DIR` at it and it works) is met for the config layer: rpi
-reads the same `auth.json`/`models.json`/`settings.json`/`trust.json` pi
-writes, honors a saved `defaultModel`/`defaultThinkingLevel`/`theme`, and
-expands `$ENV`/`!command` config values (§4c).
+**Status.** Config lives under `~/.rpi/agent/` (`auth.json`, `models.json`,
+`settings.json`, `trust.json`). `RPI_CODING_AGENT_DIR` (absolute path only)
+overrides the agent dir itself. rpi honors a saved
+`defaultModel`/`defaultThinkingLevel`/`theme` and expands `$ENV`/`!command`
+config values (§4c).
 
 **Migration.** A one-shot `config::migrate_legacy_layout()` (called from
 `app::run` on startup, **only when `RPI_CODING_AGENT_DIR` is unset**) moves
-legacy flat `~/.rpi/{auth.json,models.json,.setup_done,.earendil_seen}` into
+legacy flat `~/.rpi/{auth.json,models.json,.setup_done}` into
 `~/.rpi/agent/`. It's idempotent, best-effort (rename with copy-fallback),
 no-ops when `agent/` already exists or no flat files are present, and never
 blocks startup. Existing flat installs upgrade transparently on the next run.
 
-**Sentinels.** `.setup_done` / `.earendil_seen` moved under `agent/` (the
+**Sentinels.** `.setup_done` moved under `agent/` (the
 `extras.rs` sentinels now delegate to `config::agent_dir()` instead of a
 private `rpi_dir()`, which also fixes an old bug where they ignored the env
 override).
@@ -192,11 +188,9 @@ override).
   prompt or gate project `.rpi`/`.pi` resources behind it — rpi doesn't load the
   resources pi gates there (skills/templates/context, §8). Deferred until
   resource discovery lands.
-- **Session dir.** v1's default session dir is `<cwd>/.rpi/sessions`, with an
-  existing `<cwd>/.pi/sessions` directory retained as a compatibility fallback
-  (see §6), **not** `<agentDir>/sessions`. pi encodes cwd into session
-  filenames; rpi's session layer is a separate design. Aligning the session
-  location is out of scope for this config-parity pass.
+- **Session dir.** The default session dir is `<cwd>/.rpi/sessions`, **not**
+  `<agentDir>/sessions`. rpi's session layer is a separate design from
+  cwd-encoded session filenames.
 
 ### 4b. No file lock; atomic rename instead
 
@@ -373,18 +367,16 @@ records (restore is not implemented in the harness).
 **Divergence.** TS `SessionManager` resolves continue/resume/specific-session
 into an existing JSONL file and the harness replays it. v1 always creates a
 *fresh* session (ephemeral via `--no-session`, or a new JSONL file under
-`--session-dir`/the default `<cwd>/.pi/sessions`).
+`--session-dir`/the default `<cwd>/.rpi/sessions`).
 
 **To revisit.** Depends on harness restore (M5f #1/#3). Once `AgentHarness` can
 rehydrate a session from an existing JSONL file, wire `-c` (most-recent in the
 cwd's session dir), `-r` (a picker — needs a TUI), and `--session` (id/path
 resolution).
 
-**Note.** The v1 default session dir is `<cwd>/.rpi/sessions`; an existing
-`<cwd>/.pi/sessions` is used when no `.rpi/sessions` exists (TS uses
-`<agentDir>/sessions` under the home dir). This is a documented divergence so
-sessions live *with the project* rather than globally; revisit if a global
-location is preferred.
+**Note.** The default session dir is `<cwd>/.rpi/sessions`. This is a
+documented divergence so sessions live *with the project* rather than globally;
+revisit if a global location is preferred.
 
 ---
 
@@ -417,15 +409,15 @@ already accepts `Vec<ImageContent>`; this is purely CLI-side wiring.
 + `crates/pi-harness/src/context_files.rs` + `crates/pi-harness/src/system_prompt.rs`.
 
 **Status (Part A, done).** Resource discovery is wired end-to-end:
-- **Skills**: discovered from `<cwd>/.rpi/skills`, then legacy
-  `<cwd>/.pi/skills`, then `agent_dir()/skills`, project-wins-first dedupe
+- **Skills**: discovered from `<cwd>/.rpi/skills`, then
+  `agent_dir()/skills`, project-wins-first dedupe
   (`resource_dirs::dedupe_skills`, mirrors pi
   `addSkills` collision semantics). The `<available_skills>` listing is injected
   into the system prompt by `AgentHarness::compose_prompt`, gated on the `read`
   tool being active AND `disable_model_invocation` filtering (applied inside
   `format_skills_for_system_prompt`, mirroring pi `skills.ts:335-336`).
-- **Prompt-templates**: discovered from `<cwd>/.rpi/prompts`, then legacy
-  `<cwd>/.pi/prompts`, then `agent_dir()/prompts`, project-wins-first dedupe.
+- **Prompt-templates**: discovered from `<cwd>/.rpi/prompts`, then
+  `agent_dir()/prompts`, project-wins-first dedupe.
   On-demand only (never in the
   system prompt); surfaced as `/<name>` slash commands in the TUI autocomplete +
   expandable via the harness `prompt_from_template` lane call. `/context` lists
@@ -435,8 +427,8 @@ already accepts `Vec<ImageContent>`; this is purely CLI-side wiring.
   "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"]`, global agentDir first
   then ancestor-walk cwd→root with the **deepest (cwd) file concatenated last**).
   Rendered as a `<project_context>` block by `format_project_context`.
-- **SYSTEM.md / APPEND_SYSTEM.md**: project `<cwd>/.rpi/` wins, then legacy
-  `<cwd>/.pi/`, then global `<agent_dir>/` (mirrors pi
+- **SYSTEM.md / APPEND_SYSTEM.md**: project `<cwd>/.rpi/` wins, then global
+  `<agent_dir>/` (mirrors pi
   `discoverSystemPromptFile` with an rpi-owned project layer); the same
   precedence applies to `APPEND_SYSTEM.md`. Explicit `--system-prompt` wins over
   SYSTEM.md; `--append-system-prompt` wins over APPEND_SYSTEM.md (pi
@@ -444,25 +436,17 @@ already accepts `Vec<ImageContent>`; this is purely CLI-side wiring.
   base → append → context → skills.
 - **Flags**: `--no-skills`/`-ns`, `--no-prompt-templates`/`-np`,
   `--no-context-files`/`-nc` each suppress one channel independently;
-  `--no-extensions`/`-ne` controls Rust extension loading and is the final
-  kill switch for Pi JS/TS packages;
-  `--enable-pi-packages` explicitly opts into configured Pi package discovery
-  and loading; without it, package settings are not parsed.
+  `--no-extensions`/`-ne` controls Rust cdylib extension loading.
 - **`/context` (TUI)**: lists discovered skills, prompt templates, and a note on
   context/system/append sources (`interactive_tui::show_context_panel`).
 
 **Divergences (documented, deferred).**
 - **Trust gating**: pi gates project config files (+ some resources) behind
   `isProjectTrusted()`; rpi v1 has no trust prompt, so project resources are
-  read unconditionally (a copied `.rpi/` or `.pi/` drops in and works). Full
-  trust gating deferred.
-- **Discovery roots**: pi reads 4 roots (`.pi/skills`, `.agents/skills`,
-  `~/.pi/agent/skills`, `~/.agents/skills`) + installed packages; rpi reads
-  `<cwd>/.rpi/<sub>` first, then legacy `<cwd>/.pi/<sub>`, then
-  `agent_dir()/<sub>` plus enabled static package resources. rpi also resolves
-  Pi's native npm store (`~/.pi/agent/npm/node_modules/<package>`) when a copied
-  Pi `settings.json` contains an `npm:` package spec. `.agents/*` remains
+  read unconditionally (a copied `.rpi/` drops in and works). Full trust gating
   deferred.
+- **Discovery roots**: rpi reads `<cwd>/.rpi/<sub>`, then
+  `agent_dir()/<sub>`. `.agents/*` remains deferred.
 - **Worktree shadowed-context-file dedup** (`findShadowedContextFile`,
   `.reference/.../resource-loader.ts:100-116`): deferred (git-layout edge case).
 - **Full structured collision diagnostics**: pi carries `winnerPath`/`loserPath`

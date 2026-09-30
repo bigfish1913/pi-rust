@@ -73,11 +73,11 @@ endpoint overrides also honour `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN`.
 
 - Sessions are JSONL v4 files under the session directory, with branching and
   context compaction.
-- Project resources are discovered from `.rpi/` first, with `.pi/` as the Pi
-  compatibility fallback. When both define the same skill or prompt name, `.rpi/`
-  wins.
-- Plugins are loaded from project `.rpi/extensions`, legacy `.pi/extensions`,
-  global `~/.rpi/agent/extensions`, and `--extensions-dir`.
+- Project resources are discovered from `.rpi/` (skills, prompts, themes, and
+  `SYSTEM.md`), with `~/.rpi/agent/` as the global layer. When both define the
+  same skill or prompt name, the project copy wins.
+- Plugins are loaded from project `.rpi/extensions`, global
+  `~/.rpi/agent/extensions`, and `--extensions-dir`.
 
 ## Plugins
 

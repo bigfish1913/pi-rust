@@ -209,7 +209,7 @@ pub struct CancelQueuedResult {
 }
 
 /// A snapshot of the queued (not-yet-consumed) user messages on one lane,
-/// split by queue kind. Mirrors native pi's `getSteeringMessages()` /
+/// split by queue kind. Mirrors upstream's `getSteeringMessages()` /
 /// `getFollowUpMessages()` — the payload the pending-messages display renders
 /// (`Steering: <text>` / `Follow-up: <text>`) and the `app.message.dequeue`
 /// action restores into the editor.
@@ -365,7 +365,7 @@ pub trait AgentLane: Send + Sync {
     async fn queued_messages(&self) -> HarnessResult<QueuedMessages>;
 
     /// Remove and return every queued steering + follow-up message on the lane.
-    /// Mirrors native pi's `clearQueue()` (the `app.message.dequeue` action
+    /// Mirrors upstream's `clearQueue()` (the `app.message.dequeue` action
     /// restores the returned text into the editor).
     async fn clear_queue(&self) -> HarnessResult<QueuedMessages>;
     async fn record_usage(
@@ -544,7 +544,7 @@ impl Drop for ActiveRunLease<'_> {
 /// A run that recovery repaired and that can be continued without the user
 /// restating their request.
 ///
-/// Native pi resumes the interrupted operation in place (`driveOperation`
+/// Upstream resumes the interrupted operation in place (`driveOperation`
 /// re-enters at `state.at`). rpi's run has no durable re-entry point, so the
 /// equivalent is to start a run with **no new prompt**: the branch already
 /// ends with the resolved tool results, so the next thing the loop does is
@@ -1363,7 +1363,7 @@ impl AgentHarness {
     /// Drive a reconstructed deferred handle to a terminal outcome. Kept
     /// separate so `drive`/`resume` share one path.
     ///
-    /// Mirrors native pi's `readDeferredSourceHandle` + `publishResponse`: poll
+    /// Mirrors upstream's `readDeferredSourceHandle` + `publishResponse`: poll
     /// the provider, record what it returned, and then either stay suspended (the
     /// provider handed back another handle) or carry on with the run. "Carry on"
     /// means the whole reason this is not a plain continuation: a polled assistant
@@ -1716,7 +1716,7 @@ impl AgentHarness {
 
     /// Enqueue a message into a steering/follow-up queue, **requiring an active run**.
     ///
-    /// This implementation is now **unused** after aligning with native pi's
+    /// This implementation is now **unused** after aligning with upstream's
     /// design: `steer()` and `follow_up()` now enqueue unconditionally,
     /// mirroring the TS Agent class and avoiding the race between `activeRun`
     /// clearing and the TUI status check. The function is kept for reference
@@ -2002,7 +2002,7 @@ impl AgentHarness {
     /// option: an assistant message whose tool calls have no results is an
     /// invalid request for every provider.
     ///
-    /// Mirrors native pi's `recoverToolInvocation` (`drive/tools.ts`).
+    /// Mirrors upstream's `recoverToolInvocation` (`drive/tools.ts`).
     async fn resolve_interrupted_run(
         session: &Session,
         lane: &str,
@@ -2096,7 +2096,7 @@ impl AgentHarness {
     /// That is the `starting` crash: the operation opened, the prompt was
     /// persisted, and the process died before the first provider call. Nothing
     /// was produced, so the tip is still the prompt — and the run should simply
-    /// continue, which is what native pi does by re-entering its `starting` state.
+    /// continue, which is what upstream does by re-entering its `starting` state.
     async fn tip_is_user_message(session: &Session, lane: &str) -> bool {
         let entries = match session
             .view(lane)
@@ -2202,7 +2202,7 @@ impl AgentHarness {
             .map_err(|error| error.to_string());
         match replayed {
             Ok(result) => {
-                // The tool's own output first, then the marker: mirrors native pi's
+                // The tool's own output first, then the marker: mirrors upstream's
                 // `interruptedOutcome`, which appends its marker after the content
                 // the tool had already produced, and keeps the result readable —
                 // the reader sees the output before the note about it.
@@ -2287,7 +2287,7 @@ impl AgentHarness {
         // assistant frames committed before the process died and record them as
         // interrupted. Without this the whole run's output is lost and only the
         // user's prompt remains — see `docs/llm-repetition-forensics.md` §十一.
-        // Mirrors native pi's `recoverAssistantGeneration`.
+        // Mirrors upstream's `recoverAssistantGeneration`.
         //
         // Every unresolved tool call gets a result: a real one when the call may
         // be replayed, otherwise the unknown-outcome stand-in. That pairing is
@@ -3139,7 +3139,7 @@ impl AgentHarness {
         // Run-level turn ceiling shared with the post-loop notice below. The
         // loop's only other exit is "the model stopped asking for tools", which
         // nothing bounds — one observed session ran 112 turns / 867s in a single
-        // run (`docs/llm-repetition-forensics.md` §二). Native pi has no such
+        // run (`docs/llm-repetition-forensics.md` §二). Upstream has no such
         // ceiling either, so this is **off unless** `RPI_MAX_TURNS_PER_RUN=<n>`
         // asks for it; when off the hook stays `None` and the loop is unchanged.
         let run_budget = Arc::new(Mutex::new(crate::run_budget::RunBudget::from_env()));
@@ -3288,7 +3288,7 @@ impl AgentHarness {
         // Durable progress: every streamed assistant frame is appended to the
         // session as it arrives, so a crash mid-run leaves a committed prefix
         // that `salvage_run_frames` can replay instead of losing the whole run.
-        // Mirrors native pi's `openFrameProgress`. See
+        // Mirrors upstream's `openFrameProgress`. See
         // `docs/llm-repetition-forensics.md` §十一.
         let frame_recorder = Arc::new(crate::frame_progress::FrameRecordingEmitter::new(
             base_emitter,
@@ -3459,7 +3459,7 @@ impl AgentHarness {
             Err(e) => {
                 // Nothing is persisted on this path, so replay whatever frames
                 // committed and record them as interrupted instead of throwing
-                // away everything the model produced. Mirrors native pi's
+                // away everything the model produced. Mirrors upstream's
                 // `recoverAssistantGeneration`. The salvaged sequence pairs each
                 // partial with synthetic error results for its unresolved tool
                 // calls, so the transcript remains a valid request.
@@ -3901,7 +3901,7 @@ impl AgentLane for AgentHarness {
     }
 
     async fn steer(&self, message: AgentMessage) -> HarnessResult<QueueResult> {
-        // Mirror native pi's steering queue: enqueue unconditionally, even when
+        // Mirror upstream's steering queue: enqueue unconditionally, even when
         // the run has ended. The loop drains via `getSteeringMessages` at each
         // tool-batch boundary, and a message that lands after the run finishes
         // stays queued for the next explicit run. This avoids the race between

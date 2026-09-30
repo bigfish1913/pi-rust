@@ -1,6 +1,6 @@
 //! Auth guidance strings.
 //!
-//! Port of native Pi's `packages/coding-agent/src/core/auth-guidance.ts`.
+//! Port of the upstream `packages/coding-agent/src/core/auth-guidance.ts`.
 //! These produce the user-facing "you have no model / no key — here's how to fix
 //! it" messages so every entry point (startup, `/model`, provider resolution)
 //! says the same thing.

@@ -7,7 +7,7 @@
 //! whole run's messages were persisted in one pass at the end: the reducer's
 //! `validate_tool_start` requires `assistant_entry_id` to **already exist** with
 //! a matching tool call at `tool_index`, and a tool runs long before the run
-//! finishes. Native pi satisfies that requirement by committing the assistant
+//! finishes. Upstream satisfies that requirement by committing the assistant
 //! message when the step settles (`assistant.ready`), *then* running its tools.
 //!
 //! This module ports that ordering: an assistant message carrying tool calls is
@@ -31,7 +31,7 @@
 //!
 //! A message committed here is already an entry, so the run-end pass cannot
 //! "skip" it via `post_compaction_cut`. That means messages summarized by a
-//! mid-run compaction stay in the log. That matches native pi (its compaction
+//! mid-run compaction stay in the log. That matches upstream (its compaction
 //! commits a summary entry and leaves the pre-summary entries in place; context
 //! building starts after the last compaction via the cut-point scan) and is the
 //! reason this is a deliberate trade rather than an oversight.

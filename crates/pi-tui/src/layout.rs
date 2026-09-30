@@ -132,7 +132,7 @@ struct LayoutContext {
     reuse_scroll_content: bool,
     /// Frame-local render cache: component pointer → width → rendered lines.
     ///
-    /// Mirrors native pi `LayoutContext.renderCache` (`packages/tui/src/
+    /// Mirrors upstream `LayoutContext.renderCache` (`packages/tui/src/
     /// layout.ts`): inside one layout pass a component renders at most once per
     /// width, so measuring an auto-basis child does not re-render it when it is
     /// painted. `reuse_scroll_content`/`invalidate` are handled by each

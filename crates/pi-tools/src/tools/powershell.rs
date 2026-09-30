@@ -1,4 +1,4 @@
-//! Optional Windows PowerShell tool, matching native Pi's `powershell` tool.
+//! Optional Windows PowerShell tool, matching upstream's `powershell` tool.
 //! The command is passed through `-EncodedCommand` so quotes and newlines in
 //! user input cannot be reinterpreted by the outer Bash transport.
 

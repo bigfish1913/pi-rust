@@ -1,6 +1,6 @@
 //! Resource provenance metadata.
 //!
-//! Port of native Pi's `packages/coding-agent/src/core/source-info.ts`. Every
+//! Port of the upstream `packages/coding-agent/src/core/source-info.ts`. Every
 //! discovered resource (extension, skill, prompt, theme, package file) can carry
 //! where it came from: the owning package source, the scope it applies to, and
 //! whether it is a top-level file or package-contributed. The UI uses this to

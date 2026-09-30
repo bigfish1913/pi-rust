@@ -7,7 +7,7 @@
 //! asserting stability on.
 //!
 //! The cache exists to keep a repaint of a long transcript O(1) per unchanged
-//! component (see native pi `Markdown`/`Text` caches and `layout.ts`
+//! component (see upstream `Markdown`/`Text` caches and `layout.ts`
 //! `renderCached`). The risk it introduces is staleness, so these tests pin the
 //! two things that must still invalidate it: content/width change and theme
 //! change.

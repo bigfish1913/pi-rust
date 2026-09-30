@@ -51,7 +51,7 @@ pub struct Markdown {
     /// pulldown-cmark work is the dominant per-frame cost of a long transcript;
     /// a finalized message is re-rendered on every frame the transcript is
     /// repainted, so caching the parsed lines is what keeps that O(1) per
-    /// unchanged message. Mirrors native pi `Markdown.cachedText/cachedLines`.
+    /// unchanged message. Mirrors upstream `Markdown.cachedText/cachedLines`.
     cache: Mutex<Option<MarkdownCache>>,
 }
 

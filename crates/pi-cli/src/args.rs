@@ -1,5 +1,5 @@
 //! CLI argument parsing + help text. Mirrors the TS
-//! `packages/coding-agent/src/cli/args.ts` (`parseArgs` + `printHelp`), scoped
+//! The CLI arg surface, scoped
 //! to the flags the v1 Rust CLI honors.
 //!
 //! The TS parser is a hand-rolled positional/flag loop (no `yargs`/`commander`
@@ -14,7 +14,7 @@
 //! - `--mode rpc`,
 //!   `--fork`, `--approve`/`-na`,
 //!   `--extension`/`-e`, `--skill`, and `--prompt-template` are recognized but
-//!   not all wired into the full TS package manager. The supported resource
+//!   resource discovery follows the supported project/global directories.
 //!   flags are handled by the Rust loader; remaining compatibility flags are
 //!   accepted with a warning.
 //! - `--thinking` is typed via [`ThinkingLevel`] from `rpi_ai` (the TS parser
@@ -28,12 +28,12 @@ use std::time::Duration;
 
 use rpi_ai::ThinkingLevel;
 
-/// Native Pi's process-wide offline flag. The CLI normalizes a truthy value
+/// upstream's process-wide offline flag. The CLI normalizes a truthy value
 /// to `1` before dispatch so early subcommands and the regular app path share
 /// the same network gate.
-pub(crate) const PI_OFFLINE_ENV: &str = "PI_OFFLINE";
+pub(crate) const RPI_OFFLINE_ENV: &str = "RPI_OFFLINE";
 
-/// Match native Pi's environment-flag contract exactly: empty values and
+/// Match upstream's environment-flag contract exactly: empty values and
 /// values other than `1`, `true`, or `yes` are false; words are ASCII
 /// case-insensitive.
 pub(crate) fn is_truthy_env_flag(value: Option<&str>) -> bool {
@@ -43,7 +43,7 @@ pub(crate) fn is_truthy_env_flag(value: Option<&str>) -> bool {
 }
 
 pub(crate) fn offline_env_enabled() -> bool {
-    is_truthy_env_flag(std::env::var(PI_OFFLINE_ENV).ok().as_deref())
+    is_truthy_env_flag(std::env::var(RPI_OFFLINE_ENV).ok().as_deref())
 }
 
 pub(crate) fn offline_mode_enabled(cli_offline: bool) -> bool {
@@ -51,28 +51,17 @@ pub(crate) fn offline_mode_enabled(cli_offline: bool) -> bool {
 }
 
 /// Resolve and normalize offline mode before top-level subcommand dispatch.
-/// This mirrors native Pi setting `PI_OFFLINE=1` after either input enables it,
+/// This mirrors upstream setting `RPI_OFFLINE=1` after either input enables it,
 /// allowing downstream code to use the same process-wide gate.
 pub(crate) fn normalize_offline_mode(args: &[String]) -> bool {
     let enabled = offline_mode_enabled(args.iter().any(|arg| arg == "--offline"));
     if enabled {
-        std::env::set_var(PI_OFFLINE_ENV, "1");
+        std::env::set_var(RPI_OFFLINE_ENV, "1");
     }
     enabled
 }
 
-/// Remove the global offline flag before an early-dispatched subcommand parses
-/// its own options. The process-wide gate has already retained its meaning.
-pub(crate) fn without_offline_flag(args: &[String]) -> Vec<String> {
-    args.iter()
-        .filter(|arg| arg.as_str() != "--offline")
-        .cloned()
-        .collect()
-}
-
-/// Output mode. Mirrors TS `Mode = "text" | "json" | "rpc"`. `rpc` is parsed
-/// (so `--mode rpc` doesn't error) but v1 does not implement it; `main`
-/// reports an error if selected.
+/// Output mode. Mirrors rpi's text/json/rpc modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
     #[default]
@@ -117,7 +106,7 @@ pub struct Args {
     pub timeout: Option<Duration>,
     pub system_prompt: Option<String>,
     pub append_system_prompt: Vec<String>,
-    /// `--theme` — built-in theme name or a static package theme name/path.
+    /// `--theme` — built-in theme name or a theme file path.
     pub theme: Option<String>,
     pub thinking: Option<ThinkingLevel>,
 
@@ -172,21 +161,15 @@ pub struct Args {
     /// `--no-context-files`/`-nc`: skip context-file (`AGENTS.md`/`CLAUDE.md`)
     /// discovery + the `<project_context>` system-prompt block.
     pub no_context_files: bool,
-    /// `--no-extensions`/`-ne`: skip Rust cdylib extension loading and act
-    /// as a final kill switch for Pi JS/TS packages when enabled.
-    /// Honored by `session.rs` (Part B2): when set, no extension directory is
-    /// scanned and no plugin tools/handlers are registered.
+    /// `--no-extensions`/`-ne`: skip Rust cdylib extension loading.
+    /// Honored by `session.rs`: when set, no extension directory is scanned.
     pub no_extensions: bool,
-    /// `--enable-pi-packages`: opt into discovery and loading of configured
-    /// Pi JavaScript/TypeScript packages. This is intentionally opt-in because
-    /// loading a package may start a Node runtime and execute package code.
-    pub enable_pi_packages: bool,
-    /// `--no-themes`: disable package/custom theme discovery and loading.
+    /// `--no-themes`: disable custom theme discovery and loading.
     /// Built-in presets remain available unless a custom `--theme` is given.
     pub no_themes: bool,
     /// `--extensions-dir`/`-ed`: an extra directory to scan for cdylib plugins
     /// (`.dll`/`.so`/`.dylib`), in addition to project `.rpi/extensions`
-    /// (with legacy `.pi/extensions` compatibility) and global
+    /// and global
     /// `agent_dir()/extensions` defaults. May be repeated; scanned after
     /// the defaults (so a same-named tool in a default dir wins first, mirroring
     /// pi's registration order). `RPI_EXTENSIONS_DIR` (colon-separated on Unix,
@@ -203,7 +186,7 @@ pub struct Args {
 
     /// Internal scope set by `rpi dev-local` / `rpi dev --local-only`.
     /// Only the freshly staged development extension and resources it
-    /// discovers are loaded; normal project/global/package discovery is
+    /// discovers are loaded; normal project/global discovery is
     /// skipped. This is intentionally not parsed by the regular CLI parser.
     pub dev_local_only: bool,
 
@@ -381,7 +364,6 @@ pub fn parse_args(args: &[String]) -> Args {
             "--no-prompt-templates" | "-np" => result.no_prompt_templates = true,
             "--no-context-files" | "-nc" => result.no_context_files = true,
             "--no-extensions" | "-ne" => result.no_extensions = true,
-            "--enable-pi-packages" => result.enable_pi_packages = true,
             "--extensions-dir" | "-ed" => {
                 if let Some(v) = take_value(&mut result, &flag_key) {
                     result.extensions_dir.push(PathBuf::from(v));
@@ -489,9 +471,9 @@ pub fn parse_args(args: &[String]) -> Args {
             //
             // NOTE: `--no-skills`/`-ns`, `--no-prompt-templates`/`-np`,
             // `--no-context-files`/`-nc`, `--no-extensions`/`-ne`, and
-            // `--enable-pi-packages`, and `--no-themes` are honored (parsed
+            // `--no-themes` is honored (parsed into a real field above). The
             // into real fields above), so they no longer reach this arm. The
-            // resource flags gate discovery in `session.rs`; package loading
+            // resource flags gate discovery in `session.rs`; plugin loading
             // is separately opt-in.
             other if matches!(other, "--models") => {
                 // Consume a value if the next token isn't a flag (so
@@ -620,7 +602,7 @@ pub fn print_help() {
                                  be provided via the RPI_SERVER_TOKEN env var)
   --tui-mode <mode>              TUI buffer: regular or fullscreen (macOS default: regular)
   --list-models [search]         List available models (with optional fuzzy search)
-  --offline                      Disable startup network operations (same as PI_OFFLINE=1)
+  --offline                      Disable startup network operations (same as RPI_OFFLINE=1)
   --export <file>                Export a JSONL session to HTML and exit
   --approve, -a                  Force-enable current-project resources
   --no-approve, -na              Disable current-project resources
@@ -638,8 +620,7 @@ pub fn print_help() {
   --no-skills, -ns               Skip skill discovery (no <available_skills> block)
   --no-prompt-templates, -np     Skip prompt-template discovery (/expand templates)
   --no-context-files, -nc        Skip AGENTS.md/CLAUDE.md discovery (no <project_context>)
-  --no-extensions, -ne           Skip Rust cdylib and JS/TS extension loading
-  --enable-pi-packages            Enable configured Pi JS/TS packages (starts Node)
+  --no-extensions, -ne           Skip Rust cdylib extension loading
   --extensions-dir, -ed <dir>    Extra dir to scan for plugins (.dll/.so/.dylib); repeatable
                                  (also via RPI_EXTENSIONS_DIR env: ';' on Windows, ':' on Unix)
   --debug-system-prompt          Print the resolved system-prompt sections to stderr (verification)
@@ -653,17 +634,9 @@ pub fn print_help() {
                                 (see `rpi auth --help`)
   events path|tail               Inspect the extension event journal (needs
                                 RPI_EVENT_LOG=1; see `rpi events --help`)
-  package list|add|remove|update Update Rust-native packages and manage Pi package settings
-                                (see `rpi package --help`)
   install <crate>                Build and install a Rust cdylib extension
                                 (see `rpi install --help`)
-  install-pi <spec>              Install an npm/git/local Pi package
-                                (see `rpi install-pi --help`)
-  pi-package update             Update configured Pi npm/Git packages
   uninstall <crate>              Remove an installed Rust cdylib extension
-                                (use `rpi uninstall pi <spec>` for Pi packages)
-  uninstall-pi <spec>            Remove an installed npm/git/local Pi package
-                                (see `rpi uninstall-pi --help`)
   dev [options]                  Build, watch, and hot-reload a Rust extension
                                 (see `rpi dev --help`)
   dev-local [options]            Debug only the current Rust extension
@@ -699,18 +672,17 @@ pub fn print_help() {
   ANTHROPIC_AUTH_TOKEN           Bearer token (Authorization: Bearer) for third-party gateways
   ANTHROPIC_BASE_URL             Override the Anthropic endpoint (e.g. a compatible proxy)
   OPENAI_API_KEY                 Bearer token for openai-completions/responses
-  PI_OFFLINE                     Disable startup network operations when set to 1/true/yes
+  RPI_OFFLINE                     Disable startup network operations when set to 1/true/yes
   RPI_CODING_AGENT_DIR           Override the ~/.rpi config directory (auth.json + models.json)
   RPI_NO_EMOJI                   Render the brand lockup without the crab (1/true/yes)
 
 {u}Notes:{r}
   Supported HTTP protocols are Anthropic Messages and OpenAI Chat Completions.
   Define custom model catalogs and provider apiKey values in
-  ~/.rpi/agent/models.json. The interactive TUI, Rust and JS/TS extensions,
-  opt-in Pi package resources, skills, prompt templates, themes, model cycling, session
-  fork/export, and trust commands are
-  available in the current build. OAuth, RPC, and full model cycling remain
-  outside the current implementation.
+  ~/.rpi/agent/models.json. The interactive TUI, Rust extensions, skills,
+  prompt templates, themes, model cycling, session fork/export, and trust
+  commands are available in the current build. OAuth, RPC, and full model
+  cycling remain outside the current implementation.
 ",
         name = crate::APP_NAME,
         builtin = builtin,
@@ -733,8 +705,8 @@ mod tests {
     impl Drop for RestoreOfflineEnv {
         fn drop(&mut self) {
             match self.0.take() {
-                Some(value) => std::env::set_var(PI_OFFLINE_ENV, value),
-                None => std::env::remove_var(PI_OFFLINE_ENV),
+                Some(value) => std::env::set_var(RPI_OFFLINE_ENV, value),
+                None => std::env::remove_var(RPI_OFFLINE_ENV),
             }
         }
     }
@@ -916,19 +888,18 @@ mod tests {
     #[test]
     fn pi_offline_env_and_cli_flag_share_one_normalized_gate() {
         let _guard = crate::config::test_support::env_lock().lock().unwrap();
-        let _restore = RestoreOfflineEnv(std::env::var_os(PI_OFFLINE_ENV));
+        let _restore = RestoreOfflineEnv(std::env::var_os(RPI_OFFLINE_ENV));
 
-        std::env::set_var(PI_OFFLINE_ENV, "YeS");
+        std::env::set_var(RPI_OFFLINE_ENV, "YeS");
         assert!(parse_args(&[]).offline);
         assert!(normalize_offline_mode(&[]));
-        assert_eq!(std::env::var(PI_OFFLINE_ENV).as_deref(), Ok("1"));
+        assert_eq!(std::env::var(RPI_OFFLINE_ENV).as_deref(), Ok("1"));
 
-        std::env::set_var(PI_OFFLINE_ENV, "0");
+        std::env::set_var(RPI_OFFLINE_ENV, "0");
         assert!(!parse_args(&[]).offline);
-        let argv = s(&["package", "update", "--offline"]);
+        let argv = s(&["--offline"]);
         assert!(normalize_offline_mode(&argv));
-        assert_eq!(std::env::var(PI_OFFLINE_ENV).as_deref(), Ok("1"));
-        assert_eq!(without_offline_flag(&argv), s(&["package", "update"]));
+        assert_eq!(std::env::var(RPI_OFFLINE_ENV).as_deref(), Ok("1"));
     }
 
     #[test]
@@ -996,17 +967,6 @@ mod tests {
         // `--no-extensions` is parsed and disables both extension backends.
         let a = parse_args(&s(&["--no-extensions"]));
         assert!(a.no_extensions);
-        assert!(a.ignored.is_empty());
-    }
-
-    #[test]
-    fn pi_packages_are_disabled_by_default_and_explicitly_enabled() {
-        let a = parse_args(&s(&[]));
-        assert!(!a.enable_pi_packages);
-        assert!(a.ignored.is_empty());
-
-        let a = parse_args(&s(&["--enable-pi-packages"]));
-        assert!(a.enable_pi_packages);
         assert!(a.ignored.is_empty());
     }
 

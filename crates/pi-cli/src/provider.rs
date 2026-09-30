@@ -1,5 +1,5 @@
 //! Provider + model resolution. Mirrors the provider/model selection and
-//! request-auth portions of native Pi's model runtime.
+//! request-auth portions of upstream's model runtime.
 //!
 //! The built-in lane uses Anthropic's protocol, while `models.json` may add
 //! named Anthropic-compatible, OpenAI Completions, and OpenAI Responses
@@ -40,7 +40,7 @@
 //!    provider. Otherwise the slash remains part of the raw model id (for
 //!    example `meta-llama/llama-*`). If both interpretations exist, the known
 //!    provider wins while authenticated; an unauthenticated inferred provider
-//!    yields to one uniquely authenticated raw-id match, as in native Pi.
+//!    yields to one uniquely authenticated raw-id match, as in upstream.
 //! 2. Otherwise treat `--model` as `id[:thinking]`: if a trailing `:level` is a
 //!    valid thinking level, strip it and apply it (overriding `--thinking`);
 //!    else the whole string is the id.
@@ -52,7 +52,7 @@
 //!    source of "got the wrong model" bugs — documented as a divergence in
 //!    `docs/m6-cli-open-questions.md`).
 //! 5. No `--model` ⇒ [`pick_default_model`]:
-//!    (a) scan native Pi's `defaultModelPerProvider` entries in their declared
+//!    (a) scan upstream's `defaultModelPerProvider` entries in their declared
 //!    order and take the first authenticated match; otherwise (b) take the
 //!    **first authenticated model** in the catalog — mirroring the TS
 //!    `findInitialModel` fallback over `availableModels`. This lets a
@@ -82,10 +82,10 @@ use crate::config::{self, Credential, DEFAULT_PROVIDER_ID};
 use crate::settings;
 
 /// The default Anthropic model when `--model` is absent. Kept in sync with the
-/// current native Pi `defaultModelPerProvider.anthropic` entry.
+/// current upstream `defaultModelPerProvider.anthropic` entry.
 pub const DEFAULT_MODEL_ID: &str = "claude-opus-4-8";
 
-/// Native Pi checks these provider defaults in declaration order before it
+/// upstream checks these provider defaults in declaration order before it
 /// falls back to `availableModels[0]`. Configured providers using one of rpi's
 /// supported wire protocols participate too, even when they are not built in.
 const DEFAULT_MODELS_PER_PROVIDER: &[(&str, &str)] = &[
@@ -177,7 +177,7 @@ impl std::fmt::Debug for ResolvedModel {
 }
 
 /// Bind the Anthropic wire implementation to the provider id declared in
-/// models.json. Native Pi keeps providers isolated by id even when they share
+/// models.json. upstream keeps providers isolated by id even when they share
 /// the same protocol and model ids; the wrapper preserves that routing identity
 /// without duplicating the protocol implementation.
 struct NamedAnthropicProvider {
@@ -302,7 +302,7 @@ pub fn resolve(
     )
 }
 
-/// Resolve using native Pi's global -> trusted-project settings precedence.
+/// Resolve using upstream's global -> trusted-project settings precedence.
 pub fn resolve_for_cwd(
     cli_provider: Option<&str>,
     cli_model: Option<&str>,
@@ -628,19 +628,6 @@ fn resolve_with_settings(
         for candidate in &mut provider_models {
             merge_auth_headers(candidate, &headers);
         }
-    }
-    // Provider attribution headers (native `mergeProviderAttributionHeaders`):
-    // app-identifying defaults that never clobber user/model headers.
-    for candidate in &mut provider_models {
-        let attribution = crate::attribution::default_attribution_headers(candidate);
-        if attribution.is_empty() {
-            continue;
-        }
-        let mut headers = candidate.headers.clone().unwrap_or_default();
-        for (key, value) in attribution {
-            headers.entry(key).or_insert(value);
-        }
-        candidate.headers = Some(headers);
     }
     let (provider, has_provider_key): (Arc<dyn Provider>, bool) = match selected_api {
         rpi_ai::Api::AnthropicMessages => {
@@ -1027,7 +1014,7 @@ fn split_model_pattern(
         }
     }
 
-    // Native Pi attempts the complete id first. Only peel a valid thinking
+    // upstream attempts the complete id first. Only peel a valid thinking
     // suffix when that complete id does not exist in the selected scope.
     let has_full_exact_match = catalog.iter().any(|model| {
         model.id.eq_ignore_ascii_case(&model_id)
@@ -1074,7 +1061,7 @@ fn find_model(
 }
 
 /// Resolve an exact CLI model reference without silently choosing the first
-/// provider when a bare model id is duplicated. This mirrors native Pi's
+/// provider when a bare model id is duplicated. This mirrors upstream's
 /// `resolveCliModel`: a sole configured-auth match wins; zero or multiple
 /// configured-auth matches require an explicit provider.
 fn find_cli_model(
@@ -1192,7 +1179,7 @@ fn canonicalize_cli_provider(
 }
 
 fn provider_matches(model: &Model, requested: &str, cfg: &config::ModelsConfig) -> bool {
-    // Configured provider ids are exact identities in native Pi. An exact
+    // Configured provider ids are exact identities in upstream. An exact
     // config match takes precedence over the case-insensitive built-in/protocol
     // aliases below, so a custom `Anthropic` remains distinct from `anthropic`.
     if model.provider == requested {
@@ -1216,7 +1203,7 @@ fn provider_matches(model: &Model, requested: &str, cfg: &config::ModelsConfig) 
     false
 }
 
-/// Provider identity matching for native Pi's default-model table. Unlike the
+/// Provider identity matching for upstream's default-model table. Unlike the
 /// CLI matcher, this intentionally does not treat `openai` as a protocol alias:
 /// a default belonging to OpenAI must not select the same model id from an
 /// unrelated OpenAI-compatible gateway.
@@ -1284,7 +1271,7 @@ fn pick_default_model(
     openai_credentials: &OpenAiCredentials,
     has_cli_key: bool,
 ) -> Model {
-    // 1. Native Pi's known-provider defaults, in its declared priority order.
+    // 1. upstream's known-provider defaults, in its declared priority order.
     for (provider, model_id) in DEFAULT_MODELS_PER_PROVIDER {
         if let Some(model) = catalog.iter().find(|model| {
             model.id.eq_ignore_ascii_case(model_id)
@@ -1408,7 +1395,7 @@ mod tests {
         // A copied pi `settings.json` carrying `defaultModel` (step 3 of pi's
         // `findInitialModel`) overrides the built-in Anthropic default
         // when that model is in the catalog and authed. Mirrors the on-disk-
-        // parity goal: drop a `.pi/agent/` dir at `~/.rpi/agent/` and the saved
+        // Drop an agent dir at `~/.rpi/agent/` and the saved
         // default comes alive on launch (no `--model` needed).
         let _env = TestEnv::new();
         std::env::set_var(ANTHROPIC_API_KEY_ENV, "k");
@@ -3032,7 +3019,7 @@ mod tests {
         .unwrap();
         // Saved default points at the ALPHA gateway's model even though
         // "beta-gw" is declared first and would win first-authed without the
-        // settings arm, matching native Pi's Object.entries order.
+        // settings arm, matching upstream's Object.entries order.
         std::fs::write(
             config::settings_path().unwrap(),
             r#"{"defaultProvider":"alpha-gw","defaultModel":"alpha-model"}"#,

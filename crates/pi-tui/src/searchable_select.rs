@@ -1,6 +1,6 @@
 //! Searchable select list — a titled select list with a fuzzy-filter input.
 //!
-//! Port of native pi's `SelectSubmenu` (`components/settings-submenu.ts`) with
+//! Port of upstream's `SelectSubmenu` (`components/settings-submenu.ts`) with
 //! `searchable: true`. Typing filters the list through [`SelectList::set_filter`]
 //! while arrow keys, Enter, and Esc keep their list semantics, so the widget
 //! behaves like a plain [`SelectList`] until the user types.
@@ -33,7 +33,7 @@ pub struct SearchableSelectList {
 
 impl SearchableSelectList {
     /// Wrap `list` with a search input. `title` / `description` are optional
-    /// header rows (native pi's `SelectSubmenu` shows both).
+    /// header rows (upstream's `SelectSubmenu` shows both).
     pub fn new(title: Option<&str>, description: Option<&str>, list: Arc<SelectList>) -> Self {
         let input = Arc::new(Input::with_placeholder("Type to filter..."));
         // Every text edit re-filters the list. `Input::on_change` fires after
@@ -62,7 +62,7 @@ impl SearchableSelectList {
     }
 
     /// Prefill the search box and apply the filter. Used when a slash command
-    /// was given a search term that did not match exactly (native pi's
+    /// was given a search term that did not match exactly (upstream's
     /// `initialSearchInput`).
     pub fn set_search_text(&self, text: &str) {
         self.input.set_value(text);

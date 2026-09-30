@@ -1,6 +1,6 @@
 //! Length-prefixed framing for the binary (CBOR) protocol.
 //!
-//! Port of native Pi's `packages/protocol/src/framing.ts`. Each frame is a
+//! Port of the upstream `packages/protocol/` module.
 //! 4-byte big-endian unsigned payload length followed by the payload bytes.
 //! [`FrameDecoder`] incrementally splits arbitrary byte chunks into complete
 //! payloads and enforces a maximum frame length so a corrupt/hostile stream

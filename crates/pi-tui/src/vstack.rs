@@ -363,7 +363,7 @@ pub fn layout_vstack_constrained(
 /// Like [`layout_vstack_constrained`], but measures auto-basis children through
 /// the supplied closure (usually a frame-local render cache).
 ///
-/// Mirrors native pi routing every `measureHeight` through `renderCached`
+/// Mirrors upstream routing every `measureHeight` through `renderCached`
 /// (`packages/tui/src/layout.ts`).
 pub(crate) fn layout_vstack_constrained_with<F>(
     children: &[StackEntry],

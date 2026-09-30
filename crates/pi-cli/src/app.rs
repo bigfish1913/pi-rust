@@ -1,30 +1,20 @@
-//! CLI entry orchestrator. Mirrors the v1-relevant slice of the TS
-//! `packages/coding-agent/src/main.ts` — the `main(args)` function that:
+//! CLI entry orchestrator. The `main(args)` function that:
 //!
 //! 1. Parses argv ([`crate::args::parse_args`]).
 //! 2. Handles `--help`/`--version` + parse errors + startup warnings.
-//! 3. Reads piped stdin (non-TTY ⇒ treat as the initial prompt text — TS
-//!    `readPipedStdin`).
-//! 4. Expands `@file` attachments into an initial-message text block (TS
-//!    `processFileArguments` + [`build_initial_message`] — the port of TS
-//!    `buildInitialMessage`).
+//! 3. Reads piped stdin (non-TTY ⇒ treat as the initial prompt text).
+//! 4. Expands `@file` attachments into an initial-message text block
+//!    ([`build_initial_message`]).
 //! 5. Resolves the provider + model + thinking level ([`crate::provider::resolve`]).
 //! 6. Builds the harness ([`crate::session::build`]).
 //! 7. Resolves the effective run mode ([`crate::args::resolve_mode`]) and
 //!    dispatches to [`crate::modes`] (`print`/`json`/`interactive`), mapping the
 //!    outcome to an exit code.
 //!
-//! # v1 scope cuts vs TS `main.ts` (in `docs/m6-cli-open-questions.md`)
+//! `@file` expansion covers text files; images are detected but not attached to
+//! the prompt — the harness `prompt_text` accepts images, but this path does not
+//! yet wire an image processor. Binary/non-UTF-8 files error.
 //!
-//! The TS `main` is enormous: HTTP proxy config, project-trust handling,
-//! first-time setup, migrations, and full npm package management remain
-//! outside this port. rpi does support local static package management via
-//! `rpi package` and Rust cdylib extension installation. The regular agent path
-//! remains a straight parse → resolve → build → run pipeline. The `@file`
-//! expansion ports *only* the text-file branch (images are detected
-//! but not attached to the prompt — the harness `prompt_text` accepts images,
-//! but v1 does not yet wire an image processor; binary/non-UTF-8 files error).
-
 use std::io::{IsTerminal, Read};
 use std::path::Path;
 
@@ -81,7 +71,7 @@ fn resolve_connect_token(argv: &[String]) -> Option<String> {
 /// ([`crate::bin`] / `src/bin/pi.rs`) calls this under a tokio runtime and
 /// `std::process::exit`s with the returned code.
 pub async fn run() -> i32 {
-    // Startup profiling wrapper: PI_TIMING=1 records namespace timings and
+    // Startup profiling wrapper: RPI_TIMING=1 records namespace timings and
     // flushes them to stderr once the run completes, regardless of exit path.
     crate::timings::reset(crate::timings::TimingNamespace::Main);
     let code = run_inner().await;
@@ -107,9 +97,8 @@ async fn run_inner() -> i32 {
         return crate::remote::tui::run(&addr, token.as_deref()).await;
     }
 
-    // Native Pi resolves offline mode before dispatching top-level commands.
-    // Normalize the CLI flag into PI_OFFLINE so early package/update commands
-    // and the regular parsed path all observe the same process-wide gate.
+    // Normalize the CLI flag into RPI_OFFLINE so early-dispatch subcommands and
+    // the regular parsed path all observe the same process-wide gate.
     crate::args::normalize_offline_mode(&argv);
 
     // `rpi dev` wraps the normal CLI: consume only development-specific
@@ -149,37 +138,9 @@ async fn run_inner() -> i32 {
     match argv.first().map(String::as_str) {
         Some("auth") => return crate::auth::run(&argv[1..]).await,
         Some("events") => return crate::events::run(&argv[1..]).await,
-        Some("package") => return crate::packages::run_cli(&argv[1..]),
         Some("update") => return crate::updates::run_self_update(&argv[1..]),
-        Some("pi-package") => {
-            // `--help`/`-h` and the only real subcommand (`update`) both land on
-            // the same entry point; anything else is a usage error.
-            let subcommand: Option<&str> = argv.get(1).map(String::as_str);
-            if !matches!(subcommand, Some("--help" | "-h" | "update")) {
-                eprintln!("error: usage is `rpi pi-package update`");
-                return EXIT_USAGE;
-            }
-            return crate::packages::run_pi_package_update(&argv[1..]);
-        }
-        Some("pi-update") => {
-            eprintln!("error: unknown command `pi-update`; use `rpi pi-package update`");
-            return EXIT_USAGE;
-        }
-        Some("self-update") => {
-            eprintln!("error: unknown command `self-update`; use `rpi update`");
-            return EXIT_USAGE;
-        }
         Some("install") => return crate::install::run(&argv[1..]),
-        Some("install-pi") => return crate::install_pi::run(&argv[1..]),
-        Some("uninstall") => {
-            // `rpi uninstall pi` is an alias for `uninstall-pi`.
-            return if argv.get(1).map(String::as_str) == Some("pi") {
-                crate::install_pi::uninstall(&argv[2..])
-            } else {
-                crate::install::uninstall(&argv[1..])
-            };
-        }
-        Some("uninstall-pi") => return crate::install_pi::uninstall(&argv[1..]),
+        Some("uninstall") => return crate::install::uninstall(&argv[1..]),
         _ => {}
     }
 
@@ -207,9 +168,9 @@ async fn run_inner() -> i32 {
     }
 
     // `--list-models` is intentionally handled before credentials, session
-    // restoration, and harness construction. Native Pi exposes this as a
-    // catalog inspection command, so it must work for a newly installed user
-    // who has not authenticated yet.
+    // restoration, and harness construction. It is a catalog inspection
+    // command, so it must work for a newly installed user who has not
+    // authenticated yet.
     if let Some(search) = parsed.list_models.as_deref() {
         return list_models(search).await;
     }
@@ -606,10 +567,6 @@ async fn list_models(search: &str) -> i32 {
             Vec::new()
         }
     };
-    // Overlay the pi.dev provider catalogs (native `withRemoteCatalog`).
-    // Offline (`PI_OFFLINE`/`--offline`) serves the persisted cache only.
-    let allow_network = !crate::args::offline_mode_enabled(false);
-    let catalog = crate::remote_catalog::merge_into_catalog(catalog, allow_network, None).await;
     let needle = search.trim().to_ascii_lowercase();
     let mut models: Vec<_> = catalog
         .into_iter()

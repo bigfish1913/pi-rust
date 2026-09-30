@@ -176,7 +176,7 @@ pub trait Provider: Send + Sync {
 
 /// Continue a response the provider deferred (a long-poll or batch API).
 ///
-/// Mirrors the optional `streamDeferred` / `cancelDeferred` on native pi's models
+/// Mirrors the optional `streamDeferred` / `cancelDeferred` on upstream's models
 /// interface. Same contract as [`Provider::stream_simple`]: returns the consumer
 /// end of a stream and reports failures as `Error` events rather than `Err`, so
 /// the harness handles both kinds of provider call uniformly.
