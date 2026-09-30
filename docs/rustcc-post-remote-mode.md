@@ -61,12 +61,12 @@ rpi 的定位是 `pi` 的 Rust 替代品，所以远程层在**思想上**参考
 
 | 层 | 位置 | 职责 |
 |---|---|---|
-| 协议（单一真源） | `crates/pi-cli/src/remote/protocol.rs` | `RemoteEvent` / `RemoteCommand` / `RemoteResponse`，**服务端与客户端共用**，线协议不会两端漂移 |
-| 无头 agent 循环 | `crates/pi-cli/src/modes.rs` | 读 stdin 命令、驱动 `main` lane、把 `AgentEvent` 投影成线协议 |
+| 协议（单一真源） | `crates/rpi-cli/src/remote/protocol.rs` | `RemoteEvent` / `RemoteCommand` / `RemoteResponse`，**服务端与客户端共用**，线协议不会两端漂移 |
+| 无头 agent 循环 | `crates/rpi-cli/src/modes.rs` | 读 stdin 命令、驱动 `main` lane、把 `AgentEvent` 投影成线协议 |
 | 服务端适配 | `rpi-package/packages/rpi-server` | TCP JSON-RPC、会话管理、token 校验、转发子进程事件 |
-| 客户端连接 | `crates/pi-cli/src/remote/client.rs` | 握手、认证、事件泵 |
-| 客户端会话模型 | `crates/pi-cli/src/remote/session.rs` | 把事件流折叠成 transcript（用户/助手/思考/工具/通知） |
-| 客户端 TUI | `crates/pi-cli/src/remote/tui.rs` | 基于 `pi-tui` 渲染 |
+| 客户端连接 | `crates/rpi-cli/src/remote/client.rs` | 握手、认证、事件泵 |
+| 客户端会话模型 | `crates/rpi-cli/src/remote/session.rs` | 把事件流折叠成 transcript（用户/助手/思考/工具/通知） |
+| 客户端 TUI | `crates/rpi-cli/src/remote/tui.rs` | 基于 `pi-tui` 渲染 |
 
 值得强调的一点：`--connect` 在 CLI 入口**最早**被拦截，直接跳过 provider / harness / session / extension 的全部本地构建。这就是“客户端零本地资源”的落地方式，而不是给本地 harness 套一层远程代理。
 

@@ -24,7 +24,7 @@ sequenceDiagram
 `StreamFn` 是唯一的模型边界：
 
 ```rust
-// crates/pi-agent/src/stream_fn.rs
+// crates/rpi-agent/src/stream_fn.rs
 pub type StreamFn = std::sync::Arc<
     dyn Fn(
         &rpi_ai::Model,
@@ -87,6 +87,6 @@ A coding agent has to do more than call a model. It streams partial output, runs
 
 The important boundary is `StreamFn`. It returns rpi’s event stream instead of exposing an Anthropic or OpenAI response object. The loop stays the same when the provider changes. A tool call becomes a `ToolResult`, the result returns to context, and the loop requests the next turn.
 
-The faux provider follows the same path without an API key or network. That makes examples and regression tests repeatable. Start with `examples/minimal`, then read `crates/pi-agent/src/agent.rs` and `stream_fn.rs`.
+The faux provider follows the same path without an API key or network. That makes examples and regression tests repeatable. Start with `examples/minimal`, then read `crates/rpi-agent/src/agent.rs` and `stream_fn.rs`.
 
 Project: <https://github.com/bigfish1913/pi-rust>

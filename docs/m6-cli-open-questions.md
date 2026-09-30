@@ -3,7 +3,7 @@
 > Written per the user's instruction "中间有问题，写文档，我睡醒统一处理"
 > (if problems arise mid-way, write them to a doc; I'll review them on waking).
 > These are the design divergences from the TS reference that the pi-cli port
-> (`crates/pi-cli/`) introduced. None are blockers — all are recorded for
+> (`crates/rpi-cli/`) introduced. None are blockers — all are recorded for
 > review. The CLI builds, its 40 unit tests pass, the full workspace test
 > suite stays green, and the `pi` binary runs end-to-end (version/help/usage
 > errors + a real Anthropic-backed run fails cleanly at the network/auth layer
@@ -29,7 +29,7 @@ slots into the same review cadence.
 
 ## 1. CLI surface is a strict subset; ignored flags warn, not error
 
-**Where:** `crates/pi-cli/src/args.rs::parse_args` — the
+**Where:** `crates/rpi-cli/src/args.rs::parse_args` — the
 `recognized-but-ignored v1 scope cuts` arms.
 
 **What.** The TS `parseArgs` returns an `unknownFlags` map that extensions
@@ -52,7 +52,7 @@ the honest signal.
 
 ## 2. `--mode rpc` is parsed but not implemented
 
-**Where:** `crates/pi-cli/src/app.rs::run` — the `RunMode::Rpc` arm prints an
+**Where:** `crates/rpi-cli/src/app.rs::run` — the `RunMode::Rpc` arm prints an
 error and exits 2 (usage).
 
 **What.** TS `runRpcMode` drives a JSON-RPC session protocol over stdio (the
@@ -69,7 +69,7 @@ plumbing, not part of the SDK library layer this port targets).
 
 ## 3. Interactive mode is a minimal line REPL, not the TS TUI
 
-**Where:** `crates/pi-cli/src/modes.rs::interactive`.
+**Where:** `crates/rpi-cli/src/modes.rs::interactive`.
 
 **What.** The TS `modes/interactive/*` is a full terminal UI built on
 Ink/React: theme support, keyboard protocols, a rich prompt surface, command
@@ -89,8 +89,8 @@ navigation) already exist on `AgentLane`/`AgentHarness`; the gap is purely UI.
 
 ## 4. Anthropic-only; persistent config + Bearer/custom-endpoint support; no OAuth/Copilot
 
-**Where:** `crates/pi-cli/src/provider.rs::resolve`, `crates/pi-cli/src/config.rs`,
-`crates/pi-cli/src/auth.rs`.
+**Where:** `crates/rpi-cli/src/provider.rs::resolve`, `crates/rpi-cli/src/config.rs`,
+`crates/rpi-cli/src/auth.rs`.
 
 **What.** v1 is Anthropic-only (plan §5.16: "OAuth/Copilot skipped v1"). `--provider`
 must be `anthropic` (or absent); any other value is a hard `UnknownProvider` error.
@@ -138,7 +138,7 @@ The Rust port keeps auth headers on `model.headers` and merges them later in
 whether to demand an x-api-key — saw an empty `opts.headers` and errored
 "No API key for provider: anthropic" even when `model.headers` carried a Bearer.
 The fix consults *both*: `has_header_auth(&opts.headers) || has_header_auth(&model.headers)`
-(`crates/pi-ai/src/providers/anthropic/mod.rs`, `run_anthropic_stream`). This mirrors
+(`crates/rpi-ai/src/providers/anthropic/mod.rs`, `run_anthropic_stream`). This mirrors
 the TS net effect and lets a Bearer folded onto `model.headers` authenticate. A
 regression test (`header_auth_on_model_headers_counts_as_owned`) pins it.
 
@@ -205,7 +205,7 @@ future daemon/TUI left open while a `rpi` one-shot runs).
 
 ### 4c. ✅ RESOLVED — `resolveConfigValue` (`$ENV` / `${ENV}` / `!command`) ported
 
-**Where:** `crates/pi-cli/src/config.rs::resolve_config_value` +
+**Where:** `crates/rpi-cli/src/config.rs::resolve_config_value` +
 `resolve_headers` + `resolve_command`, applied at the three consumption points
 that mirror upstream (`resolve-config-value.ts`):
 
@@ -243,7 +243,7 @@ needed; the `Credential::Oauth` shape is already there to hold it.
 
 ### 4e. `authHeader: true` Bearer synthesis is centralized, not per-model
 
-**Where:** `crates/pi-cli/src/provider.rs::resolve` (via `models_json_bearer_token`)
+**Where:** `crates/rpi-cli/src/provider.rs::resolve` (via `models_json_bearer_token`)
 vs `provider_to_models` (which deliberately does *not* synthesize it).
 
 **Divergence.** Upstream folds the `authHeader:true`-wrapped Bearer onto each model
@@ -257,7 +257,7 @@ above) *and* the value folded into the Bearer — one place, one decision.
 
 ### 4f. models.json provider id is config-namespacing only
 
-**Where:** `crates/pi-cli/src/config.rs::provider_to_models` stamps
+**Where:** `crates/rpi-cli/src/config.rs::provider_to_models` stamps
 `provider = "anthropic"` (not the models.json key) on every models.json model.
 
 **Divergence.** v1 has a **single** `AnthropicProvider` (its `id()` is hardcoded
@@ -286,7 +286,7 @@ documented).
 
 ## 5. Model matching is exact (case-insensitive), not fuzzy
 
-**Where:** `crates/pi-cli/src/provider.rs::find_model` + `split_model_pattern`.
+**Where:** `crates/rpi-cli/src/provider.rs::find_model` + `split_model_pattern`.
 
 **What.** `--model` accepts `provider/id[:thinking]` or `id[:thinking]` (a
 trailing `:level` is peeled only if it is a valid thinking level, else kept in
@@ -354,7 +354,7 @@ provider-level credential behavior and the pre-gateway v1 behavior.
 
 ## 6. Session restore (`-c`/`-r`/`--session`) is recognized but not wired
 
-**Where:** `crates/pi-cli/src/session.rs::select_session` + `build_session`
+**Where:** `crates/rpi-cli/src/session.rs::select_session` + `build_session`
 (the `SessionSelection::Existing` arm → `BuildError::RestoreNotImplemented`).
 
 **What.** `-c`/`--continue`, `-r`/`--resume`, and `--session <id|path>` are
@@ -382,7 +382,7 @@ revisit if a global location is preferred.
 
 ## 7. `@file` attachments: text-only; images refused
 
-**Where:** `crates/pi-cli/src/app.rs::process_file_args`.
+**Where:** `crates/rpi-cli/src/app.rs::process_file_args`.
 
 **What.** The TS `processFileArguments` has two branches: text files are
 wrapped in `<file name="…">…</file>`; image files are mime-detected, resized,
@@ -405,8 +405,8 @@ already accepts `Vec<ImageContent>`; this is purely CLI-side wiring.
 
 ## 8. ✅ RESOLVED — Skills / prompt-templates / context-files/packages discovery wired
 
-**Where:** `crates/pi-cli/src/session.rs::build` + `crates/pi-cli/src/resource_dirs.rs`
-+ `crates/pi-harness/src/context_files.rs` + `crates/pi-harness/src/system_prompt.rs`.
+**Where:** `crates/rpi-cli/src/session.rs::build` + `crates/rpi-cli/src/resource_dirs.rs`
++ `crates/rpi-harness/src/context_files.rs` + `crates/rpi-harness/src/system_prompt.rs`.
 
 **Status (Part A, done).** Resource discovery is wired end-to-end:
 - **Skills**: discovered from `<cwd>/.rpi/skills`, then
@@ -534,11 +534,11 @@ package skills, prompts, themes, and system prompt fragments are supported by
 
 ## 9. ✅ RESOLVED — Read-only `grep`/`find`/`ls` ported to `pi-tools` (in-process)
 
-**Where:** `crates/pi-cli/src/session.rs::BUILTIN_TOOL_NAMES` + the help text.
+**Where:** `crates/rpi-cli/src/session.rs::BUILTIN_TOOL_NAMES` + the help text.
 
 **Status.** `grep`/`find`/`ls` are now in `BUILTIN_TOOL_NAMES` and registered by
 `build_tools`. The CLI help lists them; `--tools grep` works. The tools live in
-`crates/pi-tools/src/tools/{grep,find,ls}.rs` with full test coverage
+`crates/rpi-tools/src/tools/{grep,find,ls}.rs` with full test coverage
 (`tests/{grep,find,ls}.rs`, 23 tests, all green) against `InMemoryExecutionEnv`.
 
 **Divergence from TS (documented).** The TS `grep` shells out to `rg`
@@ -569,7 +569,7 @@ exists on a real fs — you're in it), so tools that default their search path t
 
 ## 10. JSON event stream is a lossy but stable shape
 
-**Where:** `crates/pi-cli/src/modes.rs::emit_json_event`.
+**Where:** `crates/rpi-cli/src/modes.rs::emit_json_event`.
 
 **What.** `--mode json` emits one JSON object per line per harness event
 (`run_start`/`run_end`) plus a terminal `result` line. The TS `toJsonEvent`
@@ -591,7 +591,7 @@ Option (b) is cleaner and matches the TS layering.
 
 ## 11. Exit-code policy
 
-**Where:** `crates/pi-cli/src/app.rs` (`EXIT_USAGE = 2`, `EXIT_RUNTIME = 1`;
+**Where:** `crates/rpi-cli/src/app.rs` (`EXIT_USAGE = 2`, `EXIT_RUNTIME = 1`;
 `modes::outcome_exit_code` maps `Failed`/`Aborted` → 1).
 
 **What.** v1 distinguishes *usage* errors (parse errors, no API key, `--mode

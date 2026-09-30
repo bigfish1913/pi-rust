@@ -17,7 +17,7 @@ flowchart LR
 Provider 的核心契约是流式输出，而不是“返回一个字符串”：
 
 ```rust
-// crates/pi-ai/src/provider.rs 的核心使用形态
+// crates/rpi-ai/src/provider.rs 的核心使用形态
 pub trait Provider: Send + Sync {
     fn id(&self) -> &str;
     fn models(&self) -> &[rpi_ai::Model];
@@ -72,7 +72,7 @@ flowchart TD
 
 Provider 只负责协议适配；队列、工具、持久化属于更上层。这样 `rpi-ai` 可以被单独使用，`rpi-agent` 也能通过自定义 `StreamFn` 接入测试替身。默认构建还可以避免不必要的 HTTP 依赖。
 
-适合面向 Rust、LLM 网关和本地模型开发者推广。更多实现见 `crates/pi-ai/src/providers` 与 `crates/pi-ai/tests`。
+适合面向 Rust、LLM 网关和本地模型开发者推广。更多实现见 `crates/rpi-ai/src/providers` 与 `crates/rpi-ai/tests`。
 
 ---
 
@@ -86,4 +86,4 @@ The agent sees a `Context`, a `Model`, and `AssistantMessageEvent`. It does not 
 
 `FauxProvider` is part of the normal design, not a hidden test helper. A test can run the same stream path as production and assert the events it receives, without a live network.
 
-Read `crates/pi-ai/src/provider.rs`, `event_stream.rs`, and `crates/pi-ai/tests` for the implementation.
+Read `crates/rpi-ai/src/provider.rs`, `event_stream.rs`, and `crates/rpi-ai/tests` for the implementation.

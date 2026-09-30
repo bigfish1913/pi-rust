@@ -97,4 +97,4 @@ path = "src/lib.rs"
 
 [[bin]]
 name = "rpi"
-path = "src/bin/pi.rs"
+path = "src/bin/rpi.rs"

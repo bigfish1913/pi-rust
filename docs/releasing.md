@@ -22,7 +22,7 @@ bash scripts/release.sh 0.3.4 --dry-run
 | `preflight` | clean tree, tag unused, version differs |
 | `bump` | `Cargo.toml` workspace version + internal pins → `cargo update --workspace` |
 | `changelog` | cuts `## [Unreleased]` into `## [X.Y.Z] - <date>` |
-| `docs` | re-syncs `crates/pi-cli/embedded-docs` (CI enforces it) |
+| `docs` | re-syncs `crates/rpi-cli/embedded-docs` (CI enforces it) |
 | `validate` | `task release:validate` (version consistency across the nine crates) |
 | `commit` | `chore(release): X.Y.Z` |
 | `tag` | `git tag vX.Y.Z` |

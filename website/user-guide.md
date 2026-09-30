@@ -19,7 +19,7 @@ rpi --help
 ```bash
 git clone https://github.com/bigfish1913/pi-rust.git
 cd pi-rust
-cargo install --path crates/pi-cli --force
+cargo install --path crates/rpi-cli --force
 ```
 
 `cargo install` 安装的是可执行文件；它不等同于 `rpi install`。后者用于安装由 `rpi-plugin-sdk` 构建的 Rust 动态库扩展。

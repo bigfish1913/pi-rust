@@ -170,9 +170,8 @@ rpi-telemetry → rpi-ai → rpi-agent → rpi-tools → rpi-harness → rpi-cli
 | [`rpi-plugin-sdk`](https://crates.io/crates/rpi-plugin-sdk) | The stable `#[repr(C)]` ABI contract for plugins. Zero runtime dependencies |
 | [`rpi-extensions`](https://crates.io/crates/rpi-extensions) | Host-side plugin loader and the async-across-ABI tool bridge |
 
-Every crate has its own README and docs.rs page. On-disk directories keep the
-historical `crates/pi-*` names; `package.name` is what crates.io and
-`extern crate` see.
+Every crate has its own README and docs.rs page. The `crates/rpi-*`
+directories and the published crate names use the same `rpi-` prefix.
 
 ## Why rpi
 

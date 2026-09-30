@@ -5521,7 +5521,7 @@ pub async fn interactive_tui(
         // double-counted in the provider context), which means the loop emits
         // no `message_start` for it — see
         // `directly_sent_prompt_emits_no_user_message_start` in
-        // `crates/pi-harness/tests/harness_run_e2e.rs`. Queued steering /
+        // `crates/rpi-harness/tests/harness_run_e2e.rs`. Queued steering /
         // follow-up prompts DO get a `message_start` (the loop drains those
         // itself), so those are deliberately rendered from the event instead.
         add_user_message(&ctx_for_cb.chat, text);

@@ -134,7 +134,7 @@ policy and the current tool declaration say the call is safe) or records the
 outcome as unknown. Retrying is bounded by a resume budget.
 
 The end-to-end expectations are pinned in
-[`crates/pi-harness/tests/harness_run_e2e.rs`](https://github.com/bigfish1913/pi-rust/blob/main/crates/pi-harness/tests/harness_run_e2e.rs),
+[`crates/rpi-harness/tests/harness_run_e2e.rs`](https://github.com/bigfish1913/pi-rust/blob/main/crates/rpi-harness/tests/harness_run_e2e.rs),
 including one test per crash point.
 
 ## Related crates

@@ -43,7 +43,7 @@ flowchart LR
     Context --> Events[统一 AgentEvent]
 ```
 
-取消运行时，队列也必须有明确策略：恢复到编辑器、保留等待，或显式丢弃。rpi 的测试覆盖 steering、follow-up 和 abort 路径，入口见 `crates/pi-agent/tests/steering.rs`、`follow_up.rs`。
+取消运行时，队列也必须有明确策略：恢复到编辑器、保留等待，或显式丢弃。rpi 的测试覆盖 steering、follow-up 和 abort 路径，入口见 `crates/rpi-agent/tests/steering.rs`、`follow_up.rs`。
 
 ## 这对实际项目有什么用
 
@@ -59,4 +59,4 @@ Users often need to correct an agent before the current run ends. rpi has two qu
 
 Both queues are FIFO queues with an explicit drain policy. `OneAtATime` releases the oldest message and keeps the rest. `All` drains the whole queue in order. The loop chooses the drain point, so input is not inserted into a transcript halfway through a model operation.
 
-This makes cancellation and UI behavior easier to reason about. The implementation is in `crates/pi-agent/src/queue.rs`; the steering and follow-up tests document the edge cases.
+This makes cancellation and UI behavior easier to reason about. The implementation is in `crates/rpi-agent/src/queue.rs`; the steering and follow-up tests document the edge cases.

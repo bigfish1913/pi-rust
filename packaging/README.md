@@ -11,7 +11,7 @@ is a template with placeholders.
 | --- | --- | --- | --- |
 | `cargo install rpi-cli` | crates.io | **live** | none |
 | `curl … install.sh \| sh` | [`scripts/install.sh`](../scripts/install.sh) | **live** | none |
-| `cargo binstall rpi-cli` | [`crates/pi-cli/Cargo.toml`](../crates/pi-cli/Cargo.toml) | **configured** | none — takes effect with the next published crate version |
+| `cargo binstall rpi-cli` | [`crates/rpi-cli/Cargo.toml`](../crates/rpi-cli/Cargo.toml) | **configured** | none — takes effect with the next published crate version |
 | Homebrew | [`bigfish1913/homebrew-tap`](https://github.com/bigfish1913/homebrew-tap) | **live** | none — `brew tap bigfish1913/tap && brew install rpi` |
 | Scoop | [`bigfish1913/scoop-bucket`](https://github.com/bigfish1913/scoop-bucket) | **live** | none — `scoop bucket add bigfish1913 <bucket url>` |
 | winget | [open at `microsoft/winget-pkgs#441442`](https://github.com/microsoft/winget-pkgs/pull/441442) | **submitted** | review by the winget team; `winget install bigfish1913.rpi` does not work until it merges |

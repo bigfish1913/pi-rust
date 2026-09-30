@@ -18,7 +18,7 @@ flowchart LR
 缓存的关键不是“永远缓存”，而是把失效条件写清楚：内容变化、宽度变化或主题 revision 变化时重新计算。主题切换不能继续使用旧颜色。
 
 ```rust
-// 伪代码，展示缓存 key；真实组件见 crates/pi-tui/src
+// 伪代码，展示缓存 key；真实组件见 crates/rpi-tui/src
 #[derive(Hash, Eq, PartialEq)]
 struct RenderKey {
     content: String,
@@ -43,7 +43,7 @@ cargo run -p pi-tui --example bench_transcript --release
 
 性能数字应以本机、当前版本和基准脚本为准，不应把单次测量包装成所有场景的保证。对读者来说，这里的重点是把性能优化落在可解释的数据流和失效策略上：长会话越长，缓存收益越容易被观察到。
 
-代码入口：`crates/pi-tui/src`，版本变更记录见 `CHANGELOG.md`。
+代码入口：`crates/rpi-tui/src`，版本变更记录见 `CHANGELOG.md`。
 
 ---
 

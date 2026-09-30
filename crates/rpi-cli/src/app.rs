@@ -68,7 +68,7 @@ fn resolve_connect_token(argv: &[String]) -> Option<String> {
 /// The v1 CLI entry point. Mirrors TS `export async function main(args)`.
 ///
 /// Returns the process exit code (0 = success). The binary wrapper
-/// ([`crate::bin`] / `src/bin/pi.rs`) calls this under a tokio runtime and
+/// ([`crate::bin`] / `src/bin/rpi.rs`) calls this under a tokio runtime and
 /// `std::process::exit`s with the returned code.
 pub async fn run() -> i32 {
     // Startup profiling wrapper: RPI_TIMING=1 records namespace timings and

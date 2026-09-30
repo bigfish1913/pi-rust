@@ -52,7 +52,7 @@ async fn write_then_read_in_memory() {
 }
 ```
 
-真实的工具集成测试位于 `crates/pi-tools/tests`。推广时应强调：这是“可替换执行环境”，不是自动提供安全沙箱；如果要执行不可信代码，仍需额外容器、权限和网络隔离。
+真实的工具集成测试位于 `crates/rpi-tools/tests`。推广时应强调：这是“可替换执行环境”，不是自动提供安全沙箱；如果要执行不可信代码，仍需额外容器、权限和网络隔离。
 
 ## 读者可能会关心什么
 
@@ -60,7 +60,7 @@ async fn write_then_read_in_memory() {
 - 测试不依赖开发者机器上的文件和 Shell。
 - 错误、截断和输出限制集中在工具层管理。
 
-代码入口：`crates/pi-tools/src/env.rs`、`crates/pi-tools/src/tools`。可以作为 Rust 工程实践或 Agent 工具链主题的技术文章。
+代码入口：`crates/rpi-tools/src/env.rs`、`crates/rpi-tools/src/tools`。可以作为 Rust 工程实践或 Agent 工具链主题的技术文章。
 
 ---
 
@@ -74,4 +74,4 @@ Reading a file is easy to demo. Running model-generated shell commands in a real
 
 This is not a security sandbox by itself. Untrusted code still needs containers, restricted credentials, and network policy. The narrower benefit is practical: tool behavior is isolated and testable.
 
-Start with `crates/pi-tools/src/env.rs` and `crates/pi-tools/src/tools`.
+Start with `crates/rpi-tools/src/env.rs` and `crates/rpi-tools/src/tools`.

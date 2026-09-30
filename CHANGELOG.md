@@ -45,7 +45,7 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
   not rendered again when painted. A live theme switch bumps a global revision
   that every cache keys on, so `apply_theme_preset` cannot leave stale colours.
   A 400-message transcript drops from ~18 ms to ~0.8 ms per frame (~22×) and
-  stays under budget past 3000 messages; `crates/pi-tui/examples/bench_transcript.rs`
+  stays under budget past 3000 messages; `crates/rpi-tui/examples/bench_transcript.rs`
   reproduces the measurement.
 - **The terminal window/tab title now carries the startup mark.** An idle
   session sets `▃ ▅ ▂ rpi · 🦀` instead of `🦀π rpi`, keeping the activity
@@ -224,7 +224,7 @@ on `main` and fixes how every crate presents itself on crates.io and docs.rs.
   installed. The same measurement shows 83% of rpi's startup is its own runtime
   initialisation rather than process overhead, which is now the roadmap's
   optimisation target.
-- `crates/pi-cli/embedded-docs/` — the documentation snapshot compiled into the
+- `crates/rpi-cli/embedded-docs/` — the documentation snapshot compiled into the
   `rpi` binary for the `docs` tool — is refreshed and now guarded: CI runs
   `scripts/sync-embedded-docs.sh` and fails if the snapshot drifts from the
   repository documents. It had fallen behind by several releases.

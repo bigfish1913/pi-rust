@@ -12,7 +12,7 @@
 # Before recording: build and install so the first frame is not a compile, and
 # pick a prompt whose output is stable enough to read in ~15 seconds.
 #
-#   cargo build --release -p rpi-cli && cargo install --path crates/pi-cli --force
+#   cargo build --release -p rpi-cli && cargo install --path crates/rpi-cli --force
 #
 # Then run with a prompt that shows the parts worth showing: a tool call, the
 # approval/streaming view, and the resumed session. Keep it under ~20s — a GIF

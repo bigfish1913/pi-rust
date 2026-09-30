@@ -18,7 +18,7 @@
 
 ## 概述
 
-对比 TypeScript 版本的 pi TUI（`packages/coding-agent/src/modes/interactive/interactive-mode.ts`，6000+ 行）与 Rust 版本（`crates/pi-cli/src/interactive_tui.rs`，591 行），差距非常大。
+对比 TypeScript 版本的 pi TUI（`packages/coding-agent/src/modes/interactive/interactive-mode.ts`，6000+ 行）与 Rust 版本（`crates/rpi-cli/src/interactive_tui.rs`，591 行），差距非常大。
 
 ## 一、库层对比（pi-tui）
 

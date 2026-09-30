@@ -46,7 +46,7 @@ sequenceDiagram
 
 远程模式的价值在于职责边界清晰：UI 是可替换的，Agent 运行时可以放在有 GPU、密钥和工作区的机器上。部署时仍需配置防火墙、TLS/VPN、token 轮换和最小权限；TCP token 认证不等于完整零信任系统。
 
-验证入口：`.github` 与 `crates/pi-cli/tests/remote_client_smoke.rs`。适合 DevOps、远程开发和自托管 Agent 主题推广。
+验证入口：`.github` 与 `crates/rpi-cli/tests/remote_client_smoke.rs`。适合 DevOps、远程开发和自托管 Agent 主题推广。
 
 ---
 
@@ -60,4 +60,4 @@ The usual shape is `rpi --server` on the machine that has the project and `rpi -
 
 Treat the connection token as a secret. Use a private network or TLS/VPN where appropriate, rotate tokens, and restrict the server account. Remote mode provides a process split, not a complete security policy.
 
-See `crates/pi-cli/tests/remote_client_smoke.rs`. Use the installed CLI’s `--help` output for exact flags and ports.
+See `crates/rpi-cli/tests/remote_client_smoke.rs`. Use the installed CLI’s `--help` output for exact flags and ports.

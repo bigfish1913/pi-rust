@@ -122,7 +122,7 @@ Tokio. The loop, streaming, and tools are all `async`. `pi-harness` JSONL writes
 Mirror `ai/src/types.ts`.
 
 ```rust
-// crates/pi-ai/src/types.rs
+// crates/rpi-ai/src/types.rs
 pub struct Api(pub Cow<'static, str>);           // "anthropic-messages" | "openai-responses" | ...
 pub struct ProviderId(pub Cow<'static, str>);
 
@@ -178,7 +178,7 @@ TS uses TypeBox (`TSchema`) — a JSON-Schema builder with a compiled validator.
 ### Event stream
 
 ```rust
-// crates/pi-ai/src/event_stream.rs — mirrors ai/src/utils/event-stream.ts
+// crates/rpi-ai/src/event_stream.rs — mirrors ai/src/utils/event-stream.ts
 pub enum AssistantMessageEvent {
     Start { partial: AssistantMessage },
     TextStart { content_index: usize, partial: AssistantMessage },
@@ -233,7 +233,7 @@ User said "保持一致" (keep consistent with the TS source) → port the provi
 - **Tier 2 (v0.2):** `openai-responses` + `openai-completions` (covers OpenAI, Azure, DeepSeek, Groq, Together, Fireworks, OpenRouter since they're all OpenAI-compatible — one adapter + `OpenAICompletionsCompat` flags).
 - **Tier 3 (later):** google, bedrock, mistral.
 
-Rust providers are each their own submodule under `crates/pi-ai/src/providers/`. HTTP via `reqwest` (streaming SSE via `reqwest::Response::bytes_stream()`). Each provider **does not** use the official SDK — the TS source calls raw REST too (`anthropic-messages.ts` uses `@anthropic-ai/sdk` but only as an HTTP/payload helper; we go straight to reqwest to keep it dependency-light and uniform across providers).
+Rust providers are each their own submodule under `crates/rpi-ai/src/providers/`. HTTP via `reqwest` (streaming SSE via `reqwest::Response::bytes_stream()`). Each provider **does not** use the official SDK — the TS source calls raw REST too (`anthropic-messages.ts` uses `@anthropic-ai/sdk` but only as an HTTP/payload helper; we go straight to reqwest to keep it dependency-light and uniform across providers).
 
 ## 4. Agent runtime (`pi-agent`)
 

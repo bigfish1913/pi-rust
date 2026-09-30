@@ -55,7 +55,7 @@ body:
     id: install
     attributes:
       label: How did you install rpi?
-      placeholder: "cargo install rpi-cli / cargo install --path crates/pi-cli / prebuilt binary"
+      placeholder: "cargo install rpi-cli / cargo install --path crates/rpi-cli / prebuilt binary"
     validations:
       required: true
 

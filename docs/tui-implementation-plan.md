@@ -2,7 +2,7 @@
 
 ## 概述
 
-本文档记录了 TypeScript 版本的 TUI (`packages/coding-agent/src/modes/interactive/`) 与 Rust 版本的 TUI (`crates/pi-cli/src/interactive_tui.rs`) 之间的差距，以及实现计划。
+本文档记录了 TypeScript 版本的 TUI (`packages/coding-agent/src/modes/interactive/`) 与 Rust 版本的 TUI (`crates/rpi-cli/src/interactive_tui.rs`) 之间的差距，以及实现计划。
 
 ## 当前状态
 
@@ -93,7 +93,7 @@ const logo = theme.bold(theme.fg("accent", APP_NAME)) + theme.fg("dim", ` v${thi
 - [ ] 显示错误消息
 
 **实现步骤**:
-1. 创建 `crates/pi-tui/src/assistant_message.rs`
+1. 创建 `crates/rpi-tui/src/assistant_message.rs`
 2. 实现基本结构
 3. 集成到 `interactive_tui.rs`
 
@@ -114,7 +114,7 @@ const logo = theme.bold(theme.fg("accent", APP_NAME)) + theme.fg("dim", ` v${thi
 - [ ] 动态更新状态
 
 **实现步骤**:
-1. 创建 `crates/pi-tui/src/footer.rs`
+1. 创建 `crates/rpi-tui/src/footer.rs`
 2. 实现基本结构
 3. 集成到布局中
 
@@ -213,14 +213,14 @@ case "message_end":
 ## 实现总结
 
 ### 新创建的文件
-1. `crates/pi-tui/src/assistant_message.rs` - AssistantMessageComponent
-2. `crates/pi-tui/src/footer.rs` - FooterComponent
-3. `crates/pi-tui/src/tool_execution.rs` - ToolExecutionComponent
+1. `crates/rpi-tui/src/assistant_message.rs` - AssistantMessageComponent
+2. `crates/rpi-tui/src/footer.rs` - FooterComponent
+3. `crates/rpi-tui/src/tool_execution.rs` - ToolExecutionComponent
 4. `docs/tui-implementation-plan.md` - 实现计划文档
 
 ### 修改的文件
-1. `crates/pi-tui/src/lib.rs` - 添加新模块和导出
-2. `crates/pi-cli/src/interactive_tui.rs` - 使用新组件，添加斜杠命令处理
+1. `crates/rpi-tui/src/lib.rs` - 添加新模块和导出
+2. `crates/rpi-cli/src/interactive_tui.rs` - 使用新组件，添加斜杠命令处理
 
 ### 测试结果
 - 编译成功 ✅
@@ -259,13 +259,13 @@ Rust 版本只有运行级别事件：
 - 等等
 
 ## 新创建的文件
-1. `crates/pi-tui/src/assistant_message.rs` - AssistantMessageComponent
-2. `crates/pi-tui/src/footer.rs` - FooterComponent
+1. `crates/rpi-tui/src/assistant_message.rs` - AssistantMessageComponent
+2. `crates/rpi-tui/src/footer.rs` - FooterComponent
 3. `docs/tui-implementation-plan.md` - 实现计划文档
 
 ## 修改的文件
-1. `crates/pi-tui/src/lib.rs` - 添加新模块和导出
-2. `crates/pi-cli/src/interactive_tui.rs` - 使用新组件，改进交互流程
+1. `crates/rpi-tui/src/lib.rs` - 添加新模块和导出
+2. `crates/rpi-cli/src/interactive_tui.rs` - 使用新组件，改进交互流程
 
 ---
 
@@ -278,9 +278,9 @@ Rust 版本只有运行级别事件：
 - `packages/coding-agent/src/modes/interactive/components/custom-editor.ts` (100 行)
 
 ### Rust 文件
-- `crates/pi-cli/src/interactive_tui.rs` (当前 ~300 行)
-- `crates/pi-tui/src/markdown.rs` (当前 ~280 行)
-- `crates/pi-tui/src/editor.rs` (当前 ~400 行)
+- `crates/rpi-cli/src/interactive_tui.rs` (当前 ~300 行)
+- `crates/rpi-tui/src/markdown.rs` (当前 ~280 行)
+- `crates/rpi-tui/src/editor.rs` (当前 ~400 行)
 
 ---
 

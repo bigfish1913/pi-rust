@@ -1,14 +1,13 @@
-# pi-rust — Rust port of the Pi agent SDK
-# Workspace root. See README.md and docs/architecture.md.
+# rpi — a Rust agent runtime + CLI. See README.md and docs/architecture.md.
 [workspace]
 members = [
-    "crates/pi-telemetry",
-    "crates/pi-ai",
-    "crates/pi-agent",
-    "crates/pi-tools",
-    "crates/pi-harness",
-    "crates/pi-cli",
-    "crates/pi-tui",
+    "crates/rpi-telemetry",
+    "crates/rpi-ai",
+    "crates/rpi-agent",
+    "crates/rpi-tools",
+    "crates/rpi-harness",
+    "crates/rpi-cli",
+    "crates/rpi-tui",
     "crates/rpi-plugin-sdk",
     "crates/rpi-extensions",
     "examples/minimal",
@@ -17,10 +16,10 @@ members = [
     "examples/plugin-stub",
 ]
 default-members = [
-    "crates/pi-agent",
-    "crates/pi-tools",
-    "crates/pi-harness",
-    "crates/pi-cli",
+    "crates/rpi-agent",
+    "crates/rpi-tools",
+    "crates/rpi-harness",
+    "crates/rpi-cli",
 ]
 resolver = "2"
 
@@ -70,15 +69,14 @@ globset = "=0.4.15"
 dirs = "5"
 rpassword = "7"
 
-# pi-rust internal crates (published under the `rpi-` prefix; directories keep
-# the `pi-` name — package `name` is what crates.io + `extern crate` see).
-rpi-telemetry = { path = "crates/pi-telemetry", version = "0.3.5" }
-rpi-ai = { path = "crates/pi-ai", version = "0.3.5" }
-rpi-agent = { path = "crates/pi-agent", version = "0.3.5" }
-rpi-tools = { path = "crates/pi-tools", version = "0.3.5" }
-rpi-harness = { path = "crates/pi-harness", version = "0.3.5" }
+# rpi internal crates (package names and directories both use the `rpi-` prefix).
+rpi-telemetry = { path = "crates/rpi-telemetry", version = "0.3.5" }
+rpi-ai = { path = "crates/rpi-ai", version = "0.3.5" }
+rpi-agent = { path = "crates/rpi-agent", version = "0.3.5" }
+rpi-tools = { path = "crates/rpi-tools", version = "0.3.5" }
+rpi-harness = { path = "crates/rpi-harness", version = "0.3.5" }
 
-rpi-tui = { path = "crates/pi-tui", version = "0.3.5" }
+rpi-tui = { path = "crates/rpi-tui", version = "0.3.5" }
 
 rpi-plugin-sdk = { path = "crates/rpi-plugin-sdk", version = "0.3.5" }
 rpi-extensions = { path = "crates/rpi-extensions", version = "0.3.5" }

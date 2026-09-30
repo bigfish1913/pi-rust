@@ -90,7 +90,7 @@
           "links": [
             {
               "label": "rpi-agent API",
-              "url": "https://github.com/bigfish1913/pi-rust/tree/main/crates/pi-agent"
+              "url": "https://github.com/bigfish1913/pi-rust/tree/main/crates/rpi-agent"
             }
           ]
         },
@@ -105,13 +105,13 @@
           ],
           "code": {
             "language": "rust",
-            "file": "crates/pi-tools/src/lib.rs",
+            "file": "crates/rpi-tools/src/lib.rs",
             "content": "use rpi_tools::{create_read_tool, InMemoryExecutionEnv};\n\nlet env = InMemoryExecutionEnv::default();\nlet read = create_read_tool(env.clone());\nlet mut agent = Agent::builder(model)\n    .tool(read)\n    .build();"
           },
           "links": [
             {
               "label": "内置工具与 ExecutionEnv",
-              "url": "https://github.com/bigfish1913/pi-rust/tree/main/crates/pi-tools"
+              "url": "https://github.com/bigfish1913/pi-rust/tree/main/crates/rpi-tools"
             }
           ]
         },
@@ -147,13 +147,13 @@
           ],
           "code": {
             "language": "rust",
-            "file": "crates/pi-harness/src/lib.rs",
+            "file": "crates/rpi-harness/src/lib.rs",
             "content": "use rpi_harness::AgentHarness;\n\nlet harness = AgentHarness::builder(agent)\n    .session_dir(\".rpi/sessions\")\n    .build()\n    .await?;\nharness.prompt(\"Summarize this file\").await?;"
           },
           "links": [
             {
               "label": "Harness 模块",
-              "url": "https://github.com/bigfish1913/pi-rust/tree/main/crates/pi-harness"
+              "url": "https://github.com/bigfish1913/pi-rust/tree/main/crates/rpi-harness"
             }
           ]
         },
@@ -193,13 +193,13 @@
           ],
           "code": {
             "language": "rust",
-            "file": "crates/pi-ai/src/lib.rs",
+            "file": "crates/rpi-ai/src/lib.rs",
             "content": "let model = faux_provider().model(\"echo\");\nlet mut agent = Agent::builder(model)\n    .tool(create_read_tool(InMemoryExecutionEnv::default()))\n    .build();\nagent.prompt(\"read README.md\").await?;"
           },
           "links": [
             {
               "label": "faux provider 源码",
-              "url": "https://github.com/bigfish1913/pi-rust/tree/main/crates/pi-ai"
+              "url": "https://github.com/bigfish1913/pi-rust/tree/main/crates/rpi-ai"
             }
           ]
         }
@@ -242,13 +242,13 @@
           ],
           "code": {
             "language": "rust",
-            "file": "crates/pi-ai/src/provider.rs",
+            "file": "crates/rpi-ai/src/provider.rs",
             "content": "#[async_trait]\npub trait Provider: Send + Sync {\n    fn id(&self) -> &str;\n    fn models(&self) -> &[Model];\n    async fn stream_simple(\n        &self,\n        model: &Model,\n        ctx: &Context,\n        opts: &SimpleStreamOptions,\n    ) -> AssistantMessageEventStream;\n}"
           },
           "links": [
             {
               "label": "rpi-ai exports",
-              "url": "https://github.com/bigfish1913/pi-rust/blob/main/crates/pi-ai/src/lib.rs"
+              "url": "https://github.com/bigfish1913/pi-rust/blob/main/crates/rpi-ai/src/lib.rs"
             }
           ]
         },
@@ -263,13 +263,13 @@
           ],
           "code": {
             "language": "rust",
-            "file": "crates/pi-agent/src/agent_tool.rs",
+            "file": "crates/rpi-agent/src/agent_tool.rs",
             "content": "#[async_trait]\npub trait AgentTool: Send + Sync {\n    fn schema(&self) -> &Tool;\n    fn label(&self) -> &str;\n    async fn execute(\n        &self,\n        tool_call_id: &str,\n        params: serde_json::Value,\n        signal: CancellationToken,\n        on_update: Arc<dyn Fn(ToolResultPartial) + Send + Sync>,\n    ) -> Result<AgentToolResult, AgentError>;\n}"
           },
           "links": [
             {
               "label": "rpi-agent exports",
-              "url": "https://github.com/bigfish1913/pi-rust/blob/main/crates/pi-agent/src/lib.rs"
+              "url": "https://github.com/bigfish1913/pi-rust/blob/main/crates/rpi-agent/src/lib.rs"
             }
           ]
         },
@@ -284,13 +284,13 @@
           ],
           "code": {
             "language": "rust",
-            "file": "crates/pi-tools/src/lib.rs",
+            "file": "crates/rpi-tools/src/lib.rs",
             "content": "pub trait ExecutionEnv: Send + Sync {\n    async fn read_file(&self, path: &Path) -> Result<String>;\n    async fn write_file(&self, path: &Path, content: &str) -> Result<()>;\n    async fn run_command(&self, command: &str) -> Result<CommandOutput>;\n}\n\npub fn create_grep_tool(env: Arc<dyn ExecutionEnv>) -> impl AgentTool { /* ... */ }"
           },
           "links": [
             {
               "label": "ExecutionEnv API",
-              "url": "https://github.com/bigfish1913/pi-rust/blob/main/crates/pi-tools/src/lib.rs"
+              "url": "https://github.com/bigfish1913/pi-rust/blob/main/crates/rpi-tools/src/lib.rs"
             }
           ]
         },
@@ -305,13 +305,13 @@
           ],
           "code": {
             "language": "rust",
-            "file": "crates/pi-harness/src/lib.rs",
+            "file": "crates/rpi-harness/src/lib.rs",
             "content": "pub mod agent_harness;\npub mod session;\npub mod compaction;\npub mod skills;\npub mod prompt_templates;\npub mod context_files;\npub mod events;\npub mod system_prompt;"
           },
           "links": [
             {
               "label": "Harness modules",
-              "url": "https://github.com/bigfish1913/pi-rust/tree/main/crates/pi-harness"
+              "url": "https://github.com/bigfish1913/pi-rust/tree/main/crates/rpi-harness"
             }
           ]
         },
@@ -326,13 +326,13 @@
           ],
           "code": {
             "language": "text",
-            "file": "crates/pi-agent/src/lib.rs",
+            "file": "crates/rpi-agent/src/lib.rs",
             "content": "AgentBuilder\n  -> Agent::build\n  -> subscribe()\n  -> prompt(message)\n  -> Provider stream\n  -> AgentTool execution\n  -> AgentEvent::AgentEnd"
           },
           "links": [
             {
               "label": "Agent loop",
-              "url": "https://github.com/bigfish1913/pi-rust/blob/main/crates/pi-agent/src/lib.rs"
+              "url": "https://github.com/bigfish1913/pi-rust/blob/main/crates/rpi-agent/src/lib.rs"
             }
           ]
         },
@@ -347,13 +347,13 @@
           ],
           "code": {
             "language": "rust",
-            "file": "crates/pi-ai/src/lib.rs",
+            "file": "crates/rpi-ai/src/lib.rs",
             "content": "pub enum AssistantMessageEvent {\n    Start,\n    TextDelta(String),\n    ToolCall { name: String, arguments: Value },\n    Done { stop_reason: StopReason },\n    Error(String),\n}"
           },
           "links": [
             {
               "label": "AI event types",
-              "url": "https://github.com/bigfish1913/pi-rust/blob/main/crates/pi-ai/src/lib.rs"
+              "url": "https://github.com/bigfish1913/pi-rust/blob/main/crates/rpi-ai/src/lib.rs"
             }
           ]
         },

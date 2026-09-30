@@ -1,7 +1,7 @@
 #!/bin/sh
 # Refresh the documentation snapshot that is compiled into the `rpi` binary.
 #
-# crates/pi-cli/src/docs_tool.rs pulls these files in with include_str!, so they
+# crates/rpi-cli/src/docs_tool.rs pulls these files in with include_str!, so they
 # must be byte-copies of the dedicated docs/rpi-tool/ sources. Keep these
 # sources separate from docs/ ordinary user/developer documentation: the latter
 # may contain release notes, website-oriented pages, or implementation notes
@@ -12,7 +12,7 @@
 
 set -eu
 
-DEST="crates/pi-cli/embedded-docs"
+DEST="crates/rpi-cli/embedded-docs"
 
 # source -> destination file name
 FILES="docs/rpi-tool/README.md:README.md \
