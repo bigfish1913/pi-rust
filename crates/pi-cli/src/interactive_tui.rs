@@ -5065,6 +5065,55 @@ const PASTE_PROBE: std::time::Duration = std::time::Duration::from_millis(4);
 /// cannot deliver two keypresses this fast, so anything tighter is paste.
 const PASTE_BURST_GAP: std::time::Duration = std::time::Duration::from_millis(20);
 
+/// Windows crossterm reads console KEY_EVENTs, not bracketed-paste payloads.
+/// Buffer a rapid text run before handing it to the editor as one paste.
+/// A lone typed character is released promptly; a confirmed run may pause
+/// briefly while the terminal feeds the rest of the clipboard.
+#[derive(Default)]
+struct WindowsPasteRun {
+    text: String,
+    last_at: Option<std::time::Instant>,
+    burst: bool,
+}
+
+impl WindowsPasteRun {
+    fn grace(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(if self.burst { 120 } else { 15 })
+    }
+
+    fn feed(&mut self, ch: char, now: std::time::Instant) {
+        if self.last_at.is_some_and(|at| now.duration_since(at) <= PASTE_BURST_GAP) {
+            self.burst = true;
+        }
+        self.text.push(ch);
+        self.last_at = Some(now);
+    }
+
+    fn flush(&mut self, editor: &Editor) {
+        if !self.text.is_empty() {
+            editor.handle_paste(&self.text);
+        }
+        *self = Self::default();
+    }
+}
+
+/// Never turn a lone Enter into a newline. A queued next key proves this is
+/// an interior pasted newline. At the end of a paste, require clipboard
+/// corroboration before consuming Enter; otherwise preserve submit.
+fn windows_enter_in_paste(run: &WindowsPasteRun, more_queued: bool, clipboard: Option<&str>) -> bool {
+    if more_queued {
+        return true;
+    }
+    if run.text.is_empty() {
+        return false;
+    }
+    run.burst && clipboard.is_some_and(|text| {
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        let prefix = format!("{}\n", run.text);
+        normalized.starts_with(&prefix) && normalized.matches('\n').count() >= 10
+    })
+}
+
 /// Whether a bare Enter is pasted content (insert a newline) rather than a
 /// submit.
 ///
@@ -6716,13 +6765,11 @@ pub async fn interactive_tui(
         // Native pi's `handleCtrlC` "press twice to exit" window: the instant of
         // the last lone Ctrl+C. Shares the 500ms with Esc's double-escape.
         let mut last_sigint_time: Option<std::time::Instant> = None;
-        // Paste-burst tracking (see the bare-Enter guard below): the instant of
-        // the most recent key event that could have been pasted text.
-        let mut last_text_key_at: Option<std::time::Instant> = None;
         // One event peeked at by the paste-burst probe (which must discard a
         // key's Release but never lose a meaningful event it read). Restored
         // at the top of the next loop iteration.
         let mut pending_event: Option<Event> = None;
+        let mut windows_paste_run = WindowsPasteRun::default();
         if crate::key_trace::enabled() {
             crate::key_trace::note(&format!(
                 "--- rpi TUI key trace start pid={} TERM={} raw_mode={} ---",
@@ -6751,9 +6798,20 @@ pub async fn interactive_tui(
             } else {
                 // `event::read()` blocks indefinitely. Poll first so shutdown can
                 // stop and join this worker even when no further key arrives.
-                match crossterm::event::poll(std::time::Duration::from_millis(50)) {
+                match crossterm::event::poll(if cfg!(windows) && !windows_paste_run.text.is_empty() {
+                    windows_paste_run.grace()
+                } else {
+                    std::time::Duration::from_millis(50)
+                }) {
                     Ok(true) => {}
-                    Ok(false) => continue,
+                    Ok(false) => {
+                        if cfg!(windows) && !windows_paste_run.text.is_empty() {
+                            windows_paste_run.flush(&editor_for_key);
+                            refresh_autocomplete(&state_for_key, &editor_for_key);
+                            tui_for_key.request_render_reusing_scroll_content();
+                        }
+                        continue;
+                    }
                     Err(_) => {
                         state_for_key.cancel_js_preparation();
                         let _ = tx_for_key.send(TuiMessage::Exit);
@@ -7614,77 +7672,49 @@ pub async fn interactive_tui(
                 continue;
             }
 
-            // ---- Paste-burst coalescing (Windows only) ----------------------
-            // `crossterm` 0.27 implements bracketed paste ONLY on Unix: its
-            // Windows console event source (`ReadConsoleInputW`) never emits
-            // `Event::Paste`, so `?2004h` buys nothing there and a pasted block
-            // arrives as ordinary key events with a bare Enter per line. The
-            // editor treats a bare Enter as "submit", so one paste became N
-            // messages. See [`enter_is_paste_burst`] for the discriminator.
-            //
-            // On Unix the timing heuristic is both unnecessary AND harmful: a
-            // remote/mobile client (SSH, soft keyboard) coalesces typed text +
-            // Enter into one network burst, so the Enter lands within
-            // [`PASTE_BURST_GAP`] of the last character and the heuristic
-            // misclassifies it as pasted content — "回车变成了换行". Real pastes
-            // on Unix arrive as `Event::Paste` (bracketed paste is enabled by
-            // `ProcessTerminal::enter_raw_mode`), so gating to Windows restores
-            // remote Enter without losing the Windows paste fix.
-            if cfg!(windows)
-                && key.modifiers.is_empty()
-                && matches!(
-                    key.code,
-                    KeyCode::Enter | KeyCode::Char('\n') | KeyCode::Char('\r')
-                )
-            {
-                // Probe for a *real* queued key. Windows queues each key's
-                // Release event directly behind its Press, and a bare
-                // non-blocking poll cannot tell the two apart — treating that
-                // Release as "more input" made every Enter on a remote/RDP
-                // console look like a paste burst ("回车变成了换行"). See
-                // [`probe_paste_input`].
-                let (more_queued, stashed) = probe_paste_input(pending_event.take(), || {
-                    if crossterm::event::poll(PASTE_PROBE).unwrap_or(false) {
-                        crossterm::event::read().ok()
+            // Windows' console backend has no Event::Paste. Assemble text keys
+            // into one payload; only absorb Enter when another key is queued
+            // or the clipboard confirms a trailing pasted newline. A standalone
+            // Enter must reach Editor::handle_key so it submits normally.
+            if cfg!(windows) {
+                let text_key = match key.code {
+                    KeyCode::Char(c) if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => Some(c),
+                    _ => None,
+                };
+                if let Some(ch) = text_key {
+                    if ch == '\r' || ch == '\n' {
+                        // Treat these the same as KeyCode::Enter below.
+                    } else {
+                        windows_paste_run.feed(ch, std::time::Instant::now());
+                        continue;
+                    }
+                }
+                if key.modifiers.is_empty()
+                    && matches!(key.code, KeyCode::Enter | KeyCode::Char('\n') | KeyCode::Char('\r'))
+                {
+                    let (more_queued, stashed) = probe_paste_input(pending_event.take(), || {
+                        if crossterm::event::poll(PASTE_PROBE).unwrap_or(false) {
+                            crossterm::event::read().ok()
+                        } else {
+                            None
+                        }
+                    });
+                    pending_event = stashed;
+                    let clipboard = if !more_queued && windows_paste_run.burst {
+                        read_clipboard_text()
                     } else {
                         None
+                    };
+                    if windows_enter_in_paste(&windows_paste_run, more_queued, clipboard.as_deref()) {
+                        windows_paste_run.feed('\n', std::time::Instant::now());
+                        crate::key_trace::note("windows paste run -> newline");
+                        continue;
                     }
-                });
-                pending_event = stashed;
-                if enter_is_paste_burst(last_text_key_at, std::time::Instant::now(), more_queued) {
-                    crate::key_trace::note(&format!(
-                        "enter-decision -> newline (paste burst) gap_ms={} more_queued={more_queued}",
-                        gap_ms(last_text_key_at),
-                    ));
-                    // Pasted newline: insert it and keep the remaining queued
-                    // events flowing through this same path.
-                    editor_for_key.insert("\n");
-                    last_text_key_at = Some(std::time::Instant::now());
-                    refresh_autocomplete(&state_for_key, &editor_for_key);
-                    tui_for_key.request_render_reusing_scroll_content();
-                    continue;
+                    crate::key_trace::note("windows paste run -> flush + submit");
+                    windows_paste_run.flush(&editor_for_key);
+                } else {
+                    windows_paste_run.flush(&editor_for_key);
                 }
-                crate::key_trace::note(&format!(
-                    "enter-decision -> submit gap_ms={} more_queued={more_queued}",
-                    gap_ms(last_text_key_at),
-                ));
-                // A real submit ends the burst so a follow-up Enter is not
-                // mistaken for paste continuation.
-                last_text_key_at = None;
-            } else if matches!(
-                key.code,
-                KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Tab
-            ) && !key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-            {
-                // Unmodified text keys extend the burst. Ctrl/Alt chords
-                // (Ctrl+C, Alt+Enter, …) are commands, not paste content.
-                last_text_key_at = Some(std::time::Instant::now());
-            } else {
-                // Arrows, Esc, Ctrl/Alt chords, PageUp/Down, … — not paste
-                // content; break the burst.
-                last_text_key_at = None;
             }
 
             // 6. Otherwise forward to the editor + refresh autocomplete. The

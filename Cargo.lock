@@ -2402,6 +2402,7 @@ dependencies = [
  "tracing",
  "unicode-segmentation",
  "unicode-width",
+ "winapi",
 ]
 
 [[package]]

@@ -14,7 +14,7 @@ keywords = ["agent", "llm", "ai", "terminal", "tui"]
 categories = ["command-line-interface", "api-bindings"]
 
 [dependencies]
-crossterm = { version = "0.27", features = ["events"] }
+crossterm = { version = "0.27", features = ["events", "bracketed-paste"] }
 unicode-width = "0.1"
 unicode-segmentation = "1"
 thiserror.workspace = true
@@ -23,6 +23,9 @@ regex = "1"
 base64 = "0.22"
 similar = { version = "2", features = ["text", "unicode"] }
 pulldown-cmark = { version = "0.12", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["consoleapi", "processenv", "winbase", "wincon"] }
 
 [package.metadata.docs.rs]
 all-features = true
