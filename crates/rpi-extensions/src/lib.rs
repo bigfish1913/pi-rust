@@ -61,7 +61,7 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
 use rpi_plugin_sdk::{
-    EventHandlerFn, EventTag, FreeStringFn, PluginApiVt, PluginApiVt3Ext, ProviderRequestFn,
+    EventHandlerFn, EventTag, FreeStringFn, ProviderRequestFn,
     RenderFn, ResourcesDiscoverFn, RuntimeActionFn, StablePluginEvent, StableToolSchema, StbString,
     StbStringRef, ToolCancelFn, ToolDestroyFn, ToolExecuteFn, ToolPollFn,
 };
@@ -157,17 +157,16 @@ pub extern "C" fn host_free_string(s: StbString) {
 }
 
 // ===========================================================================
-// HostApi — the PluginApiVt the host builds and hands to each plugin's register
+// HostApi — the PluginApi the host builds and hands to each plugin's register
 // ===========================================================================
 
-/// The host state a [`PluginApiVt`] closes over. Held behind `Arc` so the fn
+/// The host state a [`PluginApi`] closes over. Held behind `Arc` so the fn
 /// pointers (which are `extern "C"`,不好做闭包) can recover the host state via
 /// the `user_data` slot — but since `extern "C" fn` cannot capture, the host
 /// stores per-registration receiver state in the [`HostApi`] itself keyed by
 /// nothing (single registry per host), and the fns are thin trampolines that
-/// read a process-global-attached registry. In v1 we keep it simple: the host
-/// builds one `HostApi` per load session; the `register_*` trampolines forward
-/// into it.
+/// read a process-global-attached registry. The host builds one `HostApi` per
+/// load session; the `register_*` trampolines forward into it.
 ///
 /// This struct is `Send + Sync` (registry is `Mutex`-guarded).
 pub struct HostApi {
@@ -178,10 +177,10 @@ pub struct HostApi {
     /// part of the ABI — the plugin never sees it.
     name: String,
     /// B5a: the plugin→host action bridge, carried in
-    /// [`PluginApiVt::user_data`] so [`trampoline_runtime_action`] can recover
+    /// [`PluginApi::user_data`] so [`trampoline_runtime_action`] can recover
     /// the harness state from ANY thread a plugin calls from (post-register, no
     /// thread-local). `None` keeps the no-bridge stub `runtime_action` and the
-    /// register `user_data` (the `HostApi` pointer) — so older call sites that
+    /// register `user_data` (the `HostApi` pointer) — so call sites that
     /// don't pass a bridge behave exactly as before.
     action_bridge: Option<Arc<ActionBridge>>,
 }
@@ -238,14 +237,14 @@ impl HostApi {
         self.registry.lock().expect("host api registry lock").take()
     }
 
-    /// Build the ABI v2 C vtable passed to `rpi_plugin_register_v2`.
+    /// Build the [`PluginApi`] struct passed to `rpi_plugin_register`.
     ///
-    /// Every optional registrar slot currently resolves to a real `extern "C"`
-    /// trampoline that forwards into `self`'s registry (so a plugin that calls
-    /// `register_tool` / `register_command` / renderer registration now sees
-    /// its registration land). `runtime_action` resolves
-    /// to the real [`trampoline_runtime_action`] when a bridge is present (B5a),
-    /// else the stub returning `-1`.
+    /// Every optional registrar slot resolves to a real `extern "C"` trampoline
+    /// that forwards into `self`'s registry (so a plugin that calls
+    /// `register_tool` / `register_command` / renderer registration sees its
+    /// registration land). `runtime_action` resolves to the real
+    /// [`trampoline_runtime_action`] when a bridge is present (B5a), else the
+    /// stub returning `-1`.
     ///
     /// **`user_data`**: the register trampolines recover host state via the
     /// thread-local `CURRENT_HOST_API` (set for the duration of register in
@@ -255,13 +254,13 @@ impl HostApi {
     /// `ActionBridge` (the SDK-designated "host's opaque context"). The bridge's
     /// master `Arc` is kept by `rpi-cli` for the harness lifetime, so the
     /// pointer a plugin stores during register stays valid.
-    pub fn build_vtable(self: &Arc<Self>) -> PluginApiVt {
+    pub fn build_vtable(self: &Arc<Self>) -> rpi_plugin_sdk::PluginApi {
         // When a bridge is present, user_data carries it (post-register action
         // recovery). Otherwise keep the register-path HostApi pointer (harmless
         // — register trampolines use the thread-local and ignore user_data).
         // Cast both arms to the `RuntimeActionFn` pointer type — distinct fn
         // items have unique types even with identical signatures, so the match
-        // needs a common fn-pointer type to unify on (the vtable field is
+        // needs a common fn-pointer type to unify on (the struct field is
         // `RuntimeActionFn`, a bare `extern "C" fn` alias, not an `Option`).
         let (runtime_action_fn, ud) = match &self.action_bridge {
             Some(bridge) => (
@@ -273,7 +272,9 @@ impl HostApi {
                 Arc::as_ptr(self) as *mut c_void,
             ),
         };
-        PluginApiVt {
+        rpi_plugin_sdk::PluginApi {
+            abi_version: rpi_plugin_sdk::RPI_PLUGIN_ABI_VERSION_UNIFIED,
+            struct_size: std::mem::size_of::<rpi_plugin_sdk::PluginApi>() as u32,
             free_string: host_free_string,
             register_tool: Some(trampoline_register_tool),
             register_command: Some(trampoline_register_command),
@@ -288,51 +289,7 @@ impl HostApi {
             runtime_action: runtime_action_fn,
             dispatch_event: Some(trampoline_dispatch_event),
             user_data: ud,
-        }
-    }
-
-    /// Build the unified ABI struct passed to `rpi_plugin_register`.
-    ///
-    /// The unified ABI has no version suffix in the symbol name; the version
-    /// lives inside the struct (first field `abi_version`). This is the *only*
-    /// ABI going forward; old versioned symbols are kept temporarily for
-    /// migration but are deprecated.
-    ///
-    /// The struct includes `abi_version` and `struct_size` prefix fields for
-    /// robust version checking that survives future signature changes. The
-    /// `declare` slot (previously in `PluginApiVt3Ext`) is folded in.
-    pub fn build_vtable_unified(self: &Arc<Self>) -> rpi_plugin_sdk::PluginApi {
-        let v2 = self.build_vtable();
-        rpi_plugin_sdk::PluginApi {
-            abi_version: rpi_plugin_sdk::RPI_PLUGIN_ABI_VERSION_UNIFIED,
-            struct_size: std::mem::size_of::<rpi_plugin_sdk::PluginApi>() as u32,
-            free_string: v2.free_string,
-            register_tool: v2.register_tool,
-            register_command: v2.register_command,
-            register_shortcut: v2.register_shortcut,
-            register_flag: v2.register_flag,
-            register_provider: v2.register_provider,
-            register_message_renderer: v2.register_message_renderer,
-            register_markdown_transformer: v2.register_markdown_transformer,
-            register_entry_renderer: v2.register_entry_renderer,
-            register_event_handler: v2.register_event_handler,
-            register_resources_discover: v2.register_resources_discover,
-            runtime_action: v2.runtime_action,
-            dispatch_event: v2.dispatch_event,
-            user_data: v2.user_data,
             declare: Some(trampoline_declare),
-        }
-    }
-
-    /// P2: build the ABI v3 **extension block** passed alongside the frozen v2
-    /// [`PluginApiVt`] to `rpi_plugin_register_v3`. Today it exposes only
-    /// `declare` (priority / platforms); the reserved slots are null. A plugin
-    /// that never calls `declare` keeps the host defaults (priority 100, all
-    /// platforms).
-    pub fn build_vtable_v3_ext(self: &Arc<Self>) -> PluginApiVt3Ext {
-        PluginApiVt3Ext {
-            declare: Some(trampoline_declare),
-            _reserved: [std::ptr::null_mut(); 3],
         }
     }
 }

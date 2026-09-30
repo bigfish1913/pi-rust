@@ -1,9 +1,8 @@
 //! The `libloading` loader: discover and register cdylib plugins.
 //!
-//! [`load_one`] loads a single cdylib and prefers the unified `rpi_plugin_register`
-//! (ABI v4), then falls back to `rpi_plugin_register_v3` (ABI v3), then
-//! `rpi_plugin_register_v2` (ABI v2). The selected entrypoint is called exactly
-//! once; a nonzero return never triggers fallback to the other ABI.
+//! [`load_one`] loads a single cdylib and looks up the unified
+//! `rpi_plugin_register` entrypoint (ABI v4). The entrypoint is called exactly
+//! once; a nonzero return is reported via diagnostics.
 //!
 //! [`load_dir`] walks a directory for `.{dll,so,dylib}` files and loads each.
 //! The returned [`LoadedPlugin`]s hold the `libloading::Library` (dropping them
@@ -17,8 +16,7 @@ use libloading::Library;
 use thiserror::Error;
 
 use rpi_plugin_sdk::{
-    PluginApiVt, PluginApiVt3Ext, RpiPluginRegister, RpiPluginRegisterUnified, RpiPluginRegisterV3,
-    RPI_PLUGIN_ABI_VERSION, RPI_PLUGIN_ABI_VERSION_UNIFIED, RPI_PLUGIN_ABI_VERSION_V3,
+    RpiPluginRegisterUnified, RPI_PLUGIN_ABI_VERSION_UNIFIED,
 };
 
 use crate::registry::{ExtensionRegistry, RegistrySnapshot};
@@ -41,13 +39,11 @@ pub enum PluginLoadError {
         source: libloading::Error,
     },
     #[error(
-        "neither `rpi_plugin_register`, `rpi_plugin_register_v3`, nor `rpi_plugin_register_v2` was found in {path} (unified: {unified_error}; v3: {v3_error}; v2: {v2_error})"
+        "`rpi_plugin_register` was not found in {path}: {error}"
     )]
     Symbol {
         path: PathBuf,
-        unified_error: String,
-        v3_error: String,
-        v2_error: String,
+        error: String,
     },
     #[error("register returned nonzero code {code} for {path}")]
     RegisterReturned { path: PathBuf, code: i32 },
@@ -74,88 +70,35 @@ pub struct LoadedPlugin {
     pub library: Library,
     /// Where it was loaded from (for diagnostics).
     pub path: PathBuf,
-    /// ABI selected from the exported register symbol (`1` or `2`).
+    /// ABI version (always [`RPI_PLUGIN_ABI_VERSION_UNIFIED`] for plugins
+    /// loaded by this version of the loader).
     pub abi_version: u32,
     /// The registry snapshot built from this plugin's registrations. The host
     /// merges snapshots from all loaded plugins into one session registry.
     pub registry: ExtensionRegistry,
 }
 
-#[derive(Clone, Copy)]
-enum RegisterEntrypoint {
-    /// Unified ABI: single unversioned symbol `rpi_plugin_register`, version in struct.
-    Unified(RpiPluginRegisterUnified),
-    /// ABI v3: receives the frozen v2 vtable + the v3 ext block (temporary migration).
-    V3(RpiPluginRegisterV3),
-    /// ABI v2: receives the frozen v2 vtable (temporary migration).
-    V2(RpiPluginRegister),
-}
-
-impl RegisterEntrypoint {
-    fn abi_version(self) -> u32 {
-        match self {
-            Self::Unified(_) => RPI_PLUGIN_ABI_VERSION_UNIFIED,
-            Self::V3(_) => RPI_PLUGIN_ABI_VERSION_V3,
-            Self::V2(_) => RPI_PLUGIN_ABI_VERSION,
-        }
-    }
-}
-
-/// Prefer the unified ABI, then v3, then v2. Each lookup is lazy — once a
-/// higher symbol is found, lower ones are not consulted (mirrors the "never
-/// fall back after a successful lookup" contract). On total failure the three
-/// errors are returned for the `Symbol` diagnostic.
-fn select_register<E>(
-    unified: Result<RpiPluginRegisterUnified, E>,
-    v3: impl FnOnce() -> Result<RpiPluginRegisterV3, E>,
-    v2: impl FnOnce() -> Result<RpiPluginRegister, E>,
-) -> Result<RegisterEntrypoint, (E, E, E)> {
-    match unified {
-        Ok(register) => Ok(RegisterEntrypoint::Unified(register)),
-        Err(unified_error) => match v3() {
-            Ok(register) => Ok(RegisterEntrypoint::V3(register)),
-            Err(v3_error) => match v2() {
-                Ok(register) => Ok(RegisterEntrypoint::V2(register)),
-                Err(v2_error) => Err((unified_error, v3_error, v2_error)),
-            },
-        },
-    }
-}
-
-fn call_register(entrypoint: RegisterEntrypoint, host_api: &Arc<HostApi>) -> i32 {
-    // Leak the vtables. The SDK asks plugins to *copy* the function pointers
+fn call_register(
+    register: RpiPluginRegisterUnified,
+    host_api: &Arc<HostApi>,
+) -> i32 {
+    // Leak the API struct. The SDK asks plugins to *copy* the function pointers
     // they need during `register`, but real-world plugins retain the `api`
     // pointer to call e.g. `runtime_action` later. The host already keeps the
     // `user_data` (the `ActionBridge`) alive for the whole session, so keeping
     // the table valid is consistent with that contract and prevents a
-    // use-after-free for plugins that hold the pointer. Bounded: one table per
+    // use-after-free for plugins that hold the pointer. Bounded: one struct per
     // plugin load (a leak of a few dozen bytes per load/reload).
     //
-    // Defense in depth: the SDK's `export_plugin!`/`export_plugin_v2!`/`export_plugin_v3!`
-    // (and `register_entrypoint*`) already convert a plugin panic into
-    // `REGISTER_PANIC_STATUS` before it can reach the `extern "C"` boundary.
-    // We still wrap the call so a plugin built against a *newer* `C-unwind`
-    // entrypoint, or a panic raised by host vtable construction, is contained
-    // rather than unwinding through the loader.
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match entrypoint {
-        RegisterEntrypoint::Unified(register) => {
-            let api: &'static rpi_plugin_sdk::PluginApi =
-                Box::leak(Box::new(host_api.build_vtable_unified()));
-            register(api as *const rpi_plugin_sdk::PluginApi)
-        }
-        RegisterEntrypoint::V3(register) => {
-            let vtable: &'static PluginApiVt = Box::leak(Box::new(host_api.build_vtable()));
-            let ext: &'static PluginApiVt3Ext = Box::leak(Box::new(host_api.build_vtable_v3_ext()));
-            register(
-                vtable as *const PluginApiVt,
-                ext as *const PluginApiVt3Ext,
-                RPI_PLUGIN_ABI_VERSION_V3,
-            )
-        }
-        RegisterEntrypoint::V2(register) => {
-            let vtable: &'static PluginApiVt = Box::leak(Box::new(host_api.build_vtable()));
-            register(vtable as *const PluginApiVt, RPI_PLUGIN_ABI_VERSION)
-        }
+    // Defense in depth: the SDK's `export_plugin!` (and `register_entrypoint`)
+    // already convert a plugin panic into `REGISTER_PANIC_STATUS` before it can
+    // reach the `extern "C"` boundary. We still wrap the call so a plugin built
+    // against a *newer* `C-unwind` entrypoint, or a panic raised by host vtable
+    // construction, is contained rather than unwinding through the loader.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let api: &'static rpi_plugin_sdk::PluginApi =
+            Box::leak(Box::new(host_api.build_vtable()));
+        register(api as *const rpi_plugin_sdk::PluginApi)
     })) {
         Ok(code) => code,
         // Reaching here means the panic unwound *into the host* rather than
@@ -181,7 +124,7 @@ fn call_register(entrypoint: RegisterEntrypoint, host_api: &Arc<HostApi>) -> i32
 /// `action_bridge` (B5a): when `Some`, the plugin's vtable wires the real
 /// [`trampoline_runtime_action`] and carries the bridge in `user_data`, so the
 /// plugin can invoke host runtime actions post-register from any thread. `None`
-/// keeps the v1 stub (actions return `-1`). `rpi-cli` builds ONE master
+/// keeps the stub (actions return `-1`). `rpi-cli` builds ONE master
 /// `Arc<ActionBridge>` per session and clones it into every `load_one` — every
 /// plugin's `user_data` points at the same bridge (Arc-ptr-stable, kept alive
 /// by `rpi-cli` for the harness lifetime).
@@ -197,35 +140,17 @@ pub fn load_one(
         source: e,
     })?;
 
-    // 2. Prefer the unified ABI, then v3, then v2. Each lookup is lazy,
-    // so a plugin exporting the unified symbol is unambiguously unified and
-    // lower paths are not even consulted.
-    let entrypoint = unsafe {
-        select_register(
-            library
-                .get::<RpiPluginRegisterUnified>(rpi_plugin_sdk::REGISTER_SYMBOL_UNIFIED)
-                .map(|symbol| *symbol),
-            || {
-                library
-                    .get::<RpiPluginRegisterV3>(rpi_plugin_sdk::REGISTER_SYMBOL_V3)
-                    .map(|symbol| *symbol)
-            },
-            || {
-                library
-                    .get::<RpiPluginRegister>(rpi_plugin_sdk::REGISTER_SYMBOL_V2)
-                    .map(|symbol| *symbol)
-            },
-        )
+    // 2. Look up the unified entrypoint.
+    let register: RpiPluginRegisterUnified = unsafe {
+        library
+            .get::<RpiPluginRegisterUnified>(rpi_plugin_sdk::REGISTER_SYMBOL_UNIFIED)
+            .map(|symbol| *symbol)
     }
-    .map_err(
-        |(unified_error, v3_error, v2_error)| PluginLoadError::Symbol {
-            path: path.clone(),
-            unified_error: unified_error.to_string(),
-            v3_error: v3_error.to_string(),
-            v2_error: v2_error.to_string(),
-        },
-    )?;
-    let abi_version = entrypoint.abi_version();
+    .map_err(|e| PluginLoadError::Symbol {
+        path: path.clone(),
+        error: e.to_string(),
+    })?;
+    let abi_version = RPI_PLUGIN_ABI_VERSION_UNIFIED;
 
     // Plugin display name (file stem) — stamped onto every registration the
     // plugin makes so host diagnostics (e.g. lifecycle veto messages) can name
@@ -251,11 +176,7 @@ pub fn load_one(
     // SAFETY: `host_api` is alive for the duration of the register call (held on
     // this stack); we clear_current_api immediately after.
     unsafe { set_current_api(&host_api) };
-    // The selected symbol is invoked exactly once. In particular, a nonzero v2
-    // result does not fall back to v1, because registration may have produced
-    // side effects before returning. A panic from an `extern "C"` plugin is not
-    // recoverable in general and is deliberately not advertised as contained.
-    let rc = call_register(entrypoint, &host_api);
+    let rc = call_register(register, &host_api);
     clear_current_api();
 
     if rc != 0 {
@@ -359,15 +280,7 @@ fn is_cdylib(path: &Path) -> bool {
 /// stay alive — callers keep the `Library` handles).
 pub fn merge_registries(plugins: &mut [LoadedPlugin]) -> ExtensionRegistry {
     let mut session = ExtensionRegistry::new();
-    // We can't move registries out of LoadedPlugin without taking them; borrow
-    // mutably and drain into the session. Since ExtensionRegistry's registrars
-    // consume by value, we rebuild from the snapshot instead.
-    // Simpler: snapshot each, then re-register by iteration. But ExtensionRegistry
-    // has no public "absorb another registry" — so we drain tools/commands/handlers
-    // via internal access. For v1 we expose the typed fields via crate-internal
-    // methods on ExtensionRegistry used only here.
     for p in plugins.iter_mut() {
-        // Take the plugin's registry out (LoadedPlugin keeps the Library).
         let taken = std::mem::take(&mut p.registry);
         session.absorb(taken);
     }
@@ -450,7 +363,7 @@ pub struct ExtensionSession {
 
 impl ExtensionSession {
     /// Assemble a session from already-loaded parts (explicit `--extension`
-    /// files via `load_one` + `merge_registries`). Mirrors `load_session`'s
+    /// files via `load_one` + `merge_registries`). Mirrors `load_session` but
     /// internal assembly so callers can build a session without a dir scan.
     pub fn from_parts(
         snapshot: Arc<RegistrySnapshot>,
@@ -547,7 +460,7 @@ impl ExtensionSession {
 /// `action_bridge` (B5a) is cloned into every loaded plugin's vtable so
 /// post-register `runtime_action` calls recover the bridge on any thread.
 /// `rpi-cli` builds one master `Arc<ActionBridge>` per session and passes it
-/// here; `None` keeps the v1 stub (used by tests / `--no-extensions` no-ops).
+/// here; `None` keeps the stub (used by tests / `--no-extensions` no-ops).
 pub fn load_session(
     dirs: &[PathBuf],
     diagnostics: Arc<dyn PluginDiagnostics>,
@@ -582,13 +495,7 @@ pub fn load_session_mixed(
         return ExtensionSession::none();
     }
     let loaded_paths: Vec<PathBuf> = loaded.iter().map(|p| p.path.clone()).collect();
-    // Merge the per-plugin registries first-wins. This drains each `registry`
-    // field (via mem::take inside `absorb`) but leaves `library` intact, so we
-    // can then destructure-own each Library into the keepalive below.
     let session_registry = merge_registries(&mut loaded);
-    // Now move each Library out of its (registry-hollowed) LoadedPlugin by struct
-    // destructuring, collecting them into the keepalive. `registry`/`path` were
-    // left valid-but-empty / cloned already, and `library` is a move into `libs`.
     let mut libs: Vec<Library> = Vec::with_capacity(loaded.len());
     for p in loaded {
         let LoadedPlugin {
@@ -617,20 +524,11 @@ mod tests {
     use super::*;
     use std::fs;
     use std::process::Command;
-    use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     static UNIFIED_CALLS: AtomicUsize = AtomicUsize::new(0);
-    static V2_CALLS: AtomicUsize = AtomicUsize::new(0);
-    static UNIFIED_LOOKUPS: AtomicUsize = AtomicUsize::new(0);
-    static V3_LOOKUPS: AtomicUsize = AtomicUsize::new(0);
-    static V2_LOOKUPS: AtomicUsize = AtomicUsize::new(0);
-    static V2_SEEN_VERSION: AtomicU32 = AtomicU32::new(0);
-    static UNIFIED_SEEN_VERSION: AtomicU32 = AtomicU32::new(0);
-    static V2_RETURN: AtomicI32 = AtomicI32::new(0);
-    static V3_CALLS: AtomicUsize = AtomicUsize::new(0);
-    static V3_SEEN_VERSION: AtomicU32 = AtomicU32::new(0);
-    static V3_RETURN: AtomicI32 = AtomicI32::new(0);
+    static UNIFIED_SEEN_VERSION: AtomicUsize = AtomicUsize::new(0);
     static UNIFIED_RETURN: AtomicI32 = AtomicI32::new(0);
 
     extern "C" fn test_register_unified(api: *const rpi_plugin_sdk::PluginApi) -> i32 {
@@ -638,30 +536,8 @@ mod tests {
             return -99;
         }
         UNIFIED_CALLS.fetch_add(1, Ordering::SeqCst);
-        UNIFIED_SEEN_VERSION.store(unsafe { (*api).abi_version }, Ordering::SeqCst);
+        UNIFIED_SEEN_VERSION.store(unsafe { (*api).abi_version as usize }, Ordering::SeqCst);
         UNIFIED_RETURN.load(Ordering::SeqCst)
-    }
-
-    extern "C" fn test_register_v3(
-        api: *const PluginApiVt,
-        ext: *const PluginApiVt3Ext,
-        abi_version: u32,
-    ) -> i32 {
-        if api.is_null() || ext.is_null() {
-            return -99;
-        }
-        V3_CALLS.fetch_add(1, Ordering::SeqCst);
-        V3_SEEN_VERSION.store(abi_version, Ordering::SeqCst);
-        V3_RETURN.load(Ordering::SeqCst)
-    }
-
-    extern "C" fn test_register_v2(api: *const PluginApiVt, abi_version: u32) -> i32 {
-        if api.is_null() {
-            return -99;
-        }
-        V2_CALLS.fetch_add(1, Ordering::SeqCst);
-        V2_SEEN_VERSION.store(abi_version, Ordering::SeqCst);
-        V2_RETURN.load(Ordering::SeqCst)
     }
 
     #[derive(Default)]
@@ -734,242 +610,47 @@ mod tests {
         CdylibFixture { dir, path }
     }
 
-    // A minimal self-contained ABI v3 plugin: exports `rpi_plugin_register_v3`
-    // and calls the v3 `declare` slot to declare a priority + platforms. It does
-    // NOT import the workspace SDK, so it also proves the loader negotiates v3
-    // and delivers the ext block end-to-end.
-    const V3_PLUGIN_SOURCE: &str = r##"
-use std::ffi::c_void;
-
-#[repr(C)]
-struct StbStringRef {
-    ptr: *const u8,
-    len: usize,
-}
-
-#[repr(C)]
-struct PluginApiVt3Ext {
-    declare: Option<extern "C" fn(json: StbStringRef) -> i32>,
-    _reserved: [*mut c_void; 3],
-}
-
-// Opaque frozen v2 vtable: the fixture never reads it, only receives the ptr.
-#[repr(C)]
-struct PluginApiVt {
-    _opaque: [*mut c_void; 14],
-}
-
-#[no_mangle]
-pub extern "C" fn rpi_plugin_register_v3(
-    _api: *const PluginApiVt,
-    ext: *const PluginApiVt3Ext,
-    abi_version: u32,
-) -> i32 {
-    if abi_version != 3 {
-        return 1;
-    }
-    if ext.is_null() {
-        return 2;
-    }
-    let ext = unsafe { &*ext };
-    let Some(declare) = ext.declare else {
-        return 3;
-    };
-    let json = r#"{"priority":42,"platforms":["all"]}"#;
-    let rc = declare(StbStringRef {
-        ptr: json.as_ptr(),
-        len: json.len(),
-    });
-    if rc != 0 {
-        return 4;
-    }
-    0
-}
-"##;
-
     #[test]
-    fn loads_v3_plugin_and_applies_declaration() {
-        let fixture = build_cdylib_fixture("abi_v3_declare", V3_PLUGIN_SOURCE);
-        let diagnostics = Arc::new(CapturingDiag::default());
-        let loaded = load_one(
-            &fixture.path,
-            Arc::clone(&diagnostics) as Arc<dyn PluginDiagnostics>,
-            None,
-        )
-        .expect("load v3 plugin");
-        assert_eq!(loaded.abi_version, 3);
-        // The v3 `declare` slot landed the priority + platforms on the plugin's
-        // registry (the loader negotiated v3, built the ext block, and the
-        // trampoline applied the JSON).
-        assert_eq!(loaded.registry.declared_priority(), 42);
-        assert_eq!(loaded.registry.declared_platforms(), ["all".to_string()]);
-    }
-
-    #[test]
-    fn entrypoint_selection_prefers_unified_then_v3_then_v2() {
-        UNIFIED_CALLS.store(0, Ordering::SeqCst);
-        V2_CALLS.store(0, Ordering::SeqCst);
-        UNIFIED_LOOKUPS.store(0, Ordering::SeqCst);
-        V3_LOOKUPS.store(0, Ordering::SeqCst);
-        V2_LOOKUPS.store(0, Ordering::SeqCst);
-        V2_RETURN.store(0, Ordering::SeqCst);
-        V3_CALLS.store(0, Ordering::SeqCst);
-        V3_RETURN.store(0, Ordering::SeqCst);
-        UNIFIED_RETURN.store(0, Ordering::SeqCst);
-
-        // unified present → selected; v3/v2 lookups are not consulted.
-        let entrypoint = select_register(
-            Ok::<RpiPluginRegisterUnified, &str>(test_register_unified),
-            || {
-                V3_LOOKUPS.fetch_add(1, Ordering::SeqCst);
-                Ok(test_register_v3)
-            },
-            || {
-                V2_LOOKUPS.fetch_add(1, Ordering::SeqCst);
-                Ok(test_register_v2)
-            },
-        )
-        .expect("unified selected");
-        assert!(matches!(entrypoint, RegisterEntrypoint::Unified(_)));
-        assert_eq!(call_register(entrypoint, &test_host_api()), 0);
-        assert_eq!(UNIFIED_CALLS.load(Ordering::SeqCst), 1);
-        assert_eq!(V3_CALLS.load(Ordering::SeqCst), 0);
-        assert_eq!(V3_LOOKUPS.load(Ordering::SeqCst), 0);
-        assert_eq!(V2_LOOKUPS.load(Ordering::SeqCst), 0);
-        assert_eq!(UNIFIED_SEEN_VERSION.load(Ordering::SeqCst), 4);
-
-        // unified missing → v3 selected; v2 lookup is not consulted.
-        let entrypoint = select_register(
-            Err::<RpiPluginRegisterUnified, &str>("unified missing"),
-            || {
-                V3_LOOKUPS.fetch_add(1, Ordering::SeqCst);
-                Ok(test_register_v3)
-            },
-            || {
-                V2_LOOKUPS.fetch_add(1, Ordering::SeqCst);
-                Ok(test_register_v2)
-            },
-        )
-        .expect("v3 selected");
-        assert!(matches!(entrypoint, RegisterEntrypoint::V3(_)));
-        assert_eq!(call_register(entrypoint, &test_host_api()), 0);
-        assert_eq!(V3_CALLS.load(Ordering::SeqCst), 1);
-        assert_eq!(V3_LOOKUPS.load(Ordering::SeqCst), 1);
-        assert_eq!(V2_LOOKUPS.load(Ordering::SeqCst), 0);
-        assert_eq!(V3_SEEN_VERSION.load(Ordering::SeqCst), 3);
-
-        // unified+v3 missing → v2.
-        let entrypoint = select_register(
-            Err::<RpiPluginRegisterUnified, &str>("unified missing"),
-            || Err::<RpiPluginRegisterV3, &str>("v3 missing"),
-            || {
-                V2_LOOKUPS.fetch_add(1, Ordering::SeqCst);
-                Ok(test_register_v2)
-            },
-        )
-        .expect("v2 selected");
-        assert!(matches!(entrypoint, RegisterEntrypoint::V2(_)));
-        assert_eq!(call_register(entrypoint, &test_host_api()), 0);
-        assert_eq!(V2_CALLS.load(Ordering::SeqCst), 1);
-        assert_eq!(V2_SEEN_VERSION.load(Ordering::SeqCst), 2);
-
-        // A selected unified entrypoint that later fails is still called once and is
-        // not followed by a v3/v2 call.
-        UNIFIED_RETURN.store(73, Ordering::SeqCst);
-        let entrypoint = select_register(
-            Ok::<RpiPluginRegisterUnified, &str>(test_register_unified),
-            || {
-                V3_LOOKUPS.fetch_add(1, Ordering::SeqCst);
-                Ok(test_register_v3)
-            },
-            || {
-                V2_LOOKUPS.fetch_add(1, Ordering::SeqCst);
-                Ok(test_register_v2)
-            },
-        )
-        .expect("unified selected even though its later call will fail");
-        assert_eq!(call_register(entrypoint, &test_host_api()), 73);
-        assert_eq!(UNIFIED_CALLS.load(Ordering::SeqCst), 2);
-        assert_eq!(V3_CALLS.load(Ordering::SeqCst), 1);
-        assert_eq!(V3_LOOKUPS.load(Ordering::SeqCst), 1);
-        assert_eq!(V2_CALLS.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn load_one_prefers_unified_over_v3_and_v2() {
+    fn loads_unified_plugin() {
         const PREFIX: &str = "use std::ffi::c_void;\n";
         let diag: Arc<dyn PluginDiagnostics> = Arc::new(CapturingDiag::default());
 
-        // Unified symbol only
         let unified = build_cdylib_fixture(
             "abi_unified_only",
             &format!(
                 "{PREFIX}#[no_mangle]\npub extern \"C\" fn rpi_plugin_register(api: *const c_void) -> i32 {{ if !api.is_null() {{ 0 }} else {{ 91 }} }}\n"
             ),
         );
-        let loaded_unified =
-            load_one(&unified.path, Arc::clone(&diag), None).expect("load unified plugin");
-        assert_eq!(loaded_unified.abi_version, 4);
-        drop(loaded_unified);
+        let loaded = load_one(&unified.path, Arc::clone(&diag), None).expect("load unified plugin");
+        assert_eq!(loaded.abi_version, RPI_PLUGIN_ABI_VERSION_UNIFIED);
+        drop(loaded);
         drop(unified);
+    }
 
-        // v3 symbol only
-        let v3 = build_cdylib_fixture(
-            "abi_v3_only",
-            &format!(
-                "{PREFIX}#[no_mangle]\npub extern \"C\" fn rpi_plugin_register_v3(api: *const c_void, ext: *const c_void, abi: u32) -> i32 {{ if !api.is_null() && !ext.is_null() && abi == 3 {{ 0 }} else {{ 92 }} }}\n"
-            ),
-        );
-        let loaded_v3 = load_one(&v3.path, Arc::clone(&diag), None).expect("load v3 plugin");
-        assert_eq!(loaded_v3.abi_version, 3);
-        drop(loaded_v3);
-        drop(v3);
+    #[test]
+    fn unified_registration_failure_is_reported() {
+        const PREFIX: &str = "use std::ffi::c_void;\n";
+        let diag: Arc<dyn PluginDiagnostics> = Arc::new(CapturingDiag::default());
 
-        // v2 symbol only
-        let v2 = build_cdylib_fixture(
-            "abi_v2_only",
-            &format!(
-                "{PREFIX}#[no_mangle]\npub extern \"C\" fn rpi_plugin_register_v2(api: *const c_void, abi: u32) -> i32 {{ if !api.is_null() && abi == 2 {{ 0 }} else {{ 93 }} }}\n"
-            ),
-        );
-        let loaded_v2 = load_one(&v2.path, Arc::clone(&diag), None).expect("load v2 plugin");
-        assert_eq!(loaded_v2.abi_version, 2);
-        drop(loaded_v2);
-        drop(v2);
-
-        // Dual: unified + v2, should prefer unified
-        let dual = build_cdylib_fixture(
-            "abi_dual_unified_v2",
-            &format!(
-                "{PREFIX}#[no_mangle]\npub extern \"C\" fn rpi_plugin_register(_: *const c_void) -> i32 {{ 0 }}\n#[no_mangle]\npub extern \"C\" fn rpi_plugin_register_v2(api: *const c_void, abi: u32) -> i32 {{ if !api.is_null() && abi == 2 {{ 0 }} else {{ 94 }} }}\n"
-            ),
-        );
-        let loaded_dual =
-            load_one(&dual.path, Arc::clone(&diag), None).expect("dual-symbol plugin uses unified");
-        assert_eq!(loaded_dual.abi_version, 4);
-        drop(loaded_dual);
-        drop(dual);
-
-        // Failed unified registration doesn't fall back to v3/v2
-        let failed_unified = build_cdylib_fixture(
+        let failed = build_cdylib_fixture(
             "abi_unified_failure",
             &format!(
-                "{PREFIX}#[no_mangle]\npub extern \"C\" fn rpi_plugin_register(_: *const c_void) -> i32 {{ 73 }}\n#[no_mangle]\npub extern \"C\" fn rpi_plugin_register_v3(_: *const c_void, _: *const c_void, _: u32) -> i32 {{ 0 }}\n"
+                "{PREFIX}#[no_mangle]\npub extern \"C\" fn rpi_plugin_register(_: *const c_void) -> i32 {{ 73 }}\n"
             ),
         );
-        let error = match load_one(&failed_unified.path, diag, None) {
-            Ok(_) => panic!("failed unified registration must not fall back to v3/v2"),
+        let error = match load_one(&failed.path, diag, None) {
+            Ok(_) => panic!("failed registration must be reported as error"),
             Err(error) => error,
         };
         assert!(matches!(
             error,
             PluginLoadError::RegisterReturned { code: 73, .. }
         ));
-        drop(failed_unified);
+        drop(failed);
     }
 
     /// A plugin whose `extern "C"` register body panics must be skipped, not
-    /// crash the host. This mirrors what the SDK's `export_plugin_v2!` /
+    /// crash the host. This mirrors what the SDK's `export_plugin!` /
     /// `register_entrypoint` do: catch the panic *inside* the plugin and return
     /// `REGISTER_PANIC_STATUS` so the unwind never reaches the `extern "C"`
     /// boundary (which would abort the process).
@@ -979,14 +660,11 @@ pub extern "C" fn rpi_plugin_register_v3(
         let diag_dyn: Arc<dyn PluginDiagnostics> = diag.clone();
         let panic_status = rpi_plugin_sdk::REGISTER_PANIC_STATUS;
         const PREFIX: &str = "use std::ffi::c_void;\n";
-        // The fixture reproduces the SDK shim: an `extern "C"` entrypoint that
-        // runs the (panicking) body behind `catch_unwind`.
         let source = format!(
             r#"{PREFIX}
 fn body() -> i32 {{ panic!("register body exploded"); }}
 #[no_mangle]
-pub extern "C" fn rpi_plugin_register_v2(_: *const c_void, abi: u32) -> i32 {{
-    if abi != 2 {{ return 1; }}
+pub extern "C" fn rpi_plugin_register(_: *const c_void) -> i32 {{
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {{
         Ok(code) => code,
         Err(_) => {panic_status},
@@ -994,8 +672,7 @@ pub extern "C" fn rpi_plugin_register_v2(_: *const c_void, abi: u32) -> i32 {{
 }}
 "#
         );
-        let fixture = build_cdylib_fixture("abi_v2_panic", &source);
-        // Suppress the default panic message noise from the child's hook.
+        let fixture = build_cdylib_fixture("abi_unified_panic", &source);
         let prev_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let result = load_one(&fixture.path, diag_dyn, None);

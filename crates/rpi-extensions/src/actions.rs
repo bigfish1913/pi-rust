@@ -1,6 +1,6 @@
 //! B5a — the plugin→host `runtime_action` bridge (inverted FFI).
 //!
-//! A plugin invokes `PluginApiVt::runtime_action` to drive the harness (send a
+//! A plugin invokes `PluginApi::runtime_action` to drive the harness (send a
 //! message, switch models, fork a session, reload extensions, …). Unlike the
 //! register trampolines — which run synchronously inside the selected register
 //! entrypoint
@@ -10,7 +10,7 @@
 //! itself. Neither has the thread-local set, and the host cannot predict which
 //! threads a plugin will call from. Thread-local is the wrong tool here.
 //!
-//! The verified-correct recovery channel is [`PluginApiVt::user_data`]: it is
+//! The verified-correct recovery channel is [`PluginApi::user_data`]: it is
 //! `Send+Sync`, populated at vtable build, passed back unchanged on every call,
 //! and the SDK designates it "the host's opaque context". Today every register
 //! trampoline ignores `user_data` (the register path uses the thread-local), so
@@ -376,7 +376,7 @@ pub trait RuntimeActionHost: Send + Sync {
     }
 }
 
-/// The host-side bridge carried in [`PluginApiVt::user_data`] so
+/// The host-side bridge carried in [`PluginApi::user_data`] so
 /// [`trampoline_runtime_action`] can recover the harness state from any thread.
 ///
 /// `runtime: Handle` is captured at build time (the host is on the runtime when
