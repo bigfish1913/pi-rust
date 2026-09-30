@@ -15,9 +15,7 @@ use std::sync::Arc;
 use libloading::Library;
 use thiserror::Error;
 
-use rpi_plugin_sdk::{
-    RpiPluginRegisterUnified, RPI_PLUGIN_ABI_VERSION_UNIFIED,
-};
+use rpi_plugin_sdk::{RpiPluginRegisterUnified, RPI_PLUGIN_ABI_VERSION_UNIFIED};
 
 use crate::registry::{ExtensionRegistry, RegistrySnapshot};
 use crate::{
@@ -38,13 +36,8 @@ pub enum PluginLoadError {
         #[source]
         source: libloading::Error,
     },
-    #[error(
-        "`rpi_plugin_register` was not found in {path}: {error}"
-    )]
-    Symbol {
-        path: PathBuf,
-        error: String,
-    },
+    #[error("`rpi_plugin_register` was not found in {path}: {error}")]
+    Symbol { path: PathBuf, error: String },
     #[error("register returned nonzero code {code} for {path}")]
     RegisterReturned { path: PathBuf, code: i32 },
     /// ABI version reported by the plugin mismatches the host's. Skip + diag.
@@ -78,10 +71,7 @@ pub struct LoadedPlugin {
     pub registry: ExtensionRegistry,
 }
 
-fn call_register(
-    register: RpiPluginRegisterUnified,
-    host_api: &Arc<HostApi>,
-) -> i32 {
+fn call_register(register: RpiPluginRegisterUnified, host_api: &Arc<HostApi>) -> i32 {
     // Leak the API struct. The SDK asks plugins to *copy* the function pointers
     // they need during `register`, but real-world plugins retain the `api`
     // pointer to call e.g. `runtime_action` later. The host already keeps the
@@ -96,8 +86,7 @@ fn call_register(
     // against a *newer* `C-unwind` entrypoint, or a panic raised by host vtable
     // construction, is contained rather than unwinding through the loader.
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let api: &'static rpi_plugin_sdk::PluginApi =
-            Box::leak(Box::new(host_api.build_vtable()));
+        let api: &'static rpi_plugin_sdk::PluginApi = Box::leak(Box::new(host_api.build_vtable()));
         register(api as *const rpi_plugin_sdk::PluginApi)
     })) {
         Ok(code) => code,

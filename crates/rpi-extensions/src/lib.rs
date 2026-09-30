@@ -61,9 +61,9 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
 use rpi_plugin_sdk::{
-    EventHandlerFn, EventTag, FreeStringFn, ProviderRequestFn,
-    RenderFn, ResourcesDiscoverFn, RuntimeActionFn, StablePluginEvent, StableToolSchema, StbString,
-    StbStringRef, ToolCancelFn, ToolDestroyFn, ToolExecuteFn, ToolPollFn,
+    EventHandlerFn, EventTag, FreeStringFn, ProviderRequestFn, RenderFn, ResourcesDiscoverFn,
+    RuntimeActionFn, StablePluginEvent, StableToolSchema, StbString, StbStringRef, ToolCancelFn,
+    ToolDestroyFn, ToolExecuteFn, ToolPollFn,
 };
 use thiserror::Error;
 
