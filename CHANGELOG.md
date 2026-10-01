@@ -34,6 +34,20 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ### Fixed
 
+- A spawned shell no longer inherits rpi-langfuse's subagent-nesting channel
+  (`LANGFUSE_PI_PARENT_TRACE_ID` / `_SPAN_ID` / `_SESSION_ID` / `_DEPTH`). The
+  extension publishes those variables so a launcher can attach a nested `rpi` to
+  the turn that spawned it, and decides it is a subagent by reading them back —
+  but a bash/powershell child inherits the environment, so a plain `rpi` started
+  from inside a shell adopted its ancestor's trace: it reused the parent trace
+  id, hung its root off the parent's root span, and named it `Subagent Turn`
+  instead of opening its own trace. Only `RPI_SESSION_ID` was on the
+  host-private exclusion list, because the prefix-based check could not see
+  these. They are now excluded (`rpi_tools::HOST_PRIVATE_ENV`); a launcher that
+  sets them deliberately still gets through, which is the supported nesting path.
+  Two tests pin both halves, and `rpi-cli` now asserts the exclusion agrees with
+  the extension's names so a rename cannot silently re-leak them.
+
 - Switching sessions no longer leaves plugins naming the previous one. The
   session id reaches a plugin on two channels — the `ToolCallContext` (read per
   plugin **tool** call) and `RPI_SESSION_ID` (read per turn by the provider

@@ -3358,4 +3358,31 @@ mod tests {
             );
         }
     }
+
+    /// The same agreement check for the *extension* side of the exclusion.
+    ///
+    /// `rpi-langfuse` decides it is a subagent by reading these four names, and
+    /// publishes them so a launcher can attach a nested `rpi` to the turn that
+    /// spawned it. `rpi-tools` excludes them from a shell's environment by
+    /// literal, so renaming them in the extension would silently stop the
+    /// exclusion from matching and re-leak the channel into every `bash` child.
+    ///
+    /// The names are asserted here as literals precisely because nothing links
+    /// the two crates: this test *is* the link. If it fails, either the
+    /// extension renamed its variables (update both) or `rpi-tools` dropped one.
+    #[test]
+    fn plugin_private_env_matches_the_langfuse_contract() {
+        for name in [
+            "LANGFUSE_PI_PARENT_TRACE_ID",
+            "LANGFUSE_PI_PARENT_SPAN_ID",
+            "LANGFUSE_PI_PARENT_SESSION_ID",
+            "LANGFUSE_PI_PARENT_DEPTH",
+        ] {
+            assert!(
+                rpi_tools::is_host_private_env(name),
+                "`{name}` must stay out of a spawned shell: an inherited value makes a                  nested rpi adopt its ancestor's trace instead of opening its own.                  rpi-tools currently excludes {}",
+                rpi_tools::HOST_PRIVATE_ENV.join(", ")
+            );
+        }
+    }
 }

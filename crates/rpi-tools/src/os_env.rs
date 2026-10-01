@@ -74,10 +74,28 @@ struct ShellConfig {
 /// variable already present, refuse to publish its own. Both are wrong answers,
 /// and neither is visible from the child.
 ///
+/// The `LANGFUSE_PI_PARENT_*` entries are the same hazard from the other side.
+/// An extension (rpi-langfuse) publishes them so a *launcher* can attach a
+/// nested `rpi` to the turn that spawned it — it looks at
+/// `LANGFUSE_PI_PARENT_TRACE_ID` to decide it is a subagent. That makes them a
+/// deliberate input when a launcher sets them on the child *it* starts, and a
+/// false positive when a shell merely inherits them: a plain `rpi` started from
+/// inside `bash` would silently adopt the parent's trace, report the parent's
+/// root as its own parent, and rename its root `Subagent Turn` instead of
+/// opening its own trace.
+///
 /// Exposed so a host crate can assert this list agrees with its own contract
-/// constants (see `rpi-cli`'s `host_private_env_matches_the_plugin_contract`)
-/// rather than the two drifting apart silently.
-pub const HOST_PRIVATE_ENV: &[&str] = &["RPI_SESSION_ID"];
+/// constants (see `rpi-cli`'s `host_private_env_matches_the_plugin_contract` and
+/// `plugin_private_env_matches_the_langfuse_contract`) rather than the two
+/// drifting apart silently.
+pub const HOST_PRIVATE_ENV: &[&str] = &[
+    "RPI_SESSION_ID",
+    // rpi-langfuse's subagent-nesting channel (`ENV_PARENT_*` in its source).
+    "LANGFUSE_PI_PARENT_TRACE_ID",
+    "LANGFUSE_PI_PARENT_SPAN_ID",
+    "LANGFUSE_PI_PARENT_SESSION_ID",
+    "LANGFUSE_PI_PARENT_DEPTH",
+];
 
 /// Whether `name` is host-private and must not be inherited by a spawned shell.
 pub fn is_host_private_env(name: &str) -> bool {

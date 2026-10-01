@@ -1,12 +1,17 @@
 //! A spawned shell must not receive the host's private plumbing.
 //!
-//! The host writes `RPI_SESSION_ID` into its own environment so plugins can name
-//! the session they observe. A bash/powershell child inherits the environment by
-//! default, so without an explicit exclusion the variable reaches *everything*
-//! the shell runs — including a nested `rpi`, which would then see the variable
-//! already present and refuse to publish its own session id (the host only sets
-//! it when absent). The result is a descendant reporting an ancestor's session,
-//! silently.
+//! Two families of variables are in scope, and both are answered by the same
+//! exclusion:
+//!
+//! * `RPI_SESSION_ID` — the host writes it so plugins can name the session they
+//!   observe. A bash/powershell child inherits the environment by default, so
+//!   without an exclusion it reaches *everything* the shell runs, including a
+//!   nested `rpi`, which would then report an ancestor's session.
+//! * `LANGFUSE_PI_PARENT_*` — an extension publishes these so a *launcher* can
+//!   attach a nested `rpi` to the turn that spawned it (the extension looks at
+//!   `LANGFUSE_PI_PARENT_TRACE_ID` to decide it is a subagent). Inherited by a
+//!   plain shell they are a false positive: a nested `rpi` adopts its
+//!   ancestor's trace instead of opening its own.
 //!
 //! These run against a real shell, because the property under test is about the
 //! process environment of a real child — an in-memory fake spawns nothing and
@@ -95,6 +100,66 @@ fn the_private_list_names_the_plugin_session_variable() {
     // the same thing from the other side (see its own test), because rpi-tools
     // must not depend on rpi-plugin-sdk just to name one string.
     assert!(is_host_private_env("RPI_SESSION_ID"));
+    for name in [
+        "LANGFUSE_PI_PARENT_TRACE_ID",
+        "LANGFUSE_PI_PARENT_SPAN_ID",
+        "LANGFUSE_PI_PARENT_SESSION_ID",
+        "LANGFUSE_PI_PARENT_DEPTH",
+    ] {
+        assert!(
+            is_host_private_env(name),
+            "{name} tells a nested rpi it is a subagent; it must not inherit"
+        );
+    }
     assert!(!is_host_private_env("RPI_OFFLINE"));
     assert!(!is_host_private_env("PATH"));
+}
+
+/// The subagent channel is host-private in a spawned shell, but a launcher that
+/// *deliberately* sets it on a child it starts must still get through — that is
+/// the supported way to nest a subagent. This pins both halves so a future
+/// widening of the exclusion cannot quietly disable nesting.
+#[tokio::test]
+async fn the_subagent_channel_is_inherited_from_augment_not_the_ambient_env() {
+    let Some(env) = shell_or_skip().await else {
+        return;
+    };
+
+    // Ambient (inherited) values are excluded…
+    std::env::set_var("LANGFUSE_PI_PARENT_TRACE_ID", "ambient-trace");
+    let out = env
+        .exec(
+            "printf '%s' \"${LANGFUSE_PI_PARENT_TRACE_ID:-unset}\"",
+            ShellExecOptions::default(),
+        )
+        .await
+        .expect("exec");
+    assert_eq!(
+        out.stdout.trim(),
+        "unset",
+        "an inherited subagent marker must not reach the shell"
+    );
+    std::env::remove_var("LANGFUSE_PI_PARENT_TRACE_ID");
+
+    // …while an explicit per-call value still does (the nesting path).
+    let mut env_vars = std::collections::HashMap::new();
+    env_vars.insert(
+        "LANGFUSE_PI_PARENT_TRACE_ID".to_string(),
+        "deliberate-trace".to_string(),
+    );
+    let out = env
+        .exec(
+            "printf '%s' \"${LANGFUSE_PI_PARENT_TRACE_ID:-unset}\"",
+            ShellExecOptions {
+                env: Some(env_vars),
+                ..ShellExecOptions::default()
+            },
+        )
+        .await
+        .expect("exec");
+    assert_eq!(
+        out.stdout.trim(),
+        "deliberate-trace",
+        "a launcher that sets the value on purpose must not be blocked"
+    );
 }
