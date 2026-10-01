@@ -64,8 +64,8 @@ struct ShellConfig {
     transport: CommandTransport,
 }
 
-/// Environment variables the host sets for its own runtime plumbing and must
-/// **not** hand to a shell it spawns.
+/// Environment variables the **host** sets for its own runtime plumbing, which
+/// must not be handed to a shell it spawns.
 ///
 /// A spawned shell is a child process, so anything inherited reaches whatever
 /// that shell runs — including another `rpi`. `RPI_SESSION_ID` names the session
@@ -74,32 +74,33 @@ struct ShellConfig {
 /// variable already present, refuse to publish its own. Both are wrong answers,
 /// and neither is visible from the child.
 ///
-/// The `LANGFUSE_PI_PARENT_*` entries are the same hazard from the other side.
-/// An extension (rpi-langfuse) publishes them so a *launcher* can attach a
-/// nested `rpi` to the turn that spawned it — it looks at
-/// `LANGFUSE_PI_PARENT_TRACE_ID` to decide it is a subagent. That makes them a
-/// deliberate input when a launcher sets them on the child *it* starts, and a
-/// false positive when a shell merely inherits them: a plain `rpi` started from
-/// inside `bash` would silently adopt the parent's trace, report the parent's
-/// root as its own parent, and rename its root `Subagent Turn` instead of
-/// opening its own trace.
-///
-/// Exposed so a host crate can assert this list agrees with its own contract
-/// constants (see `rpi-cli`'s `host_private_env_matches_the_plugin_contract` and
-/// `plugin_private_env_matches_the_langfuse_contract`) rather than the two
-/// drifting apart silently.
-pub const HOST_PRIVATE_ENV: &[&str] = &[
-    "RPI_SESSION_ID",
-    // rpi-langfuse's subagent-nesting channel (`ENV_PARENT_*` in its source).
-    "LANGFUSE_PI_PARENT_TRACE_ID",
-    "LANGFUSE_PI_PARENT_SPAN_ID",
-    "LANGFUSE_PI_PARENT_SESSION_ID",
-    "LANGFUSE_PI_PARENT_DEPTH",
-];
+/// This is only the host's own half. An *extension* can publish variables with
+/// the same hazard, and it declares them itself; [`is_host_private_env`] is the
+/// function that answers the full question. Use it rather than reading this
+/// slice, or an extension's channel will be missed — which is precisely the bug
+/// that let `LANGFUSE_PI_PARENT_*` through.
+pub const HOST_PRIVATE_ENV: &[&str] = &[rpi_plugin_sdk::SESSION_ID_ENV];
 
-/// Whether `name` is host-private and must not be inherited by a spawned shell.
+/// Whether `name` must not be inherited by a spawned shell.
+///
+/// Two sources, because the variables come from two places:
+///
+/// - [`HOST_PRIVATE_ENV`] — the host's own plumbing.
+/// - [`rpi_plugin_sdk::SUBAGENT_PARENT_ENV`] — the family an *extension*
+///   declares for subagent nesting. An inherited copy makes a plain `rpi` started
+///   from inside `bash` adopt its ancestor's trace, hang its root off the
+///   ancestor's root span, and call itself `Subagent Turn` instead of opening its
+///   own trace. A launcher that sets these on the child *it* starts is the
+///   supported nesting path, so this is about not *inheriting* them, not about
+///   forbidding the names.
+///
+/// The extension family is consulted **as the SDK's slice**, never as names
+/// restated here. Restating them is what the previous version did, and it is
+/// how the channel re-leaked when the plugin renamed them: the list went on
+/// matching a name nobody set. Going through the constant means a rename is a
+/// compile error, and a newly added family member is excluded automatically.
 pub fn is_host_private_env(name: &str) -> bool {
-    HOST_PRIVATE_ENV.contains(&name)
+    HOST_PRIVATE_ENV.contains(&name) || rpi_plugin_sdk::SUBAGENT_PARENT_ENV.contains(&name)
 }
 
 /// Real-OS `ExecutionEnv`. Clone shares the tracked-pid set + registry.

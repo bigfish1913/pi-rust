@@ -621,6 +621,49 @@ pub const HOST_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// `std::env::set_var` sound.
 pub const SESSION_ID_ENV: &str = "RPI_SESSION_ID";
 
+/// Environment variable a tracing extension publishes to name the trace a
+/// *nested* `rpi` should attach to, and reads back to decide it is a subagent.
+///
+/// The name is `rpi-langfuse`'s (it owns the `LANGFUSE_` prefix), but the
+/// variable is declared here because **three** parties have to agree on it and
+/// they live in different crates, two of them in different repositories:
+///
+/// - the extension writes it (so a launcher can attach a nested run),
+/// - the host's `bash`/`powershell` must *not* pass it on to a shell (or a plain
+///   `rpi` started from one mistakes itself for a subagent), and
+/// - a launcher may set it deliberately, which is the supported nesting path.
+///
+/// Declaring it once here is what keeps those three in step. The host builds its
+/// exclusion list from these declarations, so dropping or renaming the family
+/// ([`SUBAGENT_PARENT_ENV`]) is a compile error there rather than a silently
+/// re-opened leak, and a newly added member is excluded without the host having
+/// to be told. What the compiler still cannot check is the string itself, since
+/// `rpi-langfuse` lives in another repository and matches on the *value* — that
+/// is pinned by a test. See [`SUBAGENT_PARENT_ENV`] for the whole family.
+pub const SUBAGENT_PARENT_TRACE_ID_ENV: &str = "LANGFUSE_PI_PARENT_TRACE_ID";
+
+/// See [`SUBAGENT_PARENT_TRACE_ID_ENV`]. The parent turn's root observation id.
+pub const SUBAGENT_PARENT_SPAN_ID_ENV: &str = "LANGFUSE_PI_PARENT_SPAN_ID";
+
+/// See [`SUBAGENT_PARENT_TRACE_ID_ENV`]. The parent's session id.
+pub const SUBAGENT_PARENT_SESSION_ID_ENV: &str = "LANGFUSE_PI_PARENT_SESSION_ID";
+
+/// See [`SUBAGENT_PARENT_TRACE_ID_ENV`]. Nesting depth, so a grandchild knows
+/// how far down it is.
+pub const SUBAGENT_PARENT_DEPTH_ENV: &str = "LANGFUSE_PI_PARENT_DEPTH";
+
+/// Every [`SUBAGENT_PARENT_TRACE_ID_ENV`] sibling, as one slice.
+///
+/// A host that excludes this channel from a spawned shell should cover the whole
+/// slice rather than restating the names, and assert it does — a new entry here
+/// that is not excluded is the failure mode this array exists to make testable.
+pub const SUBAGENT_PARENT_ENV: &[&str] = &[
+    SUBAGENT_PARENT_TRACE_ID_ENV,
+    SUBAGENT_PARENT_SPAN_ID_ENV,
+    SUBAGENT_PARENT_SESSION_ID_ENV,
+    SUBAGENT_PARENT_DEPTH_ENV,
+];
+
 /// No-payload marker for events that carry none (e.g. `session_shutdown`).
 /// Carries a dummy byte so the empty-struct isn't flagged FFI-unsafe by
 /// `improper_ctypes` (zero-sized C structs are rejected regardless of `repr(C)`).

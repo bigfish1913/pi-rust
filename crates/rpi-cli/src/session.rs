@@ -3330,23 +3330,51 @@ mod tests {
     // NOTE: `build_tools`/`active_tool_names` integration is exercised by the
     // `tests/build.rs` harness-build test (needs a provider + multi-thread rt).
 
+    /// The exclusion policy, checked against the constants rather than copies.
+    ///
+    /// `rpi-tools` builds its exclusion from `rpi-plugin-sdk`'s declarations, so
+    /// within this repo a rename is a compile error — this test is not the link
+    /// between those two crates any more. What it still guards is the part the
+    /// compiler cannot see:
+    ///
+    /// - **The wire values.** `rpi-langfuse` lives in a different repository and
+    ///   agrees on the *strings*, not the constant paths. Rewriting a constant's
+    ///   value would compile here and silently stop matching there, so the exact
+    ///   values are pinned below. Changing one is a deliberate, breaking change to
+    ///   a cross-repo contract, and it should fail here first.
+    /// - **Coverage.** Every name the SDK declares must actually be excluded.
+    /// - **Narrowness.** The user's own configuration must still reach the shell.
     #[test]
-    fn host_private_env_matches_the_plugin_contract() {
-        // `rpi-tools` excludes these names from a spawned shell's environment,
-        // naming them as literals because it must not depend on `rpi-plugin-sdk`
-        // to spell one string. That independence is the risk: rename the plugin
-        // constant and the exclusion would silently stop matching, re-leaking the
-        // variable into every `bash` child (including a nested `rpi`, which would
-        // then misreport its session). Assert the two agree here, where both
-        // crates are in scope.
-        assert!(
-            rpi_tools::is_host_private_env(rpi_plugin_sdk::SESSION_ID_ENV),
-            "rpi-tools must exclude `{}` from a spawned shell; it currently excludes {}",
-            rpi_plugin_sdk::SESSION_ID_ENV,
-            rpi_tools::HOST_PRIVATE_ENV.join(", ")
+    fn host_private_env_matches_the_declared_contract() {
+        // 1. The wire values. Pinned literally on purpose: see the doc comment.
+        assert_eq!(rpi_plugin_sdk::SESSION_ID_ENV, "RPI_SESSION_ID");
+        assert_eq!(
+            rpi_plugin_sdk::SUBAGENT_PARENT_ENV,
+            [
+                "LANGFUSE_PI_PARENT_TRACE_ID",
+                "LANGFUSE_PI_PARENT_SPAN_ID",
+                "LANGFUSE_PI_PARENT_SESSION_ID",
+                "LANGFUSE_PI_PARENT_DEPTH",
+            ],
+            "these strings are what rpi-langfuse (a different repo) matches; a \
+             change here is a breaking cross-repo change, not a refactor"
         );
-        // And the list must stay narrow: these name how the *user* configured the
-        // run and are exactly what a command inside the shell should still see.
+
+        // 2. Coverage — derived from the declarations, so a newly added family
+        //    member is checked without anyone remembering to extend this test.
+        for name in rpi_plugin_sdk::SUBAGENT_PARENT_ENV
+            .iter()
+            .chain(std::iter::once(&rpi_plugin_sdk::SESSION_ID_ENV))
+        {
+            assert!(
+                rpi_tools::is_host_private_env(name),
+                "`{name}` must not reach a spawned shell, but rpi-tools excludes only {:?}",
+                rpi_tools::HOST_PRIVATE_ENV
+            );
+        }
+
+        // 3. Narrowness — these name how the *user* configured the run and are
+        //    exactly what a command inside the shell should still see.
         for visible in [
             crate::args::RPI_OFFLINE_ENV,
             crate::config::CONFIG_DIR_ENV,
@@ -3355,33 +3383,6 @@ mod tests {
             assert!(
                 !rpi_tools::is_host_private_env(visible),
                 "{visible} describes the user's configuration and must still reach the shell"
-            );
-        }
-    }
-
-    /// The same agreement check for the *extension* side of the exclusion.
-    ///
-    /// `rpi-langfuse` decides it is a subagent by reading these four names, and
-    /// publishes them so a launcher can attach a nested `rpi` to the turn that
-    /// spawned it. `rpi-tools` excludes them from a shell's environment by
-    /// literal, so renaming them in the extension would silently stop the
-    /// exclusion from matching and re-leak the channel into every `bash` child.
-    ///
-    /// The names are asserted here as literals precisely because nothing links
-    /// the two crates: this test *is* the link. If it fails, either the
-    /// extension renamed its variables (update both) or `rpi-tools` dropped one.
-    #[test]
-    fn plugin_private_env_matches_the_langfuse_contract() {
-        for name in [
-            "LANGFUSE_PI_PARENT_TRACE_ID",
-            "LANGFUSE_PI_PARENT_SPAN_ID",
-            "LANGFUSE_PI_PARENT_SESSION_ID",
-            "LANGFUSE_PI_PARENT_DEPTH",
-        ] {
-            assert!(
-                rpi_tools::is_host_private_env(name),
-                "`{name}` must stay out of a spawned shell: an inherited value makes a                  nested rpi adopt its ancestor's trace instead of opening its own.                  rpi-tools currently excludes {}",
-                rpi_tools::HOST_PRIVATE_ENV.join(", ")
             );
         }
     }

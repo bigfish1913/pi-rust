@@ -95,22 +95,22 @@ async fn an_explicit_private_variable_still_reaches_the_shell() {
 }
 
 #[test]
-fn the_private_list_names_the_plugin_session_variable() {
-    // The exclusion list and the plugin contract have to agree; rpi-cli asserts
-    // the same thing from the other side (see its own test), because rpi-tools
-    // must not depend on rpi-plugin-sdk just to name one string.
-    assert!(is_host_private_env("RPI_SESSION_ID"));
-    for name in [
-        "LANGFUSE_PI_PARENT_TRACE_ID",
-        "LANGFUSE_PI_PARENT_SPAN_ID",
-        "LANGFUSE_PI_PARENT_SESSION_ID",
-        "LANGFUSE_PI_PARENT_DEPTH",
-    ] {
+fn the_private_list_covers_what_the_contract_declares() {
+    // Derived from the SDK's declarations, not restated: the point of moving
+    // these names out of literals was that a copy can drift. Iterating the
+    // declared slice means a newly added family member is covered (and checked)
+    // without anyone remembering to extend this test.
+    for name in rpi_plugin_sdk::SUBAGENT_PARENT_ENV
+        .iter()
+        .chain(std::iter::once(&rpi_plugin_sdk::SESSION_ID_ENV))
+    {
         assert!(
             is_host_private_env(name),
-            "{name} tells a nested rpi it is a subagent; it must not inherit"
+            "`{name}` tells a nested rpi about its ancestor; it must not inherit"
         );
     }
+
+    // Narrow: the user's own configuration must still reach the shell.
     assert!(!is_host_private_env("RPI_OFFLINE"));
     assert!(!is_host_private_env("PATH"));
 }

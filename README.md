@@ -155,7 +155,11 @@ rpi-telemetry → rpi-ai → rpi-agent → rpi-tools → rpi-harness
 
 Three crates sit outside that chain:
 
-- `rpi-tui` and `rpi-plugin-sdk` depend on no other `rpi-*` crate.
+- `rpi-tui` depends on no other `rpi-*` crate.
+- `rpi-plugin-sdk` is a leaf too (it has no `rpi-*` deps), but it is not only
+  the host's plugin contract: `rpi-tools` also reads its env-var names, so the
+  host and its plugins cannot disagree about the strings they exchange across
+  the ABI. That edge is names-only — nothing is linked or called.
 - `rpi-extensions` is `rpi-plugin-sdk` plus `rpi-ai`/`rpi-agent`, since it hosts
   plugins that run tools.
 - `rpi-cli` depends on all eight of the others, which is how the `rpi` binary

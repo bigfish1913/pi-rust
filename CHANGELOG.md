@@ -11,6 +11,30 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+### Fixed
+
+- A spawned shell no longer inherits rpi-langfuse's subagent-nesting channel
+  (`LANGFUSE_PI_PARENT_TRACE_ID` / `_SPAN_ID` / `_SESSION_ID` / `_DEPTH`). The
+  extension publishes those variables so a launcher can attach a nested `rpi` to
+  the turn that spawned it, and decides it is a subagent by reading them back —
+  but a bash/powershell child inherits the environment, so a plain `rpi` started
+  from inside a shell adopted its ancestor's trace: it reused the parent trace
+  id, hung its root off the parent's root span, and named it `Subagent Turn`
+  instead of opening its own trace. Only `RPI_SESSION_ID` was on the
+  host-private exclusion list, because the prefix-based check could not see
+  these. They are now excluded; a launcher that sets them deliberately still
+  gets through, which is the supported nesting path. Two tests pin both halves.
+- The subagent channel's variable names moved into the plugin contract
+  (`rpi_plugin_sdk::SUBAGENT_PARENT_*`, with `SUBAGENT_PARENT_ENV` as the
+  family), and `rpi-tools` now consults that declaration instead of restating
+  the strings. Restating them is what made the leak above possible in the first
+  place: the exclusion and the extension each held a private copy of the names,
+  across two repositories, so a rename on either side left the list matching a
+  name nobody sets — no compile error, no failing test, the leak simply came
+  back. A newly added family member is now excluded automatically, and
+  `rpi-cli` pins the wire values so changing one is caught as the cross-repo
+  change it is.
+
 ## [0.3.10] - 2026-10-01
 
 ### Added
@@ -33,20 +57,6 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
   environment variable is a convenience for plugins that never see a tool call.
 
 ### Fixed
-
-- A spawned shell no longer inherits rpi-langfuse's subagent-nesting channel
-  (`LANGFUSE_PI_PARENT_TRACE_ID` / `_SPAN_ID` / `_SESSION_ID` / `_DEPTH`). The
-  extension publishes those variables so a launcher can attach a nested `rpi` to
-  the turn that spawned it, and decides it is a subagent by reading them back —
-  but a bash/powershell child inherits the environment, so a plain `rpi` started
-  from inside a shell adopted its ancestor's trace: it reused the parent trace
-  id, hung its root off the parent's root span, and named it `Subagent Turn`
-  instead of opening its own trace. Only `RPI_SESSION_ID` was on the
-  host-private exclusion list, because the prefix-based check could not see
-  these. They are now excluded (`rpi_tools::HOST_PRIVATE_ENV`); a launcher that
-  sets them deliberately still gets through, which is the supported nesting path.
-  Two tests pin both halves, and `rpi-cli` now asserts the exclusion agrees with
-  the extension's names so a rename cannot silently re-leak them.
 
 - Switching sessions no longer leaves plugins naming the previous one. The
   session id reaches a plugin on two channels — the `ToolCallContext` (read per

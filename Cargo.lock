@@ -2374,6 +2374,7 @@ dependencies = [
  "regex",
  "rpi-agent",
  "rpi-ai",
+ "rpi-plugin-sdk",
  "schemars",
  "serde",
  "serde_json",
