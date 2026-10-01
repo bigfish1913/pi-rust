@@ -15,8 +15,8 @@ use std::sync::Arc;
 use rpi_agent::error::AgentError;
 use rpi_ai::types::Tool;
 use rpi_plugin_sdk::{
-    CommandHandlerFn, EventHandlerFn, EventTag, FreeStringFn, ProviderRequestFn, RenderFn,
-    ResourcesDiscoverFn, EVENT_TAG_COUNT,
+    BeforeAgentStartFn, CommandHandlerFn, EventHandlerFn, EventTag, FreeStringFn,
+    ProviderRequestFn, RenderFn, ResourcesDiscoverFn, EVENT_TAG_COUNT,
 };
 
 use crate::tool::PluginToolHandle;
@@ -140,6 +140,26 @@ pub struct ResourcesDiscoverHandler {
 // thread-safe; the host only reads `user_data` through `handler`.
 unsafe impl Send for ResourcesDiscoverHandler {}
 unsafe impl Sync for ResourcesDiscoverHandler {}
+
+/// A registered `before_agent_start` handler (system-prompt transform). Same
+/// ownership shape as [`ResourcesDiscoverHandler`]: the handler produces a
+/// **plugin-owned** `out` [`StbString`] the host reclaims via the plugin's own
+/// `plugin_free_string`, which therefore travels alongside. `user_data` is the
+/// plugin's opaque context.
+///
+/// SAFETY: same as [`RegisteredHandler`] — the plugin warrants `handler` is
+/// callable from any thread and `user_data` is valid for the registry's
+/// lifetime; the host never frees `user_data`.
+#[derive(Clone, Copy)]
+pub struct BeforeAgentStartHandler {
+    pub handler: BeforeAgentStartFn,
+    pub plugin_free_string: FreeStringFn,
+    pub user_data: *mut std::ffi::c_void,
+}
+// SAFETY: fn pointers + an opaque plugin pointer the plugin warrants is
+// thread-safe; the host only reads `user_data` through `handler`.
+unsafe impl Send for BeforeAgentStartHandler {}
+unsafe impl Sync for BeforeAgentStartHandler {}
 
 /// A registered custom provider (B5c). The host wraps `request_fn` in a
 /// [`PluggableProvider`](crate::PluggableProvider) impl of `rpi_ai::Provider`;
@@ -274,6 +294,11 @@ pub struct ExtensionRegistry {
     /// are a single flat list — `resources_discover` has its own out-param
     /// signature and is never dispatched through the fire-and-forget event path.
     resources_discover: Vec<ResourcesDiscoverHandler>,
+    /// `before_agent_start` system-prompt transformers. A flat list for the same
+    /// reason as `resources_discover`: this is an out-param handler (the plugin
+    /// returns the prompt to install), not a fire-and-forget event subscription,
+    /// so it is not indexed by a tag. Chained in registration order.
+    before_agent_start: Vec<BeforeAgentStartHandler>,
     /// Registered custom providers (B5c). The host wraps each in a
     /// [`PluggableProvider`](crate::PluggableProvider). First-registration-wins on
     /// `provider_id`.
@@ -309,6 +334,7 @@ impl ExtensionRegistry {
             shortcuts: Vec::new(),
             handlers,
             resources_discover: Vec::new(),
+            before_agent_start: Vec::new(),
             providers: Vec::new(),
             renderers: Vec::new(),
             priority: DEFAULT_PRIORITY,
@@ -480,6 +506,24 @@ impl ExtensionRegistry {
         false
     }
 
+    /// Register a `before_agent_start` system-prompt transformer. Multiple
+    /// handlers are kept (chained in registration order: each sees the prompt the
+    /// previous one returned, mirroring pi `runner.ts:1329-1347`). Always
+    /// inserts; returns `false`.
+    pub fn register_before_agent_start(
+        &mut self,
+        handler: BeforeAgentStartFn,
+        plugin_free_string: FreeStringFn,
+        user_data: *mut std::ffi::c_void,
+    ) -> bool {
+        self.before_agent_start.push(BeforeAgentStartHandler {
+            handler,
+            plugin_free_string,
+            user_data,
+        });
+        false
+    }
+
     /// Register a custom provider (B5c). First-registration-wins on `provider_id`
     /// (a later registration for an existing id is dropped, mirroring tool/command
     /// first-wins). Returns `true` if a prior provider of the same id was kept.
@@ -536,6 +580,7 @@ impl ExtensionRegistry {
             shortcuts: self.shortcuts.clone(),
             handlers,
             resources_discover: self.resources_discover.clone(),
+            before_agent_start: self.before_agent_start.clone(),
             providers: self.providers.clone(),
             renderers: self.renderers.clone(),
             active: Arc::clone(&self.active),
@@ -605,6 +650,8 @@ impl ExtensionRegistry {
         }
         self.resources_discover
             .append(&mut other.resources_discover);
+        self.before_agent_start
+            .append(&mut other.before_agent_start);
         for p in other.providers.drain(..) {
             if self
                 .providers
@@ -646,6 +693,7 @@ pub struct RegistrySnapshot {
     shortcuts: Vec<RegisteredShortcut>,
     handlers: [Vec<RegisteredHandler>; EVENT_TAG_COUNT],
     resources_discover: Vec<ResourcesDiscoverHandler>,
+    before_agent_start: Vec<BeforeAgentStartHandler>,
     providers: Vec<RegisteredProvider>,
     renderers: Vec<RegisteredRenderer>,
     active: Arc<AtomicBool>,
@@ -697,6 +745,13 @@ impl RegistrySnapshot {
     /// no plugin registered a discovery handler.
     pub fn resources_discover(&self) -> &[ResourcesDiscoverHandler] {
         &self.resources_discover
+    }
+
+    /// The `before_agent_start` system-prompt transformers, registration order.
+    /// Empty when no plugin asked to transform the prompt — the common case, and
+    /// the one callers treat as "leave the prompt alone".
+    pub fn before_agent_start(&self) -> &[BeforeAgentStartHandler] {
+        &self.before_agent_start
     }
 
     /// The registered custom providers (B5c), registration order. The host wraps

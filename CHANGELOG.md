@@ -11,6 +11,29 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.3.12] - 2026-10-01
+
+### Added
+
+- Plugins can now replace the system prompt at runtime via
+  `register_before_agent_start` — the mechanism pi's extensions use as a
+  `before_agent_start` handler returning `systemPrompt`. rpi already broadcast
+  `BeforeAgentStart` so a plugin could watch a turn start, but the event handler
+  ABI is fire-and-forget (`i32` only), so it could not influence one. The new
+  slot carries an `out` pointer instead, which is the shape
+  `register_resources_discover` already used for the same reason.
+
+  Semantics match pi: the return value **replaces** the prompt (a plugin that
+  wants to append reads the envelope's `systemPrompt` and concatenates),
+  handlers chain in registration order, a handler that errors or panics is
+  skipped without aborting the fan-out, and the result applies to that run only.
+  It is computed once per user prompt, so a tool loop's several provider calls
+  see the same prompt rather than re-running handlers mid-run.
+
+  The slot is appended at the end of the plugin API struct, which keeps every
+  earlier field offset valid — existing plugins keep loading unchanged and a
+  plugin checks for the slot before using it, so there is no ABI version bump.
+
 ## [0.3.11] - 2026-10-01
 
 ### Fixed

@@ -388,6 +388,121 @@ async fn loads_real_cdylib_and_drives_echo_tool() {
     assert!(md_hits >= 1, "markdown transform fn should have fired");
 }
 
+/// Read the stub's `plugin_stub_prompt_transform_hits` counter through the cdylib.
+fn stub_prompt_transform_hits(stub_path: &std::path::Path) -> usize {
+    let lib = match unsafe { libloading::Library::new(stub_path) } {
+        Ok(l) => l,
+        Err(_) => return 0,
+    };
+    type HitFn = extern "C" fn() -> usize;
+    let sym: libloading::Symbol<HitFn> =
+        match unsafe { lib.get(b"plugin_stub_prompt_transform_hits\0") } {
+            Ok(s) => s,
+            Err(_) => return 0,
+        };
+    let hits = sym();
+    drop(sym);
+    drop(lib);
+    hits
+}
+
+/// The system-prompt transform, driven end to end through the **real** cdylib.
+///
+/// This is the E2E proof that a plugin can change what the model is asked with:
+/// the stub appends a marker to whatever prompt it is handed, and we assert the
+/// host's `ProviderHooks::transform_context` seam applied it — including that the
+/// base prompt survived, so the return value is a replacement the plugin built
+/// from the prompt it was given (pi's contract) rather than a wholesale override
+/// that dropped the original.
+///
+/// Also asserts the per-prompt caching: one prompt must run the handlers once
+/// even across several provider calls, which is what stops the transform from
+/// re-firing mid-run (pi computes it once and reuses it for the run).
+#[tokio::test]
+async fn a_real_cdylib_can_replace_the_system_prompt() {
+    use rpi_ai::{Context, ProviderHooks};
+
+    let Some((stub_src, _)) = locate_stub() else {
+        eprintln!("plugin_stub cdylib not built — skipping (run `cargo build -p plugin-stub`)");
+        return;
+    };
+    let scratch = tempfile::tempdir().expect("temp dir");
+    let stub_path = scratch.path().join(cdylib_filename());
+    std::fs::copy(&stub_src, &stub_path).expect("copy stub cdylib");
+
+    let diag = Arc::new(RecordingDiag::default());
+    let session = load_session(
+        &[scratch.path().to_path_buf()],
+        Arc::clone(&diag) as Arc<dyn PluginDiagnostics>,
+        None,
+    );
+    // The bridge must exist even though this plugin registers no provider-hook
+    // *event* handler for the prompt path — the transformer is its own slot. A
+    // `from_session` that only looked at event tags would return `None` here and
+    // silently ignore the transform.
+    let hooks =
+        rpi_extensions::ExtensionProviderHooks::from_session(&session).expect("bridge installed");
+
+    let snapshot = session.snapshot().expect("snapshot");
+    assert_eq!(
+        snapshot.before_agent_start().len(),
+        1,
+        "the stub registers exactly one prompt transformer"
+    );
+
+    let model = rpi_ai::Model::new(
+        "stub-model",
+        "stub-model",
+        rpi_ai::Api::AnthropicMessages,
+        "stub-provider",
+        "https://stub.example",
+    );
+    let ctx = Context::new(vec![rpi_ai::types::Message::User(
+        rpi_ai::types::UserMessage::new(
+            rpi_ai::types::UserContent::Text("do the thing".to_string()),
+            1,
+        ),
+    )]);
+    // The base prompt the plugin will append to.
+    let ctx = Context {
+        system_prompt: Some("BASE PROMPT".to_string()),
+        ..ctx
+    };
+
+    let hits_before = stub_prompt_transform_hits(&stub_path);
+    let patch = hooks
+        .transform_context(&model, &ctx)
+        .expect("the stub's transformer returns a patch");
+    let hits_after = stub_prompt_transform_hits(&stub_path);
+
+    assert_eq!(
+        hits_after,
+        hits_before + 1,
+        "the real cdylib's transformer should have fired exactly once"
+    );
+    let applied = patch.system_prompt.expect("patch carries a system prompt");
+    assert!(
+        applied.contains("[plugin-stub says: "),
+        "the plugin's marker must reach the live context; got {applied:?}"
+    );
+    assert!(
+        applied.contains("BASE PROMPT"),
+        "the base prompt the plugin appended to must survive; got {applied:?}"
+    );
+
+    // Per-prompt caching: a second provider call for the SAME prompt reuses the
+    // computed result and does not re-run the handler.
+    let again = hooks
+        .transform_context(&model, &ctx)
+        .expect("cached result is still a patch");
+    assert_eq!(again.system_prompt.as_deref(), Some(applied.as_str()));
+    assert_eq!(
+        stub_prompt_transform_hits(&stub_path),
+        hits_before + 1,
+        "a second request for the same prompt must reuse the cached transform"
+    );
+}
+
 /// Read the stub's `plugin_stub_discover_hits` counter through the cdylib
 /// (second mapping — refcounted, same pattern as `stub_message_end_hits`).
 fn stub_discover_hits(stub_path: &std::path::Path) -> usize {

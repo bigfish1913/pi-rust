@@ -280,6 +280,54 @@ extern "C" fn on_resources_discover(
 }
 
 // ---------------------------------------------------------------------------
+// The before_agent_start prompt transformer — proves the system-prompt round-trip
+// ---------------------------------------------------------------------------
+
+/// Appended to whatever prompt the host would otherwise use. A prefix marker so
+/// the smoke test can assert the host applied *this plugin's* text to the real
+/// request rather than something upstream already contained.
+pub const STUB_PROMPT_MARKER: &str = "[plugin-stub says: ";
+static PROMPT_TRANSFORM_HITS: AtomicUsize = AtomicUsize::new(0);
+
+/// Exported so the smoke test can read the hit counter across the cdylib
+/// boundary (the atomic lives in the plugin's address space).
+#[no_mangle]
+pub extern "C" fn plugin_stub_prompt_transform_hits() -> usize {
+    PROMPT_TRANSFORM_HITS.load(Ordering::SeqCst)
+}
+
+/// `before_agent_start(event_json, out, user_data) -> i32`.
+///
+/// Reads `systemPrompt` out of the borrowed event envelope and writes back
+/// `{"systemPrompt": "<marker><original>"}` into the plugin-owned `out` the host
+/// reclaims. This is deliberately an **append** — pi's contract makes the return
+/// value a replacement, so a plugin that wants to add text must read the current
+/// prompt and concatenate it, which is exactly what this does. A test asserts
+/// both that the marker is present and that the original text survived, so a
+/// host that treated the return as a wholesale replacement (dropping the base
+/// prompt) would fail.
+extern "C" fn on_before_agent_start(
+    event_json: rpi_plugin_sdk::StbStringRef,
+    out: *mut rpi_plugin_sdk::StbString,
+    _user_data: *mut c_void,
+) -> i32 {
+    rpi_plugin_sdk::guard_or(1, || {
+        PROMPT_TRANSFORM_HITS.fetch_add(1, Ordering::SeqCst);
+        // SAFETY: the host guarantees the borrowed ref is valid for this call.
+        let envelope = unsafe { event_json.as_str() };
+        let current = serde_json::from_str::<serde_json::Value>(envelope)
+            .ok()
+            .and_then(|v| v.get("systemPrompt")?.as_str().map(str::to_string))
+            .unwrap_or_default();
+        let json = serde_json::json!({ "systemPrompt": format!("{STUB_PROMPT_MARKER}{current}") });
+        unsafe {
+            *out = StbString::from_string(json.to_string());
+        }
+        0
+    })
+}
+
+// ---------------------------------------------------------------------------
 // The register provider (B5c) — proves the provider-injection round-trip
 // ---------------------------------------------------------------------------
 
@@ -433,6 +481,23 @@ rpi_plugin_sdk::export_plugin!(|api| {
     );
     if rc != 0 {
         return rc;
+    }
+
+    // Register the before_agent_start prompt transformer. The host stores our
+    // handler + our `plugin_free_string` + our `user_data`, then calls it on
+    // every provider request to let us replace the system prompt the request
+    // carries (pi's `before_agent_start` returning `systemPrompt`). A host that
+    // predates the appended slot leaves it `None`; we degrade and continue,
+    // because the prompt transform is optional to this stub's other duties.
+    if let Some(register_before_agent_start) = api.register_before_agent_start {
+        let rc = register_before_agent_start(
+            on_before_agent_start,
+            plugin_free_string,
+            std::ptr::null_mut(),
+        );
+        if rc != 0 {
+            return rc;
+        }
     }
 
     // Register a custom provider (B5c). The host wraps `on_provider_request`

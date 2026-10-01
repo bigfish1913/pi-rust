@@ -2375,7 +2375,7 @@ impl AgentHarness {
                 match provider {
                     Some(p) => {
                         let model = model.clone();
-                        let ctx = ctx.clone();
+                        let mut ctx = ctx.clone();
                         // B4 [merge_into]: the loop builds `opts` via
                         // `AgentLoopConfig::to_stream_options`, which DROPS the
                         // harness's pinned `headers`/`metadata` (AgentLoopConfig
@@ -2386,6 +2386,14 @@ impl AgentHarness {
                         // `ProviderHooks::before_request` patch on top.
                         let mut opts = stream_options.merge_into(opts.clone());
                         if let Some(hooks) = &provider_hooks {
+                            // pi's `transform_context`: the last chance to change
+                            // what the model reads. Applied to `ctx` before the
+                            // request, so a plugin's forced prompt is what this
+                            // request carries — and only this one, since `ctx` is
+                            // rebuilt per call from the loop's context.
+                            if let Some(patch) = hooks.transform_context(&model, &ctx) {
+                                patch.apply(&mut ctx);
+                            }
                             if let Some(patch) = hooks.before_request(&model, &ctx, &opts) {
                                 patch.apply(&mut opts);
                             }

@@ -348,6 +348,20 @@ All optional, all on `AgentBuilder`:
 
 Closures are `Arc<dyn Fn(...) -> BoxFuture<...> + Send + Sync>`. This is the trickiest part of the port — TS just uses function values; Rust needs boxed futures. We'll define shared `BoxFuture`-returning `Arc` type aliases per hook to keep builder syntax clean.
 
+**Two `transform_context` layers, not one.** pi has both a low-level and a
+harness-level hook of this name, and they are not interchangeable:
+
+| | pi | rpi |
+|---|---|---|
+| `agent-loop.ts` | `(messages) => messages` | `TransformContext` on `AgentLoopConfig` — **same** |
+| `harness` hook map | `{messages, systemPrompt} => {messages?, systemPrompt?}` | the prompt half lives on `ProviderHooks::transform_context` returning `ContextPatch`; the messages half is **not** implemented |
+
+A plugin reaches the prompt half through `register_before_agent_start`
+(`before_agent_start` returning `systemPrompt`, i.e. pi's `forceSystemPrompt`).
+So `TransformContext` above staying `messages -> messages` is correct, not an
+abbreviated port: it mirrors the loop, and the prompt lives one layer up where a
+provider request is assembled.
+
 ### Cancelation / abort
 
 TS uses `AbortSignal`. Rust uses `tokio_util::sync::CancellationToken` (graceful cooperative cancel, child tokens for nested work). `Agent::abort()` cancels the run's token; tools receive a child token and must check/await it. Partial-update callbacks are no-ops after the tool future resolves (`acceptingUpdates` flag → a `bool` behind the closure).
