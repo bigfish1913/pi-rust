@@ -41,10 +41,10 @@ the binary at the archive root** and a `.sha256` beside every archive:
 
 | Target | Asset | sha256 (v0.3.2) |
 | --- | --- | --- |
-| `x86_64-unknown-linux-gnu` | `rpi-v0.3.2-x86_64-unknown-linux-gnu.tar.gz` | `048893c6034c85dccc4d8174acb86060a4679799acce72c5dde954a98f20a14f` |
-| `aarch64-unknown-linux-gnu` | `rpi-v0.3.2-aarch64-unknown-linux-gnu.tar.gz` | `db8727ca7fba01c6ff9feb5780358920f2fa780a42dc0229535b03504daade14` |
-| `aarch64-apple-darwin` | `rpi-v0.3.2-aarch64-apple-darwin.tar.gz` | `0c2b0c4a57586d71d4ea635b6f8a823ea62e746c740582d7cad6607821ee7b98` |
-| `x86_64-pc-windows-msvc` | `rpi-v0.3.2-x86_64-pc-windows-msvc.zip` | `e67eb5b636679772b81284c9784a85ebee67056f1bfdb86d09f1db96f2376871` |
+| `x86_64-unknown-linux-gnu` | `rpi-v0.3.2-x86_64-unknown-linux-gnu.tar.gz` | `326149d98c50e236d1b959cf1cb58b503c160338d3f6087b5c5fe7b6a9d2593e` |
+| `aarch64-unknown-linux-gnu` | `rpi-v0.3.2-aarch64-unknown-linux-gnu.tar.gz` | `fe2cfedf76d25bb8dfb0455838b52da83f13d2dbfbb5c6e45dcc3e7a418bf30e` |
+| `aarch64-apple-darwin` | `rpi-v0.3.2-aarch64-apple-darwin.tar.gz` | `590f85722b9aab48fdbbc73188658df08a58893bbcae8f26b3f76b86873d6898` |
+| `x86_64-pc-windows-msvc` | `rpi-v0.3.2-x86_64-pc-windows-msvc.zip` | `7399754258762f599e22327eaf8687de44f38755d496436d7ff1fddd4d043ba8` |
 
 Two consequences worth knowing:
 
@@ -60,7 +60,7 @@ Two consequences worth knowing:
 networks (this machine included), so use `gh`, which goes through the API:
 
 ```bash
-TAG=v0.3.11                      # the tag being packaged
+TAG=v0.3.12                      # the tag being packaged
 gh release download "$TAG" --pattern "*.sha256" --dir /tmp/rpi-sha --clobber
 cat /tmp/rpi-sha/*.sha256
 ```

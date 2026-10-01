@@ -193,3 +193,82 @@ fn only_the_claimed_key_is_routed() {
     assert!(!snapshot.has_shortcut("a"));
     assert!(!snapshot.has_shortcut("enter"));
 }
+
+/// The spoken-style prompt transform, driven through the real `rpi_voice`
+/// cdylib.
+///
+/// Voice appends a "write for the ear" section to the system prompt while
+/// replies are being read aloud, and must leave a typed session untouched. Both
+/// halves span the FFI boundary and are invisible to unit tests in either repo:
+/// the plugin has to register the `before_agent_start` slot at load, and its
+/// handler has to read the envelope + return `systemPrompt` in the shape the
+/// host parses. This exercises that end to end against the built artifact.
+#[test]
+fn voice_registers_a_prompt_transformer_that_respects_the_speech_switch() {
+    use rpi_plugin_sdk::{StbString, StbStringRef};
+
+    let Some((_, snapshot)) = load_voice() else {
+        eprintln!("rpi_voice cdylib not built — skipping");
+        return;
+    };
+
+    let handlers = snapshot.before_agent_start();
+    assert_eq!(
+        handlers.len(),
+        1,
+        "rpi_voice should register exactly one system-prompt transformer"
+    );
+    let h = &handlers[0];
+
+    /// Call the plugin's handler the way the host does: envelope in, JSON out.
+    fn transform(h: &rpi_extensions::BeforeAgentStartHandler, base: &str) -> serde_json::Value {
+        let envelope = serde_json::json!({
+            "prompt": "hello",
+            "imageCount": 0,
+            "systemPrompt": base,
+        })
+        .to_string();
+        let mut out = StbString::empty();
+        let rc = (h.handler)(StbStringRef::from_str(&envelope), &mut out, h.user_data);
+        assert_eq!(rc, 0, "handler must report success");
+        let text = out.to_string_lossy();
+        out.free_with(Some(h.plugin_free_string));
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("bad payload {text:?}: {e}"))
+    }
+
+    // The switch lives in the plugin's process-global state, driven by env at
+    // registration; drive it through the same door the plugin reads so the test
+    // is independent of test ordering. `/voice on|off` sets the same flag.
+    let speech_on = std::env::var("RPI_VOICE_AUTO_TTS")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "on" | "1" | "true" | "yes"))
+        .unwrap_or(false);
+    if !speech_on {
+        eprintln!("RPI_VOICE_AUTO_TTS is not on — exercising only the no-change path");
+        let payload = transform(h, "BASE");
+        assert_eq!(
+            payload, serde_json::json!({}),
+            "with speech off the plugin must report no change"
+        );
+        return;
+    }
+
+    // Speech on: the base prompt survives and the style section is appended.
+    let payload = transform(h, "BASE PROMPT");
+    let next = payload
+        .get("systemPrompt")
+        .and_then(|v| v.as_str())
+        .expect("speech on must return a replacement prompt");
+    assert!(
+        next.starts_with("BASE PROMPT"),
+        "the host's prompt must be preserved, got: {next}"
+    );
+    assert!(
+        next.contains("write for the ear"),
+        "the spoken style section is missing: {next}"
+    );
+
+    // Idempotent: a second pass must not duplicate the section.
+    let again = transform(h, next);
+    let twice = again.get("systemPrompt").and_then(|v| v.as_str()).unwrap();
+    assert_eq!(twice, next, "the section must not stack");
+}
