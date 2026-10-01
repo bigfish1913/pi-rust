@@ -11,6 +11,32 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+### Fixed
+
+- `rpi update` no longer refuses to run when the running `rpi` was launched
+  through a link, junction, or `subst` drive. The path validation demanded that
+  `canonicalize()` reproduce the launch path byte for byte, so any link *above*
+  the executable — a `C:\tools\current\rpi.exe` junction, a `subst`, scoop's
+  `current` directories — aborted the update with "current rpi executable
+  resolves through a link or junction". The message named neither the path nor
+  the link, and the check was the wrong shape: the leaf is what matters, so a
+  linked *file* is still refused, now with both paths printed, while links
+  *above* the executable resolve to the real install directory the update
+  should rewrite.
+- `rpi update` no longer tells you to add the staging directory to `PATH`.
+  Cargo's install advice named `<agent>/self-update/pending-*/bin`, which the
+  atomic replace consumes, so following it added a path that stopped existing a
+  second later; the child `cargo install` now runs `--quiet` (errors still
+  print).
+
+### Changed
+
+- `docs/rustcc-post-v0.1.13.md` is marked as a historical 0.1.13 release post,
+  and its update-commands section now carries a correction. It still told
+  readers to run `rpi pi-update` and `rpi self-update`, neither of which exists
+  any more — the article only documented 0.1.13-era behavior and was never
+  revisited when the Pi layer was removed and the alias was dropped.
+
 ## [0.3.9] - 2026-10-01
 
 ### Added

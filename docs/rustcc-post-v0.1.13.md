@@ -1,5 +1,13 @@
 # rpi 0.1.13 后续开发：让本地扩展和 package 更新更可控
 
+> **这篇是 0.1.13 时期的历史发布稿，命令示例按当时的状态保留。**
+> 之后 Pi 兼容层已整体移除：`rpi pi-update`、`rpi package update`、
+> `rpi install-pi` / `rpi uninstall-pi` 都不再存在，`rpi self-update`
+> 也改名为 `rpi update`。现在的命令面见
+> [user-guide](rpi-tool/user-guide.md)，其中与更新相关的只有
+> `rpi update`（更新 rpi CLI 自身）、`rpi install <crate>` 和
+> `rpi uninstall <crate>`（管理 Rust 扩展）。
+
 rpi 是一个 Rust 原生、library-first 的 Pi agent SDK，同时提供可直接使用的终端 coding-agent CLI。稳定版本目前为 `v0.1.13`。最近在 `v0.1.13` 之后，项目继续完善本地扩展开发和 package 更新流程，目标是让开发者在自己的项目中迭代 Agent 能力时更容易验证、回滚和定位问题。
 
 ## 最近的改动
@@ -19,7 +27,11 @@ rpi dev --local-only
 
 ### 2. 拆分不同类型的更新命令
 
-现在更新范围更加明确：
+> 已过时：这一节描述的 `rpi pi-update` 和 `rpi self-update` 都已不存在。
+> 现在只有 `rpi update`，它更新的是 rpi CLI 自身；Rust 扩展的安装与卸载
+> 用 `rpi install <crate>` / `rpi uninstall <crate>`。以下是 0.1.13 当时的原文。
+
+当时更新范围更加明确：
 
 ```bash
 # 只更新 Rust 原生扩展

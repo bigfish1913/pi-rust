@@ -504,7 +504,11 @@ fn cargo_install_command(
     if let Some(staging_root) = staging_root {
         command.arg("--root").arg(staging_root);
     }
-    command.args(["rpi-cli", "--locked", "--force"]);
+    // `--quiet` suppresses cargo's trailing advice to add the install root to
+    // PATH. Here that advice is actively wrong: the staging root is a temp
+    // directory that the atomic replace consumes, so a user who follows it
+    // adds a path that will not exist a second later. Errors still print.
+    command.args(["rpi-cli", "--locked", "--force", "--quiet"]);
     Ok(command)
 }
 
@@ -633,6 +637,13 @@ fn canonicalize_allow_missing(path: &Path, label: &str) -> Result<PathBuf, Strin
     Ok(canonical)
 }
 
+fn canonical_display(path: &Path) -> String {
+    std::fs::canonicalize(path)
+        .map(normalize_windows_path)
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "<unresolvable>".to_string())
+}
+
 fn validated_self_update_command_dir(path: &Path) -> Result<PathBuf, String> {
     if !path.is_absolute() {
         return Err("self-update command directory must be absolute".to_string());
@@ -647,11 +658,6 @@ fn validated_self_update_command_dir(path: &Path) -> Result<PathBuf, String> {
         .map_err(|error| {
             format!("could not canonicalize self-update command directory: {error}")
         })?;
-    if !windows_paths_equal(&canonical, path) {
-        return Err(
-            "self-update command directory resolves through a link or junction".to_string(),
-        );
-    }
     Ok(canonical)
 }
 
@@ -1599,40 +1605,55 @@ fn parse_rpi_version_output(output: &[u8]) -> Option<semver::Version> {
     semver::Version::parse(version).ok()
 }
 
+/// A real directory *by its own entry*: the leaf is not a link, so the update
+/// is free to write into it. Links further up are resolved rather than
+/// refused — a launch path such as `C:\tools\current\rpi.exe` where `current`
+/// is a junction names the real install directory, which is exactly what an
+/// update should rewrite.
 fn validated_real_directory(path: &Path, label: &str) -> Result<PathBuf, String> {
     if !path.is_absolute() {
         return Err(format!("{label} must be absolute"));
     }
     let metadata = std::fs::symlink_metadata(path)
         .map_err(|error| format!("could not inspect {label}: {error}"))?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "{label} is a link or junction, not a real directory ({} -> {})",
+            path.display(),
+            canonical_display(path),
+        ));
+    }
+    if !metadata.is_dir() {
         return Err(format!("{label} is not a real directory"));
     }
-    let canonical = std::fs::canonicalize(path)
+    std::fs::canonicalize(path)
         .map(normalize_windows_path)
-        .map_err(|error| format!("could not canonicalize {label}: {error}"))?;
-    if !windows_paths_equal(&canonical, path) {
-        return Err(format!("{label} resolves through a link or junction"));
-    }
-    Ok(canonical)
+        .map_err(|error| format!("could not canonicalize {label}: {error}"))
 }
 
+/// A non-empty regular file *by its own entry*: a link to a file is refused
+/// with both paths named, because replacing the link would leave the real
+/// target stale. Ancestor links are resolved, as in
+/// [`validated_real_directory`].
 fn validated_regular_file(path: &Path, label: &str) -> Result<PathBuf, String> {
     if !path.is_absolute() {
         return Err(format!("{label} must be absolute"));
     }
     let metadata = std::fs::symlink_metadata(path)
         .map_err(|error| format!("could not inspect {label}: {error}"))?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() == 0 {
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "{label} is a link or junction, not a non-empty regular file ({} -> {})",
+            path.display(),
+            canonical_display(path),
+        ));
+    }
+    if !metadata.is_file() || metadata.len() == 0 {
         return Err(format!("{label} is not a non-empty regular file"));
     }
-    let canonical = std::fs::canonicalize(path)
+    std::fs::canonicalize(path)
         .map(normalize_windows_path)
-        .map_err(|error| format!("could not canonicalize {label}: {error}"))?;
-    if !windows_paths_equal(&canonical, path) {
-        return Err(format!("{label} resolves through a link or junction"));
-    }
-    Ok(canonical)
+        .map_err(|error| format!("could not canonicalize {label}: {error}"))
 }
 
 fn is_self_update_status_name(name: &std::ffi::OsStr) -> bool {
@@ -1891,21 +1912,14 @@ fn write_windows_update_status(path: &Path, state: &str, message: &str) -> Resul
 
 #[cfg(test)]
 mod tests {
-    /// The self-update path validation refuses any ancestor that resolves
-    /// through a link or junction, so fixtures must not be built under an
-    /// ambient TEMP that happens to be a junction (e.g. `D:\Temp` on some
-    /// Windows hosts). Canonicalizing the base first strips the junction.
+    /// Fixtures may live under an ambient TEMP that is itself a junction
+    /// (e.g. `D:\Temp` on some Windows hosts). Ancestor links are resolved by
+    /// the path validation rather than refused, so a plain `tempdir()` is a
+    /// valid fixture — and using one keeps these tests honest about that.
     fn real_tempdir() -> tempfile::TempDir {
-        // Canonicalizing yields a verbatim (`\?\`) path on Windows; strip it
-        // again so fixtures look like ordinary user paths. Leaving it verbatim
-        // makes PowerShell compare `$PSScriptRoot` against a `\?\` argument
-        // and reject the run as "outside the validated staging directory".
-        let base = std::fs::canonicalize(std::env::temp_dir())
-            .map(super::normalize_windows_path)
-            .unwrap_or_else(|_| std::env::temp_dir());
         tempfile::Builder::new()
             .prefix("rpi-update-test-")
-            .tempdir_in(base)
+            .tempdir()
             .unwrap()
     }
 
@@ -2002,6 +2016,76 @@ mod tests {
     }
 
     #[test]
+    fn path_validation_resolves_ancestor_links_but_refuses_a_link_leaf() {
+        let temp = real_tempdir();
+        // Real targets, plus a link directory that points at one of them.
+        let real_dir = temp.path().join("real-dir");
+        let real_file = temp.path().join("real-file.exe");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        std::fs::write(&real_file, b"payload").unwrap();
+
+        let link_dir = temp.path().join("link-dir");
+        let link_file = temp.path().join("link-file.exe");
+        #[cfg(unix)]
+        let linked = {
+            std::os::unix::fs::symlink(&real_dir, &link_dir).unwrap();
+            std::os::unix::fs::symlink(&real_file, &link_file).unwrap();
+            true
+        };
+        #[cfg(windows)]
+        let linked = {
+            // Junctions need no elevation; file symlinks do, so skip the file
+            // half when this process cannot create one.
+            let dir_ok = std::process::Command::new("cmd")
+                .args(["/c", "mklink", "/J"])
+                .arg(&link_dir)
+                .arg(&real_dir)
+                .output()
+                .map(|out| out.status.success())
+                .unwrap_or(false);
+            if dir_ok {
+                let file_ok = std::os::windows::fs::symlink_file(&real_file, &link_file).is_ok();
+                if !file_ok {
+                    eprintln!("skipping the file-link half: no symlink privilege");
+                }
+            }
+            dir_ok
+        };
+        if !linked {
+            eprintln!("skipping: this platform could not create the link fixture");
+            return;
+        }
+
+        // A file *below* a linked directory resolves: the link is an ancestor,
+        // not the thing being written.
+        let through_link = link_dir.join("nested").join("leaf.exe");
+        std::fs::create_dir_all(through_link.parent().unwrap()).unwrap();
+        std::fs::write(&through_link, b"payload").unwrap();
+        super::validated_regular_file(&through_link, "file below a linked directory").unwrap();
+        assert_eq!(
+            std::fs::canonicalize(&link_dir).unwrap(),
+            std::fs::canonicalize(&real_dir).unwrap(),
+        );
+
+        // A link *leaf* is still refused, and the error names both paths.
+        let error = super::validated_real_directory(&link_dir, "linked directory").unwrap_err();
+        assert!(error.contains("link or junction"), "{error}");
+        assert!(error.contains(&link_dir.display().to_string()), "{error}");
+
+        if link_file.exists() {
+            let error = super::validated_regular_file(&link_file, "linked file").unwrap_err();
+            assert!(error.contains("link or junction"), "{error}");
+            assert!(error.contains(&link_file.display().to_string()), "{error}");
+            assert!(error.contains(&real_file.display().to_string()), "{error}");
+        }
+
+        // The link leaf check must not be a blanket refusal: the real targets
+        // still validate.
+        super::validated_real_directory(&real_dir, "real directory").unwrap();
+        super::validated_regular_file(&real_file, "real file").unwrap();
+    }
+
+    #[test]
     fn cargo_self_update_staging_is_passed_as_a_structured_argument() {
         let temp = real_tempdir();
         let staging = temp.path().join("staging");
@@ -2012,13 +2096,16 @@ mod tests {
         let args = command.get_args().map(OsString::from).collect::<Vec<_>>();
 
         assert_eq!(command.get_program(), "cargo");
-        assert_eq!(args.len(), 6);
+        assert_eq!(args.len(), 7);
         assert_eq!(args[0], "install");
         assert_eq!(args[1], "--root");
         assert_eq!(args[2], staging.as_os_str());
         assert_eq!(args[3], "rpi-cli");
         assert_eq!(args[4], "--locked");
         assert_eq!(args[5], "--force");
+        // Suppresses cargo's "add this to your PATH" advice, which names the
+        // staging root that the atomic replace is about to consume.
+        assert_eq!(args[6], "--quiet");
         assert_eq!(command.get_current_dir(), Some(command_dir.as_path()));
     }
 
@@ -2178,7 +2265,7 @@ mod tests {
 
         assert_eq!(
             args,
-            ["install", "rpi-cli", "--locked", "--force"]
+            ["install", "rpi-cli", "--locked", "--force", "--quiet"]
                 .into_iter()
                 .map(OsString::from)
                 .collect::<Vec<_>>()
