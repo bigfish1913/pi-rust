@@ -11,6 +11,8 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.3.10] - 2026-10-01
+
 ### Added
 
 - The plugin contract now owns the host identity: `rpi_plugin_sdk::HOST_NAME`
