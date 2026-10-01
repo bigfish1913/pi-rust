@@ -52,20 +52,29 @@ use std::process::Command;
 /// This function intentionally does NOT invoke a shell. The URL is passed
 /// directly as an argument to the platform-specific launcher, preventing
 /// command injection from malicious URLs.
-pub fn open_browser(url: &str) -> Result<(), String> {
-    let (cmd, args): (&str, Vec<&str>) = if cfg!(target_os = "macos") {
-        ("open", vec![url])
+/// Pure platform mapping used by [`open_browser`] — resolves which launcher
+/// command to run, but spawns nothing.
+///
+/// Split out from [`open_browser`] so the platform selection can be unit-tested
+/// without actually launching the user's browser.
+fn browser_launch_command(url: &str) -> Result<(&'static str, Vec<&str>), String> {
+    if cfg!(target_os = "macos") {
+        Ok(("open", vec![url]))
     } else if cfg!(target_os = "windows") {
-        ("rundll32", vec!["url.dll,FileProtocolHandler", url])
+        Ok(("rundll32", vec!["url.dll,FileProtocolHandler", url]))
     } else if cfg!(target_os = "linux")
         || cfg!(target_os = "freebsd")
         || cfg!(target_os = "openbsd")
         || cfg!(target_os = "netbsd")
     {
-        ("xdg-open", vec![url])
+        Ok(("xdg-open", vec![url]))
     } else {
-        return Err(format!("Unsupported platform for opening browser"));
-    };
+        Err("Unsupported platform for opening browser".to_string())
+    }
+}
+
+pub fn open_browser(url: &str) -> Result<(), String> {
+    let (cmd, args) = browser_launch_command(url)?;
 
     // Spawn the command without waiting for it to complete.
     // Browser launch is best-effort: we don't want to block if the browser
@@ -122,17 +131,37 @@ pub fn open_file(path: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    #[test]
-    #[ignore] // This test actually opens a browser, so it's ignored by default
-    fn test_open_browser() {
-        // This would open a browser in a real test
-        let result = open_browser("https://example.com");
-        assert!(result.is_ok());
-    }
+    // Commented out on purpose: this calls `open_browser`, which really spawns
+    // the platform launcher (on Windows `rundll32 url.dll,FileProtocolHandler`),
+    // so merely running the suite pops a browser window open. The side-effect-free
+    // equivalent below asserts the same platform mapping without launching
+    // anything, so there is nothing left for this to cover.
+    //
+    // #[test]
+    // fn test_open_browser() {
+    //     let result = open_browser("https://example.com");
+    //     assert!(result.is_ok());
+    // }
 
     #[test]
     fn test_platform_detection() {
-        // Just verify the function doesn't panic on the current platform
-        let _ = open_browser("https://example.com");
+        // Must stay side-effect free: this asserts the platform mapping only.
+        // Calling `open_browser` here would really launch the user's browser
+        // (on Windows: rundll32 url.dll,FileProtocolHandler <url>).
+        let (cmd, args) =
+            browser_launch_command("https://example.com").expect("supported platform");
+        if cfg!(target_os = "windows") {
+            assert_eq!(cmd, "rundll32");
+            assert_eq!(
+                args,
+                vec!["url.dll,FileProtocolHandler", "https://example.com"]
+            );
+        } else if cfg!(target_os = "macos") {
+            assert_eq!(cmd, "open");
+            assert_eq!(args, vec!["https://example.com"]);
+        } else {
+            assert_eq!(cmd, "xdg-open");
+            assert_eq!(args, vec!["https://example.com"]);
+        }
     }
 }
