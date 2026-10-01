@@ -3171,6 +3171,7 @@ async fn switch_to_session(
     cwd: &std::path::Path,
     chat: &Arc<Container>,
     state: &Arc<TuiState>,
+    tool_context: &rpi_extensions::ToolCallContext,
 ) -> bool {
     if *state.status.lock().unwrap() == RunStatus::Working {
         state.set_status(RunStatus::Aborting);
@@ -3179,7 +3180,11 @@ async fn switch_to_session(
     let cwd_str = cwd.to_string_lossy().to_string();
     match crate::session::open_session_by_id(id, &cwd_str).await {
         Ok(new_session) => {
-            let _ = harness.set_session(new_session).await;
+            // Route through the funnel so the plugin channels follow the swap;
+            // a bare `set_session` would leave every plugin naming the session
+            // it was serving before this call.
+            let _ =
+                crate::session::set_active_session(harness, new_session, Some(tool_context)).await;
             chat.clear();
             add_welcome_message(chat);
             render_session_history(
@@ -3211,6 +3216,7 @@ async fn import_session(
     cwd: &std::path::Path,
     chat: &Arc<Container>,
     state: &Arc<TuiState>,
+    tool_context: &rpi_extensions::ToolCallContext,
 ) {
     use std::path::Path as FsPath;
 
@@ -3236,7 +3242,7 @@ async fn import_session(
     match std::fs::copy(src, &dest) {
         Ok(_) => {
             let id = fname.strip_suffix(".jsonl").unwrap_or(fname).to_string();
-            if switch_to_session(harness, lane, &id, cwd, chat, state).await {
+            if switch_to_session(harness, lane, &id, cwd, chat, state, tool_context).await {
                 add_note_message(chat, &format!("Imported session from {path}"));
             }
         }
@@ -3249,6 +3255,7 @@ async fn fork_session(
     cwd: &std::path::Path,
     chat: &Arc<Container>,
     state: &Arc<TuiState>,
+    tool_context: &rpi_extensions::ToolCallContext,
 ) {
     use rpi_harness::session::jsonl::{JsonlSessionRepo, JsonlSessionRepoOptions};
     use rpi_tools::FileSystem;
@@ -3297,7 +3304,7 @@ async fn fork_session(
         }
     };
     let new_session = rpi_harness::session::session::Session::new(Arc::new(fork_storage), None);
-    let _ = harness.set_session(new_session).await;
+    let _ = crate::session::set_active_session(harness, new_session, Some(tool_context)).await;
     chat.clear();
     add_welcome_message(chat);
     render_session_history(
@@ -5225,7 +5232,7 @@ pub async fn interactive_tui(
     if let Some(m) = model_catalog.iter().find(|m| m.id == lane_model_id) {
         footer.set_context_window(m.context_window as i64);
     }
-    footer.set_hints("Enter: Send | Shift+Enter: New line | Ctrl+C: Clear/Exit | Esc: Abort | Ctrl+L: Model | Ctrl+P: Cycle | Ctrl+T: Expand tool | /help");
+    footer.set_hints("Enter: Send | Shift+Enter: New line | Ctrl+C: Clear/Exit | Esc: Abort | Ctrl+L: Model | Ctrl+P: Cycle | Ctrl+O: Expand tool | /help");
 
     // Live git-branch refresh (native fs-watch on `.git/HEAD`): a checkout or
     // commit updates the footer's branch without a manual refresh.
@@ -6840,11 +6847,29 @@ pub async fn interactive_tui(
                 break;
             }
             Some(TuiMessage::SwitchSession(id)) => {
-                switch_to_session(&harness, &lane, &id, &cwd, &chat_container, &state).await;
+                switch_to_session(
+                    &harness,
+                    &lane,
+                    &id,
+                    &cwd,
+                    &chat_container,
+                    &state,
+                    &reload_context.tool_context,
+                )
+                .await;
                 tui.request_render(false);
             }
             Some(TuiMessage::ImportSession(path)) => {
-                import_session(&harness, &lane, &path, &cwd, &chat_container, &state).await;
+                import_session(
+                    &harness,
+                    &lane,
+                    &path,
+                    &cwd,
+                    &chat_container,
+                    &state,
+                    &reload_context.tool_context,
+                )
+                .await;
                 tui.request_render(false);
             }
             Some(TuiMessage::ShareSession) => {
@@ -6947,7 +6972,14 @@ pub async fn interactive_tui(
                 tui.request_render(false);
             }
             Some(TuiMessage::ForkSession) => {
-                fork_session(&harness, &cwd, &chat_container, &state).await;
+                fork_session(
+                    &harness,
+                    &cwd,
+                    &chat_container,
+                    &state,
+                    &reload_context.tool_context,
+                )
+                .await;
                 tui.request_render(false);
             }
             Some(TuiMessage::ReloadExtensions) => {

@@ -11,6 +11,124 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.3.11] - 2026-10-01
+
+### Fixed
+
+- A spawned shell no longer inherits rpi-langfuse's subagent-nesting channel
+  (`LANGFUSE_PI_PARENT_TRACE_ID` / `_SPAN_ID` / `_SESSION_ID` / `_DEPTH`). The
+  extension publishes those variables so a launcher can attach a nested `rpi` to
+  the turn that spawned it, and decides it is a subagent by reading them back —
+  but a bash/powershell child inherits the environment, so a plain `rpi` started
+  from inside a shell adopted its ancestor's trace: it reused the parent trace
+  id, hung its root off the parent's root span, and named it `Subagent Turn`
+  instead of opening its own trace. Only `RPI_SESSION_ID` was on the
+  host-private exclusion list, because the prefix-based check could not see
+  these. They are now excluded; a launcher that sets them deliberately still
+  gets through, which is the supported nesting path. Two tests pin both halves.
+- The subagent channel's variable names moved into the plugin contract
+  (`rpi_plugin_sdk::SUBAGENT_PARENT_*`, with `SUBAGENT_PARENT_ENV` as the
+  family), and `rpi-tools` now consults that declaration instead of restating
+  the strings. Restating them is what made the leak above possible in the first
+  place: the exclusion and the extension each held a private copy of the names,
+  across two repositories, so a rename on either side left the list matching a
+  name nobody sets — no compile error, no failing test, the leak simply came
+  back. A newly added family member is now excluded automatically, and
+  `rpi-cli` pins the wire values so changing one is caught as the cross-repo
+  change it is.
+
+## [0.3.10] - 2026-10-01
+
+### Added
+
+- The plugin contract now owns the host identity: `rpi_plugin_sdk::HOST_NAME`
+  (`"rpi"`) and `HOST_VERSION`, with `rpi_cli::APP_NAME` / `VERSION` defined as
+  aliases of them so the two cannot drift. `BeforeAgentStart`'s payload carries
+  `host: {name, version}`, giving an extension a way to label its own output (a
+  trace name, a tag, `service.name`) from the host instead of hardcoding a brand
+  that a rename silently invalidates. `rpi-langfuse` had been reporting the
+  upstream TypeScript plugin's `"Pi Turn"` / `"pi"` for exactly that reason.
+- The host now publishes the session id twice, so an extension that observes a
+  run can name the session it is watching. `RPI_SESSION_ID` (constant:
+  `rpi_plugin_sdk::SESSION_ID_ENV`) is written whenever a session becomes active,
+  and `BeforeAgentStart`'s payload carries `sessionId` next to
+  `prompt`/`imageCount`, recomputed each turn. Previously the only channel was
+  `__rpi.sessionId` on a plugin **tool** call, so a tracing extension reported a
+  placeholder session for a pure-chat run and for every turn before the first
+  tool call. The payload field is the one that makes the first turn correct; the
+  environment variable is a convenience for plugins that never see a tool call.
+
+### Fixed
+
+- Switching sessions no longer leaves plugins naming the previous one. The
+  session id reaches a plugin on two channels — the `ToolCallContext` (read per
+  plugin **tool** call) and `RPI_SESSION_ID` (read per turn by the provider
+  hooks) — and only the startup build republished them. An in-process swap
+  (`/import`, `/fork`, the `/session` selector, and the plugin
+  `NewSession`/`Fork`/`SwitchSession` runtime actions) changed the session the
+  harness serves without touching either, so a plugin keyed to the old id went
+  on serving it. All of them now route through one funnel that republishes both.
+- `RPI_SESSION_ID` no longer leaks into the shell that `bash`/`powershell`
+  spawn. The shell inherited the whole process environment, so the variable
+  reached anything the command ran — including another `rpi`, which had no way
+  to tell its ancestor's session from its own. A small deny-list now keeps the
+  host's own plumbing out of a spawned shell, while explicit per-call values
+  still pass through.
+- `rpi update` no longer refuses to run when the running `rpi` was launched
+  through a link, junction, or `subst` drive. The path validation demanded that
+  `canonicalize()` reproduce the launch path byte for byte, so any link *above*
+  the executable — a `C:\tools\current\rpi.exe` junction, a `subst`, scoop's
+  `current` directories — aborted the update with "current rpi executable
+  resolves through a link or junction". The message named neither the path nor
+  the link, and the check was the wrong shape: the leaf is what matters, so a
+  linked *file* is still refused, now with both paths printed, while links
+  *above* the executable resolve to the real install directory the update
+  should rewrite.
+- `rpi update` no longer tells you to add the staging directory to `PATH`.
+  Cargo's install advice named `<agent>/self-update/pending-*/bin`, which the
+  atomic replace consumes, so following it added a path that stopped existing a
+  second later; the child `cargo install` now runs `--quiet` (errors still
+  print).
+
+### Changed
+
+- `docs/rustcc-post-v0.1.13.md` is marked as a historical 0.1.13 release post,
+  and its update-commands section now carries a correction. It still told
+  readers to run `rpi pi-update` and `rpi self-update`, neither of which exists
+  any more — the article only documented 0.1.13-era behavior and was never
+  revisited when the Pi layer was removed and the alias was dropped.
+
+## [0.3.9] - 2026-10-01
+
+### Added
+
+- `rpi update` performs a real self-update again. `a5506dd` had reduced it to a
+  bare `cargo install` that ignored its arguments, so `rpi update --help`
+  reinstalled the crate instead of printing help and `--offline` did nothing.
+  Restored: argument validation, `--help`, the `cargo binstall`/`cargo install`
+  path, direct binary replacement on Unix, the staged PowerShell replacement on
+  Windows (a running `.exe` cannot replace itself), staged-binary version
+  validation, rollback, and the status report shown on the next start.
+- The startup update check covers the rpi release and installed Rust extensions
+  again, with the 6-hour cache and per-item fallback that survived a registry
+  outage.
+
+### Changed
+
+- The Pi compatibility layer is *not* restored: `rpi package`, `pi-package
+  update`, `install-pi`, `uninstall-pi` and `--enable-pi-packages` stay removed,
+  along with the npm/Git package stores and the Node extension host.
+
+### Fixed
+
+- Removed subcommands no longer fall through to the prompt path. `rpi package
+  update` used to be sent to the model as the message "package update" and
+  appeared to hang; it now fails immediately with a pointer to `rpi install` /
+  `rpi uninstall` / `rpi update`. `rpi self-update` reports the same way and
+  points at `rpi update`.
+
+## [0.3.8] - 2026-09-30
+
 ## [0.3.6] - 2026-09-30
 
 ## [0.3.5] - 2026-09-29
@@ -220,12 +338,14 @@ on `main` and fixes how every crate presents itself on crates.io and docs.rs.
 ### Docs
 
 - Added `docs/performance-vs-pi.md` and `scripts/bench-vs-pi.mjs` — a reproducible,
-  same-machine comparison against native Pi over the same JSONL RPC endpoint,
+  same-machine comparison against native Pi over the same JSONL command channel,
   with isolated config directories and both tools offline. rpi is 9.7× faster to
-  start, 1.7× faster to a usable agent, 4.9× smaller in memory and ~21× smaller
-  installed. The same measurement shows 83% of rpi's startup is its own runtime
-  initialisation rather than process overhead, which is now the roadmap's
-  optimisation target.
+  start, 10.7× faster to cold start, 7.6× smaller in memory and ~18× smaller
+  installed. **Corrected after release:** an earlier run set only pi's `PI_*`
+  isolation variables, so rpi read the real `~/.rpi/agent` and loaded the
+  machine's global plugins (reported 103.6 ms / 1.7×); a second bug started the
+  cold-start stopwatch after `spawn()`. With both fixed, rpi's `--version` (17.5 ms) and
+  a cold start (17.7 ms) are effectively equal — the cost is process creation.
 - `crates/rpi-cli/embedded-docs/` — the documentation snapshot compiled into the
   `rpi` binary for the `docs` tool — is refreshed and now guarded: CI runs
   `scripts/sync-embedded-docs.sh` and fails if the snapshot drifts from the

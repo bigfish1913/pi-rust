@@ -38,18 +38,22 @@ Highlights:
   state.
 
 I also measured it against the TypeScript original it ports, same machine, same
-RPC endpoint, isolated config, both offline:
+JSONL command channel, isolated config, both offline:
 
-  --version        17.9 ms vs 172.9 ms   (9.7x)
-  RPC ready       103.6 ms vs 176.4 ms   (1.7x)
-  RSS at ready     18.6 MiB vs  91.6 MiB (4.9x)
-  install        23.9 MiB vs  ~513 MiB   (~21x)
+  --version        17.5 ms vs 169.5 ms   (9.7x)
+  Cold start       17.7 ms vs 189.5 ms   (10.7x)
+  RSS at ready     12.0 MiB vs  91.5 MiB (7.6x)
+  install        21.8 MiB vs  ~385 MiB   (~18x)
 
-The honest caveat: most of rpi's remaining 103 ms is its *own* initialisation,
-not process startup — about 86 ms of it. Pi's cost is almost entirely Node boot,
-so it has little left to win there. So the next work is lazy initialisation,
-not a smaller binary. I have not measured tool-loop throughput or long-session
-memory for either tool.
+An earlier version of this post reported 103 ms and 1.7x; that was my bug. The
+harness set pi's `PI_OFFLINE` / `PI_CODING_AGENT_DIR`, which rpi does not read —
+it uses `RPI_OFFLINE` / `RPI_CODING_AGENT_DIR` — so rpi was silently loading the
+25 plugin DLLs in my real `~/.rpi/agent` while pi ran clean. A second bug then
+under-reported rpi: the cold-start stopwatch started *after* `spawn()`, hiding ~7 ms of
+process creation. With both fixed: rpi's `--version` (17.5 ms) and its usable
+agent (17.7 ms) are equal, so its initialisation is negligible; Pi's two numbers
+differ by ~20 ms, its own agent init on top of Node boot. I have not measured
+tool-loop throughput or long-session memory for either tool.
 
 Known gaps, stated up front: the Node/TypeScript extension bridge is opt-in and
 incomplete, Intel macOS prebuilt binaries are not built yet, and
@@ -235,10 +239,12 @@ Design decisions that might be interesting here:
   actually emit.
 
 I also measured startup against the TypeScript original it ports, same machine,
-same RPC endpoint, isolated config, both offline: 9.7x faster to start, 1.7x
-faster to a usable agent, 4.9x smaller RSS. The interesting part is that most of
-rpi's remaining 103 ms is its own initialisation (86 ms), not process start — so
-the optimisation target is lazy init, not a smaller binary.
+same JSONL command channel, isolated config, both offline: 9.7x faster to start, 10.7x
+faster to cold start, 7.6x smaller RSS. An earlier run reported 1.7x; that
+was an isolation bug — I set pi's `PI_*` variables but rpi reads `RPI_*`, so rpi
+kept loading the 25 plugin DLLs in my real `~/.rpi/agent` while pi ran clean. A
+second run reported 10 ms because the stopwatch started after `spawn()`; rpi's
+real number is 17.7 ms, essentially its process-creation cost.
 
 Honest gaps: the JS/TS extension bridge is opt-in and incomplete, and
 `cargo fmt --all` does not currently pass across the workspace (tracked in #15).

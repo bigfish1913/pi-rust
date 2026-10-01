@@ -64,6 +64,45 @@ struct ShellConfig {
     transport: CommandTransport,
 }
 
+/// Environment variables the **host** sets for its own runtime plumbing, which
+/// must not be handed to a shell it spawns.
+///
+/// A spawned shell is a child process, so anything inherited reaches whatever
+/// that shell runs — including another `rpi`. `RPI_SESSION_ID` names the session
+/// *this process* serves, which is meaningless (and actively misleading) in a
+/// descendant: the child would either report the parent's session or, seeing the
+/// variable already present, refuse to publish its own. Both are wrong answers,
+/// and neither is visible from the child.
+///
+/// This is only the host's own half. An *extension* can publish variables with
+/// the same hazard, and it declares them itself; [`is_host_private_env`] is the
+/// function that answers the full question. Use it rather than reading this
+/// slice, or an extension's channel will be missed — which is precisely the bug
+/// that let `LANGFUSE_PI_PARENT_*` through.
+pub const HOST_PRIVATE_ENV: &[&str] = &[rpi_plugin_sdk::SESSION_ID_ENV];
+
+/// Whether `name` must not be inherited by a spawned shell.
+///
+/// Two sources, because the variables come from two places:
+///
+/// - [`HOST_PRIVATE_ENV`] — the host's own plumbing.
+/// - [`rpi_plugin_sdk::SUBAGENT_PARENT_ENV`] — the family an *extension*
+///   declares for subagent nesting. An inherited copy makes a plain `rpi` started
+///   from inside `bash` adopt its ancestor's trace, hang its root off the
+///   ancestor's root span, and call itself `Subagent Turn` instead of opening its
+///   own trace. A launcher that sets these on the child *it* starts is the
+///   supported nesting path, so this is about not *inheriting* them, not about
+///   forbidding the names.
+///
+/// The extension family is consulted **as the SDK's slice**, never as names
+/// restated here. Restating them is what the previous version did, and it is
+/// how the channel re-leaked when the plugin renamed them: the list went on
+/// matching a name nobody set. Going through the constant means a rename is a
+/// compile error, and a newly added family member is excluded automatically.
+pub fn is_host_private_env(name: &str) -> bool {
+    HOST_PRIVATE_ENV.contains(&name) || rpi_plugin_sdk::SUBAGENT_PARENT_ENV.contains(&name)
+}
+
 /// Real-OS `ExecutionEnv`. Clone shares the tracked-pid set + registry.
 pub struct OsExecutionEnv {
     cwd: PathBuf,
@@ -786,9 +825,17 @@ impl Shell for OsExecutionEnv {
         let mut cmd = tokio::process::Command::new(&shell_cfg.shell);
         cmd.current_dir(&cwd);
         cmd.env_clear();
-        // Environment: inherit + shell_env + per-call.
+        // Environment: inherit + shell_env + per-call. The host's own private
+        // plumbing (`HOST_PRIVATE_ENV`) is skipped: it describes *this* process,
+        // not the shell or anything the shell runs, and inheriting it makes a
+        // nested `rpi` misreport its session. A caller that genuinely wants a
+        // value passed down can still set it explicitly through `env`/`shell_env`
+        // below (those are applied after this loop and win).
         if options.inherit_env {
             for (k, v) in std::env::vars() {
+                if is_host_private_env(&k) {
+                    continue;
+                }
                 cmd.env(k, v);
             }
         }

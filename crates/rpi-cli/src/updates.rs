@@ -1,6 +1,30 @@
-//! rpi self-update and release notification support.
+//! Lightweight update discovery and update commands.
+//!
+//! Startup checks are deliberately best-effort: callers decide when to run
+//! them, each registry request uses a short timeout, and cached values are
+//! retained only as a fallback for temporary registry failures.
 
-use serde::Deserialize;
+use std::collections::BTreeMap;
+use std::future::Future;
+use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::process::Stdio;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use futures::{stream, StreamExt};
+use serde::{Deserialize, Serialize};
+
+const CACHE_FILE: &str = "update-check.json";
+const CACHE_FALLBACK_MAX_AGE_MS: i64 = 6 * 60 * 60 * 1000;
+const REQUEST_TIMEOUT_MS: u64 = 1800;
+const UPDATE_CHECK_CONCURRENCY: usize = 4;
+const CRATES_IO_API: &str = "https://crates.io/api/v1/crates/rpi-cli";
+const STAGED_RPI_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const MAX_STAGED_RPI_OUTPUT_BYTES: usize = 4 * 1024;
+const MAX_SELF_UPDATE_STATUS_BYTES: u64 = 64 * 1024;
+const MAX_SELF_UPDATE_STATUS_MESSAGE_CHARS: usize = 2 * 1024;
+static UPDATE_CACHE_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static SELF_UPDATE_STATUS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateNotice {
@@ -28,92 +52,2672 @@ impl UpdateReport {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct UpdateCache {
+    /// Legacy aggregate timestamp retained for backward-compatible cache reads.
+    checked_at: i64,
+    rpi_latest: Option<String>,
+    #[serde(default)]
+    native_packages: BTreeMap<String, String>,
+    #[serde(default)]
+    freshness: UpdateCacheFreshness,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct UpdateCacheFreshness {
+    rpi: i64,
+    #[serde(default)]
+    native_packages: BTreeMap<String, i64>,
+}
+
+type RegistryCacheUpdate = (BTreeMap<String, String>, BTreeMap<String, i64>);
+
 #[derive(Debug, Deserialize)]
 struct CratesResponse {
     #[serde(rename = "crate")]
     crate_info: CrateInfo,
 }
+
 #[derive(Debug, Deserialize)]
 struct CrateInfo {
     max_version: String,
 }
 
-fn updates_disabled() -> bool {
+#[derive(Debug, Deserialize)]
+struct SelfUpdateStatus {
+    state: String,
+    #[serde(default)]
+    message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RegistryLookup {
+    Found(String),
+    Missing,
+    TransientFailure,
+}
+
+/// Best-effort startup check for the rpi release and installed Rust extensions.
+pub async fn check_startup(cwd: &Path) -> UpdateReport {
+    let _ = cwd;
+    check_rpi_startup().await
+}
+
+/// Check the rpi release and every installed Rust cdylib extension.
+///
+/// Native-only: the npm/Git package halves of the old scope went away with the
+/// Pi compatibility layer, so this never shells out to a package manager.
+pub async fn check_rpi_startup() -> UpdateReport {
+    if update_checks_disabled() {
+        return report_without_remote_checks();
+    }
+    check_startup_with_client(startup_http_client()).await
+}
+
+fn update_checks_disabled() -> bool {
     crate::args::offline_env_enabled() || std::env::var_os("RPI_DISABLE_UPDATE_CHECK").is_some()
 }
 
-pub async fn check_rpi_startup() -> UpdateReport {
-    if updates_disabled() {
-        return UpdateReport::default();
-    }
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
-        .user_agent(format!("rpi/{}", crate::VERSION))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return UpdateReport::default(),
-    };
-    let url = "https://crates.io/api/v1/crates/rpi-cli";
-    let latest = match client
-        .get(url)
-        .send()
-        .await
-        .and_then(|r| r.error_for_status())
-    {
-        Ok(response) => match response.json::<CratesResponse>().await {
-            Ok(v) => v.crate_info.max_version,
-            Err(_) => return UpdateReport::default(),
-        },
-        Err(_) => return UpdateReport::default(),
-    };
-    if is_newer(crate::VERSION, &latest) {
-        UpdateReport {
-            notices: vec![UpdateNotice {
-                name: "rpi".into(),
-                current: crate::VERSION.into(),
-                latest,
-                command: "rpi update".into(),
-            }],
-            warnings: Vec::new(),
-        }
-    } else {
-        UpdateReport::default()
+/// Report the outcome of a self-update that ran in a previous process.
+fn report_without_remote_checks() -> UpdateReport {
+    let warnings = crate::config::agent_dir()
+        .ok()
+        .map(|agent_dir| consume_self_update_statuses(&agent_dir))
+        .unwrap_or_default();
+    UpdateReport {
+        notices: Vec::new(),
+        warnings,
     }
 }
 
-pub fn is_newer(current: &str, latest: &str) -> bool {
-    match (
-        semver::Version::parse(current),
-        semver::Version::parse(latest),
-    ) {
-        (Ok(a), Ok(b)) => b > a,
-        _ => current != latest,
+fn startup_http_client() -> Option<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(REQUEST_TIMEOUT_MS))
+        .user_agent(format!("rpi/{}", crate::VERSION))
+        .build()
+        .ok()
+}
+
+async fn check_startup_with_client(client: Option<reqwest::Client>) -> UpdateReport {
+    let agent_dir = match crate::config::agent_dir() {
+        Ok(dir) => dir,
+        Err(_) => return UpdateReport::default(),
+    };
+    let warnings = consume_self_update_statuses(&agent_dir);
+    let cache_path = agent_dir.join(CACHE_FILE);
+    let previous_cache = read_cache(&cache_path);
+
+    // Installed Rust extensions come from `rpi install`'s registry, so this
+    // path stays independent of any Pi package resource discovery.
+    let native_checks = crate::install::installed_native_packages()
+        .into_iter()
+        .filter(|package| package.source.is_none())
+        .map(|package| {
+            let client = client.clone();
+            async move {
+                let latest = match client.as_ref() {
+                    Some(client) => fetch_crates_latest(client, &package.name).await,
+                    None => RegistryLookup::TransientFailure,
+                };
+                (package.name, latest)
+            }
+        });
+    let rpi_check = async {
+        Some(match client.as_ref() {
+            Some(client) => fetch_rpi_latest(client).await,
+            None => RegistryLookup::TransientFailure,
+        })
+    };
+    let (rpi_result, native_results) = tokio::join!(rpi_check, collect_bounded(native_checks));
+
+    let checked_at = now_ms();
+    let mut rpi_update = None;
+    if let Some(rpi_result) = rpi_result {
+        let cached_at = previous_cache
+            .as_ref()
+            .map(rpi_cache_checked_at)
+            .unwrap_or_default();
+        let fallback_allowed = timestamp_is_fresh(cached_at, checked_at);
+        let (latest, used_fallback) = lookup_with_cache_fallback(
+            rpi_result,
+            previous_cache
+                .as_ref()
+                .and_then(|cache| cache.rpi_latest.as_deref()),
+            fallback_allowed,
+        );
+        let value_checked_at =
+            resolved_checked_at(latest.as_deref(), used_fallback, cached_at, checked_at);
+        rpi_update = Some((latest, value_checked_at));
     }
+
+    let legacy_checked_at = previous_cache
+        .as_ref()
+        .map(|cache| cache.checked_at)
+        .unwrap_or_default();
+    let native_packages = results_with_individual_cache_fallback(
+        native_results,
+        previous_cache.as_ref().map(|cache| &cache.native_packages),
+        previous_cache
+            .as_ref()
+            .map(|cache| &cache.freshness.native_packages),
+        legacy_checked_at,
+        checked_at,
+    );
+
+    let cache = merge_and_write_cache(&cache_path, checked_at, rpi_update, native_packages);
+    let mut report = report_from_cache(&cache);
+    report.warnings = warnings;
+    report
+}
+
+async fn collect_bounded<I, F, T>(checks: I) -> Vec<T>
+where
+    I: IntoIterator<Item = F>,
+    F: Future<Output = T>,
+{
+    stream::iter(checks)
+        .buffer_unordered(UPDATE_CHECK_CONCURRENCY)
+        .collect()
+        .await
+}
+
+fn rpi_cache_checked_at(cache: &UpdateCache) -> i64 {
+    if cache.freshness.rpi > 0 {
+        cache.freshness.rpi
+    } else {
+        cache.checked_at
+    }
+}
+
+fn entry_cache_checked_at(
+    freshness: Option<&BTreeMap<String, i64>>,
+    key: &str,
+    legacy_checked_at: i64,
+) -> i64 {
+    freshness
+        .and_then(|values| values.get(key).copied())
+        .filter(|checked_at| *checked_at > 0)
+        .unwrap_or(legacy_checked_at)
+}
+
+fn timestamp_is_fresh(checked_at: i64, now: i64) -> bool {
+    let age = now.saturating_sub(checked_at);
+    checked_at > 0 && age >= 0 && age <= CACHE_FALLBACK_MAX_AGE_MS
+}
+
+fn resolved_checked_at(
+    value: Option<&str>,
+    used_fallback: bool,
+    cached_at: i64,
+    checked_at: i64,
+) -> i64 {
+    if value.is_none() {
+        0
+    } else if used_fallback {
+        cached_at
+    } else {
+        checked_at
+    }
+}
+
+fn results_with_individual_cache_fallback(
+    results: Vec<(String, RegistryLookup)>,
+    cached: Option<&BTreeMap<String, String>>,
+    freshness: Option<&BTreeMap<String, i64>>,
+    legacy_checked_at: i64,
+    checked_at: i64,
+) -> RegistryCacheUpdate {
+    let mut values = BTreeMap::new();
+    let mut checked_at_values = BTreeMap::new();
+    for (name, result) in results {
+        let cached_value = cached.and_then(|cached| cached.get(&name).map(String::as_str));
+        let cached_at = entry_cache_checked_at(freshness, &name, legacy_checked_at);
+        let (latest, used_fallback) = lookup_with_cache_fallback(
+            result,
+            cached_value,
+            timestamp_is_fresh(cached_at, checked_at),
+        );
+        if let Some(latest) = latest {
+            checked_at_values.insert(
+                name.clone(),
+                resolved_checked_at(Some(&latest), used_fallback, cached_at, checked_at),
+            );
+            values.insert(name, latest);
+        }
+    }
+    (values, checked_at_values)
+}
+
+fn merge_and_write_cache(
+    path: &Path,
+    checked_at: i64,
+    rpi_update: Option<(Option<String>, i64)>,
+    native_packages: RegistryCacheUpdate,
+) -> UpdateCache {
+    let _guard = UPDATE_CACHE_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut cache = read_cache(path).unwrap_or_default();
+    if cache.checked_at <= 0 {
+        cache.checked_at = checked_at;
+    }
+    if let Some((latest, latest_checked_at)) = rpi_update {
+        cache.rpi_latest = latest;
+        cache.freshness.rpi = latest_checked_at;
+    }
+    cache.native_packages = native_packages.0;
+    cache.freshness.native_packages = native_packages.1;
+    let _ = write_cache(path, &cache);
+    cache
+}
+
+fn lookup_with_cache_fallback(
+    result: RegistryLookup,
+    cached: Option<&str>,
+    fallback_allowed: bool,
+) -> (Option<String>, bool) {
+    match result {
+        RegistryLookup::Found(version) => (Some(version), false),
+        RegistryLookup::Missing => (None, false),
+        RegistryLookup::TransientFailure if fallback_allowed => {
+            (cached.map(str::to_owned), cached.is_some())
+        }
+        RegistryLookup::TransientFailure => (None, false),
+    }
+}
+fn report_from_cache(cache: &UpdateCache) -> UpdateReport {
+    let mut notices = Vec::new();
+    if let Some(latest) = cache.rpi_latest.as_deref() {
+        if is_newer(crate::VERSION, latest) {
+            notices.push(UpdateNotice {
+                name: "rpi".into(),
+                current: crate::VERSION.into(),
+                latest: latest.into(),
+                command: "rpi update".into(),
+            });
+        }
+    }
+    for package in crate::install::installed_native_packages() {
+        if package.source.is_some() {
+            continue;
+        }
+        let Some(latest) = cache.native_packages.get(&package.name) else {
+            continue;
+        };
+        if is_newer(&package.version, latest) {
+            notices.push(UpdateNotice {
+                name: package.name.clone(),
+                current: package.version,
+                latest: latest.clone(),
+                command: format!("rpi install {} --force", package.name),
+            });
+        }
+    }
+    UpdateReport {
+        notices,
+        warnings: Vec::new(),
+    }
+}
+
+fn normalize_windows_path(path: PathBuf) -> PathBuf {
+    if cfg!(windows) {
+        let text = path.to_string_lossy();
+        if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{unc}"));
+        }
+        if let Some(local) = text.strip_prefix(r"\\?\") {
+            return PathBuf::from(local);
+        }
+    }
+    path
+}
+
+fn windows_paths_equal(left: &Path, right: &Path) -> bool {
+    let left = normalize_windows_path(left.to_path_buf());
+    let right = normalize_windows_path(right.to_path_buf());
+    if cfg!(windows) {
+        left.to_string_lossy()
+            .replace('/', "\\")
+            .eq_ignore_ascii_case(&right.to_string_lossy().replace('/', "\\"))
+    } else {
+        left == right
+    }
+}
+
+async fn fetch_rpi_latest(client: &reqwest::Client) -> RegistryLookup {
+    fetch_crates_url(client, CRATES_IO_API).await
+}
+
+async fn fetch_crates_latest(client: &reqwest::Client, name: &str) -> RegistryLookup {
+    fetch_crates_url(client, &format!("https://crates.io/api/v1/crates/{name}")).await
+}
+
+async fn fetch_crates_url(client: &reqwest::Client, url: &str) -> RegistryLookup {
+    let response = match client.get(url).send().await {
+        Ok(response) => response,
+        Err(_) => return RegistryLookup::TransientFailure,
+    };
+    if matches!(
+        response.status(),
+        reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE
+    ) {
+        return RegistryLookup::Missing;
+    }
+    if !response.status().is_success() {
+        return RegistryLookup::TransientFailure;
+    }
+    match response.json::<CratesResponse>().await {
+        Ok(response) => RegistryLookup::Found(response.crate_info.max_version),
+        Err(_) => RegistryLookup::TransientFailure,
+    }
+}
+
+/// Compare complete semantic versions, including prerelease precedence.
+pub fn is_newer(current: &str, latest: &str) -> bool {
+    let parse = |value: &str| semver::Version::parse(value.trim().trim_start_matches('v')).ok();
+    match (parse(current), parse(latest)) {
+        (Some(current), Some(latest)) => latest > current,
+        _ => false,
+    }
+}
+
+fn read_cache(path: &Path) -> Option<UpdateCache> {
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
+fn write_cache(path: &Path, cache: &UpdateCache) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let data = serde_json::to_vec_pretty(cache).map_err(|error| error.to_string())?;
+    crate::config::atomic_write(path, &data).map_err(|error| error.to_string())
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 pub fn print_startup_notices(report: &UpdateReport) {
+    for warning in &report.warnings {
+        eprintln!("warning: {} Run `{}`.", warning.message, warning.command);
+    }
     for notice in &report.notices {
         eprintln!(
-            "update available: {} {} -> {} ({})",
+            "Update available: {} {} -> {}. Run `{}`.",
             notice.name, notice.current, notice.latest, notice.command
         );
     }
-    for warning in &report.warnings {
-        eprintln!("warning: {} ({})", warning.message, warning.command);
+}
+
+/// Update the installed rpi CLI through its documented crates.io install path.
+/// Windows stages first because a running executable cannot replace itself;
+/// other platforms retain Cargo's direct replacement behavior.
+pub fn run_self_update(args: &[String]) -> i32 {
+    let offline = crate::args::normalize_offline_mode(args);
+    let args = crate::args::without_offline_flag(args);
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
+    {
+        println!("Usage: rpi update [--offline]\n\nUpdate the rpi CLI from crates.io.");
+        return 0;
+    }
+    if !args.is_empty() {
+        eprintln!("error: `rpi update` does not accept arguments");
+        return 2;
+    }
+    if offline {
+        println!("rpi update skipped: offline mode is enabled");
+        return 0;
+    }
+
+    #[cfg(windows)]
+    {
+        run_windows_self_update()
+    }
+    #[cfg(not(windows))]
+    {
+        run_direct_self_update()
     }
 }
 
-pub fn run_self_update(_args: &[String]) -> i32 {
-    let status = std::process::Command::new("cargo")
-        .args(["install", "rpi-cli", "--locked"])
-        .status();
+fn cargo_install_command(
+    staging_root: Option<&Path>,
+    isolated_cwd: &Path,
+) -> Result<std::process::Command, String> {
+    let isolated_cwd = validated_self_update_command_dir(isolated_cwd)?;
+    let mut command = std::process::Command::new("cargo");
+    command.arg("install").current_dir(isolated_cwd);
+    for variable in [
+        "RUSTC_WRAPPER",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "CARGO_BUILD_RUSTC_WRAPPER",
+        "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+    ] {
+        command.env_remove(variable);
+    }
+    if let Some(staging_root) = staging_root {
+        command.arg("--root").arg(staging_root);
+    }
+    // `--quiet` suppresses cargo's trailing advice to add the install root to
+    // PATH. Here that advice is actively wrong: the staging root is a temp
+    // directory that the atomic replace consumes, so a user who follows it
+    // adds a path that will not exist a second later. Errors still print.
+    command.args(["rpi-cli", "--locked", "--force", "--quiet"]);
+    Ok(command)
+}
+
+/// Cargo discovers `.cargo/config.toml` from its working directory upward.
+/// Put update commands directly below the user's home directory so neither an
+/// untrusted project, a project-local `CARGO_HOME`, nor a world-writable system
+/// temp directory can join that discovery chain. Cargo still reads its
+/// explicitly configured user-level home through its normal environment.
+fn create_self_update_command_dir() -> Result<tempfile::TempDir, String> {
+    let configured_root =
+        dirs::home_dir().ok_or_else(|| "could not resolve the user home directory".to_string())?;
+    if !configured_root.is_absolute() {
+        return Err("user home must be absolute for self-update".to_string());
+    }
+    let canonical_root = std::fs::canonicalize(&configured_root)
+        .map(normalize_windows_path)
+        .map_err(|error| format!("could not canonicalize user home: {error}"))?;
+    let metadata = std::fs::symlink_metadata(&canonical_root)
+        .map_err(|error| format!("could not inspect user home: {error}"))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err("user home does not resolve to a real directory".to_string());
+    }
+    let current = std::env::current_dir()
+        .and_then(std::fs::canonicalize)
+        .map(normalize_windows_path)
+        .map_err(|error| format!("could not validate the caller directory: {error}"))?;
+    let project_root = current
+        .ancestors()
+        .find(|ancestor| std::fs::symlink_metadata(ancestor.join(".git")).is_ok())
+        .map(Path::to_path_buf);
+    validate_configured_cargo_home(project_root.as_deref())?;
+    if project_root.as_deref().is_some_and(|root| {
+        !windows_paths_equal(&canonical_root, root) && path_is_within(&canonical_root, root)
+    }) {
+        return Err(
+            "refusing to create a self-update command directory inside the caller project"
+                .to_string(),
+        );
+    }
+    let directory = tempfile::Builder::new()
+        .prefix("rpi-self-update-command-")
+        .tempdir_in(&canonical_root)
+        .map_err(|error| format!("could not allocate Cargo command directory: {error}"))?;
+    validated_self_update_command_dir(directory.path())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let directory_metadata = std::fs::symlink_metadata(directory.path())
+            .map_err(|error| format!("could not inspect Cargo command directory: {error}"))?;
+        if metadata.uid() != directory_metadata.uid() || metadata.permissions().mode() & 0o022 != 0
+        {
+            return Err("user home is not private to the current account".to_string());
+        }
+    }
+    Ok(directory)
+}
+
+fn path_is_within(candidate: &Path, ancestor: &Path) -> bool {
+    candidate
+        .ancestors()
+        .any(|component| windows_paths_equal(component, ancestor))
+}
+
+fn validate_configured_cargo_home(project_root: Option<&Path>) -> Result<(), String> {
+    let Some(configured) = std::env::var_os("CARGO_HOME") else {
+        return Ok(());
+    };
+    let configured = PathBuf::from(configured);
+    if !configured.is_absolute() {
+        return Err("CARGO_HOME must be absolute for self-update".to_string());
+    }
+    let project_local = match project_root {
+        Some(root) => cargo_home_is_project_local(&configured, root)?,
+        None => {
+            canonicalize_allow_missing(&configured, "CARGO_HOME")?;
+            false
+        }
+    };
+    if project_local {
+        return Err("refusing project-local CARGO_HOME during self-update".to_string());
+    }
+    Ok(())
+}
+
+fn cargo_home_is_project_local(configured: &Path, project_root: &Path) -> Result<bool, String> {
+    if !configured.is_absolute() {
+        return Err("CARGO_HOME must be absolute for self-update".to_string());
+    }
+    let configured = canonicalize_allow_missing(configured, "CARGO_HOME")?;
+    Ok(path_is_within(&configured, project_root))
+}
+
+fn canonicalize_allow_missing(path: &Path, label: &str) -> Result<PathBuf, String> {
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::CurDir | std::path::Component::ParentDir
+        )
+    }) {
+        return Err(format!("{label} contains relative path components"));
+    }
+    let mut existing = path;
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(existing) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let name = existing
+                    .file_name()
+                    .ok_or_else(|| format!("could not resolve {label}"))?;
+                missing.push(name.to_os_string());
+                existing = existing
+                    .parent()
+                    .ok_or_else(|| format!("could not resolve {label}"))?;
+            }
+            Err(error) => return Err(format!("could not inspect {label}: {error}")),
+        }
+    }
+    let mut canonical = std::fs::canonicalize(existing)
+        .map(normalize_windows_path)
+        .map_err(|error| format!("could not canonicalize {label}: {error}"))?;
+    for component in missing.into_iter().rev() {
+        canonical.push(component);
+    }
+    Ok(canonical)
+}
+
+fn canonical_display(path: &Path) -> String {
+    std::fs::canonicalize(path)
+        .map(normalize_windows_path)
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "<unresolvable>".to_string())
+}
+
+fn validated_self_update_command_dir(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err("self-update command directory must be absolute".to_string());
+    }
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("could not inspect self-update command directory: {error}"))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err("self-update command directory is not a real directory".to_string());
+    }
+    let canonical = std::fs::canonicalize(path)
+        .map(normalize_windows_path)
+        .map_err(|error| {
+            format!("could not canonicalize self-update command directory: {error}")
+        })?;
+    Ok(canonical)
+}
+
+#[cfg(not(windows))]
+#[derive(Debug, Clone)]
+struct DirectUpdatePlan {
+    staging_dir: PathBuf,
+    staged_exe: PathBuf,
+    target_exe: PathBuf,
+    replacement_temp: PathBuf,
+    backup_file: PathBuf,
+}
+
+#[cfg(not(windows))]
+fn run_direct_self_update() -> i32 {
+    let staging = match create_self_update_staging_directory() {
+        Ok(directory) => directory,
+        Err(error) => {
+            eprintln!("error: could not create self-update staging directory: {error}");
+            return 1;
+        }
+    };
+    let command_dir = match create_self_update_command_dir() {
+        Ok(directory) => directory,
+        Err(error) => {
+            eprintln!("error: could not create an isolated self-update directory: {error}");
+            return 1;
+        }
+    };
+    let mut command = match cargo_install_command(Some(staging.path()), command_dir.path()) {
+        Ok(command) => command,
+        Err(error) => {
+            eprintln!("error: invalid isolated self-update directory: {error}");
+            return 1;
+        }
+    };
+    let status = command.status();
     match status {
-        Ok(s) if s.success() => 0,
-        Ok(s) => s.code().unwrap_or(1),
-        Err(e) => {
-            eprintln!("rpi update failed: {e}");
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            eprintln!("error: cargo install exited with {status}");
+            return 1;
+        }
+        Err(error) => {
+            eprintln!("error: could not run cargo (install Rust/Cargo first): {error}");
+            return 1;
+        }
+    }
+
+    let current_exe = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("error: could not resolve the current rpi executable: {error}");
+            return 1;
+        }
+    };
+    let plan = match build_direct_update_plan(staging.path(), &current_exe) {
+        Ok(plan) => plan,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return 1;
+        }
+    };
+    match activate_direct_update(&plan) {
+        Ok(version) => {
+            println!("rpi updated successfully to {version}");
+            0
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
             1
         }
+    }
+}
+
+fn create_self_update_staging_directory() -> Result<tempfile::TempDir, String> {
+    let agent = crate::config::agent_dir().map_err(|error| error.to_string())?;
+    if !agent.is_absolute() {
+        return Err("agent directory must be absolute".to_string());
+    }
+    std::fs::create_dir_all(&agent)
+        .map_err(|error| format!("could not create {}: {error}", agent.display()))?;
+    let agent = validated_real_directory(&agent, "agent directory")?;
+    let update_root = agent.join("self-update");
+    std::fs::create_dir_all(&update_root)
+        .map_err(|error| format!("could not create {}: {error}", update_root.display()))?;
+    let update_root = validated_real_directory(&update_root, "self-update root")?;
+    let staging = tempfile::Builder::new()
+        .prefix("pending-")
+        .tempdir_in(&update_root)
+        .map_err(|error| format!("could not allocate staging directory: {error}"))?;
+    validated_real_directory(staging.path(), "self-update staging directory")?;
+    Ok(staging)
+}
+
+#[cfg(not(windows))]
+fn build_direct_update_plan(
+    staging_dir: &Path,
+    target_exe: &Path,
+) -> Result<DirectUpdatePlan, String> {
+    let staging_dir = validated_real_directory(staging_dir, "self-update staging directory")?;
+    let staged_exe = validated_regular_file(
+        &staging_dir.join("bin").join(crate::APP_NAME),
+        "staged rpi executable",
+    )?;
+    let target_exe = validated_regular_file(target_exe, "current rpi executable")?;
+    let target_dir = validated_real_directory(
+        target_exe
+            .parent()
+            .ok_or_else(|| "current executable has no parent directory".to_string())?,
+        "current executable directory",
+    )?;
+    if target_exe.parent() != Some(target_dir.as_path()) {
+        return Err("current executable is not a direct child of its validated directory".into());
+    }
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    let replacement_temp = target_dir.join(format!(".rpi-update-{token}.new"));
+    let backup_file = target_dir.join(format!(".rpi-update-{token}.old"));
+    if replacement_temp.exists() || backup_file.exists() {
+        return Err("self-update replacement path collision".to_string());
+    }
+    Ok(DirectUpdatePlan {
+        staging_dir,
+        staged_exe,
+        target_exe,
+        replacement_temp,
+        backup_file,
+    })
+}
+
+#[cfg(not(windows))]
+fn activate_direct_update(plan: &DirectUpdatePlan) -> Result<semver::Version, String> {
+    let staged_version = validate_rpi_executable_version(
+        &plan.staged_exe,
+        &plan.staging_dir,
+        crate::VERSION,
+        "staged rpi",
+    )?;
+    preflight_direct_replacement(plan)?;
+
+    let result = (|| {
+        std::fs::copy(&plan.staged_exe, &plan.replacement_temp).map_err(|error| {
+            format!("could not copy staged rpi beside the current executable: {error}")
+        })?;
+        validated_regular_file(&plan.replacement_temp, "replacement rpi executable")?;
+        let copied_version = validate_rpi_executable_version(
+            &plan.replacement_temp,
+            plan.target_exe
+                .parent()
+                .ok_or_else(|| "current executable has no parent directory".to_string())?,
+            crate::VERSION,
+            "replacement rpi",
+        )?;
+        if copied_version != staged_version
+            || !files_are_identical(&plan.staged_exe, &plan.replacement_temp)?
+        {
+            return Err(
+                "replacement rpi does not match the validated staged executable".to_string(),
+            );
+        }
+
+        std::fs::hard_link(&plan.target_exe, &plan.backup_file)
+            .map_err(|error| format!("could not preserve the current rpi executable: {error}"))?;
+        let installed_version = validate_rpi_executable_version(
+            &plan.backup_file,
+            plan.target_exe
+                .parent()
+                .ok_or_else(|| "current executable has no parent directory".to_string())?,
+            crate::VERSION,
+            "current rpi",
+        )?;
+        if staged_version < installed_version {
+            return Err(format!(
+                "refusing to replace rpi {installed_version} with older version {staged_version}"
+            ));
+        }
+        if !files_are_identical(&plan.target_exe, &plan.backup_file)? {
+            return Err("current rpi executable changed while preparing the update".to_string());
+        }
+
+        std::fs::rename(&plan.replacement_temp, &plan.target_exe).map_err(|error| {
+            format!("could not atomically replace the current rpi executable: {error}")
+        })?;
+        Ok(())
+    })();
+
+    if let Err(error) = result {
+        let _ = remove_file_if_exists(&plan.replacement_temp);
+        let _ = remove_file_if_exists(&plan.backup_file);
+        return Err(error);
+    }
+
+    let validation = (|| {
+        if !files_are_identical(&plan.staged_exe, &plan.target_exe)? {
+            return Err("updated rpi executable does not match the staged executable".to_string());
+        }
+        let updated_version = validate_rpi_executable_version(
+            &plan.target_exe,
+            plan.target_exe
+                .parent()
+                .ok_or_else(|| "current executable has no parent directory".to_string())?,
+            crate::VERSION,
+            "updated rpi",
+        )?;
+        if updated_version != staged_version {
+            return Err(format!(
+                "updated rpi reported version {updated_version}, expected {staged_version}"
+            ));
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = validation {
+        return Err(rollback_direct_update(plan, &error));
+    }
+    let _ = remove_file_if_exists(&plan.backup_file);
+    Ok(staged_version)
+}
+
+#[cfg(not(windows))]
+fn preflight_direct_replacement(plan: &DirectUpdatePlan) -> Result<(), String> {
+    for path in [&plan.replacement_temp, &plan.backup_file] {
+        if path.exists() {
+            return Err(format!(
+                "self-update path already exists: {}",
+                path.display()
+            ));
+        }
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|error| format!("cannot write beside the current executable: {error}"))?;
+        drop(file);
+        std::fs::remove_file(path)
+            .map_err(|error| format!("could not remove self-update probe: {error}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn rollback_direct_update(plan: &DirectUpdatePlan, failure: &str) -> String {
+    let _ = remove_file_if_exists(&plan.replacement_temp);
+    match std::fs::rename(&plan.backup_file, &plan.target_exe) {
+        Ok(()) => format!("{failure}; restored the previous rpi executable"),
+        Err(rollback) => format!(
+            "{failure}; automatic rollback failed ({rollback}); the previous executable remains at {}",
+            plan.backup_file.display()
+        ),
+    }
+}
+
+#[cfg(not(windows))]
+fn remove_file_if_exists(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[cfg(not(windows))]
+fn files_are_identical(left: &Path, right: &Path) -> Result<bool, String> {
+    use std::io::{BufReader, Read};
+
+    let left_file = std::fs::File::open(left)
+        .map_err(|error| format!("could not open {}: {error}", left.display()))?;
+    let right_file = std::fs::File::open(right)
+        .map_err(|error| format!("could not open {}: {error}", right.display()))?;
+    if left_file
+        .metadata()
+        .map_err(|error| error.to_string())?
+        .len()
+        != right_file
+            .metadata()
+            .map_err(|error| error.to_string())?
+            .len()
+    {
+        return Ok(false);
+    }
+    let mut left = BufReader::new(left_file);
+    let mut right = BufReader::new(right_file);
+    let mut left_buffer = [0u8; 64 * 1024];
+    let mut right_buffer = [0u8; 64 * 1024];
+    loop {
+        let left_read = left
+            .read(&mut left_buffer)
+            .map_err(|error| error.to_string())?;
+        let right_read = right
+            .read(&mut right_buffer)
+            .map_err(|error| error.to_string())?;
+        if left_read != right_read || left_buffer[..left_read] != right_buffer[..right_read] {
+            return Ok(false);
+        }
+        if left_read == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone)]
+struct WindowsUpdatePlan {
+    staging_dir: PathBuf,
+    staged_exe: PathBuf,
+    target_exe: PathBuf,
+    helper_script: PathBuf,
+    status_file: PathBuf,
+    replacement_temp: PathBuf,
+    backup_file: PathBuf,
+    rollback_displaced_file: PathBuf,
+}
+
+#[cfg(windows)]
+struct WindowsUpdateStaging {
+    directory: tempfile::TempDir,
+    status_file: PathBuf,
+}
+
+#[cfg(windows)]
+const WINDOWS_UPDATE_HELPER: &str = r#"param(
+    [Parameter(Mandatory = $true)][long] $ParentPid,
+    [Parameter(Mandatory = $true)][string] $StagingPath,
+    [Parameter(Mandatory = $true)][string] $StagedPath,
+    [Parameter(Mandatory = $true)][string] $StagedVersion,
+    [Parameter(Mandatory = $true)][string] $TargetPath,
+    [Parameter(Mandatory = $true)][string] $TempPath,
+    [Parameter(Mandatory = $true)][string] $BackupPath,
+    [Parameter(Mandatory = $true)][string] $RollbackDisplacedPath,
+    [Parameter(Mandatory = $true)][string] $StatusPath
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+function Write-UpdateStatus {
+    param([string] $State, [string] $Message)
+    $record = [ordered]@{
+        state = $State
+        message = $Message
+        parentPid = $ParentPid
+        staging = $StagingPath
+        target = $TargetPath
+        staged = $StagedPath
+        stagedVersion = $StagedVersion
+        backup = $BackupPath
+        rollbackDisplaced = $RollbackDisplacedPath
+        updatedAt = [DateTime]::UtcNow.ToString('o')
+    }
+    $json = $record | ConvertTo-Json -Compress
+    $statusTemp = $StatusPath + '.tmp'
+    [IO.File]::WriteAllText($statusTemp, $json, [Text.UTF8Encoding]::new($false))
+    Move-Item -LiteralPath $statusTemp -Destination $StatusPath -Force
+}
+
+function Assert-RegularFile {
+    param([string] $Path, [string] $Label)
+    $item = Get-Item -LiteralPath $Path -Force
+    if ($item.PSIsContainer -or $item.Length -le 0 -or
+        (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        throw "$Label is not a non-empty regular file"
+    }
+}
+
+function Assert-WindowsExecutable {
+    param([string] $Path, [string] $Label)
+    Assert-RegularFile -Path $Path -Label $Label
+    $stream = [IO.File]::OpenRead($Path)
+    try {
+        if ($stream.ReadByte() -ne 77 -or $stream.ReadByte() -ne 90) {
+            throw "$Label is not a Windows executable"
+        }
+    } finally {
+        $stream.Dispose()
+    }
+}
+
+function Assert-RealDirectory {
+    param([string] $Path, [string] $Label)
+    $item = Get-Item -LiteralPath $Path -Force
+    if (-not $item.PSIsContainer -or
+        (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        throw "$Label is not a real directory"
+    }
+}
+
+function Get-FileSha256 {
+    param([string] $Path)
+    $stream = [IO.File]::OpenRead($Path)
+    try {
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        try {
+            return ([BitConverter]::ToString($sha256.ComputeHash($stream))).Replace('-', '')
+        } finally {
+            $sha256.Dispose()
+        }
+    } finally {
+        $stream.Dispose()
+    }
+}
+
+function Remove-StagingPayload {
+    try {
+        $root = [IO.Path]::GetFullPath($StagingPath)
+        Assert-RealDirectory -Path $root -Label 'self-update staging directory'
+        $bin = [IO.Path]::Combine($root, 'bin')
+        $helper = [IO.Path]::Combine($root, 'apply-update.ps1')
+        foreach ($file in @(
+            $StagedPath,
+            [IO.Path]::Combine($root, '.crates.toml'),
+            [IO.Path]::Combine($root, '.crates2.json'),
+            $helper
+        )) {
+            if ([IO.File]::Exists($file)) {
+                [IO.File]::Delete($file)
+            }
+        }
+        if ([IO.Directory]::Exists($bin) -and
+            [IO.Directory]::GetFileSystemEntries($bin).Length -eq 0) {
+            [IO.Directory]::Delete($bin, $false)
+        }
+        if ([IO.Directory]::Exists($root) -and
+            [IO.Directory]::GetFileSystemEntries($root).Length -eq 0) {
+            [IO.Directory]::Delete($root, $false)
+        }
+    } catch {
+        # Cleanup is best-effort; update status and recovery files stay intact.
+    }
+}
+
+$replaced = $false
+try {
+    $stagingFull = [IO.Path]::GetFullPath($StagingPath)
+    $stagedFull = [IO.Path]::GetFullPath($StagedPath)
+    $targetFull = [IO.Path]::GetFullPath($TargetPath)
+    $tempFull = [IO.Path]::GetFullPath($TempPath)
+    $backupFull = [IO.Path]::GetFullPath($BackupPath)
+    $rollbackDisplacedFull = [IO.Path]::GetFullPath($RollbackDisplacedPath)
+    $helperFull = [IO.Path]::Combine($stagingFull, 'apply-update.ps1')
+    $statusFull = [IO.Path]::GetFullPath($StatusPath)
+    $targetDirectory = [IO.Path]::GetDirectoryName($targetFull)
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals(
+            [IO.Path]::GetDirectoryName([IO.Path]::GetDirectoryName($stagedFull)), $stagingFull) -or
+        -not [StringComparer]::OrdinalIgnoreCase.Equals(
+            [IO.Path]::GetDirectoryName($helperFull), $stagingFull) -or
+        -not [StringComparer]::OrdinalIgnoreCase.Equals(
+            [IO.Path]::GetFullPath($PSScriptRoot), $stagingFull) -or
+        -not [StringComparer]::OrdinalIgnoreCase.Equals(
+            [IO.Path]::GetDirectoryName($statusFull), [IO.Path]::GetDirectoryName($stagingFull)) -or
+        [string]::IsNullOrWhiteSpace($targetDirectory) -or
+        -not [StringComparer]::OrdinalIgnoreCase.Equals(
+            [IO.Path]::GetDirectoryName($tempFull), $targetDirectory) -or
+        -not [StringComparer]::OrdinalIgnoreCase.Equals(
+            [IO.Path]::GetDirectoryName($backupFull), $targetDirectory) -or
+        -not [StringComparer]::OrdinalIgnoreCase.Equals(
+            [IO.Path]::GetDirectoryName($rollbackDisplacedFull), $targetDirectory)) {
+        throw 'self-update paths are outside their validated staging or target directories'
+    }
+
+    Assert-RealDirectory -Path $stagingFull -Label 'self-update staging directory'
+    Assert-RealDirectory -Path $targetDirectory -Label 'target directory'
+    Assert-WindowsExecutable -Path $stagedFull -Label 'staged executable'
+    Assert-WindowsExecutable -Path $targetFull -Label 'current executable'
+    $expectedHash = Get-FileSha256 -Path $stagedFull
+    $originalTargetHash = Get-FileSha256 -Path $targetFull
+    if ([IO.File]::Exists($tempFull) -or [IO.File]::Exists($backupFull) -or
+        [IO.File]::Exists($rollbackDisplacedFull)) {
+        throw 'replacement, backup, or rollback path already exists'
+    }
+
+    Write-UpdateStatus -State 'waiting' -Message 'waiting for the current rpi process to exit'
+    if ($ParentPid -lt 1 -or $ParentPid -gt [int]::MaxValue) {
+        throw 'parent process id is outside the supported Windows range'
+    }
+    $parentProcess = $null
+    try {
+        $candidate = [Diagnostics.Process]::GetProcessById([int]$ParentPid)
+        try {
+            $candidatePath = [IO.Path]::GetFullPath($candidate.MainModule.FileName)
+            if ([StringComparer]::OrdinalIgnoreCase.Equals($candidatePath, $targetFull)) {
+                $parentProcess = $candidate
+            } else {
+                $candidate.Dispose()
+            }
+        } catch {
+            if ($candidate.HasExited) {
+                $candidate.Dispose()
+            } else {
+                throw
+            }
+        }
+    } catch [ArgumentException] {
+        # The invoking process exited before the helper acquired its handle.
+    }
+    if ($null -ne $parentProcess) {
+        try {
+            if (-not $parentProcess.WaitForExit(600000)) {
+                throw 'timed out waiting for the current rpi process to exit'
+            }
+        } finally {
+            $parentProcess.Dispose()
+        }
+    }
+
+    Assert-RealDirectory -Path $targetDirectory -Label 'target directory'
+    Assert-WindowsExecutable -Path $stagedFull -Label 'staged executable'
+    Assert-WindowsExecutable -Path $targetFull -Label 'current executable'
+    if ((Get-FileSha256 -Path $stagedFull) -ne $expectedHash) {
+        throw 'staged executable changed while waiting for rpi to exit'
+    }
+    if ((Get-FileSha256 -Path $targetFull) -ne $originalTargetHash) {
+        throw 'current executable changed while waiting for rpi to exit'
+    }
+    if ([IO.File]::Exists($tempFull) -or [IO.File]::Exists($backupFull) -or
+        [IO.File]::Exists($rollbackDisplacedFull)) {
+        throw 'replacement, backup, or rollback path appeared while waiting for rpi to exit'
+    }
+
+    [IO.File]::Copy($stagedFull, $tempFull, $false)
+    Assert-WindowsExecutable -Path $tempFull -Label 'replacement executable'
+    if ((Get-FileSha256 -Path $tempFull) -ne $expectedHash) {
+        throw 'replacement executable hash mismatch'
+    }
+
+    [IO.File]::Replace($tempFull, $targetFull, $backupFull, $true)
+    $replaced = $true
+    Assert-WindowsExecutable -Path $targetFull -Label 'updated executable'
+    if ((Get-FileSha256 -Path $targetFull) -ne $expectedHash) {
+        throw 'updated executable hash mismatch'
+    }
+} catch {
+    $failureMessage = $_.Exception.Message
+    $recoveryMessage = ''
+    if ($replaced -and [IO.File]::Exists($BackupPath)) {
+        try {
+            [IO.File]::Copy($BackupPath, $TempPath, $false)
+            Assert-WindowsExecutable -Path $TempPath -Label 'rollback executable'
+            if ((Get-FileSha256 -Path $TempPath) -ne $originalTargetHash) {
+                throw 'rollback executable hash mismatch'
+            }
+            [IO.File]::Replace($TempPath, $TargetPath, $RollbackDisplacedPath, $true)
+            Assert-WindowsExecutable -Path $TargetPath -Label 'restored executable'
+            if ((Get-FileSha256 -Path $TargetPath) -ne $originalTargetHash) {
+                throw 'restored executable hash mismatch'
+            }
+            $replaced = $false
+            try { [IO.File]::Delete($BackupPath) } catch {}
+            try { [IO.File]::Delete($RollbackDisplacedPath) } catch {}
+        } catch {
+            $rollbackFailure = $_.Exception.Message
+            if ([IO.File]::Exists($BackupPath)) {
+                $recoveryMessage = "; automatic rollback failed ($rollbackFailure); the original executable remains at $BackupPath"
+            } else {
+                $recoveryMessage = "; automatic rollback failed ($rollbackFailure) and no verified recovery backup remains"
+            }
+        }
+    }
+    if ([IO.File]::Exists($TempPath)) {
+        try { Remove-Item -LiteralPath $TempPath -Force } catch {}
+    }
+    try { Write-UpdateStatus -State 'failed' -Message ($failureMessage + $recoveryMessage) } catch {}
+    Remove-StagingPayload
+    exit 1
+}
+
+try { Write-UpdateStatus -State 'succeeded' -Message 'rpi executable replaced successfully' } catch {}
+if ([IO.File]::Exists($BackupPath)) {
+    try { Remove-Item -LiteralPath $BackupPath -Force } catch {}
+}
+Remove-StagingPayload
+exit 0
+"#;
+
+#[cfg(windows)]
+fn run_windows_self_update() -> i32 {
+    let staging = match create_windows_update_staging() {
+        Ok(staging) => staging,
+        Err(error) => {
+            eprintln!("error: could not create self-update staging directory: {error}");
+            return 1;
+        }
+    };
+    let staging_dir = staging.directory.path().to_path_buf();
+    let status_file = staging.status_file.clone();
+    let _ = write_windows_update_status(
+        &status_file,
+        "preparing",
+        "installing the update into staging",
+    );
+
+    let current_exe = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => {
+            let message = format!("could not resolve the current rpi executable: {error}");
+            let _ = write_windows_update_status(&status_file, "failed", &message);
+            eprintln!("error: {message}");
+            return 1;
+        }
+    };
+    let powershell = match system_powershell_path() {
+        Ok(path) => path,
+        Err(error) => {
+            let _ = write_windows_update_status(&status_file, "failed", &error);
+            eprintln!("error: {error}");
+            return 1;
+        }
+    };
+
+    let command_dir = match create_self_update_command_dir() {
+        Ok(directory) => directory,
+        Err(error) => {
+            let message = format!("could not create an isolated Cargo directory: {error}");
+            let _ = write_windows_update_status(&status_file, "failed", &message);
+            eprintln!("error: {message}");
+            return 1;
+        }
+    };
+    let mut cargo = match cargo_install_command(Some(&staging_dir), command_dir.path()) {
+        Ok(command) => command,
+        Err(error) => {
+            let message = format!("invalid isolated Cargo directory: {error}");
+            let _ = write_windows_update_status(&status_file, "failed", &message);
+            eprintln!("error: {message}");
+            return 1;
+        }
+    };
+    let status = cargo.status();
+    match status {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            let message = format!("cargo install exited with {status}");
+            let _ = write_windows_update_status(&status_file, "failed", &message);
+            eprintln!("error: {message}");
+            return 1;
+        }
+        Err(error) => {
+            let message = format!("could not run cargo (install Rust/Cargo first): {error}");
+            let _ = write_windows_update_status(&status_file, "failed", &message);
+            eprintln!("error: {message}");
+            return 1;
+        }
+    }
+
+    let plan = match build_windows_update_plan(&staging_dir, &current_exe, &status_file) {
+        Ok(plan) => plan,
+        Err(error) => {
+            let _ = write_windows_update_status(&status_file, "failed", &error);
+            eprintln!("error: {error}");
+            return 1;
+        }
+    };
+    let staged_version = match validate_staged_rpi(&plan) {
+        Ok(version) => version,
+        Err(error) => {
+            let _ = write_windows_update_status(&plan.status_file, "failed", &error);
+            eprintln!("error: {error}");
+            return 1;
+        }
+    };
+    if let Err(error) = preflight_windows_replacement(&plan) {
+        let _ = write_windows_update_status(&plan.status_file, "failed", &error);
+        eprintln!("error: {error}");
+        return 1;
+    }
+    if let Err(error) = std::fs::write(&plan.helper_script, WINDOWS_UPDATE_HELPER.as_bytes()) {
+        let message = format!("could not write the self-update helper: {error}");
+        let _ = write_windows_update_status(&plan.status_file, "failed", &message);
+        eprintln!("error: {message}");
+        return 1;
+    }
+    if validated_regular_file(&plan.helper_script, "self-update helper").is_err() {
+        let message = "self-update helper did not pass regular-file validation";
+        let _ = write_windows_update_status(&plan.status_file, "failed", message);
+        eprintln!("error: {message}");
+        return 1;
+    }
+    let _ = write_windows_update_status(
+        &plan.status_file,
+        "scheduled",
+        &format!("validated rpi {staged_version}; waiting to replace rpi after this process exits"),
+    );
+    let mut command = windows_update_helper_command(
+        &powershell,
+        &plan,
+        std::process::id(),
+        &staged_version.to_string(),
+    );
+    use std::os::windows::process::CommandExt;
+    command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    match command.spawn() {
+        Ok(_) => {
+            let persisted_staging = staging.directory.keep();
+            println!(
+                "rpi update staged; it will be applied after this process exits\nStatus: {}",
+                plan.status_file.display()
+            );
+            debug_assert!(windows_paths_equal(&persisted_staging, &plan.staging_dir));
+            0
+        }
+        Err(error) => {
+            let message = format!("could not start the self-update helper: {error}");
+            let _ = write_windows_update_status(&plan.status_file, "failed", &message);
+            eprintln!("error: {message}");
+            1
+        }
+    }
+}
+
+#[cfg(windows)]
+fn create_windows_update_staging() -> Result<WindowsUpdateStaging, String> {
+    let staging = create_self_update_staging_directory()?;
+    let update_root = staging
+        .path()
+        .parent()
+        .ok_or_else(|| "self-update staging directory has no parent".to_string())?;
+    let status_file = update_root.join(format!("status-{}.json", uuid::Uuid::new_v4().simple()));
+    if status_file.exists() {
+        return Err("self-update status path collision".to_string());
+    }
+    Ok(WindowsUpdateStaging {
+        directory: staging,
+        status_file,
+    })
+}
+
+#[cfg(windows)]
+fn build_windows_update_plan(
+    staging_dir: &Path,
+    target_exe: &Path,
+    status_file: &Path,
+) -> Result<WindowsUpdatePlan, String> {
+    let staging_dir = validated_real_directory(staging_dir, "self-update staging directory")?;
+    if !status_file.is_absolute() {
+        return Err("self-update status path must be absolute".to_string());
+    }
+    let status_parent = validated_real_directory(
+        status_file
+            .parent()
+            .ok_or_else(|| "self-update status path has no parent".to_string())?,
+        "self-update status directory",
+    )?;
+    if staging_dir.parent() != Some(status_parent.as_path()) {
+        return Err("self-update status file is outside the staging parent".to_string());
+    }
+    let status_name = status_file
+        .file_name()
+        .ok_or_else(|| "self-update status file has no name".to_string())?;
+    if !is_self_update_status_name(status_name) {
+        return Err("self-update status file has an invalid name".to_string());
+    }
+    if status_file.exists() {
+        validated_regular_file(status_file, "self-update status file")?;
+    }
+    let staged_exe = validated_windows_executable(
+        &staging_dir.join("bin").join("rpi.exe"),
+        "staged rpi executable",
+    )?;
+    let target_exe = validated_windows_executable(target_exe, "current rpi executable")?;
+    let target_dir = validated_real_directory(
+        target_exe
+            .parent()
+            .ok_or_else(|| "current executable has no parent directory".to_string())?,
+        "current executable directory",
+    )?;
+    if target_exe.parent() != Some(target_dir.as_path()) {
+        return Err("current executable is not a direct child of its validated directory".into());
+    }
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    let replacement_temp = target_dir.join(format!(".rpi-update-{token}.new.exe"));
+    let backup_file = target_dir.join(format!(".rpi-update-{token}.old.exe"));
+    let rollback_displaced_file = target_dir.join(format!(".rpi-update-{token}.rollback-new.exe"));
+    if replacement_temp.exists() || backup_file.exists() || rollback_displaced_file.exists() {
+        return Err("self-update replacement path collision".to_string());
+    }
+
+    Ok(WindowsUpdatePlan {
+        staging_dir: staging_dir.clone(),
+        staged_exe,
+        target_exe,
+        helper_script: staging_dir.join("apply-update.ps1"),
+        status_file: status_file.to_path_buf(),
+        replacement_temp,
+        backup_file,
+        rollback_displaced_file,
+    })
+}
+
+#[cfg(windows)]
+fn preflight_windows_replacement(plan: &WindowsUpdatePlan) -> Result<(), String> {
+    for path in [
+        &plan.replacement_temp,
+        &plan.backup_file,
+        &plan.rollback_displaced_file,
+    ] {
+        if path.exists() {
+            return Err(format!(
+                "self-update path already exists: {}",
+                path.display()
+            ));
+        }
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|error| format!("cannot write beside the current executable: {error}"))?;
+        drop(file);
+        std::fs::remove_file(path)
+            .map_err(|error| format!("could not remove self-update probe: {error}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_staged_rpi(plan: &WindowsUpdatePlan) -> Result<semver::Version, String> {
+    let cwd = plan
+        .helper_script
+        .parent()
+        .ok_or_else(|| "self-update staging directory is missing".to_string())?;
+    validate_rpi_executable_version(&plan.staged_exe, cwd, crate::VERSION, "staged rpi")
+}
+
+/// Captured output of a bounded self-update probe.
+struct BoundedProcessOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Run a short-lived probe under both a wall-clock and an output cap.
+///
+/// The child runs on its own thread and current-thread runtime so this stays
+/// safe when `rpi update` is entered from inside a Tokio runtime. The old
+/// implementation reused the npm bridge's process runner, which went away with
+/// the Pi compatibility layer.
+fn run_bounded_process_blocking(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    timeout: std::time::Duration,
+    max_output_bytes: usize,
+) -> Result<BoundedProcessOutput, String> {
+    let program = program.to_string();
+    let args = args.to_vec();
+    let cwd = cwd.to_path_buf();
+    std::thread::Builder::new()
+        .name("rpi-bounded-version-probe".to_string())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| format!("probe runtime failed: {error}"))?;
+            runtime.block_on(async move {
+                let child = tokio::process::Command::new(&program)
+                    .args(&args)
+                    .current_dir(&cwd)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .kill_on_drop(true)
+                    .spawn()
+                    .map_err(|error| format!("spawn failed: {error}"))?;
+                let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+                    Ok(result) => result.map_err(|error| format!("wait failed: {error}"))?,
+                    // Dropping the future drops the child, which `kill_on_drop`
+                    // turns into a kill.
+                    Err(_) => return Err(format!("timed out after {timeout:?}")),
+                };
+                Ok(BoundedProcessOutput {
+                    status: output.status,
+                    stdout: cap_bytes(output.stdout, max_output_bytes),
+                    stderr: cap_bytes(output.stderr, max_output_bytes),
+                })
+            })
+        })
+        .map_err(|error| format!("probe thread failed: {error}"))?
+        .join()
+        .map_err(|_| "probe worker panicked".to_string())?
+}
+
+fn cap_bytes(bytes: Vec<u8>, limit: usize) -> Vec<u8> {
+    if bytes.len() <= limit {
+        bytes
+    } else {
+        bytes[..limit].to_vec()
+    }
+}
+
+fn validate_rpi_executable_version(
+    executable: &Path,
+    cwd: &Path,
+    current: &str,
+    label: &str,
+) -> Result<semver::Version, String> {
+    let program = executable
+        .to_str()
+        .ok_or_else(|| format!("{label} path cannot be represented as Unicode"))?;
+    let args = vec!["--version".to_string()];
+    let output = run_bounded_process_blocking(
+        program,
+        &args,
+        cwd,
+        STAGED_RPI_CHECK_TIMEOUT,
+        MAX_STAGED_RPI_OUTPUT_BYTES,
+    )
+    .map_err(|error| format!("{label} version check failed: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("{label} --version exited with {}", output.status));
+    }
+    validate_staged_rpi_version_output(&output.stdout, &output.stderr, current)
+}
+
+fn validate_staged_rpi_version_output(
+    stdout: &[u8],
+    stderr: &[u8],
+    current: &str,
+) -> Result<semver::Version, String> {
+    if !stderr.is_empty() {
+        return Err("staged rpi --version wrote unexpected stderr output".to_string());
+    }
+    let staged = parse_rpi_version_output(stdout)
+        .ok_or_else(|| "staged rpi returned an invalid --version response".to_string())?;
+    let current = semver::Version::parse(current)
+        .map_err(|_| "the running rpi version is not valid semantic versioning".to_string())?;
+    if staged < current {
+        return Err(format!(
+            "refusing to replace rpi {current} with older version {staged}"
+        ));
+    }
+    Ok(staged)
+}
+
+fn parse_rpi_version_output(output: &[u8]) -> Option<semver::Version> {
+    let output = std::str::from_utf8(output).ok()?;
+    let line = output
+        .strip_suffix("\r\n")
+        .or_else(|| output.strip_suffix('\n'))
+        .unwrap_or(output);
+    if line.contains(['\r', '\n']) {
+        return None;
+    }
+    let version = line.strip_prefix(crate::APP_NAME)?.strip_prefix(' ')?;
+    if version.is_empty() || version.chars().any(char::is_whitespace) {
+        return None;
+    }
+    semver::Version::parse(version).ok()
+}
+
+/// A real directory *by its own entry*: the leaf is not a link, so the update
+/// is free to write into it. Links further up are resolved rather than
+/// refused — a launch path such as `C:\tools\current\rpi.exe` where `current`
+/// is a junction names the real install directory, which is exactly what an
+/// update should rewrite.
+fn validated_real_directory(path: &Path, label: &str) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err(format!("{label} must be absolute"));
+    }
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("could not inspect {label}: {error}"))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "{label} is a link or junction, not a real directory ({} -> {})",
+            path.display(),
+            canonical_display(path),
+        ));
+    }
+    if !metadata.is_dir() {
+        return Err(format!("{label} is not a real directory"));
+    }
+    std::fs::canonicalize(path)
+        .map(normalize_windows_path)
+        .map_err(|error| format!("could not canonicalize {label}: {error}"))
+}
+
+/// A non-empty regular file *by its own entry*: a link to a file is refused
+/// with both paths named, because replacing the link would leave the real
+/// target stale. Ancestor links are resolved, as in
+/// [`validated_real_directory`].
+fn validated_regular_file(path: &Path, label: &str) -> Result<PathBuf, String> {
+    if !path.is_absolute() {
+        return Err(format!("{label} must be absolute"));
+    }
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("could not inspect {label}: {error}"))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "{label} is a link or junction, not a non-empty regular file ({} -> {})",
+            path.display(),
+            canonical_display(path),
+        ));
+    }
+    if !metadata.is_file() || metadata.len() == 0 {
+        return Err(format!("{label} is not a non-empty regular file"));
+    }
+    std::fs::canonicalize(path)
+        .map(normalize_windows_path)
+        .map_err(|error| format!("could not canonicalize {label}: {error}"))
+}
+
+fn is_self_update_status_name(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let Some(token) = name
+        .strip_prefix("status-")
+        .and_then(|name| name.strip_suffix(".json"))
+    else {
+        return false;
+    };
+    token.len() == 32 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn validated_self_update_status_file(update_root: &Path, path: &Path) -> Result<PathBuf, String> {
+    if !path.is_absolute() || path.parent() != Some(update_root) {
+        return Err("self-update status file is outside the update root".to_string());
+    }
+    if !path.file_name().is_some_and(is_self_update_status_name) {
+        return Err("self-update status file has an invalid name".to_string());
+    }
+    let path = validated_regular_file(path, "self-update status file")?;
+    let length = std::fs::metadata(&path)
+        .map_err(|error| format!("could not inspect self-update status file: {error}"))?
+        .len();
+    if length > MAX_SELF_UPDATE_STATUS_BYTES {
+        return Err("self-update status file is too large".to_string());
+    }
+    Ok(path)
+}
+
+fn read_self_update_status(path: &Path) -> Option<SelfUpdateStatus> {
+    use std::io::Read;
+
+    let file = std::fs::File::open(path).ok()?;
+    let mut data = Vec::with_capacity(
+        usize::try_from(MAX_SELF_UPDATE_STATUS_BYTES)
+            .unwrap_or_default()
+            .min(8 * 1024),
+    );
+    file.take(MAX_SELF_UPDATE_STATUS_BYTES.saturating_add(1))
+        .read_to_end(&mut data)
+        .ok()?;
+    if data.len() as u64 > MAX_SELF_UPDATE_STATUS_BYTES {
+        return None;
+    }
+    serde_json::from_slice(&data).ok()
+}
+
+fn sanitized_self_update_status_message(message: &str) -> String {
+    let mut sanitized = String::new();
+    let mut pending_space = false;
+    let mut truncated = false;
+    for character in message.trim().chars() {
+        if character.is_control() || character.is_whitespace() {
+            pending_space = !sanitized.is_empty();
+            continue;
+        }
+        if sanitized.chars().count() >= MAX_SELF_UPDATE_STATUS_MESSAGE_CHARS {
+            truncated = true;
+            break;
+        }
+        if pending_space {
+            sanitized.push(' ');
+            pending_space = false;
+        }
+        sanitized.push(character);
+    }
+    if sanitized.is_empty() {
+        return "no diagnostic message was recorded".to_string();
+    }
+    if truncated {
+        sanitized.push_str("...");
+    }
+    sanitized
+}
+
+fn consume_self_update_statuses(agent_dir: &Path) -> Vec<UpdateWarning> {
+    let _guard = SELF_UPDATE_STATUS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let agent_dir = match validated_real_directory(agent_dir, "agent directory") {
+        Ok(path) => path,
+        Err(_) => return Vec::new(),
+    };
+    let update_root = match validated_real_directory(
+        &agent_dir.join("self-update"),
+        "self-update status directory",
+    ) {
+        Ok(path) if path.parent() == Some(agent_dir.as_path()) => path,
+        _ => return Vec::new(),
+    };
+    let entries = match std::fs::read_dir(&update_root) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut warnings = Vec::new();
+    for entry in entries.flatten() {
+        if !is_self_update_status_name(&entry.file_name()) {
+            continue;
+        }
+        let path = match validated_self_update_status_file(&update_root, &entry.path()) {
+            Ok(path) => path,
+            Err(_) => continue,
+        };
+        let Some(status) = read_self_update_status(&path) else {
+            continue;
+        };
+        if !matches!(status.state.as_str(), "failed" | "succeeded") {
+            continue;
+        }
+
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            // A failure is still actionable even when cleanup is denied. Keep
+            // the file so a later startup can retry consumption.
+            Err(_) if status.state == "failed" => {}
+            Err(_) => continue,
+        }
+        if status.state == "failed" {
+            warnings.push(UpdateWarning {
+                message: format!(
+                    "The previously scheduled rpi update failed: {}",
+                    sanitized_self_update_status_message(&status.message)
+                ),
+                command: "rpi update".to_string(),
+            });
+        }
+    }
+    warnings
+}
+
+#[cfg(windows)]
+fn validated_windows_executable(path: &Path, label: &str) -> Result<PathBuf, String> {
+    use std::io::Read;
+
+    let path = validated_regular_file(path, label)?;
+    let mut file =
+        std::fs::File::open(&path).map_err(|error| format!("could not open {label}: {error}"))?;
+    let mut magic = [0u8; 2];
+    file.read_exact(&mut magic)
+        .map_err(|error| format!("could not read {label}: {error}"))?;
+    if magic != *b"MZ" {
+        return Err(format!("{label} is not a Windows executable"));
+    }
+    Ok(path)
+}
+
+#[cfg(windows)]
+fn system_powershell_path() -> Result<PathBuf, String> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::SystemInformation::GetWindowsDirectoryW;
+
+    let mut buffer = vec![0u16; 260];
+    let system_root = loop {
+        let length = unsafe {
+            GetWindowsDirectoryW(
+                buffer.as_mut_ptr(),
+                u32::try_from(buffer.len()).unwrap_or(u32::MAX),
+            )
+        };
+        if length == 0 {
+            return Err(format!(
+                "could not locate the Windows system directory: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let length = usize::try_from(length)
+            .map_err(|error| format!("invalid Windows system directory length: {error}"))?;
+        if length < buffer.len() {
+            buffer.truncate(length);
+            break PathBuf::from(OsString::from_wide(&buffer));
+        }
+        buffer.resize(length.saturating_add(1), 0);
+    };
+    let system_root = validated_real_directory(&system_root, "Windows system root")?;
+    let powershell = validated_windows_executable(
+        &system_root.join("System32/WindowsPowerShell/v1.0/powershell.exe"),
+        "Windows PowerShell",
+    )?;
+    powershell
+        .strip_prefix(&system_root)
+        .map_err(|_| "Windows PowerShell is outside SystemRoot".to_string())?;
+    Ok(powershell)
+}
+
+#[cfg(windows)]
+fn windows_update_helper_command(
+    powershell: &Path,
+    plan: &WindowsUpdatePlan,
+    parent_pid: u32,
+    staged_version: &str,
+) -> std::process::Command {
+    let mut command = std::process::Command::new(powershell);
+    let powershell_modules = powershell
+        .parent()
+        .expect("validated PowerShell path has a parent")
+        .join("Modules");
+    command
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(&plan.helper_script)
+        .arg("-ParentPid")
+        .arg(parent_pid.to_string())
+        .arg("-StagingPath")
+        .arg(&plan.staging_dir)
+        .arg("-StagedPath")
+        .arg(&plan.staged_exe)
+        .arg("-StagedVersion")
+        .arg(staged_version)
+        .arg("-TargetPath")
+        .arg(&plan.target_exe)
+        .arg("-TempPath")
+        .arg(&plan.replacement_temp)
+        .arg("-BackupPath")
+        .arg(&plan.backup_file)
+        .arg("-RollbackDisplacedPath")
+        .arg(&plan.rollback_displaced_file)
+        .arg("-StatusPath")
+        .arg(&plan.status_file)
+        .current_dir(
+            plan.status_file
+                .parent()
+                .expect("validated status path has an update-root parent"),
+        )
+        .env("PSModulePath", powershell_modules)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
+#[cfg(windows)]
+fn write_windows_update_status(path: &Path, state: &str, message: &str) -> Result<(), String> {
+    let data = serde_json::to_vec_pretty(&serde_json::json!({
+        "state": state,
+        "message": message,
+        "parentPid": std::process::id(),
+        "currentVersion": crate::VERSION,
+        "updatedAtMs": now_ms(),
+    }))
+    .map_err(|error| error.to_string())?;
+    std::fs::write(path, data)
+        .map_err(|error| format!("could not write update status {}: {error}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    /// Fixtures may live under an ambient TEMP that is itself a junction
+    /// (e.g. `D:\Temp` on some Windows hosts). Ancestor links are resolved by
+    /// the path validation rather than refused, so a plain `tempdir()` is a
+    /// valid fixture — and using one keeps these tests honest about that.
+    fn real_tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("rpi-update-test-")
+            .tempdir()
+            .unwrap()
+    }
+
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    #[cfg(unix)]
+    use super::{activate_direct_update, build_direct_update_plan};
+    #[cfg(windows)]
+    use super::{
+        build_windows_update_plan, preflight_windows_replacement, system_powershell_path,
+        windows_update_helper_command, write_windows_update_status, WINDOWS_UPDATE_HELPER,
+    };
+    use super::{
+        cargo_home_is_project_local, cargo_install_command, collect_bounded,
+        create_self_update_command_dir, fetch_crates_url, is_newer, parse_rpi_version_output,
+        path_is_within, results_with_individual_cache_fallback, validate_staged_rpi_version_output,
+        RegistryLookup, CACHE_FALLBACK_MAX_AGE_MS, UPDATE_CHECK_CONCURRENCY,
+    };
+
+    struct RestoreConfigDir(Option<OsString>);
+
+    impl Drop for RestoreConfigDir {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var(crate::config::CONFIG_DIR_ENV, value),
+                None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
+            }
+        }
+    }
+
+    struct RestoreEnv {
+        name: &'static str,
+        value: Option<OsString>,
+    }
+
+    impl RestoreEnv {
+        fn capture(name: &'static str) -> Self {
+            Self {
+                name,
+                value: std::env::var_os(name),
+            }
+        }
+    }
+
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            match self.value.take() {
+                Some(value) => std::env::set_var(self.name, value),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn fake_windows_executable(path: &Path, marker: &[u8]) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut bytes = b"MZ".to_vec();
+        bytes.extend_from_slice(marker);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn fake_unix_rpi(path: &Path, version: &str, fail_after_rename_to: Option<&str>) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let failure = fail_after_rename_to.map_or_else(String::new, |name| {
+            format!(
+                "case \"$0\" in\n  */{name}) echo 'post-replace failure' >&2; exit 1 ;;\nesac\n"
+            )
+        });
+        std::fs::write(
+            path,
+            format!("#!/bin/sh\n{failure}printf 'rpi {version}\\n'\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn write_test_update_status(path: &Path, state: &str, message: &str) {
+        std::fs::write(
+            path,
+            serde_json::to_vec(&serde_json::json!({
+                "state": state,
+                "message": message,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn path_validation_resolves_ancestor_links_but_refuses_a_link_leaf() {
+        let temp = real_tempdir();
+        // Real targets, plus a link directory that points at one of them.
+        let real_dir = temp.path().join("real-dir");
+        let real_file = temp.path().join("real-file.exe");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        std::fs::write(&real_file, b"payload").unwrap();
+
+        let link_dir = temp.path().join("link-dir");
+        let link_file = temp.path().join("link-file.exe");
+        #[cfg(unix)]
+        let linked = {
+            std::os::unix::fs::symlink(&real_dir, &link_dir).unwrap();
+            std::os::unix::fs::symlink(&real_file, &link_file).unwrap();
+            true
+        };
+        #[cfg(windows)]
+        let linked = {
+            // Junctions need no elevation; file symlinks do, so skip the file
+            // half when this process cannot create one.
+            let dir_ok = std::process::Command::new("cmd")
+                .args(["/c", "mklink", "/J"])
+                .arg(&link_dir)
+                .arg(&real_dir)
+                .output()
+                .map(|out| out.status.success())
+                .unwrap_or(false);
+            if dir_ok {
+                let file_ok = std::os::windows::fs::symlink_file(&real_file, &link_file).is_ok();
+                if !file_ok {
+                    eprintln!("skipping the file-link half: no symlink privilege");
+                }
+            }
+            dir_ok
+        };
+        if !linked {
+            eprintln!("skipping: this platform could not create the link fixture");
+            return;
+        }
+
+        // A file *below* a linked directory resolves: the link is an ancestor,
+        // not the thing being written.
+        let through_link = link_dir.join("nested").join("leaf.exe");
+        std::fs::create_dir_all(through_link.parent().unwrap()).unwrap();
+        std::fs::write(&through_link, b"payload").unwrap();
+        super::validated_regular_file(&through_link, "file below a linked directory").unwrap();
+        assert_eq!(
+            std::fs::canonicalize(&link_dir).unwrap(),
+            std::fs::canonicalize(&real_dir).unwrap(),
+        );
+
+        // A link *leaf* is still refused, and the error names both paths.
+        let error = super::validated_real_directory(&link_dir, "linked directory").unwrap_err();
+        assert!(error.contains("link or junction"), "{error}");
+        assert!(error.contains(&link_dir.display().to_string()), "{error}");
+
+        if link_file.exists() {
+            let error = super::validated_regular_file(&link_file, "linked file").unwrap_err();
+            assert!(error.contains("link or junction"), "{error}");
+            assert!(error.contains(&link_file.display().to_string()), "{error}");
+            assert!(error.contains(&real_file.display().to_string()), "{error}");
+        }
+
+        // The link leaf check must not be a blanket refusal: the real targets
+        // still validate.
+        super::validated_real_directory(&real_dir, "real directory").unwrap();
+        super::validated_regular_file(&real_file, "real file").unwrap();
+    }
+
+    #[test]
+    fn cargo_self_update_staging_is_passed_as_a_structured_argument() {
+        let temp = real_tempdir();
+        let staging = temp.path().join("staging");
+        let command_dir = temp.path().join("command");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&command_dir).unwrap();
+        let command = cargo_install_command(Some(&staging), &command_dir).unwrap();
+        let args = command.get_args().map(OsString::from).collect::<Vec<_>>();
+
+        assert_eq!(command.get_program(), "cargo");
+        assert_eq!(args.len(), 7);
+        assert_eq!(args[0], "install");
+        assert_eq!(args[1], "--root");
+        assert_eq!(args[2], staging.as_os_str());
+        assert_eq!(args[3], "rpi-cli");
+        assert_eq!(args[4], "--locked");
+        assert_eq!(args[5], "--force");
+        // Suppresses cargo's "add this to your PATH" advice, which names the
+        // staging root that the atomic replace is about to consume.
+        assert_eq!(args[6], "--quiet");
+        assert_eq!(command.get_current_dir(), Some(command_dir.as_path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_update_replaces_the_selected_target_and_rejects_downgrades() {
+        let temp = real_tempdir();
+        let staging = temp.path().join("staging");
+        let staged = staging.join("bin/rpi");
+        let target = temp.path().join("target/rpi-current");
+        fake_unix_rpi(&staged, "9.9.9", None);
+        fake_unix_rpi(&target, crate::VERSION, None);
+        let expected = std::fs::read(&staged).unwrap();
+
+        let plan = build_direct_update_plan(&staging, &target).unwrap();
+        assert_eq!(activate_direct_update(&plan).unwrap().to_string(), "9.9.9");
+        assert_eq!(std::fs::read(&target).unwrap(), expected);
+        assert!(!plan.replacement_temp.exists());
+        assert!(!plan.backup_file.exists());
+
+        fake_unix_rpi(&staged, "0.0.1", None);
+        let plan = build_direct_update_plan(&staging, &target).unwrap();
+        let error = activate_direct_update(&plan).unwrap_err();
+        assert!(error.contains("older version"), "{error}");
+        assert_eq!(std::fs::read(&target).unwrap(), expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_update_rolls_back_when_post_replace_validation_fails() {
+        let temp = real_tempdir();
+        let staging = temp.path().join("staging");
+        let staged = staging.join("bin/rpi");
+        let target = temp.path().join("target/rpi-current");
+        fake_unix_rpi(&staged, "9.9.9", Some("rpi-current"));
+        fake_unix_rpi(&target, crate::VERSION, None);
+        let original = std::fs::read(&target).unwrap();
+
+        let plan = build_direct_update_plan(&staging, &target).unwrap();
+        let error = activate_direct_update(&plan).unwrap_err();
+
+        assert!(error.contains("restored the previous"), "{error}");
+        assert_eq!(std::fs::read(&target).unwrap(), original);
+        assert!(!plan.replacement_temp.exists());
+        assert!(!plan.backup_file.exists());
+    }
+
+    #[test]
+    fn self_update_honors_env_and_early_dispatched_offline_flag() {
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        let _restore = RestoreEnv::capture(crate::args::RPI_OFFLINE_ENV);
+
+        std::env::set_var(crate::args::RPI_OFFLINE_ENV, "tRuE");
+        assert_eq!(super::run_self_update(&[]), 0);
+
+        std::env::set_var(crate::args::RPI_OFFLINE_ENV, "0");
+        assert_eq!(super::run_self_update(&["--offline".into()]), 0);
+        assert_eq!(
+            std::env::var(crate::args::RPI_OFFLINE_ENV).as_deref(),
+            Ok("1")
+        );
+    }
+
+    #[tokio::test]
+    async fn offline_skips_rpi_startup_checks_before_cache_io() {
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        let _restore_config = RestoreConfigDir(std::env::var_os(crate::config::CONFIG_DIR_ENV));
+        let _restore_offline = RestoreEnv::capture(crate::args::RPI_OFFLINE_ENV);
+        let _restore_disabled = RestoreEnv::capture("RPI_DISABLE_UPDATE_CHECK");
+        let temp = real_tempdir();
+        let agent = temp.path().join("offline-agent");
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
+        std::env::set_var(crate::args::RPI_OFFLINE_ENV, "YES");
+        std::env::remove_var("RPI_DISABLE_UPDATE_CHECK");
+
+        let report = super::check_rpi_startup().await;
+
+        assert_eq!(report, super::UpdateReport::default());
+        assert!(
+            !agent.exists(),
+            "offline checks must not create the update cache directory"
+        );
+    }
+
+    #[test]
+    fn completed_self_update_statuses_are_consumed_once() {
+        let temp = real_tempdir();
+        let agent = temp.path().join("agent");
+        let update_root = agent.join("self-update");
+        std::fs::create_dir_all(&update_root).unwrap();
+        let failed = update_root.join("status-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json");
+        let succeeded = update_root.join("status-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.json");
+        let waiting = update_root.join("status-cccccccccccccccccccccccccccccccc.json");
+        let temporary = update_root.join("status-dddddddddddddddddddddddddddddddd.json.tmp");
+        let malformed = update_root.join("status-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.json");
+        let invalid_name = update_root.join("status-not-a-uuid.json");
+        write_test_update_status(&failed, "failed", "permission\u{1b}[31m\r\n denied\u{7}");
+        write_test_update_status(&succeeded, "succeeded", "done");
+        write_test_update_status(&waiting, "waiting", "still running");
+        write_test_update_status(&temporary, "failed", "not published");
+        std::fs::write(&malformed, b"{not-json").unwrap();
+        write_test_update_status(&invalid_name, "failed", "invalid name");
+
+        let warnings = super::consume_self_update_statuses(&agent);
+
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0]
+            .message
+            .contains("rpi update failed: permission [31m denied"));
+        assert!(!warnings[0].message.chars().any(char::is_control));
+        assert_eq!(warnings[0].command, "rpi update");
+        assert!(!failed.exists());
+        assert!(!succeeded.exists());
+        assert!(waiting.exists());
+        assert!(temporary.exists());
+        assert!(malformed.exists());
+        assert!(invalid_name.exists());
+        assert!(super::consume_self_update_statuses(&agent).is_empty());
+    }
+
+    #[test]
+    fn self_update_status_validation_rejects_escape_and_links() {
+        let temp = real_tempdir();
+        let agent = temp.path().join("agent");
+        let update_root = agent.join("self-update");
+        let outside_root = temp.path().join("outside");
+        std::fs::create_dir_all(&update_root).unwrap();
+        std::fs::create_dir_all(&outside_root).unwrap();
+        let name = "status-ffffffffffffffffffffffffffffffff.json";
+        let outside = outside_root.join(name);
+        write_test_update_status(&outside, "failed", "outside");
+
+        assert!(super::validated_self_update_status_file(&update_root, &outside).is_err());
+
+        let linked = update_root.join(name);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &linked).unwrap();
+        #[cfg(windows)]
+        let link_created = std::os::windows::fs::symlink_file(&outside, &linked).is_ok();
+        #[cfg(unix)]
+        let link_created = true;
+        if link_created {
+            assert!(super::validated_self_update_status_file(&update_root, &linked).is_err());
+            assert!(super::consume_self_update_statuses(&agent).is_empty());
+            assert!(outside.exists());
+        }
+    }
+
+    #[test]
+    fn cargo_self_update_without_staging_never_inherits_the_callers_cwd() {
+        let temp = real_tempdir();
+        let command_dir = temp.path().join("isolated");
+        std::fs::create_dir_all(&command_dir).unwrap();
+
+        let command = cargo_install_command(None, &command_dir).unwrap();
+        let args = command.get_args().map(OsString::from).collect::<Vec<_>>();
+
+        assert_eq!(
+            args,
+            ["install", "rpi-cli", "--locked", "--force", "--quiet"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(command.get_current_dir(), Some(command_dir.as_path()));
+        assert_ne!(
+            command.get_current_dir(),
+            std::env::current_dir().ok().as_deref()
+        );
+        for variable in [
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "CARGO_BUILD_RUSTC_WRAPPER",
+            "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+        ] {
+            assert!(command
+                .get_envs()
+                .any(|(name, value)| name == variable && value.is_none()));
+        }
+        assert!(cargo_install_command(None, Path::new("relative-command-dir")).is_err());
+
+        let generated = create_self_update_command_dir().unwrap();
+        let caller = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        assert!(generated.path().is_absolute());
+        assert!(!path_is_within(generated.path(), &caller));
+    }
+
+    #[test]
+    fn project_local_cargo_home_is_rejected_even_when_its_leaf_is_missing() {
+        let temp = real_tempdir();
+        let project = temp.path().join("project");
+        let global = temp.path().join("global-cargo");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&global).unwrap();
+        let project = std::fs::canonicalize(project).unwrap();
+
+        assert!(cargo_home_is_project_local(&project.join(".cargo-home"), &project).unwrap());
+        assert!(cargo_home_is_project_local(&project, &project).unwrap());
+        assert!(!cargo_home_is_project_local(&global, &project).unwrap());
+        assert!(cargo_home_is_project_local(Path::new("relative"), &project).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_update_helper_atomically_replaces_a_valid_target() {
+        let temp = real_tempdir();
+        let staging = temp.path().join("staging 'semi;& with spaces");
+        let staged = staging.join("bin/rpi.exe");
+        let target = temp.path().join("target 'semi;& with spaces/rpi-copy.exe");
+        fake_windows_executable(&staged, b"new-version");
+        fake_windows_executable(&target, b"old-version");
+        let expected = std::fs::read(&staged).unwrap();
+        let plan = build_windows_update_plan(
+            &staging,
+            &target,
+            &temp
+                .path()
+                .join("status-00000000000000000000000000000000.json"),
+        )
+        .unwrap();
+        preflight_windows_replacement(&plan).unwrap();
+        std::fs::write(&plan.helper_script, WINDOWS_UPDATE_HELPER).unwrap();
+        write_windows_update_status(&plan.status_file, "scheduled", "test").unwrap();
+
+        let powershell = system_powershell_path().unwrap();
+        let mut command =
+            windows_update_helper_command(&powershell, &plan, i32::MAX as u32, "9.9.9");
+        let args = command.get_args().map(OsString::from).collect::<Vec<_>>();
+        for (flag, expected) in [
+            ("-StagingPath", &plan.staging_dir),
+            ("-StagedPath", &plan.staged_exe),
+            ("-TargetPath", &plan.target_exe),
+            ("-TempPath", &plan.replacement_temp),
+            ("-BackupPath", &plan.backup_file),
+            ("-RollbackDisplacedPath", &plan.rollback_displaced_file),
+            ("-StatusPath", &plan.status_file),
+        ] {
+            let index = args.iter().position(|arg| arg == flag).unwrap();
+            assert_eq!(args[index + 1], expected.as_os_str());
+        }
+        let version_index = args.iter().position(|arg| arg == "-StagedVersion").unwrap();
+        assert_eq!(args[version_index + 1], "9.9.9");
+        assert_eq!(command.get_current_dir(), plan.status_file.parent());
+        assert!(command.get_envs().any(|(name, value)| {
+            name == "PSModulePath"
+                && value == Some(powershell.parent().unwrap().join("Modules").as_os_str())
+        }));
+        let status = command.status().unwrap();
+
+        let status_text = std::fs::read_to_string(&plan.status_file).unwrap();
+        assert!(
+            status.success(),
+            "helper exited with {status}: {status_text}"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), expected);
+        assert!(!staging.exists());
+        assert!(!plan.replacement_temp.exists());
+        assert!(!plan.backup_file.exists());
+        assert!(!plan.rollback_displaced_file.exists());
+        let status: serde_json::Value = serde_json::from_str(&status_text).unwrap();
+        assert_eq!(status["state"], "succeeded");
+        assert_eq!(status["stagedVersion"], "9.9.9");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_update_helper_failure_preserves_the_old_executable() {
+        let temp = real_tempdir();
+        let staging = temp.path().join("staging with spaces");
+        let staged = staging.join("bin/rpi.exe");
+        let target = temp.path().join("target with spaces/rpi-copy.exe");
+        fake_windows_executable(&staged, b"new-version");
+        fake_windows_executable(&target, b"old-version");
+        let expected = std::fs::read(&target).unwrap();
+        let plan = build_windows_update_plan(
+            &staging,
+            &target,
+            &temp
+                .path()
+                .join("status-00000000000000000000000000000000.json"),
+        )
+        .unwrap();
+        preflight_windows_replacement(&plan).unwrap();
+        std::fs::write(&plan.helper_script, WINDOWS_UPDATE_HELPER).unwrap();
+        write_windows_update_status(&plan.status_file, "scheduled", "test").unwrap();
+        std::fs::remove_file(&plan.staged_exe).unwrap();
+
+        let status = windows_update_helper_command(
+            &system_powershell_path().unwrap(),
+            &plan,
+            i32::MAX as u32,
+            "9.9.9",
+        )
+        .status()
+        .unwrap();
+
+        let status_text = std::fs::read_to_string(&plan.status_file).unwrap();
+        assert!(!status.success());
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            expected,
+            "status={status_text}; backup_exists={}",
+            plan.backup_file.exists()
+        );
+        assert!(!staging.exists());
+        assert!(!plan.replacement_temp.exists());
+        assert!(!plan.backup_file.exists());
+        assert!(!plan.rollback_displaced_file.exists());
+        let status: serde_json::Value = serde_json::from_str(&status_text).unwrap();
+        assert_eq!(status["state"], "failed");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_update_helper_rolls_back_after_post_replace_validation_failure() {
+        let temp = real_tempdir();
+        let staging = temp.path().join("staging");
+        let staged = staging.join("bin/rpi.exe");
+        let target = temp.path().join("target/rpi-copy.exe");
+        fake_windows_executable(&staged, b"new-version");
+        fake_windows_executable(&target, b"old-version");
+        let expected = std::fs::read(&target).unwrap();
+        let plan = build_windows_update_plan(
+            &staging,
+            &target,
+            &temp
+                .path()
+                .join("status-00000000000000000000000000000000.json"),
+        )
+        .unwrap();
+        preflight_windows_replacement(&plan).unwrap();
+        let forced_failure = WINDOWS_UPDATE_HELPER.replace(
+            "(Get-FileSha256 -Path $targetFull) -ne $expectedHash",
+            "$true",
+        );
+        assert_ne!(forced_failure, WINDOWS_UPDATE_HELPER);
+        std::fs::write(&plan.helper_script, forced_failure).unwrap();
+        write_windows_update_status(&plan.status_file, "scheduled", "test").unwrap();
+
+        let status = windows_update_helper_command(
+            &system_powershell_path().unwrap(),
+            &plan,
+            i32::MAX as u32,
+            "9.9.9",
+        )
+        .status()
+        .unwrap();
+
+        let status_text = std::fs::read_to_string(&plan.status_file).unwrap();
+        assert!(!status.success());
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            expected,
+            "status={status_text}; backup_exists={}",
+            plan.backup_file.exists()
+        );
+        assert!(!staging.exists());
+        assert!(!plan.replacement_temp.exists());
+        assert!(!plan.backup_file.exists());
+        assert!(!plan.rollback_displaced_file.exists());
+        let status: serde_json::Value = serde_json::from_str(&status_text).unwrap();
+        assert_eq!(status["state"], "failed");
+        assert!(status["message"]
+            .as_str()
+            .unwrap()
+            .contains("updated executable hash mismatch"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_update_plan_rejects_a_non_executable_staged_file() {
+        let temp = real_tempdir();
+        let staging = temp.path().join("staging");
+        let staged = staging.join("bin/rpi.exe");
+        let target = temp.path().join("target/rpi.exe");
+        std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        std::fs::write(&staged, b"not-a-pe").unwrap();
+        fake_windows_executable(&target, b"old-version");
+        let expected = std::fs::read(&target).unwrap();
+
+        let error = build_windows_update_plan(
+            &staging,
+            &target,
+            &temp
+                .path()
+                .join("status-00000000000000000000000000000000.json"),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("not a Windows executable"));
+        assert_eq!(std::fs::read(&target).unwrap(), expected);
+    }
+
+    #[test]
+    fn staged_rpi_version_output_is_exact_and_cannot_downgrade() {
+        assert_eq!(
+            parse_rpi_version_output(b"rpi 1.2.3\r\n").unwrap(),
+            semver::Version::new(1, 2, 3)
+        );
+        assert_eq!(
+            validate_staged_rpi_version_output(b"rpi 1.2.3\n", b"", "1.2.3").unwrap(),
+            semver::Version::new(1, 2, 3)
+        );
+        assert!(
+            validate_staged_rpi_version_output(b"rpi 1.2.2\n", b"", "1.2.3")
+                .unwrap_err()
+                .contains("older version")
+        );
+
+        for output in [
+            &b"pi 1.2.3\n"[..],
+            &b"rpi v1.2.3\n"[..],
+            &b"rpi 1.2.3 extra\n"[..],
+            &b"rpi 1.2.3\nsecond line\n"[..],
+            &b" rpi 1.2.3\n"[..],
+        ] {
+            assert!(
+                parse_rpi_version_output(output).is_none(),
+                "output={output:?}"
+            );
+        }
+        assert!(
+            validate_staged_rpi_version_output(b"rpi 1.2.3\n", b"warning", "1.2.3")
+                .unwrap_err()
+                .contains("stderr")
+        );
+    }
+
+    #[test]
+    fn compares_release_versions_conservatively() {
+        assert!(is_newer("0.1.9", "0.1.10"));
+        assert!(is_newer("v1.2.3", "1.3.0"));
+        assert!(is_newer("1.2.3-beta.1", "1.2.3-beta.2"));
+        assert!(is_newer("1.2.3-beta.2", "1.2.3"));
+        assert!(!is_newer("1.2.3", "1.2.3"));
+        assert!(!is_newer("nightly", "1.0.0"));
+    }
+
+    #[test]
+    fn failed_item_checks_keep_only_corresponding_cached_values() {
+        let cached = BTreeMap::from([
+            ("fresh".to_string(), "1.0.0".to_string()),
+            ("failed".to_string(), "2.0.0".to_string()),
+            ("removed".to_string(), "3.0.0".to_string()),
+        ]);
+        let results = vec![
+            (
+                "fresh".to_string(),
+                RegistryLookup::Found("1.1.0".to_string()),
+            ),
+            ("failed".to_string(), RegistryLookup::TransientFailure),
+            ("uncached".to_string(), RegistryLookup::TransientFailure),
+            ("missing".to_string(), RegistryLookup::Missing),
+        ];
+
+        let (merged, checked_at_values) =
+            results_with_individual_cache_fallback(results, Some(&cached), None, 100, 100);
+        assert_eq!(merged.get("fresh").map(String::as_str), Some("1.1.0"));
+        assert_eq!(merged.get("failed").map(String::as_str), Some("2.0.0"));
+        assert!(!merged.contains_key("removed"));
+        assert!(!merged.contains_key("uncached"));
+        assert!(!merged.contains_key("missing"));
+        // A live lookup is stamped with the current check; a fallback keeps the
+        // timestamp it was cached at, so the fallback window cannot be extended
+        // indefinitely by repeated offline starts.
+        assert_eq!(checked_at_values.get("fresh").copied(), Some(100));
+        assert_eq!(checked_at_values.get("failed").copied(), Some(100));
+        assert!(!checked_at_values.contains_key("uncached"));
+        assert!(!checked_at_values.contains_key("missing"));
+    }
+
+    #[tokio::test]
+    async fn package_update_checks_have_a_shared_concurrency_limit() {
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let checks = (0..(UPDATE_CHECK_CONCURRENCY * 3)).map(|index| {
+            let in_flight = Arc::clone(&in_flight);
+            let maximum = Arc::clone(&maximum);
+            async move {
+                let active = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(active, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                index
+            }
+        });
+
+        let mut results = collect_bounded(checks).await;
+        results.sort_unstable();
+
+        assert_eq!(
+            results,
+            (0..(UPDATE_CHECK_CONCURRENCY * 3)).collect::<Vec<_>>()
+        );
+        assert_eq!(maximum.load(Ordering::SeqCst), UPDATE_CHECK_CONCURRENCY);
+        assert_eq!(in_flight.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn bounded_checks_do_not_head_of_line_block_new_work() {
+        let release_first = Arc::new(tokio::sync::Notify::new());
+        let checks = (0..(UPDATE_CHECK_CONCURRENCY + 1)).map(|index| {
+            let release_first = Arc::clone(&release_first);
+            async move {
+                if index == 0 {
+                    release_first.notified().await;
+                } else if index == UPDATE_CHECK_CONCURRENCY {
+                    release_first.notify_one();
+                }
+                index
+            }
+        });
+
+        let mut results =
+            tokio::time::timeout(std::time::Duration::from_secs(1), collect_bounded(checks))
+                .await
+                .expect("a completed later check must free a concurrency slot");
+        results.sort_unstable();
+        assert_eq!(results, (0..=UPDATE_CHECK_CONCURRENCY).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn fresh_results_keep_individual_timestamps_when_a_peer_uses_fallback() {
+        let now = 10 * CACHE_FALLBACK_MAX_AGE_MS;
+        let nearly_stale = now - CACHE_FALLBACK_MAX_AGE_MS + 60_000;
+        let cached = BTreeMap::from([
+            ("fresh".to_string(), "1.0.0".to_string()),
+            ("failed".to_string(), "2.0.0".to_string()),
+        ]);
+        let freshness = BTreeMap::from([
+            ("fresh".to_string(), nearly_stale),
+            ("failed".to_string(), nearly_stale),
+        ]);
+        let (values, timestamps) = results_with_individual_cache_fallback(
+            vec![
+                (
+                    "fresh".to_string(),
+                    RegistryLookup::Found("1.1.0".to_string()),
+                ),
+                ("failed".to_string(), RegistryLookup::TransientFailure),
+            ],
+            Some(&cached),
+            Some(&freshness),
+            nearly_stale,
+            now,
+        );
+
+        assert_eq!(timestamps.get("fresh"), Some(&now));
+        assert_eq!(timestamps.get("failed"), Some(&nearly_stale));
+        let after_old_entry_expires = now + 120_000;
+        let (fallback, _) = results_with_individual_cache_fallback(
+            vec![
+                ("fresh".to_string(), RegistryLookup::TransientFailure),
+                ("failed".to_string(), RegistryLookup::TransientFailure),
+            ],
+            Some(&values),
+            Some(&timestamps),
+            nearly_stale,
+            after_old_entry_expires,
+        );
+        assert_eq!(fallback.get("fresh").map(String::as_str), Some("1.1.0"));
+        assert!(!fallback.contains_key("failed"));
+    }
+
+    #[tokio::test]
+    async fn crates_rate_limits_and_request_timeouts_are_transient() {
+        async fn lookup(status: &str, body: &str) -> RegistryLookup {
+            use std::io::{BufRead, BufReader, Write};
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let status = status.to_string();
+            let body = body.to_string();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                {
+                    let mut reader = BufReader::new(&mut stream);
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                            break;
+                        }
+                    }
+                }
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            });
+            let client = reqwest::Client::builder().build().unwrap();
+            let result = fetch_crates_url(&client, &format!("http://{address}/crate")).await;
+            server.join().unwrap();
+            result
+        }
+
+        assert_eq!(
+            lookup("408 Request Timeout", "").await,
+            RegistryLookup::TransientFailure
+        );
+        assert_eq!(
+            lookup("429 Too Many Requests", "").await,
+            RegistryLookup::TransientFailure
+        );
+        let malformed = lookup("200 OK", "{malformed-json").await;
+        assert_eq!(malformed, RegistryLookup::TransientFailure);
+        assert_eq!(
+            super::lookup_with_cache_fallback(malformed, Some("9.9.9"), true),
+            (Some("9.9.9".to_string()), true)
+        );
+        assert_eq!(lookup("404 Not Found", "").await, RegistryLookup::Missing);
     }
 }

@@ -33,11 +33,13 @@
 - 远程模式：`rpi --server` 无头 TCP 服务 + `rpi --connect` 零本地资源 TUI 客户端，连接级 token 认证。
 - 插件：`rpi-plugin-sdk` 提供稳定 `#[repr(C)]` ABI（含 panic 隔离、版本协商），`rpi-extensions` 是宿主侧加载器；`rpi install` / `rpi dev` 覆盖安装与热重载。
 - 性能（同机实测，`node scripts/bench-vs-pi.mjs --pi <path>` 可复现，方法见 `docs/performance-vs-pi.md`）：
-  - `--version` **17.9 ms** vs 原生 pi 172.9 ms（**9.7×**）
-  - 到可用 agent（RPC ready）**103.6 ms** vs 176.4 ms（**1.7×**）
-  - 常驻内存 **18.6 MiB** vs 91.6 MiB（**4.9×**）
-  - 安装体积 **23.9 MiB 单二进制** vs 约 513 MiB（**~21×**）
-  - 引用时必须同时说明：本机实测、单一版本对、未测 LLM 延迟/工具循环吞吐/长会话内存。
+  - `--version` **17.5 ms** vs 原生 pi 169.5 ms（**9.7×**）
+  - 冷启动 **17.7 ms** vs 189.5 ms（**10.7×**）
+  - 常驻内存 **12.0 MiB** vs 91.5 MiB（**7.6×**）
+  - 安装体积 **21.8 MiB 单二进制** vs 约 385 MiB（+约 91 MiB Node，**~18–22×**）
+  - 引用时必须同时说明：本机实测、单一版本对、**两边都隔离配置**（rpi 用的是
+    `RPI_CODING_AGENT_DIR` / `RPI_OFFLINE`，不是 pi 的 `PI_*`，写错会导致 rpi 加载本机全局插件），
+    且冷启动的秒表要从 `spawn()` 之前起，以及未测 LLM 延迟/工具循环吞吐/长会话内存。
 
 ### 必须标注为实验性的部分
 
@@ -45,7 +47,7 @@
 
 - **Node/TypeScript 扩展桥接**：需要 `--enable-pi-packages` 显式开启，且接口面不完整——`ui.select` / `ui.confirm` / `ui.input` / `ui.editor` 与 `session.sendMessage` 目前直接抛 `unsupported capability`，事件面只覆盖 `resources_discover`。描述为「实验性、仅本地评估」。
 - **插件 ABI 统一**：0.3.0 把入口统一到单一 `rpi_plugin_register`（版本号移入 `PluginApi` 结构体），宿主仍会回退解析 `_v3` / `_v2`，老插件可继续加载；但扩展作者应重新构建。
-- **benchmark 对比**：现在**可以**引用 `docs/performance-vs-pi.md` 的数字（rpi vs 原生 pi，同机同协议），但必须一并给出「本机实测、单一版本对」的前提，以及未测的范围。不要编造与 Claude Code / Codex / aider 的对比——那些没有测过。
+- **benchmark 对比**：现在**可以**引用 `docs/performance-vs-pi.md` 的数字（rpi vs 原生 pi，同机同协议），但必须一并给出「本机实测、单一版本对、两边都隔离配置、秒表从 `spawn()` 之前起」的前提，以及未测的范围。隔离变量两边不同（`RPI_*` vs `PI_*`），混淆会让 rpi 读本机 `~/.rpi/agent` 并加载全局插件，把冷启动从 ~18 ms 拉到 ~100 ms。不要编造与 Claude Code / Codex / aider 的对比——那些没有测过。
 
 ## 各渠道的完整文案
 
@@ -123,7 +125,7 @@
 > rpi -p "hello"
 > ```
 >
-> Measured on Windows 11 / rustc 1.97.1 against the published TypeScript pi 0.87.1, same machine, same RPC endpoint, both offline with an isolated config dir: 17.9 ms vs 172.9 ms for `--version` (9.7×), 103.6 ms vs 176.4 ms to a usable agent (1.7×), 18.6 MiB vs 91.6 MiB resident (4.9×). The script is in the repo so you can re-run it. The honest caveat: most of rpi's remaining 103 ms is its *own* init, not process startup, and I have not measured tool-loop throughput or long-session memory for either tool.
+> Measured on Windows 11 / rustc 1.97.1 against the published TypeScript pi 0.87.1, same machine, same JSONL command channel, both offline with an isolated config dir. Two measurement gotchas, both documented: rpi reads `RPI_CODING_AGENT_DIR` / `RPI_OFFLINE`, not pi's `PI_*` (set the wrong names and rpi loads your global plugins), and the cold-start stopwatch must start before `spawn()`. Correct numbers: 17.5 ms vs 169.5 ms for `--version` (9.7×), 17.7 ms vs 189.5 ms to cold start (10.7×), 12.0 MiB vs 91.5 MiB resident (7.6×). The script is in the repo so you can re-run it. I have not measured tool-loop throughput or long-session memory for either tool.
 >
 > Known gaps, stated up front: the Node/TypeScript extension bridge is experimental and incomplete, and Intel macOS prebuilt binaries are not built yet. There is a `docs/native-pi-missing-features.md` in the repo that tracks compatibility honestly.
 >
@@ -147,7 +149,7 @@
 > - 工具参数用 `schemars` 从类型派生 schema，再用一层 coercion 修复模型略写错的 JSON。
 > - 插件是手写的 `#[repr(C)]` ABI：不能有 `Drop` 类型跨界、字符串用 ptr+len 加显式 `free_string`、两边都 `catch_unwind`。文档里逐条写了为什么。
 > - 默认构建不含 HTTP 依赖，测试离线可跑。
-> - 与原生 TypeScript pi 的同机对比：`--version` 9.7×、到可用 agent 1.7×、内存 4.9×、安装体积 ~21×。有意思的是原生 pi 的开销几乎全在 Node 启动（约 3 ms 是 agent 初始化），而 rpi 的 86/104 ms 是自身运行时初始化——所以下一步优化方向是惰性初始化，不是把二进制做小。
+> - 与原生 TypeScript pi 的同机对比：`--version` 9.7×、冷启动 10.7×、内存 7.6×、安装体积 ~21×。rpi 的 `--version`（17.5 ms）和冷启动（17.7 ms）几乎相等，说明初始化可忽略、成本就是进程创建；原生 pi 两个数差约 20 ms，是它自己的 agent 初始化叠在 Node 启动上。**两个测量前提**：隔离变量两边不同（`RPI_*` vs `PI_*`，写错会让 rpi 读本机 `~/.rpi/agent`、加载全局插件），且秒表要在 `spawn()` 之前起。
 >
 > 可以先 `cargo run -p minimal` 跑通一个不联网的 agent。
 

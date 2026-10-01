@@ -1,12 +1,8 @@
 //! Mirrors `packages/agent/src/harness/tools/read.ts` — the built-in `read`
 //! `AgentTool`. Reads a file (text or image), applies head-truncation with a
-//! continuation hint, and detects supported image MIME types.
-//!
-//! Divergences from TS (documented): the TS supports an injected `imageProcessor`
-//! (resize/convert). The v1 Rust port ships no processor — BMP images yield an
-//! "omitted" text notice (matching the TS no-processor path), and other supported
-//! images are base64-encoded inline. The `ReadImageProcessor` trait seam is kept
-//! for a future impl.
+//! continuation hint, and detects supported image MIME types. An optional
+//! `ReadImageProcessor` seam supports resize/convert implementations; without
+//! one, BMP images yield an omitted notice and other formats are inlined.
 
 use std::sync::Arc;
 
@@ -49,16 +45,42 @@ pub struct ReadToolDetails {
     pub truncation: Option<TruncationResult>,
 }
 
-/// Options for `create_read_tool`. Mirrors TS `ReadToolOptions`. The Rust port
-/// keeps the `auto_resize_images` flag for forward-compat but has no processor.
-#[derive(Debug, Clone, Default)]
+/// Options for `create_read_tool`. Mirrors TS `ReadToolOptions`.
 pub struct ReadToolOptions {
     /// Whether an injected image processor should resize images. Default true.
     pub auto_resize_images: bool,
+    /// Optional image conversion/resizing implementation.
+    pub image_processor: Option<Arc<dyn ReadImageProcessor>>,
 }
 
-/// Optional image-conversion seam (v1 ships no impl). Mirrors TS
-/// `ReadImageProcessor`.
+impl Clone for ReadToolOptions {
+    fn clone(&self) -> Self {
+        Self {
+            auto_resize_images: self.auto_resize_images,
+            image_processor: self.image_processor.clone(),
+        }
+    }
+}
+
+impl std::fmt::Debug for ReadToolOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadToolOptions")
+            .field("auto_resize_images", &self.auto_resize_images)
+            .field("image_processor", &self.image_processor.is_some())
+            .finish()
+    }
+}
+
+impl Default for ReadToolOptions {
+    fn default() -> Self {
+        Self {
+            auto_resize_images: true,
+            image_processor: None,
+        }
+    }
+}
+
+/// Optional image-conversion seam. Mirrors TS `ReadImageProcessor`.
 pub trait ReadImageProcessor: Send + Sync {
     fn process(
         &self,
@@ -107,11 +129,13 @@ pub fn create_read_tool(
     context: &ExecutionToolContext,
     options: Option<ReadToolOptions>,
 ) -> Arc<dyn AgentTool> {
+    let options = options.unwrap_or_default();
+    let image_processor = options.image_processor.clone();
     Arc::new(ReadTool {
         schema: ReadTool::schema(),
         env: context.env().clone(),
-        options: options.unwrap_or_default(),
-        image_processor: None,
+        options,
+        image_processor,
     })
 }
 
@@ -154,8 +178,7 @@ impl AgentTool for ReadTool {
         }
 
         // Text path.
-        let text_content = String::from_utf8(bytes)
-            .map_err(|e| AgentError::Tool(format!("read: invalid utf-8 in {}: {e}", input.path)))?;
+        let text_content = String::from_utf8_lossy(&bytes).into_owned();
         let all_lines: Vec<&str> = text_content.split('\n').collect();
         // Mirror TS: `textContent.split("\n")` keeps a trailing "" when the
         // content ends with '\n'; the line-count + slice math below uses the raw
@@ -189,7 +212,7 @@ impl AgentTool for ReadTool {
         let (output_text, details): (String, Option<TruncationResult>) = if truncation
             .first_line_exceeds_limit
         {
-            let first_line_size = format_size(all_lines[start_line].len());
+            let first_line_size = format_size(all_lines[start_line].as_bytes().len());
             (
                     format!(
                         "[Line {start_line_display} is {first_line_size}, exceeds {} limit. \

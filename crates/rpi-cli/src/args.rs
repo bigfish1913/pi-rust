@@ -61,6 +61,15 @@ pub(crate) fn normalize_offline_mode(args: &[String]) -> bool {
     enabled
 }
 
+/// Drop the global `--offline` flag before an early-dispatched subcommand parses
+/// its own arguments (`rpi update --offline` must not see it as a stray arg).
+pub(crate) fn without_offline_flag(args: &[String]) -> Vec<String> {
+    args.iter()
+        .filter(|arg| arg.as_str() != "--offline")
+        .cloned()
+        .collect()
+}
+
 /// Output mode. Mirrors rpi's text/json/rpc modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
@@ -674,6 +683,7 @@ pub fn print_help() {
   OPENAI_API_KEY                 Bearer token for openai-completions/responses
   RPI_OFFLINE                     Disable startup network operations when set to 1/true/yes
   RPI_CODING_AGENT_DIR           Override the ~/.rpi config directory (auth.json + models.json)
+  RPI_SESSION_ID                 Session id served by a plugin (set by the host; also honored as an override)
   RPI_NO_EMOJI                   Render the brand lockup without the crab (1/true/yes)
 
 {u}Notes:{r}

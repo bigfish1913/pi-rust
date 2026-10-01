@@ -25,11 +25,14 @@
 set -euo pipefail
 
 REPO="bigfish1913/pi-rust"
+# `<target>:<archive extension>` — must mirror the `archive:` column of the
+# release-binaries matrix. Each target publishes exactly ONE archive (plus its
+# `.sha256` sidecar), so requiring both formats here waits forever.
 ASSET_TARGETS=(
-  "x86_64-unknown-linux-gnu"
-  "aarch64-unknown-linux-gnu"
-  "aarch64-apple-darwin"
-  "x86_64-pc-windows-msvc"
+  "x86_64-unknown-linux-gnu:tar.gz"
+  "aarch64-unknown-linux-gnu:tar.gz"
+  "aarch64-apple-darwin:tar.gz"
+  "x86_64-pc-windows-msvc:zip"
 )
 
 DRY_RUN=0
@@ -160,6 +163,12 @@ phase_validate() {
 phase_commit() {
   note "commit the version bump"
   step git add -A
+  # Re-running a release whose bump already landed leaves an empty index;
+  # `git commit` would exit 1 there and abort the pipeline under `set -e`.
+  if [[ "$DRY_RUN" != "1" ]] && git diff --cached --quiet; then
+    note "  nothing to commit"
+    return
+  fi
   step git commit -m "chore(release): $release_version"
 }
 
@@ -177,10 +186,11 @@ phase_push() {
 phase_wait() {
   note "wait for the release binaries (release-binaries.yml)"
   local needed=()
-  local target
-  for target in "${ASSET_TARGETS[@]}"; do
-    needed+=("rpi-$release_tag-$target.tar.gz" "rpi-$release_tag-$target.tar.gz.sha256")
-    needed+=("rpi-$release_tag-$target.zip" "rpi-$release_tag-$target.zip.sha256")
+  local entry target ext
+  for entry in "${ASSET_TARGETS[@]}"; do
+    target="${entry%%:*}"
+    ext="${entry##*:}"
+    needed+=("rpi-$release_tag-$target.$ext" "rpi-$release_tag-$target.$ext.sha256")
   done
   if [[ "$DRY_RUN" == "1" ]]; then
     echo "  \$ poll: gh release view $release_tag --json assets until all archives + .sha256 exist"
@@ -211,6 +221,10 @@ phase_channels() {
 phase_commit_channels() {
   note "commit the channel refresh"
   step git add -A
+  if [[ "$DRY_RUN" != "1" ]] && git diff --cached --quiet; then
+    note "  nothing to commit"
+    return
+  fi
   step git commit -m "chore(release): refresh the install channels and the site for $release_version"
 }
 
@@ -227,7 +241,7 @@ phase_winget() {
 phase_crates() {
   note "publish nine crates to crates.io"
   confirm "Publish $release_version to crates.io (irreversible)?" || { note "  skipped"; return; }
-  step task publish RELEASE_VERSION="$release_version"
+  step task publish:crates RELEASE_VERSION="$release_version"
 }
 
 phase_site() {

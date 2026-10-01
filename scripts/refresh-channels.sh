@@ -4,9 +4,17 @@
 #   bash scripts/refresh-channels.sh 0.3.4
 #
 # Requires the release assets to exist (run after the binaries workflow
-# finishes). It downloads only the small `.sha256` sidecars via `gh` and does
-# targeted substitutions — no templates — so a format tweak upstream does not
-# silently drop. Idempotent: re-running against the same version is a no-op.
+# finishes). It reads the asset digests from the GitHub API and does targeted
+# substitutions — no templates — so a format tweak upstream does not silently
+# drop. Idempotent: re-running against the same version is a no-op.
+#
+# Why the API digest and not the `.sha256` sidecars: this machine cannot reach
+# `release-assets.githubusercontent.com` (the host every release-asset URL
+# redirects to), so both `gh release download` and a plain `curl -L` time out.
+# The API's `digest` field is the sha256 GitHub computed for the uploaded asset
+# — the same value the sidecar contains — so it removes the download entirely
+# and is reachable. Verified against v0.3.9: every API digest matched the hash
+# already recorded in the Homebrew/Scoop manifests.
 
 set -euo pipefail
 
@@ -25,13 +33,27 @@ OLD=$(grep -m1 -oE '"version": "[0-9.]+"' packaging/scoop/rpi.json | grep -oE '[
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-note "fetching .sha256 sidecars for $TAG"
-gh release download "$TAG" -R "$REPO" -p "*.sha256" -D "$tmp" >/dev/null
 
-# sha ASSET -> lowercase hex digest from its .sha256 sidecar.
+# sha ASSET -> lowercase hex digest for the asset named `$1`.
+#
+# Prefers the API's `digest`; falls back to downloading the `.sha256` sidecar
+# for a GitHub instance that does not populate `digest` yet. The sidecar content
+# is "<hex>  <filename>", hence the awk.
 sha() {
-  local file="$tmp/$1.sha256"
-  [[ -f "$file" ]] || die "missing $1.sha256 in the $TAG release"
+  local asset="$1"
+  local digest
+  digest=$(gh api "repos/$REPO/releases/tags/$TAG" \
+    --jq ".assets[] | select(.name == \"$asset\") | .digest" 2>/dev/null \
+    | sed 's/^sha256://' | tr 'A-F' 'a-f')
+  if [[ "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+    printf '%s\n' "$digest"
+    return 0
+  fi
+  note "  digest unavailable for $asset; falling back to the .sha256 sidecar"
+  gh release download "$TAG" -R "$REPO" -p "$asset.sha256" -D "$tmp" >/dev/null \
+    || die "could not fetch $asset.sha256"
+  local file="$tmp/$asset.sha256"
+  [[ -f "$file" ]] || die "missing $asset.sha256 in the $TAG release"
   awk '{print $1}' "$file" | tr 'A-F' 'a-f'
 }
 

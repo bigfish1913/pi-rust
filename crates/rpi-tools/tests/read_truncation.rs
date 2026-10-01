@@ -7,7 +7,10 @@ use std::sync::Arc;
 
 use rpi_agent::agent_tool::AgentTool;
 use rpi_agent::error::AgentError;
-use rpi_tools::{ExecutionToolContext, FileSystem, InMemoryExecutionEnv};
+use rpi_tools::{
+    ExecutionToolContext, FileSystem, InMemoryExecutionEnv, ProcessedImage, ReadImageProcessor,
+    ReadToolOptions,
+};
 use tokio_util::sync::CancellationToken;
 
 /// Build a fresh in-memory tool context rooted at `/tmp/work`.
@@ -52,6 +55,57 @@ async fn run_read(
     tool.execute("read-1", params, signal, on_update).await
 }
 
+#[tokio::test]
+async fn read_replaces_invalid_utf8_like_text_decoder() {
+    let (env, ctx) = fresh_context();
+    seed(&env, "invalid.txt", vec![b'a', 0xff, b'b']).await;
+
+    let tool = rpi_tools::create_read_tool(&ctx, None);
+    let result = run_read(tool, serde_json::json!({ "path": "invalid.txt" }))
+        .await
+        .expect("invalid UTF-8 should be lossily decoded");
+    let out = text_output(&result);
+    assert_eq!(out, "a\u{fffd}b");
+}
+struct TestImageProcessor;
+
+impl ReadImageProcessor for TestImageProcessor {
+    fn process(
+        &self,
+        bytes: &[u8],
+        mime_type: &str,
+        auto_resize: bool,
+    ) -> Result<ProcessedImage, String> {
+        assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+        Ok(ProcessedImage {
+            data: "processed".to_string(),
+            mime_type: mime_type.to_string(),
+            hints: vec![format!("resize={auto_resize}")],
+        })
+    }
+}
+
+#[tokio::test]
+async fn read_uses_injected_image_processor_and_resize_option() {
+    let (env, ctx) = fresh_context();
+    seed(&env, "image.png", base64_png()).await;
+
+    let tool = rpi_tools::create_read_tool(
+        &ctx,
+        Some(ReadToolOptions {
+            auto_resize_images: false,
+            image_processor: Some(Arc::new(TestImageProcessor)),
+        }),
+    );
+    let result = run_read(tool, serde_json::json!({ "path": "image.png" }))
+        .await
+        .expect("processor path should succeed");
+    assert!(text_output(&result).contains("resize=false"));
+    assert!(matches!(
+        result.content.last(),
+        Some(rpi_agent::types::TextContentOrImage::Image(image)) if image.data == "processed"
+    ));
+}
 #[tokio::test]
 async fn read_offsets_limits_and_continuation_notice() {
     let (env, ctx) = fresh_context();

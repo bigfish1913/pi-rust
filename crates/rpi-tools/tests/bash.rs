@@ -227,6 +227,7 @@ async fn supports_command_prefix() {
         Some(BashToolOptions {
             command_prefix: Some("value=hello".into()),
             default_timeout: None,
+            prepare: None,
         }),
     );
     // The shell_script prefix-matches on the composed command start; echo is the

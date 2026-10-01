@@ -87,7 +87,26 @@ impl ProviderHooks for ExtensionProviderHooks {
                 let event = serde_json::json!({
                     "prompt": prompt,
                     "imageCount": image_count,
+                    // The session this process serves. A plugin that traces the
+                    // run reports it as the session id (nothing else tells an
+                    // observer which session it is watching). Read from the
+                    // environment per turn rather than captured at harness build,
+                    // so an in-process session swap is reflected on the very next
+                    // turn.
+                    "sessionId": std::env::var(rpi_plugin_sdk::SESSION_ID_ENV).ok(),
+                    // Who this extension is embedded in, so it can label its own
+                    // output (trace name, tags, `service.name`) without
+                    // hardcoding a brand that a rename would silently
+                    // invalidate. Sent per turn, so it describes the process
+                    // actually running rather than the SDK the plugin was built
+                    // against.
+                    "host": host_identity(),
                 });
+                // Synchronous, like the request dispatch below: a subscriber's
+                // `BeforeAgentStart` handler runs before any
+                // `BeforeProviderRequest` of this turn reaches it, so the turn is
+                // fully identified (session included) by the time its first
+                // generation is created.
                 dispatch_data_event(
                     &self.snapshot,
                     EventTag::BeforeAgentStart,
@@ -137,6 +156,20 @@ impl ProviderHooks for ExtensionProviderHooks {
             &json.to_string(),
         );
     }
+}
+
+/// The host's own identity, as handed to plugins.
+///
+/// The name is the plugin contract's constant ([`rpi_plugin_sdk::HOST_NAME`])
+/// and the version is this host crate's own `CARGO_PKG_VERSION` — every
+/// workspace crate shares one version, so this is the running host's version
+/// and not the SDK a plugin was compiled against. Both are compile-time
+/// aliases, so there is exactly one place to change either.
+fn host_identity() -> serde_json::Value {
+    serde_json::json!({
+        "name": rpi_plugin_sdk::HOST_NAME,
+        "version": env!("CARGO_PKG_VERSION"),
+    })
 }
 
 /// Text/timestamp/image-count of the most recent user message. Mirrors the
@@ -272,7 +305,27 @@ mod tests {
             1,
             "before_agent_start must fire once per prompt: {captured:?}"
         );
-        assert!(agent_starts[0].1.contains("\"prompt\":\"hello\""));
+        let start_payload: serde_json::Value =
+            serde_json::from_str(&agent_starts[0].1).expect("before_agent_start payload is JSON");
+        assert_eq!(start_payload["prompt"], "hello");
+        assert_eq!(start_payload["imageCount"], 0);
+        // The session id rides along so an observer can name the session on the
+        // very first turn (the prompt is the only per-turn channel it gets).
+        // Absent when this process has no session id in its environment.
+        assert_eq!(
+            start_payload.get("sessionId").map(|v| v.is_null()),
+            Some(std::env::var(rpi_plugin_sdk::SESSION_ID_ENV).is_err()),
+            "sessionId must mirror the host's session id env var: {}",
+            agent_starts[0].1
+        );
+        // And the host identifies itself, so a plugin can label its own output
+        // (trace name, tags, service.name) without hardcoding a brand.
+        assert_eq!(start_payload["host"]["name"], rpi_plugin_sdk::HOST_NAME);
+        assert_eq!(
+            start_payload["host"]["version"],
+            env!("CARGO_PKG_VERSION"),
+            "the host reports the version of the host, not of the plugin SDK"
+        );
 
         let requests: Vec<_> = captured
             .iter()

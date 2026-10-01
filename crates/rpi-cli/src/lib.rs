@@ -68,9 +68,17 @@ pub mod updates;
 
 /// Crate version, surfaced by `rpi --version`. Mirrors the TS `VERSION` export
 /// (sourced from `package.json`; here from `env!("CARGO_PKG_VERSION")`).
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+///
+/// Aliases [`rpi_plugin_sdk::HOST_VERSION`] so the version the CLI prints and
+/// the version handed to plugins (and, through it, the version extensions stamp
+/// on their own telemetry) can never disagree.
+pub const VERSION: &str = rpi_plugin_sdk::HOST_VERSION;
 
 /// The application name used in help + version output. Mirrors TS `APP_NAME`
 /// (the TS bin is `"pi"`; the Rust crate publishes under the `rpi-` namespace,
 /// so the binary + displayed name is `"rpi"` to match).
-pub const APP_NAME: &str = "rpi";
+///
+/// Aliases [`rpi_plugin_sdk::HOST_NAME`] — the plugin contract owns the
+/// identity, so an extension can label its output (a trace name, a tag) without
+/// hardcoding a brand that a rename would silently invalidate.
+pub const APP_NAME: &str = rpi_plugin_sdk::HOST_NAME;

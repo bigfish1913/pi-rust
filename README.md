@@ -10,9 +10,9 @@
 [![Latest release](https://img.shields.io/github/v/release/bigfish1913/pi-rust)](https://github.com/bigfish1913/pi-rust/releases/latest)
 
 `rpi` is a library-first coding-agent runtime written in Rust, plus a terminal
-agent built on top of it. Nine composable crates take you from provider
-adapters to a durable, crash-resumable agent loop with a stable plugin ABI —
-usable as an embedded SDK or as a ready-to-run `rpi` command.
+agent built on top of it. Nine composable crates span provider adapters, a
+durable crash-resumable agent loop, a terminal UI, and a stable plugin ABI — so
+the same code works as an embedded SDK or as a ready-to-run `rpi` command.
 
 Website: <https://rpi.laofu.online/> · Docs: <https://rpi.laofu.online/docs.html>
 
@@ -65,7 +65,7 @@ scoop install rpi                                     # Windows
 
 The Homebrew formula omits Intel macOS because no `x86_64-apple-darwin` build is
 published — use `cargo install rpi-cli` there. A winget manifest is [open for
-review](https://github.com/microsoft/winget-pkgs/pull/441442).
+review](https://github.com/microsoft/winget-pkgs/pull/444745).
 
 **From source:**
 
@@ -96,9 +96,9 @@ AgentEnd observed; tool ran against OsExecutionEnv.
 ### The CLI
 
 ```bash
-export ANTHROPIC_API_KEY=...        # or OPENAI_API_KEY, or ~/.rpi/agent/models.json
-rpi                                 # interactive TUI
-rpi -p "summarize the README"      # one-shot
+export ANTHROPIC_API_KEY=...          # or OPENAI_API_KEY, or ~/.rpi/agent/models.json
+rpi                                   # interactive TUI
+rpi -p "summarize the README"         # one-shot
 rpi --mode json -p "list the crates"  # machine-readable event stream
 ```
 
@@ -113,17 +113,14 @@ Build an agent against a deterministic in-process provider — no API key, no
 network, no flakiness:
 
 ```rust
-use std::sync::Arc;
-
 use rpi_agent::AgentBuilder;
 use rpi_ai::providers::faux::{FauxProvider, FauxScript};
 use rpi_ai::Provider;
 
 #[tokio::main]
 async fn main() {
-    let provider = Arc::new(FauxProvider::new(
-        FauxScript::new().with_text("Hello from the faux provider!"),
-    ));
+    // `FauxProvider::new` already returns an `Arc<Self>`.
+    let provider = FauxProvider::new(FauxScript::new().with_text("Hello from the faux provider!"));
     let model = provider.default_model().clone();
 
     let agent = AgentBuilder::new()
@@ -153,21 +150,31 @@ Nine crates, one version, published together. Dependency direction is one-way
 and enforced in review:
 
 ```
-rpi-telemetry → rpi-ai → rpi-agent → rpi-tools → rpi-harness → rpi-cli
-                  ↑                                        ↑
-            rpi-tui                              rpi-plugin-sdk → rpi-extensions
+rpi-telemetry → rpi-ai → rpi-agent → rpi-tools → rpi-harness
 ```
+
+Three crates sit outside that chain:
+
+- `rpi-tui` depends on no other `rpi-*` crate.
+- `rpi-plugin-sdk` is a leaf too (it has no `rpi-*` deps), but it is not only
+  the host's plugin contract: `rpi-tools` also reads its env-var names, so the
+  host and its plugins cannot disagree about the strings they exchange across
+  the ABI. That edge is names-only — nothing is linked or called.
+- `rpi-extensions` is `rpi-plugin-sdk` plus `rpi-ai`/`rpi-agent`, since it hosts
+  plugins that run tools.
+- `rpi-cli` depends on all eight of the others, which is how the `rpi` binary
+gets the TUI, the harness and the plugin loader at once.
 
 | Crate | What it is |
 | ----- | ---------- |
-| [`rpi-telemetry`](https://crates.io/crates/rpi-telemetry) | Span/event contracts with a no-op default — instrumentation is opt-in and dependency-free |
+| [`rpi-telemetry`](https://crates.io/crates/rpi-telemetry) | Span/event contracts with a no-op default — instrumentation is opt-in, and pulls in no tracing or OpenTelemetry backend |
 | [`rpi-ai`](https://crates.io/crates/rpi-ai) | Provider-agnostic message, streaming and tool-schema types; Anthropic + OpenAI-compatible + `faux` providers |
 | [`rpi-agent`](https://crates.io/crates/rpi-agent) | The agent loop: `AgentTool`, events, hooks, queues, cancellation |
 | [`rpi-tools`](https://crates.io/crates/rpi-tools) | `read`/`write`/`edit`/`bash` (+ `grep`, `find`, `ls`, `powershell`) and the `ExecutionEnv` seam |
 | [`rpi-harness`](https://crates.io/crates/rpi-harness) | Session tree, JSONL persistence, compaction, crash recovery, the run loop |
 | [`rpi-tui`](https://crates.io/crates/rpi-tui) | Terminal UI primitives: components, layout, editor, transcript rendering |
 | [`rpi-cli`](https://crates.io/crates/rpi-cli) | The `rpi` binary: TUI, one-shot and JSON modes, config, plugin loading |
-| [`rpi-plugin-sdk`](https://crates.io/crates/rpi-plugin-sdk) | The stable `#[repr(C)]` ABI contract for plugins. Zero runtime dependencies |
+| [`rpi-plugin-sdk`](https://crates.io/crates/rpi-plugin-sdk) | The stable `#[repr(C)]` ABI contract for plugins. No `rpi-*` deps; only `serde_json`, behind a default `json` feature that can be turned off |
 | [`rpi-extensions`](https://crates.io/crates/rpi-extensions) | Host-side plugin loader and the async-across-ABI tool bridge |
 
 Every crate has its own README and docs.rs page. The `crates/rpi-*`
@@ -182,9 +189,9 @@ changes what you can build with it:
   to run an agent inside your own process, with your own event handling and
   output — no shelling out to a tool and scraping stdout.
 - **Testable offline.** A deterministic `faux` provider and an in-memory
-  execution environment are first-class, not mocks bolted on. The default build
-  pulls no HTTP stack at all (`rpi-ai`'s providers are behind a feature flag), so
-  your test suite cannot silently depend on the network.
+  execution environment are first-class, not mocks bolted on. `rpi-ai` puts its
+  real HTTP providers behind a `providers` feature flag, so your test suite
+  cannot silently depend on the network for the paths you exercise.
 - **Durable.** Sessions are a tree with JSONL persistence and per-frame
   progress. A crash mid-tool-call resumes instead of losing the turn or
   double-executing the tool.
@@ -222,31 +229,32 @@ rebuild and re-measure on your own machine.
 
 | Metric | Value |
 | ------ | ----- |
-| Release binary size | **23.9 MiB** |
-| `rpi --version` wall time | **~18 ms** median |
-| RSS once the agent is ready | **18.6 MiB** |
+| Release binary size | **21.8 MiB** |
+| `rpi --version` wall time | **~17 ms** median |
+| RSS once the agent is ready | **12.0 MiB** |
 
-`node scripts/bench-vs-pi.mjs --pi <path-to-pi>` — measured against native Pi on
-the same machine, over the same RPC endpoint, with an isolated config directory
-and both tools offline:
+`node scripts/bench-vs-pi.mjs --pi <path-to-pi>` — against native Pi on the same
+machine, both offline, each with a fresh isolated config directory:
 
 | Metric | rpi (Rust) | pi (TypeScript) | Difference |
 | ------ | ---------: | --------------: | ---------- |
-| `--version` | **17.9 ms** | 172.9 ms | **9.7× faster** |
-| Time to a usable agent (RPC ready) | **103.6 ms** | 176.4 ms | **1.7× faster** |
-| RSS at ready | **18.6 MiB** | 91.6 MiB | **4.9× smaller** |
-| Install footprint | **23.9 MiB** (one binary) | ~513 MiB | **~21× smaller** |
+| `--version` | **17.5 ms** | 169.5 ms | **9.7× faster** |
+| Cold start | **17.7 ms** | 189.5 ms | **10.7× faster** |
+| RSS at ready | **12.0 MiB** | 91.5 MiB | **7.6× smaller** |
+| Install footprint | **21.8 MiB** (one binary) | ~385 MiB (+ ~91 MiB Node) | **~18–22× smaller** |
 
-The interesting part is where the time goes. Pi's cost is almost entirely Node
-startup — its `--version` and its fully-initialised agent differ by about 3 ms.
-rpi's process start is 17.9 ms, but reaching a usable agent takes 103.6 ms, so
-~86 ms (83% of its startup) is its own runtime initialisation rather than process
-or loader overhead. Further startup wins for rpi therefore have to come from lazy
-initialisation, not from a smaller binary — see the [roadmap](ROADMAP.md).
+**Cold start** is spawn → the agent answering its first command: process creation
+plus full initialisation, excluding teardown and any LLM work. rpi's `--version`
+(17.5 ms) and cold start (17.7 ms) are effectively equal, so startup is process
+creation, not initialisation; Pi is dominated by Node boot.
 
-The full method, raw per-run numbers, and an explicit list of what is *not*
-measured (LLM latency, tool-loop throughput, long sessions, TUI frame cost) are
-in [`docs/performance-vs-pi.md`](docs/performance-vs-pi.md).
+Isolation caveat: rpi reads `RPI_CODING_AGENT_DIR` / `RPI_OFFLINE`, native Pi reads
+`PI_CODING_AGENT_DIR` / `PI_OFFLINE`. Set the matching pair for each, or rpi
+silently loads the machine's global plugins.
+
+Method, raw per-run numbers, and what is *not* measured (LLM latency, tool-loop
+throughput, long sessions, TUI frame cost) are in
+[`docs/performance-vs-pi.md`](docs/performance-vs-pi.md).
 
 ## Plugins
 
@@ -299,7 +307,7 @@ machine. See [`docs/remote-mode.md`](docs/remote-mode.md).
 
 | | |
 | --- | --- |
-| Current release | **0.3.0** (nine crates, published together) |
+| Current release | **[0.3.9](https://github.com/bigfish1913/pi-rust/releases)** (nine crates, published together) |
 | Stability | `rpi-ai`, `rpi-agent`, `rpi-tools`, `rpi-harness`, `rpi-plugin-sdk` are the intended stable surface |
 | MSRV | 1.78 |
 | Platforms | Linux, macOS, Windows (CI runs the suite on Linux) |
@@ -326,6 +334,25 @@ build/test commands and the repository layout, and the
 through [SECURITY.md](SECURITY.md), not a public issue.
 
 The whole test suite runs offline: `cargo test --workspace --locked`.
+
+## Community
+
+Questions, ideas and early builds are welcome in either group:
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <img src="docs/images/weixin.png" width="230" alt="WeChat group QR code"><br>
+      <sub><b>WeChat</b> — <a href="https://weixin.qq.com/g/AQYAAD8z3FmKPk143hi_HUVOtGvNqlHWMtVZu1VGGB_46JKoNpyhJvS7kDwQwUTr">微信交流群</a></sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="docs/images/tg.png" width="230" alt="Telegram group QR code"><br>
+      <sub><b>Telegram</b> — <a href="https://t.me/+7YfN4TZPP7Y0M2Q1">t.me/+7YfN4TZPP7Y0M2Q1</a></sub>
+    </td>
+  </tr>
+</table>
+
+<sub>Group invite codes expire — WeChat's rotates every few days. If a QR code stops working, open an issue and it will be refreshed.</sub>
 
 ## License
 

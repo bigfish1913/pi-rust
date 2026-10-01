@@ -1,13 +1,16 @@
 //! Mirrors `packages/agent/src/harness/tools/bash.ts` — the built-in `bash`
-//! `AgentTool`. Drives `execute_shell_with_capture` with a 100ms-throttled
-//! `on_update`, and converts ALL failures (non-zero exit, timeout, abort,
+//! `AgentTool`. Drives `execute_shell_with_capture` with a 2-second checkpoint
+//! throttle, and converts ALL failures (non-zero exit, timeout, abort,
 //! executionError) into `Err(AgentError)` — the agent loop encodes those into an
 //! error `ToolResultMessage`.
 //!
-//! Throttle mirrors the TS `BASH_UPDATE_THROTTLE_MS`: at most one `on_update` per
-//! 100ms window; a final flush after capture resolves. `on_chunk` invocations
-//! from the capture layer mark the throttle dirty + schedule a flush.
+//! Throttle mirrors the TS `BASH_CHECKPOINT_INTERVAL_MS`: at most one
+//! checkpoint update per 2-second window; a final flush always follows capture
+//! resolution.
 
+use futures::future::BoxFuture;
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -30,7 +33,7 @@ use crate::tools::tool_context::ExecutionToolContext;
 use crate::truncate::{format_size, TruncationResult, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES};
 
 /// Throttle window for bash `on_update` flushes. Mirrors `BASH_UPDATE_THROTTLE_MS`.
-const BASH_UPDATE_THROTTLE_MS: u64 = 100;
+const BASH_UPDATE_THROTTLE_MS: u64 = 2_000;
 
 /// Input for the bash tool. Mirrors TS `BashToolInput`. `timeout` is in seconds.
 #[derive(Debug, Clone, JsonSchema, Deserialize)]
@@ -51,8 +54,22 @@ pub struct BashToolDetails {
     pub full_output_path: Option<String>,
 }
 
+/// Mutable execution description passed to the optional prepare hook.
+#[derive(Debug, Clone)]
+pub struct BashExecution {
+    pub command: String,
+    pub cwd: PathBuf,
+    pub env: HashMap<String, String>,
+    pub inherit_env: bool,
+}
+
+/// Async hook called immediately before shell execution, matching native Pi's
+/// `BashPrepare` extension point.
+pub type BashPrepare =
+    Arc<dyn Fn(&mut BashExecution) -> BoxFuture<'static, Result<(), String>> + Send + Sync>;
+
 /// Options for `create_bash_tool`. Mirrors TS `BashToolOptions`.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct BashToolOptions {
     /// Prepended to the command (separated by `\n`) before execution.
     pub command_prefix: Option<String>,
@@ -61,6 +78,8 @@ pub struct BashToolOptions {
     /// forever (reported as "卡住") — rpi injects this at the harness build
     /// site. A model-supplied timeout still wins.
     pub default_timeout: Option<f64>,
+    /// Optional async hook that can adjust command, cwd, and environment.
+    pub prepare: Option<BashPrepare>,
 }
 
 /// The built-in `bash` tool. Holds an `Arc<dyn ExecutionEnv>` (read-only view
@@ -124,10 +143,19 @@ impl AgentTool for BashTool {
         let input: BashInput = serde_json::from_value(params)
             .map_err(|e| AgentError::Validation(format!("bash input invalid: {e}")))?;
         validate_timeout(input.timeout)?;
-        let command = match &self.options.command_prefix {
-            Some(p) => format!("{p}\n{}", input.command),
-            None => input.command,
+        let mut execution = BashExecution {
+            command: match &self.options.command_prefix {
+                Some(p) => format!("{p}\n{}", input.command),
+                None => input.command,
+            },
+            cwd: self.env.cwd().to_path_buf(),
+            env: HashMap::new(),
+            inherit_env: true,
         };
+        if let Some(prepare) = &self.options.prepare {
+            prepare(&mut execution).await.map_err(AgentError::Tool)?;
+        }
+        let command = execution.command;
         let timeout = input.timeout.or(self.options.default_timeout);
 
         // Initial empty update (mirrors TS `onUpdate?.({ content: [], details: undefined })`).
@@ -190,12 +218,12 @@ impl AgentTool for BashTool {
             },
         );
 
-        let cwd = self.env.cwd().to_path_buf();
+        let cwd = execution.cwd;
         let env = self.env.clone();
         let capture_opts = ShellCaptureOptions {
             cwd: Some(cwd),
-            env: None,
-            inherit_env: true,
+            env: Some(execution.env),
+            inherit_env: execution.inherit_env,
             timeout,
             cancel: Some(&signal),
             on_chunk: Some(on_chunk),

@@ -254,6 +254,7 @@ pub async fn build(
         cwd.to_path_buf(),
         runtime.clone(),
         args.unknown_flags.clone(),
+        tool_context.clone(),
     );
     let host_arc: Arc<dyn rpi_extensions::RuntimeActionHost> = Arc::new(action_host);
     // `runtime` is reused below (B5c: `PluggableProvider` needs a captured
@@ -330,7 +331,7 @@ pub async fn build(
     // their per-session state off it. A session without an id (ephemeral) leaves
     // the field unset and a plugin is expected to fall back to project scope.
     if let Ok(metadata) = session.get_metadata().await {
-        tool_context.set_session_id(metadata.id);
+        publish_session_identity(&tool_context, &metadata.id);
     }
     // `--name`/`-n` sets the session display name durably (a `name` fact in the
     // log). It applies to whichever session this launch works in — a fresh one
@@ -1095,6 +1096,7 @@ where
                 ctx.cwd.clone(),
                 ctx.runtime.clone(),
                 ctx.args.unknown_flags.clone(),
+                ctx.tool_context.clone(),
             );
             crate::extensions_actions::HarnessActionHost::set_harness(
                 &_cell,
@@ -1685,6 +1687,7 @@ pub fn bash_options() -> rpi_tools::tools::bash::BashToolOptions {
     BashToolOptions {
         command_prefix: settings.shell_command_prefix.clone(),
         default_timeout: Some(default),
+        prepare: None,
     }
 }
 
@@ -2228,6 +2231,62 @@ pub async fn open_session_by_id(id: &str, cwd: &str) -> Result<Session, OpenErro
             other => other.to_string(),
         })
     })
+}
+
+/// Publish the active session's id to plugins, on both channels that carry it.
+///
+/// Called on **every** activation of a session — the startup build AND every
+/// in-process swap (`switch_to_session`, `fork_session`, and the plugin
+/// `NewSession`/`Fork`/`SwitchSession` runtime actions all route through
+/// [`set_active_session`]). Two things must stay in step:
+///
+/// - `ToolCallContext` — read per plugin **tool** call, which is why a stale
+///   value there made a plugin's `todo`-style state follow the wrong session.
+/// - `RPI_SESSION_ID` — read per **turn** by the provider hooks, which is the
+///   only channel an observer gets for a pure-chat run. Process-global, which is
+///   exactly the scope of "the session this process is serving".
+///
+/// The write overwrites unconditionally, deliberately. An inherited value is not
+/// an override: `rpi` spawning `rpi` would otherwise hand the child the parent's
+/// session id, and the child — which is *serving its own* session — would report
+/// it forever. (Children no longer inherit the variable at all; see
+/// `rpi_tools::HOST_PRIVATE_ENV`. This overwrite is the second line of defence,
+/// for any other way a value can arrive pre-set.)
+///
+/// An embedder that genuinely wants to pin the id can revert to the old
+/// behaviour by setting the variable *after* this runs; there is no supported
+/// way to pin it before, because a session that does not match its own id is
+/// never what the caller wants.
+fn publish_session_identity(tool_context: &rpi_extensions::ToolCallContext, id: &str) {
+    std::env::set_var(rpi_plugin_sdk::SESSION_ID_ENV, id);
+    tool_context.set_session_id(id);
+}
+
+/// Swap the session the harness serves, republishing the identity to plugins.
+///
+/// The single funnel for an in-process session change. Prefer this over calling
+/// `AgentHarness::set_session` directly: the harness holds no reference to the
+/// plugin channels, so a bare `set_session` would leave every plugin reporting
+/// the session it had before the swap.
+///
+/// `tool_context` is optional because not every caller has one (the harness's own
+/// tests, a headless embedder); the env channel is always published, since the
+/// provider hooks depend on it.
+pub(crate) async fn set_active_session(
+    harness: &AgentHarness,
+    session: Session,
+    tool_context: Option<&rpi_extensions::ToolCallContext>,
+) -> Result<(), String> {
+    if let Ok(metadata) = session.get_metadata().await {
+        std::env::set_var(rpi_plugin_sdk::SESSION_ID_ENV, &metadata.id);
+        if let Some(context) = tool_context {
+            context.set_session_id(metadata.id);
+        }
+    }
+    harness
+        .set_session(session)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Fork the harness's current session into a new JSONL session (new id, parent
@@ -3270,4 +3329,61 @@ mod tests {
 
     // NOTE: `build_tools`/`active_tool_names` integration is exercised by the
     // `tests/build.rs` harness-build test (needs a provider + multi-thread rt).
+
+    /// The exclusion policy, checked against the constants rather than copies.
+    ///
+    /// `rpi-tools` builds its exclusion from `rpi-plugin-sdk`'s declarations, so
+    /// within this repo a rename is a compile error — this test is not the link
+    /// between those two crates any more. What it still guards is the part the
+    /// compiler cannot see:
+    ///
+    /// - **The wire values.** `rpi-langfuse` lives in a different repository and
+    ///   agrees on the *strings*, not the constant paths. Rewriting a constant's
+    ///   value would compile here and silently stop matching there, so the exact
+    ///   values are pinned below. Changing one is a deliberate, breaking change to
+    ///   a cross-repo contract, and it should fail here first.
+    /// - **Coverage.** Every name the SDK declares must actually be excluded.
+    /// - **Narrowness.** The user's own configuration must still reach the shell.
+    #[test]
+    fn host_private_env_matches_the_declared_contract() {
+        // 1. The wire values. Pinned literally on purpose: see the doc comment.
+        assert_eq!(rpi_plugin_sdk::SESSION_ID_ENV, "RPI_SESSION_ID");
+        assert_eq!(
+            rpi_plugin_sdk::SUBAGENT_PARENT_ENV,
+            [
+                "LANGFUSE_PI_PARENT_TRACE_ID",
+                "LANGFUSE_PI_PARENT_SPAN_ID",
+                "LANGFUSE_PI_PARENT_SESSION_ID",
+                "LANGFUSE_PI_PARENT_DEPTH",
+            ],
+            "these strings are what rpi-langfuse (a different repo) matches; a \
+             change here is a breaking cross-repo change, not a refactor"
+        );
+
+        // 2. Coverage — derived from the declarations, so a newly added family
+        //    member is checked without anyone remembering to extend this test.
+        for name in rpi_plugin_sdk::SUBAGENT_PARENT_ENV
+            .iter()
+            .chain(std::iter::once(&rpi_plugin_sdk::SESSION_ID_ENV))
+        {
+            assert!(
+                rpi_tools::is_host_private_env(name),
+                "`{name}` must not reach a spawned shell, but rpi-tools excludes only {:?}",
+                rpi_tools::HOST_PRIVATE_ENV
+            );
+        }
+
+        // 3. Narrowness — these name how the *user* configured the run and are
+        //    exactly what a command inside the shell should still see.
+        for visible in [
+            crate::args::RPI_OFFLINE_ENV,
+            crate::config::CONFIG_DIR_ENV,
+            "PATH",
+        ] {
+            assert!(
+                !rpi_tools::is_host_private_env(visible),
+                "{visible} describes the user's configuration and must still reach the shell"
+            );
+        }
+    }
 }

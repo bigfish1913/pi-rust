@@ -28,7 +28,8 @@ manifest below, push the taps, open the winget PR, publish to crates.io, deploy
 the site — is one command; see [`docs/releasing.md`](../docs/releasing.md):
 
 ```bash
-task release RELEASE_VERSION=0.3.4
+task publish                 # auto-increments the version
+task release RELEASE_VERSION=0.3.4   # explicit version
 ```
 
 Add `-- --dry-run` to print the plan without executing anything.
@@ -40,10 +41,10 @@ the binary at the archive root** and a `.sha256` beside every archive:
 
 | Target | Asset | sha256 (v0.3.2) |
 | --- | --- | --- |
-| `x86_64-unknown-linux-gnu` | `rpi-v0.3.2-x86_64-unknown-linux-gnu.tar.gz` | `ba7c5c05cbfbabe96c78b74e384c287aadfc23f28034dbcef59bd5b20f8a7b12` |
-| `aarch64-unknown-linux-gnu` | `rpi-v0.3.2-aarch64-unknown-linux-gnu.tar.gz` | `2c7616d0a6fcd068750b0319fe54447b346508bd9d9b48c6e59511e25cfabcbf` |
-| `aarch64-apple-darwin` | `rpi-v0.3.2-aarch64-apple-darwin.tar.gz` | `147cf807d16d400f345cbf8bfcd0f823bb7073fef00027999db58665e143c4f9` |
-| `x86_64-pc-windows-msvc` | `rpi-v0.3.2-x86_64-pc-windows-msvc.zip` | `1f62154581fd5cb3c6e60ead2a7d28a124695280627540477c0b55e7e6f0bd82` |
+| `x86_64-unknown-linux-gnu` | `rpi-v0.3.2-x86_64-unknown-linux-gnu.tar.gz` | `048893c6034c85dccc4d8174acb86060a4679799acce72c5dde954a98f20a14f` |
+| `aarch64-unknown-linux-gnu` | `rpi-v0.3.2-aarch64-unknown-linux-gnu.tar.gz` | `db8727ca7fba01c6ff9feb5780358920f2fa780a42dc0229535b03504daade14` |
+| `aarch64-apple-darwin` | `rpi-v0.3.2-aarch64-apple-darwin.tar.gz` | `0c2b0c4a57586d71d4ea635b6f8a823ea62e746c740582d7cad6607821ee7b98` |
+| `x86_64-pc-windows-msvc` | `rpi-v0.3.2-x86_64-pc-windows-msvc.zip` | `e67eb5b636679772b81284c9784a85ebee67056f1bfdb86d09f1db96f2376871` |
 
 Two consequences worth knowing:
 
@@ -59,7 +60,7 @@ Two consequences worth knowing:
 networks (this machine included), so use `gh`, which goes through the API:
 
 ```bash
-TAG=v0.3.6                      # the tag being packaged
+TAG=v0.3.11                      # the tag being packaged
 gh release download "$TAG" --pattern "*.sha256" --dir /tmp/rpi-sha --clobber
 cat /tmp/rpi-sha/*.sha256
 ```

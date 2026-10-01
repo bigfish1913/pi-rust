@@ -6,9 +6,9 @@
  *
  *   1. `--version`      process spawn -> exit. The floor cost of starting the
  *                       tool at all.
- *   2. RPC ready        process spawn -> the answer to a real
- *                       `{"type":"get_state"}` request on the JSONL RPC channel.
- *                       This is the metric native pi's own
+ *   2. Cold start       process spawn -> the answer to a real
+ *                       `{"type":"get_state"}` request sent over the child's
+ *                       JSONL command channel. This is the metric native pi's own
  *                       `scripts/profile-coding-agent-node.mjs` defines for "the
  *                       agent is actually usable", so it is the fair comparison
  *                       point rather than something invented here.
@@ -23,8 +23,14 @@
  * Fairness rules applied to both sides:
  *   - `PI_OFFLINE=1` and a fresh, empty `PI_CODING_AGENT_DIR` per run, so neither
  *     performs network work and neither reads machine-specific config,
- *     extensions or sessions. rpi honours the same `PI_OFFLINE` variable native
- *     pi sets, so neither is disadvantaged by the offline settings.
+ *     extensions or sessions. rpi uses **its own** variable names
+ *     (`RPI_OFFLINE` / `RPI_CODING_AGENT_DIR`), so the harness sets those too —
+ *     setting only the `PI_*` names leaves rpi pointed at the real
+ *     `~/.rpi/agent` and silently loads the machine's global plugin set, which
+ *     dominates startup and makes the comparison meaningless.
+ *   - a placeholder `ANTHROPIC_API_KEY` for both tools. rpi refuses to build a
+ *     session in an empty config dir without some provider credential, so an
+ *     isolated run needs one; it is never used because both tools run offline.
  *   - a neutral temporary working directory for both, so neither scans this
  *     repository on startup.
  *   - provider credentials are cleared from the environment.
@@ -154,10 +160,17 @@ const mib = (bytes) => `${(bytes / 1048576).toFixed(1)} MiB`;
 function runEnvironment(agentDir) {
   return {
     ...process.env,
+    // native pi
     PI_OFFLINE: "1",
     PI_SKIP_VERSION_CHECK: "1",
     PI_CODING_AGENT_DIR: agentDir,
-    ANTHROPIC_API_KEY: "",
+    // rpi — same isolation, its own variable names. Without these rpi ignores the
+    // PI_* vars above and loads the real ~/.rpi/agent (global extensions included).
+    RPI_OFFLINE: "1",
+    RPI_CODING_AGENT_DIR: agentDir,
+    // Real credentials are cleared. The placeholder only lets rpi resolve a
+    // default model in an otherwise empty config dir; offline, it is never sent.
+    ANTHROPIC_API_KEY: "bench-placeholder",
     ANTHROPIC_AUTH_TOKEN: "",
     OPENAI_API_KEY: "",
   };
@@ -177,8 +190,13 @@ function measureVersion(tool, { env, cwd }) {
  * Spawn the tool in RPC mode, ask for `get_state`, and wait for the answer.
  * No sampling happens in here -- see the header for why.
  */
-function measureRpc(tool, { env, cwd, timeoutMs = 180000, onReady }) {
+function measureColdStart(tool, { env, cwd, timeoutMs = 180000, onReady }) {
   return new Promise((resolvePromise, reject) => {
+    // Start the clock *before* spawn(), so process creation is included. Node's
+    // spawn() does a synchronous chunk of the work on Windows (~7 ms); timing
+    // from after it understates time-to-cold-start and is not comparable with
+    // measureVersion(), which times from before spawnSync().
+    const startedAt = performance.now();
     const child = spawn(tool.invocation.command, [...tool.invocation.args, "--mode", "rpc"], {
       env,
       cwd,
@@ -188,7 +206,6 @@ function measureRpc(tool, { env, cwd, timeoutMs = 180000, onReady }) {
     let stdoutBuffer = "";
     let stderr = "";
     let settled = false;
-    const startedAt = performance.now();
 
     const timer = setTimeout(() => {
       if (settled) return;
@@ -303,7 +320,7 @@ async function main() {
   try {
     for (const tool of tools) {
       const versionTimes = [];
-      const readyTimes = [];
+      const coldStartTimes = [];
       const rssValues = [];
       const total = options.runs + options.warmup;
 
@@ -317,15 +334,15 @@ async function main() {
 
         const measured = index >= options.warmup;
         const versionMs = measureVersion(tool, { env, cwd: neutralCwd });
-        const rpc = await measureRpc(tool, { env, cwd: neutralCwd });
+        const coldStart = await measureColdStart(tool, { env, cwd: neutralCwd });
 
         if (measured) {
           versionTimes.push(versionMs);
-          readyTimes.push(rpc.elapsedMs);
+          coldStartTimes.push(coldStart.elapsedMs);
         }
 
         const tag = measured ? `run ${index - options.warmup + 1}` : `warmup ${index + 1}`;
-        console.log(`  ${tool.name.padEnd(3)} ${tag.padEnd(9)} version ${ms(versionMs).padStart(9)}   rpc-ready ${ms(rpc.elapsedMs).padStart(9)}`);
+        console.log(`  ${tool.name.padEnd(3)} ${tag.padEnd(9)} version ${ms(versionMs).padStart(9)}   cold-start ${ms(coldStart.elapsedMs).padStart(9)}`);
       }
 
       // Separate phase: reading another process's RSS costs a `tasklist` spawn on
@@ -337,7 +354,7 @@ async function main() {
         mkdirSync(agentDir, { recursive: true });
         mkdirSync(neutralCwd, { recursive: true });
         const env = runEnvironment(agentDir);
-        const { extra } = await measureRpc(tool, {
+        const { extra } = await measureColdStart(tool, {
           env,
           cwd: neutralCwd,
           onReady: (child) => readRssBytes(child.pid),
@@ -351,8 +368,8 @@ async function main() {
         version: tool.version,
         versionMs: median(versionTimes),
         versionAll: versionTimes,
-        rpcReadyMs: median(readyTimes),
-        rpcReadyAll: readyTimes,
+        coldStartMs: median(coldStartTimes),
+        coldStartAll: coldStartTimes,
         rssAtReadyBytes: rssValues.length ? median(rssValues) : null,
         rssAtReadyAll: rssValues,
       };
@@ -366,7 +383,7 @@ async function main() {
   const pi = results.pi;
   const rows = [
     ["`--version` (median)", ms(rpi.versionMs), ms(pi.versionMs), `${(pi.versionMs / rpi.versionMs).toFixed(1)}× faster`],
-    ["RPC ready (median)", ms(rpi.rpcReadyMs), ms(pi.rpcReadyMs), `${(pi.rpcReadyMs / rpi.rpcReadyMs).toFixed(1)}× faster`],
+    ["Cold start (median)", ms(rpi.coldStartMs), ms(pi.coldStartMs), `${(pi.coldStartMs / rpi.coldStartMs).toFixed(1)}× faster`],
   ];
   if (rpi.rssAtReadyBytes && pi.rssAtReadyBytes) {
     rows.push(["RSS at ready", mib(rpi.rssAtReadyBytes), mib(pi.rssAtReadyBytes), `${(pi.rssAtReadyBytes / rpi.rssAtReadyBytes).toFixed(1)}× smaller`]);
