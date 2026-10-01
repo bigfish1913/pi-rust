@@ -240,13 +240,19 @@ fn voice_registers_a_prompt_transformer_that_respects_the_speech_switch() {
     // registration; drive it through the same door the plugin reads so the test
     // is independent of test ordering. `/voice on|off` sets the same flag.
     let speech_on = std::env::var("RPI_VOICE_AUTO_TTS")
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "on" | "1" | "true" | "yes"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "on" | "1" | "true" | "yes"
+            )
+        })
         .unwrap_or(false);
     if !speech_on {
         eprintln!("RPI_VOICE_AUTO_TTS is not on — exercising only the no-change path");
         let payload = transform(h, "BASE");
         assert_eq!(
-            payload, serde_json::json!({}),
+            payload,
+            serde_json::json!({}),
             "with speech off the plugin must report no change"
         );
         return;
@@ -268,8 +274,14 @@ fn voice_registers_a_prompt_transformer_that_respects_the_speech_switch() {
     );
     // The user's ask, verbatim: acknowledge first, then say what you are about
     // to do. Pin both so a rewrite that drops them is caught here.
-    assert!(next.contains("Acknowledge first"), "missing acknowledgement rule");
-    assert!(next.contains("Announce before you act"), "missing announce rule");
+    assert!(
+        next.contains("Acknowledge first"),
+        "missing acknowledgement rule"
+    );
+    assert!(
+        next.contains("Announce before you act"),
+        "missing announce rule"
+    );
 
     // Idempotent: a second pass must not duplicate the section.
     let again = transform(h, next);
