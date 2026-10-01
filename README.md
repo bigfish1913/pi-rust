@@ -335,6 +335,25 @@ through [SECURITY.md](SECURITY.md), not a public issue.
 
 The whole test suite runs offline: `cargo test --workspace --locked`.
 
+## Community
+
+Questions, ideas and early builds are welcome in either group:
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <img src="docs/images/weixin.png" width="230" alt="WeChat group QR code"><br>
+      <sub><b>WeChat</b> — <a href="https://weixin.qq.com/g/AQYAAD8z3FmKPk143hi_HUVOtGvNqlHWMtVZu1VGGB_46JKoNpyhJvS7kDwQwUTr">微信交流群</a></sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="docs/images/tg.png" width="230" alt="Telegram group QR code"><br>
+      <sub><b>Telegram</b> — <a href="https://t.me/+7YfN4TZPP7Y0M2Q1">t.me/+7YfN4TZPP7Y0M2Q1</a></sub>
+    </td>
+  </tr>
+</table>
+
+<sub>Group invite codes expire — WeChat's rotates every few days. If a QR code stops working, open an issue and it will be refreshed.</sub>
+
 ## License
 
 MIT. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
