@@ -11,6 +11,33 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+### Added
+
+- `rpi update` performs a real self-update again. `a5506dd` had reduced it to a
+  bare `cargo install` that ignored its arguments, so `rpi update --help`
+  reinstalled the crate instead of printing help and `--offline` did nothing.
+  Restored: argument validation, `--help`, the `cargo binstall`/`cargo install`
+  path, direct binary replacement on Unix, the staged PowerShell replacement on
+  Windows (a running `.exe` cannot replace itself), staged-binary version
+  validation, rollback, and the status report shown on the next start.
+- The startup update check covers the rpi release and installed Rust extensions
+  again, with the 6-hour cache and per-item fallback that survived a registry
+  outage.
+
+### Changed
+
+- The Pi compatibility layer is *not* restored: `rpi package`, `pi-package
+  update`, `install-pi`, `uninstall-pi` and `--enable-pi-packages` stay removed,
+  along with the npm/Git package stores and the Node extension host.
+
+### Fixed
+
+- Removed subcommands no longer fall through to the prompt path. `rpi package
+  update` used to be sent to the model as the message "package update" and
+  appeared to hang; it now fails immediately with a pointer to `rpi install` /
+  `rpi uninstall` / `rpi update`. `rpi self-update` reports the same way and
+  points at `rpi update`.
+
 ## [0.3.8] - 2026-09-30
 
 ## [0.3.6] - 2026-09-30

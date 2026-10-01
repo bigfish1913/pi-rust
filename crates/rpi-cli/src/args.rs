@@ -61,6 +61,15 @@ pub(crate) fn normalize_offline_mode(args: &[String]) -> bool {
     enabled
 }
 
+/// Drop the global `--offline` flag before an early-dispatched subcommand parses
+/// its own arguments (`rpi update --offline` must not see it as a stray arg).
+pub(crate) fn without_offline_flag(args: &[String]) -> Vec<String> {
+    args.iter()
+        .filter(|arg| arg.as_str() != "--offline")
+        .cloned()
+        .collect()
+}
+
 /// Output mode. Mirrors rpi's text/json/rpc modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
