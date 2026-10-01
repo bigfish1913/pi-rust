@@ -1553,7 +1553,6 @@ mod tests {
         assert!(api.register_event_handler.is_none());
         assert!(api.register_resources_discover.is_none());
         assert!(api.register_before_agent_start.is_none());
-        assert!(api.register_before_agent_start.is_none());
         // Copy (POD) — no UB from a plain copy.
         let _copy = api;
         assert!(!core::mem::needs_drop::<PluginApi>());
