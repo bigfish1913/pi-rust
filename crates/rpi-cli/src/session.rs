@@ -254,6 +254,7 @@ pub async fn build(
         cwd.to_path_buf(),
         runtime.clone(),
         args.unknown_flags.clone(),
+        tool_context.clone(),
     );
     let host_arc: Arc<dyn rpi_extensions::RuntimeActionHost> = Arc::new(action_host);
     // `runtime` is reused below (B5c: `PluggableProvider` needs a captured
@@ -330,21 +331,7 @@ pub async fn build(
     // their per-session state off it. A session without an id (ephemeral) leaves
     // the field unset and a plugin is expected to fall back to project scope.
     if let Ok(metadata) = session.get_metadata().await {
-        // Publish the id to **every** plugin, not just to tools. `__rpi` reaches a
-        // plugin only on a tool call, so an observer that traces a run (rpi-langfuse
-        // reports it as the Langfuse session id) had no way to name the session
-        // until the first tool call — and never at all for a pure-chat run. The
-        // env var is process-global, which is exactly the scope of "the session
-        // this process is serving"; it is set once here, before any agent turn.
-        //
-        // An explicitly present `RPI_SESSION_ID` (an embedder's override, or a
-        // stale one inherited from a parent process) is respected: the host does
-        // not clobber it. The id is host-generated plain UTF-8 with no NUL, which
-        // is what keeps `set_var` sound.
-        if std::env::var_os(rpi_plugin_sdk::SESSION_ID_ENV).is_none() {
-            std::env::set_var(rpi_plugin_sdk::SESSION_ID_ENV, &metadata.id);
-        }
-        tool_context.set_session_id(metadata.id);
+        publish_session_identity(&tool_context, &metadata.id);
     }
     // `--name`/`-n` sets the session display name durably (a `name` fact in the
     // log). It applies to whichever session this launch works in — a fresh one
@@ -1109,6 +1096,7 @@ where
                 ctx.cwd.clone(),
                 ctx.runtime.clone(),
                 ctx.args.unknown_flags.clone(),
+                ctx.tool_context.clone(),
             );
             crate::extensions_actions::HarnessActionHost::set_harness(
                 &_cell,
@@ -2245,6 +2233,62 @@ pub async fn open_session_by_id(id: &str, cwd: &str) -> Result<Session, OpenErro
     })
 }
 
+/// Publish the active session's id to plugins, on both channels that carry it.
+///
+/// Called on **every** activation of a session — the startup build AND every
+/// in-process swap (`switch_to_session`, `fork_session`, and the plugin
+/// `NewSession`/`Fork`/`SwitchSession` runtime actions all route through
+/// [`set_active_session`]). Two things must stay in step:
+///
+/// - `ToolCallContext` — read per plugin **tool** call, which is why a stale
+///   value there made a plugin's `todo`-style state follow the wrong session.
+/// - `RPI_SESSION_ID` — read per **turn** by the provider hooks, which is the
+///   only channel an observer gets for a pure-chat run. Process-global, which is
+///   exactly the scope of "the session this process is serving".
+///
+/// The write overwrites unconditionally, deliberately. An inherited value is not
+/// an override: `rpi` spawning `rpi` would otherwise hand the child the parent's
+/// session id, and the child — which is *serving its own* session — would report
+/// it forever. (Children no longer inherit the variable at all; see
+/// `rpi_tools::HOST_PRIVATE_ENV`. This overwrite is the second line of defence,
+/// for any other way a value can arrive pre-set.)
+///
+/// An embedder that genuinely wants to pin the id can revert to the old
+/// behaviour by setting the variable *after* this runs; there is no supported
+/// way to pin it before, because a session that does not match its own id is
+/// never what the caller wants.
+fn publish_session_identity(tool_context: &rpi_extensions::ToolCallContext, id: &str) {
+    std::env::set_var(rpi_plugin_sdk::SESSION_ID_ENV, id);
+    tool_context.set_session_id(id);
+}
+
+/// Swap the session the harness serves, republishing the identity to plugins.
+///
+/// The single funnel for an in-process session change. Prefer this over calling
+/// `AgentHarness::set_session` directly: the harness holds no reference to the
+/// plugin channels, so a bare `set_session` would leave every plugin reporting
+/// the session it had before the swap.
+///
+/// `tool_context` is optional because not every caller has one (the harness's own
+/// tests, a headless embedder); the env channel is always published, since the
+/// provider hooks depend on it.
+pub(crate) async fn set_active_session(
+    harness: &AgentHarness,
+    session: Session,
+    tool_context: Option<&rpi_extensions::ToolCallContext>,
+) -> Result<(), String> {
+    if let Ok(metadata) = session.get_metadata().await {
+        std::env::set_var(rpi_plugin_sdk::SESSION_ID_ENV, &metadata.id);
+        if let Some(context) = tool_context {
+            context.set_session_id(metadata.id);
+        }
+    }
+    harness
+        .set_session(session)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Fork the harness's current session into a new JSONL session (new id, parent
 /// set to the source) and wrap it in a `Session`. Mirrors the TUI's
 /// `fork_session` flow (`interactive_tui.rs`) — hoisted here so both the TUI
@@ -3285,4 +3329,33 @@ mod tests {
 
     // NOTE: `build_tools`/`active_tool_names` integration is exercised by the
     // `tests/build.rs` harness-build test (needs a provider + multi-thread rt).
+
+    #[test]
+    fn host_private_env_matches_the_plugin_contract() {
+        // `rpi-tools` excludes these names from a spawned shell's environment,
+        // naming them as literals because it must not depend on `rpi-plugin-sdk`
+        // to spell one string. That independence is the risk: rename the plugin
+        // constant and the exclusion would silently stop matching, re-leaking the
+        // variable into every `bash` child (including a nested `rpi`, which would
+        // then misreport its session). Assert the two agree here, where both
+        // crates are in scope.
+        assert!(
+            rpi_tools::is_host_private_env(rpi_plugin_sdk::SESSION_ID_ENV),
+            "rpi-tools must exclude `{}` from a spawned shell; it currently excludes {}",
+            rpi_plugin_sdk::SESSION_ID_ENV,
+            rpi_tools::HOST_PRIVATE_ENV.join(", ")
+        );
+        // And the list must stay narrow: these name how the *user* configured the
+        // run and are exactly what a command inside the shell should still see.
+        for visible in [
+            crate::args::RPI_OFFLINE_ENV,
+            crate::config::CONFIG_DIR_ENV,
+            "PATH",
+        ] {
+            assert!(
+                !rpi_tools::is_host_private_env(visible),
+                "{visible} describes the user's configuration and must still reach the shell"
+            );
+        }
+    }
 }

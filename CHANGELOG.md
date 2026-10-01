@@ -22,8 +22,8 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
   upstream TypeScript plugin's `"Pi Turn"` / `"pi"` for exactly that reason.
 - The host now publishes the session id twice, so an extension that observes a
   run can name the session it is watching. `RPI_SESSION_ID` (constant:
-  `rpi_plugin_sdk::SESSION_ID_ENV`) is written once the session exists, before
-  the first turn, and `BeforeAgentStart`'s payload carries `sessionId` next to
+  `rpi_plugin_sdk::SESSION_ID_ENV`) is written whenever a session becomes active,
+  and `BeforeAgentStart`'s payload carries `sessionId` next to
   `prompt`/`imageCount`, recomputed each turn. Previously the only channel was
   `__rpi.sessionId` on a plugin **tool** call, so a tracing extension reported a
   placeholder session for a pure-chat run and for every turn before the first
@@ -32,6 +32,20 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ### Fixed
 
+- Switching sessions no longer leaves plugins naming the previous one. The
+  session id reaches a plugin on two channels — the `ToolCallContext` (read per
+  plugin **tool** call) and `RPI_SESSION_ID` (read per turn by the provider
+  hooks) — and only the startup build republished them. An in-process swap
+  (`/import`, `/fork`, the `/session` selector, and the plugin
+  `NewSession`/`Fork`/`SwitchSession` runtime actions) changed the session the
+  harness serves without touching either, so a plugin keyed to the old id went
+  on serving it. All of them now route through one funnel that republishes both.
+- `RPI_SESSION_ID` no longer leaks into the shell that `bash`/`powershell`
+  spawn. The shell inherited the whole process environment, so the variable
+  reached anything the command ran — including another `rpi`, which had no way
+  to tell its ancestor's session from its own. A small deny-list now keeps the
+  host's own plumbing out of a spawned shell, while explicit per-call values
+  still pass through.
 - `rpi update` no longer refuses to run when the running `rpi` was launched
   through a link, junction, or `subst` drive. The path validation demanded that
   `canonicalize()` reproduce the launch path byte for byte, so any link *above*

@@ -64,6 +64,26 @@ struct ShellConfig {
     transport: CommandTransport,
 }
 
+/// Environment variables the host sets for its own runtime plumbing and must
+/// **not** hand to a shell it spawns.
+///
+/// A spawned shell is a child process, so anything inherited reaches whatever
+/// that shell runs — including another `rpi`. `RPI_SESSION_ID` names the session
+/// *this process* serves, which is meaningless (and actively misleading) in a
+/// descendant: the child would either report the parent's session or, seeing the
+/// variable already present, refuse to publish its own. Both are wrong answers,
+/// and neither is visible from the child.
+///
+/// Exposed so a host crate can assert this list agrees with its own contract
+/// constants (see `rpi-cli`'s `host_private_env_matches_the_plugin_contract`)
+/// rather than the two drifting apart silently.
+pub const HOST_PRIVATE_ENV: &[&str] = &["RPI_SESSION_ID"];
+
+/// Whether `name` is host-private and must not be inherited by a spawned shell.
+pub fn is_host_private_env(name: &str) -> bool {
+    HOST_PRIVATE_ENV.contains(&name)
+}
+
 /// Real-OS `ExecutionEnv`. Clone shares the tracked-pid set + registry.
 pub struct OsExecutionEnv {
     cwd: PathBuf,
@@ -786,9 +806,17 @@ impl Shell for OsExecutionEnv {
         let mut cmd = tokio::process::Command::new(&shell_cfg.shell);
         cmd.current_dir(&cwd);
         cmd.env_clear();
-        // Environment: inherit + shell_env + per-call.
+        // Environment: inherit + shell_env + per-call. The host's own private
+        // plumbing (`HOST_PRIVATE_ENV`) is skipped: it describes *this* process,
+        // not the shell or anything the shell runs, and inheriting it makes a
+        // nested `rpi` misreport its session. A caller that genuinely wants a
+        // value passed down can still set it explicitly through `env`/`shell_env`
+        // below (those are applied after this loop and win).
         if options.inherit_env {
             for (k, v) in std::env::vars() {
+                if is_host_private_env(&k) {
+                    continue;
+                }
                 cmd.env(k, v);
             }
         }

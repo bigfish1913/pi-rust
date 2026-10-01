@@ -89,9 +89,10 @@ impl ProviderHooks for ExtensionProviderHooks {
                     "imageCount": image_count,
                     // The session this process serves. A plugin that traces the
                     // run reports it as the session id (nothing else tells an
-                    // observer which session it is watching). Read here (not at
-                    // harness build) so an embedder's `RPI_SESSION_ID` override
-                    // is picked up on every turn.
+                    // observer which session it is watching). Read from the
+                    // environment per turn rather than captured at harness build,
+                    // so an in-process session swap is reflected on the very next
+                    // turn.
                     "sessionId": std::env::var(rpi_plugin_sdk::SESSION_ID_ENV).ok(),
                     // Who this extension is embedded in, so it can label its own
                     // output (trace name, tags, `service.name`) without

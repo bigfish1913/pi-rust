@@ -610,10 +610,13 @@ pub const HOST_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Environment variable carrying the id of the session this process serves.
 ///
-/// The host sets it once the session exists (before the first turn) so an
-/// extension that observes a run can name the session without waiting for a
-/// tool call — `__rpi.sessionId` only reaches a plugin on a tool call, and never
-/// for a pure-chat run. An already-present value is honored as an override.
+/// The host **rewrites** it whenever a session becomes active — at startup and
+/// on every in-process swap (`/import`, fork, switch) — so the value always
+/// names the session currently being served. It is not an embedder override:
+/// a value inherited from a parent process would otherwise make a child `rpi`
+/// report its ancestor's session forever. Embedders that need to pin the id set
+/// it after the session is active rather than before.
+///
 /// The id is a plain UTF-8 string (no NUL), which is what makes writing it with
 /// `std::env::set_var` sound.
 pub const SESSION_ID_ENV: &str = "RPI_SESSION_ID";
