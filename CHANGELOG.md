@@ -13,6 +13,13 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ### Added
 
+- The plugin contract now owns the host identity: `rpi_plugin_sdk::HOST_NAME`
+  (`"rpi"`) and `HOST_VERSION`, with `rpi_cli::APP_NAME` / `VERSION` defined as
+  aliases of them so the two cannot drift. `BeforeAgentStart`'s payload carries
+  `host: {name, version}`, giving an extension a way to label its own output (a
+  trace name, a tag, `service.name`) from the host instead of hardcoding a brand
+  that a rename silently invalidates. `rpi-langfuse` had been reporting the
+  upstream TypeScript plugin's `"Pi Turn"` / `"pi"` for exactly that reason.
 - The host now publishes the session id twice, so an extension that observes a
   run can name the session it is watching. `RPI_SESSION_ID` (constant:
   `rpi_plugin_sdk::SESSION_ID_ENV`) is written once the session exists, before

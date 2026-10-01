@@ -585,6 +585,29 @@ pub enum EventTag {
 /// `EVENT_TAG_COUNT == 37` so a future edit that adds/removes a tag is caught.
 pub const EVENT_TAG_COUNT: usize = 37;
 
+/// The application name of the host that loads plugins: `"rpi"`.
+///
+/// This is the **contract's** copy of the host identity, and the host's
+/// `APP_NAME` is defined in terms of it, so the two cannot drift. An extension
+/// that labels its own output (a trace name, a tag, a `service.name`) should
+/// derive from this rather than hardcode a brand — it has no other way to learn
+/// what it is embedded in.
+///
+/// [`HOST_VERSION`] is the matching version. Both are also handed to plugins at
+/// runtime in the `BeforeAgentStart` payload's `host` object, which is what an
+/// extension should prefer: that value always describes the process actually
+/// running, whereas these constants describe the host the plugin was *built*
+/// against.
+pub const HOST_NAME: &str = "rpi";
+
+/// Version of the [`HOST_NAME`] host that this SDK ships with.
+///
+/// Because every workspace crate shares one version, this is the host's version
+/// as of this SDK release — good for a user agent or a fallback label, and
+/// superseded at runtime by the `host.version` field of the `BeforeAgentStart`
+/// payload.
+pub const HOST_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Environment variable carrying the id of the session this process serves.
 ///
 /// The host sets it once the session exists (before the first turn) so an

@@ -93,6 +93,13 @@ impl ProviderHooks for ExtensionProviderHooks {
                     // harness build) so an embedder's `RPI_SESSION_ID` override
                     // is picked up on every turn.
                     "sessionId": std::env::var(rpi_plugin_sdk::SESSION_ID_ENV).ok(),
+                    // Who this extension is embedded in, so it can label its own
+                    // output (trace name, tags, `service.name`) without
+                    // hardcoding a brand that a rename would silently
+                    // invalidate. Sent per turn, so it describes the process
+                    // actually running rather than the SDK the plugin was built
+                    // against.
+                    "host": host_identity(),
                 });
                 // Synchronous, like the request dispatch below: a subscriber's
                 // `BeforeAgentStart` handler runs before any
@@ -148,6 +155,20 @@ impl ProviderHooks for ExtensionProviderHooks {
             &json.to_string(),
         );
     }
+}
+
+/// The host's own identity, as handed to plugins.
+///
+/// The name is the plugin contract's constant ([`rpi_plugin_sdk::HOST_NAME`])
+/// and the version is this host crate's own `CARGO_PKG_VERSION` — every
+/// workspace crate shares one version, so this is the running host's version
+/// and not the SDK a plugin was compiled against. Both are compile-time
+/// aliases, so there is exactly one place to change either.
+fn host_identity() -> serde_json::Value {
+    serde_json::json!({
+        "name": rpi_plugin_sdk::HOST_NAME,
+        "version": env!("CARGO_PKG_VERSION"),
+    })
 }
 
 /// Text/timestamp/image-count of the most recent user message. Mirrors the
@@ -295,6 +316,14 @@ mod tests {
             Some(std::env::var(rpi_plugin_sdk::SESSION_ID_ENV).is_err()),
             "sessionId must mirror the host's session id env var: {}",
             agent_starts[0].1
+        );
+        // And the host identifies itself, so a plugin can label its own output
+        // (trace name, tags, service.name) without hardcoding a brand.
+        assert_eq!(start_payload["host"]["name"], rpi_plugin_sdk::HOST_NAME);
+        assert_eq!(
+            start_payload["host"]["version"],
+            env!("CARGO_PKG_VERSION"),
+            "the host reports the version of the host, not of the plugin SDK"
         );
 
         let requests: Vec<_> = captured
