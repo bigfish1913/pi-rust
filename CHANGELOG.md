@@ -11,6 +11,8 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.3.12] - 2026-10-01
+
 ### Added
 
 - Plugins can now replace the system prompt at runtime via
