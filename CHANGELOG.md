@@ -11,6 +11,18 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+### Added
+
+- The host now publishes the session id twice, so an extension that observes a
+  run can name the session it is watching. `RPI_SESSION_ID` (constant:
+  `rpi_plugin_sdk::SESSION_ID_ENV`) is written once the session exists, before
+  the first turn, and `BeforeAgentStart`'s payload carries `sessionId` next to
+  `prompt`/`imageCount`, recomputed each turn. Previously the only channel was
+  `__rpi.sessionId` on a plugin **tool** call, so a tracing extension reported a
+  placeholder session for a pure-chat run and for every turn before the first
+  tool call. The payload field is the one that makes the first turn correct; the
+  environment variable is a convenience for plugins that never see a tool call.
+
 ### Fixed
 
 - `rpi update` no longer refuses to run when the running `rpi` was launched

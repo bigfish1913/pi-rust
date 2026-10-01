@@ -585,6 +585,16 @@ pub enum EventTag {
 /// `EVENT_TAG_COUNT == 37` so a future edit that adds/removes a tag is caught.
 pub const EVENT_TAG_COUNT: usize = 37;
 
+/// Environment variable carrying the id of the session this process serves.
+///
+/// The host sets it once the session exists (before the first turn) so an
+/// extension that observes a run can name the session without waiting for a
+/// tool call — `__rpi.sessionId` only reaches a plugin on a tool call, and never
+/// for a pure-chat run. An already-present value is honored as an override.
+/// The id is a plain UTF-8 string (no NUL), which is what makes writing it with
+/// `std::env::set_var` sound.
+pub const SESSION_ID_ENV: &str = "RPI_SESSION_ID";
+
 /// No-payload marker for events that carry none (e.g. `session_shutdown`).
 /// Carries a dummy byte so the empty-struct isn't flagged FFI-unsafe by
 /// `improper_ctypes` (zero-sized C structs are rejected regardless of `repr(C)`).

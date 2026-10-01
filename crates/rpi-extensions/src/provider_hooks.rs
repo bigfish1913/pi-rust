@@ -87,7 +87,18 @@ impl ProviderHooks for ExtensionProviderHooks {
                 let event = serde_json::json!({
                     "prompt": prompt,
                     "imageCount": image_count,
+                    // The session this process serves. A plugin that traces the
+                    // run reports it as the session id (nothing else tells an
+                    // observer which session it is watching). Read here (not at
+                    // harness build) so an embedder's `RPI_SESSION_ID` override
+                    // is picked up on every turn.
+                    "sessionId": std::env::var(rpi_plugin_sdk::SESSION_ID_ENV).ok(),
                 });
+                // Synchronous, like the request dispatch below: a subscriber's
+                // `BeforeAgentStart` handler runs before any
+                // `BeforeProviderRequest` of this turn reaches it, so the turn is
+                // fully identified (session included) by the time its first
+                // generation is created.
                 dispatch_data_event(
                     &self.snapshot,
                     EventTag::BeforeAgentStart,
@@ -272,7 +283,19 @@ mod tests {
             1,
             "before_agent_start must fire once per prompt: {captured:?}"
         );
-        assert!(agent_starts[0].1.contains("\"prompt\":\"hello\""));
+        let start_payload: serde_json::Value =
+            serde_json::from_str(&agent_starts[0].1).expect("before_agent_start payload is JSON");
+        assert_eq!(start_payload["prompt"], "hello");
+        assert_eq!(start_payload["imageCount"], 0);
+        // The session id rides along so an observer can name the session on the
+        // very first turn (the prompt is the only per-turn channel it gets).
+        // Absent when this process has no session id in its environment.
+        assert_eq!(
+            start_payload.get("sessionId").map(|v| v.is_null()),
+            Some(std::env::var(rpi_plugin_sdk::SESSION_ID_ENV).is_err()),
+            "sessionId must mirror the host's session id env var: {}",
+            agent_starts[0].1
+        );
 
         let requests: Vec<_> = captured
             .iter()

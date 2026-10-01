@@ -683,6 +683,7 @@ pub fn print_help() {
   OPENAI_API_KEY                 Bearer token for openai-completions/responses
   RPI_OFFLINE                     Disable startup network operations when set to 1/true/yes
   RPI_CODING_AGENT_DIR           Override the ~/.rpi config directory (auth.json + models.json)
+  RPI_SESSION_ID                 Session id served by a plugin (set by the host; also honored as an override)
   RPI_NO_EMOJI                   Render the brand lockup without the crab (1/true/yes)
 
 {u}Notes:{r}

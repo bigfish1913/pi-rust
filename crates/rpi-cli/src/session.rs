@@ -330,6 +330,20 @@ pub async fn build(
     // their per-session state off it. A session without an id (ephemeral) leaves
     // the field unset and a plugin is expected to fall back to project scope.
     if let Ok(metadata) = session.get_metadata().await {
+        // Publish the id to **every** plugin, not just to tools. `__rpi` reaches a
+        // plugin only on a tool call, so an observer that traces a run (rpi-langfuse
+        // reports it as the Langfuse session id) had no way to name the session
+        // until the first tool call — and never at all for a pure-chat run. The
+        // env var is process-global, which is exactly the scope of "the session
+        // this process is serving"; it is set once here, before any agent turn.
+        //
+        // An explicitly present `RPI_SESSION_ID` (an embedder's override, or a
+        // stale one inherited from a parent process) is respected: the host does
+        // not clobber it. The id is host-generated plain UTF-8 with no NUL, which
+        // is what keeps `set_var` sound.
+        if std::env::var_os(rpi_plugin_sdk::SESSION_ID_ENV).is_none() {
+            std::env::set_var(rpi_plugin_sdk::SESSION_ID_ENV, &metadata.id);
+        }
         tool_context.set_session_id(metadata.id);
     }
     // `--name`/`-n` sets the session display name durably (a `name` fact in the
