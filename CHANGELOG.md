@@ -11,6 +11,8 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.3.11] - 2026-10-01
+
 ### Fixed
 
 - A spawned shell no longer inherits rpi-langfuse's subagent-nesting channel
