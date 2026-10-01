@@ -61,9 +61,9 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
 use rpi_plugin_sdk::{
-    EventHandlerFn, EventTag, FreeStringFn, ProviderRequestFn, RenderFn, ResourcesDiscoverFn,
-    RuntimeActionFn, StablePluginEvent, StableToolSchema, StbString, StbStringRef, ToolCancelFn,
-    ToolDestroyFn, ToolExecuteFn, ToolPollFn,
+    BeforeAgentStartFn, EventHandlerFn, EventTag, FreeStringFn, ProviderRequestFn, RenderFn,
+    ResourcesDiscoverFn, RuntimeActionFn, StablePluginEvent, StableToolSchema, StbString,
+    StbStringRef, ToolCancelFn, ToolDestroyFn, ToolExecuteFn, ToolPollFn,
 };
 use thiserror::Error;
 
@@ -77,11 +77,12 @@ pub use loader::{
     load_dir, load_one, load_session, load_session_mixed, merge_registries, ExtensionSession,
     LoadedPlugin, PluginKeepalive, PluginLoadError,
 };
+pub use prompt_transform::emit_before_agent_start;
 pub use provider::PluggableProvider;
 pub use provider_hooks::ExtensionProviderHooks;
 pub use registry::{
-    assert_active, current_platform, platform_allows, ExtensionRegistry, ExtensionTool,
-    RegisteredFlag, RegisteredHandler, RegisteredProvider, RegisteredRenderer,
+    assert_active, current_platform, platform_allows, BeforeAgentStartHandler, ExtensionRegistry,
+    ExtensionTool, RegisteredFlag, RegisteredHandler, RegisteredProvider, RegisteredRenderer,
     RegisteredRendererKind, RegisteredShortcut, RegistryEntry, RegistrySnapshot,
     ResourcesDiscoverHandler, DEFAULT_PRIORITY,
 };
@@ -97,6 +98,7 @@ mod actions;
 mod editor_text;
 mod event_log;
 mod loader;
+mod prompt_transform;
 mod provider;
 mod provider_hooks;
 mod registry;
@@ -286,6 +288,9 @@ impl HostApi {
             register_entry_renderer: Some(trampoline_register_entry_renderer), // B5c
             register_event_handler: Some(trampoline_register_event_handler),
             register_resources_discover: Some(trampoline_register_resources_discover),
+            // Appended last so `struct_size` grows without shifting any earlier
+            // offset (a plugin built against the previous layout keeps working).
+            register_before_agent_start: Some(trampoline_register_before_agent_start),
             runtime_action: runtime_action_fn,
             dispatch_event: Some(trampoline_dispatch_event),
             user_data: ud,
@@ -673,6 +678,34 @@ extern "C" fn trampoline_register_resources_discover(
     let ok = with_current_api(|api| {
         match api.with_registry(|reg| {
             reg.register_resources_discover(handler, plugin_free_string, user_data)
+        }) {
+            Some(_) => true,
+            None => false,
+        }
+    });
+    if ok == Some(true) {
+        0
+    } else {
+        -1
+    }
+}
+
+/// `register_before_agent_start` trampoline. Same shape as
+/// [`trampoline_register_resources_discover`]: runs synchronously inside a
+/// plugin's `register` call (thread-local `CURRENT_HOST_API` is set), stores the
+/// handler plus the plugin's own `plugin_free_string` (the `out` StbString the
+/// handler later produces is plugin-owned) and its opaque `user_data`.
+extern "C" fn trampoline_register_before_agent_start(
+    handler: BeforeAgentStartFn,
+    plugin_free_string: FreeStringFn,
+    user_data: *mut c_void,
+) -> i32 {
+    if !current_api_present() {
+        return -1;
+    }
+    let ok = with_current_api(|api| {
+        match api.with_registry(|reg| {
+            reg.register_before_agent_start(handler, plugin_free_string, user_data)
         }) {
             Some(_) => true,
             None => false,

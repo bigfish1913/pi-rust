@@ -749,6 +749,147 @@ async fn harness_fires_provider_hooks_before_request_per_call() {
     );
 }
 
+/// `ProviderHooks::transform_context` must reach the provider request: the
+/// prompt a hook installs is the prompt the model is asked with.
+///
+/// This is the load-bearing half of the pi `transform_context` parity work. The
+/// bridge test proves a plugin's text comes back through the ABI; this one
+/// proves the harness then applies it to the LIVE `Context` handed to
+/// `stream_simple` — and that the base prompt the hook received is still there
+/// underneath, so nothing downstream silently dropped it.
+///
+/// Uses a recording provider rather than the faux one because the assertion is
+/// about what the *provider* was handed, not what the loop did with the reply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn provider_hooks_can_replace_the_system_prompt_the_model_sees() {
+    use rpi_ai::types::Context as AiContext;
+    use rpi_ai::{AssistantMessageEventStream, ContextPatch, ProviderHooks};
+
+    /// Wraps a faux provider and records the system prompt of every request.
+    struct RecordingProvider {
+        inner: Arc<FauxProvider>,
+        seen: Arc<Mutex<Vec<Option<String>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for RecordingProvider {
+        fn id(&self) -> &str {
+            self.inner.id()
+        }
+        fn models(&self) -> &[rpi_ai::Model] {
+            self.inner.models()
+        }
+        async fn stream_simple(
+            &self,
+            model: &rpi_ai::Model,
+            ctx: &AiContext,
+            opts: &rpi_ai::SimpleStreamOptions,
+        ) -> AssistantMessageEventStream {
+            self.seen.lock().unwrap().push(ctx.system_prompt.clone());
+            self.inner.stream_simple(model, ctx, opts).await
+        }
+    }
+
+    /// Replaces the prompt with `<marker>\n<original>` — an append built the way
+    /// pi requires (read the event's prompt, return the concatenation).
+    struct AppendHooks;
+    impl ProviderHooks for AppendHooks {
+        fn transform_context(
+            &self,
+            _model: &rpi_ai::Model,
+            ctx: &AiContext,
+        ) -> Option<ContextPatch> {
+            Some(ContextPatch {
+                system_prompt: Some(format!(
+                    "HOOK-FIRST\n{}",
+                    ctx.system_prompt.as_deref().unwrap_or_default()
+                )),
+            })
+        }
+    }
+
+    let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(RecordingProvider {
+        inner: FauxProvider::new(FauxScript::new().with_text("done")),
+        seen: Arc::clone(&seen),
+    });
+
+    let model = provider.inner.default_model().clone();
+
+    // Same shape as the B4 provider-hooks test above: build options directly so
+    // this test can set both the hooks AND a system prompt.
+    let env = Arc::new(InMemoryExecutionEnv::new());
+    let env_dyn: Arc<dyn rpi_tools::ExecutionEnv> = env.clone();
+    let mut_env: Arc<dyn rpi_tools::MutatingEnv> = env.clone();
+    let _registry = Arc::new(MutationQueueRegistry::new());
+    let tool_ctx = ExecutionToolContext::new(env_dyn, Some(mut_env));
+    let tools: Vec<HarnessTool> = vec![create_write_tool(&tool_ctx)]
+        .into_iter()
+        .map(HarnessTool::new)
+        .collect();
+    let active: Vec<String> = tools.iter().map(|t| t.tool.schema().name.clone()).collect();
+    let metadata = SessionMetadata {
+        id: "b4-transform-context".into(),
+        created_at: 0,
+        parent_session_id: None,
+    };
+    let storage = Arc::new(InMemorySessionStorage::new(
+        metadata,
+        Arc::new(SystemClock),
+        Arc::new(DefaultIdGenerator::new()),
+    ));
+    let session = Session::new(storage, None);
+    let options = AgentHarnessOptions {
+        model,
+        thinking_level: Default::default(),
+        active_tool_names: active,
+        tools,
+        // The composed prompt a real session would have built; the hook must
+        // receive this and pass it through in its replacement.
+        system_prompt: Some("BASE SYSTEM PROMPT".to_string()),
+        resources: Default::default(),
+        stream_options: Default::default(),
+        retry: RetryPolicy::default(),
+        compaction: Default::default(),
+        steering_mode: Default::default(),
+        follow_up_mode: Default::default(),
+        tool_execution: Default::default(),
+        drive: Default::default(),
+        session,
+        models: vec![provider.clone() as Arc<dyn Provider>],
+        to_provider_messages: None,
+        entry_projectors: Default::default(),
+        agent_emitter: None,
+        before_tool_call: None,
+        after_tool_call: None,
+        transform_context: None,
+        entry_transforms: Vec::new(),
+        provider_hooks: Some(Arc::new(AppendHooks) as Arc<dyn ProviderHooks>),
+        allow_existing_session: false,
+    };
+    let harness = AgentHarness::create(options).await.expect("create harness");
+
+    harness
+        .prompt_text("hello", vec![])
+        .await
+        .expect("prompt completes");
+
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1, "one-turn script = one provider call");
+    let prompt = seen[0]
+        .as_deref()
+        .expect("the request must carry a system prompt — the harness had one");
+    assert!(
+        prompt.starts_with("HOOK-FIRST"),
+        "the hook's text must be what the provider receives; got {prompt:?}"
+    );
+    assert!(
+        prompt.contains("BASE SYSTEM PROMPT"),
+        "the hook appended to the composed prompt, so the base must survive; \
+         got {prompt:?}"
+    );
+}
+
 /// Regression: the harness persists prompts itself and drives
 /// `run_agent_loop` with an EMPTY prompts vec (to avoid double-counting them in
 /// the provider context), so the loop never emits `message_start`/`message_end`

@@ -544,6 +544,11 @@ pub enum EventTag {
     BeforeProviderRequest = 12,
     BeforeProviderHeaders = 13,
     AfterProviderResponse = 14,
+    /// The start of a run, carrying the user prompt (`{"prompt", "imageCount",
+    /// "sessionId", "host"}`). Fire-and-forget like every other tag: subscribe to
+    /// *observe* the turn. To **change** the system prompt for the run, register a
+    /// handler with `register_before_agent_start` — that slot carries an `out`
+    /// pointer, which this fire-and-forget signature cannot.
     BeforeAgentStart = 15,
     AgentStart = 16,
     AgentEnd = 17,
@@ -904,6 +909,31 @@ pub type ResourcesDiscoverFn = extern "C" fn(
     user_data: *mut c_void,
 ) -> i32;
 
+/// `before_agent_start` handler signature. Unlike [`EventHandlerFn`]
+/// (fire-and-forget, `i32` only), this carries an owning `out` so the plugin can
+/// hand back a system prompt to install for the run — pi's
+/// `BeforeAgentStartEventResult` (`extensions/types.ts:1394`), whose
+/// `systemPrompt` becomes `forceSystemPrompt` (`runner.ts:1347`).
+///
+/// `event_json` is a borrowed envelope with the same fields the
+/// [`EventTag::BeforeAgentStart`] broadcast carries (`prompt`, `imageCount`,
+/// `sessionId`, `host`) plus the live `systemPrompt` the run would otherwise
+/// use. `out` is plugin-produced JSON `{"systemPrompt": "..."}` (or an empty
+/// object for "no change"), reclaimed via the `plugin_free_string` the host
+/// stored at registration.
+///
+/// Returns `0` on success (host reads `out`); nonzero on a handled error (host
+/// logs the plugin's message and leaves the prompt untouched, then continues the
+/// fan-out — mirrors pi, which isolates a throwing handler).
+///
+/// **Replacement, not append**: the returned text becomes the system prompt. A
+/// plugin that wants to append reads `event_json.systemPrompt` and returns the
+/// two concatenated, which is what pi requires of its extensions too.
+/// SAFETY: the plugin warrants `user_data` is valid for the registry's lifetime
+/// and the handler is callable from any thread.
+pub type BeforeAgentStartFn =
+    extern "C" fn(event_json: StbStringRef, out: *mut StbString, user_data: *mut c_void) -> i32;
+
 // ---------------------------------------------------------------------------
 // Runtime actions — uniform JSON-RPC dispatch by RuntimeActionId
 // ---------------------------------------------------------------------------
@@ -1151,6 +1181,27 @@ pub struct PluginApi {
     /// not support declarations yet (plugin skips the call; host applies
     /// defaults: priority `100`, all platforms).
     pub declare: Option<extern "C" fn(json: StbStringRef) -> i32>,
+
+    /// Register a system-prompt transformer for the run (pi's
+    /// `before_agent_start` returning `systemPrompt`).
+    ///
+    /// **Appended last on purpose.** A plugin compiled against a shorter
+    /// `PluginApi` indexes every earlier field by offset, so a slot inserted in
+    /// the middle would make an old plugin read the new host's fields at the
+    /// wrong offsets. Appending keeps every existing offset valid, which is what
+    /// lets this ship without an ABI version bump; a plugin checks
+    /// `struct_size` (or the slot for `None`) before using it.
+    ///
+    /// Nullable: a host that predates this slot leaves it `None`, the plugin
+    /// skips the call, and the prompt is left alone — exactly that host's
+    /// behavior before this slot existed.
+    pub register_before_agent_start: Option<
+        extern "C" fn(
+            handler: BeforeAgentStartFn,
+            plugin_free_string: FreeStringFn,
+            user_data: *mut c_void,
+        ) -> i32,
+    >,
 }
 unsafe impl Send for PluginApi {}
 unsafe impl Sync for PluginApi {}
@@ -1495,11 +1546,14 @@ mod tests {
             dispatch_event: None,
             user_data: core::ptr::null_mut(),
             declare: None,
+            register_before_agent_start: None,
         };
         // All optional slots are null → plugin must degrade.
         assert!(api.register_tool.is_none());
         assert!(api.register_event_handler.is_none());
         assert!(api.register_resources_discover.is_none());
+        assert!(api.register_before_agent_start.is_none());
+        assert!(api.register_before_agent_start.is_none());
         // Copy (POD) — no UB from a plain copy.
         let _copy = api;
         assert!(!core::mem::needs_drop::<PluginApi>());
@@ -1507,6 +1561,40 @@ mod tests {
         assert!(!core::mem::needs_drop::<StepResult>());
         assert!(!core::mem::needs_drop::<StablePluginEvent>());
         assert!(!core::mem::needs_drop::<StableToolSchema>());
+    }
+
+    /// New vtable slots must be **appended**, never inserted.
+    ///
+    /// A plugin compiled against a shorter `PluginApi` reads every field by
+    /// offset. Inserting a slot in the middle would make that plugin read the
+    /// new host's fields at the wrong offsets — silently, since both sides just
+    /// see pointers. Appending is what lets a slot ship without an ABI version
+    /// bump. This pins the three fields at the end and the identity markers at
+    /// the front, so a future edit that inserts in the middle fails here.
+    #[test]
+    fn vtable_grows_only_at_the_end() {
+        use core::mem::{align_of, size_of};
+
+        // Identity markers stay first: a plugin reads these before anything
+        // else, independent of the entrypoint arity.
+        assert_eq!(core::mem::offset_of!(PluginApi, abi_version), 0);
+        assert_eq!(
+            core::mem::offset_of!(PluginApi, struct_size),
+            size_of::<u32>()
+        );
+
+        // The most recently added slot is last, and the two before it are
+        // adjacent — i.e. nothing was wedged in between them.
+        let declare = core::mem::offset_of!(PluginApi, declare);
+        let new_slot = core::mem::offset_of!(PluginApi, register_before_agent_start);
+        assert_eq!(
+            new_slot,
+            declare + size_of::<Option<extern "C" fn(StbStringRef) -> i32>>(),
+            "register_before_agent_start must be appended right after `declare`; \
+             inserting a slot earlier shifts every later offset and breaks \
+             plugins built against the previous layout"
+        );
+        assert_eq!(align_of::<PluginApi>(), align_of::<*const ()>());
     }
 
     #[test]
@@ -1570,6 +1658,7 @@ mod tests {
             dispatch_event: None,
             user_data: core::ptr::null_mut(),
             declare: None,
+            register_before_agent_start: None,
         };
         assert_eq!(RPI_PLUGIN_ABI_VERSION_UNIFIED, 4);
 

@@ -239,6 +239,28 @@ pub trait DeferredProvider: Send + Sync {
 pub trait ProviderHooks: Send + Sync {
     /// Fired before each `stream_simple` call, with a snapshot of the model +
     /// context + opts the harness is about to pass. Return a patch that the
+    /// harness applies to a clone of `ctx` before calling the provider; return
+    /// `None` to leave `ctx` untouched.
+    ///
+    /// This is the seam pi calls `transform_context`
+    /// (`harness/execution/assistant.ts:142`), and it fires on **every** provider
+    /// request of a run — the same cadence as [`Self::before_request`], and the
+    /// reason a plugin can change the prompt for one turn without the change
+    /// sticking to the session. It runs before `before_request` so a prompt the
+    /// hook installs is what that request carries.
+    ///
+    /// Unlike `before_request` this cannot patch `opts`; the two are separate so
+    /// a caller can reason about "what the model sees" independently of "how the
+    /// request is sent".
+    ///
+    /// Must not retain the borrow. Runs on the blocking-bridge thread inside the
+    /// harness `StreamFn` closure.
+    fn transform_context(&self, _model: &Model, _ctx: &Context) -> Option<ContextPatch> {
+        None
+    }
+
+    /// Fired before each `stream_simple` call, with a snapshot of the model +
+    /// context + opts the harness is about to pass. Return a patch that the
     /// harness applies to a clone of `opts` before calling the provider; return
     /// `None` to leave `opts` untouched.
     ///
@@ -266,6 +288,33 @@ pub trait ProviderHooks: Send + Sync {
 #[derive(Default)]
 pub struct NoopProviderHooks;
 impl ProviderHooks for NoopProviderHooks {}
+
+/// A patch against the model-facing [`Context`] returned by
+/// [`ProviderHooks::transform_context`].
+///
+/// Mirrors the `systemPrompt` half of pi's `transform_context` result
+/// (`harness/agent-harness.ts:445`): the hook may replace the system prompt the
+/// request carries. pi also allows replacing `messages` there; rpi deliberately
+/// does not (yet) — see `ProviderHooks::transform_context`.
+///
+/// `None` inside means "leave as-is", so an empty patch is a no-op and a caller
+/// that only wants to observe can return `None` from the hook entirely.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContextPatch {
+    /// Replacement system prompt for this request. `Some` installs it verbatim
+    /// (**replacement, not append** — a plugin that wants to append reads
+    /// `ctx.system_prompt` and concatenates, exactly as pi requires).
+    pub system_prompt: Option<String>,
+}
+
+impl ContextPatch {
+    /// Apply this patch to `ctx` in place.
+    pub fn apply(&self, ctx: &mut Context) {
+        if let Some(prompt) = &self.system_prompt {
+            ctx.system_prompt = Some(prompt.clone());
+        }
+    }
+}
 
 /// A patch against [`SimpleStreamOptions`] returned by [`ProviderHooks::before_request`].
 /// Mirrors TS `beforeRequest`'s per-request overrides but targets the live
