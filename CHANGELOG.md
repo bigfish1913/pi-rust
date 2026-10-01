@@ -11,6 +11,8 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.3.9] - 2026-10-01
+
 ### Added
 
 - `rpi update` performs a real self-update again. `a5506dd` had reduced it to a
