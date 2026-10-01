@@ -65,7 +65,7 @@ scoop install rpi                                     # Windows
 
 The Homebrew formula omits Intel macOS because no `x86_64-apple-darwin` build is
 published — use `cargo install rpi-cli` there. A winget manifest is [open for
-review](https://github.com/microsoft/winget-pkgs/pull/441442).
+review](https://github.com/microsoft/winget-pkgs/pull/444745).
 
 **From source:**
 
@@ -113,17 +113,14 @@ Build an agent against a deterministic in-process provider — no API key, no
 network, no flakiness:
 
 ```rust
-use std::sync::Arc;
-
 use rpi_agent::AgentBuilder;
 use rpi_ai::providers::faux::{FauxProvider, FauxScript};
 use rpi_ai::Provider;
 
 #[tokio::main]
 async fn main() {
-    let provider = Arc::new(FauxProvider::new(
-        FauxScript::new().with_text("Hello from the faux provider!"),
-    ));
+    // `FauxProvider::new` already returns an `Arc<Self>`.
+    let provider = FauxProvider::new(FauxScript::new().with_text("Hello from the faux provider!"));
     let model = provider.default_model().clone();
 
     let agent = AgentBuilder::new()
@@ -153,21 +150,27 @@ Nine crates, one version, published together. Dependency direction is one-way
 and enforced in review:
 
 ```
-rpi-telemetry → rpi-ai → rpi-agent → rpi-tools → rpi-harness → rpi-cli
-                  ↑                                        ↑
-            rpi-tui                              rpi-plugin-sdk → rpi-extensions
+rpi-telemetry → rpi-ai → rpi-agent → rpi-tools → rpi-harness
 ```
+
+Three crates sit outside that chain:
+
+- `rpi-tui` and `rpi-plugin-sdk` depend on no other `rpi-*` crate.
+- `rpi-extensions` is `rpi-plugin-sdk` plus `rpi-ai`/`rpi-agent`, since it hosts
+  plugins that run tools.
+- `rpi-cli` depends on all eight of the others, which is how the `rpi` binary
+gets the TUI, the harness and the plugin loader at once.
 
 | Crate | What it is |
 | ----- | ---------- |
-| [`rpi-telemetry`](https://crates.io/crates/rpi-telemetry) | Span/event contracts with a no-op default — instrumentation is opt-in and dependency-free |
+| [`rpi-telemetry`](https://crates.io/crates/rpi-telemetry) | Span/event contracts with a no-op default — instrumentation is opt-in, and pulls in no tracing or OpenTelemetry backend |
 | [`rpi-ai`](https://crates.io/crates/rpi-ai) | Provider-agnostic message, streaming and tool-schema types; Anthropic + OpenAI-compatible + `faux` providers |
 | [`rpi-agent`](https://crates.io/crates/rpi-agent) | The agent loop: `AgentTool`, events, hooks, queues, cancellation |
 | [`rpi-tools`](https://crates.io/crates/rpi-tools) | `read`/`write`/`edit`/`bash` (+ `grep`, `find`, `ls`, `powershell`) and the `ExecutionEnv` seam |
 | [`rpi-harness`](https://crates.io/crates/rpi-harness) | Session tree, JSONL persistence, compaction, crash recovery, the run loop |
 | [`rpi-tui`](https://crates.io/crates/rpi-tui) | Terminal UI primitives: components, layout, editor, transcript rendering |
 | [`rpi-cli`](https://crates.io/crates/rpi-cli) | The `rpi` binary: TUI, one-shot and JSON modes, config, plugin loading |
-| [`rpi-plugin-sdk`](https://crates.io/crates/rpi-plugin-sdk) | The stable `#[repr(C)]` ABI contract for plugins. Zero runtime dependencies |
+| [`rpi-plugin-sdk`](https://crates.io/crates/rpi-plugin-sdk) | The stable `#[repr(C)]` ABI contract for plugins. No `rpi-*` deps; only `serde_json`, behind a default `json` feature that can be turned off |
 | [`rpi-extensions`](https://crates.io/crates/rpi-extensions) | Host-side plugin loader and the async-across-ABI tool bridge |
 
 Every crate has its own README and docs.rs page. The `crates/rpi-*`
@@ -182,9 +185,9 @@ changes what you can build with it:
   to run an agent inside your own process, with your own event handling and
   output — no shelling out to a tool and scraping stdout.
 - **Testable offline.** A deterministic `faux` provider and an in-memory
-  execution environment are first-class, not mocks bolted on. The default build
-  pulls no HTTP stack at all (`rpi-ai`'s providers are behind a feature flag), so
-  your test suite cannot silently depend on the network.
+  execution environment are first-class, not mocks bolted on. `rpi-ai` puts its
+  real HTTP providers behind a `providers` feature flag, so your test suite
+  cannot silently depend on the network for the paths you exercise.
 - **Durable.** Sessions are a tree with JSONL persistence and per-frame
   progress. A crash mid-tool-call resumes instead of losing the turn or
   double-executing the tool.
@@ -300,7 +303,7 @@ machine. See [`docs/remote-mode.md`](docs/remote-mode.md).
 
 | | |
 | --- | --- |
-| Current release | **[0.3.6](https://github.com/bigfish1913/pi-rust/releases)** (nine crates, published together) |
+| Current release | **[0.3.9](https://github.com/bigfish1913/pi-rust/releases)** (nine crates, published together) |
 | Stability | `rpi-ai`, `rpi-agent`, `rpi-tools`, `rpi-harness`, `rpi-plugin-sdk` are the intended stable surface |
 | MSRV | 1.78 |
 | Platforms | Linux, macOS, Windows (CI runs the suite on Linux) |
