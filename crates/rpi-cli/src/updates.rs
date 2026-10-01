@@ -4,7 +4,7 @@
 //! them, each registry request uses a short timeout, and cached values are
 //! retained only as a fallback for temporary registry failures.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
@@ -23,6 +23,15 @@ const STAGED_RPI_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_
 const MAX_STAGED_RPI_OUTPUT_BYTES: usize = 4 * 1024;
 const MAX_SELF_UPDATE_STATUS_BYTES: u64 = 64 * 1024;
 const MAX_SELF_UPDATE_STATUS_MESSAGE_CHARS: usize = 2 * 1024;
+/// How long a running self-update may stay in a non-terminal state before a
+/// later process treats it as debris and prunes it. A `cargo install` compiles
+/// from source, so the window is generous; a helper that outlives it is stuck,
+/// not slow.
+const STALE_SELF_UPDATE_STATUS_TTL_MS: i64 = 60 * 60 * 1000;
+/// How long a completed update keeps its status record. `rpi update` prints
+/// that path, so the file has to outlive the command that named it by long
+/// enough to actually be read; after that it is just clutter.
+const COMPLETED_SELF_UPDATE_STATUS_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 static UPDATE_CACHE_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static SELF_UPDATE_STATUS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -86,10 +95,18 @@ struct CrateInfo {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SelfUpdateStatus {
     state: String,
     #[serde(default)]
     message: String,
+    /// The staging directory this update was installed into. Written by the
+    /// Windows helper; the older `preparing` records lack it, which is why an
+    /// unmapped staging directory is aged out instead of matched by name.
+    #[serde(default)]
+    staging: Option<PathBuf>,
+    #[serde(default)]
+    updated_at_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -454,36 +471,295 @@ pub fn print_startup_notices(report: &UpdateReport) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelfUpdateArgs {
+    Help,
+    Run { force: bool },
+    Usage,
+}
+
+/// Parse `rpi update`'s own arguments after the global `--offline` flag has been
+/// stripped.
+fn parse_self_update_args(args: &[String]) -> SelfUpdateArgs {
+    let mut force = false;
+    for arg in args {
+        match arg.as_str() {
+            "--help" | "-h" => return SelfUpdateArgs::Help,
+            "--force" | "-f" => force = true,
+            _ => return SelfUpdateArgs::Usage,
+        }
+    }
+    SelfUpdateArgs::Run { force }
+}
+
+fn print_self_update_help() {
+    println!(
+        "Usage: rpi update [--force] [--offline]\n\n\
+         Update the rpi CLI from crates.io.\n\n\
+         Options:\n  \
+         --force    reinstall even when this rpi is already the latest release\n  \
+         --offline  do not touch the network; report the last known answer only"
+    );
+}
+
+/// The latest release this process already knows about.
+///
+/// `registry_lookup: true` means a crates.io request just answered *in this
+/// process*, so using it to short-circuit cannot hide a newer release. A value
+/// read from the 6-hour cache is only trusted for the offline report, where
+/// there is no alternative and the output says so.
+fn known_latest_rpi(registry_lookup: Option<&str>, cached: Option<&str>) -> Option<(String, bool)> {
+    registry_lookup
+        .map(|latest| (latest.to_string(), false))
+        .or_else(|| cached.map(|latest| (latest.to_string(), true)))
+}
+
+async fn lookup_latest_rpi() -> Option<(String, bool)> {
+    let cache_path = crate::config::agent_dir()
+        .ok()
+        .map(|dir| dir.join(CACHE_FILE));
+    let cached = cache_path.as_deref().and_then(read_cache);
+    let result = match startup_http_client() {
+        Some(client) => fetch_rpi_latest(&client).await,
+        None => RegistryLookup::TransientFailure,
+    };
+    // Only a live registry answer counts as verified; a value that came back
+    // from the cache means the request failed and the version is up to six
+    // hours old.
+    let verified = matches!(result, RegistryLookup::Found(_));
+    let previous = cached
+        .as_ref()
+        .filter(|cache| timestamp_is_fresh(rpi_cache_checked_at(cache), now_ms()))
+        .and_then(|cache| cache.rpi_latest.as_deref());
+    let (latest, _) = lookup_with_cache_fallback(result, previous, true);
+    latest.map(|latest| (latest, verified))
+}
+
+/// `rpi update` is synchronous — the `cargo install` it guards blocks the same
+/// way — so the one registry request it makes runs on its own thread and
+/// current-thread runtime. That also keeps it safe to call from inside a Tokio
+/// runtime, which is where the CLI enters it.
+fn lookup_latest_rpi_blocking() -> Option<(String, bool)> {
+    std::thread::Builder::new()
+        .name("rpi-update-latest-lookup".to_string())
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok()?;
+            runtime.block_on(lookup_latest_rpi())
+        })
+        .ok()?
+        .join()
+        .ok()?
+}
+
+/// The newest version already staged in a `pending-*` directory.
+///
+/// A staged update is a fully validated binary waiting for the running process
+/// to exit. Re-running `rpi update` while one is queued must not start a second
+/// compile, so the staged version joins the up-to-date comparison.
+fn staged_pending_version(update_root: &Path) -> Option<semver::Version> {
+    let entries = std::fs::read_dir(update_root).ok()?;
+    let mut newest: Option<semver::Version> = None;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(suffix) = name.strip_prefix("pending-") else {
+            continue;
+        };
+        // `tempfile` builds the name from `[A-Za-z0-9]`; anything else is not
+        // ours, so it is left alone rather than probed.
+        if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+            continue;
+        }
+        let staging = update_root.join(name);
+        if validated_real_directory(&staging, "self-update staging directory").is_err() {
+            continue;
+        }
+        let Ok(version) = validate_rpi_executable_version(
+            &staging.join("bin").join(staged_rpi_file_name()),
+            update_root,
+            crate::VERSION,
+            "staged rpi",
+        ) else {
+            continue;
+        };
+        if newest.as_ref().map_or(true, |newest| version > *newest) {
+            newest = Some(version);
+        }
+    }
+    newest
+}
+
+fn staged_rpi_file_name() -> &'static str {
+    if cfg!(windows) {
+        "rpi.exe"
+    } else {
+        crate::APP_NAME
+    }
+}
+
+/// Reclaim debris and surface a previous run's failure, without a network
+/// round trip.
+///
+/// `rpi update` is the command that creates `self-update` records and staging
+/// directories, so it is also the right place to clean them up: leaving it to
+/// the startup check means a machine that only ever runs `rpi chat` keeps the
+/// debris from every interrupted update until the next start.
+fn reclaim_self_update_artifacts() {
+    let Ok(agent_dir) = crate::config::agent_dir() else {
+        return;
+    };
+    for warning in consume_self_update_statuses(&agent_dir) {
+        eprintln!("warning: {} Run `{}`.", warning.message, warning.command);
+    }
+}
+
 /// Update the installed rpi CLI through its documented crates.io install path.
 /// Windows stages first because a running executable cannot replace itself;
 /// other platforms retain Cargo's direct replacement behavior.
 pub fn run_self_update(args: &[String]) -> i32 {
     let offline = crate::args::normalize_offline_mode(args);
     let args = crate::args::without_offline_flag(args);
-    if args
-        .iter()
-        .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
-    {
-        println!("Usage: rpi update [--offline]\n\nUpdate the rpi CLI from crates.io.");
-        return 0;
-    }
-    if !args.is_empty() {
-        eprintln!("error: `rpi update` does not accept arguments");
-        return 2;
-    }
+    let force = match parse_self_update_args(&args) {
+        SelfUpdateArgs::Help => {
+            print_self_update_help();
+            return 0;
+        }
+        SelfUpdateArgs::Run { force } => force,
+        SelfUpdateArgs::Usage => {
+            eprintln!("error: `rpi update` accepts only `--force` and `--offline`");
+            return 2;
+        }
+    };
+
     if offline {
-        println!("rpi update skipped: offline mode is enabled");
+        reclaim_self_update_artifacts();
+        // The cache is the only source available without a network round trip,
+        // so it may be stale — say so rather than assert a version.
+        match known_latest_rpi(None, cached_latest_rpi().as_deref()) {
+            Some((latest, true)) if is_newer(crate::VERSION, &latest) => println!(
+                "rpi {} -> {} is available (offline: last known, not verified)\n\
+                 Run `rpi update` without --offline to install it.",
+                crate::VERSION,
+                latest
+            ),
+            Some(_) => println!(
+                "rpi is up to date with the last known release ({})\n\
+                 Offline mode is enabled; the registry was not contacted.",
+                crate::VERSION
+            ),
+            None => println!(
+                "rpi update skipped: offline mode is enabled and no cached release is known"
+            ),
+        }
         return 0;
     }
 
-    #[cfg(windows)]
-    {
-        run_windows_self_update()
+    // Without this gate `rpi update` at the newest release still runs a full
+    // `cargo install` and schedules a binary replacement for the version that
+    // is already installed — which is exactly what makes a working update look
+    // broken. `--force` keeps an explicit reinstall available.
+    if !force {
+        reclaim_self_update_artifacts();
+        let staged = pending_staged_version();
+        let (latest, verified) = match lookup_latest_rpi_blocking() {
+            Some(found) => found,
+            None if staged.is_some() => {
+                println!(
+                    "could not reach crates.io to check the latest release; using the already staged update"
+                );
+                (crate::VERSION.to_string(), false)
+            }
+            None => {
+                println!(
+                    "could not reach crates.io to check the latest release\n\
+                     Run `rpi update --force` to install the newest version anyway."
+                );
+                return 1;
+            }
+        };
+        // A staged update counts as "already going to happen": it is a fully
+        // validated binary waiting only for this process to exit, so compiling
+        // a second one buys nothing. It only counts when it is at least as new
+        // as the release the registry just reported.
+        let staged_wins = staged
+            .as_ref()
+            .filter(|staged| !is_newer(&staged.to_string(), &latest))
+            .map(std::string::ToString::to_string);
+        let target = staged_wins.clone().unwrap_or_else(|| latest.clone());
+        if !is_newer(crate::VERSION, &target) {
+            if staged_wins.is_some() {
+                println!(
+                    "rpi {target} is already staged; quit this rpi and it will be applied\n\
+                     Run `rpi update --force` to stage it again."
+                );
+            } else if verified {
+                println!(
+                    "rpi is up to date ({} is the latest release)\n\
+                     Run `rpi update --force` to reinstall anyway.",
+                    crate::VERSION
+                );
+            } else {
+                println!(
+                    "rpi is up to date ({}; last known release {latest}, unverified)\n\
+                     Run `rpi update --force` to reinstall anyway.",
+                    crate::VERSION
+                );
+            }
+            return 0;
+        }
     }
-    #[cfg(not(windows))]
-    {
-        run_direct_self_update()
+
+    let code = {
+        #[cfg(windows)]
+        {
+            run_windows_self_update()
+        }
+        #[cfg(not(windows))]
+        {
+            run_direct_self_update()
+        }
+    };
+    if code == 0 {
+        clear_cached_latest_rpi();
     }
+    code
+}
+
+fn pending_staged_version() -> Option<semver::Version> {
+    let agent_dir = crate::config::agent_dir().ok()?;
+    let update_root = agent_dir.join("self-update");
+    staged_pending_version(&update_root)
+}
+
+fn cached_latest_rpi() -> Option<String> {
+    let agent_dir = crate::config::agent_dir().ok()?;
+    let cache = read_cache(&agent_dir.join(CACHE_FILE))?;
+    cache.rpi_latest
+}
+
+/// A self-update just changed the binary on disk, so the cached release is the
+/// version being replaced. Dropping it stops the next startup (and the next
+/// `rpi update`) from announcing an update that is already installed; the
+/// following registry check refills it.
+fn clear_cached_latest_rpi() {
+    let Ok(agent_dir) = crate::config::agent_dir() else {
+        return;
+    };
+    let path = agent_dir.join(CACHE_FILE);
+    let _guard = UPDATE_CACHE_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(mut cache) = read_cache(&path) else {
+        return;
+    };
+    cache.rpi_latest = None;
+    cache.freshness.rpi = 0;
+    let _ = write_cache(&path, &cache);
 }
 
 fn cargo_install_command(
@@ -910,51 +1186,11 @@ fn rollback_direct_update(plan: &DirectUpdatePlan, failure: &str) -> String {
     }
 }
 
-#[cfg(not(windows))]
 fn remove_file_if_exists(path: &Path) -> Result<(), String> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.to_string()),
-    }
-}
-
-#[cfg(not(windows))]
-fn files_are_identical(left: &Path, right: &Path) -> Result<bool, String> {
-    use std::io::{BufReader, Read};
-
-    let left_file = std::fs::File::open(left)
-        .map_err(|error| format!("could not open {}: {error}", left.display()))?;
-    let right_file = std::fs::File::open(right)
-        .map_err(|error| format!("could not open {}: {error}", right.display()))?;
-    if left_file
-        .metadata()
-        .map_err(|error| error.to_string())?
-        .len()
-        != right_file
-            .metadata()
-            .map_err(|error| error.to_string())?
-            .len()
-    {
-        return Ok(false);
-    }
-    let mut left = BufReader::new(left_file);
-    let mut right = BufReader::new(right_file);
-    let mut left_buffer = [0u8; 64 * 1024];
-    let mut right_buffer = [0u8; 64 * 1024];
-    loop {
-        let left_read = left
-            .read(&mut left_buffer)
-            .map_err(|error| error.to_string())?;
-        let right_read = right
-            .read(&mut right_buffer)
-            .map_err(|error| error.to_string())?;
-        if left_read != right_read || left_buffer[..left_read] != right_buffer[..right_read] {
-            return Ok(false);
-        }
-        if left_read == 0 {
-            return Ok(true);
-        }
     }
 }
 
@@ -1351,7 +1587,8 @@ fn run_windows_self_update() -> i32 {
         Ok(_) => {
             let persisted_staging = staging.directory.keep();
             println!(
-                "rpi update staged; it will be applied after this process exits\nStatus: {}",
+                "rpi {staged_version} staged; quit this rpi and it will be applied.\n\
+                 Status: {}",
                 plan.status_file.display()
             );
             debug_assert!(windows_paths_equal(&persisted_staging, &plan.staging_dir));
@@ -1545,6 +1782,47 @@ fn cap_bytes(bytes: Vec<u8>, limit: usize) -> Vec<u8> {
     }
 }
 
+/// Byte-for-byte comparison, used to prove a copied or replaced rpi binary is
+/// the one that was validated.
+#[cfg(not(windows))]
+fn files_are_identical(left: &Path, right: &Path) -> Result<bool, String> {
+    use std::io::{BufReader, Read};
+
+    let left_file = std::fs::File::open(left)
+        .map_err(|error| format!("could not open {}: {error}", left.display()))?;
+    let right_file = std::fs::File::open(right)
+        .map_err(|error| format!("could not open {}: {error}", right.display()))?;
+    if left_file
+        .metadata()
+        .map_err(|error| error.to_string())?
+        .len()
+        != right_file
+            .metadata()
+            .map_err(|error| error.to_string())?
+            .len()
+    {
+        return Ok(false);
+    }
+    let mut left = BufReader::new(left_file);
+    let mut right = BufReader::new(right_file);
+    let mut left_buffer = [0u8; 64 * 1024];
+    let mut right_buffer = [0u8; 64 * 1024];
+    loop {
+        let left_read = left
+            .read(&mut left_buffer)
+            .map_err(|error| error.to_string())?;
+        let right_read = right
+            .read(&mut right_buffer)
+            .map_err(|error| error.to_string())?;
+        if left_read != right_read || left_buffer[..left_read] != right_buffer[..right_read] {
+            return Ok(false);
+        }
+        if left_read == 0 {
+            return Ok(true);
+        }
+    }
+}
+
 fn validate_rpi_executable_version(
     executable: &Path,
     cwd: &Path,
@@ -1669,6 +1947,16 @@ fn is_self_update_status_name(name: &std::ffi::OsStr) -> bool {
     token.len() == 32 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// `tempfile::Builder::new().prefix("pending-")` mints the rest of the name
+/// from `[A-Za-z0-9]`. Requiring that shape keeps the pruning from ever
+/// pointing `remove_dir_all` at a directory this tool did not create.
+fn is_self_update_staging_name(name: &str) -> bool {
+    let Some(suffix) = name.strip_prefix("pending-") else {
+        return false;
+    };
+    !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
 fn validated_self_update_status_file(update_root: &Path, path: &Path) -> Result<PathBuf, String> {
     if !path.is_absolute() || path.parent() != Some(update_root) {
         return Err("self-update status file is outside the update root".to_string());
@@ -1752,7 +2040,18 @@ fn consume_self_update_statuses(agent_dir: &Path) -> Vec<UpdateWarning> {
         Err(_) => return Vec::new(),
     };
 
+    let now = now_ms();
     let mut warnings = Vec::new();
+    // Every staging directory a live status file still claims.
+    let mut claimed = BTreeSet::new();
+    // Staging directories a status file proved to be debris: the helper that
+    // would have installed from them is gone, so their on-disk age — which can
+    // look recent when a run died early — does not have to vouch for them.
+    let mut obsolete = BTreeSet::new();
+    // Non-terminal records young enough that the writer is probably still
+    // alive. Reconciled after the scan, once a terminal record could have
+    // claimed the same directory.
+    let mut undecided = Vec::new();
     for entry in entries.flatten() {
         if !is_self_update_status_name(&entry.file_name()) {
             continue;
@@ -1765,6 +2064,39 @@ fn consume_self_update_statuses(agent_dir: &Path) -> Vec<UpdateWarning> {
             continue;
         };
         if !matches!(status.state.as_str(), "failed" | "succeeded") {
+            // A record with no usable timestamp has an unknown age. Leaving it
+            // alone is the safe reading: the alternative deletes a status file
+            // that a live helper may still be writing.
+            let stale = status.updated_at_ms > 0
+                && now.saturating_sub(status.updated_at_ms) > STALE_SELF_UPDATE_STATUS_TTL_MS;
+            if stale {
+                if let Some(staging) = status.staging.as_deref() {
+                    obsolete.insert(staging.to_path_buf());
+                }
+                let _ = remove_file_if_exists(&path);
+            } else {
+                undecided.push((path, status));
+            }
+            continue;
+        }
+        if let Some(staging) = status.staging.as_deref() {
+            claimed.insert(staging.to_path_buf());
+        }
+
+        if status.state == "succeeded" {
+            // Kept as the durable record of what was installed. The path is
+            // printed by `rpi update`, so deleting the file on the next start
+            // made a finished update look like it had never run. It ages out
+            // with the rest of the record set instead.
+            let old = status.updated_at_ms > 0
+                && now.saturating_sub(status.updated_at_ms) > COMPLETED_SELF_UPDATE_STATUS_TTL_MS;
+            if old {
+                if let Some(staging) = status.staging.as_deref() {
+                    claimed.remove(staging);
+                    obsolete.insert(staging.to_path_buf());
+                }
+                let _ = remove_file_if_exists(&path);
+            }
             continue;
         }
 
@@ -1773,20 +2105,130 @@ fn consume_self_update_statuses(agent_dir: &Path) -> Vec<UpdateWarning> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             // A failure is still actionable even when cleanup is denied. Keep
             // the file so a later startup can retry consumption.
-            Err(_) if status.state == "failed" => {}
-            Err(_) => continue,
+            Err(_) => {}
         }
-        if status.state == "failed" {
-            warnings.push(UpdateWarning {
-                message: format!(
-                    "The previously scheduled rpi update failed: {}",
-                    sanitized_self_update_status_message(&status.message)
-                ),
-                command: "rpi update".to_string(),
-            });
+        warnings.push(UpdateWarning {
+            message: format!(
+                "The previously scheduled rpi update failed: {}",
+                sanitized_self_update_status_message(&status.message)
+            ),
+            command: "rpi update".to_string(),
+        });
+    }
+
+    // A non-terminal record whose staging directory a terminal record already
+    // owns is a leftover of a completed run, not a live one.
+    for (path, status) in undecided {
+        let staging = status.staging.clone();
+        if staging
+            .as_deref()
+            .is_some_and(|staging| claimed.contains(staging))
+        {
+            let _ = remove_file_if_exists(&path);
+            continue;
+        }
+        if let Some(staging) = staging {
+            claimed.insert(staging);
         }
     }
+
+    prune_self_update_staging(&update_root, &claimed, &obsolete, now);
     warnings
+}
+
+/// Delete staging directories no live status file references.
+///
+/// A Windows update persists its staging directory (`TempDir::keep`) so the
+/// helper can install from it after the parent exits. When the helper dies
+/// first — a reboot at the wrong moment, a machine-wide `taskkill` — the
+/// directory stays behind forever: nothing else in the update path removes it,
+/// and because its status file was still `preparing` the next start never
+/// looked at it either. Those are the directories that pile up in
+/// `~/.rpi/agent/self-update`.
+///
+/// A directory a status file already proved dead (`obsolete`) goes as soon as
+/// its name validates. Otherwise the evidence has to come from the directory
+/// itself: empty debris goes unconditionally, because no update can be
+/// mid-install in a directory with nothing in it, while a populated one waits
+/// for the TTL. That keeps a staging directory whose record was just consumed —
+/// and which a helper may still be reading — from being deleted underneath it.
+fn prune_self_update_staging(
+    update_root: &Path,
+    claimed: &BTreeSet<PathBuf>,
+    obsolete: &BTreeSet<PathBuf>,
+    now: i64,
+) {
+    let Ok(entries) = std::fs::read_dir(update_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !is_self_update_staging_name(name) {
+            continue;
+        }
+        let path = update_root.join(name);
+        if claimed.contains(&path) {
+            continue;
+        }
+        if validated_real_directory(&path, "self-update staging directory").is_err() {
+            continue;
+        }
+        let aged_out = directory_age_ms(
+            entry.metadata().ok().and_then(|meta| meta.modified().ok()),
+            now,
+        )
+        .is_some_and(|age| age >= STALE_SELF_UPDATE_STATUS_TTL_MS);
+        if obsolete.contains(&path) || !staging_holds_payload(&path) || aged_out {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+}
+
+/// Whether a staging directory still holds something an install could use.
+///
+/// `cargo install --root <dir>` leaves zero-byte `.crates.toml` / `.crates2.json`
+/// bookkeeping files behind even when it produced no binary, and the helper's
+/// own cleanup deletes the payload first. So the presence of *a* file proves
+/// nothing — a directory whose only contents are empty files is debris that can
+/// never be installed from, and waiting out the TTL for it just keeps garbage
+/// around. Only a non-empty file does, and the payload lives one level down in
+/// `bin/`.
+fn staging_holds_payload(path: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if metadata.is_file() {
+            if metadata.len() > 0 {
+                return true;
+            }
+            continue;
+        }
+        if metadata.is_dir()
+            && std::fs::read_dir(entry.path()).is_ok_and(|nested| {
+                nested.flatten().any(|nested| {
+                    nested
+                        .metadata()
+                        .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+                })
+            })
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn directory_age_ms(modified: Option<SystemTime>, now: i64) -> Option<i64> {
+    let modified = modified?;
+    let millis = modified.duration_since(UNIX_EPOCH).ok()?.as_millis();
+    i64::try_from(millis).ok().map(|at| now.saturating_sub(at))
 }
 
 #[cfg(windows)]
@@ -2003,6 +2445,17 @@ mod tests {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    fn write_test_update_status_at(path: &Path, state: &str, message: &str, updated_at_ms: i64) {
+        let mut status = serde_json::json!({
+            "state": state,
+            "message": message,
+        });
+        if updated_at_ms > 0 {
+            status["updatedAtMs"] = serde_json::json!(updated_at_ms);
+        }
+        std::fs::write(path, serde_json::to_vec(&status).unwrap()).unwrap();
+    }
+
     fn write_test_update_status(path: &Path, state: &str, message: &str) {
         std::fs::write(
             path,
@@ -2154,6 +2607,37 @@ mod tests {
     }
 
     #[test]
+    fn self_update_arguments_are_parsed_explicitly() {
+        let args = |list: &[&str]| list.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            super::parse_self_update_args(&args(&[])),
+            super::SelfUpdateArgs::Run { force: false }
+        );
+        for flag in ["--force", "-f"] {
+            assert_eq!(
+                super::parse_self_update_args(&args(&[flag])),
+                super::SelfUpdateArgs::Run { force: true }
+            );
+        }
+        for flag in ["--help", "-h"] {
+            assert_eq!(
+                super::parse_self_update_args(&args(&[flag])),
+                super::SelfUpdateArgs::Help
+            );
+        }
+        // `--help` wins wherever it appears, and unknown flags are a usage
+        // error rather than being silently ignored.
+        assert_eq!(
+            super::parse_self_update_args(&args(&["--force", "--help"])),
+            super::SelfUpdateArgs::Help
+        );
+        assert_eq!(
+            super::parse_self_update_args(&args(&["--nope"])),
+            super::SelfUpdateArgs::Usage
+        );
+    }
+
+    #[test]
     fn self_update_honors_env_and_early_dispatched_offline_flag() {
         let _guard = crate::config::test_support::env_lock().lock().unwrap();
         let _restore = RestoreEnv::capture(crate::args::RPI_OFFLINE_ENV);
@@ -2218,12 +2702,152 @@ mod tests {
         assert!(!warnings[0].message.chars().any(char::is_control));
         assert_eq!(warnings[0].command, "rpi update");
         assert!(!failed.exists());
-        assert!(!succeeded.exists());
+        // A `succeeded` record is the receipt for the version now installed —
+        // `rpi update` prints its path — so it survives consumption instead of
+        // being deleted the moment the next start looks at it.
+        assert!(succeeded.exists());
         assert!(waiting.exists());
         assert!(temporary.exists());
         assert!(malformed.exists());
         assert!(invalid_name.exists());
+        // The failure is reported once: the record is gone, the kept one is not
+        // a failure, and the young `waiting` record says nothing.
         assert!(super::consume_self_update_statuses(&agent).is_empty());
+        assert!(succeeded.exists());
+    }
+
+    #[test]
+    fn stale_and_orphaned_self_update_records_are_pruned() {
+        let temp = real_tempdir();
+        let agent = temp.path().join("agent");
+        let update_root = agent.join("self-update");
+        std::fs::create_dir_all(&update_root).unwrap();
+        let name =
+            |token: char| update_root.join(format!("status-{}.json", token.to_string().repeat(32)));
+        let now = super::now_ms();
+        let stale_ms = now - super::STALE_SELF_UPDATE_STATUS_TTL_MS - 60_000;
+
+        // Live run: recent `waiting` record that owns its staging directory.
+        let live_status = name('1');
+        let live_staging = update_root.join("pending-Live001");
+        std::fs::create_dir_all(live_staging.join("bin")).unwrap();
+        std::fs::write(live_staging.join("bin").join("rpi.exe"), b"payload").unwrap();
+        std::fs::write(
+            &live_status,
+            serde_json::to_vec(&serde_json::json!({
+                "state": "waiting",
+                "staging": live_staging,
+                "updatedAtMs": now - 1000,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Abandoned run: the helper died, so the record aged out and the
+        // payload it claims is debris.
+        let dead_status = name('2');
+        let dead_staging = update_root.join("pending-Dead002");
+        std::fs::create_dir_all(dead_staging.join("bin")).unwrap();
+        std::fs::write(dead_staging.join("bin").join("rpi.exe"), b"payload").unwrap();
+        write_test_update_status_at(&dead_status, "preparing", "installing", stale_ms);
+        // Name the staging directory in the stale record, the way the Windows
+        // helper does: that is the evidence its payload is debris even though
+        // the directory's own timestamp looks recent.
+        let mut dead =
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(&dead_status).unwrap())
+                .unwrap();
+        dead["staging"] = serde_json::json!(dead_staging);
+        std::fs::write(&dead_status, serde_json::to_vec(&dead).unwrap()).unwrap();
+
+        // Orphan: no status file ever named it, and it was created long ago.
+        let orphan = update_root.join("pending-Orphan3");
+        std::fs::create_dir_all(orphan.join("bin")).unwrap();
+        std::fs::write(orphan.join("bin").join("rpi.exe"), b"payload").unwrap();
+
+        // Debris that can never be serving an update: an empty staging
+        // directory, even while it is brand new.
+        let empty = update_root.join("pending-Empty04");
+        std::fs::create_dir(&empty).unwrap();
+
+        // Not ours to touch: the name is not a tempfile label.
+        let foreign = update_root.join("pending-not-ours");
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::write(foreign.join("keep"), b"keep").unwrap();
+
+        let warnings = super::consume_self_update_statuses(&agent);
+
+        assert!(warnings.is_empty());
+        assert!(live_status.exists(), "a live run's record must survive");
+        assert!(live_staging.exists(), "a live run's staging must survive");
+        assert!(!dead_status.exists());
+        assert!(!dead_staging.exists());
+        // Pruning only deletes a populated directory it can prove is old; an
+        // untimestamped orphan is left for a later pass rather than guessed at.
+        assert!(orphan.exists());
+        // An empty directory cannot be serving an update, whatever its age.
+        assert!(!empty.exists());
+        assert!(foreign.exists());
+    }
+
+    #[test]
+    fn completed_records_survive_and_supersede_leftovers() {
+        let temp = real_tempdir();
+        let agent = temp.path().join("agent");
+        let update_root = agent.join("self-update");
+        std::fs::create_dir_all(&update_root).unwrap();
+        let now = super::now_ms();
+        let staging = update_root.join("pending-Done001");
+        std::fs::create_dir_all(staging.join("bin")).unwrap();
+        std::fs::write(staging.join("bin").join("rpi.exe"), b"payload").unwrap();
+
+        // A `waiting` leftover naming the same directory as a completed run.
+        let leftover = update_root.join(format!("status-{}.json", "3".repeat(32)));
+        std::fs::write(
+            &leftover,
+            serde_json::to_vec(&serde_json::json!({
+                "state": "waiting",
+                "staging": staging,
+                "updatedAtMs": now,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let recent = update_root.join(format!("status-{}.json", "4".repeat(32)));
+        std::fs::write(
+            &recent,
+            serde_json::to_vec(&serde_json::json!({
+                "state": "succeeded",
+                "message": "rpi executable replaced successfully",
+                "staging": staging,
+                "updatedAtMs": now,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let aged = update_root.join(format!("status-{}.json", "5".repeat(32)));
+        std::fs::write(
+            &aged,
+            serde_json::to_vec(&serde_json::json!({
+                "state": "succeeded",
+                "message": "rpi executable replaced successfully",
+                "updatedAtMs": now - super::COMPLETED_SELF_UPDATE_STATUS_TTL_MS - 60_000,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(super::consume_self_update_statuses(&agent).is_empty());
+
+        // The receipt for the installed version is kept until it ages out.
+        assert!(recent.exists());
+        assert!(!aged.exists());
+        // The completed record owns the staging directory, so the leftover
+        // `waiting` record that names it is debris; the directory itself is
+        // still referenced, so it stays.
+        assert!(!leftover.exists());
+        assert!(staging.exists());
     }
 
     #[test]

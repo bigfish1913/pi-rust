@@ -11,6 +11,32 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+### Fixed
+
+- `rpi update` no longer stages a brand new build of the version that is
+  already running. It now asks crates.io first and reports
+  `rpi is up to date (0.3.13 is the latest release)` instead of compiling and
+  scheduling a replacement for the same version — the behaviour that made a
+  working update look broken. `--force` keeps an explicit reinstall available,
+  and an unverified answer (cached, or a registry that could not be reached) is
+  labelled as such rather than asserted. A `pending-*` directory that already
+  holds a validated binary counts as "about to happen", so re-running
+  `rpi update` while an update is queued does not start a second compile.
+- `rpi update` prunes the debris previous interrupted runs left in
+  `~/.rpi/agent/self-update`. A Windows update persists its `pending-*` staging
+  directory so the PowerShell helper can install from it after the parent exits;
+  when the helper died first — a reboot at the wrong moment, a machine-wide
+  `taskkill` — the directory stayed forever, because nothing in the update path
+  removed it and its still-`preparing` status file meant the next start never
+  looked at it either. Staging directories no live status file claims are now
+  reclaimed, along with the `preparing`/`waiting` records that named them.
+- The status file `rpi update` prints is readable by the time you go looking for
+  it. A `succeeded` record used to be deleted by the very next rpi start, so the
+  path in that message was dead on arrival and a finished update read as one
+  that never ran. Completed records now survive as the receipt for the installed
+  version (aging out after a day), and the `staged` line names the version and
+  says what to do: `rpi 0.3.13 staged; quit this rpi and it will be applied.`
+
 ## [0.3.12] - 2026-10-01
 
 ### Added
