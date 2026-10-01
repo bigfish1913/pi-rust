@@ -263,9 +263,13 @@ fn voice_registers_a_prompt_transformer_that_respects_the_speech_switch() {
         "the host's prompt must be preserved, got: {next}"
     );
     assert!(
-        next.contains("write for the ear"),
+        next.to_lowercase().contains("write for the ear"),
         "the spoken style section is missing: {next}"
     );
+    // The user's ask, verbatim: acknowledge first, then say what you are about
+    // to do. Pin both so a rewrite that drops them is caught here.
+    assert!(next.contains("Acknowledge first"), "missing acknowledgement rule");
+    assert!(next.contains("Announce before you act"), "missing announce rule");
 
     // Idempotent: a second pass must not duplicate the section.
     let again = transform(h, next);
