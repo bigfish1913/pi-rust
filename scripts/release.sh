@@ -25,11 +25,14 @@
 set -euo pipefail
 
 REPO="bigfish1913/pi-rust"
+# `<target>:<archive extension>` — must mirror the `archive:` column of the
+# release-binaries matrix. Each target publishes exactly ONE archive (plus its
+# `.sha256` sidecar), so requiring both formats here waits forever.
 ASSET_TARGETS=(
-  "x86_64-unknown-linux-gnu"
-  "aarch64-unknown-linux-gnu"
-  "aarch64-apple-darwin"
-  "x86_64-pc-windows-msvc"
+  "x86_64-unknown-linux-gnu:tar.gz"
+  "aarch64-unknown-linux-gnu:tar.gz"
+  "aarch64-apple-darwin:tar.gz"
+  "x86_64-pc-windows-msvc:zip"
 )
 
 DRY_RUN=0
@@ -183,10 +186,11 @@ phase_push() {
 phase_wait() {
   note "wait for the release binaries (release-binaries.yml)"
   local needed=()
-  local target
-  for target in "${ASSET_TARGETS[@]}"; do
-    needed+=("rpi-$release_tag-$target.tar.gz" "rpi-$release_tag-$target.tar.gz.sha256")
-    needed+=("rpi-$release_tag-$target.zip" "rpi-$release_tag-$target.zip.sha256")
+  local entry target ext
+  for entry in "${ASSET_TARGETS[@]}"; do
+    target="${entry%%:*}"
+    ext="${entry##*:}"
+    needed+=("rpi-$release_tag-$target.$ext" "rpi-$release_tag-$target.$ext.sha256")
   done
   if [[ "$DRY_RUN" == "1" ]]; then
     echo "  \$ poll: gh release view $release_tag --json assets until all archives + .sha256 exist"
