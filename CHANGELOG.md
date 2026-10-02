@@ -11,8 +11,27 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+### Added
+
+- Recovering a session that was interrupted mid-tool-call no longer poisons the
+  provider context. When an assistant `toolCall` has no matching `toolResult` —
+  the crash landed between the two durable writes — OpenAI-compatible endpoints
+  rejected the whole request with `No tool output found for function call …`.
+  The harness now repairs the in-memory context before conversion: it inserts a
+  synthetic error result ("Tool call was interrupted before its result was
+  persisted. The tool was not re-executed during session recovery.") directly
+  after the call, in call order for parallel calls, and logs how many it
+  repaired. The durable session is untouched, no interrupted tool is re-run,
+  and normal history round-trips unchanged.
+
 ### Fixed
 
+- Plugin `message_update` events now carry native Pi's `assistantMessageEvent`
+  delta envelope (`text_delta`, `thinking_delta`, `toolcall_delta`, …) instead
+  of a growing `AgentMessage` snapshot. A streaming consumer reads each delta's
+  real `delta` field once, so it no longer has to diff successive cumulative
+  snapshots and stream size stays linear — matching the JSON/RPC contract the
+  other Pi runtimes emit.
 - `rpi update` no longer stages a brand new build of the version that is
   already running. It now asks crates.io first and reports
   `rpi is up to date (0.3.13 is the latest release)` instead of compiling and
