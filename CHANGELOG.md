@@ -11,6 +11,8 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.3.13] - 2026-10-02
+
 ### Added
 
 - Recovering a session that was interrupted mid-tool-call no longer poisons the
