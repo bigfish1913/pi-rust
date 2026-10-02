@@ -139,6 +139,7 @@ ANTHROPIC_AUTH_TOKEN=token
 --no-context-files      跳过 AGENTS.md/CLAUDE.md 发现
 --no-extensions         禁用扩展加载
 --extensions-dir <dir>  额外扫描 Rust 扩展目录
+--local-only            跳过自动扩展发现：只加载 --extensions-dir / --extension 指定的路径
 --list-models [search]  列出可用模型（可带模糊搜索）
 --offline               禁用启动时的网络检查
 --export <file>         把 JSONL 会话导出为 HTML

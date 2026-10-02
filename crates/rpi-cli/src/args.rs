@@ -193,10 +193,12 @@ pub struct Args {
     /// directory (repeated).
     pub prompt_template: Vec<PathBuf>,
 
-    /// Internal scope set by `rpi dev-local` / `rpi dev --local-only`.
-    /// Only the freshly staged development extension and resources it
-    /// discovers are loaded; normal project/global discovery is
-    /// skipped. This is intentionally not parsed by the regular CLI parser.
+    /// `--local-only`: skip automatic extension discovery and load only what
+    /// the caller points at. Extensions come solely from `--extensions-dir`
+    /// and `--extension`/`-e`; skills/prompts fall back to project dirs plus
+    /// explicit `--skill`/`--prompt-template` paths. Also set internally by
+    /// `rpi dev-local` / `rpi dev --local-only` to scope the staged
+    /// development extension.
     pub dev_local_only: bool,
 
     pub verbose: bool,
@@ -373,6 +375,7 @@ pub fn parse_args(args: &[String]) -> Args {
             "--no-prompt-templates" | "-np" => result.no_prompt_templates = true,
             "--no-context-files" | "-nc" => result.no_context_files = true,
             "--no-extensions" | "-ne" => result.no_extensions = true,
+            "--local-only" => result.dev_local_only = true,
             "--extensions-dir" | "-ed" => {
                 if let Some(v) = take_value(&mut result, &flag_key) {
                     result.extensions_dir.push(PathBuf::from(v));
@@ -632,6 +635,9 @@ pub fn print_help() {
   --no-extensions, -ne           Skip Rust cdylib extension loading
   --extensions-dir, -ed <dir>    Extra dir to scan for plugins (.dll/.so/.dylib); repeatable
                                  (also via RPI_EXTENSIONS_DIR env: ';' on Windows, ':' on Unix)
+  --local-only                   Skip automatic extension discovery: load only
+                                 --extensions-dir / --extension paths (no project
+                                 .rpi/extensions, no global extensions)
   --debug-system-prompt          Print the resolved system-prompt sections to stderr (verification)
   --verbose                      Show startup warnings (e.g. ignored flags)
   --help, -h                     Show this help
@@ -977,6 +983,16 @@ mod tests {
         // `--no-extensions` is parsed and disables both extension backends.
         let a = parse_args(&s(&["--no-extensions"]));
         assert!(a.no_extensions);
+        assert!(a.ignored.is_empty());
+    }
+
+    #[test]
+    fn local_only_flag_is_honored_on_the_regular_parser() {
+        // The plain `rpi --local-only` form sets the same scope `rpi dev
+        // --local-only` uses, without the build/watch layer.
+        let a = parse_args(&s(&["--local-only"]));
+        assert!(a.errors.is_empty());
+        assert!(a.dev_local_only);
         assert!(a.ignored.is_empty());
     }
 
