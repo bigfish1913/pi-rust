@@ -20,8 +20,11 @@
 //! `convertToLlm`).
 
 use rpi_agent::message::{AgentMessage, CustomMessage};
-use rpi_ai::types::{Content, Message, UserContent, UserMessage};
+use rpi_ai::types::{
+    Content, Message, ToolResultMessage, ToolResultRole, UserContent, UserMessage,
+};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 /// Wraps `summary` in the compaction-summary text envelope. Mirrors
 /// `COMPACTION_SUMMARY_PREFIX` / `SUFFIX`.
@@ -285,11 +288,107 @@ pub fn bash_execution_to_text(data: &BashExecutionData) -> String {
 // convertToLlm — the harness-level AgentMessage[] -> Message[] converter
 // ---------------------------------------------------------------------------
 
-/// The harness converter. Mirrors TS `convertToLlm`: drops `bashExecution` when
-/// `excludeFromContext`; renders `bashExecution`/`branchSummary`/`compactionSummary`
-/// as `User` text messages; passes through `user`/`assistant`/`toolResult`;
-/// drops unregistered custom roles.
+/// A diagnostic summary produced while repairing a recovered context.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolCallRepairReport {
+    pub repaired_call_ids: Vec<String>,
+}
+
+impl ToolCallRepairReport {
+    pub fn is_empty(&self) -> bool {
+        self.repaired_call_ids.is_empty()
+    }
+}
+
+const RECOVERY_TOOL_RESULT: &str = concat!(
+    "Tool call was interrupted before its result was persisted. ",
+    "The tool was not re-executed during session recovery."
+);
+
+/// Repair assistant tool calls whose result was lost during a crash or partial
+/// session write. This only changes the in-memory provider context: the durable
+/// session remains the user's original history and no tool is executed again.
+pub fn repair_orphaned_tool_calls(
+    messages: Vec<AgentMessage>,
+) -> (Vec<AgentMessage>, ToolCallRepairReport) {
+    let existing_results: HashSet<String> = messages
+        .iter()
+        .filter_map(|message| match message {
+            AgentMessage::ToolResult(result) => Some(result.tool_call_id.clone()),
+            _ => None,
+        })
+        .collect();
+    let mut repaired = Vec::new();
+    let mut report = ToolCallRepairReport::default();
+    let mut pending_calls: Vec<(String, String, i64)> = Vec::new();
+
+    let flush_missing = |repaired: &mut Vec<AgentMessage>,
+                         pending: &mut Vec<(String, String, i64)>,
+                         report: &mut ToolCallRepairReport| {
+        for (tool_call_id, tool_name, timestamp) in pending.drain(..) {
+            report.repaired_call_ids.push(tool_call_id.clone());
+            repaired.push(AgentMessage::ToolResult(Box::new(ToolResultMessage {
+                role: ToolResultRole,
+                tool_call_id,
+                tool_name,
+                content: vec![Content::text(RECOVERY_TOOL_RESULT)],
+                details: None,
+                usage: None,
+                added_tool_names: Vec::new(),
+                is_error: true,
+                timestamp,
+            })));
+        }
+    };
+
+    for message in messages {
+        match &message {
+            AgentMessage::Assistant(assistant) => {
+                let calls = assistant
+                    .content
+                    .iter()
+                    .filter_map(|content| match content {
+                        Content::ToolCall(call) if !existing_results.contains(&call.id) => {
+                            Some((call.id.clone(), call.name.clone(), assistant.timestamp))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                flush_missing(&mut repaired, &mut pending_calls, &mut report);
+                repaired.push(message);
+                pending_calls = calls;
+            }
+            AgentMessage::ToolResult(result) => {
+                if let Some(index) = pending_calls
+                    .iter()
+                    .position(|(id, _, _)| id == &result.tool_call_id)
+                {
+                    pending_calls.remove(index);
+                }
+                repaired.push(message);
+            }
+            _ => {
+                flush_missing(&mut repaired, &mut pending_calls, &mut report);
+                repaired.push(message);
+            }
+        }
+    }
+    flush_missing(&mut repaired, &mut pending_calls, &mut report);
+    (repaired, report)
+}
+
+/// The harness converter. It repairs interrupted tool calls, then mirrors
+/// TS `convertToLlm`: renders custom roles as user text and passes through
+/// normal user/assistant/tool-result messages.
 pub fn convert_to_llm(messages: Vec<AgentMessage>) -> Vec<Message> {
+    let (messages, report) = repair_orphaned_tool_calls(messages);
+    if !report.repaired_call_ids.is_empty() {
+        tracing::warn!(
+            repaired = report.repaired_call_ids.len(),
+            call_ids = ?report.repaired_call_ids,
+            "repaired orphaned tool calls while building provider context"
+        );
+    }
     messages
         .into_iter()
         .filter_map(|m| match m {
@@ -343,6 +442,85 @@ fn convert_custom_to_llm(c: CustomMessage) -> Option<Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rpi_ai::types::{Api, AssistantMessage, ToolCall, ToolCallType};
+
+    fn assistant_with_calls(ids: &[(&str, &str)]) -> AgentMessage {
+        let mut assistant = AssistantMessage::empty(Api::OpenaiCompletions, "test", "model", 42);
+        assistant.content = ids
+            .iter()
+            .map(|(id, name)| {
+                Content::ToolCall(ToolCall {
+                    kind: ToolCallType,
+                    id: (*id).to_string(),
+                    name: (*name).to_string(),
+                    arguments: serde_json::json!({}),
+                    thought_signature: None,
+                    namespace: None,
+                })
+            })
+            .collect();
+        AgentMessage::Assistant(Box::new(assistant))
+    }
+
+    fn tool_result(id: &str, name: &str) -> AgentMessage {
+        AgentMessage::ToolResult(Box::new(ToolResultMessage {
+            role: ToolResultRole,
+            tool_call_id: id.to_string(),
+            tool_name: name.to_string(),
+            content: vec![Content::text("ok")],
+            details: None,
+            usage: None,
+            added_tool_names: Vec::new(),
+            is_error: false,
+            timestamp: 43,
+        }))
+    }
+
+    #[test]
+    fn repair_inserts_error_result_for_missing_tool_output() {
+        let original = assistant_with_calls(&[("call-1", "read")]);
+        let (repaired, report) = repair_orphaned_tool_calls(vec![original.clone()]);
+
+        assert_eq!(report.repaired_call_ids, vec!["call-1"]);
+        assert_eq!(repaired.len(), 2);
+        assert_eq!(repaired[0], original);
+        let AgentMessage::ToolResult(result) = &repaired[1] else {
+            panic!("expected synthetic tool result");
+        };
+        assert_eq!(result.tool_call_id, "call-1");
+        assert_eq!(result.tool_name, "read");
+        assert!(result.is_error);
+        assert!(
+            matches!(&result.content[0], Content::Text(text) if text.text.contains("not re-executed"))
+        );
+    }
+
+    #[test]
+    fn repair_handles_parallel_calls_and_preserves_existing_results() {
+        let assistant = assistant_with_calls(&[("call-1", "read"), ("call-2", "bash")]);
+        let (repaired, report) =
+            repair_orphaned_tool_calls(vec![assistant, tool_result("call-1", "read")]);
+
+        assert_eq!(report.repaired_call_ids, vec!["call-2"]);
+        assert_eq!(repaired.len(), 3);
+        assert!(
+            matches!(&repaired[1], AgentMessage::ToolResult(result) if result.tool_call_id == "call-1" && !result.is_error)
+        );
+        assert!(
+            matches!(&repaired[2], AgentMessage::ToolResult(result) if result.tool_call_id == "call-2" && result.is_error)
+        );
+    }
+
+    #[test]
+    fn normal_history_is_not_changed_by_repair() {
+        let messages = vec![
+            assistant_with_calls(&[("call-1", "read")]),
+            tool_result("call-1", "read"),
+        ];
+        let (repaired, report) = repair_orphaned_tool_calls(messages.clone());
+        assert!(report.is_empty());
+        assert_eq!(repaired, messages);
+    }
 
     #[test]
     fn compaction_summary_round_trips_data() {
