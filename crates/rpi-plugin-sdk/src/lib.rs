@@ -689,8 +689,10 @@ impl Default for EventEmpty {
     }
 }
 
-/// A serialized message payload (`message_start`/`update`/`end`, tool-result
-/// messages). `message` is a JSON `AgentMessage`.
+/// A serialized message lifecycle payload (`message_start`/`message_update`/
+/// `message_end`). `message` is JSON. For `message_update`, it follows native
+/// Pi's envelope and carries `assistantMessageEvent`; streaming consumers must
+/// read its real `text_delta.delta` instead of diffing a cumulative snapshot.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct EventMessage {
