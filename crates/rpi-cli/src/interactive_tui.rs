@@ -6,7 +6,7 @@
 //! mapping (`handleEvent`), driven by the live `AgentEvent` stream the harness
 //! emits via the `BroadcastEmitter` installed in [`crate::session`].
 //!
-//! Key architecture facts (see `docs/tui-gap-analysis.md`):
+//! Key architecture facts (see the initial port notes (retired)):
 //! - `TuiAltScreen::start()` still has a readerless companion, so this module
 //!   owns a `spawn_blocking` crossterm `read()` loop for key dispatch and a
 //!   `tokio::spawn` task that drains `broadcast::Receiver<AgentEvent>` into UI

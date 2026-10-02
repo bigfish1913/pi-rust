@@ -106,7 +106,7 @@ tool → result → follow-up cycle offline. See
 ## Documentation
 
 - Crate docs: <https://docs.rs/rpi-ai>
-- Architecture: [docs/architecture.md](https://github.com/bigfish1913/pi-rust/blob/main/docs/architecture.md)
+- Architecture: [docs/architecture/overview.md](https://github.com/bigfish1913/pi-rust/blob/main/docs/architecture/overview.md)
 
 ## License
 

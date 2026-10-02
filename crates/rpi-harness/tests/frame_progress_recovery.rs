@@ -6,7 +6,7 @@
 //! takes, and it is where a missing codec whitelist entry would surface as
 //! "recovery silently finds nothing".
 //!
-//! See `docs/llm-repetition-forensics.md` §11.7.1.
+//! See `docs/debugging/llm-repetition-forensics.md` §11.7.1.
 
 use std::sync::Arc;
 

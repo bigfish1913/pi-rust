@@ -18,7 +18,7 @@ Website: <https://rpi.laofu.online/> · Docs: <https://rpi.laofu.online/docs.htm
 
 ![rpi interactive session](docs/images/rpi-interactive.png)
 
-<sub>Interactive TUI. See [`docs/user-guide.md`](docs/user-guide.md) for the full command surface.</sub>
+<sub>Interactive TUI. See [`docs/guides/user-guide.md`](docs/guides/user-guide.md) for the full command surface.</sub>
 
 ![rpi SDK demo — an agent loop and a real tool round-trip, offline with the faux provider](docs/images/rpi-sdk-demo.gif)
 
@@ -34,7 +34,7 @@ Website: <https://rpi.laofu.online/> · Docs: <https://rpi.laofu.online/docs.htm
 
 The three share one implementation. Build your tools once, debug them inside an
 embedded agent, and ship the same code as a `cdylib` plugin that the global `rpi`
-loads. See [`docs/agent-project.md`](docs/agent-project.md) for the recommended
+loads. See [`docs/agent/project-structure.md`](docs/agent/project-structure.md) for the recommended
 project layout.
 
 ## Install
@@ -254,7 +254,7 @@ silently loads the machine's global plugins.
 
 Method, raw per-run numbers, and what is *not* measured (LLM latency, tool-loop
 throughput, long sessions, TUI frame cost) are in
-[`docs/performance-vs-pi.md`](docs/performance-vs-pi.md).
+[`docs/performance/benchmark-vs-pi.md`](docs/performance/benchmark-vs-pi.md).
 
 ## Plugins
 
@@ -289,7 +289,7 @@ export_plugin!(|api| {
 
 Start from [`examples/plugin-stub`](examples/plugin-stub) — a complete plugin
 with the full `execute`→`poll`→`cancel`→`destroy` lifecycle — and read
-[`docs/extension-authoring.md`](docs/extension-authoring.md) for the safety
+[`docs/extensions/authoring.md`](docs/extensions/authoring.md) for the safety
 rules, which are load-bearing rather than stylistic.
 
 ## Remote mode
@@ -301,7 +301,7 @@ rpi --connect host:port --token T   # TUI client with zero local agent resources
 
 The client holds no provider, tools, extensions or session files — all agent
 work happens on the server, so a thin terminal anywhere can drive a beefy
-machine. See [`docs/remote-mode.md`](docs/remote-mode.md).
+machine. See [`docs/remote/user-guide.md`](docs/remote/user-guide.md).
 
 ## Project status
 
@@ -318,11 +318,15 @@ required and none is loaded.
 
 ## Documentation
 
-- [User guide](docs/user-guide.md) — commands, config, sessions, skills
-- [Architecture](docs/architecture.md) — how the crates fit together and why
-- [Building an agent project](docs/agent-project.md) — recommended structure
-- [Extension authoring](docs/extension-authoring.md) — plugin templates and ABI rules
-- [Remote mode](docs/remote-mode.md) — protocol, tokens, limitations
+Start with the [documentation index](docs/README.md), grouped by feature.
+
+Start with the [documentation index](docs/README.md), grouped by feature.
+
+- [User guide](docs/guides/user-guide.md) — commands, config, sessions, skills
+- [Architecture](docs/architecture/overview.md) — how the crates fit together and why
+- [Building an agent project](docs/agent/project-structure.md) — recommended structure
+- [Extension authoring](docs/extensions/authoring.md) — plugin templates and ABI rules
+- [Remote mode](docs/remote/user-guide.md) — protocol, tokens, limitations
 - [Roadmap](ROADMAP.md) · [Changelog](CHANGELOG.md)
 - [docs.rs](https://docs.rs/rpi-cli) for per-crate API docs
 

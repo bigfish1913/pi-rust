@@ -156,11 +156,11 @@ async fn run_inner() -> i32 {
             );
             return EXIT_USAGE;
         }
-        // Never a working invocation; the same fall-through applies.
-        Some("self-update") => {
-            eprintln!("error: unknown command `self-update`; use `rpi update`");
-            return EXIT_USAGE;
-        }
+        // // Never a working invocation; the same fall-through applies.
+        // Some("self-update") => {
+        //     eprintln!("error: unknown command `self-update`; use `rpi update`");
+        //     return EXIT_USAGE;
+        // }
         _ => {}
     }
 

@@ -10,7 +10,7 @@
 //! native extension can claim and consume its own CLI options after loading.
 //!
 //! Divergences from the TS parser (all deliberate v1 scope cuts, documented in
-//! `docs/m6-cli-open-questions.md`):
+//! the initial port notes (retired)):
 //! - `--mode rpc`,
 //!   `--fork`, `--approve`/`-na`,
 //!   `--extension`/`-e`, `--skill`, and `--prompt-template` are recognized but

@@ -6,7 +6,7 @@
 //! bash dependency) plus the `OsExecutionEnv` for a couple of real-shell smoke
 //! checks gated on bash availability.
 //!
-//! See docs/m4-open-questions.md for the divergence note on the timeout-truncated
+//! See the initial port notes (retired) for the divergence note on the timeout-truncated
 //! output case (the TS `TimeoutOutputExecutionEnv` cannot be expressed against
 //! `InMemoryExecutionEnv` without a blocking-override env like `abort_bracketing`).
 

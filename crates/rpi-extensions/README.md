@@ -67,7 +67,7 @@ rpi dev                                   # build + watch + live reload
 ## Docs
 
 - Crate docs: <https://docs.rs/rpi-extensions>
-- [Extension authoring guide](https://github.com/bigfish1913/pi-rust/blob/main/docs/extension-authoring.md)
+- [Extension authoring guide](https://github.com/bigfish1913/pi-rust/blob/main/docs/extensions/authoring.md)
 - [Plugin ABI contract](https://docs.rs/rpi-plugin-sdk)
 - [Ready-to-install extensions](https://github.com/pi-rust/rpi-package)
 

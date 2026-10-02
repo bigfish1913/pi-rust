@@ -100,7 +100,7 @@ rpi --connect host:port --token T # zero-local-resource TUI client
 
 The client holds no local provider, tools, extensions or session files; all
 agent work happens on the server. See
-[docs/remote-mode.md](https://github.com/bigfish1913/pi-rust/blob/main/docs/remote-mode.md).
+[docs/remote/user-guide.md](https://github.com/bigfish1913/pi-rust/blob/main/docs/remote/user-guide.md).
 
 ## Default tools
 
@@ -121,13 +121,13 @@ rpi-cli = "0.3"
 For building your own agent, depend on
 [`rpi-agent`](https://crates.io/crates/rpi-agent) and
 [`rpi-harness`](https://crates.io/crates/rpi-harness) directly instead — see
-[docs/agent-project.md](https://github.com/bigfish1913/pi-rust/blob/main/docs/agent-project.md).
+[docs/agent/project-structure.md](https://github.com/bigfish1913/pi-rust/blob/main/docs/agent/project-structure.md).
 
 ## Documentation
 
 - User guide: <https://rpi.laofu.online/docs.html>
-- Architecture: [docs/architecture.md](https://github.com/bigfish1913/pi-rust/blob/main/docs/architecture.md)
-- Extension authoring: [docs/extension-authoring.md](https://github.com/bigfish1913/pi-rust/blob/main/docs/extension-authoring.md)
+- Architecture: [docs/architecture/overview.md](https://github.com/bigfish1913/pi-rust/blob/main/docs/architecture/overview.md)
+- Extension authoring: [docs/extensions/authoring.md](https://github.com/bigfish1913/pi-rust/blob/main/docs/extensions/authoring.md)
 - Changelog: [CHANGELOG.md](https://github.com/bigfish1913/pi-rust/blob/main/CHANGELOG.md)
 
 ## License

@@ -239,7 +239,7 @@ pub enum RegistryEntry {
 pub const DEFAULT_PRIORITY: i32 = 100;
 
 /// The host platform, as matched against a plugin's declared `platforms`.
-/// Mirrors the lifescope `Platform` set.
+/// Platform set used by extension capability declarations.
 pub fn current_platform() -> &'static str {
     if cfg!(target_os = "android") {
         "android"

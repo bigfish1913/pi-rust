@@ -21,7 +21,7 @@
 //!
 //! The shared [`SessionRepo`] trait signatures (`create`/`list`/`fork`) do NOT
 //! carry `cwd`, but the JSONL on-disk layout is cwd-encoded — `cwd` is load-
-//! bearing for the JSONL backend. Resolution (see `docs/m5c-open-questions.md`):
+//! bearing for the JSONL backend. Resolution (see the initial port notes (retired)):
 //!
 //! - **Inherent typed methods** — [`JsonlSessionRepo::create_typed`],
 //!   [`JsonlSessionRepo::list_typed`], [`JsonlSessionRepo::fork_typed`] — take

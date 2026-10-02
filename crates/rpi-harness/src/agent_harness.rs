@@ -9,7 +9,7 @@
 //! clone inputs, getters return clones — mirroring TS `[...]`/`{...}`).
 //!
 //! What the v1 port implements (the rest is documented as deferred in
-//! `docs/m5f-open-questions.md`):
+//! the initial port notes (retired)):
 //! - [`AgentHarness::create`] — reject when the session already has records
 //!   (TS `create.restore` is not implemented either; we surface restore as a
 //!   `HarnessError::Io` rejection rather than a panic).
@@ -2286,7 +2286,7 @@ impl AgentHarness {
         // The run never got to persist its messages, so replay whatever
         // assistant frames committed before the process died and record them as
         // interrupted. Without this the whole run's output is lost and only the
-        // user's prompt remains — see `docs/llm-repetition-forensics.md` §十一.
+        // user's prompt remains — see `docs/debugging/llm-repetition-forensics.md` §十一.
         // Mirrors upstream's `recoverAssistantGeneration`.
         //
         // Every unresolved tool call gets a result: a real one when the call may
@@ -3147,7 +3147,7 @@ impl AgentHarness {
         // Run-level turn ceiling shared with the post-loop notice below. The
         // loop's only other exit is "the model stopped asking for tools", which
         // nothing bounds — one observed session ran 112 turns / 867s in a single
-        // run (`docs/llm-repetition-forensics.md` §二). Upstream has no such
+        // run (`docs/debugging/llm-repetition-forensics.md` §二). Upstream has no such
         // ceiling either, so this is **off unless** `RPI_MAX_TURNS_PER_RUN=<n>`
         // asks for it; when off the hook stays `None` and the loop is unchanged.
         let run_budget = Arc::new(Mutex::new(crate::run_budget::RunBudget::from_env()));
@@ -3297,7 +3297,7 @@ impl AgentHarness {
         // session as it arrives, so a crash mid-run leaves a committed prefix
         // that `salvage_run_frames` can replay instead of losing the whole run.
         // Mirrors upstream's `openFrameProgress`. See
-        // `docs/llm-repetition-forensics.md` §十一.
+        // `docs/debugging/llm-repetition-forensics.md` §十一.
         let frame_recorder = Arc::new(crate::frame_progress::FrameRecordingEmitter::new(
             base_emitter,
             self.session.clone(),

@@ -221,9 +221,9 @@ tasks:
     desc: 上传 rpi 完整使用手册、扩展作者指南和调试指引
     cmds:
       - ssh root@139.196.85.175 "mkdir -p /var/www/{{.RPI_SERVICE_NAME}}"
-      - scp docs/user-guide.md root@139.196.85.175:/var/www/{{.RPI_SERVICE_NAME}}/user-guide.md
-      - scp docs/extension-authoring.md root@139.196.85.175:/var/www/{{.RPI_SERVICE_NAME}}/extension-authoring.md
-      - scp docs/rust-debugging.md root@139.196.85.175:/var/www/{{.RPI_SERVICE_NAME}}/rust-debugging.md
+      - scp docs/guides/user-guide.md root@139.196.85.175:/var/www/{{.RPI_SERVICE_NAME}}/user-guide.md
+      - scp docs/extensions/authoring.md root@139.196.85.175:/var/www/{{.RPI_SERVICE_NAME}}/extension-authoring.md
+      - scp docs/debugging/rust-debugging.md root@139.196.85.175:/var/www/{{.RPI_SERVICE_NAME}}/rust-debugging.md
       - >-
         echo "使用手册、扩展作者指南和调试指引已上传"
 

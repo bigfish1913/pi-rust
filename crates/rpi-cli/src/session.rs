@@ -78,15 +78,15 @@ pub fn default_system_prompt(cwd: &str, prior_reasoning_replayed: bool) -> Strin
     // again, and claiming otherwise makes it re-derive and restate the plan
     // every turn — the re-plan symptom in `docs/llm-repetition-forensics.md`.
     let working_state_rule = if prior_reasoning_replayed {
-        "- Keep a SHORT working plan visible (a few bullets, or the todo tool) and update it as you go.  
-  Your own reasoning is carried back to you on the next turn, so do not re-derive it or restate  
-  the whole plan: continue from the last unfinished step, and when a step lands, say which one.  
+        "- Keep a SHORT working plan visible (a few bullets, or the todo tool) and update it as you go.
+  Your own reasoning is carried back to you on the next turn, so do not re-derive it or restate
+  the whole plan: continue from the last unfinished step, and when a step lands, say which one.
   Re-listing the same plan without acting on it is a bug, not progress."
     } else {
-        "- Keep your working state in your VISIBLE replies, not only in reasoning. Reasoning is not  
-  carried into your next turn: only the text you write and the tool output you produce come  
-  back. Before each batch of tool calls, write one short line naming the task you are on and  
-  what remains. When you finish a step, say which one is done. If you keep the plan only in  
+        "- Keep your working state in your VISIBLE replies, not only in reasoning. Reasoning is not
+  carried into your next turn: only the text you write and the tool output you produce come
+  back. Before each batch of tool calls, write one short line naming the task you are on and
+  what remains. When you finish a step, say which one is done. If you keep the plan only in
   your head you will re-derive it from scratch every turn."
     };
 
@@ -300,8 +300,7 @@ pub async fn build(
     // loaders below (borrowed); clone one branch so both hold a reference.
     let ctx = ExecutionToolContext::new(env_dyn.clone(), Some(mut_env));
 
-    let tools = build_tools(&ctx, args);
-    let mut tools = tools;
+    let mut tools = build_tools(&ctx, args);
 
     // ---- Extensions (Part B2) ----
     // Load cdylib plugins from the resolved extension dirs, merge their tools

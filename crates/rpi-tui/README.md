@@ -78,7 +78,7 @@ navigation — the source is at
 ## Documentation
 
 - Crate docs: <https://docs.rs/rpi-tui>
-- [TUI gap analysis](https://github.com/bigfish1913/pi-rust/blob/main/docs/tui-gap-analysis.md)
+- [TUI gap analysis](https://github.com/bigfish1913/pi-rust/blob/main/docs/README.md)
 
 ## License
 

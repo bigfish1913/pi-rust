@@ -162,7 +162,7 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ### Changed
 
-- `docs/rustcc-post-v0.1.13.md` is marked as a historical 0.1.13 release post,
+- `docs/README.md` is marked as a historical 0.1.13 release post,
   and its update-commands section now carries a correction. It still told
   readers to run `rpi pi-update` and `rpi self-update`, neither of which exists
   any more — the article only documented 0.1.13-era behavior and was never
@@ -302,7 +302,7 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
   A model cannot forge it either — the host's value overrides one that matches.
   Built-in tools are unaffected; they already receive an
   `ExecutionToolContext`. This is what lets a plugin keep per-session state
-  without asking the model to guess an identity. `docs/extension-authoring.md`
+  without asking the model to guess an identity. `docs/extensions/authoring.md`
   documents the contract, including the one failure mode worth naming: a
   `#[serde(deny_unknown_fields)]` parameter struct will reject the injected key.
 - `cargo binstall rpi-cli` works: `[package.metadata.binstall]` points at the
@@ -400,14 +400,14 @@ on `main` and fixes how every crate presents itself on crates.io and docs.rs.
 - Every crate declares `homepage` and `documentation`, and ships its own
   `README.md` instead of the workspace README. Previously all nine crates.io and
   docs.rs pages showed the same generic document, and its relative links
-  (`docs/architecture.md`, `LICENSE`, `examples/plugin-stub`) resolved to 404 on
+  (`docs/architecture/overview.md`, `LICENSE`, `examples/plugin-stub`) resolved to 404 on
   those sites.
 - docs.rs now builds with `all-features` for every crate except `rpi-cli`, whose
   clipboard feature needs platform libraries that are not present there.
 
 ### Docs
 
-- Added `docs/performance-vs-pi.md` and `scripts/bench-vs-pi.mjs` — a reproducible,
+- Added `docs/performance/benchmark-vs-pi.md` and `scripts/bench-vs-pi.mjs` — a reproducible,
   same-machine comparison against native Pi over the same JSONL command channel,
   with isolated config directories and both tools offline. rpi is 9.7× faster to
   start, 10.7× faster to cold start, 7.6× smaller in memory and ~18× smaller
@@ -437,11 +437,11 @@ on `main` and fixes how every crate presents itself on crates.io and docs.rs.
 ### Added
 
 - A model-visible system prompt section that makes the agent aware of reasoning
-  replay, developed alongside `docs/llm-repetition-forensics.md`.
+  replay, developed alongside `docs/debugging/llm-repetition-forensics.md`.
 
 ### Docs
 
-- `docs/llm-repetition-forensics.md` updated with the latest evidence and the
+- `docs/debugging/llm-repetition-forensics.md` updated with the latest evidence and the
   corrections to earlier conclusions in that document.
 
 ## [0.2.0] - 2026-09-25
@@ -479,7 +479,7 @@ on `main` and fixes how every crate presents itself on crates.io and docs.rs.
 
 ### Docs
 
-- `docs/llm-repetition-forensics.md` §11 documents the per-state comparison
+- `docs/debugging/llm-repetition-forensics.md` §11 documents the per-state comparison
   against native Pi's durable state machine.
 - `docs/native-pi-missing-features.md` §7/§15 corrected against verified
   behaviour.
@@ -553,7 +553,7 @@ on `main` and fixes how every crate presents itself on crates.io and docs.rs.
 
 ### Docs
 
-- New `docs/remote-mode.md` and `docs/lifescope.md`.
+- New `docs/remote/user-guide.md` and `docs/README.md`.
 
 ## [0.1.23] - 2026-09-21
 

@@ -159,8 +159,8 @@ run (`AgentStart`/`AgentEnd`), each assistant message
 ## Documentation
 
 - Crate docs: <https://docs.rs/rpi-agent>
-- Architecture: [docs/architecture.md](https://github.com/bigfish1913/pi-rust/blob/main/docs/architecture.md)
-- Project structure guide: [docs/agent-project.md](https://github.com/bigfish1913/pi-rust/blob/main/docs/agent-project.md)
+- Architecture: [docs/architecture/overview.md](https://github.com/bigfish1913/pi-rust/blob/main/docs/architecture/overview.md)
+- Project structure guide: [docs/agent/project-structure.md](https://github.com/bigfish1913/pi-rust/blob/main/docs/agent/project-structure.md)
 
 ## License
 

@@ -67,7 +67,7 @@ The ABI and loader work; the ecosystem is thin. Concretely:
 
 ### 5. Startup initialisation (measured)
 
-The benchmark in [`docs/performance-vs-pi.md`](docs/performance-vs-pi.md) puts rpi
+The benchmark in [`docs/performance/benchmark-vs-pi.md`](docs/performance/benchmark-vs-pi.md) puts rpi
 at **17.7 ms** from spawn to cold start (native Pi: 189.5 ms). Core startup is
 essentially just process creation — config, session store, tool registry and the
 harness are negligible (rpi's `--version` and its cold start differ by 0.2 ms).

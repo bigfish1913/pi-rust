@@ -98,7 +98,7 @@ plugin checks `struct_size`.
   a complete plugin registering an `echo` tool with the full four-function
   lifecycle (`execute` → `poll` → `cancel` → `destroy`), an event handler, and a
   resource-discovery handler.
-- [Extension authoring guide](https://github.com/bigfish1913/pi-rust/blob/main/docs/extension-authoring.md) —
+- [Extension authoring guide](https://github.com/bigfish1913/pi-rust/blob/main/docs/extensions/authoring.md) —
   templates, safety rules, testing and release checklist.
 - Host-side loader: [`rpi-extensions`](https://crates.io/crates/rpi-extensions).
 - Ready-to-install extensions:

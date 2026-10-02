@@ -490,7 +490,7 @@ pub fn dispatch_data_event_claiming(
     claimed
 }
 
-/// Per-lifecycle-event handler timeout budget (mirrors lifescope §6.1):
+/// Per-lifecycle-event handler timeout budget (see docs/extensions/lifecycle.md):
 /// startup 5s, session shutdown 15s, everything else 10s. A handler that
 /// exceeds its budget is logged + skipped (it keeps running on its blocking
 /// thread, but no longer gates startup/shutdown).

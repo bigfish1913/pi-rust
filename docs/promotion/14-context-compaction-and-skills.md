@@ -13,9 +13,11 @@ flowchart TD
     Prepare --> Summary[生成摘要 entry]
     Summary --> Build
     Run --> Persist[持久化消息与 usage]
+    Persist --> Check{工具结果后继续?}
+    Check -->|是| Budget
 ```
 
-`rpi-harness` 在 run 前评估上下文，并在需要时调用 `should_compact`、`prepare_compaction` 和 `compact`。摘要是会话树中的 entry，而不是偷偷修改历史文件。
+`rpi-harness` 在 run 前以及运行中工具结果返回后评估上下文，并在需要时调用 `should_compact`、`prepare_compaction` 和 `compact`。摘要是会话树中的 entry，而不是偷偷修改历史文件。
 
 ## Skills 和模板是输入层
 
@@ -48,8 +50,11 @@ Skills 不应该直接改 Agent 内部状态；它们应当成为可审计的 pr
 
 A long session eventually reaches a context limit. Putting every old message into the next request is simple, but it is expensive and eventually stops working. rpi keeps compaction above the low-level loop, inside `rpi-harness`.
 
-Before a run, the harness estimates the context and decides whether a compaction pass is needed. It selects a cut point, writes a summary entry, and builds the next context from the branch plus that summary. The original records remain available for inspection.
+Before a run and after tool results during a run, the harness estimates the context and decides whether a compaction pass is needed. It selects a cut point, writes a summary entry, and builds the next context from the branch plus that summary. The original records remain available for inspection.
 
 Skills and prompt templates are input resources. They are composed into the system prompt instead of being mixed into runtime state. This makes runs easier to inspect and keeps the same agent usable from a CLI or an embedded service.
 
 Read `crates/rpi-harness/src/compaction`, `skills.rs`, `system_prompt.rs`, and `agent_harness.rs`.
+
+
+当前行为与实现边界见 [上下文压缩](../agent/context-compaction.md)。

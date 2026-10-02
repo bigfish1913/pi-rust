@@ -110,7 +110,7 @@ Pi-compatible set — and exposes the rest through the `default_tools` setting.
 ## Documentation
 
 - Crate docs: <https://docs.rs/rpi-tools>
-- Architecture: [docs/architecture.md](https://github.com/bigfish1913/pi-rust/blob/main/docs/architecture.md)
+- Architecture: [docs/architecture/overview.md](https://github.com/bigfish1913/pi-rust/blob/main/docs/architecture/overview.md)
 
 ## License
 

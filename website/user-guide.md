@@ -361,7 +361,7 @@ rpi-plugin-sdk → rpi-extensions → rpi-tui → rpi-cli
 - Rust API：<https://docs.rs/rpi-agent>、<https://docs.rs/rpi-plugin-sdk>
 - Pi 参考实现：<https://github.com/earendil-works/pi>
 - Package 与扩展作者指南：<https://rpi.laofu.online/extension-authoring.md>
-- 远程模式：<docs/remote-mode.md>
+- 远程模式：<docs/remote/user-guide.md>
 - Rust 扩展与 agent 调试：`rpi` 内 `docs` 工具的 `debugging` 主题
 
 当在线文档和已安装版本不一致时，以对应版本的 Git tag 和仓库内文档为准。

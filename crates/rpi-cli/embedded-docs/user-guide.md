@@ -139,7 +139,6 @@ ANTHROPIC_AUTH_TOKEN=token
 --no-context-files      跳过 AGENTS.md/CLAUDE.md 发现
 --no-extensions         禁用扩展加载
 --extensions-dir <dir>  额外扫描 Rust 扩展目录
---local-only            跳过自动扩展发现：只加载 --extensions-dir / --extension 指定的路径
 --list-models [search]  列出可用模型（可带模糊搜索）
 --offline               禁用启动时的网络检查
 --export <file>         把 JSONL 会话导出为 HTML
@@ -370,7 +369,7 @@ rpi-plugin-sdk → rpi-extensions → rpi-tui → rpi-cli
 - Rust API：<https://docs.rs/rpi-agent>、<https://docs.rs/rpi-plugin-sdk>
 
 - Package 与扩展作者指南：<https://rpi.laofu.online/extension-authoring.md>
-- 远程模式：<docs/remote-mode.md>
+- 远程模式：<docs/remote/user-guide.md>
 - Rust 扩展与 agent 调试：`rpi` 内 `docs` 工具的 `debugging` 主题
 
 当在线文档和已安装版本不一致时，以对应版本的 Git tag 和仓库内文档为准。

@@ -9,7 +9,7 @@
 //! - `format_prompt_template_invocation` substitutes `$1`${@:2}`$ARGUMENTS`.
 //!
 //! The TS symlink case is deferred to an OS-env conformance test (the in-memory
-//! env's `canonical_path` is identity) — see `docs/m5e-open-questions.md`.
+//! env's `canonical_path` is identity) — see the initial port notes (retired).
 
 use std::sync::Arc;
 

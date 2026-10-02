@@ -1272,7 +1272,7 @@ mod tests {
         // The `compat` block is what lets a custom openai-completions provider
         // describe its quirks. `requiresThinkingAsText` is the one that decides
         // whether the model's own reasoning is sent back or dropped — see
-        // `docs/llm-repetition-forensics.md` §八. If this hop ever breaks, the
+        // `docs/debugging/llm-repetition-forensics.md` §八. If this hop ever breaks, the
         // setting silently does nothing (the provider falls back to
         // `Content::text_only`, which drops every thinking block).
         let config: ModelsConfig = serde_json::from_str(

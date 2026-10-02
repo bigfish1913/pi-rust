@@ -13,7 +13,7 @@
 //! - `rpi auth logout` — drop the `anthropic` entry from `auth.json` (env vars
 //!   are left untouched, matching upstream `/logout` semantics).
 //!
-//! # Not ported (deferred — see `docs/m6-cli-open-questions.md`)
+//! # Not ported (deferred — see the initial port notes (retired))
 //!
 //! OAuth device-code login (Claude Pro/Max subscriptions), the full TUI
 //! `--provider` picker, and `auth print-api-key`/`print-bearer-token`. Only

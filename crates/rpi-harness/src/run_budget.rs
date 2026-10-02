@@ -6,7 +6,7 @@
 //! (`agent_loop.rs`: `while has_more_tool_calls || !pending_messages.is_empty()`).
 //! Nothing bounds how long that takes, so a model that keeps emitting tool
 //! calls runs until it decides to stop. One observed session did **112 turns in
-//! a single run over 867 seconds** (`docs/llm-repetition-forensics.md` §二), and
+//! a single run over 867 seconds** (`docs/debugging/llm-repetition-forensics.md` §二), and
 //! the same run also paid an O(n²) per-delta clone cost (§4.7) — so the whole
 //! 14 minutes was spent on a run the user had no way to interrupt or bound.
 //!

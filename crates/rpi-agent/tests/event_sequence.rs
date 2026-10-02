@@ -278,7 +278,7 @@ async fn emits_message_update_events_on_streaming_deltas() {
 /// loop must forward the provider's `Arc` rather than deep-cloning the whole
 /// growing message once per delta. That clone (plus one in the loop's context
 /// update, plus one per consumer) is what made a long stream quadratic in the
-/// output length — see `docs/llm-repetition-forensics.md` §十.
+/// output length — see `docs/debugging/llm-repetition-forensics.md` §十.
 ///
 /// Pointer identity is the precise assertion: it can only hold if no copy
 /// happened anywhere between the provider and the event.

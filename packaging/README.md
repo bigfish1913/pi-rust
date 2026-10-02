@@ -25,7 +25,7 @@ has open, which is traffic the website cannot reach.
 
 The whole pipeline — bump, tag, wait for the release binaries, refresh every
 manifest below, push the taps, open the winget PR, publish to crates.io, deploy
-the site — is one command; see [`docs/releasing.md`](../docs/releasing.md):
+the site — is one command; see [`docs/maintaining/releasing.md`](../docs/maintaining/releasing.md):
 
 ```bash
 task publish                 # auto-increments the version
