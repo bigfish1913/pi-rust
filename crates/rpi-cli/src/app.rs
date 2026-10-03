@@ -141,18 +141,12 @@ async fn run_inner() -> i32 {
         Some("update") => return crate::updates::run_self_update(&argv[1..]),
         Some("install") => return crate::install::run(&argv[1..]),
         Some("uninstall") => return crate::install::uninstall(&argv[1..]),
-        // Subcommands that went away with the Pi compatibility layer. Without
-        // an explicit arm these fall through to the prompt path, so
-        // `rpi package update` silently starts a chat session whose first
-        // message is "package update" — reported as a hang, because there is no
-        // terminal to read a prompt from. Fail loudly instead.
-        Some(
-            removed @ ("package" | "pi-package" | "pi-update" | "install-pi" | "uninstall-pi"),
-        ) => {
+        Some("package") => return crate::packages::run(&argv[1..]),
+        // These historical aliases are intentionally rejected instead of
+        // falling through to the prompt path.
+        Some(removed @ ("pi-package" | "pi-update" | "install-pi" | "uninstall-pi")) => {
             eprintln!(
-                "error: `rpi {removed}` is not available; the Pi package layer was removed.\n\
-                 Use `rpi install <crate>` and `rpi uninstall <crate>` for Rust extensions,\n\
-                 and `rpi update` to update the CLI."
+                "error: `rpi {removed}` is not available; use `rpi package`, `rpi install`, or `rpi update`."
             );
             return EXIT_USAGE;
         }

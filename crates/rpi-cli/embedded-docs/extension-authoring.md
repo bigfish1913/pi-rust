@@ -175,48 +175,6 @@ fan-out 到所有已注册 handler，合并返回的 `{skillPaths, promptPaths, 
 单个 handler 报错不中止 fan-out。`out` 是插件拥有的 `StbString`，宿主通过插件
 注册时给的 `plugin_free_string` 回收。
 
-### 运行时改写系统提示词
-
-`api.register_before_agent_start` 注册系统提示词变换器，对应 pi 的
-`before_agent_start` handler 返回 `systemPrompt`（成为该次运行的
-`forceSystemPrompt`）。这是插件**运行时**改变系统提示词的唯一正规入口：
-
-```rust
-// event_json 里带 prompt / imageCount / sessionId / host，以及**当前** systemPrompt。
-extern "C" fn on_before_agent_start(
-    event_json: StbStringRef,
-    out: *mut StbString,
-    user_data: *mut c_void,
-) -> i32 {
-    rpi_plugin_sdk::guard_or(1, || {
-        let env: serde_json::Value =
-            serde_json::from_str(unsafe { event_json.as_str() }).unwrap_or_default();
-        let current = env["systemPrompt"].as_str().unwrap_or("");
-        // 返回值是**替换**而非追加：想追加就读当前值再拼回去（pi 同样要求）。
-        let next = format!("{current}\n\n本仓库优先使用 `just test` 而非 `cargo test`。");
-        unsafe { *out = StbString::from_string(json!({ "systemPrompt": next }).to_string()); }
-        0
-    })
-}
-```
-
-语义要点（与 pi 对齐）：
-
-- **替换，不是追加。** 返回的文本成为提示词。想追加必须自己读 `eventJson` 里的
-  `systemPrompt` 再拼接——宿主不会帮你保留原文。
-- **按注册顺序串联。** 后一个 handler 收到的是前一个 handler 返回的结果。
-- **单个 handler 失败不致命。** 返回非零或 panic 时，提示词保持前一个 handler 的
-  结果，fan-out 继续（宿主记日志 + 跳过）。
-- **只影响该次运行。** 宿主每轮重新从会话状态推导提示词，插件的结果不会被持久化。
-- **每个用户 prompt 只算一次。** 一次 prompt 可能触发多轮 provider 调用（工具循环），
-  变换器只在第一轮前运行并缓存结果，避免同一运行中途漂移。
-- **返回空对象/空串 = 不变。** 只想观察不想改的插件可以什么都不返回；显式返回空
-  字符串则是“清空提示词”，会被采纳。
-
-`out` 与其他 out-param handler 一样由插件拥有、宿主经 `plugin_free_string` 回收。
-该槽位在结构体末尾新增且可为 `None`：面向旧宿主的插件应检测后再注册（见 §3
-能力检测），宿主则在没有插件注册时完全不进入这条路径。
-
 ### Provider 与渲染器
 
 `api.register_provider` 注入自定义 LLM Provider（`provider_id`/`base_url`/
@@ -272,7 +230,30 @@ TUI 中执行 `/reload` 会强制重新运行 Cargo build，再加载新阶段�
 已加载 DLL 无法原地覆盖，因此不要手工把 Cargo target DLL 复制到固定文件名；
 `rpi dev` 的版本化 staging 会安全地完成切换，并在会话退出、loader 释放后清理。
 
-## 8. 资源与配置约定
+## 8. 项目本地扩展包
+
+开发完成后，可以把当前扩展构建并登记到目标项目：
+
+```bash
+# 在目标项目目录执行；--path 可指向另一个扩展源码目录
+rpi package link --path ../my-rpi-extension --package my-rpi-extension
+rpi package list
+
+# 之后在目标项目目录直接启动 rpi 即可加载
+rpi
+
+# 删除项目包
+rpi package unlink my-rpi-extension
+```
+
+项目包保存在 `.rpi/packages/<name>/`，动态库位于其 `extensions/` 子目录；同一目录
+还可以提供 `skills/`、`prompts/` 和 `themes/`。多个包可以重复执行 `link` 登记。
+
+`rpi package` 是 rpi 的项目级 Rust 扩展包机制，不执行 npm/Node package。全局扩展
+仍使用 `rpi install`，开发热重载仍使用 `rpi dev` 或 `rpi dev-local`。项目包会随普通
+`rpi` 启动自动发现；包内动态库属于本机可信代码，请只登记可信源码。
+
+## 9. 资源与配置约定
 
 项目级资源放在 `.rpi/`。同名资源优先级是项目内定义优先
 高于 `.pi`，项目高于全局，package 最后：

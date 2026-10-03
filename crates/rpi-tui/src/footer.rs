@@ -424,15 +424,11 @@ impl Component for FooterComponent {
         // ---- Line 2: stats … model ----
         let model_label = if !model.is_empty() {
             let inner = match thinking_level {
+                Some(ref lvl) if lvl == "off" => format!("{model} • thinking off"),
                 Some(ref lvl) => format!("{model} • {lvl}"),
                 None => model.clone(),
             };
-            format!(
-                "{}{}{}",
-                colors.accent.fg("["),
-                colors.dim.fg(&inner),
-                colors.accent.fg("]")
-            )
+            colors.dim.fg(&inner)
         } else {
             String::new()
         };
@@ -593,6 +589,7 @@ mod tests {
         footer.set_thinking_level(Some("medium"));
         let row = strip_ansi(&footer.render(80)[0]);
         assert!(row.contains("test-model • medium"), "suffix missing: {row}");
+        assert!(!row.contains("[test-model"), "unexpected brackets: {row}");
     }
 
     #[test]

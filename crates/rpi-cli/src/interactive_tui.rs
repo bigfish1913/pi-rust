@@ -4879,7 +4879,11 @@ impl TuiState {
     /// cycle). Called from the `/model` on_select and the Ctrl+P handler.
     fn set_current_model(&self, model: &rpi_ai::Model) {
         *self.current_model_id.lock().unwrap() = model.id.clone();
-        self.footer.set_model(&short_model_name(&model.id));
+        self.footer.set_model(&format!(
+            "({}) {}",
+            model.provider,
+            short_model_name(&model.id)
+        ));
         // A model switch changes the context window, so the `%/{window}` badge
         // must rescale against the same last-reported token count.
         self.footer.set_context_window(model.context_window as i64);
@@ -5080,9 +5084,17 @@ pub async fn interactive_tui(
 
     // Resolve the active model once, up front. The full id feeds the TuiState
     // tracking field + the selectors/key loop (which run on a blocking thread
-    // and can't await `lane.get_model()`); the short name feeds the footer.
-    let lane_model_id = lane.get_model().await.map(|m| m.id).unwrap_or_default();
-    let model_name = short_model_name(&lane_model_id);
+    // and can't await `lane.get_model()`); the provider-qualified label feeds
+    // the footer, matching Pi's `(provider) model` display.
+    let lane_model = lane.get_model().await.ok();
+    let lane_model_id = lane_model
+        .as_ref()
+        .map(|model| model.id.clone())
+        .unwrap_or_default();
+    let model_name = lane_model
+        .as_ref()
+        .map(|model| format!("({}) {}", model.provider, short_model_name(&model.id)))
+        .unwrap_or_else(|| short_model_name(&lane_model_id));
 
     // Snapshot startup capabilities for the welcome screen. Both accessors
     // return defensive clones, so rendering this summary does not retain a

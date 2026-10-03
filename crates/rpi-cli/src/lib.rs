@@ -51,6 +51,7 @@ pub mod llama_command;
 pub mod model_registry;
 pub mod modes;
 pub mod oauth;
+pub mod packages;
 pub mod provider;
 pub mod remote;
 pub mod resource_dirs;

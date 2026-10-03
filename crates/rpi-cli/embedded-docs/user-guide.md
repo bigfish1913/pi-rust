@@ -66,7 +66,7 @@ rpi auth login
 rpi auth logout
 ```
 
-不要把密钥写入 Git 仓库、项目文档或 package manifest。
+不要把密钥写入 Git 仓库或项目文档。
 
 ### 自定义 Provider
 
@@ -163,15 +163,8 @@ rpi uninstall <crate>
 rpi update                 # 更新 rpi CLI 自身
 rpi dev [options]          # 开发 Rust 扩展：编译、watch、热重载
 rpi dev-local [options]    # 只调试当前 Rust 扩展（隔离模式）
+rpi package link|list|unlink # 管理项目本地 Rust 扩展包
 ```
-
-### TUI 历史消息滚动
-
-交互式 TUI 默认使用 alternate screen，并由应用自己管理 transcript 滚动。可以使用 `PageUp` / `PageDown`、`Home` / `End`，或鼠标和触控板滚轮浏览历史消息。
-
-macOS 的行为与 main-screen 的终端原生 scrollback 不同：alternate-screen TUI 必须接收鼠标追踪事件，滚轮和触控板才能滚动历史消息。进入 raw mode 后，TUI 会在 alternate-screen 模式显式重新启用鼠标追踪；main-screen 模式则继续关闭鼠标追踪，以保留终端原生滚动和文本选择。
-
-如果 macOS 上滚轮无法滚动历史消息，应检查 `TuiAltScreen::start_readerless` 是否包含 alternate-screen 的鼠标追踪初始化，不要直接修改 macOS 的全局默认值。
 
 ### 远程模式（`--server` / `--connect`）
 
@@ -189,7 +182,7 @@ rpi --connect 127.0.0.1:9899
 服务端默认开启 token 认证（`--no-token` 可关闭）。客户端支持 `/state`、`/model`、
 `/thinking`、`/tools`、`/abort` 等命令；`/tree`、`/fork`、`/switch`、`/export`、
 `/name`、`/reload` 依赖本地 harness，在远程模式下不可用。完整协议、可用命令与
-限制见 [`remote-mode.md`](remote-mode.md)。
+限制见 [`remote-mode.md`](../remote/user-guide.md)。
 
 ## 4. 内置工具
 
@@ -212,23 +205,21 @@ rpi --tools read,bash,edit,write,docs -p "检查并修改项目文件"
 
 ## 5. 项目目录和资源优先级
 
-rpi 会优先使用 rpi 自己的目录，同时兼容原 Pi 的 `.pi` 布局：
+rpi 使用自己的 `.rpi` 目录：
 
 ```text
 项目/
-├── .rpi/
-│   ├── settings.json
-│   ├── SYSTEM.md
-│   ├── APPEND_SYSTEM.md
-│   ├── skills/
-│   ├── prompts/
-│   ├── themes/
-│   ├── extensions/
-│   └── packages/
-└── themes/
+└── .rpi/
+    ├── settings.json
+    ├── SYSTEM.md
+    ├── APPEND_SYSTEM.md
+    ├── skills/
+    ├── prompts/
+    ├── themes/
+    └── extensions/
 ```
 
-项目 `.rpi` 优先于项目 `.pi`。全局资源默认位于 `~/.rpi/agent/`，包括 `settings.json`、`models.json`、`skills/`、`prompts/`、`themes/`、`extensions/` 和 `packages/`。同名资源发生冲突时，项目资源优先于全局资源，`.rpi` 优先于 `.pi`。
+全局资源默认位于 `~/.rpi/agent/`，包括 `settings.json`、`models.json`、`skills/`、`prompts/`、`themes/` 和 `extensions/`。同名资源发生冲突时，项目资源优先于全局资源。
 
 项目级 `.rpi/settings.json` 可以追加资源目录：
 
@@ -236,12 +227,11 @@ rpi 会优先使用 rpi 自己的目录，同时兼容原 Pi 的 `.pi` 布局：
 {
   "skillDirs": ["./team-skills"],
   "promptDirs": ["./prompts/shared"],
-  "extensionDirs": ["./target/debug"],
-  "packages": ["./packages/review-tools"]
+  "extensionDirs": ["./target/debug"]
 }
 ```
 
-路径相对于项目根目录；`skills`、`prompts`、`extensions` 是对应 `*Dirs` 字段的简写。自定义目录会与 `.rpi`、`.pi` 和全局约定目录一起加载，`.rpi` 优先。全局 `~/.rpi/agent/settings.json` 也支持这些字段，相对路径相对于 agent 目录。
+路径相对于项目根目录；`skills`、`prompts`、`extensions` 是对应 `*Dirs` 字段的简写。自定义目录会与 `.rpi` 和全局约定目录一起加载。全局 `~/.rpi/agent/settings.json` 也支持这些字段，相对路径相对于 agent 目录。
 
 配置目录可以重定位：
 
@@ -283,7 +273,18 @@ rpi dev
 # 只调试当前扩展：rpi dev-local（隔离模式，不加载全局扩展）
 ```
 
-`rpi dev` 会自动识别 Cargo `cdylib`、首次编译并从 `.rpi/extensions/.dev` 加载版本化产物。源码变化会触发重新编译和热重载；手工执行 `/reload` 也会先重新编译。编译失败时继续保留当前已经加载的版本。完整模板和边界规则见在线扩展作者指南：<https://rpi.laofu.online/extension-authoring.md>，调试技巧见 `docs` 的 `debugging` 主题。
+`rpi dev` 会自动识别 Cargo `cdylib`、首次编译并从 `.rpi/extensions/.dev` 加载版本化产物。源码变化会触发重新编译和热重载；手工执行 `/reload` 也会先重新编译。编译失败时继续保留当前已经加载的版本。
+
+如果希望把开发好的扩展固定到某个项目，可使用项目包命令：
+
+```bash
+rpi package link --path ../my-extension --package my-extension
+rpi package list
+# 之后在该项目目录直接运行 rpi 即可加载
+rpi package unlink my-extension
+```
+
+项目包位于 `.rpi/packages/<name>/`，是受信任的本机 Rust 动态库；它不是 npm/Node Pi package。全局安装仍使用 `rpi install`。完整模板和边界规则见在线扩展作者指南：<https://rpi.laofu.online/extension-authoring.md>`，调试技巧见 `docs` 的 `debugging` 主题。
 
 安装后的动态库位于 `~/.rpi/agent/extensions`（或 `RPI_CODING_AGENT_DIR` 指定的目录），下次启动 rpi 时加载。插件通过稳定 ABI 注册工具、Provider、事件处理器和资源处理器；不要直接依赖 `rpi-cli` 的私有模块。
 

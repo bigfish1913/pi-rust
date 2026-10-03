@@ -14,6 +14,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
+use crate::env::ShellOverride;
 use crate::shell_output::{execute_shell_with_capture, ShellCaptureOptions};
 use crate::tools::tool_context::ExecutionToolContext;
 
@@ -79,12 +80,30 @@ impl AgentTool for PowerShellTool {
             .flat_map(u16::to_le_bytes)
             .collect();
         let encoded = STANDARD.encode(utf16);
-        let command =
-            format!("powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand {encoded}");
+        let command = encoded;
+        let program = if cfg!(windows) {
+            std::env::var_os("ProgramFiles")
+                .map(|p| std::path::PathBuf::from(p).join("PowerShell/7/pwsh.exe"))
+                .filter(|p| p.exists())
+                .unwrap_or_else(|| std::path::PathBuf::from("powershell.exe"))
+        } else {
+            std::path::PathBuf::from("powershell.exe")
+        };
         let capture = execute_shell_with_capture(
             &self.env,
             &command,
             ShellCaptureOptions {
+                shell: Some(ShellOverride {
+                    program,
+                    args: vec![
+                        "-NoLogo".into(),
+                        "-NoProfile".into(),
+                        "-NonInteractive".into(),
+                        "-ExecutionPolicy".into(),
+                        "Bypass".into(),
+                        "-EncodedCommand".into(),
+                    ],
+                }),
                 cwd: Some(self.env.cwd().to_path_buf()),
                 env: None,
                 inherit_env: true,

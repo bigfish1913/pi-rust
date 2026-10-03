@@ -982,6 +982,9 @@ pub enum RuntimeActionId {
     /// `{"ok":true,"chars":N}`. A headless host has no editor and accepts the
     /// write without rendering it, mirroring [`RuntimeActionId::SetStatus`].
     SetEditorText = 19,
+    /// Return the current session branch entries oldest-first as JSON.
+    /// Args: `{}`; result: `{"entries":[...]}`.
+    GetSessionBranch = 20,
 }
 
 /// Error returned when a plugin passes a numeric runtime-action id that this
@@ -1022,6 +1025,7 @@ impl TryFrom<u32> for RuntimeActionId {
             17 => Ok(Self::UiDialog),
             18 => Ok(Self::SetStatus),
             19 => Ok(Self::SetEditorText),
+            20 => Ok(Self::GetSessionBranch),
             other => Err(UnknownRuntimeActionId(other)),
         }
     }
@@ -1621,6 +1625,7 @@ mod tests {
             RuntimeActionId::UiDialog,
             RuntimeActionId::SetStatus,
             RuntimeActionId::SetEditorText,
+            RuntimeActionId::GetSessionBranch,
         ];
 
         for (raw, expected) in ids.into_iter().enumerate() {
@@ -1630,8 +1635,8 @@ mod tests {
         // One past the highest defined id is rejected (nothing is silently
         // accepted), and so is the u32 ceiling.
         assert_eq!(
-            RuntimeActionId::try_from(20),
-            Err(UnknownRuntimeActionId(20))
+            RuntimeActionId::try_from(21),
+            Err(UnknownRuntimeActionId(21))
         );
         assert_eq!(
             RuntimeActionId::try_from(u32::MAX),

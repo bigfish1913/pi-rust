@@ -163,6 +163,7 @@ rpi uninstall <crate>
 rpi update                 # 更新 rpi CLI 自身
 rpi dev [options]          # 开发 Rust 扩展：编译、watch、热重载
 rpi dev-local [options]    # 只调试当前 Rust 扩展（隔离模式）
+rpi package link|list|unlink # 管理项目本地 Rust 扩展包
 ```
 
 ### 远程模式（`--server` / `--connect`）
@@ -272,7 +273,18 @@ rpi dev
 # 只调试当前扩展：rpi dev-local（隔离模式，不加载全局扩展）
 ```
 
-`rpi dev` 会自动识别 Cargo `cdylib`、首次编译并从 `.rpi/extensions/.dev` 加载版本化产物。源码变化会触发重新编译和热重载；手工执行 `/reload` 也会先重新编译。编译失败时继续保留当前已经加载的版本。完整模板和边界规则见在线扩展作者指南：<https://rpi.laofu.online/extension-authoring.md>，调试技巧见 `docs` 的 `debugging` 主题。
+`rpi dev` 会自动识别 Cargo `cdylib`、首次编译并从 `.rpi/extensions/.dev` 加载版本化产物。源码变化会触发重新编译和热重载；手工执行 `/reload` 也会先重新编译。编译失败时继续保留当前已经加载的版本。
+
+如果希望把开发好的扩展固定到某个项目，可使用项目包命令：
+
+```bash
+rpi package link --path ../my-extension --package my-extension
+rpi package list
+# 之后在该项目目录直接运行 rpi 即可加载
+rpi package unlink my-extension
+```
+
+项目包位于 `.rpi/packages/<name>/`，是受信任的本机 Rust 动态库；它不是 npm/Node Pi package。全局安装仍使用 `rpi install`。完整模板和边界规则见在线扩展作者指南：<https://rpi.laofu.online/extension-authoring.md>`，调试技巧见 `docs` 的 `debugging` 主题。
 
 安装后的动态库位于 `~/.rpi/agent/extensions`（或 `RPI_CODING_AGENT_DIR` 指定的目录），下次启动 rpi 时加载。插件通过稳定 ABI 注册工具、Provider、事件处理器和资源处理器；不要直接依赖 `rpi-cli` 的私有模块。
 

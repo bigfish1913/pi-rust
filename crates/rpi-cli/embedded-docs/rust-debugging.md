@@ -179,7 +179,23 @@ extern "C" fn my_destroy(handle: StepHandle) {
 `register_markdown_transformer` / `register_entry_renderer` 注册消息渲染能力，
 宿主接受 `{text, lines}` 组件信封。这些槽位都可能为 `None`，使用前必须检测。
 
-## 5. 用 `rpi dev` 开发
+## 5. 项目包与 `rpi dev` 的区别
+
+`rpi dev` 适合当前源码目录中的 watch 和热重载；如果要让某个项目在普通启动时
+自动加载开发好的扩展，使用：
+
+```bash
+rpi package link --path ../my-extension --package my-extension
+rpi package list
+rpi
+```
+
+包产物位于项目 `.rpi/packages/<name>/extensions/`。如果启动时没有加载，先检查
+`rpi package list`、包目录中的动态库，以及 `rpi --verbose` 的扩展摘要。删除使用
+`rpi package unlink <name>`。这套机制只支持 rpi Rust `cdylib`，不等同于 npm/Node
+Pi package。
+
+## 6. 用 `rpi dev` 开发
 
 在扩展 crate 目录运行：
 

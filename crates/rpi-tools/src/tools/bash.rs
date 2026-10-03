@@ -221,6 +221,7 @@ impl AgentTool for BashTool {
         let cwd = execution.cwd;
         let env = self.env.clone();
         let capture_opts = ShellCaptureOptions {
+            shell: None,
             cwd: Some(cwd),
             env: Some(execution.env),
             inherit_env: execution.inherit_env,

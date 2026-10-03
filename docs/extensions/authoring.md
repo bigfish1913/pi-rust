@@ -230,7 +230,30 @@ TUI 中执行 `/reload` 会强制重新运行 Cargo build，再加载新阶段�
 已加载 DLL 无法原地覆盖，因此不要手工把 Cargo target DLL 复制到固定文件名；
 `rpi dev` 的版本化 staging 会安全地完成切换，并在会话退出、loader 释放后清理。
 
-## 8. 资源与配置约定
+## 8. 项目本地扩展包
+
+开发完成后，可以把当前扩展构建并登记到目标项目：
+
+```bash
+# 在目标项目目录执行；--path 可指向另一个扩展源码目录
+rpi package link --path ../my-rpi-extension --package my-rpi-extension
+rpi package list
+
+# 之后在目标项目目录直接启动 rpi 即可加载
+rpi
+
+# 删除项目包
+rpi package unlink my-rpi-extension
+```
+
+项目包保存在 `.rpi/packages/<name>/`，动态库位于其 `extensions/` 子目录；同一目录
+还可以提供 `skills/`、`prompts/` 和 `themes/`。多个包可以重复执行 `link` 登记。
+
+`rpi package` 是 rpi 的项目级 Rust 扩展包机制，不执行 npm/Node package。全局扩展
+仍使用 `rpi install`，开发热重载仍使用 `rpi dev` 或 `rpi dev-local`。项目包会随普通
+`rpi` 启动自动发现；包内动态库属于本机可信代码，请只登记可信源码。
+
+## 9. 资源与配置约定
 
 项目级资源放在 `.rpi/`。同名资源优先级是项目内定义优先
 高于 `.pi`，项目高于全局，package 最后：

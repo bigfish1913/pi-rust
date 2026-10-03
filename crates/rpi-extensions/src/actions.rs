@@ -374,6 +374,14 @@ pub trait RuntimeActionHost: Send + Sync {
     async fn ui_dialog(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
         Err("ask_user requires an interactive UI".to_string())
     }
+
+    /// `GetSessionBranch` — current main branch entries, oldest-first.
+    async fn get_session_branch(
+        &self,
+        _args: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        Err("session branch lookup is not configured".to_string())
+    }
 }
 
 /// The host-side bridge carried in [`PluginApi::user_data`] so
@@ -655,6 +663,7 @@ async fn dispatch(
         // Editor-only action: served by the bridge (no harness call), exactly
         // like `SetStatus`/`UiDialog`. The TUI drains the queue each tick.
         RuntimeActionId::SetEditorText => editor_text.handle(args),
+        RuntimeActionId::GetSessionBranch => host.get_session_branch(args).await,
     }
 }
 
