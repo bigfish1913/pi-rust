@@ -78,7 +78,8 @@ pub use loader::{
     LoadedPlugin, PluginKeepalive, PluginLoadError,
 };
 pub use oauth::{
-    list as list_oauth_providers, request as request_oauth, OAuthExtensionError, OAuthProviderInfo,
+    list as list_oauth_providers, request as request_oauth, OAuthActionResponse,
+    OAuthExtensionError, OAuthProviderInfo, OAuthResponseKind,
 };
 pub use prompt_transform::emit_before_agent_start;
 pub use provider::PluggableProvider;

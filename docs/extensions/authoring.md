@@ -344,22 +344,15 @@ rpi 的 OAuth 方向是“轻量核心 + 平台插件”：平台差异由扩展
 }
 ```
 
-callback 接收 JSON action envelope，动作名预留为：
+OAuth callback 使用版本化 JSON action envelope。支持的动作是 `begin`、`exchange`、
+`refresh` 和 `revoke`，但 action input 和平台流程完全由扩展定义。OAuth token 属于
+敏感信息：不得写入普通事件、模型消息、工具结果、调试日志或错误文本。插件拥有
+自己产生的输出字符串，宿主通过注册时提供的 `plugin_free_string` 回收。插件应使用
+RPI 的 provider-scoped credential bridge，而不是自行把 token 写入项目目录。
 
-- `begin`：生成授权地址、state、PKCE challenge 等启动信息；
-- `exchange`：用授权 code 换取 token；
-- `refresh`：刷新 access token；
-- `revoke`：撤销授权。
-
-OAuth token 属于敏感信息：不得写入普通事件、模型消息、工具结果、调试日志或
-错误文本。插件拥有自己产生的输出字符串，宿主通过注册时提供的
-`plugin_free_string` 回收。插件应使用 `rpi` 提供的安全凭证桥接，而不是自行把
-token 写入项目目录。
-
-当前阶段完成的是 manifest 注册、校验、去重和 session snapshot 发现；浏览器/device
-code/PKCE 交互以及 `rpi auth login <provider>` 对插件 callback 的完整路由仍在后续
-阶段实现。现有 API key 和 Anthropic 兼容认证不应删除，直到官方 OAuth 插件完成迁移
-并通过登录、刷新、登出和失效恢复测试。
+宿主只实现标准 interaction/credential/success/error response；浏览器、device-code、
+PKCE、state、callback 解析和平台 token 映射全部属于扩展。API key fallback 继续保留，
+但宿主 OAuth 层不再包含任何 Anthropic/OpenAI 等平台特判。
 
 ### OAuth action envelope
 
@@ -369,28 +362,45 @@ code/PKCE 交互以及 `rpi auth login <provider>` 对插件 callback 的完整�
 {
   "action": "begin|exchange|refresh|revoke",
   "providerId": "example-platform",
-  "params": {}
+  "input": {}
 }
 ```
 
-插件返回 JSON；非零返回码会被宿主转换为结构化错误。`begin` 的返回值可以包含
-授权 URL、state、PKCE challenge 和 redirect 信息；`exchange`/`refresh` 可以返回
-access token、refresh token 和过期时间；`revoke` 返回操作结果。宿主只把结果交给
-明确的认证流程，不能把 token 写入 agent transcript、普通插件事件或日志。
+插件返回版本化标准 response：
+
+```json
+{
+  "version": 1,
+  "kind": "interaction|credential|success|error",
+  "payload": {}
+}
+```
+
+只有扩展负责解析 provider-specific 字段并转换为标准 credential：
+
+```json
+{"access":"...", "refresh":"...", "expires_at":1234567890}
+```
+
+宿主不识别 authorization URL、callback、PKCE、state 或 provider token alias；这些
+都属于扩展实现。非零返回码会被宿主转换为结构化错误，token 不能进入 agent
+transcript、普通插件事件或日志。
 
 `rpi-extensions` 提供 `list_oauth_providers` 和 `request_oauth` 两个宿主侧入口。
 它们只允许调用已经注册且 manifest `id` 匹配的 provider，并在读取插件输出后立即
-调用插件提供的 `plugin_free_string`。
+调用插件提供的 `plugin_free_string`。宿主只做 opaque input 转发和标准 response
+校验，不包含任何平台 provider 特判。
 
-已接入最小 CLI 流程：
+已接入通用 CLI 流程：
 
 ```text
 rpi auth login --provider <id>
-  begin → 打印 authorization URL → 用户粘贴 callback/code
-  exchange → 宿主按 provider id 原子保存 access/refresh/expiry
+  begin → interaction（由扩展决定展示内容和输入）
+  exchange → credential（标准 access/refresh/expires_at）
 ```
 
-当前版本使用手动粘贴 callback/code，浏览器自动回调和 PKCE/state 强制校验仍待
-OAuth provider manifest 与安全交互协议完善。`rpi auth refresh --provider <id>`
-会调用 provider 的 `refresh` action，`rpi auth logout --provider <id>` 会先调用
-`revoke`，成功后才删除本地凭证。插件不得把 token 写入普通事件、模型消息或日志。
+宿主只展示标准 interaction payload，并将用户输入作为 opaque `input` 原样传回扩展。
+浏览器回调、device-code、PKCE/state 等由扩展自行实现。`rpi auth refresh
+--provider <id>` 会传递标准 credential context 并调用 provider 的 `refresh` action；
+`rpi auth logout --provider <id>` 会先调用 `revoke`，成功后才删除本地凭证。插件不得
+把 token 写入普通事件、模型消息或日志。

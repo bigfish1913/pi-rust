@@ -15,12 +15,90 @@ use crate::registry::{RegisteredOAuthProvider, RegistrySnapshot};
 pub enum OAuthExtensionError {
     #[error("OAuth provider `{0}` is not registered")]
     NotFound(String),
+    #[error("OAuth response has unsupported version")]
+    UnsupportedVersion,
+    #[error("OAuth response has invalid kind")]
+    InvalidResponseKind,
     #[error("OAuth action must be one of begin, exchange, refresh, revoke")]
     InvalidAction,
     #[error("OAuth plugin returned status {0}: {1}")]
     PluginStatus(i32, String),
     #[error("OAuth plugin returned invalid JSON: {0}")]
     InvalidResponse(String),
+}
+
+/// Standard response kinds understood by the host. Payload contents remain
+/// provider-defined except for `credential`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OAuthResponseKind {
+    Interaction,
+    Credential,
+    Success,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+pub struct OAuthActionResponse {
+    pub kind: OAuthResponseKind,
+    pub payload: Value,
+}
+
+impl OAuthActionResponse {
+    pub fn parse(value: Value) -> Result<Self, OAuthExtensionError> {
+        let version = value.get("version").and_then(Value::as_u64).unwrap_or(1);
+        if version != 1 {
+            return Err(OAuthExtensionError::UnsupportedVersion);
+        }
+        let kind = match value.get("kind").and_then(Value::as_str) {
+            Some("interaction") => OAuthResponseKind::Interaction,
+            Some("credential") => OAuthResponseKind::Credential,
+            Some("success") => OAuthResponseKind::Success,
+            Some("error") => OAuthResponseKind::Error,
+            _ => return Err(OAuthExtensionError::InvalidResponseKind),
+        };
+        Ok(Self {
+            kind,
+            payload: value.get("payload").cloned().unwrap_or(Value::Null),
+        })
+    }
+
+    /// Parse the host-owned credential envelope. Provider-specific token
+    /// aliases must be converted by the extension before this point.
+    pub fn credential(&self) -> Result<Option<OAuthCredential>, OAuthExtensionError> {
+        if self.kind != OAuthResponseKind::Credential {
+            return Ok(None);
+        }
+        let object = self.payload.as_object().ok_or_else(|| {
+            OAuthExtensionError::InvalidResponse("credential payload must be an object".into())
+        })?;
+        let access = object
+            .get("access")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                OAuthExtensionError::InvalidResponse("missing credential access".into())
+            })?;
+        let refresh = object
+            .get("refresh")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let expires_at = object
+            .get("expires_at")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        Ok(Some(OAuthCredential {
+            access: access.to_string(),
+            refresh: refresh.to_string(),
+            expires_at,
+        }))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OAuthCredential {
+    pub access: String,
+    pub refresh: String,
+    pub expires_at: i64,
 }
 
 /// A non-secret view of a registered OAuth provider.
@@ -78,7 +156,7 @@ fn invoke(
     let request = serde_json::json!({
         "action": action,
         "providerId": provider_id(provider),
-        "params": params,
+        "input": params,
     })
     .to_string();
     let mut out = StbString::empty();
@@ -173,6 +251,39 @@ mod tests {
         let result = request(&snapshot(), "acme", "refresh", serde_json::json!({"x": 1})).unwrap();
         assert_eq!(result["access"], "secret");
         assert_eq!(FREED.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn parses_standard_interaction_and_credential_responses() {
+        let interaction = OAuthActionResponse::parse(serde_json::json!({
+            "version": 1,
+            "kind": "interaction",
+            "payload": {"display": {"url": "opaque"}}
+        }))
+        .unwrap();
+        assert_eq!(interaction.kind, OAuthResponseKind::Interaction);
+
+        let credential = OAuthActionResponse::parse(serde_json::json!({
+            "version": 1,
+            "kind": "credential",
+            "payload": {"access": "a", "refresh": "r", "expires_at": 42}
+        }))
+        .unwrap();
+        assert_eq!(credential.credential().unwrap().unwrap().expires_at, 42);
+    }
+
+    #[test]
+    fn rejects_unknown_response_version_and_kind() {
+        assert!(matches!(
+            OAuthActionResponse::parse(serde_json::json!({"version": 2, "kind": "success"})),
+            Err(OAuthExtensionError::UnsupportedVersion)
+        ));
+        assert!(matches!(
+            OAuthActionResponse::parse(
+                serde_json::json!({"version": 1, "kind": "provider-specific"})
+            ),
+            Err(OAuthExtensionError::InvalidResponseKind)
+        ));
     }
 
     #[test]
