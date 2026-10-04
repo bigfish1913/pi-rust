@@ -360,3 +360,25 @@ token 写入项目目录。
 code/PKCE 交互以及 `rpi auth login <provider>` 对插件 callback 的完整路由仍在后续
 阶段实现。现有 API key 和 Anthropic 兼容认证不应删除，直到官方 OAuth 插件完成迁移
 并通过登录、刷新、登出和失效恢复测试。
+
+### OAuth action envelope
+
+宿主调用已注册 provider 时，会发送如下请求：
+
+```json
+{
+  "action": "begin|exchange|refresh|revoke",
+  "providerId": "example-platform",
+  "params": {}
+}
+```
+
+插件返回 JSON；非零返回码会被宿主转换为结构化错误。`begin` 的返回值可以包含
+授权 URL、state、PKCE challenge 和 redirect 信息；`exchange`/`refresh` 可以返回
+access token、refresh token 和过期时间；`revoke` 返回操作结果。宿主只把结果交给
+明确的认证流程，不能把 token 写入 agent transcript、普通插件事件或日志。
+
+`rpi-extensions` 提供 `list_oauth_providers` 和 `request_oauth` 两个宿主侧入口。
+它们只允许调用已经注册且 manifest `id` 匹配的 provider，并在读取插件输出后立即
+调用插件提供的 `plugin_free_string`。当前这两个入口还没有接入浏览器授权和
+`rpi auth login`；这会在凭证存储、PKCE/state 校验和旧认证迁移方案确定后接入。

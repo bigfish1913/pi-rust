@@ -77,6 +77,9 @@ pub use loader::{
     load_dir, load_one, load_session, load_session_mixed, merge_registries, ExtensionSession,
     LoadedPlugin, PluginKeepalive, PluginLoadError,
 };
+pub use oauth::{
+    list as list_oauth_providers, request as request_oauth, OAuthExtensionError, OAuthProviderInfo,
+};
 pub use prompt_transform::emit_before_agent_start;
 pub use provider::PluggableProvider;
 pub use provider_hooks::ExtensionProviderHooks;
@@ -98,6 +101,7 @@ mod actions;
 mod editor_text;
 mod event_log;
 mod loader;
+mod oauth;
 mod prompt_transform;
 mod provider;
 mod provider_hooks;
@@ -591,6 +595,7 @@ extern "C" fn trampoline_register_oauth_provider(
     }
     let manifest = unsafe { manifest_json.as_str().to_string() };
     let record = crate::registry::RegisteredOAuthProvider {
+        plugin: with_current_api(|api| api.name.clone()).unwrap_or_default(),
         manifest_json: manifest,
         request_fn,
         plugin_free_string,

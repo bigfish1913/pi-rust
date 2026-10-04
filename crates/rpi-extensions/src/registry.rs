@@ -192,6 +192,10 @@ pub struct RegisteredProvider {
 /// `{\"action\":\"begin\"}` and returns plugin-owned JSON.
 #[derive(Clone)]
 pub struct RegisteredOAuthProvider {
+    /// The owning extension display name, used to scope credentials and
+    /// diagnostics. This is host-owned metadata and is not supplied by the
+    /// plugin.
+    pub plugin: String,
     pub manifest_json: String,
     pub request_fn: OAuthRequestFn,
     pub plugin_free_string: FreeStringFn,
@@ -846,6 +850,21 @@ impl RegistrySnapshot {
         &self.oauth_providers
     }
 
+    /// Find an OAuth provider by its manifest `id`.
+    pub fn oauth_provider(&self, provider_id: &str) -> Option<&RegisteredOAuthProvider> {
+        self.oauth_providers.iter().find(|provider| {
+            serde_json::from_str::<serde_json::Value>(&provider.manifest_json)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|id| id == provider_id)
+                })
+                .unwrap_or(false)
+        })
+    }
+
     /// The registered renderers of a specific kind (B5c). The TUI dispatches
     /// message and entry renderers through the same JSON adapter used by the
     /// markdown transformer.
@@ -1060,6 +1079,7 @@ mod tests {
     fn oauth_manifest_registers_and_deduplicates() {
         let mut reg = ExtensionRegistry::new();
         let make = |manifest: &str| RegisteredOAuthProvider {
+            plugin: "test-plugin".to_string(),
             manifest_json: manifest.to_string(),
             request_fn: noop_oauth,
             plugin_free_string: noop_free,
