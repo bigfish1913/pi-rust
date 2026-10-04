@@ -179,11 +179,12 @@ while let Some(event) = events.recv().await {
 
 ## 6. cdylib ABI 适配（给全局 `rpi` 用）
 
-扩展导出稳定 C ABI 符号，宿主按 **v3 → v2 → v1** 协商，只调用最高版本。
-新插件默认用 v2，需要在启动日志声明优先级/平台时用 v3。
+宿主只加载统一 C ABI 符号 `rpi_plugin_register`。扩展使用 `export_plugin!`，
+通过同一个 `PluginApi` 注册能力并调用 `api.declare` 声明优先级/平台。
+SDK 在注册前检查 `abi_version` 和 `struct_size`；不兼容时返回非零状态，宿主报告加载失败。
 
 ```rust
-rpi_plugin_sdk::export_plugin_v2!(|api| {
+rpi_plugin_sdk::export_plugin!(|api| {
     let Some(register_tool) = api.register_tool else {
         return -1;                         // 能力检测：槽位缺失就明确失败
     };
@@ -290,7 +291,7 @@ Cargo target DLL 复制成固定文件名。
 - `rpi dev --no-watch` 能编译、加载并注册预期工具；`rpi install <crate> --force`
   的干净安装路径通过。
 - 提供 `cdylib` 时，`crate-type` 包含 `"cdylib"`，导出
-  `rpi_plugin_register_v2`/`rpi_plugin_register_v3`，依赖已发布的 `rpi-plugin-sdk`。
+  `rpi_plugin_register`，依赖已发布的 `rpi-plugin-sdk`。
 - `README` 写明工具 schema、权限边界、持久化文件、网络访问、支持平台和卸载方式；
   `AGENTS.md`、`config/agent.json`、`prompts/`、`skills/`、`.rpi/settings.json`
   之间的路径保持一致。

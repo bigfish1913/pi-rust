@@ -35,6 +35,7 @@ pub fn run(args: &[String]) -> i32 {
         }
         Some("link") => link(&args[1..]),
         Some("list") => list(&args[1..]),
+        Some("update") => update(&args[1..]),
         Some("unlink") => unlink(&args[1..]),
         Some(other) => {
             eprintln!("error: unknown package command `{other}`");
@@ -214,6 +215,148 @@ fn list(args: &[String]) -> i32 {
         Err(e) => {
             eprintln!("error: {e}");
             1
+        }
+    }
+}
+
+fn update(args: &[String]) -> i32 {
+    let mut name = None;
+    let mut link_args = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--debug" | "--locked" => link_args.push(args[i].clone()),
+            "--help" | "-h" => {
+                print_update_help();
+                return 0;
+            }
+            value if value.starts_with('-') => {
+                eprintln!("error: unknown update option `{value}`");
+                return 2;
+            }
+            value => {
+                if name.replace(value.to_string()).is_some() {
+                    eprintln!("error: update accepts at most one package name");
+                    return 2;
+                }
+            }
+        }
+        i += 1;
+    }
+
+    let cwd = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
+    let registry = match read_registry(&cwd) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
+    let packages = registry
+        .packages
+        .iter()
+        .filter(|package| {
+            name.as_deref()
+                .map_or(true, |wanted| wanted == package.name)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let mut status = 0;
+    for package in packages {
+        let package_name = package.name.clone();
+        eprintln!("package: updating project package `{package_name}`...");
+        let mut args = vec![
+            "--path".to_string(),
+            package.source,
+            "--package".to_string(),
+            package.cargo_package,
+            "--name".to_string(),
+            package.name,
+            "--force".to_string(),
+        ];
+        args.extend(link_args.iter().cloned());
+        if link(&args) != 0 {
+            status = 1;
+        }
+    }
+
+    // Global extensions installed by `rpi install` are also packages. This is
+    // the path used by crates.io extensions such as rpi-im-message; delegate to
+    // the existing transactional installer so artifact and registry updates
+    // remain atomic and version resolution stays in one place.
+    let global_packages = match crate::install::installed_native_packages_strict() {
+        Ok(packages) => packages
+            .into_iter()
+            .filter(|package| {
+                package.source.is_none()
+                    && name
+                        .as_deref()
+                        .map_or(true, |wanted| wanted == package.name)
+            })
+            .collect::<Vec<_>>(),
+        Err(error) => {
+            eprintln!("error: {error}");
+            return 1;
+        }
+    };
+    if let Some(wanted) = name.as_deref() {
+        let project_found = registry
+            .packages
+            .iter()
+            .any(|package| package.name == wanted);
+        let global_found = global_packages.iter().any(|package| package.name == wanted);
+        if !project_found && !global_found {
+            eprintln!("error: package `{wanted}` is not installed");
+            return 1;
+        }
+    }
+    for package in global_packages {
+        eprintln!("package: updating global package `{}`...", package.name);
+        if !update_global_package(&package.name, &link_args) {
+            status = 1;
+        }
+    }
+
+    if status == 0 && registry.packages.is_empty() && name.is_none() {
+        let has_global = crate::install::installed_native_packages()
+            .into_iter()
+            .any(|package| package.source.is_none());
+        if !has_global {
+            println!("no project or global packages to update");
+        }
+    }
+    status
+}
+
+fn update_global_package(name: &str, args: &[String]) -> bool {
+    let executable = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("error: could not resolve rpi executable: {error}");
+            return false;
+        }
+    };
+    let mut command = std::process::Command::new(executable);
+    command.args(["install", name, "--force"]);
+    if args.iter().any(|arg| arg == "--locked") {
+        command.arg("--locked");
+    }
+    match command.status() {
+        Ok(exit) if exit.success() => true,
+        Ok(exit) => {
+            eprintln!("error: updating global package `{name}` failed with {exit}");
+            false
+        }
+        Err(error) => {
+            eprintln!("error: could not run rpi install for `{name}`: {error}");
+            false
         }
     }
 }
@@ -441,10 +584,13 @@ pub fn project_package_dirs(cwd: &Path, kind: &str) -> Vec<PathBuf> {
     }
 }
 pub fn print_help() {
-    println!("Usage: rpi package <command>\n\nCommands:\n  link [name] [--path <dir>] [--package <name>] [--force]  Build and link a project-local Rust extension\n  list                                                   List project packages\n  unlink <name>                                          Remove a project package");
+    println!("Usage: rpi package <command>\n\nCommands:\n  link [name] [--path <dir>] [--package <name>] [--force]  Build and link a project-local Rust extension\n  list                                                   List project packages\n  update [name] [--debug] [--locked]                    Update project and global installed packages\n  unlink <name>                                          Remove a project package");
 }
 fn print_link_help() {
     println!("Usage: rpi package link [name] [options]\n\nOptions:\n  --path <dir>       Extension source directory (default: current directory)\n  --package, -P <n>  Select a Cargo cdylib package\n  --debug            Build debug artifacts instead of release\n  --locked           Pass --locked to Cargo\n  --force, -f        Replace an existing package");
+}
+fn print_update_help() {
+    println!("Usage: rpi package update [name] [options]\n\nOptions:\n  --debug            Build debug artifacts instead of release\n  --locked           Pass --locked to Cargo\n  --help, -h         Show this help\n\nWithout a name, all project and global installed packages are updated.");
 }
 
 #[cfg(test)]
@@ -457,6 +603,11 @@ mod tests {
         assert!(!valid_name("../review-tools"));
         assert!(!valid_name("review/tools"));
         assert!(!valid_name(""));
+    }
+
+    #[test]
+    fn update_help_is_available_without_a_registry() {
+        print_update_help();
     }
 
     #[test]

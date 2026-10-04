@@ -10,13 +10,13 @@
 | 项目 | Rust 原生扩展 |
 | --- | --- |
 | 安装 | `rpi install crate-name`（crates.io 或 `--path`） |
-| 入口 | `rpi_plugin_register_v2` / `rpi_plugin_register_v3` C ABI 符号 |
+| 入口 | `rpi_plugin_register` C ABI 符号 |
 | 开发反馈 | `rpi dev` watch + 热重载；`rpi dev-local` 隔离调试 |
 | 静态资源 | `resources_discover` 或随项目放入 `.rpi` |
 | 运行环境 | 本机动态库，当前用户权限 |
 | 适用场景 | 本地工具、系统集成、性能敏感或纯 Rust 项目 |
 
-扩展应遵循能力检测：只调用宿主明确提供的 capability，检查 `PluginApiVt`
+扩展应遵循能力检测：只调用宿主明确提供的 capability，检查 `PluginApi`
 对应注册槽位是否为 `Some`。缺少能力时返回清晰错误并优雅降级，不要 panic、
 空指针或依赖 `undefined` 语义。
 
@@ -58,13 +58,20 @@ serde_json = "1"
 
 ## 3. ABI 入口
 
-宿主按 **v3 → v2 → v1** 协商。新插件导出 v3（需要声明优先级/平台时）或 v2；
-只有极老的插件才用 v1。同时导出多个符号时宿主只调用最高版本，失败不回退。
-
-### v2 入口（默认）
+宿主只加载统一 C ABI 符号 `rpi_plugin_register`。扩展使用 `export_plugin!`，
+通过同一个 `PluginApi` 注册能力并调用 `api.declare` 声明优先级/平台。
+SDK 在注册前检查 `abi_version` 和 `struct_size`；不兼容时返回非零状态，宿主报告加载失败。
 
 ```rust
-rpi_plugin_sdk::export_plugin_v2!(|api| {
+rpi_plugin_sdk::export_plugin!(|api| {
+    if let Some(declare) = api.declare {
+        let status = declare(rpi_plugin_sdk::StbStringRef::from_str(
+            r#"{"priority":60,"platforms":["linux"]}"#,
+        ));
+        if status != 0 {
+            return status;
+        }
+    }
     let Some(register_tool) = api.register_tool else {
         return -1;
     };
@@ -75,29 +82,15 @@ rpi_plugin_sdk::export_plugin_v2!(|api| {
 });
 ```
 
-### v3 入口（声明优先级 / 平台）
-
-```rust
-rpi_plugin_sdk::export_plugin_v3!(|api, ext| {
-    if let Some(declare) = ext.declare {
-        declare(rpi_plugin_sdk::StbStringRef::from_str(
-            r#"{"priority":60,"platforms":["linux"]}"#,
-        ));
-    }
-    // 其余注册与 v2 相同
-    0
-});
-```
-
 `declare` 的 JSON 支持 `priority`（数字，越大越先）和 `platforms`（字符串数组，
-如 `["linux","windows","macos"]`）。
+如 `["linux","windows","macos"]`）；宿主在分发事件处理器时跳过不匹配的平台。
 
 ### 能力检测
 
 每个注册槽位都是 `Option`。注册前检查 vtable slot 是否为 `Some`，缺失时返回
 清晰错误；不要依赖空指针或 panic 表达不支持。宿主对未知 runtime action ID
-返回结构化错误，不会进入分发。ABI v1 的 runtime action 仅允许 ID `0..=15`，
-v2/v3 允许当前定义的 `0..=17`（含 `GetCliFlag`、`UiDialog`）。
+返回结构化错误，不会进入分发。runtime action 使用 SDK 的 `RuntimeActionId`
+定义（含 `GetCliFlag`、`UiDialog`），不要自行假定数字范围。
 
 ## 4. 工具生命周期：execute → poll → cancel → destroy
 
@@ -327,8 +320,8 @@ Linux/macOS 使用冒号分隔。命令行和环境变量适合本机开发、CI
 ## 9. 发布检查清单
 
 - `cargo fmt --check`、`cargo clippy --all-targets`、`cargo test` 通过。
-- `crate-type` 包含 `cdylib`，使用 `export_plugin_v2!` / `export_plugin_v3!` 导出
-  `rpi_plugin_register_v2` / `rpi_plugin_register_v3`。
+- `crate-type` 包含 `cdylib`，使用 `export_plugin!` 导出
+  `rpi_plugin_register`。
 - 依赖已发布的 `rpi-plugin-sdk` 兼容版本，不链接宿主私有 crate。
 - `rpi dev --no-watch` 能编译、加载并注册预期工具。
 - `rpi install <crate> --force` 的干净安装路径通过。

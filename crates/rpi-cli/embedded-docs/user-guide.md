@@ -161,6 +161,8 @@ rpi events path|tail    检查扩展事件日志（需 RPI_EVENT_LOG=1）
 rpi install <crate>
 rpi uninstall <crate>
 rpi update                 # 更新 rpi CLI 自身
+rpi package update         # 更新项目和全局已安装的 package
+rpi package update <name>  # 更新指定 package（如 rpi-im-message）
 rpi dev [options]          # 开发 Rust 扩展：编译、watch、热重载
 rpi dev-local [options]    # 只调试当前 Rust 扩展（隔离模式）
 ```

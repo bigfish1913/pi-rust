@@ -25,7 +25,8 @@ harness consumes its adapters through injection.
 
 - **Loading.** `load_one` loads a single library, `load_dir` scans a directory,
   and `load_session` resolves the whole set for a session. Entrypoints are
-  resolved unified → v3 → v2, so older plugins keep working.
+  resolved through the single `rpi_plugin_register` symbol. Plugins must use
+  the unified ABI; incompatible registrations are reported as load failures.
 - **Registry.** `ExtensionRegistry` holds what plugins registered: tools,
   providers, handlers, renderers and resource-discovery callbacks, with a
   deterministic snapshot the runtime can read.

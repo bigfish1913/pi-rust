@@ -652,7 +652,7 @@ pub fn print_help() {
   install <crate>                Build and install a Rust cdylib extension
                                 (see `rpi install --help`)
   uninstall <crate>              Remove an installed Rust cdylib extension
-  package link|list|unlink       Manage project-local Rust extension packages
+  package link|list|update|unlink Manage project-local Rust extension packages
                                 (see `rpi package --help`)
   dev [options]                  Build, watch, and hot-reload a Rust extension
                                 (see `rpi dev --help`)

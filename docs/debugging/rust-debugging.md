@@ -1,6 +1,6 @@
 # rpi Rust 扩展与 Agent 调试指引
 
-本文覆盖两条主线：**如何编写 Rust `cdylib` 扩展**（ABI v3/v2、工具生命周期、
+本文覆盖两条主线：**如何编写 Rust `cdylib` 扩展**（统一 C ABI、工具生命周期、
 事件处理器、资源发现、Provider/渲染器），以及**如何调试 agent 与扩展**（事件日志、
 开发宿主、系统提示词检查、常见失败定位）。创建完整 Agent 项目的默认结构见 `docs` 的 `agent` 主题。
 
@@ -36,42 +36,34 @@ serde_json = "1"
 仓库自带的 `examples/plugin-stub` 是完整可运行的模板，包含 echo 工具、事件
 处理器和资源发现三种能力，是复制骨架的首选来源。
 
-## 2. ABI 入口：v3 / v2
+## 2. 统一 ABI 入口
 
-宿主按 **v3 → v2 → v1** 顺序协商。新插件应导出 v3（需要声明优先级/平台时）或
-v2；只有极老的插件才用 v1。一个动态库同时导出多个符号时，宿主只调用最高版本，
-失败不回退到低版本（避免重复注册副作用）。
-
-### v2 入口（默认推荐）
+宿主只加载统一 C ABI 符号 `rpi_plugin_register`。扩展使用 `export_plugin!`，
+通过同一个 `PluginApi` 注册能力并调用 `api.declare` 声明优先级/平台。
+SDK 在注册前检查 `abi_version` 和 `struct_size`；不兼容时返回非零状态，宿主报告加载失败。
 
 ```rust
-rpi_plugin_sdk::export_plugin_v2!(|api| {
-    // api 是 &PluginApiVt：注册工具、命令、事件处理器、资源发现、Provider 等
+rpi_plugin_sdk::export_plugin!(|api| {
+    if let Some(declare) = api.declare {
+        let status = declare(rpi_plugin_sdk::StbStringRef::from_str(
+            r#"{"priority":60,"platforms":["linux"]}"#,
+        ));
+        if status != 0 {
+            return status;
+        }
+    }
     let Some(register_tool) = api.register_tool else {
-        return -1; // 宿主不支持该能力
+        return -1;
     };
+    // 构建 StableToolSchema 和 execute/poll/cancel/destroy 函数表，
+    // 然后调用 register_tool。完整实现参考 examples/plugin-stub。
     let _ = register_tool;
     0
 });
 ```
 
-### v3 入口（需要声明优先级 / 平台时）
-
-```rust
-rpi_plugin_sdk::export_plugin_v3!(|api, ext| {
-    if let Some(declare) = ext.declare {
-        declare(rpi_plugin_sdk::StbStringRef::from_str(
-            r#"{"priority":60,"platforms":["linux"]}"#,
-        ));
-    }
-    // 其余注册与 v2 相同
-    0
-});
-```
-
 `declare` 的 JSON 支持 `priority`（数字，越大越先）和 `platforms`（字符串数组，
-如 `["linux","windows","macos"]`；不匹配的宿主应跳过该扩展）。v3 的 `api` 与
-v2 完全兼容，只是额外拿到 `ext`。
+如 `["linux","windows","macos"]`）；宿主在分发事件处理器时跳过不匹配的平台。
 
 ### 能力检测
 
