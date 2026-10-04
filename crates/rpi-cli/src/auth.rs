@@ -49,7 +49,8 @@ pub async fn run_with_extensions(
     match sub {
         "login" => run_login(&args[1..], snapshot.as_ref()).await,
         "check" | "status" => run_check(&args[1..]).await,
-        "logout" => run_logout(&args[1..]).await,
+        "refresh" => run_refresh(&args[1..], snapshot.as_ref()).await,
+        "logout" => run_logout(&args[1..], snapshot.as_ref()).await,
         "--help" | "-h" | "help" | "" => {
             print_auth_help();
             0
@@ -151,8 +152,71 @@ async fn run_check(args: &[String]) -> i32 {
 }
 
 /// `rpi auth logout [--provider <id>]` — drop the stored credential.
-async fn run_logout(args: &[String]) -> i32 {
+async fn run_refresh(
+    args: &[String],
+    snapshot: Option<&Arc<rpi_extensions::RegistrySnapshot>>,
+) -> i32 {
     let provider = parse_provider(args).unwrap_or(DEFAULT_PROVIDER_ID);
+    let Some(snapshot) = snapshot else {
+        eprintln!("error: no OAuth extensions are loaded");
+        return EXIT_ERROR;
+    };
+    let Some(Credential::Oauth { refresh, .. }) = config::read_oauth_token(provider).ok().flatten()
+    else {
+        eprintln!("error: no stored OAuth credentials for \"{provider}\"");
+        return EXIT_NOT_READY;
+    };
+    if refresh.is_empty() {
+        eprintln!("error: stored OAuth credentials have no refresh token");
+        return EXIT_ERROR;
+    }
+    let response = match rpi_extensions::request_oauth(
+        snapshot,
+        provider,
+        "refresh",
+        serde_json::json!({"refresh": refresh, "refreshToken": refresh}),
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("error: OAuth refresh failed: {error}");
+            return EXIT_ERROR;
+        }
+    };
+    let Some((access, refresh, expires)) = parse_oauth_token(&response) else {
+        eprintln!("error: OAuth refresh returned no access token");
+        return EXIT_ERROR;
+    };
+    if let Err(error) = config::upsert_oauth_token(provider, access, refresh, expires) {
+        eprintln!("error: could not save refreshed OAuth credentials: {error}");
+        return EXIT_ERROR;
+    }
+    println!("OAuth credentials refreshed for \"{provider}\".");
+    0
+}
+
+async fn run_logout(
+    args: &[String],
+    snapshot: Option<&Arc<rpi_extensions::RegistrySnapshot>>,
+) -> i32 {
+    let provider = parse_provider(args).unwrap_or(DEFAULT_PROVIDER_ID);
+    if let Ok(Some(Credential::Oauth {
+        access, refresh, ..
+    })) = config::read_oauth_token(provider)
+    {
+        let Some(snapshot) = snapshot else {
+            eprintln!("error: cannot revoke OAuth credentials: no OAuth extensions are loaded");
+            return EXIT_ERROR;
+        };
+        if let Err(error) = rpi_extensions::request_oauth(
+            snapshot,
+            provider,
+            "revoke",
+            serde_json::json!({"access": access, "refresh": refresh}),
+        ) {
+            eprintln!("error: OAuth revoke failed; local credentials were kept: {error}");
+            return EXIT_ERROR;
+        }
+    }
     match delete_credential(provider) {
         Ok(true) => {
             println!("Removed stored credentials for \"{provider}\".");
@@ -172,6 +236,42 @@ async fn run_logout(args: &[String]) -> i32 {
 /// Pull the `--provider <id>` value from a subcommand's args (defaults to
 /// `None`). Mirrors the TS `--provider` handshake before it falls back to the
 /// default.
+fn parse_oauth_token(token: &serde_json::Value) -> Option<(String, String, i64)> {
+    let access = token
+        .get("access")
+        .or_else(|| token.get("accessToken"))
+        .or_else(|| token.get("access_token"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())?
+        .to_string();
+    let refresh = token
+        .get("refresh")
+        .or_else(|| token.get("refreshToken"))
+        .or_else(|| token.get("refresh_token"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let expires = token
+        .get("expires")
+        .or_else(|| token.get("expiresAt"))
+        .or_else(|| token.get("expires_at"))
+        .and_then(serde_json::Value::as_i64)
+        .or_else(|| {
+            token
+                .get("expiresIn")
+                .or_else(|| token.get("expires_in"))
+                .and_then(serde_json::Value::as_i64)
+                .and_then(|seconds| {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .map(|now| now.as_secs() as i64 + seconds)
+                })
+        })
+        .unwrap_or(0);
+    Some((access, refresh, expires))
+}
+
 async fn run_oauth_login(provider: &str, snapshot: &Arc<rpi_extensions::RegistrySnapshot>) -> i32 {
     let begin =
         match rpi_extensions::request_oauth(snapshot, provider, "begin", serde_json::json!({})) {
@@ -212,43 +312,11 @@ async fn run_oauth_login(provider: &str, snapshot: &Arc<rpi_extensions::Registry
             return EXIT_ERROR;
         }
     };
-    let Some(access) = token
-        .get("access")
-        .or_else(|| token.get("accessToken"))
-        .or_else(|| token.get("access_token"))
-        .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.is_empty())
-    else {
+    let Some((access, refresh, expires)) = parse_oauth_token(&token) else {
         eprintln!("error: OAuth exchange returned no access token");
         return EXIT_ERROR;
     };
-    let refresh = token
-        .get("refresh")
-        .or_else(|| token.get("refreshToken"))
-        .or_else(|| token.get("refresh_token"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    let expires = token
-        .get("expires")
-        .or_else(|| token.get("expiresAt"))
-        .or_else(|| token.get("expires_at"))
-        .and_then(serde_json::Value::as_i64)
-        .or_else(|| {
-            token
-                .get("expiresIn")
-                .or_else(|| token.get("expires_in"))
-                .and_then(serde_json::Value::as_i64)
-                .and_then(|seconds| {
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .ok()
-                        .map(|now| now.as_secs() as i64 + seconds)
-                })
-        })
-        .unwrap_or(0);
-    if let Err(error) =
-        config::upsert_oauth_token(provider, access.to_string(), refresh.to_string(), expires)
-    {
+    if let Err(error) = config::upsert_oauth_token(provider, access, refresh, expires) {
         eprintln!("error: could not save OAuth credentials: {error}");
         return EXIT_ERROR;
     }
@@ -401,7 +469,8 @@ Subcommands:
   login   Prompt for an API key, or run an OAuth provider login.
   check   Report whether credentials are available (no network call).
   status  Alias for check; never prints token material.
-  logout  Remove the stored credential.
+  refresh Refresh an OAuth token through its provider extension.
+  logout  Revoke OAuth credentials, then remove the stored credential.
 
 Options:
   --provider <id>   Provider id (default: anthropic)
@@ -416,8 +485,9 @@ Notes:
   `login` stores Anthropic API-key credentials by default. For a registered
   OAuth extension, use `login --provider <id>`; the first flow prints its
   authorization URL, accepts a pasted callback or code, and saves only the
-  returned token in auth.json. OpenAI-compatible providers normally store
-  apiKey in ~/.rpi/agent/models.json.
+  returned token in auth.json. `refresh` and `logout` use the provider's
+  refresh/revoke actions. OpenAI-compatible providers normally store apiKey
+  in ~/.rpi/agent/models.json.
 ",
         name = crate::APP_NAME
     );
@@ -489,6 +559,26 @@ mod tests {
             Some(v) => std::env::set_var(name, v),
             None => std::env::remove_var(name),
         }
+    }
+
+    #[test]
+    fn parse_oauth_token_accepts_absolute_and_relative_expiry_fields() {
+        let token = serde_json::json!({
+            "accessToken": "access",
+            "refresh_token": "refresh",
+            "expiresIn": 60,
+        });
+        let (access, refresh, expires) = parse_oauth_token(&token).unwrap();
+        assert_eq!(access, "access");
+        assert_eq!(refresh, "refresh");
+        assert!(expires > 0);
+
+        let absolute = serde_json::json!({
+            "access": "next",
+            "refresh": "r2",
+            "expires_at": 123,
+        });
+        assert_eq!(parse_oauth_token(&absolute).unwrap().2, 123);
     }
 
     #[tokio::test]
@@ -588,7 +678,7 @@ mod tests {
         )
         .unwrap();
         assert!(auth_path().unwrap().exists());
-        let code = run_logout(&[]).await;
+        let code = run_logout(&[], None).await;
         assert_eq!(code, 0);
         // The entry should be gone → check is now not_ready.
         assert_eq!(run_check(&[]).await, EXIT_NOT_READY);
@@ -597,7 +687,7 @@ mod tests {
     #[tokio::test]
     async fn logout_when_empty_is_noop() {
         let _cfg = TempConfig::new();
-        let code = run_logout(&[]).await;
+        let code = run_logout(&[], None).await;
         assert_eq!(code, 0);
     }
 

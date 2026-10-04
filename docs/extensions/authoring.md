@@ -390,6 +390,7 @@ rpi auth login --provider <id>
   exchange → 宿主按 provider id 原子保存 access/refresh/expiry
 ```
 
-当前版本使用手动粘贴 callback/code，浏览器自动回调、PKCE/state 强制校验和 token
-刷新命令仍待 OAuth provider manifest 与安全交互协议完善。插件不得把 token 写入
-普通事件、模型消息或日志。
+当前版本使用手动粘贴 callback/code，浏览器自动回调和 PKCE/state 强制校验仍待
+OAuth provider manifest 与安全交互协议完善。`rpi auth refresh --provider <id>`
+会调用 provider 的 `refresh` action，`rpi auth logout --provider <id>` 会先调用
+`revoke`，成功后才删除本地凭证。插件不得把 token 写入普通事件、模型消息或日志。
