@@ -135,12 +135,12 @@ pub enum SessionSelection {
     /// Fresh durable JSONL session under `--session-dir` (or the default dir).
     New { dir: PathBuf, name: Option<String> },
     /// `-c` / `-r`: restore the most recent session in the default dir.
-    Latest,
+    Latest { dir: PathBuf },
     /// `--session <id|path>`: restore the session whose id matches, or whose
     /// file name contains the id.
-    ById { id: String },
+    ById { id: String, dir: PathBuf },
     /// `--session-id <id>`: use the EXACT session id, creating it if missing.
-    ByExactId { id: String },
+    ByExactId { id: String, dir: PathBuf },
     /// `--fork <path|id>`: fork the given session into a new one and start in
     /// the fork.
     Fork { source: String },
@@ -151,21 +151,9 @@ pub fn select_session(args: &Args, cwd: &Path) -> SessionSelection {
     if args.no_session {
         return SessionSelection::Ephemeral;
     }
-    if args.continue_session || args.resume {
-        // `--continue` and `--resume` both restore the most recent session.
-        return SessionSelection::Latest;
-    }
-    if let Some(s) = &args.fork {
-        return SessionSelection::Fork { source: s.clone() };
-    }
-    if let Some(s) = &args.session_id {
-        return SessionSelection::ByExactId { id: s.clone() };
-    }
-    if let Some(s) = &args.session {
-        return SessionSelection::ById { id: s.clone() };
-    }
     // `--session-dir` wins; then the saved `sessionDir` (upstream's key, same
-    // format as the flag); then the built-in default.
+    // format as the flag); then the built-in default. Keep this directory on
+    // restore selections too, not only on fresh sessions.
     let dir = args
         .session_dir
         .clone()
@@ -175,6 +163,18 @@ pub fn select_session(args: &Args, cwd: &Path) -> SessionSelection {
                 .and_then(|settings| settings.session_dir)
         })
         .unwrap_or_else(|| default_session_dir(cwd));
+    if args.continue_session || args.resume {
+        return SessionSelection::Latest { dir };
+    }
+    if let Some(s) = &args.fork {
+        return SessionSelection::Fork { source: s.clone() };
+    }
+    if let Some(s) = &args.session_id {
+        return SessionSelection::ByExactId { id: s.clone(), dir };
+    }
+    if let Some(s) = &args.session {
+        return SessionSelection::ById { id: s.clone(), dir };
+    }
     SessionSelection::New {
         dir,
         name: args.name.clone(),
@@ -664,7 +664,7 @@ pub async fn build(
         // records — let the harness load it and keep appending.
         allow_existing_session: matches!(
             selection,
-            SessionSelection::Latest
+            SessionSelection::Latest { .. }
                 | SessionSelection::ById { .. }
                 | SessionSelection::ByExactId { .. }
                 | SessionSelection::Fork { .. }
@@ -1808,7 +1808,7 @@ async fn build_session(selection: &SessionSelection, cwd: &str) -> Result<Sessio
                 .map_err(|e| BuildError::SessionDir(format!("{}: {e}", dir.display())))?;
             Ok(session)
         }
-        SessionSelection::Latest
+        SessionSelection::Latest { .. }
         | SessionSelection::ById { .. }
         | SessionSelection::ByExactId { .. } => restore_session(selection, cwd).await,
         SessionSelection::Fork { source } => fork_session_at_launch(source, cwd).await,
@@ -1825,8 +1825,8 @@ async fn restore_session(selection: &SessionSelection, cwd: &str) -> Result<Sess
     // the id exactly or by file-name containment (so `--session 01a02…` or a
     // partial id works, mirroring the TS id/path matching).
     match selection {
-        SessionSelection::Latest => {
-            let metas = list_session_metadata(cwd).await?;
+        SessionSelection::Latest { dir } => {
+            let metas = list_session_metadata_in_dir(cwd, dir).await?;
             let Some(meta) = first_resumable_session(&metas) else {
                 return Err(BuildError::SessionNotFound {
                     requested: "the most recent session".to_string(),
@@ -1835,24 +1835,25 @@ async fn restore_session(selection: &SessionSelection, cwd: &str) -> Result<Sess
             };
             open_session(meta, cwd).await
         }
-        SessionSelection::ById { id } => open_session_by_id(id, cwd).await.map_err(|e| match e {
-            OpenError::NotFound { requested } => BuildError::SessionNotFound {
-                requested,
-                dir: default_session_dir(Path::new(cwd)).display().to_string(),
-            },
-            OpenError::Other(msg) => BuildError::SessionOpen(msg),
-        }),
-        SessionSelection::ByExactId { id } => {
+        SessionSelection::ById { id, dir } => open_session_by_id_in_dir(id, cwd, dir)
+            .await
+            .map_err(|e| match e {
+                OpenError::NotFound { requested } => BuildError::SessionNotFound {
+                    requested,
+                    dir: default_session_dir(Path::new(cwd)).display().to_string(),
+                },
+                OpenError::Other(msg) => BuildError::SessionOpen(msg),
+            }),
+        SessionSelection::ByExactId { id, dir } => {
             // Exact id match only (pi `--session-id`): restore when the
-            // session exists, else create a fresh one under the default dir.
-            let metas = list_session_metadata(cwd).await?;
+            // session exists, else create a fresh one under the selected dir.
+            let metas = list_session_metadata_in_dir(cwd, dir).await?;
             if let Some(meta) = metas.iter().find(|m| m.id == *id) {
                 return open_session(meta, cwd).await;
             }
-            let dir = default_session_dir(Path::new(cwd));
-            std::fs::create_dir_all(&dir)
+            std::fs::create_dir_all(dir)
                 .map_err(|e| BuildError::SessionDir(format!("{}: {e}", dir.display())))?;
-            create_jsonl_session_with_id(&dir, cwd, Some(id.clone()))
+            create_jsonl_session_with_id(dir, cwd, Some(id.clone()))
                 .await
                 .map_err(|e| BuildError::SessionDir(format!("{}: {e}", dir.display())))
         }
@@ -1936,12 +1937,19 @@ impl std::fmt::Display for OpenError {
 pub async fn list_session_metadata(
     cwd: &str,
 ) -> Result<Vec<rpi_harness::session::jsonl::JsonlSessionMetadata>, BuildError> {
+    let dir = default_session_dir(Path::new(cwd));
+    list_session_metadata_in_dir(cwd, &dir).await
+}
+
+async fn list_session_metadata_in_dir(
+    cwd: &str,
+    dir: &Path,
+) -> Result<Vec<rpi_harness::session::jsonl::JsonlSessionMetadata>, BuildError> {
     use rpi_harness::session::jsonl::{
         JsonlSessionListOptions, JsonlSessionRepo, JsonlSessionRepoOptions,
     };
     use rpi_tools::FileSystem;
 
-    let dir = default_session_dir(Path::new(cwd));
     let env = Arc::new(OsExecutionEnv::with_cwd(PathBuf::from(cwd)));
     let fs: Arc<dyn FileSystem> = env.clone();
     let repo = JsonlSessionRepo::with_env_cwd(JsonlSessionRepoOptions {
@@ -2210,7 +2218,12 @@ fn first_resumable_session<'a>(
 /// (so `--session 01a02…` / a partial id / a full file name all work). The
 /// TUI `/session` hot-switch calls this with the selector's item value.
 pub async fn open_session_by_id(id: &str, cwd: &str) -> Result<Session, OpenError> {
-    let metas = list_session_metadata(cwd)
+    let dir = default_session_dir(Path::new(cwd));
+    open_session_by_id_in_dir(id, cwd, &dir).await
+}
+
+async fn open_session_by_id_in_dir(id: &str, cwd: &str, dir: &Path) -> Result<Session, OpenError> {
+    let metas = list_session_metadata_in_dir(cwd, dir)
         .await
         .map_err(|e| OpenError::Other(e.to_string()))?;
     let Some(meta) = metas
@@ -3255,7 +3268,7 @@ mod tests {
         let cwd = Path::new("/tmp");
         assert!(matches!(
             select_session(&args, cwd),
-            SessionSelection::Latest
+            SessionSelection::Latest { .. }
         ));
 
         let args = Args {
@@ -3264,7 +3277,7 @@ mod tests {
         };
         assert!(matches!(
             select_session(&args, cwd),
-            SessionSelection::Latest
+            SessionSelection::Latest { .. }
         ));
     }
 
@@ -3277,7 +3290,7 @@ mod tests {
         let cwd = Path::new("/tmp");
         assert!(matches!(
             select_session(&args, cwd),
-            SessionSelection::ById { id } if id == "01a02ece"
+            SessionSelection::ById { id, .. } if id == "01a02ece"
         ));
     }
 
