@@ -11,6 +11,8 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.3.15] - 2026-10-04
+
 ## [0.3.13] - 2026-10-02
 
 ### Added
