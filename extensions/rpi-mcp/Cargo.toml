@@ -1,0 +1,17 @@
+[package]
+name = "rpi-mcp"
+version.workspace = true
+edition.workspace = true
+publish = false
+description = "MCP client extension for rpi; provider/runtime logic stays outside the host"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+rpi-plugin-sdk = { workspace = true }
