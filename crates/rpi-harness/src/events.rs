@@ -105,9 +105,46 @@ pub struct RunEndEvent {
     pub leaf_id: String,
 }
 
+/// Context compaction progress for interactive clients.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionProgressEvent {
+    pub lane: String,
+    pub manual: bool,
+    pub active: bool,
+}
+
+pub(crate) struct CompactionProgressGuard {
+    bus: HarnessEventBus,
+    event: CompactionProgressEvent,
+}
+
+impl CompactionProgressGuard {
+    pub(crate) fn new(bus: &HarnessEventBus, lane: &str, manual: bool) -> Self {
+        let event = CompactionProgressEvent {
+            lane: lane.into(),
+            manual,
+            active: true,
+        };
+        bus.emit(&HarnessEvent::CompactionProgress(event.clone()));
+        Self {
+            bus: bus.clone(),
+            event,
+        }
+    }
+}
+
+impl Drop for CompactionProgressGuard {
+    fn drop(&mut self) {
+        self.event.active = false;
+        self.bus
+            .emit(&HarnessEvent::CompactionProgress(self.event.clone()));
+    }
+}
+
 /// The harness event union. Mirrors TS `HarnessEvent`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HarnessEvent {
+    CompactionProgress(CompactionProgressEvent),
     RunStart(RunStartEvent),
     RunEnd(RunEndEvent),
 }
@@ -116,6 +153,7 @@ impl HarnessEvent {
     /// Stable type tag. Mirrors TS `HarnessEvent["type"]`.
     pub fn type_tag(&self) -> &'static str {
         match self {
+            HarnessEvent::CompactionProgress(_) => "compaction_progress",
             HarnessEvent::RunStart(_) => "run_start",
             HarnessEvent::RunEnd(_) => "run_end",
         }
@@ -435,6 +473,39 @@ impl<T> Drop for WatchHandle<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compaction_progress_clears_on_drop_and_unwind() {
+        for manual in [false, true] {
+            let bus = HarnessEventBus::new();
+            let received = Arc::new(Mutex::new(Vec::new()));
+            let output = received.clone();
+            let mut watch = bus.watch(|| ());
+            watch.start(Arc::new(move |event| {
+                output.lock().unwrap().push(event.clone())
+            }));
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _progress = CompactionProgressGuard::new(&bus, "main", manual);
+                assert_eq!(received.lock().unwrap().len(), 1);
+                panic!("compaction interrupted");
+            }));
+            assert_eq!(
+                *received.lock().unwrap(),
+                vec![
+                    HarnessEvent::CompactionProgress(CompactionProgressEvent {
+                        lane: "main".into(),
+                        manual,
+                        active: true
+                    }),
+                    HarnessEvent::CompactionProgress(CompactionProgressEvent {
+                        lane: "main".into(),
+                        manual,
+                        active: false
+                    }),
+                ]
+            );
+        }
+    }
 
     #[cfg(test)]
     mod tests_case_outcomes {

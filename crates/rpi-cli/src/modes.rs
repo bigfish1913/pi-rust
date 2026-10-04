@@ -505,6 +505,9 @@ fn agent_event_json(event: &AgentEvent) -> serde_json::Value {
 /// payload's key fields).
 fn emit_json_event(event: &HarnessEvent) {
     let line = match event {
+        HarnessEvent::CompactionProgress(e) => {
+            serde_json::json!({ "type": "compaction_progress", "lane": e.lane, "manual": e.manual, "active": e.active })
+        }
         HarnessEvent::RunStart(e) => serde_json::json!({
             "type": "run_start",
             "lane": e.lane,

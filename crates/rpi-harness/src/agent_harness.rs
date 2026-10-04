@@ -3062,7 +3062,12 @@ impl AgentHarness {
                             },
                             custom_instructions: None,
                         };
-                        match compact(&prep, &llm_opts).await {
+                        match {
+                            let _progress = crate::events::CompactionProgressGuard::new(
+                                &self.bus, &self.lane, false,
+                            );
+                            compact(&prep, &llm_opts).await
+                        } {
                             Ok(result) => {
                                 let _ = self
                                     .persist_compaction_entry(
@@ -3229,7 +3234,7 @@ impl AgentHarness {
                             })).collect();
                             let prep = match prepare_compaction(&entries, settings) { Ok(Some(p)) => p, _ => return None };
                             let opts = CompactionLlmOptions { provider, model: model.clone(), api_key: None, signal: compaction_signal, thinking_level: None, retry: None, custom_instructions: None };
-                            let result = match compact(&prep, &opts).await { Ok(r) => r, Err(_) => return None };
+                            let result = match { let _progress = crate::events::CompactionProgressGuard::new(&harness.bus, &harness.lane, false); compact(&prep, &opts).await } { Ok(r) => r, Err(_) => return None };
                             // Mid-loop compaction fires because the turn pushed the
                             // context over the threshold.
                             if harness.persist_compaction_entry(&compaction_run_id, &result, CompactionReason::Threshold).await.is_err() { return None; }
@@ -3648,7 +3653,12 @@ impl AgentHarness {
                         },
                         custom_instructions: custom_instructions.clone(),
                     };
-                    match compact(&prep, &llm_opts).await {
+                    match {
+                        let _progress = crate::events::CompactionProgressGuard::new(
+                            &self.bus, &self.lane, true,
+                        );
+                        compact(&prep, &llm_opts).await
+                    } {
                         Ok(result) => {
                             let entry = self
                                 .persist_compaction_entry(

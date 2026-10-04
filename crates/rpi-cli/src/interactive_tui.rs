@@ -5370,6 +5370,36 @@ pub async fn interactive_tui(
         selection_end: std::sync::Mutex::new(None),
     });
 
+    let _compaction_watcher = harness.watch({
+        let state = Arc::clone(&state);
+        let tui = Arc::clone(&tui);
+        move |event| {
+            if let rpi_harness::events::HarnessEvent::CompactionProgress(event) = event {
+                if event.lane != "main" {
+                    return;
+                }
+                if event.active {
+                    if state.show_terminal_progress {
+                        state.editor.set_working(Some(WorkingState {
+                            frame: 0,
+                            started_at: std::time::Instant::now(),
+                            message: if event.manual {
+                                "Compacting context… (Esc to cancel)"
+                            } else {
+                                "Auto-compacting… (Esc to cancel)"
+                            }
+                            .into(),
+                        }));
+                    }
+                } else {
+                    let status = *state.status.lock().unwrap();
+                    state.apply_status(status);
+                }
+                tui.request_render(false);
+            }
+        }
+    });
+
     // Capture the model catalog + cwd for the selector builders + the key loop
     // (the callbacks fire on blocking threads and need owned data).
     let model_catalog_arc = Arc::new(model_catalog.clone());
@@ -7295,9 +7325,8 @@ async fn run_prompt_streaming(
 }
 
 /// `/compact`: drive a compaction on the lane (mirrors TS `app.compact`).
-/// Reports the outcome as a transcript note; v1's compaction summarizes the
-/// session in place, so no streaming display is wired (compaction emits no
-/// `AgentEvent`s — only the harness bus `RunEnd`).
+/// Reports the outcome as a transcript note; the harness progress watcher
+/// displays the compaction indicator while the summary is generated.
 async fn run_compact(lane: &Arc<dyn AgentLane>, tui: &Arc<TuiAltScreen>, state: &Arc<TuiState>) {
     state.set_status(RunStatus::Working);
     tui.request_render(false);
