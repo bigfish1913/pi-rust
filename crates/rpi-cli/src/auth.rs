@@ -37,7 +37,7 @@ pub async fn run(args: &[String]) -> i32 {
     let sub = args.first().map(|s| s.as_str()).unwrap_or("");
     match sub {
         "login" => run_login(&args[1..]).await,
-        "check" => run_check(&args[1..]).await,
+        "check" | "status" => run_check(&args[1..]).await,
         "logout" => run_logout(&args[1..]).await,
         "--help" | "-h" | "help" | "" => {
             print_auth_help();
@@ -169,7 +169,8 @@ fn parse_provider(args: &[String]) -> Option<&str> {
 
 /// Where a credential was found — used by `auth check` to report its source.
 enum CredentialSource {
-    StoredFile,
+    StoredApiKey,
+    StoredOauth,
     ModelsJson,
     EnvApiKey,
     EnvAuthTToken,
@@ -183,7 +184,8 @@ impl CredentialSource {
     }
     fn as_json_str(&self) -> &'static str {
         match self {
-            CredentialSource::StoredFile => "auth.json",
+            CredentialSource::StoredApiKey => "auth.json",
+            CredentialSource::StoredOauth => "oauth",
             CredentialSource::ModelsJson => "models.json",
             CredentialSource::EnvApiKey => "ANTHROPIC_API_KEY",
             CredentialSource::EnvAuthTToken => "ANTHROPIC_AUTH_TOKEN",
@@ -193,7 +195,8 @@ impl CredentialSource {
     }
     fn as_display(&self) -> Option<&'static str> {
         match self {
-            CredentialSource::StoredFile => Some("key in ~/.rpi/auth.json"),
+            CredentialSource::StoredApiKey => Some("key in ~/.rpi/auth.json"),
+            CredentialSource::StoredOauth => Some("OAuth token in ~/.rpi/auth.json"),
             CredentialSource::ModelsJson => Some("apiKey in ~/.rpi/agent/models.json"),
             CredentialSource::EnvApiKey => Some("ANTHROPIC_API_KEY env var"),
             CredentialSource::EnvAuthTToken => Some("ANTHROPIC_AUTH_TOKEN env var"),
@@ -208,17 +211,30 @@ impl CredentialSource {
 /// the CLI layer; here we probe file + env only).
 fn detect_credential(provider: &str) -> CredentialSource {
     if let Ok(store) = read_auth() {
-        if matches!(store.get(provider), Some(Credential::ApiKey { key: Some(k), .. }) if !k.is_empty())
-            || matches!(
-                store.get(provider),
-                Some(Credential::ApiKey {
-                    key: None,
-                    env: Some(_env),
-                    ..
-                })
-            )
-        {
-            return CredentialSource::StoredFile;
+        match store.get(provider) {
+            Some(Credential::ApiKey { key: Some(k), .. }) if !k.is_empty() => {
+                return CredentialSource::StoredApiKey;
+            }
+            Some(Credential::ApiKey {
+                key: None,
+                env: Some(_),
+                ..
+            }) => {
+                return CredentialSource::StoredApiKey;
+            }
+            Some(Credential::Oauth {
+                access, expires, ..
+            }) if !access.is_empty()
+                && (*expires == 0
+                    || *expires
+                        > std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|duration| duration.as_secs() as i64)
+                            .unwrap_or(i64::MAX)) =>
+            {
+                return CredentialSource::StoredOauth;
+            }
+            _ => {}
         }
     }
     let configured = config::load_models_config().ok().and_then(|models| {
@@ -281,6 +297,7 @@ Manage persisted credentials and inspect models.json provider authentication.
 Subcommands:
   login   Prompt for an API key and save it (input is not echoed).
   check   Report whether credentials are available (no network call).
+  status  Alias for check; never prints token material.
   logout  Remove the stored credential.
 
 Options:
@@ -388,6 +405,32 @@ mod tests {
         .unwrap();
         let code = run_check(&[]).await;
         assert_eq!(code, 0);
+    }
+
+    #[tokio::test]
+    async fn check_ready_with_oauth_credential() {
+        let _cfg = TempConfig::new();
+        crate::config::upsert_oauth_token(
+            DEFAULT_PROVIDER_ID,
+            "access".into(),
+            "refresh".into(),
+            0,
+        )
+        .unwrap();
+        assert_eq!(run_check(&[]).await, 0);
+    }
+
+    #[tokio::test]
+    async fn check_rejects_expired_oauth_credential() {
+        let _cfg = TempConfig::new();
+        crate::config::upsert_oauth_token(
+            DEFAULT_PROVIDER_ID,
+            "access".into(),
+            "refresh".into(),
+            1,
+        )
+        .unwrap();
+        assert_eq!(run_check(&[]).await, EXIT_NOT_READY);
     }
 
     #[tokio::test]

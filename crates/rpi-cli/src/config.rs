@@ -230,9 +230,8 @@ fn migrate_legacy_layout_in(root: &Path, agent: &Path) -> Result<usize, ConfigEr
 // ---------------------------------------------------------------------------
 
 /// A stored credential. Mirrors the TS `Credential` union
-/// (`packages/ai/src/auth/types.ts`). The `Oauth` variant exists for forward
-/// compatibility but v1 never writes it (no OAuth device-code flow); `resolve`
-/// does not consume it.
+/// (`packages/ai/src/auth/types.ts`). OAuth credentials are provider-scoped
+/// and must never be logged or exposed to the agent transcript.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum Credential {
@@ -243,11 +242,13 @@ pub enum Credential {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         env: Option<BTreeMap<String, String>>,
     },
-    /// OAuth tokens (access + refresh + expiry). v1 does not write this.
+    /// OAuth tokens (access + refresh + expiry).
     Oauth {
         access: String,
+        #[serde(default)]
         refresh: String,
-        /// Unix epoch seconds.
+        /// Unix epoch seconds. `0` means no known expiry.
+        #[serde(default)]
         expires: i64,
     },
 }
@@ -285,6 +286,40 @@ pub fn upsert_credential(provider_id: &str, cred: Credential) -> Result<(), Conf
     let mut store = read_auth()?;
     store.insert(provider_id.to_string(), cred);
     write_auth(&store)
+}
+
+/// Store an OAuth token under exactly one provider id using the atomic auth
+/// store writer. Token values never enter the event or session layer.
+pub fn upsert_oauth_token(
+    provider_id: &str,
+    access: String,
+    refresh: String,
+    expires: i64,
+) -> Result<(), ConfigError> {
+    upsert_credential(
+        provider_id,
+        Credential::Oauth {
+            access,
+            refresh,
+            expires,
+        },
+    )
+}
+
+/// Read only the OAuth credential for one provider.
+pub fn read_oauth_token(provider_id: &str) -> Result<Option<Credential>, ConfigError> {
+    Ok(match read_auth()?.get(provider_id) {
+        Some(Credential::Oauth {
+            access,
+            refresh,
+            expires,
+        }) => Some(Credential::Oauth {
+            access: access.clone(),
+            refresh: refresh.clone(),
+            expires: *expires,
+        }),
+        _ => None,
+    })
 }
 
 /// Remove `provider_id` from the store. Returns `true` if a credential was
@@ -1099,6 +1134,18 @@ mod tests {
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(raw.contains("\"anthropic\""));
         assert!(raw.contains("api_key"));
+    }
+
+    #[test]
+    fn oauth_token_is_scoped_and_round_trips() {
+        let _cfg = TempConfig::new();
+        upsert_oauth_token("acme", "access".into(), "refresh".into(), 123).unwrap();
+        assert!(matches!(
+            read_oauth_token("acme").unwrap(),
+            Some(Credential::Oauth { access, refresh, expires })
+                if access == "access" && refresh == "refresh" && expires == 123
+        ));
+        assert!(read_oauth_token("other").unwrap().is_none());
     }
 
     #[test]
