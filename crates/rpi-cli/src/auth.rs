@@ -20,6 +20,8 @@
 //! the `anthropic` provider id is handled.
 
 use std::collections::BTreeMap;
+use std::io::{self, Write};
+use std::sync::Arc;
 
 use crate::config::{
     self, delete_credential, read_auth, upsert_credential, Credential, DEFAULT_PROVIDER_ID,
@@ -34,9 +36,18 @@ const EXIT_ERROR: i32 = 2;
 /// subcommand + its flags). Returns the process exit code. Async to match the
 /// `app::run` shape, though v1 does no async work here.
 pub async fn run(args: &[String]) -> i32 {
+    run_with_extensions(args, None).await
+}
+
+/// Run auth with an optional extension snapshot. The caller must keep the
+/// matching extension session alive until this future completes.
+pub async fn run_with_extensions(
+    args: &[String],
+    snapshot: Option<Arc<rpi_extensions::RegistrySnapshot>>,
+) -> i32 {
     let sub = args.first().map(|s| s.as_str()).unwrap_or("");
     match sub {
-        "login" => run_login(&args[1..]).await,
+        "login" => run_login(&args[1..], snapshot.as_ref()).await,
         "check" | "status" => run_check(&args[1..]).await,
         "logout" => run_logout(&args[1..]).await,
         "--help" | "-h" | "help" | "" => {
@@ -53,8 +64,16 @@ pub async fn run(args: &[String]) -> i32 {
 }
 
 /// `rpi auth login [--provider <id>]` — prompt for a key and persist it.
-async fn run_login(args: &[String]) -> i32 {
+async fn run_login(
+    args: &[String],
+    snapshot: Option<&Arc<rpi_extensions::RegistrySnapshot>>,
+) -> i32 {
     let provider = parse_provider(args).unwrap_or(DEFAULT_PROVIDER_ID);
+    if let Some(snapshot) = snapshot {
+        if snapshot.oauth_provider(provider).is_some() {
+            return run_oauth_login(provider, snapshot).await;
+        }
+    }
     if provider != DEFAULT_PROVIDER_ID {
         eprintln!(
             "error: v1 only supports the \"{DEFAULT_PROVIDER_ID}\" provider for login (got \"{provider}\")"
@@ -153,6 +172,90 @@ async fn run_logout(args: &[String]) -> i32 {
 /// Pull the `--provider <id>` value from a subcommand's args (defaults to
 /// `None`). Mirrors the TS `--provider` handshake before it falls back to the
 /// default.
+async fn run_oauth_login(provider: &str, snapshot: &Arc<rpi_extensions::RegistrySnapshot>) -> i32 {
+    let begin =
+        match rpi_extensions::request_oauth(snapshot, provider, "begin", serde_json::json!({})) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("error: OAuth begin failed: {error}");
+                return EXIT_ERROR;
+            }
+        };
+    if let Some(url) = begin
+        .get("authorizationUrl")
+        .or_else(|| begin.get("authorization_url"))
+        .and_then(serde_json::Value::as_str)
+    {
+        println!("Open this URL to authorize {provider}:\n{url}");
+    }
+    eprint!("Paste the authorization callback or code: ");
+    let _ = io::stderr().flush();
+    let mut callback = String::new();
+    if io::stdin().read_line(&mut callback).is_err() {
+        eprintln!("error: could not read the OAuth callback");
+        return EXIT_ERROR;
+    }
+    let callback = callback.trim();
+    if callback.is_empty() {
+        eprintln!("error: an empty OAuth callback was entered; nothing saved.");
+        return EXIT_ERROR;
+    }
+    let token = match rpi_extensions::request_oauth(
+        snapshot,
+        provider,
+        "exchange",
+        serde_json::json!({"callback": callback, "begin": begin}),
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("error: OAuth exchange failed: {error}");
+            return EXIT_ERROR;
+        }
+    };
+    let Some(access) = token
+        .get("access")
+        .or_else(|| token.get("accessToken"))
+        .or_else(|| token.get("access_token"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+    else {
+        eprintln!("error: OAuth exchange returned no access token");
+        return EXIT_ERROR;
+    };
+    let refresh = token
+        .get("refresh")
+        .or_else(|| token.get("refreshToken"))
+        .or_else(|| token.get("refresh_token"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let expires = token
+        .get("expires")
+        .or_else(|| token.get("expiresAt"))
+        .or_else(|| token.get("expires_at"))
+        .and_then(serde_json::Value::as_i64)
+        .or_else(|| {
+            token
+                .get("expiresIn")
+                .or_else(|| token.get("expires_in"))
+                .and_then(serde_json::Value::as_i64)
+                .and_then(|seconds| {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .map(|now| now.as_secs() as i64 + seconds)
+                })
+        })
+        .unwrap_or(0);
+    if let Err(error) =
+        config::upsert_oauth_token(provider, access.to_string(), refresh.to_string(), expires)
+    {
+        eprintln!("error: could not save OAuth credentials: {error}");
+        return EXIT_ERROR;
+    }
+    println!("OAuth credentials saved for \"{provider}\".");
+    0
+}
+
 fn parse_provider(args: &[String]) -> Option<&str> {
     let mut iter = args.iter();
     while let Some(a) = iter.next() {
@@ -295,7 +398,7 @@ fn print_auth_help() {
 Manage persisted credentials and inspect models.json provider authentication.
 
 Subcommands:
-  login   Prompt for an API key and save it (input is not echoed).
+  login   Prompt for an API key, or run an OAuth provider login.
   check   Report whether credentials are available (no network call).
   status  Alias for check; never prints token material.
   logout  Remove the stored credential.
@@ -310,8 +413,11 @@ Environment:
   OPENAI_API_KEY         Fallback bearer token for openai-completions.
 
 Notes:
-  `login` stores Anthropic credentials. OpenAI-compatible providers normally
-  store apiKey in ~/.rpi/agent/models.json. OAuth remains deferred.
+  `login` stores Anthropic API-key credentials by default. For a registered
+  OAuth extension, use `login --provider <id>`; the first flow prints its
+  authorization URL, accepts a pasted callback or code, and saves only the
+  returned token in auth.json. OpenAI-compatible providers normally store
+  apiKey in ~/.rpi/agent/models.json.
 ",
         name = crate::APP_NAME
     );

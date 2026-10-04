@@ -136,7 +136,15 @@ async fn run_inner() -> i32 {
     // is the right level of abstraction (and matches the `match mode { .. }`
     // dispatch at the end of this function).
     match argv.first().map(String::as_str) {
-        Some("auth") => return crate::auth::run(&argv[1..]).await,
+        Some("auth") => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
+            let dirs = crate::resource_dirs::extension_dirs(&cwd);
+            let diagnostics: std::sync::Arc<dyn rpi_extensions::PluginDiagnostics> =
+                std::sync::Arc::new(rpi_extensions::NullDiagnostics);
+            let extension_session = rpi_extensions::load_session(&dirs, diagnostics, None);
+            return crate::auth::run_with_extensions(&argv[1..], extension_session.snapshot_arc())
+                .await;
+        }
         Some("events") => return crate::events::run(&argv[1..]).await,
         Some("update") => return crate::updates::run_self_update(&argv[1..]),
         Some("install") => return crate::install::run(&argv[1..]),

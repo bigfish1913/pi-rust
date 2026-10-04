@@ -380,5 +380,16 @@ access token、refresh token 和过期时间；`revoke` 返回操作结果。宿
 
 `rpi-extensions` 提供 `list_oauth_providers` 和 `request_oauth` 两个宿主侧入口。
 它们只允许调用已经注册且 manifest `id` 匹配的 provider，并在读取插件输出后立即
-调用插件提供的 `plugin_free_string`。当前这两个入口还没有接入浏览器授权和
-`rpi auth login`；这会在凭证存储、PKCE/state 校验和旧认证迁移方案确定后接入。
+调用插件提供的 `plugin_free_string`。
+
+已接入最小 CLI 流程：
+
+```text
+rpi auth login --provider <id>
+  begin → 打印 authorization URL → 用户粘贴 callback/code
+  exchange → 宿主按 provider id 原子保存 access/refresh/expiry
+```
+
+当前版本使用手动粘贴 callback/code，浏览器自动回调、PKCE/state 强制校验和 token
+刷新命令仍待 OAuth provider manifest 与安全交互协议完善。插件不得把 token 写入
+普通事件、模型消息或日志。
