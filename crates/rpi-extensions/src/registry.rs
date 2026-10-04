@@ -15,7 +15,7 @@ use std::sync::Arc;
 use rpi_agent::error::AgentError;
 use rpi_ai::types::Tool;
 use rpi_plugin_sdk::{
-    BeforeAgentStartFn, CommandHandlerFn, EventHandlerFn, EventTag, FreeStringFn,
+    BeforeAgentStartFn, CommandHandlerFn, EventHandlerFn, EventTag, FreeStringFn, OAuthRequestFn,
     ProviderRequestFn, RenderFn, ResourcesDiscoverFn, EVENT_TAG_COUNT,
 };
 
@@ -186,6 +186,19 @@ pub struct RegisteredProvider {
     pub plugin_free_string: FreeStringFn,
     pub user_data: *mut std::ffi::c_void,
 }
+
+/// A provider-owned OAuth implementation. `manifest_json` is validated JSON
+/// copied from the plugin; the callback receives action envelopes such as
+/// `{\"action\":\"begin\"}` and returns plugin-owned JSON.
+#[derive(Clone)]
+pub struct RegisteredOAuthProvider {
+    pub manifest_json: String,
+    pub request_fn: OAuthRequestFn,
+    pub plugin_free_string: FreeStringFn,
+    pub user_data: *mut std::ffi::c_void,
+}
+unsafe impl Send for RegisteredOAuthProvider {}
+unsafe impl Sync for RegisteredOAuthProvider {}
 // SAFETY: fn pointers + owned `String`s + an opaque plugin pointer the plugin
 // warrants is thread-safe; the host never frees `user_data`.
 unsafe impl Send for RegisteredProvider {}
@@ -303,6 +316,9 @@ pub struct ExtensionRegistry {
     /// [`PluggableProvider`](crate::PluggableProvider). First-registration-wins on
     /// `provider_id`.
     providers: Vec<RegisteredProvider>,
+    /// Provider-owned OAuth implementations. First-registration-wins on the
+    /// manifest `id` field.
+    oauth_providers: Vec<RegisteredOAuthProvider>,
     /// Registered renderers (B5c), split by kind at registration. First-wins on
     /// `(kind, name)`. The host records these now; TUI consumption is B5e.
     renderers: Vec<RegisteredRenderer>,
@@ -336,6 +352,7 @@ impl ExtensionRegistry {
             resources_discover: Vec::new(),
             before_agent_start: Vec::new(),
             providers: Vec::new(),
+            oauth_providers: Vec::new(),
             renderers: Vec::new(),
             priority: DEFAULT_PRIORITY,
             platforms: Vec::new(),
@@ -539,6 +556,36 @@ impl ExtensionRegistry {
         false
     }
 
+    /// Register a provider-owned OAuth implementation. The manifest must be a
+    /// JSON object with a non-empty string `id`; malformed manifests are
+    /// rejected. Returns `true` when an existing provider won.
+    pub fn register_oauth_provider(&mut self, provider: RegisteredOAuthProvider) -> bool {
+        let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&provider.manifest_json)
+        else {
+            return true;
+        };
+        let Some(id) = manifest.get("id").and_then(serde_json::Value::as_str) else {
+            return true;
+        };
+        if id.trim().is_empty()
+            || self.oauth_providers.iter().any(|p| {
+                serde_json::from_str::<serde_json::Value>(&p.manifest_json)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("id")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .as_deref()
+                    == Some(id)
+            })
+        {
+            return true;
+        }
+        self.oauth_providers.push(provider);
+        false
+    }
+
     /// Register a renderer (B5c — message/markdown/entry). First-wins on
     /// `(kind, name)`. Returns `true` if a prior renderer of the same kind+name
     /// was kept.
@@ -582,6 +629,7 @@ impl ExtensionRegistry {
             resources_discover: self.resources_discover.clone(),
             before_agent_start: self.before_agent_start.clone(),
             providers: self.providers.clone(),
+            oauth_providers: self.oauth_providers.clone(),
             renderers: self.renderers.clone(),
             active: Arc::clone(&self.active),
         }
@@ -662,6 +710,31 @@ impl ExtensionRegistry {
             }
             self.providers.push(p);
         }
+        for oauth in other.oauth_providers.drain(..) {
+            if self.oauth_providers.iter().any(|existing| {
+                let existing_id =
+                    serde_json::from_str::<serde_json::Value>(&existing.manifest_json)
+                        .ok()
+                        .and_then(|value| {
+                            value
+                                .get("id")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned)
+                        });
+                let oauth_id = serde_json::from_str::<serde_json::Value>(&oauth.manifest_json)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("id")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                    });
+                existing_id.is_some() && existing_id == oauth_id
+            }) {
+                continue;
+            }
+            self.oauth_providers.push(oauth);
+        }
         for r in other.renderers.drain(..) {
             if self
                 .renderers
@@ -695,6 +768,7 @@ pub struct RegistrySnapshot {
     resources_discover: Vec<ResourcesDiscoverHandler>,
     before_agent_start: Vec<BeforeAgentStartHandler>,
     providers: Vec<RegisteredProvider>,
+    oauth_providers: Vec<RegisteredOAuthProvider>,
     renderers: Vec<RegisteredRenderer>,
     active: Arc<AtomicBool>,
 }
@@ -765,6 +839,11 @@ impl RegistrySnapshot {
     /// kinds.
     pub fn renderers(&self) -> &[RegisteredRenderer] {
         &self.renderers
+    }
+
+    /// OAuth providers registered by extensions, in registration order.
+    pub fn oauth_providers(&self) -> &[RegisteredOAuthProvider] {
+        &self.oauth_providers
     }
 
     /// The registered renderers of a specific kind (B5c). The TUI dispatches
@@ -965,5 +1044,30 @@ mod tests {
         assert!(!platform_allows(&["nonexistent-os".to_string()]));
         // Empty host subset is fine; a non-matching list is not.
         assert!(!platform_allows(&["definitely-not-this-host".to_string()]));
+    }
+
+    extern "C" fn noop_oauth(
+        _request: rpi_plugin_sdk::StbStringRef,
+        _out: *mut rpi_plugin_sdk::StbString,
+        _user_data: *mut std::ffi::c_void,
+    ) -> i32 {
+        0
+    }
+
+    extern "C" fn noop_free(_value: rpi_plugin_sdk::StbString) {}
+
+    #[test]
+    fn oauth_manifest_registers_and_deduplicates() {
+        let mut reg = ExtensionRegistry::new();
+        let make = |manifest: &str| RegisteredOAuthProvider {
+            manifest_json: manifest.to_string(),
+            request_fn: noop_oauth,
+            plugin_free_string: noop_free,
+            user_data: std::ptr::null_mut(),
+        };
+        assert!(!reg.register_oauth_provider(make(r#"{"id":"acme","displayName":"Acme"}"#)));
+        assert!(reg.register_oauth_provider(make(r#"{"id":"acme"}"#)));
+        assert!(reg.register_oauth_provider(make(r#"{"displayName":"missing-id"}"#)));
+        assert_eq!(reg.snapshot().oauth_providers().len(), 1);
     }
 }

@@ -325,3 +325,38 @@ Linux/macOS 使用冒号分隔。命令行和环境变量适合本机开发、CI
 4. 实现领域逻辑与边界测试，再连接 loader/ABI。
 5. 使用 `rpi dev --no-watch` 与 `rpi install <crate> --force` 做真实 smoke test。
 6. 不声称未验证的 Pi capability 已完全兼容；明确记录降级行为。
+
+## 11. OAuth 扩展接口（统一标准，实验阶段）
+
+rpi 的 OAuth 方向是“轻量核心 + 平台插件”：平台差异由扩展实现，宿主负责统一
+发现、生命周期和后续的凭证存储。当前统一 ABI 已提供可选的
+`register_oauth_provider` 槽位；旧插件不需要重新编译即可继续加载。
+
+插件注册一个 JSON manifest 和一个 action callback：
+
+```json
+{
+  "id": "example-platform",
+  "displayName": "Example Platform",
+  "scopes": ["models:read", "models:run"],
+  "supportsPkce": true,
+  "capabilities": ["authorization_code", "refresh", "revoke"]
+}
+```
+
+callback 接收 JSON action envelope，动作名预留为：
+
+- `begin`：生成授权地址、state、PKCE challenge 等启动信息；
+- `exchange`：用授权 code 换取 token；
+- `refresh`：刷新 access token；
+- `revoke`：撤销授权。
+
+OAuth token 属于敏感信息：不得写入普通事件、模型消息、工具结果、调试日志或
+错误文本。插件拥有自己产生的输出字符串，宿主通过注册时提供的
+`plugin_free_string` 回收。插件应使用 `rpi` 提供的安全凭证桥接，而不是自行把
+token 写入项目目录。
+
+当前阶段完成的是 manifest 注册、校验、去重和 session snapshot 发现；浏览器/device
+code/PKCE 交互以及 `rpi auth login <provider>` 对插件 callback 的完整路由仍在后续
+阶段实现。现有 API key 和 Anthropic 兼容认证不应删除，直到官方 OAuth 插件完成迁移
+并通过登录、刷新、登出和失效恢复测试。

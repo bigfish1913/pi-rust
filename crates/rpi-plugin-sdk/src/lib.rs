@@ -1078,6 +1078,18 @@ pub type RenderFn =
 pub type ProviderRequestFn =
     extern "C" fn(req_json: StbStringRef, out: *mut StbString, user_data: *mut c_void) -> i32;
 
+/// OAuth provider callback. The host sends a JSON action envelope and the
+/// plugin returns a JSON response. Actions are `begin`, `exchange`,
+/// `refresh`, and `revoke`; token material remains plugin-owned and is never
+/// placed in normal agent events.
+pub type OAuthRequestFn =
+    extern "C" fn(req_json: StbStringRef, out: *mut StbString, user_data: *mut c_void) -> i32;
+
+/// Register an OAuth provider using a JSON manifest plus one action callback.
+/// The manifest is copied by the host and should include `id`, `displayName`,
+/// `scopes`, `supportsPkce`, and optional `capabilities`.
+pub type OAuthRegisterFn = OAuthRequestFn;
+
 // ---------------------------------------------------------------------------
 // Unified ABI — single struct, version inside
 // ---------------------------------------------------------------------------
@@ -1204,6 +1216,17 @@ pub struct PluginApi {
     pub register_before_agent_start: Option<
         extern "C" fn(
             handler: BeforeAgentStartFn,
+            plugin_free_string: FreeStringFn,
+            user_data: *mut c_void,
+        ) -> i32,
+    >,
+
+    /// Register a provider-owned OAuth flow. Appended for ABI compatibility;
+    /// older plugins compiled against a shorter struct remain valid.
+    pub register_oauth_provider: Option<
+        extern "C" fn(
+            manifest_json: StbStringRef,
+            request_fn: OAuthRequestFn,
             plugin_free_string: FreeStringFn,
             user_data: *mut c_void,
         ) -> i32,
@@ -1553,6 +1576,7 @@ mod tests {
             user_data: core::ptr::null_mut(),
             declare: None,
             register_before_agent_start: None,
+            register_oauth_provider: None,
         };
         // All optional slots are null → plugin must degrade.
         assert!(api.register_tool.is_none());
@@ -1665,6 +1689,7 @@ mod tests {
             user_data: core::ptr::null_mut(),
             declare: None,
             register_before_agent_start: None,
+            register_oauth_provider: None,
         };
         assert_eq!(RPI_PLUGIN_ABI_VERSION_UNIFIED, 4);
 
