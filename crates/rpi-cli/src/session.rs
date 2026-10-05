@@ -58,7 +58,7 @@ use crate::provider::ResolvedModel;
 use crate::resource_dirs::{
     discover_append_system_prompt_file, discover_system_prompt_file, extension_dirs,
     global_extension_dirs, global_prompt_template_dirs, global_skill_dirs,
-    load_prompt_templates_with_precedence, load_skills_with_precedence,
+    load_prompt_templates_with_precedence, load_skills_with_precedence, project_extension_dirs,
     project_prompt_template_dirs, project_skill_dirs, prompt_template_dirs, skill_dirs,
 };
 use rpi_extensions::{
@@ -96,7 +96,7 @@ You help users by reading files, executing commands, editing code, and writing n
 
 Available tools:
 - read  — Read file contents
-- bash  — Execute shell commands
+- bash  — Execute Bash commands using Bash/POSIX syntax, including on Windows
 - edit  — Find/replace edits to existing files
 - write — Create or overwrite files
 - docs  — Look up rpi usage, extension, package, and compatibility documentation
@@ -110,6 +110,9 @@ Guidelines:
 - Be concise in your responses
 - Show file paths clearly when working with files
 - Prefer the smallest change that solves the problem
+- The bash tool runs Bash, even on Windows. Use ls, find, rg, and POSIX pipelines;
+  do not pass PowerShell cmdlets such as Get-ChildItem, Select-Object, or Select-String.
+  If a powershell tool is available, use it for PowerShell commands.
 {working_state_rule}
 - Track multi-step work with the todo tool instead of re-listing the plan in prose: add the
   steps once, then mark them done as you go. Re-stating the same plan without acting on it is
@@ -430,7 +433,7 @@ pub async fn build(
     let mut skill_diags: Vec<rpi_harness::skills::SkillDiagnostic> = Vec::new();
     let mut resource_diags: Vec<rpi_harness::diagnostics::ResourceDiagnostic> = Vec::new();
     if !args.no_skills {
-        let mut dirs = if args.dev_local_only {
+        let mut dirs = if args.dev_local_only || args.project_only {
             project_skill_dirs(cwd)
         } else if project_trusted {
             skill_dirs(cwd)
@@ -448,7 +451,7 @@ pub async fn build(
     let mut prompt_templates: Vec<rpi_harness::types::PromptTemplate> = Vec::new();
     let mut prompt_diags: Vec<rpi_harness::prompt_templates::PromptTemplateDiagnostic> = Vec::new();
     if !args.no_prompt_templates {
-        let mut dirs = if args.dev_local_only {
+        let mut dirs = if args.dev_local_only || args.project_only {
             project_prompt_template_dirs(cwd)
         } else if project_trusted {
             prompt_template_dirs(cwd)
@@ -1464,6 +1467,8 @@ where
 
     let mut extension_dirs = if args.no_extensions || args.dev_local_only {
         Vec::new()
+    } else if args.project_only {
+        project_extension_dirs(cwd)
     } else if project_trusted {
         extension_dirs(cwd)
     } else {
@@ -1475,7 +1480,7 @@ where
 
     let skill_base_dirs = if args.no_skills {
         Vec::new()
-    } else if args.dev_local_only {
+    } else if args.dev_local_only || args.project_only {
         project_skill_dirs(cwd)
     } else if project_trusted {
         skill_dirs(cwd)
@@ -1485,7 +1490,7 @@ where
 
     let prompt_base_dirs = if args.no_prompt_templates {
         Vec::new()
-    } else if args.dev_local_only {
+    } else if args.dev_local_only || args.project_only {
         project_prompt_template_dirs(cwd)
     } else if project_trusted {
         prompt_template_dirs(cwd)
@@ -1612,6 +1617,8 @@ fn load_extensions(
 ) -> ExtensionSession {
     let mut dirs = if args.dev_local_only {
         Vec::new()
+    } else if args.project_only {
+        project_extension_dirs(cwd)
     } else if project_trusted {
         extension_dirs(cwd)
     } else {
@@ -2652,7 +2659,9 @@ mod tests {
         assert!(!p.contains("- grep"));
         assert!(!p.contains("- find"));
         assert!(!p.contains("- ls"));
-        assert!(!p.contains("powershell"));
+        assert!(!p.contains("- powershell"));
+        assert!(p.contains("Bash/POSIX syntax, including on Windows"));
+        assert!(p.contains("do not pass PowerShell cmdlets"));
     }
 
     #[test]

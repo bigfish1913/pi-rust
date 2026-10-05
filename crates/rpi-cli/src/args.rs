@@ -193,13 +193,11 @@ pub struct Args {
     /// directory (repeated).
     pub prompt_template: Vec<PathBuf>,
 
-    /// `--local-only`: skip automatic extension discovery and load only what
-    /// the caller points at. Extensions come solely from `--extensions-dir`
-    /// and `--extension`/`-e`; skills/prompts fall back to project dirs plus
-    /// explicit `--skill`/`--prompt-template` paths. Also set internally by
-    /// `rpi dev-local` / `rpi dev --local-only` to scope the staged
-    /// development extension.
+    /// `--local-only`: load only explicitly supplied extension paths.
     pub dev_local_only: bool,
+    /// `--package-only` / `--project-only`: load project resources and
+    /// extensions from the active project's settings, excluding global ones.
+    pub project_only: bool,
 
     pub verbose: bool,
     pub help: bool,
@@ -376,6 +374,7 @@ pub fn parse_args(args: &[String]) -> Args {
             "--no-context-files" | "-nc" => result.no_context_files = true,
             "--no-extensions" | "-ne" => result.no_extensions = true,
             "--local-only" => result.dev_local_only = true,
+            "--package-only" | "--project-only" => result.project_only = true,
             "--extensions-dir" | "-ed" => {
                 if let Some(v) = take_value(&mut result, &flag_key) {
                     result.extensions_dir.push(PathBuf::from(v));
@@ -638,6 +637,8 @@ pub fn print_help() {
   --local-only                   Skip automatic extension discovery: load only
                                  --extensions-dir / --extension paths (no project
                                  .rpi/extensions, no global extensions)
+  --package-only, --project-only Load project skills/prompts/extensions/packages
+                                 from the active project; exclude global resources
   --debug-system-prompt          Print the resolved system-prompt sections to stderr (verification)
   --verbose                      Show startup warnings (e.g. ignored flags)
   --help, -h                     Show this help
@@ -996,6 +997,16 @@ mod tests {
         assert!(a.errors.is_empty());
         assert!(a.dev_local_only);
         assert!(a.ignored.is_empty());
+    }
+
+    #[test]
+    fn project_only_aliases_are_honored() {
+        for flag in ["--package-only", "--project-only"] {
+            let a = parse_args(&s(&[flag]));
+            assert!(a.errors.is_empty());
+            assert!(a.project_only);
+            assert!(a.ignored.is_empty());
+        }
     }
 
     #[test]

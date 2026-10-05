@@ -326,6 +326,10 @@ pub fn extension_dirs(cwd: &Path) -> Vec<PathBuf> {
     dirs
 }
 
+pub fn project_extension_dirs(cwd: &Path) -> Vec<PathBuf> {
+    project_resource_dirs(cwd, "extensions", ResourceKind::Extensions)
+}
+
 pub fn global_extension_dirs() -> Vec<PathBuf> {
     global_resource_dirs("extensions", ResourceKind::Extensions)
 }
