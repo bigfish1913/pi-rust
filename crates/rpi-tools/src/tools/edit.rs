@@ -74,7 +74,7 @@ impl EditTool {
         let params = schemars::schema_for!(EditInput);
         Tool {
             name: "edit".to_string(),
-            description: "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. Each edit is matched against the same original file snapshot, not incrementally after earlier edits. Do not include overlapping or nested edits. If two changes affect the same block or nearby lines, merge them into one edit. Keep oldText as small as possible while still being unique; do not use a short identifier that appears multiple times. Use camelCase oldText/newText fields.".to_string(),
+            description: "Edit a single file using exact text replacement. Before editing, use read to inspect the current target region and copy oldText from that output, preserving whitespace and excluding display line numbers or truncation markers. If matching fails, read the target region again and rebuild the edit from the current content before retrying. Every edits[].oldText must match a unique, non-overlapping region of the original file. Each edit is matched against the same original file snapshot, not incrementally after earlier edits. Do not include overlapping or nested edits. If two changes affect the same block or nearby lines, merge them into one edit. Keep oldText as small as possible while still being unique; do not use a short identifier that appears multiple times. Use camelCase oldText/newText fields.".to_string(),
             parameters: rpi_ai::types::Schema::new(
                 serde_json::to_value(params).unwrap_or_default(),
             ),
