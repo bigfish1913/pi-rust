@@ -1026,6 +1026,9 @@ pub async fn interactive_tui(
     // ---- Footer + status ----
     let footer = Arc::new(FooterComponent::new());
     footer.set_model(&model_name);
+    if let Ok(level) = lane.get_thinking_level().await {
+        footer.set_thinking_level(Some(thinking_level_name(level)));
+    }
     footer.set_cwd(&cwd.to_string_lossy());
     footer.set_git_branch(git_branch_for(&cwd).as_deref());
     if let Some(m) = model_catalog.iter().find(|m| m.id == lane_model_id) {
