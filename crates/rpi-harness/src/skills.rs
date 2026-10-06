@@ -18,7 +18,7 @@
 //! `.ignore` / `.fdignore` via an `ignore`-pattern matcher (hand-ported; no
 //! `ignore` crate dep).
 //!
-//! v1 divergences from TS (see `docs/m5e-open-questions.md`):
+//! v1 divergences from TS (see the initial port notes (retired)):
 //! - Malformed frontmatter yields a `parse_failed` diagnostic, matching TS.
 //! - `loadSourcedSkills` is ported as a generic helper where the caller owns
 //!   the source type (Rust has no TS variadic generics); the `mapSkill` hook is

@@ -187,11 +187,11 @@ rpi 是 Rust 原生、library-first 的 coding-agent runtime，MIT 许可，九�
 
 - GitHub：https://github.com/bigfish1913/pi-rust
 - 官网 / 文档：https://rpi.laofu.online/
-- 架构文档：https://github.com/bigfish1913/pi-rust/blob/main/docs/architecture.md
+- 架构文档：https://github.com/bigfish1913/pi-rust/blob/main/docs/architecture/overview.md
 - 自己搭 agent 的项目结构建议：
-  https://github.com/bigfish1913/pi-rust/blob/main/docs/agent-project.md
+  https://github.com/bigfish1913/pi-rust/blob/main/docs/agent/project-structure.md
 - 与原生 TypeScript 版的实测对比：
-  https://github.com/bigfish1913/pi-rust/blob/main/docs/performance-vs-pi.md
+  https://github.com/bigfish1913/pi-rust/blob/main/docs/performance/benchmark-vs-pi.md
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/bigfish1913/pi-rust/main/scripts/install.sh | sh

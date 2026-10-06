@@ -11,7 +11,7 @@
 //!   run each, print the assistant text, loop until EOF / `/exit`. v1 does NOT
 //!   port the TS `InteractiveMode` TUI (`modes/interactive/*` — a full terminal
 //!   UI with Ink/React components); this is a deliberately minimal replacement,
-//!   documented in `docs/m6-cli-open-questions.md`.
+//!   documented in the initial port notes (retired).
 //!
 //! All three drive the same `AgentHarness` via `AgentLane::prompt_text`.
 
@@ -505,6 +505,9 @@ fn agent_event_json(event: &AgentEvent) -> serde_json::Value {
 /// payload's key fields).
 fn emit_json_event(event: &HarnessEvent) {
     let line = match event {
+        HarnessEvent::CompactionProgress(e) => {
+            serde_json::json!({ "type": "compaction_progress", "lane": e.lane, "manual": e.manual, "active": e.active })
+        }
         HarnessEvent::RunStart(e) => serde_json::json!({
             "type": "run_start",
             "lane": e.lane,
@@ -536,7 +539,7 @@ fn run_end_outcome_str(o: RunEndOutcome) -> &'static str {
 ///
 /// `model_catalog` is the resolved provider's full model list, passed through
 /// so the TUI's `/model` selector can display available models (read-only —
-/// v1 does not switch models mid-session; see `docs/m6-cli-open-questions.md`).
+/// v1 does not switch models mid-session; see the initial port notes (retired)).
 pub async fn interactive(
     harness: &AgentHarness,
     event_rx: Option<tokio::sync::broadcast::Receiver<rpi_agent::AgentEvent>>,

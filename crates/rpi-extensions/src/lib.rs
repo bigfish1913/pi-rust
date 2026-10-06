@@ -61,8 +61,8 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
 use rpi_plugin_sdk::{
-    BeforeAgentStartFn, EventHandlerFn, EventTag, FreeStringFn, ProviderRequestFn, RenderFn,
-    ResourcesDiscoverFn, RuntimeActionFn, StablePluginEvent, StableToolSchema, StbString,
+    BeforeAgentStartFn, EventHandlerFn, EventTag, FreeStringFn, OAuthRequestFn, ProviderRequestFn,
+    RenderFn, ResourcesDiscoverFn, RuntimeActionFn, StablePluginEvent, StableToolSchema, StbString,
     StbStringRef, ToolCancelFn, ToolDestroyFn, ToolExecuteFn, ToolPollFn,
 };
 use thiserror::Error;
@@ -77,14 +77,18 @@ pub use loader::{
     load_dir, load_one, load_session, load_session_mixed, merge_registries, ExtensionSession,
     LoadedPlugin, PluginKeepalive, PluginLoadError,
 };
+pub use oauth::{
+    list as list_oauth_providers, request as request_oauth, OAuthActionResponse,
+    OAuthExtensionError, OAuthProviderInfo, OAuthResponseKind,
+};
 pub use prompt_transform::emit_before_agent_start;
 pub use provider::PluggableProvider;
 pub use provider_hooks::ExtensionProviderHooks;
 pub use registry::{
     assert_active, current_platform, platform_allows, BeforeAgentStartHandler, ExtensionRegistry,
-    ExtensionTool, RegisteredFlag, RegisteredHandler, RegisteredProvider, RegisteredRenderer,
-    RegisteredRendererKind, RegisteredShortcut, RegistryEntry, RegistrySnapshot,
-    ResourcesDiscoverHandler, DEFAULT_PRIORITY,
+    ExtensionTool, RegisteredFlag, RegisteredHandler, RegisteredOAuthProvider, RegisteredProvider,
+    RegisteredRenderer, RegisteredRendererKind, RegisteredShortcut, RegistryEntry,
+    RegistrySnapshot, ResourcesDiscoverHandler, DEFAULT_PRIORITY,
 };
 pub use resources::{emit_resources_discover, DiscoveredResources};
 pub use status::ExtensionStatusMailbox;
@@ -98,6 +102,7 @@ mod actions;
 mod editor_text;
 mod event_log;
 mod loader;
+mod oauth;
 mod prompt_transform;
 mod provider;
 mod provider_hooks;
@@ -291,6 +296,7 @@ impl HostApi {
             // Appended last so `struct_size` grows without shifting any earlier
             // offset (a plugin built against the previous layout keeps working).
             register_before_agent_start: Some(trampoline_register_before_agent_start),
+            register_oauth_provider: Some(trampoline_register_oauth_provider),
             runtime_action: runtime_action_fn,
             dispatch_event: Some(trampoline_dispatch_event),
             user_data: ud,
@@ -572,6 +578,34 @@ extern "C" fn trampoline_register_provider(
         0
     } else {
         -1
+    }
+}
+
+/// Register an OAuth provider manifest and action callback. The manifest is
+/// copied immediately; token-bearing responses remain plugin-owned and are
+/// reclaimed through the plugin free function when invoked by a future host
+/// OAuth bridge.
+extern "C" fn trampoline_register_oauth_provider(
+    manifest_json: StbStringRef,
+    request_fn: OAuthRequestFn,
+    plugin_free_string: FreeStringFn,
+    user_data: *mut c_void,
+) -> i32 {
+    if !current_api_present() {
+        return -1;
+    }
+    let manifest = unsafe { manifest_json.as_str().to_string() };
+    let record = crate::registry::RegisteredOAuthProvider {
+        plugin: with_current_api(|api| api.name.clone()).unwrap_or_default(),
+        manifest_json: manifest,
+        request_fn,
+        plugin_free_string,
+        user_data,
+    };
+    match with_current_api(|api| api.with_registry(|reg| reg.register_oauth_provider(record))) {
+        Some(Some(true)) => 1,
+        Some(Some(false)) => 0,
+        _ => -1,
     }
 }
 

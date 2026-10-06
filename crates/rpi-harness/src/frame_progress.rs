@@ -29,7 +29,7 @@
 //!
 //! Before this, a run persisted nothing until it finished, so a crash after 14
 //! minutes of work left only the user's prompt. See
-//! `docs/llm-repetition-forensics.md` §十一.
+//! `docs/debugging/llm-repetition-forensics.md` §十一.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};

@@ -689,8 +689,10 @@ impl Default for EventEmpty {
     }
 }
 
-/// A serialized message payload (`message_start`/`update`/`end`, tool-result
-/// messages). `message` is a JSON `AgentMessage`.
+/// A serialized message lifecycle payload (`message_start`/`message_update`/
+/// `message_end`). `message` is JSON. For `message_update`, it follows native
+/// Pi's envelope and carries `assistantMessageEvent`; streaming consumers must
+/// read its real `text_delta.delta` instead of diffing a cumulative snapshot.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct EventMessage {
@@ -980,6 +982,9 @@ pub enum RuntimeActionId {
     /// `{"ok":true,"chars":N}`. A headless host has no editor and accepts the
     /// write without rendering it, mirroring [`RuntimeActionId::SetStatus`].
     SetEditorText = 19,
+    /// Return the current session branch entries oldest-first as JSON.
+    /// Args: `{}`; result: `{"entries":[...]}`.
+    GetSessionBranch = 20,
 }
 
 /// Error returned when a plugin passes a numeric runtime-action id that this
@@ -1020,6 +1025,7 @@ impl TryFrom<u32> for RuntimeActionId {
             17 => Ok(Self::UiDialog),
             18 => Ok(Self::SetStatus),
             19 => Ok(Self::SetEditorText),
+            20 => Ok(Self::GetSessionBranch),
             other => Err(UnknownRuntimeActionId(other)),
         }
     }
@@ -1071,6 +1077,18 @@ pub type RenderFn =
 /// The host wraps this into a `Provider` impl (B4/B5).
 pub type ProviderRequestFn =
     extern "C" fn(req_json: StbStringRef, out: *mut StbString, user_data: *mut c_void) -> i32;
+
+/// OAuth provider callback. The host sends a JSON action envelope and the
+/// plugin returns a JSON response. Actions are `begin`, `exchange`,
+/// `refresh`, and `revoke`; token material remains plugin-owned and is never
+/// placed in normal agent events.
+pub type OAuthRequestFn =
+    extern "C" fn(req_json: StbStringRef, out: *mut StbString, user_data: *mut c_void) -> i32;
+
+/// Register an OAuth provider using a JSON manifest plus one action callback.
+/// The manifest is copied by the host and should include `id`, `displayName`,
+/// `scopes`, `supportsPkce`, and optional `capabilities`.
+pub type OAuthRegisterFn = OAuthRequestFn;
 
 // ---------------------------------------------------------------------------
 // Unified ABI — single struct, version inside
@@ -1198,6 +1216,17 @@ pub struct PluginApi {
     pub register_before_agent_start: Option<
         extern "C" fn(
             handler: BeforeAgentStartFn,
+            plugin_free_string: FreeStringFn,
+            user_data: *mut c_void,
+        ) -> i32,
+    >,
+
+    /// Register a provider-owned OAuth flow. Appended for ABI compatibility;
+    /// older plugins compiled against a shorter struct remain valid.
+    pub register_oauth_provider: Option<
+        extern "C" fn(
+            manifest_json: StbStringRef,
+            request_fn: OAuthRequestFn,
             plugin_free_string: FreeStringFn,
             user_data: *mut c_void,
         ) -> i32,
@@ -1547,6 +1576,7 @@ mod tests {
             user_data: core::ptr::null_mut(),
             declare: None,
             register_before_agent_start: None,
+            register_oauth_provider: None,
         };
         // All optional slots are null → plugin must degrade.
         assert!(api.register_tool.is_none());
@@ -1619,6 +1649,7 @@ mod tests {
             RuntimeActionId::UiDialog,
             RuntimeActionId::SetStatus,
             RuntimeActionId::SetEditorText,
+            RuntimeActionId::GetSessionBranch,
         ];
 
         for (raw, expected) in ids.into_iter().enumerate() {
@@ -1628,8 +1659,8 @@ mod tests {
         // One past the highest defined id is rejected (nothing is silently
         // accepted), and so is the u32 ceiling.
         assert_eq!(
-            RuntimeActionId::try_from(20),
-            Err(UnknownRuntimeActionId(20))
+            RuntimeActionId::try_from(21),
+            Err(UnknownRuntimeActionId(21))
         );
         assert_eq!(
             RuntimeActionId::try_from(u32::MAX),
@@ -1658,6 +1689,7 @@ mod tests {
             user_data: core::ptr::null_mut(),
             declare: None,
             register_before_agent_start: None,
+            register_oauth_provider: None,
         };
         assert_eq!(RPI_PLUGIN_ABI_VERSION_UNIFIED, 4);
 

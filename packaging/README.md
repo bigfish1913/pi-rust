@@ -25,7 +25,7 @@ has open, which is traffic the website cannot reach.
 
 The whole pipeline — bump, tag, wait for the release binaries, refresh every
 manifest below, push the taps, open the winget PR, publish to crates.io, deploy
-the site — is one command; see [`docs/releasing.md`](../docs/releasing.md):
+the site — is one command; see [`docs/maintaining/releasing.md`](../docs/maintaining/releasing.md):
 
 ```bash
 task publish                 # auto-increments the version
@@ -41,10 +41,10 @@ the binary at the archive root** and a `.sha256` beside every archive:
 
 | Target | Asset | sha256 (v0.3.2) |
 | --- | --- | --- |
-| `x86_64-unknown-linux-gnu` | `rpi-v0.3.2-x86_64-unknown-linux-gnu.tar.gz` | `326149d98c50e236d1b959cf1cb58b503c160338d3f6087b5c5fe7b6a9d2593e` |
-| `aarch64-unknown-linux-gnu` | `rpi-v0.3.2-aarch64-unknown-linux-gnu.tar.gz` | `fe2cfedf76d25bb8dfb0455838b52da83f13d2dbfbb5c6e45dcc3e7a418bf30e` |
-| `aarch64-apple-darwin` | `rpi-v0.3.2-aarch64-apple-darwin.tar.gz` | `590f85722b9aab48fdbbc73188658df08a58893bbcae8f26b3f76b86873d6898` |
-| `x86_64-pc-windows-msvc` | `rpi-v0.3.2-x86_64-pc-windows-msvc.zip` | `7399754258762f599e22327eaf8687de44f38755d496436d7ff1fddd4d043ba8` |
+| `x86_64-unknown-linux-gnu` | `rpi-v0.3.2-x86_64-unknown-linux-gnu.tar.gz` | `c7b82a4e8f3b001bce03909cce573dfd834b667b0d885ea3d65ba63588fce082` |
+| `aarch64-unknown-linux-gnu` | `rpi-v0.3.2-aarch64-unknown-linux-gnu.tar.gz` | `b4cce9da5db9f72c41870e4cce85a6a54c21b1cb4b4f0bc8d55da6b2c441a5c3` |
+| `aarch64-apple-darwin` | `rpi-v0.3.2-aarch64-apple-darwin.tar.gz` | `62b02ebb6cbb158ef0bba0fd27430030ed23759c9affabb846abec33a5d39b42` |
+| `x86_64-pc-windows-msvc` | `rpi-v0.3.2-x86_64-pc-windows-msvc.zip` | `d0debe018560def9176b75c9b9299312db0eed4342f0dc389b6a0785b53e31c8` |
 
 Two consequences worth knowing:
 
@@ -60,7 +60,7 @@ Two consequences worth knowing:
 networks (this machine included), so use `gh`, which goes through the API:
 
 ```bash
-TAG=v0.3.12                      # the tag being packaged
+TAG=v0.3.16                      # the tag being packaged
 gh release download "$TAG" --pattern "*.sha256" --dir /tmp/rpi-sha --clobber
 cat /tmp/rpi-sha/*.sha256
 ```

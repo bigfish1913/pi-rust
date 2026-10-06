@@ -8,7 +8,7 @@
 //! `${@:N:L}`) via [`substitute_args`].
 //!
 //! The TS `yaml` parse is replaced by the shared minimal YAML-subset parser
-//! ([`crate::frontmatter::parse_frontmatter`]); see `docs/m5e-open-questions.md`.
+//! ([`crate::frontmatter::parse_frontmatter`]); see the initial port notes (retired).
 
 use std::sync::Arc;
 

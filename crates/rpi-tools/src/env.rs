@@ -87,7 +87,17 @@ pub struct ShellOutput {
 /// Mirrors TS `ShellExecOptions` (note: `timeout` is in **seconds**, matching
 /// the TS contract). `on_stdout` / `on_stderr` fire per chunk, interleaved in
 /// arrival order; the bash-tool wraps these with throttling + capture.
+#[derive(Clone, Debug)]
+pub struct ShellOverride {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+}
+
 pub struct ShellExecOptions<'a> {
+    /// Optional executable and fixed arguments. `None` keeps the environment's
+    /// default shell (Bash on POSIX/Windows), while tools such as PowerShell
+    /// can select their native interpreter without going through Bash.
+    pub shell: Option<ShellOverride>,
     pub cwd: Option<PathBuf>,
     pub env: Option<HashMap<String, String>>,
     /// Default `true`. When `false`, ONLY `env` is used (no process env, no
@@ -103,6 +113,7 @@ pub struct ShellExecOptions<'a> {
 impl<'a> Default for ShellExecOptions<'a> {
     fn default() -> Self {
         Self {
+            shell: None,
             cwd: None,
             env: None,
             inherit_env: true,

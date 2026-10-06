@@ -4,22 +4,23 @@
 //!
 //! v1 ships three actions:
 //!
-//! - `rpi auth login`  — prompt (no echo, via `rpassword`) for an Anthropic API
-//!   key and persist it to `~/.rpi/auth.json` (atomic write + 0o600 on Unix).
+//! - `rpi auth login`  — legacy API-key prompt (no echo, via `rpassword`) for
+//!   the default provider and persist it to `~/.rpi/auth.json`.
 //!   Mirrors the upstream `/login` TUI's `type:"secret"` prompt + `modify`.
 //! - `rpi auth check`  — local-only probe of `auth.json` + the `ANTHROPIC_*`
 //!   env vars; reports `ready`/`not_ready` (no network call — the upstream
 //!   `--no-refresh` equivalent). `--json` emits a structured result.
-//! - `rpi auth logout` — drop the `anthropic` entry from `auth.json` (env vars
-//!   are left untouched, matching upstream `/logout` semantics).
+//! - `rpi auth logout` — drop the selected provider entry from `auth.json`
+//!   (env vars are left untouched).
 //!
-//! # Not ported (deferred — see `docs/m6-cli-open-questions.md`)
+//! # Not ported (deferred — see the initial port notes (retired))
 //!
-//! OAuth device-code login (Claude Pro/Max subscriptions), the full TUI
-//! `--provider` picker, and `auth print-api-key`/`print-bearer-token`. Only
-//! the `anthropic` provider id is handled.
+//! Provider-specific OAuth implementations belong in extensions. The host only
+//! understands the standard OAuth action response and scoped credential format.
 
 use std::collections::BTreeMap;
+use std::io::{self, Write};
+use std::sync::Arc;
 
 use crate::config::{
     self, delete_credential, read_auth, upsert_credential, Credential, DEFAULT_PROVIDER_ID,
@@ -34,11 +35,21 @@ const EXIT_ERROR: i32 = 2;
 /// subcommand + its flags). Returns the process exit code. Async to match the
 /// `app::run` shape, though v1 does no async work here.
 pub async fn run(args: &[String]) -> i32 {
+    run_with_extensions(args, None).await
+}
+
+/// Run auth with an optional extension snapshot. The caller must keep the
+/// matching extension session alive until this future completes.
+pub async fn run_with_extensions(
+    args: &[String],
+    snapshot: Option<Arc<rpi_extensions::RegistrySnapshot>>,
+) -> i32 {
     let sub = args.first().map(|s| s.as_str()).unwrap_or("");
     match sub {
-        "login" => run_login(&args[1..]).await,
-        "check" => run_check(&args[1..]).await,
-        "logout" => run_logout(&args[1..]).await,
+        "login" => run_login(&args[1..], snapshot.as_ref()).await,
+        "check" | "status" => run_check(&args[1..]).await,
+        "refresh" => run_refresh(&args[1..], snapshot.as_ref()).await,
+        "logout" => run_logout(&args[1..], snapshot.as_ref()).await,
         "--help" | "-h" | "help" | "" => {
             print_auth_help();
             0
@@ -53,15 +64,19 @@ pub async fn run(args: &[String]) -> i32 {
 }
 
 /// `rpi auth login [--provider <id>]` — prompt for a key and persist it.
-async fn run_login(args: &[String]) -> i32 {
+async fn run_login(
+    args: &[String],
+    snapshot: Option<&Arc<rpi_extensions::RegistrySnapshot>>,
+) -> i32 {
     let provider = parse_provider(args).unwrap_or(DEFAULT_PROVIDER_ID);
-    if provider != DEFAULT_PROVIDER_ID {
-        eprintln!(
-            "error: v1 only supports the \"{DEFAULT_PROVIDER_ID}\" provider for login (got \"{provider}\")"
-        );
-        return EXIT_ERROR;
+    if let Some(snapshot) = snapshot {
+        if snapshot.oauth_provider(provider).is_some() {
+            return run_oauth_login(provider, snapshot).await;
+        }
     }
-    eprint!("Enter Anthropic API key: ");
+    // Compatibility API-key login. This path is provider-neutral; OAuth
+    // behavior is supplied by the matching extension above.
+    eprint!("Enter API key for {provider}: ");
     let key = match rpassword::read_password() {
         Ok(k) => k,
         Err(e) => {
@@ -132,8 +147,106 @@ async fn run_check(args: &[String]) -> i32 {
 }
 
 /// `rpi auth logout [--provider <id>]` — drop the stored credential.
-async fn run_logout(args: &[String]) -> i32 {
+async fn run_refresh(
+    args: &[String],
+    snapshot: Option<&Arc<rpi_extensions::RegistrySnapshot>>,
+) -> i32 {
     let provider = parse_provider(args).unwrap_or(DEFAULT_PROVIDER_ID);
+    let Some(snapshot) = snapshot else {
+        eprintln!("error: no OAuth extensions are loaded");
+        return EXIT_ERROR;
+    };
+    let Some(Credential::Oauth {
+        access,
+        refresh,
+        expires,
+    }) = config::read_oauth_token(provider).ok().flatten()
+    else {
+        eprintln!("error: no stored OAuth credentials for \"{provider}\"");
+        return EXIT_NOT_READY;
+    };
+    let response = match rpi_extensions::request_oauth(
+        snapshot,
+        provider,
+        "refresh",
+        serde_json::json!({"credential": {"access": access, "refresh": refresh, "expires_at": expires}}),
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("error: OAuth refresh failed: {error}");
+            return EXIT_ERROR;
+        }
+    };
+    let response = match rpi_extensions::OAuthActionResponse::parse(response) {
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!("error: invalid OAuth refresh response: {error}");
+            return EXIT_ERROR;
+        }
+    };
+    let Some(token) = (match response.credential() {
+        Ok(token) => token,
+        Err(error) => {
+            eprintln!("error: invalid OAuth refresh credential: {error}");
+            return EXIT_ERROR;
+        }
+    }) else {
+        eprintln!("error: OAuth refresh returned no credential");
+        return EXIT_ERROR;
+    };
+    if let Err(error) =
+        config::upsert_oauth_token(provider, token.access, token.refresh, token.expires_at)
+    {
+        eprintln!("error: could not save refreshed OAuth credentials: {error}");
+        return EXIT_ERROR;
+    }
+    println!("OAuth credentials refreshed for \"{provider}\".");
+    0
+}
+
+async fn run_logout(
+    args: &[String],
+    snapshot: Option<&Arc<rpi_extensions::RegistrySnapshot>>,
+) -> i32 {
+    let provider = parse_provider(args).unwrap_or(DEFAULT_PROVIDER_ID);
+    if let Ok(Some(Credential::Oauth {
+        access, refresh, ..
+    })) = config::read_oauth_token(provider)
+    {
+        let Some(snapshot) = snapshot else {
+            eprintln!("error: cannot revoke OAuth credentials: no OAuth extensions are loaded");
+            return EXIT_ERROR;
+        };
+        let response = match rpi_extensions::request_oauth(
+            snapshot,
+            provider,
+            "revoke",
+            serde_json::json!({"credential": {"access": access, "refresh": refresh}}),
+        ) {
+            Ok(response) => response,
+            Err(error) => {
+                eprintln!("error: OAuth revoke failed; local credentials were kept: {error}");
+                return EXIT_ERROR;
+            }
+        };
+        match rpi_extensions::OAuthActionResponse::parse(response) {
+            Ok(response) if response.kind == rpi_extensions::OAuthResponseKind::Success => {}
+            Ok(_) => {
+                eprintln!(
+                    "error: OAuth revoke did not return success; local credentials were kept"
+                );
+                return EXIT_ERROR;
+            }
+            Err(error) => {
+                eprintln!(
+                    "error: invalid OAuth revoke response; local credentials were kept: {error}"
+                );
+                return EXIT_ERROR;
+            }
+        }
+        /*
+         */
+    }
     match delete_credential(provider) {
         Ok(true) => {
             println!("Removed stored credentials for \"{provider}\".");
@@ -153,6 +266,80 @@ async fn run_logout(args: &[String]) -> i32 {
 /// Pull the `--provider <id>` value from a subcommand's args (defaults to
 /// `None`). Mirrors the TS `--provider` handshake before it falls back to the
 /// default.
+async fn run_oauth_login(provider: &str, snapshot: &Arc<rpi_extensions::RegistrySnapshot>) -> i32 {
+    let mut input = serde_json::json!({});
+    let mut action = "begin";
+    loop {
+        let raw = match rpi_extensions::request_oauth(snapshot, provider, action, input) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("error: OAuth {action} failed: {error}");
+                return EXIT_ERROR;
+            }
+        };
+        let response = match rpi_extensions::OAuthActionResponse::parse(raw) {
+            Ok(response) => response,
+            Err(error) => {
+                eprintln!("error: invalid OAuth response: {error}");
+                return EXIT_ERROR;
+            }
+        };
+        match response.kind {
+            rpi_extensions::OAuthResponseKind::Credential => {
+                let Some(token) = response.credential().ok().flatten() else {
+                    eprintln!("error: OAuth response contained no valid credential");
+                    return EXIT_ERROR;
+                };
+                if let Err(error) = config::upsert_oauth_token(
+                    provider,
+                    token.access,
+                    token.refresh,
+                    token.expires_at,
+                ) {
+                    eprintln!("error: could not save OAuth credentials: {error}");
+                    return EXIT_ERROR;
+                }
+                println!("OAuth credentials saved for \"{provider}\".");
+                return 0;
+            }
+            rpi_extensions::OAuthResponseKind::Error => {
+                eprintln!("error: OAuth provider rejected the request");
+                return EXIT_ERROR;
+            }
+            rpi_extensions::OAuthResponseKind::Success => {
+                eprintln!("error: OAuth login completed without credentials");
+                return EXIT_ERROR;
+            }
+            rpi_extensions::OAuthResponseKind::Interaction => {
+                let display = response.payload.get("display").unwrap_or(&response.payload);
+                if let Some(title) = display.get("title").and_then(serde_json::Value::as_str) {
+                    println!("{title}");
+                }
+                if let Some(url) = display.get("url").and_then(serde_json::Value::as_str) {
+                    println!("{url}");
+                }
+                if let Some(instructions) = display
+                    .get("instructions")
+                    .and_then(serde_json::Value::as_array)
+                {
+                    for instruction in instructions.iter().filter_map(serde_json::Value::as_str) {
+                        println!("{instruction}");
+                    }
+                }
+                eprint!("OAuth input: ");
+                let _ = io::stderr().flush();
+                let mut line = String::new();
+                if io::stdin().read_line(&mut line).is_err() || line.trim().is_empty() {
+                    eprintln!("error: empty OAuth input; nothing saved.");
+                    return EXIT_ERROR;
+                }
+                input = serde_json::json!({"value": line.trim()});
+                action = "exchange";
+            }
+        }
+    }
+}
+
 fn parse_provider(args: &[String]) -> Option<&str> {
     let mut iter = args.iter();
     while let Some(a) = iter.next() {
@@ -169,7 +356,8 @@ fn parse_provider(args: &[String]) -> Option<&str> {
 
 /// Where a credential was found — used by `auth check` to report its source.
 enum CredentialSource {
-    StoredFile,
+    StoredApiKey,
+    StoredOauth,
     ModelsJson,
     EnvApiKey,
     EnvAuthTToken,
@@ -183,7 +371,8 @@ impl CredentialSource {
     }
     fn as_json_str(&self) -> &'static str {
         match self {
-            CredentialSource::StoredFile => "auth.json",
+            CredentialSource::StoredApiKey => "auth.json",
+            CredentialSource::StoredOauth => "oauth",
             CredentialSource::ModelsJson => "models.json",
             CredentialSource::EnvApiKey => "ANTHROPIC_API_KEY",
             CredentialSource::EnvAuthTToken => "ANTHROPIC_AUTH_TOKEN",
@@ -193,7 +382,8 @@ impl CredentialSource {
     }
     fn as_display(&self) -> Option<&'static str> {
         match self {
-            CredentialSource::StoredFile => Some("key in ~/.rpi/auth.json"),
+            CredentialSource::StoredApiKey => Some("key in ~/.rpi/auth.json"),
+            CredentialSource::StoredOauth => Some("OAuth token in ~/.rpi/auth.json"),
             CredentialSource::ModelsJson => Some("apiKey in ~/.rpi/agent/models.json"),
             CredentialSource::EnvApiKey => Some("ANTHROPIC_API_KEY env var"),
             CredentialSource::EnvAuthTToken => Some("ANTHROPIC_AUTH_TOKEN env var"),
@@ -208,17 +398,30 @@ impl CredentialSource {
 /// the CLI layer; here we probe file + env only).
 fn detect_credential(provider: &str) -> CredentialSource {
     if let Ok(store) = read_auth() {
-        if matches!(store.get(provider), Some(Credential::ApiKey { key: Some(k), .. }) if !k.is_empty())
-            || matches!(
-                store.get(provider),
-                Some(Credential::ApiKey {
-                    key: None,
-                    env: Some(_env),
-                    ..
-                })
-            )
-        {
-            return CredentialSource::StoredFile;
+        match store.get(provider) {
+            Some(Credential::ApiKey { key: Some(k), .. }) if !k.is_empty() => {
+                return CredentialSource::StoredApiKey;
+            }
+            Some(Credential::ApiKey {
+                key: None,
+                env: Some(_),
+                ..
+            }) => {
+                return CredentialSource::StoredApiKey;
+            }
+            Some(Credential::Oauth {
+                access, expires, ..
+            }) if !access.is_empty()
+                && (*expires == 0
+                    || *expires
+                        > std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|duration| duration.as_secs() as i64)
+                            .unwrap_or(i64::MAX)) =>
+            {
+                return CredentialSource::StoredOauth;
+            }
+            _ => {}
         }
     }
     let configured = config::load_models_config().ok().and_then(|models| {
@@ -279,9 +482,11 @@ fn print_auth_help() {
 Manage persisted credentials and inspect models.json provider authentication.
 
 Subcommands:
-  login   Prompt for an API key and save it (input is not echoed).
+  login   Prompt for an API key, or run an OAuth provider login.
   check   Report whether credentials are available (no network call).
-  logout  Remove the stored credential.
+  status  Alias for check; never prints token material.
+  refresh Refresh an OAuth token through its provider extension.
+  logout  Revoke OAuth credentials, then remove the stored credential.
 
 Options:
   --provider <id>   Provider id (default: anthropic)
@@ -293,8 +498,11 @@ Environment:
   OPENAI_API_KEY         Fallback bearer token for openai-completions.
 
 Notes:
-  `login` stores Anthropic credentials. OpenAI-compatible providers normally
-  store apiKey in ~/.rpi/agent/models.json. OAuth remains deferred.
+  `login --provider <id>` uses the registered OAuth extension when one exists;
+  otherwise it is a provider-neutral API-key compatibility prompt. The host
+  only handles standard interaction and credential responses for OAuth.
+  `refresh` and `logout` use extension actions. API-key providers may still
+  use ~/.rpi/agent/models.json or environment variables.
 ",
         name = crate::APP_NAME
     );
@@ -368,6 +576,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn standard_oauth_credential_response_is_parsed() {
+        let response = rpi_extensions::OAuthActionResponse::parse(serde_json::json!({
+            "version": 1,
+            "kind": "credential",
+            "payload": {
+                "access": "access",
+                "refresh": "refresh",
+                "expires_at": 123
+            }
+        }))
+        .unwrap();
+        let credential = response.credential().unwrap().unwrap();
+        assert_eq!(credential.access, "access");
+        assert_eq!(credential.refresh, "refresh");
+        assert_eq!(credential.expires_at, 123);
+    }
+
     #[tokio::test]
     async fn check_not_ready_with_no_credentials() {
         let _cfg = TempConfig::new();
@@ -388,6 +614,32 @@ mod tests {
         .unwrap();
         let code = run_check(&[]).await;
         assert_eq!(code, 0);
+    }
+
+    #[tokio::test]
+    async fn check_ready_with_oauth_credential() {
+        let _cfg = TempConfig::new();
+        crate::config::upsert_oauth_token(
+            DEFAULT_PROVIDER_ID,
+            "access".into(),
+            "refresh".into(),
+            0,
+        )
+        .unwrap();
+        assert_eq!(run_check(&[]).await, 0);
+    }
+
+    #[tokio::test]
+    async fn check_rejects_expired_oauth_credential() {
+        let _cfg = TempConfig::new();
+        crate::config::upsert_oauth_token(
+            DEFAULT_PROVIDER_ID,
+            "access".into(),
+            "refresh".into(),
+            1,
+        )
+        .unwrap();
+        assert_eq!(run_check(&[]).await, EXIT_NOT_READY);
     }
 
     #[tokio::test]
@@ -439,7 +691,7 @@ mod tests {
         )
         .unwrap();
         assert!(auth_path().unwrap().exists());
-        let code = run_logout(&[]).await;
+        let code = run_logout(&[], None).await;
         assert_eq!(code, 0);
         // The entry should be gone → check is now not_ready.
         assert_eq!(run_check(&[]).await, EXIT_NOT_READY);
@@ -448,7 +700,7 @@ mod tests {
     #[tokio::test]
     async fn logout_when_empty_is_noop() {
         let _cfg = TempConfig::new();
-        let code = run_logout(&[]).await;
+        let code = run_logout(&[], None).await;
         assert_eq!(code, 0);
     }
 

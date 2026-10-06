@@ -148,7 +148,7 @@ including one test per crash point.
 ## Documentation
 
 - Crate docs: <https://docs.rs/rpi-harness>
-- Design notes: [docs/architecture.md](https://github.com/bigfish1913/pi-rust/blob/main/docs/architecture.md)
+- Design notes: [docs/architecture/overview.md](https://github.com/bigfish1913/pi-rust/blob/main/docs/architecture/overview.md)
 
 ## License
 

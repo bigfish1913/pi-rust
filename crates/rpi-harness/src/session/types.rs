@@ -799,7 +799,7 @@ impl StepAttemptRecord {
 /// than the branch, so they can never appear in the branch path the model's
 /// context is built from. Mirrors upstream's `pendingAssistantFrames` list
 /// storage, adapted to rpi's append-only record log — see
-/// `docs/llm-repetition-forensics.md` §十一.
+/// `docs/debugging/llm-repetition-forensics.md` §十一.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AssistantFrameRecord {

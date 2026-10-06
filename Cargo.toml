@@ -1,4 +1,4 @@
-# rpi — a Rust agent runtime + CLI. See README.md and docs/architecture.md.
+# rpi — a Rust agent runtime + CLI. See README.md and docs/architecture/overview.md.
 [workspace]
 members = [
     "crates/rpi-telemetry",
@@ -29,7 +29,7 @@ rust-version = "1.78"
 license = "MIT"
 repository = "https://github.com/bigfish1913/pi-rust"
 homepage = "https://rpi.laofu.online/"
-version = "0.3.12"
+version = "0.3.16"
 authors = ["BigFish <bigfish1913@gmail.com>"]
 
 [workspace.dependencies]
@@ -70,16 +70,16 @@ dirs = "5"
 rpassword = "7"
 
 # rpi internal crates (package names and directories both use the `rpi-` prefix).
-rpi-telemetry = { path = "crates/rpi-telemetry", version = "0.3.12" }
-rpi-ai = { path = "crates/rpi-ai", version = "0.3.12" }
-rpi-agent = { path = "crates/rpi-agent", version = "0.3.12" }
-rpi-tools = { path = "crates/rpi-tools", version = "0.3.12" }
-rpi-harness = { path = "crates/rpi-harness", version = "0.3.12" }
+rpi-telemetry = { path = "crates/rpi-telemetry", version = "0.3.16" }
+rpi-ai = { path = "crates/rpi-ai", version = "0.3.16" }
+rpi-agent = { path = "crates/rpi-agent", version = "0.3.16" }
+rpi-tools = { path = "crates/rpi-tools", version = "0.3.16" }
+rpi-harness = { path = "crates/rpi-harness", version = "0.3.16" }
 
-rpi-tui = { path = "crates/rpi-tui", version = "0.3.12" }
+rpi-tui = { path = "crates/rpi-tui", version = "0.3.16" }
 
-rpi-plugin-sdk = { path = "crates/rpi-plugin-sdk", version = "0.3.12" }
-rpi-extensions = { path = "crates/rpi-extensions", version = "0.3.12" }
+rpi-plugin-sdk = { path = "crates/rpi-plugin-sdk", version = "0.3.16" }
+rpi-extensions = { path = "crates/rpi-extensions", version = "0.3.16" }
 
 [profile.release]
 lto = "thin"

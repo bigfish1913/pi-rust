@@ -808,8 +808,16 @@ impl Shell for OsExecutionEnv {
             Some(c) => Self::resolve_path(&self.cwd, &c.to_string_lossy()),
             None => self.cwd.clone(),
         };
-        // Shell config.
-        let shell_cfg = self.get_shell_config().await?;
+        // Shell config. An explicit override is used by native shell tools
+        // such as PowerShell; otherwise preserve the default Bash behavior.
+        let shell_cfg = match &options.shell {
+            Some(override_shell) => ShellConfig {
+                shell: override_shell.program.clone(),
+                args: override_shell.args.clone(),
+                transport: CommandTransport::Argv,
+            },
+            None => self.get_shell_config().await?,
+        };
         // Verify cwd exists.
         if !cwd.exists() {
             return Err(ExecutionError::new(

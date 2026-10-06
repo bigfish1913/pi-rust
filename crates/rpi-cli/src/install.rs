@@ -961,10 +961,18 @@ fn parse_args(args: &[String]) -> Result<InstallOptions, String> {
         }
         i += 1;
     }
-    let package = package.ok_or_else(|| "missing crate name".to_string())?;
     if path.is_some() && version.is_some() {
         return Err("--path and --version cannot be used together".to_string());
     }
+    let package = match package {
+        Some(package) => package,
+        None => {
+            let path = path
+                .as_deref()
+                .ok_or_else(|| "missing crate name (or use --path <directory>)".to_string())?;
+            package_name_from_manifest(path)?
+        }
+    };
     if !valid_package_name(&package) {
         return Err(format!("invalid Cargo package name `{package}`"));
     }
@@ -984,6 +992,50 @@ fn value(args: &[String], index: usize, flag: &str) -> Result<String, String> {
         .ok_or_else(|| format!("{flag} requires a value"))
 }
 
+fn package_name_from_manifest(path: &Path) -> Result<String, String> {
+    let manifest = if path.is_dir() {
+        path.join("Cargo.toml")
+    } else {
+        path.to_path_buf()
+    };
+    let output = Command::new("cargo")
+        .args([
+            "metadata",
+            "--no-deps",
+            "--format-version",
+            "1",
+            "--manifest-path",
+        ])
+        .arg(&manifest)
+        .output()
+        .map_err(|error| format!("could not run cargo metadata: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "could not inspect {}: {}",
+            manifest.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let metadata: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("cargo metadata returned invalid JSON: {error}"))?;
+    let manifest = std::fs::canonicalize(&manifest)
+        .map_err(|error| format!("could not resolve {}: {error}", manifest.display()))?;
+    metadata
+        .get("packages")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|packages| {
+            packages.iter().find_map(|package| {
+                let package_manifest = package.get("manifest_path")?.as_str()?;
+                let package_manifest = std::fs::canonicalize(package_manifest).ok()?;
+                (package_manifest == manifest)
+                    .then(|| package.get("name")?.as_str().map(str::to_owned))
+                    .flatten()
+            })
+        })
+        .filter(|name| valid_package_name(name))
+        .ok_or_else(|| format!("{} has no valid [package].name", manifest.display()))
+}
+
 fn valid_package_name(name: &str) -> bool {
     !name.is_empty()
         && name
@@ -997,7 +1049,7 @@ fn help_requested() -> &'static str {
 
 pub fn print_help() {
     println!(
-        "Usage: rpi install <crate> [options]\n\nInstall an rpi Rust cdylib extension from crates.io.\n\nOptions:\n  --version <version>  Install a specific crates.io version\n  --path <directory>   Build a local extension crate\n  --locked             Require Cargo.lock to remain unchanged\n  --force, -f          Replace an existing installed extension\n  --help, -h           Show this help\n\nExamples:\n  rpi install rpi-extension-example\n  rpi install rpi-extension-example --version 0.1.0\n  rpi install my-extension --path ../my-rpi-extension --force"
+        "Usage: rpi install [<crate>] [options]\n\nInstall an rpi Rust cdylib extension from crates.io or a local Cargo crate.\n\nOptions:\n  --version <version>  Install a specific crates.io version\n  --path <directory>   Build a local extension crate; crate name may be omitted\n  --locked             Require Cargo.lock to remain unchanged\n  --force, -f          Replace an existing installed extension\n  --help, -h           Show this help\n\nExamples:\n  rpi install rpi-extension-example\n  rpi install rpi-extension-example --version 0.1.0\n  rpi install --path . --force\n  rpi install my-extension --path ../my-rpi-extension --force"
     );
 }
 
@@ -1210,6 +1262,14 @@ mod tests {
     fn parses_local_package() {
         let parsed = parse_args(&args(&["--path", "../extension", "my-extension"])).unwrap();
         assert_eq!(parsed.path, Some(PathBuf::from("../extension")));
+    }
+
+    #[test]
+    fn local_path_can_infer_package_name() {
+        let parsed = parse_args(&args(&["--path", ".", "--force"])).unwrap();
+        assert!(!parsed.package.is_empty());
+        assert!(valid_package_name(&parsed.package));
+        assert!(parsed.force);
     }
 
     #[test]

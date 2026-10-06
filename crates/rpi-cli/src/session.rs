@@ -58,7 +58,7 @@ use crate::provider::ResolvedModel;
 use crate::resource_dirs::{
     discover_append_system_prompt_file, discover_system_prompt_file, extension_dirs,
     global_extension_dirs, global_prompt_template_dirs, global_skill_dirs,
-    load_prompt_templates_with_precedence, load_skills_with_precedence,
+    load_prompt_templates_with_precedence, load_skills_with_precedence, project_extension_dirs,
     project_prompt_template_dirs, project_skill_dirs, prompt_template_dirs, skill_dirs,
 };
 use rpi_extensions::{
@@ -78,15 +78,15 @@ pub fn default_system_prompt(cwd: &str, prior_reasoning_replayed: bool) -> Strin
     // again, and claiming otherwise makes it re-derive and restate the plan
     // every turn — the re-plan symptom in `docs/llm-repetition-forensics.md`.
     let working_state_rule = if prior_reasoning_replayed {
-        "- Keep a SHORT working plan visible (a few bullets, or the todo tool) and update it as you go.  
-  Your own reasoning is carried back to you on the next turn, so do not re-derive it or restate  
-  the whole plan: continue from the last unfinished step, and when a step lands, say which one.  
+        "- Keep a SHORT working plan visible (a few bullets, or the todo tool) and update it as you go.
+  Your own reasoning is carried back to you on the next turn, so do not re-derive it or restate
+  the whole plan: continue from the last unfinished step, and when a step lands, say which one.
   Re-listing the same plan without acting on it is a bug, not progress."
     } else {
-        "- Keep your working state in your VISIBLE replies, not only in reasoning. Reasoning is not  
-  carried into your next turn: only the text you write and the tool output you produce come  
-  back. Before each batch of tool calls, write one short line naming the task you are on and  
-  what remains. When you finish a step, say which one is done. If you keep the plan only in  
+        "- Keep your working state in your VISIBLE replies, not only in reasoning. Reasoning is not
+  carried into your next turn: only the text you write and the tool output you produce come
+  back. Before each batch of tool calls, write one short line naming the task you are on and
+  what remains. When you finish a step, say which one is done. If you keep the plan only in
   your head you will re-derive it from scratch every turn."
     };
 
@@ -96,7 +96,7 @@ You help users by reading files, executing commands, editing code, and writing n
 
 Available tools:
 - read  — Read file contents
-- bash  — Execute shell commands
+- bash  — Execute Bash commands using Bash/POSIX syntax, including on Windows
 - edit  — Find/replace edits to existing files
 - write — Create or overwrite files
 - docs  — Look up rpi usage, extension, package, and compatibility documentation
@@ -110,6 +110,9 @@ Guidelines:
 - Be concise in your responses
 - Show file paths clearly when working with files
 - Prefer the smallest change that solves the problem
+- The bash tool runs Bash, even on Windows. Use ls, find, rg, and POSIX pipelines;
+  do not pass PowerShell cmdlets such as Get-ChildItem, Select-Object, or Select-String.
+  If a powershell tool is available, use it for PowerShell commands.
 {working_state_rule}
 - Track multi-step work with the todo tool instead of re-listing the plan in prose: add the
   steps once, then mark them done as you go. Re-stating the same plan without acting on it is
@@ -135,12 +138,12 @@ pub enum SessionSelection {
     /// Fresh durable JSONL session under `--session-dir` (or the default dir).
     New { dir: PathBuf, name: Option<String> },
     /// `-c` / `-r`: restore the most recent session in the default dir.
-    Latest,
+    Latest { dir: PathBuf },
     /// `--session <id|path>`: restore the session whose id matches, or whose
     /// file name contains the id.
-    ById { id: String },
+    ById { id: String, dir: PathBuf },
     /// `--session-id <id>`: use the EXACT session id, creating it if missing.
-    ByExactId { id: String },
+    ByExactId { id: String, dir: PathBuf },
     /// `--fork <path|id>`: fork the given session into a new one and start in
     /// the fork.
     Fork { source: String },
@@ -151,21 +154,9 @@ pub fn select_session(args: &Args, cwd: &Path) -> SessionSelection {
     if args.no_session {
         return SessionSelection::Ephemeral;
     }
-    if args.continue_session || args.resume {
-        // `--continue` and `--resume` both restore the most recent session.
-        return SessionSelection::Latest;
-    }
-    if let Some(s) = &args.fork {
-        return SessionSelection::Fork { source: s.clone() };
-    }
-    if let Some(s) = &args.session_id {
-        return SessionSelection::ByExactId { id: s.clone() };
-    }
-    if let Some(s) = &args.session {
-        return SessionSelection::ById { id: s.clone() };
-    }
     // `--session-dir` wins; then the saved `sessionDir` (upstream's key, same
-    // format as the flag); then the built-in default.
+    // format as the flag); then the built-in default. Keep this directory on
+    // restore selections too, not only on fresh sessions.
     let dir = args
         .session_dir
         .clone()
@@ -175,6 +166,18 @@ pub fn select_session(args: &Args, cwd: &Path) -> SessionSelection {
                 .and_then(|settings| settings.session_dir)
         })
         .unwrap_or_else(|| default_session_dir(cwd));
+    if args.continue_session || args.resume {
+        return SessionSelection::Latest { dir };
+    }
+    if let Some(s) = &args.fork {
+        return SessionSelection::Fork { source: s.clone() };
+    }
+    if let Some(s) = &args.session_id {
+        return SessionSelection::ByExactId { id: s.clone(), dir };
+    }
+    if let Some(s) = &args.session {
+        return SessionSelection::ById { id: s.clone(), dir };
+    }
     SessionSelection::New {
         dir,
         name: args.name.clone(),
@@ -300,8 +303,7 @@ pub async fn build(
     // loaders below (borrowed); clone one branch so both hold a reference.
     let ctx = ExecutionToolContext::new(env_dyn.clone(), Some(mut_env));
 
-    let tools = build_tools(&ctx, args);
-    let mut tools = tools;
+    let mut tools = build_tools(&ctx, args);
 
     // ---- Extensions (Part B2) ----
     // Load cdylib plugins from the resolved extension dirs, merge their tools
@@ -431,7 +433,7 @@ pub async fn build(
     let mut skill_diags: Vec<rpi_harness::skills::SkillDiagnostic> = Vec::new();
     let mut resource_diags: Vec<rpi_harness::diagnostics::ResourceDiagnostic> = Vec::new();
     if !args.no_skills {
-        let mut dirs = if args.dev_local_only {
+        let mut dirs = if args.dev_local_only || args.project_only {
             project_skill_dirs(cwd)
         } else if project_trusted {
             skill_dirs(cwd)
@@ -449,7 +451,7 @@ pub async fn build(
     let mut prompt_templates: Vec<rpi_harness::types::PromptTemplate> = Vec::new();
     let mut prompt_diags: Vec<rpi_harness::prompt_templates::PromptTemplateDiagnostic> = Vec::new();
     if !args.no_prompt_templates {
-        let mut dirs = if args.dev_local_only {
+        let mut dirs = if args.dev_local_only || args.project_only {
             project_prompt_template_dirs(cwd)
         } else if project_trusted {
             prompt_template_dirs(cwd)
@@ -665,7 +667,7 @@ pub async fn build(
         // records — let the harness load it and keep appending.
         allow_existing_session: matches!(
             selection,
-            SessionSelection::Latest
+            SessionSelection::Latest { .. }
                 | SessionSelection::ById { .. }
                 | SessionSelection::ByExactId { .. }
                 | SessionSelection::Fork { .. }
@@ -966,6 +968,26 @@ pub async fn dispatch_session_event_async(
     }
 }
 
+/// Join plugin teardown before unloading modules. A detached timed-out handler
+/// could still execute code in the old DLL, so it cannot safely permit a swap.
+async fn shutdown_extensions_for_reload(
+    snapshot: Option<Arc<rpi_extensions::RegistrySnapshot>>,
+    keepalive: Arc<rpi_extensions::PluginKeepalive>,
+) -> Result<(), String> {
+    if let Some(snapshot) = snapshot {
+        tokio::task::spawn_blocking(move || {
+            let _keepalive = keepalive;
+            rpi_extensions::dispatch_empty_event(
+                &snapshot,
+                rpi_plugin_sdk::EventTag::SessionShutdown,
+            );
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 /// The outcome of a reload: a human-readable status line for the transcript
 /// (counts of what reloaded), and whether any load diagnostics appeared.
 pub struct ReloadOutcome {
@@ -1078,6 +1100,23 @@ where
         prompt_base_dirs,
     } = prepared;
     let mut warnings = false;
+
+    // Shutdown callbacks must finish before a replacement can unload old DLLs.
+    // Ordinary lifecycle dispatch can time out or stop on a veto; unload cleanup
+    // instead joins every handler while keeping its module mapped.
+    let (shutdown_snapshot, shutdown_keepalive) = {
+        let session = ctx.extension_session.lock().unwrap();
+        (session.snapshot_arc(), session.keepalive())
+    };
+    if let Err(reason) = shutdown_extensions_for_reload(shutdown_snapshot, shutdown_keepalive).await
+    {
+        return ReloadOutcome {
+            summary: "Reload failed during extension shutdown".into(),
+            had_warnings: true,
+            details: vec![reason],
+            had_errors: true,
+        };
+    }
 
     // ---- 1. Build a fresh ActionBridge + ExtensionSession ----
     // The fresh bridge carries the SAME `HarnessActionHost` (the host's harness
@@ -1465,6 +1504,8 @@ where
 
     let mut extension_dirs = if args.no_extensions || args.dev_local_only {
         Vec::new()
+    } else if args.project_only {
+        project_extension_dirs(cwd)
     } else if project_trusted {
         extension_dirs(cwd)
     } else {
@@ -1476,7 +1517,7 @@ where
 
     let skill_base_dirs = if args.no_skills {
         Vec::new()
-    } else if args.dev_local_only {
+    } else if args.dev_local_only || args.project_only {
         project_skill_dirs(cwd)
     } else if project_trusted {
         skill_dirs(cwd)
@@ -1486,7 +1527,7 @@ where
 
     let prompt_base_dirs = if args.no_prompt_templates {
         Vec::new()
-    } else if args.dev_local_only {
+    } else if args.dev_local_only || args.project_only {
         project_prompt_template_dirs(cwd)
     } else if project_trusted {
         prompt_template_dirs(cwd)
@@ -1613,6 +1654,8 @@ fn load_extensions(
 ) -> ExtensionSession {
     let mut dirs = if args.dev_local_only {
         Vec::new()
+    } else if args.project_only {
+        project_extension_dirs(cwd)
     } else if project_trusted {
         extension_dirs(cwd)
     } else {
@@ -1809,7 +1852,7 @@ async fn build_session(selection: &SessionSelection, cwd: &str) -> Result<Sessio
                 .map_err(|e| BuildError::SessionDir(format!("{}: {e}", dir.display())))?;
             Ok(session)
         }
-        SessionSelection::Latest
+        SessionSelection::Latest { .. }
         | SessionSelection::ById { .. }
         | SessionSelection::ByExactId { .. } => restore_session(selection, cwd).await,
         SessionSelection::Fork { source } => fork_session_at_launch(source, cwd).await,
@@ -1826,8 +1869,8 @@ async fn restore_session(selection: &SessionSelection, cwd: &str) -> Result<Sess
     // the id exactly or by file-name containment (so `--session 01a02…` or a
     // partial id works, mirroring the TS id/path matching).
     match selection {
-        SessionSelection::Latest => {
-            let metas = list_session_metadata(cwd).await?;
+        SessionSelection::Latest { dir } => {
+            let metas = list_session_metadata_in_dir(cwd, dir).await?;
             let Some(meta) = first_resumable_session(&metas) else {
                 return Err(BuildError::SessionNotFound {
                     requested: "the most recent session".to_string(),
@@ -1836,24 +1879,25 @@ async fn restore_session(selection: &SessionSelection, cwd: &str) -> Result<Sess
             };
             open_session(meta, cwd).await
         }
-        SessionSelection::ById { id } => open_session_by_id(id, cwd).await.map_err(|e| match e {
-            OpenError::NotFound { requested } => BuildError::SessionNotFound {
-                requested,
-                dir: default_session_dir(Path::new(cwd)).display().to_string(),
-            },
-            OpenError::Other(msg) => BuildError::SessionOpen(msg),
-        }),
-        SessionSelection::ByExactId { id } => {
+        SessionSelection::ById { id, dir } => open_session_by_id_in_dir(id, cwd, dir)
+            .await
+            .map_err(|e| match e {
+                OpenError::NotFound { requested } => BuildError::SessionNotFound {
+                    requested,
+                    dir: default_session_dir(Path::new(cwd)).display().to_string(),
+                },
+                OpenError::Other(msg) => BuildError::SessionOpen(msg),
+            }),
+        SessionSelection::ByExactId { id, dir } => {
             // Exact id match only (pi `--session-id`): restore when the
-            // session exists, else create a fresh one under the default dir.
-            let metas = list_session_metadata(cwd).await?;
+            // session exists, else create a fresh one under the selected dir.
+            let metas = list_session_metadata_in_dir(cwd, dir).await?;
             if let Some(meta) = metas.iter().find(|m| m.id == *id) {
                 return open_session(meta, cwd).await;
             }
-            let dir = default_session_dir(Path::new(cwd));
-            std::fs::create_dir_all(&dir)
+            std::fs::create_dir_all(dir)
                 .map_err(|e| BuildError::SessionDir(format!("{}: {e}", dir.display())))?;
-            create_jsonl_session_with_id(&dir, cwd, Some(id.clone()))
+            create_jsonl_session_with_id(dir, cwd, Some(id.clone()))
                 .await
                 .map_err(|e| BuildError::SessionDir(format!("{}: {e}", dir.display())))
         }
@@ -1937,12 +1981,19 @@ impl std::fmt::Display for OpenError {
 pub async fn list_session_metadata(
     cwd: &str,
 ) -> Result<Vec<rpi_harness::session::jsonl::JsonlSessionMetadata>, BuildError> {
+    let dir = default_session_dir(Path::new(cwd));
+    list_session_metadata_in_dir(cwd, &dir).await
+}
+
+async fn list_session_metadata_in_dir(
+    cwd: &str,
+    dir: &Path,
+) -> Result<Vec<rpi_harness::session::jsonl::JsonlSessionMetadata>, BuildError> {
     use rpi_harness::session::jsonl::{
         JsonlSessionListOptions, JsonlSessionRepo, JsonlSessionRepoOptions,
     };
     use rpi_tools::FileSystem;
 
-    let dir = default_session_dir(Path::new(cwd));
     let env = Arc::new(OsExecutionEnv::with_cwd(PathBuf::from(cwd)));
     let fs: Arc<dyn FileSystem> = env.clone();
     let repo = JsonlSessionRepo::with_env_cwd(JsonlSessionRepoOptions {
@@ -2211,7 +2262,12 @@ fn first_resumable_session<'a>(
 /// (so `--session 01a02…` / a partial id / a full file name all work). The
 /// TUI `/session` hot-switch calls this with the selector's item value.
 pub async fn open_session_by_id(id: &str, cwd: &str) -> Result<Session, OpenError> {
-    let metas = list_session_metadata(cwd)
+    let dir = default_session_dir(Path::new(cwd));
+    open_session_by_id_in_dir(id, cwd, &dir).await
+}
+
+async fn open_session_by_id_in_dir(id: &str, cwd: &str, dir: &Path) -> Result<Session, OpenError> {
+    let metas = list_session_metadata_in_dir(cwd, dir)
         .await
         .map_err(|e| OpenError::Other(e.to_string()))?;
     let Some(meta) = metas
@@ -2640,7 +2696,9 @@ mod tests {
         assert!(!p.contains("- grep"));
         assert!(!p.contains("- find"));
         assert!(!p.contains("- ls"));
-        assert!(!p.contains("powershell"));
+        assert!(!p.contains("- powershell"));
+        assert!(p.contains("Bash/POSIX syntax, including on Windows"));
+        assert!(p.contains("do not pass PowerShell cmdlets"));
     }
 
     #[test]
@@ -3256,7 +3314,7 @@ mod tests {
         let cwd = Path::new("/tmp");
         assert!(matches!(
             select_session(&args, cwd),
-            SessionSelection::Latest
+            SessionSelection::Latest { .. }
         ));
 
         let args = Args {
@@ -3265,7 +3323,7 @@ mod tests {
         };
         assert!(matches!(
             select_session(&args, cwd),
-            SessionSelection::Latest
+            SessionSelection::Latest { .. }
         ));
     }
 
@@ -3278,7 +3336,7 @@ mod tests {
         let cwd = Path::new("/tmp");
         assert!(matches!(
             select_session(&args, cwd),
-            SessionSelection::ById { id } if id == "01a02ece"
+            SessionSelection::ById { id, .. } if id == "01a02ece"
         ));
     }
 
@@ -3385,5 +3443,36 @@ mod tests {
                 "{visible} describes the user's configuration and must still reach the shell"
             );
         }
+    }
+    #[tokio::test]
+    async fn reload_shutdown_joins_all_handlers_even_after_veto() {
+        use rpi_plugin_sdk::{EventTag, StablePluginEvent};
+        use std::sync::atomic::AtomicUsize;
+        extern "C" fn stop(_: StablePluginEvent, data: *mut std::ffi::c_void) -> i32 {
+            let calls = unsafe { &*(data as *const AtomicUsize) };
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                rpi_plugin_sdk::EVENT_HANDLER_ABORT
+            } else {
+                0
+            }
+        }
+        let calls = AtomicUsize::new(0);
+        let mut registry = rpi_extensions::ExtensionRegistry::new();
+        for name in ["first", "second"] {
+            registry.register_event_handler(
+                name.into(),
+                EventTag::SessionShutdown,
+                stop,
+                &calls as *const _ as *mut std::ffi::c_void,
+            );
+        }
+        super::shutdown_extensions_for_reload(
+            Some(Arc::new(registry.snapshot())),
+            rpi_extensions::PluginKeepalive::empty(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }

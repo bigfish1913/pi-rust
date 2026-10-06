@@ -943,7 +943,7 @@ async fn directly_sent_prompt_emits_no_user_message_start() {
 
 /// The loop's only other exit is "the model stopped asking for tools", which
 /// nothing bounds — one observed session ran 112 turns / 867 s in a single run
-/// (`docs/llm-repetition-forensics.md` §二). The run budget is the backstop:
+/// (`docs/debugging/llm-repetition-forensics.md` §二). The run budget is the backstop:
 /// when a model keeps emitting tool calls forever, the run must end on a known
 /// ceiling and say so, so a truncated task is never mistaken for a finished one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1150,7 +1150,7 @@ async fn no_turn_ceiling_by_default_matches_native_pi() {
 ///
 /// Before frame progress, a run persisted nothing until it finished, so killing
 /// the process after minutes of work left only the user's prompt
-/// (`docs/llm-repetition-forensics.md` §十一). Frames are appended to the record
+/// (`docs/debugging/llm-repetition-forensics.md` §十一). Frames are appended to the record
 /// stream as they arrive, so the committed prefix can be replayed.
 ///
 /// The crash is simulated faithfully: the run future is dropped mid-stream by

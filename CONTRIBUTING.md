@@ -90,8 +90,8 @@ whole runtime; `rpi-extensions` sits on top of it. Adding a dependency that
 points backwards (for example `rpi-agent` depending on `rpi-cli`) will be
 rejected.
 
-`docs/architecture.md` explains the design intent behind the split;
-`docs/agent-project.md` is the recommended structure for projects built on top
+`docs/architecture/overview.md` explains the design intent behind the split;
+`docs/agent/project-structure.md` is the recommended structure for projects built on top
 of the crates.
 
 ## Coding guidelines

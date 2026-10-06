@@ -48,7 +48,7 @@ bash scripts/release.sh 0.3.5 --from wait
 bash scripts/release.sh 0.3.5 --only crates,site
 ```
 
-发布系统的对读者来说，实际价值在于可审计和可恢复：版本修改、tag、构建产物和渠道清单都有明确阶段。项目入口：`docs/releasing.md`、`Taskfile.yml`、`.github/workflows/release-binaries.yml`。
+发布系统的对读者来说，实际价值在于可审计和可恢复：版本修改、tag、构建产物和渠道清单都有明确阶段。项目入口：`docs/maintaining/releasing.md`、`Taskfile.yml`、`.github/workflows/release-binaries.yml`。
 
 ---
 
@@ -71,4 +71,4 @@ bash scripts/release.sh 0.3.5 --from wait
 bash scripts/release.sh 0.3.5 --only crates,site
 ```
 
-See `docs/releasing.md` for credentials and phases that require human approval.
+See `docs/maintaining/releasing.md` for credentials and phases that require human approval.

@@ -70,7 +70,7 @@ impl AnthropicMessagesCompat {
 /// channel: when reasoning *is* replayed, telling the model "reasoning is not
 /// carried into your next turn" is simply false, and the instruction to restate
 /// the plan every turn becomes busy-work (the re-plan symptom in
-/// `docs/llm-repetition-forensics.md`).
+/// `docs/debugging/llm-repetition-forensics.md`).
 ///
 /// - `openai-completions`: only with `compat.requiresThinkingAsText`, which
 ///   flattens thinking blocks into `text` parts (`providers/openai_completions.rs`).

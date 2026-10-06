@@ -24,6 +24,35 @@ cargo install --path crates/rpi-cli --force
 
 `cargo install` 安装的是可执行文件；它不等同于 `rpi install`。后者用于安装由 `rpi-plugin-sdk` 构建的 Rust 动态库扩展。
 
+### 从源码启动与构建
+
+本项目是 Rust Cargo workspace，不是 Node/npm 项目，根目录没有 `package.json`。在仓库根目录执行：
+
+```bash
+# 直接启动 CLI
+cargo run -p rpi-cli
+
+# 向 CLI 传递参数（`--` 后的内容属于 rpi）
+cargo run -p rpi-cli -- -p "总结 README.md"
+cargo run -p rpi-cli -- --mode json -p "列出项目中的 crates"
+
+# 构建 release 版本
+cargo build -p rpi-cli --release
+```
+
+构建完成后，Windows 可执行文件位于 `target/release/rpi.exe`，Linux/macOS 下通常为 `target/release/rpi`。也可以把本地 CLI 安装到 Cargo 的 bin 目录后直接使用：
+
+```bash
+cargo install --path crates/rpi-cli --force
+rpi
+```
+
+离线示例（不需要 API Key 或网络）可以使用：
+
+```bash
+cargo run -p minimal
+```
+
 ### 第一次运行
 
 交互模式：
@@ -139,6 +168,8 @@ ANTHROPIC_AUTH_TOKEN=token
 --no-context-files      跳过 AGENTS.md/CLAUDE.md 发现
 --no-extensions         禁用扩展加载
 --extensions-dir <dir>  额外扫描 Rust 扩展目录
+--package-only         只加载当前项目 package/resource，排除全局资源
+--project-only         `--package-only` 的等价别名
 --list-models [search]  列出可用模型（可带模糊搜索）
 --offline               禁用启动时的网络检查
 --export <file>         把 JSONL 会话导出为 HTML
@@ -242,6 +273,15 @@ rpi 会优先使用 rpi 自己的目录，同时兼容原 Pi 的 `.pi` 布局：
 ```
 
 路径相对于项目根目录；`skills`、`prompts`、`extensions` 是对应 `*Dirs` 字段的简写。自定义目录会与 `.rpi`、`.pi` 和全局约定目录一起加载，`.rpi` 优先。全局 `~/.rpi/agent/settings.json` 也支持这些字段，相对路径相对于 agent 目录。
+
+只加载当前项目的 package/resource、排除全局资源时，使用以下任一等价参数：
+
+```bash
+rpi --package-only
+rpi --project-only
+```
+
+两者都会加载当前项目的 skills、prompts、themes、extensions 和 packages，并读取项目 `.rpi/settings.json`；不会自动加载全局资源。`--local-only` 语义不同，只加载通过 `--extensions-dir` 或 `--extension` 显式指定的扩展。
 
 配置目录可以重定位：
 
@@ -369,7 +409,7 @@ rpi-plugin-sdk → rpi-extensions → rpi-tui → rpi-cli
 - Rust API：<https://docs.rs/rpi-agent>、<https://docs.rs/rpi-plugin-sdk>
 
 - Package 与扩展作者指南：<https://rpi.laofu.online/extension-authoring.md>
-- 远程模式：<docs/remote-mode.md>
+- 远程模式：<docs/remote/user-guide.md>
 - Rust 扩展与 agent 调试：`rpi` 内 `docs` 工具的 `debugging` 主题
 
 当在线文档和已安装版本不一致时，以对应版本的 Git tag 和仓库内文档为准。

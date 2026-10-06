@@ -50,7 +50,7 @@
 //!    catalog. The TS resolver additionally does fuzzy/partial matching; v1
 //!    keeps it exact to avoid surprising model picks (partial match is a common
 //!    source of "got the wrong model" bugs — documented as a divergence in
-//!    `docs/m6-cli-open-questions.md`).
+//!    the initial port notes (retired)).
 //! 5. No `--model` ⇒ [`pick_default_model`]:
 //!    (a) scan upstream's `defaultModelPerProvider` entries in their declared
 //!    order and take the first authenticated match; otherwise (b) take the

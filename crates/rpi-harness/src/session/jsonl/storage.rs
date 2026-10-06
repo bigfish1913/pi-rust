@@ -197,6 +197,15 @@ impl JsonlSessionStorage {
                     kept_lines.push(*line);
                 }
                 Err(err) => {
+                    // Assistant frames are transient streaming progress, not
+                    // session history. Native Pi treats an undecodable frame
+                    // as lost progress rather than making the whole session
+                    // unopenable. Keep all other schema errors strict.
+                    if err.kind == JsonlDecodeErrorKind::Schema && is_assistant_frame_append(*line)
+                    {
+                        tracing::warn!(line = line_no, "skipping undecodable assistant frame");
+                        continue;
+                    }
                     let is_last = idx == physical_lines.len() - 1;
                     let is_torn_tail = is_last && err.kind == JsonlDecodeErrorKind::Syntax;
                     if is_torn_tail {
@@ -568,6 +577,19 @@ impl SessionStorage for JsonlSessionStorage {
     }
 }
 
+/// Whether a raw JSONL line is an append of transient assistant-frame progress.
+///
+/// This intentionally only identifies the record envelope. The nested frame is
+/// allowed to fail schema decoding; ordinary records must remain strict.
+fn is_assistant_frame_append(line: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return false;
+    };
+    value.get("kind").and_then(serde_json::Value::as_str) == Some("record")
+        && value.get("type").and_then(serde_json::Value::as_str) == Some("assistant_frame")
+        && value.get("op").and_then(serde_json::Value::as_str) == Some("append")
+}
+
 // The `enqueue` closure approach above fights the borrow checker (closures
 // can't capture `&self` across an await of a method on `self`). The trait impl
 // therefore inlines the stamp→persist→apply sequence directly per method,
@@ -773,6 +795,60 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(err.code, SessionErrorCode::InvalidEntry);
+    }
+
+    #[tokio::test]
+    async fn undecodable_assistant_frame_does_not_block_load() {
+        let env = rpi_tools::InMemoryExecutionEnv::with_cwd("/".into());
+        let fs: Arc<dyn FileSystem> = Arc::new(env);
+        let clock: Arc<dyn Clock> = Arc::new(FakeClock::new());
+        let ids: Arc<dyn IdGenerator> = Arc::new(CounterIdGenerator::new());
+
+        JsonlSessionStorage::create(fs.clone(), "/s.jsonl", header(), clock.clone(), ids.clone())
+            .await
+            .unwrap();
+
+        // The envelope is a valid assistant-frame append, but its nested frame
+        // variant is not. This is recoverable progress loss, not history loss.
+        fs.append_file(
+            "/s.jsonl",
+            FileContent::Text(
+                r#"{"kind":"record","type":"assistant_frame","id":"bad","seq":1,"lane":"main","timestamp":1,"runId":"run","streamIndex":0,"op":"append","frame":{"type":"not_a_real_frame_variant"}}
+"#.into(),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+        fs.append_file(
+            "/s.jsonl",
+            FileContent::Text(encode_mutation(&SessionMutation::Lane {
+                seq: 2,
+                lane: "main".into(),
+                leaf_id: None,
+            })),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let reloaded = JsonlSessionStorage::load(fs, "/s.jsonl", clock, ids)
+            .await
+            .expect("an undecodable assistant frame must not block load");
+        assert_eq!(reloaded.get_name().await.unwrap(), None);
+        reloaded
+            .append_entry(
+                ProvisionedEntry {
+                    id: "e1".into(),
+                    kind: ProvisionedKind::Message {
+                        message: user_msg("after recovery"),
+                        terminate: None,
+                    },
+                },
+                "main",
+            )
+            .await
+            .expect("session remains writable after skipping frame");
     }
 
     #[tokio::test]

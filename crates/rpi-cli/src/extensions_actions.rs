@@ -45,6 +45,7 @@ use rpi_ai::types::ThinkingLevel;
 use rpi_extensions::RuntimeActionHost;
 use rpi_harness::agent_harness::{AgentHarness, HarnessRunOutcome, NavigationOutcome};
 use rpi_harness::session::session::Session;
+use rpi_harness::session::types::{BranchBounds, EntryOrder, EntryQuery};
 use tokio::runtime::Handle;
 
 use crate::session::{default_session_dir, open_session_by_id};
@@ -317,6 +318,29 @@ impl RuntimeActionHost for HarnessActionHost {
             .await
             .map_err(|e| e.to_string())?;
         Ok(serde_json::json!({ "entryId": id }))
+    }
+
+    async fn get_session_branch(
+        &self,
+        _args: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let entries = self
+            .harness()?
+            .find_entries_on_branch(
+                &EntryQuery {
+                    order: Some(EntryOrder::OldestFirst),
+                    ..Default::default()
+                },
+                &BranchBounds::default(),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let entries = entries
+            .iter()
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("serialize session branch: {e}"))?;
+        Ok(serde_json::json!({"entries": entries}))
     }
 
     async fn set_session_name(&self, args: serde_json::Value) -> Result<serde_json::Value, String> {

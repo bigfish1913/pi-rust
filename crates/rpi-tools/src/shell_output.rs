@@ -63,6 +63,7 @@ pub struct ShellCaptureResult {
 
 /// Mirrors `ShellCaptureOptions`.
 pub struct ShellCaptureOptions<'a> {
+    pub shell: Option<crate::env::ShellOverride>,
     pub cwd: Option<PathBuf>,
     pub env: Option<HashMap<String, String>>,
     pub inherit_env: bool,
@@ -75,6 +76,7 @@ pub struct ShellCaptureOptions<'a> {
 impl<'a> Default for ShellCaptureOptions<'a> {
     fn default() -> Self {
         Self {
+            shell: None,
             cwd: None,
             env: None,
             inherit_env: true,
@@ -302,6 +304,7 @@ pub async fn execute_shell_with_capture(
     });
 
     let exec_opts = ShellExecOptions {
+        shell: options.shell.clone(),
         cwd: options.cwd.clone(),
         env: options.env.clone(),
         inherit_env: options.inherit_env,

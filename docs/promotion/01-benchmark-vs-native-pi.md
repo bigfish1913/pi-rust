@@ -91,7 +91,7 @@ node scripts/bench-vs-pi.mjs --pi .bench/node_modules/.bin/pi --runs 11 --warmup
   --json .bench/results.json
 ```
 
-换一台机器重跑会得到不同的绝对值，比值也请以你自己机器上的结果为准，别直接引用这里的毫秒数。完整方法和原始数据在 `docs/performance-vs-pi.md`。
+换一台机器重跑会得到不同的绝对值，比值也请以你自己机器上的结果为准，别直接引用这里的毫秒数。完整方法和原始数据在 `docs/performance/benchmark-vs-pi.md`。
 
 ## 项目
 
@@ -99,7 +99,7 @@ rpi 是 Rust 原生、library-first 的 coding-agent runtime，九个 crate 同�
 
 - GitHub：https://github.com/bigfish1913/pi-rust
 - 官网：https://rpi.laofu.online/
-- 完整数据与方法：https://github.com/bigfish1913/pi-rust/blob/main/docs/performance-vs-pi.md
+- 完整数据与方法：https://github.com/bigfish1913/pi-rust/blob/main/docs/performance/benchmark-vs-pi.md
 - 免 Rust 工具链安装：`curl -fsSL https://raw.githubusercontent.com/bigfish1913/pi-rust/main/scripts/install.sh | sh`
 
 ---
@@ -193,4 +193,4 @@ node scripts/bench-vs-pi.mjs --pi .bench/node_modules/.bin/pi --runs 11 --warmup
   --json .bench/results.json
 ```
 
-Absolute milliseconds are machine-specific. Re-run on your own hardware and compare ratios, not the numbers above. The full method and raw data are in `docs/performance-vs-pi.md`.
+Absolute milliseconds are machine-specific. Re-run on your own hardware and compare ratios, not the numbers above. The full method and raw data are in `docs/performance/benchmark-vs-pi.md`.

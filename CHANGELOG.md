@@ -11,6 +11,57 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.3.16] - 2026-10-06
+
+## [0.3.15] - 2026-10-04
+
+## [0.3.13] - 2026-10-02
+
+### Added
+
+- Recovering a session that was interrupted mid-tool-call no longer poisons the
+  provider context. When an assistant `toolCall` has no matching `toolResult` —
+  the crash landed between the two durable writes — OpenAI-compatible endpoints
+  rejected the whole request with `No tool output found for function call …`.
+  The harness now repairs the in-memory context before conversion: it inserts a
+  synthetic error result ("Tool call was interrupted before its result was
+  persisted. The tool was not re-executed during session recovery.") directly
+  after the call, in call order for parallel calls, and logs how many it
+  repaired. The durable session is untouched, no interrupted tool is re-run,
+  and normal history round-trips unchanged.
+
+### Fixed
+
+- Plugin `message_update` events now carry native Pi's `assistantMessageEvent`
+  delta envelope (`text_delta`, `thinking_delta`, `toolcall_delta`, …) instead
+  of a growing `AgentMessage` snapshot. A streaming consumer reads each delta's
+  real `delta` field once, so it no longer has to diff successive cumulative
+  snapshots and stream size stays linear — matching the JSON/RPC contract the
+  other Pi runtimes emit.
+- `rpi update` no longer stages a brand new build of the version that is
+  already running. It now asks crates.io first and reports
+  `rpi is up to date (0.3.13 is the latest release)` instead of compiling and
+  scheduling a replacement for the same version — the behaviour that made a
+  working update look broken. `--force` keeps an explicit reinstall available,
+  and an unverified answer (cached, or a registry that could not be reached) is
+  labelled as such rather than asserted. A `pending-*` directory that already
+  holds a validated binary counts as "about to happen", so re-running
+  `rpi update` while an update is queued does not start a second compile.
+- `rpi update` prunes the debris previous interrupted runs left in
+  `~/.rpi/agent/self-update`. A Windows update persists its `pending-*` staging
+  directory so the PowerShell helper can install from it after the parent exits;
+  when the helper died first — a reboot at the wrong moment, a machine-wide
+  `taskkill` — the directory stayed forever, because nothing in the update path
+  removed it and its still-`preparing` status file meant the next start never
+  looked at it either. Staging directories no live status file claims are now
+  reclaimed, along with the `preparing`/`waiting` records that named them.
+- The status file `rpi update` prints is readable by the time you go looking for
+  it. A `succeeded` record used to be deleted by the very next rpi start, so the
+  path in that message was dead on arrival and a finished update read as one
+  that never ran. Completed records now survive as the receipt for the installed
+  version (aging out after a day), and the `staged` line names the version and
+  says what to do: `rpi 0.3.13 staged; quit this rpi and it will be applied.`
+
 ## [0.3.12] - 2026-10-01
 
 ### Added
@@ -115,7 +166,7 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ### Changed
 
-- `docs/rustcc-post-v0.1.13.md` is marked as a historical 0.1.13 release post,
+- `docs/README.md` is marked as a historical 0.1.13 release post,
   and its update-commands section now carries a correction. It still told
   readers to run `rpi pi-update` and `rpi self-update`, neither of which exists
   any more — the article only documented 0.1.13-era behavior and was never
@@ -255,7 +306,7 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
   A model cannot forge it either — the host's value overrides one that matches.
   Built-in tools are unaffected; they already receive an
   `ExecutionToolContext`. This is what lets a plugin keep per-session state
-  without asking the model to guess an identity. `docs/extension-authoring.md`
+  without asking the model to guess an identity. `docs/extensions/authoring.md`
   documents the contract, including the one failure mode worth naming: a
   `#[serde(deny_unknown_fields)]` parameter struct will reject the injected key.
 - `cargo binstall rpi-cli` works: `[package.metadata.binstall]` points at the
@@ -353,14 +404,14 @@ on `main` and fixes how every crate presents itself on crates.io and docs.rs.
 - Every crate declares `homepage` and `documentation`, and ships its own
   `README.md` instead of the workspace README. Previously all nine crates.io and
   docs.rs pages showed the same generic document, and its relative links
-  (`docs/architecture.md`, `LICENSE`, `examples/plugin-stub`) resolved to 404 on
+  (`docs/architecture/overview.md`, `LICENSE`, `examples/plugin-stub`) resolved to 404 on
   those sites.
 - docs.rs now builds with `all-features` for every crate except `rpi-cli`, whose
   clipboard feature needs platform libraries that are not present there.
 
 ### Docs
 
-- Added `docs/performance-vs-pi.md` and `scripts/bench-vs-pi.mjs` — a reproducible,
+- Added `docs/performance/benchmark-vs-pi.md` and `scripts/bench-vs-pi.mjs` — a reproducible,
   same-machine comparison against native Pi over the same JSONL command channel,
   with isolated config directories and both tools offline. rpi is 9.7× faster to
   start, 10.7× faster to cold start, 7.6× smaller in memory and ~18× smaller
@@ -390,11 +441,11 @@ on `main` and fixes how every crate presents itself on crates.io and docs.rs.
 ### Added
 
 - A model-visible system prompt section that makes the agent aware of reasoning
-  replay, developed alongside `docs/llm-repetition-forensics.md`.
+  replay, developed alongside `docs/debugging/llm-repetition-forensics.md`.
 
 ### Docs
 
-- `docs/llm-repetition-forensics.md` updated with the latest evidence and the
+- `docs/debugging/llm-repetition-forensics.md` updated with the latest evidence and the
   corrections to earlier conclusions in that document.
 
 ## [0.2.0] - 2026-09-25
@@ -432,7 +483,7 @@ on `main` and fixes how every crate presents itself on crates.io and docs.rs.
 
 ### Docs
 
-- `docs/llm-repetition-forensics.md` §11 documents the per-state comparison
+- `docs/debugging/llm-repetition-forensics.md` §11 documents the per-state comparison
   against native Pi's durable state machine.
 - `docs/native-pi-missing-features.md` §7/§15 corrected against verified
   behaviour.
@@ -506,7 +557,7 @@ on `main` and fixes how every crate presents itself on crates.io and docs.rs.
 
 ### Docs
 
-- New `docs/remote-mode.md` and `docs/lifescope.md`.
+- New `docs/remote/user-guide.md` and `docs/README.md`.
 
 ## [0.1.23] - 2026-09-21
 

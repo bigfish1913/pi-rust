@@ -96,7 +96,7 @@ impl BashTool {
         Tool {
             name: "bash".to_string(),
             description: format!(
-                "Execute a bash command in the current working directory. Returns stdout and \
+                "Execute a Bash command in the current working directory using Bash/POSIX syntax, even on Windows. PowerShell cmdlets (Get-ChildItem, Select-Object, Select-String) are not valid here; use ls, find, rg, and POSIX pipelines instead. Returns stdout and \
                  stderr. Output is truncated to last {DEFAULT_MAX_LINES} lines or {kb}KB \
                  (whichever is hit first). If truncated, full output is saved to a temp file. \
                  Optionally provide a timeout in seconds.",
@@ -221,6 +221,7 @@ impl AgentTool for BashTool {
         let cwd = execution.cwd;
         let env = self.env.clone();
         let capture_opts = ShellCaptureOptions {
+            shell: None,
             cwd: Some(cwd),
             env: Some(execution.env),
             inherit_env: execution.inherit_env,

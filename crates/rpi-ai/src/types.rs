@@ -131,7 +131,10 @@ fn is_false(b: &bool) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImageContent {
-    #[serde(rename = "type")]
+    // `Content` is internally tagged and consumes `type` before deserializing
+    // this struct. Default the marker just like text/thinking content so
+    // persisted image blocks round-trip through JSONL.
+    #[serde(default, rename = "type")]
     pub kind: ImageContentType,
     pub data: String,
     pub mime_type: String,

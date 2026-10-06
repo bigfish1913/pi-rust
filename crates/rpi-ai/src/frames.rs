@@ -11,7 +11,7 @@
 //! to durable storage as the stream advances. If the process dies mid-stream,
 //! the committed frame prefix can be replayed into the partial assistant
 //! message that had been produced so far instead of losing the whole run —
-//! see `docs/llm-repetition-forensics.md` §十一 and the harness-side recovery
+//! see `docs/debugging/llm-repetition-forensics.md` §十一 and the harness-side recovery
 //! that consumes these.
 //!
 //! # The encoder is not a pure mapping

@@ -74,23 +74,22 @@ behaviour at the boundary.
 
 ## Compatibility
 
-The host loader resolves entrypoints in this order:
+The host loader only resolves `rpi_plugin_register`, exported with
+`export_plugin!`. The host passes a `PluginApi` containing registration slots,
+`runtime_action` and `declare` (priority and platforms).
 
-| Symbol | ABI | Note |
-| ------ | --- | ---- |
-| `rpi_plugin_register` | `RPI_PLUGIN_ABI_VERSION_UNIFIED` | Current. Preferred. |
-| `rpi_plugin_register_v3` | `RPI_PLUGIN_ABI_VERSION_V3` | Adds `declare` (priority, platforms). |
-| `rpi_plugin_register_v2` | `RPI_PLUGIN_ABI_VERSION` | Legacy. |
-
-A plugin built against an older ABI keeps loading, so the migration path for
-extension authors is "rebuild when convenient", not "rebuild or break".
+The SDK checks `abi_version` against `RPI_PLUGIN_ABI_VERSION_UNIFIED` and
+requires `struct_size` to cover the `PluginApi` expected by the plugin before
+calling its registration body. A mismatch returns a nonzero status and the
+host reports a load failure. Extensions using retired entrypoints must be
+updated to `export_plugin!` and rebuilt with the current SDK.
 
 ## Versioning
 
 A plugin depends on `rpi-plugin-sdk` only, so its version is decoupled from the
-rest of the family. When the ABI struct changes, an existing plugin continues to
-work through its older entrypoint; a new field is only reachable after the
-plugin checks `struct_size`.
+rest of the family. ABI compatibility is checked through `abi_version` and
+`struct_size`; each optional capability must also be checked before use.
+Rebuild extensions when the SDK contract they require changes.
 
 ## Examples and docs
 
@@ -98,7 +97,7 @@ plugin checks `struct_size`.
   a complete plugin registering an `echo` tool with the full four-function
   lifecycle (`execute` → `poll` → `cancel` → `destroy`), an event handler, and a
   resource-discovery handler.
-- [Extension authoring guide](https://github.com/bigfish1913/pi-rust/blob/main/docs/extension-authoring.md) —
+- [Extension authoring guide](https://github.com/bigfish1913/pi-rust/blob/main/docs/extensions/authoring.md) —
   templates, safety rules, testing and release checklist.
 - Host-side loader: [`rpi-extensions`](https://crates.io/crates/rpi-extensions).
 - Ready-to-install extensions:

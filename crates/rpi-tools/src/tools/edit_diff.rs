@@ -223,7 +223,11 @@ pub fn apply_edits_to_normalized_content(
         if occurrences > 1 {
             return Err(FileError::new(
                 crate::error::FileErrorCode::Invalid,
-                duplicate_error(path, i, total, occurrences),
+                format!(
+                    "{}{}",
+                    duplicate_error(path, i, total, occurrences),
+                    duplicate_match_context(normalized_content, &e.old_text),
+                ),
             )
             .with_path(path));
         }
@@ -637,6 +641,45 @@ fn duplicate_error(path: &str, i: usize, total: usize, occurrences: usize) -> St
     }
 }
 
+/// Show bounded diagnostics using the same normalization as duplicate detection.
+/// Line numbers refer to the original file, and snippets preserve its characters.
+fn duplicate_match_context(content: &str, old_text: &str) -> String {
+    const MAX_MATCHES: usize = 5;
+    const MAX_LINE_CHARS: usize = 200;
+    let normalized = normalize_for_fuzzy_match(content);
+    let needle = normalize_for_fuzzy_match(old_text);
+    if needle.is_empty() {
+        return String::new();
+    }
+    let mut line_starts = vec![0];
+    line_starts.extend(normalized.match_indices('\n').map(|(index, _)| index + 1));
+    let original_lines: Vec<&str> = content.split('\n').collect();
+    let mut out = String::from(
+        "\nMatching locations (line labels are diagnostic; do not include them in oldText):\n",
+    );
+    for (number, (offset, _)) in normalized.match_indices(&needle).enumerate() {
+        if number == MAX_MATCHES {
+            out.push_str("[More matches omitted; use read to inspect the intended region.]\n");
+            break;
+        }
+        let line = line_starts.partition_point(|start| *start <= offset) - 1;
+        out.push_str(&format!("Match {} at line {}:\n", number + 1, line + 1));
+        let start = line.saturating_sub(1);
+        let end = (line + 2).min(original_lines.len());
+        for (index, text) in original_lines.iter().enumerate().take(end).skip(start) {
+            let snippet: String = text.chars().take(MAX_LINE_CHARS).collect();
+            let suffix = if text.chars().count() > MAX_LINE_CHARS {
+                " [line truncated]"
+            } else {
+                ""
+            };
+            out.push_str(&format!("{}: {snippet}{suffix}\n", index + 1));
+        }
+    }
+    out.push_str("Read the intended region and include enough surrounding text to make oldText unique before retrying.");
+    out
+}
+
 fn no_change_error(path: &str, total: usize) -> String {
     if total == 1 {
         format!("No changes made to {path}. The replacement produced identical content. This might indicate an issue with special characters or the text not existing as expected.")
@@ -716,7 +759,48 @@ mod tests {
         }];
         let r = apply_edits_to_normalized_content(content, &edits, "/x");
         assert!(r.is_err());
-        assert_eq!(r.unwrap_err().code, crate::error::FileErrorCode::Invalid);
+        let error = r.unwrap_err();
+        assert_eq!(error.code, crate::error::FileErrorCode::Invalid);
+        let message = error.to_string();
+        assert!(message.contains("Match 1 at line 1"));
+        assert!(message.contains("Match 2 at line 3"));
+        assert!(message.contains("2: mid"));
+    }
+
+    #[test]
+    fn duplicate_diagnostics_preserve_original_unicode_and_batch_index() {
+        let edits = vec![
+            ReplaceEdit {
+                old_text: "heading".into(),
+                new_text: "title".into(),
+            },
+            ReplaceEdit {
+                old_text: "it's".into(),
+                new_text: "changed".into(),
+            },
+        ];
+        let error = apply_edits_to_normalized_content(
+            "heading\n第一处 it’s\n中间\n第二处 it's\n",
+            &edits,
+            "/x",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("2 occurrences of edits[1]"));
+        assert!(error.contains("Match 1 at line 2"));
+        assert!(error.contains("Match 2 at line 4"));
+        assert!(error.contains("2: 第一处 it’s"));
+    }
+
+    #[test]
+    fn duplicate_diagnostics_bound_matches_and_long_unicode_lines() {
+        let content = format!("{} repeated\n", "界".repeat(1000)).repeat(20);
+        let context = duplicate_match_context(&content, "repeated");
+        assert!(context.contains("Match 5 at line 5"));
+        assert!(!context.contains("Match 6"));
+        assert!(context.contains("More matches omitted"));
+        assert!(context.contains("[line truncated]"));
+        assert!(context.len() < 12_000);
     }
 
     #[test]

@@ -13,7 +13,7 @@
 //! The TS suite runs against `NodeExecutionEnv` + real tempdirs (incl. a
 //! symlink case). The in-memory env does not model symlinks faithfully
 //! (`canonical_path` is identity), so the symlink case is deferred to an
-//! OS-env conformance test — see `docs/m5e-open-questions.md`.
+//! OS-env conformance test — see the initial port notes (retired).
 
 use std::sync::Arc;
 

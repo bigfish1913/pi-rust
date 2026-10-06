@@ -60,13 +60,18 @@ pub fn translate(event: &AgentEvent) -> Option<StablePluginEvent> {
             let stb = message_to_stb(message);
             Some(StablePluginEvent::message(tag, stb))
         }
-        AgentEvent::MessageUpdate { message, .. } => {
-            // The partial arrives as a shared `Arc<AssistantMessage>`; serialize it
-            // in the same `AgentMessage` shape the other two arms use, without
-            // materializing a copy of the growing message per delta.
-            let stb =
-                StbString::from_string(rpi_agent::message::assistant_json(message).to_string());
-            Some(StablePluginEvent::message(tag, stb))
+        AgentEvent::MessageUpdate {
+            assistant_message_event,
+            ..
+        } => {
+            // Match native Pi's wire contract: message_update carries the
+            // provider event, not a growing message snapshot. Consumers that
+            // need live text read assistantMessageEvent.delta directly.
+            let payload = assistant_message_event_to_json(assistant_message_event);
+            Some(StablePluginEvent::message(
+                tag,
+                StbString::from_string(payload),
+            ))
         }
 
         AgentEvent::ToolExecutionStart {
@@ -110,6 +115,107 @@ pub fn translate(event: &AgentEvent) -> Option<StablePluginEvent> {
         | AgentEvent::TurnEnd { .. } => Some(StablePluginEvent::empty(tag)),
 
         AgentEvent::RetryScheduled { .. } => None,
+    }
+}
+
+/// Serialize the stream event inside native Pi's `message_update` envelope.
+///
+/// Do not include `partial`: it is a cumulative snapshot and the native JSON /
+/// RPC contract deliberately omits it so consumers process each delta exactly
+/// once and stream size stays linear.
+fn assistant_message_event_to_json(event: &rpi_ai::types::AssistantMessageEvent) -> String {
+    use rpi_ai::types::AssistantMessageEvent as E;
+
+    let value = match event {
+        E::TextStart { content_index, .. } => serde_json::json!({
+            "type": "text_start",
+            "contentIndex": content_index,
+        }),
+        E::TextDelta {
+            content_index,
+            delta,
+            ..
+        } => serde_json::json!({
+            "type": "text_delta",
+            "contentIndex": content_index,
+            "delta": delta,
+        }),
+        E::TextEnd {
+            content_index,
+            content,
+            ..
+        } => serde_json::json!({
+            "type": "text_end",
+            "contentIndex": content_index,
+            "content": content,
+        }),
+        E::ThinkingStart { content_index, .. } => serde_json::json!({
+            "type": "thinking_start",
+            "contentIndex": content_index,
+        }),
+        E::ThinkingDelta {
+            content_index,
+            delta,
+            ..
+        } => serde_json::json!({
+            "type": "thinking_delta",
+            "contentIndex": content_index,
+            "delta": delta,
+        }),
+        E::ThinkingEnd {
+            content_index,
+            content,
+            ..
+        } => serde_json::json!({
+            "type": "thinking_end",
+            "contentIndex": content_index,
+            "content": content,
+        }),
+        E::ToolCallStart { content_index, .. } => serde_json::json!({
+            "type": "toolcall_start",
+            "contentIndex": content_index,
+        }),
+        E::ToolCallDelta {
+            content_index,
+            delta,
+            ..
+        } => serde_json::json!({
+            "type": "toolcall_delta",
+            "contentIndex": content_index,
+            "delta": delta,
+        }),
+        E::ToolCallEnd {
+            content_index,
+            tool_call,
+            ..
+        } => serde_json::json!({
+            "type": "toolcall_end",
+            "contentIndex": content_index,
+            "toolCall": tool_call,
+        }),
+        E::Start { .. } | E::Done { .. } | E::Error { .. } => {
+            serde_json::json!({ "type": event_type_name(event) })
+        }
+    };
+
+    serde_json::json!({ "assistantMessageEvent": value }).to_string()
+}
+
+fn event_type_name(event: &rpi_ai::types::AssistantMessageEvent) -> &'static str {
+    use rpi_ai::types::AssistantMessageEvent as E;
+    match event {
+        E::Start { .. } => "start",
+        E::TextStart { .. } => "text_start",
+        E::TextDelta { .. } => "text_delta",
+        E::TextEnd { .. } => "text_end",
+        E::ThinkingStart { .. } => "thinking_start",
+        E::ThinkingDelta { .. } => "thinking_delta",
+        E::ThinkingEnd { .. } => "thinking_end",
+        E::ToolCallStart { .. } => "toolcall_start",
+        E::ToolCallDelta { .. } => "toolcall_delta",
+        E::ToolCallEnd { .. } => "toolcall_end",
+        E::Done { .. } => "done",
+        E::Error { .. } => "error",
     }
 }
 
@@ -384,7 +490,7 @@ pub fn dispatch_data_event_claiming(
     claimed
 }
 
-/// Per-lifecycle-event handler timeout budget (mirrors lifescope §6.1):
+/// Per-lifecycle-event handler timeout budget (see docs/extensions/lifecycle.md):
 /// startup 5s, session shutdown 15s, everything else 10s. A handler that
 /// exceeds its budget is logged + skipped (it keeps running on its blocking
 /// thread, but no longer gates startup/shutdown).
@@ -695,7 +801,7 @@ mod tests {
     use super::*;
     use rpi_agent::message::AgentMessage;
     use rpi_agent::types::AgentToolResult;
-    use rpi_ai::types::{AssistantMessage, Usage};
+    use rpi_ai::types::{AssistantMessage, AssistantMessageEvent, Usage};
     use rpi_plugin_sdk::EventTag;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -786,6 +892,49 @@ mod tests {
             error: "503".into(),
         })
         .is_none());
+    }
+
+    #[test]
+    fn translate_message_update_forwards_native_text_deltas_without_snapshot() {
+        let partial = Arc::new(AssistantMessage {
+            role: rpi_ai::types::AssistantRole,
+            content: vec![rpi_ai::types::Content::text("你好世界")],
+            api: rpi_ai::types::Api::AnthropicMessages,
+            provider: "anthropic".to_string(),
+            model: "m".into(),
+            response_model: None,
+            response_id: None,
+            usage: Usage::zero(),
+            stop_reason: rpi_ai::types::StopReason::Pending,
+            deferred: None,
+            error_message: None,
+            raw_stop_reason: None,
+            end_turn: None,
+            timestamp: 0,
+        });
+        let translate_delta = |delta: &str| {
+            let event = AgentEvent::MessageUpdate {
+                message: Arc::clone(&partial),
+                assistant_message_event: AssistantMessageEvent::TextDelta {
+                    content_index: 0,
+                    delta: delta.to_string(),
+                    partial: Arc::clone(&partial),
+                },
+            };
+            let stable = translate(&event).expect("message_update maps");
+            let payload = unsafe { stable.payload.message.message.to_string_lossy() };
+            unsafe { host_free_string(stable.payload.message.message) };
+            serde_json::from_str::<serde_json::Value>(&payload).expect("valid payload")
+        };
+
+        let first = translate_delta("你好");
+        let second = translate_delta("世界");
+        assert_eq!(first["assistantMessageEvent"]["type"], "text_delta");
+        assert_eq!(first["assistantMessageEvent"]["contentIndex"], 0);
+        assert_eq!(first["assistantMessageEvent"]["delta"], "你好");
+        assert_eq!(second["assistantMessageEvent"]["delta"], "世界");
+        assert!(first.get("message").is_none());
+        assert!(first["assistantMessageEvent"].get("partial").is_none());
     }
 
     #[test]

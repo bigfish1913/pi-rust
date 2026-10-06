@@ -38,7 +38,7 @@ static DOCS: &[DocPage] = &[
         topic: "guide",
         description: "完整使用手册：安装、模型、CLI、.rpi 资源、Rust 扩展、SDK、排错和发布",
         content: include_str!("../embedded-docs/user-guide.md"),
-        aliases: &["manual", "user-guide", "cli", "quickstart"],
+        aliases: &["manual", "user-guide", "cli", "quickstart", "package", "packages", "extension", "extensions"],
     },
     DocPage {
         topic: "overview",
@@ -301,6 +301,15 @@ mod tests {
     async fn agent_aliases_resolve() {
         let output = execute(serde_json::json!({"topic": "create-agent"})).await;
         assert!(output.contains("rpi Agent 项目结构创建指南"));
+    }
+
+    #[tokio::test]
+    async fn package_and_extension_aliases_resolve() {
+        for topic in ["package", "packages", "extension", "extensions", "PACKAGES"] {
+            let output = execute(serde_json::json!({"topic": topic, "query": "packages"})).await;
+            assert!(output.starts_with("# rpi docs: guide"));
+            assert!(output.contains("Matches for"));
+        }
     }
 
     #[tokio::test]

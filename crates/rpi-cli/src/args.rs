@@ -10,7 +10,7 @@
 //! native extension can claim and consume its own CLI options after loading.
 //!
 //! Divergences from the TS parser (all deliberate v1 scope cuts, documented in
-//! `docs/m6-cli-open-questions.md`):
+//! the initial port notes (retired)):
 //! - `--mode rpc`,
 //!   `--fork`, `--approve`/`-na`,
 //!   `--extension`/`-e`, `--skill`, and `--prompt-template` are recognized but
@@ -193,11 +193,11 @@ pub struct Args {
     /// directory (repeated).
     pub prompt_template: Vec<PathBuf>,
 
-    /// Internal scope set by `rpi dev-local` / `rpi dev --local-only`.
-    /// Only the freshly staged development extension and resources it
-    /// discovers are loaded; normal project/global discovery is
-    /// skipped. This is intentionally not parsed by the regular CLI parser.
+    /// `--local-only`: load only explicitly supplied extension paths.
     pub dev_local_only: bool,
+    /// `--package-only` / `--project-only`: load project resources and
+    /// extensions from the active project's settings, excluding global ones.
+    pub project_only: bool,
 
     pub verbose: bool,
     pub help: bool,
@@ -373,6 +373,8 @@ pub fn parse_args(args: &[String]) -> Args {
             "--no-prompt-templates" | "-np" => result.no_prompt_templates = true,
             "--no-context-files" | "-nc" => result.no_context_files = true,
             "--no-extensions" | "-ne" => result.no_extensions = true,
+            "--local-only" => result.dev_local_only = true,
+            "--package-only" | "--project-only" => result.project_only = true,
             "--extensions-dir" | "-ed" => {
                 if let Some(v) = take_value(&mut result, &flag_key) {
                     result.extensions_dir.push(PathBuf::from(v));
@@ -632,6 +634,11 @@ pub fn print_help() {
   --no-extensions, -ne           Skip Rust cdylib extension loading
   --extensions-dir, -ed <dir>    Extra dir to scan for plugins (.dll/.so/.dylib); repeatable
                                  (also via RPI_EXTENSIONS_DIR env: ';' on Windows, ':' on Unix)
+  --local-only                   Skip automatic extension discovery: load only
+                                 --extensions-dir / --extension paths (no project
+                                 .rpi/extensions, no global extensions)
+  --package-only, --project-only Load project skills/prompts/extensions/packages
+                                 from the active project; exclude global resources
   --debug-system-prompt          Print the resolved system-prompt sections to stderr (verification)
   --verbose                      Show startup warnings (e.g. ignored flags)
   --help, -h                     Show this help
@@ -646,6 +653,8 @@ pub fn print_help() {
   install <crate>                Build and install a Rust cdylib extension
                                 (see `rpi install --help`)
   uninstall <crate>              Remove an installed Rust cdylib extension
+  package link|list|update|unlink Manage project-local Rust extension packages
+                                (see `rpi package --help`)
   dev [options]                  Build, watch, and hot-reload a Rust extension
                                 (see `rpi dev --help`)
   dev-local [options]            Debug only the current Rust extension
@@ -978,6 +987,26 @@ mod tests {
         let a = parse_args(&s(&["--no-extensions"]));
         assert!(a.no_extensions);
         assert!(a.ignored.is_empty());
+    }
+
+    #[test]
+    fn local_only_flag_is_honored_on_the_regular_parser() {
+        // The plain `rpi --local-only` form sets the same scope `rpi dev
+        // --local-only` uses, without the build/watch layer.
+        let a = parse_args(&s(&["--local-only"]));
+        assert!(a.errors.is_empty());
+        assert!(a.dev_local_only);
+        assert!(a.ignored.is_empty());
+    }
+
+    #[test]
+    fn project_only_aliases_are_honored() {
+        for flag in ["--package-only", "--project-only"] {
+            let a = parse_args(&s(&[flag]));
+            assert!(a.errors.is_empty());
+            assert!(a.project_only);
+            assert!(a.ignored.is_empty());
+        }
     }
 
     #[test]
