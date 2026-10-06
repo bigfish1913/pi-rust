@@ -968,6 +968,26 @@ pub async fn dispatch_session_event_async(
     }
 }
 
+/// Join plugin teardown before unloading modules. A detached timed-out handler
+/// could still execute code in the old DLL, so it cannot safely permit a swap.
+async fn shutdown_extensions_for_reload(
+    snapshot: Option<Arc<rpi_extensions::RegistrySnapshot>>,
+    keepalive: Arc<rpi_extensions::PluginKeepalive>,
+) -> Result<(), String> {
+    if let Some(snapshot) = snapshot {
+        tokio::task::spawn_blocking(move || {
+            let _keepalive = keepalive;
+            rpi_extensions::dispatch_empty_event(
+                &snapshot,
+                rpi_plugin_sdk::EventTag::SessionShutdown,
+            );
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 /// The outcome of a reload: a human-readable status line for the transcript
 /// (counts of what reloaded), and whether any load diagnostics appeared.
 pub struct ReloadOutcome {
@@ -1080,6 +1100,23 @@ where
         prompt_base_dirs,
     } = prepared;
     let mut warnings = false;
+
+    // Shutdown callbacks must finish before a replacement can unload old DLLs.
+    // Ordinary lifecycle dispatch can time out or stop on a veto; unload cleanup
+    // instead joins every handler while keeping its module mapped.
+    let (shutdown_snapshot, shutdown_keepalive) = {
+        let session = ctx.extension_session.lock().unwrap();
+        (session.snapshot_arc(), session.keepalive())
+    };
+    if let Err(reason) = shutdown_extensions_for_reload(shutdown_snapshot, shutdown_keepalive).await
+    {
+        return ReloadOutcome {
+            summary: "Reload failed during extension shutdown".into(),
+            had_warnings: true,
+            details: vec![reason],
+            had_errors: true,
+        };
+    }
 
     // ---- 1. Build a fresh ActionBridge + ExtensionSession ----
     // The fresh bridge carries the SAME `HarnessActionHost` (the host's harness
@@ -3406,5 +3443,36 @@ mod tests {
                 "{visible} describes the user's configuration and must still reach the shell"
             );
         }
+    }
+    #[tokio::test]
+    async fn reload_shutdown_joins_all_handlers_even_after_veto() {
+        use rpi_plugin_sdk::{EventTag, StablePluginEvent};
+        use std::sync::atomic::AtomicUsize;
+        extern "C" fn stop(_: StablePluginEvent, data: *mut std::ffi::c_void) -> i32 {
+            let calls = unsafe { &*(data as *const AtomicUsize) };
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                rpi_plugin_sdk::EVENT_HANDLER_ABORT
+            } else {
+                0
+            }
+        }
+        let calls = AtomicUsize::new(0);
+        let mut registry = rpi_extensions::ExtensionRegistry::new();
+        for name in ["first", "second"] {
+            registry.register_event_handler(
+                name.into(),
+                EventTag::SessionShutdown,
+                stop,
+                &calls as *const _ as *mut std::ffi::c_void,
+            );
+        }
+        super::shutdown_extensions_for_reload(
+            Some(Arc::new(registry.snapshot())),
+            rpi_extensions::PluginKeepalive::empty(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }

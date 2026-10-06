@@ -1599,7 +1599,7 @@ pub async fn interactive_tui(
             }
             // Mouse wheel scrolls the transcript (pi supports wheel
             // scrolling). Previously every non-Key event was dropped, so a
-            // wheel had zero effect — "滚动还是不行".
+            // wheel had zero effect
             if let Event::Mouse(m) = ev {
                 use crossterm::event::MouseEventKind;
                 match m.kind {

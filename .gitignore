@@ -25,6 +25,8 @@ target/*
 .rpi/skills/*
 !.rpi/skills/rpi-extension-authoring/
 !.rpi/skills/rpi-extension-authoring/SKILL.md
+!.rpi/skills/rpi-release/
+!.rpi/skills/rpi-release/SKILL.md
 website/.rpi/*
 .git/rpi-release-helper.exe
 publish-*.log

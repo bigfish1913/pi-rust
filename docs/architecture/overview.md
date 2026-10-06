@@ -21,12 +21,29 @@ rpi 是 Rust 原生 Agent SDK 与终端应用。当前 workspace 包含九个产
 ## 一次请求的路径
 
 ```text
-CLI / TUI / 嵌入应用
-  → AgentHarness（可选：会话、资源、上下文压缩）
-  → Agent Loop（模型调用、工具执行、下一轮）
-  → Provider（请求与流式协议解析）
-  → 消息 / 事件 → 持久化与界面更新
+TUI Enter → Editor::submit → editor.on_submit 回调
+  → TuiMessage::UserInput → TUI 主循环
+  → interactive_tui/run.rs::run_prompt_streaming
+  → LaneHandle::prompt_text → AgentHarness::prompt_text
+  → run_core → run_core_with_entry（持久化用户消息、构造上下文）
+  → run_agent_loop → run_loop
+      → stream_assistant_response → StreamFn → Provider → HTTP/SSE
+      → AssistantMessage → 工具执行 → ToolResultMessage → 下一轮模型请求
+  → AgentEvent → BroadcastEmitter
+  → interactive_tui/events.rs::drain_agent_events → handle_agent_event
+  → TranscriptView / TUI 组件 → 终端渲染
 ```
+
+运行中提交通过 `lane.steer` 入队，由 loop 在检查点消费。SDK 的 `Agent::prompt`
+走 `prompt_messages → run_prompt → run_agent_loop`；TUI 不经过这个入口或 `AgentSession`。
+完整调用与恢复分支见 [Agent Loop 与流式消息链路](../agent/loop-walkthrough.md)。
+
+## TUI 模块边界
+
+[interactive_tui.rs](../../crates/rpi-cli/src/interactive_tui.rs) 保留启动、输入提交与主循环。
+同名目录的子模块按职责组织：`commands`、`extensions`、`settings`、`sessions`、`state`、
+`run`、`events`、`selectors`、`autocomplete`、`rendering`；回归测试放在 `tests.rs`。
+主文件负责调度，子模块共享宿主状态，辅助接口限制在 TUI 模块内部。
 
 Provider 是 LLM 协议边界。上层处理统一消息和事件，具体 HTTP/SSE 协议由 `rpi-ai` 适配。工具通过 AgentTool 接口执行，内置工具使用 ExecutionEnv，以支持真实环境与离线测试环境。
 

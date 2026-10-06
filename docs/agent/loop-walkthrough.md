@@ -2,7 +2,7 @@
 
 > 本文从 TUI 用户按下 Enter 开始，追踪一条消息经过 TUI、Harness、Agent Loop、Provider、SSE 解析，再回到 TUI 渲染的完整链路。
 >
-> 文中的源码链接均为相对路径并带行号，可以直接点击跳转。
+> 更新于 2026-10-05，按 TUI 拆分后的源码校对。源码链接使用相对路径和当前行号；后续改动可能使行号偏移，请以方法名为准。
 
 ## 1. 总体链路
 
@@ -11,17 +11,23 @@ TUI Enter
   ↓
 Editor::submit
   ↓
-interactive_tui::on_submit
+editor.on_submit 回调
   ↓
 TuiMessage::UserInput
   ↓
 run_prompt_streaming
   ↓
-AgentLane::prompt_text
+LaneHandle::prompt_text
+  ↓
+AgentHarness::prompt_text
   ↓
 AgentHarness::run_core
   ↓
+AgentHarness::run_core_with_entry
+  ↓
 run_agent_loop
+  ↓
+run_loop
   ↓
 stream_assistant_response
   ↓
@@ -54,9 +60,27 @@ TUI drain task
 
 ## 2. TUI：用户消息从哪里发出
 
+### 2.0 拆分后的模块位置
+
+`crates/rpi-cli/src/interactive_tui.rs` 保留入口、初始化、提交回调和主循环；具体功能位于同名目录下：
+
+| 模块 | 职责 |
+| --- | --- |
+| `commands.rs` | 内置 slash 命令与扩展命令登记 |
+| `extensions.rs` | 扩展命令执行、原生弹窗与 ask-user 桥接 |
+| `settings.rs` | 设置菜单、模型目录与设置变更 |
+| `sessions.rs` | 切换、导入、fork、分享与历史渲染 |
+| `state.rs` | 共享状态、键盘处理、输入历史与自动发送 |
+| `run.rs` | prompt 执行、完成态同步、压缩与剪贴板 |
+| `events.rs` | AgentEvent 消费、渲染与排队消息恢复 |
+| `selectors.rs` | 模型、会话、主题、思考、工具与图片选择器 |
+| `autocomplete.rs` | 补全与编辑器光标操作 |
+| `rendering.rs` | 消息、欢迎面板、错误与恢复提示 |
+| `tests.rs` | TUI 回归测试 |
+
 ### 2.1 TUI 创建和事件管道
 
-入口是 [`interactive_tui`](../../crates/rpi-cli/src/interactive_tui.rs#L5921)：
+入口是 [`interactive_tui`](../../crates/rpi-cli/src/interactive_tui.rs#L825)：
 
 ```rust
 let lane: Arc<dyn AgentLane> = harness.lane("main");
@@ -64,7 +88,7 @@ let lane: Arc<dyn AgentLane> = harness.lane("main");
 
 Harness 创建时会安装 `BroadcastEmitter`：
 
-- [`session.rs:779`](../../crates/rpi-cli/src/session.rs#L779)
+- [`session.rs:608`](../../crates/rpi-cli/src/session.rs#L608)
 - [`BroadcastEmitter`](../../crates/rpi-agent/src/events.rs#L135)
 
 ```rust
@@ -97,7 +121,7 @@ Editor 对 Enter 的处理位于 [`editor.rs:1274`](../../crates/rpi-tui/src/edi
 
 ### 2.3 TUI 提交回调
 
-提交回调位于 [`interactive_tui.rs:6431`](../../crates/rpi-cli/src/interactive_tui.rs#L6431)。这里会先做本地命令分流：
+提交回调位于 [`interactive_tui.rs:1286`](../../crates/rpi-cli/src/interactive_tui.rs#L1286)。这里会先做本地命令分流：
 
 ```text
 /command  → slash command
@@ -118,7 +142,7 @@ ctx_for_cb.tx.send(TuiMessage::UserInput(text.to_string()));
 
 ### 2.4 TUI 主循环接收消息
 
-主循环处理 `UserInput` 的位置是 [`interactive_tui.rs:7762`](../../crates/rpi-cli/src/interactive_tui.rs#L7762)：
+主循环处理 `UserInput` 的位置是 [`interactive_tui.rs:2541`](../../crates/rpi-cli/src/interactive_tui.rs#L2541)：
 
 ```rust
 Some(TuiMessage::UserInput(prompt)) => {
@@ -137,13 +161,34 @@ Some(TuiMessage::UserInput(prompt)) => {
 
 ### 2.5 调用 Harness
 
-[`run_prompt_streaming`](../../crates/rpi-cli/src/interactive_tui.rs#L8264) 最终调用：
+[`run_prompt_streaming`](../../crates/rpi-cli/src/interactive_tui/run.rs#L89) 最终调用：
 
 ```rust
 lane.prompt_text(prompt, images).await
 ```
 
-从这里开始，消息离开 TUI，进入 Harness。
+从这里开始，消息离开 TUI，进入 Harness。`harness.lane("main")` 返回的
+[`LaneHandle::prompt_text`](../../crates/rpi-harness/src/agent_harness.rs#L4317)
+通过 `self.runner().prompt_text(text, images)` 转发给绑定该 lane 的 `AgentHarness`。
+
+这条 TUI 路径不经过 `AgentSession` 或 `Agent::prompt`。SDK 的纯文本入口是
+[`Agent::prompt`](../../crates/rpi-agent/src/agent.rs#L377)，走
+`prompt_messages → run_prompt → run_agent_loop`，与 TUI 共用底层 loop。
+
+### 2.6 运行中消息与恢复入口
+
+运行中普通提交直接调用 `lane.steer(message).await` 入队，不经 `TuiMessage::UserInput`
+等待当前 run 结束。Harness 通过 `get_steering_messages` / `get_follow_up_messages`
+回调将队列接入 loop。Steering 在 loop 的检查点被消费，并在下一次模型请求前注入；
+follow-up 在 loop 准备停止时被消费。被消费的消息发出 `MessageStart` / `MessageEnd`，
+由 `events.rs` 渲染用户气泡。
+
+新提交的普通消息已在提交回调显示；Harness 会先持久化它，再用空 prompts 驱动 loop，
+因此不能依赖 loop 再发一次用户 `MessageStart` 来显示这条消息。
+
+`run_prompt_streaming` 的 `resume=true` 分支调用 `lane.resume_pending()`，不创建新的用户消息。
+对于已保存但尚未执行工具的 assistant 响应，Harness 使用
+`run_agent_loop_from_assistant` 从工具执行继续；普通新消息仍走 `run_agent_loop`。
 
 ---
 
@@ -151,7 +196,7 @@ lane.prompt_text(prompt, images).await
 
 ### 3.1 `prompt_text`
 
-主 lane 的 `prompt_text` 位于 [`agent_harness.rs:3761`](../../crates/rpi-harness/src/agent_harness.rs#L3761)：
+主 lane 的 `prompt_text` 位于 [`agent_harness.rs:3779`](../../crates/rpi-harness/src/agent_harness.rs#L3779)：
 
 ```rust
 let message = AgentMessage::User(UserMessage::new(content, now_ms()));
@@ -172,7 +217,7 @@ AgentMessage::User
 
 ### 3.2 `run_core`
 
-[`run_core`](../../crates/rpi-harness/src/agent_harness.rs#L2890) 只是一个薄封装：
+[`run_core`](../../crates/rpi-harness/src/agent_harness.rs#L2898) 只是一个薄封装：
 
 ```rust
 async fn run_core(&self, prompts: Vec<AgentMessage>) -> HarnessResult<RunResult> {
@@ -180,7 +225,7 @@ async fn run_core(&self, prompts: Vec<AgentMessage>) -> HarnessResult<RunResult>
 }
 ```
 
-真正的准备工作在 [`run_core_with_entry`](../../crates/rpi-harness/src/agent_harness.rs#L2903)。
+真正的准备工作在 [`run_core_with_entry`](../../crates/rpi-harness/src/agent_harness.rs#L2911)。
 
 ### 3.3 `run_core_with_entry` 做什么
 
@@ -199,7 +244,7 @@ async fn run_core(&self, prompts: Vec<AgentMessage>) -> HarnessResult<RunResult>
 11. 构造 `StreamFn`。
 12. 调用 Agent Loop。
 
-调用 Agent Loop 的位置是 [`agent_harness.rs:3332`](../../crates/rpi-harness/src/agent_harness.rs#L3332)：
+调用 Agent Loop 的位置是 [`agent_harness.rs:3345`](../../crates/rpi-harness/src/agent_harness.rs#L3345)：
 
 ```rust
 run_agent_loop(
@@ -584,7 +629,7 @@ current_context.messages
 
 Agent Loop 产生的事件通过 `BroadcastEmitter` 广播。
 
-TUI 的消费入口是 [`interactive_tui.rs:8752`](../../crates/rpi-cli/src/interactive_tui.rs#L8752)：
+TUI 的消费入口是 [`interactive_tui/events.rs:149`](../../crates/rpi-cli/src/interactive_tui/events.rs#L149)：
 
 ```rust
 async fn drain_agent_events(
@@ -601,7 +646,7 @@ while let Ok(event) = rx.recv().await {
 }
 ```
 
-具体渲染逻辑位于 [`interactive_tui.rs:8774`](../../crates/rpi-cli/src/interactive_tui.rs#L8774)：
+具体渲染逻辑位于 [`interactive_tui/events.rs:171`](../../crates/rpi-cli/src/interactive_tui/events.rs#L171)：
 
 ```rust
 async fn handle_agent_event(...) {
@@ -667,11 +712,11 @@ AgentEvent
 
 ### 第三遍：看 Harness
 
-1. [`prompt_text`](../../crates/rpi-harness/src/agent_harness.rs#L3761)
-2. [`run_core`](../../crates/rpi-harness/src/agent_harness.rs#L2890)
-3. [`run_core_with_entry`](../../crates/rpi-harness/src/agent_harness.rs#L2903)
+1. [`prompt_text`](../../crates/rpi-harness/src/agent_harness.rs#L3779)
+2. [`run_core`](../../crates/rpi-harness/src/agent_harness.rs#L2898)
+3. [`run_core_with_entry`](../../crates/rpi-harness/src/agent_harness.rs#L2911)
 4. [`build_stream_fn`](../../crates/rpi-harness/src/agent_harness.rs#L2362)
-5. [`run_agent_loop 调用`](../../crates/rpi-harness/src/agent_harness.rs#L3332)
+5. [`run_agent_loop 调用`](../../crates/rpi-harness/src/agent_harness.rs#L3345)
 
 ### 第四遍：看 Provider
 
