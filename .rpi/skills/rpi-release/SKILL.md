@@ -97,7 +97,7 @@ task publish RELEASE_VERSION=0.3.16 -- --yes
 
 ## 发布失败恢复
 
-发布阶段是幂等的。不要重复 bump 版本；使用当前已经准备好的版本继续：
+不要重复 bump 版本；使用当前已经准备好的版本从失败阶段继续。并非所有阶段都能直接重跑：`tag` 已存在时不可重建，winget 的文件 PUT 重跑需要现有文件的 SHA。
 
 ```bash
 task publish RELEASE_BUMP=none -- --from push --yes
@@ -109,6 +109,14 @@ task publish RELEASE_BUMP=none -- --from push --yes
 task publish RELEASE_VERSION=0.3.16 -- --from channels --yes
 task publish RELEASE_VERSION=0.3.16 -- --only crates,site --yes
 ```
+
+## 本次发布经验（0.3.16）
+
+- 长时间发布建议输出到 `.deploy/release-X.Y.Z-resume.log`，完成后检查退出码和各阶段日志；不要把命令超时当成测试通过。
+- `winget-submit.sh` 可能因 fork 尚未包含 upstream master 的提交而创建分支失败，并被误报为“branch may already exist”。先用 `gh api repos/<owner>/winget-pkgs/git/refs/heads/rpi-X.Y.Z` 确认分支真的存在；更新 fork 后使用有效的 commit SHA 创建分支。必要时从 fork 的 master 创建，但必须检查 PR diff 仅包含预期 manifests。
+- 已存在的 winget manifest 再次 PUT 时需要 SHA；已存在的 PR 不要重复创建。winget 成功后可从 `crates` 阶段继续。
+- `commit-channels` 之后脚本没有再次推送主仓库分支。发布结束必须执行 `git push origin HEAD`，确保安装渠道提交也在远端。
+- 发布 skill 中的版本号是示例；每次按当前 workspace、tag 和用户要求重新确认版本，不要机械复用。
 
 ## 发布后合并与创建下一分支
 
