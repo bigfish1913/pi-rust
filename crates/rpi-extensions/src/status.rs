@@ -82,9 +82,18 @@ impl ExtensionStatusMailbox {
 
     /// Render visible footer entries, omitting keys consumed by richer UI.
     pub fn text_except(&self, keys: &[&str]) -> String {
-        self.entries.lock().map(|entries| entries.iter()
-            .filter(|(key, value)| !keys.contains(&key.as_str()) && !value.trim().is_empty())
-            .map(|(_, value)| value.as_str()).collect::<Vec<_>>().join("  "))
+        self.entries
+            .lock()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|(key, value)| {
+                        !keys.contains(&key.as_str()) && !value.trim().is_empty()
+                    })
+                    .map(|(_, value)| value.as_str())
+                    .collect::<Vec<_>>()
+                    .join("  ")
+            })
             .unwrap_or_default()
     }
 
