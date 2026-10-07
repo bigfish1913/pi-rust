@@ -46,6 +46,63 @@ The macro emits the `rpi_plugin_register` symbol. The version lives *inside* the
 `PluginApi` struct (`abi_version`, `struct_size`) rather than in the symbol name,
 so the entrypoint signature does not change when the struct grows.
 
+## Positioned plugin panels
+
+Hosts with declarative panel support accept a `panel` field on the existing
+`RuntimeActionId::SetStatus` (18). The ABI and legacy
+`{"key":"my-plugin","value":"footer text"}` behavior are unchanged.
+No host changes are needed for each new plugin, its text or its position.
+
+```json
+{
+  "key": "my-plugin.monitor",
+  "panel": {
+    "version": 1,
+    "anchor": "top-right",
+    "offsetX": -2,
+    "offsetY": 1,
+    "width": 44,
+    "maxHeight": 9,
+    "minScreenWidth": 50,
+    "border": true,
+    "title": "My monitor",
+    "lines": ["1 round · 87 steps · 252 tok/s", "First token: 0.42s"]
+  }
+}
+```
+
+Pass this JSON using `api.runtime_action` and free its output with
+`api.free_string`, as for other runtime actions. Update the same key to replace
+its panel, or send `{"key":"my-plugin.monitor","panel":null}` to remove it.
+Clear panels during `SessionShutdown` as well. Footer statuses and panels have
+independent registries; clearing one does not clear the other. Headless runs
+store panels without rendering them. Older hosts do not render the new field.
+
+Supported anchors: `top-left`, `top-center`, `top-right`, `left-center`, `center`,
+`right-center`, `bottom-left`, `bottom-center`, `bottom-right`. Signed offsets
+are terminal columns/rows relative to the anchor; negative offsets move left/up.
+Positions are relative to the visible terminal, so they stay fixed while chat
+scrolls. Panels are passive text overlays and do not change keyboard focus.
+They can cover chat content; use distinct anchors or offsets for multiple panels.
+
+Set `"layout":"sidebar"` to reserve a column beside the transcript instead of
+covering chat. The default `"layout":"overlay"` preserves existing panels.
+Left anchors use the left sidebar; other anchors use the right sidebar. A single
+panel follows its vertical anchor and `offsetY`; multiple panels on one side
+stack in key order. `offsetX` applies only to overlays. A sidebar adds a two-column
+separator to the requested width. It hides when `minScreenWidth` is not met or
+less than 48 columns would remain for chat. The editor and footer stay full width.
+Removing sidebar panels restores the transcript width. Sidebar mode leaves
+keyboard focus and transcript scrolling with the original components.
+
+`version` and `lines` are required. Defaults: anchor `top-right`, width 44,
+maxHeight 16, offsets 0, minScreenWidth 0, border true, title empty. Width is
+4–240 columns; maxHeight is 1–80 rows including title and borders. Content is
+clipped to width and height, with Unicode display widths respected. Terminal
+control sequences in content are stripped. At most 32 panels, 64 lines per
+panel, 2048 UTF-8 bytes per line and 256 bytes per title are accepted. Invalid
+updates return an error and preserve the previous panel.
+
 ## Why a hand-written C ABI
 
 Both sides are Rust, but they are compiled separately and may use different

@@ -1,6 +1,26 @@
 use super::*;
 use rpi_tui::Component;
 
+#[test]
+#[ignore = "set RPI_STATS_DLL to the monitor DLL"]
+fn monitor_function_key_works_with_a_draft_without_changing_text() {
+    use rpi_extensions::{dispatch_empty_event,load_session_mixed,NullDiagnostics,RegistrySnapshot};
+    use rpi_plugin_sdk::EventTag;
+    struct Shutdown(Arc<RegistrySnapshot>);
+    impl Drop for Shutdown {fn drop(&mut self) {dispatch_empty_event(&self.0,EventTag::SessionShutdown);}}
+    let state=test_tui_state();
+    let session=load_session_mixed(&[],&[std::path::PathBuf::from(std::env::var("RPI_STATS_DLL").unwrap())],Arc::new(NullDiagnostics),None);
+    let snapshot=session.snapshot_arc().expect("monitor loaded");
+    *state.extension_session.lock().unwrap()=session;
+    let _shutdown=Shutdown(snapshot);
+    state.editor.set_text("unsent draft");
+    assert!(dispatch_key_event(&state,&KeyEvent::new(KeyCode::F(8),KeyModifiers::NONE),&state.editor));
+    assert_eq!(state.editor.get_text(),"unsent draft");
+    assert!(!dispatch_key_event(&state,&KeyEvent::new(KeyCode::F(8),KeyModifiers::CONTROL),&state.editor));
+    assert!(!dispatch_key_event(&state,&KeyEvent::new(KeyCode::Char(' '),KeyModifiers::NONE),&state.editor));
+    assert_eq!(state.editor.get_text(),"unsent draft");
+}
+
 /// A draft injected from a voice transcription is submitted only when it is
 /// still exactly what we put in the editor and no run has started; any
 /// user edit (or a cleared editor) hands it back for editing instead.

@@ -30,7 +30,7 @@ struct DocPage {
 static DOCS: &[DocPage] = &[
     DocPage {
         topic: "authoring",
-        description: "Rust cdylib 扩展开发最佳实践：ABI v3/v2 入口、工具生命周期、事件处理器、资源发现、rpi dev 开发与发布检查清单",
+        description: "Rust cdylib 扩展开发最佳实践：统一 C ABI 入口、工具生命周期、事件处理器、资源发现、rpi dev 开发与发布检查清单",
         content: include_str!("../embedded-docs/extension-authoring.md"),
         aliases: &["package-authoring", "extension-authoring", "create-package", "create-extension"],
     },
@@ -66,7 +66,7 @@ static DOCS: &[DocPage] = &[
     },
     DocPage {
         topic: "debugging",
-        description: "Rust cdylib 扩展编写（ABI v3/v2、工具生命周期、事件处理器）与 agent/扩展调试（事件日志、rpi dev-local、常见失败定位）",
+        description: "Rust cdylib 扩展编写（统一 C ABI、工具生命周期、事件处理器）与 agent/扩展调试（事件日志、rpi dev-local、常见失败定位）",
         content: include_str!("../embedded-docs/rust-debugging.md"),
         aliases: &["rust", "rust-debug", "extension-debug", "troubleshoot", "debug"],
     },
@@ -256,6 +256,8 @@ mod tests {
         assert!(output.contains("authoring"));
         assert!(output.contains("- agent:"));
         assert!(output.contains("debugging"));
+        assert!(output.contains("统一 C ABI"));
+        assert!(!output.contains("ABI v3/v2"));
         assert!(!output.contains("- extensions:"));
         assert!(!output.contains("- compatibility:"));
     }

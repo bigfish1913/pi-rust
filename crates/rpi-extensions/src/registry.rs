@@ -100,7 +100,7 @@ pub struct RegisteredFlag {
 /// snapshot sorts handlers by `priority` (smaller first, stable), and dispatch
 /// skips a handler whose non-empty `platforms` excludes the host platform.
 /// Both default to `100` / empty (all platforms); a plugin sets them via the
-/// ABI v3 `declare` ext block.
+/// unified C ABI `declare` callback.
 ///
 /// SAFETY contract: the plugin guarantees `handler` is safe to call from any
 /// thread (the host dispatches from the async emitter thread) and `user_data`
@@ -455,7 +455,7 @@ impl ExtensionRegistry {
         false
     }
 
-    /// Apply a plugin's declaration (P2) parsed from the ABI v3 `declare` JSON
+    /// Apply a plugin's declaration parsed from the unified C ABI `declare` JSON
     /// (`{"priority":60,"platforms":["linux","macos"]}`). Unknown keys are
     /// ignored; malformed values leave the corresponding field unchanged.
     /// Retro-updates any handlers already registered (so declare order doesn't

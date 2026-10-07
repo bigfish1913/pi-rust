@@ -47,7 +47,7 @@ use autocomplete::*;
 mod rendering;
 use rendering::*;
 mod pet;
-mod run_stats;
+mod panels;
 
 #[cfg(test)]
 mod tests;
@@ -422,8 +422,8 @@ fn char_shortcut_name(ch: char) -> Option<String> {
 /// skip normal editor handling).
 ///
 /// Only keys an extension explicitly claimed via `register_shortcut` are
-/// routed, and only while the editor is empty, so a claimed key never steals
-/// ordinary typing. Press **and** Release (and Repeat) are dispatched, which is
+/// routed. Function keys also work with a draft; other shortcuts require an
+/// empty editor so they never steal ordinary typing. Press **and** Release (and Repeat) are dispatched, which is
 /// what lets a push-to-talk extension measure how long a key was held — the
 /// normal editor path deliberately drops Release.
 fn dispatch_key_event(state: &TuiState, key: &KeyEvent, editor: &Editor) -> bool {
@@ -450,9 +450,9 @@ fn dispatch_key_event(state: &TuiState, key: &KeyEvent, editor: &Editor) -> bool
     if !snapshot.has_shortcut(&name) || snapshot.handlers_for(EventTag::Input).is_empty() {
         return false;
     }
-    // Only claim the key while the editor is empty: with a draft in progress the
-    // key belongs to typing (space especially).
-    if !editor.get_text().is_empty() {
+    // Function keys do not insert text. Other keys belong to the draft editor
+    // while composing (space especially).
+    if !editor.get_text().is_empty() && !matches!(key.code,KeyCode::F(_)) {
         return false;
     }
 
@@ -1231,9 +1231,12 @@ pub async fn interactive_tui(
         StackChild::Entry(StackEntry::new(footer.clone())),
     ]));
 
+    let transcript_stack = Arc::new(rpi_tui::HStack::from_entries(vec![
+        StackEntry::new(scroll_view.clone()).basis(0).grow(1).shrink(1).min_size(1),
+    ]));
     let root = VStack::from_children(vec![
         StackChild::Entry(
-            StackEntry::new(scroll_view.clone())
+            StackEntry::new(transcript_stack.clone())
                 .basis(0)
                 .grow(1)
                 .shrink(1)
@@ -1456,16 +1459,8 @@ pub async fn interactive_tui(
     // fire even when the user types nothing.
     let tx_tick = tx.clone();
     let pet_tick = pet_document.clone();
-    let stats_panel = Arc::new(run_stats::Panel(reload_context.ext_status.clone()));
-    let stats_overlay = tui.show_overlay(stats_panel, Some(rpi_tui::OverlayOptions {
-        anchor: rpi_tui::OverlayAnchor::TopRight,
-        width: Some(rpi_tui::tui::SizeValue::Absolute(44)),
-        max_height: Some(rpi_tui::tui::SizeValue::Absolute(9)),
-        non_capturing: true,
-        visible: Some(|width, height| width >= 50 && height >= 18),
-        ..Default::default()
-    }));
-    stats_overlay.set_hidden(!run_stats::active(&reload_context.ext_status));
+    let mut plugin_panels = panels::Panels::with_sidebar(transcript_stack,scroll_view.clone(),reload_context.ext_status.clone());
+    plugin_panels.sync(tui.as_ref(), &reload_context.ext_status);
     let scroll_tick = scroll_view.clone();
     let tick_handle = tokio::spawn(async move {
         // 80ms per frame — upstream's `DEFAULT_INTERVAL_MS`, i.e. a full
@@ -1484,8 +1479,8 @@ pub async fn interactive_tui(
             interval.tick().await;
             // Extension status (langfuse ✓ …, …) — cheap revision check, and the
             // only reason an idle session repaints its footer.
-            if state_tick.sync_extension_status() {
-                stats_overlay.set_hidden(!run_stats::active(&state_tick.ext_status));
+            let panels_changed = plugin_panels.sync(tui_tick.as_ref(), &state_tick.ext_status);
+            if state_tick.sync_extension_status() || panels_changed {
                 tui_tick.request_render(false);
             }
             if pet_tick.tick(scroll_tick.viewport_height()) {

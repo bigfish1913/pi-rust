@@ -975,6 +975,9 @@ pub enum RuntimeActionId {
     /// Args: `{"key":"langfuse","value":"langfuse ✓ (trace sent)"}`; an
     /// empty/absent `value` clears that key. Result: `{"ok":true,"changed":bool}`.
     /// Headless hosts accept the write but have nothing to render.
+    /// Legacy footer text (`key`, `value`) or an opt-in positioned text panel
+    /// (`key`, `panel`). See the SDK README for the versioned JSON contract.
+    /// Setting `panel` to null removes that panel without changing footer text.
     SetStatus = 18,
     /// Put text into the interactive editor (the prompt input box) instead of
     /// sending it. Args: `{"text":"...", "mode":"append"|"replace",

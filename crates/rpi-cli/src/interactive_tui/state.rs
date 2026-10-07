@@ -976,7 +976,12 @@ impl TuiState {
         }
         self.ext_status_revision
             .store(revision, std::sync::atomic::Ordering::SeqCst);
-        self.footer.set_extension_status(&self.ext_status.text_except(&[pet::PET_KEY, run_stats::KEY]));
+        let hidden = if pet::active(&self.ext_status) {
+            vec![pet::PET_KEY, "voice"]
+        } else {
+            vec![pet::PET_KEY]
+        };
+        self.footer.set_extension_status(&self.ext_status.text_except(&hidden));
         true
     }
 
