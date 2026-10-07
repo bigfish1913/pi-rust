@@ -976,7 +976,7 @@ impl TuiState {
         }
         self.ext_status_revision
             .store(revision, std::sync::atomic::Ordering::SeqCst);
-        self.footer.set_extension_status(&self.ext_status.text());
+        self.footer.set_extension_status(&self.ext_status.text_except(&[pet::PET_KEY, run_stats::KEY]));
         true
     }
 
@@ -1201,13 +1201,7 @@ impl TuiState {
 
     pub(super) fn toggle_tool_outputs(&self) -> bool {
         let next = !*self.tool_outputs_expanded.lock().unwrap();
-        *self.tool_outputs_expanded.lock().unwrap() = next;
-        for comp in self.tool_components.lock().unwrap().values() {
-            comp.set_expanded(next);
-        }
-        for comp in self.bash_components.lock().unwrap().values() {
-            comp.set_expanded(next);
-        }
+        self.transcript_view().set_expanded(next);
         next
     }
 

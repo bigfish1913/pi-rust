@@ -212,6 +212,11 @@ impl TranscriptView {
     /// live panel.
     pub fn set_expanded(&self, expanded: bool) {
         *self.expanded.lock().unwrap() = expanded;
+        for child in self.chat.get_children() {
+            if let Some(component) = child.as_any().downcast_ref::<ToolExecutionComponent>() {
+                component.set_expanded(expanded);
+            }
+        }
         for comp in self.tool_components.lock().unwrap().values() {
             comp.set_expanded(expanded);
         }
@@ -328,6 +333,12 @@ impl TranscriptView {
     /// later `tool_start` coalesces onto the same entry.
     fn sync_tool_calls(&self, calls: &[UiToolCall]) {
         for call in calls {
+            if matches!(
+                call.name.as_str(),
+                "todo" | "plan_mode_start" | "plan_mode_complete"
+            ) {
+                continue;
+            }
             if call.name == "bash" {
                 let command = call
                     .args
@@ -376,6 +387,9 @@ impl TranscriptView {
     }
 
     fn tool_start(&self, id: &str, name: &str, args: &Value, _width: usize) {
+        if matches!(name, "todo" | "plan_mode_start" | "plan_mode_complete") {
+            return;
+        }
         if name.trim().is_empty() {
             return;
         }
@@ -425,6 +439,9 @@ impl TranscriptView {
     }
 
     fn tool_update(&self, id: &str, name: &str, args: &Value, result: &Value, width: usize) {
+        if matches!(name, "todo" | "plan_mode_start" | "plan_mode_complete") {
+            return;
+        }
         if name.trim().is_empty() {
             return;
         }
@@ -494,6 +511,15 @@ impl TranscriptView {
     }
 
     fn tool_end(&self, id: &str, name: &str, result: &Value, is_error: bool, width: usize) {
+        if matches!(name, "plan_mode_start" | "plan_mode_complete")
+            && !is_error
+            && update_plan_panel(&self.chat, result)
+        {
+            return;
+        }
+        if name == "todo" && !is_error && update_todo_list(&self.chat, result) {
+            return;
+        }
         if name.trim().is_empty() {
             return;
         }
@@ -551,6 +577,97 @@ impl TranscriptView {
             apply_edit_diff(&comp, name, details, width);
         }
     }
+}
+
+/// Tool calls, slash commands, and restored entries share the same current plan.
+pub(crate) fn update_plan_panel(chat: &Arc<Container>, result: &Value) -> bool {
+    let Some(details) = result.get("details") else {
+        return false;
+    };
+    if details.get("kind").and_then(Value::as_str) != Some("plan") || details.get("error").is_some()
+    {
+        return false;
+    }
+    let Some(active) = details.get("active").and_then(Value::as_bool) else {
+        return false;
+    };
+    let plan = match details.get("plan") {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(plan)) => plan.clone(),
+        _ => return false,
+    };
+    for child in chat.get_children().into_iter().rev() {
+        if let Some(component) = child.as_any().downcast_ref::<ToolExecutionComponent>() {
+            if component.is_plan_panel() {
+                component.set_plan_state(plan, active);
+                component.set_result("", false);
+                if let Some(expanded) = details.get("expanded").and_then(Value::as_bool) {
+                    component.set_expanded(expanded);
+                }
+                chat.remove_child(&child);
+                chat.add_child(child);
+                return true;
+            }
+        }
+    }
+    let component = Arc::new(ToolExecutionComponent::new("plan_mode_complete", ""));
+    component.set_plan_state(plan, active);
+    component.set_result("", false);
+    component.set_expanded(
+        details
+            .get("expanded")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    );
+    chat.add_child(component);
+    true
+}
+
+/// Keep one visible current task list while retaining every result in session storage.
+pub(crate) fn update_todo_list(chat: &Arc<Container>, result: &Value) -> bool {
+    let Some(details) = result.get("details") else {
+        return false;
+    };
+    if details.get("error").is_some() {
+        return false;
+    }
+    let Some(items) = details.get("todos").and_then(Value::as_array) else {
+        return false;
+    };
+    let rows: Option<Vec<_>> = items
+        .iter()
+        .map(|item| {
+            let text = item.get("text")?.as_str()?.to_owned();
+            let status = if item.get("done").and_then(Value::as_bool) == Some(true) {
+                "completed"
+            } else {
+                item.get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("pending")
+            };
+            Some((text, status.to_owned()))
+        })
+        .collect();
+    let Some(rows) = rows else {
+        return false;
+    };
+    let text = tool_result_text(result);
+    for child in chat.get_children().into_iter().rev() {
+        if let Some(component) = child.as_any().downcast_ref::<ToolExecutionComponent>() {
+            if component.is_todo_list() {
+                component.set_todo_state(rows);
+                component.set_result(&text, false);
+                chat.remove_child(&child);
+                chat.add_child(child);
+                return true;
+            }
+        }
+    }
+    let candidate = Arc::new(ToolExecutionComponent::new("todo", ""));
+    candidate.set_todo_state(rows);
+    candidate.set_result(&text, false);
+    chat.add_child(candidate);
+    true
 }
 
 /// Map a wire/local assistant message's content blocks into the provider-free
@@ -1000,5 +1117,102 @@ mod tests {
         assert!(!view.expanded());
         assert!(view.toggle_expanded());
         assert!(view.expanded());
+    }
+
+    #[test]
+    fn todo_updates_share_one_panel_and_preserve_errors() {
+        let view = view();
+        for (id, done) in [("a", false), ("b", true)] {
+            view.sync_tool_calls(&[UiToolCall {
+                id: id.into(),
+                name: "todo".into(),
+                args: json!({"action":"toggle"}),
+            }]);
+            view.tool_start(id, "todo", &json!({}), 80);
+            view.tool_end(id, "todo", &json!({"content":[],"details":{"todos":[{"id":1,"text":"Run tests","done":done}]}}), false, 80);
+        }
+        assert_eq!(view.chat.child_count(), 1);
+        assert!(view.tool_components.lock().unwrap().is_empty());
+        let children = view.chat.get_children();
+        let panel = children[0]
+            .as_any()
+            .downcast_ref::<ToolExecutionComponent>()
+            .unwrap();
+        use rpi_tui::Component;
+        let rendered = rpi_tui::ansi::strip_ansi(&panel.render(80).join("\n"));
+        assert!(rendered.contains("1/1 completed"));
+        assert!(rendered.contains("[✓] Run tests"));
+        view.tool_end(
+            "error",
+            "todo",
+            &json!({"content":[{"type":"text","text":"invalid task"}]}),
+            true,
+            80,
+        );
+        assert_eq!(view.chat.child_count(), 2);
+        view.tool_end("soft-error", "todo", &json!({"content":[{"type":"text","text":"todo not found"}],"details":{"todos":[],"error":"todo not found"}}), false, 80);
+        assert_eq!(view.chat.child_count(), 3);
+        assert!(update_todo_list(
+            &view.chat,
+            &json!({"details":{"todos":[]}})
+        ));
+        assert_eq!(view.chat.child_count(), 3);
+        assert!(!update_todo_list(
+            &view.chat,
+            &json!({"details":{"todos":[{}]}})
+        ));
+        assert_eq!(view.chat.child_count(), 3);
+    }
+
+    #[test]
+    fn plan_tools_and_show_update_one_expandable_panel() {
+        let view = view();
+        view.sync_tool_calls(&[UiToolCall {
+            id: "start".into(),
+            name: "plan_mode_start".into(),
+            args: json!({}),
+        }]);
+        view.tool_start("start", "plan_mode_start", &json!({}), 80);
+        view.tool_end(
+            "start",
+            "plan_mode_start",
+            &json!({"details":{"kind":"plan","active":true}}),
+            false,
+            80,
+        );
+        let body = (1..=30)
+            .map(|i| format!("{i}. Step {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        view.tool_end(
+            "complete",
+            "plan_mode_complete",
+            &json!({"details":{"kind":"plan","active":false,"plan":body}}),
+            false,
+            80,
+        );
+        assert_eq!(view.chat.child_count(), 1);
+        assert!(view.tool_components.lock().unwrap().is_empty());
+        view.set_expanded(true);
+        let children = view.chat.get_children();
+        let panel = children[0]
+            .as_any()
+            .downcast_ref::<ToolExecutionComponent>()
+            .unwrap();
+        use rpi_tui::Component;
+        assert!(rpi_tui::ansi::strip_ansi(&panel.render(80).join("\n")).contains("Step 30"));
+        assert!(update_plan_panel(
+            &view.chat,
+            &json!({"kind":"message","details":{"kind":"plan","active":false,"plan":body,"expanded":true}})
+        ));
+        assert_eq!(view.chat.child_count(), 1);
+        view.tool_end(
+            "error",
+            "plan_mode_complete",
+            &json!({"content":[{"type":"text","text":"not active"}]}),
+            true,
+            80,
+        );
+        assert_eq!(view.chat.child_count(), 2);
     }
 }

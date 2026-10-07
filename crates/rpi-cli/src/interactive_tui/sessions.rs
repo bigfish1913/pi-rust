@@ -314,6 +314,30 @@ pub(super) async fn render_session_history(
                     rendered_any = true;
                 }
                 AgentMessage::ToolResult(result) => {
+                    if matches!(
+                        result.tool_name.as_str(),
+                        "plan_mode_start" | "plan_mode_complete"
+                    ) && !result.is_error
+                        && crate::transcript_view::update_plan_panel(
+                            chat,
+                            &serde_json::json!({"details":result.details}),
+                        )
+                    {
+                        rendered_any = true;
+                        continue;
+                    }
+                    if result.tool_name == "todo"
+                        && !result.is_error
+                        && crate::transcript_view::update_todo_list(
+                            chat,
+                            &serde_json::json!({
+                                "content": result.content, "details": result.details,
+                            }),
+                        )
+                    {
+                        rendered_any = true;
+                        continue;
+                    }
                     // Tool results are persisted as separate message entries,
                     // not as part of the assistant text. Restore them as
                     // completed tool panels so resumed sessions show the
@@ -364,6 +388,19 @@ pub(super) async fn render_session_history(
                 rendered_any = true;
             }
             Entry::Custom(custom) => {
+                if custom.custom_type == "plan-mode" {
+                    let mut details = custom.data.clone().unwrap_or(serde_json::Value::Null);
+                    if let Some(fields) = details.as_object_mut() {
+                        fields.insert("kind".into(), serde_json::json!("plan"));
+                    }
+                    if crate::transcript_view::update_plan_panel(
+                        chat,
+                        &serde_json::json!({"details":details}),
+                    ) {
+                        rendered_any = true;
+                        continue;
+                    }
+                }
                 let rendered = extension_session.as_ref().and_then(|session| {
                     extension_entry_component(session, &custom.custom_type, custom.data.clone())
                 });

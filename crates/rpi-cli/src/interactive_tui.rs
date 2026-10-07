@@ -46,6 +46,8 @@ mod autocomplete;
 use autocomplete::*;
 mod rendering;
 use rendering::*;
+mod pet;
+mod run_stats;
 
 #[cfg(test)]
 mod tests;
@@ -977,8 +979,11 @@ pub async fn interactive_tui(
     // Add bottom padding to the output area for visual breathing room.
     document_container.add_child(Arc::new(Spacer::new(1)));
 
+    let pet_document = Arc::new(pet::PetDocument::new(
+        document_container.clone(), reload_context.ext_status.clone(),
+    ));
     let scroll_view = Arc::new(ScrollView::new(
-        document_container.clone(),
+        pet_document.clone(),
         ScrollViewOptions {
             follow: FollowMode::End,
             primary: true,
@@ -1034,7 +1039,7 @@ pub async fn interactive_tui(
     if let Some(m) = model_catalog.iter().find(|m| m.id == lane_model_id) {
         footer.set_context_window(m.context_window as i64);
     }
-    footer.set_hints("Enter: Send | Shift+Enter: New line | Ctrl+C: Clear/Exit | Esc: Abort | Ctrl+L: Model | Ctrl+P: Cycle | Ctrl+O: Expand tool | /help");
+    footer.set_hints("Enter: Send | Shift+Enter: New line | Ctrl+C: Clear/Exit | Esc: Abort | Ctrl+L: Model | Ctrl+P: Cycle | Ctrl+O: Expand/collapse tools | Ctrl+T: Show/hide thinking | /help");
 
     // Live git-branch refresh (native fs-watch on `.git/HEAD`): a checkout or
     // commit updates the footer's branch without a manual refresh.
@@ -1450,6 +1455,18 @@ pub async fn interactive_tui(
     // The tick, not the key loop, drives the voice-draft auto-send: it must
     // fire even when the user types nothing.
     let tx_tick = tx.clone();
+    let pet_tick = pet_document.clone();
+    let stats_panel = Arc::new(run_stats::Panel(reload_context.ext_status.clone()));
+    let stats_overlay = tui.show_overlay(stats_panel, Some(rpi_tui::OverlayOptions {
+        anchor: rpi_tui::OverlayAnchor::TopRight,
+        width: Some(rpi_tui::tui::SizeValue::Absolute(44)),
+        max_height: Some(rpi_tui::tui::SizeValue::Absolute(9)),
+        non_capturing: true,
+        visible: Some(|width, height| width >= 50 && height >= 18),
+        ..Default::default()
+    }));
+    stats_overlay.set_hidden(!run_stats::active(&reload_context.ext_status));
+    let scroll_tick = scroll_view.clone();
     let tick_handle = tokio::spawn(async move {
         // 80ms per frame — upstream's `DEFAULT_INTERVAL_MS`, i.e. a full
         // 10-frame cycle every 800ms. The tick only *requests a repaint*; the
@@ -1468,6 +1485,10 @@ pub async fn interactive_tui(
             // Extension status (langfuse ✓ …, …) — cheap revision check, and the
             // only reason an idle session repaints its footer.
             if state_tick.sync_extension_status() {
+                stats_overlay.set_hidden(!run_stats::active(&state_tick.ext_status));
+                tui_tick.request_render(false);
+            }
+            if pet_tick.tick(scroll_tick.viewport_height()) {
                 tui_tick.request_render(false);
             }
             // Extension editor-text injection (`SetEditorText`): a voice plugin
@@ -1808,6 +1829,18 @@ pub async fn interactive_tui(
                 }
                 tui_for_key.request_render_reusing_scroll_content();
                 continue;
+            }
+
+            // Pet Esc pauses audio; an active run still reaches normal abort
+            // routing below. Dialogs and selectors retain their own Escape.
+            if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE
+                && !state_for_key.selector_open() && pet::active(&state_for_key.ext_status)
+            {
+                let _ = invoke_extension_command(&state_for_key.extension_session, "pet", "quiet");
+                tui_for_key.request_render(false);
+                if *state_for_key.status.lock().unwrap() == RunStatus::Idle && editor_for_key.get_text().is_empty() {
+                    continue;
+                }
             }
 
             // 0. Ctrl+C: upstream's `handleCtrlC`. A second press inside the
