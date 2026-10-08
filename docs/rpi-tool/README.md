@@ -342,7 +342,7 @@ Questions, ideas and early builds are welcome in either group:
 <table>
   <tr>
     <td align="center" width="50%">
-      <img src="docs/images/weixin.png" width="230" alt="WeChat group QR code"><br>
+      <img src="docs/images/weixin.jpg" width="230" alt="WeChat group QR code"><br>
       <sub><b>WeChat</b> — <a href="https://weixin.qq.com/g/AQYAAD8z3FmKPk143hi_HUVOtGvNqlHWMtVZu1VGGB_46JKoNpyhJvS7kDwQwUTr">微信交流群</a></sub>
     </td>
     <td align="center" width="50%">
