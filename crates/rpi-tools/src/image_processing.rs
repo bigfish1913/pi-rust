@@ -31,6 +31,159 @@
 use image::{DynamicImage, ImageFormat};
 use std::io::Cursor;
 
+/// Pi's default inline limits: 2000 pixels per side and 4.5 MiB of base64.
+pub const INLINE_IMAGE_MAX_SIDE: u32 = 2000;
+pub const INLINE_IMAGE_MAX_BASE64_BYTES: usize = 9 * 1024 * 1024 / 2;
+
+/// Decode, orient, resize and encode an image for model input. Small supported
+/// images retain their original bytes; oversized images fall back to JPEG.
+pub fn prepare_inline_image(bytes: &[u8]) -> Result<crate::tools::read::ProcessedImage, String> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use image::ImageDecoder;
+    let reader = image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| e.to_string())?;
+    let mut decoder = reader.into_decoder().map_err(|e| e.to_string())?;
+    let orientation = decoder.orientation().map_err(|e| e.to_string())?;
+    let mut img = DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())?;
+    img.apply_orientation(orientation);
+    let original = (img.width(), img.height());
+    let mime = crate::image::detect_supported_image_mime_type(bytes);
+    let base64_len = bytes.len().div_ceil(3) * 4;
+    if matches!(
+        mime,
+        Some("image/png" | "image/jpeg" | "image/gif" | "image/webp")
+    ) && original.0 <= INLINE_IMAGE_MAX_SIDE
+        && original.1 <= INLINE_IMAGE_MAX_SIDE
+        && base64_len < INLINE_IMAGE_MAX_BASE64_BYTES
+        && orientation == image::metadata::Orientation::NoTransforms
+    {
+        return Ok(crate::tools::read::ProcessedImage {
+            data: STANDARD.encode(bytes),
+            mime_type: mime.unwrap().into(),
+            hints: vec![],
+        });
+    }
+    img = resize_image(
+        img,
+        Some(INLINE_IMAGE_MAX_SIDE),
+        Some(INLINE_IMAGE_MAX_SIDE),
+    );
+    for _ in 0..8 {
+        let png = encode_image(&img, Some(OutputFormat::Png))?;
+        let mut candidate = (png, "image/png");
+        if candidate.0.len().div_ceil(3) * 4 >= INLINE_IMAGE_MAX_BASE64_BYTES {
+            // JPEG cannot encode alpha; convert explicitly before encoding.
+            let mut rgb = img.to_rgb8();
+            let rgba = img.to_rgba8();
+            for (target, source) in rgb.pixels_mut().zip(rgba.pixels()) {
+                let alpha = source[3] as u16;
+                for channel in 0..3 {
+                    target[channel] =
+                        ((source[channel] as u16 * alpha + 255 * (255 - alpha)) / 255) as u8;
+                }
+            }
+            let rgb = DynamicImage::ImageRgb8(rgb);
+            for quality in [85, 70, 50] {
+                let jpeg = encode_image(&rgb, Some(OutputFormat::Jpeg { quality }))?;
+                if jpeg.len() < candidate.0.len() {
+                    candidate = (jpeg, "image/jpeg");
+                }
+                if candidate.0.len().div_ceil(3) * 4 < INLINE_IMAGE_MAX_BASE64_BYTES {
+                    break;
+                }
+            }
+        }
+        if candidate.0.len().div_ceil(3) * 4 < INLINE_IMAGE_MAX_BASE64_BYTES {
+            let mut hints = vec![];
+            if let Some(mime) = mime {
+                if mime != candidate.1 {
+                    hints.push(format!("[Image converted from {mime} to {}.]", candidate.1));
+                }
+            }
+            if original != (img.width(), img.height()) {
+                hints.push(format!(
+                    "[Image resized from {}x{} to {}x{}.]",
+                    original.0,
+                    original.1,
+                    img.width(),
+                    img.height()
+                ));
+            }
+            return Ok(crate::tools::read::ProcessedImage {
+                data: STANDARD.encode(candidate.0),
+                mime_type: candidate.1.into(),
+                hints,
+            });
+        }
+        let bounds = ((img.width() * 3 / 4).max(1), (img.height() * 3 / 4).max(1));
+        img = resize_image(img, Some(bounds.0), Some(bounds.1));
+    }
+    Err("Image could not be resized below the inline image size limit".into())
+}
+
+/// Shared processor for the built-in read tool.
+pub struct InlineImageProcessor;
+
+/// Normalize image blocks while retaining order and surfacing omissions as
+/// text, rather than sending an invalid image to a provider.
+pub fn normalize_image_blocks(blocks: &mut Vec<rpi_ai::types::Content>) {
+    use rpi_ai::types::Content;
+    let mut output = Vec::with_capacity(blocks.len());
+    for block in std::mem::take(blocks) {
+        if let Content::Image(mut img) = block {
+            use base64::{engine::general_purpose::STANDARD, Engine};
+            match STANDARD
+                .decode(&img.data)
+                .map_err(|e| e.to_string())
+                .and_then(|bytes| prepare_inline_image(&bytes))
+            {
+                Ok(processed) => {
+                    img.data = processed.data;
+                    img.mime_type = processed.mime_type;
+                    output.push(Content::Image(img));
+                    output.extend(processed.hints.into_iter().map(Content::text));
+                }
+                Err(error) => output.push(Content::text(format!("[Image omitted: {error}.]"))),
+            }
+        } else {
+            output.push(block);
+        }
+    }
+    *blocks = output;
+}
+
+impl crate::tools::read::ReadImageProcessor for InlineImageProcessor {
+    fn process(
+        &self,
+        bytes: &[u8],
+        _mime_type: &str,
+        auto_resize: bool,
+    ) -> Result<crate::tools::read::ProcessedImage, String> {
+        if auto_resize {
+            return prepare_inline_image(bytes);
+        }
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let mime = crate::image::detect_supported_image_mime_type(bytes);
+        let (bytes, mime) = if matches!(
+            mime,
+            Some("image/png" | "image/jpeg" | "image/gif" | "image/webp")
+        ) {
+            (bytes.to_vec(), mime.unwrap())
+        } else {
+            (
+                process_image(bytes, ImageProcessingOptions::default())?,
+                "image/png",
+            )
+        };
+        Ok(crate::tools::read::ProcessedImage {
+            data: STANDARD.encode(bytes),
+            mime_type: mime.into(),
+            hints: vec![],
+        })
+    }
+}
+
 /// Output format for processed images.
 #[derive(Debug, Clone, Copy)]
 pub enum OutputFormat {
@@ -248,6 +401,62 @@ pub fn get_image_dimensions(data: &[u8]) -> Result<(u32, u32), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inline_images_keep_small_bytes_and_resize_large_images() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let small = encode_image(&DynamicImage::new_rgba8(8, 8), Some(OutputFormat::Png)).unwrap();
+        let processed = prepare_inline_image(&small).unwrap();
+        assert_eq!(STANDARD.decode(processed.data).unwrap(), small);
+        let large = encode_image(
+            &DynamicImage::new_rgba8(2400, 1200),
+            Some(OutputFormat::Png),
+        )
+        .unwrap();
+        let processed = prepare_inline_image(&large).unwrap();
+        assert!(processed.data.len() < INLINE_IMAGE_MAX_BASE64_BYTES);
+        let resized = image::load_from_memory(&STANDARD.decode(processed.data).unwrap()).unwrap();
+        assert_eq!((resized.width(), resized.height()), (2000, 1000));
+        assert!(processed.hints[0].contains("2400x1200 to 2000x1000"));
+    }
+
+    #[test]
+    fn inline_bmp_is_converted_and_invalid_images_are_reported() {
+        let mut bmp = Cursor::new(Vec::new());
+        DynamicImage::new_rgb8(4, 4)
+            .write_to(&mut bmp, ImageFormat::Bmp)
+            .unwrap();
+        let processed = prepare_inline_image(&bmp.into_inner()).unwrap();
+        assert_eq!(processed.mime_type, "image/png");
+        let mut blocks = vec![rpi_ai::types::Content::Image(rpi_ai::types::ImageContent {
+            kind: rpi_ai::types::ImageContentType,
+            data: "invalid".into(),
+            mime_type: "image/png".into(),
+        })];
+        normalize_image_blocks(&mut blocks);
+        assert!(
+            matches!(&blocks[0], rpi_ai::types::Content::Text(text) if text.text.contains("Image omitted"))
+        );
+    }
+
+    #[test]
+    fn inline_images_reduce_encoded_payload_even_below_dimension_limit() {
+        let mut rgba = image::RgbaImage::new(1200, 1200);
+        let mut seed = 1u32;
+        for pixel in rgba.pixels_mut() {
+            for channel in &mut pixel.0 {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                *channel = seed as u8;
+            }
+        }
+        let png = encode_image(&DynamicImage::ImageRgba8(rgba), Some(OutputFormat::Png)).unwrap();
+        assert!(png.len().div_ceil(3) * 4 > INLINE_IMAGE_MAX_BASE64_BYTES);
+        let processed = prepare_inline_image(&png).unwrap();
+        assert!(processed.data.len() < INLINE_IMAGE_MAX_BASE64_BYTES);
+        assert_eq!(processed.mime_type, "image/jpeg");
+    }
 
     #[test]
     fn test_detect_image_mime_png() {

@@ -92,6 +92,8 @@ pub use registry::{
 };
 pub use resources::{emit_resources_discover, DiscoveredResources};
 pub use status::ExtensionStatusMailbox;
+mod panel;
+pub use panel::{ExtensionPanel, PanelAnchor, PanelLayout};
 pub use tool::{PluginToolAdapter, PluginToolHandle, ToolCallContext};
 pub use translate::{
     dispatch_data_event, dispatch_data_event_claiming, dispatch_empty_event,
@@ -519,7 +521,7 @@ extern "C" fn trampoline_register_event_handler(
     }
 }
 
-/// P2: ABI v3 `declare` trampoline. Runs synchronously during a v3 plugin's
+/// Plugin `declare` trampoline. Runs synchronously during a plugin's
 /// `register` (thread-local `CURRENT_HOST_API` is set). The plugin hands a
 /// borrowed JSON payload (`{"priority":60,"platforms":["linux"]}`); we parse
 /// and apply it to this plugin's registry (retro-updating any handlers already

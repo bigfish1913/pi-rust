@@ -72,6 +72,8 @@ pub struct AssistantMessageComponent {
     content_container: Arc<Container>,
     /// Rendering options
     options: Mutex<AssistantMessageOptions>,
+    show_images: Mutex<bool>,
+    trailing_spacing: Mutex<usize>,
     /// Whether this message has tool calls
     has_tool_calls: Mutex<bool>,
     /// Whether currently streaming
@@ -98,6 +100,8 @@ impl AssistantMessageComponent {
         Self {
             content_container,
             options: Mutex::new(options),
+            show_images: Mutex::new(true),
+            trailing_spacing: Mutex::new(0),
             has_tool_calls: Mutex::new(false),
             is_streaming: Mutex::new(false),
             last_blocks: Mutex::new(Vec::new()),
@@ -222,10 +226,9 @@ impl AssistantMessageComponent {
                     i += 1;
                 }
                 AssistantBlock::Image(data) if !data.is_empty() => {
-                    self.content_container.add_child(Arc::new(Image::from_data(
-                        data.clone(),
-                        ImageOptions::default(),
-                    )));
+                    let image = Arc::new(Image::from_data(data.clone(), ImageOptions::default()));
+                    image.set_inline_visible(*self.show_images.lock().unwrap());
+                    self.content_container.add_child(image);
                     i += 1;
                 }
                 AssistantBlock::Image(_) => {
@@ -329,6 +332,15 @@ impl AssistantMessageComponent {
         self.rebuild_content(&blocks);
     }
 
+    pub fn set_show_images(&self, show: bool) {
+        *self.show_images.lock().unwrap() = show;
+        for child in self.content_container.get_children() {
+            if let Some(image) = child.as_any().downcast_ref::<Image>() {
+                image.set_inline_visible(show);
+            }
+        }
+    }
+
     /// Set hidden thinking label. Rebuilds the last content (mirrors TS).
     pub fn set_hidden_thinking_label(&self, label: &str) {
         let blocks = {
@@ -362,6 +374,11 @@ impl AssistantMessageComponent {
         self.markdown_transformer.lock().unwrap().clone()
     }
 
+    /// Add trailing rows only when the message renders visible content.
+    pub fn set_trailing_spacing(&self, rows: usize) {
+        *self.trailing_spacing.lock().unwrap() = rows;
+    }
+
     /// Set streaming state.
     pub fn set_streaming(&self, streaming: bool) {
         if let Ok(mut s) = self.is_streaming.lock() {
@@ -372,8 +389,13 @@ impl AssistantMessageComponent {
 
 impl Component for AssistantMessageComponent {
     fn render(&self, width: usize) -> Vec<String> {
-        // Render content container
-        self.content_container.render(width)
+        let mut lines = self.content_container.render(width);
+        // A provider can start with no content or whitespace-only deltas.
+        // Such a message must not reserve even its inter-message spacing.
+        if !lines.is_empty() {
+            lines.extend((0..*self.trailing_spacing.lock().unwrap()).map(|_| String::new()));
+        }
+        lines
     }
 
     fn invalidate(&self) {
@@ -412,6 +434,30 @@ mod tests {
 
         let lines = msg.render(80);
         assert!(lines.is_empty() || lines.iter().all(|l| l.trim().is_empty()));
+    }
+
+    #[test]
+    fn trailing_spacing_does_not_render_for_empty_streaming_content() {
+        let msg = AssistantMessageComponent::default();
+        msg.set_trailing_spacing(1);
+        msg.set_streaming(true);
+        for blocks in [
+            vec![],
+            vec![AssistantBlock::Text(" \n\t".into())],
+            vec![AssistantBlock::Thinking(" ".into())],
+        ] {
+            msg.update_blocks(&blocks);
+            assert!(msg.render(80).is_empty());
+        }
+        msg.update_text("Hello");
+        msg.set_trailing_spacing(0);
+        let mut expected = msg.render(80);
+        expected.push(String::new());
+        msg.set_trailing_spacing(1);
+        assert_eq!(msg.render(80), expected);
+        msg.update_blocks(&[]);
+        msg.set_streaming(false);
+        assert!(msg.render(80).is_empty());
     }
 
     #[test]

@@ -7,6 +7,9 @@ use unicode_width::UnicodeWidthStr;
 
 /// Get the visible width of a string, ignoring ANSI escape sequences.
 pub fn visible_width(s: &str) -> usize {
+    if s.contains("\x1b_") || s.contains("\x1b]") {
+        return crate::ansi::visible_width(s);
+    }
     let mut width = 0;
     let mut in_escape = false;
     let mut chars = s.chars().peekable();
@@ -222,6 +225,9 @@ pub fn truncate_to_width(s: &str, max_width: usize, suffix: &str) -> String {
 
 /// Strip ANSI escape sequences from a string.
 pub fn strip_ansi(s: &str) -> String {
+    if s.contains("\x1b_") || s.contains("\x1b]") {
+        return crate::ansi::strip_ansi(s);
+    }
     let mut result = String::new();
     let mut in_escape = false;
     let mut chars = s.chars().peekable();

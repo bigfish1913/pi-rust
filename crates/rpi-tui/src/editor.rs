@@ -1282,7 +1282,9 @@ impl Editor {
                 self.submit();
             }
             // Shift+Enter inserts a newline (mirrors `tui.input.newLine`).
-            (KeyModifiers::SHIFT, KeyCode::Enter) => self.insert("\n"),
+            (KeyModifiers::SHIFT, KeyCode::Enter)
+            | (KeyModifiers::SHIFT, KeyCode::Char('\r'))
+            | (KeyModifiers::SHIFT, KeyCode::Char('\n')) => self.insert("\n"),
 
             // Ctrl shortcuts
             (KeyModifiers::CONTROL, KeyCode::Char('a')) => self.cursor_home(),
@@ -2011,6 +2013,18 @@ l12",
         assert_eq!(editor.get_text(), "hello");
         editor.undo();
         assert_eq!(editor.get_text(), "hello world", "kill is undoable");
+    }
+
+    #[test]
+    fn shift_enter_encodings_insert_newline_without_submitting() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        for code in [KeyCode::Enter, KeyCode::Char('\r'), KeyCode::Char('\n')] {
+            let editor = Editor::simple();
+            editor.on_submit(Arc::new(|_| panic!("Shift+Enter must not submit")));
+            editor.insert("draft");
+            editor.handle_key(KeyEvent::new(code, KeyModifiers::SHIFT));
+            assert_eq!(editor.get_text(), "draft\n");
+        }
     }
 
     #[test]

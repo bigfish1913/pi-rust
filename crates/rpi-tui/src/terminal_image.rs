@@ -93,16 +93,15 @@ static CAPABILITIES_CACHE: std::sync::OnceLock<Mutex<TerminalCapabilities>> =
 
 /// Get cached capabilities.
 pub fn get_capabilities() -> TerminalCapabilities {
-    let cache = CAPABILITIES_CACHE.get_or_init(|| Mutex::new(TerminalCapabilities::default()));
+    let cache = CAPABILITIES_CACHE.get_or_init(|| Mutex::new(detect_capabilities()));
     cache.lock().map(|c| c.clone()).unwrap_or_default()
 }
 
 /// Set capabilities.
 pub fn set_capabilities(capabilities: TerminalCapabilities) {
-    if let Some(cache) = CAPABILITIES_CACHE.get() {
-        if let Ok(mut c) = cache.lock() {
-            *c = capabilities;
-        }
+    let cache = CAPABILITIES_CACHE.get_or_init(|| Mutex::new(detect_capabilities()));
+    if let Ok(mut c) = cache.lock() {
+        *c = capabilities;
     }
 }
 
@@ -112,18 +111,11 @@ pub fn reset_capabilities_cache() {
 }
 
 /// Detect terminal capabilities.
-/// This queries the terminal for supported protocols.
+/// Detect supported protocols from the terminal environment, as Pi does.
 pub fn detect_capabilities() -> TerminalCapabilities {
     let mut caps = TerminalCapabilities::default();
 
-    // Try to detect Kitty protocol
-    // In a real implementation, we would query the terminal
-    // For now, we check environment variables
-    if std::env::var("KITTY_WINDOW_ID").is_ok() {
-        caps.protocol = ImageProtocol::Kitty;
-    } else if std::env::var("ITERM_SESSION_ID").is_ok() {
-        caps.protocol = ImageProtocol::ITerm2;
-    }
+    caps.protocol = detect_image_protocol(|key| std::env::var(key).ok());
 
     // Get terminal size
     if let Ok(size) = crossterm::terminal::size() {
@@ -132,6 +124,32 @@ pub fn detect_capabilities() -> TerminalCapabilities {
     }
 
     caps
+}
+
+fn detect_image_protocol(env: impl Fn(&str) -> Option<String>) -> ImageProtocol {
+    let program = env("TERM_PROGRAM").unwrap_or_default().to_lowercase();
+    let term = env("TERM").unwrap_or_default().to_lowercase();
+    let present = |key| env(key).is_some_and(|value| !value.is_empty());
+    if present("TMUX") || term.starts_with("tmux") || term.starts_with("screen") {
+        return ImageProtocol::None;
+    }
+    if present("KITTY_WINDOW_ID")
+        || program == "kitty"
+        || program == "ghostty"
+        || term.contains("ghostty")
+        || present("GHOSTTY_RESOURCES_DIR")
+        || program == "wezterm"
+        || present("WEZTERM_PANE")
+        || program == "warpterminal"
+        || present("WARP_SESSION_ID")
+        || present("WARP_TERMINAL_SESSION_UUID")
+    {
+        ImageProtocol::Kitty
+    } else if present("ITERM_SESSION_ID") || program == "iterm.app" {
+        ImageProtocol::ITerm2
+    } else {
+        ImageProtocol::None
+    }
 }
 
 /// Set cell dimensions.
@@ -165,7 +183,7 @@ pub fn encode_kitty(data: &[u8], options: &ImageRenderOptions) -> String {
 
     // Build control string
     let mut control = String::new();
-    control.push_str("a=T,f=100"); // Transmit and display
+    control.push_str("a=T,f=100,C=1,q=2"); // PNG; keep cursor fixed, suppress responses
 
     if let Some(id) = options.id {
         control.push_str(&format!(",i={}", id));
@@ -177,10 +195,7 @@ pub fn encode_kitty(data: &[u8], options: &ImageRenderOptions) -> String {
 
     // Calculate dimensions
     if let (Some(w), Some(h)) = (options.width, options.height) {
-        let caps = get_capabilities();
-        let px_width = w as u32 * caps.cell_width as u32;
-        let px_height = h as u32 * caps.cell_height as u32;
-        control.push_str(&format!(",s={},v={}", px_width, px_height));
+        control.push_str(&format!(",c={w},r={h}"));
     }
 
     // Encode image data as base64
@@ -239,6 +254,30 @@ pub fn delete_kitty_image(id: u32) -> String {
 /// Delete all Kitty images.
 pub fn delete_all_kitty_images() -> String {
     "\x1b_Ga=d,d=A\x1b\\".to_string()
+}
+
+/// Delete placements whose retained line changed or disappeared. Other images
+/// remain in place, so ordinary streaming text does not retransmit them.
+pub(crate) fn removed_kitty_placements(previous: &[String], current: &[String]) -> String {
+    let mut output = String::new();
+    for (row, line) in previous.iter().enumerate() {
+        if current.get(row) == Some(line) {
+            continue;
+        }
+        for chunk in line.split("\x1b_G").skip(1) {
+            let control = chunk.split(';').next().unwrap_or_default();
+            if !control.split(',').any(|field| field == "a=T") {
+                continue;
+            }
+            if let Some(id) = control
+                .split(',')
+                .find_map(|field| field.strip_prefix("i=")?.parse::<u32>().ok())
+            {
+                output.push_str(&delete_kitty_image(id));
+            }
+        }
+    }
+    output
 }
 
 /// Create an OSC 8 hyperlink.
@@ -419,6 +458,67 @@ pub fn image_fallback(_alt_text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_pi_image_terminals_and_disables_multiplexers() {
+        for program in [
+            "kitty",
+            "ghostty",
+            "wezterm",
+            "WarpTerminal",
+            "iTerm.app",
+            "vscode",
+        ] {
+            let expected = match program {
+                "iTerm.app" => ImageProtocol::ITerm2,
+                "vscode" => ImageProtocol::None,
+                _ => ImageProtocol::Kitty,
+            };
+            assert_eq!(
+                detect_image_protocol(|key| (key == "TERM_PROGRAM").then(|| program.into())),
+                expected
+            );
+            assert_eq!(
+                detect_image_protocol(|key| match key {
+                    "TERM_PROGRAM" => Some(program.into()),
+                    "TMUX" => Some("session".into()),
+                    _ => None,
+                }),
+                ImageProtocol::None
+            );
+        }
+        assert_eq!(
+            detect_image_protocol(|key| match key {
+                "TERM" => Some("screen-256color".into()),
+                "KITTY_WINDOW_ID" => Some("1".into()),
+                _ => None,
+            }),
+            ImageProtocol::None
+        );
+    }
+
+    #[test]
+    fn kitty_graphics_have_zero_width_and_removed_placements_are_deleted() {
+        let sequence = encode_kitty(
+            b"png",
+            &ImageRenderOptions {
+                id: Some(42),
+                width: Some(10),
+                height: Some(5),
+                ..Default::default()
+            },
+        );
+        assert!(sequence.contains("C=1"));
+        assert!(sequence.contains("c=10,r=5"));
+        assert_eq!(crate::ansi::visible_width(&sequence), 0);
+        assert_eq!(crate::utils::visible_width(&sequence), 0);
+        assert_eq!(crate::utils::truncate_to_width(&sequence, 10, ""), sequence);
+        assert!(removed_kitty_placements(&[sequence.clone()], &[sequence.clone()]).is_empty());
+        assert_eq!(
+            removed_kitty_placements(&[sequence], &["[Image]".into()]),
+            delete_kitty_image(42)
+        );
+    }
 
     #[test]
     fn test_capabilities_default() {

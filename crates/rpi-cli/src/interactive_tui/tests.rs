@@ -1,6 +1,120 @@
 use super::*;
 use rpi_tui::Component;
 
+#[test]
+fn queued_user_message_keeps_images_and_image_only_messages() {
+    let image = rpi_ai::types::ImageContent {
+        kind: rpi_ai::types::ImageContentType,
+        data: "test".into(),
+        mime_type: "image/png".into(),
+    };
+    for text in ["", "inspect this"] {
+        let message = user_message_with_images(text, vec![image.clone()]);
+        let AgentMessage::User(user) = message else {
+            panic!("expected user message")
+        };
+        let rpi_ai::types::UserContent::Blocks(blocks) = user.content else {
+            panic!("expected image blocks")
+        };
+        assert!(
+            matches!(blocks.last(), Some(rpi_ai::types::Content::Image(value)) if value == &image)
+        );
+        assert_eq!(blocks.len(), if text.is_empty() { 1 } else { 2 });
+    }
+}
+
+#[test]
+fn pasted_images_accept_multiple_quoted_paths_without_consuming_normal_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut bytes, 1, 1);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder
+            .write_header()
+            .unwrap()
+            .write_image_data(&[255, 0, 0, 255])
+            .unwrap();
+    }
+    let first = dir.path().join("first image.png");
+    let second = dir.path().join("second.png");
+    std::fs::write(&first, &bytes).unwrap();
+    std::fs::write(&second, &bytes).unwrap();
+    let quoted = format!("\"{}\" \"{}\"", first.display(), second.display());
+    assert_eq!(images_from_pasted_paths(&quoted).unwrap().len(), 2);
+    assert_eq!(
+        images_from_pasted_paths(&format!("{}\n{}", first.display(), second.display()))
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(images_from_pasted_paths("please inspect these images").is_none());
+    let state = test_tui_state();
+    let images = images_from_pasted_paths(&quoted).unwrap();
+    for image in &images {
+        state.queue_image(image.clone());
+    }
+    let sent = state.take_pending_images();
+    assert!(state.take_pending_images().is_empty());
+    state.queue_image(images[0].clone());
+    state.restore_pending_images(sent);
+    assert_eq!(state.take_pending_images().len(), 3);
+    state.editor.set_text("existing draft");
+    assert!(attach_pasted_images(
+        &state,
+        &format!("\"{}\"", first.display())
+    ));
+    assert_eq!(state.take_pending_images().len(), 1);
+    assert_eq!(state.editor.get_text(), "existing draft");
+    assert!(!attach_pasted_images(&state, "normal clipboard text"));
+    assert!(state.take_pending_images().is_empty());
+}
+
+#[test]
+#[ignore = "set RPI_STATS_DLL to the monitor DLL"]
+fn monitor_function_key_works_with_a_draft_without_changing_text() {
+    use rpi_extensions::{
+        dispatch_empty_event, load_session_mixed, NullDiagnostics, RegistrySnapshot,
+    };
+    use rpi_plugin_sdk::EventTag;
+    struct Shutdown(Arc<RegistrySnapshot>);
+    impl Drop for Shutdown {
+        fn drop(&mut self) {
+            dispatch_empty_event(&self.0, EventTag::SessionShutdown);
+        }
+    }
+    let state = test_tui_state();
+    let session = load_session_mixed(
+        &[],
+        &[std::path::PathBuf::from(
+            std::env::var("RPI_STATS_DLL").unwrap(),
+        )],
+        Arc::new(NullDiagnostics),
+        None,
+    );
+    let snapshot = session.snapshot_arc().expect("monitor loaded");
+    *state.extension_session.lock().unwrap() = session;
+    let _shutdown = Shutdown(snapshot);
+    state.editor.set_text("unsent draft");
+    assert!(dispatch_key_event(
+        &state,
+        &KeyEvent::new(KeyCode::F(8), KeyModifiers::NONE),
+        &state.editor
+    ));
+    assert_eq!(state.editor.get_text(), "unsent draft");
+    assert!(!dispatch_key_event(
+        &state,
+        &KeyEvent::new(KeyCode::F(8), KeyModifiers::CONTROL),
+        &state.editor
+    ));
+    assert!(!dispatch_key_event(
+        &state,
+        &KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+        &state.editor
+    ));
+    assert_eq!(state.editor.get_text(), "unsent draft");
+}
+
 /// A draft injected from a voice transcription is submitted only when it is
 /// still exactly what we put in the editor and no run has started; any
 /// user edit (or a cleared editor) hands it back for editing instead.

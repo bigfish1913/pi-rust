@@ -51,7 +51,7 @@ pub fn strip_ansi(s: &str) -> String {
                         }
                     }
                 }
-                Some(']') => {
+                Some(']' | '_' | 'P' | '^') => {
                     chars.next(); // consume ']'
                                   // OSC sequence: skip until BEL (0x07) or ST (ESC \)
                     while let Some(&c) = chars.peek() {

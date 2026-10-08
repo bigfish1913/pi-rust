@@ -234,6 +234,10 @@ impl Terminal for ProcessTerminal {
         // Event::Paste instead of individual key events (which would trigger
         // submit per line for multi-line pastes).
         self.write("\x1b[?2004h");
+        // Ask supporting Unix terminals to distinguish modified Enter from
+        // plain Enter. Without this, Shift+Enter may arrive as an ordinary CR.
+        #[cfg(unix)]
+        self.write("\x1b[>1u");
         self.update_size();
         self.flush();
     }
@@ -242,6 +246,8 @@ impl Terminal for ProcessTerminal {
         // Mirror `enter_raw_mode` without tearing the terminal down: drop the
         // bracketed-paste mode it turned on and restore the line discipline.
         self.write("\x1b[?2004l");
+        #[cfg(unix)]
+        self.write("\x1b[<u");
         self.flush();
         let _ = cterm::disable_raw_mode();
     }
@@ -255,16 +261,7 @@ impl Terminal for ProcessTerminal {
         on_input: Box<dyn Fn(InputEvent) + Send + Sync>,
         on_resize: Box<dyn Fn() + Send + Sync>,
     ) {
-        // Enter raw mode
-        let _ = cterm::enable_raw_mode();
-
-        if let Ok(mut running) = self.running.lock() {
-            *running = true;
-        }
-
-        self.configure_mouse_tracking();
-        self.hide_cursor();
-        self.flush();
+        self.enter_raw_mode();
 
         // Update size initially
         self.update_size();
@@ -322,6 +319,8 @@ impl Terminal for ProcessTerminal {
         self.show_cursor();
         // Disable bracketed paste mode before exiting raw mode.
         self.write("\x1b[?2004l");
+        #[cfg(unix)]
+        self.write("\x1b[<u");
         self.flush();
 
         // Exit raw mode

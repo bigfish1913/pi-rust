@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::component::Component;
+use super::hstack::HStack;
 use super::layout_node::LayoutViewport;
 use super::scroll_view::ScrollView;
 use super::vstack::{layout_vstack_constrained_with, VStack};
@@ -248,6 +249,9 @@ fn layout_component(
     if let Some(vstack) = component.as_any().downcast_ref::<VStack>() {
         return layout_vstack(component, vstack, x, y, safe_width, height, clip, context);
     }
+    if let Some(hstack) = component.as_any().downcast_ref::<HStack>() {
+        return layout_hstack(component, hstack, x, y, safe_width, height, clip, context);
+    }
 
     // ScrollView: clip the child to the allocated viewport height and render
     // only the visible window. Without this the scroll view emitted *all*
@@ -361,6 +365,61 @@ fn layout_vstack(
     let mut box_layout = LayoutBox::new(component.clone(), rect, own_clip);
     box_layout.children = child_boxes;
     box_layout
+}
+
+/// Horizontal stacks must recurse through the layout engine so scroll viewport,
+/// cursor and hit-test rectangles remain tied to each child's allocated area.
+fn layout_hstack(
+    component: &Arc<dyn Component>,
+    stack: &HStack,
+    x: usize,
+    y: usize,
+    width: usize,
+    height: Option<usize>,
+    clip: LayoutRect,
+    context: &mut LayoutContext,
+) -> LayoutBox {
+    let children = stack.get_children();
+    let allocated =
+        layout_vstack_constrained_with(&children, width, width, stack.gap(), |child, w| {
+            context
+                .render_cached(child, w)
+                .iter()
+                .map(|line| visible_width(line))
+                .max()
+                .unwrap_or(0)
+        });
+    let mut boxes = Vec::new();
+    let mut column = x;
+    for (index, (child, child_width)) in allocated.into_iter().enumerate() {
+        if index > 0 {
+            column = column.saturating_add(stack.gap());
+        }
+        if child_width > 0 {
+            let child_clip = clip.intersect(&LayoutRect::new(
+                column,
+                y,
+                child_width,
+                height.unwrap_or(clip.height),
+            ));
+            let mut child_box =
+                layout_component(&child, column, y, child_width, height, child_clip, context);
+            child_box.parent_index = Some(index);
+            boxes.push(child_box);
+        }
+        column = column.saturating_add(child_width);
+    }
+    let box_height = height.unwrap_or_else(|| {
+        boxes
+            .iter()
+            .map(|child| child.rect.height)
+            .max()
+            .unwrap_or(0)
+    });
+    let rect = LayoutRect::new(x, y, width, box_height);
+    let mut result = LayoutBox::new(component.clone(), rect, clip.intersect(&rect));
+    result.children = boxes;
+    result
 }
 
 /// Lay out a ScrollView by clipping its child to the allocated viewport.

@@ -244,12 +244,12 @@ impl BashExecutionComponent {
         }
         if hidden > 0 {
             if expanded {
-                parts.push(colors.muted.fg("(Ctrl+T to collapse)"));
+                parts.push(colors.muted.fg("(Ctrl+O to collapse)"));
             } else {
                 parts.push(
                     colors
                         .muted
-                        .fg(&format!("... {} more lines (Ctrl+T to expand)", hidden)),
+                        .fg(&format!("... {} more lines (Ctrl+O to expand)", hidden)),
                 );
             }
         }

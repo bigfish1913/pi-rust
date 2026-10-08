@@ -377,12 +377,255 @@ pub(super) fn read_clipboard_image() -> Result<Option<rpi_ai::types::ImageConten
     }))
 }
 
-pub(super) fn add_image_preview(chat: &Arc<Container>, image: &rpi_ai::types::ImageContent) {
+/// Finder copied files arrive as aliases, rather than clipboard bitmaps.
+#[cfg(all(target_os = "macos", feature = "clipboard"))]
+pub(super) fn read_clipboard_file_paths() -> Option<Vec<String>> {
+    let script = "try\nset items to the clipboard as alias list\nset paths to {}\nrepeat with itemPath in items\nset end of paths to POSIX path of itemPath\nend repeat\nset AppleScript's text item delimiters to linefeed\nreturn paths as text\non error\nreturn \"\"\nend try";
+    let output = std::process::Command::new("osascript")
+        .args(["-e", script])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let paths: Vec<String> = text
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if paths.is_empty() {
+        None
+    } else {
+        Some(paths)
+    }
+}
+
+/// Explorer's copied files use CF_HDROP rather than a bitmap or plain text.
+#[cfg(all(windows, feature = "clipboard"))]
+pub(super) fn read_clipboard_file_paths() -> Option<Vec<String>> {
+    use windows_sys::Win32::System::DataExchange::{
+        CloseClipboard, GetClipboardData, OpenClipboard,
+    };
+    use windows_sys::Win32::UI::Shell::DragQueryFileW;
+    const CF_HDROP: u32 = 15;
+
+    struct ClipboardRead;
+    impl Drop for ClipboardRead {
+        fn drop(&mut self) {
+            // SAFETY: this guard exists only after OpenClipboard succeeds.
+            unsafe {
+                CloseClipboard();
+            }
+        }
+    }
+
+    // SAFETY: null HWND is supported; the clipboard is opened only for reading.
+    if unsafe { OpenClipboard(std::ptr::null_mut()) } == 0 {
+        return None;
+    }
+    let _guard = ClipboardRead;
+    // SAFETY: the clipboard remains open while its borrowed HDROP is queried.
+    let drop = unsafe { GetClipboardData(CF_HDROP) };
+    if drop.is_null() {
+        return None;
+    }
+    let count = unsafe { DragQueryFileW(drop, u32::MAX, std::ptr::null_mut(), 0) };
+    let mut paths = Vec::new();
+    for index in 0..count {
+        // SAFETY: query the length first, then provide that many UTF-16 units
+        // plus the terminator. No DragFinish: the handle belongs to the clipboard.
+        let length = unsafe { DragQueryFileW(drop, index, std::ptr::null_mut(), 0) };
+        if length == 0 {
+            continue;
+        }
+        let mut buffer = vec![0u16; length as usize + 1];
+        let copied =
+            unsafe { DragQueryFileW(drop, index, buffer.as_mut_ptr(), buffer.len() as u32) };
+        if copied == 0 {
+            continue;
+        }
+        let path = String::from_utf16(&buffer[..copied as usize]).ok()?;
+        paths.push(path);
+    }
+    if paths.is_empty() {
+        None
+    } else {
+        Some(paths)
+    }
+}
+
+#[cfg(not(all(any(target_os = "macos", windows), feature = "clipboard")))]
+pub(super) fn read_clipboard_file_paths() -> Option<Vec<String>> {
+    None
+}
+
+pub(super) fn attach_pasted_images(state: &Arc<TuiState>, text: &str) -> bool {
+    let Some(images) = images_from_pasted_paths(text) else {
+        return false;
+    };
+    let count = images.len();
+    for image in images {
+        state.queue_image(image);
+    }
+    add_note_message(
+        &state.chat_container,
+        &format!("Attached {count} image(s) to the next prompt."),
+    );
+    true
+}
+
+/// Consume a paste as attachments only when every path is an actual image.
+/// Otherwise leave the pasted text intact. Handles Finder escaped spaces,
+/// quoted multiple paths and clipboard file paths separated by newlines.
+pub(super) fn images_from_pasted_paths(text: &str) -> Option<Vec<rpi_ai::types::ImageContent>> {
+    let candidate = text.trim().trim_matches(['\"', '\'']);
+    let single = std::path::Path::new(candidate);
+    if single.is_file() {
+        return crate::app::image_content_from_path(single)
+            .ok()
+            .flatten()
+            .map(|image| vec![image]);
+    }
+    let mut paths = Vec::new();
+    if text.contains('\n') {
+        paths.extend(
+            text.lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| line.trim().trim_matches(['\"', '\'']).to_owned()),
+        );
+    } else {
+        let mut path = String::new();
+        let mut quote = None;
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '\'' | '"' if quote == Some(ch) => quote = None,
+                '\'' | '"' if quote.is_none() => quote = Some(ch),
+                '\\' if quote != Some('\'')
+                    && chars.peek().is_some_and(|ch| {
+                        ch.is_whitespace() || matches!(ch, '\'' | '"' | '\\')
+                    }) =>
+                {
+                    path.push(chars.next().unwrap());
+                }
+                ch if ch.is_whitespace() && quote.is_none() => {
+                    if !path.is_empty() {
+                        paths.push(std::mem::take(&mut path));
+                    }
+                }
+                _ => path.push(ch),
+            }
+        }
+        if quote.is_some() {
+            return None;
+        }
+        if !path.is_empty() {
+            paths.push(path);
+        }
+    }
+    if paths.is_empty() {
+        return None;
+    }
+    paths
+        .iter()
+        .map(|path| {
+            crate::app::image_content_from_path(std::path::Path::new(path))
+                .ok()
+                .flatten()
+        })
+        .collect()
+}
+
+pub(super) fn user_message_with_images(
+    text: &str,
+    images: Vec<rpi_ai::types::ImageContent>,
+) -> AgentMessage {
+    let content = if images.is_empty() {
+        rpi_ai::types::UserContent::Text(text.into())
+    } else {
+        let mut blocks = Vec::with_capacity(images.len() + 1);
+        if !text.is_empty() {
+            blocks.push(rpi_ai::types::Content::text(text));
+        }
+        blocks.extend(images.into_iter().map(rpi_ai::types::Content::Image));
+        rpi_ai::types::UserContent::Blocks(blocks)
+    };
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default();
+    AgentMessage::User(UserMessage::new(content, timestamp))
+}
+
+pub(super) fn add_image_previews(
+    chat: &Arc<Container>,
+    images: &[rpi_ai::types::ImageContent],
+    show: bool,
+) {
+    for image in images {
+        add_image_preview(chat, image, show);
+    }
+}
+
+pub(super) fn add_user_images(
+    chat: &Arc<Container>,
+    user: &rpi_ai::types::UserMessage,
+    show: bool,
+) {
+    if let rpi_ai::types::UserContent::Blocks(blocks) = &user.content {
+        for block in blocks {
+            if let rpi_ai::types::Content::Image(image) = block {
+                add_image_preview(chat, image, show);
+            }
+        }
+    }
+}
+
+pub(super) fn add_tool_images(
+    chat: &Arc<Container>,
+    content: &[rpi_agent::types::TextContentOrImage],
+    show: bool,
+) {
+    for block in content {
+        if let rpi_agent::types::TextContentOrImage::Image(image) = block {
+            add_image_preview(
+                chat,
+                &rpi_ai::types::ImageContent {
+                    kind: rpi_ai::types::ImageContentType,
+                    data: image.data.clone(),
+                    mime_type: image.mime_type.clone(),
+                },
+                show,
+            );
+        }
+    }
+}
+
+pub(super) fn add_image_preview(
+    chat: &Arc<Container>,
+    image: &rpi_ai::types::ImageContent,
+    show: bool,
+) {
     if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&image.data) {
+        // Kitty's f=100 payload must be PNG, regardless of the model MIME type.
+        let bytes = if image.mime_type == "image/png" {
+            bytes
+        } else {
+            match rpi_tools::image_processing::process_image(&bytes, Default::default()) {
+                Ok(png) => png,
+                Err(_) => {
+                    add_note_message(chat, "[Image preview unavailable]");
+                    return;
+                }
+            }
+        };
         let mut options = ImageOptions::default();
-        options.width = Some(48);
-        options.alt_text = Some("Attached image".into());
-        chat.add_child(Arc::new(Image::from_data(bytes, options)));
+        options.width = Some(60);
+        options.alt_text = Some("[Attached image]".into());
+        let preview = Arc::new(Image::from_data(bytes, options));
+        preview.set_inline_visible(show);
+        chat.add_child(preview);
         chat.add_child(Arc::new(Spacer::new(1)));
     }
 }

@@ -17,7 +17,7 @@ use crate::utils::{apply_background_to_line, truncate_to_width, wrap_text_with_a
 const DIFF_LINE_CAP: usize = 40;
 /// Diff lines shown when collapsed — a preview density that keeps a big edit
 /// from dumping 40 lines into the transcript while still showing what changed.
-/// Ctrl+T expands to [`DIFF_LINE_CAP`].
+/// Ctrl+O expands to [`DIFF_LINE_CAP`].
 const DIFF_PREVIEW_LINES: usize = 6;
 /// Maximum visual rows shown for a regular tool result while collapsed.
 /// Read/grep/find output can be hundreds of physical lines; keeping a compact
@@ -72,6 +72,9 @@ pub struct ToolExecutionComponent {
     /// result; the interactive host calls [`Self::set_result_markdown`] when
     /// it sees that flag. See [`Self::set_result_markdown`].
     result_markdown: Mutex<bool>,
+    /// Complete todo snapshot, rendered as a single compact task list.
+    todo_state: Mutex<Option<Vec<(String, String)>>>,
+    plan_state: Mutex<Option<(String, bool)>>,
     /// Bumped by every mutator. A finished tool panel is immutable (no live
     /// elapsed timer), so its rendered lines are memoized by width; the
     /// revision drops the cache when args/result/expand change.
@@ -106,6 +109,8 @@ impl ToolExecutionComponent {
             expanded: Mutex::new(false),
             diff_lines: Mutex::new(None),
             result_markdown: Mutex::new(false),
+            todo_state: Mutex::new(None),
+            plan_state: Mutex::new(None),
             revision: AtomicU64::new(0),
             cache: Mutex::new(None),
         }
@@ -232,6 +237,25 @@ impl ToolExecutionComponent {
         }
         self.bump();
     }
+
+    /// Install plain task rows; the host owns plugin snapshot parsing.
+    pub fn set_todo_state(&self, rows: Vec<(String, String)>) {
+        *self.todo_state.lock().unwrap() = Some(rows);
+        self.bump();
+    }
+
+    pub fn is_todo_list(&self) -> bool {
+        self.todo_state.lock().unwrap().is_some()
+    }
+
+    pub fn set_plan_state(&self, plan: String, active: bool) {
+        *self.plan_state.lock().unwrap() = Some((plan, active));
+        self.bump();
+    }
+
+    pub fn is_plan_panel(&self) -> bool {
+        self.plan_state.lock().unwrap().is_some()
+    }
 }
 
 impl Component for ToolExecutionComponent {
@@ -259,6 +283,98 @@ impl Component for ToolExecutionComponent {
         }
 
         let colors = theme().colors;
+        if let Some((plan, active)) = self.plan_state.lock().unwrap().as_ref() {
+            let status = if *active {
+                "Planning"
+            } else if plan.trim().is_empty() {
+                "Idle"
+            } else {
+                "Ready"
+            };
+            let mut rows = vec![
+                String::new(),
+                truncate_to_width(
+                    &colors.accent.fg(&bold(&format!(" Plan · {status}"))),
+                    width,
+                    "…",
+                ),
+            ];
+            if plan.trim().is_empty() {
+                let hint = if *active {
+                    "Inspect the repository, then complete the plan."
+                } else {
+                    "No saved plan. Use /plan start."
+                };
+                for line in wrap_text_with_ansi(hint, width.saturating_sub(2).max(1)) {
+                    rows.push(truncate_to_width(
+                        &format!("  {}", colors.muted.fg(&line)),
+                        width,
+                        "…",
+                    ));
+                }
+            } else {
+                let content = crate::markdown::Markdown::new(plan.clone(), 0, 0)
+                    .render(width.saturating_sub(2).max(1));
+                let expanded = *self.expanded.lock().unwrap();
+                let shown = if expanded {
+                    content.len()
+                } else {
+                    content.len().min(16)
+                };
+                for line in content.iter().take(shown) {
+                    rows.push(truncate_to_width(&format!("  {line}"), width, "…"));
+                }
+                if content.len() > shown {
+                    rows.push(truncate_to_width(
+                        &colors.muted.fg(&format!(
+                            "  … {} more lines · Ctrl+O or /plan show",
+                            content.len() - shown
+                        )),
+                        width,
+                        "…",
+                    ));
+                }
+            }
+            return rows;
+        }
+        if let Some(todos) = self.todo_state.lock().unwrap().as_ref() {
+            let done = todos
+                .iter()
+                .filter(|(_, status)| status == "completed")
+                .count();
+            let heading = format!(" Tasks  {done}/{} completed", todos.len());
+            let mut rows = vec![
+                String::new(),
+                truncate_to_width(&colors.tool_title.fg(&bold(&heading)), width, "…"),
+            ];
+            if todos.is_empty() {
+                rows.push(colors.muted.fg("   No tasks"));
+            }
+            for (text, status) in todos {
+                let (mark, color) = match status.as_str() {
+                    "completed" => ("[✓]", colors.muted),
+                    "in_progress" => ("[•]", colors.accent),
+                    _ => ("[ ]", colors.tool_output),
+                };
+                for (index, line) in wrap_text_with_ansi(text, width.saturating_sub(7).max(1))
+                    .into_iter()
+                    .enumerate()
+                {
+                    let label = if status == "completed" {
+                        format!("\x1b[9m{line}\x1b[29m")
+                    } else {
+                        line
+                    };
+                    let prefix = if index == 0 { mark } else { "   " };
+                    rows.push(truncate_to_width(
+                        &format!("   {} {}", color.fg(prefix), color.fg(&label)),
+                        width,
+                        "…",
+                    ));
+                }
+            }
+            return rows;
+        }
         let mut lines = Vec::new();
 
         // Top spacer — pi's tool-execution.ts adds a Spacer(1) child inside
@@ -281,10 +397,10 @@ impl Component for ToolExecutionComponent {
 
         // Skill invocation mode: render as native-Pi's `[skill]` box rather
         // than a generic tool panel — custom-message background, collapsed to
-        // a single `[skill] <name> (Ctrl+T to expand)` line, expanded to the
+        // a single `[skill] <name> (Ctrl+O to expand)` line, expanded to the
         // full skill markdown (the `read` result). Mirrors pi's
         // `SkillInvocationMessageComponent` while reusing the tool panel's
-        // result streaming + Ctrl+T expand plumbing.
+        // result streaming + Ctrl+O expand plumbing.
         if let Some(skill) = skill_name.as_deref() {
             let content = result.as_deref().unwrap_or("");
             let lines = render_skill(&colors, skill, content, *expanded, width);
@@ -439,13 +555,13 @@ impl Component for ToolExecutionComponent {
             let hidden = visual_lines.len().saturating_sub(shown);
             if hidden > 0 {
                 let hint = format!(
-                    "  {} … {hidden} more lines (Ctrl+T to expand)",
+                    "  {} … {hidden} more lines (Ctrl+O to expand)",
                     colors.dim.fg("│")
                 );
                 let hint = colors.muted.fg(&hint);
                 lines.push(apply_background_to_line(&hint, width, |s| bg.bg(s)));
             } else if *expanded && visual_lines.len() > OUTPUT_PREVIEW_LINES {
-                let hint = format!("  {} Ctrl+T to collapse", colors.dim.fg("│"));
+                let hint = format!("  {} Ctrl+O to collapse", colors.dim.fg("│"));
                 let hint = colors.muted.fg(&hint);
                 lines.push(apply_background_to_line(&hint, width, |s| bg.bg(s)));
             }
@@ -482,9 +598,9 @@ impl Component for ToolExecutionComponent {
             if total > cap {
                 let more = total - cap;
                 let hint = if *expanded {
-                    format!("… {} more diff lines (Ctrl+T to collapse)", more)
+                    format!("… {} more diff lines (Ctrl+O to collapse)", more)
                 } else {
-                    format!("… {} more diff lines (Ctrl+T to expand)", more)
+                    format!("… {} more diff lines (Ctrl+O to expand)", more)
                 };
                 lines.push(format!("  {}", colors.muted.fg(&hint)));
             }
@@ -519,7 +635,7 @@ impl Component for ToolExecutionComponent {
 ///
 /// Mirrors pi's `SkillInvocationMessageComponent`: a `[skill]` box on the
 /// custom-message background. Collapsed it is a single line
-/// `[skill] <name> (Ctrl+T to expand)`; expanded it shows the `[skill]` label,
+/// `[skill] <name> (Ctrl+O to expand)`; expanded it shows the `[skill]` label,
 /// the bold skill name, then the full skill markdown content (the `read`
 /// result) rendered with the standard markdown component.
 fn render_skill(
@@ -540,12 +656,12 @@ fn render_skill(
     out.push(apply_background_to_line("", width, |s| bg.bg(s)));
 
     if !expanded {
-        // Single collapsed line: `[skill] <name> (Ctrl+T to expand)`.
+        // Single collapsed line: `[skill] <name> (Ctrl+O to expand)`.
         let line = format!(
             "{pad}{} {} {}",
             colors.custom_message_label.fg(&label),
             colors.custom_message_text.fg(name),
-            colors.dim.fg("(Ctrl+T to expand)"),
+            colors.dim.fg("(Ctrl+O to expand)"),
         );
         out.push(apply_background_to_line(&line, width, |s| bg.bg(s)));
         out.push(apply_background_to_line("", width, |s| bg.bg(s)));
@@ -1068,6 +1184,72 @@ mod tools {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn plan_panel_keeps_markdown_and_hides_raw_arguments() {
+        use super::*;
+        let panel = ToolExecutionComponent::new("plan_mode_complete", "RAW_PLAN_ARGUMENT");
+        panel.set_result("Plan complete. Normal tool access restored.", false);
+        panel.set_plan_state(
+            "## Implementation\n\n1. Inspect code\n2. Update UI\n\n## Validation\n\nRun tests"
+                .into(),
+            false,
+        );
+        panel.set_expanded(true);
+        let rendered = strip_ansi(&panel.render(60).join("\n"));
+        assert!(rendered.contains("Plan · Ready"));
+        assert!(rendered.contains("Implementation"));
+        assert!(rendered.contains("Validation"));
+        assert!(rendered.contains("Inspect code"));
+        assert!(rendered.contains("Update UI"));
+        assert!(!rendered.contains("RAW_PLAN_ARGUMENT"));
+        assert!(!rendered.contains("args:"));
+        assert!(!rendered.contains("Normal tool access"));
+        panel.set_plan_state(String::new(), false);
+        assert!(strip_ansi(&panel.render(60).join("\n")).contains("Plan · Idle"));
+    }
+
+    #[test]
+    fn completed_plan_can_expand_to_the_full_body() {
+        use super::*;
+        let panel = ToolExecutionComponent::new("plan_mode_complete", "{}");
+        panel.set_result("", false);
+        panel.set_plan_state(
+            (1..=30)
+                .map(|i| format!("{i}. Step {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            false,
+        );
+        let preview = strip_ansi(&panel.render(60).join("\n"));
+        assert!(preview.contains("more lines"));
+        assert!(!preview.contains("Step 30"));
+        panel.set_expanded(true);
+        let full = strip_ansi(&panel.render(60).join("\n"));
+        assert!(full.contains("Step 30"));
+    }
+    #[test]
+    fn task_list_wraps_and_distinguishes_statuses() {
+        use super::*;
+        let panel = ToolExecutionComponent::new("todo", "{}");
+        panel.set_result("ignored summary", false);
+        panel.set_todo_state(vec![
+            ("Finished task".into(), "completed".into()),
+            ("正在处理一个很长的任务名称".into(), "in_progress".into()),
+            ("Next task".into(), "pending".into()),
+        ]);
+        let rows = panel.render(24);
+        let rendered = strip_ansi(&rows.join("\n"));
+        assert!(rendered.contains("1/3 completed"));
+        assert!(rendered.contains("[✓] Finished task"));
+        assert!(rendered.contains("[•]"));
+        assert!(rendered.contains("[ ] Next task"));
+        assert!(rows.iter().any(|line| line.contains("\x1b[9m")));
+        assert!(!rendered.contains("ignored summary"));
+        assert!(!rendered.contains("args:"));
+        for line in rows {
+            assert!(crate::utils::visible_width(&line) <= 24);
+        }
+    }
     use super::*;
 
     #[test]
@@ -1192,7 +1374,7 @@ mod tests {
     }
 
     #[test]
-    fn long_tool_output_collapses_and_ctrl_t_expands() {
+    fn long_tool_output_collapses_and_ctrl_o_expands() {
         let tool = ToolExecutionComponent::new("read", r#"{"path":"large.rs"}"#);
         let output = (1..=20)
             .map(|line| format!("line {line}"))
@@ -1202,14 +1384,14 @@ mod tests {
 
         let collapsed = tool.render(80);
         let collapsed_plain = crate::ansi::strip_ansi(&collapsed.join("\n"));
-        assert!(collapsed_plain.contains("8 more lines (Ctrl+T to expand)"));
+        assert!(collapsed_plain.contains("8 more lines (Ctrl+O to expand)"));
         assert!(!collapsed_plain.contains("line 20"));
 
         tool.set_expanded(true);
         let expanded = tool.render(80);
         let expanded_plain = crate::ansi::strip_ansi(&expanded.join("\n"));
         assert!(expanded_plain.contains("line 20"));
-        assert!(expanded_plain.contains("Ctrl+T to collapse"));
+        assert!(expanded_plain.contains("Ctrl+O to collapse"));
     }
 
     /// The header summarizes the args JSON into a compact signature instead
@@ -1233,7 +1415,7 @@ mod tests {
             plain.contains("[skill] release"),
             "collapsed label: {plain}"
         );
-        assert!(plain.contains("(Ctrl+T to expand)"), "expand hint: {plain}");
+        assert!(plain.contains("(Ctrl+O to expand)"), "expand hint: {plain}");
         assert!(!plain.contains("Steps"), "collapsed hides body: {plain}");
         // Uses the custom-message background (dark: #2d2838), not a tool tint.
         assert!(
@@ -1334,7 +1516,7 @@ mod tests {
             .find(|l| l.contains("more diff lines"));
         assert!(hint.is_some(), "preview hint missing");
         assert!(
-            hint.as_ref().unwrap().contains("Ctrl+T to expand"),
+            hint.as_ref().unwrap().contains("Ctrl+O to expand"),
             "hint text: {hint:?}"
         );
 

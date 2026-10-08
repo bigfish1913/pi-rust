@@ -127,6 +127,7 @@ pub(super) async fn switch_to_session(
                 chat,
                 state.markdown_transformer(),
                 Some(state.extension_session.clone()),
+                state.images_visible(),
             )
             .await;
             state.set_status(RunStatus::Idle);
@@ -247,6 +248,7 @@ pub(super) async fn fork_session(
         chat,
         state.markdown_transformer(),
         Some(state.extension_session.clone()),
+        state.images_visible(),
     )
     .await;
     state.set_status(RunStatus::Idle);
@@ -267,6 +269,7 @@ pub(super) async fn render_session_history(
     chat: &Arc<Container>,
     transformer: Option<MarkdownTransformer>,
     extension_session: Option<crate::session::ExtensionSessionCell>,
+    show_images: bool,
 ) {
     let tree = harness.session().view("main");
     let entries = match tree
@@ -291,20 +294,21 @@ pub(super) async fn render_session_history(
             Entry::Message(me) => match &me.message {
                 AgentMessage::User(u) => {
                     add_user_message(chat, &user_message_text(u));
+                    add_user_images(chat, u, show_images);
                     rendered_any = true;
                 }
                 AgentMessage::Assistant(a) => {
                     let comp = Arc::new(AssistantMessageComponent::new(
                         AssistantMessageOptions::default(),
                     ));
+                    comp.set_show_images(show_images);
+                    comp.set_trailing_spacing(1);
                     if let Some(t) = &transformer {
                         comp.set_markdown_transformer(Some(t.clone()));
                     }
                     comp.update_blocks(&assistant_blocks(a));
                     chat.add_child(comp);
-                    // Single trailing spacer: the next transcript entry (user or
-                    // assistant) follows one blank line below.
-                    chat.add_child(Arc::new(Spacer::new(1)));
+                    // The component adds spacing only when it has visible content.
                     if let Some(text) = extension_usage_text(extension_session.as_ref(), &a.usage) {
                         add_note_message(chat, &text);
                     }
@@ -314,6 +318,30 @@ pub(super) async fn render_session_history(
                     rendered_any = true;
                 }
                 AgentMessage::ToolResult(result) => {
+                    if matches!(
+                        result.tool_name.as_str(),
+                        "plan_mode_start" | "plan_mode_complete"
+                    ) && !result.is_error
+                        && crate::transcript_view::update_plan_panel(
+                            chat,
+                            &serde_json::json!({"details":result.details}),
+                        )
+                    {
+                        rendered_any = true;
+                        continue;
+                    }
+                    if result.tool_name == "todo"
+                        && !result.is_error
+                        && crate::transcript_view::update_todo_list(
+                            chat,
+                            &serde_json::json!({
+                                "content": result.content, "details": result.details,
+                            }),
+                        )
+                    {
+                        rendered_any = true;
+                        continue;
+                    }
                     // Tool results are persisted as separate message entries,
                     // not as part of the assistant text. Restore them as
                     // completed tool panels so resumed sessions show the
@@ -324,6 +352,11 @@ pub(super) async fn render_session_history(
                         comp.set_result_markdown(true);
                     }
                     chat.add_child(comp);
+                    for block in &result.content {
+                        if let rpi_ai::types::Content::Image(image) = block {
+                            add_image_preview(chat, image, show_images);
+                        }
+                    }
                     chat.add_child(Arc::new(Spacer::new(1)));
                     rendered_any = true;
                 }
@@ -364,6 +397,19 @@ pub(super) async fn render_session_history(
                 rendered_any = true;
             }
             Entry::Custom(custom) => {
+                if custom.custom_type == "plan-mode" {
+                    let mut details = custom.data.clone().unwrap_or(serde_json::Value::Null);
+                    if let Some(fields) = details.as_object_mut() {
+                        fields.insert("kind".into(), serde_json::json!("plan"));
+                    }
+                    if crate::transcript_view::update_plan_panel(
+                        chat,
+                        &serde_json::json!({"details":details}),
+                    ) {
+                        rendered_any = true;
+                        continue;
+                    }
+                }
                 let rendered = extension_session.as_ref().and_then(|session| {
                     extension_entry_component(session, &custom.custom_type, custom.data.clone())
                 });

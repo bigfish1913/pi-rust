@@ -593,6 +593,9 @@ impl TuiAltScreen {
         let previous_width = *self.main_previous_width.lock().unwrap();
         let previous_height = *self.main_previous_height.lock().unwrap();
         let previous_cursor = *self.main_previous_cursor.lock().unwrap();
+        terminal.write(&crate::terminal_image::removed_kitty_placements(
+            &previous, &lines,
+        ));
 
         // Size changes alter wrapping or viewport coordinates everywhere;
         // mirror upstream and rebuild once. Normal streaming updates stay
@@ -786,6 +789,9 @@ impl TuiAltScreen {
 
         // Build output buffer
         let mut buffer = String::new();
+        buffer.push_str(&crate::terminal_image::removed_kitty_placements(
+            &previous, &visible,
+        ));
 
         if let Ok(terminal) = self.terminal.lock() {
             if full_redraw {

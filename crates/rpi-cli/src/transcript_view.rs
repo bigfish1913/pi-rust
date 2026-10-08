@@ -84,6 +84,7 @@ pub enum UiEvent {
 /// so a streaming assistant message and each tool/bash panel are updated in
 /// place rather than rebuilt per event.
 pub struct TranscriptView {
+    show_images: bool,
     chat: Arc<Container>,
     current_assistant: Arc<Mutex<Option<Arc<AssistantMessageComponent>>>>,
     tool_components: Arc<Mutex<HashMap<String, Arc<ToolExecutionComponent>>>>,
@@ -133,6 +134,7 @@ impl TranscriptView {
         markdown_transformer: Arc<Mutex<Option<MarkdownTransformer>>>,
     ) -> Self {
         Self {
+            show_images: true,
             chat,
             current_assistant,
             tool_components,
@@ -141,6 +143,12 @@ impl TranscriptView {
             expanded,
             markdown_transformer,
         }
+    }
+
+    /// Configure image visibility for newly created assistant components.
+    pub fn with_show_images(mut self, show: bool) -> Self {
+        self.show_images = show;
+        self
     }
 
     /// Append a user prompt bubble.
@@ -212,6 +220,11 @@ impl TranscriptView {
     /// live panel.
     pub fn set_expanded(&self, expanded: bool) {
         *self.expanded.lock().unwrap() = expanded;
+        for child in self.chat.get_children() {
+            if let Some(component) = child.as_any().downcast_ref::<ToolExecutionComponent>() {
+                component.set_expanded(expanded);
+            }
+        }
         for comp in self.tool_components.lock().unwrap().values() {
             comp.set_expanded(expanded);
         }
@@ -295,13 +308,14 @@ impl TranscriptView {
             AssistantMessageOptions::default(),
         ));
         comp.set_hide_thinking(*self.hide_thinking.lock().unwrap());
+        comp.set_show_images(self.show_images);
+        comp.set_trailing_spacing(1);
         if let Some(transformer) = self.markdown_transformer.lock().unwrap().clone() {
             comp.set_markdown_transformer(Some(transformer));
         }
         comp.set_streaming(true);
         comp.update_blocks(blocks);
         self.chat.add_child(comp.clone());
-        self.chat.add_child(Arc::new(Spacer::new(1)));
         *self.current_assistant.lock().unwrap() = Some(comp);
     }
 
@@ -314,12 +328,13 @@ impl TranscriptView {
                 AssistantMessageOptions::default(),
             ));
             comp.set_hide_thinking(*self.hide_thinking.lock().unwrap());
+            comp.set_show_images(self.show_images);
+            comp.set_trailing_spacing(1);
             if let Some(transformer) = self.markdown_transformer.lock().unwrap().clone() {
                 comp.set_markdown_transformer(Some(transformer));
             }
             comp.set_streaming(true);
             self.chat.add_child(comp.clone());
-            self.chat.add_child(Arc::new(Spacer::new(1)));
             *current = Some(comp);
         }
     }
@@ -328,6 +343,12 @@ impl TranscriptView {
     /// later `tool_start` coalesces onto the same entry.
     fn sync_tool_calls(&self, calls: &[UiToolCall]) {
         for call in calls {
+            if matches!(
+                call.name.as_str(),
+                "todo" | "plan_mode_start" | "plan_mode_complete"
+            ) {
+                continue;
+            }
             if call.name == "bash" {
                 let command = call
                     .args
@@ -376,6 +397,9 @@ impl TranscriptView {
     }
 
     fn tool_start(&self, id: &str, name: &str, args: &Value, _width: usize) {
+        if matches!(name, "todo" | "plan_mode_start" | "plan_mode_complete") {
+            return;
+        }
         if name.trim().is_empty() {
             return;
         }
@@ -425,6 +449,9 @@ impl TranscriptView {
     }
 
     fn tool_update(&self, id: &str, name: &str, args: &Value, result: &Value, width: usize) {
+        if matches!(name, "todo" | "plan_mode_start" | "plan_mode_complete") {
+            return;
+        }
         if name.trim().is_empty() {
             return;
         }
@@ -494,6 +521,15 @@ impl TranscriptView {
     }
 
     fn tool_end(&self, id: &str, name: &str, result: &Value, is_error: bool, width: usize) {
+        if matches!(name, "plan_mode_start" | "plan_mode_complete")
+            && !is_error
+            && update_plan_panel(&self.chat, result)
+        {
+            return;
+        }
+        if name == "todo" && !is_error && update_todo_list(&self.chat, result) {
+            return;
+        }
         if name.trim().is_empty() {
             return;
         }
@@ -553,6 +589,97 @@ impl TranscriptView {
     }
 }
 
+/// Tool calls, slash commands, and restored entries share the same current plan.
+pub(crate) fn update_plan_panel(chat: &Arc<Container>, result: &Value) -> bool {
+    let Some(details) = result.get("details") else {
+        return false;
+    };
+    if details.get("kind").and_then(Value::as_str) != Some("plan") || details.get("error").is_some()
+    {
+        return false;
+    }
+    let Some(active) = details.get("active").and_then(Value::as_bool) else {
+        return false;
+    };
+    let plan = match details.get("plan") {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(plan)) => plan.clone(),
+        _ => return false,
+    };
+    for child in chat.get_children().into_iter().rev() {
+        if let Some(component) = child.as_any().downcast_ref::<ToolExecutionComponent>() {
+            if component.is_plan_panel() {
+                component.set_plan_state(plan, active);
+                component.set_result("", false);
+                if let Some(expanded) = details.get("expanded").and_then(Value::as_bool) {
+                    component.set_expanded(expanded);
+                }
+                chat.remove_child(&child);
+                chat.add_child(child);
+                return true;
+            }
+        }
+    }
+    let component = Arc::new(ToolExecutionComponent::new("plan_mode_complete", ""));
+    component.set_plan_state(plan, active);
+    component.set_result("", false);
+    component.set_expanded(
+        details
+            .get("expanded")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    );
+    chat.add_child(component);
+    true
+}
+
+/// Keep one visible current task list while retaining every result in session storage.
+pub(crate) fn update_todo_list(chat: &Arc<Container>, result: &Value) -> bool {
+    let Some(details) = result.get("details") else {
+        return false;
+    };
+    if details.get("error").is_some() {
+        return false;
+    }
+    let Some(items) = details.get("todos").and_then(Value::as_array) else {
+        return false;
+    };
+    let rows: Option<Vec<_>> = items
+        .iter()
+        .map(|item| {
+            let text = item.get("text")?.as_str()?.to_owned();
+            let status = if item.get("done").and_then(Value::as_bool) == Some(true) {
+                "completed"
+            } else {
+                item.get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("pending")
+            };
+            Some((text, status.to_owned()))
+        })
+        .collect();
+    let Some(rows) = rows else {
+        return false;
+    };
+    let text = tool_result_text(result);
+    for child in chat.get_children().into_iter().rev() {
+        if let Some(component) = child.as_any().downcast_ref::<ToolExecutionComponent>() {
+            if component.is_todo_list() {
+                component.set_todo_state(rows);
+                component.set_result(&text, false);
+                chat.remove_child(&child);
+                chat.add_child(child);
+                return true;
+            }
+        }
+    }
+    let candidate = Arc::new(ToolExecutionComponent::new("todo", ""));
+    candidate.set_todo_state(rows);
+    candidate.set_result(&text, false);
+    chat.add_child(candidate);
+    true
+}
+
 /// Map a wire/local assistant message's content blocks into the provider-free
 /// [`AssistantBlock`] list the shared component renders (text + thinking +
 /// decoded image blocks, in document order).
@@ -577,7 +704,18 @@ pub fn assistant_blocks_from_value(message: &Value) -> Vec<AssistantBlock> {
                 if let Some(data) = block.get("data").and_then(Value::as_str) {
                     if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) {
                         if !bytes.is_empty() {
-                            blocks.push(AssistantBlock::Image(bytes));
+                            let png = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+                                Some(bytes)
+                            } else {
+                                rpi_tools::image_processing::process_image(
+                                    &bytes,
+                                    Default::default(),
+                                )
+                                .ok()
+                            };
+                            if let Some(png) = png {
+                                blocks.push(AssistantBlock::Image(png));
+                            }
                         }
                     }
                 }
@@ -849,6 +987,49 @@ mod tests {
     }
 
     #[test]
+    fn empty_assistant_start_and_whitespace_deltas_do_not_move_the_transcript() {
+        use rpi_tui::Component;
+        for starts_with_event in [true, false] {
+            let view = view();
+            view.add_user("hi");
+            let before = view.chat.render(80);
+            if starts_with_event {
+                view.apply(&UiEvent::AssistantStart { blocks: vec![] }, 80);
+                assert_eq!(view.chat.render(80), before);
+            }
+            for blocks in [
+                vec![],
+                vec![AssistantBlock::Text(" ".into())],
+                vec![AssistantBlock::Thinking("\n".into())],
+            ] {
+                view.apply(
+                    &UiEvent::AssistantUpdate {
+                        blocks,
+                        tool_calls: vec![],
+                    },
+                    80,
+                );
+                assert_eq!(view.chat.render(80), before);
+            }
+            view.apply(
+                &UiEvent::AssistantUpdate {
+                    blocks: vec![AssistantBlock::Text("hello".into())],
+                    tool_calls: vec![],
+                },
+                80,
+            );
+            let visible = view.chat.render(80);
+            assert!(visible.len() > before.len());
+            assert!(visible.iter().any(|line| line.contains("hello")));
+            assert_eq!(visible.last(), Some(&String::new()));
+            view.apply(&UiEvent::AssistantEnd { blocks: vec![] }, 80);
+            assert_eq!(view.chat.render(80), before);
+            view.apply(&UiEvent::AssistantStart { blocks: vec![] }, 80);
+            assert_eq!(view.chat.render(80), before);
+        }
+    }
+
+    #[test]
     fn assistant_blocks_follow_content_order() {
         let message = json!({
             "content": [
@@ -868,13 +1049,36 @@ mod tests {
 
     #[test]
     fn assistant_blocks_decode_images() {
-        // "aGk=" is base64 for "hi".
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, 1, 1);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder
+                .write_header()
+                .unwrap()
+                .write_image_data(&[255, 0, 0])
+                .unwrap();
+        }
         let message = json!({
-            "content": [{"type": "image", "data": "aGk=", "mimeType": "image/png"}]
+            "content": [{"type": "image", "data": base64::engine::general_purpose::STANDARD.encode(&bytes), "mimeType": "image/png"}]
         });
         assert_eq!(
             assistant_blocks_from_value(&message),
-            vec![AssistantBlock::Image(b"hi".to_vec())]
+            vec![AssistantBlock::Image(bytes.to_vec())]
+        );
+        let jpeg = rpi_tools::image_processing::process_image(
+            &bytes,
+            rpi_tools::image_processing::ImageProcessingOptions {
+                format: Some(rpi_tools::image_processing::OutputFormat::Jpeg { quality: 85 }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let blocks = assistant_blocks_from_value(&json!({
+            "content": [{"type": "image", "data": base64::engine::general_purpose::STANDARD.encode(jpeg), "mimeType": "image/jpeg"}]
+        }));
+        assert!(
+            matches!(&blocks[0], AssistantBlock::Image(data) if data.starts_with(b"\x89PNG\r\n\x1a\n"))
         );
     }
 
@@ -1000,5 +1204,102 @@ mod tests {
         assert!(!view.expanded());
         assert!(view.toggle_expanded());
         assert!(view.expanded());
+    }
+
+    #[test]
+    fn todo_updates_share_one_panel_and_preserve_errors() {
+        let view = view();
+        for (id, done) in [("a", false), ("b", true)] {
+            view.sync_tool_calls(&[UiToolCall {
+                id: id.into(),
+                name: "todo".into(),
+                args: json!({"action":"toggle"}),
+            }]);
+            view.tool_start(id, "todo", &json!({}), 80);
+            view.tool_end(id, "todo", &json!({"content":[],"details":{"todos":[{"id":1,"text":"Run tests","done":done}]}}), false, 80);
+        }
+        assert_eq!(view.chat.child_count(), 1);
+        assert!(view.tool_components.lock().unwrap().is_empty());
+        let children = view.chat.get_children();
+        let panel = children[0]
+            .as_any()
+            .downcast_ref::<ToolExecutionComponent>()
+            .unwrap();
+        use rpi_tui::Component;
+        let rendered = rpi_tui::ansi::strip_ansi(&panel.render(80).join("\n"));
+        assert!(rendered.contains("1/1 completed"));
+        assert!(rendered.contains("[✓] Run tests"));
+        view.tool_end(
+            "error",
+            "todo",
+            &json!({"content":[{"type":"text","text":"invalid task"}]}),
+            true,
+            80,
+        );
+        assert_eq!(view.chat.child_count(), 2);
+        view.tool_end("soft-error", "todo", &json!({"content":[{"type":"text","text":"todo not found"}],"details":{"todos":[],"error":"todo not found"}}), false, 80);
+        assert_eq!(view.chat.child_count(), 3);
+        assert!(update_todo_list(
+            &view.chat,
+            &json!({"details":{"todos":[]}})
+        ));
+        assert_eq!(view.chat.child_count(), 3);
+        assert!(!update_todo_list(
+            &view.chat,
+            &json!({"details":{"todos":[{}]}})
+        ));
+        assert_eq!(view.chat.child_count(), 3);
+    }
+
+    #[test]
+    fn plan_tools_and_show_update_one_expandable_panel() {
+        let view = view();
+        view.sync_tool_calls(&[UiToolCall {
+            id: "start".into(),
+            name: "plan_mode_start".into(),
+            args: json!({}),
+        }]);
+        view.tool_start("start", "plan_mode_start", &json!({}), 80);
+        view.tool_end(
+            "start",
+            "plan_mode_start",
+            &json!({"details":{"kind":"plan","active":true}}),
+            false,
+            80,
+        );
+        let body = (1..=30)
+            .map(|i| format!("{i}. Step {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        view.tool_end(
+            "complete",
+            "plan_mode_complete",
+            &json!({"details":{"kind":"plan","active":false,"plan":body}}),
+            false,
+            80,
+        );
+        assert_eq!(view.chat.child_count(), 1);
+        assert!(view.tool_components.lock().unwrap().is_empty());
+        view.set_expanded(true);
+        let children = view.chat.get_children();
+        let panel = children[0]
+            .as_any()
+            .downcast_ref::<ToolExecutionComponent>()
+            .unwrap();
+        use rpi_tui::Component;
+        assert!(rpi_tui::ansi::strip_ansi(&panel.render(80).join("\n")).contains("Step 30"));
+        assert!(update_plan_panel(
+            &view.chat,
+            &json!({"kind":"message","details":{"kind":"plan","active":false,"plan":body,"expanded":true}})
+        ));
+        assert_eq!(view.chat.child_count(), 1);
+        view.tool_end(
+            "error",
+            "plan_mode_complete",
+            &json!({"content":[{"type":"text","text":"not active"}]}),
+            true,
+            80,
+        );
+        assert_eq!(view.chat.child_count(), 2);
     }
 }

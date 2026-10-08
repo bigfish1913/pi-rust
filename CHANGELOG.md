@@ -11,6 +11,39 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.3.17] - 2026-10-08
+
+### Added
+
+- TUI plugin panels support positioned transcript, sidebar, and popup layouts,
+  including pet companion and live run statistics panels. Task lists and plans
+  retain their current state across tool updates and restored sessions.
+- TUI prompts accept multiple pasted image paths, clipboard screenshots, and
+  copied image files on Windows and macOS. Image-only prompts, steering, and
+  follow-up messages retain their attachments; dequeuing restores them to the
+  draft, and clearing the draft removes pending images.
+- User and tool images are normalized for model input with Pi's default
+  2000-pixel dimensions and 4.5 MiB base64 limit, including orientation handling,
+  format conversion, and explicit notices when an image cannot be processed.
+
+### Fixed
+
+- Empty assistant starts and whitespace-only streaming updates no longer insert
+  a blank row before the reply. Message spacing appears only with visible content.
+- The footer displays the current thinking level when starting or restoring a
+  session. Tool output hints consistently identify Ctrl+O for expansion and
+  Ctrl+T for showing or hiding thinking blocks.
+- Image visibility settings now apply to previews and restored history. Terminal
+  image detection includes Ghostty, WezTerm, and Warp; Kitty rendering preserves
+  aspect ratio, reserves layout rows, and removes obsolete placements.
+- Supporting Unix terminals enable enhanced keyboard reporting so Shift+Enter
+  can be distinguished from Enter and inserts a newline rather than submitting.
+- The self-update tests resolve fixture paths consistently with production
+  validation, avoiding macOS ancestor-link path mismatches and exercising the
+  stale staging cleanup branch.
+- Documentation topic descriptions reference the unified C ABI rather than
+  obsolete ABI v2/v3 entrypoints.
+
 ## [0.3.16] - 2026-10-06
 
 ## [0.3.15] - 2026-10-04

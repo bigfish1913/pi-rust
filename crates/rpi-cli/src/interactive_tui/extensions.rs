@@ -88,6 +88,10 @@ pub(super) fn handle_extension_ui_result(
     }
     match value.get("kind").and_then(|v| v.as_str()) {
         Some("message") | None => {
+            if crate::transcript_view::update_plan_panel(&ctx.chat, &value) {
+                ctx.tui.request_render(false);
+                return;
+            }
             let fallback = value.to_string();
             let text = value
                 .get("text")
