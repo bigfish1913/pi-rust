@@ -947,6 +947,17 @@ pub async fn interactive_tui(
     // banner once, then write the sentinel. The banner covers the theme hint;
     // the theme stays pickable via `/theme`. See `extras.rs`.
     crate::extras::maybe_first_time_setup(&chat_container);
+    let collapse_changelog =
+        preferred_project_setting(&project_settings, |settings| settings.collapse_changelog)
+            .or(saved_settings.collapse_changelog)
+            .unwrap_or(false);
+    maybe_add_startup_changelog(
+        &harness,
+        &chat_container,
+        &saved_settings,
+        collapse_changelog,
+    )
+    .await;
 
     // A --continue/--resume/--session launch opens on an existing JSONL
     // session — render its prior user/assistant transcript so the user sees

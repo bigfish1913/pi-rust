@@ -2,6 +2,31 @@ use super::*;
 use rpi_tui::Component;
 
 #[test]
+fn changelog_command_renders_real_bundled_release_notes() {
+    let chat = Arc::new(Container::new());
+    add_changelog_message(&chat);
+    let output = strip_ansi(&chat.render(120).join("\n"));
+    assert!(output.contains("0.3.17"));
+    assert!(output.contains("whitespace-only streaming"));
+    assert!(!output.contains("Native parity phase 1"));
+}
+
+#[test]
+fn collapsed_startup_changelog_links_to_full_notes() {
+    let chat = Arc::new(Container::new());
+    add_startup_changelog_message(&chat, "## 0.3.17\n\n- full release detail", "0.3.17", true);
+    let output = strip_ansi(&chat.render(120).join("\n"));
+    assert!(output.contains("Updated to v0.3.17"));
+    assert!(output.contains("/changelog"));
+    assert!(!output.contains("full release detail"));
+    let chat = Arc::new(Container::new());
+    add_startup_changelog_message(&chat, "## 0.3.17\n\n- full release detail", "0.3.17", false);
+    let output = strip_ansi(&chat.render(120).join("\n"));
+    assert!(output.contains("What's New"));
+    assert!(output.contains("full release detail"));
+}
+
+#[test]
 fn queued_user_message_keeps_images_and_image_only_messages() {
     let image = rpi_ai::types::ImageContent {
         kind: rpi_ai::types::ImageContentType,
@@ -458,6 +483,7 @@ fn settings_menu_covers_the_wired_settings_surface() {
             "show-images",
             "cache-miss-notices",
             "quiet-startup",
+            "collapse-changelog",
             "terminal-progress",
             "fullscreen-copy-on-select",
             "double-escape-action",
@@ -486,10 +512,19 @@ fn settings_menu_covers_the_wired_settings_surface() {
         );
     }
     // The default model row falls back to the running lane's model.
-    assert_eq!(items[1].value, "claude-sonnet-5");
+    let value = |key: &str| {
+        items
+            .iter()
+            .find(|item| item.key == key)
+            .unwrap()
+            .value
+            .as_str()
+    };
+    assert_eq!(value("model"), "claude-sonnet-5");
     // Native defaults: cache-miss notices off, terminal progress on.
-    assert_eq!(items[6].value, "false");
-    assert_eq!(items[8].value, "true");
+    assert_eq!(value("cache-miss-notices"), "false");
+    assert_eq!(value("terminal-progress"), "true");
+    assert_eq!(value("collapse-changelog"), "false");
 }
 
 #[test]

@@ -195,9 +195,7 @@ pub(super) fn add_version_message(container: &Arc<Container>) {
     container.add_child(Arc::new(Spacer::new(1)));
 }
 
-/// Add a compact `/changelog` block to the chat container. Keep this local to
-/// the binary so the command remains useful in installed builds without a
-/// source checkout or a network request.
+/// Show the real bundled changelog, including in installed/offline builds.
 pub(super) fn add_changelog_message(container: &Arc<Container>) {
     let c = current_theme().colors;
     container.add_child(Arc::new(Text::new(
@@ -206,29 +204,41 @@ pub(super) fn add_changelog_message(container: &Arc<Container>) {
         0,
     )));
     container.add_child(Arc::new(Spacer::new(1)));
-    let entries = [
-        (
-            "Native parity phase 1",
-            "models, images, trust, export, and JSON events",
-        ),
-        (
-            "TUI controls",
-            "external editor, thinking levels, and tool output toggles",
-        ),
-        (
-            "Provider auth",
-            "OpenAI-compatible API key aliases and gateway headers",
-        ),
-    ];
-    for (release, summary) in entries {
-        let row = format!("  {}  {}", c.accent.fg(release), c.muted.fg(summary));
-        container.add_child(Arc::new(Text::new(row, 1, 0)));
+    let markdown = crate::changelog::format_entries(&crate::changelog::bundled_entries());
+    let markdown = if markdown.is_empty() {
+        "No changelog entries found.".into()
+    } else {
+        markdown
+    };
+    container.add_child(Arc::new(Markdown::new(markdown, 1, 0)));
+    container.add_child(Arc::new(Spacer::new(1)));
+}
+
+pub(super) fn add_startup_changelog_message(
+    container: &Arc<Container>,
+    markdown: &str,
+    version: &str,
+    collapse: bool,
+) {
+    container.add_child(Arc::new(DynamicBorder::new()));
+    if collapse {
+        container.add_child(Arc::new(Text::new(
+            format!("Updated to v{version}. Use /changelog to view full changelog."),
+            1,
+            0,
+        )));
+    } else {
+        let c = current_theme().colors;
+        container.add_child(Arc::new(Text::new(
+            c.md_heading.fg(&tui_bold("What's New")),
+            1,
+            0,
+        )));
+        container.add_child(Arc::new(Spacer::new(1)));
+        container.add_child(Arc::new(Markdown::new(markdown.to_owned(), 1, 0)));
+        container.add_child(Arc::new(Spacer::new(1)));
     }
-    container.add_child(Arc::new(Text::new(
-        format!("  {} {}", c.dim.fg("Version"), c.text.fg(crate::VERSION)),
-        1,
-        0,
-    )));
+    container.add_child(Arc::new(DynamicBorder::new()));
     container.add_child(Arc::new(Spacer::new(1)));
 }
 
