@@ -2365,6 +2365,22 @@ mod tests {
             .unwrap()
     }
 
+    /// The path a fixture resolves to once production validation has seen it.
+    ///
+    /// Every validated call site canonicalizes and normalizes a path before it
+    /// stores or compares it, so a test asserting against a production-derived
+    /// path has to resolve its own fixture the same way. `real_tempdir()` stays
+    /// unresolved on purpose — that is what keeps these tests honest about an
+    /// ambient temp root that is itself a link — but on macOS `/var` is a link
+    /// to `/private/var`, so the raw fixture path and the resolved production
+    /// path are different strings for the same directory. Comparing them
+    /// directly fails for a reason that has nothing to do with the code under
+    /// test, and does so only on hosts whose temp root is reached through a
+    /// link, which is why a Linux-only CI never saw it.
+    fn as_production_resolves(path: &Path) -> std::path::PathBuf {
+        super::normalize_windows_path(std::fs::canonicalize(path).unwrap())
+    }
+
     use std::collections::BTreeMap;
     use std::ffi::OsString;
     use std::path::Path;
@@ -2559,7 +2575,12 @@ mod tests {
         // Suppresses cargo's "add this to your PATH" advice, which names the
         // staging root that the atomic replace is about to consume.
         assert_eq!(args[6], "--quiet");
-        assert_eq!(command.get_current_dir(), Some(command_dir.as_path()));
+        // The command runs in the resolved directory, not the unresolved
+        // fixture path: `cargo_install_command` validates it first.
+        assert_eq!(
+            command.get_current_dir(),
+            Some(as_production_resolves(&command_dir).as_path())
+        );
     }
 
     #[cfg(unix)]
@@ -2720,6 +2741,13 @@ mod tests {
     fn stale_and_orphaned_self_update_records_are_pruned() {
         let temp = real_tempdir();
         let agent = temp.path().join("agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        // `consume_self_update_statuses` resolves the agent directory before it
+        // derives any staging path from it, so the fixture starts from the same
+        // resolved path. Otherwise a staging directory this test records in a
+        // status file would never compare equal to the one pruning computes,
+        // and the pruning under test would silently not run.
+        let agent = as_production_resolves(&agent);
         let update_root = agent.join("self-update");
         std::fs::create_dir_all(&update_root).unwrap();
         let name =
@@ -2894,7 +2922,10 @@ mod tests {
                 .map(OsString::from)
                 .collect::<Vec<_>>()
         );
-        assert_eq!(command.get_current_dir(), Some(command_dir.as_path()));
+        assert_eq!(
+            command.get_current_dir(),
+            Some(as_production_resolves(&command_dir).as_path())
+        );
         assert_ne!(
             command.get_current_dir(),
             std::env::current_dir().ok().as_deref()
