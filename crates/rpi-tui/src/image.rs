@@ -67,7 +67,8 @@ pub struct Image {
     options: ImageOptions,
     theme: ImageTheme,
     image_id: Mutex<Option<u32>>,
-    cached_render: Mutex<Option<String>>,
+    cached_render: Mutex<Option<(usize, String)>>,
+    inline_visible: Mutex<bool>,
 }
 
 impl Image {
@@ -80,6 +81,7 @@ impl Image {
             theme: ImageTheme::default(),
             image_id: Mutex::new(None),
             cached_render: Mutex::new(None),
+            inline_visible: Mutex::new(true),
         }
     }
 
@@ -93,6 +95,7 @@ impl Image {
             theme: ImageTheme::default(),
             image_id: Mutex::new(Some(id)),
             cached_render: Mutex::new(None),
+            inline_visible: Mutex::new(true),
         }
     }
 
@@ -105,6 +108,7 @@ impl Image {
             theme: ImageTheme::default(),
             image_id: Mutex::new(None),
             cached_render: Mutex::new(None),
+            inline_visible: Mutex::new(true),
         }
     }
 
@@ -168,12 +172,20 @@ impl Image {
 
     /// Render the image.
     fn render_image(&self, width: usize) -> String {
+        if width == 0 {
+            return String::new();
+        }
+        if !*self.inline_visible.lock().unwrap() {
+            return crate::utils::truncate_to_width("[Image]", width, "");
+        }
         let caps = get_capabilities();
 
         // Check if we have cached render
         if let Ok(cached) = self.cached_render.lock() {
-            if cached.is_some() {
-                return cached.clone().unwrap();
+            if let Some((cached_width, rendered)) = cached.as_ref() {
+                if *cached_width == width {
+                    return rendered.clone();
+                }
             }
         }
 
@@ -181,14 +193,40 @@ impl Image {
         let (img_width, img_height) = if let Some((w, h)) = self.get_dimensions() {
             // Calculate cell dimensions
             let cell_dims = super::terminal_image::get_cell_dimensions();
-            let cell_width = self.options.width.unwrap_or_else(|| {
-                ((w as f32 / cell_dims.width as f32).ceil() as u16).min(width as u16)
-            });
+            let cell_width = self
+                .options
+                .width
+                .unwrap_or_else(|| {
+                    ((w as f32 / cell_dims.width.max(1) as f32).ceil() as u16).min(60)
+                })
+                .min(width.saturating_sub(2).max(1).min(u16::MAX as usize) as u16)
+                .max(1);
             let cell_height = self
                 .options
                 .height
-                .unwrap_or_else(|| (h as f32 / cell_dims.height as f32).ceil() as u16);
-            (cell_width, cell_height)
+                .unwrap_or_else(|| {
+                    ((h as f64 / w.max(1) as f64) * cell_width as f64 * cell_dims.width as f64
+                        / cell_dims.height.max(1) as f64)
+                        .ceil() as u16
+                })
+                .max(1);
+            let max_height = self
+                .options
+                .height
+                .unwrap_or_else(|| {
+                    (cell_width as f64 * cell_dims.width as f64 / cell_dims.height.max(1) as f64)
+                        .ceil() as u16
+                })
+                .max(1);
+            if self.options.preserve_aspect && cell_height > max_height {
+                (
+                    ((cell_width as f64 * max_height as f64 / cell_height as f64).floor() as u16)
+                        .max(1),
+                    max_height,
+                )
+            } else {
+                (cell_width, cell_height)
+            }
         } else {
             (
                 self.options.width.unwrap_or(width as u16),
@@ -199,7 +237,11 @@ impl Image {
         // Render based on protocol
         let result = if caps.protocol == ImageProtocol::None {
             // Fallback: render placeholder
-            self.render_placeholder(img_width as usize, img_height as usize, width)
+            crate::utils::truncate_to_width(
+                self.options.alt_text.as_deref().unwrap_or("[Image]"),
+                width,
+                "",
+            )
         } else if let Ok(data) = self.data.lock() {
             if let Some(ref img_data) = *data {
                 let id = self.image_id.lock().ok().and_then(|id| *id);
@@ -212,7 +254,20 @@ impl Image {
                     z_index: None,
                     id,
                 };
-                render_image(img_data, &options)
+                // Keep cursor position stable and reserve the image's rows in
+                // the retained layout so following text cannot overlap it.
+                let sequence = render_image(img_data, &options);
+                let rows = img_height.saturating_sub(1) as usize;
+                if caps.protocol == ImageProtocol::Kitty {
+                    format!("{sequence}{}", "\n".repeat(rows))
+                } else {
+                    let up = if rows > 0 {
+                        format!("\x1b[{rows}A")
+                    } else {
+                        String::new()
+                    };
+                    format!("{}{up}{sequence}", "\n".repeat(rows))
+                }
             } else {
                 self.render_placeholder(img_width as usize, img_height as usize, width)
             }
@@ -222,10 +277,20 @@ impl Image {
 
         // Cache the result
         if let Ok(mut cached) = self.cached_render.lock() {
-            *cached = Some(result.clone());
+            *cached = Some((width, result.clone()));
         }
 
         result
+    }
+
+    /// Hide terminal graphics while retaining an attachment placeholder.
+    pub fn set_inline_visible(&self, visible: bool) {
+        let mut current = self.inline_visible.lock().unwrap();
+        if *current == visible {
+            return;
+        }
+        *current = visible;
+        *self.cached_render.lock().unwrap() = None;
     }
 
     /// Render a placeholder when image can't be displayed.
@@ -316,6 +381,20 @@ impl Component for Image {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_visibility_retains_placeholder_and_resizing_rebuilds_layout() {
+        let image = Image::new();
+        image.set_inline_visible(false);
+        assert_eq!(image.render(80), vec!["[Image]"]);
+        assert_eq!(image.render(3), vec!["[Im"]);
+        assert_eq!(image.render(0), vec![""]);
+        image.set_inline_visible(true);
+        let wide = image.render(80);
+        let narrow = image.render(3);
+        assert_ne!(wide, narrow);
+        assert!(narrow.iter().all(|line| visible_width(line) <= 3));
+    }
 
     #[test]
     fn test_image_new() {

@@ -71,6 +71,7 @@ pub(super) async fn restore_queued_messages_to_editor(
 ) -> usize {
     match lane.clear_queue().await {
         Ok(queued) => {
+            state.restore_pending_images(queued.images.clone());
             let all: Vec<String> = queued
                 .steering
                 .iter()
@@ -281,6 +282,7 @@ pub(super) async fn handle_agent_event(
             // renders that bubble instead.
             AgentMessage::User(user) => {
                 state.transcript_view().add_user(&user_message_text(&user));
+                add_user_images(&state.chat_container, &user, state.images_visible());
                 // A consumed entry must drop out of the pending display.
                 refresh_pending_messages(state, lane).await;
                 tui.request_render(false);
@@ -435,6 +437,11 @@ pub(super) async fn handle_agent_event(
                     is_error,
                 },
                 tui.width(),
+            );
+            add_tool_images(
+                &state.chat_container,
+                &result.content,
+                state.images_visible(),
             );
             state.sync_working_loader_with_bash();
             // Bash tool completion is user-visible: immediate render ensures the

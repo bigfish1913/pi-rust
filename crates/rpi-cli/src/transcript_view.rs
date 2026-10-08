@@ -84,6 +84,7 @@ pub enum UiEvent {
 /// so a streaming assistant message and each tool/bash panel are updated in
 /// place rather than rebuilt per event.
 pub struct TranscriptView {
+    show_images: bool,
     chat: Arc<Container>,
     current_assistant: Arc<Mutex<Option<Arc<AssistantMessageComponent>>>>,
     tool_components: Arc<Mutex<HashMap<String, Arc<ToolExecutionComponent>>>>,
@@ -133,6 +134,7 @@ impl TranscriptView {
         markdown_transformer: Arc<Mutex<Option<MarkdownTransformer>>>,
     ) -> Self {
         Self {
+            show_images: true,
             chat,
             current_assistant,
             tool_components,
@@ -141,6 +143,12 @@ impl TranscriptView {
             expanded,
             markdown_transformer,
         }
+    }
+
+    /// Configure image visibility for newly created assistant components.
+    pub fn with_show_images(mut self, show: bool) -> Self {
+        self.show_images = show;
+        self
     }
 
     /// Append a user prompt bubble.
@@ -300,6 +308,7 @@ impl TranscriptView {
             AssistantMessageOptions::default(),
         ));
         comp.set_hide_thinking(*self.hide_thinking.lock().unwrap());
+        comp.set_show_images(self.show_images);
         if let Some(transformer) = self.markdown_transformer.lock().unwrap().clone() {
             comp.set_markdown_transformer(Some(transformer));
         }
@@ -319,6 +328,7 @@ impl TranscriptView {
                 AssistantMessageOptions::default(),
             ));
             comp.set_hide_thinking(*self.hide_thinking.lock().unwrap());
+            comp.set_show_images(self.show_images);
             if let Some(transformer) = self.markdown_transformer.lock().unwrap().clone() {
                 comp.set_markdown_transformer(Some(transformer));
             }
@@ -694,7 +704,18 @@ pub fn assistant_blocks_from_value(message: &Value) -> Vec<AssistantBlock> {
                 if let Some(data) = block.get("data").and_then(Value::as_str) {
                     if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) {
                         if !bytes.is_empty() {
-                            blocks.push(AssistantBlock::Image(bytes));
+                            let png = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+                                Some(bytes)
+                            } else {
+                                rpi_tools::image_processing::process_image(
+                                    &bytes,
+                                    Default::default(),
+                                )
+                                .ok()
+                            };
+                            if let Some(png) = png {
+                                blocks.push(AssistantBlock::Image(png));
+                            }
                         }
                     }
                 }
@@ -985,13 +1006,36 @@ mod tests {
 
     #[test]
     fn assistant_blocks_decode_images() {
-        // "aGk=" is base64 for "hi".
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, 1, 1);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder
+                .write_header()
+                .unwrap()
+                .write_image_data(&[255, 0, 0])
+                .unwrap();
+        }
         let message = json!({
-            "content": [{"type": "image", "data": "aGk=", "mimeType": "image/png"}]
+            "content": [{"type": "image", "data": base64::engine::general_purpose::STANDARD.encode(&bytes), "mimeType": "image/png"}]
         });
         assert_eq!(
             assistant_blocks_from_value(&message),
-            vec![AssistantBlock::Image(b"hi".to_vec())]
+            vec![AssistantBlock::Image(bytes.to_vec())]
+        );
+        let jpeg = rpi_tools::image_processing::process_image(
+            &bytes,
+            rpi_tools::image_processing::ImageProcessingOptions {
+                format: Some(rpi_tools::image_processing::OutputFormat::Jpeg { quality: 85 }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let blocks = assistant_blocks_from_value(&json!({
+            "content": [{"type": "image", "data": base64::engine::general_purpose::STANDARD.encode(jpeg), "mimeType": "image/jpeg"}]
+        }));
+        assert!(
+            matches!(&blocks[0], AssistantBlock::Image(data) if data.starts_with(b"\x89PNG\r\n\x1a\n"))
         );
     }
 

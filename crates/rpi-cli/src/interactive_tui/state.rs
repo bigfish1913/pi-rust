@@ -708,7 +708,10 @@ pub(super) fn submit_draft(
         tui.request_render(false);
     }
     push_history(state, text);
-    let _ = tx.send(TuiMessage::UserInput(text.to_string()));
+    let _ = tx.send(TuiMessage::UserInput(
+        text.to_string(),
+        state.take_pending_images(),
+    ));
 }
 
 /// Advance a pending auto-send countdown. Returns `true` when the caller needs
@@ -1251,6 +1254,7 @@ impl TuiState {
             self.tool_outputs_expanded.clone(),
             self.markdown_transformer.clone(),
         )
+        .with_show_images(self.images_visible())
     }
 
     /// B5e: swap the live transformer. Used at startup (install the first
@@ -1277,5 +1281,27 @@ impl TuiState {
 
     pub(super) fn take_pending_images(&self) -> Vec<rpi_ai::types::ImageContent> {
         std::mem::take(&mut *self.pending_images.lock().unwrap())
+    }
+
+    pub(super) fn restore_pending_images(&self, mut images: Vec<rpi_ai::types::ImageContent>) {
+        let mut pending = self.pending_images.lock().unwrap();
+        images.append(&mut *pending);
+        *pending = images;
+    }
+
+    pub(super) fn set_show_images(&self, show: bool) {
+        *self.show_images.lock().unwrap() = show;
+        for child in self.chat_container.get_children() {
+            if let Some(image) = child.as_any().downcast_ref::<Image>() {
+                image.set_inline_visible(show);
+            }
+            if let Some(assistant) = child.as_any().downcast_ref::<AssistantMessageComponent>() {
+                assistant.set_show_images(show);
+            }
+        }
+    }
+
+    pub(super) fn images_visible(&self) -> bool {
+        *self.show_images.lock().unwrap()
     }
 }

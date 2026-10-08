@@ -758,7 +758,7 @@ pub(super) fn open_images_selector(
     let chat_sel = chat.clone();
     list.on_select(Arc::new(move |item| {
         let on = item.value == "yes";
-        *state_sel.show_images.lock().unwrap() = on;
+        state_sel.set_show_images(on);
         add_note_message(
             &chat_sel,
             &format!("Inline images {}.", if on { "enabled" } else { "disabled" }),

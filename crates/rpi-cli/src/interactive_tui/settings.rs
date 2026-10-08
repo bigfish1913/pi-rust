@@ -290,9 +290,7 @@ pub(super) fn apply_setting_change(
         }
         // Live: the image flag is consulted when images would be rendered.
         "show-images" => {
-            if let Ok(mut guard) = state.show_images.lock() {
-                *guard = as_bool();
-            }
+            state.set_show_images(as_bool());
             settings.show_images = Some(as_bool());
             Some(format!(
                 "Inline images {}.",

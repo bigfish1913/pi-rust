@@ -127,6 +127,7 @@ pub(super) async fn switch_to_session(
                 chat,
                 state.markdown_transformer(),
                 Some(state.extension_session.clone()),
+                state.images_visible(),
             )
             .await;
             state.set_status(RunStatus::Idle);
@@ -247,6 +248,7 @@ pub(super) async fn fork_session(
         chat,
         state.markdown_transformer(),
         Some(state.extension_session.clone()),
+        state.images_visible(),
     )
     .await;
     state.set_status(RunStatus::Idle);
@@ -267,6 +269,7 @@ pub(super) async fn render_session_history(
     chat: &Arc<Container>,
     transformer: Option<MarkdownTransformer>,
     extension_session: Option<crate::session::ExtensionSessionCell>,
+    show_images: bool,
 ) {
     let tree = harness.session().view("main");
     let entries = match tree
@@ -291,12 +294,14 @@ pub(super) async fn render_session_history(
             Entry::Message(me) => match &me.message {
                 AgentMessage::User(u) => {
                     add_user_message(chat, &user_message_text(u));
+                    add_user_images(chat, u, show_images);
                     rendered_any = true;
                 }
                 AgentMessage::Assistant(a) => {
                     let comp = Arc::new(AssistantMessageComponent::new(
                         AssistantMessageOptions::default(),
                     ));
+                    comp.set_show_images(show_images);
                     if let Some(t) = &transformer {
                         comp.set_markdown_transformer(Some(t.clone()));
                     }
@@ -348,6 +353,11 @@ pub(super) async fn render_session_history(
                         comp.set_result_markdown(true);
                     }
                     chat.add_child(comp);
+                    for block in &result.content {
+                        if let rpi_ai::types::Content::Image(image) = block {
+                            add_image_preview(chat, image, show_images);
+                        }
+                    }
                     chat.add_child(Arc::new(Spacer::new(1)));
                     rendered_any = true;
                 }

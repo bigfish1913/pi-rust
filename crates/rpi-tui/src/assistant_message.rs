@@ -72,6 +72,7 @@ pub struct AssistantMessageComponent {
     content_container: Arc<Container>,
     /// Rendering options
     options: Mutex<AssistantMessageOptions>,
+    show_images: Mutex<bool>,
     /// Whether this message has tool calls
     has_tool_calls: Mutex<bool>,
     /// Whether currently streaming
@@ -98,6 +99,7 @@ impl AssistantMessageComponent {
         Self {
             content_container,
             options: Mutex::new(options),
+            show_images: Mutex::new(true),
             has_tool_calls: Mutex::new(false),
             is_streaming: Mutex::new(false),
             last_blocks: Mutex::new(Vec::new()),
@@ -222,10 +224,9 @@ impl AssistantMessageComponent {
                     i += 1;
                 }
                 AssistantBlock::Image(data) if !data.is_empty() => {
-                    self.content_container.add_child(Arc::new(Image::from_data(
-                        data.clone(),
-                        ImageOptions::default(),
-                    )));
+                    let image = Arc::new(Image::from_data(data.clone(), ImageOptions::default()));
+                    image.set_inline_visible(*self.show_images.lock().unwrap());
+                    self.content_container.add_child(image);
                     i += 1;
                 }
                 AssistantBlock::Image(_) => {
@@ -327,6 +328,15 @@ impl AssistantMessageComponent {
             self.last_blocks.lock().unwrap().clone()
         };
         self.rebuild_content(&blocks);
+    }
+
+    pub fn set_show_images(&self, show: bool) {
+        *self.show_images.lock().unwrap() = show;
+        for child in self.content_container.get_children() {
+            if let Some(image) = child.as_any().downcast_ref::<Image>() {
+                image.set_inline_visible(show);
+            }
+        }
     }
 
     /// Set hidden thinking label. Rebuilds the last content (mirrors TS).

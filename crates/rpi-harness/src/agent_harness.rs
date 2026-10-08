@@ -217,6 +217,8 @@ pub struct CancelQueuedResult {
 pub struct QueuedMessages {
     pub steering: Vec<String>,
     pub follow_up: Vec<String>,
+    /// Image attachments returned by `clear_queue` for draft restoration.
+    pub images: Vec<rpi_ai::types::ImageContent>,
 }
 
 impl QueuedMessages {
@@ -2514,12 +2516,15 @@ impl AgentHarness {
     /// `active_tool_names` means "all tools active" (mirrors TS default).
     fn active_tools(tools: &[HarnessTool], active: &[String]) -> Vec<Arc<dyn AgentTool>> {
         if active.is_empty() {
-            return tools.iter().map(|t| Arc::clone(&t.tool)).collect();
+            return tools
+                .iter()
+                .map(|t| crate::image_tool::wrap(Arc::clone(&t.tool)))
+                .collect();
         }
         tools
             .iter()
             .filter(|t| active.contains(&t.tool.schema().name))
-            .map(|t| Arc::clone(&t.tool))
+            .map(|t| crate::image_tool::wrap(Arc::clone(&t.tool)))
             .collect()
     }
 
@@ -2896,7 +2901,11 @@ impl AgentHarness {
 
     /// The core run loop shared by all prompt overloads + skill + template.
     async fn run_core(&self, prompts: Vec<AgentMessage>) -> HarnessResult<RunResult> {
-        self.run_core_with_entry(prompts, false).await
+        let mut normalized = Vec::with_capacity(prompts.len());
+        for prompt in prompts {
+            normalized.push(normalize_user_images(prompt).await?);
+        }
+        self.run_core_with_entry(normalized, false).await
     }
 
     /// Continue a run from the assistant message at the branch tip.
@@ -3754,6 +3763,25 @@ struct ConfigSnapshot {
 // AgentLane impl for AgentHarness (the main lane)
 // ===========================================================================
 
+async fn normalize_user_images(mut message: AgentMessage) -> HarnessResult<AgentMessage> {
+    let has_images = matches!(&message, AgentMessage::User(user)
+        if matches!(&user.content, UserContent::Blocks(blocks)
+            if blocks.iter().any(|block| matches!(block, Content::Image(_)))));
+    if !has_images {
+        return Ok(message);
+    }
+    tokio::task::spawn_blocking(move || {
+        if let AgentMessage::User(user) = &mut message {
+            if let UserContent::Blocks(blocks) = &mut user.content {
+                rpi_tools::image_processing::normalize_image_blocks(blocks);
+            }
+        }
+        message
+    })
+    .await
+    .map_err(|error| HarnessError::agent(format!("Image processing failed: {error}")))
+}
+
 #[async_trait::async_trait]
 impl AgentLane for AgentHarness {
     async fn has_pending_resume(&self) -> bool {
@@ -3925,17 +3953,20 @@ impl AgentLane for AgentHarness {
         // stays queued for the next explicit run. This avoids the race between
         // `activeRun` clearing and the TUI's status check that used to send
         // messages to `next_run_queue` (which never auto-wakes).
-        self.enqueue_message(message, QueueKind::Steer).await
+        self.enqueue_message(normalize_user_images(message).await?, QueueKind::Steer)
+            .await
     }
 
     async fn follow_up(&self, message: AgentMessage) -> HarnessResult<QueueResult> {
         // Same as steer: unconditional enqueue, drained by `getFollowUpMessages`
         // after the loop would otherwise stop.
-        self.enqueue_message(message, QueueKind::FollowUp).await
+        self.enqueue_message(normalize_user_images(message).await?, QueueKind::FollowUp)
+            .await
     }
 
     async fn next_run(&self, message: AgentMessage) -> HarnessResult<QueueResult> {
-        self.enqueue_message(message, QueueKind::NextRun).await
+        self.enqueue_message(normalize_user_images(message).await?, QueueKind::NextRun)
+            .await
     }
 
     async fn cancel_queued(&self, entry_id: &str) -> HarnessResult<CancelQueuedResult> {
@@ -4001,6 +4032,7 @@ impl AgentLane for AgentHarness {
         Ok(QueuedMessages {
             steering,
             follow_up,
+            images: Vec::new(),
         })
     }
 
@@ -4026,6 +4058,7 @@ impl AgentLane for AgentHarness {
         };
         let mut steering = Vec::with_capacity(steering_items.len());
         let mut follow_up = Vec::with_capacity(follow_up_items.len());
+        let mut images = Vec::new();
         // Un-queuing is a cancellation: without the record these messages would
         // come back on the next start, even though they are in the editor now.
         for (items, out) in [
@@ -4046,11 +4079,23 @@ impl AgentLane for AgentHarness {
                     }
                 }
                 out.push(queued_message_text(&item.message));
+                if let AgentMessage::User(user) = &item.message {
+                    if let UserContent::Blocks(blocks) = &user.content {
+                        images.extend(blocks.iter().filter_map(|block| {
+                            if let Content::Image(image) = block {
+                                Some(image.clone())
+                            } else {
+                                None
+                            }
+                        }));
+                    }
+                }
             }
         }
         Ok(QueuedMessages {
             steering,
             follow_up,
+            images,
         })
     }
 
@@ -4821,6 +4866,30 @@ mod session_switch_tests {
             entry_transforms: Vec::new(),
             provider_hooks: None,
         }
+    }
+
+    #[tokio::test]
+    async fn clearing_image_queues_restores_attachments_without_losing_text() {
+        // A complete 1x1 GIF, small enough to retain its original bytes.
+        let image = rpi_ai::types::ImageContent {
+            kind: rpi_ai::types::ImageContentType,
+            data: "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7".into(),
+            mime_type: "image/gif".into(),
+        };
+        let harness = AgentHarness::create(opts()).await.unwrap();
+        let message = |text: &str| {
+            AgentMessage::User(UserMessage::new(
+                UserContent::Blocks(vec![Content::text(text), Content::Image(image.clone())]),
+                0,
+            ))
+        };
+        harness.steer(message("steer")).await.unwrap();
+        harness.follow_up(message("follow")).await.unwrap();
+        let restored = harness.clear_queue().await.unwrap();
+        assert_eq!(restored.steering, vec!["steer"]);
+        assert_eq!(restored.follow_up, vec!["follow"]);
+        assert_eq!(restored.images, vec![image.clone(), image]);
+        assert!(harness.queued_messages().await.unwrap().is_empty());
     }
 
     #[tokio::test]

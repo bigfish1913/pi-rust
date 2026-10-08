@@ -626,7 +626,7 @@ fn start_user_bash(ctx: &CommandContext, command: &str, exclude_from_context: bo
 /// Message type for communication between the key/callback threads and the
 /// main async loop.
 enum TuiMessage {
-    UserInput(String),
+    UserInput(String, Vec<rpi_ai::types::ImageContent>),
     OpenTree,
     NavigateTree(String),
     Exit,
@@ -968,6 +968,7 @@ pub async fn interactive_tui(
             &chat_container,
             initial_transformer.clone(),
             Some(reload_context.extension_session.clone()),
+            show_images,
         )
         .await;
     }
@@ -1296,7 +1297,7 @@ pub async fn interactive_tui(
     let registry_for_cb = registry.clone();
     editor.on_submit(Arc::new(move |text: &str| {
         let text = text.trim();
-        if text.is_empty() {
+        if text.is_empty() && ctx_for_cb.state.pending_images.lock().unwrap().is_empty() {
             return;
         }
 
@@ -1323,7 +1324,8 @@ pub async fn interactive_tui(
 
         let run_status = *ctx_for_cb.state.status.lock().unwrap();
         if run_status != RunStatus::Idle {
-            let message = AgentMessage::User(UserMessage::new(text.to_string(), 0));
+            let images = ctx_for_cb.state.take_pending_images();
+            let message = user_message_with_images(text, images.clone());
             let lane = ctx_for_cb.lane.clone();
             let chat = ctx_for_cb.chat.clone();
             let tui = ctx_for_cb.tui.clone();
@@ -1339,6 +1341,7 @@ pub async fn interactive_tui(
                 // next run. This matches the TS design and avoids the race
                 // between `activeRun` clearing and the status check.
                 if let Err(error) = lane.steer(message).await {
+                    state.restore_pending_images(images);
                     add_error_message(&chat, &format!("Could not queue message: {error}"));
                     tui.render_now(false);
                     return;
@@ -1383,7 +1386,10 @@ pub async fn interactive_tui(
         push_history(&ctx_for_cb.state, text);
         if ctx_for_cb
             .tx
-            .send(TuiMessage::UserInput(text.to_string()))
+            .send(TuiMessage::UserInput(
+                text.to_string(),
+                ctx_for_cb.state.take_pending_images(),
+            ))
             .is_err()
         {
             ctx_for_cb.state.set_status(RunStatus::Idle);
@@ -1709,19 +1715,16 @@ pub async fn interactive_tui(
                         "paste event ({} bytes, bracketed paste supported)",
                         text.len()
                     ));
-                    let candidate = text.trim().trim_matches(['\"', '\'']);
-                    let path = std::path::PathBuf::from(candidate);
-                    if !candidate.chars().any(|c| c == '\n' || c == '\r') && path.is_file() {
-                        if let Ok(Some(image)) = crate::app::image_content_from_path(&path) {
-                            add_image_preview(&state_for_key.chat_container, &image);
+                    if let Some(images) = images_from_pasted_paths(&text) {
+                        for image in images {
                             state_for_key.queue_image(image);
-                            add_note_message(
-                                &state_for_key.chat_container,
-                                "Dropped image attached to the next prompt.",
-                            );
-                            tui_for_key.request_render(false);
-                            continue;
                         }
+                        add_note_message(
+                            &state_for_key.chat_container,
+                            "Dropped images attached to the next prompt.",
+                        );
+                        tui_for_key.request_render(false);
+                        continue;
                     }
                     editor_for_key.handle_paste(&text);
                     refresh_autocomplete(&state_for_key, &editor_for_key);
@@ -1871,6 +1874,7 @@ pub async fn interactive_tui(
                         }
                         CtrlCAction::Clear => {
                             editor_for_key.clear();
+                            state_for_key.take_pending_images();
                             refresh_autocomplete(&state_for_key, &editor_for_key);
                             last_sigint_time = Some(now);
                             tui_for_key.request_render(false);
@@ -2181,9 +2185,24 @@ pub async fn interactive_tui(
                 &key,
                 rpi_tui::keybindings::keys::PASTE_IMAGE,
             ) {
+                if let Some(paths) = read_clipboard_file_paths() {
+                    let text = paths.join("\n");
+                    if let Some(images) = images_from_pasted_paths(&text) {
+                        for image in images {
+                            state_for_key.queue_image(image);
+                        }
+                        add_note_message(
+                            &state_for_key.chat_container,
+                            "Clipboard images attached to the next prompt.",
+                        );
+                    } else {
+                        editor_for_key.handle_paste(&text);
+                    }
+                    tui_for_key.request_render(false);
+                    continue;
+                }
                 match read_clipboard_image() {
                     Ok(Some(image)) => {
-                        add_image_preview(&state_for_key.chat_container, &image);
                         state_for_key.queue_image(image);
                         add_note_message(
                             &state_for_key.chat_container,
@@ -2194,20 +2213,15 @@ pub async fn interactive_tui(
                     }
                     Ok(None) | Err(_) => {}
                 }
-                // The arboard text fallback is Windows-only. On Unix a real
-                // paste arrives as `Event::Paste` (bracketed paste is enabled
-                // by `ProcessTerminal::enter_raw_mode`), so reading the
-                // SERVER's clipboard here would paste stale TUI content on a
-                // remote/mobile client — copy-on-select can have written the
-                // welcome "Skills (…)" line into the server clipboard, and
-                // Ctrl+V on the client returns that instead of the user's own
-                // clipboard ("不是系统的粘贴的内容"). On Windows the console
-                // never emits `Event::Paste`, so the arboard read is the only
-                // paste source and must stay.
-                if cfg!(windows) {
+                // Local Ctrl+V can paste clipboard text as Pi does. Under SSH,
+                // text must arrive from the client via bracketed paste rather
+                // than reading the remote host's unrelated clipboard.
+                if cfg!(windows) || std::env::var_os("SSH_CONNECTION").is_none() {
                     if let Some(text) = read_clipboard_text() {
                         if !text.is_empty() {
-                            editor_for_key.handle_paste(&text);
+                            if !attach_pasted_images(&state_for_key, &text) {
+                                editor_for_key.handle_paste(&text);
+                            }
                             refresh_autocomplete(&state_for_key, &editor_for_key);
                             tui_for_key.request_render_reusing_scroll_content();
                             continue;
@@ -2397,7 +2411,7 @@ pub async fn interactive_tui(
                 rpi_tui::keybindings::keys::MESSAGE_FOLLOW_UP,
             ) {
                 let prompt = editor_for_key.get_expanded_text().trim().to_string();
-                if prompt.is_empty() {
+                if prompt.is_empty() && state_for_key.pending_images.lock().unwrap().is_empty() {
                     continue;
                 }
                 editor_for_key.clear();
@@ -2409,19 +2423,24 @@ pub async fn interactive_tui(
                         // handler in `interactive_tui`).
                         add_user_message(&state_for_key.chat_container, &prompt);
                         push_history(&state_for_key, &prompt);
-                        let _ = tx_for_key.send(TuiMessage::UserInput(prompt));
+                        let _ = tx_for_key.send(TuiMessage::UserInput(
+                            prompt,
+                            state_for_key.take_pending_images(),
+                        ));
                     }
                 } else {
                     // Follow-ups are echoed by the loop's
                     // `AgentEvent::MessageStart` once they are consumed; while
                     // they wait, the pending-messages display shows them.
-                    let message = AgentMessage::User(UserMessage::new(prompt, 0));
+                    let images = state_for_key.take_pending_images();
+                    let message = user_message_with_images(&prompt, images.clone());
                     let lane = lane_for_key.clone();
                     let chat = state_for_key.chat_container.clone();
                     let tui = tui_for_key.clone();
                     let state = state_for_key.clone();
                     tokio::spawn(async move {
                         if let Err(error) = lane.follow_up(message).await {
+                            state.restore_pending_images(images);
                             add_error_message(&chat, &format!("Could not queue message: {error}"));
                             tui.request_render(false);
                             return;
@@ -2550,6 +2569,7 @@ pub async fn interactive_tui(
         // (it drives the loop with an empty prompts vec), so the initial
         // `-p` / `--prompt` bubbles are rendered here.
         add_user_message(&chat_container, &prompt);
+        add_image_previews(&chat_container, &images, show_images);
         tui.request_render(false);
         run_prompt_streaming(
             &lane,
@@ -2569,7 +2589,7 @@ pub async fn interactive_tui(
             break;
         }
         match rx.recv().await {
-            Some(TuiMessage::UserInput(prompt)) => {
+            Some(TuiMessage::UserInput(prompt, prompt_images)) => {
                 // Clear the editor so the next prompt starts fresh (the submit
                 // handler runs on the blocking key thread and can't mutate the
                 // editor state safely there; clearing here, on the async loop,
@@ -2578,7 +2598,7 @@ pub async fn interactive_tui(
                 // as a user edit made a hands-free voice session switch itself
                 // off the moment it was started.
                 state.clear_editor_programmatically();
-                let prompt_images = state.take_pending_images();
+                add_image_previews(&chat_container, &prompt_images, state.images_visible());
                 if !prompt_images.is_empty() {
                     add_note_message(
                         &chat_container,
@@ -2668,6 +2688,7 @@ pub async fn interactive_tui(
                                 &chat_container,
                                 state.markdown_transformer(),
                                 Some(state.extension_session.clone()),
+                                state.images_visible(),
                             )
                             .await;
                             add_note_message(

@@ -1749,7 +1749,16 @@ fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
     let mut all: Vec<(&'static str, HarnessTool)> = vec![
         (
             "read",
-            HarnessTool::new(create_read_tool(ctx, None)).with_replay(ToolReplay::Safe),
+            HarnessTool::new(create_read_tool(
+                ctx,
+                Some(rpi_tools::tools::read::ReadToolOptions {
+                    image_processor: Some(Arc::new(
+                        rpi_tools::image_processing::InlineImageProcessor,
+                    )),
+                    ..Default::default()
+                }),
+            ))
+            .with_replay(ToolReplay::Safe),
         ),
         (
             "bash",
