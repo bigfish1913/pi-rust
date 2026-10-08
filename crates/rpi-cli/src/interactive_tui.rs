@@ -46,8 +46,8 @@ mod autocomplete;
 use autocomplete::*;
 mod rendering;
 use rendering::*;
-mod pet;
 mod panels;
+mod pet;
 
 #[cfg(test)]
 mod tests;
@@ -452,7 +452,7 @@ fn dispatch_key_event(state: &TuiState, key: &KeyEvent, editor: &Editor) -> bool
     }
     // Function keys do not insert text. Other keys belong to the draft editor
     // while composing (space especially).
-    if !editor.get_text().is_empty() && !matches!(key.code,KeyCode::F(_)) {
+    if !editor.get_text().is_empty() && !matches!(key.code, KeyCode::F(_)) {
         return false;
     }
 
@@ -981,7 +981,8 @@ pub async fn interactive_tui(
     document_container.add_child(Arc::new(Spacer::new(1)));
 
     let pet_document = Arc::new(pet::PetDocument::new(
-        document_container.clone(), reload_context.ext_status.clone(),
+        document_container.clone(),
+        reload_context.ext_status.clone(),
     ));
     let scroll_view = Arc::new(ScrollView::new(
         pet_document.clone(),
@@ -1232,9 +1233,13 @@ pub async fn interactive_tui(
         StackChild::Entry(StackEntry::new(footer.clone())),
     ]));
 
-    let transcript_stack = Arc::new(rpi_tui::HStack::from_entries(vec![
-        StackEntry::new(scroll_view.clone()).basis(0).grow(1).shrink(1).min_size(1),
-    ]));
+    let transcript_stack = Arc::new(rpi_tui::HStack::from_entries(vec![StackEntry::new(
+        scroll_view.clone(),
+    )
+    .basis(0)
+    .grow(1)
+    .shrink(1)
+    .min_size(1)]));
     let root = VStack::from_children(vec![
         StackChild::Entry(
             StackEntry::new(transcript_stack.clone())
@@ -1465,7 +1470,11 @@ pub async fn interactive_tui(
     // fire even when the user types nothing.
     let tx_tick = tx.clone();
     let pet_tick = pet_document.clone();
-    let mut plugin_panels = panels::Panels::with_sidebar(transcript_stack,scroll_view.clone(),reload_context.ext_status.clone());
+    let mut plugin_panels = panels::Panels::with_sidebar(
+        transcript_stack,
+        scroll_view.clone(),
+        reload_context.ext_status.clone(),
+    );
     plugin_panels.sync(tui.as_ref(), &reload_context.ext_status);
     let scroll_tick = scroll_view.clone();
     let tick_handle = tokio::spawn(async move {
@@ -1831,12 +1840,16 @@ pub async fn interactive_tui(
 
             // Pet Esc pauses audio; an active run still reaches normal abort
             // routing below. Dialogs and selectors retain their own Escape.
-            if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE
-                && !state_for_key.selector_open() && pet::active(&state_for_key.ext_status)
+            if key.code == KeyCode::Esc
+                && key.modifiers == KeyModifiers::NONE
+                && !state_for_key.selector_open()
+                && pet::active(&state_for_key.ext_status)
             {
                 let _ = invoke_extension_command(&state_for_key.extension_session, "pet", "quiet");
                 tui_for_key.request_render(false);
-                if *state_for_key.status.lock().unwrap() == RunStatus::Idle && editor_for_key.get_text().is_empty() {
+                if *state_for_key.status.lock().unwrap() == RunStatus::Idle
+                    && editor_for_key.get_text().is_empty()
+                {
                     continue;
                 }
             }

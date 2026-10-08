@@ -342,8 +342,8 @@ mod tests {
         mailbox.handle(serde_json::json!({"key":"monitor","panel":{"version":1,"layout":"sidebar","width":24,"minScreenWidth":80,"border":false,"lines":["TTFT 0.42 s","TPS 252 tok/s"]}})).unwrap();
         panels.sync_viewport(&tui, &mailbox, (120, 21));
         let frame = rpi_tui::layout::render_layout_frame(root.clone(), 120, 24);
-        assert_eq!(frame.primary_scroll_view.unwrap().viewport_height(),21);
-        assert_eq!(scroll.viewport_height(),21);
+        assert_eq!(frame.primary_scroll_view.unwrap().viewport_height(), 21);
+        assert_eq!(scroll.viewport_height(), 21);
         let chat = &frame.root.children[0].children[0];
         let rail = &frame.root.children[0].children[1];
         assert_eq!(chat.rect.width, 94);

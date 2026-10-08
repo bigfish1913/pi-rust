@@ -984,7 +984,8 @@ impl TuiState {
         } else {
             vec![pet::PET_KEY]
         };
-        self.footer.set_extension_status(&self.ext_status.text_except(&hidden));
+        self.footer
+            .set_extension_status(&self.ext_status.text_except(&hidden));
         true
     }
 
