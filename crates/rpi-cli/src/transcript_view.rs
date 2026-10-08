@@ -309,13 +309,13 @@ impl TranscriptView {
         ));
         comp.set_hide_thinking(*self.hide_thinking.lock().unwrap());
         comp.set_show_images(self.show_images);
+        comp.set_trailing_spacing(1);
         if let Some(transformer) = self.markdown_transformer.lock().unwrap().clone() {
             comp.set_markdown_transformer(Some(transformer));
         }
         comp.set_streaming(true);
         comp.update_blocks(blocks);
         self.chat.add_child(comp.clone());
-        self.chat.add_child(Arc::new(Spacer::new(1)));
         *self.current_assistant.lock().unwrap() = Some(comp);
     }
 
@@ -329,12 +329,12 @@ impl TranscriptView {
             ));
             comp.set_hide_thinking(*self.hide_thinking.lock().unwrap());
             comp.set_show_images(self.show_images);
+            comp.set_trailing_spacing(1);
             if let Some(transformer) = self.markdown_transformer.lock().unwrap().clone() {
                 comp.set_markdown_transformer(Some(transformer));
             }
             comp.set_streaming(true);
             self.chat.add_child(comp.clone());
-            self.chat.add_child(Arc::new(Spacer::new(1)));
             *current = Some(comp);
         }
     }
@@ -984,6 +984,49 @@ mod tests {
 
     fn view() -> TranscriptView {
         TranscriptView::new(Arc::new(Container::new()))
+    }
+
+    #[test]
+    fn empty_assistant_start_and_whitespace_deltas_do_not_move_the_transcript() {
+        use rpi_tui::Component;
+        for starts_with_event in [true, false] {
+            let view = view();
+            view.add_user("hi");
+            let before = view.chat.render(80);
+            if starts_with_event {
+                view.apply(&UiEvent::AssistantStart { blocks: vec![] }, 80);
+                assert_eq!(view.chat.render(80), before);
+            }
+            for blocks in [
+                vec![],
+                vec![AssistantBlock::Text(" ".into())],
+                vec![AssistantBlock::Thinking("\n".into())],
+            ] {
+                view.apply(
+                    &UiEvent::AssistantUpdate {
+                        blocks,
+                        tool_calls: vec![],
+                    },
+                    80,
+                );
+                assert_eq!(view.chat.render(80), before);
+            }
+            view.apply(
+                &UiEvent::AssistantUpdate {
+                    blocks: vec![AssistantBlock::Text("hello".into())],
+                    tool_calls: vec![],
+                },
+                80,
+            );
+            let visible = view.chat.render(80);
+            assert!(visible.len() > before.len());
+            assert!(visible.iter().any(|line| line.contains("hello")));
+            assert_eq!(visible.last(), Some(&String::new()));
+            view.apply(&UiEvent::AssistantEnd { blocks: vec![] }, 80);
+            assert_eq!(view.chat.render(80), before);
+            view.apply(&UiEvent::AssistantStart { blocks: vec![] }, 80);
+            assert_eq!(view.chat.render(80), before);
+        }
     }
 
     #[test]

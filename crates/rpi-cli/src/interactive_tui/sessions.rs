@@ -302,14 +302,13 @@ pub(super) async fn render_session_history(
                         AssistantMessageOptions::default(),
                     ));
                     comp.set_show_images(show_images);
+                    comp.set_trailing_spacing(1);
                     if let Some(t) = &transformer {
                         comp.set_markdown_transformer(Some(t.clone()));
                     }
                     comp.update_blocks(&assistant_blocks(a));
                     chat.add_child(comp);
-                    // Single trailing spacer: the next transcript entry (user or
-                    // assistant) follows one blank line below.
-                    chat.add_child(Arc::new(Spacer::new(1)));
+                    // The component adds spacing only when it has visible content.
                     if let Some(text) = extension_usage_text(extension_session.as_ref(), &a.usage) {
                         add_note_message(chat, &text);
                     }

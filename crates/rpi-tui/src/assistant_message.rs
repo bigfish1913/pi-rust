@@ -73,6 +73,7 @@ pub struct AssistantMessageComponent {
     /// Rendering options
     options: Mutex<AssistantMessageOptions>,
     show_images: Mutex<bool>,
+    trailing_spacing: Mutex<usize>,
     /// Whether this message has tool calls
     has_tool_calls: Mutex<bool>,
     /// Whether currently streaming
@@ -100,6 +101,7 @@ impl AssistantMessageComponent {
             content_container,
             options: Mutex::new(options),
             show_images: Mutex::new(true),
+            trailing_spacing: Mutex::new(0),
             has_tool_calls: Mutex::new(false),
             is_streaming: Mutex::new(false),
             last_blocks: Mutex::new(Vec::new()),
@@ -372,6 +374,11 @@ impl AssistantMessageComponent {
         self.markdown_transformer.lock().unwrap().clone()
     }
 
+    /// Add trailing rows only when the message renders visible content.
+    pub fn set_trailing_spacing(&self, rows: usize) {
+        *self.trailing_spacing.lock().unwrap() = rows;
+    }
+
     /// Set streaming state.
     pub fn set_streaming(&self, streaming: bool) {
         if let Ok(mut s) = self.is_streaming.lock() {
@@ -382,8 +389,13 @@ impl AssistantMessageComponent {
 
 impl Component for AssistantMessageComponent {
     fn render(&self, width: usize) -> Vec<String> {
-        // Render content container
-        self.content_container.render(width)
+        let mut lines = self.content_container.render(width);
+        // A provider can start with no content or whitespace-only deltas.
+        // Such a message must not reserve even its inter-message spacing.
+        if !lines.is_empty() {
+            lines.extend((0..*self.trailing_spacing.lock().unwrap()).map(|_| String::new()));
+        }
+        lines
     }
 
     fn invalidate(&self) {
@@ -422,6 +434,30 @@ mod tests {
 
         let lines = msg.render(80);
         assert!(lines.is_empty() || lines.iter().all(|l| l.trim().is_empty()));
+    }
+
+    #[test]
+    fn trailing_spacing_does_not_render_for_empty_streaming_content() {
+        let msg = AssistantMessageComponent::default();
+        msg.set_trailing_spacing(1);
+        msg.set_streaming(true);
+        for blocks in [
+            vec![],
+            vec![AssistantBlock::Text(" \n\t".into())],
+            vec![AssistantBlock::Thinking(" ".into())],
+        ] {
+            msg.update_blocks(&blocks);
+            assert!(msg.render(80).is_empty());
+        }
+        msg.update_text("Hello");
+        msg.set_trailing_spacing(0);
+        let mut expected = msg.render(80);
+        expected.push(String::new());
+        msg.set_trailing_spacing(1);
+        assert_eq!(msg.render(80), expected);
+        msg.update_blocks(&[]);
+        msg.set_streaming(false);
+        assert!(msg.render(80).is_empty());
     }
 
     #[test]
