@@ -162,6 +162,10 @@ pub struct ResolvedModel {
     /// the TUI applies it at startup when it matches a known preset
     /// (dark/light/monochrome); otherwise ignored.
     pub theme: Option<String>,
+    /// Every authenticated provider runtime, with the selected provider first.
+    /// The harness resolves a provider lazily by `model.provider`, so this lets
+    /// `/model` hot-switch across providers without a restart.
+    pub providers: Vec<Arc<dyn Provider>>,
 }
 
 impl std::fmt::Debug for ResolvedModel {
@@ -375,6 +379,10 @@ fn resolve_with_settings(
             }
         }
     }
+
+    // Snapshot the full (un-retained) catalog so auxiliary provider runtimes
+    // for `/model` hot-switching can be built after the selected one.
+    let full_catalog = catalog.clone();
 
     if let Some(requested) = cli_provider {
         catalog.retain(|model| provider_matches(model, requested, &models_cfg));
@@ -612,37 +620,122 @@ fn resolve_with_settings(
             &BTreeMap::from([("authorization".into(), format!("Bearer {key}"))]),
         );
     }
+    let (provider, has_provider_key) = build_runtime(
+        &selected_provider,
+        &selected_api,
+        &full_catalog,
+        selected_anthropic_credential.as_ref(),
+        selected_openai_key.as_deref(),
+        &settings,
+    );
+
+    // Build runtimes for every OTHER authenticated provider so the harness can
+    // hot-switch providers by `model.provider` (its lazy resolve matches by
+    // id). The selected provider is already built above.
+    let mut providers: Vec<Arc<dyn Provider>> = vec![provider.clone()];
+    {
+        let mut seen: Vec<(String, rpi_ai::Api)> =
+            vec![(selected_provider.clone(), selected_api.clone())];
+        for candidate in &full_catalog {
+            let key = (candidate.provider.clone(), candidate.api.clone());
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.push(key.clone());
+            let (anth, openai_key) = match &candidate.api {
+                rpi_ai::Api::AnthropicMessages => {
+                    let auth_header = models_cfg
+                        .providers
+                        .get(&candidate.provider)
+                        .and_then(|p| p.auth_header)
+                        .unwrap_or(false);
+                    (
+                        credential_for_selected_anthropic_provider(
+                            None,
+                            &anthropic_credentials,
+                            &candidate.provider,
+                            auth_header,
+                        ),
+                        None,
+                    )
+                }
+                rpi_ai::Api::OpenaiCompletions | rpi_ai::Api::OpenaiResponses => (
+                    None,
+                    openai_credential_for(&openai_credentials, &candidate.provider).cloned(),
+                ),
+                _ => (None, None),
+            };
+            let authed = model_has_header_auth(candidate)
+                || match candidate.api {
+                    rpi_ai::Api::AnthropicMessages => anth.is_some(),
+                    rpi_ai::Api::OpenaiCompletions | rpi_ai::Api::OpenaiResponses => {
+                        openai_key.is_some()
+                    }
+                    _ => false,
+                };
+            if !authed {
+                continue;
+            }
+            let (runtime, _) = build_runtime(
+                &candidate.provider,
+                &candidate.api,
+                &full_catalog,
+                anth.as_ref(),
+                openai_key.as_deref(),
+                &settings,
+            );
+            providers.push(runtime);
+        }
+    }
+
+    Ok(ResolvedModel {
+        provider,
+        model,
+        thinking_level,
+        has_provider_key,
+        theme: settings.theme.clone(),
+        providers,
+    })
+}
+
+/// Build one provider runtime from a pre-computed credential. Shared by
+/// [`resolve_with_settings`] (for the selected provider) and the
+/// all-provider runtime list built for `/model` hot-switching.
+fn build_runtime(
+    provider_id: &str,
+    api: &rpi_ai::Api,
+    catalog: &[Model],
+    anthropic_credential: Option<&AnthropicCredential>,
+    openai_key: Option<&str>,
+    settings: &settings::Settings,
+) -> (Arc<dyn Provider>, bool) {
     let mut provider_models: Vec<Model> = catalog
-        .into_iter()
-        .filter(|candidate| {
-            candidate.api == selected_api && candidate.provider == selected_provider
-        })
+        .iter()
+        .filter(|candidate| candidate.api == *api && candidate.provider == provider_id)
+        .cloned()
         .collect();
-    if let Some(AnthropicCredential::Headers(headers)) = &selected_anthropic_credential {
+    if let Some(AnthropicCredential::Headers(headers)) = anthropic_credential {
         for candidate in &mut provider_models {
             merge_auth_headers(candidate, headers);
         }
     }
-    if let Some(key) = &selected_openai_key {
+    if let Some(key) = openai_key {
         let headers = BTreeMap::from([("authorization".into(), format!("Bearer {key}"))]);
         for candidate in &mut provider_models {
             merge_auth_headers(candidate, &headers);
         }
     }
-    let (provider, has_provider_key): (Arc<dyn Provider>, bool) = match selected_api {
+    match api {
         rpi_ai::Api::AnthropicMessages => {
-            let provider_key = selected_anthropic_credential
-                .as_ref()
+            let provider_key = anthropic_credential
                 .and_then(AnthropicCredential::provider_key)
                 .map(str::to_string);
             let has_key = provider_key.is_some();
             let http =
-                provider_http_client(&provider_models, "https://api.anthropic.com", &settings);
-            let inner = if selected_provider == DEFAULT_PROVIDER_ID
-                && !matches!(
-                    selected_anthropic_credential,
-                    Some(AnthropicCredential::Headers(_))
-                ) {
+                provider_http_client(&provider_models, "https://api.anthropic.com", settings);
+            let inner = if provider_id == DEFAULT_PROVIDER_ID
+                && !matches!(anthropic_credential, Some(AnthropicCredential::Headers(_)))
+            {
                 AnthropicProvider::with_models(provider_key, http, provider_models)
             } else {
                 AnthropicProvider::with_models_without_env_api_key(
@@ -653,27 +746,27 @@ fn resolve_with_settings(
             };
             (
                 Arc::new(NamedAnthropicProvider {
-                    id: selected_provider,
+                    id: provider_id.to_string(),
                     inner,
                 }),
                 has_key,
             )
         }
         rpi_ai::Api::OpenaiCompletions => {
-            let has_key = selected_openai_key.is_some();
+            let has_key = openai_key.is_some();
             let http =
-                provider_http_client(&provider_models, "https://api.openai.com/v1", &settings);
-            let inner = if selected_provider == "openai" {
+                provider_http_client(&provider_models, "https://api.openai.com/v1", settings);
+            let inner = if provider_id == "openai" {
                 OpenAiCompletionsProvider::with_models(
-                    selected_provider,
-                    selected_openai_key,
+                    provider_id.to_string(),
+                    openai_key.map(str::to_string),
                     http,
                     provider_models,
                 )
             } else {
                 OpenAiCompletionsProvider::with_models_without_env_api_key(
-                    selected_provider,
-                    selected_openai_key,
+                    provider_id.to_string(),
+                    openai_key.map(str::to_string),
                     http,
                     provider_models,
                 )
@@ -681,20 +774,20 @@ fn resolve_with_settings(
             (Arc::new(inner), has_key)
         }
         rpi_ai::Api::OpenaiResponses => {
-            let has_key = selected_openai_key.is_some();
+            let has_key = openai_key.is_some();
             let http =
-                provider_http_client(&provider_models, "https://api.openai.com/v1", &settings);
-            let inner = if selected_provider == "openai" {
+                provider_http_client(&provider_models, "https://api.openai.com/v1", settings);
+            let inner = if provider_id == "openai" {
                 OpenAiResponsesProvider::with_models(
-                    selected_provider,
-                    selected_openai_key,
+                    provider_id.to_string(),
+                    openai_key.map(str::to_string),
                     http,
                     provider_models,
                 )
             } else {
                 OpenAiResponsesProvider::with_models_without_env_api_key(
-                    selected_provider,
-                    selected_openai_key,
+                    provider_id.to_string(),
+                    openai_key.map(str::to_string),
                     http,
                     provider_models,
                 )
@@ -702,15 +795,7 @@ fn resolve_with_settings(
             (Arc::new(inner), has_key)
         }
         _ => unreachable!("unsupported APIs are filtered while loading models.json"),
-    };
-
-    Ok(ResolvedModel {
-        provider,
-        model,
-        thinking_level,
-        has_provider_key,
-        theme: settings.theme.clone(),
-    })
+    }
 }
 
 /// The catalog the TUI's `/model` selector displays (read-only). Re-derives the
@@ -738,6 +823,21 @@ pub fn available_catalog(resolved: &ResolvedModel) -> Vec<Model> {
         // must only offer models the current lane can actually route to.
         .filter(|m| m.api == *selected_api && m.provider == *selected_provider)
         .filter(|m| model_is_authed(m, resolved.has_provider_key))
+        .filter(|m| seen.insert((m.api.clone(), m.provider.clone(), m.id.to_ascii_lowercase())))
+        .cloned()
+        .collect()
+}
+
+/// Return every authenticated model across ALL configured providers (built-in
+/// + models.json), not just the currently selected one. Derived from the
+/// already-built provider runtimes so each model keeps its merged auth headers
+/// and base-url override (a `catalog_all()`-based derivation would drop both).
+pub fn authenticated_catalog(resolved: &ResolvedModel) -> Vec<Model> {
+    let mut seen = std::collections::HashSet::new();
+    resolved
+        .providers
+        .iter()
+        .flat_map(|provider| provider.models())
         .filter(|m| seen.insert((m.api.clone(), m.provider.clone(), m.id.to_ascii_lowercase())))
         .cloned()
         .collect()
@@ -2171,6 +2271,85 @@ mod tests {
             headers.get("authorization").map(|s| s.as_str()),
             Some("Bearer gw-secret")
         );
+    }
+
+    #[test]
+    fn resolved_providers_include_all_authenticated_runtimes() {
+        let _env = TestEnv::new();
+        std::fs::write(
+            config::models_path().unwrap(),
+            r#"{
+  "providers": {
+    "gateway-a": {
+      "baseUrl": "https://a.example.com",
+      "api": "openai-completions",
+      "apiKey": "key-a",
+      "models": [ { "id": "model-a" } ]
+    },
+    "gateway-b": {
+      "baseUrl": "https://b.example.com",
+      "api": "openai-completions",
+      "apiKey": "key-b",
+      "models": [ { "id": "model-b" } ]
+    }
+  }
+}"#,
+        )
+        .unwrap();
+
+        let resolved = resolve(None, None, None, None, None).unwrap();
+        let ids: Vec<&str> = resolved.providers.iter().map(|p| p.id()).collect();
+        // Both runtimes are registered so the harness can hot-switch by
+        // `model.provider`; the selected one comes first.
+        assert_eq!(resolved.provider.id(), "gateway-a");
+        assert_eq!(ids[0], "gateway-a");
+        assert!(
+            ids.contains(&"gateway-b"),
+            "gateway-b runtime missing: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn authenticated_catalog_spans_all_configured_providers() {
+        let _env = TestEnv::new();
+        std::fs::write(
+            config::models_path().unwrap(),
+            r#"{
+  "providers": {
+    "gateway-a": {
+      "baseUrl": "https://a.example.com",
+      "api": "openai-completions",
+      "apiKey": "key-a",
+      "models": [ { "id": "model-a" } ]
+    },
+    "gateway-b": {
+      "baseUrl": "https://b.example.com",
+      "api": "openai-completions",
+      "apiKey": "key-b",
+      "models": [ { "id": "model-b" } ]
+    }
+  }
+}"#,
+        )
+        .unwrap();
+
+        let resolved = resolve(None, None, None, None, None).unwrap();
+        let catalog = authenticated_catalog(&resolved);
+        let providers: std::collections::BTreeSet<&str> =
+            catalog.iter().map(|m| m.provider.as_str()).collect();
+        assert!(
+            providers.contains("gateway-a"),
+            "gateway-a models missing: {providers:?}"
+        );
+        assert!(
+            providers.contains("gateway-b"),
+            "gateway-b models missing: {providers:?}"
+        );
+        // Unauthenticated built-ins are excluded (no ANTHROPIC/OPENAI key here).
+        assert!(!providers.contains("anthropic"));
+        assert!(!providers.contains("openai"));
+        // Auth headers merged at build time survive into the selector catalog.
+        assert!(catalog.iter().all(|m| m.headers.is_some()));
     }
 
     #[test]
