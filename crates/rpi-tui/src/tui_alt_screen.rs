@@ -642,7 +642,27 @@ impl TuiAltScreen {
                     first
                 };
                 let mut output = String::from("\x1b[?2026h");
-                if move_target > viewport_bottom {
+                let mut force_tail_repaint = false;
+                if move_target < viewport_top {
+                    // The changed range starts above the visible viewport (e.g.
+                    // a long streamed message re-wrapping above the visible
+                    // tail). Scroll the viewport up so the write lands on the
+                    // correct document rows; without this the cursor clamps to
+                    // the top row and the transcript is painted over the dock,
+                    // while `advanced` under-counts the real scroll and corrupts
+                    // `main_viewport_top`/`main_hardware_row` for later frames.
+                    //
+                    // SD leaves the rows below the rewritten range blank, so
+                    // when the rewrite does NOT reach the document tail (an
+                    // in-place edit above the viewport) those rows must still be
+                    // repainted — force the write range through the last line.
+                    force_tail_repaint = true;
+                    let scroll = viewport_top - move_target;
+                    output.push_str("\x1b[H");
+                    output.push_str(&format!("\x1b[{scroll}T"));
+                    viewport_top = move_target;
+                    hardware_row = move_target;
+                } else if move_target > viewport_bottom {
                     let current_screen = hardware_row
                         .saturating_sub(viewport_top)
                         .min(height.saturating_sub(1));
@@ -663,7 +683,10 @@ impl TuiAltScreen {
                     output.push_str(&format!("\x1b[{}A", current_screen - target_screen));
                 }
                 output.push_str(if append_start { "\r\n" } else { "\r" });
-                let render_end = last.min(lines.len().saturating_sub(1));
+                let mut render_end = last.min(lines.len().saturating_sub(1));
+                if force_tail_repaint {
+                    render_end = lines.len().saturating_sub(1);
+                }
                 if !deleted_tail_only {
                     for index in first..=render_end {
                         if index > first {
@@ -705,14 +728,67 @@ impl TuiAltScreen {
 
         if let Some((row, col)) = cursor {
             let hardware_row = *self.main_hardware_row.lock().unwrap();
-            if hardware_row > row {
-                terminal.write(&format!("\x1b[{}A", hardware_row - row));
-            } else if row > hardware_row {
-                terminal.write(&format!("\x1b[{}B", row - hardware_row));
+            let mut viewport_top = *self.main_viewport_top.lock().unwrap();
+            let viewport_bottom = viewport_top + height.saturating_sub(1);
+
+            if row > viewport_bottom {
+                // The editor row is below the visible window (a write scrolled
+                // up to an edit above the old viewport). Scroll back down so
+                // the editor is the bottom row, then move the cursor there.
+                let scroll = row - viewport_bottom;
+                let mut output = String::new();
+                let current_screen = hardware_row
+                    .saturating_sub(viewport_top)
+                    .min(height.saturating_sub(1));
+                let down = height.saturating_sub(1).saturating_sub(current_screen);
+                if down > 0 {
+                    output.push_str(&format!("\x1b[{down}B"));
+                }
+                output.push_str(&"\r\n".repeat(scroll));
+                terminal.write(&output);
+                viewport_top += scroll;
+            } else if row < viewport_top {
+                // The editor row is above the visible window. Scroll up so it
+                // becomes the top row, then repaint the revealed viewport — SD
+                // leaves the scrolled-off bottom rows blank otherwise.
+                let scroll = viewport_top - row;
+                terminal.write(&format!("\x1b[H\x1b[{scroll}T"));
+                viewport_top = row;
+                let mut output = String::from("\x1b[?2026h");
+                for i in 0..height {
+                    let line = lines
+                        .get(viewport_top + i)
+                        .map(String::as_str)
+                        .unwrap_or("");
+                    if i > 0 {
+                        output.push_str("\r\n");
+                    }
+                    output.push_str("\x1b[2K");
+                    output.push_str(line);
+                }
+                // Return the cursor to the top row (the editor row) so the
+                // column move below lands on it.
+                output.push_str(&format!("\x1b[{}A", height.saturating_sub(1)));
+                output.push_str("\x1b[?2026l");
+                terminal.write(&output);
+            } else {
+                // Within the window: a relative move is enough (and never
+                // scrolls, so it cannot drift the viewport bookkeeping).
+                let current_screen = hardware_row
+                    .saturating_sub(viewport_top)
+                    .min(height.saturating_sub(1));
+                let target_screen = row - viewport_top;
+                if target_screen > current_screen {
+                    terminal.write(&format!("\x1b[{}B", target_screen - current_screen));
+                } else if current_screen > target_screen {
+                    terminal.write(&format!("\x1b[{}A", current_screen - target_screen));
+                }
             }
+
             terminal.write(&format!("\r\x1b[{}C", col));
             terminal.write("\x1b[?25h");
             *self.main_hardware_row.lock().unwrap() = row;
+            *self.main_viewport_top.lock().unwrap() = viewport_top;
         } else {
             terminal.write("\x1b[?25l");
         }
