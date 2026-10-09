@@ -1531,7 +1531,9 @@ pub async fn interactive_tui(
             // only reason an idle session repaints its footer.
             let panels_changed = plugin_panels.sync(tui_tick.as_ref(), &state_tick.ext_status);
             if state_tick.sync_extension_status() || panels_changed {
-                tui_tick.request_render(false);
+                // Status/panel updates leave chat content untouched. The scroll
+                // cache regenerates itself if enabling a sidebar changes width.
+                tui_tick.request_render_reusing_scroll_content();
             }
             if pet_tick.tick(scroll_tick.viewport_height()) {
                 tui_tick.request_render(false);
