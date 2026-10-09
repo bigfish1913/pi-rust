@@ -10,9 +10,7 @@ use super::component::Component;
 use super::container::Container;
 use super::layout::composite_tui_line;
 use super::overlay::OverlayManager;
-use super::tui::{OverlayAnchor, SizeValue};
 use super::tui::{OverlayHandle, OverlayOptions, TuiMode, TuiStopOptions, TUI};
-use crate::ansi::visible_width;
 use crate::terminal::Terminal;
 
 /// Main screen TUI that uses terminal scrollback for scrolling.
@@ -196,7 +194,7 @@ impl TUI for TuiMainScreen {
 impl TuiMainScreen {
     fn paint_overlays(&self, base_lines: &[String], width: usize) {
         let height = self.terminal.rows().max(1);
-        let overlays = self.overlays.get_visible();
+        let overlays = self.overlays.render_visible(width, height);
         if overlays.is_empty() || base_lines.is_empty() {
             return;
         }
@@ -209,62 +207,10 @@ impl TuiMainScreen {
         self.terminal.write("\r\n");
         self.terminal.write(&format!("\x1b[{}A\x1b[s", base_height));
 
-        for (component, options) in overlays {
-            if let Some(visible) = options.visible {
-                if !visible(width, height) {
-                    continue;
-                }
-            }
-            let mut overlay_lines = component.render(width);
-            if overlay_lines.is_empty() {
-                continue;
-            }
-            let natural_width = overlay_lines
-                .iter()
-                .map(|line| visible_width(line))
-                .max()
-                .unwrap_or(1);
-            let overlay_width = match options.width {
-                Some(SizeValue::Absolute(value)) => value,
-                Some(SizeValue::Percent(value)) => ((width as f64 * value).round() as usize).max(1),
-                None => natural_width,
-            }
-            .max(options.min_width.unwrap_or(0))
-            .min(width.max(1));
-            if let Some(max_height) = options.max_height.map(|value| match value {
-                SizeValue::Absolute(value) => value,
-                SizeValue::Percent(value) => ((height as f64 * value).round() as usize).max(1),
-            }) {
-                overlay_lines.truncate(max_height.max(1));
-            }
-            let overlay_height = overlay_lines.len().min(height);
-            let margin = options.margin.unwrap_or_default();
-            let x = match options.anchor {
-                OverlayAnchor::TopLeft | OverlayAnchor::LeftCenter | OverlayAnchor::BottomLeft => {
-                    margin.left
-                }
-                OverlayAnchor::TopRight
-                | OverlayAnchor::RightCenter
-                | OverlayAnchor::BottomRight => width.saturating_sub(overlay_width + margin.right),
-                _ => width.saturating_sub(overlay_width) / 2,
-            };
-            let y = match options.anchor {
-                OverlayAnchor::TopLeft | OverlayAnchor::TopCenter | OverlayAnchor::TopRight => {
-                    margin.top
-                }
-                OverlayAnchor::BottomLeft
-                | OverlayAnchor::BottomCenter
-                | OverlayAnchor::BottomRight => {
-                    height.saturating_sub(overlay_height + margin.bottom)
-                }
-                _ => height.saturating_sub(overlay_height) / 2,
-            };
-            let x = (x as i32 + options.offset_x).max(0) as usize;
-            let y = (y as i32 + options.offset_y).max(0) as usize;
-
-            if y >= height {
-                continue;
-            }
+        for overlay in overlays {
+            let (x, y, overlay_width) = (overlay.x, overlay.y, overlay.width);
+            let overlay_lines = overlay.lines;
+            let overlay_height = overlay_lines.len();
             // Restore the first base row before positioning each overlay so
             // multiple overlays retain their z-order and anchor independently.
             self.terminal.write("\x1b[u");

@@ -19,6 +19,12 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ### Fixed
 
+- macOS TUI keyboard setup stays on the active screen buffer and requests
+  printable-key release events where supported. Local Terminal.app recognizes
+  Shift+Enter through native modifier state; suspension restores terminal modes.
+- Plugin shortcuts no longer intercept modal dialog, selector or search input.
+  Passive panels render at their allocated width, stay clear of the editor/footer,
+  clamp offsets and avoid each other while space permits.
 - `/changelog` displays the real packaged changelog instead of a static summary,
   including offline installs and Keep a Changelog version headings.
 

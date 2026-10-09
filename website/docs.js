@@ -2,6 +2,17 @@ import { initI18n, localizeData, onLocaleChange, t } from './i18n.js';
 
 const $ = (selector, scope = document) => scope.querySelector(selector);
 const $$ = (selector, scope = document) => [...scope.querySelectorAll(selector)];
+
+function escapeHtml(value) {
+  const div = document.createElement('div');
+  div.textContent = String(value ?? '');
+  return div.innerHTML;
+}
+
+function escapeAttribute(value) {
+  return escapeHtml(value).replace(/["'`]/g, (character) => ({ '"': '&quot;', "'": '&#39;', '`': '&#96;' })[character]);
+}
+
 const state = { rawData: null, data: null, mode: 'guide', query: '' };
 
 function showToast(message) {
@@ -29,20 +40,20 @@ function matches(section) {
 }
 
 function renderModes() {
-  $('[data-docs-modes]').innerHTML = Object.entries(state.data.modes).map(([key, mode], index) => `<button class="docs-mode ${key === state.mode ? 'is-active' : ''}" type="button" role="tab" aria-selected="${key === state.mode}" data-docs-mode="${key}"><span>0${index + 1}</span>${mode.label}</button>`).join('');
+  $('[data-docs-modes]').innerHTML = Object.entries(state.data.modes).map(([key, mode], index) => `<button class="docs-mode ${key === state.mode ? 'is-active' : ''}" type="button" role="tab" aria-selected="${key === state.mode}" data-docs-mode="${escapeAttribute(key)}"><span>0${index + 1}</span>${escapeHtml(mode.label)}</button>`).join('');
   $$('[data-docs-mode]').forEach((button) => button.addEventListener('click', () => { state.mode = button.dataset.docsMode; state.query = ''; $('[data-docs-search]').value = ''; render(); }));
 }
 
 function renderNav(sections) {
   const nav = $('[data-docs-nav]');
-  nav.innerHTML = sections.length ? sections.map((section) => `<a href="#${section.id}"><span>${section.kicker.split(' / ')[0]}</span>${section.title}</a>`).join('') : '';
+  nav.innerHTML = sections.length ? sections.map((section) => `<a href="#${escapeAttribute(section.id)}"><span>${escapeHtml(section.kicker.split(' / ')[0])}</span>${escapeHtml(section.title)}</a>`).join('') : '';
   $$('a', nav).forEach((link) => link.addEventListener('click', (event) => { event.preventDefault(); document.getElementById(link.hash.slice(1))?.scrollIntoView({ behavior: 'smooth', block: 'start' }); history.replaceState(null, '', link.hash); }));
 }
 
 function sectionMarkup(section) {
-  const links = (section.links || []).map((link) => `<a href="${link.url}" target="_blank" rel="noreferrer">${link.label} ↗</a>`).join('');
-  const code = section.code ? `<div class="docs-code"><div class="docs-code-top"><span>${section.code.file}</span><button type="button" data-copy-docs-code aria-label="${t('docs.copyCode')}">${t('action.copy')} <span aria-hidden="true">⧉</span></button></div><pre><code>${section.code.content}</code></pre></div>` : '';
-  return `<article class="docs-section" id="${section.id}"><div class="docs-section-heading"><span class="eyebrow eyebrow-dark">${section.kicker}</span><h2>${section.title}</h2><p class="docs-summary">${section.summary}</p></div><div class="docs-section-body">${section.body.map((paragraph) => `<p>${paragraph}</p>`).join('')}${code}<div class="docs-links">${links}</div></div></article>`;
+  const links = (section.links || []).map((link) => `<a href="${escapeAttribute(link.url)}" target="_blank" rel="noreferrer">${escapeHtml(link.label)} ↗</a>`).join('');
+  const code = section.code ? `<div class="docs-code"><div class="docs-code-top"><span>${escapeHtml(section.code.file)}</span><button type="button" data-copy-docs-code aria-label="${escapeAttribute(t('docs.copyCode'))}">${escapeHtml(t('action.copy'))} <span aria-hidden="true">⧉</span></button></div><pre><code>${escapeHtml(section.code.content)}</code></pre></div>` : '';
+  return `<article class="docs-section" id="${escapeAttribute(section.id)}"><div class="docs-section-heading"><span class="eyebrow eyebrow-dark">${escapeHtml(section.kicker)}</span><h2>${escapeHtml(section.title)}</h2><p class="docs-summary">${escapeHtml(section.summary)}</p></div><div class="docs-section-body">${section.body.map((paragraph) => `<p>${escapeHtml(paragraph)}</p>`).join('')}${code}<div class="docs-links">${links}</div></div></article>`;
 }
 
 function bindCodeCopy() {

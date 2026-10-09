@@ -136,6 +136,22 @@ pub struct ProcessTerminal {
     info: Mutex<TerminalInfo>,
     running: Mutex<bool>,
     writer: Mutex<Box<dyn Write + Send + Sync>>,
+    #[cfg(any(unix, test))]
+    keyboard: Mutex<KeyboardProtocolState>,
+}
+
+#[cfg(any(unix, test))]
+#[derive(Clone, Copy)]
+enum KeyboardProtocol {
+    Kitty,
+    Legacy,
+}
+
+#[cfg(any(unix, test))]
+#[derive(Default)]
+struct KeyboardProtocolState {
+    detected: Option<bool>,
+    active: Option<KeyboardProtocol>,
 }
 
 impl ProcessTerminal {
@@ -154,6 +170,8 @@ impl ProcessTerminal {
             info: Mutex::new(info),
             running: Mutex::new(false),
             writer: Mutex::new(Box::new(io::stdout())),
+            #[cfg(any(unix, test))]
+            keyboard: Mutex::new(KeyboardProtocolState::default()),
         }
     }
 
@@ -172,6 +190,57 @@ impl ProcessTerminal {
             self.enable_mouse();
         } else {
             self.disable_mouse();
+        }
+    }
+
+    /// Negotiate before starting the input reader. Cache support so resuming
+    /// never queries stdin while a reader is already running.
+    #[cfg(any(unix, test))]
+    fn enable_keyboard_protocol(&self, detect: impl FnOnce() -> bool) {
+        let mut keyboard = self.keyboard.lock().unwrap_or_else(|p| p.into_inner());
+        if keyboard.active.is_some() {
+            return;
+        }
+        let supported = match keyboard.detected {
+            Some(supported) => supported,
+            None => {
+                // 1: disambiguate, 2: repeat/release, 4: alternate keys,
+                // 8: also report printable-key releases (e.g. push-to-talk space).
+                self.write("\x1b[>15u");
+                self.flush();
+                let supported = detect();
+                keyboard.detected = Some(supported);
+                if !supported {
+                    self.write("\x1b[<u");
+                }
+                if let Ok(mut info) = self.info.lock() {
+                    info.supports_kitty_keyboard = supported;
+                }
+                if supported {
+                    keyboard.active = Some(KeyboardProtocol::Kitty);
+                    return;
+                }
+                false
+            }
+        };
+        let protocol = if supported {
+            self.write("\x1b[>15u");
+            KeyboardProtocol::Kitty
+        } else {
+            // Crossterm cannot parse xterm's CSI 27;modifier;key~ encoding.
+            // Keep legacy input rather than enabling modifyOtherKeys and
+            // losing keys. Apple Terminal's Shift+Enter is normalized below.
+            KeyboardProtocol::Legacy
+        };
+        keyboard.active = Some(protocol);
+    }
+
+    #[cfg(any(unix, test))]
+    fn disable_keyboard_protocol(&self) {
+        let mut keyboard = self.keyboard.lock().unwrap_or_else(|p| p.into_inner());
+        match keyboard.active.take() {
+            Some(KeyboardProtocol::Kitty) => self.write("\x1b[<u"),
+            Some(KeyboardProtocol::Legacy) | None => {}
         }
     }
 }
@@ -234,10 +303,12 @@ impl Terminal for ProcessTerminal {
         // Event::Paste instead of individual key events (which would trigger
         // submit per line for multi-line pastes).
         self.write("\x1b[?2004h");
-        // Ask supporting Unix terminals to distinguish modified Enter from
-        // plain Enter. Without this, Shift+Enter may arrive as an ordinary CR.
         #[cfg(unix)]
-        self.write("\x1b[>1u");
+        if self.is_tty() && io::stdin().is_terminal() {
+            self.enable_keyboard_protocol(|| {
+                cterm::supports_keyboard_enhancement().unwrap_or(false)
+            });
+        }
         self.update_size();
         self.flush();
     }
@@ -247,7 +318,7 @@ impl Terminal for ProcessTerminal {
         // bracketed-paste mode it turned on and restore the line discipline.
         self.write("\x1b[?2004l");
         #[cfg(unix)]
-        self.write("\x1b[<u");
+        self.disable_keyboard_protocol();
         self.flush();
         let _ = cterm::disable_raw_mode();
     }
@@ -283,7 +354,9 @@ impl Terminal for ProcessTerminal {
                     Ok(true) => {
                         if let Ok(event) = event::read() {
                             match event {
-                                Event::Key(key) => on_input(InputEvent::Key(key)),
+                                Event::Key(key) => {
+                                    on_input(InputEvent::Key(normalize_key_event(key)))
+                                }
                                 Event::Mouse(mouse) => on_input(InputEvent::Mouse(mouse)),
                                 Event::Resize(cols, rows) => {
                                     if let Ok(mut info) = info_clone.lock() {
@@ -320,7 +393,7 @@ impl Terminal for ProcessTerminal {
         // Disable bracketed paste mode before exiting raw mode.
         self.write("\x1b[?2004l");
         #[cfg(unix)]
-        self.write("\x1b[<u");
+        self.disable_keyboard_protocol();
         self.flush();
 
         // Exit raw mode
@@ -348,9 +421,132 @@ impl Terminal for ProcessTerminal {
     }
 }
 
+/// Apple Terminal sends the same CR for Enter and Shift+Enter. Like Pi's
+/// native helper, consult the local modifier state only for that legacy key.
+/// SSH input belongs to the remote user, not the Mac's physical keyboard.
+pub fn normalize_key_event(key: KeyEvent) -> KeyEvent {
+    #[cfg(target_os = "macos")]
+    if key.code == event::KeyCode::Enter
+        && key.modifiers.is_empty()
+        && local_apple_terminal(
+            std::env::var("TERM_PROGRAM").ok().as_deref(),
+            ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"]
+                .iter()
+                .any(|name| std::env::var_os(name).is_some()),
+        )
+    {
+        #[link(name = "CoreGraphics", kind = "framework")]
+        extern "C" {
+            fn CGEventSourceFlagsState(state_id: i32) -> u64;
+        }
+        // kCGEventSourceStateCombinedSessionState = 0; maskShift = 1 << 17.
+        // This accessor reads modifier flags without creating an event tap.
+        let shift_pressed = unsafe { CGEventSourceFlagsState(0) } & (1 << 17) != 0;
+        return normalize_native_shift_enter(key, shift_pressed);
+    }
+    key
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn local_apple_terminal(term_program: Option<&str>, ssh: bool) -> bool {
+    term_program == Some("Apple_Terminal") && !ssh
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn normalize_native_shift_enter(mut key: KeyEvent, shift_pressed: bool) -> KeyEvent {
+    if key.code == event::KeyCode::Enter && key.modifiers.is_empty() && shift_pressed {
+        key.modifiers.insert(event::KeyModifiers::SHIFT);
+    }
+    key
+}
+
 #[cfg(test)]
 mod tests {
-    use super::mouse_tracking_enabled_for;
+    use super::*;
+
+    #[derive(Clone)]
+    struct RecordedOutput(Arc<Mutex<Vec<u8>>>);
+    impl Write for RecordedOutput {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn kitty_protocol_reports_printable_releases_and_restores_once_per_activation() {
+        let terminal = ProcessTerminal::new();
+        let output = RecordedOutput(Arc::new(Mutex::new(Vec::new())));
+        *terminal.writer.lock().unwrap() = Box::new(output.clone());
+        terminal.enable_keyboard_protocol(|| true);
+        assert!(terminal.info().supports_kitty_keyboard);
+        terminal.enable_keyboard_protocol(|| panic!("active protocol must not be pushed twice"));
+        terminal.disable_keyboard_protocol();
+        terminal.disable_keyboard_protocol();
+        terminal.enable_keyboard_protocol(|| panic!("resume must not query stdin"));
+        terminal.disable_keyboard_protocol();
+        let bytes = output.0.lock().unwrap().clone();
+        assert_eq!(bytes, b"\x1b[>15u\x1b[<u\x1b[>15u\x1b[<u");
+        let flags = event::KeyboardEnhancementFlags::from_bits(15).unwrap();
+        assert!(flags.contains(event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES));
+        assert!(flags.contains(event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
+    }
+
+    #[test]
+    fn legacy_terminal_does_not_enable_an_encoding_the_reader_cannot_parse() {
+        let terminal = ProcessTerminal::new();
+        let output = RecordedOutput(Arc::new(Mutex::new(Vec::new())));
+        *terminal.writer.lock().unwrap() = Box::new(output.clone());
+        terminal.enable_keyboard_protocol(|| false);
+        assert!(!terminal.info().supports_kitty_keyboard);
+        terminal.disable_keyboard_protocol();
+        terminal.enable_keyboard_protocol(|| panic!("resume must reuse detection"));
+        terminal.disable_keyboard_protocol();
+        assert_eq!(output.0.lock().unwrap().as_slice(), b"\x1b[>15u\x1b[<u");
+    }
+
+    #[test]
+    fn native_shift_enter_only_changes_unmodified_enter_in_local_apple_terminal() {
+        use event::{KeyCode, KeyModifiers};
+        assert!(local_apple_terminal(Some("Apple_Terminal"), false));
+        assert!(!local_apple_terminal(Some("Apple_Terminal"), true));
+        assert!(!local_apple_terminal(Some("iTerm.app"), false));
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            normalize_native_shift_enter(enter, true).modifiers,
+            KeyModifiers::SHIFT
+        );
+        assert_eq!(normalize_native_shift_enter(enter, false), enter);
+        for key in [
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+        ] {
+            assert_eq!(normalize_native_shift_enter(key, true), key);
+        }
+    }
+
+    #[test]
+    fn native_shift_enter_inserts_a_line_before_plain_enter_submits() {
+        use event::{KeyCode, KeyModifiers};
+        let editor = crate::Editor::simple();
+        let submitted = Arc::new(Mutex::new(Vec::new()));
+        let capture = submitted.clone();
+        editor.on_submit(Arc::new(move |text| {
+            capture.lock().unwrap().push(text.to_string())
+        }));
+        editor.insert("first");
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        editor.handle_key(normalize_native_shift_enter(enter, true));
+        editor.insert("second");
+        assert_eq!(editor.get_text(), "first\nsecond");
+        assert!(submitted.lock().unwrap().is_empty());
+        editor.handle_key(normalize_native_shift_enter(enter, false));
+        assert_eq!(submitted.lock().unwrap().as_slice(), &["first\nsecond"]);
+    }
 
     #[test]
     fn mouse_tracking_default_preserves_native_selection_on_macos() {

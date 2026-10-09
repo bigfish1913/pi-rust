@@ -262,6 +262,9 @@ pub(super) struct TuiState {
     pub(super) markdown_transformer: Arc<std::sync::Mutex<Option<MarkdownTransformer>>>,
     /// Live extension registry used by message/entry renderer dispatch.
     pub(super) extension_session: crate::session::ExtensionSessionCell,
+    /// Releases for already-claimed presses must reach the plugin even if a
+    /// draft or modal appears while the key is held (e.g. push-to-talk).
+    pub(super) extension_claimed_keys: Mutex<std::collections::HashSet<KeyCode>>,
     /// Transcript search handler (Ctrl+Shift+F).
     pub(super) search: Arc<AltScreenSearch>,
     /// Search bar component shown when search is active.

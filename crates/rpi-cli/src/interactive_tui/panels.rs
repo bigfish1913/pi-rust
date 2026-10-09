@@ -15,12 +15,11 @@ fn clean(s: &str) -> String {
         .collect()
 }
 impl Component for Panel {
-    fn render(&self, screen_width: usize) -> Vec<String> {
+    fn render(&self, available_width: usize) -> Vec<String> {
         let spec = self.0.lock().unwrap_or_else(|p| p.into_inner());
-        if screen_width < spec.min_screen_width {
-            return vec![];
-        }
-        let width = screen_width.min(spec.width);
+        // Visibility is checked against terminal width by Panels, while this
+        // component receives only its allocated overlay/sidebar width.
+        let width = available_width.min(spec.width);
         if width < 4 {
             return vec![];
         }
@@ -57,7 +56,7 @@ impl Component for Panel {
         self
     }
 }
-fn options(spec: &ExtensionPanel) -> OverlayOptions {
+fn options(spec: &ExtensionPanel, bottom_margin: usize) -> OverlayOptions {
     let anchor = match spec.anchor {
         PanelAnchor::TopLeft => OverlayAnchor::TopLeft,
         PanelAnchor::TopCenter => OverlayAnchor::TopCenter,
@@ -76,6 +75,10 @@ fn options(spec: &ExtensionPanel) -> OverlayOptions {
         width: Some(rpi_tui::tui::SizeValue::Absolute(spec.width)),
         max_height: Some(rpi_tui::tui::SizeValue::Absolute(spec.max_height)),
         non_capturing: true,
+        margin: Some(rpi_tui::tui::OverlayMargin {
+            bottom: bottom_margin,
+            ..Default::default()
+        }),
         ..Default::default()
     }
 }
@@ -165,6 +168,7 @@ pub(super) struct Panels {
     dock: Option<Dock>,
     revision: Option<u64>,
     viewport: (usize, usize),
+    screen_height: usize,
 }
 impl Panels {
     pub(super) fn with_sidebar(
@@ -211,11 +215,14 @@ impl Panels {
         viewport: (usize, usize),
     ) -> bool {
         let revision = mailbox.revision();
-        if self.revision == Some(revision) && self.viewport == viewport {
+        let screen_height = tui.terminal().rows();
+        let viewport_changed = self.viewport != viewport || self.screen_height != screen_height;
+        if self.revision == Some(revision) && !viewport_changed {
             return false;
         }
         self.revision = Some(revision);
         self.viewport = viewport;
+        self.screen_height = screen_height;
         let mut specs = mailbox.panels();
         if let Some(dock) = &mut self.dock {
             let (mut left, mut right) = (0, 0);
@@ -272,7 +279,16 @@ impl Panels {
                 dock.sizes = Some((left, right));
             }
         }
-        specs.retain(|_, spec| spec.layout == PanelLayout::Overlay);
+        specs.retain(|_, spec| {
+            spec.layout == PanelLayout::Overlay && viewport.0 >= spec.min_screen_width
+        });
+        // Passive plugin panels belong to the transcript. Leave the editor,
+        // footer and active input dialogs visible even for bottom anchors.
+        let bottom_margin = if self.dock.is_some() {
+            screen_height.saturating_sub(viewport.1)
+        } else {
+            0
+        };
         self.entries.retain(|key, (_, handle)| {
             if specs.contains_key(key) {
                 true
@@ -284,13 +300,13 @@ impl Panels {
         for (key, spec) in specs {
             if let Some((panel, handle)) = self.entries.get(&key) {
                 let mut current = panel.0.lock().unwrap_or_else(|p| p.into_inner());
-                if current.same_geometry(&spec) {
+                if current.same_geometry(&spec) && !viewport_changed {
                     *current = spec;
                     continue;
                 }
                 handle.hide();
             }
-            let opts = options(&spec);
+            let opts = options(&spec, bottom_margin);
             let panel = Arc::new(Panel(Mutex::new(spec)));
             let handle = tui.show_overlay(panel.clone(), Some(opts));
             self.entries.insert(key, (panel, handle));
@@ -309,6 +325,25 @@ impl Drop for Panels {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn overlay_visibility_uses_terminal_width_and_reflows_with_resize() {
+        let tui = TuiAltScreen::new(Box::new(ProcessTerminal::new()), false, None);
+        let mailbox = rpi_extensions::ExtensionStatusMailbox::new();
+        let mut panels = Panels::default();
+        mailbox.handle(serde_json::json!({"key":"monitor","panel":{"version":1,"width":24,"minScreenWidth":80,"lines":["visible"]}})).unwrap();
+        panels.sync_viewport(&tui, &mailbox, (120, 21));
+        let panel = panels.entries["monitor"].0.clone();
+        assert!(panel.render(24).join("\n").contains("visible"));
+        panels.sync_viewport(&tui, &mailbox, (64, 21));
+        assert!(panels.entries.is_empty());
+        panels.sync_viewport(&tui, &mailbox, (120, 21));
+        assert!(panels.entries["monitor"]
+            .0
+            .render(24)
+            .join("\n")
+            .contains("visible"));
+        assert!(!Arc::ptr_eq(&panel, &panels.entries["monitor"].0));
+    }
     #[test]
     fn sidebar_reserves_space_preserves_scroll_and_editor_and_restores_layout_when_hidden() {
         let tui = TuiAltScreen::new(Box::new(ProcessTerminal::new()), false, None);
