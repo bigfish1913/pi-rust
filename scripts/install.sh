@@ -56,9 +56,7 @@ esac
 
 # Only the combinations the release workflow actually builds.
 case "${arch_part}-${os_part}" in
-  x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu|aarch64-apple-darwin|x86_64-pc-windows-msvc) ;;
-  x86_64-apple-darwin)
-    die "no prebuilt binary for Intel macOS yet. Build from source with 'cargo install rpi-cli'." ;;
+  x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu|aarch64-apple-darwin|x86_64-apple-darwin|x86_64-pc-windows-msvc) ;;
   *) die "no prebuilt binary for ${arch_part}-${os_part}. Build from source with 'cargo install rpi-cli'." ;;
 esac
 

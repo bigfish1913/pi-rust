@@ -37,7 +37,11 @@ Add `-- --dry-run` to print the plan without executing anything.
 ## The asset contract these manifests depend on
 
 `.github/workflows/release-binaries.yml` publishes one archive per target, **with
-the binary at the archive root** and a `.sha256` beside every archive:
+the binary at the archive root** and a `.sha256` beside every archive.
+
+The table below records the original four targets. The workflow also builds
+Intel macOS as `rpi-v<version>-x86_64-apple-darwin.tar.gz`, with a matching
+`.sha256`; this asset is available in releases whose tag includes that target.
 
 | Target | Asset | sha256 (v0.3.2) |
 | --- | --- | --- |
@@ -48,8 +52,9 @@ the binary at the archive root** and a `.sha256` beside every archive:
 
 Two consequences worth knowing:
 
-- **There is no `x86_64-apple-darwin` build.** Intel Macs are served by
-  `cargo install rpi-cli`; the Homebrew formula deliberately omits that branch.
+- Intel Macs can use `scripts/install.sh` for releases containing that asset,
+  or `cargo install rpi-cli`. The Homebrew formula currently covers Apple
+  silicon on macOS.
 - The assets are named after the **binary** (`rpi`), while the crate is
   `rpi-cli`. Anything templating a URL from the crate name is wrong — which is
   why the binstall `pkg-url` uses `{ bin }` and not `{ name }`.
