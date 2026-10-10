@@ -231,6 +231,13 @@ pub(super) fn settings_menu_items(
         .with_description("Disable the verbose startup listing (applies on restart)")
         .with_values(&["true", "false"]),
         SettingItem::new(
+            "collapse-changelog",
+            "Collapse changelog",
+            bool_setting_value(settings.collapse_changelog.unwrap_or(false)),
+        )
+        .with_description("Show a compact upgrade notice (applies on restart)")
+        .with_values(&["true", "false"]),
+        SettingItem::new(
             "terminal-progress",
             "Terminal progress",
             bool_setting_value(settings.show_terminal_progress().unwrap_or(true)),
@@ -340,6 +347,10 @@ pub(super) fn apply_setting_change(
         // Persisted only: resolved once at startup.
         "quiet-startup" => {
             settings.quiet_startup = Some(as_bool());
+            None
+        }
+        "collapse-changelog" => {
+            settings.collapse_changelog = Some(as_bool());
             None
         }
         "terminal-progress" => {

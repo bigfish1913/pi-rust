@@ -2,6 +2,12 @@
 rpi.laofu.online {
     encode gzip
     root * /var/www/rpi
+
+    # Markdown source files are fetched by guide.js; direct visits should open the rendered guide.
+    redir /user-guide.md /guide.html?doc=user-guide 302
+    redir /extension-authoring.md /guide.html?doc=extension-authoring 302
+    redir /agent-project.md /guide.html?doc=agent-project 302
+
     file_server
     tls {
         issuer acme

@@ -81,9 +81,14 @@ store panels without rendering them. Older hosts do not render the new field.
 Supported anchors: `top-left`, `top-center`, `top-right`, `left-center`, `center`,
 `right-center`, `bottom-left`, `bottom-center`, `bottom-right`. Signed offsets
 are terminal columns/rows relative to the anchor; negative offsets move left/up.
-Positions are relative to the visible terminal, so they stay fixed while chat
-scrolls. Panels are passive text overlays and do not change keyboard focus.
-They can cover chat content; use distinct anchors or offsets for multiple panels.
+In the interactive TUI, positions are relative to the visible transcript area,
+so panels stay fixed while chat scrolls and never cover the editor or footer.
+Panels are passive text overlays and do not change keyboard focus. Content is
+rendered at the allocated width and offsets are clamped inside the available area.
+When passive panels overlap, the host moves later panels to the nearest free
+vertical position, leaving a one-row gap. A panel that cannot fit is temporarily
+hidden and returns when space becomes available. Use `sidebar` to reserve space
+beside chat rather than cover transcript content.
 
 Set `"layout":"sidebar"` to reserve a column beside the transcript instead of
 covering chat. The default `"layout":"overlay"` preserves existing panels.

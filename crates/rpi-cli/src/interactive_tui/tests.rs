@@ -2,6 +2,31 @@ use super::*;
 use rpi_tui::Component;
 
 #[test]
+fn changelog_command_renders_real_bundled_release_notes() {
+    let chat = Arc::new(Container::new());
+    add_changelog_message(&chat);
+    let output = strip_ansi(&chat.render(120).join("\n"));
+    assert!(output.contains("0.3.17"));
+    assert!(output.contains("whitespace-only streaming"));
+    assert!(!output.contains("Native parity phase 1"));
+}
+
+#[test]
+fn collapsed_startup_changelog_links_to_full_notes() {
+    let chat = Arc::new(Container::new());
+    add_startup_changelog_message(&chat, "## 0.3.17\n\n- full release detail", "0.3.17", true);
+    let output = strip_ansi(&chat.render(120).join("\n"));
+    assert!(output.contains("Updated to v0.3.17"));
+    assert!(output.contains("/changelog"));
+    assert!(!output.contains("full release detail"));
+    let chat = Arc::new(Container::new());
+    add_startup_changelog_message(&chat, "## 0.3.17\n\n- full release detail", "0.3.17", false);
+    let output = strip_ansi(&chat.render(120).join("\n"));
+    assert!(output.contains("What's New"));
+    assert!(output.contains("full release detail"));
+}
+
+#[test]
 fn queued_user_message_keeps_images_and_image_only_messages() {
     let image = rpi_ai::types::ImageContent {
         kind: rpi_ai::types::ImageContentType,
@@ -113,6 +138,101 @@ fn monitor_function_key_works_with_a_draft_without_changing_text() {
         &state.editor
     ));
     assert_eq!(state.editor.get_text(), "unsent draft");
+}
+
+#[test]
+fn modal_inputs_keep_registered_plugin_shortcuts_until_closed() {
+    use rpi_extensions::{ExtensionRegistry, ExtensionSession, PluginKeepalive};
+    use rpi_plugin_sdk::{EventTag, StablePluginEvent, EVENT_HANDLER_CLAIMED};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    extern "C" fn claim(_: StablePluginEvent, user_data: *mut std::ffi::c_void) -> i32 {
+        // The counter outlives the session and all synchronous dispatch calls.
+        let calls = unsafe { &*user_data.cast::<AtomicUsize>() };
+        calls.fetch_add(1, Ordering::SeqCst);
+        EVENT_HANDLER_CLAIMED
+    }
+    let calls = AtomicUsize::new(0);
+    let state = test_tui_state();
+    let mut registry = ExtensionRegistry::new();
+    for name in ["space", "f8", "escape", "enter"] {
+        registry.register_shortcut("test".into(), name.into(), "test".into());
+    }
+    registry.register_event_handler(
+        "test".into(),
+        EventTag::Input,
+        claim,
+        (&calls as *const AtomicUsize).cast_mut().cast(),
+    );
+    *state.extension_session.lock().unwrap() = ExtensionSession::from_parts(
+        Arc::new(registry.snapshot()),
+        PluginKeepalive::empty(),
+        vec![],
+        None,
+    );
+    let keys = [KeyCode::Char(' '), KeyCode::F(8), KeyCode::Enter];
+    for code in keys {
+        assert!(dispatch_key_event(
+            &state,
+            &KeyEvent::new(code, KeyModifiers::NONE),
+            &state.editor
+        ));
+        assert!(dispatch_key_event(
+            &state,
+            &KeyEvent::new_with_kind(code, KeyModifiers::NONE, KeyEventKind::Release),
+            &state.editor
+        ));
+    }
+    let before = calls.load(Ordering::SeqCst);
+    for modal in 0..4 {
+        match modal {
+            0 => *state.active_extension_editor.lock().unwrap() = Some(Arc::new(Editor::simple())),
+            1 => *state.active_extension_input.lock().unwrap() = Some(Arc::new(Input::new())),
+            2 => {
+                *state.active_selector.lock().unwrap() = Some((
+                    SelectorView::List(Arc::new(SelectList::new(vec![], 5))),
+                    SelectorKind::Extension,
+                ))
+            }
+            _ => state.search.activate(),
+        }
+        for code in keys.into_iter().chain([KeyCode::Esc]) {
+            for kind in [
+                KeyEventKind::Press,
+                KeyEventKind::Repeat,
+                KeyEventKind::Release,
+            ] {
+                let key = KeyEvent::new_with_kind(code, KeyModifiers::NONE, kind);
+                assert!(!dispatch_key_event(&state, &key, &state.editor));
+            }
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), before);
+        state.active_extension_editor.lock().unwrap().take();
+        state.active_extension_input.lock().unwrap().take();
+        state.active_selector.lock().unwrap().take();
+        state.search.deactivate();
+    }
+    assert!(dispatch_key_event(
+        &state,
+        &KeyEvent::new(KeyCode::F(8), KeyModifiers::NONE),
+        &state.editor
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), before + 1);
+    let space = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
+    assert!(dispatch_key_event(&state, &space, &state.editor));
+    state.editor.set_text("injected transcription");
+    *state.active_extension_input.lock().unwrap() = Some(Arc::new(Input::new()));
+    let held = calls.load(Ordering::SeqCst);
+    assert!(dispatch_key_event(
+        &state,
+        &KeyEvent::new_with_kind(space.code, space.modifiers, KeyEventKind::Release),
+        &state.editor
+    ));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        held + 1,
+        "finish the already-owned hold"
+    );
+    assert!(!dispatch_key_event(&state, &space, &state.editor));
 }
 
 /// A draft injected from a voice transcription is submitted only when it is
@@ -260,6 +380,7 @@ fn test_tui_state() -> Arc<TuiState> {
         cache_tracker: std::sync::Mutex::new(rpi_harness::cache_stats::CacheMissTracker::new()),
         scoped_edit: std::sync::Mutex::new(None),
         markdown_transformer: Arc::new(std::sync::Mutex::new(None)),
+        extension_claimed_keys: Mutex::new(Default::default()),
         extension_session: Arc::new(std::sync::Mutex::new(
             rpi_extensions::ExtensionSession::none(),
         )),
@@ -461,6 +582,7 @@ fn settings_menu_covers_the_wired_settings_surface() {
             "show-images",
             "cache-miss-notices",
             "quiet-startup",
+            "collapse-changelog",
             "terminal-progress",
             "fullscreen-copy-on-select",
             "double-escape-action",
@@ -489,10 +611,19 @@ fn settings_menu_covers_the_wired_settings_surface() {
         );
     }
     // The default model row falls back to the running lane's model.
-    assert_eq!(items[1].value, "claude-sonnet-5");
+    let value = |key: &str| {
+        items
+            .iter()
+            .find(|item| item.key == key)
+            .unwrap()
+            .value
+            .as_str()
+    };
+    assert_eq!(value("model"), "claude-sonnet-5");
     // Native defaults: cache-miss notices off, terminal progress on.
-    assert_eq!(items[6].value, "false");
-    assert_eq!(items[8].value, "true");
+    assert_eq!(value("cache-miss-notices"), "false");
+    assert_eq!(value("terminal-progress"), "true");
+    assert_eq!(value("collapse-changelog"), "false");
 }
 
 #[test]
@@ -1280,6 +1411,7 @@ fn test_agent_event_mapping_creates_assistant_and_tool() {
         cache_tracker: std::sync::Mutex::new(rpi_harness::cache_stats::CacheMissTracker::new()),
         scoped_edit: std::sync::Mutex::new(None),
         markdown_transformer: Arc::new(std::sync::Mutex::new(None)),
+        extension_claimed_keys: Mutex::new(Default::default()),
         extension_session: Arc::new(std::sync::Mutex::new(
             rpi_extensions::ExtensionSession::none(),
         )),
@@ -1919,6 +2051,7 @@ fn test_autocomplete_slash_suggestions_render() {
         cache_tracker: std::sync::Mutex::new(rpi_harness::cache_stats::CacheMissTracker::new()),
         scoped_edit: std::sync::Mutex::new(None),
         markdown_transformer: Arc::new(std::sync::Mutex::new(None)),
+        extension_claimed_keys: Mutex::new(Default::default()),
         extension_session: Arc::new(std::sync::Mutex::new(
             rpi_extensions::ExtensionSession::none(),
         )),
@@ -2008,6 +2141,7 @@ fn test_select_list_swap_restores_editor() {
         cache_tracker: std::sync::Mutex::new(rpi_harness::cache_stats::CacheMissTracker::new()),
         scoped_edit: std::sync::Mutex::new(None),
         markdown_transformer: Arc::new(std::sync::Mutex::new(None)),
+        extension_claimed_keys: Mutex::new(Default::default()),
         extension_session: Arc::new(std::sync::Mutex::new(
             rpi_extensions::ExtensionSession::none(),
         )),
@@ -2100,6 +2234,7 @@ fn test_message_history_browse_restores_draft() {
         cache_tracker: std::sync::Mutex::new(rpi_harness::cache_stats::CacheMissTracker::new()),
         scoped_edit: std::sync::Mutex::new(None),
         markdown_transformer: Arc::new(std::sync::Mutex::new(None)),
+        extension_claimed_keys: Mutex::new(Default::default()),
         extension_session: Arc::new(std::sync::Mutex::new(
             rpi_extensions::ExtensionSession::none(),
         )),
@@ -2195,6 +2330,7 @@ fn test_accept_top_suggestion_replaces_prefix() {
         cache_tracker: std::sync::Mutex::new(rpi_harness::cache_stats::CacheMissTracker::new()),
         scoped_edit: std::sync::Mutex::new(None),
         markdown_transformer: Arc::new(std::sync::Mutex::new(None)),
+        extension_claimed_keys: Mutex::new(Default::default()),
         extension_session: Arc::new(std::sync::Mutex::new(
             rpi_extensions::ExtensionSession::none(),
         )),

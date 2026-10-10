@@ -2,16 +2,16 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.12.0.schema.json
 
 PackageIdentifier: bigfish1913.rpi
-PackageVersion: 0.3.17
+PackageVersion: 0.3.18
 InstallerType: zip
 NestedInstallerType: portable
-ReleaseDate: 2026-10-08
+ReleaseDate: 2026-10-10
 Installers:
 - Architecture: x64
   NestedInstallerFiles:
   - RelativeFilePath: rpi.exe
     PortableCommandAlias: rpi
-  InstallerUrl: https://github.com/bigfish1913/pi-rust/releases/download/v0.3.17/rpi-v0.3.17-x86_64-pc-windows-msvc.zip
-  InstallerSha256: 0EC8186F31EE8EAE624685668B4B65D08B7B41A25A2FC11BDC77E1BBC9E10863
+  InstallerUrl: https://github.com/bigfish1913/pi-rust/releases/download/v0.3.18/rpi-v0.3.18-x86_64-pc-windows-msvc.zip
+  InstallerSha256: 0C00A7271FDC50E1AAB1E5AC7B7EE2BA2942BCE3BC2916D5A66E61699BC5CA5A
 ManifestType: installer
 ManifestVersion: 1.12.0

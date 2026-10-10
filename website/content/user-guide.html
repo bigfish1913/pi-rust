@@ -1,0 +1,289 @@
+<h1 id="rpi">rpi 使用手册</h1>
+<p>这是一份面向使用者和扩展作者的 rpi 手册。rpi 是基于 Pi agent 设计的 Rust 原生 coding-agent：核心能力以 crate 形式提供，<code>rpi</code> 是开箱即用的 CLI。本文记录当前版本已经实现的命令和行为，随 <code>rpi-cli</code> 一起发布。</p>
+<h2 id="1">1. 安装</h2>
+<h3 id="cli">直接安装 CLI</h3>
+<p>需要 Rust/Cargo：</p>
+<pre><code class="language-bash">cargo install rpi-cli
+rpi --version
+rpi --help
+</code></pre>
+<p>从本仓库源码安装开发版本：</p>
+<pre><code class="language-bash">git clone https://github.com/bigfish1913/pi-rust.git
+cd pi-rust
+cargo install --path crates/rpi-cli --force
+</code></pre>
+<p><code>cargo install</code> 安装的是可执行文件；它不等同于 <code>rpi install</code>。后者用于安装由 <code>rpi-plugin-sdk</code> 构建的 Rust 动态库扩展。</p>
+<h3 id="_1">从源码启动与构建</h3>
+<p>本项目是 Rust Cargo workspace，不是 Node/npm 项目，根目录没有 <code>package.json</code>。在仓库根目录执行：</p>
+<pre><code class="language-bash"># 直接启动 CLI
+cargo run -p rpi-cli
+
+# 向 CLI 传递参数（`--` 后的内容属于 rpi）
+cargo run -p rpi-cli -- -p &quot;总结 README.md&quot;
+cargo run -p rpi-cli -- --mode json -p &quot;列出项目中的 crates&quot;
+
+# 构建 release 版本
+cargo build -p rpi-cli --release
+</code></pre>
+<p>构建完成后，Windows 可执行文件位于 <code>target/release/rpi.exe</code>，Linux/macOS 下通常为 <code>target/release/rpi</code>。也可以把本地 CLI 安装到 Cargo 的 bin 目录后直接使用：</p>
+<pre><code class="language-bash">cargo install --path crates/rpi-cli --force
+rpi
+</code></pre>
+<p>离线示例（不需要 API Key 或网络）可以使用：</p>
+<pre><code class="language-bash">cargo run -p minimal
+</code></pre>
+<h3 id="_2">第一次运行</h3>
+<p>交互模式：</p>
+<pre><code class="language-bash">rpi
+rpi &quot;解释当前项目的目录结构&quot;
+</code></pre>
+<p>单次输出模式：</p>
+<pre><code class="language-bash">rpi -p &quot;总结 README.md&quot;
+rpi --mode json -p &quot;列出项目的风险&quot;
+</code></pre>
+<p>通过 <code>@</code> 把文件放进第一条消息：</p>
+<pre><code class="language-bash">rpi @README.md &quot;给出这个项目的改进建议&quot;
+</code></pre>
+<h2 id="2">2. 模型和凭据</h2>
+<h3 id="_3">凭据优先级</h3>
+<p>当多个来源同时存在时，优先级为：</p>
+<ol>
+<li><code>--api-key</code></li>
+<li><code>~/.rpi/auth.json</code>（由 <code>rpi auth login</code> 写入）</li>
+<li><code>~/.rpi/agent/models.json</code> 中对应 provider 的 <code>apiKey</code></li>
+<li>环境变量</li>
+</ol>
+<p>Anthropic 使用 <code>ANTHROPIC_API_KEY</code> 或 <code>ANTHROPIC_AUTH_TOKEN</code>；OpenAI-compatible provider 使用 <code>OPENAI_API_KEY</code>。检查凭据时不会发起网络请求：</p>
+<pre><code class="language-bash">rpi auth check
+rpi auth check --provider gateway --json
+rpi auth login
+rpi auth logout
+</code></pre>
+<p>不要把密钥写入 Git 仓库或项目文档。</p>
+<h3 id="provider">自定义 Provider</h3>
+<p>配置文件默认是 <code>~/.rpi/agent/models.json</code>，也可以通过 <code>RPI_CODING_AGENT_DIR</code> 指定 agent 配置目录：</p>
+<pre><code class="language-jsonc">{
+  &quot;providers&quot;: {
+    &quot;gateway&quot;: {
+      &quot;api&quot;: &quot;anthropic-messages&quot;,
+      &quot;baseUrl&quot;: &quot;https://gateway.example.com&quot;,
+      &quot;apiKey&quot;: &quot;sk-gateway-secret&quot;,
+      &quot;models&quot;: [
+        { &quot;id&quot;: &quot;custom-claude&quot;, &quot;name&quot;: &quot;Custom Claude&quot; }
+      ]
+    },
+    &quot;openai-gateway&quot;: {
+      &quot;api&quot;: &quot;openai-completions&quot;,
+      &quot;baseUrl&quot;: &quot;https://api.example.com/v1&quot;,
+      &quot;apiKey&quot;: &quot;sk-openai-secret&quot;,
+      &quot;models&quot;: [
+        { &quot;id&quot;: &quot;custom-model&quot;, &quot;name&quot;: &quot;Custom Model&quot; }
+      ]
+    }
+  }
+}
+</code></pre>
+<p>选择模型：</p>
+<pre><code class="language-bash">rpi --model gateway/custom-claude -p &quot;hello&quot;
+rpi --model openai-gateway/custom-model -p &quot;hello&quot;
+rpi --provider gateway --model custom-claude -p &quot;hello&quot;
+</code></pre>
+<p>不传 <code>--model</code> 时，rpi 会优先选择已经认证的模型。标准 Anthropic 凭据存在时使用内置默认模型；只有自定义 gateway 已认证时，会选择该 gateway 的第一个可用模型。</p>
+<p>Anthropic 的兼容网关还可以使用：</p>
+<pre><code class="language-text">ANTHROPIC_BASE_URL=https://gateway.example.com
+ANTHROPIC_AUTH_TOKEN=token
+</code></pre>
+<h2 id="3-cli">3. CLI 命令</h2>
+<p>常用全局选项：</p>
+<pre><code class="language-text">--provider &lt;name&gt;       Provider 名称
+--model &lt;pattern&gt;       模型 ID，支持 provider/model 和 thinking 后缀
+--api-key &lt;key&gt;         本次运行覆盖凭据
+--base-url &lt;url&gt;        覆盖模型 endpoint
+--timeout &lt;seconds&gt;     LLM API 请求超时（默认 600）
+--thinking &lt;level&gt;      off/minimal/low/medium/high/xhigh/max
+--print, -p             单次运行并退出
+--mode text|json|rpc    输出模式
+--continue, -c          继续最近会话
+--resume, -r            选择历史会话
+--session &lt;id|path&gt;     指定会话
+--session-dir &lt;dir&gt;     指定会话目录
+--name, -n &lt;name&gt;       设置会话显示名称
+--tools &lt;list&gt;          只允许指定工具
+--exclude-tools &lt;list&gt;  禁用指定工具
+--no-tools              禁用所有工具
+--no-builtin-tools      禁用内置工具（read/bash/edit/write/docs）
+--no-skills             跳过技能发现
+--no-prompt-templates   跳过 prompt-template 发现
+--no-context-files      跳过 AGENTS.md/CLAUDE.md 发现
+--no-extensions         禁用扩展加载
+--extensions-dir &lt;dir&gt;  额外扫描 Rust 扩展目录
+--package-only         只加载当前项目 package/resource，排除全局资源
+--project-only         `--package-only` 的等价别名
+--list-models [search]  列出可用模型（可带模糊搜索）
+--offline               禁用启动时的网络检查
+--export &lt;file&gt;         把 JSONL 会话导出为 HTML
+--tui-mode &lt;mode&gt;       TUI buffer：regular 或 fullscreen
+--system-prompt &lt;text&gt;  替换默认系统提示词
+--append-system-prompt &lt;text&gt;  追加系统提示词（可重复）
+--debug-system-prompt   把解析后的系统提示词各段打印到 stderr
+--verbose               显示启动警告（如被忽略的 flag）
+--server [--port &lt;n&gt;] [--bind &lt;ip&gt;]
+                        无头服务端（启动时打印 token）
+--connect &lt;host:port&gt;   远程客户端 TUI（零本地资源）
+--token &lt;token&gt;         远程认证 token（也支持环境变量 RPI_SERVER_TOKEN）
+</code></pre>
+<p>子命令：</p>
+<pre><code class="language-text">rpi auth login|check|logout
+rpi events path|tail    检查扩展事件日志（需 RPI_EVENT_LOG=1）
+rpi install &lt;crate&gt;
+rpi uninstall &lt;crate&gt;
+rpi update                 # 更新 rpi CLI 自身
+rpi dev [options]          # 开发 Rust 扩展：编译、watch、热重载
+rpi dev-local [options]    # 只调试当前 Rust 扩展（隔离模式）
+rpi package link|list|unlink # 管理项目本地 Rust 扩展包
+</code></pre>
+<h3 id="-server-connect">远程模式（<code>--server</code> / <code>--connect</code>）</h3>
+<p>把 agent 跑在无头服务端，另一个进程用 TUI 远程驱动。客户端<strong>无任何本地 agent 资源</strong>。</p>
+<pre><code class="language-bash">rpi --server --port 9899          # 服务端：启动时打印 token
+rpi --connect 127.0.0.1:9899 --token &lt;token&gt;   # 客户端
+
+# 或通过环境变量传递 token
+export RPI_SERVER_TOKEN=&lt;token&gt;
+rpi --connect 127.0.0.1:9899
+</code></pre>
+<p>服务端默认开启 token 认证（<code>--no-token</code> 可关闭）。客户端支持 <code>/state</code>、<code>/model</code>、
+<code>/thinking</code>、<code>/tools</code>、<code>/abort</code> 等命令；<code>/tree</code>、<code>/fork</code>、<code>/switch</code>、<code>/export</code>、
+<code>/name</code>、<code>/reload</code> 依赖本地 harness，在远程模式下不可用。完整协议、可用命令与
+限制见 <a href="../remote/user-guide.md"><code>remote-mode.md</code></a>。</p>
+<h2 id="4">4. 内置工具</h2>
+<p>默认工具包含 Pi 的 <code>read</code>、<code>bash</code>、<code>edit</code>、<code>write</code>，以及 rpi 自带的只读 <code>docs</code> 文档查询工具。Windows 上还会默认注册 <code>powershell</code>。<code>docs</code> 可以查询使用手册、扩展开发、Agent 项目结构、Rust 调试和架构说明；<code>grep</code>、<code>find</code>、<code>ls</code> 仍保留为库实现，但不由 CLI 默认注册。</p>
+<p>可以通过 <code>.rpi/settings.json</code> 的 <code>defaultTools</code> 字段（或简写 <code>default_tools</code>）在未指定
+<code>--tools</code> 时限定启动工具集：</p>
+<pre><code class="language-json">{
+  &quot;defaultTools&quot;: [&quot;read&quot;, &quot;bash&quot;, &quot;edit&quot;, &quot;write&quot;, &quot;docs&quot;]
+}
+</code></pre>
+<p>需要限制工具范围时，显式列出 Pi 的四个工具：</p>
+<pre><code class="language-bash">rpi --tools read,bash,edit,write,docs -p &quot;检查并修改项目文件&quot;
+</code></pre>
+<h2 id="5">5. 项目目录和资源优先级</h2>
+<p>rpi 使用自己的 <code>.rpi</code> 目录：</p>
+<pre><code class="language-text">项目/
+└── .rpi/
+    ├── settings.json
+    ├── SYSTEM.md
+    ├── APPEND_SYSTEM.md
+    ├── skills/
+    ├── prompts/
+    ├── themes/
+    └── extensions/
+</code></pre>
+<p>全局资源默认位于 <code>~/.rpi/agent/</code>，包括 <code>settings.json</code>、<code>models.json</code>、<code>skills/</code>、<code>prompts/</code>、<code>themes/</code> 和 <code>extensions/</code>。同名资源发生冲突时，项目资源优先于全局资源。</p>
+<p>项目级 <code>.rpi/settings.json</code> 可以追加资源目录：</p>
+<pre><code class="language-json">{
+  &quot;skillDirs&quot;: [&quot;./team-skills&quot;],
+  &quot;promptDirs&quot;: [&quot;./prompts/shared&quot;],
+  &quot;extensionDirs&quot;: [&quot;./target/debug&quot;]
+}
+</code></pre>
+<p>路径相对于项目根目录；<code>skills</code>、<code>prompts</code>、<code>extensions</code> 是对应 <code>*Dirs</code> 字段的简写。自定义目录会与 <code>.rpi</code> 和全局约定目录一起加载。全局 <code>~/.rpi/agent/settings.json</code> 也支持这些字段，相对路径相对于 agent 目录。</p>
+<p>只加载当前项目的 package/resource、排除全局资源时，使用以下任一等价参数：</p>
+<pre><code class="language-bash">rpi --package-only
+rpi --project-only
+</code></pre>
+<p>两者都会加载当前项目的 skills、prompts、themes、extensions 和 packages，并读取项目 <code>.rpi/settings.json</code>；不会自动加载全局资源。<code>--local-only</code> 语义不同，只加载通过 <code>--extensions-dir</code> 或 <code>--extension</code> 显式指定的扩展。</p>
+<p>配置目录可以重定位：</p>
+<pre><code class="language-bash">RPI_CODING_AGENT_DIR=/work/rpi-agent rpi
+</code></pre>
+<p>会话默认保存到 agent 配置目录下的 sessions；<code>--no-session</code> 可使用临时会话。</p>
+<h2 id="6-rust">6. Rust 插件</h2>
+<p>Rust 原生插件是 <code>cdylib</code>，只依赖 <code>rpi-plugin-sdk</code>，由 <code>rpi-extensions</code> 动态加载：</p>
+<pre><code class="language-bash">cargo build -p plugin-stub
+rpi --extensions-dir target/debug -p 'echo &quot;hi&quot;'
+</code></pre>
+<p>从 crates.io 安装：</p>
+<pre><code class="language-bash">rpi install rpi-extension-example
+rpi install rpi-extension-example --version 0.1.0
+rpi install rpi-extension-example --force
+</code></pre>
+<p>本地开发：</p>
+<pre><code class="language-bash">rpi install my-extension --path ../my-rpi-extension --force
+</code></pre>
+<p>开发扩展项目时使用 watch 模式：</p>
+<pre><code class="language-bash">cd ../my-rpi-extension
+rpi dev
+# 多扩展 workspace：rpi dev --package my-extension
+# 只调试当前扩展：rpi dev-local（隔离模式，不加载全局扩展）
+</code></pre>
+<p><code>rpi dev</code> 会自动识别 Cargo <code>cdylib</code>、首次编译并从 <code>.rpi/extensions/.dev</code> 加载版本化产物。源码变化会触发重新编译和热重载；手工执行 <code>/reload</code> 也会先重新编译。编译失败时继续保留当前已经加载的版本。</p>
+<p>如果希望把开发好的扩展固定到某个项目，可使用项目包命令：</p>
+<pre><code class="language-bash">rpi package link --path ../my-extension --package my-extension
+rpi package list
+# 之后在该项目目录直接运行 rpi 即可加载
+rpi package unlink my-extension
+</code></pre>
+<p>项目包位于 <code>.rpi/packages/&lt;name&gt;/</code>，是受信任的本机 Rust 动态库；它不是 npm/Node Pi package。全局安装仍使用 <code>rpi install</code>。完整模板和边界规则见在线扩展作者指南：<a href="https://rpi.laofu.online/extension-authoring.md">https://rpi.laofu.online/extension-authoring.md</a><code>，调试技巧见</code>docs<code>的</code>debugging` 主题。</p>
+<p>安装后的动态库位于 <code>~/.rpi/agent/extensions</code>（或 <code>RPI_CODING_AGENT_DIR</code> 指定的目录），下次启动 rpi 时加载。插件通过稳定 ABI 注册工具、Provider、事件处理器和资源处理器；不要直接依赖 <code>rpi-cli</code> 的私有模块。</p>
+<h2 id="7-sdk">7. SDK 集成</h2>
+<p>只需要嵌入 Agent 时，依赖 <code>rpi-agent</code> 和 <code>rpi-ai</code>；需要内置工具时再加入 <code>rpi-tools</code>；需要会话、压缩、skills 和上下文文件时加入 <code>rpi-harness</code>。</p>
+<pre><code class="language-rust">use rpi_agent::{Agent, AgentEvent};
+use rpi_ai::providers::faux::faux_provider;
+
+let model = faux_provider().model(&quot;echo&quot;);
+let mut agent = Agent::builder(model)
+    .system_prompt(&quot;You are a helpful assistant.&quot;)
+    .build();
+
+let mut events = agent.subscribe();
+agent.prompt(&quot;Hello from rpi&quot;).await?;
+while let Some(event) = events.recv().await {
+    if matches!(event, AgentEvent::AgentEnd { .. }) {
+        break;
+    }
+}
+</code></pre>
+<p>自定义工具实现 <code>rpi-agent::AgentTool</code>；Provider 实现 <code>rpi-ai::Provider</code>。使用 <code>faux provider</code> 和 <code>InMemoryExecutionEnv</code> 可以在没有网络、API key 或真实文件系统的情况下测试 Agent loop。</p>
+<h2 id="8">8. 故障排查</h2>
+<h3 id="_4">找不到模型或接口报错</h3>
+<p>运行 <code>rpi auth check</code>，确认 provider、<code>models.json</code>、环境变量和 <code>baseUrl</code>。使用 <code>--provider</code> 和完整的 <code>provider/model</code> 避免同名模型歧义。接口错误会保留 provider 返回的诊断文本；先检查 endpoint、认证头和模型 ID。</p>
+<h3 id="_5">扩展加载失败</h3>
+<p>确认 Rust 插件是 <code>cdylib</code> 并与当前平台匹配；临时使用 <code>--extensions-dir</code> 指向生成目录。加载失败时保留宿主输出的完整错误信息，检查扩展是否声明了宿主未提供的能力。</p>
+<h3 id="_6">扩展事件处理器没触发或启动被中止</h3>
+<pre><code class="language-bash">export RPI_EVENT_LOG=1
+rpi            # 记录所有扩展事件处理器调用
+rpi events tail   # 跟踪日志；看 result 是 Continue 还是 Error/Abort/Panic/Timeout
+</code></pre>
+<p>日志默认在 <code>~/.rpi/logs/events.jsonl</code>（可用 <code>RPI_EVENT_LOG_PATH</code> 覆盖）。如果
+<code>BeforeTuiStart</code> 阶段有扩展返回 veto（<code>EVENT_HANDLER_ABORT</code>），CLI 以退出码 <code>3</code>
+中止启动并打印原因。</p>
+<h3 id="_7">资源没有出现在欢迎页</h3>
+<p>确认文件位于 <code>.rpi</code>（或兼容的 <code>.pi</code>）或全局 <code>~/.rpi/agent</code>。使用 <code>rpi --debug-system-prompt</code> 查看最终系统提示词、skills 和资源计数；同名资源优先检查 <code>.rpi</code> 是否覆盖了 <code>.pi</code>。</p>
+<h3 id="_8">远程模式连不上</h3>
+<p>确认服务端已用 <code>rpi --server --port &lt;port&gt;</code> 启动且 token 正确（或通过
+<code>RPI_SERVER_TOKEN</code> 提供）。客户端是纯显示端，不加载任何本地 provider/工具/扩展；
+会话文件在服务端。</p>
+<h2 id="9">9. 开发、测试和发布</h2>
+<p>运行格式化、检查和测试：</p>
+<pre><code class="language-bash">cargo fmt --all
+cargo check --workspace
+cargo test --workspace
+</code></pre>
+<p>发布 crate 时按依赖顺序：</p>
+<pre><code class="language-text">rpi-telemetry → rpi-ai → rpi-agent → rpi-tools → rpi-harness →
+rpi-plugin-sdk → rpi-extensions → rpi-tui → rpi-cli
+</code></pre>
+<p>发布前更新版本号和 <code>docs/release-vX.Y.Z.md</code>，确认 README、官网 <code>website/data/docs.json</code> 和本手册中的命令一致。官网是静态站点，文档文件提交到仓库后仍需按项目部署流程重新部署。</p>
+<h2 id="10">10. 文档查询入口</h2>
+<ul>
+<li>在线文档：<a href="https://rpi.laofu.online/docs.html">https://rpi.laofu.online/docs.html</a></li>
+<li>源码仓库：<a href="https://github.com/bigfish1913/pi-rust">https://github.com/bigfish1913/pi-rust</a></li>
+<li>
+<p>Rust API：<a href="https://docs.rs/rpi-agent">https://docs.rs/rpi-agent</a>、<a href="https://docs.rs/rpi-plugin-sdk">https://docs.rs/rpi-plugin-sdk</a></p>
+</li>
+<li>
+<p>Package 与扩展作者指南：<a href="https://rpi.laofu.online/extension-authoring.md">https://rpi.laofu.online/extension-authoring.md</a></p>
+</li>
+<li>远程模式：<docs/remote/user-guide.md></li>
+<li>Rust 扩展与 agent 调试：<code>rpi</code> 内 <code>docs</code> 工具的 <code>debugging</code> 主题</li>
+</ul>
+<p>当在线文档和已安装版本不一致时，以对应版本的 Git tag 和仓库内文档为准。</p>

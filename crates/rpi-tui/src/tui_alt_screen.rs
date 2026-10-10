@@ -17,9 +17,7 @@ use super::layout::{
 };
 use super::overlay::OverlayManager;
 use super::scroll_view::ScrollView;
-use super::tui::{
-    OverlayAnchor, OverlayHandle, OverlayOptions, SizeValue, TuiMode, TuiStopOptions, TUI,
-};
+use super::tui::{OverlayHandle, OverlayOptions, TuiMode, TuiStopOptions, TUI};
 use crate::ansi::{visible_width, CURSOR_MARKER};
 use crate::terminal::{InputEvent, Terminal, TerminalInfo};
 
@@ -505,6 +503,8 @@ impl TuiAltScreen {
     /// Exit alternate screen mode.
     fn exit_alt_screen(&self, preserve_screen: bool) {
         if let Ok(terminal) = self.terminal.lock() {
+            // Autowrap is a terminal mode, not restored by leaving the buffer.
+            terminal.write("\x1b[?7h");
             if preserve_screen {
                 terminal.write("\x1b[?1049l\x1b[?25h");
             } else {
@@ -529,15 +529,15 @@ impl TuiAltScreen {
     /// same TUI can be resumed in place.
     pub fn suspend(&self) {
         self.set_render_suspended(true);
-        if !self.uses_main_screen() {
-            // `preserve_screen`: leave the alt buffer without clearing the
-            // user's main-buffer scrollback (unlike a normal shutdown).
-            self.exit_alt_screen(true);
-        }
         if let Ok(terminal) = self.terminal.lock() {
             terminal.disable_mouse();
             terminal.exit_raw_mode();
             terminal.flush();
+        }
+        if !self.uses_main_screen() {
+            // `preserve_screen`: leave the alt buffer without clearing the
+            // user's main-buffer scrollback (unlike a normal shutdown).
+            self.exit_alt_screen(true);
         }
     }
 
@@ -545,12 +545,17 @@ impl TuiAltScreen {
     /// from `SIGTSTP`, then force a full repaint (the alt buffer came back
     /// empty — `set_render_suspended` is what schedules it).
     pub fn resume(&self) {
-        if let Ok(terminal) = self.terminal.lock() {
-            terminal.enter_raw_mode();
-            terminal.flush();
-        }
         if !self.uses_main_screen() {
             self.enter_alt_screen();
+        }
+        if let Ok(terminal) = self.terminal.lock() {
+            terminal.enter_raw_mode();
+            if self.uses_main_screen() {
+                terminal.disable_mouse();
+            } else {
+                terminal.enable_mouse();
+            }
+            terminal.flush();
         }
         self.set_render_suspended(false);
     }
@@ -692,8 +697,13 @@ impl TuiAltScreen {
                         if index > first {
                             output.push_str("\r\n");
                         }
-                        output.push_str("\x1b[2K");
-                        output.push_str(&lines[index]);
+                        if let Some((column,text))=previous.get(index).and_then(|old|crate::line_diff::patch(old,&lines[index])) {
+                            if column>0 {output.push_str(&format!("\x1b[{column}C"));}
+                            output.push_str(&text);
+                        } else {
+                            output.push_str(&lines[index]);
+                            if index < previous.len() && visible_width(&lines[index]) < visible_width(&previous[index]) {output.push_str("\x1b[K");}
+                        }
                     }
                 }
                 let mut final_row = render_end;
@@ -885,7 +895,15 @@ impl TuiAltScreen {
                 if !full_redraw && row < previous.len() && &previous[row] == line {
                     continue; // Skip unchanged lines
                 }
-                buffer.push_str(&format!("\x1b[{};1H\x1b[2K{}", row + 1, line));
+                // Overwrite before clearing any leftover tail. Clearing the
+                // whole row first blanks stationary sidebars during scroll on
+                // terminals that do not implement synchronized output.
+                if let Some((column,text))=(!full_redraw).then(||crate::line_diff::patch(&previous[row],line)).flatten() {
+                    buffer.push_str(&format!("\x1b[{};{}H{}",row+1,column+1,text));
+                } else {
+                    buffer.push_str(&format!("\x1b[{};1H{}", row + 1, line));
+                    if !full_redraw && visible_width(line) < visible_width(&previous[row]) {buffer.push_str("\x1b[K");}
+                }
             }
 
             // Position the hardware cursor using the marker location captured
@@ -914,58 +932,10 @@ impl TuiAltScreen {
     }
 
     fn paint_overlays(&self, lines: &mut [String], width: usize, height: usize) {
-        for (component, options) in self.overlays.get_visible() {
-            if let Some(visible) = options.visible {
-                if !visible(width, height) {
-                    continue;
-                }
-            }
-            let mut overlay_lines = component.render(width);
-            if overlay_lines.is_empty() {
-                continue;
-            }
-            let natural_width = overlay_lines
-                .iter()
-                .map(|line| visible_width(line))
-                .max()
-                .unwrap_or(1);
-            let overlay_width = match options.width {
-                Some(SizeValue::Absolute(value)) => value,
-                Some(SizeValue::Percent(value)) => ((width as f64 * value).round() as usize).max(1),
-                None => natural_width,
-            }
-            .max(options.min_width.unwrap_or(0))
-            .min(width.max(1));
-            if let Some(max_height) = options.max_height.map(|value| match value {
-                SizeValue::Absolute(value) => value,
-                SizeValue::Percent(value) => ((height as f64 * value).round() as usize).max(1),
-            }) {
-                overlay_lines.truncate(max_height.max(1));
-            }
-            let overlay_height = overlay_lines.len().min(height.max(1));
-            let margin = options.margin.unwrap_or_default();
-            let x = match options.anchor {
-                OverlayAnchor::TopLeft | OverlayAnchor::LeftCenter | OverlayAnchor::BottomLeft => {
-                    margin.left
-                }
-                OverlayAnchor::TopRight
-                | OverlayAnchor::RightCenter
-                | OverlayAnchor::BottomRight => width.saturating_sub(overlay_width + margin.right),
-                _ => width.saturating_sub(overlay_width) / 2,
-            };
-            let y = match options.anchor {
-                OverlayAnchor::TopLeft | OverlayAnchor::TopCenter | OverlayAnchor::TopRight => {
-                    margin.top
-                }
-                OverlayAnchor::BottomLeft
-                | OverlayAnchor::BottomCenter
-                | OverlayAnchor::BottomRight => {
-                    height.saturating_sub(overlay_height + margin.bottom)
-                }
-                _ => height.saturating_sub(overlay_height) / 2,
-            };
-            let x = (x as i32 + options.offset_x).max(0) as usize;
-            let y = (y as i32 + options.offset_y).max(0) as usize;
+        for overlay in self.overlays.render_visible(width, height) {
+            let (x, y, overlay_width) = (overlay.x, overlay.y, overlay.width);
+            let overlay_lines = overlay.lines;
+            let overlay_height = overlay_lines.len();
             for (index, line) in overlay_lines.iter().take(overlay_height).enumerate() {
                 let row = y + index;
                 if row >= lines.len() {
@@ -1090,6 +1060,12 @@ impl TUI for TuiAltScreen {
         // Clone the necessary Arc references for the closures
         let running = self.running.clone();
 
+        // Keyboard protocol stacks belong to each screen buffer. Switch first
+        // so the terminal enables its protocol on the screen that receives input.
+        if !self.uses_main_screen() {
+            self.enter_alt_screen();
+        }
+
         // Get terminal and start it (spawns its own input-reader thread whose
         // callbacks are stubs below; kept for the non-pi-tui callers that still
         // rely on `start()`). The asynchronous interactive path uses
@@ -1104,9 +1080,14 @@ impl TUI for TuiAltScreen {
                 }),
                 Box::new(move || {}),
             );
+            if self.uses_main_screen() {
+                terminal.disable_mouse();
+            } else {
+                terminal.enable_mouse();
+            }
+            terminal.flush();
         }
 
-        self.enter_alt_screen();
         self.do_render(false);
     }
 
@@ -1131,12 +1112,11 @@ impl TUI for TuiAltScreen {
                 terminal.stop();
             }
         } else {
-            // Leave the alternate buffer and clear the restored main screen
-            // while the terminal is still in raw mode.
-            self.exit_alt_screen(options.preserve_screen);
+            // Pop the keyboard protocol on its owning screen before leaving it.
             if let Ok(terminal) = self.terminal.lock() {
                 terminal.stop();
             }
+            self.exit_alt_screen(options.preserve_screen);
         }
     }
 
@@ -1201,6 +1181,9 @@ impl TuiAltScreen {
         if let Ok(mut running) = self.running.lock() {
             *running = true;
         }
+        if !self.uses_main_screen() {
+            self.enter_alt_screen();
+        }
         if let Ok(terminal) = self.terminal.lock() {
             terminal.enter_raw_mode();
             if self.uses_main_screen() {
@@ -1214,9 +1197,7 @@ impl TuiAltScreen {
                 // must explicitly re-enable wheel/touchpad events here.
                 terminal.enable_mouse();
             }
-        }
-        if !self.uses_main_screen() {
-            self.enter_alt_screen();
+            terminal.flush();
         }
         self.do_render(false);
     }
@@ -1372,6 +1353,27 @@ mod tests {
     use crate::{Editor, Focusable, Text};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+    #[test]
+    fn changed_rows_overwrite_without_blanking_sidebar_and_clear_shorter_tails_afterwards() {
+        for main_screen in [false,true] {
+        let output=Arc::new(Mutex::new(String::new()));
+        let tui=TuiAltScreen::new(Box::new(RecordingTerminal {output:output.clone()}),false,None);
+        let text=Arc::new(Text::new("chat one    │ RUN STATS",0,0));
+        tui.set_main_screen_mode(main_screen);
+        tui.set_layout_root(Some(text.clone())); tui.start_readerless();
+        output.lock().unwrap().clear();
+        text.set_text("chat two    │ RUN STATS"); tui.do_render(false);
+        let frame=output.lock().unwrap().clone();
+        assert!(frame.contains("tw"));
+        assert!(!frame.contains("RUN STATS"));
+        assert!(!frame.contains("\x1b[2K")); assert!(!frame.contains("\x1b[2J"));
+        output.lock().unwrap().clear();
+        text.set_text("short"); tui.do_render(false);
+        let frame=output.lock().unwrap().clone();
+        assert!(frame.contains("short")); assert!(!frame.contains("\x1b[2K"));
+        }
+    }
+
     struct RecordingTerminal {
         output: Arc<Mutex<String>>,
     }
@@ -1396,21 +1398,82 @@ mod tests {
         fn set_title(&self, _title: &str) {}
         fn enable_mouse(&self) {}
         fn disable_mouse(&self) {}
-        fn enter_raw_mode(&self) {}
-        fn exit_raw_mode(&self) {}
+        fn enter_raw_mode(&self) {
+            self.write("<raw-on>");
+        }
+        fn exit_raw_mode(&self) {
+            self.write("<raw-off>");
+        }
         fn refresh_size(&self) {}
         fn start(
             &self,
             _on_input: Box<dyn Fn(InputEvent) + Send + Sync>,
             _on_resize: Box<dyn Fn() + Send + Sync>,
         ) {
+            self.enter_raw_mode();
         }
-        fn stop(&self) {}
+        fn stop(&self) {
+            self.write("<stop>");
+        }
         fn is_tty(&self) -> bool {
             true
         }
         fn set_progress(&self, _active: bool) {}
         fn flush(&self) {}
+    }
+
+    #[test]
+    fn keyboard_setup_and_teardown_stay_on_the_owning_screen_buffer() {
+        for readerless in [true, false] {
+            let output = Arc::new(Mutex::new(String::new()));
+            let tui = TuiAltScreen::new(
+                Box::new(RecordingTerminal {
+                    output: output.clone(),
+                }),
+                true,
+                None,
+            );
+            if readerless {
+                tui.start_readerless();
+            } else {
+                tui.start();
+            }
+            let rendered = output.lock().unwrap().clone();
+            assert!(rendered.find("\x1b[?1049h").unwrap() < rendered.find("<raw-on>").unwrap());
+            output.lock().unwrap().clear();
+            tui.suspend();
+            let rendered = output.lock().unwrap().clone();
+            assert!(rendered.find("<raw-off>").unwrap() < rendered.find("\x1b[?1049l").unwrap());
+            assert!(rendered.contains("\x1b[?7h"));
+            output.lock().unwrap().clear();
+            tui.resume();
+            let rendered = output.lock().unwrap().clone();
+            assert!(rendered.find("\x1b[?1049h").unwrap() < rendered.find("<raw-on>").unwrap());
+            output.lock().unwrap().clear();
+            tui.stop(TuiStopOptions::default());
+            let rendered = output.lock().unwrap().clone();
+            assert!(rendered.find("<stop>").unwrap() < rendered.find("\x1b[?1049l").unwrap());
+        }
+    }
+
+    #[test]
+    fn regular_start_never_switches_to_the_alternate_screen() {
+        let output = Arc::new(Mutex::new(String::new()));
+        let tui = TuiAltScreen::new(
+            Box::new(RecordingTerminal {
+                output: output.clone(),
+            }),
+            true,
+            None,
+        );
+        tui.set_main_screen_mode(true);
+        tui.start();
+        tui.suspend();
+        tui.resume();
+        tui.stop(TuiStopOptions::default());
+        let rendered = output.lock().unwrap().clone();
+        assert!(rendered.contains("<raw-on>"));
+        assert!(!rendered.contains("\x1b[?1049"));
     }
 
     #[test]
@@ -1495,7 +1558,7 @@ mod tests {
         tui.request_render(false);
 
         let rendered = output.lock().unwrap().clone();
-        assert!(rendered.contains("status2"));
+        assert!(rendered.contains("\x1b[6C2"));
         assert!(!rendered.contains("editor"));
         assert!(!rendered.contains("footer"));
     }

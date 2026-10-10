@@ -188,6 +188,12 @@ pub struct Settings {
     /// Update checks remain enabled, matching upstream.
     #[serde(default)]
     pub quiet_startup: Option<bool>,
+    /// Most recent release notes seen in a fresh interactive session (global).
+    #[serde(default)]
+    pub last_changelog_version: Option<String>,
+    /// Show a compact upgrade notice instead of full notes. Pi defaults false.
+    #[serde(default)]
+    pub collapse_changelog: Option<bool>,
     /// Show the global terminal progress indicator while a run is active.
     #[serde(default)]
     pub show_terminal_progress: Option<bool>,
@@ -532,6 +538,10 @@ fn save_settings_to_path(
             settings.default_thinking_level.as_ref(),
         ),
         ("theme", settings.theme.as_ref()),
+        (
+            "lastChangelogVersion",
+            settings.last_changelog_version.as_ref(),
+        ),
     ] {
         match val {
             Some(v) => {
@@ -587,6 +597,10 @@ fn save_settings_to_path(
         (
             "quietStartup",
             settings.quiet_startup.map(serde_json::Value::Bool),
+        ),
+        (
+            "collapseChangelog",
+            settings.collapse_changelog.map(serde_json::Value::Bool),
         ),
         (
             "showTerminalProgress",
@@ -1002,6 +1016,25 @@ mod scoped_tests {
         s2.scoped_models = None;
         save_settings(&s2).unwrap();
         assert_eq!(load_settings().unwrap().scoped_models, None);
+    }
+
+    #[test]
+    fn changelog_settings_roundtrip_without_losing_existing_configuration() {
+        let (_tmp, _guard) = with_temp_env();
+        let path = config::settings_path().unwrap();
+        std::fs::write(&path, r#"{"defaultModel":"existing-model","lastChangelogVersion":"0.3.16","collapseChangelog":true,"custom":{"retained":true}}"#).unwrap();
+        let mut settings = load_settings().unwrap();
+        assert_eq!(settings.last_changelog_version.as_deref(), Some("0.3.16"));
+        assert_eq!(settings.collapse_changelog, Some(true));
+        settings.last_changelog_version = Some("0.3.17".into());
+        save_settings(&settings).unwrap();
+        let loaded = load_settings().unwrap();
+        assert_eq!(loaded.last_changelog_version.as_deref(), Some("0.3.17"));
+        assert_eq!(loaded.default_model.as_deref(), Some("existing-model"));
+        assert_eq!(loaded.collapse_changelog, Some(true));
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(value["custom"]["retained"], true);
     }
 
     #[test]

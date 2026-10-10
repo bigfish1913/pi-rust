@@ -425,6 +425,20 @@ fn char_shortcut_name(ch: char) -> Option<String> {
 fn dispatch_key_event(state: &TuiState, key: &KeyEvent, editor: &Editor) -> bool {
     use rpi_plugin_sdk::EventTag;
 
+    let owned_release = key.kind == KeyEventKind::Release
+        && state
+            .extension_claimed_keys
+            .lock()
+            .unwrap()
+            .remove(&key.code);
+    // Modal input owns its keys, including function keys and cancellation.
+    // The draft editor can be empty even while the dialog has text/focus.
+    if !owned_release
+        && (state.extension_dialog_open() || state.selector_open() || state.search.is_active())
+    {
+        return false;
+    }
+
     let name = key_shortcut_name(key.code)
         .map(str::to_string)
         .or_else(|| match key.code {
@@ -448,7 +462,7 @@ fn dispatch_key_event(state: &TuiState, key: &KeyEvent, editor: &Editor) -> bool
     }
     // Function keys do not insert text. Other keys belong to the draft editor
     // while composing (space especially).
-    if !editor.get_text().is_empty() && !matches!(key.code, KeyCode::F(_)) {
+    if !owned_release && !editor.get_text().is_empty() && !matches!(key.code, KeyCode::F(_)) {
         return false;
     }
 
@@ -470,7 +484,16 @@ fn dispatch_key_event(state: &TuiState, key: &KeyEvent, editor: &Editor) -> bool
     // `CLAIMED` code while its feature is active and `CONTINUE` otherwise, so a
     // registered-but-disabled shortcut (push-to-talk toggled off) still lets the
     // key reach the editor normally.
-    rpi_extensions::dispatch_data_event_claiming(&snapshot, EventTag::Input, &payload)
+    let claimed =
+        rpi_extensions::dispatch_data_event_claiming(&snapshot, EventTag::Input, &payload);
+    if claimed && key.kind == KeyEventKind::Press {
+        state
+            .extension_claimed_keys
+            .lock()
+            .unwrap()
+            .insert(key.code);
+    }
+    claimed
 }
 
 /// Resolve a command for a `/`-prefixed input and run it when one matches.
@@ -943,6 +966,17 @@ pub async fn interactive_tui(
     // banner once, then write the sentinel. The banner covers the theme hint;
     // the theme stays pickable via `/theme`. See `extras.rs`.
     crate::extras::maybe_first_time_setup(&chat_container);
+    let collapse_changelog =
+        preferred_project_setting(&project_settings, |settings| settings.collapse_changelog)
+            .or(saved_settings.collapse_changelog)
+            .unwrap_or(false);
+    maybe_add_startup_changelog(
+        &harness,
+        &chat_container,
+        &saved_settings,
+        collapse_changelog,
+    )
+    .await;
 
     // A --continue/--resume/--session launch opens on an existing JSONL
     // session — render its prior user/assistant transcript so the user sees
@@ -1154,6 +1188,7 @@ pub async fn interactive_tui(
         cache_tracker: std::sync::Mutex::new(rpi_harness::cache_stats::CacheMissTracker::new()),
         scoped_edit: std::sync::Mutex::new(None),
         markdown_transformer: Arc::new(std::sync::Mutex::new(initial_transformer)),
+        extension_claimed_keys: Mutex::new(Default::default()),
         extension_session: reload_context.extension_session.clone(),
         search: Arc::new(AltScreenSearch::new()),
         search_bar: Arc::new(SearchBar::new()),
@@ -1493,7 +1528,9 @@ pub async fn interactive_tui(
             // only reason an idle session repaints its footer.
             let panels_changed = plugin_panels.sync(tui_tick.as_ref(), &state_tick.ext_status);
             if state_tick.sync_extension_status() || panels_changed {
-                tui_tick.request_render(false);
+                // Status/panel updates leave chat content untouched. The scroll
+                // cache regenerates itself if enabling a sidebar changes width.
+                tui_tick.request_render_reusing_scroll_content();
             }
             if pet_tick.tick(scroll_tick.viewport_height()) {
                 tui_tick.request_render(false);
@@ -1748,6 +1785,7 @@ pub async fn interactive_tui(
                 }
                 continue;
             };
+            let key = rpi_tui::terminal::normalize_key_event(key);
             // Diagnostic trace (off unless RPI_DEBUG_KEYS is set): records what
             // actually arrived before any routing decision, so a client that
             // sends LF for Enter is visible as `Char('j') mods=CONTROL`.

@@ -2,6 +2,46 @@
 
 use super::*;
 
+pub(super) async fn maybe_add_startup_changelog(
+    harness: &AgentHarness,
+    chat: &Arc<Container>,
+    settings: &crate::settings::Settings,
+    collapse: bool,
+) {
+    let has_messages = harness
+        .session()
+        .find_entry_on_branch(
+            &EntryQuery {
+                entry_type: Some("message"),
+                ..Default::default()
+            },
+            &Default::default(),
+        )
+        .await
+        .map(|entry| entry.is_some())
+        .unwrap_or(true);
+    let notice = crate::changelog::startup_changelog(
+        &crate::changelog::bundled_entries(),
+        settings.last_changelog_version.as_deref(),
+        crate::VERSION,
+        has_messages,
+    );
+    if let Some(markdown) = &notice.markdown {
+        add_startup_changelog_message(chat, markdown, crate::VERSION, collapse);
+    }
+    if let Some(version) = notice.version_to_record {
+        let saved = crate::settings::load_settings()
+            .map_err(|error| error.to_string())
+            .and_then(|mut current| {
+                current.last_changelog_version = Some(version);
+                crate::settings::save_settings(&current)
+            });
+        if let Err(error) = saved {
+            tracing::warn!("Could not record changelog version: {error}");
+        }
+    }
+}
+
 // ===========================================================================
 // Run a single prompt (streaming or blocking)
 // ===========================================================================

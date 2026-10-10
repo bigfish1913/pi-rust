@@ -1,14 +1,16 @@
 //! Changelog fetching and parsing.
 //!
 //! Port of the upstream changelog utility.
-//! reads a local `CHANGELOG.md` when present and can otherwise fetch it from
-//! GitHub. rpi keeps the same split: parse a local/remote markdown changelog into
-//! versioned entries.
+//! Bundled release notes power startup notices and `/changelog` without a
+//! source checkout or network request. Optional remote fetching remains
+//! available to consumers, with the same versioned-entry parser.
 //!
 //! The remote URL is overridable with `RPI_CHANGELOG_URL` so a fork can point at
 //! its own changelog without a rebuild.
 
 use serde::{Deserialize, Serialize};
+
+const BUNDLED_CHANGELOG: &str = include_str!("../embedded-docs/changelog.md");
 
 /// One released version's changelog section.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,8 +34,8 @@ pub fn changelog_url() -> String {
 /// Parse a semver-ish heading like `## 1.2.3` / `# 1.2.3` / `## v1.2.3`.
 fn parse_heading(line: &str) -> Option<(u64, u64, u64)> {
     let trimmed = line.trim_start_matches('#').trim();
-    let trimmed = trimmed.strip_prefix('v').unwrap_or(trimmed);
-    let version = trimmed.split_whitespace().next()?;
+    let version = trimmed.split_whitespace().next()?.trim_matches(['[', ']']);
+    let version = version.strip_prefix('v').unwrap_or(version);
     let mut parts = version.split('.');
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next().unwrap_or("0").parse().unwrap_or(0);
@@ -81,6 +83,75 @@ pub fn parse_changelog(text: &str) -> Vec<ChangelogEntry> {
 fn finalize(mut entry: ChangelogEntry) -> ChangelogEntry {
     entry.content = entry.content.trim().to_string();
     entry
+}
+
+/// Release notes shipped with this binary, usable without network or checkout.
+pub fn bundled_entries() -> Vec<ChangelogEntry> {
+    let mut entries = parse_changelog(BUNDLED_CHANGELOG);
+    entries.sort_by_key(|entry| std::cmp::Reverse((entry.major, entry.minor, entry.patch)));
+    entries
+}
+
+pub fn format_entries(entries: &[ChangelogEntry]) -> String {
+    entries
+        .iter()
+        .map(|entry| {
+            format!(
+                "## {}.{}.{}\n\n{}",
+                entry.major, entry.minor, entry.patch, entry.content
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+#[derive(Debug, Default)]
+pub struct StartupChangelog {
+    pub markdown: Option<String>,
+    pub version_to_record: Option<String>,
+}
+
+/// Pi parity: first install records a baseline; upgrades show unseen releases;
+/// existing transcripts and downgrades do not consume or regress that baseline.
+pub fn startup_changelog(
+    entries: &[ChangelogEntry],
+    last_version: Option<&str>,
+    current_version: &str,
+    has_messages: bool,
+) -> StartupChangelog {
+    if has_messages {
+        return StartupChangelog::default();
+    }
+    let Ok(current) = semver::Version::parse(current_version) else {
+        return StartupChangelog::default();
+    };
+    let Some(last) = last_version.and_then(|version| semver::Version::parse(version).ok()) else {
+        return StartupChangelog {
+            markdown: None,
+            version_to_record: Some(current_version.into()),
+        };
+    };
+    if last >= current {
+        return StartupChangelog::default();
+    }
+    let last = (last.major, last.minor, last.patch);
+    let current = (current.major, current.minor, current.patch);
+    let mut unseen: Vec<_> = entries
+        .iter()
+        .filter(|entry| {
+            let version = (entry.major, entry.minor, entry.patch);
+            version > last && version <= current
+        })
+        .cloned()
+        .collect();
+    unseen.sort_by_key(|entry| std::cmp::Reverse((entry.major, entry.minor, entry.patch)));
+    if unseen.is_empty() {
+        return StartupChangelog::default();
+    }
+    StartupChangelog {
+        markdown: Some(format_entries(&unseen)),
+        version_to_record: Some(current_version.into()),
+    }
 }
 
 /// Fetch the changelog body. `allow_network == false` returns `Ok(None)`.
@@ -155,6 +226,51 @@ mod tests {
         let entries = parse_changelog(text);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].content, "- out");
+    }
+
+    #[test]
+    fn parses_keep_a_changelog_headings_and_bundled_notes() {
+        let entries = parse_changelog("## [Unreleased]\n- next\n\n## [0.3.17] - 2026-10-08\n### Fixed\n- reply spacing\n\n## [0.3.16] - 2026-10-06\n- previous");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            (entries[0].major, entries[0].minor, entries[0].patch),
+            (0, 3, 17)
+        );
+        assert!(entries[0].content.contains("reply spacing"));
+        assert!(!entries[0].content.contains("previous"));
+        assert!(!bundled_entries().is_empty());
+    }
+
+    #[test]
+    fn startup_notes_show_once_only_for_new_sessions_after_upgrade() {
+        let entries = parse_changelog(
+            "## [0.3.18]\n- future\n## [0.3.17]\n- current\n## [0.3.16]\n- previous",
+        );
+        let fresh = startup_changelog(&entries, None, "0.3.17", false);
+        assert!(fresh.markdown.is_none());
+        assert_eq!(fresh.version_to_record.as_deref(), Some("0.3.17"));
+        let upgrade = startup_changelog(&entries, Some("0.3.15"), "0.3.17", false);
+        let markdown = upgrade.markdown.unwrap();
+        assert!(markdown.contains("current"));
+        assert!(markdown.contains("previous"));
+        assert!(!markdown.contains("future"));
+        let again = startup_changelog(
+            &entries,
+            upgrade.version_to_record.as_deref(),
+            "0.3.17",
+            false,
+        );
+        assert!(again.markdown.is_none());
+        assert!(again.version_to_record.is_none());
+        let resumed = startup_changelog(&entries, Some("0.3.16"), "0.3.17", true);
+        assert!(resumed.markdown.is_none());
+        assert!(resumed.version_to_record.is_none());
+        assert!(startup_changelog(&entries, Some("0.3.16"), "0.3.17", false)
+            .markdown
+            .is_some());
+        let downgraded = startup_changelog(&entries, Some("0.3.18"), "0.3.17", false);
+        assert!(downgraded.markdown.is_none());
+        assert!(downgraded.version_to_record.is_none());
     }
 
     #[test]
