@@ -697,12 +697,21 @@ impl TuiAltScreen {
                         if index > first {
                             output.push_str("\r\n");
                         }
-                        if let Some((column,text))=previous.get(index).and_then(|old|crate::line_diff::patch(old,&lines[index])) {
-                            if column>0 {output.push_str(&format!("\x1b[{column}C"));}
+                        if let Some((column, text)) = previous
+                            .get(index)
+                            .and_then(|old| crate::line_diff::patch(old, &lines[index]))
+                        {
+                            if column > 0 {
+                                output.push_str(&format!("\x1b[{column}C"));
+                            }
                             output.push_str(&text);
                         } else {
                             output.push_str(&lines[index]);
-                            if index < previous.len() && visible_width(&lines[index]) < visible_width(&previous[index]) {output.push_str("\x1b[K");}
+                            if index < previous.len()
+                                && visible_width(&lines[index]) < visible_width(&previous[index])
+                            {
+                                output.push_str("\x1b[K");
+                            }
                         }
                     }
                 }
@@ -898,11 +907,16 @@ impl TuiAltScreen {
                 // Overwrite before clearing any leftover tail. Clearing the
                 // whole row first blanks stationary sidebars during scroll on
                 // terminals that do not implement synchronized output.
-                if let Some((column,text))=(!full_redraw).then(||crate::line_diff::patch(&previous[row],line)).flatten() {
-                    buffer.push_str(&format!("\x1b[{};{}H{}",row+1,column+1,text));
+                if let Some((column, text)) = (!full_redraw)
+                    .then(|| crate::line_diff::patch(&previous[row], line))
+                    .flatten()
+                {
+                    buffer.push_str(&format!("\x1b[{};{}H{}", row + 1, column + 1, text));
                 } else {
                     buffer.push_str(&format!("\x1b[{};1H{}", row + 1, line));
-                    if !full_redraw && visible_width(line) < visible_width(&previous[row]) {buffer.push_str("\x1b[K");}
+                    if !full_redraw && visible_width(line) < visible_width(&previous[row]) {
+                        buffer.push_str("\x1b[K");
+                    }
                 }
             }
 
@@ -1355,22 +1369,33 @@ mod tests {
 
     #[test]
     fn changed_rows_overwrite_without_blanking_sidebar_and_clear_shorter_tails_afterwards() {
-        for main_screen in [false,true] {
-        let output=Arc::new(Mutex::new(String::new()));
-        let tui=TuiAltScreen::new(Box::new(RecordingTerminal {output:output.clone()}),false,None);
-        let text=Arc::new(Text::new("chat one    │ RUN STATS",0,0));
-        tui.set_main_screen_mode(main_screen);
-        tui.set_layout_root(Some(text.clone())); tui.start_readerless();
-        output.lock().unwrap().clear();
-        text.set_text("chat two    │ RUN STATS"); tui.do_render(false);
-        let frame=output.lock().unwrap().clone();
-        assert!(frame.contains("tw"));
-        assert!(!frame.contains("RUN STATS"));
-        assert!(!frame.contains("\x1b[2K")); assert!(!frame.contains("\x1b[2J"));
-        output.lock().unwrap().clear();
-        text.set_text("short"); tui.do_render(false);
-        let frame=output.lock().unwrap().clone();
-        assert!(frame.contains("short")); assert!(!frame.contains("\x1b[2K"));
+        for main_screen in [false, true] {
+            let output = Arc::new(Mutex::new(String::new()));
+            let tui = TuiAltScreen::new(
+                Box::new(RecordingTerminal {
+                    output: output.clone(),
+                }),
+                false,
+                None,
+            );
+            let text = Arc::new(Text::new("chat one    │ RUN STATS", 0, 0));
+            tui.set_main_screen_mode(main_screen);
+            tui.set_layout_root(Some(text.clone()));
+            tui.start_readerless();
+            output.lock().unwrap().clear();
+            text.set_text("chat two    │ RUN STATS");
+            tui.do_render(false);
+            let frame = output.lock().unwrap().clone();
+            assert!(frame.contains("tw"));
+            assert!(!frame.contains("RUN STATS"));
+            assert!(!frame.contains("\x1b[2K"));
+            assert!(!frame.contains("\x1b[2J"));
+            output.lock().unwrap().clear();
+            text.set_text("short");
+            tui.do_render(false);
+            let frame = output.lock().unwrap().clone();
+            assert!(frame.contains("short"));
+            assert!(!frame.contains("\x1b[2K"));
         }
     }
 
