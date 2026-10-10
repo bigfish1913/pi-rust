@@ -11,6 +11,8 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.3.18] - 2026-10-10
+
 ### Added
 
 - New interactive sessions show bundled release notes once after an upgrade.
