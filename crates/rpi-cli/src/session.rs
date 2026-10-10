@@ -783,7 +783,7 @@ pub async fn build(
         action_bridge: Arc::new(Mutex::new(Some(Arc::clone(&action_bridge)))),
         tool_context,
         catalog,
-        gateway: resolved.provider.clone(),
+        providers: resolved.providers.clone(),
         runtime: runtime.clone(),
         cwd: cwd.to_path_buf(),
         project_trusted,
@@ -885,9 +885,9 @@ pub struct ReloadContext {
     /// the provider (auth/provider resolution is a startup concern; reloading
     /// extensions does not re-open auth).
     pub catalog: Vec<rpi_ai::Model>,
-    /// The resolved gateway provider clone (for rebuilding `models` =
-    /// `vec![gateway] + PluggableProvider::from_session`). Cheap to clone (`Arc`).
-    pub gateway: Arc<dyn Provider>,
+    /// The resolved provider runtimes (for rebuilding `models` =
+    /// `providers + PluggableProvider::from_session`). Cheap to clone (`Arc`).
+    pub providers: Vec<Arc<dyn Provider>>,
     /// The ambient runtime handle (captured in `build`) — `PluggableProvider`
     /// + the fresh `ActionBridge` need a captured `Handle` to spawn from any
     /// thread.
@@ -1377,7 +1377,7 @@ where
     let _ = harness.set_agent_emitter(Some(emitter)).await;
     let _ = harness
         .set_models(build_models_with_extensions_for_reload(
-            &ctx.gateway,
+            &ctx.providers,
             &extension_session,
             ctx.runtime.clone(),
         ))
@@ -1550,16 +1550,16 @@ where
     })
 }
 
-/// `build_models_with_extensions` for the reload path: the resolved gateway
-/// (NOT `resolved` — the reload context carries the gateway `Arc<dyn Provider>`
-/// directly, since the provider/auth did not change) first, then one
+/// `build_models_with_extensions` for the reload path: the resolved provider
+/// runtimes (NOT `resolved` — the reload context carries the `Arc<dyn Provider>`
+/// list directly, since provider/auth did not change) first, then one
 /// `PluggableProvider` per registered extension provider in the fresh session.
 fn build_models_with_extensions_for_reload(
-    gateway: &Arc<dyn Provider>,
+    providers: &[Arc<dyn Provider>],
     extension_session: &ExtensionSession,
     runtime: tokio::runtime::Handle,
 ) -> Vec<Arc<dyn Provider>> {
-    let mut models: Vec<Arc<dyn Provider>> = vec![gateway.clone()];
+    let mut models: Vec<Arc<dyn Provider>> = providers.to_vec();
     let pluggable = rpi_extensions::PluggableProvider::from_session(extension_session, runtime);
     models.extend(pluggable);
     models
@@ -1621,7 +1621,7 @@ fn build_models_with_extensions(
     extension_session: &ExtensionSession,
     runtime: tokio::runtime::Handle,
 ) -> Vec<Arc<dyn Provider>> {
-    let mut models: Vec<Arc<dyn Provider>> = vec![resolved.provider.clone() as Arc<dyn Provider>];
+    let mut models: Vec<Arc<dyn Provider>> = resolved.providers.clone();
     let pluggable = rpi_extensions::PluggableProvider::from_session(extension_session, runtime);
     models.extend(pluggable);
     models

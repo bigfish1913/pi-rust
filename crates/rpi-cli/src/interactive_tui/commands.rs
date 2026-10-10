@@ -144,6 +144,7 @@ impl SlashCommand for ModelCommand {
                 return;
             }
         }
+        let current_id = ctx.state.current_model_id();
         open_model_selector(
             &ctx.state,
             &ctx.editor_container,
@@ -151,10 +152,44 @@ impl SlashCommand for ModelCommand {
             &ctx.tui,
             &ctx.model_catalog,
             &ctx.lane,
-            &ctx.lane_model_id,
+            &current_id,
             &ctx.chat,
             (!term.is_empty()).then_some(term),
         );
+    }
+}
+
+pub(super) struct ProviderCommand;
+impl SlashCommand for ProviderCommand {
+    fn name(&self) -> &'static str {
+        "/provider"
+    }
+    fn description(&self) -> &'static str {
+        "Add, remove, or set the default provider"
+    }
+    fn execute(&self, ctx: &CommandContext, args: &str) {
+        let term = args.trim();
+        if term == "add" || term == "new" {
+            begin_provider_form(&ctx.state, &ctx.editor_container, &ctx.editor, &ctx.tui);
+            return;
+        }
+        if let Some(id) = term.strip_prefix("remove ") {
+            match remove_provider(id) {
+                Ok(note) => add_note_message(&ctx.chat, &note),
+                Err(error) => add_error_message(&ctx.chat, &error),
+            }
+            ctx.tui.request_render(false);
+            return;
+        }
+        if !term.is_empty() {
+            match set_default_provider(term) {
+                Ok(note) => add_note_message(&ctx.chat, &note),
+                Err(error) => add_error_message(&ctx.chat, &error),
+            }
+            ctx.tui.request_render(false);
+            return;
+        }
+        open_provider_selector(&ctx.state, &ctx.editor_container, &ctx.editor, &ctx.tui);
     }
 }
 
@@ -194,6 +229,7 @@ impl SlashCommand for ThinkingCommand {
             ctx.tui.request_render(false);
             return;
         }
+        let current_id = ctx.state.current_model_id();
         open_thinking_selector(
             &ctx.state,
             &ctx.editor_container,
@@ -201,7 +237,7 @@ impl SlashCommand for ThinkingCommand {
             &ctx.tui,
             &ctx.lane,
             &ctx.model_catalog,
-            &ctx.lane_model_id,
+            &current_id,
             &ctx.chat,
         );
     }
@@ -557,6 +593,7 @@ impl SlashCommand for SettingsCommand {
         "Open settings menu"
     }
     fn execute(&self, ctx: &CommandContext, _args: &str) {
+        let current_id = ctx.state.current_model_id();
         open_settings_selector(
             &ctx.state,
             &ctx.editor_container,
@@ -564,7 +601,7 @@ impl SlashCommand for SettingsCommand {
             &ctx.tui,
             &ctx.lane,
             &ctx.model_catalog,
-            &ctx.lane_model_id,
+            &current_id,
             &ctx.chat,
         );
     }
@@ -679,6 +716,7 @@ pub(super) fn build_builtin_registry() -> CommandRegistry {
     r.register(Arc::new(VersionCommand));
     r.register(Arc::new(ChangelogCommand));
     r.register(Arc::new(ModelCommand));
+    r.register(Arc::new(ProviderCommand));
     r.register(Arc::new(ThinkingCommand));
     r.register(Arc::new(ToolsCommand));
     r.register(Arc::new(ImagesCommand));

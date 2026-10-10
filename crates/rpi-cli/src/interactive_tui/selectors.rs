@@ -150,8 +150,9 @@ pub(super) fn open_model_selector(
     let tui_sel = tui.clone();
     let chat_sel = chat.clone();
     let lane_sel = lane.clone();
+    let lane_model_sel = lane_model_id.to_string();
     list.on_select(Arc::new(move |item| {
-        let Some(model) = catalog_arc.iter().find(|m| m.id == item.value).cloned() else {
+        let Some(model) = find_model_selector_match(&catalog_arc, &item.value) else {
             add_note_message(
                 &chat_sel,
                 &format!("Model {} not found in catalog.", item.label),
@@ -159,6 +160,21 @@ pub(super) fn open_model_selector(
             close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
             return;
         };
+
+        // The harness now registers every authenticated provider runtime, so
+        // picking a model from ANOTHER provider hot-switches it (no restart).
+        // Persist the choice as the saved default so the next launch keeps it.
+        let current_provider = catalog_arc
+            .iter()
+            .find(|m| m.id.eq_ignore_ascii_case(&lane_model_sel))
+            .map(|m| m.provider.clone());
+        if current_provider
+            .as_deref()
+            .map_or(true, |cur| !model.provider.eq_ignore_ascii_case(cur))
+        {
+            let _ = set_default_model(&model.provider, &model.id);
+        }
+
         state_sel.set_current_model(&model);
         let lane = lane_sel.clone();
         tokio::spawn(async move {
@@ -486,6 +502,138 @@ pub(super) fn open_theme_selector(
         tui,
         list,
         SelectorKind::Theme,
+    );
+}
+
+/// Sentinel value for the "Add new provider" row in the `/provider` picker.
+const ADD_PROVIDER_VALUE: &str = "__add_provider__";
+/// Sentinel value for the "Remove provider" row in the `/provider` picker.
+const REMOVE_PROVIDER_VALUE: &str = "__remove_provider__";
+
+/// Open the `/provider` selector: pick a provider and persist it as the saved
+/// default (takes effect on the next launch — provider identity, auth, and the
+/// provider runtime are resolved once at startup, unlike `/model`'s live
+/// switch).
+pub(super) fn open_provider_selector(
+    state: &Arc<TuiState>,
+    editor_container: &Arc<Container>,
+    editor: &Arc<Editor>,
+    tui: &Arc<TuiAltScreen>,
+) {
+    let mut items = provider_selector_items();
+    if items.is_empty() {
+        add_note_message(
+            &state.chat_container,
+            "No providers available. Use \"Add new provider\" to configure one in ~/.rpi/agent/models.json.",
+        );
+        tui.request_render(false);
+        return;
+    }
+    // The trailing actions turn the picker into a small management surface.
+    items.push(
+        SelectItem::new(ADD_PROVIDER_VALUE, "＋ Add new provider")
+            .with_description("Interactive form → writes ~/.rpi/agent/models.json")
+            .with_search_text("add new provider"),
+    );
+    items.push(
+        SelectItem::new(REMOVE_PROVIDER_VALUE, "− Remove provider")
+            .with_description("Delete a models.json provider")
+            .with_search_text("remove delete provider"),
+    );
+    let list = Arc::new(SelectList::new(items, 10));
+
+    let state_sel = state.clone();
+    let ec_sel = editor_container.clone();
+    let editor_sel = editor.clone();
+    let tui_sel = tui.clone();
+    let chat_sel = state.chat_container.clone();
+    list.on_select(Arc::new(move |item| {
+        if item.value == ADD_PROVIDER_VALUE {
+            close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
+            begin_provider_form(&state_sel, &ec_sel, &editor_sel, &tui_sel);
+            return;
+        }
+        if item.value == REMOVE_PROVIDER_VALUE {
+            close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
+            open_provider_remove_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
+            return;
+        }
+        match set_default_provider(&item.value) {
+            Ok(note) => add_note_message(&chat_sel, &note),
+            Err(error) => add_error_message(&chat_sel, &error),
+        }
+        close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
+    }));
+    let state_cancel = state.clone();
+    let ec_cancel = editor_container.clone();
+    let editor_cancel = editor.clone();
+    let tui_cancel = tui.clone();
+    list.on_cancel(Arc::new(move || {
+        close_selector(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
+    }));
+
+    // Searchable like `/model` so the selector carries a title, a filter box,
+    // and the Enter/Esc affordances instead of a bare list.
+    open_searchable_selector(
+        state,
+        editor_container,
+        editor,
+        tui,
+        Some("Select provider"),
+        Some("Type to filter providers · Enter selects · Esc cancels"),
+        list,
+        SelectorKind::Provider,
+    );
+}
+
+/// Open the "remove provider" picker: lists only the providers defined in
+/// `models.json` (built-ins cannot be removed), and deletes the chosen one.
+pub(super) fn open_provider_remove_selector(
+    state: &Arc<TuiState>,
+    editor_container: &Arc<Container>,
+    editor: &Arc<Editor>,
+    tui: &Arc<TuiAltScreen>,
+) {
+    let items = removable_provider_items();
+    if items.is_empty() {
+        add_note_message(
+            &state.chat_container,
+            "No removable providers. Only providers defined in ~/.rpi/agent/models.json can be removed.",
+        );
+        tui.request_render(false);
+        return;
+    }
+    let list = Arc::new(SelectList::new(items, 10));
+
+    let state_sel = state.clone();
+    let ec_sel = editor_container.clone();
+    let editor_sel = editor.clone();
+    let tui_sel = tui.clone();
+    let chat_sel = state.chat_container.clone();
+    list.on_select(Arc::new(move |item| {
+        match remove_provider(&item.value) {
+            Ok(note) => add_note_message(&chat_sel, &note),
+            Err(error) => add_error_message(&chat_sel, &error),
+        }
+        close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
+    }));
+    let state_cancel = state.clone();
+    let ec_cancel = editor_container.clone();
+    let editor_cancel = editor.clone();
+    let tui_cancel = tui.clone();
+    list.on_cancel(Arc::new(move || {
+        close_selector(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
+    }));
+
+    open_searchable_selector(
+        state,
+        editor_container,
+        editor,
+        tui,
+        Some("Remove provider"),
+        Some("Type to filter · Enter deletes · Esc cancels"),
+        list,
+        SelectorKind::Provider,
     );
 }
 
