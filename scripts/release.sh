@@ -32,6 +32,7 @@ ASSET_TARGETS=(
   "x86_64-unknown-linux-gnu:tar.gz"
   "aarch64-unknown-linux-gnu:tar.gz"
   "aarch64-apple-darwin:tar.gz"
+  "x86_64-apple-darwin:tar.gz"
   "x86_64-pc-windows-msvc:zip"
 )
 

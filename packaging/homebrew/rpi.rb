@@ -19,8 +19,8 @@ class Rpi < Formula
       url "https://github.com/bigfish1913/pi-rust/releases/download/v0.3.19/rpi-v0.3.19-aarch64-apple-darwin.tar.gz"
       sha256 "25e334e183614442fe7eb3ea56e9f17a87e0c745d1bc841001f76d18eb6a2b51"
     end
-    # No x86_64 macOS build is published (see .github/workflows/release-binaries.yml).
-    # Intel Macs are covered by `cargo install rpi-cli`.
+    # Intel macOS prebuilt binaries are installed via scripts/install.sh.
+    # This formula currently covers Apple silicon on macOS.
   end
 
   on_linux do

@@ -63,8 +63,9 @@ scoop bucket add bigfish1913 https://github.com/bigfish1913/scoop-bucket
 scoop install rpi                                     # Windows
 ```
 
-The Homebrew formula omits Intel macOS because no `x86_64-apple-darwin` build is
-published — use `cargo install rpi-cli` there. A winget manifest is [open for
+The Homebrew formula currently supports Apple silicon on macOS. Intel Macs can
+use the prebuilt installer for releases with an `x86_64-apple-darwin` asset, or
+`cargo install rpi-cli`. A winget manifest is [open for
 review](https://github.com/microsoft/winget-pkgs/pull/444745).
 
 **From source:**
@@ -311,7 +312,7 @@ machine. See [`docs/remote/user-guide.md`](docs/remote/user-guide.md).
 | Stability | `rpi-ai`, `rpi-agent`, `rpi-tools`, `rpi-harness`, `rpi-plugin-sdk` are the intended stable surface |
 | MSRV | 1.78 |
 | Platforms | Linux, macOS, Windows (CI runs the suite on Linux) |
-| Not yet | Intel macOS prebuilt binaries |
+| Binary release targets | Linux (x86_64/aarch64), macOS (Intel/Apple silicon), Windows (x86_64) |
 
 `rpi` is a self-contained Rust coding-agent stack. No Node component is
 required and none is loaded.
