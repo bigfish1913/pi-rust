@@ -48,6 +48,17 @@ curl -fsSL https://raw.githubusercontent.com/bigfish1913/pi-rust/main/scripts/in
 Verifies the published SHA-256 checksum and installs to `/usr/local/bin` or
 `~/.local/bin`. Preview first with `--dry-run`.
 
+On **Windows (x64)**, run in PowerShell 5.1 or later:
+
+```powershell
+& ([scriptblock]::Create((Invoke-WebRequest -UseBasicParsing https://raw.githubusercontent.com/bigfish1913/pi-rust/main/scripts/install.ps1).Content))
+```
+
+Verifies the published SHA-256 checksum and installs to
+`$env:LOCALAPPDATA\Programs\rpi`. Follow the printed instructions to add it to
+PATH, then run `rpi --version`. Append `-DryRun` to preview, or use
+`-Version 0.3.19` and `-Dir 'C:\Tools\rpi'` to select a version and directory.
+
 **From crates.io** (requires Rust 1.78+):
 
 ```bash
