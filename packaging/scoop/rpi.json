@@ -1,12 +1,12 @@
 {
-  "version": "0.3.18",
+  "version": "0.3.19",
   "description": "Rust-native, library-first coding-agent runtime and terminal CLI",
   "homepage": "https://rpi.laofu.online/",
   "license": "MIT",
   "architecture": {
     "64bit": {
-      "url": "https://github.com/bigfish1913/pi-rust/releases/download/v0.3.18/rpi-v0.3.18-x86_64-pc-windows-msvc.zip",
-      "hash": "0c00a7271fdc50e1aab1e5ac7b7ee2ba2942bce3bc2916d5a66e61699bc5ca5a"
+      "url": "https://github.com/bigfish1913/pi-rust/releases/download/v0.3.19/rpi-v0.3.19-x86_64-pc-windows-msvc.zip",
+      "hash": "01b8a61a6baffbfe07d437ba4d52fdc81e1076c2a37ebdf4de3e247a5175beb1"
     }
   },
   "bin": "rpi.exe",
