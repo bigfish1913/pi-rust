@@ -33,6 +33,7 @@ pub mod keys;
 pub mod kill_ring;
 pub mod latex;
 pub mod layout;
+mod line_diff;
 pub mod layout_node;
 pub mod loader;
 pub mod markdown;
