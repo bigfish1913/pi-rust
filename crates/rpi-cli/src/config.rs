@@ -342,10 +342,10 @@ pub fn delete_credential(provider_id: &str) -> Result<bool, ConfigError> {
 
 /// The `models.json` document. Mirrors TS `{ providers: Record<id, ProviderConfig> }`
 /// (`core/model-config.ts` `ModelsConfigSchema`).
-#[derive(serde::Deserialize, Default, Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Default, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelsConfig {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "indexmap::IndexMap::is_empty")]
     // Provider entries are walked in declaration order, so declaration order
     // participates in the final available-model fallback.
     pub providers: indexmap::IndexMap<String, ProviderConfig>,
@@ -354,49 +354,49 @@ pub struct ModelsConfig {
 /// A provider entry in `models.json`. The fields mirror the TS `ProviderConfig`
 /// one-for-one; v1 honors `base_url`/`api_key`/`headers`/`auth_header`/`models`,
 /// and **ignores** `api` values other than `anthropic-messages` (documented).
-#[derive(serde::Deserialize, Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderConfig {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub headers: Option<BTreeMap<String, String>>,
     /// `true` ⇒ wrap `api_key` as `Authorization: Bearer <key>` (mirrors
     /// upstream `provider-composer.ts` `authHeader`).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_header: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<ModelDefinition>,
 }
 
 /// One model under a provider. `id` is required (mirrors TS `ModelDefinition`).
-#[derive(serde::Deserialize, Debug, Clone)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelDefinition {
     pub id: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u64>,
     /// Free-form modality strings ("text"/"image"); unknown values fall back
     /// to text-only.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input: Option<Vec<String>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub headers: Option<BTreeMap<String, String>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compat: Option<serde_json::Value>,
 }
 
@@ -409,6 +409,32 @@ pub fn load_models_config() -> Result<ModelsConfig, ConfigError> {
         }
         None => Ok(ModelsConfig::default()),
     }
+}
+
+/// Atomically write the whole `~/.rpi/models.json` (used by the interactive
+/// provider form). Note: unlike [`crate::settings::save_settings`], this
+/// serializes the modeled config directly, so hand-written comments and unknown
+/// fields in `models.json` are not preserved on rewrite. A timestamped
+/// `models.json.bak-*` snapshot is written first so a mistake can be reverted.
+pub fn save_models_config(cfg: &ModelsConfig) -> Result<(), ConfigError> {
+    let path = models_path()?;
+    let dir = agent_dir()?;
+    ensure_dir(&dir)?;
+    // Back up the existing file before rewriting it (best-effort; a missing
+    // file is normal on first save).
+    if let Ok(existing) = std::fs::read(&path) {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let backup = dir.join(format!("models.json.bak-{stamp}"));
+        let _ = std::fs::write(&backup, existing);
+    }
+    let text = serde_json::to_string_pretty(cfg).map_err(|source| ConfigError::Json {
+        path: path.clone(),
+        source,
+    })?;
+    atomic_write(&path, text.as_bytes())
 }
 
 // ---------------------------------------------------------------------------

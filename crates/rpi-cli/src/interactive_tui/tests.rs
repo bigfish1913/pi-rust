@@ -359,6 +359,9 @@ fn test_tui_state() -> Arc<TuiState> {
         editor: Arc::new(Editor::simple()),
         last_assistant_text: std::sync::Mutex::new(String::new()),
         active_selector: std::sync::Mutex::new(None),
+        provider_form: std::sync::Mutex::new(None),
+        active_provider_input: std::sync::Mutex::new(None),
+        active_provider_select: std::sync::Mutex::new(None),
         active_extension_editor: std::sync::Mutex::new(None),
         active_extension_input: std::sync::Mutex::new(None),
         active_extension_cancel: std::sync::Mutex::new(None),
@@ -1287,6 +1290,7 @@ fn test_slash_command_dispatch() {
     resolves_to("/hotkeys", "/hotkeys");
     resolves_to("/model", "/model");
     resolves_to("/m", "/model"); // alias
+    resolves_to("/provider", "/provider");
     resolves_to("/theme", "/theme");
     resolves_to("/session", "/session");
     resolves_to("/resume", "/session"); // alias
@@ -1328,6 +1332,7 @@ fn test_registry_visible_entries_cover_dispatch() {
         "/version",
         "/changelog",
         "/model",
+        "/provider",
         "/session",
         "/theme",
         "/compact",
@@ -1385,6 +1390,9 @@ fn test_agent_event_mapping_creates_assistant_and_tool() {
         editor: Arc::new(Editor::simple()),
         last_assistant_text: std::sync::Mutex::new(String::new()),
         active_selector: std::sync::Mutex::new(None),
+        provider_form: std::sync::Mutex::new(None),
+        active_provider_input: std::sync::Mutex::new(None),
+        active_provider_select: std::sync::Mutex::new(None),
         active_extension_editor: std::sync::Mutex::new(None),
         active_extension_input: std::sync::Mutex::new(None),
         active_extension_cancel: std::sync::Mutex::new(None),
@@ -1646,13 +1654,18 @@ fn model_selector_items_are_deduplicated_and_provider_qualified() {
 
     let items = model_selector_items(&[gateway, duplicate, anthropic], "gpt-5.6-sol");
     assert_eq!(items.len(), 2);
-    assert_eq!(items[0].value, "gpt-5.6-sol");
+    // Value is provider-qualified so a bare id shared across endpoints resolves
+    // to the right provider.
+    assert_eq!(items[0].value, "routeryo-copy/gpt-5.6-sol");
     assert_eq!(items[0].label, "GPT 5.6 Sol");
     assert_eq!(
         items[0].description.as_deref(),
         Some("routeryo-copy/gpt-5.6-sol (current)")
     );
-    assert_eq!(items[1].description.as_deref(), Some("claude-sonnet-5"));
+    assert_eq!(
+        items[1].description.as_deref(),
+        Some("anthropic/claude-sonnet-5")
+    );
 }
 
 #[test]
@@ -1720,6 +1733,166 @@ fn model_selector_match_accepts_bare_and_qualified_ids() {
         "claude-sonnet-5"
     );
     assert!(find_model_selector_match(&catalog, "other/gpt-5.6-sol").is_none());
+}
+
+#[test]
+fn provider_input_canonicalization_exact_then_case_insensitive_unique() {
+    use rpi_ai::{Api, Model};
+
+    let anthropic = Model::new(
+        "claude-sonnet-5",
+        "Claude Sonnet 5",
+        Api::AnthropicMessages,
+        "anthropic",
+        "https://api.anthropic.com",
+    );
+    let gateway = Model::new(
+        "gpt-5.6-sol",
+        "GPT 5.6 Sol",
+        Api::OpenaiCompletions,
+        "MyGateway",
+        "https://gateway.example.com",
+    );
+    let catalog = [anthropic, gateway];
+
+    assert_eq!(
+        canonicalize_provider_input("anthropic", &catalog).unwrap(),
+        "anthropic"
+    );
+    assert_eq!(
+        canonicalize_provider_input("ANTHROPIC", &catalog).unwrap(),
+        "anthropic"
+    );
+    assert_eq!(
+        canonicalize_provider_input("mygateway", &catalog).unwrap(),
+        "MyGateway"
+    );
+    assert!(canonicalize_provider_input("nope", &catalog).is_err());
+}
+
+#[test]
+fn provider_form_saves_provider_to_models_json() {
+    with_isolated_config_dir(|| {
+        let form = ProviderFormState {
+            step: ProviderFormStep::ModelName,
+            id: "openrouter".into(),
+            api: "openai-completions".into(),
+            base_url: "https://openrouter.ai/api/v1".into(),
+            api_key: "$OPENROUTER_API_KEY".into(),
+            model_id: "claude-sonnet".into(),
+            model_name: "Claude Sonnet".into(),
+        };
+        let note = save_provider_from_form(&form).unwrap();
+        assert!(note.contains("openrouter"), "{note}");
+
+        let cfg = crate::config::load_models_config().unwrap();
+        let provider = cfg.providers.get("openrouter").expect("provider written");
+        assert_eq!(provider.api.as_deref(), Some("openai-completions"));
+        assert_eq!(
+            provider.base_url.as_deref(),
+            Some("https://openrouter.ai/api/v1")
+        );
+        assert_eq!(provider.api_key.as_deref(), Some("$OPENROUTER_API_KEY"));
+        assert_eq!(provider.models.len(), 1);
+        assert_eq!(provider.models[0].id, "claude-sonnet");
+        assert_eq!(provider.models[0].name.as_deref(), Some("Claude Sonnet"));
+
+        // The duplicate-id guard sees the provider we just wrote.
+        assert!(provider_id_exists("openrouter"));
+        assert!(!provider_id_exists("nope"));
+    });
+}
+
+#[test]
+fn provider_url_validation_requires_http_scheme() {
+    assert!(is_valid_provider_url("https://api.example.com/v1"));
+    assert!(is_valid_provider_url("http://localhost:8080"));
+    assert!(!is_valid_provider_url("api.example.com/v1"));
+    assert!(!is_valid_provider_url(""));
+}
+
+#[test]
+fn remove_provider_deletes_from_models_json() {
+    with_isolated_config_dir(|| {
+        let form = ProviderFormState {
+            step: ProviderFormStep::ModelName,
+            id: "openrouter".into(),
+            api: "openai-completions".into(),
+            base_url: "https://openrouter.ai/api/v1".into(),
+            api_key: "$OPENROUTER_API_KEY".into(),
+            model_id: "claude-sonnet".into(),
+            model_name: String::new(),
+        };
+        save_provider_from_form(&form).unwrap();
+        assert!(provider_id_exists("openrouter"));
+
+        let note = remove_provider("openrouter").unwrap();
+        assert!(note.contains("openrouter"), "{note}");
+        assert!(!provider_id_exists("openrouter"));
+
+        // Built-ins / unknown ids cannot be removed.
+        assert!(remove_provider("anthropic").is_err());
+        assert!(remove_provider("nope").is_err());
+    });
+}
+
+/// Isolate the config dir (and serialize against other env-touching tests)
+/// while `body` runs, then restore the previous value.
+fn with_isolated_config_dir<T>(body: impl FnOnce() -> T) -> T {
+    let _guard = crate::config::test_support::env_lock().lock().unwrap();
+    let prev = std::env::var_os(crate::config::CONFIG_DIR_ENV);
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var(crate::config::CONFIG_DIR_ENV, tmp.path());
+    let result = body();
+    match prev {
+        Some(value) => std::env::set_var(crate::config::CONFIG_DIR_ENV, value),
+        None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
+    }
+    result
+}
+
+#[test]
+fn provider_selector_items_cover_builtin_providers() {
+    with_isolated_config_dir(|| {
+        let items = provider_selector_items();
+        let ids: Vec<&str> = items.iter().map(|item| item.value.as_str()).collect();
+        assert!(
+            ids.contains(&"anthropic"),
+            "built-in anthropic provider missing: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"openai"),
+            "built-in openai provider missing: {ids:?}"
+        );
+        // Every row advertises its model count, origin, and key status, so a
+        // built-in catalog entry can't be mistaken for a configured one.
+        assert!(items.iter().all(|item| {
+            item.description
+                .as_deref()
+                .is_some_and(|d| d.contains("model(s)") && d.contains("内置") && d.contains("key"))
+        }));
+    });
+}
+
+#[test]
+fn set_default_provider_persists_provider_and_a_matching_model() {
+    with_isolated_config_dir(|| {
+        let note = set_default_provider("openai").unwrap();
+        assert!(
+            note.contains("openai"),
+            "note should name the provider: {note}"
+        );
+
+        let settings = crate::settings::load_settings().unwrap();
+        assert_eq!(settings.default_provider.as_deref(), Some("openai"));
+        assert!(
+            settings.default_model.is_some(),
+            "a matching default model must be saved so the choice resolves on restart"
+        );
+
+        // Unknown provider → error, and nothing is persisted.
+        assert!(set_default_provider("does-not-exist").is_err());
+    });
 }
 
 #[test]
@@ -1857,6 +2030,9 @@ fn test_autocomplete_slash_suggestions_render() {
         editor: Arc::new(Editor::simple()),
         last_assistant_text: std::sync::Mutex::new(String::new()),
         active_selector: std::sync::Mutex::new(None),
+        provider_form: std::sync::Mutex::new(None),
+        active_provider_input: std::sync::Mutex::new(None),
+        active_provider_select: std::sync::Mutex::new(None),
         active_extension_editor: std::sync::Mutex::new(None),
         active_extension_input: std::sync::Mutex::new(None),
         active_extension_cancel: std::sync::Mutex::new(None),
@@ -1944,6 +2120,9 @@ fn test_select_list_swap_restores_editor() {
         editor: Arc::new(Editor::simple()),
         last_assistant_text: std::sync::Mutex::new(String::new()),
         active_selector: std::sync::Mutex::new(None),
+        provider_form: std::sync::Mutex::new(None),
+        active_provider_input: std::sync::Mutex::new(None),
+        active_provider_select: std::sync::Mutex::new(None),
         active_extension_editor: std::sync::Mutex::new(None),
         active_extension_input: std::sync::Mutex::new(None),
         active_extension_cancel: std::sync::Mutex::new(None),
@@ -2034,6 +2213,9 @@ fn test_message_history_browse_restores_draft() {
         editor: Arc::new(Editor::simple()),
         last_assistant_text: std::sync::Mutex::new(String::new()),
         active_selector: std::sync::Mutex::new(None),
+        provider_form: std::sync::Mutex::new(None),
+        active_provider_input: std::sync::Mutex::new(None),
+        active_provider_select: std::sync::Mutex::new(None),
         active_extension_editor: std::sync::Mutex::new(None),
         active_extension_input: std::sync::Mutex::new(None),
         active_extension_cancel: std::sync::Mutex::new(None),
@@ -2127,6 +2309,9 @@ fn test_accept_top_suggestion_replaces_prefix() {
         editor: Arc::new(Editor::simple()),
         last_assistant_text: std::sync::Mutex::new(String::new()),
         active_selector: std::sync::Mutex::new(None),
+        provider_form: std::sync::Mutex::new(None),
+        active_provider_input: std::sync::Mutex::new(None),
+        active_provider_select: std::sync::Mutex::new(None),
         active_extension_editor: std::sync::Mutex::new(None),
         active_extension_input: std::sync::Mutex::new(None),
         active_extension_cancel: std::sync::Mutex::new(None),

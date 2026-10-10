@@ -154,8 +154,7 @@ impl Input {
     }
 
     /// Handle bracketed paste.
-    #[allow(dead_code)]
-    fn handle_paste(&self, pasted_text: &str) {
+    pub fn handle_paste(&self, pasted_text: &str) {
         self.set_last_action(LastAction::None);
 
         // Clean the pasted text - remove newlines and tabs

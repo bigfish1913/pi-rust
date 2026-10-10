@@ -14,6 +14,31 @@ pub(super) enum RunStatus {
     Aborting,
 }
 
+/// Steps of the interactive "Add provider" form (`/provider` → Add). Each step
+/// is answered through the editor (submitted with Enter).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(super) enum ProviderFormStep {
+    #[default]
+    Id,
+    Api,
+    BaseUrl,
+    ApiKey,
+    ModelId,
+    ModelName,
+}
+
+/// In-progress state for the interactive "Add provider" form.
+#[derive(Clone, Debug, Default)]
+pub(super) struct ProviderFormState {
+    pub(super) step: ProviderFormStep,
+    pub(super) id: String,
+    pub(super) api: String,
+    pub(super) base_url: String,
+    pub(super) api_key: String,
+    pub(super) model_id: String,
+    pub(super) model_name: String,
+}
+
 /// Which selector overlay (if any) is currently swapped into the editor slot.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum SelectorKind {
@@ -29,6 +54,8 @@ pub(super) enum SelectorKind {
     Session,
     /// `/theme` — dark / light / monochrome presets applied live.
     Theme,
+    /// `/provider` — set the default provider (persisted, applies on restart).
+    Provider,
     /// `/scoped-models` — multi-toggle Ctrl+P cycle scope.
     ScopedModels,
     /// `/settings` — interactive settings menu (and its sub-selectors).
@@ -199,6 +226,19 @@ pub(super) struct TuiState {
     /// a selector is open; the key loop routes to it first and restores the
     /// editor on done/cancel.
     pub(super) active_selector: std::sync::Mutex<Option<(SelectorView, SelectorKind)>>,
+    /// In-progress interactive "Add provider" form (`/provider` → Add new
+    /// provider). `Some` while the form is collecting fields; each step shows
+    /// its own single-line input (see [`Self::active_provider_input`]) instead
+    /// of reusing the chat editor.
+    pub(super) provider_form: std::sync::Mutex<Option<ProviderFormState>>,
+    /// The single-line input currently occupying the input slot for the active
+    /// provider form step. `Some` while the form is collecting a field; the key
+    /// loop routes keys to it and Enter/Esc drive the form.
+    pub(super) active_provider_input: std::sync::Mutex<Option<Arc<Input>>>,
+    /// The select-list currently occupying the input slot for a choice-style
+    /// provider form step (the protocol step). Mutually exclusive with
+    /// [`Self::active_provider_input`].
+    pub(super) active_provider_select: std::sync::Mutex<Option<Arc<SelectList>>>,
     /// Extension-provided editor currently occupying the input slot.
     pub(super) active_extension_editor: std::sync::Mutex<Option<Arc<Editor>>>,
     /// Single-line input currently occupying the input slot for an extension.

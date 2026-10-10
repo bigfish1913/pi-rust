@@ -251,10 +251,6 @@ struct CommandContext {
     editor_container: Arc<Container>,
     lane: Arc<dyn AgentLane>,
     model_catalog: Arc<Vec<rpi_ai::Model>>,
-    /// Lane model id snapshot, read once via `lane.get_model().await` BEFORE the
-    /// blocking key loop starts. Selectors/key loop can't await, so they read
-    /// this owned string instead. Semantically unchanged from pre-refactor.
-    lane_model_id: String,
     cwd: std::path::PathBuf,
     /// Harness resources snapshot (skills + prompt templates) for `/context`.
     /// Captured once at TUI startup because the blocking submit thread can't
@@ -1171,6 +1167,9 @@ pub async fn interactive_tui(
         editor: editor.clone(),
         last_assistant_text: std::sync::Mutex::new(String::new()),
         active_selector: std::sync::Mutex::new(None),
+        provider_form: std::sync::Mutex::new(None),
+        active_provider_input: std::sync::Mutex::new(None),
+        active_provider_select: std::sync::Mutex::new(None),
         active_extension_editor: std::sync::Mutex::new(None),
         active_extension_input: std::sync::Mutex::new(None),
         active_extension_cancel: std::sync::Mutex::new(None),
@@ -1235,7 +1234,6 @@ pub async fn interactive_tui(
     // Capture the model catalog + cwd for the selector builders + the key loop
     // (the callbacks fire on blocking threads and need owned data).
     let model_catalog_arc = Arc::new(model_catalog.clone());
-    let lane_model_id = lane.get_model().await.map(|m| m.id).unwrap_or_default();
 
     // ---- Layout root (built ONCE; mirrors TS fullscreenLayoutRoot) ----
     // root = VStack[ scrollview(basis:0 grow:1 shrink:1 min:1), dock(shrink:1) ]
@@ -1326,7 +1324,6 @@ pub async fn interactive_tui(
         editor_container: editor_container.clone(),
         lane: lane.clone(),
         model_catalog: model_catalog_arc.clone(),
-        lane_model_id: lane_model_id.clone(),
         cwd: cwd.clone(),
         resources: resources_arc.clone(),
         reload_context: Arc::new(reload_context.clone()),
@@ -1761,6 +1758,16 @@ pub async fn interactive_tui(
                         "paste event ({} bytes, bracketed paste supported)",
                         text.len()
                     ));
+                    // A provider-form text step owns the input slot: paste into
+                    // its single-line input instead of the chat editor.
+                    if state_for_key.provider_form.lock().unwrap().is_some() {
+                        let active = state_for_key.active_provider_input.lock().unwrap().clone();
+                        if let Some(input) = active {
+                            input.handle_paste(&text);
+                            tui_for_key.request_render_reusing_scroll_content();
+                            continue;
+                        }
+                    }
                     if let Some(images) = images_from_pasted_paths(&text) {
                         for image in images {
                             state_for_key.queue_image(image);
@@ -1841,6 +1848,24 @@ pub async fn interactive_tui(
                     .expect("selector_open guaranteed Some")
                     .0;
                 selector.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+                tui_for_key.request_render_reusing_scroll_content();
+                continue;
+            }
+
+            // The interactive "Add provider" form owns the input slot while it
+            // collects a field: route every key to its single-line input (Esc
+            // and Enter are handled by the Input's own callbacks). Clone the
+            // input OUTSIDE `if let` so the `active_provider_input` mutex guard
+            // drops before `handle_key` — the submit path re-enters that mutex
+            // to swap in the next step's input and would deadlock on it.
+            if state_for_key.provider_form.lock().unwrap().is_some() {
+                let active_input = state_for_key.active_provider_input.lock().unwrap().clone();
+                let active_select = state_for_key.active_provider_select.lock().unwrap().clone();
+                if let Some(input) = active_input {
+                    input.handle_key(key);
+                } else if let Some(select) = active_select {
+                    select.handle_key(key);
+                }
                 tui_for_key.request_render_reusing_scroll_content();
                 continue;
             }
@@ -2146,8 +2171,10 @@ pub async fn interactive_tui(
             ) {
                 let current = state_for_key.current_model_id();
                 // Cycle within the `/scoped-models` set (settings.json) when
-                // configured; otherwise the full catalog.
+                // configured; otherwise the full catalog, restricted to the
+                // current provider (the lane cannot route another provider).
                 let scope = scoped_catalog(&ctx_for_key.model_catalog, &current);
+                let scope = same_provider_catalog(&scope, &current);
                 if let Some(next) = cycle_next_model(&scope, &current) {
                     state_for_key.set_current_model(&next);
                     let lane = lane_for_key.clone();
@@ -2168,6 +2195,7 @@ pub async fn interactive_tui(
             ) {
                 let current = state_for_key.current_model_id();
                 let scope = scoped_catalog(&ctx_for_key.model_catalog, &current);
+                let scope = same_provider_catalog(&scope, &current);
                 if let Some(prev) = cycle_prev_model(&scope, &current) {
                     state_for_key.set_current_model(&prev);
                     let lane = lane_for_key.clone();

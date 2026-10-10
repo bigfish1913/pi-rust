@@ -264,9 +264,10 @@ async fn run_inner() -> i32 {
         }
     };
 
-    // The full authenticated catalog (read-only) for the TUI's `/model` selector.
-    // v1 does not switch models mid-session, so this is display-only.
-    let model_catalog = crate::provider::available_catalog(&resolved);
+    // The full authenticated catalog (read-only) for the TUI's `/model`
+    // selector, derived from the built provider runtimes so auth headers and
+    // base-url overrides survive.
+    let model_catalog = crate::provider::authenticated_catalog(&resolved);
 
     // `--models <patterns>`: persist the Ctrl+P cycle scope to settings.json
     // (the same set `/scoped-models` edits). Each pattern matches catalog ids
