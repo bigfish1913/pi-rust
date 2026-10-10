@@ -11,6 +11,14 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.3.19] - 2026-10-10
+
+### Fixed
+
+- Restore IME text input in iTerm2 after the 0.3.18 keyboard regression by
+  using Pi's Kitty flags 7 instead of all-key reporting (flags 15). Preserve
+  UTF-8 text commits, modified keys and functional-key repeat/release events.
+
 ## [0.3.18] - 2026-10-10
 
 ### Added

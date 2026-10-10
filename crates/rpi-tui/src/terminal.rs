@@ -204,9 +204,10 @@ impl ProcessTerminal {
         let supported = match keyboard.detected {
             Some(supported) => supported,
             None => {
-                // 1: disambiguate, 2: repeat/release, 4: alternate keys,
-                // 8: also report printable-key releases (e.g. push-to-talk space).
-                self.write("\x1b[>15u");
+                // Match Pi: 1: disambiguate, 2: repeat/release, 4: alternate keys.
+                // Leave text as UTF-8 for IME commits. Flag 8 replaces text
+                // with key reports; crossterm cannot consume associated text.
+                self.write("\x1b[>7u");
                 self.flush();
                 let supported = detect();
                 keyboard.detected = Some(supported);
@@ -224,7 +225,7 @@ impl ProcessTerminal {
             }
         };
         let protocol = if supported {
-            self.write("\x1b[>15u");
+            self.write("\x1b[>7u");
             KeyboardProtocol::Kitty
         } else {
             // Crossterm cannot parse xterm's CSI 27;modifier;key~ encoding.
@@ -477,7 +478,7 @@ mod tests {
     }
 
     #[test]
-    fn kitty_protocol_reports_printable_releases_and_restores_once_per_activation() {
+    fn kitty_protocol_preserves_ime_text_and_restores_once_per_activation() {
         let terminal = ProcessTerminal::new();
         let output = RecordedOutput(Arc::new(Mutex::new(Vec::new())));
         *terminal.writer.lock().unwrap() = Box::new(output.clone());
@@ -489,10 +490,21 @@ mod tests {
         terminal.enable_keyboard_protocol(|| panic!("resume must not query stdin"));
         terminal.disable_keyboard_protocol();
         let bytes = output.0.lock().unwrap().clone();
-        assert_eq!(bytes, b"\x1b[>15u\x1b[<u\x1b[>15u\x1b[<u");
-        let flags = event::KeyboardEnhancementFlags::from_bits(15).unwrap();
+        assert_eq!(bytes, b"\x1b[>7u\x1b[<u\x1b[>7u\x1b[<u");
+        // Check the actual emitted flags to prevent reintroducing all-key mode.
+        let sequence = std::str::from_utf8(&bytes)
+            .unwrap()
+            .split('u')
+            .next()
+            .unwrap();
+        let mask: u8 = sequence.strip_prefix("\x1b[>").unwrap().parse().unwrap();
+        let flags = event::KeyboardEnhancementFlags::from_bits(mask).unwrap();
         assert!(flags.contains(event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES));
-        assert!(flags.contains(event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
+        assert!(flags.contains(event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
+        assert!(flags.contains(event::KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS));
+        assert!(!flags.contains(event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES));
+        // Bit 16 is associated-text reporting, unsupported by crossterm 0.27.
+        assert_eq!(mask & 16, 0);
     }
 
     #[test]
@@ -505,7 +517,7 @@ mod tests {
         terminal.disable_keyboard_protocol();
         terminal.enable_keyboard_protocol(|| panic!("resume must reuse detection"));
         terminal.disable_keyboard_protocol();
-        assert_eq!(output.0.lock().unwrap().as_slice(), b"\x1b[>15u\x1b[<u");
+        assert_eq!(output.0.lock().unwrap().as_slice(), b"\x1b[>7u\x1b[<u");
     }
 
     #[test]
@@ -552,5 +564,27 @@ mod tests {
     fn mouse_tracking_default_preserves_native_selection_on_macos() {
         assert!(!mouse_tracking_enabled_for(true));
         assert!(mouse_tracking_enabled_for(false));
+    }
+
+    #[test]
+    fn ime_committed_utf8_text_reaches_editor_without_submitting() {
+        use event::{KeyCode, KeyModifiers};
+        let editor = crate::Editor::simple();
+        let submitted = Arc::new(Mutex::new(Vec::new()));
+        let capture = submitted.clone();
+        editor.on_submit(Arc::new(move |text| {
+            capture.lock().unwrap().push(text.to_string())
+        }));
+        let committed = "你好，世界𠮷 abc";
+        for ch in committed.chars() {
+            editor.handle_key(normalize_key_event(KeyEvent::new(
+                KeyCode::Char(ch),
+                KeyModifiers::NONE,
+            )));
+        }
+        assert_eq!(editor.get_text(), committed);
+        assert!(submitted.lock().unwrap().is_empty());
+        editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(submitted.lock().unwrap().as_slice(), &[committed]);
     }
 }
