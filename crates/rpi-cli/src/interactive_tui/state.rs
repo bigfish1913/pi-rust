@@ -253,6 +253,8 @@ pub(super) struct TuiState {
     pub(super) autocomplete_container: Arc<Container>,
     /// Maximum number of autocomplete rows rendered above the editor.
     pub(super) autocomplete_max_visible: usize,
+    /// Currently highlighted autocomplete row (0-based), moved by ↑/↓.
+    pub(super) autocomplete_selection: std::sync::Mutex<usize>,
     /// Images queued from clipboard paste and attached to the next prompt.
     pub(super) pending_images: std::sync::Mutex<Vec<rpi_ai::types::ImageContent>>,
     /// The owned theme manager — `/theme` applies presets here. The global

@@ -57,24 +57,44 @@ pub(super) fn render_autocomplete(
 ) {
     state.autocomplete_container.clear();
     let Some(sugg) = suggestions else {
+        *state.autocomplete_selection.lock().unwrap() = 0;
         return;
     };
     if sugg.items.is_empty() {
+        *state.autocomplete_selection.lock().unwrap() = 0;
         return;
     }
-    // Build a compact list: top item marked with `→`, rest with `  `.
+    // Clamp the highlight to the full candidate list, then compute the visible
+    // window (with a scroll offset) so ↓ can reach items past `max_visible`.
+    let max_visible = state.autocomplete_max_visible;
+    let total = sugg.items.len();
+    let selection = {
+        let mut sel = state.autocomplete_selection.lock().unwrap();
+        *sel = (*sel).min(total.saturating_sub(1));
+        *sel
+    };
+    let window_start = if total <= max_visible {
+        0
+    } else {
+        selection
+            .saturating_sub(max_visible / 2)
+            .min(total - max_visible)
+    };
+    let window_end = (window_start + max_visible).min(total);
+    // Build a compact list: the highlighted item marked with `→`, the rest `  `.
     // Cap the list so the dock doesn't swallow the transcript.
     let accent = state.theme_manager.get().colors.accent;
     let muted = state.theme_manager.get().colors.muted;
     for (i, item) in sugg
         .items
         .iter()
-        .take(state.autocomplete_max_visible)
         .enumerate()
+        .skip(window_start)
+        .take(window_end - window_start)
     {
-        let prefix = if i == 0 { "→ " } else { "  " };
+        let prefix = if i == selection { "→ " } else { "  " };
         let label = item.display_text();
-        let line = if i == 0 {
+        let line = if i == selection {
             format!(
                 "{prefix}{} {}",
                 accent.fg(label),
@@ -93,16 +113,20 @@ pub(super) fn render_autocomplete(
     }
 }
 
-/// Accept the top autocomplete suggestion: replace `text[start..end]` with the
-/// suggestion text, reposition the caret, and clear the suggestion list.
-/// Returns `true` if a suggestion was accepted.
+/// Accept the highlighted autocomplete suggestion: replace `text[start..end]`
+/// with the suggestion text, reposition the caret, and clear the suggestion
+/// list. Returns `true` if a suggestion was accepted.
 pub(super) fn accept_top_suggestion(state: &Arc<TuiState>, editor: &Arc<Editor>) -> bool {
     let text = editor.get_text();
     let cursor = editor_cursor_offset(editor, &text);
     let Some(sugg) = state.autocomplete.get_suggestions(&text, cursor) else {
         return false;
     };
-    let Some(top) = sugg.items.first() else {
+    let index = {
+        let sel = *state.autocomplete_selection.lock().unwrap();
+        sel.min(sugg.items.len().saturating_sub(1))
+    };
+    let Some(top) = sugg.items.get(index) else {
         return false;
     };
     // Replace the [start, end) span with the suggestion text. `start`/`end`
@@ -133,5 +157,45 @@ pub(super) fn accept_top_suggestion(state: &Arc<TuiState>, editor: &Arc<Editor>)
     editor.set_text(&replaced);
     set_editor_cursor_offset(editor, &replaced, new_cursor);
     state.autocomplete_container.clear();
+    *state.autocomplete_selection.lock().unwrap() = 0;
+    true
+}
+
+/// Move the autocomplete highlight up (`direction < 0`) or down (`direction > 0`)
+/// and re-render the list. Returns `true` when the key was consumed.
+///
+/// Only takes over the arrow keys in an explicit completion context (`/` or
+/// `@` prefix); a bare-word path completion (e.g. a draft containing `docs`)
+/// must NOT swallow ↑/↓, which the editor uses for cursor/history movement.
+pub(super) fn navigate_autocomplete(
+    state: &Arc<TuiState>,
+    editor: &Arc<Editor>,
+    direction: i32,
+) -> bool {
+    let text = editor.get_text();
+    let cursor = editor_cursor_offset(editor, &text);
+    let Some(sugg) = state.autocomplete.get_suggestions(&text, cursor) else {
+        return false;
+    };
+    if sugg.items.is_empty() {
+        return false;
+    }
+    let start = sugg.start.min(text.len());
+    // `/` commands keep the slash at `start`; the path provider keeps `@` by
+    // placing `start` *after* it, so look just before `start` for `@`.
+    let explicit = text[start..].starts_with('/') || text[..start].ends_with('@');
+    if !explicit {
+        return false;
+    }
+    let total = sugg.items.len();
+    {
+        let mut sel = state.autocomplete_selection.lock().unwrap();
+        if direction < 0 {
+            *sel = sel.saturating_sub(1);
+        } else {
+            *sel = (*sel + 1).min(total.saturating_sub(1));
+        }
+    }
+    render_autocomplete(state, Some(sugg));
     true
 }
