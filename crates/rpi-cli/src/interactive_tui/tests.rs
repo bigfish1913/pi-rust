@@ -368,6 +368,7 @@ fn test_tui_state() -> Arc<TuiState> {
         autocomplete: AutocompleteManager::new(),
         autocomplete_container: Arc::new(Container::new()),
         autocomplete_max_visible: 5,
+        autocomplete_selection: std::sync::Mutex::new(0),
         pending_images: std::sync::Mutex::new(Vec::new()),
         theme_manager: Arc::new(ThemeManager::new()),
         tui: None,
@@ -1399,6 +1400,7 @@ fn test_agent_event_mapping_creates_assistant_and_tool() {
         autocomplete: AutocompleteManager::new(),
         autocomplete_container: Arc::new(Container::new()),
         autocomplete_max_visible: 5,
+        autocomplete_selection: std::sync::Mutex::new(0),
         pending_images: std::sync::Mutex::new(Vec::new()),
         theme_manager: Arc::new(ThemeManager::new()),
         tui: None,
@@ -2039,6 +2041,7 @@ fn test_autocomplete_slash_suggestions_render() {
         autocomplete: AutocompleteManager::new(),
         autocomplete_container: Arc::new(Container::new()),
         autocomplete_max_visible: 5,
+        autocomplete_selection: std::sync::Mutex::new(0),
         pending_images: std::sync::Mutex::new(Vec::new()),
         theme_manager: Arc::new(ThemeManager::new()),
         tui: None,
@@ -2129,6 +2132,7 @@ fn test_select_list_swap_restores_editor() {
         autocomplete: AutocompleteManager::new(),
         autocomplete_container: Arc::new(Container::new()),
         autocomplete_max_visible: 5,
+        autocomplete_selection: std::sync::Mutex::new(0),
         pending_images: std::sync::Mutex::new(Vec::new()),
         theme_manager: Arc::new(ThemeManager::new()),
         tui: None,
@@ -2222,6 +2226,7 @@ fn test_message_history_browse_restores_draft() {
         autocomplete: AutocompleteManager::new(),
         autocomplete_container: Arc::new(Container::new()),
         autocomplete_max_visible: 5,
+        autocomplete_selection: std::sync::Mutex::new(0),
         pending_images: std::sync::Mutex::new(Vec::new()),
         theme_manager: Arc::new(ThemeManager::new()),
         tui: None,
@@ -2318,6 +2323,7 @@ fn test_accept_top_suggestion_replaces_prefix() {
         autocomplete: AutocompleteManager::new(),
         autocomplete_container: Arc::new(Container::new()),
         autocomplete_max_visible: 5,
+        autocomplete_selection: std::sync::Mutex::new(0),
         pending_images: std::sync::Mutex::new(Vec::new()),
         theme_manager: Arc::new(ThemeManager::new()),
         tui: None,
@@ -2361,6 +2367,171 @@ fn test_accept_top_suggestion_replaces_prefix() {
     assert!(
         text.starts_with("/help"),
         "editor text should start with /help, got {text}"
+    );
+}
+
+/// Build a `TuiState` for autocomplete tests (autocomplete providers are
+/// installed by each test).
+fn autocomplete_test_state(max_visible: usize) -> Arc<TuiState> {
+    Arc::new(TuiState {
+        current_assistant: Arc::new(std::sync::Mutex::new(None)),
+        tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        hide_thinking: Arc::new(std::sync::Mutex::new(false)),
+        tool_outputs_expanded: Arc::new(std::sync::Mutex::new(false)),
+        show_terminal_progress: true,
+        status: std::sync::Mutex::new(RunStatus::Idle),
+        ext_status: rpi_extensions::ExtensionStatusMailbox::new(),
+        ext_status_revision: std::sync::atomic::AtomicU64::new(u64::MAX),
+        editor_text: rpi_extensions::EditorTextMailbox::new(),
+        auto_send: std::sync::Mutex::new(None),
+        last_editor_text: std::sync::Mutex::new(String::new()),
+        programmatic_editor_write: std::sync::atomic::AtomicBool::new(false),
+        js_preparation_cancel: std::sync::Mutex::new(None),
+        user_bash_cancel: std::sync::Mutex::new(None),
+        pending_bash_messages: std::sync::Mutex::new(Vec::new()),
+        footer: Arc::new(FooterComponent::new()),
+        status_container: Arc::new(Container::new()),
+        chat_container: Arc::new(Container::new()),
+        loader: Arc::new(Loader::new()),
+        editor: Arc::new(Editor::simple()),
+        last_assistant_text: std::sync::Mutex::new(String::new()),
+        active_selector: std::sync::Mutex::new(None),
+        provider_form: std::sync::Mutex::new(None),
+        active_provider_input: std::sync::Mutex::new(None),
+        active_provider_select: std::sync::Mutex::new(None),
+        active_extension_editor: std::sync::Mutex::new(None),
+        active_extension_input: std::sync::Mutex::new(None),
+        active_extension_cancel: std::sync::Mutex::new(None),
+        autocomplete: AutocompleteManager::new(),
+        autocomplete_container: Arc::new(Container::new()),
+        autocomplete_max_visible: max_visible,
+        autocomplete_selection: std::sync::Mutex::new(0),
+        pending_images: std::sync::Mutex::new(Vec::new()),
+        theme_manager: Arc::new(ThemeManager::new()),
+        tui: None,
+        current_model_id: std::sync::Mutex::new(String::new()),
+        show_images: std::sync::Mutex::new(true),
+        cache_miss_notices: std::sync::Mutex::new(false),
+        history: std::sync::Mutex::new(Vec::new()),
+        history_index: std::sync::Mutex::new(-1),
+        history_draft: std::sync::Mutex::new(None),
+        cache_tracker: std::sync::Mutex::new(rpi_harness::cache_stats::CacheMissTracker::new()),
+        scoped_edit: std::sync::Mutex::new(None),
+        markdown_transformer: Arc::new(std::sync::Mutex::new(None)),
+        extension_claimed_keys: Mutex::new(Default::default()),
+        extension_session: Arc::new(std::sync::Mutex::new(
+            rpi_extensions::ExtensionSession::none(),
+        )),
+        search: Arc::new(AltScreenSearch::new()),
+        search_bar: Arc::new(SearchBar::new()),
+        pending_container: Arc::new(Container::new()),
+        dequeue_hint: String::new(),
+        pending_snapshot: std::sync::Mutex::new(
+            rpi_harness::agent_harness::QueuedMessages::default(),
+        ),
+        selection_start: std::sync::Mutex::new(None),
+        selection_end: std::sync::Mutex::new(None),
+    })
+}
+
+#[test]
+fn autocomplete_navigation_reaches_beyond_visible_window() {
+    let state = autocomplete_test_state(5);
+    let commands: Vec<rpi_tui::SlashCommand> = (0..7)
+        .map(|i| rpi_tui::SlashCommand {
+            name: format!("/choice{i}"),
+            description: format!("choice {i}"),
+        })
+        .collect();
+    state
+        .autocomplete
+        .set_provider(Arc::new(SlashCommandAutocompleteProvider::new(commands)));
+    let editor = Arc::new(Editor::simple());
+    editor.set_text("/");
+    editor.set_cursor(0, 1);
+    refresh_autocomplete(&state, &editor);
+
+    // 5 × ↓ must move the highlight to index 5 (the 6th item), past the
+    // 5-row visible window (previously it clamped at max_visible - 1 = 4).
+    for _ in 0..5 {
+        assert!(navigate_autocomplete(&state, &editor, 1));
+    }
+    assert_eq!(*state.autocomplete_selection.lock().unwrap(), 5);
+    assert!(accept_top_suggestion(&state, &editor));
+    assert!(
+        editor.get_text().starts_with("/choice5"),
+        "Tab should accept the highlighted 6th item, got {}",
+        editor.get_text()
+    );
+}
+
+#[test]
+fn autocomplete_navigation_does_not_swallow_plain_draft_arrows() {
+    let state = autocomplete_test_state(5);
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("docs")).unwrap();
+    let mut combined = CombinedAutocompleteProvider::new();
+    combined.add_provider(Arc::new(FilePathAutocompleteProvider::with_root(
+        tmp.path().to_path_buf(),
+    )));
+    state.autocomplete.set_provider(Arc::new(combined));
+
+    let editor = Arc::new(Editor::simple());
+    editor.set_text("first line\nplease check docs");
+    editor.set_cursor(1, 18);
+    // A bare-word path completion (`docs`) must not consume ↑ — the editor
+    // owns cursor movement outside explicit `/` or `@` completion.
+    assert!(!navigate_autocomplete(&state, &editor, -1));
+}
+
+#[test]
+fn autocomplete_navigation_handles_leading_at_file_completion() {
+    let state = autocomplete_test_state(5);
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("docs_a")).unwrap();
+    std::fs::create_dir_all(tmp.path().join("docs_b")).unwrap();
+    state
+        .autocomplete
+        .set_provider(Arc::new(FilePathAutocompleteProvider::with_root(
+            tmp.path().to_path_buf(),
+        )));
+    let editor = Arc::new(Editor::simple());
+    editor.set_text("@do");
+    editor.set_cursor(0, 3);
+    refresh_autocomplete(&state, &editor);
+    // The path provider keeps `@` and puts `start` after it; ↓ must still work.
+    assert!(navigate_autocomplete(&state, &editor, 1));
+    assert_eq!(*state.autocomplete_selection.lock().unwrap(), 1);
+    assert!(accept_top_suggestion(&state, &editor));
+    assert!(
+        editor.get_text().starts_with("@docs_"),
+        "@ plus the picked candidate must be inserted, got {}",
+        editor.get_text()
+    );
+}
+
+#[test]
+fn autocomplete_navigation_handles_at_file_after_chinese_draft() {
+    let state = autocomplete_test_state(5);
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("docs_a")).unwrap();
+    std::fs::create_dir_all(tmp.path().join("docs_b")).unwrap();
+    state
+        .autocomplete
+        .set_provider(Arc::new(FilePathAutocompleteProvider::with_root(
+            tmp.path().to_path_buf(),
+        )));
+    let editor = Arc::new(Editor::simple());
+    editor.set_text("请查看 @do");
+    editor.set_cursor(0, 13);
+    refresh_autocomplete(&state, &editor);
+    assert!(navigate_autocomplete(&state, &editor, 1));
+    assert!(accept_top_suggestion(&state, &editor));
+    assert!(
+        editor.get_text().starts_with("请查看 @docs_"),
+        "draft, @, and the picked candidate must be preserved, got {}",
+        editor.get_text()
     );
 }
 

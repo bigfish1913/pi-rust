@@ -23,6 +23,17 @@ const fn mouse_tracking_enabled_by_default() -> bool {
     mouse_tracking_enabled_for(cfg!(target_os = "macos"))
 }
 
+/// The kitty keyboard protocol (`\x1b[>u`) makes macOS IME composition stop
+/// working (no candidate window → CJK input breaks). Disable it on macOS by
+/// default; `RPI_KITTY_KEYBOARD=1` re-enables it for push-to-talk-style
+/// key-release handling, `RPI_KITTY_KEYBOARD=0` forces it off elsewhere.
+fn keyboard_protocol_enabled() -> bool {
+    if let Some(value) = std::env::var_os("RPI_KITTY_KEYBOARD") {
+        return value != "0";
+    }
+    !cfg!(target_os = "macos")
+}
+
 /// Errors that can occur during terminal operations.
 #[derive(Debug, Error)]
 pub enum TerminalError {
@@ -305,7 +316,7 @@ impl Terminal for ProcessTerminal {
         // submit per line for multi-line pastes).
         self.write("\x1b[?2004h");
         #[cfg(unix)]
-        if self.is_tty() && io::stdin().is_terminal() {
+        if keyboard_protocol_enabled() && self.is_tty() && io::stdin().is_terminal() {
             self.enable_keyboard_protocol(|| {
                 cterm::supports_keyboard_enhancement().unwrap_or(false)
             });

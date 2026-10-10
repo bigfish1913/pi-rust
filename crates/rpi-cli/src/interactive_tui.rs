@@ -1176,6 +1176,7 @@ pub async fn interactive_tui(
         autocomplete,
         autocomplete_container: autocomplete_container.clone(),
         autocomplete_max_visible,
+        autocomplete_selection: std::sync::Mutex::new(0),
         pending_images: std::sync::Mutex::new(Vec::new()),
         theme_manager,
         tui: Some(tui.clone()),
@@ -2424,6 +2425,18 @@ pub async fn interactive_tui(
                 scroll_for_key.scroll_to_end();
                 tui_for_key.request_render_reusing_scroll_content();
                 continue;
+            }
+
+            // 5a-bis. ↑/↓ navigate the autocomplete list while it is open
+            //     (typed `/` or `@`), then Tab accepts the highlighted row.
+            if key.modifiers == KeyModifiers::NONE
+                && (key.code == KeyCode::Up || key.code == KeyCode::Down)
+            {
+                let direction = if key.code == KeyCode::Up { -1 } else { 1 };
+                if navigate_autocomplete(&state_for_key, &editor_for_key, direction) {
+                    tui_for_key.request_render_reusing_scroll_content();
+                    continue;
+                }
             }
 
             // 5b. ↑/↓ browse submitted-message history when the editor is
