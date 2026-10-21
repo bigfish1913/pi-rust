@@ -323,6 +323,27 @@ async fn run_inner() -> i32 {
         .lock()
         .map(|session| session.owns_stdio())
         .unwrap_or(false);
+    let web_requested = match parsed.unknown_flags.get("web") {
+        Some(serde_json::Value::Bool(value)) => *value,
+        Some(serde_json::Value::String(value)) => {
+            !value.is_empty() && !value.eq_ignore_ascii_case("false")
+        }
+        _ => false,
+    };
+    let web_registered = reload_context
+        .extension_session
+        .lock()
+        .ok()
+        .and_then(|session| {
+            session
+                .snapshot()
+                .map(|snapshot| snapshot.flags().iter().any(|flag| flag.name == "web"))
+        })
+        .unwrap_or(false);
+    if web_requested && (!web_registered || !stdio_claimed) {
+        eprintln!("error: --web requires the rpi-web server extension; it is missing, disabled, or failed to load.\nInstall it with: rpi install rpi-web --github pi-rust/rpi-package\nThen restart with: rpi --web");
+        return EXIT_USAGE;
+    }
     let stdio_lifecycle = reload_context
         .extension_session
         .lock()
