@@ -962,6 +962,12 @@ impl AgentHarness {
         }
     }
 
+    /// The compaction budget in force, so a client can show how close the
+    /// context is to the threshold without duplicating the defaults.
+    pub fn compaction_settings(&self) -> crate::types::CompactionSettings {
+        self.inner.lock().unwrap().compaction.clone()
+    }
+
     /// The run recovery repaired and that is waiting to be continued, if any.
     pub fn pending_resume(&self) -> Option<PendingResume> {
         self.inner
@@ -4438,6 +4444,10 @@ impl AgentHarness {
             }
         };
 
+        if matches!(outcome, CompactionOutcome::Declined { .. }) {
+            self.write_operation_finished(&run_id, OperationOutcome::Declined, None)
+                .await?;
+        }
         self.finish_context_writes(&run_id, None).await?;
         Ok(CompactionResult { run_id, outcome })
     }

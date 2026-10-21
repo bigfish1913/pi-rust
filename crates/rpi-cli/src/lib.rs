@@ -58,6 +58,7 @@ pub mod provider;
 pub mod remote;
 pub mod resource_dirs;
 pub mod resume_picker;
+pub(crate) mod rpc;
 pub mod session;
 pub mod session_cwd;
 pub mod session_driver;

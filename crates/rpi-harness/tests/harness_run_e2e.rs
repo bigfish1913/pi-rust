@@ -48,6 +48,27 @@ use rpi_tools::{
     InMemoryExecutionEnv, MutationQueueRegistry,
 };
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn declined_compaction_records_a_terminal_outcome() {
+    let (harness, _, _) = harness_with(FauxScript::new().with_text("unused")).await;
+    let result = harness.compact(None).await.unwrap();
+    assert!(matches!(
+        result.outcome,
+        rpi_harness::agent_harness::CompactionOutcome::Declined { .. }
+    ));
+    let records = harness
+        .session()
+        .find_records(&RecordQuery::default())
+        .await
+        .unwrap();
+    let terminal_records = records.iter().filter(|record| {
+        matches!(record, LaneRecord::OperationFinished(finished)
+            if finished.run_id == result.run_id
+                && finished.outcome == rpi_harness::session::types::OperationOutcome::Declined)
+    });
+    assert_eq!(terminal_records.count(), 1);
+}
+
 /// Build an `AgentHarness` over a faux provider + in-memory env + the read/
 /// write/bash tools. The faux script is caller-supplied so each test pins the
 /// exact LLM turns. Returns `(harness, provider, env)` so the test can inspect

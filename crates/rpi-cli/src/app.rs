@@ -487,6 +487,11 @@ async fn run_inner() -> i32 {
                         Some(event_rx),
                         model_catalog,
                         reload_context.ui_dialog.clone(),
+                        reload_context
+                            .extension_session
+                            .lock()
+                            .unwrap()
+                            .snapshot_arc(),
                     )
                     .await
                 };
