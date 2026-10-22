@@ -145,7 +145,7 @@ fn detect_image_protocol(env: impl Fn(&str) -> Option<String>) -> ImageProtocol 
         || present("WARP_TERMINAL_SESSION_UUID")
     {
         ImageProtocol::Kitty
-    } else if present("ITERM_SESSION_ID") || program == "iterm.app" {
+    } else if present("ITERM_SESSION_ID") || matches!(program.as_str(), "iterm.app" | "iterm2") {
         ImageProtocol::ITerm2
     } else {
         ImageProtocol::None
@@ -227,23 +227,21 @@ pub fn encode_iterm2(data: &[u8], options: &ImageRenderOptions) -> String {
 
     let encoded = STANDARD.encode(data);
 
-    let mut name = String::new();
+    let mut params = vec!["inline=1".to_string()];
     if let Some(id) = options.id {
-        name = format!("name=id{}", id);
+        // iTerm2 treats `name` as an opaque file name for the inline image.
+        // Keep it stable per image so retained-screen redraws do not create a
+        // different attachment name each time.
+        params.push(format!("name=id{id}"));
     }
-
-    let mut dims = String::new();
     if let Some(w) = options.width {
-        dims = format!("width={}", w);
+        params.push(format!("width={w}"));
     }
     if let Some(h) = options.height {
-        if !dims.is_empty() {
-            dims.push(';');
-        }
-        dims.push_str(&format!("height={}", h));
+        params.push(format!("height={h}"));
     }
 
-    format!("\x1b]1337;File={};{}:{}\x07", name, dims, encoded)
+    format!("\x1b]1337;File={}:{}\x07", params.join(";"), encoded)
 }
 
 /// Delete a Kitty image by ID.
@@ -517,6 +515,33 @@ mod tests {
         assert_eq!(
             removed_kitty_placements(&[sequence], &["[Image]".into()]),
             delete_kitty_image(42)
+        );
+    }
+
+    #[test]
+    fn iterm2_images_are_marked_inline() {
+        let sequence = encode_iterm2(
+            b"png",
+            &ImageRenderOptions {
+                id: Some(7),
+                width: Some(10),
+                height: Some(5),
+                ..Default::default()
+            },
+        );
+        assert!(sequence.starts_with("\x1b]1337;File=inline=1;name=id7;width=10;height=5:"));
+        assert!(sequence.ends_with("cG5n\x07"));
+    }
+
+    #[test]
+    fn detects_iterm2_program_name_variants() {
+        assert_eq!(
+            detect_image_protocol(|key| (key == "TERM_PROGRAM").then(|| "iTerm2".into())),
+            ImageProtocol::ITerm2
+        );
+        assert_eq!(
+            detect_image_protocol(|key| (key == "TERM_PROGRAM").then(|| "iTerm.app".into())),
+            ImageProtocol::ITerm2
         );
     }
 
