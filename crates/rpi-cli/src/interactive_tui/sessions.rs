@@ -625,46 +625,100 @@ pub(super) fn custom_message_fallback(custom: &rpi_agent::CustomMessage) -> Stri
     }
 }
 
-/// Path to the enclosing repository's `.git/HEAD`, if any.
-pub(super) fn find_git_head_path(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
+/// Resolve the enclosing repository's Git directory. A linked worktree uses a
+/// `.git` file containing `gitdir: ...`, while a regular checkout has a `.git`
+/// directory. The returned path is absolute when the worktree pointer is
+/// relative to the checkout root.
+fn find_git_dir(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
     let mut dir = Some(cwd);
     while let Some(current) = dir {
-        let head = current.join(".git").join("HEAD");
-        if head.exists() {
-            return Some(head);
+        let dot_git = current.join(".git");
+        if dot_git.is_dir() {
+            return Some(dot_git);
+        }
+        if let Ok(contents) = std::fs::read_to_string(&dot_git) {
+            let gitdir = contents
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("gitdir:"))
+                .map(str::trim)
+                .filter(|path| !path.is_empty())?;
+            let gitdir = std::path::PathBuf::from(gitdir);
+            return Some(if gitdir.is_absolute() {
+                gitdir
+            } else {
+                current.join(gitdir)
+            });
         }
         dir = current.parent();
     }
     None
 }
 
+/// Path to the enclosing repository's `.git/HEAD`, if any.
+pub(super) fn find_git_head_path(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
+    let head = find_git_dir(cwd)?.join("HEAD");
+    head.is_file().then_some(head)
+}
+
 /// Current git branch for `cwd`, or `None` outside a repository / on error.
 /// Reads `.git/HEAD` directly (no `git` subprocess) so the footer can call it
-/// cheaply at startup.
+/// cheaply at startup. This also handles linked worktrees, whose `.git` is a
+/// file pointing at `.git/worktrees/<name>`.
 pub(super) fn git_branch_for(cwd: &std::path::Path) -> Option<String> {
-    let mut dir = Some(cwd);
-    while let Some(current) = dir {
-        let head = current.join(".git").join("HEAD");
-        if let Ok(contents) = std::fs::read_to_string(&head) {
-            let trimmed = contents.trim();
-            if let Some(reference) = trimmed.strip_prefix("ref: ") {
-                let branch = reference
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(reference)
-                    .trim()
-                    .to_string();
-                if !branch.is_empty() {
-                    return Some(branch);
-                }
-            }
-            if !trimmed.is_empty() {
-                return Some(trimmed.chars().take(7).collect());
-            }
+    let head = find_git_head_path(cwd)?;
+    let contents = std::fs::read_to_string(head).ok()?;
+    let trimmed = contents.trim();
+    if let Some(reference) = trimmed.strip_prefix("ref: ") {
+        let branch = reference
+            .rsplit('/')
+            .next()
+            .unwrap_or(reference)
+            .trim()
+            .to_string();
+        if !branch.is_empty() {
+            return Some(branch);
         }
-        dir = current.parent();
+    }
+    if !trimmed.is_empty() {
+        return Some(trimmed.chars().take(7).collect());
     }
     None
+}
+
+#[cfg(test)]
+mod git_footer_tests {
+    use super::{find_git_head_path, git_branch_for};
+    use std::fs;
+
+    #[test]
+    fn resolves_branch_from_linked_worktree_git_file() {
+        let checkout = tempfile::tempdir().unwrap();
+        let git_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            checkout.path().join(".git"),
+            format!("gitdir: {}\n", git_dir.path().display()),
+        )
+        .unwrap();
+        let head = git_dir.path().join("HEAD");
+        fs::write(&head, "ref: refs/heads/feature-0.8.1\n").unwrap();
+
+        assert_eq!(find_git_head_path(checkout.path()), Some(head));
+        assert_eq!(
+            git_branch_for(checkout.path()).as_deref(),
+            Some("feature-0.8.1")
+        );
+    }
+
+    #[test]
+    fn resolves_branch_from_regular_checkout_git_directory() {
+        let checkout = tempfile::tempdir().unwrap();
+        let git_dir = checkout.path().join(".git");
+        fs::create_dir(&git_dir).unwrap();
+        let head = git_dir.join("HEAD");
+        fs::write(&head, "ref: refs/heads/main\n").unwrap();
+
+        assert_eq!(git_branch_for(checkout.path()).as_deref(), Some("main"));
+    }
 }
 
 /// The name displayed for a model id (last path segment / after the final
