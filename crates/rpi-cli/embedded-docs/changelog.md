@@ -11,6 +11,23 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.9.0](https://github.com/bigfish1913/pi-rust/compare/v0.8.0...v0.9.0) - 2026-10-22
+
+### Added
+
+- *(extensions)* drive wake-capable tools without idle blocking workers
+
+### Fixed
+
+- *(rpc)* release extension session lock before awaiting RPC
+- keep wake token allocation compatible with stable Rust
+
+### Other
+
+- add RPI_CODING_AGENT_SESSION_DIR env config
+- measure idle tool workers and check Windows ownership
+- *(harness)* serialize run budget environment tests
+
 ## [0.8.0](https://github.com/bigfish1913/pi-rust/compare/v0.7.1...v0.8.0) - 2026-10-22
 
 ### Fixed
