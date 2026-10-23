@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use crate::utils::visible_width;
 
 /// Search state.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SearchState {
     /// Current search query.
     pub query: String,
@@ -17,17 +17,6 @@ pub struct SearchState {
     pub matches: Vec<SearchMatch>,
     /// Whether search is active.
     pub active: bool,
-}
-
-impl Default for SearchState {
-    fn default() -> Self {
-        Self {
-            query: String::new(),
-            match_index: 0,
-            matches: Vec::new(),
-            active: false,
-        }
-    }
 }
 
 /// A search match.
@@ -323,7 +312,7 @@ impl AltScreenSearch {
             }
 
             if in_ansi {
-                if c == '\x07' || (c >= '@' && c <= '~' && c != '[') {
+                if c == '\x07' || (('@'..='~').contains(&c) && c != '[') {
                     in_ansi = false;
                 }
                 continue;

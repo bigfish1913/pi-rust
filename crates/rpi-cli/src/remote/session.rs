@@ -121,7 +121,7 @@ impl Transcript {
                     }
                 }
                 TranscriptItem::Notice(text) => {
-                    out.push_str("[");
+                    out.push('[');
                     out.push_str(text);
                     out.push_str("]\n");
                 }
@@ -269,14 +269,11 @@ impl RemoteSession {
             }
             RemoteEvent::TurnStart | RemoteEvent::TurnEnd { .. } => {}
             RemoteEvent::MessageStart { message } => {
-                match message_role(message) {
-                    "assistant" => {
-                        // If the previous assistant item is still open with no
-                        // content, reuse it; otherwise start a new block.
-                        self.open_assistant = Some(self.transcript.push_assistant());
-                        self.open_thinking = None;
-                    }
-                    _ => {}
+                if message_role(message) == "assistant" {
+                    // If the previous assistant item is still open with no
+                    // content, reuse it; otherwise start a new block.
+                    self.open_assistant = Some(self.transcript.push_assistant());
+                    self.open_thinking = None;
                 }
             }
             RemoteEvent::MessageEnd { message } => {

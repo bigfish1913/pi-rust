@@ -448,7 +448,7 @@ pub(super) fn sanitize_error_message(text: &str) -> String {
             continue;
         }
         if count >= MAX_ERROR_CHARS {
-            result.push_str("…");
+            result.push('…');
             break;
         }
         match ch {

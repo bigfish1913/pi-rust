@@ -294,7 +294,7 @@ pub fn get_png_dimensions(data: &[u8]) -> Option<ImageDimensions> {
     }
 
     // PNG signature: 89 50 4E 47 0D 0A 1A 0A
-    if &data[0..8] != &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A] {
+    if data[0..8] != [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A] {
         return None;
     }
 
@@ -422,7 +422,7 @@ pub fn get_image_dimensions(data: &[u8]) -> Option<ImageDimensions> {
 
 /// Calculate number of rows needed for an image.
 pub fn calculate_image_rows(height: u32, cell_height: u16) -> u16 {
-    ((height + cell_height as u32 - 1) / cell_height as u32) as u16
+    height.div_ceil(cell_height as u32) as u16
 }
 
 /// Render image with fallback.

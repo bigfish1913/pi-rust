@@ -184,7 +184,7 @@ pub fn render_latex(latex: &str, options: &RenderLatexOptions) -> String {
     }
 
     // Clean up remaining braces
-    result = result.replace('{', "").replace('}', "");
+    result = result.replace(['{', '}'], "");
 
     // Handle special LaTeX spaces
     result = result
@@ -322,7 +322,7 @@ pub fn strip_latex(latex: &str) -> String {
     }
 
     // Clean up braces
-    result = result.replace('{', "").replace('}', "");
+    result = result.replace(['{', '}'], "");
 
     result.trim().to_string()
 }

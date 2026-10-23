@@ -263,7 +263,7 @@ fn layout_component(
     // ---- Leaf (Container/Editor/Footer/Text/...) ----
     let lines = context.render_cached(component, safe_width);
 
-    let allocated_height = height.unwrap_or_else(|| lines.len());
+    let allocated_height = height.unwrap_or(lines.len());
 
     // Calculate line offset for cursor visibility
     let line_offset = if lines.len() > allocated_height && allocated_height > 0 {

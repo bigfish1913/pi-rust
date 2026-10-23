@@ -13,10 +13,10 @@
 
 use std::any::Any;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::component::Component;
+use super::component::{Component, RenderedDocument};
 use crate::ansi::bold;
 use crate::ansi::strip_ansi;
 use crate::spacer::Spacer;
@@ -58,7 +58,7 @@ struct BashRenderCache {
     width: usize,
     revision: u64,
     theme_revision: u64,
-    lines: Vec<String>,
+    lines: Arc<Vec<String>>,
 }
 
 /// Component that displays a bash command execution with streaming output.
@@ -367,8 +367,8 @@ impl BashExecutionComponent {
     }
 }
 
-impl Component for BashExecutionComponent {
-    fn render(&self, width: usize) -> Vec<String> {
+impl BashExecutionComponent {
+    fn shared_lines(&self, width: usize) -> Arc<Vec<String>> {
         let status = *self.status.lock().unwrap();
         let revision = self.revision.load(Ordering::Acquire);
         let theme_revision = theme_revision();
@@ -389,7 +389,7 @@ impl Component for BashExecutionComponent {
             }
         }
 
-        let lines = self.render_panel(width, status, &theme());
+        let lines = Arc::new(self.render_panel(width, status, &theme()));
 
         if status != BashStatus::Running {
             if let Ok(mut cache) = self.cache.lock() {
@@ -406,6 +406,16 @@ impl Component for BashExecutionComponent {
 
         lines
     }
+}
+
+impl Component for BashExecutionComponent {
+    fn render(&self, width: usize) -> Vec<String> {
+        self.shared_lines(width).as_ref().clone()
+    }
+
+    fn render_document(&self, width: usize) -> RenderedDocument {
+        RenderedDocument::from_shared(self.shared_lines(width))
+    }
 
     fn invalidate(&self) {
         self.bump();
@@ -419,6 +429,75 @@ impl Component for BashExecutionComponent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finalized_documents_share_rows_and_refresh_after_changes() {
+        for (exit_code, cancelled) in [(0, false), (1, false), (0, true)] {
+            let panel = BashExecutionComponent::new("echo output");
+            *panel.started_at.lock().unwrap() = None;
+            let output = (1..=30)
+                .map(|i| format!("line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            panel.append_output(&output);
+            panel.set_complete(Some(exit_code), cancelled, BashTruncation::default());
+            let first = panel.shared_lines(80);
+            assert!(Arc::ptr_eq(&first, &panel.shared_lines(80)));
+            let references = Arc::strong_count(&first);
+            let document = panel.render_document(80);
+            let second_document = panel.render_document(80);
+            assert_eq!(Arc::strong_count(&first), references + 2);
+            assert_eq!(document.lines(0, document.len()), first.as_ref().clone());
+            assert_eq!(second_document.len(), document.len());
+            assert_eq!(panel.render(80), first.as_ref().clone());
+
+            panel.set_expanded(true);
+            let expanded = panel.shared_lines(80);
+            assert!(!Arc::ptr_eq(&first, &expanded));
+            assert!(expanded
+                .iter()
+                .any(|row| strip_ansi(row).trim() == "line 1"));
+            assert!(!first.iter().any(|row| strip_ansi(row).trim() == "line 1"));
+            assert!(expanded.len() > first.len());
+
+            panel.append_output("late output");
+            let updated = panel.shared_lines(80);
+            assert!(!Arc::ptr_eq(&expanded, &updated));
+            assert!(strip_ansi(&updated.join("\n")).contains("late output"));
+            panel.set_command("echo corrected");
+            let corrected = panel.shared_lines(80);
+            assert!(!Arc::ptr_eq(&updated, &corrected));
+            assert!(strip_ansi(&corrected.join("\n")).contains("echo corrected"));
+            let narrow = panel.shared_lines(24);
+            assert!(!Arc::ptr_eq(&corrected, &narrow));
+            assert!(narrow
+                .iter()
+                .all(|row| crate::utils::visible_width(row) <= 24));
+            panel.invalidate();
+            let invalidated = panel.shared_lines(24);
+            assert!(!Arc::ptr_eq(&narrow, &invalidated));
+            assert_eq!(narrow, invalidated);
+            assert!(Arc::ptr_eq(&invalidated, &panel.shared_lines(24)));
+        }
+    }
+
+    #[test]
+    fn running_documents_do_not_cache_output_or_elapsed_rows() {
+        let panel = BashExecutionComponent::new("echo live");
+        let first = panel.shared_lines(80);
+        assert!(!Arc::ptr_eq(&first, &panel.shared_lines(80)));
+        panel.append_output("live output");
+        let updated = panel.shared_lines(80);
+        assert!(strip_ansi(&updated.join("\n")).contains("live output"));
+        assert!(!strip_ansi(&first.join("\n")).contains("live output"));
+        *panel.started_at.lock().unwrap() = Some(Instant::now() - Duration::from_secs(65));
+        let later = panel.shared_lines(80);
+        let text = strip_ansi(&later.join("\n"));
+        assert!(text.contains("1m5s"));
+        assert!(text.contains("Esc / Ctrl+C"));
+        assert!(!Arc::ptr_eq(&updated, &later));
+        assert!(panel.cache.lock().unwrap().is_none());
+    }
 
     #[test]
     fn panel_has_themed_insets_in_every_execution_state() {

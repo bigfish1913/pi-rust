@@ -23,19 +23,15 @@ use std::sync::{Arc, RwLock};
 /// Trust decision for a project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum TrustDecision {
     /// Project is trusted; load all project-local resources.
     Trusted,
     /// Project is not trusted; restrict project-local resources.
     NotTrusted,
     /// No decision has been made yet; prompt the user.
+    #[default]
     Undecided,
-}
-
-impl Default for TrustDecision {
-    fn default() -> Self {
-        TrustDecision::Undecided
-    }
 }
 
 /// Trust configuration for a project.

@@ -32,6 +32,10 @@ homepage = "https://rpi.laofu.online/"
 version = "0.9.0"
 authors = ["BigFish <fuwei201473@gmail.com>"]
 
+[workspace.metadata.release]
+# Automatic releases stay on this series until a maintainer changes it.
+series = "0.8"
+
 [workspace.dependencies]
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "process", "sync", "io-util"] }

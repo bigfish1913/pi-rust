@@ -679,7 +679,7 @@ fn read_fallback_settings_value(
     if path == target {
         return Ok(None);
     }
-    match std::fs::read_to_string(&path) {
+    match std::fs::read_to_string(path) {
         Ok(text) => parse_settings_value(&text).map(Some).map_err(|error| {
             format!(
                 "cannot parse fallback settings file {}: {error}",

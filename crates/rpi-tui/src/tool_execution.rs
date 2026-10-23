@@ -5,10 +5,10 @@
 
 use std::any::Any;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use super::component::Component;
+use super::component::{Component, RenderedDocument};
 use crate::ansi::{bold, strip_ansi};
 use crate::theme::{theme, theme_revision, Theme, ThemeColors};
 use crate::tool_panel::ToolPanel;
@@ -92,7 +92,7 @@ struct ToolRenderCache {
     width: usize,
     revision: u64,
     theme_revision: u64,
-    lines: Vec<String>,
+    lines: Arc<Vec<String>>,
 }
 
 impl ToolExecutionComponent {
@@ -480,16 +480,14 @@ impl ToolExecutionComponent {
         // Expanded: the full args JSON (indented, dim) above the result. The
         // compact summary already lives in the header, so this is the
         // "show me everything" path for debugging a tool call.
-        if *expanded {
-            if !args.is_empty() && args.trim() != "{}" {
-                let args_line = format!(
-                    "{} {}",
-                    colors.muted.fg("args:"),
-                    colors.dim.fg(&pretty_args(&args))
-                );
-                for part in wrap_text_with_ansi(&args_line, content_width) {
-                    lines.push(panel.line(&part));
-                }
+        if *expanded && !args.is_empty() && args.trim() != "{}" {
+            let args_line = format!(
+                "{} {}",
+                colors.muted.fg("args:"),
+                colors.dim.fg(&pretty_args(&args))
+            );
+            for part in wrap_text_with_ansi(&args_line, content_width) {
+                lines.push(panel.line(&part));
             }
         }
 
@@ -580,8 +578,8 @@ impl ToolExecutionComponent {
     }
 }
 
-impl Component for ToolExecutionComponent {
-    fn render(&self, width: usize) -> Vec<String> {
+impl ToolExecutionComponent {
+    fn shared_lines(&self, width: usize) -> Arc<Vec<String>> {
         let status = *self.status.lock().unwrap();
         let revision = self.revision.load(Ordering::Acquire);
         let theme_revision = theme_revision();
@@ -600,7 +598,7 @@ impl Component for ToolExecutionComponent {
                 }
             }
         }
-        let lines = self.render_panel(width, &theme());
+        let lines = Arc::new(self.render_panel(width, &theme()));
         if finished {
             if let Ok(mut cache) = self.cache.lock() {
                 *cache = Some(ToolRenderCache {
@@ -614,6 +612,16 @@ impl Component for ToolExecutionComponent {
             *cache = None;
         }
         lines
+    }
+}
+
+impl Component for ToolExecutionComponent {
+    fn render(&self, width: usize) -> Vec<String> {
+        self.shared_lines(width).as_ref().clone()
+    }
+
+    fn render_document(&self, width: usize) -> RenderedDocument {
+        RenderedDocument::from_shared(self.shared_lines(width))
     }
 
     fn invalidate(&self) {
@@ -1077,7 +1085,7 @@ mod tools {
         }
         let mut s = String::new();
         let mut esc = false;
-        while let Some(c) = chars.next() {
+        for c in chars.by_ref() {
             if esc {
                 esc = false;
                 s.push(c);
@@ -1101,7 +1109,7 @@ mod tools {
                 let mut s = String::from("\"");
                 chars.next();
                 let mut esc = false;
-                while let Some(c) = chars.next() {
+                for c in chars.by_ref() {
                     s.push(c);
                     if esc {
                         esc = false;
@@ -1140,7 +1148,7 @@ mod tools {
         let mut depth = 0isize;
         let mut in_str = false;
         let mut esc = false;
-        while let Some(c) = chars.next() {
+        for c in chars.by_ref() {
             s.push(c);
             if in_str {
                 if esc {
@@ -1178,6 +1186,71 @@ mod tools {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn finalized_documents_share_rows_and_refresh_after_changes() {
+        use super::*;
+        for failed in [false, true] {
+            let tool = ToolExecutionComponent::new("read", "{}");
+            let output = (1..=20)
+                .map(|i| format!("line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            tool.set_result(&output, failed);
+            let first = tool.shared_lines(80);
+            assert!(Arc::ptr_eq(&first, &tool.shared_lines(80)));
+            let references = Arc::strong_count(&first);
+            let document = tool.render_document(80);
+            let second_document = tool.render_document(80);
+            assert_eq!(Arc::strong_count(&first), references + 2);
+            assert_eq!(document.lines(0, document.len()), first.as_ref().clone());
+            assert_eq!(second_document.len(), document.len());
+            assert_eq!(tool.render(80), first.as_ref().clone());
+
+            tool.set_expanded(true);
+            let expanded = tool.shared_lines(80);
+            assert!(!Arc::ptr_eq(&first, &expanded));
+            assert!(strip_ansi(&expanded.join("\n")).contains("line 20"));
+            assert!(!strip_ansi(&first.join("\n")).contains("line 20"));
+
+            tool.set_result("late result", failed);
+            let updated = tool.shared_lines(80);
+            assert!(!Arc::ptr_eq(&expanded, &updated));
+            assert!(strip_ansi(&updated.join("\n")).contains("late result"));
+            let narrow = tool.shared_lines(24);
+            assert!(!Arc::ptr_eq(&updated, &narrow));
+            assert!(narrow
+                .iter()
+                .all(|row| crate::utils::visible_width(row) <= 24));
+            tool.invalidate();
+            let invalidated = tool.shared_lines(24);
+            assert!(!Arc::ptr_eq(&narrow, &invalidated));
+            assert_eq!(narrow, invalidated);
+            assert!(Arc::ptr_eq(&invalidated, &tool.shared_lines(24)));
+        }
+    }
+
+    #[test]
+    fn pending_and_running_rows_remain_live_and_uncached() {
+        use super::*;
+        let tool = ToolExecutionComponent::new("read", "{}");
+        let pending = tool.shared_lines(80);
+        assert!(!Arc::ptr_eq(&pending, &tool.shared_lines(80)));
+        assert!(tool.cache.lock().unwrap().is_none());
+        tool.set_result("finished", false);
+        let finished = tool.shared_lines(80);
+        tool.set_running();
+        let running = tool.shared_lines(80);
+        assert!(!Arc::ptr_eq(&finished, &running));
+        assert!(!Arc::ptr_eq(&running, &tool.shared_lines(80)));
+        assert!(tool.cache.lock().unwrap().is_none());
+        // Move the clock origin directly rather than sleeping or relying on timing.
+        *tool.started_at.lock().unwrap() =
+            Some(Instant::now() - std::time::Duration::from_secs(65));
+        let later = tool.shared_lines(80);
+        assert!(strip_ansi(&later.join("\n")).contains("1m5s"));
+        assert!(!Arc::ptr_eq(&running, &later));
+    }
+
     #[test]
     fn plan_panel_keeps_markdown_and_hides_raw_arguments() {
         use super::*;

@@ -392,7 +392,7 @@ pub(super) async fn render_session_history(
                             continue;
                         }
                     }
-                    add_note_message(chat, &custom_message_fallback(&custom));
+                    add_note_message(chat, &custom_message_fallback(custom));
                     rendered_any = true;
                 }
             },
@@ -489,12 +489,12 @@ pub(super) fn invoke_extension_renderer(
                     Some(renderer.plugin_free_string),
                 )
             };
-            let text = if rc == 0 {
+
+            if rc == 0 {
                 Some(out.to_string_lossy())
             } else {
                 None
-            };
-            text
+            }
         }))
         .ok()
         .flatten();
