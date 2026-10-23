@@ -158,6 +158,8 @@ pub struct CompactionLlmOptions {
     pub thinking_level: Option<ThinkingLevel>,
     pub retry: Option<RetryPolicy>,
     pub custom_instructions: Option<String>,
+    /// Pinned request controls, including total and stream idle timeouts.
+    pub stream_options: crate::types::AgentHarnessStreamOptions,
 }
 
 // ---------------------------------------------------------------------------
@@ -600,7 +602,9 @@ fn turn_prefix_max_tokens(reserve_tokens: i64, model_max_tokens: u64) -> u64 {
 /// `max_tokens`. Sets `api_key`/`signal`/`max_tokens`/`reasoning` (reasoning
 /// only when the model reasons AND a non-`Off` level is set — mirrors TS).
 fn build_summary_options(opts: &CompactionLlmOptions, max_tokens: u64) -> SimpleStreamOptions {
-    let mut o = SimpleStreamOptions::default();
+    let mut o = opts
+        .stream_options
+        .merge_into(SimpleStreamOptions::default());
     o.api_key = opts.api_key.clone();
     o.signal = opts.signal.clone();
     o.max_tokens = Some(max_tokens);
@@ -808,6 +812,30 @@ pub async fn compact(
 mod tests {
     use super::*;
     use crate::session::types::EntryBase;
+
+    #[test]
+    fn compaction_inherits_total_and_idle_timeouts() {
+        let provider =
+            rpi_ai::providers::faux::FauxProvider::new(rpi_ai::providers::faux::FauxScript::new());
+        let opts = CompactionLlmOptions {
+            model: provider.default_model().clone(),
+            provider,
+            api_key: None,
+            signal: CancellationToken::new(),
+            thinking_level: None,
+            retry: None,
+            custom_instructions: None,
+            stream_options: crate::types::AgentHarnessStreamOptions {
+                timeout: Some(Duration::from_secs(30)),
+                stream_idle_timeout: Some(Duration::ZERO),
+                ..Default::default()
+            },
+        };
+        let options = build_summary_options(&opts, 42);
+        assert_eq!(options.request_timeout(), Duration::from_secs(30));
+        assert_eq!(options.stream_idle_timeout(), None);
+        assert_eq!(options.max_tokens, Some(42));
+    }
 
     fn user_msg(text: &str, seq: u64) -> Entry {
         Entry::Message(MessageEntry {

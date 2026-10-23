@@ -11,6 +11,66 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.8.3](https://github.com/bigfish1913/pi-rust/compare/v0.8.2...v0.8.3) - 2026-10-23
+
+### Added
+
+- add plugin lifecycle and reusable provider contexts
+
+### Fixed
+
+- *(cli)* invalidate host actions before plugin shutdown
+- propagate provider HTTP client construction errors
+
+### Other
+
+- clarify lifecycle ownership and Rust API migration
+- record provider context reuse and shutdown checks
+- verify plugin workers join before DLL unload
+
+## [0.8.2](https://github.com/bigfish1913/pi-rust/compare/v0.8.1...v0.8.2) - 2026-10-23
+
+### Added
+
+- *(ai)* add stream idle timeout and model compat diagnostics
+
+### Fixed
+
+- *(cli)* preserve session roots and safely fork and import logs
+- *(providers)* close cancellation and compat diagnostic gaps
+- *(providers)* preserve manifest diagnostics and thinking constraints
+- *(ai)* dispatch CR-delimited SSE frames without waiting for bytes
+- *(ai)* preserve initial SSE events after a UTF-8 BOM
+- *(ai)* merge and remove HTTP headers case insensitively
+- *(ai)* classify retries and honor SSE control boundaries
+- *(extensions)* saturate oversized stream idle durations
+
+### Other
+
+- consolidate provider transport and session fixes
+- *(cli)* isolate and restore session directory overrides
+
+## [0.8.1](https://github.com/bigfish1913/pi-rust/compare/v0.8.0...v0.8.1) - 2026-10-23
+
+### Added
+
+- *(extensions)* drive wake-capable tools without idle blocking workers
+
+### Fixed
+
+- *(tui)* preserve working caret and isolate theme cache revisions
+- *(rpc)* release extension session lock before awaiting RPC
+- keep wake token allocation compatible with stable Rust
+
+### Other
+
+- Merge remote-tracking branch 'origin/main' into codex/fix-pr74-cursor
+- Merge branch 'main' into ui
+- add RPI_CODING_AGENT_SESSION_DIR env config
+- share transcript rows and slice the viewport in fullscreen
+- measure idle tool workers and check Windows ownership
+- *(harness)* serialize run budget environment tests
+
 ## [0.8.0](https://github.com/bigfish1913/pi-rust/compare/v0.7.1...v0.8.0) - 2026-10-22
 
 ### Fixed

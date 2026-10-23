@@ -144,10 +144,13 @@ async fn run_stream(
     let mut state = StreamState::new(model);
     let api_key = resolve_api_key(&provider_key, opts, allow_env_api_key);
 
-    let mut headers = model.headers.clone().unwrap_or_default();
-    if let Some(extra) = &opts.headers {
+    let mut headers = BTreeMap::new();
+    for extra in [model.headers.as_ref(), opts.headers.as_ref()]
+        .into_iter()
+        .flatten()
+    {
         for (name, value) in extra {
-            headers.insert(name.clone(), value.clone());
+            crate::provider::set_http_header(&mut headers, name, Some(value));
         }
     }
     apply_api_key(&mut headers, api_key);
@@ -218,13 +221,17 @@ async fn run_stream(
     };
 
     state.start(producer);
-    let mut events = SseEventStream::new(response, opts.signal.clone());
+    let mut events = SseEventStream::new(response, opts.signal.clone())
+        .with_idle_timeout(opts.stream_idle_timeout());
     loop {
         match events.next_event().await {
             Ok(Some(event)) if event.data.trim() == "[DONE]" => {
                 state.finish(producer, model);
                 return;
             }
+            // Named keepalives and empty data frames carry no JSON payload.
+            // Their bytes still refresh the shared SSE idle watchdog.
+            Ok(Some(event)) if event.data.trim().is_empty() => continue,
             Ok(Some(event)) => match serde_json::from_str::<Value>(&event.data) {
                 Ok(chunk) => {
                     if let Some(message) = chunk
@@ -415,6 +422,26 @@ fn build_request(model: &Model, ctx: &Context, opts: &SimpleStreamOptions) -> Va
     }
     if let Some(temperature) = opts.temperature {
         body.insert("temperature".into(), Value::from(temperature));
+    }
+    if compat(model).and_then(|c| c.thinking_format)
+        == Some(crate::model::OpenaiThinkingFormat::Deepseek)
+    {
+        // An explicitly configured DeepSeek format must also disable the
+        // endpoint's default thinking when the catalog marks a model non-reasoning.
+        let enabled = model.reasoning && opts.reasoning_level() != ThinkingLevel::Off;
+        let can_disable = !matches!(
+            model
+                .thinking_level_map
+                .as_ref()
+                .and_then(|map| map.get(&ThinkingLevel::Off)),
+            Some(None)
+        );
+        if enabled || can_disable {
+            body.insert(
+                "thinking".into(),
+                json!({ "type": if enabled { "enabled" } else { "disabled" } }),
+            );
+        }
     }
     if model.reasoning && supports_reasoning_effort(model) {
         if let Some(effort) = reasoning_effort(model, opts.reasoning_level()) {
@@ -1568,6 +1595,71 @@ mod tests {
         );
         assert_eq!(replayed["messages"][1]["reasoning_content"], "");
         assert!(crate::model::prior_reasoning_is_replayed(&model));
+    }
+
+    #[test]
+    fn pi_deepseek_compat_preserves_reasoning_and_controls_thinking() {
+        let mut model = model();
+        model.compat = Some(StreamingProtocolCompat::OpenaiCompletions(
+            serde_json::from_value(json!({
+                "thinkingFormat": "deepseek",
+                "requiresReasoningContentOnAssistantMessages": true,
+                "supportsReasoningEffort": false
+            }))
+            .unwrap(),
+        ));
+        let mut assistant =
+            AssistantMessage::empty(Api::OpenaiCompletions, "gateway", "gpt-test", 1);
+        assistant.content = vec![
+            Content::thinking("retained reasoning"),
+            Content::text("answer"),
+        ];
+        let mut plain = assistant.clone();
+        plain.content = vec![Content::text("plain answer")];
+        let context = Context::new(vec![
+            Message::Assistant(Box::new(assistant)),
+            Message::Assistant(Box::new(plain)),
+        ]);
+        let options = SimpleStreamOptions {
+            reasoning: Some(ThinkingLevel::High),
+            ..Default::default()
+        };
+        let request = build_request(&model, &context, &options);
+        assert_eq!(request["thinking"]["type"], "enabled");
+        assert!(request.get("reasoning_effort").is_none());
+        assert_eq!(
+            request["messages"][0]["reasoning_content"],
+            "retained reasoning"
+        );
+        assert_eq!(request["messages"][1]["reasoning_content"], "");
+        let off = build_request(&model, &context, &SimpleStreamOptions::default());
+        assert_eq!(off["thinking"]["type"], "disabled");
+        model.thinking_level_map = Some(BTreeMap::from([(ThinkingLevel::Off, None)]));
+        assert!(
+            build_request(&model, &context, &SimpleStreamOptions::default())
+                .get("thinking")
+                .is_none()
+        );
+        model.compat = None;
+        assert!(build_request(&model, &context, &options)
+            .get("thinking")
+            .is_none());
+    }
+
+    #[test]
+    fn deepseek_format_explicitly_disables_thinking_for_non_reasoning_models() {
+        let mut model = model();
+        model.reasoning = false;
+        model.compat = Some(StreamingProtocolCompat::OpenaiCompletions(
+            serde_json::from_value(json!({"thinkingFormat":"deepseek"})).unwrap(),
+        ));
+        let request = build_request(
+            &model,
+            &Context::new(vec![]),
+            &SimpleStreamOptions::default(),
+        );
+        assert_eq!(request["thinking"]["type"], "disabled");
+        assert!(request.get("reasoning_effort").is_none());
     }
 
     #[test]

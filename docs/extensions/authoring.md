@@ -509,6 +509,8 @@ Provider 负责推理，auth 负责凭据和登录流程，两者独立注册。
 `rpi_plugin_sdk::export_provider!`，需显式开启 SDK 默认关闭的 `provider` feature。模块提供
 `fn(&Model, &SimpleStreamOptions) -> Arc<dyn Provider>`。OpenAI-compatible 接入可复用
 `rpi_plugin_sdk::provider::completions(model, options, anonymous)`，无需复制 SSE 解析器。
+该 helper 返回 `Result`；通过 `ContextFactory` 传播客户端配置错误，或使用
+`context.completions(model, options, anonymous)` 复用客户端。
 宿主私有 `ProviderFactory` 统一选择扩展 / 内置协议，不是插件需要实现的接口。
 运行时依赖使用 `rpi-ai` 与开启 `provider` feature 的 `rpi-plugin-sdk`，不依赖 `rpi-cli`；宿主加载器
 可以作为测试依赖。

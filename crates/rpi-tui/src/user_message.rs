@@ -10,10 +10,9 @@
 //! [OSC 133]: https://terminalguide.namepad.de/seq/osc-133/
 
 use std::any::Any;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use super::component::Component;
+use super::component::{Component, RenderedDocument};
 use crate::box_component::Box;
 use crate::markdown::Markdown;
 use crate::theme::{theme, theme_revision};
@@ -33,9 +32,13 @@ pub struct UserMessageComponent {
     /// `render`, so the inner caches could never hit and each frame re-parsed
     /// every user message. Rebuild only on `invalidate` / `with_pad` / a theme
     /// change (the background colour is baked into the box).
-    inner: Mutex<Box>,
-    /// Theme revision the current inner box was built against.
-    built_revision: AtomicU64,
+    inner: Mutex<UserMessageState>,
+}
+
+struct UserMessageState {
+    bubble: Box,
+    built_revision: u64,
+    cache: Option<(usize, Arc<Vec<String>>)>,
 }
 
 fn build_box(text: &str, output_pad: usize) -> Box {
@@ -58,8 +61,11 @@ impl UserMessageComponent {
         Self {
             text,
             output_pad: 1,
-            inner: Mutex::new(inner),
-            built_revision: AtomicU64::new(theme_revision()),
+            inner: Mutex::new(UserMessageState {
+                bubble: inner,
+                built_revision: theme_revision(),
+                cache: None,
+            }),
         }
     }
 
@@ -69,29 +75,36 @@ impl UserMessageComponent {
         Self {
             text: self.text,
             output_pad: pad,
-            inner: Mutex::new(inner),
-            built_revision: AtomicU64::new(theme_revision()),
+            inner: Mutex::new(UserMessageState {
+                bubble: inner,
+                built_revision: theme_revision(),
+                cache: None,
+            }),
         }
     }
 }
 
-impl Component for UserMessageComponent {
-    fn render(&self, width: usize) -> Vec<String> {
-        // The background colour is baked into the inner box; rebuild it when
-        // the live theme has changed since it was built.
+impl UserMessageComponent {
+    fn shared_lines(&self, width: usize) -> Arc<Vec<String>> {
+        // Box rebuilding and decorated-row publication share one lock, so an
+        // invalidation can never leave rows from the previous bubble cached.
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let revision = theme_revision();
-        if self.built_revision.load(Ordering::Acquire) != revision {
-            if let Ok(mut inner) = self.inner.lock() {
-                *inner = build_box(&self.text, self.output_pad);
+        if inner.built_revision != revision {
+            inner.bubble = build_box(&self.text, self.output_pad);
+            inner.built_revision = revision;
+            inner.cache = None;
+        }
+        if let Some((cached_width, lines)) = inner.cache.as_ref() {
+            if *cached_width == width {
+                return Arc::clone(lines);
             }
-            self.built_revision.store(revision, Ordering::Release);
         }
 
-        let mut lines = match self.inner.lock() {
-            Ok(inner) => inner.render(width),
-            Err(_) => return Vec::new(),
-        };
+        let mut lines = inner.bubble.render(width);
         if lines.is_empty() {
+            let lines = Arc::new(lines);
+            inner.cache = Some((width, Arc::clone(&lines)));
             return lines;
         }
         // Prepend zone-start to the first line, append zone-end+final to the
@@ -101,17 +114,28 @@ impl Component for UserMessageComponent {
         let last = lines.last_mut().unwrap();
         last.insert_str(0, OSC133_ZONE_END);
         last.insert_str(OSC133_ZONE_END.len(), OSC133_ZONE_FINAL);
+        let lines = Arc::new(lines);
+        inner.cache = Some((width, Arc::clone(&lines)));
         lines
+    }
+}
+
+impl Component for UserMessageComponent {
+    fn render(&self, width: usize) -> Vec<String> {
+        self.shared_lines(width).as_ref().clone()
+    }
+
+    fn render_document(&self, width: usize) -> RenderedDocument {
+        RenderedDocument::from_shared(self.shared_lines(width))
     }
 
     fn invalidate(&self) {
-        // Rebuild the inner box so a theme change is picked up by the baked-in
-        // background colour, and so the Markdown cache is dropped.
+        // Clear decorated rows atomically with rebuilding the themed bubble.
         if let Ok(mut inner) = self.inner.lock() {
-            *inner = build_box(&self.text, self.output_pad);
+            inner.bubble = build_box(&self.text, self.output_pad);
+            inner.built_revision = theme_revision();
+            inner.cache = None;
         }
-        self.built_revision
-            .store(theme_revision(), Ordering::Release);
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -123,6 +147,33 @@ impl Component for UserMessageComponent {
 mod tests {
     use super::*;
     use crate::ansi::strip_ansi;
+
+    #[test]
+    fn shared_rows_reuse_decorated_bubble_and_regenerate() {
+        let c = UserMessageComponent::new("abcdefghij");
+        let first = c.shared_lines(40);
+        let _document = c.render_document(40);
+        assert!(Arc::ptr_eq(&first, &c.shared_lines(40)));
+        assert_eq!(first.as_ref(), &c.render(40));
+        let narrow = c.shared_lines(8);
+        assert!(!Arc::ptr_eq(&first, &narrow));
+        c.invalidate();
+        let refreshed = c.shared_lines(8);
+        assert!(!Arc::ptr_eq(&narrow, &refreshed));
+        assert_eq!(narrow.as_ref(), refreshed.as_ref());
+        for rows in [&first, &narrow, &refreshed] {
+            let joined = rows.join("\n");
+            assert_eq!(joined.matches(OSC133_ZONE_START).count(), 1);
+            assert_eq!(joined.matches(OSC133_ZONE_END).count(), 1);
+            assert_eq!(joined.matches(OSC133_ZONE_FINAL).count(), 1);
+            let compact = strip_ansi(&joined).replace([' ', '\n'], "");
+            assert_eq!(compact, "abcdefghij");
+        }
+        let padded = c.with_pad(2);
+        let padded_rows = padded.shared_lines(40);
+        assert!(!Arc::ptr_eq(&first, &padded_rows));
+        assert!(strip_ansi(&padded_rows.join("\n")).contains("  abcdefghij"));
+    }
 
     #[test]
     fn test_renders_non_empty() {

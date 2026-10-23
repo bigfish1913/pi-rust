@@ -14,15 +14,16 @@ use rpi_tui::{
 ///
 /// Returns `Ok(None)` when the user cancels with Esc or Ctrl+C.
 pub async fn select(cwd: &Path) -> Result<Option<String>, String> {
+    select_in_dir(cwd, &crate::session::default_session_dir(cwd)).await
+}
+
+pub(crate) async fn select_in_dir(cwd: &Path, dir: &Path) -> Result<Option<String>, String> {
     let cwd_text = cwd.to_string_lossy().into_owned();
-    let metadata = crate::session::list_session_metadata(&cwd_text)
+    let metadata = crate::session::list_session_metadata_in_dir(&cwd_text, dir)
         .await
         .map_err(|e| e.to_string())?;
     if metadata.is_empty() {
-        return Err(format!(
-            "no sessions found in {}",
-            crate::session::default_session_dir(cwd).display()
-        ));
+        return Err(format!("no sessions found in {}", dir.display()));
     }
 
     // Each summary opens + reads a (bounded) slice of the session file. That is
@@ -72,7 +73,7 @@ pub async fn select(cwd: &Path) -> Result<Option<String>, String> {
     if items.is_empty() {
         return Err(format!(
             "no resumable sessions with messages in {}",
-            crate::session::default_session_dir(cwd).display()
+            dir.display()
         ));
     }
 

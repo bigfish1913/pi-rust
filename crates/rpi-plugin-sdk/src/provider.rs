@@ -1,5 +1,5 @@
 //! Provider packages use the same C ABI as tools. This bridge owns a runtime
-//! per request, so no plugin worker thread survives DLL unloading.
+//! per request by default; opt-in contexts reuse resources until lifecycle shutdown.
 //!
 //! Available with the optional `provider` feature. Use [`crate::export_provider!`]
 //! for single-provider plugins, or [`register`] and [`drive`] when registering
@@ -14,21 +14,24 @@ use rpi_ai::{
 };
 use std::{ffi::c_void, sync::Arc, time::Duration};
 
+mod context;
+pub use context::{drive_with_context, register_with_context, ContextFactory, ProviderContext};
+
 pub type Factory = fn(&Model, &SimpleStreamOptions) -> Arc<dyn Provider>;
 
 /// Reuse the maintained OpenAI-compatible protocol without importing any
-/// vendor credentials from the host process environment.
+/// vendor credentials from the host process environment. Client construction
+/// errors propagate without bypassing the configured transport.
 pub fn completions(
     model: &Model,
     options: &SimpleStreamOptions,
     anonymous: bool,
-) -> Arc<dyn Provider> {
-    let client = rpi_ai::http::build_client(&model.base_url, None, None)
-        .unwrap_or_else(|_| reqwest::Client::new());
+) -> Result<Arc<dyn Provider>, String> {
+    let client = rpi_ai::http::build_client(&model.base_url, None, None)?;
     if anonymous && options.api_key.is_none() {
-        Arc::new(rpi_ai::providers::openai_completions::OpenAiCompletionsProvider::with_models_without_auth(model.provider.clone(), client, vec![model.clone()]))
+        Ok(Arc::new(rpi_ai::providers::openai_completions::OpenAiCompletionsProvider::with_models_without_auth(model.provider.clone(), client, vec![model.clone()])))
     } else {
-        Arc::new(rpi_ai::providers::openai_completions::OpenAiCompletionsProvider::with_models_without_env_api_key(model.provider.clone(), options.api_key.clone(), client, vec![model.clone()]))
+        Ok(Arc::new(rpi_ai::providers::openai_completions::OpenAiCompletionsProvider::with_models_without_env_api_key(model.provider.clone(), options.api_key.clone(), client, vec![model.clone()])))
     }
 }
 
@@ -84,6 +87,9 @@ fn options(value: &serde_json::Value) -> SimpleStreamOptions {
     let mut options = SimpleStreamOptions::default();
     options.api_key = value["apiKey"].as_str().map(str::to_string);
     options.timeout = value["timeoutMs"].as_u64().map(Duration::from_millis);
+    options.stream_idle_timeout = value["streamIdleTimeoutMs"]
+        .as_u64()
+        .map(Duration::from_millis);
     options.max_retry_delay = value["maxRetryDelayMs"].as_u64().map(Duration::from_millis);
     options.max_retries = value["maxRetries"].as_u64().and_then(|n| n.try_into().ok());
     options.max_tokens = value["maxTokens"].as_u64();
@@ -216,6 +222,76 @@ fn event_json(
     chunk
 }
 
+async fn drive_stream(
+    provider: Arc<dyn Provider>,
+    request: &Request,
+    options: &SimpleStreamOptions,
+    emit: Option<ProviderStreamEmitFn>,
+    emit_data: *mut c_void,
+    control: Option<&ProviderStreamControl>,
+) -> AssistantMessage {
+    let mut stream = provider
+        .stream_simple(&request.model, &request.context, options)
+        .await;
+    let mut partial = Arc::new(AssistantMessage::empty(
+        request.model.api.clone(),
+        request.model.provider.clone(),
+        request.model.id.clone(),
+        0,
+    ));
+    let mut previous_text = None;
+    let mut poll = tokio::time::interval(Duration::from_millis(10));
+    loop {
+        // Check synchronously too: an already-buffered provider can
+        // finish before the interval's initial tick becomes ready.
+        if options.signal.is_cancelled()
+            || control.is_some_and(|control| (control.is_cancelled)(control.user_data, 0) != 0)
+        {
+            options.signal.cancel();
+            let mut partial = (*partial).clone();
+            partial.stop_reason = StopReason::Aborted;
+            partial.error_message = Some("provider request was cancelled".into());
+            break partial;
+        }
+        tokio::select! {
+            biased;
+            _ = poll.tick() => {}
+            event = stream.next() => {
+                let Some(event) = event else {
+                    break stream.result().await.unwrap_or_else(|error| AssistantMessage::terminal(
+                        request.model.api.clone(), request.model.provider.clone(), request.model.id.clone(), StopReason::Error, error.to_string(), 0));
+                };
+                match &event {
+                    AssistantMessageEvent::Done { message, .. } => break message.clone(),
+                    AssistantMessageEvent::Error { error, .. } => break error.clone(),
+                    _ => {},
+                }
+                partial = match &event {
+                    AssistantMessageEvent::Start { partial }
+                    | AssistantMessageEvent::TextStart { partial, .. }
+                    | AssistantMessageEvent::TextDelta { partial, .. }
+                    | AssistantMessageEvent::TextEnd { partial, .. }
+                    | AssistantMessageEvent::ThinkingStart { partial, .. }
+                    | AssistantMessageEvent::ThinkingDelta { partial, .. }
+                    | AssistantMessageEvent::ThinkingEnd { partial, .. }
+                    | AssistantMessageEvent::ToolCallStart { partial, .. }
+                    | AssistantMessageEvent::ToolCallDelta { partial, .. }
+                    | AssistantMessageEvent::ToolCallEnd { partial, .. } => Arc::clone(partial),
+                    AssistantMessageEvent::Done { .. } | AssistantMessageEvent::Error { .. } => unreachable!(),
+                };
+                let Some(emit) = emit else { continue; };
+                let chunk = event_json(&event, &mut previous_text);
+                if emit(StbString::from_string(chunk.to_string()), emit_data) != 0 {
+                    options.signal.cancel();
+                    let mut partial = (*partial).clone();
+                    partial.stop_reason = StopReason::Aborted;
+                    break partial;
+                }
+            }
+        }
+    }
+}
+
 /// Drive a synchronous plugin request without retaining any borrowed ABI data.
 ///
 /// # Safety
@@ -246,57 +322,7 @@ pub unsafe fn drive(
         let control = unsafe { control.as_ref() };
         let message = runtime.block_on(async {
             let provider = factory(&request.model, &options);
-            let mut stream = provider.stream_simple(&request.model, &request.context, &options).await;
-            let mut partial = Arc::new(AssistantMessage::empty(request.model.api.clone(), request.model.provider.clone(), request.model.id.clone(), 0));
-            let mut previous_text = None;
-            let mut poll = tokio::time::interval(Duration::from_millis(10));
-            loop {
-                // Check synchronously too: an already-buffered provider can
-                // finish before the interval's initial tick becomes ready.
-                if control.is_some_and(|control| (control.is_cancelled)(control.user_data, 0) != 0) {
-                    options.signal.cancel();
-                    let mut partial = (*partial).clone();
-                    partial.stop_reason = StopReason::Aborted;
-                    partial.error_message = Some("provider request was cancelled".into());
-                    break partial;
-                }
-                tokio::select! {
-                    biased;
-                    _ = poll.tick() => {}
-                    event = stream.next() => {
-                        let Some(event) = event else {
-                            break stream.result().await.unwrap_or_else(|error| AssistantMessage::terminal(
-                                request.model.api.clone(), request.model.provider.clone(), request.model.id.clone(), StopReason::Error, error.to_string(), 0));
-                        };
-                        match &event {
-                            AssistantMessageEvent::Done { message, .. } => break message.clone(),
-                            AssistantMessageEvent::Error { error, .. } => break error.clone(),
-                            _ => {},
-                        }
-                        partial = match &event {
-                            AssistantMessageEvent::Start { partial }
-                            | AssistantMessageEvent::TextStart { partial, .. }
-                            | AssistantMessageEvent::TextDelta { partial, .. }
-                            | AssistantMessageEvent::TextEnd { partial, .. }
-                            | AssistantMessageEvent::ThinkingStart { partial, .. }
-                            | AssistantMessageEvent::ThinkingDelta { partial, .. }
-                            | AssistantMessageEvent::ThinkingEnd { partial, .. }
-                            | AssistantMessageEvent::ToolCallStart { partial, .. }
-                            | AssistantMessageEvent::ToolCallDelta { partial, .. }
-                            | AssistantMessageEvent::ToolCallEnd { partial, .. } => Arc::clone(partial),
-                            AssistantMessageEvent::Done { .. } | AssistantMessageEvent::Error { .. } => unreachable!(),
-                        };
-                        let Some(emit) = emit else { continue; };
-                        let chunk = event_json(&event, &mut previous_text);
-                        if emit(StbString::from_string(chunk.to_string()), emit_data) != 0 {
-                            options.signal.cancel();
-                            let mut partial = (*partial).clone();
-                            partial.stop_reason = StopReason::Aborted;
-                            break partial;
-                        }
-                    }
-                }
-            }
+            drive_stream(provider, &request, &options, emit, emit_data, control).await
         });
         // Convert via Value to normalize tagged Content's field representation.
         let json = serde_json::to_value(message)
@@ -378,6 +404,58 @@ mod tests {
         .to_string()
     }
     #[test]
+    fn transport_construction_errors_return_terminal_output_with_or_without_emit() {
+        fn factory(
+            _: &ProviderContext,
+            model: &Model,
+            options: &SimpleStreamOptions,
+        ) -> Result<Arc<dyn Provider>, String> {
+            completions(model, options, false)
+        }
+        let model = Model::new(
+            "m",
+            "M",
+            rpi_ai::Api::OpenaiCompletions,
+            "probe",
+            ":invalid",
+        );
+        assert!(completions(&model, &SimpleStreamOptions::default(), false).is_err());
+        let request =
+            serde_json::json!({"model":model, "context":Context::new(vec![]), "options":{}})
+                .to_string();
+        for with_emit in [false, true] {
+            let mut chunks = Vec::<serde_json::Value>::new();
+            let mut out = StbString::empty();
+            assert_eq!(
+                unsafe {
+                    drive_with_context(
+                        factory,
+                        std::ptr::null_mut(),
+                        StbStringRef::from_str(&request),
+                        with_emit.then_some(collect as ProviderStreamEmitFn),
+                        (&mut chunks as *mut Vec<serde_json::Value>).cast(),
+                        std::ptr::null(),
+                        &mut out,
+                    )
+                },
+                0
+            );
+            let output = unsafe {
+                crate::callbacks::OwnedString::from_raw(out, Some(crate::callbacks::free_string))
+            };
+            let message: AssistantMessage =
+                serde_json::from_str(&output.to_string_lossy()).unwrap();
+            assert_eq!(message.stop_reason, StopReason::Error);
+            assert!(message
+                .error_message
+                .as_deref()
+                .unwrap()
+                .contains("invalid target URL"));
+            assert!(chunks.is_empty(), "terminal errors use the output slot");
+        }
+    }
+
+    #[test]
     fn bridge_emits_tool_identity_and_valid_terminal_json() {
         let mut chunks = Vec::<serde_json::Value>::new();
         let mut out = StbString::empty();
@@ -446,11 +524,14 @@ mod tests {
     }
     #[test]
     fn options_preserve_provider_controls() {
-        let options = options(&serde_json::json!({"apiKey":"key","timeoutMs":42,
+        let options = options(
+            &serde_json::json!({"apiKey":"key","timeoutMs":42,"streamIdleTimeoutMs":11,
             "maxRetries":3,"maxRetryDelayMs":17,"reasoning":"Xhigh","maxTokens":80,
-            "headers":{"x-custom":"value"},"cacheRetention":"Long","sessionId":"s"}));
+            "headers":{"x-custom":"value"},"cacheRetention":"Long","sessionId":"s"}),
+        );
         assert_eq!(options.api_key.as_deref(), Some("key"));
         assert_eq!(options.timeout, Some(Duration::from_millis(42)));
+        assert_eq!(options.stream_idle_timeout, Some(Duration::from_millis(11)));
         assert_eq!(options.max_retries, Some(3));
         assert_eq!(options.max_retry_delay, Some(Duration::from_millis(17)));
         assert_eq!(options.reasoning, Some(rpi_ai::ThinkingLevel::Xhigh));

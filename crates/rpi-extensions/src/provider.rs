@@ -420,6 +420,7 @@ fn options_json(opts: &SimpleStreamOptions) -> serde_json::Value {
     serde_json::json!({
         "apiKey": opts.api_key,
         "timeoutMs": opts.timeout.map(|d| d.as_millis() as u64),
+        "streamIdleTimeoutMs": opts.stream_idle_timeout.map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
         "maxRetries": opts.max_retries,
         "maxRetryDelayMs": opts.max_retry_delay.map(|d| d.as_millis() as u64),
         "headers": opts.headers,
@@ -1353,6 +1354,29 @@ fn chunk_string(chunk: &serde_json::Value, field: &str) -> String {
 mod tests {
     use super::*;
     use crate::registry::ExtensionRegistry;
+
+    #[test]
+    fn stream_idle_duration_preserves_disabled_default_and_large_values_across_abi() {
+        for (duration, expected) in [
+            (None, serde_json::Value::Null),
+            (Some(std::time::Duration::ZERO), serde_json::json!(0)),
+            (
+                Some(std::time::Duration::from_secs(45)),
+                serde_json::json!(45_000),
+            ),
+            // A valid u64 CLI seconds value must not wrap to a tiny timeout.
+            (
+                Some(std::time::Duration::from_secs(u64::MAX / 1000 + 1)),
+                serde_json::json!(u64::MAX),
+            ),
+        ] {
+            let options = SimpleStreamOptions {
+                stream_idle_timeout: duration,
+                ..Default::default()
+            };
+            assert_eq!(options_json(&options)["streamIdleTimeoutMs"], expected);
+        }
+    }
 
     rpi_plugin_sdk::string_handler! {
         /// A stub `ProviderRequestFn` that writes a minimal assistant-message JSON

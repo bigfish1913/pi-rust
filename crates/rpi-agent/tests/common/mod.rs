@@ -213,6 +213,7 @@ pub fn loop_config_with_converter(
         thinking_level: rpi_ai::types::ThinkingLevel::Off,
         api_key: None,
         timeout: None,
+        stream_idle_timeout: None,
         max_retries: None,
         max_retry_delay: None,
         cache_retention: rpi_ai::provider::CacheRetention::default(),

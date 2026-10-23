@@ -119,12 +119,16 @@ fn models() -> Vec<Model> {
     vec![model]
 }
 
-fn create(model: &Model, options: &SimpleStreamOptions) -> Arc<dyn Provider> {
-    // 使用本次请求的端点与凭据，不读取 OPENAI_API_KEY 等进程变量。
-    rpi_plugin_sdk::provider::completions(model, options, false)
+fn create(
+    context: &rpi_plugin_sdk::provider::ProviderContext,
+    model: &Model,
+    options: &SimpleStreamOptions,
+) -> Result<Arc<dyn Provider>, String> {
+    // 使用本次请求的端点与凭据，并传播 HTTP 客户端配置错误。
+    context.completions(model, options, false)
 }
 
-rpi_plugin_sdk::export_provider!(
+rpi_plugin_sdk::export_provider_with_context!(
     ID, BASE_URL, "openai-completions",
     serde_json::json!({
         "id": ID, "models": models(),
@@ -135,7 +139,7 @@ rpi_plugin_sdk::export_provider!(
 ```
 
 匿名服务必须同时声明 `requiresAuth: false`，并使用允许匿名的协议构造路径；对上面的
-helper 即 `completions(model, options, true)`。仅修改 manifest 不会自动改变插件内部
+helper 即 `context.completions(model, options, true)`。仅修改 manifest 不会自动改变插件内部
 客户端的认证要求。自定义协议替换 `create` 的实现，仍通过同一桥接宏导出。
 
 ## 5. 认证与私有执行配置

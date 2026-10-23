@@ -6,7 +6,7 @@
 use std::any::Any;
 use std::sync::{Arc, Mutex};
 
-use super::component::Component;
+use super::component::{Component, RenderedDocument};
 use super::layout_node::{LayoutNode, LayoutNodeProvider, ScrollNode};
 
 /// Follow mode for ScrollView.
@@ -102,7 +102,7 @@ impl ScrollViewState {
 #[derive(Clone)]
 struct ScrollRenderCache {
     content_width: usize,
-    lines: Arc<Vec<String>>,
+    document: Arc<RenderedDocument>,
 }
 
 /// ScrollView - A scrollable container.
@@ -392,17 +392,17 @@ impl ScrollView {
         } else {
             None
         };
-        let all_lines = cached.map(|cache| cache.lines).unwrap_or_else(|| {
-            let lines = Arc::new(self.child.render(content_width));
+        let document = cached.map(|cache| cache.document).unwrap_or_else(|| {
+            let document = Arc::new(self.child.render_document(content_width));
             if let Ok(mut cache) = self.render_cache.lock() {
                 *cache = Some(ScrollRenderCache {
                     content_width,
-                    lines: lines.clone(),
+                    document: document.clone(),
                 });
             }
-            lines
+            document
         });
-        let content_height = all_lines.len();
+        let content_height = document.len();
 
         // Update state
         self.update_layout(content_height, height, None);
@@ -410,12 +410,7 @@ impl ScrollView {
         let scroll_top = self.scroll_top();
 
         // Extract visible portion
-        let visible: Vec<String> = all_lines
-            .iter()
-            .skip(scroll_top)
-            .take(height)
-            .cloned()
-            .collect();
+        let visible = document.lines(scroll_top, height);
 
         // Pad to fill viewport if needed
         let mut visible = visible;
@@ -496,6 +491,153 @@ pub fn render_scroll_view(scroll_view: &ScrollView, width: usize, height: usize)
 mod tests {
     use super::*;
     use crate::Text;
+
+    struct SharedHistory(Arc<Vec<String>>);
+
+    impl Component for SharedHistory {
+        fn render(&self, _: usize) -> Vec<String> {
+            panic!("fullscreen must not flatten historical rows");
+        }
+        fn render_document(&self, _: usize) -> RenderedDocument {
+            RenderedDocument::from_shared(self.0.clone())
+        }
+        fn invalidate(&self) {}
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    struct MutableRow(Mutex<String>);
+
+    impl Component for MutableRow {
+        fn render(&self, _: usize) -> Vec<String> {
+            vec![self.0.lock().unwrap().clone()]
+        }
+        fn invalidate(&self) {}
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[test]
+    fn fresh_frames_share_history_and_refresh_arbitrary_mutable_children() {
+        for size in [1, 1_000, 10_000] {
+            let rows = Arc::new(vec!["historical row".repeat(16); size]);
+            let transcript = Arc::new(crate::Container::new());
+            transcript.add_child(Arc::new(SharedHistory(rows.clone())));
+            let live = Arc::new(MutableRow(Mutex::new("first update".into())));
+            let live_component: Arc<dyn Component> = live.clone();
+            transcript.add_child(live_component.clone());
+            let wrapper = Arc::new(crate::Container::new());
+            wrapper.add_child(transcript.clone());
+            let scroll = ScrollView::new(
+                wrapper,
+                ScrollViewOptions {
+                    scrollbar: ScrollbarMode::Hidden,
+                    preserve_manual_position: true,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(scroll.render_with_viewport(40, 1), ["first update"]);
+            // Original handle, SharedHistory, and cached document all retain
+            // the same historical row allocation; no strings were flattened.
+            assert_eq!(Arc::strong_count(&rows), 3);
+            *live.0.lock().unwrap() = "second update".into();
+            assert_eq!(scroll.render_with_viewport(40, 1), ["second update"]);
+            assert_eq!(Arc::strong_count(&rows), 3);
+            scroll.scroll_to_start();
+            let position = scroll.scroll_top();
+            *live.0.lock().unwrap() = "third update".into();
+            scroll.render_with_viewport(40, 1);
+            assert_eq!(scroll.scroll_top(), position);
+            assert!(!scroll.is_following_end());
+            scroll.scroll_to_end();
+            assert_eq!(scroll.render_with_cached_content(40, 1), ["third update"]);
+            transcript.remove_child(&live_component);
+            scroll.render_with_viewport(40, 1);
+            transcript.add_child(live_component);
+            assert_eq!(scroll.render_with_viewport(20, 1), ["third update"]);
+            scroll.invalidate();
+            *live.0.lock().unwrap() = "after invalidation".into();
+            assert_eq!(
+                scroll.render_with_cached_content(20, 1),
+                ["after invalidation"]
+            );
+            assert_eq!(Arc::strong_count(&rows), 3);
+        }
+    }
+
+    #[test]
+    #[ignore = "manual render-cost comparison; run with --ignored --nocapture"]
+    fn compare_flat_and_shared_long_transcript_frames() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        for count in [10, 200] {
+            let transcript = crate::Container::new();
+            for index in 0..count {
+                transcript.add_child(Arc::new(crate::UserMessageComponent::new(format!(
+                    "prompt {index}\n{}",
+                    "historical prompt text\n".repeat(10)
+                ))));
+                let response = Arc::new(crate::AssistantMessageComponent::default());
+                response.update_text(&"historical **response** with `code`\n".repeat(20));
+                transcript.add_child(response);
+            }
+            let live = Arc::new(crate::AssistantMessageComponent::default());
+            transcript.add_child(live.clone());
+            live.update_text("initial live output");
+            let expected = transcript.render(80);
+            let document = transcript.render_document(80);
+            assert_eq!(document.lines(0, document.len()), expected);
+            let rows = expected.len();
+            let frames = 100;
+            let started = Instant::now();
+            for index in 0..frames {
+                live.update_text(&format!("live output {index}"));
+                let lines = transcript.render(80);
+                black_box(&lines[lines.len().saturating_sub(20)..]);
+            }
+            let flat = started.elapsed();
+            let started = Instant::now();
+            for index in 0..frames {
+                live.update_text(&format!("live output {index}"));
+                let document = transcript.render_document(80);
+                black_box(document.lines(document.len().saturating_sub(20), 20));
+            }
+            let shared = started.elapsed();
+            eprintln!("{count} pairs / {rows} rows / {frames} fresh frames: flat={flat:?}, shared={shared:?}");
+        }
+    }
+
+    #[test]
+    fn shared_message_updates_match_legacy_rendering() {
+        let transcript = Arc::new(crate::Container::new());
+        transcript.add_child(Arc::new(crate::UserMessageComponent::new("user prompt")));
+        let assistant = Arc::new(crate::AssistantMessageComponent::default());
+        assistant.update_text("first **response**");
+        assistant.set_trailing_spacing(1);
+        transcript.add_child(assistant.clone());
+        let bash = Arc::new(crate::BashExecutionComponent::new("echo result"));
+        transcript.add_child(bash.clone());
+        let scroll = ScrollView::new(
+            transcript.clone(),
+            ScrollViewOptions {
+                scrollbar: ScrollbarMode::Hidden,
+                ..Default::default()
+            },
+        );
+        for width in [80, 30] {
+            assistant.update_text("latest **response**");
+            bash.append_output("latest tool output");
+            bash.set_complete(Some(0), false, crate::BashTruncation::default());
+            let expected = transcript.render(width);
+            let actual = scroll.render_with_viewport(width, expected.len());
+            assert_eq!(actual, expected);
+            assert!(crate::strip_ansi(&actual.join("\n")).contains("latest response"));
+            assert!(crate::strip_ansi(&actual.join("\n")).contains("latest tool output"));
+        }
+    }
 
     #[test]
     fn test_scroll_view_basic() {

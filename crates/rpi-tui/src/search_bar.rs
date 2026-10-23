@@ -67,7 +67,7 @@ impl Component for SearchBar {
             if query.is_empty() {
                 String::new()
             } else {
-                format!("No matches")
+                "No matches".to_string()
             }
         } else {
             format!("{}/{}", current_match + 1, match_count)

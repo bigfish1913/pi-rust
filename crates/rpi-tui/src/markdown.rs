@@ -5,11 +5,11 @@
 //! leaking escape sequences. Reuses the shared utilities in [`crate::utils`].
 
 use std::any::Any;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
-use super::component::Component;
+use super::component::{Component, RenderedDocument};
 use super::mermaid::Mermaid;
 use crate::ansi::{bold, italic, underline};
 use crate::theme::theme;
@@ -47,7 +47,7 @@ pub struct Markdown {
     options: MarkdownOptions,
     padding_x: usize,
     padding_y: usize,
-    /// Render cache keyed by (content, width). Markdown parsing + inline
+    /// Render cache keyed by (width, theme revision). Markdown parsing + inline
     /// pulldown-cmark work is the dominant per-frame cost of a long transcript;
     /// a finalized message is re-rendered on every frame the transcript is
     /// repainted, so caching the parsed lines is what keeps that O(1) per
@@ -57,10 +57,9 @@ pub struct Markdown {
 
 #[derive(Clone)]
 struct MarkdownCache {
-    content: String,
     width: usize,
     theme_revision: u64,
-    lines: Vec<String>,
+    lines: Arc<Vec<String>>,
 }
 
 impl Markdown {
@@ -146,15 +145,38 @@ impl Markdown {
     pub fn set_content(&self, content: impl Into<String>) {
         if let Ok(mut c) = self.content.lock() {
             *c = content.into();
+            if let Ok(mut cache) = self.cache.lock() {
+                *cache = None;
+            }
         }
-        self.clear_cache();
     }
 
     /// Drop the cached render output.
     fn clear_cache(&self) {
-        if let Ok(mut cache) = self.cache.lock() {
-            *cache = None;
+        // Always acquire content before cache, including invalidation.
+        if let Ok(_content) = self.content.lock() {
+            if let Ok(mut cache) = self.cache.lock() {
+                *cache = None;
+            }
         }
+    }
+
+    fn shared_lines(&self, width: usize) -> Arc<Vec<String>> {
+        let content = self.content.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        let theme_revision = crate::theme::theme_revision();
+        if let Some(cached) = cache.as_ref() {
+            if cached.width == width && cached.theme_revision == theme_revision {
+                return Arc::clone(&cached.lines);
+            }
+        }
+        let lines = Arc::new(self.render_markdown(&content, width));
+        *cache = Some(MarkdownCache {
+            width,
+            theme_revision,
+            lines: Arc::clone(&lines),
+        });
+        lines
     }
 
     /// Get the content.
@@ -173,8 +195,7 @@ impl Markdown {
     }
 
     /// Render markdown to lines.
-    fn render_markdown(&self, width: usize) -> Vec<String> {
-        let content = self.content.lock().map(|c| c.clone()).unwrap_or_default();
+    fn render_markdown(&self, content: &str, width: usize) -> Vec<String> {
         let colors = theme().colors;
         let mut lines: Vec<String> = Vec::new();
         let indent = " ".repeat(self.options.code_block_indent);
@@ -708,8 +729,7 @@ fn is_partial_fence(line: &str) -> bool {
 
 /// Strip a leading `prefix` of `#`s followed by a space from `line`.
 fn strip_header<'a>(line: &'a str, hashes: &str) -> Option<&'a str> {
-    if line.starts_with(hashes) {
-        let rest = &line[hashes.len()..];
+    if let Some(rest) = line.strip_prefix(hashes) {
         if let Some(stripped) = rest.strip_prefix(' ') {
             return Some(stripped);
         }
@@ -922,30 +942,11 @@ fn push_wrapped_with_prefix(
 
 impl Component for Markdown {
     fn render(&self, width: usize) -> Vec<String> {
-        let content = self.content.lock().map(|c| c.clone()).unwrap_or_default();
-        let theme_revision = crate::theme::theme_revision();
+        self.shared_lines(width).as_ref().clone()
+    }
 
-        if let Ok(cache) = self.cache.lock() {
-            if let Some(cached) = cache.as_ref() {
-                if cached.width == width
-                    && cached.content == content
-                    && cached.theme_revision == theme_revision
-                {
-                    return cached.lines.clone();
-                }
-            }
-        }
-
-        let lines = self.render_markdown(width);
-        if let Ok(mut cache) = self.cache.lock() {
-            *cache = Some(MarkdownCache {
-                content,
-                width,
-                theme_revision,
-                lines: lines.clone(),
-            });
-        }
-        lines
+    fn render_document(&self, width: usize) -> RenderedDocument {
+        RenderedDocument::from_shared(self.shared_lines(width))
     }
 
     fn invalidate(&self) {
@@ -960,6 +961,26 @@ impl Component for Markdown {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_rows_reuse_and_regenerate_on_mutation_and_width() {
+        let md = Markdown::new("abcdefgh", 0, 0);
+        let first = md.shared_lines(80);
+        let _document = md.render_document(80);
+        assert!(Arc::ptr_eq(&first, &md.shared_lines(80)));
+        assert_eq!(first.as_ref(), &md.render(80));
+        let narrow = md.shared_lines(4);
+        assert!(!Arc::ptr_eq(&first, &narrow));
+        assert_eq!(narrow.as_ref(), &vec!["abcd", "efgh"]);
+        md.set_content("**new text**");
+        let changed = md.shared_lines(80);
+        assert!(!Arc::ptr_eq(&first, &changed));
+        assert_eq!(crate::ansi::strip_ansi(&changed.join("\n")), "new text");
+        md.invalidate();
+        let refreshed = md.shared_lines(80);
+        assert!(!Arc::ptr_eq(&changed, &refreshed));
+        assert_eq!(changed.as_ref(), refreshed.as_ref());
+    }
 
     #[test]
     fn test_markdown_headers() {

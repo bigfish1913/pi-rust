@@ -235,6 +235,10 @@ pub struct Settings {
     /// `httpIdleTimeout`. rpi surface: `httpIdleTimeout`.
     #[serde(default, alias = "httpIdleTimeoutMs")]
     pub http_idle_timeout: Option<serde_json::Value>,
+    /// Maximum silence between streamed response bytes, in seconds.
+    /// Absent uses 300 seconds; zero disables it; the CLI flag takes priority.
+    #[serde(default)]
+    pub stream_idle_timeout: Option<u64>,
 }
 
 /// upstream's `terminal` settings block (`TerminalSettings`). Only the fields
@@ -649,6 +653,10 @@ fn save_settings_to_path(
                 .map(|v| serde_json::Value::Number(v.into())),
         ),
         ("httpIdleTimeout", settings.http_idle_timeout.clone()),
+        (
+            "streamIdleTimeout",
+            settings.stream_idle_timeout.map(serde_json::Value::from),
+        ),
     ] {
         match value {
             Some(value) => {
@@ -679,7 +687,7 @@ fn read_fallback_settings_value(
     if path == target {
         return Ok(None);
     }
-    match std::fs::read_to_string(&path) {
+    match std::fs::read_to_string(path) {
         Ok(text) => parse_settings_value(&text).map(Some).map_err(|error| {
             format!(
                 "cannot parse fallback settings file {}: {error}",
@@ -1174,6 +1182,17 @@ mod scoped_tests {
         assert_eq!(raw["piOnlyField"], "keep-me");
         assert_eq!(raw["scopedModels"][0], "m1");
         assert_eq!(raw["theme"], "dark");
+    }
+
+    #[test]
+    fn stream_idle_timeout_settings_round_trip_including_disabled() {
+        let (_tmp, _guard) = with_temp_env();
+        for seconds in [45, 0] {
+            let mut settings = load_settings().unwrap();
+            settings.stream_idle_timeout = Some(seconds);
+            save_settings(&settings).unwrap();
+            assert_eq!(load_settings().unwrap().stream_idle_timeout, Some(seconds));
+        }
     }
 
     #[test]

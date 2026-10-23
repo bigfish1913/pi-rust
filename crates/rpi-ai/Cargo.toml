@@ -36,6 +36,9 @@ regex = { workspace = true }
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
 [features]
 default = []
 # Real HTTP providers (anthropic). Off by default so core builds remain network-free.

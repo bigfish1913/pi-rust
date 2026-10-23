@@ -297,21 +297,19 @@ pub(super) fn cycle_prev_model(
 }
 
 /// Build + open the `/session` selector. Lists JSONL session files under the
-/// default session dir (`<cwd>/.rpi/sessions`
-/// fallback), newest-first, labelled with the session name or first prompt so
-/// two sessions are distinguishable. Header-only sessions are skipped: there is
-/// nothing to switch to.
+/// selected session directory, newest-first, labelled with the session name or
+/// first prompt so two sessions are distinguishable. Header-only sessions are
+/// skipped: there is nothing to switch to.
 pub(super) fn open_session_selector(
     state: &Arc<TuiState>,
     editor_container: &Arc<Container>,
     editor: &Arc<Editor>,
     tui: &Arc<TuiAltScreen>,
-    cwd: &std::path::Path,
     tx: &mpsc::UnboundedSender<TuiMessage>,
 ) {
-    let dir = crate::session::default_session_dir(cwd);
+    let dir = &state.session_dir;
     let mut items: Vec<SelectItem> = Vec::new();
-    for path in crate::session::list_session_files_sync(&dir) {
+    for path in crate::session::list_session_files_sync(dir) {
         let summary = crate::session::summarize_session_file(&path);
         if summary.empty {
             continue;

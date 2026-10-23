@@ -38,6 +38,7 @@ async fn cancellation_sleeps_until_the_driver_returns_and_overrides_a_late_succe
             schema(),
             PluginToolHandle {
                 execute_fn: consume_execute,
+                set_waker_fn: None,
                 poll_fn: late_poll,
                 cancel_fn: noop,
                 destroy_fn: late_destroy,

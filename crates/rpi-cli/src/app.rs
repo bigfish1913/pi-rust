@@ -268,6 +268,10 @@ async fn run_inner() -> i32 {
         }
     };
 
+    for warning in &resolved.compat_warnings {
+        eprintln!("warning: models.json: {warning}");
+    }
+
     // The full authenticated catalog (read-only) for the TUI's `/model`
     // selector, derived from the built provider runtimes so auth headers and
     // base-url overrides survive.
@@ -503,16 +507,18 @@ async fn run_inner() -> i32 {
                     // `rpi --connect` talks to. The extension `UiDialog`
                     // mailbox is bridged over the same channel so a permission
                     // gate can ask the client mid-run.
+                    // Release the extension session lock before the RPC loop awaits.
+                    // ToolCall hooks need the same lock to dispatch approvals.
+                    let oauth_snapshot = {
+                        let session = reload_context.extension_session.lock().unwrap();
+                        session.snapshot_arc()
+                    };
                     crate::modes::rpc(
                         &harness,
                         Some(event_rx),
                         model_catalog,
                         reload_context.ui_dialog.clone(),
-                        reload_context
-                            .extension_session
-                            .lock()
-                            .unwrap()
-                            .snapshot_arc(),
+                        oauth_snapshot,
                     )
                     .await
                 };
@@ -649,10 +655,12 @@ async fn resolve_resume(parsed: &mut Args, cwd: &Path) -> Option<i32> {
         return Some(EXIT_USAGE);
     }
 
-    match crate::resume_picker::select(cwd).await {
+    let session_dir = crate::session::configured_session_dir(parsed, cwd);
+    match crate::resume_picker::select_in_dir(cwd, &session_dir).await {
         Ok(Some(id)) => {
             parsed.resume = false;
             parsed.session = Some(id);
+            parsed.session_dir = Some(session_dir);
             None
         }
         Ok(None) => Some(0),
@@ -687,8 +695,13 @@ async fn list_models(search: &str, args: &Args, cwd: &Path) -> i32 {
         }
     };
     let manifests = crate::provider::manifests_from_session(&prepared.extension_session);
-    let catalog = match crate::provider::catalog_with_manifests(&manifests) {
-        Ok(models) => models,
+    let catalog = match crate::provider::catalog_with_diagnostics(&manifests) {
+        Ok((models, warnings)) => {
+            for warning in warnings {
+                eprintln!("warning: models.json: {warning}");
+            }
+            models
+        }
         Err(error) => {
             eprintln!("warning: could not load models.json: {error}");
             Vec::new()

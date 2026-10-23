@@ -47,6 +47,10 @@
 //! `cancel` is an idempotent thread-safe flag-set; `destroy` is the single
 //! free, owned by the driver.
 //!
+//! Wake-capable tools use an owned async driver with serialized, short
+//! `spawn_blocking` FFI calls. Wake notifications are retained across polls;
+//! an idle `Pending` execution occupies no blocking worker.
+//!
 //! ## Events
 //!
 //! [`ExtensionEmitter`] impls `AgentEmitter` by subscribing to the host's
@@ -167,6 +171,8 @@ pub use rpi_plugin_sdk::callbacks::free_string as host_free_string;
 ///
 /// This struct is `Send + Sync` (registry is `Mutex`-guarded).
 pub struct HostApi {
+    lifecycle: Mutex<Vec<PluginLifecycle>>,
+    shutting_down: std::sync::atomic::AtomicBool,
     registry: Mutex<Option<ExtensionRegistry>>,
     /// Display name of the plugin currently registering (from the cdylib file
     /// stem). Stamped onto every registration the plugin makes (e.g. event
@@ -192,10 +198,33 @@ impl HostApi {
         _diagnostics: Arc<dyn PluginDiagnostics>,
     ) -> Arc<Self> {
         Arc::new(Self {
+            lifecycle: Mutex::new(Vec::new()),
+            shutting_down: std::sync::atomic::AtomicBool::new(false),
             registry: Mutex::new(Some(registry)),
             name: name.into(),
             action_bridge: None,
         })
+    }
+
+    pub(crate) fn begin_shutdown(&self) {
+        if !self
+            .shutting_down
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            let lifecycle = self.lifecycle.lock().unwrap().clone();
+            for lifecycle in lifecycle {
+                (lifecycle.begin)(lifecycle.user_data);
+            }
+        }
+    }
+
+    pub(crate) fn finish_shutdown(&self) -> bool {
+        let lifecycle = self.lifecycle.lock().unwrap().clone();
+        let mut success = true;
+        for lifecycle in lifecycle {
+            success &= (lifecycle.finish)(lifecycle.user_data) == 0;
+        }
+        success
     }
 
     /// The registering plugin's display name.
@@ -219,6 +248,8 @@ impl HostApi {
         let name = name.into();
         let action_bridge = action_bridge.for_plugin(&name);
         Arc::new(Self {
+            lifecycle: Mutex::new(Vec::new()),
+            shutting_down: std::sync::atomic::AtomicBool::new(false),
             registry: Mutex::new(Some(registry)),
             name,
             action_bridge: Some(action_bridge),
@@ -275,6 +306,8 @@ impl HostApi {
             struct_size: std::mem::size_of::<rpi_plugin_sdk::PluginApi>() as u32,
             free_string: host_free_string,
             register_tool: Some(trampoline_register_tool),
+            register_tool_with_wake: Some(trampoline_register_tool_with_wake),
+            register_plugin_lifecycle: Some(trampoline_register_plugin_lifecycle),
             register_command: Some(trampoline_register_command),
             register_shortcut: Some(trampoline_register_shortcut),
             register_flag: Some(trampoline_register_flag),
@@ -295,6 +328,37 @@ impl HostApi {
             declare: Some(trampoline_declare),
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct PluginLifecycle {
+    begin: rpi_plugin_sdk::PluginBeginShutdownFn,
+    finish: rpi_plugin_sdk::PluginFinishShutdownFn,
+    user_data: *mut c_void,
+}
+
+// The plugin contract permits lifecycle callbacks on host cleanup threads.
+unsafe impl Send for PluginLifecycle {}
+unsafe impl Sync for PluginLifecycle {}
+
+extern "C" fn trampoline_register_plugin_lifecycle(
+    begin: rpi_plugin_sdk::PluginBeginShutdownFn,
+    finish: rpi_plugin_sdk::PluginFinishShutdownFn,
+    user_data: *mut c_void,
+) -> i32 {
+    with_current_api(|api| {
+        if api.shutting_down.load(std::sync::atomic::Ordering::Acquire) {
+            return 1;
+        }
+        let mut lifecycle = api.lifecycle.lock().unwrap();
+        lifecycle.push(PluginLifecycle {
+            begin,
+            finish,
+            user_data,
+        });
+        0
+    })
+    .unwrap_or(1)
 }
 
 // Thread-local "current host api" for the duration of a plugin register call.
@@ -348,6 +412,46 @@ extern "C" fn trampoline_register_tool(
     destroy_fn: ToolDestroyFn,
     plugin_free_string: FreeStringFn,
 ) -> i32 {
+    register_tool(
+        schema,
+        execute_fn,
+        poll_fn,
+        cancel_fn,
+        destroy_fn,
+        plugin_free_string,
+        None,
+    )
+}
+
+extern "C" fn trampoline_register_tool_with_wake(
+    schema: *const StableToolSchema,
+    execute_fn: ToolExecuteFn,
+    poll_fn: ToolPollFn,
+    cancel_fn: ToolCancelFn,
+    destroy_fn: ToolDestroyFn,
+    plugin_free_string: FreeStringFn,
+    set_waker_fn: rpi_plugin_sdk::ToolSetWakerFn,
+) -> i32 {
+    register_tool(
+        schema,
+        execute_fn,
+        poll_fn,
+        cancel_fn,
+        destroy_fn,
+        plugin_free_string,
+        Some(set_waker_fn),
+    )
+}
+
+fn register_tool(
+    schema: *const StableToolSchema,
+    execute_fn: ToolExecuteFn,
+    poll_fn: ToolPollFn,
+    cancel_fn: ToolCancelFn,
+    destroy_fn: ToolDestroyFn,
+    plugin_free_string: FreeStringFn,
+    set_waker_fn: Option<rpi_plugin_sdk::ToolSetWakerFn>,
+) -> i32 {
     if !current_api_present() {
         return -1;
     }
@@ -393,6 +497,7 @@ extern "C" fn trampoline_register_tool(
         cancel_fn,
         destroy_fn,
         plugin_free_string,
+        set_waker_fn,
         runtime_handle: None,
     };
     // `register_tool` returns `bool` (true on overwrite of a prior same-named
@@ -854,6 +959,48 @@ mod current_api_tests {
 
     fn api(name: &str) -> Arc<HostApi> {
         HostApi::new(name, ExtensionRegistry::new(), Arc::new(NullDiagnostics))
+    }
+
+    #[test]
+    fn all_lifecycle_contexts_finish_even_when_one_reports_failure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Calls {
+            begins: AtomicUsize,
+            finishes: AtomicUsize,
+        }
+        extern "C" fn begin(data: *mut c_void) {
+            unsafe { &*data.cast::<Calls>() }
+                .begins
+                .fetch_add(1, Ordering::SeqCst);
+        }
+        extern "C" fn finish(data: *mut c_void) -> i32 {
+            unsafe { &*data.cast::<Calls>() }
+                .finishes
+                .fetch_add(1, Ordering::SeqCst);
+            1
+        }
+        let calls = Calls {
+            begins: AtomicUsize::new(0),
+            finishes: AtomicUsize::new(0),
+        };
+        let owner = api("multiple-contexts");
+        let registration = enter_current_api(&owner);
+        for _ in 0..2 {
+            assert_eq!(
+                trampoline_register_plugin_lifecycle(
+                    begin,
+                    finish,
+                    (&calls as *const Calls).cast_mut().cast()
+                ),
+                0
+            );
+        }
+        drop(registration);
+        owner.begin_shutdown();
+        owner.begin_shutdown();
+        assert_eq!(calls.begins.load(Ordering::SeqCst), 2);
+        assert!(!owner.finish_shutdown());
+        assert_eq!(calls.finishes.load(Ordering::SeqCst), 2);
     }
 
     #[test]

@@ -201,12 +201,13 @@ impl Component for PetDocument {
         if state.layout == "work" && width >= 70 {
             let pet_width = 28;
             let chat_width = width.saturating_sub(pet_width + 3);
-            let chat = self.transcript.render(chat_width);
-            let start = chat.len().saturating_sub(height);
+            let document = self.transcript.render_document(chat_width);
+            let start = document.len().saturating_sub(height);
+            let chat = document.lines(start, height);
             let pet = pet_lines(&state, pet_width, height, frame);
             return (0..height)
                 .map(|i| {
-                    let left = chat.get(start + i).map(String::as_str).unwrap_or("");
+                    let left = chat.get(i).map(String::as_str).unwrap_or("");
                     let right = pet.get(i).map(String::as_str).unwrap_or("");
                     format!(
                         "{}{} │ {}",
@@ -226,6 +227,16 @@ impl Component for PetDocument {
         }
         lines
     }
+    fn render_document(&self, width: usize) -> rpi_tui::component::RenderedDocument {
+        if !active(&self.mailbox) {
+            // Normal chat must retain shared historical blocks all the way to
+            // ScrollView; flattening this wrapper defeats incremental reuse.
+            self.transcript.render_document(width)
+        } else {
+            rpi_tui::component::RenderedDocument::from_lines(self.render(width))
+        }
+    }
+
     fn invalidate(&self) {
         self.transcript.invalidate();
     }
@@ -240,6 +251,36 @@ mod tests {
     fn snapshot(mood: &str) -> String {
         serde_json::json!({"version":1,"name":"小鱼","animal":"cat","mood":mood,"caption":"这是一个很长的中文回复。".repeat(30),"speaker":"pet","hint":"voice: listening","auto":true}).to_string()
     }
+    struct SharedOnlyTranscript;
+
+    impl Component for SharedOnlyTranscript {
+        fn render(&self, _: usize) -> Vec<String> {
+            panic!("pet wrapper must not flatten the transcript");
+        }
+        fn render_document(&self, _: usize) -> rpi_tui::component::RenderedDocument {
+            rpi_tui::component::RenderedDocument::from_lines(vec!["shared chat".into()])
+        }
+        fn invalidate(&self) {}
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn default_and_work_layouts_preserve_shared_transcript_rendering() {
+        let mailbox = rpi_extensions::ExtensionStatusMailbox::new();
+        let doc = PetDocument::new(Arc::new(SharedOnlyTranscript), mailbox.clone());
+        assert_eq!(doc.render_document(80).lines(0, 1), ["shared chat"]);
+        let mut state: serde_json::Value = serde_json::from_str(&snapshot("think")).unwrap();
+        state["layout"] = "work".into();
+        mailbox.set(PET_KEY, &state.to_string());
+        assert!(doc
+            .render_document(100)
+            .lines(0, 22)
+            .join("\n")
+            .contains("shared chat"));
+    }
+
     #[test]
     fn pet_switch_preserves_live_transcript_and_falls_back_on_bad_metadata() {
         let transcript = Arc::new(Text::new("original chat", 0, 0));

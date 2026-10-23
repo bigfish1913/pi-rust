@@ -132,8 +132,14 @@ Replace the paths with the same compatible core checkout. Released SDK versions
 through 0.6.2 do not include this feature; use the migrated source until a version
 containing it is published.
 
-`provider::completions(model, options, anonymous)` reuses the OpenAI-compatible
-protocol without reading vendor credentials from the process environment.
+`provider::completions(model, options, anonymous)` returns
+`Result<Arc<dyn Provider>, String>` and reuses the OpenAI-compatible protocol
+without reading vendor credentials from the process environment. Propagate
+client construction errors through a `ContextFactory`; transport failures never
+fall back to an unconfigured HTTP client. Changing this helper's return type
+from `Arc<dyn Provider>` to `Result<Arc<dyn Provider>, String>` is a Rust source
+API break included in the maintainer-managed breaking release. Migrate callers
+to a fallible `ContextFactory` and propagate the result with `?`.
 `export_provider!` exports a single-provider plugin from a Rust factory. For
 multiple providers, keep one `export_plugin!` entrypoint and use
 `provider::register` and `provider::drive` for each provider instead.
@@ -301,3 +307,49 @@ questions do not accept nested questions, multiple answers or freeform input.
 hosts and adapters. Answers retain the selected original title in `values`.
 Transport adapters that cannot show ordinary questions cancel them explicitly;
 they must not reinterpret them as permission choices.
+
+## Wake-driven tools
+
+`PluginApi::register_tool_with_wake` accepts the existing tool lifecycle and
+producer deallocator plus `ToolSetWakerFn`. It is an optional appended slot;
+fall back to `register_tool` when it is absent on an older host. Installing a
+waker must notify immediately if progress is already available. After returning
+`Pending`, notify whenever another poll could make progress. Notifications may
+come from any thread and coalesce. The host serializes all lifecycle calls per
+handle and passes `None` to unregister before destroy. A racing late wake is safe;
+the opaque callback token must never be dereferenced. Partial callbacks still
+run synchronously within `poll` and must not be retained.
+
+Opt into registration-scoped resources with `provider::ProviderContext`, a
+`provider::ContextFactory`, and `export_provider_with_context!`. The context
+lazily starts one runtime worker; concurrent request threads drive their own
+streams through its handle, and emit callbacks stay on those request threads.
+`context.completions(model, options, anonymous)` returns a fallible provider
+using a bounded cache of 16 HTTP clients keyed by origin and effective proxy.
+Client construction keeps the existing proxy and idle-timeout rules and
+propagates errors. API keys and request headers stay on each request.
+
+The optional `PluginApi::register_plugin_lifecycle` slot follows the tool wake
+slot without changing earlier offsets or the ABI version. Rust `PluginApi`
+struct literals must add `register_plugin_lifecycle: None` (or their registrar).
+Register a pair of hooks for each owned resource context:
+`begin_shutdown` must be idempotent and return without joining workers, and
+`finish_shutdown` joins and releases all work on a blocking cleanup thread.
+A zero finish status guarantees that no background plugin code can run again.
+The host waits until active FFI calls and producer-side string frees finish;
+if shutdown fails, it logs and retains the DLL and host context for the process
+lifetime. It never uses a timeout to unload live code. Older hosts use the
+context helper's request-scoped runtime/client fallback. Existing `Factory`,
+`register`, `drive`, and `export_provider!` remain available.
+
+Run the offline runtime/client construction comparison with:
+
+```sh
+cargo test -p rpi-plugin-sdk --features provider --release benchmark_context_resources -- --ignored --nocapture
+```
+
+The fixture drives actual context requests with a local faux provider and HTTP
+client construction/cache lookup, without network requests. It reports runtime
+and client builds plus request p50/p95 for scoped/shared resources, sequential
+calls and four concurrent accounts; every response checks account isolation.
+Timing includes request driving and is diagnostic, without pass/fail thresholds.

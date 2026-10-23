@@ -434,7 +434,8 @@ async fn run_anthropic_stream(
     // failure never delivers a partial `start` with no terminal. `run_mapper`
     // applies the model-aware `cost_fn` on the final usage before the terminal
     // event (mirrors the inline `calculateCost(model, output.usage)` calls).
-    let mut sse = SseEventStream::new(response, opts.signal.clone());
+    let mut sse = SseEventStream::new(response, opts.signal.clone())
+        .with_idle_timeout(opts.stream_idle_timeout());
     let cost_model = model.cost.clone();
     let cost_fn = move |usage: &Usage| calculate_cost(&cost_model, usage);
     run_mapper(&mut sse, prod, &mut state, cost_fn).await;

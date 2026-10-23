@@ -117,7 +117,7 @@ pub(super) async fn switch_to_session(
         return false;
     }
     let cwd_str = cwd.to_string_lossy().to_string();
-    match crate::session::open_session_by_id(id, &cwd_str).await {
+    match crate::session::open_session_by_id_in_dir(id, &cwd_str, &state.session_dir).await {
         Ok(new_session) => {
             // Route through the funnel so the plugin channels follow the swap;
             // a bare `set_session` would leave every plugin naming the session
@@ -151,9 +151,8 @@ pub(super) async fn switch_to_session(
     }
 }
 
-/// `/import <path>`: copy a JSONL session file into the default session dir,
-/// then hot-switch to it (the file name becomes its id — matching the
-/// selector/`open_session_by_id` containment rules).
+/// `/import <path>`: validate and save a session in the selected repository,
+/// then activate it through the same funnel as other session switches.
 pub(super) async fn import_session(
     harness: &AgentHarness,
     lane: &Arc<dyn AgentLane>,
@@ -178,21 +177,43 @@ pub(super) async fn import_session(
         add_error_message(chat, "Import source must be a .jsonl session file.");
         return;
     }
-    let dir = crate::session::default_session_dir(cwd);
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        add_error_message(chat, &format!("Could not create session dir: {e}"));
+    if *state.status.lock().unwrap() == RunStatus::Working {
+        state.set_status(RunStatus::Aborting);
+        let _ = lane.abort().await;
+    }
+    if let Err(error) = lane.wait_for_idle().await {
+        add_error_message(chat, &format!("Could not import session: {error}"));
         return;
     }
-    let dest = dir.join(fname);
-    match std::fs::copy(src, &dest) {
-        Ok(_) => {
-            let id = fname.strip_suffix(".jsonl").unwrap_or(fname).to_string();
-            if switch_to_session(harness, lane, &id, cwd, chat, state, tool_context).await {
-                add_note_message(chat, &format!("Imported session from {path}"));
-            }
+    let result =
+        crate::session::import_session_file(src, &cwd.to_string_lossy(), &state.session_dir).await;
+    let new_session = match result {
+        Ok(session) => session,
+        Err(error) => {
+            state.set_status(RunStatus::Idle);
+            add_error_message(chat, &format!("Could not import session: {error}"));
+            return;
         }
-        Err(e) => add_error_message(chat, &format!("Could not copy import: {e}")),
+    };
+    if let Err(error) =
+        crate::session::set_active_session(harness, new_session, Some(tool_context)).await
+    {
+        state.set_status(RunStatus::Idle);
+        add_error_message(chat, &format!("Could not import session: {error}"));
+        return;
     }
+    chat.clear();
+    add_welcome_message(chat);
+    render_session_history(
+        harness,
+        chat,
+        state.markdown_transformer(),
+        Some(state.extension_session.clone()),
+        state.images_visible(),
+    )
+    .await;
+    state.set_status(RunStatus::Idle);
+    add_note_message(chat, &format!("Imported session from {path}"));
 }
 
 pub(super) async fn fork_session(
@@ -202,56 +223,33 @@ pub(super) async fn fork_session(
     state: &Arc<TuiState>,
     tool_context: &rpi_extensions::ToolCallContext,
 ) {
-    use rpi_harness::session::jsonl::{JsonlSessionRepo, JsonlSessionRepoOptions};
-    use rpi_tools::FileSystem;
-
-    let cwd_str = cwd.to_string_lossy().to_string();
-    let dir = crate::session::default_session_dir(cwd);
-    let env = Arc::new(rpi_tools::OsExecutionEnv::with_cwd(cwd.to_path_buf()));
-    let fs: Arc<dyn FileSystem> = env.clone();
-    let repo = JsonlSessionRepo::with_env_cwd(JsonlSessionRepoOptions {
-        fs,
-        sessions_root: dir.to_string_lossy().into_owned(),
-        clock: Arc::new(rpi_harness::session::memory::SystemClock),
-        ids: Arc::new(rpi_harness::session::session::DefaultIdGenerator::new()),
-    });
-    // The fork needs the rich JSONL metadata (with the on-disk path); resolve
-    // it from the session list by the current session's id.
-    let id = harness.session().storage().metadata().id.clone();
-    let metas = match crate::session::list_session_metadata(&cwd_str).await {
-        Ok(m) => m,
-        Err(e) => {
-            add_error_message(chat, &format!("Could not list sessions: {e}"));
-            return;
-        }
-    };
-    let Some(source) = metas.iter().find(|m| m.id == id) else {
-        add_error_message(chat, &format!("Current session {id} not found on disk."));
+    let lane = harness.lane("main");
+    if *state.status.lock().unwrap() == RunStatus::Working {
+        state.set_status(RunStatus::Aborting);
+        let _ = lane.abort().await;
+    }
+    if let Err(error) = lane.wait_for_idle().await {
+        add_error_message(chat, &format!("Could not fork session: {error}"));
         return;
-    };
-    let fork_storage = match repo
-        .fork_typed(
-            source,
-            &rpi_harness::session::jsonl::JsonlSessionCreateOptions {
-                id: None,
-                parent_session_id: Some(source.id.clone()),
-                cwd: cwd_str.clone(),
-                metadata: None,
-            },
-            &rpi_harness::session::types::ForkOptions::default(),
-        )
-        .await
+    }
+    let new_session = match crate::session::fork_session_storage(
+        harness,
+        &cwd.to_string_lossy(),
+        &state.session_dir,
+    )
+    .await
     {
-        Ok(s) => s,
-        Err(e) => {
-            add_error_message(chat, &format!("Could not fork session: {e}"));
+        Ok(session) => session,
+        Err(error) => {
+            state.set_status(RunStatus::Idle);
+            add_error_message(chat, &format!("Could not fork session: {error}"));
             return;
         }
     };
-    let new_session = rpi_harness::session::session::Session::new(Arc::new(fork_storage), None);
     if let Err(error) =
         crate::session::set_active_session(harness, new_session, Some(tool_context)).await
     {
+        state.set_status(RunStatus::Idle);
         add_error_message(chat, &format!("Could not fork session: {error}"));
         return;
     }
@@ -392,7 +390,7 @@ pub(super) async fn render_session_history(
                             continue;
                         }
                     }
-                    add_note_message(chat, &custom_message_fallback(&custom));
+                    add_note_message(chat, &custom_message_fallback(custom));
                     rendered_any = true;
                 }
             },
@@ -489,12 +487,12 @@ pub(super) fn invoke_extension_renderer(
                     Some(renderer.plugin_free_string),
                 )
             };
-            let text = if rc == 0 {
+
+            if rc == 0 {
                 Some(out.to_string_lossy())
             } else {
                 None
-            };
-            text
+            }
         }))
         .ok()
         .flatten();

@@ -303,7 +303,6 @@ impl SlashCommand for SessionCommand {
             &ctx.editor_container,
             &ctx.editor,
             &ctx.tui,
-            &ctx.cwd,
             &ctx.tx,
         );
     }

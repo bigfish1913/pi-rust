@@ -340,22 +340,22 @@ pub enum CornerStyle {
     Sharp,
 }
 
-/// Global theme manager.
+/// A theme palette and its cache revision.
 pub struct ThemeManager {
     current: Mutex<Theme>,
+    revision: std::sync::atomic::AtomicU64,
 }
 
-/// Monotonic revision bumped on every theme mutation.
+/// Current process-wide theme revision, bumped on every global theme mutation.
 ///
 /// Components that memoize rendered output (which bakes in theme colors) key
 /// their cache on this value, so a live theme switch invalidates them without
 /// every host having to walk the tree and call `invalidate` (upstream's
 /// `theme-controller.ts` does both: swap the palette and `ui.invalidate()`).
-static THEME_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// Current theme revision. Cache the value at build time and compare on render.
 pub fn theme_revision() -> u64 {
-    THEME_REVISION.load(std::sync::atomic::Ordering::Acquire)
+    global_theme_manager()
+        .revision
+        .load(std::sync::atomic::Ordering::Acquire)
 }
 
 impl ThemeManager {
@@ -363,6 +363,7 @@ impl ThemeManager {
     pub fn new() -> Self {
         Self {
             current: Mutex::new(Theme::default()),
+            revision: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -375,8 +376,9 @@ impl ThemeManager {
     pub fn set(&self, theme: Theme) {
         if let Ok(mut current) = self.current.lock() {
             *current = theme;
+            self.revision
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         }
-        THEME_REVISION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// Apply a preset theme to this manager.
@@ -545,9 +547,15 @@ mod tests {
 
     #[test]
     fn test_theme_manager() {
+        let global_revision = theme_revision();
         let manager = ThemeManager::new();
         manager.apply_preset(ThemePreset::Dark);
         let theme = manager.get();
         assert!(matches!(theme.colors.accent, Color::Ansi256(108)));
+        assert_eq!(
+            manager.revision.load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+        assert_eq!(theme_revision(), global_revision);
     }
 }

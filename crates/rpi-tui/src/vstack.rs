@@ -480,7 +480,7 @@ where
     // Return component and size pairs
     children
         .iter()
-        .zip(sizes.into_iter())
+        .zip(sizes)
         .map(|(entry, size)| (entry.component.clone(), size))
         .collect()
 }

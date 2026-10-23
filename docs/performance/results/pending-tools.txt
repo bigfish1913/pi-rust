@@ -1,0 +1,155 @@
+trial=1
+
+running 1 test
+test tool::wake::tests::pending_population_benchmark ... tool_pending mode=candidate_legacy population=1 startup_ms=2.377 elapsed_ms=104.406 polls=95 blocking_current_pending=1 blocking_peak=1 blocking_after_cancel=0 cancel_ms=0.691
+tool_pending mode=wake population=1 startup_ms=2.402 elapsed_ms=103.935 polls=1 blocking_current_pending=0 blocking_peak=1 blocking_after_cancel=0 cancel_ms=0.199
+tool_pending mode=candidate_legacy population=64 startup_ms=6.822 elapsed_ms=108.017 polls=6332 blocking_current_pending=64 blocking_peak=64 blocking_after_cancel=0 cancel_ms=1.119
+tool_pending mode=wake population=64 startup_ms=2.770 elapsed_ms=103.796 polls=64 blocking_current_pending=0 blocking_peak=4 blocking_after_cancel=0 cancel_ms=0.693
+tool_pending mode=candidate_legacy population=256 startup_ms=15.071 elapsed_ms=117.483 polls=26615 blocking_current_pending=256 blocking_peak=256 blocking_after_cancel=0 cancel_ms=1.272
+tool_pending mode=wake population=256 startup_ms=14.013 elapsed_ms=117.942 polls=256 blocking_current_pending=0 blocking_peak=12 blocking_after_cancel=0 cancel_ms=2.635
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 145 filtered out; finished in 0.68s
+
+
+trial=2
+
+running 1 test
+test tool::wake::tests::pending_population_benchmark ... tool_pending mode=candidate_legacy population=1 startup_ms=2.272 elapsed_ms=104.349 polls=95 blocking_current_pending=1 blocking_peak=1 blocking_after_cancel=0 cancel_ms=0.805
+tool_pending mode=wake population=1 startup_ms=2.544 elapsed_ms=104.083 polls=1 blocking_current_pending=0 blocking_peak=1 blocking_after_cancel=0 cancel_ms=0.198
+tool_pending mode=candidate_legacy population=64 startup_ms=6.743 elapsed_ms=109.131 polls=6398 blocking_current_pending=64 blocking_peak=64 blocking_after_cancel=0 cancel_ms=1.123
+tool_pending mode=wake population=64 startup_ms=4.877 elapsed_ms=105.976 polls=64 blocking_current_pending=0 blocking_peak=4 blocking_after_cancel=0 cancel_ms=0.772
+tool_pending mode=candidate_legacy population=256 startup_ms=16.699 elapsed_ms=119.148 polls=26844 blocking_current_pending=256 blocking_peak=256 blocking_after_cancel=0 cancel_ms=1.299
+tool_pending mode=wake population=256 startup_ms=4.504 elapsed_ms=117.163 polls=256 blocking_current_pending=0 blocking_peak=13 blocking_after_cancel=0 cancel_ms=11.329
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 145 filtered out; finished in 0.68s
+
+
+trial=3
+
+running 1 test
+test tool::wake::tests::pending_population_benchmark ... tool_pending mode=candidate_legacy population=1 startup_ms=2.172 elapsed_ms=104.467 polls=96 blocking_current_pending=1 blocking_peak=1 blocking_after_cancel=0 cancel_ms=0.985
+tool_pending mode=wake population=1 startup_ms=2.458 elapsed_ms=103.954 polls=1 blocking_current_pending=0 blocking_peak=1 blocking_after_cancel=0 cancel_ms=0.161
+tool_pending mode=candidate_legacy population=64 startup_ms=6.828 elapsed_ms=108.122 polls=6333 blocking_current_pending=64 blocking_peak=64 blocking_after_cancel=0 cancel_ms=1.151
+tool_pending mode=wake population=64 startup_ms=2.669 elapsed_ms=106.775 polls=64 blocking_current_pending=0 blocking_peak=7 blocking_after_cancel=0 cancel_ms=2.833
+tool_pending mode=candidate_legacy population=256 startup_ms=16.068 elapsed_ms=118.484 polls=26772 blocking_current_pending=256 blocking_peak=256 blocking_after_cancel=0 cancel_ms=1.291
+tool_pending mode=wake population=256 startup_ms=9.465 elapsed_ms=113.654 polls=256 blocking_current_pending=0 blocking_peak=5 blocking_after_cancel=0 cancel_ms=2.897
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 145 filtered out; finished in 0.68s
+
+
+timed_trial=1
+
+running 1 test
+test tool::wake::tests::pending_population_benchmark ... tool_pending mode=candidate_legacy population=1 startup_ms=2.113 elapsed_ms=104.093 polls=97 blocking_current_pending=1 blocking_peak=1 blocking_after_cancel=0 cancel_ms=0.740
+tool_pending mode=wake population=1 startup_ms=2.282 elapsed_ms=103.689 polls=1 blocking_current_pending=0 blocking_peak=1 blocking_after_cancel=0 cancel_ms=0.168
+tool_pending mode=candidate_legacy population=64 startup_ms=6.246 elapsed_ms=108.603 polls=6394 blocking_current_pending=64 blocking_peak=64 blocking_after_cancel=0 cancel_ms=1.181
+tool_pending mode=wake population=64 startup_ms=2.518 elapsed_ms=107.581 polls=64 blocking_current_pending=0 blocking_peak=8 blocking_after_cancel=0 cancel_ms=3.766
+tool_pending mode=candidate_legacy population=256 startup_ms=15.266 elapsed_ms=117.711 polls=26681 blocking_current_pending=256 blocking_peak=256 blocking_after_cancel=0 cancel_ms=1.293
+tool_pending mode=wake population=256 startup_ms=11.504 elapsed_ms=115.628 polls=256 blocking_current_pending=0 blocking_peak=6 blocking_after_cancel=0 cancel_ms=2.838
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 145 filtered out; finished in 0.68s
+
+
+	Command being timed: "target/release/deps/rpi_extensions-4c8931dacbf45b7e pending_population_benchmark --ignored --nocapture --test-threads=1"
+	User time (seconds): 0.10
+	System time (seconds): 0.27
+	Percent of CPU this job got: 55%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:00.68
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 10296
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 2805
+	Voluntary context switches: 39564
+	Involuntary context switches: 31
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 0
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+
+timed_trial=2
+
+running 1 test
+test tool::wake::tests::pending_population_benchmark ... tool_pending mode=candidate_legacy population=1 startup_ms=2.259 elapsed_ms=104.500 polls=96 blocking_current_pending=1 blocking_peak=1 blocking_after_cancel=0 cancel_ms=0.927
+tool_pending mode=wake population=1 startup_ms=2.367 elapsed_ms=103.865 polls=1 blocking_current_pending=0 blocking_peak=1 blocking_after_cancel=0 cancel_ms=0.208
+tool_pending mode=candidate_legacy population=64 startup_ms=6.429 elapsed_ms=108.733 polls=6401 blocking_current_pending=64 blocking_peak=64 blocking_after_cancel=0 cancel_ms=1.117
+tool_pending mode=wake population=64 startup_ms=6.765 elapsed_ms=109.048 polls=64 blocking_current_pending=0 blocking_peak=4 blocking_after_cancel=0 cancel_ms=1.023
+tool_pending mode=candidate_legacy population=256 startup_ms=22.077 elapsed_ms=124.808 polls=26199 blocking_current_pending=256 blocking_peak=256 blocking_after_cancel=0 cancel_ms=1.545
+tool_pending mode=wake population=256 startup_ms=11.450 elapsed_ms=128.057 polls=256 blocking_current_pending=0 blocking_peak=5 blocking_after_cancel=0 cancel_ms=12.166
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 145 filtered out; finished in 0.71s
+
+
+	Command being timed: "target/release/deps/rpi_extensions-4c8931dacbf45b7e pending_population_benchmark --ignored --nocapture --test-threads=1"
+	User time (seconds): 0.13
+	System time (seconds): 0.28
+	Percent of CPU this job got: 58%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:00.71
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 9168
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 2593
+	Voluntary context switches: 38489
+	Involuntary context switches: 368
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 0
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+
+timed_trial=3
+
+running 1 test
+test tool::wake::tests::pending_population_benchmark ... tool_pending mode=candidate_legacy population=1 startup_ms=3.851 elapsed_ms=105.814 polls=98 blocking_current_pending=1 blocking_peak=1 blocking_after_cancel=0 cancel_ms=0.762
+tool_pending mode=wake population=1 startup_ms=6.750 elapsed_ms=108.552 polls=1 blocking_current_pending=0 blocking_peak=1 blocking_after_cancel=0 cancel_ms=0.611
+tool_pending mode=candidate_legacy population=64 startup_ms=19.449 elapsed_ms=121.518 polls=6068 blocking_current_pending=64 blocking_peak=64 blocking_after_cancel=0 cancel_ms=1.229
+tool_pending mode=wake population=64 startup_ms=5.923 elapsed_ms=111.438 polls=64 blocking_current_pending=0 blocking_peak=4 blocking_after_cancel=0 cancel_ms=3.531
+tool_pending mode=candidate_legacy population=256 startup_ms=39.277 elapsed_ms=143.001 polls=27437 blocking_current_pending=256 blocking_peak=256 blocking_after_cancel=0 cancel_ms=2.513
+tool_pending mode=wake population=256 startup_ms=16.474 elapsed_ms=126.204 polls=256 blocking_current_pending=0 blocking_peak=15 blocking_after_cancel=0 cancel_ms=8.514
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 145 filtered out; finished in 0.76s
+
+
+	Command being timed: "target/release/deps/rpi_extensions-4c8931dacbf45b7e pending_population_benchmark --ignored --nocapture --test-threads=1"
+	User time (seconds): 0.10
+	System time (seconds): 0.26
+	Percent of CPU this job got: 47%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:00.77
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 8840
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 2421
+	Voluntary context switches: 38525
+	Involuntary context switches: 677
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 0
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

@@ -1164,10 +1164,13 @@ async fn run_stream(
         model.id.clone(),
         now_ms(),
     );
-    let mut headers = model.headers.clone().unwrap_or_default();
-    if let Some(extra) = &opts.headers {
+    let mut headers = std::collections::BTreeMap::new();
+    for extra in [model.headers.as_ref(), opts.headers.as_ref()]
+        .into_iter()
+        .flatten()
+    {
         for (k, v) in extra {
-            headers.insert(k.clone(), v.clone());
+            crate::provider::set_http_header(&mut headers, k, Some(v));
         }
     }
     let key = resolve_api_key(&provider_key, opts, allow_env_api_key);
@@ -1195,7 +1198,8 @@ async fn run_stream(
             return;
         }
     };
-    let mut events = SseEventStream::new(response, opts.signal.clone());
+    let mut events = SseEventStream::new(response, opts.signal.clone())
+        .with_idle_timeout(opts.stream_idle_timeout());
     let mut state =
         ResponsesStreamState::with_tools(&ctx.tools, supports_openai_grammar_tools(model));
     // The stream contract exposes a pending assistant message immediately after

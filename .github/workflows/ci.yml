@@ -114,6 +114,21 @@ jobs:
           python3 scripts/test_release_automation.py
           python3 scripts/test_release_channels.py
 
+  windows-plugin-lifecycle:
+    name: Windows plugin ABI and DLL lifecycle
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Negotiate old and new ABI tables
+        run: cargo test -p rpi-plugin-sdk --features provider --locked
+      - name: Check DLL shutdown and tool ownership
+        run: cargo test -p rpi-extensions --lib --features rpi-ai/providers --locked
+
   release:
     name: Release automation
     if: github.repository == 'bigfish1913/pi-rust' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')

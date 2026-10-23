@@ -1019,7 +1019,7 @@ pub async fn interactive_tui(
             .or(saved_settings.collapse_changelog)
             .unwrap_or(false);
     maybe_add_startup_changelog(
-        &harness,
+        harness,
         &chat_container,
         &saved_settings,
         collapse_changelog,
@@ -1043,7 +1043,7 @@ pub async fn interactive_tui(
     // conversation history. This fixes stale prompts appearing every startup.
     if launch_restores_history(args) {
         render_session_history(
-            &harness,
+            harness,
             &chat_container,
             initial_transformer.clone(),
             Some(reload_context.extension_session.clone()),
@@ -1191,6 +1191,7 @@ pub async fn interactive_tui(
         .get_as::<bool>("display.tool_outputs_expanded")
         .unwrap_or(false);
     let state = Arc::new(TuiState {
+        session_dir: reload_context.session_dir(),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -2395,7 +2396,9 @@ pub async fn interactive_tui(
                         state
                             .footer
                             .set_thinking_level(Some(thinking_level_name(next)));
-                        state.tui.as_ref().map(|tui| tui.request_render(false));
+                        if let Some(tui) = state.tui.as_ref() {
+                            tui.request_render(false)
+                        }
                     }
                 });
                 continue;
@@ -2431,17 +2434,14 @@ pub async fn interactive_tui(
                     tui_for_key.request_render(false);
                     continue;
                 }
-                match read_clipboard_image() {
-                    Ok(Some(image)) => {
-                        state_for_key.queue_image(image);
-                        add_note_message(
-                            &state_for_key.chat_container,
-                            "Clipboard image attached to the next prompt.",
-                        );
-                        tui_for_key.request_render(false);
-                        continue;
-                    }
-                    Ok(None) | Err(_) => {}
+                if let Ok(Some(image)) = read_clipboard_image() {
+                    state_for_key.queue_image(image);
+                    add_note_message(
+                        &state_for_key.chat_container,
+                        "Clipboard image attached to the next prompt.",
+                    );
+                    tui_for_key.request_render(false);
+                    continue;
                 }
                 // Local Ctrl+V can paste clipboard text as Pi does. Under SSH,
                 // text must arrive from the client via bracketed paste rather
@@ -2927,7 +2927,7 @@ pub async fn interactive_tui(
                     tui.request_render(false);
                 } else {
                     open_tree_selector(
-                        &harness,
+                        harness,
                         &state,
                         &editor_container,
                         &editor,
@@ -2945,7 +2945,7 @@ pub async fn interactive_tui(
                             chat_container.clear();
                             add_welcome_message(&chat_container);
                             render_session_history(
-                                &harness,
+                                harness,
                                 &chat_container,
                                 state.markdown_transformer(),
                                 Some(state.extension_session.clone()),
@@ -2990,7 +2990,7 @@ pub async fn interactive_tui(
             }
             Some(TuiMessage::SwitchSession(id)) => {
                 switch_to_session(
-                    &harness,
+                    harness,
                     &lane,
                     &id,
                     &cwd,
@@ -3003,7 +3003,7 @@ pub async fn interactive_tui(
             }
             Some(TuiMessage::ImportSession(path)) => {
                 import_session(
-                    &harness,
+                    harness,
                     &lane,
                     &path,
                     &cwd,
@@ -3015,7 +3015,7 @@ pub async fn interactive_tui(
                 tui.request_render(false);
             }
             Some(TuiMessage::ShareSession) => {
-                share_session(&harness, &chat_container).await;
+                share_session(harness, &chat_container).await;
                 tui.request_render(false);
             }
             Some(TuiMessage::SetSessionName(name)) => {
@@ -3115,7 +3115,7 @@ pub async fn interactive_tui(
             }
             Some(TuiMessage::ForkSession) => {
                 fork_session(
-                    &harness,
+                    harness,
                     &cwd,
                     &chat_container,
                     &state,
@@ -3280,7 +3280,7 @@ pub async fn interactive_tui(
                 add_note_message(&chat_container, "Reloading extensions + resources…");
                 tui.request_render(false);
                 let outcome =
-                    crate::session::reload_extension_resources(&harness, &reload_ctx).await;
+                    crate::session::reload_extension_resources(harness, &reload_ctx).await;
                 if !outcome.had_errors {
                     if let Ok(resources) = harness.get_resources().await {
                         update_resource_listing(
@@ -3353,7 +3353,7 @@ pub async fn interactive_tui(
     // a terminal that scrolled away can be recovered. Mirrors
     // `formatResumeCommand` (id + `--session-dir` only when non-default).
     let session_id = harness.session().storage().metadata().id;
-    if let Some(command) = format_resume_command(&session_id, &cwd, args.session_dir.as_deref()) {
+    if let Some(command) = format_resume_command(&session_id, &cwd, Some(&state.session_dir)) {
         println!("\x1b[2mTo resume this session:\x1b[0m {command}");
     }
     println!("\nGoodbye!");

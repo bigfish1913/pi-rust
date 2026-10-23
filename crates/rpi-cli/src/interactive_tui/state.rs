@@ -155,6 +155,8 @@ pub(super) fn auto_send_step(
 }
 
 pub(super) struct TuiState {
+    /// The root selected at startup, retained across session switches/reloads.
+    pub(super) session_dir: std::path::PathBuf,
     /// The in-flight streaming assistant message (cleared on finalize).
     /// `Arc`-shared with the [`TranscriptView`] the event drain renders through,
     /// so the render-tick / reload / toggle paths keep direct access.

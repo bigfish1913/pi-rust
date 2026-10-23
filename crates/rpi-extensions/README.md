@@ -33,7 +33,12 @@ harness consumes its adapters through injection.
 - **Tool bridge.** `PluginToolAdapter` implements the agent's `AgentTool` trait
   on top of a plugin's four-function lifecycle (`execute` → `poll` → `cancel` →
   `destroy`). The blocking `poll` loop runs on `spawn_blocking` inside the
-  ambient runtime — the adapter does not own a runtime of its own.
+  ambient runtime — the adapter does not own a runtime of its own. Tools registered
+  with `register_tool_with_wake` use short, serialized blocking calls and sleep
+  asynchronously on `Pending`, without retaining an idle blocking worker. Wakes
+  during callback installation or poll are retained. Cancellation or caller drop
+  cancels, unregisters the callback and destroys the handle exactly once, while
+  retaining the library and invocation context through cleanup.
 - **Partial results.** Tool progress flows back through an unbounded channel and
   is forwarded to `on_update`, behind a `catch_unwind` trampoline so a panicking
   callback cannot unwind across the FFI boundary.
@@ -82,3 +87,17 @@ rpi dev                                   # build + watch + live reload
 
 MIT. See [LICENSE](https://github.com/bigfish1913/pi-rust/blob/main/LICENSE)
 and [NOTICE](https://github.com/bigfish1913/pi-rust/blob/main/NOTICE).
+
+Plugins may register the optional two-phase lifecycle hooks. Reload calls
+`begin_shutdown` outside session locks to cancel work and reject new requests.
+The last FFI/string-free keepalive schedules `finish_shutdown` on a blocking
+cleanup thread before unloading the library. A failed finish permanently
+retains the DLL and callback context and emits a diagnostic; cleanup has no
+unload timeout. The same ownership path handles partial registration failure
+and ordinary session teardown.
+
+This changes the published Rust `LoadedPlugin` layout: `library` is now a
+`ManuallyDrop<Library>`, and private ownership fields prevent external struct
+literals or field moves. Use `load_one` and retain the returned owner until all
+plugin calls finish. This source API change needs a breaking release; compiled
+plugins keep their existing ABI compatibility.

@@ -121,6 +121,8 @@ pub struct AgentLoopConfig {
     pub thinking_level: ThinkingLevel,
     pub api_key: Option<String>,
     pub timeout: Option<Duration>,
+    /// Maximum silence between streamed response bytes; zero disables it.
+    pub stream_idle_timeout: Option<Duration>,
     pub max_retries: Option<u32>,
     pub max_retry_delay: Option<Duration>,
     pub cache_retention: CacheRetention,
@@ -167,6 +169,7 @@ impl AgentLoopConfig {
         let mut opts = SimpleStreamOptions {
             api_key,
             timeout: self.timeout,
+            stream_idle_timeout: self.stream_idle_timeout,
             max_retries: self.max_retries,
             max_retry_delay: self.max_retry_delay,
             headers: None,

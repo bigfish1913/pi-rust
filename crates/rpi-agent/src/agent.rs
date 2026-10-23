@@ -533,6 +533,7 @@ impl Agent {
             thinking_level: state.thinking_level,
             api_key: None,
             timeout: None,
+            stream_idle_timeout: None,
             max_retries: None,
             max_retry_delay: None,
             cache_retention: rpi_ai::provider::CacheRetention::default(),

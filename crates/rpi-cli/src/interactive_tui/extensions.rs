@@ -62,12 +62,12 @@ pub(super) fn invoke_extension_command(
                 Some(rpi_extensions::host_free_string),
             )
         };
-        let text = if rc == 0 {
+
+        if rc == 0 {
             Some(out.to_string_lossy())
         } else {
             None
-        };
-        text
+        }
     }))
     .ok()
     .flatten()?;

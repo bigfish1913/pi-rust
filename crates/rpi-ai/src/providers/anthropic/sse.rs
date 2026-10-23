@@ -44,6 +44,7 @@ pub struct ServerSentEvent {
 /// Accumulator state for the line-buffered decoder. Mirrors `SseDecoderState`.
 #[derive(Debug, Default)]
 pub struct SseDecoderState {
+    started: bool,
     event: Option<String>,
     data: Vec<String>,
     raw: Vec<String>,
@@ -57,6 +58,13 @@ impl SseDecoderState {
     /// Process one complete line. Returns `Some(event)` when the line is empty
     /// (the flush trigger) and a pending event exists. Mirrors `decodeSseLine`.
     pub fn decode_line(&mut self, line: &str) -> Option<ServerSentEvent> {
+        // SSE's UTF-8 decoding strips exactly one leading BOM. Complete lines
+        // reach this decoder only after fragmented code points are reassembled.
+        let line = if std::mem::replace(&mut self.started, true) {
+            line
+        } else {
+            line.strip_prefix('\u{feff}').unwrap_or(line)
+        };
         if line.is_empty() {
             return self.flush();
         }
@@ -120,15 +128,10 @@ fn next_line_break_index(text: &str) -> Option<usize> {
 }
 
 /// Split the first complete line off `text`, consuming a trailing `\r\n` or
-/// single `\r`/`\n`. A `\r` at the end of a body chunk is ambiguous: it may be
-/// the first half of `\r\n`, so it stays buffered until the next chunk unless
-/// `allow_trailing_cr` is set for EOF processing. Mirrors `consumeLine` while
-/// preserving line boundaries across HTTP chunks.
-fn consume_line(text: &str, allow_trailing_cr: bool) -> Option<(&str, &str)> {
+/// single `\r`/`\n`. A trailing `\r` completes a line immediately; the stream
+/// suppresses a possible leading `\n` in the next HTTP chunk.
+fn consume_line(text: &str) -> Option<(&str, &str)> {
     let idx = next_line_break_index(text)?;
-    if !allow_trailing_cr && idx + 1 == text.len() && text.as_bytes().get(idx) == Some(&b'\r') {
-        return None;
-    }
     let mut next = idx + 1;
     if text.as_bytes().get(idx) == Some(&b'\r') && text.as_bytes().get(next) == Some(&b'\n') {
         next += 1;
@@ -192,7 +195,10 @@ pub struct SseEventStream {
     state: SseDecoderState,
     buffer: String,
     utf8_buffer: Vec<u8>,
+    skip_lf: bool,
     signal: CancellationToken,
+    idle_timeout: Option<std::time::Duration>,
+    last_bytes_at: tokio::time::Instant,
     done: bool,
 }
 
@@ -203,22 +209,48 @@ impl SseEventStream {
             state: SseDecoderState::new(),
             buffer: String::new(),
             utf8_buffer: Vec::new(),
+            skip_lf: false,
             signal,
+            idle_timeout: Some(crate::provider::DEFAULT_STREAM_IDLE_TIMEOUT),
+            last_bytes_at: tokio::time::Instant::now(),
             done: false,
         }
+    }
+
+    /// Set the maximum silence between body chunks. `None` or zero disables
+    /// the watchdog. SSE comments and partial frames count as activity.
+    pub fn with_idle_timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
+        self.idle_timeout = timeout.filter(|value| !value.is_zero());
+        self
     }
 
     /// Pull the next SSE event, or `Ok(None)` when the body is exhausted (after
     /// the trailing flush). Mirrors one iteration of `iterateSseMessages`.
     pub async fn next_event(&mut self) -> Result<Option<ServerSentEvent>, AiError> {
         loop {
+            // One body chunk may contain several complete events. Cancellation
+            // must win before dispatching buffered events as well as body reads.
+            if self.signal.is_cancelled() {
+                return Err(AiError::Abort {
+                    message: "Request was aborted".to_string(),
+                });
+            }
             // Try to flush a complete event from already-buffered lines first.
             // Take ownership of the buffer so we can mutate `self` while
             // dispatching on the borrowed slice (mirrors the TS string cursor).
             let buffer = std::mem::take(&mut self.buffer);
             let mut leftover = buffer;
             let mut produced = None;
-            while let Some((line, rest)) = consume_line(&leftover, self.done) {
+            while !leftover.is_empty() {
+                // A CR already terminated the previous line, even when it was
+                // the last byte received. Swallow only its optional LF partner.
+                if std::mem::take(&mut self.skip_lf) && leftover.starts_with('\n') {
+                    leftover.remove(0);
+                }
+                let Some((line, rest)) = consume_line(&leftover) else {
+                    break;
+                };
+                self.skip_lf = rest.is_empty() && leftover.ends_with('\r');
                 let line_owned = line.to_string();
                 leftover = rest.to_string();
                 if let Some(event) = self.state.decode_line(&line_owned) {
@@ -263,6 +295,17 @@ impl SseEventStream {
                     });
                 }
                 next = self.bytes_stream.next() => next,
+                _ = async {
+                    match self.idle_timeout.and_then(|timeout| self.last_bytes_at.checked_add(timeout)) {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    return Err(AiError::Http {
+                        status: Some(408),
+                        message: "stream idle timeout: no response bytes received; retry the request or increase --stream-idle-timeout".into(),
+                    });
+                }
             };
 
             match next {
@@ -299,6 +342,9 @@ impl SseEventStream {
                     });
                 }
                 Some(Ok(chunk)) => {
+                    if !chunk.is_empty() {
+                        self.last_bytes_at = tokio::time::Instant::now();
+                    }
                     append_utf8_chunk(&mut self.buffer, &mut self.utf8_buffer, &chunk);
                 }
             }
@@ -433,6 +479,180 @@ pub async fn iterate_anthropic_events(
 mod tests {
     use super::*;
 
+    fn idle_test_stream() -> (tokio::sync::mpsc::Sender<Bytes>, SseEventStream) {
+        let (sender, receiver) = tokio::sync::mpsc::channel::<Bytes>(8);
+        let chunks = futures::stream::unfold(receiver, |mut receiver| async move {
+            receiver.recv().await.map(|chunk| (Ok(chunk), receiver))
+        })
+        .boxed();
+        let stream = SseEventStream {
+            bytes_stream: chunks,
+            state: SseDecoderState::new(),
+            buffer: String::new(),
+            utf8_buffer: Vec::new(),
+            skip_lf: false,
+            signal: CancellationToken::new(),
+            idle_timeout: Some(std::time::Duration::from_secs(5)),
+            last_bytes_at: tokio::time::Instant::now(),
+            done: false,
+        };
+        (sender, stream)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn leading_bom_does_not_drop_the_first_event_when_split_across_chunks() {
+        for split in 0..=3 {
+            let (sender, mut stream) = idle_test_stream();
+            let bom = b"\xef\xbb\xbf";
+            sender
+                .send(Bytes::copy_from_slice(&bom[..split]))
+                .await
+                .unwrap();
+            sender
+                .send(Bytes::copy_from_slice(&bom[split..]))
+                .await
+                .unwrap();
+            sender
+                .send(Bytes::from_static(b"data: first\n\ndata: second\n\n"))
+                .await
+                .unwrap();
+            drop(sender);
+            assert_eq!(
+                stream.next_event().await.unwrap().unwrap().data,
+                "first",
+                "split={split}"
+            );
+            assert_eq!(stream.next_event().await.unwrap().unwrap().data, "second");
+            assert!(stream.next_event().await.unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn only_one_bom_at_the_start_of_the_stream_is_stripped() {
+        let events = decode_all("\u{feff}event: message\ndata: \u{feff}payload\n\n\u{feff}data: ignored\n\ndata: later\n\n");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event.as_deref(), Some("message"));
+        assert_eq!(events[0].data, "\u{feff}payload");
+        assert_eq!(events[1].data, "later");
+        for prefix in ["\n", ": comment\n", "\u{feff}"] {
+            assert!(decode_all(&format!("{prefix}\u{feff}data: ignored\n\n")).is_empty());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cr_delimited_frames_are_dispatched_before_more_bytes_or_eof() {
+        let (sender, mut stream) = idle_test_stream();
+        sender
+            .send(Bytes::from_static(b"data: first\r\r"))
+            .await
+            .unwrap();
+        assert_eq!(stream.next_event().await.unwrap().unwrap().data, "first");
+        sender
+            .send(Bytes::from_static(b"data: second\r\r"))
+            .await
+            .unwrap();
+        assert_eq!(stream.next_event().await.unwrap().unwrap().data, "second");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn all_line_endings_preserve_multiline_frames_when_every_byte_is_a_chunk() {
+        for ending in ["\r", "\r\n", "\n"] {
+            let (sender, mut stream) = idle_test_stream();
+            let data = format!("event: message{ending}data: one{ending}data: two{ending}{ending}data: later{ending}{ending}");
+            let writer = tokio::spawn(async move {
+                for byte in data.bytes() {
+                    sender.send(Bytes::from(vec![byte])).await.unwrap();
+                }
+            });
+            let first = stream.next_event().await.unwrap().unwrap();
+            assert_eq!(first.event.as_deref(), Some("message"));
+            assert_eq!(first.data, "one\ntwo", "ending={ending:?}");
+            assert_eq!(stream.next_event().await.unwrap().unwrap().data, "later");
+            assert!(stream.next_event().await.unwrap().is_none());
+            writer.await.unwrap();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_timeout_interrupts_a_stream_stalled_mid_response() {
+        let (sender, mut stream) = idle_test_stream();
+        sender
+            .send(Bytes::from_static(b"data: first\n\n"))
+            .await
+            .unwrap();
+        assert_eq!(stream.next_event().await.unwrap().unwrap().data, "first");
+        // A partial frame is also network activity, but cannot mask a later stall.
+        sender
+            .send(Bytes::from_static(b"data: partial"))
+            .await
+            .unwrap();
+        let start = tokio::time::Instant::now();
+        let error = stream.next_event().await.unwrap_err();
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(5));
+        assert!(error.to_string().contains("stream idle timeout"));
+        assert!(error.is_retryable());
+        assert!(!error.is_abort());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_timeout_resets_on_comments_and_partial_frames() {
+        let (sender, mut stream) = idle_test_stream();
+        let writer = tokio::spawn(async move {
+            for chunk in [": keepalive\n\n", "data: ", "still ", "working\n\n"] {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                sender.send(Bytes::from(chunk)).await.unwrap();
+            }
+        });
+        let start = tokio::time::Instant::now();
+        assert_eq!(
+            stream.next_event().await.unwrap().unwrap().data,
+            "still working"
+        );
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(12));
+        writer.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disabled_idle_timeout_allows_long_silence() {
+        let (sender, stream) = idle_test_stream();
+        let mut stream = stream.with_idle_timeout(Some(std::time::Duration::ZERO));
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            sender
+                .send(Bytes::from_static(b"data: late\n\n"))
+                .await
+                .unwrap();
+        });
+        assert_eq!(stream.next_event().await.unwrap().unwrap().data, "late");
+        writer.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_wins_over_events_already_buffered_from_the_same_chunk() {
+        let (sender, mut stream) = idle_test_stream();
+        sender
+            .send(Bytes::from_static(b"data: first\n\ndata: second\n\n"))
+            .await
+            .unwrap();
+        assert_eq!(stream.next_event().await.unwrap().unwrap().data, "first");
+        stream.signal.cancel();
+        assert!(matches!(
+            stream.next_event().await,
+            Err(AiError::Abort { .. })
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_wins_over_an_expired_idle_deadline() {
+        let (_sender, mut stream) = idle_test_stream();
+        tokio::time::advance(std::time::Duration::from_secs(10)).await;
+        stream.signal.cancel();
+        assert!(matches!(
+            stream.next_event().await,
+            Err(AiError::Abort { .. })
+        ));
+    }
+
     fn decode_all(input: &str) -> Vec<ServerSentEvent> {
         let mut state = SseDecoderState::new();
         let mut out = Vec::new();
@@ -484,12 +704,12 @@ mod tests {
     }
 
     #[test]
-    fn keeps_trailing_cr_until_the_next_chunk() {
-        assert!(consume_line("data: value\r", false).is_none());
-
-        let (line, rest) = consume_line("data: value\r\n", false).unwrap();
-        assert_eq!(line, "data: value");
-        assert!(rest.is_empty());
+    fn cr_and_crlf_both_complete_a_line_immediately() {
+        for text in ["data: value\r", "data: value\r\n"] {
+            let (line, rest) = consume_line(text).unwrap();
+            assert_eq!(line, "data: value");
+            assert!(rest.is_empty());
+        }
     }
 
     #[test]
@@ -497,7 +717,7 @@ mod tests {
         let mut state = SseDecoderState::new();
         let mut buffer = "event: message_start\rdata: {}\r".to_string();
         let mut events = Vec::new();
-        while let Some((line, rest)) = consume_line(&buffer, true) {
+        while let Some((line, rest)) = consume_line(&buffer) {
             let line = line.to_string();
             buffer = rest.to_string();
             if let Some(event) = state.decode_line(&line) {

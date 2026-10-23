@@ -9,6 +9,14 @@ root changelog, synchronizes the embedded documentation, validates the nine
 crates, and marks the PR ready. The shared workspace version and `rpi` version
 group keep the nine core crates together; examples are excluded.
 
+Automatic releases currently stay on **0.8.x**, as configured by
+`workspace.metadata.release.series` in `Cargo.toml`. After release-plz proposes
+a version, the preparation step keeps it on this series, updates the workspace
+and internal pins, and retargets the new changelog section and PR metadata. The
+publish gate rejects versions outside the series. Change this setting explicitly
+when starting 0.9.x. API compatibility findings remain visible in the Release PR;
+the numbering policy does not disable those checks.
+
 Merge that Release PR when ready to ship. After its main-branch CI passes:
 
 1. The existing release helper publishes the nine crates in dependency order.

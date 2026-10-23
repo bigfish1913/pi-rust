@@ -32,6 +32,7 @@ async fn partials_arrive_while_the_foreign_poll_is_still_running() {
         schema(),
         PluginToolHandle {
             execute_fn: consume_execute,
+            set_waker_fn: None,
             poll_fn: streaming_poll,
             cancel_fn: noop,
             destroy_fn: noop,
