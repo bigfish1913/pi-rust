@@ -11,7 +11,7 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
-## [0.9.0](https://github.com/bigfish1913/pi-rust/compare/v0.8.0...v0.9.0) - 2026-10-22
+## [0.8.1](https://github.com/bigfish1913/pi-rust/compare/v0.8.0...v0.8.1) - 2026-10-23
 
 ### Added
 
@@ -24,6 +24,7 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ### Other
 
+- *(tui)* share cached transcript rows and avoid cloning editor history while preserving draft caret positioning ([#74](https://github.com/bigfish1913/pi-rust/pull/74))
 - add RPI_CODING_AGENT_SESSION_DIR env config
 - measure idle tool workers and check Windows ownership
 - *(harness)* serialize run budget environment tests
