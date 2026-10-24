@@ -1257,6 +1257,21 @@ impl TuiState {
         self.extension_editor_open() || self.extension_input_open()
     }
 
+    /// Drop the state that belongs to the session being left behind.
+    ///
+    /// The transcript container is cleared by the caller (it also rebuilds the
+    /// welcome header). This method covers the state that lives outside that
+    /// container: the footer's accumulated usage/context badge, the `/copy`
+    /// cache, and the tool/bash component maps keyed by `tool_call_id`.
+    pub(super) fn reset_session_state(&self) {
+        self.footer.reset_session_counters();
+        *self.last_assistant_text.lock().unwrap() = String::new();
+        self.current_assistant.lock().unwrap().take();
+        self.tool_components.lock().unwrap().clear();
+        self.bash_components.lock().unwrap().clear();
+        self.pending_bash_messages.lock().unwrap().clear();
+    }
+
     pub(super) fn set_hide_thinking(&self, hide: bool) {
         *self.hide_thinking.lock().unwrap() = hide;
         if let Some(comp) = self.current_assistant.lock().unwrap().as_ref() {

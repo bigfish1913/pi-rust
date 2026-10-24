@@ -1048,6 +1048,9 @@ pub async fn interactive_tui(
             initial_transformer.clone(),
             Some(reload_context.extension_session.clone()),
             show_images,
+            // The footer is built later in this function, so there is nothing
+            // to fold replayed usage into yet.
+            None,
         )
         .await;
     }
@@ -2942,14 +2945,23 @@ pub async fn interactive_tui(
                 match lane.navigate_tree(Some(&entry_id), false, None, None).await {
                     Ok(result) => match result.outcome {
                         rpi_harness::agent_harness::NavigationOutcome::Completed { .. } => {
+                            state.reset_session_state();
                             chat_container.clear();
-                            add_welcome_message(&chat_container);
+                            let (tools, skills, context_files) =
+                                current_capabilities(harness, &lane).await;
+                            add_welcome_message_with_capabilities(
+                                &chat_container,
+                                &tools,
+                                &skills,
+                                &context_files,
+                            );
                             render_session_history(
                                 harness,
                                 &chat_container,
                                 state.markdown_transformer(),
                                 Some(state.extension_session.clone()),
                                 state.images_visible(),
+                                None,
                             )
                             .await;
                             add_note_message(
@@ -2973,8 +2985,19 @@ pub async fn interactive_tui(
                 tui.request_render(false);
             }
             Some(TuiMessage::ClearChat) => {
-                chat_container.clear();
-                add_welcome_message(&chat_container);
+                // `/new` starts a genuinely new session instead of only wiping
+                // the transcript: the harness swaps its JSONL backing, the
+                // banner is rebuilt from the real capability snapshot, and the
+                // footer counters are reset.
+                start_new_session(
+                    harness,
+                    &lane,
+                    &cwd,
+                    &chat_container,
+                    &state,
+                    &reload_context.tool_context,
+                )
+                .await;
                 tui.request_render(false);
             }
             Some(TuiMessage::Compact) => {

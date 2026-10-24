@@ -34,7 +34,7 @@ impl SlashCommand for ClearChatCommand {
         &["/new"]
     }
     fn description(&self) -> &'static str {
-        "Clear the conversation"
+        "Start a new session (the previous one stays saved)"
     }
     fn execute(&self, ctx: &CommandContext, _args: &str) {
         let _ = ctx.tx.send(TuiMessage::ClearChat);

@@ -130,13 +130,16 @@ pub(super) async fn switch_to_session(
                 return false;
             }
             chat.clear();
-            add_welcome_message(chat);
+            state.reset_session_state();
+            let (tools, skills, context_files) = current_capabilities(harness, lane).await;
+            add_welcome_message_with_capabilities(chat, &tools, &skills, &context_files);
             render_session_history(
                 harness,
                 chat,
                 state.markdown_transformer(),
                 Some(state.extension_session.clone()),
                 state.images_visible(),
+                None,
             )
             .await;
             state.set_status(RunStatus::Idle);
@@ -203,13 +206,16 @@ pub(super) async fn import_session(
         return;
     }
     chat.clear();
-    add_welcome_message(chat);
+    state.reset_session_state();
+    let (tools, skills, context_files) = current_capabilities(harness, lane).await;
+    add_welcome_message_with_capabilities(chat, &tools, &skills, &context_files);
     render_session_history(
         harness,
         chat,
         state.markdown_transformer(),
         Some(state.extension_session.clone()),
         state.images_visible(),
+        None,
     )
     .await;
     state.set_status(RunStatus::Idle);
@@ -254,17 +260,107 @@ pub(super) async fn fork_session(
         return;
     }
     chat.clear();
-    add_welcome_message(chat);
+    state.reset_session_state();
+    let (tools, skills, context_files) = current_capabilities(harness, &lane).await;
+    add_welcome_message_with_capabilities(chat, &tools, &skills, &context_files);
     render_session_history(
         harness,
         chat,
         state.markdown_transformer(),
         Some(state.extension_session.clone()),
         state.images_visible(),
+        None,
     )
     .await;
     state.set_status(RunStatus::Idle);
     add_note_message(chat, "Forked into a new session.");
+}
+
+/// `/new` (alias `/clear`): begin a fresh session.
+///
+/// Creates a new JSONL session file, swaps it onto the harness through the
+/// shared [`crate::session::set_active_session`] funnel (so plugin channels
+/// follow the swap), rebuilds the transcript with the session's REAL capability
+/// snapshot, and drops every per-session counter in the footer.
+///
+/// The session being left behind is **not** deleted: its file stays on disk and
+/// remains reachable through `/session`. Removing user data is not something
+/// `/new` should do implicitly.
+///
+/// Returns `true` when the harness now serves a new session.
+pub(super) async fn start_new_session(
+    harness: &AgentHarness,
+    lane: &Arc<dyn AgentLane>,
+    cwd: &std::path::Path,
+    chat: &Arc<Container>,
+    state: &Arc<TuiState>,
+    tool_context: &rpi_extensions::ToolCallContext,
+) -> bool {
+    if *state.status.lock().unwrap() == RunStatus::Working {
+        state.set_status(RunStatus::Aborting);
+        let _ = lane.abort().await;
+    }
+    if let Err(error) = lane.wait_for_idle().await {
+        add_error_message(chat, &format!("Could not start a new session: {error}"));
+        state.set_status(RunStatus::Idle);
+        return false;
+    }
+    let dir = &state.session_dir;
+    if let Err(error) = std::fs::create_dir_all(dir) {
+        add_error_message(
+            chat,
+            &format!(
+                "Could not create session dir {}: {error} — check write permissions",
+                dir.display()
+            ),
+        );
+        state.set_status(RunStatus::Idle);
+        return false;
+    }
+    let cwd_str = cwd.to_string_lossy().to_string();
+    let new_session = match crate::session::create_jsonl_session(dir, &cwd_str).await {
+        Ok(session) => session,
+        Err(error) => {
+            add_error_message(
+                chat,
+                &format!("Could not create session: {error} — the current session is still active"),
+            );
+            state.set_status(RunStatus::Idle);
+            return false;
+        }
+    };
+    let new_id = new_session.storage().metadata().id.clone();
+    // Route through the funnel so the plugin channels follow the swap; a bare
+    // `set_session` would leave every plugin naming the session it was serving
+    // before this call.
+    if let Err(error) =
+        crate::session::set_active_session(harness, new_session, Some(tool_context)).await
+    {
+        add_error_message(
+            chat,
+            &format!(
+                "Could not start a new session: {error} — the previous session is still active"
+            ),
+        );
+        state.set_status(RunStatus::Idle);
+        return false;
+    }
+    state.reset_session_state();
+    chat.clear();
+    let (tools, skills, context_files) = current_capabilities(harness, lane).await;
+    add_welcome_message_with_capabilities(chat, &tools, &skills, &context_files);
+    render_session_history(
+        harness,
+        chat,
+        state.markdown_transformer(),
+        Some(state.extension_session.clone()),
+        state.images_visible(),
+        None,
+    )
+    .await;
+    state.set_status(RunStatus::Idle);
+    add_note_message(chat, &format!("Started new session {new_id}."));
+    true
 }
 
 /// Render the restored session's prior transcript (user + assistant messages)
@@ -276,13 +372,21 @@ pub(super) async fn fork_session(
 /// the identity path. Each restored assistant component installs it so replayed
 /// history renders through the same `register_markdown_transformer` handlers
 /// the live stream does.
+///
+/// `footer` is the footer whose per-session counters the replayed usage belongs
+/// to. It is `None` at startup, where the footer has not been built yet.
 pub(super) async fn render_session_history(
     harness: &AgentHarness,
     chat: &Arc<Container>,
     transformer: Option<MarkdownTransformer>,
     extension_session: Option<crate::session::ExtensionSessionCell>,
     show_images: bool,
+    footer: Option<&rpi_tui::FooterComponent>,
 ) {
+    // Folding the replayed usage back into `footer` is a follow-up change; the
+    // parameter is threaded through now so that change does not have to touch
+    // every call site again.
+    let _ = footer;
     let tree = harness.session().view("main");
     let entries = match tree
         .find_entries(&EntryQuery {
