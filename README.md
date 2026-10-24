@@ -8,6 +8,7 @@
 [![CI](https://github.com/bigfish1913/pi-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/bigfish1913/pi-rust/actions/workflows/ci.yml)
 [![GitHub stars](https://img.shields.io/github/stars/bigfish1913/pi-rust?style=flat)](https://github.com/bigfish1913/pi-rust/stargazers)
 [![Latest release](https://img.shields.io/github/v/release/bigfish1913/pi-rust)](https://github.com/bigfish1913/pi-rust/releases/latest)
+[![Best of Agent Harnesses](https://img.shields.io/badge/%F0%9F%8F%86_Best_of-Agent_Harnesses-5ac4bf)](https://github.com/RyanAlberts/best-of-Agent-Harnesses)
 
 `rpi` is a library-first coding-agent runtime written in Rust, plus a terminal
 agent built on top of it. Nine composable crates span provider adapters, a
@@ -271,6 +272,10 @@ tools are as of 2026-09 and change often — check their documentation; only the
 
 If you want the most polished single-vendor experience, use the vendor's tool.
 `rpi` is for people who want to own the loop.
+
+rpi is listed in [Best of Agent Harnesses](https://github.com/RyanAlberts/best-of-Agent-Harnesses)
+under *Coding agent products*, scored **bounded** and **durable** — the durable
+score comes from the crash-resumable JSONL sessions.
 
 ## Performance
 
