@@ -11,6 +11,12 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.8.5](https://github.com/bigfish1913/pi-rust/compare/v0.8.4...v0.8.5) - 2026-10-24
+
+### Fixed
+
+- *(cli)* rebuild the banner and start a real session on /new ([#98](https://github.com/bigfish1913/pi-rust/pull/98))
+
 ## [0.8.4](https://github.com/bigfish1913/pi-rust/compare/v0.8.3...v0.8.4) - 2026-10-23
 
 ### Added
