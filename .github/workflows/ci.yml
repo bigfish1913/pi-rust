@@ -33,10 +33,39 @@ jobs:
         shell: pwsh
         run: ./scripts/tests/install.Tests.ps1
 
+  check:
+    name: Cargo check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check workspace targets without warnings
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Check all extension features and test targets
+        run: cargo check -p rpi-extensions --all-features --tests --locked
+
   test:
     name: Cargo test
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      RUSTFLAGS: "-D warnings"
+      RUSTDOCFLAGS: "-D warnings"
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -63,6 +92,20 @@ jobs:
       - name: Run workspace tests
         run: cargo test --workspace --locked
 
+      - name: Test the optional provider SDK bridge
+        run: cargo test -p rpi-plugin-sdk --features provider --locked
+
+      - name: Exercise the real plugin shared library
+        run: |
+          cargo build -p plugin-stub --locked
+          cargo test -p rpi-extensions --features provider-performance --test plugin_stub_smoke --locked
+
+      - name: Check the standalone ABI core
+        run: cargo check -p rpi-plugin-sdk --no-default-features --locked
+
+      - name: Test provider bridge reconstruction and capacity
+        run: cargo test -p rpi-extensions --features provider-performance --locked 'provider::'
+
       - name: Test prebuilt release manifests
         run: python3 scripts/test_prebuilt_release.py
 
@@ -71,13 +114,25 @@ jobs:
           python3 scripts/test_release_automation.py
           python3 scripts/test_release_channels.py
 
-      - name: Check workspace targets
-        run: cargo check --workspace --all-targets --locked
+  windows-plugin-lifecycle:
+    name: Windows plugin ABI and DLL lifecycle
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Negotiate old and new ABI tables
+        run: cargo test -p rpi-plugin-sdk --features provider --locked
+      - name: Check DLL shutdown and tool ownership
+        run: cargo test -p rpi-extensions --lib --features rpi-ai/providers --locked
 
   release:
     name: Release automation
     if: github.repository == 'bigfish1913/pi-rust' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-    needs: [test, windows-installer]
+    needs: [check, test, windows-installer]
     permissions:
       contents: write
       pull-requests: read

@@ -222,26 +222,31 @@ async fn emits_message_update_events_on_streaming_deltas() {
             );
             partial.content.push(rpi_ai::types::Content::text(""));
             let p = std::sync::Arc::new(partial.clone());
-            prod.push(AssistantMessageEvent::Start { partial: p.clone() });
+            prod.push(AssistantMessageEvent::Start { partial: p.clone() })
+                .await;
             prod.push(AssistantMessageEvent::TextStart {
                 content_index: 0,
                 partial: p.clone(),
-            });
+            })
+            .await;
             prod.push(AssistantMessageEvent::TextDelta {
                 content_index: 0,
                 delta: "Hi ".into(),
                 partial: p.clone(),
-            });
+            })
+            .await;
             prod.push(AssistantMessageEvent::TextDelta {
                 content_index: 0,
                 delta: "there!".into(),
                 partial: p.clone(),
-            });
+            })
+            .await;
             prod.push(AssistantMessageEvent::TextEnd {
                 content_index: 0,
                 content: "Hi there!".into(),
                 partial: p.clone(),
-            });
+            })
+            .await;
             let mut final_msg = (*p).clone();
             final_msg.stop_reason = StopReason::Stop;
             final_msg.content.clear();
@@ -251,7 +256,8 @@ async fn emits_message_update_events_on_streaming_deltas() {
             prod.push(AssistantMessageEvent::Done {
                 reason: DoneReason::Stop,
                 message: final_msg,
-            });
+            })
+            .await;
         });
         stream
     });
@@ -302,13 +308,15 @@ async fn message_update_forwards_the_provider_snapshot_without_copying() {
             let snapshot = Arc::new(partial.clone());
             prod.push(AssistantMessageEvent::Start {
                 partial: Arc::clone(&snapshot),
-            });
+            })
+            .await;
             for delta in ["Hi ", "there!"] {
                 prod.push(AssistantMessageEvent::TextDelta {
                     content_index: 0,
                     delta: delta.into(),
                     partial: Arc::clone(&snapshot),
-                });
+                })
+                .await;
             }
             let mut final_msg = (*snapshot).clone();
             final_msg.stop_reason = StopReason::Stop;
@@ -319,7 +327,8 @@ async fn message_update_forwards_the_provider_snapshot_without_copying() {
             prod.push(AssistantMessageEvent::Done {
                 reason: DoneReason::Stop,
                 message: final_msg,
-            });
+            })
+            .await;
         });
         stream
     });

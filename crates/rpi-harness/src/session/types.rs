@@ -1300,6 +1300,15 @@ pub trait SessionStorage: Send + Sync {
         self.metadata()
     }
 
+    /// Whether this storage never persists session data beyond the process.
+    /// Memory backends return `true`; durable backends (JSONL, SQLite) keep
+    /// the `false` default. Hosts consult this so an explicit no-persistence
+    /// choice survives session churn — e.g. a `/new` in ephemeral mode must
+    /// swap in another in-memory session, not silently write a file.
+    fn is_ephemeral(&self) -> bool {
+        false
+    }
+
     // Lanes
     async fn get_lanes(&self) -> SessionResult<Vec<LanePointer>>;
     async fn create_lane(&self, lane: &str, at: Option<&str>) -> SessionResult<()>;

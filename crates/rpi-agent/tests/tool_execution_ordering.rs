@@ -139,7 +139,8 @@ fn two_call_stream_fn(release: Arc<Notify>) -> rpi_agent::StreamFn {
                     prod.push(AssistantMessageEvent::Error {
                         reason: rpi_ai::types::ErrorReason::Error,
                         error: err,
-                    });
+                    })
+                    .await;
                     return;
                 }
             };
@@ -147,13 +148,15 @@ fn two_call_stream_fn(release: Arc<Notify>) -> rpi_agent::StreamFn {
             let partial = Arc::new(message.clone());
             prod.push(AssistantMessageEvent::Start {
                 partial: partial.clone(),
-            });
+            })
+            .await;
             let reason = match message.stop_reason {
                 StopReason::ToolUse => DoneReason::ToolUse,
                 StopReason::Stop => DoneReason::Stop,
                 _ => DoneReason::Stop,
             };
-            prod.push(AssistantMessageEvent::Done { reason, message });
+            prod.push(AssistantMessageEvent::Done { reason, message })
+                .await;
             // If this was the tool-call turn, schedule the release of `tool-1`
             // after 20ms — mirrors TS `setTimeout(() => releaseFirst?.(), 20)`.
             if is_tool_turn {

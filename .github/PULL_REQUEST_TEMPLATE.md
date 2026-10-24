@@ -40,11 +40,14 @@ the baseline; add whatever else is relevant (a new test name, a manual CLI
 transcript, a session file that now recovers).
 -->
 
-```
+```bash
 cargo fmt --all -- --check
-cargo check --workspace --all-targets --locked
-cargo test  --workspace --locked
+RUSTFLAGS="-D warnings" cargo check --workspace --all-targets --locked
+RUSTFLAGS="-D warnings" RUSTDOCFLAGS="-D warnings" cargo test --workspace --locked
 ```
+
+<!-- PowerShell: set $env:RUSTFLAGS = "-D warnings" and
+$env:RUSTDOCFLAGS = "-D warnings" before running the Cargo commands. -->
 
 ## Notes for reviewers
 
@@ -56,6 +59,7 @@ boundary described in SECURITY.md.
 
 - [ ] I kept the `rpi-telemetry → rpi-ai → rpi-agent → rpi-tools → rpi-harness → rpi-cli`
       dependency direction (no new backwards edges).
+- [ ] Compilation is warning-free (CI checks Linux and Windows with `-D warnings`).
 - [ ] New behaviour has a test that runs offline (no live provider, no network).
 - [ ] Public API additions have doc comments.
 

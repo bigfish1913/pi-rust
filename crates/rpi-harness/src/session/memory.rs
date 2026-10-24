@@ -209,6 +209,10 @@ impl SessionStorage for InMemorySessionStorage {
         self.metadata.clone()
     }
 
+    fn is_ephemeral(&self) -> bool {
+        true
+    }
+
     async fn get_lanes(&self) -> SessionResult<Vec<LanePointer>> {
         Ok(self.inner.read_state(|state| state.get_lanes()))
     }

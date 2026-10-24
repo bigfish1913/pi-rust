@@ -6,7 +6,7 @@
 //!
 //! [`load_dir`] walks a directory for `.{dll,so,dylib}` files and loads each.
 //! The returned [`LoadedPlugin`]s hold the `libloading::Library` (dropping them
-//! unloads the cdylib — keep them alive for the session lifetime).
+//! shuts down resources before unloading — keep them alive for the session lifetime).
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -54,11 +54,11 @@ pub enum PluginLoadError {
 // ---------------------------------------------------------------------------
 
 /// A successfully loaded + registered plugin. Holds the `Library` so the cdylib
-/// stays mapped for the session. Dropping this unloads the plugin (do not drop
-/// while any of its tool drivers may still be running).
+/// stays mapped for the session. Dropping this schedules final shutdown and
+/// unloading (do not drop while any of its FFI calls may still be running).
 pub struct LoadedPlugin {
-    /// The loaded cdylib. Kept alive for the session.
-    pub library: Library,
+    /// The loaded cdylib. Only final cleanup may release this handle.
+    pub library: std::mem::ManuallyDrop<Library>,
     /// Where it was loaded from (for diagnostics).
     pub path: PathBuf,
     /// ABI version (always [`RPI_PLUGIN_ABI_VERSION_UNIFIED`] for plugins
@@ -67,8 +67,65 @@ pub struct LoadedPlugin {
     /// The registry snapshot built from this plugin's registrations. The host
     /// merges snapshots from all loaded plugins into one session registry.
     pub registry: ExtensionRegistry,
-    /// Retains the plugin-scoped runtime context used by its FFI callbacks.
+    /// Retains the plugin-scoped action bridge used by its FFI callbacks.
     pub action_bridge: Option<Arc<ActionBridge>>,
+    host_api: Option<Arc<HostApi>>,
+    diagnostics: Arc<dyn PluginDiagnostics>,
+}
+
+impl LoadedPlugin {
+    /// Reject new background work and cancel existing work without waiting.
+    pub fn begin_shutdown(&self) {
+        if let Some(api) = &self.host_api {
+            api.begin_shutdown();
+        }
+    }
+}
+
+impl Drop for LoadedPlugin {
+    fn drop(&mut self) {
+        // The last keepalive has gone: all FFI calls and plugin-owned string
+        // frees have returned. Joining runtime workers must not block Tokio.
+        let library = unsafe { std::mem::ManuallyDrop::take(&mut self.library) };
+        let api = self.host_api.take();
+        let diagnostics = self.diagnostics.clone();
+        let path = self.path.clone();
+        let cleanup = move || {
+            // Drop can run under a caller's lock. Plugin callbacks run only on
+            // this cleanup thread; reload begins shutdown explicitly earlier.
+            if let Some(api) = &api {
+                api.begin_shutdown();
+            }
+            if api.as_ref().is_some_and(|api| !api.finish_shutdown()) {
+                std::mem::forget(library);
+                std::mem::forget(api);
+                diagnostics.warn(&format!(
+                    "plugin {} shutdown failed; retaining its library and callback context for process lifetime",
+                    path.display()
+                ));
+            } else {
+                drop(library);
+                drop(api);
+            }
+        };
+        // If thread creation fails, dropping a captured Library would unload
+        // live code. The shared cell lets the failure path retain everything.
+        let pending = Arc::new(std::sync::Mutex::new(Some(cleanup)));
+        let work = pending.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name("plugin-shutdown".into())
+            .spawn(move || {
+                if let Some(cleanup) = work.lock().unwrap().take() {
+                    cleanup();
+                }
+            })
+        {
+            std::mem::forget(pending);
+            self.diagnostics.warn(&format!(
+                "could not start plugin cleanup: {error}; retaining library"
+            ));
+        }
+    }
 }
 
 fn call_register(register: RpiPluginRegisterUnified, host_api: &Arc<HostApi>) -> i32 {
@@ -159,6 +216,16 @@ pub fn load_one(
         ),
         None => HostApi::new(plugin_name, registry, Arc::clone(&diagnostics)),
     };
+    // Install ownership before calling plugin code, including failed registrations.
+    let mut loaded = LoadedPlugin {
+        action_bridge: host_api.action_bridge.clone(),
+        library: std::mem::ManuallyDrop::new(library),
+        path: path.clone(),
+        abi_version,
+        registry: ExtensionRegistry::new(),
+        host_api: Some(host_api.clone()),
+        diagnostics: diagnostics.clone(),
+    };
     // 4. Own the thread-local api during registration and restore the enclosing
     //    context afterward, even if registration fails or reenters the loader.
     let rc = {
@@ -204,13 +271,8 @@ pub fn load_one(
 
     tracing::debug!(path = %path.display(), abi_version, "loaded native plugin");
 
-    Ok(LoadedPlugin {
-        action_bridge: host_api.action_bridge.clone(),
-        library,
-        path,
-        abi_version,
-        registry,
-    })
+    loaded.registry = registry;
+    Ok(loaded)
 }
 
 // ---------------------------------------------------------------------------
@@ -307,7 +369,7 @@ pub struct PluginKeepalive {
     /// loaded, or in tests.
     #[allow(dead_code)]
     action_bridge: Option<Arc<ActionBridge>>,
-    plugin_bridges: Vec<Arc<ActionBridge>>,
+    plugins: Vec<LoadedPlugin>,
 }
 
 impl PluginKeepalive {
@@ -316,9 +378,16 @@ impl PluginKeepalive {
     /// real plugins.
     pub fn new(libraries: Vec<Library>, action_bridge: Option<Arc<ActionBridge>>) -> Self {
         Self {
-            plugin_bridges: Vec::new(),
+            plugins: Vec::new(),
             libraries,
             action_bridge,
+        }
+    }
+
+    /// Begin shutdown while outstanding adapters still retain the libraries.
+    pub fn begin_shutdown(&self) {
+        for plugin in &self.plugins {
+            plugin.begin_shutdown();
         }
     }
 
@@ -385,6 +454,11 @@ impl ExtensionSession {
             loaded_paths: Vec::new(),
             action_bridge: None,
         }
+    }
+
+    /// Cancel plugin background work. Call outside host/session locks.
+    pub fn begin_shutdown(&self) {
+        self.keepalive.begin_shutdown();
     }
 
     /// The shared keepalive — clone one per adapter/emitter you build from this
@@ -511,23 +585,8 @@ pub fn load_session_mixed(
     }
     let loaded_paths: Vec<PathBuf> = loaded.iter().map(|p| p.path.clone()).collect();
     let session_registry = merge_registries(&mut loaded);
-    let mut libs: Vec<Library> = Vec::with_capacity(loaded.len());
-    let mut plugin_bridges = Vec::new();
-    for p in loaded {
-        let LoadedPlugin {
-            action_bridge: plugin_bridge,
-            library,
-            registry: _,
-            path: _,
-            abi_version: _,
-        } = p;
-        if let Some(bridge) = plugin_bridge {
-            plugin_bridges.push(bridge);
-        }
-        libs.push(library);
-    }
-    let mut keepalive = PluginKeepalive::new(libs, action_bridge.clone());
-    keepalive.plugin_bridges = plugin_bridges;
+    let mut keepalive = PluginKeepalive::new(Vec::new(), action_bridge.clone());
+    keepalive.plugins = loaded;
     let snapshot = Arc::new(session_registry.snapshot());
     ExtensionSession {
         keepalive: Arc::new(keepalive),
@@ -609,6 +668,159 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         CdylibFixture { dir, path }
+    }
+
+    fn lifecycle_fixture(
+        name: &str,
+        register_status: i32,
+        finish_status: i32,
+    ) -> (CdylibFixture, PathBuf) {
+        let marker =
+            std::env::temp_dir().join(format!("rpi-lifecycle-{}-{name}", std::process::id()));
+        let _ = fs::remove_file(&marker);
+        let offset = std::mem::offset_of!(rpi_plugin_sdk::PluginApi, register_plugin_lifecycle);
+        let fixture = build_cdylib_fixture(
+            name,
+            &format!(
+                r#"
+use std::ffi::c_void;
+use std::sync::{{Arc, Mutex, atomic::{{AtomicBool, Ordering}}}};
+static WORKER: Mutex<Option<(Arc<AtomicBool>, std::thread::JoinHandle<()>)>> = Mutex::new(None);
+fn mark(value: &[u8]) {{
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open({marker:?}).unwrap();
+    file.write_all(value).unwrap();
+}}
+extern "C" fn begin(_: *mut c_void) {{
+    mark(b"B");
+    WORKER.lock().unwrap().as_ref().unwrap().0.store(true, Ordering::Release);
+}}
+extern "C" fn finish(_: *mut c_void) -> i32 {{
+    let (_, worker) = WORKER.lock().unwrap().take().unwrap();
+    worker.join().unwrap();
+    mark(b"F");
+    {finish_status}
+}}
+#[no_mangle]
+pub extern "C" fn still_mapped() -> i32 {{ 42 }}
+#[no_mangle]
+pub extern "C" fn rpi_plugin_register(api: *const u8) -> i32 {{
+    type Register = extern "C" fn(extern "C" fn(*mut c_void), extern "C" fn(*mut c_void) -> i32, *mut c_void) -> i32;
+    let register: Option<Register> = unsafe {{ std::ptr::read_unaligned(api.add({offset}).cast()) }};
+    assert_eq!(register.unwrap()(begin, finish, std::ptr::null_mut()), 0);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let worker_cancelled = cancelled.clone();
+    let worker = std::thread::spawn(move || {{
+        while !worker_cancelled.load(Ordering::Acquire) {{
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }}
+        mark(b"W");
+    }});
+    *WORKER.lock().unwrap() = Some((cancelled, worker));
+    {register_status}
+}}
+"#,
+                marker = marker.to_string_lossy()
+            ),
+        );
+        (fixture, marker)
+    }
+
+    fn wait_for_finish(marker: &Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while fs::read(marker).unwrap_or_default() != b"BWF" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "shutdown did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(windows)]
+    fn dll_is_mapped(path: &Path) -> bool {
+        use std::os::windows::ffi::OsStrExt;
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetModuleHandleW(name: *const u16) -> *mut std::ffi::c_void;
+        }
+        let name: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        // GetModuleHandleW observes the loader without retaining another DLL reference.
+        !unsafe { GetModuleHandleW(name.as_ptr()) }.is_null()
+    }
+
+    #[cfg(windows)]
+    fn wait_for_unload(path: &Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while dll_is_mapped(path) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "DLL remained mapped after successful shutdown"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn lifecycle_cancels_once_and_waits_for_last_keepalive() {
+        let (fixture, marker) = lifecycle_fixture("lifecycle_keepalive", 0, 0);
+        let session = load_session_mixed(
+            &[],
+            std::slice::from_ref(&fixture.path),
+            Arc::new(NullDiagnostics),
+            None,
+        );
+        let active_request = session.keepalive();
+        #[cfg(windows)]
+        assert!(dll_is_mapped(&fixture.path));
+        session.begin_shutdown();
+        session.begin_shutdown();
+        drop(session);
+        let recorded = fs::read(&marker).unwrap();
+        assert_eq!(recorded.iter().filter(|&&event| event == b'B').count(), 1);
+        assert!(
+            !recorded.contains(&b'F'),
+            "finish ran while an FFI keepalive remained"
+        );
+        drop(active_request);
+        wait_for_finish(&marker);
+        #[cfg(windows)]
+        wait_for_unload(&fixture.path);
+        let _ = fs::remove_file(marker);
+    }
+
+    #[test]
+    fn failed_registration_also_finishes_lifecycle() {
+        let (fixture, marker) = lifecycle_fixture("lifecycle_register_failure", 73, 0);
+        assert!(matches!(
+            load_one(&fixture.path, Arc::new(NullDiagnostics), None),
+            Err(PluginLoadError::RegisterReturned { code: 73, .. })
+        ));
+        wait_for_finish(&marker);
+        let _ = fs::remove_file(marker);
+    }
+
+    #[test]
+    fn failed_finish_keeps_dll_mapped_and_logs() {
+        let (fixture, marker) = lifecycle_fixture("lifecycle_finish_failure", 0, 1);
+        let diagnostics = Arc::new(CapturingDiag::default());
+        let plugin = load_one(&fixture.path, diagnostics.clone(), None).unwrap();
+        let still_mapped = unsafe {
+            *plugin
+                .library
+                .get::<extern "C" fn() -> i32>(b"still_mapped\0")
+                .unwrap()
+        };
+        drop(plugin);
+        wait_for_finish(&marker);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while diagnostics.warns.lock().unwrap().is_empty() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(still_mapped(), 42);
+        assert!(diagnostics.warns.lock().unwrap()[0].contains("retaining"));
+        let _ = fs::remove_file(marker);
     }
 
     #[test]

@@ -416,6 +416,78 @@ pub fn load_models_config() -> Result<ModelsConfig, ConfigError> {
     }
 }
 
+/// Diagnose unsupported compat keys and malformed values without rejecting
+/// unrelated providers.
+pub fn model_compat_warnings(config: &ModelsConfig) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (provider, cfg) in &config.providers {
+        let defaults = match cfg.api.as_deref() {
+            Some("openai-completions") => {
+                serde_json::to_value(rpi_ai::model::OpenaiCompletionsCompat::default())
+                    .expect("compat defaults serialize")
+            }
+            Some("openai-responses") => {
+                serde_json::to_value(rpi_ai::model::OpenaiResponsesCompat::default())
+                    .expect("compat defaults serialize")
+            }
+            _ => continue,
+        };
+        for model in &cfg.models {
+            let Some(value) = &model.compat else { continue };
+            let context = format!("provider {provider:?}, model {:?}, compat", model.id);
+            if let Some(fields) = value.as_object() {
+                if provider_is_openai_completions(cfg) {
+                    if let (Some(native), Some(alias)) = (
+                        fields.get("requiresReasoningContent"),
+                        fields.get("requiresReasoningContentOnAssistantMessages"),
+                    ) {
+                        if native != alias {
+                            warnings.push(format!("{context}: conflicting reasoning-content flags; requiresReasoningContent takes precedence"));
+                        }
+                    }
+                }
+                for key in fields.keys() {
+                    let alias = provider_is_openai_completions(cfg)
+                        && key == "requiresReasoningContentOnAssistantMessages";
+                    if defaults.get(key).is_none() && !alias {
+                        warnings.push(format!("{context}: unknown field {key:?}; ignored"));
+                    }
+                }
+            }
+            let parsed = if provider_is_openai_completions(cfg) {
+                serde_json::from_value::<rpi_ai::model::OpenaiCompletionsCompat>(
+                    normalize_completions_compat(value.clone()),
+                )
+                .map(|_| ())
+            } else {
+                serde_json::from_value::<rpi_ai::model::OpenaiResponsesCompat>(value.clone())
+                    .map(|_| ())
+            };
+            if let Err(error) = parsed {
+                // Serde's full error may echo a malformed value, including a
+                // credential accidentally pasted into a boolean field.
+                let error = error.to_string();
+                let expected = error
+                    .rsplit_once(", expected ")
+                    .map_or("a valid compat object", |(_, expected)| expected);
+                warnings.push(format!(
+                    "{context}: invalid configuration; expected {expected}; compat ignored"
+                ));
+            }
+        }
+    }
+    warnings
+}
+
+fn normalize_completions_compat(mut value: serde_json::Value) -> serde_json::Value {
+    if let Some(fields) = value.as_object_mut() {
+        if let Some(alias) = fields.remove("requiresReasoningContentOnAssistantMessages") {
+            fields.entry("requiresReasoningContent").or_insert(alias);
+        }
+    }
+    value
+}
+
 /// Atomically write the whole `~/.rpi/models.json` (used by the interactive
 /// provider form). Note: unlike [`crate::settings::save_settings`], this
 /// serializes the modeled config directly, so hand-written comments and unknown
@@ -542,10 +614,8 @@ fn find_line_comment(line: &str) -> Option<usize> {
         match ch {
             '\\' if in_str => esc = true,
             '"' => in_str = !in_str,
-            '/' if !in_str => {
-                if line.as_bytes().get(i + 1) == Some(&b'/') {
-                    return Some(i);
-                }
+            '/' if !in_str && line.as_bytes().get(i + 1) == Some(&b'/') => {
+                return Some(i);
             }
             _ => {}
         }
@@ -740,10 +810,10 @@ fn resolve_template(
     for part in parts {
         match part {
             TemplatePart::Literal(s) => out.push_str(&s),
-            TemplatePart::Env(name) => match env_lookup(&name, env_overlay) {
-                Some(v) => out.push_str(&v),
-                None => return None,
-            },
+            TemplatePart::Env(name) => {
+                let v = env_lookup(&name, env_overlay)?;
+                out.push_str(&v)
+            }
         }
     }
     Some(out)
@@ -920,7 +990,9 @@ pub fn provider_to_models(provider_id: &str, cfg: &ProviderConfig) -> Option<Vec
                     if let Ok(compat) = serde_json::from_value(value) {
                         m.compat = Some(StreamingProtocolCompat::OpenaiResponses(compat));
                     }
-                } else if let Ok(compat) = serde_json::from_value(value) {
+                } else if let Ok(compat) =
+                    serde_json::from_value(normalize_completions_compat(value))
+                {
                     m.compat = Some(StreamingProtocolCompat::OpenaiCompletions(compat));
                 }
             }
@@ -1071,6 +1143,37 @@ pub(crate) mod test_support {
     pub(crate) fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// Isolate session-directory overrides while holding the shared env lock.
+    /// Restore the inherited value before releasing the lock, even on unwind.
+    pub(crate) struct SessionDirEnv {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl SessionDirEnv {
+        pub(crate) fn new(directory: Option<&std::path::Path>) -> Self {
+            let guard = env_lock().lock().unwrap();
+            let previous = std::env::var_os("RPI_CODING_AGENT_SESSION_DIR");
+            match directory {
+                Some(directory) => std::env::set_var("RPI_CODING_AGENT_SESSION_DIR", directory),
+                None => std::env::remove_var("RPI_CODING_AGENT_SESSION_DIR"),
+            }
+            Self {
+                _guard: guard,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for SessionDirEnv {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("RPI_CODING_AGENT_SESSION_DIR", value),
+                None => std::env::remove_var("RPI_CODING_AGENT_SESSION_DIR"),
+            }
+        }
     }
 }
 
@@ -1442,6 +1545,86 @@ mod tests {
         .unwrap();
         let plain_models = provider_to_models("qwen", &plain.providers["qwen"]).unwrap();
         assert!(plain_models[0].compat.is_none());
+    }
+
+    #[test]
+    fn models_json_accepts_pi_deepseek_compat_and_warns_on_unknown_or_invalid_fields() {
+        let mut config: ModelsConfig = serde_json::from_value(serde_json::json!({
+            "providers": { "deepseek": {
+                "api": "openai-completions",
+                "models": [{ "id": "reasoner", "reasoning": true, "compat": {
+                    "thinkingFormat": "deepseek",
+                    "requiresReasoningContentOnAssistantMessages": true
+                }}]
+            }}
+        }))
+        .unwrap();
+        assert!(model_compat_warnings(&config).is_empty());
+        let models = provider_to_models("deepseek", &config.providers["deepseek"]).unwrap();
+        assert!(rpi_ai::model::prior_reasoning_is_replayed(&models[0]));
+        let Some(StreamingProtocolCompat::OpenaiCompletions(compat)) = &models[0].compat else {
+            panic!("missing model compatibility flags");
+        };
+        assert_eq!(compat.requires_reasoning_content, Some(true));
+        assert_eq!(
+            compat.thinking_format,
+            Some(rpi_ai::model::OpenaiThinkingFormat::Deepseek)
+        );
+
+        config.providers["deepseek"].models[0]
+            .compat
+            .as_mut()
+            .unwrap()["misspelledField"] = serde_json::json!("secret-fixture-value");
+        let warnings = model_compat_warnings(&config);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("deepseek") && warnings[0].contains("reasoner"));
+        assert!(warnings[0].contains("unknown field \"misspelledField\""));
+        assert!(!warnings[0].contains("secret-fixture-value"));
+
+        config.providers["deepseek"].models[0].compat =
+            Some(serde_json::json!({"requiresReasoningContent": "secret-fixture-token"}));
+        let warning = &model_compat_warnings(&config)[0];
+        assert!(warning.contains("invalid configuration"));
+        assert!(!warning.contains("secret-fixture-token"));
+        config.providers["deepseek"].models[0].compat =
+            Some(serde_json::json!({"thinkingFormat": "unsupported"}));
+        assert!(model_compat_warnings(&config)[0].contains("invalid configuration"));
+    }
+
+    #[test]
+    fn responses_compat_diagnostics_use_the_responses_schema() {
+        let config: ModelsConfig = serde_json::from_value(serde_json::json!({
+            "providers": { "relay": {
+                "api": "openai-responses", "models": [{ "id": "test", "compat": {
+                    "supportsOpenAIGrammarTools": true, "supportsStore": false
+                }}]
+            }}
+        }))
+        .unwrap();
+        let warnings = model_compat_warnings(&config);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("supportsStore"));
+    }
+
+    #[test]
+    fn native_reasoning_content_key_wins_over_a_conflicting_pi_alias() {
+        let config: ModelsConfig = serde_json::from_value(serde_json::json!({
+            "providers": { "relay": {
+                "api": "openai-completions", "models": [{ "id": "test", "compat": {
+                    "requiresReasoningContent": false,
+                    "requiresReasoningContentOnAssistantMessages": true
+                }}]
+            }}
+        }))
+        .unwrap();
+        let warnings = model_compat_warnings(&config);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("takes precedence"));
+        let models = provider_to_models("relay", &config.providers["relay"]).unwrap();
+        let Some(StreamingProtocolCompat::OpenaiCompletions(compat)) = &models[0].compat else {
+            panic!("valid native flag must survive an alias conflict");
+        };
+        assert_eq!(compat.requires_reasoning_content, Some(false));
     }
 
     #[test]

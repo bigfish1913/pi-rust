@@ -24,11 +24,11 @@
 | --- | --- | --- |
 | 宿主 | 扩展发现、模型配置合并、凭据解析与存储、factory 选择、执行绑定、会话切换 | package 复用这些能力，不重新实现一套凭据优先级 |
 | package | provider ID、默认目录、认证策略、协议适配、供应商命令 / OAuth 流程 | 不将供应商特判写回 CLI |
-| `rpi-provider-runtime` | 同步 C ABI 与异步 Provider 桥接、流式事件、请求取消 | 使用普通 Rust factory 即可导出 package |
+| `rpi-plugin-sdk::provider` | 同步 C ABI 与异步 Provider 桥接、流式事件、请求取消 | 开启 SDK 的 `provider` feature，使用普通 Rust factory 即可导出 package |
 | `rpi-ai` | `Model`、`Provider`、流式事件和可复用协议 | 优先复用现有协议解析、错误、用量与重试实现 |
 | `rpi-plugin-sdk` | 动态库入口、能力检测、跨 ABI 类型与字符串释放 | ABI 边界只传 SDK 类型及约定 JSON |
 
-package 运行时依赖可使用 `rpi-ai`、`rpi-plugin-sdk`、`rpi-provider-runtime`，不得依赖
+package 运行时依赖可使用 `rpi-ai` 与开启 `provider` feature 的 `rpi-plugin-sdk`，不得依赖
 `rpi-cli` 或宿主私有 factory / binding。真实加载测试可把 `rpi-extensions` 放在
 `dev-dependencies`。依赖版本按当前仓库模板保持兼容，不根据示例假定 crate 已发布。
 
@@ -85,7 +85,19 @@ serde_json::json!({
 根 `src/lib.rs` 只导出一次 `export_plugin!`，遍历各模块的注册函数；每个模块仍有独立的
 provider ID、目录、认证策略与 factory。安装 / 卸载 / 升级一次作用于整个包。
 
-下面展示单 provider 教学扩展的写法。用于统一包时，调用包内
+下面展示单 provider 教学扩展的写法。SDK 的 `provider` feature 默认关闭，需要显式开启：
+
+```toml
+[dependencies]
+rpi-plugin-sdk = { path = "/path/to/pi-rust/crates/rpi-plugin-sdk", features = ["provider"] }
+rpi-ai = { path = "/path/to/pi-rust/crates/rpi-ai", features = ["providers"] }
+serde_json = "1"
+```
+
+路径替换为同一份兼容的核心源码。已发布的 0.6.2 及更早版本 SDK 不含该 feature；
+包含迁移的版本发布前，使用上述源码依赖或固定到包含迁移的 Git 提交。
+
+用于统一包时，调用包内
 `crate::registration::register_provider!` 生成注册函数，并在根模块登记；不要在各模块
 重复调用 `export_provider!`，否则会重复导出原生插件入口。
 
@@ -107,12 +119,16 @@ fn models() -> Vec<Model> {
     vec![model]
 }
 
-fn create(model: &Model, options: &SimpleStreamOptions) -> Arc<dyn Provider> {
-    // 使用本次请求的端点与凭据，不读取 OPENAI_API_KEY 等进程变量。
-    rpi_provider_runtime::completions(model, options, false)
+fn create(
+    context: &rpi_plugin_sdk::provider::ProviderContext,
+    model: &Model,
+    options: &SimpleStreamOptions,
+) -> Result<Arc<dyn Provider>, String> {
+    // 使用本次请求的端点与凭据，并传播 HTTP 客户端配置错误。
+    context.completions(model, options, false)
 }
 
-rpi_provider_runtime::export_provider!(
+rpi_plugin_sdk::export_provider_with_context!(
     ID, BASE_URL, "openai-completions",
     serde_json::json!({
         "id": ID, "models": models(),
@@ -123,7 +139,7 @@ rpi_provider_runtime::export_provider!(
 ```
 
 匿名服务必须同时声明 `requiresAuth: false`，并使用允许匿名的协议构造路径；对上面的
-helper 即 `completions(model, options, true)`。仅修改 manifest 不会自动改变插件内部
+helper 即 `context.completions(model, options, true)`。仅修改 manifest 不会自动改变插件内部
 客户端的认证要求。自定义协议替换 `create` 的实现，仍通过同一桥接宏导出。
 
 ## 5. 认证与私有执行配置

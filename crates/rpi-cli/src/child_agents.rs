@@ -267,11 +267,21 @@ impl ChildAgents {
             if jobs.len() >= MAX_JOBS {
                 return Err("child capacity reached; dispose finished children".into());
             }
-            self.active
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                    (n < MAX_JOBS).then_some(n + 1)
-                })
-                .map_err(|_| "child cleanup still in progress; retry later")?;
+            let mut active = self.active.load(Ordering::Acquire);
+            loop {
+                if active >= MAX_JOBS {
+                    return Err("child cleanup still in progress; retry later".into());
+                }
+                match self.active.compare_exchange_weak(
+                    active,
+                    active + 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(current) => active = current,
+                }
+            }
             permit = Permit(self.active.clone());
             jobs.insert(id.clone(), job.clone());
         }

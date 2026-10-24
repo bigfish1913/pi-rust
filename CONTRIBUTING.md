@@ -40,9 +40,14 @@ cargo test  --workspace --locked
 Before opening a PR, run what CI enforces:
 
 ```bash
-cargo check --workspace --all-targets --locked
-cargo test  --workspace --locked
+RUSTFLAGS="-D warnings" cargo check --workspace --all-targets --locked
+RUSTFLAGS="-D warnings" RUSTDOCFLAGS="-D warnings" cargo test --workspace --locked
 ```
+
+CI rejects compiler warnings on both Linux and Windows, including test and
+example targets. The Linux test job also rejects rustdoc warnings. In
+PowerShell, set `$env:RUSTFLAGS = "-D warnings"` and
+`$env:RUSTDOCFLAGS = "-D warnings"` before running the Cargo commands.
 
 Formatting: run `cargo fmt --all -- --check` before opening a PR. CI runs the
 same check. The repo-wide formatting sweep is listed in
@@ -52,7 +57,7 @@ same check. The repo-wide formatting sweep is listed in
 git config blame.ignoreRevsFile .git-blame-ignore-revs
 ```
 
-Clippy is not part of CI either, so keep new code warning-free by hand:
+Clippy is not part of CI; it can be run locally for additional lint checks:
 
 ```bash
 cargo clippy --workspace --all-targets --locked
@@ -130,7 +135,8 @@ keep the type prefix and scope in the conventional form.
 1. Fork, branch from `main`, and keep the branch focused on one change.
 2. Fill in the PR template — including which crates are affected and how you
    verified the change.
-3. Make sure CI is green. `Cargo test` and `Cargo check` both have to pass.
+3. Make sure CI is green. `Cargo test` and both `Cargo check` jobs (Linux and
+   Windows) must pass without warnings.
 4. Expect review comments on API additions; the public surface of these crates
    is intended to be small and stable.
 

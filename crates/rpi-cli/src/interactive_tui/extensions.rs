@@ -62,12 +62,12 @@ pub(super) fn invoke_extension_command(
                 Some(rpi_extensions::host_free_string),
             )
         };
-        let text = if rc == 0 {
+
+        if rc == 0 {
             Some(out.to_string_lossy())
         } else {
             None
-        };
-        text
+        }
     }))
     .ok()
     .flatten()?;
@@ -105,7 +105,13 @@ pub(super) fn handle_extension_ui_result(
                 .unwrap_or(&fallback)
                 .to_string();
             if !text.is_empty() {
-                add_note_message(&ctx.chat, &text);
+                if value.get("markdown").and_then(|v| v.as_bool()) == Some(true) {
+                    if let Some(component) = extension_text_component(&value) {
+                        ctx.chat.add_child(component);
+                    }
+                } else {
+                    add_note_message(&ctx.chat, &text);
+                }
             }
             ctx.tui.request_render(false);
         }

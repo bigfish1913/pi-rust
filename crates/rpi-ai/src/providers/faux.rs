@@ -8,7 +8,9 @@
 //! throttling, abort via `CancellationToken`, usage estimate, and error-on-empty.
 //! Deferred responses (long-poll) are out of scope for v1 — left as a TODO.
 
-use crate::event_stream::{create_assistant_message_event_stream, AssistantMessageEventStream};
+use crate::event_stream::{
+    create_assistant_message_event_stream_with_cancellation, AssistantMessageEventStream,
+};
 use crate::model::Model;
 use crate::provider::{DeferredProvider, Provider, SimpleStreamOptions};
 use crate::types::{
@@ -407,11 +409,14 @@ impl DeferredProvider for FauxProvider {
                 Some(queue.remove(0))
             }
         };
-        let (mut producer, stream) = create_assistant_message_event_stream();
+        let (mut producer, stream) =
+            create_assistant_message_event_stream_with_cancellation(&_opts.signal);
         let placeholder = faux_assistant_message("", StopReason::Stop);
-        producer.push(AssistantMessageEvent::Start {
-            partial: Arc::new(placeholder.clone()),
-        });
+        producer
+            .push(AssistantMessageEvent::Start {
+                partial: Arc::new(placeholder.clone()),
+            })
+            .await;
         let message = match poll {
             Some(DeferredPoll::Message(mut message)) => {
                 message.deferred = None;
@@ -438,10 +443,12 @@ impl DeferredProvider for FauxProvider {
                 } else {
                     ErrorReason::Error
                 };
-                producer.push(AssistantMessageEvent::Error {
-                    reason,
-                    error: message.clone(),
-                });
+                producer
+                    .push(AssistantMessageEvent::Error {
+                        reason,
+                        error: message.clone(),
+                    })
+                    .await;
             }
             other => {
                 let reason = match other {
@@ -450,10 +457,12 @@ impl DeferredProvider for FauxProvider {
                     StopReason::Deferred => DoneReason::Deferred,
                     _ => DoneReason::Stop,
                 };
-                producer.push(AssistantMessageEvent::Done {
-                    reason,
-                    message: message.clone(),
-                });
+                producer
+                    .push(AssistantMessageEvent::Done {
+                        reason,
+                        message: message.clone(),
+                    })
+                    .await;
             }
         }
         producer.close();
@@ -481,7 +490,8 @@ impl Provider for FauxProvider {
         ctx: &Context,
         opts: &SimpleStreamOptions,
     ) -> crate::event_stream::AssistantMessageEventStream {
-        let (mut prod, stream) = create_assistant_message_event_stream();
+        let (mut prod, stream) =
+            create_assistant_message_event_stream_with_cancellation(&opts.signal);
 
         // Capture everything the producer task needs by value.
         let state = Arc::clone(&self.state);
@@ -489,7 +499,8 @@ impl Provider for FauxProvider {
         let id = self.id.clone();
         let model = model.clone();
         let ctx = Arc::new(ctx.clone());
-        let opts = opts.clone();
+        let mut opts = opts.clone();
+        opts.signal = prod.cancellation_token();
 
         tokio::spawn(async move {
             state.call_count.fetch_add(1, Ordering::Relaxed);
@@ -526,7 +537,7 @@ impl Provider for FauxProvider {
             // internal abort-after timer. A detached timer task cancels the
             // child token after `abort_after`; firing after completion is a
             // harmless no-op (the token is no longer polled).
-            let child = opts.signal.child_token();
+            let child = opts.signal.clone();
             let timer_token = child.clone();
             let _timer = script.abort_after.map(|d| {
                 tokio::spawn(async move {
@@ -678,14 +689,16 @@ async fn stream_with_deltas(
         prod.push(AssistantMessageEvent::Error {
             reason: ErrorReason::Aborted,
             error: aborted.clone(),
-        });
+        })
+        .await;
         *message = aborted;
         return;
     }
 
     prod.push(AssistantMessageEvent::Start {
         partial: Arc::new(partial.clone()),
-    });
+    })
+    .await;
 
     let mut abort_into_message = None::<AssistantMessage>;
     for index in 0..message.content.len() {
@@ -701,7 +714,8 @@ async fn stream_with_deltas(
                 prod.push(AssistantMessageEvent::ThinkingStart {
                     content_index: index,
                     partial: Arc::new(partial.clone()),
-                });
+                })
+                .await;
                 for chunk in
                     split_string_by_token_size(&tc.thinking, min_token_size, max_token_size)
                 {
@@ -717,7 +731,8 @@ async fn stream_with_deltas(
                         content_index: index,
                         delta: chunk,
                         partial: Arc::new(partial.clone()),
-                    });
+                    })
+                    .await;
                 }
                 if abort_into_message.is_some() {
                     break;
@@ -726,14 +741,16 @@ async fn stream_with_deltas(
                     content_index: index,
                     content: tc.thinking.clone(),
                     partial: Arc::new(partial.clone()),
-                });
+                })
+                .await;
             }
             Content::Text(tc) => {
                 partial.content.push(faux_text(""));
                 prod.push(AssistantMessageEvent::TextStart {
                     content_index: index,
                     partial: Arc::new(partial.clone()),
-                });
+                })
+                .await;
                 for chunk in split_string_by_token_size(&tc.text, min_token_size, max_token_size) {
                     schedule_chunk(&chunk, tokens_per_second).await;
                     if signal.is_cancelled() {
@@ -747,7 +764,8 @@ async fn stream_with_deltas(
                         content_index: index,
                         delta: chunk,
                         partial: Arc::new(partial.clone()),
-                    });
+                    })
+                    .await;
                 }
                 if abort_into_message.is_some() {
                     break;
@@ -756,7 +774,8 @@ async fn stream_with_deltas(
                     content_index: index,
                     content: tc.text.clone(),
                     partial: Arc::new(partial.clone()),
-                });
+                })
+                .await;
             }
             Content::ToolCall(tc) => {
                 partial.content.push(Content::tool_call(
@@ -767,7 +786,8 @@ async fn stream_with_deltas(
                 prod.push(AssistantMessageEvent::ToolCallStart {
                     content_index: index,
                     partial: Arc::new(partial.clone()),
-                });
+                })
+                .await;
                 for chunk in split_string_by_token_size(
                     &tc.arguments.to_string(),
                     min_token_size,
@@ -782,7 +802,8 @@ async fn stream_with_deltas(
                         content_index: index,
                         delta: chunk,
                         partial: Arc::new(partial.clone()),
-                    });
+                    })
+                    .await;
                 }
                 if abort_into_message.is_some() {
                     break;
@@ -801,7 +822,8 @@ async fn stream_with_deltas(
                         namespace: tc.namespace.clone(),
                     },
                     partial: Arc::new(partial.clone()),
-                });
+                })
+                .await;
             }
             Content::Image(_) => {
                 // Faux doesn't stream image blocks — mirrors TS (no image arm).
@@ -813,7 +835,8 @@ async fn stream_with_deltas(
         prod.push(AssistantMessageEvent::Error {
             reason: ErrorReason::Aborted,
             error: aborted.clone(),
-        });
+        })
+        .await;
         *message = aborted;
         return;
     }
@@ -831,7 +854,8 @@ async fn stream_with_deltas(
             prod.push(AssistantMessageEvent::Error {
                 reason: ErrorReason::Error,
                 error: err.clone(),
-            });
+            })
+            .await;
             *message = err;
         }
         StopReason::Error | StopReason::Aborted => {
@@ -841,7 +865,8 @@ async fn stream_with_deltas(
             prod.push(AssistantMessageEvent::Error {
                 reason,
                 error: message.clone(),
-            });
+            })
+            .await;
         }
         StopReason::Stop | StopReason::Length | StopReason::ToolUse | StopReason::Deferred => {
             let reason = match message.stop_reason {
@@ -854,7 +879,8 @@ async fn stream_with_deltas(
             prod.push(AssistantMessageEvent::Done {
                 reason,
                 message: message.clone(),
-            });
+            })
+            .await;
         }
     }
 }

@@ -272,7 +272,7 @@ fn entry_cache_checked_at(
 
 fn timestamp_is_fresh(checked_at: i64, now: i64) -> bool {
     let age = now.saturating_sub(checked_at);
-    checked_at > 0 && age >= 0 && age <= CACHE_FALLBACK_MAX_AGE_MS
+    checked_at > 0 && (0..=CACHE_FALLBACK_MAX_AGE_MS).contains(&age)
 }
 
 fn resolved_checked_at(

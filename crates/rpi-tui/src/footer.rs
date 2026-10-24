@@ -268,6 +268,25 @@ impl FooterComponent {
         self.recompute_context_percent();
     }
 
+    /// Drop every per-session counter so a new session starts from zero.
+    ///
+    /// The footer accumulates usage across turns (`add_usage`) and keeps the
+    /// last reported context size, so without this a `/new` session inherits
+    /// the previous one's `↑input ↓output` totals and `%/window` badge and
+    /// appears to keep adding to them.
+    ///
+    /// Deliberately does NOT touch `context_window`, `model`, `cwd` or
+    /// `git_branch`: those describe the environment and the active model, not
+    /// the session's history.
+    pub fn reset_session_counters(&self) {
+        self.set_usage(UsageTotals::default());
+        self.set_cache_hit_rate(None);
+        // Recomputes the badge to `?` because there is no token count left.
+        self.set_context_tokens(None);
+        self.set_session_name(None);
+        self.set_status("");
+    }
+
     /// Derive the context-usage percent from the tracked tokens/window.
     fn recompute_context_percent(&self) {
         let window = *self.context_window.lock().unwrap();
@@ -639,6 +658,49 @@ mod tests {
         footer.set_context_tokens(None);
         let stats = strip_ansi(&footer.render(120).join("\n"));
         assert!(stats.contains("0.0%/128k"), "stats: {stats}");
+    }
+
+    /// A new session must not inherit the previous session's counters, but the
+    /// environment/model facts must survive.
+    #[test]
+    fn reset_session_counters_clears_usage_and_keeps_environment() {
+        let footer = FooterComponent::new();
+        footer.set_model("(prov) model");
+        footer.set_cwd("/home/u/proj");
+        footer.set_git_branch(Some("main"));
+        footer.set_context_window(200_000);
+        footer.set_session_name(Some("old session"));
+        footer.set_usage(UsageTotals {
+            input: 12_300,
+            output: 3_400,
+            cache_read: 40_000,
+            cache_write: 1_200,
+            cost: 0.421,
+        });
+        footer.set_cache_hit_rate(Some(72.0));
+        footer.set_context_tokens(Some(126_400));
+
+        let before = strip_ansi(&footer.render(120).join("\n"));
+        assert!(before.contains("↑12k"), "before: {before}");
+        assert!(before.contains("$0.421"), "before: {before}");
+        assert!(before.contains("old session"), "before: {before}");
+        assert!(before.contains("63.2%/200k"), "before: {before}");
+
+        footer.reset_session_counters();
+
+        let after = strip_ansi(&footer.render(120).join("\n"));
+        // Session-scoped counters are gone.
+        assert!(!after.contains("↑12k"), "usage must reset: {after}");
+        assert!(!after.contains("$0.421"), "cost must reset: {after}");
+        assert!(!after.contains("old session"), "name must reset: {after}");
+        assert!(!after.contains("63.2%"), "badge must reset: {after}");
+        assert!(!after.contains("72.0%"), "cache rate must reset: {after}");
+        // Environment/model facts survive: they describe the session's setup,
+        // not its history.
+        assert!(after.contains("(prov) model"), "model kept: {after}");
+        assert!(after.contains("(main)"), "branch kept: {after}");
+        assert!(after.contains("proj"), "cwd kept: {after}");
+        assert!(after.contains("200k"), "window kept: {after}");
     }
 
     #[test]

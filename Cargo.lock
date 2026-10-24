@@ -2296,7 +2296,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-agent"
-version = "0.5.0"
+version = "0.8.5"
 dependencies = [
  "async-trait",
  "futures",
@@ -2313,7 +2313,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-ai"
-version = "0.5.0"
+version = "0.8.5"
 dependencies = [
  "async-trait",
  "base64",
@@ -2336,7 +2336,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-cli"
-version = "0.5.0"
+version = "0.8.5"
 dependencies = [
  "arboard",
  "async-trait",
@@ -2379,7 +2379,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-extensions"
-version = "0.5.0"
+version = "0.8.5"
 dependencies = [
  "async-trait",
  "dirs",
@@ -2400,7 +2400,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-harness"
-version = "0.5.0"
+version = "0.8.5"
 dependencies = [
  "async-trait",
  "futures",
@@ -2423,29 +2423,20 @@ dependencies = [
 
 [[package]]
 name = "rpi-plugin-sdk"
-version = "0.5.0"
+version = "0.8.5"
 dependencies = [
  "libc",
+ "reqwest",
+ "rpi-ai",
+ "serde",
  "serde_json",
+ "tokio",
  "windows-sys 0.61.2",
 ]
 
 [[package]]
-name = "rpi-provider-runtime"
-version = "0.5.0"
-dependencies = [
- "reqwest",
- "rpi-ai",
- "rpi-plugin-sdk",
- "serde",
- "serde_json",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
 name = "rpi-telemetry"
-version = "0.5.0"
+version = "0.8.5"
 dependencies = [
  "async-trait",
  "serde",
@@ -2455,7 +2446,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-tools"
-version = "0.5.0"
+version = "0.8.5"
 dependencies = [
  "async-trait",
  "base64",
@@ -2484,7 +2475,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-tui"
-version = "0.5.0"
+version = "0.8.5"
 dependencies = [
  "base64",
  "crossterm",

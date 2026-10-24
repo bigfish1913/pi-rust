@@ -34,7 +34,14 @@ pub fn changelog_url() -> String {
 /// Parse a semver-ish heading like `## 1.2.3` / `# 1.2.3` / `## v1.2.3`.
 fn parse_heading(line: &str) -> Option<(u64, u64, u64)> {
     let trimmed = line.trim_start_matches('#').trim();
-    let version = trimmed.split_whitespace().next()?.trim_matches(['[', ']']);
+    let version = trimmed.split_whitespace().next()?;
+    // release-plz emits linked headings: `[0.5.1](https://.../compare/...)`.
+    // Extract the label before parsing so the URL cannot turn the patch into 0.
+    let version = if let Some(label) = version.strip_prefix('[') {
+        label.split_once(']')?.0
+    } else {
+        version
+    };
     let version = version.strip_prefix('v').unwrap_or(version);
     let mut parts = version.split('.');
     let major = parts.next()?.parse().ok()?;
@@ -248,6 +255,26 @@ pub async fn load_entries(allow_network: bool) -> Vec<ChangelogEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linked_release_headings_preserve_the_patch_version() {
+        let entries = parse_changelog(
+            "## [Unreleased]\n\n## [0.5.1](https://example.test/compare/v0.5.0...v0.5.1) - 2026-10-18\n\n- fixed\n\n## [v0.5.0](https://example.test/old)\n\n- previous",
+        );
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            (entries[0].major, entries[0].minor, entries[0].patch),
+            (0, 5, 1)
+        );
+        assert_eq!(
+            (entries[1].major, entries[1].minor, entries[1].patch),
+            (0, 5, 0)
+        );
+        let notice = startup_changelog_for_profile(&entries, None, "0.5.1", false, true);
+        let markdown = notice.markdown.unwrap();
+        assert!(markdown.contains("## 0.5.1"));
+        assert!(!markdown.contains("## 0.5.0"));
+    }
 
     #[test]
     fn parses_versions() {

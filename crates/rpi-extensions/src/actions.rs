@@ -359,6 +359,10 @@ impl UiDialogMailbox {
     }
 }
 
+/// Host-only, owner-bound UI writer. It contains no plugin callbacks or pointers.
+pub type SideQuestionSink =
+    Arc<dyn Fn(serde_json::Value) -> Result<serde_json::Value, String> + Send + Sync>;
+
 /// The host-side implementation the bridge delegates to. Defined in
 /// `rpi-extensions` (NOT `rpi-harness`) so the crate DAG stays a leaf: this is a
 /// trait the **host** (`rpi-cli`) implements over the harness — `rpi-extensions`
@@ -371,10 +375,37 @@ impl UiDialogMailbox {
 /// to/from JSON at the impl boundary. Errors are `String` (become the action's
 /// nonzero `i32` + `{"error": msg}` JSON on the plugin side).
 ///
-/// The 18 methods map 1:1 to [`RuntimeActionId`]; `dispatch` below is the
-/// exhaustive switch that connects the FFI id to the method.
+/// `dispatch` below connects the FFI id to the method; owner-scoped actions
+/// are routed directly by the plugin bridge.
 #[async_trait::async_trait]
 pub trait RuntimeActionHost: Send + Sync {
+    /// Revoke side questions when their plugin bridge is retired.
+    fn cancel_side_questions(&self, _owner: u64) {}
+    /// Host-internal TUI snapshots; never exposed as a cross-owner plugin action.
+    fn side_question_revision(&self) -> u64 {
+        0
+    }
+    fn side_question_views(&self) -> Vec<serde_json::Value> {
+        Vec::new()
+    }
+    async fn side_question_ui(
+        &self,
+        _owner: u64,
+        _thread_id: String,
+        _args: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        Err("SideQuestion UI is not supported by this host".into())
+    }
+    /// Owner-scoped read-only inference, including host-owned UI publication.
+    async fn side_question(
+        &self,
+        _owner: u64,
+        _args: serde_json::Value,
+        _sink: SideQuestionSink,
+    ) -> Result<serde_json::Value, String> {
+        Err("SideQuestion is not supported by this host; upgrade rpi".into())
+    }
+
     /// Refresh the host-side model selector after provider packages reload.
     fn replace_model_catalog(&self, _models: Vec<rpi_ai::Model>) {}
     /// Invalidate child handles owned by an unloading/reloaded plugin.
@@ -534,9 +565,14 @@ impl ActionBridge {
         {
             return id as *mut c_void;
         }
-        let id = NEXT
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-            .expect("runtime handle space exhausted");
+        let mut id = NEXT.load(Ordering::Relaxed);
+        loop {
+            let next = id.checked_add(1).expect("runtime handle space exhausted");
+            match NEXT.compare_exchange_weak(id, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(current) => id = current,
+            }
+        }
         registry.insert(id, Arc::downgrade(self));
         id as *mut c_void
     }
@@ -721,14 +757,22 @@ impl ActionBridge {
     /// the old `user_data` pointer fail fast with a staleness error instead of
     /// driving the swapped-out session. Idempotent.
     pub fn invalidate(&self) {
-        let owners = self
-            .component_owners
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        self.active.store(false, Ordering::SeqCst);
-        for owner in owners.iter() {
-            self.ext_status.remove_owner(*owner);
-            self.host.cancel_child_agents(*owner);
+        let owners = {
+            let owners = self
+                .component_owners
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            self.active.store(false, Ordering::SeqCst);
+            for owner in owners.iter() {
+                self.ext_status.remove_owner(*owner);
+            }
+            owners.clone()
+        };
+        // Host cancellation may contend with a job publishing through its
+        // sink. Never invoke it while holding the sink's lifecycle gate.
+        for owner in owners {
+            self.host.cancel_child_agents(owner);
+            self.host.cancel_side_questions(owner);
         }
     }
 
@@ -871,6 +915,7 @@ async fn dispatch(
         RuntimeActionId::GetSessionBranch => host.get_session_branch(args).await,
         RuntimeActionId::GetExecutionContext => host.get_execution_context(args).await,
         RuntimeActionId::ChildAgent => Err("ChildAgent requires a plugin bridge".into()),
+        RuntimeActionId::SideQuestion => Err("SideQuestion requires a plugin bridge".into()),
         RuntimeActionId::StdioLifecycle => {
             Err("stdio lifecycle requires a plugin context".to_owned())
         }
@@ -910,7 +955,7 @@ pub extern "C" fn trampoline_runtime_action(
         run_action(
             action_id,
             // Highest id this ABI defines — bump when adding an action.
-            u32::from(RuntimeActionId::ChildAgent),
+            u32::from(RuntimeActionId::SideQuestion),
             args_json,
             out,
             user_data,
@@ -1050,6 +1095,34 @@ fn run_action(
             Err("stale plugin bridge".into())
         };
         let _ = tx.send(result);
+    } else if action == RuntimeActionId::SideQuestion {
+        let owner = bridge.plugin_identity.as_ref().map_or(0, |(id, _)| *id);
+        if owner == 0 || bridge.invocation.is_some() {
+            let _ = tx.send(Err(
+                "SideQuestion requires a plugin command, not a tool invocation".into(),
+            ));
+        } else {
+            // Serialize writes with invalidate(): no late publication can
+            // resurrect components after owner retirement. Keep only weak state.
+            let weak = Arc::downgrade(&bridge);
+            let sink: SideQuestionSink = Arc::new(move |args| {
+                let bridge = weak.upgrade().ok_or("expired side question bridge")?;
+                let _owners = bridge
+                    .component_owners
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if !bridge.is_active() {
+                    return Err("stale side question bridge".into());
+                }
+                if args["op"] == "check" {
+                    return Ok(serde_json::json!({"ok":true}));
+                }
+                bridge.ext_status.component(owner, args)
+            });
+            bridge.runtime.spawn(async move {
+                let _ = tx.send(host.side_question(owner, args, sink).await);
+            });
+        }
     } else if action == RuntimeActionId::ChildAgent {
         // A registration handle cannot assert that it is a parent invocation.
         // All child-originated invocations fail closed, regardless of tool name.
@@ -1885,10 +1958,10 @@ mod tests {
         );
 
         // A genuinely unknown id is still rejected (no silent acceptance).
-        // 25 is one past the highest defined action.
+        // 26 is one past the highest defined action.
         let mut out = StbString::empty();
         assert_eq!(
-            trampoline_runtime_action(25, StbStringRef::from_str("{}"), &mut out, user_data),
+            trampoline_runtime_action(26, StbStringRef::from_str("{}"), &mut out, user_data),
             2
         );
         // SAFETY: this action returned a live host allocation, not previously freed.
@@ -2007,6 +2080,7 @@ impl Drop for ActionBridge {
         if let Some((owner, _)) = &self.plugin_identity {
             self.ext_status.remove_owner(*owner);
             self.host.cancel_child_agents(*owner);
+            self.host.cancel_side_questions(*owner);
         }
     }
 }

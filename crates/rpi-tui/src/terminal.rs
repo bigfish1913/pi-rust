@@ -149,7 +149,10 @@ pub trait Terminal: Send + Sync {
     fn exit_raw_mode(&self);
 
     /// Re-read the current terminal size into the cached [`TerminalInfo`].
-    /// Called on `Event::Resize` so subsequent renders use the new dimensions.
+    ///
+    /// Called by the renderer before laying out every frame and by the hosts'
+    /// size watchdog, so a window that changed without a usable resize event
+    /// still gets a correct frame.
     fn refresh_size(&self);
 
     /// Start terminal raw mode.
@@ -383,6 +386,7 @@ impl Terminal for ProcessTerminal {
         let running = Arc::new(Mutex::new(true));
         let running_clone = running.clone();
         let info_clone = Arc::new(Mutex::new(self.info()));
+        let supports_kitty_keyboard = self.info().supports_kitty_keyboard;
 
         std::thread::spawn(move || {
             loop {
@@ -396,9 +400,9 @@ impl Terminal for ProcessTerminal {
                     Ok(true) => {
                         if let Ok(event) = event::read() {
                             match event {
-                                Event::Key(key) => {
-                                    on_input(InputEvent::Key(normalize_key_event(key)))
-                                }
+                                Event::Key(key) => on_input(InputEvent::Key(
+                                    normalize_key_event_with_protocol(key, supports_kitty_keyboard),
+                                )),
                                 Event::Mouse(mouse) => on_input(InputEvent::Mouse(mouse)),
                                 Event::Resize(cols, rows) => {
                                     if let Ok(mut info) = info_clone.lock() {
@@ -489,6 +493,38 @@ pub fn normalize_key_event(key: KeyEvent) -> KeyEvent {
     key
 }
 
+/// Normalize decoded input using the protocol negotiated by this terminal.
+/// Legacy iTerm2 uses CSI 1;9 A/B/C/D for Option+arrows; crossterm decodes
+/// modifier 9 as Super (the kitty meaning). Keep actual kitty Super keys intact.
+pub fn normalize_key_event_with_protocol(key: KeyEvent, supports_kitty_keyboard: bool) -> KeyEvent {
+    let key = normalize_legacy_iterm_arrow(
+        key,
+        std::env::var("TERM_PROGRAM").ok().as_deref(),
+        supports_kitty_keyboard,
+    );
+    normalize_key_event(key)
+}
+
+fn normalize_legacy_iterm_arrow(
+    mut key: KeyEvent,
+    term_program: Option<&str>,
+    supports_kitty_keyboard: bool,
+) -> KeyEvent {
+    use event::{KeyCode, KeyModifiers};
+    if term_program == Some("iTerm.app")
+        && !supports_kitty_keyboard
+        && matches!(
+            key.code,
+            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right
+        )
+        && key.modifiers.contains(KeyModifiers::SUPER)
+    {
+        key.modifiers.remove(KeyModifiers::SUPER);
+        key.modifiers.insert(KeyModifiers::ALT);
+    }
+    key
+}
+
 #[cfg(any(target_os = "macos", test))]
 fn local_apple_terminal(term_program: Option<&str>, ssh: bool) -> bool {
     term_program == Some("Apple_Terminal") && !ssh
@@ -505,6 +541,51 @@ fn normalize_native_shift_enter(mut key: KeyEvent, shift_pressed: bool) -> KeyEv
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_iterm_option_up_matches_dequeue_without_changing_kitty_super() {
+        use event::{KeyCode, KeyEventKind, KeyModifiers};
+        let mut bindings = crate::Keybindings::new();
+        bindings.set(
+            crate::keybindings::keys::DEQUEUE,
+            vec![crate::KeyCombo::new(KeyCode::Up, KeyModifiers::ALT)],
+        );
+        // CSI 1;9A decodes as Up+Super in crossterm 0.27.
+        let legacy =
+            KeyEvent::new_with_kind(KeyCode::Up, KeyModifiers::SUPER, KeyEventKind::Repeat);
+        let normalized = normalize_legacy_iterm_arrow(legacy, Some("iTerm.app"), false);
+        assert!(bindings.matches(&normalized, crate::keybindings::keys::DEQUEUE));
+        assert_eq!(normalized.kind, KeyEventKind::Repeat);
+        assert_eq!(
+            normalize_legacy_iterm_arrow(legacy, Some("iTerm.app"), true),
+            legacy
+        );
+        assert_eq!(
+            normalize_legacy_iterm_arrow(legacy, Some("ghostty"), false),
+            legacy
+        );
+        assert_eq!(normalize_legacy_iterm_arrow(legacy, None, false), legacy);
+        let plain = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(
+            normalize_legacy_iterm_arrow(plain, Some("iTerm.app"), false),
+            plain
+        );
+        let alt = KeyEvent::new(KeyCode::Up, KeyModifiers::ALT);
+        assert_eq!(
+            normalize_legacy_iterm_arrow(alt, Some("iTerm.app"), false),
+            alt
+        );
+        let letter = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SUPER);
+        assert_eq!(
+            normalize_legacy_iterm_arrow(letter, Some("iTerm.app"), false),
+            letter
+        );
+        let shifted = KeyEvent::new(KeyCode::Left, KeyModifiers::SUPER | KeyModifiers::SHIFT);
+        assert_eq!(
+            normalize_legacy_iterm_arrow(shifted, Some("iTerm.app"), false).modifiers,
+            KeyModifiers::ALT | KeyModifiers::SHIFT
+        );
+    }
 
     #[derive(Clone)]
     struct RecordedOutput(Arc<Mutex<Vec<u8>>>);

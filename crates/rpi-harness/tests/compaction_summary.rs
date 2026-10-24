@@ -76,6 +76,7 @@ fn llm_options(provider: Arc<dyn Provider>, model: Model) -> CompactionLlmOption
         thinking_level: None,
         retry: None,
         custom_instructions: None,
+        stream_options: Default::default(),
     }
 }
 

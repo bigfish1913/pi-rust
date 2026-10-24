@@ -1,7 +1,7 @@
 //! OpenAI Responses API provider (`/v1/responses`).
 
 use crate::event_stream::{
-    create_assistant_message_event_stream, AssistantMessageEventStream,
+    create_assistant_message_event_stream_with_cancellation, AssistantMessageEventStream,
     AssistantMessageEventStreamProducer,
 };
 use crate::model::{Model, StreamingProtocolCompat};
@@ -100,13 +100,15 @@ impl Provider for OpenAiResponsesProvider {
         ctx: &Context,
         opts: &SimpleStreamOptions,
     ) -> AssistantMessageEventStream {
-        let (mut producer, stream) = create_assistant_message_event_stream();
+        let (mut producer, stream) =
+            create_assistant_message_event_stream_with_cancellation(&opts.signal);
         let http = self.http.clone();
         let key = self.api_key.clone();
         let allow_env_api_key = self.allow_env_api_key;
         let model = model.clone();
         let ctx = Arc::new(ctx.clone());
-        let opts = opts.clone();
+        let mut opts = opts.clone();
+        opts.signal = producer.cancellation_token();
         tokio::spawn(async move {
             run_stream(
                 &mut producer,
@@ -224,16 +226,16 @@ impl ResponsesStreamState {
     /// (`finish_item` / `finish_open_slots`, i.e. before each `*End`) and
     /// whenever the stream switches channel, so no delta is dropped or
     /// reordered.
-    fn flush_pending(
+    async fn flush_pending(
         &mut self,
         out: &mut AssistantMessage,
         p: &mut AssistantMessageEventStreamProducer,
     ) {
-        self.flush_text(out, p);
-        self.flush_thinking(out, p);
+        self.flush_text(out, p).await;
+        self.flush_thinking(out, p).await;
     }
 
-    fn flush_text(
+    async fn flush_text(
         &mut self,
         out: &mut AssistantMessage,
         p: &mut AssistantMessageEventStreamProducer,
@@ -251,10 +253,11 @@ impl ResponsesStreamState {
             content_index,
             delta,
             partial: Arc::new(out.clone()),
-        });
+        })
+        .await;
     }
 
-    fn flush_thinking(
+    async fn flush_thinking(
         &mut self,
         out: &mut AssistantMessage,
         p: &mut AssistantMessageEventStreamProducer,
@@ -272,7 +275,8 @@ impl ResponsesStreamState {
             content_index,
             delta,
             partial: Arc::new(out.clone()),
-        });
+        })
+        .await;
     }
 
     fn custom_property_for(&self, name: &str) -> String {
@@ -405,7 +409,7 @@ impl ResponsesStreamState {
         })
     }
 
-    fn add_item(
+    async fn add_item(
         &mut self,
         index: usize,
         item: &Value,
@@ -505,23 +509,32 @@ impl ResponsesStreamState {
             },
         );
         match kind {
-            ResponseSlotKind::Thinking => p.push(AssistantMessageEvent::ThinkingStart {
-                content_index,
-                partial: Arc::new(out.clone()),
-            }),
-            ResponseSlotKind::Text => p.push(AssistantMessageEvent::TextStart {
-                content_index,
-                partial: Arc::new(out.clone()),
-            }),
-            ResponseSlotKind::ToolCall => p.push(AssistantMessageEvent::ToolCallStart {
-                content_index,
-                partial: Arc::new(out.clone()),
-            }),
+            ResponseSlotKind::Thinking => {
+                p.push(AssistantMessageEvent::ThinkingStart {
+                    content_index,
+                    partial: Arc::new(out.clone()),
+                })
+                .await
+            }
+            ResponseSlotKind::Text => {
+                p.push(AssistantMessageEvent::TextStart {
+                    content_index,
+                    partial: Arc::new(out.clone()),
+                })
+                .await
+            }
+            ResponseSlotKind::ToolCall => {
+                p.push(AssistantMessageEvent::ToolCallStart {
+                    content_index,
+                    partial: Arc::new(out.clone()),
+                })
+                .await
+            }
         };
         Some(content_index)
     }
 
-    fn ensure_delta_slot(
+    async fn ensure_delta_slot(
         &mut self,
         value: &Value,
         kind: ResponseSlotKind,
@@ -558,7 +571,7 @@ impl ResponsesStreamState {
                 "name": value.get("name").and_then(Value::as_str).unwrap_or_default(),
             });
             item[if custom { "input" } else { "arguments" }] = Value::String(String::new());
-            self.add_item(index, &item, out, p);
+            self.add_item(index, &item, out, p).await;
         } else {
             if let Some(slot) = self.slots.get_mut(&index) {
                 if slot.kind != kind || slot.custom != custom || slot.ended {
@@ -585,7 +598,7 @@ impl ResponsesStreamState {
         self.slots.contains_key(&index).then_some(index)
     }
 
-    fn append_text(
+    async fn append_text(
         &mut self,
         index: usize,
         delta: &str,
@@ -605,11 +618,11 @@ impl ResponsesStreamState {
             }
             // Keep channel order strict: text already streamed must reach the
             // consumer before the first thinking delta of a new block.
-            self.flush_text(out, p);
+            self.flush_text(out, p).await;
             self.pending_thinking_index = Some(slot.content_index);
             self.pending_thinking.push_str(delta);
             if self.should_flush(&self.pending_thinking) {
-                self.flush_thinking(out, p);
+                self.flush_thinking(out, p).await;
             }
         } else {
             if let Some(Content::Text(block)) = out.content.get_mut(slot.content_index) {
@@ -619,12 +632,12 @@ impl ResponsesStreamState {
             self.pending_text_index = Some(slot.content_index);
             self.pending_text.push_str(delta);
             if self.should_flush(&self.pending_text) {
-                self.flush_text(out, p);
+                self.flush_text(out, p).await;
             }
         }
     }
 
-    fn append_tool_delta(
+    async fn append_tool_delta(
         &mut self,
         index: usize,
         delta: &str,
@@ -649,14 +662,15 @@ impl ResponsesStreamState {
             content_index: slot.content_index,
             delta: delta.to_string(),
             partial: Arc::new(out.clone()),
-        });
+        })
+        .await;
     }
 
     /// Append a custom-tool input fragment while exposing the neutral tool
     /// call as a one-property JSON object. The Responses wire protocol carries
     /// the raw input string in `response.custom_tool_call_input.*` events; the
     /// surrounding JSON is synthesized only for the stream delta.
-    fn append_custom_tool_input(
+    async fn append_custom_tool_input(
         &mut self,
         index: usize,
         next_input: &str,
@@ -725,11 +739,12 @@ impl ResponsesStreamState {
                 content_index: slot.content_index,
                 delta: wire_delta,
                 partial: Arc::new(out.clone()),
-            });
+            })
+            .await;
         }
     }
 
-    fn finish_item(
+    async fn finish_item(
         &mut self,
         index: usize,
         item: &Value,
@@ -739,7 +754,7 @@ impl ResponsesStreamState {
         // Item boundary: the batched tail must be emitted before the `*End`
         // event that closes this item, otherwise it would appear in the final
         // message but never in the delta stream.
-        self.flush_pending(out, p);
+        self.flush_pending(out, p).await;
         apply_message_phase(out, item);
         if let Some(slot) = self.slots.get_mut(&index) {
             update_slot_metadata(slot, item);
@@ -754,7 +769,8 @@ impl ResponsesStreamState {
                 .map(str::to_string)
                 .or_else(|| self.slots.get(&index).map(|slot| slot.arguments.clone()))
                 .unwrap_or_default();
-            self.append_custom_tool_input(index, &input, true, out, p);
+            self.append_custom_tool_input(index, &input, true, out, p)
+                .await;
         }
         let Some(slot) = self.slots.get_mut(&index) else {
             return;
@@ -825,7 +841,8 @@ impl ResponsesStreamState {
                         content_index: slot.content_index,
                         content: block.thinking.clone(),
                         partial: Arc::new(out.clone()),
-                    });
+                    })
+                    .await;
                 }
             }
             ResponseSlotKind::Text => {
@@ -855,7 +872,8 @@ impl ResponsesStreamState {
                         content_index: slot.content_index,
                         content: block.text.clone(),
                         partial: Arc::new(out.clone()),
-                    });
+                    })
+                    .await;
                 }
             }
             ResponseSlotKind::ToolCall => {
@@ -889,13 +907,14 @@ impl ResponsesStreamState {
                     content_index: slot.content_index,
                     tool_call: call,
                     partial: Arc::new(out.clone()),
-                });
+                })
+                .await;
             }
         }
         slot.ended = true;
     }
 
-    fn reconcile_terminal_output(
+    async fn reconcile_terminal_output(
         &mut self,
         items: &[Value],
         out: &mut AssistantMessage,
@@ -909,20 +928,20 @@ impl ResponsesStreamState {
                 .find_for_item(item, Some(output_index))
                 .unwrap_or_else(|| self.reserve_index());
             if !self.slots.contains_key(&index) {
-                self.add_item(index, item, out, p);
+                self.add_item(index, item, out, p).await;
             } else if self.slots.get(&index).map(|slot| slot.kind) != Some(kind) {
                 continue;
             }
-            self.finish_item(index, item, out, p);
+            self.finish_item(index, item, out, p).await;
         }
     }
 
-    fn finish_open_slots(
+    async fn finish_open_slots(
         &mut self,
         out: &mut AssistantMessage,
         p: &mut AssistantMessageEventStreamProducer,
     ) {
-        self.flush_pending(out, p);
+        self.flush_pending(out, p).await;
         let mut indexes: Vec<usize> = self
             .slots
             .iter()
@@ -943,7 +962,7 @@ impl ResponsesStreamState {
                     })
                 })
                 .unwrap_or_else(|| json!({}));
-            self.finish_item(index, &item, out, p);
+            self.finish_item(index, &item, out, p).await;
         }
     }
 }
@@ -1164,10 +1183,13 @@ async fn run_stream(
         model.id.clone(),
         now_ms(),
     );
-    let mut headers = model.headers.clone().unwrap_or_default();
-    if let Some(extra) = &opts.headers {
+    let mut headers = std::collections::BTreeMap::new();
+    for extra in [model.headers.as_ref(), opts.headers.as_ref()]
+        .into_iter()
+        .flatten()
+    {
         for (k, v) in extra {
-            headers.insert(k.clone(), v.clone());
+            crate::provider::set_http_header(&mut headers, k, Some(v));
         }
     }
     let key = resolve_api_key(&provider_key, opts, allow_env_api_key);
@@ -1176,7 +1198,7 @@ async fn run_stream(
         .keys()
         .any(|k| k.eq_ignore_ascii_case("authorization") || k.eq_ignore_ascii_case("x-api-key"))
     {
-        emit_error(p, &mut out, "No API key", false);
+        emit_error(p, &mut out, "No API key", false).await;
         return;
     }
     let body = build_request(model, ctx, opts);
@@ -1191,18 +1213,20 @@ async fn run_stream(
     let response = match response {
         Ok(r) => r,
         Err(e) => {
-            emit_error(p, &mut out, e.to_string(), e.is_abort());
+            emit_error(p, &mut out, e.to_string(), e.is_abort()).await;
             return;
         }
     };
-    let mut events = SseEventStream::new(response, opts.signal.clone());
+    let mut events = SseEventStream::new(response, opts.signal.clone())
+        .with_idle_timeout(opts.stream_idle_timeout());
     let mut state =
         ResponsesStreamState::with_tools(&ctx.tools, supports_openai_grammar_tools(model));
     // The stream contract exposes a pending assistant message immediately after
     // the HTTP response is accepted, before the first output item arrives.
     p.push(AssistantMessageEvent::Start {
         partial: Arc::new(out.clone()),
-    });
+    })
+    .await;
     loop {
         match events.next_event().await {
             Ok(Some(ev)) => {
@@ -1213,8 +1237,8 @@ async fn run_stream(
                 // error and reporting only an unexpected EOF later.
                 if ev.data.trim() == "[DONE]" {
                     state.terminal = true;
-                    state.finish_open_slots(&mut out, p);
-                    finish(p, out, model, None, None);
+                    state.finish_open_slots(&mut out, p).await;
+                    finish(p, out, model, None, None).await;
                     return;
                 }
                 if ev.data.trim().is_empty() {
@@ -1231,7 +1255,8 @@ async fn run_stream(
                                 ev.data
                             ),
                             false,
-                        );
+                        )
+                        .await;
                         return;
                     }
                 };
@@ -1259,7 +1284,7 @@ async fn run_stream(
                                 .map(|value| value as usize)
                                 .or_else(|| state.find_for_item(item, None))
                                 .unwrap_or_else(|| state.reserve_index());
-                            state.add_item(index, item, &mut out, p);
+                            state.add_item(index, item, &mut out, p).await;
                         }
                     }
                     "response.content_part.added" => {
@@ -1277,69 +1302,86 @@ async fn run_stream(
                                 }
                             });
                         if let Some(kind) = kind {
-                            state.ensure_delta_slot(&value, kind, false, &mut out, p);
+                            state
+                                .ensure_delta_slot(&value, kind, false, &mut out, p)
+                                .await;
                         }
                     }
                     "response.output_text.delta" => {
                         if let Some(delta) = value.get("delta").and_then(Value::as_str) {
-                            if let Some(index) = state.ensure_delta_slot(
-                                &value,
-                                ResponseSlotKind::Text,
-                                false,
-                                &mut out,
-                                p,
-                            ) {
-                                state.append_text(index, delta, &mut out, p, false);
+                            if let Some(index) = state
+                                .ensure_delta_slot(
+                                    &value,
+                                    ResponseSlotKind::Text,
+                                    false,
+                                    &mut out,
+                                    p,
+                                )
+                                .await
+                            {
+                                state.append_text(index, delta, &mut out, p, false).await;
                             }
                         }
                     }
                     "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
                         if let Some(delta) = value.get("delta").and_then(Value::as_str) {
-                            if let Some(index) = state.ensure_delta_slot(
+                            if let Some(index) = state
+                                .ensure_delta_slot(
+                                    &value,
+                                    ResponseSlotKind::Thinking,
+                                    false,
+                                    &mut out,
+                                    p,
+                                )
+                                .await
+                            {
+                                state.append_text(index, delta, &mut out, p, true).await;
+                            }
+                        }
+                    }
+                    "response.reasoning_summary_part.done" => {
+                        if let Some(index) = state
+                            .ensure_delta_slot(
                                 &value,
                                 ResponseSlotKind::Thinking,
                                 false,
                                 &mut out,
                                 p,
-                            ) {
-                                state.append_text(index, delta, &mut out, p, true);
-                            }
-                        }
-                    }
-                    "response.reasoning_summary_part.done" => {
-                        if let Some(index) = state.ensure_delta_slot(
-                            &value,
-                            ResponseSlotKind::Thinking,
-                            false,
-                            &mut out,
-                            p,
-                        ) {
-                            state.append_text(index, "\n\n", &mut out, p, true);
+                            )
+                            .await
+                        {
+                            state.append_text(index, "\n\n", &mut out, p, true).await;
                         }
                     }
                     "response.refusal.delta" => {
                         if let Some(delta) = value.get("delta").and_then(Value::as_str) {
-                            if let Some(index) = state.ensure_delta_slot(
-                                &value,
-                                ResponseSlotKind::Text,
-                                false,
-                                &mut out,
-                                p,
-                            ) {
-                                state.append_text(index, delta, &mut out, p, false);
+                            if let Some(index) = state
+                                .ensure_delta_slot(
+                                    &value,
+                                    ResponseSlotKind::Text,
+                                    false,
+                                    &mut out,
+                                    p,
+                                )
+                                .await
+                            {
+                                state.append_text(index, delta, &mut out, p, false).await;
                             }
                         }
                     }
                     "response.function_call_arguments.delta" => {
                         if let Some(delta) = value.get("delta").and_then(Value::as_str) {
-                            if let Some(index) = state.ensure_delta_slot(
-                                &value,
-                                ResponseSlotKind::ToolCall,
-                                false,
-                                &mut out,
-                                p,
-                            ) {
-                                state.append_tool_delta(index, delta, &mut out, p);
+                            if let Some(index) = state
+                                .ensure_delta_slot(
+                                    &value,
+                                    ResponseSlotKind::ToolCall,
+                                    false,
+                                    &mut out,
+                                    p,
+                                )
+                                .await
+                            {
+                                state.append_tool_delta(index, delta, &mut out, p).await;
                             }
                         }
                     }
@@ -1347,13 +1389,16 @@ async fn run_stream(
                         let Some(arguments) = value.get("arguments").and_then(Value::as_str) else {
                             continue;
                         };
-                        let Some(index) = state.ensure_delta_slot(
-                            &value,
-                            ResponseSlotKind::ToolCall,
-                            false,
-                            &mut out,
-                            p,
-                        ) else {
+                        let Some(index) = state
+                            .ensure_delta_slot(
+                                &value,
+                                ResponseSlotKind::ToolCall,
+                                false,
+                                &mut out,
+                                p,
+                            )
+                            .await
+                        else {
                             continue;
                         };
                         let previous = state
@@ -1364,7 +1409,7 @@ async fn run_stream(
                         if arguments.starts_with(&previous) {
                             let suffix = &arguments[previous.len()..];
                             if !suffix.is_empty() {
-                                state.append_tool_delta(index, suffix, &mut out, p);
+                                state.append_tool_delta(index, suffix, &mut out, p).await;
                             }
                         } else if let Some(slot) = state.slots.get_mut(&index) {
                             slot.arguments = arguments.to_string();
@@ -1379,13 +1424,16 @@ async fn run_stream(
                         let Some(delta) = value.get("delta").and_then(Value::as_str) else {
                             continue;
                         };
-                        let Some(index) = state.ensure_delta_slot(
-                            &value,
-                            ResponseSlotKind::ToolCall,
-                            true,
-                            &mut out,
-                            p,
-                        ) else {
+                        let Some(index) = state
+                            .ensure_delta_slot(
+                                &value,
+                                ResponseSlotKind::ToolCall,
+                                true,
+                                &mut out,
+                                p,
+                            )
+                            .await
+                        else {
                             continue;
                         };
                         let current = state
@@ -1395,16 +1443,21 @@ async fn run_stream(
                             .unwrap_or_default();
                         let mut next = current;
                         next.push_str(delta);
-                        state.append_custom_tool_input(index, &next, false, &mut out, p);
+                        state
+                            .append_custom_tool_input(index, &next, false, &mut out, p)
+                            .await;
                     }
                     "response.custom_tool_call_input.done" => {
-                        let Some(index) = state.ensure_delta_slot(
-                            &value,
-                            ResponseSlotKind::ToolCall,
-                            true,
-                            &mut out,
-                            p,
-                        ) else {
+                        let Some(index) = state
+                            .ensure_delta_slot(
+                                &value,
+                                ResponseSlotKind::ToolCall,
+                                true,
+                                &mut out,
+                                p,
+                            )
+                            .await
+                        else {
                             continue;
                         };
                         let input = value
@@ -1413,7 +1466,9 @@ async fn run_stream(
                             .map(str::to_string)
                             .or_else(|| state.slots.get(&index).map(|slot| slot.arguments.clone()))
                             .unwrap_or_default();
-                        state.append_custom_tool_input(index, &input, true, &mut out, p);
+                        state
+                            .append_custom_tool_input(index, &input, true, &mut out, p)
+                            .await;
                     }
                     "response.output_item.done" => {
                         if let Some(item) = value.get("item") {
@@ -1425,9 +1480,9 @@ async fn run_stream(
                                 .find_for_item(item, index_hint)
                                 .unwrap_or_else(|| state.reserve_index());
                             if !state.slots.contains_key(&index) {
-                                state.add_item(index, item, &mut out, p);
+                                state.add_item(index, item, &mut out, p).await;
                             }
-                            state.finish_item(index, item, &mut out, p);
+                            state.finish_item(index, item, &mut out, p).await;
                         }
                     }
                     "response.completed" | "response.done" | "response.incomplete" => {
@@ -1437,13 +1492,13 @@ async fn run_stream(
                         let resp = value.get("response").unwrap_or(&value);
                         apply_response_metadata(&mut out, resp);
                         if let Some(items) = resp.get("output").and_then(Value::as_array) {
-                            state.reconcile_terminal_output(items, &mut out, p);
+                            state.reconcile_terminal_output(items, &mut out, p).await;
                         }
                         state.terminal = true;
-                        state.finish_open_slots(&mut out, p);
+                        state.finish_open_slots(&mut out, p).await;
                         let status = response_terminal_status(kind, resp, &value);
                         let incomplete_reason = response_incomplete_reason(resp, &value);
-                        finish(p, out, model, status, incomplete_reason);
+                        finish(p, out, model, status, incomplete_reason).await;
                         return;
                     }
                     "response.failed" | "error" => {
@@ -1453,11 +1508,12 @@ async fn run_stream(
                             out.raw_stop_reason = Some(status.to_string());
                         }
                         let msg = response_error_message(&value, response);
-                        emit_error(p, &mut out, msg, false);
+                        emit_error(p, &mut out, msg, false).await;
                         return;
                     }
                     _ => {}
                 }
+                p.commit_metadata(&out);
             }
             Ok(None) => {
                 if !state.terminal {
@@ -1466,15 +1522,16 @@ async fn run_stream(
                         &mut out,
                         "OpenAI Responses stream ended before a terminal response event",
                         false,
-                    );
+                    )
+                    .await;
                 } else {
-                    state.finish_open_slots(&mut out, p);
-                    finish(p, out, model, None, None);
+                    state.finish_open_slots(&mut out, p).await;
+                    finish(p, out, model, None, None).await;
                 }
                 return;
             }
             Err(e) => {
-                emit_error(p, &mut out, e.to_string(), e.is_abort());
+                emit_error(p, &mut out, e.to_string(), e.is_abort()).await;
                 return;
             }
         }
@@ -2300,7 +2357,7 @@ fn parse_usage(v: &Value) -> Usage {
         cost: Default::default(),
     }
 }
-fn finish(
+async fn finish(
     p: &mut AssistantMessageEventStreamProducer,
     mut out: AssistantMessage,
     model: &Model,
@@ -2337,7 +2394,8 @@ fn finish(
         p.push(AssistantMessageEvent::Error {
             reason: ErrorReason::Error,
             error: out,
-        });
+        })
+        .await;
         return;
     }
     p.push(AssistantMessageEvent::Done {
@@ -2347,9 +2405,10 @@ fn finish(
             _ => DoneReason::Stop,
         },
         message: out,
-    });
+    })
+    .await;
 }
-fn emit_error(
+async fn emit_error(
     p: &mut AssistantMessageEventStreamProducer,
     out: &mut AssistantMessage,
     msg: impl Into<String>,
@@ -2368,7 +2427,8 @@ fn emit_error(
             ErrorReason::Error
         },
         error: out.clone(),
-    });
+    })
+    .await;
 }
 fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2381,6 +2441,7 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event_stream::create_assistant_message_event_stream;
     use crate::model::OpenaiResponsesCompat;
     use crate::types::{
         Api, AssistantMessage, Context, GrammarFormat, Message, Schema, StopReason, TextContent,
@@ -2594,32 +2655,39 @@ mod tests {
     /// the other two, so it had the same quadratic cost. Batching is shared
     /// policy (`providers::DELTA_FLUSH_BYTES`), and the item boundary flush in
     /// `finish_item` must still deliver the tail.
-    #[test]
-    fn text_deltas_are_batched_without_losing_the_tail() {
+    #[tokio::test]
+    async fn text_deltas_are_batched_without_losing_the_tail() {
         let count = 500usize;
         let (mut producer, stream) = create_assistant_message_event_stream();
         let mut state = ResponsesStreamState::default();
         let mut output = AssistantMessage::empty(Api::OpenaiResponses, "openai", "gpt-test", 1);
-        state.add_item(
-            0,
-            &json!({ "type": "message", "id": "msg_1" }),
-            &mut output,
-            &mut producer,
-        );
+        state
+            .add_item(
+                0,
+                &json!({ "type": "message", "id": "msg_1" }),
+                &mut output,
+                &mut producer,
+            )
+            .await;
         for _ in 0..count {
-            state.append_text(0, "x", &mut output, &mut producer, false);
+            state
+                .append_text(0, "x", &mut output, &mut producer, false)
+                .await;
         }
-        state.finish_item(
-            0,
-            &json!({ "type": "message", "id": "msg_1" }),
-            &mut output,
-            &mut producer,
-        );
+        state
+            .finish_item(
+                0,
+                &json!({ "type": "message", "id": "msg_1" }),
+                &mut output,
+                &mut producer,
+            )
+            .await;
 
-        let mut receiver = stream.split().0;
+        drop(producer);
+        let mut receiver = stream;
         let mut tags: Vec<&'static str> = Vec::new();
         let mut joined = String::new();
-        while let Ok(event) = receiver.try_recv() {
+        while let Some(event) = receiver.next().await {
             tags.push(event.type_tag());
             if let AssistantMessageEvent::TextDelta { delta, .. } = &event {
                 joined.push_str(delta);
@@ -2648,41 +2716,50 @@ mod tests {
         );
     }
 
-    #[test]
-    fn custom_tool_stream_wraps_and_escapes_raw_input_once() {
+    #[tokio::test]
+    async fn custom_tool_stream_wraps_and_escapes_raw_input_once() {
         let tool = grammar_tool();
         let (mut producer, stream) = create_assistant_message_event_stream();
         let mut state = ResponsesStreamState::with_tools(&[tool], true);
         let mut output = AssistantMessage::empty(Api::OpenaiResponses, "openai", "gpt-test", 1);
-        state.add_item(
-            0,
-            &json!({
-                "type": "custom_tool_call",
-                "id": "ctc_1",
-                "call_id": "call_1",
-                "name": "run_grammar"
-            }),
-            &mut output,
-            &mut producer,
-        );
-        state.append_custom_tool_input(0, "a\"", false, &mut output, &mut producer);
-        state.append_custom_tool_input(0, "a\"\nb", true, &mut output, &mut producer);
-        state.finish_item(
-            0,
-            &json!({
-                "type": "custom_tool_call",
-                "id": "ctc_1",
-                "call_id": "call_1",
-                "name": "run_grammar",
-                "input": "a\"\nb"
-            }),
-            &mut output,
-            &mut producer,
-        );
+        state
+            .add_item(
+                0,
+                &json!({
+                    "type": "custom_tool_call",
+                    "id": "ctc_1",
+                    "call_id": "call_1",
+                    "name": "run_grammar"
+                }),
+                &mut output,
+                &mut producer,
+            )
+            .await;
+        state
+            .append_custom_tool_input(0, "a\"", false, &mut output, &mut producer)
+            .await;
+        state
+            .append_custom_tool_input(0, "a\"\nb", true, &mut output, &mut producer)
+            .await;
+        state
+            .finish_item(
+                0,
+                &json!({
+                    "type": "custom_tool_call",
+                    "id": "ctc_1",
+                    "call_id": "call_1",
+                    "name": "run_grammar",
+                    "input": "a\"\nb"
+                }),
+                &mut output,
+                &mut producer,
+            )
+            .await;
 
-        let (mut receiver, _result) = stream.split();
+        drop(producer);
+        let mut receiver = stream;
         let mut deltas = Vec::new();
-        while let Ok(event) = receiver.try_recv() {
+        while let Some(event) = receiver.next().await {
             if let AssistantMessageEvent::ToolCallDelta { delta, .. } = event {
                 deltas.push(delta);
             }
@@ -2728,59 +2805,66 @@ mod tests {
         assert_eq!(body["input"][1]["type"], "custom_tool_call_output");
     }
 
-    #[test]
-    fn output_item_done_keeps_streamed_function_arguments_when_wire_value_is_empty() {
+    #[tokio::test]
+    async fn output_item_done_keeps_streamed_function_arguments_when_wire_value_is_empty() {
         let (mut producer, stream) = create_assistant_message_event_stream();
         let mut output = AssistantMessage::empty(Api::OpenaiResponses, "openai", "gpt-test", 1);
         let mut state = ResponsesStreamState::default();
-        state.add_item(
-            0,
-            &json!({
-                "type": "function_call",
-                "id": "fc_1",
-                "call_id": "call_1",
-                "name": "read"
-            }),
-            &mut output,
-            &mut producer,
-        );
-        state.append_tool_delta(0, "{\"path\":\"README.md\"}", &mut output, &mut producer);
-        state.finish_item(
-            0,
-            &json!({
-                "type": "function_call",
-                "id": "fc_1",
-                "call_id": "call_1",
-                "name": "read",
-                "arguments": ""
-            }),
-            &mut output,
-            &mut producer,
-        );
+        state
+            .add_item(
+                0,
+                &json!({
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "read"
+                }),
+                &mut output,
+                &mut producer,
+            )
+            .await;
+        state
+            .append_tool_delta(0, "{\"path\":\"README.md\"}", &mut output, &mut producer)
+            .await;
+        state
+            .finish_item(
+                0,
+                &json!({
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "read",
+                    "arguments": ""
+                }),
+                &mut output,
+                &mut producer,
+            )
+            .await;
 
-        let (_, result) = stream.split();
-        let _ = result;
+        drop(stream);
         assert_eq!(
             output.content[0],
             Content::tool_call("call_1|fc_1", "read", json!({"path": "README.md"}))
         );
     }
 
-    #[test]
-    fn final_answer_phase_is_visible_in_live_partial_message() {
+    #[tokio::test]
+    async fn final_answer_phase_is_visible_in_live_partial_message() {
         let (mut producer, _stream) = create_assistant_message_event_stream();
         let mut output = AssistantMessage::empty(Api::OpenaiResponses, "openai", "gpt-test", 1);
         let mut state = ResponsesStreamState::default();
-        state.add_item(
-            0,
-            &json!({
-                "type": "message",
-                "id": "msg_1",
-                "phase": "final_answer"
-            }),
-            &mut output,
-            &mut producer,
-        );
+        state
+            .add_item(
+                0,
+                &json!({
+                    "type": "message",
+                    "id": "msg_1",
+                    "phase": "final_answer"
+                }),
+                &mut output,
+                &mut producer,
+            )
+            .await;
         assert_eq!(output.stop_reason, StopReason::Stop);
     }
 
@@ -3195,8 +3279,8 @@ mod tests {
         assert_eq!(usage.total_tokens, 120);
     }
 
-    #[test]
-    fn idless_text_deltas_reuse_the_open_text_slot() {
+    #[tokio::test]
+    async fn idless_text_deltas_reuse_the_open_text_slot() {
         let (mut producer, _stream) = create_assistant_message_event_stream();
         let mut state = ResponsesStreamState::default();
         let mut output = AssistantMessage::empty(Api::OpenaiResponses, "openai", "gpt-test", 1);
@@ -3209,8 +3293,11 @@ mod tests {
                 &mut output,
                 &mut producer,
             )
+            .await
             .unwrap();
-        state.append_text(first, "a", &mut output, &mut producer, false);
+        state
+            .append_text(first, "a", &mut output, &mut producer, false)
+            .await;
         let second = state
             .ensure_delta_slot(
                 &json!({"delta":"b"}),
@@ -3219,8 +3306,11 @@ mod tests {
                 &mut output,
                 &mut producer,
             )
+            .await
             .unwrap();
-        state.append_text(second, "b", &mut output, &mut producer, false);
+        state
+            .append_text(second, "b", &mut output, &mut producer, false)
+            .await;
 
         assert_eq!(first, second);
         assert_eq!(output.content.len(), 1);
@@ -3264,17 +3354,19 @@ mod tests {
         assert!(!state.mark_sequence(&first));
     }
 
-    #[test]
-    fn unknown_identified_delta_does_not_corrupt_another_open_slot() {
+    #[tokio::test]
+    async fn unknown_identified_delta_does_not_corrupt_another_open_slot() {
         let (mut producer, _stream) = create_assistant_message_event_stream();
         let mut state = ResponsesStreamState::default();
         let mut output = AssistantMessage::empty(Api::OpenaiResponses, "openai", "gpt-test", 1);
-        state.add_item(
-            0,
-            &json!({"type":"message","id":"msg_a"}),
-            &mut output,
-            &mut producer,
-        );
+        state
+            .add_item(
+                0,
+                &json!({"type":"message","id":"msg_a"}),
+                &mut output,
+                &mut producer,
+            )
+            .await;
         let index = state
             .ensure_delta_slot(
                 &json!({"item_id":"msg_b","delta":"b"}),
@@ -3283,15 +3375,18 @@ mod tests {
                 &mut output,
                 &mut producer,
             )
+            .await
             .unwrap();
-        state.append_text(index, "b", &mut output, &mut producer, false);
+        state
+            .append_text(index, "b", &mut output, &mut producer, false)
+            .await;
         assert_ne!(index, 0);
         assert!(matches!(&output.content[0], Content::Text(text) if text.text.is_empty()));
         assert!(matches!(&output.content[index], Content::Text(text) if text.text == "b"));
     }
 
-    #[test]
-    fn sparse_output_index_routes_delta_to_its_wire_slot() {
+    #[tokio::test]
+    async fn sparse_output_index_routes_delta_to_its_wire_slot() {
         let (mut producer, _stream) = create_assistant_message_event_stream();
         let mut state = ResponsesStreamState::default();
         let mut output = AssistantMessage::empty(Api::OpenaiResponses, "openai", "gpt-test", 1);
@@ -3304,15 +3399,18 @@ mod tests {
                 &mut output,
                 &mut producer,
             )
+            .await
             .unwrap();
         assert_eq!(index, 3);
 
-        state.append_text(index, "kept", &mut output, &mut producer, false);
+        state
+            .append_text(index, "kept", &mut output, &mut producer, false)
+            .await;
         assert!(matches!(&output.content[0], Content::Text(text) if text.text == "kept"));
     }
 
-    #[test]
-    fn sparse_output_index_routes_function_arguments_to_its_wire_slot() {
+    #[tokio::test]
+    async fn sparse_output_index_routes_function_arguments_to_its_wire_slot() {
         let (mut producer, _stream) = create_assistant_message_event_stream();
         let mut state = ResponsesStreamState::default();
         let mut output = AssistantMessage::empty(Api::OpenaiResponses, "openai", "gpt-test", 1);
@@ -3330,15 +3428,18 @@ mod tests {
                 &mut output,
                 &mut producer,
             )
+            .await
             .unwrap();
         assert_eq!(index, 5);
 
-        state.append_tool_delta(
-            index,
-            "{\"path\":\"README.md\"}",
-            &mut output,
-            &mut producer,
-        );
+        state
+            .append_tool_delta(
+                index,
+                "{\"path\":\"README.md\"}",
+                &mut output,
+                &mut producer,
+            )
+            .await;
         assert!(matches!(
             &output.content[0],
             Content::ToolCall(call)
@@ -3347,52 +3448,64 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn terminal_items_without_ids_are_aligned_by_output_index() {
+    #[tokio::test]
+    async fn terminal_items_without_ids_are_aligned_by_output_index() {
         let (mut producer, _stream) = create_assistant_message_event_stream();
         let mut state = ResponsesStreamState::default();
         let mut output = AssistantMessage::empty(Api::OpenaiResponses, "openai", "gpt-test", 1);
-        state.add_item(0, &json!({"type":"message"}), &mut output, &mut producer);
-        state.add_item(1, &json!({"type":"message"}), &mut output, &mut producer);
-        state.reconcile_terminal_output(
-            &[
-                json!({"type":"message","content":[{"type":"output_text","text":"first"}]}),
-                json!({"type":"message","content":[{"type":"output_text","text":"second"}]}),
-            ],
-            &mut output,
-            &mut producer,
-        );
+        state
+            .add_item(0, &json!({"type":"message"}), &mut output, &mut producer)
+            .await;
+        state
+            .add_item(1, &json!({"type":"message"}), &mut output, &mut producer)
+            .await;
+        state
+            .reconcile_terminal_output(
+                &[
+                    json!({"type":"message","content":[{"type":"output_text","text":"first"}]}),
+                    json!({"type":"message","content":[{"type":"output_text","text":"second"}]}),
+                ],
+                &mut output,
+                &mut producer,
+            )
+            .await;
         assert!(matches!(&output.content[0], Content::Text(text) if text.text == "first"));
         assert!(matches!(&output.content[1], Content::Text(text) if text.text == "second"));
     }
 
-    #[test]
-    fn terminal_reasoning_item_backfills_a_missing_encrypted_signature() {
+    #[tokio::test]
+    async fn terminal_reasoning_item_backfills_a_missing_encrypted_signature() {
         let (mut producer, _stream) = create_assistant_message_event_stream();
         let mut state = ResponsesStreamState::default();
         let mut output = AssistantMessage::empty(Api::OpenaiResponses, "openai", "gpt-test", 1);
-        state.add_item(
-            0,
-            &json!({"type":"reasoning","id":"rs_1"}),
-            &mut output,
-            &mut producer,
-        );
-        state.finish_item(
-            0,
-            &json!({"type":"reasoning","id":"rs_1","summary":[{"text":"think"}]}),
-            &mut output,
-            &mut producer,
-        );
-        state.reconcile_terminal_output(
-            &[json!({
-                "type":"reasoning",
-                "id":"rs_1",
-                "summary":[{"text":"think"}],
-                "encrypted_content":"opaque"
-            })],
-            &mut output,
-            &mut producer,
-        );
+        state
+            .add_item(
+                0,
+                &json!({"type":"reasoning","id":"rs_1"}),
+                &mut output,
+                &mut producer,
+            )
+            .await;
+        state
+            .finish_item(
+                0,
+                &json!({"type":"reasoning","id":"rs_1","summary":[{"text":"think"}]}),
+                &mut output,
+                &mut producer,
+            )
+            .await;
+        state
+            .reconcile_terminal_output(
+                &[json!({
+                    "type":"reasoning",
+                    "id":"rs_1",
+                    "summary":[{"text":"think"}],
+                    "encrypted_content":"opaque"
+                })],
+                &mut output,
+                &mut producer,
+            )
+            .await;
         let Content::Thinking(thinking) = &output.content[0] else {
             panic!("expected thinking content");
         };
@@ -3402,8 +3515,8 @@ mod tests {
             .is_some_and(|value| value.contains("encrypted_content")));
     }
 
-    #[test]
-    fn output_item_done_and_terminal_output_emit_one_tool_call_end() {
+    #[tokio::test]
+    async fn output_item_done_and_terminal_output_emit_one_tool_call_end() {
         let (mut producer, stream) = create_assistant_message_event_stream();
         let mut state = ResponsesStreamState::default();
         let mut output = AssistantMessage::empty(Api::OpenaiResponses, "openai", "gpt-test", 1);
@@ -3413,33 +3526,39 @@ mod tests {
             "call_id":"call_1",
             "name":"read"
         });
-        state.add_item(0, &item, &mut output, &mut producer);
-        state.append_tool_delta(0, "{\"path\":\"a\"}", &mut output, &mut producer);
-        state.finish_item(
-            0,
-            &json!({
-                "type":"function_call",
-                "id":"fc_1",
-                "call_id":"call_1",
-                "name":"read",
-                "arguments":"{\"path\":\"a\"}"
-            }),
-            &mut output,
-            &mut producer,
-        );
-        state.reconcile_terminal_output(
-            &[json!({
-                "type":"function_call",
-                "id":"fc_1",
-                "call_id":"call_1",
-                "name":"read",
-                "arguments":"{\"path\":\"a\"}"
-            })],
-            &mut output,
-            &mut producer,
-        );
+        state.add_item(0, &item, &mut output, &mut producer).await;
+        state
+            .append_tool_delta(0, "{\"path\":\"a\"}", &mut output, &mut producer)
+            .await;
+        state
+            .finish_item(
+                0,
+                &json!({
+                    "type":"function_call",
+                    "id":"fc_1",
+                    "call_id":"call_1",
+                    "name":"read",
+                    "arguments":"{\"path\":\"a\"}"
+                }),
+                &mut output,
+                &mut producer,
+            )
+            .await;
+        state
+            .reconcile_terminal_output(
+                &[json!({
+                    "type":"function_call",
+                    "id":"fc_1",
+                    "call_id":"call_1",
+                    "name":"read",
+                    "arguments":"{\"path\":\"a\"}"
+                })],
+                &mut output,
+                &mut producer,
+            )
+            .await;
 
-        let (_rx, _result) = stream.split();
+        drop(stream);
         // The slot is ended after the first item; terminal reconciliation must
         // not append a second tool call or emit another end event.
         assert_eq!(output.content.len(), 1);
@@ -3487,35 +3606,39 @@ mod tests {
         assert_eq!(body["input"][0]["content"][0]["text"], "visible reasoning");
     }
 
-    #[test]
-    fn reasoning_content_fills_when_summary_is_absent() {
+    #[tokio::test]
+    async fn reasoning_content_fills_when_summary_is_absent() {
         let (mut producer, _stream) = create_assistant_message_event_stream();
         let mut state = ResponsesStreamState::default();
         let mut output = AssistantMessage::empty(Api::OpenaiResponses, "openai", "gpt-test", 1);
-        state.add_item(
-            0,
-            &json!({"type":"reasoning","id":"rs_content"}),
-            &mut output,
-            &mut producer,
-        );
-        state.finish_item(
-            0,
-            &json!({
-                "type":"reasoning",
-                "id":"rs_content",
-                "content":[{"type":"reasoning_text","text":"from content"}]
-            }),
-            &mut output,
-            &mut producer,
-        );
+        state
+            .add_item(
+                0,
+                &json!({"type":"reasoning","id":"rs_content"}),
+                &mut output,
+                &mut producer,
+            )
+            .await;
+        state
+            .finish_item(
+                0,
+                &json!({
+                    "type":"reasoning",
+                    "id":"rs_content",
+                    "content":[{"type":"reasoning_text","text":"from content"}]
+                }),
+                &mut output,
+                &mut producer,
+            )
+            .await;
         assert!(matches!(
             &output.content[0],
             Content::Thinking(thinking) if thinking.thinking == "from content"
         ));
     }
 
-    #[test]
-    fn cancelled_terminal_status_is_reported_as_error() {
+    #[tokio::test]
+    async fn cancelled_terminal_status_is_reported_as_error() {
         let (mut producer, stream) = create_assistant_message_event_stream();
         finish(
             &mut producer,
@@ -3523,7 +3646,8 @@ mod tests {
             &model(),
             Some("cancelled"),
             None,
-        );
+        )
+        .await;
         let result = futures::executor::block_on(stream.result()).unwrap();
         assert_eq!(result.stop_reason, StopReason::Error);
         assert!(result
@@ -3532,8 +3656,8 @@ mod tests {
             .is_some_and(|message| message.contains("cancelled")));
     }
 
-    #[test]
-    fn incomplete_max_output_tokens_maps_to_length() {
+    #[tokio::test]
+    async fn incomplete_max_output_tokens_maps_to_length() {
         let (mut producer, stream) = create_assistant_message_event_stream();
         finish(
             &mut producer,
@@ -3541,15 +3665,16 @@ mod tests {
             &model(),
             Some("incomplete"),
             Some("max_output_tokens"),
-        );
+        )
+        .await;
         let result = futures::executor::block_on(stream.result()).unwrap();
         assert_eq!(result.stop_reason, StopReason::Length);
         assert_eq!(result.raw_stop_reason.as_deref(), Some("incomplete"));
         assert!(result.error_message.is_none());
     }
 
-    #[test]
-    fn incomplete_non_token_reason_maps_to_length() {
+    #[tokio::test]
+    async fn incomplete_non_token_reason_maps_to_length() {
         let (mut producer, stream) = create_assistant_message_event_stream();
         finish(
             &mut producer,
@@ -3557,7 +3682,8 @@ mod tests {
             &model(),
             Some("incomplete"),
             Some("content_filter"),
-        );
+        )
+        .await;
         let result = futures::executor::block_on(stream.result()).unwrap();
         assert_eq!(result.stop_reason, StopReason::Length);
         assert_eq!(result.raw_stop_reason.as_deref(), Some("incomplete"));

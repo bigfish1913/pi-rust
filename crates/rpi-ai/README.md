@@ -76,6 +76,31 @@ running, and reports failures as `Error` events rather than `Err`. That keeps
 the harness and the agent loop uniform across providers: one code path handles
 a network failure, a malformed frame, and a cancelled request.
 
+## Stream backpressure and Rust API migration
+
+`AssistantMessageEventStreamProducer::push(event)` is now async: await it and
+stop ordinary production when it returns `false`. `split()` was removed; use
+`stream.next().await` or `stream.result().await`. `result()` drains and discards
+intermediate events so providers can finish even when only a result is wanted.
+
+Ordinary events default to 64 queued entries and 4 MiB of accounted payload.
+The payload walk includes message content, tool arguments, signatures and other
+metadata without serializing; it measures queued payload rather than RSS or
+allocator capacity; producer state, one in-flight event, and consumer-held events
+are outside that budget. Shared snapshots are charged for every queued event. A
+single oversized event consumes the byte budget exclusively. Terminal events
+and the final result have independent slots and never wait for ordinary capacity;
+the first terminal wins.
+
+Providers should create streams with
+`create_assistant_message_event_stream_with_cancellation(&options.signal)` and
+use `producer.cancellation_token()` for upstream work. Dropping the stream
+cancels that child token without cancelling its caller. Tests can inject limits
+with `create_assistant_message_event_stream_with_limits(count, bytes, &signal)`.
+An enqueue cancelled while waiting does not commit its snapshot to the aborted
+result. Metadata-only frames can use `producer.commit_metadata(&message)`;
+this preserves the last queued content.
+
 ## Testing without a network
 
 The `faux` provider scripts exact turns, so a test pins the model's behaviour

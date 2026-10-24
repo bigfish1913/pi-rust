@@ -22,7 +22,7 @@ pub mod sse;
 
 use crate::error::AiError;
 use crate::event_stream::{
-    create_assistant_message_event_stream, AssistantMessageEventStream,
+    create_assistant_message_event_stream_with_cancellation, AssistantMessageEventStream,
     AssistantMessageEventStreamProducer,
 };
 use crate::model::{Model, StreamingProtocolCompat};
@@ -142,14 +142,16 @@ impl Provider for AnthropicProvider {
         // producer task, hand back the consumer. Failures surface as `Error`
         // events on the stream, never as panics (plan §5.11). Mirrors the TS
         // `stream` IIFE pattern.
-        let (mut prod, stream) = create_assistant_message_event_stream();
+        let (mut prod, stream) =
+            create_assistant_message_event_stream_with_cancellation(&opts.signal);
 
         let http = self.http.clone();
         let provider_key = self.api_key.clone();
         let allow_env_api_key = self.allow_env_api_key;
         let model = model.clone();
         let ctx = Arc::new(ctx.clone());
-        let opts = opts.clone();
+        let mut opts = opts.clone();
+        opts.signal = prod.cancellation_token();
 
         tokio::spawn(async move {
             run_anthropic_stream(
@@ -220,7 +222,7 @@ async fn run_anthropic_stream(
         (None, false) => {
             // Mirrors `assertRequestAuth`'s `throw new Error("No API key for…")`.
             let msg = format!("No API key for provider: {}", model.provider);
-            emit_terminal_error(prod, &mut state, msg, false);
+            emit_terminal_error(prod, &mut state, msg, false).await;
             return;
         }
     };
@@ -235,7 +237,8 @@ async fn run_anthropic_stream(
                 &mut state,
                 format!("failed to serialize request body: {e}"),
                 false,
-            );
+            )
+            .await;
             return;
         }
     };
@@ -325,7 +328,7 @@ async fn run_anthropic_stream(
             // the alt-screen. The error is propagated to the UI via
             // `emit_terminal_error` → `AssistantMessageEvent::Error`, which the
             // TUI renders as a `✗` line in the transcript.
-            emit_terminal_error(prod, &mut state, err.to_string(), aborted);
+            emit_terminal_error(prod, &mut state, err.to_string(), aborted).await;
             return;
         }
     };
@@ -344,7 +347,7 @@ async fn run_anthropic_stream(
             Ok(body) => body,
             Err(error) => {
                 let aborted = error.is_abort();
-                emit_terminal_error(prod, &mut state, error.to_string(), aborted);
+                emit_terminal_error(prod, &mut state, error.to_string(), aborted).await;
                 return;
             }
         };
@@ -356,7 +359,8 @@ async fn run_anthropic_stream(
                     &mut state,
                     format!("failed to parse non-stream response: {error}"),
                     false,
-                );
+                )
+                .await;
                 return;
             }
         };
@@ -379,7 +383,8 @@ async fn run_anthropic_stream(
                 &mut state,
                 "non-stream response contained no text content".into(),
                 false,
-            );
+            )
+            .await;
             return;
         }
         state.output.content.push(Content::text(text.clone()));
@@ -406,25 +411,30 @@ async fn run_anthropic_stream(
         let partial = std::sync::Arc::new(state.output.clone());
         prod.push(AssistantMessageEvent::Start {
             partial: partial.clone(),
-        });
+        })
+        .await;
         prod.push(AssistantMessageEvent::TextStart {
             content_index: 0,
             partial: partial.clone(),
-        });
+        })
+        .await;
         prod.push(AssistantMessageEvent::TextDelta {
             content_index: 0,
             delta: text.clone(),
             partial: partial.clone(),
-        });
+        })
+        .await;
         prod.push(AssistantMessageEvent::TextEnd {
             content_index: 0,
             content: text,
             partial,
-        });
+        })
+        .await;
         prod.push(AssistantMessageEvent::Done {
             reason: DoneReason::Stop,
             message: state.output,
-        });
+        })
+        .await;
         return;
     }
 
@@ -434,7 +444,8 @@ async fn run_anthropic_stream(
     // failure never delivers a partial `start` with no terminal. `run_mapper`
     // applies the model-aware `cost_fn` on the final usage before the terminal
     // event (mirrors the inline `calculateCost(model, output.usage)` calls).
-    let mut sse = SseEventStream::new(response, opts.signal.clone());
+    let mut sse = SseEventStream::new(response, opts.signal.clone())
+        .with_idle_timeout(opts.stream_idle_timeout());
     let cost_model = model.cost.clone();
     let cost_fn = move |usage: &Usage| calculate_cost(&cost_model, usage);
     run_mapper(&mut sse, prod, &mut state, cost_fn).await;

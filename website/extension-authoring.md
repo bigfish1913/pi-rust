@@ -152,7 +152,7 @@ Provider 接入遵循 [Provider 接入规范](https://github.com/bigfish1913/pi-
 生产实现统一维护在 [rpi-providers](https://github.com/pi-rust/rpi-package/tree/feature-1014/packages/rpi-providers)，
 一个安装入口提供多个独立 provider；新增供应商在包内加模块，根模块只导出一次插件入口。
 
-推荐 `rpi-provider-runtime::export_provider!`：通过 `declare` 声明完整模型目录、
+单 provider 示例可使用 `rpi_plugin_sdk::export_provider!`（需开启 SDK 默认关闭的 `provider` feature）：通过 `declare` 声明完整模型目录、
 `apiKeyEnv` 与 `requiresAuth`，优先注册 `register_streaming_provider`，旧宿主降级
 `register_provider`。流式增量在生成期间发送，最终 `out` 仍返回完整消息；宿主产生唯一终态。
 取消后应停止网络与后台任务，request fn 返回后不得继续调用 `emit`。

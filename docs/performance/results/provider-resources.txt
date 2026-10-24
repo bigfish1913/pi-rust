@@ -1,0 +1,44 @@
+Resource benchmark: actual context drive, offline faux/client-cache fixture; existing release binary.
+Command: /usr/bin/time -f process_wall_s=%e process_user_s=%U process_sys_s=%S process_max_rss_kib=%M target/release/deps/rpi_plugin_sdk-a30f0b40f9480661 provider::context::tests::benchmark_context_resources --exact --ignored --nocapture
+
+RUN 1
+
+running 1 test
+{"benchmark":"context_resources","fixture":"faux_with_client_cache","network":false,"shared":false,"concurrent":false,"requests":200,"threads":1,"runtime_builds":200,"client_builds":200,"elapsed_us":25879,"request_p50_us":101,"request_p95_us":130}
+{"benchmark":"context_resources","fixture":"faux_with_client_cache","network":false,"shared":true,"concurrent":false,"requests":200,"threads":1,"runtime_builds":1,"client_builds":1,"elapsed_us":16629,"request_p50_us":63,"request_p95_us":78}
+{"benchmark":"context_resources","fixture":"faux_with_client_cache","network":false,"shared":false,"concurrent":true,"requests":200,"threads":4,"runtime_builds":200,"client_builds":200,"elapsed_us":7274,"request_p50_us":106,"request_p95_us":134}
+{"benchmark":"context_resources","fixture":"faux_with_client_cache","network":false,"shared":true,"concurrent":true,"requests":200,"threads":4,"runtime_builds":1,"client_builds":1,"elapsed_us":7379,"request_p50_us":102,"request_p95_us":160}
+test provider::context::tests::benchmark_context_resources ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 52 filtered out; finished in 0.06s
+
+process_wall_s=0.06 process_user_s=0.08 process_sys_s=0.02 process_max_rss_kib=6460
+exit_code=0
+
+RUN 2
+
+running 1 test
+{"benchmark":"context_resources","fixture":"faux_with_client_cache","network":false,"shared":false,"concurrent":false,"requests":200,"threads":1,"runtime_builds":200,"client_builds":200,"elapsed_us":23028,"request_p50_us":97,"request_p95_us":114}
+{"benchmark":"context_resources","fixture":"faux_with_client_cache","network":false,"shared":true,"concurrent":false,"requests":200,"threads":1,"runtime_builds":1,"client_builds":1,"elapsed_us":15280,"request_p50_us":59,"request_p95_us":87}
+{"benchmark":"context_resources","fixture":"faux_with_client_cache","network":false,"shared":false,"concurrent":true,"requests":200,"threads":4,"runtime_builds":200,"client_builds":200,"elapsed_us":7475,"request_p50_us":104,"request_p95_us":192}
+{"benchmark":"context_resources","fixture":"faux_with_client_cache","network":false,"shared":true,"concurrent":true,"requests":200,"threads":4,"runtime_builds":1,"client_builds":1,"elapsed_us":7092,"request_p50_us":99,"request_p95_us":147}
+test provider::context::tests::benchmark_context_resources ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 52 filtered out; finished in 0.05s
+
+process_wall_s=0.05 process_user_s=0.07 process_sys_s=0.02 process_max_rss_kib=6520
+exit_code=0
+
+RUN 3
+
+running 1 test
+{"benchmark":"context_resources","fixture":"faux_with_client_cache","network":false,"shared":false,"concurrent":false,"requests":200,"threads":1,"runtime_builds":200,"client_builds":200,"elapsed_us":23034,"request_p50_us":92,"request_p95_us":119}
+{"benchmark":"context_resources","fixture":"faux_with_client_cache","network":false,"shared":true,"concurrent":false,"requests":200,"threads":1,"runtime_builds":1,"client_builds":1,"elapsed_us":15873,"request_p50_us":61,"request_p95_us":73}
+{"benchmark":"context_resources","fixture":"faux_with_client_cache","network":false,"shared":false,"concurrent":true,"requests":200,"threads":4,"runtime_builds":200,"client_builds":200,"elapsed_us":7767,"request_p50_us":103,"request_p95_us":185}
+{"benchmark":"context_resources","fixture":"faux_with_client_cache","network":false,"shared":true,"concurrent":true,"requests":200,"threads":4,"runtime_builds":1,"client_builds":1,"elapsed_us":6531,"request_p50_us":97,"request_p95_us":135}
+test provider::context::tests::benchmark_context_resources ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 52 filtered out; finished in 0.05s
+
+process_wall_s=0.05 process_user_s=0.08 process_sys_s=0.01 process_max_rss_kib=6236
+exit_code=0

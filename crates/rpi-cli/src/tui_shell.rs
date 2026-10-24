@@ -91,7 +91,6 @@ pub async fn run_driver_tui<D: SessionDriver>(driver: &D, addr: &str) -> Result<
         let _ = submit_tx.send(text.to_string());
     }));
 
-    let input_tui = tui.clone();
     let reader_stop = tokio_util::sync::CancellationToken::new();
     let stop_reader = reader_stop.clone();
     let reader = tokio::task::spawn_blocking(move || {
@@ -103,7 +102,10 @@ pub async fn run_driver_tui<D: SessionDriver>(driver: &D, addr: &str) -> Result<
             }
             match crossterm::event::read() {
                 Ok(event) => {
-                    let _ = input_tui.refresh_size();
+                    // The size is adopted from `Event::Resize` in the run loop
+                    // below. Refreshing on every event used to invalidate the
+                    // painted frame on each keystroke (a full repaint per key)
+                    // without ever learning a new size.
                     if input_tx.send(event).is_err() {
                         break;
                     }
@@ -187,7 +189,9 @@ async fn run_loop<D: SessionDriver>(
             maybe_input = input_rx.recv() => {
                 let Some(event) = maybe_input else { break };
                 match event {
-                    Event::Resize(_, _) => tui.refresh_size(),
+                    Event::Resize(..) => {
+                        tui.note_resize();
+                    }
                     Event::Mouse(mouse) => {
                         if tui.handle_scroll_to_end_indicator_mouse_event(&mouse) { continue; }
                         match mouse.kind {
@@ -247,6 +251,10 @@ async fn run_loop<D: SessionDriver>(
                 }
             }
             _ = ticker.tick() => {
+                // Size watchdog: an event can be missed (or arrive before the
+                // window rectangle moves), and a fullscreen frame must always
+                // match the real window.
+                tui.ensure_size();
                 let retrying = chrome.tick_retry();
                 if status.streaming || retrying {
                     tui.request_render(false);

@@ -224,3 +224,74 @@ async fn close_and_session_switch_cancel_old_scopes_but_new_session_can_delegate
         .await
         .is_err());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn side_question_inherits_private_binding_but_not_main_run_lifetime_or_tools() {
+    let (parent, provider, _) = parent(FauxScript::new().with_text("side answer")).await;
+    let mut model = provider.default_model().clone();
+    model.id = "live-model".into();
+    model.base_url = "https://private-endpoint.test".into();
+    // Exercise inheritance with a model that can actually enable thinking.
+    model.reasoning = true;
+    model.headers = Some(BTreeMap::from([(
+        "Authorization".into(),
+        "private-key".into(),
+    )]));
+    parent.set_model(model.clone()).await.unwrap();
+    parent
+        .set_thinking_level(rpi_ai::ThinkingLevel::High)
+        .await
+        .unwrap();
+    let (run_id, _, _) = parent.acquire_run(OperationKind::Run).await.unwrap();
+    let parent_tip = parent.get_tip_id().await.unwrap();
+    let (child, reference) = parent
+        .create_side_question(session("side"), emitter())
+        .await
+        .unwrap();
+    assert!(reference.is_empty());
+    let config = child.harness.snapshot_config().unwrap();
+    assert_eq!(config.model, model);
+    assert!(Arc::ptr_eq(
+        &config.models[0],
+        &parent.snapshot_config().unwrap().models[0]
+    ));
+    assert_eq!(config.thinking_level, rpi_ai::ThinkingLevel::High);
+    assert!(config.tools.is_empty());
+    assert!(config.before_tool_call.is_none());
+    assert!(config.transform_context.is_none());
+    assert_eq!(child.harness.max_turns, Some(1));
+    parent.release_run(&run_id);
+    assert!(
+        !child.scope.is_cancelled(),
+        "main completion must not cancel side questions"
+    );
+    let result = child.harness.prompt_text("side?", vec![]).await.unwrap();
+    assert!(matches!(
+        result.outcome,
+        HarnessRunOutcome::Completed { .. }
+    ));
+    assert_eq!(parent.get_tip_id().await.unwrap(), parent_tip);
+    parent.close().await.unwrap();
+    assert!(child.scope.is_cancelled());
+}
+
+#[test]
+fn side_reference_is_utf8_bounded_and_excludes_non_text_blocks() {
+    use rpi_ai::types::{UserContent, UserMessage};
+    let messages = vec![
+        AgentMessage::User(UserMessage {
+            role: rpi_ai::types::UserRole,
+            content: UserContent::Text("old-secret-marker".into()),
+            timestamp: 0,
+        }),
+        AgentMessage::User(UserMessage {
+            role: rpi_ai::types::UserRole,
+            content: UserContent::Text("中".repeat(30_000)),
+            timestamp: 0,
+        }),
+    ];
+    let reference = side_question_reference(&messages);
+    assert!(reference.len() <= 64 * 1024);
+    assert!(!reference.contains("old-secret-marker"));
+    assert!(reference.contains("[user]"));
+}

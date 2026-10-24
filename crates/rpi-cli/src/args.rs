@@ -113,6 +113,8 @@ pub struct Args {
     pub base_url: Option<String>,
     /// `--timeout <seconds>` overrides the deadline for each LLM API request.
     pub timeout: Option<Duration>,
+    /// Maximum silence between streamed response bytes; zero disables it.
+    pub stream_idle_timeout: Option<Duration>,
     pub system_prompt: Option<String>,
     pub append_system_prompt: Vec<String>,
     /// `--theme` — built-in theme name or a theme file path.
@@ -398,6 +400,16 @@ pub fn parse_args(args: &[String]) -> Args {
                     }
                 }
             }
+            "--stream-idle-timeout" => {
+                if let Some(v) = take_value(&mut result, "--stream-idle-timeout") {
+                    match v.parse::<u64>() {
+                        Ok(seconds) => result.stream_idle_timeout = Some(Duration::from_secs(seconds)),
+                        Err(_) => result.errors.push(format!(
+                            "Invalid --stream-idle-timeout \"{v}\". Expected a non-negative integer number of seconds (0 disables it)"
+                        )),
+                    }
+                }
+            }
             "--system-prompt" => result.system_prompt = take_value(&mut result, "--system-prompt"),
             "--append-system-prompt" => {
                 if let Some(v) = take_value(&mut result, "--append-system-prompt") {
@@ -601,6 +613,7 @@ pub fn print_help() {
   --api-key <key>                API key override for the selected provider
   --base-url <url>               Override the selected model endpoint
   --timeout <seconds>            LLM API request timeout (default: 600)
+  --stream-idle-timeout <seconds> Max silence between response bytes (default: 300; 0 disables)
   --system-prompt <text>         Replace the default system prompt
   --append-system-prompt <text>  Append text to the system prompt (repeatable)
   --thinking <level>             off, minimal, low, medium, high, xhigh, max
@@ -879,6 +892,26 @@ mod tests {
             assert_eq!(args.errors.len(), 1, "value: {value}");
             assert!(args.timeout.is_none(), "value: {value}");
         }
+    }
+
+    #[test]
+    fn stream_idle_timeout_accepts_both_forms_and_zero_but_rejects_invalid_values() {
+        for (argv, seconds) in [
+            (s(&["--stream-idle-timeout", "45"]), 45),
+            (s(&["--stream-idle-timeout=90"]), 90),
+            (s(&["--stream-idle-timeout=0"]), 0),
+        ] {
+            let args = parse_args(&argv);
+            assert!(args.errors.is_empty(), "{:?}", args.errors);
+            assert_eq!(args.stream_idle_timeout, Some(Duration::from_secs(seconds)));
+            assert!(args.timeout.is_none());
+        }
+        for value in ["-1", "1.5", "no", "18446744073709551616"] {
+            let args = parse_args(&s(&[&format!("--stream-idle-timeout={value}")]));
+            assert!(!args.errors.is_empty(), "{value}");
+            assert!(args.stream_idle_timeout.is_none());
+        }
+        assert!(!parse_args(&s(&["--stream-idle-timeout"])).errors.is_empty());
     }
 
     #[test]

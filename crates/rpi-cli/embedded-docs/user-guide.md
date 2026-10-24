@@ -151,6 +151,7 @@ ANTHROPIC_AUTH_TOKEN=token
 --api-key <key>         本次运行覆盖凭据
 --base-url <url>        覆盖模型 endpoint
 --timeout <seconds>     LLM API 请求超时（默认 600）
+--stream-idle-timeout <seconds> 流式响应空闲超时（默认 300；0 禁用；独立于总超时）
 --thinking <level>      off/minimal/low/medium/high/xhigh/max
 --print, -p             单次运行并退出
 --mode text|json|rpc    输出模式

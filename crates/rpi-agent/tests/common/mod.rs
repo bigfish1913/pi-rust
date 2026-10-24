@@ -40,7 +40,8 @@ pub fn mock_stream_fn(messages: Vec<AssistantMessage>) -> StreamFn {
                     let partial = Arc::new(message.clone());
                     prod.push(AssistantMessageEvent::Start {
                         partial: partial.clone(),
-                    });
+                    })
+                    .await;
                     match message.stop_reason {
                         StopReason::Error | StopReason::Aborted => {
                             let reason = matches!(message.stop_reason, StopReason::Aborted)
@@ -49,11 +50,13 @@ pub fn mock_stream_fn(messages: Vec<AssistantMessage>) -> StreamFn {
                             prod.push(AssistantMessageEvent::Error {
                                 reason,
                                 error: message,
-                            });
+                            })
+                            .await;
                         }
                         _ => {
                             let reason = done_reason_from_stop(message.stop_reason);
-                            prod.push(AssistantMessageEvent::Done { reason, message });
+                            prod.push(AssistantMessageEvent::Done { reason, message })
+                                .await;
                         }
                     }
                 }
@@ -69,7 +72,8 @@ pub fn mock_stream_fn(messages: Vec<AssistantMessage>) -> StreamFn {
                     prod.push(AssistantMessageEvent::Error {
                         reason: ErrorReason::Error,
                         error: err,
-                    });
+                    })
+                    .await;
                 }
             }
         });
@@ -213,6 +217,7 @@ pub fn loop_config_with_converter(
         thinking_level: rpi_ai::types::ThinkingLevel::Off,
         api_key: None,
         timeout: None,
+        stream_idle_timeout: None,
         max_retries: None,
         max_retry_delay: None,
         cache_retention: rpi_ai::provider::CacheRetention::default(),

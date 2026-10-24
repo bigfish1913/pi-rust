@@ -962,6 +962,12 @@ impl AgentHarness {
         }
     }
 
+    /// The compaction budget in force, so a client can show how close the
+    /// context is to the threshold without duplicating the defaults.
+    pub fn compaction_settings(&self) -> crate::types::CompactionSettings {
+        self.inner.lock().unwrap().compaction.clone()
+    }
+
     /// The run recovery repaired and that is waiting to be continued, if any.
     pub fn pending_resume(&self) -> Option<PendingResume> {
         self.inner
@@ -1992,6 +1998,7 @@ impl AgentHarness {
     fn deferred_stream_options(&self, snap: &ConfigSnapshot) -> rpi_ai::SimpleStreamOptions {
         rpi_ai::SimpleStreamOptions {
             timeout: snap.stream_options.timeout,
+            stream_idle_timeout: snap.stream_options.stream_idle_timeout,
             session_id: None,
             signal: CancellationToken::new(),
             reasoning: match snap.thinking_level {
@@ -2991,10 +2998,13 @@ impl AgentHarness {
                             format!("No provider registered for '{}'", model.provider),
                             0,
                         );
-                        let _ = producer.push(rpi_ai::types::AssistantMessageEvent::Error {
-                            reason: rpi_ai::types::ErrorReason::Error,
-                            error: msg,
-                        });
+                        // Terminal publication never waits for ordinary queue capacity.
+                        let _ = futures::executor::block_on(producer.push(
+                            rpi_ai::types::AssistantMessageEvent::Error {
+                                reason: rpi_ai::types::ErrorReason::Error,
+                                error: msg,
+                            },
+                        ));
                         stream
                     }
                 }
@@ -3723,6 +3733,7 @@ impl AgentHarness {
                                 None
                             },
                             custom_instructions: None,
+                            stream_options: snap.stream_options.clone(),
                         };
                         match {
                             let _progress = crate::events::CompactionProgressGuard::new(
@@ -3868,6 +3879,7 @@ impl AgentHarness {
                 let harness = self.clone();
                 let enabled = snap.compaction.enabled;
                 let settings = snap.compaction;
+                let stream_options = snap.stream_options.clone();
                 let model = snap.model.clone();
                 let provider = snap
                     .models
@@ -3884,6 +3896,7 @@ impl AgentHarness {
                         let provider = provider.clone().expect("checked above");
                         let cut = Arc::clone(&cut_for_hook);
                         let compaction_signal = compaction_signal.clone();
+                        let stream_options = stream_options.clone();
                         let compaction_run_id = compaction_run_id.clone();
                         let context = ctx.context.clone();
                         let new_messages_len = ctx.new_messages.len();
@@ -3897,7 +3910,7 @@ impl AgentHarness {
                                 message: message.clone(), terminate: None,
                             })).collect();
                             let prep = match prepare_compaction(&entries, settings) { Ok(Some(p)) => p, _ => return None };
-                            let opts = CompactionLlmOptions { provider, model: model.clone(), api_key: None, signal: compaction_signal, thinking_level: None, retry: None, custom_instructions: None };
+                            let opts = CompactionLlmOptions { provider, model: model.clone(), api_key: None, signal: compaction_signal, thinking_level: None, retry: None, custom_instructions: None, stream_options };
                             let result = match { let _progress = crate::events::CompactionProgressGuard::new(&harness.bus, &harness.lane, false); compact(&prep, &opts).await } { Ok(r) => r, Err(_) => return None };
                             // Mid-loop compaction fires because the turn pushed the
                             // context over the threshold.
@@ -3941,6 +3954,7 @@ impl AgentHarness {
             thinking_level: snap.thinking_level,
             api_key: None,
             timeout: snap.stream_options.timeout,
+            stream_idle_timeout: snap.stream_options.stream_idle_timeout,
             // Pi's `retry.maxRetries` is an assistant-level retry budget. The
             // provider/SDK retry budget is intentionally independent and
             // defaults to zero, so transient failures are retried by the
@@ -4369,6 +4383,7 @@ impl AgentHarness {
                             None
                         },
                         custom_instructions: custom_instructions.clone(),
+                        stream_options: snap.stream_options.clone(),
                     };
                     match {
                         let _progress = crate::events::CompactionProgressGuard::new(
@@ -4438,6 +4453,10 @@ impl AgentHarness {
             }
         };
 
+        if matches!(outcome, CompactionOutcome::Declined { .. }) {
+            self.write_operation_finished(&run_id, OperationOutcome::Declined, None)
+                .await?;
+        }
         self.finish_context_writes(&run_id, None).await?;
         Ok(CompactionResult { run_id, outcome })
     }

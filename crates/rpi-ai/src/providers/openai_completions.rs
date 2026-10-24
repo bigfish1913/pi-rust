@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use serde_json::{json, Map, Value};
 
 use crate::event_stream::{
-    create_assistant_message_event_stream, AssistantMessageEventStream,
+    create_assistant_message_event_stream_with_cancellation, AssistantMessageEventStream,
     AssistantMessageEventStreamProducer,
 };
 use crate::model::{MaxTokensField, Model, StreamingProtocolCompat};
@@ -104,14 +104,16 @@ impl Provider for OpenAiCompletionsProvider {
         ctx: &Context,
         opts: &SimpleStreamOptions,
     ) -> AssistantMessageEventStream {
-        let (mut producer, stream) = create_assistant_message_event_stream();
+        let (mut producer, stream) =
+            create_assistant_message_event_stream_with_cancellation(&opts.signal);
         let http = self.http.clone();
         let provider_key = self.api_key.clone();
         let allow_env_api_key = self.allow_env_api_key;
         let require_auth = self.require_auth;
         let model = model.clone();
         let ctx = Arc::new(ctx.clone());
-        let opts = opts.clone();
+        let mut opts = opts.clone();
+        opts.signal = producer.cancellation_token();
 
         tokio::spawn(async move {
             run_stream(
@@ -144,10 +146,13 @@ async fn run_stream(
     let mut state = StreamState::new(model);
     let api_key = resolve_api_key(&provider_key, opts, allow_env_api_key);
 
-    let mut headers = model.headers.clone().unwrap_or_default();
-    if let Some(extra) = &opts.headers {
+    let mut headers = BTreeMap::new();
+    for extra in [model.headers.as_ref(), opts.headers.as_ref()]
+        .into_iter()
+        .flatten()
+    {
         for (name, value) in extra {
-            headers.insert(name.clone(), value.clone());
+            crate::provider::set_http_header(&mut headers, name, Some(value));
         }
     }
     apply_api_key(&mut headers, api_key);
@@ -155,11 +160,13 @@ async fn run_stream(
     // caller/model already set a User-Agent.
     crate::http::ensure_user_agent(&mut headers);
     if require_auth && !has_auth_header(&headers) {
-        state.error(
-            producer,
-            format!("No API key for provider: {}", model.provider),
-            false,
-        );
+        state
+            .error(
+                producer,
+                format!("No API key for provider: {}", model.provider),
+                false,
+            )
+            .await;
         return;
     }
 
@@ -212,19 +219,25 @@ async fn run_stream(
     let response = match response {
         Ok(response) => response,
         Err(error) => {
-            state.error(producer, error.to_string(), error.is_abort());
+            state
+                .error(producer, error.to_string(), error.is_abort())
+                .await;
             return;
         }
     };
 
-    state.start(producer);
-    let mut events = SseEventStream::new(response, opts.signal.clone());
+    state.start(producer).await;
+    let mut events = SseEventStream::new(response, opts.signal.clone())
+        .with_idle_timeout(opts.stream_idle_timeout());
     loop {
         match events.next_event().await {
             Ok(Some(event)) if event.data.trim() == "[DONE]" => {
-                state.finish(producer, model);
+                state.finish(producer, model).await;
                 return;
             }
+            // Named keepalives and empty data frames carry no JSON payload.
+            // Their bytes still refresh the shared SSE idle watchdog.
+            Ok(Some(event)) if event.data.trim().is_empty() => continue,
             Ok(Some(event)) => match serde_json::from_str::<Value>(&event.data) {
                 Ok(chunk) => {
                     if let Some(message) = chunk
@@ -232,26 +245,30 @@ async fn run_stream(
                         .and_then(|v| v.get("message"))
                         .and_then(Value::as_str)
                     {
-                        state.error(producer, message.to_string(), false);
+                        state.error(producer, message.to_string(), false).await;
                         return;
                     }
-                    state.apply_chunk(producer, &chunk);
+                    state.apply_chunk(producer, &chunk).await;
                 }
                 Err(error) => {
-                    state.error(
-                        producer,
-                        format!("failed to parse OpenAI SSE chunk: {error}"),
-                        false,
-                    );
+                    state
+                        .error(
+                            producer,
+                            format!("failed to parse OpenAI SSE chunk: {error}"),
+                            false,
+                        )
+                        .await;
                     return;
                 }
             },
             Ok(None) => {
-                state.finish(producer, model);
+                state.finish(producer, model).await;
                 return;
             }
             Err(error) => {
-                state.error(producer, error.to_string(), error.is_abort());
+                state
+                    .error(producer, error.to_string(), error.is_abort())
+                    .await;
                 return;
             }
         }
@@ -409,12 +426,32 @@ fn build_request(model: &Model, ctx: &Context, opts: &SimpleStreamOptions) -> Va
     if supports_streaming_usage(model) {
         body.insert("stream_options".into(), json!({ "include_usage": true }));
     }
-    let max_tokens = opts.max_tokens.unwrap_or(model.max_tokens);
+    let max_tokens = resolve_max_tokens(model, opts);
     if max_tokens > 0 {
         body.insert(max_tokens_field(model).into(), Value::from(max_tokens));
     }
     if let Some(temperature) = opts.temperature {
         body.insert("temperature".into(), Value::from(temperature));
+    }
+    if compat(model).and_then(|c| c.thinking_format)
+        == Some(crate::model::OpenaiThinkingFormat::Deepseek)
+    {
+        // An explicitly configured DeepSeek format must also disable the
+        // endpoint's default thinking when the catalog marks a model non-reasoning.
+        let enabled = model.reasoning && opts.reasoning_level() != ThinkingLevel::Off;
+        let can_disable = !matches!(
+            model
+                .thinking_level_map
+                .as_ref()
+                .and_then(|map| map.get(&ThinkingLevel::Off)),
+            Some(None)
+        );
+        if enabled || can_disable {
+            body.insert(
+                "thinking".into(),
+                json!({ "type": if enabled { "enabled" } else { "disabled" } }),
+            );
+        }
     }
     if model.reasoning && supports_reasoning_effort(model) {
         if let Some(effort) = reasoning_effort(model, opts.reasoning_level()) {
@@ -580,6 +617,58 @@ fn requires_thinking_as_text(model: &Model) -> bool {
         .unwrap_or(false)
 }
 
+/// The reasoning budget a request with the active thinking level should leave
+/// room for, in tokens. `0` when thinking is off.
+fn thinking_budget(opts: &SimpleStreamOptions) -> u64 {
+    let level = crate::providers::anthropic::build_params::clamp_reasoning(opts.reasoning_level());
+    if level == ThinkingLevel::Off {
+        return 0;
+    }
+    let defaults = crate::providers::anthropic::build_params::default_thinking_budgets();
+    let budgets = opts.thinking_budgets.unwrap_or(defaults);
+    match level {
+        ThinkingLevel::Minimal => budgets.minimal.or(defaults.minimal),
+        ThinkingLevel::Low => budgets.low.or(defaults.low),
+        ThinkingLevel::Medium => budgets.medium.or(defaults.medium),
+        _ => budgets.high.or(defaults.high),
+    }
+    .unwrap_or(0)
+}
+
+/// Whether this model's `max_tokens` covers hidden reasoning tokens too.
+fn reasoning_counts_toward_max_tokens(model: &Model) -> bool {
+    model.reasoning
+        && compat(model)
+            .and_then(|compat| compat.reasoning_counts_toward_max_tokens)
+            .unwrap_or(false)
+}
+
+/// Resolve the `max_tokens` / `max_completion_tokens` value for one request.
+///
+/// `Model::max_tokens` describes the visible *answer* allowance. Gateways that
+/// bill hidden reasoning tokens inside that same budget (DeepSeek's reasoning
+/// models, and relays that copy them) would otherwise spend it on the chain of
+/// thought: the stream ends with `finish_reason: "length"` and an empty or
+/// clipped answer, indistinguishable from an interrupted message. For models
+/// that declare [`reasoning_counts_toward_max_tokens`](crate::model::OpenaiCompletionsCompat::reasoning_counts_toward_max_tokens)
+/// the request reserves the level's reasoning budget on top of the answer
+/// allowance, which is the same shape Anthropic gets from
+/// `adjust_max_tokens_for_thinking`.
+///
+/// A caller-pinned `opts.max_tokens` is sent verbatim: whoever computed it owns
+/// the reasoning headroom, so this rule never stacks a second time.
+fn resolve_max_tokens(model: &Model, opts: &SimpleStreamOptions) -> u64 {
+    let Some(pinned) = opts.max_tokens else {
+        let base = model.max_tokens;
+        return if reasoning_counts_toward_max_tokens(model) {
+            base.saturating_add(thinking_budget(opts))
+        } else {
+            base
+        };
+    };
+    pinned
+}
+
 fn max_tokens_field(model: &Model) -> &'static str {
     match compat(model).and_then(|compat| compat.max_tokens_field) {
         Some(MaxTokensField::MaxCompletionTokens) => "max_completion_tokens",
@@ -692,12 +781,12 @@ impl StreamState {
 
     /// Emit whatever text/thinking is batched. Called at every channel boundary
     /// so no delta is ever dropped or reordered.
-    fn flush_pending(&mut self, producer: &mut AssistantMessageEventStreamProducer) {
-        self.flush_text(producer);
-        self.flush_thinking(producer);
+    async fn flush_pending(&mut self, producer: &mut AssistantMessageEventStreamProducer) {
+        self.flush_text(producer).await;
+        self.flush_thinking(producer).await;
     }
 
-    fn flush_text(&mut self, producer: &mut AssistantMessageEventStreamProducer) {
+    async fn flush_text(&mut self, producer: &mut AssistantMessageEventStreamProducer) {
         if self.pending_text.is_empty() {
             return;
         }
@@ -707,14 +796,16 @@ impl StreamState {
         };
         let delta = std::mem::take(&mut self.pending_text);
         self.last_flush = Instant::now();
-        producer.push(AssistantMessageEvent::TextDelta {
-            content_index: index,
-            delta,
-            partial: Arc::new(self.output.clone()),
-        });
+        producer
+            .push(AssistantMessageEvent::TextDelta {
+                content_index: index,
+                delta,
+                partial: Arc::new(self.output.clone()),
+            })
+            .await;
     }
 
-    fn flush_thinking(&mut self, producer: &mut AssistantMessageEventStreamProducer) {
+    async fn flush_thinking(&mut self, producer: &mut AssistantMessageEventStreamProducer) {
         if self.pending_thinking.is_empty() {
             return;
         }
@@ -724,23 +815,31 @@ impl StreamState {
         };
         let delta = std::mem::take(&mut self.pending_thinking);
         self.last_flush = Instant::now();
-        producer.push(AssistantMessageEvent::ThinkingDelta {
-            content_index: index,
-            delta,
-            partial: Arc::new(self.output.clone()),
-        });
+        producer
+            .push(AssistantMessageEvent::ThinkingDelta {
+                content_index: index,
+                delta,
+                partial: Arc::new(self.output.clone()),
+            })
+            .await;
     }
 
-    fn start(&mut self, producer: &mut AssistantMessageEventStreamProducer) {
+    async fn start(&mut self, producer: &mut AssistantMessageEventStreamProducer) {
         if !self.started {
             self.started = true;
-            producer.push(AssistantMessageEvent::Start {
-                partial: Arc::new(self.output.clone()),
-            });
+            producer
+                .push(AssistantMessageEvent::Start {
+                    partial: Arc::new(self.output.clone()),
+                })
+                .await;
         }
     }
 
-    fn apply_chunk(&mut self, producer: &mut AssistantMessageEventStreamProducer, chunk: &Value) {
+    async fn apply_chunk(
+        &mut self,
+        producer: &mut AssistantMessageEventStreamProducer,
+        chunk: &Value,
+    ) {
         if let Some(id) = chunk.get("id").and_then(Value::as_str) {
             self.output.response_id = Some(id.to_string());
         }
@@ -756,6 +855,7 @@ impl StreamState {
             .and_then(Value::as_array)
             .and_then(|choices| choices.first())
         else {
+            producer.commit_metadata(&self.output);
             return;
         };
         if chunk.get("usage").map_or(true, Value::is_null) {
@@ -769,7 +869,7 @@ impl StreamState {
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
         {
-            self.push_text(producer, text);
+            self.push_text(producer, text).await;
         }
         let thinking = delta
             .get("reasoning_content")
@@ -778,11 +878,11 @@ impl StreamState {
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty());
         if let Some(thinking) = thinking {
-            self.push_thinking(producer, thinking);
+            self.push_thinking(producer, thinking).await;
         }
         if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
             for tool in tool_calls {
-                self.push_tool_delta(producer, tool);
+                self.push_tool_delta(producer, tool).await;
             }
         }
         if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
@@ -796,19 +896,22 @@ impl StreamState {
                 }
             }
         }
+        producer.commit_metadata(&self.output);
     }
 
-    fn push_text(&mut self, producer: &mut AssistantMessageEventStreamProducer, delta: &str) {
+    async fn push_text(&mut self, producer: &mut AssistantMessageEventStreamProducer, delta: &str) {
         let index = match self.text_index {
             Some(index) => index,
             None => {
                 let index = self.output.content.len();
                 self.output.content.push(Content::text(""));
                 self.text_index = Some(index);
-                producer.push(AssistantMessageEvent::TextStart {
-                    content_index: index,
-                    partial: Arc::new(self.output.clone()),
-                });
+                producer
+                    .push(AssistantMessageEvent::TextStart {
+                        content_index: index,
+                        partial: Arc::new(self.output.clone()),
+                    })
+                    .await;
                 index
             }
         };
@@ -819,14 +922,18 @@ impl StreamState {
         // SSE chunk makes a long stream quadratic. See `DELTA_FLUSH_BYTES`.
         self.pending_text.push_str(delta);
         if self.should_flush(&self.pending_text) {
-            self.flush_text(producer);
+            self.flush_text(producer).await;
         }
     }
 
-    fn push_thinking(&mut self, producer: &mut AssistantMessageEventStreamProducer, delta: &str) {
+    async fn push_thinking(
+        &mut self,
+        producer: &mut AssistantMessageEventStreamProducer,
+        delta: &str,
+    ) {
         // Keep channel order strict: text already streamed must be emitted before
         // the first thinking delta of a new block.
-        self.flush_text(producer);
+        self.flush_text(producer).await;
         let index = match self.thinking_index {
             Some(index) => index,
             None => {
@@ -838,10 +945,12 @@ impl StreamState {
                     redacted: false,
                 }));
                 self.thinking_index = Some(index);
-                producer.push(AssistantMessageEvent::ThinkingStart {
-                    content_index: index,
-                    partial: Arc::new(self.output.clone()),
-                });
+                producer
+                    .push(AssistantMessageEvent::ThinkingStart {
+                        content_index: index,
+                        partial: Arc::new(self.output.clone()),
+                    })
+                    .await;
                 index
             }
         };
@@ -850,18 +959,18 @@ impl StreamState {
         }
         self.pending_thinking.push_str(delta);
         if self.should_flush(&self.pending_thinking) {
-            self.flush_thinking(producer);
+            self.flush_thinking(producer).await;
         }
     }
 
-    fn push_tool_delta(
+    async fn push_tool_delta(
         &mut self,
         producer: &mut AssistantMessageEventStreamProducer,
         value: &Value,
     ) {
         // A tool-call block starts a new channel; flush what is batched so the
         // consumer never sees tool events before the text that preceded them.
-        self.flush_pending(producer);
+        self.flush_pending(producer).await;
         let wire_index = value.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
         if !self.tools.contains_key(&wire_index) {
             let content_index = self.output.content.len();
@@ -877,10 +986,12 @@ impl StreamState {
                     arguments: String::new(),
                 },
             );
-            producer.push(AssistantMessageEvent::ToolCallStart {
-                content_index,
-                partial: Arc::new(self.output.clone()),
-            });
+            producer
+                .push(AssistantMessageEvent::ToolCallStart {
+                    content_index,
+                    partial: Arc::new(self.output.clone()),
+                })
+                .await;
         }
 
         let tool = self
@@ -914,40 +1025,46 @@ impl StreamState {
             call.arguments = parse_streaming_json(Some(&tool.arguments));
         }
         if !arguments.is_empty() {
-            producer.push(AssistantMessageEvent::ToolCallDelta {
-                content_index: tool.content_index,
-                delta: arguments.to_string(),
-                partial: Arc::new(self.output.clone()),
-            });
+            producer
+                .push(AssistantMessageEvent::ToolCallDelta {
+                    content_index: tool.content_index,
+                    delta: arguments.to_string(),
+                    partial: Arc::new(self.output.clone()),
+                })
+                .await;
         }
     }
 
-    fn finish(&mut self, producer: &mut AssistantMessageEventStreamProducer, model: &Model) {
+    async fn finish(&mut self, producer: &mut AssistantMessageEventStreamProducer, model: &Model) {
         // Terminal boundary: emit the last batched delta before the `*End`
         // events, otherwise the tail of a short final chunk would be visible in
         // the final message but never in the delta stream.
-        self.flush_pending(producer);
+        self.flush_pending(producer).await;
         if let Some(index) = self.text_index {
             let content = match self.output.content.get(index) {
                 Some(Content::Text(text)) => text.text.clone(),
                 _ => String::new(),
             };
-            producer.push(AssistantMessageEvent::TextEnd {
-                content_index: index,
-                content,
-                partial: Arc::new(self.output.clone()),
-            });
+            producer
+                .push(AssistantMessageEvent::TextEnd {
+                    content_index: index,
+                    content,
+                    partial: Arc::new(self.output.clone()),
+                })
+                .await;
         }
         if let Some(index) = self.thinking_index {
             let content = match self.output.content.get(index) {
                 Some(Content::Thinking(thinking)) => thinking.thinking.clone(),
                 _ => String::new(),
             };
-            producer.push(AssistantMessageEvent::ThinkingEnd {
-                content_index: index,
-                content,
-                partial: Arc::new(self.output.clone()),
-            });
+            producer
+                .push(AssistantMessageEvent::ThinkingEnd {
+                    content_index: index,
+                    content,
+                    partial: Arc::new(self.output.clone()),
+                })
+                .await;
         }
         for tool in self.tools.values() {
             let call = ToolCall {
@@ -961,14 +1078,16 @@ impl StreamState {
             if let Some(slot) = self.output.content.get_mut(tool.content_index) {
                 *slot = Content::ToolCall(call.clone());
             }
-            producer.push(AssistantMessageEvent::ToolCallEnd {
-                content_index: tool.content_index,
-                tool_call: call,
-                partial: Arc::new(self.output.clone()),
-            });
+            producer
+                .push(AssistantMessageEvent::ToolCallEnd {
+                    content_index: tool.content_index,
+                    tool_call: call,
+                    partial: Arc::new(self.output.clone()),
+                })
+                .await;
         }
         if let Some(message) = self.finish_error.take() {
-            self.error(producer, message, false);
+            self.error(producer, message, false).await;
             return;
         }
         if self.finish_reason.is_none() && supports_finish_reason(model) {
@@ -976,7 +1095,8 @@ impl StreamState {
                 producer,
                 "Stream ended without finish_reason".to_string(),
                 false,
-            );
+            )
+            .await;
             return;
         }
         let reason = self.finish_reason.unwrap_or_else(|| {
@@ -988,13 +1108,15 @@ impl StreamState {
         });
         self.output.stop_reason = reason.into();
         self.output.usage.cost = calculate_cost(&model.cost, &self.output.usage);
-        producer.push(AssistantMessageEvent::Done {
-            reason,
-            message: self.output.clone(),
-        });
+        producer
+            .push(AssistantMessageEvent::Done {
+                reason,
+                message: self.output.clone(),
+            })
+            .await;
     }
 
-    fn error(
+    async fn error(
         &mut self,
         producer: &mut AssistantMessageEventStreamProducer,
         message: String,
@@ -1008,15 +1130,17 @@ impl StreamState {
         self.output.error_message = Some(message);
         // Surface whatever streamed before the failure; the batched tail would
         // otherwise be lost from the delta stream.
-        self.flush_pending(producer);
-        producer.push(AssistantMessageEvent::Error {
-            reason: if aborted {
-                ErrorReason::Aborted
-            } else {
-                ErrorReason::Error
-            },
-            error: self.output.clone(),
-        });
+        self.flush_pending(producer).await;
+        producer
+            .push(AssistantMessageEvent::Error {
+                reason: if aborted {
+                    ErrorReason::Aborted
+                } else {
+                    ErrorReason::Error
+                },
+                error: self.output.clone(),
+            })
+            .await;
     }
 }
 
@@ -1069,6 +1193,7 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event_stream::create_assistant_message_event_stream;
     use crate::model::OpenaiCompletionsCompat;
     use crate::types::{
         AssistantMessage, AssistantMessageEvent, ImageContent, ImageContentType, Message,
@@ -1095,9 +1220,9 @@ mod tests {
 
     /// Drain every event the producer pushed. `next()` yields `None` after the
     /// terminal `Done`/`Error`, so this always terminates.
-    fn drain(stream: &mut AssistantMessageEventStream) -> Vec<AssistantMessageEvent> {
+    async fn drain(stream: &mut AssistantMessageEventStream) -> Vec<AssistantMessageEvent> {
         let mut events = Vec::new();
-        while let Some(event) = futures::executor::block_on(stream.next()) {
+        while let Some(event) = stream.next().await {
             events.push(event);
         }
         events
@@ -1113,8 +1238,8 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn a_slow_stream_flushes_on_the_interval_not_the_byte_count() {
+    #[tokio::test]
+    async fn a_slow_stream_flushes_on_the_interval_not_the_byte_count() {
         // A pure byte threshold would hide output for
         // `DELTA_FLUSH_BYTES / rate`; a model emitting one character per 100ms
         // would show nothing for six seconds. Ageing `last_flush` by more than
@@ -1126,9 +1251,9 @@ mod tests {
         let model = model();
         let (mut producer, mut stream) = create_assistant_message_event_stream();
         let mut state = StreamState::new(&model);
-        state.start(&mut producer);
+        state.start(&mut producer).await;
 
-        state.apply_chunk(&mut producer, &text_chunk("a"));
+        state.apply_chunk(&mut producer, &text_chunk("a")).await;
         assert_eq!(
             state.pending_text, "a",
             "a single byte well inside the interval must stay batched (no event)"
@@ -1138,20 +1263,23 @@ mod tests {
         state.last_flush = Instant::now()
             .checked_sub(DELTA_FLUSH_INTERVAL + Duration::from_millis(5))
             .expect("instant arithmetic");
-        state.apply_chunk(&mut producer, &text_chunk("b"));
+        state.apply_chunk(&mut producer, &text_chunk("b")).await;
         assert!(
             state.pending_text.is_empty(),
             "an aged batch must be emitted even though it is under the byte threshold"
         );
 
-        state.apply_chunk(&mut producer, &stop_chunk());
-        state.finish(&mut producer, &model);
+        state.apply_chunk(&mut producer, &stop_chunk()).await;
+        state.finish(&mut producer, &model).await;
         // Flushing early must not lose or duplicate anything.
-        assert_eq!(text_deltas(&drain(&mut stream)), vec!["ab".to_string()]);
+        assert_eq!(
+            text_deltas(&drain(&mut stream).await),
+            vec!["ab".to_string()]
+        );
     }
 
-    #[test]
-    fn event_count_is_bounded_by_the_batch_size_not_the_message_length() {
+    #[tokio::test]
+    async fn event_count_is_bounded_by_the_batch_size_not_the_message_length() {
         // The regression this guards: every event carries a full
         // `Arc<AssistantMessage>` snapshot, so one event per SSE chunk made a
         // long stream quadratic (measured 500 deltas 1.1ms → 8000 deltas 105ms).
@@ -1160,15 +1288,15 @@ mod tests {
         let model = model();
         let (mut producer, mut stream) = create_assistant_message_event_stream();
         let mut state = StreamState::new(&model);
-        state.start(&mut producer);
-
         let total = 8000usize;
-        for _ in 0..total {
-            state.apply_chunk(&mut producer, &text_chunk("x"));
-        }
-        state.finish(&mut producer, &model);
-
-        let events = drain(&mut stream);
+        let produce = async {
+            state.start(&mut producer).await;
+            for _ in 0..total {
+                state.apply_chunk(&mut producer, &text_chunk("x")).await;
+            }
+            state.finish(&mut producer, &model).await;
+        };
+        let (_, events) = tokio::join!(produce, drain(&mut stream));
         let batches = text_deltas(&events).len();
         assert!(
             batches <= total / DELTA_FLUSH_BYTES + 5,
@@ -1179,22 +1307,22 @@ mod tests {
         assert_eq!(text_deltas(&events).join("").len(), total);
     }
 
-    #[test]
-    fn batched_text_is_flushed_before_text_end_and_matches_the_final_message() {
+    #[tokio::test]
+    async fn batched_text_is_flushed_before_text_end_and_matches_the_final_message() {
         let model = model();
         let (mut producer, mut stream) = create_assistant_message_event_stream();
         let mut state = StreamState::new(&model);
-        state.start(&mut producer);
+        state.start(&mut producer).await;
 
         // Deliberately shorter than the flush threshold: the tail must still
         // reach the consumer, via the boundary flush in `finish`.
         let short = "hi";
         assert!(short.len() < DELTA_FLUSH_BYTES);
-        state.apply_chunk(&mut producer, &text_chunk(short));
-        state.apply_chunk(&mut producer, &stop_chunk());
-        state.finish(&mut producer, &model);
+        state.apply_chunk(&mut producer, &text_chunk(short)).await;
+        state.apply_chunk(&mut producer, &stop_chunk()).await;
+        state.finish(&mut producer, &model).await;
 
-        let events = drain(&mut stream);
+        let events = drain(&mut stream).await;
         let deltas = text_deltas(&events);
         assert_eq!(deltas, vec![short.to_string()]);
 
@@ -1220,18 +1348,20 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn channel_switch_flushes_text_before_the_thinking_block() {
+    #[tokio::test]
+    async fn channel_switch_flushes_text_before_the_thinking_block() {
         let model = model();
         let (mut producer, mut stream) = create_assistant_message_event_stream();
         let mut state = StreamState::new(&model);
-        state.start(&mut producer);
+        state.start(&mut producer).await;
 
-        state.apply_chunk(&mut producer, &text_chunk("abc"));
-        state.apply_chunk(&mut producer, &thinking_chunk("reasoning"));
-        state.finish(&mut producer, &model);
+        state.apply_chunk(&mut producer, &text_chunk("abc")).await;
+        state
+            .apply_chunk(&mut producer, &thinking_chunk("reasoning"))
+            .await;
+        state.finish(&mut producer, &model).await;
 
-        let events = drain(&mut stream);
+        let events = drain(&mut stream).await;
         let delta_at = events
             .iter()
             .position(|e| matches!(e, AssistantMessageEvent::TextDelta { .. }))
@@ -1252,20 +1382,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn thinking_deltas_are_batched_losslessly_too() {
+    #[tokio::test]
+    async fn thinking_deltas_are_batched_losslessly_too() {
         let model = model();
         let (mut producer, mut stream) = create_assistant_message_event_stream();
         let mut state = StreamState::new(&model);
-        state.start(&mut producer);
+        state.start(&mut producer).await;
 
         let total = 500usize;
         for _ in 0..total {
-            state.apply_chunk(&mut producer, &thinking_chunk("y"));
+            state.apply_chunk(&mut producer, &thinking_chunk("y")).await;
         }
-        state.finish(&mut producer, &model);
+        state.finish(&mut producer, &model).await;
 
-        let events = drain(&mut stream);
+        let events = drain(&mut stream).await;
         let joined: String = events
             .iter()
             .filter_map(|event| match event {
@@ -1284,17 +1414,19 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_error_flushes_batched_text_before_the_terminal_event() {
+    #[tokio::test]
+    async fn an_error_flushes_batched_text_before_the_terminal_event() {
         let model = model();
         let (mut producer, mut stream) = create_assistant_message_event_stream();
         let mut state = StreamState::new(&model);
-        state.start(&mut producer);
+        state.start(&mut producer).await;
 
-        state.apply_chunk(&mut producer, &text_chunk("partial"));
-        state.error(&mut producer, "boom".to_string(), false);
+        state
+            .apply_chunk(&mut producer, &text_chunk("partial"))
+            .await;
+        state.error(&mut producer, "boom".to_string(), false).await;
 
-        let events = drain(&mut stream);
+        let events = drain(&mut stream).await;
         assert_eq!(text_deltas(&events), vec!["partial".to_string()]);
         assert!(matches!(
             events.last(),
@@ -1386,6 +1518,73 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_that_shares_the_completion_budget_reserves_answer_room() {
+        // DeepSeek's reasoning models bill the chain of thought inside
+        // `max_tokens`. Sending only the answer allowance made long thinking
+        // sessions end with `finish_reason: "length"` and no visible text, so
+        // the level's reasoning budget is added on top when the model opts in.
+        let mut model = model();
+        model.compat = Some(StreamingProtocolCompat::OpenaiCompletions(
+            OpenaiCompletionsCompat {
+                reasoning_counts_toward_max_tokens: Some(true),
+                ..Default::default()
+            },
+        ));
+        let context = Context::new(vec![Message::User(UserMessage::new("hello", 0))]);
+
+        let mut opts = SimpleStreamOptions::default();
+        opts.reasoning = Some(ThinkingLevel::High);
+        let body = build_request(&model, &context, &opts);
+        assert_eq!(body["max_completion_tokens"], 1024 + 16_384);
+
+        // Thinking off keeps the plain answer allowance.
+        let mut off = SimpleStreamOptions::default();
+        off.reasoning = Some(ThinkingLevel::Off);
+        let body = build_request(&model, &context, &off);
+        assert_eq!(body["max_completion_tokens"], 1024);
+
+        // A caller-pinned ceiling is sent verbatim: it already carries whatever
+        // reasoning headroom its owner wanted.
+        let mut pinned = SimpleStreamOptions::default();
+        pinned.reasoning = Some(ThinkingLevel::Low);
+        pinned.max_tokens = Some(4096);
+        let body = build_request(&model, &context, &pinned);
+        assert_eq!(body["max_completion_tokens"], 4096);
+
+        // Custom per-level budgets are honoured.
+        let mut custom = SimpleStreamOptions::default();
+        custom.reasoning = Some(ThinkingLevel::High);
+        custom.thinking_budgets = Some(crate::types::ThinkingBudgets {
+            high: Some(24_000),
+            ..Default::default()
+        });
+        let body = build_request(&model, &context, &custom);
+        assert_eq!(body["max_completion_tokens"], 1024 + 24_000);
+    }
+
+    #[test]
+    fn models_without_the_shared_budget_flag_keep_their_ceiling() {
+        // The compat flag is opt-in: every other gateway keeps sending exactly
+        // the configured cap, even with thinking enabled.
+        let mut model = model();
+        assert!(model.compat.is_none());
+        let context = Context::new(vec![Message::User(UserMessage::new("hello", 0))]);
+        let mut opts = SimpleStreamOptions::default();
+        opts.reasoning = Some(ThinkingLevel::High);
+        let body = build_request(&model, &context, &opts);
+        assert_eq!(body["max_completion_tokens"], 1024);
+
+        model.compat = Some(StreamingProtocolCompat::OpenaiCompletions(
+            OpenaiCompletionsCompat {
+                reasoning_counts_toward_max_tokens: Some(false),
+                ..Default::default()
+            },
+        ));
+        let body = build_request(&model, &context, &opts);
+        assert_eq!(body["max_completion_tokens"], 1024);
+    }
+
+    #[test]
     fn drops_empty_aborted_assistant_messages() {
         // A stopped/aborted turn leaves a terminal assistant message with no
         // content and no tool calls in context. DeepSeek (and other strict
@@ -1452,6 +1651,71 @@ mod tests {
     }
 
     #[test]
+    fn pi_deepseek_compat_preserves_reasoning_and_controls_thinking() {
+        let mut model = model();
+        model.compat = Some(StreamingProtocolCompat::OpenaiCompletions(
+            serde_json::from_value(json!({
+                "thinkingFormat": "deepseek",
+                "requiresReasoningContentOnAssistantMessages": true,
+                "supportsReasoningEffort": false
+            }))
+            .unwrap(),
+        ));
+        let mut assistant =
+            AssistantMessage::empty(Api::OpenaiCompletions, "gateway", "gpt-test", 1);
+        assistant.content = vec![
+            Content::thinking("retained reasoning"),
+            Content::text("answer"),
+        ];
+        let mut plain = assistant.clone();
+        plain.content = vec![Content::text("plain answer")];
+        let context = Context::new(vec![
+            Message::Assistant(Box::new(assistant)),
+            Message::Assistant(Box::new(plain)),
+        ]);
+        let options = SimpleStreamOptions {
+            reasoning: Some(ThinkingLevel::High),
+            ..Default::default()
+        };
+        let request = build_request(&model, &context, &options);
+        assert_eq!(request["thinking"]["type"], "enabled");
+        assert!(request.get("reasoning_effort").is_none());
+        assert_eq!(
+            request["messages"][0]["reasoning_content"],
+            "retained reasoning"
+        );
+        assert_eq!(request["messages"][1]["reasoning_content"], "");
+        let off = build_request(&model, &context, &SimpleStreamOptions::default());
+        assert_eq!(off["thinking"]["type"], "disabled");
+        model.thinking_level_map = Some(BTreeMap::from([(ThinkingLevel::Off, None)]));
+        assert!(
+            build_request(&model, &context, &SimpleStreamOptions::default())
+                .get("thinking")
+                .is_none()
+        );
+        model.compat = None;
+        assert!(build_request(&model, &context, &options)
+            .get("thinking")
+            .is_none());
+    }
+
+    #[test]
+    fn deepseek_format_explicitly_disables_thinking_for_non_reasoning_models() {
+        let mut model = model();
+        model.reasoning = false;
+        model.compat = Some(StreamingProtocolCompat::OpenaiCompletions(
+            serde_json::from_value(json!({"thinkingFormat":"deepseek"})).unwrap(),
+        ));
+        let request = build_request(
+            &model,
+            &Context::new(vec![]),
+            &SimpleStreamOptions::default(),
+        );
+        assert_eq!(request["thinking"]["type"], "disabled");
+        assert!(request.get("reasoning_effort").is_none());
+    }
+
+    #[test]
     fn applies_message_compat_and_preserves_tool_result_images() {
         let mut model = model();
         model.input.push(InputModality::Image);
@@ -1505,32 +1769,36 @@ mod tests {
         assert_eq!(body["store"], false);
     }
 
-    #[test]
-    fn maps_text_tool_calls_and_usage() {
+    #[tokio::test]
+    async fn maps_text_tool_calls_and_usage() {
         let model = model();
         let (mut producer, _stream) = create_assistant_message_event_stream();
         let mut state = StreamState::new(&model);
-        state.start(&mut producer);
-        state.apply_chunk(
-            &mut producer,
-            &json!({
-                "id": "chat-1",
-                "model": "gpt-test-actual",
-                "choices": [{"delta": {"content": "hello"}, "finish_reason": null}]
-            }),
-        );
-        state.apply_chunk(
-            &mut producer,
-            &json!({
-                "choices": [{"delta": {"tool_calls": [{
-                    "index": 0,
-                    "id": "call-1",
-                    "function": {"name": "read", "arguments": "{\"path\":\"a\"}"}
-                }]}, "finish_reason": "tool_calls"}],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
-            }),
-        );
-        state.finish(&mut producer, &model);
+        state.start(&mut producer).await;
+        state
+            .apply_chunk(
+                &mut producer,
+                &json!({
+                    "id": "chat-1",
+                    "model": "gpt-test-actual",
+                    "choices": [{"delta": {"content": "hello"}, "finish_reason": null}]
+                }),
+            )
+            .await;
+        state
+            .apply_chunk(
+                &mut producer,
+                &json!({
+                    "choices": [{"delta": {"tool_calls": [{
+                        "index": 0,
+                        "id": "call-1",
+                        "function": {"name": "read", "arguments": "{\"path\":\"a\"}"}
+                    }]}, "finish_reason": "tool_calls"}],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+                }),
+            )
+            .await;
+        state.finish(&mut producer, &model).await;
         assert_eq!(state.output.stop_reason, StopReason::ToolUse);
         assert_eq!(state.output.response_id.as_deref(), Some("chat-1"));
         assert_eq!(state.output.usage.total_tokens, 15);
@@ -1560,19 +1828,21 @@ mod tests {
         assert_eq!(usage.total_tokens, 120);
     }
 
-    #[test]
-    fn maps_provider_error_finish_reason_to_error() {
+    #[tokio::test]
+    async fn maps_provider_error_finish_reason_to_error() {
         let model = model();
         let (mut producer, _stream) = create_assistant_message_event_stream();
         let mut state = StreamState::new(&model);
-        state.start(&mut producer);
-        state.apply_chunk(
-            &mut producer,
-            &json!({
-                "choices": [{"delta": {}, "finish_reason": "content_filter"}]
-            }),
-        );
-        state.finish(&mut producer, &model);
+        state.start(&mut producer).await;
+        state
+            .apply_chunk(
+                &mut producer,
+                &json!({
+                    "choices": [{"delta": {}, "finish_reason": "content_filter"}]
+                }),
+            )
+            .await;
+        state.finish(&mut producer, &model).await;
         assert_eq!(state.output.stop_reason, StopReason::Error);
         assert_eq!(
             state.output.error_message.as_deref(),
@@ -1580,13 +1850,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn missing_finish_reason_obeys_compat_flag() {
+    #[tokio::test]
+    async fn missing_finish_reason_obeys_compat_flag() {
         let mut model = model();
         let (mut producer, _stream) = create_assistant_message_event_stream();
         let mut state = StreamState::new(&model);
-        state.start(&mut producer);
-        state.finish(&mut producer, &model);
+        state.start(&mut producer).await;
+        state.finish(&mut producer, &model).await;
         assert_eq!(state.output.stop_reason, StopReason::Error);
 
         model.compat = Some(StreamingProtocolCompat::OpenaiCompletions(
@@ -1597,8 +1867,8 @@ mod tests {
         ));
         let (mut producer, _stream) = create_assistant_message_event_stream();
         let mut state = StreamState::new(&model);
-        state.start(&mut producer);
-        state.finish(&mut producer, &model);
+        state.start(&mut producer).await;
+        state.finish(&mut producer, &model).await;
         assert_eq!(state.output.stop_reason, StopReason::Stop);
     }
 
@@ -1624,5 +1894,39 @@ mod tests {
             chat_completions_url("https://gateway.test/custom/chat/completions"),
             "https://gateway.test/custom/chat/completions"
         );
+    }
+    #[tokio::test]
+    async fn cancellation_while_enqueue_waits_keeps_committed_content_and_metadata() {
+        use crate::event_stream::create_assistant_message_event_stream_with_limits;
+        use tokio_util::sync::CancellationToken;
+        let parent = CancellationToken::new();
+        let (mut producer, mut stream) =
+            create_assistant_message_event_stream_with_limits(1, 4 * 1024 * 1024, &parent);
+        let mut state = StreamState::new(&model());
+        state.start(&mut producer).await;
+        stream.next().await.unwrap();
+        state
+            .apply_chunk(&mut producer, &text_chunk("accepted"))
+            .await;
+        stream.next().await.unwrap(); // TextStart
+        state.flush_pending(&mut producer).await; // fills the queue with accepted content
+        state
+            .apply_chunk(
+                &mut producer,
+                &json!({ "id": "accepted-id", "choices": [], "usage": { "prompt_tokens": 42 } }),
+            )
+            .await;
+
+        let rejected = json!({ "id": "rejected-id", "choices": [{ "delta": { "content": "x".repeat(DELTA_FLUSH_BYTES) } }] });
+        let mut blocked = Box::pin(state.apply_chunk(&mut producer, &rejected));
+        assert!(futures::poll!(&mut blocked).is_pending());
+        parent.cancel();
+        blocked.await;
+        state.error(&mut producer, "cancelled".into(), true).await;
+        let result = stream.result().await.unwrap();
+        assert_eq!(result.content, vec![Content::text("accepted")]);
+        assert_eq!(result.response_id.as_deref(), Some("accepted-id"));
+        assert_eq!(result.usage.input, 42);
+        assert_eq!(result.stop_reason, StopReason::Aborted);
     }
 }

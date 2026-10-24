@@ -173,7 +173,7 @@ impl SettingsList {
     fn refilter(&self) {
         let filter = self.filter.lock().map(|f| f.clone()).unwrap_or_default();
         if let Ok(settings) = self.settings.lock() {
-            let filtered = fuzzy_filter(&*settings, &filter, |item| item.key.as_str());
+            let filtered = fuzzy_filter(&settings, &filter, |item| item.key.as_str());
             if let Ok(mut f) = self.filtered.lock() {
                 *f = filtered;
             }

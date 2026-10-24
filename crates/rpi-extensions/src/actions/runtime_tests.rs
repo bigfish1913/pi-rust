@@ -7,9 +7,21 @@ use tokio_util::sync::CancellationToken;
 struct Host {
     calls: AtomicUsize,
     revoked: AtomicUsize,
+    side_sinks: std::sync::Mutex<Vec<SideQuestionSink>>,
 }
 #[async_trait::async_trait]
 impl RuntimeActionHost for Host {
+    async fn side_question(
+        &self,
+        owner: u64,
+        args: Value,
+        sink: SideQuestionSink,
+    ) -> Result<Value, String> {
+        assert!(args.get("__rpiRuntimeKey").is_none());
+        sink(json!({"op":"register","id":"btw-test","type":"text","slot":"overlay"}))?;
+        self.side_sinks.lock().unwrap().push(sink);
+        Ok(json!({"owner":owner}))
+    }
     async fn send_message(&self, _: Value) -> Result<Value, String> {
         unreachable!()
     }
@@ -195,3 +207,39 @@ mod cleanup;
 mod driver;
 mod pacing;
 mod streaming;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn side_questions_use_plugin_owner_and_stale_sinks_cannot_resurrect_panels() {
+    let host = Arc::new(Host::default());
+    let root = ActionBridge::new(Handle::current(), host.clone());
+    let plugin = root.for_plugin("btw");
+    let invoke = |bridge: &Arc<ActionBridge>| {
+        let mut out = StbString::empty();
+        let rc = trampoline_runtime_action(
+            RuntimeActionId::SideQuestion.into(),
+            StbStringRef::from_str(r#"{"op":"start","question":"q","owner":999}"#),
+            &mut out,
+            bridge.user_data(),
+        );
+        // SAFETY: trampoline transfers its output allocation to this caller.
+        let output = unsafe {
+            rpi_plugin_sdk::callbacks::OwnedString::from_raw(out, Some(crate::host_free_string))
+        };
+        (
+            rc,
+            serde_json::from_str::<Value>(&output.to_string_lossy()).unwrap(),
+        )
+    };
+    assert_eq!(invoke(&root).0, 1);
+    let invocation = plugin.for_invocation(false, CancellationToken::new());
+    assert_eq!(invoke(&invocation).0, 1);
+    let value = invoke(&plugin);
+    assert_eq!(value.0, 0);
+    assert_eq!(value.1["owner"], plugin.plugin_identity.as_ref().unwrap().0);
+    assert!(!root.extension_status_mailbox().panels().is_empty());
+    root.invalidate();
+    assert!(root.extension_status_mailbox().panels().is_empty());
+    let sink = host.side_sinks.lock().unwrap()[0].clone();
+    assert!(sink(json!({"op":"register","id":"btw-test","type":"text"})).is_err());
+    assert!(root.extension_status_mailbox().panels().is_empty());
+}

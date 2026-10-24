@@ -17,28 +17,33 @@ async fn drain_deltas_then_done() {
 
     prod.push(AssistantMessageEvent::Start {
         partial: partial.clone(),
-    });
+    })
+    .await;
     prod.push(AssistantMessageEvent::TextStart {
         content_index: 0,
         partial: partial.clone(),
-    });
+    })
+    .await;
     prod.push(AssistantMessageEvent::TextDelta {
         content_index: 0,
         delta: "hi".into(),
         partial: partial.clone(),
-    });
+    })
+    .await;
     prod.push(AssistantMessageEvent::TextEnd {
         content_index: 0,
         content: "hi".into(),
         partial: partial.clone(),
-    });
+    })
+    .await;
 
     let mut final_msg = (*partial).clone();
     final_msg.stop_reason = StopReason::Stop;
     prod.push(AssistantMessageEvent::Done {
         reason: DoneReason::Stop,
         message: final_msg.clone(),
-    });
+    })
+    .await;
 
     let mut tags = Vec::new();
     while let Some(ev) = stream.next().await {
@@ -67,7 +72,8 @@ async fn result_resolves_to_error_message() {
     prod.push(AssistantMessageEvent::Error {
         reason: ErrorReason::Aborted,
         error: err_msg.clone(),
-    });
+    })
+    .await;
     let result = stream.result().await.unwrap();
     assert!(matches!(result.stop_reason, StopReason::Aborted));
     assert_eq!(result.error_message.as_deref(), Some("cancelled"));
@@ -77,14 +83,20 @@ async fn result_resolves_to_error_message() {
 async fn push_after_terminal_is_noop() {
     let (mut prod, mut stream) = create_assistant_message_event_stream();
     let msg = AssistantMessage::terminal(Api::Faux, "faux", "faux", StopReason::Stop, "", 0);
-    assert!(prod.push(AssistantMessageEvent::Done {
-        reason: DoneReason::Stop,
-        message: msg,
-    }));
+    assert!(
+        prod.push(AssistantMessageEvent::Done {
+            reason: DoneReason::Stop,
+            message: msg,
+        })
+        .await
+    );
     // Post-terminal push must not deliver an extra event.
-    assert!(prod.push(AssistantMessageEvent::Start {
-        partial: empty_partial(1)
-    }));
+    assert!(
+        prod.push(AssistantMessageEvent::Start {
+            partial: empty_partial(1)
+        })
+        .await
+    );
 
     let mut tags = Vec::new();
     while let Some(ev) = stream.next().await {

@@ -48,6 +48,32 @@ use rpi_tools::{
     InMemoryExecutionEnv, MutationQueueRegistry,
 };
 
+// `RPI_MAX_TURNS_PER_RUN` is process-global, so tests that change it must not
+// overlap. The guard stays held across the async harness run, not just the
+// set/remove call, because the harness reads the variable while starting a run.
+static RUN_BUDGET_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn declined_compaction_records_a_terminal_outcome() {
+    let (harness, _, _) = harness_with(FauxScript::new().with_text("unused")).await;
+    let result = harness.compact(None).await.unwrap();
+    assert!(matches!(
+        result.outcome,
+        rpi_harness::agent_harness::CompactionOutcome::Declined { .. }
+    ));
+    let records = harness
+        .session()
+        .find_records(&RecordQuery::default())
+        .await
+        .unwrap();
+    let terminal_records = records.iter().filter(|record| {
+        matches!(record, LaneRecord::OperationFinished(finished)
+            if finished.run_id == result.run_id
+                && finished.outcome == rpi_harness::session::types::OperationOutcome::Declined)
+    });
+    assert_eq!(terminal_records.count(), 1);
+}
+
 /// Build an `AgentHarness` over a faux provider + in-memory env + the read/
 /// write/bash tools. The faux script is caller-supplied so each test pins the
 /// exact LLM turns. Returns `(harness, provider, env)` so the test can inspect
@@ -948,13 +974,14 @@ async fn directly_sent_prompt_emits_no_user_message_start() {
 /// ceiling and say so, so a truncated task is never mistaken for a finished one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn run_budget_stops_a_looping_run_and_records_why() {
+    let _env_lock = RUN_BUDGET_ENV_LOCK.lock().await;
+
     // A model that never stops asking for tools: far more scripted turns than
     // the ceiling, so only the guard can end this run.
     //
     // The guard is off by default (upstream parity), so this test opts in for
-    // its duration. `std::env` is process-global — this is an integration-test
-    // binary whose other tests never approach the ceiling, so a parallel
-    // harness picking it up is harmless; the value is restored at the end.
+    // its duration. `std::env` is process-global; the lock above also prevents
+    // the no-ceiling test below from changing it while the harness is running.
     let previous = std::env::var(rpi_harness::run_budget::MAX_TURNS_ENV).ok();
     std::env::set_var(
         rpi_harness::run_budget::MAX_TURNS_ENV,
@@ -1061,6 +1088,8 @@ async fn run_budget_stops_a_looping_run_and_records_why() {
 /// guard by default.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn no_turn_ceiling_by_default_matches_native_pi() {
+    let _env_lock = RUN_BUDGET_ENV_LOCK.lock().await;
+
     let previous = std::env::var(rpi_harness::run_budget::MAX_TURNS_ENV).ok();
     std::env::remove_var(rpi_harness::run_budget::MAX_TURNS_ENV);
 

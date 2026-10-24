@@ -24,7 +24,7 @@ pub fn visible_width(s: &str) -> usize {
                 in_escape = false;
             }
             // CSI sequences end with a byte in 0x40-0x7E
-            else if c >= '@' && c <= '~' && c != '[' {
+            else if ('@'..='~').contains(&c) && c != '[' {
                 in_escape = false;
             }
             // OSC ] ... (ends with BEL or ST)
@@ -89,7 +89,7 @@ pub fn slice_by_column(s: &str, start_col: usize, max_cols: usize, pad: bool) ->
                 pending_styles.push('\\');
                 i += 1;
                 in_escape = false;
-            } else if c >= '@' && c <= '~' && c != '[' {
+            } else if ('@'..='~').contains(&c) && c != '[' {
                 in_escape = false;
             }
             // OSC sequence
@@ -184,7 +184,7 @@ pub fn truncate_to_width(s: &str, max_width: usize, suffix: &str) -> String {
     for c in s.chars() {
         if in_escape {
             style_stack.push(c);
-            if c == '\x07' || (c >= '@' && c <= '~' && c != '[') {
+            if c == '\x07' || (('@'..='~').contains(&c) && c != '[') {
                 in_escape = false;
             }
             continue;
@@ -242,7 +242,7 @@ pub fn strip_ansi(s: &str) -> String {
                 in_escape = false;
             }
             // CSI ends with byte in 0x40-0x7E
-            else if c >= '@' && c <= '~' && c != '[' {
+            else if ('@'..='~').contains(&c) && c != '[' {
                 in_escape = false;
             }
             // OSC
@@ -287,7 +287,7 @@ pub fn wrap_text_with_ansi(s: &str, max_width: usize) -> Vec<String> {
     for c in s.chars() {
         if in_escape {
             pending_style.push(c);
-            if c == '\x07' || (c >= '@' && c <= '~' && c != '[') {
+            if c == '\x07' || (('@'..='~').contains(&c) && c != '[') {
                 in_escape = false;
             }
             continue;
@@ -415,7 +415,7 @@ pub fn get_osc8_link_at_column(s: &str, column: usize) -> Option<String> {
                 }
                 in_escape = false;
                 continue;
-            } else if c >= '@' && c <= '~' && c != '[' {
+            } else if ('@'..='~').contains(&c) && c != '[' {
                 in_escape = false;
             }
             continue;

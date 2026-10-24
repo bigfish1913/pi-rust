@@ -63,7 +63,8 @@ async fn abort_during_stream_produces_agent_end() {
             );
             prod.push(AssistantMessageEvent::Start {
                 partial: Arc::new(partial),
-            });
+            })
+            .await;
             // Poll the token until cancelled (TS `checkAbort` loop).
             loop {
                 if token.is_cancelled() {
@@ -78,7 +79,8 @@ async fn abort_during_stream_produces_agent_end() {
                     prod.push(AssistantMessageEvent::Error {
                         reason: ErrorReason::Aborted,
                         error: aborted,
-                    });
+                    })
+                    .await;
                     return;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(2)).await;

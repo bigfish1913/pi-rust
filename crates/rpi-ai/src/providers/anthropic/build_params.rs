@@ -89,7 +89,6 @@ pub enum AnthropicContentBlock {
 
 /// The `source` of an `image` block.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename = "type", rename_all = "snake_case")]
 pub struct AnthropicImageSource {
     #[serde(rename = "type")]
     pub kind: String, // always "base64"
@@ -98,7 +97,7 @@ pub struct AnthropicImageSource {
 }
 
 /// Tool-result content: either a plain string (concatenated text) or an array
-/// of text blocks. Mirrors the Anthropic `content` field union.
+/// of text/image/reference blocks. Mirrors the Anthropic `content` field union.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ToolResultContent {
@@ -111,6 +110,9 @@ pub enum ToolResultContent {
 pub enum AnthropicToolResultBlock {
     Text {
         text: String,
+    },
+    Image {
+        source: AnthropicImageSource,
     },
     /// A deferred-tool load reference. Mirrors Anthropic's `tool_reference`
     /// content-block (replaces the ordinary text content of a `tool_result`
@@ -881,7 +883,7 @@ pub fn convert_messages(
 /// Build the `tool_result` + sibling `tool_reference` blocks for one
 /// `ToolResultMessage`. Mirrors `convertToolResult`. When the result carries
 /// `added_tool_names` that are deferred AND not yet loaded, the tool_result's
-/// content is replaced with `tool_reference` blocks and the actual text is
+/// content is replaced with `tool_reference` blocks and the actual text/images are
 /// emitted as sibling content (Anthropic rejects mixing references with
 /// ordinary content in a single tool_result).
 fn convert_tool_result(
@@ -907,7 +909,7 @@ fn convert_tool_result(
     if !references.is_empty() {
         // Anthropic rejects tool references mixed with ordinary tool-result
         // content, so the references displace the real content into sibling
-        // user-text blocks that follow the tool_result.
+        // user text/image blocks that follow the tool_result.
         let siblings = sibling_content_from(converted_content);
         let tool_result = AnthropicContentBlock::ToolResult {
             tool_use_id: msg.tool_call_id.clone(),
@@ -925,7 +927,7 @@ fn convert_tool_result(
     }
 }
 
-/// Turn a converted tool-result content into sibling user-text blocks for the
+/// Turn a converted tool-result content into sibling user text/image blocks for the
 /// reference-displacement path. Mirrors the TS `siblingContent` construction.
 fn sibling_content_from(converted: ToolResultContent) -> Vec<AnthropicContentBlock> {
     match converted {
@@ -938,6 +940,10 @@ fn sibling_content_from(converted: ToolResultContent) -> Vec<AnthropicContentBlo
             .map(|b| match b {
                 AnthropicToolResultBlock::Text { text } => AnthropicContentBlock::Text {
                     text,
+                    cache_control: None,
+                },
+                AnthropicToolResultBlock::Image { source } => AnthropicContentBlock::Image {
+                    source,
                     cache_control: None,
                 },
                 AnthropicToolResultBlock::ToolReference { tool_name } => {
@@ -965,35 +971,25 @@ fn convert_content_blocks(content: &[Content]) -> ToolResultContent {
         return ToolResultContent::Text(sanitize_surrogates(&text));
     }
     let mut blocks: Vec<AnthropicToolResultBlock> = Vec::new();
-    let mut has_text = false;
     for block in content {
         match block {
             Content::Text(t) => {
-                has_text = true;
                 blocks.push(AnthropicToolResultBlock::Text {
                     text: sanitize_surrogates(&t.text),
                 });
             }
-            Content::Image(_) => {
-                // Images in tool results are represented as a placeholder text
-                // block (Anthropic tool_result content is text-only in the SDK
-                // shape pi emits). The full image-downgrade path handles
-                // non-vision models earlier; for vision models this remains a
-                // TODO to emit the image source block.
-                blocks.push(AnthropicToolResultBlock::Text {
-                    text: "(see attached image)".to_string(),
+            Content::Image(img) => {
+                // Unsupported images were already downgraded by transform_messages.
+                blocks.push(AnthropicToolResultBlock::Image {
+                    source: AnthropicImageSource {
+                        kind: "base64".into(),
+                        media_type: img.mime_type.clone(),
+                        data: img.data.clone(),
+                    },
                 });
             }
             _ => {}
         }
-    }
-    if !has_text {
-        blocks.insert(
-            0,
-            AnthropicToolResultBlock::Text {
-                text: "(see attached image)".to_string(),
-            },
-        );
     }
     ToolResultContent::Blocks(blocks)
 }
@@ -1664,6 +1660,65 @@ mod tests {
             }
             other => panic!("expected Enabled, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn tool_image_conversion_and_sibling_displacement_preserve_content() {
+        let image = Content::Image(ImageContent {
+            kind: Default::default(),
+            data: "aW1hZ2U=".into(),
+            mime_type: "image/png".into(),
+        });
+        let wire_image = json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": "aW1hZ2U="}
+        });
+        for (content, expected) in [
+            (vec![image.clone()], json!([wire_image.clone()])),
+            (
+                vec![
+                    Content::text("before"),
+                    image.clone(),
+                    Content::text("after"),
+                ],
+                json!([
+                    {"type": "text", "text": "before"}, wire_image.clone(),
+                    {"type": "text", "text": "after"}
+                ]),
+            ),
+            (
+                vec![image.clone(), image],
+                json!([wire_image.clone(), wire_image]),
+            ),
+        ] {
+            let converted = convert_content_blocks(&content);
+            assert_eq!(serde_json::to_value(&converted).unwrap(), expected);
+            assert_eq!(
+                serde_json::to_value(sibling_content_from(converted)).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn text_only_and_nonvision_tool_content_remain_plain_strings() {
+        let content = vec![Content::text("before"), Content::text("after")];
+        assert_eq!(
+            serde_json::to_value(convert_content_blocks(&content)).unwrap(),
+            json!("before\nafter")
+        );
+        let images = vec![Content::Image(ImageContent {
+            kind: Default::default(),
+            data: "aW1hZ2U=".into(),
+            mime_type: "image/png".into(),
+        })];
+        assert_eq!(
+            serde_json::to_value(convert_content_blocks(&downgrade_tool_result_images(
+                &images
+            )))
+            .unwrap(),
+            json!("(tool image omitted: model does not support images)")
+        );
     }
 
     #[test]

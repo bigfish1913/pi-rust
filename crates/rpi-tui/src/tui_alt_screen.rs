@@ -135,14 +135,20 @@ pub struct TuiAltScreen {
     focused: Mutex<Option<Arc<dyn Component>>>,
     full_redraw_count: Mutex<usize>,
     previous_screen: Mutex<Vec<String>>,
+    /// Size the frame in `previous_screen` was laid out for. Any mismatch means
+    /// the terminal reflowed its rows, so the frame cannot be patched cell by
+    /// cell and must be repainted whole.
+    painted_size: Mutex<(usize, usize)>,
+    /// Set when a resize event reaches the loop. The window can end up at the
+    /// size it already had (dragged out and back) while every intermediate
+    /// resize reflowed the terminal's rows, so the next frame repaints whole.
+    resize_dirty: AtomicBool,
     scroll_top: Mutex<usize>,
     stick_to_bottom: Mutex<bool>,
     current_frame: Mutex<Option<LayoutFrame>>,
     /// When true, render into the terminal's main buffer and let the terminal
     /// own scrollback (upstream's default `regular` mode).
     main_screen_mode: Mutex<bool>,
-    main_previous_width: Mutex<usize>,
-    main_previous_height: Mutex<usize>,
     main_hardware_row: Mutex<usize>,
     main_viewport_top: Mutex<usize>,
     main_previous_cursor: Mutex<Option<(usize, usize)>>,
@@ -191,12 +197,12 @@ impl TuiAltScreen {
             focused: Mutex::new(None),
             full_redraw_count: Mutex::new(0),
             previous_screen: Mutex::new(Vec::new()),
+            painted_size: Mutex::new((0, 0)),
+            resize_dirty: AtomicBool::new(false),
             scroll_top: Mutex::new(0),
             stick_to_bottom: Mutex::new(true),
             current_frame: Mutex::new(None),
             main_screen_mode: Mutex::new(false),
-            main_previous_width: Mutex::new(0),
-            main_previous_height: Mutex::new(0),
             main_hardware_row: Mutex::new(0),
             main_viewport_top: Mutex::new(0),
             main_previous_cursor: Mutex::new(None),
@@ -529,16 +535,50 @@ impl TuiAltScreen {
         true
     }
 
-    /// Enter alternate screen mode.
-    /// Refresh the cached terminal size (call on `Event::Resize`) and force a
-    /// full redraw so the constrained layout re-fits the new dimensions.
+    /// Re-read the cached terminal size and force a full alternate-screen repaint.
+    ///
+    /// Kept for existing hosts that call this from their resize-event handler.
+    /// Even an unchanged size can require repainting after terminal reflow;
+    /// use [`TuiAltScreen::ensure_size`] for periodic size checks instead.
     pub fn refresh_size(&self) {
         if let Ok(terminal) = self.terminal.lock() {
             terminal.refresh_size();
         }
-        // Alt-screen frames need every viewport row repainted. Main-screen mode
-        // keeps the previous document so its renderer can detect width changes
-        // and deliberately rebuild terminal scrollback once.
+        self.note_resize();
+    }
+
+    /// A resize event reached the loop: schedule one full-screen repaint.
+    ///
+    /// The event's dimensions are not used (on Windows they carry the console
+    /// buffer size, not the window) — the renderer re-reads the size itself.
+    /// The repaint is forced even when the window ends up at the size it already
+    /// had, because every intermediate resize reflowed the terminal's rows.
+    pub fn note_resize(&self) {
+        self.resize_dirty.store(true, Ordering::Release);
+        self.request_render(false);
+    }
+
+    /// Watchdog: re-read the terminal size and repaint when it differs from the
+    /// geometry currently on screen.
+    ///
+    /// A resize *event* is only a wake-up — on Windows its record carries the
+    /// console buffer size and can arrive before the window rectangle moves —
+    /// so hosts call this from their periodic tick. The render path re-reads the
+    /// size on every frame too; this catches a window that changed while no
+    /// event reached the loop.
+    pub fn ensure_size(&self) {
+        let Some((columns, rows)) = self.terminal.lock().ok().map(|terminal| {
+            terminal.refresh_size();
+            (terminal.columns(), terminal.rows())
+        }) else {
+            return;
+        };
+        if columns == 0 || rows == 0 || *self.painted_size.lock().unwrap() == (columns, rows) {
+            return;
+        }
+        // Alt-screen frames need every row repainted: the terminal reflowed the
+        // old frame, so it can no longer be patched cell by cell. Main-screen
+        // mode keeps its document and rebuilds it when it sees the size change.
         if !self.uses_main_screen() {
             if let Ok(mut prev) = self.previous_screen.lock() {
                 prev.clear();
@@ -633,6 +673,9 @@ impl TuiAltScreen {
         let Ok(terminal) = self.terminal.lock() else {
             return;
         };
+        // Same rule as the alt-screen path: lay the document out for the size
+        // the window has *now*, not for the last size an event reported.
+        terminal.refresh_size();
         let width = terminal.columns();
         let height = terminal.rows();
         let root: Arc<dyn Component> = self
@@ -652,8 +695,9 @@ impl TuiAltScreen {
             .lock()
             .map(|p| p.clone())
             .unwrap_or_default();
-        let previous_width = *self.main_previous_width.lock().unwrap();
-        let previous_height = *self.main_previous_height.lock().unwrap();
+        // The previous frame's geometry, recorded by whichever renderer ran
+        // last. A mismatch means the terminal reflowed its rows.
+        let (previous_width, previous_height) = *self.painted_size.lock().unwrap();
         let previous_cursor = *self.main_previous_cursor.lock().unwrap();
         terminal.write(&crate::terminal_image::removed_kitty_placements(
             &previous, &lines,
@@ -855,9 +899,10 @@ impl TuiAltScreen {
         }
         terminal.flush();
         *self.previous_screen.lock().unwrap() = lines;
-        *self.main_previous_width.lock().unwrap() = width;
-        *self.main_previous_height.lock().unwrap() = height;
         *self.main_previous_cursor.lock().unwrap() = cursor;
+        if let Ok(mut painted) = self.painted_size.lock() {
+            *painted = (width, height);
+        }
     }
 
     /// Perform a differential render with constrained layout.
@@ -881,6 +926,11 @@ impl TuiAltScreen {
         }
 
         let (width, height) = if let Ok(terminal) = self.terminal.lock() {
+            // Re-read instead of trusting the last event/cached value: a
+            // fullscreen frame must be laid out for the size the window has
+            // *now*, otherwise a resize leaves the dock and borders drawn for
+            // the previous geometry.
+            terminal.refresh_size();
             (terminal.columns(), terminal.rows())
         } else {
             return;
@@ -924,7 +974,14 @@ impl TuiAltScreen {
             .lock()
             .map(|p| p.clone())
             .unwrap_or_default();
-        let full_redraw = previous.len() != height || previous.is_empty();
+        let painted = *self.painted_size.lock().unwrap();
+        let resize_dirty = self.resize_dirty.swap(false, Ordering::AcqRel);
+        // A resize reflows the terminal's rows, so a frame captured at another
+        // geometry (or before a resize notification) can no longer be patched
+        // cell-by-cell: the skipped "unchanged" rows would keep the terminal's
+        // reflowed leftovers (short borders, duplicated spinner rows). Repaint
+        // every row when it moved.
+        let full_redraw = previous.is_empty() || painted != (width, height) || resize_dirty;
 
         // Build output buffer
         let mut buffer = String::new();
@@ -937,7 +994,11 @@ impl TuiAltScreen {
                 if let Ok(mut count) = self.full_redraw_count.lock() {
                     *count += 1;
                 }
-                buffer.push_str("\x1b[2J"); // Clear screen
+                // Clear, then re-assert "no autowrap": a full frame fills the
+                // whole width, and a terminal that reset the mode on resize
+                // would wrap the last cell and shift every following row.
+                buffer.push_str("\x1b[2J");
+                buffer.push_str("\x1b[?7l");
             }
 
             // Begin synchronized output
@@ -986,6 +1047,9 @@ impl TuiAltScreen {
         // Store current screen
         if let Ok(mut prev) = self.previous_screen.lock() {
             *prev = visible;
+        }
+        if let Ok(mut painted) = self.painted_size.lock() {
+            *painted = (width, height);
         }
     }
 
@@ -1226,15 +1290,16 @@ impl TuiAltScreen {
     /// Set up the tty and render the first frame **without** spawning the
     /// `ProcessTerminal` input-reader thread. The caller owns the input loop
     /// (e.g. a `spawn_blocking` `event::read()` loop) and handles resize/key
-    /// events directly via [`TuiAltScreen::refresh_size`] / its key dispatch.
+    /// events directly via [`TuiAltScreen::note_resize`] / its key dispatch.
     ///
     /// The first frame is painted inline. Hosts that want the native-pi frame
     /// throttle should also call [`TuiAltScreen::start_render_scheduler`].
     ///
     /// This avoids two `event::read()` consumers racing the same stdin queue
     /// (the stub thread in [`TUI::start`] dropped a fraction of keystrokes).
-    /// The caller is responsible for `enable_raw_mode`-dependent event reads
-    /// and for calling `refresh_size` on `Event::Resize`.
+    /// The caller is responsible for `enable_raw_mode`-dependent event reads,
+    /// for calling `note_resize` on `Event::Resize`, and for running the
+    /// `ensure_size` watchdog from a periodic tick.
     pub fn start_readerless(&self) {
         if let Ok(mut running) = self.running.lock() {
             *running = true;
@@ -1410,6 +1475,241 @@ mod tests {
     use super::*;
     use crate::{Editor, Focusable, Text};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    /// A terminal whose size the test controls, so a resize can be replayed
+    /// exactly as the host input loop sees it.
+    struct ResizableTerminal {
+        output: Arc<Mutex<String>>,
+        size: Arc<Mutex<(usize, usize)>>,
+    }
+
+    impl ResizableTerminal {
+        fn new(columns: usize, rows: usize) -> Self {
+            Self {
+                output: Arc::new(Mutex::new(String::new())),
+                size: Arc::new(Mutex::new((columns, rows))),
+            }
+        }
+
+        fn output(&self) -> Arc<Mutex<String>> {
+            self.output.clone()
+        }
+
+        fn size(&self) -> Arc<Mutex<(usize, usize)>> {
+            self.size.clone()
+        }
+    }
+
+    impl Terminal for ResizableTerminal {
+        fn info(&self) -> TerminalInfo {
+            let (columns, rows) = *self.size.lock().unwrap();
+            TerminalInfo {
+                columns,
+                rows,
+                ..Default::default()
+            }
+        }
+
+        fn write(&self, data: &str) {
+            self.output.lock().unwrap().push_str(data);
+        }
+
+        fn hide_cursor(&self) {}
+        fn show_cursor(&self) {}
+        fn move_cursor(&self, _row: usize, _col: usize) {}
+        fn clear_screen(&self) {}
+        fn set_title(&self, _title: &str) {}
+        fn enable_mouse(&self) {}
+        fn disable_mouse(&self) {}
+        fn enter_raw_mode(&self) {}
+        fn exit_raw_mode(&self) {}
+        fn refresh_size(&self) {}
+        fn start(
+            &self,
+            _on_input: Box<dyn Fn(InputEvent) + Send + Sync>,
+            _on_resize: Box<dyn Fn() + Send + Sync>,
+        ) {
+        }
+        fn stop(&self) {}
+        fn is_tty(&self) -> bool {
+            true
+        }
+        fn set_progress(&self, _active: bool) {}
+        fn flush(&self) {}
+    }
+
+    #[test]
+    fn resize_repaints_every_row_at_the_dimensions_the_window_reports() {
+        let terminal = ResizableTerminal::new(40, 8);
+        let output = terminal.output();
+        let size = terminal.size();
+        let tui = TuiAltScreen::new(Box::new(terminal), false, None);
+        let editor = Arc::new(Editor::simple());
+        editor.set_focused(true);
+        tui.set_layout_root(Some(editor));
+        tui.start_readerless();
+        output.lock().unwrap().clear();
+
+        // A corner drag grows both axes. The new frame must cover the whole new
+        // viewport instead of staying at the previous, smaller geometry (the
+        // reported "UI still only fills the old small area").
+        *size.lock().unwrap() = (60, 12);
+        tui.ensure_size();
+
+        let frame = output.lock().unwrap().clone();
+        assert!(
+            frame.contains("\x1b[2J"),
+            "a resize must repaint the whole screen, got: {frame:?}"
+        );
+        assert!(
+            frame.contains("\x1b[12;1H"),
+            "the last row of the new viewport must be painted, got: {frame:?}"
+        );
+        assert!(
+            !frame.contains("\x1b[13;1H"),
+            "no row beyond the new height may be addressed, got: {frame:?}"
+        );
+        assert_eq!(*tui.painted_size.lock().unwrap(), (60, 12));
+    }
+
+    #[test]
+    fn a_resize_event_never_lays_the_frame_out_for_a_size_the_window_does_not_have() {
+        let terminal = ResizableTerminal::new(40, 8);
+        let output = terminal.output();
+        let size = terminal.size();
+        let tui = TuiAltScreen::new(Box::new(terminal), false, None);
+        let editor = Arc::new(Editor::simple());
+        editor.set_focused(true);
+        tui.set_layout_root(Some(editor));
+        tui.start_readerless();
+
+        // The resize notification arrives while the window still reports the old
+        // geometry — exactly the Windows ordering while a corner is dragged. The
+        // frame must stay on the size the window really has; writing rows for a
+        // not-yet-existing size is what scrolls the dock away and stacks
+        // leftovers behind.
+        output.lock().unwrap().clear();
+        tui.ensure_size();
+        assert!(
+            output.lock().unwrap().is_empty(),
+            "a window that still reports the old size must not repaint"
+        );
+
+        // The window catches up; the next watchdog tick re-fits the frame.
+        output.lock().unwrap().clear();
+        *size.lock().unwrap() = (60, 12);
+        tui.ensure_size();
+        let frame = output.lock().unwrap().clone();
+        assert!(frame.contains("\x1b[12;1H"), "got: {frame:?}");
+        assert_eq!(*tui.painted_size.lock().unwrap(), (60, 12));
+    }
+
+    #[test]
+    fn a_width_only_resize_repaints_instead_of_patching_reflowed_rows() {
+        let terminal = ResizableTerminal::new(40, 8);
+        let output = terminal.output();
+        let size = terminal.size();
+        let tui = TuiAltScreen::new(Box::new(terminal), false, None);
+        let editor = Arc::new(Editor::simple());
+        editor.set_focused(true);
+        tui.set_layout_root(Some(editor));
+        tui.start_readerless();
+        output.lock().unwrap().clear();
+
+        // Change the terminal's geometry behind the TUI's back so only the
+        // renderer's own geometry guard can catch it. The height is unchanged, so
+        // a height-only full-redraw check would take the diff path and keep the
+        // terminal's reflowed rows: short input borders and repeated spinner
+        // rows.
+        *size.lock().unwrap() = (52, 8);
+        tui.do_render(false);
+
+        let frame = output.lock().unwrap().clone();
+        assert!(
+            frame.contains("\x1b[2J"),
+            "a width change must repaint every row, got: {frame:?}"
+        );
+        assert_eq!(*tui.painted_size.lock().unwrap(), (52, 8));
+    }
+
+    #[test]
+    fn a_resize_notification_repaints_even_when_the_window_ends_up_the_same_size() {
+        let terminal = ResizableTerminal::new(40, 8);
+        let output = terminal.output();
+        let tui = TuiAltScreen::new(Box::new(terminal), false, None);
+        let editor = Arc::new(Editor::simple());
+        editor.set_focused(true);
+        tui.set_layout_root(Some(editor));
+        tui.start_readerless();
+        output.lock().unwrap().clear();
+
+        // Dragged out and back between two watchdog ticks: the size is the one
+        // already painted, but the terminal reflowed its rows in between, so a
+        // diff against the old frame would leave short borders and repeated
+        // spinner rows behind.
+        tui.note_resize();
+
+        let frame = output.lock().unwrap().clone();
+        assert!(
+            frame.contains("\x1b[2J"),
+            "a resize notification must repaint every row, got: {frame:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_refresh_size_repaints_a_same_size_resize_with_or_without_coalescing() {
+        for coalesced in [false, true] {
+            let terminal = ResizableTerminal::new(40, 8);
+            let output = terminal.output();
+            let tui = TuiAltScreen::new(Box::new(terminal), false, None);
+            tui.set_layout_root(Some(Arc::new(Text::new("stable frame", 0, 0))));
+            if coalesced {
+                tui.enable_render_coalescing();
+            }
+            tui.start_readerless();
+            output.lock().unwrap().clear();
+            let redraws = tui.full_redraws();
+
+            // Existing hosts call refresh_size from their Resize handler.
+            // An out-and-back drag can reflow the terminal without changing
+            // its final dimensions, so the legacy API must force a repaint.
+            tui.refresh_size();
+            if coalesced {
+                assert!(output.lock().unwrap().is_empty());
+                assert!(tui.flush_pending_render());
+            }
+            let frame = output.lock().unwrap().clone();
+            assert!(frame.contains("\x1b[2J"), "missing full repaint: {frame:?}");
+            assert_eq!(tui.full_redraws(), redraws + 1);
+
+            // Steady-state watchdog ticks must still leave the frame alone.
+            output.lock().unwrap().clear();
+            tui.ensure_size();
+            assert!(!tui.flush_pending_render());
+            assert!(output.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn the_size_watchdog_does_not_repaint_an_unchanged_frame() {
+        let terminal = ResizableTerminal::new(40, 8);
+        let output = terminal.output();
+        let tui = TuiAltScreen::new(Box::new(terminal), false, None);
+        let editor = Arc::new(Editor::simple());
+        editor.set_focused(true);
+        tui.set_layout_root(Some(editor));
+        tui.start_readerless();
+        output.lock().unwrap().clear();
+
+        // A watchdog tick on a steady window must be free: Windows Terminal
+        // repeats resize events, and repainting on each one flickers.
+        tui.ensure_size();
+        assert!(
+            output.lock().unwrap().is_empty(),
+            "an unchanged size must not repaint, got: {:?}",
+            output.lock().unwrap()
+        );
+    }
 
     #[test]
     fn changed_rows_overwrite_without_blanking_sidebar_and_clear_shorter_tails_afterwards() {

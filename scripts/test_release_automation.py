@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import patch
 import os
 import sys
+import tempfile
 import tomllib
 
 sys.dont_write_bytecode = True
@@ -115,6 +116,79 @@ class ReleaseGateTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "tested main commit"):
                 automation.main()
             api.assert_not_called()
+
+
+class ReleaseSeriesTests(unittest.TestCase):
+    def test_versions_stay_on_the_selected_series_and_increment_numerically(self):
+        tags = ["v0.8.0", "v0.8.9", "v0.7.99", "v0.8.10-rc1", "v0.8.invalid"]
+        self.assertEqual(automation.series_version("0.9.0", "0.8", tags), "0.8.10")
+        self.assertEqual(automation.series_version("1.0.0", "0.8", tags), "0.8.10")
+        self.assertEqual(automation.series_version("0.8.12", "0.8", tags), "0.8.12")
+        self.assertEqual(automation.series_version("0.9.0", "0.8", []), "0.8.0")
+        for series in ("0.08", "0.8.0", "invalid"):
+            with self.assertRaises(ValueError):
+                automation.series_version("0.9.0", series, tags)
+
+    def test_publish_gate_rejects_a_version_outside_the_series(self):
+        root = {"workspace": {"metadata": {"release": {"series": "0.8"}}}}
+        automation.check_series("0.8.1", root)
+        for version in ("0.9.0", "1.0.0", "0.8.1-rc1"):
+            with self.assertRaises(ValueError):
+                automation.check_series(version, root)
+
+    def test_normalize_updates_pins_and_new_notes_without_rewriting_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = root / "Cargo.toml"
+            manifest.write_text('''[workspace.package]
+version = "0.9.0"
+[workspace.metadata.release]
+series = "0.8"
+[workspace.dependencies]
+rpi-tui = { path = "crates/rpi-tui", version = "0.9.0" }
+serde = "1"
+''', encoding="utf-8")
+            changelog = root / "CHANGELOG.md"
+            historical = "## [0.8.0] - 2026-10-22\n\nPrevious release, targeting 0.9.0 later.\n"
+            changelog.write_text("## [Unreleased]\n\n"
+                                 "## [0.9.0](https://example.test/v0.8.0...v0.9.0) - 2026-10-23\n"
+                                 "\n### Added\n\n- New feature\n\n" + historical,
+                                 encoding="utf-8")
+            self.assertEqual(automation.normalize_release(root, ["v0.8.0"]), "0.8.1")
+            result = tomllib.loads(manifest.read_text(encoding="utf-8"))
+            self.assertEqual(result["workspace"]["package"]["version"], "0.8.1")
+            self.assertEqual(result["workspace"]["dependencies"]["rpi-tui"]["version"], "0.8.1")
+            self.assertEqual(result["workspace"]["dependencies"]["serde"], "1")
+            notes = changelog.read_text(encoding="utf-8")
+            self.assertIn("## [0.8.1](https://example.test/v0.8.0...v0.8.1)", notes)
+            self.assertTrue(notes.endswith(historical))
+            self.assertEqual(automation.normalize_release(root, ["v0.8.0"]), "0.8.1")
+            self.assertEqual(changelog.read_text(encoding="utf-8"), notes)
+
+    def test_missing_proposed_notes_fail_before_modifying_the_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = root / "Cargo.toml"
+            original = ('[workspace.package]\nversion = "0.9.0"\n'
+                        '[workspace.metadata.release]\nseries = "0.8"\n')
+            manifest.write_text(original, encoding="utf-8")
+            (root / "CHANGELOG.md").write_text("## [0.8.0]\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "missing from CHANGELOG"):
+                automation.normalize_release(root, ["v0.8.0"])
+            self.assertEqual(manifest.read_text(encoding="utf-8"), original)
+
+    def test_published_notes_cannot_be_retargeted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = root / "Cargo.toml"
+            manifest.write_text('[workspace.package]\nversion = "0.8.0"\n'
+                                '[workspace.metadata.release]\nseries = "0.8"\n', encoding="utf-8")
+            changelog = root / "CHANGELOG.md"
+            original = "## [0.8.0]\n\nPublished notes\n"
+            changelog.write_text(original, encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "already published"):
+                automation.normalize_release(root, ["v0.8.0"])
+            self.assertEqual(changelog.read_text(encoding="utf-8"), original)
 
 
 class ChannelReadinessTests(unittest.TestCase):

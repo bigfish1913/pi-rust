@@ -56,6 +56,7 @@ pub mod terminal_image;
 pub mod text;
 pub mod theme;
 pub mod tool_execution;
+mod tool_panel;
 pub mod truncated_text;
 pub mod tui;
 pub mod tui_alt_screen;

@@ -51,12 +51,12 @@ The table below records the original four targets. The workflow also builds
 Intel macOS as `rpi-v<version>-x86_64-apple-darwin.tar.gz`, with a matching
 `.sha256`; this asset is available in releases whose tag includes that target.
 
-| Target | Asset | sha256 (v0.5.0) |
+| Target | Asset | sha256 (v0.5.1) |
 | --- | --- | --- |
-| `x86_64-unknown-linux-gnu` | `rpi-v0.5.0-x86_64-unknown-linux-gnu.tar.gz` | `6c7283fa3242c123ee26848f3f54e4c0e7b63cbbe6946e91cb50981bafda528a` |
-| `aarch64-unknown-linux-gnu` | `rpi-v0.5.0-aarch64-unknown-linux-gnu.tar.gz` | `89035f3152afaddfde234228a7bbaacc893b0d05a53f80847075dee729d29583` |
-| `aarch64-apple-darwin` | `rpi-v0.5.0-aarch64-apple-darwin.tar.gz` | `93e925ac17501007077a0ba22bce0c3b334b4340033167a7b8cb4aa0f13af5c1` |
-| `x86_64-pc-windows-msvc` | `rpi-v0.5.0-x86_64-pc-windows-msvc.zip` | `f14855cbc2b8c023b6c8eb361c4dece00ece0cb0ade429e464c56c9082737afd` |
+| `x86_64-unknown-linux-gnu` | `rpi-v0.5.1-x86_64-unknown-linux-gnu.tar.gz` | `45a638aaf6cbefb3304174c687069abd3ed5fd89fcc178151f7a3fc8db9617ef` |
+| `aarch64-unknown-linux-gnu` | `rpi-v0.5.1-aarch64-unknown-linux-gnu.tar.gz` | `f8eb9e5a3973993516f0575ce75705d807d971accfca3f2fb691922615e567b3` |
+| `aarch64-apple-darwin` | `rpi-v0.5.1-aarch64-apple-darwin.tar.gz` | `e2591167842e40e09ed1f3bc0904787f2ecbd8adb784e9c637b7a24611ee49a5` |
+| `x86_64-pc-windows-msvc` | `rpi-v0.5.1-x86_64-pc-windows-msvc.zip` | `6c3140c30f92af7cbb64cd0c115f0ce66233ab9b1541e3c6991563dd50bd0d9f` |
 
 Two consequences worth knowing:
 
@@ -73,7 +73,7 @@ Two consequences worth knowing:
 networks (this machine included), so use `gh`, which goes through the API:
 
 ```bash
-TAG=v0.5.0                      # the tag being packaged
+TAG=v0.5.1                      # the tag being packaged
 gh release download "$TAG" --pattern "*.sha256" --dir /tmp/rpi-sha --clobber
 cat /tmp/rpi-sha/*.sha256
 ```

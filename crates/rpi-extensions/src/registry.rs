@@ -71,8 +71,8 @@ impl ExtensionTool {
 }
 
 /// A registered slash command and its plugin callback.
-/// The plugin keeps its opaque context live and makes the callback safe to
-/// invoke from any host thread, as for [`RegisteredHandler`].
+/// The host supplies an opaque owner-scoped runtime handle, not plugin memory.
+/// The plugin makes its callback safe to invoke from any host thread.
 #[derive(Clone)]
 pub struct RegisteredCommand {
     pub name: String,
@@ -95,8 +95,8 @@ pub struct RegisteredShortcut {
     pub plugin: String,
 }
 
-// SAFETY: the plugin guarantees both context lifetime and thread-safe callback
-// access. Opaque pointers are only passed back to their registered callbacks.
+// SAFETY: user_data is an opaque host registry handle (never dereferenced),
+// and plugin callbacks support invocation from any host thread.
 unsafe impl Send for RegisteredCommand {}
 unsafe impl Sync for RegisteredCommand {}
 

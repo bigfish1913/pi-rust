@@ -209,8 +209,8 @@ impl OverlayManager {
                         passive.iter().all(|&(x, top, w, h)| {
                             overlay.x >= x + w
                                 || x >= overlay.x + overlay.width
-                                || y >= top + h + 1
-                                || top >= y + overlay.lines.len() + 1
+                                || y > top + h
+                                || top > y + overlay.lines.len()
                         })
                     })
                     .min_by_key(|&y| y.abs_diff(overlay.y));

@@ -524,10 +524,10 @@
       ],
       "releases": [
         {
-          "version": "0.5.0",
+          "version": "0.5.1",
           "status": "current",
-          "title": "Host-managed child agents and runtime hardening",
-          "description": "Plugins can create isolated child agents through the host with inherited models, authentication and approvals, bounded budgets, cancellation and resource cleanup. Breaking Rust API changes establish 0.5.0 as the new baseline."
+          "title": "Consistent tool panel themes and warning-free builds",
+          "description": "Edit, read and write panels share themed insets and status backgrounds. Changelog version parsing is fixed, and Linux and Windows PR checks now reject compiler warnings."
         },
         {
           "version": "next",

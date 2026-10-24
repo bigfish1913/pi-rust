@@ -2,28 +2,10 @@
 
 use super::*;
 
-/// Restrict a catalog to models whose provider matches the one owning
-/// `current_id`. The lane is bound to a single provider runtime, so hot-cycle
-/// shortcuts (`Ctrl+P` / `Shift+Ctrl+P`) must not jump across providers.
-pub(super) fn same_provider_catalog(
+pub(super) fn scoped_catalog(
     catalog: &[rpi_ai::Model],
-    current_id: &str,
+    current: &rpi_ai::Model,
 ) -> Vec<rpi_ai::Model> {
-    let Some(provider) = catalog
-        .iter()
-        .find(|m| m.id.eq_ignore_ascii_case(current_id))
-        .map(|m| m.provider.clone())
-    else {
-        return catalog.to_vec();
-    };
-    catalog
-        .iter()
-        .filter(|m| m.provider == provider)
-        .cloned()
-        .collect()
-}
-
-pub(super) fn scoped_catalog(catalog: &[rpi_ai::Model], current_id: &str) -> Vec<rpi_ai::Model> {
     let scoped = crate::settings::load_settings()
         .ok()
         .and_then(|s| s.scoped_models)
@@ -33,17 +15,17 @@ pub(super) fn scoped_catalog(catalog: &[rpi_ai::Model], current_id: &str) -> Vec
     }
     let mut out: Vec<rpi_ai::Model> = catalog
         .iter()
-        .filter(|m| scoped.iter().any(|s| s.eq_ignore_ascii_case(&m.id)))
+        .filter(|m| {
+            scoped.iter().any(|s| {
+                s.eq_ignore_ascii_case(&m.id)
+                    || s.eq_ignore_ascii_case(&format!("{}/{}", m.provider, m.id))
+            })
+        })
         .cloned()
         .collect();
     // Never strand the user: if the current model isn't in scope, keep it.
-    if !out.iter().any(|m| m.id.eq_ignore_ascii_case(current_id)) {
-        if let Some(cur) = catalog
-            .iter()
-            .find(|m| m.id.eq_ignore_ascii_case(current_id))
-        {
-            out.push(cur.clone());
-        }
+    if !out.contains(current) {
+        out.push(current.clone());
     }
     out
 }
@@ -483,24 +465,12 @@ pub(super) fn open_settings_model_selector(
             close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
             return;
         };
-        state_sel.set_current_model(&model);
-        let provider = model.provider.clone();
-        let model_id = model.id.clone();
         let lane = lane_sel.clone();
+        let state = state_sel.clone();
+        let tui = tui_sel.clone();
         tokio::spawn(async move {
-            let _ = lane.set_model(model).await;
+            report_model_selection(&lane, &state, &tui, model, true).await;
         });
-        // Persist provider + model together so a cross-provider default
-        // survives the next launch (bare `defaultModel` alone would fall back).
-        let note = set_default_model(&provider, &model_id);
-        add_note_message(
-            &chat_sel,
-            &format!(
-                "Default model set to {} ({})",
-                short_model_name(&model_id),
-                if note.is_ok() { "saved" } else { "not saved" },
-            ),
-        );
         close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
     }));
     let state_cancel = state.clone();
@@ -1338,15 +1308,14 @@ pub(super) async fn switch_provider(
     Ok((model, note))
 }
 
-/// Persist a specific default provider + model pair (used when `/model` picks a
-/// model from a different provider than the one currently bound to the lane).
+/// Persist a specific default provider + model pair after a live switch.
 pub(super) fn set_default_model(provider_id: &str, model_id: &str) -> Result<String, String> {
     let mut settings = crate::settings::load_settings().unwrap_or_default();
     settings.default_provider = Some(provider_id.to_string());
     settings.default_model = Some(model_id.to_string());
     crate::settings::save_settings(&settings).map_err(|error| error.to_string())?;
     Ok(format!(
-        "Default provider set to {provider_id} (model {model_id}) — takes effect after restart. The current session keeps its startup provider."
+        "Default provider saved as {provider_id} (model {model_id})."
     ))
 }
 

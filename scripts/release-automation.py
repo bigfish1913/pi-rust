@@ -10,6 +10,7 @@ import tomllib
 
 REPOSITORY = "bigfish1913/pi-rust"
 VERSION = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
+SERIES = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 
 
 def run(*args):
@@ -43,6 +44,57 @@ def check_version(version, tags, commit, existing_commit=None):
         raise ValueError("release version must be newer than all existing stable tags")
 
 
+def check_series(version, root):
+    series = root["workspace"].get("metadata", {}).get("release", {}).get("series")
+    if series is not None:
+        if not SERIES.fullmatch(series):
+            raise ValueError("release series must be a stable X.Y")
+        if not VERSION.fullmatch(version) or version.rsplit(".", 1)[0] != series:
+            raise ValueError(f"release version {version} is outside the configured {series}.x series")
+    return series
+
+
+def series_version(proposed, series, tags):
+    if not SERIES.fullmatch(series):
+        raise ValueError("release series must be a stable X.Y")
+    versions = [tuple(map(int, tag[1:].split("."))) for tag in tags
+                if tag.startswith(f"v{series}.") and VERSION.fullmatch(tag[1:])]
+    patch = max((v[2] for v in versions), default=-1) + 1
+    if VERSION.fullmatch(proposed) and proposed.rsplit(".", 1)[0] == series:
+        patch = max(patch, int(proposed.rsplit(".", 1)[1]))
+    return f"{series}.{patch}"
+
+
+def normalize_release(root, tags):
+    manifest_path = root / "Cargo.toml"
+    manifest = manifest_path.read_text(encoding="utf-8")
+    config = tomllib.loads(manifest)
+    proposed = config["workspace"]["package"]["version"]
+    series = config["workspace"].get("metadata", {}).get("release", {}).get("series")
+    if series is None:
+        return proposed
+    if f"v{proposed}" in tags:
+        raise ValueError("cannot normalize an already published release")
+    version = series_version(proposed, series, tags)
+    if version == proposed:
+        return version
+    changelog_path = root / "CHANGELOG.md"
+    changelog = changelog_path.read_text(encoding="utf-8")
+    # Only retarget the proposed release section, preserving historical notes.
+    section = re.search(rf"^## \[{re.escape(proposed)}\][^\n]*\n(?:(?!^## ).)*",
+                        changelog, re.MULTILINE | re.DOTALL)
+    if section is None:
+        raise ValueError("proposed release version is missing from CHANGELOG.md")
+    changelog = (changelog[:section.start()] + section[0].replace(proposed, version)
+                 + changelog[section.end():])
+    # The shared workspace version and internal dependency pins use this literal.
+    manifest = re.sub(rf'(\bversion\s*=\s*"){re.escape(proposed)}(")',
+                      lambda m: m[1] + version + m[2], manifest)
+    manifest_path.write_text(manifest, encoding="utf-8", newline="\n")
+    changelog_path.write_text(changelog, encoding="utf-8", newline="\n")
+    return version
+
+
 def output(**values):
     for key, value in values.items():
         line = f"{key}={value}\n"
@@ -54,8 +106,11 @@ def output(**values):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("detect", "tag"))
+    parser.add_argument("command", choices=("detect", "tag", "normalize"))
     args = parser.parse_args()
+    if args.command == "normalize":
+        print(normalize_release(Path("."), run("git", "tag", "--list").splitlines()))
+        return
     if (os.environ.get("GITHUB_REPOSITORY") != REPOSITORY
             or os.environ.get("GITHUB_REF") != "refs/heads/main"
             or os.environ.get("GITHUB_EVENT_NAME") not in ("push", "workflow_dispatch")):
@@ -72,6 +127,7 @@ def main():
         return
     root = tomllib.loads(Path("Cargo.toml").read_text(encoding="utf-8"))
     version = root["workspace"]["package"]["version"]
+    check_series(version, root)
     tag = f"v{version}"
     tags = run("git", "tag", "--list").splitlines()
     existing = run("git", "rev-parse", f"{tag}^{{commit}}") if tag in tags else None

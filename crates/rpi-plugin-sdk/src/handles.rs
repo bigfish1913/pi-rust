@@ -53,11 +53,20 @@ impl<T> ToolHandles<T> {
 
     /// Share the cancellation flag with a worker started by the plugin.
     pub fn insert_with_cancel(&self, state: T, cancelled: Arc<AtomicBool>) -> StepHandle {
-        let token = NEXT_HANDLE
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
-                next.checked_add(1)
-            })
-            .expect("tool handle tokens exhausted");
+        // Use a CAS loop to retain MSRV compatibility without deprecated fetch_update.
+        let mut token = NEXT_HANDLE.load(Ordering::Relaxed);
+        loop {
+            let next = token.checked_add(1).expect("tool handle tokens exhausted");
+            match NEXT_HANDLE.compare_exchange_weak(
+                token,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(current) => token = current,
+            }
+        }
         let entry = Arc::new(ToolState {
             state: Mutex::new(state),
             cancelled,
@@ -118,6 +127,33 @@ mod tests {
         assert!(handles.remove(first).is_none());
         assert!(handles.get(first).is_none());
         assert_ne!(handles.insert(3), first);
+    }
+
+    #[test]
+    fn concurrent_insertions_allocate_unique_nonzero_handles() {
+        let handles = ToolHandles::new();
+        let tokens = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    let handles = &handles;
+                    scope.spawn(move || {
+                        (0..100)
+                            .map(|value| handles.insert(value) as usize)
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let unique: std::collections::HashSet<_> = tokens.iter().copied().collect();
+        assert_eq!(unique.len(), 800);
+        assert!(!unique.contains(&0));
+        for token in tokens {
+            assert!(handles.get(token as StepHandle).is_some());
+        }
     }
 
     #[test]

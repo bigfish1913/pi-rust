@@ -316,7 +316,7 @@ fn parse_csi_sequence(data: &str) -> Option<Key> {
 
     // Determine event type (Kitty protocol)
     let event_type = if params.len() >= 2 {
-        let event_type_code = params.get(0).copied().unwrap_or(1);
+        let event_type_code = params.first().copied().unwrap_or(1);
         match event_type_code {
             1 => KeyEventType::Press,
             2 => KeyEventType::Repeat,
@@ -396,7 +396,7 @@ fn decode_kitty_printable(params: &[u32]) -> Option<Key> {
     let code = params.first().copied().unwrap_or(0);
 
     // Printable ASCII
-    if code >= 32 && code < 127 {
+    if (32..127).contains(&code) {
         let c = code as u8 as char;
         return Some(Key::new(c.to_string()));
     }
@@ -467,7 +467,7 @@ pub fn decode_kitty_printable_from_str(data: &str) -> Option<String> {
         let code = params.first().copied().unwrap_or(0);
 
         // Printable ASCII
-        if code >= 32 && code < 127 {
+        if (32..127).contains(&code) {
             let c = code as u8 as char;
             return Some(c.to_string());
         }

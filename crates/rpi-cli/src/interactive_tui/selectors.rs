@@ -150,7 +150,6 @@ pub(super) fn open_model_selector(
     let tui_sel = tui.clone();
     let chat_sel = chat.clone();
     let lane_sel = lane.clone();
-    let lane_model_sel = lane_model_id.to_string();
     list.on_select(Arc::new(move |item| {
         let Some(model) = find_model_selector_match(&catalog_arc, &item.value) else {
             add_note_message(
@@ -161,32 +160,12 @@ pub(super) fn open_model_selector(
             return;
         };
 
-        // The harness now registers every authenticated provider runtime, so
-        // picking a model from ANOTHER provider hot-switches it (no restart).
-        // Persist the choice as the saved default so the next launch keeps it.
-        let current_provider = catalog_arc
-            .iter()
-            .find(|m| m.id.eq_ignore_ascii_case(&lane_model_sel))
-            .map(|m| m.provider.clone());
-        if current_provider
-            .as_deref()
-            .map_or(true, |cur| !model.provider.eq_ignore_ascii_case(cur))
-        {
-            let _ = set_default_model(&model.provider, &model.id);
-        }
-
-        state_sel.set_current_model(&model);
         let lane = lane_sel.clone();
+        let state = state_sel.clone();
+        let tui = tui_sel.clone();
         tokio::spawn(async move {
-            let _ = lane.set_model(model).await;
+            report_model_selection(&lane, &state, &tui, model, false).await;
         });
-        add_note_message(
-            &chat_sel,
-            &format!(
-                "Model set to {} — applies to the next message.",
-                short_model_name(&item.value)
-            ),
-        );
         close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
     }));
     let state_cancel = state.clone();
@@ -213,20 +192,78 @@ pub(super) fn open_model_selector(
     Some(searchable)
 }
 
-/// Cycle to the next catalog entry after `current_id`, wrapping to the first.
-/// Returns `None` only when the catalog is empty or the current id isn't
-/// found (in which case the first entry is returned — a no-op if it IS the
-/// current). Used by the Ctrl+P model-cycle hotkey.
+/// Resolve a hot-cycle against the live lane, including authenticated models
+/// from other providers. Keep the actual current model when it is off-scope.
+pub(super) async fn cycle_model(
+    lane: &Arc<dyn AgentLane>,
+    catalog: &[rpi_ai::Model],
+    backwards: bool,
+) -> Result<Option<rpi_ai::Model>, String> {
+    if catalog.is_empty() {
+        return Ok(None);
+    }
+    let current = lane.get_model().await.map_err(|error| error.to_string())?;
+    let scope = scoped_catalog(catalog, &current);
+    Ok(if backwards {
+        cycle_prev_model(&scope, &current)
+    } else {
+        cycle_next_model(&scope, &current)
+    })
+}
+
+/// Commit UI/default changes only after the live lane accepts the model.
+pub(super) async fn apply_model_selection(
+    lane: &Arc<dyn AgentLane>,
+    state: &Arc<TuiState>,
+    model: rpi_ai::Model,
+    save_default: bool,
+) -> Result<String, String> {
+    let current = lane.get_model().await.map_err(|error| error.to_string())?;
+    lane.set_model(model.clone())
+        .await
+        .map_err(|error| format!("Could not switch model: {error}"))?;
+    state.set_current_model(&model);
+    let mut note = format!(
+        "Model set to {}/{} — applies to the next message.",
+        model.provider, model.id
+    );
+    if save_default || current.provider != model.provider {
+        match set_default_model(&model.provider, &model.id) {
+            Ok(_) => note.push_str(" Default saved."),
+            Err(error) => note.push_str(&format!(" Could not save the default: {error}")),
+        }
+    }
+    Ok(note)
+}
+
+pub(super) async fn report_model_selection(
+    lane: &Arc<dyn AgentLane>,
+    state: &Arc<TuiState>,
+    tui: &Arc<TuiAltScreen>,
+    model: rpi_ai::Model,
+    save_default: bool,
+) {
+    match apply_model_selection(lane, state, model, save_default).await {
+        Ok(note) => add_note_message(&state.chat_container, &note),
+        Err(error) => add_error_message(&state.chat_container, &error),
+    }
+    tui.request_render(false);
+}
+
+/// Cycle after the current provider/API/model identity, wrapping to the first.
+/// An empty catalog returns `None`; a missing anchor returns the first entry.
 pub(super) fn cycle_next_model(
     catalog: &[rpi_ai::Model],
-    current_id: &str,
+    current: &rpi_ai::Model,
 ) -> Option<rpi_ai::Model> {
     if catalog.is_empty() {
         return None;
     }
-    let idx = catalog
-        .iter()
-        .position(|m| m.id.eq_ignore_ascii_case(current_id));
+    let idx = catalog.iter().position(|m| {
+        m.provider == current.provider
+            && m.api == current.api
+            && m.id.eq_ignore_ascii_case(&current.id)
+    });
     match idx {
         Some(i) => {
             let next = (i + 1) % catalog.len();
@@ -236,18 +273,20 @@ pub(super) fn cycle_next_model(
     }
 }
 
-/// Cycle to the catalog entry *before* `current_id`, wrapping to the last —
+/// Cycle before the current provider/API/model identity, wrapping to the last —
 /// the mirror of [`cycle_next_model`] for the previous-model hotkey.
 pub(super) fn cycle_prev_model(
     catalog: &[rpi_ai::Model],
-    current_id: &str,
+    current: &rpi_ai::Model,
 ) -> Option<rpi_ai::Model> {
     if catalog.is_empty() {
         return None;
     }
-    let idx = catalog
-        .iter()
-        .position(|m| m.id.eq_ignore_ascii_case(current_id));
+    let idx = catalog.iter().position(|m| {
+        m.provider == current.provider
+            && m.api == current.api
+            && m.id.eq_ignore_ascii_case(&current.id)
+    });
     match idx {
         Some(i) => {
             let prev = (i + catalog.len() - 1) % catalog.len();
@@ -258,21 +297,19 @@ pub(super) fn cycle_prev_model(
 }
 
 /// Build + open the `/session` selector. Lists JSONL session files under the
-/// default session dir (`<cwd>/.rpi/sessions`
-/// fallback), newest-first, labelled with the session name or first prompt so
-/// two sessions are distinguishable. Header-only sessions are skipped: there is
-/// nothing to switch to.
+/// selected session directory, newest-first, labelled with the session name or
+/// first prompt so two sessions are distinguishable. Header-only sessions are
+/// skipped: there is nothing to switch to.
 pub(super) fn open_session_selector(
     state: &Arc<TuiState>,
     editor_container: &Arc<Container>,
     editor: &Arc<Editor>,
     tui: &Arc<TuiAltScreen>,
-    cwd: &std::path::Path,
     tx: &mpsc::UnboundedSender<TuiMessage>,
 ) {
-    let dir = crate::session::default_session_dir(cwd);
+    let dir = &state.session_dir;
     let mut items: Vec<SelectItem> = Vec::new();
-    for path in crate::session::list_session_files_sync(&dir) {
+    for path in crate::session::list_session_files_sync(dir) {
         let summary = crate::session::summarize_session_file(&path);
         if summary.empty {
             continue;

@@ -6,8 +6,9 @@
 新增接入遵循 [Provider 接入规范](../extensions/provider-integration.md)。
 
 核心保留 Anthropic Messages、OpenAI Chat Completions / Responses，以及离线测试用的 Faux。
-CLI 不依赖供应商实现。`rpi-provider-runtime` 留在核心仓库作为通用 ABI / 异步协议桥接库，
-不会登记供应商或解析宿主凭据。
+CLI 不依赖供应商实现。通用 ABI / 异步协议桥接由核心仓库的
+`rpi-plugin-sdk::provider` 提供，只有显式开启 SDK 的 `provider` feature 才会引入
+AI、Tokio 与 HTTP 依赖；默认 ABI SDK 保持轻量。桥接层不内置供应商，也不解析宿主凭据。
 
 ## 统一包中的 provider
 
@@ -107,6 +108,18 @@ factory 负责提供协议实现，不读取环境变量、不决定凭据优先
 已有同 ID 的 auth.json / models.json 配置可以复用。package 顺序提供默认模型，核心不再保留 DeepSeek 默认项。
 通用 Chat Completions 的 `requiresReasoningContent` 兼容选项支持独立回传历史思考；DeepSeek package
 启用该能力并处理思考开关与 effort 映射，核心协议不判断 DeepSeek 身份。
+
+推理模型的思考 token 计费方式由网关决定，这里也是“消息突然中断”的常见来源之一。
+部分兼容网关（DeepSeek 的 reasoning 模型即是典型）把隐藏思考计入 `maxTokens` 描述的同一个补全预算：
+只发送答案额度时，长思考会把额度全部消耗，流以 `finish_reason: length` 结束而正文为空或截断。
+声明 `reasoningCountsTowardMaxTokens: true` 的模型会在开启思考时额外预留当前思考级别的预算
+（与 Anthropic 的 `adjustMaxTokensForThinking` 形态一致）；未声明则保持原有单一预算行为。
+`maxTokens` 仍表示可见答案的额度，不是模型的服务端上限——声明该选项时两者需要分别核对。
+调用方显式传入的 `maxTokens` 按原值发送，不做叠加，默认由传入方自己算好思考余量。
+
+需要注意生效位置：插件 provider 在插件自己编进去的 `rpi-ai` 里执行请求构建，
+而不是宿主核心。因此这条选项对插件 provider 生效的前提，是插件把 `rpi-ai` 依赖升到包含它的版本；
+仅升级宿主 CLI 不会改变插件发出的 `maxTokens`。
 
 启动顺序是：加载扩展一次 → 收集 package 目录和 runtime factories → 合并用户模型配置 →
 按 provider id 解析凭据 → 选择模型并绑定 runtime → 创建 harness。

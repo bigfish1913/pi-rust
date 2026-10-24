@@ -173,9 +173,12 @@ impl OsExecutionEnv {
     /// Detect + return the shell config, or `ShellUnavailable`. Mirrors
     /// `getShellConfig`.
     async fn get_shell_config(&self) -> Result<ShellConfig, ExecutionError> {
-        // Explicit override.
+        // Explicit override. Shell discovery happens on the hot path immediately
+        // before spawning a command. Keep this probe synchronous: putting a
+        // `tokio::fs` metadata future here can queue work on Tokio's blocking
+        // pool and leave a tool run waiting before it has even created a child.
         if let Some(sp) = &self.shell_path {
-            if tokio::fs::metadata(sp).await.is_ok() {
+            if sp.is_file() {
                 return Ok(bash_shell_config(sp.clone()));
             }
             return Err(ExecutionError::new(
@@ -197,7 +200,7 @@ impl OsExecutionEnv {
         // POSIX.
         #[cfg(not(windows))]
         {
-            if tokio::fs::metadata("/bin/bash").await.is_ok() {
+            if std::path::Path::new("/bin/bash").is_file() {
                 return Ok(ShellConfig {
                     shell: PathBuf::from("/bin/bash"),
                     args: vec!["-c".to_string()],
@@ -209,7 +212,7 @@ impl OsExecutionEnv {
                 run_command("which", &["bash"], std::time::Duration::from_millis(5000)).await
             {
                 let trimmed = found.trim();
-                if !trimmed.is_empty() && tokio::fs::metadata(trimmed).await.is_ok() {
+                if !trimmed.is_empty() && std::path::Path::new(trimmed).is_file() {
                     return Ok(ShellConfig {
                         shell: PathBuf::from(trimmed),
                         args: vec!["-c".to_string()],
@@ -871,7 +874,6 @@ impl Shell for OsExecutionEnv {
         cmd.stderr(std::process::Stdio::piped());
         #[cfg(unix)]
         {
-            use std::os::unix::process::CommandExt;
             cmd.process_group(0); // child becomes its own group leader.
         }
         #[cfg(windows)]

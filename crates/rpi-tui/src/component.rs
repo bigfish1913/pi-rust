@@ -19,6 +19,14 @@ pub trait Component: Send + Sync {
     /// Array of strings, each representing a line
     fn render(&self, width: usize) -> Vec<String>;
 
+    /// Render shared row blocks for a scrollable document. Components with
+    /// cached output can override this to avoid copying off-screen history.
+    /// The default deliberately renders afresh: arbitrary mutable components
+    /// must never be assumed immutable merely because their identity is stable.
+    fn render_document(&self, width: usize) -> RenderedDocument {
+        RenderedDocument::from_lines(self.render(width))
+    }
+
     /// Optional handler for keyboard input when component has focus.
     ///
     /// # Arguments
@@ -43,6 +51,72 @@ pub trait Component: Send + Sync {
     /// Downcast to Any for runtime type checking.
     /// This enables the layout system to check for LayoutNodeProvider.
     fn as_any(&self) -> &dyn Any;
+}
+
+/// A rendered document assembled from immutable, shared row blocks.
+///
+/// Composing documents copies only block handles, not historical strings.
+/// Cumulative block ends permit viewport extraction without walking every row.
+#[derive(Clone, Default)]
+pub struct RenderedDocument {
+    blocks: Vec<Arc<Vec<String>>>,
+    ends: Vec<usize>,
+}
+
+impl RenderedDocument {
+    /// Own a freshly rendered block.
+    pub fn from_lines(lines: Vec<String>) -> Self {
+        Self::from_shared(Arc::new(lines))
+    }
+
+    /// Retain cached rows without copying their contents.
+    pub fn from_shared(lines: Arc<Vec<String>>) -> Self {
+        if lines.is_empty() {
+            return Self::default();
+        }
+        Self {
+            ends: vec![lines.len()],
+            blocks: vec![lines],
+        }
+    }
+
+    /// Append another document, retaining its shared row allocations.
+    pub fn append(&mut self, other: Self) {
+        let offset = self.len();
+        self.ends
+            .extend(other.ends.into_iter().map(|end| offset + end));
+        self.blocks.extend(other.blocks);
+    }
+
+    /// Total rendered row count.
+    pub fn len(&self) -> usize {
+        self.ends.last().copied().unwrap_or(0)
+    }
+
+    /// Whether the document contains no rows.
+    pub fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
+    }
+
+    /// Copy only the requested rows, typically the visible viewport.
+    pub fn lines(&self, start: usize, height: usize) -> Vec<String> {
+        let mut index = self.ends.partition_point(|end| *end <= start);
+        let mut offset = start.saturating_sub(if index == 0 { 0 } else { self.ends[index - 1] });
+        let mut visible = Vec::with_capacity(height.min(self.len().saturating_sub(start)));
+        while index < self.blocks.len() && visible.len() < height {
+            let block = &self.blocks[index];
+            visible.extend(
+                block
+                    .iter()
+                    .skip(offset)
+                    .take(height - visible.len())
+                    .cloned(),
+            );
+            index += 1;
+            offset = 0;
+        }
+        visible
+    }
 }
 
 /// Interface for components that can receive focus and display a hardware cursor.
@@ -97,6 +171,35 @@ mod tests {
 
         fn as_any(&self) -> &dyn Any {
             self
+        }
+    }
+
+    #[test]
+    fn document_composition_retains_shared_rows_and_slices_across_blocks() {
+        let first = Arc::new(vec!["one".into(), "two".into()]);
+        let second = Arc::new(vec!["three".into(), "four".into()]);
+        let mut document = RenderedDocument::from_shared(first.clone());
+        document.append(RenderedDocument::default());
+        document.append(RenderedDocument::from_shared(second.clone()));
+        assert!(Arc::ptr_eq(&document.blocks[0], &first));
+        assert!(Arc::ptr_eq(&document.blocks[1], &second));
+        assert_eq!(document.len(), 4);
+        assert_eq!(document.lines(1, 2), ["two", "three"]);
+        assert_eq!(document.lines(2, usize::MAX), ["three", "four"]);
+        assert!(document.lines(4, 1).is_empty());
+        assert!(document.lines(usize::MAX, 1).is_empty());
+        assert!(document.lines(0, 0).is_empty());
+    }
+
+    #[test]
+    fn document_viewport_does_not_copy_large_history() {
+        for size in [1, 1_000, 10_000] {
+            let rows = Arc::new(vec!["historical row".repeat(64); size]);
+            let document = RenderedDocument::from_shared(rows.clone());
+            let copy = document.clone();
+            assert!(Arc::ptr_eq(&copy.blocks[0], &rows));
+            assert_eq!(copy.lines(size - 1, 1), [rows[size - 1].clone()]);
+            assert_eq!(Arc::strong_count(&rows), 3);
         }
     }
 

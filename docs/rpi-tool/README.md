@@ -19,7 +19,7 @@ by Mario Zechner. It now includes its own Rust-native plugin ABI and execution
 infrastructure. See [Acknowledgements](#acknowledgements) and the repository's
 [NOTICE](https://github.com/bigfish1913/pi-rust/blob/main/NOTICE) for upstream attribution.
 
-Website: <https://rpi.laofu.online/> · Docs: <https://rpi.laofu.online/docs.html>
+Website: <https://rpi.bigfisharc.cn/> · Docs: <https://rpi.bigfisharc.cn/docs.html>
 
 ![rpi interactive session](docs/images/rpi-interactive.png)
 
@@ -112,6 +112,41 @@ Sessions persist as JSONL and survive a crash mid-run; `rpi` resumes from the
 last committed frame rather than replaying the turn. Custom Anthropic or
 OpenAI-compatible gateways are declared in `~/.rpi/agent/models.json` and
 selected with `--model <provider>/<model>`.
+
+### Request timeouts and model compatibility
+
+`--timeout 600` limits a whole LLM request, including its streamed response.
+`--stream-idle-timeout 300` independently limits silence between response body
+bytes after the response starts. Every non-empty chunk resets the idle timer,
+including SSE keepalives and partial frames. A stalled stream produces a
+retryable error; the configured retry policy controls whether it is retried.
+Healthy streams may run longer than the idle timeout, up to the total deadline.
+Use `--stream-idle-timeout 0` to disable the idle timer. You can also set
+`"streamIdleTimeout": 300` (seconds) in `~/.rpi/agent/settings.json`; the CLI flag
+takes precedence. `httpIdleTimeout` only expires unused pooled connections and
+does not control an active response.
+
+For providers with `"api": "openai-completions"`, put compatibility flags in
+each model's `compat` object in `~/.rpi/agent/models.json`, for example:
+
+```json
+"compat": {
+  "thinkingFormat": "deepseek",
+  "requiresReasoningContent": true
+}
+```
+
+`requiresReasoningContent` replays assistant thinking in `reasoning_content`,
+including an empty string for assistant messages without thinking. The pi name
+`requiresReasoningContentOnAssistantMessages` is accepted as an alias; if both
+are present, the rpi spelling wins and conflicting values produce a warning.
+`thinkingFormat` supports `"openai"` (the default request
+shape) and `"deepseek"` (also sends `thinking: { "type": "enabled" | "disabled" }`
+for reasoning-capable models). `supportsReasoningEffort: false` suppresses
+`reasoning_effort` if the gateway does not accept it. `requiresThinkingAsText`
+instead places thinking in ordinary text content. Unknown compat fields and
+invalid values produce warnings naming the provider and model; invalid compat
+objects are ignored. Other pi thinking formats are not currently supported.
 
 ### The SDK
 
@@ -279,7 +314,7 @@ The host loads project `.rpi/extensions`, then global
 
 Ready-to-install extensions live in the companion
 [`pi-rust/rpi-package`](https://github.com/pi-rust/rpi-package) repository, with
-an [online catalog](https://rpi.laofu.online/packages.html).
+an [online catalog](https://rpi.bigfisharc.cn/packages.html).
 
 ### Optional web and subagent tools
 
@@ -341,7 +376,7 @@ machine. See [`docs/remote/user-guide.md`](docs/remote/user-guide.md).
 
 | | |
 | --- | --- |
-| Current release | **[0.5.0](https://github.com/bigfish1913/pi-rust/releases)** (nine crates, published together) |
+| Current release | **[0.8.5](https://github.com/bigfish1913/pi-rust/releases)** (nine crates, published together) |
 | Stability | `rpi-ai`, `rpi-agent`, `rpi-tools`, `rpi-harness`, `rpi-plugin-sdk` are the intended stable surface |
 | MSRV | 1.78 |
 | Platforms | Linux, macOS, Windows (CI runs the suite on Linux) |

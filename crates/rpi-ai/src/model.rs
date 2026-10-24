@@ -108,10 +108,31 @@ pub struct OpenaiCompletionsCompat {
     pub requires_thinking_as_text: Option<bool>,
     /// Replay prior assistant thinking in the wire reasoning_content field.
     /// Opt-in per model; ordinary OpenAI endpoints keep their existing shape.
+    #[serde(alias = "requiresReasoningContentOnAssistantMessages")]
     pub requires_reasoning_content: Option<bool>,
+    /// Request format for thinking. Unset keeps the OpenAI request shape.
+    pub thinking_format: Option<OpenaiThinkingFormat>,
+    /// Whether the endpoint counts hidden reasoning tokens against the same
+    /// completion budget `max_tokens` describes (DeepSeek v4 reasoning models,
+    /// several OpenAI-compat relays). When set, a request that enables thinking
+    /// reserves the level's reasoning budget on top of `Model::max_tokens` so a
+    /// long chain of thought cannot starve the answer into
+    /// `finish_reason: "length"` with an empty or clipped message.
+    /// Opt-in per model; unset keeps the previous single-budget behaviour.
+    pub reasoning_counts_toward_max_tokens: Option<bool>,
     pub supports_strict_mode: Option<bool>,
     pub send_session_affinity_headers: Option<bool>,
     pub supports_long_cache_retention: Option<bool>,
+}
+
+/// Supported thinking request formats for OpenAI-compatible endpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OpenaiThinkingFormat {
+    /// Send `reasoning_effort` when supported.
+    Openai,
+    /// Also send `thinking: { type: "enabled" | "disabled" }`.
+    Deepseek,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

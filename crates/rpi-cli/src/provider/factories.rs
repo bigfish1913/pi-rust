@@ -213,24 +213,26 @@ impl Provider for RoutedProvider {
         });
         match route {
             Some(route) => route.stream_simple(model, context, options).await,
-            None => unbound_model_error(model, &self.id),
+            None => unbound_model_error(model, &self.id).await,
         }
     }
 }
 
-fn unbound_model_error(model: &Model, provider_id: &str) -> AssistantMessageEventStream {
+async fn unbound_model_error(model: &Model, provider_id: &str) -> AssistantMessageEventStream {
     let (mut producer, stream) = rpi_ai::event_stream::create_assistant_message_event_stream();
-    producer.push(rpi_ai::AssistantMessageEvent::Error {
-        reason: rpi_ai::types::ErrorReason::Error,
-        error: rpi_ai::types::AssistantMessage::terminal(
-            model.api.clone(),
-            provider_id,
-            model.id.clone(),
-            rpi_ai::types::StopReason::Error,
-            "model is not registered in this provider execution binding",
-            0,
-        ),
-    });
+    producer
+        .push(rpi_ai::AssistantMessageEvent::Error {
+            reason: rpi_ai::types::ErrorReason::Error,
+            error: rpi_ai::types::AssistantMessage::terminal(
+                model.api.clone(),
+                provider_id,
+                model.id.clone(),
+                rpi_ai::types::StopReason::Error,
+                "model is not registered in this provider execution binding",
+                0,
+            ),
+        })
+        .await;
     stream
 }
 
@@ -249,7 +251,7 @@ impl Provider for ConfiguredProvider {
         options: &SimpleStreamOptions,
     ) -> AssistantMessageEventStream {
         let Some((model, options)) = self.binding.prepare(model, options) else {
-            return unbound_model_error(model, &self.id);
+            return unbound_model_error(model, &self.id).await;
         };
         self.inner.stream_simple(&model, context, &options).await
     }
@@ -296,15 +298,17 @@ mod tests {
                 .push((model.clone(), options.clone()));
             let (mut producer, stream) =
                 rpi_ai::event_stream::create_assistant_message_event_stream();
-            producer.push(AssistantMessageEvent::Done {
-                reason: DoneReason::Stop,
-                message: AssistantMessage::empty(
-                    model.api.clone(),
-                    model.provider.clone(),
-                    model.id.clone(),
-                    0,
-                ),
-            });
+            producer
+                .push(AssistantMessageEvent::Done {
+                    reason: DoneReason::Stop,
+                    message: AssistantMessage::empty(
+                        model.api.clone(),
+                        model.provider.clone(),
+                        model.id.clone(),
+                        0,
+                    ),
+                })
+                .await;
             stream
         }
     }

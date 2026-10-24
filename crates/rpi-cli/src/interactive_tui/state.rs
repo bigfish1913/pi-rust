@@ -155,6 +155,8 @@ pub(super) fn auto_send_step(
 }
 
 pub(super) struct TuiState {
+    /// The root selected at startup, retained across session switches/reloads.
+    pub(super) session_dir: std::path::PathBuf,
     /// The in-flight streaming assistant message (cleared on finalize).
     /// `Arc`-shared with the [`TranscriptView`] the event drain renders through,
     /// so the render-tick / reload / toggle paths keep direct access.
@@ -1253,6 +1255,21 @@ impl TuiState {
 
     pub(super) fn extension_dialog_open(&self) -> bool {
         self.extension_editor_open() || self.extension_input_open()
+    }
+
+    /// Drop the state that belongs to the session being left behind.
+    ///
+    /// The transcript container is cleared by the caller (it also rebuilds the
+    /// welcome header). This method covers the state that lives outside that
+    /// container: the footer's accumulated usage/context badge, the `/copy`
+    /// cache, and the tool/bash component maps keyed by `tool_call_id`.
+    pub(super) fn reset_session_state(&self) {
+        self.footer.reset_session_counters();
+        *self.last_assistant_text.lock().unwrap() = String::new();
+        self.current_assistant.lock().unwrap().take();
+        self.tool_components.lock().unwrap().clear();
+        self.bash_components.lock().unwrap().clear();
+        self.pending_bash_messages.lock().unwrap().clear();
     }
 
     pub(super) fn set_hide_thinking(&self, hide: bool) {

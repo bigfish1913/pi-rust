@@ -491,7 +491,7 @@ pub struct AssistantMessageEventStream
 
 ```text
 Provider 后台 task
-    ↓ producer.push(event)
+    ↓ producer.push(event).await
 AssistantMessageEventStream
     ↓ response.next().await
 Agent Loop

@@ -98,10 +98,10 @@
   ],
   "releases": [
     {
-      "version": "0.5.0",
+      "version": "0.5.1",
       "status": "current",
-      "title": "宿主管理的子代理与扩展运行时加固",
-      "description": "插件可通过宿主创建独立子代理，继承模型、认证与审批，并提供任务隔离、预算、取消和资源清理；Rust 公共 API 的不兼容变更以 0.5.0 为新基线。"
+      "title": "统一工具面板主题与零告警构建",
+      "description": "edit、read、write 等工具面板统一主题内边距与状态背景，修复更新日志版本解析，并在 Linux 和 Windows 的 PR 检查中强制编译零告警。"
     },
     {
       "version": "next",

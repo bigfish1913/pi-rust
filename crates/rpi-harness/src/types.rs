@@ -169,6 +169,8 @@ pub enum AgentHarnessToolContextSource<T: Send + Sync + 'static> {
 #[derive(Debug, Clone, Default)]
 pub struct AgentHarnessStreamOptions {
     pub timeout: Option<std::time::Duration>,
+    /// Maximum silence between streamed body bytes; zero disables it.
+    pub stream_idle_timeout: Option<std::time::Duration>,
     pub max_retries: Option<u32>,
     pub max_retry_delay: Option<std::time::Duration>,
     pub headers: Option<BTreeMap<String, String>>,
@@ -186,6 +188,9 @@ impl AgentHarnessStreamOptions {
         if self.timeout.is_some() {
             base.timeout = self.timeout;
         }
+        if self.stream_idle_timeout.is_some() {
+            base.stream_idle_timeout = self.stream_idle_timeout;
+        }
         if self.max_retries.is_some() {
             base.max_retries = self.max_retries;
         }
@@ -196,7 +201,7 @@ impl AgentHarnessStreamOptions {
         if let Some(h) = &self.headers {
             let mut merged = base.headers.unwrap_or_default();
             for (k, v) in h {
-                merged.insert(k.clone(), v.clone());
+                rpi_ai::provider::set_http_header(&mut merged, k, Some(v));
             }
             base.headers = Some(merged);
         }
@@ -215,11 +220,13 @@ impl AgentHarnessStreamOptions {
 }
 
 /// Per-request stream-option patch returned by provider hooks. Mirrors TS
-/// `AgentHarnessStreamOptionsPatch` — `None` means "leave unchanged", an empty
-/// `Some(map)` means "clear".
+/// `AgentHarnessStreamOptionsPatch` — outer `None` leaves a field unchanged;
+/// map entries merge, and inner `None` deletes that entry.
 #[derive(Debug, Clone, Default)]
 pub struct AgentHarnessStreamOptionsPatch {
     pub timeout: Option<Option<std::time::Duration>>,
+    /// Pin or unpin the stream idle timeout; an explicit zero disables it.
+    pub stream_idle_timeout: Option<Option<std::time::Duration>>,
     pub max_retries: Option<Option<u32>>,
     pub max_retry_delay: Option<Option<std::time::Duration>>,
     /// `None` = leave; `Some(map)` = merge, with inner `None` deleting keys.
@@ -235,6 +242,9 @@ impl AgentHarnessStreamOptionsPatch {
         if let Some(v) = self.timeout {
             opts.timeout = v;
         }
+        if let Some(v) = self.stream_idle_timeout {
+            opts.stream_idle_timeout = v;
+        }
         if let Some(v) = self.max_retries {
             opts.max_retries = v;
         }
@@ -244,14 +254,7 @@ impl AgentHarnessStreamOptionsPatch {
         if let Some(patch) = &self.headers {
             let mut map = opts.headers.take().unwrap_or_default();
             for (k, v) in patch {
-                match v {
-                    Some(val) => {
-                        map.insert(k.clone(), val.clone());
-                    }
-                    None => {
-                        map.remove(k);
-                    }
-                }
+                rpi_ai::provider::set_http_header(&mut map, k, v.as_deref());
             }
             opts.headers = if map.is_empty() { None } else { Some(map) };
         }
@@ -521,5 +524,60 @@ mod tests {
         let retry = RetryPolicy::default();
         assert!(retry.enabled);
         assert_eq!(retry.max_retries, 10);
+    }
+
+    #[test]
+    fn header_overlays_and_removals_use_case_insensitive_names() {
+        use std::collections::BTreeMap;
+        let mut overlay = super::AgentHarnessStreamOptions {
+            headers: Some(BTreeMap::from([(
+                "authorization".into(),
+                "Bearer Override".into(),
+            )])),
+            metadata: Some(BTreeMap::from([(
+                "tenant".into(),
+                "metadata override".into(),
+            )])),
+            ..Default::default()
+        };
+        let base = rpi_ai::SimpleStreamOptions {
+            headers: Some(BTreeMap::from([(
+                "Authorization".into(),
+                "Bearer Base".into(),
+            )])),
+            metadata: Some(BTreeMap::from([("Tenant".into(), "metadata base".into())])),
+            ..Default::default()
+        };
+        let merged = overlay.merge_into(base);
+        assert_eq!(merged.headers, overlay.headers);
+        assert_eq!(
+            merged.metadata.unwrap().len(),
+            2,
+            "metadata names retain their case-sensitive semantics"
+        );
+        super::AgentHarnessStreamOptionsPatch {
+            headers: Some(BTreeMap::from([("AUTHORIZATION".into(), None)])),
+            ..Default::default()
+        }
+        .apply(&mut overlay);
+        assert_eq!(overlay.headers, None);
+        assert_eq!(overlay.metadata.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn stream_idle_timeout_survives_harness_merge_and_patches() {
+        use std::time::Duration;
+        let mut options = super::AgentHarnessStreamOptions {
+            stream_idle_timeout: Some(Duration::from_secs(17)),
+            ..Default::default()
+        };
+        let merged = options.merge_into(rpi_ai::SimpleStreamOptions::default());
+        assert_eq!(merged.stream_idle_timeout(), Some(Duration::from_secs(17)));
+        super::AgentHarnessStreamOptionsPatch {
+            stream_idle_timeout: Some(Some(Duration::ZERO)),
+            ..Default::default()
+        }
+        .apply(&mut options);
+        assert_eq!(options.merge_into(merged).stream_idle_timeout(), None);
     }
 }

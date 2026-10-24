@@ -130,7 +130,7 @@ For building your own agent, depend on
 
 ## Documentation
 
-- User guide: <https://rpi.laofu.online/docs.html>
+- User guide: <https://rpi.bigfisharc.cn/docs.html>
 - Architecture: [docs/architecture/overview.md](https://github.com/bigfish1913/pi-rust/blob/main/docs/architecture/overview.md)
 - Extension authoring: [docs/extensions/authoring.md](https://github.com/bigfish1913/pi-rust/blob/main/docs/extensions/authoring.md)
 - Changelog: [CHANGELOG.md](https://github.com/bigfish1913/pi-rust/blob/main/CHANGELOG.md)

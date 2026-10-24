@@ -51,7 +51,7 @@ use rpi_harness::session::types::{BranchBounds, EntryOrder, EntryQuery};
 use rpi_harness::types::SendMessageOptions;
 use tokio::runtime::Handle;
 
-use crate::session::{default_session_dir, open_session_by_id};
+use crate::session::{default_session_dir, open_session_by_id_in_dir};
 
 /// The `RuntimeActionHost` impl over an `AgentHarness`. Built once per session
 /// in [`crate::session::build`] — constructed **empty** before extension load
@@ -72,6 +72,7 @@ pub struct HarnessActionHost {
     /// The session cwd — `new_session`/`fork`/`switch_session` need it to
     /// locate the session dir.
     cwd: PathBuf,
+    session_dir: PathBuf,
     /// Parsed unknown long flags retained for extension consumption.
     cli_flags: BTreeMap<String, serde_json::Value>,
     /// The session's plugin-tool context (`cwd` + session id). The session
@@ -81,6 +82,7 @@ pub struct HarnessActionHost {
     /// it named before the swap.
     tool_context: rpi_extensions::ToolCallContext,
     children: crate::child_agents::ChildAgents,
+    side_questions: crate::side_questions::SideQuestions,
     #[allow(dead_code)]
     runtime: Handle,
 }
@@ -104,10 +106,12 @@ impl HarnessActionHost {
             Self {
                 harness: Arc::clone(&harness),
                 catalog: RwLock::new(catalog),
+                session_dir: default_session_dir(&cwd),
                 cwd,
                 cli_flags,
                 tool_context,
                 children: crate::child_agents::ChildAgents::default(),
+                side_questions: crate::side_questions::SideQuestions::default(),
                 runtime,
             },
             harness,
@@ -119,6 +123,11 @@ impl HarnessActionHost {
             .catalog
             .write()
             .unwrap_or_else(|error| error.into_inner()) = catalog;
+    }
+
+    pub(crate) fn with_session_dir(mut self, session_dir: PathBuf) -> Self {
+        self.session_dir = session_dir;
+        self
     }
 
     /// Fill the harness cell. Call exactly once, immediately after
@@ -334,7 +343,7 @@ fn send_message_result(result: SendMessageResult) -> serde_json::Value {
 }
 
 /// Extract the concatenated text from an assistant message (the `text` blocks).
-fn assistant_text(msg: &rpi_ai::types::AssistantMessage) -> String {
+pub(crate) fn assistant_text(msg: &rpi_ai::types::AssistantMessage) -> String {
     msg.content
         .iter()
         .filter_map(|b| match b {
@@ -347,6 +356,36 @@ fn assistant_text(msg: &rpi_ai::types::AssistantMessage) -> String {
 
 #[async_trait::async_trait]
 impl RuntimeActionHost for HarnessActionHost {
+    fn cancel_side_questions(&self, owner: u64) {
+        self.side_questions.cancel_owner(owner);
+    }
+    fn side_question_revision(&self) -> u64 {
+        self.side_questions.revision()
+    }
+    fn side_question_views(&self) -> Vec<serde_json::Value> {
+        self.side_questions.views()
+    }
+    async fn side_question_ui(
+        &self,
+        owner: u64,
+        thread_id: String,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        self.side_questions
+            .ui_handle(&self.harness()?, owner, thread_id, args)
+            .await
+    }
+    async fn side_question(
+        &self,
+        owner: u64,
+        args: serde_json::Value,
+        sink: rpi_extensions::SideQuestionSink,
+    ) -> Result<serde_json::Value, String> {
+        self.side_questions
+            .handle(&self.harness()?, owner, args, sink)
+            .await
+    }
+
     fn cancel_child_agents(&self, owner: u64) {
         self.children.cancel_owner(owner);
     }
@@ -568,10 +607,10 @@ impl RuntimeActionHost for HarnessActionHost {
     async fn new_session(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
         let harness = self.harness()?;
         let cwd_str = self.cwd.to_string_lossy().to_string();
-        let dir = default_session_dir(&self.cwd);
-        std::fs::create_dir_all(&dir)
+        let dir = &self.session_dir;
+        std::fs::create_dir_all(dir)
             .map_err(|e| format!("create session dir {}: {e}", dir.display()))?;
-        let session = crate::session::create_jsonl_session(&dir, &cwd_str)
+        let session = crate::session::create_jsonl_session(dir, &cwd_str)
             .await
             .map_err(|e| format!("create session: {e}"))?;
         let id = session.storage().metadata().id.clone();
@@ -582,9 +621,10 @@ impl RuntimeActionHost for HarnessActionHost {
     async fn fork(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
         let harness = self.harness()?;
         let cwd_str = self.cwd.to_string_lossy().to_string();
-        let new_session = crate::session::fork_session_storage(&harness, &cwd_str)
-            .await
-            .map_err(|e| format!("fork session: {e}"))?;
+        let new_session =
+            crate::session::fork_session_storage(&harness, &cwd_str, &self.session_dir)
+                .await
+                .map_err(|e| format!("fork session: {e}"))?;
         let id = new_session.storage().metadata().id.clone();
         crate::session::set_active_session(&harness, new_session, Some(&self.tool_context)).await?;
         Ok(serde_json::json!({ "sessionId": id }))
@@ -618,7 +658,7 @@ impl RuntimeActionHost for HarnessActionHost {
         let harness = self.harness()?;
         let id = arg_str(&args, "id")?;
         let cwd_str = self.cwd.to_string_lossy().to_string();
-        let new_session: Session = open_session_by_id(&id, &cwd_str)
+        let new_session: Session = open_session_by_id_in_dir(&id, &cwd_str, &self.session_dir)
             .await
             .map_err(|e| e.to_string())?;
         let new_id = new_session.storage().metadata().id.clone();

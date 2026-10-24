@@ -13,6 +13,9 @@ use tokio_util::sync::CancellationToken;
 /// Default deadline for one LLM API request, including its streamed response.
 pub const DEFAULT_LLM_API_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// Default maximum silence between response body bytes on an active stream.
+pub const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Cache-retention hint passed to a provider. Mirrors TS `CacheRetention`.
 /// `Long` requests 1h ephemeral cache control on Anthropic (subject to compat);
 /// `Short` requests the default ephemeral; `None` disables cache control.
@@ -35,11 +38,15 @@ pub struct SimpleStreamOptions {
     /// Request timeout. Defaults to 600 seconds; `None` uses the same provider
     /// fallback and can be used by patches to clear a caller override.
     pub timeout: Option<Duration>,
+    /// Maximum silence between streamed body bytes. `None` uses the 300-second
+    /// default; `Some(Duration::ZERO)` disables it. Independent of `timeout`.
+    pub stream_idle_timeout: Option<Duration>,
     /// Max retry attempts on retryable errors (408/409/429/>=500). `None` = 0.
     pub max_retries: Option<u32>,
     /// Cap on the total backoff between retries. `None` = 60s.
     pub max_retry_delay: Option<Duration>,
-    /// Extra HTTP headers to send (merged over provider defaults).
+    /// Extra HTTP headers to send (merged over provider defaults by
+    /// case-insensitive header name).
     pub headers: Option<BTreeMap<String, String>>,
     /// Free-form provider metadata (request id, trace id, …). Anthropic reads
     /// `user_id` for abuse tracking; faux ignores it.
@@ -74,6 +81,7 @@ impl Default for SimpleStreamOptions {
         Self {
             api_key: None,
             timeout: Some(DEFAULT_LLM_API_TIMEOUT),
+            stream_idle_timeout: Some(DEFAULT_STREAM_IDLE_TIMEOUT),
             max_retries: None,
             max_retry_delay: None,
             headers: None,
@@ -113,6 +121,23 @@ impl SimpleStreamOptions {
     pub fn request_timeout(&self) -> Duration {
         self.timeout.unwrap_or(DEFAULT_LLM_API_TIMEOUT)
     }
+
+    /// Effective stream idle timeout; zero disables the watchdog.
+    pub fn stream_idle_timeout(&self) -> Option<Duration> {
+        let duration = self
+            .stream_idle_timeout
+            .unwrap_or(DEFAULT_STREAM_IDLE_TIMEOUT);
+        (!duration.is_zero()).then_some(duration)
+    }
+}
+
+/// Replace or remove every spelling of an HTTP header name. Header values and
+/// the selected spelling are preserved; metadata keys remain case-sensitive.
+pub fn set_http_header(headers: &mut BTreeMap<String, String>, name: &str, value: Option<&str>) {
+    headers.retain(|existing, _| !existing.eq_ignore_ascii_case(name));
+    if let Some(value) = value {
+        headers.insert(name.to_owned(), value.to_owned());
+    }
 }
 
 #[cfg(test)]
@@ -121,10 +146,61 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn header_patches_replace_and_delete_names_without_case_sensitivity() {
+        let mut options = super::SimpleStreamOptions {
+            headers: Some(std::collections::BTreeMap::from([
+                ("Authorization".into(), "Bearer Old".into()),
+                ("X-Tenant".into(), "tenant".into()),
+            ])),
+            ..Default::default()
+        };
+        super::SimpleStreamOptionsPatch {
+            headers: Some(std::collections::BTreeMap::from([
+                ("authorization".into(), Some("Bearer New".into())),
+                ("x-tenant".into(), None),
+            ])),
+            ..Default::default()
+        }
+        .apply(&mut options);
+        assert_eq!(
+            options.headers,
+            Some(std::collections::BTreeMap::from([(
+                "authorization".into(),
+                "Bearer New".into()
+            )]))
+        );
+    }
+
+    #[test]
     fn llm_api_timeout_defaults_to_ten_minutes() {
         let options = SimpleStreamOptions::default();
         assert_eq!(options.timeout, Some(Duration::from_secs(600)));
         assert_eq!(options.request_timeout(), DEFAULT_LLM_API_TIMEOUT);
+    }
+
+    #[test]
+    fn stream_idle_timeout_is_independent_and_can_be_disabled_or_reset() {
+        let mut options = SimpleStreamOptions::default();
+        assert_eq!(
+            options.stream_idle_timeout(),
+            Some(Duration::from_secs(300))
+        );
+        super::SimpleStreamOptionsPatch {
+            stream_idle_timeout: Some(Some(Duration::ZERO)),
+            ..Default::default()
+        }
+        .apply(&mut options);
+        assert_eq!(options.stream_idle_timeout(), None);
+        assert_eq!(options.request_timeout(), Duration::from_secs(600));
+        super::SimpleStreamOptionsPatch {
+            stream_idle_timeout: Some(None),
+            ..Default::default()
+        }
+        .apply(&mut options);
+        assert_eq!(
+            options.stream_idle_timeout(),
+            Some(Duration::from_secs(300))
+        );
     }
 
     #[test]
@@ -329,6 +405,8 @@ impl ContextPatch {
 #[derive(Debug, Clone, Default)]
 pub struct SimpleStreamOptionsPatch {
     pub timeout: Option<Option<Duration>>,
+    /// Replace the idle timeout, reset its default with inner `None`, or disable with zero.
+    pub stream_idle_timeout: Option<Option<Duration>>,
     pub max_retries: Option<Option<u32>>,
     pub max_retry_delay: Option<Option<Duration>>,
     /// `None` = leave; `Some(map)` = merge, inner `None` deletes a key.
@@ -349,6 +427,9 @@ impl SimpleStreamOptionsPatch {
         if let Some(v) = self.timeout {
             opts.timeout = v;
         }
+        if let Some(v) = self.stream_idle_timeout {
+            opts.stream_idle_timeout = v;
+        }
         if let Some(v) = self.max_retries {
             opts.max_retries = v;
         }
@@ -358,10 +439,7 @@ impl SimpleStreamOptionsPatch {
         if let Some(patch) = &self.headers {
             let mut map = opts.headers.take().unwrap_or_default();
             for (k, v) in patch {
-                match v {
-                    Some(val) => map.insert(k.clone(), val.clone()),
-                    None => map.remove(k),
-                };
+                set_http_header(&mut map, k, v.as_deref());
             }
             opts.headers = if map.is_empty() { None } else { Some(map) };
         }

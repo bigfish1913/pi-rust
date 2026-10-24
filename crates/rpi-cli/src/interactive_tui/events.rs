@@ -481,6 +481,15 @@ pub(super) fn assistant_error_text(message: &rpi_ai::AssistantMessage) -> Option
     let fallback = match message.stop_reason {
         rpi_ai::StopReason::Error => "Provider request failed.",
         rpi_ai::StopReason::Aborted => "Request aborted.",
+        // A `length` stop is not an error, but a silent cut is indistinguishable
+        // from an interrupted message. Reasoning models make this common: a long
+        // chain of thought can consume the whole output budget (DeepSeek bills
+        // reasoning tokens inside `max_tokens`), so the answer arrives empty or
+        // clipped. Say why it stopped instead of leaving the turn looking broken.
+        rpi_ai::StopReason::Length => {
+            "Response was truncated at the output-token limit (max_tokens) before it finished. \
+             Lower the thinking level or raise the model's maxTokens."
+        }
         _ => return None,
     };
     Some(

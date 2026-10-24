@@ -1,6 +1,8 @@
 use super::*;
 use rpi_tui::Component;
 
+mod session_regressions;
+
 #[test]
 fn changelog_command_shows_current_release_and_all_is_explicit() {
     let entries = crate::changelog::bundled_entries();
@@ -435,6 +437,7 @@ fn markdown_flag_only_comes_from_an_explicit_true() {
 /// the explicit literals other tests build, but keeps one copy in sync.
 fn test_tui_state() -> Arc<TuiState> {
     Arc::new(TuiState {
+        session_dir: std::path::PathBuf::from("unused-session-root"),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -667,6 +670,125 @@ fn dequeue_places_the_caret_at_the_end_of_the_last_line_in_bytes() {
     );
 }
 
+#[tokio::test]
+async fn dequeue_restores_both_queues_images_and_folded_draft_without_aborting() {
+    let harness = AgentHarness::create(Default::default()).await.unwrap();
+    let lane: Arc<dyn AgentLane> = harness.lane("main");
+    let state = test_tui_state();
+    let tui = Arc::new(TuiAltScreen::new(
+        Box::new(ProcessTerminal::new()),
+        true,
+        None,
+    ));
+    let image = rpi_ai::types::ImageContent {
+        kind: rpi_ai::types::ImageContentType,
+        data: "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7".into(),
+        mime_type: "image/gif".into(),
+    };
+    lane.steer(user_message_with_images("排队修改", vec![image.clone()]))
+        .await
+        .unwrap();
+    lane.follow_up(user_message_with_images("后续消息", vec![]))
+        .await
+        .unwrap();
+    refresh_pending_messages(&state, &lane).await;
+    let draft = "草稿\n".repeat(30);
+    state.editor.handle_paste(&draft);
+    state.set_status(RunStatus::Working);
+    handle_dequeue(lane.clone(), state.editor.clone(), state.clone(), tui).await;
+    let expected = format!("排队修改\n\n后续消息\n\n{draft}");
+    assert_eq!(state.editor.get_expanded_text(), expected);
+    assert_eq!(
+        state.editor.cursor_position(),
+        (expected.split('\n').count() - 1, 0)
+    );
+    assert_eq!(*state.pending_images.lock().unwrap(), vec![image]);
+    assert!(lane.queued_messages().await.unwrap().is_empty());
+    assert!(state.pending_snapshot.lock().unwrap().is_empty());
+    assert!(*state.status.lock().unwrap() == RunStatus::Working);
+    assert!(strip_ansi(&state.chat_container.render(120).join("\n"))
+        .contains("Restored 2 queued messages to editor"));
+    harness.close().await.unwrap();
+}
+
+#[test]
+fn hot_cycle_crosses_providers_and_anchors_duplicate_ids_to_the_live_lane() {
+    with_isolated_config_dir(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let harness = AgentHarness::create(Default::default()).await.unwrap();
+                let lane: Arc<dyn AgentLane> = harness.lane("main");
+                let state = test_tui_state();
+                let first = rpi_ai::Model::new(
+                    "shared",
+                    "First",
+                    rpi_ai::Api::OpenaiCompletions,
+                    "first",
+                    "http://first.invalid",
+                );
+                let second = rpi_ai::Model::new(
+                    "shared",
+                    "Second",
+                    rpi_ai::Api::OpenaiCompletions,
+                    "second",
+                    "http://second.invalid",
+                );
+                let mut responses = second.clone();
+                responses.api = rpi_ai::Api::OpenaiResponses;
+                let catalog = [first.clone(), second.clone(), responses.clone()];
+                lane.set_model(first.clone()).await.unwrap();
+                let next = cycle_model(&lane, &catalog, false).await.unwrap().unwrap();
+                assert_eq!(next, second);
+                let note = apply_model_selection(&lane, &state, next, false)
+                    .await
+                    .unwrap();
+                assert!(note.contains("second/shared"));
+                assert_eq!(lane.get_model().await.unwrap(), second);
+                assert!(
+                    strip_ansi(&state.footer.render(120).join("\n")).contains("(second) shared")
+                );
+                let saved = crate::settings::load_settings().unwrap();
+                assert_eq!(saved.default_provider.as_deref(), Some("second"));
+                assert_eq!(
+                    cycle_model(&lane, &catalog, true).await.unwrap().unwrap(),
+                    first
+                );
+                assert_eq!(
+                    cycle_model(&lane, &catalog, false).await.unwrap().unwrap(),
+                    responses
+                );
+                lane.set_model(responses).await.unwrap();
+                assert_eq!(
+                    cycle_model(&lane, &catalog, false).await.unwrap().unwrap(),
+                    first
+                );
+                let mut settings = saved.clone();
+                settings.scoped_models = Some(vec!["first/shared".into()]);
+                crate::settings::save_settings(&settings).unwrap();
+                assert_eq!(
+                    cycle_model(&lane, &catalog, false).await.unwrap().unwrap(),
+                    first
+                );
+                assert!(cycle_model(&lane, &[], false).await.unwrap().is_none());
+                let old_id = state.current_model_id();
+                let old_footer = state.footer.render(120);
+                harness.close().await.unwrap();
+                assert!(apply_model_selection(&lane, &state, first, true)
+                    .await
+                    .is_err());
+                assert_eq!(state.current_model_id(), old_id);
+                assert_eq!(state.footer.render(120), old_footer);
+                assert_eq!(
+                    crate::settings::load_settings().unwrap().default_provider,
+                    saved.default_provider
+                );
+            });
+    });
+}
+
 #[test]
 fn settings_menu_covers_the_wired_settings_surface() {
     let state = test_tui_state();
@@ -798,6 +920,7 @@ fn verbose_overrides_quiet_startup_listing() {
 
 #[test]
 fn resume_command_omits_the_default_session_dir() {
+    let _env = crate::config::test_support::SessionDirEnv::new(None);
     let cwd = std::path::Path::new("/proj/demo");
     assert_eq!(format_resume_command("", cwd, None), None);
     assert_eq!(
@@ -1549,6 +1672,7 @@ fn test_agent_event_mapping_creates_assistant_and_tool() {
     };
 
     let state = Arc::new(TuiState {
+        session_dir: std::path::PathBuf::from("unused-session-root"),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -2541,6 +2665,15 @@ fn assistant_error_text_keeps_terminal_provider_diagnostic_visible() {
         assistant_error_text(&aborted).as_deref(),
         Some("Request aborted.")
     );
+
+    // A truncated turn keeps its text but still needs a visible reason: without
+    // one the transcript looks like the message was interrupted.
+    let mut truncated = aborted;
+    truncated.stop_reason = StopReason::Length;
+    truncated.content = vec![rpi_ai::types::Content::text("half an answer")];
+    let note = assistant_error_text(&truncated).expect("length must be surfaced");
+    assert!(note.contains("truncated"), "{note}");
+    assert!(note.contains("max_tokens"), "{note}");
 }
 
 #[test]
@@ -2571,13 +2704,13 @@ fn test_cycle_next_model_wraps_around() {
     };
     let catalog = [mk("a"), mk("b"), mk("c")];
     // Next after "a" is "b"; after "c" wraps to "a".
-    assert_eq!(cycle_next_model(&catalog, "a").unwrap().id, "b");
-    assert_eq!(cycle_next_model(&catalog, "c").unwrap().id, "a");
+    assert_eq!(cycle_next_model(&catalog, &mk("a")).unwrap().id, "b");
+    assert_eq!(cycle_next_model(&catalog, &mk("c")).unwrap().id, "a");
     // An unknown current id falls back to the first model.
-    assert_eq!(cycle_next_model(&catalog, "zzz").unwrap().id, "a");
+    assert_eq!(cycle_next_model(&catalog, &mk("zzz")).unwrap().id, "a");
     // Empty catalog yields None.
     let empty: Vec<Model> = vec![];
-    assert!(cycle_next_model(&empty, "a").is_none());
+    assert!(cycle_next_model(&empty, &mk("a")).is_none());
 }
 
 #[test]
@@ -2594,13 +2727,13 @@ fn test_cycle_prev_model_wraps_around() {
     };
     let catalog = [mk("a"), mk("b"), mk("c")];
     // Previous before "b" is "a"; before "a" wraps to "c".
-    assert_eq!(cycle_prev_model(&catalog, "b").unwrap().id, "a");
-    assert_eq!(cycle_prev_model(&catalog, "a").unwrap().id, "c");
+    assert_eq!(cycle_prev_model(&catalog, &mk("b")).unwrap().id, "a");
+    assert_eq!(cycle_prev_model(&catalog, &mk("a")).unwrap().id, "c");
     // An unknown current id falls back to the first model.
-    assert_eq!(cycle_prev_model(&catalog, "zzz").unwrap().id, "a");
+    assert_eq!(cycle_prev_model(&catalog, &mk("zzz")).unwrap().id, "a");
     // Empty catalog yields None.
     let empty: Vec<Model> = vec![];
-    assert!(cycle_prev_model(&empty, "a").is_none());
+    assert!(cycle_prev_model(&empty, &mk("a")).is_none());
 }
 
 #[test]
@@ -2608,6 +2741,7 @@ fn test_autocomplete_slash_suggestions_render() {
     // The autocomplete container should render at least one suggestion
     // line when the editor holds a `/` prefix, and clear when it doesn't.
     let state = Arc::new(TuiState {
+        session_dir: std::path::PathBuf::from("unused-session-root"),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -2701,6 +2835,7 @@ fn test_select_list_swap_restores_editor() {
     // child; closing restores it. Verify the container child count + the
     // active_selector flag round-trip.
     let state = Arc::new(TuiState {
+        session_dir: std::path::PathBuf::from("unused-session-root"),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -2797,6 +2932,7 @@ fn test_message_history_browse_restores_draft() {
     // messages, browse older → newer → back past the newest restores the
     // draft the user was typing.
     let state = Arc::new(TuiState {
+        session_dir: std::path::PathBuf::from("unused-session-root"),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -2896,6 +3032,7 @@ fn test_message_history_browse_restores_draft() {
 fn test_accept_top_suggestion_replaces_prefix() {
     // `/he` + Tab → `/help ` (slash command provider inserts a space).
     let state = Arc::new(TuiState {
+        session_dir: std::path::PathBuf::from("unused-session-root"),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -2981,6 +3118,7 @@ fn test_accept_top_suggestion_replaces_prefix() {
 /// installed by each test).
 fn autocomplete_test_state(max_visible: usize) -> Arc<TuiState> {
     Arc::new(TuiState {
+        session_dir: std::path::PathBuf::from("unused-session-root"),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),

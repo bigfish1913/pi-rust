@@ -116,11 +116,12 @@ fn single_tool_use_stream_fn(calls: Vec<(&str, &str)>) -> rpi_agent::StreamFn {
         let (mut prod, stream) = create_assistant_message_event_stream();
         tokio::spawn(async move {
             let partial = Arc::new(msg.clone());
-            prod.push(AssistantMessageEvent::Start { partial });
+            prod.push(AssistantMessageEvent::Start { partial }).await;
             prod.push(AssistantMessageEvent::Done {
                 reason: DoneReason::ToolUse,
                 message: msg,
-            });
+            })
+            .await;
         });
         stream
     })

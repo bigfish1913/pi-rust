@@ -113,12 +113,12 @@ impl MapperState {
     /// Emit whatever text/thinking is batched. Called at every block boundary
     /// (`content_block_stop`, `message_stop`, the terminal event) and whenever
     /// the stream switches channel, so no delta is dropped or reordered.
-    fn flush_pending(&mut self, prod: &mut AssistantMessageEventStreamProducer) {
-        self.flush_text(prod);
-        self.flush_thinking(prod);
+    async fn flush_pending(&mut self, prod: &mut AssistantMessageEventStreamProducer) {
+        self.flush_text(prod).await;
+        self.flush_thinking(prod).await;
     }
 
-    fn flush_text(&mut self, prod: &mut AssistantMessageEventStreamProducer) {
+    async fn flush_text(&mut self, prod: &mut AssistantMessageEventStreamProducer) {
         if self.pending_text.is_empty() {
             return;
         }
@@ -132,10 +132,11 @@ impl MapperState {
             content_index,
             delta,
             partial: Arc::new(self.output.clone()),
-        });
+        })
+        .await;
     }
 
-    fn flush_thinking(&mut self, prod: &mut AssistantMessageEventStreamProducer) {
+    async fn flush_thinking(&mut self, prod: &mut AssistantMessageEventStreamProducer) {
         if self.pending_thinking.is_empty() {
             return;
         }
@@ -149,15 +150,17 @@ impl MapperState {
             content_index,
             delta,
             partial: Arc::new(self.output.clone()),
-        });
+        })
+        .await;
     }
 
-    fn ensure_started(&mut self, prod: &mut AssistantMessageEventStreamProducer) {
+    async fn ensure_started(&mut self, prod: &mut AssistantMessageEventStreamProducer) {
         if !self.started {
             self.started = true;
             prod.push(AssistantMessageEvent::Start {
                 partial: Arc::new(self.output.clone()),
-            });
+            })
+            .await;
         }
     }
 
@@ -173,7 +176,7 @@ impl MapperState {
     /// parse errors surface earlier, in the decoder. Never panics: a missing
     /// block for an index is a no-op (the TS `findIndex` returns -1 and the
     /// delta is skipped).
-    pub fn apply(
+    pub async fn apply(
         &mut self,
         event: &AnthropicEvent,
         prod: &mut AssistantMessageEventStreamProducer,
@@ -190,23 +193,24 @@ impl MapperState {
         // `iterate_anthropic_events` already filtered to ANTHROPIC_MESSAGE_EVENTS,
         // so we dispatch on the payload `type` (which equals the SSE event name).
         match event_type.as_str() {
-            "message_start" => self.apply_message_start(payload, prod),
-            "content_block_start" => self.apply_content_block_start(payload, prod),
-            "content_block_delta" => self.apply_content_block_delta(payload, prod)?,
-            "content_block_stop" => self.apply_content_block_stop(payload, prod),
-            "message_delta" => self.apply_message_delta(payload, prod),
+            "message_start" => self.apply_message_start(payload, prod).await,
+            "content_block_start" => self.apply_content_block_start(payload, prod).await,
+            "content_block_delta" => self.apply_content_block_delta(payload, prod).await?,
+            "content_block_stop" => self.apply_content_block_stop(payload, prod).await,
+            "message_delta" => self.apply_message_delta(payload, prod).await,
             "message_stop" => self.saw_message_end = true,
             _ => {}
         }
+        prod.commit_metadata(&self.output);
         Ok(())
     }
 
-    fn apply_message_start(
+    async fn apply_message_start(
         &mut self,
         payload: &serde_json::Value,
         prod: &mut AssistantMessageEventStreamProducer,
     ) {
-        self.ensure_started(prod);
+        self.ensure_started(prod).await;
         // `event.message.id` — response id.
         if let Some(id) = payload
             .pointer("/message/id")
@@ -261,7 +265,7 @@ impl MapperState {
         }
     }
 
-    fn apply_content_block_start(
+    async fn apply_content_block_start(
         &mut self,
         payload: &serde_json::Value,
         prod: &mut AssistantMessageEventStreamProducer,
@@ -269,8 +273,8 @@ impl MapperState {
         // A new block implies the previous one is done. `content_block_stop`
         // normally flushed already; this covers a stream that opens a block
         // without closing the last one.
-        self.flush_pending(prod);
-        self.ensure_started(prod);
+        self.flush_pending(prod).await;
+        self.ensure_started(prod).await;
         let anthropic_index = payload.get("index").and_then(|v| v.as_i64()).unwrap_or(0);
         let Some(block) = payload.get("content_block") else {
             return;
@@ -299,7 +303,8 @@ impl MapperState {
                 prod.push(AssistantMessageEvent::TextStart {
                     content_index,
                     partial: Arc::new(self.output.clone()),
-                });
+                })
+                .await;
             }
             "thinking" => {
                 let thinking = block
@@ -333,7 +338,8 @@ impl MapperState {
                 prod.push(AssistantMessageEvent::ThinkingStart {
                     content_index,
                     partial: Arc::new(self.output.clone()),
-                });
+                })
+                .await;
             }
             "redacted_thinking" => {
                 let data = block
@@ -361,7 +367,8 @@ impl MapperState {
                 prod.push(AssistantMessageEvent::ThinkingStart {
                     content_index,
                     partial: Arc::new(self.output.clone()),
-                });
+                })
+                .await;
             }
             "tool_use" => {
                 let id = block
@@ -392,7 +399,8 @@ impl MapperState {
                 prod.push(AssistantMessageEvent::ToolCallStart {
                     content_index,
                     partial: Arc::new(self.output.clone()),
-                });
+                })
+                .await;
             }
             // image / unknown content blocks are not emitted by the Anthropic
             // Messages streaming API on the assistant side — skip (mirrors TS).
@@ -400,7 +408,7 @@ impl MapperState {
         }
     }
 
-    fn apply_content_block_delta(
+    async fn apply_content_block_delta(
         &mut self,
         payload: &serde_json::Value,
         prod: &mut AssistantMessageEventStreamProducer,
@@ -436,7 +444,7 @@ impl MapperState {
                 self.pending_text_index = Some(content_index);
                 self.pending_text.push_str(&text);
                 if self.should_flush(&self.pending_text) {
-                    self.flush_text(prod);
+                    self.flush_text(prod).await;
                 }
             }
             (BlockKind::Thinking { redacted: false }, "thinking_delta") => {
@@ -450,11 +458,11 @@ impl MapperState {
                 }
                 // Keep channel order strict: text already streamed must reach the
                 // consumer before the first thinking delta of a new block.
-                self.flush_text(prod);
+                self.flush_text(prod).await;
                 self.pending_thinking_index = Some(content_index);
                 self.pending_thinking.push_str(&thinking);
                 if self.should_flush(&self.pending_thinking) {
-                    self.flush_thinking(prod);
+                    self.flush_thinking(prod).await;
                 }
             }
             (BlockKind::Thinking { redacted: false }, "signature_delta") => {
@@ -478,7 +486,7 @@ impl MapperState {
                 // A tool-call block is a new channel; flush what is batched so
                 // the consumer never sees tool events before the text that
                 // preceded them.
-                self.flush_pending(prod);
+                self.flush_pending(prod).await;
                 let scratch = &mut self.blocks[scratch_index];
                 scratch.partial_json.push_str(&partial);
                 // Re-parse the accumulated partial JSON on every delta so the
@@ -492,7 +500,8 @@ impl MapperState {
                     content_index,
                     delta: partial,
                     partial: Arc::new(self.output.clone()),
-                });
+                })
+                .await;
             }
             // Redacted-thinking blocks receive no deltas; unknown delta types
             // are ignored (forward-compat for future delta variants).
@@ -501,7 +510,7 @@ impl MapperState {
         Ok(())
     }
 
-    fn apply_content_block_stop(
+    async fn apply_content_block_stop(
         &mut self,
         payload: &serde_json::Value,
         prod: &mut AssistantMessageEventStreamProducer,
@@ -514,7 +523,7 @@ impl MapperState {
         // closes the block, otherwise the tail would be visible in the final
         // message but never in the delta stream. Must happen before `scratch`
         // takes its mutable borrow of `self.blocks`.
-        self.flush_pending(prod);
+        self.flush_pending(prod).await;
         let scratch = &mut self.blocks[scratch_index];
         let content_index = scratch.content_index;
         match scratch.kind {
@@ -527,7 +536,8 @@ impl MapperState {
                     content_index,
                     content,
                     partial: Arc::new(self.output.clone()),
-                });
+                })
+                .await;
             }
             BlockKind::Thinking { redacted } => {
                 let thinking_text = match &self.output.content[content_index] {
@@ -542,7 +552,8 @@ impl MapperState {
                     content_index,
                     content: thinking_text,
                     partial: Arc::new(self.output.clone()),
-                });
+                })
+                .await;
             }
             BlockKind::ToolCall => {
                 // Final authoritative parse. Mirrors the TS
@@ -566,12 +577,13 @@ impl MapperState {
                     content_index,
                     tool_call,
                     partial: Arc::new(self.output.clone()),
-                });
+                })
+                .await;
             }
         }
     }
 
-    fn apply_message_delta(
+    async fn apply_message_delta(
         &mut self,
         payload: &serde_json::Value,
         prod: &mut AssistantMessageEventStreamProducer,
@@ -731,12 +743,12 @@ pub async fn run_mapper<F>(
                     match crate::providers::anthropic::sse::parse_anthropic_event(&sse_frame) {
                         Ok(e) => e,
                         Err(err) => {
-                            emit_terminal_error(prod, state, err.to_string(), false);
+                            emit_terminal_error(prod, state, err.to_string(), false).await;
                             return;
                         }
                     };
-                if let Err(err) = state.apply(&event, prod) {
-                    emit_terminal_error(prod, state, err.to_string(), false);
+                if let Err(err) = state.apply(&event, prod).await {
+                    emit_terminal_error(prod, state, err.to_string(), false).await;
                     return;
                 }
                 // `message_stop` is Anthropic's protocol-level terminal
@@ -746,19 +758,19 @@ pub async fn run_mapper<F>(
                 // error.  The event has already carried the final stop/usage
                 // state, so finalize immediately and drop the body stream.
                 if event.event_type() == Some("message_stop") {
-                    finalize_mapper(prod, state, cost_fn);
+                    finalize_mapper(prod, state, cost_fn).await;
                     return;
                 }
             }
             Err(err) => {
                 let aborted = matches!(err, AiError::Abort { .. });
-                emit_terminal_error(prod, state, err.to_string(), aborted);
+                emit_terminal_error(prod, state, err.to_string(), aborted).await;
                 return;
             }
         }
     }
 
-    finalize_mapper(prod, state, cost_fn);
+    finalize_mapper(prod, state, cost_fn).await;
 }
 
 /// Emit the terminal `Done`/`Error` event for a normally-ended stream. Mirrors
@@ -769,7 +781,7 @@ pub async fn run_mapper<F>(
 /// Extracted from [`run_mapper`] so tests can drive the mapper over a
 /// pre-decoded `Vec<AnthropicEvent>` (no `reqwest::Response` needed) and still
 /// exercise the terminal logic.
-pub fn finalize_mapper<F>(
+pub async fn finalize_mapper<F>(
     prod: &mut AssistantMessageEventStreamProducer,
     state: &mut MapperState,
     cost_fn: F,
@@ -794,7 +806,8 @@ pub fn finalize_mapper<F>(
             state,
             "Anthropic stream ended without a stop reason".to_string(),
             false,
-        );
+        )
+        .await;
         return;
     }
     if matches!(
@@ -807,7 +820,7 @@ pub fn finalize_mapper<F>(
             .error_message
             .clone()
             .unwrap_or_else(|| "An unknown error occurred".to_string());
-        emit_terminal_error(prod, state, msg, aborted);
+        emit_terminal_error(prod, state, msg, aborted).await;
         return;
     }
 
@@ -823,7 +836,8 @@ pub fn finalize_mapper<F>(
     prod.push(AssistantMessageEvent::Done {
         reason,
         message: state.output.clone(),
-    });
+    })
+    .await;
 }
 
 /// Emit the terminal `Error` event for the stream, stamping `output.stop_reason`
@@ -834,7 +848,7 @@ pub fn finalize_mapper<F>(
 /// Extracted as a `pub` helper so the provider's pre-stream catch (auth
 /// failure / HTTP error / abort) reuses the same terminal shape the mapper's
 /// in-stream catch uses, keeping the consumer's `result()` contract uniform.
-pub fn emit_terminal_error(
+pub async fn emit_terminal_error(
     prod: &mut AssistantMessageEventStreamProducer,
     state: &mut MapperState,
     message: String,
@@ -848,7 +862,7 @@ pub fn emit_terminal_error(
     state.output.error_message = Some(message);
     // Surface whatever streamed before the failure; the batched tail would
     // otherwise be lost from the delta stream.
-    state.flush_pending(prod);
+    state.flush_pending(prod).await;
     let reason = if aborted {
         ErrorReason::Aborted
     } else {
@@ -857,7 +871,8 @@ pub fn emit_terminal_error(
     prod.push(AssistantMessageEvent::Error {
         reason,
         error: state.output.clone(),
-    });
+    })
+    .await;
 }
 
 #[cfg(test)]
@@ -895,16 +910,12 @@ mod tests {
             MapperState::new(Api::AnthropicMessages, "anthropic", "claude-haiku-4-5", 0);
         for f in &frames {
             let event = parse_anthropic_event(f).expect("event parses");
-            state.apply(&event, &mut prod).expect("apply");
+            state.apply(&event, &mut prod).await.expect("apply");
         }
         // finalize_mapper applies the model-aware cost; tests pass a zero cost
         // fn since they assert usage fields, not dollar amounts.
-        finalize_mapper(&mut prod, &mut state, |_| UsageCost::default());
+        finalize_mapper(&mut prod, &mut state, |_| UsageCost::default()).await;
 
-        // Hand the producer to a driver task so it can push the buffered events
-        // while the consumer drains. The producer's push calls happen above
-        // synchronously; dropping the producer into a task that immediately exits
-        // lets the consumer observe the terminal event via the result oneshot.
         drop(prod);
         let mut stream = stream;
         let mut tags = Vec::new();
@@ -1609,7 +1620,7 @@ mod tests {
         // An error frame — parse_anthropic_event returns Err.
         let err_frame = frame("error", "rate limited");
         match parse_anthropic_event(&err_frame) {
-            Err(e) => emit_terminal_error(&mut prod, &mut state, e.to_string(), false),
+            Err(e) => emit_terminal_error(&mut prod, &mut state, e.to_string(), false).await,
             Ok(_) => panic!("expected error"),
         }
         let result = stream.result().await.expect("terminal");
