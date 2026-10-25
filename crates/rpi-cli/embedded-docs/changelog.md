@@ -11,6 +11,12 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.9.1](https://github.com/bigfish1913/pi-rust/compare/v0.9.0...v0.9.1) - 2026-10-25
+
+### Fixed
+
+- *(cli)* stop buffering IME commits as pastes on Windows ([#91](https://github.com/bigfish1913/pi-rust/pull/91))
+
 ## [0.9.0](https://github.com/bigfish1913/pi-rust/compare/v0.8.5...v0.9.0) - 2026-10-25
 
 ### Added
