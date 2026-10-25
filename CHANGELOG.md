@@ -11,6 +11,12 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.9.2](https://github.com/bigfish1913/pi-rust/compare/v0.9.1...v0.9.2) - 2026-10-25
+
+### Fixed
+
+- *(cli)* restore the session's model and footer usage on switch ([#104](https://github.com/bigfish1913/pi-rust/pull/104))
+
 ## [0.9.1](https://github.com/bigfish1913/pi-rust/compare/v0.9.0...v0.9.1) - 2026-10-25
 
 ### Fixed
