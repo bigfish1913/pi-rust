@@ -38,8 +38,7 @@ use std::sync::{Arc, Mutex};
 pub type SessionResourceCleanup = Box<dyn Fn(Option<&str>) + Send + Sync>;
 
 /// Global registry of session resource cleanup callbacks.
-static CLEANUP_REGISTRY: std::sync::LazyLock<Mutex<Vec<Arc<SessionResourceCleanup>>>> =
-    std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+static CLEANUP_REGISTRY: Mutex<Vec<Arc<SessionResourceCleanup>>> = Mutex::new(Vec::new());
 
 /// Register a session resource cleanup callback. Returns an unregister function
 /// that removes the callback when called.
@@ -153,8 +152,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     // Global lock to serialize tests that use the shared CLEANUP_REGISTRY
-    static TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn register_and_cleanup() {

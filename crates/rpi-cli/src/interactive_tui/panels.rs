@@ -222,7 +222,7 @@ impl Component for Rail {
                 _ => 0,
             };
             let start = (start as i64 + offset as i64).clamp(0, free as i64) as usize;
-            rows.splice(0..0, std::iter::repeat_n(String::new(), start));
+            rows.splice(0..0, std::iter::repeat(String::new()).take(start));
         }
         rows
     }

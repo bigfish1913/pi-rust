@@ -11,6 +11,36 @@ permissions:
   contents: read
 
 jobs:
+  msrv:
+    name: Supported Rust 1.78
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.78
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.78.0"
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check workspace targets on the declared MSRV
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Check the standalone ABI core on the declared MSRV
+        run: cargo check -p rpi-plugin-sdk --no-default-features --locked
+
+      - name: Check the provider SDK bridge on the declared MSRV
+        run: cargo check -p rpi-plugin-sdk --features provider --locked
+
+      - name: Check rpi-ai without default features on the declared MSRV
+        run: cargo check -p rpi-ai --no-default-features --locked
+
   windows-installer:
     name: Windows installer (${{ matrix.shell }})
     runs-on: windows-latest

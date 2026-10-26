@@ -1612,7 +1612,7 @@ async fn rpc_set_model(
         .iter()
         .find(|m| {
             m.id.eq_ignore_ascii_case(id)
-                && provider.is_none_or(|provider| m.provider.eq_ignore_ascii_case(provider))
+                && provider.map_or(true, |provider| m.provider.eq_ignore_ascii_case(provider))
         })
         .cloned()
         .ok_or_else(|| format!("unknown model: {id}"))?;

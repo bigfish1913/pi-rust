@@ -46,7 +46,11 @@ similar = { version = "2", features = ["text"] }
 unicode-normalization = "0.1"
 regex = { workspace = true }
 globset = { workspace = true }
-image = "0.25"  # Image processing (resize, convert, EXIF)
+# Image processing (resize, convert, EXIF). Image's default features minus
+# `avif` and `rayon`: rpi never encodes AVIF, and the AVIF encoder stack
+# (ravif -> rav1e -> aligned) needs Rust 1.85+ and stays in Cargo.lock even when
+# unused. Decoders are unchanged.
+image = { version = "0.25", default-features = false, features = ["bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp"] }
 
 [package.metadata.docs.rs]
 all-features = true

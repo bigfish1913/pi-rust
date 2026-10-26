@@ -21,7 +21,7 @@ pub(super) extern "C" fn consume_execute(
 ) -> StepHandle {
     // SAFETY: execute receives ownership of params and its producer deallocator.
     drop(unsafe { rpi_plugin_sdk::callbacks::OwnedString::from_raw(params, free) });
-    std::ptr::dangling_mut()
+    std::ptr::NonNull::dangling().as_ptr()
 }
 pub(super) extern "C" fn noop(_: StepHandle) {}
 extern "C" fn noop_set_waker(_: StepHandle, _: Option<rpi_plugin_sdk::ToolWakeCb>, _: *mut c_void) {
