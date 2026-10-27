@@ -11,6 +11,13 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.10.0](https://github.com/bigfish1913/pi-rust/compare/v0.9.5...v0.10.0) - 2026-10-27
+
+### Fixed
+
+- *(prompt)* list only the active tools and drop guidelines for absent ones ([#119](https://github.com/bigfish1913/pi-rust/pull/119))
+- *(edit)* the display diff shows replaced lines old then new ([#121](https://github.com/bigfish1913/pi-rust/pull/121))
+
 ## [0.9.5](https://github.com/bigfish1913/pi-rust/compare/v0.9.4...v0.9.5) - 2026-10-27
 
 ### Fixed
