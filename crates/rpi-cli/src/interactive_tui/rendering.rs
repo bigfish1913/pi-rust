@@ -257,6 +257,10 @@ pub(super) fn add_help_message(container: &Arc<Container>) {
         ("/compact", "Compact the conversation"),
         ("/copy", "Copy last reply to clipboard"),
         ("/hotkeys", "Show keyboard shortcuts"),
+        (
+            "/skills",
+            "List skills or invoke one: /skills <name> [instructions]",
+        ),
     ];
     let cmd_w = cmds.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
     for (cmd, desc) in cmds {
@@ -533,6 +537,50 @@ pub(super) fn add_note_message(container: &Arc<Container>, text: &str) {
         0,
     )));
     container.add_child(Arc::new(Spacer::new(1)));
+}
+
+/// Add an explicit skill activation notice to the transcript.
+pub(super) fn add_skill_activation_message(container: &Arc<Container>, name: &str) {
+    let c = current_theme().colors;
+    container.add_child(Arc::new(Text::new(
+        format!(
+            "  {} {}",
+            c.accent.fg("[skill]"),
+            c.text.fg(&format!("Activating {name}")),
+        ),
+        1,
+        0,
+    )));
+    container.add_child(Arc::new(Spacer::new(1)));
+}
+
+/// List the skills currently available to this session.
+pub(super) fn show_skills_panel(
+    chat: &Arc<Container>,
+    resources: &rpi_harness::types::AgentHarnessResources,
+) {
+    let skills = resources.skills.as_deref().unwrap_or(&[]);
+    let mut lines = Vec::new();
+    lines.push("🧩 Skills available in this session:".to_string());
+    if skills.is_empty() {
+        lines.push("  (none discovered — create .rpi/skills/ or ~/.rpi/agent/skills/)".into());
+    } else {
+        for skill in skills {
+            let hidden = if skill.disable_model_invocation == Some(true) {
+                " [hidden]"
+            } else {
+                ""
+            };
+            lines.push(format!(
+                "  • {}{} — {}",
+                skill.name,
+                hidden,
+                skill.description.chars().take(72).collect::<String>()
+            ));
+        }
+        lines.push("  Invoke with: /skills <name> [instructions]".into());
+    }
+    container_note_block(chat, &lines.join("\n"));
 }
 
 /// Render the `/context` panel: a transcript message listing the discovered

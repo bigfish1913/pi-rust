@@ -277,6 +277,8 @@ struct CommandContext {
     /// reads, export, or usage stats go through this instead of reaching into
     /// the harness directly, so the product surface is one object.
     session: Arc<crate::agent_session::AgentSession>,
+    /// Whether the live AgentEvent drain is available for this TUI session.
+    streaming: bool,
 }
 
 /// One slash command.
@@ -1400,6 +1402,7 @@ pub async fn interactive_tui(
         scoped_models,
         cwd.clone(),
     ));
+    let streaming = event_rx.is_some();
     let ctx = CommandContext {
         chat: chat_container.clone(),
         tui: tui.clone(),
@@ -1414,6 +1417,7 @@ pub async fn interactive_tui(
         startup_context,
         reload_context: Arc::new(reload_context.clone()),
         session: agent_session.clone(),
+        streaming,
     };
 
     let ctx_for_cb = ctx.clone();

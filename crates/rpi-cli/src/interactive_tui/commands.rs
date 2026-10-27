@@ -726,6 +726,67 @@ impl SlashCommand for ShareCommand {
     }
 }
 
+/// `/skills` lists the current skill registry, or explicitly invokes one.
+/// Usage: `/skills` or `/skills <name> [additional instructions]`.
+pub(super) struct SkillsCommand;
+impl SlashCommand for SkillsCommand {
+    fn name(&self) -> &'static str {
+        "/skills"
+    }
+    fn description(&self) -> &'static str {
+        "List skills or invoke one with optional instructions"
+    }
+    fn execute(&self, ctx: &CommandContext, args: &str) {
+        let input = args.trim();
+        if input.is_empty() {
+            let resources = ctx.resources.lock().unwrap().clone();
+            show_skills_panel(&ctx.chat, &resources);
+            ctx.tui.request_render(false);
+            return;
+        }
+
+        let mut parts = input.splitn(2, char::is_whitespace);
+        let name = parts.next().unwrap_or_default();
+        let additional = parts.next().map(str::trim).filter(|text| !text.is_empty());
+        let exists = ctx
+            .resources
+            .lock()
+            .unwrap()
+            .skills
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .any(|skill| skill.name == name);
+        if !exists {
+            add_error_message(
+                &ctx.chat,
+                &format!("Unknown skill \"{name}\". Use /skills to list available skills."),
+            );
+            ctx.tui.request_render(false);
+            return;
+        }
+        if !ctx.state.try_start_working() {
+            add_error_message(
+                &ctx.chat,
+                "A run is already in progress. Press Esc to abort it first.",
+            );
+            ctx.tui.request_render(false);
+            return;
+        }
+
+        add_skill_activation_message(&ctx.chat, name);
+        let lane = ctx.lane.clone();
+        let tui = ctx.tui.clone();
+        let state = ctx.state.clone();
+        let name = name.to_string();
+        let additional = additional.map(str::to_string);
+        let streaming = ctx.streaming;
+        tokio::spawn(async move {
+            run_skill_streaming(&lane, &name, additional.as_deref(), &tui, &state, streaming).await;
+        });
+    }
+}
+
 /// `/context` — lists discovered context files, skills, and prompt templates.
 /// Hidden from autocomplete (needs the resources snapshot to be meaningful as a
 /// discovery surface; like `/name`, it's recognized-v1 but kept off the list).
@@ -813,6 +874,7 @@ pub(super) fn build_builtin_registry() -> CommandRegistry {
     r.register(Arc::new(CopyCommand));
     r.register(Arc::new(HotkeysCommand));
     r.register(Arc::new(ContextCommand));
+    r.register(Arc::new(SkillsCommand));
     r.register(Arc::new(UsageCommand));
     // Recognized but inert in v1 (one struct backs them all). The TS builtins
     // out of v1 scope; each carries a description so autocomplete surfaces its

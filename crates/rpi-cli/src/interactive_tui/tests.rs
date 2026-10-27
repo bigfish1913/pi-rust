@@ -1319,6 +1319,27 @@ fn test_chat_container_has_welcome_content() {
 }
 
 #[test]
+fn skills_panel_lists_and_documents_explicit_invocation() {
+    let chat = Arc::new(Container::new());
+    let resources = rpi_harness::types::AgentHarnessResources {
+        skills: Some(vec![rpi_harness::types::Skill {
+            name: "release".into(),
+            description: "Publish the current workspace".into(),
+            content: "# Release".into(),
+            file_path: "/skills/release/SKILL.md".into(),
+            disable_model_invocation: Some(true),
+        }]),
+        ..Default::default()
+    };
+
+    show_skills_panel(&chat, &resources);
+    let plain = strip_ansi(&chat.render(100).join("\n"));
+    assert!(plain.contains("release [hidden]"));
+    assert!(plain.contains("Publish the current workspace"));
+    assert!(plain.contains("/skills <name> [instructions]"));
+}
+
+#[test]
 fn reload_updates_context_header_and_context_panel_without_stale_paths() {
     use rpi_harness::types::AgentHarnessResources;
     let chat = Arc::new(Container::new());
@@ -1652,6 +1673,7 @@ fn test_slash_command_dispatch() {
     resolves_to("/tools", "/tools");
     resolves_to("/images", "/images");
     resolves_to("/context", "/context");
+    resolves_to("/skills", "/skills");
     // Out-of-v1-scope commands resolve to their own UnsupportedCommand entry.
     resolves_to("/settings", "/settings");
     resolves_to("/name", "/name");
@@ -1693,6 +1715,7 @@ fn test_registry_visible_entries_cover_dispatch() {
         "/images",
         "/thinking",
         "/usage",
+        "/skills",
     ] {
         assert!(
             names.contains(&recognized.to_string()),

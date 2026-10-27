@@ -381,6 +381,9 @@ impl TranscriptView {
             };
             let mut tools = self.tool_components.lock().unwrap();
             if let Some(existing) = tools.get(&call.id) {
+                if let Some(skill) = skill_tool_name(&call.name, &call.args) {
+                    existing.set_skill_name(skill);
+                }
                 if !display.trim().is_empty() && display.trim() != "{}" {
                     existing.set_args(&display);
                 }
@@ -436,6 +439,9 @@ impl TranscriptView {
             if ask_user {
                 existing.set_display_title("ASK USER");
             }
+            if let Some(skill) = skill_tool_name(name, args) {
+                existing.set_skill_name(skill);
+            }
             existing.set_args(&display);
         } else {
             let comp = Arc::new(ToolExecutionComponent::new(name, &display));
@@ -479,6 +485,9 @@ impl TranscriptView {
         let existing = self.tool_components.lock().unwrap().get(id).cloned();
         match existing {
             Some(comp) => {
+                if let Some(skill) = skill_tool_name(name, args) {
+                    comp.set_skill_name(skill);
+                }
                 if ask_user {
                     comp.set_display_title("ASK USER");
                     comp.set_args(&ask_user_args_display(args));
