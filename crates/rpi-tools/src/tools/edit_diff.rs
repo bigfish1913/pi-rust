@@ -471,17 +471,14 @@ pub fn generate_diff_string(
             if first_changed_line.is_none() {
                 first_changed_line = Some(new_line_num);
             }
-            for line in &raw {
-                if is_added {
-                    out.push(format!(
-                        "+{:>width$} {}",
-                        new_line_num,
-                        line,
-                        width = line_num_width
-                    ));
-                    new_line_num += 1;
+            // A `Replace` op is the removed old lines followed by the added new
+            // lines, as jsdiff reports them; the two ranges may differ in length.
+            if is_removed {
+                let mut removed = &old_lines[op.old_range().start..op.old_range().end];
+                if removed.last().is_some_and(|s| s.is_empty()) {
+                    removed = &removed[..removed.len() - 1];
                 }
-                if is_removed {
+                for line in removed {
                     out.push(format!(
                         "-{:>width$} {}",
                         old_line_num,
@@ -491,8 +488,17 @@ pub fn generate_diff_string(
                     old_line_num += 1;
                 }
             }
-            // A `Replace` op iterates both add and remove above; for pure
-            // Insert/Delete only one branch fires. Leave last_was_change set.
+            if is_added {
+                for line in &raw {
+                    out.push(format!(
+                        "+{:>width$} {}",
+                        new_line_num,
+                        line,
+                        width = line_num_width
+                    ));
+                    new_line_num += 1;
+                }
+            }
             last_was_change = true;
             let _ = i; // index only needed for context lookahead below
         } else {
@@ -702,6 +708,14 @@ mod tests {
         assert_eq!(detect_line_ending("a\r\nb\nc"), "\r\n");
         assert_eq!(detect_line_ending("a\nb\r\nc"), "\n");
         assert_eq!(detect_line_ending("noslash"), "\n");
+    }
+
+    #[test]
+    fn diff_string_shows_replaced_lines_old_then_new() {
+        let old = "keep\nold one\nold two\nkeep\n";
+        let new = "keep\nnew\nkeep\n";
+        let diff = generate_diff_string(old, new, 4).diff;
+        assert_eq!(diff, " 1 keep\n-2 old one\n-3 old two\n+2 new\n 4 keep");
     }
 
     #[test]
