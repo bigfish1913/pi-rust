@@ -73,58 +73,129 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &["read", "bash", "edit", "write", "docs
 
 /// The default coding system prompt. A condensed port of the TS
 /// `packages/coding-agent/src/core/system-prompt.ts` base prompt.
-pub fn default_system_prompt(cwd: &str, prior_reasoning_replayed: bool) -> String {
+///
+/// `tools` is the active tool set after `--tools`/`--exclude-tools` and
+/// extension merging: the prompt lists only those tools and keeps only the
+/// guidelines that mention one of them, so a restricted run is never told it
+/// can edit or track todos (pi builds its list from the selected tools too).
+pub fn default_system_prompt(
+    cwd: &str,
+    prior_reasoning_replayed: bool,
+    tools: &[String],
+) -> String {
+    let has = |name: &str| tools.iter().any(|tool| tool == name);
+    let todo_hint = if has("todo") {
+        ", or the todo tool"
+    } else {
+        ""
+    };
     // The working-state rule must match what actually comes back on the next
     // request. With `compat.requiresThinkingAsText` (or the native thinking
     // channels of anthropic/responses) the model *does* see its own reasoning
     // again, and claiming otherwise makes it re-derive and restate the plan
     // every turn — the re-plan symptom in `docs/llm-repetition-forensics.md`.
     let working_state_rule = if prior_reasoning_replayed {
-        "- Keep a SHORT working plan visible (a few bullets, or the todo tool) and update it as you go.
+        format!(
+            "- Keep a SHORT working plan visible (a few bullets{todo_hint}) and update it as you go.
   Your own reasoning is carried back to you on the next turn, so do not re-derive it or restate
   the whole plan: continue from the last unfinished step, and when a step lands, say which one.
   Re-listing the same plan without acting on it is a bug, not progress."
+        )
     } else {
         "- Keep your working state in your VISIBLE replies, not only in reasoning. Reasoning is not
   carried into your next turn: only the text you write and the tool output you produce come
   back. Before each batch of tool calls, write one short line naming the task you are on and
   what remains. When you finish a step, say which one is done. If you keep the plan only in
   your head you will re-derive it from scratch every turn."
+            .to_string()
     };
+
+    let tool_lines = if tools.is_empty() {
+        "(none)".to_string()
+    } else {
+        tools
+            .iter()
+            .map(|name| match builtin_tool_snippet(name) {
+                Some(snippet) => format!("- {name:<5} — {snippet}"),
+                None => format!("- {name}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let mut guidelines = vec![
+        "- Reply in the SAME language the user is writing in. Detect the language of the user's
+  latest message (and, when it is too short to be sure, the working language of the
+  conversation so far) and use it for your prose replies. Mirror it unless the user
+  explicitly asks for a different language; only fall back to English when the
+  user's language cannot be determined."
+            .to_string(),
+        "- Be concise in your responses".to_string(),
+        "- Show file paths clearly when working with files".to_string(),
+        "- Prefer the smallest change that solves the problem".to_string(),
+    ];
+    if has("bash") {
+        guidelines.push(
+            "- The bash tool runs Bash, even on Windows. Use ls, find, rg, and POSIX pipelines;
+  do not pass PowerShell cmdlets such as Get-ChildItem, Select-Object, or Select-String.
+  If a powershell tool is available, use it for PowerShell commands."
+                .to_string(),
+        );
+    }
+    guidelines.push(working_state_rule);
+    if has("todo") {
+        guidelines.push(
+            "- Track multi-step work with the todo tool instead of re-listing the plan in prose: add the
+  steps once, then mark them done as you go. Re-stating the same plan without acting on it is
+  a bug, not progress."
+                .to_string(),
+        );
+    } else {
+        guidelines.push(
+            "- Re-stating the same plan without acting on it is a bug, not progress.".to_string(),
+        );
+    }
+    guidelines.push(
+        "- Read only what you need. If a file or search result was already shown earlier in this
+  conversation, use it instead of fetching it again."
+            .to_string(),
+    );
+    if has("docs") {
+        guidelines.push(
+            "- When unsure about rpi commands, extensions, Pi package compatibility, or .rpi configuration, consult the project documentation before guessing"
+                .to_string(),
+        );
+    }
+    let guidelines = guidelines.join("\n");
 
     format!(
         "You are an expert coding assistant operating inside rpi, a coding agent harness. \
 You help users by reading files, executing commands, editing code, and writing new files.
 
 Available tools:
-- read  — Read file contents
-- bash  — Execute Bash commands using Bash/POSIX syntax, including on Windows
-- edit  — Find/replace edits to existing files
-- write — Create or overwrite files
-- docs  — Look up rpi usage, extension, package, and compatibility documentation
+{tool_lines}
 
 Guidelines:
-- Reply in the SAME language the user is writing in. Detect the language of the user's
-  latest message (and, when it is too short to be sure, the working language of the
-  conversation so far) and use it for your prose replies. Mirror it unless the user
-  explicitly asks for a different language; only fall back to English when the
-  user's language cannot be determined.
-- Be concise in your responses
-- Show file paths clearly when working with files
-- Prefer the smallest change that solves the problem
-- The bash tool runs Bash, even on Windows. Use ls, find, rg, and POSIX pipelines;
-  do not pass PowerShell cmdlets such as Get-ChildItem, Select-Object, or Select-String.
-  If a powershell tool is available, use it for PowerShell commands.
-{working_state_rule}
-- Track multi-step work with the todo tool instead of re-listing the plan in prose: add the
-  steps once, then mark them done as you go. Re-stating the same plan without acting on it is
-  a bug, not progress.
-- Read only what you need. If a file or search result was already shown earlier in this
-  conversation, use it instead of fetching it again.
-- When unsure about rpi commands, extensions, Pi package compatibility, or .rpi configuration, consult the project documentation before guessing
+{guidelines}
 
 Current working directory: {cwd}"
     )
+}
+
+/// One-line prompt descriptions of the tools rpi itself registers.
+fn builtin_tool_snippet(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "read" => "Read file contents",
+        "bash" => "Execute Bash commands using Bash/POSIX syntax, including on Windows",
+        "edit" => "Find/replace edits to existing files",
+        "write" => "Create or overwrite files",
+        "docs" => "Look up rpi usage, extension, package, and compatibility documentation",
+        "grep" => "Search file contents for a pattern",
+        "find" => "Find files by glob pattern",
+        "ls" => "List directory contents",
+        "powershell" => "Execute PowerShell commands on Windows",
+        _ => return None,
+    })
 }
 
 /// How the user asked to select a session. v1 honors `NoSession` (ephemeral
@@ -456,15 +527,17 @@ pub async fn build_prepared(
     // Whether this model sees its own prior reasoning again decides how the
     // working-state rule is worded (see `default_system_prompt`).
     let prior_reasoning_replayed = rpi_ai::model::prior_reasoning_is_replayed(&resolved.model);
+    let prompt_tools = active.clone();
     let mut context_paths = Vec::new();
     let base_prompt = match args.system_prompt.as_deref() {
         Some(explicit) => explicit.to_string(),
         None if project_trusted => match discover_system_prompt_file(cwd) {
-            Some(path) => read_prompt_source(&path, &mut context_paths)
-                .unwrap_or_else(|| default_system_prompt(&cwd_str, prior_reasoning_replayed)),
-            None => default_system_prompt(&cwd_str, prior_reasoning_replayed),
+            Some(path) => read_prompt_source(&path, &mut context_paths).unwrap_or_else(|| {
+                default_system_prompt(&cwd_str, prior_reasoning_replayed, &prompt_tools)
+            }),
+            None => default_system_prompt(&cwd_str, prior_reasoning_replayed, &prompt_tools),
         },
-        None => default_system_prompt(&cwd_str, prior_reasoning_replayed),
+        None => default_system_prompt(&cwd_str, prior_reasoning_replayed, &prompt_tools),
     };
 
     // ---- Append-text sources (precedence: --append-system-prompt > APPEND_SYSTEM.md) ----
@@ -1562,16 +1635,33 @@ where
     // Same working-state wording rule as `build`; a mid-session `/model` switch
     // re-composes the prompt on the next reload, which is the same staleness the
     // rest of this path already has (provider resolution is a startup concern).
+    // Re-merge extension tools (a reloaded plugin may have added/removed a
+    // tool). The built-in set is rebuilt from scratch + extension tools merged
+    // on top, mirroring `build`. Built before the
+    // prompt so the prompt lists exactly the active tools.
+    let mut_env: Arc<dyn rpi_tools::MutatingEnv> = env.clone();
+    let tool_ctx = rpi_tools::ExecutionToolContext::new(env_dyn.clone(), Some(mut_env));
+    let mut tools = build_tools(&tool_ctx, &effective_args);
+    merge_extension_tools(
+        &mut tools,
+        &extension_session,
+        &effective_args,
+        &ctx.tool_context,
+    );
+    let mut active = active_tool_names(&tools, &effective_args);
+    active = filter_active_tool_names(active, &effective_args);
+    let prompt_tools = active.clone();
     let prior_reasoning_replayed = rpi_ai::model::prior_reasoning_is_replayed(&ctx.resolved_model);
     let mut context_paths = Vec::new();
     let base_prompt = match effective_args.system_prompt.as_deref() {
         Some(explicit) => explicit.to_string(),
         None if project_trusted => match discover_system_prompt_file(&ctx.cwd) {
-            Some(path) => read_prompt_source(&path, &mut context_paths)
-                .unwrap_or_else(|| default_system_prompt(&cwd_str, prior_reasoning_replayed)),
-            None => default_system_prompt(&cwd_str, prior_reasoning_replayed),
+            Some(path) => read_prompt_source(&path, &mut context_paths).unwrap_or_else(|| {
+                default_system_prompt(&cwd_str, prior_reasoning_replayed, &prompt_tools)
+            }),
+            None => default_system_prompt(&cwd_str, prior_reasoning_replayed, &prompt_tools),
         },
-        None => default_system_prompt(&cwd_str, prior_reasoning_replayed),
+        None => default_system_prompt(&cwd_str, prior_reasoning_replayed, &prompt_tools),
     };
     let mut append_texts: Vec<String> = Vec::new();
     for extra in &effective_args.append_system_prompt {
@@ -1673,20 +1763,6 @@ where
         let _ = harness.lane("main").set_model(resolved.model.clone()).await;
     }
 
-    // Re-merge extension tools (a reloaded plugin may have added/removed a
-    // tool). The built-in set is rebuilt from scratch + extension tools merged
-    // on top, mirroring `build`.
-    let mut_env: Arc<dyn rpi_tools::MutatingEnv> = env.clone();
-    let tool_ctx = rpi_tools::ExecutionToolContext::new(env_dyn.clone(), Some(mut_env));
-    let mut tools = build_tools(&tool_ctx, &effective_args);
-    merge_extension_tools(
-        &mut tools,
-        &extension_session,
-        &effective_args,
-        &ctx.tool_context,
-    );
-    let mut active = active_tool_names(&tools, &effective_args);
-    active = filter_active_tool_names(active, &effective_args);
     let _ = harness.set_tools(tools, Some(active)).await;
 
     let summary = format!(
@@ -3378,9 +3454,44 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// The default CLI tool set plus the `todo` tool its bundled plugins add.
+    fn default_prompt_tools() -> Vec<String> {
+        BUILTIN_TOOL_NAMES
+            .iter()
+            .copied()
+            .chain(["todo"])
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn default_prompt_lists_only_the_active_tools() {
+        let tools = ["read", "grep", "find", "ls"].map(str::to_owned);
+        let p = default_system_prompt("/tmp/proj", true, &tools);
+        assert!(p.contains("- read  — Read file contents"));
+        assert!(p.contains("- grep  — Search file contents"));
+        for absent in [
+            "- edit",
+            "- write",
+            "- bash",
+            "- docs",
+            "todo",
+            "PowerShell cmdlets",
+            "project documentation",
+        ] {
+            assert!(
+                !p.contains(absent),
+                "{absent} must not appear for a read-only run: {p}"
+            );
+        }
+        assert!(p.contains("Re-stating the same plan without acting on it is a bug"));
+        let none = default_system_prompt("/tmp/proj", false, &[]);
+        assert!(none.contains("Available tools:\n(none)"));
+    }
+
     #[test]
     fn default_prompt_mentions_cwd_and_tools() {
-        let p = default_system_prompt("/tmp/proj", false);
+        let p = default_system_prompt("/tmp/proj", false, &default_prompt_tools());
         assert!(p.contains("/tmp/proj"));
         assert!(p.contains("read"));
         assert!(p.contains("bash"));
@@ -3400,7 +3511,7 @@ mod tests {
         // The model must detect the user's language and answer in it, so a
         // Chinese (or any non-English) user gets a same-language reply without
         // having to ask every turn.
-        let p = default_system_prompt("/tmp/proj", false);
+        let p = default_system_prompt("/tmp/proj", false, &default_prompt_tools());
         let lower = p.to_lowercase();
         assert!(
             lower.contains("same language") && lower.contains("detect"),
@@ -3417,7 +3528,7 @@ mod tests {
         // observed session paid for that 112 times in a single run, and twice
         // hallucinated the user's input ("The user is greeting me with hello",
         // with no such message). See `docs/llm-repetition-forensics.md` §八.
-        let p = default_system_prompt("/tmp/proj", false);
+        let p = default_system_prompt("/tmp/proj", false, &default_prompt_tools());
         let lower = p.to_lowercase();
         // The rule must state the mechanism, not just "be clear".
         assert!(
@@ -3449,7 +3560,7 @@ mod tests {
         // carried into your next turn" is false, and the instruction to restate
         // the plan every turn is exactly the busy-work the re-plan analysis
         // measured. The wording must flip with the mechanism.
-        let p = default_system_prompt("/tmp/proj", true);
+        let p = default_system_prompt("/tmp/proj", true, &default_prompt_tools());
         let lower = p.to_lowercase();
         assert!(
             lower.contains("carried back"),
