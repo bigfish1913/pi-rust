@@ -11,6 +11,16 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.10.1](https://github.com/bigfish1913/pi-rust/compare/v0.10.0...v0.10.1) - 2026-10-27
+
+### Fixed
+
+- *(session)* --fork takes a session file outside the session directory
+
+### Other
+
+- Merge branch 'main' into fix/fork-session-file
+
 ## [0.10.0](https://github.com/bigfish1913/pi-rust/compare/v0.9.6...v0.10.0) - 2026-10-27
 
 ### Added
