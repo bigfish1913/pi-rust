@@ -71,14 +71,26 @@ use rpi_extensions::{
 /// The coding tools registered by the CLI by default.
 pub const BUILTIN_TOOL_NAMES: &[&str] = &["read", "bash", "edit", "write", "docs"];
 
-/// The default coding system prompt. A condensed port of the TS
+/// The default coding system prompt for the CLI's built-in tools.
+///
+/// This retains the two-argument API for library callers. Session startup and
+/// reload use [`default_system_prompt_with_tools`] with the actual active tools.
+pub fn default_system_prompt(cwd: &str, prior_reasoning_replayed: bool) -> String {
+    let tools = BUILTIN_TOOL_NAMES
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect::<Vec<_>>();
+    default_system_prompt_with_tools(cwd, prior_reasoning_replayed, &tools)
+}
+
+/// A coding system prompt for the selected tools. A condensed port of the TS
 /// `packages/coding-agent/src/core/system-prompt.ts` base prompt.
 ///
 /// `tools` is the active tool set after `--tools`/`--exclude-tools` and
 /// extension merging: the prompt lists only those tools and keeps only the
 /// guidelines that mention one of them, so a restricted run is never told it
 /// can edit or track todos (pi builds its list from the selected tools too).
-pub fn default_system_prompt(
+pub fn default_system_prompt_with_tools(
     cwd: &str,
     prior_reasoning_replayed: bool,
     tools: &[String],
@@ -533,11 +545,13 @@ pub async fn build_prepared(
         Some(explicit) => explicit.to_string(),
         None if project_trusted => match discover_system_prompt_file(cwd) {
             Some(path) => read_prompt_source(&path, &mut context_paths).unwrap_or_else(|| {
-                default_system_prompt(&cwd_str, prior_reasoning_replayed, &prompt_tools)
+                default_system_prompt_with_tools(&cwd_str, prior_reasoning_replayed, &prompt_tools)
             }),
-            None => default_system_prompt(&cwd_str, prior_reasoning_replayed, &prompt_tools),
+            None => {
+                default_system_prompt_with_tools(&cwd_str, prior_reasoning_replayed, &prompt_tools)
+            }
         },
-        None => default_system_prompt(&cwd_str, prior_reasoning_replayed, &prompt_tools),
+        None => default_system_prompt_with_tools(&cwd_str, prior_reasoning_replayed, &prompt_tools),
     };
 
     // ---- Append-text sources (precedence: --append-system-prompt > APPEND_SYSTEM.md) ----
@@ -1657,11 +1671,13 @@ where
         Some(explicit) => explicit.to_string(),
         None if project_trusted => match discover_system_prompt_file(&ctx.cwd) {
             Some(path) => read_prompt_source(&path, &mut context_paths).unwrap_or_else(|| {
-                default_system_prompt(&cwd_str, prior_reasoning_replayed, &prompt_tools)
+                default_system_prompt_with_tools(&cwd_str, prior_reasoning_replayed, &prompt_tools)
             }),
-            None => default_system_prompt(&cwd_str, prior_reasoning_replayed, &prompt_tools),
+            None => {
+                default_system_prompt_with_tools(&cwd_str, prior_reasoning_replayed, &prompt_tools)
+            }
         },
-        None => default_system_prompt(&cwd_str, prior_reasoning_replayed, &prompt_tools),
+        None => default_system_prompt_with_tools(&cwd_str, prior_reasoning_replayed, &prompt_tools),
     };
     let mut append_texts: Vec<String> = Vec::new();
     for extra in &effective_args.append_system_prompt {
@@ -3467,7 +3483,7 @@ mod tests {
     #[test]
     fn default_prompt_lists_only_the_active_tools() {
         let tools = ["read", "grep", "find", "ls"].map(str::to_owned);
-        let p = default_system_prompt("/tmp/proj", true, &tools);
+        let p = default_system_prompt_with_tools("/tmp/proj", true, &tools);
         assert!(p.contains("- read  — Read file contents"));
         assert!(p.contains("- grep  — Search file contents"));
         for absent in [
@@ -3485,13 +3501,13 @@ mod tests {
             );
         }
         assert!(p.contains("Re-stating the same plan without acting on it is a bug"));
-        let none = default_system_prompt("/tmp/proj", false, &[]);
+        let none = default_system_prompt_with_tools("/tmp/proj", false, &[]);
         assert!(none.contains("Available tools:\n(none)"));
     }
 
     #[test]
     fn default_prompt_mentions_cwd_and_tools() {
-        let p = default_system_prompt("/tmp/proj", false, &default_prompt_tools());
+        let p = default_system_prompt_with_tools("/tmp/proj", false, &default_prompt_tools());
         assert!(p.contains("/tmp/proj"));
         assert!(p.contains("read"));
         assert!(p.contains("bash"));
@@ -3511,7 +3527,7 @@ mod tests {
         // The model must detect the user's language and answer in it, so a
         // Chinese (or any non-English) user gets a same-language reply without
         // having to ask every turn.
-        let p = default_system_prompt("/tmp/proj", false, &default_prompt_tools());
+        let p = default_system_prompt_with_tools("/tmp/proj", false, &default_prompt_tools());
         let lower = p.to_lowercase();
         assert!(
             lower.contains("same language") && lower.contains("detect"),
@@ -3528,7 +3544,7 @@ mod tests {
         // observed session paid for that 112 times in a single run, and twice
         // hallucinated the user's input ("The user is greeting me with hello",
         // with no such message). See `docs/llm-repetition-forensics.md` §八.
-        let p = default_system_prompt("/tmp/proj", false, &default_prompt_tools());
+        let p = default_system_prompt_with_tools("/tmp/proj", false, &default_prompt_tools());
         let lower = p.to_lowercase();
         // The rule must state the mechanism, not just "be clear".
         assert!(
@@ -3560,7 +3576,7 @@ mod tests {
         // carried into your next turn" is false, and the instruction to restate
         // the plan every turn is exactly the busy-work the re-plan analysis
         // measured. The wording must flip with the mechanism.
-        let p = default_system_prompt("/tmp/proj", true, &default_prompt_tools());
+        let p = default_system_prompt_with_tools("/tmp/proj", true, &default_prompt_tools());
         let lower = p.to_lowercase();
         assert!(
             lower.contains("carried back"),
