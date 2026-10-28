@@ -25,7 +25,9 @@ use rpi_harness::agent_harness::{
 };
 use rpi_harness::events::{HarnessEvent, RunEndOutcome};
 use rpi_harness::session::session::SessionEntryCommit;
-use rpi_harness::session::types::{BranchBounds, EntryOrder, EntryQuery, LaneRecord, RecordQuery};
+use rpi_harness::session::types::{
+    BranchBounds, EntryCursor, EntryOrder, EntryQuery, LaneRecord, RecordQuery,
+};
 
 use crate::args::Args;
 use crate::rpc::protocol as rpc_protocol;
@@ -347,6 +349,7 @@ where
                                 "entryId": commit.entry_id,
                                 "entryType": commit.entry_type,
                                 "customType": commit.custom_type,
+                                "entrySeq": commit.entry_seq,
                                 "lane": commit.lane,
                             }),
                         )
@@ -1142,17 +1145,22 @@ async fn rpc_get_session_branch(
         .find_entries_on_branch(&query, &BranchBounds::default())
         .await
         .map_err(|error| error.to_string())?;
+    let first_seq = entries.first().map(|entry| entry.base().seq);
+    let last_seq = entries.last().map(|entry| entry.base().seq);
     let entries = entries
         .iter()
         .map(|entry| serde_json::to_value(entry).map_err(|error| error.to_string()))
         .collect::<Result<Vec<_>, _>>()?;
     // `filtered` tells a polling client that the answer honors its query, so it
     // can keep asking without serializing the whole transcript every time.
-    let filtered = query.custom_type.is_some() || query.limit.is_some();
+    let filtered = query.custom_type.is_some() || query.limit.is_some() || query.cursor.is_some();
     Ok(serde_json::json!({
         "entries": entries,
         "count": entries.len(),
         "filtered": filtered,
+        "afterSeq": msg.get("afterSeq").or_else(|| msg.get("after_seq")),
+        "firstSeq": first_seq,
+        "lastSeq": last_seq,
     }))
 }
 
@@ -1178,6 +1186,14 @@ pub(crate) fn branch_entry_query(msg: &serde_json::Value) -> Result<EntryQuery, 
             Some(usize::try_from(limit).map_err(|_| "get_session_branch: `limit` is too large")?)
         }
     };
+    let after_seq = match msg.get("afterSeq").or_else(|| msg.get("after_seq")) {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_u64()
+                .ok_or("get_session_branch: `afterSeq` must be a non-negative integer")?,
+        ),
+    };
     let order = match msg.get("order").and_then(serde_json::Value::as_str) {
         None => EntryOrder::OldestFirst,
         Some(value) if value.eq_ignore_ascii_case("oldestFirst") => EntryOrder::OldestFirst,
@@ -1191,7 +1207,7 @@ pub(crate) fn branch_entry_query(msg: &serde_json::Value) -> Result<EntryQuery, 
         custom_type,
         order: Some(order),
         limit,
-        cursor: None,
+        cursor: after_seq.map(|after_seq| EntryCursor { after_seq }),
     })
 }
 
@@ -2109,6 +2125,13 @@ mod tests {
         assert_eq!(newest.custom_type.as_deref(), Some("rpi-durable"));
         assert_eq!(newest.limit, Some(1));
         assert_eq!(newest.order, Some(EntryOrder::NewestFirst));
+
+        let incremental = branch_entry_query(&serde_json::json!({
+            "customType": "durable-state",
+            "afterSeq": 41,
+        }))
+        .unwrap();
+        assert_eq!(incremental.cursor, Some(EntryCursor { after_seq: 41 }));
 
         assert!(branch_entry_query(&serde_json::json!({"limit": 0})).is_err());
         assert!(branch_entry_query(&serde_json::json!({"order": "sideways"})).is_err());

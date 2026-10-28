@@ -151,6 +151,7 @@ pub struct SessionEntryCommit {
     pub entry_id: String,
     pub entry_type: String,
     pub custom_type: Option<String>,
+    pub entry_seq: u64,
     pub lane: String,
 }
 
@@ -741,6 +742,7 @@ impl Session {
                 entry_id: entry.base().id.clone(),
                 entry_type: entry.base().entry_type.clone(),
                 custom_type,
+                entry_seq: entry.base().seq,
                 lane: lane.to_string(),
             });
         }
