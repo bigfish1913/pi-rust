@@ -338,8 +338,16 @@ impl TranscriptView {
         // them outside the fold made the transcript show their whole body while
         // every other call was a single row.
         let keep_visible = style.always_shown(name);
-        if !style.group_tools || keep_visible {
+        if !style.group_tools {
             self.chat.add_child(component);
+            return;
+        }
+        if keep_visible {
+            self.chat.add_child(component);
+            // A directly rendered card is a segment boundary. Do not let the
+            // next grouped call jump back into the group that is before this
+            // card in the container; that would reorder the visible transcript.
+            self.reset_group();
             return;
         }
         self.current_group(style).add(name, component);
@@ -1518,6 +1526,84 @@ mod tests {
             ask_user_args_display(&json!({"type": "confirm", "summary": "Deploy?"})),
             "Confirmation requested: Deploy?"
         );
+    }
+
+    #[test]
+    fn always_shown_tool_ends_the_current_group() {
+        rpi_tui::transcript::set_active_style(Some(Arc::new(
+            rpi_tui::transcript::TranscriptStyle::from_value(&json!({
+                "groupTools": true,
+                "alwaysShowTools": ["edit"]
+            }))
+            .unwrap(),
+        )));
+        let view = view();
+        view.apply(
+            &UiEvent::ToolStart {
+                id: "read-1".into(),
+                name: "read".into(),
+                args: json!({"path": "a.txt"}),
+            },
+            80,
+        );
+        view.apply(
+            &UiEvent::ToolEnd {
+                id: "read-1".into(),
+                name: "read".into(),
+                result: json!({"content": [{"type": "text", "text": "read result"}]}),
+                is_error: false,
+            },
+            80,
+        );
+        view.apply(
+            &UiEvent::ToolStart {
+                id: "edit-1".into(),
+                name: "edit".into(),
+                args: json!({"path": "b.txt"}),
+            },
+            80,
+        );
+        view.apply(
+            &UiEvent::ToolEnd {
+                id: "edit-1".into(),
+                name: "edit".into(),
+                result: json!({"content": [{"type": "text", "text": "edit result"}]}),
+                is_error: false,
+            },
+            80,
+        );
+        view.apply(
+            &UiEvent::ToolStart {
+                id: "bash-1".into(),
+                name: "bash".into(),
+                args: json!({"command": "echo done"}),
+            },
+            80,
+        );
+        view.apply(
+            &UiEvent::ToolEnd {
+                id: "bash-1".into(),
+                name: "bash".into(),
+                result: json!({"content": [{"type": "text", "text": "bash result"}]}),
+                is_error: false,
+            },
+            80,
+        );
+
+        let lines = view.chat.render(100);
+        let plain = lines
+            .iter()
+            .map(|line| strip_ansi(line))
+            .collect::<Vec<_>>();
+        let first = |needle: &str| {
+            plain
+                .iter()
+                .position(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} missing: {plain:?}"))
+        };
+        assert!(first("read") < first("edit"));
+        assert!(first("edit") < first("bash"));
+        rpi_tui::transcript::set_active_style(None);
     }
 
     #[test]
