@@ -25,7 +25,9 @@ use rpi_harness::agent_harness::{
 };
 use rpi_harness::events::{HarnessEvent, RunEndOutcome};
 use rpi_harness::session::session::SessionEntryCommit;
-use rpi_harness::session::types::{BranchBounds, EntryOrder, EntryQuery, LaneRecord, RecordQuery};
+use rpi_harness::session::types::{
+    BranchBounds, EntryCursor, EntryOrder, EntryQuery, LaneRecord, RecordQuery,
+};
 
 use crate::args::Args;
 use crate::rpc::protocol as rpc_protocol;
@@ -1146,9 +1148,7 @@ async fn rpc_get_session_branch(
         .iter()
         .map(|entry| serde_json::to_value(entry).map_err(|error| error.to_string()))
         .collect::<Result<Vec<_>, _>>()?;
-    // `filtered` tells a polling client that the answer honors its query, so it
-    // can keep asking without serializing the whole transcript every time.
-    let filtered = query.custom_type.is_some() || query.limit.is_some();
+    let filtered = query.custom_type.is_some() || query.limit.is_some() || query.cursor.is_some();
     Ok(serde_json::json!({
         "entries": entries,
         "count": entries.len(),
@@ -1186,12 +1186,23 @@ pub(crate) fn branch_entry_query(msg: &serde_json::Value) -> Result<EntryQuery, 
             return Err("get_session_branch: `order` must be oldestFirst or newestFirst".into())
         }
     };
+    let after_seq = match ["afterSeq", "after_seq"]
+        .iter()
+        .find_map(|key| msg.get(*key))
+    {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_u64()
+                .ok_or("get_session_branch: `afterSeq` must be a non-negative integer")?,
+        ),
+    };
     Ok(EntryQuery {
         entry_type: None,
         custom_type,
         order: Some(order),
         limit,
-        cursor: None,
+        cursor: after_seq.map(|after_seq| EntryCursor { after_seq }),
     })
 }
 
@@ -2110,8 +2121,16 @@ mod tests {
         assert_eq!(newest.limit, Some(1));
         assert_eq!(newest.order, Some(EntryOrder::NewestFirst));
 
+        let incremental = branch_entry_query(&serde_json::json!({
+            "customType": "durable-state",
+            "afterSeq": 42,
+        }))
+        .unwrap();
+        assert_eq!(incremental.cursor, Some(EntryCursor { after_seq: 42 }));
+
         assert!(branch_entry_query(&serde_json::json!({"limit": 0})).is_err());
         assert!(branch_entry_query(&serde_json::json!({"order": "sideways"})).is_err());
+        assert!(branch_entry_query(&serde_json::json!({"afterSeq": -1})).is_err());
     }
 
     #[tokio::test]

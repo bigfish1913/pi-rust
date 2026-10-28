@@ -502,7 +502,8 @@ impl RuntimeActionHost for HarnessActionHost {
             .map(serde_json::to_value)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("serialize session branch: {e}"))?;
-        let filtered = query.custom_type.is_some() || query.limit.is_some();
+        let filtered =
+            query.custom_type.is_some() || query.limit.is_some() || query.cursor.is_some();
         Ok(serde_json::json!({"entries": entries, "filtered": filtered}))
     }
 
