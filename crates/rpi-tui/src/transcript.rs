@@ -993,7 +993,8 @@ impl ToolGroup {
     pub fn click_at(&self, row: usize, width: usize) -> bool {
         // A single-call group draws its card directly (no summary row), so every
         // row of it belongs to that card.
-        let foldable = self.is_foldable();
+        let style_active = crate::transcript::active_style().is_some();
+        let foldable = style_active && self.is_foldable();
         // The summary may wrap onto several rows when many tools ran: any of them
         // toggles the fold.
         let summary_rows = if foldable {
@@ -1009,13 +1010,13 @@ impl ToolGroup {
             return false;
         }
         let inner = width.max(1);
-        let members: Vec<Arc<dyn Component>> = self
+        let members: Vec<(String, Arc<dyn Component>)> = self
             .members
             .lock()
             .map(|members| {
                 members
                     .iter()
-                    .map(|(_, component)| component.clone())
+                    .map(|(name, component)| (name.clone(), component.clone()))
                     .collect()
             })
             .unwrap_or_default();
@@ -1023,7 +1024,10 @@ impl ToolGroup {
         // member offsets start after the real summary height (a fixed `1`
         // shifted every row and made clicks land on the wrong card).
         let mut offset = summary_rows;
-        for member in members {
+        for (name, member) in members {
+            if !style_active && name == "thinking" {
+                continue;
+            }
             let height = member.render(inner).len();
             if row < offset + height {
                 let local = row - offset;

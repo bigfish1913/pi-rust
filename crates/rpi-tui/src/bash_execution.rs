@@ -275,13 +275,19 @@ impl BashExecutionComponent {
 
     /// Click on a rendered row: header toggles, body extends.
     pub fn click(&self, row: usize) -> bool {
-        // Header toggles; the body adds one more screenful of output.
-        if row == 0 || !self.is_expanded() {
-            let next = !self.is_expanded();
-            self.set_expanded(next);
+        let expanded = self.is_expanded();
+        if !expanded {
+            self.set_expanded(true);
             return true;
         }
-        self.grow();
+        let style = crate::transcript::style_or_active(&self.style.lock().unwrap());
+        let header_row = crate::theme::theme().spacing.tool_panel_padding_y
+            + usize::from(style.map(|style| style.frame_tools).unwrap_or(false));
+        if row == header_row {
+            self.set_expanded(false);
+        } else {
+            self.grow();
+        }
         true
     }
 
@@ -617,6 +623,20 @@ impl Component for BashExecutionComponent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn click_on_padded_header_collapses_open_bash() {
+        let panel = BashExecutionComponent::new("echo hi");
+        panel.set_style(Some(
+            Arc::new(crate::transcript::TranscriptStyle::default()),
+        ));
+        panel.append_output("body");
+        panel.set_complete(Some(0), false, BashTruncation::default());
+        panel.set_expanded(true);
+        let header_row = crate::theme::theme().spacing.tool_panel_padding_y;
+        assert!(panel.click(header_row));
+        assert!(!panel.is_expanded());
+    }
 
     #[test]
     fn finalized_documents_share_rows_and_refresh_after_changes() {

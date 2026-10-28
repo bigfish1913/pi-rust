@@ -261,14 +261,19 @@ impl ToolExecutionComponent {
 
     /// Click on a rendered row: the header row toggles, the body extends.
     pub fn click(&self, row: usize) -> bool {
-        // Header toggles the card; a click inside an open card reveals one more
-        // screenful (the third expansion state the docs describe).
-        if row == 0 || !self.is_expanded() {
-            let next = !self.is_expanded();
-            self.set_expanded(next);
+        let expanded = self.is_expanded();
+        if !expanded {
+            self.set_expanded(true);
             return true;
         }
-        self.grow();
+        let style = crate::transcript::style_or_active(&self.style.lock().unwrap());
+        let header_row = crate::theme::theme().spacing.tool_panel_padding_y
+            + usize::from(style.map(|style| style.frame_tools).unwrap_or(false));
+        if row == header_row {
+            self.set_expanded(false);
+        } else {
+            self.grow();
+        }
         true
     }
 
@@ -1516,6 +1521,20 @@ mod tools {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn click_on_padded_header_collapses_open_tool() {
+        use super::*;
+        let tool = ToolExecutionComponent::new("read", "{}");
+        tool.set_style(Some(
+            Arc::new(crate::transcript::TranscriptStyle::default()),
+        ));
+        tool.set_result("body", false);
+        tool.set_expanded(true);
+        let header_row = crate::theme::theme().spacing.tool_panel_padding_y;
+        assert!(tool.click(header_row));
+        assert!(!tool.is_expanded());
+    }
+
     #[test]
     fn finalized_documents_share_rows_and_refresh_after_changes() {
         use super::*;

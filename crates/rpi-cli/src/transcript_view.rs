@@ -15,7 +15,7 @@
 //! types into the client.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use base64::Engine;
 use rpi_tui::{
@@ -109,9 +109,13 @@ pub type MarkdownTransformer = Arc<dyn Fn(&str) -> String + Send + Sync>;
 /// The fold group of the transcript that owns it, keyed by the chat container's
 /// address. Keying by the chat (instead of one process-wide slot) keeps two
 /// `TranscriptView`s in the same process from appending into each other's group.
-static CURRENT_GROUPS: std::sync::Mutex<
-    std::collections::BTreeMap<usize, Arc<rpi_tui::transcript::ToolGroup>>,
-> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+struct CurrentGroup {
+    chat: Weak<Container>,
+    group: Arc<rpi_tui::transcript::ToolGroup>,
+}
+
+static CURRENT_GROUPS: std::sync::Mutex<std::collections::BTreeMap<usize, CurrentGroup>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 impl TranscriptView {
     /// Self-contained view owning fresh maps (the remote client).
@@ -273,9 +277,19 @@ impl TranscriptView {
     ) -> Arc<rpi_tui::transcript::ToolGroup> {
         let key = Arc::as_ptr(&self.chat) as *const () as usize;
         if let Ok(mut groups) = CURRENT_GROUPS.lock() {
-            if let Some(group) = groups.get(&key) {
-                return group.clone();
+            if let Some(entry) = groups.get(&key) {
+                let belongs_to_chat = entry
+                    .chat
+                    .upgrade()
+                    .map(|chat| Arc::ptr_eq(&chat, &self.chat))
+                    .unwrap_or(false);
+                if belongs_to_chat {
+                    return entry.group.clone();
+                }
             }
+            // The address may have been reused after an old chat was dropped;
+            // discard that stale group before installing the new one.
+            groups.remove(&key);
             let group = rpi_tui::transcript::ToolGroup::new(style);
             // The fold belongs ABOVE the text it describes: thinking and calls
             // happen before the reply they produce. The bubble already exists, so
@@ -295,7 +309,13 @@ impl TranscriptView {
             } else {
                 self.chat.add_child(group.clone());
             }
-            groups.insert(key, group.clone());
+            groups.insert(
+                key,
+                CurrentGroup {
+                    chat: Arc::downgrade(&self.chat),
+                    group: group.clone(),
+                },
+            );
             return group;
         }
         let group = rpi_tui::transcript::ToolGroup::new(style);
@@ -393,8 +413,8 @@ impl TranscriptView {
         // preference, including later hide/show toggles.
         let key = Arc::as_ptr(&self.chat) as *const () as usize;
         if let Ok(groups) = CURRENT_GROUPS.lock() {
-            if let Some(group) = groups.get(&key) {
-                group.set_thinking_hidden(hide);
+            if let Some(entry) = groups.get(&key) {
+                entry.group.set_thinking_hidden(hide);
             }
         }
     }
@@ -505,8 +525,8 @@ impl TranscriptView {
         {
             let key = Arc::as_ptr(&self.chat) as *const () as usize;
             if let Ok(groups) = CURRENT_GROUPS.lock() {
-                if let Some(group) = groups.get(&key) {
-                    group.reset_thinking();
+                if let Some(entry) = groups.get(&key) {
+                    entry.group.reset_thinking();
                 }
             }
         }
