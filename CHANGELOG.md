@@ -11,6 +11,20 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.11.1](https://github.com/bigfish1913/pi-rust/compare/v0.11.0...v0.11.1) - 2026-10-28
+
+### Added
+
+- *(rpc)* publish session entry commit invalidations ([#147](https://github.com/bigfish1913/pi-rust/pull/147))
+
+### Fixed
+
+- *(cli)* resolve CLI updates from GitHub releases ([#146](https://github.com/bigfish1913/pi-rust/pull/146))
+
+### Other
+
+- *(agent)* cover provider cache invalidation ([#148](https://github.com/bigfish1913/pi-rust/pull/148))
+
 ## [0.11.0](https://github.com/bigfish1913/pi-rust/compare/v0.10.1...v0.11.0) - 2026-10-27
 
 ### Added
