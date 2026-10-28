@@ -266,9 +266,28 @@ impl ToolExecutionComponent {
             self.set_expanded(true);
             return true;
         }
+        let is_special = self
+            .plan_state
+            .lock()
+            .map(|state| state.is_some())
+            .unwrap_or(false)
+            || self
+                .todo_state
+                .lock()
+                .map(|state| state.is_some())
+                .unwrap_or(false);
+        let is_skill = self
+            .skill_name
+            .lock()
+            .map(|name| name.is_some())
+            .unwrap_or(false);
         let style = crate::transcript::style_or_active(&self.style.lock().unwrap());
-        let header_row = crate::theme::theme().spacing.tool_panel_padding_y
-            + usize::from(style.map(|style| style.frame_tools).unwrap_or(false));
+        let header_row = if is_special {
+            0
+        } else {
+            crate::theme::theme().spacing.tool_panel_padding_y
+                + usize::from(!is_skill && style.map(|style| style.frame_tools).unwrap_or(false))
+        };
         if row == header_row {
             self.set_expanded(false);
         } else {
@@ -1535,6 +1554,29 @@ mod tests {
         assert!(!tool.is_expanded());
     }
 
+    #[test]
+    fn click_uses_special_panel_header_rows() {
+        use super::*;
+        let style = Arc::new(crate::transcript::TranscriptStyle::default());
+        for kind in ["plan", "todo", "skill"] {
+            let tool = ToolExecutionComponent::new(kind, "{}");
+            tool.set_style(Some(style.clone()));
+            match kind {
+                "plan" => tool.set_plan_state("step".into(), false),
+                "todo" => tool.set_todo_state(vec![("task".into(), "pending".into())]),
+                "skill" => tool.set_skill_name("foo"),
+                _ => unreachable!(),
+            }
+            tool.set_expanded(true);
+            let header_row = if kind == "skill" {
+                crate::theme::theme().spacing.tool_panel_padding_y
+            } else {
+                0
+            };
+            assert!(tool.click(header_row), "{kind} header was not clickable");
+            assert!(!tool.is_expanded(), "{kind} header did not collapse");
+        }
+    }
     #[test]
     fn finalized_documents_share_rows_and_refresh_after_changes() {
         use super::*;
