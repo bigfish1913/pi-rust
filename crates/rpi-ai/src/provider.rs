@@ -5,6 +5,7 @@
 
 use crate::event_stream::AssistantMessageEventStream;
 use crate::model::Model;
+use crate::redact::RedactedHeaders;
 use crate::types::{AssistantMessage, Context, DeferredHandle, ThinkingBudgets, ThinkingLevel};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -137,34 +138,6 @@ impl fmt::Debug for SimpleStreamOptions {
             .field("thinking_budgets", thinking_budgets)
             .finish()
     }
-}
-
-/// Debug view of a header map that masks values of sensitive headers.
-struct RedactedHeaders<'a>(&'a BTreeMap<String, String>);
-
-impl fmt::Debug for RedactedHeaders<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_map()
-            .entries(self.0.iter().map(|(name, value)| {
-                let value = if is_sensitive_header(name) {
-                    "<redacted>"
-                } else {
-                    value.as_str()
-                };
-                (name, value)
-            }))
-            .finish()
-    }
-}
-
-/// True for header names that usually carry credentials (case-insensitive).
-/// Substring matches also cover `proxy-authorization`, `x-api-key`,
-/// `cf-aig-authorization`, `set-cookie`, and `x-session-token`.
-fn is_sensitive_header(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    ["authorization", "api-key", "cookie", "token", "secret"]
-        .iter()
-        .any(|needle| name.contains(needle))
 }
 
 impl SimpleStreamOptions {
