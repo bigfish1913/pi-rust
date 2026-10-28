@@ -291,9 +291,10 @@ impl TranscriptView {
             // discard that stale group before installing the new one.
             groups.remove(&key);
             let group = rpi_tui::transcript::ToolGroup::new(style);
-            // The fold belongs ABOVE the text it describes: thinking and calls
-            // happen before the reply they produce. The bubble already exists, so
-            // move it below the new group instead of appending the group after it.
+            // A fold normally belongs immediately before the assistant bubble
+            // it describes. If a visible tool already follows that bubble,
+            // however, the new group belongs after that boundary; moving the
+            // bubble again would reorder already-rendered assistant text.
             let bubble = self.current_assistant.lock().unwrap().clone();
             let bubble = bubble.filter(|bubble| {
                 self.chat.get_children().iter().any(|child| {
@@ -303,9 +304,19 @@ impl TranscriptView {
             });
             if let Some(bubble) = bubble.as_ref() {
                 let as_component: Arc<dyn rpi_tui::Component> = bubble.clone();
-                self.chat.remove_child(&as_component);
-                self.chat.add_child(group.clone());
-                self.chat.add_child(as_component);
+                let children = self.chat.get_children();
+                let has_children_after_bubble = children
+                    .iter()
+                    .position(|child| Arc::ptr_eq(child, &as_component))
+                    .map(|index| index + 1 < children.len())
+                    .unwrap_or(false);
+                if has_children_after_bubble {
+                    self.chat.add_child(group.clone());
+                } else {
+                    self.chat.remove_child(&as_component);
+                    self.chat.add_child(group.clone());
+                    self.chat.add_child(as_component);
+                }
             } else {
                 self.chat.add_child(group.clone());
             }
@@ -1539,6 +1550,12 @@ mod tests {
         )));
         let view = view();
         view.apply(
+            &UiEvent::AssistantStart {
+                blocks: vec![AssistantBlock::Text("assistant text".into())],
+            },
+            80,
+        );
+        view.apply(
             &UiEvent::ToolStart {
                 id: "read-1".into(),
                 name: "read".into(),
@@ -1601,7 +1618,8 @@ mod tests {
                 .position(|line| line.contains(needle))
                 .unwrap_or_else(|| panic!("{needle} missing: {plain:?}"))
         };
-        assert!(first("read") < first("edit"));
+        assert!(first("read") < first("assistant text"));
+        assert!(first("assistant text") < first("edit"));
         assert!(first("edit") < first("bash"));
         rpi_tui::transcript::set_active_style(None);
     }
