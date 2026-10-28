@@ -57,6 +57,7 @@ struct BashRenderCache {
     width: usize,
     revision: u64,
     theme_revision: u64,
+    style_revision: u64,
     lines: Arc<Vec<String>>,
 }
 
@@ -79,6 +80,12 @@ pub struct BashExecutionComponent {
     /// when the user expands it or a late update lands.
     revision: AtomicU64,
     cache: Mutex<Option<BashRenderCache>>,
+    /// Screenfuls of output an expanded panel shows (one per click).
+    expansion_windows: std::sync::atomic::AtomicUsize,
+    /// Render as one header row (a folded group row) instead of a box.
+    row_only: std::sync::atomic::AtomicBool,
+    /// Active transcript style pack (host mechanism; the pack owns the look).
+    style: Mutex<Option<Arc<crate::transcript::TranscriptStyle>>>,
 }
 
 impl BashExecutionComponent {
@@ -103,10 +110,13 @@ impl BashExecutionComponent {
             expanded: Mutex::new(false),
             truncation: Mutex::new(BashTruncation::default()),
             exclude_from_context: Mutex::new(exclude_from_context),
-            started_at: Mutex::new(Some(Instant::now())),
+            started_at: Mutex::new(None),
             finished_at: Mutex::new(None),
             revision: AtomicU64::new(0),
             cache: Mutex::new(None),
+            expansion_windows: std::sync::atomic::AtomicUsize::new(1),
+            row_only: std::sync::atomic::AtomicBool::new(false),
+            style: Mutex::new(None),
         }
     }
 
@@ -141,6 +151,18 @@ impl BashExecutionComponent {
         *self.exclude_from_context.lock().unwrap()
     }
 
+    /// Start the clock. Called from the execution-start event, never from panel
+    /// construction: a panel can be built while the model is still streaming the
+    /// call, and counting that time made a 1s `ls` report a minute.
+    pub fn mark_started(&self) {
+        if let Ok(mut started) = self.started_at.lock() {
+            if started.is_none() {
+                *started = Some(Instant::now());
+            }
+        }
+        self.bump();
+    }
+
     /// Apply the authoritative command from `ToolExecutionStart`. A panel may
     /// have been created from an earlier streaming snapshot, so this must
     /// replace a partial command as well as an empty one.
@@ -159,6 +181,9 @@ impl BashExecutionComponent {
     /// so far, not a delta. Appending each update duplicated all prior lines
     /// (`a`, then `a\nb` became `aa\nb`). Keep the latest snapshot instead.
     pub fn append_output(&self, chunk: &str) {
+        // First output means the command is really running: start the clock here
+        // so a panel created earlier never counts streaming time.
+        self.mark_started();
         let clean = strip_ansi(chunk).replace("\r\n", "\n").replace('\r', "\n");
         if let Ok(mut out) = self.output_lines.lock() {
             *out = if clean.is_empty() {
@@ -207,12 +232,74 @@ impl BashExecutionComponent {
         if let Ok(mut e) = self.expanded.lock() {
             *e = expanded;
         }
+        self.expansion_windows
+            .store(if expanded { 1 } else { 0 }, Ordering::Relaxed);
         self.bump();
+    }
+
+    /// Render as a single folded row (or a full box) — set by the group.
+    pub fn set_row_only(&self, row_only: bool) {
+        self.row_only.store(row_only, Ordering::Relaxed);
+        self.bump();
+    }
+
+    /// Wall-clock interval of this command: `(started, finished)`.
+    pub fn timing(&self) -> Option<(Instant, Option<Instant>)> {
+        let started = self.started_at.lock().ok().and_then(|g| *g)?;
+        Some((started, self.finished_at.lock().ok().and_then(|g| *g)))
+    }
+
+    /// Execution duration in milliseconds: frozen once the command finishes,
+    /// live while it runs, `None` before it starts.
+    pub fn elapsed_ms(&self) -> Option<u128> {
+        let started = self.started_at.lock().ok().and_then(|g| *g)?;
+        match self.finished_at.lock().ok().and_then(|g| *g) {
+            Some(finished) => Some(finished.saturating_duration_since(started).as_millis()),
+            None if *self.status.lock().unwrap() == BashStatus::Running => {
+                Some(started.elapsed().as_millis())
+            }
+            None => None,
+        }
+    }
+
+    /// One more screenful of output.
+    pub fn grow(&self) {
+        let next = self
+            .expansion_windows
+            .load(Ordering::Relaxed)
+            .saturating_add(1)
+            .min(16);
+        self.expansion_windows.store(next, Ordering::Relaxed);
+        self.bump();
+    }
+
+    /// Click on a rendered row: header toggles, body extends.
+    pub fn click(&self, row: usize) -> bool {
+        // Header toggles; the body adds one more screenful of output.
+        if row == 0 || !self.is_expanded() {
+            let next = !self.is_expanded();
+            self.set_expanded(next);
+            return true;
+        }
+        self.grow();
+        true
+    }
+
+    fn expansion_budget(&self) -> usize {
+        crate::transcript::window_rows() * self.expansion_windows.load(Ordering::Relaxed).max(1)
     }
 
     /// Whether currently expanded.
     pub fn is_expanded(&self) -> bool {
         *self.expanded.lock().unwrap()
+    }
+
+    /// Install the active transcript style pack. `None` restores stock drawing.
+    pub fn set_style(&self, style: Option<Arc<crate::transcript::TranscriptStyle>>) {
+        if let Ok(mut current) = self.style.lock() {
+            *current = style;
+        }
+        self.bump();
     }
 
     /// Get the raw joined output.
@@ -281,12 +368,65 @@ impl BashExecutionComponent {
     /// Render against one theme snapshot; keep all insets inside the background.
     fn render_panel(&self, width: usize, status: BashStatus, theme: &Theme) -> Vec<String> {
         let colors = &theme.colors;
-        let bg = match status {
-            BashStatus::Running => colors.tool_pending_bg,
-            BashStatus::Error | BashStatus::Cancelled => colors.tool_error_bg,
-            BashStatus::Complete => colors.tool_success_bg,
+        // A fold row: one highlighted command line with its status glyph.
+        if self.row_only.load(Ordering::Relaxed) && !self.is_expanded() {
+            let style = crate::transcript::style_or_active(&self.style.lock().unwrap());
+            let command = self.command.lock().unwrap().clone();
+            let glyph = match status {
+                BashStatus::Running => colors.accent.fg("●"),
+                BashStatus::Error | BashStatus::Cancelled => colors.error.fg("✗"),
+                BashStatus::Complete => colors.success.fg("✓"),
+            };
+            let body = match style.as_ref() {
+                Some(style) if style.command_highlight => {
+                    crate::transcript::highlight_command(&command, style, colors)
+                }
+                _ => colors.bash_mode.fg(&bold(&command)),
+            };
+            return vec![
+                truncate_to_width(
+                    &format!(" {glyph} {body} {}", colors.muted.fg("▸")),
+                    width,
+                    "…",
+                ),
+                String::new(),
+            ];
+        }
+        // Transparent card only when the pack actually frames it; a pack that
+        // just groups/highlights keeps the stock status tint.
+        let framed = self
+            .style
+            .lock()
+            .unwrap()
+            .clone()
+            .or_else(crate::transcript::active_style)
+            .map(|style| style.frame_tools)
+            .unwrap_or(false);
+        let bg = if framed {
+            crate::theme::Color::Default
+        } else {
+            match status {
+                BashStatus::Running => colors.tool_pending_bg,
+                BashStatus::Error | BashStatus::Cancelled => colors.tool_error_bg,
+                BashStatus::Complete => colors.tool_success_bg,
+            }
         };
-        let Some(panel) = ToolPanel::new(width, theme.spacing, bg) else {
+        // Framed panels lay out two columns narrower so the border fits (see
+        // the tool panel for why: otherwise every row is clipped).
+        let framed = self
+            .style
+            .lock()
+            .unwrap()
+            .clone()
+            .or_else(crate::transcript::active_style)
+            .map(|style| style.frame_tools)
+            .unwrap_or(false);
+        let panel_width = if framed {
+            width.saturating_sub(2).max(1)
+        } else {
+            width
+        };
+        let Some(panel) = ToolPanel::new(panel_width, theme.spacing, bg) else {
             return Vec::new();
         };
         let content_width = panel.content_width;
@@ -302,8 +442,25 @@ impl BashExecutionComponent {
             colors.bash_mode
         };
         let command = self.command.lock().unwrap().clone();
-        for part in wrap_text_with_ansi(&format!("$ {command}"), content_width) {
-            lines.push(panel_line(&color_key.fg(&bold(&part))));
+        let style = crate::transcript::style_or_active(&self.style.lock().unwrap());
+        let prompt = format!("{} ", color_key.fg(&bold("$")));
+        match style.as_ref() {
+            Some(style) if style.command_highlight => {
+                for part in wrap_text_with_ansi(
+                    &format!(
+                        "{prompt}{}",
+                        crate::transcript::highlight_command(&command, style, colors)
+                    ),
+                    content_width,
+                ) {
+                    lines.push(panel_line(&part));
+                }
+            }
+            _ => {
+                for part in wrap_text_with_ansi(&format!("$ {command}"), content_width) {
+                    lines.push(panel_line(&color_key.fg(&bold(&part))));
+                }
+            }
         }
 
         let (display_lines, hidden) = {
@@ -320,12 +477,17 @@ impl BashExecutionComponent {
                         .join("\n")
                 );
                 if expanded {
-                    (
-                        crate::text::Text::new(&styled, 0, 0).render(content_width),
-                        0,
-                    )
+                    let mut all = crate::text::Text::new(&styled, 0, 0).render(content_width);
+                    let budget = self.expansion_budget();
+                    let hidden = all.len().saturating_sub(budget);
+                    all.truncate(budget);
+                    (all, hidden)
                 } else {
-                    let r = truncate_to_visual_lines(&styled, PREVIEW_LINES, content_width, 0);
+                    let budget = style
+                        .as_ref()
+                        .and_then(|style| style.bash_result_lines)
+                        .unwrap_or(PREVIEW_LINES);
+                    let r = truncate_to_visual_lines(&styled, budget, content_width, 0);
                     (r.visual_lines, r.skipped_count)
                 }
             }
@@ -335,6 +497,13 @@ impl BashExecutionComponent {
         }
 
         if status == BashStatus::Running {
+            // The live counter is part of the open card only; a folded row shows
+            // no animating number.
+            if !self.is_expanded() {
+                lines.extend(std::iter::repeat(blank).take(panel.padding_y));
+                lines.push(String::new());
+                return lines;
+            }
             let elapsed = self.elapsed();
             let row = format!(
                 "{} {}",
@@ -361,6 +530,20 @@ impl BashExecutionComponent {
                 }
             }
         }
+        // Style pack: a rounded, transparent frame replaces the tinted band.
+        if let Some(style) = style.as_ref() {
+            if style.frame_tools {
+                let border = match status {
+                    BashStatus::Running => colors.border_muted,
+                    BashStatus::Complete => colors.success,
+                    BashStatus::Error | BashStatus::Cancelled => colors.error,
+                };
+                let mut framed = crate::transcript::draw_frame(&lines, width, border);
+                framed.push(String::new());
+                return framed;
+            }
+        }
+
         lines.extend(std::iter::repeat(blank).take(panel.padding_y));
         // Trailing spacer (one convention for every panel: each transcript
         // entry ends with its own blank row; nothing adds a leading one).
@@ -374,6 +557,7 @@ impl BashExecutionComponent {
         let status = *self.status.lock().unwrap();
         let revision = self.revision.load(Ordering::Acquire);
         let theme_revision = theme_revision();
+        let style_revision = crate::transcript::style_revision();
 
         // A finished panel never changes (no live elapsed timer), so serve it
         // from the cache. A running panel is skipped — its elapsed timer must
@@ -384,6 +568,7 @@ impl BashExecutionComponent {
                     if cached.width == width
                         && cached.revision == revision
                         && cached.theme_revision == theme_revision
+                        && cached.style_revision == style_revision
                     {
                         return cached.lines.clone();
                     }
@@ -399,6 +584,7 @@ impl BashExecutionComponent {
                     width,
                     revision,
                     theme_revision,
+                    style_revision,
                     lines: lines.clone(),
                 });
             }
@@ -460,7 +646,7 @@ mod tests {
                 .iter()
                 .any(|row| strip_ansi(row).trim() == "line 1"));
             assert!(!first.iter().any(|row| strip_ansi(row).trim() == "line 1"));
-            assert!(expanded.len() > first.len());
+            assert!(expanded.len() >= first.len());
 
             panel.append_output("late output");
             let updated = panel.shared_lines(80);
@@ -493,6 +679,9 @@ mod tests {
         assert!(strip_ansi(&updated.join("\n")).contains("live output"));
         assert!(!strip_ansi(&first.join("\n")).contains("live output"));
         *panel.started_at.lock().unwrap() = Some(Instant::now() - Duration::from_secs(65));
+        // Live elapsed is drawn only inside an open card (a folded row must not
+        // animate a counter).
+        panel.set_expanded(true);
         let later = panel.shared_lines(80);
         let text = strip_ansi(&later.join("\n"));
         assert!(text.contains("1m5s"));
@@ -664,14 +853,22 @@ mod tests {
     }
 
     #[test]
-    fn test_new_renders_header_and_live_elapsed() {
+    fn test_new_renders_header_and_live_elapsed_when_expanded() {
         let c = BashExecutionComponent::new("ls -la");
-        let lines = c.render(40);
-        let joined = lines.join("\n");
-        assert!(joined.contains("$ ls -la"));
-        // A running panel reports a live elapsed timer and a static status
+        let collapsed = strip_ansi(&c.render(40).join("\n"));
+        assert!(collapsed.contains("$ ls -la"));
+        // No clock yet (execution has not started) and none in a folded row: an
+        // animating number there would force a repaint every tick.
+        assert!(
+            !collapsed.contains('●'),
+            "folded/not-started panel must not draw the live row: {collapsed}"
+        );
+
+        c.mark_started();
+        c.set_expanded(true);
+        let plain = strip_ansi(&c.render(40).join("\n"));
+        // An open, running panel reports a live elapsed timer and a static status
         // glyph — no spinner, matching tool panels.
-        let plain = strip_ansi(&joined);
         assert!(
             plain.contains('●'),
             "running panel needs the status glyph: {plain}"

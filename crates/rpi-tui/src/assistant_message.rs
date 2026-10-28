@@ -43,6 +43,9 @@ pub enum AssistantBlock {
 pub struct AssistantMessageOptions {
     /// Hide thinking blocks (show placeholder instead)
     pub hide_thinking: bool,
+    /// Skip thinking blocks entirely (no placeholder line). Used when the
+    /// transcript renders the reasoning elsewhere (folded into the group).
+    pub omit_thinking: bool,
     /// Label to show when thinking is hidden
     pub hidden_thinking_label: String,
     /// Horizontal padding
@@ -53,6 +56,7 @@ impl Default for AssistantMessageOptions {
     fn default() -> Self {
         Self {
             hide_thinking: false,
+            omit_thinking: false,
             hidden_thinking_label: "Thinking...".to_string(),
             output_pad: 1,
         }
@@ -255,6 +259,11 @@ impl AssistantMessageComponent {
                         continue;
                     }
 
+                    if opts.omit_thinking {
+                        // The reasoning is rendered elsewhere (folded into the
+                        // transcript group): no placeholder belongs here.
+                        continue;
+                    }
                     if opts.hide_thinking {
                         // One static dim label per thinking run (TS path).
                         self.content_container.add_child(Arc::new(Text::new(
@@ -342,6 +351,19 @@ impl AssistantMessageComponent {
         }
     }
 
+    /// Skip thinking blocks entirely. Rebuilds the last content.
+    pub fn set_omit_thinking(&self, omit: bool) {
+        let blocks = {
+            let mut opts = self.options.lock().unwrap();
+            if opts.omit_thinking == omit {
+                return;
+            }
+            opts.omit_thinking = omit;
+            self.last_blocks.lock().unwrap().clone()
+        };
+        self.rebuild_content(&blocks);
+    }
+
     /// Set hidden thinking label. Rebuilds the last content (mirrors TS).
     pub fn set_hidden_thinking_label(&self, label: &str) {
         let blocks = {
@@ -390,16 +412,36 @@ impl AssistantMessageComponent {
 
 impl Component for AssistantMessageComponent {
     fn render(&self, width: usize) -> Vec<String> {
-        let mut lines = self.content_container.render(width);
+        // `frameMessages` draws the same rounded, transparent frame around a
+        // message bubble that tools get. Content lays out two columns narrower
+        // so the border has room.
+        let framed = crate::transcript::active_style().filter(|style| style.frame_messages);
+        let inner_width = if framed.is_some() {
+            width.saturating_sub(2).max(1)
+        } else {
+            width
+        };
+        let mut lines = self.content_container.render(inner_width);
         // A provider can start with no content or whitespace-only deltas.
         // Such a message must not reserve even its inter-message spacing.
         if !lines.is_empty() {
+            if let Some(style) = framed.as_ref() {
+                let border = style.message_border(&crate::theme::theme().colors, "assistant");
+                lines = crate::transcript::draw_frame(&lines, width, border);
+            }
             lines.extend((0..*self.trailing_spacing.lock().unwrap()).map(|_| String::new()));
         }
         lines
     }
 
     fn render_document(&self, width: usize) -> RenderedDocument {
+        if crate::transcript::active_style()
+            .map(|style| style.frame_messages)
+            .unwrap_or(false)
+        {
+            // Framed rows cannot be shared blocks; only framed messages pay this.
+            return RenderedDocument::from_lines(self.render(width));
+        }
         let mut document = self.content_container.render_document(width);
         if !document.is_empty() {
             let spacing = *self.trailing_spacing.lock().unwrap();
@@ -486,6 +528,7 @@ mod tests {
     fn test_assistant_message_options() {
         let msg = AssistantMessageComponent::new(AssistantMessageOptions {
             hide_thinking: true,
+            omit_thinking: false,
             hidden_thinking_label: "Processing...".to_string(),
             output_pad: 2,
         });

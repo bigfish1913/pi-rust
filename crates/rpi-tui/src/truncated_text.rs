@@ -22,7 +22,7 @@ impl TruncatedText {
         Self {
             text: Mutex::new(text.to_string()),
             max_width,
-            ellipsis: "...".to_string(),
+            ellipsis: "…".to_string(),
             style: None,
         }
     }
