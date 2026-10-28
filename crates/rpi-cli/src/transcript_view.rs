@@ -351,6 +351,10 @@ impl TranscriptView {
         let keep_visible = style.always_shown(name);
         if !style.group_tools {
             self.chat.add_child(component);
+            // Turning grouping off is also a boundary. Otherwise re-enabling
+            // it later in the same turn would append new calls to the old
+            // group, placing them before these direct-rendered panels.
+            self.reset_group();
             return;
         }
         if keep_visible {
@@ -1624,6 +1628,66 @@ mod tests {
         rpi_tui::transcript::set_active_style(None);
     }
 
+    #[test]
+    fn disabling_grouping_ends_the_current_group() {
+        rpi_tui::transcript::set_active_style(Some(Arc::new(
+            rpi_tui::transcript::TranscriptStyle::from_value(&json!({
+                "groupTools": true
+            }))
+            .unwrap(),
+        )));
+        let view = view();
+        view.apply(
+            &UiEvent::ToolStart {
+                id: "read-1".into(),
+                name: "read".into(),
+                args: json!({"path": "a.txt"}),
+            },
+            80,
+        );
+        rpi_tui::transcript::set_active_style(Some(Arc::new(
+            rpi_tui::transcript::TranscriptStyle::from_value(&json!({
+                "groupTools": false
+            }))
+            .unwrap(),
+        )));
+        view.apply(
+            &UiEvent::ToolStart {
+                id: "edit-1".into(),
+                name: "edit".into(),
+                args: json!({"path": "b.txt"}),
+            },
+            80,
+        );
+        rpi_tui::transcript::set_active_style(Some(Arc::new(
+            rpi_tui::transcript::TranscriptStyle::from_value(&json!({
+                "groupTools": true
+            }))
+            .unwrap(),
+        )));
+        view.apply(
+            &UiEvent::ToolStart {
+                id: "bash-1".into(),
+                name: "bash".into(),
+                args: json!({"command": "echo done"}),
+            },
+            80,
+        );
+        let lines = view.chat.render(100);
+        let plain = lines
+            .iter()
+            .map(|line| strip_ansi(line))
+            .collect::<Vec<_>>();
+        let first = |needle: &str| {
+            plain
+                .iter()
+                .position(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} missing: {plain:?}"))
+        };
+        assert!(first("read") < first("edit"));
+        assert!(first("edit") < first("bash"));
+        rpi_tui::transcript::set_active_style(None);
+    }
     #[test]
     fn tool_start_routes_bash_to_its_own_map() {
         let view = view();
