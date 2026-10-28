@@ -47,7 +47,7 @@ use rpi_harness::agent_harness::{
     AgentHarness, HarnessRunOutcome, NavigationOutcome, SendMessageResult, WeakAgentHarness,
 };
 use rpi_harness::session::session::Session;
-use rpi_harness::session::types::{BranchBounds, EntryOrder, EntryQuery};
+use rpi_harness::session::types::BranchBounds;
 use rpi_harness::types::SendMessageOptions;
 use tokio::runtime::Handle;
 
@@ -489,17 +489,12 @@ impl RuntimeActionHost for HarnessActionHost {
 
     async fn get_session_branch(
         &self,
-        _args: serde_json::Value,
+        args: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
+        let query = crate::modes::branch_entry_query(&args)?;
         let entries = self
             .harness()?
-            .find_entries_on_branch(
-                &EntryQuery {
-                    order: Some(EntryOrder::OldestFirst),
-                    ..Default::default()
-                },
-                &BranchBounds::default(),
-            )
+            .find_entries_on_branch(&query, &BranchBounds::default())
             .await
             .map_err(|e| e.to_string())?;
         let entries = entries
@@ -507,7 +502,8 @@ impl RuntimeActionHost for HarnessActionHost {
             .map(serde_json::to_value)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("serialize session branch: {e}"))?;
-        Ok(serde_json::json!({"entries": entries}))
+        let filtered = query.custom_type.is_some() || query.limit.is_some();
+        Ok(serde_json::json!({"entries": entries, "filtered": filtered}))
     }
 
     async fn set_session_name(&self, args: serde_json::Value) -> Result<serde_json::Value, String> {

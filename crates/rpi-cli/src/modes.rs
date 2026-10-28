@@ -717,7 +717,7 @@ where
             "get_commands" => Ok(rpc_get_commands(oauth_snapshot.as_deref())),
             "get_messages" => rpc_get_messages(&lane, harness, &msg).await,
             "get_history" => rpc_get_history(&lane, harness, &msg).await,
-            "get_session_branch" => rpc_get_session_branch(harness).await,
+            "get_session_branch" => rpc_get_session_branch(harness, &msg).await,
             "append_entry" => rpc_append_entry(harness, &msg).await,
             "get_stats" => rpc_get_stats(&lane, harness).await,
             "get_queue" => rpc_get_queue(&lane, harness, &msg).await,
@@ -1133,22 +1133,66 @@ async fn rpc_get_history(
     }))
 }
 
-async fn rpc_get_session_branch(harness: &AgentHarness) -> Result<serde_json::Value, String> {
+async fn rpc_get_session_branch(
+    harness: &AgentHarness,
+    msg: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let query = branch_entry_query(msg)?;
     let entries = harness
-        .find_entries_on_branch(
-            &EntryQuery {
-                order: Some(EntryOrder::OldestFirst),
-                ..Default::default()
-            },
-            &BranchBounds::default(),
-        )
+        .find_entries_on_branch(&query, &BranchBounds::default())
         .await
         .map_err(|error| error.to_string())?;
     let entries = entries
         .iter()
         .map(|entry| serde_json::to_value(entry).map_err(|error| error.to_string()))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(serde_json::json!({"entries": entries, "count": entries.len()}))
+    // `filtered` tells a polling client that the answer honors its query, so it
+    // can keep asking without serializing the whole transcript every time.
+    let filtered = query.custom_type.is_some() || query.limit.is_some();
+    Ok(serde_json::json!({
+        "entries": entries,
+        "count": entries.len(),
+        "filtered": filtered,
+    }))
+}
+
+/// Optional filters keep `get_session_branch` proportional to what the caller
+/// needs. Without them the whole transcript is serialized: a bridge that only
+/// tracks its own custom entry can ask for the newest match instead of
+/// megabytes of history on every poll.
+pub(crate) fn branch_entry_query(msg: &serde_json::Value) -> Result<EntryQuery, String> {
+    let custom_type = ["customType", "custom_type"]
+        .iter()
+        .find_map(|key| msg.get(*key))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let limit = match msg.get("limit") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => {
+            let limit = value
+                .as_u64()
+                .filter(|limit| *limit > 0)
+                .ok_or("get_session_branch: `limit` must be a positive integer")?;
+            Some(usize::try_from(limit).map_err(|_| "get_session_branch: `limit` is too large")?)
+        }
+    };
+    let order = match msg.get("order").and_then(serde_json::Value::as_str) {
+        None => EntryOrder::OldestFirst,
+        Some(value) if value.eq_ignore_ascii_case("oldestFirst") => EntryOrder::OldestFirst,
+        Some(value) if value.eq_ignore_ascii_case("newestFirst") => EntryOrder::NewestFirst,
+        Some(_) => {
+            return Err("get_session_branch: `order` must be oldestFirst or newestFirst".into())
+        }
+    };
+    Ok(EntryQuery {
+        entry_type: None,
+        custom_type,
+        order: Some(order),
+        limit,
+        cursor: None,
+    })
 }
 
 async fn rpc_append_entry(
@@ -2048,6 +2092,27 @@ mod tests {
         AssistantMessage, Content, StopReason, TextContent, TextContentType, Usage,
     };
     use rpi_harness::session::types::OperationError;
+
+    #[test]
+    fn session_branch_query_defaults_to_the_full_branch_and_accepts_filters() {
+        let all = branch_entry_query(&serde_json::json!({})).unwrap();
+        assert_eq!(all.custom_type, None);
+        assert_eq!(all.limit, None);
+        assert_eq!(all.order, Some(EntryOrder::OldestFirst));
+
+        let newest = branch_entry_query(&serde_json::json!({
+            "customType": "rpi-durable",
+            "limit": 1,
+            "order": "newestFirst",
+        }))
+        .unwrap();
+        assert_eq!(newest.custom_type.as_deref(), Some("rpi-durable"));
+        assert_eq!(newest.limit, Some(1));
+        assert_eq!(newest.order, Some(EntryOrder::NewestFirst));
+
+        assert!(branch_entry_query(&serde_json::json!({"limit": 0})).is_err());
+        assert!(branch_entry_query(&serde_json::json!({"order": "sideways"})).is_err());
+    }
 
     #[tokio::test]
     async fn rpc_commands_list_and_execute_registered_handler() {
