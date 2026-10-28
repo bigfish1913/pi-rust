@@ -64,10 +64,21 @@ pub struct ToolExecutionComponent {
     finished_at: Mutex<Option<Instant>>,
     /// Whether expanded
     expanded: Mutex<bool>,
+    /// Render as one header row (a folded group row) instead of a box.
+    row_only: std::sync::atomic::AtomicBool,
+    /// How many screenfuls of body an expanded panel shows. One click opens one
+    /// window; clicking the body again extends it, so a huge output never floods
+    /// the transcript in a single step.
+    expansion_windows: std::sync::atomic::AtomicUsize,
     /// Optional pre-rendered colored diff lines (from `render_diff`). When
     /// present the diff is always shown regardless of `expanded` — the diff
     /// IS the useful content for an `edit` tool.
     diff_lines: Mutex<Option<Vec<String>>>,
+    /// Raw display diff (`+12 text` / `-7 text`), kept so a style pack can
+    /// render it side by side instead of unified.
+    diff_source: Mutex<Option<String>>,
+    /// Active transcript style pack (host mechanism; the pack owns the look).
+    style: Mutex<Option<Arc<crate::transcript::TranscriptStyle>>>,
     /// Render the result body as markdown (tables, bold, lists) instead of
     /// plain text. Tools opt in by setting `details.markdown = true` on their
     /// result; the interactive host calls [`Self::set_result_markdown`] when
@@ -92,6 +103,7 @@ struct ToolRenderCache {
     width: usize,
     revision: u64,
     theme_revision: u64,
+    style_revision: u64,
     lines: Arc<Vec<String>>,
 }
 
@@ -108,7 +120,11 @@ impl ToolExecutionComponent {
             started_at: Mutex::new(None),
             finished_at: Mutex::new(None),
             expanded: Mutex::new(false),
+            row_only: std::sync::atomic::AtomicBool::new(false),
+            expansion_windows: std::sync::atomic::AtomicUsize::new(1),
             diff_lines: Mutex::new(None),
+            diff_source: Mutex::new(None),
+            style: Mutex::new(None),
             result_markdown: Mutex::new(false),
             todo_state: Mutex::new(None),
             plan_state: Mutex::new(None),
@@ -151,6 +167,34 @@ impl ToolExecutionComponent {
         self.bump();
     }
 
+    /// The displayed argument text (the streaming snapshot's JSON).
+    pub fn args_text(&self) -> String {
+        self.args
+            .lock()
+            .map(|args| args.clone())
+            .unwrap_or_default()
+    }
+
+    /// Whether `name`/`args` describe the same still-running call this panel is
+    /// showing.
+    ///
+    /// Streamed argument snapshots arrive repeatedly while the model types the
+    /// call, and a host that mints a fresh call id per snapshot would otherwise
+    /// render one card per delta (`write`, `write`, `write`…). When one argument
+    /// string is a prefix of the other, it is the same call still growing.
+    pub fn same_streaming_call(&self, name: &str, args: &str) -> bool {
+        if self.name.lock().map(|n| n.as_str() != name).unwrap_or(true) {
+            return false;
+        }
+        if matches!(self.status(), ToolStatus::Completed | ToolStatus::Failed) {
+            return false;
+        }
+        let mine = self.args_text();
+        let mine = mine.trim();
+        let other = args.trim();
+        !mine.is_empty() && (other.starts_with(mine) || mine.starts_with(other))
+    }
+
     /// Mark as running.
     pub fn set_running(&self) {
         if let Ok(mut s) = self.status.lock() {
@@ -167,7 +211,70 @@ impl ToolExecutionComponent {
         if let Ok(mut e) = self.expanded.lock() {
             *e = expanded;
         }
+        self.expansion_windows
+            .store(if expanded { 1 } else { 0 }, Ordering::Relaxed);
         self.bump();
+    }
+
+    /// Wall-clock interval of this call: `(started, finished)`.
+    ///
+    /// The group uses this to compute one span for the whole fold, so the
+    /// displayed time is the real work window and freezes once every call is
+    /// finished.
+    pub fn timing(&self) -> Option<(Instant, Option<Instant>)> {
+        let started = (*self.started_at.lock().ok()?)?;
+        Some((started, *self.finished_at.lock().ok()?))
+    }
+
+    /// Execution duration in milliseconds.
+    ///
+    /// A finished tool reports `finished - started`, so the number is frozen the
+    /// moment the call ends. A still-running call reports live elapsed time; a
+    /// call that never started reports `None`.
+    pub fn elapsed_ms(&self) -> Option<u128> {
+        let started = (*self.started_at.lock().ok()?)?;
+        match *self.finished_at.lock().ok()? {
+            Some(finished) => Some(finished.saturating_duration_since(started).as_millis()),
+            None if *self.status.lock().ok()? == ToolStatus::Running => {
+                Some(started.elapsed().as_millis())
+            }
+            None => None,
+        }
+    }
+
+    /// Render as a single folded row (or a full box) — set by the group.
+    pub fn set_row_only(&self, row_only: bool) {
+        self.row_only.store(row_only, Ordering::Relaxed);
+        self.bump();
+    }
+
+    /// One more screenful of body (a click below the header).
+    pub fn grow(&self) {
+        let next = self
+            .expansion_windows
+            .load(Ordering::Relaxed)
+            .saturating_add(1)
+            .min(16);
+        self.expansion_windows.store(next, Ordering::Relaxed);
+        self.bump();
+    }
+
+    /// Click on a rendered row: the header row toggles, the body extends.
+    pub fn click(&self, row: usize) -> bool {
+        // Header toggles the card; a click inside an open card reveals one more
+        // screenful (the third expansion state the docs describe).
+        if row == 0 || !self.is_expanded() {
+            let next = !self.is_expanded();
+            self.set_expanded(next);
+            return true;
+        }
+        self.grow();
+        true
+    }
+
+    /// Body rows the expanded panel may use right now.
+    fn expansion_budget(&self) -> usize {
+        crate::transcript::window_rows() * self.expansion_windows.load(Ordering::Relaxed).max(1)
     }
 
     /// Whether the component is currently expanded (for toggle helpers).
@@ -221,6 +328,23 @@ impl ToolExecutionComponent {
     pub fn set_diff(&self, lines: Vec<String>) {
         if let Ok(mut d) = self.diff_lines.lock() {
             *d = Some(lines);
+        }
+        self.bump();
+    }
+
+    /// Attach the raw display diff so the active style pack can choose between
+    /// the unified and the two-pane rendering at paint time.
+    pub fn set_diff_source(&self, raw: &str) {
+        if let Ok(mut d) = self.diff_source.lock() {
+            *d = Some(raw.to_string());
+        }
+        self.bump();
+    }
+
+    /// Install the active transcript style pack. `None` restores stock drawing.
+    pub fn set_style(&self, style: Option<Arc<crate::transcript::TranscriptStyle>>) {
+        if let Ok(mut current) = self.style.lock() {
+            *current = style;
         }
         self.bump();
     }
@@ -302,7 +426,7 @@ impl ToolExecutionComponent {
                     content.len().min(16)
                 };
                 for line in content.iter().take(shown) {
-                    rows.push(truncate_to_width(&format!("  {line}"), width, "…"));
+                    rows.push(truncate_to_width(&format!("  {line}"), width, ""));
                 }
                 if content.len() > shown {
                     rows.push(truncate_to_width(
@@ -375,6 +499,8 @@ impl ToolExecutionComponent {
         let result_markdown = self.result_markdown.lock().unwrap();
         let started_at = self.started_at.lock().unwrap();
         let finished_at = self.finished_at.lock().unwrap();
+        let style = crate::transcript::style_or_active(&self.style.lock().unwrap());
+        let diff_source = self.diff_source.lock().unwrap().clone();
 
         // Skill invocation mode: render as native-Pi's `[skill]` box rather
         // than a generic tool panel — custom-message background, collapsed to
@@ -401,12 +527,34 @@ impl ToolExecutionComponent {
         };
 
         // Background tint for the header row reflects status (pi tool*Bg).
-        let bg = match *status {
-            ToolStatus::Pending | ToolStatus::Running => colors.tool_pending_bg,
-            ToolStatus::Failed => colors.tool_error_bg,
-            ToolStatus::Completed => colors.tool_success_bg,
+        // Only a framed card goes transparent: a pack that just groups/icons
+        // still wants the stock status tint.
+        let bg = if style
+            .as_ref()
+            .map(|style| style.frame_tools)
+            .unwrap_or(false)
+        {
+            crate::theme::Color::Default
+        } else {
+            match *status {
+                ToolStatus::Pending | ToolStatus::Running => colors.tool_pending_bg,
+                ToolStatus::Failed => colors.tool_error_bg,
+                ToolStatus::Completed => colors.tool_success_bg,
+            }
         };
-        let panel = ToolPanel::new(width, theme.spacing, bg).expect("nonzero panel width");
+        // A framed panel lays its content out two columns narrower so the
+        // rounded border has room: otherwise every row overflows by 2 and gets
+        // clipped (the stray `…` and right-hand `│`).
+        let framed = style
+            .as_ref()
+            .map(|style| style.frame_tools)
+            .unwrap_or(false);
+        let panel_width = if framed {
+            width.saturating_sub(2).max(1)
+        } else {
+            width
+        };
+        let panel = ToolPanel::new(panel_width, theme.spacing, bg).expect("nonzero panel width");
         let content_width = panel.content_width;
         lines.extend(std::iter::repeat(panel.blank()).take(panel.padding_y));
 
@@ -419,13 +567,66 @@ impl ToolExecutionComponent {
             .as_deref()
             .map(str::to_string)
             .unwrap_or_else(|| tools::tool_label(&name));
-        let summary = tools::parse_args_summary(&name, &args);
+        // A style pack may put its own glyph in front of the tool name.
+        // Path-bearing tools (`read`/`write`/`edit`) show the file's own glyph
+        // and brand colour instead of the generic tool glyph: with a file per
+        // row, the icon is what tells them apart at a glance.
+        let icon_prefix = style
+            .as_ref()
+            .map(|style| {
+                let path = serde_json::from_str::<serde_json::Value>(&args)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("path")
+                            .or_else(|| value.get("file_path"))
+                            .and_then(|path| path.as_str())
+                            .map(str::to_string)
+                    });
+                match path.and_then(|path| style.file_icon(&path)) {
+                    Some(icon) => {
+                        let glyph = match icon.color {
+                            Some(color) => color.fg(&icon.glyph),
+                            None => icon.glyph.clone(),
+                        };
+                        format!("{glyph} ")
+                    }
+                    None => style
+                        .tool_icon(name.as_str())
+                        .map(|icon| format!("{} ", icon.glyph))
+                        .unwrap_or_default(),
+                }
+            })
+            .unwrap_or_default();
+        let summary = match style.as_ref() {
+            Some(style) if style.command_highlight && name.as_str() == "bash" => {
+                let command = serde_json::from_str::<serde_json::Value>(&args)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("command")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                    });
+                match command {
+                    Some(command) if !command.is_empty() => {
+                        crate::transcript::highlight_command(&command, style, colors)
+                    }
+                    _ => tools::parse_args_summary(&name, &args),
+                }
+            }
+            _ => tools::parse_args_summary(&name, &args),
+        };
         // Calculate elapsed time
         let elapsed_str = if *status == ToolStatus::Running {
-            // Real-time elapsed while running
-            if let Some(started) = *started_at {
-                let elapsed = started.elapsed();
-                format_elapsed(elapsed)
+            // Live time only inside an open card: a folded row must not force a
+            // repaint every tick just to animate a number nobody can see.
+            if *expanded {
+                if let Some(started) = *started_at {
+                    format_elapsed(started.elapsed())
+                } else {
+                    String::new()
+                }
             } else {
                 String::new()
             }
@@ -442,16 +643,21 @@ impl ToolExecutionComponent {
         };
         let head_parts = if summary.is_empty() && elapsed_str.is_empty() {
             format!(
-                "{} {} {}",
+                "{} {} {}{}",
                 status_color.fg(status_icon),
-                colors.tool_title.fg(&bold(&label)),
+                colors
+                    .tool_title
+                    .fg(&bold(&format!("{icon_prefix}{label}"))),
                 colors.muted.fg(chevron),
+                ""
             )
         } else if summary.is_empty() {
             format!(
                 "{} {} {} {}",
                 status_color.fg(status_icon),
-                colors.tool_title.fg(&bold(&label)),
+                colors
+                    .tool_title
+                    .fg(&bold(&format!("{icon_prefix}{label}"))),
                 colors.muted.fg(&elapsed_str),
                 colors.muted.fg(chevron),
             )
@@ -459,20 +665,30 @@ impl ToolExecutionComponent {
             format!(
                 "{} {} {} {}",
                 status_color.fg(status_icon),
-                colors.tool_title.fg(&bold(&label)),
-                colors.tool_output.fg(&summary),
+                colors
+                    .tool_title
+                    .fg(&bold(&format!("{icon_prefix}{label}"))),
+                summary,
                 colors.muted.fg(chevron),
             )
         } else {
             format!(
                 "{} {} {} {} {}",
                 status_color.fg(status_icon),
-                colors.tool_title.fg(&bold(&label)),
-                colors.tool_output.fg(&summary),
+                colors
+                    .tool_title
+                    .fg(&bold(&format!("{icon_prefix}{label}"))),
+                summary,
                 colors.muted.fg(&elapsed_str),
                 colors.muted.fg(chevron),
             )
         };
+        // A fold row: the style pack asked for one line per call. The chevron
+        // shows whether this row's own box is open, and the click toggles it.
+        if self.row_only.load(Ordering::Relaxed) && !*expanded {
+            return vec![truncate_to_width(&head_parts, width, ""), String::new()];
+        }
+
         // Do not sacrifice a long tool name/path summary for the running
         // indicator. Tool calls often carry generated paths or extension
         // names; wrap the header into panel rows so it remains inspectable.
@@ -484,13 +700,36 @@ impl ToolExecutionComponent {
         // compact summary already lives in the header, so this is the
         // "show me everything" path for debugging a tool call.
         if *expanded && !args.is_empty() && args.trim() != "{}" {
-            let args_line = format!(
-                "{} {}",
-                colors.muted.fg("args:"),
-                colors.dim.fg(&pretty_args(&args))
-            );
-            for part in wrap_text_with_ansi(&args_line, content_width) {
-                lines.push(panel.line(&part));
+            // `write` carries the whole file body in `content`; printing the raw
+            // JSON blob shows `\n` escapes and reads as one endless paragraph.
+            let content = serde_json::from_str::<serde_json::Value>(&args)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("content")
+                        .and_then(|content| content.as_str())
+                        .map(str::to_string)
+                });
+            match content {
+                Some(content) if !content.is_empty() => {
+                    for line in content.lines() {
+                        let row =
+                            format!("{} {}", colors.muted.fg("│"), colors.tool_output.fg(line));
+                        for part in wrap_text_with_ansi(&row, content_width) {
+                            lines.push(panel.line(&part));
+                        }
+                    }
+                }
+                _ => {
+                    let args_line = format!(
+                        "{} {}",
+                        colors.muted.fg("args:"),
+                        colors.dim.fg(&pretty_args(&args))
+                    );
+                    for part in wrap_text_with_ansi(&args_line, content_width) {
+                        lines.push(panel.line(&part));
+                    }
+                }
             }
         }
 
@@ -502,6 +741,25 @@ impl ToolExecutionComponent {
             // Drop it only when it would leave no room for output text.
             let gutter = !*result_markdown && content_width > 2;
             let body_width = content_width - if gutter { 2 } else { 0 };
+            // File-shaped output (read/write/grep on a path) gets the same
+            // syntax colours as the code blocks, so an opened card reads like
+            // the file instead of a wall of grey.
+            let mut body_highlighter = if *result_markdown {
+                None
+            } else {
+                serde_json::from_str::<serde_json::Value>(&args)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("path")
+                            .or_else(|| value.get("file_path"))
+                            .and_then(|path| path.as_str())
+                            .map(str::to_string)
+                    })
+                    .map(|path| path.rsplit('.').next().unwrap_or("").to_ascii_lowercase())
+                    .filter(|ext| !ext.is_empty())
+                    .map(|ext| crate::syntax_highlight::Highlighter::new(&ext))
+            };
             // Markdown results are rendered by the markdown component, which
             // wraps and styles its own rows (tables, lists, inline code). The
             // plain path keeps the existing naive wrap so non-markdown tool
@@ -515,18 +773,30 @@ impl ToolExecutionComponent {
                     .collect()
             };
             let shown = if *expanded {
-                visual_lines.len()
+                visual_lines.len().min(self.expansion_budget())
             } else {
-                visual_lines.len().min(OUTPUT_PREVIEW_LINES)
+                let budget = style
+                    .as_ref()
+                    .and_then(|style| {
+                        style.result_budget(name.as_str(), *status == ToolStatus::Failed)
+                    })
+                    .unwrap_or(OUTPUT_PREVIEW_LINES);
+                visual_lines.len().min(budget)
             };
             for part in visual_lines.iter().take(shown) {
+                let styled = match body_highlighter.as_mut() {
+                    Some(highlighter) if !part.trim().is_empty() => {
+                        highlighter.highlight(part, colors)
+                    }
+                    _ => colors.tool_output.fg(part),
+                };
                 let result_line = if gutter {
-                    format!("{} {}", colors.dim.fg("│"), colors.tool_output.fg(part))
+                    format!("{} {}", colors.dim.fg("│"), styled)
                 } else if *result_markdown {
                     // Markdown carries its own styling, including table edges.
                     part.clone()
                 } else {
-                    colors.tool_output.fg(part)
+                    styled
                 };
                 lines.push(panel.line(&result_line));
             }
@@ -546,14 +816,54 @@ impl ToolExecutionComponent {
             }
         }
 
+        // A style pack may render the raw diff as two panes; otherwise the
+        // pre-rendered unified rows below are used.
+        let mut diff_rendered = false;
+        // Rows whose background belongs to the content (tinted diff lines): the
+        // frame must not strip those fills.
+        let mut diff_bg: Option<std::ops::Range<usize>> = None;
+        if let Some(style) = style.as_ref() {
+            if style.split_diff {
+                if let Some(raw) = diff_source.as_deref() {
+                    let max = if *expanded { None } else { style.diff_lines };
+                    // Highlight the panes with the file's own language when the
+                    // call carries a path (`edit` / `write`).
+                    let language = serde_json::from_str::<serde_json::Value>(&args)
+                        .ok()
+                        .and_then(|value| {
+                            value
+                                .get("path")
+                                .or_else(|| value.get("file_path"))
+                                .and_then(|path| path.as_str())
+                                .map(str::to_string)
+                        })
+                        .map(|path| path.rsplit('.').next().unwrap_or("").to_ascii_lowercase());
+                    if let Some(rows) = crate::transcript::split_diff(
+                        raw,
+                        content_width,
+                        max,
+                        style,
+                        language.as_deref(),
+                    ) {
+                        let start = lines.len();
+                        for row in rows {
+                            lines.push(panel.line(&row));
+                        }
+                        diff_bg = Some(start..lines.len());
+                        diff_rendered = true;
+                    }
+                }
+            }
+        }
+
         // A colored diff (from `render_diff`) is shown collapsed by default
         // (a small preview) and fully when expanded — an edit's diff is the
         // useful payload, but dumping 40 lines into the transcript by default
         // swamped the conversation. Cap at DIFF_LINE_CAP even when expanded.
-        if let Some(diff) = diff_lines.as_ref() {
+        if let (false, Some(diff)) = (diff_rendered, diff_lines.as_ref()) {
             let total = diff.len();
             let cap = if *expanded {
-                DIFF_LINE_CAP
+                DIFF_LINE_CAP.min(self.expansion_budget())
             } else {
                 DIFF_PREVIEW_LINES
             };
@@ -576,6 +886,17 @@ impl ToolExecutionComponent {
             }
         }
 
+        // Style pack: a rounded, transparent frame replaces the tinted band.
+        if let Some(style) = style.as_ref() {
+            if style.frame_tools {
+                let border = style.tool_border(colors, name.as_str(), *status);
+                let mut framed =
+                    crate::transcript::draw_frame_keep(&lines, width, border, diff_bg.clone());
+                framed.push(String::new());
+                return framed;
+            }
+        }
+
         lines.extend(std::iter::repeat(panel.blank()).take(panel.padding_y));
         // Trailing spacer (one convention for every panel: each transcript
         // entry ends with its own blank row; nothing adds a leading one).
@@ -589,6 +910,7 @@ impl ToolExecutionComponent {
         let status = *self.status.lock().unwrap();
         let revision = self.revision.load(Ordering::Acquire);
         let theme_revision = theme_revision();
+        let style_revision = crate::transcript::style_revision();
 
         // Only finished panels are immutable: running ones have a live timer.
         let finished = matches!(status, ToolStatus::Completed | ToolStatus::Failed);
@@ -598,6 +920,7 @@ impl ToolExecutionComponent {
                     if cached.width == width
                         && cached.revision == revision
                         && cached.theme_revision == theme_revision
+                        && cached.style_revision == style_revision
                     {
                         return cached.lines.clone();
                     }
@@ -611,6 +934,7 @@ impl ToolExecutionComponent {
                     width,
                     revision,
                     theme_revision,
+                    style_revision,
                     lines: lines.clone(),
                 });
             }
@@ -1252,6 +1576,8 @@ mod tests {
         // Move the clock origin directly rather than sleeping or relying on timing.
         *tool.started_at.lock().unwrap() =
             Some(Instant::now() - std::time::Duration::from_secs(65));
+        // The live timer belongs to an open card; a folded row stays static.
+        tool.set_expanded(true);
         let later = tool.shared_lines(80);
         assert!(strip_ansi(&later.join("\n")).contains("1m5s"));
         assert!(!Arc::ptr_eq(&running, &later));

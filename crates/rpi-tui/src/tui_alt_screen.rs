@@ -451,6 +451,33 @@ impl TuiAltScreen {
         true
     }
 
+    /// The primary transcript viewport in screen coordinates.
+    ///
+    /// Returns `(top_row, width, scroll_top, height)`: the first visible row, the
+    /// content width, the content row currently shown at `top_row`, and the
+    /// viewport height. Lets a host map a click to a **content row** (and then to
+    /// the component that drew it) without reaching into the layout tree.
+    pub fn transcript_viewport(&self) -> Option<(usize, usize, usize, usize)> {
+        let frame = self
+            .current_frame
+            .lock()
+            .ok()
+            .and_then(|frame| frame.clone())?;
+        let primary = frame.primary_scroll_view.clone()?;
+        fn find(
+            b: &crate::layout::LayoutBox,
+            target: &Arc<crate::scroll_view::ScrollView>,
+        ) -> Option<(usize, usize, usize, usize)> {
+            if let Some(scroll) = &b.scroll_view {
+                if Arc::ptr_eq(scroll, target) {
+                    return Some((b.rect.y, b.rect.width, scroll.scroll_top(), b.rect.height));
+                }
+            }
+            b.children.iter().find_map(|child| find(child, target))
+        }
+        find(&frame.root, &primary)
+    }
+
     /// Feed a left-button mouse event to the fullscreen selection tracker.
     ///
     /// Must be called before the host interprets the event itself (the host
@@ -1003,6 +1030,11 @@ impl TuiAltScreen {
         // Store the frame for input handling
         if let Ok(mut current) = self.current_frame.lock() {
             *current = Some(frame.clone());
+        }
+        // Publish the transcript viewport so expansion is capped at one
+        // screenful per step instead of dumping an unbounded block.
+        if let Some((_, _, _, viewport_height)) = self.transcript_viewport() {
+            crate::transcript::set_viewport_height(viewport_height);
         }
 
         // Get screen lines and composite modal overlays above the layout.

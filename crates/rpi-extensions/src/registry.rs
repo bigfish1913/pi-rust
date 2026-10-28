@@ -363,6 +363,10 @@ pub struct ExtensionRegistry {
     /// Registered renderers (B5c), split by kind at registration. First-wins on
     /// `(kind, name)`. The host records these now; TUI consumption is B5e.
     renderers: Vec<RegisteredRenderer>,
+    /// Transcript style packs declared inline by plugins, smallest priority
+    /// first. A pack is drawing policy: the host owns the mechanism, the plugin
+    /// owns the look.
+    transcript_styles: Vec<(i32, serde_json::Value)>,
     /// P2: the registering plugin's declared dispatch priority. Stamped onto
     /// every handler it registers; a later `declare` also retro-updates them.
     priority: i32,
@@ -403,6 +407,7 @@ impl ExtensionRegistry {
             provider_manifests: std::collections::BTreeMap::new(),
             oauth_providers: Vec::new(),
             renderers: Vec::new(),
+            transcript_styles: Vec::new(),
             priority: DEFAULT_PRIORITY,
             platforms: Vec::new(),
             owns_stdio: false,
@@ -573,6 +578,12 @@ impl ExtensionRegistry {
                     .filter_map(|v| v.as_str().map(|s| s.to_string()))
                     .collect::<Vec<String>>()
             });
+        if let Some(style) = value.get("transcriptStyle").filter(|v| v.is_object()) {
+            self.transcript_styles
+                .push((priority.unwrap_or(DEFAULT_PRIORITY), style.clone()));
+            self.transcript_styles
+                .sort_by_key(|(priority, _)| *priority);
+        }
         if let Some(owns) = value.get("ownsStdio").and_then(|v| v.as_bool()) {
             // A claim, not a toggle: once a plugin owns stdio it stays claimed
             // (and `absorb` ORs it across plugins).
@@ -748,6 +759,7 @@ impl ExtensionRegistry {
             provider_manifests: self.provider_manifests.clone(),
             oauth_providers: self.oauth_providers.clone(),
             renderers: self.renderers.clone(),
+            transcript_styles: self.transcript_styles.clone(),
             owns_stdio: self.owns_stdio,
             active: Arc::clone(&self.active),
         }
@@ -877,6 +889,11 @@ impl ExtensionRegistry {
         // session own stdio. The live bridge has already checked the exclusive
         // owner; this flag projects that claim into the immutable snapshot.
         self.owns_stdio |= other.owns_stdio;
+        for style in other.transcript_styles.drain(..) {
+            self.transcript_styles.push(style);
+        }
+        self.transcript_styles
+            .sort_by_key(|(priority, _)| *priority);
     }
 }
 
@@ -903,6 +920,7 @@ pub struct RegistrySnapshot {
     provider_manifests: std::collections::BTreeMap<String, ProviderManifest>,
     oauth_providers: Vec<RegisteredOAuthProvider>,
     renderers: Vec<RegisteredRenderer>,
+    transcript_styles: Vec<(i32, serde_json::Value)>,
     /// A plugin's `{"ownsStdio":true}` claim (merged OR across plugins). The
     /// host reads this after `load_session` to defer `read_piped_stdin` and run
     /// the headless `Rpc` lifecycle. See [`ExtensionRegistry::declared_owns_stdio`].
@@ -914,6 +932,14 @@ impl RegistrySnapshot {
     /// The extension tools (schema + handle), insertion order.
     pub fn tools(&self) -> &[ExtensionTool] {
         &self.tools
+    }
+
+    /// The highest-priority transcript style pack declared by a loaded plugin.
+    ///
+    /// The host applies it to the native transcript (grouping, frames, glyphs,
+    /// budgets); with no pack the stock transcript is used unchanged.
+    pub fn transcript_style(&self) -> Option<&serde_json::Value> {
+        self.transcript_styles.first().map(|(_, value)| value)
     }
 
     /// Consume the snapshot into the owned tool list (for building adapters).

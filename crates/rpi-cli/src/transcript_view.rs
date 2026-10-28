@@ -106,6 +106,13 @@ pub struct TranscriptView {
 /// trait object so this crate stays free of any plugin types.
 pub type MarkdownTransformer = Arc<dyn Fn(&str) -> String + Send + Sync>;
 
+/// The fold group of the transcript that owns it, keyed by the chat container's
+/// address. Keying by the chat (instead of one process-wide slot) keeps two
+/// `TranscriptView`s in the same process from appending into each other's group.
+static CURRENT_GROUPS: std::sync::Mutex<
+    std::collections::BTreeMap<usize, Arc<rpi_tui::transcript::ToolGroup>>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
 impl TranscriptView {
     /// Self-contained view owning fresh maps (the remote client).
     pub fn new(chat: Arc<Container>) -> Self {
@@ -153,6 +160,11 @@ impl TranscriptView {
 
     /// Append a user prompt bubble.
     pub fn add_user(&self, text: &str) {
+        // A user turn ends the previous fold: the next tools start a fresh group.
+        let key = Arc::as_ptr(&self.chat) as *const () as usize;
+        if let Ok(mut groups) = CURRENT_GROUPS.lock() {
+            groups.remove(&key);
+        }
         self.chat
             .add_child(Arc::new(UserMessageComponent::new(text.to_string())));
         self.chat.add_child(Arc::new(Spacer::new(1)));
@@ -194,13 +206,18 @@ impl TranscriptView {
             UiEvent::AssistantUpdate { blocks, tool_calls } => {
                 self.ensure_assistant();
                 self.sync_tool_calls(tool_calls);
-                if let Some(comp) = self.current_assistant.lock().unwrap().as_ref() {
-                    comp.update_blocks(blocks);
+                // Clone the handle and drop the guard: `update_assistant_blocks`
+                // may create a fold group, which locks this same cell. Holding the
+                // guard here self-deadlocked the event loop (the UI just spun).
+                let comp = self.current_assistant.lock().unwrap().clone();
+                if let Some(comp) = comp {
+                    self.update_assistant_blocks(&comp, blocks);
                 }
             }
             UiEvent::AssistantEnd { blocks } => {
-                if let Some(comp) = self.current_assistant.lock().unwrap().take() {
-                    comp.update_blocks(blocks);
+                let comp = self.current_assistant.lock().unwrap().take();
+                if let Some(comp) = comp {
+                    self.update_assistant_blocks(&comp, blocks);
                     comp.set_streaming(false);
                 }
             }
@@ -237,8 +254,98 @@ impl TranscriptView {
         }
     }
 
+    /// The fold group for the current assistant segment.
+    ///
+    /// A segment owns exactly one group. Reusing "the last child if it is a
+    /// group" was not enough: an always-visible card (edit/write) appended after
+    /// the group made the next tool or thinking delta open a *second* group, so
+    /// the same reasoning appeared again and the transcript filled with
+    /// repeated fold rows. Segment-scoped state makes that impossible.
+    fn current_group(
+        &self,
+        style: Arc<rpi_tui::transcript::TranscriptStyle>,
+    ) -> Arc<rpi_tui::transcript::ToolGroup> {
+        let key = Arc::as_ptr(&self.chat) as *const () as usize;
+        if let Ok(mut groups) = CURRENT_GROUPS.lock() {
+            if let Some(group) = groups.get(&key) {
+                return group.clone();
+            }
+            let group = rpi_tui::transcript::ToolGroup::new(style);
+            // The fold belongs ABOVE the text it describes: thinking and calls
+            // happen before the reply they produce. The bubble already exists, so
+            // move it below the new group instead of appending the group after it.
+            let bubble = self.current_assistant.lock().unwrap().clone();
+            let bubble = bubble.filter(|bubble| {
+                self.chat.get_children().iter().any(|child| {
+                    std::sync::Arc::as_ptr(child) as *const ()
+                        == std::sync::Arc::as_ptr(bubble) as *const ()
+                })
+            });
+            if let Some(bubble) = bubble.as_ref() {
+                let as_component: Arc<dyn rpi_tui::Component> = bubble.clone();
+                self.chat.remove_child(&as_component);
+                self.chat.add_child(group.clone());
+                self.chat.add_child(as_component);
+            } else {
+                self.chat.add_child(group.clone());
+            }
+            groups.insert(key, group.clone());
+            return group;
+        }
+        let group = rpi_tui::transcript::ToolGroup::new(style);
+        self.chat.add_child(group.clone());
+        group
+    }
+
+    /// Route a freshly built tool panel into the transcript.
+    ///
+    /// Grouped tools join this segment's group; a tool the pack keeps visible
+    /// (an edit's diff *is* the payload) or a skill panel is appended directly
+    /// and does not end the group.
+    fn push_tool_panel(&self, name: &str, component: Arc<dyn rpi_tui::Component>) {
+        let Some(style) = rpi_tui::transcript::active_style() else {
+            self.chat.add_child(component);
+            return;
+        };
+        // Skills fold like every other call: the group row reports `skill` (see
+        // `ToolGroup::summary`) instead of the tool that loaded them. Keeping
+        // them outside the fold made the transcript show their whole body while
+        // every other call was a single row.
+        let keep_visible = style.always_shown(name);
+        if !style.group_tools || keep_visible {
+            self.chat.add_child(component);
+            return;
+        }
+        self.current_group(style).add(name, component);
+    }
+
     /// Flip the expansion preference; returns the new value.
     pub fn toggle_expanded(&self) -> bool {
+        // A style pack that folds tools walks the group first: folded row →
+        // one row per call → every box expanded → folded row.
+        let groups: Vec<Arc<dyn rpi_tui::Component>> = self
+            .chat
+            .get_children()
+            .into_iter()
+            .filter(|child| {
+                child
+                    .as_any()
+                    .downcast_ref::<rpi_tui::transcript::ToolGroup>()
+                    .is_some()
+            })
+            .collect();
+        if !groups.is_empty() {
+            let mut state = 0;
+            for group in &groups {
+                if let Some(group) = group
+                    .as_any()
+                    .downcast_ref::<rpi_tui::transcript::ToolGroup>()
+                {
+                    state = group.cycle();
+                }
+            }
+            return state > 0;
+        }
         let next = !*self.expanded.lock().unwrap();
         self.set_expanded(next);
         next
@@ -254,6 +361,14 @@ impl TranscriptView {
         *self.hide_thinking.lock().unwrap() = hide;
         if let Some(comp) = self.current_assistant.lock().unwrap().as_ref() {
             comp.set_hide_thinking(hide);
+        }
+        // The fold carries its own reasoning rows; they must obey the same
+        // preference, including later hide/show toggles.
+        let key = Arc::as_ptr(&self.chat) as *const () as usize;
+        if let Ok(groups) = CURRENT_GROUPS.lock() {
+            if let Some(group) = groups.get(&key) {
+                group.set_thinking_hidden(hide);
+            }
         }
     }
 
@@ -287,8 +402,11 @@ impl TranscriptView {
 
     /// Finalize the assistant panel with an authoritative final block list.
     pub fn finalize_assistant_blocks(&self, blocks: &[AssistantBlock]) {
-        if let Some(comp) = self.current_assistant.lock().unwrap().take() {
-            comp.update_blocks(blocks);
+        // Drop the guard before the update: it can create a fold group, which
+        // locks this same cell.
+        let comp = self.current_assistant.lock().unwrap().take();
+        if let Some(comp) = comp {
+            self.update_assistant_blocks(&comp, blocks);
             comp.set_streaming(false);
         }
     }
@@ -307,7 +425,64 @@ impl TranscriptView {
         !self.bash_components.lock().unwrap().is_empty()
     }
 
+    /// Fold a segment's reasoning into its group as one row.
+    ///
+    /// The row keeps a flowing one-line preview while collapsed (tail of the
+    /// reasoning), opens to the full text on click, and closes again on click.
+    /// The bubble itself drops the reasoning block so it never shows twice.
+    fn update_assistant_blocks(
+        &self,
+        comp: &Arc<AssistantMessageComponent>,
+        blocks: &[AssistantBlock],
+    ) {
+        let Some(style) = rpi_tui::transcript::active_style() else {
+            comp.update_blocks(blocks);
+            return;
+        };
+        let thinking: String = blocks
+            .iter()
+            .filter_map(|block| match block {
+                AssistantBlock::Thinking(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if thinking.trim().is_empty() {
+            comp.update_blocks(blocks);
+            return;
+        }
+        comp.set_hide_thinking(true);
+        // No "Thinking..." placeholder in the bubble: the reasoning row lives in
+        // the fold, so the bubble shows only text.
+        comp.set_omit_thinking(true);
+        let group = self.current_group(style.clone());
+        match group.thinking() {
+            Some(panel) => panel.set_text(&thinking),
+            None => {
+                let panel = rpi_tui::transcript::ThinkingPanel::new(style);
+                panel.set_text(&thinking);
+                panel.set_hidden(*self.hide_thinking.lock().unwrap());
+                group.set_thinking(panel.clone());
+                group.add("thinking", panel);
+            }
+        }
+        // The bubble keeps the authoritative block list (thinking included but
+        // hidden): "hidden" is a view state, so disabling the pack can simply
+        // un-hide it again instead of having thrown the text away.
+        comp.update_blocks(blocks);
+    }
+
     fn start_assistant(&self, blocks: &[AssistantBlock]) {
+        // A new message in the same turn gets its own reasoning row, but keeps
+        // appending to the turn's fold: one summary row per user turn.
+        {
+            let key = Arc::as_ptr(&self.chat) as *const () as usize;
+            if let Ok(groups) = CURRENT_GROUPS.lock() {
+                if let Some(group) = groups.get(&key) {
+                    group.reset_thinking();
+                }
+            }
+        }
         let comp = Arc::new(AssistantMessageComponent::new(
             AssistantMessageOptions::default(),
         ));
@@ -318,15 +493,29 @@ impl TranscriptView {
             comp.set_markdown_transformer(Some(transformer));
         }
         comp.set_streaming(true);
-        comp.update_blocks(blocks);
-        self.chat.add_child(comp.clone());
-        *self.current_assistant.lock().unwrap() = Some(comp);
+        // Publish the handle BEFORE the first update: group placement needs to
+        // know which bubble this message owns.
+        *self.current_assistant.lock().unwrap() = Some(comp.clone());
+        self.update_assistant_blocks(&comp, blocks);
+        let children = self.chat.get_children();
+        if !children.iter().any(|child| {
+            std::sync::Arc::as_ptr(child) as *const () == std::sync::Arc::as_ptr(&comp) as *const ()
+        }) {
+            self.chat.add_child(comp);
+        }
     }
 
     /// Create the streaming assistant component if a delta arrives before
     /// `assistant_start` (the wire does not strictly guarantee ordering).
     fn ensure_assistant(&self) {
         let mut current = self.current_assistant.lock().unwrap();
+        // One bubble per assistant message; updates flow into it in place.
+        //
+        // NOTE: splitting the bubble whenever a tool card sits after it was
+        // tried and reverted: during a turn, text deltas and tool cards
+        // interleave, so every delta opened another bubble and the transcript
+        // re-rendered the same thinking/tool content over and over. Ordering
+        // needs a segment model inside the bubble, not extra bubbles.
         if current.is_none() {
             let comp = Arc::new(AssistantMessageComponent::new(
                 AssistantMessageOptions::default(),
@@ -343,8 +532,14 @@ impl TranscriptView {
         }
     }
 
-    /// Pre-create panels for the tool calls visible in an assistant snapshot. A
-    /// later `tool_start` coalesces onto the same entry.
+    /// Update panels that already exist from a streaming assistant snapshot.
+    ///
+    /// Panels are created by `ToolStart` — the execution event that carries the
+    /// stable call id. Creating them here (as this used to) minted one card per
+    /// streamed snapshot, because a snapshot may carry a different id: that is
+    /// why one `write` showed up repeatedly, and why the leftovers stayed
+    /// "running" forever (nothing ever completed them) and kept the group timer
+    /// alive.
     fn sync_tool_calls(&self, calls: &[UiToolCall]) {
         for call in calls {
             if matches!(
@@ -362,14 +557,8 @@ impl TranscriptView {
                 if command.trim().is_empty() {
                     continue;
                 }
-                let mut bash = self.bash_components.lock().unwrap();
-                if let Some(existing) = bash.get(&call.id) {
+                if let Some(existing) = self.bash_components.lock().unwrap().get(&call.id) {
                     existing.set_command(command);
-                } else {
-                    let comp = Arc::new(BashExecutionComponent::new(command));
-                    comp.set_expanded(self.expanded());
-                    self.chat.add_child(comp.clone());
-                    bash.insert(call.id.clone(), comp);
                 }
                 continue;
             }
@@ -379,26 +568,16 @@ impl TranscriptView {
             } else {
                 call.args.to_string()
             };
-            let mut tools = self.tool_components.lock().unwrap();
-            if let Some(existing) = tools.get(&call.id) {
+            if display.trim().is_empty() || display.trim() == "{}" {
+                continue;
+            }
+            if let Some(existing) = self.tool_components.lock().unwrap().get(&call.id) {
+                // Skill names arrive with the streamed snapshot, so keep updating
+                // them on the panel `ToolStart` created.
                 if let Some(skill) = skill_tool_name(&call.name, &call.args) {
                     existing.set_skill_name(skill);
                 }
-                if !display.trim().is_empty() && display.trim() != "{}" {
-                    existing.set_args(&display);
-                }
-            } else {
-                let comp = Arc::new(ToolExecutionComponent::new(&call.name, &display));
-                if ask_user {
-                    comp.set_display_title("ASK USER");
-                }
-                if let Some(skill) = skill_tool_name(&call.name, &call.args) {
-                    comp.set_skill_name(skill);
-                }
-                comp.set_expanded(self.expanded());
-                comp.set_running();
-                self.chat.add_child(comp.clone());
-                tools.insert(call.id.clone(), comp);
+                existing.set_args(&display);
             }
         }
     }
@@ -422,8 +601,9 @@ impl TranscriptView {
                 existing.set_command(command);
             } else {
                 let comp = Arc::new(BashExecutionComponent::new(command));
+                comp.mark_started();
                 comp.set_expanded(self.expanded());
-                self.chat.add_child(comp.clone());
+                self.push_tool_panel("bash", comp.clone());
                 bash.insert(id.to_string(), comp);
             }
             return;
@@ -453,7 +633,7 @@ impl TranscriptView {
             }
             comp.set_expanded(self.expanded());
             comp.set_running();
-            self.chat.add_child(comp.clone());
+            self.push_tool_panel(name, comp.clone());
             tools.insert(id.to_string(), comp);
         }
     }
@@ -523,7 +703,7 @@ impl TranscriptView {
                     if !ask_user {
                         apply_edit_diff(&comp, name, result.get("details"), width);
                     }
-                    self.chat.add_child(comp.clone());
+                    self.push_tool_panel(name, comp.clone());
                     self.tool_components
                         .lock()
                         .unwrap()
@@ -561,12 +741,13 @@ impl TranscriptView {
                         return;
                     }
                     let comp = Arc::new(BashExecutionComponent::new(command));
+                    comp.mark_started();
                     comp.set_expanded(self.expanded());
                     if !text.is_empty() {
                         comp.append_output(&text);
                     }
                     finalize_bash(&comp, result, is_error);
-                    self.chat.add_child(comp);
+                    self.push_tool_panel("bash", comp);
                 }
             }
             return;
@@ -588,7 +769,7 @@ impl TranscriptView {
                     comp.set_display_title("ASK USER");
                 }
                 comp.set_expanded(self.expanded());
-                self.chat.add_child(comp.clone());
+                self.push_tool_panel(name, comp.clone());
                 comp
             }
         };
@@ -957,6 +1138,7 @@ fn apply_edit_diff(
     if diff_text.is_empty() {
         return;
     }
+    comp.set_diff_source(diff_text);
     comp.set_diff(render_diff(diff_text, width));
 }
 

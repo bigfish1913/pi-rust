@@ -130,6 +130,123 @@ type MarkdownTransformer = Arc<dyn Fn(&str) -> String + Send + Sync>;
 /// calling pattern mirrors `plugin_stub_smoke.rs`'s direct `RenderFn` round-
 /// trip (input `{"markdown":…}` → `render_fn` → reclaim `out` via the plugin's
 /// `free_string` → parse `{"markdown":…}`).
+/// Install the highest-priority transcript style pack declared by a loaded
+/// plugin, or restore the stock transcript when none is declared.
+///
+/// The pack is drawing *policy* (folding, frames, glyphs, budgets); the host
+/// owns the mechanism. Nothing here knows which pack it is applying.
+fn install_transcript_style(snapshot: Option<Arc<rpi_extensions::RegistrySnapshot>>) {
+    let style = snapshot
+        .and_then(|snapshot| snapshot.transcript_style().cloned())
+        .and_then(|value| rpi_tui::transcript::TranscriptStyle::from_value(&value))
+        .map(Arc::new);
+    rpi_tui::transcript::set_active_style(style);
+}
+
+/// Map a click to the transcript row it landed on and toggle that row.
+///
+/// Only rows a style pack drew are consumed (fold summary, member rows,
+/// thinking rows, expanded panels); everything else falls through to text
+/// selection.
+fn tidy_click(
+    tui: &Arc<rpi_tui::TuiAltScreen>,
+    state: &Arc<TuiState>,
+    event: &crossterm::event::MouseEvent,
+) -> bool {
+    let Some((top, _, scroll_top, viewport)) = tui.transcript_viewport() else {
+        return false;
+    };
+    let row = event.row as usize;
+    if row < top || row >= top + viewport {
+        return false;
+    }
+    let content_row = scroll_top + (row - top);
+    let Some((width, ranges)) = state.chat_container.row_ranges() else {
+        return false;
+    };
+    let children = state.chat_container.get_children();
+    for (index, (start, height)) in ranges.iter().enumerate() {
+        if content_row < start + height {
+            let Some(child) = children.get(index) else {
+                return false;
+            };
+            let local = content_row - start;
+            if let Some(group) = child
+                .as_any()
+                .downcast_ref::<rpi_tui::transcript::ToolGroup>()
+            {
+                return group.click_at(local, width);
+            }
+            return rpi_tui::transcript::toggle_component(child);
+        }
+    }
+    false
+}
+
+/// The row currently under the pointer: the group that owns it and its local
+/// row. Kept so moving off a row can clear its highlight again.
+static HOVERED: std::sync::Mutex<Option<(std::sync::Arc<dyn rpi_tui::Component>, usize)>> =
+    std::sync::Mutex::new(None);
+
+fn tidy_hover(
+    tui: &Arc<rpi_tui::TuiAltScreen>,
+    state: &Arc<TuiState>,
+    event: &crossterm::event::MouseEvent,
+) -> bool {
+    let target = tui
+        .transcript_viewport()
+        .and_then(|(top, _, scroll_top, viewport)| {
+            let row = event.row as usize;
+            if row < top || row >= top + viewport {
+                return None;
+            }
+            let content_row = scroll_top + (row - top);
+            let (_, ranges) = state.chat_container.row_ranges()?;
+            let children = state.chat_container.get_children();
+            ranges
+                .iter()
+                .position(|(start, height)| content_row < start + height)
+                .and_then(|index| {
+                    let start = ranges[index].0;
+                    children
+                        .get(index)
+                        .map(|child| (child.clone(), content_row - start))
+                })
+        });
+
+    let Ok(mut current) = HOVERED.lock() else {
+        return false;
+    };
+    match (&*current, &target) {
+        (None, None) => false,
+        (Some((old, old_row)), Some((new, new_row)))
+            if std::sync::Arc::ptr_eq(old, new) && old_row == new_row =>
+        {
+            false
+        }
+        _ => {
+            if let Some((old, _)) = current.take() {
+                if let Some(group) = old
+                    .as_any()
+                    .downcast_ref::<rpi_tui::transcript::ToolGroup>()
+                {
+                    group.set_hover_row(None);
+                }
+            }
+            if let Some((new, row)) = target {
+                if let Some(group) = new
+                    .as_any()
+                    .downcast_ref::<rpi_tui::transcript::ToolGroup>()
+                {
+                    group.set_hover_row(Some(row));
+                    *current = Some((new, row));
+                }
+            }
+            true
+        }
+    }
+}
+
 fn build_markdown_transformer(
     snapshot: Option<std::sync::Arc<rpi_extensions::RegistrySnapshot>>,
 ) -> Option<MarkdownTransformer> {
@@ -1058,6 +1175,16 @@ pub async fn interactive_tui(
             .unwrap()
             .snapshot_arc(),
     );
+    // A plugin that declares a transcript style pack changes the native
+    // transcript (folding, frames, glyphs, budgets); with no pack the stock
+    // look is kept. Same lifecycle as the markdown transformer.
+    install_transcript_style(
+        reload_context
+            .extension_session
+            .lock()
+            .unwrap()
+            .snapshot_arc(),
+    );
     // A normal launch creates a fresh session and must not replay records from
     // another/project harness. Only explicit restore/fork modes render prior
     // conversation history. This fixes stale prompts appearing every startup.
@@ -1796,6 +1923,13 @@ pub async fn interactive_tui(
                 }
                 use crossterm::event::MouseEventKind;
                 match m.kind {
+                    // Hover feedback for clickable rows: a light band under the
+                    // pointer, cleared when it leaves.
+                    MouseEventKind::Moved => {
+                        if tidy_hover(&tui_for_key, &state_for_key, &m) {
+                            tui_for_key.request_render(false);
+                        }
+                    }
                     MouseEventKind::ScrollUp => {
                         let delta = -MOUSE_WHEEL_SCROLL_LINES;
                         if scroll_for_key.scroll_by(delta) != delta {
@@ -1823,11 +1957,15 @@ pub async fn interactive_tui(
                         }
                     }
                     MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-                        // Begin fullscreen text selection (anchor + highlight).
-                        // The TUI owns the anchor/focus state in content
-                        // coordinates; a plain click later collapses it and
-                        // never touches the clipboard.
-                        tui_for_key.handle_selection_mouse_event(&m);
+                        // Fold-aware click: a style pack's summary/row consumes
+                        // the click; anything else still starts a selection.
+                        if tidy_click(&tui_for_key, &state_for_key, &m) {
+                            // A state change must repaint the transcript; reusing
+                            // the cached scroll content would show the old frame.
+                            tui_for_key.request_render(false);
+                        } else {
+                            tui_for_key.handle_selection_mouse_event(&m);
+                        }
                     }
                     MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
                         // Extend the selection; the re-render paints the
@@ -3416,6 +3554,9 @@ pub async fn interactive_tui(
                     reload_ctx.extension_session.lock().unwrap().snapshot_arc(),
                 );
                 state.set_markdown_transformer_with_reinstall(fresh_transformer);
+                install_transcript_style(
+                    reload_ctx.extension_session.lock().unwrap().snapshot_arc(),
+                );
                 if outcome.had_errors {
                     // Hard failure: the summary itself carries the error detail
                     // (e.g. "Settings reload failed: …"), so render it as an

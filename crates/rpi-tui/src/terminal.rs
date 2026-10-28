@@ -329,12 +329,14 @@ impl Terminal for ProcessTerminal {
     }
 
     fn enable_mouse(&self) {
-        // Enable mouse tracking (SGR mode)
-        self.write("\x1b[?1000h\x1b[?1002h\x1b[?1006h");
+        // Enable mouse tracking (SGR mode). 1003 = any-motion, which is what
+        // lets a host highlight the row under the pointer; 1002 alone only
+        // reports motion while a button is held.
+        self.write("\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h");
     }
 
     fn disable_mouse(&self) {
-        self.write("\x1b[?1006l\x1b[?1002l\x1b[?1000l");
+        self.write("\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l");
     }
 
     fn enter_raw_mode(&self) {
