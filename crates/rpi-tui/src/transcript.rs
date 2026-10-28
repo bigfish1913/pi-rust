@@ -1185,8 +1185,10 @@ impl Component for ToolGroup {
         if crate::transcript::active_style().is_none() {
             let mut out = Vec::new();
             if let Ok(members) = self.members.lock() {
-                for (_, component) in members.iter() {
-                    out.extend(component.render(width));
+                for (name, component) in members.iter() {
+                    if name != "thinking" {
+                        out.extend(component.render(width));
+                    }
                 }
             }
             return out;
@@ -1372,10 +1374,15 @@ impl ThinkingPanel {
     }
 
     /// Click on the rendered row: the header toggles, the body extends.
-    pub fn click(&self, _row: usize) -> bool {
-        // Any click on an open row folds it back: an expanded card must never
-        // trap the user in a state they cannot close.
-        self.toggle()
+    pub fn click(&self, row: usize) -> bool {
+        if row == 0 {
+            self.toggle();
+        } else if self.is_expanded() {
+            self.grow();
+        } else {
+            self.set_expanded(true);
+        }
+        true
     }
 
     /// Rows the expanded body may take right now.
@@ -1412,6 +1419,9 @@ impl Component for ThinkingPanel {
         // text. The bubble keeps it hidden while a pack is active, and losing the
         // content on reload would be worse than showing it unfolded.
         if crate::transcript::active_style().is_none() {
+            if self.is_hidden() {
+                return vec![String::new()];
+            }
             let text = self.text();
             if text.trim().is_empty() {
                 return vec![String::new()];
@@ -1521,6 +1531,25 @@ mod tests {
         TranscriptStyle::from_value(&value).expect("pack enabled")
     }
 
+    #[test]
+    fn thinking_body_click_grows_instead_of_collapsing() {
+        set_viewport_height(4);
+        set_active_style(Some(Arc::new(TranscriptStyle::default())));
+        let panel = ThinkingPanel::new(Arc::new(TranscriptStyle::default()));
+        panel.set_text(
+            &(0..100)
+                .map(|i| format!("line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        panel.set_expanded(true);
+        let before = panel.render(80).len();
+        assert!(panel.click(1));
+        let after = panel.render(80).len();
+        assert!(after > before);
+        set_viewport_height(20);
+        set_active_style(None);
+    }
     #[test]
     fn default_pack_keeps_the_stock_look() {
         let base = TranscriptStyle::default();

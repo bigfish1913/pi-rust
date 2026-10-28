@@ -3557,6 +3557,7 @@ pub async fn interactive_tui(
                 install_transcript_style(
                     reload_ctx.extension_session.lock().unwrap().snapshot_arc(),
                 );
+                state.refresh_transcript_style();
                 if outcome.had_errors {
                     // Hard failure: the summary itself carries the error detail
                     // (e.g. "Settings reload failed: …"), so render it as an

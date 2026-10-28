@@ -1567,6 +1567,7 @@ impl TuiState {
         self.footer.reset_session_counters();
         *self.last_assistant_text.lock().unwrap() = String::new();
         self.current_assistant.lock().unwrap().take();
+        self.transcript_view().reset_group();
         self.tool_components.lock().unwrap().clear();
         self.bash_components.lock().unwrap().clear();
         self.pending_bash_messages.lock().unwrap().clear();
@@ -1637,6 +1638,10 @@ impl TuiState {
             self.markdown_transformer.clone(),
         )
         .with_show_images(self.images_visible())
+    }
+
+    pub(super) fn refresh_transcript_style(&self) {
+        self.transcript_view().refresh_transcript_style();
     }
 
     /// B5e: swap the live transformer. Used at startup (install the first

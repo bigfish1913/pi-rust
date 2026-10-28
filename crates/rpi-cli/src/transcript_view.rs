@@ -158,13 +158,19 @@ impl TranscriptView {
         self
     }
 
-    /// Append a user prompt bubble.
-    pub fn add_user(&self, text: &str) {
-        // A user turn ends the previous fold: the next tools start a fresh group.
+    /// Drop the current fold when the chat/session is cleared without a new user
+    /// message. This prevents the next session from appending to a group that
+    /// is no longer present in the container.
+    pub fn reset_group(&self) {
         let key = Arc::as_ptr(&self.chat) as *const () as usize;
         if let Ok(mut groups) = CURRENT_GROUPS.lock() {
             groups.remove(&key);
         }
+    }
+
+    /// Append a user prompt bubble.
+    pub fn add_user(&self, text: &str) {
+        self.reset_group();
         self.chat
             .add_child(Arc::new(UserMessageComponent::new(text.to_string())));
         self.chat.add_child(Arc::new(Spacer::new(1)));
@@ -317,6 +323,27 @@ impl TranscriptView {
             return;
         }
         self.current_group(style).add(name, component);
+    }
+
+    /// Reconcile retained transcript components after `/reload` changes the
+    /// active style. The assistant keeps the full block list, so disabling a
+    /// pack can restore stock thinking rendering instead of losing reasoning.
+    pub fn refresh_transcript_style(&self) {
+        let packed = rpi_tui::transcript::active_style().is_some();
+        let user_hides_thinking = *self.hide_thinking.lock().unwrap();
+        for child in self.chat.get_children() {
+            if let Some(assistant) = child.as_any().downcast_ref::<AssistantMessageComponent>() {
+                assistant.set_omit_thinking(packed);
+                assistant.set_hide_thinking(packed || user_hides_thinking);
+            }
+            if let Some(group) = child
+                .as_any()
+                .downcast_ref::<rpi_tui::transcript::ToolGroup>()
+            {
+                group.set_thinking_hidden(user_hides_thinking);
+            }
+            child.invalidate();
+        }
     }
 
     /// Flip the expansion preference; returns the new value.
