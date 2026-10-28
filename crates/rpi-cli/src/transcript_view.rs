@@ -351,10 +351,27 @@ impl TranscriptView {
     pub fn refresh_transcript_style(&self) {
         let packed = rpi_tui::transcript::active_style().is_some();
         let user_hides_thinking = *self.hide_thinking.lock().unwrap();
+        let current_assistant = self.current_assistant.lock().unwrap().clone();
         for child in self.chat.get_children() {
             if let Some(assistant) = child.as_any().downcast_ref::<AssistantMessageComponent>() {
-                assistant.set_omit_thinking(packed);
-                assistant.set_hide_thinking(packed || user_hides_thinking);
+                let is_current = current_assistant
+                    .as_ref()
+                    .map(|current| std::ptr::eq(current.as_ref(), assistant))
+                    .unwrap_or(false);
+                if packed && is_current {
+                    // A pack can be enabled after a stock transcript was already
+                    // rendered. Re-route only the in-flight assistant: completed
+                    // stock messages have no segment/group association to recover,
+                    // so hiding their thinking would lose visible content.
+                    let blocks = assistant.blocks();
+                    self.update_assistant_blocks(
+                        current_assistant.as_ref().expect("current assistant"),
+                        &blocks,
+                    );
+                } else if !packed {
+                    assistant.set_omit_thinking(false);
+                    assistant.set_hide_thinking(user_hides_thinking);
+                }
             }
             if let Some(group) = child
                 .as_any()

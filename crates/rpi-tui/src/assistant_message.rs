@@ -170,6 +170,15 @@ impl AssistantMessageComponent {
         self.rebuild_content(blocks);
     }
 
+    /// Return the authoritative block snapshot used for rendering.
+    ///
+    /// The host uses this when a transcript style is enabled while an existing
+    /// assistant response is still active, so reasoning can be moved into the
+    /// style-managed fold without losing the original block list.
+    pub fn blocks(&self) -> Vec<AssistantBlock> {
+        self.last_blocks.lock().unwrap().clone()
+    }
+
     /// Update the content with assistant message text.
     ///
     /// Convenience for callers that have only text (the legacy path). The
