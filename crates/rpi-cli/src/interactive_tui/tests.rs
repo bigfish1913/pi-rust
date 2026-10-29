@@ -900,6 +900,43 @@ fn settings_menu_covers_the_wired_settings_surface() {
 }
 
 #[test]
+fn enabling_images_on_an_unsupported_terminal_says_so() {
+    // Driven through the public setting entry point, and the expectation is
+    // derived from the same capability the note is built from, so the probe is
+    // deterministic on any developer terminal (Kitty/Ghostty/WezTerm on CI).
+    // It is a behaviour assertion, not a compile assertion: on the previous
+    // code the note is always "Inline images enabled." and the `None` cell
+    // below fails.
+    let state = test_tui_state();
+    let mut settings = crate::settings::Settings::default();
+    let supported = rpi_tui::get_capabilities().protocol != rpi_tui::ImageProtocol::None;
+
+    let note = apply_setting_change(&state, "show-images", "true", &mut settings)
+        .expect("user-visible note");
+    assert_eq!(settings.show_images, Some(true));
+    assert!(*state.show_images.lock().unwrap());
+
+    if supported {
+        assert_eq!(note, "Inline images enabled.");
+    } else {
+        assert!(
+            note.contains("cannot display them"),
+            "a terminal without an image protocol must not be told images are on: {note}"
+        );
+        assert!(
+            note.contains("placeholder"),
+            "the note must say what the user will see instead: {note}"
+        );
+    }
+
+    // Disabling never carries the capability warning: it is always accurate.
+    let note = apply_setting_change(&state, "show-images", "false", &mut settings)
+        .expect("user-visible note");
+    assert_eq!(note, "Inline images disabled.");
+    assert!(!*state.show_images.lock().unwrap());
+}
+
+#[test]
 fn apply_setting_change_updates_settings_and_live_state() {
     let state = test_tui_state();
     let mut settings = crate::settings::Settings::default();
