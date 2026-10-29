@@ -399,6 +399,19 @@ impl ScrollView {
         self.render_with_viewport_impl(width, height, true)
     }
 
+    /// Document rendered for the last viewport pass.
+    ///
+    /// The layout uses it to find placements that scrolled above the viewport:
+    /// a kitty escape lives on the image's first row, which the visible slice
+    /// no longer contains, so the placement has to be re-anchored to the first
+    /// visible row and cropped to the rows that are still on screen.
+    pub(crate) fn rendered_document(&self) -> Option<Arc<RenderedDocument>> {
+        self.render_cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.as_ref().map(|cache| cache.document.clone()))
+    }
+
     fn render_with_viewport_impl(
         &self,
         width: usize,

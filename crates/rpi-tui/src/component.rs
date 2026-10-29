@@ -98,6 +98,18 @@ impl RenderedDocument {
         self.blocks.is_empty()
     }
 
+    /// Borrow a single row, e.g. to inspect a row that scrolled out of view.
+    pub fn line(&self, index: usize) -> Option<&str> {
+        let block_index = self.ends.partition_point(|end| *end <= index);
+        let block = self.blocks.get(block_index)?;
+        let start = if block_index == 0 {
+            0
+        } else {
+            self.ends[block_index - 1]
+        };
+        block.get(index - start).map(String::as_str)
+    }
+
     /// Copy only the requested rows, typically the visible viewport.
     pub fn lines(&self, start: usize, height: usize) -> Vec<String> {
         let mut index = self.ends.partition_point(|end| *end <= start);

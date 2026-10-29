@@ -7,8 +7,8 @@ use std::sync::Mutex;
 
 use super::component::Component;
 use super::terminal_image::{
-    allocate_image_id, get_capabilities, get_image_dimensions, render_image, ImageProtocol,
-    ImageRenderOptions,
+    allocate_image_id, get_capabilities, get_image_dimensions, register_kitty_image, render_image,
+    ImageProtocol, ImageRenderOptions, KittyImageMetadata,
 };
 use crate::utils::visible_width;
 
@@ -190,7 +190,8 @@ impl Image {
         }
 
         // Calculate dimensions
-        let (img_width, img_height) = if let Some((w, h)) = self.get_dimensions() {
+        let dimensions = self.get_dimensions();
+        let (img_width, img_height) = if let Some((w, h)) = dimensions {
             // Calculate cell dimensions
             let cell_dims = super::terminal_image::get_cell_dimensions();
             let cell_width = self
@@ -245,6 +246,19 @@ impl Image {
         } else if let Ok(data) = self.data.lock() {
             if let Some(ref img_data) = *data {
                 let id = self.image_id.lock().ok().and_then(|id| *id);
+                // The layout crops a placement to the rows that are on screen,
+                // which needs the pixel geometry behind the cell rectangle.
+                if caps.protocol == ImageProtocol::Kitty {
+                    if let (Some(id), Some((w, h))) = (id, dimensions) {
+                        register_kitty_image(KittyImageMetadata {
+                            id,
+                            columns: img_width,
+                            rows: img_height,
+                            width_px: w,
+                            height_px: h,
+                        });
+                    }
+                }
                 let options = ImageRenderOptions {
                     width: Some(img_width),
                     height: Some(img_height),
