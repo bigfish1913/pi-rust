@@ -90,6 +90,29 @@ fn extension_api_defaults_are_resolved_before_compat_diagnostics() {
     assert_eq!(compat.requires_reasoning_content, Some(true));
 }
 
+#[test]
+fn anthropic_messages_models_keep_their_compat() {
+    let cfg: config::ModelsConfig = serde_json::from_value(serde_json::json!({
+        "providers": {"gateway": {"api": "anthropic-messages", "models": [{"id": "m", "compat": {
+            "forceAdaptiveThinking": true, "misspelledFlag": true
+        }}]}}
+    }))
+    .unwrap();
+    let warnings = config::model_compat_warnings(&cfg);
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("misspelledFlag"));
+    let models = config::provider_to_models(
+        "gateway",
+        &cfg.providers["gateway"],
+        &crate::test_host::TestValues,
+    )
+    .unwrap();
+    let Some(rpi_ai::StreamingProtocolCompat::AnthropicMessages(compat)) = &models[0].compat else {
+        panic!("anthropic-messages compat must reach the model");
+    };
+    assert_eq!(compat.force_adaptive_thinking, Some(true));
+}
+
 /// Scope a test to a throwaway config dir + clear the `ANTHROPIC_*` env
 /// vars, restoring both on drop. Holds the shared env lock for its whole
 /// lifetime so parallel env-mutating tests across config/provider/auth all
