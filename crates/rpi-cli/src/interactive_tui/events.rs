@@ -157,9 +157,21 @@ pub(super) async fn drain_agent_events(
     loop {
         match rx.recv().await {
             Ok(event) => handle_agent_event(event, &tui, &state, &chat, &lane).await,
-            Err(broadcast::error::RecvError::Lagged(_)) => {
-                // We dropped some intermediate deltas; the next MessageUpdate/
-                // MessageEnd carries a full partial snapshot so the UI re-syncs.
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                // `MessageUpdate` carries a full snapshot of the block list, so
+                // the transcript re-syncs on its own. `MessageEnd` does NOT —
+                // it is a terminal event with no later carrier, so the footer
+                // counters accumulated from it (usage totals, cache-hit rate)
+                // would stay frozen. Record the gap so the run's end-of-turn
+                // reconciliation knows to rebuild from the durable log instead
+                // of trusting what the drain managed to observe.
+                tracing::debug!(
+                    skipped,
+                    "agent event broadcast lagged; run-end footer reconciliation required"
+                );
+                state
+                    .events_lagged
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 continue;
             }
             Err(broadcast::error::RecvError::Closed) => break,
@@ -201,9 +213,24 @@ pub(super) async fn handle_agent_event(
             refresh_pending_messages(state, lane).await;
             // A write that failed mid-run is not a run failure, so it cannot ride
             // the run outcome. Report it here: inside the alternate screen a
-            // `tracing::warn!` reaches nobody, and "the conversation stopped
-            // being saved" is something the user has to know before exiting.
+            // `tracing::warn!` reaches nobody, and the user must know before
+            // exiting that the conversation stopped being saved.
             report_write_failures(chat, lane);
+            // Authoritative footer reconciliation when the broadcast dropped
+            // events (`Lagged`). `AgentEnd` is the barrier that makes a rebuild
+            // here safe: the broadcast preserves order, so at this point every
+            // event queued before it — including every `MessageEnd` this run
+            // emitted — has already been through this handler, and no event of
+            // this run can arrive after it to be counted twice. Rebuilding only
+            // on the lagged path keeps an ordinary turn off the whole-branch
+            // read; a dropped `MessageEnd` is terminal, so the frozen counters
+            // have no later carrier to heal them and need the durable log.
+            if state
+                .events_lagged
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                reconcile_footer_from_lane(lane, state).await;
+            }
             tui.request_render(false);
         }
 
@@ -336,7 +363,13 @@ pub(super) async fn handle_agent_event(
                 // Uses the shared cache-stats logic (noise floor, idle gap,
                 // model change) and prices the miss when known.
                 let usage = &a.usage;
-                // Footer usage totals + cache hit rate (pi footer.ts).
+                // Footer usage totals + cache hit rate (pi footer.ts). Unconditional
+                // accumulation: the duplicate-suppression problem is handled at the
+                // reconciliation site instead — reconciliation only runs inside this
+                // drain (see the `AgentEnd` arm), where the FIFO broadcast guarantees
+                // every event queued before it has already been through this handler.
+                // A rebuild that replaced the totals can therefore never be followed
+                // by a still-queued duplicate of a turn it already counted.
                 state.footer.add_usage(
                     usage.input,
                     usage.output,
@@ -479,6 +512,93 @@ pub(super) fn record_context_usage(
     }
 }
 
+/// Fold the session's recorded usage into the footer, replacing whatever the
+/// live `MessageEnd` path accumulated. Only called from the drain's `AgentEnd`
+/// handler: the FIFO broadcast makes that call a consumption barrier, so every
+/// event queued before it has already been applied and a rebuild here can never
+/// be followed by a delayed duplicate of a turn it counted.
+///
+/// The live path (`handle_agent_event`) can only add what it actually observed.
+/// An `AgentEvent` broadcast that overflows reports `Lagged` and drops events
+/// outright, and `MessageEnd` is terminal — unlike `MessageUpdate`, it has no
+/// later snapshot that re-delivers the same information. So a single dropped
+/// `MessageEnd` froze `↑/↓/R/W/$` and `CH%` for the rest of the session, while
+/// the context badge kept moving because it had its own fallback.
+///
+/// This rebuilds every counter from the durable log, which is the authority the
+/// replay path (`render_session_history`) reads too — so a live session and a
+/// resumed one agree on the numbers by construction. `set_*` (replace) rather
+/// than `add_usage` (accumulate) keeps it idempotent: it runs on top of a footer
+/// that usually already holds the same totals.
+///
+/// Best-effort: the footer is cosmetic, so a failed read leaves it untouched
+/// instead of failing the turn.
+pub(super) async fn reconcile_footer_from_lane(lane: &Arc<dyn AgentLane>, state: &Arc<TuiState>) {
+    let entries = match lane
+        .session_view()
+        .find_entries_on_branch(
+            &EntryQuery {
+                entry_type: None,
+                custom_type: None,
+                order: Some(EntryOrder::OldestFirst),
+                limit: None,
+                cursor: None,
+            },
+            &BranchBounds::default(),
+        )
+        .await
+    {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::debug!(%error, "could not read session history for footer reconciliation");
+            return;
+        }
+    };
+
+    // Same rules as the live `MessageEnd` handler and the replay path: totals
+    // sum across turns, the cache-hit rate keeps the LATEST eligible turn's
+    // value, and aborted/errored turns do not measure the context.
+    let mut totals = rpi_tui::footer::UsageTotals::default();
+    let mut hit_rate: Option<f64> = None;
+    let mut context: Option<i64> = None;
+    for entry in &entries {
+        let Entry::Message(message_entry) = entry else {
+            continue;
+        };
+        let AgentMessage::Assistant(a) = &message_entry.message else {
+            continue;
+        };
+        totals.add(
+            a.usage.input,
+            a.usage.output,
+            a.usage.cache_read,
+            a.usage.cache_write,
+            a.usage.cost.total,
+        );
+        let denom = a.usage.input + a.usage.cache_read + a.usage.cache_write;
+        if denom > 0 && (a.usage.cache_read + a.usage.cache_write) > 0 {
+            hit_rate = Some(a.usage.cache_read as f64 / denom as f64 * 100.0);
+        }
+        if a.stop_reason != rpi_ai::StopReason::Aborted
+            && a.stop_reason != rpi_ai::StopReason::Error
+        {
+            let tokens = a.usage.context_tokens();
+            if tokens > 0 {
+                context = Some(tokens);
+            }
+        }
+    }
+
+    state.footer.set_usage(totals);
+    state.footer.set_cache_hit_rate(hit_rate);
+    // `set_context_tokens` only when a real measurement survived: a session
+    // whose every assistant turn aborted has no badge value to restore, and
+    // clearing it here would blank a badge the live path was right about.
+    if context.is_some() {
+        state.footer.set_context_tokens(context);
+    }
+}
+
 /// Return the diagnostic carried by a failed or aborted provider request.
 /// Providers may omit `error_message`; keep a stable fallback so a terminal
 /// request failure can never render as an empty transcript turn.
@@ -542,9 +662,9 @@ pub(super) fn report_write_failures(chat: &Arc<Container>, lane: &Arc<dyn AgentL
         add_error_message(
             chat,
             &format!(
-                "Session not saved: could not persist {} ({}). \
-                 Your messages are still on screen, and /export now writes the \
-                 unsaved ones into the exported file — do that before exiting: \
+                "Session not saved: could not persist {} ({}). \\
+                 Your messages are still on screen, and /export now writes the \\
+                 unsaved ones into the exported file — do that before exiting: \\
                  the session log cannot be repaired.",
                 failure.what, failure.message
             ),

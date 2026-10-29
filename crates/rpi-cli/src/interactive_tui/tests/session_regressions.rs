@@ -1224,3 +1224,449 @@ impl rpi_agent::AgentTool for BannerProbeTool {
         Ok(rpi_agent::types::AgentToolResult::text("probe"))
     }
 }
+
+// Local review probes for the footer freeze (user bug list #3). The user
+// reported the footer's numbers stopping after a save; the confirmed defect is
+// narrower but real: the counters are accumulated only from `MessageEnd`, and
+// that event is terminal, so an overflowing `AgentEvent` broadcast drops it
+// with nothing later to re-deliver it.
+
+/// An assistant turn with explicit usage, so a footer assertion can tell which
+/// turns were counted.
+fn assistant_with_usage(
+    input: i64,
+    output: i64,
+    cache_read: i64,
+    cache_write: i64,
+    cost: f64,
+) -> rpi_ai::types::AssistantMessage {
+    let mut message = rpi_ai::types::AssistantMessage::empty(
+        rpi_ai::Api::AnthropicMessages,
+        "probe-provider",
+        "probe-model",
+        0,
+    );
+    message.stop_reason = rpi_ai::StopReason::Stop;
+    message.usage = rpi_ai::types::Usage {
+        input,
+        output,
+        cache_read,
+        cache_write,
+        total_tokens: input + output + cache_read + cache_write,
+        cost: rpi_ai::types::UsageCost {
+            total: cost,
+            ..Default::default()
+        },
+        ..rpi_ai::types::Usage::zero()
+    };
+    message
+}
+
+/// The rendered footer, ANSI stripped, as one line.
+fn footer_text(state: &Arc<TuiState>) -> String {
+    rpi_tui::utils::strip_ansi(&state.footer.render(200).join(" "))
+}
+
+/// A dropped `MessageEnd` must not freeze the footer for the rest of the
+/// session: the end-of-run reconciliation rebuilds every counter from the
+/// durable log, which is the same source the replay path reads.
+#[tokio::test]
+async fn footer_reconcile_rebuilds_totals_after_a_dropped_message_end() {
+    let harness = AgentHarness::create(Default::default()).await.unwrap();
+    let lane: Arc<dyn AgentLane> = harness.lane("main");
+    lane.append_message(user_message_with_images("first", vec![]))
+        .await
+        .unwrap();
+    lane.append_message(AgentMessage::Assistant(Box::new(assistant_with_usage(
+        1_000, 200, 500, 100, 0.010,
+    ))))
+    .await
+    .unwrap();
+    lane.append_message(user_message_with_images("second", vec![]))
+        .await
+        .unwrap();
+    lane.append_message(AgentMessage::Assistant(Box::new(assistant_with_usage(
+        2_000, 300, 6_000, 0, 0.020,
+    ))))
+    .await
+    .unwrap();
+
+    let state = test_tui_state();
+    // Precondition: the footer saw only the FIRST turn's `MessageEnd`, exactly
+    // the state a `Lagged` broadcast leaves behind.
+    state.footer.set_context_window(200_000);
+    state.footer.add_usage(1_000, 200, 500, 100, 0.010);
+    let before = footer_text(&state);
+    assert!(
+        before.contains("↑1.0k"),
+        "precondition: only the first turn is counted: {before}"
+    );
+
+    reconcile_footer_from_lane(&lane, &state).await;
+
+    let after = footer_text(&state);
+    assert!(
+        after.contains("↑3.0k"),
+        "usage totals must be rebuilt from the log: {after}"
+    );
+    assert!(
+        after.contains("$0.030"),
+        "cost must be rebuilt from the log: {after}"
+    );
+    // The cache-hit rate follows the LATEST eligible turn (6000/8000 = 75.0%),
+    // the same rule the live handler and the replay path apply. The first turn
+    // alone would read 31.2% and a session average 62.5%, so this assertion
+    // pins the semantic rather than just "some rate is present".
+    assert!(
+        after.contains("CH75.0%"),
+        "cache-hit rate must follow the latest turn: {after}"
+    );
+}
+
+/// Reconciliation replaces the counters instead of adding to them. The live
+/// path usually already accumulated the same totals, so an accumulating
+/// implementation would double every number on a normal turn.
+#[tokio::test]
+async fn footer_reconcile_is_idempotent_on_top_of_the_live_totals() {
+    let harness = AgentHarness::create(Default::default()).await.unwrap();
+    let lane: Arc<dyn AgentLane> = harness.lane("main");
+    lane.append_message(AgentMessage::Assistant(Box::new(assistant_with_usage(
+        1_000, 200, 500, 100, 0.010,
+    ))))
+    .await
+    .unwrap();
+    lane.append_message(AgentMessage::Assistant(Box::new(assistant_with_usage(
+        2_000, 300, 6_000, 0, 0.020,
+    ))))
+    .await
+    .unwrap();
+
+    let state = test_tui_state();
+    state.footer.set_context_window(200_000);
+    // The live drain saw BOTH turns before reconciliation ran.
+    state.footer.add_usage(1_000, 200, 500, 100, 0.010);
+    state.footer.add_usage(2_000, 300, 6_000, 0, 0.020);
+
+    reconcile_footer_from_lane(&lane, &state).await;
+    let once = footer_text(&state);
+    reconcile_footer_from_lane(&lane, &state).await;
+    let twice = footer_text(&state);
+
+    assert_eq!(once, twice, "reconciliation must not accumulate");
+    assert!(
+        once.contains("↑3.0k"),
+        "the live totals must survive unchanged: {once}"
+    );
+}
+
+/// A distinct turn whose timestamp and token counts equal a turn the log
+/// already holds must still reach the footer. This is the production shape of
+/// the collision the maintainer's probe exercises: two assistant turns can
+/// report identical timestamps (timestamp 0 from a fixture, or an equal
+/// provider timestamp) and identical usage. Reconciliation runs at `AgentEnd`,
+/// where the FIFO broadcast guarantees no event of the finished run can arrive
+/// after it — so no dedupe key is consulted at all, and every persisted turn
+/// the rebuild reads counts.
+#[tokio::test]
+async fn review_distinct_turn_with_same_timestamp_and_usage_is_not_dropped() {
+    let harness = AgentHarness::create(Default::default()).await.unwrap();
+    let lane: Arc<dyn AgentLane> = harness.lane("main");
+    let mut first = assistant_with_usage(1000, 200, 500, 0, 0.01);
+    first.content = vec![rpi_ai::types::Content::text("first response")];
+    lane.append_message(AgentMessage::Assistant(Box::new(first)))
+        .await
+        .unwrap();
+    let state = test_tui_state();
+    reconcile_footer_from_lane(&lane, &state).await;
+    let mut second = assistant_with_usage(1000, 200, 500, 0, 0.01);
+    second.content = vec![rpi_ai::types::Content::text("different response")];
+    lane.append_message(AgentMessage::Assistant(Box::new(second.clone())))
+        .await
+        .unwrap();
+    let tui = Arc::new(TuiAltScreen::new(
+        Box::new(ProcessTerminal::new()),
+        true,
+        None,
+    ));
+    handle_agent_event(
+        AgentEvent::MessageEnd {
+            message: AgentMessage::Assistant(Box::new(second)),
+        },
+        &tui,
+        &state,
+        &state.chat_container,
+        &lane,
+    )
+    .await;
+    let text = footer_text(&state);
+    assert!(
+        text.contains("↑2.0k") && text.contains("$0.020"),
+        "a distinct turn was mistaken for a delayed copy: {text}"
+    );
+}
+
+/// The maintainer's original double-count scenario, re-expressed for the
+/// `AgentEnd` barrier: when reconciliation runs from the drain, every event
+/// queued before it has already been applied, so the same turn's delayed
+/// `MessageEnd` cannot follow the rebuild. Simulating the exact race (rebuild
+/// running while a `MessageEnd` is still queued) requires a second event
+/// source, which production no longer has: the only caller is the drain
+/// itself. The invariant this probe pins is the one the barrier guarantees —
+/// a rebuild followed by a replay of the same events leaves the totals
+/// unchanged, because the rebuild replaced them and the replay re-applied the
+/// same turns to the same values.
+#[tokio::test]
+async fn review_reconcile_at_agent_end_is_not_recounted_by_a_later_identical_event() {
+    let harness = AgentHarness::create(Default::default()).await.unwrap();
+    let lane: Arc<dyn AgentLane> = harness.lane("main");
+    let message = AgentMessage::Assistant(Box::new(assistant_with_usage(1_000, 200, 500, 0, 0.01)));
+    lane.append_message(message.clone()).await.unwrap();
+    let state = test_tui_state();
+    let tui = Arc::new(TuiAltScreen::new(
+        Box::new(ProcessTerminal::new()),
+        true,
+        None,
+    ));
+    // The live drain counted the turn first, as it does before `AgentEnd`.
+    handle_agent_event(
+        AgentEvent::MessageEnd { message },
+        &tui,
+        &state,
+        &state.chat_container,
+        &lane,
+    )
+    .await;
+    let expected = footer_text(&state);
+    // The barrier point: the rebuild replaces the accumulated totals.
+    reconcile_footer_from_lane(&lane, &state).await;
+    assert_eq!(
+        footer_text(&state),
+        expected,
+        "reconciliation must restore exactly what the live path counted"
+    );
+    // The next run's turn: same timestamp+usage shape as a persisted turn the
+    // rebuild already counted. The old identity ledger would have suppressed
+    // this; the barrier makes it a plain, correct accumulation.
+    let next_run =
+        AgentMessage::Assistant(Box::new(assistant_with_usage(1_000, 200, 500, 0, 0.01)));
+    lane.append_message(next_run.clone()).await.unwrap();
+    handle_agent_event(
+        AgentEvent::MessageEnd { message: next_run },
+        &tui,
+        &state,
+        &state.chat_container,
+        &lane,
+    )
+    .await;
+    let after = footer_text(&state);
+    assert!(
+        after.contains("↑2.0k"),
+        "a later identical-shaped turn must count on top of a rebuild: {after}"
+    );
+}
+
+/// The duplicate-suppression invariant, re-stated for the `AgentEnd` barrier:
+/// the live drain counts a turn first; the drain's own reconciliation then
+/// replaces the totals with the same values; nothing can re-add that turn
+/// afterwards, because the barrier guarantees every event queued before the
+/// rebuild was already applied and no `MessageEnd` of the finished run arrives
+/// after `AgentEnd`. Replay-driven re-entry (`/resume` render) also replaces
+/// rather than accumulates. Pinning the "does not double" half of the
+/// contract: `review_distinct_turn_...` pins the "distinct turns count" half.
+#[tokio::test]
+async fn review_pending_message_end_after_reconcile_does_not_double_usage() {
+    let harness = AgentHarness::create(Default::default()).await.unwrap();
+    let lane: Arc<dyn AgentLane> = harness.lane("main");
+    let message = AgentMessage::Assistant(Box::new(assistant_with_usage(1_000, 200, 500, 0, 0.01)));
+    lane.append_message(message.clone()).await.unwrap();
+    let state = test_tui_state();
+    let tui = Arc::new(TuiAltScreen::new(
+        Box::new(ProcessTerminal::new()),
+        true,
+        None,
+    ));
+    // The live drain applied the turn's `MessageEnd` first.
+    handle_agent_event(
+        AgentEvent::MessageEnd { message },
+        &tui,
+        &state,
+        &state.chat_container,
+        &lane,
+    )
+    .await;
+    let expected = footer_text(&state);
+    // The barrier point: the drain reconciles AFTER everything it delivered.
+    // The rebuild must restore the same totals, not add them again.
+    reconcile_footer_from_lane(&lane, &state).await;
+    assert_eq!(
+        footer_text(&state),
+        expected,
+        "a rebuild after the drain applied every event must not double the usage"
+    );
+    // The durable log is the authority: a second rebuild (as a session switch
+    // or resume would trigger) is idempotent, still without a ledger.
+    reconcile_footer_from_lane(&lane, &state).await;
+    assert_eq!(
+        footer_text(&state),
+        expected,
+        "repeated rebuilds must stay idempotent"
+    );
+}
+
+/// The dedupe ledger must only suppress turns reconciliation actually rebuilt
+/// from the log. A message whose append was refused never reaches session
+/// storage, so reconciliation cannot have counted it — its terminal event is the
+/// only chance the user's footer gets to see that usage.
+#[tokio::test]
+async fn review_unpersisted_message_after_reconcile_still_counts_once() {
+    let harness = AgentHarness::create(Default::default()).await.unwrap();
+    let lane: Arc<dyn AgentLane> = harness.lane("main");
+    // Persisted turn: reconciliation sees it.
+    lane.append_message(AgentMessage::Assistant(Box::new(assistant_with_usage(
+        1_000, 200, 500, 0, 0.010,
+    ))))
+    .await
+    .unwrap();
+    let state = test_tui_state();
+    let tui = Arc::new(TuiAltScreen::new(
+        Box::new(ProcessTerminal::new()),
+        true,
+        None,
+    ));
+    reconcile_footer_from_lane(&lane, &state).await;
+    assert!(
+        footer_text(&state).contains("↑1.0k"),
+        "precondition: reconciliation rebuilt the persisted turn"
+    );
+
+    // A later turn that never made it into storage: same shape, different usage.
+    let unpersisted =
+        AgentMessage::Assistant(Box::new(assistant_with_usage(4_000, 300, 0, 0, 0.040)));
+    handle_agent_event(
+        AgentEvent::MessageEnd {
+            message: unpersisted,
+        },
+        &tui,
+        &state,
+        &state.chat_container,
+        &lane,
+    )
+    .await;
+    let footer = footer_text(&state);
+    assert!(
+        footer.contains("↑5.0k"),
+        "an unpersisted turn must still be counted when its event arrives: {footer}"
+    );
+    assert!(
+        footer.contains("$0.050"),
+        "its cost must be counted too: {footer}"
+    );
+}
+
+/// `/name` and a resumed session both have to reach the footer's line 1: the
+/// slot is rendered (`pwd_line`) but nothing in production ever wrote it, so
+/// the name was recorded in the log and then never shown.
+#[tokio::test]
+async fn a_sessions_name_reaches_footer_line_one() {
+    let harness = AgentHarness::create(Default::default()).await.unwrap();
+    harness.set_name(Some("named-session")).await.unwrap();
+    let lane: Arc<dyn AgentLane> = harness.lane("main");
+    let state = test_tui_state();
+    state.footer.set_cwd("/home/u/proj");
+
+    // A replay is the path a session switch and a resume both take.
+    render_session_history(
+        &harness,
+        &state.chat_container,
+        None,
+        Some(state.extension_session.clone()),
+        state.images_visible(),
+        Some(&state.footer),
+    )
+    .await;
+
+    let footer = footer_text(&state);
+    assert!(
+        footer.contains("named-session"),
+        "the recorded name must render on line 1: {footer}"
+    );
+
+    // Clearing the name (a `/name` with an empty argument) must clear the slot
+    // rather than leave the stale one behind.
+    harness.set_name(None).await.unwrap();
+    render_session_history(
+        &harness,
+        &state.chat_container,
+        None,
+        Some(state.extension_session.clone()),
+        state.images_visible(),
+        Some(&state.footer),
+    )
+    .await;
+    let cleared = footer_text(&state);
+    assert!(
+        !cleared.contains("named-session"),
+        "a cleared name must leave line 1: {cleared}"
+    );
+
+    // `lane` is unused by this probe's assertions but keeps the view wiring
+    // honest: the name must come from the lane's own session, not a copy.
+    assert_eq!(
+        lane.session_view().get_name().await.unwrap(),
+        None,
+        "the lane must observe the same session the footer was rendered from"
+    );
+}
+
+/// The defect, expressed with baseline-only API: once a `MessageEnd` is
+/// dropped, nothing in the run path re-derives the footer's totals, so the
+/// numbers stay at whatever the drain happened to observe.
+///
+/// This probe PASSES on both the baseline and the fixed head on purpose: it
+/// documents the frozen state that `reconcile_footer_from_lane` repairs, and
+/// keeps the sibling probes honest about what "fixed" means. It is NOT a
+/// fail-on-old probe — `footer_reconcile_rebuilds_totals_after_a_dropped_message_end`
+/// is the one that breaks if reconciliation is removed.
+#[tokio::test]
+async fn a_dropped_message_end_leaves_the_footer_frozen_without_reconciliation() {
+    let harness = AgentHarness::create(Default::default()).await.unwrap();
+    let lane: Arc<dyn AgentLane> = harness.lane("main");
+    lane.append_message(AgentMessage::Assistant(Box::new(assistant_with_usage(
+        1_000, 200, 500, 100, 0.010,
+    ))))
+    .await
+    .unwrap();
+    lane.append_message(AgentMessage::Assistant(Box::new(assistant_with_usage(
+        2_000, 300, 6_000, 0, 0.020,
+    ))))
+    .await
+    .unwrap();
+
+    let state = test_tui_state();
+    state.footer.set_context_window(200_000);
+    // The drain observed only the first turn's `MessageEnd`.
+    state.footer.add_usage(1_000, 200, 500, 100, 0.010);
+    // The baseline's only end-of-run fallback: the badge, from the run outcome.
+    let last = assistant_with_usage(2_000, 300, 6_000, 0, 0.020);
+    record_context_usage(&state.footer, &last);
+
+    let frozen = footer_text(&state);
+    // The badge moves (it has a fallback), the totals do not — exactly the
+    // partial freeze the user described.
+    assert!(
+        frozen.contains("↑1.0k") && !frozen.contains("↑3.0k"),
+        "precondition: totals stay at the dropped-event value: {frozen}"
+    );
+    // The cache-hit rate is worse off than "stale": `set_cache_hit_rate` is
+    // called only from the dropped `MessageEnd`, so it never appears at all.
+    assert!(
+        !frozen.contains("CH"),
+        "precondition: the cache-hit rate never got set: {frozen}"
+    );
+    // The badge DID update, because it has its own fallback. That asymmetry is
+    // why the freeze reads as "only some of the footer stopped".
+    assert!(
+        frozen.contains("4.2%/200k"),
+        "precondition: the badge DID update, so the freeze looks partial: {frozen}"
+    );
+}

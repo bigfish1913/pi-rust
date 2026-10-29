@@ -215,11 +215,21 @@ pub(super) async fn run_prompt_streaming(
     // the only place its write failures can surface.
     super::events::report_write_failures(&state.chat_container, lane);
 
-    // Authoritative context-badge fallback. The streaming drain normally
-    // updates it from `MessageEnd`, but a `Lagged` broadcast or the blocking
-    // path can skip that event; reconcile from the run outcome so the badge
-    // always reflects the newest real response.
+    // Footer repair for a dropped `MessageEnd` used to live here, but that call
+    // raced the drain: the final assistant message can already be in the log
+    // while its `MessageEnd` is still queued, so the rebuild counted turns the
+    // drain was about to count again — and a distinct turn with the same
+    // timestamp and usage is indistinguishable from that delayed duplicate by
+    // content alone. Reconciliation now runs inside the drain's `AgentEnd`
+    // handler, which the FIFO broadcast turns into a consumption barrier: every
+    // event queued before it has been applied, so a `set_usage` rebuild can
+    // never be followed by a delayed duplicate of what it counted.
     if let Ok(result) = &outcome {
+        // The context badge keeps its run-outcome fallback: it shows one turn's
+        // measurement (set semantics, nothing accumulated), so racing the drain
+        // costs nothing — the drain's own `MessageEnd` handling just overwrites
+        // it. On the non-streaming path there is no drain at all, and this is
+        // the only place the badge gets a value from.
         let final_message: Option<&AssistantMessage> = match &result.outcome {
             HarnessRunOutcome::Completed { final_message, .. }
             | HarnessRunOutcome::Aborted { final_message, .. } => Some(final_message),

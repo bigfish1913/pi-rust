@@ -708,6 +708,14 @@ pub(super) async fn render_session_history(
         // Spacer(1), so an extra would double the bottom gap.
     }
     if let Some(footer) = footer {
+        // The session's own name, which `/name` (and a session created by an
+        // extension) records in the log. `reset_session_counters` cleared the
+        // slot before this replay ran, so without this a switch to a named
+        // session left line 1 blank. Independent of the usage gate below: a
+        // session with no recorded turns can still be named.
+        if let Ok(name) = harness.get_name().await {
+            footer.set_session_name(name.as_deref());
+        }
         // Only restore when the session actually recorded usage; a fresh or
         // metadata-only session must not overwrite the live counters.
         if restored_input > 0 || restored_output > 0 || restored_cost > 0.0 {

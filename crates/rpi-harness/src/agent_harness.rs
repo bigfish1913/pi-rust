@@ -6749,3 +6749,96 @@ mod unsaved_isolation_tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
+
+#[cfg(test)]
+mod agent_end_log_barrier_tests {
+    use super::*;
+    use rpi_ai::providers::faux::{FauxProvider, FauxScript};
+
+    /// `AgentEnd` is the log-completion barrier for the broadcast: when it is
+    /// forwarded, every message of the finished run — including the final
+    /// assistant message, which the loop emits `MessageEnd` for before
+    /// `run_core` persists it — must already be in the durable log. The probe
+    /// wraps the emitter and inspects the log exactly when `AgentEnd` reaches
+    /// the forwarding point, the same moment the TUI's footer reconciliation
+    /// would read it.
+    struct ProbeBarrierEmitter {
+        inner: Arc<dyn AgentEmitter>,
+        harness: Mutex<Option<AgentHarness>>,
+        seen_final_at_barrier: Arc<Mutex<bool>>,
+    }
+    impl AgentEmitter for ProbeBarrierEmitter {
+        fn emit(&self, event: AgentEvent) -> futures::future::BoxFuture<'static, ()> {
+            if matches!(event, AgentEvent::AgentEnd { .. }) {
+                let harness = self.harness.lock().unwrap().clone();
+                if let Some(harness) = harness {
+                    let entries = futures::executor::block_on(async {
+                        harness
+                            .session()
+                            .view("main")
+                            .find_entries(&crate::session::types::EntryQuery {
+                                order: Some(crate::session::types::EntryOrder::OldestFirst),
+                                ..Default::default()
+                            })
+                            .await
+                            .unwrap_or_default()
+                    });
+                    let has_assistant = entries.iter().any(|entry| {
+                        matches!(
+                            entry,
+                            crate::session::types::Entry::Message(me)
+                                if matches!(me.message, rpi_agent::AgentMessage::Assistant(_))
+                        )
+                    });
+                    *self.seen_final_at_barrier.lock().unwrap() = has_assistant;
+                }
+            }
+            self.inner.emit(event)
+        }
+        fn try_emit(&self, event: AgentEvent) {
+            self.inner.try_emit(event);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_agent_end_is_forwarded_only_after_the_final_turn_is_durable() {
+        let provider: Arc<dyn rpi_ai::Provider> =
+            FauxProvider::new(FauxScript::new().with_text("final reply"));
+        let base_emitter: Arc<dyn AgentEmitter> = Arc::new(rpi_agent::CollectorEmitter::default());
+        let seen_final_at_barrier = Arc::new(Mutex::new(false));
+        let options = AgentHarnessOptions {
+            model: FauxProvider::new(FauxScript::new()).default_model().clone(),
+            models: vec![Arc::clone(&provider)],
+            session: crate::session::session::Session::new(
+                Arc::new(crate::session::memory::InMemorySessionStorage::new(
+                    crate::session::types::SessionMetadata {
+                        id: "log-barrier".into(),
+                        created_at: 0,
+                        parent_session_id: None,
+                    },
+                    Arc::new(crate::session::memory::SystemClock),
+                    Arc::new(crate::session::session::DefaultIdGenerator::new()),
+                )),
+                None,
+            ),
+            ..Default::default()
+        };
+        let harness = AgentHarness::create(options).await.unwrap();
+        let emitter = Arc::new(ProbeBarrierEmitter {
+            inner: base_emitter,
+            harness: Mutex::new(Some(harness.clone())),
+            seen_final_at_barrier: Arc::clone(&seen_final_at_barrier),
+        });
+        harness.set_agent_emitter(Some(emitter)).await.unwrap();
+        let lane = harness.lane("main");
+
+        lane.prompt_text("one prompt", vec![]).await.unwrap();
+
+        assert!(
+            *seen_final_at_barrier.lock().unwrap(),
+            "when AgentEnd is forwarded, the run's final assistant message must \
+             already be in the durable log (the footer reconciles from the log \
+             exactly there)"
+        );
+    }
+}

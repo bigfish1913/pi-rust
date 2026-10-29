@@ -787,7 +787,99 @@ impl SettlingEmitter {
                     emitter.start_tool(&tool_call_id, &tool_name, &args).await;
                 }))
             }
+            AgentEvent::AgentEnd { .. } => {
+                // The final assistant message of a completed or aborted run is
+                // persisted by `run_core` AFTER its `MessageEnd` broadcast, so
+                // the log can still be missing the run's last turn here. Commit
+                // it now, before `AgentEnd` itself is forwarded: every consumer
+                // of the broadcast can then treat `AgentEnd` as the point where
+                // the durable log is complete for this run (the TUI's footer
+                // reconciliation is exactly such a consumer). Same fallback the
+                // injected-delivery path uses, minus an injection to deliver.
+                // `prepare_commit`/`append_provisioned` need await, so this runs
+                // inside the future `emit` polls, not in `handle`.
+                if self.state.uncommitted_assistant.lock().unwrap().is_none() {
+                    return None;
+                }
+                let emitter = Self {
+                    inner: Arc::clone(&self.inner),
+                    recorder: Arc::clone(&self.recorder),
+                    state: Arc::clone(&self.state),
+                    harness: self.harness.clone(),
+                };
+                Some(Box::pin(async move {
+                    emitter.settle_final_assistant().await;
+                }))
+            }
             _ => None,
+        }
+    }
+
+    /// Commit the run's final assistant message before `AgentEnd` is forwarded.
+    /// Called with the lock NOT held: everything here awaits.
+    async fn settle_final_assistant(&self) {
+        let Some((assistant_index, stream_index, assistant)) =
+            self.state.uncommitted_assistant.lock().unwrap().take()
+        else {
+            return;
+        };
+        let already_committed = self
+            .state
+            .committed
+            .lock()
+            .unwrap()
+            .contains(&assistant_index);
+        if already_committed {
+            // The normal settle path beat us to it; only the stream's frames
+            // still need retiring.
+            if let Err(error) = self.recorder.clear_stream(stream_index).await {
+                tracing::warn!(
+                    stream_index,
+                    %error,
+                    "could not retire the final assistant before AgentEnd"
+                );
+            }
+            return;
+        }
+        let assistant_id = self.state.reserve_entry_id(assistant_index, &self.harness);
+        if let Err(error) = self
+            .state
+            .prepare_commit(assistant_index, &assistant_id, &self.harness)
+            .await
+        {
+            // The message stays uncommitted, so `run_core`'s persistence pass
+            // will still write it after the emitter returns.
+            tracing::warn!(%error, "could not bind the final assistant before AgentEnd");
+            return;
+        }
+        let entry = ProvisionedEntry {
+            id: assistant_id.clone(),
+            kind: ProvisionedKind::Message {
+                message: AgentMessage::Assistant(Box::new(assistant)),
+                terminate: None,
+            },
+        };
+        match self.harness.append_provisioned(entry).await {
+            Ok(_) => {
+                self.state.record_commit(assistant_index, &assistant_id);
+            }
+            Err(error) => {
+                // Leave the message for `run_core`'s own persistence pass,
+                // which runs after this emitter returns; the log is then
+                // complete one step later than usual.
+                tracing::warn!(
+                    %error,
+                    "could not commit the final assistant before AgentEnd"
+                );
+                return;
+            }
+        }
+        if let Err(error) = self.recorder.clear_stream(stream_index).await {
+            tracing::warn!(
+                stream_index,
+                %error,
+                "could not retire the final assistant before AgentEnd"
+            );
         }
     }
 }
