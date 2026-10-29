@@ -868,6 +868,7 @@ pub async fn build_prepared(
                     .stream_idle_timeout
                     .map(std::time::Duration::from_secs)
             }),
+            thinking_budgets: saved_settings.thinking_budgets,
             ..Default::default()
         },
         // Settings-backed harness options: upstream lets users tune retry,
