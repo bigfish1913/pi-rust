@@ -1083,8 +1083,20 @@ impl Shell for OsExecutionEnv {
             // the inherited pipes, so reading to EOF waits for a process the
             // command no longer owns. No timeout rescues that: the timeout wraps
             // `child.wait()` and the child already exited successfully.
+            //
+            // The pipes are still read while the child runs: a command that writes
+            // more than the pipe buffer (64 KiB on Linux) blocks until someone
+            // reads, so waiting for the child first would deadlock on any broad
+            // `rg` or build log.
             tokio::pin!(status_fut, stdout_task, stderr_task);
-            let status_res = (&mut status_fut).await;
+            let (mut stdout_done, mut stderr_done) = (false, false);
+            let status_res = loop {
+                tokio::select! {
+                    status = &mut status_fut => break status,
+                    () = &mut stdout_task, if !stdout_done => stdout_done = true,
+                    () = &mut stderr_task, if !stderr_done => stderr_done = true,
+                }
+            };
             // Drain what is already in the pipe — a completed write is already in
             // the pipe buffer, so this is not a race — then stop, without waiting
             // for an EOF that may never come. A command whose own process is gone
@@ -1092,7 +1104,18 @@ impl Shell for OsExecutionEnv {
             let _ = tokio::time::timeout(
                 std::time::Duration::from_millis(EXIT_STDIO_GRACE_MS),
                 async {
-                    let _ = tokio::join!(&mut stdout_task, &mut stderr_task);
+                    tokio::join!(
+                        async {
+                            if !stdout_done {
+                                (&mut stdout_task).await;
+                            }
+                        },
+                        async {
+                            if !stderr_done {
+                                (&mut stderr_task).await;
+                            }
+                        },
+                    );
                 },
             )
             .await;
