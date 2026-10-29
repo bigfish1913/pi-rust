@@ -11,6 +11,20 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.13.0](https://github.com/bigfish1913/pi-rust/compare/v0.12.0...v0.13.0) - 2026-10-29
+
+### Fixed
+
+- *(tui)* keep Windows mouse selections aligned with painted frames ([#166](https://github.com/bigfish1913/pi-rust/pull/166))
+- *(bash)* enforce a default tool execution timeout ([#164](https://github.com/bigfish1913/pi-rust/pull/164))
+- *(cli)* say when the terminal cannot render inline images ([#161](https://github.com/bigfish1913/pi-rust/pull/161))
+- *(cli)* classify session storage failures
+- *(cli)* stop footer counters freezing after dropped events
+- *(harness)* surface session write failures to the user ([#136](https://github.com/bigfish1913/pi-rust/pull/136))
+- *(ai)* redact credentials from stream and image option debug output ([#154](https://github.com/bigfish1913/pi-rust/pull/154))
+- *(bash)* read output while the command runs ([#163](https://github.com/bigfish1913/pi-rust/pull/163))
+- *(tui)* crop kitty images to the viewport ([#158](https://github.com/bigfish1913/pi-rust/pull/158))
+
 ## [0.12.0](https://github.com/bigfish1913/pi-rust/compare/v0.11.1...v0.12.0) - 2026-10-28
 
 ### Fixed
