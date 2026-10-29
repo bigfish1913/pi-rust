@@ -993,17 +993,23 @@ impl TuiAltScreen {
         let root_component: Arc<dyn Component> =
             root.unwrap_or_else(|| Arc::new(self.container.clone()));
 
+        // Reflow changes document row/column identities. Never reinterpret an
+        // old selection against rows wrapped for a different terminal width.
+        // Cancel before rendering so a non-dragged click can restore follow.
+        if self.current_frame.lock().ok().is_some_and(|current| {
+            current
+                .as_ref()
+                .is_some_and(|previous| previous.width != width)
+        }) {
+            self.selection.clear();
+        }
+
         // Render layout frame
         let frame = if reuse_scroll_content {
             render_layout_frame_reusing_scroll_content(root_component.clone(), width, height)
         } else {
             render_layout_frame(root_component.clone(), width, height)
         };
-
-        // Store the frame for input handling
-        if let Ok(mut current) = self.current_frame.lock() {
-            *current = Some(frame.clone());
-        }
 
         // Get screen lines and composite modal overlays above the layout.
         let mut visible = frame.lines.clone();
@@ -1101,6 +1107,12 @@ impl TuiAltScreen {
             terminal.flush();
         }
 
+        // Publish input geometry only after the synchronized frame is written.
+        // Its scroll snapshots must describe the screen the user actually saw,
+        // not a frame still being assembled or an already-mutated live cache.
+        if let Ok(mut current) = self.current_frame.lock() {
+            *current = Some(frame);
+        }
         // Store current screen
         if let Ok(mut prev) = self.previous_screen.lock() {
             *prev = visible;
@@ -1659,6 +1671,75 @@ mod tests {
         let frame = output.lock().unwrap().clone();
         assert!(frame.contains("\x1b[12;1H"), "got: {frame:?}");
         assert_eq!(*tui.painted_size.lock().unwrap(), (60, 12));
+    }
+
+    #[test]
+    fn reflow_clears_old_selection_instead_of_reusing_stale_columns() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let terminal = ResizableTerminal::new(40, 8);
+        let size = terminal.size();
+        let tui = TuiAltScreen::new(Box::new(terminal), false, None);
+        let scroll = Arc::new(ScrollView::simple(Arc::new(Text::new(
+            "prefix TARGET suffix",
+            0,
+            0,
+        ))));
+        tui.set_layout_root(Some(scroll));
+        tui.start_readerless();
+        for (kind, column) in [
+            (MouseEventKind::Down(MouseButton::Left), 7),
+            (MouseEventKind::Drag(MouseButton::Left), 12),
+            (MouseEventKind::Up(MouseButton::Left), 12),
+        ] {
+            tui.handle_selection_mouse_event(&MouseEvent {
+                kind,
+                column,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            });
+        }
+        assert_eq!(tui.selection_text().as_deref(), Some("TARGET"));
+        *size.lock().unwrap() = (30, 8);
+        tui.request_render(false);
+        assert!(tui.selection_text().is_none());
+        assert!(!tui.selection_dragged());
+    }
+
+    #[test]
+    fn reflow_cancels_a_plain_press_without_leaving_follow_paused() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let terminal = ResizableTerminal::new(40, 8);
+        let size = terminal.size();
+        let tui = TuiAltScreen::new(Box::new(terminal), false, None);
+        let text = Arc::new(Text::new(
+            (0..30)
+                .map(|i| format!("row {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            0,
+            0,
+        ));
+        let scroll = Arc::new(ScrollView::primary(text));
+        tui.set_layout_root(Some(scroll.clone()));
+        tui.start_readerless();
+        tui.handle_selection_mouse_event(&MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(!scroll.is_following_end());
+        *size.lock().unwrap() = (30, 12);
+        tui.request_render(false);
+        assert!(scroll.is_following_end());
+        assert_eq!(scroll.scroll_top(), 18);
+        assert!(tui.selection_text().is_none());
+        assert!(!tui.handle_selection_mouse_event(&MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 2,
+            row: 0,
+            modifiers: KeyModifiers::NONE
+        }));
     }
 
     #[test]

@@ -425,6 +425,16 @@ pub(super) async fn run_compact(
     tui.request_render(false);
 }
 
+/// Copy the fullscreen mouse selection, if present. `Some(false)` still
+/// means the selection handled the action: never silently copy another source
+/// when the clipboard write fails. Injection keeps tests off the OS clipboard.
+pub(super) fn copy_mouse_selection_with(
+    tui: &TuiAltScreen,
+    copy: impl FnOnce(&str) -> bool,
+) -> Option<bool> {
+    tui.selection_text().map(|text| copy(&text))
+}
+
 /// `/copy`: copy the last assistant reply to the clipboard. Best-effort —
 /// when no clipboard is available (or the `clipboard` feature is off), prints a
 /// hint instead. Mirrors the TS `/copy` (copies `this.messages.at(-1)` text).

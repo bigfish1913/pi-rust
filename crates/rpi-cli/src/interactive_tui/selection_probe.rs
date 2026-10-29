@@ -159,3 +159,112 @@ fn divergence(after: &str, before: &str) -> usize {
         .count()
         .min(after.len())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rpi_tui::TUI;
+
+    #[test]
+    fn fullscreen_partial_selection_preserves_the_rendered_row() {
+        let probe = Probe::build(
+            "hello world test",
+            "tail",
+            SelectionGeometry {
+                width: 40,
+                rows: 12,
+            },
+        );
+        for (from, to) in [(6, 10), (10, 6)] {
+            probe.mouse(MouseEventKind::Down(MouseButton::Left), from, 0);
+            probe.mouse(MouseEventKind::Drag(MouseButton::Left), to, 0);
+            probe.mouse(MouseEventKind::Up(MouseButton::Left), to, 0);
+            probe.output.lock().unwrap().clear();
+            probe.tui.request_render(true);
+            let output = probe.frame();
+            assert!(
+                output.contains("hello \x1b[7mworld\x1b[27m test"),
+                "{output:?}"
+            );
+            assert_eq!(probe.tui.selection_text().as_deref(), Some("world"));
+        }
+    }
+
+    #[test]
+    fn fullscreen_middle_copy_excludes_prefix_for_plain_cjk_and_wrapped_markdown() {
+        use rpi_tui::{AssistantBlock, AssistantMessageComponent, Component};
+        let geometry = SelectionGeometry {
+            width: 40,
+            rows: 12,
+        };
+        for (source, selected) in [
+            ("ABCDE", "CD"),
+            ("前缀文字，中间选中，后缀文字", "中间选中"),
+            ("PREFIX paragraph before the selected paragraph with enough text to wrap.\n\nbefore `TARGET` after\n\nSUFFIX", "TARGET"),
+        ] {
+            let assistant = Arc::new(AssistantMessageComponent::default());
+            assistant.update_blocks(&[AssistantBlock::Text(source.into())]);
+            let rendered = assistant.render(geometry.width);
+            let (row, line, byte) = rendered.iter().enumerate().find_map(|(row, line)| {
+                let plain = rpi_tui::strip_ansi(line);
+                plain.find(selected).map(|byte| (row, plain, byte))
+            }).expect("selected text is visible on one rendered row");
+            assert!(row < geometry.rows);
+            let first = rpi_tui::visible_width(&line[..byte]) as u16;
+            let last = first + rpi_tui::visible_width(selected) as u16 - 1;
+            for (from, to) in [(first, last), (last, first)] {
+                let probe = Probe::build("", "", geometry);
+                let view = Arc::new(ScrollView::new(assistant.clone(), ScrollViewOptions::default()));
+                probe.tui.set_layout_root(Some(view));
+                probe.tui.request_render(false);
+                probe.mouse(MouseEventKind::Down(MouseButton::Left), from, row as u16);
+                probe.mouse(MouseEventKind::Drag(MouseButton::Left), to, row as u16);
+                probe.mouse(MouseEventKind::Up(MouseButton::Left), to, row as u16);
+                let mut copied = String::new();
+                let result = super::super::copy_mouse_selection_with(&probe.tui, |text| {
+                    copied = text.into();
+                    true
+                });
+                assert_eq!(result, Some(true));
+                assert_eq!(copied, selected, "source={source:?}, drag={from}->{to}");
+            }
+        }
+    }
+
+    #[test]
+    fn fullscreen_manual_copy_uses_mouse_selection_and_failure_stays_handled() {
+        let probe = Probe::build(
+            "hello world test",
+            "last reply",
+            SelectionGeometry {
+                width: 40,
+                rows: 12,
+            },
+        );
+        // Reverse-select from 'd' to 'w', not from the blank after the word.
+        // Mouse release alone leaves a selection; explicit copying must work
+        // independently of the fullscreenCopyOnSelect setting.
+        probe.mouse(MouseEventKind::Down(MouseButton::Left), 10, 0);
+        probe.mouse(MouseEventKind::Drag(MouseButton::Left), 6, 0);
+        probe.mouse(MouseEventKind::Up(MouseButton::Left), 6, 0);
+        let mut copied = String::new();
+        let result = super::super::copy_mouse_selection_with(&probe.tui, |text| {
+            copied = text.to_string();
+            true
+        });
+        assert_eq!(result, Some(true));
+        assert_eq!(copied, "world");
+        let failed = super::super::copy_mouse_selection_with(&probe.tui, |_| false);
+        assert_eq!(
+            failed,
+            Some(false),
+            "failure must not fall through to another source"
+        );
+        assert_eq!(probe.tui.selection_text().as_deref(), Some("world"));
+        probe.tui.clear_selection();
+        assert_eq!(
+            super::super::copy_mouse_selection_with(&probe.tui, |_| panic!("no selection")),
+            None
+        );
+    }
+}

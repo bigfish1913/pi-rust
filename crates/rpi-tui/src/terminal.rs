@@ -14,7 +14,7 @@ use crossterm::{
 use thiserror::Error;
 
 /// Mouse tracking prevents native text selection in macOS terminal emulators.
-/// RPI only consumes wheel events, so keep the platform default selectable.
+/// Preserve that platform default; elsewhere the TUI handles selection and scrolling.
 const fn mouse_tracking_enabled_for(is_macos: bool) -> bool {
     !is_macos
 }
@@ -180,6 +180,8 @@ pub struct ProcessTerminal {
     info: Mutex<TerminalInfo>,
     running: Mutex<bool>,
     writer: Mutex<Box<dyn Write + Send + Sync>>,
+    #[cfg(windows)]
+    mouse_captured: Mutex<bool>,
     #[cfg(any(unix, test))]
     keyboard: Mutex<KeyboardProtocolState>,
 }
@@ -214,6 +216,8 @@ impl ProcessTerminal {
             info: Mutex::new(info),
             running: Mutex::new(false),
             writer: Mutex::new(Box::new(io::stdout())),
+            #[cfg(windows)]
+            mouse_captured: Mutex::new(false),
             #[cfg(any(unix, test))]
             keyboard: Mutex::new(KeyboardProtocolState::default()),
         }
@@ -329,16 +333,62 @@ impl Terminal for ProcessTerminal {
     }
 
     fn enable_mouse(&self) {
+        #[cfg(windows)]
+        {
+            let mut captured = self
+                .mouse_captured
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if !*captured {
+                let mut writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+                match crossterm::execute!(&mut *writer, event::EnableMouseCapture) {
+                    Ok(()) => *captured = true,
+                    Err(error) => tracing::warn!(%error, "Failed to enable mouse capture"),
+                }
+            }
+        }
+        #[cfg(not(windows))]
         // Enable mouse tracking (SGR mode)
         self.write("\x1b[?1000h\x1b[?1002h\x1b[?1006h");
     }
 
     fn disable_mouse(&self) {
+        #[cfg(windows)]
+        {
+            let mut captured = self
+                .mouse_captured
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if *captured {
+                // Crossterm caches the entire input mode on the FIRST capture,
+                // even across later activations. Preserve the current raw-mode
+                // state rather than resurrecting that potentially stale state.
+                let raw = cterm::is_raw_mode_enabled();
+                let mut writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+                match crossterm::execute!(&mut *writer, event::DisableMouseCapture) {
+                    Ok(()) => {
+                        *captured = false;
+                        let restored = match raw {
+                            Ok(true) => cterm::enable_raw_mode(),
+                            Ok(false) => cterm::disable_raw_mode(),
+                            Err(error) => Err(error),
+                        };
+                        if let Err(error) = restored {
+                            tracing::warn!(%error, "Failed to preserve raw mode after mouse capture");
+                        }
+                    }
+                    Err(error) => tracing::warn!(%error, "Failed to disable mouse capture"),
+                }
+            }
+        }
+        #[cfg(not(windows))]
         self.write("\x1b[?1006l\x1b[?1002l\x1b[?1000l");
     }
 
     fn enter_raw_mode(&self) {
-        let _ = cterm::enable_raw_mode();
+        if let Err(error) = cterm::enable_raw_mode() {
+            tracing::warn!(%error, "Failed to enter terminal raw mode");
+        }
         if let Ok(mut running) = self.running.lock() {
             *running = true;
         }
@@ -364,8 +414,14 @@ impl Terminal for ProcessTerminal {
         self.write("\x1b[?2004l");
         #[cfg(unix)]
         self.disable_keyboard_protocol();
+        #[cfg(windows)]
+        self.disable_mouse();
         self.flush();
-        let _ = cterm::disable_raw_mode();
+        // Mouse capture may restore a cached raw input mode. Always restore
+        // the shell's line discipline AFTER disabling capture.
+        if let Err(error) = cterm::disable_raw_mode() {
+            tracing::warn!(%error, "Failed to exit terminal raw mode");
+        }
     }
 
     fn refresh_size(&self) {
@@ -447,8 +503,10 @@ impl Terminal for ProcessTerminal {
         self.disable_keyboard_protocol();
         self.flush();
 
-        // Exit raw mode
-        let _ = cterm::disable_raw_mode();
+        // Exit raw mode only after mouse capture has restored its input mode.
+        if let Err(error) = cterm::disable_raw_mode() {
+            tracing::warn!(%error, "Failed to exit terminal raw mode");
+        }
     }
 
     fn is_tty(&self) -> bool {
@@ -822,6 +880,106 @@ mod tests {
         assert!(submitted.lock().unwrap().is_empty());
         editor.handle_key(normalize_native_shift_enter(enter, false));
         assert_eq!(submitted.lock().unwrap().as_slice(), &["first\nsecond"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_mouse_capture_restores_console_across_repeated_raw_mode_cycles() {
+        use std::os::windows::io::AsRawHandle;
+        use winapi::um::{
+            consoleapi::{GetConsoleMode, SetConsoleMode},
+            wincon::{ENABLE_EXTENDED_FLAGS, ENABLE_MOUSE_INPUT, ENABLE_QUICK_EDIT_MODE},
+        };
+
+        // A redirected test runner may still have CONIN$; test the same real
+        // console crossterm uses, not stdout's TTY status. Never allocate one.
+        let console = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("CONIN$")
+        {
+            Ok(console) => console,
+            Err(error) => {
+                eprintln!("SKIP windows mouse capture: no real console ({error})");
+                return;
+            }
+        };
+        fn mode(console: &std::fs::File) -> io::Result<u32> {
+            let mut mode = 0;
+            if unsafe { GetConsoleMode(console.as_raw_handle().cast(), &mut mode) } == 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(mode)
+            }
+        }
+        let original = match mode(&console) {
+            Ok(mode) => mode,
+            Err(error) => {
+                eprintln!("SKIP windows mouse capture: no console input mode ({error})");
+                return;
+            }
+        };
+        struct RestoreConsole(std::fs::File, u32);
+        impl Drop for RestoreConsole {
+            fn drop(&mut self) {
+                if unsafe { SetConsoleMode(self.0.as_raw_handle().cast(), self.1) } == 0 {
+                    eprintln!(
+                        "Failed to restore test console: {}",
+                        io::Error::last_os_error()
+                    );
+                }
+            }
+        }
+        let restore = RestoreConsole(console, original);
+        let terminal = ProcessTerminal::new();
+        *terminal.writer.lock().unwrap() =
+            Box::new(RecordedOutput(Arc::new(Mutex::new(Vec::new()))));
+        let assert_capture = || {
+            let mode = mode(&restore.0).unwrap();
+            assert_ne!(mode & ENABLE_MOUSE_INPUT, 0);
+            assert_ne!(mode & ENABLE_EXTENDED_FLAGS, 0);
+            assert_eq!(mode & ENABLE_QUICK_EDIT_MODE, 0);
+            assert!(cterm::is_raw_mode_enabled().unwrap());
+            assert!(*terminal.mouse_captured.lock().unwrap());
+        };
+
+        // Disabling before enabling must not ask crossterm to restore an
+        // uninitialized cache or modify the console at all.
+        terminal.disable_mouse();
+        assert_eq!(mode(&restore.0).unwrap(), original);
+        for _ in 0..2 {
+            terminal.enter_raw_mode();
+            terminal.enter_raw_mode();
+            terminal.enable_mouse();
+            assert_capture();
+            terminal.disable_mouse();
+            terminal.disable_mouse();
+            assert!(cterm::is_raw_mode_enabled().unwrap());
+            terminal.enable_mouse();
+            assert_capture();
+            terminal.exit_raw_mode();
+            terminal.exit_raw_mode();
+            assert!(!*terminal.mouse_captured.lock().unwrap());
+            assert!(!cterm::is_raw_mode_enabled().unwrap());
+            terminal.stop();
+            terminal.stop();
+            assert!(!cterm::is_raw_mode_enabled().unwrap());
+        }
+        terminal.enter_raw_mode();
+        assert_capture();
+        terminal.stop();
+        terminal.stop();
+        assert!(!*terminal.mouse_captured.lock().unwrap());
+        assert!(!cterm::is_raw_mode_enabled().unwrap());
+
+        // A capture started outside raw mode must not make a later explicit
+        // disable_mouse unexpectedly leave raw mode.
+        terminal.enable_mouse();
+        terminal.enter_raw_mode();
+        terminal.disable_mouse();
+        assert!(cterm::is_raw_mode_enabled().unwrap());
+        terminal.stop();
+        assert!(!cterm::is_raw_mode_enabled().unwrap());
     }
 
     #[test]

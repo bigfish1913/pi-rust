@@ -76,6 +76,8 @@ pub struct LayoutBox {
     pub layer: usize,
     /// ScrollView reference if this is a scroll view.
     pub scroll_view: Option<Arc<ScrollView>>,
+    /// Immutable scroll content and position captured for this layout frame.
+    pub scroll_snapshot: Option<crate::scroll_view::ScrollSnapshot>,
     /// Scroll content lines (pre-rendered).
     pub scroll_content_lines: Option<Vec<String>>,
 }
@@ -92,6 +94,7 @@ impl LayoutBox {
             line_offset: 0,
             layer: 0,
             scroll_view: None,
+            scroll_snapshot: None,
             scroll_content_lines: None,
         }
     }
@@ -293,6 +296,7 @@ fn layout_component(
         line_offset,
         layer: 0,
         scroll_view: None,
+        scroll_snapshot: None,
         scroll_content_lines: None,
     }
 }
@@ -474,6 +478,7 @@ fn layout_scroll_view(
         line_offset,
         layer: 0,
         scroll_view: Some(sv_arc),
+        scroll_snapshot: sv.snapshot(width),
         scroll_content_lines: None,
     }
 }
@@ -917,9 +922,15 @@ mod scroll_layout_tests {
             "tail visible: {:?}",
             f1.lines[0]
         );
+        let snapshot = f1.root.scroll_snapshot.as_ref().unwrap();
+        assert_eq!(snapshot.scroll_top, 40);
+        assert_eq!(snapshot.content_width, 40);
         // Scroll up, then re-layout: older rows must appear.
         sv.scroll_by(-10);
         let f2 = render_layout_frame(root, 40, 10);
+        assert_eq!(f2.root.scroll_snapshot.as_ref().unwrap().scroll_top, 30);
+        assert_eq!(snapshot.scroll_top, 40);
+        assert!(snapshot.document.lines(40, 1)[0].contains("row 40"));
         assert!(
             f2.lines[0].contains("row 30"),
             "after scroll-up, row 30 top: {:?}",

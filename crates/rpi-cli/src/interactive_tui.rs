@@ -1856,12 +1856,15 @@ pub async fn interactive_tui(
                                 .ok()
                                 .and_then(|s| s.fullscreen_copy_on_select)
                                 .unwrap_or(true);
-                            if auto_copy {
-                                if let Some(selected_text) = tui_for_key.selection_text() {
-                                    if !selected_text.trim().is_empty() {
-                                        let _ = copy_to_clipboard(&selected_text);
-                                    }
-                                }
+                            if auto_copy
+                                && copy_mouse_selection_with(&tui_for_key, copy_to_clipboard)
+                                    == Some(false)
+                            {
+                                add_note_message(
+                                    &state_for_key.chat_container,
+                                    "Clipboard unavailable. Selection kept; press Ctrl+X to retry.",
+                                );
+                                tui_for_key.request_render(false);
                             }
                         }
                     }
@@ -2140,9 +2143,9 @@ pub async fn interactive_tui(
                 continue;
             }
 
-            // 0b. Ctrl+X: upstream's `app.message.copy` — copy the editor
-            //     selection, else the last assistant reply. Native's Ctrl+C no
-            //     longer copies, so selection-copy lives here now.
+            // 0b. Ctrl+X: copy the mouse selection first, then the editor
+            //     selection, else the last assistant reply. Ctrl+C retains its
+            //     clear/exit semantics. A failed write must not change sources.
             if !state_for_key.selector_open()
                 && keybinding_matches(
                     &keybindings_for_key,
@@ -2150,10 +2153,22 @@ pub async fn interactive_tui(
                     rpi_tui::keybindings::keys::MESSAGE_COPY,
                 )
             {
-                if editor_for_key.has_selection() && editor_for_key.copy_selection() {
-                    add_note_message(&state_for_key.chat_container, "Copied!");
-                } else {
-                    copy_last_assistant(&state_for_key, &state_for_key.chat_container);
+                match copy_mouse_selection_with(&tui_for_key, copy_to_clipboard) {
+                    Some(copied) => add_note_message(
+                        &state_for_key.chat_container,
+                        if copied {
+                            "Copied selection to the clipboard."
+                        } else {
+                            "Clipboard unavailable. Selection kept; press Ctrl+X to retry."
+                        },
+                    ),
+                    None => {
+                        if editor_for_key.has_selection() && editor_for_key.copy_selection() {
+                            add_note_message(&state_for_key.chat_container, "Copied!");
+                        } else {
+                            copy_last_assistant(&state_for_key, &state_for_key.chat_container);
+                        }
+                    }
                 }
                 tui_for_key.request_render(false);
                 continue;
