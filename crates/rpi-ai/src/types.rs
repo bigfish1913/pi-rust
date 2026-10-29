@@ -520,6 +520,12 @@ pub struct ThinkingBudgets {
     pub medium: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub high: Option<u64>,
+    /// Used only for models whose `thinkingLevelMap` offers `xhigh`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xhigh: Option<u64>,
+    /// Used only for models whose `thinkingLevelMap` offers `max`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<u64>,
 }
 
 // ----------------------------------------------------------------------------

@@ -650,20 +650,12 @@ fn requires_thinking_as_text(model: &Model) -> bool {
 
 /// The reasoning budget a request with the active thinking level should leave
 /// room for, in tokens. `0` when thinking is off.
-fn thinking_budget(opts: &SimpleStreamOptions) -> u64 {
-    let level = crate::providers::anthropic::build_params::clamp_reasoning(opts.reasoning_level());
-    if level == ThinkingLevel::Off {
-        return 0;
-    }
-    let defaults = crate::providers::anthropic::build_params::default_thinking_budgets();
-    let budgets = opts.thinking_budgets.unwrap_or(defaults);
-    match level {
-        ThinkingLevel::Minimal => budgets.minimal.or(defaults.minimal),
-        ThinkingLevel::Low => budgets.low.or(defaults.low),
-        ThinkingLevel::Medium => budgets.medium.or(defaults.medium),
-        _ => budgets.high.or(defaults.high),
-    }
-    .unwrap_or(0)
+fn thinking_budget(model: &Model, opts: &SimpleStreamOptions) -> u64 {
+    crate::providers::anthropic::build_params::thinking_budget_for_level(
+        model,
+        opts.reasoning_level(),
+        opts.thinking_budgets.as_ref(),
+    )
 }
 
 /// Whether this model's `max_tokens` covers hidden reasoning tokens too.
@@ -692,7 +684,7 @@ fn resolve_max_tokens(model: &Model, opts: &SimpleStreamOptions) -> u64 {
     let Some(pinned) = opts.max_tokens else {
         let base = model.max_tokens;
         return if reasoning_counts_toward_max_tokens(model) {
-            base.saturating_add(thinking_budget(opts))
+            base.saturating_add(thinking_budget(model, opts))
         } else {
             base
         };
