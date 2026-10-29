@@ -500,7 +500,7 @@ impl RuntimeActionHost for HarnessActionHost {
         Ok(serde_json::json!({
             "entries": entries,
             "count": entries.len(),
-            "filtered": request.is_filtered(),
+            "filtered": true,
         }))
     }
 

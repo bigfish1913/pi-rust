@@ -219,6 +219,34 @@ rules the SDK enforces:
 These are not stylistic preferences — violating any of them is undefined
 behaviour at the boundary.
 
+### Preview custom entries with runtime actions
+
+`RuntimeActionId::GetSessionBranch` uses the same preview-only query as RPC
+`get_session_branch`, without the RPC `type`/`id` envelope. For example, pass
+this JSON to the runtime-action SDK call:
+
+```rust
+let args = serde_json::json!({
+    "customTypes": ["durable-state", "other-custom-type"],
+    "afterSeq": 42,
+    "limit": 20,
+    "order": "newestFirst"
+});
+let action = rpi_plugin_sdk::RuntimeActionId::GetSessionBranch;
+// Submit `action` and `args` through the runtime_action slot.
+```
+
+`customTypes` is required and non-empty. The other three fields are optional;
+order defaults to `oldestFirst`. `afterSeq` is exclusive in the selected order:
+`seq > afterSeq` for `oldestFirst`, `seq < afterSeq` for `newestFirst`.
+Entries must be on the selected branch and match a requested custom
+type; ordering and limit apply globally across those types. The result is
+`{"entries":[...],"count":N,"filtered":true}`.
+
+Empty `{}`, unknown keys, and retired `customType`, `custom_type`, `custom_types`,
+or `after_seq` query keys fail explicitly, including mixed old/new requests.
+This does **not** change `AppendEntry`'s singular `customType` write argument.
+
 ## Compatibility
 
 The host loader only resolves `rpi_plugin_register`, exported with

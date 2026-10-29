@@ -128,6 +128,29 @@ For building your own agent, depend on
 [`rpi-harness`](https://crates.io/crates/rpi-harness) directly instead — see
 [docs/agent/project-structure.md](https://github.com/bigfish1913/pi-rust/blob/main/docs/agent/project-structure.md).
 
+## Branch preview queries (RPC and runtime actions)
+
+`get_session_branch` is a preview-only custom-entry query, not an unfiltered
+transcript export. RPC example:
+
+```json
+{"id":"preview-1","type":"get_session_branch","customTypes":["durable-state","other-custom-type"],"afterSeq":42,"limit":20,"order":"newestFirst"}
+```
+
+`customTypes` is required and must be a non-empty array of non-empty strings.
+Only `afterSeq` (non-negative integer), `limit` (positive integer), and `order`
+(`oldestFirst`, the default, or `newestFirst`) are optional query arguments.
+The cursor is exclusive in the selected order: `seq > afterSeq` for
+`oldestFirst`, `seq < afterSeq` for `newestFirst`. Type filtering and
+branch ancestry apply before global ordering and limit across all requested
+types. Results are `{"entries":[...],"count":N,"filtered":true}`.
+
+Runtime action `GetSessionBranch` accepts the same query, without RPC's `type`
+and `id` envelope. Both surfaces reject `{}`, unknown fields, and the retired
+query keys `customType`, `custom_type`, `custom_types`, and `after_seq`, even
+when mixed with valid modern keys. This preview contract has no alias fallback.
+`append_entry` / `AppendEntry` still use singular `customType` for writes.
+
 ## Documentation
 
 - User guide: <https://rpi.bigfisharc.cn/docs.html>

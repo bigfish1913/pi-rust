@@ -1146,7 +1146,14 @@ async fn rpc_get_session_branch(
     harness: &AgentHarness,
     msg: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let request = branch_entry_query(msg)?;
+    // Envelope fields are not query arguments. Everything else is validated by
+    // the same strict parser used by the runtime action.
+    let mut args = msg.clone();
+    if let Some(args) = args.as_object_mut() {
+        args.remove("type");
+        args.remove("id");
+    }
+    let request = branch_entry_query(&args)?;
     let entries = find_branch_entries(harness, &request).await?;
     let entries = entries
         .iter()
@@ -1155,34 +1162,28 @@ async fn rpc_get_session_branch(
     Ok(serde_json::json!({
         "entries": entries,
         "count": entries.len(),
-        "filtered": request.is_filtered(),
+        "filtered": true,
     }))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BranchEntryQuery {
-    pub custom_types: Option<Vec<String>>,
+    pub custom_types: Vec<String>,
     pub order: EntryOrder,
     pub limit: Option<usize>,
     pub after_seq: Option<u64>,
 }
 
 impl BranchEntryQuery {
-    pub(crate) fn is_filtered(&self) -> bool {
-        self.custom_types.is_some() || self.limit.is_some() || self.after_seq.is_some()
-    }
-
     fn entry_queries(&self) -> Vec<EntryQuery> {
-        let type_names: Vec<Option<&String>> = match self.custom_types.as_ref() {
-            Some(types) => types.iter().map(Some).collect(),
-            None => vec![None],
-        };
-        let per_query_limit = (type_names.len() <= 1).then_some(self.limit).flatten();
-        type_names
-            .into_iter()
+        let per_query_limit = (self.custom_types.len() == 1)
+            .then_some(self.limit)
+            .flatten();
+        self.custom_types
+            .iter()
             .map(|custom_type| EntryQuery {
-                entry_type: None,
-                custom_type: custom_type.cloned(),
+                entry_type: Some("custom"),
+                custom_type: Some(custom_type.clone()),
                 order: Some(self.order),
                 limit: per_query_limit,
                 cursor: self.after_seq.map(|after_seq| EntryCursor { after_seq }),
@@ -1195,20 +1196,35 @@ pub(crate) async fn find_branch_entries(
     harness: &AgentHarness,
     request: &BranchEntryQuery,
 ) -> Result<Vec<Entry>, String> {
+    // Pin both the storage binding and branch tip once. Session handles follow
+    // harness session switches, and resolving the live leaf per type can merge
+    // entries from different branches while a query is in flight.
+    let storage = harness.session().storage();
+    let leaf_id = storage
+        .get_lanes()
+        .await
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|pointer| pointer.lane == "main")
+        .ok_or_else(|| "Lane not found: main".to_string())?
+        .leaf_id;
+    let Some(start) = leaf_id else {
+        return Ok(Vec::new());
+    };
+    let bounds = BranchBounds {
+        start: Some(start.clone()),
+        ..Default::default()
+    };
     let mut entries = Vec::new();
     for query in request.entry_queries() {
         entries.extend(
-            harness
-                .find_entries_on_branch(&query, &BranchBounds::default())
+            storage
+                .find_entries_on_branch(&query, &bounds, &start)
                 .await
                 .map_err(|error| error.to_string())?,
         );
     }
-    if request
-        .custom_types
-        .as_ref()
-        .is_some_and(|types| types.len() > 1)
-    {
+    if request.custom_types.len() > 1 {
         let mut seen = HashSet::with_capacity(entries.len());
         entries.retain(|entry| seen.insert(entry.id().to_owned()));
         match request.order {
@@ -1222,49 +1238,37 @@ pub(crate) async fn find_branch_entries(
     Ok(entries)
 }
 
-/// Optional filters keep `get_session_branch` proportional to what the caller
-/// needs. Without them the whole transcript is serialized.
+/// Preview-only custom-entry query. Reject unknown/legacy arguments even when
+/// valid modern arguments are also present; never fall back to a full scan.
 pub(crate) fn branch_entry_query(msg: &serde_json::Value) -> Result<BranchEntryQuery, String> {
-    let custom_type = ["customType", "custom_type"]
-        .iter()
-        .find_map(|key| msg.get(*key));
-    let custom_types = ["customTypes", "custom_types"]
-        .iter()
-        .find_map(|key| msg.get(*key));
-    if custom_type.is_some() && custom_types.is_some() {
-        return Err(
-            "get_session_branch: use either `customType` or `customTypes`, not both".into(),
-        );
+    let args = msg
+        .as_object()
+        .ok_or("get_session_branch: query must be an object")?;
+    for key in args.keys() {
+        if !matches!(key.as_str(), "customTypes" | "afterSeq" | "limit" | "order") {
+            return Err(format!(
+                "get_session_branch: unknown query argument `{key}`"
+            ));
+        }
     }
-    let custom_types = if let Some(value) = custom_types {
-        let values = value
-            .as_array()
-            .ok_or("get_session_branch: `customTypes` must be a non-empty string array")?;
-        if values.is_empty() {
-            return Err("get_session_branch: `customTypes` must not be empty".into());
-        }
-        let mut types = Vec::with_capacity(values.len());
-        for value in values {
-            let custom_type = value
-                .as_str()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or("get_session_branch: every `customTypes` item must be a non-empty string")?;
-            if !types.iter().any(|existing| existing == custom_type) {
-                types.push(custom_type.to_owned());
-            }
-        }
-        Some(types)
-    } else if let Some(value) = custom_type {
+    let values = args
+        .get("customTypes")
+        .and_then(serde_json::Value::as_array)
+        .filter(|values| !values.is_empty())
+        .ok_or(
+            "get_session_branch: `customTypes` is required and must be a non-empty string array",
+        )?;
+    let mut custom_types = Vec::with_capacity(values.len());
+    for value in values {
         let custom_type = value
             .as_str()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .ok_or("get_session_branch: `customType` must be a non-empty string")?;
-        Some(vec![custom_type.to_owned()])
-    } else {
-        None
-    };
+            .ok_or("get_session_branch: every `customTypes` item must be a non-empty string")?;
+        if !custom_types.iter().any(|existing| existing == custom_type) {
+            custom_types.push(custom_type.to_owned());
+        }
+    }
     let limit = match msg.get("limit") {
         None | Some(serde_json::Value::Null) => None,
         Some(value) => {
@@ -1275,18 +1279,15 @@ pub(crate) fn branch_entry_query(msg: &serde_json::Value) -> Result<BranchEntryQ
             Some(usize::try_from(limit).map_err(|_| "get_session_branch: `limit` is too large")?)
         }
     };
-    let order = match msg.get("order").and_then(serde_json::Value::as_str) {
+    let order = match msg.get("order") {
         None => EntryOrder::OldestFirst,
-        Some(value) if value.eq_ignore_ascii_case("oldestFirst") => EntryOrder::OldestFirst,
-        Some(value) if value.eq_ignore_ascii_case("newestFirst") => EntryOrder::NewestFirst,
+        Some(serde_json::Value::String(value)) if value == "oldestFirst" => EntryOrder::OldestFirst,
+        Some(serde_json::Value::String(value)) if value == "newestFirst" => EntryOrder::NewestFirst,
         Some(_) => {
             return Err("get_session_branch: `order` must be oldestFirst or newestFirst".into())
         }
     };
-    let after_seq = match ["afterSeq", "after_seq"]
-        .iter()
-        .find_map(|key| msg.get(*key))
-    {
+    let after_seq = match msg.get("afterSeq") {
         None | Some(serde_json::Value::Null) => None,
         Some(value) => Some(
             value
@@ -2201,50 +2202,266 @@ mod tests {
     use rpi_harness::session::types::OperationError;
 
     #[test]
-    fn session_branch_query_defaults_to_the_full_branch_and_accepts_filters() {
-        let all = branch_entry_query(&serde_json::json!({})).unwrap();
-        assert_eq!(all.custom_types, None);
-        assert_eq!(all.limit, None);
-        assert_eq!(all.order, EntryOrder::OldestFirst);
-
-        let newest = branch_entry_query(&serde_json::json!({
-            "customType": "rpi-durable",
-            "limit": 1,
-            "order": "newestFirst",
+    fn session_branch_query_requires_modern_preview_arguments() {
+        let query = branch_entry_query(&serde_json::json!({
+            "customTypes": ["alpha", "beta", "alpha"], "afterSeq": 42,
         }))
         .unwrap();
-        assert_eq!(
-            newest.custom_types.as_deref(),
-            Some(["rpi-durable".to_owned()].as_slice())
-        );
-        assert_eq!(newest.limit, Some(1));
-        assert_eq!(newest.order, EntryOrder::NewestFirst);
+        assert_eq!(query.custom_types, ["alpha", "beta"]);
+        assert_eq!(query.order, EntryOrder::OldestFirst);
+        assert_eq!(query.after_seq, Some(42));
+        assert!(query.entry_queries().iter().all(|q| q.limit.is_none()));
+        for invalid in [
+            serde_json::json!({}),
+            serde_json::json!(null),
+            serde_json::json!([]),
+            serde_json::json!({"customTypes": []}),
+            serde_json::json!({"customTypes": "alpha"}),
+            serde_json::json!({"customTypes": [""]}),
+            serde_json::json!({"customTypes": ["alpha", 1]}),
+            serde_json::json!({"customTypes": ["alpha"], "limit": 0}),
+            serde_json::json!({"customTypes": ["alpha"], "limit": 1.5}),
+            serde_json::json!({"customTypes": ["alpha"], "order": "sideways"}),
+            serde_json::json!({"customTypes": ["alpha"], "order": 1}),
+            serde_json::json!({"customTypes": ["alpha"], "afterSeq": -1}),
+        ] {
+            assert!(branch_entry_query(&invalid).is_err(), "{invalid}");
+        }
+    }
 
-        let multiple = branch_entry_query(&serde_json::json!({
-            "customTypes": ["durable-state", "rpi-durable-runtime", "durable-state"],
-            "afterSeq": 42,
-        }))
+    #[tokio::test]
+    async fn session_branch_preview_filters_merges_and_respects_fork_bounds() {
+        use rpi_harness::session::types::{ForkOptions, ForkPosition, SessionRepo};
+        use rpi_harness::session::{CounterIdGenerator, FakeClock, InMemorySessionRepo, Session};
+        let repo = InMemorySessionRepo::new(
+            Arc::new(FakeClock::new()),
+            Arc::new(CounterIdGenerator::new()),
+        );
+        let storage = repo.create(&Default::default()).await.unwrap();
+        let session = Session::new(Arc::new(storage), None);
+        let harness = AgentHarness::create(rpi_harness::types::AgentHarnessOptions {
+            session,
+            ..Default::default()
+        })
+        .await
         .unwrap();
+        let session = harness.session();
+        let empty = rpc_get_session_branch(
+            &harness,
+            &serde_json::json!({"customTypes":["alpha","beta"]}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(empty["entries"], serde_json::json!([]));
+        assert_eq!(empty["filtered"], true);
+        let mut ids = Vec::new();
+        let mut fork_target = None;
+        for (index, kind) in ["alpha", "noise", "beta", "alpha", "noise", "beta"]
+            .into_iter()
+            .enumerate()
+        {
+            if index == 2 {
+                fork_target = Some(
+                    session
+                        .append_message(rpi_agent::AgentMessage::User(UserMessage::new(
+                            "fork target",
+                            0,
+                        )))
+                        .await
+                        .unwrap(),
+                );
+            }
+            ids.push(session.append_custom_entry(kind, None).await.unwrap());
+        }
+        // Neither ordinary messages nor durable lane records are custom entries.
+        session
+            .append_message(rpi_agent::AgentMessage::User(UserMessage::new("noise", 0)))
+            .await
+            .unwrap();
+        session
+            .append_record(
+                serde_json::from_value(serde_json::json!({
+                    "type":"usage", "id":"usage-noise", "seq":0, "timestamp":0,
+                    "lane":"main", "usage":Usage::zero(), "cause":"adjustment"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let run = |args| {
+            let harness = &harness;
+            async move { rpc_get_session_branch(harness, &args).await.unwrap() }
+        };
+        let all = run(serde_json::json!({"customTypes":["alpha","beta","alpha"]})).await;
+        let entry_ids = |value: &serde_json::Value| -> Vec<String> {
+            value["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["id"].as_str().unwrap().to_owned())
+                .collect()
+        };
         assert_eq!(
-            multiple.custom_types.as_deref(),
-            Some(["durable-state".to_owned(), "rpi-durable-runtime".to_owned()].as_slice())
+            entry_ids(&all),
+            vec![
+                ids[0].clone(),
+                ids[2].clone(),
+                ids[3].clone(),
+                ids[5].clone()
+            ]
         );
-        assert_eq!(multiple.after_seq, Some(42));
-        assert_eq!(multiple.entry_queries().len(), 2);
-        assert!(multiple
-            .entry_queries()
-            .iter()
-            .all(|query| query.limit.is_none()));
+        assert_eq!(all["count"], 4);
+        assert_eq!(all["filtered"], true);
+        let cursor = all["entries"][1]["seq"].as_u64().unwrap();
+        for (order, expected) in [
+            (
+                "oldestFirst",
+                vec![ids[0].clone(), ids[2].clone(), ids[3].clone()],
+            ),
+            (
+                "newestFirst",
+                vec![ids[5].clone(), ids[3].clone(), ids[2].clone()],
+            ),
+        ] {
+            let result =
+                run(serde_json::json!({"customTypes":["alpha","beta"], "order":order, "limit":3}))
+                    .await;
+            assert_eq!(entry_ids(&result), expected);
+            let result = run(serde_json::json!({"customTypes":["alpha","beta"], "order":order, "afterSeq":cursor, "limit":1})).await;
+            assert_eq!(
+                entry_ids(&result),
+                vec![if order == "oldestFirst" {
+                    ids[3].clone()
+                } else {
+                    ids[0].clone()
+                }]
+            );
+        }
+        let single = run(serde_json::json!({"customTypes":["beta"], "afterSeq":all["entries"][3]["seq"], "order":"newestFirst", "limit":1})).await;
+        assert_eq!(entry_ids(&single), vec![ids[2].clone()]);
 
-        assert!(branch_entry_query(&serde_json::json!({
-            "customType": "durable-state",
-            "customTypes": ["rpi-durable-runtime"],
-        }))
-        .is_err());
-        assert!(branch_entry_query(&serde_json::json!({"customTypes": []})).is_err());
-        assert!(branch_entry_query(&serde_json::json!({"limit": 0})).is_err());
-        assert!(branch_entry_query(&serde_json::json!({"order": "sideways"})).is_err());
-        assert!(branch_entry_query(&serde_json::json!({"afterSeq": -1})).is_err());
+        // Rewind and append: old descendants and other lanes must not leak in.
+        session.move_lane("main", Some(&ids[2])).await.unwrap();
+        let branch_tip = session.append_custom_entry("alpha", None).await.unwrap();
+        session.create_lane("other", Some(&ids[5])).await.unwrap();
+        let branch = run(serde_json::json!({"customTypes":["alpha","beta"]})).await;
+        assert_eq!(
+            entry_ids(&branch),
+            vec![ids[0].clone(), ids[2].clone(), branch_tip]
+        );
+        let empty =
+            run(serde_json::json!({"customTypes":["alpha","beta"], "afterSeq":u64::MAX - 1})).await;
+        assert!(entry_ids(&empty).is_empty());
+
+        // Fork before the message preceding beta; custom entries remain covered.
+        let fork = repo
+            .fork(
+                &session.storage().metadata(),
+                &Default::default(),
+                &ForkOptions::Branch {
+                    entry_id: fork_target,
+                    position: Some(ForkPosition::Before),
+                },
+            )
+            .await
+            .unwrap();
+        harness
+            .set_session(Session::new(Arc::new(fork), None))
+            .await
+            .unwrap();
+        let forked = run(
+            serde_json::json!({"customTypes":["alpha","beta"], "order":"newestFirst", "limit":2}),
+        )
+        .await;
+        assert_eq!(entry_ids(&forked), vec![ids[0].clone()]);
+    }
+
+    #[tokio::test]
+    async fn session_branch_rpc_and_action_share_strict_query_behavior() {
+        use rpi_extensions::RuntimeActionHost;
+        let harness = AgentHarness::create(Default::default()).await.unwrap();
+        let (host, cell) = crate::extensions_actions::HarnessActionHost::new_empty(
+            vec![],
+            std::env::temp_dir(),
+            tokio::runtime::Handle::current(),
+            Default::default(),
+            rpi_extensions::ToolCallContext::default(),
+        );
+        crate::extensions_actions::HarnessActionHost::set_harness(&cell, Arc::new(harness.clone()));
+        // AppendEntry deliberately keeps its distinct singular write protocol.
+        host.append_entry(serde_json::json!({"customType":"alpha", "data":{"n":1}}))
+            .await
+            .unwrap();
+        rpc_append_entry(
+            &harness,
+            &serde_json::json!({"customType":"beta", "data":{"n":2}}),
+        )
+        .await
+        .unwrap();
+        let valid =
+            serde_json::json!({"customTypes":["alpha","beta"], "limit":1, "order":"newestFirst"});
+        let expected = host.get_session_branch(valid.clone()).await.unwrap();
+        assert_eq!(expected["entries"][0]["customType"], "beta");
+        let mut requests = vec![serde_json::json!({})];
+        for key in [
+            "customType",
+            "custom_type",
+            "custom_types",
+            "after_seq",
+            "unknown",
+        ] {
+            let value = if key == "after_seq" {
+                serde_json::json!(0)
+            } else {
+                serde_json::json!("alpha")
+            };
+            requests.push(serde_json::json!({key:value.clone()}));
+            let mut mixed = valid.clone();
+            mixed[key] = value;
+            requests.push(mixed);
+        }
+        let mut input = String::new();
+        let mut envelope = valid;
+        envelope["type"] = serde_json::json!("get_session_branch");
+        envelope["id"] = serde_json::json!("modern");
+        input.push_str(&format!("{envelope}\n"));
+        for (index, args) in requests.iter().enumerate() {
+            let error = host.get_session_branch(args.clone()).await.unwrap_err();
+            assert!(error.contains("get_session_branch"), "{error}");
+            let mut envelope = args.clone();
+            envelope["type"] = serde_json::json!("get_session_branch");
+            envelope["id"] = serde_json::json!(index);
+            assert_eq!(
+                rpc_get_session_branch(&harness, &envelope)
+                    .await
+                    .unwrap_err(),
+                error
+            );
+            input.push_str(&format!("{envelope}\n"));
+        }
+        let output = RpcOutput::default();
+        assert_eq!(
+            rpc_with_io(
+                &harness,
+                None,
+                vec![],
+                rpi_extensions::UiDialogMailbox::new(),
+                None,
+                tokio::io::BufReader::new(input.as_bytes()),
+                output.clone(),
+            )
+            .await,
+            0
+        );
+        let messages = output.messages();
+        assert_eq!(
+            messages.iter().find(|m| m["id"] == "modern").unwrap()["data"],
+            expected
+        );
+        for index in 0..requests.len() {
+            let response = messages.iter().find(|m| m["id"] == index).unwrap();
+            assert_eq!(response["success"], false, "{response}");
+        }
     }
 
     #[tokio::test]

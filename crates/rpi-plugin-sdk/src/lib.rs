@@ -1092,8 +1092,17 @@ pub enum RuntimeActionId {
     /// `{"ok":true,"chars":N}`. A headless host has no editor and accepts the
     /// write without rendering it, mirroring [`RuntimeActionId::SetStatus`].
     SetEditorText = 19,
-    /// Return the current session branch entries oldest-first as JSON.
-    /// Args: `{}`; result: `{"entries":[...]}`.
+    /// Preview custom entries on the current main branch. Args:
+    /// `{"customTypes":["durable-state","other-custom-type"],"afterSeq":42,
+    /// "limit":20,"order":"newestFirst"}`. `customTypes` is required and
+    /// non-empty; the other fields are optional. Default order: `oldestFirst`.
+    /// `afterSeq` is exclusive: `seq > afterSeq` for oldestFirst, `seq < afterSeq`
+    /// for newestFirst. Ordering and
+    /// limit apply globally across types, within the selected branch only.
+    /// Result: `{"entries":[...],"count":N,"filtered":true}`. Empty `{}`,
+    /// unknown keys and legacy `customType`/`custom_type`/`custom_types`/
+    /// `after_seq` query arguments are errors, including mixed old/new requests.
+    /// This does not change AppendEntry's singular `customType` write argument.
     GetSessionBranch = 20,
     /// Inspect or finish a plugin-owned stdio server lifecycle. Args:
     /// `{"op":"status"}` or `{"op":"finish","exitCode":0}`. Only the
