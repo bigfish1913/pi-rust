@@ -114,7 +114,11 @@ pub async fn print(
                                 }
                             }
                         }
-                        eprintln!("run failed: {error:?}");
+                        if error.code == "SessionStorage" {
+                            eprintln!("{}", session_storage_notice(&error.message));
+                        } else {
+                            eprintln!("run failed: {error:?}");
+                        }
                     }
                     HarnessRunOutcome::Suspended { .. } => {
                         eprintln!("run suspended (deferred) — resume is not supported in v1");
@@ -2058,6 +2062,19 @@ async fn run_one(
     }
 }
 
+/// The print-mode (headless) message for a refused session write.
+///
+/// Print mode has no transcript to fall back on and no interactive `/export`
+/// either — the process is about to exit. Naming a recovery the user cannot run
+/// from here would be worse than saying what was lost, so this deliberately does
+/// not recommend exporting (unlike the TUI, where `/export` does work).
+fn session_storage_notice(message: &str) -> String {
+    format!(
+        "conversation not saved: {message} — the session log is missing this turn \
+         and print mode exits without writing it"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2940,5 +2957,27 @@ mod page_window_tests {
     fn limit_larger_than_the_branch_never_underflows() {
         assert_eq!(page_window(5, 100, Some(2)), (0..2, false));
         assert_eq!(page_window(5, 100, None), (0..5, false));
+    }
+}
+
+#[cfg(test)]
+mod session_storage_notice_tests {
+    use super::session_storage_notice;
+
+    /// Print mode cannot recover a refused write by exporting: it is about to
+    /// exit and offers no interactive `/export`. The message must say what was
+    /// lost instead of naming a recovery the user cannot run from here.
+    #[test]
+    fn the_headless_notice_does_not_promise_an_unavailable_recourse() {
+        let notice = session_storage_notice("disk full");
+        assert!(notice.contains("disk full"), "{notice}");
+        assert!(
+            !notice.contains("/export"),
+            "print mode has no interactive /export: {notice}"
+        );
+        assert!(
+            notice.contains("print mode exits"),
+            "the notice must say the turn is not coming back: {notice}"
+        );
     }
 }

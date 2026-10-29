@@ -1224,3 +1224,46 @@ impl rpi_agent::AgentTool for BannerProbeTool {
         Ok(rpi_agent::types::AgentToolResult::text("probe"))
     }
 }
+
+/// The TUI tells the user to `/export` a refused session write. That advice is
+/// only honest if the export really carries the refused message, so this pins the
+/// claim the guidance makes rather than just its wording: it drives the
+/// production export and asserts the file contains the unsaved text.
+#[tokio::test]
+async fn review_the_export_advice_recovers_the_unsaved_message() {
+    use rpi_ai::types::UserContent;
+
+    let harness = AgentHarness::create(Default::default()).await.unwrap();
+    let text = "only on screen";
+    let refused = rpi_harness::messages::create_custom_message(
+        "probe",
+        UserContent::Text(text.into()),
+        true,
+        None,
+        0,
+    );
+    harness.keep_unsaved_message_for_test("a message you sent", refused);
+    assert_eq!(
+        harness.unsaved_messages().len(),
+        1,
+        "precondition: the harness retained the refused message"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("export.md");
+    crate::export::export_session(&harness, crate::export::ExportFormat::Markdown, &out)
+        .await
+        .unwrap();
+    let written = std::fs::read_to_string(&out).unwrap();
+    assert!(
+        written.contains(text),
+        "/export must write the refused message it recommends exporting: {written}"
+    );
+
+    // The other half of the promise: the guidance must actually name `/export`,
+    // otherwise the recovery it describes is undiscoverable.
+    let notice = tui_session_storage_notice(&rpi_harness::result::HarnessError::session_storage(
+        "disk full",
+    ));
+    assert!(notice.contains("/export"), "{notice}");
+}
