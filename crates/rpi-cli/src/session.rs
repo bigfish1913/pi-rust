@@ -2084,7 +2084,7 @@ pub fn bash_options() -> rpi_tools::tools::bash::BashToolOptions {
     let default = std::env::var("RPI_BASH_TIMEOUT")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(120.0);
+        .unwrap_or(rpi_tools::tools::bash::DEFAULT_BASH_TIMEOUT_SECONDS);
     // Saved user defaults, matching how `defaultTools` is read in `build_tools`.
     // `shellCommandPrefix` is prepended to every command (upstream's key for
     // alias/`shopt` setup). Native's `shellPath` is *not* wired: neither
