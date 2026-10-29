@@ -6021,6 +6021,10 @@ mod queue_tests {
 fn session_to_harness_err(e: SessionError) -> HarnessError {
     match e.code {
         SessionErrorCode::InvalidLane => HarnessError::invalid_lane("main", "session", e.message),
+        // The backend refused the write. Kept distinct from `Io` so the host can
+        // tell the user to export their transcript instead of retrying a request
+        // that was never the problem.
+        SessionErrorCode::Storage => HarnessError::session_storage(e.message),
         _ => HarnessError::io(e.message),
     }
 }
@@ -6280,6 +6284,47 @@ mod session_switch_tests {
             );
         }
         assert_eq!(harness.take_write_failures().len(), MAX_WRITE_FAILURES);
+    }
+
+    /// A refused write must not masquerade as a provider failure.
+    ///
+    /// Both used to collapse into `HarnessError::Io`, so the UI printed a model
+    /// error for a full disk. The user's next action differs: retry a request
+    /// versus export the transcript. The distinction is carried by the error tag
+    /// (and by the `SessionStorage` code on a failed run outcome).
+    #[test]
+    fn a_storage_error_keeps_its_own_tag() {
+        let storage = crate::error::SessionError::storage("disk full");
+        let mapped = session_to_harness_err(storage);
+        assert_eq!(mapped.tag(), crate::result::HarnessErrorTag::SessionStorage);
+
+        // The neighbouring codes keep their existing mapping, so this cannot be
+        // passing merely because every session error now reports the same tag.
+        let not_found = crate::error::SessionError::new(
+            crate::error::SessionErrorCode::NotFound,
+            "no such entry",
+        );
+        assert_eq!(
+            session_to_harness_err(not_found).tag(),
+            crate::result::HarnessErrorTag::Io
+        );
+    }
+
+    /// The tag must survive to the string the run outcome carries.
+    ///
+    /// `HarnessRunOutcome::Failed` carries `OperationError { code, message }`, and
+    /// the TUI/print paths branch on `code`. If the constructors disagreed, the UI
+    /// would key on a value the harness never produces.
+    #[test]
+    fn the_storage_tag_has_a_stable_wire_name() {
+        assert_eq!(
+            crate::result::HarnessErrorTag::SessionStorage.as_str(),
+            "SessionStorage"
+        );
+        assert_eq!(
+            HarnessError::session_storage("disk full").tag().as_str(),
+            "SessionStorage"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

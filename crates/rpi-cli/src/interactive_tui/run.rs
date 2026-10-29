@@ -149,6 +149,21 @@ pub(super) fn reconcile_streamed_assistant_completion(
 /// `AgentEvent` drain task renders the response live and the completed outcome
 /// reconciles its final snapshot. When false (no `event_rx`), this falls back
 /// to the blocking await-final-text path.
+/// The TUI message for a refused session write.
+///
+/// Refusing to save is not a provider problem: retrying fails the same way, and
+/// the messages on screen are the only copy. The advice is accurate because
+/// `export_session` appends `AgentHarness::unsaved_messages` to the file — a
+/// refused append never becomes a session entry, so an export that read only the
+/// log would silently drop exactly the turns this warning is about.
+pub(super) fn tui_session_storage_notice(error: &rpi_harness::result::HarnessError) -> String {
+    format!(
+        "The conversation could not be saved: {error}. Your messages are still on \
+         screen, and /export writes the unsaved ones into the exported file — do \
+         that before exiting."
+    )
+}
+
 pub(super) async fn run_prompt_streaming(
     lane: &Arc<dyn AgentLane>,
     prompt: &str,
@@ -293,7 +308,13 @@ pub(super) async fn run_prompt_streaming(
             }
         },
         Err(e) => {
-            add_error_message(&state.chat_container, &e.to_string());
+            // A refused session write is not a provider problem: retrying will fail
+            // the same way, and the transcript on screen is the only copy left.
+            if e.tag() == rpi_harness::result::HarnessErrorTag::SessionStorage {
+                add_error_message(&state.chat_container, &tui_session_storage_notice(&e));
+            } else {
+                add_error_message(&state.chat_container, &e.to_string());
+            }
         }
     }
 
