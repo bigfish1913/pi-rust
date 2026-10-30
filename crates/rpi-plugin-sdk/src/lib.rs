@@ -649,7 +649,21 @@ pub enum EventTag {
     AgentStart = 16,
     AgentEnd = 17,
     AgentSettled = 18,
+    /// Start of one assistant turn (a model request plus the tool calls it
+    /// asked for). Payload-free.
     TurnStart = 19,
+    /// End of one assistant turn, carrying a JSON `data` payload:
+    /// `{"outcome":"stop"|"aborted"|"error", "stopReason":"<raw>",
+    /// "turnIndex":N, "toolResultCount":N}`.
+    ///
+    /// `outcome` is the normalized value to branch on: `stop` covers a normal
+    /// stop, a tool-use continuation and a token-ceiling truncation; `aborted`
+    /// means the run was cancelled; `error` covers every other termination.
+    ///
+    /// ABI note: hosts before this payload existed sent `turn_end` with an
+    /// **empty** payload. Read it via `EventView::data_text()`, which returns
+    /// `None` for an empty payload, so a consumer handles both hosts without a
+    /// version probe.
     TurnEnd = 20,
     MessageStart = 21,
     MessageUpdate = 22,

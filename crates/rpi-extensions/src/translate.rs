@@ -52,11 +52,57 @@ fn message_to_stb(message: &rpi_agent::message::AgentMessage) -> StbString {
     StbString::from_string(text)
 }
 
+/// Normalize an assistant `StopReason` into the two-value `outcome` a plugin
+/// consumer branches on (`stop` vs `error`).
+///
+/// `stop`, `toolUse` and `length` are all *successful* terminations of a turn:
+/// the model stopped on its own, is waiting for a tool round, or hit the token
+/// ceiling. Everything else means the turn did not finish normally.
+///
+/// `aborted` is reported as its own value rather than folded into `error`: a
+/// host UI that only has `stop`/`error` cannot distinguish "the user pressed
+/// stop" from "the provider failed", and those need different affordances
+/// (no retry vs retry). Consumers that only care about success/failure should
+/// treat `aborted` as a non-`stop` outcome.
+fn turn_outcome(stop_reason: rpi_ai::types::StopReason) -> &'static str {
+    use rpi_ai::types::StopReason;
+    match stop_reason {
+        StopReason::Stop | StopReason::ToolUse | StopReason::Length => "stop",
+        StopReason::Aborted => "aborted",
+        _ => "error",
+    }
+}
+
+/// Build the `turn_end` payload: `{"outcome":..,"stopReason":..,"turnIndex":..,
+/// "toolResultCount":..}`.
+///
+/// `turnIndex` is supplied by the emitter (it is the only place with a per-run
+/// counter); `translate` itself stays pure.
+fn turn_end_payload(message: &rpi_agent::message::AgentMessage, tool_results: usize) -> String {
+    let stop_reason = message
+        .as_assistant()
+        .map(|assistant| assistant.stop_reason);
+    let outcome = stop_reason.map(turn_outcome).unwrap_or("error");
+    serde_json::json!({
+        "outcome": outcome,
+        "stopReason": stop_reason.map(|reason| reason.as_str()),
+        "turnIndex": serde_json::Value::Null,
+        "toolResultCount": tool_results,
+    })
+    .to_string()
+}
+
 /// Build the stable event for an `AgentEvent`, or `None` if the event carries
 /// no payload that maps onto a stable variant (always maps today, but kept as
 /// `Option` for forward-compat with unmapped future variants). Ownership of any
 /// `StbString` in the returned event passes to the handler.
 pub fn translate(event: &AgentEvent) -> Option<StablePluginEvent> {
+    translate_at(event, None)
+}
+
+/// [`translate`] with the run's 0-based turn index, which the emitter tracks.
+/// `None` leaves `turnIndex` out of the `turn_end` payload.
+pub fn translate_at(event: &AgentEvent, turn_index: Option<u64>) -> Option<StablePluginEvent> {
     let tag = event_tag_for(event)?;
     match event {
         AgentEvent::MessageStart { message } | AgentEvent::MessageEnd { message } => {
@@ -111,11 +157,29 @@ pub fn translate(event: &AgentEvent) -> Option<StablePluginEvent> {
             ))
         }
 
+        // `turn_end` carries a payload so plugins can tell a normal stop from a
+        // failure (and from a user abort) without inferring it from the last
+        // `message_end`. The other lifecycle events below stay payload-free.
+        AgentEvent::TurnEnd {
+            message,
+            tool_results,
+        } => {
+            let mut payload: serde_json::Value =
+                serde_json::from_str(&turn_end_payload(message, tool_results.len()))
+                    .unwrap_or_else(|_| serde_json::json!({}));
+            if let Some(index) = turn_index {
+                payload["turnIndex"] = serde_json::json!(index);
+            }
+            Some(StablePluginEvent::data(
+                tag,
+                StbString::from_string(payload.to_string()),
+            ))
+        }
+
         // No-payload events.
         AgentEvent::AgentStart
         | AgentEvent::TurnStart
-        | AgentEvent::AgentEnd { .. }
-        | AgentEvent::TurnEnd { .. } => Some(StablePluginEvent::empty(tag)),
+        | AgentEvent::AgentEnd { .. } => Some(StablePluginEvent::empty(tag)),
 
         AgentEvent::RetryScheduled { .. } => None,
     }
@@ -308,6 +372,11 @@ fn free_event_strings(_event: &StablePluginEvent) {
 /// `spawn_blocking` cross-FFI where recovery is unsafe.
 pub struct ExtensionEmitter {
     snapshot: Arc<RegistrySnapshot>,
+    /// 0-based index of the *next* turn. Bumped on `TurnStart`, so inside a
+    /// turn the in-progress index is always `current - 1`. `translate` is a pure
+    /// function, so the counter lives here — the only stateful point on the
+    /// event path.
+    turn_index: std::sync::atomic::AtomicU64,
     /// Keeps the loaded cdylibs mapped for as long as this emitter (installed
     /// into `AgentHarnessOptions.agent_emitter`) may dispatch to handler fn
     /// pointers that live inside them. Cloned from the load session; the
@@ -322,7 +391,28 @@ impl ExtensionEmitter {
     pub fn new(snapshot: Arc<RegistrySnapshot>, keepalive: Arc<crate::PluginKeepalive>) -> Self {
         Self {
             snapshot,
+            turn_index: std::sync::atomic::AtomicU64::new(0),
             keepalive,
+        }
+    }
+
+    /// Translate one event, keeping the `turn_end` turn index in step.
+    ///
+    /// `TurnStart` advances the counter; `TurnEnd` reports the turn that just
+    /// finished (`current - 1`). Every other event translates without an index.
+    fn stable_event(&self, event: &AgentEvent) -> Option<StablePluginEvent> {
+        use std::sync::atomic::Ordering;
+        match event {
+            AgentEvent::TurnStart => translate_at(
+                event,
+                // Report the index of the turn that is starting, then advance.
+                Some(self.turn_index.fetch_add(1, Ordering::Relaxed)),
+            ),
+            AgentEvent::TurnEnd { .. } => translate_at(
+                event,
+                Some(self.turn_index.load(Ordering::Relaxed).saturating_sub(1)),
+            ),
+            _ => translate(event),
         }
     }
 
@@ -832,14 +922,14 @@ impl AgentEmitter for ExtensionEmitter {
         // Translate + dispatch synchronously (the emitter's emit is awaited by
         // the loop in event order; dispatch is non-blocking fn-pointer calls).
         // If the event maps to no tag, do nothing.
-        if let Some(stable) = translate(&event) {
+        if let Some(stable) = self.stable_event(&event) {
             self.dispatch(&stable);
         }
         Box::pin(async {})
     }
 
     fn try_emit(&self, event: AgentEvent) {
-        if let Some(stable) = translate(&event) {
+        if let Some(stable) = self.stable_event(&event) {
             self.dispatch(&stable);
         }
     }
@@ -944,7 +1034,6 @@ fn free_dispatched_event(event: &StablePluginEvent) {
         | T::AgentEnd
         | T::AgentSettled
         | T::TurnStart
-        | T::TurnEnd
         | T::ModelSelect
         | T::ThinkingLevelSelect
         | T::UserBash
@@ -956,11 +1045,16 @@ fn free_dispatched_event(event: &StablePluginEvent) {
         // The B4 provider-hook observer events, and the `Input` /`EditorChange`
         // events dispatched by the TUI, carry a generic data payload (built by
         // `dispatch_data_event`); free the single StbString.
+        //
+        // `TurnEnd` is in this arm since it gained its outcome payload: it is a
+        // `data` event now, NOT an empty one. Freeing it as `empty` would leak
+        // the JSON string, so this arm is load-bearing for `turn_end`.
         T::BeforeProviderRequest
         | T::BeforeProviderHeaders
         | T::AfterProviderResponse
         | T::Input
-        | T::EditorChange => {
+        | T::EditorChange
+        | T::TurnEnd => {
             // SAFETY: these tags are only ever constructed as data payloads.
             unsafe { host_free_string(event.payload.data.data) };
         }
@@ -1068,6 +1162,171 @@ mod tests {
             error: "503".into(),
         })
         .is_none());
+    }
+
+    /// Build an assistant message with a chosen `stop_reason` (the field the
+    /// `turn_end` outcome normalizes).
+    fn assistant_with(
+        stop_reason: rpi_ai::types::StopReason,
+        error_message: Option<&str>,
+    ) -> AgentMessage {
+        AgentMessage::Assistant(Box::new(AssistantMessage {
+            role: rpi_ai::types::AssistantRole,
+            content: vec![rpi_ai::types::Content::text("hi")],
+            api: rpi_ai::types::Api::AnthropicMessages,
+            provider: "anthropic".to_string(),
+            model: "m".into(),
+            response_model: None,
+            response_id: None,
+            usage: Usage::zero(),
+            stop_reason,
+            deferred: None,
+            error_message: error_message.map(|m| m.to_string()),
+            raw_stop_reason: None,
+            end_turn: None,
+            timestamp: 0,
+        }))
+    }
+
+    /// A tool-result message for the `toolResultCount` assertion.
+    fn tool_result_message(tool_call_id: &str) -> rpi_ai::types::ToolResultMessage {
+        rpi_ai::types::ToolResultMessage {
+            role: rpi_ai::types::ToolResultRole,
+            tool_call_id: tool_call_id.to_string(),
+            tool_name: "echo".to_string(),
+            content: vec![rpi_ai::types::Content::text("ok")],
+            details: None,
+            usage: None,
+            added_tool_names: vec![],
+            is_error: false,
+            timestamp: 0,
+        }
+    }
+
+    /// Read the `data` payload of a translated event as JSON.
+    fn payload_json(event: &StablePluginEvent) -> serde_json::Value {
+        // SAFETY: every tag used with this helper is built via
+        // `StablePluginEvent::data`, so the `data` union arm is initialized.
+        let text = unsafe { event.payload.data.data.to_string_lossy() };
+        serde_json::from_str(&text).expect("turn_end payload must be JSON")
+    }
+
+    #[test]
+    fn turn_end_carries_an_outcome_payload() {
+        use rpi_ai::types::StopReason;
+
+        // A normal stop is `stop`.
+        let event = translate(&AgentEvent::TurnEnd {
+            message: assistant_with(StopReason::Stop, None),
+            tool_results: vec![],
+        })
+        .unwrap();
+        assert_eq!(event.tag, EventTag::TurnEnd);
+        let payload = payload_json(&event);
+        assert_eq!(payload["outcome"], "stop");
+        assert_eq!(payload["stopReason"], "stop");
+        assert_eq!(payload["toolResultCount"], 0);
+
+        // A tool-use continuation and a length truncation are still successful
+        // turn terminations, not failures.
+        for reason in [StopReason::ToolUse, StopReason::Length] {
+            let payload = payload_json(
+                &translate(&AgentEvent::TurnEnd {
+                    message: assistant_with(reason, None),
+                    tool_results: vec![],
+                })
+                .unwrap(),
+            );
+            assert_eq!(payload["outcome"], "stop", "{reason:?}");
+            assert_eq!(payload["stopReason"], reason.as_str());
+        }
+
+        // A user abort is reported distinctly from an error: a control surface
+        // offers "retry" for one and nothing for the other.
+        let payload = payload_json(
+            &translate(&AgentEvent::TurnEnd {
+                message: assistant_with(StopReason::Aborted, None),
+                tool_results: vec![],
+            })
+            .unwrap(),
+        );
+        assert_eq!(payload["outcome"], "aborted");
+
+        // Provider failures are `error` and keep the raw reason.
+        let payload = payload_json(
+            &translate(&AgentEvent::TurnEnd {
+                message: assistant_with(StopReason::Error, Some("429 rate limited")),
+                tool_results: vec![],
+            })
+            .unwrap(),
+        );
+        assert_eq!(payload["outcome"], "error");
+        assert_eq!(payload["stopReason"], "error");
+
+        // The tool-result count reports the turn's tool fan-out.
+        let payload = payload_json(
+            &translate(&AgentEvent::TurnEnd {
+                message: assistant_with(StopReason::ToolUse, None),
+                tool_results: vec![
+                    tool_result_message("c1"),
+                    tool_result_message("c2"),
+                ],
+            })
+            .unwrap(),
+        );
+        assert_eq!(payload["toolResultCount"], 2);
+    }
+
+    #[test]
+    fn turn_end_turn_index_is_omitted_by_the_pure_translator() {
+        // `translate` has no per-run state, so it must not invent an index.
+        // The emitter's `translate_at` supplies it.
+        let event = AgentEvent::TurnEnd {
+            message: assistant_with(rpi_ai::types::StopReason::Stop, None),
+            tool_results: vec![],
+        };
+        assert!(payload_json(&translate(&event).unwrap())["turnIndex"].is_null());
+        assert_eq!(
+            payload_json(&translate_at(&event, Some(4)).unwrap())["turnIndex"],
+            4
+        );
+    }
+
+    /// Regression: giving `turn_end` a payload must not give the neighbouring
+    /// lifecycle events one. `AgentStart`, `AgentSettled` and `AgentEnd` stay
+    /// payload-free, so a consumer that reads them as empty keeps working.
+    ///
+    /// Asserted through `EventView::data_text` — the exact accessor a plugin
+    /// uses — so this fails if the payload variant ever changes, which is what
+    /// would make an existing consumer read garbage.
+    #[test]
+    fn neighbouring_lifecycle_events_stay_payload_free() {
+        use rpi_plugin_sdk::events::EventView;
+        for event in [
+            AgentEvent::AgentStart,
+            AgentEvent::TurnStart,
+            AgentEvent::AgentEnd { messages: vec![] },
+        ] {
+            let translated = translate(&event).unwrap();
+            // SAFETY: `from_raw` only borrows; the event outlives the view.
+            let view = unsafe { EventView::from_raw(&translated) };
+            assert_eq!(
+                view.data_text(),
+                None,
+                "{:?} must stay an empty payload",
+                event.type_tag()
+            );
+        }
+        // ...while `turn_end` is now readable through the same accessor.
+        let end = translate(&AgentEvent::TurnEnd {
+            message: assistant_with(rpi_ai::types::StopReason::Stop, None),
+            tool_results: vec![],
+        })
+        .unwrap();
+        // SAFETY: as above.
+        let view = unsafe { EventView::from_raw(&end) };
+        let payload = view.data_text().expect("turn_end must expose a payload");
+        assert!(payload.contains("\"outcome\""), "{payload}");
     }
 
     #[test]
@@ -1206,6 +1465,58 @@ mod tests {
             1,
             "stale registry must not dispatch"
         );
+    }
+
+    #[test]
+    fn emitter_numbers_turns_so_turn_end_names_the_turn_it_closed() {
+        let _guard = HANDLER_TEST_LOCK.lock().unwrap();
+        // Capture the `turn_end` payloads the handler receives. The handler is
+        // an `extern "C" fn`, so the sink is process-global (guarded by
+        // HANDLER_TEST_LOCK).
+        static TURN_END_PAYLOADS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        extern "C" fn record_turn_end(ev: StablePluginEvent, _ud: *mut std::ffi::c_void) -> i32 {
+            use rpi_plugin_sdk::events::EventView;
+            // SAFETY: the host guarantees the payload arm matches the tag for
+            // the duration of the call.
+            let view = unsafe { EventView::from_raw(&ev) };
+            if let Some(payload) = view.data_text() {
+                TURN_END_PAYLOADS.lock().unwrap().push(payload);
+            }
+            0
+        }
+
+        TURN_END_PAYLOADS.lock().unwrap().clear();
+        let mut reg = crate::registry::ExtensionRegistry::new();
+        reg.register_event_handler(
+            "turn-counter".to_string(),
+            EventTag::TurnEnd,
+            record_turn_end,
+            std::ptr::null_mut(),
+        );
+        let emitter = ExtensionEmitter::new(
+            Arc::new(reg.snapshot()),
+            crate::loader::PluginKeepalive::empty(),
+        );
+
+        // Three turns, in the order the agent loop emits them.
+        for _ in 0..3 {
+            emitter.try_emit(AgentEvent::TurnStart);
+            emitter.try_emit(AgentEvent::TurnEnd {
+                message: assistant_with(rpi_ai::types::StopReason::ToolUse, None),
+                tool_results: vec![],
+            });
+        }
+
+        let payloads = TURN_END_PAYLOADS.lock().unwrap();
+        assert_eq!(payloads.len(), 3, "{payloads:?}");
+        for (expected, payload) in payloads.iter().enumerate() {
+            let value: serde_json::Value = serde_json::from_str(payload).unwrap();
+            assert_eq!(
+                value["turnIndex"], expected,
+                "turn_end must name the turn it closed: {payload}"
+            );
+            assert_eq!(value["outcome"], "stop");
+        }
     }
 
     // --- TeeEmitter: fan-out to both the broadcast + the extension emitter ----

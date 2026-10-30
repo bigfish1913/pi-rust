@@ -66,11 +66,20 @@ impl<'a> EventView<'a> {
                 | EventTag::UiPromptStart
                 | EventTag::UiPromptEnd
                 | EventTag::EditorChange
+                // `turn_end` carries `{outcome, stopReason, turnIndex,
+                // toolResultCount}`. Older hosts send it as an empty payload;
+                // the reader below therefore treats an empty string as absent
+                // rather than parsing nulls.
+                | EventTag::TurnEnd
         ) {
             return None;
         }
         // SAFETY: from_raw's invariant and the tag check select the live arm.
-        Some(unsafe { self.raw.payload.data.data.to_string_lossy() })
+        let text = unsafe { self.raw.payload.data.data.to_string_lossy() };
+        // An older host sends `turn_end` with the empty variant, whose `data`
+        // field is a null `StbString`. Surface that as `None` so a consumer's
+        // `?`-chain degrades to "no payload" instead of parsing `""`.
+        (!text.is_empty()).then_some(text)
     }
 
     pub fn tool_call(&self) -> Option<ToolCall> {
