@@ -534,9 +534,34 @@ impl SessionState {
                     None => self.require_lane("main")?,
                 };
                 let target_id: Option<String> = if let Some(sel) = selected {
-                    let entry = self.get_entry(&sel).ok_or_else(|| {
+                    let mut entry = self.get_entry(&sel).ok_or_else(|| {
                         SessionError::not_found(format!("Entry not found: {sel}"))
                     })?;
+                    // Implicit tip (`entry_id: None`) may be a state entry: the
+                    // session's newest entry is frequently `model_change` /
+                    // `thinking_level_change`, and pi still forks such a session.
+                    // Fall back to the nearest message ancestor so `/fork` keeps
+                    // working after a `/model` switch. An **explicit** target that
+                    // is not a message still errors — the caller asked for it.
+                    if entry_id.is_none() && !matches!(entry, Entry::Message(_)) {
+                        let mut cursor = entry.parent_id().map(str::to_string);
+                        let mut steps = 0usize;
+                        while let Some(parent) = cursor {
+                            entry = self.get_entry(&parent).ok_or_else(|| {
+                                SessionError::not_found(format!("Entry not found: {parent}"))
+                            })?;
+                            if matches!(entry, Entry::Message(_)) {
+                                break;
+                            }
+                            cursor = entry.parent_id().map(str::to_string);
+                            steps += 1;
+                            if steps > 10_000 {
+                                return Err(SessionError::invalid_fork_target(format!(
+                                    "Fork target has no message ancestor: {sel}"
+                                )));
+                            }
+                        }
+                    }
                     if !matches!(entry, Entry::Message(_)) {
                         return Err(SessionError::invalid_fork_target(format!(
                             "Fork target is not a message entry: {sel}"
