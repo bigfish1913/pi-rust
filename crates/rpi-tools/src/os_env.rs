@@ -351,7 +351,8 @@ async fn run_command(cmd: &str, args: &[&str], timeout: std::time::Duration) -> 
     if !out.status.success() {
         return None;
     }
-    let s = String::from_utf8_lossy(&out.stdout).into_owned();
+    // `where` prints paths in the console code page (e.g. a Chinese user name).
+    let s = crate::output_decode::decode_output(&out.stdout);
     if s.trim().is_empty() {
         None
     } else {
@@ -971,6 +972,7 @@ impl Shell for OsExecutionEnv {
         let stdout_task = async {
             if let Some(s) = stdout.as_mut() {
                 let mut buf = vec![0u8; 8192];
+                let mut decoder = crate::output_decode::StreamDecoder::new();
                 use tokio::io::AsyncReadExt;
                 loop {
                     let read = s.read(&mut buf);
@@ -986,7 +988,10 @@ impl Shell for OsExecutionEnv {
                         Ok(n) => n,
                         Err(_) => break,
                     };
-                    let chunk = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let chunk = decoder.push(&buf[..n]);
+                    if chunk.is_empty() {
+                        continue;
+                    }
                     if let Some(cb) = on_stdout.as_mut() {
                         // Callback errors are swallowed (TS sets callbackError;
                         // v1 simplifies — the callback contract is best-effort).
@@ -994,11 +999,19 @@ impl Shell for OsExecutionEnv {
                     }
                     stdout_buf.push_str(&chunk);
                 }
+                let tail = decoder.finish();
+                if !tail.is_empty() {
+                    if let Some(cb) = on_stdout.as_mut() {
+                        cb(&tail);
+                    }
+                    stdout_buf.push_str(&tail);
+                }
             }
         };
         let stderr_task = async {
             if let Some(s) = stderr.as_mut() {
                 let mut buf = vec![0u8; 8192];
+                let mut decoder = crate::output_decode::StreamDecoder::new();
                 use tokio::io::AsyncReadExt;
                 loop {
                     let read = s.read(&mut buf);
@@ -1014,11 +1027,21 @@ impl Shell for OsExecutionEnv {
                         Ok(n) => n,
                         Err(_) => break,
                     };
-                    let chunk = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let chunk = decoder.push(&buf[..n]);
+                    if chunk.is_empty() {
+                        continue;
+                    }
                     if let Some(cb) = on_stderr.as_mut() {
                         cb(&chunk);
                     }
                     stderr_buf.push_str(&chunk);
+                }
+                let tail = decoder.finish();
+                if !tail.is_empty() {
+                    if let Some(cb) = on_stderr.as_mut() {
+                        cb(&tail);
+                    }
+                    stderr_buf.push_str(&tail);
                 }
             }
         };

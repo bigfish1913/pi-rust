@@ -18,6 +18,7 @@ pub mod image;
 pub mod image_processing;
 pub mod in_memory;
 pub mod os_env;
+pub mod output_decode;
 pub mod path_utils;
 pub mod shell_output;
 pub mod truncate;
