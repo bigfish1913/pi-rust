@@ -176,6 +176,8 @@ pub struct AgentHarnessStreamOptions {
     pub headers: Option<BTreeMap<String, String>>,
     pub metadata: Option<BTreeMap<String, String>>,
     pub cache_retention: Option<CacheRetention>,
+    /// Budgets for budget-based thinking (settings `thinkingBudgets`).
+    pub thinking_budgets: Option<rpi_ai::ThinkingBudgets>,
 }
 
 /// The harness's pinned subset folded into a real [`SimpleStreamOptions`] per
@@ -214,6 +216,9 @@ impl AgentHarnessStreamOptions {
         }
         if let Some(c) = self.cache_retention {
             base.cache_retention = c;
+        }
+        if self.thinking_budgets.is_some() {
+            base.thinking_budgets = self.thinking_budgets;
         }
         base
     }
@@ -562,6 +567,26 @@ mod tests {
         .apply(&mut overlay);
         assert_eq!(overlay.headers, None);
         assert_eq!(overlay.metadata.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn thinking_budgets_reach_the_provider_options() {
+        let budgets = rpi_ai::ThinkingBudgets {
+            high: Some(24576),
+            ..Default::default()
+        };
+        let options = super::AgentHarnessStreamOptions {
+            thinking_budgets: Some(budgets),
+            ..Default::default()
+        };
+        let merged = options.merge_into(rpi_ai::SimpleStreamOptions::default());
+        assert_eq!(merged.thinking_budgets, Some(budgets));
+        let unset = super::AgentHarnessStreamOptions::default().merge_into(merged);
+        assert_eq!(
+            unset.thinking_budgets,
+            Some(budgets),
+            "unset keeps the caller's budgets"
+        );
     }
 
     #[test]
