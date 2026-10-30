@@ -196,6 +196,88 @@ fn arg_str_array(args: &serde_json::Value, key: &str) -> Result<Vec<String>, Str
         .ok_or_else(|| format!("missing string-array field `{key}` in action args"))
 }
 
+/// Outcome of parsing `SendUserMessage`'s optional `images` array.
+struct ParsedImages {
+    /// The images that will actually be sent, in input order.
+    images: Vec<rpi_ai::types::ImageContent>,
+    /// How many entries were dropped (malformed, empty, or not an object).
+    skipped: usize,
+}
+
+/// Parse `SendUserMessage`'s `images` array into [`rpi_ai::types::ImageContent`].
+///
+/// The wire shape matches pi's extension API — `{"mediaType":"image/png",
+/// "data":"<base64>"}` — **not** `ImageContent`'s own serde shape, so this is a
+/// hand-written mapping rather than `serde_json::from_value`. (`ImageContent`
+/// serializes `mimeType`; the plugin-facing key is `mediaType`. Accepting both
+/// keeps a plugin that already speaks the stored shape working.)
+///
+/// A bad image is **skipped, not fatal**: one malformed screenshot must not
+/// prevent the message from being delivered. The caller reports the count so an
+/// extension can surface "2 of 3 attached". An absent `images` key is not an
+/// error (the overwhelming majority of sends are text-only); a present but
+/// non-array `images` key is, because that is a caller bug rather than content.
+fn parse_images(args: &serde_json::Value) -> Result<ParsedImages, String> {
+    use base64::Engine as _;
+
+    let Some(value) = args.get("images") else {
+        return Ok(ParsedImages {
+            images: Vec::new(),
+            skipped: 0,
+        });
+    };
+    if value.is_null() {
+        return Ok(ParsedImages {
+            images: Vec::new(),
+            skipped: 0,
+        });
+    }
+    let entries = value
+        .as_array()
+        .ok_or_else(|| "`images` must be an array of {mediaType, data} objects".to_string())?;
+
+    let mut images = Vec::with_capacity(entries.len());
+    let mut skipped = 0usize;
+    for entry in entries {
+        let Some(object) = entry.as_object() else {
+            skipped += 1;
+            continue;
+        };
+        // `mediaType` is the pi/extension-API spelling; `mimeType` is what the
+        // stored `ImageContent` block uses. Accept both.
+        let mime_type = object
+            .get("mediaType")
+            .or_else(|| object.get("mimeType"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let data = object
+            .get("data")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        // Reject anything that is not actually an image, or that is not valid
+        // base64. Whitespace (line-wrapped base64) is stripped first, matching
+        // what a copy-pasted data URL looks like.
+        let compact: String = data.chars().filter(|c| !c.is_whitespace()).collect();
+        if !mime_type.starts_with("image/")
+            || compact.is_empty()
+            || base64::engine::general_purpose::STANDARD
+                .decode(&compact)
+                .is_err()
+        {
+            skipped += 1;
+            continue;
+        }
+        images.push(rpi_ai::types::ImageContent {
+            kind: rpi_ai::types::ImageContentType,
+            // Send the normalized (unwrapped) payload: the compact form is what
+            // every provider expects and what the stored block round-trips.
+            data: compact,
+            mime_type: mime_type.to_string(),
+        });
+    }
+    Ok(ParsedImages { images, skipped })
+}
+
 /// Render a `HarnessRunOutcome` as JSON for the plugin. Only the terminal
 /// status + leaf id cross (the final message text is folded to a string; full
 /// assistant content is too rich for a v1 action result).
@@ -448,13 +530,29 @@ impl RuntimeActionHost for HarnessActionHost {
         &self,
         args: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let text = arg_str(&args, "text")?;
+        // Text and images are independent: a pure-image message (a pasted
+        // screenshot with no caption) is valid, so `text` is optional as long as
+        // at least one image survives parsing. Requiring `text` first is what
+        // made image-only sends impossible.
+        let text = arg_str_opt(&args, "text").unwrap_or_default();
+        let parsed = parse_images(&args)?;
+        if text.is_empty() && parsed.images.is_empty() {
+            return Err("send_user_message requires `text` or at least one image".to_string());
+        }
+        let sent = parsed.images.len();
         let lane = self.harness()?.lane("main");
         let result = lane
-            .prompt_text(&text, Vec::new())
+            .prompt_text(&text, parsed.images)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(run_outcome_json(result.outcome))
+        let mut outcome = run_outcome_json(result.outcome);
+        if let Some(object) = outcome.as_object_mut() {
+            // `skippedImages` is always present so a caller can distinguish "no
+            // images were skipped" from "this host does not report it".
+            object.insert("skippedImages".into(), serde_json::json!(parsed.skipped));
+            object.insert("images".into(), serde_json::json!(sent));
+        }
+        Ok(outcome)
     }
 
     async fn append_entry(&self, args: serde_json::Value) -> Result<serde_json::Value, String> {
@@ -671,6 +769,149 @@ impl RuntimeActionHost for HarnessActionHost {
 
 #[cfg(test)]
 mod lifetime_tests;
+
+#[cfg(test)]
+mod send_user_message_tests {
+    use super::*;
+    use base64::Engine as _;
+    use serde_json::json;
+
+    /// 1x1 transparent PNG, base64. A real image keeps the test honest about
+    /// what the provider actually receives.
+    fn png_base64() -> String {
+        base64::engine::general_purpose::STANDARD.encode([
+            0x89u8, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9c, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ])
+    }
+
+    #[test]
+    fn text_only_send_is_unchanged() {
+        let parsed = parse_images(&json!({"text":"hello"})).unwrap();
+        assert!(parsed.images.is_empty());
+        assert_eq!(parsed.skipped, 0);
+        // An explicit null / empty array is the same as omitting the key.
+        for args in [json!({"text":"hi","images":null}), json!({"text":"hi","images":[]})] {
+            let parsed = parse_images(&args).unwrap();
+            assert!(parsed.images.is_empty(), "{args}");
+            assert_eq!(parsed.skipped, 0);
+        }
+    }
+
+    #[test]
+    fn text_plus_images_maps_media_type_to_the_content_block() {
+        let parsed = parse_images(&json!({
+            "text":"look at this",
+            "images":[{"mediaType":"image/png","data":png_base64()}]
+        }))
+        .unwrap();
+        assert_eq!(parsed.skipped, 0);
+        assert_eq!(
+            parsed.images,
+            vec![rpi_ai::types::ImageContent {
+                kind: rpi_ai::types::ImageContentType,
+                data: png_base64(),
+                mime_type: "image/png".to_string(),
+            }]
+        );
+        // The stored shape's `mimeType` spelling is accepted too.
+        let stored_shape = parse_images(&json!({
+            "images":[{"mimeType":"image/png","data":png_base64()}]
+        }))
+        .unwrap();
+        assert_eq!(stored_shape.images, parsed.images);
+    }
+
+    #[test]
+    fn image_only_send_is_allowed() {
+        // No `text` key at all: a pasted screenshot with no caption.
+        let parsed = parse_images(&json!({
+            "images":[{"mediaType":"image/png","data":png_base64()}]
+        }))
+        .unwrap();
+        assert_eq!(parsed.images.len(), 1);
+        assert!(arg_str_opt(&json!({"images":[]}), "text").is_none());
+    }
+
+    #[test]
+    fn bad_images_are_skipped_and_counted_not_fatal() {
+        let parsed = parse_images(&json!({
+            "text":"two of four",
+            "images":[
+                // Valid.
+                {"mediaType":"image/png","data":png_base64()},
+                // Invalid base64.
+                {"mediaType":"image/png","data":"!!!not-base64!!"},
+                // Empty payload.
+                {"mediaType":"image/png","data":""},
+                // Not an image at all.
+                {"mediaType":"text/plain","data":png_base64()},
+                // Missing mediaType entirely.
+                {"data":png_base64()},
+                // Valid, so the run still gets a usable attachment.
+                {"mediaType":"image/jpeg","data":png_base64()},
+            ]
+        }))
+        .unwrap();
+        assert_eq!(parsed.images.len(), 2, "the two valid images survive");
+        assert_eq!(parsed.skipped, 4);
+        assert_eq!(parsed.images[1].mime_type, "image/jpeg");
+    }
+
+    #[test]
+    fn line_wrapped_base64_is_normalized_instead_of_rejected() {
+        let wrapped = png_base64()
+            .as_bytes()
+            .chunks(16)
+            .map(|chunk| String::from_utf8_lossy(chunk).to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let parsed = parse_images(&json!({
+            "text":"wrapped",
+            "images":[{"mediaType":"image/png","data":wrapped}]
+        }))
+        .unwrap();
+        assert_eq!(parsed.skipped, 0);
+        assert_eq!(parsed.images[0].data, png_base64(), "newlines stripped");
+    }
+
+    #[test]
+    fn a_non_array_images_field_is_a_caller_error() {
+        // Malformed *content* is skipped; a malformed *request* is rejected so
+        // the bug surfaces instead of silently sending text only.
+        assert!(parse_images(&json!({"text":"hi","images":"oops"})).is_err());
+        assert!(parse_images(&json!({"text":"hi","images":{}})).is_err());
+    }
+
+    #[test]
+    fn every_message_needs_text_or_at_least_one_usable_image() {
+        // Mirrors the guard in `send_user_message`: empty text and no surviving
+        // image must not silently start a blank run.
+        let is_sendable = |args: &serde_json::Value| {
+            let text = arg_str_opt(args, "text").unwrap_or_default();
+            let parsed = parse_images(args).unwrap();
+            !(text.is_empty() && parsed.images.is_empty())
+        };
+        for args in [
+            json!({}),
+            json!({"text":""}),
+            json!({"text":"","images":[]}),
+            json!({"images":[{"mediaType":"image/png","data":"bad"}]}),
+        ] {
+            assert!(!is_sendable(&args), "{args} should have been rejected");
+        }
+        // ...and each of these is accepted.
+        for args in [
+            json!({"text":"hi"}),
+            json!({"images":[{"mediaType":"image/png","data":png_base64()}]}),
+        ] {
+            assert!(is_sendable(&args), "{args} should have been accepted");
+        }
+    }
+}
 
 #[cfg(test)]
 mod send_message_tests {

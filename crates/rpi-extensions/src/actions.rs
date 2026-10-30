@@ -415,7 +415,8 @@ pub trait RuntimeActionHost: Send + Sync {
     /// starts an idle run, `false` only updates context, and `nextTurn` waits
     /// for a new explicit prompt. Results distinguish appended/queued/run.
     async fn send_message(&self, args: serde_json::Value) -> Result<serde_json::Value, String>;
-    /// `SendUserMessage` — drive a run from a user-text message.
+    /// `SendUserMessage` — drive a run from a user message. `text` is optional
+    /// when `images` is non-empty.
     async fn send_user_message(&self, args: serde_json::Value)
         -> Result<serde_json::Value, String>;
     /// `AppendEntry` — append without starting a run. `customType`/`data`

@@ -1055,6 +1055,12 @@ pub enum RuntimeActionId {
     /// nested under `options`. Default: idle append, active steer. Use explicit
     /// `triggerTurn: true` to start an idle run. `nextTurn` always defers.
     SendMessage = 0,
+    /// Drive a run from a user message. Args: `{"text":"…","images":[{"mediaType":
+    /// "image/png","data":"<base64>"}]}`. `text` may be empty when at least one
+    /// image is supplied (a pasted screenshot with no caption). Malformed or
+    /// non-image entries are skipped rather than failing the send; the run
+    /// result reports `skippedImages` and `images` (how many were sent).
+    /// Result: the run outcome, as for [`RuntimeActionId::SendMessage`].
     SendUserMessage = 1,
     /// Append without starting a run. `{"customType": ..., "data": ...}` stores
     /// extension data; `{"message": ...}` queues context until the active turn
