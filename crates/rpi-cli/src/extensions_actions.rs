@@ -667,6 +667,25 @@ impl RuntimeActionHost for HarnessActionHost {
         // the "not configured" fallback.
         Err("reload not configured (no /reload callback on this bridge)".to_string())
     }
+
+    async fn abort(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
+        // Aborting an idle lane is a no-op, not an error: a plugin's stop button
+        // must be idempotent (double click, or a click that lands as the run
+        // settles). `AgentLane::abort` reports that case as `NoActiveRun`, which
+        // we translate into `{"aborted": false}` instead of propagating.
+        match self.harness()?.lane("main").abort().await {
+            Ok(result) => Ok(serde_json::json!({
+                "aborted": true,
+                "runId": result.run_id,
+            })),
+            Err(error)
+                if error.tag() == rpi_harness::result::HarnessErrorTag::NoActiveRun =>
+            {
+                Ok(serde_json::json!({ "aborted": false }))
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
 }
 
 #[cfg(test)]

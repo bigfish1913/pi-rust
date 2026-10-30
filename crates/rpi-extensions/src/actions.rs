@@ -459,6 +459,13 @@ pub trait RuntimeActionHost: Send + Sync {
     /// B5d — until then this returns an "unsupported" error string).
     async fn reload(&self, args: serde_json::Value) -> Result<serde_json::Value, String>;
 
+    /// `Abort` — cancel the run in progress on the main lane.
+    ///
+    /// An idle lane is a no-op, not an error: a plugin's stop button must be
+    /// safe to press twice, and the user may click it as the run settles. Hosts
+    /// report `{"aborted": false}` in that case instead of failing.
+    async fn abort(&self, args: serde_json::Value) -> Result<serde_json::Value, String>;
+
     /// `GetCliFlag` — read a parsed extension CLI flag. Args are
     /// `{"name":"flag"}` and the result is `{"value": <bool|string|null>}`.
     async fn get_cli_flag(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
@@ -909,6 +916,7 @@ async fn dispatch(
         RuntimeActionId::NavigateTree => host.navigate_tree(args).await,
         RuntimeActionId::SwitchSession => host.switch_session(args).await,
         RuntimeActionId::Reload => host.reload(args).await,
+        RuntimeActionId::Abort => host.abort(args).await,
         RuntimeActionId::GetCliFlag => host.get_cli_flag(args).await,
         RuntimeActionId::UiDialog => ui_dialog.handle(args),
         // UI-only action: handled by the bridge (no harness call), exactly like
@@ -961,7 +969,7 @@ pub extern "C" fn trampoline_runtime_action(
         run_action(
             action_id,
             // Highest id this ABI defines — bump when adding an action.
-            u32::from(RuntimeActionId::SideQuestion),
+            u32::from(RuntimeActionId::Abort),
             args_json,
             out,
             user_data,
@@ -1514,6 +1522,10 @@ mod tests {
         async fn reload(&self, _: serde_json::Value) -> Result<serde_json::Value, String> {
             self.saw.lock().unwrap().push(RuntimeActionId::Reload);
             Ok(serde_json::Value::Null)
+        }
+        async fn abort(&self, _: serde_json::Value) -> Result<serde_json::Value, String> {
+            self.saw.lock().unwrap().push(RuntimeActionId::Abort);
+            Ok(serde_json::json!({ "aborted": false }))
         }
         async fn get_cli_flag(&self, _: serde_json::Value) -> Result<serde_json::Value, String> {
             self.saw.lock().unwrap().push(RuntimeActionId::GetCliFlag);

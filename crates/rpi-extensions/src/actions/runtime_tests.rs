@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 struct Host {
     calls: AtomicUsize,
     revoked: AtomicUsize,
+    aborts: AtomicUsize,
     side_sinks: std::sync::Mutex<Vec<SideQuestionSink>>,
 }
 #[async_trait::async_trait]
@@ -70,6 +71,16 @@ impl RuntimeActionHost for Host {
     async fn reload(&self, _: Value) -> Result<Value, String> {
         unreachable!()
     }
+    async fn abort(&self, args: Value) -> Result<Value, String> {
+        self.aborts.fetch_add(1, Ordering::SeqCst);
+        assert!(
+            args.get("__rpiRuntimeKey").is_none(),
+            "capabilities must not reach action payloads"
+        );
+        // Hosts made no run active: mirror the idle-lane no-op contract so the
+        // test pins "idle abort is not an error".
+        Ok(json!({"aborted": false}))
+    }
     async fn child_agent(&self, owner: u64, args: Value) -> Result<Value, String> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         assert!(
@@ -100,6 +111,48 @@ fn call(id: usize, args: Value) -> (i32, Value) {
         rpi_plugin_sdk::callbacks::OwnedString::from_raw(out, Some(crate::host_free_string))
     };
     (rc, serde_json::from_str(&owned.to_string_lossy()).unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abort_reaches_the_host_and_is_not_blocked_by_the_action_id_ceiling() {
+    // The trampoline rejects every id above the highest one this ABI defines
+    // (`max_action_id`). A newly appended action id must bump that bound too,
+    // or the action dispatches to `2` (unknown id) instead of the host. This
+    // test pins the highest id end-to-end through the FFI entrypoint.
+    let host = Arc::new(Host::default());
+    let root = ActionBridge::new(Handle::current(), host.clone());
+    let plugin = root.for_plugin("stopper");
+    let mut out = StbString::empty();
+    let rc = trampoline_runtime_action(
+        RuntimeActionId::Abort.into(),
+        StbStringRef::from_str("{}"),
+        &mut out,
+        plugin.user_data(),
+    );
+    // SAFETY: the trampoline returned a live host allocation to its caller.
+    let owned = unsafe {
+        rpi_plugin_sdk::callbacks::OwnedString::from_raw(out, Some(crate::host_free_string))
+    };
+    let value: Value = serde_json::from_str(&owned.to_string_lossy()).unwrap();
+    assert_eq!(rc, 0, "Abort must dispatch, not fail as an unknown id");
+    assert_eq!(value, json!({"aborted": false}));
+    assert_eq!(host.aborts.load(Ordering::SeqCst), 1);
+
+    // One past the new ceiling is still rejected as an unknown id.
+    let mut rejected = StbString::empty();
+    let rc = trampoline_runtime_action(
+        u32::from(RuntimeActionId::Abort) + 1,
+        StbStringRef::from_str("{}"),
+        &mut rejected,
+        plugin.user_data(),
+    );
+    assert_eq!(rc, 2);
+    // SAFETY: the trampoline wrote an owning error string into `rejected`.
+    let owned = unsafe {
+        rpi_plugin_sdk::callbacks::OwnedString::from_raw(rejected, Some(crate::host_free_string))
+    };
+    assert!(owned.to_string_lossy().contains("unknown runtime action id"));
+    assert_eq!(host.aborts.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
