@@ -19,7 +19,9 @@ use std::io::{BufRead, IsTerminal, Write};
 use std::sync::{Arc, Mutex};
 
 use rpi_agent::events::AgentEvent;
-use rpi_ai::types::{AssistantMessage, Content, ImageContent, StopReason, UserMessage};
+use rpi_ai::types::{
+    AssistantMessage, AudioContent, Content, ImageContent, StopReason, UserMessage,
+};
 use rpi_harness::agent_harness::{
     AgentHarness, AgentLane, CompactionOutcome, CompactionResult, HarnessRunOutcome,
 };
@@ -30,6 +32,7 @@ use rpi_harness::session::types::{
 };
 
 use crate::args::Args;
+use crate::rpc::client_requests::{dialog_answer, ClientRequestBroker, MAX_TIMEOUT_MS};
 use crate::rpc::protocol as rpc_protocol;
 use crate::rpc::writer::{start_rpc_writer, write_agent_event, write_line, RpcWriter};
 
@@ -272,6 +275,30 @@ fn emit_agent_event(event: &AgentEvent) {
     println!("{}", agent_event_json(event));
 }
 
+struct RpcModeState {
+    current: String,
+    /// The baseline prompt may itself be None. `base_prompt_saved` keeps that
+    /// distinction from "we have not captured the baseline yet".
+    base_prompt: Option<String>,
+    base_prompt_saved: bool,
+    base_tools: Option<Vec<String>>,
+}
+
+fn mode_descriptors() -> serde_json::Value {
+    serde_json::json!([
+        {
+            "id": "default",
+            "name": "Default",
+            "description": "Normal rpi tool and prompt strategy"
+        },
+        {
+            "id": "plan",
+            "name": "Plan",
+            "description": "Plan-first strategy with mutating tools disabled"
+        }
+    ])
+}
+
 /// `rpc` mode: a headless JSONL command loop (the server-side agent).
 ///
 /// Reads one JSON command per line from stdin (`{id?, type, ...}`), drives the
@@ -292,26 +319,47 @@ fn emit_agent_event(event: &AgentEvent) {
 /// reading — that is what lets `abort` and dialog answers arrive mid-run.
 pub async fn rpc(
     harness: &AgentHarness,
-    mut agent_events: Option<tokio::sync::broadcast::Receiver<AgentEvent>>,
+    agent_events: Option<tokio::sync::broadcast::Receiver<AgentEvent>>,
     model_catalog: Vec<rpi_ai::Model>,
     ui_dialog: rpi_extensions::UiDialogMailbox,
     oauth_snapshot: Option<Arc<rpi_extensions::RegistrySnapshot>>,
 ) -> i32 {
-    rpc_with_io(
+    rpc_with_client(harness, agent_events, model_catalog, ui_dialog, oauth_snapshot, None, None).await
+}
+
+pub(crate) async fn rpc_with_client(
+    harness: &AgentHarness,
+    agent_events: Option<tokio::sync::broadcast::Receiver<AgentEvent>>,
+    model_catalog: Vec<rpi_ai::Model>,
+    ui_dialog: rpi_extensions::UiDialogMailbox,
+    oauth_snapshot: Option<Arc<rpi_extensions::RegistrySnapshot>>,
+    client_tools: Option<Arc<crate::rpc::client_tools::ClientTools>>,
+    child_context: Option<&crate::session::ReloadContext>,
+) -> i32 {
+    rpc_with_io_child(
         harness,
-        agent_events.take(),
+        agent_events,
         model_catalog,
         ui_dialog,
         oauth_snapshot,
         tokio::io::BufReader::new(tokio::io::stdin()),
         std::io::stdout(),
+        client_tools,
+        child_context,
+        Some(Box::new(|| {
+            eprintln!("[rpi] fatal RPC output/producer shutdown stall; terminating RPC process");
+            // Only the real CLI owns this process. OS termination also stops
+            // blocking stdout writes/tools that Rust task cancellation cannot.
+            std::process::exit(1);
+        })),
     )
     .await
 }
 
+#[cfg(test)]
 async fn rpc_with_io<R, W>(
     harness: &AgentHarness,
-    mut agent_events: Option<tokio::sync::broadcast::Receiver<AgentEvent>>,
+    agent_events: Option<tokio::sync::broadcast::Receiver<AgentEvent>>,
     model_catalog: Vec<rpi_ai::Model>,
     ui_dialog: rpi_extensions::UiDialogMailbox,
     oauth_snapshot: Option<Arc<rpi_extensions::RegistrySnapshot>>,
@@ -322,12 +370,73 @@ where
     R: tokio::io::AsyncBufRead + Unpin,
     W: Write + Send + 'static,
 {
+    rpc_with_io_client(harness, agent_events, model_catalog, ui_dialog, oauth_snapshot, input, output, None).await
+}
+
+#[cfg(test)]
+async fn rpc_with_io_client<R, W>(
+    harness: &AgentHarness,
+    agent_events: Option<tokio::sync::broadcast::Receiver<AgentEvent>>,
+    model_catalog: Vec<rpi_ai::Model>,
+    ui_dialog: rpi_extensions::UiDialogMailbox,
+    oauth_snapshot: Option<Arc<rpi_extensions::RegistrySnapshot>>,
+    input: R,
+    output: W,
+    client_tools: Option<Arc<crate::rpc::client_tools::ClientTools>>,
+) -> i32
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: Write + Send + 'static,
+{
+    rpc_with_io_child(harness, agent_events, model_catalog, ui_dialog, oauth_snapshot, input, output, client_tools, None, None).await
+}
+
+async fn rpc_with_io_child<R, W>(
+    harness: &AgentHarness,
+    mut agent_events: Option<tokio::sync::broadcast::Receiver<AgentEvent>>,
+    model_catalog: Vec<rpi_ai::Model>,
+    ui_dialog: rpi_extensions::UiDialogMailbox,
+    oauth_snapshot: Option<Arc<rpi_extensions::RegistrySnapshot>>,
+    input: R,
+    output: W,
+    client_tools: Option<Arc<crate::rpc::client_tools::ClientTools>>,
+    child_context: Option<&crate::session::ReloadContext>,
+    escalate: Option<Box<dyn FnOnce() + Send>>,
+) -> i32
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: Write + Send + 'static,
+{
     let mut command_tasks = Vec::new();
     let lane: Arc<dyn AgentLane> = harness.lane("main");
-    // One blocking writer owns stdout. Producers only enqueue bounded messages,
-    // so pipe backpressure never blocks a Tokio worker on IO or a std mutex.
+    if let Err(error) = crate::rpc::system_prompt::restore_system_prompt(harness).await {
+        eprintln!("[rpi] failed to restore system prompt: {error}");
+        return 1;
+    }
     let (stdout, writer_task, writer_failed) = start_rpc_writer(output);
+    let watchdog = escalate.map(|escalate| RpcShutdownWatchdog::start(writer_failed.clone(), escalate));
     let pump_stop = tokio_util::sync::CancellationToken::new();
+    let mode_state = Arc::new(tokio::sync::Mutex::new(RpcModeState {
+        current: "default".to_string(),
+        base_prompt: None,
+        base_prompt_saved: false,
+        base_tools: None,
+    }));
+    let client_request_broker = ClientRequestBroker::default();
+    let mut samples = crate::rpc::sampling::Samples::default();
+    let external_tools = crate::rpc::external_tools::ExternalTools::new(stdout.clone());
+    let mut external_names = Vec::<String>::new();
+    if let Some(client) = &client_tools {
+        client.attach(stdout.clone(), harness.session().storage().metadata().id.clone());
+    }
+    // The selected mode is a durable native session entry. Restore it before
+    // accepting requests so a new bridge process cannot advertise default
+    // while the loaded session is still using plan semantics.
+    if persisted_mode(harness).await.as_deref() == Some("plan") {
+        if let Err(error) = rpc_apply_mode(&lane, harness, &mode_state, "plan", false).await {
+            eprintln!("[rpi] failed to restore persisted plan mode: {error}");
+        }
+    }
 
     // Publish generic commit metadata after successful Session appends. The
     // event is intentionally not a durable-state payload: consumers reread
@@ -340,6 +449,7 @@ where
         let out = stdout.clone();
         tokio::spawn(async move {
             loop {
+                if out.is_failed() { break; }
                 match commit_rx.recv().await {
                     Ok(commit) => {
                         write_line(
@@ -371,6 +481,7 @@ where
         let stop = pump_stop.clone();
         tokio::spawn(async move {
             loop {
+                if out.is_failed() { break; }
                 let received = tokio::select! {
                     _ = stop.cancelled() => {
                         drain_rpc_events(&out, &mut rx).await;
@@ -405,26 +516,32 @@ where
         let out = stdout.clone();
         let stop = pump_stop.clone();
         tokio::spawn(async move {
-            let mut shown = std::collections::HashSet::new();
-            while !stop.is_cancelled() {
+            let mut shown = std::collections::HashMap::new();
+            while !stop.is_cancelled() && !out.is_failed() {
                 while let Some(request) = mailbox.take_pending() {
+                    if out.is_failed() { break; }
+                    let session_id = request.session_id.clone();
                     let event = crate::remote::protocol::RemoteEvent::UiDialogRequest {
                         request_id: request.request_id.clone(),
                         tool_call_id: request.tool_call_id,
                         ui: request.ui,
                     };
-                    write_line(&out, &serde_json::to_value(event).unwrap()).await;
-                    shown.insert(request.request_id);
+                    let mut event = serde_json::to_value(event).unwrap();
+                    if let Some(id) = &session_id { event["sessionId"] = serde_json::json!(id); }
+                    write_line(&out, &event).await;
+                    shown.insert(request.request_id, session_id);
                 }
                 let closed: Vec<String> = shown
-                    .iter()
-                    .filter(|id| !mailbox.is_pending(id))
+                    .keys()
+                    .filter(|id| !mailbox.is_pending_wire(id))
                     .cloned()
                     .collect();
                 for request_id in closed {
-                    shown.remove(&request_id);
+                    let session_id = shown.remove(&request_id).flatten();
                     let event = crate::remote::protocol::RemoteEvent::UiDialogClosed { request_id };
-                    write_line(&out, &serde_json::to_value(event).unwrap()).await;
+                    let mut event = serde_json::to_value(event).unwrap();
+                    if let Some(id) = session_id { event["sessionId"] = serde_json::json!(id); }
+                    write_line(&out, &event).await;
                 }
                 tokio::select! {
                     _ = stop.cancelled() => break,
@@ -445,10 +562,28 @@ where
     use tokio::io::AsyncBufReadExt;
 
     let mut lines = input.lines();
-    write_line(&stdout, &rpc_protocol::ready()).await;
+    let child_context = child_context.filter(|_| crate::session::child_events_enabled());
+    let child_task = child_context.map(|ctx| {
+        let (sink, task) = start_child_rpc_forwarder(stdout.clone(), ctx.action_bridge.clone());
+        ctx.child_action_host.set_child_event_sink(Some(sink));
+        task
+    });
+    let mut ready = rpc_protocol::ready();
+    if child_task.is_some() {
+        ready["supportedEvents"].as_array_mut().unwrap().extend(
+            ["child_start", "child_event", "child_end"].map(|name| serde_json::json!(name)),
+        );
+        ready["childEventsVersion"] = serde_json::json!(1);
+    }
+    write_line(&stdout, &ready).await;
 
     loop {
+        if writer_failed.is_cancelled() {
+            cancel_on_exit = true;
+            break;
+        }
         let incoming = tokio::select! {
+            biased;
             _ = writer_failed.cancelled() => {
                 cancel_on_exit = true;
                 break;
@@ -490,6 +625,40 @@ where
             .unwrap_or("")
             .to_string();
 
+        // Client responses are deliberately not commands: they can arrive
+        // while any native command or prompt is running. Resolve the
+        // producer's request without consuming the response as a new command.
+        if kind == "external_tool_response" {
+            let result = if line.len() > rpc_protocol::MAX_FRAME_BYTES {
+                Err("external response exceeds frame limit".into())
+            } else {
+                external_tools.respond(&msg).map(|accepted| serde_json::json!({"accepted":accepted}))
+            };
+            write_line(&stdout, &rpc_protocol::response(Some(id), &kind, result.map(Some))).await;
+            continue;
+        }
+        if kind == "client_response" {
+            if let Some(request_id) = msg.get("requestId").and_then(serde_json::Value::as_str) {
+                let response =
+                    if msg.get("cancelled").and_then(serde_json::Value::as_bool) == Some(true) {
+                        Err("client request cancelled".to_owned())
+                    } else if let Some(error) = msg.get("error") {
+                        Err(error.to_string())
+                    } else {
+                        Ok(msg
+                            .get("result")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null))
+                    };
+                if !client_request_broker.resolve(request_id, response.clone()) {
+                    if let Some(client) = &client_tools {
+                        let _ = client.broker.resolve(request_id, response);
+                    }
+                }
+            }
+            continue;
+        }
+
         if rpc_protocol::SUPPORTED_COMMANDS.contains(&kind.as_str())
             && serde_json::from_value::<rpc_protocol::Request>(msg.clone()).is_err()
         {
@@ -506,24 +675,130 @@ where
         }
 
         match kind.as_str() {
+            "sample" => {
+                if let Err(error) = samples.start(harness, &msg, stdout.clone()).await {
+                    write_line(&stdout, &rpc_protocol::response(Some(id), "sample", Err(error))).await;
+                }
+                continue;
+            }
+            "cancel_sample" => {
+                let result = samples.cancel(&msg).await;
+                write_line(&stdout, &rpc_protocol::response(Some(id), "cancel_sample", result.map(Some))).await;
+                continue;
+            }
+            "client_request" => {
+                let method = msg
+                    .get("method")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|method| !method.trim().is_empty())
+                    .map(str::to_owned);
+                let params = msg
+                    .get("params")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                let Some(method) = method else {
+                    write_line(
+                        &stdout,
+                        &rpc_protocol::response(
+                            Some(id),
+                            "client_request",
+                            Err("client_request requires method".into()),
+                        ),
+                    )
+                    .await;
+                    continue;
+                };
+                if !params.is_object() {
+                    write_line(
+                        &stdout,
+                        &rpc_protocol::response(
+                            Some(id),
+                            "client_request",
+                            Err("client_request params must be an object".into()),
+                        ),
+                    )
+                    .await;
+                    continue;
+                }
+                let timeout_ms = match msg.get("timeoutMs") {
+                    None => MAX_TIMEOUT_MS,
+                    Some(value) => match value.as_u64() {
+                        Some(ms) if (1..=MAX_TIMEOUT_MS).contains(&ms) => ms,
+                        _ => {
+                            write_line(
+                                &stdout,
+                                &rpc_protocol::response(
+                                    Some(id),
+                                    "client_request",
+                                    Err(format!(
+                                        "timeoutMs must be between 1 and {MAX_TIMEOUT_MS}"
+                                    )),
+                                ),
+                            )
+                            .await;
+                            continue;
+                        }
+                    },
+                };
+                let request = match client_request_broker.register() {
+                    Ok(request) => request,
+                    Err(error) => {
+                        write_line(
+                            &stdout,
+                            &rpc_protocol::response(Some(id), "client_request", Err(error)),
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+                let request_id = request.id.clone();
+                write_line(
+                    &stdout,
+                    &serde_json::json!({
+                        "type": "client_request",
+                        "requestId": request_id.clone(),
+                        // Opaque originating-command token for adapters that
+                        // multiplex concurrent requests of the same method.
+                        "correlationId": msg.get("correlationId").cloned(),
+                        "sessionId": harness.session().storage().metadata().id,
+                        "method": method,
+                        "params": params,
+                    }),
+                )
+                .await;
+                command_tasks.retain(|task: &tokio::task::JoinHandle<()>| !task.is_finished());
+                let out = stdout.clone();
+                let cancel = pump_stop.clone();
+                command_tasks.push(tokio::spawn(async move {
+                    let result = request
+                        .wait(std::time::Duration::from_millis(timeout_ms), &cancel)
+                        .await;
+                    write_line(
+                        &out,
+                        &serde_json::json!({
+                            "type": "client_request_closed",
+                            "requestId": request_id,
+                        }),
+                    )
+                    .await;
+                    write_line(
+                        &out,
+                        &rpc_protocol::response(Some(id), "client_request", result.map(Some)),
+                    )
+                    .await;
+                }));
+                continue;
+            }
             "ui_dialog_response" => {
                 let request_id = msg
                     .get("requestId")
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let result = if msg
-                    .get("cancelled")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
-                {
-                    ui_dialog.cancel(&request_id)
-                } else {
-                    let answer = msg
-                        .get("answer")
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null);
-                    ui_dialog.respond(&request_id, answer)
+                let result = match dialog_answer(&msg) {
+                    Ok(Some(answer)) => ui_dialog.respond_wire(&request_id, answer),
+                    Ok(None) => ui_dialog.cancel_wire(&request_id),
+                    Err(error) => Err(error),
                 };
                 if msg.get("id").is_some() {
                     let response = match result {
@@ -611,18 +886,66 @@ where
                     .await;
                     continue;
                 }
+                let ordered = match rpc_protocol::ordered_content(&msg) {
+                    Ok(parts) => parts,
+                    Err(error) => {
+                        run_active.store(false, std::sync::atomic::Ordering::Release);
+                        write_line(&stdout, &rpc_protocol::response(Some(id), "prompt", Err(error))).await;
+                        continue;
+                    }
+                };
                 let content = msg
                     .get("message")
                     .or_else(|| msg.get("content"))
                     .or_else(|| msg.get("prompt"))
                     .and_then(|v| v.as_str())
                     .map(str::to_owned);
+                let images = match msg.get("images") {
+                    None => Vec::new(),
+                    Some(value) => match serde_json::from_value::<Vec<ImageContent>>(value.clone())
+                    {
+                        Ok(images) => images,
+                        Err(error) => {
+                            run_active.store(false, std::sync::atomic::Ordering::Release);
+                            write_line(
+                                &stdout,
+                                &rpc_protocol::response(
+                                    Some(id),
+                                    "prompt",
+                                    Err(format!("invalid image content: {error}")),
+                                ),
+                            )
+                            .await;
+                            continue;
+                        }
+                    },
+                };
+                let audio = match msg.get("audio") {
+                    None => Vec::new(),
+                    Some(value) => match serde_json::from_value::<Vec<AudioContent>>(value.clone())
+                    {
+                        Ok(audio) => audio,
+                        Err(error) => {
+                            run_active.store(false, std::sync::atomic::Ordering::Release);
+                            write_line(
+                                &stdout,
+                                &rpc_protocol::response(
+                                    Some(id),
+                                    "prompt",
+                                    Err(format!("invalid audio content: {error}")),
+                                ),
+                            )
+                            .await;
+                            continue;
+                        }
+                    },
+                };
                 let lane_task = Arc::clone(&lane);
                 let out_task = stdout.clone();
                 let active_task = Arc::clone(&run_active);
                 let mailbox_task = ui_dialog.clone();
                 let flush_events = event_flush.clone();
-                let Some(content) = content.or_else(|| (resume || compact).then(String::new))
+                let Some(content) = content.or_else(|| (resume || compact || ordered.is_some()).then(String::new))
                 else {
                     active_task.store(false, std::sync::atomic::Ordering::Release);
                     write_line(
@@ -650,13 +973,56 @@ where
                     .and_then(|v| v.as_str())
                     .map(str::to_owned);
                 run_task = Some(tokio::spawn(async move {
+                    let compaction_id = if compact {
+                        Some(format!("compaction-{}", uuid::Uuid::new_v4()))
+                    } else {
+                        None
+                    };
+                    if let Some(id) = &compaction_id {
+                        write_line(
+                            &out_task,
+                            &serde_json::json!({
+                                "type": "compaction_started",
+                                "compactionId": id,
+                            }),
+                        )
+                        .await;
+                    }
                     let result = if compact {
                         rpc_compact_cancellable(&lane_task, instructions, cancel_task).await
                     } else if resume {
                         rpc_resume_cancellable(&lane_task, cancel_task).await
                     } else {
-                        rpc_prompt_cancellable(&lane_task, &content, cancel_task).await
+                        rpc_prompt_cancellable(&lane_task, &content, images, audio, ordered, cancel_task)
+                            .await
                     };
+                    if let Some(id) = &compaction_id {
+                        let (status, summary, error) = match &result {
+                            Ok(value) if value["outcome"] == "compacted" => {
+                                ("completed", value.get("summary").cloned(), None)
+                            }
+                            Ok(value) if value["outcome"] == "aborted" => {
+                                ("cancelled", value.get("summary").cloned(), None)
+                            }
+                            Ok(value) => (
+                                "failed",
+                                value.get("summary").cloned(),
+                                value.get("error").cloned(),
+                            ),
+                            Err(error) => ("failed", None, Some(serde_json::json!(error))),
+                        };
+                        write_line(
+                            &out_task,
+                            &serde_json::json!({
+                                "type": "compaction_finished",
+                                "compactionId": id,
+                                "status": status,
+                                "summary": summary,
+                                "error": error,
+                            }),
+                        )
+                        .await;
+                    }
                     if let Some(flush) = flush_events {
                         let (done, drained) = tokio::sync::oneshot::channel();
                         if flush.send(done).is_ok() {
@@ -704,7 +1070,30 @@ where
             _ => {}
         }
 
+        // Abort retires foreground bridge requests, not independent samples.
+        // Sampling callers cancel their exact sampleId; connection teardown
+        // below still cancels and joins every remaining sample.
+        if kind == "abort" {
+            // Publish run cancellation before retiring tool waiters. A waiter
+            // can complete on another worker immediately, so the reverse order
+            // may settle the run as completed before it observes cancellation.
+            if run_active.load(std::sync::atomic::Ordering::Acquire) {
+                run_cancel.cancel();
+                let _ = lane.abort().await;
+            }
+            client_request_broker.cancel_all();
+            external_tools.abort();
+        }
         let result = match kind.as_str() {
+            "set_system_prompt" if run_active.load(std::sync::atomic::Ordering::Acquire) =>
+                Err("cannot change system prompt while a run is active".into()),
+            "set_system_prompt" => rpc_set_system_prompt(&lane, harness, &mode_state, &msg).await,
+            "configure_external_tools" if run_active.load(std::sync::atomic::Ordering::Acquire) =>
+                Err("cannot configure external tools while a prompt is active".into()),
+            "configure_external_tools" => rpc_configure_external_tools(&lane, harness, &mode_state,
+                &external_tools, &mut external_names, &msg).await,
+            "set_mode" | "set_active_tools" if run_active.load(std::sync::atomic::Ordering::Acquire) =>
+                Err("cannot change tools or mode while a prompt is active".into()),
             "abort" if run_active.load(std::sync::atomic::Ordering::Acquire) => {
                 // This also covers abort arriving before the task enters the lane.
                 run_cancel.cancel();
@@ -715,7 +1104,11 @@ where
                 .await
                 .map(|_| serde_json::json!({"aborted": true}))
                 .map_err(|e| e.to_string()),
-            "get_state" => Ok(rpc_get_state(&lane, harness).await),
+            "get_state" => Ok(rpc_get_state(&lane, harness, &mode_state).await),
+            "get_context_usage" => Ok(rpc_context_usage(&lane, harness).await),
+            "set_compaction_enabled" => rpc_set_compaction_enabled(harness, &msg).await,
+            "get_modes" => Ok(rpc_get_modes(&mode_state).await),
+            "set_mode" => rpc_set_mode(&lane, harness, &mode_state, &msg).await,
             "get_commands" => Ok(rpc_get_commands(oauth_snapshot.as_deref())),
             "get_messages" => rpc_get_messages(&lane, harness, &msg).await,
             "get_history" => rpc_get_history(&lane, harness, &msg).await,
@@ -735,6 +1128,8 @@ where
             "get_available_thinking_levels" => Ok(rpc_get_available_thinking_levels(&lane).await),
             "set_thinking_level" => rpc_set_thinking_level(&lane, &msg).await,
             "get_available_tools" => Ok(rpc_get_available_tools(&lane, harness).await),
+            "set_active_tools" if mode_state.lock().await.current == "plan" =>
+                Err("cannot override active tools in plan mode".into()),
             "set_active_tools" => rpc_set_active_tools(&lane, &msg).await,
             "ping" => Ok(serde_json::json!({"pong": true})),
             other => Err(format!("unknown command type: {other}")),
@@ -744,10 +1139,32 @@ where
         write_line(&stdout, &response).await;
     }
 
+    // Bound the entire teardown, including native tools/provider joins, not
+    // just the async writer handle. Only successful joins disarm escalation.
+    if let Some(watchdog) = &watchdog { watchdog.arm(); }
+    if writer_failed.is_cancelled() {
+        cancel_on_exit = true;
+        pump_stop.cancel();
+    }
+    // Samples never survive EOF, stop or output failure.
+    samples.shutdown().await;
     // EOF closes the input half of the protocol, not an accepted prompt.
     // There can be no more dialog answers, so release approvals, then await the
     // run before SessionShutdown can unload plugins or the runtime exits.
+    if let Some(ctx) = child_context {
+        // Revoke owners before releasing the sink. Each child owns its sink
+        // until its terminal callback finishes; channel EOF joins that drain.
+        if let Some(bridge) = ctx.action_bridge.lock().unwrap().as_ref() {
+            bridge.invalidate();
+        }
+        ctx.child_action_host.set_child_event_sink(None);
+    }
     ui_dialog.detach();
+    external_tools.shutdown();
+    client_request_broker.cancel_all();
+    if let Some(client) = &client_tools {
+        client.shutdown().await;
+    }
     if cancel_on_exit {
         run_cancel.cancel();
     }
@@ -760,6 +1177,9 @@ where
             eprintln!("[rpi] rpc prompt task failed: {error}");
             exit_code = 1;
         }
+    }
+    if let Some(task) = child_task {
+        let _ = task.await;
     }
     pump_stop.cancel();
     harness.session().set_entry_commit_publisher(None);
@@ -778,7 +1198,82 @@ where
             exit_code = 1;
         }
     }
+    if writer_failed.is_cancelled() { exit_code = 1; }
+    if let Some(watchdog) = watchdog { watchdog.joined(); }
     exit_code
+}
+
+/// Process-owner policy, deliberately outside RpcWriter. A dedicated OS thread
+/// enforces the deadline even if Tokio workers or native tool joins are stuck.
+/// A timed-out JoinHandle is NOT evidence that a blocking write has stopped.
+struct RpcShutdownWatchdog {
+    arm: std::sync::mpsc::Sender<bool>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl RpcShutdownWatchdog {
+    fn start(failed: tokio_util::sync::CancellationToken, escalate: Box<dyn FnOnce() + Send>) -> Self {
+        let (arm, rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let mut deadline = None;
+            loop {
+                match rx.recv_timeout(std::time::Duration::from_millis(10)) {
+                    Ok(true) => break, // all producers AND writer actually joined
+                    Ok(false) => { deadline.get_or_insert_with(|| std::time::Instant::now() + std::time::Duration::from_secs(2)); }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        // Owner unwound without proving joins: fail closed.
+                        deadline.get_or_insert_with(|| std::time::Instant::now() + std::time::Duration::from_secs(2));
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                }
+                if failed.is_cancelled() {
+                    deadline.get_or_insert_with(|| std::time::Instant::now() + std::time::Duration::from_secs(2));
+                }
+                if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                    escalate();
+                    break;
+                }
+            }
+        });
+        Self { arm, thread }
+    }
+
+    fn arm(&self) { let _ = self.arm.send(false); }
+
+    fn joined(self) {
+        let _ = self.arm.send(true);
+        let _ = self.thread.join();
+    }
+}
+
+fn start_child_rpc_forwarder(
+    out: RpcWriter,
+    bridges: crate::session::ActionBridgeCell,
+) -> (crate::child_agents::ChildEventSink, tokio::task::JoinHandle<()>) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(serde_json::Value, tokio::sync::oneshot::Sender<()>)>(64);
+    let task = tokio::spawn(async move {
+        while let Some((envelope, admitted)) = rx.recv().await {
+            write_line(&out, &envelope).await;
+            if out.is_failed() { break; }
+            // A child runner cannot issue tool UI until its start envelope is
+            // admitted to the same writer queue used by those UI requests.
+            let _ = admitted.send(());
+        }
+    });
+    let sink: crate::child_agents::ChildEventSink = Arc::new(move |envelope| {
+        let tx = tx.clone();
+        let bridges = bridges.clone();
+        Box::pin(async move {
+            let (admitted, admission) = tokio::sync::oneshot::channel();
+            if tx.send((envelope, admitted)).await.is_err() || admission.await.is_err() {
+                if let Some(bridge) = bridges.lock().unwrap().as_ref() {
+                    bridge.invalidate();
+                }
+            }
+        })
+    });
+    (sink, task)
 }
 
 fn rpc_get_commands(snapshot: Option<&rpi_extensions::RegistrySnapshot>) -> serde_json::Value {
@@ -840,6 +1335,7 @@ async fn drain_rpc_events(
     events: &mut tokio::sync::broadcast::Receiver<AgentEvent>,
 ) {
     loop {
+        if out.is_failed() { break; }
         match events.try_recv() {
             Ok(event) => write_agent_event(out, &event).await,
             Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
@@ -853,9 +1349,12 @@ async fn drain_rpc_events(
 async fn rpc_prompt_cancellable(
     lane: &Arc<dyn AgentLane>,
     content: &str,
+    images: Vec<ImageContent>,
+    audio: Vec<AudioContent>,
+    ordered: Option<Vec<Content>>,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<serde_json::Value, String> {
-    let prompt = rpc_prompt_text(lane, content);
+    let prompt = rpc_prompt_text(lane, content, images, audio, ordered);
     tokio::pin!(prompt);
     tokio::select! {
         biased;
@@ -870,10 +1369,6 @@ async fn rpc_prompt_cancellable(
 }
 
 /// Compact the branch, unless the caller cancels first.
-///
-/// Compaction is its own operation kind in the harness: it spends a provider
-/// call on the summary, so it takes the same single-run slot and reports the
-/// same settlement shape a prompt does.
 async fn rpc_compact_cancellable(
     lane: &Arc<dyn AgentLane>,
     instructions: Option<String>,
@@ -1000,18 +1495,28 @@ fn rpc_outcome_str(outcome: &HarnessRunOutcome) -> (&'static str, Option<String>
 async fn rpc_prompt_text(
     lane: &Arc<dyn AgentLane>,
     content: &str,
+    images: Vec<ImageContent>,
+    audio: Vec<AudioContent>,
+    ordered: Option<Vec<Content>>,
 ) -> Result<serde_json::Value, String> {
-    let result = lane
-        .prompt_text(content, Vec::new())
-        .await
-        .map_err(|e| e.to_string())?;
+    let result = if let Some(parts) = ordered {
+        lane.prompt_message(rpi_agent::message::AgentMessage::User(UserMessage::new(
+            rpi_ai::types::UserContent::Blocks(parts), rpc_now_ms(),
+        ))).await
+    } else {
+        lane.prompt_text_with_media(content, images, audio).await
+    }.map_err(|e| e.to_string())?;
     let (outcome, final_text, error) = rpc_outcome_str(&result.outcome);
     Ok(
         serde_json::json!({"runId":result.run_id, "outcome": outcome, "finalText": final_text, "error": error}),
     )
 }
 
-async fn rpc_get_state(lane: &Arc<dyn AgentLane>, harness: &AgentHarness) -> serde_json::Value {
+async fn rpc_get_state(
+    lane: &Arc<dyn AgentLane>,
+    harness: &AgentHarness,
+    mode_state: &Arc<tokio::sync::Mutex<RpcModeState>>,
+) -> serde_json::Value {
     let model = lane.get_model().await.ok();
     let thinking = lane
         .get_thinking_level()
@@ -1035,14 +1540,19 @@ async fn rpc_get_state(lane: &Arc<dyn AgentLane>, harness: &AgentHarness) -> ser
         });
     let queued = lane.queued_messages().await.unwrap_or_default();
     let stats = rpc_get_stats(lane, harness).await.ok();
+    let mode = mode_state.lock().await.current.clone();
     serde_json::json!({
         "modelId": model.as_ref().map(|model| model.id.clone()),
         "model": model.as_ref().map(|model| model.id.clone()),
         "provider": model.as_ref().map(|model| model.provider.clone()),
         "thinkingLevel": thinking,
         "activeTools": active_tools,
+        "modeId": mode,
+        "systemPrompt": harness.get_system_prompt().await.ok().flatten(),
+        "availableModes": mode_descriptors(),
         "leafId": leaf_id,
         "context": context,
+        "compactionEnabled": harness.compaction_settings().enabled,
         "sessionId": harness.session().storage().metadata().id,
         "activeOperation": active_operation,
         "queue": {
@@ -1221,6 +1731,229 @@ async fn rpc_append_entry(
         .await
         .map_err(|error| error.to_string())?;
     Ok(serde_json::json!({"entryId": entry_id, "customType": custom_type}))
+}
+
+async fn rpc_set_system_prompt(
+    lane: &Arc<dyn AgentLane>,
+    harness: &AgentHarness,
+    mode_state: &Arc<tokio::sync::Mutex<RpcModeState>>,
+    msg: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    use crate::rpc::system_prompt::{persisted_snapshot, PromptSnapshot, validate_prompt, SYSTEM_PROMPT_ENTRY};
+    if lane.snapshot().await.map_err(|error| error.to_string())?.active.is_some() {
+        return Err("cannot change system prompt while a run is active".into());
+    }
+    // Plan mode owns a temporary prompt overlay and its saved base. Do not
+    // silently replace either half of that transaction.
+    if mode_state.lock().await.current != "default" {
+        return Err("return to default mode before changing system prompt".into());
+    }
+    let prompt = msg.get("prompt").and_then(serde_json::Value::as_str)
+        .ok_or("set_system_prompt requires string `prompt`")?;
+    validate_prompt(prompt)?;
+    let mode = match msg.get("mode") {
+        None => "append",
+        Some(value) => value.as_str().ok_or("mode must be append or replace")?,
+    };
+    let old = harness.get_system_prompt().await.map_err(|error| error.to_string())?;
+    let previous = persisted_snapshot(harness).await?;
+    let snapshot = PromptSnapshot::configure(previous.as_ref(), old.clone(), prompt, mode)?;
+    let target = &snapshot.effective;
+    if previous.as_ref().is_some_and(|p| p.version == 2 && p.client_prompt == prompt && p.mode == mode) {
+        return Ok(serde_json::json!({"systemPrompt": target, "mode": mode}));
+    }
+    harness.set_system_prompt(Some(target.clone())).await.map_err(|error| error.to_string())?;
+    if let Err(error) = harness.append_custom_entry(
+        SYSTEM_PROMPT_ENTRY,
+        Some(serde_json::to_value(&snapshot).map_err(|error| error.to_string())?),
+    ).await {
+        harness.set_system_prompt(old).await
+            .map_err(|rollback| format!("system prompt persist failed: {error}; rollback failed: {rollback}"))?;
+        return Err(format!("system prompt change rolled back: {error}"));
+    }
+    Ok(serde_json::json!({"systemPrompt": target, "mode": mode}))
+}
+
+async fn persisted_mode(harness: &AgentHarness) -> Option<String> {
+    let query = EntryQuery {
+        custom_type: Some("rpi_mode".to_string()),
+        order: Some(EntryOrder::OldestFirst),
+        ..Default::default()
+    };
+    harness
+        .find_entries_on_branch(&query, &BranchBounds::default())
+        .await
+        .ok()?
+        .into_iter()
+        .rev()
+        .find_map(|entry| match entry {
+            rpi_harness::session::types::Entry::Custom(custom)
+                if custom.custom_type == "rpi_mode" =>
+            {
+                custom.data.and_then(|data| {
+                    data.get("modeId")
+                        .and_then(|id| id.as_str())
+                        .map(str::to_owned)
+                })
+            }
+            _ => None,
+        })
+        .filter(|mode| matches!(mode.as_str(), "default" | "plan"))
+}
+
+async fn rpc_get_modes(mode_state: &Arc<tokio::sync::Mutex<RpcModeState>>) -> serde_json::Value {
+    let state = mode_state.lock().await;
+    serde_json::json!({"currentModeId": state.current, "availableModes": mode_descriptors()})
+}
+
+const PLAN_READ_ONLY_TOOLS: &[&str] = &[
+    "read",
+    "grep",
+    "glob",
+    "search",
+    "codegraph",
+    "codegraph_search",
+    "webfetch",
+    "websearch",
+    "todo",
+];
+
+async fn rpc_set_mode(
+    lane: &Arc<dyn AgentLane>,
+    harness: &AgentHarness,
+    mode_state: &Arc<tokio::sync::Mutex<RpcModeState>>,
+    msg: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let mode = msg
+        .get("modeId")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("set_mode requires `modeId`")?;
+    rpc_apply_mode(lane, harness, mode_state, mode, true).await
+}
+
+async fn rpc_apply_mode(
+    lane: &Arc<dyn AgentLane>,
+    harness: &AgentHarness,
+    mode_state: &Arc<tokio::sync::Mutex<RpcModeState>>,
+    mode: &str,
+    persist: bool,
+) -> Result<serde_json::Value, String> {
+    if !matches!(mode, "default" | "plan") {
+        return Err(format!("unknown mode: {mode}"));
+    }
+    if lane
+        .snapshot()
+        .await
+        .map_err(|error| error.to_string())?
+        .active
+        .is_some()
+    {
+        return Err("cannot change session mode while a run is active".into());
+    }
+
+    let mut state = mode_state.lock().await;
+    if state.current == mode {
+        return Ok(serde_json::json!({
+            "currentModeId": state.current,
+            "availableModes": mode_descriptors()
+        }));
+    }
+    let old_prompt = harness
+        .get_system_prompt()
+        .await
+        .map_err(|e| e.to_string())?;
+    let old_tools = lane.get_active_tools().await.map_err(|e| e.to_string())?;
+    let old_base_prompt_saved = state.base_prompt_saved;
+    let old_base_tools = state.base_tools.clone();
+
+    let (target_prompt, target_tools, new_base_prompt, new_base_prompt_saved, new_base_tools) =
+        if mode == "plan" {
+            let base_prompt = if state.current == "default" {
+                old_prompt.clone()
+            } else if state.base_prompt_saved {
+                state.base_prompt.clone()
+            } else {
+                old_prompt.clone()
+            };
+            let base_tools = if state.current == "default" {
+                old_tools.clone()
+            } else {
+                state.base_tools.clone().unwrap_or(old_tools.clone())
+            };
+            let tools = base_tools
+                .iter()
+                .filter(|name| PLAN_READ_ONLY_TOOLS.contains(&name.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            let prompt = format!(
+            "{}\n\nYou are in plan mode. Analyze the request and produce an actionable plan. Only read-only tools are enabled; do not modify files or run mutating commands.",
+            base_prompt.clone().unwrap_or_default()
+        );
+            (Some(prompt), tools, base_prompt, true, Some(base_tools))
+        } else {
+            (
+                if state.base_prompt_saved {
+                    state.base_prompt.clone()
+                } else {
+                    old_prompt.clone()
+                },
+                state.base_tools.clone().unwrap_or(old_tools.clone()),
+                None,
+                false,
+                None,
+            )
+        };
+
+    // Apply as one transaction. If either native mutation or durable mode
+    // recording fails, restore both fields before reporting the old mode.
+    let apply = async {
+        lane.set_active_tools(target_tools.clone())
+            .await
+            .map_err(|error| error.to_string())?;
+        harness
+            .set_system_prompt(target_prompt.clone())
+            .await
+            .map_err(|error| error.to_string())?;
+        if persist {
+            harness
+                .append_custom_entry("rpi_mode", Some(serde_json::json!({"modeId": mode})))
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok::<(), String>(())
+    }
+    .await;
+    if let Err(error) = apply {
+        let _ = lane.set_active_tools(old_tools).await;
+        let _ = harness.set_system_prompt(old_prompt).await;
+        state.base_prompt_saved = old_base_prompt_saved;
+        state.base_tools = old_base_tools;
+        return Err(format!("mode change rolled back: {error}"));
+    }
+
+    state.base_prompt = new_base_prompt;
+    state.base_prompt_saved = new_base_prompt_saved;
+    state.base_tools = new_base_tools;
+    state.current = mode.to_string();
+    Ok(serde_json::json!({
+        "currentModeId": state.current,
+        "availableModes": mode_descriptors()
+    }))
+}
+
+async fn rpc_set_compaction_enabled(
+    harness: &AgentHarness,
+    msg: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let enabled = msg
+        .get("enabled")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or("set_compaction_enabled requires boolean `enabled`")?;
+    harness
+        .set_compaction_enabled(enabled)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({"enabled": enabled}))
 }
 
 async fn rpc_get_stats(
@@ -1788,6 +2521,42 @@ async fn rpc_get_available_thinking_levels(lane: &Arc<dyn AgentLane>) -> serde_j
     serde_json::json!({"levels": levels})
 }
 
+async fn rpc_configure_external_tools(
+    lane: &Arc<dyn AgentLane>,
+    harness: &AgentHarness,
+    mode_state: &Arc<tokio::sync::Mutex<RpcModeState>>,
+    backend: &Arc<crate::rpc::external_tools::ExternalTools>,
+    old_names: &mut Vec<String>,
+    msg: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    use rpi_tools::tools::external::{ExternalToolDefinition, validate_external_tool_definitions, create_external_tool};
+    use rpi_harness::types::HarnessTool;
+    if lane.snapshot().await.map_err(|e| e.to_string())?.active.is_some() {
+        return Err("cannot configure external tools while a run is active".into());
+    }
+    let definitions: Vec<ExternalToolDefinition> = serde_json::from_value(msg["tools"].clone()).map_err(|e| e.to_string())?;
+    let mut registry = harness.get_tools().await.map_err(|e| e.to_string())?;
+    registry.retain(|t| !old_names.contains(&t.tool.schema().name));
+    // Reserve native names even when disabled at launch; permission tools
+    // cannot be impersonated by an external producer.
+    let mut reserved = ["read", "write", "edit", "bash", "powershell", "docs", "grep", "find", "ls", "image", "permissions", "permission", "ask_user", "plan_mode_start", "plan_mode_complete"]
+        .iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    reserved.extend(registry.iter().map(|t| t.tool.schema().name.clone()));
+    validate_external_tool_definitions(&definitions, &reserved).map_err(|e| e.to_string())?;
+    let names = definitions.iter().map(|d| d.name.clone()).collect::<Vec<_>>();
+    let mut state = mode_state.lock().await;
+    let mut active = lane.get_active_tools().await.map_err(|e| e.to_string())?;
+    active.retain(|n| !old_names.contains(n));
+    if state.current != "plan" { active.extend(names.clone()); }
+    registry.extend(definitions.into_iter().map(|d| HarnessTool::new(create_external_tool(d, backend.clone()))));
+    harness.set_tools(registry, Some(active.clone())).await.map_err(|e| e.to_string())?;
+    // Configuration during Plan must not resurrect old or newly configured
+    // external tools on return to default. Only preserve preexisting native tools.
+    if let Some(base) = state.base_tools.as_mut() { base.retain(|n| !old_names.contains(n)); }
+    *old_names = names.clone();
+    Ok(serde_json::json!({"tools":names,"activeTools":active}))
+}
+
 async fn rpc_get_available_tools(
     lane: &Arc<dyn AgentLane>,
     harness: &AgentHarness,
@@ -2254,6 +3023,39 @@ mod tests {
         assert!(!text.contains("\\n"));
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rpc_child_callback_reaches_writer_in_fifo_order() {
+        let (parent, _) = rpc_test_harness("child live output", 1000.0).await;
+        let output = RpcOutput::default();
+        let (writer, writer_task, _) = start_rpc_writer(output.clone());
+        let (sink, forwarder) = start_child_rpc_forwarder(writer.clone(), Arc::new(Mutex::new(None)));
+        let children = crate::child_agents::ChildAgents::default();
+        children.set_event_sink(Some(sink));
+        let started = children.handle(&parent, 7, serde_json::json!({
+            "op":"start", "task":"report", "tools":[]
+        })).await.unwrap();
+        let id = started["childId"].as_str().unwrap();
+        output.wait_for(|m| m["type"] == "child_end").await;
+        children.set_event_sink(None);
+        forwarder.await.unwrap();
+        drop(writer);
+        writer_task.await.unwrap().unwrap();
+        let messages = output.messages();
+        assert_eq!(messages.first().unwrap()["type"], "child_start");
+        assert_eq!(messages.last().unwrap()["type"], "child_end");
+        assert!(messages.iter().any(|m| m["type"] == "child_event"));
+        assert_eq!(messages.iter().filter(|m| m["type"] == "child_end").count(), 1);
+        for message in &messages {
+            assert_eq!(message["sessionId"], id);
+            assert_eq!(message["childId"], id);
+            assert_eq!(message["parentSessionId"], parent.session().storage().metadata().id);
+            assert!(message.get("toolCallId").is_none());
+        }
+        assert_ne!(id, parent.session().storage().metadata().id);
+        assert!(rpc_protocol::ready()["supportedEvents"].as_array().unwrap()
+            .iter().all(|v| v != "child_start"));
+    }
+
     #[derive(Clone, Default)]
     struct RpcOutput(Arc<Mutex<Vec<u8>>>);
 
@@ -2292,6 +3094,9 @@ mod tests {
             .expect("RPC message not received")
         }
     }
+
+    include!("rpc/external_tools_configuration_tests.rs");
+    include!("rpc/system_prompt_tests.rs");
 
     async fn rpc_test_harness(
         text: &str,
@@ -2427,6 +3232,76 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rpc_ordered_mixed_and_malformed_legacy_rejected_before_acceptance() {
+        use tokio::io::AsyncWriteExt;
+        let (harness, provider) = rpc_test_harness("must not run", 0.0).await;
+        let (mut client, output, task) = start_test_rpc(harness, rpi_extensions::UiDialogMailbox::new());
+        for (index, (key, value)) in [
+            ("message", serde_json::json!("legacy")),
+            ("prompt", serde_json::json!("legacy")),
+            ("images", serde_json::json!([{"data":"AA==","mimeType":"image/png"}])),
+            ("audio", serde_json::json!([{"data":"AA==","mimeType":"audio/wav"}])),
+            ("images", serde_json::json!({"bad":"type"})),
+            ("audio", serde_json::json!("bad type")),
+            ("images", serde_json::json!(null)),
+            ("audio", serde_json::json!([{}])),
+        ].into_iter().enumerate() {
+            let id = index + 10;
+            let mut command = serde_json::json!({"type":"prompt", "id":id,
+                "content":[{"type":"text", "text":"ordered"}]});
+            command[key] = value;
+            client.write_all(format!("{command}\n").as_bytes()).await.unwrap();
+            let response = output.wait_for(|m| m["type"] == "response" && m["id"] == id).await;
+            assert_eq!(response["success"], false, "{command}: {response}");
+            assert!(!output.messages().iter().any(|m| m["id"] == id && m["data"]["accepted"] == true));
+            let query = serde_json::json!({"type":"get_messages", "id":id + 100});
+            client.write_all(format!("{query}\n").as_bytes()).await.unwrap();
+            let history = output.wait_for(|m| m["type"] == "response" && m["id"] == id + 100).await;
+            assert_eq!(history["data"]["messages"].as_array().unwrap().iter()
+                .filter(|m| m["role"] == "user").count(), 0, "{command}");
+            assert_eq!(provider.state().call_count.load(std::sync::atomic::Ordering::Relaxed), 0);
+        }
+        client.write_all(b"{\"type\":\"stop\",\"id\":999}\n").await.unwrap();
+        assert_eq!(task.await.unwrap(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rpc_ordered_prompt_commits_and_reaches_provider_in_order() {
+        use tokio::io::AsyncWriteExt;
+        use rpi_ai::providers::faux::{FauxStep, faux_assistant_message};
+        // A real tiny PNG avoids the harness's intentional invalid-image
+        // placeholder conversion; assert exact bytes as well as block order.
+        let parts = serde_json::json!([
+            {"type":"text","text":"before"},
+            {"type":"image","data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==","mimeType":"image/png"},
+            {"type":"text","text":"between"},
+            {"type":"audio","data":"AA==","mimeType":"audio/wav"},
+            {"type":"text","text":"after"}
+        ]);
+        let expected = parts.clone();
+        let (harness, provider) = rpc_test_harness("unused", 0.0).await;
+        provider.script().set_responses(vec![FauxStep::factory(move |context| {
+            let messages = serde_json::to_value(&context.messages).unwrap();
+            let user = messages.as_array().unwrap().iter().find(|m| m["role"] == "user").unwrap();
+            assert_eq!(user["content"], expected, "provider input order");
+            faux_assistant_message("completed", rpi_ai::types::StopReason::Stop)
+        })]);
+        let (mut client, output, task) = start_test_rpc(harness, rpi_extensions::UiDialogMailbox::new());
+        let command = serde_json::json!({"type":"prompt","id":1,"content":parts});
+        client.write_all(format!("{command}\n").as_bytes()).await.unwrap();
+        let event = output.wait_for(|m| m["type"] == "session_entry_committed" && m["entryType"] == "message").await;
+        assert!(event["entryId"].as_str().is_some());
+        let settled = output.wait_for(|m| m["type"] == "agent_settled").await;
+        assert_eq!(settled["outcome"], "completed");
+        client.write_all(b"{\"type\":\"get_messages\",\"id\":2}\n").await.unwrap();
+        let history = output.wait_for(|m| m["type"] == "response" && m["id"] == 2).await;
+        let user = history["data"]["messages"].as_array().unwrap().iter().find(|m| m["role"] == "user").unwrap();
+        assert_eq!(user["content"], parts, "committed input order");
+        client.write_all(b"{\"type\":\"stop\",\"id\":3}\n").await.unwrap();
+        assert_eq!(task.await.unwrap(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rpc_compaction_settlement_identifies_its_durable_operation() {
         let (harness, _) = rpc_test_harness("unused", 0.0).await;
         let output = RpcOutput::default();
@@ -2506,6 +3381,44 @@ mod tests {
         }
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rpc_owner_stalled_sink_escalates_before_sink_release() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // Exercise both the command and agent-event producers, including EOF
+        // while a write is blocked. Library tests inject policy, never exit.
+        for events_only in [false, true] {
+            let harness = AgentHarness::create(Default::default()).await.unwrap();
+            let release = Arc::new(AtomicBool::new(false));
+            struct ReleaseOnDrop(Arc<AtomicBool>);
+            impl Drop for ReleaseOnDrop {
+                fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); }
+            }
+            let _cleanup = ReleaseOnDrop(release.clone());
+            let escalated = Arc::new(AtomicBool::new(false));
+            let observed = escalated.clone();
+            let unblock = release.clone();
+            let (tx, rx) = tokio::sync::broadcast::channel(256);
+            for _ in 0..150 { tx.send(AgentEvent::AgentStart).unwrap(); }
+            let commands = (0..150).map(|id| format!("{{\"type\":\"get_state\",\"id\":{id}}}\n")).collect::<String>();
+            let input = if events_only { "" } else { commands.as_str() };
+            let result = tokio::time::timeout(std::time::Duration::from_secs(6), rpc_with_io_child(
+                &harness, if events_only { Some(rx) } else { None }, vec![],
+                rpi_extensions::UiDialogMailbox::new(), None,
+                tokio::io::BufReader::new(input.as_bytes()),
+                BackpressuredOutput {
+                    entered: Arc::new(AtomicBool::new(false)), release: release.clone(),
+                    output: RpcOutput::default(),
+                }, None, None, Some(Box::new(move || {
+                    assert!(!unblock.load(Ordering::SeqCst), "escalation must precede sink release");
+                    observed.store(true, Ordering::SeqCst);
+                    unblock.store(true, Ordering::SeqCst);
+                })),
+            )).await.unwrap();
+            assert_eq!(result, 1);
+            assert!(escalated.load(Ordering::SeqCst));
         }
     }
 
@@ -2745,12 +3658,14 @@ mod tests {
             .unwrap();
         ui.handle(serde_json::json!({"requestId":"approval", "toolCallId":"call", "ui":{}}))
             .unwrap();
-        output.wait_for(|m| m["type"] == "ui_dialog_request").await;
-        client.write_all(b"{\"type\":\"ui_dialog_response\",\"requestId\":\"approval\",\"answer\":true}\n{\"type\":\"ping\",\"id\":2}\n").await.unwrap();
+        let dialog = output.wait_for(|m| m["type"] == "ui_dialog_request").await;
+        let wire = dialog["requestId"].as_str().unwrap();
+        let response = serde_json::json!({"type":"ui_dialog_response","requestId":wire,"answer":true});
+        client.write_all(format!("{response}\n{{\"type\":\"ping\",\"id\":2}}\n").as_bytes()).await.unwrap();
         output.wait_for(|m| m["id"] == 2).await;
         assert_eq!(ui.poll("approval").unwrap()["answer"], true);
         output
-            .wait_for(|m| m["type"] == "ui_dialog_closed" && m["requestId"] == "approval")
+            .wait_for(|m| m["type"] == "ui_dialog_closed" && m["requestId"] == wire)
             .await;
         client.shutdown().await.unwrap();
         assert_eq!(
@@ -2774,15 +3689,154 @@ mod tests {
         output.wait_for(|m| m["type"] == "ready").await;
         ui.handle(serde_json::json!({"requestId":"cancelled", "toolCallId":"c", "ui":{}}))
             .unwrap();
-        output.wait_for(|m| m["type"] == "ui_dialog_request").await;
+        let dialog = output.wait_for(|m| m["type"] == "ui_dialog_request").await;
         ui.cancel_tool_call("c");
         output
-            .wait_for(|m| m["type"] == "ui_dialog_closed" && m["requestId"] == "cancelled")
+            .wait_for(|m| m["type"] == "ui_dialog_closed" && m["requestId"] == dialog["requestId"])
             .await;
         // The notification must not consume the cancellation meant for the plugin.
         assert_eq!(ui.poll("cancelled").unwrap()["status"], "cancelled");
         client.shutdown().await.unwrap();
         assert_eq!(task.await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn rpc_url_actions_reach_plugin_without_collapsing_decline_into_cancel() {
+        use tokio::io::AsyncWriteExt;
+        let harness = AgentHarness::create(Default::default()).await.unwrap();
+        let ui = rpi_extensions::UiDialogMailbox::new();
+        let (mut client, output, task) = start_test_rpc(harness, ui.clone());
+        output.wait_for(|m| m["type"] == "ready").await;
+        for (index, action) in ["accept", "decline", "cancel"].into_iter().enumerate() {
+            let request_id = format!("url-{index}");
+            ui.handle(serde_json::json!({"requestId":request_id,"ui":{
+                "kind":"url","url":"https://example.com","message":"Open URL"
+            }}))
+            .unwrap();
+            let dialog = output
+                .wait_for(|m| m["type"] == "ui_dialog_request" && m["ui"]["kind"] == "url"
+                    && m["requestId"].as_str().is_some_and(|id| ui.is_pending_wire(id)))
+                .await;
+            let wire = &dialog["requestId"];
+            // Invalid actions must leave the request pending.
+            let invalid = serde_json::json!({"type":"ui_dialog_response", "id":100 + index,
+                "requestId":wire,"urlElicitation":{"action":"invalid"}});
+            client
+                .write_all(format!("{invalid}\n").as_bytes())
+                .await
+                .unwrap();
+            let ack = output.wait_for(|m| m["id"] == 100 + index).await;
+            assert_eq!(ack["success"], false);
+            assert!(ui.is_pending(&request_id));
+            let response = serde_json::json!({"type":"ui_dialog_response", "id":200 + index,
+                "requestId":wire,"urlElicitation":{"action":action},"cancelled":action != "accept"});
+            client
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .unwrap();
+            assert_eq!(
+                output.wait_for(|m| m["id"] == 200 + index).await["success"],
+                true
+            );
+            let result = ui.poll(&request_id).unwrap();
+            assert_eq!(result["answer"]["urlElicitation"]["action"], action);
+            assert!(!ui.is_pending(&request_id));
+            client
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+        client.shutdown().await.unwrap();
+        assert_eq!(task.await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn rpc_client_requests_correlate_same_method_and_retire_late_replies() {
+        use tokio::io::AsyncWriteExt;
+        let harness = AgentHarness::create(Default::default()).await.unwrap();
+        let (mut client, output, task) =
+            start_test_rpc(harness, rpi_extensions::UiDialogMailbox::new());
+        for id in [1, 2] {
+            let request = serde_json::json!({"type":"client_request", "id":id,
+                "correlationId":format!("origin-{id}"),
+                "method":"fs/read_text_file","params":{"path":format!("C:/file-{id}")}});
+            client
+                .write_all(format!("{request}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+        let first = output
+            .wait_for(|m| m["type"] == "client_request" && m["params"]["path"] == "C:/file-1")
+            .await;
+        let second = output
+            .wait_for(|m| m["type"] == "client_request" && m["params"]["path"] == "C:/file-2")
+            .await;
+        assert_ne!(first["requestId"], second["requestId"]);
+        assert_eq!(first["correlationId"], "origin-1");
+        assert_eq!(second["correlationId"], "origin-2");
+        for (id, event) in [(2, second), (1, first)] {
+            let response = serde_json::json!({"type":"client_response", "requestId":event["requestId"],"result":{"content":format!("reply-{id}")}});
+            client
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .unwrap();
+            let result = output
+                .wait_for(|m| m["type"] == "response" && m["id"] == id)
+                .await;
+            assert_eq!(result["data"]["content"], format!("reply-{id}"));
+            output
+                .wait_for(|m| {
+                    m["type"] == "client_request_closed" && m["requestId"] == event["requestId"]
+                })
+                .await;
+            client
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+        client.write_all(b"{\"type\":\"client_request\",\"id\":3,\"method\":\"fs/read_text_file\",\"params\":{},\"timeoutMs\":1}\n").await.unwrap();
+        let expired = output
+            .wait_for(|m| m["type"] == "client_request" && m["params"] == serde_json::json!({}))
+            .await;
+        assert_eq!(output.wait_for(|m| m["id"] == 3).await["success"], false);
+        let late = serde_json::json!({"type":"client_response","requestId":expired["requestId"],"result":{"content":"late"}});
+        client
+            .write_all(format!("{late}\n").as_bytes())
+            .await
+            .unwrap();
+        client.write_all(b"{\"type\":\"client_request\",\"id\":4,\"method\":\"fs/read_text_file\",\"params\":{\"path\":\"abort\"}}\n").await.unwrap();
+        let aborted = output
+            .wait_for(|m| m["type"] == "client_request" && m["params"]["path"] == "abort")
+            .await;
+        client
+            .write_all(b"{\"type\":\"abort\",\"id\":5}\n")
+            .await
+            .unwrap();
+        assert_eq!(output.wait_for(|m| m["id"] == 4).await["success"], false);
+        output
+            .wait_for(|m| {
+                m["type"] == "client_request_closed" && m["requestId"] == aborted["requestId"]
+            })
+            .await;
+        client.write_all(b"{\"type\":\"client_request\",\"id\":6,\"method\":\"fs/read_text_file\",\"params\":{\"path\":\"eof\"}}\n").await.unwrap();
+        let eof = output
+            .wait_for(|m| m["type"] == "client_request" && m["params"]["path"] == "eof")
+            .await;
+        client.shutdown().await.unwrap();
+        assert_eq!(task.await.unwrap(), 0);
+        let messages = output.messages();
+        assert!(messages
+            .iter()
+            .any(|m| m["type"] == "client_request_closed" && m["requestId"] == eof["requestId"]));
+        for id in [1, 2, 3, 4, 6] {
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|m| m["type"] == "response" && m["id"] == id)
+                    .count(),
+                1
+            );
+        }
     }
 
     #[tokio::test]
@@ -2803,11 +3857,11 @@ mod tests {
         ] {
             ui.handle(serde_json::json!({"requestId":request_id,"toolCallId":request_id,"ui":{}}))
                 .unwrap();
-            output
-                .wait_for(|m| m["type"] == "ui_dialog_request" && m["requestId"] == request_id)
+            let dialog = output
+                .wait_for(|m| m["type"] == "ui_dialog_request" && m["toolCallId"] == request_id)
                 .await;
             let command = RemoteCommand::UiDialogResponse {
-                request_id: request_id.into(),
+                request_id: dialog["requestId"].as_str().unwrap().into(),
                 cancelled: answer.is_none(),
                 answer,
             }
@@ -2840,6 +3894,7 @@ mod tests {
             api: rpi_ai::Api::AnthropicMessages,
             provider: "anthropic".into(),
             model: "claude-sonnet-5".into(),
+            message_id: None,
             response_model: None,
             response_id: None,
             usage: Usage::zero(),
@@ -2876,6 +3931,53 @@ mod tests {
             final_message: assistant("ok", StopReason::Stop),
         };
         assert_eq!(outcome_exit_code(&completed), 0);
+    }
+
+    #[tokio::test]
+    async fn rpc_dialog_wire_ownership_survives_collisions_and_late_cleanup() {
+        use tokio::io::AsyncWriteExt;
+        let harness = AgentHarness::create(Default::default()).await.unwrap();
+        let ui = rpi_extensions::UiDialogMailbox::new();
+        let (mut client, output, task) = start_test_rpc(harness, ui.clone());
+        output.wait_for(|m| m["type"] == "ready").await;
+        let sessions = [None, Some("child-a"), Some("child-b")];
+        let mut dialogs = Vec::new();
+        for session in sessions {
+            ui.handle_with_session(serde_json::json!({"requestId":"same", "toolCallId":"same-call",
+                "sessionId":"forged", "ui":{"message":session.unwrap_or("root")}}), session.map(str::to_owned)).unwrap();
+            let dialog = output.wait_for(|m| m["type"] == "ui_dialog_request"
+                && m["ui"]["message"] == session.unwrap_or("root")).await;
+            assert_ne!(dialog["requestId"], "same");
+            assert_eq!(dialog.get("sessionId").and_then(|v| v.as_str()), session);
+            dialogs.push(dialog);
+        }
+        // The old caller-local ID is not a transport capability, even at root.
+        client.write_all(b"{\"type\":\"ui_dialog_response\",\"id\":70,\"requestId\":\"same\",\"answer\":\"forged\"}\n").await.unwrap();
+        assert_eq!(output.wait_for(|m| m["id"] == 70).await["success"], false);
+        ui.cancel_tool_call_with_session("same-call", Some("child-a".into()));
+        let closed = output.wait_for(|m| m["type"] == "ui_dialog_closed" && m["requestId"] == dialogs[1]["requestId"]).await;
+        assert_eq!(closed["sessionId"], "child-a");
+        for i in [2, 0, 1] {
+            let response = serde_json::json!({"type":"ui_dialog_response","id":80+i,
+                "requestId":dialogs[i]["requestId"],"answer":i,"sessionId":"forged"});
+            client.write_all(format!("{response}\n").as_bytes()).await.unwrap();
+            assert_eq!(output.wait_for(|m| m["id"] == 80+i).await["success"], i != 1);
+            let result = ui.handle_with_session(serde_json::json!({"op":"poll","requestId":"same"}), sessions[i].map(str::to_owned)).unwrap();
+            assert_eq!(result["requestId"], "same");
+            if i == 1 {
+                assert_eq!(result["status"], "cancelled");
+            } else {
+                assert_eq!(result["answer"], i);
+                let closed = output.wait_for(|m| m["type"] == "ui_dialog_closed" && m["requestId"] == dialogs[i]["requestId"]).await;
+                assert_eq!(closed.get("sessionId").and_then(|v| v.as_str()), sessions[i]);
+            }
+            // Retirement cannot answer a reopened local request or a sibling.
+            client.write_all(format!("{response}\n").as_bytes()).await.unwrap();
+            client.write_all(format!("{{\"type\":\"ping\",\"id\":{}}}\n", 90+i).as_bytes()).await.unwrap();
+            output.wait_for(|m| m["id"] == 90+i).await;
+        }
+        client.shutdown().await.unwrap();
+        assert_eq!(task.await.unwrap(), 0);
     }
 
     #[test]

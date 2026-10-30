@@ -15,15 +15,45 @@ use rpi_harness::session::Session;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
+/// Host-owned asynchronous transport hook. Implementations must complete each emit;
+/// the child owns ordering and draining, not the host transport's lifetime.
+pub(crate) type ChildEventSink =
+    Arc<dyn Fn(Value) -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
+
+/// Creator-only request: no model-provided path or relation fields.
+pub(crate) struct ChildSessionRequest {
+    pub id: String,
+    pub parent_storage: Arc<dyn rpi_harness::session::types::SessionStorage>,
+    pub parent_tool_call_id: Option<rpi_agent::tool_execution_scope::InvocationToolCallId>,
+}
+pub(crate) type ChildSessionFactory = Arc<dyn Fn(ChildSessionRequest) -> futures::future::BoxFuture<'static, Result<Session, String>> + Send + Sync>;
+
+pub(crate) fn memory_child_session(request: &ChildSessionRequest) -> Session {
+    Session::new(Arc::new(InMemorySessionStorage::new(SessionMetadata {
+        id: request.id.clone(), created_at: 0,
+        parent_session_id: Some(request.parent_storage.metadata().id),
+    }, Arc::new(SystemClock), Arc::new(DefaultIdGenerator::new()))), None).with_volatile_progress()
+}
+
+// Cancelling the admission caller revokes publication, but the creator-owned
+// task still finishes storage creation and drains before releasing its slot.
+struct AdmissionGuard(Option<Arc<Job>>);
+impl Drop for AdmissionGuard {
+    fn drop(&mut self) { if let Some(job) = &self.0 { job.cancel.cancel(); } }
+}
+
 const MAX_JOBS: usize = 16;
 const MAX_OUTPUT: usize = 4 * 1024 * 1024;
 const MAX_EVENTS: usize = 8192;
 
 #[derive(Default)]
 pub(crate) struct ChildAgents {
-    jobs: Mutex<HashMap<String, Arc<Job>>>,
+    jobs: Arc<Mutex<HashMap<String, Arc<Job>>>>,
     revoked: Mutex<HashSet<u64>>,
     active: Arc<AtomicUsize>,
+    sink: Mutex<Option<ChildEventSink>>,
+    factory: Mutex<Option<ChildSessionFactory>>,
+    tasks: Mutex<tokio::task::JoinSet<()>>,
 }
 
 struct Permit(Arc<AtomicUsize>);
@@ -37,7 +67,15 @@ struct Job {
     owner: u64,
     cancel: CancellationToken,
     invocation_signal: Option<CancellationToken>,
+    parent_tool_call_id: Option<rpi_agent::tool_execution_scope::InvocationToolCallId>,
     state: Mutex<State>,
+    forwarding: Mutex<Option<Forwarding>>,
+}
+
+struct Forwarding {
+    sender: Option<tokio::sync::mpsc::Sender<Value>>,
+    task: tokio::task::JoinHandle<()>,
+    envelope: Value,
 }
 
 #[derive(Default)]
@@ -47,10 +85,66 @@ struct State {
     events: usize,
     turns: u32,
     result: Option<Value>,
+    settled: bool,
     error: Option<String>,
 }
 
 impl Job {
+    // Called before the runner is spawned. The forwarding task announces the
+    // association before releasing the runner, and owns the single terminal.
+    fn attach(
+        self: &Arc<Self>,
+        sink: ChildEventSink,
+        mut envelope: Value,
+    ) -> tokio::sync::oneshot::Receiver<()> {
+        if let Some(id) = &self.parent_tool_call_id {
+            envelope["parentToolCallId"] = json!(id.as_str());
+        }
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<Value>(256);
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let weak = Arc::downgrade(self);
+        let mut announcement = envelope.clone();
+        announcement["type"] = json!("child_start");
+        let mut terminal = envelope.clone();
+        let task = tokio::spawn(async move {
+            sink(announcement).await;
+            let _ = ready.send(());
+            while let Some(event) = receiver.recv().await {
+                sink(event).await;
+            }
+            terminal["type"] = json!("child_end");
+            if let Some(job) = weak.upgrade() {
+                let state = job.state.lock().unwrap_or_else(|e| e.into_inner());
+                terminal["status"] = json!(if state.error.is_some() {
+                    "failed"
+                } else {
+                    "done"
+                });
+                terminal["error"] = json!(state.error);
+                terminal["result"] = json!(state.result);
+            }
+            sink(terminal).await;
+        });
+        *self.forwarding.lock().unwrap_or_else(|e| e.into_inner()) = Some(Forwarding {
+            sender: Some(sender),
+            task,
+            envelope,
+        });
+        started
+    }
+
+    async fn finish_events(&self) {
+        let forwarding = self
+            .forwarding
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(mut forwarding) = forwarding {
+            forwarding.sender.take();
+            let _ = forwarding.task.await;
+        }
+    }
+
     fn fail(&self, error: impl Into<String>) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.result.is_none() && state.error.is_none() {
@@ -64,6 +158,37 @@ impl Job {
         if state.result.is_some() || state.error.is_some() {
             return;
         }
+        let forwarding = self.forwarding.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(forwarding) = forwarding.as_ref() {
+            let mut envelope = forwarding.envelope.clone();
+            envelope["type"] = json!("child_event");
+            envelope["event"] = serde_json::to_value(
+                crate::remote::protocol::RemoteEvent::from_agent_event(&event),
+            )
+            .expect("native event projection is serializable");
+            // RemoteEvent intentionally projects message payloads; retain the
+            // native canonical identity as well where the source supplies it.
+            match &event {
+                AgentEvent::MessageStart { message_id, .. }
+                | AgentEvent::MessageUpdate { message_id, .. }
+                | AgentEvent::MessageEnd { message_id, .. } => {
+                    if let Some(id) = message_id {
+                        envelope["event"]["messageId"] = json!(id);
+                    }
+                }
+                _ => {}
+            }
+            if forwarding
+                .sender
+                .as_ref()
+                .is_none_or(|tx| tx.try_send(envelope).is_err())
+            {
+                state.error = Some("child event forwarding overflow or closed sink".into());
+                self.cancel.cancel();
+                return;
+            }
+        }
+        drop(forwarding);
         match event {
             AgentEvent::TurnEnd { .. } => state.turns += 1,
             AgentEvent::MessageUpdate {
@@ -100,10 +225,28 @@ impl AgentEmitter for Emitter {
 impl Drop for ChildAgents {
     fn drop(&mut self) {
         self.cancel_all();
+        // Rust Drop cannot await. Transfer the bounded set to one cleanup owner,
+        // which joins (never detaches) every creation/runner future. In-flight
+        // creation finishes without publication, then drains and releases slots.
+        let mut tasks = std::mem::take(self.tasks.get_mut().unwrap_or_else(|e| e.into_inner()));
+        if !tasks.is_empty() {
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move { while tasks.join_next().await.is_some() {} });
+            }
+        }
     }
 }
 
 impl ChildAgents {
+    pub(crate) fn set_session_factory(&self, factory: ChildSessionFactory) {
+        *self.factory.lock().unwrap_or_else(|e| e.into_inner()) = Some(factory);
+    }
+
+    /// Applies to future children only; existing jobs retain their original sink.
+    pub(crate) fn set_event_sink(&self, sink: Option<ChildEventSink>) {
+        *self.sink.lock().unwrap_or_else(|e| e.into_inner()) = sink;
+    }
+
     pub(crate) fn cancel_owner(&self, owner: u64) {
         self.revoked
             .lock()
@@ -165,7 +308,7 @@ impl ChildAgents {
                 let mut state = job.state.lock().unwrap_or_else(|e| e.into_inner());
                 let status = if state.error.is_some() {
                     "failed"
-                } else if state.result.is_some() {
+                } else if state.result.is_some() && state.settled {
                     "done"
                 } else {
                     "running"
@@ -184,7 +327,7 @@ impl ChildAgents {
                 let drained = state.deltas.is_empty();
                 Ok(
                     json!({"childId":id, "status":if drained {status} else {"running"}, "deltas":deltas,
-                    "turns":state.turns, "result":if drained {state.result.clone()} else {None},
+                    "turns":state.turns, "result":if drained && state.settled {state.result.clone()} else {None},
                     "error":if drained {state.error.clone()} else {None}}),
                 )
             }
@@ -254,7 +397,9 @@ impl ChildAgents {
             owner,
             cancel: CancellationToken::new(),
             invocation_signal,
+            parent_tool_call_id: rpi_agent::tool_execution_scope::invocation_tool_call_id(),
             state: Mutex::new(State::default()),
+            forwarding: Mutex::new(None),
         });
         // Reserve before awaiting construction so concurrent starts cannot exceed the cap.
         let permit;
@@ -285,56 +430,94 @@ impl ChildAgents {
             permit = Permit(self.active.clone());
             jobs.insert(id.clone(), job.clone());
         }
-        let session = Session::new(
-            Arc::new(InMemorySessionStorage::new(
-                SessionMetadata {
-                    id: id.clone(),
-                    created_at: 0,
-                    parent_session_id: Some(parent.session().storage().metadata().id.clone()),
-                },
-                Arc::new(SystemClock),
-                Arc::new(DefaultIdGenerator::new()),
-            )),
-            None,
-        );
-        let child = match parent
-            .create_child(session, Arc::new(Emitter(job.clone())), turns, tools)
-            .await
-        {
-            Ok(child) => child,
-            Err(error) => {
-                self.jobs
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&id);
-                return Err(error.to_string());
-            }
+        let sink = self.sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let factory = self.factory.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let request = ChildSessionRequest {
+            id: id.clone(), parent_storage: parent.session().storage(),
+            parent_tool_call_id: job.parent_tool_call_id.clone(),
         };
-        let prompt = format!("You are a delegated {role} subagent. Complete the task in at most {turns} turns. Do not delegate, spawn, or ask another agent to do work. Work only in the current project and return a concise final report.\n\nTask:\n{task}");
+        let parent = parent.clone();
+        let jobs = self.jobs.clone();
+        let role = role.to_owned();
+        let prompt = format!("You are a delegated {role} subagent. Complete the task in at most {turns} turns. Do not delegate, spawn, or ask another agent to do work. Work only in the current project and return a concise final report.
+
+Task:
+{task}");
+        let (reply, response) = tokio::sync::oneshot::channel();
+        let mut admission = AdmissionGuard(Some(job.clone()));
         let worker = job.clone();
-        let execution_scope = child.execution_scope.clone();
-        let cleanup_harness = child.harness.clone();
-        tokio::spawn(async move {
+        {
+        let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        while tasks.try_join_next().is_some() {}
+        tasks.spawn(async move {
             let _permit = permit;
-            if std::panic::AssertUnwindSafe(run_child(
-                child,
-                worker.clone(),
-                prompt,
-                turns,
-                timeout,
-            ))
-            .catch_unwind()
-            .await
-            .is_err()
-            {
+            let admitted = async {
+                let parent_storage = request.parent_storage.clone();
+                let session = match factory {
+                    Some(factory) => factory(request).await?,
+                    None => memory_child_session(&request),
+                };
+                let storage = session.storage();
+                let cancelled = || reply.is_closed() || worker.cancel.is_cancelled()
+                    || !Arc::ptr_eq(&parent_storage, &parent.session().storage())
+                    || worker.invocation_signal.as_ref().is_some_and(CancellationToken::is_cancelled);
+                if cancelled() {
+                    storage.drain().await;
+                    return Err("child admission cancelled".to_owned());
+                }
+                let child = match parent.create_child(session, Arc::new(Emitter(worker.clone())), turns, tools).await {
+                    Ok(child) => child,
+                    Err(error) => { storage.drain().await; return Err(error.to_string()); }
+                };
+                if cancelled() {
+                    let _ = child.harness.close().await;
+                    storage.drain().await;
+                    return Err("child admission cancelled".to_owned());
+                }
+                Ok((child, storage))
+            };
+            let (child, storage) = match std::panic::AssertUnwindSafe(admitted).catch_unwind().await {
+                Ok(Ok(value)) => value,
+                result => {
+                    let error = match result { Ok(Err(error)) => error, _ => "child construction panicked".into() };
+                    worker.fail(error.clone());
+                    jobs.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+                    let _ = reply.send(Err(error));
+                    return;
+                }
+            };
+            // Sending admission is synchronous: a dropped receiver cannot cause
+            // an announcement. Storage and harness exist before any child traffic.
+            if reply.send(Ok(json!({"childId":id,"sessionId":id,"status":"running"}))).is_err() {
+                let _ = child.harness.close().await;
+                storage.drain().await;
+                jobs.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+                return;
+            }
+            let started = sink.map(|sink| worker.attach(sink, json!({
+                "parentSessionId": storage.metadata().parent_session_id,
+                "sessionId": id, "childId": id, "role": role,
+            })));
+            let execution_scope = child.execution_scope.clone();
+            let cleanup_harness = child.harness.clone();
+            if let Some(started) = started {
+                if started.await.is_err() { worker.fail("child event announcement failed"); }
+            }
+            if std::panic::AssertUnwindSafe(run_child(child, worker.clone(), prompt, turns, timeout))
+                .catch_unwind().await.is_err() {
                 worker.fail("child runner panicked");
                 let _ = cleanup_harness.close().await;
             }
-            // Also retain capacity when run_child unwinds after starting a
-            // background driver; catch_unwind is not a cleanup completion.
             execution_scope.wait_idle().await;
+            storage.drain().await;
+            worker.state.lock().unwrap_or_else(|e| e.into_inner()).settled = true;
+            worker.finish_events().await;
         });
-        Ok(json!({"childId":id,"sessionId":id,"status":"running"}))
+        }
+        let result = response.await.map_err(|_| "child admission task stopped".to_owned())?;
+        // Successful admission transfers cancellation ownership to the runner.
+        if result.is_ok() { admission.0.take(); }
+        result
     }
 }
 

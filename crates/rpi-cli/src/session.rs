@@ -71,6 +71,40 @@ use rpi_extensions::{
 /// The coding tools registered by the CLI by default.
 pub const BUILTIN_TOOL_NAMES: &[&str] = &["read", "bash", "edit", "write", "docs"];
 
+/// Parse the bridge-provided ACP workspace roots once per native build. The
+/// bridge validates these before launch; native still re-validates so a child
+/// cannot become unrestricted if it is launched directly with a malformed env.
+fn acp_workspace_roots() -> Vec<PathBuf> {
+    let separator = if cfg!(windows) { ';' } else { ':' };
+    std::env::var("RPI_ACP_ADDITIONAL_DIRECTORIES")
+        .ok()
+        .into_iter()
+        .flat_map(|raw| {
+            raw.split(separator)
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from)
+                .collect::<Vec<_>>()
+        })
+        .filter_map(|path| std::fs::canonicalize(path).ok())
+        .filter(|path| path.is_dir())
+        .fold(Vec::new(), |mut roots, path| {
+            if !roots.contains(&path) {
+                roots.push(path);
+            }
+            roots
+        })
+}
+
+fn acp_tool_env(cwd: &Path) -> OsExecutionEnv {
+    let roots = acp_workspace_roots();
+    if roots.is_empty() && std::env::var_os("RPI_ACP_ADDITIONAL_DIRECTORIES").is_none() {
+        OsExecutionEnv::with_cwd(cwd.to_path_buf())
+    } else {
+        OsExecutionEnv::with_cwd_and_allowed_roots(cwd.to_path_buf(), roots)
+    }
+}
+
 /// The default coding system prompt for the CLI's built-in tools.
 ///
 /// This retains the two-argument API for library callers. Session startup and
@@ -456,15 +490,34 @@ pub async fn build_prepared(
     action_host.set_catalog(catalog.clone());
 
     // ---- Execution env + tools ----
-    let env = Arc::new(OsExecutionEnv::with_cwd(cwd.to_path_buf()));
-    let env_dyn: Arc<dyn rpi_tools::ExecutionEnv> = env.clone();
-    let mut_env: Arc<dyn rpi_tools::MutatingEnv> = env.clone();
+    // Resource discovery may legitimately read the user's global agent
+    // directory, while actual coding tools must obey ACP workspace roots.
+    let resource_env = Arc::new(OsExecutionEnv::with_cwd(cwd.to_path_buf()));
+    let tool_env = Arc::new(acp_tool_env(cwd));
+    let client_tools = match std::env::var("RPI_CLIENT_TOOLS") {
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => return Err(BuildError::HarnessCreate(format!("RPI_CLIENT_TOOLS: {error}"))),
+        Ok(raw) => {
+            if args.mode != crate::args::Mode::Rpc {
+                return Err(BuildError::HarnessCreate("RPI_CLIENT_TOOLS requires --mode rpc".into()));
+            }
+            let config = crate::rpc::client_tools::ClientToolsConfig::parse(&raw)
+                .map_err(BuildError::HarnessCreate)?;
+            let mut roots = acp_workspace_roots();
+            roots.extend(config.workspace_roots.clone());
+            let client_env = Arc::new(OsExecutionEnv::with_cwd_and_allowed_roots(cwd.to_path_buf(), roots));
+            Some(crate::rpc::client_tools::ClientTools::new(config, client_env))
+        }
+    };
+    let resource_env_dyn: Arc<dyn rpi_tools::ExecutionEnv> = resource_env;
+    let tool_env_dyn: Arc<dyn rpi_tools::ExecutionEnv> = tool_env.clone();
+    let mut_env: Arc<dyn rpi_tools::MutatingEnv> = tool_env;
     let _registry = Arc::new(MutationQueueRegistry::new());
-    // `env_dyn` is shared between the tool context (moved in) and the resource
-    // loaders below (borrowed); clone one branch so both hold a reference.
-    let ctx = ExecutionToolContext::new(env_dyn.clone(), Some(mut_env));
+    // Keep resource loading unrestricted, but pass the constrained environment
+    // to built-in and extension tools.
+    let ctx = ExecutionToolContext::new(tool_env_dyn.clone(), Some(mut_env));
 
-    let mut tools = build_tools(&ctx, args);
+    let mut tools = build_tools_with_client(&ctx, args, client_tools.as_ref());
 
     // ---- Extensions (Part B2) ----
     // Load cdylib plugins from the resolved extension dirs, merge their tools
@@ -545,6 +598,24 @@ pub async fn build_prepared(
             }
         }
     }
+    // ACP `additionalDirectories` are carried into the native child by the
+    // bridge. The native tools already accept absolute paths, so expose the
+    // negotiated roots in the model context without changing the ordinary CLI
+    // working directory or global resource discovery rules.
+    if let Ok(raw) = std::env::var("RPI_ACP_ADDITIONAL_DIRECTORIES") {
+        let separator = if cfg!(windows) { ';' } else { ':' };
+        let roots = raw
+            .split(separator)
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+            .collect::<Vec<_>>();
+        if !roots.is_empty() {
+            append_texts.push(format!(
+                "<acp_additional_workspace_roots>\n{}\n</acp_additional_workspace_roots>",
+                roots.join("\n")
+            ));
+        }
+    }
     let append_join = if append_texts.is_empty() {
         None
     } else {
@@ -597,7 +668,7 @@ pub async fn build_prepared(
         };
         dirs.extend(args.skill.iter().cloned());
         dirs.extend(discovered.skill_paths.iter().map(PathBuf::from));
-        let result = load_skills_with_precedence(&env_dyn, &dirs).await;
+        let result = load_skills_with_precedence(&resource_env_dyn, &dirs).await;
         skills = result.skills;
         skill_diags = result.diagnostics;
         resource_diags.extend(result.resource_diagnostics);
@@ -615,7 +686,7 @@ pub async fn build_prepared(
         };
         dirs.extend(args.prompt_template.iter().cloned());
         dirs.extend(discovered.prompt_paths.iter().map(PathBuf::from));
-        let result = load_prompt_templates_with_precedence(&env_dyn, &dirs).await;
+        let result = load_prompt_templates_with_precedence(&resource_env_dyn, &dirs).await;
         prompt_templates = result.prompt_templates;
         prompt_diags = result.diagnostics;
         resource_diags.extend(result.resource_diagnostics);
@@ -629,7 +700,7 @@ pub async fn build_prepared(
         // none is resolvable, pass the cwd dir so only the ancestor-walk runs
         // (the global step returns None anyway).
         let agent_dir_path = agent_dir.clone().unwrap_or_else(|| cwd.to_path_buf());
-        let files = load_project_context_files(&env_dyn, cwd, &agent_dir_path).await;
+        let files = load_project_context_files(&resource_env_dyn, cwd, &agent_dir_path).await;
         context_paths.extend(
             files
                 .iter()
@@ -827,6 +898,36 @@ pub async fn build_prepared(
                 ui_dialog_mailbox.clone(),
             )
         });
+    // Live children use host-captured identity through client tools and the UI
+    // mailbox. Missing provenance fails closed; admitted calls still traverse
+    // the exact inherited parent approval hook. The external-tool transport
+    // independently rejects children until it has child-aware correlation.
+    let before_tool_call = if child_events_enabled() {
+        let parent_hook = before_tool_call;
+        Some(Arc::new(move |ctx: rpi_agent::BeforeToolCallContext<'_>, signal| {
+            if rpi_agent::tool_execution_scope::is_child_execution()
+                && !rpi_agent::tool_execution_scope::execution_context().is_some_and(|context| {
+                    let child = context["sessionId"].as_str().filter(|id| !id.trim().is_empty());
+                    let root = context["rootSessionId"].as_str().filter(|id| !id.trim().is_empty());
+                    matches!((child, root), (Some(child), Some(root)) if child != root)
+                })
+            {
+                return Box::pin(async {
+                    Some(rpi_agent::BeforeToolCallResult {
+                        block: true,
+                        reason: Some("live child tool requires trusted child/root identity".into()),
+                        ..Default::default()
+                    })
+                }) as futures::future::BoxFuture<'_, _>;
+            }
+            match &parent_hook {
+                Some(hook) => hook(ctx, signal),
+                None => Box::pin(async { None }),
+            }
+        }) as rpi_agent::BeforeToolCall)
+    } else {
+        before_tool_call
+    };
 
     let options = AgentHarnessOptions {
         model: resolved.model.clone(),
@@ -917,6 +1018,12 @@ pub async fn build_prepared(
         Err(e) => return Err(BuildError::HarnessCreate(e.to_string())),
     };
 
+    // Runtime prompt snapshots are owned by the native selected branch, not
+    // by adapter metadata. Restore before any provider run or resource reload.
+    crate::rpc::system_prompt::restore_system_prompt(&harness)
+        .await
+        .map_err(BuildError::HarnessCreate)?;
+
     // ---- Durable operation recovery (runtime layer) ----
     // A previous process can die between `operation_started` and
     // `operation_finished`, leaving the lane with an orphaned operation. Sweep
@@ -984,6 +1091,8 @@ pub async fn build_prepared(
         broadcast: broadcast_for_context,
         mailbox: reload_mailbox,
         ui_dialog: ui_dialog_mailbox,
+        client_tools,
+        child_action_host: action_host,
         ext_status: ext_status_mailbox,
         editor_text: editor_text_mailbox,
         dev_extension: None,
@@ -1093,6 +1202,10 @@ pub type ActionBridgeCell = Arc<Mutex<Option<Arc<rpi_extensions::ActionBridge>>>
 /// reload callback without borrowing the harness).
 #[derive(Clone)]
 pub struct ReloadContext {
+    /// Typed host retained for optional root-only live child transport injection.
+    pub(crate) child_action_host: Arc<crate::extensions_actions::HarnessActionHost>,
+    /// Explicit RPC client backend, retained unchanged across resource reloads.
+    pub(crate) client_tools: Option<Arc<crate::rpc::client_tools::ClientTools>>,
     /// The live extension-session cell (swapped on reload).
     pub extension_session: ExtensionSessionCell,
     /// The session's plugin-tool context (`cwd` + session id), reused — not
@@ -1161,6 +1274,10 @@ pub struct ReloadContext {
     /// swapping plugin sessions; its watcher signals `mailbox` after a
     /// successful background build.
     pub dev_extension: Option<Arc<crate::dev_extension::DevExtension>>,
+}
+
+pub(crate) fn child_events_enabled() -> bool {
+    std::env::var("RPI_CHILD_EVENTS").as_deref() == Ok("1")
 }
 
 impl ReloadContext {
@@ -1365,25 +1482,7 @@ where
     let old_bridge = ctx.action_bridge.lock().unwrap().clone();
     let host: Arc<dyn rpi_extensions::RuntimeActionHost> = match &old_bridge {
         Some(b) => b.clone_host(),
-        None => {
-            // No prior bridge (no extensions ever loaded). Build a fresh host so
-            // a reload that newly discovers plugins can still drive actions.
-            let (action_host, _cell) = crate::extensions_actions::HarnessActionHost::new_empty(
-                ctx.catalog
-                    .read()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .clone(),
-                ctx.cwd.clone(),
-                ctx.runtime.clone(),
-                ctx.args.unknown_flags.clone(),
-                ctx.tool_context.clone(),
-            );
-            crate::extensions_actions::HarnessActionHost::set_harness(
-                &_cell,
-                Arc::new(harness.clone()),
-            );
-            Arc::new(action_host.with_session_dir(ctx.session_dir()))
-        }
+        None => ctx.child_action_host.clone(),
     };
 
     let reload_cb = rpi_extensions::reload_callback_from_mailbox(ctx.mailbox.clone());
@@ -1517,8 +1616,10 @@ where
         .unwrap_or_default();
 
     // ---- 4. Re-run the Part-A loaders (same precedence + --no-* gates) ----
-    let env = Arc::new(rpi_tools::OsExecutionEnv::with_cwd(ctx.cwd.clone()));
-    let env_dyn: Arc<dyn rpi_tools::ExecutionEnv> = env.clone();
+    let resource_env = Arc::new(rpi_tools::OsExecutionEnv::with_cwd(ctx.cwd.clone()));
+    let tool_env = Arc::new(acp_tool_env(&ctx.cwd));
+    let resource_env_dyn: Arc<dyn rpi_tools::ExecutionEnv> = resource_env;
+    let tool_env_dyn: Arc<dyn rpi_tools::ExecutionEnv> = tool_env.clone();
 
     let mut skills: Vec<rpi_harness::types::Skill> = Vec::new();
     let mut skill_diags: Vec<rpi_harness::skills::SkillDiagnostic> = Vec::new();
@@ -1536,7 +1637,7 @@ where
             js_paths,
             package_paths,
         );
-        let result = load_skills_with_precedence(&env_dyn, &dirs).await;
+        let result = load_skills_with_precedence(&resource_env_dyn, &dirs).await;
         skills = result.skills;
         skill_diags = result.diagnostics;
         resource_diags.extend(result.resource_diagnostics);
@@ -1554,7 +1655,7 @@ where
             js_paths,
             package_paths,
         );
-        let result = load_prompt_templates_with_precedence(&env_dyn, &dirs).await;
+        let result = load_prompt_templates_with_precedence(&resource_env_dyn, &dirs).await;
         prompt_templates = result.prompt_templates;
         prompt_diags = result.diagnostics;
         resource_diags.extend(result.resource_diagnostics);
@@ -1565,7 +1666,7 @@ where
     } else {
         let agent_dir = crate::config::agent_dir().ok();
         let agent_dir_path = agent_dir.unwrap_or_else(|| ctx.cwd.clone());
-        load_project_context_files(&env_dyn, &ctx.cwd, &agent_dir_path).await
+        load_project_context_files(&resource_env_dyn, &ctx.cwd, &agent_dir_path).await
     };
     let context_block = format_project_context(&context_files);
 
@@ -1623,9 +1724,9 @@ where
     // tool). The built-in set is rebuilt from scratch + extension tools merged
     // on top, mirroring `build`. Built before the
     // prompt so the prompt lists exactly the active tools.
-    let mut_env: Arc<dyn rpi_tools::MutatingEnv> = env.clone();
-    let tool_ctx = rpi_tools::ExecutionToolContext::new(env_dyn.clone(), Some(mut_env));
-    let mut tools = build_tools(&tool_ctx, &effective_args);
+    let mut_env: Arc<dyn rpi_tools::MutatingEnv> = tool_env;
+    let tool_ctx = rpi_tools::ExecutionToolContext::new(tool_env_dyn, Some(mut_env));
+    let mut tools = build_tools_with_client(&tool_ctx, &effective_args, ctx.client_tools.as_ref());
     merge_extension_tools(
         &mut tools,
         &extension_session,
@@ -1684,6 +1785,12 @@ where
         },
         append_join.as_deref(),
     );
+
+    let system_prompt = crate::rpc::system_prompt::persisted_system_prompt(harness)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(system_prompt);
 
     // ---- Rebuild the emitter (TeeEmitter over fresh ExtensionEmitter) ----
     let emitter: Arc<dyn rpi_agent::AgentEmitter> = match extension_session.snapshot_arc() {
@@ -2086,7 +2193,16 @@ pub fn bash_options() -> rpi_tools::tools::bash::BashToolOptions {
     }
 }
 
+#[cfg(test)]
 fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
+    build_tools_with_client(ctx, args, None)
+}
+
+fn build_tools_with_client(
+    ctx: &ExecutionToolContext,
+    args: &Args,
+    client: Option<&Arc<crate::rpc::client_tools::ClientTools>>,
+) -> Vec<HarnessTool> {
     if args.no_tools {
         return Vec::new();
     }
@@ -2127,6 +2243,19 @@ fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
     // Add PowerShell tool on Windows
     #[cfg(target_os = "windows")]
     all.push(("powershell", HarnessTool::new(create_powershell_tool(ctx))));
+
+    if let Some(client) = client {
+        use rpi_tools::tools::client::{create_client_bash_tool, create_client_read_tool, create_client_write_tool, ClientToolBackend};
+        let backend: Arc<dyn ClientToolBackend> = Arc::new(crate::rpc::client_tools::ClientBackend(client.clone()));
+        for (name, tool) in &mut all {
+            match *name {
+                "read" if client.config.read_text => *tool = HarnessTool::new(create_client_read_tool(backend.clone())).with_replay(ToolReplay::Safe),
+                "write" if client.config.write_text => *tool = HarnessTool::new(create_client_write_tool(backend.clone())),
+                "bash" if client.config.terminal => *tool = HarnessTool::new(create_client_bash_tool(backend.clone())),
+                _ => {}
+            }
+        }
+    }
 
     // Apply default_tools from settings (if no CLI override)
     if args.tools.is_none() {
@@ -2276,7 +2405,7 @@ async fn fork_session_at_launch(
     use rpi_harness::session::jsonl::{
         JsonlSessionCreateOptions, JsonlSessionRepo, JsonlSessionRepoOptions,
     };
-    use rpi_harness::session::types::{ForkOptions, SessionStorage};
+    use rpi_harness::session::types::ForkOptions;
     use rpi_tools::FileSystem;
 
     let dir = dir.to_path_buf();
@@ -2323,8 +2452,7 @@ async fn fork_session_at_launch(
         .await
         .map_err(|e| BuildError::SessionDir(format!("fork {}: {e}", source_meta.path)))?;
     claim_session_lock(&fork_storage.jsonl_metadata().path).map_err(BuildError::SessionOpen)?;
-    let storage_arc: Arc<dyn SessionStorage> = Arc::new(fork_storage);
-    Ok(Session::new(storage_arc, None))
+    Ok(registered_jsonl_session(fork_storage))
 }
 
 /// The metadata of the JSONL session file at `path`, or `None` when `path` is
@@ -2797,7 +2925,7 @@ pub(crate) async fn fork_session_storage(
         .await
         .map_err(|e| e.to_string())?;
     claim_session_lock(&fork_storage.jsonl_metadata().path)?;
-    Ok(Session::new(Arc::new(fork_storage), None))
+    Ok(registered_jsonl_session(fork_storage))
 }
 
 /// Validate a private copy before publishing it in the repo's normal cwd
@@ -2877,7 +3005,7 @@ pub(crate) async fn import_session_file(
         .open_by_jsonl_metadata(&metadata)
         .await
         .map_err(|e| e.to_string())?;
-    Ok(Session::new(Arc::new(storage), None))
+    Ok(registered_jsonl_session(storage))
 }
 
 /// Session logs this process has claimed, so re-claiming is a no-op.
@@ -2934,7 +3062,6 @@ async fn open_session(
     cwd: &str,
 ) -> Result<Session, BuildError> {
     use rpi_harness::session::jsonl::{JsonlSessionRepo, JsonlSessionRepoOptions};
-    use rpi_harness::session::types::SessionStorage;
     use rpi_tools::FileSystem;
 
     let dir = default_session_dir(Path::new(cwd));
@@ -2964,8 +3091,7 @@ async fn open_session(
             crate::session_cwd::format_missing_session_cwd_error(&issue)
         );
     }
-    let storage_arc: Arc<dyn SessionStorage> = Arc::new(storage);
-    Ok(Session::new(storage_arc, None))
+    Ok(registered_jsonl_session(storage))
 }
 
 /// A fresh ephemeral in-memory session (no persistence). Used for `--no-session`
@@ -3006,6 +3132,17 @@ pub(crate) async fn create_jsonl_session_with_id(
     cwd: &str,
     id: Option<String>,
 ) -> Result<Session, String> {
+    create_jsonl_session_with_options(dir, cwd, id, None, None).await
+}
+
+/// Shared native creation path; child relation fields never come from model JSON.
+async fn create_jsonl_session_with_options(
+    dir: &Path,
+    cwd: &str,
+    id: Option<String>,
+    parent_session_id: Option<String>,
+    metadata: Option<serde_json::Map<String, serde_json::Value>>,
+) -> Result<Session, String> {
     use rpi_harness::session::jsonl::{
         JsonlSessionCreateOptions, JsonlSessionRepo, JsonlSessionRepoOptions,
     };
@@ -3025,9 +3162,9 @@ pub(crate) async fn create_jsonl_session_with_id(
 
     let opts = JsonlSessionCreateOptions {
         id, // fresh uuidv7 when None (--session-id passes the fixed id)
-        parent_session_id: None,
+        parent_session_id,
         cwd: cwd.to_string(),
-        metadata: None,
+        metadata,
     };
     let storage = repo
         .create_typed(&opts)
@@ -3036,8 +3173,84 @@ pub(crate) async fn create_jsonl_session_with_id(
     claim_session_lock(&storage.jsonl_metadata().path)
         .map_err(|e| format!("create session: {e}"))?;
     // `JsonlSessionStorage` implements `SessionStorage`; wrap in the facade.
-    let storage_arc: Arc<dyn rpi_harness::session::types::SessionStorage> = Arc::new(storage);
-    Ok(Session::new(storage_arc, None))
+    Ok(registered_jsonl_session(storage))
+}
+
+/// CLI-owned path binding. The storage trait intentionally has no path API;
+/// weak object identity prevents an id/model/cwd from impersonating an opened root.
+fn registered_jsonl_session(storage: rpi_harness::session::jsonl::JsonlSessionStorage) -> Session {
+    let path = PathBuf::from(&storage.jsonl_metadata().path);
+    let storage: Arc<dyn rpi_harness::session::types::SessionStorage> = Arc::new(storage);
+    let mut paths = ROOT_STORAGE_PATHS.get_or_init(Default::default).lock().unwrap();
+    paths.retain(|(storage, _)| storage.strong_count() != 0);
+    paths.push((Arc::downgrade(&storage), path));
+    Session::new(storage, None)
+}
+
+type StoragePath = (std::sync::Weak<dyn rpi_harness::session::types::SessionStorage>, PathBuf);
+static ROOT_STORAGE_PATHS: OnceLock<Mutex<Vec<StoragePath>>> = OnceLock::new();
+
+#[cfg(test)]
+#[path = "session_child_root_tests.rs"]
+mod child_root_tests;
+
+// Mirrors jsonl::repo's create-time session-id rule (1..=64 ASCII bytes,
+// alphanumeric endpoints, internal ._-), plus Windows device-name protection.
+// Apply on every platform so a transcript has the same child policy when moved.
+fn safe_child_root_component(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    if bytes.is_empty() || bytes.len() > 64
+        || !bytes[0].is_ascii_alphanumeric()
+        || !bytes[bytes.len() - 1].is_ascii_alphanumeric()
+        || !bytes.iter().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return false;
+    }
+    // Windows reserves device basenames even with an extension (e.g. CON.txt).
+    let base = id.split('.').next().unwrap().to_ascii_uppercase();
+    !matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
+        && !(base.len() == 4
+            && (base.starts_with("COM") || base.starts_with("LPT"))
+            && matches!(base.as_bytes()[3], b'1'..=b'9'))
+}
+
+pub(crate) fn native_child_session_factory(cwd: PathBuf) -> crate::child_agents::ChildSessionFactory {
+    Arc::new(move |request| {
+        let cwd = cwd.clone();
+        Box::pin(async move {
+            if request.parent_storage.is_ephemeral() {
+                return Ok(crate::child_agents::memory_child_session(&request));
+            }
+            let path = ROOT_STORAGE_PATHS.get_or_init(Default::default).lock().unwrap()
+                .iter().find_map(|(storage, path)| {
+                    storage.upgrade().filter(|s| Arc::ptr_eq(s, &request.parent_storage))
+                        .map(|_| path.clone())
+                }).ok_or("durable child requires an authoritative CLI-opened root path")?;
+            let root = request.parent_storage.metadata().id;
+            // Exact-file opens can contain legacy ids that bypass create-time
+            // validation. Bound child paths without changing root-open compatibility.
+            if !safe_child_root_component(&root) {
+                return Err("invalid root native session id".into());
+            }
+            let dir = path.parent().ok_or("root transcript has no parent directory")?
+                .join(".children").join(&root);
+            #[derive(serde::Serialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Relation<'a> {
+                kind: &'static str,
+                version: u8,
+                root_session_id: &'a str,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                parent_tool_call_id: Option<&'a str>,
+            }
+            let metadata = serde_json::to_value(Relation {
+                kind: "delegated-child", version: 1, root_session_id: &root,
+                parent_tool_call_id: request.parent_tool_call_id.as_ref().map(|id| id.as_str()),
+            }).map_err(|e| e.to_string())?.as_object().unwrap().clone();
+            create_jsonl_session_with_options(&dir, &cwd.to_string_lossy(), Some(request.id),
+                Some(root), Some(metadata)).await.map(Session::with_volatile_progress)
+        })
+    })
 }
 
 /// Read an `--append-system-prompt` target: if it's a readable file path, return

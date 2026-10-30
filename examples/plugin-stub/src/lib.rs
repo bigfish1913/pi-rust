@@ -33,14 +33,18 @@
 //! ```
 //! (`echo.dll`/`libecho.so`/`libecho.dylib` depending on platform — the loader
 //! recognizes all of `.{dll,so,dylib,pyd}`.)
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::OnceLock;
+
+mod oauth_test;
 
 use rpi_plugin_sdk::{
     EventTag, ProviderChunkKind, ProviderStreamCompletionFn, ProviderStreamControl,
-    ProviderStreamEmitFn, StableToolSchema, StbString, StbStringRef, StepHandle, StepResult,
-    StepResultTag, ToolPartialCb,
+    ProviderStreamEmitFn, RuntimeActionFn, RuntimeActionId, StableToolSchema, StbString,
+    StbStringRef, StepHandle, StepResult, StepResultTag, ToolPartialCb,
 };
 // The provider/render fn signatures are referenced transitively by the
 // `register_provider`/`register_markdown_transformer` vtable slots (the host
@@ -576,6 +580,42 @@ rpi_plugin_sdk::string_handler! {
     }
 }
 
+// The command callback receives the owner-scoped runtime handle from the host,
+// while the action function itself is stable for the lifetime of this plugin.
+// Keeping only the function pointer here avoids retaining a session-specific
+// opaque handle across registrations.
+static COMMAND_RUNTIME_ACTION: OnceLock<RuntimeActionFn> = OnceLock::new();
+
+extern "C" fn plan_command(
+    args_json: StbStringRef,
+    out: *mut StbString,
+    user_data: *mut c_void,
+) -> i32 {
+    rpi_plugin_sdk::guard_or(1, || {
+        let args = unsafe { args_json.as_str() };
+        let parsed: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
+        let suffix = parsed
+            .get("args")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        let text = if suffix.trim().is_empty() {
+            "/plan".to_owned()
+        } else {
+            format!("/plan {suffix}")
+        };
+        let input = serde_json::json!({"text": text}).to_string();
+        let Some(action) = COMMAND_RUNTIME_ACTION.get().copied() else {
+            return 1;
+        };
+        action(
+            RuntimeActionId::SendUserMessage as u32,
+            StbStringRef::from_str(&input),
+            out,
+            user_data,
+        )
+    })
+}
+
 // ---------------------------------------------------------------------------
 // The register entrypoint
 // ---------------------------------------------------------------------------
@@ -584,6 +624,10 @@ rpi_plugin_sdk::string_handler! {
 // the version/null checks before running our registration body. Return 0 on
 // success; nonzero means the host logs and skips this plugin.
 rpi_plugin_sdk::export_plugin!(|api| {
+    let rc = oauth_test::register(api);
+    if rc != 0 {
+        return rc;
+    }
     // Register the echo tool. Build an owning StableToolSchema (name +
     // description + parameters-as-JSON); the host frees the schema's strings
     // via our `plugin_free_string` after copying them out.
@@ -619,6 +663,23 @@ rpi_plugin_sdk::export_plugin!(|api| {
     drop(schema);
     if rc != 0 {
         return rc;
+    }
+
+    // Register a real slash command used by the ACP lifecycle probe. The
+    // callback starts a user turn through the owner-scoped runtime action and
+    // returns only after the authoritative native run settles; this exercises
+    // command discovery, command execution and streamed native lifecycle
+    // rather than merely returning a canned message.
+    if let Some(register_command) = api.register_command {
+        let _ = COMMAND_RUNTIME_ACTION.set(api.runtime_action);
+        let rc = register_command(
+            StbStringRef::from_str("plan"),
+            StbStringRef::from_str("Run the plan command"),
+            plan_command,
+        );
+        if rc != 0 {
+            return rc;
+        }
     }
 
     // Register the MessageEnd event handler (the on() surface).

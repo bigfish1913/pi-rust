@@ -80,7 +80,8 @@ impl RuntimeActionHost for Host {
             args.get("__rpiRuntimeKey").is_none(),
             "capabilities must not reach action payloads"
         );
-        Ok(json!({"owner":owner}))
+        Ok(json!({"owner":owner,"parentToolCallId":rpi_agent::tool_execution_scope::invocation_tool_call_id().map(|id| id.as_str().to_owned()),
+            "isChild":rpi_agent::tool_execution_scope::is_child_execution()}))
     }
     fn cancel_child_agents(&self, _: u64) {
         self.revoked.fetch_add(1, Ordering::SeqCst);
@@ -203,6 +204,7 @@ async fn finishing_an_invocation_does_not_unload_its_plugin_owner() {
 }
 
 mod cancel_wait;
+mod correlation;
 mod cleanup;
 mod driver;
 mod pacing;

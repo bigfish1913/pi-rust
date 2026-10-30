@@ -169,6 +169,7 @@ fn assistant_message_with_tool_call_and_length() -> rpi_ai::types::AssistantMess
         api: Api::Other("openai-responses".into()),
         provider: "mock".to_string(),
         model: "mock".to_string(),
+        message_id: None,
         response_model: None,
         response_id: None,
         usage: Usage::zero(),

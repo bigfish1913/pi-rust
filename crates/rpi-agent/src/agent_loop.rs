@@ -97,6 +97,7 @@ pub async fn run_agent_loop(
             &emit,
             AgentEvent::MessageStart {
                 message: prompt.clone(),
+                message_id: None,
             },
         )
         .await;
@@ -104,6 +105,7 @@ pub async fn run_agent_loop(
             &emit,
             AgentEvent::MessageEnd {
                 message: prompt.clone(),
+                message_id: None,
             },
         )
         .await;
@@ -265,6 +267,7 @@ async fn run_loop(
                         emit,
                         AgentEvent::MessageStart {
                             message: message.clone(),
+                            message_id: None,
                         },
                     )
                     .await;
@@ -272,6 +275,7 @@ async fn run_loop(
                         emit,
                         AgentEvent::MessageEnd {
                             message: message.clone(),
+                            message_id: None,
                         },
                     )
                     .await;
@@ -676,6 +680,7 @@ async fn stream_assistant_response(
         diagnostics.stream_started = Some(Instant::now());
     }
 
+    let message_id = uuid::Uuid::now_v7().to_string();
     let mut added_partial = false;
     let mut first_poll = true;
 
@@ -704,7 +709,13 @@ async fn stream_assistant_response(
                 context.messages.push(am.clone());
                 added_partial = true;
                 diagnostics
-                    .emit_agent_event(emit, AgentEvent::MessageStart { message: am })
+                    .emit_agent_event(
+                        emit,
+                        AgentEvent::MessageStart {
+                            message: am,
+                            message_id: Some(message_id.clone()),
+                        },
+                    )
                     .await;
             }
             AssistantMessageEvent::TextStart { partial, .. }
@@ -727,22 +738,25 @@ async fn stream_assistant_response(
                         .emit_agent_event(
                             emit,
                             AgentEvent::MessageUpdate {
-                                // `Arc` bump, not a deep clone: this fires once per
-                                // streaming delta, and the provider already built the
-                                // snapshot it hands us.
+                                // The message Arc remains the provider's
+                                // snapshot. Carry identity out-of-band so
+                                // canonicalization never breaks the zero-copy
+                                // update contract.
                                 message: Arc::clone(partial),
                                 assistant_message_event: event,
+                                message_id: Some(message_id.clone()),
                             },
                         )
                         .await;
                 }
             }
             AssistantMessageEvent::Done { .. } | AssistantMessageEvent::Error { .. } => {
-                let final_message = response.result().await.map_err(|_| {
+                let mut final_message = response.result().await.map_err(|_| {
                     AgentError::Provider(
                         "assistant-message event stream ended without a terminal event".into(),
                     )
                 })?;
+                final_message.message_id = Some(message_id.clone());
                 let am = AgentMessage::Assistant(Box::new(final_message.clone()));
                 if added_partial {
                     if let Some(last) = context.messages.last_mut() {
@@ -755,12 +769,19 @@ async fn stream_assistant_response(
                             emit,
                             AgentEvent::MessageStart {
                                 message: am.clone(),
+                                message_id: Some(message_id.clone()),
                             },
                         )
                         .await;
                 }
                 diagnostics
-                    .emit_agent_event(emit, AgentEvent::MessageEnd { message: am })
+                    .emit_agent_event(
+                        emit,
+                        AgentEvent::MessageEnd {
+                            message: am,
+                            message_id: Some(message_id.clone()),
+                        },
+                    )
                     .await;
                 if let Some(started) = event_started {
                     diagnostics.fold_ns += AssistantRequestDiagnostics::elapsed_ns(started);
@@ -775,9 +796,10 @@ async fn stream_assistant_response(
 
     // Stream ended without a terminal event — finalize from result() (TS has the
     // same fallback).
-    let final_message = response.result().await.map_err(|_| {
+    let mut final_message = response.result().await.map_err(|_| {
         AgentError::Provider("assistant-message event stream ended without a terminal event".into())
     })?;
+    final_message.message_id = Some(message_id.clone());
     let am = AgentMessage::Assistant(Box::new(final_message.clone()));
     if added_partial {
         if let Some(last) = context.messages.last_mut() {
@@ -790,12 +812,19 @@ async fn stream_assistant_response(
                 emit,
                 AgentEvent::MessageStart {
                     message: am.clone(),
+                    message_id: Some(message_id.clone()),
                 },
             )
             .await;
     }
     diagnostics
-        .emit_agent_event(emit, AgentEvent::MessageEnd { message: am })
+        .emit_agent_event(
+            emit,
+            AgentEvent::MessageEnd {
+                message: am,
+                message_id: Some(message_id.clone()),
+            },
+        )
         .await;
     Ok(final_message)
 }
@@ -1538,10 +1567,18 @@ async fn emit_tool_result_message(emit: &Arc<dyn AgentEmitter>, trm: &ToolResult
         emit,
         AgentEvent::MessageStart {
             message: am.clone(),
+            message_id: None,
         },
     )
     .await;
-    emit_event(emit, AgentEvent::MessageEnd { message: am }).await;
+    emit_event(
+        emit,
+        AgentEvent::MessageEnd {
+            message: am,
+            message_id: None,
+        },
+    )
+    .await;
 }
 
 /// Drain steering messages (empty vec if no hook).

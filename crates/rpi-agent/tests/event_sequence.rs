@@ -385,6 +385,7 @@ async fn message_update_forwards_the_provider_snapshot_without_copying() {
         let AgentEvent::MessageUpdate {
             message,
             assistant_message_event,
+            ..
         } = event
         else {
             continue;

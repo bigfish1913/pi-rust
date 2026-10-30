@@ -59,7 +59,12 @@ impl AgentHarness {
             .iter()
             .map(|tool| tool.schema().name.clone())
             .collect();
+        if let Some(scope) = &self.inner.lock().unwrap().execution_scope {
+            return Ok(scope.run_context());
+        }
         Ok(serde_json::json!({
+            "sessionId": self.session.storage().metadata().id,
+            "rootSessionId": self.session.storage().metadata().id,
             "model": {"id": snap.model.id, "provider": snap.model.provider, "api": snap.model.api},
             "thinkingLevel": snap.thinking_level,
             "tools": tools,
@@ -113,6 +118,9 @@ impl AgentHarness {
         }
         let execution_scope = Arc::new(
             rpi_agent::tool_execution_scope::ToolExecutionScope::with_context(serde_json::json!({
+                "sessionId": session.storage().metadata().id,
+                "parentSessionId": self.session.storage().metadata().id,
+                "rootSessionId": self.session.storage().metadata().id,
                 "model": {"id":snap.model.id,"provider":snap.model.provider,"api":snap.model.api},
                 "thinkingLevel":snap.thinking_level,
                 "tools":tools.iter().map(|tool| tool.tool.schema().name.clone()).collect::<Vec<_>>(),
@@ -208,7 +216,12 @@ impl AgentHarness {
         };
         let execution_scope = Arc::new(
             rpi_agent::tool_execution_scope::ToolExecutionScope::with_context(
-                serde_json::json!({"childAgent":false,"tools":[]}),
+                serde_json::json!({
+                    "sessionId":session.storage().metadata().id,
+                    "parentSessionId":self.session.storage().metadata().id,
+                    "rootSessionId":self.session.storage().metadata().id,
+                    "childAgent":false,"tools":[]
+                }),
             ),
         );
         let mut child = Self::create(AgentHarnessOptions {

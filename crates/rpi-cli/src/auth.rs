@@ -26,6 +26,8 @@ use crate::config::{
     self, delete_credential, read_auth, upsert_credential, Credential, DEFAULT_PROVIDER_ID,
 };
 use crate::credentials::CredentialSource;
+
+mod rpc;
 /// Exit code for a missing-credential `auth check` (mirrors upstream's
 /// non-zero `auth check` when not ready).
 const EXIT_NOT_READY: i32 = 1;
@@ -47,6 +49,10 @@ pub async fn run_with_extensions(
 ) -> i32 {
     let sub = args.first().map(|s| s.as_str()).unwrap_or("");
     match sub {
+        "describe" => rpc::describe(&args[1..], snapshot.as_ref()),
+        "login" if args.iter().any(|arg| arg == "--rpc") => {
+            rpc::login(&args[1..], snapshot.as_ref()).await
+        }
         "login" => run_login(&args[1..], snapshot.as_ref()).await,
         "check" | "status" => run_check(&args[1..], snapshot.as_ref()).await,
         "refresh" => run_refresh(&args[1..], snapshot.as_ref()).await,
@@ -390,7 +396,8 @@ fn print_auth_help() {
 Manage persisted credentials and inspect provider package authentication.
 
 Subcommands:
-  login   Prompt for an API key, or run an OAuth provider login.
+  describe Describe headless login capability (--provider <id> --json).
+  login   Prompt for an API key, or run an OAuth provider login (--rpc for JSONL).
   check   Report whether credentials are available (no network call).
   status  Alias for check; never prints token material.
   refresh Refresh an OAuth token through its provider extension.
@@ -429,7 +436,7 @@ mod tests {
     /// Scope `RPI_CODING_AGENT_DIR` + the `ANTHROPIC_*` env vars to a temp dir
     /// for the duration of a test. Holds the shared env lock for its whole
     /// lifetime so it can't race with config/provider env-mutating tests.
-    struct TempConfig {
+    pub(super) struct TempConfig {
         _guard: std::sync::MutexGuard<'static, ()>,
         _tmp: tempfile::TempDir,
         prev_dir: Option<std::ffi::OsString>,
@@ -438,7 +445,7 @@ mod tests {
         prev_openai_key: Option<std::ffi::OsString>,
     }
     impl TempConfig {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             let guard = env_lock().lock().unwrap();
             let prev_dir = std::env::var_os(crate::config::CONFIG_DIR_ENV);
             let prev_key = std::env::var_os(crate::provider::ANTHROPIC_API_KEY_ENV);

@@ -120,6 +120,7 @@ pub fn assistant_text(text: impl Into<String>, stop: StopReason) -> AssistantMes
         api: Api::Other("openai-responses".into()),
         provider: "mock".to_string(),
         model: "mock".to_string(),
+        message_id: None,
         response_model: None,
         response_id: None,
         usage: rpi_ai::types::Usage::zero(),
@@ -157,6 +158,7 @@ pub fn assistant_tool_calls(
         api: Api::Other("openai-responses".into()),
         provider: "mock".to_string(),
         model: "mock".to_string(),
+        message_id: None,
         response_model: None,
         response_id: None,
         usage: rpi_ai::types::Usage::zero(),
@@ -281,7 +283,7 @@ pub fn tool_result_message_ids(events: &[rpi_agent::AgentEvent]) -> Vec<String> 
     events
         .iter()
         .filter_map(|e| match e {
-            rpi_agent::AgentEvent::MessageEnd { message } => match message {
+            rpi_agent::AgentEvent::MessageEnd { message, .. } => match message {
                 rpi_agent::AgentMessage::ToolResult(t) => Some(t.tool_call_id.clone()),
                 _ => None,
             },

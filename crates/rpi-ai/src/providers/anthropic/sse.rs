@@ -193,6 +193,8 @@ fn append_utf8_chunk(buffer: &mut String, utf8_buffer: &mut Vec<u8>, chunk: &[u8
 /// `Ok(None)`.
 pub struct SseEventStream {
     bytes_stream: futures::stream::BoxStream<'static, Result<Bytes, reqwest::Error>>,
+    max_response_bytes: Option<usize>,
+    response_bytes: usize,
     state: SseDecoderState,
     buffer: String,
     utf8_buffer: Vec<u8>,
@@ -210,6 +212,8 @@ impl SseEventStream {
     pub fn new(response: reqwest::Response, signal: CancellationToken) -> Self {
         Self {
             bytes_stream: response.bytes_stream().boxed(),
+            max_response_bytes: None,
+            response_bytes: 0,
             state: SseDecoderState::new(),
             buffer: String::new(),
             utf8_buffer: Vec::new(),
@@ -222,6 +226,13 @@ impl SseEventStream {
             diagnostics_first_event_ns: None,
             diagnostics_event_count: 0,
         }
+    }
+
+    /// Total decoded body ceiling, including SSE framing/comments. Reject an
+    /// offending chunk before UTF-8 buffering or event parsing; drop upstream.
+    pub fn with_response_budget(mut self, max: Option<usize>) -> Self {
+        self.max_response_bytes = max;
+        self
     }
 
     /// Set the maximum silence between body chunks. `None` or zero disables
@@ -395,6 +406,22 @@ impl SseEventStream {
                     });
                 }
                 Some(Ok(chunk)) => {
+                    if let Some(max) = self.max_response_bytes {
+                        match self.response_bytes.checked_add(chunk.len()).filter(|n| *n <= max) {
+                            Some(total) => self.response_bytes = total,
+                            None => {
+                                self.done = true;
+                                self.bytes_stream = futures::stream::empty().boxed();
+                                self.buffer.clear();
+                                self.utf8_buffer.clear();
+                                self.state = SseDecoderState::new();
+                                return Err(AiError::Provider {
+                                    code: "response_budget_exceeded".into(),
+                                    message: "response byte budget exceeded".into(),
+                                });
+                            }
+                        }
+                    }
                     if !chunk.is_empty() {
                         self.last_bytes_at = tokio::time::Instant::now();
                     }
@@ -532,6 +559,45 @@ pub async fn iterate_anthropic_events(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn response_budget_rejects_before_append_single_raw_line() {
+        let (sender, stream) = idle_test_stream();
+        let mut stream = stream.with_response_budget(Some(256 * 1024));
+        // No newline or valid JSON: the byte check must precede both buffering
+        // and event parsing, even when one transport chunk is enormous.
+        sender.send(Bytes::from(vec![b'x'; 256 * 1024 + 1])).await.unwrap();
+        let error = stream.next_event().await.unwrap_err();
+        assert!(matches!(error, AiError::Provider { ref code, .. } if code == "response_budget_exceeded"));
+        assert_eq!(stream.response_bytes, 0, "rejected bytes were counted as accepted");
+        assert!(stream.buffer.is_empty());
+        assert!(stream.utf8_buffer.is_empty());
+        assert!(stream.state.raw.is_empty());
+        assert!(stream.state.data.is_empty());
+        assert!(stream.next_event().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn response_budget_cumulative_safe_event_then_unbounded_raw_line() {
+        let (sender, stream) = idle_test_stream();
+        let max = 256 * 1024;
+        let mut stream = stream.with_response_budget(Some(max));
+        let safe = b"data: {\"safe\":true}\n\n";
+        sender.send(Bytes::from_static(safe)).await.unwrap();
+        assert_eq!(stream.next_event().await.unwrap().unwrap().data, "{\"safe\":true}");
+        assert_eq!(stream.response_bytes, safe.len());
+        // Exactly fill the remaining budget without a line break, then exceed
+        // it. None of the rejected chunk may be appended or accepted.
+        sender.send(Bytes::from(vec![b'x'; max - safe.len()])).await.unwrap();
+        sender.send(Bytes::from_static(b"x")).await.unwrap();
+        let error = stream.next_event().await.unwrap_err();
+        assert!(matches!(error, AiError::Provider { ref code, .. } if code == "response_budget_exceeded"));
+        assert_eq!(stream.response_bytes, max);
+        assert!(stream.buffer.is_empty());
+        assert!(stream.state.raw.is_empty());
+        assert!(stream.state.data.is_empty());
+        assert!(stream.next_event().await.unwrap().is_none());
+    }
+
     fn idle_test_stream() -> (tokio::sync::mpsc::Sender<Bytes>, SseEventStream) {
         let (sender, receiver) = tokio::sync::mpsc::channel::<Bytes>(8);
         let chunks = futures::stream::unfold(receiver, |mut receiver| async move {
@@ -540,6 +606,8 @@ mod tests {
         .boxed();
         let stream = SseEventStream {
             bytes_stream: chunks,
+            max_response_bytes: None,
+            response_bytes: 0,
             state: SseDecoderState::new(),
             buffer: String::new(),
             utf8_buffer: Vec::new(),

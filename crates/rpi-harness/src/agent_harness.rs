@@ -348,6 +348,22 @@ pub trait AgentLane: Send + Sync {
         text: &str,
         images: Vec<rpi_ai::types::ImageContent>,
     ) -> HarnessResult<RunResult>;
+    /// Prompt with provider-neutral image and audio attachments. The default
+    /// keeps existing lane implementations source-compatible while making
+    /// unsupported audio an explicit error rather than silently dropping it.
+    async fn prompt_text_with_media(
+        &self,
+        text: &str,
+        images: Vec<rpi_ai::types::ImageContent>,
+        audio: Vec<rpi_ai::types::AudioContent>,
+    ) -> HarnessResult<RunResult> {
+        if !audio.is_empty() {
+            return Err(HarnessError::agent(
+                "this agent lane does not support audio prompt content",
+            ));
+        }
+        self.prompt_text(text, images).await
+    }
     async fn prompt_message(&self, message: AgentMessage) -> HarnessResult<RunResult>;
     /// Send using Pi's `triggerTurn`/`deliverAs` semantics. Active-run deliveries
     /// enqueue immediately rather than waiting for the executing tool to finish.
@@ -677,6 +693,7 @@ pub struct AgentHarness {
 }
 
 mod child;
+mod isolated;
 pub use child::ChildHarness;
 mod weak;
 pub use weak::WeakAgentHarness;
@@ -1379,15 +1396,26 @@ impl AgentHarness {
     /// Context-only messages are already durable. Emit directly to the client
     /// emitter so they do not increment the loop's persistence indices.
     async fn emit_appended_messages(&self, messages: Vec<AgentMessage>) {
+        self.emit_identified_messages(messages.into_iter().map(|message| (None, message)).collect()).await;
+    }
+
+    /// IDs here name entries whose append has already completed, never reservations.
+    async fn emit_identified_messages(&self, messages: Vec<(Option<String>, AgentMessage)>) {
         let emitter = self.inner.lock().unwrap().agent_emitter.clone();
         if let Some(emitter) = emitter {
-            for message in messages {
+            for (message_id, message) in messages {
                 emitter
                     .emit(AgentEvent::MessageStart {
                         message: message.clone(),
+                        message_id: message_id.clone(),
                     })
                     .await;
-                emitter.emit(AgentEvent::MessageEnd { message }).await;
+                emitter
+                    .emit(AgentEvent::MessageEnd {
+                        message,
+                        message_id,
+                    })
+                    .await;
             }
         }
     }
@@ -2198,6 +2226,16 @@ impl AgentHarness {
         Ok(())
     }
 
+    /// Enable or disable automatic context compaction for subsequent runs.
+    /// This is a runtime setting, not an adapter-side presentation flag.
+    pub async fn set_compaction_enabled(&self, enabled: bool) -> HarnessResult<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.closed {
+            return Err(HarnessError::closed());
+        }
+        inner.compaction.enabled = enabled;
+        Ok(())
+    }
     /// `setResources(resources)`. Replace the skills + prompt-templates the
     /// harness advertises (TUI `/context` listing, `<available_skills>` gate).
     pub async fn set_resources(&self, resources: AgentHarnessResources) -> HarnessResult<()> {
@@ -3748,6 +3786,7 @@ impl AgentHarness {
             system_prompt_override: None,
             resume_data,
         };
+        let mut committed_prompts = Vec::with_capacity(prompts.len());
         let prompt_start = if let Some(first) = prompts.first() {
             let first_entry_id = queued_ids
                 .first()
@@ -3758,7 +3797,7 @@ impl AgentHarness {
                 source_leaf.clone(),
                 intent,
                 ProvisionedEntry {
-                    id: first_entry_id,
+                    id: first_entry_id.clone(),
                     kind: ProvisionedKind::Message {
                         message: first.clone(),
                         terminate: None,
@@ -3766,6 +3805,7 @@ impl AgentHarness {
                 },
             )
             .await?;
+            committed_prompts.push((Some(first_entry_id), first.clone()));
             1
         } else {
             self.write_operation_started(&run_id, source_leaf.clone(), intent)
@@ -3777,25 +3817,19 @@ impl AgentHarness {
         // they're durable. The first prompt, when present, was committed with
         // operation_started above.
         for (index, msg) in prompts.iter().enumerate().skip(prompt_start) {
-            if let Some(entry_id) = queued_ids.get(index) {
-                self.append_provisioned(ProvisionedEntry {
-                    id: entry_id.clone(),
-                    kind: ProvisionedKind::Message {
-                        message: msg.clone(),
-                        terminate: None,
-                    },
-                })
-                .await?;
-            } else {
-                self.view()
-                    .append_message(msg.clone())
-                    .await
-                    .map_err(session_to_harness_err)?;
-            }
+            let entry_id = queued_ids.get(index).cloned().unwrap_or_else(|| self.next_entry_id());
+            self.append_provisioned(ProvisionedEntry {
+                id: entry_id.clone(),
+                kind: ProvisionedKind::Message {
+                    message: msg.clone(),
+                    terminate: None,
+                },
+            })
+            .await?;
+            committed_prompts.push((Some(entry_id), msg.clone()));
         }
 
-        self.emit_appended_messages(prompts.iter().take(queued_ids.len()).cloned().collect())
-            .await;
+        self.emit_identified_messages(committed_prompts).await;
 
         let snap = self.snapshot_config()?;
         let build_opts = Self::build_opts(&snap.entry_projectors, &snap.entry_transforms);
@@ -4350,6 +4384,17 @@ impl AgentHarness {
                     }
                 }
                 let outcome = Self::derive_outcome(&new_messages, leaf.clone(), final_id.clone());
+                // Cancellation can stop the loop immediately after a tool result,
+                // leaving the last assistant message at ToolUse rather than a
+                // synthetic Aborted message. The run verdict must still reflect
+                // its cancellation; never report successful settlement for it.
+                let outcome = match outcome {
+                    HarnessRunOutcome::Completed { leaf_id, final_entry_id, final_message }
+                        if signal.is_cancelled() => HarnessRunOutcome::Aborted {
+                            leaf_id, final_entry_id, final_message,
+                        },
+                    outcome => outcome,
+                };
                 // The run's messages are durable now, so its frames are no
                 // longer needed as progress. Retiring them here (rather than at
                 // each `MessageEnd`) is what keeps a *failed retry attempt*'s
@@ -4737,6 +4782,23 @@ impl AgentLane for AgentHarness {
         };
         let message = AgentMessage::User(UserMessage::new(content, now_ms()));
         self.run_core(vec![message]).await
+    }
+
+    async fn prompt_text_with_media(
+        &self,
+        text: &str,
+        images: Vec<rpi_ai::types::ImageContent>,
+        audio: Vec<rpi_ai::types::AudioContent>,
+    ) -> HarnessResult<RunResult> {
+        let mut blocks: Vec<Content> = Vec::with_capacity(images.len() + audio.len() + 1);
+        blocks.push(Content::text(text));
+        blocks.extend(images.into_iter().map(Content::Image));
+        blocks.extend(audio.into_iter().map(Content::Audio));
+        self.run_core(vec![AgentMessage::User(UserMessage::new(
+            UserContent::Blocks(blocks),
+            now_ms(),
+        ))])
+        .await
     }
 
     async fn prompt_message(&self, message: AgentMessage) -> HarnessResult<RunResult> {
@@ -5341,6 +5403,17 @@ impl AgentLane for LaneHandle {
         images: Vec<rpi_ai::types::ImageContent>,
     ) -> HarnessResult<RunResult> {
         self.runner().prompt_text(text, images).await
+    }
+
+    async fn prompt_text_with_media(
+        &self,
+        text: &str,
+        images: Vec<rpi_ai::types::ImageContent>,
+        audio: Vec<rpi_ai::types::AudioContent>,
+    ) -> HarnessResult<RunResult> {
+        self.runner()
+            .prompt_text_with_media(text, images, audio)
+            .await
     }
 
     async fn prompt_message(&self, message: AgentMessage) -> HarnessResult<RunResult> {

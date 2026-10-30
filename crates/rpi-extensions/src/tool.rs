@@ -273,7 +273,21 @@ impl ToolCallContext {
 /// no-parameter tool call arrives in) is promoted to an object so such a tool
 /// still receives the context.
 fn inject_tool_context(params: Value, context: &ToolCallContext) -> Value {
-    let Some(context_json) = context.to_json() else {
+    let mut context_json = context.to_json();
+    // The shared adapter belongs to the root harness. Only the host's scoped
+    // execution identity may replace its session, never model/plugin arguments.
+    if let Some(session_id) =
+        rpi_agent::tool_execution_scope::execution_context().and_then(|context| {
+            context
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+    {
+        context_json.get_or_insert_with(|| serde_json::json!({}))["sessionId"] =
+            Value::String(session_id);
+    }
+    let Some(context_json) = context_json else {
         return params;
     };
     match params {
@@ -439,9 +453,10 @@ impl AgentTool for PluginToolAdapter {
             .runtime_handle
             .and_then(crate::ActionBridge::resolve_handle)
             .map(|bridge| {
-                bridge.for_invocation(
+                bridge.for_tool_invocation(
                     rpi_agent::tool_execution_scope::is_child_execution(),
                     invocation_signal,
+                    Some(tool_call_id),
                 )
             });
 
@@ -1006,6 +1021,38 @@ mod tests {
         );
         assert_eq!(merged["__rpi"]["cwd"], "/real");
         assert_eq!(merged["__rpi"]["sessionId"], "real-session");
+    }
+
+    #[tokio::test]
+    async fn scoped_child_identity_overrides_spoofs_without_mutating_root_context() {
+        let context = ToolCallContext::new("/root");
+        context.set_session_id("root");
+        let args =
+            json!({"__rpi": {"sessionId":"spoof", "runtimeHandle":123, "runtimeKey":"spoof"}});
+        let scope = Arc::new(
+            rpi_agent::tool_execution_scope::ToolExecutionScope::with_context(
+                json!({"sessionId":"child", "cwd":"/not-the-adapter-cwd", "runtimeHandle":456}),
+            ),
+        );
+        scope
+            .run(async {
+                let injected = inject_tool_context(args.clone(), &context);
+                assert_eq!(injected["__rpi"]["sessionId"], "child");
+                assert_eq!(injected["__rpi"]["cwd"], "/root");
+                assert!(injected["__rpi"].get("runtimeHandle").is_none());
+                assert!(injected["__rpi"].get("runtimeKey").is_none());
+                assert_eq!(
+                    inject_tool_context(Value::Null, &ToolCallContext::default())["__rpi"]
+                        ["sessionId"],
+                    "child"
+                );
+            })
+            .await;
+        assert_eq!(
+            inject_tool_context(args, &context)["__rpi"]["sessionId"],
+            "root"
+        );
+        assert_eq!(context.to_json().unwrap()["sessionId"], "root");
     }
 
     #[test]

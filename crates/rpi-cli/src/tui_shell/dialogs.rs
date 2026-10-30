@@ -303,6 +303,7 @@ mod tests {
         rpi_extensions::UiDialogRequest {
             request_id: id.into(),
             tool_call_id: Some(format!("call-{id}")),
+            session_id: None,
             raw: ui.clone(),
             ui,
         }

@@ -4,8 +4,10 @@
 //! shared helpers.
 
 pub mod bash;
+pub mod client;
 pub mod edit;
 pub mod edit_diff;
+pub mod external;
 pub mod find;
 pub mod grep;
 pub mod image;

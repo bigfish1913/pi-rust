@@ -1005,6 +1005,7 @@ impl AgentEmitter for FrameRecordingEmitter {
             match &event {
                 AgentEvent::MessageStart {
                     message: AgentMessage::Assistant(assistant),
+                    ..
                 } => {
                     let start = AssistantMessageEvent::Start {
                         partial: Arc::new((**assistant).clone()),
@@ -1019,6 +1020,7 @@ impl AgentEmitter for FrameRecordingEmitter {
                 }
                 AgentEvent::MessageEnd {
                     message: AgentMessage::Assistant(_),
+                    ..
                 } => {
                     shared.state.lock().unwrap().current = None;
                 }
@@ -1064,6 +1066,7 @@ mod volatile_tests {
         let mut message = AssistantMessage::empty(Api::Faux, "faux", "m", 42);
         let mut events = vec![AgentEvent::MessageStart {
             message: message.clone().into(),
+            message_id: None,
         }];
         // Start snapshots may already cover a delta not yet observed by the
         // encoder. Both modes must retain the encoder's catch-up semantics.
@@ -1075,6 +1078,7 @@ mod volatile_tests {
                 content_index: 0,
                 partial,
             },
+            message_id: None,
         });
         for delta in ["ahead", " 🐈", "", "!"] {
             if delta != "ahead" {
@@ -1090,6 +1094,7 @@ mod volatile_tests {
                     delta: delta.into(),
                     partial,
                 },
+                message_id: None,
             });
         }
         events

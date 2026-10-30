@@ -133,6 +133,7 @@ async fn prepare_arguments_folds_legacy_oldtext_newtext_into_edits() {
         api: Api::Other("openai-responses".into()),
         provider: "mock".to_string(),
         model: "mock".to_string(),
+        message_id: None,
         response_model: None,
         response_id: None,
         usage: Usage::zero(),

@@ -168,6 +168,10 @@ pub enum AgentHarnessToolContextSource<T: Send + Sync + 'static> {
 /// reasoning, thinking_budgets, session_id) per turn.
 #[derive(Debug, Clone, Default)]
 pub struct AgentHarnessStreamOptions {
+    /// Explicit output budget and temperature, independent of model defaults.
+    pub max_response_bytes: Option<usize>,
+    pub max_tokens: Option<u64>,
+    pub temperature: Option<f64>,
     pub timeout: Option<std::time::Duration>,
     /// Maximum silence between streamed body bytes; zero disables it.
     pub stream_idle_timeout: Option<std::time::Duration>,
@@ -185,6 +189,15 @@ impl AgentHarnessStreamOptions {
     /// Merge these pinned options into a base `SimpleStreamOptions`, with this
     /// set taking precedence on `Some` fields.
     pub fn merge_into(&self, mut base: SimpleStreamOptions) -> SimpleStreamOptions {
+        if self.max_response_bytes.is_some() {
+            base.max_response_bytes = self.max_response_bytes;
+        }
+        if self.max_tokens.is_some() {
+            base.max_tokens = self.max_tokens;
+        }
+        if self.temperature.is_some() {
+            base.temperature = self.temperature;
+        }
         if self.timeout.is_some() {
             base.timeout = self.timeout;
         }

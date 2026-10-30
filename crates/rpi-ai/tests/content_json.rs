@@ -1,7 +1,7 @@
 //! Regression coverage for #59: raw JSON must round-trip without Value normalization.
 use rpi_ai::types::{
-    Api, AssistantMessage, Content, ImageContent, StopReason, TextContent, ThinkingContent,
-    ToolCall, ToolResultMessage, UserContent, UserMessage,
+    Api, AssistantMessage, AudioContent, Content, ImageContent, StopReason, TextContent,
+    ThinkingContent, ToolCall, ToolResultMessage, UserContent, UserMessage,
 };
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::json;
@@ -24,6 +24,11 @@ fn blocks() -> Vec<Content> {
             kind: Default::default(),
             data: "aW1hZ2U=".into(),
             mime_type: "image/png".into(),
+        }),
+        Content::Audio(AudioContent {
+            kind: Default::default(),
+            data: "UklGRg==".into(),
+            mime_type: "audio/wav".into(),
         }),
         Content::ToolCall(ToolCall {
             kind: Default::default(),
@@ -74,6 +79,7 @@ fn standalone_blocks_keep_their_discriminator_and_match_content_encoding() {
             Content::Text(inner) => check(inner, &block, "text"),
             Content::Thinking(inner) => check(inner, &block, "thinking"),
             Content::Image(inner) => check(inner, &block, "image"),
+            Content::Audio(inner) => check(inner, &block, "audio"),
             Content::ToolCall(inner) => check(inner, &block, "toolCall"),
         }
     }

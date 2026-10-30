@@ -116,7 +116,7 @@ pub fn map_agent_event(event: &AgentEvent) -> Option<UiEvent> {
             error: error.clone(),
         }),
         AgentEvent::TurnStart | AgentEvent::TurnEnd { .. } => None,
-        AgentEvent::MessageStart { message } => match message {
+        AgentEvent::MessageStart { message, .. } => match message {
             AgentMessage::Assistant(a) => Some(UiEvent::AssistantStart {
                 blocks: assistant_blocks(a),
             }),
@@ -126,7 +126,7 @@ pub fn map_agent_event(event: &AgentEvent) -> Option<UiEvent> {
             blocks: assistant_blocks(message),
             tool_calls: assistant_tool_calls(message),
         }),
-        AgentEvent::MessageEnd { message } => match message {
+        AgentEvent::MessageEnd { message, .. } => match message {
             AgentMessage::Assistant(a) => Some(UiEvent::AssistantEnd {
                 blocks: assistant_blocks(a),
             }),
@@ -341,6 +341,7 @@ fn map_remote_driver_event(event: &RemoteEvent) -> Option<DriverEvent> {
         } => Some(DriverEvent::UiDialog(rpi_extensions::UiDialogRequest {
             request_id: request_id.clone(),
             tool_call_id: tool_call_id.clone(),
+            session_id: None,
             ui: ui.clone(),
             raw: serde_json::to_value(event).unwrap_or(Value::Null),
         })),

@@ -619,6 +619,7 @@ fn content_kind(content: &Content) -> &'static str {
         Content::Thinking(_) => "thinking",
         Content::ToolCall(_) => "toolCall",
         Content::Image(_) => "image",
+        Content::Audio(_) => "audio",
     }
 }
 

@@ -31,7 +31,9 @@ fn job(owner: u64) -> Arc<Job> {
         owner,
         cancel: CancellationToken::new(),
         invocation_signal: None,
+        parent_tool_call_id: None,
         state: Mutex::new(State::default()),
+        forwarding: Mutex::new(None),
     })
 }
 fn delta(text: String) -> AgentEvent {
@@ -43,6 +45,7 @@ fn delta(text: String) -> AgentEvent {
             delta: text,
             partial,
         },
+        message_id: None,
     }
 }
 async fn wait(manager: &ChildAgents, parent: &AgentHarness, id: &str) -> Value {
@@ -189,6 +192,7 @@ async fn poll_drains_bounded_batches_before_delivering_a_terminal_result() {
         job.observe(delta("x".repeat(32 * 1024)));
     }
     job.state.lock().unwrap().result = Some(json!({"status":"completed","text":"report"}));
+    job.state.lock().unwrap().settled = true;
     manager.jobs.lock().unwrap().insert("c".into(), job);
     let a = manager
         .handle(&parent, 7, json!({"op":"poll","childId":"c"}))
@@ -236,4 +240,128 @@ fn child_limits_reject_wrong_types_and_out_of_range_values() {
 }
 
 mod invocation;
+mod correlation;
 mod security;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_sink_announces_identity_then_native_events_then_one_terminal() {
+    let parent = parent(FauxScript::new().with_text("live child")).await;
+    let manager = ChildAgents::default();
+    let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let output = events.clone();
+    manager.set_event_sink(Some(Arc::new(move |value| {
+        let output = output.clone();
+        Box::pin(async move {
+            output.lock().unwrap().push(value);
+        })
+    })));
+    let started = manager
+        .handle(&parent, 7, json!({"op":"start","task":"report"}))
+        .await
+        .unwrap();
+    let id = started["childId"].as_str().unwrap();
+    wait(&manager, &parent, id).await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while manager.active.load(Ordering::Acquire) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    manager
+        .handle_existing(7, json!({"op":"dispose","childId":id}))
+        .unwrap();
+    let events = events.lock().unwrap();
+    assert_eq!(events.first().unwrap()["type"], "child_start");
+    assert_eq!(events.last().unwrap()["type"], "child_end");
+    assert_eq!(
+        events.iter().filter(|e| e["type"] == "child_end").count(),
+        1
+    );
+    assert!(events
+        .iter()
+        .any(|e| e["event"]["type"] == "message_update"));
+    assert!(events.iter().any(|e| e["event"]["type"] == "agent_end"));
+    for event in events.iter() {
+        assert_eq!(event["childId"], id);
+        assert_eq!(event["sessionId"], id);
+        assert_eq!(event["parentSessionId"], "parent");
+        assert_eq!(event["role"], "worker");
+        assert!(event.get("toolCallId").is_none());
+        assert!(event.get("parentToolCallId").is_none());
+    }
+}
+
+#[tokio::test]
+async fn forwarding_overflow_fails_and_drains_accepted_events_before_terminal() {
+    let job = job(7);
+    let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+
+    let output = events.clone();
+    let ready = job.attach(
+        Arc::new(move |value| {
+            let output = output.clone();
+            Box::pin(async move {
+                output.lock().unwrap().push(value);
+            })
+        }),
+        json!({"parentSessionId":"p","sessionId":"c","childId":"c"}),
+    );
+    ready.await.unwrap();
+    for _ in 0..257 {
+        job.observe(AgentEvent::TurnStart);
+    }
+    assert!(job.cancel.is_cancelled());
+    assert!(job
+        .state
+        .lock()
+        .unwrap()
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("overflow"));
+    job.finish_events().await;
+    job.finish_events().await;
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 258);
+    assert_eq!(events.last().unwrap()["status"], "failed");
+    assert_eq!(events.last().unwrap()["type"], "child_end");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropped_manager_cancels_runner_and_forwarder_still_delivers_terminal() {
+    let parent = parent(
+        FauxScript::new()
+            .with_text("slow")
+            .with_tokens_per_second(0.1),
+    )
+    .await;
+    let manager = ChildAgents::default();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    manager.set_event_sink(Some(Arc::new(move |value| {
+        let tx = tx.clone();
+        Box::pin(async move {
+            tx.send(value).unwrap();
+        })
+    })));
+    manager
+        .handle(&parent, 7, json!({"op":"start","task":"report"}))
+        .await
+        .unwrap();
+    drop(manager);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        assert_eq!(rx.recv().await.unwrap()["type"], "child_start");
+        loop {
+            let event = rx.recv().await.unwrap();
+            if event["type"] == "child_end" {
+                assert_eq!(event["status"], "failed");
+                break;
+            }
+        }
+        assert!(rx.recv().await.is_none());
+    })
+    .await
+    .unwrap();
+}
+
+mod durable;

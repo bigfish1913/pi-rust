@@ -4,6 +4,58 @@ use serde_json::{json, Value};
 pub const MAX_FRAME_BYTES: usize = 1_048_576;
 pub const PI_BASELINE: &str = "1.2.0";
 
+/// Native ordered user payload; deliberately excludes assistant/tool blocks.
+#[derive(Debug, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PromptPart {
+    Text { text: String },
+    Image { data: String, #[serde(rename = "mimeType")] mime_type: String },
+    Audio { data: String, #[serde(rename = "mimeType")] mime_type: String },
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(untagged)]
+pub enum PromptContent {
+    Legacy(String),
+    Ordered(Vec<PromptPart>),
+}
+
+pub fn ordered_content(request: &Value) -> Result<Option<Vec<rpi_ai::types::Content>>, String> {
+    let Some(value) = request.get("content") else { return Ok(None); };
+    let content: PromptContent = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+    let parts = match content {
+        PromptContent::Legacy(text) => {
+            // Legacy strings retain the existing frame bound, not the tighter
+            // ordered-parts budget. The dispatcher still combines legacy media.
+            if text.len() > MAX_FRAME_BYTES {
+                return Err("prompt content exceeds native frame limit".into());
+            }
+            return Ok(None);
+        }
+        PromptContent::Ordered(parts) => parts,
+    };
+    // There is no implied ordering between the two representations. Check both
+    // aliases, including ones hidden by dispatcher precedence. Empty placeholders
+    // remain valid; malformed media still goes through the existing decoder.
+    if ["message", "prompt"].iter().any(|key| {
+        request.get(key).and_then(Value::as_str).is_some_and(|text| !text.is_empty())
+    }) || ["images", "audio"].iter().any(|key| {
+        request.get(key).and_then(Value::as_array).is_some_and(|parts| !parts.is_empty())
+    }) {
+        return Err("ordered content cannot be combined with nonempty legacy message, prompt, images or audio".into());
+    }
+    if parts.len() > 256 || serde_json::to_vec(value).map_err(|e| e.to_string())?.len() > 900_000 {
+        return Err("prompt content exceeds native input limits".into());
+    }
+    use rpi_ai::types::{Content, ImageContent, AudioContent};
+    Ok(Some(parts.into_iter().map(|part| match part {
+        PromptPart::Text { text } => Content::text(text),
+        PromptPart::Image { data, mime_type } => Content::Image(ImageContent { kind: Default::default(), data, mime_type }),
+        PromptPart::Audio { data, mime_type } => Content::Audio(AudioContent { kind: Default::default(), data, mime_type }),
+    }).collect()))
+}
+
+
 #[allow(dead_code)]
 #[derive(Debug, serde::Deserialize)]
 pub struct Request {
@@ -20,11 +72,27 @@ pub struct Request {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
     Prompt {
-        #[serde(alias = "content", alias = "prompt")]
-        message: String,
+        #[serde(default, alias = "prompt")]
+        message: Option<String>,
+        #[serde(default)]
+        content: Option<PromptContent>,
     },
     Abort,
+    Sample {
+        #[serde(rename = "sampleId")]
+        sample_id: String,
+        request: Value,
+    },
+    CancelSample {
+        #[serde(rename = "sampleId")]
+        sample_id: String,
+    },
     GetState,
+    /// Append (default) to the current pre-skills prompt, or explicitly replace it.
+    SetSystemPrompt {
+        prompt: String,
+        mode: Option<String>,
+    },
     /// List extension slash commands (name and description).
     GetCommands,
     /// Invoke an extension handler and return its JSON result as response data.
@@ -54,6 +122,18 @@ pub enum Command {
         #[serde(rename = "customType")]
         custom_type: String,
         data: Option<Value>,
+    },
+    /// Read the context-window usage estimate used by native compaction.
+    GetContextUsage,
+    /// Toggle native automatic context compaction for subsequent runs.
+    SetCompactionEnabled {
+        enabled: bool,
+    },
+    /// Read and change the native session mode strategy.
+    GetModes,
+    SetMode {
+        #[serde(rename = "modeId")]
+        mode_id: String,
     },
     GetStats,
     GetQueue,
@@ -104,19 +184,39 @@ pub enum Command {
     SetActiveTools {
         tools: Vec<String>,
     },
+    /// Ask a connected client to perform an operation and wait for its unique
+    /// `requestId`. This command is a bridge seam, not a registered agent tool.
+    /// Optional `timeoutMs` is validated by the dispatcher (1..=60_000).
+    ClientRequest {
+        method: String,
+        params: Value,
+    },
     UiDialogResponse {
         #[serde(rename = "requestId")]
         request_id: String,
         answer: Option<Value>,
+        /// Explicit URL action; takes precedence over generic cancellation.
+        #[serde(rename = "urlElicitation")]
+        url_elicitation: Option<Value>,
         #[serde(default)]
         cancelled: bool,
+    },
+    ConfigureExternalTools {
+        tools: Vec<rpi_tools::tools::external::ExternalToolDefinition>,
+    },
+    ExternalToolResponse {
+        #[serde(rename = "requestId")]
+        request_id: String,
     },
     Ping,
     Stop,
 }
 
 pub const SUPPORTED_COMMANDS: &[&str] = &[
+    "sample",
+    "cancel_sample",
     "get_state",
+    "set_system_prompt",
     "get_commands",
     "execute_command",
     "get_messages",
@@ -124,6 +224,10 @@ pub const SUPPORTED_COMMANDS: &[&str] = &[
     "get_session_branch",
     "append_entry",
     "get_stats",
+    "get_context_usage",
+    "set_compaction_enabled",
+    "get_modes",
+    "set_mode",
     "get_queue",
     "queue_message",
     "cancel_queued",
@@ -142,6 +246,9 @@ pub const SUPPORTED_COMMANDS: &[&str] = &[
     "set_thinking_level",
     "get_available_tools",
     "set_active_tools",
+    "configure_external_tools",
+    "external_tool_response",
+    "client_request",
     "ui_dialog_response",
     "ping",
     "stop",
@@ -175,9 +282,10 @@ pub fn ready() -> Value {
     json!({
         "type": "ready",
         "protocol": "rpi",
+        "promptContentVersion": 1,
         "piCompatibilityTarget": PI_BASELINE,
         "supportedCommands": SUPPORTED_COMMANDS,
-        "supportedEvents": ["session_entry_committed"],
+        "supportedEvents": ["session_entry_committed", "compaction_started", "compaction_finished"],
         "semantics": {
             "promptResponse": "accepted",
             "settlementEvent": "agent_settled",
@@ -310,6 +418,22 @@ mod tests {
     }
 
     #[test]
+    fn client_request_payload_is_native_and_correlated() {
+        assert!(SUPPORTED_COMMANDS.contains(&"client_request"));
+        let request: Request = serde_json::from_value(json!({
+            "type": "client_request",
+            "id": 9,
+            "method": "fs/read_text_file",
+            "params": {"path": "C:/workspace/README.md"}
+        }))
+        .unwrap();
+        assert!(matches!(
+            request.command,
+            Command::ClientRequest { method, params }
+                if method == "fs/read_text_file" && params["path"] == "C:/workspace/README.md"
+        ));
+    }
+    #[test]
     fn auth_commands_keep_secret_fields_in_request_only() {
         let request: Request = serde_json::from_value(json!({
             "type": "set_api_key",
@@ -337,16 +461,67 @@ mod tests {
     }
     #[test]
     fn prompt_payload_accepts_legacy_content_and_prompt_fields() {
-        for field in ["content", "prompt"] {
+        for field in ["message", "content", "prompt"] {
             let request: Request = serde_json::from_value(json!({
                 "type": "prompt",
                 field: "legacy text"
             }))
             .unwrap();
-            assert!(
-                matches!(request.command, Command::Prompt { message } if message == "legacy text")
-            );
+            match request.command {
+                Command::Prompt { message: Some(message), .. } => assert_eq!(message, "legacy text"),
+                Command::Prompt { content: Some(PromptContent::Legacy(text)), .. } => assert_eq!(text, "legacy text"),
+                other => panic!("legacy prompt not preserved: {other:?}"),
+            }
+            assert!(ordered_content(&json!({"type":"prompt", field:"legacy text"})).unwrap().is_none());
         }
+    }
+
+    #[test]
+    fn ordered_prompt_rejects_every_nonempty_legacy_alias() {
+        for (key, value) in [
+            ("message", json!("legacy")), ("prompt", json!("legacy")),
+            ("images", json!([{"data":"AA==","mimeType":"image/png"}])),
+            ("audio", json!([{"data":"AA==","mimeType":"audio/wav"}])),
+        ] {
+            let mut request = json!({"content":[{"type":"text","text":"ordered"}]});
+            request[key] = value;
+            assert!(ordered_content(&request).unwrap_err().contains("nonempty legacy"), "{key}");
+        }
+        let hidden = json!({"message":"", "prompt":"hidden", "content":[]});
+        assert!(ordered_content(&hidden).is_err());
+        assert!(ordered_content(&json!({"message":"", "prompt":"", "images":[], "audio":[],
+            "content":[{"type":"text","text":"ordered"}]})).unwrap().is_some());
+        // Wrong-type attachments are left for the dispatcher's strict media
+        // decoder, not interpreted as an empty array or silently accepted there.
+        assert!(ordered_content(&json!({"images":{}, "content":[]})).unwrap().is_some());
+    }
+
+    #[test]
+    fn ordered_prompt_parts_are_strict_bounded_and_keep_order() {
+        let parts = json!([
+            {"type":"text","text":"before"},
+            {"type":"image","data":"AA==","mimeType":"image/png"},
+            {"type":"text","text":"between"},
+            {"type":"audio","data":"AA==","mimeType":"audio/wav"},
+            {"type":"text","text":"after"}
+        ]);
+        let request: Request = serde_json::from_value(json!({"type":"prompt","content":parts})).unwrap();
+        assert!(matches!(request.command, Command::Prompt { content: Some(PromptContent::Ordered(parts)), .. } if parts.len() == 5));
+        let decoded = ordered_content(&json!({"content":parts})).unwrap().unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), parts);
+        for part in [
+            json!({"type":"assistant","text":"no"}),
+            json!({"type":"tool_result","text":"no"}),
+            json!({"type":"text","text":"no","role":"assistant"}),
+            json!({"type":"text","text":"no","unknown":true}),
+        ] {
+            let input = json!({"type":"prompt","content":[part]});
+            assert!(serde_json::from_value::<Request>(input.clone()).is_err());
+            assert!(ordered_content(&input).is_err());
+        }
+        assert!(ordered_content(&json!({"content":vec![json!({"type":"text","text":"x"});257]})).is_err());
+        assert!(ordered_content(&json!({"content":[{"type":"text","text":"x".repeat(900_000)}]})).is_err());
+        assert!(ordered_content(&json!({"content":"x".repeat(900_001)})).unwrap().is_none());
     }
 
     #[test]

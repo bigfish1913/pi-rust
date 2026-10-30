@@ -250,6 +250,7 @@ impl AnthropicProvider {
 
 #[async_trait]
 impl Provider for AnthropicProvider {
+    fn supports_response_budget(&self) -> bool { true }
     fn id(&self) -> &str {
         "anthropic"
     }
@@ -507,6 +508,9 @@ async fn run_anthropic_stream(
                 let status = resp.status();
                 if !status.is_success() {
                     let code = status.as_u16();
+                    if opts.max_response_bytes.is_some() {
+                        return Err(AiError::Http { status: Some(code), message: "provider HTTP error".into() });
+                    }
                     // Read the error body for a diagnostic message; the retry
                     // predicate only needs the status code.
                     let text = tokio::select! {
@@ -556,10 +560,7 @@ async fn run_anthropic_stream(
             _ = opts.signal.cancelled() => Err(AiError::Abort {
                 message: "Request aborted".to_string(),
             }),
-            result = response.text() => result.map_err(|error| AiError::Http {
-                status: None,
-                message: format!("failed to read non-stream response: {error}"),
-            }),
+            result = super::request::response_text(response, opts) => result,
         } {
             Ok(body) => body,
             Err(error) => {
@@ -662,6 +663,7 @@ async fn run_anthropic_stream(
     // applies the model-aware `cost_fn` on the final usage before the terminal
     // event (mirrors the inline `calculateCost(model, output.usage)` calls).
     let mut sse = SseEventStream::new(response, opts.signal.clone())
+        .with_response_budget(opts.max_response_bytes)
         .with_idle_timeout(opts.stream_idle_timeout())
         .with_diagnostics(diagnostics.enabled);
     let cost_model = model.cost.clone();

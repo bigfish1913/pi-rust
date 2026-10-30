@@ -214,6 +214,7 @@ async fn loads_real_cdylib_and_drives_echo_tool() {
         api: rpi_ai::types::Api::AnthropicMessages,
         provider: "anthropic".to_string(),
         model: "m".into(),
+        message_id: None,
         response_model: None,
         response_id: None,
         usage: Usage::zero(),
@@ -225,7 +226,10 @@ async fn loads_real_cdylib_and_drives_echo_tool() {
         timestamp: 0,
     }));
     let before = stub_message_end_hits(&stub_path);
-    emitter.try_emit(rpi_agent::AgentEvent::MessageEnd { message: am });
+    emitter.try_emit(rpi_agent::AgentEvent::MessageEnd {
+        message: am,
+        message_id: None,
+    });
     let after = stub_message_end_hits(&stub_path);
     assert_eq!(
         after,

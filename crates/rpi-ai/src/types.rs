@@ -159,6 +159,35 @@ impl<'de> Deserialize<'de> for ImageContentType {
     }
 }
 
+/// An audio content block (base64-encoded).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioContent {
+    #[serde(default, rename = "type")]
+    pub kind: AudioContentType,
+    pub data: String,
+    pub mime_type: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AudioContentType;
+impl Serialize for AudioContentType {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str("audio")
+    }
+}
+impl<'de> Deserialize<'de> for AudioContentType {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        if s != "audio" {
+            return Err(serde::de::Error::custom(format!(
+                "expected \"audio\", got {s:?}"
+            )));
+        }
+        Ok(Self)
+    }
+}
+
 /// A tool call request from the model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -206,6 +235,7 @@ pub enum Content {
     Text(TextContent),
     Thinking(ThinkingContent),
     Image(ImageContent),
+    Audio(AudioContent),
     ToolCall(ToolCall),
 }
 
@@ -218,6 +248,7 @@ impl Serialize for Content {
             Self::Text(block) => block.serialize(serializer),
             Self::Thinking(block) => block.serialize(serializer),
             Self::Image(block) => block.serialize(serializer),
+            Self::Audio(block) => block.serialize(serializer),
             Self::ToolCall(block) => block.serialize(serializer),
         }
     }
@@ -484,6 +515,7 @@ pub type ProviderId = String;
 pub enum InputModality {
     Text,
     Image,
+    Audio,
 }
 
 /// Thinking levels, mirroring TS `ThinkingLevel | "off"`.
@@ -662,6 +694,8 @@ pub struct AssistantMessage {
     pub provider: ProviderId,
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_id: Option<String>,
@@ -712,6 +746,7 @@ impl AssistantMessage {
             api,
             provider: provider.into(),
             model: model.into(),
+            message_id: None,
             response_model: None,
             response_id: None,
             usage: Usage::zero(),
@@ -739,6 +774,7 @@ impl AssistantMessage {
             api,
             provider: provider.into(),
             model: model.into(),
+            message_id: None,
             response_model: None,
             response_id: None,
             usage: Usage::zero(),
@@ -1120,6 +1156,7 @@ fn message_payload_bytes(message: &AssistantMessage) -> usize {
                         + thinking.thinking_signature.as_ref().map_or(0, String::len)
                 }
                 Content::Image(image) => image.data.len() + image.mime_type.len(),
+                Content::Audio(audio) => audio.data.len() + audio.mime_type.len(),
                 Content::ToolCall(tool) => tool_payload_bytes(tool),
             };
     }

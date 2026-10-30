@@ -41,6 +41,20 @@ fn bridges() -> &'static Mutex<HashMap<usize, Weak<ActionBridge>>> {
 }
 thread_local! {
     static CURRENT_INVOCATION: std::cell::RefCell<Option<Arc<ActionBridge>>> = const { std::cell::RefCell::new(None) };
+    static CURRENT_UI_SESSION: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Carry host-captured identity through a blocking approval callback. Never
+/// derive this value from the callback's tool arguments or UI payload.
+pub(crate) fn with_ui_session<T>(session_id: Option<String>, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<String>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CURRENT_UI_SESSION.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(CURRENT_UI_SESSION.with(|slot| slot.replace(session_id)));
+    f()
 }
 pub(crate) struct InvocationGuard {
     previous: Option<Arc<ActionBridge>>,
@@ -63,13 +77,24 @@ use tokio::runtime::Handle;
 /// `ui` is the normalized UI payload that TUI renderers generally need.
 #[derive(Clone, Debug, PartialEq)]
 pub struct UiDialogRequest {
+    /// Host-generated opaque wire capability; not the plugin-local request ID.
     pub request_id: String,
     pub tool_call_id: Option<String>,
+    /// Host-captured execution session; untrusted JSON never populates this.
+    pub session_id: Option<String>,
     pub ui: serde_json::Value,
     pub raw: serde_json::Value,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct UiDialogKey {
+    session_id: Option<String>,
+    owner: u64,
+    local_id: String,
+}
+
 struct UiDialogEntry {
+    key: UiDialogKey,
     request: UiDialogRequest,
     answer: Option<serde_json::Value>,
     cancelled: bool,
@@ -78,13 +103,14 @@ struct UiDialogEntry {
 struct UiDialogState {
     attached: bool,
     pending: VecDeque<String>,
+    // Only host-generated capabilities index the presentation/transport map.
     active: HashMap<String, UiDialogEntry>,
-    cancelled_tool_calls: std::collections::HashSet<String>,
+    local: HashMap<UiDialogKey, String>,
+    cancelled_tool_calls: std::collections::HashSet<(Option<String>, String)>,
 }
 
-/// Thread-safe mailbox connecting plugin runtime actions to an interactive
-/// host (normally the TUI). It deliberately carries only JSON and primitives,
-/// so the extension crate remains independent of the UI crate.
+/// JSON-only UI broker. Plugins address local IDs in a trusted session and
+/// invocation; consumers receive opaque wire capabilities, never those IDs.
 #[derive(Clone)]
 pub struct UiDialogMailbox {
     state: Arc<Mutex<UiDialogState>>,
@@ -103,12 +129,12 @@ impl UiDialogMailbox {
                 attached: false,
                 pending: VecDeque::new(),
                 active: HashMap::new(),
+                local: HashMap::new(),
                 cancelled_tool_calls: std::collections::HashSet::new(),
             })),
         }
     }
 
-    /// Mark an interactive consumer as available. Re-attaching is idempotent.
     pub fn attach(&self) {
         self.state
             .lock()
@@ -116,16 +142,10 @@ impl UiDialogMailbox {
             .attached = true;
     }
 
-    /// Detach the consumer and cancel every outstanding request. This prevents
-    /// a TUI restart/reload from leaving plugin polls blocked forever.
     pub fn detach(&self) {
         let mut state = self.state.lock().expect("ui dialog mailbox poisoned");
         state.attached = false;
-        state.pending.clear();
-        for entry in state.active.values_mut() {
-            entry.cancelled = true;
-            entry.answer = None;
-        }
+        Self::cancel_entries(&mut state);
     }
 
     pub fn is_attached(&self) -> bool {
@@ -135,13 +155,10 @@ impl UiDialogMailbox {
             .attached
     }
 
-    /// Remove and return the next request for presentation by the TUI.
-    /// Cancelled/answered requests are skipped; duplicate `open` calls never
-    /// enqueue the same request id twice.
     pub fn take_pending(&self) -> Option<UiDialogRequest> {
         let mut state = self.state.lock().expect("ui dialog mailbox poisoned");
-        while let Some(request_id) = state.pending.pop_front() {
-            if let Some(entry) = state.active.get(&request_id) {
+        while let Some(id) = state.pending.pop_front() {
+            if let Some(entry) = state.active.get(&id) {
                 if !entry.cancelled && entry.answer.is_none() {
                     return Some(entry.request.clone());
                 }
@@ -158,29 +175,42 @@ impl UiDialogMailbox {
             .len()
     }
 
-    /// Inspect lifecycle without consuming the answer reserved for a plugin.
-    pub fn is_pending(&self, request_id: &str) -> bool {
+    // Legacy native host helpers accept root-local IDs. Never use this lookup
+    // for incoming transport data or plugin operations (including root plugins).
+    fn host_id(state: &UiDialogState, id: &str) -> Option<String> {
+        if state.active.contains_key(id) {
+            return Some(id.to_owned());
+        }
+        state
+            .local
+            .get(&UiDialogKey {
+                session_id: None,
+                owner: 0,
+                local_id: id.to_owned(),
+            })
+            .cloned()
+    }
+
+    pub fn is_pending(&self, id: &str) -> bool {
+        let state = self.state.lock().expect("ui dialog mailbox poisoned");
+        Self::host_id(&state, id)
+            .and_then(|id| state.active.get(&id))
+            .is_some_and(|entry| !entry.cancelled && entry.answer.is_none())
+    }
+
+    /// Transport lifecycle lookup: no local-ID fallback, even for root.
+    pub fn is_pending_wire(&self, id: &str) -> bool {
         self.state
             .lock()
             .expect("ui dialog mailbox poisoned")
             .active
-            .get(request_id)
+            .get(id)
             .is_some_and(|entry| !entry.cancelled && entry.answer.is_none())
     }
 
-    /// Supply an answer for a request. Repeating the same operation is
-    /// idempotent; answering a cancelled/unknown request is an explicit error.
-    pub fn respond(&self, request_id: &str, answer: serde_json::Value) -> Result<(), String> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| "ui dialog mailbox poisoned".to_string())?;
-        let entry = state
-            .active
-            .get_mut(request_id)
-            .ok_or_else(|| format!("unknown UI request `{request_id}`"))?;
+    fn answer_entry(entry: &mut UiDialogEntry, answer: serde_json::Value) -> Result<(), String> {
         if entry.cancelled {
-            return Err(format!("UI request `{request_id}` was cancelled"));
+            return Err("UI request was cancelled".into());
         }
         if entry.answer.is_none() {
             entry.answer = Some(answer);
@@ -188,26 +218,56 @@ impl UiDialogMailbox {
         Ok(())
     }
 
-    /// Mark one request cancelled. The terminal state remains visible to the
-    /// plugin's next `poll`, then is reclaimed by that poll.
-    pub fn cancel(&self, request_id: &str) -> Result<(), String> {
+    pub fn respond_wire(&self, id: &str, answer: serde_json::Value) -> Result<(), String> {
         let mut state = self
             .state
             .lock()
-            .map_err(|_| "ui dialog mailbox poisoned".to_string())?;
+            .map_err(|_| "ui dialog mailbox poisoned")?;
         let entry = state
             .active
-            .get_mut(request_id)
-            .ok_or_else(|| format!("unknown UI request `{request_id}`"))?;
+            .get_mut(id)
+            .ok_or_else(|| format!("unknown UI request `{id}`"))?;
+        Self::answer_entry(entry, answer)
+    }
+
+    pub fn respond(&self, id: &str, answer: serde_json::Value) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "ui dialog mailbox poisoned")?;
+        let wire = Self::host_id(&state, id).ok_or_else(|| format!("unknown UI request `{id}`"))?;
+        Self::answer_entry(state.active.get_mut(&wire).unwrap(), answer)
+    }
+
+    fn cancel_entry(state: &mut UiDialogState, wire: &str) -> Result<(), String> {
+        let entry = state
+            .active
+            .get_mut(wire)
+            .ok_or_else(|| format!("unknown UI request `{wire}`"))?;
         entry.cancelled = true;
         entry.answer = None;
-        state.pending.retain(|id| id != request_id);
+        state.pending.retain(|id| id != wire);
         Ok(())
     }
 
-    /// Cancel all requests currently known to the mailbox.
-    pub fn cancel_all(&self) {
-        let mut state = self.state.lock().expect("ui dialog mailbox poisoned");
+    pub fn cancel_wire(&self, id: &str) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "ui dialog mailbox poisoned")?;
+        Self::cancel_entry(&mut state, id)
+    }
+
+    pub fn cancel(&self, id: &str) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "ui dialog mailbox poisoned")?;
+        let wire = Self::host_id(&state, id).ok_or_else(|| format!("unknown UI request `{id}`"))?;
+        Self::cancel_entry(&mut state, &wire)
+    }
+
+    fn cancel_entries(state: &mut UiDialogState) {
         state.pending.clear();
         for entry in state.active.values_mut() {
             entry.cancelled = true;
@@ -215,90 +275,124 @@ impl UiDialogMailbox {
         }
     }
 
-    /// Cancel approval requests belonging to one tool without disturbing
-    /// questions from concurrent tool calls.
-    pub fn cancel_tool_call(&self, tool_call_id: &str) {
-        let mut state = self.state.lock().expect("ui dialog mailbox poisoned");
-        // A callback can reach `open` just after the host cancels its call.
-        // Remember the cancellation so it cannot enqueue an orphan question.
-        state.cancelled_tool_calls.insert(tool_call_id.to_string());
-        for entry in state.active.values_mut() {
-            if entry.request.tool_call_id.as_deref() == Some(tool_call_id) {
-                entry.cancelled = true;
-                entry.answer = None;
-            }
-        }
-        let cancelled: std::collections::HashSet<String> = state
-            .active
-            .iter()
-            .filter(|(_, entry)| entry.cancelled)
-            .map(|(id, _)| id.clone())
-            .collect();
-        state.pending.retain(|id| !cancelled.contains(id));
+    pub fn cancel_all(&self) {
+        Self::cancel_entries(&mut self.state.lock().expect("ui dialog mailbox poisoned"));
     }
 
-    /// Poll a request and consume a terminal answer/cancellation. Pending
-    /// polls are cheap and preserve the request for subsequent calls.
-    pub fn poll(&self, request_id: &str) -> Result<serde_json::Value, String> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| "ui dialog mailbox poisoned".to_string())?;
-        let terminal = match state.active.get(request_id) {
-            Some(entry) if entry.cancelled => Some(serde_json::json!({
-                "status": "cancelled",
-                "requestId": request_id,
-                "toolCallId": entry.request.tool_call_id,
-            })),
-            Some(entry) if entry.answer.is_some() => Some(serde_json::json!({
-                "status": "answered",
-                "requestId": request_id,
-                "toolCallId": entry.request.tool_call_id,
-                "answer": entry.answer.clone().unwrap_or(serde_json::Value::Null),
-            })),
-            Some(entry) => Some(serde_json::json!({
-                "status": "pending",
-                "requestId": request_id,
-                "toolCallId": entry.request.tool_call_id,
-            })),
-            None => None,
+    /// Legacy root-only cancellation; child cleanup must pass captured session.
+    pub fn cancel_tool_call(&self, tool_call_id: &str) {
+        self.cancel_tool_call_with_session(tool_call_id, None);
+    }
+
+    /// Capture session at resource creation, not at late cleanup. Invocation
+    /// owner deliberately isn't required: approval callbacks share the tool's
+    /// session but have a separate plugin invocation/registration owner.
+    pub fn cancel_tool_call_with_session(&self, tool_call_id: &str, session_id: Option<String>) {
+        let mut state = self.state.lock().expect("ui dialog mailbox poisoned");
+        state
+            .cancelled_tool_calls
+            .insert((session_id.clone(), tool_call_id.to_owned()));
+        let wires: Vec<_> = state
+            .active
+            .iter()
+            .filter(|(_, entry)| {
+                entry.key.session_id == session_id
+                    && entry.request.tool_call_id.as_deref() == Some(tool_call_id)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for wire in wires {
+            let _ = Self::cancel_entry(&mut state, &wire);
+        }
+    }
+
+    fn poll_entry(state: &mut UiDialogState, wire: &str) -> Result<serde_json::Value, String> {
+        let entry = state
+            .active
+            .get(wire)
+            .ok_or_else(|| format!("unknown UI request `{wire}`"))?;
+        let status = if entry.cancelled {
+            "cancelled"
+        } else if entry.answer.is_some() {
+            "answered"
+        } else {
+            "pending"
         };
-        let Some(result) = terminal else {
-            return Err(format!("unknown UI request `{request_id}`"));
-        };
-        if result.get("status").and_then(serde_json::Value::as_str) != Some("pending") {
-            state.active.remove(request_id);
+        let mut result = serde_json::json!({
+            "status": status, "requestId": entry.key.local_id, "toolCallId": entry.request.tool_call_id,
+        });
+        if status == "answered" {
+            result["answer"] = entry.answer.clone().unwrap();
+        }
+        if status != "pending" {
+            let key = entry.key.clone();
+            state.active.remove(wire);
+            state.local.remove(&key);
+            state.pending.retain(|id| id != wire);
         }
         Ok(result)
     }
 
-    /// Parse and execute the JSON action envelope used by runtime action 17.
-    /// Supported operations are `open`, `poll`, `cancel`; `response` is also
-    /// accepted as a convenience for hosts that proxy answers through JSON.
+    /// Native host compatibility helper; plugin polling uses exact local scope.
+    pub fn poll(&self, id: &str) -> Result<serde_json::Value, String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "ui dialog mailbox poisoned")?;
+        let wire = Self::host_id(&state, id).ok_or_else(|| format!("unknown UI request `{id}`"))?;
+        Self::poll_entry(&mut state, &wire)
+    }
+
     pub fn handle(&self, args: serde_json::Value) -> Result<serde_json::Value, String> {
+        let session_id = CURRENT_UI_SESSION.with(|slot| slot.borrow().clone());
+        self.handle_with_session(args, session_id)
+    }
+
+    /// Host-only approval/legacy route. Never derive session from JSON.
+    pub fn handle_with_session(
+        &self,
+        args: serde_json::Value,
+        session_id: Option<String>,
+    ) -> Result<serde_json::Value, String> {
+        self.handle_with_owner(args, session_id, 0)
+    }
+
+    /// `owner` is a stable host-generated invocation (or registration) handle,
+    /// never a plugin argument. Wire capabilities are NOT accepted as local IDs
+    /// unless this owner actually opened a request using that local string.
+    pub fn handle_with_owner(
+        &self,
+        args: serde_json::Value,
+        session_id: Option<String>,
+        owner: u64,
+    ) -> Result<serde_json::Value, String> {
         let op = args
             .get("op")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("open");
-        let request_id = || {
-            args.get("requestId")
-                .or_else(|| args.get("request_id"))
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-                .filter(|id| !id.trim().is_empty())
-                .ok_or_else(|| "missing non-empty `requestId`".to_string())
+        let id = args
+            .get("requestId")
+            .or_else(|| args.get("request_id"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| "missing non-empty `requestId`".to_string())?
+            .to_owned();
+        let key = UiDialogKey {
+            session_id: session_id.clone(),
+            owner,
+            local_id: id.clone(),
         };
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "ui dialog mailbox poisoned")?;
         match op {
             "open" => {
-                let id = request_id()?;
-                let mut state = self
-                    .state
-                    .lock()
-                    .map_err(|_| "ui dialog mailbox poisoned".to_string())?;
                 if !state.attached {
-                    return Err("ask_user requires an interactive UI".to_string());
+                    return Err("ask_user requires an interactive UI".into());
                 }
-                if let Some(entry) = state.active.get(&id) {
+                if let Some(wire) = state.local.get(&key) {
+                    let entry = state.active.get(wire).unwrap();
                     return Ok(if entry.cancelled {
                         serde_json::json!({"status":"cancelled","requestId":id})
                     } else if let Some(answer) = &entry.answer {
@@ -312,22 +406,26 @@ impl UiDialogMailbox {
                     .or_else(|| args.get("tool_call_id"))
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_owned);
-                if tool_call_id
-                    .as_ref()
-                    .is_some_and(|id| state.cancelled_tool_calls.contains(id))
-                {
-                    return Ok(serde_json::json!({
-                        "status": "cancelled", "requestId": id, "toolCallId": tool_call_id,
-                    }));
+                if tool_call_id.as_ref().is_some_and(|id| {
+                    state
+                        .cancelled_tool_calls
+                        .contains(&(session_id.clone(), id.clone()))
+                }) {
+                    return Ok(
+                        serde_json::json!({"status":"cancelled","requestId":id,"toolCallId":tool_call_id}),
+                    );
                 }
                 let ui = args.get("ui").cloned().unwrap_or_else(|| args.clone());
                 rpi_plugin_sdk::dialogs::validate(&ui, tool_call_id.as_deref())?;
+                let wire = uuid::Uuid::new_v4().to_string();
                 state.active.insert(
-                    id.clone(),
+                    wire.clone(),
                     UiDialogEntry {
+                        key: key.clone(),
                         request: UiDialogRequest {
-                            request_id: id.clone(),
+                            request_id: wire.clone(),
                             tool_call_id: tool_call_id.clone(),
+                            session_id,
                             ui,
                             raw: args,
                         },
@@ -335,30 +433,41 @@ impl UiDialogMailbox {
                         cancelled: false,
                     },
                 );
-                state.pending.push_back(id.clone());
+                state.local.insert(key, wire.clone());
+                state.pending.push_back(wire);
                 Ok(serde_json::json!({"status":"pending","requestId":id,"toolCallId":tool_call_id}))
             }
-            "poll" => self.poll(&request_id()?),
-            "cancel" => {
-                let id = request_id()?;
-                self.cancel(&id)?;
-                Ok(serde_json::json!({"status":"cancelled","requestId":id}))
-            }
-            "response" | "respond" => {
-                let id = request_id()?;
-                let answer = args
-                    .get("answer")
-                    .or_else(|| args.get("value"))
+            "poll" | "cancel" | "response" | "respond" => {
+                let wire = state
+                    .local
+                    .get(&key)
                     .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                self.respond(&id, answer)?;
-                Ok(serde_json::json!({"status":"answered","requestId":id}))
+                    .ok_or_else(|| format!("unknown UI request `{id}`"))?;
+                match op {
+                    "poll" => Self::poll_entry(&mut state, &wire),
+                    "cancel" => {
+                        Self::cancel_entry(&mut state, &wire)?;
+                        Ok(serde_json::json!({"status":"cancelled","requestId":id}))
+                    }
+                    _ => {
+                        let answer = args
+                            .get("answer")
+                            .or_else(|| args.get("value"))
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
+                        Self::answer_entry(state.active.get_mut(&wire).unwrap(), answer)?;
+                        Ok(serde_json::json!({"status":"answered","requestId":id}))
+                    }
+                }
             }
             other => Err(format!("unknown UI dialog operation `{other}`")),
         }
     }
 }
 
+#[cfg(test)]
+#[path = "actions_mailbox_tests.rs"]
+mod mailbox_ownership_tests;
 /// Host-only, owner-bound UI writer. It contains no plugin callbacks or pointers.
 pub type SideQuestionSink =
     Arc<dyn Fn(serde_json::Value) -> Result<serde_json::Value, String> + Send + Sync>;
@@ -526,8 +635,11 @@ pub trait RuntimeActionHost: Send + Sync {
 /// and dropped candidate sessions cannot leave dereferenceable dangling pointers.
 pub struct ActionBridge {
     /// Some(child) only for a live host-created tool invocation.
-    invocation: Option<(bool, String, tokio_util::sync::CancellationToken)>,
+    invocation: Option<(bool, String, tokio_util::sync::CancellationToken, Option<rpi_agent::tool_execution_scope::InvocationToolCallId>)>,
     execution_context: Option<serde_json::Value>,
+    execution_scope: Option<Arc<rpi_agent::tool_execution_scope::ToolExecutionScope>>,
+    // Weak ownership follows the foreign driver's lifetime, including cleanup.
+    child_invocations: Arc<std::sync::Mutex<Vec<Weak<ActionBridge>>>>,
     stdio: crate::StdioLifecycle,
     plugin_identity: Option<(u64, String)>,
     component_owners: Arc<std::sync::Mutex<Vec<u64>>>,
@@ -588,9 +700,21 @@ impl ActionBridge {
         child: bool,
         signal: tokio_util::sync::CancellationToken,
     ) -> Arc<Self> {
-        Arc::new(Self {
-            invocation: Some((child, uuid::Uuid::new_v4().to_string(), signal)),
+        self.for_tool_invocation(child, signal, None)
+    }
+
+    pub(crate) fn for_tool_invocation(
+        &self,
+        child: bool,
+        signal: tokio_util::sync::CancellationToken,
+        actual_tool_call_id: Option<&str>,
+    ) -> Arc<Self> {
+        let invocation = Arc::new(Self {
+            invocation: Some((child, uuid::Uuid::new_v4().to_string(), signal,
+                actual_tool_call_id.and_then(rpi_agent::tool_execution_scope::InvocationToolCallId::new))),
             execution_context: rpi_agent::tool_execution_scope::execution_context(),
+            execution_scope: rpi_agent::tool_execution_scope::ToolExecutionScope::capture(),
+            child_invocations: self.child_invocations.clone(),
             stdio: self.stdio.clone(),
             plugin_identity: self.plugin_identity.clone(),
             component_owners: self.component_owners.clone(),
@@ -601,10 +725,33 @@ impl ActionBridge {
             ext_status: self.ext_status.clone(),
             editor_text: self.editor_text.clone(),
             active: self.active.clone(),
-        })
+        });
+        if child {
+            let mut children = self.child_invocations.lock().unwrap_or_else(|e| e.into_inner());
+            children.retain(|entry| entry.strong_count() != 0);
+            children.push(Arc::downgrade(&invocation));
+        }
+        invocation
     }
+    /// Capture host task provenance before crossing a blocking/foreign boundary.
+    /// Root command dispatchers can use this too, avoiding ambiguous registration
+    /// authority while unrelated child invocations are active.
+    pub fn capture_invocation(
+        &self,
+        signal: tokio_util::sync::CancellationToken,
+    ) -> Arc<Self> {
+        self.for_invocation(rpi_agent::tool_execution_scope::is_child_execution(), signal)
+    }
+
+    /// Establish captured authority for synchronous callbacks. Worker threads
+    /// must carry `user_data()` explicitly; they do not inherit thread locals.
+    pub fn with_invocation<T>(self: &Arc<Self>, callback: impl FnOnce() -> T) -> T {
+        let _guard = self.enter_invocation();
+        callback()
+    }
+
     pub(crate) fn invocation_key(&self) -> Option<&str> {
-        self.invocation.as_ref().map(|(_, key, _)| key.as_str())
+        self.invocation.as_ref().map(|(_, key, _, _)| key.as_str())
     }
     pub(crate) fn enter_invocation(self: &Arc<Self>) -> InvocationGuard {
         InvocationGuard {
@@ -618,6 +765,8 @@ impl ActionBridge {
         Arc::new(Self {
             invocation: None,
             execution_context: None,
+            execution_scope: None,
+            child_invocations: Arc::new(std::sync::Mutex::new(Vec::new())),
             stdio: crate::StdioLifecycle::default(),
             plugin_identity: None,
             component_owners: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -657,6 +806,8 @@ impl ActionBridge {
         Arc::new(Self {
             invocation: None,
             execution_context: None,
+            execution_scope: None,
+            child_invocations: Arc::new(std::sync::Mutex::new(Vec::new())),
             stdio: crate::StdioLifecycle::default(),
             plugin_identity: None,
             component_owners: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -682,6 +833,8 @@ impl ActionBridge {
         Arc::new(Self {
             invocation: None,
             execution_context: None,
+            execution_scope: None,
+            child_invocations: Arc::new(std::sync::Mutex::new(Vec::new())),
             stdio: crate::StdioLifecycle::default(),
             plugin_identity: None,
             component_owners: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -705,6 +858,8 @@ impl ActionBridge {
         Arc::new(Self {
             invocation: None,
             execution_context: None,
+            execution_scope: None,
+            child_invocations: self.child_invocations.clone(),
             component_owners: self.component_owners.clone(),
             stdio: self.stdio.clone(),
             plugin_identity: Some((owner, name.to_owned())),
@@ -1059,6 +1214,45 @@ fn run_action(
             .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()))
     };
 
+    // A host task scope is authority; JSON runtimeHandle/sessionId never is.
+    let bridge = if bridge.invocation.is_none()
+        && rpi_agent::tool_execution_scope::is_child_execution()
+    {
+        bridge.for_invocation(true, rpi_agent::tool_execution_scope::invocation_signal()
+            .unwrap_or_default())
+    } else {
+        bridge
+    };
+    let child = bridge.invocation.as_ref().is_some_and(|(child, _, _, _)| *child);
+    let cancelled = bridge.invocation.as_ref().is_some_and(|(_, _, signal, _)| signal.is_cancelled());
+    let ambiguous = bridge.invocation.is_none() && {
+        let mut children = bridge.child_invocations.lock().unwrap_or_else(|e| e.into_inner());
+        children.retain(|entry| entry.strong_count() != 0);
+        !children.is_empty()
+    };
+    let ui_cleanup = action == RuntimeActionId::UiDialog
+        && matches!(args.get("op").and_then(serde_json::Value::as_str), Some("poll" | "cancel"));
+    let denied = if child && !matches!(action, RuntimeActionId::GetExecutionContext | RuntimeActionId::UiDialog) {
+        Some("runtime action is root-only; child invocation denied")
+    } else if child && (bridge.execution_scope.is_none()
+        || (action == RuntimeActionId::UiDialog && bridge.execution_context.as_ref()
+            .and_then(|context| context.get("sessionId"))
+            .and_then(serde_json::Value::as_str).is_none())) {
+        Some("child invocation lacks trusted execution scope/session")
+    } else if ambiguous {
+        Some("registration handle is ambiguous during active child invocation; pass the invocation handle")
+    } else if cancelled && !ui_cleanup && action != RuntimeActionId::ChildAgent {
+        Some("runtime invocation is cancelled")
+    } else {
+        None
+    };
+    if let Some(error) = denied {
+        if !out.is_null() {
+            unsafe { *out = StbString::from_string(serde_json::json!({"error":error}).to_string()); }
+        }
+        return 1;
+    }
+
     let runtime_key = args
         .as_object_mut()
         .and_then(|args| args.remove("__rpiRuntimeKey"));
@@ -1077,6 +1271,16 @@ fn run_action(
     let editor_text = bridge.editor_text.clone();
     let reload_cb = bridge.reload.clone();
     let execution_context = bridge.execution_context.clone();
+    let execution_scope = bridge.execution_scope.clone();
+    let invocation_signal = bridge.invocation.as_ref().map(|(_, _, signal, _)| signal.clone());
+    // Capture before leaving the foreign/approval callback thread. Only the
+    // invocation bridge and host-scoped approval identity are trusted sources.
+    let ui_session_id = execution_context
+        .as_ref()
+        .and_then(|context| context.get("sessionId"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| CURRENT_UI_SESSION.with(|slot| slot.borrow().clone()));
     if action == RuntimeActionId::StdioLifecycle {
         let result = bridge.stdio.handle(
             bridge.plugin_identity.as_ref().map_or(0, |(id, _)| *id),
@@ -1135,7 +1339,7 @@ fn run_action(
         let allowed = bridge
             .invocation
             .as_ref()
-            .is_some_and(|(child, key, signal)| {
+            .is_some_and(|(child, key, signal, _)| {
                 !child
                     && (cleanup || !signal.is_cancelled())
                     && (invocation_thread
@@ -1152,8 +1356,10 @@ fn run_action(
                 .expect("authorized invocation")
                 .2
                 .clone();
+            let tool_call_id = bridge.invocation.as_ref().expect("authorized invocation").3.clone();
             bridge.runtime.spawn(async move {
-                let result = rpi_agent::tool_execution_scope::with_invocation_signal(
+                let result = rpi_agent::tool_execution_scope::with_invocation_binding(
+                    tool_call_id,
                     signal,
                     host.child_agent(owner, args),
                 )
@@ -1176,16 +1382,20 @@ fn run_action(
             let _ = tx.send(editor_text.handle(args));
         });
     } else if action == RuntimeActionId::UiDialog {
+        // The capability is stable for this live invocation and is captured
+        // before crossing the foreign-thread boundary, just like the session.
+        let ui_owner = bridge.user_data() as usize as u64;
         // UiDialog is intentionally synchronous at the plugin ABI boundary:
         // `open` waits until the TUI answers. Never park that wait inside the
         // Tokio worker that services the bridge. A SEARCH/extension tool that
         // invokes `ui_request/open` from a single-thread runtime would
         // otherwise block the executor before the TUI can deliver the answer.
         std::thread::spawn(move || {
-            let _ = tx.send(ui_dialog.handle(args));
+            let _ = tx.send(ui_dialog.handle_with_owner(args, ui_session_id, ui_owner));
         });
     } else {
         bridge.runtime.spawn(async move {
+            let operation = async move {
             let mut r = if action == RuntimeActionId::Reload {
                 if let Some(cb) = reload_cb {
                     cb().await;
@@ -1208,6 +1418,13 @@ fn run_action(
             // If the plugin thread already moved on (dropped rx), discard — a
             // send error is NOT a host fault.
             let _ = tx.send(r);
+            };
+            let scoped = rpi_agent::tool_execution_scope::run_captured(execution_scope, operation);
+            if let Some(signal) = invocation_signal {
+                rpi_agent::tool_execution_scope::with_invocation_signal(signal, scoped).await;
+            } else {
+                scoped.await;
+            }
         });
     }
 
@@ -1435,6 +1652,12 @@ mod tests {
 
     #[async_trait::async_trait]
     impl RuntimeActionHost for MockHost {
+        async fn get_execution_context(
+            &self,
+            _: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            Ok(serde_json::json!({"sessionId":"root", "rootSessionId":"root"}))
+        }
         async fn send_message(&self, _: serde_json::Value) -> Result<serde_json::Value, String> {
             unreachable!("not under test")
         }
@@ -1818,6 +2041,100 @@ mod tests {
     }
 
     #[test]
+    fn ui_session_identity_is_host_only_and_scoped() {
+        let mailbox = UiDialogMailbox::new();
+        mailbox.attach();
+        let mut args = open_args("unscoped", "call");
+        args["sessionId"] = serde_json::json!("spoof");
+        args["ui"]["sessionId"] = serde_json::json!("nested-spoof");
+        mailbox.handle(args.clone()).unwrap();
+        assert_eq!(mailbox.take_pending().unwrap().session_id, None);
+        args["requestId"] = serde_json::json!("child");
+        with_ui_session(Some("child-session".into()), || {
+            mailbox.handle(args.clone()).unwrap();
+            assert_eq!(
+                mailbox.take_pending().unwrap().session_id.as_deref(),
+                Some("child-session")
+            );
+        });
+        args["requestId"] = serde_json::json!("root");
+        mailbox.handle(args).unwrap();
+        assert_eq!(mailbox.take_pending().unwrap().session_id, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ui_trampoline_captures_invocation_session_before_thread_hop() {
+        let mailbox = UiDialogMailbox::new();
+        mailbox.attach();
+        let bridge = ActionBridge::with_ui_dialog(
+            Handle::current(),
+            Arc::new(MockHost {
+                prompt: String::new(),
+                saw: Mutex::new(Vec::new()),
+            }),
+            mailbox.clone(),
+        );
+        let scope = Arc::new(
+            rpi_agent::tool_execution_scope::ToolExecutionScope::with_context(
+                serde_json::json!({"sessionId":"child", "rootSessionId":"root"}),
+            ),
+        );
+        let invocation = scope
+            .run(async { bridge.for_invocation(true, tokio_util::sync::CancellationToken::new()) })
+            .await;
+        let mut args = open_args("child-request", "call");
+        args["sessionId"] = serde_json::json!("spoof");
+        args["ui"]["sessionId"] = serde_json::json!("spoof");
+        let mut out = StbString::empty();
+        assert_eq!(
+            trampoline_runtime_action(
+                RuntimeActionId::UiDialog as u32,
+                StbStringRef::from_str(&args.to_string()),
+                &mut out,
+                invocation.user_data(),
+            ),
+            0
+        );
+        unsafe { crate::host_free_string(out) };
+        assert_eq!(
+            mailbox.take_pending().unwrap().session_id.as_deref(),
+            Some("child")
+        );
+        // Releasing the live child capability restores registration compatibility.
+        drop(invocation);
+        let args = open_args("root-request", "root-call").to_string();
+        assert_eq!(
+            trampoline_runtime_action(
+                RuntimeActionId::UiDialog as u32,
+                StbStringRef::from_str(&args),
+                &mut out,
+                bridge.user_data(),
+            ),
+            0
+        );
+        unsafe { crate::host_free_string(out) };
+        assert_eq!(mailbox.take_pending().unwrap().session_id, None);
+        for (handle, expected_session) in [(bridge.user_data(), "root")] {
+            assert_eq!(
+                trampoline_runtime_action(
+                    RuntimeActionId::GetExecutionContext as u32,
+                    StbStringRef::from_str(r#"{"sessionId":"spoof"}"#),
+                    &mut out,
+                    handle,
+                ),
+                0
+            );
+            let text = unsafe {
+                rpi_plugin_sdk::callbacks::OwnedString::from_raw(out, Some(crate::host_free_string))
+            }
+            .to_string_lossy();
+            let context: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(context["sessionId"], expected_session);
+            assert_eq!(context["rootSessionId"], "root");
+        }
+    }
+
+    #[test]
     fn ui_dialog_open_poll_answer_round_trip() {
         let mailbox = UiDialogMailbox::new();
         mailbox.attach();
@@ -1827,7 +2144,10 @@ mod tests {
         assert_eq!(opened["toolCallId"], "c1");
 
         let request = mailbox.take_pending().expect("request visible to TUI");
-        assert_eq!(request.request_id, "r1");
+        // The plugin keeps its local ID; the UI/transport receives an opaque
+        // capability so another session cannot collide with or guess it.
+        assert_ne!(request.request_id, "r1");
+        assert_eq!(request.raw["requestId"], "r1");
         assert_eq!(request.tool_call_id.as_deref(), Some("c1"));
         // A pending poll is non-destructive and remains available.
         assert_eq!(mailbox.poll("r1").unwrap()["status"], "pending");
@@ -1862,7 +2182,9 @@ mod tests {
         mailbox.handle(open_args("r2", "c2")).unwrap();
         mailbox.cancel_tool_call("c1");
         assert_eq!(mailbox.poll("r1").unwrap()["status"], "cancelled");
-        assert_eq!(mailbox.take_pending().unwrap().request_id, "r2");
+        let other = mailbox.take_pending().unwrap();
+        assert_eq!(other.raw["requestId"], "r2");
+        assert_ne!(other.request_id, "r2");
         assert_eq!(mailbox.poll("r2").unwrap()["status"], "pending");
         assert_eq!(
             mailbox.handle(open_args("late", "c1")).unwrap()["status"],
@@ -2087,3 +2409,6 @@ impl Drop for ActionBridge {
 
 #[cfg(test)]
 mod runtime_tests;
+
+#[cfg(test)]
+mod authorization_tests;

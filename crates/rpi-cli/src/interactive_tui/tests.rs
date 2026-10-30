@@ -1834,6 +1834,7 @@ fn test_agent_event_mapping_creates_assistant_and_tool() {
         api: rpi_ai::Api::AnthropicMessages,
         provider: "anthropic".into(),
         model: "claude-sonnet-5".into(),
+        message_id: None,
         response_model: None,
         response_id: None,
         usage: Usage::zero(),
@@ -2700,6 +2701,7 @@ fn assistant_error_text_keeps_terminal_provider_diagnostic_visible() {
         api: rpi_ai::Api::AnthropicMessages,
         provider: "anthropic".into(),
         model: "claude-sonnet-5".into(),
+        message_id: None,
         response_model: None,
         response_id: None,
         usage: Usage::zero(),
@@ -3813,6 +3815,7 @@ fn ask_user_prompt_parser_supports_flat_and_questions_shapes() {
     let flat = rpi_extensions::UiDialogRequest {
         request_id: "r1".into(),
         tool_call_id: Some("c1".into()),
+        session_id: None,
         ui: serde_json::json!({
             "kind": "selector",
             "id": "proxy_port",

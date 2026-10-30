@@ -117,7 +117,6 @@ pub enum RemoteEvent {
         result: Value,
     },
 }
-
 impl RemoteEvent {
     /// The wire `type` tag (kept in sync with the serde `rename_all`).
     pub fn type_tag(&self) -> &'static str {
@@ -172,15 +171,16 @@ impl RemoteEvent {
                 tool_result_count: tool_results.len(),
                 tool_results: serde_json::to_value(tool_results).unwrap_or(Value::Null),
             },
-            AgentEvent::MessageStart { message } => RemoteEvent::MessageStart {
+            AgentEvent::MessageStart { message, .. } => RemoteEvent::MessageStart {
                 message: serde_json::to_value(message).unwrap_or(Value::Null),
             },
-            AgentEvent::MessageEnd { message } => RemoteEvent::MessageEnd {
+            AgentEvent::MessageEnd { message, .. } => RemoteEvent::MessageEnd {
                 message: serde_json::to_value(message).unwrap_or(Value::Null),
             },
             AgentEvent::MessageUpdate {
                 message,
                 assistant_message_event,
+                ..
             } => {
                 let (content_index, delta) = match assistant_message_event {
                     AssistantMessageEvent::TextDelta {

@@ -152,7 +152,7 @@ impl StbString {
         // slice from ptr+len and drops it. Store the element pointer as
         // `*mut c_char` (u8 ↔ c_char on every platform rpi targets). Ownership
         // moves into the `StbString` (we do NOT drop here).
-        let ptr = Box::into_raw(buf) as *mut [u8] as *mut u8 as *mut c_char;
+        let ptr = Box::into_raw(buf).cast::<u8>().cast::<c_char>();
         let _ = len;
         Self { ptr, len }
     }
@@ -230,6 +230,7 @@ impl StbStringRef {
 
     /// Borrow a `&str` for the duration of a call. The caller must outlive the
     /// call (normal borrow rules).
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         Self {
             ptr: s.as_ptr() as *const c_char,
@@ -1665,7 +1666,7 @@ pub unsafe fn register_entrypoint(
     // truncated mandatory prefix or a partial function pointer.
     if host_size < required_size
         || (host_size < known_size
-            && (host_size - required_size) % core::mem::size_of::<*const ()>() != 0)
+            && !(host_size - required_size).is_multiple_of(core::mem::size_of::<*const ()>()))
     {
         return 3;
     }
@@ -1729,7 +1730,7 @@ mod tests {
     // A test allocator + free fn so we can verify the own/free contract
     // without a real plugin's free_string.
     std::thread_local! {
-        static FREED: std::cell::Cell<usize> = std::cell::Cell::new(0);
+        static FREED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
 
     unsafe extern "C" fn test_free(s: StbString) {

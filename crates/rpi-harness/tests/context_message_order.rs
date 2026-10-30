@@ -86,6 +86,13 @@ impl AgentEmitter for AppendDuringEvent {
         Box::pin(async move {
             observed.lock().unwrap().push(event.clone());
             let Some(harness) = harness else { return };
+            if let AgentEvent::MessageStart { message: AgentMessage::User(user), message_id }
+                | AgentEvent::MessageEnd { message: AgentMessage::User(user), message_id } = &event {
+                if let Some(id) = message_id {
+                    assert!(matches!(harness.get_entry(id).await.unwrap(), Some(Entry::Message(entry))
+                        if entry.message == AgentMessage::User(user.clone())), "user identity must already be committed");
+                }
+            }
             if inject {
                 // This await is inside the tool's event callback. Waiting for
                 // the run to end here would deadlock the tool itself.
@@ -114,7 +121,7 @@ impl AgentEmitter for AppendDuringEvent {
                     proceed.notified().await;
                 }
             }
-            if let AgentEvent::MessageEnd { message } = event {
+            if let AgentEvent::MessageEnd { message, .. } = event {
                 if message != context_message() {
                     return;
                 }
@@ -139,7 +146,7 @@ fn on_tool(event: &AgentEvent) -> bool {
     matches!(event, AgentEvent::ToolExecutionEnd { .. })
 }
 fn on_final(event: &AgentEvent) -> bool {
-    matches!(event, AgentEvent::MessageEnd { message: AgentMessage::Assistant(a) }
+    matches!(event, AgentEvent::MessageEnd { message: AgentMessage::Assistant(a), .. }
         if !a.content.iter().any(|c| matches!(c, Content::ToolCall(_))))
 }
 fn on_start(event: &AgentEvent) -> bool {
@@ -316,7 +323,8 @@ async fn tool_callback_append_waits_for_the_whole_batch_and_reaches_the_next_req
             matches!(
                 e,
                 AgentEvent::MessageEnd {
-                    message: AgentMessage::ToolResult(_)
+                    message: AgentMessage::ToolResult(_),
+                    ..
                 }
             )
         })
@@ -327,7 +335,8 @@ async fn tool_callback_append_waits_for_the_whole_batch_and_reaches_the_next_req
             matches!(
                 e,
                 AgentEvent::MessageEnd {
-                    message: AgentMessage::Custom(_)
+                    message: AgentMessage::Custom(_),
+                    ..
                 }
             )
         })
@@ -1081,7 +1090,7 @@ async fn compaction_then_retry_preserves_the_recovered_final_message() {
 async fn retry_success_with_silent_context_must_not_schedule_another_resume() {
     for failed_attempts in [1, 2] {
         let mut emitter = AppendDuringEvent::new(
-            |event| matches!(event, AgentEvent::MessageEnd { message: AgentMessage::Assistant(a) } if a.stop_reason == StopReason::Stop),
+            |event| matches!(event, AgentEvent::MessageEnd { message: AgentMessage::Assistant(a), .. } if a.stop_reason == StopReason::Stop),
         );
         emitter.send = Some(SendMessageOptions {
             trigger_turn: Some(false),
@@ -1278,6 +1287,11 @@ async fn all_accepted_message_roles_keep_delivery_ids_across_restart() {
             let (h, _) = harness(fresh_session(), script, Some(emitter.clone()), false).await;
             h.prompt_text("write", vec![]).await.unwrap();
             let id = emitter.reserved.lock().unwrap()[0].clone();
+            if matches!(message, AgentMessage::User(_)) {
+                assert!(emitter.observed.lock().unwrap().iter().any(|event|
+                    matches!(event, AgentEvent::MessageEnd { message: observed, message_id: Some(observed_id) }
+                        if observed == message && observed_id == &id)), "injected user end must carry its committed reservation");
+            }
             assert!(
                 matches!(h.get_entry(&id).await.unwrap(), Some(Entry::Message(m)) if m.message == *message)
             );
@@ -2198,5 +2212,33 @@ async fn restored_legacy_run_bound_queues_can_be_cancelled_after_their_run_finis
             assert!(restored.get_entry("legacy-queued").await.unwrap().is_none());
             validate_history(&restored).await;
         }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repeated_user_insertions_are_committed_before_events_and_survive_restore() {
+    let session = fresh_session();
+    let mut ids = Vec::new();
+    for restore in [false, true] {
+        let emitter = Arc::new(AppendDuringEvent::new(|_| false));
+        let (h, _) = harness(session.clone(), FauxScript::new().with_text("done").with_text("done"), Some(emitter.clone()), restore).await;
+        for _ in 0..2 {
+            emitter.observed.lock().unwrap().clear();
+            h.prompt_text("identical user input", vec![]).await.unwrap();
+            let events = emitter.observed.lock().unwrap();
+            let user_events: Vec<_> = events.iter().filter_map(|event| match event {
+                AgentEvent::MessageStart { message: AgentMessage::User(_), message_id }
+                | AgentEvent::MessageEnd { message: AgentMessage::User(_), message_id } => Some(message_id.clone().expect("committed user identity")),
+                _ => None,
+            }).collect();
+            assert_eq!(user_events.len(), 2);
+            assert_eq!(user_events[0], user_events[1]);
+            assert!(!ids.contains(&user_events[0]));
+            ids.push(user_events[0].clone());
+        }
+        validate_history(&h).await;
+    }
+    for id in ids {
+        assert!(session.get_entry(&id).await.unwrap().is_some());
     }
 }

@@ -102,6 +102,8 @@ impl HarnessActionHost {
         tool_context: rpi_extensions::ToolCallContext,
     ) -> (Self, Arc<OnceLock<WeakAgentHarness>>) {
         let harness = Arc::new(OnceLock::new());
+        let children = crate::child_agents::ChildAgents::default();
+        children.set_session_factory(crate::session::native_child_session_factory(cwd.clone()));
         (
             Self {
                 harness: Arc::clone(&harness),
@@ -110,12 +112,17 @@ impl HarnessActionHost {
                 cwd,
                 cli_flags,
                 tool_context,
-                children: crate::child_agents::ChildAgents::default(),
+                children,
                 side_questions: crate::side_questions::SideQuestions::default(),
                 runtime,
             },
             harness,
         )
+    }
+
+    /// Optional native child transport injection; no root advertisement is implied.
+    pub(crate) fn set_child_event_sink(&self, sink: Option<crate::child_agents::ChildEventSink>) {
+        self.children.set_event_sink(sink);
     }
 
     pub fn set_catalog(&self, catalog: Vec<rpi_ai::Model>) {
@@ -398,6 +405,10 @@ impl RuntimeActionHost for HarnessActionHost {
     ) -> Result<serde_json::Value, String> {
         let harness = self.harness()?;
         let mut context = harness.execution_context().map_err(|e| e.to_string())?;
+        let root_session_id = harness.session().storage().metadata().id.clone();
+        context["cwd"] = serde_json::json!(self.cwd);
+        context["sessionId"] = serde_json::json!(root_session_id);
+        context["rootSessionId"] = serde_json::json!(root_session_id);
         if let Some(serde_json::Value::Object(child)) =
             rpi_agent::tool_execution_scope::execution_context()
         {
@@ -406,8 +417,6 @@ impl RuntimeActionHost for HarnessActionHost {
                 .expect("execution context is an object")
                 .extend(child);
         }
-        context["cwd"] = serde_json::json!(self.cwd);
-        context["sessionId"] = serde_json::json!(harness.session().storage().metadata().id);
         Ok(context)
     }
 
@@ -673,6 +682,9 @@ impl RuntimeActionHost for HarnessActionHost {
 
 #[cfg(test)]
 mod lifetime_tests;
+
+#[cfg(test)]
+mod runtime_authorization_tests;
 
 #[cfg(test)]
 mod send_message_tests {

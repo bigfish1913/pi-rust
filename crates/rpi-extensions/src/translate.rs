@@ -59,7 +59,7 @@ fn message_to_stb(message: &rpi_agent::message::AgentMessage) -> StbString {
 pub fn translate(event: &AgentEvent) -> Option<StablePluginEvent> {
     let tag = event_tag_for(event)?;
     match event {
-        AgentEvent::MessageStart { message } | AgentEvent::MessageEnd { message } => {
+        AgentEvent::MessageStart { message, .. } | AgentEvent::MessageEnd { message, .. } => {
             let stb = message_to_stb(message);
             Some(StablePluginEvent::message(tag, stb))
         }
@@ -483,6 +483,9 @@ async fn dispatch_tool_call_event_with_timeout(
     timeout: std::time::Duration,
 ) -> Option<String> {
     let snapshot = session.snapshot()?;
+    let session_id = rpi_agent::tool_execution_scope::execution_context().and_then(|context| {
+        context.get("sessionId").and_then(serde_json::Value::as_str).map(str::to_owned)
+    });
     if !crate::registry::assert_active(snapshot.active_flag()) {
         return Some(format!(
             "tool `{tool_name}` approval session is stale; retry after reload"
@@ -493,7 +496,7 @@ async fn dispatch_tool_call_event_with_timeout(
             continue;
         }
         if signal.is_cancelled() {
-            ui_dialog.cancel_tool_call(tool_call_id);
+            ui_dialog.cancel_tool_call_with_session(tool_call_id, session_id.clone());
             return Some(format!("tool `{tool_name}` approval cancelled"));
         }
         if !crate::registry::assert_active(snapshot.active_flag()) {
@@ -510,16 +513,26 @@ async fn dispatch_tool_call_event_with_timeout(
         // Capture the whole RegisteredHandler rather than its raw user_data.
         // The callback's own keepalive also survives timeout/cancellation.
         let background = rpi_agent::tool_execution_scope::track_background_tool();
+        let callback_session = session_id.clone();
+        let invocation = session.action_bridge().map(|bridge| {
+            bridge.for_invocation(
+                rpi_agent::tool_execution_scope::is_child_execution(),
+                signal.clone(),
+            )
+        });
         let mut task = tokio::task::spawn_blocking(move || {
             let _keepalive = keepalive;
             let _background = background;
-            call_tool_call_handler(h, id, name, payload)
+            let _invocation = invocation.as_ref().map(|bridge| bridge.enter_invocation());
+            crate::actions::with_ui_session(callback_session, || {
+                call_tool_call_handler(h, id, name, payload)
+            })
         });
         let outcome = tokio::select! {
             biased;
             _ = signal.cancelled() => {
                 task.abort(); // Prevent a queued callback from starting.
-                ui_dialog.cancel_tool_call(tool_call_id);
+                ui_dialog.cancel_tool_call_with_session(tool_call_id, session_id.clone());
                 crate::event_log::log_handler_invocation(
                     EventTag::ToolCall, &plugin_name, "Cancelled",
                     started.elapsed().as_millis() as u64, None,
@@ -573,12 +586,12 @@ async fn dispatch_tool_call_event_with_timeout(
             error.clone(),
         );
         if let Some(reason) = error {
-            ui_dialog.cancel_tool_call(tool_call_id);
+            ui_dialog.cancel_tool_call_with_session(tool_call_id, session_id.clone());
             return Some(reason);
         }
         // A reload can invalidate this session while the callback is running.
         if !crate::registry::assert_active(snapshot.active_flag()) {
-            ui_dialog.cancel_tool_call(tool_call_id);
+            ui_dialog.cancel_tool_call_with_session(tool_call_id, session_id.clone());
             return Some(format!(
                 "tool `{tool_name}` approval session is stale; retry after reload"
             ));
@@ -999,6 +1012,7 @@ mod tests {
             api: rpi_ai::types::Api::AnthropicMessages,
             provider: "anthropic".to_string(),
             model: "m".into(),
+            message_id: None,
             response_model: None,
             response_id: None,
             usage: Usage::zero(),
@@ -1019,6 +1033,7 @@ mod tests {
             },
             AgentEvent::MessageStart {
                 message: am.clone(),
+                message_id: None,
             },
             AgentEvent::MessageUpdate {
                 // `MessageUpdate` carries the shared partial snapshot, so build
@@ -1027,8 +1042,12 @@ mod tests {
                 assistant_message_event: rpi_ai::types::AssistantMessageEvent::Start {
                     partial: std::sync::Arc::new((*am.as_assistant().unwrap()).clone()),
                 },
+                message_id: None,
             },
-            AgentEvent::MessageEnd { message: am },
+            AgentEvent::MessageEnd {
+                message: am,
+                message_id: None,
+            },
             AgentEvent::ToolExecutionStart {
                 tool_call_id: "c1".into(),
                 tool_name: "echo".into(),
@@ -1078,6 +1097,7 @@ mod tests {
             api: rpi_ai::types::Api::AnthropicMessages,
             provider: "anthropic".to_string(),
             model: "m".into(),
+            message_id: None,
             response_model: None,
             response_id: None,
             usage: Usage::zero(),
@@ -1096,6 +1116,7 @@ mod tests {
                     delta: delta.to_string(),
                     partial: Arc::clone(&partial),
                 },
+                message_id: None,
             };
             let stable = translate(&event).expect("message_update maps");
             let payload = unsafe { stable.payload.message.message.to_string_lossy() };
@@ -1121,6 +1142,7 @@ mod tests {
             api: rpi_ai::types::Api::AnthropicMessages,
             provider: "anthropic".to_string(),
             model: "m".into(),
+            message_id: None,
             response_model: None,
             response_id: None,
             usage: Usage::zero(),
@@ -1131,7 +1153,10 @@ mod tests {
             end_turn: None,
             timestamp: 0,
         }));
-        let ev = AgentEvent::MessageEnd { message: am };
+        let ev = AgentEvent::MessageEnd {
+            message: am,
+            message_id: None,
+        };
         let stable = translate(&ev).expect("maps");
         assert_eq!(stable.tag, EventTag::MessageEnd);
         // free the payload string (host owns cleanup).
@@ -1168,6 +1193,7 @@ mod tests {
             api: rpi_ai::types::Api::AnthropicMessages,
             provider: "anthropic".to_string(),
             model: "m".into(),
+            message_id: None,
             response_model: None,
             response_id: None,
             usage: Usage::zero(),
@@ -1179,7 +1205,10 @@ mod tests {
             timestamp: 0,
         }));
         // Use try_emit (sync) — no runtime needed.
-        emitter.try_emit(AgentEvent::MessageEnd { message: am });
+        emitter.try_emit(AgentEvent::MessageEnd {
+            message: am,
+            message_id: None,
+        });
         assert_eq!(HANDLER_HITS.load(Ordering::SeqCst), 1);
 
         // Stale registry → no dispatch.
@@ -1190,6 +1219,7 @@ mod tests {
             api: rpi_ai::types::Api::AnthropicMessages,
             provider: "anthropic".to_string(),
             model: "m".into(),
+            message_id: None,
             response_model: None,
             response_id: None,
             usage: Usage::zero(),
@@ -1200,7 +1230,10 @@ mod tests {
             end_turn: None,
             timestamp: 0,
         }));
-        emitter.try_emit(AgentEvent::MessageEnd { message: am2 });
+        emitter.try_emit(AgentEvent::MessageEnd {
+            message: am2,
+            message_id: None,
+        });
         assert_eq!(
             HANDLER_HITS.load(Ordering::SeqCst),
             1,
@@ -1241,6 +1274,7 @@ mod tests {
             api: rpi_ai::types::Api::AnthropicMessages,
             provider: "anthropic".to_string(),
             model: "m".into(),
+            message_id: None,
             response_model: None,
             response_id: None,
             usage: Usage::zero(),
@@ -1253,7 +1287,11 @@ mod tests {
         }));
         // Broadcast path: both collectors receive the event, and the extension
         // emitter dispatches to the one registered handler.
-        tee.emit(AgentEvent::MessageEnd { message: am }).await;
+        tee.emit(AgentEvent::MessageEnd {
+            message: am,
+            message_id: None,
+        })
+        .await;
         assert_eq!(
             events_a.lock().unwrap().len(),
             1,
@@ -1459,7 +1497,7 @@ mod tests {
             if state.release.load(Ordering::SeqCst) {
                 break;
             }
-            if state.ui.poll("approval").unwrap()["status"] == "cancelled" {
+            if state.ui.handle(serde_json::json!({"op":"poll","requestId":"approval"})).unwrap()["status"] == "cancelled" {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(2));
@@ -1515,24 +1553,35 @@ mod tests {
         let task_signal = signal.clone();
         let task_ui = ui.clone();
         let task = tokio::spawn(async move {
-            dispatch_tool_call_event_with_timeout(
-                &session,
-                "call",
-                "bash",
-                &serde_json::json!({}),
-                &task_signal,
-                &task_ui,
-                if cancel {
-                    TOOL_CALL_TIMEOUT
-                } else {
-                    std::time::Duration::from_millis(200)
-                },
-            )
-            .await
+            let scope = Arc::new(
+                rpi_agent::tool_execution_scope::ToolExecutionScope::with_context(
+                    serde_json::json!({"sessionId":"approval-child"}),
+                ),
+            );
+            scope
+                .run(dispatch_tool_call_event_with_timeout(
+                    &session,
+                    "call",
+                    "bash",
+                    &serde_json::json!({}),
+                    &task_signal,
+                    &task_ui,
+                    if cancel {
+                        TOOL_CALL_TIMEOUT
+                    } else {
+                        std::time::Duration::from_millis(200)
+                    },
+                ))
+                .await
         });
         tokio::time::timeout(std::time::Duration::from_secs(2), state.entered.notified())
             .await
             .unwrap();
+        assert_eq!(ui.take_pending().unwrap().session_id, None);
+        assert_eq!(
+            ui.take_pending().unwrap().session_id.as_deref(),
+            Some("approval-child")
+        );
         if cancel {
             signal.cancel();
         }

@@ -960,7 +960,8 @@ async fn directly_sent_prompt_emits_no_user_message_start() {
             matches!(
                 event,
                 AgentEvent::MessageStart {
-                    message: rpi_agent::AgentMessage::User(_)
+                    message: rpi_agent::AgentMessage::User(_),
+                    ..
                 }
             )
         })
@@ -975,7 +976,8 @@ async fn directly_sent_prompt_emits_no_user_message_start() {
         events.iter().any(|event| matches!(
             event,
             AgentEvent::MessageStart {
-                message: rpi_agent::AgentMessage::Assistant(_)
+                message: rpi_agent::AgentMessage::Assistant(_),
+                ..
             }
         )),
         "assistant MessageStart must still fire"

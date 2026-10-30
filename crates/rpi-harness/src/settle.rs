@@ -646,7 +646,7 @@ impl SettlingEmitter {
         // Recognize queue deliveries before dispatching on role: a stored
         // assistant/tool-result is an injection, not a new provider generation
         // or a tool invocation produced by this run.
-        if let AgentEvent::MessageEnd { message } = event {
+        if let AgentEvent::MessageEnd { message, .. } = event {
             let index = self.state.seen.load(Ordering::Acquire).saturating_sub(1);
             if self.state.injected_indices.lock().unwrap().contains(&index) {
                 if matches!(message, AgentMessage::Assistant(_)) {
@@ -665,7 +665,7 @@ impl SettlingEmitter {
             }
         }
         match event {
-            AgentEvent::MessageStart { message } => {
+            AgentEvent::MessageStart { message, .. } => {
                 let index = self.state.seen.fetch_add(1, Ordering::AcqRel);
                 let injection = {
                     let mut pending = self.state.injected.lock().unwrap();
@@ -716,6 +716,7 @@ impl SettlingEmitter {
             }
             AgentEvent::MessageEnd {
                 message: AgentMessage::Assistant(assistant),
+                ..
             } => {
                 // `seen` was advanced by this message's `MessageStart`; the index
                 // of the message that just settled is one less.
@@ -756,6 +757,7 @@ impl SettlingEmitter {
             }
             AgentEvent::MessageEnd {
                 message: AgentMessage::ToolResult(result),
+                ..
             } => {
                 let index = self.state.seen.load(Ordering::Acquire).saturating_sub(1);
                 let emitter = SettlingEmitter {
@@ -793,12 +795,14 @@ impl SettlingEmitter {
 }
 
 impl AgentEmitter for SettlingEmitter {
-    fn emit(&self, event: AgentEvent) -> BoxFuture<'static, ()> {
+    fn emit(&self, mut event: AgentEvent) -> BoxFuture<'static, ()> {
         let inner = Arc::clone(&self.inner);
         let state = Arc::clone(&self.state);
         let emit_started = state.diagnostics.start();
         let handle_started = state.diagnostics.start();
         let settles = self.handle(&event);
+        let user_index = matches!(&event, AgentEvent::MessageEnd { message: AgentMessage::User(_), .. })
+            .then(|| state.seen.load(Ordering::Acquire).saturating_sub(1));
         state
             .diagnostics
             .record(SettlePhase::EmitHandle, handle_started);
@@ -808,6 +812,11 @@ impl AgentEmitter for SettlingEmitter {
             let settle_started = state.diagnostics.start();
             if let Some(settles) = settles {
                 settles.await;
+            }
+            // entry_at is populated by record_commit only after the append
+            // succeeds. A queue reservation alone must never acknowledge insertion.
+            if let (Some(index), AgentEvent::MessageEnd { message_id, .. }) = (user_index, &mut event) {
+                *message_id = state.entry_at(index);
             }
             state
                 .diagnostics

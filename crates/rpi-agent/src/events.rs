@@ -48,7 +48,12 @@ pub enum AgentEvent {
     },
     /// Emitted when any message (user prompt, assistant response, tool result,
     /// custom) is appended to the transcript.
-    MessageStart { message: AgentMessage },
+    MessageStart {
+        message: AgentMessage,
+        /// Native-created canonical identity for this message, present for
+        /// assistant messages and absent for user/tool/custom messages.
+        message_id: Option<String>,
+    },
     /// Emitted only for assistant messages, on each streaming delta. Carries
     /// the underlying `AssistantMessageEvent` plus a **shared** snapshot of the
     /// partial assistant message.
@@ -61,9 +66,15 @@ pub enum AgentEvent {
     MessageUpdate {
         message: Arc<AssistantMessage>,
         assistant_message_event: AssistantMessageEvent,
+        /// Canonical identity is carried separately so the provider snapshot
+        /// Arc remains zero-copy and can be shared across deltas.
+        message_id: Option<String>,
     },
     /// Emitted when a message finishes (complement of `MessageStart`).
-    MessageEnd { message: AgentMessage },
+    MessageEnd {
+        message: AgentMessage,
+        message_id: Option<String>,
+    },
     /// Emitted before a tool call starts executing.
     ToolExecutionStart {
         tool_call_id: String,

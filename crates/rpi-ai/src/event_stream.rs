@@ -131,6 +131,7 @@ impl AssistantMessageEventStreamProducer {
             if previous.api == message.api
                 && previous.provider == message.provider
                 && previous.model == message.model
+                && previous.message_id == message.message_id
                 && previous.response_model == message.response_model
                 && previous.response_id == message.response_id
                 && previous.usage == message.usage
@@ -154,6 +155,7 @@ impl AssistantMessageEventStreamProducer {
             api: message.api.clone(),
             provider: message.provider.clone(),
             model: message.model.clone(),
+            message_id: message.message_id.clone(),
             response_model: message.response_model.clone(),
             response_id: message.response_id.clone(),
             usage: message.usage.clone(),

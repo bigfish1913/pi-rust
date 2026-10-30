@@ -194,6 +194,9 @@ struct RoutedProvider {
 
 #[async_trait::async_trait]
 impl Provider for RoutedProvider {
+    fn supports_response_budget(&self) -> bool {
+        self.routes.iter().all(|route| route.supports_response_budget())
+    }
     fn id(&self) -> &str {
         &self.id
     }
@@ -240,6 +243,9 @@ async fn unbound_model_error(model: &Model, provider_id: &str) -> AssistantMessa
 
 #[async_trait::async_trait]
 impl Provider for ConfiguredProvider {
+    fn supports_response_budget(&self) -> bool {
+        self.inner.supports_response_budget()
+    }
     fn id(&self) -> &str {
         &self.id
     }
@@ -270,7 +276,26 @@ mod tests {
 
     type Calls = Arc<Mutex<Vec<(Model, SimpleStreamOptions)>>>;
     struct RecordingFactory(Calls);
-    struct RecordingProvider(Calls);
+    struct RecordingProvider(Calls, bool);
+
+    #[test]
+    fn response_budget_capability_survives_configured_and_routed_wrappers() {
+        let configured = |supported| -> Arc<dyn Provider> {
+            Arc::new(ConfiguredProvider {
+                id: "recording".into(),
+                inner: Arc::new(RecordingProvider(Calls::default(), supported)),
+                binding: Arc::new(ExecutionBinding::new("recording", vec![], RequestAuth::ApiKey("test-only".into()))),
+            })
+        };
+        assert!(configured(true).supports_response_budget());
+        assert!(!configured(false).supports_response_budget());
+        for (flags, expected) in [(vec![true, true], true), (vec![true, false], false), (vec![false, true], false), (vec![false, false], false)] {
+            let routes = flags.into_iter().map(&configured).collect();
+            let providers = combine_provider_runtimes(routes);
+            assert_eq!(providers.len(), 1);
+            assert_eq!(providers[0].supports_response_budget(), expected);
+        }
+    }
     impl ProviderFactory for RecordingFactory {
         fn create(
             &self,
@@ -283,11 +308,14 @@ mod tests {
                 models.iter().all(|model| model.headers.is_none()),
                 "factories receive public descriptors"
             );
-            Ok(Arc::new(RecordingProvider(self.0.clone())))
+            Ok(Arc::new(RecordingProvider(self.0.clone(), false)))
         }
     }
     #[async_trait::async_trait]
     impl Provider for RecordingProvider {
+        fn supports_response_budget(&self) -> bool {
+            self.1
+        }
         fn id(&self) -> &str {
             "recording"
         }

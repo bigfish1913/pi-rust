@@ -74,6 +74,7 @@ fn crashed_stream() -> Vec<LaneRecord> {
         api: Api::Faux,
         provider: "faux".into(),
         model: "faux-model".into(),
+        message_id: None,
         response_model: None,
         response_id: None,
         usage: Usage::zero(),

@@ -13,15 +13,31 @@ pub(crate) fn project(event: &AgentEvent) -> serde_json::Value {
 
 /// Encode frequent delta updates without building two full snapshot trees plus
 /// a third projection tree. The JSON fields remain identical to `project`.
+#[cfg(test)]
 pub(crate) fn encode(event: &AgentEvent) -> serde_json::Result<Vec<u8>> {
+    encode_with_message_id(event, None)
+}
+
+/// Keep the single-snapshot delta encoder used by the native streaming path.
+/// The optional ID is assigned by the stateful RPC writer at MessageStart and
+/// is copied onto every cumulative snapshot for that assistant message.
+pub(crate) fn encode_with_message_id(
+    event: &AgentEvent,
+    message_id: Option<&str>,
+) -> serde_json::Result<Vec<u8>> {
     use rpi_ai::AssistantMessageEvent;
     use std::sync::Arc;
     let AgentEvent::MessageUpdate {
         message,
         assistant_message_event,
+        ..
     } = event
     else {
-        return serde_json::to_vec(&project(event));
+        let mut value = project(event);
+        if let Some(id) = message_id {
+            value["message"]["messageId"] = serde_json::Value::String(id.to_owned());
+        }
+        return serde_json::to_vec(&value);
     };
     let (index, delta, partial) = match assistant_message_event {
         AssistantMessageEvent::TextDelta {
@@ -39,15 +55,27 @@ pub(crate) fn encode(event: &AgentEvent) -> serde_json::Result<Vec<u8>> {
             delta,
             partial,
         } => (content_index, delta, partial),
-        _ => return serde_json::to_vec(&project(event)),
+        _ => {
+            let mut value = project(event);
+            if let Some(id) = message_id {
+                value["message"]["messageId"] = serde_json::Value::String(id.to_owned());
+            }
+            return serde_json::to_vec(&value);
+        }
     };
-    // Value normalizes Content's internally tagged markers just like the legacy
-    // projection. Serialize this normalized snapshot once and reuse its bytes.
-    let snapshot = serde_json::to_vec(&serde_json::to_value(&**message)?)?;
+    let mut snapshot_value = serde_json::to_value(&**message)?;
+    if let Some(id) = message_id {
+        snapshot_value["messageId"] = serde_json::Value::String(id.to_owned());
+    }
+    let snapshot = serde_json::to_vec(&snapshot_value)?;
+    let mut partial_value = serde_json::to_value(&**partial)?;
+    if let Some(id) = message_id {
+        partial_value["messageId"] = serde_json::Value::String(id.to_owned());
+    }
     let other = if Arc::ptr_eq(message, partial) {
         None
     } else {
-        Some(serde_json::to_vec(&serde_json::to_value(&**partial)?)?)
+        Some(serde_json::to_vec(&partial_value)?)
     };
     let partial = other.as_deref().unwrap_or(&snapshot);
     let delta = serde_json::to_vec(delta)?;
@@ -58,17 +86,17 @@ pub(crate) fn encode(event: &AgentEvent) -> serde_json::Result<Vec<u8>> {
     out.extend_from_slice(&snapshot[1..]);
     out.extend_from_slice(br#", "assistantMessageEvent":{"type":"#);
     out.extend_from_slice(&tag);
-    out.extend_from_slice(br#", "contentIndex":"#);
+    out.extend_from_slice(br#", "contentIndex": "#);
     out.extend_from_slice(&index);
-    out.extend_from_slice(br#", "delta":"#);
+    out.extend_from_slice(br#", "delta": "#);
     out.extend_from_slice(&delta);
     out.extend_from_slice(br#", "partial":"#);
     out.extend_from_slice(partial);
     out.extend_from_slice(br#"},"eventType":"#);
     out.extend_from_slice(&tag);
-    out.extend_from_slice(br#", "contentIndex":"#);
+    out.extend_from_slice(br#", "contentIndex": "#);
     out.extend_from_slice(&index);
-    out.extend_from_slice(br#", "delta":"#);
+    out.extend_from_slice(br#", "delta": "#);
     out.extend_from_slice(&delta);
     out.push(b'}');
     Ok(out)
@@ -114,6 +142,7 @@ mod tests {
                 let event = AgentEvent::MessageUpdate {
                     message: Arc::clone(&message),
                     assistant_message_event: event,
+                    message_id: None,
                 };
                 let bytes = encode(&event).unwrap();
                 assert_eq!(
@@ -132,6 +161,7 @@ mod tests {
             AgentEvent::AgentEnd { messages: vec![] },
             AgentEvent::MessageEnd {
                 message: rpi_ai::UserMessage::new("hello", 0).into(),
+                message_id: None,
             },
         ] {
             assert_eq!(

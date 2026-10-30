@@ -99,6 +99,7 @@ fn single_tool_use_stream_fn(calls: Vec<(&str, &str)>) -> rpi_agent::StreamFn {
         api: rpi_ai::types::Api::Other("openai-responses".into()),
         provider: "mock".to_string(),
         model: "mock".to_string(),
+        message_id: None,
         response_model: None,
         response_id: None,
         usage: rpi_ai::types::Usage::zero(),

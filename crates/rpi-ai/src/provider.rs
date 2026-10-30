@@ -66,6 +66,10 @@ pub struct SimpleStreamOptions {
     /// Optional caller override for the requested output-token ceiling. `None`
     /// lets the provider fit the thinking budget inside `Model::max_tokens`.
     /// Mirrors TS `SimpleStreamOptions.maxTokens`.
+    /// Optional decoded HTTP body ceiling, including JSON/SSE overhead. Checked
+    /// before buffering/parsing; only providers advertising support enforce it.
+    /// None preserves ordinary unbounded response behavior.
+    pub max_response_bytes: Option<usize>,
     pub max_tokens: Option<u64>,
     /// Sampling temperature. Only applied when the model supports it AND
     /// thinking is disabled (Anthropic rejects temperature under thinking).
@@ -90,6 +94,7 @@ impl Default for SimpleStreamOptions {
             session_id: None,
             signal: CancellationToken::new(),
             reasoning: None,
+            max_response_bytes: None,
             max_tokens: None,
             temperature: None,
             thinking_budgets: None,
@@ -223,6 +228,10 @@ mod tests {
 /// never as panics or `Err` from this method.
 #[async_trait::async_trait]
 pub trait Provider: Send + Sync {
+    /// True only when every response-body path enforces max_response_bytes
+    /// before parsing or copying decoded chunks. Custom providers fail closed.
+    fn supports_response_budget(&self) -> bool { false }
+
     /// Stable provider id (e.g. `"anthropic"`, `"faux"`).
     fn id(&self) -> &str;
 

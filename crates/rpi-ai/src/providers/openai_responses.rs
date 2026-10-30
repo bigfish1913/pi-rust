@@ -131,6 +131,7 @@ where
 
 #[async_trait]
 impl Provider for OpenAiResponsesProvider {
+    fn supports_response_budget(&self) -> bool { true }
     fn id(&self) -> &str {
         &self.id
     }
@@ -1243,7 +1244,7 @@ async fn run_stream(
     drop(body);
     let response = retry_provider_request(move || { let request=request.clone(); let signal=signal.clone(); async move {
         let response = tokio::select! { r=request.send()=>r?, _=signal.cancelled()=>return Err(AiError::Abort{message:"Request aborted".into()})};
-        if response.status().is_success() { Ok(response) } else { let status=response.status().as_u16(); let msg=response.text().await.unwrap_or_default(); Err(AiError::Http{status:Some(status),message:msg}) }
+        if response.status().is_success() { Ok(response) } else { let status=response.status().as_u16(); let msg=if opts.max_response_bytes.is_some() { "provider HTTP error".to_string() } else { response.text().await.unwrap_or_default() }; Err(AiError::Http{status:Some(status),message:msg}) }
     }}, opts.max_retries, opts.max_retry_delay, &opts.signal).await;
     let response = match response {
         Ok(r) => r,
@@ -1253,6 +1254,7 @@ async fn run_stream(
         }
     };
     let mut events = SseEventStream::new(response, opts.signal.clone())
+        .with_response_budget(opts.max_response_bytes)
         .with_idle_timeout(opts.stream_idle_timeout());
     let mut state = ResponsesStreamState::with_tools(custom_tool_properties);
     // The stream contract exposes a pending assistant message immediately after
@@ -2210,6 +2212,16 @@ fn user_content_for_model(c: &UserContent, model: &Model) -> Value {
                         }));
                         previous_image = false;
                     }
+                    Content::Audio(audio) if model.input.contains(&InputModality::Audio) => {
+                        content.push(json!({
+                            "type":"input_audio",
+                            "input_audio": {
+                                "data": audio.data,
+                                "format": audio_format(&audio.mime_type),
+                            }
+                        }));
+                        previous_image = false;
+                    }
                     Content::Image(_) => {
                         if !previous_image {
                             content.push(json!({
@@ -2230,6 +2242,16 @@ fn user_content_for_model(c: &UserContent, model: &Model) -> Value {
                 Value::Array(content)
             }
         }
+    }
+}
+
+fn audio_format(mime_type: &str) -> &str {
+    match mime_type.to_ascii_lowercase().as_str() {
+        "audio/wav" | "audio/x-wav" => "wav",
+        "audio/mpeg" | "audio/mp3" => "mp3",
+        "audio/ogg" => "ogg",
+        "audio/webm" => "webm",
+        _ => mime_type.split('/').nth(1).unwrap_or("wav"),
     }
 }
 

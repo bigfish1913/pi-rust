@@ -200,9 +200,10 @@ impl PluginToolAdapter {
             .runtime_handle
             .and_then(crate::ActionBridge::resolve_handle)
             .map(|bridge| {
-                bridge.for_invocation(
+                bridge.for_tool_invocation(
                     rpi_agent::tool_execution_scope::is_child_execution(),
                     signal.clone(),
+                    Some(tool_call_id),
                 )
             });
         let mut params = inject_tool_context(params, &self.context);

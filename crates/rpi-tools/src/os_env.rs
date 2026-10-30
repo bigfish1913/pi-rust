@@ -108,6 +108,10 @@ pub fn is_host_private_env(name: &str) -> bool {
 /// Real-OS `ExecutionEnv`. Clone shares the tracked-pid set + registry.
 pub struct OsExecutionEnv {
     cwd: PathBuf,
+    /// When set, filesystem operations are restricted to these canonical roots.
+    /// `None` preserves the ordinary CLI environment; ACP supplies the session
+    /// cwd plus its negotiated `additionalDirectories`.
+    allowed_roots: Option<Arc<Vec<PathBuf>>>,
     shell_path: Option<PathBuf>,
     shell_env: Option<HashMap<String, String>>,
     active_pids: Arc<Mutex<HashSet<u32>>>,
@@ -115,9 +119,10 @@ pub struct OsExecutionEnv {
 }
 
 impl OsExecutionEnv {
-    pub fn new() -> Self {
+    fn from_parts(cwd: PathBuf, allowed_roots: Option<Vec<PathBuf>>) -> Self {
         Self {
-            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+            cwd,
+            allowed_roots: allowed_roots.map(Arc::new),
             shell_path: None,
             shell_env: None,
             active_pids: Arc::new(Mutex::new(HashSet::new())),
@@ -125,14 +130,40 @@ impl OsExecutionEnv {
         }
     }
 
+    pub fn new() -> Self {
+        Self::from_parts(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
+            None,
+        )
+    }
+
     pub fn with_cwd(cwd: PathBuf) -> Self {
-        Self {
-            cwd,
-            shell_path: None,
-            shell_env: None,
-            active_pids: Arc::new(Mutex::new(HashSet::new())),
-            registry: Arc::new(MutationQueueRegistry::new()),
+        Self::from_parts(cwd, None)
+    }
+
+    /// Construct an ACP-scoped environment. Every root must already be an
+    /// existing directory; invalid roots are ignored rather than turning a
+    /// native child into an unrestricted environment.
+    pub fn with_cwd_and_allowed_roots(cwd: PathBuf, roots: Vec<PathBuf>) -> Self {
+        let mut allowed = Vec::with_capacity(roots.len() + 1);
+        for root in std::iter::once(cwd.clone()).chain(roots) {
+            if let Ok(canonical) = std::fs::canonicalize(&root) {
+                if canonical.is_dir() && !allowed.contains(&canonical) {
+                    allowed.push(canonical);
+                }
+            }
         }
+        Self::from_parts(cwd, Some(allowed))
+    }
+
+    /// Validate a client shell command with the same workspace policy as local
+    /// execution, without spawning a local process. This is a conservative
+    /// operand guard, not a sandbox for arbitrary shell programs.
+    pub fn validate_shell_command(&self, command: &str) -> Result<(), ExecutionError> {
+        self.ensure_allowed(&self.cwd).map_err(|error| {
+            ExecutionError::new(ExecutionErrorCode::SpawnError, error.to_string())
+        })?;
+        self.ensure_shell_paths_allowed(command)
     }
 
     pub fn with_shell_path(mut self, shell_path: PathBuf) -> Self {
@@ -145,8 +176,82 @@ impl OsExecutionEnv {
         self
     }
 
-    /// Resolve a path (tilde, file://, absolute/relative) against `cwd`. Pure.
-    fn resolve_path(cwd: &Path, path: &str) -> PathBuf {
+    /// Resolve a path against `cwd` and enforce the optional workspace-root
+    /// policy. Canonicalizing the nearest existing ancestor also protects
+    /// writes to not-yet-created paths and rejects `..`/symlink escapes.
+    fn resolve_path(&self, path: &str) -> Result<PathBuf, FileError> {
+        let resolved = Self::resolve_path_unchecked(&self.cwd, path);
+        self.ensure_allowed(&resolved)?;
+        Ok(resolved)
+    }
+
+    fn ensure_allowed(&self, path: &Path) -> Result<(), FileError> {
+        let Some(roots) = &self.allowed_roots else {
+            return Ok(());
+        };
+        let canonical = canonicalize_for_access(path)
+            .map_err(|error| io_to_file_error(error, Some(&path.to_string_lossy())))?;
+        if roots.iter().any(|root| canonical.starts_with(root)) {
+            Ok(())
+        } else {
+            Err(FileError::new(
+                FileErrorCode::PermissionDenied,
+                "path is outside the negotiated ACP workspace roots",
+            )
+            .with_path(path.to_string_lossy()))
+        }
+    }
+
+    /// Apply a conservative command-level guard in addition to the cwd guard.
+    ///
+    /// Native filesystem tools can enforce roots exactly, but a shell is a
+    /// language and cannot be safely sandboxed by string rewriting. Rejecting
+    /// explicit absolute/relative path operands outside the negotiated roots
+    /// closes the common `cat /outside`, redirection, and `cd ../outside`
+    /// escapes while keeping the residual limitation explicit for shell
+    /// indirection (`eval`, command substitution, environment variables, etc.).
+    fn ensure_shell_paths_allowed(&self, command: &str) -> Result<(), ExecutionError> {
+        if self.allowed_roots.is_none() {
+            return Ok(());
+        }
+        let mut token = String::new();
+        let mut quote = None;
+        let check = |raw: &str| -> Result<(), ExecutionError> {
+            let candidate = raw.trim_matches(|c| matches!(c, '\'' | '"' | '`' | '(' | ')'));
+            let path_like = candidate.starts_with('/')
+                || candidate.starts_with("\\\\")
+                || (candidate.len() >= 3
+                    && candidate.as_bytes()[1] == b':'
+                    && matches!(candidate.as_bytes()[2], b'/' | b'\\'))
+                || candidate.starts_with("../")
+                || candidate.starts_with("..\\")
+                || candidate.starts_with("./")
+                || candidate.starts_with(".\\")
+                || candidate.starts_with("file://");
+            if !path_like {
+                return Ok(());
+            }
+            let path = Self::resolve_path_unchecked(&self.cwd, candidate);
+            self.ensure_allowed(&path).map_err(|error| {
+                ExecutionError::new(ExecutionErrorCode::SpawnError, error.to_string())
+            })
+        };
+        for ch in command.chars() {
+            match (quote, ch) {
+                (Some(active), c) if c == active => quote = None,
+                (None, '\'' | '"' | '`') => quote = Some(ch),
+                (None, c) if c.is_whitespace() || matches!(c, ';' | '|' | '&' | '>' | '<') => {
+                    check(&token)?;
+                    token.clear();
+                }
+                _ => token.push(ch),
+            }
+        }
+        check(&token)
+    }
+
+    /// Resolve a path without applying the optional root policy.
+    fn resolve_path_unchecked(cwd: &Path, path: &str) -> PathBuf {
         let mut p = path.to_string();
         // Tilde expansion (literal only).
         if p == "~" {
@@ -258,6 +363,31 @@ fn normalize_absolute(p: &Path) -> PathBuf {
         }
     }
     out
+}
+
+fn canonicalize_for_access(path: &Path) -> std::io::Result<PathBuf> {
+    match std::fs::canonicalize(path) {
+        Ok(canonical) => Ok(canonical),
+        Err(original) if original.kind() == std::io::ErrorKind::NotFound => {
+            let mut missing = Vec::new();
+            let mut probe = path.to_path_buf();
+            while !probe.exists() {
+                let Some(name) = probe.file_name().map(|name| name.to_os_string()) else {
+                    return Err(original);
+                };
+                missing.push(name);
+                if !probe.pop() {
+                    return Err(original);
+                }
+            }
+            let mut canonical = std::fs::canonicalize(probe)?;
+            for component in missing.iter().rev() {
+                canonical.push(component);
+            }
+            Ok(canonical)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn file_url_to_path(url: &str) -> Option<String> {
@@ -399,7 +529,7 @@ impl FileSystem for OsExecutionEnv {
         &self,
         path: &str,
     ) -> Result<Option<Box<dyn crate::env::AppendFile>>, FileError> {
-        let path = Self::resolve_path(&self.cwd, path);
+        let path = self.resolve_path(path)?;
         Ok(Some(Box::new(append::OsAppendFile::open(path).await?)))
     }
 
@@ -410,7 +540,7 @@ impl FileSystem for OsExecutionEnv {
         cancel: Option<&CancellationToken>,
     ) -> Result<(), FileError> {
         check_cancel_file(cancel, Some(path))?;
-        let abs = Self::resolve_path(&self.cwd, path);
+        let abs = self.resolve_path(path)?;
         let error_path = abs.to_string_lossy().into_owned();
         tokio::task::spawn_blocking(move || {
             let file = std::fs::OpenOptions::new().write(true).open(&abs)?;
@@ -442,7 +572,7 @@ impl FileSystem for OsExecutionEnv {
         cancel: Option<&CancellationToken>,
     ) -> Result<PathBuf, FileError> {
         check_cancel_file(cancel, Some(path))?;
-        Ok(Self::resolve_path(&self.cwd, path))
+        self.resolve_path(path)
     }
 
     async fn join_path(
@@ -464,7 +594,7 @@ impl FileSystem for OsExecutionEnv {
         cancel: Option<&CancellationToken>,
     ) -> Result<String, FileError> {
         check_cancel_file(cancel, Some(path))?;
-        let abs = Self::resolve_path(&self.cwd, path);
+        let abs = self.resolve_path(path)?;
         let bytes = read_cancellable(&abs, cancel).await?;
         String::from_utf8(bytes).map_err(|e| {
             FileError::new(FileErrorCode::Invalid, format!("invalid utf-8: {e}"))
@@ -501,7 +631,7 @@ impl FileSystem for OsExecutionEnv {
         cancel: Option<&CancellationToken>,
     ) -> Result<Vec<u8>, FileError> {
         check_cancel_file(cancel, Some(path))?;
-        let abs = Self::resolve_path(&self.cwd, path);
+        let abs = self.resolve_path(path)?;
         read_cancellable(&abs, cancel).await
     }
 
@@ -512,7 +642,7 @@ impl FileSystem for OsExecutionEnv {
         cancel: Option<&CancellationToken>,
     ) -> Result<(), FileError> {
         check_cancel_file(cancel, Some(path))?;
-        let abs = Self::resolve_path(&self.cwd, path);
+        let abs = self.resolve_path(path)?;
         // mkdir parent (recursive).
         if let Some(parent) = abs.parent() {
             if !parent.as_os_str().is_empty() {
@@ -532,7 +662,7 @@ impl FileSystem for OsExecutionEnv {
         cancel: Option<&CancellationToken>,
     ) -> Result<(), FileError> {
         check_cancel_file(cancel, Some(path))?;
-        let abs = Self::resolve_path(&self.cwd, path);
+        let abs = self.resolve_path(path)?;
         if let Some(parent) = abs.parent() {
             if !parent.as_os_str().is_empty() {
                 let _ = tokio::fs::create_dir_all(parent).await;
@@ -566,8 +696,8 @@ impl FileSystem for OsExecutionEnv {
         cancel: Option<&CancellationToken>,
     ) -> Result<(), FileError> {
         check_cancel_file(cancel, Some(source))?;
-        let src = Self::resolve_path(&self.cwd, source);
-        let dst = Self::resolve_path(&self.cwd, dest);
+        let src = self.resolve_path(source)?;
+        let dst = self.resolve_path(dest)?;
         tokio::fs::rename(&src, &dst)
             .await
             .map_err(|e| io_to_file_error(e, Some(&src.to_string_lossy())))
@@ -579,7 +709,7 @@ impl FileSystem for OsExecutionEnv {
         cancel: Option<&CancellationToken>,
     ) -> Result<FileInfo, FileError> {
         check_cancel_file(cancel, Some(path))?;
-        let abs = Self::resolve_path(&self.cwd, path);
+        let abs = self.resolve_path(path)?;
         let meta = tokio::fs::symlink_metadata(&abs)
             .await
             .map_err(|e| io_to_file_error(e, Some(&abs.to_string_lossy())))?;
@@ -620,7 +750,7 @@ impl FileSystem for OsExecutionEnv {
         cancel: Option<&CancellationToken>,
     ) -> Result<Vec<FileInfo>, FileError> {
         check_cancel_file(cancel, Some(path))?;
-        let abs = Self::resolve_path(&self.cwd, path);
+        let abs = self.resolve_path(path)?;
         let mut entries = tokio::fs::read_dir(&abs)
             .await
             .map_err(|e| io_to_file_error(e, Some(&abs.to_string_lossy())))?;
@@ -680,7 +810,7 @@ impl FileSystem for OsExecutionEnv {
         cancel: Option<&CancellationToken>,
     ) -> Result<PathBuf, FileError> {
         check_cancel_file(cancel, Some(path))?;
-        let abs = Self::resolve_path(&self.cwd, path);
+        let abs = self.resolve_path(path)?;
         tokio::fs::canonicalize(&abs)
             .await
             .map_err(|e| io_to_file_error(e, Some(&abs.to_string_lossy())))
@@ -692,7 +822,7 @@ impl FileSystem for OsExecutionEnv {
         cancel: Option<&CancellationToken>,
     ) -> Result<bool, FileError> {
         check_cancel_file(cancel, Some(path))?;
-        let abs = Self::resolve_path(&self.cwd, path);
+        let abs = self.resolve_path(path)?;
         match tokio::fs::symlink_metadata(&abs).await {
             Ok(_) => Ok(true),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -707,7 +837,7 @@ impl FileSystem for OsExecutionEnv {
         cancel: Option<&CancellationToken>,
     ) -> Result<(), FileError> {
         check_cancel_file(cancel, Some(path))?;
-        let abs = Self::resolve_path(&self.cwd, path);
+        let abs = self.resolve_path(path)?;
         let res = if recursive {
             tokio::fs::create_dir_all(&abs).await
         } else {
@@ -724,7 +854,7 @@ impl FileSystem for OsExecutionEnv {
         cancel: Option<&CancellationToken>,
     ) -> Result<(), FileError> {
         check_cancel_file(cancel, Some(path))?;
-        let abs = Self::resolve_path(&self.cwd, path);
+        let abs = self.resolve_path(path)?;
         let res = if recursive {
             tokio::fs::remove_dir_all(&abs).await
         } else {
@@ -748,14 +878,21 @@ impl FileSystem for OsExecutionEnv {
     ) -> Result<PathBuf, FileError> {
         check_cancel_file(cancel, None)?;
         let prefix = prefix.unwrap_or("tmp-");
+        let tmp_root = self
+            .allowed_roots
+            .as_ref()
+            .and_then(|roots| roots.first().cloned())
+            .map(|root| root.join(".rpi").join("tmp"))
+            .unwrap_or_else(std::env::temp_dir);
+        std::fs::create_dir_all(&tmp_root)
+            .map_err(|e| io_to_file_error(e, Some(&tmp_root.to_string_lossy())))?;
         // Use tempfile's NamedTempFile-less builder for a dir.
-        let tmp =
-            tempfile::tempdir_in(std::env::temp_dir()).map_err(|e| io_to_file_error(e, None))?;
+        let tmp = tempfile::tempdir_in(&tmp_root).map_err(|e| io_to_file_error(e, None))?;
         // tempfile picks a random name; rename to include the prefix.
         let path = tmp.path().to_path_buf();
         std::mem::forget(tmp); // keep the dir alive; caller manages cleanup.
                                // Build a prefixed sibling.
-        let final_path = std::env::temp_dir().join(format!("{}{}", prefix, random_suffix()));
+        let final_path = tmp_root.join(format!("{}{}", prefix, random_suffix()));
         // Rename the tempdir into the prefixed path.
         if let Err(e) = tokio::fs::rename(&path, &final_path).await {
             // Fallback: just return the original random path.
@@ -855,9 +992,14 @@ impl Shell for OsExecutionEnv {
         };
         // Resolve cwd.
         let cwd = match &options.cwd {
-            Some(c) => Self::resolve_path(&self.cwd, &c.to_string_lossy()),
+            Some(c) => self.resolve_path(&c.to_string_lossy()).map_err(|error| {
+                ExecutionError::new(ExecutionErrorCode::SpawnError, error.to_string())
+            })?,
             None => self.cwd.clone(),
         };
+        self.ensure_allowed(&cwd).map_err(|error| {
+            ExecutionError::new(ExecutionErrorCode::SpawnError, error.to_string())
+        })?;
         // Shell config. An explicit override is used by native shell tools
         // such as PowerShell; otherwise preserve the default Bash behavior.
         let shell_cfg = match &options.shell {
@@ -878,6 +1020,7 @@ impl Shell for OsExecutionEnv {
                 ),
             ));
         }
+        self.ensure_shell_paths_allowed(command)?;
 
         // Build the spawn.
         let mut cmd = tokio::process::Command::new(&shell_cfg.shell);

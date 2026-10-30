@@ -162,6 +162,7 @@ pub fn faux_assistant_message(
         api: Api::Faux,
         provider: DEFAULT_PROVIDER.to_string(),
         model: DEFAULT_MODEL_ID.to_string(),
+        message_id: None,
         response_model: None,
         response_id: None,
         usage: crate::types::Usage::zero(),
@@ -182,6 +183,7 @@ fn content_to_assistant_text(content: &[Content]) -> String {
             Content::Thinking(t) => t.thinking.clone(),
             Content::ToolCall(tc) => format!("{}:{}", tc.name, tc.arguments),
             Content::Image(_) => String::new(),
+            Content::Audio(_) => String::new(),
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -834,6 +836,9 @@ async fn stream_with_deltas(
             }
             Content::Image(_) => {
                 // Faux doesn't stream image blocks — mirrors TS (no image arm).
+            }
+            Content::Audio(_) => {
+                // Faux doesn't stream audio blocks; they are input-only.
             }
         }
     }

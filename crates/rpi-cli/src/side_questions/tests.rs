@@ -403,6 +403,7 @@ async fn timeout_and_output_limits_are_terminal() {
             delta: "x".repeat(MAX_OUTPUT + 1),
             partial: message,
         },
+        message_id: None,
     });
     assert!(timed.snapshot()["error"]
         .as_str()

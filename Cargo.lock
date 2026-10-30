@@ -2052,6 +2052,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -2215,6 +2216,7 @@ dependencies = [
  "futures",
  "globset",
  "image",
+ "jsonschema",
  "nix",
  "regex",
  "rpi-agent",

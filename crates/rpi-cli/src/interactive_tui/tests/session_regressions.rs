@@ -852,7 +852,10 @@ async fn review_pr104_replay_preserves_the_live_cache_hit_rate() {
     // Run the actual live MessageEnd handler; the latest turn is a 10% hit.
     for message in messages {
         handle_agent_event(
-            AgentEvent::MessageEnd { message },
+            AgentEvent::MessageEnd {
+                message,
+                message_id: None,
+            },
             &tui,
             &state,
             &state.chat_container,

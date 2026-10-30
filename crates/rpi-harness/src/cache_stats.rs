@@ -270,6 +270,7 @@ mod tests {
             api: Api::AnthropicMessages,
             provider: ProviderId::from(provider),
             model: model.to_string(),
+            message_id: None,
             response_model: None,
             response_id: None,
             usage: Usage {

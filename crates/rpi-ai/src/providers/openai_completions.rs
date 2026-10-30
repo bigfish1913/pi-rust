@@ -134,6 +134,7 @@ where
 
 #[async_trait]
 impl Provider for OpenAiCompletionsProvider {
+    fn supports_response_budget(&self) -> bool { true }
     fn id(&self) -> &str {
         &self.id
     }
@@ -233,7 +234,9 @@ async fn run_stream(
                     Ok(response)
                 } else {
                     let code = status.as_u16();
-                    let message = response.text().await.unwrap_or_default();
+                    let message = if opts.max_response_bytes.is_some() {
+                        "provider HTTP error".to_string()
+                    } else { response.text().await.unwrap_or_default() };
                     Err(AiError::Http {
                         status: Some(code),
                         message,
@@ -259,6 +262,7 @@ async fn run_stream(
 
     state.start(producer).await;
     let mut events = SseEventStream::new(response, opts.signal.clone())
+        .with_response_budget(opts.max_response_bytes)
         .with_idle_timeout(opts.stream_idle_timeout());
     loop {
         match events.next_event().await {
@@ -556,10 +560,27 @@ fn user_content(content: &UserContent) -> Value {
                             "url": format!("data:{};base64,{}", image.mime_type, image.data)
                         }
                     })),
+                    Content::Audio(audio) => Some(json!({
+                        "type": "input_audio",
+                        "input_audio": {
+                            "data": audio.data,
+                            "format": audio_format(&audio.mime_type),
+                        }
+                    })),
                     _ => None,
                 })
                 .collect(),
         ),
+    }
+}
+
+fn audio_format(mime_type: &str) -> &str {
+    match mime_type.to_ascii_lowercase().as_str() {
+        "audio/wav" | "audio/x-wav" => "wav",
+        "audio/mpeg" | "audio/mp3" => "mp3",
+        "audio/ogg" => "ogg",
+        "audio/webm" => "webm",
+        _ => mime_type.split('/').nth(1).unwrap_or("wav"),
     }
 }
 
@@ -1226,6 +1247,7 @@ mod tests {
     use super::*;
     use crate::event_stream::create_assistant_message_event_stream;
     use crate::model::OpenaiCompletionsCompat;
+    use crate::types::AudioContent;
     use crate::types::{
         AssistantMessage, AssistantMessageEvent, ImageContent, ImageContentType, Message,
         StopReason, Tool, ToolResultMessage, ToolResultRole, UserMessage,
@@ -1838,6 +1860,18 @@ mod tests {
         );
         assert_eq!(request["thinking"]["type"], "disabled");
         assert!(request.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn user_content_encodes_audio_as_provider_input_audio() {
+        let value = user_content(&UserContent::Blocks(vec![Content::Audio(AudioContent {
+            kind: Default::default(),
+            data: "UklGRg==".into(),
+            mime_type: "audio/wav".into(),
+        })]));
+        assert_eq!(value[0]["type"], "input_audio");
+        assert_eq!(value[0]["input_audio"]["data"], "UklGRg==");
+        assert_eq!(value[0]["input_audio"]["format"], "wav");
     }
 
     #[test]

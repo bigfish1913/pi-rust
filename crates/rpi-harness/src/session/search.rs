@@ -318,6 +318,7 @@ mod tests {
                 api: rpi_ai::types::Api::AnthropicMessages,
                 provider: "test".to_string(),
                 model: "test-model".to_string(),
+                message_id: None,
                 response_model: None,
                 response_id: None,
                 usage: rpi_ai::types::Usage::zero(),

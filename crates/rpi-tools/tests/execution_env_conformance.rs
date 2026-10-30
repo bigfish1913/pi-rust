@@ -120,6 +120,75 @@ async fn truncate_file_only_shrinks_on_both_backends() {
 }
 
 #[tokio::test]
+async fn acp_workspace_roots_allow_only_the_cwd_and_negotiated_directories() {
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path().join("cwd");
+    let extra = temp.path().join("extra");
+    let outside = temp.path().join("outside");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir_all(&extra).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+
+    let env = OsExecutionEnv::with_cwd_and_allowed_roots(cwd.clone(), vec![extra.clone()]);
+    env.write_file("inside.txt", FileContent::Text("cwd".into()), None)
+        .await
+        .unwrap();
+    env.write_file(
+        &format!("{}/inside.txt", extra.display()),
+        FileContent::Text("extra".into()),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        env.read_text_file(&format!("{}/inside.txt", extra.display()), None)
+            .await
+            .unwrap(),
+        "extra"
+    );
+
+    let outside_file = outside.join("blocked.txt");
+    assert!(env
+        .write_file(
+            &outside_file.to_string_lossy(),
+            FileContent::Text("no".into()),
+            None,
+        )
+        .await
+        .is_err());
+    assert!(env
+        .read_text_file(&outside_file.to_string_lossy(), None)
+        .await
+        .is_err());
+    assert!(env
+        .exec(
+            "printf blocked",
+            ShellExecOptions {
+                cwd: Some(outside.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .is_err());
+    assert!(env
+        .exec(
+            &format!("printf blocked > {}", outside_file.display()),
+            ShellExecOptions::default(),
+        )
+        .await
+        .is_err());
+    env.exec(
+        "printf allowed > inside-shell.txt",
+        ShellExecOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("inside-shell.txt")).unwrap(),
+        "allowed"
+    );
+}
+#[tokio::test]
 async fn os_cancel_interrupts_even_when_timeout_is_set() {
     let tmp = std::env::temp_dir().join(format!("pi-tools-cancel-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);

@@ -96,6 +96,36 @@ impl PreparedJsonRequest {
     }
 }
 
+/// Bounded decoded non-stream body, checked before copying each network chunk.
+/// Network-owned chunks themselves are not allocated by this collector.
+pub(super) async fn response_text(
+    response: reqwest::Response,
+    opts: &crate::SimpleStreamOptions,
+) -> Result<String, crate::AiError> {
+    use futures::StreamExt;
+    if opts.max_response_bytes.is_none() {
+        return response.text().await.map_err(|_| crate::AiError::Http {
+            status: None, message: "failed to read response body".into(),
+        });
+    }
+    let max = opts.max_response_bytes.unwrap();
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    loop {
+        let next = tokio::select! {
+            _ = opts.signal.cancelled() => return Err(crate::AiError::Abort { message: "Request aborted".into() }),
+            next = stream.next() => next,
+        };
+        let Some(chunk) = next else { break };
+        let chunk = chunk.map_err(|_| crate::AiError::Http { status: None, message: "failed to read response body".into() })?;
+        if bytes.len().checked_add(chunk.len()).is_none_or(|n| n > max) {
+            return Err(crate::AiError::Provider { code: "response_budget_exceeded".into(), message: "response byte budget exceeded".into() });
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    String::from_utf8(bytes).map_err(|_| crate::AiError::Sse { message: "invalid response encoding".into() })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -791,6 +791,10 @@ pub fn transform_messages(messages: &[Message], model: &Model) -> Vec<Message> {
                             // Assistant-side images are not expected; pass through.
                             new_content.push(block.clone());
                         }
+                        Content::Audio(_) => {
+                            // Anthropic's message adapter has no audio wire block.
+                            new_content.push(block.clone());
+                        }
                     }
                 }
                 let mut new_msg = a.clone();
@@ -1321,6 +1325,9 @@ fn convert_messages_impl<'message>(
                         }
                         Content::Image(_) => {
                             // Assistant-side images are not emitted by the protocol.
+                        }
+                        Content::Audio(_) => {
+                            // Audio is only emitted by providers with native audio support.
                         }
                     }
                 }

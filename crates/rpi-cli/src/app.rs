@@ -513,12 +513,14 @@ async fn run_inner() -> i32 {
                         let session = reload_context.extension_session.lock().unwrap();
                         session.snapshot_arc()
                     };
-                    crate::modes::rpc(
+                    crate::modes::rpc_with_client(
                         &harness,
                         Some(event_rx),
                         model_catalog,
                         reload_context.ui_dialog.clone(),
                         oauth_snapshot,
+                        reload_context.client_tools.clone(),
+                        Some(&reload_context),
                     )
                     .await
                 };

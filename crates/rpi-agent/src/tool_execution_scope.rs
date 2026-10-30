@@ -7,6 +7,7 @@ use tokio::sync::Notify;
 tokio::task_local! {
     static CURRENT: Arc<ToolExecutionScope>;
     static INVOCATION_SIGNAL: tokio_util::sync::CancellationToken;
+    static INVOCATION_TOOL: Option<InvocationToolCallId>;
 }
 
 /// Bind a runtime action to the originating tool invocation, even after its
@@ -20,6 +21,36 @@ pub async fn with_invocation_signal<F: Future>(
 
 pub fn invocation_signal() -> Option<tokio_util::sync::CancellationToken> {
     INVOCATION_SIGNAL.try_with(Clone::clone).ok()
+}
+
+/// Host-captured actual execute argument, never deserialized from plugin JSON.
+/// This provenance is independent of child execution authority (`CURRENT`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvocationToolCallId(String);
+
+impl InvocationToolCallId {
+    pub fn new(actual_tool_call_id: &str) -> Option<Self> {
+        (!actual_tool_call_id.trim().is_empty()
+            && actual_tool_call_id.len() <= 1024
+            && !actual_tool_call_id.bytes().any(|byte| byte.is_ascii_control()))
+            .then(|| Self(actual_tool_call_id.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str { &self.0 }
+}
+
+pub fn invocation_tool_call_id() -> Option<InvocationToolCallId> {
+    INVOCATION_TOOL.try_with(Clone::clone).ok().flatten()
+}
+
+/// Restores even an absent binding, so signal-only host paths cannot inherit
+/// another invocation's provenance. Neither binding grants child authority.
+pub async fn with_invocation_binding<F: Future>(
+    tool_call_id: Option<InvocationToolCallId>,
+    signal: tokio_util::sync::CancellationToken,
+    future: F,
+) -> F::Output {
+    INVOCATION_TOOL.scope(tool_call_id, with_invocation_signal(signal, future)).await
 }
 
 /// Shared by a child's run, tools, providers and detached foreign callbacks.
@@ -36,6 +67,15 @@ impl ToolExecutionScope {
             ..Default::default()
         }
     }
+    pub fn run_context(&self) -> serde_json::Value {
+        self.context.clone().unwrap_or_else(|| serde_json::json!({}))
+    }
+
+    /// Capture host provenance before spawning work; task locals are not inherited.
+    pub fn capture() -> Option<Arc<Self>> {
+        CURRENT.try_with(Clone::clone).ok()
+    }
+
     pub async fn run<F: Future>(self: &Arc<Self>, future: F) -> F::Output {
         CURRENT.scope(self.clone(), future).await
     }
@@ -52,6 +92,18 @@ impl ToolExecutionScope {
             notified.await;
         }
     }
+}
+
+/// Re-enter captured provenance, including after the originating task exits.
+pub async fn run_captured<F: Future>(scope: Option<Arc<ToolExecutionScope>>, future: F) -> F::Output {
+    match scope {
+        Some(scope) => scope.run(future).await,
+        None => future.await,
+    }
+}
+
+pub fn execution_session_id() -> Option<String> {
+    execution_context()?.get("sessionId")?.as_str().map(str::to_owned)
 }
 
 pub fn is_child_execution() -> bool {
@@ -81,6 +133,10 @@ pub fn track_background_tool() -> Option<BackgroundToolGuard> {
         })
         .ok()
 }
+
+#[cfg(test)]
+#[path = "tool_execution_scope_correlation_tests.rs"]
+mod correlation_tests;
 
 #[cfg(test)]
 mod tests {
@@ -124,6 +180,25 @@ mod tests {
         token.cancel();
         assert!(captured.is_cancelled());
     }
+    #[tokio::test]
+    async fn captured_provenance_crosses_spawn_and_outlives_origin_scope() {
+        let mut jobs = Vec::new();
+        for id in ["child-a", "child-b"] {
+            let scope = Arc::new(ToolExecutionScope::with_context(serde_json::json!({
+                "sessionId":id,"parentSessionId":"root","rootSessionId":"root"
+            })));
+            let captured = scope.run(async { ToolExecutionScope::capture() }).await;
+            jobs.push(tokio::spawn(run_captured(captured, async move {
+                tokio::task::yield_now().await;
+                assert_eq!(execution_session_id().as_deref(), Some(id));
+                assert_eq!(execution_context().unwrap()["rootSessionId"], "root");
+            })));
+        }
+        for job in jobs { job.await.unwrap(); }
+        assert!(execution_session_id().is_none());
+        assert!(ToolExecutionScope::capture().is_none());
+    }
+
     #[tokio::test]
     async fn dropping_the_foreground_scope_does_not_finish_its_background_work() {
         let scope = Arc::new(ToolExecutionScope::default());
