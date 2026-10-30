@@ -3434,6 +3434,41 @@ impl AgentHarness {
             .map_err(session_to_harness_err)
     }
 
+    /// Append a `model_change` / `thinking_level_change` / `active_tools_change`
+    /// entry for a **mid-session** state change.
+    ///
+    /// Mirrors pi: every `setModel` / `setThinkingLevel` / `setActiveTools`
+    /// lands on the session branch, so a reader of the file can reconstruct
+    /// which model and thinking level a turn actually ran with. rpi parsed and
+    /// rendered these entries but never wrote one.
+    ///
+    /// Skipped when the branch is still empty: a non-message entry as the sole
+    /// leaf breaks `fork` (`ForkOptions::Branch` requires a message leaf), the
+    /// same constraint that defers the startup `thinking_level_change` write to
+    /// the first turn.
+    async fn record_state_change(&self, kind: ProvisionedKind) -> HarnessResult<()> {
+        let any = self
+            .session
+            .find_entries_on_branch(
+                &EntryQuery {
+                    limit: Some(1),
+                    ..Default::default()
+                },
+                &BranchBounds::default(),
+            )
+            .await
+            .map_err(session_to_harness_err)?;
+        if any.is_empty() {
+            return Ok(());
+        }
+        self.append_provisioned(ProvisionedEntry {
+            id: self.session.id_generator().next(),
+            kind,
+        })
+        .await?;
+        Ok(())
+    }
+
     /// Commit the frame-stream binding, assistant entry, and step attempt in
     /// one durable append. The logical order remains binding → entry → step.
     pub(crate) async fn append_bound_provisioned_with_step_attempt(
@@ -5388,11 +5423,23 @@ impl AgentLane for AgentHarness {
     }
 
     async fn set_model(&self, model: Model) -> HarnessResult<()> {
-        let mut inner = self.inner.lock().unwrap();
-        if inner.closed {
-            return Err(HarnessError::closed());
+        let changed = {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.closed {
+                return Err(HarnessError::closed());
+            }
+            let changed =
+                inner.model.id != model.id || inner.model.provider != model.provider;
+            inner.model = model.clone();
+            changed
+        };
+        if changed {
+            self.record_state_change(ProvisionedKind::ModelChange {
+                provider: model.provider.clone(),
+                model_id: model.id.clone(),
+            })
+            .await?;
         }
-        inner.model = model;
         Ok(())
     }
 
@@ -5405,11 +5452,26 @@ impl AgentLane for AgentHarness {
     }
 
     async fn set_thinking_level(&self, level: ThinkingLevel) -> HarnessResult<()> {
-        let mut inner = self.inner.lock().unwrap();
-        if inner.closed {
-            return Err(HarnessError::closed());
+        let changed = {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.closed {
+                return Err(HarnessError::closed());
+            }
+            let changed = inner.thinking_level != level;
+            inner.thinking_level = level;
+            changed
+        };
+        if changed {
+            // The entry stores the wire name; derive it from the enum's own
+            // serde representation so this cannot drift from what a reader
+            // parses back (same rule as the startup write).
+            let thinking_level = serde_json::to_value(level)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_else(|| "off".to_string());
+            self.record_state_change(ProvisionedKind::ThinkingLevel { thinking_level })
+                .await?;
         }
-        inner.thinking_level = level;
         Ok(())
     }
 
@@ -5422,11 +5484,21 @@ impl AgentLane for AgentHarness {
     }
 
     async fn set_active_tools(&self, names: Vec<String>) -> HarnessResult<()> {
-        let mut inner = self.inner.lock().unwrap();
-        if inner.closed {
-            return Err(HarnessError::closed());
+        let changed = {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.closed {
+                return Err(HarnessError::closed());
+            }
+            let changed = inner.active_tool_names != names;
+            inner.active_tool_names = names.clone();
+            changed
+        };
+        if changed {
+            self.record_state_change(ProvisionedKind::ActiveTools {
+                active_tool_names: names,
+            })
+            .await?;
         }
-        inner.active_tool_names = names;
         Ok(())
     }
 
@@ -5735,11 +5807,26 @@ impl AgentLane for LaneHandle {
     }
 
     async fn set_model(&self, model: Model) -> HarnessResult<()> {
-        let mut inner = self.inner.lock().unwrap();
-        if inner.closed {
-            return Err(HarnessError::closed());
+        let changed = {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.closed {
+                return Err(HarnessError::closed());
+            }
+            let changed =
+                inner.model.id != model.id || inner.model.provider != model.provider;
+            inner.model = model.clone();
+            changed
+        };
+        // Same durability rule as the main lane: the branch records what each
+        // turn actually ran with.
+        if changed {
+            self.runner()
+                .record_state_change(ProvisionedKind::ModelChange {
+                    provider: model.provider.clone(),
+                    model_id: model.id.clone(),
+                })
+                .await?;
         }
-        inner.model = model;
         Ok(())
     }
 
@@ -5752,11 +5839,24 @@ impl AgentLane for LaneHandle {
     }
 
     async fn set_thinking_level(&self, level: ThinkingLevel) -> HarnessResult<()> {
-        let mut inner = self.inner.lock().unwrap();
-        if inner.closed {
-            return Err(HarnessError::closed());
+        let changed = {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.closed {
+                return Err(HarnessError::closed());
+            }
+            let changed = inner.thinking_level != level;
+            inner.thinking_level = level;
+            changed
+        };
+        if changed {
+            let thinking_level = serde_json::to_value(level)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_else(|| "off".to_string());
+            self.runner()
+                .record_state_change(ProvisionedKind::ThinkingLevel { thinking_level })
+                .await?;
         }
-        inner.thinking_level = level;
         Ok(())
     }
 
@@ -5769,11 +5869,22 @@ impl AgentLane for LaneHandle {
     }
 
     async fn set_active_tools(&self, names: Vec<String>) -> HarnessResult<()> {
-        let mut inner = self.inner.lock().unwrap();
-        if inner.closed {
-            return Err(HarnessError::closed());
+        let changed = {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.closed {
+                return Err(HarnessError::closed());
+            }
+            let changed = inner.active_tool_names != names;
+            inner.active_tool_names = names.clone();
+            changed
+        };
+        if changed {
+            self.runner()
+                .record_state_change(ProvisionedKind::ActiveTools {
+                    active_tool_names: names,
+                })
+                .await?;
         }
-        inner.active_tool_names = names;
         Ok(())
     }
 
@@ -6885,5 +6996,128 @@ mod agent_end_log_barrier_tests {
              already be in the durable log (the footer reconciles from the log \
              exactly there)"
         );
+    }
+}
+
+#[cfg(test)]
+mod state_change_entry_tests {
+    use super::*;
+    use crate::session::memory::{InMemorySessionStorage, SystemClock};
+    use crate::session::session::DefaultIdGenerator;
+    use crate::session::types::SessionMetadata;
+    use rpi_ai::providers::faux::{FauxProvider, FauxScript};
+    use rpi_ai::types::UserMessage;
+
+    async fn harness() -> AgentHarness {
+        let provider = FauxProvider::new(FauxScript::new().with_text("ok"));
+        AgentHarness::create(AgentHarnessOptions {
+            model: provider.default_model().clone(),
+            models: vec![provider],
+            session: Session::new(
+                Arc::new(InMemorySessionStorage::new(
+                    SessionMetadata {
+                        id: "state-change".into(),
+                        created_at: 0,
+                        parent_session_id: None,
+                    },
+                    Arc::new(SystemClock),
+                    Arc::new(DefaultIdGenerator::new()),
+                )),
+                None,
+            ),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+    }
+
+    /// 某个类型在 main 分支上的条数。
+    async fn count(harness: &AgentHarness, entry_type: &'static str) -> usize {
+        harness
+            .session()
+            .find_entries_on_branch(
+                &EntryQuery {
+                    entry_type: Some(entry_type),
+                    ..Default::default()
+                },
+                &BranchBounds::default(),
+            )
+            .await
+            .unwrap()
+            .len()
+    }
+
+    /// 往会话里塞一条 user 消息（让分支不再是空的）。
+    async fn push_user(harness: &AgentHarness) {
+        harness
+            .session()
+            .append_message(AgentMessage::User(UserMessage::new("hi", 0)))
+            .await
+            .unwrap();
+    }
+
+    /// 空分支**不写**（否则非消息条目成了唯一叶子，`fork` 会坏）。
+    #[tokio::test]
+    async fn empty_branch_records_nothing() {
+        let h = harness().await;
+        h.lane("main")
+            .set_thinking_level(ThinkingLevel::Low)
+            .await
+            .unwrap();
+        assert_eq!(count(&h, "thinking_level_change").await, 0);
+    }
+
+    /// 思考强度：变了才写，同值不重复。
+    #[tokio::test]
+    async fn thinking_level_change_is_recorded_once_per_change() {
+        let h = harness().await;
+        push_user(&h).await;
+        h.lane("main")
+            .set_thinking_level(ThinkingLevel::Low)
+            .await
+            .unwrap();
+        assert_eq!(count(&h, "thinking_level_change").await, 1);
+        // 幂等：同值再设一次不写第二条。
+        h.lane("main")
+            .set_thinking_level(ThinkingLevel::Low)
+            .await
+            .unwrap();
+        assert_eq!(count(&h, "thinking_level_change").await, 1);
+        // 再变一次 → 第二条。
+        h.lane("main")
+            .set_thinking_level(ThinkingLevel::High)
+            .await
+            .unwrap();
+        assert_eq!(count(&h, "thinking_level_change").await, 2);
+    }
+
+    /// 模型：变了才写。
+    #[tokio::test]
+    async fn model_change_is_recorded_once_per_change() {
+        let h = harness().await;
+        push_user(&h).await;
+        let mut m = h.get_model().await.unwrap();
+        m.id = "other-model".into();
+        h.lane("main").set_model(m.clone()).await.unwrap();
+        assert_eq!(count(&h, "model_change").await, 1);
+        h.lane("main").set_model(m).await.unwrap();
+        assert_eq!(count(&h, "model_change").await, 1, "同模型不该重复写");
+    }
+
+    /// 启用工具：变了才写。
+    #[tokio::test]
+    async fn active_tools_change_is_recorded_once_per_change() {
+        let h = harness().await;
+        push_user(&h).await;
+        h.lane("main")
+            .set_active_tools(vec!["read".into(), "bash".into()])
+            .await
+            .unwrap();
+        assert_eq!(count(&h, "active_tools_change").await, 1);
+        h.lane("main")
+            .set_active_tools(vec!["read".into(), "bash".into()])
+            .await
+            .unwrap();
+        assert_eq!(count(&h, "active_tools_change").await, 1);
     }
 }
