@@ -17,7 +17,7 @@ async fn ffi_child_actions_leave_real_parent_transcript_tools_and_config_unchang
     let bridge = rpi_extensions::ActionBridge::new(Handle::current(), host.clone());
     let before_context = host.get_execution_context(json!({})).await.unwrap();
     let before_tools = host.get_active_tools(json!({})).await.unwrap();
-    let before_history = host.get_session_branch(json!({})).await.unwrap();
+    let before_history = host.get_session_branch(json!({"customTypes":["must-not-append", "root-compatible"]})).await.unwrap();
     let scope = Arc::new(rpi_agent::tool_execution_scope::ToolExecutionScope::with_context(json!({
         "sessionId":"trusted-child", "rootSessionId":before_context["sessionId"], "childAgent":false
     })));
@@ -49,7 +49,7 @@ async fn ffi_child_actions_leave_real_parent_transcript_tools_and_config_unchang
         }
     }).join().unwrap();
     assert_eq!(host.get_active_tools(json!({})).await.unwrap(), before_tools);
-    assert_eq!(host.get_session_branch(json!({})).await.unwrap(), before_history);
+    assert_eq!(host.get_session_branch(json!({"customTypes":["must-not-append", "root-compatible"]})).await.unwrap(), before_history);
     assert_eq!(host.get_execution_context(json!({})).await.unwrap(), before_context);
     drop(invocation);
     // Normal root FFI append still reaches the same production host.
@@ -57,5 +57,5 @@ async fn ffi_child_actions_leave_real_parent_transcript_tools_and_config_unchang
     assert_eq!(rpi_extensions::trampoline_runtime_action(RuntimeActionId::AppendEntry.into(),
         StbStringRef::from_str(r#"{"customType":"root-compatible","data":{"ok":true}}"#), &mut out, bridge.user_data()), 0);
     unsafe { rpi_extensions::host_free_string(out) };
-    assert_ne!(host.get_session_branch(json!({})).await.unwrap(), before_history);
+    assert_ne!(host.get_session_branch(json!({"customTypes":["must-not-append", "root-compatible"]})).await.unwrap(), before_history);
 }

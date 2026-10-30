@@ -79,6 +79,24 @@ pub enum Mode {
     Rpc,
 }
 
+/// RPC message-update wire representation. Missing capability metadata on older
+/// hosts means snapshot semantics, not this CLI's default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RpcMessageUpdates {
+    #[default]
+    CompactDeltas,
+    Snapshot,
+}
+
+impl RpcMessageUpdates {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CompactDeltas => "compact-deltas",
+            Self::Snapshot => "snapshot",
+        }
+    }
+}
+
 /// Interactive TUI presentation mode. `fullscreen` uses the alternate screen
 /// buffer; `regular` renders into the terminal's normal scrollback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,6 +141,7 @@ pub struct Args {
 
     pub print: bool,
     pub mode: Mode,
+    pub rpc_message_updates: RpcMessageUpdates,
     /// `--tui-mode regular|fullscreen` controls the interactive terminal
     /// buffer. macOS defaults to regular so native selection and terminal
     /// scrollback remain available together; other platforms use fullscreen.
@@ -338,6 +357,17 @@ pub fn parse_args(args: &[String]) -> Args {
                             Mode::Text
                         }
                     };
+                }
+            }
+            "--rpc-message-updates" => {
+                if let Some(value) = take_value(&mut result, "--rpc-message-updates") {
+                    match value.as_str() {
+                        "snapshot" => result.rpc_message_updates = RpcMessageUpdates::Snapshot,
+                        "compact-deltas" => result.rpc_message_updates = RpcMessageUpdates::CompactDeltas,
+                        other => result.errors.push(format!(
+                            "Invalid --rpc-message-updates \"{other}\". Valid: snapshot, compact-deltas"
+                        )),
+                    }
                 }
             }
             "--tui-mode" => {
@@ -606,6 +636,7 @@ pub fn print_help() {
   --append-system-prompt <text>  Append text to the system prompt (repeatable)
   --thinking <level>             off, minimal, low, medium, high, xhigh, max
   --mode <mode>                  Output mode: text (default), json, or rpc
+  --rpc-message-updates <mode>   RPC updates: compact-deltas (default) or snapshot (legacy)
   --server [--port <n>] [--bind <ip>]
                                  Headless server: serve a remote-connectable agent (no TUI)
   --connect <host:port>          Remote client: connect to a `--server` instance and run the TUI
@@ -718,6 +749,48 @@ pub fn print_version() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rpc_message_updates_selection_and_errors() {
+        assert_eq!(
+            super::Args::default().rpc_message_updates,
+            super::RpcMessageUpdates::CompactDeltas
+        );
+        for (value, expected) in [
+            ("snapshot", super::RpcMessageUpdates::Snapshot),
+            ("compact-deltas", super::RpcMessageUpdates::CompactDeltas),
+        ] {
+            for args in [
+                vec![
+                    "--mode".into(),
+                    "rpc".into(),
+                    format!("--rpc-message-updates={value}"),
+                ],
+                vec!["--rpc-message-updates".into(), value.into()],
+            ] {
+                let parsed = super::parse_args(&args);
+                assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+                assert_eq!(parsed.rpc_message_updates, expected);
+                assert!(parsed.unknown_flags.is_empty());
+            }
+        }
+        for args in [
+            vec!["--rpc-message-updates".into()],
+            vec!["--rpc-message-updates".into(), "--mode=json".into()],
+            vec!["--rpc-message-updates=".into()],
+            vec!["--rpc-message-updates=invalid".into()],
+            vec!["--rpc-message-updates".into(), "invalid".into()],
+        ] {
+            let parsed = super::parse_args(&args);
+            assert_eq!(parsed.errors.len(), 1);
+            assert!(parsed.errors[0].contains("--rpc-message-updates"));
+        }
+        let parsed = super::parse_args(&[
+            "--mode=json".into(),
+            "--rpc-message-updates=snapshot".into(),
+        ]);
+        assert_eq!(parsed.mode, super::Mode::Json);
+    }
+
     use super::*;
 
     struct RestoreOfflineEnv(Option<std::ffi::OsString>);

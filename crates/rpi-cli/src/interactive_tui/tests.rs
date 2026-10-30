@@ -1,6 +1,7 @@
 use super::*;
 use rpi_tui::Component;
 
+mod autocomplete_flicker;
 mod enter_completion;
 mod session_regressions;
 
@@ -485,6 +486,7 @@ fn test_tui_state() -> Arc<TuiState> {
         history_index: std::sync::Mutex::new(-1),
         history_draft: std::sync::Mutex::new(None),
         cache_tracker: std::sync::Mutex::new(rpi_harness::cache_stats::CacheMissTracker::new()),
+        events_lagged: std::sync::atomic::AtomicBool::new(false),
         scoped_edit: std::sync::Mutex::new(None),
         markdown_transformer: Arc::new(std::sync::Mutex::new(None)),
         extension_claimed_keys: Mutex::new(Default::default()),
@@ -896,6 +898,43 @@ fn settings_menu_covers_the_wired_settings_surface() {
     assert_eq!(value("cache-miss-notices"), "false");
     assert_eq!(value("terminal-progress"), "true");
     assert_eq!(value("collapse-changelog"), "false");
+}
+
+#[test]
+fn enabling_images_on_an_unsupported_terminal_says_so() {
+    // Driven through the public setting entry point, and the expectation is
+    // derived from the same capability the note is built from, so the probe is
+    // deterministic on any developer terminal (Kitty/Ghostty/WezTerm on CI).
+    // It is a behaviour assertion, not a compile assertion: on the previous
+    // code the note is always "Inline images enabled." and the `None` cell
+    // below fails.
+    let state = test_tui_state();
+    let mut settings = crate::settings::Settings::default();
+    let supported = rpi_tui::get_capabilities().protocol != rpi_tui::ImageProtocol::None;
+
+    let note = apply_setting_change(&state, "show-images", "true", &mut settings)
+        .expect("user-visible note");
+    assert_eq!(settings.show_images, Some(true));
+    assert!(*state.show_images.lock().unwrap());
+
+    if supported {
+        assert_eq!(note, "Inline images enabled.");
+    } else {
+        assert!(
+            note.contains("cannot display them"),
+            "a terminal without an image protocol must not be told images are on: {note}"
+        );
+        assert!(
+            note.contains("placeholder"),
+            "the note must say what the user will see instead: {note}"
+        );
+    }
+
+    // Disabling never carries the capability warning: it is always accurate.
+    let note = apply_setting_change(&state, "show-images", "false", &mut settings)
+        .expect("user-visible note");
+    assert_eq!(note, "Inline images disabled.");
+    assert!(!*state.show_images.lock().unwrap());
 }
 
 #[test]
@@ -1790,6 +1829,7 @@ fn test_agent_event_mapping_creates_assistant_and_tool() {
         history_index: std::sync::Mutex::new(-1),
         history_draft: std::sync::Mutex::new(None),
         cache_tracker: std::sync::Mutex::new(rpi_harness::cache_stats::CacheMissTracker::new()),
+        events_lagged: std::sync::atomic::AtomicBool::new(false),
         scoped_edit: std::sync::Mutex::new(None),
         markdown_transformer: Arc::new(std::sync::Mutex::new(None)),
         extension_claimed_keys: Mutex::new(Default::default()),
@@ -2860,6 +2900,7 @@ fn test_autocomplete_slash_suggestions_render() {
         history_index: std::sync::Mutex::new(-1),
         history_draft: std::sync::Mutex::new(None),
         cache_tracker: std::sync::Mutex::new(rpi_harness::cache_stats::CacheMissTracker::new()),
+        events_lagged: std::sync::atomic::AtomicBool::new(false),
         scoped_edit: std::sync::Mutex::new(None),
         markdown_transformer: Arc::new(std::sync::Mutex::new(None)),
         extension_claimed_keys: Mutex::new(Default::default()),
@@ -2953,6 +2994,7 @@ fn test_select_list_swap_restores_editor() {
         history_index: std::sync::Mutex::new(-1),
         history_draft: std::sync::Mutex::new(None),
         cache_tracker: std::sync::Mutex::new(rpi_harness::cache_stats::CacheMissTracker::new()),
+        events_lagged: std::sync::atomic::AtomicBool::new(false),
         scoped_edit: std::sync::Mutex::new(None),
         markdown_transformer: Arc::new(std::sync::Mutex::new(None)),
         extension_claimed_keys: Mutex::new(Default::default()),
@@ -3049,6 +3091,7 @@ fn test_message_history_browse_restores_draft() {
         history_index: std::sync::Mutex::new(-1),
         history_draft: std::sync::Mutex::new(None),
         cache_tracker: std::sync::Mutex::new(rpi_harness::cache_stats::CacheMissTracker::new()),
+        events_lagged: std::sync::atomic::AtomicBool::new(false),
         scoped_edit: std::sync::Mutex::new(None),
         markdown_transformer: Arc::new(std::sync::Mutex::new(None)),
         extension_claimed_keys: Mutex::new(Default::default()),
@@ -3148,6 +3191,7 @@ fn test_accept_top_suggestion_replaces_prefix() {
         history_index: std::sync::Mutex::new(-1),
         history_draft: std::sync::Mutex::new(None),
         cache_tracker: std::sync::Mutex::new(rpi_harness::cache_stats::CacheMissTracker::new()),
+        events_lagged: std::sync::atomic::AtomicBool::new(false),
         scoped_edit: std::sync::Mutex::new(None),
         markdown_transformer: Arc::new(std::sync::Mutex::new(None)),
         extension_claimed_keys: Mutex::new(Default::default()),
@@ -3233,6 +3277,7 @@ fn autocomplete_test_state(max_visible: usize) -> Arc<TuiState> {
         history_index: std::sync::Mutex::new(-1),
         history_draft: std::sync::Mutex::new(None),
         cache_tracker: std::sync::Mutex::new(rpi_harness::cache_stats::CacheMissTracker::new()),
+        events_lagged: std::sync::atomic::AtomicBool::new(false),
         scoped_edit: std::sync::Mutex::new(None),
         markdown_transformer: Arc::new(std::sync::Mutex::new(None)),
         extension_claimed_keys: Mutex::new(Default::default()),
@@ -3785,7 +3830,9 @@ fn ask_user_freeform_submit_releases_dialog_locks_before_callback() {
         mailbox.poll("freeform").unwrap()["answer"]["text"],
         "自定义回答"
     );
-    assert_eq!(bridge.take_pending().unwrap().request_id, "next");
+    let next = bridge.take_pending().unwrap();
+    assert_eq!(next.raw["requestId"], "next");
+    assert_ne!(next.request_id, "next", "wire IDs are host allocated");
 }
 
 #[test]
@@ -3878,17 +3925,19 @@ fn ask_user_bridge_answers_and_cancels_by_request_id() {
         .unwrap();
 
     let first = bridge.take_pending().expect("r1 visible");
-    assert_eq!(first.request_id, "r1");
+    assert_eq!(first.raw["requestId"], "r1");
+    assert_ne!(first.request_id, "r1", "wire IDs are host allocated");
     assert!(
         bridge.take_pending().is_none(),
         "only one request occupies the input slot"
     );
-    bridge.respond("r1", serde_json::json!({"text": "7897"}));
+    bridge.respond(&first.request_id, serde_json::json!({"text": "7897"}));
     assert_eq!(mailbox.poll("r1").unwrap()["answer"]["text"], "7897");
 
     let second = bridge.take_pending().expect("r2 visible");
-    assert_eq!(second.request_id, "r2");
-    bridge.cancel("r2");
+    assert_eq!(second.raw["requestId"], "r2");
+    assert_ne!(second.request_id, first.request_id);
+    bridge.cancel(&second.request_id);
     assert_eq!(mailbox.poll("r2").unwrap()["status"], "cancelled");
 
     // cancel_all drops anything still queued.

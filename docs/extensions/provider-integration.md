@@ -14,6 +14,26 @@
 | 新协议或现有协议无法表达的请求 / 响应差异 | package 实现 `rpi_ai::Provider`，经统一 ABI 接入 |
 | 浏览器登录、device-code、token 刷新或撤销 | 另外注册 OAuth provider；推理与认证是两项独立能力 |
 
+### `openai-completions` 的 `baseUrl`
+
+使用 `models.json` 配置 `"api": "openai-completions"` 时，`baseUrl` 可以是 API 根地址，
+也可以是完整的 Chat Completions 端点。以下示例使用中性占位域名：
+
+| `baseUrl` | 实际请求端点 |
+| --- | --- |
+| `https://gateway.example/proxy` | `https://gateway.example/proxy/v1/chat/completions` |
+| `https://gateway.example/proxy/` | `https://gateway.example/proxy/v1/chat/completions` |
+| `https://gateway.example/proxy/v1` | `https://gateway.example/proxy/v1/chat/completions` |
+| `https://gateway.example/proxy/chat/completions` | `https://gateway.example/proxy/chat/completions` |
+
+如果服务的端点是 `/proxy/chat/completions`，请提供完整端点；只填 `/proxy` 会自动插入
+`/v1`。已有版本后缀的根地址（例如 `/v1`、`/v3`、`/v1beta`）只追加
+`/chat/completions`，完整端点则保持不变。
+
+此规则仅适用于 `openai-completions`；Responses 和 Anthropic provider 的路径拼接方式
+不同，不能套用上述完整端点示例。这里的地址应不含查询参数或片段：当前 helper 按字符串
+后缀处理路径，不做通用 URL 规范化。
+
 核心保留 OpenAI、Anthropic 与离线测试用的 Faux；DeepSeek 已迁到独立 `rpi-package` 项目。新增供应商适配默认放入
 独立 package，不给 CLI 增加供应商分支或默认依赖。协议兼容不等于支持该供应商的所有
 功能；README 必须列出已验证能力和限制。
@@ -148,8 +168,8 @@ Provider 负责“怎样请求模型”，auth 负责“以谁的凭据请求”
 同时实现 OAuth；API key package 声明认证策略后即可使用通用 `auth` 命令。
 
 宿主按 provider ID 解析默认凭据：选中 provider 的 `--api-key` → `auth.json` 的有效 key
-或未过期 OAuth token → `models.json` 的 `apiKey` → package 声明的环境变量 → 显式允许的匿名。
-空白值、无法解析的引用与过期 token 不算可用凭据；显式认证请求头也参与就绪判断。
+或可用 OAuth token → `models.json` 的 `apiKey` → package 声明的环境变量 → 显式允许的匿名。
+空白值、无法解析的引用与无法刷新的过期 token 不算可用凭据；显式认证请求头也参与就绪判断。
 只有内置 Anthropic、OpenAI 保留自己的默认环境变量规则；DeepSeek 也通过 package 声明认证，新 provider 不会因为
 使用 `openai-completions` 而继承 `OPENAI_API_KEY`，也不会根据 ID 自动推导环境变量名。
 
@@ -178,6 +198,12 @@ rpi auth logout --provider vendor-example
 # 尚未安装的动态库：显式路径写在 auth 子命令后
 rpi auth check --provider vendor-example --extension /path/to/provider.dll --json
 ```
+
+加载匹配 OAuth 扩展且存储项含 refresh token 时，过期凭据仍可用于选择 provider。
+宿主在每次请求前检查到期时间，在到期前 60 秒内调用扩展的 `refresh`，先保存成功结果再发送请求；
+同一进程中，同一 provider 的并发请求共享一次刷新结果；不同 provider 的刷新互不等待，即使另一个 provider 的 `refresh` 尚未返回。省略新 refresh token 时保留原值，`expires_at: 0` 表示无已知到期时间。
+刷新或保存失败会终止请求并提示重新登录，不会发送旧 token。显式 API key 保持原有优先级。
+刷新沿用同步 OAuth callback；跨进程写入锁及 OAuth callback 取消不属于此机制。
 
 `refresh` 需要对应 OAuth 实现；API key 不通过它刷新。`auth check` 只检查本地就绪状态，
 不访问服务端、不刷新 token，不能证明 key 在服务端有效。JSON 的 `source` 可能是

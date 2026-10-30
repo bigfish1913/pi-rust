@@ -1445,18 +1445,17 @@ impl Component for Editor {
         // `editor.ts:539-578`). The `EditorStyle.prompt` field is retained for
         // API compatibility but unread here.
         let content_width = width.saturating_sub(self.options.padding_x).max(1);
-        // Leave one cell for the cursor marker on the active logical line so
-        // the terminal never performs an implicit wrap at the right border.
-        let active_width = content_width.saturating_sub(1).max(1);
+        // Wrapping uses one width for every logical row, the cursor's row
+        // included. Reserving the cursor cell per-row used to make the wrap
+        // point depend on where the caret happened to be: the same text
+        // reflowed one column earlier while it was being edited and again
+        // after the caret moved away. Upstream keeps a single `layoutWidth`
+        // for the same reason (`editor.ts:489`). The one cell the caret needs
+        // is taken from layout width once, here, so it is spent identically
+        // whether or not the row carries the caret.
+        let layout_width = content_width.saturating_sub(1).max(1);
         for (row_idx, line) in state.lines.iter().enumerate() {
-            let ranges = wrap_line_ranges(
-                line,
-                if row_idx == state.cursor_row {
-                    active_width
-                } else {
-                    content_width
-                },
-            );
+            let ranges = wrap_line_ranges(line, layout_width);
             for (chunk_start, chunk_end) in ranges {
                 let chunk = &line[chunk_start..chunk_end];
                 // Placeholder (dim) only on the single empty line at the cursor —
@@ -1490,22 +1489,17 @@ impl Component for Editor {
                 let visible_w = crate::ansi::visible_width(&content);
                 // Pad the line out to the full width (left padding + content +
                 // right padding) so the border box has a uniform interior width
-                // (mirrors editor.ts:522-578).
+                // (mirrors editor.ts:522-578). The caret's cell is reserved by
+                // `layout_width`, so every row — caret row included — pads to
+                // the same right edge; trimming this row instead would leave a
+                // one-column notch that moves as the caret moves.
                 let right_pad = " ".repeat(
                     width
                         .saturating_sub(self.options.padding_x)
                         .saturating_sub(visible_w),
                 );
-                let right_pad_cursor = if state.focused && row_idx == state.cursor_row {
-                    right_pad
-                        .get(..right_pad.len().saturating_sub(1))
-                        .unwrap_or("")
-                        .to_string()
-                } else {
-                    right_pad
-                };
 
-                let mut rendered = format!("{pad}{content}{right_pad_cursor}");
+                let mut rendered = format!("{pad}{content}{right_pad}");
 
                 // Cursor marker if this focused row holds the cursor. `cursor_col`
                 // is a byte offset into `line`; the rendered prefix up to the caret
@@ -2417,6 +2411,109 @@ l12",
         let rendered = crate::ansi::strip_ansi(&lines.join("\n"));
         assert!(rendered.contains("1234567"));
         assert!(rendered.contains("90123456"));
+    }
+
+    /// The wrap point must not depend on where the caret is.
+    ///
+    /// Reserving the cursor cell inside the *wrapping* width for the caret's
+    /// row only made the same text reflow one column earlier while it was
+    /// being edited than after the caret moved away — the row grew a line, the
+    /// dock changed height and the transcript jumped. Upstream avoids this by
+    /// computing one `layoutWidth` for every row (`editor.ts:489`).
+    #[test]
+    fn wrap_and_height_are_independent_of_the_cursor_row() {
+        for padding_x in [0usize, 1, 2] {
+            for width in [10usize, 13, 40] {
+                let editor = Editor::new(
+                    EditorOptions {
+                        padding_x,
+                        ..Default::default()
+                    },
+                    EditorStyle::default(),
+                    Arc::new(Keybindings::new()),
+                );
+                editor.set_focused(true);
+                let content_width = width.saturating_sub(padding_x).max(1);
+                // `content_width - 1` is the widest wrap that still leaves the
+                // caret a cell; the two lengths around it straddle the boundary
+                // where a caret-sensitive width would flip the height.
+                for len in [content_width - 2, content_width - 1, content_width] {
+                    let text = "x".repeat(len);
+                    let on_caret_row = {
+                        editor.set_text(&text);
+                        editor.set_cursor(0, len);
+                        editor.render(width).len()
+                    };
+                    let off_caret_row = {
+                        // Same logical line, caret parked on a second line so
+                        // row 0 renders without it.
+                        editor.set_text(&format!("{text}\nz"));
+                        editor.set_cursor(1, 1);
+                        editor.render(width).len() - 1
+                    };
+                    assert_eq!(
+                        on_caret_row, off_caret_row,
+                        "padding_x={padding_x} width={width} len={len}: the caret row wrapped "
+                    );
+                    let rows = {
+                        editor.set_text(&text);
+                        editor.set_cursor(0, len);
+                        editor.render(width)
+                    };
+                    for row in &rows {
+                        assert!(
+                            crate::ansi::visible_width(row) <= width,
+                            "padding_x={padding_x} width={width} len={len}: row escaped the box: {row:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every interior row must reach the same right edge, caret row included.
+    ///
+    /// The caret's cell was reserved *twice* for the row holding it — once by
+    /// the wrap width and once by trimming its right padding — which left that
+    /// row one column short of the box. The notch moved with the caret, so the
+    /// border's right edge visibly stepped in and out while typing.
+    #[test]
+    fn the_caret_row_reaches_the_same_right_edge_as_the_other_rows() {
+        for padding_x in [0usize, 1, 3] {
+            let editor = Editor::new(
+                EditorOptions {
+                    padding_x,
+                    ..Default::default()
+                },
+                EditorStyle::default(),
+                Arc::new(Keybindings::new()),
+            );
+            editor.set_focused(true);
+            let width = 20;
+            editor.set_text("hi\nthere");
+            // Caret on row 1: row 0 is then an ordinary row in the same frame,
+            // so both edges are measured against the same render call.
+            editor.set_cursor(1, 5);
+            let lines = editor.render(width);
+            let interior: Vec<usize> = lines[1..lines.len() - 1]
+                .iter()
+                .map(|line| crate::ansi::visible_width(line))
+                .collect();
+            assert_eq!(
+                interior,
+                vec![width, width],
+                "padding_x={padding_x}: rows of one frame must share a right edge"
+            );
+
+            // And the caret row's marker stays strictly inside the box.
+            let position = crate::extract_cursor_position(&lines, lines.len())
+                .expect("the caret row carries a marker");
+            assert!(
+                position.1 < width,
+                "padding_x={padding_x}: caret column {} must stay inside a {width}-wide box",
+                position.1
+            );
+        }
     }
 
     #[test]

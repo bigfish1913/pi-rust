@@ -470,12 +470,21 @@ impl Session {
             })?;
             assert_json_serializable(&value)?;
         }
-        let result = self
-            .storage_arc()
-            .append_record_and_entry(record, entry, lane)
-            .await?;
-        self.publish_entry_commit(&result.1, lane);
-        Ok(result)
+        let storage = self.storage_arc();
+        let entry_id = entry.id.clone();
+        let was_absent = self
+            .batch_entry_was_absent(storage.as_ref(), &entry_id)
+            .await;
+        let result = storage.append_record_and_entry(record, entry, lane).await;
+        self.publish_batch_commit(
+            storage.as_ref(),
+            &entry_id,
+            was_absent,
+            result.as_ref().ok().map(|(_, entry)| entry),
+            lane,
+        )
+        .await;
+        result
     }
 
     /// Append a record, an entry, and a following record in that exact order.
@@ -496,12 +505,23 @@ impl Session {
             })?;
             assert_json_serializable(&value)?;
         }
-        let result = self
-            .storage_arc()
+        let storage = self.storage_arc();
+        let entry_id = entry.id.clone();
+        let was_absent = self
+            .batch_entry_was_absent(storage.as_ref(), &entry_id)
+            .await;
+        let result = storage
             .append_record_entry_and_record(before, entry, lane, after)
-            .await?;
-        self.publish_entry_commit(&result.1, lane);
-        Ok(result)
+            .await;
+        self.publish_batch_commit(
+            storage.as_ref(),
+            &entry_id,
+            was_absent,
+            result.as_ref().ok().map(|(_, entry, _)| entry),
+            lane,
+        )
+        .await;
+        result
     }
 
     /// Append a batch of records through the active storage backend.
@@ -728,8 +748,40 @@ impl Session {
         result
     }
 
-    /// Publish only after the storage operation succeeds. All entry-writing
-    /// paths, including record/entry batches, use the storage-stamped metadata.
+    /// Only observers need the preflight read. Some backends use the ordered
+    /// fallback rather than an atomic transaction, so a later record can fail
+    /// after the entry has committed. Remember whether this id was absent to
+    /// avoid reporting an old entry when a duplicate-id append is refused.
+    async fn batch_entry_was_absent(&self, storage: &dyn SessionStorage, id: &str) -> bool {
+        let observed = self
+            .binding
+            .read()
+            .unwrap()
+            .entry_commit_publisher
+            .is_some();
+        observed && matches!(storage.get_entry(id).await, Ok(None))
+    }
+
+    async fn publish_batch_commit(
+        &self,
+        storage: &dyn SessionStorage,
+        id: &str,
+        was_absent: bool,
+        committed: Option<&Entry>,
+        lane: &str,
+    ) {
+        if let Some(entry) = committed {
+            self.publish_entry_commit(entry, lane);
+        } else if was_absent {
+            // Preserve the original batch error. If the backend is unreadable,
+            // do not invent a commit; a recovery read is best-effort.
+            if let Ok(Some(entry)) = storage.get_entry(id).await {
+                self.publish_entry_commit(&entry, lane);
+            }
+        }
+    }
+
+    /// Publish confirmed entry commits using storage-stamped metadata.
     fn publish_entry_commit(&self, entry: &Entry, lane: &str) {
         let publisher = self.binding.read().unwrap().entry_commit_publisher.clone();
         if let Some(publisher) = publisher {
@@ -1033,6 +1085,77 @@ mod tests {
             outcome: OperationOutcome::Completed,
             error: None,
         })
+    }
+
+    #[tokio::test]
+    async fn rejected_duplicate_batch_does_not_notify_an_existing_entry() {
+        for with_after in [false, true] {
+            let session = fixture_session();
+            let entry = || ProvisionedEntry {
+                id: "existing".into(),
+                kind: ProvisionedKind::Message {
+                    message: user("old"),
+                    terminate: None,
+                },
+            };
+            session.append_entry(entry(), "main").await.unwrap();
+            let (publisher, mut events) = broadcast::channel(4);
+            session.set_entry_commit_publisher(Some(publisher));
+            let before = notification_record("notification-op");
+            let result = if with_after {
+                session
+                    .append_record_entry_and_record(before, entry(), "main", notification_finish())
+                    .await
+                    .map(|_| ())
+            } else {
+                session
+                    .append_record_and_entry(before, entry(), "main")
+                    .await
+                    .map(|_| ())
+            };
+            assert!(result.is_err());
+            assert!(matches!(
+                events.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_batch_failure_still_notifies_committed_entry() {
+        let session = fixture_session();
+        let (publisher, mut events) = broadcast::channel(4);
+        session.set_entry_commit_publisher(Some(publisher));
+        let mut after = notification_finish();
+        if let LaneRecord::OperationFinished(record) = &mut after {
+            record.base.id = "notification-op".into(); // Reject only the final record.
+        }
+        let result = session
+            .append_record_entry_and_record(
+                notification_record("notification-op"),
+                ProvisionedEntry {
+                    id: "actually-committed".into(),
+                    kind: ProvisionedKind::Message {
+                        message: user("saved"),
+                        terminate: None,
+                    },
+                },
+                "main",
+                after,
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(
+            session
+                .view("main")
+                .get_entry("actually-committed")
+                .await
+                .unwrap()
+                .is_some(),
+            "default storage fallback has already committed the entry"
+        );
+        let event = events.try_recv().expect("an entry that exists must not be omitted from invalidation just because the following record failed");
+        assert_eq!(event.entry_id, "actually-committed");
     }
 
     #[tokio::test]

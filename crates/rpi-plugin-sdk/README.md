@@ -47,6 +47,38 @@ The macro emits the `rpi_plugin_register` symbol. The version lives *inside* the
 `PluginApi` struct (`abi_version`, `struct_size`) rather than in the symbol name,
 so the entrypoint signature does not change when the struct grows.
 
+## Tool prompt metadata
+
+Like pi, a tool's provider-facing schema and its system-prompt contributions
+are independent. After registering a tool, optionally register `promptSnippet`
+and `promptGuidelines` through the appended `PluginApi::register_tool_prompt` slot:
+
+```rust,ignore
+if let Some(register_prompt) = api.register_tool_prompt {
+    let status = register_prompt(
+        StbStringRef::from_str("my_tool"),
+        StbStringRef::from_str(r#"{"promptSnippet":"Brief tool summary","promptGuidelines":["Use my_tool for its specific purpose"]}"#),
+    );
+    if status != 0 { return status; }
+}
+```
+
+The tool must already exist in the registering plugin's local registry. The host
+copies the borrowed arguments immediately. Status codes are `0` (success), `1`
+(unknown tool), `2` (invalid metadata object), and `-1` (outside registration).
+Missing fields default to no contribution; an empty object clears the metadata.
+Snippets and rules are trimmed and empty entries ignored. Only active tools
+contribute; rules are deduplicated in active-tool order, even across tools and
+core rules. Rules do not require a snippet. Metadata follows the winning tool
+through name collisions, snapshots and reload; an extension replacing a built-in
+does not inherit the built-in's prompt metadata.
+
+A tool without a snippet is not repeated in the prompt's text list, but its
+schema still makes it callable. Older plugins remain compatible: neither
+`StableToolSchema` nor the ABI version changes. On older hosts the optional slot
+is `None`; skip metadata registration, **not** tool registration. The CLI does not
+invent rules for external tools (including `todo`); extensions must opt in.
+
 ## Safe plugin helpers
 
 `handles::ToolHandles<T>` keeps tool state inside the plugin and returns opaque
@@ -218,6 +250,44 @@ rules the SDK enforces:
 
 These are not stylistic preferences — violating any of them is undefined
 behaviour at the boundary.
+
+### Query custom entries with runtime actions
+
+`RuntimeActionId::GetSessionBranch` uses the same canonical query as RPC
+`get_session_branch`, without the RPC `type`/`id` envelope. For example, pass
+this JSON to the runtime-action SDK call:
+
+```rust
+let args = serde_json::json!({
+    "customTypes": ["durable-state", "other-custom-type"],
+    "afterSeq": 42,
+    "limit": 20,
+    "order": "newestFirst"
+});
+let action = rpi_plugin_sdk::RuntimeActionId::GetSessionBranch;
+// Submit `action` and `args` through the runtime_action slot.
+```
+
+`customTypes` is required and non-empty; each identifier must be non-blank.
+Identifiers match the exact stored string, preserving case and whitespace.
+The other three fields are optional;
+order defaults to `oldestFirst`. `afterSeq` is exclusive in the selected order:
+`seq > afterSeq` for `oldestFirst`, `seq < afterSeq` for `newestFirst`.
+Entries must be on the selected branch and match a requested custom
+type; ordering and limit apply globally across those types. The result is
+`{"entries":[...],"count":N,"filtered":true}`.
+
+Empty `{}`, unknown keys, and retired `customType`, `custom_type`, `custom_types`,
+or `after_seq` query keys fail explicitly, including mixed old/new requests.
+This does **not** change `AppendEntry`'s singular `customType` write argument.
+
+This query contract is a breaking change from the older unfiltered action.
+Upgrade hosts and consumers together. Consumers requiring filtered semantics
+must check for **`filtered == true`** and reject a successful response without
+that marker: older hosts can ignore the arguments and return the whole branch.
+Action ID 20 and the binary ABI/layout are unchanged, so a successful plugin
+load or ABI/size check alone does not prove support for this query contract.
+Do not silently fall back to `{}` or replay an unfiltered response.
 
 ## Compatibility
 

@@ -39,10 +39,15 @@ pub fn export_file(input: &Path, output: &Path) -> Result<(), String> {
 
     let entries = read_jsonl_session_entries(input)?;
 
+    // `--export` reads a finished session file: every message in it was accepted
+    // by storage, so there is nothing to recover here. The recovery copies only
+    // exist for a live harness (see `export_session`).
+    let unsaved: &[rpi_harness::agent_harness::UnsavedMessage] = &[];
+
     match format {
-        ExportFormat::Markdown => export_markdown(&entries, output),
-        ExportFormat::Html => export_html(&entries, output),
-        ExportFormat::Jsonl => export_jsonl(&entries, output),
+        ExportFormat::Markdown => export_markdown(&entries, unsaved, output),
+        ExportFormat::Html => export_html(&entries, unsaved, output),
+        ExportFormat::Jsonl => export_jsonl(&entries, unsaved, output),
     }
 }
 
@@ -109,14 +114,23 @@ pub async fn export_session(
         .await
         .map_err(|e| format!("Could not read session: {e}"))?;
 
+    // A refused append never becomes an entry, so the session view above cannot
+    // contain it. Append the harness's recovery copies: the warning tells the user
+    // to export before exiting, and this is what makes that promise true.
+    let unsaved = harness.unsaved_messages();
+
     match format {
-        ExportFormat::Markdown => export_markdown(&entries, output_path),
-        ExportFormat::Html => export_html(&entries, output_path),
-        ExportFormat::Jsonl => export_jsonl(&entries, output_path),
+        ExportFormat::Markdown => export_markdown(&entries, &unsaved, output_path),
+        ExportFormat::Html => export_html(&entries, &unsaved, output_path),
+        ExportFormat::Jsonl => export_jsonl(&entries, &unsaved, output_path),
     }
 }
 
-fn export_markdown(entries: &[Entry], output_path: &Path) -> Result<(), String> {
+fn export_markdown(
+    entries: &[Entry],
+    unsaved: &[rpi_harness::agent_harness::UnsavedMessage],
+    output_path: &Path,
+) -> Result<(), String> {
     let mut md = String::from("# Session\n\n");
     for e in entries {
         if let Entry::Message(me) = e {
@@ -135,10 +149,46 @@ fn export_markdown(entries: &[Entry], output_path: &Path) -> Result<(), String> 
             }
         }
     }
+    // Messages the session never accepted, appended last: they are the most
+    // recent turns, and a refused write is exactly the content that exists
+    // nowhere else.
+    if !unsaved.is_empty() {
+        md.push_str("# Not saved\n\n");
+        md.push_str(
+            "These messages are missing from the session log because saving them was \
+             refused. They are reproduced here so this export is the complete \
+             conversation.\n\n",
+        );
+        for failure in unsaved {
+            append_unsaved_markdown(&mut md, &failure.message);
+        }
+    }
     std::fs::write(output_path, md).map_err(|e| format!("Could not write markdown export: {e}"))
 }
 
-fn export_html(entries: &[Entry], output_path: &Path) -> Result<(), String> {
+/// Render one recovery-copied message into a markdown export.
+fn append_unsaved_markdown(md: &mut String, message: &rpi_agent::AgentMessage) {
+    match message {
+        rpi_agent::AgentMessage::User(u) => {
+            md.push_str(&format!("## User\n\n{}\n\n", user_message_text(u)));
+        }
+        rpi_agent::AgentMessage::Assistant(a) => {
+            let text = assistant_text(a);
+            if !text.is_empty() {
+                md.push_str(&format!("## Assistant\n\n{text}\n\n"));
+            }
+        }
+        other => {
+            md.push_str(&format!("## Message\n\n```text\n{other:?}\n```\n\n"));
+        }
+    }
+}
+
+fn export_html(
+    entries: &[Entry],
+    unsaved: &[rpi_harness::agent_harness::UnsavedMessage],
+    output_path: &Path,
+) -> Result<(), String> {
     let mut html = String::from(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -191,16 +241,75 @@ fn export_html(entries: &[Entry], output_path: &Path) -> Result<(), String> {
         }
     }
 
+    if !unsaved.is_empty() {
+        html.push_str(
+            r#"<h2>Not saved</h2>
+<p>These messages are missing from the session log because saving them was refused. They are reproduced here so this export is the complete conversation.</p>
+"#,
+        );
+        for failure in unsaved {
+            match &failure.message {
+                rpi_agent::AgentMessage::User(u) => {
+                    html.push_str(&format!(
+                        r#"<div class="message user">
+    <div class="role">User</div>
+    <div>{}</div>
+</div>"#,
+                        escape_html(&user_message_text(u))
+                    ));
+                }
+                rpi_agent::AgentMessage::Assistant(a) => {
+                    let text = assistant_text(a);
+                    if !text.is_empty() {
+                        html.push_str(&format!(
+                            r#"<div class="message assistant">
+    <div class="role">Assistant</div>
+    <div>{}</div>
+</div>"#,
+                            escape_html(&text)
+                        ));
+                    }
+                }
+                other => {
+                    html.push_str(&format!(
+                        r#"<div class="message assistant">
+    <div class="role">Message</div>
+    <pre>{}</pre>
+</div>"#,
+                        escape_html(&format!("{other:?}"))
+                    ));
+                }
+            }
+        }
+    }
+
     html.push_str("\n</body>\n</html>");
 
     std::fs::write(output_path, html).map_err(|e| format!("Could not write HTML export: {e}"))
 }
 
-fn export_jsonl(entries: &[Entry], output_path: &Path) -> Result<(), String> {
+fn export_jsonl(
+    entries: &[Entry],
+    unsaved: &[rpi_harness::agent_harness::UnsavedMessage],
+    output_path: &Path,
+) -> Result<(), String> {
     let mut jsonl = String::new();
     for e in entries {
         let json = serde_json::to_string(e)
             .map_err(|e| format!("Could not serialize entry to JSON: {e}"))?;
+        jsonl.push_str(&json);
+        jsonl.push('\n');
+    }
+    // A JSONL export is a machine-readable stream, so the recovery copies are
+    // written as messages with an explicit marker rather than a comment line:
+    // the consumer can then tell an unsaved turn from a persisted one.
+    for failure in unsaved {
+        let json = serde_json::to_string(&serde_json::json!({
+            "type": "unsaved_message",
+            "reason": failure.what,
+            "message": failure.message,
+        }))
+        .map_err(|e| format!("Could not serialize unsaved message to JSON: {e}"))?;
         jsonl.push_str(&json);
         jsonl.push('\n');
     }
@@ -355,6 +464,53 @@ mod tests {
         assert_eq!(parsed.len(), 2);
     }
 
+    /// The write-failure warning tells the user to export before exiting, and
+    /// JSONL storage applies an entry only after the append succeeds — so a
+    /// refused message exists nowhere the session-backed export can read. This
+    /// drives the production export with a recovery copy present and asserts the
+    /// file actually contains the refused text, in every format.
+    #[test]
+    fn a_refused_write_reaches_the_export_through_the_recovery_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let message = rpi_agent::AgentMessage::User(rpi_ai::types::UserMessage {
+            role: rpi_ai::types::UserRole,
+            content: rpi_ai::types::UserContent::Text("only on screen".into()),
+            timestamp: 0,
+        });
+        let unsaved = vec![rpi_harness::agent_harness::UnsavedMessage {
+            message,
+            what: "a message you sent".to_string(),
+            at: 0,
+            session_id: "sess".to_string(),
+            lane: "main".to_string(),
+        }];
+
+        let md_path = dir.path().join("out.md");
+        export_markdown(&[], &unsaved, &md_path).unwrap();
+        let md = std::fs::read_to_string(&md_path).unwrap();
+        assert!(md.contains("only on screen"), "{md}");
+        assert!(
+            md.contains("Not saved"),
+            "the export must say the message is not in the session log: {md}"
+        );
+
+        let html_path = dir.path().join("out.html");
+        export_html(&[], &unsaved, &html_path).unwrap();
+        let html = std::fs::read_to_string(&html_path).unwrap();
+        assert!(html.contains("only on screen"), "{html}");
+        assert!(html.trim_end().ends_with("</html>"), "{html}");
+
+        let jsonl_path = dir.path().join("out.jsonl");
+        export_jsonl(&[], &unsaved, &jsonl_path).unwrap();
+        let jsonl = std::fs::read_to_string(&jsonl_path).unwrap();
+        let line: serde_json::Value = serde_json::from_str(jsonl.lines().next().unwrap()).unwrap();
+        assert_eq!(line["type"], "unsaved_message", "{jsonl}");
+        assert_eq!(
+            line["message"]["content"], "only on screen",
+            "the machine-readable export must carry the message body: {jsonl}"
+        );
+    }
+
     #[test]
     fn export_file_rejects_a_non_session_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -363,5 +519,34 @@ mod tests {
         let out = dir.path().join("out.md");
         let err = export_file(&bogus, &out).unwrap_err();
         assert!(err.contains("not a JSONL v4 session file"), "{err}");
+    }
+
+    /// The maintainer's isolation probe, verbatim in shape: preload a recovery
+    /// copy for session A through the test hook, switch to an empty ephemeral
+    /// session B, export B through the production `export_session` — the file
+    /// must not contain A's refused content. Combined with the harness-side
+    /// `review_session_switch_does_not_expose_previous_session_recovery`, this
+    /// pins both ends of the isolation contract (scoped reader + real switch).
+    #[tokio::test]
+    async fn review_session_switch_does_not_export_previous_session_recovery() {
+        let harness = AgentHarness::create(Default::default()).await.unwrap();
+        harness.keep_unsaved_message_for_test(
+            "old session message",
+            rpi_agent::AgentMessage::User(rpi_ai::types::UserMessage::new("SESSION_A_SECRET", 1)),
+        );
+        harness
+            .set_session(crate::session::ephemeral_session())
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("session-b.md");
+        export_session(&harness, ExportFormat::Markdown, &output)
+            .await
+            .unwrap();
+        let text = std::fs::read_to_string(output).unwrap();
+        assert!(
+            !text.contains("SESSION_A_SECRET"),
+            "session B export leaked session A's recovery data: {text}"
+        );
     }
 }

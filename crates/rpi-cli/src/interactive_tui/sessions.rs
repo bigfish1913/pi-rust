@@ -129,12 +129,13 @@ pub(super) async fn switch_to_session(
     }
     let cwd_str = cwd.to_string_lossy().to_string();
     match crate::session::open_session_by_id_in_dir(id, &cwd_str, &state.session_dir).await {
-        Ok(new_session) => {
+        Ok(restored) => {
             // Route through the funnel so the plugin channels follow the swap;
             // a bare `set_session` would leave every plugin naming the session
             // it was serving before this call.
             if let Err(error) =
-                crate::session::set_active_session(harness, new_session, Some(tool_context)).await
+                crate::session::set_active_session(harness, restored.session, Some(tool_context))
+                    .await
             {
                 add_error_message(chat, &format!("Could not switch session: {error}"));
                 state.set_status(RunStatus::Idle);
@@ -160,6 +161,27 @@ pub(super) async fn switch_to_session(
             .await;
             state.set_status(RunStatus::Idle);
             add_note_message(chat, &format!("Switched to session {id}."));
+            // The tools' working directory is fixed by the run that built them;
+            // a hot-switch cannot move it (that would take a reload-level
+            // rebuild of the tool env, system prompt, and project resources).
+            // Say where the session belongs instead of implying the move.
+            match &restored.recorded_cwd {
+                Some(dir) if dir != cwd => add_note_message(
+                    chat,
+                    &format!(
+                        "This session was created in {}. Tools still run in {}; \
+                         restart rpi in that directory to work there.",
+                        dir.display(),
+                        cwd.display()
+                    ),
+                ),
+                None => add_note_message(
+                    chat,
+                    "This session's recorded directory no longer exists; \
+                     tools keep using the current one.",
+                ),
+                _ => {}
+            }
             true
         }
         Err(e) => {
@@ -686,6 +708,14 @@ pub(super) async fn render_session_history(
         // Spacer(1), so an extra would double the bottom gap.
     }
     if let Some(footer) = footer {
+        // The session's own name, which `/name` (and a session created by an
+        // extension) records in the log. `reset_session_counters` cleared the
+        // slot before this replay ran, so without this a switch to a named
+        // session left line 1 blank. Independent of the usage gate below: a
+        // session with no recorded turns can still be named.
+        if let Ok(name) = harness.get_name().await {
+            footer.set_session_name(name.as_deref());
+        }
         // Only restore when the session actually recorded usage; a fresh or
         // metadata-only session must not overwrite the live counters.
         if restored_input > 0 || restored_output > 0 || restored_cost > 0.0 {

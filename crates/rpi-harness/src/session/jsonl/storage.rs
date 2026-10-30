@@ -116,6 +116,19 @@ impl Clone for JsonlSessionStorage {
 }
 
 impl JsonlSessionStorage {
+    /// Replace the append handle. Test-only: lets a probe make the backend
+    /// refuse or tear a write without a real disk fault.
+    #[cfg(test)]
+    pub fn install_append_handle(&self, handle: Box<dyn rpi_tools::env::AppendFile>) {
+        // The handle can only be swapped while nothing is writing, which is
+        // always true at the point a probe installs one.
+        let mut slot = self
+            .append
+            .try_lock()
+            .expect("install_append_handle requires an idle append slot");
+        *slot = Some(handle);
+    }
+
     /// Detached owner: cancellation of a caller cannot skip append + reducer commit.
     async fn run_owned<T, F, Fut>(&self, op: F) -> SessionResult<T>
     where

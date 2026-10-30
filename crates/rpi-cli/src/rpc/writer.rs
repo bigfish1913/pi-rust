@@ -6,26 +6,23 @@ use tokio::sync::Mutex;
 struct EventProjector;
 
 impl EventProjector {
-    fn project(&mut self, event: &rpi_agent::events::AgentEvent) -> Vec<u8> {
-        let value = super::events::project(event);
-        let assistant =
-            value["message"]["role"] == "assistant" || value["message"]["kind"] == "assistant";
-        // AssistantMessage.message_id is allocated by the native agent loop at
-        // message creation and is persisted with the transcript. Never derive
-        // an ACP identity from the live event ordinal: replay and live must use
-        // the same ID, including after aborts, branching, or restarts.
+    fn project(&mut self, event: &rpi_agent::events::AgentEvent, mode: crate::args::RpcMessageUpdates) -> Vec<u8> {
+        // IDs belong to the native message/entry, never a live-event ordinal.
+        // Inspect identity directly: compact deltas must not serialize snapshots.
         let id = match event {
-            rpi_agent::events::AgentEvent::MessageStart { message_id, .. }
-            | rpi_agent::events::AgentEvent::MessageUpdate { message_id, .. }
-            | rpi_agent::events::AgentEvent::MessageEnd { message_id, .. } => message_id.as_deref(),
+            rpi_agent::events::AgentEvent::MessageStart { message_id, message }
+            | rpi_agent::events::AgentEvent::MessageEnd { message_id, message } => {
+                message_id.as_deref().or_else(|| match message {
+                    rpi_agent::AgentMessage::Assistant(message) => message.message_id.as_deref(),
+                    _ => None,
+                })
+            }
+            rpi_agent::events::AgentEvent::MessageUpdate { message_id, message, .. } => {
+                message_id.as_deref().or(message.message_id.as_deref())
+            }
             _ => None,
-        }
-        .or_else(|| {
-            assistant
-                .then(|| value["message"]["messageId"].as_str())
-                .flatten()
-        });
-        super::events::encode_with_message_id(event, id).unwrap_or_else(|_| b"null".to_vec())
+        };
+        super::events::encode_with_message_id(event, id, mode).unwrap_or_else(|_| b"null".to_vec())
     }
 }
 
@@ -34,10 +31,21 @@ pub(crate) struct RpcWriter {
     sender: tokio::sync::mpsc::Sender<Vec<u8>>,
     projector: Arc<Mutex<EventProjector>>,
     failed: tokio_util::sync::CancellationToken,
+    mode: crate::args::RpcMessageUpdates,
 }
 
-pub(crate) fn start_rpc_writer<W: Write + Send + 'static>(
+#[cfg(test)]
+pub(crate) fn start_rpc_writer<W: Write + Send + 'static>(output: W) -> (
+    RpcWriter,
+    tokio::task::JoinHandle<std::io::Result<()>>,
+    tokio_util::sync::CancellationToken,
+) {
+    start_rpc_writer_with_mode(output, Default::default())
+}
+
+pub(crate) fn start_rpc_writer_with_mode<W: Write + Send + 'static>(
     output: W,
+    mode: crate::args::RpcMessageUpdates,
 ) -> (
     RpcWriter,
     tokio::task::JoinHandle<std::io::Result<()>>,
@@ -65,6 +73,7 @@ pub(crate) fn start_rpc_writer<W: Write + Send + 'static>(
             sender: tx,
             projector: Arc::new(Mutex::new(EventProjector)),
             failed: failed.clone(),
+            mode,
         },
         task,
         failed,
@@ -124,7 +133,7 @@ impl RpcWriter {
     pub(crate) async fn write_agent_event(&self, event: &rpi_agent::events::AgentEvent) {
         if self.is_failed() { return; }
         let mut projector = self.projector.lock().await;
-        let mut line = projector.project(event);
+        let mut line = projector.project(event, self.mode);
         line.push(b'\n');
         let _ = self.enqueue(line).await;
     }
@@ -244,6 +253,52 @@ mod tests {
         assert_eq!(*bytes.lock().unwrap(), expected);
     }
 
+    #[test]
+    fn native_message_identity_survives_both_update_modes() {
+        use crate::args::RpcMessageUpdates::{CompactDeltas, Snapshot};
+        use rpi_agent::{events::AgentEvent, AgentMessage};
+        use rpi_ai::{Api, AssistantMessage, AssistantMessageEvent, Content};
+
+        let mut message = AssistantMessage::empty(Api::Faux, "faux", "m", 42);
+        message.message_id = Some("native-assistant-id".into());
+        message.content = vec![Content::text("reply")];
+        let message = Arc::new(message);
+        for mode in [CompactDeltas, Snapshot] {
+            // The writer must use durable native identity even when the outer
+            // event lacks it, and must not manufacture IDs from event order.
+            let events = [
+                AgentEvent::MessageStart {
+                    message_id: None,
+                    message: AgentMessage::Assistant(Box::new((*message).clone())),
+                },
+                AgentEvent::MessageUpdate {
+                    message_id: None,
+                    message: message.clone(),
+                    assistant_message_event: AssistantMessageEvent::TextDelta {
+                        content_index: 0,
+                        delta: "reply".into(),
+                        partial: message.clone(),
+                    },
+                },
+                AgentEvent::MessageEnd {
+                    message_id: None,
+                    message: AgentMessage::Assistant(Box::new((*message).clone())),
+                },
+            ];
+            let mut projector = EventProjector;
+            for (index, event) in events.iter().enumerate() {
+                let value: serde_json::Value =
+                    serde_json::from_slice(&projector.project(event, mode)).unwrap();
+                if index == 1 && mode == CompactDeltas {
+                    assert_eq!(value["messageId"], "native-assistant-id");
+                    assert!(value.get("message").is_none());
+                } else {
+                    assert_eq!(value["message"]["messageId"], "native-assistant-id");
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn bounded_enqueue_closed_receiver_signals_failure() {
         let (sender, receiver) = tokio::sync::mpsc::channel(64);
@@ -252,6 +307,7 @@ mod tests {
             sender,
             projector: Arc::new(Mutex::new(EventProjector)),
             failed: failed.clone(),
+            mode: Default::default(),
         };
         drop(receiver);
         let error = writer

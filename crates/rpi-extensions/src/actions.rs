@@ -598,7 +598,13 @@ pub trait RuntimeActionHost: Send + Sync {
         Err("ChildAgent is not supported by this host".into())
     }
 
-    /// `GetSessionBranch` — current main branch entries, oldest-first.
+    /// `GetSessionBranch` — query custom entries on the current main branch.
+    /// Required: non-empty `customTypes` string array. Optional: `afterSeq`
+    /// (exclusive), `limit` (positive), `order` (`oldestFirst` default or
+    /// `newestFirst`). Unknown/legacy keys and unfiltered `{}` are rejected.
+    /// Sorting/limit apply globally across the requested types; identifiers
+    /// match exactly. Consumers must require `filtered == true` in the reply
+    /// rather than accepting an older host's unfiltered successful response.
     async fn get_session_branch(
         &self,
         _args: serde_json::Value,

@@ -35,12 +35,15 @@ use crate::truncate::{format_size, TruncationResult, DEFAULT_MAX_BYTES, DEFAULT_
 /// Throttle window for bash `on_update` flushes. Mirrors `BASH_UPDATE_THROTTLE_MS`.
 const BASH_UPDATE_THROTTLE_MS: u64 = 2_000;
 
+/// Default Bash deadline when neither the caller nor the host specifies one.
+pub const DEFAULT_BASH_TIMEOUT_SECONDS: f64 = 120.0;
+
 /// Input for the bash tool. Mirrors TS `BashToolInput`. `timeout` is in seconds.
 #[derive(Debug, Clone, JsonSchema, Deserialize)]
 pub struct BashInput {
     /// Bash command to execute.
     pub command: String,
-    /// Timeout in seconds (optional, no default timeout).
+    /// Timeout in seconds (optional; uses the host default, otherwise 120 seconds).
     #[serde(default)]
     pub timeout: Option<f64>,
 }
@@ -74,9 +77,8 @@ pub struct BashToolOptions {
     /// Prepended to the command (separated by `\n`) before execution.
     pub command_prefix: Option<String>,
     /// Fallback timeout in seconds applied when the model doesn't pass one.
-    /// pi has no default, but a model that forgets `timeout` can hang the run
-    /// forever (reported as "卡住") — rpi injects this at the harness build
-    /// site. A model-supplied timeout still wins.
+    /// `None` uses `DEFAULT_BASH_TIMEOUT_SECONDS`, not an unlimited deadline.
+    /// A model-supplied timeout still wins.
     pub default_timeout: Option<f64>,
     /// Optional async hook that can adjust command, cwd, and environment.
     pub prepare: Option<BashPrepare>,
@@ -91,20 +93,20 @@ pub struct BashTool {
 }
 
 impl BashTool {
-    fn schema() -> Tool {
-        let params = schemars::schema_for!(BashInput);
+    fn schema(default_timeout: f64) -> Tool {
+        let mut params = serde_json::to_value(schemars::schema_for!(BashInput)).unwrap_or_default();
+        params["properties"]["timeout"]["description"] =
+            format!("Timeout in seconds (optional, defaults to {default_timeout} seconds).").into();
         Tool {
             name: "bash".to_string(),
             description: format!(
                 "Execute a Bash command in the current working directory using Bash/POSIX syntax, even on Windows. PowerShell cmdlets (Get-ChildItem, Select-Object, Select-String) are not valid here; use ls, find, rg, and POSIX pipelines instead. Returns stdout and \
                  stderr. Output is truncated to last {DEFAULT_MAX_LINES} lines or {kb}KB \
                  (whichever is hit first). If truncated, full output is saved to a temp file. \
-                 Optionally provide a timeout in seconds.",
+                 Defaults to a {default_timeout}-second timeout; provide timeout in seconds to override it.",
                 kb = DEFAULT_MAX_BYTES / 1024
             ),
-            parameters: rpi_ai::types::Schema::new(
-                serde_json::to_value(params).unwrap_or_default(),
-            ),
+            parameters: rpi_ai::types::Schema::new(params),
             constrained_sampling: Some(ConstrainedSamplingConfig::JsonSchema {
                 strict: ConstrainedStrictness::Prefer,
             }),
@@ -117,10 +119,15 @@ pub fn create_bash_tool(
     context: &ExecutionToolContext,
     options: Option<BashToolOptions>,
 ) -> Arc<dyn AgentTool> {
+    let options = options.unwrap_or_default();
     Arc::new(BashTool {
-        schema: BashTool::schema(),
+        schema: BashTool::schema(
+            options
+                .default_timeout
+                .unwrap_or(DEFAULT_BASH_TIMEOUT_SECONDS),
+        ),
         env: context.env().clone(),
-        options: options.unwrap_or_default(),
+        options,
     })
 }
 
@@ -142,7 +149,10 @@ impl AgentTool for BashTool {
     ) -> Result<AgentToolResult, AgentError> {
         let input: BashInput = serde_json::from_value(params)
             .map_err(|e| AgentError::Validation(format!("bash input invalid: {e}")))?;
-        validate_timeout(input.timeout)?;
+        let timeout = Some(resolve_timeout(
+            input.timeout,
+            self.options.default_timeout,
+        )?);
         let mut execution = BashExecution {
             command: match &self.options.command_prefix {
                 Some(p) => format!("{p}\n{}", input.command),
@@ -156,7 +166,6 @@ impl AgentTool for BashTool {
             prepare(&mut execution).await.map_err(AgentError::Tool)?;
         }
         let command = execution.command;
-        let timeout = input.timeout.or(self.options.default_timeout);
 
         // Initial empty update (mirrors TS `onUpdate?.({ content: [], details: undefined })`).
         emit_update(&on_update, String::new(), None, None);
@@ -402,11 +411,11 @@ fn build_bash_output(capture: &ShellCaptureResult) -> (String, BashToolDetails) 
     (output_text, details)
 }
 
-/// Validate a timeout (seconds). Mirrors `validateTimeout`.
-fn validate_timeout(timeout: Option<f64>) -> Result<(), AgentError> {
-    let Some(secs) = timeout else {
-        return Ok(());
-    };
+/// Resolve and validate the effective deadline before preparing a command.
+fn resolve_timeout(timeout: Option<f64>, default_timeout: Option<f64>) -> Result<f64, AgentError> {
+    let secs = timeout
+        .or(default_timeout)
+        .unwrap_or(DEFAULT_BASH_TIMEOUT_SECONDS);
     if !secs.is_finite() || secs <= 0.0 {
         return Err(AgentError::Tool(
             "Invalid timeout: must be a finite number of seconds".into(),
@@ -418,9 +427,41 @@ fn validate_timeout(timeout: Option<f64>) -> Result<(), AgentError> {
             "Invalid timeout: maximum is {max} seconds"
         )));
     }
-    Ok(())
+    Ok(secs)
 }
 
 fn exec_err_to_agent(e: ExecutionError) -> AgentError {
     AgentError::Tool(e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn omitted_and_null_timeout_use_tool_default() {
+        for params in [
+            serde_json::json!({ "command": "noop" }),
+            serde_json::json!({ "command": "noop", "timeout": null }),
+        ] {
+            let input: BashInput = serde_json::from_value(params).unwrap();
+            assert_eq!(resolve_timeout(input.timeout, None).unwrap(), 120.0);
+        }
+    }
+
+    #[test]
+    fn explicit_timeout_overrides_host_default() {
+        assert_eq!(resolve_timeout(None, Some(30.0)).unwrap(), 30.0);
+        assert_eq!(resolve_timeout(Some(300.0), Some(30.0)).unwrap(), 300.0);
+        assert_eq!(resolve_timeout(Some(300.0), None).unwrap(), 300.0);
+    }
+
+    #[test]
+    fn effective_timeout_must_be_valid() {
+        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY, 2_147_484.0] {
+            assert!(resolve_timeout(Some(invalid), None).is_err());
+            assert!(resolve_timeout(None, Some(invalid)).is_err());
+            assert_eq!(resolve_timeout(Some(10.0), Some(invalid)).unwrap(), 10.0);
+        }
+    }
 }

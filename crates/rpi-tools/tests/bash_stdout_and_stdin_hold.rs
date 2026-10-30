@@ -129,3 +129,34 @@ async fn a_command_that_ignores_the_timeout_is_still_killed() {
         "the timeout took {elapsed:?} to fire"
     );
 }
+
+/// Output larger than the pipe buffer (64 KiB on Linux) must be read while the
+/// command runs. Waiting for the child before reading deadlocks: the command
+/// blocks writing to a full pipe, and the reader waits for it to exit. A broad
+/// `rg` over a docs folder is enough to hit it.
+#[tokio::test]
+async fn output_larger_than_the_pipe_buffer_is_read_while_the_command_runs() {
+    let tmp = scratch("pipe-full");
+    let env = OsExecutionEnv::with_cwd(tmp.clone());
+    let started = Instant::now();
+    let result = tokio::time::timeout(
+        Duration::from_secs(20),
+        env.exec(
+            "head -c 300000 /dev/zero | tr '\\0' a; echo; head -c 300000 /dev/zero | tr '\\0' b >&2",
+            ShellExecOptions::default(),
+        ),
+    )
+    .await;
+    let elapsed = started.elapsed();
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    let output = match result {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) if error.code == ExecutionErrorCode::ShellUnavailable => return,
+        Ok(Err(error)) => panic!("exec failed: {error:?}"),
+        Err(_) => panic!("exec never returned: nothing drained the full stdout pipe"),
+    };
+    assert_eq!(output.stdout.trim_end().len(), 300_000);
+    assert_eq!(output.stderr.len(), 300_000);
+    assert!(elapsed < Duration::from_secs(5), "took {elapsed:?}");
+}

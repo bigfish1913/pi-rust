@@ -34,6 +34,10 @@ pub enum HarnessErrorTag {
     Io,
     Agent,
     Compaction,
+    /// A durable session write was refused. Distinct from `Io` so a host can tell
+    /// "the disk would not take the write" from "the provider request failed":
+    /// the user's next action differs (`/export` vs retry).
+    SessionStorage,
     /// The requested capability is recognized but not implemented in this
     /// port. Carries the deferred feature name for diagnostics.
     NotImplemented,
@@ -59,6 +63,7 @@ impl HarnessErrorTag {
             HarnessErrorTag::Io => "Io",
             HarnessErrorTag::Agent => "Agent",
             HarnessErrorTag::Compaction => "Compaction",
+            HarnessErrorTag::SessionStorage => "SessionStorage",
             HarnessErrorTag::NotImplemented => "NotImplemented",
         }
     }
@@ -147,6 +152,11 @@ pub enum HarnessError {
     Agent { message: String },
     #[error("{message}")]
     Compaction { message: String },
+    /// A durable session write the backend refused. Distinct from `Io` so a host
+    /// can tell "the disk would not take the write" from "the provider request
+    /// failed": the user's next action differs (`/export` vs retry).
+    #[error("{message}")]
+    SessionStorage { message: String },
     /// The requested capability is recognized but not implemented yet. Keeps
     /// the deferred surface explicit instead of returning a silent `Ok`.
     #[error("{message}")]
@@ -175,6 +185,7 @@ impl HarnessError {
             HarnessError::Io { .. } => HarnessErrorTag::Io,
             HarnessError::Agent { .. } => HarnessErrorTag::Agent,
             HarnessError::Compaction { .. } => HarnessErrorTag::Compaction,
+            HarnessError::SessionStorage { .. } => HarnessErrorTag::SessionStorage,
             HarnessError::NotImplemented { .. } => HarnessErrorTag::NotImplemented,
         }
     }
@@ -269,6 +280,16 @@ impl HarnessError {
     }
     pub fn io(message: impl Into<String>) -> Self {
         HarnessError::Io {
+            message: message.into(),
+        }
+    }
+    /// A durable session write the backend refused.
+    ///
+    /// Separate from [`Self::io`] so the host can act differently: an `Io` failure
+    /// is usually a transient tool or filesystem problem, while this one means the
+    /// conversation stopped being saved and `/export` is the user's only recovery.
+    pub fn session_storage(message: impl Into<String>) -> Self {
+        HarnessError::SessionStorage {
             message: message.into(),
         }
     }

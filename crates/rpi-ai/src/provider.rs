@@ -5,8 +5,10 @@
 
 use crate::event_stream::AssistantMessageEventStream;
 use crate::model::Model;
+use crate::redact::RedactedHeaders;
 use crate::types::{AssistantMessage, Context, DeferredHandle, ThinkingBudgets, ThinkingLevel};
 use std::collections::BTreeMap;
+use std::fmt;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -30,7 +32,7 @@ pub enum CacheRetention {
 /// Options for a "simple" (non-agent) stream call — what compaction / smoke
 /// tests / bare provider usage pass. The agent loop wraps this with its richer
 /// equivalent when it drives a real turn (M2).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SimpleStreamOptions {
     /// API key. A provider may fall back to an env var when `None` (M3 anthropic
     /// reads `ANTHROPIC_API_KEY`); faux ignores it.
@@ -63,13 +65,13 @@ pub struct SimpleStreamOptions {
     /// still emit `thinking: { type: "disabled" }` when the model reasons).
     /// Mirrors TS `SimpleStreamOptions.reasoning`.
     pub reasoning: Option<ThinkingLevel>,
-    /// Optional caller override for the requested output-token ceiling. `None`
-    /// lets the provider fit the thinking budget inside `Model::max_tokens`.
-    /// Mirrors TS `SimpleStreamOptions.maxTokens`.
     /// Optional decoded HTTP body ceiling, including JSON/SSE overhead. Checked
     /// before buffering/parsing; only providers advertising support enforce it.
     /// None preserves ordinary unbounded response behavior.
     pub max_response_bytes: Option<usize>,
+    /// Optional caller override for the requested output-token ceiling. `None`
+    /// lets the provider fit the thinking budget inside `Model::max_tokens`.
+    /// Mirrors TS `SimpleStreamOptions.maxTokens`.
     pub max_tokens: Option<u64>,
     /// Sampling temperature. Only applied when the model supports it AND
     /// thinking is disabled (Anthropic rejects temperature under thinking).
@@ -99,6 +101,49 @@ impl Default for SimpleStreamOptions {
             temperature: None,
             thinking_budgets: None,
         }
+    }
+}
+
+/// `Debug` redacts credentials: `api_key` is shown only as present or absent,
+/// and sensitive header values are masked. The destructuring below is
+/// exhaustive, so adding a field to the struct fails to compile until it is
+/// printed here too.
+impl fmt::Debug for SimpleStreamOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            api_key,
+            timeout,
+            stream_idle_timeout,
+            max_retries,
+            max_retry_delay,
+            headers,
+            metadata,
+            cache_retention,
+            session_id,
+            signal,
+            reasoning,
+            max_response_bytes,
+            max_tokens,
+            temperature,
+            thinking_budgets,
+        } = self;
+        f.debug_struct("SimpleStreamOptions")
+            .field("api_key", &api_key.as_ref().map(|_| "<redacted>"))
+            .field("timeout", timeout)
+            .field("stream_idle_timeout", stream_idle_timeout)
+            .field("max_retries", max_retries)
+            .field("max_retry_delay", max_retry_delay)
+            .field("headers", &headers.as_ref().map(RedactedHeaders))
+            .field("metadata", metadata)
+            .field("cache_retention", cache_retention)
+            .field("session_id", session_id)
+            .field("signal", signal)
+            .field("reasoning", reasoning)
+            .field("max_response_bytes", max_response_bytes)
+            .field("max_tokens", max_tokens)
+            .field("temperature", temperature)
+            .field("thinking_budgets", thinking_budgets)
+            .finish()
     }
 }
 
@@ -206,6 +251,43 @@ mod tests {
             options.stream_idle_timeout(),
             Some(Duration::from_secs(300))
         );
+    }
+
+    #[test]
+    fn debug_output_redacts_api_key_and_sensitive_headers() {
+        let options = SimpleStreamOptions {
+            api_key: Some("sk-live-SECRET-KEY".into()),
+            headers: Some(std::collections::BTreeMap::from([
+                ("Authorization".into(), "Bearer SECRET-BEARER".into()),
+                ("x-api-key".into(), "SECRET-XAPIKEY".into()),
+                ("Proxy-Authorization".into(), "SECRET-PROXY".into()),
+                ("Cookie".into(), "SECRET-COOKIE".into()),
+                ("x-session-token".into(), "SECRET-TOKEN".into()),
+                ("x-client-secret".into(), "SECRET-CLIENT".into()),
+                ("X-Tenant".into(), "tenant-visible".into()),
+            ])),
+            max_retries: Some(3),
+            ..Default::default()
+        };
+        let debug = format!("{options:?}");
+        for secret in [
+            "SECRET-KEY",
+            "SECRET-BEARER",
+            "SECRET-XAPIKEY",
+            "SECRET-PROXY",
+            "SECRET-COOKIE",
+            "SECRET-TOKEN",
+            "SECRET-CLIENT",
+        ] {
+            assert!(!debug.contains(secret), "leaked {secret} in {debug}");
+        }
+        assert!(debug.contains("api_key: Some(\"<redacted>\")"), "{debug}");
+        assert!(
+            debug.contains("\"X-Tenant\": \"tenant-visible\""),
+            "{debug}"
+        );
+        assert!(debug.contains("max_retries: Some(3)"), "{debug}");
+        assert!(debug.contains("stream_idle_timeout"), "{debug}");
     }
 
     #[test]

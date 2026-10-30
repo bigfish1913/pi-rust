@@ -128,6 +128,41 @@ For building your own agent, depend on
 [`rpi-harness`](https://crates.io/crates/rpi-harness) directly instead — see
 [docs/agent/project-structure.md](https://github.com/bigfish1913/pi-rust/blob/main/docs/agent/project-structure.md).
 
+## Custom-entry branch queries (RPC and runtime actions)
+
+`get_session_branch` is a filtered custom-entry query, not an unfiltered
+transcript export. RPC example:
+
+```json
+{"id":"preview-1","type":"get_session_branch","customTypes":["durable-state","other-custom-type"],"afterSeq":42,"limit":20,"order":"newestFirst"}
+```
+
+`customTypes` is required and must be a non-empty array of non-blank strings.
+Type identifiers match exactly as written by `append_entry`: whitespace and
+case are preserved, and only exact duplicate identifiers are deduplicated.
+Only `afterSeq` (non-negative integer), `limit` (positive integer), and `order`
+(`oldestFirst`, the default, or `newestFirst`) are optional query arguments.
+The cursor is exclusive in the selected order: `seq > afterSeq` for
+`oldestFirst`, `seq < afterSeq` for `newestFirst`. Type filtering and
+branch ancestry apply before global ordering and limit across all requested
+types. Results are `{"entries":[...],"count":N,"filtered":true}`.
+
+Runtime action `GetSessionBranch` accepts the same query, without RPC's `type`
+and `id` envelope. Both surfaces reject `{}`, unknown fields, and the retired
+query keys `customType`, `custom_type`, `custom_types`, and `after_seq`, even
+when mixed with valid modern keys. This canonical contract has no alias fallback.
+`append_entry` / `AppendEntry` still use singular `customType` for writes.
+
+### Migration from unfiltered hosts
+
+This is a breaking query-contract change: replace unfiltered `{}` or legacy
+arguments with an explicit `customTypes` list. Upgrade the host and consumers
+together. Older hosts may accept the new arguments but ignore them; clients
+requiring filtering **must require `filtered == true`** in the reply and reject
+unsupported hosts rather than treating an unfiltered branch as filtered data.
+Plugin ABI compatibility alone does not establish this query capability.
+`get_messages`, `get_history`, and the append/write protocol are unchanged.
+
 ## Documentation
 
 - User guide: <https://rpi.bigfisharc.cn/docs.html>

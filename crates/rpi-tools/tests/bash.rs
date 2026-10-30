@@ -239,3 +239,81 @@ async fn supports_command_prefix() {
         .expect("ok");
     assert_eq!(text_output(&r), "hello");
 }
+
+#[test]
+fn schema_describes_effective_default_timeout() {
+    let (_, ctx) = fresh_context();
+    for (options, expected) in [
+        (None, 120.0),
+        (Some(BashToolOptions::default()), 120.0),
+        (
+            Some(BashToolOptions {
+                default_timeout: Some(30.0),
+                ..Default::default()
+            }),
+            30.0,
+        ),
+    ] {
+        let tool = rpi_tools::create_bash_tool(&ctx, options);
+        assert!(tool
+            .schema()
+            .description
+            .contains(&format!("{expected}-second timeout")));
+        let params = serde_json::to_value(&tool.schema().parameters).unwrap();
+        assert!(params["properties"]["timeout"]["description"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("defaults to {expected} seconds")));
+    }
+}
+
+#[tokio::test]
+async fn real_shell_honors_fallback_and_explicit_timeouts() {
+    use rpi_tools::{ExecutionErrorCode, OsExecutionEnv, Shell, ShellExecOptions};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let env = Arc::new(OsExecutionEnv::with_cwd(tmp.path().to_path_buf()));
+    match env
+        .exec(
+            "echo ready",
+            ShellExecOptions {
+                timeout: Some(5.0),
+                ..Default::default()
+            },
+        )
+        .await
+    {
+        Err(error) if error.code == ExecutionErrorCode::ShellUnavailable => {
+            eprintln!("skipping real-shell timeout test: {error}");
+            return;
+        }
+        result => {
+            result.expect("shell is available");
+        }
+    }
+    let ctx = ExecutionToolContext::new(env, None);
+    for (default_timeout, params) in [
+        (0.1, serde_json::json!({ "command": "sleep 30" })),
+        (
+            0.1,
+            serde_json::json!({ "command": "sleep 30", "timeout": null }),
+        ),
+        (
+            30.0,
+            serde_json::json!({ "command": "sleep 30", "timeout": 0.1 }),
+        ),
+    ] {
+        let tool = rpi_tools::create_bash_tool(
+            &ctx,
+            Some(BashToolOptions {
+                default_timeout: Some(default_timeout),
+                ..Default::default()
+            }),
+        );
+        let result = tokio::time::timeout(Duration::from_secs(10), run_bash(tool, params))
+            .await
+            .expect("bash must return within its deadline");
+        let msg = err_text(&result.expect_err("slow command must time out"));
+        assert!(msg.contains("Command timed out after 0.1s"), "{msg}");
+    }
+}

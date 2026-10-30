@@ -239,6 +239,11 @@ pub struct Settings {
     /// Absent uses 300 seconds; zero disables it; the CLI flag takes priority.
     #[serde(default)]
     pub stream_idle_timeout: Option<u64>,
+    /// upstream's `thinkingBudgets`: token budgets for the minimal/low/medium/
+    /// high levels on budget-based thinking models. Levels left out keep the
+    /// built-in budgets.
+    #[serde(default)]
+    pub thinking_budgets: Option<rpi_ai::ThinkingBudgets>,
 }
 
 /// upstream's `terminal` settings block (`TerminalSettings`). Only the fields
@@ -1182,6 +1187,17 @@ mod scoped_tests {
         assert_eq!(raw["piOnlyField"], "keep-me");
         assert_eq!(raw["scopedModels"][0], "m1");
         assert_eq!(raw["theme"], "dark");
+    }
+
+    #[test]
+    fn thinking_budgets_are_read_from_settings() {
+        let settings: Settings =
+            serde_json::from_str(r#"{"thinkingBudgets":{"medium":6000,"high":24576}}"#).unwrap();
+        let budgets = settings.thinking_budgets.unwrap();
+        assert_eq!(
+            (budgets.medium, budgets.high, budgets.low),
+            (Some(6000), Some(24576), None)
+        );
     }
 
     #[test]

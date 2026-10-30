@@ -115,7 +115,9 @@ pub enum Command {
         #[serde(rename = "beforeSeq")]
         before_seq: Option<u64>,
     },
-    /// Return every entry on the currently selected native branch.
+    /// Query custom entries on the selected branch. Query validation is shared
+    /// with the runtime action (required non-empty `customTypes`; optional
+    /// `afterSeq`, `limit`, `order`), after removing the RPC envelope.
     GetSessionBranch,
     /// Append a protocol-neutral custom entry to the current branch.
     AppendEntry {
@@ -278,7 +280,7 @@ pub fn response(id: Option<Value>, command: &str, result: Result<Option<Value>, 
     out
 }
 
-pub fn ready() -> Value {
+pub fn ready(mode: crate::args::RpcMessageUpdates) -> Value {
     json!({
         "type": "ready",
         "protocol": "rpi",
@@ -287,6 +289,7 @@ pub fn ready() -> Value {
         "supportedCommands": SUPPORTED_COMMANDS,
         "supportedEvents": ["session_entry_committed", "compaction_started", "compaction_finished"],
         "semantics": {
+            "messageUpdates": mode.as_str(),
             "promptResponse": "accepted",
             "settlementEvent": "agent_settled",
             "agentEndIsTerminal": false
@@ -341,7 +344,13 @@ mod tests {
 
     #[test]
     fn ready_advertises_the_p0_contract() {
-        let value = ready();
+        for mode in [
+            crate::args::RpcMessageUpdates::CompactDeltas,
+            crate::args::RpcMessageUpdates::Snapshot,
+        ] {
+            assert_eq!(ready(mode)["semantics"]["messageUpdates"], mode.as_str());
+        }
+        let value = ready(crate::args::RpcMessageUpdates::default());
         assert_eq!(value["protocol"], "rpi");
         assert_eq!(value["semantics"]["settlementEvent"], "agent_settled");
         assert!(value["supportedCommands"]
@@ -353,7 +362,7 @@ mod tests {
 
     #[test]
     fn ready_advertises_the_read_only_history_snapshot() {
-        let value = ready();
+        let value = ready(crate::args::RpcMessageUpdates::default());
         assert!(value["supportedCommands"]
             .as_array()
             .unwrap()
@@ -363,7 +372,7 @@ mod tests {
 
     #[test]
     fn ready_advertises_resuming_an_interrupted_run() {
-        let value = ready();
+        let value = ready(crate::args::RpcMessageUpdates::default());
         assert!(value["supportedCommands"]
             .as_array()
             .unwrap()
@@ -373,7 +382,7 @@ mod tests {
 
     #[test]
     fn ready_advertises_compaction() {
-        let value = ready();
+        let value = ready(crate::args::RpcMessageUpdates::default());
         assert!(value["supportedCommands"]
             .as_array()
             .unwrap()

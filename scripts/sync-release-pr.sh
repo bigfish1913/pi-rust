@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # Finish the bot's draft PR before marking it ready for review/CI.
 set -euo pipefail
-branch=$(jq -r '.head_branch // empty' <<<"${RELEASE_PR_JSON:?}")
-number=$(jq -r '.number // empty' <<<"$RELEASE_PR_JSON")
+# On a no-op retry release-plz can omit its PR output. Recover the existing PR
+# returned by the draft step so it cannot be stranded in draft after success.
+release_pr=$(jq -c --argjson existing "${EXISTING_RELEASE_PR_JSON:-null}" \
+  'if .head_branch? and .number? then . else $existing end' <<<"${RELEASE_PR_JSON:-null}")
+branch=$(jq -r '.head_branch // empty' <<<"$release_pr")
+number=$(jq -r '.number // empty' <<<"$release_pr")
 [[ -n "$branch" && -n "$number" ]] || exit 0
 [[ "$branch" == release-plz-* ]] || { echo 'unexpected release branch' >&2; exit 1; }
 git fetch origin "$branch"
@@ -30,6 +34,7 @@ if ! git diff --cached --quiet; then
   gh auth setup-git
   git push origin "HEAD:refs/heads/$branch"
 fi
-if [[ $(gh pr view "$number" --json isDraft --jq .isDraft) == true ]]; then
+is_draft=$(gh pr view "$number" --json isDraft --jq .isDraft)
+if [[ "$is_draft" == true ]]; then
   gh pr ready "$number"
 fi

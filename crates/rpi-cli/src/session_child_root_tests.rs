@@ -26,7 +26,7 @@ async fn exact_v4_unsafe_roots_fail_child_factory_without_events_or_files() {
             "createdAt": 0, "cwd":cwd}));
         std::fs::write(&path, &bytes).unwrap();
         let meta = session_metadata_at(&path).unwrap();
-        let session = open_session(&meta, &cwd).await.unwrap();
+        let session = open_session(&meta, &cwd, temp.path()).await.unwrap().session;
         assert_eq!(session.storage().metadata().id, id);
         let provider = FauxProvider::new(FauxScript::new().with_text("must not run"));
         let parent = AgentHarness::create(rpi_harness::types::AgentHarnessOptions {

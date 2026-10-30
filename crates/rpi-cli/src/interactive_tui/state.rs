@@ -308,6 +308,17 @@ pub(super) struct TuiState {
     /// counts and prices prompt-cache misses across turns using the same
     /// noise floor, idle-gap, and model-change logic as the batch scan.
     pub(super) cache_tracker: std::sync::Mutex<rpi_harness::cache_stats::CacheMissTracker>,
+    /// Set by the event drain when the `AgentEvent` broadcast reported
+    /// `Lagged`, i.e. at least one event was dropped outright.
+    ///
+    /// `MessageUpdate` re-delivers a full snapshot, so a dropped delta is
+    /// harmless — but `MessageEnd` is terminal and carries the turn's usage.
+    /// Losing one freezes the footer's totals for the rest of the session, and
+    /// nothing later in the stream re-sends them. The flag makes that
+    /// possibility actionable at the end of the run, where an authoritative
+    /// rebuild is affordable; without it every turn would have to re-read the
+    /// whole branch to notice a gap that almost never happens.
+    pub(super) events_lagged: std::sync::atomic::AtomicBool,
     /// The in-progress scoped-models selection while the `/scoped-models`
     /// selector is open (toggle per item, Esc saves). `None` when not editing.
     pub(super) scoped_edit: std::sync::Mutex<Option<Vec<String>>>,
@@ -1220,6 +1231,10 @@ impl TuiState {
         *self.status.lock().unwrap() = status;
         self.apply_status(status);
     }
+
+    // =======================================================================
+    // Footer usage accounting across the live/reconcile race
+    // =======================================================================
 
     /// The dock container listing queued messages (upstream's
     /// `pendingMessagesContainer`).

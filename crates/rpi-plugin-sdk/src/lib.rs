@@ -1093,8 +1093,20 @@ pub enum RuntimeActionId {
     /// `{"ok":true,"chars":N}`. A headless host has no editor and accepts the
     /// write without rendering it, mirroring [`RuntimeActionId::SetStatus`].
     SetEditorText = 19,
-    /// Return the current session branch entries oldest-first as JSON.
-    /// Args: `{}`; result: `{"entries":[...]}`.
+    /// Query custom entries on the current main branch. Args:
+    /// `{"customTypes":["durable-state","other-custom-type"],"afterSeq":42,
+    /// "limit":20,"order":"newestFirst"}`. `customTypes` is required and
+    /// non-empty; the other fields are optional. Default order: `oldestFirst`.
+    /// `afterSeq` is exclusive: `seq > afterSeq` for oldestFirst, `seq < afterSeq`
+    /// for newestFirst. Ordering and
+    /// limit apply globally across types, within the selected branch only.
+    /// Result: `{"entries":[...],"count":N,"filtered":true}`. Empty `{}`,
+    /// unknown keys and legacy `customType`/`custom_type`/`custom_types`/
+    /// `after_seq` query arguments are errors, including mixed old/new requests.
+    /// This does not change AppendEntry's singular `customType` write argument.
+    /// Type identifiers match exactly (including case and whitespace).
+    /// Consumers must require `filtered == true`: older ABI-compatible hosts
+    /// may ignore the query and return the unfiltered branch instead.
     GetSessionBranch = 20,
     /// Inspect or finish a plugin-owned stdio server lifecycle. Args:
     /// `{"op":"status"}` or `{"op":"finish","exitCode":0}`. Only the
@@ -1566,6 +1578,18 @@ pub struct PluginApi {
 
     /// Optional plugin shutdown hooks, appended after wake-driven tools.
     pub register_plugin_lifecycle: Option<RegisterPluginLifecycleFn>,
+
+    /// Set explicit prompt metadata for a tool already registered by this plugin.
+    /// `metadata_json` is an object with optional `promptSnippet` (string) and
+    /// `promptGuidelines` (string array), matching pi's tool definition fields.
+    /// Both arguments are borrowed and copied before this call returns.
+    ///
+    /// Returns 0 on success, 1 for an unknown tool, 2 for malformed metadata,
+    /// and -1 outside registration. Appended without changing StableToolSchema
+    /// or the ABI version. Older hosts supply None: skip the call; the tool's
+    /// schema and execution remain available without any prompt contribution.
+    pub register_tool_prompt:
+        Option<extern "C" fn(name: StbStringRef, metadata_json: StbStringRef) -> i32>,
 }
 unsafe impl Send for PluginApi {}
 unsafe impl Sync for PluginApi {}
@@ -1957,6 +1981,7 @@ mod tests {
             register_streaming_provider: None,
             register_tool_with_wake: None,
             register_plugin_lifecycle: None,
+            register_tool_prompt: None,
         };
         // All optional slots are null → plugin must degrade.
         assert!(api.register_tool.is_none());
@@ -2055,8 +2080,12 @@ mod tests {
             core::mem::offset_of!(PluginApi, register_tool_with_wake) + size_of::<usize>()
         );
         assert_eq!(
-            size_of::<PluginApi>(),
+            core::mem::offset_of!(PluginApi, register_tool_prompt),
             core::mem::offset_of!(PluginApi, register_plugin_lifecycle) + size_of::<usize>()
+        );
+        assert_eq!(
+            size_of::<PluginApi>(),
+            core::mem::offset_of!(PluginApi, register_tool_prompt) + size_of::<usize>()
         );
         assert_eq!(align_of::<PluginApi>(), align_of::<*const ()>());
     }
@@ -2132,6 +2161,7 @@ mod tests {
             register_streaming_provider: None,
             register_tool_with_wake: None,
             register_plugin_lifecycle: None,
+            register_tool_prompt: None,
         }
     }
 
@@ -2184,6 +2214,7 @@ mod tests {
             core::mem::offset_of!(PluginApi, register_streaming_provider),
             core::mem::offset_of!(PluginApi, register_tool_with_wake),
             core::mem::offset_of!(PluginApi, register_plugin_lifecycle),
+            core::mem::offset_of!(PluginApi, register_tool_prompt),
         ] {
             let mut api = entrypoint_test_api();
             api.struct_size = size as u32;
@@ -2208,6 +2239,7 @@ mod tests {
                     assert!(api.register_streaming_provider.is_none());
                     assert!(api.register_tool_with_wake.is_none());
                     assert!(api.register_plugin_lifecycle.is_none());
+                    assert!(api.register_tool_prompt.is_none());
                     assert!(
                         api.register_provider.is_some(),
                         "one-shot fallback remains available"

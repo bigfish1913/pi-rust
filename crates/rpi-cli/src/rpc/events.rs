@@ -11,19 +11,16 @@ pub(crate) fn project(event: &AgentEvent) -> serde_json::Value {
     .unwrap_or(serde_json::Value::Null)
 }
 
-/// Encode frequent delta updates without building two full snapshot trees plus
-/// a third projection tree. The JSON fields remain identical to `project`.
+/// Encode using the selected wire shape without changing canonical message identity.
 #[cfg(test)]
-pub(crate) fn encode(event: &AgentEvent) -> serde_json::Result<Vec<u8>> {
-    encode_with_message_id(event, None)
+pub(crate) fn encode(event: &AgentEvent, mode: crate::args::RpcMessageUpdates) -> serde_json::Result<Vec<u8>> {
+    encode_with_message_id(event, None, mode)
 }
 
-/// Keep the single-snapshot delta encoder used by the native streaming path.
-/// The optional ID is assigned by the stateful RPC writer at MessageStart and
-/// is copied onto every cumulative snapshot for that assistant message.
 pub(crate) fn encode_with_message_id(
     event: &AgentEvent,
     message_id: Option<&str>,
+    mode: crate::args::RpcMessageUpdates,
 ) -> serde_json::Result<Vec<u8>> {
     use rpi_ai::AssistantMessageEvent;
     use std::sync::Arc;
@@ -63,6 +60,33 @@ pub(crate) fn encode_with_message_id(
             return serde_json::to_vec(&value);
         }
     };
+    if mode == crate::args::RpcMessageUpdates::CompactDeltas {
+        let mut nested = serde_json::json!({
+            "type": assistant_message_event.type_tag(),
+            "contentIndex": index,
+            "delta": delta,
+        });
+        if matches!(
+            assistant_message_event,
+            AssistantMessageEvent::ToolCallDelta { .. }
+        ) {
+            if let Some(rpi_ai::Content::ToolCall(call)) = partial.content.get(*index) {
+                nested["id"] = serde_json::json!(call.id);
+                nested["toolName"] = serde_json::json!(call.name);
+            }
+        }
+        let mut value = serde_json::json!({
+            "type": "message_update",
+            "assistantMessageEvent": nested,
+            "eventType": assistant_message_event.type_tag(),
+            "contentIndex": index,
+            "delta": delta,
+        });
+        if let Some(id) = message_id {
+            value["messageId"] = serde_json::Value::String(id.to_owned());
+        }
+        return serde_json::to_vec(&value);
+    }
     let mut snapshot_value = serde_json::to_value(&**message)?;
     if let Some(id) = message_id {
         snapshot_value["messageId"] = serde_json::Value::String(id.to_owned());
@@ -105,6 +129,7 @@ pub(crate) fn encode_with_message_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::args::RpcMessageUpdates::{CompactDeltas, Snapshot};
     use rpi_ai::{Api, AssistantMessage, AssistantMessageEvent, Content};
     use std::sync::Arc;
 
@@ -113,13 +138,21 @@ mod tests {
         let delta = "quote\" slash\\ line\n nul\0 🐈";
         for shared in [false, true] {
             let mut message = AssistantMessage::empty(Api::Faux, "faux", "m", 42);
-            message.content = vec![Content::text(delta), Content::thinking("reasoning")];
+            message.content = vec![
+                Content::text(delta),
+                Content::thinking("reasoning"),
+                Content::tool_call("call", "read", serde_json::json!({"large": delta})),
+            ];
             let message = Arc::new(message);
             let partial = if shared {
                 Arc::clone(&message)
             } else {
                 let mut other = (*message).clone();
-                other.content = vec![Content::text("different snapshot")];
+                other.content = vec![
+                    Content::text("different snapshot"),
+                    Content::thinking("other reasoning"),
+                    Content::tool_call("other", "write", serde_json::json!({})),
+                ];
                 Arc::new(other)
             };
             for event in [
@@ -144,11 +177,191 @@ mod tests {
                     assistant_message_event: event,
                     message_id: None,
                 };
-                let bytes = encode(&event).unwrap();
+                let bytes = encode(&event, Snapshot).unwrap();
                 assert_eq!(
                     serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
                     project(&event)
                 );
+                let compact: serde_json::Value =
+                    serde_json::from_slice(&encode(&event, CompactDeltas).unwrap()).unwrap();
+                let mut expected = project(&event);
+                expected.as_object_mut().unwrap().remove("message");
+                expected["assistantMessageEvent"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("partial");
+                if let AgentEvent::MessageUpdate {
+                    assistant_message_event: AssistantMessageEvent::ToolCallDelta { partial, .. },
+                    ..
+                } = &event
+                {
+                    let Content::ToolCall(call) = &partial.content[2] else {
+                        panic!("tool")
+                    };
+                    expected["assistantMessageEvent"]["id"] = serde_json::json!(call.id);
+                    expected["assistantMessageEvent"]["toolName"] = serde_json::json!(call.name);
+                }
+                assert_eq!(compact, expected);
+                assert_eq!(compact["delta"], delta);
+            }
+        }
+    }
+
+    #[test]
+    fn high_frequency_compact_bytes_grow_linearly_not_quadratically() {
+        fn bytes(count: usize, mode: crate::args::RpcMessageUpdates) -> usize {
+            (1..=count)
+                .map(|size| {
+                    let mut message = AssistantMessage::empty(Api::Faux, "faux", "m", 42);
+                    message.content = vec![Content::text("x".repeat(size))];
+                    let message = Arc::new(message);
+                    [0, 1, 2]
+                        .into_iter()
+                        .map(|kind| {
+                            let delta = match kind {
+                                0 => AssistantMessageEvent::TextDelta {
+                                    content_index: 0,
+                                    delta: "x".into(),
+                                    partial: message.clone(),
+                                },
+                                1 => AssistantMessageEvent::ThinkingDelta {
+                                    content_index: 0,
+                                    delta: "x".into(),
+                                    partial: message.clone(),
+                                },
+                                _ => AssistantMessageEvent::ToolCallDelta {
+                                    content_index: 0,
+                                    delta: "x".into(),
+                                    partial: message.clone(),
+                                },
+                            };
+                            encode(
+                                &AgentEvent::MessageUpdate { message_id: None,
+                                    message: message.clone(),
+                                    assistant_message_event: delta,
+                                },
+                                mode,
+                            )
+                            .unwrap()
+                            .len()
+                        })
+                        .sum::<usize>()
+                })
+                .sum()
+        }
+        let compact = bytes(1024, CompactDeltas);
+        assert_eq!(bytes(2048, CompactDeltas), compact * 2);
+        let snapshot = bytes(1024, Snapshot);
+        let larger_snapshot = bytes(2048, Snapshot);
+        assert!(
+            larger_snapshot > snapshot * 3,
+            "snapshot payload should approach quadratic growth"
+        );
+        assert!(larger_snapshot < snapshot * 4);
+        assert!(snapshot > compact * 5);
+    }
+
+    #[test]
+    fn structural_updates_and_terminal_metadata_keep_legacy_projection() {
+        use rpi_ai::{DoneReason, ErrorReason, StopReason};
+        for reason in [StopReason::Stop, StopReason::Error, StopReason::Aborted] {
+            let mut message = AssistantMessage::empty(Api::Faux, "faux", "model", 42);
+            message.content = vec![Content::text("final 🐈"), Content::thinking("thought")];
+            message.stop_reason = reason;
+            message.error_message = Some("diagnostic \"\\\n".into());
+            message.usage.input = 123;
+            message.usage.output = 45;
+            message.usage.total_tokens = 168;
+            message.usage.cost.output = 0.125;
+            let message = Arc::new(message);
+            let mut events = vec![
+                AssistantMessageEvent::Start {
+                    partial: message.clone(),
+                },
+                AssistantMessageEvent::TextStart {
+                    content_index: 0,
+                    partial: message.clone(),
+                },
+                AssistantMessageEvent::TextEnd {
+                    content_index: 0,
+                    content: "final 🐈".into(),
+                    partial: message.clone(),
+                },
+                AssistantMessageEvent::ThinkingStart {
+                    content_index: 1,
+                    partial: message.clone(),
+                },
+                AssistantMessageEvent::ThinkingEnd {
+                    content_index: 1,
+                    content: "thought".into(),
+                    partial: message.clone(),
+                },
+                AssistantMessageEvent::ToolCallStart {
+                    content_index: 2,
+                    partial: message.clone(),
+                },
+                AssistantMessageEvent::ToolCallEnd {
+                    content_index: 2,
+                    tool_call: rpi_ai::ToolCall {
+                        kind: Default::default(),
+                        namespace: None,
+                        id: "call".into(),
+                        name: "tool".into(),
+                        arguments: serde_json::json!({"x": 1}),
+                        thought_signature: None,
+                    },
+                    partial: message.clone(),
+                },
+            ];
+            events.push(match reason {
+                StopReason::Stop => AssistantMessageEvent::Done {
+                    reason: DoneReason::Stop,
+                    message: (*message).clone(),
+                },
+                StopReason::Aborted => AssistantMessageEvent::Error {
+                    reason: ErrorReason::Aborted,
+                    error: (*message).clone(),
+                },
+                _ => AssistantMessageEvent::Error {
+                    reason: ErrorReason::Error,
+                    error: (*message).clone(),
+                },
+            });
+            let final_message: rpi_agent::message::AgentMessage = (*message).clone().into();
+            let mut events: Vec<_> = events
+                .into_iter()
+                .map(|assistant_message_event| AgentEvent::MessageUpdate { message_id: None,
+                    message: message.clone(),
+                    assistant_message_event,
+                })
+                .collect();
+            events.extend([
+                AgentEvent::MessageStart { message_id: None,
+                    message: final_message.clone(),
+                },
+                AgentEvent::MessageEnd { message_id: None,
+                    message: final_message.clone(),
+                },
+                AgentEvent::TurnEnd {
+                    message: final_message.clone(),
+                    tool_results: vec![],
+                },
+                AgentEvent::AgentEnd {
+                    messages: vec![final_message],
+                },
+                AgentEvent::RetryScheduled {
+                    attempt: 1,
+                    max_retries: 3,
+                    delay_ms: 100,
+                    error: "retry".into(),
+                },
+            ]);
+            for event in events {
+                for mode in [CompactDeltas, Snapshot] {
+                    let actual: serde_json::Value =
+                        serde_json::from_slice(&encode(&event, mode).unwrap()).unwrap();
+                    assert_eq!(actual, project(&event));
+                }
             }
         }
     }
@@ -164,10 +377,13 @@ mod tests {
                 message_id: None,
             },
         ] {
-            assert_eq!(
-                serde_json::from_slice::<serde_json::Value>(&encode(&event).unwrap()).unwrap(),
-                project(&event)
-            );
+            for mode in [CompactDeltas, Snapshot] {
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&encode(&event, mode).unwrap())
+                        .unwrap(),
+                    project(&event)
+                );
+            }
         }
     }
 }

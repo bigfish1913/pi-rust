@@ -12,6 +12,18 @@ root changelog, synchronizes the embedded documentation, validates the core
 crates, and marks the PR ready. The shared workspace version and `rpi` version
 group keep the core crates together; examples are excluded.
 
+Only same-repository `release-plz-*` draft PRs targeting `main` defer CI until
+preparation is complete; ordinary PRs (including drafts and fork PRs) still run
+all checks. Before updating an existing Release PR, automation returns it to
+draft so intermediate version/changelog commits are not checked prematurely.
+After documentation synchronization and validation succeed, marking the PR ready
+triggers full CI on its final head, even when a retry produces no new commit.
+Skipped draft jobs use distinct names, so they cannot satisfy the required
+`Cargo check` / `Cargo test` checks while the ready-event run is being scheduled.
+A failed preparation leaves the PR in draft; fix the failure and rerun preparation
+rather than marking an incomplete Release PR ready manually. The embedded-docs
+consistency check and publishing authorization remain unchanged.
+
 Automatic releases use the version proposed by release-plz without pinning a
 minor series or rewriting it to a patch release. Versions such as `0.9.0` and
 `1.0.0` may proceed through the same Release PR workflow. The publish gate still

@@ -8,8 +8,10 @@
 
 use std::sync::{Arc, Mutex};
 
+use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use rpi_tui::{
-    AssistantBlock, AssistantMessageComponent, Container, Focusable, Text, TuiAltScreen, TUI,
+    AssistantBlock, AssistantMessageComponent, Container, Focusable, ScrollView, ScrollViewOptions,
+    Text, TuiAltScreen, TUI,
 };
 
 /// Shared virtual-terminal state so the test can keep a handle to the same
@@ -22,6 +24,8 @@ struct VtState {
     document: Vec<Vec<char>>,
     italics: Vec<Vec<bool>>,
     italic: bool,
+    inverses: Vec<Vec<bool>>,
+    inverse: bool,
     /// Document index currently at the top of the screen.
     viewport_top: usize,
     cursor_row: usize,
@@ -42,6 +46,8 @@ impl VirtualTerminal {
             document: vec![vec![' '; columns]; rows],
             italics: vec![vec![false; columns]; rows],
             italic: false,
+            inverses: vec![vec![false; columns]; rows],
+            inverse: false,
             viewport_top: 0,
             cursor_row: 0,
             cursor_col: 0,
@@ -64,6 +70,7 @@ impl VirtualTerminal {
         while st.document.len() <= index {
             st.document.push(vec![' '; st.columns]);
             st.italics.push(vec![false; st.columns]);
+            st.inverses.push(vec![false; st.columns]);
         }
     }
 
@@ -107,6 +114,7 @@ impl VirtualTerminal {
         let col = st.cursor_col.min(st.columns - 1);
         st.document[index][col] = ch;
         st.italics[index][col] = st.italic;
+        st.inverses[index][col] = st.inverse;
         st.cursor_col += 1;
     }
 
@@ -125,6 +133,7 @@ impl VirtualTerminal {
             let excess = st.viewport_top.saturating_sub(limit);
             st.document.drain(..excess);
             st.italics.drain(..excess);
+            st.inverses.drain(..excess);
             st.viewport_top -= excess;
         }
     }
@@ -144,10 +153,12 @@ impl VirtualTerminal {
         for row in (n..rows).rev() {
             st.document[top + row] = st.document[top + row - n].clone();
             st.italics[top + row] = st.italics[top + row - n].clone();
+            st.inverses[top + row] = st.inverses[top + row - n].clone();
         }
         for row in 0..n {
             st.document[top + row] = vec![' '; st.columns];
             st.italics[top + row] = vec![false; st.columns];
+            st.inverses[top + row] = vec![false; st.columns];
         }
     }
 
@@ -230,6 +241,7 @@ impl VirtualTerminal {
                                         let top = st.viewport_top;
                                         st.document.drain(..top);
                                         st.italics.drain(..top);
+                                        st.inverses.drain(..top);
                                         st.viewport_top = 0;
                                         continue;
                                     }
@@ -239,6 +251,7 @@ impl VirtualTerminal {
                                         self.ensure_row(&mut st, row);
                                         st.document[row] = vec![' '; st.columns];
                                         st.italics[row] = vec![false; st.columns];
+                                        st.inverses[row] = vec![false; st.columns];
                                     }
                                 }
                                 b'K' => {
@@ -253,18 +266,26 @@ impl VirtualTerminal {
                                     for c in start..st.columns {
                                         st.document[index][c] = ' ';
                                         st.italics[index][c] = false;
+                                        st.inverses[index][c] = false;
                                     }
                                 }
                                 b'm' => {
                                     let mut st = self.state.lock().unwrap();
                                     if params.is_empty() {
                                         st.italic = false;
+                                        st.inverse = false;
                                     }
                                     let mut index = 0;
                                     while index < nums.len() {
                                         match nums[index] {
-                                            0 | 23 => st.italic = false,
+                                            0 => {
+                                                st.italic = false;
+                                                st.inverse = false;
+                                            }
+                                            23 => st.italic = false,
                                             3 => st.italic = true,
+                                            7 => st.inverse = true,
+                                            27 => st.inverse = false,
                                             38 | 48 if nums.get(index + 1) == Some(&5) => {
                                                 index += 2
                                             }
@@ -386,6 +407,144 @@ impl VirtualTerminal {
             &st.italics[row][column..column + needle.len()]
         );
     }
+}
+
+#[test]
+fn alternate_screen_selection_preserves_text_during_incremental_patches() {
+    let term = VirtualTerminal::new(56, 8);
+    let tui = TuiAltScreen::new(Box::new(term.clone()), true, None);
+    let plain = [
+        "First paragraph remains readable before any selection.",
+        "Second paragraph has a prefix and a long intact suffix.",
+        "Styled prefix colored italic words and intact suffix.",
+        "Last paragraph must never change when selecting above.",
+    ];
+    let content = format!(
+        "{}\n{}\nStyled prefix \x1b[31mcolored\x1b[0m \x1b[3mitalic words\x1b[0m and intact suffix.\n{}",
+        plain[0], plain[1], plain[3]
+    );
+    let scroll = Arc::new(ScrollView::new(
+        Arc::new(Text::new(content, 0, 0)),
+        ScrollViewOptions {
+            primary: true,
+            ..Default::default()
+        },
+    ));
+    tui.set_layout_root(Some(scroll));
+    tui.start_readerless();
+
+    let initial = term.visible();
+    let expected: Vec<String> = plain
+        .iter()
+        .map(|line| format!("{line:<56}"))
+        .chain(std::iter::repeat_n(" ".repeat(56), 4))
+        .collect();
+    assert_eq!(
+        initial, expected,
+        "initial screen must contain every paragraph"
+    );
+    let redraws = tui.full_redraws();
+    let assert_screen = |selection: Option<(usize, usize, usize)>| {
+        // Check the entire screen, not just the extracted selection: the old
+        // reverse_video_span slice bug erased/replaced unselected suffixes.
+        assert_eq!(
+            term.visible(),
+            initial,
+            "selection must not change any text"
+        );
+        let st = term.state.lock().unwrap();
+        for row in 0..st.rows {
+            for col in 0..st.columns {
+                let expected = selection
+                    .is_some_and(|(y, start, end)| row == y && (start..end).contains(&col));
+                assert_eq!(
+                    st.inverses[st.viewport_top + row][col],
+                    expected,
+                    "wrong inverse at ({col}, {row}), selection {selection:?}"
+                );
+            }
+        }
+        assert_eq!(tui.full_redraws(), redraws, "must use incremental patches");
+    };
+    let mouse = |kind, column, row| {
+        tui.handle_selection_mouse_event(&MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+    };
+
+    assert_screen(None);
+    // Exercise both plain text and a span crossing color/italic resets. Each
+    // mouse event renders normally; forcing a redraw would bypass the bug.
+    for row in [1, 2] {
+        mouse(MouseEventKind::Down(MouseButton::Left), 8, row);
+        assert_screen(None);
+        mouse(MouseEventKind::Drag(MouseButton::Left), 18, row);
+        assert_screen(Some((row as usize, 8, 19)));
+        mouse(MouseEventKind::Drag(MouseButton::Left), 36, row);
+        assert_screen(Some((row as usize, 8, 37)));
+        mouse(MouseEventKind::Drag(MouseButton::Left), 4, row);
+        assert_screen(Some((row as usize, 4, 9)));
+        mouse(MouseEventKind::Up(MouseButton::Left), 4, row);
+        assert_screen(Some((row as usize, 4, 9)));
+        assert_eq!(
+            tui.selection_text().as_deref(),
+            Some(&plain[row as usize][4..9])
+        );
+        tui.clear_selection();
+        tui.request_render(false);
+        assert_screen(None);
+    }
+}
+
+#[test]
+fn middle_selection_stays_in_place_while_streaming_appends_rows() {
+    let term = VirtualTerminal::new(40, 12);
+    let tui = TuiAltScreen::new(Box::new(term.clone()), true, None);
+    let rows = |count| {
+        (0..count)
+            .map(|i| format!("line {i:02} content"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let text = Arc::new(Text::new(rows(30), 0, 0));
+    let scroll = Arc::new(ScrollView::primary(text.clone()));
+    tui.set_layout_root(Some(scroll.clone()));
+    tui.start_readerless();
+    let redraws = tui.full_redraws();
+    let mouse = |kind, column| {
+        tui.handle_selection_mouse_event(&MouseEvent {
+            kind,
+            column,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        });
+    };
+    mouse(MouseEventKind::Down(MouseButton::Left), 5);
+    text.set_text(rows(45));
+    tui.request_render(false);
+    mouse(MouseEventKind::Drag(MouseButton::Left), 6);
+    mouse(MouseEventKind::Up(MouseButton::Left), 6);
+    assert_eq!(tui.selection_text().as_deref(), Some("20"));
+    assert_eq!(term.visible()[2].trim_end(), "line 20 content");
+    let st = term.state.lock().unwrap();
+    for col in 0..40 {
+        assert_eq!(
+            st.inverses[st.viewport_top + 2][col],
+            (5..7).contains(&col),
+            "selection drifted to column {col}"
+        );
+    }
+    drop(st);
+    assert_eq!(tui.full_redraws(), redraws);
+    assert!(!scroll.is_following_end());
+    tui.scroll_to_bottom();
+    assert!(
+        scroll.is_following_end(),
+        "End explicitly resumes following output"
+    );
 }
 
 #[test]

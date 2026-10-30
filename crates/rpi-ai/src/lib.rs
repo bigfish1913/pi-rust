@@ -24,6 +24,7 @@ pub mod json_parse;
 pub mod model;
 pub mod provider;
 pub mod providers;
+pub(crate) mod redact;
 pub mod schema;
 #[cfg(feature = "providers")]
 pub(crate) mod strict_schema;

@@ -1025,6 +1025,13 @@ pub async fn interactive_tui(
     } else {
         None
     };
+    // Startup notices from the launch (a restored session whose directory fell
+    // back, an untrusted adopted directory). Notes in the transcript rather than
+    // stderr: the TUI is already in the alternate screen by the time it draws
+    // this, and a stray write would corrupt the layout (issue #115).
+    for notice in &reload_context.startup_notices {
+        add_note_message(&chat_container, notice);
+    }
 
     // First-launch gate: if `~/.rpi/.setup_done` is absent, show the welcome
     // banner once, then write the sentinel. The banner covers the theme hint;
@@ -1145,6 +1152,12 @@ pub async fn interactive_tui(
         footer.set_context_window(m.context_window as i64);
     }
     footer.set_hints("Enter: Send | Shift+Enter: New line | Ctrl+C: Clear/Exit | Esc: Abort | Ctrl+L: Model | Ctrl+P: Cycle | Ctrl+O: Expand/collapse tools | Ctrl+T: Show/hide thinking | /help");
+    // A restored session may already carry a name (`/name` in an earlier run, or
+    // an extension that names sessions). Line 1 reserves a slot for it, so a
+    // resume that left it blank showed less than the session actually knew.
+    if let Some(name) = lane.session_view().get_name().await.ok().flatten() {
+        footer.set_session_name(Some(&name));
+    }
 
     // Live git-branch refresh (native fs-watch on `.git/HEAD`): a checkout or
     // commit updates the footer's branch without a manual refresh.
@@ -1261,6 +1274,7 @@ pub async fn interactive_tui(
         history_index: std::sync::Mutex::new(-1),
         history_draft: std::sync::Mutex::new(None),
         cache_tracker: std::sync::Mutex::new(rpi_harness::cache_stats::CacheMissTracker::new()),
+        events_lagged: std::sync::atomic::AtomicBool::new(false),
         scoped_edit: std::sync::Mutex::new(None),
         markdown_transformer: Arc::new(std::sync::Mutex::new(initial_transformer)),
         extension_claimed_keys: Mutex::new(Default::default()),
@@ -1842,12 +1856,15 @@ pub async fn interactive_tui(
                                 .ok()
                                 .and_then(|s| s.fullscreen_copy_on_select)
                                 .unwrap_or(true);
-                            if auto_copy {
-                                if let Some(selected_text) = tui_for_key.selection_text() {
-                                    if !selected_text.trim().is_empty() {
-                                        let _ = copy_to_clipboard(&selected_text);
-                                    }
-                                }
+                            if auto_copy
+                                && copy_mouse_selection_with(&tui_for_key, copy_to_clipboard)
+                                    == Some(false)
+                            {
+                                add_note_message(
+                                    &state_for_key.chat_container,
+                                    "Clipboard unavailable. Selection kept; press Ctrl+X to retry.",
+                                );
+                                tui_for_key.request_render(false);
                             }
                         }
                     }
@@ -2126,9 +2143,9 @@ pub async fn interactive_tui(
                 continue;
             }
 
-            // 0b. Ctrl+X: upstream's `app.message.copy` — copy the editor
-            //     selection, else the last assistant reply. Native's Ctrl+C no
-            //     longer copies, so selection-copy lives here now.
+            // 0b. Ctrl+X: copy the mouse selection first, then the editor
+            //     selection, else the last assistant reply. Ctrl+C retains its
+            //     clear/exit semantics. A failed write must not change sources.
             if !state_for_key.selector_open()
                 && keybinding_matches(
                     &keybindings_for_key,
@@ -2136,10 +2153,22 @@ pub async fn interactive_tui(
                     rpi_tui::keybindings::keys::MESSAGE_COPY,
                 )
             {
-                if editor_for_key.has_selection() && editor_for_key.copy_selection() {
-                    add_note_message(&state_for_key.chat_container, "Copied!");
-                } else {
-                    copy_last_assistant(&state_for_key, &state_for_key.chat_container);
+                match copy_mouse_selection_with(&tui_for_key, copy_to_clipboard) {
+                    Some(copied) => add_note_message(
+                        &state_for_key.chat_container,
+                        if copied {
+                            "Copied selection to the clipboard."
+                        } else {
+                            "Clipboard unavailable. Selection kept; press Ctrl+X to retry."
+                        },
+                    ),
+                    None => {
+                        if editor_for_key.has_selection() && editor_for_key.copy_selection() {
+                            add_note_message(&state_for_key.chat_container, "Copied!");
+                        } else {
+                            copy_last_assistant(&state_for_key, &state_for_key.chat_container);
+                        }
+                    }
                 }
                 tui_for_key.request_render(false);
                 continue;
@@ -3135,10 +3164,16 @@ pub async fn interactive_tui(
             Some(TuiMessage::SetSessionName(name)) => {
                 let outcome = harness.session().set_name(Some(&name)).await;
                 match outcome {
-                    Ok(_) => add_note_message(
-                        &chat_container,
-                        &format!("Session renamed to \"{name}\"."),
-                    ),
+                    Ok(_) => {
+                        // Line 1 of the footer renders `session_name`, but nothing
+                        // in production ever wrote it — the slot was always empty
+                        // and `/name` looked like a no-op on screen.
+                        state.footer.set_session_name(Some(&name));
+                        add_note_message(
+                            &chat_container,
+                            &format!("Session renamed to \"{name}\"."),
+                        );
+                    }
                     Err(e) => add_error_message(
                         &chat_container,
                         &format!("Could not rename session: {e}"),

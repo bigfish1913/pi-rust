@@ -207,6 +207,35 @@ steering/follow-up 不会重入正在执行的工具，`nextTurn` 也不会被�
 默认空闲发送现在与 Pi 一致，不再自动请求模型。原来依赖默认发送立即回复的
 调用，应显式传 `triggerTurn: true`。
 
+### 工具提示词摘要与规则（与 Pi 一致）
+
+工具 schema 决定模型是否能调用工具；系统提示词只选择性展示摘要，两者独立。
+先注册工具，再通过可选 `api.register_tool_prompt` 注册显式元数据：
+
+```rust
+if let Some(register_prompt) = api.register_tool_prompt {
+    let status = register_prompt(
+        rpi_plugin_sdk::StbStringRef::from_str("my_tool"),
+        rpi_plugin_sdk::StbStringRef::from_str(
+            r#"{"promptSnippet":"工具的简短摘要","promptGuidelines":["该工具的具体使用规则"]}"#,
+        ),
+    );
+    if status != 0 { return status; }
+}
+```
+
+- 只能为当前插件已经注册的工具设置元数据。返回值：`0` 成功、`1` 未知工具、
+  `2` 元数据不是合法对象或字段类型错误、`-1` 不在注册阶段；参数字符串由宿主立即复制。
+- `promptSnippet` 可省略；trim 后非空且工具已启用，才出现在提示词工具列表。
+  无摘要的工具仍通过 schema 正常可用，不自动把 description 当摘要。
+- `promptGuidelines` 可省略；只收集启用工具的规则，trim、去空白，并按启用工具顺序
+  与其他工具及核心规则去重。有规则不要求有摘要；宿主不再为外部 todo 工具硬编码规则。
+- 元数据随工具定义参与 first-wins 合并及 reload。同名扩展替换内置工具时，不继承
+  原内置摘要；卸载或停用工具后，不残留其摘要和规则。空对象清除元数据。
+- registrar 只追加到 ABI vtable 尾部，不改变 `StableToolSchema` 或 ABI 版本。
+  旧插件仍可加载；旧宿主槽位为 `None` 时跳过元数据注册，不能因此跳过工具注册。
+- 自定义 `SYSTEM.md` / `--system-prompt` 仍替换默认提示词；上述自动贡献只用于默认提示词。
+
 ## 4. 工具生命周期：execute → poll → cancel → destroy
 
 工具导出四个 `extern "C"` 函数，宿主按固定协议驱动：
@@ -582,12 +611,14 @@ provider / API / model ID 恢复；修改公开描述不能重定向绑定的凭
 
 默认凭据由宿主按 provider ID 解析：选中 provider 的 `--api-key` → `auth.json`
 有效 key / OAuth → `models.json` → 声明的 `apiKeyEnv` → 显式允许的匿名。
-协议名不决定认证，不继承 `OPENAI_API_KEY`；空白、未解析引用和过期 token 不算可用。
+协议名不决定认证，不继承 `OPENAI_API_KEY`；空白、未解析引用和无法刷新的过期 token 不算可用。
 目录不得含凭据；请求参数、token 与私密请求头不得进入日志、普通事件或错误文本。
 OAuth 供应商流程另外通过 `register_oauth_provider` 接入，宿主负责通用命令与存储。
 
-`auth check`、`/provider` 与实际请求使用同一认证解析。`auth check` 只检查本地状态，
-不访问服务端或刷新 token；退出码为就绪 0、缺少凭据 1、配置错误 2。
+加载匹配 OAuth 扩展且存储项含 refresh token 时，宿主可选择过期登录对应的 provider，
+并在每次请求前自动刷新已过期或 60 秒内到期的 token，先保存再使用；刷新失败不发送旧 token。
+`auth check` 只检查本地未过期凭据，不访问服务端或刷新 token，可能在请求仍可自动刷新时报告缺少凭据；
+退出码为就绪 0、缺少凭据 1、配置错误 2。
 `/provider <id>` 与列表选择会即时切换当前会话并保存默认模型；缺少认证或切换失败时
 保留原会话与默认值。`/model` 选择具体模型；`/provider remove` 删除配置，
 卸载 package 使用 `rpi package unlink`。API-key logout 不会清除环境变量或 models.json。

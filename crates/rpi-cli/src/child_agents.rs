@@ -486,6 +486,10 @@ Task:
                     return;
                 }
             };
+            // Admission no longer needs the parent binding. Retaining it for
+            // the run would keep weak runtime-action bindings alive and prevent
+            // the parent's Drop from cancelling its children.
+            drop(parent);
             // Sending admission is synchronous: a dropped receiver cannot cause
             // an announcement. Storage and harness exist before any child traffic.
             if reply.send(Ok(json!({"childId":id,"sessionId":id,"status":"running"}))).is_err() {

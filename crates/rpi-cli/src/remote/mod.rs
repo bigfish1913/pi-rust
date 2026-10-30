@@ -28,6 +28,7 @@ pub mod cbor;
 pub mod client;
 pub mod codec;
 pub mod framing;
+pub(crate) mod message_accumulator;
 pub mod protocol;
 pub mod session;
 pub mod tui;
