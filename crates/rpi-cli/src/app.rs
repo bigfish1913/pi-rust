@@ -307,7 +307,12 @@ async fn run_inner() -> i32 {
         Ok(prepared) => prepared,
         Err(error) => {
             print_build_error(&error);
-            return EXIT_RUNTIME;
+            // A bad `--host-tools` declaration is a startup-contract mistake
+            // (wrong mode, bad names), not a runtime failure.
+            return match error {
+                BuildError::HostTools(_) => EXIT_USAGE,
+                _ => EXIT_RUNTIME,
+            };
         }
     };
     let resolved = match resolve_with_extensions(
@@ -590,6 +595,7 @@ async fn run_inner() -> i32 {
                         reload_context.ui_dialog.clone(),
                         oauth_snapshot,
                         parsed.rpc_message_updates,
+                        reload_context.host_tools.clone(),
                     )
                     .await
                 };
@@ -1020,6 +1026,11 @@ fn print_build_error(e: &BuildError) {
             eprintln!("error: {e}");
             eprintln!();
             eprintln!("List saved sessions with the /session command in interactive mode.");
+        }
+        BuildError::HostTools(_) => {
+            eprintln!("error: {e}");
+            eprintln!();
+            eprintln!("Write the declaration as a JSON array of {{name, description, parameters}} entries.");
         }
         _ => eprintln!("error: {e}"),
     }

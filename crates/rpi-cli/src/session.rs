@@ -328,6 +328,9 @@ pub fn default_session_dir(cwd: &Path) -> PathBuf {
 /// host remains unbound until the harness and authenticated catalog exist.
 pub struct PreparedExtensions {
     pub extension_session: ExtensionSession,
+    /// Host-declared tools (`--host-tools`), validated against the loaded
+    /// extension tool names so a collision is a startup error.
+    pub host_tools: crate::host_tools::HostToolBridge,
     session_dir: PathBuf,
     runtime: tokio::runtime::Handle,
     tool_context: rpi_extensions::ToolCallContext,
@@ -429,6 +432,21 @@ pub fn prepare_extensions(
         }
         report_deferred_renderers(&extension_session);
     }
+    // Host tools are validated against what extensions actually registered, so
+    // this has to run after the load. A failed declaration is fatal here rather
+    // than at first call: the model must never be offered a tool nobody answers.
+    let extension_tool_names: Vec<String> = extension_session
+        .snapshot()
+        .map(|snapshot| {
+            snapshot
+                .tools()
+                .iter()
+                .map(|tool| tool.tool.name.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let host_tools =
+        crate::host_tools::load(args, &extension_tool_names).map_err(BuildError::HostTools)?;
     Ok(PreparedExtensions {
         session_dir,
         runtime,
@@ -441,6 +459,7 @@ pub fn prepare_extensions(
         editor_text_mailbox,
         action_bridge,
         extension_session,
+        host_tools,
     })
 }
 
@@ -500,6 +519,7 @@ pub async fn build_prepared(
     let PreparedExtensions {
         session_dir,
         runtime,
+        host_tools,
         tool_context,
         action_host,
         harness_cell,
@@ -532,6 +552,7 @@ pub async fn build_prepared(
     // the harness lifetime via the returned session guard. `--no-extensions`
     // skips discovery entirely (no dirs scanned, no plugins loaded).
     merge_extension_tools(&mut tools, &extension_session, args, &tool_context);
+    host_tools.merge_into(&mut tools, args);
     let active = filter_active_tool_names(active_tool_names(&tools, args), args);
 
     // ---- Session storage ----
@@ -573,7 +594,8 @@ pub async fn build_prepared(
     // working-state rule is worded (see `default_system_prompt`).
     let prior_reasoning_replayed = rpi_ai::model::prior_reasoning_is_replayed(&resolved.model);
     let prompt_tools = active.clone();
-    let prompt_metadata = extension_tool_prompt_metadata(&extension_session);
+    let mut prompt_metadata = extension_tool_prompt_metadata(&extension_session);
+    prompt_metadata.extend(host_tools.prompt_metadata());
     let default_prompt = || {
         default_system_prompt_with_tool_prompts(
             &cwd_str,
@@ -1055,6 +1077,7 @@ pub async fn build_prepared(
         broadcast: broadcast_for_context,
         mailbox: reload_mailbox,
         ui_dialog: ui_dialog_mailbox,
+        host_tools,
         ext_status: ext_status_mailbox,
         editor_text: editor_text_mailbox,
         dev_extension: None,
@@ -1229,6 +1252,10 @@ pub struct ReloadContext {
     /// A detached mailbox makes `ask_user` fail with "requires an interactive
     /// UI" (headless contract).
     pub ui_dialog: rpi_extensions::UiDialogMailbox,
+    /// Host-declared tools (`--host-tools`). Held here so `/reload` re-merges
+    /// the same bridge the `--mode rpc` loop relays to the client; an empty
+    /// bridge is the normal case for every other mode.
+    pub host_tools: crate::host_tools::HostToolBridge,
     /// Active `rpi dev` extension builder. `/reload` rebuilds it before
     /// swapping plugin sessions; its watcher signals `mailbox` after a
     /// successful background build.
@@ -1710,10 +1737,12 @@ where
         &effective_args,
         &ctx.tool_context,
     );
+    ctx.host_tools.merge_into(&mut tools, &effective_args);
     let mut active = active_tool_names(&tools, &effective_args);
     active = filter_active_tool_names(active, &effective_args);
     let prompt_tools = active.clone();
-    let prompt_metadata = extension_tool_prompt_metadata(&extension_session);
+    let mut prompt_metadata = extension_tool_prompt_metadata(&extension_session);
+    prompt_metadata.extend(ctx.host_tools.prompt_metadata());
     let prior_reasoning_replayed = rpi_ai::model::prior_reasoning_is_replayed(&ctx.resolved_model);
     let default_prompt = || {
         default_system_prompt_with_tool_prompts(
@@ -2049,6 +2078,8 @@ pub enum BuildError {
     SessionNotFound { requested: String, dir: String },
     #[error("Could not build the harness: {0}")]
     HarnessCreate(String),
+    #[error("Invalid --host-tools declaration: {0}")]
+    HostTools(String),
 }
 
 /// Keep configured factories (including package-specific auth and catalogs)

@@ -113,6 +113,34 @@ provider / harness / session / extension 的全部本地构建——这是“客
 客户端可用命令（`RemoteCommand`）：`prompt`、`abort`、`get_state`、`set_model`、
 `set_thinking_level`、`set_active_tools`、`ping`、`stop`。
 
+### 宿主工具（`--host-tools`）
+
+宿主可以在启动时声明只有它自己才能实现的工具（例如“在界面上打开某个文件”）：
+`--host-tools <file>` 指向一个 JSON 数组，每项为
+`{name, description, parameters, promptSnippet?, promptGuidelines?}`，其中 `parameters`
+是 `type: "object"` 的 JSON Schema，`promptSnippet`/`promptGuidelines` 与扩展工具
+同名元数据一样进系统提示词（不给则不列出该工具）。该参数只能和 `--mode rpc` 一起用，
+启动时即校验：文件可读、JSON 合法、`name` 匹配 `^[A-Za-z0-9_-]{1,64}$`、名字不重复
+且不与内置/扩展工具重名；失败直接报错退出。宿主工具同样受
+`--tools`/`--exclude-tools`/`--no-tools` 约束。
+
+模型调用宿主工具时服务端发事件，然后等宿主回结果：
+
+```json
+{"type":"host_tool_call","requestId":"r-1","toolCallId":"tool-7","toolName":"open_file","arguments":{"path":"a.txt"}}
+{"type":"host_tool_result","id":9,"requestId":"r-1","content":[{"type":"text","text":"opened a.txt"}],"details":{"path":"a.txt"}}
+```
+
+`content` 原样成为工具结果内容（文本或 `{"type":"image","data":"<base64>","mimeType":"image/png"}`），
+`details` 进结果的 details，`isError: true` 时该调用按失败返回（文字取 `content` 里的文本）。
+带 `id` 时回 `response`（成功为 `{"accepted":true,"requestId":…}`，未知或已结束的
+`requestId` 报错），不带 `id` 时错误只写 stderr。运行被 abort 时引擎立即以中止错误返回该工具
+并发出 `{"type":"host_tool_cancelled","requestId":…}`，之后再来的同一 `requestId` 结果按
+未知报错；stdin EOF 或 `stop` 时所有未完成的调用以 “host disconnected” 结束。服务端没有超时，
+超时策略由宿主自己负责。`ready` 里 `supportedCommands` 含 `host_tool_result`、
+`supportedEvents` 含 `host_tool_call`/`host_tool_cancelled`，并新增
+`hostTools`（已声明且启用的工具名，未声明时为 `[]`）。
+
 ### 消息更新模式与升级（#171）
 
 **默认线格式发生变化：新版 `--mode rpc` 默认使用 `compact-deltas`。**

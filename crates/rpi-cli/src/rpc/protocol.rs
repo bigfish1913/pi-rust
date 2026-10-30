@@ -113,6 +113,17 @@ pub enum Command {
         #[serde(default)]
         cancelled: bool,
     },
+    /// The host's answer to a `host_tool_call`.
+    HostToolResult {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        #[serde(default)]
+        content: Vec<crate::host_tools::HostToolContentBlock>,
+        #[serde(rename = "isError", default)]
+        is_error: bool,
+        #[serde(default)]
+        details: Option<Value>,
+    },
     Ping,
     Stop,
 }
@@ -145,6 +156,7 @@ pub const SUPPORTED_COMMANDS: &[&str] = &[
     "get_available_tools",
     "set_active_tools",
     "ui_dialog_response",
+    "host_tool_result",
     "ping",
     "stop",
 ];
@@ -173,13 +185,18 @@ pub fn response(id: Option<Value>, command: &str, result: Result<Option<Value>, 
     out
 }
 
-pub fn ready(mode: crate::args::RpcMessageUpdates) -> Value {
+pub fn ready(mode: crate::args::RpcMessageUpdates, host_tools: &[String]) -> Value {
     json!({
         "type": "ready",
         "protocol": "rpi",
         "piCompatibilityTarget": PI_BASELINE,
         "supportedCommands": SUPPORTED_COMMANDS,
-        "supportedEvents": ["session_entry_committed"],
+        "supportedEvents": [
+            "session_entry_committed",
+            "host_tool_call",
+            "host_tool_cancelled"
+        ],
+        "hostTools": host_tools,
         "semantics": {
             "messageUpdates": mode.as_str(),
             "promptResponse": "accepted",
@@ -240,9 +257,12 @@ mod tests {
             crate::args::RpcMessageUpdates::CompactDeltas,
             crate::args::RpcMessageUpdates::Snapshot,
         ] {
-            assert_eq!(ready(mode)["semantics"]["messageUpdates"], mode.as_str());
+            assert_eq!(
+                ready(mode, &[])["semantics"]["messageUpdates"],
+                mode.as_str()
+            );
         }
-        let value = ready(crate::args::RpcMessageUpdates::default());
+        let value = ready(crate::args::RpcMessageUpdates::default(), &[]);
         assert_eq!(value["protocol"], "rpi");
         assert_eq!(value["semantics"]["settlementEvent"], "agent_settled");
         assert!(value["supportedCommands"]
@@ -254,7 +274,7 @@ mod tests {
 
     #[test]
     fn ready_advertises_the_read_only_history_snapshot() {
-        let value = ready(crate::args::RpcMessageUpdates::default());
+        let value = ready(crate::args::RpcMessageUpdates::default(), &[]);
         assert!(value["supportedCommands"]
             .as_array()
             .unwrap()
@@ -264,7 +284,7 @@ mod tests {
 
     #[test]
     fn ready_advertises_resuming_an_interrupted_run() {
-        let value = ready(crate::args::RpcMessageUpdates::default());
+        let value = ready(crate::args::RpcMessageUpdates::default(), &[]);
         assert!(value["supportedCommands"]
             .as_array()
             .unwrap()
@@ -274,7 +294,7 @@ mod tests {
 
     #[test]
     fn ready_advertises_compaction() {
-        let value = ready(crate::args::RpcMessageUpdates::default());
+        let value = ready(crate::args::RpcMessageUpdates::default(), &[]);
         assert!(value["supportedCommands"]
             .as_array()
             .unwrap()
@@ -374,6 +394,45 @@ mod tests {
                 if provider == "example"
                     && action == "begin"
                     && input["code"] == "fixture"
+        ));
+    }
+
+    #[test]
+    fn ready_advertises_host_tools() {
+        let value = ready(
+            crate::args::RpcMessageUpdates::default(),
+            &["open_file".to_string()],
+        );
+        let commands = value["supportedCommands"].as_array().unwrap();
+        assert!(commands.iter().any(|command| command == "host_tool_result"));
+        let events = value["supportedEvents"].as_array().unwrap();
+        for event in ["host_tool_call", "host_tool_cancelled"] {
+            assert!(events.iter().any(|value| value == event), "{event}");
+        }
+        assert_eq!(value["hostTools"], json!(["open_file"]));
+        // No declared tools still advertises the capability, with an empty list.
+        assert_eq!(
+            ready(crate::args::RpcMessageUpdates::default(), &[])["hostTools"],
+            json!([])
+        );
+    }
+
+    #[test]
+    fn host_tool_result_payload_keeps_content_and_error() {
+        let request: Request = serde_json::from_value(json!({
+            "type": "host_tool_result", "requestId": "r1",
+            "content": [
+                {"type": "text", "text": "opened"},
+                {"type": "image", "data": "AAA", "mimeType": "image/png"}
+            ],
+            "isError": true, "details": {"path": "a.txt"}
+        }))
+        .unwrap();
+        assert!(matches!(
+            request.command,
+            Command::HostToolResult { request_id, content, is_error, details }
+                if request_id == "r1" && content.len() == 2 && is_error
+                    && details == Some(json!({"path": "a.txt"}))
         ));
     }
 
