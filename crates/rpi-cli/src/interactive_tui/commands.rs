@@ -352,8 +352,22 @@ impl SlashCommand for ThemeCommand {
                 registry.as_ref(),
             ) {
                 Ok(message) => {
-                    if let Ok(mut active) = ctx.state.active_theme_spec.lock() {
-                        *active = Some(spec.clone());
+                    ctx.state.set_active_theme_spec(Some(spec.clone()));
+                    let registry_now = ctx
+                        .state
+                        .theme_registry
+                        .read()
+                        .ok()
+                        .map(|registry| registry.clone());
+                    let chat_watcher = ctx.chat.clone();
+                    if let Some(registry_now) = registry_now.as_ref() {
+                        crate::themes::restart_theme_watcher(
+                            &ctx.state.theme_watcher,
+                            Some(&spec),
+                            registry_now,
+                            &ctx.state.theme_manager,
+                            theme_watch_notify(chat_watcher, ctx.tui.clone()),
+                        );
                     }
                     add_note_message(&ctx.chat, &message);
                 }

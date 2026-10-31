@@ -288,6 +288,10 @@ pub(super) struct TuiState {
     /// file path / registry name), so `/reload` can detect that the active
     /// file theme vanished and fall back.
     pub(super) active_theme_spec: std::sync::Mutex<Option<String>>,
+    /// The running theme-file watcher, if the active theme is a file. Swapped
+    /// whenever the active theme changes (selection or reload fallback);
+    /// presets leave it `None` (nothing to poll).
+    pub(super) theme_watcher: std::sync::Mutex<Option<crate::fs_watch::WatchHandle>>,
     /// The alt-screen handle, held so `set_status` can reflect run state in the
     /// terminal window title ("rpi — working" / "rpi"). `None` in unit tests
     /// that never call `set_status` with a title.
@@ -1414,6 +1418,22 @@ pub(super) fn navigate_history(state: &Arc<TuiState>, editor: &Arc<Editor>, dire
 }
 
 impl TuiState {
+    /// Current active theme spec (the persisted form: preset name or file
+    /// path / registry name).
+    pub(super) fn active_theme_spec(&self) -> Option<String> {
+        self.active_theme_spec
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    /// Record the active theme spec (selection, reload fallback).
+    pub(super) fn set_active_theme_spec(&self, spec: Option<String>) {
+        if let Ok(mut guard) = self.active_theme_spec.lock() {
+            *guard = spec;
+        }
+    }
+
     pub(super) fn cancel_js_preparation(&self) -> bool {
         let cancellation = self.js_preparation_cancel.lock().unwrap().take();
         if let Some(cancellation) = cancellation {
