@@ -1354,6 +1354,27 @@ impl AgentHarness {
             .map_err(session_to_harness_err)
     }
 
+    /// Bounded user-only summaries on this harness's selected lane.
+    pub async fn message_summaries(
+        &self,
+        query: &crate::session::types::MessageSummaryQuery,
+    ) -> HarnessResult<crate::session::types::MessageSummaryPage> {
+        self.view()
+            .message_summaries(query)
+            .await
+            .map_err(session_to_harness_err)
+    }
+    /// Bounded, bidirectionally pageable transcript context on the selected lane.
+    pub async fn message_window(
+        &self,
+        query: &crate::session::types::MessageWindowQuery,
+    ) -> HarnessResult<crate::session::types::MessageWindowPage> {
+        self.view()
+            .message_window(query)
+            .await
+            .map_err(session_to_harness_err)
+    }
+
     /// `getEntry(id)` — look up a single entry by id. Mirrors TS
     /// `AgentHarness.getEntry`.
     pub async fn get_entry(&self, id: &str) -> HarnessResult<Option<Entry>> {

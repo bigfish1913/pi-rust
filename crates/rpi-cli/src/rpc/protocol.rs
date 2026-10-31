@@ -40,6 +40,26 @@ pub enum Command {
         #[serde(rename = "beforeId")]
         before_id: Option<String>,
     },
+    /// Optional bounded user summaries and transcript windows.
+    GetMessageSummaries {
+        limit: Option<u64>,
+        role: Option<String>,
+        #[serde(rename = "beforeId")]
+        before_id: Option<String>,
+        #[serde(rename = "leafId")]
+        leaf_id: Option<String>,
+    },
+    GetMessageWindow {
+        limit: Option<u64>,
+        #[serde(rename = "anchorId")]
+        anchor_id: Option<String>,
+        #[serde(rename = "beforeId")]
+        before_id: Option<String>,
+        #[serde(rename = "afterId")]
+        after_id: Option<String>,
+        #[serde(rename = "leafId")]
+        leaf_id: Option<String>,
+    },
     GetHistory {
         limit: Option<u64>,
         #[serde(rename = "afterSeq")]
@@ -172,6 +192,8 @@ pub const SUPPORTED_COMMANDS: &[&str] = &[
     "get_commands",
     "execute_command",
     "get_messages",
+    "get_message_summaries",
+    "get_message_window",
     "get_history",
     "get_session_branch",
     "append_entry",
