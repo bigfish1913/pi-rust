@@ -13,8 +13,9 @@
 //! for UTF-8 and legacy CJK encodings; `\r` also flushes progress displays.
 //!
 //! The limit bounds buffering for long lines without delimiters. Once exceeded,
-//! the encoding decision applies until the next `\n` or `\r`, with incomplete
-//! characters carried by the chosen decoder. Decisions use a fixed byte count,
+//! a UTF-8 character cut by the limit is completed (at most 3 more bytes) before
+//! deciding, and the decision applies until the next `\n` or `\r`, with
+//! incomplete characters carried by the chosen decoder. Decisions use a fixed byte count,
 //! independent of read boundaries. A known UTF-8 fallback (the non-Windows
 //! default) has no ambiguity and streams immediately, retaining only incomplete
 //! trailing characters.
@@ -25,7 +26,8 @@
 use encoding_rs::{Decoder, Encoding};
 
 // Bound memory and latency for undelimited output, while allowing ordinary
-// non-ASCII lines to be classified as a whole. Commit at exactly LIMIT + 1 bytes.
+// non-ASCII lines to be classified as a whole. Decide at LIMIT + 1 bytes, or up
+// to 3 bytes later when that cuts a UTF-8 character.
 const PENDING_LIMIT: usize = 64 * 1024;
 
 /// Decodes one output stream chunk by chunk. Create one per stream.
@@ -99,11 +101,16 @@ impl StreamDecoder {
                     continue;
                 }
             }
-            let count = line.len().min(PENDING_LIMIT + 1 - self.pending.len());
+            // Past the limit, take one byte at a time until UTF-8 validity is
+            // decided, so the decision point does not depend on reads.
+            let room = (PENDING_LIMIT + 1)
+                .saturating_sub(self.pending.len())
+                .max(1);
+            let count = line.len().min(room);
             self.pending.extend_from_slice(&line[..count]);
             bytes = &bytes[count..];
             let last = ends_line && count == line.len();
-            if last || self.pending.len() > PENDING_LIMIT {
+            if last || (self.pending.len() > PENDING_LIMIT && utf8_decided(&self.pending)) {
                 self.commit_pending(last, &mut out);
             }
         }
@@ -137,6 +144,12 @@ impl StreamDecoder {
         }
         out
     }
+}
+
+/// Whether `bytes` is valid UTF-8 or contains an invalid sequence, as opposed
+/// to valid UTF-8 cut inside its last character (at most 3 bytes).
+fn utf8_decided(bytes: &[u8]) -> bool {
+    std::str::from_utf8(bytes).map_or_else(|err| err.error_len().is_some(), |_| true)
 }
 
 /// Decode a whole buffer at once (e.g. a probe's captured stdout).
@@ -309,6 +322,29 @@ mod tests {
                 .push(&bytes[PENDING_LIMIT..PENDING_LIMIT + 1])
                 .is_empty());
         }
+    }
+
+    #[test]
+    fn pending_limit_keeps_characters_cut_by_the_limit() {
+        for ch in ["é", "中", "😀"] {
+            for cut in 1..ch.len() {
+                // Pending starts at "é"; `ch` starts `cut` bytes before the limit.
+                let mut text = format!("é{}", "a".repeat(PENDING_LIMIT - 1 - cut));
+                text.push_str(&ch.repeat(3));
+                text.push('\n');
+                let bytes = text.as_bytes();
+                for splits in [vec![], vec![PENDING_LIMIT], vec![PENDING_LIMIT + 1]] {
+                    assert_eq!(decode_at_splits(bytes, &splits), text, "{ch} cut {cut}");
+                }
+                let mut decoder = StreamDecoder::with_fallback(encoding_rs::GBK);
+                assert_eq!(decode_in_reads(&mut decoder, bytes, 8192), text);
+            }
+        }
+        // A GBK lead byte at the limit that also starts a UTF-8 sequence.
+        let mut bytes = b"\xC2\xA9".to_vec();
+        bytes.resize(PENDING_LIMIT, b'a');
+        bytes.extend_from_slice(b"\xD6\xD0\n");
+        assert!(decode_at_splits(&bytes, &[]).ends_with("a中\n"));
     }
 
     #[test]
