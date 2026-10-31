@@ -2366,6 +2366,7 @@ fn assistant_with_one_tool_call(call_id: &str, name: &str) -> rpi_ai::types::Ass
             arguments: serde_json::json!({}),
             thought_signature: None,
             namespace: None,
+            recorded: None,
         }));
     message
 }
@@ -3966,6 +3967,7 @@ async fn a_deferred_response_suspends_and_then_resumes_through_its_tools() {
         arguments: serde_json::json!({ "path": "b.txt" }),
         thought_signature: None,
         namespace: None,
+        recorded: None,
     })];
     provider.push_deferred_poll(DeferredPoll::Message(polled));
 

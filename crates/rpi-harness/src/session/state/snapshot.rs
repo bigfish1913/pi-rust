@@ -123,7 +123,38 @@ impl<'de> Deserialize<'de> for SessionState {
                 other => StoredLogItem::Other(Box::new(other)),
             });
         }
+        // Rebuild the derived role index. Reject malformed parent graphs rather
+        // than allowing an optimized ancestry walk to loop or cross a branch.
+        if entries_by_id.len() != snapshot.entries.len() {
+            return Err(D::Error::custom("snapshot has duplicate entry IDs"));
+        }
+        let mut nearest_user = Vec::with_capacity(snapshot.entries.len());
+        for (index, entry) in snapshot.entries.iter().enumerate() {
+            let previous = match entry.parent_id() {
+                Some(id) => {
+                    let parent = entries_by_id
+                        .get(id)
+                        .filter(|parent| **parent < index)
+                        .ok_or_else(|| {
+                            D::Error::custom("snapshot has a missing or forward parent")
+                        })?;
+                    nearest_user[*parent]
+                }
+                None => None,
+            };
+            nearest_user.push(
+                if matches!(
+                    entry.as_message(),
+                    Some(rpi_agent::message::AgentMessage::User(_))
+                ) {
+                    Some(index)
+                } else {
+                    previous
+                },
+            );
+        }
         Ok(Self {
+            nearest_user,
             sequence: snapshot.sequence,
             used_ids: snapshot.used_ids,
             entries: snapshot.entries,

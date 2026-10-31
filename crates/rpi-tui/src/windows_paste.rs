@@ -164,7 +164,10 @@ mod tests {
         let editor = crate::Editor::simple();
         editor.handle_paste(&actual);
         assert!(editor.get_text().starts_with("[paste #1"));
-        assert_eq!(editor.get_expanded_text(), actual.replace('\t', "    "));
+        assert_eq!(
+            editor.get_expanded_text(),
+            crate::editor::expand_tabs(&actual, crate::editor::PASTE_TAB_WIDTH)
+        );
     }
 
     #[test]

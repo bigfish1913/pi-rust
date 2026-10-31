@@ -85,6 +85,37 @@ pub fn note(text: &str) {
     append(path, &format!("{} {text}\n", timestamp()));
 }
 
+/// Paste-boundary diagnostics, independent of the per-key/content trace.
+/// Only caller-supplied counts and decisions are recorded, never clipboard text.
+/// Enable with RPI_DEBUG_PASTE=1 or a log file path for one test session.
+pub fn paste_note(note: impl FnOnce() -> String) {
+    static TARGET: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    let path = TARGET.get_or_init(|| {
+        let value = std::env::var("RPI_DEBUG_PASTE").ok()?;
+        let value = value.trim();
+        let path = if value.is_empty() || value == "0" {
+            return None;
+        } else if value == "1" || value.eq_ignore_ascii_case("true") {
+            std::env::temp_dir().join("rpi-paste.log")
+        } else {
+            std::path::PathBuf::from(value)
+        };
+        append(
+            &path,
+            &format!(
+                "{} paste run pid={} version={}\n",
+                timestamp(),
+                std::process::id(),
+                env!("CARGO_PKG_VERSION")
+            ),
+        );
+        Some(path)
+    });
+    if let Some(path) = path {
+        append(path, &format!("{} paste {}\n", timestamp(), note()));
+    }
+}
+
 fn append(path: &std::path::Path, line: &str) {
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)

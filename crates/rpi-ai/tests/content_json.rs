@@ -32,6 +32,7 @@ fn blocks() -> Vec<Content> {
             arguments: json!({"region": [1, 2], "nested": {"enabled": true}}),
             thought_signature: Some("tool-signature".into()),
             namespace: Some("synthetic".into()),
+            recorded: None,
         }),
     ]
 }

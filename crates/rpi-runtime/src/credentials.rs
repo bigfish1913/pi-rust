@@ -47,9 +47,10 @@ pub(crate) fn state(
     store: &AuthStore,
     manifest: Option<&ProviderManifest>,
     values: &dyn ValueSource,
+    refreshable: bool,
     has_headers: impl FnOnce() -> bool,
 ) -> AuthState {
-    let credential = resolve(provider, config, store, manifest, values);
+    let credential = resolve_refreshable(provider, config, store, manifest, values, refreshable);
     let source = if credential.source.is_present() {
         credential.source
     } else if has_headers() {
@@ -91,6 +92,36 @@ impl CredentialSource {
     }
 }
 
+/// Seconds before expiry at which a stored OAuth credential is renewed, so a
+/// token cannot expire between the check and the provider's request.
+pub const OAUTH_REFRESH_MARGIN_SECS: i64 = 60;
+
+/// Whether a stored OAuth credential expiring at `expires` (Unix seconds, `0`
+/// for never) should be renewed before it is used at `now`.
+pub fn oauth_needs_refresh(expires: i64, now: i64) -> bool {
+    expires != 0 && expires <= now.saturating_add(OAUTH_REFRESH_MARGIN_SECS)
+}
+
+/// A renewed OAuth access token, already persisted by the host.
+// Deliberately no Debug: this object contains secret material.
+pub struct RefreshedOAuth {
+    pub access: String,
+    /// Unix seconds; `0` means the credential does not expire.
+    pub expires: i64,
+}
+
+/// Host-owned renewal of stored OAuth credentials, typically through the
+/// provider package that issued them. Requests call it before sending a stored
+/// OAuth credential that has expired or is about to.
+pub trait OAuthRefresher: Send + Sync {
+    /// Whether the host can renew `provider`'s stored OAuth credential.
+    fn supports(&self, provider: &str) -> bool;
+    /// Renew and persist `provider`'s stored credential. This may block, so the
+    /// runtime calls it off the async workers. The error is shown to the user
+    /// and must not contain credential material.
+    fn refresh(&self, provider: &str) -> Result<RefreshedOAuth, String>;
+}
+
 // Deliberately no Debug: this object contains secret material.
 pub struct ResolvedCredential {
     pub key: Option<String>,
@@ -119,6 +150,19 @@ pub fn resolve(
     manifest: Option<&ProviderManifest>,
     values: &dyn ValueSource,
 ) -> ResolvedCredential {
+    resolve_refreshable(provider, config, store, manifest, values, false)
+}
+
+/// As [`resolve`], except that an expired stored OAuth credential still counts
+/// when `refreshable`: the execution binding renews it before it is sent.
+pub(crate) fn resolve_refreshable(
+    provider: &str,
+    config: Option<&ProviderConfig>,
+    store: &AuthStore,
+    manifest: Option<&ProviderManifest>,
+    values: &dyn ValueSource,
+    refreshable: bool,
+) -> ResolvedCredential {
     let bearer = config
         .and_then(|config| config.auth_header)
         .unwrap_or(false);
@@ -142,10 +186,12 @@ pub fn resolve(
             }
         }
         Some(Credential::Oauth {
-            access, expires, ..
+            access,
+            refresh,
+            expires,
         }) if !access.trim().is_empty() => {
             let now = values.now_unix_seconds();
-            if *expires == 0 || *expires > now {
+            if *expires == 0 || *expires > now || (refreshable && !refresh.trim().is_empty()) {
                 return credential(access.clone(), CredentialSource::StoredOauth, true);
             }
         }

@@ -1354,6 +1354,27 @@ impl AgentHarness {
             .map_err(session_to_harness_err)
     }
 
+    /// Bounded user-only summaries on this harness's selected lane.
+    pub async fn message_summaries(
+        &self,
+        query: &crate::session::types::MessageSummaryQuery,
+    ) -> HarnessResult<crate::session::types::MessageSummaryPage> {
+        self.view()
+            .message_summaries(query)
+            .await
+            .map_err(session_to_harness_err)
+    }
+    /// Bounded, bidirectionally pageable transcript context on the selected lane.
+    pub async fn message_window(
+        &self,
+        query: &crate::session::types::MessageWindowQuery,
+    ) -> HarnessResult<crate::session::types::MessageWindowPage> {
+        self.view()
+            .message_window(query)
+            .await
+            .map_err(session_to_harness_err)
+    }
+
     /// `getEntry(id)` — look up a single entry by id. Mirrors TS
     /// `AgentHarness.getEntry`.
     pub async fn get_entry(&self, id: &str) -> HarnessResult<Option<Entry>> {
@@ -2978,6 +2999,11 @@ impl AgentHarness {
         outcome: &crate::frame_progress::UnknownToolOutcome,
         timestamp: i64,
     ) -> AgentMessage {
+        // A call that already ran upstream is answered from its recording and is
+        // never replayed, whatever the tool declares about replay.
+        if let Some(recording) = &outcome.recorded {
+            return crate::frame_progress::recorded_tool_result(outcome, recording, timestamp);
+        }
         let frame = recorded.get(&outcome.tool_call_id);
         let tool = tools
             .iter()
@@ -6885,5 +6911,190 @@ mod agent_end_log_barrier_tests {
              already be in the durable log (the footer reconciles from the log \
              exactly there)"
         );
+    }
+}
+
+#[cfg(test)]
+mod recorded_recovery_tests {
+    use super::*;
+    use crate::session::memory::{CounterIdGenerator, FakeClock, InMemorySessionStorage};
+    use crate::session::session::Session;
+    use crate::session::types::{SessionMetadata, ToolStartedRecord};
+    use crate::types::ToolReplay as HarnessReplay;
+    use rpi_agent::{AgentError, AgentTool, AgentToolResult, ToolResultPartial};
+    use rpi_ai::types::{Api, Content, Tool};
+
+    /// A replay-safe tool whose `execute` is observable through `executions`.
+    struct CountingTool {
+        schema: Tool,
+        executions: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentTool for CountingTool {
+        fn schema(&self) -> &Tool {
+            &self.schema
+        }
+        fn label(&self) -> &str {
+            "Shell"
+        }
+        async fn execute(
+            &self,
+            _id: &str,
+            _params: serde_json::Value,
+            _signal: CancellationToken,
+            _update: Arc<dyn Fn(ToolResultPartial) + Send + Sync>,
+        ) -> Result<AgentToolResult, AgentError> {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            Ok(AgentToolResult::text("executed locally"))
+        }
+    }
+
+    fn shell_tool(executions: &Arc<AtomicUsize>) -> Vec<HarnessTool> {
+        let schema = Tool {
+            name: "shell".into(),
+            description: "Run a shell command".into(),
+            parameters: rpi_ai::types::Schema::new(serde_json::json!({
+                "type": "object",
+                "properties": { "command": { "type": "string" } },
+                "additionalProperties": false
+            })),
+            constrained_sampling: None,
+        };
+        let tool = CountingTool {
+            schema,
+            executions: Arc::clone(executions),
+        };
+        vec![HarnessTool::new(Arc::new(tool)).with_replay(HarnessReplay::Safe)]
+    }
+
+    fn safe_record(call_id: &str) -> BTreeMap<String, ToolStartedRecord> {
+        BTreeMap::from([(
+            call_id.to_string(),
+            ToolStartedRecord {
+                base: RecordBase {
+                    id: "tool-started-1".into(),
+                    seq: 0,
+                    lane: "main".into(),
+                    timestamp: 0,
+                },
+                run_id: "run".into(),
+                assistant_entry_id: "assistant".into(),
+                tool_index: 0,
+                tool_call_id: call_id.into(),
+                tool_name: "shell".into(),
+                effective_args: serde_json::json!({ "command": "rm -rf target" }),
+                result_entry_id: "result".into(),
+                replay: ToolReplay::Safe,
+            },
+        )])
+    }
+
+    fn empty_session() -> Session {
+        Session::new(
+            Arc::new(InMemorySessionStorage::new(
+                SessionMetadata {
+                    id: "memory".into(),
+                    created_at: 0,
+                    parent_session_id: None,
+                },
+                Arc::new(FakeClock::new()),
+                Arc::new(CounterIdGenerator::new()),
+            )),
+            None,
+        )
+    }
+
+    fn partial_with(call: serde_json::Value) -> AssistantMessage {
+        let mut partial = AssistantMessage::empty(Api::Faux, "external", "model", 7);
+        partial
+            .content
+            .push(serde_json::from_value::<Content>(call).expect("tool call decodes"));
+        partial
+    }
+
+    /// Crash recovery must not re-run a call that already ran upstream, even
+    /// when the tool is replay-safe and the call was recorded as safe to replay.
+    /// The recording is the outcome, so it is reported rather than repeated.
+    #[tokio::test]
+    async fn recovery_answers_a_recorded_call_without_replaying_it() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let tools = shell_tool(&executions);
+        let partial = partial_with(serde_json::json!({
+            "type": "toolCall",
+            "id": "call-1",
+            "name": "shell",
+            "arguments": { "command": "rm -rf target" },
+            "recorded": {
+                "version": 1,
+                "isError": false,
+                "result": {
+                    "content": [{ "type": "text", "text": "recorded output" }],
+                    "details": {},
+                    "terminate": true
+                }
+            }
+        }));
+        let outcomes =
+            crate::frame_progress::unknown_tool_outcomes(&empty_session(), "main", &partial)
+                .await
+                .expect("outcomes");
+        assert_eq!(outcomes.len(), 1);
+
+        let message = AgentHarness::resolve_tool_call(
+            &tools,
+            &CancellationToken::new(),
+            &safe_record("call-1"),
+            &outcomes[0],
+            7,
+        )
+        .await;
+
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            0,
+            "a recorded call is never replayed"
+        );
+        let AgentMessage::ToolResult(result) = message else {
+            panic!("expected a tool result");
+        };
+        assert!(!result.is_error);
+        let text: String = result
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                Content::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "recorded output");
+    }
+
+    /// The ordinary replay path is unchanged for calls without a recording.
+    #[tokio::test]
+    async fn recovery_still_replays_an_ordinary_safe_call() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let tools = shell_tool(&executions);
+        let partial = partial_with(serde_json::json!({
+            "type": "toolCall",
+            "id": "call-1",
+            "name": "shell",
+            "arguments": { "command": "rm -rf target" }
+        }));
+        let outcomes =
+            crate::frame_progress::unknown_tool_outcomes(&empty_session(), "main", &partial)
+                .await
+                .expect("outcomes");
+
+        let _ = AgentHarness::resolve_tool_call(
+            &tools,
+            &CancellationToken::new(),
+            &safe_record("call-1"),
+            &outcomes[0],
+            7,
+        )
+        .await;
+
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
     }
 }

@@ -14,6 +14,16 @@ use super::component::Component;
 use super::fuzzy::fuzzy_filter;
 use crate::utils::{truncate_to_width, visible_width};
 
+/// Width of the `"→ "` / `"  "` row prefix.
+const PREFIX_WIDTH: usize = 2;
+/// Width reserved for the value column so labels cannot crowd it out.
+const VALUE_COLUMN_WIDTH: usize = 15;
+/// Narrowest label column worth rendering.
+const MIN_LABEL_COLUMN_WIDTH: usize = 20;
+/// Widest label column; beyond this a long label is truncated with `…` so the
+/// description keeps room on wide terminals.
+const MAX_LABEL_COLUMN_WIDTH: usize = 32;
+
 /// A setting item.
 #[derive(Debug, Clone)]
 pub struct SettingItem {
@@ -375,23 +385,52 @@ impl SettingsList {
         }
     }
 
+    /// Width of the label column shared by every rendered row.
+    ///
+    /// Wide enough for the longest label in `filtered` so labels are never cut
+    /// mid-word, but clamped to `[MIN_LABEL_COLUMN_WIDTH, MAX_LABEL_COLUMN_WIDTH]`
+    /// and to the space left by the value column, so a narrow terminal still
+    /// shows the values.
+    fn label_column_width(&self, filtered: &[SettingItem], width: usize) -> usize {
+        let reserved = PREFIX_WIDTH + VALUE_COLUMN_WIDTH + 1;
+        let available = width.saturating_sub(reserved);
+        let widest = filtered
+            .iter()
+            .map(|item| visible_width(&item.label))
+            .max()
+            .unwrap_or(MIN_LABEL_COLUMN_WIDTH);
+        widest
+            .clamp(MIN_LABEL_COLUMN_WIDTH, MAX_LABEL_COLUMN_WIDTH)
+            .min(available)
+            .max(1)
+    }
+
     /// Render a single setting item.
-    fn render_item(&self, item: &SettingItem, is_selected: bool, width: usize) -> String {
+    ///
+    /// `label_width` is the column width from [`Self::label_column_width`]; the
+    /// label is padded to it so every value starts in the same column.
+    fn render_item(
+        &self,
+        item: &SettingItem,
+        is_selected: bool,
+        width: usize,
+        label_width: usize,
+    ) -> String {
         let prefix = if is_selected { "→ " } else { "  " };
 
-        let key_width = 20;
-        let value_width = 15;
+        let value_width = VALUE_COLUMN_WIDTH;
 
-        let key_display = truncate_to_width(&item.label, key_width, "");
+        let label = truncate_to_width(&item.label, label_width, "…");
+        let label_pad = " ".repeat(label_width.saturating_sub(visible_width(&label)));
+        let key_display = format!("{label}{label_pad}");
         let value_display = truncate_to_width(&item.value, value_width, "");
 
         let main_line = if is_selected {
             format!(
-                "{}{} {} {}",
+                "{}{} {}",
                 (self.theme.selected_prefix)(prefix),
                 (self.theme.key)(&key_display),
-                (self.theme.selected)(&value_display),
-                ""
+                (self.theme.selected)(&value_display)
             )
         } else {
             format!(
@@ -441,11 +480,14 @@ impl Component for SettingsList {
         };
         let end = (start + self.max_visible).min(filtered.len());
 
+        // One label column for the whole list so values line up.
+        let label_width = self.label_column_width(&filtered, width);
+
         let mut lines = Vec::new();
 
         for i in start..end {
             if let Some(item) = filtered.get(i) {
-                lines.push(self.render_item(item, i == selected, width));
+                lines.push(self.render_item(item, i == selected, width, label_width));
             }
         }
 

@@ -177,6 +177,7 @@ jobs:
         run: |
           cargo build -p plugin-stub --locked
           cargo test -p rpi-extensions --features provider-performance --test plugin_stub_smoke --locked
+          cargo test -p rpi-cli --test tool_prompt_metadata --locked
 
       - name: Check the standalone ABI core
         run: cargo check -p rpi-plugin-sdk --no-default-features --locked

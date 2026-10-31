@@ -168,6 +168,7 @@ fn api() -> sdk::PluginApi {
         register_streaming_provider: None,
         register_tool_with_wake: None,
         register_plugin_lifecycle: None,
+        register_tool_prompt: None,
     }
 }
 

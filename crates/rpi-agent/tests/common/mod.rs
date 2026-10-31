@@ -148,6 +148,7 @@ pub fn assistant_tool_calls(
                 arguments: args,
                 thought_signature: None,
                 namespace: None,
+                recorded: None,
             })
         })
         .collect();

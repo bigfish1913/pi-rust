@@ -466,6 +466,9 @@ pub struct UnknownToolOutcome {
     /// The arguments the model asked for, recovered from the frames. This is what
     /// lets a reader judge what the tool *would* have done.
     pub arguments: serde_json::Value,
+    /// The call's recording when it already ran upstream. Such a call is answered
+    /// from this recording and is never replayed.
+    pub recorded: Option<serde_json::Value>,
 }
 
 /// The tool calls of `partial` whose results are not committed on `lane`.
@@ -520,6 +523,7 @@ pub async fn unknown_tool_outcomes(
             tool_call_id: call.id.clone(),
             tool_name: call.name.clone(),
             arguments: call.arguments.clone(),
+            recorded: call.recorded.clone(),
         })
         .collect())
 }
@@ -535,6 +539,32 @@ pub fn interrupted_tool_result(outcome: &UnknownToolOutcome, timestamp: i64) -> 
         usage: None,
         added_tool_names: Vec::new(),
         is_error: true,
+        timestamp,
+    }))
+}
+
+/// The tool result for an unresolved call that already ran upstream: its
+/// recording, or an error result when the recording is unusable. The call is
+/// never executed here.
+pub fn recorded_tool_result(
+    outcome: &UnknownToolOutcome,
+    recording: &serde_json::Value,
+    timestamp: i64,
+) -> AgentMessage {
+    let (result, is_error) = match rpi_agent::agent_loop::recorded_tool_result(recording) {
+        Ok(decoded) => decoded,
+        Err(reason) => (rpi_agent::AgentToolResult::error_text(reason), true),
+    };
+    let details = Some(result.details.clone());
+    AgentMessage::ToolResult(Box::new(rpi_ai::types::ToolResultMessage {
+        role: rpi_ai::types::ToolResultRole,
+        tool_call_id: outcome.tool_call_id.clone(),
+        tool_name: outcome.tool_name.clone(),
+        content: result.into_content(),
+        details,
+        usage: None,
+        added_tool_names: Vec::new(),
+        is_error,
         timestamp,
     }))
 }

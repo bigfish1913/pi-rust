@@ -56,6 +56,9 @@ mod selection_probe;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+#[path = "interactive_tui/tests/windows_paste_folding.rs"]
+mod windows_paste_folding;
 
 mod state;
 pub(crate) use state::configured_keybindings;
@@ -77,19 +80,18 @@ use rpi_harness::session::types::{BranchBounds, Entry, EntryOrder, EntryQuery};
 use rpi_tui::scroll_view::{OverscrollMode, ScrollbarMode};
 #[cfg(test)]
 use rpi_tui::strip_ansi;
-use rpi_tui::{
-    apply_theme_preset, AltScreenSearch, AssistantBlock, AssistantMessageComponent,
-    AssistantMessageOptions, AutocompleteItem, AutocompleteManager, AutocompleteSuggestions,
-    BashExecutionComponent, BashTruncation, CombinedAutocompleteProvider, Component, Container,
-    DynamicBorder, Editor, EditorOptions, EditorStyle, FilePathAutocompleteProvider, Focusable,
-    FollowMode, FooterComponent, Image, ImageOptions, Input, Loader, Markdown, ProcessTerminal,
-    ScrollView, ScrollViewOptions, SearchBar, SearchableSelectList, SelectItem, SelectList,
-    SettingItem, SettingsList, SlashCommand as SlashCommandEntry, SlashCommandAutocompleteProvider,
-    Spacer, StackChild, StackEntry, StatusIndicator, Text, ThemeManager, ThemePreset,
-    ToolExecutionComponent, ToolStatus, TuiAltScreen, UserMessageComponent, VStack, WorkingState,
-    TUI,
-};
 use rpi_tui::{bold as tui_bold, theme as current_theme};
+use rpi_tui::{
+    AltScreenSearch, AssistantBlock, AssistantMessageComponent, AssistantMessageOptions,
+    AutocompleteItem, AutocompleteManager, AutocompleteSuggestions, BashExecutionComponent,
+    BashTruncation, CombinedAutocompleteProvider, Component, Container, DynamicBorder, Editor,
+    EditorOptions, EditorStyle, FilePathAutocompleteProvider, Focusable, FollowMode,
+    FooterComponent, Image, ImageOptions, Input, Loader, Markdown, ProcessTerminal, ScrollView,
+    ScrollViewOptions, SearchBar, SearchableSelectList, SelectItem, SelectList, SettingItem,
+    SettingsList, SlashCommand as SlashCommandEntry, SlashCommandAutocompleteProvider, Spacer,
+    StackChild, StackEntry, StatusIndicator, Text, ThemeManager, ToolExecutionComponent,
+    ToolStatus, TuiAltScreen, UserMessageComponent, VStack, WorkingState, TUI,
+};
 
 #[allow(unused_imports)]
 use rpi_tui::BashStatus;
@@ -909,7 +911,7 @@ pub async fn interactive_tui(
     extra_messages: &[String],
     initial_images: Vec<rpi_ai::types::ImageContent>,
     theme: Option<&str>,
-    _no_themes: bool,
+    no_themes: bool,
     reload_context: &crate::session::ReloadContext,
 ) -> i32 {
     let lane: Arc<dyn AgentLane> = harness.lane("main");
@@ -993,16 +995,47 @@ pub async fn interactive_tui(
     // components keep styled text, so doing this after the welcome banner left
     // the first screen in the dark palette until it was rebuilt.
     let theme_manager = Arc::new(ThemeManager::new());
-    if let Some(preset) = match theme {
-        Some("light") => Some(ThemePreset::Light),
-        Some("monochrome") => Some(ThemePreset::Monochrome),
-        Some("dark") => Some(ThemePreset::Dark),
-        _ => None,
-    } {
-        apply_theme_preset(preset);
-        theme_manager.apply_preset(preset);
+    // Build the discovery registry before resolving the saved spec: selector
+    // and settings persist a registry name (e.g. "ocean"), which only
+    // resolves to its file when the registry is already in scope.
+    let theme_registry = if no_themes {
+        crate::themes::ThemeRegistry::default()
+    } else {
+        let (mut registry, diagnostics) =
+            crate::themes::ThemeRegistry::discover(&cwd, project_trusted);
+        // Extension-contributed themes (`resources_discover` themePaths) merge
+        // after the static dirs; `--no-themes` suppresses them like discovery.
+        if let Ok(paths) = reload_context.discovered_theme_paths.lock() {
+            registry.merge_discovered(&paths);
+        }
+        for diagnostic in &diagnostics {
+            eprintln!("warning: {diagnostic}");
+        }
+        registry
+    };
+    if let Some(spec) = theme {
+        // `--theme` / settings: preset name, registry name, or theme file
+        // path. A file that fails to load warns and falls back to the
+        // built-in default without vetoing startup (`emit_startup_warnings`
+        // style); the TUI still comes up in the dark palette and `/theme`
+        // remains available.
+        match crate::themes::apply_startup_spec(spec, Some(&theme_registry), &theme_manager) {
+            Ok(()) => {}
+            Err(message) => {
+                eprintln!("warning: {message}; using the built-in default theme");
+            }
+        }
     }
-
+    // Record which spec is active (the persisted form) so `/reload` can detect
+    // that the active file theme vanished and fall back to the default.
+    let active_theme_spec: Option<String> =
+        theme.and_then(
+            |spec| match crate::themes::resolve_spec_in(spec, Some(&theme_registry)) {
+                crate::themes::ThemeSpec::Preset(_) => Some(spec.to_string()),
+                crate::themes::ThemeSpec::File(path) if path.is_file() => Some(spec.to_string()),
+                crate::themes::ThemeSpec::File(_) => None,
+            },
+        );
     // ---- TUI + containers ----
     let terminal = Box::new(ProcessTerminal::new());
     let tui = Arc::new(TuiAltScreen::new(terminal, true, None));
@@ -1266,6 +1299,9 @@ pub async fn interactive_tui(
         autocomplete_selection_stamped_for: std::sync::Mutex::new(None),
         pending_images: std::sync::Mutex::new(Vec::new()),
         theme_manager,
+        theme_registry: std::sync::RwLock::new(theme_registry),
+        active_theme_spec: std::sync::Mutex::new(active_theme_spec),
+        theme_watcher: std::sync::Mutex::new(None),
         tui: Some(tui.clone()),
         current_model_id: std::sync::Mutex::new(lane_model_id.clone()),
         show_images: std::sync::Mutex::new(show_images),
@@ -1317,6 +1353,28 @@ pub async fn interactive_tui(
             }
         }
     });
+
+    // Hot-reload the active theme file (native fs-watch contract): an edit to
+    // the JSON re-parses and re-applies live; a broken in-progress edit keeps
+    // the current palette and surfaces the parse error instead of dropping the
+    // user back to the default. Presets are immutable and `--no-themes`
+    // suppresses the watcher entirely, so only file themes poll (one task,
+    // one mtime entry — see fs_watch.rs). The handle lives in the state slot
+    // and is re-targeted by selection and reload.
+    {
+        let chat_ref = chat_container.clone();
+        let tui_ref = tui.clone();
+        let registry_snapshot = state.theme_registry.read().ok().map(|r| r.clone());
+        crate::themes::restart_theme_watcher(
+            &state.theme_watcher,
+            state.active_theme_spec().as_deref(),
+            registry_snapshot
+                .as_ref()
+                .unwrap_or(&crate::themes::ThemeRegistry::default()),
+            &state.theme_manager,
+            theme_watch_notify(chat_ref, tui_ref),
+        );
+    }
 
     // Capture the model catalog + cwd for the selector builders + the key loop
     // (the callbacks fire on blocking threads and need owned data).
@@ -1743,8 +1801,31 @@ pub async fn interactive_tui(
             if !*running_key.lock().unwrap() {
                 break;
             }
+            // Console releases, mouse motion and resize must not postpone
+            // the last text character's idle deadline indefinitely.
+            if cfg!(windows)
+                && windows_paste_run
+                    .remaining_delay(std::time::Instant::now())
+                    .is_some_and(|left| left.is_zero())
+            {
+                windows_paste_run.flush_with_clipboard(
+                    &editor_for_key,
+                    std::time::Instant::now(),
+                    read_clipboard_text,
+                );
+                refresh_autocomplete(&state_for_key, &editor_for_key);
+                tui_for_key.request_render_reusing_scroll_content();
+            }
             if !state_for_key.selector_open() && !state_for_key.extension_dialog_open() {
                 if let Some(request) = ask_user_for_key.take_pending() {
+                    if cfg!(windows) {
+                        windows_paste_run.flush_with_clipboard(
+                            &editor_for_key,
+                            std::time::Instant::now(),
+                            read_clipboard_text,
+                        );
+                        windows_paste_run.end_paste_session();
+                    }
                     open_ask_user_dialog(&ctx_for_key, ask_user_for_key.clone(), request);
                 }
             }
@@ -1753,18 +1834,27 @@ pub async fn interactive_tui(
             } else {
                 // `event::read()` blocks indefinitely. Poll first so shutdown can
                 // stop and join this worker even when no further key arrives. A
-                // paste run being collected may pause for the rest of the
-                // payload; ordinary typing must be taken at once.
-                let idle = if cfg!(windows) && windows_paste_run.is_buffering() {
-                    std::time::Duration::from_millis(120)
+                // paste run waits only for the remainder of its idle window,
+                // not another full 120ms after each unrelated event.
+                let idle = if cfg!(windows) {
+                    windows_paste_run.remaining_delay(std::time::Instant::now())
                 } else {
-                    std::time::Duration::from_millis(50)
-                };
+                    None
+                }
+                .unwrap_or(std::time::Duration::from_millis(50));
                 match crossterm::event::poll(idle) {
                     Ok(true) => {}
                     Ok(false) => {
-                        if cfg!(windows) && windows_paste_run.is_buffering() {
-                            windows_paste_run.flush(&editor_for_key, std::time::Instant::now());
+                        if cfg!(windows)
+                            && windows_paste_run
+                                .remaining_delay(std::time::Instant::now())
+                                .is_some_and(|left| left.is_zero())
+                        {
+                            windows_paste_run.flush_with_clipboard(
+                                &editor_for_key,
+                                std::time::Instant::now(),
+                                read_clipboard_text,
+                            );
                             refresh_autocomplete(&state_for_key, &editor_for_key);
                             tui_for_key.request_render_reusing_scroll_content();
                         }
@@ -1796,6 +1886,18 @@ pub async fn interactive_tui(
             // scrolling). Previously every non-Key event was dropped, so a
             // wheel had zero effect
             if let Event::Mouse(m) = ev {
+                if cfg!(windows) && m.kind != crossterm::event::MouseEventKind::Moved {
+                    if windows_paste_run.is_buffering() {
+                        windows_paste_run.flush_with_clipboard(
+                            &editor_for_key,
+                            std::time::Instant::now(),
+                            read_clipboard_text,
+                        );
+                        refresh_autocomplete(&state_for_key, &editor_for_key);
+                        tui_for_key.request_render_reusing_scroll_content();
+                    }
+                    windows_paste_run.end_paste_session();
+                }
                 if side_questions::input_allowed(&state_for_key)
                     && side_for_key
                         .lock()
@@ -1823,6 +1925,12 @@ pub async fn interactive_tui(
                         }
                     }
                     MouseEventKind::Down(crossterm::event::MouseButton::Right) if cfg!(windows) => {
+                        windows_paste_run.flush_with_clipboard(
+                            &editor_for_key,
+                            std::time::Instant::now(),
+                            read_clipboard_text,
+                        );
+                        windows_paste_run.end_paste_session();
                         // upstream treats Windows right-click as a clipboard
                         // paste, rather than letting the console deliver the
                         // clipboard contents as individual key events. This is
@@ -1874,6 +1982,14 @@ pub async fn interactive_tui(
             }
             let Event::Key(key) = ev else {
                 if let Event::Paste(text) = ev {
+                    if cfg!(windows) {
+                        windows_paste_run.flush_with_clipboard(
+                            &editor_for_key,
+                            std::time::Instant::now(),
+                            read_clipboard_text,
+                        );
+                        windows_paste_run.end_paste_session();
+                    }
                     if side_questions::input_allowed(&state_for_key)
                         && side_for_key.lock().unwrap().paste(&text, &tui_for_key)
                     {
@@ -1928,6 +2044,18 @@ pub async fn interactive_tui(
                 key,
                 tui_for_key.terminal().info().supports_kitty_keyboard,
             );
+            if cfg!(windows) && windows_paste_key_barrier(&key) {
+                if windows_paste_run.is_buffering() {
+                    windows_paste_run.flush_with_clipboard(
+                        &editor_for_key,
+                        std::time::Instant::now(),
+                        read_clipboard_text,
+                    );
+                    refresh_autocomplete(&state_for_key, &editor_for_key);
+                    tui_for_key.request_render_reusing_scroll_content();
+                }
+                windows_paste_run.end_paste_session();
+            }
             // Diagnostic trace (off unless RPI_DEBUG_KEYS is set): records what
             // actually arrived before any routing decision, so a client that
             // sends LF for Enter is visible as `Char('j') mods=CONTROL`.
@@ -1964,7 +2092,20 @@ pub async fn interactive_tui(
             // push-to-talk extension time a hold). Checked before the
             // release-drop below; a claimed key with an empty editor is routed
             // to the plugin's `Input` handler instead of the editor.
-            if dispatch_key_event(&state_for_key, &key, &editor_for_key) {
+            // Hidden, buffered text is still a draft. Do not let an
+            // empty-editor shortcut (notably push-to-talk Space) steal a
+            // printable key while that draft awaits its display deadline.
+            // Releases owned by an extension must still reach that owner.
+            let owned_release = key.kind == KeyEventKind::Release
+                && state_for_key
+                    .extension_claimed_keys
+                    .lock()
+                    .unwrap()
+                    .contains(&key.code);
+            let shortcut_allowed = !windows_paste_run.is_buffering()
+                || matches!(key.code, KeyCode::F(_))
+                || owned_release;
+            if shortcut_allowed && dispatch_key_event(&state_for_key, &key, &editor_for_key) {
                 continue;
             }
             // Drop releases but preserve Repeat so holding arrows, Backspace,
@@ -2452,6 +2593,14 @@ pub async fn interactive_tui(
                 &key,
                 rpi_tui::keybindings::keys::PASTE_IMAGE,
             ) {
+                if cfg!(windows) {
+                    windows_paste_run.flush_with_clipboard(
+                        &editor_for_key,
+                        std::time::Instant::now(),
+                        read_clipboard_text,
+                    );
+                    windows_paste_run.end_paste_session();
+                }
                 if let Some(paths) = read_clipboard_file_paths() {
                     let text = paths.join("\n");
                     if let Some(images) = images_from_pasted_paths(&text) {
@@ -2751,18 +2900,9 @@ pub async fn interactive_tui(
                             }
                             continue;
                         }
-                        // Paste vs typing is decided by the console queue, not
-                        // by elapsed time. A clipboard payload is handed over
-                        // already queued, so a *real* key still waiting behind
-                        // this one means the run is a paste to collect and fold.
-                        // An empty queue means these are keystrokes — and an IME
-                        // commit, which delivers a whole word with no gap at all,
-                        // looks exactly like this — so they go straight to the
-                        // editor instead of waiting out a timer.
-                        //
-                        // `probe_paste_input` is essential here: Windows queues
-                        // every key's Release directly behind its Press, so a raw
-                        // poll would report "more input" for ordinary typing.
+                        // Queue-empty is not a paste boundary. Leave the run
+                        // buffered for its idle window; probe only to retain
+                        // newline evidence. Releases are not queued text.
                         let (more_queued, stashed) =
                             probe_paste_input(pending_event.take(), || {
                                 if crossterm::event::poll(std::time::Duration::ZERO)
@@ -2775,17 +2915,8 @@ pub async fn interactive_tui(
                             });
                         pending_event = stashed;
                         if more_queued {
-                            // Real input was queued behind this character, which
-                            // is the only proof that this run is a paste. IME
-                            // commits never reach here: their queue is empty.
                             windows_paste_run.mark_collected();
-                            continue;
                         }
-                        // Nothing queued behind it: hand the run over now. This
-                        // is the typing path, so it must not wait on a timer.
-                        windows_paste_run.flush(&editor_for_key, now);
-                        refresh_autocomplete(&state_for_key, &editor_for_key);
-                        tui_for_key.request_render_reusing_scroll_content();
                         continue;
                     }
                 }
@@ -2823,9 +2954,22 @@ pub async fn interactive_tui(
                         continue;
                     }
                     crate::key_trace::note("windows paste run -> flush + submit");
-                    windows_paste_run.flush(&editor_for_key, now);
+                    windows_paste_run.flush_with_clipboard(
+                        &editor_for_key,
+                        now,
+                        read_clipboard_text,
+                    );
+                    windows_paste_run.end_paste_session();
+                    // Enter can beat the idle deadline: autocomplete must see
+                    // the newly delivered draft before its confirm/submit path.
+                    refresh_autocomplete(&state_for_key, &editor_for_key);
                 } else {
-                    windows_paste_run.flush(&editor_for_key, std::time::Instant::now());
+                    windows_paste_run.flush_with_clipboard(
+                        &editor_for_key,
+                        std::time::Instant::now(),
+                        read_clipboard_text,
+                    );
+                    windows_paste_run.end_paste_session();
                 }
             }
 
@@ -3451,6 +3595,66 @@ pub async fn interactive_tui(
                     reload_ctx.extension_session.lock().unwrap().snapshot_arc(),
                 );
                 state.set_markdown_transformer_with_reinstall(fresh_transformer);
+                // Rebuild the custom-theme registry: extension reloads can
+                // change project trust (`/trust` flow) and the session cwd is
+                // fixed per TUI, so re-resolve both. Use the policy this
+                // reload actually resolved (`resolve_project_trust` over the
+                // effective args), not the immutable startup snapshot;
+                // after a hard failure the previous resources were kept, so
+                // the previous registry stays untouched too. A broken theme
+                // dir surfaces as a warning, never a reload failure.
+                if !reload_ctx.args.no_themes {
+                    let mut rebuilt = None;
+                    if let Some(reload_trusted) = outcome.project_trusted {
+                        let (mut registry, diagnostics) =
+                            crate::themes::ThemeRegistry::discover(&reload_ctx.cwd, reload_trusted);
+                        let discovered = reload_ctx
+                            .discovered_theme_paths
+                            .lock()
+                            .map(|paths| paths.clone())
+                            .unwrap_or_default();
+                        registry.merge_discovered(&discovered);
+                        for diagnostic in &diagnostics {
+                            eprintln!("warning: {diagnostic}");
+                        }
+                        // A reload can remove the active file theme (its package
+                        // went away or no longer returns the path); fall back to
+                        // the default preset with a notice instead of rendering
+                        // with a palette nothing can re-resolve.
+                        let active = state.active_theme_spec.lock().ok().and_then(|g| g.clone());
+                        if let Ok(mut guard) = state.theme_registry.write() {
+                            *guard = registry.clone();
+                        }
+                        if let Some(notice) = crate::themes::reconcile_after_reload(
+                            active.as_deref(),
+                            &registry,
+                            &state.theme_manager,
+                        ) {
+                            add_note_message(&chat_container, &notice);
+                            state.set_active_theme_spec(Some("dark".to_string()));
+                        }
+                        rebuilt = Some(registry);
+                    }
+                    // The registry may now resolve a different file for the
+                    // active name; re-target the watcher either way (with the
+                    // rebuilt registry when the reload completed, the previous
+                    // one after a hard failure kept the old resources).
+                    let registry = rebuilt.unwrap_or_else(|| {
+                        state
+                            .theme_registry
+                            .read()
+                            .map(|guard| guard.clone())
+                            .unwrap_or_default()
+                    });
+                    let chat_ref = chat_container.clone();
+                    crate::themes::restart_theme_watcher(
+                        &state.theme_watcher,
+                        state.active_theme_spec().as_deref(),
+                        &registry,
+                        &state.theme_manager,
+                        theme_watch_notify(chat_ref, tui.clone()),
+                    );
+                }
                 if outcome.had_errors {
                     // Hard failure: the summary itself carries the error detail
                     // (e.g. "Settings reload failed: …"), so render it as an

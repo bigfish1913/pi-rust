@@ -481,6 +481,7 @@ mod tests {
                 arguments: serde_json::json!({ "path": "a.txt" }),
                 thought_signature: None,
                 namespace: None,
+                recorded: None,
             }));
         message
     }

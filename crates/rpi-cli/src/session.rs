@@ -30,7 +30,7 @@
 //!   The interactive `-c`/`-r`/`--session` paths enable that mode and replay
 //!   the existing branch before appending new messages. See [`SessionSelection`].
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -65,7 +65,7 @@ use crate::resource_dirs::{
 };
 use rpi_extensions::{
     emit_resources_discover, ExtensionEmitter, ExtensionSession, NullDiagnostics,
-    PluginDiagnostics, PluginToolAdapter, TeeEmitter,
+    PluginDiagnostics, PluginToolAdapter, TeeEmitter, ToolPromptMetadata,
 };
 
 /// The coding tools registered by the CLI by default.
@@ -74,7 +74,8 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &["read", "bash", "edit", "write", "docs
 /// The default coding system prompt for the CLI's built-in tools.
 ///
 /// This retains the two-argument API for library callers. Session startup and
-/// reload use [`default_system_prompt_with_tools`] with the actual active tools.
+/// reload use [`default_system_prompt_with_tool_prompts`] with the actual active
+/// tools and their winning extension metadata.
 pub fn default_system_prompt(cwd: &str, prior_reasoning_replayed: bool) -> String {
     let tools = BUILTIN_TOOL_NAMES
         .iter()
@@ -87,53 +88,75 @@ pub fn default_system_prompt(cwd: &str, prior_reasoning_replayed: bool) -> Strin
 /// `packages/coding-agent/src/core/system-prompt.ts` base prompt.
 ///
 /// `tools` is the active tool set after `--tools`/`--exclude-tools` and
-/// extension merging: the prompt lists only those tools and keeps only the
-/// guidelines that mention one of them, so a restricted run is never told it
-/// can edit or track todos (pi builds its list from the selected tools too).
+/// extension merging. Like pi, the text list includes only tools with an
+/// explicit prompt snippet; other active tools remain available through their
+/// provider-facing schemas. Tool-specific guidelines still follow the full
+/// active set, so restricted runs get no guidance for unavailable tools.
 pub fn default_system_prompt_with_tools(
     cwd: &str,
     prior_reasoning_replayed: bool,
     tools: &[String],
 ) -> String {
-    let has = |name: &str| tools.iter().any(|tool| tool == name);
-    let todo_hint = if has("todo") {
-        "\n  Keep the steps of multi-step work in the todo tool and mark them done as you go."
-    } else {
-        ""
-    };
+    default_system_prompt_with_tool_prompts(cwd, prior_reasoning_replayed, tools, &BTreeMap::new())
+}
+
+/// Render pi-style explicit prompt contributions for the active tool set.
+/// Entries override built-in metadata, including an empty entry for an
+/// extension that replaces a built-in without contributing a prompt snippet.
+/// Inactive metadata is ignored. Schemas and callable tools are not modified.
+pub fn default_system_prompt_with_tool_prompts(
+    cwd: &str,
+    prior_reasoning_replayed: bool,
+    tools: &[String],
+    overrides: &BTreeMap<String, ToolPromptMetadata>,
+) -> String {
+    let metadata: BTreeMap<_, _> = tools
+        .iter()
+        .map(|name| {
+            let prompt = overrides
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| ToolPromptMetadata {
+                    prompt_snippet: builtin_tool_snippet(name).map(str::to_owned),
+                    prompt_guidelines: Vec::new(),
+                })
+                .normalized();
+            (name.as_str(), prompt)
+        })
+        .collect();
     // The working-state rule must match what actually comes back on the next
     // request. With `compat.requiresThinkingAsText` (or the native thinking
     // channels of anthropic/responses) the model *does* see its own reasoning
     // again, and claiming otherwise makes it re-derive and restate the plan
     // every turn — the re-plan symptom in `docs/llm-repetition-forensics.md`.
-    // One rule covers the plan, the todo tool and the anti-repetition line, so
-    // none of them is stated twice.
     let working_state_rule = if prior_reasoning_replayed {
-        format!(
-            "- Your reasoning is carried back to you on the next turn: do not re-derive it or restate
-  the plan. Continue from the last unfinished step, and when a step lands, say which one.{todo_hint}
+        "- Your reasoning is carried back to you on the next turn: do not re-derive it or restate
+  the plan. Continue from the last unfinished step, and when a step lands, say which one.
   Re-stating the same plan without acting on it is a bug, not progress."
-        )
     } else {
-        format!(
-            "- Your reasoning is not carried into your next turn; only your visible replies and tool
+        "- Your reasoning is not carried into your next turn; only your visible replies and tool
   output come back. Before each batch of tool calls, write one short line naming the step you
-  are on and what remains, and say which step is done when it lands.{todo_hint}
+  are on and what remains, and say which step is done when it lands.
   Re-stating the same plan without acting on it is a bug, not progress."
-        )
     };
 
-    let tool_lines = if tools.is_empty() {
+    // The text list is a selective summary, not the tool registry. In
+    // particular, do not repeat extension tool names without a prompt snippet.
+    let tool_lines = tools
+        .iter()
+        .filter_map(|name| {
+            metadata
+                .get(name.as_str())?
+                .prompt_snippet
+                .as_ref()
+                .map(|snippet| format!("- {name:<5} — {snippet}"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let tool_lines = if tool_lines.is_empty() {
         "(none)".to_string()
     } else {
-        tools
-            .iter()
-            .map(|name| match builtin_tool_snippet(name) {
-                Some(snippet) => format!("- {name:<5} — {snippet}"),
-                None => format!("- {name}"),
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+        tool_lines
     };
 
     // Tool-specific rules (Bash on Windows, docs before guessing) live in the
@@ -144,11 +167,27 @@ pub fn default_system_prompt_with_tools(
         "- Be concise in your responses",
         "- Show file paths clearly when working with files",
         "- Prefer the smallest change that solves the problem",
-        &working_state_rule,
+        working_state_rule,
         "- Read only what you need. If a file or search result was already shown earlier in this
   conversation, use it instead of fetching it again.",
     ];
-    let guidelines = guidelines.join("\n");
+    // Tools contribute rules even without snippets. Like pi, trim and dedupe
+    // across the full active set and the core rules, preserving first occurrence.
+    let mut seen = HashSet::new();
+    let tool_rules = tools
+        .iter()
+        .flat_map(|name| &metadata[name.as_str()].prompt_guidelines)
+        .map(String::as_str);
+    let core_rules = guidelines
+        .iter()
+        .map(|rule| rule.strip_prefix("- ").unwrap_or(rule));
+    let guidelines = tool_rules
+        .chain(core_rules)
+        .map(str::trim)
+        .filter(|rule| !rule.is_empty() && seen.insert(*rule))
+        .map(|rule| format!("- {rule}"))
+        .collect::<Vec<_>>()
+        .join("\n");
 
     format!(
         "You are an expert coding assistant operating inside rpi, a coding agent harness. \
@@ -157,11 +196,30 @@ You help users by reading files, executing commands, editing code, and writing n
 Available tools:
 {tool_lines}
 
+In addition to the tools above, you may have access to other custom tools depending on the project.
+
 Guidelines:
 {guidelines}
 
 Current working directory: {cwd}"
     )
+}
+
+/// Take metadata from the same winning extension definitions used for tool
+/// merging, including empty metadata for overrides. Called on startup/reload.
+fn extension_tool_prompt_metadata(
+    session: &ExtensionSession,
+) -> BTreeMap<String, ToolPromptMetadata> {
+    session
+        .snapshot()
+        .map(|snapshot| {
+            snapshot
+                .tools()
+                .iter()
+                .map(|tool| (tool.tool.name.clone(), tool.prompt.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// One-line prompt descriptions of the tools rpi itself registers.
@@ -515,18 +573,25 @@ pub async fn build_prepared(
     // working-state rule is worded (see `default_system_prompt`).
     let prior_reasoning_replayed = rpi_ai::model::prior_reasoning_is_replayed(&resolved.model);
     let prompt_tools = active.clone();
+    let prompt_metadata = extension_tool_prompt_metadata(&extension_session);
+    let default_prompt = || {
+        default_system_prompt_with_tool_prompts(
+            &cwd_str,
+            prior_reasoning_replayed,
+            &prompt_tools,
+            &prompt_metadata,
+        )
+    };
     let mut context_paths = Vec::new();
     let base_prompt = match args.system_prompt.as_deref() {
         Some(explicit) => explicit.to_string(),
         None if project_trusted => match discover_system_prompt_file(cwd) {
-            Some(path) => read_prompt_source(&path, &mut context_paths).unwrap_or_else(|| {
-                default_system_prompt_with_tools(&cwd_str, prior_reasoning_replayed, &prompt_tools)
-            }),
-            None => {
-                default_system_prompt_with_tools(&cwd_str, prior_reasoning_replayed, &prompt_tools)
+            Some(path) => {
+                read_prompt_source(&path, &mut context_paths).unwrap_or_else(default_prompt)
             }
+            None => default_prompt(),
         },
-        None => default_system_prompt_with_tools(&cwd_str, prior_reasoning_replayed, &prompt_tools),
+        None => default_prompt(),
     };
 
     // ---- Append-text sources (precedence: --append-system-prompt > APPEND_SYSTEM.md) ----
@@ -985,6 +1050,7 @@ pub async fn build_prepared(
         runtime: runtime.clone(),
         cwd: cwd.to_path_buf(),
         project_trusted,
+        discovered_theme_paths: Arc::new(std::sync::Mutex::new(discovered.theme_paths.clone())),
         args: reload_args,
         resolved_model: resolved.model.clone(),
         broadcast: broadcast_for_context,
@@ -1135,6 +1201,11 @@ pub struct ReloadContext {
     /// Startup consumers reuse this value so extension code cannot change the
     /// effective policy by mutating the process cwd while it is loading.
     pub project_trusted: bool,
+    /// Theme file paths contributed by extensions via `resources_discover`,
+    /// shared so the TUI theme registry can merge them. Filled at startup,
+    /// replaced on every `/reload` (paths are unattributed — the v1 divergence
+    /// documented in `rpi-extensions::resources`).
+    pub discovered_theme_paths: Arc<std::sync::Mutex<Vec<String>>>,
     /// The parsed args (cloned) — `--no-*`/`--tools`/`--exclude-tools`/
     /// `--extensions-dir`/`--no-extensions`/`--system-prompt`/etc all apply on
     /// reload exactly as at startup (a reload re-reads the same flags; it does
@@ -1256,6 +1327,11 @@ pub struct ReloadOutcome {
     /// settings reload errored) and the previous resources were kept. Soft
     /// diagnostics (skill shadowing, name validation) do not set this.
     pub had_errors: bool,
+    /// The project-trust policy this reload actually resolved and applied.
+    /// `None` when the reload failed hard and kept the previous resources, so
+    /// consumers (e.g. theme discovery) should stay on the snapshot they
+    /// already match instead of re-reading a stale startup bool.
+    pub project_trusted: Option<bool>,
 }
 
 struct PreparedReloadInputs {
@@ -1326,6 +1402,7 @@ where
                 had_warnings: true,
                 details: Vec::new(),
                 had_errors: true,
+                project_trusted: None,
             };
         }
     }
@@ -1341,6 +1418,7 @@ where
                 had_warnings: true,
                 details: Vec::new(),
                 had_errors: true,
+                project_trusted: None,
             };
         }
     };
@@ -1366,6 +1444,7 @@ where
             had_warnings: true,
             details: vec![reason],
             had_errors: true,
+            project_trusted: None,
         };
     }
 
@@ -1463,6 +1542,7 @@ where
                         current.provider
                     )],
                     had_errors: true,
+                    project_trusted: None,
                 };
             }
             args.provider = Some(current.provider.clone());
@@ -1485,6 +1565,7 @@ where
                     had_warnings: true,
                     details: vec![error.to_string()],
                     had_errors: true,
+                    project_trusted: None,
                 }
             }
         }
@@ -1528,6 +1609,11 @@ where
         .snapshot_arc()
         .map(|snap| rpi_extensions::emit_resources_discover(&cwd_str, "reload", &snap))
         .unwrap_or_default();
+    // Publish the fresh theme paths so the TUI registry rebuild sees the same
+    // set the skill/prompt loaders just consumed.
+    if let Ok(mut guard) = ctx.discovered_theme_paths.lock() {
+        *guard = discovered.theme_paths.clone();
+    }
 
     // ---- 4. Re-run the Part-A loaders (same precedence + --no-* gates) ----
     let env = Arc::new(rpi_tools::OsExecutionEnv::with_cwd(ctx.cwd.clone()));
@@ -1648,19 +1734,26 @@ where
     let mut active = active_tool_names(&tools, &effective_args);
     active = filter_active_tool_names(active, &effective_args);
     let prompt_tools = active.clone();
+    let prompt_metadata = extension_tool_prompt_metadata(&extension_session);
     let prior_reasoning_replayed = rpi_ai::model::prior_reasoning_is_replayed(&ctx.resolved_model);
+    let default_prompt = || {
+        default_system_prompt_with_tool_prompts(
+            &cwd_str,
+            prior_reasoning_replayed,
+            &prompt_tools,
+            &prompt_metadata,
+        )
+    };
     let mut context_paths = Vec::new();
     let base_prompt = match effective_args.system_prompt.as_deref() {
         Some(explicit) => explicit.to_string(),
         None if project_trusted => match discover_system_prompt_file(&ctx.cwd) {
-            Some(path) => read_prompt_source(&path, &mut context_paths).unwrap_or_else(|| {
-                default_system_prompt_with_tools(&cwd_str, prior_reasoning_replayed, &prompt_tools)
-            }),
-            None => {
-                default_system_prompt_with_tools(&cwd_str, prior_reasoning_replayed, &prompt_tools)
+            Some(path) => {
+                read_prompt_source(&path, &mut context_paths).unwrap_or_else(default_prompt)
             }
+            None => default_prompt(),
         },
-        None => default_system_prompt_with_tools(&cwd_str, prior_reasoning_replayed, &prompt_tools),
+        None => default_prompt(),
     };
     let mut append_texts: Vec<String> = Vec::new();
     for extra in &effective_args.append_system_prompt {
@@ -1777,6 +1870,7 @@ where
         // Reload completed; any diagnostics here are soft (shadowing / name
         // validation / skipped optional resources), not hard failures.
         had_errors: false,
+        project_trusted: Some(project_trusted),
     }
 }
 
@@ -3665,10 +3759,10 @@ mod tests {
             lower.contains("reasoning is not") && lower.contains("carried into your next turn"),
             "the prompt must explain that reasoning does not survive the turn: {p}"
         );
-        // …and the remedy: keep state visible, use the todo tool.
+        // Working state stays visible; extension-specific rules require opt-in.
         assert!(
-            lower.contains("visible") && lower.contains("todo tool"),
-            "the prompt must point at visible text and the todo tool: {p}"
+            lower.contains("visible") && !lower.contains("todo tool"),
+            "the prompt must keep state visible without inventing extension rules: {p}"
         );
         // …plus the anti-repetition rule itself.
         assert!(
@@ -3721,9 +3815,13 @@ mod tests {
         for replayed in [false, true] {
             let p =
                 default_system_prompt_with_tools("/tmp/proj", replayed, &default_prompt_tools());
-            for phrase in ["the same plan", "todo tool", "Windows", "guessing"] {
+            for phrase in ["the same plan", "Windows", "guessing"] {
                 assert_eq!(p.matches(phrase).count(), 1, "{phrase:?} repeated: {p}");
             }
+            assert!(
+                !p.contains("todo tool"),
+                "extension rules require explicit metadata"
+            );
         }
     }
 
@@ -3912,6 +4010,10 @@ mod tests {
         assert!(outcome.had_warnings);
         assert!(outcome.summary.contains("Settings reload failed"));
         assert!(outcome.summary.contains("could not load global settings"));
+        // Hard failure keeps the previous resources; the outcome must not
+        // advertise a fresh trust policy either (theme discovery keeps the
+        // registry it already matches).
+        assert_eq!(outcome.project_trusted, None);
         assert_eq!(harness.get_resources().await.unwrap(), before_resources);
         assert_eq!(harness.get_system_prompt().await.unwrap(), before_prompt);
         let after_tools: Vec<String> = harness
@@ -3930,6 +4032,63 @@ mod tests {
             .unwrap()
             .clone();
         assert!(Arc::ptr_eq(&after_bridge, &before_bridge));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reload_outcome_carries_the_current_project_trust() {
+        struct RestoreConfigDir(Option<std::ffi::OsString>);
+
+        impl Drop for RestoreConfigDir {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var(crate::config::CONFIG_DIR_ENV, value),
+                    None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
+                }
+            }
+        }
+
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        let _restore = RestoreConfigDir(std::env::var_os(crate::config::CONFIG_DIR_ENV));
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = tmp.path().join("agent");
+        let cwd = tmp.path().join("project");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
+
+        // Startup snapshot: trusted.
+        crate::config::set_project_trust(&cwd, Some(true)).unwrap();
+        let resolved = crate::provider::resolve(
+            Some("anthropic"),
+            Some(crate::provider::DEFAULT_MODEL_ID),
+            None,
+            Some("test-key"),
+            None,
+        )
+        .unwrap();
+        let args = Args {
+            no_session: true,
+            no_extensions: true,
+            no_prompt_templates: true,
+            no_context_files: true,
+            system_prompt: Some("stable system prompt".into()),
+            ..Args::default()
+        };
+        let (harness, _events, context) = build(&resolved, &args, &cwd, true).await.unwrap();
+        assert!(context.project_trusted, "startup snapshot is trusted");
+
+        // /trust no, then /reload: the outcome must report the CURRENT
+        // decision, not the immutable startup snapshot.
+        crate::config::set_project_trust(&cwd, Some(false)).unwrap();
+        let outcome = reload_extension_resources(&harness, &context).await;
+        assert!(!outcome.had_errors, "{}", outcome.summary);
+        assert_eq!(outcome.project_trusted, Some(false));
+
+        // And the opposite transition back to trusted.
+        crate::config::set_project_trust(&cwd, Some(true)).unwrap();
+        let outcome = reload_extension_resources(&harness, &context).await;
+        assert!(!outcome.had_errors, "{}", outcome.summary);
+        assert_eq!(outcome.project_trusted, Some(true));
     }
 
     #[test]

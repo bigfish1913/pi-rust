@@ -254,10 +254,21 @@ pub(crate) fn resolve_with_factories(
         .map(|requested| canonicalize_cli_provider(requested, &models_cfg))
         .transpose()?;
     let cli_provider = canonical_cli_provider.as_deref();
-    let anthropic_credentials =
-        resolve_anthropic_credentials(&models_cfg, auth_store, &factories.manifests, values);
-    let openai_credentials =
-        resolve_openai_credentials(&models_cfg, auth_store, &factories.manifests, values);
+    let refreshable = |provider: &str| factories.refreshes_oauth(provider);
+    let anthropic_credentials = resolve_anthropic_credentials_with(
+        &models_cfg,
+        auth_store,
+        &factories.manifests,
+        values,
+        &refreshable,
+    );
+    let openai_credentials = resolve_openai_credentials_with(
+        &models_cfg,
+        auth_store,
+        &factories.manifests,
+        values,
+        &refreshable,
+    );
     // The CLI override is intentionally not inserted into either provider map:
     // it is applied only after the final model/provider identity is selected.
     let cli_api_key = cli_api_key
@@ -552,6 +563,7 @@ pub(crate) fn resolve_with_factories(
             selected_anthropic_credential.as_ref(),
             selected_openai_key.as_deref(),
         ),
+        cli_api_key.is_none().then_some(auth_store),
         settings,
         values,
         factories,
@@ -613,6 +625,7 @@ pub(crate) fn resolve_with_factories(
                 &candidate.api,
                 &full_catalog,
                 (anth.as_ref(), openai_key.as_deref()),
+                Some(auth_store),
                 settings,
                 values,
                 factories,
@@ -660,6 +673,7 @@ pub(crate) fn resolve_with_factories(
                     .iter()
                     .find(|manifest| manifest.id == id),
                 values,
+                refreshable(&id),
                 || {
                     full_catalog
                         .iter()
@@ -710,11 +724,13 @@ pub(crate) fn resolve_with_factories(
 /// all-provider runtime list built for `/model` hot-switching.
 type BoundRuntime = (Arc<dyn Provider>, Arc<ExecutionBinding>, bool);
 
+#[allow(clippy::too_many_arguments)]
 fn build_runtime(
     provider_id: &str,
     api: &rpi_ai::Api,
     catalog: &[Model],
     credentials: (Option<&AnthropicCredential>, Option<&str>),
+    auth_store: Option<&config::AuthStore>,
     settings: &RuntimeSettings,
     values: &dyn ValueSource,
     factories: &RuntimeFactories,
@@ -737,8 +753,9 @@ fn build_runtime(
         None => openai_key.map_or(RequestAuth::None, |key| RequestAuth::ApiKey(key.into())),
     };
     let has_provider_key = matches!(auth, RequestAuth::ApiKey(_)) || anonymous;
+    let oauth = auth_store.and_then(|store| factories.oauth_lease(provider_id, store, &auth));
     let (provider, binding) =
-        factories.configure(provider_id, api, models, auth, settings, values)?;
+        factories.configure_with_oauth(provider_id, api, models, auth, oauth, settings, values)?;
     Ok((provider, binding, has_provider_key))
 }
 
@@ -929,11 +946,22 @@ type OpenAiCredentials = BTreeMap<String, OpenAiCredential>;
 /// Resolve one independent Anthropic-wire credential for each provider id.
 /// Stored credentials win over `models.json`; only the built-in `anthropic`
 /// identity may fall back to the `ANTHROPIC_*` environment variables.
+#[cfg(test)]
 fn resolve_anthropic_credentials(
     cfg: &config::ModelsConfig,
     auth_store: &config::AuthStore,
     manifests: &[crate::ProviderDeclaration],
     values: &dyn ValueSource,
+) -> AnthropicCredentials {
+    resolve_anthropic_credentials_with(cfg, auth_store, manifests, values, &|_| false)
+}
+
+fn resolve_anthropic_credentials_with(
+    cfg: &config::ModelsConfig,
+    auth_store: &config::AuthStore,
+    manifests: &[crate::ProviderDeclaration],
+    values: &dyn ValueSource,
+    refreshable: &dyn Fn(&str) -> bool,
 ) -> AnthropicCredentials {
     let mut provider_ids = vec![DEFAULT_PROVIDER_ID.to_string()];
     for (provider_id, provider_cfg) in &cfg.providers {
@@ -946,12 +974,13 @@ fn resolve_anthropic_credentials(
 
     let mut credentials = BTreeMap::new();
     for provider_id in provider_ids {
-        let resolved = crate::credentials::resolve(
+        let resolved = crate::credentials::resolve_refreshable(
             &provider_id,
             cfg.providers.get(&provider_id),
             auth_store,
             manifests.iter().find(|manifest| manifest.id == provider_id),
             values,
+            refreshable(&provider_id),
         );
         let credential = resolved
             .key
@@ -993,11 +1022,12 @@ fn credential_for_selected_anthropic_provider(
         .or_else(|| anthropic_credential_for(credentials, provider_id).cloned())
 }
 
-fn resolve_openai_credentials(
+fn resolve_openai_credentials_with(
     cfg: &config::ModelsConfig,
     auth_store: &config::AuthStore,
     manifests: &[crate::ProviderDeclaration],
     values: &dyn ValueSource,
+    refreshable: &dyn Fn(&str) -> bool,
 ) -> OpenAiCredentials {
     let mut provider_ids = vec!["openai".to_string()];
     for (provider_id, provider_cfg) in &cfg.providers {
@@ -1017,8 +1047,14 @@ fn resolve_openai_credentials(
     for provider_id in provider_ids {
         let provider_cfg = cfg.providers.get(&provider_id);
         let manifest = manifests.iter().find(|manifest| manifest.id == provider_id);
-        let resolved =
-            crate::credentials::resolve(&provider_id, provider_cfg, auth_store, manifest, values);
+        let resolved = crate::credentials::resolve_refreshable(
+            &provider_id,
+            provider_cfg,
+            auth_store,
+            manifest,
+            values,
+            refreshable(&provider_id),
+        );
         // Anthropic keys are represented by their own map, preserving bearer vs
         // x-api-key semantics. Anonymous declarations apply to every protocol.
         if provider_cfg.is_some_and(config::provider_is_anthropic_compatible) {

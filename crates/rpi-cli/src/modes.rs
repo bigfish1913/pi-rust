@@ -312,6 +312,7 @@ pub async fn rpc(
     model_catalog: Vec<rpi_ai::Model>,
     ui_dialog: rpi_extensions::UiDialogMailbox,
     oauth_snapshot: Option<Arc<rpi_extensions::RegistrySnapshot>>,
+    message_updates: crate::args::RpcMessageUpdates,
 ) -> i32 {
     rpc_with_io(
         harness,
@@ -319,6 +320,7 @@ pub async fn rpc(
         model_catalog,
         ui_dialog,
         oauth_snapshot,
+        message_updates,
         tokio::io::BufReader::new(tokio::io::stdin()),
         std::io::stdout(),
     )
@@ -331,7 +333,8 @@ async fn rpc_with_io<R, W>(
     model_catalog: Vec<rpi_ai::Model>,
     ui_dialog: rpi_extensions::UiDialogMailbox,
     oauth_snapshot: Option<Arc<rpi_extensions::RegistrySnapshot>>,
-    input: R,
+    message_updates: crate::args::RpcMessageUpdates,
+    mut input: R,
     output: W,
 ) -> i32
 where
@@ -342,8 +345,20 @@ where
     let lane: Arc<dyn AgentLane> = harness.lane("main");
     // One blocking writer owns stdout. Producers only enqueue bounded messages,
     // so pipe backpressure never blocks a Tokio worker on IO or a std mutex.
-    let (stdout, writer_task, writer_failed) = start_rpc_writer(output);
+    let (stdout, writer_task, writer_failed) = start_rpc_writer(output, message_updates);
     let pump_stop = tokio_util::sync::CancellationToken::new();
+    let external_tools =
+        crate::rpc::external_tools::ExternalTools::new(stdout.clone(), Arc::downgrade(&lane));
+    let mut external_names = Vec::new();
+    let mut owner = RpcOwner {
+        harness,
+        backend: external_tools.clone(),
+        run_cancel: tokio_util::sync::CancellationToken::new(),
+        pump_stop: pump_stop.clone(),
+        failed: writer_failed.clone(),
+        mailbox: ui_dialog.clone(),
+        armed: true,
+    };
 
     // Publish generic commit metadata after successful Session appends. The
     // event is intentionally not a durable-state payload: consumers reread
@@ -458,10 +473,7 @@ where
     let mut run_cancel = tokio_util::sync::CancellationToken::new();
     let mut cancel_on_exit = false;
 
-    use tokio::io::AsyncBufReadExt;
-
-    let mut lines = input.lines();
-    write_line(&stdout, &rpc_protocol::ready()).await;
+    write_line(&stdout, &rpc_protocol::ready(message_updates)).await;
 
     loop {
         let incoming = tokio::select! {
@@ -469,18 +481,32 @@ where
                 cancel_on_exit = true;
                 break;
             }
-            line = lines.next_line() => line,
+            line = crate::rpc::framing::read_frame(&mut input) => line,
         };
         let line = match incoming {
             Ok(Some(line)) => line,
             Ok(None) => break, // EOF
             Err(error) => {
                 eprintln!("[rpi] rpc stdin error: {error}");
+                run_cancel.cancel();
+                let _ = lane.abort().await;
+                external_tools.shutdown();
+                writer_failed.cancel();
                 cancel_on_exit = true;
                 break;
             }
         };
-        let line = line.trim();
+        let line = match std::str::from_utf8(&line) {
+            Ok(line) => line.trim(),
+            Err(_) => {
+                run_cancel.cancel();
+                let _ = lane.abort().await;
+                external_tools.shutdown();
+                writer_failed.cancel();
+                cancel_on_exit = true;
+                break;
+            }
+        };
         if line.is_empty() {
             continue;
         }
@@ -581,6 +607,9 @@ where
             }
             "stop" => {
                 cancel_on_exit = true;
+                run_cancel.cancel();
+                let _ = lane.abort().await;
+                external_tools.shutdown();
                 write_line(
                     &stdout,
                     &rpc_protocol::response(
@@ -611,6 +640,7 @@ where
                     let _ = task.await;
                 }
                 run_cancel = tokio_util::sync::CancellationToken::new();
+                owner.run_cancel = run_cancel.clone();
                 let cancel_task = run_cancel.clone();
                 // Resuming spends the tokens the interrupted run never did, so it
                 // only proceeds when recovery actually left a pending run.
@@ -722,18 +752,37 @@ where
 
         let result = match kind.as_str() {
             "abort" if run_active.load(std::sync::atomic::Ordering::Acquire) => {
-                // This also covers abort arriving before the task enters the lane.
+                // Keep wrapper cancellation for pre-admission aborts, but signal
+                // an admitted harness run before retiring external broker waiters.
                 run_cancel.cancel();
+                let _ = lane.abort().await;
+                external_tools.abort();
                 Ok(serde_json::json!({"aborted": true}))
             }
-            "abort" => lane
-                .abort()
+            "abort" => {
+                let result = lane.abort().await.map_err(|e| e.to_string());
+                external_tools.abort();
+                result.map(|_| serde_json::json!({"aborted": true}))
+            }
+            "configure_external_tools" => {
+                rpc_configure_external_tools(
+                    &lane,
+                    harness,
+                    run_active.load(std::sync::atomic::Ordering::Acquire),
+                    &external_tools,
+                    &mut external_names,
+                    &msg,
+                )
                 .await
-                .map(|_| serde_json::json!({"aborted": true}))
-                .map_err(|e| e.to_string()),
+            }
+            "external_tool_response" => external_tools
+                .respond(&msg)
+                .map(|accepted| serde_json::json!({"accepted": accepted})),
             "get_state" => Ok(rpc_get_state(&lane, harness).await),
             "get_commands" => Ok(rpc_get_commands(oauth_snapshot.as_deref())),
             "get_messages" => rpc_get_messages(&lane, harness, &msg).await,
+            "get_message_summaries" => crate::rpc::message_queries::summaries(harness, &msg).await,
+            "get_message_window" => crate::rpc::message_queries::window(harness, &msg).await,
             "get_history" => rpc_get_history(&lane, harness, &msg).await,
             "get_session_branch" => rpc_get_session_branch(harness, &msg).await,
             "append_entry" => rpc_append_entry(harness, &msg).await,
@@ -766,13 +815,28 @@ where
     ui_dialog.detach();
     if cancel_on_exit {
         run_cancel.cancel();
+        let _ = lane.abort().await;
     }
+    // EOF makes future external replies impossible. Disable the backend before
+    // joining, without cancelling an otherwise healthy model-only run.
+    external_tools.shutdown();
     for task in command_tasks {
         let _ = task.await;
     }
     let mut exit_code = 0;
-    if let Some(task) = run_task {
-        if let Err(error) = task.await {
+    // A broken transport during healthy EOF waiting must still cancel the run.
+    if let Some(mut task) = run_task {
+        let result = tokio::select! {
+            biased;
+            result = &mut task => result,
+            _ = writer_failed.cancelled() => {
+                run_cancel.cancel();
+                let _ = lane.abort().await;
+                external_tools.shutdown();
+                task.await
+            }
+        };
+        if let Err(error) = result {
             eprintln!("[rpi] rpc prompt task failed: {error}");
             exit_code = 1;
         }
@@ -799,7 +863,32 @@ where
             exit_code = 1;
         }
     }
+    owner.armed = false;
     exit_code
+}
+
+// Synchronous cleanup survives cancellation/drop of the RPC owner future.
+// The run is signalled before retiring waiters, preserving aborted settlement.
+struct RpcOwner<'a> {
+    harness: &'a AgentHarness,
+    backend: Arc<crate::rpc::external_tools::ExternalTools>,
+    run_cancel: tokio_util::sync::CancellationToken,
+    pump_stop: tokio_util::sync::CancellationToken,
+    failed: tokio_util::sync::CancellationToken,
+    mailbox: rpi_extensions::UiDialogMailbox,
+    armed: bool,
+}
+impl Drop for RpcOwner<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.run_cancel.cancel();
+            self.backend.shutdown();
+            self.failed.cancel();
+            self.pump_stop.cancel();
+            self.mailbox.detach();
+            self.harness.session().set_entry_commit_publisher(None);
+        }
+    }
 }
 
 fn rpc_get_commands(snapshot: Option<&rpi_extensions::RegistrySnapshot>) -> serde_json::Value {
@@ -1898,6 +1987,75 @@ async fn rpc_get_available_thinking_levels(lane: &Arc<dyn AgentLane>) -> serde_j
     serde_json::json!({"levels": levels})
 }
 
+async fn rpc_configure_external_tools(
+    lane: &Arc<dyn AgentLane>,
+    harness: &AgentHarness,
+    run_active: bool,
+    backend: &Arc<crate::rpc::external_tools::ExternalTools>,
+    old_names: &mut Vec<String>,
+    msg: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    use rpi_harness::types::HarnessTool;
+    use rpi_tools::tools::external::{
+        create_external_tool, validate_external_tool_definitions, ExternalToolDefinition,
+    };
+    if run_active
+        || lane
+            .snapshot()
+            .await
+            .map_err(|e| e.to_string())?
+            .active
+            .is_some()
+    {
+        return Err("cannot configure external tools while a run is active".into());
+    }
+    let definitions: Vec<ExternalToolDefinition> =
+        serde_json::from_value(msg["tools"].clone()).map_err(|e| e.to_string())?;
+    let mut registry = harness.get_tools().await.map_err(|e| e.to_string())?;
+    registry.retain(|tool| !old_names.contains(&tool.tool.schema().name));
+    // Reserve security/native names even when unavailable or disabled at launch.
+    let mut reserved = [
+        "read",
+        "write",
+        "edit",
+        "bash",
+        "powershell",
+        "docs",
+        "grep",
+        "find",
+        "ls",
+        "image",
+        "permissions",
+        "permission",
+        "ask_user",
+        "plan_mode_start",
+        "plan_mode_complete",
+    ]
+    .iter()
+    .map(|name| name.to_string())
+    .collect::<Vec<_>>();
+    reserved.extend(registry.iter().map(|tool| tool.tool.schema().name.clone()));
+    validate_external_tool_definitions(&definitions, &reserved).map_err(|e| e.to_string())?;
+    let names = definitions
+        .iter()
+        .map(|def| def.name.clone())
+        .collect::<Vec<_>>();
+    let mut active = lane.get_active_tools().await.map_err(|e| e.to_string())?;
+    active.retain(|name| !old_names.contains(name));
+    active.extend(names.clone());
+    registry.extend(
+        definitions
+            .into_iter()
+            .map(|def| HarnessTool::new(create_external_tool(def, backend.clone()))),
+    );
+    harness
+        .set_tools(registry, Some(active.clone()))
+        .await
+        .map_err(|e| e.to_string())?;
+    *old_names = names.clone();
+    Ok(serde_json::json!({"tools": names, "activeTools": active}))
+}
+
 async fn rpc_get_available_tools(
     lane: &Arc<dyn AgentLane>,
     harness: &AgentHarness,
@@ -2231,6 +2389,10 @@ mod tests {
     };
     use rpi_harness::session::types::OperationError;
 
+    include!("rpc/external_tools_configuration_tests.rs");
+    include!("rpc/external_tools_lifecycle_tests.rs");
+    include!("rpc/external_tools_abort_outcome_tests.rs");
+
     #[test]
     fn session_branch_query_requires_canonical_arguments() {
         let query = branch_entry_query(&serde_json::json!({
@@ -2326,6 +2488,7 @@ mod tests {
                 vec![],
                 rpi_extensions::UiDialogMailbox::new(),
                 None,
+                crate::args::RpcMessageUpdates::default(),
                 tokio::io::BufReader::new(input.as_bytes()),
                 output.clone(),
             )
@@ -2560,6 +2723,7 @@ mod tests {
                 vec![],
                 rpi_extensions::UiDialogMailbox::new(),
                 None,
+                crate::args::RpcMessageUpdates::default(),
                 tokio::io::BufReader::new(input.as_bytes()),
                 output.clone(),
             )
@@ -2612,6 +2776,7 @@ mod tests {
                 vec![],
                 rpi_extensions::UiDialogMailbox::new(),
                 Some(Arc::new(registry.snapshot())),
+                crate::args::RpcMessageUpdates::default(),
                 tokio::io::BufReader::new(input.as_bytes()),
                 output.clone()
             )
@@ -2772,12 +2937,96 @@ mod tests {
                 vec![],
                 ui,
                 None,
+                crate::args::RpcMessageUpdates::default(),
                 tokio::io::BufReader::new(input),
                 captured,
             )
             .await
         });
         (client, output, task)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rpc_paginated_user_summaries_and_context_windows_are_read_only() {
+        use tokio::io::AsyncWriteExt;
+        let (harness, _unused_provider) = rpc_test_harness("must not be called", 0.0).await;
+        let view = harness.view();
+        for index in 0..23 {
+            view.append_message(
+                rpi_ai::UserMessage::new(format!("Question {index}"), index).into(),
+            )
+            .await
+            .unwrap();
+        }
+        let pinned = view.get_leaf_id().await.unwrap();
+        let (mut client, output, task) =
+            start_test_rpc(harness, rpi_extensions::UiDialogMailbox::new());
+        let ready = output.wait_for(|frame| frame["type"] == "ready").await;
+        for command in ["get_message_summaries", "get_message_window"] {
+            assert!(ready["supportedCommands"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(command)));
+        }
+        client
+            .write_all(b"{\"type\":\"get_message_summaries\",\"id\":1,\"limit\":10}\n")
+            .await
+            .unwrap();
+        let first = output.wait_for(|frame| frame["id"] == 1).await;
+        assert_eq!(first["success"], true);
+        assert_eq!(first["data"]["messages"][0]["preview"], "Question 13");
+        assert_eq!(first["data"]["messages"].as_array().unwrap().len(), 10);
+        for (id, command, cursor, value) in [
+            (
+                2,
+                "get_message_summaries",
+                "beforeId",
+                first["data"]["nextBeforeId"].clone(),
+            ),
+            (
+                3,
+                "get_message_window",
+                "anchorId",
+                first["data"]["firstId"].clone(),
+            ),
+        ] {
+            let mut request = serde_json::json!({"id":id,"type":command,"limit":4,"leafId":pinned});
+            request[cursor] = value;
+            client
+                .write_all(format!("{request}\n").as_bytes())
+                .await
+                .unwrap();
+            let page = output.wait_for(|frame| frame["id"] == id).await;
+            assert_eq!(page["success"], true);
+            assert_eq!(page["data"]["messages"].as_array().unwrap().len(), 4);
+            assert_eq!(page["data"]["leafId"], serde_json::json!(pinned));
+        }
+        let context = output.wait_for(|frame| frame["id"] == 3).await;
+        for (id, cursor, key) in [
+            (4, "beforeId", "nextBeforeId"),
+            (5, "afterId", "nextAfterId"),
+        ] {
+            let mut request =
+                serde_json::json!({"type":"get_message_window", "id":id,"leafId":pinned,"limit":4});
+            request[cursor] = context["data"][key].clone();
+            client
+                .write_all(format!("{request}\n").as_bytes())
+                .await
+                .unwrap();
+            let response = output.wait_for(|frame| frame["id"] == id).await;
+            assert_eq!(response["success"], true);
+            assert_eq!(response["data"]["messages"].as_array().unwrap().len(), 4);
+        }
+        client
+            .write_all(b"{\"type\":\"stop\",\"id\":6}\n")
+            .await
+            .unwrap();
+        assert_eq!(task.await.unwrap(), 0);
+        assert_eq!(view.get_leaf_id().await.unwrap(), pinned);
+        assert!(!output
+            .messages()
+            .iter()
+            .any(|frame| frame["type"] == "agent_start"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2887,6 +3136,7 @@ mod tests {
             vec![],
             rpi_extensions::UiDialogMailbox::new(),
             None,
+            crate::args::RpcMessageUpdates::default(),
             tokio::io::BufReader::new(input.as_bytes()),
             output.clone(),
         )
@@ -2916,6 +3166,7 @@ mod tests {
             vec![],
             rpi_extensions::UiDialogMailbox::new(),
             None,
+            crate::args::RpcMessageUpdates::default(),
             tokio::io::BufReader::new(&input[..]),
             output.clone(),
         )
@@ -2946,6 +3197,7 @@ mod tests {
             vec![],
             rpi_extensions::UiDialogMailbox::new(),
             None,
+            crate::args::RpcMessageUpdates::default(),
             tokio::io::BufReader::new(&b"{\"type\":\"compact\",\"id\":1}\n"[..]),
             output.clone(),
         )
@@ -2985,6 +3237,7 @@ mod tests {
             vec![],
             rpi_extensions::UiDialogMailbox::new(),
             None,
+            crate::args::RpcMessageUpdates::default(),
             tokio::io::BufReader::new(&b""[..]),
             output.clone(),
         )
@@ -2997,6 +3250,215 @@ mod tests {
             "ready plus every queued event must be flushed"
         );
         assert_eq!(messages.last().unwrap()["type"], "agent_end");
+    }
+
+    fn assert_rpc_update_mode(
+        messages: &[serde_json::Value],
+        mode: crate::args::RpcMessageUpdates,
+    ) {
+        let updates: Vec<_> = messages
+            .iter()
+            .filter(|m| {
+                matches!(
+                    m["eventType"].as_str(),
+                    Some("text_delta" | "thinking_delta" | "toolcall_delta")
+                )
+            })
+            .collect();
+        assert!(
+            !updates.is_empty(),
+            "expected streaming deltas: {messages:?}"
+        );
+        for update in updates {
+            let snapshot = mode == crate::args::RpcMessageUpdates::Snapshot;
+            assert_eq!(update.get("message").is_some(), snapshot, "{update}");
+            assert_eq!(
+                update["assistantMessageEvent"].get("partial").is_some(),
+                snapshot,
+                "{update}"
+            );
+            assert_eq!(update["eventType"], update["assistantMessageEvent"]["type"]);
+            assert_eq!(
+                update["contentIndex"],
+                update["assistantMessageEvent"]["contentIndex"]
+            );
+            assert_eq!(update["delta"], update["assistantMessageEvent"]["delta"]);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rpc_selected_updates_survive_prompt_eof_and_stop() {
+        use tokio::io::AsyncWriteExt;
+        for mode in [
+            crate::args::RpcMessageUpdates::CompactDeltas,
+            crate::args::RpcMessageUpdates::Snapshot,
+        ] {
+            for stop in [false, true] {
+                let (harness, _) =
+                    rpc_test_harness("one two three four five six seven eight", 100.0).await;
+                let (emitter, events) = rpi_agent::events::BroadcastEmitter::new(256);
+                harness
+                    .set_agent_emitter(Some(Arc::new(emitter)))
+                    .await
+                    .unwrap();
+                let (mut client, input) = tokio::io::duplex(4096);
+                let output = RpcOutput::default();
+                let captured = output.clone();
+                let task = tokio::spawn(async move {
+                    rpc_with_io(
+                        &harness,
+                        Some(events),
+                        vec![],
+                        rpi_extensions::UiDialogMailbox::new(),
+                        None,
+                        mode,
+                        tokio::io::BufReader::new(input),
+                        captured,
+                    )
+                    .await
+                });
+                let ready = output.wait_for(|m| m["type"] == "ready").await;
+                assert_eq!(ready["semantics"]["messageUpdates"], mode.as_str());
+                client
+                    .write_all(b"{\"type\":\"prompt\",\"id\":1,\"message\":\"test\"}\n")
+                    .await
+                    .unwrap();
+                if stop {
+                    output.wait_for(|m| m["eventType"] == "text_delta").await;
+                    client
+                        .write_all(b"{\"type\":\"stop\",\"id\":2}\n")
+                        .await
+                        .unwrap();
+                } else {
+                    client.shutdown().await.unwrap();
+                }
+                assert_eq!(
+                    tokio::time::timeout(std::time::Duration::from_secs(3), task)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    0
+                );
+                let messages = output.messages();
+                assert_rpc_update_mode(&messages, mode);
+                assert!(messages.iter().any(|m| m["type"] == "message_end"));
+                assert!(messages.iter().any(|m| m["type"] == "agent_end"));
+                assert!(messages.iter().any(|m| m["type"] == "agent_settled"));
+                if !stop {
+                    assert!(messages
+                        .iter()
+                        .any(|m| m["type"] == "agent_settled" && m["outcome"] == "completed"));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rpc_normal_and_explicit_drain_use_the_same_immutable_writer_mode() {
+        for mode in [
+            crate::args::RpcMessageUpdates::CompactDeltas,
+            crate::args::RpcMessageUpdates::Snapshot,
+        ] {
+            let output = RpcOutput::default();
+            let (writer, task, _) = start_rpc_writer(output.clone(), mode);
+            let cloned_writer = writer.clone();
+            let mut message = rpi_ai::AssistantMessage::empty(rpi_ai::Api::Faux, "faux", "m", 42);
+            message.content = vec![rpi_ai::Content::text("snapshot")];
+            let message = Arc::new(message);
+            let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+            for kind in 0..3 {
+                let assistant_message_event = match kind {
+                    0 => rpi_ai::AssistantMessageEvent::TextDelta {
+                        content_index: 0,
+                        delta: "text".into(),
+                        partial: message.clone(),
+                    },
+                    1 => rpi_ai::AssistantMessageEvent::ThinkingDelta {
+                        content_index: 1,
+                        delta: "thought".into(),
+                        partial: message.clone(),
+                    },
+                    _ => rpi_ai::AssistantMessageEvent::ToolCallDelta {
+                        content_index: 2,
+                        delta: "{}".into(),
+                        partial: message.clone(),
+                    },
+                };
+                let event = AgentEvent::MessageUpdate {
+                    message: message.clone(),
+                    assistant_message_event,
+                };
+                write_agent_event(&writer, &event).await;
+                tx.send(event).unwrap();
+            }
+            drain_rpc_events(&cloned_writer, &mut rx).await;
+            drop(cloned_writer);
+            drop(writer);
+            task.await.unwrap().unwrap();
+            let messages = output.messages();
+            assert_eq!(messages.len(), 6);
+            assert_eq!(messages[..3], messages[3..]);
+            assert_rpc_update_mode(&messages, mode);
+        }
+    }
+
+    #[tokio::test]
+    async fn rpc_queued_deltas_are_flushed_on_eof_and_stop_in_selected_mode() {
+        for mode in [
+            crate::args::RpcMessageUpdates::CompactDeltas,
+            crate::args::RpcMessageUpdates::Snapshot,
+        ] {
+            for input in ["", "{\"type\":\"stop\",\"id\":1}\n"] {
+                let harness = AgentHarness::create(Default::default()).await.unwrap();
+                let (tx, rx) = tokio::sync::broadcast::channel(256);
+                let mut message =
+                    rpi_ai::AssistantMessage::empty(rpi_ai::Api::Faux, "faux", "m", 42);
+                message.content = vec![rpi_ai::Content::text("snapshot")];
+                let message = Arc::new(message);
+                for _ in 0..100 {
+                    tx.send(AgentEvent::MessageUpdate {
+                        message: message.clone(),
+                        assistant_message_event: rpi_ai::AssistantMessageEvent::TextDelta {
+                            content_index: 0,
+                            delta: "x".into(),
+                            partial: message.clone(),
+                        },
+                    })
+                    .unwrap();
+                }
+                tx.send(AgentEvent::AgentEnd { messages: vec![] }).unwrap();
+                let output = RpcOutput::default();
+                assert_eq!(
+                    rpc_with_io(
+                        &harness,
+                        Some(rx),
+                        vec![],
+                        rpi_extensions::UiDialogMailbox::new(),
+                        None,
+                        mode,
+                        tokio::io::BufReader::new(input.as_bytes()),
+                        output.clone()
+                    )
+                    .await,
+                    0
+                );
+                let messages = output.messages();
+                assert_eq!(
+                    messages
+                        .iter()
+                        .filter(|m| m["eventType"] == "text_delta")
+                        .count(),
+                    100
+                );
+                assert_eq!(
+                    messages.iter().find(|m| m["type"] == "ready").unwrap()["semantics"]
+                        ["messageUpdates"],
+                    mode.as_str()
+                );
+                assert_rpc_update_mode(&messages, mode);
+                assert!(messages.iter().any(|m| m["type"] == "agent_end"));
+            }
+        }
     }
 
     struct BackpressuredOutput {
@@ -3032,11 +3494,14 @@ mod tests {
         let _release = ReleaseOnDrop(release.clone());
         let entered = Arc::new(AtomicBool::new(false));
         let output = RpcOutput::default();
-        let (writer, task, _) = start_rpc_writer(BackpressuredOutput {
-            entered: entered.clone(),
-            release: release.clone(),
-            output: output.clone(),
-        });
+        let (writer, task, _) = start_rpc_writer(
+            BackpressuredOutput {
+                entered: entered.clone(),
+                release: release.clone(),
+                output: output.clone(),
+            },
+            crate::args::RpcMessageUpdates::default(),
+        );
         write_line(&writer, &serde_json::json!({"id": 0})).await;
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while !entered.load(Ordering::SeqCst) {
@@ -3094,6 +3559,7 @@ mod tests {
             vec![],
             rpi_extensions::UiDialogMailbox::new(),
             None,
+            crate::args::RpcMessageUpdates::default(),
             tokio::io::BufReader::new(
                 &b"{\"type\":\"prompt\",\"id\":1,\"message\":\"test\"}\n"[..],
             ),
@@ -3159,6 +3625,7 @@ mod tests {
                 vec![],
                 ui.clone(),
                 None,
+                crate::args::RpcMessageUpdates::default(),
                 tokio::io::BufReader::new(input),
                 BrokenOutput,
             ),

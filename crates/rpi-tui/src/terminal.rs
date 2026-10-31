@@ -155,6 +155,22 @@ pub trait Terminal: Send + Sync {
     /// still gets a correct frame.
     fn refresh_size(&self);
 
+    /// The terminal's pixel size for its current character grid, when the
+    /// platform can report one.
+    ///
+    /// Image rows are derived from the size of a cell in pixels, and the
+    /// character grid can stay identical while that changes (font zoom, a move
+    /// to a monitor with another DPI). Asking the terminal object rather than a
+    /// process-wide cache keeps the answer attached to the terminal it came
+    /// from, and gives tests an injection point that needs no global state.
+    ///
+    /// Defaults to `None`: a terminal that cannot report pixels (Windows, or a
+    /// Unix terminal that leaves the ioctl fields at zero) leaves image sizing
+    /// at the previously known geometry.
+    fn window_size(&self) -> Option<crossterm::terminal::WindowSize> {
+        None
+    }
+
     /// Start terminal raw mode.
     fn start(
         &self,
@@ -394,9 +410,9 @@ impl Terminal for ProcessTerminal {
         }
         self.configure_mouse_tracking();
         self.hide_cursor();
-        // Enable bracketed paste mode so pasted text arrives as a single
-        // Event::Paste instead of individual key events (which would trigger
-        // submit per line for multi-line pastes).
+        // Request bracketed paste. Unix crossterm decodes it as Event::Paste;
+        // the Windows console backend still needs its native paste collector
+        // because console translation can strip the bracket markers.
         self.write("\x1b[?2004h");
         #[cfg(unix)]
         if keyboard_protocol_enabled() && self.is_tty() && io::stdin().is_terminal() {
@@ -426,6 +442,10 @@ impl Terminal for ProcessTerminal {
 
     fn refresh_size(&self) {
         self.update_size();
+    }
+
+    fn window_size(&self) -> Option<crossterm::terminal::WindowSize> {
+        cterm::window_size().ok()
     }
 
     fn start(

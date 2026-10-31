@@ -494,6 +494,7 @@ mod tests {
             arguments: args,
             thought_signature: None,
             namespace: None,
+            recorded: None,
         }
     }
 
@@ -600,6 +601,7 @@ mod tests {
             arguments: json!({"n":"9"}),
             thought_signature: None,
             namespace: None,
+            recorded: None,
         };
         let v = validate_tool_call(&tools, &tc).unwrap();
         assert_eq!(v["n"], json!(9));
@@ -615,6 +617,7 @@ mod tests {
             arguments: json!({}),
             thought_signature: None,
             namespace: None,
+            recorded: None,
         };
         let err = validate_tool_call(&tools, &tc).unwrap_err();
         assert!(matches!(err, AiError::Schema { .. }));

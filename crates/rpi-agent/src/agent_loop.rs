@@ -27,7 +27,8 @@ use crate::hooks::AgentLoopConfig;
 use crate::message::AgentMessage;
 use crate::stream_fn::StreamFn;
 use crate::types::{
-    AfterToolCallContext, AgentContext, AgentToolResult, BeforeToolCallContext, ToolExecutionMode,
+    AfterToolCallContext, AgentContext, AgentToolResult, BeforeToolCallContext, TextContentOrImage,
+    ToolExecutionMode,
 };
 
 use rpi_ai::types::{
@@ -400,6 +401,7 @@ async fn run_loop(
                 new_messages,
             )
             .await
+                && !(config.signal.is_cancelled() && !tool_calls.is_empty())
             {
                 emit_event(
                     emit,
@@ -411,14 +413,46 @@ async fn run_loop(
                 return Ok(LoopOutcome::Completed);
             }
 
-            // Keep the upstream ordering here: steering is drained after the
-            // tool batch settles, even when the run was cancelled. This makes
-            // messages queued while a blocking tool was active part of the
-            // returned transcript/context instead of leaving them stranded in
-            // the queue. The next stream observes the cancelled signal and
-            // produces the terminal aborted assistant message.
+            // Retain steering queued during the tool batch even on abort. A
+            // cancelled tool continuation must end with a NEW terminal assistant:
+            // public callers return messages, not LoopOutcome, and the harness
+            // derives/persists its authoritative outcome from that assistant.
             pending_messages = drain_steering(config).await;
-            if config.signal.is_cancelled() && pending_messages.is_empty() {
+            if config.signal.is_cancelled() && !tool_calls.is_empty() {
+                emit_event(emit, AgentEvent::TurnStart).await;
+                let aborted = AgentMessage::Assistant(Box::new(AssistantMessage::terminal(
+                    message.api.clone(),
+                    message.provider.clone(),
+                    message.model.clone(),
+                    StopReason::Aborted,
+                    "Operation aborted",
+                    crate::clock::now_ms(),
+                )));
+                // Do not call a provider just to manufacture an abort, or mutate
+                // the original tool-call assistant and its settled tool results.
+                for message in pending_messages
+                    .drain(..)
+                    .chain(std::iter::once(aborted.clone()))
+                {
+                    emit_event(
+                        emit,
+                        AgentEvent::MessageStart {
+                            message: message.clone(),
+                        },
+                    )
+                    .await;
+                    current_context.messages.push(message.clone());
+                    new_messages.push(message.clone());
+                    emit_event(emit, AgentEvent::MessageEnd { message }).await;
+                }
+                emit_event(
+                    emit,
+                    AgentEvent::TurnEnd {
+                        message: aborted,
+                        tool_results: Vec::new(),
+                    },
+                )
+                .await;
                 emit_event(
                     emit,
                     AgentEvent::AgentEnd {
@@ -1219,6 +1253,18 @@ async fn prepare_tool_call(
         };
     }
 
+    // A recorded call already ran upstream. Its recording is the result, and the
+    // call must never reach a tool, a hook or an approval prompt: any path to
+    // `execute` would run it a second time. An unusable recording is an error
+    // result, which is also not an execution.
+    if let Some(recording) = &tool_call.recorded {
+        let (result, is_error) = match recorded_tool_result(recording) {
+            Ok(decoded) => decoded,
+            Err(reason) => (create_error_tool_result(&reason), true),
+        };
+        return Prepared::Immediate { result, is_error };
+    }
+
     let tool = current_context
         .tools
         .iter()
@@ -1325,6 +1371,71 @@ fn invalid_tool_call_reason(tool_call: &ToolCall) -> Option<String> {
     None
 }
 
+/// Decode the `recorded` field of a streamed tool call into the tool result it
+/// stands for, plus whether that result is an error.
+///
+/// The accepted shape is
+/// `{"version":1,"isError":bool,"result":{"content":[...],"details":any,"terminate":bool}}`,
+/// which is what the Cursor replay worker emits. `result.content` holds `text`
+/// or `image` blocks. `details` and `terminate` are optional; `terminate` sets
+/// `AgentToolResult::terminate`, so a recorded batch can stop the loop the same
+/// way a live one does. Other fields inside `result` are ignored. A partial
+/// recording such as `{"version":1}` is rejected as invalid. Any other version
+/// is reported as unsupported. Callers answer a rejected recording with an error
+/// result and never execute the call.
+pub fn recorded_tool_result(
+    recording: &serde_json::Value,
+) -> Result<(AgentToolResult, bool), String> {
+    const INVALID: &str =
+        "Recorded tool result is unavailable or invalid; replay cannot execute work";
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Recording {
+        // Checked above; present here so `deny_unknown_fields` accepts it.
+        _version: u64,
+        is_error: bool,
+        result: RecordedResult,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct RecordedResult {
+        content: Vec<Content>,
+        #[serde(default)]
+        details: serde_json::Value,
+        #[serde(default)]
+        terminate: bool,
+    }
+    match recording.get("version").and_then(serde_json::Value::as_u64) {
+        Some(1) => {}
+        Some(_) => {
+            return Err(
+                "Unsupported recorded tool result version; replay cannot execute work".into(),
+            )
+        }
+        None => return Err(INVALID.into()),
+    }
+    let recording: Recording =
+        serde_json::from_value(recording.clone()).map_err(|_| INVALID.to_string())?;
+    let result = recording.result;
+    let content = result
+        .content
+        .into_iter()
+        .map(|block| match block {
+            Content::Text(text) => Ok(TextContentOrImage::Text(text)),
+            Content::Image(image) => Ok(TextContentOrImage::Image(image)),
+            _ => Err(INVALID.to_string()),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let result = AgentToolResult {
+        content,
+        details: result.details,
+        usage: None,
+        added_tool_names: Vec::new(),
+        terminate: result.terminate,
+    };
+    Ok((result, recording.is_error))
+}
+
 #[cfg(test)]
 mod invalid_tool_call_tests {
     use super::invalid_tool_call_reason;
@@ -1338,6 +1449,7 @@ mod invalid_tool_call_tests {
             arguments: serde_json::json!({}),
             thought_signature: None,
             namespace: None,
+            recorded: None,
         }
     }
 
@@ -1635,5 +1747,6 @@ fn panicked_tool_call() -> ToolCall {
         arguments: serde_json::Value::Null,
         thought_signature: None,
         namespace: None,
+        recorded: None,
     }
 }

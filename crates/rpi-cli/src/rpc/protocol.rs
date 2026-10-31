@@ -40,6 +40,26 @@ pub enum Command {
         #[serde(rename = "beforeId")]
         before_id: Option<String>,
     },
+    /// Optional bounded user summaries and transcript windows.
+    GetMessageSummaries {
+        limit: Option<u64>,
+        role: Option<String>,
+        #[serde(rename = "beforeId")]
+        before_id: Option<String>,
+        #[serde(rename = "leafId")]
+        leaf_id: Option<String>,
+    },
+    GetMessageWindow {
+        limit: Option<u64>,
+        #[serde(rename = "anchorId")]
+        anchor_id: Option<String>,
+        #[serde(rename = "beforeId")]
+        before_id: Option<String>,
+        #[serde(rename = "afterId")]
+        after_id: Option<String>,
+        #[serde(rename = "leafId")]
+        leaf_id: Option<String>,
+    },
     GetHistory {
         limit: Option<u64>,
         #[serde(rename = "afterSeq")]
@@ -102,6 +122,15 @@ pub enum Command {
     SetThinkingLevel {
         level: rpi_ai::types::ThinkingLevel,
     },
+    ConfigureExternalTools {
+        tools: Vec<rpi_tools::tools::external::ExternalToolDefinition>,
+    },
+    // Outcome validation is presence-aware in ExternalTools::respond: Option
+    // would conflate explicit null with an absent outcome.
+    ExternalToolResponse {
+        #[serde(rename = "requestId")]
+        request_id: String,
+    },
     GetAvailableTools,
     SetActiveTools {
         tools: Vec<String>,
@@ -122,6 +151,8 @@ pub const SUPPORTED_COMMANDS: &[&str] = &[
     "get_commands",
     "execute_command",
     "get_messages",
+    "get_message_summaries",
+    "get_message_window",
     "get_history",
     "get_session_branch",
     "append_entry",
@@ -142,6 +173,8 @@ pub const SUPPORTED_COMMANDS: &[&str] = &[
     "set_model",
     "get_available_thinking_levels",
     "set_thinking_level",
+    "configure_external_tools",
+    "external_tool_response",
     "get_available_tools",
     "set_active_tools",
     "ui_dialog_response",
@@ -173,14 +206,15 @@ pub fn response(id: Option<Value>, command: &str, result: Result<Option<Value>, 
     out
 }
 
-pub fn ready() -> Value {
+pub fn ready(mode: crate::args::RpcMessageUpdates) -> Value {
     json!({
         "type": "ready",
         "protocol": "rpi",
         "piCompatibilityTarget": PI_BASELINE,
         "supportedCommands": SUPPORTED_COMMANDS,
-        "supportedEvents": ["session_entry_committed"],
+        "supportedEvents": ["session_entry_committed", "external_tool_request", "external_tool_request_closed"],
         "semantics": {
+            "messageUpdates": mode.as_str(),
             "promptResponse": "accepted",
             "settlementEvent": "agent_settled",
             "agentEndIsTerminal": false
@@ -235,7 +269,13 @@ mod tests {
 
     #[test]
     fn ready_advertises_the_p0_contract() {
-        let value = ready();
+        for mode in [
+            crate::args::RpcMessageUpdates::CompactDeltas,
+            crate::args::RpcMessageUpdates::Snapshot,
+        ] {
+            assert_eq!(ready(mode)["semantics"]["messageUpdates"], mode.as_str());
+        }
+        let value = ready(crate::args::RpcMessageUpdates::default());
         assert_eq!(value["protocol"], "rpi");
         assert_eq!(value["semantics"]["settlementEvent"], "agent_settled");
         assert!(value["supportedCommands"]
@@ -247,7 +287,7 @@ mod tests {
 
     #[test]
     fn ready_advertises_the_read_only_history_snapshot() {
-        let value = ready();
+        let value = ready(crate::args::RpcMessageUpdates::default());
         assert!(value["supportedCommands"]
             .as_array()
             .unwrap()
@@ -257,7 +297,7 @@ mod tests {
 
     #[test]
     fn ready_advertises_resuming_an_interrupted_run() {
-        let value = ready();
+        let value = ready(crate::args::RpcMessageUpdates::default());
         assert!(value["supportedCommands"]
             .as_array()
             .unwrap()
@@ -267,7 +307,7 @@ mod tests {
 
     #[test]
     fn ready_advertises_compaction() {
-        let value = ready();
+        let value = ready(crate::args::RpcMessageUpdates::default());
         assert!(value["supportedCommands"]
             .as_array()
             .unwrap()

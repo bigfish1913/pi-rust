@@ -24,6 +24,7 @@ fn call(name: &str, args: Value) -> ToolCall {
         arguments: args,
         thought_signature: None,
         namespace: None,
+        recorded: None,
     }
 }
 

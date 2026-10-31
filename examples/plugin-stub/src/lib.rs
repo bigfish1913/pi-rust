@@ -621,6 +621,20 @@ rpi_plugin_sdk::export_plugin!(|api| {
         return rc;
     }
 
+    // Prompt contributions are opt-in and separate from the callable schema.
+    // Older hosts lack this appended slot; echo still works without a summary.
+    if let Some(register_tool_prompt) = api.register_tool_prompt {
+        let rc = register_tool_prompt(
+            StbStringRef::from_str("echo"),
+            StbStringRef::from_str(
+                r#"{"promptSnippet":"Echo the supplied text","promptGuidelines":["Use echo only when an echo is requested"]}"#,
+            ),
+        );
+        if rc != 0 {
+            return rc;
+        }
+    }
+
     // Register the MessageEnd event handler (the on() surface).
     let Some(register_event_handler) = api.register_event_handler else {
         return 2;

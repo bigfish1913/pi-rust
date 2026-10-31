@@ -20,6 +20,7 @@ use super::scroll_view::ScrollView;
 use super::tui::{OverlayHandle, OverlayOptions, TuiMode, TuiStopOptions, TUI};
 use crate::ansi::{visible_width, CURSOR_MARKER};
 use crate::terminal::{InputEvent, Terminal, TerminalInfo};
+use crate::terminal_image::CellDimensions;
 
 /// Symbol for ViewportTUI capability check.
 pub const VIEWPORT_TUI: &[u8] = b"rpi-tui/viewport";
@@ -45,6 +46,19 @@ fn merge_pending_render(parked: Option<bool>, reuse_scroll_content: bool) -> Opt
         Some(parked) => Some(parked && reuse_scroll_content),
         None => Some(reuse_scroll_content),
     }
+}
+
+/// Ask one terminal for its cell size in pixels.
+///
+/// The answer comes from the terminal object rather than the process-wide
+/// capability cache, so a renderer's geometry belongs to the terminal it is
+/// drawing to. `None` means "this terminal cannot report pixels" (Windows, or
+/// a Unix terminal that leaves the ioctl fields at zero).
+fn poll_cell_dimensions_of(terminal: &dyn Terminal) -> Option<CellDimensions> {
+    crate::terminal_image::query_cell_dimensions(
+        terminal.window_size(),
+        Some((terminal.columns() as u16, terminal.rows() as u16)),
+    )
 }
 
 /// Coalescing render-scheduler state — the Rust port of upstream's
@@ -139,13 +153,31 @@ pub struct TuiAltScreen {
     /// the terminal reflowed its rows, so the frame cannot be patched cell by
     /// cell and must be repainted whole.
     painted_size: Mutex<(usize, usize)>,
+    /// Cell size in pixels the frame in `previous_screen` was laid out for.
+    ///
+    /// Image placements derive their row count from the cell geometry, so a
+    /// frame built for another geometry cannot be diffed against: the rows that
+    /// look unchanged still hold the previous geometry. Tracked separately from
+    /// `painted_size` because the character grid can stay identical while the
+    /// pixels per cell change (font zoom, another monitor's DPI).
+    painted_cells: Mutex<CellDimensions>,
+    /// The cell geometry this renderer last polled, or `None` until it polls.
+    ///
+    /// The polled value lives on the instance rather than only in the
+    /// process-wide capability cache so that a renderer always compares and
+    /// lays out against geometry it read itself. Tests then isolate by
+    /// construction: a fake terminal reports its own pixel size and nothing
+    /// another test does can move this renderer's geometry between two frames.
+    cell_geometry: Mutex<Option<CellDimensions>>,
     /// Set when a resize event reaches the loop. The window can end up at the
     /// size it already had (dragged out and back) while every intermediate
     /// resize reflowed the terminal's rows, so the next frame repaints whole.
     resize_dirty: AtomicBool,
     scroll_top: Mutex<usize>,
     stick_to_bottom: Mutex<bool>,
-    current_frame: Mutex<Option<LayoutFrame>>,
+    /// Share the immutable painted frame with input without cloning its layout
+    /// tree and visible strings for every mouse event.
+    current_frame: Mutex<Option<Arc<LayoutFrame>>>,
     /// When true, render into the terminal's main buffer and let the terminal
     /// own scrollback (upstream's default `regular` mode).
     main_screen_mode: Mutex<bool>,
@@ -205,6 +237,8 @@ impl TuiAltScreen {
             full_redraw_count: Mutex::new(0),
             previous_screen: Mutex::new(Vec::new()),
             painted_size: Mutex::new((0, 0)),
+            painted_cells: Mutex::new(crate::terminal_image::get_cell_dimensions()),
+            cell_geometry: Mutex::new(None),
             resize_dirty: AtomicBool::new(false),
             scroll_top: Mutex::new(0),
             stick_to_bottom: Mutex::new(true),
@@ -469,15 +503,12 @@ impl TuiAltScreen {
         let Some(frame) = self.current_frame.lock().ok().and_then(|f| f.clone()) else {
             return false;
         };
-        let (columns, rows) = {
-            let Ok(terminal) = self.terminal.lock() else {
-                return false;
-            };
-            (terminal.info().columns, terminal.info().rows)
-        };
+        // Resolve against the geometry actually painted, not the terminal's
+        // live size. Taking the terminal lock here would also stall the input
+        // reader behind render diffing and slow writes, queuing stale drags.
         let changed = self
             .selection
-            .handle_mouse_event(event, &frame, rows, columns);
+            .handle_mouse_event(event, &frame, frame.height, frame.width);
         if changed {
             self.request_render_reusing_scroll_content();
         }
@@ -612,6 +643,11 @@ impl TuiAltScreen {
     /// The repaint is forced even when the window ends up at the size it already
     /// had, because every intermediate resize reflowed the terminal's rows.
     pub fn note_resize(&self) {
+        // A resize can change the cell size in pixels (font zoom, moving to a
+        // monitor with a different DPI). Image sizing divides the source image
+        // by the cell size, so a stale cache would keep the old geometry. This
+        // is a no-op on terminals that do not report pixel sizes.
+        self.poll_cell_dimensions();
         self.resize_dirty.store(true, Ordering::Release);
         self.request_render(false);
     }
@@ -624,6 +660,13 @@ impl TuiAltScreen {
     /// so hosts call this from their periodic tick. The render path re-reads the
     /// size on every frame too; this catches a window that changed while no
     /// event reached the loop.
+    ///
+    /// The cell size in pixels is polled here as well, because the character
+    /// grid can stay identical while the cell geometry changes (font zoom, a
+    /// move to a monitor with another DPI) and no resize event is guaranteed to
+    /// arrive for that. A geometry change repaints every row: image placements
+    /// re-derive their row count from the cell size, so a diff against the old
+    /// frame would keep rows at the previous geometry.
     pub fn ensure_size(&self) {
         let Some((columns, rows)) = self.terminal.lock().ok().map(|terminal| {
             terminal.refresh_size();
@@ -631,7 +674,13 @@ impl TuiAltScreen {
         }) else {
             return;
         };
-        if columns == 0 || rows == 0 || *self.painted_size.lock().unwrap() == (columns, rows) {
+        if columns == 0 || rows == 0 {
+            return;
+        }
+        let size_changed = *self.painted_size.lock().unwrap() != (columns, rows);
+        self.poll_cell_dimensions();
+        let cells_changed = self.cell_geometry_changed();
+        if !size_changed && !cells_changed {
             return;
         }
         // Alt-screen frames need every row repainted: the terminal reflowed the
@@ -642,7 +691,63 @@ impl TuiAltScreen {
                 prev.clear();
             }
         }
+        self.resize_dirty.store(true, Ordering::Release);
         self.request_render(false);
+    }
+
+    /// The cell geometry this renderer has polled, polling once if it has not.
+    ///
+    /// Reading through this instead of [`crate::terminal_image::get_cell_dimensions`]
+    /// keeps the renderer's own view of the geometry separate from the
+    /// process-wide cache, which other terminals (and, in tests, other
+    /// renderers) also write.
+    fn current_cell_dimensions(&self) -> CellDimensions {
+        if let Some(cells) = *self.cell_geometry.lock().unwrap() {
+            return cells;
+        }
+        self.poll_cell_dimensions()
+    }
+
+    /// Poll the terminal's pixel size and record it on this renderer.
+    ///
+    /// A terminal that cannot report a pixel size leaves the previously polled
+    /// geometry in place, so a transient `Unsupported` reply cannot reset an
+    /// established geometry mid-session. Before the first successful poll the
+    /// process-wide cache supplies the fallback, which keeps a terminal that
+    /// never reports pixels rendering at the historical default.
+    fn poll_cell_dimensions(&self) -> CellDimensions {
+        let polled = self
+            .terminal
+            .lock()
+            .ok()
+            .and_then(|terminal| poll_cell_dimensions_of(terminal.as_ref()));
+        self.record_cell_dimensions(polled)
+    }
+
+    /// Poll through a terminal lock the caller already holds.
+    ///
+    /// Renderers take the terminal lock for the whole frame; re-locking here
+    /// would deadlock against themselves.
+    fn poll_cell_dimensions_with(&self, terminal: &dyn Terminal) -> CellDimensions {
+        self.record_cell_dimensions(poll_cell_dimensions_of(terminal))
+    }
+
+    fn record_cell_dimensions(&self, polled: Option<CellDimensions>) -> CellDimensions {
+        let mut slot = self.cell_geometry.lock().unwrap();
+        if let Some(polled) = polled {
+            *slot = Some(polled);
+        }
+        slot.unwrap_or_else(crate::terminal_image::get_cell_dimensions)
+    }
+
+    /// Whether the polled cell geometry differs from the frame on screen.
+    ///
+    /// Compared against `painted_cells` (what the last frame was laid out for),
+    /// not against the previous poll: a geometry change that arrived while a
+    /// repaint was parked must still be picked up by the next tick.
+    fn cell_geometry_changed(&self) -> bool {
+        let current = self.current_cell_dimensions();
+        *self.painted_cells.lock().unwrap() != current
     }
 
     fn enter_alt_screen(&self) {
@@ -753,10 +858,21 @@ impl TuiAltScreen {
         terminal.refresh_size();
         let width = terminal.columns();
         let height = terminal.rows();
+        // The main screen is the other half of the same invariant: an image's
+        // row count is derived from the cell geometry, so a document laid out
+        // for a stale geometry is wrong even when the columns did not move.
+        // Polling here too means a host that renders without a periodic tick
+        // still picks up a font zoom / DPI change instead of only noticing it
+        // through `ensure_size`. The terminal lock is already held, so this
+        // polls through it rather than re-locking.
+        let cells = self.poll_cell_dimensions_with(terminal.as_ref());
         let root: Arc<dyn Component> = self
             .get_layout_root()
             .unwrap_or_else(|| Arc::new(self.container.clone()));
-        let raw_lines = root.render(width);
+        // Components inside the frame read the geometry this renderer polled
+        // (frame-scoped), not the process-wide cache.
+        let raw_lines =
+            crate::terminal_image::with_frame_cell_geometry(cells, || root.render(width));
         let cursor = raw_lines.iter().enumerate().rev().find_map(|(row, line)| {
             line.find(CURSOR_MARKER)
                 .map(|idx| (row, visible_width(&line[..idx])))
@@ -773,6 +889,7 @@ impl TuiAltScreen {
         // The previous frame's geometry, recorded by whichever renderer ran
         // last. A mismatch means the terminal reflowed its rows.
         let (previous_width, previous_height) = *self.painted_size.lock().unwrap();
+        let previous_cells = *self.painted_cells.lock().unwrap();
         let previous_cursor = *self.main_previous_cursor.lock().unwrap();
         terminal.write(&crate::terminal_image::removed_kitty_placements(
             &previous, &lines,
@@ -799,6 +916,7 @@ impl TuiAltScreen {
         // remain incremental.
         if (previous_width != 0 && previous_width != width)
             || (previous_height != 0 && previous_height != height)
+            || previous_cells != cells
             || changed_in_scrollback
         {
             terminal.write("\x1b[?2026h");
@@ -979,6 +1097,7 @@ impl TuiAltScreen {
         if let Ok(mut painted) = self.painted_size.lock() {
             *painted = (width, height);
         }
+        *self.painted_cells.lock().unwrap() = cells;
     }
 
     /// Perform a differential render with constrained layout.
@@ -1012,6 +1131,13 @@ impl TuiAltScreen {
             return;
         };
 
+        // Re-poll the cell geometry before laying the frame out, for the same
+        // reason as the character size above: an image's row count is derived
+        // from it, so a frame laid out for a stale cell size is wrong even when
+        // the columns did not move. Doing it here (not only in `ensure_size`)
+        // covers a host that renders without a periodic tick.
+        let cells = self.poll_cell_dimensions();
+
         // Get layout root or use container
         let root = self.get_layout_root();
         let root_component: Arc<dyn Component> =
@@ -1028,18 +1154,26 @@ impl TuiAltScreen {
             self.selection.clear();
         }
 
-        // Render layout frame
-        let frame = if reuse_scroll_content {
-            render_layout_frame_reusing_scroll_content(root_component.clone(), width, height)
-        } else {
-            render_layout_frame(root_component.clone(), width, height)
-        };
-
-        // Get screen lines and composite modal overlays above the layout.
-        let mut visible = frame.lines.clone();
-        self.jump_to_end
-            .paint(&frame, &mut visible, self.has_overlay());
-        self.paint_overlays(&mut visible, width, height);
+        // Render layout frame. Components inside the frame read the geometry
+        // this renderer polled (frame-scoped), not the process-wide cache.
+        // EVERY component that can size an image renders inside this one
+        // scope, overlays included: the body frame and the overlays of the
+        // same frame must be laid out for the same cell geometry, or an
+        // overlay image keeps the old row count while the body below it has
+        // already resized.
+        let (frame, mut visible) = crate::terminal_image::with_frame_cell_geometry(cells, || {
+            let frame = if reuse_scroll_content {
+                render_layout_frame_reusing_scroll_content(root_component.clone(), width, height)
+            } else {
+                render_layout_frame(root_component.clone(), width, height)
+            };
+            // Get screen lines and composite modal overlays above the layout.
+            let mut visible = frame.lines.clone();
+            self.jump_to_end
+                .paint(&frame, &mut visible, self.has_overlay());
+            self.paint_overlays(&mut visible, width, height);
+            (frame, visible)
+        });
 
         // Cursor markers are an internal layout protocol, not terminal output.
         // Extract the location first, then strip every marker before diffing or
@@ -1068,7 +1202,13 @@ impl TuiAltScreen {
         // cell-by-cell: the skipped "unchanged" rows would keep the terminal's
         // reflowed leftovers (short borders, duplicated spinner rows). Repaint
         // every row when it moved.
-        let full_redraw = previous.is_empty() || painted != (width, height) || resize_dirty;
+        //
+        // The cell size counts as geometry too: an image's row count is derived
+        // from it, so a frame laid out for another cell size holds placements of
+        // the wrong height even though every column count matches.
+        let cells_changed = *self.painted_cells.lock().unwrap() != cells;
+        let full_redraw =
+            previous.is_empty() || painted != (width, height) || resize_dirty || cells_changed;
 
         // Build output buffer
         let mut buffer = String::new();
@@ -1164,7 +1304,7 @@ impl TuiAltScreen {
         // Its scroll snapshots must describe the screen the user actually saw,
         // not a frame still being assembled or an already-mutated live cache.
         if let Ok(mut current) = self.current_frame.lock() {
-            *current = Some(frame);
+            *current = Some(Arc::new(frame));
         }
         // Store current screen
         if let Ok(mut prev) = self.previous_screen.lock() {
@@ -1173,6 +1313,7 @@ impl TuiAltScreen {
         if let Ok(mut painted) = self.painted_size.lock() {
             *painted = (width, height);
         }
+        *self.painted_cells.lock().unwrap() = cells;
     }
 
     fn paint_overlays(&self, lines: &mut [String], width: usize, height: usize) {
@@ -1567,6 +1708,10 @@ impl Terminal for TerminalProxy {
         let _ = self.with(|terminal| terminal.refresh_size());
     }
 
+    fn window_size(&self) -> Option<crossterm::terminal::WindowSize> {
+        self.with(|terminal| terminal.window_size()).flatten()
+    }
+
     fn start(
         &self,
         on_input: Box<dyn Fn(InputEvent) + Send + Sync>,
@@ -1604,6 +1749,9 @@ mod tests {
     struct ResizableTerminal {
         output: Arc<Mutex<String>>,
         size: Arc<Mutex<(usize, usize)>>,
+        /// The pixel size this fake terminal reports for its current grid.
+        /// `None` means "cannot report pixels", the Windows / zero-ioctl case.
+        pixels: Arc<Mutex<Option<(u16, u16)>>>,
     }
 
     impl ResizableTerminal {
@@ -1611,6 +1759,7 @@ mod tests {
             Self {
                 output: Arc::new(Mutex::new(String::new())),
                 size: Arc::new(Mutex::new((columns, rows))),
+                pixels: Arc::new(Mutex::new(None)),
             }
         }
 
@@ -1620,6 +1769,16 @@ mod tests {
 
         fn size(&self) -> Arc<Mutex<(usize, usize)>> {
             self.size.clone()
+        }
+
+        /// The pixel size this terminal reports, settable per test.
+        ///
+        /// The geometry a renderer uses is a property of its terminal, so a
+        /// test drives it through the fake terminal instead of a process-wide
+        /// override: nothing another test does can move this renderer's cell
+        /// size between two frames.
+        fn pixels(&self) -> Arc<Mutex<Option<(u16, u16)>>> {
+            self.pixels.clone()
         }
     }
 
@@ -1647,6 +1806,16 @@ mod tests {
         fn enter_raw_mode(&self) {}
         fn exit_raw_mode(&self) {}
         fn refresh_size(&self) {}
+        fn window_size(&self) -> Option<crossterm::terminal::WindowSize> {
+            let (columns, rows) = *self.size.lock().unwrap();
+            let (width, height) = (*self.pixels.lock().unwrap())?;
+            Some(crossterm::terminal::WindowSize {
+                columns: columns as u16,
+                rows: rows as u16,
+                width,
+                height,
+            })
+        }
         fn start(
             &self,
             _on_input: Box<dyn Fn(InputEvent) + Send + Sync>,
@@ -1725,6 +1894,111 @@ mod tests {
         let frame = output.lock().unwrap().clone();
         assert!(frame.contains("\x1b[12;1H"), "got: {frame:?}");
         assert_eq!(*tui.painted_size.lock().unwrap(), (60, 12));
+    }
+
+    #[test]
+    fn selection_burst_does_not_wait_for_terminal_output() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use std::sync::mpsc;
+
+        let terminal = ResizableTerminal::new(40, 8);
+        let output = terminal.output();
+        let tui = Arc::new(TuiAltScreen::new(Box::new(terminal), false, None));
+        tui.set_layout_root(Some(Arc::new(ScrollView::simple(Arc::new(Text::new(
+            "prefix TARGET suffix",
+            0,
+            0,
+        ))))));
+        tui.start_readerless();
+        tui.enable_render_coalescing();
+        let painted = tui.current_frame.lock().unwrap().clone().unwrap();
+        output.lock().unwrap().clear();
+
+        // Model the render thread holding the terminal during a slow write.
+        // Input must keep consuming events and park only the latest repaint.
+        let terminal_guard = tui.terminal.lock().unwrap();
+        let input_tui = tui.clone();
+        let (tx, rx) = mpsc::channel();
+        let input = std::thread::spawn(move || {
+            let mouse = |kind, column| MouseEvent {
+                kind,
+                column,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            };
+            input_tui
+                .handle_selection_mouse_event(&mouse(MouseEventKind::Down(MouseButton::Left), 7));
+            for i in 0..200 {
+                input_tui.handle_selection_mouse_event(&mouse(
+                    MouseEventKind::Drag(MouseButton::Left),
+                    8 + i % 10,
+                ));
+            }
+            input_tui
+                .handle_selection_mouse_event(&mouse(MouseEventKind::Up(MouseButton::Left), 12));
+            tx.send(input_tui.selection_text()).unwrap();
+        });
+        let selected = rx.recv_timeout(Duration::from_secs(2));
+        // Release and join even on failure, so a regression cannot hang the suite.
+        drop(terminal_guard);
+        input.join().unwrap();
+        assert_eq!(
+            selected
+                .expect("mouse input must not wait for the terminal lock")
+                .as_deref(),
+            Some("TARGET")
+        );
+        assert!(output.lock().unwrap().is_empty());
+        assert!(Arc::ptr_eq(
+            &painted,
+            tui.current_frame.lock().unwrap().as_ref().unwrap()
+        ));
+        assert!(tui.flush_pending_render());
+        assert!(output.lock().unwrap().contains("\x1b[7mTARGET"));
+        assert!(!Arc::ptr_eq(
+            &painted,
+            tui.current_frame.lock().unwrap().as_ref().unwrap()
+        ));
+        assert_eq!(painted.lines[0], "prefix TARGET suffix");
+        assert!(!tui.flush_pending_render());
+    }
+
+    #[test]
+    fn selection_uses_painted_dimensions_until_resize_is_rendered() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+        let terminal = ResizableTerminal::new(40, 8);
+        let size = terminal.size();
+        let tui = TuiAltScreen::new(Box::new(terminal), false, None);
+        tui.set_layout_root(Some(Arc::new(Text::new(
+            "header\nmiddle\nprefix TARGET suffix",
+            0,
+            0,
+        ))));
+        tui.start_readerless();
+        tui.enable_render_coalescing();
+
+        // The terminal has resized, but input still refers to the old painted
+        // frame. Mixing its layout with the live size would clamp to row 0.
+        *size.lock().unwrap() = (8, 1);
+        for (kind, column) in [
+            (MouseEventKind::Down(MouseButton::Left), 7),
+            (MouseEventKind::Drag(MouseButton::Left), 12),
+            (MouseEventKind::Up(MouseButton::Left), 12),
+        ] {
+            tui.handle_selection_mouse_event(&MouseEvent {
+                kind,
+                column,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            });
+        }
+        assert_eq!(tui.selection_text().as_deref(), Some("TARGET"));
+        assert!(tui.flush_pending_render());
+        assert!(
+            tui.selection_text().is_none(),
+            "reflow clears the old selection"
+        );
     }
 
     #[test]
@@ -1882,6 +2156,51 @@ mod tests {
         }
     }
 
+    /// The character grid can stay identical while the cell geometry changes
+    /// (font zoom, a window moved to a monitor with another DPI). No resize event
+    /// has to arrive for that, so the watchdog is the only place that can notice
+    /// it — and a diff against the previous frame would keep the old image rows.
+    ///
+    /// The previous frame's geometry is faked through `painted_cells` instead of
+    /// mutating the process-wide capability cache, which other tests running in
+    /// parallel would observe.
+    #[test]
+    fn the_size_watchdog_repaints_when_only_the_cell_geometry_changed() {
+        let terminal = ResizableTerminal::new(40, 8);
+        let output = terminal.output();
+        let tui = TuiAltScreen::new(Box::new(terminal), false, None);
+        tui.set_layout_root(Some(Arc::new(Text::new("stable frame", 0, 0))));
+        tui.start_readerless();
+        output.lock().unwrap().clear();
+
+        // The frame on screen was laid out for a cell size the terminal no
+        // longer reports, with the columns and rows unchanged.
+        let painted = *tui.painted_cells.lock().unwrap();
+        *tui.painted_cells.lock().unwrap() = CellDimensions {
+            width: painted.width.saturating_add(1).max(1),
+            height: painted.height.saturating_add(1).max(1),
+        };
+        let redraws = tui.full_redraws();
+        tui.ensure_size();
+
+        let frame = output.lock().unwrap().clone();
+        assert!(
+            frame.contains("\x1b[2J"),
+            "a cell geometry change must repaint every row, got: {frame:?}"
+        );
+        assert_eq!(tui.full_redraws(), redraws + 1);
+        assert_eq!(*tui.painted_cells.lock().unwrap(), painted);
+
+        // A tick that re-reads the same geometry stays free.
+        output.lock().unwrap().clear();
+        tui.ensure_size();
+        assert!(
+            output.lock().unwrap().is_empty(),
+            "an unchanged cell geometry must not repaint, got: {:?}",
+            output.lock().unwrap()
+        );
+    }
+
     #[test]
     fn the_size_watchdog_does_not_repaint_an_unchanged_frame() {
         let terminal = ResizableTerminal::new(40, 8);
@@ -1900,6 +2219,119 @@ mod tests {
             output.lock().unwrap().is_empty(),
             "an unchanged size must not repaint, got: {:?}",
             output.lock().unwrap()
+        );
+    }
+
+    /// Two renderers with different cell geometries must not see each other.
+    ///
+    /// This is the isolation the previous head lacked: the injected pixel size
+    /// and the geometry derived from it were process-wide, so a probe running
+    /// in parallel could move another renderer's cell size between two frames.
+    /// Each renderer now polls its own terminal, so this holds with no lock at
+    /// all — the assertion is that interleaved renders keep their own geometry.
+    #[test]
+    fn two_renderers_keep_their_own_cell_geometry() {
+        let small = ResizableTerminal::new(40, 8);
+        let small_pixels = small.pixels();
+        *small_pixels.lock().unwrap() = Some((400, 160)); // 10x20 per cell
+        let small_out = small.output();
+        let small_tui = TuiAltScreen::new(Box::new(small), false, None);
+        small_tui.set_layout_root(Some(Arc::new(Text::new("small", 0, 0))));
+        small_tui.start_readerless();
+        small_out.lock().unwrap().clear();
+
+        let large = ResizableTerminal::new(40, 8);
+        let large_pixels = large.pixels();
+        *large_pixels.lock().unwrap() = Some((800, 160)); // 20x20 per cell
+        let large_out = large.output();
+        let large_tui = TuiAltScreen::new(Box::new(large), false, None);
+        large_tui.set_layout_root(Some(Arc::new(Text::new("large", 0, 0))));
+        large_tui.start_readerless();
+        large_out.lock().unwrap().clear();
+
+        assert_eq!(
+            *small_tui.cell_geometry.lock().unwrap(),
+            Some(CellDimensions {
+                width: 10,
+                height: 20
+            })
+        );
+        assert_eq!(
+            *large_tui.cell_geometry.lock().unwrap(),
+            Some(CellDimensions {
+                width: 20,
+                height: 20
+            })
+        );
+
+        // Interleave the watchdogs: each renderer re-polls its own terminal and
+        // neither adopts the other's geometry.
+        for _ in 0..3 {
+            small_tui.ensure_size();
+            large_tui.ensure_size();
+        }
+        assert_eq!(
+            *small_tui.cell_geometry.lock().unwrap(),
+            Some(CellDimensions {
+                width: 10,
+                height: 20
+            }),
+            "the smaller-cell renderer must keep its own geometry"
+        );
+        assert_eq!(
+            *large_tui.cell_geometry.lock().unwrap(),
+            Some(CellDimensions {
+                width: 20,
+                height: 20
+            }),
+            "the larger-cell renderer must keep its own geometry"
+        );
+    }
+
+    /// A font zoom the terminal reports on its own must reach the watchdog.
+    ///
+    /// The previous probes faked the *cached* geometry, so they never proved
+    /// the poll: this one changes what the terminal answers and asserts the
+    /// repaint follows, which is the path a real font zoom takes.
+    #[test]
+    fn the_watchdog_follows_a_geometry_the_terminal_starts_reporting() {
+        let terminal = ResizableTerminal::new(40, 8);
+        let pixels = terminal.pixels();
+        *pixels.lock().unwrap() = Some((400, 160)); // 10x20 per cell
+        let output = terminal.output();
+        let tui = TuiAltScreen::new(Box::new(terminal), false, None);
+        tui.set_layout_root(Some(Arc::new(Text::new("stable frame", 0, 0))));
+        tui.start_readerless();
+        output.lock().unwrap().clear();
+
+        // A steady tick stays free.
+        tui.ensure_size();
+        assert!(
+            output.lock().unwrap().is_empty(),
+            "an unchanged geometry must not repaint, got: {:?}",
+            output.lock().unwrap()
+        );
+
+        // Font zoom: same 40x8 grid, half the pixels per cell. No resize event
+        // arrives for this, so the watchdog poll is the only thing that can
+        // notice.
+        *pixels.lock().unwrap() = Some((400, 80));
+        let redraws = tui.full_redraws();
+        tui.ensure_size();
+
+        let frame = output.lock().unwrap().clone();
+        assert!(
+            frame.contains("\x1b[2J"),
+            "a geometry-only change the terminal reports must repaint every row, got: {frame:?}"
+        );
+        assert_eq!(tui.full_redraws(), redraws + 1);
+        assert_eq!(
+            *tui.cell_geometry.lock().unwrap(),
+            Some(CellDimensions {
+                width: 10,
+                height: 10
+            }),
+            "the watchdog must adopt the geometry the terminal now reports"
         );
     }
 
@@ -2220,6 +2652,71 @@ mod tests {
         tui.request_render(false);
 
         assert!(output.lock().unwrap().is_empty());
+    }
+
+    /// The main-screen renderer must poll the cell geometry before it lays the
+    /// document out, not just inherit whatever `ensure_size` last wrote.
+    ///
+    /// The alt-screen path already re-polls right before layout; the main
+    /// screen returned to `do_render_main_screen()` first, so a host that
+    /// renders without a periodic watchdog would keep the geometry from
+    /// startup.
+    ///
+    /// The pixel size comes from the fake terminal's own `window_size()`, so
+    /// this test shares no mutable state with the rest of the binary: nothing
+    /// it does can move another renderer's geometry, and nothing another test
+    /// does can move this one's. The assertions read the renderer's polled
+    /// geometry rather than the process-wide cache for the same reason.
+    #[test]
+    fn the_main_screen_polls_the_cell_geometry_before_laying_out() {
+        // The grid is 40x8; 400x160 pixels means one cell is 10x20.
+        let terminal = ResizableTerminal::new(40, 8);
+        let pixels = terminal.pixels();
+        *pixels.lock().unwrap() = Some((400, 160));
+        let output = terminal.output();
+        let tui = TuiAltScreen::new(Box::new(terminal), true, None);
+        tui.set_main_screen_mode(true);
+        tui.set_layout_root(Some(Arc::new(Text::new("main screen frame", 0, 0))));
+        tui.start_readerless();
+        output.lock().unwrap().clear();
+
+        // `start_readerless` paints the first frame; the renderer must have
+        // polled the pixel size instead of trusting the 8x16 default.
+        assert_eq!(
+            *tui.cell_geometry.lock().unwrap(),
+            Some(CellDimensions {
+                width: 10,
+                height: 20
+            }),
+            "the main-screen renderer must poll the cell geometry before layout"
+        );
+
+        // A later font zoom (new pixel size, same grid) must be picked up by a
+        // plain render too, without waiting for `ensure_size`.
+        *pixels.lock().unwrap() = Some((800, 160));
+        tui.do_render(false);
+        assert_eq!(
+            *tui.cell_geometry.lock().unwrap(),
+            Some(CellDimensions {
+                width: 20,
+                height: 20
+            }),
+            "a direct main-screen render must re-poll the cell geometry"
+        );
+
+        // The Windows / zero-pixel fallback: a terminal that cannot report a
+        // pixel size must leave the last known geometry in place instead of
+        // resetting it to the 8x16 default mid-session.
+        *pixels.lock().unwrap() = None;
+        tui.do_render(false);
+        assert_eq!(
+            *tui.cell_geometry.lock().unwrap(),
+            Some(CellDimensions {
+                width: 20,
+                height: 20
+            }),
+            "an unsupported pixel query must keep the polled geometry"
+        );
     }
 
     #[test]

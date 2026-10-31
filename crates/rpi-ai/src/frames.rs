@@ -119,6 +119,12 @@ pub enum AssistantMessageFrame {
         thought_signature: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         namespace: Option<String>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "crate::types::deserialize_present_json"
+        )]
+        recorded: Option<Value>,
     },
 }
 
@@ -469,6 +475,7 @@ impl AssistantMessageFrameEncoder {
                     arguments: tool_call.arguments.clone(),
                     thought_signature: tool_call.thought_signature.clone(),
                     namespace: tool_call.namespace.clone(),
+                    recorded: tool_call.recorded.clone(),
                 }))
             }
         }
@@ -803,6 +810,7 @@ pub fn reduce_frames(
                 arguments,
                 thought_signature,
                 namespace,
+                recorded,
             } => {
                 let (block, state) = active_block(
                     message,
@@ -817,6 +825,7 @@ pub fn reduce_frames(
                     call.arguments = arguments.clone();
                     call.thought_signature = thought_signature.clone();
                     call.namespace = namespace.clone();
+                    call.recorded = recorded.clone();
                 }
                 state.ended = true;
             }
@@ -935,6 +944,7 @@ mod tests {
             arguments,
             thought_signature: None,
             namespace: None,
+            recorded: None,
         }
     }
 

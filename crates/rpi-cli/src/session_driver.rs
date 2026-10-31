@@ -244,6 +244,7 @@ impl RemoteDriver {
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
             let mut session = RemoteSession::new();
+            let mut mapper = RemoteEventMapper::default();
             let mut last_error: Option<String> = None;
             while let Some(line) = lines.recv().await {
                 session.apply_line(&line);
@@ -255,7 +256,7 @@ impl RemoteDriver {
                     }
                 }
                 if let Ok(event) = serde_json::from_value::<RemoteEvent>(line) {
-                    if let Some(event) = map_remote_driver_event(&event) {
+                    if let Some(event) = mapper.map(&event) {
                         let _ = tx.send(event);
                     }
                 }
@@ -327,6 +328,19 @@ fn status_of(session: &RemoteSession) -> DriverStatus {
         retry: session
             .retry_attempt
             .map(|(attempt, max)| (attempt, max, session.retry_delay_ms.unwrap_or(1000))),
+    }
+}
+
+/// Stateful wire-to-UI adapter used by the actual remote event pump. Keep the
+/// stateless projection below available for callers with complete snapshots.
+#[derive(Default)]
+struct RemoteEventMapper {
+    messages: crate::remote::message_accumulator::MessageAccumulator,
+}
+
+impl RemoteEventMapper {
+    fn map(&mut self, event: &RemoteEvent) -> Option<DriverEvent> {
+        map_remote_driver_event(&self.messages.apply(event))
     }
 }
 
@@ -614,6 +628,10 @@ fn parse_thinking_level_name(name: &str) -> Option<ThinkingLevel> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+#[path = "remote/compatibility_tests.rs"]
+mod compact_compatibility_tests;
 
 #[cfg(test)]
 mod tests {

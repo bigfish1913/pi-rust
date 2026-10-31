@@ -923,6 +923,8 @@ impl StreamState {
     }
 
     async fn push_text(&mut self, producer: &mut AssistantMessageEventStreamProducer, delta: &str) {
+        // Flush before even the start snapshot can expose buffered thinking.
+        self.flush_thinking(producer).await;
         let index = match self.text_index {
             Some(index) => index,
             None => {
@@ -1097,6 +1099,7 @@ impl StreamState {
                 arguments: parse_streaming_json(Some(&tool.arguments)),
                 thought_signature: None,
                 namespace: None,
+                recorded: None,
             };
             if let Some(slot) = self.output.content.get_mut(tool.content_index) {
                 *slot = Content::ToolCall(call.clone());
@@ -1998,6 +2001,14 @@ mod tests {
         assert_eq!(
             chat_completions_url("https://gateway.test"),
             "https://gateway.test/v1/chat/completions"
+        );
+        assert_eq!(
+            chat_completions_url("https://gateway.test/proxy"),
+            "https://gateway.test/proxy/v1/chat/completions"
+        );
+        assert_eq!(
+            chat_completions_url("https://gateway.test/proxy/"),
+            "https://gateway.test/proxy/v1/chat/completions"
         );
         assert_eq!(
             chat_completions_url("https://ark.cn-beijing.volces.com/api/coding/v3"),

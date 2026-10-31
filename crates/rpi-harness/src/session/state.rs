@@ -53,6 +53,8 @@ pub struct SessionState {
     used_ids: std::collections::HashSet<String>,
     entries: Vec<Entry>,
     entries_by_id: HashMap<String, usize>,
+    // Rebuilt by replay, including imported/forked entries; never persisted separately.
+    nearest_user: Vec<Option<usize>>,
     records: Vec<LaneRecord>,
     open_operations_by_lane: HashMap<String, BTreeMap<u64, OperationStartedRecord>>,
     lanes: BTreeMap<String, Option<String>>,
@@ -79,6 +81,7 @@ impl SessionState {
             used_ids: std::collections::HashSet::new(),
             entries: Vec::new(),
             entries_by_id: HashMap::new(),
+            nearest_user: Vec::new(),
             records: Vec::new(),
             open_operations_by_lane: HashMap::new(),
             lanes,
@@ -197,6 +200,18 @@ impl SessionState {
                     }
                 }
 
+                let nearest_user = if matches!(
+                    entry.as_message(),
+                    Some(rpi_agent::message::AgentMessage::User(_))
+                ) {
+                    Some(self.entries.len())
+                } else {
+                    entry
+                        .parent_id()
+                        .and_then(|id| self.entries_by_id.get(id))
+                        .and_then(|index| self.nearest_user[*index])
+                };
+                self.nearest_user.push(nearest_user);
                 let is_message = matches!(entry, Entry::Message(_));
                 self.sequence = seq;
                 self.used_ids.insert(entry.id().to_string());
@@ -754,3 +769,5 @@ impl SessionState {
         &self.entries
     }
 }
+
+mod message_queries;

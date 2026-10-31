@@ -47,6 +47,38 @@ The macro emits the `rpi_plugin_register` symbol. The version lives *inside* the
 `PluginApi` struct (`abi_version`, `struct_size`) rather than in the symbol name,
 so the entrypoint signature does not change when the struct grows.
 
+## Tool prompt metadata
+
+Like pi, a tool's provider-facing schema and its system-prompt contributions
+are independent. After registering a tool, optionally register `promptSnippet`
+and `promptGuidelines` through the appended `PluginApi::register_tool_prompt` slot:
+
+```rust,ignore
+if let Some(register_prompt) = api.register_tool_prompt {
+    let status = register_prompt(
+        StbStringRef::from_str("my_tool"),
+        StbStringRef::from_str(r#"{"promptSnippet":"Brief tool summary","promptGuidelines":["Use my_tool for its specific purpose"]}"#),
+    );
+    if status != 0 { return status; }
+}
+```
+
+The tool must already exist in the registering plugin's local registry. The host
+copies the borrowed arguments immediately. Status codes are `0` (success), `1`
+(unknown tool), `2` (invalid metadata object), and `-1` (outside registration).
+Missing fields default to no contribution; an empty object clears the metadata.
+Snippets and rules are trimmed and empty entries ignored. Only active tools
+contribute; rules are deduplicated in active-tool order, even across tools and
+core rules. Rules do not require a snippet. Metadata follows the winning tool
+through name collisions, snapshots and reload; an extension replacing a built-in
+does not inherit the built-in's prompt metadata.
+
+A tool without a snippet is not repeated in the prompt's text list, but its
+schema still makes it callable. Older plugins remain compatible: neither
+`StableToolSchema` nor the ABI version changes. On older hosts the optional slot
+is `None`; skip metadata registration, **not** tool registration. The CLI does not
+invent rules for external tools (including `todo`); extensions must opt in.
+
 ## Safe plugin helpers
 
 `handles::ToolHandles<T>` keeps tool state inside the plugin and returns opaque
@@ -145,6 +177,12 @@ multiple providers, keep one `export_plugin!` entrypoint and use
 `provider::register` and `provider::drive` for each provider instead.
 The bridge forwards streaming events, honors host cancellation and owns a
 per-request runtime, so no worker survives plugin unloading.
+`provider::host_capabilities()` returns the request's `capabilities` object
+(`null` on older hosts) on the request thread while the bridge is driving it, so
+a factory can pass it to its provider. On any other thread, including tasks
+spawned under `drive_with_context`, it is `null`; read it in the factory. A provider may set `ToolCall::recorded` only when
+`recordedToolCalls` is at least `1`; on a host without it, the bridge turns a
+final message carrying a recorded call into an error.
 
 The `provider` feature enables `json` and the AI, Tokio and HTTP dependencies.
 It is **off by default**; tool-only plugins retain the lightweight ABI SDK,

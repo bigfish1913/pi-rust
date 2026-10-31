@@ -216,6 +216,10 @@ fan-out 到所有已注册 handler，合并返回的 `{skillPaths, promptPaths, 
 单个 handler 报错不中止 fan-out。`out` 是插件拥有的 `StbString`，宿主通过插件
 注册时给的 `plugin_free_string` 回收。
 
+`themePaths` 是具体的主题 JSON 文件路径（pi 契约，与 skills 的 dir-or-file 双兼容
+不同），会按文件名（stem）并入 `/theme` 选择器，优先级在静态主题目录之后。路径
+不归属到具体扩展（v1 差异）：同名冲突时静态目录主题胜出，诊断信息只能给出路径。
+
 ### Provider 与渲染器
 
 推理 provider 的目录、认证、执行绑定与验收要求见本文末尾的「Provider 接入规范」。
@@ -241,6 +245,13 @@ fan-out 到所有已注册 handler，合并返回的 `{skillPaths, promptPaths, 
 `thinking_start`/`thinking_delta`/`thinking_end`、
 `toolcall_start`/`toolcall_delta`/`toolcall_end`、`usage`；未知 `type` 会被忽略
 （向前兼容）。
+
+`toolcall_end` 可带可选的 `recorded` 字段，表示该调用已在远端执行过：宿主把它当作已完成的
+工具结果，绝不在本地再次执行（形状与版本规则见 `docs/rpi-tool/extension-authoring.md`）。
+`capabilities.recordedToolCalls` 是宿主能解码的最高 `recorded` 版本，插件只能在它 `>= 1` 时
+发送 `recorded`；旧宿主没有这个键，会忽略 `recorded` 并执行调用。SDK 桥接会自动执行这条检查。
+流中带过 `recorded` 的调用在 `out` 中必须是同一 `id`、`name` 和 `arguments`：缺少记录时宿主
+会补上，冲突或缺失则这一轮以 `Error` 结束。
 
 两点约定：
 

@@ -1,7 +1,9 @@
 //! Built-in protocols and native extensions implement the same factory contract.
 //! Authentication and model binding are applied once, outside every factory.
-use super::binding::{ExecutionBinding, RequestAuth};
+use super::binding::{ExecutionBinding, OAuthLease, RequestAuth};
 use super::*;
+use crate::config::Credential;
+use crate::credentials::OAuthRefresher;
 use crate::ProviderDeclaration as ProviderManifest;
 
 trait ProviderFactory: Send + Sync {
@@ -72,6 +74,7 @@ pub struct RuntimeFactories {
     protocols: BTreeMap<String, Arc<dyn ProviderFactory>>,
     providers: BTreeMap<(String, String), Arc<dyn ProviderFactory>>,
     pub manifests: Vec<ProviderManifest>,
+    oauth_refresher: Option<Arc<dyn OAuthRefresher>>,
 }
 
 impl Default for RuntimeFactories {
@@ -93,6 +96,7 @@ impl Default for RuntimeFactories {
             protocols,
             providers: BTreeMap::new(),
             manifests: Vec::new(),
+            oauth_refresher: None,
         }
     }
 }
@@ -113,12 +117,62 @@ impl RuntimeFactories {
         );
     }
 
+    /// Renew stored OAuth credentials through `refresher` before requests send
+    /// them. Without one, an expired stored OAuth credential is unavailable.
+    pub fn set_oauth_refresher(&mut self, refresher: Arc<dyn OAuthRefresher>) {
+        self.oauth_refresher = Some(refresher);
+    }
+
+    pub(crate) fn refreshes_oauth(&self, provider_id: &str) -> bool {
+        self.oauth_refresher
+            .as_ref()
+            .is_some_and(|refresher| refresher.supports(provider_id))
+    }
+
+    /// A lease when `auth` sends `provider_id`'s stored, renewable OAuth token.
+    pub(super) fn oauth_lease(
+        &self,
+        provider_id: &str,
+        store: &config::AuthStore,
+        auth: &RequestAuth,
+    ) -> Option<OAuthLease> {
+        let refresher = self
+            .oauth_refresher
+            .as_ref()
+            .filter(|refresher| refresher.supports(provider_id))?;
+        match store.get(provider_id) {
+            Some(Credential::Oauth {
+                access,
+                refresh,
+                expires,
+            }) if *expires != 0 && !refresh.trim().is_empty() && auth.carries(access) => {
+                Some(OAuthLease::new(Arc::clone(refresher), *expires))
+            }
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
     pub(super) fn configure(
         &self,
         provider_id: &str,
         api: &rpi_ai::Api,
         models: Vec<Model>,
         auth: RequestAuth,
+        settings: &crate::RuntimeSettings,
+        values: &dyn ValueSource,
+    ) -> Result<(Arc<dyn Provider>, Arc<ExecutionBinding>), ResolveError> {
+        self.configure_with_oauth(provider_id, api, models, auth, None, settings, values)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn configure_with_oauth(
+        &self,
+        provider_id: &str,
+        api: &rpi_ai::Api,
+        models: Vec<Model>,
+        auth: RequestAuth,
+        oauth: Option<OAuthLease>,
         settings: &crate::RuntimeSettings,
         values: &dyn ValueSource,
     ) -> Result<(Arc<dyn Provider>, Arc<ExecutionBinding>), ResolveError> {
@@ -130,7 +184,7 @@ impl RuntimeFactories {
                 provider: provider_id.into(),
                 api: api.as_str().into(),
             })?;
-        let binding = Arc::new(ExecutionBinding::new(provider_id, models, auth));
+        let binding = Arc::new(ExecutionBinding::new(provider_id, models, auth, oauth));
         let inner = factory.create(
             provider_id,
             binding.descriptors().to_vec(),
@@ -221,6 +275,19 @@ impl Provider for RoutedProvider {
 }
 
 async fn unbound_model_error(model: &Model, provider_id: &str) -> AssistantMessageEventStream {
+    error_stream(
+        model,
+        provider_id,
+        "model is not registered in this provider execution binding".into(),
+    )
+    .await
+}
+
+async fn error_stream(
+    model: &Model,
+    provider_id: &str,
+    message: String,
+) -> AssistantMessageEventStream {
     let (mut producer, stream) = rpi_ai::event_stream::create_assistant_message_event_stream();
     producer
         .push(rpi_ai::AssistantMessageEvent::Error {
@@ -230,7 +297,7 @@ async fn unbound_model_error(model: &Model, provider_id: &str) -> AssistantMessa
                 provider_id,
                 model.id.clone(),
                 rpi_ai::types::StopReason::Error,
-                "model is not registered in this provider execution binding",
+                message,
                 0,
             ),
         })
@@ -252,6 +319,16 @@ impl Provider for ConfiguredProvider {
         context: &Context,
         options: &SimpleStreamOptions,
     ) -> AssistantMessageEventStream {
+        if !self.binding.binds(model) {
+            return unbound_model_error(model, &self.id).await;
+        }
+        if let Err(error) = self.binding.renew_oauth(options).await {
+            let id = &self.id;
+            let message = format!(
+                "The stored OAuth login for \"{id}\" has expired and could not be refreshed: {error}. Run `rpi auth login --provider {id}`."
+            );
+            return error_stream(model, id, message).await;
+        }
         let Some((model, options)) = self.binding.prepare(model, options) else {
             return unbound_model_error(model, &self.id).await;
         };
@@ -319,6 +396,141 @@ mod tests {
                 .await;
             stream
         }
+    }
+
+    struct TestRefresher {
+        calls: std::sync::atomic::AtomicUsize,
+        access: &'static str,
+        expires: i64,
+    }
+
+    impl OAuthRefresher for TestRefresher {
+        fn supports(&self, _: &str) -> bool {
+            true
+        }
+        fn refresh(&self, _: &str) -> Result<crate::credentials::RefreshedOAuth, String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::credentials::RefreshedOAuth {
+                access: self.access.into(),
+                expires: self.expires,
+            })
+        }
+    }
+
+    fn oauth_provider(
+        api: Api,
+        auth: RequestAuth,
+        expires: i64,
+        refresher: Arc<TestRefresher>,
+        calls: Calls,
+    ) -> Arc<dyn Provider> {
+        let mut factories = RuntimeFactories::default();
+        factories
+            .protocols
+            .insert(api.as_str().into(), Arc::new(RecordingFactory(calls)));
+        let model = Model::new(
+            "model",
+            "Model",
+            api.clone(),
+            "account",
+            "https://configured.example/v1",
+        );
+        factories
+            .configure_with_oauth(
+                "account",
+                &api,
+                vec![model],
+                auth,
+                Some(OAuthLease::new(refresher, expires)),
+                &crate::RuntimeSettings::default(),
+                &BTreeMap::<String, String>::new(),
+            )
+            .unwrap()
+            .0
+    }
+
+    async fn request(
+        provider: &Arc<dyn Provider>,
+        options: &SimpleStreamOptions,
+    ) -> AssistantMessage {
+        provider
+            .stream_simple(&provider.models()[0], &Context::new(vec![]), options)
+            .await
+            .result()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn oauth_anthropic_overrides_and_invalid_refresh_never_reach_provider() {
+        let calls = Calls::default();
+        let refresher = Arc::new(TestRefresher {
+            calls: 0.into(),
+            access: " ",
+            expires: 0,
+        });
+        let provider = oauth_provider(
+            Api::AnthropicMessages,
+            RequestAuth::Headers(BTreeMap::from([(
+                "authorization".into(),
+                "Bearer old-secret".into(),
+            )])),
+            1,
+            refresher.clone(),
+            calls.clone(),
+        );
+        let key = SimpleStreamOptions {
+            api_key: Some("explicit-key".into()),
+            ..Default::default()
+        };
+        request(&provider, &key).await;
+        let header = SimpleStreamOptions {
+            headers: Some(BTreeMap::from([(
+                "Authorization".into(),
+                "Bearer explicit".into(),
+            )])),
+            ..Default::default()
+        };
+        request(&provider, &header).await;
+        assert_eq!(refresher.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let result = request(&provider, &SimpleStreamOptions::default()).await;
+        assert_eq!(result.stop_reason, StopReason::Error);
+        assert_eq!(refresher.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[0].1.api_key.as_deref(), Some("explicit-key"));
+        assert_eq!(
+            recorded[1].1.headers.as_ref().unwrap()["Authorization"],
+            "Bearer explicit"
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_renews_anthropic_bearer_header() {
+        let calls = Calls::default();
+        let refresher = Arc::new(TestRefresher {
+            calls: 0.into(),
+            access: "renewed-secret",
+            expires: 0,
+        });
+        let provider = oauth_provider(
+            Api::AnthropicMessages,
+            RequestAuth::Headers(BTreeMap::from([(
+                "authorization".into(),
+                "Bearer old-secret".into(),
+            )])),
+            1,
+            refresher,
+            calls.clone(),
+        );
+        request(&provider, &SimpleStreamOptions::default()).await;
+        assert_eq!(
+            calls.lock().unwrap()[0].1.headers.as_ref().unwrap()["authorization"],
+            "Bearer renewed-secret"
+        );
+        assert!(!serde_json::to_string(provider.models())
+            .unwrap()
+            .contains("secret"));
     }
 
     #[tokio::test]

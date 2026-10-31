@@ -775,6 +775,20 @@ impl SessionStorage for JsonlSessionStorage {
         self.run_owned(move |s| async move { s.append_records_owned(records).await })
             .await
     }
+    async fn message_summaries(
+        &self,
+        lane: &str,
+        query: &crate::session::types::MessageSummaryQuery,
+    ) -> SessionResult<crate::session::types::MessageSummaryPage> {
+        self.state.lock().await.message_summaries(lane, query)
+    }
+    async fn message_window(
+        &self,
+        lane: &str,
+        query: &crate::session::types::MessageWindowQuery,
+    ) -> SessionResult<crate::session::types::MessageWindowPage> {
+        self.state.lock().await.message_window(lane, query)
+    }
     async fn get_entry(&self, id: &str) -> SessionResult<Option<Entry>> {
         let state = self.state.lock().await;
         Ok(state.get_entry(id).cloned())

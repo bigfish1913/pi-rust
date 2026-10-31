@@ -827,6 +827,7 @@ async fn stream_with_deltas(
                         arguments: tc.arguments.clone(),
                         thought_signature: tc.thought_signature.clone(),
                         namespace: tc.namespace.clone(),
+                        recorded: tc.recorded.clone(),
                     },
                     partial: Arc::new(partial.clone()),
                 })

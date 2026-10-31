@@ -1322,8 +1322,9 @@ pub type ProviderStreamEmitFn = extern "C" fn(event_json: StbString, user_data: 
 /// Same request envelope and final-response contract as [`ProviderRequestFn`],
 /// plus a per-chunk channel and the cancellation protocol:
 ///
-/// - `req_json` — borrowed `{ model, context, options }` envelope (never freed by
-///   the plugin).
+/// - `req_json` — borrowed `{ model, context, options, capabilities }` envelope
+///   (never freed by the plugin). `capabilities` is absent on hosts that predate
+///   it; see `recorded` below.
 /// - `emit` + `emit_user_data` — the host's per-chunk callback. `emit` is `None`
 ///   only if the host cannot accept chunks; a plugin then degrades to buffering
 ///   and returning the message through `out`. While the caller is cancelled the
@@ -1372,6 +1373,20 @@ pub type ProviderStreamEmitFn = extern "C" fn(event_json: StbString, user_data: 
 /// Unknown `type` values are ignored (forward compatibility). A `*_delta` may
 /// carry an optional `partial` object (a full assistant message) to override the
 /// host-side accumulated snapshot; otherwise the host accumulates deltas itself.
+///
+/// A `toolcall_end` may carry `recorded` when the call already ran upstream: the
+/// host then uses the recording as the tool result and never executes the call
+/// locally. Its shape is `{"version":1,"isError":false,"result":{"content":[...],"terminate":false}}`,
+/// and a call without the key executes as usual. A host that predates
+/// `recorded` ignores it and executes the call, so a plugin may send `recorded`
+/// only when the request's top-level `capabilities.recordedToolCalls` is at
+/// least `1`. That value is the highest recording version the host decodes; a
+/// host that advertises `n` decodes every version from `1` to `n`. The
+/// `provider` bridge applies this check itself.
+/// The host holds `out` to every recorded `toolcall_end`: a final call with the
+/// same `id`, `name` and `arguments` but no `recorded` key gets the streamed
+/// recording, and a missing, repeated or conflicting call ends the turn with an
+/// error instead of running it.
 pub type ProviderStreamRequestFn = extern "C" fn(
     req_json: StbStringRef,
     emit: Option<ProviderStreamEmitFn>,
@@ -1577,6 +1592,18 @@ pub struct PluginApi {
 
     /// Optional plugin shutdown hooks, appended after wake-driven tools.
     pub register_plugin_lifecycle: Option<RegisterPluginLifecycleFn>,
+
+    /// Set explicit prompt metadata for a tool already registered by this plugin.
+    /// `metadata_json` is an object with optional `promptSnippet` (string) and
+    /// `promptGuidelines` (string array), matching pi's tool definition fields.
+    /// Both arguments are borrowed and copied before this call returns.
+    ///
+    /// Returns 0 on success, 1 for an unknown tool, 2 for malformed metadata,
+    /// and -1 outside registration. Appended without changing StableToolSchema
+    /// or the ABI version. Older hosts supply None: skip the call; the tool's
+    /// schema and execution remain available without any prompt contribution.
+    pub register_tool_prompt:
+        Option<extern "C" fn(name: StbStringRef, metadata_json: StbStringRef) -> i32>,
 }
 unsafe impl Send for PluginApi {}
 unsafe impl Sync for PluginApi {}
@@ -1968,6 +1995,7 @@ mod tests {
             register_streaming_provider: None,
             register_tool_with_wake: None,
             register_plugin_lifecycle: None,
+            register_tool_prompt: None,
         };
         // All optional slots are null → plugin must degrade.
         assert!(api.register_tool.is_none());
@@ -2066,8 +2094,12 @@ mod tests {
             core::mem::offset_of!(PluginApi, register_tool_with_wake) + size_of::<usize>()
         );
         assert_eq!(
-            size_of::<PluginApi>(),
+            core::mem::offset_of!(PluginApi, register_tool_prompt),
             core::mem::offset_of!(PluginApi, register_plugin_lifecycle) + size_of::<usize>()
+        );
+        assert_eq!(
+            size_of::<PluginApi>(),
+            core::mem::offset_of!(PluginApi, register_tool_prompt) + size_of::<usize>()
         );
         assert_eq!(align_of::<PluginApi>(), align_of::<*const ()>());
     }
@@ -2143,6 +2175,7 @@ mod tests {
             register_streaming_provider: None,
             register_tool_with_wake: None,
             register_plugin_lifecycle: None,
+            register_tool_prompt: None,
         }
     }
 
@@ -2195,6 +2228,7 @@ mod tests {
             core::mem::offset_of!(PluginApi, register_streaming_provider),
             core::mem::offset_of!(PluginApi, register_tool_with_wake),
             core::mem::offset_of!(PluginApi, register_plugin_lifecycle),
+            core::mem::offset_of!(PluginApi, register_tool_prompt),
         ] {
             let mut api = entrypoint_test_api();
             api.struct_size = size as u32;
@@ -2219,6 +2253,7 @@ mod tests {
                     assert!(api.register_streaming_provider.is_none());
                     assert!(api.register_tool_with_wake.is_none());
                     assert!(api.register_plugin_lifecycle.is_none());
+                    assert!(api.register_tool_prompt.is_none());
                     assert!(
                         api.register_provider.is_some(),
                         "one-shot fallback remains available"

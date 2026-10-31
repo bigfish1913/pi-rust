@@ -967,4 +967,37 @@ mod tests {
         assert!(ops.read.contains("/r"));
         assert!(ops.edited.contains("/m"));
     }
+
+    /// A host error that fails a turn closed so a recorded tool call cannot run
+    /// must never be retried automatically: a retry asks a remote agent to run
+    /// the turn again. A transient-looking error stays retryable.
+    #[test]
+    fn recorded_call_fail_closed_errors_are_not_retryable() {
+        let error = |text: &str| {
+            let mut message = AssistantMessage::empty(rpi_ai::types::Api::Faux, "p", "m", 0);
+            message.stop_reason = StopReason::Error;
+            message.error_message = Some(text.to_string());
+            message
+        };
+        // These mirror the fixed fail-closed texts in rpi-extensions (provider.rs)
+        // and rpi-plugin-sdk (provider.rs), which have exact-text tests there.
+        let texts = [
+            "a recorded call has no id",
+            "two recorded calls share an id",
+            "the call is missing",
+            "the call is repeated",
+            "its name or arguments changed",
+            "its recording differs",
+        ]
+        .map(|reason| {
+            format!("plugin provider final message drops a recorded tool call: {reason}")
+        });
+        let sdk = "host does not support recorded tool calls".to_string();
+        for text in texts.iter().chain([&sdk]) {
+            assert!(!is_retryable_assistant_error(&error(text)), "{text}");
+        }
+        assert!(is_retryable_assistant_error(&error(
+            "503 service unavailable"
+        )));
+    }
 }

@@ -110,6 +110,13 @@ pub struct ScrollSnapshot {
 #[derive(Clone)]
 struct ScrollRenderCache {
     content_width: usize,
+    /// Cell geometry the document was rendered for.
+    ///
+    /// Image rows are derived from the terminal's cell size, so a document
+    /// rendered for another geometry holds placements of the wrong height even
+    /// when the content width is identical. Keying the cache on width alone
+    /// would serve those stale rows to a pure scroll frame.
+    cells: crate::terminal_image::CellDimensions,
     document: Arc<RenderedDocument>,
     /// Position used to slice this viewport, not a pending live scroll delta.
     scroll_top: usize,
@@ -216,7 +223,9 @@ impl ScrollView {
         let content_width = self.get_content_width(width);
         let cache = self.render_cache.lock().ok()?;
         let cache = cache.as_ref()?;
-        if cache.content_width != content_width {
+        if cache.content_width != content_width
+            || cache.cells != crate::terminal_image::effective_cell_dimensions()
+        {
             return None;
         }
         let height = cache.document.len();
@@ -470,12 +479,13 @@ impl ScrollView {
         reuse_cached_content: bool,
     ) -> Vec<String> {
         let content_width = self.get_content_width(width);
+        let cells = crate::terminal_image::effective_cell_dimensions();
         let cached = if reuse_cached_content {
             self.render_cache
                 .lock()
                 .ok()
                 .and_then(|cache| cache.clone())
-                .filter(|cache| cache.content_width == content_width)
+                .filter(|cache| cache.content_width == content_width && cache.cells == cells)
         } else {
             None
         };
@@ -533,6 +543,7 @@ impl ScrollView {
         if let Ok(mut cache) = self.render_cache.lock() {
             *cache = Some(ScrollRenderCache {
                 content_width,
+                cells,
                 document,
                 scroll_top,
             });
@@ -715,6 +726,70 @@ mod tests {
             );
             assert_eq!(Arc::strong_count(&rows), 3);
         }
+    }
+
+    /// A pure scroll frame reuses the last rendered document, but only for the
+    /// geometry it was rendered at: image rows are derived from the cell size, so
+    /// serving a document rendered for another geometry would keep the previous
+    /// row heights in the transcript.
+    ///
+    /// The counter proves the child was actually re-rendered — asserting only on
+    /// the rows would pass on a document that happened to look the same.
+    #[test]
+    fn cached_content_is_dropped_when_only_the_cell_geometry_changed() {
+        struct CountingChild {
+            renders: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl Component for CountingChild {
+            fn render(&self, _: usize) -> Vec<String> {
+                self.render_document(0).lines(0, usize::MAX)
+            }
+            fn render_document(&self, _: usize) -> RenderedDocument {
+                self.renders
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                RenderedDocument::from_lines(vec!["row".into()])
+            }
+            fn invalidate(&self) {}
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        // The capability cache is process-wide, so this probe has to hold the
+        // shared lock: without it a parallel test can observe the geometry swap
+        // mid-assertion (or this one can observe theirs).
+        let _g = crate::terminal_image::capability_test_lock();
+        let saved = crate::terminal_image::get_capabilities();
+        struct Restore(crate::terminal_image::TerminalCapabilities);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::terminal_image::set_capabilities(self.0.clone());
+            }
+        }
+        let _restore = Restore(saved);
+
+        crate::terminal_image::set_cell_dimensions(10, 20);
+        let renders = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let scroll = ScrollView::new(
+            Arc::new(CountingChild {
+                renders: renders.clone(),
+            }),
+            ScrollViewOptions {
+                scrollbar: ScrollbarMode::Hidden,
+                ..Default::default()
+            },
+        );
+
+        scroll.render_with_cached_content(40, 1);
+        assert_eq!(renders.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // Same width and geometry: the cache is what makes a pure scroll free.
+        scroll.render_with_cached_content(40, 1);
+        assert_eq!(renders.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Same width, new cell geometry: the cached document is stale.
+        crate::terminal_image::set_cell_dimensions(10, 10);
+        scroll.render_with_cached_content(40, 1);
+        assert_eq!(renders.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]

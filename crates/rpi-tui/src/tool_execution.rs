@@ -1301,6 +1301,35 @@ mod tests {
         assert!(full.contains("Step 30"));
     }
     #[test]
+    fn task_list_keeps_crlf_rows_distinct() {
+        use super::*;
+        // CRLF segments as one grapheme; the shared wrapper dropped the pair
+        // as controls and glued the rows into one task ("firstsecond").
+        let panel = ToolExecutionComponent::new("todo", "{}");
+        panel.set_todo_state(vec![("first\r\nsecond".into(), "pending".into())]);
+        let rows = panel.render(80);
+        let rendered = strip_ansi(&rows.join("\n"));
+        assert!(
+            rendered.contains("first") && rendered.contains("second"),
+            "CRLF task rows lost: {rendered}"
+        );
+        let first_line = rows
+            .iter()
+            .enumerate()
+            .find(|(_, l)| strip_ansi(l).contains("first"))
+            .map(|(i, _)| i);
+        let second_line = rows
+            .iter()
+            .enumerate()
+            .find(|(_, l)| strip_ansi(l).contains("second"))
+            .map(|(i, _)| i);
+        assert_ne!(
+            first_line, second_line,
+            "CRLF must render as two distinct rows: {rendered}"
+        );
+    }
+
+    #[test]
     fn task_list_wraps_and_distinguishes_statuses() {
         use super::*;
         let panel = ToolExecutionComponent::new("todo", "{}");
