@@ -963,6 +963,7 @@ impl Shell for OsExecutionEnv {
         let mut stdout_buf = String::new();
         let mut stderr_buf = String::new();
         let cancel = options.cancel;
+        let stop_readers = CancellationToken::new();
         let mut on_stdout = options.on_stdout;
         let mut on_stderr = options.on_stderr;
 
@@ -975,13 +976,16 @@ impl Shell for OsExecutionEnv {
                 let mut decoder = crate::output_decode::StreamDecoder::new();
                 use tokio::io::AsyncReadExt;
                 loop {
-                    let read = s.read(&mut buf);
-                    let read_result = match cancel {
-                        Some(token) => tokio::select! {
-                            result = read => result,
-                            _ = token.cancelled() => break,
-                        },
-                        None => read.await,
+                    let read_result = tokio::select! {
+                        biased;
+                        _ = stop_readers.cancelled() => break,
+                        _ = async {
+                            match cancel {
+                                Some(token) => token.cancelled().await,
+                                None => std::future::pending::<()>().await,
+                            }
+                        } => break,
+                        result = s.read(&mut buf) => result,
                     };
                     let n = match read_result {
                         Ok(0) => break,
@@ -1014,13 +1018,16 @@ impl Shell for OsExecutionEnv {
                 let mut decoder = crate::output_decode::StreamDecoder::new();
                 use tokio::io::AsyncReadExt;
                 loop {
-                    let read = s.read(&mut buf);
-                    let read_result = match cancel {
-                        Some(token) => tokio::select! {
-                            result = read => result,
-                            _ = token.cancelled() => break,
-                        },
-                        None => read.await,
+                    let read_result = tokio::select! {
+                        biased;
+                        _ = stop_readers.cancelled() => break,
+                        _ = async {
+                            match cancel {
+                                Some(token) => token.cancelled().await,
+                                None => std::future::pending::<()>().await,
+                            }
+                        } => break,
+                        result = s.read(&mut buf) => result,
                     };
                     let n = match read_result {
                         Ok(0) => break,
@@ -1124,24 +1131,33 @@ impl Shell for OsExecutionEnv {
             // the pipe buffer, so this is not a race — then stop, without waiting
             // for an EOF that may never come. A command whose own process is gone
             // should not be able to hold the call open.
-            let _ = tokio::time::timeout(
+            let drain = async {
+                tokio::join!(
+                    async {
+                        if !stdout_done {
+                            (&mut stdout_task).await;
+                        }
+                    },
+                    async {
+                        if !stderr_done {
+                            (&mut stderr_task).await;
+                        }
+                    },
+                );
+            };
+            tokio::pin!(drain);
+            if tokio::time::timeout(
                 std::time::Duration::from_millis(EXIT_STDIO_GRACE_MS),
-                async {
-                    tokio::join!(
-                        async {
-                            if !stdout_done {
-                                (&mut stdout_task).await;
-                            }
-                        },
-                        async {
-                            if !stderr_done {
-                                (&mut stderr_task).await;
-                            }
-                        },
-                    );
-                },
+                &mut drain,
             )
-            .await;
+            .await
+            .is_err()
+            {
+                // Stop reads, not their futures: both decoders must finish and
+                // deliver already-read tails to callbacks and captured output.
+                stop_readers.cancel();
+                drain.await;
+            }
             status_res
         };
 
