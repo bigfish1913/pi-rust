@@ -1125,6 +1125,21 @@ pub enum RuntimeActionId {
     /// use start(question), status, cancel, hide and show. Never changes the
     /// main transcript or its queues. Presentation and execution stay in host.
     SideQuestion = 25,
+    /// Relay host UI-dialog requests to an external UI.
+    ///
+    /// Args:
+    /// * `{"op":"take"}` — take every request the host has **not** reserved for
+    ///   a plugin (i.e. ids that do not start with the reserved prefix),
+    ///   removing them from the mailbox. Result:
+    ///   `{"requests":[{"requestId","toolCallId","ui"}]}` (possibly empty).
+    /// * `{"op":"respond","requestId":"…","answer":…}` and
+    ///   `{"op":"cancel","requestId":"…"}` — behave like the corresponding
+    ///   `UiDialog` ops.
+    ///
+    /// Exists because the TUI and plugins share one dialog mailbox: without a
+    /// relay, a third-party extension's question pops up on the terminal while
+    /// the user is watching a remote client, and is effectively lost.
+    RelayUiDialog = 28,
 }
 
 /// Error returned when a plugin passes a numeric runtime-action id that this
@@ -1171,9 +1186,66 @@ impl TryFrom<u32> for RuntimeActionId {
             23 => Ok(Self::GetExecutionContext),
             24 => Ok(Self::ChildAgent),
             25 => Ok(Self::SideQuestion),
+            28 => Ok(Self::RelayUiDialog),
             other => Err(UnknownRuntimeActionId(other)),
         }
     }
+}
+
+impl RuntimeActionId {
+    /// Every defined action, in ascending id order.
+    ///
+    /// Kept next to `TryFrom` so adding a variant has one obvious place to
+    /// update. The host's trampoline ceiling and the id-consistency tests both
+    /// derive from [`Self::MAX`], so a forgotten bump fails a test instead of
+    /// silently making the newest action unreachable.
+    pub const ALL: &'static [RuntimeActionId] = &[
+        Self::SendMessage,
+        Self::SendUserMessage,
+        Self::AppendEntry,
+        Self::SetSessionName,
+        Self::GetActiveTools,
+        Self::SetActiveTools,
+        Self::SetModel,
+        Self::GetThinkingLevel,
+        Self::SetThinkingLevel,
+        Self::Compact,
+        Self::GetSystemPrompt,
+        Self::NewSession,
+        Self::Fork,
+        Self::NavigateTree,
+        Self::SwitchSession,
+        Self::Reload,
+        Self::GetCliFlag,
+        Self::UiDialog,
+        Self::SetStatus,
+        Self::SetEditorText,
+        Self::GetSessionBranch,
+        Self::StdioLifecycle,
+        Self::UiComponent,
+        Self::GetExecutionContext,
+        Self::ChildAgent,
+        Self::SideQuestion,
+        Self::RelayUiDialog,
+    ];
+
+    /// The highest defined action id.
+    ///
+    /// The FFI trampoline rejects anything above it, so this must track the
+    /// variants — deriving it here (rather than at each call site) is what makes
+    /// forgetting impossible.
+    pub const MAX: u32 = {
+        let mut max = 0u32;
+        let mut i = 0;
+        while i < Self::ALL.len() {
+            let id = Self::ALL[i] as u32;
+            if id > max {
+                max = id;
+            }
+            i += 1;
+        }
+        max
+    };
 }
 
 impl From<RuntimeActionId> for u32 {
@@ -2272,17 +2344,35 @@ mod tests {
             RuntimeActionId::GetExecutionContext,
             RuntimeActionId::ChildAgent,
             RuntimeActionId::SideQuestion,
+            RuntimeActionId::RelayUiDialog,
         ];
 
-        for (raw, expected) in ids.into_iter().enumerate() {
-            assert_eq!(RuntimeActionId::try_from(raw as u32), Ok(expected));
-            assert_eq!(u32::from(expected), raw as u32);
+        // Explicit ids, not `enumerate()`: numbering has to stay stable when
+        // two proposed actions are developed in parallel, so a gap is allowed
+        // (ids 26/27 are reserved by other in-flight proposals). Deriving ids
+        // from position would silently renumber everything after a gap.
+        for expected in ids {
+            let raw = u32::from(expected);
+            assert_eq!(RuntimeActionId::try_from(raw), Ok(expected));
+            assert_eq!(u32::from(expected), raw);
+        }
+        // Reserved ids stay unimplemented here rather than silently accepted.
+        for reserved in [26u32, 27u32] {
+            assert!(
+                RuntimeActionId::try_from(reserved).is_err(),
+                "id {reserved} is reserved, not implemented in this PR"
+            );
         }
         // One past the highest defined id is rejected (nothing is silently
         // accepted), and so is the u32 ceiling.
+        //
+        // Derived from the enum, not hardcoded: adding an action shifts the
+        // boundary, and a literal here would silently start asserting on a real
+        // id (or keep passing while dispatching).
+        let one_past_last = u32::from(RuntimeActionId::RelayUiDialog) + 1;
         assert_eq!(
-            RuntimeActionId::try_from(26),
-            Err(UnknownRuntimeActionId(26))
+            RuntimeActionId::try_from(one_past_last),
+            Err(UnknownRuntimeActionId(one_past_last))
         );
         assert_eq!(
             RuntimeActionId::try_from(u32::MAX),

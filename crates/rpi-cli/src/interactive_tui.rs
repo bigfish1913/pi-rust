@@ -1819,7 +1819,7 @@ pub async fn interactive_tui(
                 tui_for_key.request_render_reusing_scroll_content();
             }
             if !state_for_key.selector_open() && !state_for_key.extension_dialog_open() {
-                if let Some(request) = ask_user_for_key.take_pending() {
+                if let Some(request) = ask_user_for_key.take_pending_for_tui() {
                     if cfg!(windows) {
                         windows_paste_run.flush_with_clipboard(
                             &editor_for_key,

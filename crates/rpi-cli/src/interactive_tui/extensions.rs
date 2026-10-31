@@ -547,12 +547,24 @@ impl AskUserBridge {
     /// Take the next pending request and mark it visible. Only the single key
     /// loop calls this while no other dialog is open, so the visible-id
     /// bookkeeping is race-free without a separate lock.
-    pub(super) fn take_pending(&self) -> Option<rpi_extensions::UiDialogRequest> {
+    /// Take the next request the TUI should draw.
+    ///
+    /// Skips plugin-reserved entries (`pidingo:` prefix): those belong to a
+    /// remote UI's gate, so drawing them here would show the question in the
+    /// terminal while the user who can answer it watches a remote client.
+    pub(super) fn take_pending_for_tui(&self) -> Option<rpi_extensions::UiDialogRequest> {
         let mut visible = self.visible.lock().ok()?;
         if visible.is_some() {
             return None;
         }
-        let request = self.mailbox.take_pending()?;
+        // An external UI owns delivery: taking here would steal the request and
+        // draw it in a terminal the user is not watching.
+        if self.mailbox.external_takeover() {
+            return None;
+        }
+        let request = self
+            .mailbox
+            .take_pending_filtered(|r| !self.mailbox.is_reserved(&r.request_id))?;
         *visible = Some(request.request_id.clone());
         Some(request)
     }
