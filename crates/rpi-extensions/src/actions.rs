@@ -473,6 +473,32 @@ pub trait RuntimeActionHost: Send + Sync {
     }
 
     /// Safe, effective runtime metadata; never serialize credential bindings.
+    /// Enumerate the registered slash commands.
+    ///
+    /// Args: `{}`. Result: `{"commands":[{name, description, source}]}` where
+    /// `source` is `builtin` / `extension` / `prompt`. A host with no registry
+    /// returns an empty list (genuinely "none registered"), not an error: the
+    /// remote UI should degrade to "no completion available".
+    ///
+    /// Added because the plugin ABI had no way to enumerate commands, so a
+    /// remote client could not offer slash-command completion at all — it saw
+    /// an empty list and could not tell that apart from "no host attached".
+    async fn list_commands(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
+        Ok(serde_json::json!({ "commands": [] }))
+    }
+
+    /// Publish a freshly loaded extension registry to the host.
+    ///
+    /// Called after extension discovery **and after a successful `/reload`**, so
+    /// `ListCommands` keeps answering with the current command set. Hosts that
+    /// do not cache a registry (RPC mode reads the snapshot directly) keep the
+    /// default no-op.
+    ///
+    /// Why it is on the trait instead of a downcast: `/reload` only has the
+    /// `Arc<dyn RuntimeActionHost>` from the old bridge, so there is no concrete
+    /// type to downcast to. A default no-op keeps every other host source-compatible.
+    fn publish_registry(&self, _snapshot: std::sync::Arc<crate::registry::RegistrySnapshot>) {}
+
     async fn get_execution_context(
         &self,
         _args: serde_json::Value,
@@ -922,6 +948,7 @@ async fn dispatch(
         RuntimeActionId::GetExecutionContext => host.get_execution_context(args).await,
         RuntimeActionId::ChildAgent => Err("ChildAgent requires a plugin bridge".into()),
         RuntimeActionId::SideQuestion => Err("SideQuestion requires a plugin bridge".into()),
+        RuntimeActionId::ListCommands => host.list_commands(args).await,
         RuntimeActionId::StdioLifecycle => {
             Err("stdio lifecycle requires a plugin context".to_owned())
         }
@@ -960,8 +987,8 @@ pub extern "C" fn trampoline_runtime_action(
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_action(
             action_id,
-            // Highest id this ABI defines — bump when adding an action.
-            u32::from(RuntimeActionId::SideQuestion),
+            // Highest id this ABI defines.
+            rpi_plugin_sdk::RuntimeActionId::MAX,
             args_json,
             out,
             user_data,
@@ -1925,6 +1952,98 @@ mod tests {
         assert!(mailbox.take_pending().is_none());
     }
 
+    /// `ListCommands` must route through the trampoline to the host method, and
+    /// the default implementation must answer with an **empty list** rather than
+    /// an error — a client has to be able to tell "no commands registered" apart
+    /// from "this host does not support the action".
+    /// The FFI trampoline's ceiling must be exactly the SDK's highest action id.
+    ///
+    /// A branch that adds an action but leaves the ceiling behind compiles,
+    /// keeps every other test green, and quietly makes the newest action
+    /// un-dispatchable. The ceiling and the enum live in different crates, so
+    /// nothing but a test can notice the drift.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn trampoline_ceiling_matches_the_highest_defined_action() {
+        let highest = RuntimeActionId::MAX;
+        assert_eq!(
+            highest,
+            RuntimeActionId::ALL
+                .iter()
+                .copied()
+                .map(u32::from)
+                .max()
+                .unwrap(),
+            "RuntimeActionId::MAX must be the maximum of RuntimeActionId::ALL"
+        );
+        let host: Arc<dyn RuntimeActionHost> = Arc::new(MockHost {
+            prompt: String::new(),
+            saw: Mutex::new(Vec::new()),
+        });
+        let bridge = ActionBridge::with_ui_dialog(
+            tokio::runtime::Handle::current(),
+            host,
+            UiDialogMailbox::new(),
+        );
+        let mut out = StbString::empty();
+        let rc = trampoline_runtime_action(
+            highest,
+            StbStringRef::from_str("{}"),
+            &mut out,
+            bridge.user_data(),
+        );
+        assert_ne!(
+            rc, 2,
+            "the highest defined action id ({highest}) must not be rejected as unknown — \
+             the trampoline ceiling is stale"
+        );
+        if rc == 0 {
+            // SAFETY: success means the trampoline wrote a live host allocation.
+            drop(unsafe {
+                rpi_plugin_sdk::callbacks::OwnedString::from_raw(out, Some(crate::host_free_string))
+            });
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn list_commands_routes_to_the_host_and_defaults_to_empty() {
+        let host: Arc<dyn RuntimeActionHost> = Arc::new(MockHost {
+            prompt: String::new(),
+            saw: Mutex::new(Vec::new()),
+        });
+        let bridge = ActionBridge::with_ui_dialog(
+            tokio::runtime::Handle::current(),
+            host,
+            UiDialogMailbox::new(),
+        );
+        let user_data = bridge.user_data();
+        let mut out = StbString::empty();
+        let rc = trampoline_runtime_action(
+            u32::from(RuntimeActionId::ListCommands),
+            StbStringRef::from_str("{}"),
+            &mut out,
+            user_data,
+        );
+        assert_eq!(
+            rc, 0,
+            "ListCommands must not fail on a host with no registry"
+        );
+        let payload: serde_json::Value = serde_json::from_str(
+            &unsafe {
+                rpi_plugin_sdk::callbacks::OwnedString::from_raw(out, Some(crate::host_free_string))
+            }
+            .to_string_lossy(),
+        )
+        .expect("JSON");
+        assert_eq!(
+            payload
+                .get("commands")
+                .and_then(|c| c.as_array())
+                .map(Vec::len),
+            Some(0),
+            "an empty registry is an empty list, not an error: {payload}"
+        );
+    }
+
     /// The v2 trampoline must route action 17 into the session mailbox rather
     /// than rejecting it as unknown, and a detached mailbox must surface the
     /// explicit "requires an interactive UI" error (headless contract).
@@ -1964,10 +2083,17 @@ mod tests {
         );
 
         // A genuinely unknown id is still rejected (no silent acceptance).
-        // 26 is one past the highest defined action.
+        // Derive "one past the highest" from the enum so adding an action does
+        // not silently turn this into a real dispatch.
+        let one_past_last = rpi_plugin_sdk::RuntimeActionId::MAX + 1;
         let mut out = StbString::empty();
         assert_eq!(
-            trampoline_runtime_action(26, StbStringRef::from_str("{}"), &mut out, user_data),
+            trampoline_runtime_action(
+                one_past_last,
+                StbStringRef::from_str("{}"),
+                &mut out,
+                user_data
+            ),
             2
         );
         // SAFETY: this action returned a live host allocation, not previously freed.

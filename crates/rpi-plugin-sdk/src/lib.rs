@@ -1125,6 +1125,22 @@ pub enum RuntimeActionId {
     /// use start(question), status, cancel, hide and show. Never changes the
     /// main transcript or its queues. Presentation and execution stay in host.
     SideQuestion = 25,
+    /// Enumerate the registered slash commands. Args: `{}`; result:
+    /// `{"commands":[{"name":"…","description":"…","source":"builtin"|"extension"|"prompt"}]}`.
+    ///
+    /// Worth having as an action because the ABI had no way to enumerate
+    /// commands at all: a remote client saw an empty completion list and could
+    /// not tell it apart from "this host has no commands". `GetActiveTools` is
+    /// about tools, not slash commands.
+    ///
+    /// A host with no extension registry returns an **empty list** rather than
+    /// an error: "none registered" is a real answer, and a client should
+    /// degrade to "no completion available" instead of surfacing a failure.
+    ///
+    /// `source` is `builtin` for the host's own commands, `extension` for ones
+    /// a plugin registered, and `prompt` for a prompt template; clients use it
+    /// to decide how to dispatch a chosen entry.
+    ListCommands = 26,
 }
 
 /// Error returned when a plugin passes a numeric runtime-action id that this
@@ -1171,9 +1187,66 @@ impl TryFrom<u32> for RuntimeActionId {
             23 => Ok(Self::GetExecutionContext),
             24 => Ok(Self::ChildAgent),
             25 => Ok(Self::SideQuestion),
+            26 => Ok(Self::ListCommands),
             other => Err(UnknownRuntimeActionId(other)),
         }
     }
+}
+
+impl RuntimeActionId {
+    /// Every defined action, in ascending id order.
+    ///
+    /// Kept next to `TryFrom` so adding a variant has one obvious place to
+    /// update. The host's trampoline ceiling and the id-consistency tests both
+    /// derive from [`Self::MAX`], so a forgotten bump fails a test instead of
+    /// silently making the newest action unreachable.
+    pub const ALL: &'static [RuntimeActionId] = &[
+        Self::SendMessage,
+        Self::SendUserMessage,
+        Self::AppendEntry,
+        Self::SetSessionName,
+        Self::GetActiveTools,
+        Self::SetActiveTools,
+        Self::SetModel,
+        Self::GetThinkingLevel,
+        Self::SetThinkingLevel,
+        Self::Compact,
+        Self::GetSystemPrompt,
+        Self::NewSession,
+        Self::Fork,
+        Self::NavigateTree,
+        Self::SwitchSession,
+        Self::Reload,
+        Self::GetCliFlag,
+        Self::UiDialog,
+        Self::SetStatus,
+        Self::SetEditorText,
+        Self::GetSessionBranch,
+        Self::StdioLifecycle,
+        Self::UiComponent,
+        Self::GetExecutionContext,
+        Self::ChildAgent,
+        Self::SideQuestion,
+        Self::ListCommands,
+    ];
+
+    /// The highest defined action id.
+    ///
+    /// The FFI trampoline rejects anything above it, so this must track the
+    /// variants — deriving it here (rather than at each call site) is what makes
+    /// forgetting impossible.
+    pub const MAX: u32 = {
+        let mut max = 0u32;
+        let mut i = 0;
+        while i < Self::ALL.len() {
+            let id = Self::ALL[i] as u32;
+            if id > max {
+                max = id;
+            }
+            i += 1;
+        }
+        max
+    };
 }
 
 impl From<RuntimeActionId> for u32 {
@@ -2272,17 +2345,22 @@ mod tests {
             RuntimeActionId::GetExecutionContext,
             RuntimeActionId::ChildAgent,
             RuntimeActionId::SideQuestion,
+            RuntimeActionId::ListCommands,
         ];
 
-        for (raw, expected) in ids.into_iter().enumerate() {
-            assert_eq!(RuntimeActionId::try_from(raw as u32), Ok(expected));
-            assert_eq!(u32::from(expected), raw as u32);
+        // Explicit ids, not `enumerate()`: numbering has to stay stable when
+        // two proposed actions are developed in parallel, so implementation
+        // order must not imply numbering.
+        for expected in ids {
+            let raw = u32::from(expected);
+            assert_eq!(RuntimeActionId::try_from(raw), Ok(expected));
+            assert_eq!(u32::from(expected), raw);
         }
         // One past the highest defined id is rejected (nothing is silently
         // accepted), and so is the u32 ceiling.
         assert_eq!(
-            RuntimeActionId::try_from(26),
-            Err(UnknownRuntimeActionId(26))
+            RuntimeActionId::try_from(27),
+            Err(UnknownRuntimeActionId(27))
         );
         assert_eq!(
             RuntimeActionId::try_from(u32::MAX),
