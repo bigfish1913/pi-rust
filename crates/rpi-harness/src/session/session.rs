@@ -832,6 +832,19 @@ fn entry_id(entry: &Entry) -> String {
 
 #[async_trait]
 impl SessionTree for Session {
+    async fn message_summaries(
+        &self,
+        query: &crate::session::types::MessageSummaryQuery,
+    ) -> SessionResult<crate::session::types::MessageSummaryPage> {
+        self.storage_arc().message_summaries("main", query).await
+    }
+    async fn message_window(
+        &self,
+        query: &crate::session::types::MessageWindowQuery,
+    ) -> SessionResult<crate::session::types::MessageWindowPage> {
+        self.storage_arc().message_window("main", query).await
+    }
+
     async fn get_leaf_id(&self) -> SessionResult<Option<String>> {
         Session::get_leaf_id(self).await
     }
@@ -903,6 +916,25 @@ pub struct LaneView {
 
 #[async_trait]
 impl SessionTree for LaneView {
+    async fn message_summaries(
+        &self,
+        query: &crate::session::types::MessageSummaryQuery,
+    ) -> SessionResult<crate::session::types::MessageSummaryPage> {
+        self.session
+            .storage_arc()
+            .message_summaries(&self.lane, query)
+            .await
+    }
+    async fn message_window(
+        &self,
+        query: &crate::session::types::MessageWindowQuery,
+    ) -> SessionResult<crate::session::types::MessageWindowPage> {
+        self.session
+            .storage_arc()
+            .message_window(&self.lane, query)
+            .await
+    }
+
     async fn get_leaf_id(&self) -> SessionResult<Option<String>> {
         self.session.get_leaf_id_for_lane(&self.lane).await
     }

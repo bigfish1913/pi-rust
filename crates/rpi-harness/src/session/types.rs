@@ -1100,6 +1100,90 @@ pub struct BranchBounds {
     pub stop_at_id: Option<String>,
 }
 
+// Bounded transcript reads. These are session/storage types, not UI or RPC types.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessageSummaryQuery {
+    #[serde(default = "default_summary_limit")]
+    pub limit: usize,
+    #[serde(default = "default_summary_role")]
+    pub role: String,
+    pub before_id: Option<String>,
+    pub leaf_id: Option<String>,
+}
+fn default_summary_limit() -> usize {
+    10
+}
+fn default_summary_role() -> String {
+    "user".into()
+}
+impl Default for MessageSummaryQuery {
+    fn default() -> Self {
+        Self {
+            limit: 10,
+            role: default_summary_role(),
+            before_id: None,
+            leaf_id: None,
+        }
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageSummary {
+    pub entry_id: String,
+    pub role: String,
+    pub preview: String,
+    pub timestamp: i64,
+    pub has_images: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageSummaryPage {
+    pub filtered: bool,
+    pub role: String,
+    pub messages: Vec<MessageSummary>,
+    pub first_id: Option<String>,
+    pub last_id: Option<String>,
+    pub next_before_id: Option<String>,
+    pub has_more: bool,
+    pub leaf_id: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessageWindowQuery {
+    #[serde(default = "default_window_limit")]
+    pub limit: usize,
+    pub anchor_id: Option<String>,
+    pub before_id: Option<String>,
+    pub after_id: Option<String>,
+    pub leaf_id: Option<String>,
+}
+fn default_window_limit() -> usize {
+    48
+}
+impl Default for MessageWindowQuery {
+    fn default() -> Self {
+        Self {
+            limit: 48,
+            anchor_id: None,
+            before_id: None,
+            after_id: None,
+            leaf_id: None,
+        }
+    }
+}
+#[derive(Debug, Clone)]
+pub struct MessageWindowPage {
+    pub entries: Vec<Entry>,
+    pub first_id: Option<String>,
+    pub last_id: Option<String>,
+    pub next_before_id: Option<String>,
+    pub next_after_id: Option<String>,
+    pub has_more_before: bool,
+    pub has_more_after: bool,
+    pub leaf_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RecordQuery {
     pub lane: Option<String>,
@@ -1356,6 +1440,28 @@ pub trait SessionStorage: Send + Sync {
     }
 
     // Reads
+    async fn message_summaries(
+        &self,
+        lane: &str,
+        query: &MessageSummaryQuery,
+    ) -> SessionResult<MessageSummaryPage> {
+        let _ = (lane, query);
+        Err(crate::error::SessionError::new(
+            crate::error::SessionErrorCode::InvalidQuery,
+            "message summaries unsupported by storage",
+        ))
+    }
+    async fn message_window(
+        &self,
+        lane: &str,
+        query: &MessageWindowQuery,
+    ) -> SessionResult<MessageWindowPage> {
+        let _ = (lane, query);
+        Err(crate::error::SessionError::new(
+            crate::error::SessionErrorCode::InvalidQuery,
+            "message windows unsupported by storage",
+        ))
+    }
     async fn get_entry(&self, id: &str) -> SessionResult<Option<Entry>>;
     async fn find_entries(&self, query: &EntryQuery) -> SessionResult<Vec<Entry>>;
     async fn find_entries_on_branch(
@@ -1434,6 +1540,23 @@ pub trait SessionRepo: Send + Sync {
 /// `SessionTree`. Lane-bound harness runners own one of these views.
 #[async_trait::async_trait]
 pub trait SessionTree: Send + Sync {
+    async fn message_summaries(
+        &self,
+        query: &MessageSummaryQuery,
+    ) -> SessionResult<MessageSummaryPage> {
+        let _ = query;
+        Err(crate::error::SessionError::new(
+            crate::error::SessionErrorCode::InvalidQuery,
+            "message summaries unsupported by tree",
+        ))
+    }
+    async fn message_window(&self, query: &MessageWindowQuery) -> SessionResult<MessageWindowPage> {
+        let _ = query;
+        Err(crate::error::SessionError::new(
+            crate::error::SessionErrorCode::InvalidQuery,
+            "message windows unsupported by tree",
+        ))
+    }
     async fn get_leaf_id(&self) -> SessionResult<Option<String>>;
     async fn get_entry(&self, id: &str) -> SessionResult<Option<Entry>>;
     async fn get_stats(&self) -> SessionResult<SessionStats>;

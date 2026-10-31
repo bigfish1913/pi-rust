@@ -292,6 +292,22 @@ impl SessionStorage for InMemorySessionStorage {
         })
     }
 
+    async fn message_summaries(
+        &self,
+        lane: &str,
+        query: &crate::session::types::MessageSummaryQuery,
+    ) -> SessionResult<crate::session::types::MessageSummaryPage> {
+        self.inner
+            .read_state(|state| state.message_summaries(lane, query))
+    }
+    async fn message_window(
+        &self,
+        lane: &str,
+        query: &crate::session::types::MessageWindowQuery,
+    ) -> SessionResult<crate::session::types::MessageWindowPage> {
+        self.inner
+            .read_state(|state| state.message_window(lane, query))
+    }
     async fn get_entry(&self, id: &str) -> SessionResult<Option<Entry>> {
         Ok(self.inner.read_state(|state| state.get_entry(id).cloned()))
     }
