@@ -1394,7 +1394,7 @@ impl AgentHarness {
     async fn append_message_locked(
         &self,
         message: AgentMessage,
-    ) -> HarnessResult<(String, bool, Vec<AgentMessage>)> {
+    ) -> HarnessResult<(String, bool, Vec<(String, AgentMessage)>)> {
         let active = {
             let inner = self.inner.lock().unwrap();
             if inner.closed {
@@ -1430,7 +1430,7 @@ impl AgentHarness {
             .append_message(message.clone())
             .await
             .map_err(session_to_harness_err)?;
-        appended.push(message);
+        appended.push((id.clone(), message));
         Ok((id, false, appended))
     }
 
@@ -1547,20 +1547,21 @@ impl AgentHarness {
     async fn commit_context_entries(
         &self,
         entries: Vec<ProvisionedEntry>,
-    ) -> HarnessResult<Vec<AgentMessage>> {
+    ) -> HarnessResult<Vec<(String, AgentMessage)>> {
         let mut messages = Vec::with_capacity(entries.len());
         for entry in entries {
             let ProvisionedKind::Message { message, .. } = &entry.kind else {
                 unreachable!()
             };
             let message = message.clone();
+            let id = entry.id.clone();
             self.append_provisioned(entry).await?;
-            messages.push(message);
+            messages.push((id, message));
         }
         Ok(messages)
     }
 
-    async fn flush_context_messages_locked(&self) -> HarnessResult<Vec<AgentMessage>> {
+    async fn flush_context_messages_locked(&self) -> HarnessResult<Vec<(String, AgentMessage)>> {
         let messages = self
             .commit_context_entries(self.pending_context_entries().await?)
             .await?;
@@ -1582,16 +1583,22 @@ impl AgentHarness {
 
     /// Context-only messages are already durable. Emit directly to the client
     /// emitter so they do not increment the loop's persistence indices.
-    async fn emit_appended_messages(&self, messages: Vec<AgentMessage>) {
+    async fn emit_appended_messages(&self, messages: Vec<(String, AgentMessage)>) {
         let emitter = self.inner.lock().unwrap().agent_emitter.clone();
         if let Some(emitter) = emitter {
-            for message in messages {
+            for (id, message) in messages {
                 emitter
                     .emit(AgentEvent::MessageStart {
+                        message_id: Some(id.clone()),
                         message: message.clone(),
                     })
                     .await;
-                emitter.emit(AgentEvent::MessageEnd { message }).await;
+                emitter
+                    .emit(AgentEvent::MessageEnd {
+                        message,
+                        message_id: Some(id),
+                    })
+                    .await;
             }
         }
     }
@@ -1644,7 +1651,7 @@ impl AgentHarness {
             .remove(&self.lane);
         drop(gate);
         self.emit_appended_messages(messages.clone()).await;
-        Ok(messages)
+        Ok(messages.into_iter().map(|(_, message)| message).collect())
     }
 
     /// Finish callbacks before admitting another operation. RunEnd and the
@@ -2810,7 +2817,7 @@ impl AgentHarness {
         tools: &[HarnessTool],
         signal: &CancellationToken,
         salvage_failed_attempts: bool,
-    ) -> HarnessResult<Vec<AgentMessage>> {
+    ) -> HarnessResult<Vec<ProvisionedEntry>> {
         // The `tool_started` records hold what a replay needs and the frames do
         // not: the arguments the call was made with, and the policy declared at
         // the time. The in-memory copy died with the process.
@@ -2836,7 +2843,9 @@ impl AgentHarness {
 
         // (1) Streams that never became entries: salvage them as interrupted
         //     assistant messages, each followed by its unresolved tool results.
-        for partial in crate::frame_progress::replay_run_frames(session, run_id).await? {
+        for (entry_id, partial) in
+            crate::frame_progress::replay_bound_run_frames(session, run_id).await?
+        {
             // When the run is about to be retried, none of its uncommitted
             // streams is worth keeping: they are the failed attempts of the retry
             // chain, and recording one would leave a dead assistant message in the
@@ -2852,14 +2861,31 @@ impl AgentHarness {
             let unresolved =
                 crate::frame_progress::unknown_tool_outcomes(session, lane, &partial).await?;
             let timestamp = partial.timestamp;
-            messages.push(AgentMessage::Assistant(Box::new(
-                crate::frame_progress::interrupted_message(partial),
-            )));
+            messages.push(ProvisionedEntry {
+                id: entry_id.unwrap_or_else(|| session.id_generator().next()),
+                kind: ProvisionedKind::Message {
+                    message: AgentMessage::Assistant(Box::new(
+                        crate::frame_progress::interrupted_message(partial),
+                    )),
+                    terminate: None,
+                },
+            });
             for outcome in unresolved {
                 resolved.insert(outcome.tool_call_id.clone());
-                messages.push(
-                    Self::resolve_tool_call(tools, signal, &recorded, &outcome, timestamp).await,
-                );
+                let id = recorded
+                    .get(&outcome.tool_call_id)
+                    .map(|record| record.result_entry_id.clone())
+                    .unwrap_or_else(|| session.id_generator().next());
+                messages.push(ProvisionedEntry {
+                    id,
+                    kind: ProvisionedKind::Message {
+                        message: Self::resolve_tool_call(
+                            tools, signal, &recorded, &outcome, timestamp,
+                        )
+                        .await,
+                        terminate: None,
+                    },
+                });
             }
         }
 
@@ -2881,10 +2907,20 @@ impl AgentHarness {
             let timestamp = partial.timestamp;
             for outcome in unresolved {
                 if resolved.insert(outcome.tool_call_id.clone()) {
-                    messages.push(
-                        Self::resolve_tool_call(tools, signal, &recorded, &outcome, timestamp)
+                    let id = recorded
+                        .get(&outcome.tool_call_id)
+                        .map(|record| record.result_entry_id.clone())
+                        .unwrap_or_else(|| session.id_generator().next());
+                    messages.push(ProvisionedEntry {
+                        id,
+                        kind: ProvisionedKind::Message {
+                            message: Self::resolve_tool_call(
+                                tools, signal, &recorded, &outcome, timestamp,
+                            )
                             .await,
-                    );
+                            terminate: None,
+                        },
+                    });
                 }
             }
         }
@@ -3117,7 +3153,7 @@ impl AgentHarness {
         {
             Ok(salvaged) => {
                 for message in salvaged {
-                    if let Err(error) = session.view(lane).append_message(message).await {
+                    if let Err(error) = session.append_entry(message, lane).await {
                         tracing::warn!(
                             lane,
                             %error,
@@ -3966,6 +4002,7 @@ impl AgentHarness {
             system_prompt_override: None,
             resume_data,
         };
+        let mut prompt_ids = Vec::with_capacity(prompts.len());
         let prompt_start = if let Some(first) = prompts.first() {
             let first_entry_id = queued_ids
                 .first()
@@ -3976,7 +4013,7 @@ impl AgentHarness {
                 source_leaf.clone(),
                 intent,
                 ProvisionedEntry {
-                    id: first_entry_id,
+                    id: first_entry_id.clone(),
                     kind: ProvisionedKind::Message {
                         message: first.clone(),
                         terminate: None,
@@ -3994,6 +4031,7 @@ impl AgentHarness {
                 self.keep_unsaved_message("a message you sent", first.clone());
                 error
             })?;
+            prompt_ids.push(first_entry_id);
             1
         } else {
             self.write_operation_started(&run_id, source_leaf.clone(), intent)
@@ -4014,14 +4052,16 @@ impl AgentHarness {
                     },
                 })
                 .await
-                .map(|_| ())
+                .map(|entry| entry.base().id.clone())
             } else {
                 self.view()
                     .append_message(msg.clone())
                     .await
-                    .map(|_| ())
                     .map_err(session_to_harness_err)
             };
+            if let Ok(id) = &persisted {
+                prompt_ids.push(id.clone());
+            }
             if let Err(error) = persisted {
                 // Same recovery contract as the first prompt: the text is on
                 // screen, the write was refused, and /export must be able to
@@ -4033,8 +4073,14 @@ impl AgentHarness {
             }
         }
 
-        self.emit_appended_messages(prompts.iter().take(queued_ids.len()).cloned().collect())
-            .await;
+        self.emit_appended_messages(
+            prompt_ids
+                .into_iter()
+                .zip(prompts.iter().cloned())
+                .take(queued_ids.len())
+                .collect(),
+        )
+        .await;
 
         let snap = self.snapshot_config()?;
         let build_opts = Self::build_opts(&snap.entry_projectors, &snap.entry_transforms);
@@ -4267,6 +4313,55 @@ impl AgentHarness {
                 })
                 .collect(),
         ));
+        // A deferred poll's assistant is already history, but this fresh run
+        // has not observed its MessageEnd. Seed call registrations from the
+        // durable source entry, never by searching for matching text/content
+        // and never by re-appending it or inventing an assistant identity.
+        if from_assistant {
+            let entry_id = source_leaf.as_deref().ok_or_else(|| {
+                HarnessError::agent("resumed assistant has no durable source entry")
+            })?;
+            let Some(Entry::Message(entry)) = self.get_entry(entry_id).await? else {
+                return Err(HarnessError::agent(
+                    "resumed assistant source entry is missing",
+                ));
+            };
+            let AgentMessage::Assistant(assistant) = &entry.message else {
+                return Err(HarnessError::agent(
+                    "resumed source entry is not an assistant",
+                ));
+            };
+            let Some(AgentMessage::Assistant(context_assistant)) = agent_context.messages.last()
+            else {
+                return Err(HarnessError::agent(
+                    "resumed context does not end in an assistant",
+                ));
+            };
+            // Tools execute in content-block order. A context transform must
+            // not silently reassign a durable call to a different slot.
+            let call_slots = |message: &AssistantMessage| {
+                message
+                    .content
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, block)| {
+                        if let Content::ToolCall(call) = block {
+                            Some((index, call.id.clone(), call.name.clone()))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
+            if call_slots(assistant) != call_slots(context_assistant) {
+                return Err(HarnessError::agent(
+                    "resumed tool call slots differ from durable assistant",
+                ));
+            }
+            self.write_step_attempt(&run_id, StepKind::Assistant, 1, entry_id, None)
+                .await?;
+            settle_state.record_tool_calls(entry_id, assistant);
+        }
         let context_write_error = Arc::new(Mutex::new(None));
         let mut config = AgentLoopConfig {
             model: snap.model.clone(),
@@ -4426,6 +4521,7 @@ impl AgentHarness {
             Arc::clone(&frame_recorder),
             Arc::clone(&settle_state),
             self.clone(),
+            signal.clone(),
         ));
         let result = loop {
             // An attempt owns its history. A retry reloads the durable branch
@@ -4456,6 +4552,9 @@ impl AgentHarness {
                 .await
             };
 
+            if let Some(error) = settle_state.identity_error() {
+                return Err(HarnessError::io(error));
+            }
             let retry_error = attempt_result
                 .as_ref()
                 .ok()
@@ -4651,8 +4750,8 @@ impl AgentHarness {
                     .unwrap_or_default();
                 let mut leaf_after_salvage = leaf.clone();
                 for message in salvaged {
-                    match self.session.view(&self.lane).append_message(message).await {
-                        Ok(id) => leaf_after_salvage = id,
+                    match self.session.append_entry(message, &self.lane).await {
+                        Ok(entry) => leaf_after_salvage = entry.base().id.clone(),
                         Err(append_error) => {
                             tracing::warn!(
                                 lane = %self.lane,

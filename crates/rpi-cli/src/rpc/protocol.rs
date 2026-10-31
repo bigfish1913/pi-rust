@@ -20,8 +20,8 @@ pub struct Request {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
     Prompt {
-        #[serde(alias = "content", alias = "prompt")]
-        message: String,
+        #[serde(flatten)]
+        content: PromptPayload,
     },
     Abort,
     GetState,
@@ -102,6 +102,16 @@ pub enum Command {
     SetThinkingLevel {
         level: rpi_ai::types::ThinkingLevel,
     },
+    ConfigureFileIo {
+        #[serde(rename = "readText")]
+        read_text: bool,
+        #[serde(rename = "writeText")]
+        write_text: bool,
+    },
+    FileIoResponse {
+        #[serde(rename = "requestId")]
+        request_id: String,
+    },
     ConfigureExternalTools {
         tools: Vec<rpi_tools::tools::external::ExternalToolDefinition>,
     },
@@ -124,6 +134,37 @@ pub enum Command {
     },
     Ping,
     Stop,
+}
+
+/// Shape-only deserialization; pixel validation belongs to the owned run worker.
+/// Presence, not serde aliases, determines legacy precedence.
+#[allow(dead_code)] // Shape-only schema; production dispatch uses the owned raw frame.
+#[derive(Debug)]
+pub enum PromptPayload {
+    Legacy(String),
+    Blocks(Vec<Value>),
+}
+impl<'de> serde::Deserialize<'de> for PromptPayload {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = <Value as serde::Deserialize>::deserialize(deserializer)?;
+        let invalid = |error: String| <D::Error as serde::de::Error>::custom(error);
+        super::prompt_content::validate_prompt_shape(&value).map_err(invalid)?;
+        if let Some(blocks) = value.get("contentBlocks") {
+            Ok(Self::Blocks(
+                blocks.as_array().expect("validated blocks").clone(),
+            ))
+        } else {
+            Ok(Self::Legacy(
+                value
+                    .get("message")
+                    .or_else(|| value.get("content"))
+                    .or_else(|| value.get("prompt"))
+                    .and_then(Value::as_str)
+                    .expect("validated legacy string")
+                    .to_owned(),
+            ))
+        }
+    }
 }
 
 pub const SUPPORTED_COMMANDS: &[&str] = &[
@@ -151,6 +192,8 @@ pub const SUPPORTED_COMMANDS: &[&str] = &[
     "set_model",
     "get_available_thinking_levels",
     "set_thinking_level",
+    "configure_file_io",
+    "file_io_response",
     "configure_external_tools",
     "external_tool_response",
     "get_available_tools",
@@ -190,9 +233,12 @@ pub fn ready(mode: crate::args::RpcMessageUpdates) -> Value {
         "protocol": "rpi",
         "piCompatibilityTarget": PI_BASELINE,
         "supportedCommands": SUPPORTED_COMMANDS,
-        "supportedEvents": ["session_entry_committed", "external_tool_request", "external_tool_request_closed"],
+        "supportedEvents": ["session_entry_committed", "external_tool_request", "external_tool_request_closed", "file_io_request", "file_io_request_closed"],
+        "promptContent": super::prompt_content::prompt_capabilities(),
+        "fileIO": super::file_io::capabilities(),
         "semantics": {
             "messageUpdates": mode.as_str(),
+            "messageIds": "sessionEntryId-v1",
             "promptResponse": "accepted",
             "settlementEvent": "agent_settled",
             "agentEndIsTerminal": false
@@ -255,6 +301,7 @@ mod tests {
         }
         let value = ready(crate::args::RpcMessageUpdates::default());
         assert_eq!(value["protocol"], "rpi");
+        assert_eq!(value["semantics"]["messageIds"], "sessionEntryId-v1");
         assert_eq!(value["semantics"]["settlementEvent"], "agent_settled");
         assert!(value["supportedCommands"]
             .as_array()
@@ -364,7 +411,7 @@ mod tests {
             }))
             .unwrap();
             assert!(
-                matches!(request.command, Command::Prompt { message } if message == "legacy text")
+                matches!(request.command, Command::Prompt { content: PromptPayload::Legacy(message) } if message == "legacy text")
             );
         }
     }

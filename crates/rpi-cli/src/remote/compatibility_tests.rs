@@ -223,7 +223,7 @@ async fn assert_real_provider_channel_order(api: rpi_ai::Api) {
                 assert!(matches!(&message.content[0], rpi_ai::Content::Thinking(block) if block.thinking == "考える🧠終"));
                 assert!(matches!(&message.content[1], rpi_ai::Content::Text(block) if block.text == "Hé🌍! Done"));
             }
-            let event = AgentEvent::MessageUpdate {
+            let event = AgentEvent::MessageUpdate { message_id: None,
                 message: Arc::new(nested.partial().clone()),
                 assistant_message_event: nested,
             };
@@ -283,6 +283,7 @@ fn real_encoder_preserves_first_and_late_tool_identity_after_empty_start() {
                 }
             };
             let event = AgentEvent::MessageUpdate {
+                message_id: None,
                 message: partial,
                 assistant_message_event: nested,
             };

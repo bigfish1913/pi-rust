@@ -68,6 +68,56 @@ use rpi_extensions::{
     PluginDiagnostics, PluginToolAdapter, TeeEmitter, ToolPromptMetadata,
 };
 
+// Preserve the existing public modes::rpc signature. This CLI-only attachment
+// table holds no session/router alive and keys by storage allocation identity,
+// NOT by a durable ID (two independent restored hosts must never share routing).
+// The session/tools/ReloadContext own the actual router. RPC owns its client.
+// Reload MUST reuse ReloadContext::file_io, including a disconnected selected
+// client backend; rebuilding a default router would silently restore host file
+// authority. Missing attachments reject configuration (never infer a router or
+// install host-backed replacements). This compatibility bridge can be replaced
+// by an explicit neutral harness attachment when its public API is revised.
+type FileIOAttachment = (
+    std::sync::Weak<dyn rpi_harness::session::types::SessionStorage>,
+    std::sync::Weak<rpi_tools::file_io::FileIORouter>,
+);
+fn file_io_attachments() -> &'static Mutex<Vec<FileIOAttachment>> {
+    static ATTACHMENTS: std::sync::OnceLock<Mutex<Vec<FileIOAttachment>>> =
+        std::sync::OnceLock::new();
+    ATTACHMENTS.get_or_init(|| Mutex::new(Vec::new()))
+}
+pub(crate) fn register_file_io_router(
+    harness: &AgentHarness,
+    router: &Arc<rpi_tools::file_io::FileIORouter>,
+) {
+    let storage = harness.session().storage();
+    let mut attachments = file_io_attachments()
+        .lock()
+        .expect("file I/O attachments poisoned");
+    attachments.retain(|(s, r)| {
+        s.strong_count() > 0
+            && r.strong_count() > 0
+            && !s
+                .upgrade()
+                .is_some_and(|known| Arc::ptr_eq(&known, &storage))
+    });
+    attachments.push((Arc::downgrade(&storage), Arc::downgrade(router)));
+}
+pub(crate) fn file_io_router(
+    harness: &AgentHarness,
+) -> Option<Arc<rpi_tools::file_io::FileIORouter>> {
+    let storage = harness.session().storage();
+    let mut attachments = file_io_attachments()
+        .lock()
+        .expect("file I/O attachments poisoned");
+    attachments.retain(|(s, r)| s.strong_count() > 0 && r.strong_count() > 0);
+    attachments.iter().find_map(|(s, r)| {
+        s.upgrade()
+            .filter(|known| Arc::ptr_eq(known, &storage))
+            .and_then(|_| r.upgrade())
+    })
+}
+
 /// The coding tools registered by the CLI by default.
 pub const BUILTIN_TOOL_NAMES: &[&str] = &["read", "bash", "edit", "write", "docs"];
 
@@ -520,7 +570,9 @@ pub async fn build_prepared(
     let _registry = Arc::new(MutationQueueRegistry::new());
     // `env_dyn` is shared between the tool context (moved in) and the resource
     // loaders below (borrowed); clone one branch so both hold a reference.
-    let ctx = ExecutionToolContext::new(env_dyn.clone(), Some(mut_env));
+    let file_io = Arc::new(rpi_tools::file_io::FileIORouter::new());
+    let ctx =
+        ExecutionToolContext::new(env_dyn.clone(), Some(mut_env)).with_file_io(file_io.clone());
 
     let mut tools = build_tools(&ctx, args);
 
@@ -988,6 +1040,8 @@ pub async fn build_prepared(
         Err(e) => return Err(BuildError::HarnessCreate(e.to_string())),
     };
 
+    register_file_io_router(&harness, &file_io);
+
     // ---- Durable operation recovery (runtime layer) ----
     // A previous process can die between `operation_started` and
     // `operation_finished`, leaving the lane with an orphaned operation. Sweep
@@ -1045,6 +1099,7 @@ pub async fn build_prepared(
         extension_session: extension_session_cell,
         action_bridge: Arc::new(Mutex::new(Some(Arc::clone(&action_bridge)))),
         tool_context,
+        file_io,
         catalog: Arc::new(std::sync::RwLock::new(catalog)),
         providers: Arc::new(std::sync::RwLock::new(resolved.providers.clone())),
         runtime: runtime.clone(),
@@ -1166,6 +1221,8 @@ pub type ActionBridgeCell = Arc<Mutex<Option<Arc<rpi_extensions::ActionBridge>>>
 /// reload callback without borrowing the harness).
 #[derive(Clone)]
 pub struct ReloadContext {
+    /// One neutral router for all built-ins, including those reconstructed on reload.
+    pub file_io: Arc<rpi_tools::file_io::FileIORouter>,
     /// The live extension-session cell (swapped on reload).
     pub extension_session: ExtensionSessionCell,
     /// The session's plugin-tool context (`cwd` + session id), reused — not
@@ -1723,7 +1780,8 @@ where
     // on top, mirroring `build`. Built before the
     // prompt so the prompt lists exactly the active tools.
     let mut_env: Arc<dyn rpi_tools::MutatingEnv> = env.clone();
-    let tool_ctx = rpi_tools::ExecutionToolContext::new(env_dyn.clone(), Some(mut_env));
+    let tool_ctx = rpi_tools::ExecutionToolContext::new(env_dyn.clone(), Some(mut_env))
+        .with_file_io(ctx.file_io.clone());
     let mut tools = build_tools(&tool_ctx, &effective_args);
     merge_extension_tools(
         &mut tools,

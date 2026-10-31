@@ -147,20 +147,21 @@ async fn post_tool_abort_case(resume: bool, steering: bool) {
             matches!(
                 e,
                 AgentEvent::MessageEnd {
-                    message: AgentMessage::ToolResult(_)
+                    message: AgentMessage::ToolResult(_),
+                    ..
                 }
             )
         })
         .unwrap();
     let abort_start = events
         .iter()
-        .position(|e| matches!(e, AgentEvent::MessageStart { message } if message == aborted))
+        .position(|e| matches!(e, AgentEvent::MessageStart { message, .. } if message == aborted))
         .unwrap();
     assert!(result_end < abort_start);
     assert_eq!(
         events
             .iter()
-            .filter(|e| matches!(e, AgentEvent::MessageEnd { message } if message == aborted))
+            .filter(|e| matches!(e, AgentEvent::MessageEnd { message, .. } if message == aborted))
             .count(),
         1
     );
@@ -213,7 +214,8 @@ async fn post_tool_late_cancel_does_not_relabel_normal_completed_assistant() {
             .filter(|e| matches!(
                 e,
                 AgentEvent::MessageEnd {
-                    message: AgentMessage::Assistant(_)
+                    message: AgentMessage::Assistant(_),
+                    ..
                 }
             ))
             .count(),

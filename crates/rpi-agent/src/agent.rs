@@ -89,7 +89,7 @@ impl MutableAgentState {
     /// Reduce an event into state. Mirrors the switch in TS `processEvents`.
     fn reduce(&mut self, event: &AgentEvent) {
         match event {
-            AgentEvent::MessageStart { message } => {
+            AgentEvent::MessageStart { message, .. } => {
                 // One clone per message (not per delta): the state holds the
                 // partial as a shared snapshot from here on.
                 self.streaming_message = message
@@ -99,7 +99,7 @@ impl MutableAgentState {
             AgentEvent::MessageUpdate { message, .. } => {
                 self.streaming_message = Some(Arc::clone(message));
             }
-            AgentEvent::MessageEnd { message } => {
+            AgentEvent::MessageEnd { message, .. } => {
                 self.streaming_message = None;
                 self.messages.push(message.clone());
             }

@@ -62,14 +62,20 @@ pub enum RemoteEvent {
         tool_results: Value,
     },
     MessageStart {
+        #[serde(rename = "messageId", default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
         #[serde(default)]
         message: Value,
     },
     MessageEnd {
+        #[serde(rename = "messageId", default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
         #[serde(default)]
         message: Value,
     },
     MessageUpdate {
+        #[serde(rename = "messageId", default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
         #[serde(default)]
         message: Value,
         #[serde(rename = "assistantMessageEvent", default)]
@@ -172,13 +178,22 @@ impl RemoteEvent {
                 tool_result_count: tool_results.len(),
                 tool_results: serde_json::to_value(tool_results).unwrap_or(Value::Null),
             },
-            AgentEvent::MessageStart { message } => RemoteEvent::MessageStart {
+            AgentEvent::MessageStart {
+                message,
+                message_id,
+            } => RemoteEvent::MessageStart {
+                message_id: message_id.clone(),
                 message: serde_json::to_value(message).unwrap_or(Value::Null),
             },
-            AgentEvent::MessageEnd { message } => RemoteEvent::MessageEnd {
+            AgentEvent::MessageEnd {
+                message,
+                message_id,
+            } => RemoteEvent::MessageEnd {
+                message_id: message_id.clone(),
                 message: serde_json::to_value(message).unwrap_or(Value::Null),
             },
             AgentEvent::MessageUpdate {
+                message_id,
                 message,
                 assistant_message_event,
             } => {
@@ -201,6 +216,7 @@ impl RemoteEvent {
                     _ => (None, None),
                 };
                 RemoteEvent::MessageUpdate {
+                    message_id: message_id.clone(),
                     // `assistant_json` keeps this identical to the
                     // `AgentMessage` encoding without copying the message.
                     message: rpi_agent::message::assistant_json(message),
@@ -471,10 +487,29 @@ mod tests {
     }
 
     #[test]
+    fn native_message_ids_round_trip_and_legacy_messages_remain_optional() {
+        for kind in ["message_start", "message_update", "message_end"] {
+            let legacy = serde_json::json!({"type": kind, "message": {"role":"assistant"}});
+            let parsed: RemoteEvent = serde_json::from_value(legacy).unwrap();
+            assert!(serde_json::to_value(parsed)
+                .unwrap()
+                .get("messageId")
+                .is_none());
+            let value = serde_json::json!({"type": kind, "messageId": "native-\"🐈", "message": {"role":"assistant"}});
+            let parsed: RemoteEvent = serde_json::from_value(value).unwrap();
+            assert_eq!(
+                serde_json::to_value(parsed).unwrap()["messageId"],
+                "native-\"🐈"
+            );
+        }
+    }
+
+    #[test]
     fn events_round_trip_over_the_wire() {
         for event in [
             RemoteEvent::AgentStart,
             RemoteEvent::MessageUpdate {
+                message_id: Some("entry-1".into()),
                 message: serde_json::json!({"role": "assistant"}),
                 assistant_message_event: serde_json::json!({"type": "text_delta"}),
                 event_type: "text_delta".into(),

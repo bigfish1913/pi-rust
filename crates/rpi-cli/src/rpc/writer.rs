@@ -103,6 +103,36 @@ impl RpcWriter {
         }
     }
 
+    /// Reserve external-request capacity without publishing any bytes. Dropping
+    /// this future (or its permit) has no output side effects. The caller can
+    /// commit the permit synchronously under its own lifecycle gate.
+    pub(crate) async fn reserve_bounded(
+        &self,
+    ) -> std::io::Result<tokio::sync::mpsc::OwnedPermit<Vec<u8>>> {
+        let reserve = async {
+            tokio::select! {
+                biased;
+                _ = self.failed.cancelled() => Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe, "RPC writer failed",
+                )),
+                result = self.sender.clone().reserve_owned() => result.map_err(|_| {
+                    self.failed.cancel();
+                    std::io::Error::new(std::io::ErrorKind::BrokenPipe, "RPC writer closed")
+                }),
+            }
+        };
+        match tokio::time::timeout(std::time::Duration::from_millis(200), reserve).await {
+            Ok(result) => result,
+            Err(_) => {
+                self.failed.cancel();
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "RPC external request queue stalled",
+                ))
+            }
+        }
+    }
+
     /// RAII closure notification cannot await. Failure to queue is an
     /// authoritative transport failure, not a silently lost notification.
     pub(crate) fn try_write_line(&self, value: &serde_json::Value) {

@@ -35,6 +35,94 @@ use std::io::Cursor;
 pub const INLINE_IMAGE_MAX_SIDE: u32 = 2000;
 pub const INLINE_IMAGE_MAX_BASE64_BYTES: usize = 9 * 1024 * 1024 / 2;
 
+/// Restricted RPC input profile. This is deliberately narrower than tool images.
+pub const RPC_IMAGE_MAX_BYTES: usize = 256 * 1024;
+pub const RPC_IMAGE_MAX_BASE64_BYTES: usize = RPC_IMAGE_MAX_BYTES.div_ceil(3) * 4;
+pub const RPC_IMAGE_MAX_PIXELS: u64 = 4_000_000;
+pub const RPC_IMAGE_MAX_ALLOC: u64 = 32 * 1024 * 1024;
+
+/// Validate without transforming or omitting any image. Call on a blocking worker
+/// before accepting a prompt, not via `normalize_image_blocks` (which omits errors).
+/// Errors deliberately exclude decoder diagnostics and all client payloads.
+///
+/// image 0.25.6 enforces strict dimensions, but its `Limits::max_alloc` is a
+/// best-effort decoder budget (in particular JPEG does not account all scratch
+/// allocations). This is not a process-wide hard memory ceiling.
+pub fn validate_rpc_inline_image(data: &str, mime_type: &str) -> Result<(), String> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use image::ImageDecoder;
+
+    let format = match mime_type {
+        "image/png" => ImageFormat::Png,
+        "image/jpeg" => ImageFormat::Jpeg,
+        _ => return Err("image MIME must be image/png or image/jpeg".into()),
+    };
+    if data.is_empty() || data.len() > RPC_IMAGE_MAX_BASE64_BYTES {
+        return Err("image data must contain 1..262144 decoded bytes".into());
+    }
+    let bytes = STANDARD
+        .decode(data)
+        .map_err(|_| "image data must be canonical standard base64".to_string())?;
+    if bytes.is_empty() || bytes.len() > RPC_IMAGE_MAX_BYTES {
+        return Err("image data must contain 1..262144 decoded bytes".into());
+    }
+    if STANDARD.encode(&bytes) != data {
+        return Err("image data must be canonical standard base64".into());
+    }
+    if crate::image::detect_supported_image_mime_type(&bytes) != Some(mime_type) {
+        return Err("image signature does not match the declared MIME".into());
+    }
+
+    // Set limits before constructing the decoder: PNG needs the allocation
+    // budget during header parsing. ImageReader::into_decoder also calls
+    // decoder.set_limits for the locked image 0.25.6 implementation.
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(INLINE_IMAGE_MAX_SIDE);
+    limits.max_image_height = Some(INLINE_IMAGE_MAX_SIDE);
+    limits.max_alloc = Some(RPC_IMAGE_MAX_ALLOC);
+    let mut reader = image::ImageReader::with_format(Cursor::new(&bytes), format);
+    reader.limits(limits.clone());
+    let mut decoder = reader
+        .into_decoder()
+        .map_err(|_| "image header is invalid or exceeds decoder limits".to_string())?;
+    let (width, height) = decoder.dimensions();
+    if width == 0
+        || height == 0
+        || width > INLINE_IMAGE_MAX_SIDE
+        || height > INLINE_IMAGE_MAX_SIDE
+        || u64::from(width) * u64::from(height) > RPC_IMAGE_MAX_PIXELS
+    {
+        return Err("image dimensions must be 1..2000 per side and at most 4000000 pixels".into());
+    }
+    // DynamicImage::from_decoder does not itself reserve its output against
+    // Limits. Reserve it explicitly before pixel allocation and pass the
+    // remaining budget to set_limits, matching ImageReader::decode. The locked
+    // PNG decoder cannot update its internal budget here, and JPEG scratch
+    // allocations are not accounted (see the public function documentation).
+    limits
+        .reserve(decoder.total_bytes())
+        .map_err(|_| "image exceeds the 32 MiB decode allocation budget".to_string())?;
+    decoder
+        .set_limits(limits)
+        .map_err(|_| "image exceeds decoder limits".to_string())?;
+    if decoder
+        .orientation()
+        .map_err(|_| "image orientation metadata is invalid".to_string())?
+        != image::metadata::Orientation::NoTransforms
+    {
+        return Err(
+            "image requires orientation transforms; normalize it on the client first".into(),
+        );
+    }
+    DynamicImage::from_decoder(decoder)
+        .map_err(|_| "image body is invalid or exceeds decoder limits".to_string())?;
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "image_processing_rpc_tests.rs"]
+mod rpc_tests;
+
 /// Decode, orient, resize and encode an image for model input. Small supported
 /// images retain their original bytes; oversized images fall back to JPEG.
 pub fn prepare_inline_image(bytes: &[u8]) -> Result<crate::tools::read::ProcessedImage, String> {
