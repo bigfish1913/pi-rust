@@ -473,6 +473,21 @@ pub trait RuntimeActionHost: Send + Sync {
     }
 
     /// Safe, effective runtime metadata; never serialize credential bindings.
+    /// Abort the current run on the main lane.
+    ///
+    /// Args: `{}`. Result: `{"aborted": bool, "runId": "…"?, "steer": [...],
+    /// "followUp": [...]}`. Reclaimed queue entries are `{"text","images"}`.
+    ///
+    /// The default implementation reports "nothing to cancel": a host with no
+    /// run loop has nothing to abort, and a stop button must stay idempotent.
+    async fn abort(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
+        Ok(serde_json::json!({
+            "aborted": false,
+            "steer": [],
+            "followUp": [],
+        }))
+    }
+
     async fn get_execution_context(
         &self,
         _args: serde_json::Value,
@@ -922,6 +937,7 @@ async fn dispatch(
         RuntimeActionId::GetExecutionContext => host.get_execution_context(args).await,
         RuntimeActionId::ChildAgent => Err("ChildAgent requires a plugin bridge".into()),
         RuntimeActionId::SideQuestion => Err("SideQuestion requires a plugin bridge".into()),
+        RuntimeActionId::Abort => host.abort(args).await,
         RuntimeActionId::StdioLifecycle => {
             Err("stdio lifecycle requires a plugin context".to_owned())
         }
@@ -960,8 +976,8 @@ pub extern "C" fn trampoline_runtime_action(
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_action(
             action_id,
-            // Highest id this ABI defines — bump when adding an action.
-            u32::from(RuntimeActionId::SideQuestion),
+            // Highest id this ABI defines.
+            rpi_plugin_sdk::RuntimeActionId::MAX,
             args_json,
             out,
             user_data,
@@ -1964,10 +1980,17 @@ mod tests {
         );
 
         // A genuinely unknown id is still rejected (no silent acceptance).
-        // 26 is one past the highest defined action.
+        // Derive "one past the highest" from the enum so adding an action does
+        // not silently turn this into a real dispatch.
+        let one_past_last = rpi_plugin_sdk::RuntimeActionId::MAX + 1;
         let mut out = StbString::empty();
         assert_eq!(
-            trampoline_runtime_action(26, StbStringRef::from_str("{}"), &mut out, user_data),
+            trampoline_runtime_action(
+                one_past_last,
+                StbStringRef::from_str("{}"),
+                &mut out,
+                user_data
+            ),
             2
         );
         // SAFETY: this action returned a live host allocation, not previously freed.
@@ -2092,4 +2115,55 @@ impl Drop for ActionBridge {
 }
 
 #[cfg(test)]
-mod runtime_tests;
+mod runtime_tests    /// The FFI trampoline's ceiling must be exactly the SDK's highest action id.
+    ///
+    /// A branch that adds an action but leaves the ceiling behind compiles,
+    /// keeps every other test green, and quietly makes the newest action
+    /// un-dispatchable. The ceiling and the enum live in different crates, so
+    /// nothing but a test can notice the drift.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn trampoline_ceiling_matches_the_highest_defined_action() {
+        let highest = RuntimeActionId::MAX;
+        assert_eq!(
+            highest,
+            RuntimeActionId::ALL
+                .iter()
+                .copied()
+                .map(u32::from)
+                .max()
+                .unwrap(),
+            "RuntimeActionId::MAX must be the maximum of RuntimeActionId::ALL"
+        );
+        let host: Arc<dyn RuntimeActionHost> = Arc::new(MockHost {
+            prompt: String::new(),
+            saw: Mutex::new(Vec::new()),
+        });
+        let bridge = ActionBridge::with_ui_dialog(
+            tokio::runtime::Handle::current(),
+            host,
+            UiDialogMailbox::new(),
+        );
+        let mut out = StbString::empty();
+        let rc = trampoline_runtime_action(
+            highest,
+            StbStringRef::from_str("{}"),
+            &mut out,
+            bridge.user_data(),
+        );
+        assert_ne!(
+            rc, 2,
+            "the highest defined action id ({highest}) must not be rejected as unknown — \
+             the trampoline ceiling is stale"
+        );
+        if rc == 0 {
+            // SAFETY: success means the trampoline wrote a live host allocation.
+            drop(unsafe {
+                rpi_plugin_sdk::callbacks::OwnedString::from_raw(
+                    out,
+                    Some(crate::host_free_string),
+                )
+            });
+        }
+    }
+
+}

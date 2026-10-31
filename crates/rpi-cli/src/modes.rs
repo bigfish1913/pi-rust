@@ -1421,8 +1421,11 @@ async fn rpc_get_state(lane: &Arc<dyn AgentLane>, harness: &AgentHarness) -> ser
         "sessionId": harness.session().storage().metadata().id,
         "activeOperation": active_operation,
         "queue": {
-            "steering": queued.steering,
-            "followUp": queued.follow_up,
+            // Text-only view: these consumers render a single-line pending row.
+            // Attachments travel in the `Abort` / `ClearQueue` replies, which
+            // keep the per-message pairing.
+            "steering": queued.texts().collect::<Vec<_>>(),
+            "followUp": queued.follow_up.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
             "steeringCount": queued.steering.len(),
             "followUpCount": queued.follow_up.len(),
         },
@@ -1863,8 +1866,8 @@ async fn rpc_clear_queue(lane: &Arc<dyn AgentLane>) -> Result<serde_json::Value,
         .map_err(|error| error.to_string())?;
     Ok(serde_json::json!({
         "cleared": result.steering.len() + result.follow_up.len(),
-        "steering": result.steering,
-        "followUp": result.follow_up,
+        "steering": result.texts().collect::<Vec<_>>(),
+        "followUp": result.follow_up.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
     }))
 }
 

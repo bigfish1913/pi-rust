@@ -71,13 +71,12 @@ pub(super) async fn restore_queued_messages_to_editor(
 ) -> usize {
     match lane.clear_queue().await {
         Ok(queued) => {
-            state.restore_pending_images(queued.images.clone());
-            let all: Vec<String> = queued
-                .steering
-                .iter()
-                .chain(queued.follow_up.iter())
-                .cloned()
-                .collect();
+            // The editor holds **one** draft, so its attachments are one strip.
+            // (The per-message pairing matters only for consumers that restore
+            // a *list* of queued entries — see `QueuedMessageView`.)
+            let images: Vec<_> = queued.iter().flat_map(|m| m.images.clone()).collect();
+            state.restore_pending_images(images);
+            let all: Vec<String> = queued.iter().map(|m| m.text.clone()).collect();
             if !all.is_empty() {
                 let queued_text = all.join("\n\n");
                 // Read the EXPANDED draft: `set_text` below clears the folded

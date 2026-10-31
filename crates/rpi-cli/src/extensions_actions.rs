@@ -164,6 +164,79 @@ impl HarnessActionHost {
     }
 }
 
+/// Serialize reclaimed queue entries for the ABI boundary.
+///
+/// Each entry is `{"text": "…", "images": [{mediaType, data}]}` — text and its
+/// own attachments **together**. A flat `images` side list would lose the
+/// pairing as soon as two queued messages carry different pictures: a restore
+/// would attach image B next to text A, or attach the picture to whichever
+/// entry happened to be first.
+fn queued_message_payloads(messages: &[rpi_agent::AgentMessage]) -> Vec<serde_json::Value> {
+    messages
+        .iter()
+        .map(|message| {
+            let (text, images) = match message {
+                rpi_agent::AgentMessage::User(user) => match &user.content {
+                    rpi_ai::types::UserContent::Text(text) => (text.clone(), Vec::new()),
+                    rpi_ai::types::UserContent::Blocks(blocks) => {
+                        let text = blocks
+                            .iter()
+                            .filter_map(|block| match block {
+                                rpi_ai::types::Content::Text(text) => Some(text.text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let collected: Vec<_> = blocks
+                            .iter()
+                            .filter_map(|block| match block {
+                                rpi_ai::types::Content::Image(image) => Some(image.clone()),
+                                _ => None,
+                            })
+                            .collect();
+                        (text, image_payloads(&collected))
+                    }
+                },
+                _ => (String::new(), Vec::new()),
+            };
+            serde_json::json!({ "text": text, "images": images })
+        })
+        .filter(|entry| {
+            entry["text"].as_str().is_some_and(|t| !t.trim().is_empty())
+                || entry["images"].as_array().is_some_and(|i| !i.is_empty())
+        })
+        .collect()
+}
+
+/// Same wire shape for the `QueuedMessages` views the idle path reads.
+fn queued_message_view_payloads(
+    messages: &[rpi_harness::agent_harness::QueuedMessageView],
+) -> Vec<serde_json::Value> {
+    messages
+        .iter()
+        .filter(|message| !message.is_empty())
+        .map(|message| {
+            serde_json::json!({
+                "text": message.text,
+                "images": image_payloads(&message.images),
+            })
+        })
+        .collect()
+}
+
+/// Serialize image attachments as `{mediaType, data}`.
+fn image_payloads(images: &[rpi_ai::types::ImageContent]) -> Vec<serde_json::Value> {
+    images
+        .iter()
+        .map(|image| {
+            serde_json::json!({
+                "mediaType": image.mime_type,
+                "data": image.data,
+            })
+        })
+        .collect()
+}
+
 /// Helper: pull a string field `key` from `args` (object), or return `msg`.
 fn arg_str(args: &serde_json::Value, key: &str) -> Result<String, String> {
     args.get(key)
@@ -391,6 +464,42 @@ impl RuntimeActionHost for HarnessActionHost {
     fn replace_model_catalog(&self, models: Vec<rpi_ai::Model>) {
         self.set_catalog(models);
     }
+    async fn abort(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
+        // The harness reclaims the queue and cancels the run under one write
+        // gate, so there is no `clear_queue()` + `abort()` window in which a
+        // message could be both drained into the transcript and handed back.
+        //
+        // Why this matters: the agent loop drains the steering queue on abort
+        // and emits those messages as transcript content. Native-pi's TUI
+        // avoids the resulting "ghost message" by calling `clearQueue()` first
+        // ("a cancel never silently swallows messages the user staged while the
+        // run was in flight"). A plugin has no editor to restore into, so it
+        // hands them back to its caller instead.
+        // `abort_reclaiming(true)`: one call cancels **and** reclaims under the
+        // harness's write gate, so the idle case is atomic too. A separate
+        // `clear_queue()` afterwards would let a new run start and drain the
+        // queue in between — the caller would then report "nothing was queued"
+        // for messages that were in fact consumed.
+        let harness = self.harness()?;
+        let result = harness
+            .abort_reclaiming(true)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(serde_json::json!({
+            // Empty run id = the lane was already idle. The queue is still
+            // handed back: a stop button must be idempotent, and messages can
+            // land as a run settles.
+            "aborted": !result.run_id.is_empty(),
+            "runId": if result.run_id.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(result.run_id)
+            },
+            "steer": queued_message_payloads(&result.steer),
+            "followUp": queued_message_payloads(&result.follow_up),
+        }))
+    }
+
     async fn get_execution_context(
         &self,
         _args: serde_json::Value,
