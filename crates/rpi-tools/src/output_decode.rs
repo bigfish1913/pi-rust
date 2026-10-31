@@ -348,6 +348,28 @@ mod tests {
     }
 
     #[test]
+    fn pending_limit_emits_as_soon_as_the_cut_character_is_complete() {
+        for ch in ["é", "中", "😀"] {
+            for cut in 1..ch.len() {
+                // Start pending at a non-ASCII byte, then put exactly `cut`
+                // bytes of the final character inside the decision window.
+                let text = format!("é{}{ch}", "a".repeat(PENDING_LIMIT - 1 - cut));
+                let bytes = text.as_bytes();
+                let mut decoder = StreamDecoder::with_fallback(encoding_rs::GBK);
+                assert_eq!(decoder.push(&bytes[..PENDING_LIMIT + 1]), "");
+                for end in PENDING_LIMIT + 2..bytes.len() {
+                    assert_eq!(decoder.push(&bytes[end - 1..end]), "");
+                }
+                // No delimiter or EOF: completing the character must release
+                // the pending span immediately, not buffer the rest of a line.
+                assert_eq!(decoder.push(&bytes[bytes.len() - 1..]), text);
+                assert_eq!(decoder.push(b"tail"), "tail");
+                assert_eq!(decoder.finish(), "");
+            }
+        }
+    }
+
+    #[test]
     fn utf8_character_split_across_reads_survives() {
         let mut decoder = StreamDecoder::with_fallback(encoding_rs::GBK);
         assert_eq!(
