@@ -3870,11 +3870,33 @@ impl AgentHarness {
 
     /// The core run loop shared by all prompt overloads + skill + template.
     async fn run_core(&self, prompts: Vec<AgentMessage>) -> HarnessResult<RunResult> {
+        // Image preparation is part of the admitted run: RPC cancellation must
+        // find an active signal and await this future, not detach its blocking
+        // decoder by dropping a pre-admission prompt. Bridge the lease through
+        // preparation; the admitted loop installs its own run-ID-checked lease.
+        let admission = self.acquire_run(OperationKind::Run).await?;
+        let _preparation_lease = ActiveRunLease {
+            harness: self,
+            run_id: admission.0.clone(),
+        };
         let mut normalized = Vec::with_capacity(prompts.len());
         for prompt in prompts {
+            if admission.1.is_cancelled() {
+                return Err(HarnessError::agent(
+                    "Operation aborted during image preparation",
+                ));
+            }
             normalized.push(normalize_user_images(prompt).await?);
         }
-        self.run_core_with_entry(normalized, false).await
+        // Await an already-started decoder even on abort, but never persist or
+        // call the model after preparation observes cancellation.
+        if admission.1.is_cancelled() {
+            return Err(HarnessError::agent(
+                "Operation aborted during image preparation",
+            ));
+        }
+        self.run_core_with_admission(normalized, false, admission, None)
+            .await
     }
 
     /// Continue a run from the assistant message at the branch tip.
@@ -5023,7 +5045,11 @@ async fn normalize_user_images(mut message: AgentMessage) -> HarnessResult<Agent
     if !has_images {
         return Ok(message);
     }
+    #[cfg(test)]
+    let test_gate = image_normalization_tests::gate_for_message(&message);
     tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _worker = test_gate.map(|gate| gate.enter_worker());
         if let AgentMessage::User(user) = &mut message {
             if let UserContent::Blocks(blocks) = &mut user.content {
                 rpi_tools::image_processing::normalize_image_blocks(blocks);
@@ -5988,6 +6014,10 @@ impl AgentLane for LaneHandle {
         self.runner().resume(suspended_id).await
     }
 }
+
+#[cfg(test)]
+#[path = "agent_harness/image_normalization_tests.rs"]
+mod image_normalization_tests;
 
 #[cfg(test)]
 mod queue_tests {
