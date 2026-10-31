@@ -216,6 +216,10 @@ fan-out 到所有已注册 handler，合并返回的 `{skillPaths, promptPaths, 
 单个 handler 报错不中止 fan-out。`out` 是插件拥有的 `StbString`，宿主通过插件
 注册时给的 `plugin_free_string` 回收。
 
+`themePaths` 是具体的主题 JSON 文件路径（pi 契约，与 skills 的 dir-or-file 双兼容
+不同），会按文件名（stem）并入 `/theme` 选择器，优先级在静态主题目录之后。路径
+不归属到具体扩展（v1 差异）：同名冲突时静态目录主题胜出，诊断信息只能给出路径。
+
 ### Provider 与渲染器
 
 推理 provider 的目录、认证、执行绑定与验收要求见本文末尾的「Provider 接入规范」。

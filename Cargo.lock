@@ -2243,6 +2243,7 @@ dependencies = [
  "crossterm",
  "pulldown-cmark",
  "regex",
+ "serde_json",
  "similar",
  "thiserror 1.0.69",
  "tokio",

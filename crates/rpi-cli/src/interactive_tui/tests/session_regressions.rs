@@ -1,4 +1,6 @@
 use super::*;
+use rpi_tui::terminal::{InputEvent, Terminal, TerminalInfo};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn state_with_root(root: &std::path::Path) -> Arc<TuiState> {
     let mut state = test_tui_state();
@@ -1710,4 +1712,70 @@ async fn review_the_export_advice_recovers_the_unsaved_message() {
         "disk full",
     ));
     assert!(notice.contains("/export"), "{notice}");
+}
+
+struct RenderCountingTerminal(Arc<AtomicUsize>);
+impl Terminal for RenderCountingTerminal {
+    fn info(&self) -> TerminalInfo {
+        TerminalInfo {
+            columns: 80,
+            rows: 24,
+            ..Default::default()
+        }
+    }
+    fn write(&self, text: &str) {
+        // A full content repaint emits a screen clear (tui_alt_screen's
+        // full_redraw path); diff patches do not.
+        if text.contains("\x1b[2J") {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    fn hide_cursor(&self) {}
+    fn show_cursor(&self) {}
+    fn move_cursor(&self, _: usize, _: usize) {}
+    fn clear_screen(&self) {}
+    fn set_title(&self, _: &str) {}
+    fn enable_mouse(&self) {}
+    fn disable_mouse(&self) {}
+    fn enter_raw_mode(&self) {}
+    fn exit_raw_mode(&self) {}
+    fn refresh_size(&self) {}
+    fn start(&self, _: Box<dyn Fn(InputEvent) + Send + Sync>, _: Box<dyn Fn() + Send + Sync>) {}
+    fn stop(&self) {}
+    fn is_tty(&self) -> bool {
+        false
+    }
+    fn set_progress(&self, _: bool) {}
+    fn flush(&self) {}
+}
+
+// review_pr202: a background theme reload (success or parse error) must
+// schedule a content repaint. Neither appending a note nor the palette change
+// requests a frame, and the scheduler only repaints an idle session when
+// size/status content actually changes — so without the explicit request the
+// reload result stays invisible until the next keypress.
+#[test]
+fn review_pr202_theme_watch_notify_repaints_idle_session() {
+    let frames = Arc::new(AtomicUsize::new(0));
+    let tui = Arc::new(TuiAltScreen::new(
+        Box::new(RenderCountingTerminal(frames.clone())),
+        false,
+        None,
+    ));
+    tui.set_layout_root(Some(Arc::new(rpi_tui::Text::new("idle", 0, 0))));
+    tui.start_readerless();
+    let before = frames.load(Ordering::SeqCst);
+
+    // Both callback outcomes must leave the old palette behind.
+    let notify_ok = theme_watch_notify(Arc::new(Container::new()), tui.clone());
+    notify_ok(Ok("Theme reloaded.".into()));
+    let after_ok = frames.load(Ordering::SeqCst);
+    assert!(after_ok > before, "success notice must schedule a repaint");
+
+    let notify_err = theme_watch_notify(Arc::new(Container::new()), tui.clone());
+    notify_err(Err("cannot load theme: bad value".into()));
+    assert!(
+        frames.load(Ordering::SeqCst) > after_ok,
+        "error notice must schedule a repaint too"
+    );
 }
