@@ -6,3 +6,5 @@ pub(crate) mod external_tools;
 pub(crate) mod framing;
 pub(crate) mod protocol;
 pub(crate) mod writer;
+
+pub(crate) mod message_queries;

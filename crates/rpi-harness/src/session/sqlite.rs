@@ -168,6 +168,22 @@ impl SessionStorage for SqliteSessionStorage {
         })
         .await
     }
+    async fn message_summaries(
+        &self,
+        lane: &str,
+        query: &crate::session::types::MessageSummaryQuery,
+    ) -> SessionResult<crate::session::types::MessageSummaryPage> {
+        let _gate = self.refresh_read().await?;
+        self.inner.message_summaries(lane, query).await
+    }
+    async fn message_window(
+        &self,
+        lane: &str,
+        query: &crate::session::types::MessageWindowQuery,
+    ) -> SessionResult<crate::session::types::MessageWindowPage> {
+        let _gate = self.refresh_read().await?;
+        self.inner.message_window(lane, query).await
+    }
     async fn get_entry(&self, id: &str) -> SessionResult<Option<Entry>> {
         let _gate = self.refresh_read().await?;
         self.inner.get_entry(id).await

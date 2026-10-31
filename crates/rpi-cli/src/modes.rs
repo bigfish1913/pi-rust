@@ -781,6 +781,8 @@ where
             "get_state" => Ok(rpc_get_state(&lane, harness).await),
             "get_commands" => Ok(rpc_get_commands(oauth_snapshot.as_deref())),
             "get_messages" => rpc_get_messages(&lane, harness, &msg).await,
+            "get_message_summaries" => crate::rpc::message_queries::summaries(harness, &msg).await,
+            "get_message_window" => crate::rpc::message_queries::window(harness, &msg).await,
             "get_history" => rpc_get_history(&lane, harness, &msg).await,
             "get_session_branch" => rpc_get_session_branch(harness, &msg).await,
             "append_entry" => rpc_append_entry(harness, &msg).await,
@@ -2942,6 +2944,89 @@ mod tests {
             .await
         });
         (client, output, task)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rpc_paginated_user_summaries_and_context_windows_are_read_only() {
+        use tokio::io::AsyncWriteExt;
+        let (harness, _unused_provider) = rpc_test_harness("must not be called", 0.0).await;
+        let view = harness.view();
+        for index in 0..23 {
+            view.append_message(
+                rpi_ai::UserMessage::new(format!("Question {index}"), index).into(),
+            )
+            .await
+            .unwrap();
+        }
+        let pinned = view.get_leaf_id().await.unwrap();
+        let (mut client, output, task) =
+            start_test_rpc(harness, rpi_extensions::UiDialogMailbox::new());
+        let ready = output.wait_for(|frame| frame["type"] == "ready").await;
+        for command in ["get_message_summaries", "get_message_window"] {
+            assert!(ready["supportedCommands"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(command)));
+        }
+        client
+            .write_all(b"{\"type\":\"get_message_summaries\",\"id\":1,\"limit\":10}\n")
+            .await
+            .unwrap();
+        let first = output.wait_for(|frame| frame["id"] == 1).await;
+        assert_eq!(first["success"], true);
+        assert_eq!(first["data"]["messages"][0]["preview"], "Question 13");
+        assert_eq!(first["data"]["messages"].as_array().unwrap().len(), 10);
+        for (id, command, cursor, value) in [
+            (
+                2,
+                "get_message_summaries",
+                "beforeId",
+                first["data"]["nextBeforeId"].clone(),
+            ),
+            (
+                3,
+                "get_message_window",
+                "anchorId",
+                first["data"]["firstId"].clone(),
+            ),
+        ] {
+            let mut request = serde_json::json!({"id":id,"type":command,"limit":4,"leafId":pinned});
+            request[cursor] = value;
+            client
+                .write_all(format!("{request}\n").as_bytes())
+                .await
+                .unwrap();
+            let page = output.wait_for(|frame| frame["id"] == id).await;
+            assert_eq!(page["success"], true);
+            assert_eq!(page["data"]["messages"].as_array().unwrap().len(), 4);
+            assert_eq!(page["data"]["leafId"], serde_json::json!(pinned));
+        }
+        let context = output.wait_for(|frame| frame["id"] == 3).await;
+        for (id, cursor, key) in [
+            (4, "beforeId", "nextBeforeId"),
+            (5, "afterId", "nextAfterId"),
+        ] {
+            let mut request =
+                serde_json::json!({"type":"get_message_window", "id":id,"leafId":pinned,"limit":4});
+            request[cursor] = context["data"][key].clone();
+            client
+                .write_all(format!("{request}\n").as_bytes())
+                .await
+                .unwrap();
+            let response = output.wait_for(|frame| frame["id"] == id).await;
+            assert_eq!(response["success"], true);
+            assert_eq!(response["data"]["messages"].as_array().unwrap().len(), 4);
+        }
+        client
+            .write_all(b"{\"type\":\"stop\",\"id\":6}\n")
+            .await
+            .unwrap();
+        assert_eq!(task.await.unwrap(), 0);
+        assert_eq!(view.get_leaf_id().await.unwrap(), pinned);
+        assert!(!output
+            .messages()
+            .iter()
+            .any(|frame| frame["type"] == "agent_start"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
