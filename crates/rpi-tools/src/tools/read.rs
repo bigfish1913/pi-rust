@@ -18,6 +18,9 @@ use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
 use crate::env::ExecutionEnv;
+use crate::file_io::{
+    resolve_client_path, FileIOOperation, FileIOReadRange, FileIORouter, FileIOSnapshot,
+};
 use crate::image::{detect_supported_image_mime_type, encode_base64};
 use crate::path_utils::resolve_read_tool_path;
 use crate::tools::tool_context::ExecutionToolContext;
@@ -102,6 +105,7 @@ pub struct ProcessedImage {
 pub struct ReadTool {
     schema: Tool,
     env: Arc<dyn ExecutionEnv>,
+    file_io: Option<Arc<FileIORouter>>,
     options: ReadToolOptions,
     image_processor: Option<Arc<dyn ReadImageProcessor>>,
 }
@@ -134,6 +138,7 @@ pub fn create_read_tool(
     Arc::new(ReadTool {
         schema: ReadTool::schema(),
         env: context.env().clone(),
+        file_io: context.file_io().cloned(),
         options,
         image_processor,
     })
@@ -157,6 +162,19 @@ impl AgentTool for ReadTool {
     ) -> Result<AgentToolResult, AgentError> {
         let input: ReadInput = serde_json::from_value(params)
             .map_err(|e| AgentError::Validation(format!("read input invalid: {e}")))?;
+
+        if let Some(router) = &self.file_io {
+            if let Some(client) = router
+                .select(FileIOOperation::Read)
+                .await
+                .map_err(|e| file_err_to_agent(e.into()))?
+            {
+                let abs = resolve_client_path(self.env.cwd(), &input.path)
+                    .map_err(|e| file_err_to_agent(e.into()))?;
+                // Text only: never sniff extensions or fetch host image bytes.
+                return client_text_result(&client, &abs, &input, &signal).await;
+            }
+        }
 
         let abs = resolve_read_tool_path(&*self.env, &input.path, Some(&signal))
             .await
@@ -273,6 +291,72 @@ impl AgentTool for ReadTool {
             ..Default::default()
         })
     }
+}
+
+/// The backend has already applied offset. The sentinel proves only that more
+/// content exists; neither its length nor truncation totals are whole-file
+/// metadata. EOF (including an offset beyond EOF) is a valid empty range.
+async fn client_text_result(
+    client: &FileIOSnapshot,
+    absolute_path: &str,
+    input: &ReadInput,
+    signal: &CancellationToken,
+) -> Result<AgentToolResult, AgentError> {
+    let offset = input.offset.unwrap_or(1).max(1);
+    let display_lines = input
+        .limit
+        .map(|n| n as usize)
+        .unwrap_or(DEFAULT_MAX_LINES)
+        .min(DEFAULT_MAX_LINES);
+    let text = client
+        .read_text(
+            absolute_path,
+            FileIOReadRange::Lines {
+                offset_1based: offset,
+                limit: display_lines as u32 + 1,
+            },
+            signal,
+        )
+        .await
+        .map_err(|e| file_err_to_agent(e.into()))?;
+    let lines = crate::truncate::split_lines_for_counting(&text);
+    let has_sentinel = lines.len() > display_lines;
+    let selected = if has_sentinel {
+        let selected_lines = &lines[..display_lines];
+        let mut selected = selected_lines.join("\n");
+        // A final blank source line needs its terminator to remain countable.
+        // Otherwise a one-blank-line page becomes empty and never advances.
+        if selected_lines.last() == Some(&"") {
+            selected.push('\n');
+        }
+        selected
+    } else {
+        text
+    };
+    let truncation = truncate_head(
+        &selected,
+        TruncationOptions {
+            max_lines: Some(display_lines),
+            max_bytes: Some(DEFAULT_MAX_BYTES),
+        },
+    );
+    let mut output = truncation.content.clone();
+    if truncation.first_line_exceeds_limit {
+        output = format!(
+            "[Line {offset} exceeds {} display limit. Client text was not displayed.]",
+            format_size(DEFAULT_MAX_BYTES)
+        );
+    } else if has_sentinel || truncation.truncated {
+        let next = u64::from(offset) + truncation.output_lines as u64;
+        output.push_str(&format!("\n\n[More content may remain; total line count unknown. Use offset={next} to continue.]"));
+    }
+    // Native TruncationResult.total_lines describes its bounded input, not the
+    // client file. Do not serialize it as misleading file metadata.
+    Ok(AgentToolResult {
+        content: vec![TextContentOrImage::text(output)],
+        details: serde_json::Value::Null,
+        ..Default::default()
+    })
 }
 
 /// Build the image-path result, honoring an optional processor. Mirrors the TS

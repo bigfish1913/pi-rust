@@ -13,6 +13,7 @@
 
 pub mod env;
 pub mod error;
+pub mod file_io;
 pub mod file_mutation_queue;
 pub mod image;
 pub mod image_processing;

@@ -59,7 +59,7 @@ fn message_to_stb(message: &rpi_agent::message::AgentMessage) -> StbString {
 pub fn translate(event: &AgentEvent) -> Option<StablePluginEvent> {
     let tag = event_tag_for(event)?;
     match event {
-        AgentEvent::MessageStart { message } | AgentEvent::MessageEnd { message } => {
+        AgentEvent::MessageStart { message, .. } | AgentEvent::MessageEnd { message, .. } => {
             let stb = message_to_stb(message);
             Some(StablePluginEvent::message(tag, stb))
         }
@@ -1018,9 +1018,11 @@ mod tests {
                 tool_results: vec![],
             },
             AgentEvent::MessageStart {
+                message_id: None,
                 message: am.clone(),
             },
             AgentEvent::MessageUpdate {
+                message_id: None,
                 // `MessageUpdate` carries the shared partial snapshot, so build
                 // the same `Arc` the provider would have handed over.
                 message: std::sync::Arc::new((*am.as_assistant().unwrap()).clone()),
@@ -1028,7 +1030,10 @@ mod tests {
                     partial: std::sync::Arc::new((*am.as_assistant().unwrap()).clone()),
                 },
             },
-            AgentEvent::MessageEnd { message: am },
+            AgentEvent::MessageEnd {
+                message_id: None,
+                message: am,
+            },
             AgentEvent::ToolExecutionStart {
                 tool_call_id: "c1".into(),
                 tool_name: "echo".into(),
@@ -1090,6 +1095,7 @@ mod tests {
         });
         let translate_delta = |delta: &str| {
             let event = AgentEvent::MessageUpdate {
+                message_id: None,
                 message: Arc::clone(&partial),
                 assistant_message_event: AssistantMessageEvent::TextDelta {
                     content_index: 0,
@@ -1131,7 +1137,10 @@ mod tests {
             end_turn: None,
             timestamp: 0,
         }));
-        let ev = AgentEvent::MessageEnd { message: am };
+        let ev = AgentEvent::MessageEnd {
+            message_id: None,
+            message: am,
+        };
         let stable = translate(&ev).expect("maps");
         assert_eq!(stable.tag, EventTag::MessageEnd);
         // free the payload string (host owns cleanup).
@@ -1179,7 +1188,10 @@ mod tests {
             timestamp: 0,
         }));
         // Use try_emit (sync) — no runtime needed.
-        emitter.try_emit(AgentEvent::MessageEnd { message: am });
+        emitter.try_emit(AgentEvent::MessageEnd {
+            message_id: None,
+            message: am,
+        });
         assert_eq!(HANDLER_HITS.load(Ordering::SeqCst), 1);
 
         // Stale registry → no dispatch.
@@ -1200,7 +1212,10 @@ mod tests {
             end_turn: None,
             timestamp: 0,
         }));
-        emitter.try_emit(AgentEvent::MessageEnd { message: am2 });
+        emitter.try_emit(AgentEvent::MessageEnd {
+            message_id: None,
+            message: am2,
+        });
         assert_eq!(
             HANDLER_HITS.load(Ordering::SeqCst),
             1,
@@ -1253,7 +1268,11 @@ mod tests {
         }));
         // Broadcast path: both collectors receive the event, and the extension
         // emitter dispatches to the one registered handler.
-        tee.emit(AgentEvent::MessageEnd { message: am }).await;
+        tee.emit(AgentEvent::MessageEnd {
+            message_id: None,
+            message: am,
+        })
+        .await;
         assert_eq!(
             events_a.lock().unwrap().len(),
             1,

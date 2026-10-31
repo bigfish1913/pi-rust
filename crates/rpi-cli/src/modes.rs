@@ -341,17 +341,20 @@ where
     R: tokio::io::AsyncBufRead + Unpin,
     W: Write + Send + 'static,
 {
-    let mut command_tasks = Vec::new();
+    let mut command_tasks: Vec<RetainedRpcTask<()>> = Vec::new();
     let lane: Arc<dyn AgentLane> = harness.lane("main");
     // One blocking writer owns stdout. Producers only enqueue bounded messages,
     // so pipe backpressure never blocks a Tokio worker on IO or a std mutex.
     let (stdout, writer_task, writer_failed) = start_rpc_writer(output, message_updates);
+    let writer_task = RetainedRpcTask::new(writer_task, writer_failed.clone());
     let pump_stop = tokio_util::sync::CancellationToken::new();
     let external_tools =
         crate::rpc::external_tools::ExternalTools::new(stdout.clone(), Arc::downgrade(&lane));
     let mut external_names = Vec::new();
+    let file_io_router = crate::session::file_io_router(harness);
     let mut owner = RpcOwner {
         harness,
+        file_io: None,
         backend: external_tools.clone(),
         run_cancel: tokio_util::sync::CancellationToken::new(),
         pump_stop: pump_stop.clone(),
@@ -392,6 +395,8 @@ where
         })
     };
 
+    let commit_task = RetainedRpcTask::new(commit_task, pump_stop.clone());
+
     // A completion response is queued only after its final events, so a
     // subsequent prompt cannot overtake the previous run's agent_end.
     let (event_flush_tx, mut event_flush_rx) =
@@ -423,6 +428,7 @@ where
         })
     });
 
+    let event_task = event_task.map(|task| RetainedRpcTask::new(task, pump_stop.clone()));
     let event_flush = event_task.as_ref().map(|_| event_flush_tx);
 
     // Bridge the extension `UiDialog` mailbox over the rpc channel so a
@@ -465,11 +471,13 @@ where
         })
     };
 
+    let dialog_task = RetainedRpcTask::new(dialog_task, pump_stop.clone());
+
     // A `prompt` runs in a spawned task so this loop keeps reading stdin while
     // the run is active — otherwise `abort` and `ui_dialog_response` could not
     // be delivered mid-run. Only one prompt may be in flight at a time.
     let run_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut run_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut run_task: Option<OwnedRpcRun> = None;
     let mut run_cancel = tokio_util::sync::CancellationToken::new();
     let mut cancel_on_exit = false;
 
@@ -532,7 +540,8 @@ where
             .unwrap_or("")
             .to_string();
 
-        if rpc_protocol::SUPPORTED_COMMANDS.contains(&kind.as_str())
+        if kind != "prompt"
+            && rpc_protocol::SUPPORTED_COMMANDS.contains(&kind.as_str())
             && serde_json::from_value::<rpc_protocol::Request>(msg.clone()).is_err()
         {
             write_line(
@@ -587,22 +596,25 @@ where
                 continue;
             }
             "execute_command" => {
-                command_tasks.retain(|task: &tokio::task::JoinHandle<()>| !task.is_finished());
+                command_tasks.retain(|task| !task.is_finished());
                 let snapshot = oauth_snapshot.clone();
                 let request = msg.clone();
                 let out = stdout.clone();
-                command_tasks.push(tokio::spawn(async move {
-                    let result = tokio::task::spawn_blocking(move || {
-                        rpc_execute_command(snapshot.as_deref(), &request)
-                    })
-                    .await
-                    .unwrap_or_else(|_| Err("command task failed".into()));
-                    write_line(
-                        &out,
-                        &rpc_protocol::response(Some(id), "execute_command", result.map(Some)),
-                    )
-                    .await;
-                }));
+                command_tasks.push(RetainedRpcTask::new(
+                    tokio::spawn(async move {
+                        let result = tokio::task::spawn_blocking(move || {
+                            rpc_execute_command(snapshot.as_deref(), &request)
+                        })
+                        .await
+                        .unwrap_or_else(|_| Err("command task failed".into()));
+                        write_line(
+                            &out,
+                            &rpc_protocol::response(Some(id), "execute_command", result.map(Some)),
+                        )
+                        .await;
+                    }),
+                    writer_failed.clone(),
+                ));
                 continue;
             }
             "stop" => {
@@ -657,94 +669,108 @@ where
                     .await;
                     continue;
                 }
-                let content = msg
-                    .get("message")
-                    .or_else(|| msg.get("content"))
-                    .or_else(|| msg.get("prompt"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_owned);
                 let lane_task = Arc::clone(&lane);
                 let out_task = stdout.clone();
                 let active_task = Arc::clone(&run_active);
                 let mailbox_task = ui_dialog.clone();
                 let flush_events = event_flush.clone();
-                let Some(content) = content.or_else(|| (resume || compact).then(String::new))
-                else {
-                    active_task.store(false, std::sync::atomic::Ordering::Release);
-                    write_line(
-                        &stdout,
-                        &rpc_protocol::response(
-                            Some(id),
-                            "prompt",
-                            Err("prompt requires a string `message`".to_string()),
-                        ),
-                    )
-                    .await;
-                    continue;
-                };
-                write_line(
-                    &stdout,
-                    &rpc_protocol::response(
-                        Some(id),
-                        &kind,
-                        Ok(Some(serde_json::json!({"accepted": true}))),
-                    ),
-                )
-                .await;
                 let instructions = msg
                     .get("customInstructions")
                     .and_then(|v| v.as_str())
                     .map(str::to_owned);
-                run_task = Some(tokio::spawn(async move {
-                    let result = if compact {
-                        rpc_compact_cancellable(&lane_task, instructions, cancel_task).await
-                    } else if resume {
-                        rpc_resume_cancellable(&lane_task, cancel_task).await
-                    } else {
-                        rpc_prompt_cancellable(&lane_task, &content, cancel_task).await
-                    };
-                    if let Some(flush) = flush_events {
-                        let (done, drained) = tokio::sync::oneshot::channel();
-                        if flush.send(done).is_ok() {
-                            let _ = drained.await;
+                // The run slot includes validation. Reader/control traffic keeps
+                // flowing while the single bounded blocking worker decodes.
+                // Rejections receive ONE failed prompt response, no acceptance,
+                // no model call, no user persistence, and no agent_settled.
+                run_task = Some(OwnedRpcRun::new(
+                    tokio::spawn(async move {
+                        #[cfg(test)]
+                        let _finished =
+                            crate::rpc::prompt_content::validation_test_hook::for_command(&msg)
+                                .map(crate::rpc::prompt_content::validation_test_hook::RunFinished);
+                        let content = if resume || compact {
+                            Ok(crate::rpc::prompt_content::ParsedPrompt::Legacy(
+                                String::new(),
+                            ))
+                        } else {
+                            rpc_validate_prompt(&lane_task, msg, &cancel_task).await
+                        };
+                        let content = match content {
+                            Ok(content) => content,
+                            Err(error) => {
+                                write_line(
+                                    &out_task,
+                                    &rpc_protocol::response(Some(id), &kind, Err(error)),
+                                )
+                                .await;
+                                active_task.store(false, std::sync::atomic::Ordering::Release);
+                                return;
+                            }
+                        };
+                        write_line(
+                            &out_task,
+                            &rpc_protocol::response(
+                                Some(id),
+                                &kind,
+                                Ok(Some(serde_json::json!({"accepted": true}))),
+                            ),
+                        )
+                        .await;
+                        let outcome_cancel = cancel_task.clone();
+                        let result = if compact {
+                            rpc_compact_cancellable(&lane_task, instructions, cancel_task).await
+                        } else if resume {
+                            rpc_resume_cancellable(&lane_task, cancel_task).await
+                        } else {
+                            rpc_prompt_cancellable(&lane_task, content, cancel_task).await
+                        };
+                        if let Some(flush) = flush_events {
+                            let (done, drained) = tokio::sync::oneshot::channel();
+                            if flush.send(done).is_ok() {
+                                let _ = drained.await;
+                            }
                         }
-                    }
-                    let (outcome, aborted, error) = match &result {
-                        Ok(value) => {
-                            let outcome = value
-                                .get("outcome")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("completed")
-                                .to_string();
-                            let error = value
-                                .get("error")
-                                .and_then(|v| v.as_str())
-                                .map(str::to_owned);
-                            (outcome.clone(), outcome == "aborted", error)
-                        }
-                        Err(ref error) => ("failed".to_string(), false, Some(error.clone())),
-                    };
-                    // Recovery may leave a continuable run behind an abort, so the
-                    // settlement carries what the client needs to offer "continue".
-                    let pending_resume = lane_task.has_pending_resume().await;
-                    let summary = result
-                        .as_ref()
-                        .ok()
-                        .and_then(|value| value.get("summary"))
-                        .cloned();
-                    let settled = serde_json::json!({
-                        "type": "agent_settled",
-                        "runId": result.as_ref().ok().and_then(|value| value.get("runId")),
-                        "outcome": outcome,
-                        "aborted": aborted,
-                        "error": error,
-                        "summary": summary,
-                        "pendingResume": pending_resume,
-                    });
-                    write_line(&out_task, &settled).await;
-                    mailbox_task.cancel_all();
-                    active_task.store(false, std::sync::atomic::Ordering::Release);
-                }));
+                        let (outcome, aborted, error) = match &result {
+                            Ok(value) => {
+                                let outcome = value
+                                    .get("outcome")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("completed")
+                                    .to_string();
+                                let error = value
+                                    .get("error")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_owned);
+                                (outcome.clone(), outcome == "aborted", error)
+                            }
+                            Err(error) if outcome_cancel.is_cancelled() => {
+                                ("aborted".to_string(), true, Some(error.clone()))
+                            }
+                            Err(ref error) => ("failed".to_string(), false, Some(error.clone())),
+                        };
+                        // Recovery may leave a continuable run behind an abort, so the
+                        // settlement carries what the client needs to offer "continue".
+                        let pending_resume = lane_task.has_pending_resume().await;
+                        let summary = result
+                            .as_ref()
+                            .ok()
+                            .and_then(|value| value.get("summary"))
+                            .cloned();
+                        let settled = serde_json::json!({
+                            "type": "agent_settled",
+                            "runId": result.as_ref().ok().and_then(|value| value.get("runId")),
+                            "outcome": outcome,
+                            "aborted": aborted,
+                            "error": error,
+                            "summary": summary,
+                            "pendingResume": pending_resume,
+                        });
+                        write_line(&out_task, &settled).await;
+                        mailbox_task.cancel_all();
+                        active_task.store(false, std::sync::atomic::Ordering::Release);
+                    }),
+                    run_cancel.clone(),
+                ));
                 continue;
             }
             _ => {}
@@ -778,6 +804,29 @@ where
             "external_tool_response" => external_tools
                 .respond(&msg)
                 .map(|accepted| serde_json::json!({"accepted": accepted})),
+            "configure_file_io" => {
+                rpc_configure_file_io(
+                    &lane,
+                    run_active.load(std::sync::atomic::Ordering::Acquire),
+                    file_io_router.as_ref(),
+                    &mut owner.file_io,
+                    &stdout,
+                    &msg,
+                )
+                .await
+            }
+            // Replies are never run-gated; the tool is waiting on this reader.
+            "file_io_response" => {
+                // Correlation belongs to the dispatcher, not the strict broker
+                // envelope. Move the owned frame and strip ONLY id: arbitrary
+                // extra fields must still fail the broker's exact-shape check.
+                let mut reply = msg;
+                if let Some(object) = reply.as_object_mut() {
+                    object.remove("id");
+                }
+                Ok(serde_json::json!({"accepted": owner.file_io.as_ref()
+                    .is_some_and(|client| client.resolve_response(&reply))}))
+            }
             "get_state" => Ok(rpc_get_state(&lane, harness).await),
             "get_commands" => Ok(rpc_get_commands(oauth_snapshot.as_deref())),
             "get_messages" => rpc_get_messages(&lane, harness, &msg).await,
@@ -796,6 +845,9 @@ where
             "get_auth_status" => Ok(rpc_get_auth_status(&model_catalog, oauth_snapshot.as_ref())),
             "oauth" => rpc_oauth(&oauth_snapshot, &msg),
             "set_api_key" => rpc_set_api_key(&msg).await,
+            "set_model" if run_active.load(std::sync::atomic::Ordering::Acquire) => {
+                Err("cannot set model while a run or prompt validation is active".into())
+            }
             "set_model" => rpc_set_model(&lane, &model_catalog, &msg).await,
             "get_available_thinking_levels" => Ok(rpc_get_available_thinking_levels(&lane).await),
             "set_thinking_level" => rpc_set_thinking_level(&lane, &msg).await,
@@ -820,6 +872,9 @@ where
     // EOF makes future external replies impossible. Disable the backend before
     // joining, without cancelling an otherwise healthy model-only run.
     external_tools.shutdown();
+    if let Some(client) = owner.file_io.take() {
+        client.close();
+    }
     for task in command_tasks {
         let _ = task.await;
     }
@@ -867,10 +922,64 @@ where
     exit_code
 }
 
+// All dispatcher-created tasks have a retained join, including writer/pumps
+// and extension commands. Root cancellation transfers ownership to cleanup;
+// never abort a future which may be joining spawn_blocking work. Cleanup needs
+// the Tokio runtime to remain alive; an OS write already in progress and plugin
+// callbacks cannot be forcibly preempted safely.
+type OwnedRpcRun = RetainedRpcTask<()>;
+struct RetainedRpcTask<T: Send + 'static> {
+    task: Option<tokio::task::JoinHandle<T>>,
+    cancel: tokio_util::sync::CancellationToken,
+}
+impl<T: Send + 'static> RetainedRpcTask<T> {
+    fn new(task: tokio::task::JoinHandle<T>, cancel: tokio_util::sync::CancellationToken) -> Self {
+        Self {
+            task: Some(task),
+            cancel,
+        }
+    }
+    fn is_finished(&self) -> bool {
+        self.task.as_ref().is_none_or(|task| task.is_finished())
+    }
+}
+impl<T: Send + 'static> std::future::Future for RetainedRpcTask<T> {
+    type Output = Result<T, tokio::task::JoinError>;
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let result = std::future::Future::poll(
+            std::pin::Pin::new(self.task.as_mut().expect("RPC task already joined")),
+            cx,
+        );
+        if result.is_ready() {
+            self.task.take();
+        }
+        result
+    }
+}
+impl<T: Send + 'static> Drop for RetainedRpcTask<T> {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            // Pruning a completed command must not cancel a healthy transport.
+            if !task.is_finished() {
+                self.cancel.cancel();
+            }
+            tokio::spawn(async move {
+                if let Err(error) = task.await {
+                    eprintln!("[rpi] cancelled RPC task cleanup failed: {error}");
+                }
+            });
+        }
+    }
+}
+
 // Synchronous cleanup survives cancellation/drop of the RPC owner future.
 // The run is signalled before retiring waiters, preserving aborted settlement.
 struct RpcOwner<'a> {
     harness: &'a AgentHarness,
+    file_io: Option<crate::rpc::file_io::FileIOClient>,
     backend: Arc<crate::rpc::external_tools::ExternalTools>,
     run_cancel: tokio_util::sync::CancellationToken,
     pump_stop: tokio_util::sync::CancellationToken,
@@ -882,6 +991,9 @@ impl Drop for RpcOwner<'_> {
     fn drop(&mut self) {
         if self.armed {
             self.run_cancel.cancel();
+            if let Some(client) = self.file_io.take() {
+                client.close();
+            }
             self.backend.shutdown();
             self.failed.cancel();
             self.pump_stop.cancel();
@@ -958,14 +1070,110 @@ async fn drain_rpc_events(
     }
 }
 
+/// Admission owns and drains its blocking decoder even when cancellation wins.
+/// Bounds are per prompt, and the single run slot bounds workers to one.
+async fn rpc_validate_prompt(
+    lane: &Arc<dyn AgentLane>,
+    command: serde_json::Value,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<crate::rpc::prompt_content::ParsedPrompt, String> {
+    use crate::rpc::prompt_content::parse_prompt_content;
+    if cancel.is_cancelled() {
+        return Err("Operation aborted during prompt validation".into());
+    }
+    // Capture the model before decoding. Client set_model is excluded until
+    // settlement. The identity recheck below is not a model lock: extensions
+    // may still mutate the harness after it, pending a harness-owned run API.
+    let model = lane.get_model().await.map_err(|e| e.to_string())?;
+    let mut worker = tokio::task::spawn_blocking(move || parse_prompt_content(&command));
+    let result = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            // abort() cannot preempt an active spawn_blocking decoder. Await it;
+            // never drop/detach its JoinHandle and never persist its result.
+            let _ = worker.await;
+            return Err("Operation aborted during prompt validation".into());
+        }
+        result = &mut worker => result.map_err(|_| "prompt validation worker failed".to_string())?,
+    }?;
+    if cancel.is_cancelled() {
+        return Err("Operation aborted during prompt validation".into());
+    }
+    if result.has_images() {
+        let current = lane.get_model().await.map_err(|e| e.to_string())?;
+        if current.id != model.id || current.provider != model.provider || current.api != model.api
+        {
+            return Err("model changed during image prompt validation; retry while idle".into());
+        }
+        if !model.input.contains(&rpi_ai::types::InputModality::Image)
+            || !current.input.contains(&rpi_ai::types::InputModality::Image)
+        {
+            return Err("selected model does not support image input".into());
+        }
+    }
+    Ok(result)
+}
+
+async fn rpc_configure_file_io(
+    lane: &Arc<dyn AgentLane>,
+    run_active: bool,
+    router: Option<&Arc<rpi_tools::file_io::FileIORouter>>,
+    owner: &mut Option<crate::rpc::file_io::FileIOClient>,
+    writer: &RpcWriter,
+    command: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    use rpi_tools::file_io::FileIOCapabilities;
+    if run_active
+        || lane
+            .snapshot()
+            .await
+            .map_err(|e| e.to_string())?
+            .active
+            .is_some()
+    {
+        return Err("cannot configure file I/O while a run or prompt validation is active".into());
+    }
+    let read_text = command
+        .get("readText")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or("readText must be a boolean")?;
+    let write_text = command
+        .get("writeText")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or("writeText must be a boolean")?;
+    let router = router.ok_or("this embedded harness has no attached built-in file I/O router")?;
+    // Close the old unique owner before installing a fresh weak backend. After
+    // transport loss the selected router remains client-authoritative: no fallback.
+    if let Some(old) = owner.take() {
+        old.close();
+    }
+    let next =
+        (read_text || write_text).then(|| crate::rpc::file_io::FileIOClient::new(writer.clone()));
+    router
+        .configure(
+            FileIOCapabilities {
+                read_text,
+                write_text,
+            },
+            next.as_ref().map(|c| c.backend()),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    *owner = next;
+    Ok(serde_json::json!({"readText": read_text, "writeText": write_text}))
+}
+
 /// Cancellation is delivered even if abort/stop arrives before prompt_text has
 /// registered a run. Once active, await its normal aborted outcome and cleanup.
 async fn rpc_prompt_cancellable(
     lane: &Arc<dyn AgentLane>,
-    content: &str,
+    content: crate::rpc::prompt_content::ParsedPrompt,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<serde_json::Value, String> {
-    let prompt = rpc_prompt_text(lane, content);
+    if cancel.is_cancelled() {
+        return Err("Operation aborted".into());
+    }
+    let prompt = rpc_prompt_content(lane, content);
     tokio::pin!(prompt);
     tokio::select! {
         biased;
@@ -1107,14 +1315,22 @@ fn rpc_outcome_str(outcome: &HarnessRunOutcome) -> (&'static str, Option<String>
     }
 }
 
-async fn rpc_prompt_text(
+async fn rpc_prompt_content(
     lane: &Arc<dyn AgentLane>,
-    content: &str,
+    content: crate::rpc::prompt_content::ParsedPrompt,
 ) -> Result<serde_json::Value, String> {
-    let result = lane
-        .prompt_text(content, Vec::new())
-        .await
-        .map_err(|e| e.to_string())?;
+    use crate::rpc::prompt_content::ParsedPrompt;
+    let result = match content {
+        ParsedPrompt::Legacy(text) => lane.prompt_text(&text, Vec::new()).await,
+        ParsedPrompt::Blocks(blocks) => {
+            lane.prompt_message(rpi_agent::AgentMessage::User(UserMessage::new(
+                rpi_ai::types::UserContent::Blocks(blocks),
+                rpc_now_ms(),
+            )))
+            .await
+        }
+    }
+    .map_err(|e| e.to_string())?;
     let (outcome, final_text, error) = rpc_outcome_str(&result.outcome);
     Ok(
         serde_json::json!({"runId":result.run_id, "outcome": outcome, "finalText": final_text, "error": error}),
@@ -2380,6 +2596,10 @@ fn session_storage_notice(message: &str) -> String {
 }
 
 #[cfg(test)]
+#[path = "rpc/native_dispatch_tests.rs"]
+mod native_dispatch_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use rpi_agent::events::AgentEvent;
@@ -2864,7 +3084,7 @@ mod tests {
     }
 
     #[derive(Clone, Default)]
-    struct RpcOutput(Arc<Mutex<Vec<u8>>>);
+    pub(super) struct RpcOutput(Arc<Mutex<Vec<u8>>>);
 
     impl Write for RpcOutput {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -2877,7 +3097,7 @@ mod tests {
     }
 
     impl RpcOutput {
-        fn messages(&self) -> Vec<serde_json::Value> {
+        pub(super) fn messages(&self) -> Vec<serde_json::Value> {
             String::from_utf8(self.0.lock().unwrap().clone())
                 .unwrap()
                 .lines()
@@ -2885,7 +3105,7 @@ mod tests {
                 .collect()
         }
 
-        async fn wait_for(
+        pub(super) async fn wait_for(
             &self,
             predicate: impl Fn(&serde_json::Value) -> bool,
         ) -> serde_json::Value {
@@ -2902,7 +3122,7 @@ mod tests {
         }
     }
 
-    async fn rpc_test_harness(
+    pub(super) async fn rpc_test_harness(
         text: &str,
         tokens_per_second: f64,
     ) -> (AgentHarness, Arc<rpi_ai::providers::faux::FauxProvider>) {
@@ -2919,7 +3139,7 @@ mod tests {
         (AgentHarness::create(options).await.unwrap(), provider)
     }
 
-    fn start_test_rpc(
+    pub(super) fn start_test_rpc(
         harness: AgentHarness,
         ui: rpi_extensions::UiDialogMailbox,
     ) -> (
@@ -3385,6 +3605,7 @@ mod tests {
                     },
                 };
                 let event = AgentEvent::MessageUpdate {
+                    message_id: None,
                     message: message.clone(),
                     assistant_message_event,
                 };
@@ -3417,6 +3638,7 @@ mod tests {
                 let message = Arc::new(message);
                 for _ in 0..100 {
                     tx.send(AgentEvent::MessageUpdate {
+                        message_id: None,
                         message: message.clone(),
                         assistant_message_event: rpi_ai::AssistantMessageEvent::TextDelta {
                             content_index: 0,
@@ -3701,10 +3923,38 @@ mod tests {
             0
         );
         let messages = output.messages();
-        assert!(messages.iter().any(|message| {
-            message["type"] == "agent_settled"
-                && (message["outcome"] == "aborted" || message["outcome"] == "failed")
-        }));
+        let response = messages
+            .iter()
+            .find(|message| message["type"] == "response" && message["id"] == 1)
+            .expect("the prompt has one correlated admission outcome");
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| { message["type"] == "response" && message["id"] == 1 })
+                .count(),
+            1
+        );
+        if response["success"] == true {
+            assert_eq!(response["data"]["accepted"], true);
+            assert!(messages.iter().any(|message| {
+                message["type"] == "agent_settled"
+                    && (message["outcome"] == "aborted" || message["outcome"] == "failed")
+            }));
+        } else {
+            // Stop may cancel the owned preflight BEFORE acceptance. In this
+            // case there is no native run to settle, and no user is persisted.
+            assert_eq!(
+                response["error"].as_str(),
+                Some("Operation aborted during prompt validation"),
+                "{response}"
+            );
+            assert!(!messages
+                .iter()
+                .any(|message| message["type"] == "agent_start"));
+        }
+        assert!(messages.iter().any(|message| message["type"] == "response"
+            && message["id"] == 2
+            && message["success"] == true));
         assert!(lane.abort().await.is_err());
     }
 

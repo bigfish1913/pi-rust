@@ -22,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::env::FileContent;
 use crate::error::{FileError, FileErrorCode};
+use crate::file_io::{resolve_client_path, FileIOOperation, FileIORouter};
 use crate::file_mutation_queue::{with_file_mutation_queue, MutatingEnv};
 use crate::path_utils::resolve_tool_path;
 use crate::tools::tool_context::ExecutionToolContext;
@@ -39,6 +40,7 @@ pub struct WriteInput {
 pub struct WriteTool {
     schema: Tool,
     env: Arc<dyn MutatingEnv>,
+    file_io: Option<Arc<FileIORouter>>,
 }
 
 impl WriteTool {
@@ -69,6 +71,7 @@ pub fn create_write_tool(context: &ExecutionToolContext) -> Arc<dyn AgentTool> {
     Arc::new(WriteTool {
         schema: WriteTool::schema(),
         env,
+        file_io: context.file_io().cloned(),
     })
 }
 
@@ -90,6 +93,39 @@ impl AgentTool for WriteTool {
     ) -> Result<AgentToolResult, AgentError> {
         let input: WriteInput = serde_json::from_value(params)
             .map_err(|e| AgentError::Validation(format!("write input invalid: {e}")))?;
+
+        // Freeze authority before any local path resolution or queue access.
+        if let Some(router) = &self.file_io {
+            if let Some(client) = router
+                .select(FileIOOperation::Write)
+                .await
+                .map_err(|e| file_err_to_agent(e.into()))?
+            {
+                let abs = resolve_client_path(self.env.as_env().cwd(), &input.path)
+                    .map_err(|e| file_err_to_agent(e.into()))?;
+                let path_for_msg = input.path;
+                let abs_for_closure = abs.clone();
+                router
+                    .with_mutation_queue(&abs, &signal, move |cancel| {
+                        async move {
+                            client
+                                .write_text(&abs_for_closure, input.content, cancel)
+                                .await
+                                .map_err(FileError::from)
+                        }
+                        .boxed()
+                    })
+                    .await
+                    .map_err(file_err_to_agent)?;
+                return Ok(AgentToolResult {
+                    content: vec![TextContentOrImage::text(format!(
+                        "Successfully wrote to {path_for_msg}"
+                    ))],
+                    details: serde_json::Value::Null,
+                    ..Default::default()
+                });
+            }
+        }
 
         let abs = resolve_tool_path(self.env.as_env(), &input.path, Some(&signal))
             .await

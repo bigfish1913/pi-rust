@@ -855,7 +855,10 @@ async fn review_pr104_replay_preserves_the_live_cache_hit_rate() {
     // Run the actual live MessageEnd handler; the latest turn is a 10% hit.
     for message in messages {
         handle_agent_event(
-            AgentEvent::MessageEnd { message },
+            AgentEvent::MessageEnd {
+                message_id: None,
+                message,
+            },
             &tui,
             &state,
             &state.chat_container,
@@ -1392,6 +1395,7 @@ async fn review_distinct_turn_with_same_timestamp_and_usage_is_not_dropped() {
     ));
     handle_agent_event(
         AgentEvent::MessageEnd {
+            message_id: None,
             message: AgentMessage::Assistant(Box::new(second)),
         },
         &tui,
@@ -1431,7 +1435,10 @@ async fn review_reconcile_at_agent_end_is_not_recounted_by_a_later_identical_eve
     ));
     // The live drain counted the turn first, as it does before `AgentEnd`.
     handle_agent_event(
-        AgentEvent::MessageEnd { message },
+        AgentEvent::MessageEnd {
+            message_id: None,
+            message,
+        },
         &tui,
         &state,
         &state.chat_container,
@@ -1453,7 +1460,10 @@ async fn review_reconcile_at_agent_end_is_not_recounted_by_a_later_identical_eve
         AgentMessage::Assistant(Box::new(assistant_with_usage(1_000, 200, 500, 0, 0.01)));
     lane.append_message(next_run.clone()).await.unwrap();
     handle_agent_event(
-        AgentEvent::MessageEnd { message: next_run },
+        AgentEvent::MessageEnd {
+            message_id: None,
+            message: next_run,
+        },
         &tui,
         &state,
         &state.chat_container,
@@ -1489,7 +1499,10 @@ async fn review_pending_message_end_after_reconcile_does_not_double_usage() {
     ));
     // The live drain applied the turn's `MessageEnd` first.
     handle_agent_event(
-        AgentEvent::MessageEnd { message },
+        AgentEvent::MessageEnd {
+            message_id: None,
+            message,
+        },
         &tui,
         &state,
         &state.chat_container,
@@ -1546,6 +1559,7 @@ async fn review_unpersisted_message_after_reconcile_still_counts_once() {
         AgentMessage::Assistant(Box::new(assistant_with_usage(4_000, 300, 0, 0, 0.040)));
     handle_agent_event(
         AgentEvent::MessageEnd {
+            message_id: None,
             message: unpersisted,
         },
         &tui,

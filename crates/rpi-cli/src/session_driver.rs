@@ -116,7 +116,7 @@ pub fn map_agent_event(event: &AgentEvent) -> Option<UiEvent> {
             error: error.clone(),
         }),
         AgentEvent::TurnStart | AgentEvent::TurnEnd { .. } => None,
-        AgentEvent::MessageStart { message } => match message {
+        AgentEvent::MessageStart { message, .. } => match message {
             AgentMessage::Assistant(a) => Some(UiEvent::AssistantStart {
                 blocks: assistant_blocks(a),
             }),
@@ -126,7 +126,7 @@ pub fn map_agent_event(event: &AgentEvent) -> Option<UiEvent> {
             blocks: assistant_blocks(message),
             tool_calls: assistant_tool_calls(message),
         }),
-        AgentEvent::MessageEnd { message } => match message {
+        AgentEvent::MessageEnd { message, .. } => match message {
             AgentMessage::Assistant(a) => Some(UiEvent::AssistantEnd {
                 blocks: assistant_blocks(a),
             }),
@@ -385,7 +385,7 @@ pub fn map_remote_event(event: &RemoteEvent) -> Option<UiEvent> {
             delay_ms: *delay_ms,
             error: error.clone(),
         }),
-        RemoteEvent::MessageStart { message } => {
+        RemoteEvent::MessageStart { message, .. } => {
             if message_role(message) != "assistant" {
                 return None;
             }
@@ -402,7 +402,7 @@ pub fn map_remote_event(event: &RemoteEvent) -> Option<UiEvent> {
                 tool_calls: tool_calls_from_value(message),
             })
         }
-        RemoteEvent::MessageEnd { message } => {
+        RemoteEvent::MessageEnd { message, .. } => {
             if message_role(message) != "assistant" {
                 return None;
             }

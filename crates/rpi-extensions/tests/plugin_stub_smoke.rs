@@ -233,7 +233,10 @@ async fn loads_real_cdylib_and_drives_echo_tool() {
         timestamp: 0,
     }));
     let before = stub_message_end_hits(&stub_path);
-    emitter.try_emit(rpi_agent::AgentEvent::MessageEnd { message: am });
+    emitter.try_emit(rpi_agent::AgentEvent::MessageEnd {
+        message_id: None,
+        message: am,
+    });
     let after = stub_message_end_hits(&stub_path);
     assert_eq!(
         after,

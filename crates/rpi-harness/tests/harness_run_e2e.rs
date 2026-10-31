@@ -53,6 +53,9 @@ use rpi_tools::{
 // set/remove call, because the harness reads the variable while starting a run.
 static RUN_BUDGET_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+#[path = "harness_run_e2e/native_identity_blockers.rs"]
+mod native_identity_blockers;
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn declined_compaction_records_a_terminal_outcome() {
     let (harness, _, _) = harness_with(FauxScript::new().with_text("unused")).await;
@@ -960,7 +963,8 @@ async fn directly_sent_prompt_emits_no_user_message_start() {
             matches!(
                 event,
                 AgentEvent::MessageStart {
-                    message: rpi_agent::AgentMessage::User(_)
+                    message: rpi_agent::AgentMessage::User(_),
+                    ..
                 }
             )
         })
@@ -975,7 +979,8 @@ async fn directly_sent_prompt_emits_no_user_message_start() {
         events.iter().any(|event| matches!(
             event,
             AgentEvent::MessageStart {
-                message: rpi_agent::AgentMessage::Assistant(_)
+                message: rpi_agent::AgentMessage::Assistant(_),
+                ..
             }
         )),
         "assistant MessageStart must still fire"
@@ -1207,7 +1212,9 @@ async fn a_crashed_run_can_be_salvaged_from_its_committed_frames() {
     let script = FauxScript::new()
         .with_tokens_per_second(20.0)
         .with_text(long.clone());
-    let (harness, _provider, _env) = harness_with(script).await;
+    let (collector, live) = CollectorEmitter::new();
+    let (harness, _provider, _env) =
+        harness_with_options(script, RetryPolicy::default(), Some(Arc::new(collector))).await;
 
     let run = {
         let harness = harness.clone();
@@ -1225,7 +1232,17 @@ async fn a_crashed_run_can_be_salvaged_from_its_committed_frames() {
             })
             .await
             .expect("frame records readable");
-        committed = records.len();
+        // CommitStream binds identity, but is not streamed content. Wait for
+        // the same three Append frames as before identity binding existed.
+        committed = records
+            .iter()
+            .filter(|record| {
+                matches!(record,
+                    LaneRecord::AssistantFrame(frame)
+                        if frame.op == rpi_harness::session::types::AssistantFrameOp::Append
+                )
+            })
+            .count();
         if committed >= 3 {
             break;
         }
@@ -1254,6 +1271,23 @@ async fn a_crashed_run_can_be_salvaged_from_its_committed_frames() {
         "only the prompt is history at this point"
     );
 
+    let live_id = live
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::MessageStart {
+                message: AgentMessage::Assistant(_),
+                message_id,
+            } => message_id.clone(),
+            _ => None,
+        })
+        .expect("published assistant has ID");
+    let bindings = session.find_records(&RecordQuery::default()).await.unwrap();
+    assert!(bindings.iter().any(|record| matches!(record,
+        LaneRecord::AssistantFrame(frame) if frame.op == rpi_harness::session::types::AssistantFrameOp::CommitStream
+            && frame.frame.as_ref().and_then(|value| value.get("entryId")).and_then(|value| value.as_str()) == Some(live_id.as_str())
+    )));
     run.abort();
     let _ = run.await;
 
@@ -1415,7 +1449,17 @@ async fn reopening_a_crashed_session_restores_the_committed_prefix() {
             })
             .await
             .expect("frame records readable");
-        if records.len() >= 3 {
+        if records
+            .iter()
+            .filter(|record| {
+                matches!(record,
+                    LaneRecord::AssistantFrame(frame)
+                        if frame.op == rpi_harness::session::types::AssistantFrameOp::Append
+                )
+            })
+            .count()
+            >= 3
+        {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -3955,6 +3999,11 @@ async fn a_deferred_response_suspends_and_then_resumes_through_its_tools() {
         .with_tool_call("read", serde_json::json!({ "path": "a.txt" }))
         .with_text("done");
     let (harness, provider, _env) = harness_with(script).await;
+    let (collector, live) = CollectorEmitter::new();
+    harness
+        .set_agent_emitter(Some(Arc::new(collector)))
+        .await
+        .unwrap();
 
     // What the poll returns: an assistant message with a tool call. Its tools were
     // never run (they came from outside the loop), which is the case this test
@@ -4031,6 +4080,29 @@ async fn a_deferred_response_suspends_and_then_resumes_through_its_tools() {
         _ => None,
     });
     let polled_result = polled_result.expect("the polled tool call must have been executed");
+    let live = live.lock().unwrap().clone();
+    assert_live_entry_ids(&harness, &live, false).await;
+    let records = harness
+        .session()
+        .find_records(&RecordQuery::default())
+        .await
+        .unwrap();
+    let started = records
+        .iter()
+        .find_map(|record| match record {
+            LaneRecord::ToolStarted(started) if started.tool_call_id == "polled-call" => {
+                Some(started)
+            }
+            _ => None,
+        })
+        .expect("polled call has a durable ToolStarted");
+    assert_eq!(started.tool_index, 0);
+    assert!(entries
+        .iter()
+        .any(|entry| entry.base().id == started.assistant_entry_id));
+    assert!(live.iter().any(|event| matches!(event,
+        AgentEvent::MessageStart { message: AgentMessage::ToolResult(result), message_id: Some(id) }
+            if result.tool_call_id == "polled-call" && id == &started.result_entry_id)));
     assert!(
         !polled_result.is_error || !polled_result.content.is_empty(),
         "the tool must actually have run, got {polled_result:?}"
@@ -4128,4 +4200,384 @@ async fn resuming_through_a_provider_without_the_capability_is_an_error() {
         format!("{error:?}").contains("no provider"),
         "the error must say which provider is missing, got {error:?}"
     );
+}
+
+/// Assert identity by event order, never by matching message content. Failed retry
+/// attempts may be deliberately absent from history, but each attempt still has
+/// its own non-reused native reservation.
+async fn assert_live_entry_ids(
+    harness: &AgentHarness,
+    events: &[AgentEvent],
+    allow_discarded: bool,
+) {
+    let mut current: Option<String> = None;
+    let mut starts = std::collections::BTreeSet::new();
+    for event in events {
+        match event {
+            AgentEvent::MessageStart { message_id, .. } => {
+                let id = message_id.clone().expect("session-backed start has ID");
+                assert!(
+                    starts.insert(id.clone()),
+                    "each message owns its reservation"
+                );
+                current = Some(id);
+            }
+            AgentEvent::MessageUpdate { message_id, .. } => {
+                assert_eq!(
+                    message_id, &current,
+                    "thinking/text/tool deltas keep start ID"
+                );
+            }
+            AgentEvent::MessageEnd {
+                message_id,
+                message,
+            } => {
+                assert_eq!(message_id, &current, "end keeps start ID");
+                let id = message_id.as_deref().unwrap();
+                match harness.get_entry(id).await.unwrap() {
+                    Some(rpi_harness::session::types::Entry::Message(entry)) => {
+                        // JSON Option<Value> round-trips Some(Null) as None.
+                        // Compare the native durable representation, not that
+                        // in-memory-only distinction in tool-result details.
+                        let canonical = |value: &AgentMessage| {
+                            serde_json::from_value::<AgentMessage>(
+                                serde_json::to_value(value).unwrap(),
+                            )
+                            .unwrap()
+                        };
+                        assert_eq!(
+                            canonical(&entry.message),
+                            canonical(message),
+                            "live end is the same durable history entry"
+                        );
+                    }
+                    None if allow_discarded
+                        && matches!(message, AgentMessage::Assistant(a) if a.stop_reason == rpi_ai::StopReason::Error) =>
+                        {}
+                    other => panic!("missing or wrong entry for {id}: {other:?}"),
+                }
+                current = None;
+            }
+            _ => {}
+        }
+    }
+    assert!(current.is_none(), "all live messages ended");
+    let records = harness
+        .session()
+        .find_records(&RecordQuery::default())
+        .await
+        .unwrap();
+    for record in records {
+        if let LaneRecord::ToolStarted(tool) = record {
+            assert!(
+                starts.contains(&tool.result_entry_id),
+                "tool result reuses ToolStarted ID"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_live_ids_match_history_for_text_thinking_tools_and_final_persist() {
+    use rpi_ai::providers::faux::FauxBlock;
+    let script = FauxScript::new();
+    script.set_responses(vec![
+        FauxStep::message(faux_assistant_message(
+            vec![
+                FauxBlock::thinking("private reasoning"),
+                FauxBlock::text("writing"),
+                FauxBlock::tool_call(
+                    "write",
+                    serde_json::json!({"path":"identity.txt","content":"same"}),
+                ),
+            ],
+            rpi_ai::StopReason::ToolUse,
+        )),
+        FauxStep::text("same"),
+    ]);
+    let (collector, events) = CollectorEmitter::new();
+    let (harness, _, _) =
+        harness_with_options(script, RetryPolicy::default(), Some(Arc::new(collector))).await;
+    harness.prompt_text("same", vec![]).await.unwrap();
+    let events = events.lock().unwrap().clone();
+    assert_live_entry_ids(&harness, &events, false).await;
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::MessageUpdate {
+            assistant_message_event: rpi_ai::AssistantMessageEvent::ThinkingDelta { .. },
+            ..
+        }
+    )));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_retry_attempt_ids_are_distinct_and_only_success_is_committed() {
+    let mut failed = faux_assistant_message("same", rpi_ai::StopReason::Error);
+    failed.error_message = Some("503 service unavailable".into());
+    let script = FauxScript::new();
+    script.set_responses(vec![
+        FauxStep::message(failed.clone()),
+        FauxStep::message(failed),
+        FauxStep::text("same"),
+    ]);
+    let (collector, events) = CollectorEmitter::new();
+    let retry = RetryPolicy {
+        enabled: true,
+        max_retries: 2,
+        base_delay_ms: 0,
+        max_agent_delay_ms: 0,
+    };
+    let (harness, _, _) = harness_with_options(script, retry, Some(Arc::new(collector))).await;
+    harness.prompt_text("same", vec![]).await.unwrap();
+    let events = events.lock().unwrap().clone();
+    assert_live_entry_ids(&harness, &events, true).await;
+    let ids: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::MessageStart {
+                message: AgentMessage::Assistant(_),
+                message_id,
+            } => message_id.clone(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids.len(), 3);
+    assert!(harness.get_entry(&ids[0]).await.unwrap().is_none());
+    assert!(harness.get_entry(&ids[1]).await.unwrap().is_none());
+    assert!(harness.get_entry(&ids[2]).await.unwrap().is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_cancelled_assistant_keeps_its_live_entry_id() {
+    let script = FauxScript::new()
+        .with_tokens_per_second(50.0)
+        .with_abort_after(std::time::Duration::from_millis(50))
+        .with_text("cancelled response ".repeat(100));
+    let (collector, events) = CollectorEmitter::new();
+    let (harness, _, _) =
+        harness_with_options(script, RetryPolicy::default(), Some(Arc::new(collector))).await;
+    let result = harness.prompt_text("cancel", vec![]).await.unwrap();
+    assert!(matches!(result.outcome, HarnessRunOutcome::Aborted { .. }));
+    let events = events.lock().unwrap().clone();
+    assert_live_entry_ids(&harness, &events, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_explicit_delivery_ids_do_not_match_identical_contents() {
+    use rpi_harness::frame_progress::FrameRecordingEmitter;
+    use rpi_harness::settle::{SettleState, SettlingEmitter};
+    let (harness, _, _) = harness_with(FauxScript::new()).await;
+    let (collector, events) = CollectorEmitter::new();
+    let recorder = Arc::new(FrameRecordingEmitter::new(
+        Arc::new(collector),
+        harness.session().clone(),
+        "main",
+        "identity-delivery",
+    ));
+    let state = Arc::new(SettleState::new(
+        "identity-delivery",
+        false,
+        0,
+        Default::default(),
+    ));
+    let emitter = SettlingEmitter::new(
+        recorder.clone(),
+        recorder,
+        state.clone(),
+        harness.clone(),
+        Default::default(),
+    );
+    let message: AgentMessage =
+        faux_assistant_message("identical", rpi_ai::StopReason::Stop).into();
+    // A generated assistant with identical bytes must NOT consume queued IDs.
+    state.push_injected("queued-1", message.clone());
+    state.push_injected("queued-2", message.clone());
+    emitter
+        .emit(AgentEvent::MessageStart {
+            message: message.clone(),
+            message_id: None,
+        })
+        .await;
+    emitter
+        .emit(AgentEvent::MessageEnd {
+            message: message.clone(),
+            message_id: None,
+        })
+        .await;
+    for _ in 0..2 {
+        emitter
+            .emit_injected(AgentEvent::MessageStart {
+                message: message.clone(),
+                message_id: None,
+            })
+            .await;
+        emitter
+            .emit(AgentEvent::MessageEnd {
+                message: message.clone(),
+                message_id: None,
+            })
+            .await;
+    }
+    let events = events.lock().unwrap().clone();
+    assert_live_entry_ids(&harness, &events, false).await;
+    let ids: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::MessageStart { message_id, .. } => message_id.clone(),
+            _ => None,
+        })
+        .collect();
+    assert_ne!(ids[0], "queued-1");
+    assert_eq!(&ids[1..], &["queued-1", "queued-2"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_missing_delivery_reservation_cancels_without_publishing_a_new_id() {
+    use rpi_harness::frame_progress::FrameRecordingEmitter;
+    use rpi_harness::settle::{SettleState, SettlingEmitter};
+    let (harness, _, _) = harness_with(FauxScript::new()).await;
+    let (collector, events) = CollectorEmitter::new();
+    let recorder = Arc::new(FrameRecordingEmitter::new(
+        Arc::new(collector),
+        harness.session().clone(),
+        "main",
+        "identity-failure",
+    ));
+    let state = Arc::new(SettleState::new(
+        "identity-failure",
+        false,
+        0,
+        Default::default(),
+    ));
+    let signal = tokio_util::sync::CancellationToken::new();
+    let emitter = SettlingEmitter::new(recorder.clone(), recorder, state, harness, signal.clone());
+    let message: AgentMessage = UserMessage::new("missing", 0).into();
+    emitter
+        .emit_injected(AgentEvent::MessageStart {
+            message: message.clone(),
+            message_id: None,
+        })
+        .await;
+    emitter
+        .emit(AgentEvent::MessageStart {
+            message,
+            message_id: None,
+        })
+        .await;
+    assert!(signal.is_cancelled());
+    assert!(events.lock().unwrap().is_empty());
+}
+
+mod native_identity_bind_failure {
+    use super::*;
+    use rpi_harness::error::{SessionError, SessionResult};
+    use rpi_harness::session::types::*;
+
+    struct RefuseBindings {
+        inner: Arc<dyn SessionStorage>,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionStorage for RefuseBindings {
+        fn metadata(&self) -> SessionMetadata {
+            self.inner.metadata()
+        }
+        async fn get_lanes(&self) -> SessionResult<Vec<LanePointer>> {
+            self.inner.get_lanes().await
+        }
+        async fn create_lane(&self, lane: &str, at: Option<&str>) -> SessionResult<()> {
+            self.inner.create_lane(lane, at).await
+        }
+        async fn move_lane(&self, lane: &str, to: Option<&str>) -> SessionResult<()> {
+            self.inner.move_lane(lane, to).await
+        }
+        async fn append_entry(&self, entry: ProvisionedEntry, lane: &str) -> SessionResult<Entry> {
+            self.inner.append_entry(entry, lane).await
+        }
+        async fn append_record(&self, record: LaneRecord) -> SessionResult<LaneRecord> {
+            if matches!(&record, LaneRecord::AssistantFrame(frame) if frame.op == AssistantFrameOp::CommitStream)
+            {
+                return Err(SessionError::storage("controlled identity binding failure"));
+            }
+            self.inner.append_record(record).await
+        }
+        async fn get_entry(&self, id: &str) -> SessionResult<Option<Entry>> {
+            self.inner.get_entry(id).await
+        }
+        async fn find_entries(&self, query: &EntryQuery) -> SessionResult<Vec<Entry>> {
+            self.inner.find_entries(query).await
+        }
+        async fn find_entries_on_branch(
+            &self,
+            query: &EntryQuery,
+            bounds: &BranchBounds,
+            start: &str,
+        ) -> SessionResult<Vec<Entry>> {
+            self.inner
+                .find_entries_on_branch(query, bounds, start)
+                .await
+        }
+        async fn find_records(&self, query: &RecordQuery) -> SessionResult<Vec<LaneRecord>> {
+            self.inner.find_records(query).await
+        }
+        async fn find_open_operations(
+            &self,
+            lane: &str,
+            limit: Option<usize>,
+        ) -> SessionResult<Vec<OperationStartedRecord>> {
+            self.inner.find_open_operations(lane, limit).await
+        }
+        async fn get_log(&self, options: &LogOptions) -> SessionResult<Vec<LogItem>> {
+            self.inner.get_log(options).await
+        }
+        async fn get_name(&self) -> SessionResult<Option<String>> {
+            self.inner.get_name().await
+        }
+        async fn set_name(&self, name: Option<&str>) -> SessionResult<()> {
+            self.inner.set_name(name).await
+        }
+        async fn get_label(&self, id: &str) -> SessionResult<Option<String>> {
+            self.inner.get_label(id).await
+        }
+        async fn set_label(&self, id: &str, label: Option<&str>) -> SessionResult<()> {
+            self.inner.set_label(id, label).await
+        }
+        async fn get_stats(&self) -> SessionResult<SessionStats> {
+            self.inner.get_stats().await
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_failed_binding_is_propagated_before_first_live_message() {
+        let (collector, events) = CollectorEmitter::new();
+        let (harness, _, _) = harness_with_options(
+            FauxScript::new().with_text("never publish an unbound ID"),
+            RetryPolicy::default(),
+            Some(Arc::new(collector)),
+        )
+        .await;
+        let storage = Arc::new(RefuseBindings {
+            inner: harness.session().storage(),
+        });
+        harness
+            .set_session(Session::new(storage, None))
+            .await
+            .unwrap();
+        let error = harness
+            .prompt_text("bind", vec![])
+            .await
+            .expect_err("binding failure must fail the run");
+        assert!(error
+            .to_string()
+            .contains("controlled identity binding failure"));
+        assert!(
+            !events.lock().unwrap().iter().any(|event| matches!(
+                event,
+                AgentEvent::MessageStart { .. }
+                    | AgentEvent::MessageUpdate { .. }
+                    | AgentEvent::MessageEnd { .. }
+            )),
+            "no identity is published after a failed durable binding"
+        );
+    }
 }

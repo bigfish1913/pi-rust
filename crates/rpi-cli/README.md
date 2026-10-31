@@ -128,6 +128,17 @@ For building your own agent, depend on
 [`rpi-harness`](https://crates.io/crates/rpi-harness) directly instead — see
 [docs/agent/project-structure.md](https://github.com/bigfish1913/pi-rust/blob/main/docs/agent/project-structure.md).
 
+## RPC message identity, images and client text files
+
+`rpi --mode rpc` exposes additive, explicitly negotiated native contracts for
+optional durable message identity, ordered inline PNG/JPEG prompt input, and
+client-authoritative text I/O through the existing built-in read/write/edit
+tools. Legacy text/local operation remains the default; client terminal support
+and an OS filesystem sandbox are not implied. See the
+[native protocol contract](../../docs/message-image-file-io-rpc.md) for gates,
+wire shapes, limits, authority combinations and validation scope. Consumers must
+check `ready` capabilities rather than infer support from a crate version.
+
 ## Custom-entry branch queries (RPC and runtime actions)
 
 `get_session_branch` is a filtered custom-entry query, not an unfiltered
