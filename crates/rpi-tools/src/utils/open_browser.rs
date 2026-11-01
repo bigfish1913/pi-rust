@@ -18,7 +18,9 @@
 //!
 //! # Example
 //!
-//! ```rust
+//! This launches a real browser, so the example is compiled but not run by doctests.
+//!
+//! ```no_run
 //! use rpi_tools::utils::open_browser::open_browser;
 //!
 //! // Open a URL in the default browser

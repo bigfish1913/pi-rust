@@ -90,6 +90,7 @@ fn single_tool_use_stream_fn(calls: Vec<(&str, &str)>) -> rpi_agent::StreamFn {
                 arguments: serde_json::json!({}),
                 thought_signature: None,
                 namespace: None,
+                recorded: None,
             })
         })
         .collect();

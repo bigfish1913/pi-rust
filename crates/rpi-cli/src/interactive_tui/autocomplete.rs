@@ -1,6 +1,9 @@
 //! Completion suggestions and editor cursor operations.
 
+use std::any::Any;
+
 use super::*;
+use rpi_tui::truncate_to_width;
 
 // ===========================================================================
 // Autocomplete
@@ -89,21 +92,36 @@ fn selection_is_explicit(state: &Arc<TuiState>, sugg: &AutocompleteSuggestions) 
 }
 
 /// Render (or clear) the autocomplete suggestion list into the container.
+///
+/// The popup reuses its row components in place: each render relabels the
+/// existing [`PopupRow`] children instead of `clear()` + rebuild, and the row
+/// count never shrinks while the popup stays open. The dock stacks this
+/// container as an auto-height entry, so its height is
+/// `container.render(width).len()`: a row count that follows the candidate
+/// count (`/clear` backspaced: 1 → 2 → 5 → 0) reflows the whole transcript on
+/// every keystroke — the panel flicker this module exists to avoid. Growing is
+/// allowed (a taller popup must show its rows); shrinking is padded with blank
+/// rows until the popup closes, and closing empties the container so the
+/// transcript reclaims the rows.
+///
+/// Keeping the row *count* flat is not enough on its own: a row rendered by
+/// `Text` word-wraps, so a long candidate costs two screen lines while the
+/// blank pad that replaces it costs one, and the popup still contracts behind
+/// a flat child count. Rows are therefore [`PopupRow`]s, which truncate to the
+/// render width and always emit exactly one line — one candidate is one
+/// screen row at every width.
+///
+/// The selection index and the explicit-selection stamp are retired exactly
+/// when candidates are gone, so ↑/↓ and Enter semantics do not outlive the
+/// popup even though its blank pad rows do.
 pub(super) fn render_autocomplete(
     state: &Arc<TuiState>,
     suggestions: Option<AutocompleteSuggestions>,
 ) {
-    state.autocomplete_container.clear();
-    let Some(sugg) = suggestions else {
-        *state.autocomplete_selection.lock().unwrap() = 0;
-        stamp_selection_for(state, None);
+    let Some(sugg) = suggestions.filter(|sugg| !sugg.items.is_empty()) else {
+        close_autocomplete_popup(state);
         return;
     };
-    if sugg.items.is_empty() {
-        *state.autocomplete_selection.lock().unwrap() = 0;
-        stamp_selection_for(state, None);
-        return;
-    }
     // Clamp the highlight to the full candidate list, then compute the visible
     // window (with a scroll offset) so ↓ can reach items past `max_visible`.
     let max_visible = state.autocomplete_max_visible;
@@ -131,31 +149,137 @@ pub(super) fn render_autocomplete(
     // Cap the list so the dock doesn't swallow the transcript.
     let accent = state.theme_manager.get().colors.accent;
     let muted = state.theme_manager.get().colors.muted;
-    for (i, item) in sugg
-        .items
+    let rows = (window_start..window_end)
+        .map(|i| {
+            let item = &sugg.items[i];
+            let prefix = if i == selection { "→ " } else { "  " };
+            let label = item.display_text();
+            if i == selection {
+                format!(
+                    "{prefix}{} {}",
+                    accent.fg(label),
+                    muted.fg(item.description.as_deref().unwrap_or(""))
+                )
+            } else {
+                format!(
+                    "{prefix}{} {}",
+                    muted.fg(label),
+                    muted.fg(item.description.as_deref().unwrap_or(""))
+                )
+            }
+        })
+        .collect::<Vec<_>>();
+    render_popup_rows(state, rows);
+}
+
+/// Close the popup: retire the navigation state and empty the container so
+/// the dock reclaims its rows immediately. Also the resting state after
+/// `apply_suggestion` and the selector/extension swaps.
+fn close_autocomplete_popup(state: &Arc<TuiState>) {
+    *state.autocomplete_selection.lock().unwrap() = 0;
+    stamp_selection_for(state, None);
+    state.autocomplete_container.clear();
+}
+
+/// Write `rows` into the popup container, relabeling its `Text` children in
+/// place and never shrinking the row count: rows past `rows.len()` are
+/// blanked, not removed, so the dock keeps the height the popup already had
+/// while candidates shrink. Only a close (`close_autocomplete_popup`) or an
+/// outside owner (selector/extension swaps clear the container) resets the
+/// row set.
+fn render_popup_rows(state: &Arc<TuiState>, rows: Vec<String>) {
+    let children = state.autocomplete_container.get_children();
+    if children
         .iter()
-        .enumerate()
-        .skip(window_start)
-        .take(window_end - window_start)
+        .any(|child| child.as_any().downcast_ref::<PopupRow>().is_none())
     {
-        let prefix = if i == selection { "→ " } else { "  " };
-        let label = item.display_text();
-        let line = if i == selection {
-            format!(
-                "{prefix}{} {}",
-                accent.fg(label),
-                muted.fg(item.description.as_deref().unwrap_or(""))
-            )
-        } else {
-            format!(
-                "{prefix}{} {}",
-                muted.fg(label),
-                muted.fg(item.description.as_deref().unwrap_or(""))
-            )
-        };
+        // The container only ever holds the rows this module created; a
+        // foreign child or an external reset re-binds it to the popup.
+        state.autocomplete_container.clear();
+        return render_popup_rows(state, rows);
+    }
+    for (index, child) in children.iter().enumerate() {
+        let popup_row = child
+            .as_any()
+            .downcast_ref::<PopupRow>()
+            .expect("checked above");
+        match rows.get(index) {
+            Some(line) => popup_row.set_line(line.clone()),
+            None => popup_row.set_line(String::new()),
+        }
+    }
+    for row in rows.iter().skip(children.len()) {
         state
             .autocomplete_container
-            .add_child(Arc::new(Text::new(line, 1, 0)));
+            .add_child(Arc::new(PopupRow::new(row.clone())));
+    }
+}
+
+/// One autocomplete candidate, always exactly one screen line.
+///
+/// The dock allocates the popup's height from `render(width).len()`, so a row
+/// that word-wraps costs two lines and makes the popup — and with it the
+/// transcript viewport above it — contract as soon as that candidate leaves the
+/// window. Unlike `Text` (whose wrapping is the point) this row truncates to the
+/// render width with an ANSI-safe helper that keeps the SGR state of the kept
+/// columns, so a wide terminal shows the whole candidate and a narrow one shows
+/// a clipped prefix instead of a second line.
+///
+/// The line is stored as a raw string and truncated per width on render; the
+/// popup re-renders on every keystroke, and `truncate_to_width` is a single
+/// ANSI-aware pass, so no cache is needed to keep that cheap.
+pub(super) struct PopupRow {
+    line: Mutex<String>,
+}
+
+impl PopupRow {
+    pub(super) fn new(line: impl Into<String>) -> Self {
+        Self {
+            line: Mutex::new(line.into()),
+        }
+    }
+
+    pub(super) fn set_line(&self, line: impl Into<String>) {
+        *self.line.lock().unwrap() = line.into();
+    }
+
+    /// Collapse anything that would start a second line. A candidate label is
+    /// single-line by contract, but a provider is free to hand back text with a
+    /// newline in it (a file name, a description), and an embedded `\n` would
+    /// travel through `Container::render` as one string and still paint two
+    /// terminal rows — the same height leak this row exists to prevent.
+    fn single_line(line: &str) -> String {
+        if line.contains('\n') || line.contains('\r') {
+            line.replace(['\n', '\r'], " ")
+        } else {
+            line.to_string()
+        }
+    }
+}
+
+impl Component for PopupRow {
+    fn render(&self, width: usize) -> Vec<String> {
+        if width == 0 {
+            return vec![String::new()];
+        }
+        let line = Self::single_line(&self.line.lock().unwrap());
+        // `Text::new(line, 1, 0)` rendered with one column of left padding, so
+        // a row occupies the same left gutter as the label it replaces while
+        // the available text width shrinks by that column. The content column
+        // never drops below one: in a one-column viewport the gutter is what
+        // goes, not the character.
+        let content_width = width.saturating_sub(1).max(1);
+        let mut rendered = truncate_to_width(&line, content_width, "…");
+        if content_width < width {
+            rendered.insert(0, ' ');
+        }
+        vec![rendered]
+    }
+
+    fn invalidate(&self) {}
+
+    fn as_any(&self) -> &dyn Any {
+        self
     }
 }
 
@@ -234,8 +358,7 @@ fn apply_suggestion(
     );
     editor.set_text(&replaced);
     set_editor_cursor_offset(editor, &replaced, new_cursor);
-    state.autocomplete_container.clear();
-    *state.autocomplete_selection.lock().unwrap() = 0;
+    close_autocomplete_popup(state);
     true
 }
 

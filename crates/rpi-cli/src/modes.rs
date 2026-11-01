@@ -88,7 +88,17 @@ pub async fn print(
 
     let mut images = initial_images;
     for prompt in prompts {
-        match lane.prompt_text(&prompt, std::mem::take(&mut images)).await {
+        let outcome = lane.prompt_text(&prompt, std::mem::take(&mut images)).await;
+        // Print mode has no transcript to report into, so a write failure goes to
+        // stderr. Silence here is what let a conversation stop being saved while
+        // the run looked fine.
+        for failure in lane.take_write_failures() {
+            eprintln!(
+                "session not saved: could not persist {} ({})",
+                failure.what, failure.message
+            );
+        }
+        match outcome {
             Ok(result) => {
                 last_exit = outcome_exit_code(&result.outcome);
                 match &result.outcome {
@@ -108,7 +118,11 @@ pub async fn print(
                                 }
                             }
                         }
-                        eprintln!("run failed: {error:?}");
+                        if error.code == "SessionStorage" {
+                            eprintln!("{}", session_storage_notice(&error.message));
+                        } else {
+                            eprintln!("run failed: {error:?}");
+                        }
                     }
                     HarnessRunOutcome::Suspended { .. } => {
                         eprintln!("run suspended (deferred) — resume is not supported in v1");
@@ -298,6 +312,7 @@ pub async fn rpc(
     model_catalog: Vec<rpi_ai::Model>,
     ui_dialog: rpi_extensions::UiDialogMailbox,
     oauth_snapshot: Option<Arc<rpi_extensions::RegistrySnapshot>>,
+    message_updates: crate::args::RpcMessageUpdates,
 ) -> i32 {
     rpc_with_io(
         harness,
@@ -305,6 +320,7 @@ pub async fn rpc(
         model_catalog,
         ui_dialog,
         oauth_snapshot,
+        message_updates,
         tokio::io::BufReader::new(tokio::io::stdin()),
         std::io::stdout(),
     )
@@ -317,7 +333,8 @@ async fn rpc_with_io<R, W>(
     model_catalog: Vec<rpi_ai::Model>,
     ui_dialog: rpi_extensions::UiDialogMailbox,
     oauth_snapshot: Option<Arc<rpi_extensions::RegistrySnapshot>>,
-    input: R,
+    message_updates: crate::args::RpcMessageUpdates,
+    mut input: R,
     output: W,
 ) -> i32
 where
@@ -328,8 +345,20 @@ where
     let lane: Arc<dyn AgentLane> = harness.lane("main");
     // One blocking writer owns stdout. Producers only enqueue bounded messages,
     // so pipe backpressure never blocks a Tokio worker on IO or a std mutex.
-    let (stdout, writer_task, writer_failed) = start_rpc_writer(output);
+    let (stdout, writer_task, writer_failed) = start_rpc_writer(output, message_updates);
     let pump_stop = tokio_util::sync::CancellationToken::new();
+    let external_tools =
+        crate::rpc::external_tools::ExternalTools::new(stdout.clone(), Arc::downgrade(&lane));
+    let mut external_names = Vec::new();
+    let mut owner = RpcOwner {
+        harness,
+        backend: external_tools.clone(),
+        run_cancel: tokio_util::sync::CancellationToken::new(),
+        pump_stop: pump_stop.clone(),
+        failed: writer_failed.clone(),
+        mailbox: ui_dialog.clone(),
+        armed: true,
+    };
 
     // Publish generic commit metadata after successful Session appends. The
     // event is intentionally not a durable-state payload: consumers reread
@@ -444,10 +473,7 @@ where
     let mut run_cancel = tokio_util::sync::CancellationToken::new();
     let mut cancel_on_exit = false;
 
-    use tokio::io::AsyncBufReadExt;
-
-    let mut lines = input.lines();
-    write_line(&stdout, &rpc_protocol::ready()).await;
+    write_line(&stdout, &rpc_protocol::ready(message_updates)).await;
 
     loop {
         let incoming = tokio::select! {
@@ -455,18 +481,32 @@ where
                 cancel_on_exit = true;
                 break;
             }
-            line = lines.next_line() => line,
+            line = crate::rpc::framing::read_frame(&mut input) => line,
         };
         let line = match incoming {
             Ok(Some(line)) => line,
             Ok(None) => break, // EOF
             Err(error) => {
                 eprintln!("[rpi] rpc stdin error: {error}");
+                run_cancel.cancel();
+                let _ = lane.abort().await;
+                external_tools.shutdown();
+                writer_failed.cancel();
                 cancel_on_exit = true;
                 break;
             }
         };
-        let line = line.trim();
+        let line = match std::str::from_utf8(&line) {
+            Ok(line) => line.trim(),
+            Err(_) => {
+                run_cancel.cancel();
+                let _ = lane.abort().await;
+                external_tools.shutdown();
+                writer_failed.cancel();
+                cancel_on_exit = true;
+                break;
+            }
+        };
         if line.is_empty() {
             continue;
         }
@@ -567,6 +607,9 @@ where
             }
             "stop" => {
                 cancel_on_exit = true;
+                run_cancel.cancel();
+                let _ = lane.abort().await;
+                external_tools.shutdown();
                 write_line(
                     &stdout,
                     &rpc_protocol::response(
@@ -597,6 +640,7 @@ where
                     let _ = task.await;
                 }
                 run_cancel = tokio_util::sync::CancellationToken::new();
+                owner.run_cancel = run_cancel.clone();
                 let cancel_task = run_cancel.clone();
                 // Resuming spends the tokens the interrupted run never did, so it
                 // only proceeds when recovery actually left a pending run.
@@ -708,15 +752,32 @@ where
 
         let result = match kind.as_str() {
             "abort" if run_active.load(std::sync::atomic::Ordering::Acquire) => {
-                // This also covers abort arriving before the task enters the lane.
+                // Keep wrapper cancellation for pre-admission aborts, but signal
+                // an admitted harness run before retiring external broker waiters.
                 run_cancel.cancel();
+                let _ = lane.abort().await;
+                external_tools.abort();
                 Ok(serde_json::json!({"aborted": true}))
             }
-            "abort" => lane
-                .abort()
+            "abort" => {
+                let result = lane.abort().await.map_err(|e| e.to_string());
+                external_tools.abort();
+                result.map(|_| serde_json::json!({"aborted": true}))
+            }
+            "configure_external_tools" => {
+                rpc_configure_external_tools(
+                    &lane,
+                    harness,
+                    run_active.load(std::sync::atomic::Ordering::Acquire),
+                    &external_tools,
+                    &mut external_names,
+                    &msg,
+                )
                 .await
-                .map(|_| serde_json::json!({"aborted": true}))
-                .map_err(|e| e.to_string()),
+            }
+            "external_tool_response" => external_tools
+                .respond(&msg)
+                .map(|accepted| serde_json::json!({"accepted": accepted})),
             "get_state" => Ok(rpc_get_state(&lane, harness).await),
             "get_commands" => Ok(rpc_get_commands(oauth_snapshot.as_deref())),
             "get_messages" => rpc_get_messages(&lane, harness, &msg).await,
@@ -752,13 +813,28 @@ where
     ui_dialog.detach();
     if cancel_on_exit {
         run_cancel.cancel();
+        let _ = lane.abort().await;
     }
+    // EOF makes future external replies impossible. Disable the backend before
+    // joining, without cancelling an otherwise healthy model-only run.
+    external_tools.shutdown();
     for task in command_tasks {
         let _ = task.await;
     }
     let mut exit_code = 0;
-    if let Some(task) = run_task {
-        if let Err(error) = task.await {
+    // A broken transport during healthy EOF waiting must still cancel the run.
+    if let Some(mut task) = run_task {
+        let result = tokio::select! {
+            biased;
+            result = &mut task => result,
+            _ = writer_failed.cancelled() => {
+                run_cancel.cancel();
+                let _ = lane.abort().await;
+                external_tools.shutdown();
+                task.await
+            }
+        };
+        if let Err(error) = result {
             eprintln!("[rpi] rpc prompt task failed: {error}");
             exit_code = 1;
         }
@@ -785,7 +861,32 @@ where
             exit_code = 1;
         }
     }
+    owner.armed = false;
     exit_code
+}
+
+// Synchronous cleanup survives cancellation/drop of the RPC owner future.
+// The run is signalled before retiring waiters, preserving aborted settlement.
+struct RpcOwner<'a> {
+    harness: &'a AgentHarness,
+    backend: Arc<crate::rpc::external_tools::ExternalTools>,
+    run_cancel: tokio_util::sync::CancellationToken,
+    pump_stop: tokio_util::sync::CancellationToken,
+    failed: tokio_util::sync::CancellationToken,
+    mailbox: rpi_extensions::UiDialogMailbox,
+    armed: bool,
+}
+impl Drop for RpcOwner<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.run_cancel.cancel();
+            self.backend.shutdown();
+            self.failed.cancel();
+            self.pump_stop.cancel();
+            self.mailbox.detach();
+            self.harness.session().set_entry_commit_publisher(None);
+        }
+    }
 }
 
 fn rpc_get_commands(snapshot: Option<&rpi_extensions::RegistrySnapshot>) -> serde_json::Value {
@@ -1097,30 +1198,20 @@ async fn rpc_get_history(
         .clamp(1, 500) as usize;
     let after_seq = msg.get("afterSeq").and_then(serde_json::Value::as_u64);
     let before_seq = msg.get("beforeSeq").and_then(serde_json::Value::as_u64);
-    let mut records = harness
+    let page = harness
         .session()
-        .find_records(&RecordQuery {
-            lane: Some(lane.name().to_string()),
+        .record_page(&rpi_harness::session::types::RecordPageQuery {
+            lane: lane.name().to_owned(),
             after_seq,
-            order: Some(EntryOrder::OldestFirst),
-            ..Default::default()
+            before_seq,
+            limit,
+            from_end: before_seq.is_some() || after_seq.is_none(),
         })
         .await
         .map_err(|error| error.to_string())?;
-    if let Some(before) = before_seq {
-        records.retain(|record| record.seq() < before);
-    }
-    let total = records.len();
-    let has_more = records.len() > limit;
-    if before_seq.is_some() {
-        if has_more {
-            records = records.split_off(records.len() - limit);
-        }
-    } else if after_seq.is_some() {
-        records.truncate(limit);
-    } else if has_more {
-        records = records.split_off(records.len() - limit);
-    }
+    let records = page.records;
+    let total = page.total;
+    let has_more = total > records.len();
     let first_seq = records.first().map(LaneRecord::seq);
     let last_seq = records.last().map(LaneRecord::seq);
     let open_operations = harness
@@ -1154,7 +1245,7 @@ async fn rpc_get_session_branch(
         args.remove("id");
     }
     let request = branch_entry_query(&args)?;
-    let entries = find_branch_entries(harness, &request).await?;
+    let (entries, session_id, leaf_id) = branch_snapshot(harness, &request).await?;
     let entries = entries
         .iter()
         .map(|entry| serde_json::to_value(entry).map_err(|error| error.to_string()))
@@ -1163,6 +1254,9 @@ async fn rpc_get_session_branch(
         "entries": entries,
         "count": entries.len(),
         "filtered": true,
+        "sessionId": session_id,
+        "leafId": leaf_id,
+        "scopedAppend": true,
     }))
 }
 
@@ -1176,9 +1270,9 @@ pub(crate) struct BranchEntryQuery {
 
 impl BranchEntryQuery {
     fn entry_queries(&self) -> Vec<EntryQuery> {
-        let per_query_limit = (self.custom_types.len() == 1)
-            .then_some(self.limit)
-            .flatten();
+        // A global top-L entry must be within its type's top L under the same
+        // order/cursor. Bound cloned payloads before the global merge as well.
+        let per_query_limit = self.limit;
         self.custom_types
             .iter()
             .map(|custom_type| EntryQuery {
@@ -1187,15 +1281,16 @@ impl BranchEntryQuery {
                 order: Some(self.order),
                 limit: per_query_limit,
                 cursor: self.after_seq.map(|after_seq| EntryCursor { after_seq }),
+                ..Default::default()
             })
             .collect()
     }
 }
 
-pub(crate) async fn find_branch_entries(
+pub(crate) async fn branch_snapshot(
     harness: &AgentHarness,
     request: &BranchEntryQuery,
-) -> Result<Vec<Entry>, String> {
+) -> Result<(Vec<Entry>, String, Option<String>), String> {
     // Pin both the storage binding and branch tip once. Session handles follow
     // harness session switches, and resolving the live leaf per type can merge
     // entries from different branches while a query is in flight.
@@ -1208,8 +1303,9 @@ pub(crate) async fn find_branch_entries(
         .find(|pointer| pointer.lane == "main")
         .ok_or_else(|| "Lane not found: main".to_string())?
         .leaf_id;
-    let Some(start) = leaf_id else {
-        return Ok(Vec::new());
+    let session_id = storage.metadata().id;
+    let Some(start) = leaf_id.clone() else {
+        return Ok((Vec::new(), session_id, None));
     };
     let bounds = BranchBounds {
         start: Some(start.clone()),
@@ -1235,10 +1331,10 @@ pub(crate) async fn find_branch_entries(
             entries.truncate(limit);
         }
     }
-    Ok(entries)
+    Ok((entries, session_id, leaf_id))
 }
 
-/// Preview-only custom-entry query. Reject unknown/legacy arguments even when
+/// Canonical custom-entry query. Reject unknown/legacy arguments even when
 /// valid modern arguments are also present; never fall back to a full scan.
 pub(crate) fn branch_entry_query(msg: &serde_json::Value) -> Result<BranchEntryQuery, String> {
     let args = msg
@@ -1262,8 +1358,7 @@ pub(crate) fn branch_entry_query(msg: &serde_json::Value) -> Result<BranchEntryQ
     for value in values {
         let custom_type = value
             .as_str()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
+            .filter(|value| !value.trim().is_empty())
             .ok_or("get_session_branch: every `customTypes` item must be a non-empty string")?;
         if !custom_types.iter().any(|existing| existing == custom_type) {
             custom_types.push(custom_type.to_owned());
@@ -1312,12 +1407,29 @@ async fn rpc_append_entry(
         .and_then(serde_json::Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| "append_entry requires a non-empty string `customType`".to_string())?;
-    let entry_id = harness
-        .session()
-        .append_custom_entry(custom_type, msg.get("data").cloned())
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(serde_json::json!({"entryId": entry_id, "customType": custom_type}))
+    let entry_id = if let Some(expected) = msg.get("expected") {
+        let guard = serde_json::from_value(expected.clone())
+            .map_err(|error| format!("invalid expected guard: {error}"))?;
+        harness
+            .append_scoped_entry(
+                &guard,
+                rpi_harness::agent_harness::ScopedEntry::Custom {
+                    custom_type: custom_type.to_owned(),
+                    data: msg.get("data").cloned(),
+                },
+            )
+            .await
+    } else {
+        harness
+            .append_custom_entry(custom_type, msg.get("data").cloned())
+            .await
+    }
+    .map_err(|error| error.to_string())?;
+    let mut response = serde_json::json!({"entryId": entry_id, "customType": custom_type});
+    if msg.get("expected").is_some() {
+        response["scoped"] = serde_json::json!(true);
+    }
+    Ok(response)
 }
 
 async fn rpc_get_stats(
@@ -1885,6 +1997,75 @@ async fn rpc_get_available_thinking_levels(lane: &Arc<dyn AgentLane>) -> serde_j
     serde_json::json!({"levels": levels})
 }
 
+async fn rpc_configure_external_tools(
+    lane: &Arc<dyn AgentLane>,
+    harness: &AgentHarness,
+    run_active: bool,
+    backend: &Arc<crate::rpc::external_tools::ExternalTools>,
+    old_names: &mut Vec<String>,
+    msg: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    use rpi_harness::types::HarnessTool;
+    use rpi_tools::tools::external::{
+        create_external_tool, validate_external_tool_definitions, ExternalToolDefinition,
+    };
+    if run_active
+        || lane
+            .snapshot()
+            .await
+            .map_err(|e| e.to_string())?
+            .active
+            .is_some()
+    {
+        return Err("cannot configure external tools while a run is active".into());
+    }
+    let definitions: Vec<ExternalToolDefinition> =
+        serde_json::from_value(msg["tools"].clone()).map_err(|e| e.to_string())?;
+    let mut registry = harness.get_tools().await.map_err(|e| e.to_string())?;
+    registry.retain(|tool| !old_names.contains(&tool.tool.schema().name));
+    // Reserve security/native names even when unavailable or disabled at launch.
+    let mut reserved = [
+        "read",
+        "write",
+        "edit",
+        "bash",
+        "powershell",
+        "docs",
+        "grep",
+        "find",
+        "ls",
+        "image",
+        "permissions",
+        "permission",
+        "ask_user",
+        "plan_mode_start",
+        "plan_mode_complete",
+    ]
+    .iter()
+    .map(|name| name.to_string())
+    .collect::<Vec<_>>();
+    reserved.extend(registry.iter().map(|tool| tool.tool.schema().name.clone()));
+    validate_external_tool_definitions(&definitions, &reserved).map_err(|e| e.to_string())?;
+    let names = definitions
+        .iter()
+        .map(|def| def.name.clone())
+        .collect::<Vec<_>>();
+    let mut active = lane.get_active_tools().await.map_err(|e| e.to_string())?;
+    active.retain(|name| !old_names.contains(name));
+    active.extend(names.clone());
+    registry.extend(
+        definitions
+            .into_iter()
+            .map(|def| HarnessTool::new(create_external_tool(def, backend.clone()))),
+    );
+    harness
+        .set_tools(registry, Some(active.clone()))
+        .await
+        .map_err(|e| e.to_string())?;
+    *old_names = names.clone();
+    Ok(serde_json::json!({"tools": names, "activeTools": active}))
+}
+
 async fn rpc_get_available_tools(
     lane: &Arc<dyn AgentLane>,
     harness: &AgentHarness,
@@ -2059,7 +2240,11 @@ pub async fn interactive(
         )
         .await
     } else {
-        // Fall back to simple REPL
+        // Fall back to simple REPL. No transcript container to hold notes, so
+        // the startup notices print as plain lines instead.
+        for notice in &reload_context.startup_notices {
+            eprintln!("note: {notice}");
+        }
         interactive_repl(harness, args, initial, extra_messages, initial_images).await
     };
 
@@ -2191,6 +2376,19 @@ async fn run_one(
     }
 }
 
+/// The print-mode (headless) message for a refused session write.
+///
+/// Print mode has no transcript to fall back on and no interactive `/export`
+/// either — the process is about to exit. Naming a recovery the user cannot run
+/// from here would be worse than saying what was lost, so this deliberately does
+/// not recommend exporting (unlike the TUI, where `/export` does work).
+fn session_storage_notice(message: &str) -> String {
+    format!(
+        "conversation not saved: {message} — the session log is missing this turn \
+         and print mode exits without writing it"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2201,8 +2399,12 @@ mod tests {
     };
     use rpi_harness::session::types::OperationError;
 
+    include!("rpc/external_tools_configuration_tests.rs");
+    include!("rpc/external_tools_lifecycle_tests.rs");
+    include!("rpc/external_tools_abort_outcome_tests.rs");
+
     #[test]
-    fn session_branch_query_requires_modern_preview_arguments() {
+    fn session_branch_query_requires_canonical_arguments() {
         let query = branch_entry_query(&serde_json::json!({
             "customTypes": ["alpha", "beta", "alpha"], "afterSeq": 42,
         }))
@@ -2218,6 +2420,7 @@ mod tests {
             serde_json::json!({"customTypes": []}),
             serde_json::json!({"customTypes": "alpha"}),
             serde_json::json!({"customTypes": [""]}),
+            serde_json::json!({"customTypes": [" \t "]}),
             serde_json::json!({"customTypes": ["alpha", 1]}),
             serde_json::json!({"customTypes": ["alpha"], "limit": 0}),
             serde_json::json!({"customTypes": ["alpha"], "limit": 1.5}),
@@ -2229,8 +2432,149 @@ mod tests {
         }
     }
 
+    #[test]
+    fn session_branch_multi_type_limit_is_pushed_to_each_storage_query() {
+        for order in ["oldestFirst", "newestFirst"] {
+            let request = branch_entry_query(&serde_json::json!({
+                "customTypes": ["alpha", "beta", "alpha"],
+                "limit": 2, "order": order, "afterSeq": 42,
+            }))
+            .unwrap();
+            let queries = request.entry_queries();
+            assert_eq!(queries.len(), 2);
+            for query in queries {
+                assert_eq!(query.limit, Some(2));
+                assert_eq!(query.order, Some(request.order));
+                assert_eq!(query.cursor, Some(EntryCursor { after_seq: 42 }));
+            }
+        }
+    }
+
     #[tokio::test]
-    async fn session_branch_preview_filters_merges_and_respects_fork_bounds() {
+    async fn branch_snapshot_guards_and_outbox_acknowledgements_cross_the_runtime_action_boundary()
+    {
+        use rpi_extensions::RuntimeActionHost;
+        let harness = AgentHarness::create(Default::default()).await.unwrap();
+        let (host, cell) = crate::extensions_actions::HarnessActionHost::new_empty(
+            vec![],
+            std::env::temp_dir(),
+            tokio::runtime::Handle::current(),
+            Default::default(),
+            rpi_extensions::ToolCallContext::default(),
+        );
+        crate::extensions_actions::HarnessActionHost::set_harness(&cell, Arc::new(harness.clone()));
+        let snapshot = host
+            .get_session_branch(
+                serde_json::json!({"customTypes":["goal-state"],"limit":1,"order":"newestFirst"}),
+            )
+            .await
+            .unwrap();
+        let expected = serde_json::json!({"sessionId":snapshot["sessionId"],"leafId":snapshot["leafId"],"customType":"goal-state","entryId":null});
+        let mutation =
+            serde_json::json!({"customType":"goal-state","data":{"goal":"A"},"expected":expected});
+        let ack = host.append_entry(mutation.clone()).await.unwrap();
+        assert_eq!(ack["scoped"], true);
+        assert!(host.append_entry(mutation.clone()).await.is_err());
+        assert!(rpc_append_entry(&harness, &mutation).await.is_err());
+        for _ in 0..2 {
+            let snapshot = host.get_session_branch(serde_json::json!({"customTypes":["goal-state"],"limit":1,"order":"newestFirst"})).await.unwrap();
+            let expected = serde_json::json!({"sessionId":snapshot["sessionId"],"leafId":snapshot["leafId"],"customType":"goal-state","entryId":ack["entryId"]});
+            let notice = host.append_entry(serde_json::json!({"expected":expected,"outboxKey":"r1","message":{
+                "kind":"custom","role":"custom","content":[{"type":"text","text":"Goal A"}],"data":{"customType":"goal"},"timestamp":1
+            }})).await.unwrap();
+            assert_eq!(notice["scoped"], true);
+        }
+        let entries = harness
+            .session()
+            .find_entries(&EntryQuery {
+                outbox_key: Some("r1".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        let snapshot = host
+            .get_session_branch(serde_json::json!({"customTypes":["goal-state"],"limit":1}))
+            .await
+            .unwrap();
+        let expected = serde_json::json!({"sessionId":snapshot["sessionId"],"leafId":snapshot["leafId"],"customType":"goal-state","entryId":ack["entryId"]});
+        let rpc_ack = rpc_append_entry(
+            &harness,
+            &serde_json::json!({"customType":"goal-state","data":{"goal":"B"},"expected":expected}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rpc_ack["scoped"], true);
+        assert!(rpc_ack["entryId"].as_str().is_some_and(|id| !id.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn session_branch_exact_type_identities_round_trip_rpc_and_actions() {
+        use rpi_extensions::RuntimeActionHost;
+        let harness = AgentHarness::create(Default::default()).await.unwrap();
+        let (host, cell) = crate::extensions_actions::HarnessActionHost::new_empty(
+            vec![],
+            std::env::temp_dir(),
+            tokio::runtime::Handle::current(),
+            Default::default(),
+            rpi_extensions::ToolCallContext::default(),
+        );
+        crate::extensions_actions::HarnessActionHost::set_harness(&cell, Arc::new(harness.clone()));
+        let names = ["alpha", " alpha ", "beta", " beta "];
+        for (index, name) in names.iter().enumerate() {
+            let args = serde_json::json!({"customType": name, "data": {"n": index}});
+            if index % 2 == 0 {
+                host.append_entry(args).await.unwrap();
+            } else {
+                rpc_append_entry(&harness, &args).await.unwrap();
+            }
+        }
+        let request = branch_entry_query(&serde_json::json!({
+            "customTypes": ["alpha", " alpha ", "beta", " beta ", "alpha"],
+        }))
+        .unwrap();
+        assert_eq!(request.custom_types, names);
+        let mut input = String::new();
+        let mut expected = Vec::new();
+        for (index, name) in names.iter().enumerate() {
+            let args = serde_json::json!({"customTypes": [name]});
+            let result = host.get_session_branch(args.clone()).await.unwrap();
+            assert_eq!(result["count"], 1);
+            assert_eq!(result["entries"][0]["customType"], *name);
+            assert_eq!(result["entries"][0]["data"]["n"], index);
+            let mut envelope = args;
+            envelope["type"] = serde_json::json!("get_session_branch");
+            envelope["id"] = serde_json::json!(index);
+            input.push_str(&format!("{envelope}\n"));
+            expected.push(result);
+        }
+        let output = RpcOutput::default();
+        assert_eq!(
+            rpc_with_io(
+                &harness,
+                None,
+                vec![],
+                rpi_extensions::UiDialogMailbox::new(),
+                None,
+                crate::args::RpcMessageUpdates::default(),
+                tokio::io::BufReader::new(input.as_bytes()),
+                output.clone(),
+            )
+            .await,
+            0
+        );
+        let messages = output.messages();
+        for (index, expected) in expected.into_iter().enumerate() {
+            let response = messages
+                .iter()
+                .find(|message| message["id"] == index)
+                .unwrap();
+            assert_eq!(response["data"], expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn session_branch_filters_merge_and_respect_fork_bounds() {
         use rpi_harness::session::types::{ForkOptions, ForkPosition, SessionRepo};
         use rpi_harness::session::{CounterIdGenerator, FakeClock, InMemorySessionRepo, Session};
         let repo = InMemorySessionRepo::new(
@@ -2447,6 +2791,7 @@ mod tests {
                 vec![],
                 rpi_extensions::UiDialogMailbox::new(),
                 None,
+                crate::args::RpcMessageUpdates::default(),
                 tokio::io::BufReader::new(input.as_bytes()),
                 output.clone(),
             )
@@ -2499,6 +2844,7 @@ mod tests {
                 vec![],
                 rpi_extensions::UiDialogMailbox::new(),
                 Some(Arc::new(registry.snapshot())),
+                crate::args::RpcMessageUpdates::default(),
                 tokio::io::BufReader::new(input.as_bytes()),
                 output.clone()
             )
@@ -2659,6 +3005,7 @@ mod tests {
                 vec![],
                 ui,
                 None,
+                crate::args::RpcMessageUpdates::default(),
                 tokio::io::BufReader::new(input),
                 captured,
             )
@@ -2774,6 +3121,7 @@ mod tests {
             vec![],
             rpi_extensions::UiDialogMailbox::new(),
             None,
+            crate::args::RpcMessageUpdates::default(),
             tokio::io::BufReader::new(input.as_bytes()),
             output.clone(),
         )
@@ -2803,6 +3151,7 @@ mod tests {
             vec![],
             rpi_extensions::UiDialogMailbox::new(),
             None,
+            crate::args::RpcMessageUpdates::default(),
             tokio::io::BufReader::new(&input[..]),
             output.clone(),
         )
@@ -2833,6 +3182,7 @@ mod tests {
             vec![],
             rpi_extensions::UiDialogMailbox::new(),
             None,
+            crate::args::RpcMessageUpdates::default(),
             tokio::io::BufReader::new(&b"{\"type\":\"compact\",\"id\":1}\n"[..]),
             output.clone(),
         )
@@ -2872,6 +3222,7 @@ mod tests {
             vec![],
             rpi_extensions::UiDialogMailbox::new(),
             None,
+            crate::args::RpcMessageUpdates::default(),
             tokio::io::BufReader::new(&b""[..]),
             output.clone(),
         )
@@ -2884,6 +3235,215 @@ mod tests {
             "ready plus every queued event must be flushed"
         );
         assert_eq!(messages.last().unwrap()["type"], "agent_end");
+    }
+
+    fn assert_rpc_update_mode(
+        messages: &[serde_json::Value],
+        mode: crate::args::RpcMessageUpdates,
+    ) {
+        let updates: Vec<_> = messages
+            .iter()
+            .filter(|m| {
+                matches!(
+                    m["eventType"].as_str(),
+                    Some("text_delta" | "thinking_delta" | "toolcall_delta")
+                )
+            })
+            .collect();
+        assert!(
+            !updates.is_empty(),
+            "expected streaming deltas: {messages:?}"
+        );
+        for update in updates {
+            let snapshot = mode == crate::args::RpcMessageUpdates::Snapshot;
+            assert_eq!(update.get("message").is_some(), snapshot, "{update}");
+            assert_eq!(
+                update["assistantMessageEvent"].get("partial").is_some(),
+                snapshot,
+                "{update}"
+            );
+            assert_eq!(update["eventType"], update["assistantMessageEvent"]["type"]);
+            assert_eq!(
+                update["contentIndex"],
+                update["assistantMessageEvent"]["contentIndex"]
+            );
+            assert_eq!(update["delta"], update["assistantMessageEvent"]["delta"]);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rpc_selected_updates_survive_prompt_eof_and_stop() {
+        use tokio::io::AsyncWriteExt;
+        for mode in [
+            crate::args::RpcMessageUpdates::CompactDeltas,
+            crate::args::RpcMessageUpdates::Snapshot,
+        ] {
+            for stop in [false, true] {
+                let (harness, _) =
+                    rpc_test_harness("one two three four five six seven eight", 100.0).await;
+                let (emitter, events) = rpi_agent::events::BroadcastEmitter::new(256);
+                harness
+                    .set_agent_emitter(Some(Arc::new(emitter)))
+                    .await
+                    .unwrap();
+                let (mut client, input) = tokio::io::duplex(4096);
+                let output = RpcOutput::default();
+                let captured = output.clone();
+                let task = tokio::spawn(async move {
+                    rpc_with_io(
+                        &harness,
+                        Some(events),
+                        vec![],
+                        rpi_extensions::UiDialogMailbox::new(),
+                        None,
+                        mode,
+                        tokio::io::BufReader::new(input),
+                        captured,
+                    )
+                    .await
+                });
+                let ready = output.wait_for(|m| m["type"] == "ready").await;
+                assert_eq!(ready["semantics"]["messageUpdates"], mode.as_str());
+                client
+                    .write_all(b"{\"type\":\"prompt\",\"id\":1,\"message\":\"test\"}\n")
+                    .await
+                    .unwrap();
+                if stop {
+                    output.wait_for(|m| m["eventType"] == "text_delta").await;
+                    client
+                        .write_all(b"{\"type\":\"stop\",\"id\":2}\n")
+                        .await
+                        .unwrap();
+                } else {
+                    client.shutdown().await.unwrap();
+                }
+                assert_eq!(
+                    tokio::time::timeout(std::time::Duration::from_secs(3), task)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    0
+                );
+                let messages = output.messages();
+                assert_rpc_update_mode(&messages, mode);
+                assert!(messages.iter().any(|m| m["type"] == "message_end"));
+                assert!(messages.iter().any(|m| m["type"] == "agent_end"));
+                assert!(messages.iter().any(|m| m["type"] == "agent_settled"));
+                if !stop {
+                    assert!(messages
+                        .iter()
+                        .any(|m| m["type"] == "agent_settled" && m["outcome"] == "completed"));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rpc_normal_and_explicit_drain_use_the_same_immutable_writer_mode() {
+        for mode in [
+            crate::args::RpcMessageUpdates::CompactDeltas,
+            crate::args::RpcMessageUpdates::Snapshot,
+        ] {
+            let output = RpcOutput::default();
+            let (writer, task, _) = start_rpc_writer(output.clone(), mode);
+            let cloned_writer = writer.clone();
+            let mut message = rpi_ai::AssistantMessage::empty(rpi_ai::Api::Faux, "faux", "m", 42);
+            message.content = vec![rpi_ai::Content::text("snapshot")];
+            let message = Arc::new(message);
+            let (tx, mut rx) = tokio::sync::broadcast::channel(16);
+            for kind in 0..3 {
+                let assistant_message_event = match kind {
+                    0 => rpi_ai::AssistantMessageEvent::TextDelta {
+                        content_index: 0,
+                        delta: "text".into(),
+                        partial: message.clone(),
+                    },
+                    1 => rpi_ai::AssistantMessageEvent::ThinkingDelta {
+                        content_index: 1,
+                        delta: "thought".into(),
+                        partial: message.clone(),
+                    },
+                    _ => rpi_ai::AssistantMessageEvent::ToolCallDelta {
+                        content_index: 2,
+                        delta: "{}".into(),
+                        partial: message.clone(),
+                    },
+                };
+                let event = AgentEvent::MessageUpdate {
+                    message: message.clone(),
+                    assistant_message_event,
+                };
+                write_agent_event(&writer, &event).await;
+                tx.send(event).unwrap();
+            }
+            drain_rpc_events(&cloned_writer, &mut rx).await;
+            drop(cloned_writer);
+            drop(writer);
+            task.await.unwrap().unwrap();
+            let messages = output.messages();
+            assert_eq!(messages.len(), 6);
+            assert_eq!(messages[..3], messages[3..]);
+            assert_rpc_update_mode(&messages, mode);
+        }
+    }
+
+    #[tokio::test]
+    async fn rpc_queued_deltas_are_flushed_on_eof_and_stop_in_selected_mode() {
+        for mode in [
+            crate::args::RpcMessageUpdates::CompactDeltas,
+            crate::args::RpcMessageUpdates::Snapshot,
+        ] {
+            for input in ["", "{\"type\":\"stop\",\"id\":1}\n"] {
+                let harness = AgentHarness::create(Default::default()).await.unwrap();
+                let (tx, rx) = tokio::sync::broadcast::channel(256);
+                let mut message =
+                    rpi_ai::AssistantMessage::empty(rpi_ai::Api::Faux, "faux", "m", 42);
+                message.content = vec![rpi_ai::Content::text("snapshot")];
+                let message = Arc::new(message);
+                for _ in 0..100 {
+                    tx.send(AgentEvent::MessageUpdate {
+                        message: message.clone(),
+                        assistant_message_event: rpi_ai::AssistantMessageEvent::TextDelta {
+                            content_index: 0,
+                            delta: "x".into(),
+                            partial: message.clone(),
+                        },
+                    })
+                    .unwrap();
+                }
+                tx.send(AgentEvent::AgentEnd { messages: vec![] }).unwrap();
+                let output = RpcOutput::default();
+                assert_eq!(
+                    rpc_with_io(
+                        &harness,
+                        Some(rx),
+                        vec![],
+                        rpi_extensions::UiDialogMailbox::new(),
+                        None,
+                        mode,
+                        tokio::io::BufReader::new(input.as_bytes()),
+                        output.clone()
+                    )
+                    .await,
+                    0
+                );
+                let messages = output.messages();
+                assert_eq!(
+                    messages
+                        .iter()
+                        .filter(|m| m["eventType"] == "text_delta")
+                        .count(),
+                    100
+                );
+                assert_eq!(
+                    messages.iter().find(|m| m["type"] == "ready").unwrap()["semantics"]
+                        ["messageUpdates"],
+                    mode.as_str()
+                );
+                assert_rpc_update_mode(&messages, mode);
+                assert!(messages.iter().any(|m| m["type"] == "agent_end"));
+            }
+        }
     }
 
     struct BackpressuredOutput {
@@ -2919,11 +3479,14 @@ mod tests {
         let _release = ReleaseOnDrop(release.clone());
         let entered = Arc::new(AtomicBool::new(false));
         let output = RpcOutput::default();
-        let (writer, task, _) = start_rpc_writer(BackpressuredOutput {
-            entered: entered.clone(),
-            release: release.clone(),
-            output: output.clone(),
-        });
+        let (writer, task, _) = start_rpc_writer(
+            BackpressuredOutput {
+                entered: entered.clone(),
+                release: release.clone(),
+                output: output.clone(),
+            },
+            crate::args::RpcMessageUpdates::default(),
+        );
         write_line(&writer, &serde_json::json!({"id": 0})).await;
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while !entered.load(Ordering::SeqCst) {
@@ -2981,6 +3544,7 @@ mod tests {
             vec![],
             rpi_extensions::UiDialogMailbox::new(),
             None,
+            crate::args::RpcMessageUpdates::default(),
             tokio::io::BufReader::new(
                 &b"{\"type\":\"prompt\",\"id\":1,\"message\":\"test\"}\n"[..],
             ),
@@ -3046,6 +3610,7 @@ mod tests {
                 vec![],
                 ui.clone(),
                 None,
+                crate::args::RpcMessageUpdates::default(),
                 tokio::io::BufReader::new(input),
                 BrokenOutput,
             ),
@@ -3336,5 +3901,27 @@ mod page_window_tests {
     fn limit_larger_than_the_branch_never_underflows() {
         assert_eq!(page_window(5, 100, Some(2)), (0..2, false));
         assert_eq!(page_window(5, 100, None), (0..5, false));
+    }
+}
+
+#[cfg(test)]
+mod session_storage_notice_tests {
+    use super::session_storage_notice;
+
+    /// Print mode cannot recover a refused write by exporting: it is about to
+    /// exit and offers no interactive `/export`. The message must say what was
+    /// lost instead of naming a recovery the user cannot run from here.
+    #[test]
+    fn the_headless_notice_does_not_promise_an_unavailable_recourse() {
+        let notice = session_storage_notice("disk full");
+        assert!(notice.contains("disk full"), "{notice}");
+        assert!(
+            !notice.contains("/export"),
+            "print mode has no interactive /export: {notice}"
+        );
+        assert!(
+            notice.contains("print mode exits"),
+            "the notice must say the turn is not coming back: {notice}"
+        );
     }
 }

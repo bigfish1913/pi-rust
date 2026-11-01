@@ -4,6 +4,7 @@
 
 use std::any::Any;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 
@@ -142,6 +143,84 @@ fn snap_boundary(s: &str, idx: usize) -> usize {
 #[derive(Debug, Clone)]
 struct PasteEntry {
     content: String,
+}
+
+/// An exclusive continuation token for one incrementally delivered paste.
+///
+/// The caller must establish that subsequent chunks belong to the same paste.
+/// Any intervening edit, key event, or explicit cursor placement invalidates
+/// the token; it is deliberately neither cloneable nor part of undo history.
+#[derive(Debug)]
+pub struct PasteSession {
+    owner: Arc<AtomicU64>,
+    revision: u64,
+    start: (usize, usize),
+    end: (usize, usize),
+    display: String,
+    raw: String,
+    paste_id: Option<u32>,
+    undo_started: bool,
+}
+
+/// Apply exactly the same normalization to ordinary and incremental pastes.
+/// Incremental callers normalize the accumulated raw text, so even CRLF and
+/// CSI-u sequences split across chunks are handled as a single payload.
+fn normalize_paste(text: &str) -> String {
+    decode_csi_u_ctrl(text)
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace('\t', "    ")
+        .chars()
+        .filter(|c| *c == '\n' || (*c as u32) >= 32)
+        .collect()
+}
+
+/// Replace only the specified byte-boundary span, retaining both surrounding
+/// fragments and all other lines. Returns the end of the replacement.
+fn replace_paste_range(
+    state: &mut EditorState,
+    start: (usize, usize),
+    end: (usize, usize),
+    text: &str,
+) -> (usize, usize) {
+    let (sr, sc) = start;
+    let (er, ec) = end;
+    let prefix = state.lines[sr][..sc].to_string();
+    let suffix = state.lines[er][ec..].to_string();
+    let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+    let row = sr + lines.len() - 1;
+    let col = lines.last().unwrap().len() + if row == sr { sc } else { 0 };
+    lines[0].insert_str(0, &prefix);
+    lines.last_mut().unwrap().push_str(&suffix);
+    state.lines.splice(sr..=er, lines);
+    state.cursor_row = row;
+    state.cursor_col = col;
+    state.selection_anchor = None;
+    (row, col)
+}
+
+/// Read just the owned span, checking bounds and UTF-8 boundaries first.
+fn paste_range_text(
+    state: &EditorState,
+    start: (usize, usize),
+    end: (usize, usize),
+) -> Option<String> {
+    let (sr, sc) = start;
+    let (er, ec) = end;
+    if start > end {
+        return None;
+    }
+    if sr == er {
+        return Some(state.lines.get(sr)?.get(sc..ec)?.to_string());
+    }
+    let mut text = state.lines.get(sr)?.get(sc..)?.to_string();
+    for row in sr + 1..er {
+        text.push('\n');
+        text.push_str(state.lines.get(row)?);
+    }
+    text.push('\n');
+    text.push_str(state.lines.get(er)?.get(..ec)?);
+    Some(text)
 }
 
 /// Matches a whole `[paste #id …]` marker (group 1 = id).
@@ -303,6 +382,9 @@ pub struct Editor {
     pastes: Mutex<HashMap<u32, PasteEntry>>,
     /// Monotonic id source for [`Self::pastes`] (upstream's `pasteCounter`).
     paste_counter: Mutex<u32>,
+    /// Unique owner identity and monotonic invalidation revision. Never restored
+    /// from an undo snapshot, so undo/redo cannot revive an old paste token.
+    paste_revision: Arc<AtomicU64>,
 }
 
 /// State for the working indicator embedded in the editor's top border.
@@ -355,6 +437,7 @@ impl Editor {
             working: Mutex::new(None),
             pastes: Mutex::new(HashMap::new()),
             paste_counter: Mutex::new(0),
+            paste_revision: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -479,18 +562,7 @@ impl Editor {
     /// A single-line pasted file path is special-cased by the caller (image
     /// attachment), so this only handles text.
     pub fn handle_paste(&self, text: &str) {
-        // Decode the CSI-u `Ctrl+<letter>` form a client may hand us, and
-        // normalize line endings + tabs (upstream's `normalizeText`).
-        let decoded = decode_csi_u_ctrl(text)
-            .replace("\r\n", "\n")
-            .replace('\r', "\n")
-            .replace('\t', "    ");
-        // Drop control characters, keeping newlines (upstream filters
-        // `char === "\n" || char.charCodeAt(0) >= 32`).
-        let filtered: String = decoded
-            .chars()
-            .filter(|c| *c == '\n' || (*c as u32) >= 32)
-            .collect();
+        let filtered = normalize_paste(text);
         if filtered.is_empty() {
             return;
         }
@@ -524,6 +596,168 @@ impl Editor {
             *self.last_action.lock().unwrap() = Some("insert");
         } else {
             self.insert(&filtered);
+        }
+    }
+
+    /// Insert the first chunk of a controlled paste immediately.
+    ///
+    /// This paste has its own undo boundary, separate from preceding/following
+    /// typing. Keep the returned token only while the input source can prove
+    /// further chunks belong to this same paste.
+    pub fn start_paste_session(&self, text: &str) -> PasteSession {
+        self.paste_revision.fetch_add(1, Ordering::SeqCst);
+        let normalized = normalize_paste(text);
+        let mut session = PasteSession {
+            owner: Arc::clone(&self.paste_revision),
+            revision: self.paste_revision.load(Ordering::SeqCst),
+            start: self.cursor_position(),
+            end: self.cursor_position(),
+            display: String::new(),
+            raw: text.to_string(),
+            paste_id: None,
+            undo_started: !normalized.is_empty(),
+        };
+        if session.undo_started {
+            self.push_undo("paste");
+            let mut state = self.state.lock().unwrap();
+            let cursor = (state.cursor_row, state.cursor_col);
+            let (start, end) = match state.selection_anchor {
+                Some(anchor) => (anchor.min(cursor), anchor.max(cursor)),
+                None => (cursor, cursor),
+            };
+            session.start = start;
+            let display = self.paste_session_display(&mut session, &normalized);
+            session.end = replace_paste_range(&mut state, start, end, &display);
+            session.display = display;
+            drop(state);
+        }
+        *self.last_action.lock().unwrap() = Some("paste");
+        if session.undo_started {
+            // Capture the revision BEFORE calling observers. An observer that
+            // edits/moves the editor must invalidate this token too.
+            session.revision = self.paste_revision.load(Ordering::SeqCst).wrapping_add(1);
+            self.notify_change();
+        }
+        session
+    }
+
+    /// Append a chunk known by the caller to belong to `session`'s paste.
+    ///
+    /// Returns `false` without changing the document, paste store, undo history,
+    /// or token if any intervening action invalidated it. In that case the
+    /// caller should insert the chunk as an independent paste instead.
+    pub fn append_paste_session(&self, session: &mut PasteSession, text: &str) -> bool {
+        self.append_paste_session_inner(session, text, true)
+    }
+
+    /// Display a not-yet-corroborated continuation without folding it.
+    ///
+    /// Retains ownership for later confirmation, but never hides these bytes
+    /// inside an existing folded paste or updates its stored content. Dropping
+    /// the token leaves all received text visible and intact.
+    pub fn append_paste_session_unfolded(&self, session: &mut PasteSession, text: &str) -> bool {
+        self.append_paste_session_inner(session, text, false)
+    }
+
+    fn append_paste_session_inner(
+        &self,
+        session: &mut PasteSession,
+        text: &str,
+        fold: bool,
+    ) -> bool {
+        if !Arc::ptr_eq(&session.owner, &self.paste_revision)
+            || session.revision != self.paste_revision.load(Ordering::SeqCst)
+        {
+            return false;
+        }
+        let mut raw = session.raw.clone();
+        raw.push_str(text);
+        let normalized = normalize_paste(&raw);
+        // Validate immediately before writing, and hold the state lock through
+        // the bounded replacement rather than releasing it after validation.
+        let mut state = self.state.lock().unwrap();
+        if session.revision != self.paste_revision.load(Ordering::SeqCst)
+            || state.selection_anchor.is_some()
+            || (state.cursor_row, state.cursor_col) != session.end
+            || paste_range_text(&state, session.start, session.end).as_deref()
+                != Some(session.display.as_str())
+        {
+            return false;
+        }
+        // A provisional suffix stays outside the stored marker until the
+        // caller confirms it. Never rewrite an already-folded prefix merely
+        // because normalization of an unverified suffix would change it.
+        let provisional = if fold {
+            None
+        } else if let Some(id) = session.paste_id {
+            let pastes = self.pastes.lock().unwrap();
+            let Some(entry) = pastes.get(&id) else {
+                return false;
+            };
+            let Some(suffix) = normalized.strip_prefix(&entry.content) else {
+                return false;
+            };
+            let Some(marker) = paste_marker_regex()
+                .find(&session.display)
+                .filter(|m| m.start() == 0)
+            else {
+                return false;
+            };
+            Some(format!("{}{suffix}", marker.as_str()))
+        } else {
+            Some(normalized.clone())
+        };
+        // Empty/control-only first chunks must not consume a selection or
+        // introduce an undo entry. Defer that entry until something is inserted.
+        if !session.undo_started && normalized.is_empty() {
+            session.raw = raw;
+            return true;
+        }
+        if !session.undo_started {
+            let snapshot = self.snapshot_locked_state(&state);
+            self.undo_stack.lock().unwrap().push(snapshot);
+            self.redo_stack.lock().unwrap().clear();
+            session.undo_started = true;
+        }
+        let display =
+            provisional.unwrap_or_else(|| self.paste_session_display(session, &normalized));
+        session.end = replace_paste_range(&mut state, session.start, session.end, &display);
+        session.display = display;
+        session.raw = raw;
+        drop(state);
+        *self.last_action.lock().unwrap() = Some("paste");
+        session.revision = self.paste_revision.load(Ordering::SeqCst).wrapping_add(1);
+        self.notify_change();
+        true
+    }
+
+    /// Produce the owned display and update only this session's store entry.
+    /// Once folded, keep the same id even if normalization of a split escape
+    /// sequence changes the size of the accumulated payload.
+    fn paste_session_display(&self, session: &mut PasteSession, normalized: &str) -> String {
+        let lines = normalized.split('\n').count();
+        let chars = normalized.chars().count();
+        if session.paste_id.is_none()
+            && lines <= PASTE_FOLD_LINE_THRESHOLD
+            && chars <= PASTE_FOLD_CHAR_THRESHOLD
+        {
+            return normalized.to_string();
+        }
+        let id = *session.paste_id.get_or_insert_with(|| {
+            let mut counter = self.paste_counter.lock().unwrap();
+            *counter += 1;
+            *counter
+        });
+        self.pastes.lock().unwrap().insert(
+            id,
+            PasteEntry {
+                content: normalized.to_string(),
+            },
+        );
+        if lines > PASTE_FOLD_LINE_THRESHOLD {
+            format!("[paste #{id} +{lines} lines]")
+        } else {
+            format!("[paste #{id} {chars} chars]")
         }
     }
 
@@ -574,6 +808,7 @@ impl Editor {
     /// the nearest preceding char boundary so multibyte input never lands
     /// mid-character.
     pub fn set_cursor(&self, row: usize, col: usize) {
+        self.paste_revision.fetch_add(1, Ordering::SeqCst);
         if let Ok(mut state) = self.state.lock() {
             let row = row.min(state.lines.len().saturating_sub(1));
             let col = snap_boundary(&state.lines[row], col);
@@ -595,6 +830,11 @@ impl Editor {
     /// folded-paste store so undo can bring a dropped paste back.
     fn snapshot_state(&self) -> EditorSnapshot {
         let state = self.state.lock().unwrap();
+        self.snapshot_locked_state(&state)
+    }
+
+    /// Snapshot while the caller already holds the document lock.
+    fn snapshot_locked_state(&self, state: &EditorState) -> EditorSnapshot {
         EditorSnapshot {
             lines: state.lines.clone(),
             cursor_row: state.cursor_row,
@@ -644,6 +884,7 @@ impl Editor {
     /// Undo the last mutation (Ctrl+-). Restores the prior snapshot; the
     /// undone state moves to the redo stack for Ctrl+R.
     pub fn undo(&self) {
+        self.paste_revision.fetch_add(1, Ordering::SeqCst);
         let popped = self.undo_stack.lock().unwrap().pop();
         let Some(snap) = popped else { return };
         // The current state is the redo target.
@@ -654,6 +895,7 @@ impl Editor {
 
     /// Redo the last undone mutation (Ctrl+R).
     pub fn redo(&self) {
+        self.paste_revision.fetch_add(1, Ordering::SeqCst);
         let popped = self.redo_stack.lock().unwrap().pop();
         let Some(snap) = popped else { return };
         self.undo_stack.lock().unwrap().push(self.snapshot_state());
@@ -1240,6 +1482,7 @@ impl Editor {
 
     /// Notify change callback.
     fn notify_change(&self) {
+        self.paste_revision.fetch_add(1, Ordering::SeqCst);
         if let Ok(cb) = self.on_change.lock() {
             if let Some(callback) = cb.as_ref() {
                 let text = self.get_text();
@@ -1250,6 +1493,7 @@ impl Editor {
 
     /// Handle keyboard input.
     pub fn handle_key(&self, key: crossterm::event::KeyEvent) -> bool {
+        self.paste_revision.fetch_add(1, Ordering::SeqCst);
         match (key.modifiers, key.code) {
             // Navigation — plain movement clears any active selection;
             // Shift+movement extends it.
@@ -1445,18 +1689,17 @@ impl Component for Editor {
         // `editor.ts:539-578`). The `EditorStyle.prompt` field is retained for
         // API compatibility but unread here.
         let content_width = width.saturating_sub(self.options.padding_x).max(1);
-        // Leave one cell for the cursor marker on the active logical line so
-        // the terminal never performs an implicit wrap at the right border.
-        let active_width = content_width.saturating_sub(1).max(1);
+        // Wrapping uses one width for every logical row, the cursor's row
+        // included. Reserving the cursor cell per-row used to make the wrap
+        // point depend on where the caret happened to be: the same text
+        // reflowed one column earlier while it was being edited and again
+        // after the caret moved away. Upstream keeps a single `layoutWidth`
+        // for the same reason (`editor.ts:489`). The one cell the caret needs
+        // is taken from layout width once, here, so it is spent identically
+        // whether or not the row carries the caret.
+        let layout_width = content_width.saturating_sub(1).max(1);
         for (row_idx, line) in state.lines.iter().enumerate() {
-            let ranges = wrap_line_ranges(
-                line,
-                if row_idx == state.cursor_row {
-                    active_width
-                } else {
-                    content_width
-                },
-            );
+            let ranges = wrap_line_ranges(line, layout_width);
             for (chunk_start, chunk_end) in ranges {
                 let chunk = &line[chunk_start..chunk_end];
                 // Placeholder (dim) only on the single empty line at the cursor —
@@ -1490,22 +1733,17 @@ impl Component for Editor {
                 let visible_w = crate::ansi::visible_width(&content);
                 // Pad the line out to the full width (left padding + content +
                 // right padding) so the border box has a uniform interior width
-                // (mirrors editor.ts:522-578).
+                // (mirrors editor.ts:522-578). The caret's cell is reserved by
+                // `layout_width`, so every row — caret row included — pads to
+                // the same right edge; trimming this row instead would leave a
+                // one-column notch that moves as the caret moves.
                 let right_pad = " ".repeat(
                     width
                         .saturating_sub(self.options.padding_x)
                         .saturating_sub(visible_w),
                 );
-                let right_pad_cursor = if state.focused && row_idx == state.cursor_row {
-                    right_pad
-                        .get(..right_pad.len().saturating_sub(1))
-                        .unwrap_or("")
-                        .to_string()
-                } else {
-                    right_pad
-                };
 
-                let mut rendered = format!("{pad}{content}{right_pad_cursor}");
+                let mut rendered = format!("{pad}{content}{right_pad}");
 
                 // Cursor marker if this focused row holds the cursor. `cursor_col`
                 // is a byte offset into `line`; the rendered prefix up to the caret
@@ -2419,6 +2657,109 @@ l12",
         assert!(rendered.contains("90123456"));
     }
 
+    /// The wrap point must not depend on where the caret is.
+    ///
+    /// Reserving the cursor cell inside the *wrapping* width for the caret's
+    /// row only made the same text reflow one column earlier while it was
+    /// being edited than after the caret moved away — the row grew a line, the
+    /// dock changed height and the transcript jumped. Upstream avoids this by
+    /// computing one `layoutWidth` for every row (`editor.ts:489`).
+    #[test]
+    fn wrap_and_height_are_independent_of_the_cursor_row() {
+        for padding_x in [0usize, 1, 2] {
+            for width in [10usize, 13, 40] {
+                let editor = Editor::new(
+                    EditorOptions {
+                        padding_x,
+                        ..Default::default()
+                    },
+                    EditorStyle::default(),
+                    Arc::new(Keybindings::new()),
+                );
+                editor.set_focused(true);
+                let content_width = width.saturating_sub(padding_x).max(1);
+                // `content_width - 1` is the widest wrap that still leaves the
+                // caret a cell; the two lengths around it straddle the boundary
+                // where a caret-sensitive width would flip the height.
+                for len in [content_width - 2, content_width - 1, content_width] {
+                    let text = "x".repeat(len);
+                    let on_caret_row = {
+                        editor.set_text(&text);
+                        editor.set_cursor(0, len);
+                        editor.render(width).len()
+                    };
+                    let off_caret_row = {
+                        // Same logical line, caret parked on a second line so
+                        // row 0 renders without it.
+                        editor.set_text(&format!("{text}\nz"));
+                        editor.set_cursor(1, 1);
+                        editor.render(width).len() - 1
+                    };
+                    assert_eq!(
+                        on_caret_row, off_caret_row,
+                        "padding_x={padding_x} width={width} len={len}: the caret row wrapped "
+                    );
+                    let rows = {
+                        editor.set_text(&text);
+                        editor.set_cursor(0, len);
+                        editor.render(width)
+                    };
+                    for row in &rows {
+                        assert!(
+                            crate::ansi::visible_width(row) <= width,
+                            "padding_x={padding_x} width={width} len={len}: row escaped the box: {row:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every interior row must reach the same right edge, caret row included.
+    ///
+    /// The caret's cell was reserved *twice* for the row holding it — once by
+    /// the wrap width and once by trimming its right padding — which left that
+    /// row one column short of the box. The notch moved with the caret, so the
+    /// border's right edge visibly stepped in and out while typing.
+    #[test]
+    fn the_caret_row_reaches_the_same_right_edge_as_the_other_rows() {
+        for padding_x in [0usize, 1, 3] {
+            let editor = Editor::new(
+                EditorOptions {
+                    padding_x,
+                    ..Default::default()
+                },
+                EditorStyle::default(),
+                Arc::new(Keybindings::new()),
+            );
+            editor.set_focused(true);
+            let width = 20;
+            editor.set_text("hi\nthere");
+            // Caret on row 1: row 0 is then an ordinary row in the same frame,
+            // so both edges are measured against the same render call.
+            editor.set_cursor(1, 5);
+            let lines = editor.render(width);
+            let interior: Vec<usize> = lines[1..lines.len() - 1]
+                .iter()
+                .map(|line| crate::ansi::visible_width(line))
+                .collect();
+            assert_eq!(
+                interior,
+                vec![width, width],
+                "padding_x={padding_x}: rows of one frame must share a right edge"
+            );
+
+            // And the caret row's marker stays strictly inside the box.
+            let position = crate::extract_cursor_position(&lines, lines.len())
+                .expect("the caret row carries a marker");
+            assert!(
+                position.1 < width,
+                "padding_x={padding_x}: caret column {} must stay inside a {width}-wide box",
+                position.1
+            );
+        }
+    }
+
     #[test]
     fn test_editor_preserves_trailing_newline() {
         let editor = Editor::simple();
@@ -2631,6 +2972,323 @@ l12",
         // otherwise expand against a stale body.
         assert_eq!(editor.get_text(), "fresh");
         assert_eq!(editor.get_expanded_text(), "fresh");
+    }
+
+    #[test]
+    fn paste_session_prefix_large_body_and_tail_become_one_marker() {
+        let editor = Editor::simple();
+        let mut session = editor.start_paste_session("prefix:");
+        assert_eq!(editor.get_text(), "prefix:", "first chunk is immediate");
+        let body = "\nbody".repeat(12);
+        assert!(editor.append_paste_session(&mut session, &body));
+        assert_eq!(session.paste_id, Some(1));
+        assert!(editor.append_paste_session(&mut session, ":tail"));
+        assert_eq!(editor.get_text(), "[paste #1 +13 lines]");
+        assert_eq!(editor.get_expanded_text(), format!("prefix:{body}:tail"));
+        assert_eq!(editor.pastes.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn paste_session_small_chunks_cross_exact_fold_thresholds() {
+        let editor = Editor::simple();
+        let mut session = editor.start_paste_session(&"界".repeat(250));
+        for _ in 0..3 {
+            assert!(editor.append_paste_session(&mut session, &"界".repeat(250)));
+        }
+        assert_eq!(editor.get_text(), "界".repeat(1000));
+        assert_eq!(session.paste_id, None);
+        assert!(editor.append_paste_session(&mut session, "😀"));
+        assert_eq!(editor.get_text(), "[paste #1 1001 chars]");
+        assert_eq!(
+            editor.get_expanded_text(),
+            format!("{}😀", "界".repeat(1000))
+        );
+
+        let editor = Editor::simple();
+        let mut session = editor.start_paste_session("a");
+        for _ in 0..9 {
+            assert!(editor.append_paste_session(&mut session, "\na"));
+        }
+        assert_eq!(editor.get_text().split('\n').count(), 10);
+        assert_eq!(session.paste_id, None);
+        assert!(editor.append_paste_session(&mut session, "\na"));
+        assert_eq!(editor.get_text(), "[paste #1 +11 lines]");
+        assert_eq!(editor.get_expanded_text(), format!("a{}", "\na".repeat(10)));
+    }
+
+    #[test]
+    fn paste_session_folded_chunks_reuse_id_and_update_marker() {
+        let editor = Editor::simple();
+        let first = "x".repeat(1001);
+        let mut session = editor.start_paste_session(&first);
+        assert_eq!(editor.get_text(), "[paste #1 1001 chars]");
+        assert!(editor.append_paste_session(&mut session, "tail"));
+        assert_eq!(editor.get_text(), "[paste #1 1005 chars]");
+        assert!(editor.append_paste_session(&mut session, &"\ny".repeat(11)));
+        assert_eq!(editor.get_text(), "[paste #1 +12 lines]");
+        assert_eq!(session.paste_id, Some(1));
+        assert_eq!(*editor.paste_counter.lock().unwrap(), 1);
+        assert_eq!(editor.pastes.lock().unwrap().len(), 1);
+        assert_eq!(
+            editor.get_expanded_text(),
+            format!("{first}tail{}", "\ny".repeat(11))
+        );
+    }
+
+    #[test]
+    fn paste_session_replaces_only_owned_span_in_multiline_draft() {
+        let editor = Editor::simple();
+        editor.set_text("草稿😀末尾\nkeep");
+        editor.set_cursor(0, "草稿".len());
+        let mut session = editor.start_paste_session("中\n间");
+        assert_eq!(editor.get_text(), "草稿中\n间😀末尾\nkeep");
+        assert!(editor.append_paste_session(&mut session, "\n尾"));
+        assert_eq!(editor.get_text(), "草稿中\n间\n尾😀末尾\nkeep");
+        assert!(editor.append_paste_session(&mut session, &"\nlarge".repeat(11)));
+        assert_eq!(editor.get_text(), "草稿[paste #1 +14 lines]😀末尾\nkeep");
+        assert_eq!(
+            editor.get_expanded_text(),
+            format!("草稿中\n间\n尾{}😀末尾\nkeep", "\nlarge".repeat(11))
+        );
+    }
+
+    #[test]
+    fn paste_session_selection_and_existing_paste_preserve_surroundings() {
+        let editor = Editor::simple();
+        let other = "other\n".repeat(11);
+        editor.handle_paste(&other);
+        editor.insert("\nleft删除\n选区right\nuntouched");
+        editor.set_cursor(1, "left".len());
+        editor.begin_selection();
+        // Select across rows, leaving both outer fragments intact.
+        {
+            let mut state = editor.state.lock().unwrap();
+            state.cursor_row = 2;
+            state.cursor_col = "选区".len();
+        }
+        let mut session = editor.start_paste_session("新");
+        assert_eq!(
+            editor.get_text(),
+            "[paste #1 +12 lines]\nleft新right\nuntouched"
+        );
+        let body = "\nchunk".repeat(11);
+        assert!(editor.append_paste_session(&mut session, &body));
+        assert!(editor.append_paste_session(&mut session, "尾"));
+        assert_eq!(
+            editor.get_text(),
+            "[paste #1 +12 lines]\nleft[paste #2 +12 lines]right\nuntouched"
+        );
+        assert_eq!(
+            editor.get_expanded_text(),
+            format!("{other}\nleft新{body}尾right\nuntouched")
+        );
+        assert_eq!(
+            editor.pastes.lock().unwrap().get(&1).unwrap().content,
+            other
+        );
+        assert_eq!(editor.pastes.lock().unwrap().len(), 2);
+        editor.undo();
+        assert_eq!(
+            editor.get_text(),
+            "[paste #1 +12 lines]\nleft删除\n选区right\nuntouched"
+        );
+        assert_eq!(editor.pastes.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn paste_session_undo_redo_is_atomic_and_separate_from_typing() {
+        let editor = Editor::simple();
+        editor.insert("before");
+        let mut session = editor.start_paste_session("first");
+        let body = "\nbody".repeat(11);
+        assert!(editor.append_paste_session(&mut session, &body));
+        assert!(editor.append_paste_session(&mut session, "tail"));
+        editor.insert("after");
+        editor.undo();
+        assert_eq!(editor.get_text(), "before[paste #1 +12 lines]");
+        editor.undo();
+        assert_eq!(editor.get_text(), "before");
+        assert!(editor.pastes.lock().unwrap().is_empty());
+        editor.undo();
+        assert_eq!(editor.get_text(), "");
+        editor.redo();
+        assert_eq!(editor.get_text(), "before");
+        editor.redo();
+        assert_eq!(editor.get_text(), "before[paste #1 +12 lines]");
+        assert_eq!(editor.get_expanded_text(), format!("beforefirst{body}tail"));
+        editor.redo();
+        assert_eq!(
+            editor.get_expanded_text(),
+            format!("beforefirst{body}tailafter")
+        );
+    }
+
+    /// Invalid continuations must not touch anything, including a foreign
+    /// editor's folded store, redo history, or the token's accumulated raw text.
+    fn assert_paste_session_rejected(editor: &Editor, session: &mut PasteSession) {
+        let before = editor.snapshot_state();
+        let expanded = editor.get_expanded_text();
+        let raw = session.raw.clone();
+        let revision = session.revision;
+        let action = *editor.last_action.lock().unwrap();
+        let selection = editor.state.lock().unwrap().selection_anchor;
+        let undo_len = editor.undo_stack.lock().unwrap().len();
+        let redo_len = editor.redo_stack.lock().unwrap().len();
+        assert!(!editor.append_paste_session(session, &"bad\n".repeat(12)));
+        let after = editor.snapshot_state();
+        assert_eq!(before.lines, after.lines);
+        assert_eq!(before.cursor_row, after.cursor_row);
+        assert_eq!(before.cursor_col, after.cursor_col);
+        assert_eq!(before.paste_counter, after.paste_counter);
+        assert_eq!(before.pastes.len(), after.pastes.len());
+        for (id, entry) in before.pastes {
+            assert_eq!(entry.content, after.pastes.get(&id).unwrap().content);
+        }
+        assert_eq!(editor.get_expanded_text(), expanded);
+        assert_eq!(session.raw, raw);
+        assert_eq!(session.revision, revision);
+        assert_eq!(*editor.last_action.lock().unwrap(), action);
+        assert_eq!(editor.state.lock().unwrap().selection_anchor, selection);
+        assert_eq!(editor.undo_stack.lock().unwrap().len(), undo_len);
+        assert_eq!(editor.redo_stack.lock().unwrap().len(), redo_len);
+    }
+
+    #[test]
+    fn paste_session_change_observer_cursor_placement_invalidates_token() {
+        let editor = Arc::new(Editor::simple());
+        let weak = Arc::downgrade(&editor);
+        let observer = Arc::new(move |_: &str| {
+            let editor = weak.upgrade().unwrap();
+            let (row, col) = editor.cursor_position();
+            editor.set_cursor(row, col);
+        });
+        editor.on_change(observer.clone());
+        let mut session = editor.start_paste_session("first");
+        assert_paste_session_rejected(&editor, &mut session);
+
+        *editor.on_change.lock().unwrap() = None;
+        let mut session = editor.start_paste_session("second");
+        editor.on_change(observer);
+        assert!(editor.append_paste_session(&mut session, "tail"));
+        assert_paste_session_rejected(&editor, &mut session);
+    }
+
+    #[test]
+    fn paste_session_cursor_moves_and_key_events_permanently_invalidate() {
+        let editor = Editor::simple();
+        let mut session = editor.start_paste_session("paste");
+        let end = editor.cursor_position();
+        editor.set_cursor(0, 0);
+        editor.set_cursor(end.0, end.1);
+        assert_paste_session_rejected(&editor, &mut session);
+
+        let mut session = editor.start_paste_session("new");
+        // Even a no-op/unhandled key invalidates the continuation.
+        editor.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::F(12),
+            KeyModifiers::NONE,
+        ));
+        assert_paste_session_rejected(&editor, &mut session);
+
+        let mut session = editor.start_paste_session("new");
+        editor.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::Left,
+            KeyModifiers::NONE,
+        ));
+        editor.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::Right,
+            KeyModifiers::NONE,
+        ));
+        assert_paste_session_rejected(&editor, &mut session);
+    }
+
+    #[test]
+    fn paste_session_edit_restored_text_and_undo_redo_never_revive_token() {
+        let editor = Editor::simple();
+        let mut session = editor.start_paste_session(&"x\n".repeat(11));
+        let original = editor.get_text();
+        editor.insert("z");
+        editor.backspace();
+        assert_eq!(editor.get_text(), original);
+        assert_paste_session_rejected(&editor, &mut session);
+
+        let mut session = editor.start_paste_session("next");
+        let original = editor.get_text();
+        editor.undo();
+        assert_paste_session_rejected(&editor, &mut session);
+        editor.redo();
+        assert_eq!(editor.get_text(), original);
+        assert_paste_session_rejected(&editor, &mut session);
+    }
+
+    #[test]
+    fn paste_session_clear_set_text_and_foreign_owner_are_rejected() {
+        let editor = Editor::simple();
+        let mut session = editor.start_paste_session(&"x\n".repeat(11));
+        editor.clear();
+        assert_paste_session_rejected(&editor, &mut session);
+        let mut session = editor.start_paste_session("short");
+        editor.set_text("short");
+        assert_paste_session_rejected(&editor, &mut session);
+
+        let foreign = Editor::simple();
+        let mut session = editor.start_paste_session(&"a\n".repeat(11));
+        foreign.handle_paste(&"b\n".repeat(11));
+        assert_paste_session_rejected(&foreign, &mut session);
+        // A wrong-owner attempt must not consume the valid owner's token.
+        assert!(editor.append_paste_session(&mut session, "own"));
+
+        let mut old = editor.start_paste_session("old");
+        let _new = editor.start_paste_session("");
+        assert_paste_session_rejected(&editor, &mut old);
+    }
+
+    #[test]
+    fn paste_session_checks_selection_expected_cursor_and_owned_display() {
+        // Test the defense-in-depth checks independently of revision tracking.
+        let editor = Editor::simple();
+        let mut session = editor.start_paste_session("你好😀");
+        editor.begin_selection();
+        assert_paste_session_rejected(&editor, &mut session);
+        editor.clear_selection();
+        editor.state.lock().unwrap().cursor_col = 0;
+        assert_paste_session_rejected(&editor, &mut session);
+        editor.state.lock().unwrap().cursor_col = session.end.1;
+        editor.state.lock().unwrap().lines[0] = "different".to_string();
+        assert_paste_session_rejected(&editor, &mut session);
+    }
+
+    #[test]
+    fn paste_session_unicode_tabs_and_split_crlf_match_single_paste() {
+        let editor = Editor::simple();
+        editor.set_text("前😀后");
+        editor.set_cursor(0, "前".len());
+        let mut session = editor.start_paste_session("中文\t😀\r");
+        assert_eq!(editor.get_text(), "前中文    😀\n😀后");
+        for chunk in ["\n后\r", "\n\t尾\r", "尾\u{1}\x1b[104;", "5u"] {
+            assert!(editor.append_paste_session(&mut session, chunk));
+        }
+        let expected = "前中文    😀\n后\n    尾\n尾😀后";
+        assert_eq!(editor.get_text(), expected);
+        assert_eq!(editor.cursor_position(), (3, "尾".len()));
+        assert_eq!(editor.get_expanded_text(), expected);
+        editor.undo();
+        assert_eq!(editor.get_text(), "前😀后");
+    }
+
+    #[test]
+    fn paste_session_empty_initial_chunks_defer_undo_until_content() {
+        let editor = Editor::simple();
+        editor.insert("before");
+        let mut session = editor.start_paste_session("\u{1}");
+        assert_eq!(editor.get_text(), "before");
+        assert!(editor.append_paste_session(&mut session, "\u{2}"));
+        assert!(editor.append_paste_session(&mut session, "text"));
+        assert_eq!(editor.get_text(), "beforetext");
+        editor.undo();
+        assert_eq!(editor.get_text(), "before");
+        editor.undo();
+        assert_eq!(editor.get_text(), "");
     }
 
     #[test]

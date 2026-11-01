@@ -571,6 +571,7 @@ impl MapperState {
                         arguments: final_args,
                         thought_signature: tc.thought_signature.clone(),
                         namespace: tc.namespace.clone(),
+                        recorded: tc.recorded.clone(),
                     },
                     _ => return,
                 };

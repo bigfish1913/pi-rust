@@ -149,6 +149,21 @@ pub(super) fn reconcile_streamed_assistant_completion(
 /// `AgentEvent` drain task renders the response live and the completed outcome
 /// reconciles its final snapshot. When false (no `event_rx`), this falls back
 /// to the blocking await-final-text path.
+/// The TUI message for a refused session write.
+///
+/// Refusing to save is not a provider problem: retrying fails the same way, and
+/// the messages on screen are the only copy. The advice is accurate because
+/// `export_session` appends `AgentHarness::unsaved_messages` to the file — a
+/// refused append never becomes a session entry, so an export that read only the
+/// log would silently drop exactly the turns this warning is about.
+pub(super) fn tui_session_storage_notice(error: &rpi_harness::result::HarnessError) -> String {
+    format!(
+        "The conversation could not be saved: {error}. Your messages are still on \
+         screen, and /export writes the unsaved ones into the exported file — do \
+         that before exiting."
+    )
+}
+
 pub(super) async fn run_prompt_streaming(
     lane: &Arc<dyn AgentLane>,
     prompt: &str,
@@ -211,12 +226,25 @@ pub(super) async fn run_prompt_streaming(
     // run/prompt — covers aborts and the non-streaming path, where no
     // `AgentEnd` event necessarily reaches the drain task.
     refresh_pending_messages(state, lane).await;
+    // The blocking path has no drain task, so `AgentEnd` never runs and this is
+    // the only place its write failures can surface.
+    super::events::report_write_failures(&state.chat_container, lane);
 
-    // Authoritative context-badge fallback. The streaming drain normally
-    // updates it from `MessageEnd`, but a `Lagged` broadcast or the blocking
-    // path can skip that event; reconcile from the run outcome so the badge
-    // always reflects the newest real response.
+    // Footer repair for a dropped `MessageEnd` used to live here, but that call
+    // raced the drain: the final assistant message can already be in the log
+    // while its `MessageEnd` is still queued, so the rebuild counted turns the
+    // drain was about to count again — and a distinct turn with the same
+    // timestamp and usage is indistinguishable from that delayed duplicate by
+    // content alone. Reconciliation now runs inside the drain's `AgentEnd`
+    // handler, which the FIFO broadcast turns into a consumption barrier: every
+    // event queued before it has been applied, so a `set_usage` rebuild can
+    // never be followed by a delayed duplicate of what it counted.
     if let Ok(result) = &outcome {
+        // The context badge keeps its run-outcome fallback: it shows one turn's
+        // measurement (set semantics, nothing accumulated), so racing the drain
+        // costs nothing — the drain's own `MessageEnd` handling just overwrites
+        // it. On the non-streaming path there is no drain at all, and this is
+        // the only place the badge gets a value from.
         let final_message: Option<&AssistantMessage> = match &result.outcome {
             HarnessRunOutcome::Completed { final_message, .. }
             | HarnessRunOutcome::Aborted { final_message, .. } => Some(final_message),
@@ -280,7 +308,13 @@ pub(super) async fn run_prompt_streaming(
             }
         },
         Err(e) => {
-            add_error_message(&state.chat_container, &e.to_string());
+            // A refused session write is not a provider problem: retrying will fail
+            // the same way, and the transcript on screen is the only copy left.
+            if e.tag() == rpi_harness::result::HarnessErrorTag::SessionStorage {
+                add_error_message(&state.chat_container, &tui_session_storage_notice(&e));
+            } else {
+                add_error_message(&state.chat_container, &e.to_string());
+            }
         }
     }
 
@@ -389,6 +423,16 @@ pub(super) async fn run_compact(
     }
     state.set_status(RunStatus::Idle);
     tui.request_render(false);
+}
+
+/// Copy the fullscreen mouse selection, if present. `Some(false)` still
+/// means the selection handled the action: never silently copy another source
+/// when the clipboard write fails. Injection keeps tests off the OS clipboard.
+pub(super) fn copy_mouse_selection_with(
+    tui: &TuiAltScreen,
+    copy: impl FnOnce(&str) -> bool,
+) -> Option<bool> {
+    tui.selection_text().map(|text| copy(&text))
 }
 
 /// `/copy`: copy the last assistant reply to the clipboard. Best-effort —

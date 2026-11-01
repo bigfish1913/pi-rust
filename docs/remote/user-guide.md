@@ -113,6 +113,58 @@ provider / harness / session / extension 的全部本地构建——这是“客
 客户端可用命令（`RemoteCommand`）：`prompt`、`abort`、`get_state`、`set_model`、
 `set_thinking_level`、`set_active_tools`、`ping`、`stop`。
 
+### 消息更新模式与升级（#171）
+
+**默认线格式发生变化：新版 `--mode rpc` 默认使用 `compact-deltas`。**
+
+```bash
+rpi --mode rpc                                     # 默认：compact-deltas
+rpi --mode rpc --rpc-message-updates=compact-deltas # 显式选择新模式
+rpi --mode rpc --rpc-message-updates=snapshot       # 迁移期临时回退
+```
+
+模式在进程启动时固定，不能在运行中的会话内切换。`ready` 会声明：
+
+```json
+{"type":"ready","semantics":{"messageUpdates":"compact-deltas"}}
+```
+
+这里只展示相关字段；其他 `ready` 元数据保持不变。旧版本缺少
+`semantics.messageUpdates` 时，按 `snapshot` 理解。
+
+compact 模式仅在 `text_delta`、`thinking_delta`、`toolcall_delta` 的
+`message_update` 中移除顶层 `message` 和嵌套 `assistantMessageEvent.partial`：
+
+```json
+{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"你好"},"eventType":"text_delta","contentIndex":0,"delta":"你好"}
+```
+
+客户端应按 `contentIndex` 累积内容，不能在同一更新已携带累计快照时再次追加 delta。
+结构性的 start/end 更新仍保留快照，工具最终 payload 与 `message_end` 是权威数据，
+包括最终工具身份/参数、usage、错误和取消信息。`toolcall_delta` 的嵌套事件还会携带
+provider 当前已知的 `id` / `toolName`，它们是累计身份值而非待拼接的片段，可以晚于
+start 出现。不能从块索引猜测身份，也不能把不完整的参数 JSON 当作最终值。
+Responses 的第一个工具参数 delta 会包含 `output_item.added` 中已有的原始前缀，
+后续 delta 仅包含新后缀；这一前缀修正也适用于非 RPC 的 provider 事件消费者。
+
+内置远程 TUI 同时支持两种格式；其他消费者必须先适配再升级 native host。
+推荐部署顺序：先升级兼容两种模式的客户端和 `rpi-package` 适配器，再升级默认
+compact 的 CLI。`rpi-server` 工具可显式传入 `rpcMessageUpdates`，例如：
+
+```json
+{"action":"start","rpcMessageUpdates":"snapshot"}
+```
+
+该配置需要配套升级 `rpi-server` 扩展；省略时使用子进程 CLI 自己的默认值，不向旧
+CLI 注入新参数。`start_session` 不是逐会话模式切换入口。对仍未迁移的外部客户端，
+可以显式配置 snapshot 临时回退；后续版本计划移除该回退，不应作为新集成的默认。
+
+此变更只消除高频 delta 的重复快照，不承诺整个流完全无快照、严格线性或无损重放。
+内部广播仍可能丢失更新，客户端需用完整边界消息校准最终状态。Web 等适配器可能在
+下游投影中重建累计消息供现有 UI 使用，不属于原始 RPC 帧的字节增长保证。
+`--mode json`、插件 ABI/事件序列化、`agent_settled` 和 canonical branch-query
+合同不受此选项影响。
+
 ## 远程 TUI 中可用的命令
 
 | 命令 | 作用 |

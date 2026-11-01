@@ -129,6 +129,7 @@ async fn prepare_arguments_folds_legacy_oldtext_newtext_into_edits() {
             arguments: serde_json::json!({ "oldText": "before", "newText": "after" }),
             thought_signature: None,
             namespace: None,
+            recorded: None,
         })],
         api: Api::Other("openai-responses".into()),
         provider: "mock".to_string(),

@@ -177,6 +177,8 @@ struct ResponseSlot {
     call_id: Option<String>,
     name: String,
     arguments: String,
+    /// Regular function deltas must include output_item.added's raw prefix once.
+    function_arguments_started: bool,
     /// Custom Responses tools stream a raw string in `input` rather than a
     /// JSON object in `arguments`. Keep that wire distinction while exposing
     /// the provider-neutral object shape to the rest of pi.
@@ -446,6 +448,8 @@ impl ResponsesStreamState {
     ) -> Option<usize> {
         let item_type = item.get("type").and_then(Value::as_str);
         let kind = response_slot_kind(item_type)?;
+        // A structural snapshot must never contain an un-emitted batch.
+        self.flush_pending(out, p).await;
         let custom = item_type == Some("custom_tool_call");
         apply_message_phase(out, item);
         let item_name = item
@@ -529,6 +533,7 @@ impl ResponsesStreamState {
                 call_id,
                 name,
                 arguments,
+                function_arguments_started: false,
                 custom,
                 custom_input_property,
                 custom_input_started: false,
@@ -641,18 +646,19 @@ impl ResponsesStreamState {
             return;
         }
         if thinking {
+            // Flush before modifying out: snapshots must not expose the next
+            // channel's content before its delta has been emitted.
+            self.flush_text(out, p).await;
             if let Some(Content::Thinking(block)) = out.content.get_mut(slot.content_index) {
                 block.thinking.push_str(delta);
             }
-            // Keep channel order strict: text already streamed must reach the
-            // consumer before the first thinking delta of a new block.
-            self.flush_text(out, p).await;
             self.pending_thinking_index = Some(slot.content_index);
             self.pending_thinking.push_str(delta);
             if self.should_flush(&self.pending_thinking) {
                 self.flush_thinking(out, p).await;
             }
         } else {
+            self.flush_thinking(out, p).await;
             if let Some(Content::Text(block)) = out.content.get_mut(slot.content_index) {
                 block.text.push_str(delta);
             }
@@ -672,6 +678,7 @@ impl ResponsesStreamState {
         out: &mut AssistantMessage,
         p: &mut AssistantMessageEventStreamProducer,
     ) {
+        self.flush_pending(out, p).await;
         let Some(slot) = self.slots.get_mut(&index) else {
             return;
         };
@@ -679,6 +686,15 @@ impl ResponsesStreamState {
             return;
         }
         slot.arguments.push_str(delta);
+        // The initial raw arguments from output_item.added have not been
+        // emitted as a delta yet. Preserve their exact bytes on the first
+        // fragment, then emit only suffixes (without changing snapshots).
+        let wire_delta = if slot.function_arguments_started {
+            delta.to_string()
+        } else {
+            slot.function_arguments_started = true;
+            slot.arguments.clone()
+        };
         if let Some(Content::ToolCall(call)) = out.content.get_mut(slot.content_index) {
             call.arguments = parse_streaming_json(Some(&slot.arguments));
             if !slot.name.is_empty() {
@@ -688,7 +704,7 @@ impl ResponsesStreamState {
         }
         p.push(AssistantMessageEvent::ToolCallDelta {
             content_index: slot.content_index,
-            delta: delta.to_string(),
+            delta: wire_delta,
             partial: Arc::new(out.clone()),
         })
         .await;
@@ -706,6 +722,7 @@ impl ResponsesStreamState {
         out: &mut AssistantMessage,
         p: &mut AssistantMessageEventStreamProducer,
     ) {
+        self.flush_pending(out, p).await;
         let Some(slot) = self.slots.get_mut(&index) else {
             return;
         };
@@ -927,6 +944,7 @@ impl ResponsesStreamState {
                     },
                     thought_signature: None,
                     namespace: None,
+                    recorded: None,
                 };
                 if let Some(content) = out.content.get_mut(slot.content_index) {
                     *content = Content::ToolCall(call.clone());
@@ -3878,6 +3896,111 @@ mod tests {
             response_incomplete_reason(&top_level, &top_level),
             Some("content_filter")
         );
+    }
+
+    #[tokio::test]
+    async fn function_tool_initial_raw_prefix_is_emitted_once_through_real_sse_mapping() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Include a second call with no deltas: its final boundary remains
+        // authoritative, without introducing a synthetic delta event.
+        let frames = [
+            json!({"type":"response.output_item.added","output_index":0,"item":{
+                "type":"function_call","id":"fc_1","call_id":"call_1","name":"read",
+                "arguments":"{\"path\":\"pre"}}),
+            json!({"type":"response.function_call_arguments.delta","output_index":0,"delta":"fix"}),
+            json!({"type":"response.function_call_arguments.delta","output_index":0,"delta":"\"}"}),
+            json!({"type":"response.output_item.done","output_index":0,"item":{
+                "type":"function_call","id":"fc_1","call_id":"call_1","name":"read",
+                "arguments":"{\"path\":\"prefix\"}"}}),
+            json!({"type":"response.output_item.added","output_index":1,"item":{
+                "type":"function_call","id":"fc_2","call_id":"call_2","name":"read",
+                "arguments":"{\"path\":\"pre"}}),
+            json!({"type":"response.output_item.done","output_index":1,"item":{
+                "type":"function_call","id":"fc_2","call_id":"call_2","name":"read",
+                "arguments":"{\"path\":\"prefix\"}"}}),
+            json!({"type":"response.completed","response":{"status":"completed","output":[]}}),
+        ];
+        let body = frames
+            .iter()
+            .map(|frame| format!("data: {frame}\r\n\r\n"))
+            .collect::<String>();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 8192];
+            let _ = socket.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(), body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let mut test_model = model();
+        test_model.base_url = format!("http://{address}/v1");
+        let provider = OpenAiResponsesProvider::with_models(
+            "test",
+            Some("test-key".into()),
+            reqwest::Client::new(),
+            vec![test_model.clone()],
+        );
+        let mut stream = provider
+            .stream_simple(
+                &test_model,
+                &Context::new(Vec::new()),
+                &SimpleStreamOptions::default(),
+            )
+            .await;
+        let mut deltas = Vec::new();
+        let mut ends = Vec::new();
+        let mut final_message = None;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(event) = stream.next().await {
+                match event {
+                    AssistantMessageEvent::ToolCallDelta {
+                        content_index,
+                        delta,
+                        partial,
+                    } => {
+                        assert_eq!(content_index, 0);
+                        let expected = if deltas.is_empty() {
+                            "{\"path\":\"prefix"
+                        } else {
+                            "{\"path\":\"prefix\"}"
+                        };
+                        assert!(matches!(&partial.content[0], Content::ToolCall(call)
+                            if call.arguments == parse_streaming_json(Some(expected))));
+                        deltas.push(delta);
+                    }
+                    AssistantMessageEvent::ToolCallEnd { tool_call, .. } => ends.push(tool_call),
+                    AssistantMessageEvent::Done { message, .. } => final_message = Some(message),
+                    AssistantMessageEvent::Error { error, .. } => {
+                        panic!("unexpected error: {error:?}")
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(deltas, ["{\"path\":\"prefix", "\"}"]);
+        assert_eq!(
+            serde_json::from_str::<Value>(&deltas.concat()).unwrap(),
+            json!({"path":"prefix"})
+        );
+        assert_eq!(ends.len(), 2);
+        for call in ends {
+            assert_eq!(call.arguments, json!({"path":"prefix"}));
+        }
+        let final_message = final_message.expect("done");
+        assert_eq!(final_message.content.len(), 2);
+        for block in &final_message.content {
+            assert!(
+                matches!(block, Content::ToolCall(call) if call.arguments == json!({"path":"prefix"}))
+            );
+        }
+        server.await.unwrap();
     }
 
     #[tokio::test]

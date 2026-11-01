@@ -10,12 +10,14 @@
 //! to its provider.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use serde::{Deserialize, Serialize};
 
+use crate::redact::RedactedHeaders;
 use crate::types::{ModelCost, ProviderId, Usage, UsageCost};
 
 /// Image generation API id. `OpenrouterImages` is the built-in; `Other`
@@ -135,13 +137,36 @@ pub struct AssistantImages {
 }
 
 /// Options for a generation call (native `ImagesOptions`).
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct ImagesOptions {
     pub api_key: Option<String>,
     pub headers: std::collections::BTreeMap<String, String>,
     pub timeout_ms: Option<u64>,
     pub max_retries: Option<u32>,
     pub max_retry_delay_ms: Option<u64>,
+}
+
+/// `Debug` redacts credentials: `api_key` is shown only as present or absent,
+/// and sensitive header values are masked. The destructuring below is
+/// exhaustive, so adding a field to the struct fails to compile until it is
+/// printed here too.
+impl fmt::Debug for ImagesOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            api_key,
+            headers,
+            timeout_ms,
+            max_retries,
+            max_retry_delay_ms,
+        } = self;
+        f.debug_struct("ImagesOptions")
+            .field("api_key", &api_key.as_ref().map(|_| "<redacted>"))
+            .field("headers", &RedactedHeaders(headers))
+            .field("timeout_ms", timeout_ms)
+            .field("max_retries", max_retries)
+            .field("max_retry_delay_ms", max_retry_delay_ms)
+            .finish()
+    }
 }
 
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
@@ -506,5 +531,30 @@ mod tests {
             .error_message
             .unwrap()
             .contains("No API provider registered"));
+    }
+
+    #[test]
+    fn options_debug_redacts_api_key_and_sensitive_headers() {
+        let options = ImagesOptions {
+            api_key: Some("img-SECRET-KEY".into()),
+            headers: std::collections::BTreeMap::from([
+                ("Authorization".into(), "Bearer IMG-SECRET-BEARER".into()),
+                ("X-Tenant".into(), "tenant-visible".into()),
+            ]),
+            timeout_ms: Some(1500),
+            max_retries: Some(2),
+            max_retry_delay_ms: Some(900),
+        };
+        let debug = format!("{options:?}");
+        assert!(!debug.contains("SECRET-KEY"), "{debug}");
+        assert!(!debug.contains("IMG-SECRET-BEARER"), "{debug}");
+        assert!(debug.contains("api_key: Some(\"<redacted>\")"), "{debug}");
+        assert!(
+            debug.contains("\"X-Tenant\": \"tenant-visible\""),
+            "{debug}"
+        );
+        assert!(debug.contains("timeout_ms: Some(1500)"), "{debug}");
+        assert!(debug.contains("max_retries: Some(2)"), "{debug}");
+        assert!(debug.contains("max_retry_delay_ms: Some(900)"), "{debug}");
     }
 }

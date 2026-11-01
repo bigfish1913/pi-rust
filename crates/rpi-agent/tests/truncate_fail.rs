@@ -165,6 +165,7 @@ fn assistant_message_with_tool_call_and_length() -> rpi_ai::types::AssistantMess
             arguments: serde_json::json!({ "value": "hel" }),
             thought_signature: None,
             namespace: None,
+            recorded: None,
         })],
         api: Api::Other("openai-responses".into()),
         provider: "mock".to_string(),

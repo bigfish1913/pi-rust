@@ -160,7 +160,7 @@ fn update_sgr_context(slots: &mut Vec<(SgrSlot, String)>, sequence: &str) {
                 };
                 let component_count = match values.get(index + 1).copied() {
                     Some("5") if values.get(index + 2).is_some() => 3,
-                    Some("2") if values.get(index + 5).is_some() => 6,
+                    Some("2") if values.get(index + 4).is_some() => 5,
                     _ => 0,
                 };
                 if component_count != 0 {
@@ -231,6 +231,69 @@ pub(crate) fn isolate_wrapped_lines(lines: &mut [String]) {
         carry = wrapped_context(&parsed);
         *line = format!("{source}\x1b[0m\x1b]8;;\x07");
     }
+}
+
+/// Expand a nonempty column range to whole graphemes. Selection painting and
+/// clipboard extraction must agree when a pointer lands inside a wide cell.
+pub(crate) fn snap_column_span(line: &str, start: usize, end: usize) -> Option<(usize, usize)> {
+    let parsed = atoms(line)?;
+    let mut column = 0;
+    let mut bounds = None;
+    for atom in parsed {
+        let next = column + atom.width;
+        if atom.width > 0 && column < end && next > start {
+            let first = bounds.map_or(column, |(first, _)| first);
+            bounds = Some((first, next));
+        }
+        column = next;
+    }
+    bounds
+}
+
+/// Paint a selection without slicing away unselected text or splitting a
+/// grapheme. Original escape sequences stay in place, including OSC8 links.
+pub(crate) fn highlight_span(line: &str, start: usize, end: usize) -> Option<String> {
+    let parsed = atoms(line)?;
+    let mut output = String::new();
+    let mut column = 0;
+    let mut active = start == 0 && end > 0;
+    let mut sgr = Vec::new();
+    if active {
+        output.push_str("\x1b[7m");
+    }
+    let restore_inverse = |output: &mut String, sgr: &[(SgrSlot, String)]| {
+        output.push_str(if sgr.iter().any(|(slot, _)| *slot == SgrSlot::Inverse) {
+            "\x1b[7m"
+        } else {
+            "\x1b[27m"
+        });
+    };
+    for atom in parsed {
+        if atom.width == 0 {
+            output.push_str(atom.text);
+            if atom.text.starts_with("\x1b[") {
+                update_sgr_context(&mut sgr, atom.text);
+                if active {
+                    output.push_str("\x1b[7m");
+                }
+            }
+            continue;
+        }
+        let selected = column < end && column + atom.width > start;
+        if active && !selected {
+            restore_inverse(&mut output, &sgr);
+            active = false;
+        } else if !active && selected {
+            output.push_str("\x1b[7m");
+            active = true;
+        }
+        output.push_str(atom.text);
+        column += atom.width;
+    }
+    if active {
+        restore_inverse(&mut output, &sgr);
+    }
+    Some(output)
 }
 
 /// Slice terminal columns without losing SGR/OSC8 context or splitting wide graphemes.
@@ -307,6 +370,37 @@ pub(crate) fn patch(old: &str, new: &str) -> Option<(usize, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn selection_preserves_styles_links_and_existing_inverse() {
+        assert_eq!(
+            highlight_span("a\x1b[31mb\x1b[0mcdef", 1, 3).unwrap(),
+            "a\x1b[31m\x1b[7mb\x1b[0m\x1b[7mc\x1b[27mdef"
+        );
+        assert_eq!(
+            highlight_span("\x1b[7mabcdef\x1b[27m", 1, 3).unwrap(),
+            "\x1b[7ma\x1b[7mbc\x1b[7mdef\x1b[27m"
+        );
+        let linked = "a\x1b]8;;https://example.com\x07bc\x1b]8;;\x07def";
+        assert_eq!(
+            highlight_span(linked, 1, 3).unwrap(),
+            "a\x1b]8;;https://example.com\x07\x1b[7mbc\x1b]8;;\x07\x1b[27mdef"
+        );
+        assert_eq!(snap_column_span("a中👩‍💻z", 2, 4), Some((1, 5)));
+        assert!(highlight_span("\x1b[2Junsafe", 0, 2).is_none());
+    }
+
+    #[test]
+    fn selection_restores_inverse_after_truecolor_sequences() {
+        for color in ["38", "48"] {
+            let line = format!("\x1b[7mab\x1b[{color};2;255;0;0mcd");
+            let expected = format!("\x1b[7ma\x1b[7mb\x1b[{color};2;255;0;0m\x1b[7mc\x1b[7md");
+            assert_eq!(highlight_span(&line, 1, 3).unwrap(), expected);
+            let line = format!("a\x1b[{color};2;255;0;0;7mbcd");
+            let expected = format!("a\x1b[{color};2;255;0;0;7m\x1b[7mbc\x1b[7md");
+            assert_eq!(highlight_span(&line, 1, 3).unwrap(), expected);
+        }
+    }
+
     #[test]
     fn wrapped_style_context_keeps_only_active_sgr_state() {
         let mut lines: Vec<String> = (0..20).map(|_| "\x1b[31mA\x1b[39m".to_string()).collect();

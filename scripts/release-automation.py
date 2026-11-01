@@ -20,14 +20,36 @@ def api(path, *args):
     return json.loads(run("gh", "api", path, *args))
 
 
-def release_pr(pr, commit):
-    """A fork branch named release-plz-* cannot authorize publication."""
-    return (pr.get("merged_at") is not None
-            and pr.get("merge_commit_sha") == commit
-            and pr.get("base", {}).get("ref") == "main"
+def upstream_release_branch(pr):
+    """A fork branch named release-plz-* is not an upstream Release PR."""
+    return (pr.get("base", {}).get("ref") == "main"
             and (pr.get("base", {}).get("repo") or {}).get("full_name") == REPOSITORY
             and (pr.get("head", {}).get("repo") or {}).get("full_name") == REPOSITORY
             and pr.get("head", {}).get("ref", "").startswith("release-plz-"))
+
+
+def release_pr(pr, commit):
+    return (pr.get("merged_at") is not None
+            and pr.get("merge_commit_sha") == commit
+            and upstream_release_branch(pr))
+
+
+def draft_release_prs():
+    # Pagination matters: an existing Release PR need not be on the first page.
+    pages = api(f"repos/{REPOSITORY}/pulls?state=open&base=main&per_page=100",
+                "--paginate", "--slurp")
+    prs = [pr for page in pages for pr in page
+           if pr.get("state") == "open" and upstream_release_branch(pr)]
+    if len(prs) > 1:
+        raise ValueError("multiple open Release PRs; close obsolete ones before preparing a release")
+    if not prs:
+        return
+    pr = prs[0]
+    if not pr["draft"]:
+        run("gh", "pr", "ready", str(pr["number"]), "--undo", "--repo", REPOSITORY)
+    # release-plz may return no PR on a no-op retry. Still sync/validate this PR
+    # and mark it ready again, but only after preparation has succeeded.
+    output(pr=json.dumps({"number": pr["number"], "head_branch": pr["head"]["ref"]}))
 
 
 def check_version(version, tags, commit, existing_commit=None):
@@ -54,7 +76,7 @@ def output(**values):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("detect", "tag"))
+    parser.add_argument("command", choices=("detect", "tag", "draft-release-prs"))
     args = parser.parse_args()
     if (os.environ.get("GITHUB_REPOSITORY") != REPOSITORY
             or os.environ.get("GITHUB_REF") != "refs/heads/main"
@@ -63,6 +85,9 @@ def main():
     commit = run("git", "rev-parse", "HEAD")
     if commit != os.environ["GITHUB_SHA"]:
         raise ValueError("checkout must match the tested main commit")
+    if args.command == "draft-release-prs":
+        draft_release_prs()
+        return
     # Use full PR metadata to check its origin, merge state and merge commit.
     prs = api(f"repos/{REPOSITORY}/commits/{commit}/pulls")
     if not any(release_pr(api(f"repos/{REPOSITORY}/pulls/{pr['number']}"), commit) for pr in prs):

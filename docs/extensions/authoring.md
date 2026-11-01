@@ -242,6 +242,13 @@ fan-out 到所有已注册 handler，合并返回的 `{skillPaths, promptPaths, 
 `toolcall_start`/`toolcall_delta`/`toolcall_end`、`usage`；未知 `type` 会被忽略
 （向前兼容）。
 
+`toolcall_end` 可带可选的 `recorded` 字段，表示该调用已在远端执行过：宿主把它当作已完成的
+工具结果，绝不在本地再次执行（形状与版本规则见 `docs/rpi-tool/extension-authoring.md`）。
+`capabilities.recordedToolCalls` 是宿主能解码的最高 `recorded` 版本，插件只能在它 `>= 1` 时
+发送 `recorded`；旧宿主没有这个键，会忽略 `recorded` 并执行调用。SDK 桥接会自动执行这条检查。
+流中带过 `recorded` 的调用在 `out` 中必须是同一 `id`、`name` 和 `arguments`：缺少记录时宿主
+会补上，冲突或缺失则这一轮以 `Error` 结束。
+
 两点约定：
 
 - **`out` 仍是最终消息。** 回调只负责增量；插件返回时写入 `out` 的完整

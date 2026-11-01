@@ -12,6 +12,7 @@
 pub mod context;
 pub mod jsonl;
 pub mod memory;
+pub(crate) mod progress;
 pub mod reducer;
 pub mod session;
 pub mod sqlite;

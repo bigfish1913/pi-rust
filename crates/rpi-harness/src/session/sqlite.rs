@@ -123,8 +123,26 @@ impl SqliteSessionStorage {
     }
 }
 
+mod progress;
+
 #[async_trait]
 impl SessionStorage for SqliteSessionStorage {
+    async fn prune_completed_progress(&self) -> SessionResult<usize> {
+        self.prune_completed_progress_sql().await
+    }
+
+    async fn append_progress(
+        &self,
+        records: Vec<crate::session::types::AssistantFrameRecord>,
+    ) -> SessionResult<Vec<crate::session::types::AssistantFrameRecord>> {
+        self.append_progress_sql(records).await
+    }
+    async fn read_progress(
+        &self,
+        run_id: &str,
+    ) -> SessionResult<Vec<crate::session::types::AssistantFrameRecord>> {
+        self.read_progress_sql(run_id).await
+    }
     fn metadata(&self) -> SessionMetadata {
         self.inner.metadata()
     }
@@ -152,6 +170,49 @@ impl SessionStorage for SqliteSessionStorage {
         })
         .await
     }
+    async fn append_queue_cancellations(
+        &self,
+        records: Vec<LaneRecord>,
+    ) -> SessionResult<Vec<LaneRecord>> {
+        self.write_retry(move |inner| {
+            let records = records.clone();
+            async move { inner.append_queue_cancellations(records).await }
+        })
+        .await
+    }
+
+    async fn history_revision(&self) -> SessionResult<u64> {
+        let _gate = self.refresh_read().await?;
+        self.inner.history_revision().await
+    }
+
+    async fn append_entry_if_revision(
+        &self,
+        entry: ProvisionedEntry,
+        lane: &str,
+        expected: u64,
+    ) -> SessionResult<Entry> {
+        let lane = lane.to_owned();
+        self.write_retry(move |inner| {
+            let entry = entry.clone();
+            let lane = lane.clone();
+            async move { inner.append_entry_if_revision(entry, &lane, expected).await }
+        })
+        .await
+    }
+
+    async fn append_record_if_revision(
+        &self,
+        record: LaneRecord,
+        expected: u64,
+    ) -> SessionResult<LaneRecord> {
+        self.write_retry(move |inner| {
+            let record = record.clone();
+            async move { inner.append_record_if_revision(record, expected).await }
+        })
+        .await
+    }
+
     async fn append_entry(&self, entry: ProvisionedEntry, lane: &str) -> SessionResult<Entry> {
         let lane = lane.to_string();
         self.write_retry(move |inner| {
@@ -199,6 +260,13 @@ impl SessionStorage for SqliteSessionStorage {
     async fn find_records(&self, query: &RecordQuery) -> SessionResult<Vec<LaneRecord>> {
         let _gate = self.refresh_read().await?;
         self.inner.find_records(query).await
+    }
+    async fn record_page(
+        &self,
+        query: &crate::session::types::RecordPageQuery,
+    ) -> SessionResult<crate::session::types::RecordPage> {
+        let _gate = self.refresh_read().await?;
+        self.inner.record_page(query).await
     }
     async fn find_open_operations(
         &self,
@@ -282,7 +350,19 @@ impl SqliteSessionRepo {
                  created_at INTEGER NOT NULL,
                  parent_session_id TEXT,
                  state_json TEXT NOT NULL
-             );",
+             );
+             CREATE TABLE IF NOT EXISTS progress_heads (
+                 session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+                 sequence INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS progress_frames (
+                 session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                 sequence INTEGER NOT NULL, id TEXT NOT NULL, lane TEXT NOT NULL,
+                 run_id TEXT NOT NULL, stream_index INTEGER NOT NULL, frame_json TEXT NOT NULL,
+                 PRIMARY KEY(session_id, sequence), UNIQUE(session_id,id)
+             );
+             CREATE INDEX IF NOT EXISTS progress_run ON progress_frames(session_id,run_id,sequence);
+             PRAGMA foreign_keys = ON;",
         )
         .map_err(|e| SessionError::storage(format!("initialize SQLite database: {e}")))?;
         Ok(Self {

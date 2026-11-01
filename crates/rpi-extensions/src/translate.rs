@@ -22,6 +22,12 @@ use crate::registry::RegistrySnapshot;
 #[cfg(test)]
 mod lifetime_tests;
 
+#[cfg(test)]
+thread_local! {
+    static TRANSLATED_EVENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FREED_EVENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Map a native [`AgentEvent`] to its pi `on()` [`EventTag`], or `None` if the
 /// host event has no stable-event counterpart. This is the **fold** described
 /// in the crate docs: the ten stable lifecycle variants map onto matching tags;
@@ -44,8 +50,8 @@ pub fn event_tag_for(event: &AgentEvent) -> Option<EventTag> {
 }
 
 /// Serialize an [`AgentMessage`](rpi_agent::message::AgentMessage) to an owning
-/// `StbString` for a message-payload event. The host produced this string, so
-/// the **handler** (plugin side) frees it via the host's `free_string`.
+/// `StbString` for a message-payload event. Handlers borrow its bytes;
+/// the dispatcher's cleanup guard frees it after fan-out.
 fn message_to_stb(message: &rpi_agent::message::AgentMessage) -> StbString {
     // AgentMessage is Serialize (#[serde(tag="kind")]); use serde_json round-trip.
     let text = serde_json::to_string(message).unwrap_or_else(|_| "null".to_string());
@@ -53,10 +59,11 @@ fn message_to_stb(message: &rpi_agent::message::AgentMessage) -> StbString {
 }
 
 /// Build the stable event for an `AgentEvent`, or `None` if the event carries
-/// no payload that maps onto a stable variant (always maps today, but kept as
-/// `Option` for forward-compat with unmapped future variants). Ownership of any
-/// `StbString` in the returned event passes to the handler.
+/// no payload that maps onto a stable variant. The caller owns the returned
+/// strings; dispatch borrows them to callbacks and frees them exactly once.
 pub fn translate(event: &AgentEvent) -> Option<StablePluginEvent> {
+    #[cfg(test)]
+    TRANSLATED_EVENTS.with(|count| count.set(count.get() + 1));
     let tag = event_tag_for(event)?;
     match event {
         AgentEvent::MessageStart { message } | AgentEvent::MessageEnd { message } => {
@@ -264,27 +271,6 @@ fn agent_tool_result_to_json(result: &rpi_agent::types::AgentToolResult) -> Stri
     txt
 }
 
-/// Free every `StbString` owned by a dispatched [[`StablePluginEvent`]] via the
-/// host's `free_string`. Called after dispatch completes (the handler SHOULD
-/// have freed them, but the host keeps ownership-of-cleanup so a buggy plugin
-/// that retains/leaks can't double-free the host's allocation — the host never
-/// trusts the plugin to free, per the SDK's "receiver owns" contract: here the
-/// host is the producer → receiver is the plugin; if the plugin failed to free,
-/// the host's free is a leak fix, not a double-free, because `StbString` is
-/// `Copy` and the host's `host_free_string` reconstructs the `Box<[u8]>` and
-/// drops it — a second free of the same bytes would be UB, so this must run
-/// EXACTLY ONCE per event. The contract is: the plugin frees what it receives.
-/// To honor that, we do NOT free here; the plugin owns the free. This fn is
-/// therefore a no-op kept for documentation + future audit).
-///
-/// **In practice:** the plugin handler is contractually required to free every
-/// `StbString` it receives via the host `free_string`. The host does not
-/// double-free. If a plugin leaks, that is a plugin bug.
-#[allow(dead_code)]
-fn free_event_strings(_event: &StablePluginEvent) {
-    // intentionally empty — see doc comment.
-}
-
 // ===========================================================================
 // ExtensionEmitter — AgentEmitter impl fanning out to plugin handlers
 // ===========================================================================
@@ -330,6 +316,21 @@ impl ExtensionEmitter {
     /// is `catch_unwind`-wrapped; errors (nonzero return) are logged but do not
     /// abort the fan-out (one handler's failure doesn't block the others — mir-
     /// rors pi's per-handler try/catch).
+    fn dispatch_agent(&self, event: &AgentEvent) {
+        if !crate::registry::assert_active(self.snapshot.active_flag()) {
+            return;
+        }
+        let Some(tag) = event_tag_for(event) else {
+            return;
+        };
+        if self.snapshot.handlers_for(tag).is_empty() {
+            return;
+        }
+        if let Some(stable) = translate(event) {
+            self.dispatch(&stable);
+        }
+    }
+
     fn dispatch(&self, event: &StablePluginEvent) {
         dispatch_to_handlers(&self.snapshot, event);
     }
@@ -340,15 +341,20 @@ impl ExtensionEmitter {
 /// dispatcher ([`crate::provider_hooks`]). Handlers MUST NOT free the event
 /// strings; the host frees exactly once after the fan-out.
 pub fn dispatch_to_handlers(snapshot: &RegistrySnapshot, event: &StablePluginEvent) {
+    // Install cleanup before every early return, including stale snapshots.
+    struct Cleanup<'a>(&'a StablePluginEvent);
+    impl Drop for Cleanup<'_> {
+        fn drop(&mut self) {
+            free_dispatched_event(self.0);
+        }
+    }
+    let _cleanup = Cleanup(event);
     // Staleness guard: a stale registry (swapped-out session) does nothing.
     if !crate::registry::assert_active(snapshot.active_flag()) {
         return;
     }
     let handlers = snapshot.handlers_for(event.tag);
     if handlers.is_empty() {
-        // No subscribers — and critically, the event's StbStrings are owned
-        // by the host and must still be freed (no handler ran to free them).
-        free_dispatched_event(event);
         return;
     }
     for h in handlers {
@@ -412,8 +418,6 @@ pub fn dispatch_to_handlers(snapshot: &RegistrySnapshot, event: &StablePluginEve
             }
         }
     }
-    // Host frees the event's strings exactly once after the fan-out.
-    free_dispatched_event(event);
 }
 
 /// Build + dispatch a generic `data` event (JSON payload) to the tag's
@@ -832,16 +836,12 @@ impl AgentEmitter for ExtensionEmitter {
         // Translate + dispatch synchronously (the emitter's emit is awaited by
         // the loop in event order; dispatch is non-blocking fn-pointer calls).
         // If the event maps to no tag, do nothing.
-        if let Some(stable) = translate(&event) {
-            self.dispatch(&stable);
-        }
+        self.dispatch_agent(&event);
         Box::pin(async {})
     }
 
     fn try_emit(&self, event: AgentEvent) {
-        if let Some(stable) = translate(&event) {
-            self.dispatch(&stable);
-        }
+        self.dispatch_agent(&event);
     }
 }
 
@@ -903,6 +903,8 @@ impl AgentEmitter for TeeEmitter {
 /// host's `free_string`. Called by [`ExtensionEmitter::dispatch`] after the
 /// fan-out completes. Handlers MUST NOT free event strings (host owns cleanup).
 fn free_dispatched_event(event: &StablePluginEvent) {
+    #[cfg(test)]
+    FREED_EVENTS.with(|count| count.set(count.get() + 1));
     use rpi_plugin_sdk::EventTag as T;
     match event.tag {
         T::MessageStart | T::MessageUpdate | T::MessageEnd => {

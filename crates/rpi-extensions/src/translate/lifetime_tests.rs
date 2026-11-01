@@ -2,6 +2,26 @@ use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+#[test]
+fn unobserved_events_are_not_serialized_and_stale_payloads_are_freed_once() {
+    let registry = crate::ExtensionRegistry::new();
+    let snapshot = Arc::new(registry.snapshot());
+    let emitter = ExtensionEmitter::new(snapshot.clone(), crate::PluginKeepalive::empty());
+    let event = AgentEvent::MessageEnd {
+        message: rpi_ai::UserMessage::new("large payload".repeat(1000), 0).into(),
+    };
+    let before = TRANSLATED_EVENTS.with(|count| count.get());
+    emitter.try_emit(event.clone());
+    assert_eq!(TRANSLATED_EVENTS.with(|count| count.get()), before);
+    let stable = translate(&event).unwrap();
+    registry.invalidate();
+    let before = FREED_EVENTS.with(|count| count.get());
+    dispatch_to_handlers(&snapshot, &stable);
+    assert_eq!(FREED_EVENTS.with(|count| count.get()), before + 1);
+    emitter.try_emit(event);
+    assert_eq!(TRANSLATED_EVENTS.with(|count| count.get()), 1);
+}
+
 #[derive(Default)]
 struct Paused {
     entered: tokio::sync::Notify,

@@ -463,11 +463,38 @@ impl RuntimeActionHost for HarnessActionHost {
         // is driven. Messages use the harness boundary writer, whose entry id
         // may be reserved until the current turn settles. Custom data stays out
         // of model context unless a caller explicitly configures a projector.
+        if let Some(expected) = args.get("expected") {
+            let guard = serde_json::from_value(expected.clone())
+                .map_err(|error| format!("invalid AppendEntry expected guard: {error}"))?;
+            let entry = if let Some(custom_type) = arg_str_opt(&args, "customType") {
+                if args.get("message").is_some() || args.get("outboxKey").is_some() {
+                    return Err("scoped custom entry cannot include message/outboxKey".into());
+                }
+                rpi_harness::agent_harness::ScopedEntry::Custom {
+                    custom_type,
+                    data: args.get("data").cloned(),
+                }
+            } else {
+                let message =
+                    serde_json::from_value(args.get("message").cloned().ok_or("missing message")?)
+                        .map_err(|error| format!("invalid message: {error}"))?;
+                let key = arg_str(&args, "outboxKey")?;
+                rpi_harness::agent_harness::ScopedEntry::Notice { message, key }
+            };
+            let id = self
+                .harness()?
+                .append_scoped_entry(&guard, entry)
+                .await
+                .map_err(|error| error.to_string())?;
+            return Ok(serde_json::json!({"entryId":id, "scoped":true}));
+        }
+        if args.get("outboxKey").is_some() {
+            return Err("outboxKey requires an expected guard".into());
+        }
         if let Some(custom_type) = arg_str_opt(&args, "customType") {
             let data = args.get("data").cloned();
             let id = self
                 .harness()?
-                .session()
                 .append_custom_entry(&custom_type, data)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -491,7 +518,8 @@ impl RuntimeActionHost for HarnessActionHost {
         args: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         let request = crate::modes::branch_entry_query(&args)?;
-        let entries = crate::modes::find_branch_entries(&self.harness()?, &request).await?;
+        let (entries, session_id, leaf_id) =
+            crate::modes::branch_snapshot(&self.harness()?, &request).await?;
         let entries = entries
             .iter()
             .map(serde_json::to_value)
@@ -501,6 +529,9 @@ impl RuntimeActionHost for HarnessActionHost {
             "entries": entries,
             "count": entries.len(),
             "filtered": true,
+            "sessionId": session_id,
+            "leafId": leaf_id,
+            "scopedAppend": true,
         }))
     }
 
@@ -654,6 +685,7 @@ impl RuntimeActionHost for HarnessActionHost {
         let cwd_str = self.cwd.to_string_lossy().to_string();
         let new_session: Session = open_session_by_id_in_dir(&id, &cwd_str, &self.session_dir)
             .await
+            .map(|restored| restored.session)
             .map_err(|e| e.to_string())?;
         let new_id = new_session.storage().metadata().id.clone();
         crate::session::set_active_session(&harness, new_session, Some(&self.tool_context)).await?;

@@ -7,6 +7,7 @@ pub use rpi_runtime::provider::{
     ANTHROPIC_AUTH_TOKEN_ENV, ANTHROPIC_BASE_URL_ENV, DEFAULT_MODEL_ID, DEFAULT_THINKING_LEVEL,
     NO_API_KEY_HINT, OPENAI_API_KEY_ENV,
 };
+use std::sync::Arc;
 
 pub(crate) struct CliValues;
 impl rpi_runtime::ValueSource for CliValues {
@@ -146,6 +147,9 @@ pub fn resolve_with_extensions(
 
 fn factories_from_session(session: &rpi_extensions::ExtensionSession) -> RuntimeFactories {
     let mut factories = RuntimeFactories::default();
+    if let Some(refresher) = crate::auth::PackageOAuthRefresher::new(session) {
+        factories.set_oauth_refresher(Arc::new(refresher));
+    }
     if let Some(snapshot) = session.snapshot() {
         for manifest in manifests_from_session(session) {
             factories.declare(declaration(&manifest));

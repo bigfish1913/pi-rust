@@ -97,6 +97,7 @@ pub struct JsonlSessionStorage {
     needs_reconcile: Arc<std::sync::atomic::AtomicBool>,
     /// Set when a failed append cannot be proven/truncated safely.
     uncertain: Arc<AtomicBool>,
+    progress: super::progress::JsonlProgressStore,
 }
 
 impl Clone for JsonlSessionStorage {
@@ -111,11 +112,25 @@ impl Clone for JsonlSessionStorage {
             append: self.append.clone(),
             needs_reconcile: self.needs_reconcile.clone(),
             uncertain: self.uncertain.clone(),
+            progress: self.progress.clone(),
         }
     }
 }
 
 impl JsonlSessionStorage {
+    /// Replace the append handle. Test-only: lets a probe make the backend
+    /// refuse or tear a write without a real disk fault.
+    #[cfg(test)]
+    pub fn install_append_handle(&self, handle: Box<dyn rpi_tools::env::AppendFile>) {
+        // The handle can only be swapped while nothing is writing, which is
+        // always true at the point a probe installs one.
+        let mut slot = self
+            .append
+            .try_lock()
+            .expect("install_append_handle requires an idle append slot");
+        *slot = Some(handle);
+    }
+
     /// Detached owner: cancellation of a caller cannot skip append + reducer commit.
     async fn run_owned<T, F, Fut>(&self, op: F) -> SessionResult<T>
     where
@@ -151,6 +166,12 @@ impl JsonlSessionStorage {
         ids: Arc<dyn IdGenerator>,
     ) -> Self {
         Self {
+            progress: super::progress::JsonlProgressStore::new(
+                fs.clone(),
+                &metadata.path,
+                &metadata.id,
+                clock.clone(),
+            ),
             fs,
             metadata,
             state: Arc::new(tokio::sync::Mutex::new(SessionState::new())),
@@ -168,10 +189,14 @@ impl JsonlSessionStorage {
     pub async fn create(
         fs: Arc<dyn FileSystem>,
         path: &str,
-        header: JsonlV4Header,
+        mut header: JsonlV4Header,
         clock: Arc<dyn Clock>,
         ids: Arc<dyn IdGenerator>,
     ) -> SessionResult<Self> {
+        header.progress_format = Some(super::progress::FORMAT.into());
+        let progress =
+            super::progress::JsonlProgressStore::new(fs.clone(), path, &header.id, clock.clone());
+        progress.initialize().await?;
         file_result(
             fs.write_file(path, FileContent::Text(encode_header(&header)), None)
                 .await,
@@ -182,7 +207,9 @@ impl JsonlSessionStorage {
             &format!("Failed to read session metadata {path}"),
         )?;
         let metadata = metadata_from_header(&header, path, info.mtime_ms);
-        Ok(Self::new(fs, metadata, clock, ids))
+        let mut storage = Self::new(fs, metadata, clock, ids);
+        storage.progress = progress;
+        Ok(storage)
     }
 
     /// Load + replay an existing session file, repairing a torn tail if the
@@ -206,12 +233,21 @@ impl JsonlSessionStorage {
             return Err(invalid_file(path, 1, &"is missing a header".to_string()));
         }
         let header = parse_header(physical_lines[0]).map_err(|e| invalid_file(path, 1, &e))?;
+        if header.progress_format.is_some()
+            && !file_result(
+                fs.exists(&format!("{path}.progress.jsonl"), None).await,
+                "check required progress companion",
+            )?
+        {
+            return Err(SessionError::invalid_entry("required progress companion is missing; restore the complete session, not only its history"));
+        }
         let info = file_result(
             fs.file_info(path, None).await,
             &format!("Failed to read session metadata {path}"),
         )?;
         let metadata = metadata_from_header(&header, path, info.mtime_ms);
-        let storage = Self::new(fs.clone(), metadata, clock, ids);
+        let mut storage = Self::new(fs.clone(), metadata, clock, ids);
+        storage.progress.required = header.progress_format.is_some();
 
         // Lines kept through the duplicate-seq recovery, so a healed file can
         // be republished without the dropped duplicates (see after the loop).
@@ -353,7 +389,7 @@ impl JsonlSessionStorage {
     pub async fn fork(
         &self,
         path: &str,
-        header: JsonlV4Header,
+        mut header: JsonlV4Header,
         options: &ForkOptions,
         clock: Arc<dyn Clock>,
         ids: Arc<dyn IdGenerator>,
@@ -362,14 +398,20 @@ impl JsonlSessionStorage {
             let state = self.state.lock().await;
             state.create_fork_mutations(options)?
         };
+        header.progress_format = Some(super::progress::FORMAT.into());
+        super::progress::JsonlProgressStore::new(self.fs.clone(), path, &header.id, clock.clone())
+            .initialize()
+            .await?;
         publish_file_atomically(&self.fs, path, |fs, temp_path| {
             let header = header.clone();
             let mutations = mutations.clone();
-            let clock = clock.clone();
-            let ids = ids.clone();
             Box::pin(async move {
-                let target =
-                    JsonlSessionStorage::create(fs.clone(), temp_path, header, clock, ids).await?;
+                file_result(
+                    fs.write_file(temp_path, FileContent::Text(encode_header(&header)), None)
+                        .await,
+                    "stage fork header",
+                )?;
+                let mut target = SessionState::new();
                 for mutation in &mutations {
                     let line = encode_mutation(mutation);
                     file_result(
@@ -377,8 +419,7 @@ impl JsonlSessionStorage {
                             .await,
                         &format!("Failed to append session {temp_path}"),
                     )?;
-                    let mut state = target.state.lock().await;
-                    state.apply_mutation(mutation.clone())?;
+                    target.apply_mutation(mutation.clone())?;
                 }
                 Ok(())
             })
@@ -698,6 +739,29 @@ fn chain_onto_lane_leaf(mutation: SessionMutation, state: &SessionState) -> Sess
 
 #[async_trait]
 impl SessionStorage for JsonlSessionStorage {
+    async fn prune_completed_progress(&self) -> SessionResult<usize> {
+        let completed = self.state.lock().await.completed_progress_runs();
+        self.progress.prune_completed(completed).await
+    }
+
+    async fn append_progress(
+        &self,
+        records: Vec<crate::session::types::AssistantFrameRecord>,
+    ) -> SessionResult<Vec<crate::session::types::AssistantFrameRecord>> {
+        {
+            let state = self.state.lock().await;
+            for record in &records {
+                state.require_lane(&record.base.lane)?;
+            }
+        }
+        self.progress.append(records).await
+    }
+    async fn read_progress(
+        &self,
+        run_id: &str,
+    ) -> SessionResult<Vec<crate::session::types::AssistantFrameRecord>> {
+        self.progress.read(run_id).await
+    }
     fn metadata(&self) -> SessionMetadata {
         self.metadata.to_base()
     }
@@ -723,6 +787,36 @@ impl SessionStorage for JsonlSessionStorage {
         self.run_owned(move |s| async move { s.move_lane_owned(&lane, to.as_deref()).await })
             .await
     }
+    async fn history_revision(&self) -> SessionResult<u64> {
+        Ok(self.state.lock().await.sequence())
+    }
+
+    async fn append_entry_if_revision(
+        &self,
+        entry: ProvisionedEntry,
+        lane: &str,
+        expected: u64,
+    ) -> SessionResult<Entry> {
+        let lane = lane.to_owned();
+        self.run_owned(move |s| async move {
+            s.state.lock().await.check_revision(expected)?;
+            s.append_entry_owned(entry, &lane).await
+        })
+        .await
+    }
+
+    async fn append_record_if_revision(
+        &self,
+        record: LaneRecord,
+        expected: u64,
+    ) -> SessionResult<LaneRecord> {
+        self.run_owned(move |s| async move {
+            s.state.lock().await.check_revision(expected)?;
+            s.append_record_owned(record).await
+        })
+        .await
+    }
+
     async fn append_entry(&self, entry: ProvisionedEntry, lane: &str) -> SessionResult<Entry> {
         let lane = lane.to_string();
         self.run_owned(move |s| async move { s.append_entry_owned(entry, &lane).await })
@@ -757,6 +851,19 @@ impl SessionStorage for JsonlSessionStorage {
     async fn append_record(&self, record: LaneRecord) -> SessionResult<LaneRecord> {
         self.run_owned(move |s| async move { s.append_record_owned(record).await })
             .await
+    }
+    async fn append_queue_cancellations(
+        &self,
+        records: Vec<LaneRecord>,
+    ) -> SessionResult<Vec<LaneRecord>> {
+        self.run_owned(move |s| async move {
+            s.state
+                .lock()
+                .await
+                .validate_queue_cancellations(&records)?;
+            s.append_record_batch_owned(records).await
+        })
+        .await
     }
     async fn append_records(&self, records: Vec<LaneRecord>) -> SessionResult<Vec<LaneRecord>> {
         self.run_owned(move |s| async move { s.append_records_owned(records).await })
@@ -794,6 +901,14 @@ impl SessionStorage for JsonlSessionStorage {
     async fn find_records(&self, query: &RecordQuery) -> SessionResult<Vec<LaneRecord>> {
         let state = self.state.lock().await;
         state.find_records(query)
+    }
+
+    async fn record_page(
+        &self,
+        query: &crate::session::types::RecordPageQuery,
+    ) -> SessionResult<crate::session::types::RecordPage> {
+        let state = self.state.lock().await;
+        state.record_page(query)
     }
 
     async fn find_open_operations(
@@ -846,6 +961,7 @@ impl SessionStorage for JsonlSessionStorage {
     /// caller's `await` on the append returns.
     async fn drain(&self) {
         let _reservation = self.tail.lock().await;
+        self.progress.drain().await;
     }
 }
 

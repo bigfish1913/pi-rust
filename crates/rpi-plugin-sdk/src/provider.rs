@@ -81,6 +81,74 @@ struct Request {
     model: Model,
     context: Context,
     options: serde_json::Value,
+    /// Host capabilities; absent (`null`) on hosts that predate them.
+    #[serde(default)]
+    capabilities: serde_json::Value,
+}
+
+thread_local! {
+    static HOST_CAPABILITIES: std::cell::RefCell<serde_json::Value> =
+        const { std::cell::RefCell::new(serde_json::Value::Null) };
+}
+
+/// The `capabilities` object of the request the bridge is driving, or `null`
+/// when the host sent none (a host that predates them) or no request is active.
+///
+/// It is set only on the request thread, for the whole bridge call, so a
+/// factory can read it and hand what it needs to the provider it builds. On any
+/// other thread it is `null`. That includes tasks a provider spawns under
+/// [`drive_with_context`], which run on the pooled runtime's worker threads, so
+/// read it in the factory and capture the value. For example, a provider may
+/// only produce `ToolCall::recorded` when `capabilities["recordedToolCalls"]` is
+/// at least `1`. The bridge enforces that rule itself from the request, not from
+/// this value, so a `null` read on the wrong thread can only make a provider
+/// more cautious: on a host without the capability, a final message with a
+/// recorded call becomes an error either way.
+pub fn host_capabilities() -> serde_json::Value {
+    HOST_CAPABILITIES.with(|capabilities| capabilities.borrow().clone())
+}
+
+/// Run `f` with [`host_capabilities`] returning `capabilities`.
+fn with_host_capabilities<R>(capabilities: &serde_json::Value, f: impl FnOnce() -> R) -> R {
+    struct Restore(serde_json::Value);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = std::mem::take(&mut self.0);
+            HOST_CAPABILITIES.with(|capabilities| *capabilities.borrow_mut() = previous);
+        }
+    }
+    let _restore = Restore(HOST_CAPABILITIES.with(|current| current.replace(capabilities.clone())));
+    f()
+}
+
+/// A host that predates `recorded` ignores it and executes the call, so a
+/// recorded call must never reach it in a final message that can execute. An
+/// error or aborted message executes nothing and keeps its own terminal.
+fn refuse_unsupported_recording(request: &Request, message: AssistantMessage) -> AssistantMessage {
+    let supported = request.capabilities["recordedToolCalls"]
+        .as_u64()
+        .is_some_and(|version| version >= 1);
+    let recorded = message
+        .content
+        .iter()
+        .any(|block| matches!(block, rpi_ai::Content::ToolCall(call) if call.recorded.is_some()));
+    if supported
+        || !recorded
+        || matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)
+    {
+        return message;
+    }
+    AssistantMessage {
+        usage: message.usage,
+        ..AssistantMessage::terminal(
+            request.model.api.clone(),
+            request.model.provider.clone(),
+            request.model.id.clone(),
+            StopReason::Error,
+            "host does not support recorded tool calls",
+            0,
+        )
+    }
 }
 
 fn options(value: &serde_json::Value) -> SimpleStreamOptions {
@@ -213,7 +281,7 @@ fn event_json(
         chunk.get("partial")?.get("content")?.get(index).cloned()
     });
     if let Some(tool) = tool {
-        for field in ["id", "name", "arguments"] {
+        for field in ["id", "name", "arguments", "recorded"] {
             if let Some(value) = tool.get(field) {
                 chunk[field] = value.clone();
             }
@@ -241,7 +309,7 @@ async fn drive_stream(
     ));
     let mut previous_text = None;
     let mut poll = tokio::time::interval(Duration::from_millis(10));
-    loop {
+    let message = loop {
         // Check synchronously too: an already-buffered provider can
         // finish before the interval's initial tick becomes ready.
         if options.signal.is_cancelled()
@@ -289,7 +357,8 @@ async fn drive_stream(
                 }
             }
         }
-    }
+    };
+    refuse_unsupported_recording(request, message)
 }
 
 /// Drive a synchronous plugin request without retaining any borrowed ABI data.
@@ -320,9 +389,11 @@ pub unsafe fn drive(
             return 1;
         };
         let control = unsafe { control.as_ref() };
-        let message = runtime.block_on(async {
-            let provider = factory(&request.model, &options);
-            drive_stream(provider, &request, &options, emit, emit_data, control).await
+        let message = with_host_capabilities(&request.capabilities, || {
+            runtime.block_on(async {
+                let provider = factory(&request.model, &options);
+                drive_stream(provider, &request, &options, emit, emit_data, control).await
+            })
         });
         // Convert via Value to normalize tagged Content's field representation.
         let json = serde_json::to_value(message)
@@ -538,5 +609,217 @@ mod tests {
         assert_eq!(options.max_tokens, Some(80));
         assert_eq!(options.session_id.as_deref(), Some("s"));
         assert_eq!(options.headers.unwrap()["x-custom"], "value");
+    }
+
+    thread_local! {
+        /// What the recorded-call factory saw through [`host_capabilities`].
+        /// Per thread: the bridge calls the factory on the request thread, and
+        /// tests run in parallel.
+        static SEEN_CAPABILITIES: std::cell::RefCell<Vec<serde_json::Value>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn recording() -> serde_json::Value {
+        serde_json::json!({"version":1,"isError":false,
+            "result":{"content":[{"type":"text","text":"ran upstream"}]}})
+    }
+
+    /// A provider whose remote agent already ran its one tool call.
+    fn recorded_factory(model: &Model, _: &SimpleStreamOptions) -> Arc<dyn Provider> {
+        SEEN_CAPABILITIES.with(|seen| seen.borrow_mut().push(host_capabilities()));
+        recorded_provider(model, StopReason::ToolUse)
+    }
+
+    /// The same provider, but its turn failed after the call ran upstream.
+    fn recorded_error_factory(model: &Model, _: &SimpleStreamOptions) -> Arc<dyn Provider> {
+        recorded_provider(model, StopReason::Error)
+    }
+
+    fn recorded_provider(model: &Model, stop_reason: StopReason) -> Arc<dyn Provider> {
+        let mut message = AssistantMessage::empty(
+            model.api.clone(),
+            model.provider.clone(),
+            model.id.clone(),
+            0,
+        );
+        message.stop_reason = stop_reason;
+        if stop_reason == StopReason::Error {
+            message.error_message = Some("upstream failed".into());
+        }
+        message.content.push(
+            serde_json::from_value(serde_json::json!({"type":"toolCall","id":"c1",
+                "name":"shell","arguments":{"command":"ls"},"recorded":recording()}))
+            .unwrap(),
+        );
+        let script = rpi_ai::providers::faux::FauxScript::new();
+        script.set_responses(vec![rpi_ai::providers::faux::FauxStep::message(message)]);
+        rpi_ai::providers::faux::FauxProvider::new(script)
+    }
+
+    fn context_recorded_factory(
+        _: &ProviderContext,
+        model: &Model,
+        options: &SimpleStreamOptions,
+    ) -> Result<Arc<dyn Provider>, String> {
+        Ok(recorded_factory(model, options))
+    }
+
+    /// Drive the recorded-call provider through `drive` (or the context bridge)
+    /// for a host that sends `capabilities`, or none at all.
+    fn drive_recorded(
+        capabilities: Option<serde_json::Value>,
+        with_context: bool,
+    ) -> (Vec<serde_json::Value>, AssistantMessage) {
+        let mut request: serde_json::Value = serde_json::from_str(&request()).unwrap();
+        if let Some(capabilities) = capabilities {
+            request["capabilities"] = capabilities;
+        }
+        let request = request.to_string();
+        let mut chunks = Vec::<serde_json::Value>::new();
+        let mut out = StbString::empty();
+        let data = (&mut chunks as *mut Vec<serde_json::Value>).cast();
+        let rc = unsafe {
+            if with_context {
+                drive_with_context(
+                    context_recorded_factory,
+                    std::ptr::null_mut(),
+                    StbStringRef::from_str(&request),
+                    Some(collect),
+                    data,
+                    std::ptr::null(),
+                    &mut out,
+                )
+            } else {
+                drive(
+                    recorded_factory,
+                    StbStringRef::from_str(&request),
+                    Some(collect),
+                    data,
+                    std::ptr::null(),
+                    &mut out,
+                )
+            }
+        };
+        assert_eq!(rc, 0);
+        let output = unsafe {
+            crate::callbacks::OwnedString::from_raw(out, Some(crate::callbacks::free_string))
+        };
+        (
+            chunks,
+            serde_json::from_str(&output.to_string_lossy()).unwrap(),
+        )
+    }
+
+    fn has_tool_call(message: &AssistantMessage) -> bool {
+        message
+            .content
+            .iter()
+            .any(|block| matches!(block, rpi_ai::Content::ToolCall(_)))
+    }
+
+    /// A host from before `recorded` ignores it and runs the call. The bridge
+    /// sees no `recordedToolCalls` capability, so it fails the turn instead of
+    /// handing that host an executable copy of a call that already ran.
+    #[test]
+    fn an_old_host_gets_an_error_instead_of_a_recorded_call() {
+        for with_context in [false, true] {
+            for capabilities in [
+                None,
+                Some(serde_json::json!({})),
+                Some(serde_json::json!({"recordedToolCalls": 0})),
+            ] {
+                let (_, out) = drive_recorded(capabilities.clone(), with_context);
+                assert_eq!(out.stop_reason, StopReason::Error, "{capabilities:?}");
+                assert!(!has_tool_call(&out), "{out:?}");
+                assert_eq!(
+                    out.error_message.as_deref(),
+                    Some("host does not support recorded tool calls")
+                );
+                // The turn's usage is still reported.
+                let (_, reference) = drive_recorded(
+                    Some(serde_json::json!({"recordedToolCalls": 1})),
+                    with_context,
+                );
+                assert!(reference.usage.total_tokens > 0);
+                assert_eq!(out.usage, reference.usage);
+            }
+        }
+    }
+
+    /// A host that decodes recording version 1 or later gets the recording on
+    /// the `toolcall_end` chunk and in the final message, and the provider can
+    /// read the capability through `host_capabilities`.
+    #[test]
+    fn a_new_host_gets_the_recording_on_the_end_chunk_and_in_out() {
+        for with_context in [false, true] {
+            for version in [1, 2] {
+                let capabilities = serde_json::json!({ "recordedToolCalls": version });
+                SEEN_CAPABILITIES.with(|seen| seen.borrow_mut().clear());
+                let (chunks, out) = drive_recorded(Some(capabilities.clone()), with_context);
+                SEEN_CAPABILITIES.with(|seen| assert_eq!(*seen.borrow(), vec![capabilities]));
+                let end = chunks
+                    .iter()
+                    .find(|chunk| chunk["type"] == "toolcall_end")
+                    .expect("a toolcall_end chunk");
+                assert_eq!(end["id"], "c1");
+                assert_eq!(end["recorded"], recording());
+                assert_eq!(out.stop_reason, StopReason::ToolUse);
+                let Some(rpi_ai::Content::ToolCall(call)) = out.content.first() else {
+                    panic!("expected the recorded call, got {out:?}");
+                };
+                assert_eq!(call.recorded, Some(recording()));
+            }
+        }
+        assert_eq!(host_capabilities(), serde_json::Value::Null);
+    }
+
+    /// An ordinary call's chunk gains no `recorded` key.
+    #[test]
+    fn an_ordinary_end_chunk_has_no_recorded_key() {
+        let mut chunks = Vec::<serde_json::Value>::new();
+        let mut out = StbString::empty();
+        let rc = unsafe {
+            drive(
+                factory,
+                StbStringRef::from_str(&request()),
+                Some(collect),
+                (&mut chunks as *mut Vec<serde_json::Value>).cast(),
+                std::ptr::null(),
+                &mut out,
+            )
+        };
+        assert_eq!(rc, 0);
+        drop(unsafe {
+            crate::callbacks::OwnedString::from_raw(out, Some(crate::callbacks::free_string))
+        });
+        let end = chunks
+            .iter()
+            .find(|chunk| chunk["type"] == "toolcall_end")
+            .unwrap();
+        assert!(end.get("recorded").is_none(), "{end}");
+    }
+
+    /// A failed turn already executes nothing, so the bridge keeps its own
+    /// error rather than replacing it for an old host.
+    #[test]
+    fn an_old_host_keeps_a_failed_turns_own_error() {
+        let mut out = StbString::empty();
+        let rc = unsafe {
+            drive(
+                recorded_error_factory,
+                StbStringRef::from_str(&request()),
+                None,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                &mut out,
+            )
+        };
+        assert_eq!(rc, 0);
+        let output = unsafe {
+            crate::callbacks::OwnedString::from_raw(out, Some(crate::callbacks::free_string))
+        };
+        let message: AssistantMessage = serde_json::from_str(&output.to_string_lossy()).unwrap();
+        assert_eq!(message.stop_reason, StopReason::Error);
+        assert_eq!(message.error_message.as_deref(), Some("upstream failed"));
     }
 }

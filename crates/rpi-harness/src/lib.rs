@@ -27,6 +27,7 @@ pub mod session;
 pub mod settle;
 pub mod skills;
 pub mod system_prompt;
+mod tool_execution;
 pub mod tool_recovery;
 pub mod types;
 pub mod watcher;

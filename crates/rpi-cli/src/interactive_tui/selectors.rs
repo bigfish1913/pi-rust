@@ -1031,8 +1031,13 @@ pub(super) fn open_images_selector(
     chat: &Arc<Container>,
 ) {
     let current = *state.show_images.lock().unwrap();
+    // Say up front that this terminal cannot paint the images, instead of
+    // letting "Inline images enabled" imply they will appear.
+    let can_display = rpi_tui::get_capabilities().protocol != rpi_tui::ImageProtocol::None;
     let items = vec![
-        SelectItem::new("yes", "Yes").with_description(if current {
+        SelectItem::new("yes", "Yes").with_description(if !can_display {
+            "Inline images (this terminal shows placeholders)"
+        } else if current {
             "Inline images (current)"
         } else {
             "Inline images"
@@ -1055,7 +1060,7 @@ pub(super) fn open_images_selector(
         state_sel.set_show_images(on);
         add_note_message(
             &chat_sel,
-            &format!("Inline images {}.", if on { "enabled" } else { "disabled" }),
+            &images_setting_note(on, rpi_tui::get_capabilities().protocol),
         );
         close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
     }));

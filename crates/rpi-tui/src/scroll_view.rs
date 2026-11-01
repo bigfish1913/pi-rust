@@ -99,10 +99,27 @@ impl ScrollViewState {
     }
 }
 
+/// Immutable content and viewport position from one rendered frame.
+#[derive(Clone)]
+pub struct ScrollSnapshot {
+    pub scroll_top: usize,
+    pub content_width: usize,
+    pub document: Arc<RenderedDocument>,
+}
+
 #[derive(Clone)]
 struct ScrollRenderCache {
     content_width: usize,
+    /// Cell geometry the document was rendered for.
+    ///
+    /// Image rows are derived from the terminal's cell size, so a document
+    /// rendered for another geometry holds placements of the wrong height even
+    /// when the content width is identical. Keying the cache on width alone
+    /// would serve those stale rows to a pure scroll frame.
+    cells: crate::terminal_image::CellDimensions,
     document: Arc<RenderedDocument>,
+    /// Position used to slice this viewport, not a pending live scroll delta.
+    scroll_top: usize,
 }
 
 /// ScrollView - A scrollable container.
@@ -206,11 +223,28 @@ impl ScrollView {
         let content_width = self.get_content_width(width);
         let cache = self.render_cache.lock().ok()?;
         let cache = cache.as_ref()?;
-        if cache.content_width != content_width {
+        if cache.content_width != content_width
+            || cache.cells != crate::terminal_image::effective_cell_dimensions()
+        {
             return None;
         }
         let height = cache.document.len();
         Some(cache.document.lines(0, height))
+    }
+
+    /// Capture the cached document without copying historical rows.
+    pub fn snapshot(&self, width: usize) -> Option<ScrollSnapshot> {
+        let content_width = self.get_content_width(width);
+        let cache = self.render_cache.lock().ok()?;
+        let cache = cache.as_ref()?;
+        if cache.content_width != content_width {
+            return None;
+        }
+        Some(ScrollSnapshot {
+            scroll_top: cache.scroll_top,
+            content_width,
+            document: cache.document.clone(),
+        })
     }
 
     /// Check if scrollbar is visible.
@@ -279,6 +313,34 @@ impl ScrollView {
             delta - moved
         } else {
             delta
+        }
+    }
+
+    /// Pause follow-end at a frame's position without requesting a render.
+    /// Returns whether follow-end was active before pausing.
+    pub fn pause_follow_at(&self, position: usize) -> bool {
+        if let Ok(mut state) = self.state.lock() {
+            let was_following_end = state.is_following_end;
+            let max_scroll = state.content_height.saturating_sub(state.viewport_height);
+            state.scroll_top = position.min(max_scroll);
+            state.is_following_end = false;
+            state.follow_suppressed_at_end = true;
+            was_following_end
+        } else {
+            false
+        }
+    }
+
+    /// Restore a temporary click pause unless explicit navigation superseded
+    /// it. Layout clamping does not count as user navigation. No render callback:
+    /// callers may be cancelling a press while already assembling a frame.
+    pub(crate) fn resume_follow_after_click(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            if self.options.follow == FollowMode::End && state.follow_suppressed_at_end {
+                state.scroll_top = state.content_height.saturating_sub(state.viewport_height);
+                state.is_following_end = true;
+                state.follow_suppressed_at_end = false;
+            }
         }
     }
 
@@ -356,10 +418,8 @@ impl ScrollView {
             let max_scroll = content_height.saturating_sub(viewport_height);
             state.scroll_top = state.scroll_top.min(max_scroll);
 
-            // Update follow state
-            if state.scroll_top < max_scroll {
-                state.follow_suppressed_at_end = false;
-            }
+            // Update follow state. Explicit pauses survive layout changes,
+            // including a viewport that temporarily fits all content.
             if self.options.follow == FollowMode::End
                 && !self.options.preserve_manual_position
                 && state.scroll_top == max_scroll
@@ -399,6 +459,19 @@ impl ScrollView {
         self.render_with_viewport_impl(width, height, true)
     }
 
+    /// Document rendered for the last viewport pass.
+    ///
+    /// The layout uses it to find placements that scrolled above the viewport:
+    /// a kitty escape lives on the image's first row, which the visible slice
+    /// no longer contains, so the placement has to be re-anchored to the first
+    /// visible row and cropped to the rows that are still on screen.
+    pub(crate) fn rendered_document(&self) -> Option<Arc<RenderedDocument>> {
+        self.render_cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.as_ref().map(|cache| cache.document.clone()))
+    }
+
     fn render_with_viewport_impl(
         &self,
         width: usize,
@@ -406,25 +479,19 @@ impl ScrollView {
         reuse_cached_content: bool,
     ) -> Vec<String> {
         let content_width = self.get_content_width(width);
+        let cells = crate::terminal_image::effective_cell_dimensions();
         let cached = if reuse_cached_content {
             self.render_cache
                 .lock()
                 .ok()
                 .and_then(|cache| cache.clone())
-                .filter(|cache| cache.content_width == content_width)
+                .filter(|cache| cache.content_width == content_width && cache.cells == cells)
         } else {
             None
         };
-        let document = cached.map(|cache| cache.document).unwrap_or_else(|| {
-            let document = Arc::new(self.child.render_document(content_width));
-            if let Ok(mut cache) = self.render_cache.lock() {
-                *cache = Some(ScrollRenderCache {
-                    content_width,
-                    document: document.clone(),
-                });
-            }
-            document
-        });
+        let document = cached
+            .map(|cache| cache.document)
+            .unwrap_or_else(|| Arc::new(self.child.render_document(content_width)));
         let content_height = document.len();
 
         // Update state
@@ -471,6 +538,16 @@ impl ScrollView {
             }
         }
 
+        // Cache exactly the source and offset used for the returned rows.
+        // A wheel event may have changed live state while rendering them.
+        if let Ok(mut cache) = self.render_cache.lock() {
+            *cache = Some(ScrollRenderCache {
+                content_width,
+                cells,
+                document,
+                scroll_top,
+            });
+        }
         visible
     }
 
@@ -543,6 +620,67 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_shares_document_and_survives_scroll_and_cache_replacement() {
+        let rows = Arc::new((0..50).map(|i| format!("row {i}")).collect());
+        let scroll = ScrollView::new(
+            Arc::new(SharedHistory(rows)),
+            ScrollViewOptions {
+                scrollbar: ScrollbarMode::Always,
+                ..Default::default()
+            },
+        );
+        assert!(scroll.snapshot(40).is_none());
+        scroll.render_with_viewport(40, 10);
+        let snapshot = scroll.snapshot(40).unwrap();
+        assert_eq!(snapshot.content_width, 39);
+        assert_eq!(snapshot.scroll_top, 40);
+        assert!(Arc::ptr_eq(
+            &snapshot.document,
+            &scroll
+                .render_cache
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .document
+        ));
+        assert!(scroll.snapshot(39).is_none());
+
+        scroll.scroll_by(-10);
+        assert_eq!(scroll.scroll_top(), 30);
+        assert_eq!(
+            scroll.snapshot(40).unwrap().scroll_top,
+            40,
+            "pending scroll has not painted yet"
+        );
+        scroll.render_with_cached_content(40, 10);
+        assert_eq!(scroll.snapshot(40).unwrap().scroll_top, 30);
+        assert_eq!(snapshot.scroll_top, 40);
+        scroll.invalidate();
+        assert!(scroll.snapshot(40).is_none());
+        scroll.render_with_viewport(20, 10);
+        let replacement = scroll.snapshot(20).unwrap();
+        assert!(!Arc::ptr_eq(&snapshot.document, &replacement.document));
+        assert_eq!(snapshot.content_width, 39);
+        assert_eq!(snapshot.document.lines(snapshot.scroll_top, 1), ["row 40"]);
+    }
+
+    #[test]
+    fn snapshot_keeps_old_content_after_mutable_child_refresh() {
+        let child = Arc::new(MutableRow(Mutex::new("original".into())));
+        let scroll = ScrollView::simple(child.clone());
+        scroll.render_with_viewport(40, 1);
+        let snapshot = scroll.snapshot(40).unwrap();
+        *child.0.lock().unwrap() = "replacement".into();
+        scroll.render_with_viewport(40, 1);
+        assert_eq!(snapshot.document.lines(0, 1), ["original"]);
+        assert_eq!(
+            scroll.snapshot(40).unwrap().document.lines(0, 1),
+            ["replacement"]
+        );
+    }
+
+    #[test]
     fn fresh_frames_share_history_and_refresh_arbitrary_mutable_children() {
         for size in [1, 1_000, 10_000] {
             let rows = Arc::new(vec!["historical row".repeat(16); size]);
@@ -588,6 +726,70 @@ mod tests {
             );
             assert_eq!(Arc::strong_count(&rows), 3);
         }
+    }
+
+    /// A pure scroll frame reuses the last rendered document, but only for the
+    /// geometry it was rendered at: image rows are derived from the cell size, so
+    /// serving a document rendered for another geometry would keep the previous
+    /// row heights in the transcript.
+    ///
+    /// The counter proves the child was actually re-rendered — asserting only on
+    /// the rows would pass on a document that happened to look the same.
+    #[test]
+    fn cached_content_is_dropped_when_only_the_cell_geometry_changed() {
+        struct CountingChild {
+            renders: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl Component for CountingChild {
+            fn render(&self, _: usize) -> Vec<String> {
+                self.render_document(0).lines(0, usize::MAX)
+            }
+            fn render_document(&self, _: usize) -> RenderedDocument {
+                self.renders
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                RenderedDocument::from_lines(vec!["row".into()])
+            }
+            fn invalidate(&self) {}
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        // The capability cache is process-wide, so this probe has to hold the
+        // shared lock: without it a parallel test can observe the geometry swap
+        // mid-assertion (or this one can observe theirs).
+        let _g = crate::terminal_image::capability_test_lock();
+        let saved = crate::terminal_image::get_capabilities();
+        struct Restore(crate::terminal_image::TerminalCapabilities);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                crate::terminal_image::set_capabilities(self.0.clone());
+            }
+        }
+        let _restore = Restore(saved);
+
+        crate::terminal_image::set_cell_dimensions(10, 20);
+        let renders = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let scroll = ScrollView::new(
+            Arc::new(CountingChild {
+                renders: renders.clone(),
+            }),
+            ScrollViewOptions {
+                scrollbar: ScrollbarMode::Hidden,
+                ..Default::default()
+            },
+        );
+
+        scroll.render_with_cached_content(40, 1);
+        assert_eq!(renders.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // Same width and geometry: the cache is what makes a pure scroll free.
+        scroll.render_with_cached_content(40, 1);
+        assert_eq!(renders.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Same width, new cell geometry: the cached document is stale.
+        crate::terminal_image::set_cell_dimensions(10, 10);
+        scroll.render_with_cached_content(40, 1);
+        assert_eq!(renders.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -817,6 +1019,50 @@ mod scroll_tests {
         assert!(!sv.is_following_end());
         sv.scroll_to_end();
         assert!(sv.is_following_end());
+    }
+
+    #[test]
+    fn pause_follow_survives_append_resize_and_temporary_fit() {
+        let (sv, inner) = tall_scroll();
+        sv.render_with_viewport(40, 10);
+        let callbacks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_count = callbacks.clone();
+        sv.update_layout(
+            50,
+            10,
+            Some(Arc::new(move || {
+                callback_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })),
+        );
+        assert!(sv.pause_follow_at(usize::MAX));
+        assert_eq!(sv.scroll_top(), 40, "pause clamps to the current maximum");
+        assert!(!sv.pause_follow_at(30));
+        assert_eq!(callbacks.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!sv.is_following_end());
+
+        inner.add_child(Arc::new(Text::new("new output", 0, 0)));
+        sv.render_with_viewport(40, 10);
+        assert_eq!(sv.scroll_top(), 30);
+        assert!(!sv.is_following_end());
+        // A dock resize first clamps the paused position to the end, then
+        // temporarily fits everything. Neither may re-enable follow-end.
+        sv.render_with_viewport(40, 25);
+        assert_eq!(sv.scroll_top(), 26);
+        assert!(!sv.is_following_end());
+        sv.render_with_viewport(40, 100);
+        assert_eq!(sv.scroll_top(), 0);
+        assert!(!sv.is_following_end());
+        inner.add_child(Arc::new(Text::new("more output", 0, 0)));
+        sv.render_with_viewport(20, 10);
+        assert_eq!(sv.scroll_top(), 0);
+        assert!(!sv.is_following_end());
+
+        sv.scroll_to_end();
+        assert!(sv.is_following_end());
+        let previous_end = sv.scroll_top();
+        inner.add_child(Arc::new(Text::new("followed output", 0, 0)));
+        sv.render_with_viewport(20, 10);
+        assert!(sv.scroll_top() > previous_end);
     }
 
     #[test]

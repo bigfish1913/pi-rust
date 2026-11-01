@@ -98,6 +98,7 @@ impl RuntimeConfig {
                 .iter()
                 .find(|manifest| manifest.id == provider),
             values,
+            providers.refreshes_oauth(provider),
             || {
                 provider::provider_has_auth_headers(
                     provider,

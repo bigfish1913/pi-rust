@@ -60,6 +60,11 @@ jobs:
           fi
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Return the existing Release PR to draft before updating it
+        id: draft-release-pr
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_AUTOMATION_TOKEN }}
+        run: python3 scripts/release-automation.py draft-release-prs
       - name: Prepare versions and changelog
         id: release-pr
         uses: release-plz/action@8921286633dfa0c4020f7f30bd1c14fe19cbb10e # v0.5.142
@@ -72,6 +77,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.RELEASE_AUTOMATION_TOKEN }}
           RELEASE_PR_JSON: ${{ steps.release-pr.outputs.pr }}
+          EXISTING_RELEASE_PR_JSON: ${{ steps.draft-release-pr.outputs.pr }}
         run: bash scripts/sync-release-pr.sh
 
   publish:

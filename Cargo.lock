@@ -2039,7 +2039,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-agent"
-version = "0.11.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -2056,7 +2056,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-ai"
-version = "0.11.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -2079,7 +2079,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-cli"
-version = "0.11.0"
+version = "0.15.0"
 dependencies = [
  "arboard",
  "async-trait",
@@ -2124,7 +2124,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-extensions"
-version = "0.11.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "dirs",
@@ -2145,7 +2145,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-harness"
-version = "0.11.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -2157,6 +2157,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -2168,7 +2169,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-plugin-sdk"
-version = "0.11.0"
+version = "0.15.0"
 dependencies = [
  "ciborium",
  "libc",
@@ -2182,7 +2183,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-runtime"
-version = "0.11.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "indexmap 2.11.4",
@@ -2197,7 +2198,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-telemetry"
-version = "0.11.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "serde",
@@ -2207,7 +2208,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-tools"
-version = "0.11.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -2215,6 +2216,7 @@ dependencies = [
  "futures",
  "globset",
  "image",
+ "jsonschema",
  "nix",
  "regex",
  "rpi-agent",
@@ -2236,7 +2238,7 @@ dependencies = [
 
 [[package]]
 name = "rpi-tui"
-version = "0.11.0"
+version = "0.15.0"
 dependencies = [
  "base64",
  "crossterm",

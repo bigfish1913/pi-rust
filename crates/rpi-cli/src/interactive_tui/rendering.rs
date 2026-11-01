@@ -389,7 +389,10 @@ pub(super) fn add_hotkeys_message(container: &Arc<Container>) {
         ("Ctrl+Y / Alt+Y", "Yank / yank-pop"),
         ("Alt+Backspace", "Kill previous word"),
         ("Ctrl+C", "Clear the editor (press twice quickly to exit)"),
-        ("Ctrl+X", "Copy the editor selection or the last reply"),
+        (
+            "Ctrl+X",
+            "Copy the mouse/editor selection or the last reply",
+        ),
         ("Esc", "Abort a running prompt"),
         ("Ctrl+L", "Open model selector"),
         ("Ctrl+P", "Cycle to the next model (live)"),

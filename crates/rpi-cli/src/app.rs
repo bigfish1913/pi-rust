@@ -235,6 +235,9 @@ async fn run_inner() -> i32 {
         parsed.mode == crate::args::Mode::Rpc || parsed.unknown_flags.contains_key("server");
 
     // ---- @file attachments → text (TS processFileArguments, text branch only) ----
+    // Deliberately runs BEFORE the cwd adoption below: `@file` paths come from
+    // the shell that launched `rpi`, so they resolve against the launch cwd no
+    // matter which directory the restored session points at.
     let (file_text, file_images) = match process_file_args(&parsed.file_args, &cwd) {
         Ok(t) => t,
         Err(msg) => {
@@ -243,8 +246,63 @@ async fn run_inner() -> i32 {
         }
     };
 
+    // ---- restored-session working directory (adopted before any resource load) ----
+    // A session records the cwd it was created in; restoring one must return
+    // the agent to that directory, because every tool resolves relative paths
+    // against the run's cwd. Adopting it here — before trust resolution,
+    // extension preparation, and the harness build — makes the whole run (tool
+    // env, system prompt, context files, extensions, footer) agree on one
+    // working directory. `@file` args above intentionally stay launch-cwd.
+    //
+    // The session ROOT is frozen first, for the same reason: settings and
+    // `RPI_CODING_AGENT_SESSION_DIR` may change while extensions load, and the
+    // adopted cwd belongs to another project's tree. Pinning the resolved root
+    // into `args` makes `prepare_extensions` and the build below read one root.
+    let session_root = crate::session::configured_session_dir(&parsed, &cwd);
+    parsed.session_dir = Some(session_root.clone());
+    let mut startup_notices: Vec<String> = Vec::new();
+    // The peek and the build both derive their selection from this frozen root,
+    // so they can never inspect one session and open another.
+    let selection = crate::session::select_session_in_dir(&parsed, session_root);
+    let restored_cwd = crate::session::peek_restored_session_cwd(&selection, &cwd).await;
+    // Pin the session the peek resolved: `-c` re-lists the directory when the
+    // build runs, and another `rpi` may have written a newer session in
+    // between. Adopting one session's directory while opening another would
+    // put the tools in a directory the opened conversation never used, which is
+    // the failure this adoption exists to prevent.
+    if let Some(restored) = &restored_cwd {
+        crate::session::pin_restored_selection(&mut parsed, restored);
+    }
+    let launch_cwd = cwd;
+    let cwd = match &restored_cwd {
+        Some(restored) => match &restored.adopted {
+            Some(adopted) => {
+                // Adopting a directory is a behaviour change the user must see:
+                // tools, context files, and extensions all switch projects.
+                startup_notices.push(crate::session_cwd::adopted_session_cwd_note(
+                    &launch_cwd,
+                    adopted,
+                ));
+                adopted.clone()
+            }
+            None => {
+                startup_notices.push(crate::session_cwd::missing_session_cwd_note(
+                    &restored.recorded,
+                    &launch_cwd,
+                ));
+                launch_cwd.clone()
+            }
+        },
+        None => launch_cwd.clone(),
+    };
+
     // ---- provider + model resolution ----
+    // Trust is resolved against the (possibly adopted) cwd: a session recorded
+    // in another project must not inherit the launch directory's trust decision.
     let project_trusted = crate::session::resolve_project_trust(&parsed, &cwd);
+    if !project_trusted && cwd != launch_cwd {
+        startup_notices.push(crate::session_cwd::untrusted_session_cwd_note(&cwd));
+    }
     let prepared = match prepare_extensions(&parsed, &cwd, project_trusted) {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -405,6 +463,18 @@ async fn run_inner() -> i32 {
     // plugin owns.
     let mode = if stdio_claimed { RunMode::Rpc } else { mode };
 
+    // ---- startup notices (restored-session cwd) ----
+    // The interactive TUI renders them as transcript notes (they must survive
+    // into the alternate screen); headless modes print them to stderr like the
+    // other startup warnings.
+    if matches!(mode, RunMode::Interactive) {
+        reload_context.startup_notices = startup_notices;
+    } else {
+        for notice in &startup_notices {
+            eprintln!("warning: {notice}");
+        }
+    }
+
     let dev_cleanup = reload_context.dev_extension.clone();
     let dev_watcher = if matches!(mode, RunMode::Interactive) {
         reload_context
@@ -519,6 +589,7 @@ async fn run_inner() -> i32 {
                         model_catalog,
                         reload_context.ui_dialog.clone(),
                         oauth_snapshot,
+                        parsed.rpc_message_updates,
                     )
                     .await
                 };

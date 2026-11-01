@@ -30,7 +30,7 @@
 //!   The interactive `-c`/`-r`/`--session` paths enable that mode and replay
 //!   the existing branch before appending new messages. See [`SessionSelection`].
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -65,7 +65,7 @@ use crate::resource_dirs::{
 };
 use rpi_extensions::{
     emit_resources_discover, ExtensionEmitter, ExtensionSession, NullDiagnostics,
-    PluginDiagnostics, PluginToolAdapter, TeeEmitter,
+    PluginDiagnostics, PluginToolAdapter, TeeEmitter, ToolPromptMetadata,
 };
 
 /// The coding tools registered by the CLI by default.
@@ -74,7 +74,8 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &["read", "bash", "edit", "write", "docs
 /// The default coding system prompt for the CLI's built-in tools.
 ///
 /// This retains the two-argument API for library callers. Session startup and
-/// reload use [`default_system_prompt_with_tools`] with the actual active tools.
+/// reload use [`default_system_prompt_with_tool_prompts`] with the actual active
+/// tools and their winning extension metadata.
 pub fn default_system_prompt(cwd: &str, prior_reasoning_replayed: bool) -> String {
     let tools = BUILTIN_TOOL_NAMES
         .iter()
@@ -87,53 +88,75 @@ pub fn default_system_prompt(cwd: &str, prior_reasoning_replayed: bool) -> Strin
 /// `packages/coding-agent/src/core/system-prompt.ts` base prompt.
 ///
 /// `tools` is the active tool set after `--tools`/`--exclude-tools` and
-/// extension merging: the prompt lists only those tools and keeps only the
-/// guidelines that mention one of them, so a restricted run is never told it
-/// can edit or track todos (pi builds its list from the selected tools too).
+/// extension merging. Like pi, the text list includes only tools with an
+/// explicit prompt snippet; other active tools remain available through their
+/// provider-facing schemas. Tool-specific guidelines still follow the full
+/// active set, so restricted runs get no guidance for unavailable tools.
 pub fn default_system_prompt_with_tools(
     cwd: &str,
     prior_reasoning_replayed: bool,
     tools: &[String],
 ) -> String {
-    let has = |name: &str| tools.iter().any(|tool| tool == name);
-    let todo_hint = if has("todo") {
-        "\n  Keep the steps of multi-step work in the todo tool and mark them done as you go."
-    } else {
-        ""
-    };
+    default_system_prompt_with_tool_prompts(cwd, prior_reasoning_replayed, tools, &BTreeMap::new())
+}
+
+/// Render pi-style explicit prompt contributions for the active tool set.
+/// Entries override built-in metadata, including an empty entry for an
+/// extension that replaces a built-in without contributing a prompt snippet.
+/// Inactive metadata is ignored. Schemas and callable tools are not modified.
+pub fn default_system_prompt_with_tool_prompts(
+    cwd: &str,
+    prior_reasoning_replayed: bool,
+    tools: &[String],
+    overrides: &BTreeMap<String, ToolPromptMetadata>,
+) -> String {
+    let metadata: BTreeMap<_, _> = tools
+        .iter()
+        .map(|name| {
+            let prompt = overrides
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| ToolPromptMetadata {
+                    prompt_snippet: builtin_tool_snippet(name).map(str::to_owned),
+                    prompt_guidelines: Vec::new(),
+                })
+                .normalized();
+            (name.as_str(), prompt)
+        })
+        .collect();
     // The working-state rule must match what actually comes back on the next
     // request. With `compat.requiresThinkingAsText` (or the native thinking
     // channels of anthropic/responses) the model *does* see its own reasoning
     // again, and claiming otherwise makes it re-derive and restate the plan
     // every turn — the re-plan symptom in `docs/llm-repetition-forensics.md`.
-    // One rule covers the plan, the todo tool and the anti-repetition line, so
-    // none of them is stated twice.
     let working_state_rule = if prior_reasoning_replayed {
-        format!(
-            "- Your reasoning is carried back to you on the next turn: do not re-derive it or restate
-  the plan. Continue from the last unfinished step, and when a step lands, say which one.{todo_hint}
+        "- Your reasoning is carried back to you on the next turn: do not re-derive it or restate
+  the plan. Continue from the last unfinished step, and when a step lands, say which one.
   Re-stating the same plan without acting on it is a bug, not progress."
-        )
     } else {
-        format!(
-            "- Your reasoning is not carried into your next turn; only your visible replies and tool
+        "- Your reasoning is not carried into your next turn; only your visible replies and tool
   output come back. Before each batch of tool calls, write one short line naming the step you
-  are on and what remains, and say which step is done when it lands.{todo_hint}
+  are on and what remains, and say which step is done when it lands.
   Re-stating the same plan without acting on it is a bug, not progress."
-        )
     };
 
-    let tool_lines = if tools.is_empty() {
+    // The text list is a selective summary, not the tool registry. In
+    // particular, do not repeat extension tool names without a prompt snippet.
+    let tool_lines = tools
+        .iter()
+        .filter_map(|name| {
+            metadata
+                .get(name.as_str())?
+                .prompt_snippet
+                .as_ref()
+                .map(|snippet| format!("- {name:<5} — {snippet}"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let tool_lines = if tool_lines.is_empty() {
         "(none)".to_string()
     } else {
-        tools
-            .iter()
-            .map(|name| match builtin_tool_snippet(name) {
-                Some(snippet) => format!("- {name:<5} — {snippet}"),
-                None => format!("- {name}"),
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+        tool_lines
     };
 
     // Tool-specific rules (Bash on Windows, docs before guessing) live in the
@@ -144,11 +167,27 @@ pub fn default_system_prompt_with_tools(
         "- Be concise in your responses",
         "- Show file paths clearly when working with files",
         "- Prefer the smallest change that solves the problem",
-        &working_state_rule,
+        working_state_rule,
         "- Read only what you need. If a file or search result was already shown earlier in this
   conversation, use it instead of fetching it again.",
     ];
-    let guidelines = guidelines.join("\n");
+    // Tools contribute rules even without snippets. Like pi, trim and dedupe
+    // across the full active set and the core rules, preserving first occurrence.
+    let mut seen = HashSet::new();
+    let tool_rules = tools
+        .iter()
+        .flat_map(|name| &metadata[name.as_str()].prompt_guidelines)
+        .map(String::as_str);
+    let core_rules = guidelines
+        .iter()
+        .map(|rule| rule.strip_prefix("- ").unwrap_or(rule));
+    let guidelines = tool_rules
+        .chain(core_rules)
+        .map(str::trim)
+        .filter(|rule| !rule.is_empty() && seen.insert(*rule))
+        .map(|rule| format!("- {rule}"))
+        .collect::<Vec<_>>()
+        .join("\n");
 
     format!(
         "You are an expert coding assistant operating inside rpi, a coding agent harness. \
@@ -157,11 +196,30 @@ You help users by reading files, executing commands, editing code, and writing n
 Available tools:
 {tool_lines}
 
+In addition to the tools above, you may have access to other custom tools depending on the project.
+
 Guidelines:
 {guidelines}
 
 Current working directory: {cwd}"
     )
+}
+
+/// Take metadata from the same winning extension definitions used for tool
+/// merging, including empty metadata for overrides. Called on startup/reload.
+fn extension_tool_prompt_metadata(
+    session: &ExtensionSession,
+) -> BTreeMap<String, ToolPromptMetadata> {
+    session
+        .snapshot()
+        .map(|snapshot| {
+            snapshot
+                .tools()
+                .iter()
+                .map(|tool| (tool.tool.name.clone(), tool.prompt.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// One-line prompt descriptions of the tools rpi itself registers.
@@ -229,7 +287,7 @@ pub(crate) fn configured_session_dir(args: &Args, cwd: &Path) -> PathBuf {
     }
 }
 
-fn select_session_in_dir(args: &Args, dir: PathBuf) -> SessionSelection {
+pub(crate) fn select_session_in_dir(args: &Args, dir: PathBuf) -> SessionSelection {
     if args.no_session {
         return SessionSelection::Ephemeral;
     }
@@ -477,6 +535,11 @@ pub async fn build_prepared(
     let active = filter_active_tool_names(active_tool_names(&tools, args), args);
 
     // ---- Session storage ----
+    // The root is the one `prepare_extensions` froze at startup, never a fresh
+    // `configured_session_dir(args, cwd)`: settings and `RPI_CODING_AGENT_SESSION_DIR`
+    // can change while extensions load, and an adopted session cwd would point
+    // at another project's tree. Both the cwd peek and this build must read the
+    // same root, so the caller pins it into `args` before either runs.
     let selection = select_session_in_dir(args, session_dir.clone());
     let session = build_session(&selection, &cwd_str).await?;
     // Plugin tools now know which session they serve: `todo` and friends key
@@ -510,18 +573,25 @@ pub async fn build_prepared(
     // working-state rule is worded (see `default_system_prompt`).
     let prior_reasoning_replayed = rpi_ai::model::prior_reasoning_is_replayed(&resolved.model);
     let prompt_tools = active.clone();
+    let prompt_metadata = extension_tool_prompt_metadata(&extension_session);
+    let default_prompt = || {
+        default_system_prompt_with_tool_prompts(
+            &cwd_str,
+            prior_reasoning_replayed,
+            &prompt_tools,
+            &prompt_metadata,
+        )
+    };
     let mut context_paths = Vec::new();
     let base_prompt = match args.system_prompt.as_deref() {
         Some(explicit) => explicit.to_string(),
         None if project_trusted => match discover_system_prompt_file(cwd) {
-            Some(path) => read_prompt_source(&path, &mut context_paths).unwrap_or_else(|| {
-                default_system_prompt_with_tools(&cwd_str, prior_reasoning_replayed, &prompt_tools)
-            }),
-            None => {
-                default_system_prompt_with_tools(&cwd_str, prior_reasoning_replayed, &prompt_tools)
+            Some(path) => {
+                read_prompt_source(&path, &mut context_paths).unwrap_or_else(default_prompt)
             }
+            None => default_prompt(),
         },
-        None => default_system_prompt_with_tools(&cwd_str, prior_reasoning_replayed, &prompt_tools),
+        None => default_prompt(),
     };
 
     // ---- Append-text sources (precedence: --append-system-prompt > APPEND_SYSTEM.md) ----
@@ -863,6 +933,7 @@ pub async fn build_prepared(
                     .stream_idle_timeout
                     .map(std::time::Duration::from_secs)
             }),
+            thinking_budgets: saved_settings.thinking_budgets,
             ..Default::default()
         },
         // Settings-backed harness options: upstream lets users tune retry,
@@ -916,6 +987,8 @@ pub async fn build_prepared(
         }
         Err(e) => return Err(BuildError::HarnessCreate(e.to_string())),
     };
+
+    install_extension_settlement_bridge(harness.events(), extension_session_cell.clone());
 
     // ---- Durable operation recovery (runtime layer) ----
     // A previous process can die between `operation_started` and
@@ -987,9 +1060,28 @@ pub async fn build_prepared(
         ext_status: ext_status_mailbox,
         editor_text: editor_text_mailbox,
         dev_extension: None,
+        startup_notices: Vec::new(),
     };
 
     Ok((harness, event_rx, reload_context))
+}
+
+/// Project authoritative harness termination, not per-attempt AgentEnd, to
+/// plugins. The bus owns this listener; its session cell follows reloads and
+/// retains callback libraries, while the action host binds the harness weakly.
+fn install_extension_settlement_bridge(
+    events: &rpi_harness::events::HarnessEventBus,
+    sessions: ExtensionSessionCell,
+) {
+    events.on_lifetime::<rpi_harness::events::RunEndEvent, _>(move |event| {
+        if event.lane != "main" {
+            return;
+        }
+        let session = sessions.lock().unwrap().clone();
+        if let Some(snapshot) = session.snapshot_arc() {
+            rpi_extensions::dispatch_empty_event(&snapshot, rpi_plugin_sdk::EventTag::AgentSettled);
+        }
+    });
 }
 
 /// Resolve the current plugin session for each call rather than keeping a
@@ -1161,6 +1253,12 @@ pub struct ReloadContext {
     /// swapping plugin sessions; its watcher signals `mailbox` after a
     /// successful background build.
     pub dev_extension: Option<Arc<crate::dev_extension::DevExtension>>,
+    /// One-line notices the host should show at startup (a session directory
+    /// that fell back, an untrusted adopted directory). Filled by the CLI after
+    /// the build and rendered as transcript notes in the TUI; headless modes
+    /// print them to stderr. Kept as data — never `eprintln!`d from here, which
+    /// would corrupt the alternate screen (issue #115).
+    pub startup_notices: Vec<String>,
 }
 
 impl ReloadContext {
@@ -1635,19 +1733,26 @@ where
     let mut active = active_tool_names(&tools, &effective_args);
     active = filter_active_tool_names(active, &effective_args);
     let prompt_tools = active.clone();
+    let prompt_metadata = extension_tool_prompt_metadata(&extension_session);
     let prior_reasoning_replayed = rpi_ai::model::prior_reasoning_is_replayed(&ctx.resolved_model);
+    let default_prompt = || {
+        default_system_prompt_with_tool_prompts(
+            &cwd_str,
+            prior_reasoning_replayed,
+            &prompt_tools,
+            &prompt_metadata,
+        )
+    };
     let mut context_paths = Vec::new();
     let base_prompt = match effective_args.system_prompt.as_deref() {
         Some(explicit) => explicit.to_string(),
         None if project_trusted => match discover_system_prompt_file(&ctx.cwd) {
-            Some(path) => read_prompt_source(&path, &mut context_paths).unwrap_or_else(|| {
-                default_system_prompt_with_tools(&cwd_str, prior_reasoning_replayed, &prompt_tools)
-            }),
-            None => {
-                default_system_prompt_with_tools(&cwd_str, prior_reasoning_replayed, &prompt_tools)
+            Some(path) => {
+                read_prompt_source(&path, &mut context_paths).unwrap_or_else(default_prompt)
             }
+            None => default_prompt(),
         },
-        None => default_system_prompt_with_tools(&cwd_str, prior_reasoning_replayed, &prompt_tools),
+        None => default_prompt(),
     };
     let mut append_texts: Vec<String> = Vec::new();
     for extra in &effective_args.append_system_prompt {
@@ -2072,7 +2177,7 @@ pub fn bash_options() -> rpi_tools::tools::bash::BashToolOptions {
     let default = std::env::var("RPI_BASH_TIMEOUT")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(120.0);
+        .unwrap_or(rpi_tools::tools::bash::DEFAULT_BASH_TIMEOUT_SECONDS);
     // Saved user defaults, matching how `defaultTools` is read in `build_tools`.
     // `shellCommandPrefix` is prepended to every command (upstream's key for
     // alias/`shopt` setup). Native's `shellPath` is *not* wired: neither
@@ -2226,44 +2331,141 @@ async fn build_session(selection: &SessionSelection, cwd: &str) -> Result<Sessio
 /// facade. The restored transcript renders into the TUI at startup and the
 /// harness continues appending to the same file.
 async fn restore_session(selection: &SessionSelection, cwd: &str) -> Result<Session, BuildError> {
-    // `list_typed` is newest-first; `Latest` takes the head, `ById` matches
-    // the id exactly or by file-name containment (so `--session 01a02…` or a
-    // partial id works, mirroring the TS id/path matching).
+    // `resolve_restore_target` is newest-first; `Latest` takes the head, `ById`
+    // matches the id exactly or by file-name containment (so `--session 01a02…`
+    // or a partial id works, mirroring the TS id/path matching).
+    let Some(meta) = resolve_restore_target(selection, cwd).await? else {
+        return match selection {
+            // Exact id match only (pi `--session-id`): a missing session is
+            // created fresh under the selected dir instead of an error.
+            SessionSelection::ByExactId { id, dir } => {
+                std::fs::create_dir_all(dir)
+                    .map_err(|e| BuildError::SessionDir(format!("{}: {e}", dir.display())))?;
+                create_jsonl_session_with_id(dir, cwd, Some(id.clone()))
+                    .await
+                    .map_err(|e| BuildError::SessionDir(format!("{}: {e}", dir.display())))
+            }
+            SessionSelection::Latest { dir } => Err(BuildError::SessionNotFound {
+                requested: "the most recent session".to_string(),
+                dir: dir.display().to_string(),
+            }),
+            SessionSelection::ById { id, dir } => Err(BuildError::SessionNotFound {
+                requested: format!("session {id}"),
+                dir: dir.display().to_string(),
+            }),
+            _ => unreachable!("resolve_restore_target only returns None for restore selections"),
+        };
+    };
+    let sessions_root = selection_dir(selection);
+    open_session(&meta, cwd, &sessions_root)
+        .await
+        .map(|restored| restored.session)
+}
+
+/// The sessions root a selection was resolved against.
+fn selection_dir(selection: &SessionSelection) -> PathBuf {
+    match selection {
+        SessionSelection::Ephemeral => PathBuf::new(),
+        SessionSelection::New { dir, .. }
+        | SessionSelection::Latest { dir }
+        | SessionSelection::ById { dir, .. }
+        | SessionSelection::ByExactId { dir, .. }
+        | SessionSelection::Fork { dir, .. } => dir.clone(),
+    }
+}
+
+/// Resolve the metadata a restore selection names, without opening the file.
+///
+/// Shared by the startup build ([`restore_session`]) and the cwd peek
+/// ([`peek_restored_session_cwd`]) so the two can never disagree about which
+/// session a launch restores. Pure listing + matching: no session lock is
+/// claimed and nothing is created.
+async fn resolve_restore_target(
+    selection: &SessionSelection,
+    cwd: &str,
+) -> Result<Option<rpi_harness::session::jsonl::JsonlSessionMetadata>, BuildError> {
     match selection {
         SessionSelection::Latest { dir } => {
             let metas = list_session_metadata_in_dir(cwd, dir).await?;
-            let Some(meta) = first_resumable_session(&metas) else {
-                return Err(BuildError::SessionNotFound {
-                    requested: "the most recent session".to_string(),
-                    dir: dir.display().to_string(),
-                });
-            };
-            open_session(meta, cwd).await
+            Ok(first_resumable_session(&metas).cloned())
         }
-        SessionSelection::ById { id, dir } => open_session_by_id_in_dir(id, cwd, dir)
-            .await
-            .map_err(|e| match e {
-                OpenError::NotFound { requested } => BuildError::SessionNotFound {
-                    requested,
-                    dir: dir.display().to_string(),
-                },
-                OpenError::Other(msg) => BuildError::SessionOpen(msg),
-            }),
+        SessionSelection::ById { id, dir } => find_session_metadata(id, cwd, dir).await,
         SessionSelection::ByExactId { id, dir } => {
-            // Exact id match only (pi `--session-id`): restore when the
-            // session exists, else create a fresh one under the selected dir.
             let metas = list_session_metadata_in_dir(cwd, dir).await?;
-            if let Some(meta) = metas.iter().find(|m| m.id == *id) {
-                return open_session(meta, cwd).await;
-            }
-            std::fs::create_dir_all(dir)
-                .map_err(|e| BuildError::SessionDir(format!("{}: {e}", dir.display())))?;
-            create_jsonl_session_with_id(dir, cwd, Some(id.clone()))
-                .await
-                .map_err(|e| BuildError::SessionDir(format!("{}: {e}", dir.display())))
+            Ok(metas.into_iter().find(|m| m.id == *id))
         }
-        _ => unreachable!("restore_session only called for Latest/ById/ByExactId"),
+        SessionSelection::Fork { .. }
+        | SessionSelection::New { .. }
+        | SessionSelection::Ephemeral => Ok(None),
     }
+}
+
+/// The metadata of the session whose id matches exactly or by file-name
+/// containment (so `--session 01a02…` / a partial id / a full file name all
+/// work), or `None` when nothing matches.
+async fn find_session_metadata(
+    id: &str,
+    cwd: &str,
+    dir: &Path,
+) -> Result<Option<rpi_harness::session::jsonl::JsonlSessionMetadata>, BuildError> {
+    let metas = list_session_metadata_in_dir(cwd, dir).await?;
+    Ok(metas
+        .into_iter()
+        .find(|m| m.id == id || m.path.contains(id) || id.contains(&m.id)))
+}
+
+/// What a launch that would restore a session says about the working directory.
+pub(crate) struct RestoredSessionCwd {
+    /// The id of the session this launch will restore. The host pins it into
+    /// `args` so the later build opens exactly this session — a directory
+    /// listing taken twice can disagree (another `rpi` may write a newer
+    /// session in between), and adopting one session's directory while opening
+    /// another is the very bug this restores.
+    pub id: String,
+    /// The directory recorded in the session header.
+    pub recorded: PathBuf,
+    /// `Some` when the recorded directory still exists and the run adopts it;
+    /// `None` when the caller must fall back to the launch cwd and say so.
+    pub adopted: Option<PathBuf>,
+}
+
+/// The working directory the launch's restored session was created in, resolved
+/// WITHOUT opening, locking, or creating anything.
+///
+/// Read-only by design: this runs before trust resolution and extension
+/// preparation, where a failure must not take the run down — the real open
+/// happens later and surfaces its own errors. Returns `None` when the selection
+/// is not a restore (fresh/ephemeral/fork) or cannot be resolved.
+pub(crate) async fn peek_restored_session_cwd(
+    selection: &SessionSelection,
+    launch_cwd: &Path,
+) -> Option<RestoredSessionCwd> {
+    let cwd_str = launch_cwd.to_string_lossy().into_owned();
+    let meta = resolve_restore_target(selection, &cwd_str).await.ok()??;
+    let recorded = PathBuf::from(&meta.cwd);
+    if recorded.as_os_str().is_empty() {
+        return None;
+    }
+    Some(RestoredSessionCwd {
+        id: meta.id,
+        adopted: crate::session_cwd::resolve_session_cwd(&recorded),
+        recorded,
+    })
+}
+
+/// Pin a peeked restore target into `args` so the later build opens exactly the
+/// session the peek inspected.
+///
+/// `Latest` (`-c`) re-lists the session directory when the build runs, and
+/// another `rpi` may have written a newer session in between. Adopting one
+/// session's working directory while opening a different conversation would put
+/// the tools in a directory that conversation never used — the exact failure
+/// this adoption exists to prevent. Pinning the resolved id turns the second
+/// listing into an exact match instead of a fresh "newest" choice.
+pub(crate) fn pin_restored_selection(args: &mut Args, restored: &RestoredSessionCwd) {
+    args.continue_session = false;
+    args.resume = false;
+    args.session = Some(restored.id.clone());
 }
 
 /// `--fork <path|id>`: open the source session, fork it into a new JSONL
@@ -2620,7 +2822,9 @@ pub fn short_session_id(id: &str) -> &str {
 pub fn list_session_files_sync(dir: &Path) -> Vec<PathBuf> {
     let mut files: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
     let mut visit = |path: PathBuf| {
-        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl")
+            || path.to_string_lossy().ends_with(".progress.jsonl")
+        {
             return;
         }
         let modified = std::fs::metadata(&path)
@@ -2664,26 +2868,25 @@ fn first_resumable_session(
 /// TUI `/session` hot-switch calls this with the selector's item value.
 pub async fn open_session_by_id(id: &str, cwd: &str) -> Result<Session, OpenError> {
     let dir = default_session_dir(Path::new(cwd));
-    open_session_by_id_in_dir(id, cwd, &dir).await
+    open_session_by_id_in_dir(id, cwd, &dir)
+        .await
+        .map(|restored| restored.session)
 }
 
 pub(crate) async fn open_session_by_id_in_dir(
     id: &str,
     cwd: &str,
     dir: &Path,
-) -> Result<Session, OpenError> {
-    let metas = list_session_metadata_in_dir(cwd, dir)
+) -> Result<RestoredSession, OpenError> {
+    let meta = find_session_metadata(id, cwd, dir)
         .await
         .map_err(|e| OpenError::Other(e.to_string()))?;
-    let Some(meta) = metas
-        .iter()
-        .find(|m| m.id == id || m.path.contains(id) || id.contains(&m.id))
-    else {
+    let Some(meta) = meta else {
         return Err(OpenError::NotFound {
             requested: format!("session {id}"),
         });
     };
-    open_session(meta, cwd).await.map_err(|e| {
+    open_session(&meta, cwd, dir).await.map_err(|e| {
         OpenError::Other(match e {
             // `open_session` renders as "Could not open the saved session:
             // <reason>" via `BuildError`. Carry the bare reason so it is not
@@ -2811,6 +3014,7 @@ pub(crate) async fn import_session_file(
     use rpi_harness::session::jsonl::{
         JsonlSessionCreateOptions, JsonlSessionRepo, JsonlSessionRepoOptions, JsonlSessionStorage,
     };
+    use rpi_harness::session::types::SessionStorage;
     use rpi_tools::FileSystem;
 
     let dir = if dir.is_absolute() {
@@ -2819,10 +3023,59 @@ pub(crate) async fn import_session_file(
         Path::new(cwd).join(dir)
     };
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let staged = tempfile::NamedTempFile::new_in(&dir)
-        .map_err(|e| e.to_string())?
-        .into_temp_path();
-    std::fs::copy(source, &staged).map_err(|e| format!("copy import: {e}"))?;
+    // External writers must be closed. This process deliberately retains locks
+    // for previously opened sessions, so its own copies additionally verify a
+    // stable history around the sidecar snapshot (bind/entry before retirement).
+    let source_progress = PathBuf::from(format!("{}.progress.jsonl", source.display()));
+    let source_lock_path = PathBuf::from(format!("{}.lock", source.display()));
+    let canonical_lock = std::fs::canonicalize(&source_lock_path).ok();
+    let owned_here = SESSION_LOCK_PATHS.get().is_some_and(|paths| {
+        paths.lock().unwrap().iter().any(|path| {
+            path == &source_lock_path
+                || canonical_lock.as_ref().is_some_and(|canonical| {
+                    std::fs::canonicalize(path).ok().as_ref() == Some(canonical)
+                })
+        })
+    });
+    let _source_lock = if !owned_here && source_progress.try_exists().map_err(|e| e.to_string())? {
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(format!("{}.lock", source.display()))
+            .map_err(|e| format!("lock import source: {e}"))?;
+        fs2::FileExt::try_lock_exclusive(&lock).map_err(|_| {
+            "close the source session before importing its recovery pair".to_owned()
+        })?;
+        Some(lock)
+    } else {
+        None
+    };
+    let staging = tempfile::tempdir_in(&dir).map_err(|e| e.to_string())?;
+    let staged = staging.path().join("history.stage");
+    let staged_progress = PathBuf::from(format!("{}.progress.jsonl", staged.display()));
+    let mut attempts = 0;
+    let has_progress = loop {
+        std::fs::copy(source, &staged).map_err(|e| format!("copy import: {e}"))?;
+        let copied_history = std::fs::read(&staged).map_err(|e| e.to_string())?;
+        let has_progress = match std::fs::copy(&source_progress, &staged_progress) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let _ = std::fs::remove_file(&staged_progress);
+                false
+            }
+            Err(error) => return Err(format!("copy progress import: {error}")),
+        };
+        if copied_history == std::fs::read(source).map_err(|e| e.to_string())? {
+            break has_progress;
+        }
+        attempts += 1;
+        if attempts >= 4 {
+            return Err(
+                "source history changed during import; retry when the session is idle".into(),
+            );
+        }
+        tokio::task::yield_now().await;
+    };
     let fs: Arc<dyn FileSystem> = Arc::new(OsExecutionEnv::with_cwd(PathBuf::from(cwd)));
     let validated = JsonlSessionStorage::load(
         fs.clone(),
@@ -2832,8 +3085,33 @@ pub(crate) async fn import_session_file(
     )
     .await
     .map_err(|e| format!("invalid session import: {e}"))?;
+    validated
+        .read_progress("")
+        .await
+        .map_err(|e| format!("invalid recovery import: {e}"))?;
     let mut metadata = validated.jsonl_metadata().clone();
     drop(validated);
+    let text = std::fs::read_to_string(&staged).map_err(|e| e.to_string())?;
+    let (first, rest) = text
+        .split_once('\n')
+        .ok_or_else(|| "import has no complete header".to_owned())?;
+    let mut header =
+        rpi_harness::session::jsonl::codec::parse_header(first).map_err(|e| e.to_string())?;
+    if has_progress && header.progress_format.is_none() {
+        return Err("history-only artifact has an undeclared recovery companion".into());
+    }
+    // An imported history-only artifact receives the destination's empty store.
+    // Imports of live-format sessions retain their validated companion instead.
+    header.progress_format = Some("assistant-progress-v1".into());
+    std::fs::write(
+        &staged,
+        format!(
+            "{}{}",
+            rpi_harness::session::jsonl::codec::encode_header(&header),
+            rest
+        ),
+    )
+    .map_err(|e| e.to_string())?;
     if list_session_metadata_in_dir(cwd, &dir)
         .await
         .map_err(|e| e.to_string())?
@@ -2868,8 +3146,16 @@ pub(crate) async fn import_session_file(
         // Another process owns this destination; leave its file intact.
         return Err(error);
     }
-    if let Err(error) = staged.persist(&path) {
+    let destination_progress = format!("{path}.progress.jsonl");
+    let publish = (|| -> std::io::Result<()> {
+        if has_progress {
+            std::fs::rename(&staged_progress, &destination_progress)?;
+        }
+        std::fs::rename(&staged, &path)
+    })();
+    if let Err(error) = publish {
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&destination_progress);
         return Err(format!("publish import: {error}"));
     }
     metadata.path = path;
@@ -2927,17 +3213,37 @@ fn claim_session_lock(session_path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// A restored session together with the working directory it was created in.
+///
+/// The recorded cwd is data for the host's notices, never a silent adoption:
+/// the launch path adopts the directory in [`app`](crate::app) before any
+/// resource loads (tools, extensions, system prompt, and trust all key off it),
+/// and the `/session` hot-switch does not move the running tools at all. Either
+/// way the user hears about the directory instead of the process quietly
+/// working somewhere unexpected.
+pub(crate) struct RestoredSession {
+    pub session: Session,
+    /// The directory recorded in the session header, when it still exists.
+    /// `None` when the record is empty or the path is gone (or is a file).
+    pub recorded_cwd: Option<PathBuf>,
+}
+
 /// Wrap an opened [`JsonlSessionStorage`] in the `Session` facade (shared by
 /// startup restore + TUI hot-switch).
+///
+/// `sessions_root` is passed in rather than re-derived from `cwd`: after a
+/// restore adopts the session's directory, `default_session_dir(cwd)` would
+/// name the ADOPTED project's tree, which is not where this session was found.
 async fn open_session(
     meta: &rpi_harness::session::jsonl::JsonlSessionMetadata,
     cwd: &str,
-) -> Result<Session, BuildError> {
+    sessions_root: &Path,
+) -> Result<RestoredSession, BuildError> {
     use rpi_harness::session::jsonl::{JsonlSessionRepo, JsonlSessionRepoOptions};
     use rpi_harness::session::types::SessionStorage;
     use rpi_tools::FileSystem;
 
-    let dir = default_session_dir(Path::new(cwd));
+    let dir = sessions_root;
     let env = Arc::new(OsExecutionEnv::with_cwd(PathBuf::from(cwd)));
     let fs: Arc<dyn FileSystem> = env.clone();
     let repo = JsonlSessionRepo::with_env_cwd(JsonlSessionRepoOptions {
@@ -2951,21 +3257,11 @@ async fn open_session(
         .open_by_jsonl_metadata(meta)
         .await
         .map_err(|e| BuildError::SessionOpen(format!("open {}: {e}", meta.path)))?;
-    // A session records the cwd it was created in. When that directory has
-    // since been removed, continuing silently in it is confusing; warn the
-    // user that we fell back to the process cwd (pi `getMissingSessionCwdIssue`).
-    if let Some(issue) = crate::session_cwd::get_missing_session_cwd_issue(
-        Some(Path::new(&meta.path)),
-        Path::new(&meta.cwd),
-        Path::new(cwd),
-    ) {
-        eprintln!(
-            "warning: {}",
-            crate::session_cwd::format_missing_session_cwd_error(&issue)
-        );
-    }
     let storage_arc: Arc<dyn SessionStorage> = Arc::new(storage);
-    Ok(Session::new(storage_arc, None))
+    Ok(RestoredSession {
+        session: Session::new(storage_arc, None),
+        recorded_cwd: crate::session_cwd::resolve_session_cwd(Path::new(&meta.cwd)),
+    })
 }
 
 /// A fresh ephemeral in-memory session (no persistence). Used for `--no-session`
@@ -3070,11 +3366,71 @@ fn read_prompt_source(path: &Path, sources: &mut Vec<String>) -> Option<String> 
 }
 
 #[cfg(test)]
+mod goal_outbox_smoke_tests;
+#[cfg(test)]
 mod runtime_session_tests;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settlement_bridge_follows_reload_and_releases_its_session_with_the_bus() {
+        use rpi_harness::events::{HarnessEvent, HarnessEventBus, RunEndEvent, RunEndOutcome};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static OLD: AtomicUsize = AtomicUsize::new(0);
+        static NEW: AtomicUsize = AtomicUsize::new(0);
+        extern "C" fn old(_: rpi_plugin_sdk::StablePluginEvent, _: *mut std::ffi::c_void) -> i32 {
+            OLD.fetch_add(1, Ordering::SeqCst);
+            0
+        }
+        extern "C" fn new(_: rpi_plugin_sdk::StablePluginEvent, _: *mut std::ffi::c_void) -> i32 {
+            NEW.fetch_add(1, Ordering::SeqCst);
+            0
+        }
+        let make = |handler: rpi_plugin_sdk::EventHandlerFn| {
+            let mut registry = rpi_extensions::ExtensionRegistry::new();
+            registry.register_event_handler(
+                "settlement".into(),
+                rpi_plugin_sdk::EventTag::AgentSettled,
+                handler,
+                std::ptr::null_mut(),
+            );
+            ExtensionSession::from_parts(
+                Arc::new(registry.snapshot()),
+                rpi_extensions::PluginKeepalive::empty(),
+                vec![],
+                None,
+            )
+        };
+        let sessions = Arc::new(Mutex::new(make(old)));
+        let weak = Arc::downgrade(&sessions);
+        let bus = HarnessEventBus::new();
+        install_extension_settlement_bridge(&bus, sessions.clone());
+        let ended = |outcome| {
+            HarnessEvent::RunEnd(RunEndEvent {
+                lane: "main".into(),
+                run_id: "run".into(),
+                outcome,
+                leaf_id: "leaf".into(),
+            })
+        };
+        bus.emit(&ended(RunEndOutcome::Completed));
+        assert_eq!(OLD.load(Ordering::SeqCst), 1);
+        *sessions.lock().unwrap() = make(new);
+        for outcome in [RunEndOutcome::Aborted, RunEndOutcome::Failed] {
+            bus.emit(&ended(outcome));
+        }
+        assert_eq!(OLD.load(Ordering::SeqCst), 1);
+        assert_eq!(NEW.load(Ordering::SeqCst), 2);
+        drop(sessions);
+        assert!(weak.upgrade().is_some());
+        drop(bus);
+        assert!(
+            weak.upgrade().is_none(),
+            "settlement observer must not create an ownership cycle"
+        );
+    }
 
     #[tokio::test]
     async fn unauthenticated_packages_are_not_reintroduced_as_legacy_adapters() {
@@ -3464,6 +3820,94 @@ mod tests {
         std::fs::remove_file(&content).ok();
     }
 
+    #[tokio::test]
+    async fn import_preserves_validates_and_locks_the_recovery_pair() {
+        use rpi_harness::session::jsonl::{JsonlSessionStorage, JsonlV4Header};
+        use rpi_harness::session::types::{
+            AssistantFrameOp, AssistantFrameRecord, RecordBase, SessionStorage,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source.jsonl");
+        let progress = tmp.path().join("source.jsonl.progress.jsonl");
+        let fs: Arc<dyn rpi_tools::FileSystem> =
+            Arc::new(OsExecutionEnv::with_cwd(tmp.path().into()));
+        let storage = JsonlSessionStorage::create(
+            fs,
+            &source.to_string_lossy(),
+            JsonlV4Header::new("import-pair".into(), 1, "/".into(), None, None, None),
+            Arc::new(SystemClock),
+            Arc::new(DefaultIdGenerator::new()),
+        )
+        .await
+        .unwrap();
+        storage
+            .append_progress(vec![AssistantFrameRecord {
+                base: RecordBase {
+                    id: "accepted-prefix".into(),
+                    seq: 0,
+                    lane: "main".into(),
+                    timestamp: 0,
+                },
+                run_id: "run".into(),
+                stream_index: 0,
+                op: AssistantFrameOp::Append,
+                frame: Some(serde_json::json!({"payload":"keep"})),
+            }])
+            .await
+            .unwrap();
+        drop(storage);
+        let original = std::fs::read(&progress).unwrap();
+        let destination = tmp.path().join("imported");
+        let imported = import_session_file(&source, &tmp.path().to_string_lossy(), &destination)
+            .await
+            .unwrap();
+        assert_eq!(
+            imported.read_progress("run").await.unwrap()[0].base.id,
+            "accepted-prefix"
+        );
+        assert_eq!(
+            std::fs::read(&progress).unwrap(),
+            original,
+            "import must not repair or mutate its source"
+        );
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(tmp.path().join("source.jsonl.lock"))
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&lock).unwrap();
+        assert!(import_session_file(
+            &source,
+            &tmp.path().to_string_lossy(),
+            &tmp.path().join("busy")
+        )
+        .await
+        .is_err());
+        drop(lock);
+        let mut corrupt = String::from_utf8(original.clone()).unwrap();
+        corrupt = corrupt.replace(
+            "\"session_id\":\"import-pair\"",
+            "\"session_id\":\"foreign\"",
+        );
+        assert_ne!(corrupt.as_bytes(), original.as_slice());
+        std::fs::write(&progress, corrupt).unwrap();
+        assert!(import_session_file(
+            &source,
+            &tmp.path().to_string_lossy(),
+            &tmp.path().join("foreign")
+        )
+        .await
+        .is_err());
+        std::fs::remove_file(&progress).unwrap();
+        assert!(import_session_file(
+            &source,
+            &tmp.path().to_string_lossy(),
+            &tmp.path().join("missing")
+        )
+        .await
+        .is_err());
+    }
+
     #[test]
     fn list_session_files_sync_walks_the_cwd_subdirectory() {
         let root = std::env::temp_dir().join(format!("rpi-summary-{}-dir", std::process::id()));
@@ -3471,8 +3915,11 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
         let file = nested.join("2026-01-01_a.jsonl");
         std::fs::write(&file, "{}\n").unwrap();
+        let sidecar = nested.join("2026-01-01_a.jsonl.progress.jsonl");
+        std::fs::write(&sidecar, "{}\n").unwrap();
         let found = list_session_files_sync(&root);
         assert!(found.iter().any(|p| p == &file));
+        assert!(!found.contains(&sidecar));
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -3546,10 +3993,10 @@ mod tests {
             lower.contains("reasoning is not") && lower.contains("carried into your next turn"),
             "the prompt must explain that reasoning does not survive the turn: {p}"
         );
-        // …and the remedy: keep state visible, use the todo tool.
+        // Working state stays visible; extension-specific rules require opt-in.
         assert!(
-            lower.contains("visible") && lower.contains("todo tool"),
-            "the prompt must point at visible text and the todo tool: {p}"
+            lower.contains("visible") && !lower.contains("todo tool"),
+            "the prompt must keep state visible without inventing extension rules: {p}"
         );
         // …plus the anti-repetition rule itself.
         assert!(
@@ -3602,9 +4049,13 @@ mod tests {
         for replayed in [false, true] {
             let p =
                 default_system_prompt_with_tools("/tmp/proj", replayed, &default_prompt_tools());
-            for phrase in ["the same plan", "todo tool", "Windows", "guessing"] {
+            for phrase in ["the same plan", "Windows", "guessing"] {
                 assert_eq!(p.matches(phrase).count(), 1, "{phrase:?} repeated: {p}");
             }
+            assert!(
+                !p.contains("todo tool"),
+                "extension rules require explicit metadata"
+            );
         }
     }
 
@@ -4323,5 +4774,197 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    // ---- restored-session working directory ----
+
+    /// A restore peek must name the directory the session was created in —
+    /// that is the whole point of recording it. Everything downstream (tool
+    /// env, system prompt, context files, extensions) keys off the run's cwd,
+    /// so a peek that falls back to the launch directory would leave the
+    /// resumed agent editing files in whatever directory `rpi` happened to be
+    /// started from.
+    #[tokio::test]
+    async fn a_restored_session_adopts_its_recorded_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project-a");
+        let launch = tmp.path().join("launch-dir");
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&launch).unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+        create_jsonl_session_with_id(
+            &sessions,
+            &project.to_string_lossy(),
+            Some("cwdadopt01".into()),
+        )
+        .await
+        .unwrap();
+
+        let selection = SessionSelection::ById {
+            id: "cwdadopt01".into(),
+            dir: sessions.clone(),
+        };
+        let peeked = peek_restored_session_cwd(&selection, &launch)
+            .await
+            .expect("a resumable session with a recorded cwd");
+        assert_eq!(peeked.recorded, project);
+        assert_eq!(peeked.adopted, Some(project));
+    }
+
+    /// A recorded directory that no longer exists must NOT be adopted: the run
+    /// falls back to the launch cwd, and the peek hands back the record so the
+    /// host can say so (instead of the old behaviour of eprintln-ing mid-TUI).
+    #[tokio::test]
+    async fn a_missing_recorded_directory_is_reported_not_adopted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gone = tmp.path().join("project-gone");
+        let launch = tmp.path().join("launch-dir");
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir_all(&launch).unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+        create_jsonl_session_with_id(
+            &sessions,
+            &gone.to_string_lossy(),
+            Some("cwdgone001".into()),
+        )
+        .await
+        .unwrap();
+
+        let selection = SessionSelection::ById {
+            id: "cwdgone001".into(),
+            dir: sessions.clone(),
+        };
+        let peeked = peek_restored_session_cwd(&selection, &launch)
+            .await
+            .expect("the session itself is resumable");
+        assert_eq!(peeked.recorded, gone);
+        assert_eq!(peeked.adopted, None);
+        let note = crate::session_cwd::missing_session_cwd_note(&peeked.recorded, &launch);
+        assert!(note.contains("no longer exists"), "{note}");
+        assert!(note.contains("launch-dir"), "{note}");
+    }
+
+    /// `open_session` hands back the recorded directory as data (for the
+    /// `/session` hot-switch notes) while still opening the session normally.
+    #[tokio::test]
+    async fn open_session_reports_the_recorded_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project-open");
+        let launch = tmp.path().join("launch-dir");
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&launch).unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+        create_jsonl_session_with_id(
+            &sessions,
+            &project.to_string_lossy(),
+            Some("cwdopen001".into()),
+        )
+        .await
+        .unwrap();
+
+        let restored =
+            open_session_by_id_in_dir("cwdopen001", &launch.to_string_lossy(), &sessions)
+                .await
+                .map_err(|error| error.to_string())
+                .unwrap();
+        assert_eq!(restored.recorded_cwd, Some(project.clone()));
+        assert_eq!(restored.session.storage().metadata().id, "cwdopen001");
+    }
+
+    /// The session the peek inspected must be the session the build opens.
+    ///
+    /// `-c` means "the most recent session", and the build lists the directory
+    /// again. Another `rpi` (or a `/session` new-session) can write a newer one
+    /// between the peek and the build; adopting the peeked session's directory
+    /// while opening the newer conversation would run the tools in a directory
+    /// that conversation never used. Pinning the resolved id makes the second
+    /// listing an exact match instead of a fresh newest-first choice.
+    #[tokio::test]
+    async fn the_peeked_session_is_the_one_the_build_opens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first_project = tmp.path().join("project-first");
+        let second_project = tmp.path().join("project-second");
+        let launch = tmp.path().join("launch-dir");
+        let sessions = tmp.path().join("sessions");
+        for dir in [&first_project, &second_project, &launch, &sessions] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        create_jsonl_session_with_id(
+            &sessions,
+            &first_project.to_string_lossy(),
+            Some("cwdrace001".into()),
+        )
+        .await
+        .unwrap();
+
+        let mut args = Args {
+            continue_session: true,
+            session_dir: Some(sessions.clone()),
+            ..Default::default()
+        };
+        let selection = select_session_in_dir(&args, sessions.clone());
+        let peeked = peek_restored_session_cwd(&selection, &launch)
+            .await
+            .expect("a resumable session");
+        assert_eq!(peeked.adopted, Some(first_project.clone()));
+
+        // A newer session appears in another project before the build runs.
+        create_jsonl_session_with_id(
+            &sessions,
+            &second_project.to_string_lossy(),
+            Some("cwdrace002".into()),
+        )
+        .await
+        .unwrap();
+
+        pin_restored_selection(&mut args, &peeked);
+        let pinned = select_session_in_dir(&args, sessions.clone());
+        let reopened = resolve_restore_target(&pinned, &launch.to_string_lossy())
+            .await
+            .unwrap()
+            .expect("the pinned session still exists");
+        assert_eq!(
+            reopened.id, peeked.id,
+            "the build must open the session the peek adopted the directory of"
+        );
+        assert_eq!(reopened.cwd, first_project.to_string_lossy());
+    }
+
+    /// Trust must be resolved against the directory it is asked about. A
+    /// session recorded in another project must not inherit the launch
+    /// directory's decision — that would run an untrusted project's settings,
+    /// skills, and context files with trusted privileges.
+    #[test]
+    fn trust_is_resolved_per_directory() {
+        struct RestoreConfigDir(Option<std::ffi::OsString>);
+
+        impl Drop for RestoreConfigDir {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var(crate::config::CONFIG_DIR_ENV, value),
+                    None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
+                }
+            }
+        }
+
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        let _restore = RestoreConfigDir(std::env::var_os(crate::config::CONFIG_DIR_ENV));
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = tmp.path().join("agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
+
+        let untrusted = tmp.path().join("project-untrusted");
+        let launch = tmp.path().join("project-launch");
+        std::fs::create_dir_all(&untrusted).unwrap();
+        std::fs::create_dir_all(&launch).unwrap();
+        crate::config::set_project_trust(&untrusted, Some(false)).unwrap();
+
+        let args = Args::default();
+        assert!(!resolve_project_trust(&args, &untrusted));
+        // A directory with no stored decision loads by default.
+        assert!(resolve_project_trust(&args, &launch));
     }
 }

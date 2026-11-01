@@ -289,7 +289,11 @@ pub unsafe fn drive_with_context(
         };
         let message = if let Some(context) = context {
             match context.enter(&options) {
-                Ok((runtime, _request)) => runtime.block_on(future),
+                Ok((runtime, _request)) => {
+                    super::with_host_capabilities(&request.capabilities, || {
+                        runtime.block_on(future)
+                    })
+                }
                 Err(error) => AssistantMessage::terminal(
                     request.model.api.clone(),
                     request.model.provider.clone(),
@@ -308,7 +312,7 @@ pub unsafe fn drive_with_context(
             };
             #[cfg(test)]
             record_resource_build(true);
-            runtime.block_on(future)
+            super::with_host_capabilities(&request.capabilities, || runtime.block_on(future))
         };
         let json = serde_json::to_value(message)
             .expect("assistant message JSON")
