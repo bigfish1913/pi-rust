@@ -227,6 +227,7 @@ impl JsonlSessionStorage {
         clock: Arc<dyn Clock>,
         ids: Arc<dyn IdGenerator>,
     ) -> SessionResult<Self> {
+        let read_diagnostics = crate::session::diagnostics::RecoveryPhase::start("history_read");
         let reader = file_result(fs.open_read_file(path).await, "open session history reader")?;
         let content = if let Some(reader) = &reader {
             let bytes = file_result(reader.read_all().await, "read session history")?;
@@ -238,6 +239,9 @@ impl JsonlSessionStorage {
                 &format!("Failed to read session {path}"),
             )?
         };
+        read_diagnostics.finish(content.len(), content.len());
+        let replay_diagnostics =
+            crate::session::diagnostics::RecoveryPhase::start("history_replay");
         // TS: content.split("\n"); drop trailing "" from the final "\n".
         let mut physical_lines: Vec<&str> = content.split('\n').collect();
         if physical_lines.last() == Some(&"") {
@@ -368,6 +372,8 @@ impl JsonlSessionStorage {
                             })
                         })
                         .await?;
+                        let applied = kept_lines.len();
+                        replay_diagnostics.finish(physical_lines.len() - 1, applied);
                         return Ok(storage);
                     }
                     return Err(invalid_file(path, line_no, &err));
@@ -404,6 +410,7 @@ impl JsonlSessionStorage {
                 })
             })
             .await?;
+            replay_diagnostics.finish(physical_lines.len() - 1, seen_lines.len());
             return Ok(storage);
         }
         // Repair an unterminated tail (no trailing "\n") so future appends are
@@ -421,6 +428,7 @@ impl JsonlSessionStorage {
                     Some(Sha256::digest(format!("{content}\n").as_bytes()).into());
             }
         }
+        replay_diagnostics.finish(physical_lines.len() - 1, seen_lines.len());
         Ok(storage)
     }
 

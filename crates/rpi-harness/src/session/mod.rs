@@ -10,6 +10,7 @@
 //! Built up incrementally across M5b–M5f.
 
 pub mod context;
+pub(crate) mod diagnostics;
 pub mod jsonl;
 pub mod memory;
 pub(crate) mod progress;

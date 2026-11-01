@@ -18,6 +18,7 @@ rpi-telemetry = { workspace = true }
 rpi-ai = { workspace = true }
 rpi-agent = { workspace = true }
 rpi-tools = { workspace = true }
+rpi-durable = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }

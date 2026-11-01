@@ -2158,6 +2158,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rpi-durable"
+version = "0.16.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "rpi-extensions"
 version = "0.16.0"
 dependencies = [
@@ -2186,6 +2195,7 @@ dependencies = [
  "futures",
  "rpi-agent",
  "rpi-ai",
+ "rpi-durable",
  "rpi-telemetry",
  "rpi-tools",
  "rusqlite",

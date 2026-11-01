@@ -2757,48 +2757,28 @@ impl AgentHarness {
         session: &Session,
         lane: &str,
     ) -> HarnessResult<Vec<(QueueKind, QueuedMessage)>> {
-        // Queue reconstruction must not materialize unrelated legacy frames.
-        let mut records = Vec::new();
-        for record_type in ["queue_enqueued", "queue_cancelled"] {
-            records.extend(
-                session
-                    .find_records(&RecordQuery {
-                        lane: Some(lane.to_string()),
-                        record_type: Some(record_type),
-                        order: Some(EntryOrder::OldestFirst),
-                        ..Default::default()
-                    })
-                    .await
-                    .map_err(session_to_harness_err)?,
-            );
-        }
-        records.sort_unstable_by_key(LaneRecord::seq);
-        let mut cancelled: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        let mut pending: Vec<QueueEnqueuedRecord> = Vec::new();
-        for record in records {
-            match record {
-                LaneRecord::QueueEnqueued(enqueued) => pending.push(enqueued),
-                LaneRecord::QueueCancelled(cancelled_record) => {
-                    cancelled.insert(cancelled_record.entry_id);
-                }
-                _ => {}
-            }
-        }
+        let diagnostics = crate::session::diagnostics::RecoveryPhase::start("queue_rebuild");
+        // Filter before cloning payloads. A single backend read also avoids
+        // merging enqueue/cancel snapshots from different points in time.
+        let records = session
+            .find_records(&RecordQuery {
+                lane: Some(lane.to_string()),
+                record_type: Some("queue_enqueued"),
+                pending_queue_only: true,
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            })
+            .await
+            .map_err(session_to_harness_err)?;
+        let selected = records.len();
         let mut rebuilt = Vec::new();
-        for enqueued in pending {
+        for record in records {
+            let LaneRecord::QueueEnqueued(enqueued) = record else {
+                continue;
+            };
             let Some(entry_id) = Self::target_entry_id(&enqueued.target) else {
                 continue;
             };
-            if cancelled.contains(entry_id)
-                || session
-                    .view(lane)
-                    .get_entry(entry_id)
-                    .await
-                    .map_err(session_to_harness_err)?
-                    .is_some()
-            {
-                continue;
-            }
             let Some(message) = Self::message_from_target(&enqueued.target) else {
                 continue;
             };
@@ -2811,6 +2791,7 @@ impl AgentHarness {
                 },
             ));
         }
+        diagnostics.finish(selected, rebuilt.len());
         Ok(rebuilt)
     }
 
