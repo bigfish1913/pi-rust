@@ -1,4 +1,6 @@
 //! Fault probes for live error recovery and stable fallback commit identities.
+#[path = "support/final_assistant_fallback.rs"]
+mod final_assistant_fallback;
 #[path = "support/tool_execution_barrier.rs"]
 mod tool_execution_barrier;
 #[path = "support/tool_result_fallback.rs"]
@@ -81,6 +83,9 @@ struct ProbedStorage {
     reads: AtomicUsize,
     fail_append: AtomicBool,
     fail_assistant: AtomicBool,
+    fail_assistants: Mutex<usize>,
+    assistant_attempts: Mutex<Vec<String>>,
+    fail_binding: AtomicBool,
     fail_clear: AtomicBool,
     fail_results: Mutex<usize>,
     result_attempts: Mutex<Vec<String>>,
@@ -100,6 +105,9 @@ impl ProbedStorage {
             reads: AtomicUsize::new(0),
             fail_append: AtomicBool::new(false),
             fail_assistant: AtomicBool::new(false),
+            fail_assistants: Mutex::new(0),
+            assistant_attempts: Mutex::new(Vec::new()),
+            fail_binding: AtomicBool::new(false),
             fail_clear: AtomicBool::new(false),
             fail_results: Mutex::new(0),
             result_attempts: Mutex::new(Vec::new()),
@@ -182,13 +190,33 @@ impl SessionStorage for ProbedStorage {
                 message: AgentMessage::Assistant(_),
                 ..
             }
-        ) && self.fail_assistant.swap(false, Ordering::SeqCst)
-        {
-            return Err(SessionError::storage("controlled recovery entry failure"));
+        ) {
+            self.assistant_attempts
+                .lock()
+                .unwrap()
+                .push(entry.id.clone());
+            let fail = {
+                let mut left = self.fail_assistants.lock().unwrap();
+                if *left == 0 {
+                    false
+                } else {
+                    *left -= 1;
+                    true
+                }
+            };
+            if self.fail_assistant.swap(false, Ordering::SeqCst) || fail {
+                return Err(SessionError::storage("controlled recovery entry failure"));
+            }
         }
         self.inner.append_entry(entry, lane).await
     }
     async fn append_record(&self, record: LaneRecord) -> SessionResult<LaneRecord> {
+        if matches!(&record, LaneRecord::AssistantFrame(frame)
+            if frame.op == AssistantFrameOp::CommitStream)
+            && self.fail_binding.swap(false, Ordering::SeqCst)
+        {
+            return Err(SessionError::storage("controlled identity binding failure"));
+        }
         if matches!(record, LaneRecord::ToolStarted(_)) {
             let fail = self.fail_start.swap(false, Ordering::SeqCst);
             if self.pause_start.swap(false, Ordering::SeqCst) {

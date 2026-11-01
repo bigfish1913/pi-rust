@@ -958,10 +958,10 @@ impl SettlingEmitter {
                 self.state.record_commit(assistant_index, &assistant_id);
             }
             Err(error) => {
-                // Leave the message for `run_core`'s own persistence pass,
-                // which runs after this emitter returns; the log is then
-                // complete one step later than usual.
-                self.fail_identity(&error);
+                // The native ID is already bound. An entry ACK refusal is not
+                // identity loss: keep the reservation for `run_core`'s ordered
+                // persistence pass to retry. A persistent refusal still returns
+                // an error there without completing the run or clearing frames.
                 tracing::warn!(
                     %error,
                     "could not commit the final assistant before AgentEnd"
