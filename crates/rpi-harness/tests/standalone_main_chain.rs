@@ -143,6 +143,7 @@ struct Gate {
     fail_terminal: AtomicBool,
     tear_cancel: AtomicBool,
     block_kind: AtomicUsize,
+    block_entry: std::sync::Mutex<Option<String>>,
     truncate_fail: AtomicBool,
     fail_stage: AtomicBool,
     rename_mode: AtomicUsize,
@@ -165,9 +166,19 @@ impl AppendFile for GatedAppend {
     async fn append(&mut self, bytes: &[u8]) -> Result<(), FileError> {
         let text = String::from_utf8_lossy(bytes);
         let kind = self.gate.block_kind.load(Ordering::SeqCst);
+        let block_entry = {
+            let mut target = self.gate.block_entry.lock().unwrap();
+            if target.as_ref().is_some_and(|id| text.contains(id)) {
+                target.take();
+                true
+            } else {
+                false
+            }
+        };
         if (kind == 1 && text.contains("queue_enqueued"))
             || (kind == 2 && text.contains("queue_cancelled"))
             || (kind == 3 && text.contains("operation_started"))
+            || block_entry
         {
             self.gate.block_kind.store(0, Ordering::SeqCst);
             self.gate.entered.notify_one();
@@ -214,6 +225,7 @@ impl AppendFile for GatedAppend {
 }
 include!("support/scoped_write_fs.rs");
 include!("support/standalone_cases.rs");
+include!("support/standalone_lifecycle.rs");
 
 async fn disk() -> (
     tempfile::TempDir,

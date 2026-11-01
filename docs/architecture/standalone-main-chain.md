@@ -29,6 +29,26 @@ This is a focused supplement to [agent-loop recovery and settlement](agentloop-r
   uncommitted reservations, preserving IDs and order for delivery in this same
   process. A prefix already committed is not replayed. This does not change the
   existing queued-input-before-native-prompt ordering or NextTurn behavior.
+- Steering/follow-up handoffs also reserve, rather than remove, their lane's
+  pending FIFO items. Their run-local reservation releases uncommitted IDs on
+  failure/drop; an entry ACK removes only that committed ID. Short owned entry
+  writes keep ACK and queue publication together, including fallback settlement.
+  In-flight reservations cannot be cancelled/cleared or shown as pending drafts.
+  `OneAtATime`/`All`, lane isolation and committed-prefix ordering are preserved.
+
+## Run and tool ownership
+
+Parallel execute/finalize futures belong to their agent loop; dropping its caller
+cannot detach a live tool task and immediately admit recovery of that same call.
+Already-ready peers keep progressing while later sequential preparation hooks or
+completion events await. Completion events remain in completion order and result
+messages in source order. Tool panics become error results under the original call
+identity. Dropping an execute future also closes its late-update gate.
+
+Releasing admission cancels both root and child run signals. This ownership covers
+the async execute/finalize futures, not arbitrary background work a tool spawns or
+an external effect already accepted elsewhere. It is not forced termination of
+`spawn_blocking`, rollback, or an exactly-once side-effect guarantee.
 
 ## Stable terminal results
 
@@ -59,6 +79,10 @@ new fields (or use query defaults); this is not a claim of Rust source compatibi
 Tool inspection uses the current branch and latest matching call. A native
 `tool_started` checkpoint binds its assistant and reserved result entry, including
 tool name, instead of treating a repeated provider call ID as execution identity.
+A fork resolves inherited native checkpoints by the selected branch assistant's
+exact entry ID, including its source lane; a same-ID imported result cannot turn
+that native call into legacy matching. The checkpoint's result must still be on
+the inspected branch.
 Imported calls without checkpoints use ordered call/result matching bounded by
 assistant/user turn boundaries. Pending/absent results are not reported complete.
 
@@ -74,6 +98,12 @@ there is no new pending database/index or duplicate transcript.
   deterministic JSONL write failures/partial batches, dropped callers, partial
   NextRun commits, lane/branch boundaries, stable result restoration, terminal
   ACK/event ordering and checkpoint/legacy tool identities.
+- `tests/support/standalone_lifecycle.rs`: inherited checkpoint identities,
+  dropped root runs, steering/follow-up handoffs before/during entry ACK, and
+  same-process/reopened pending/committed-prefix agreement.
+- `rpi-agent/tests/structured_tool_lifecycle.rs`: owned parallel execute drop,
+  late-update suppression on drop, preparation/event backpressure progress and
+  panic result identity; existing ordering/hooks tests remain in force.
 - `tests/standalone_storage.rs`: cancellation batch validation and pending-query
   filters on Memory, SQLite and JSONL.
 - `tests/standalone_allocations.rs`: cumulative caller-thread allocation while

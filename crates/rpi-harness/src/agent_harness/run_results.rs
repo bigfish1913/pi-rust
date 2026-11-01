@@ -237,10 +237,13 @@ impl AgentHarness {
                         Content::ToolCall(call) if call.id == call_id => Some(call),
                         _ => None,
                     }) {
+                        // A fork inherits its source lane's entries and native
+                        // checkpoints. Match the selected branch assistant's exact
+                        // identity below, not the destination lane or provider ID
+                        // alone; results still have to be on this branch.
                         let started = self
                             .session
                             .find_records(&RecordQuery {
-                                lane: Some(self.lane.clone()),
                                 record_type: Some("tool_started"),
                                 tool_call_id: Some(call_id.to_owned()),
                                 order: Some(EntryOrder::NewestFirst),

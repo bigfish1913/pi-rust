@@ -45,7 +45,7 @@ use futures::future::BoxFuture;
 use rpi_agent::{AgentEmitter, AgentEvent, AgentMessage};
 use rpi_ai::types::{AssistantMessage, StopReason};
 
-use crate::agent_harness::AgentHarness;
+use crate::agent_harness::{AgentHarness, QueueReservation};
 use crate::session::types::{
     ProvisionedEntry, ProvisionedKind, RecordBase, ToolReplay, ToolStartedRecord,
 };
@@ -211,6 +211,9 @@ pub struct SettleState {
     /// index, so every role can commit at settle or fall back to run-end writes
     /// without changing the durable queue target's id.
     injected: Mutex<VecDeque<(String, AgentMessage)>>,
+    /// Pending queue items stay reserved through the run. Dropping its local
+    /// state releases uncommitted handoffs without moving/reordering messages.
+    injected_reservations: Mutex<Vec<QueueReservation>>,
     /// A final assistant normally waits for run-end persistence. If a queued
     /// message continues this run, commit that assistant before the injection.
     uncommitted_assistant: Mutex<Option<(usize, usize, AssistantMessage)>>,
@@ -244,6 +247,7 @@ impl SettleState {
             pending_calls: Mutex::new(BTreeMap::new()),
             reserved_results: Mutex::new(BTreeMap::new()),
             injected: Mutex::new(VecDeque::new()),
+            injected_reservations: Mutex::new(Vec::new()),
             uncommitted_assistant: Mutex::new(None),
             frame_recorder: Mutex::new(None),
             diagnostics: SettleDiagnostics::new(),
@@ -265,6 +269,10 @@ impl SettleState {
                 .await?;
         }
         Ok(())
+    }
+
+    pub(crate) fn hold_injected_reservation(&self, reservation: QueueReservation) {
+        self.injected_reservations.lock().unwrap().push(reservation);
     }
 
     /// Register a message the run is about to inject, with the entry id its

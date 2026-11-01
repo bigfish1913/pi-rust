@@ -2,11 +2,39 @@
 //! an API caller cannot abandon the second half after storage accepted a write.
 use super::*;
 
-pub(super) struct NextRunReservation {
+pub(crate) struct QueueReservation {
     pub(super) items: Vec<QueuedMessage>,
     queue: SharedMessageQueue,
 }
-impl Drop for NextRunReservation {
+
+impl QueueReservation {
+    /// Keep pending items in their original positions until their entry ACK.
+    /// A dropped handoff only releases reservations; it cannot lose the input.
+    pub(super) fn reserve(queue: SharedMessageQueue, lane: &str, all: bool) -> Self {
+        let items = {
+            let mut q = queue.lock().unwrap();
+            let limit = if all || matches!(q.mode, QueueMode::All) {
+                usize::MAX
+            } else {
+                1
+            };
+            let items: Vec<_> = q
+                .pending
+                .iter()
+                .filter(|item| item.lane == lane && !q.reserved.contains(&item.entry_id))
+                .take(limit)
+                .cloned()
+                .collect();
+            for item in &items {
+                q.reserved.insert(item.entry_id.clone());
+            }
+            items
+        };
+        Self { items, queue }
+    }
+}
+
+impl Drop for QueueReservation {
     fn drop(&mut self) {
         let mut queue = self.queue.lock().unwrap();
         for item in &self.items {
@@ -16,30 +44,26 @@ impl Drop for NextRunReservation {
 }
 
 impl AgentHarness {
-    pub(super) async fn reserve_next_run(&self) -> NextRunReservation {
+    pub(super) async fn reserve_next_run(&self) -> QueueReservation {
         let _gate = self.message_writes.lock().await;
         let queue = self.inner.lock().unwrap().next_run_queue.clone();
-        let items = {
-            let mut q = queue.lock().unwrap();
-            let items: Vec<_> = q
-                .pending
-                .iter()
-                .filter(|item| item.lane == self.lane && !q.reserved.contains(&item.entry_id))
-                .cloned()
-                .collect();
-            for item in &items {
-                q.reserved.insert(item.entry_id.clone());
-            }
-            items
-        };
-        NextRunReservation { items, queue }
+        QueueReservation::reserve(queue, &self.lane, true)
     }
 
-    fn confirm_next_run(&self, id: &str) {
-        let queue = self.inner.lock().unwrap().next_run_queue.clone();
-        let mut q = queue.lock().unwrap();
-        q.remove(id);
-        q.reserved.remove(id);
+    fn confirm_queue_entry(&self, id: &str) {
+        let queues = {
+            let inner = self.inner.lock().unwrap();
+            [
+                inner.steering_queue.clone(),
+                inner.follow_up_queue.clone(),
+                inner.next_run_queue.clone(),
+            ]
+        };
+        for queue in queues {
+            let mut q = queue.lock().unwrap();
+            q.remove(id);
+            q.reserved.remove(id);
+        }
     }
 
     pub(super) async fn commit_initial_prompt(
@@ -56,7 +80,7 @@ impl AgentHarness {
                 .append_record_and_entry(record, entry, &harness.lane)
                 .await
                 .map_err(session_to_harness_err)?;
-            harness.confirm_next_run(committed.id());
+            harness.confirm_queue_entry(committed.id());
             Ok(committed)
         })
         .await
@@ -72,11 +96,11 @@ impl AgentHarness {
         tokio::spawn(async move {
             let _gate = gate;
             let committed = harness.append_provisioned_locked(entry).await?;
-            harness.confirm_next_run(committed.id());
+            harness.confirm_queue_entry(committed.id());
             Ok(committed)
         })
         .await
-        .map_err(|error| HarnessError::io(format!("prompt write task failed: {error}")))?
+        .map_err(|error| HarnessError::io(format!("entry write task failed: {error}")))?
     }
 
     pub(super) async fn cancel_queue_item(&self, id: &str) -> HarnessResult<CancelQueuedResult> {
@@ -153,12 +177,12 @@ impl AgentHarness {
             let items: Vec<Vec<QueuedMessage>> = queues
                 .iter()
                 .map(|queue| {
-                    queue
-                        .lock()
-                        .unwrap()
-                        .pending
+                    let q = queue.lock().unwrap();
+                    q.pending
                         .iter()
-                        .filter(|item| item.lane == harness.lane)
+                        .filter(|item| {
+                            item.lane == harness.lane && !q.reserved.contains(&item.entry_id)
+                        })
                         .cloned()
                         .collect()
                 })
@@ -200,5 +224,58 @@ impl AgentHarness {
         })
         .await
         .map_err(|error| HarnessError::io(format!("queue clear task failed: {error}")))?
+    }
+}
+
+#[cfg(test)]
+mod reservation_tests {
+    use super::*;
+
+    fn queue(mode: QueueMode) -> SharedMessageQueue {
+        let mut queue = MessageQueue::new(mode);
+        for (id, lane) in [("first", "main"), ("other", "side"), ("last", "main")] {
+            queue.pending.push_back(QueuedMessage {
+                entry_id: id.into(),
+                lane: lane.into(),
+                message: UserMessage::new(id, 0).into(),
+            });
+        }
+        Arc::new(Mutex::new(queue))
+    }
+
+    #[test]
+    fn reservations_preserve_mode_lane_order_and_uncommitted_drop() {
+        for (mode, expected) in [(QueueMode::OneAtATime, 1), (QueueMode::All, 2)] {
+            let queue = queue(mode);
+            let reservation = QueueReservation::reserve(queue.clone(), "main", false);
+            assert_eq!(reservation.items.len(), expected);
+            assert_eq!(reservation.items[0].entry_id, "first");
+            assert_eq!(queue.lock().unwrap().pending.len(), 3);
+            assert_eq!(queue.lock().unwrap().peek_for_lane("side"), ["other"]);
+            assert_eq!(
+                queue.lock().unwrap().peek_for_lane("main").len(),
+                2 - expected
+            );
+            drop(reservation);
+            assert_eq!(
+                queue.lock().unwrap().peek_for_lane("main"),
+                ["first", "last"]
+            );
+            assert!(queue.lock().unwrap().reserved.is_empty());
+        }
+    }
+
+    #[test]
+    fn next_run_reserves_all_even_in_one_at_a_time_mode() {
+        let queue = queue(QueueMode::OneAtATime);
+        let reservation = QueueReservation::reserve(queue.clone(), "main", true);
+        assert_eq!(reservation.items.len(), 2);
+        assert!(queue.lock().unwrap().peek_for_lane("main").is_empty());
+        // An ACK removes just its ID; releasing the remaining reservations
+        // cannot resurrect that committed prefix or reorder the suffix.
+        queue.lock().unwrap().remove("first");
+        drop(reservation);
+        assert_eq!(queue.lock().unwrap().peek_for_lane("main"), ["last"]);
+        assert_eq!(queue.lock().unwrap().peek_for_lane("side"), ["other"]);
     }
 }

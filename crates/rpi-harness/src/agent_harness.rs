@@ -515,6 +515,7 @@ impl MessageQueue {
     /// the caller can record the consumption against it. Dropping the ids here
     /// (as this used to) is what would make a consumed message come back to life
     /// on the next start.
+    #[cfg(test)]
     fn drain_for_lane(&mut self, lane: &str) -> Vec<QueuedMessage> {
         let items: Vec<QueuedMessage> = match self.mode {
             QueueMode::All => {
@@ -569,7 +570,7 @@ impl MessageQueue {
     fn peek_for_lane(&self, lane: &str) -> Vec<String> {
         self.pending
             .iter()
-            .filter(|item| item.lane == lane)
+            .filter(|item| item.lane == lane && !self.reserved.contains(&item.entry_id))
             .map(|item| queued_message_text(&item.message))
             .collect()
     }
@@ -761,6 +762,7 @@ pub const MAX_WRITE_FAILURES: usize = 16;
 mod child;
 pub use child::ChildHarness;
 mod queue_writes;
+pub(crate) use queue_writes::QueueReservation;
 mod run_results;
 mod scoped_entries;
 pub use scoped_entries::{BranchWriteGuard, ScopedEntry};
@@ -2544,11 +2546,10 @@ impl AgentHarness {
                 .is_some_and(|run| run.run_id == run_id)
             {
                 inner.active_run.take().map(|a| {
-                    // A child's run owns every detached tool task it started,
-                    // including when the foreground future unwinds or is dropped.
-                    if self.is_child {
-                        a.signal.cancel();
-                    }
+                    // Every admitted run owns its tools, including a root whose
+                    // caller drops the foreground future. The loop drops owned
+                    // execute futures before this lease releases admission.
+                    a.signal.cancel();
                     a.children.cancel();
                     a.idle
                 })
@@ -2709,14 +2710,13 @@ impl AgentHarness {
         settle: &Arc<crate::settle::SettleState>,
     ) -> Vec<AgentMessage> {
         let _gate = self.message_writes.lock().await;
-        let items = queue.lock().unwrap().drain_for_lane(&self.lane);
-        let mut messages = Vec::with_capacity(items.len());
-        for item in items {
-            // Its reserved entry consumes the enqueue when it commits. Keeping
-            // the record pending until then makes a crash before MessageEnd safe.
+        let reservation = QueueReservation::reserve(queue, &self.lane, false);
+        let mut messages = Vec::with_capacity(reservation.items.len());
+        for item in &reservation.items {
             settle.push_injected(item.entry_id.clone(), item.message.clone());
-            messages.push(item.message);
+            messages.push(item.message.clone());
         }
+        settle.hold_injected_reservation(reservation);
         messages
     }
 
@@ -3499,8 +3499,8 @@ impl AgentHarness {
 
     /// Commit a provisioned entry on this harness's lane.
     pub(crate) async fn append_provisioned(&self, entry: ProvisionedEntry) -> HarnessResult<Entry> {
-        let _gate = self.message_writes.lock().await;
-        self.append_provisioned_locked(entry).await
+        // The ACK and queue publication must survive caller drop together.
+        self.commit_reserved_prompt(entry).await
     }
 
     async fn append_provisioned_locked(&self, entry: ProvisionedEntry) -> HarnessResult<Entry> {
