@@ -65,6 +65,7 @@ struct ShellConfig {
 }
 
 mod append;
+mod read;
 
 /// Environment variables the **host** sets for its own runtime plumbing, which
 /// must not be handed to a shell it spawns.
@@ -402,6 +403,14 @@ impl FileSystem for OsExecutionEnv {
     ) -> Result<Option<Box<dyn crate::env::AppendFile>>, FileError> {
         let path = Self::resolve_path(&self.cwd, path);
         Ok(Some(Box::new(append::OsAppendFile::open(path).await?)))
+    }
+
+    async fn open_read_file(
+        &self,
+        path: &str,
+    ) -> Result<Option<Arc<dyn crate::env::ReadFile>>, FileError> {
+        let path = Self::resolve_path(&self.cwd, path);
+        Ok(Some(Arc::new(read::OsReadFile::open(path).await?)))
     }
 
     async fn truncate_file(

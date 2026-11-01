@@ -119,6 +119,29 @@ impl SessionState {
         self.sequence
     }
 
+    /// JSONL-only cold frame reservation. Its immutable payload/log slot lives
+    /// in the file-backed wrapper, but IDs and sequence remain write-once.
+    pub(crate) fn reserve_cold_frame(
+        &mut self,
+        frame: &crate::session::types::AssistantFrameRecord,
+    ) -> SessionResult<()> {
+        if frame.base.seq != self.sequence + 1 {
+            return Err(SessionError::invalid_entry(
+                "non-consecutive cold frame sequence",
+            ));
+        }
+        if !self.lanes.contains_key(&frame.base.lane) {
+            return Err(SessionError::invalid_entry(format!(
+                "Invalid session mutation: references missing lane {}",
+                frame.base.lane
+            )));
+        }
+        self.validate_unused_id(&frame.base.id)?;
+        self.sequence = frame.base.seq;
+        self.used_ids.insert(frame.base.id.clone());
+        Ok(())
+    }
+
     /// Validate the entire cancellation batch before any reducer mutation.
     pub(crate) fn validate_queue_cancellations(&self, records: &[LaneRecord]) -> SessionResult<()> {
         let mut ids = std::collections::HashSet::new();

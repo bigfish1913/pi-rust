@@ -9,6 +9,7 @@
 //! - [`repo`] — `JsonlSessionRepo` (`SessionRepo` impl over JSONL files).
 
 pub mod codec;
+mod cold_frames;
 pub mod errors;
 mod progress;
 pub mod repo;

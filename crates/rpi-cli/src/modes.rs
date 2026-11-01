@@ -1655,15 +1655,28 @@ async fn rpc_get_stats(
     harness: &AgentHarness,
 ) -> Result<serde_json::Value, String> {
     let stats = lane.get_stats().await.map_err(|error| error.to_string())?;
-    let records = harness
-        .session()
-        .find_records(&RecordQuery {
-            lane: Some(lane.name().to_string()),
-            order: Some(EntryOrder::OldestFirst),
-            ..Default::default()
-        })
-        .await
-        .map_err(|error| error.to_string())?;
+    // Filter before cloning/hydrating; legacy streaming progress is unrelated.
+    let mut records = Vec::new();
+    for record_type in [
+        "operation_started",
+        "operation_finished",
+        "retry_pending",
+        "usage",
+    ] {
+        records.extend(
+            harness
+                .session()
+                .find_records(&RecordQuery {
+                    lane: Some(lane.name().to_string()),
+                    record_type: Some(record_type),
+                    order: Some(EntryOrder::OldestFirst),
+                    ..Default::default()
+                })
+                .await
+                .map_err(|error| error.to_string())?,
+        );
+    }
+    records.sort_unstable_by_key(LaneRecord::seq);
     let mut operation_counts = std::collections::BTreeMap::<String, u64>::new();
     for record in &records {
         let kind = match record {
@@ -1717,15 +1730,23 @@ async fn rpc_get_queue(
         .get("includeCompleted")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    let records = harness
-        .session()
-        .find_records(&RecordQuery {
-            lane: Some(lane.name().to_string()),
-            order: Some(EntryOrder::OldestFirst),
-            ..Default::default()
-        })
-        .await
-        .map_err(|error| error.to_string())?;
+    // Filter before cloning/hydrating; legacy streaming progress is unrelated.
+    let mut records = Vec::new();
+    for record_type in ["queue_enqueued", "queue_cancelled"] {
+        records.extend(
+            harness
+                .session()
+                .find_records(&RecordQuery {
+                    lane: Some(lane.name().to_string()),
+                    record_type: Some(record_type),
+                    order: Some(EntryOrder::OldestFirst),
+                    ..Default::default()
+                })
+                .await
+                .map_err(|error| error.to_string())?,
+        );
+    }
+    records.sort_unstable_by_key(LaneRecord::seq);
     let mut cancelled = std::collections::HashMap::<String, u64>::new();
     for record in &records {
         if let LaneRecord::QueueCancelled(record) = record {
