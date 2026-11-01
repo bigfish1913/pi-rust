@@ -11,6 +11,8 @@
 
 pub mod context;
 pub(crate) mod diagnostics;
+#[cfg(feature = "experimental-native-store")]
+pub mod experimental_native;
 pub mod jsonl;
 pub mod memory;
 pub(crate) mod progress;

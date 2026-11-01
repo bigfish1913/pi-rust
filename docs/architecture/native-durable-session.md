@@ -116,6 +116,13 @@ primary history 初次读取/解析依然存在，这组数值不能外推为整
 逐步对照 `SessionState`，覆盖全部 entry/record 变种、真实 pending/open/facts/stats 语义，
 并验证 checkpoint 活动引用及内容级 ACK 对账。不接入生产 backend，不替换现有 JSONL。
 
+## 第四期显式实验后端（默认关闭）
+
+[实验 SessionStorage/Repo](experimental-native-store.md) 提供 feature-gated、显式构造的接口，
+复用第三期事实引擎，增加事务批写、独立 progress 与取消后 owner/drain 边界。
+不接 CLI/Web，不迁移旧 session；delete、summary/window 仍 fail closed，一般查询仍扫描 metadata。
+这是实验接口，不是完整生产恢复交付。
+
 ## 后续阶段（生产路径尚未实现）
 
 1. 在隔离旧 session 副本上分别测 load/replay、queue、interrupted repair、上下文准备、首屏 history。

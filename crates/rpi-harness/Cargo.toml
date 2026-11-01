@@ -13,6 +13,10 @@ readme = "README.md"
 keywords = ["agent", "llm", "ai", "claude", "harness"]
 categories = ["api-bindings", "asynchronous", "artificial-intelligence"]
 
+[features]
+# Explicit construction only; no CLI/Web routing or migration.
+experimental-native-store = ["rusqlite/hooks"]
+
 [dependencies]
 rpi-telemetry = { workspace = true }
 rpi-ai = { workspace = true }
