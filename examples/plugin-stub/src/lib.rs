@@ -584,6 +584,23 @@ rpi_plugin_sdk::string_handler! {
 // the version/null checks before running our registration body. Return 0 on
 // success; nonzero means the host logs and skips this plugin.
 rpi_plugin_sdk::export_plugin!(|api| {
+    // Opt-in real registration side effect for native host lifecycle tests.
+    // The build-only digest proves a test loaded its freshly built source, not
+    // an unrelated DLL in a shared target directory. No output by default.
+    if let Some(path) = std::env::var_os("RPI_PLUGIN_STUB_REGISTRATION_LOG") {
+        use std::io::Write;
+        if let Ok(mut log) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(
+                log,
+                "register {}",
+                option_env!("RPI_RESOURCE_FIXTURE_SOURCE_SHA256").unwrap_or("unversioned")
+            );
+        }
+    }
     // Register the echo tool. Build an owning StableToolSchema (name +
     // description + parameters-as-JSON); the host frees the schema's strings
     // via our `plugin_free_string` after copying them out.

@@ -25,6 +25,10 @@ pub enum Command {
     },
     Abort,
     GetState,
+    /// Versioned, bounded exact startup resource observations.
+    GetResourceState {
+        version: Option<u32>,
+    },
     /// List extension slash commands (name and description).
     GetCommands,
     /// Invoke an extension handler and return its JSON result as response data.
@@ -188,6 +192,7 @@ impl<'de> serde::Deserialize<'de> for PromptPayload {
 }
 
 pub const SUPPORTED_COMMANDS: &[&str] = &[
+    "get_resource_state",
     "get_state",
     "get_commands",
     "execute_command",

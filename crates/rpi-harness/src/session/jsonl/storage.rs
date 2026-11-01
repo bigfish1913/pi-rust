@@ -206,6 +206,36 @@ impl JsonlSessionStorage {
         clock: Arc<dyn Clock>,
         ids: Arc<dyn IdGenerator>,
     ) -> SessionResult<Self> {
+        Self::load_impl(fs, path, clock, ids, true).await
+    }
+
+    /// Replay through the canonical native decoder/reducer without repairing,
+    /// appending, claiming a writer, or creating any file. Recoverable tails and
+    /// exact duplicate sequences are ignored in memory, as on normal restore.
+    /// The returned snapshot cannot write to the original transcript.
+    pub async fn read_snapshot(
+        fs: Arc<dyn FileSystem>,
+        path: &str,
+        clock: Arc<dyn Clock>,
+        ids: Arc<dyn IdGenerator>,
+    ) -> SessionResult<crate::session::memory::InMemorySessionStorage> {
+        let storage = Self::load_impl(fs, path, clock.clone(), ids.clone(), false).await?;
+        let state = storage.state.lock().await.clone();
+        Ok(crate::session::memory::InMemorySessionStorage::from_state(
+            storage.metadata.to_base(),
+            state,
+            clock,
+            ids,
+        ))
+    }
+
+    async fn load_impl(
+        fs: Arc<dyn FileSystem>,
+        path: &str,
+        clock: Arc<dyn Clock>,
+        ids: Arc<dyn IdGenerator>,
+        repair: bool,
+    ) -> SessionResult<Self> {
         let content = file_result(
             fs.read_text_file(path, None).await,
             &format!("Failed to read session {path}"),
@@ -293,6 +323,9 @@ impl JsonlSessionStorage {
                     let is_last = idx == physical_lines.len() - 1;
                     let is_torn_tail = is_last && err.kind == JsonlDecodeErrorKind::Syntax;
                     if is_torn_tail {
+                        if !repair {
+                            return Ok(storage);
+                        }
                         // Drop the unacknowledged partial append by atomically
                         // publishing the valid prefix.
                         let valid_prefix = format!("{}\n", physical_lines[..idx].join("\n"));
@@ -321,7 +354,7 @@ impl JsonlSessionStorage {
         // without the dropped duplicates so the log no longer carries them.
         // Seq values are untouched (no renumbering), so subsequent appends
         // stay consistent with the file.
-        if dropped_duplicates {
+        if dropped_duplicates && repair {
             let mut repaired = String::with_capacity(content.len());
             repaired.push_str(physical_lines[0]);
             repaired.push('\n');
@@ -348,7 +381,7 @@ impl JsonlSessionStorage {
         }
         // Repair an unterminated tail (no trailing "\n") so future appends are
         // on their own line.
-        if !content.ends_with('\n') {
+        if repair && !content.ends_with('\n') {
             file_result(
                 storage
                     .fs
@@ -1854,6 +1887,68 @@ mod tests {
             .unwrap()
             .expect("entry exists");
         assert_eq!(got.id(), "e1");
+    }
+
+    #[tokio::test]
+    async fn read_snapshot_replays_recoverable_tails_without_writes_or_creation() {
+        for damage in ["torn", "duplicate", "unterminated"] {
+            let fs: Arc<dyn FileSystem> =
+                Arc::new(rpi_tools::InMemoryExecutionEnv::with_cwd("/".into()));
+            let clock: Arc<dyn Clock> = Arc::new(FakeClock::new());
+            let ids: Arc<dyn IdGenerator> = Arc::new(CounterIdGenerator::new());
+            let storage = JsonlSessionStorage::create(
+                fs.clone(),
+                "/s.jsonl",
+                header(),
+                clock.clone(),
+                ids.clone(),
+            )
+            .await
+            .unwrap();
+            storage.set_name(Some("persisted")).await.unwrap();
+            let original = fs.read_text_file("/s.jsonl", None).await.unwrap();
+            let damaged = match damage {
+                "torn" => format!("{original}{{unacknowledged"),
+                "duplicate" => format!("{original}{}\n", original.lines().last().unwrap()),
+                "unterminated" => original.trim_end_matches('\n').to_string(),
+                _ => unreachable!(),
+            };
+            fs.write_file("/s.jsonl", FileContent::Text(damaged.clone()), None)
+                .await
+                .unwrap();
+            let snapshot = JsonlSessionStorage::read_snapshot(
+                fs.clone(),
+                "/s.jsonl",
+                clock.clone(),
+                ids.clone(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                snapshot.get_name().await.unwrap().as_deref(),
+                Some("persisted")
+            );
+            snapshot.set_name(Some("memory-only")).await.unwrap();
+            assert_eq!(fs.read_text_file("/s.jsonl", None).await.unwrap(), damaged);
+            assert!(JsonlSessionStorage::read_snapshot(
+                fs.clone(),
+                "/absent.jsonl",
+                clock.clone(),
+                ids.clone()
+            )
+            .await
+            .is_err());
+            assert_eq!(fs.list_dir("/", None).await.unwrap().len(), 1);
+            // The accepted writer path retains canonical recovery semantics.
+            let restored = JsonlSessionStorage::load(fs.clone(), "/s.jsonl", clock, ids)
+                .await
+                .unwrap();
+            assert_eq!(
+                restored.get_name().await.unwrap().as_deref(),
+                Some("persisted")
+            );
+            assert_eq!(fs.read_text_file("/s.jsonl", None).await.unwrap(), original);
+        }
     }
 
     #[tokio::test]

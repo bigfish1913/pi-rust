@@ -133,6 +133,7 @@ pub struct Args {
     pub timeout: Option<Duration>,
     /// Maximum silence between streamed response bytes; zero disables it.
     pub stream_idle_timeout: Option<Duration>,
+    pub resource_config: Option<PathBuf>,
     pub system_prompt: Option<String>,
     pub append_system_prompt: Vec<String>,
     /// `--theme` — built-in theme name or a theme file path.
@@ -283,13 +284,14 @@ pub fn parse_args(args: &[String]) -> Args {
     // `RPI_EXTENSIONS_DIR` env: an extra list of plugin dirs prepended to any
     // `--extensions-dir` flags. Semicolon-separated on Windows, colon-separated
     // on Unix (PATH-style). Empty entries skipped. `--no-extensions` still wins.
+    let mut env_extension_dirs = Vec::new();
     if let Ok(raw) = std::env::var("RPI_EXTENSIONS_DIR") {
         if !raw.is_empty() {
             let sep = if cfg!(windows) { ';' } else { ':' };
             for part in raw.split(sep) {
                 let trimmed = part.trim();
                 if !trimmed.is_empty() {
-                    result.extensions_dir.push(PathBuf::from(trimmed));
+                    env_extension_dirs.push(PathBuf::from(trimmed));
                 }
             }
         }
@@ -427,6 +429,10 @@ pub fn parse_args(args: &[String]) -> Args {
                         )),
                     }
                 }
+            }
+            "--resource-config" => {
+                result.resource_config =
+                    take_value(&mut result, "--resource-config").map(PathBuf::from)
             }
             "--system-prompt" => result.system_prompt = take_value(&mut result, "--system-prompt"),
             "--append-system-prompt" => {
@@ -568,6 +574,11 @@ pub fn parse_args(args: &[String]) -> Args {
         i += 1;
     }
 
+    // Exact startup ignores discovery environment, but still rejects explicit CLI dirs.
+    if result.resource_config.is_none() {
+        env_extension_dirs.append(&mut result.extensions_dir);
+        result.extensions_dir = env_extension_dirs;
+    }
     // `--print` + `--mode json`: `--print` implies non-interactive, but
     // `--mode json` selects the JSON event stream. The TS `resolveAppMode`
     // treats `mode === "json"` as its own non-interactive mode; we follow that.
@@ -632,6 +643,7 @@ pub fn print_help() {
   --base-url <url>               Override the selected model endpoint
   --timeout <seconds>            LLM API request timeout (default: 600)
   --stream-idle-timeout <seconds> Max silence between response bytes (default: 300; 0 disables)
+  --resource-config <file>       Exact versioned startup resources (RPC only; see docs/resource-selection-rpc.md)
   --system-prompt <text>         Replace the default system prompt
   --append-system-prompt <text>  Append text to the system prompt (repeatable)
   --thinking <level>             off, minimal, low, medium, high, xhigh, max

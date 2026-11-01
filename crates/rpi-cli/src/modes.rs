@@ -481,7 +481,24 @@ where
     let mut run_cancel = tokio_util::sync::CancellationToken::new();
     let mut cancel_on_exit = false;
 
-    write_line(&stdout, &rpc_protocol::ready(message_updates)).await;
+    let mut ready = rpc_protocol::ready(message_updates);
+    ready["resourceState"] = serde_json::json!({
+        "version": 1, "enabled": harness.has_exact_resources(), "command": "get_resource_state",
+        "maxSnapshotBytes": crate::resource_selection::MAX_STATE_BYTES,
+        "changes": "restart-required", "setActiveTools": if harness.has_exact_resources() { "unsupported" } else { "legacy" },
+        "configureExternalTools": if harness.has_exact_resources() { "unsupported" } else { "supported" },
+        "automaticPersistenceRecovery": false, "hotApply": false
+    });
+    if harness.has_exact_resources() {
+        if let Ok(state) = crate::resource_selection::get_resource_state(harness).await {
+            for key in ["hostId", "host", "sessionId", "selection"] {
+                ready["resourceState"][key] = state[key].clone();
+            }
+        } else {
+            ready["resourceState"]["enabled"] = serde_json::json!(false);
+        }
+    }
+    write_line(&stdout, &ready).await;
 
     loop {
         let incoming = tokio::select! {
@@ -540,6 +557,19 @@ where
             .unwrap_or("")
             .to_string();
 
+        if kind == "get_resource_state" && serde_json::to_vec(&id).map_or(true, |v| v.len() > 4096)
+        {
+            write_line(
+                &stdout,
+                &rpc_protocol::response(
+                    None,
+                    &kind,
+                    Err("resource state request id exceeds 4096 bytes".into()),
+                ),
+            )
+            .await;
+            continue;
+        }
         if kind != "prompt"
             && rpc_protocol::SUPPORTED_COMMANDS.contains(&kind.as_str())
             && serde_json::from_value::<rpc_protocol::Request>(msg.clone()).is_err()
@@ -826,6 +856,17 @@ where
                 }
                 Ok(serde_json::json!({"accepted": owner.file_io.as_ref()
                     .is_some_and(|client| client.resolve_response(&reply))}))
+            }
+            "get_resource_state" => {
+                if msg.as_object().is_none_or(|o| {
+                    o.keys()
+                        .any(|k| !["type", "id", "version"].contains(&k.as_str()))
+                }) || msg.get("version").is_some_and(|v| v.as_u64() != Some(1))
+                {
+                    Err("unsupported resource state request/schema (version 1 only)".into())
+                } else {
+                    crate::resource_selection::get_resource_state(harness).await
+                }
             }
             "get_state" => Ok(rpc_get_state(&lane, harness).await),
             "get_commands" => Ok(rpc_get_commands(oauth_snapshot.as_deref())),
@@ -1344,7 +1385,15 @@ async fn rpc_get_state(lane: &Arc<dyn AgentLane>, harness: &AgentHarness) -> ser
         .await
         .ok()
         .map(|t| serde_json::to_value(t).unwrap_or(serde_json::Value::Null));
-    let active_tools = lane.get_active_tools().await.unwrap_or_default();
+    let active_tools = if harness.has_exact_resources() {
+        harness
+            .execution_context()
+            .ok()
+            .and_then(|v| v.get("tools").cloned())
+            .unwrap_or_else(|| serde_json::json!([]))
+    } else {
+        serde_json::json!(lane.get_active_tools().await.unwrap_or_default())
+    };
     let leaf_id = lane.get_leaf_id().await.ok().flatten();
     let context = rpc_context_usage(lane, harness).await;
     let active_operation = lane
@@ -1630,6 +1679,7 @@ async fn rpc_append_entry(
         .and_then(serde_json::Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| "append_entry requires a non-empty string `customType`".to_string())?;
+    crate::resource_selection::validate_public_entry(custom_type, msg.get("data"))?;
     let entry_id = harness
         .session()
         .append_custom_entry(custom_type, msg.get("data").cloned())
@@ -2276,7 +2326,15 @@ async fn rpc_get_available_tools(
     lane: &Arc<dyn AgentLane>,
     harness: &AgentHarness,
 ) -> serde_json::Value {
-    let active = lane.get_active_tools().await.unwrap_or_default();
+    let active: Vec<String> = if harness.has_exact_resources() {
+        harness
+            .execution_context()
+            .ok()
+            .and_then(|v| serde_json::from_value(v["tools"].clone()).ok())
+            .unwrap_or_default()
+    } else {
+        lane.get_active_tools().await.unwrap_or_default()
+    };
     let tools = harness
         .get_tools()
         .await
@@ -2340,10 +2398,14 @@ async fn rpc_set_active_tools(
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|v| v.as_str().map(str::to_owned))
-                .collect::<Vec<_>>()
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_owned)
+                        .ok_or("tool names must be strings")
+                })
+                .collect::<Result<Vec<_>, _>>()
         })
-        .ok_or("set_active_tools requires a `tools` array")?;
+        .ok_or("set_active_tools requires a `tools` array")??;
     lane.set_active_tools(tools.clone())
         .await
         .map_err(|e| e.to_string())?;

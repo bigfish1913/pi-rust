@@ -464,6 +464,7 @@ impl RuntimeActionHost for HarnessActionHost {
         // may be reserved until the current turn settles. Custom data stays out
         // of model context unless a caller explicitly configures a projector.
         if let Some(custom_type) = arg_str_opt(&args, "customType") {
+            crate::resource_selection::validate_public_entry(&custom_type, args.get("data"))?;
             let data = args.get("data").cloned();
             let id = self
                 .harness()?
