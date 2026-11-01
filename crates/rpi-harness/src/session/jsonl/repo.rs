@@ -276,10 +276,21 @@ impl JsonlSessionRepo {
         &self,
         metadata: &JsonlSessionMetadata,
     ) -> SessionResult<()> {
+        // Remove the session first: a failed primary deletion must not erase
+        // recovery payloads from a session which still exists.
         file_result(
             self.fs.remove(&metadata.path, false, true, None).await,
             &format!("Failed to delete session {}", metadata.path),
-        )
+        )?;
+        for suffix in [".progress.jsonl", ".progress.jsonl.tmp"] {
+            file_result(
+                self.fs
+                    .remove(&format!("{}{suffix}", metadata.path), false, true, None)
+                    .await,
+                "delete session progress",
+            )?;
+        }
+        Ok(())
     }
 
     /// Fork a session. Mirrors TS
@@ -542,7 +553,11 @@ async fn list_jsonl_session_metadata(
         )?;
         let files: Vec<_> = entries
             .iter()
-            .filter(|entry| entry.kind != FileKind::Directory && entry.name.ends_with(".jsonl"))
+            .filter(|entry| {
+                entry.kind != FileKind::Directory
+                    && entry.name.ends_with(".jsonl")
+                    && !entry.name.ends_with(".progress.jsonl")
+            })
             .collect();
         for file in files {
             let lines = file_result(

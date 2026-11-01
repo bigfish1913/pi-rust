@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use rpi_ai::types::{DeferredHandle, StopReason, Usage};
 use serde::{Deserialize, Serialize};
 
-use crate::error::SessionResult;
+use crate::error::{SessionError, SessionResult};
 
 /// JSON value alias — mirrors `JsonValue` from the TS module. `pi-harness`
 /// stores opaque app payloads as `serde_json::Value` rather than a recursive
@@ -721,6 +721,18 @@ pub struct OperationFinishedRecord {
     pub outcome: OperationOutcome,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<OperationError>,
+    /// Stable run result identity; absent on legacy/non-run terminal records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<RunResultIdentity>,
+}
+
+/// References existing entries instead of duplicating assistant payloads.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunResultIdentity {
+    pub leaf_id: String,
+    pub final_entry_id: Option<String>,
+    pub assistant_entry_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1085,6 +1097,14 @@ pub struct EntryCursor {
 pub struct EntryQuery {
     pub entry_type: Option<&'static str>,
     pub custom_type: Option<String>,
+    /// Exact identity, useful for a bounded branch-membership check.
+    pub entry_id: Option<String>,
+    /// Tool inspection filters before cloning unrelated transcript payloads.
+    pub tool_call_id: Option<String>,
+    /// Select assistant/user boundaries for bounded legacy tool correlation.
+    pub message_boundary_only: bool,
+    /// Host-managed custom-message outbox metadata. Filtering precedes cloning.
+    pub outbox_key: Option<String>,
     pub order: Option<EntryOrder>,
     pub limit: Option<usize>,
     pub cursor: Option<EntryCursor>,
@@ -1107,10 +1127,33 @@ pub struct RecordQuery {
     pub run_id: Option<String>,
     /// Exact operation intent kind. Valid only with type `operation_started`.
     pub operation_kind: Option<&'static str>,
+    /// Queue filters are applied before copying payloads or applying the limit.
+    pub queue_kind: Option<QueueKind>,
+    pub tool_call_id: Option<String>,
+    pub target_entry_id: Option<String>,
+    /// Select only enqueues with neither a committed target nor a cancellation.
+    pub pending_queue_only: bool,
     /// Exclusive chronological lower bound: `seq > after_seq`, regardless of order.
     pub after_seq: Option<u64>,
     pub order: Option<EntryOrder>,
     pub limit: Option<usize>,
+}
+
+/// A bounded chronological page. Bounds are exclusive; `from_end` selects
+/// the newest matching window without changing the ascending output order.
+#[derive(Debug, Clone)]
+pub struct RecordPageQuery {
+    pub lane: String,
+    pub after_seq: Option<u64>,
+    pub before_seq: Option<u64>,
+    pub limit: usize,
+    pub from_end: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecordPage {
+    pub records: Vec<LaneRecord>,
+    pub total: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1314,9 +1357,62 @@ pub trait SessionStorage: Send + Sync {
     async fn create_lane(&self, lane: &str, at: Option<&str>) -> SessionResult<()>;
     async fn move_lane(&self, lane: &str, to: Option<&str>) -> SessionResult<()>;
 
+    // Transient payloads use a separate sequence domain and never enter history.
+    // CommitStream bindings remain immutable lane records.
+    async fn append_progress(
+        &self,
+        records: Vec<AssistantFrameRecord>,
+    ) -> SessionResult<Vec<AssistantFrameRecord>>;
+    async fn read_progress(&self, run_id: &str) -> SessionResult<Vec<AssistantFrameRecord>>;
+    /// Retire payloads proven terminal by this session's durable OperationFinished.
+    /// Returns deleted payload count; neither history nor progress sequence advances.
+    async fn prune_completed_progress(&self) -> SessionResult<usize>;
+
     // Entries + records
+    /// Snapshot token for optimistic, conditional history writes. Transient
+    /// progress must not advance it. Unsupported backends fail closed.
+    async fn history_revision(&self) -> SessionResult<u64> {
+        Err(SessionError::storage(
+            "conditional history writes are unsupported",
+        ))
+    }
+
+    /// Compare the original revision and append within the storage's mutation
+    /// boundary. Never implement this as a read followed by ordinary append.
+    async fn append_entry_if_revision(
+        &self,
+        _entry: ProvisionedEntry,
+        _lane: &str,
+        _expected: u64,
+    ) -> SessionResult<Entry> {
+        Err(SessionError::storage(
+            "conditional history writes are unsupported",
+        ))
+    }
+
+    async fn append_record_if_revision(
+        &self,
+        _record: LaneRecord,
+        _expected: u64,
+    ) -> SessionResult<LaneRecord> {
+        Err(SessionError::storage(
+            "conditional history writes are unsupported",
+        ))
+    }
+
     async fn append_entry(&self, entry: ProvisionedEntry, lane: &str) -> SessionResult<Entry>;
     async fn append_record(&self, record: LaneRecord) -> SessionResult<LaneRecord>;
+
+    /// Accept a cancellation batch without exposing a partially reduced batch.
+    /// This is an ACK boundary, not a power-loss transaction guarantee.
+    async fn append_queue_cancellations(
+        &self,
+        _records: Vec<LaneRecord>,
+    ) -> SessionResult<Vec<LaneRecord>> {
+        Err(SessionError::storage(
+            "queue cancellation batches are unsupported",
+        ))
+    }
 
     async fn append_record_and_entry(
         &self,
@@ -1389,6 +1485,8 @@ pub trait SessionStorage: Send + Sync {
         ))
     }
     async fn find_records(&self, query: &RecordQuery) -> SessionResult<Vec<LaneRecord>>;
+    /// Count and select within one storage snapshot, cloning only the page.
+    async fn record_page(&self, query: &RecordPageQuery) -> SessionResult<RecordPage>;
     /// Returns unfinished `operation_started` records, newest first. Recovery
     /// uses `limit: 2`: 0 = idle, 1 = suspended, 2 = corruption.
     async fn find_open_operations(

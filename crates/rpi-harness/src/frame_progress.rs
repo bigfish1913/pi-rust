@@ -8,21 +8,22 @@
 //! # Storage choice
 //!
 //! Native keeps frames in session-scoped **list** storage
-//! (`pendingAssistantFrames(operationId, responseEntryId)`), which is separate
-//! from the branch. rpi has no list primitive, so frames ride the **record
-//! stream** (`LaneRecord::AssistantFrame`) instead.
+//! (`pendingAssistantFrames(operationId, responseEntryId)`), separate from the
+//! branch. rpi uses the independent `SessionStorage` progress APIs: Memory live
+//! state, SQLite progress tables, or a reclaimable JSONL sidecar. Payloads never
+//! enter transcript entries, the history sequence, or record pagination.
 //!
-//! That choice is load-bearing: records are not entries, so a frame can never
-//! enter the branch path the model's context is built from. Storing frames as
-//! custom *entries* (the obvious first attempt) inflates the transcript — one
-//! entry per frame — and the harness's own entry-count tests catch it.
+//! Only `AssistantFrameOp::CommitStream` bindings remain in the immutable
+//! history. Their reserved entry IDs and ordering make recovery idempotent even
+//! if an entry commit succeeds but retiring its progress fails.
 //!
 //! # Model
 //!
 //! - Each streamed assistant message gets a `stream_index` within its run.
-//! - Every frame is appended as one `AssistantFrame { op: Append }` record.
-//! - When the run's messages are persisted, one `ClearRun` record retires the
-//!   whole run's frames: they were progress, not history.
+//! - Every frame is queued for an independent `Append` progress write.
+//! - Commit and error-recovery boundaries flush the queue before consuming it.
+//! - When the run's messages are persisted, one `ClearRun` retires the whole
+//!   run's frames: they were progress, not history.
 //! - If the run dies first, [`salvage_run_frames`] replays the committed prefix
 //!   into the partial message and marks it interrupted, so the content the model
 //!   had already produced is kept instead of vanishing.
@@ -46,7 +47,7 @@ use crate::result::{HarnessError, HarnessResult};
 use crate::session::session::Session;
 use crate::session::types::{
     AssistantFrameOp, AssistantFrameRecord, Entry, EntryOrder, EntryQuery, LaneRecord, RecordBase,
-    RecordQuery,
+    RecordQuery, ToolStartedRecord,
 };
 
 const FRAME_CHUNK_RECORDS: usize = 32;
@@ -58,6 +59,7 @@ pub(crate) enum FrameFlushReason {
     #[cfg(test)]
     Manual,
     PrepareCommit,
+    ErrorRecovery,
     ClearStreamBefore,
     ClearStreamAfter,
     ClearRunBefore,
@@ -76,6 +78,7 @@ pub struct FrameDiagnosticsSnapshot {
     pub batch_append_ns: u64,
     pub writer_failures: u64,
     pub prepare_commit_flushes: u64,
+    pub error_recovery_flushes: u64,
     pub clear_stream_before_flushes: u64,
     pub clear_stream_after_flushes: u64,
     pub clear_run_before_flushes: u64,
@@ -95,6 +98,7 @@ struct FrameDiagnostics {
     batch_append_ns: AtomicU64,
     writer_failures: AtomicU64,
     prepare_commit_flushes: AtomicU64,
+    error_recovery_flushes: AtomicU64,
     clear_stream_before_flushes: AtomicU64,
     clear_stream_after_flushes: AtomicU64,
     clear_run_before_flushes: AtomicU64,
@@ -124,6 +128,7 @@ impl FrameDiagnostics {
             #[cfg(test)]
             FrameFlushReason::Manual => return,
             FrameFlushReason::PrepareCommit => &self.prepare_commit_flushes,
+            FrameFlushReason::ErrorRecovery => &self.error_recovery_flushes,
             FrameFlushReason::ClearStreamBefore => &self.clear_stream_before_flushes,
             FrameFlushReason::ClearStreamAfter => &self.clear_stream_after_flushes,
             FrameFlushReason::ClearRunBefore => &self.clear_run_before_flushes,
@@ -144,6 +149,7 @@ impl FrameDiagnostics {
             batch_append_ns: self.batch_append_ns.load(Ordering::Relaxed),
             writer_failures: self.writer_failures.load(Ordering::Relaxed),
             prepare_commit_flushes: self.prepare_commit_flushes.load(Ordering::Relaxed),
+            error_recovery_flushes: self.error_recovery_flushes.load(Ordering::Relaxed),
             clear_stream_before_flushes: self.clear_stream_before_flushes.load(Ordering::Relaxed),
             clear_stream_after_flushes: self.clear_stream_after_flushes.load(Ordering::Relaxed),
             clear_run_before_flushes: self.clear_run_before_flushes.load(Ordering::Relaxed),
@@ -398,8 +404,15 @@ async fn flush_frame_batch(
             .fetch_add(1, Ordering::Relaxed);
     }
     let started = diagnostics.enabled.then(Instant::now);
+    let frames = records
+        .into_iter()
+        .map(|record| match record {
+            LaneRecord::AssistantFrame(frame) => frame,
+            _ => unreachable!("frame writer only accepts assistant progress"),
+        })
+        .collect();
     let result = session
-        .append_records(records)
+        .append_progress(frames)
         .await
         .map(|_| ())
         .map_err(|error| {
@@ -471,19 +484,50 @@ pub struct UnknownToolOutcome {
     pub recorded: Option<serde_json::Value>,
 }
 
-/// The tool calls of `partial` whose results are not committed on `lane`.
-///
-/// Returns a `Result` rather than panicking so a recovery path can degrade to
-/// "no report" instead of failing the whole recovery.
-///
-/// Resolved by `tool_call_id` against the lane's entries rather than by a
-/// reserved result-entry id: rpi persists tool results with a freshly minted id
-/// at run end, so the id a `tool_started` record would have named is not known
-/// when the tool actually runs. `tool_call_id` is the durable link that exists.
+/// The unresolved calls of one assistant on the current lane branch. A missing
+/// entry id denotes an uncommitted partial, which cannot already have results.
+/// Storage errors and conflicting reserved-result identities fail recovery
+/// rather than silently discarding its report.
 pub async fn unknown_tool_outcomes(
     session: &Session,
     lane: &str,
+    assistant_entry_id: Option<&str>,
     partial: &AssistantMessage,
+) -> HarnessResult<Vec<UnknownToolOutcome>> {
+    let started = if assistant_entry_id.is_some()
+        && partial
+            .content
+            .iter()
+            .any(|block| matches!(block, rpi_ai::types::Content::ToolCall(_)))
+    {
+        session
+            .find_records(&RecordQuery {
+                lane: Some(lane.to_string()),
+                record_type: Some("tool_started"),
+                ..Default::default()
+            })
+            .await
+            .map_err(|error| HarnessError::io(error.to_string()))?
+            .into_iter()
+            .filter_map(|record| match record {
+                LaneRecord::ToolStarted(record) => Some(record),
+                _ => None,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    unknown_tool_outcomes_with_started(session, lane, assistant_entry_id, partial, &started).await
+}
+
+/// Recovery already read these records for the run. Reuse them rather than
+/// querying/cloning the history again for each assistant batch.
+pub(crate) async fn unknown_tool_outcomes_with_started(
+    session: &Session,
+    lane: &str,
+    assistant_entry_id: Option<&str>,
+    partial: &AssistantMessage,
+    started: &[ToolStartedRecord],
 ) -> HarnessResult<Vec<UnknownToolOutcome>> {
     let calls: Vec<&rpi_ai::types::ToolCall> = partial
         .content
@@ -498,27 +542,67 @@ pub async fn unknown_tool_outcomes(
     }
 
     let entries = session
-        .find_entries(&EntryQuery {
-            order: Some(EntryOrder::OldestFirst),
-            ..Default::default()
-        })
+        .view(lane)
+        .find_entries_on_branch(
+            &EntryQuery {
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            },
+            &Default::default(),
+        )
         .await
         .map_err(|error| HarnessError::io(error.to_string()))?;
-    let landed: std::collections::BTreeSet<&str> = entries
+    // Results belong to the assistant batch, never to a different lane or an
+    // earlier assistant that happened to reuse a provider call id.
+    let start = assistant_entry_id.and_then(|id| entries.iter().position(|entry| entry.id() == id));
+    if assistant_entry_id.is_some() && start.is_none() {
+        return Err(HarnessError::io(
+            "Recovery assistant is not on the current lane branch",
+        ));
+    }
+    let expected: BTreeMap<_, _> = started
         .iter()
-        .filter_map(|entry| match entry {
-            Entry::Message(message) => match &message.message {
-                AgentMessage::ToolResult(result) => Some(result.tool_call_id.as_str()),
-                _ => None,
-            },
-            _ => None,
+        .filter(|record| Some(record.assistant_entry_id.as_str()) == assistant_entry_id)
+        .map(|record| {
+            (
+                (record.tool_call_id.as_str(), record.tool_name.as_str()),
+                record.result_entry_id.as_str(),
+            )
         })
         .collect();
-    let _ = lane; // entries are session-wide; kept for call-site clarity.
+    let mut landed = std::collections::BTreeSet::new();
+    for entry in entries
+        .iter()
+        .skip(start.map_or(entries.len(), |i| i + 1))
+        .take_while(|entry| match entry {
+            Entry::Custom(_) => true,
+            Entry::Message(message) => matches!(message.message, AgentMessage::ToolResult(_)),
+            _ => false,
+        })
+    {
+        let Entry::Message(message) = entry else {
+            continue;
+        };
+        let AgentMessage::ToolResult(result) = &message.message else {
+            continue;
+        };
+        let key = (result.tool_call_id.as_str(), result.tool_name.as_str());
+        if let Some(expected_id) = expected.get(&key) {
+            if message.base.id != *expected_id {
+                // Never silently adopt an external result or replay over it.
+                // Validate the entire batch before ANY call can be replayed.
+                return Err(HarnessError::io(format!(
+                    "Recovery result identity conflict for {}:{}: expected entry {}, found {}",
+                    key.0, key.1, expected_id, message.base.id
+                )));
+            }
+        }
+        landed.insert(key);
+    }
 
     Ok(calls
         .into_iter()
-        .filter(|call| !landed.contains(call.id.as_str()))
+        .filter(|call| !landed.contains(&(call.id.as_str(), call.name.as_str())))
         .map(|call| UnknownToolOutcome {
             tool_call_id: call.id.clone(),
             tool_name: call.name.clone(),
@@ -571,13 +655,30 @@ pub fn recorded_tool_result(
 
 /// Reduce the committed frames of every stream in `run_id`, in stream order.
 ///
-/// A run that was cleared (i.e. it committed) yields nothing. Unreadable frame
-/// sequences are skipped rather than failing the caller — recovery must never
-/// make a session unreadable.
+/// A recoverable stream retains its durable identity until its message commits.
+pub(crate) struct ReplayedStream {
+    pub stream_index: usize,
+    pub entry_id: Option<String>,
+    pub message: AssistantMessage,
+}
+
 pub(crate) async fn replay_run_frames(
     session: &Session,
     run_id: &str,
 ) -> HarnessResult<Vec<AssistantMessage>> {
+    Ok(replay_run_streams(session, run_id)
+        .await?
+        .into_iter()
+        .map(|s| s.message)
+        .collect())
+}
+
+/// Return uncommitted streams. Cleared runs yield nothing; unreadable frame
+/// sequences are skipped rather than making the entire session unreadable.
+pub(crate) async fn replay_run_streams(
+    session: &Session,
+    run_id: &str,
+) -> HarnessResult<Vec<ReplayedStream>> {
     if let Some(progress) = session.volatile_progress() {
         // Copy only on recovery. The streaming path moves typed frames into the
         // cache, retaining the same encoder/reducer semantics as durable mode.
@@ -589,7 +690,7 @@ pub(crate) async fn replay_run_frames(
             .cloned()
             .unwrap_or_default();
         let mut replayed = Vec::new();
-        for stream in streams.into_values() {
+        for (stream_index, stream) in streams {
             let mut committed = false;
             for entry_id in &stream.committed_entries {
                 if session
@@ -604,7 +705,11 @@ pub(crate) async fn replay_run_frames(
             }
             if !committed {
                 match reduce_frames(&stream.frames) {
-                    Ok(Some(partial)) => replayed.push(partial),
+                    Ok(Some(partial)) => replayed.push(ReplayedStream {
+                        stream_index,
+                        entry_id: stream.committed_entries.last().cloned(),
+                        message: partial,
+                    }),
                     Ok(None) => {}
                     Err(error) => {
                         tracing::warn!(%error, "discarding an unreadable in-memory assistant frame stream")
@@ -614,7 +719,7 @@ pub(crate) async fn replay_run_frames(
         }
         return Ok(replayed);
     }
-    let records = session
+    let mut records = session
         .find_records(&RecordQuery {
             record_type: Some(ASSISTANT_FRAME_RECORD_TYPE),
             run_id: Some(run_id.to_string()),
@@ -624,6 +729,14 @@ pub(crate) async fn replay_run_frames(
         .await
         .map_err(|error| HarnessError::io(error.to_string()))?;
 
+    records.extend(
+        session
+            .read_progress(run_id)
+            .await
+            .map_err(|error| HarnessError::io(error.to_string()))?
+            .into_iter()
+            .map(LaneRecord::AssistantFrame),
+    );
     let mut streams: BTreeMap<usize, Vec<AssistantMessageFrame>> = BTreeMap::new();
     // Streams whose message is already an entry (committed mid-run by
     // commit-on-settle). Replaying one would duplicate it in the transcript.
@@ -692,7 +805,11 @@ pub(crate) async fn replay_run_frames(
             continue;
         }
         match reduce_frames(&frames) {
-            Ok(Some(partial)) => replayed.push(partial),
+            Ok(Some(partial)) => replayed.push(ReplayedStream {
+                stream_index: index,
+                entry_id: commits.get(&index).and_then(|ids| ids.last()).cloned(),
+                message: partial,
+            }),
             Ok(None) => {}
             Err(error) => tracing::warn!(
                 %error,
@@ -701,6 +818,34 @@ pub(crate) async fn replay_run_frames(
         }
     }
     Ok(replayed)
+}
+
+/// Retire only after all recovered transcript entries have committed.
+pub(crate) async fn retire_run_frames(
+    session: &Session,
+    lane: &str,
+    run_id: &str,
+) -> HarnessResult<()> {
+    if let Some(progress) = session.volatile_progress() {
+        progress.lock().unwrap().runs.remove(run_id);
+        return Ok(());
+    }
+    session
+        .append_progress(vec![AssistantFrameRecord {
+            base: RecordBase {
+                id: session.id_generator().next(),
+                seq: 0,
+                lane: lane.into(),
+                timestamp: 0,
+            },
+            run_id: run_id.into(),
+            stream_index: 0,
+            op: AssistantFrameOp::ClearRun,
+            frame: None,
+        }])
+        .await
+        .map_err(|error| HarnessError::io(error.to_string()))?;
+    Ok(())
 }
 
 /// Record the entry a stream will commit under before appending that entry.
@@ -836,7 +981,7 @@ impl RecorderShared {
             return;
         };
         eprintln!(
-            "RPI_FRAME_DIAGNOSTICS lane={} run_id={} frame_append_requests={} batch_count={} batch_records={} append_records_calls={} flush_requests={} queue_wait_ns={} flush_wait_ns={} batch_append_ns={} writer_failures={} prepare_commit_flushes={} clear_stream_before_flushes={} clear_stream_after_flushes={} clear_run_before_flushes={} clear_run_after_flushes={}",
+            "RPI_FRAME_DIAGNOSTICS lane={} run_id={} frame_append_requests={} batch_count={} batch_records={} append_records_calls={} flush_requests={} queue_wait_ns={} flush_wait_ns={} batch_append_ns={} writer_failures={} prepare_commit_flushes={} error_recovery_flushes={} clear_stream_before_flushes={} clear_stream_after_flushes={} clear_run_before_flushes={} clear_run_after_flushes={}",
             self.lane,
             self.run_id,
             snapshot.frame_append_requests,
@@ -849,6 +994,7 @@ impl RecorderShared {
             snapshot.batch_append_ns,
             snapshot.writer_failures,
             snapshot.prepare_commit_flushes,
+            snapshot.error_recovery_flushes,
             snapshot.clear_stream_before_flushes,
             snapshot.clear_stream_after_flushes,
             snapshot.clear_run_before_flushes,
@@ -1341,7 +1487,7 @@ mod volatile_tests {
             run_id: "old-run".into(),
             stream_index: 0,
             op: AssistantFrameOp::Append,
-            frame: None,
+            frame: Some(serde_json::json!({})),
         });
 
         writer.append(record).await.unwrap();
@@ -1349,13 +1495,8 @@ mod volatile_tests {
         session.set_storage(target_storage.clone());
         tokio::task::yield_now().await;
 
-        let query = RecordQuery {
-            record_type: Some(ASSISTANT_FRAME_RECORD_TYPE),
-            run_id: Some("old-run".into()),
-            ..Default::default()
-        };
-        let old_records = old_storage.find_records(&query).await.unwrap();
-        let target_records = target_storage.find_records(&query).await.unwrap();
+        let old_records = old_storage.read_progress("old-run").await.unwrap();
+        let target_records = target_storage.read_progress("old-run").await.unwrap();
         assert_eq!(
             old_records.len(),
             1,
@@ -1384,7 +1525,7 @@ mod volatile_tests {
                 run_id: "busy-run".into(),
                 stream_index: 0,
                 op: AssistantFrameOp::Append,
-                frame: None,
+                frame: Some(serde_json::json!({})),
             })
         };
 
@@ -1406,14 +1547,7 @@ mod volatile_tests {
             tokio::task::yield_now().await;
         }
 
-        let records = storage
-            .find_records(&RecordQuery {
-                record_type: Some(ASSISTANT_FRAME_RECORD_TYPE),
-                run_id: Some("busy-run".into()),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
+        let records = storage.read_progress("busy-run").await.unwrap();
         assert_eq!(
             records.len(),
             2,

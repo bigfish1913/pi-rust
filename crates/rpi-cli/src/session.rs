@@ -988,6 +988,8 @@ pub async fn build_prepared(
         Err(e) => return Err(BuildError::HarnessCreate(e.to_string())),
     };
 
+    install_extension_settlement_bridge(harness.events(), extension_session_cell.clone());
+
     // ---- Durable operation recovery (runtime layer) ----
     // A previous process can die between `operation_started` and
     // `operation_finished`, leaving the lane with an orphaned operation. Sweep
@@ -1062,6 +1064,24 @@ pub async fn build_prepared(
     };
 
     Ok((harness, event_rx, reload_context))
+}
+
+/// Project authoritative harness termination, not per-attempt AgentEnd, to
+/// plugins. The bus owns this listener; its session cell follows reloads and
+/// retains callback libraries, while the action host binds the harness weakly.
+fn install_extension_settlement_bridge(
+    events: &rpi_harness::events::HarnessEventBus,
+    sessions: ExtensionSessionCell,
+) {
+    events.on_lifetime::<rpi_harness::events::RunEndEvent, _>(move |event| {
+        if event.lane != "main" {
+            return;
+        }
+        let session = sessions.lock().unwrap().clone();
+        if let Some(snapshot) = session.snapshot_arc() {
+            rpi_extensions::dispatch_empty_event(&snapshot, rpi_plugin_sdk::EventTag::AgentSettled);
+        }
+    });
 }
 
 /// Resolve the current plugin session for each call rather than keeping a
@@ -2802,7 +2822,9 @@ pub fn short_session_id(id: &str) -> &str {
 pub fn list_session_files_sync(dir: &Path) -> Vec<PathBuf> {
     let mut files: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
     let mut visit = |path: PathBuf| {
-        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl")
+            || path.to_string_lossy().ends_with(".progress.jsonl")
+        {
             return;
         }
         let modified = std::fs::metadata(&path)
@@ -2992,6 +3014,7 @@ pub(crate) async fn import_session_file(
     use rpi_harness::session::jsonl::{
         JsonlSessionCreateOptions, JsonlSessionRepo, JsonlSessionRepoOptions, JsonlSessionStorage,
     };
+    use rpi_harness::session::types::SessionStorage;
     use rpi_tools::FileSystem;
 
     let dir = if dir.is_absolute() {
@@ -3000,10 +3023,59 @@ pub(crate) async fn import_session_file(
         Path::new(cwd).join(dir)
     };
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let staged = tempfile::NamedTempFile::new_in(&dir)
-        .map_err(|e| e.to_string())?
-        .into_temp_path();
-    std::fs::copy(source, &staged).map_err(|e| format!("copy import: {e}"))?;
+    // External writers must be closed. This process deliberately retains locks
+    // for previously opened sessions, so its own copies additionally verify a
+    // stable history around the sidecar snapshot (bind/entry before retirement).
+    let source_progress = PathBuf::from(format!("{}.progress.jsonl", source.display()));
+    let source_lock_path = PathBuf::from(format!("{}.lock", source.display()));
+    let canonical_lock = std::fs::canonicalize(&source_lock_path).ok();
+    let owned_here = SESSION_LOCK_PATHS.get().is_some_and(|paths| {
+        paths.lock().unwrap().iter().any(|path| {
+            path == &source_lock_path
+                || canonical_lock.as_ref().is_some_and(|canonical| {
+                    std::fs::canonicalize(path).ok().as_ref() == Some(canonical)
+                })
+        })
+    });
+    let _source_lock = if !owned_here && source_progress.try_exists().map_err(|e| e.to_string())? {
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(format!("{}.lock", source.display()))
+            .map_err(|e| format!("lock import source: {e}"))?;
+        fs2::FileExt::try_lock_exclusive(&lock).map_err(|_| {
+            "close the source session before importing its recovery pair".to_owned()
+        })?;
+        Some(lock)
+    } else {
+        None
+    };
+    let staging = tempfile::tempdir_in(&dir).map_err(|e| e.to_string())?;
+    let staged = staging.path().join("history.stage");
+    let staged_progress = PathBuf::from(format!("{}.progress.jsonl", staged.display()));
+    let mut attempts = 0;
+    let has_progress = loop {
+        std::fs::copy(source, &staged).map_err(|e| format!("copy import: {e}"))?;
+        let copied_history = std::fs::read(&staged).map_err(|e| e.to_string())?;
+        let has_progress = match std::fs::copy(&source_progress, &staged_progress) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let _ = std::fs::remove_file(&staged_progress);
+                false
+            }
+            Err(error) => return Err(format!("copy progress import: {error}")),
+        };
+        if copied_history == std::fs::read(source).map_err(|e| e.to_string())? {
+            break has_progress;
+        }
+        attempts += 1;
+        if attempts >= 4 {
+            return Err(
+                "source history changed during import; retry when the session is idle".into(),
+            );
+        }
+        tokio::task::yield_now().await;
+    };
     let fs: Arc<dyn FileSystem> = Arc::new(OsExecutionEnv::with_cwd(PathBuf::from(cwd)));
     let validated = JsonlSessionStorage::load(
         fs.clone(),
@@ -3013,8 +3085,33 @@ pub(crate) async fn import_session_file(
     )
     .await
     .map_err(|e| format!("invalid session import: {e}"))?;
+    validated
+        .read_progress("")
+        .await
+        .map_err(|e| format!("invalid recovery import: {e}"))?;
     let mut metadata = validated.jsonl_metadata().clone();
     drop(validated);
+    let text = std::fs::read_to_string(&staged).map_err(|e| e.to_string())?;
+    let (first, rest) = text
+        .split_once('\n')
+        .ok_or_else(|| "import has no complete header".to_owned())?;
+    let mut header =
+        rpi_harness::session::jsonl::codec::parse_header(first).map_err(|e| e.to_string())?;
+    if has_progress && header.progress_format.is_none() {
+        return Err("history-only artifact has an undeclared recovery companion".into());
+    }
+    // An imported history-only artifact receives the destination's empty store.
+    // Imports of live-format sessions retain their validated companion instead.
+    header.progress_format = Some("assistant-progress-v1".into());
+    std::fs::write(
+        &staged,
+        format!(
+            "{}{}",
+            rpi_harness::session::jsonl::codec::encode_header(&header),
+            rest
+        ),
+    )
+    .map_err(|e| e.to_string())?;
     if list_session_metadata_in_dir(cwd, &dir)
         .await
         .map_err(|e| e.to_string())?
@@ -3049,8 +3146,16 @@ pub(crate) async fn import_session_file(
         // Another process owns this destination; leave its file intact.
         return Err(error);
     }
-    if let Err(error) = staged.persist(&path) {
+    let destination_progress = format!("{path}.progress.jsonl");
+    let publish = (|| -> std::io::Result<()> {
+        if has_progress {
+            std::fs::rename(&staged_progress, &destination_progress)?;
+        }
+        std::fs::rename(&staged, &path)
+    })();
+    if let Err(error) = publish {
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&destination_progress);
         return Err(format!("publish import: {error}"));
     }
     metadata.path = path;
@@ -3261,11 +3366,71 @@ fn read_prompt_source(path: &Path, sources: &mut Vec<String>) -> Option<String> 
 }
 
 #[cfg(test)]
+mod goal_outbox_smoke_tests;
+#[cfg(test)]
 mod runtime_session_tests;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settlement_bridge_follows_reload_and_releases_its_session_with_the_bus() {
+        use rpi_harness::events::{HarnessEvent, HarnessEventBus, RunEndEvent, RunEndOutcome};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static OLD: AtomicUsize = AtomicUsize::new(0);
+        static NEW: AtomicUsize = AtomicUsize::new(0);
+        extern "C" fn old(_: rpi_plugin_sdk::StablePluginEvent, _: *mut std::ffi::c_void) -> i32 {
+            OLD.fetch_add(1, Ordering::SeqCst);
+            0
+        }
+        extern "C" fn new(_: rpi_plugin_sdk::StablePluginEvent, _: *mut std::ffi::c_void) -> i32 {
+            NEW.fetch_add(1, Ordering::SeqCst);
+            0
+        }
+        let make = |handler: rpi_plugin_sdk::EventHandlerFn| {
+            let mut registry = rpi_extensions::ExtensionRegistry::new();
+            registry.register_event_handler(
+                "settlement".into(),
+                rpi_plugin_sdk::EventTag::AgentSettled,
+                handler,
+                std::ptr::null_mut(),
+            );
+            ExtensionSession::from_parts(
+                Arc::new(registry.snapshot()),
+                rpi_extensions::PluginKeepalive::empty(),
+                vec![],
+                None,
+            )
+        };
+        let sessions = Arc::new(Mutex::new(make(old)));
+        let weak = Arc::downgrade(&sessions);
+        let bus = HarnessEventBus::new();
+        install_extension_settlement_bridge(&bus, sessions.clone());
+        let ended = |outcome| {
+            HarnessEvent::RunEnd(RunEndEvent {
+                lane: "main".into(),
+                run_id: "run".into(),
+                outcome,
+                leaf_id: "leaf".into(),
+            })
+        };
+        bus.emit(&ended(RunEndOutcome::Completed));
+        assert_eq!(OLD.load(Ordering::SeqCst), 1);
+        *sessions.lock().unwrap() = make(new);
+        for outcome in [RunEndOutcome::Aborted, RunEndOutcome::Failed] {
+            bus.emit(&ended(outcome));
+        }
+        assert_eq!(OLD.load(Ordering::SeqCst), 1);
+        assert_eq!(NEW.load(Ordering::SeqCst), 2);
+        drop(sessions);
+        assert!(weak.upgrade().is_some());
+        drop(bus);
+        assert!(
+            weak.upgrade().is_none(),
+            "settlement observer must not create an ownership cycle"
+        );
+    }
 
     #[tokio::test]
     async fn unauthenticated_packages_are_not_reintroduced_as_legacy_adapters() {
@@ -3655,6 +3820,94 @@ mod tests {
         std::fs::remove_file(&content).ok();
     }
 
+    #[tokio::test]
+    async fn import_preserves_validates_and_locks_the_recovery_pair() {
+        use rpi_harness::session::jsonl::{JsonlSessionStorage, JsonlV4Header};
+        use rpi_harness::session::types::{
+            AssistantFrameOp, AssistantFrameRecord, RecordBase, SessionStorage,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source.jsonl");
+        let progress = tmp.path().join("source.jsonl.progress.jsonl");
+        let fs: Arc<dyn rpi_tools::FileSystem> =
+            Arc::new(OsExecutionEnv::with_cwd(tmp.path().into()));
+        let storage = JsonlSessionStorage::create(
+            fs,
+            &source.to_string_lossy(),
+            JsonlV4Header::new("import-pair".into(), 1, "/".into(), None, None, None),
+            Arc::new(SystemClock),
+            Arc::new(DefaultIdGenerator::new()),
+        )
+        .await
+        .unwrap();
+        storage
+            .append_progress(vec![AssistantFrameRecord {
+                base: RecordBase {
+                    id: "accepted-prefix".into(),
+                    seq: 0,
+                    lane: "main".into(),
+                    timestamp: 0,
+                },
+                run_id: "run".into(),
+                stream_index: 0,
+                op: AssistantFrameOp::Append,
+                frame: Some(serde_json::json!({"payload":"keep"})),
+            }])
+            .await
+            .unwrap();
+        drop(storage);
+        let original = std::fs::read(&progress).unwrap();
+        let destination = tmp.path().join("imported");
+        let imported = import_session_file(&source, &tmp.path().to_string_lossy(), &destination)
+            .await
+            .unwrap();
+        assert_eq!(
+            imported.read_progress("run").await.unwrap()[0].base.id,
+            "accepted-prefix"
+        );
+        assert_eq!(
+            std::fs::read(&progress).unwrap(),
+            original,
+            "import must not repair or mutate its source"
+        );
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(tmp.path().join("source.jsonl.lock"))
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&lock).unwrap();
+        assert!(import_session_file(
+            &source,
+            &tmp.path().to_string_lossy(),
+            &tmp.path().join("busy")
+        )
+        .await
+        .is_err());
+        drop(lock);
+        let mut corrupt = String::from_utf8(original.clone()).unwrap();
+        corrupt = corrupt.replace(
+            "\"session_id\":\"import-pair\"",
+            "\"session_id\":\"foreign\"",
+        );
+        assert_ne!(corrupt.as_bytes(), original.as_slice());
+        std::fs::write(&progress, corrupt).unwrap();
+        assert!(import_session_file(
+            &source,
+            &tmp.path().to_string_lossy(),
+            &tmp.path().join("foreign")
+        )
+        .await
+        .is_err());
+        std::fs::remove_file(&progress).unwrap();
+        assert!(import_session_file(
+            &source,
+            &tmp.path().to_string_lossy(),
+            &tmp.path().join("missing")
+        )
+        .await
+        .is_err());
+    }
+
     #[test]
     fn list_session_files_sync_walks_the_cwd_subdirectory() {
         let root = std::env::temp_dir().join(format!("rpi-summary-{}-dir", std::process::id()));
@@ -3662,8 +3915,11 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
         let file = nested.join("2026-01-01_a.jsonl");
         std::fs::write(&file, "{}\n").unwrap();
+        let sidecar = nested.join("2026-01-01_a.jsonl.progress.jsonl");
+        std::fs::write(&sidecar, "{}\n").unwrap();
         let found = list_session_files_sync(&root);
         assert!(found.iter().any(|p| p == &file));
+        assert!(!found.contains(&sidecar));
         std::fs::remove_dir_all(&root).ok();
     }
 

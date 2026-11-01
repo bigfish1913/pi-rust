@@ -187,7 +187,8 @@ pub struct SettleState {
     /// message is the recorder's stream n: both are assigned in event order, and
     /// only assistant messages create streams.
     assistant_settled: AtomicUsize,
-    /// Indices already committed, so the run-end pass does not duplicate them.
+    /// Indices already committed. Every commit path checks its predecessors,
+    /// so this is a contiguous prefix of the current attempt's message indices.
     committed: Mutex<BTreeSet<usize>>,
     /// The entry each settled message produced, by loop-message index.
     assistant_entries: Mutex<BTreeMap<usize, String>>,
@@ -318,6 +319,38 @@ impl SettleState {
         self.committed.lock().unwrap().len()
     }
 
+    fn ensure_commit_prefix(&self, index: usize) -> crate::result::HarnessResult<()> {
+        let committed = self.committed_count();
+        if committed < index {
+            return Err(crate::result::HarnessError::io(format!(
+                "cannot commit message {index} before pending message {committed}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The prefix a turn boundary must make durable before continuing. Keep the
+    /// final/retryable assistant deferred as before; earlier messages (including
+    /// every tool result) must be entries before compaction or another request.
+    pub(crate) fn required_prefix_len(&self, messages: &[AgentMessage]) -> usize {
+        match messages.last() {
+            Some(AgentMessage::Assistant(message))
+                if !needs_early_commit(
+                    message,
+                    will_retry(
+                        message,
+                        self.retry_enabled,
+                        self.attempt(),
+                        self.max_retries,
+                    ),
+                ) =>
+            {
+                messages.len() - 1
+            }
+            _ => messages.len(),
+        }
+    }
+
     pub(crate) fn attempt(&self) -> u32 {
         self.attempt.load(Ordering::Acquire)
     }
@@ -337,7 +370,11 @@ impl SettleState {
     /// Flush frame progress before a commit whose binding is written together
     /// with the entry. The binding itself is appended by the caller so it can
     /// share the entry/step durable append.
-    pub(crate) async fn prepare_commit_for_assistant(&self) -> crate::result::HarnessResult<()> {
+    pub(crate) async fn prepare_commit_for_assistant(
+        &self,
+        index: usize,
+    ) -> crate::result::HarnessResult<()> {
+        self.ensure_commit_prefix(index)?;
         self.flush_prepare_commit().await
     }
 
@@ -349,6 +386,7 @@ impl SettleState {
         entry_id: &str,
         harness: &AgentHarness,
     ) -> crate::result::HarnessResult<()> {
+        self.ensure_commit_prefix(index)?;
         self.flush_prepare_commit().await?;
         let stream_index = self.assistant_streams.lock().unwrap().get(&index).copied();
         if let Some(stream_index) = stream_index {
@@ -372,14 +410,72 @@ impl SettleState {
             .insert(index, entry_id.to_string());
     }
 
+    /// Persist actual execution intent after argument preparation/authorization.
+    /// The caller must not enter the underlying tool unless this acknowledges.
+    pub(crate) async fn start_tool(
+        &self,
+        harness: &AgentHarness,
+        tool_call_id: &str,
+        tool_name: &str,
+        args: &serde_json::Value,
+    ) -> crate::result::HarnessResult<()> {
+        let (assistant_entry_id, tool_index) = self
+            .pending_calls
+            .lock()
+            .unwrap()
+            .get(tool_call_id)
+            .cloned()
+            .ok_or_else(|| {
+                crate::result::HarnessError::io(format!(
+                    "cannot execute tool {tool_call_id}: its assistant entry was not committed"
+                ))
+            })?;
+        let result_entry_id = harness.next_entry_id();
+        let record = ToolStartedRecord {
+            base: RecordBase {
+                id: harness.next_entry_id(),
+                seq: 0,
+                lane: harness.lane_name().to_string(),
+                timestamp: 0,
+            },
+            run_id: self.run_id.clone(),
+            assistant_entry_id,
+            tool_index,
+            tool_call_id: tool_call_id.to_string(),
+            tool_name: tool_name.to_string(),
+            effective_args: args.clone(),
+            result_entry_id: result_entry_id.clone(),
+            replay: self
+                .tool_replays
+                .get(tool_name)
+                .copied()
+                .unwrap_or(ToolReplay::Never),
+        };
+        let started = self.diagnostics.start();
+        let result = harness.write_tool_started(record).await;
+        self.diagnostics.record(SettlePhase::ToolStarted, started);
+        result?;
+        self.reserved_results
+            .lock()
+            .unwrap()
+            .insert(tool_call_id.to_string(), result_entry_id);
+        Ok(())
+    }
+
     /// Remember each tool call of a freshly committed assistant message, keyed so
-    /// `tool_execution_start` can record it against the right entry and ordinal.
-    fn record_tool_calls(&self, entry_id: &str, message: &AssistantMessage) {
+    /// the execution barrier can record it against the right entry and ordinal.
+    pub(crate) fn record_tool_calls(&self, entry_id: &str, message: &AssistantMessage) {
         let mut pending = self.pending_calls.lock().unwrap();
-        for (ordinal, block) in message.content.iter().enumerate() {
-            if let rpi_ai::types::Content::ToolCall(call) = block {
-                pending.insert(call.id.clone(), (entry_id.to_string(), ordinal as u32));
-            }
+        for (ordinal, call) in message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                rpi_ai::types::Content::ToolCall(call) => Some(call),
+                _ => None,
+            })
+            .enumerate()
+        {
+            pending.insert(call.id.clone(), (entry_id.to_string(), ordinal as u32));
         }
     }
 }
@@ -434,7 +530,7 @@ impl SettlingEmitter {
             },
         };
         let entry_id = entry.id.clone();
-        if let Err(error) = self.state.prepare_commit_for_assistant().await {
+        if let Err(error) = self.state.prepare_commit_for_assistant(index).await {
             tracing::warn!(%error, "could not bind a settled assistant stream");
             return;
         }
@@ -475,68 +571,6 @@ impl SettlingEmitter {
             Err(error) => {
                 tracing::warn!(%error, "could not commit a settled assistant message");
             }
-        }
-    }
-
-    /// Record a tool call that is about to run, and reserve the id its result
-    /// will be committed under.
-    ///
-    /// Skipped with a warning when the call's assistant message was never
-    /// committed: a `tool_started` record must reference an existing assistant
-    /// entry (the reducer rejects a mismatch), so silently writing one would
-    /// corrupt the log.
-    async fn start_tool(&self, tool_call_id: &str, tool_name: &str, args: &serde_json::Value) {
-        let Some((assistant_entry_id, tool_index)) = self
-            .state
-            .pending_calls
-            .lock()
-            .unwrap()
-            .get(tool_call_id)
-            .cloned()
-        else {
-            tracing::warn!(
-                tool_call_id,
-                "skipping a tool_started record: the assistant message carrying this call was not committed"
-            );
-            return;
-        };
-        let result_entry_id = self.harness.next_entry_id();
-        self.state
-            .reserved_results
-            .lock()
-            .unwrap()
-            .insert(tool_call_id.to_string(), result_entry_id.clone());
-        let replay = self
-            .state
-            .tool_replays
-            .get(tool_name)
-            .copied()
-            .unwrap_or(ToolReplay::Never);
-        let record = ToolStartedRecord {
-            base: RecordBase {
-                id: self.harness.next_entry_id(),
-                seq: 0,
-                // The store re-stamps the lane; it must still name a real one,
-                // since the lane is how the store routes the append.
-                lane: self.harness.lane_name().to_string(),
-                timestamp: 0,
-            },
-            run_id: self.state.run_id.clone(),
-            assistant_entry_id,
-            tool_index,
-            tool_call_id: tool_call_id.to_string(),
-            tool_name: tool_name.to_string(),
-            effective_args: args.clone(),
-            result_entry_id,
-            replay,
-        };
-        let tool_started_started = self.state.diagnostics.start();
-        let tool_started_result = self.harness.write_tool_started(record).await;
-        self.state
-            .diagnostics
-            .record(SettlePhase::ToolStarted, tool_started_started);
-        if let Err(error) = tool_started_result {
-            tracing::warn!(%error, tool_call_id, "could not record a tool_started frame");
         }
     }
 
@@ -620,6 +654,19 @@ impl SettlingEmitter {
             // run-end pass, which mints an id normally.
             return;
         };
+        // Preserve the tool_started identity even if this append fails. Both
+        // context-boundary and run-end fallback writes resolve IDs by message
+        // index, not by tool call ID.
+        self.state
+            .reserved_entries
+            .lock()
+            .unwrap()
+            .insert(index, result_entry_id.clone());
+        if self.state.ensure_commit_prefix(index).is_err() {
+            // A previous result could not be written. Keep source order: the
+            // turn-boundary fallback will persist the whole pending prefix.
+            return;
+        }
         let entry = ProvisionedEntry {
             id: result_entry_id.clone(),
             kind: ProvisionedKind::Message {
@@ -684,6 +731,12 @@ impl SettlingEmitter {
                     self.state.injected_indices.lock().unwrap().insert(index);
                 }
                 if matches!(message, AgentMessage::Assistant(_)) {
+                    // A new assistant must not borrow an older call's identity
+                    // or result reservation when a provider reuses its call ID.
+                    // Prior fallback identities already live in reserved_entries
+                    // by message index, independently of these batch-local maps.
+                    self.state.pending_calls.lock().unwrap().clear();
+                    self.state.reserved_results.lock().unwrap().clear();
                     let stream_index = self.state.assistant_settled.load(Ordering::Acquire);
                     self.state
                         .assistant_streams
@@ -767,24 +820,6 @@ impl SettlingEmitter {
                 let result = (**result).clone();
                 Some(Box::pin(async move {
                     emitter.settle_tool_result(index, &result).await;
-                }))
-            }
-            AgentEvent::ToolExecutionStart {
-                tool_call_id,
-                tool_name,
-                args,
-            } => {
-                let emitter = SettlingEmitter {
-                    inner: Arc::clone(&self.inner),
-                    recorder: Arc::clone(&self.recorder),
-                    state: Arc::clone(&self.state),
-                    harness: self.harness.clone(),
-                };
-                let tool_call_id = tool_call_id.clone();
-                let tool_name = tool_name.clone();
-                let args = args.clone();
-                Some(Box::pin(async move {
-                    emitter.start_tool(&tool_call_id, &tool_name, &args).await;
                 }))
             }
             AgentEvent::AgentEnd { .. } => {

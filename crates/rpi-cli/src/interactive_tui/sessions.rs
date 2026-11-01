@@ -12,13 +12,10 @@ pub(super) async fn share_session(harness: &AgentHarness, chat: &Arc<Container>)
     let tree = harness.session().view("main");
     let entries = match tree
         .find_entries(&EntryQuery {
-            entry_type: None,
-            custom_type: None,
             // Exports append entries top-to-bottom, so use chronological order
             // instead of the session query default (newest-first).
             order: Some(EntryOrder::OldestFirst),
-            limit: None,
-            cursor: None,
+            ..Default::default()
         })
         .await
     {
@@ -502,13 +499,10 @@ pub(super) async fn render_session_history(
     let entries = match harness
         .find_entries_on_branch(
             &EntryQuery {
-                entry_type: None,
-                custom_type: None,
                 // Branch results walk leaf→root; the transcript renders
                 // top-to-bottom, so reverse to chronological.
                 order: Some(EntryOrder::OldestFirst),
-                limit: None,
-                cursor: None,
+                ..Default::default()
             },
             &BranchBounds::default(),
         )
@@ -763,11 +757,8 @@ pub(super) async fn restore_session_model(
     let Ok(entries) = harness
         .find_entries_on_branch(
             &EntryQuery {
-                entry_type: None,
-                custom_type: None,
                 order: Some(EntryOrder::OldestFirst),
-                limit: None,
-                cursor: None,
+                ..Default::default()
             },
             &BranchBounds::default(),
         )

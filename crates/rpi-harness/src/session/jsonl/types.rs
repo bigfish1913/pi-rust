@@ -56,6 +56,9 @@ pub struct JsonlV4Header {
     pub id: String,
     pub created_at: i64,
     pub cwd: String,
+    /// A required recovery companion; absent only on history-only artifacts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_format: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
     /// Preserved only when a v3 parent path could not be resolved to a session

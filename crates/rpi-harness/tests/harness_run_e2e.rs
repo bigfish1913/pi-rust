@@ -53,6 +53,28 @@ use rpi_tools::{
 // set/remove call, because the harness reads the variable while starting a run.
 static RUN_BUDGET_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+async fn pending_frames(session: &Session) -> Vec<LaneRecord> {
+    let runs = session
+        .find_records(&RecordQuery {
+            record_type: Some("operation_started"),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let mut frames = Vec::new();
+    for run in runs {
+        frames.extend(
+            session
+                .read_progress(run.id())
+                .await
+                .unwrap()
+                .into_iter()
+                .map(LaneRecord::AssistantFrame),
+        );
+    }
+    frames
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn declined_compaction_records_a_terminal_outcome() {
     let (harness, _, _) = harness_with(FauxScript::new().with_text("unused")).await;
@@ -1218,13 +1240,7 @@ async fn a_crashed_run_can_be_salvaged_from_its_committed_frames() {
     let session = harness.session().clone();
     let mut committed = 0usize;
     for _ in 0..200 {
-        let records = session
-            .find_records(&RecordQuery {
-                record_type: Some(rpi_harness::frame_progress::ASSISTANT_FRAME_RECORD_TYPE),
-                ..Default::default()
-            })
-            .await
-            .expect("frame records readable");
+        let records = pending_frames(&session).await;
         committed = records.len();
         if committed >= 3 {
             break;
@@ -1265,13 +1281,7 @@ async fn a_crashed_run_can_be_salvaged_from_its_committed_frames() {
     assert!(salvaged.is_empty(), "a different run id salvages nothing");
 
     // Read the run id that actually wrote the frames.
-    let records = session
-        .find_records(&RecordQuery {
-            record_type: Some(rpi_harness::frame_progress::ASSISTANT_FRAME_RECORD_TYPE),
-            ..Default::default()
-        })
-        .await
-        .expect("frame records readable");
+    let records = pending_frames(&session).await;
     let run_id = records
         .iter()
         .filter_map(|record| record.run_id().map(str::to_string))
@@ -1408,13 +1418,7 @@ async fn reopening_a_crashed_session_restores_the_committed_prefix() {
     };
     let session = harness.session().clone();
     for _ in 0..200 {
-        let records = session
-            .find_records(&RecordQuery {
-                record_type: Some(rpi_harness::frame_progress::ASSISTANT_FRAME_RECORD_TYPE),
-                ..Default::default()
-            })
-            .await
-            .expect("frame records readable");
+        let records = pending_frames(&session).await;
         if records.len() >= 3 {
             break;
         }
@@ -1509,13 +1513,7 @@ async fn recovering_the_same_crashed_session_twice_does_not_duplicate() {
     };
     let session = harness.session().clone();
     for _ in 0..200 {
-        let records = session
-            .find_records(&RecordQuery {
-                record_type: Some(rpi_harness::frame_progress::ASSISTANT_FRAME_RECORD_TYPE),
-                ..Default::default()
-            })
-            .await
-            .expect("frame records readable");
+        let records = pending_frames(&session).await;
         if records.len() >= 3 {
             break;
         }
@@ -1677,29 +1675,28 @@ async fn crashing_during_a_tool_call_leaves_a_valid_transcript() {
     };
     let session = harness.session().clone();
 
-    // Wait until the tool call itself is committed in the frames.
-    let mut saw_tool_call = false;
+    // The assistant entry precedes the actual execution checkpoint. Wait for
+    // the checkpoint itself: killing between those two writes is a different
+    // (never entered execute) boundary, not this in-flight recovery scenario.
+    let mut saw_tool_start = false;
     for _ in 0..300 {
-        let records = session
+        saw_tool_start = session
             .find_records(&RecordQuery {
-                record_type: Some(rpi_harness::frame_progress::ASSISTANT_FRAME_RECORD_TYPE),
+                record_type: Some("tool_started"),
                 ..Default::default()
             })
             .await
-            .expect("frame records readable");
-        saw_tool_call = records.iter().any(|record| {
-            matches!(record, LaneRecord::AssistantFrame(f)
-                if f.frame.as_ref().and_then(|v| v.get("type")).and_then(|v| v.as_str())
-                    == Some("toolcall_end"))
-        });
-        if saw_tool_call {
+            .unwrap()
+            .iter()
+            .any(|record| matches!(record, LaneRecord::ToolStarted(started) if started.tool_name == "slow_tool"));
+        if saw_tool_start {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     assert!(
-        saw_tool_call,
-        "the tool call must be committed before the crash for this test to mean anything"
+        saw_tool_start,
+        "the execution checkpoint must precede the crash"
     );
 
     // Kill the run inside tool execution: no tool result will ever exist.
@@ -2593,6 +2590,7 @@ async fn a_run_that_keeps_dying_is_not_resumed_forever() {
             run_id: "orig-run".to_string(),
             outcome: OperationOutcome::Aborted,
             error: None,
+            result: None,
         }))
         .await
         .expect("close original run");
@@ -2624,6 +2622,7 @@ async fn a_run_that_keeps_dying_is_not_resumed_forever() {
                     run_id: run_id.clone(),
                     outcome: OperationOutcome::Aborted,
                     error: None,
+                    result: None,
                 }))
                 .await
                 .expect("close resume run");
@@ -2677,13 +2676,7 @@ async fn a_crash_mid_stream_is_not_auto_resumed() {
     };
     let session = harness.session().clone();
     for _ in 0..200 {
-        let records = session
-            .find_records(&RecordQuery {
-                record_type: Some(rpi_harness::frame_progress::ASSISTANT_FRAME_RECORD_TYPE),
-                ..Default::default()
-            })
-            .await
-            .expect("frame records readable");
+        let records = pending_frames(&session).await;
         if !records.is_empty() {
             break;
         }
@@ -2828,13 +2821,7 @@ async fn a_completed_run_is_not_resumed() {
 /// process dies.
 async fn wait_until_streaming(session: &rpi_harness::session::Session) {
     for _ in 0..300 {
-        let records = session
-            .find_records(&RecordQuery {
-                record_type: Some(rpi_harness::frame_progress::ASSISTANT_FRAME_RECORD_TYPE),
-                ..Default::default()
-            })
-            .await
-            .expect("frame records readable");
+        let records = pending_frames(session).await;
         if !records.is_empty() {
             return;
         }
@@ -4031,6 +4018,22 @@ async fn a_deferred_response_suspends_and_then_resumes_through_its_tools() {
         _ => None,
     });
     let polled_result = polled_result.expect("the polled tool call must have been executed");
+    let starts = harness
+        .session()
+        .find_records(&RecordQuery {
+            record_type: Some("tool_started"),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let started = starts.iter().find_map(|record| match record {
+        LaneRecord::ToolStarted(started) if started.tool_call_id == "polled-call" => Some(started),
+        _ => None,
+    }).expect("continuation must seed its execution checkpoint from the already durable polled assistant");
+    assert_eq!(started.effective_args, serde_json::json!({"path":"b.txt"}));
+    assert!(entries.iter().any(|entry| matches!(entry,
+        rpi_harness::session::types::Entry::Message(entry) if entry.base.id == started.result_entry_id && matches!(&entry.message,
+            AgentMessage::ToolResult(result) if result.tool_call_id == "polled-call"))));
     assert!(
         !polled_result.is_error || !polled_result.content.is_empty(),
         "the tool must actually have run, got {polled_result:?}"

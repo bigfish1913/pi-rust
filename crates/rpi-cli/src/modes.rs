@@ -1198,30 +1198,20 @@ async fn rpc_get_history(
         .clamp(1, 500) as usize;
     let after_seq = msg.get("afterSeq").and_then(serde_json::Value::as_u64);
     let before_seq = msg.get("beforeSeq").and_then(serde_json::Value::as_u64);
-    let mut records = harness
+    let page = harness
         .session()
-        .find_records(&RecordQuery {
-            lane: Some(lane.name().to_string()),
+        .record_page(&rpi_harness::session::types::RecordPageQuery {
+            lane: lane.name().to_owned(),
             after_seq,
-            order: Some(EntryOrder::OldestFirst),
-            ..Default::default()
+            before_seq,
+            limit,
+            from_end: before_seq.is_some() || after_seq.is_none(),
         })
         .await
         .map_err(|error| error.to_string())?;
-    if let Some(before) = before_seq {
-        records.retain(|record| record.seq() < before);
-    }
-    let total = records.len();
-    let has_more = records.len() > limit;
-    if before_seq.is_some() {
-        if has_more {
-            records = records.split_off(records.len() - limit);
-        }
-    } else if after_seq.is_some() {
-        records.truncate(limit);
-    } else if has_more {
-        records = records.split_off(records.len() - limit);
-    }
+    let records = page.records;
+    let total = page.total;
+    let has_more = total > records.len();
     let first_seq = records.first().map(LaneRecord::seq);
     let last_seq = records.last().map(LaneRecord::seq);
     let open_operations = harness
@@ -1255,7 +1245,7 @@ async fn rpc_get_session_branch(
         args.remove("id");
     }
     let request = branch_entry_query(&args)?;
-    let entries = find_branch_entries(harness, &request).await?;
+    let (entries, session_id, leaf_id) = branch_snapshot(harness, &request).await?;
     let entries = entries
         .iter()
         .map(|entry| serde_json::to_value(entry).map_err(|error| error.to_string()))
@@ -1264,6 +1254,9 @@ async fn rpc_get_session_branch(
         "entries": entries,
         "count": entries.len(),
         "filtered": true,
+        "sessionId": session_id,
+        "leafId": leaf_id,
+        "scopedAppend": true,
     }))
 }
 
@@ -1288,15 +1281,16 @@ impl BranchEntryQuery {
                 order: Some(self.order),
                 limit: per_query_limit,
                 cursor: self.after_seq.map(|after_seq| EntryCursor { after_seq }),
+                ..Default::default()
             })
             .collect()
     }
 }
 
-pub(crate) async fn find_branch_entries(
+pub(crate) async fn branch_snapshot(
     harness: &AgentHarness,
     request: &BranchEntryQuery,
-) -> Result<Vec<Entry>, String> {
+) -> Result<(Vec<Entry>, String, Option<String>), String> {
     // Pin both the storage binding and branch tip once. Session handles follow
     // harness session switches, and resolving the live leaf per type can merge
     // entries from different branches while a query is in flight.
@@ -1309,8 +1303,9 @@ pub(crate) async fn find_branch_entries(
         .find(|pointer| pointer.lane == "main")
         .ok_or_else(|| "Lane not found: main".to_string())?
         .leaf_id;
-    let Some(start) = leaf_id else {
-        return Ok(Vec::new());
+    let session_id = storage.metadata().id;
+    let Some(start) = leaf_id.clone() else {
+        return Ok((Vec::new(), session_id, None));
     };
     let bounds = BranchBounds {
         start: Some(start.clone()),
@@ -1336,7 +1331,7 @@ pub(crate) async fn find_branch_entries(
             entries.truncate(limit);
         }
     }
-    Ok(entries)
+    Ok((entries, session_id, leaf_id))
 }
 
 /// Canonical custom-entry query. Reject unknown/legacy arguments even when
@@ -1412,12 +1407,29 @@ async fn rpc_append_entry(
         .and_then(serde_json::Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| "append_entry requires a non-empty string `customType`".to_string())?;
-    let entry_id = harness
-        .session()
-        .append_custom_entry(custom_type, msg.get("data").cloned())
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(serde_json::json!({"entryId": entry_id, "customType": custom_type}))
+    let entry_id = if let Some(expected) = msg.get("expected") {
+        let guard = serde_json::from_value(expected.clone())
+            .map_err(|error| format!("invalid expected guard: {error}"))?;
+        harness
+            .append_scoped_entry(
+                &guard,
+                rpi_harness::agent_harness::ScopedEntry::Custom {
+                    custom_type: custom_type.to_owned(),
+                    data: msg.get("data").cloned(),
+                },
+            )
+            .await
+    } else {
+        harness
+            .append_custom_entry(custom_type, msg.get("data").cloned())
+            .await
+    }
+    .map_err(|error| error.to_string())?;
+    let mut response = serde_json::json!({"entryId": entry_id, "customType": custom_type});
+    if msg.get("expected").is_some() {
+        response["scoped"] = serde_json::json!(true);
+    }
+    Ok(response)
 }
 
 async fn rpc_get_stats(
@@ -2436,6 +2448,64 @@ mod tests {
                 assert_eq!(query.cursor, Some(EntryCursor { after_seq: 42 }));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn branch_snapshot_guards_and_outbox_acknowledgements_cross_the_runtime_action_boundary()
+    {
+        use rpi_extensions::RuntimeActionHost;
+        let harness = AgentHarness::create(Default::default()).await.unwrap();
+        let (host, cell) = crate::extensions_actions::HarnessActionHost::new_empty(
+            vec![],
+            std::env::temp_dir(),
+            tokio::runtime::Handle::current(),
+            Default::default(),
+            rpi_extensions::ToolCallContext::default(),
+        );
+        crate::extensions_actions::HarnessActionHost::set_harness(&cell, Arc::new(harness.clone()));
+        let snapshot = host
+            .get_session_branch(
+                serde_json::json!({"customTypes":["goal-state"],"limit":1,"order":"newestFirst"}),
+            )
+            .await
+            .unwrap();
+        let expected = serde_json::json!({"sessionId":snapshot["sessionId"],"leafId":snapshot["leafId"],"customType":"goal-state","entryId":null});
+        let mutation =
+            serde_json::json!({"customType":"goal-state","data":{"goal":"A"},"expected":expected});
+        let ack = host.append_entry(mutation.clone()).await.unwrap();
+        assert_eq!(ack["scoped"], true);
+        assert!(host.append_entry(mutation.clone()).await.is_err());
+        assert!(rpc_append_entry(&harness, &mutation).await.is_err());
+        for _ in 0..2 {
+            let snapshot = host.get_session_branch(serde_json::json!({"customTypes":["goal-state"],"limit":1,"order":"newestFirst"})).await.unwrap();
+            let expected = serde_json::json!({"sessionId":snapshot["sessionId"],"leafId":snapshot["leafId"],"customType":"goal-state","entryId":ack["entryId"]});
+            let notice = host.append_entry(serde_json::json!({"expected":expected,"outboxKey":"r1","message":{
+                "kind":"custom","role":"custom","content":[{"type":"text","text":"Goal A"}],"data":{"customType":"goal"},"timestamp":1
+            }})).await.unwrap();
+            assert_eq!(notice["scoped"], true);
+        }
+        let entries = harness
+            .session()
+            .find_entries(&EntryQuery {
+                outbox_key: Some("r1".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        let snapshot = host
+            .get_session_branch(serde_json::json!({"customTypes":["goal-state"],"limit":1}))
+            .await
+            .unwrap();
+        let expected = serde_json::json!({"sessionId":snapshot["sessionId"],"leafId":snapshot["leafId"],"customType":"goal-state","entryId":ack["entryId"]});
+        let rpc_ack = rpc_append_entry(
+            &harness,
+            &serde_json::json!({"customType":"goal-state","data":{"goal":"B"},"expected":expected}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(rpc_ack["scoped"], true);
+        assert!(rpc_ack["entryId"].as_str().is_some_and(|id| !id.is_empty()));
     }
 
     #[tokio::test]

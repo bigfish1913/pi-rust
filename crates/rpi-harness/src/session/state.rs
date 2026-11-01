@@ -35,9 +35,11 @@ use crate::session::types::{
     SessionMutation, SessionStats,
 };
 
+#[cfg(test)]
+mod record_page_tests;
 mod snapshot;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum StoredLogItem {
     Entry(usize),
     Record(usize),
@@ -69,6 +71,20 @@ impl Default for SessionState {
 }
 
 impl SessionState {
+    /// Borrow record payloads; copy only terminal scope metadata once per cleanup.
+    pub(crate) fn completed_progress_runs(&self) -> super::progress::CompletedProgressRuns {
+        let mut completed = super::progress::CompletedProgressRuns::new();
+        for record in &self.records {
+            if let LaneRecord::OperationFinished(finished) = record {
+                completed
+                    .entry(finished.base.lane.clone())
+                    .or_default()
+                    .insert(finished.run_id.clone());
+            }
+        }
+        completed
+    }
+
     /// New state with a single `main` lane pointing at no leaf (mirrors TS
     /// `lanes = new Map([["main", null]])`).
     pub fn new() -> Self {
@@ -98,6 +114,47 @@ impl SessionState {
     /// arrives with an already-consumed seq.
     pub(crate) fn sequence(&self) -> u64 {
         self.sequence
+    }
+
+    /// Validate the entire cancellation batch before any reducer mutation.
+    pub(crate) fn validate_queue_cancellations(&self, records: &[LaneRecord]) -> SessionResult<()> {
+        let mut ids = std::collections::HashSet::new();
+        let mut targets = std::collections::HashSet::new();
+        for record in records {
+            let LaneRecord::QueueCancelled(cancel) = record else {
+                return Err(SessionError::storage(
+                    "cancellation batch contains a non-cancellation",
+                ));
+            };
+            self.require_lane(&cancel.base.lane)?;
+            self.validate_unused_id(&cancel.base.id)?;
+            if !ids.insert(cancel.base.id.as_str()) || !targets.insert(cancel.entry_id.as_str()) {
+                return Err(SessionError::storage("duplicate queue cancellation"));
+            }
+            let enqueue = self.find_records(&RecordQuery {
+                lane: Some(cancel.base.lane.clone()),
+                target_entry_id: Some(cancel.entry_id.clone()),
+                pending_queue_only: true,
+                limit: Some(1),
+                ..Default::default()
+            })?;
+            if !matches!(enqueue.first(), Some(LaneRecord::QueueEnqueued(enqueued)) if enqueued.run_id == cancel.run_id)
+            {
+                return Err(SessionError::storage(
+                    "queue cancellation has no pending matching enqueue",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn check_revision(&self, expected: u64) -> SessionResult<()> {
+        if self.sequence != expected {
+            return Err(SessionError::storage(
+                "branch write conflict: history changed during conditional write",
+            ));
+        }
+        Ok(())
     }
 
     /// Advance the seq counter to `seq` (no-op when already at or past it).
@@ -416,6 +473,20 @@ impl SessionState {
         validate_limit(query.limit)?;
         let order = query.order.unwrap_or_default();
         let mut results = Vec::new();
+        // Borrow cancellation identities, not historical message payloads.
+        let cancelled: std::collections::HashSet<(&str, &str)> = if query.pending_queue_only {
+            self.records
+                .iter()
+                .filter_map(|record| match record {
+                    LaneRecord::QueueCancelled(cancel) => {
+                        Some((cancel.base.lane.as_str(), cancel.entry_id.as_str()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        } else {
+            Default::default()
+        };
         let iter: Box<dyn Iterator<Item = &LaneRecord>> = match order {
             EntryOrder::OldestFirst => Box::new(self.records.iter()),
             EntryOrder::NewestFirst => Box::new(self.records.iter().rev()),
@@ -423,6 +494,21 @@ impl SessionState {
         for record in iter {
             if !self.matches_record_query(record, query) {
                 continue;
+            }
+            if query.pending_queue_only {
+                let LaneRecord::QueueEnqueued(enqueued) = record else {
+                    continue;
+                };
+                let Some(id) = enqueued
+                    .target
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                else {
+                    continue;
+                };
+                if self.entries_by_id.contains_key(id) || cancelled.contains(&(record.lane(), id)) {
+                    continue;
+                }
             }
             results.push(record.clone());
             if let Some(limit) = query.limit {
@@ -432,6 +518,39 @@ impl SessionState {
             }
         }
         Ok(results)
+    }
+
+    pub fn record_page(
+        &self,
+        query: &crate::session::types::RecordPageQuery,
+    ) -> SessionResult<crate::session::types::RecordPage> {
+        validate_limit(Some(query.limit))?;
+        let matches = |record: &&LaneRecord| {
+            record.lane() == query.lane
+                && query.after_seq.is_none_or(|seq| record.seq() > seq)
+                && query.before_seq.is_none_or(|seq| record.seq() < seq)
+        };
+        let total = self.records.iter().filter(matches).count();
+        let mut records: Vec<_> = if query.from_end {
+            self.records
+                .iter()
+                .rev()
+                .filter(matches)
+                .take(query.limit)
+                .cloned()
+                .collect()
+        } else {
+            self.records
+                .iter()
+                .filter(matches)
+                .take(query.limit)
+                .cloned()
+                .collect()
+        };
+        if query.from_end {
+            records.reverse();
+        }
+        Ok(crate::session::types::RecordPage { records, total })
     }
 
     pub fn find_open_operations(
@@ -678,7 +797,37 @@ impl SessionState {
                 }
             })
             .unwrap_or(true);
-        type_ok && custom_ok && cursor_ok
+        let identity_ok = query.entry_id.as_deref().is_none_or(|id| entry.id() == id);
+        let outbox_ok = query.outbox_key.as_deref().is_none_or(|key| match entry {
+            Entry::Message(message) => match &message.message {
+                rpi_agent::AgentMessage::Custom(custom) => {
+                    custom
+                        .data
+                        .get("__rpiOutbox")
+                        .and_then(|value| value.get("key"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(key)
+                }
+                _ => false,
+            },
+            _ => false,
+        });
+        let tool_ok = query.tool_call_id.as_deref().is_none_or(|id| {
+            match entry {
+            Entry::Message(entry) => match &entry.message {
+                rpi_agent::AgentMessage::Assistant(message) => message.content.iter().any(|block| {
+                    matches!(block, rpi_ai::types::Content::ToolCall(call) if call.id == id)
+                }),
+                rpi_agent::AgentMessage::ToolResult(result) => result.tool_call_id == id,
+                _ => false,
+            },
+            _ => false,
+        }
+        });
+        let boundary_ok = !query.message_boundary_only
+            || matches!(entry,
+            Entry::Message(entry) if matches!(entry.message, rpi_agent::AgentMessage::Assistant(_) | rpi_agent::AgentMessage::User(_)));
+        type_ok && custom_ok && cursor_ok && identity_ok && outbox_ok && tool_ok && boundary_ok
     }
 
     fn matches_record_query(&self, record: &LaneRecord, query: &RecordQuery) -> bool {
@@ -710,7 +859,16 @@ impl SessionState {
             .after_seq
             .map(|after| record.seq() > after)
             .unwrap_or(true);
-        lane_ok && type_ok && run_ok && kind_ok && after_ok
+        let queue_ok = query.queue_kind.is_none_or(
+            |kind| matches!(record, LaneRecord::QueueEnqueued(enqueued) if enqueued.queue == kind),
+        );
+        let target_ok = query.target_entry_id.as_deref().is_none_or(|id| {
+            matches!(record, LaneRecord::QueueEnqueued(enqueued) if enqueued.target.get("id").and_then(serde_json::Value::as_str) == Some(id))
+        });
+        let tool_ok = query.tool_call_id.as_deref().is_none_or(
+            |id| matches!(record, LaneRecord::ToolStarted(started) if started.tool_call_id == id),
+        );
+        lane_ok && type_ok && run_ok && kind_ok && after_ok && queue_ok && target_ok && tool_ok
     }
 }
 

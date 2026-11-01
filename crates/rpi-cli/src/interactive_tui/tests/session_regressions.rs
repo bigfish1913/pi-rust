@@ -426,7 +426,9 @@ fn jsonl_files_under(root: &std::path::Path) -> Vec<String> {
             let path = entry.path();
             if path.is_dir() {
                 pending.push(path);
-            } else if path.extension().is_some_and(|ext| ext == "jsonl") {
+            } else if path.extension().is_some_and(|ext| ext == "jsonl")
+                && !path.to_string_lossy().ends_with(".progress.jsonl")
+            {
                 found.push(path.to_string_lossy().into_owned());
             }
         }

@@ -538,11 +538,8 @@ pub(super) async fn reconcile_footer_from_lane(lane: &Arc<dyn AgentLane>, state:
         .session_view()
         .find_entries_on_branch(
             &EntryQuery {
-                entry_type: None,
-                custom_type: None,
                 order: Some(EntryOrder::OldestFirst),
-                limit: None,
-                cursor: None,
+                ..Default::default()
             },
             &BranchBounds::default(),
         )

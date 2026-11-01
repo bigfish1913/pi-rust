@@ -10,6 +10,7 @@
 
 pub mod codec;
 pub mod errors;
+mod progress;
 pub mod repo;
 pub mod storage;
 pub mod types;

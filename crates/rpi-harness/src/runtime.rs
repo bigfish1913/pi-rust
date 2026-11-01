@@ -258,8 +258,9 @@ impl SessionRuntime {
         // (a frame that never landed because the process died).
         //
         // Settled means the referenced entry exists: for a deferred write, the
-        // provisioned id was committed; for a tool frame, the result for that
-        // `tool_call_id` landed.
+        // provisioned id was committed; for a tool frame, its reserved result
+        // entry must carry the matching call ID AND tool name. Provider IDs
+        // alone may recur in another batch, branch or lane.
         let entries = self
             .session
             .find_entries(&EntryQuery {
@@ -268,11 +269,15 @@ impl SessionRuntime {
             })
             .await?;
         let entry_ids: BTreeSet<&str> = entries.iter().map(|entry| entry.id()).collect();
-        let landed_tool_results: BTreeSet<&str> = entries
+        let landed_tool_results: BTreeSet<(&str, &str, &str)> = entries
             .iter()
             .filter_map(|entry| match entry {
                 Entry::Message(message) => match &message.message {
-                    AgentMessage::ToolResult(result) => Some(result.tool_call_id.as_str()),
+                    AgentMessage::ToolResult(result) => Some((
+                        message.base.id.as_str(),
+                        result.tool_call_id.as_str(),
+                        result.tool_name.as_str(),
+                    )),
                     _ => None,
                 },
                 _ => None,
@@ -308,7 +313,11 @@ impl SessionRuntime {
                 }
                 LaneRecord::ToolStarted(t) => {
                     // The tool's result landed: the invocation is settled.
-                    if landed_tool_results.contains(t.tool_call_id.as_str()) {
+                    if landed_tool_results.contains(&(
+                        t.result_entry_id.as_str(),
+                        t.tool_call_id.as_str(),
+                        t.tool_name.as_str(),
+                    )) {
                         continue;
                     }
                     if !open_ids.contains(&t.run_id) {
@@ -507,6 +516,7 @@ mod tests {
                 run_id: run_id.to_string(),
                 outcome: OperationOutcome::Completed,
                 error: None,
+                result: None,
             }))
             .await
             .unwrap();
@@ -765,12 +775,18 @@ mod tests {
             }))
             .await
             .unwrap();
-        // The tool's result landed, then the run closed.
+        // The tool's result landed under the reserved identity, then the run closed.
         session
-            .view("main")
-            .append_message(AgentMessage::ToolResult(Box::new(tool_result(
-                "call-1", "write",
-            ))))
+            .append_entry(
+                ProvisionedEntry {
+                    id: "result-1".to_string(),
+                    kind: ProvisionedKind::Message {
+                        message: AgentMessage::ToolResult(Box::new(tool_result("call-1", "write"))),
+                        terminate: None,
+                    },
+                },
+                "main",
+            )
             .await
             .unwrap();
         finish_operation(&session, "run-1", "main").await;
