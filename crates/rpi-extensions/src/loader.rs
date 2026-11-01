@@ -71,6 +71,8 @@ pub struct LoadedPlugin {
     pub action_bridge: Option<Arc<ActionBridge>>,
     host_api: Option<Arc<HostApi>>,
     diagnostics: Arc<dyn PluginDiagnostics>,
+    /// Host-only resource ownership, never part of the plugin SDK/ABI.
+    host_guard: Option<Arc<dyn Send + Sync>>,
 }
 
 impl LoadedPlugin {
@@ -90,6 +92,7 @@ impl Drop for LoadedPlugin {
         let api = self.host_api.take();
         let diagnostics = self.diagnostics.clone();
         let path = self.path.clone();
+        let host_guard = self.host_guard.take();
         let cleanup = move || {
             // Drop can run under a caller's lock. Plugin callbacks run only on
             // this cleanup thread; reload begins shutdown explicitly earlier.
@@ -99,6 +102,7 @@ impl Drop for LoadedPlugin {
             if api.as_ref().is_some_and(|api| !api.finish_shutdown()) {
                 std::mem::forget(library);
                 std::mem::forget(api);
+                std::mem::forget(host_guard);
                 diagnostics.warn(&format!(
                     "plugin {} shutdown failed; retaining its library and callback context for process lifetime",
                     path.display()
@@ -106,6 +110,9 @@ impl Drop for LoadedPlugin {
             } else {
                 drop(library);
                 drop(api);
+                // Release exclusion only AFTER actual unmapping and callback
+                // destruction, not when the asynchronous cleanup was queued.
+                drop(host_guard);
             }
         };
         // If thread creation fails, dropping a captured Library would unload
@@ -178,7 +185,16 @@ pub fn load_one(
     diagnostics: Arc<dyn PluginDiagnostics>,
     action_bridge: Option<Arc<ActionBridge>>,
 ) -> Result<LoadedPlugin, PluginLoadError> {
-    let path = path.as_ref().to_path_buf();
+    load_one_guarded(path.as_ref(), diagnostics, action_bridge, None)
+}
+
+fn load_one_guarded(
+    path: &Path,
+    diagnostics: Arc<dyn PluginDiagnostics>,
+    action_bridge: Option<Arc<ActionBridge>>,
+    host_guard: Option<Arc<dyn Send + Sync>>,
+) -> Result<LoadedPlugin, PluginLoadError> {
+    let path = path.to_path_buf();
     // 1. Open the cdylib.
     let library = unsafe { Library::new(&path) }.map_err(|e| PluginLoadError::Open {
         path: path.clone(),
@@ -225,6 +241,7 @@ pub fn load_one(
         registry: ExtensionRegistry::new(),
         host_api: Some(host_api.clone()),
         diagnostics: diagnostics.clone(),
+        host_guard,
     };
     // 4. Own the thread-local api during registration and restore the enclosing
     //    context afterward, even if registration fails or reenters the loader.
@@ -563,6 +580,19 @@ pub fn load_session_mixed(
     diagnostics: Arc<dyn PluginDiagnostics>,
     action_bridge: Option<Arc<ActionBridge>>,
 ) -> ExtensionSession {
+    load_session_mixed_guarded(dirs, files, diagnostics, action_bridge, None)
+}
+
+/// Host-only ownership guard installed before registration, including failed
+/// registration. Retained through async finalization, or leaked with unsafe code.
+/// This is not a plugin SDK or ABI capability.
+pub fn load_session_mixed_guarded(
+    dirs: &[PathBuf],
+    files: &[PathBuf],
+    diagnostics: Arc<dyn PluginDiagnostics>,
+    action_bridge: Option<Arc<ActionBridge>>,
+    host_guard: Option<Arc<dyn Send + Sync>>,
+) -> ExtensionSession {
     let mut loaded: Vec<LoadedPlugin> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let paths = dirs
@@ -575,7 +605,12 @@ pub fn load_session_mixed(
         if !seen.insert(identity) {
             continue;
         }
-        match load_one(&path, Arc::clone(&diagnostics), action_bridge.clone()) {
+        match load_one_guarded(
+            &path,
+            Arc::clone(&diagnostics),
+            action_bridge.clone(),
+            host_guard.clone(),
+        ) {
             Ok(plugin) => loaded.push(plugin),
             Err(error) => diagnostics.warn(&format!("skipped plugin {}: {error}", path.display())),
         }
@@ -635,10 +670,13 @@ mod tests {
     fn build_cdylib_fixture(name: &str, source: &str) -> CdylibFixture {
         static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
         let unique = NEXT_FIXTURE.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!(
-            "rpi-abi-loader-{}-{name}-{unique}",
-            std::process::id()
-        ));
+        let dir = std::env::var_os("RPI_TEST_GUARD_PROCESS_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!(
+                "rpi-abi-loader-{}-{name}-{unique}",
+                std::process::id()
+            ));
         fs::create_dir_all(&dir).expect("create ABI fixture directory");
         let source_path = dir.join("fixture.rs");
         fs::write(&source_path, source).expect("write ABI fixture source");
@@ -675,8 +713,21 @@ mod tests {
         register_status: i32,
         finish_status: i32,
     ) -> (CdylibFixture, PathBuf) {
-        let marker =
-            std::env::temp_dir().join(format!("rpi-lifecycle-{}-{name}", std::process::id()));
+        lifecycle_fixture_gated(name, register_status, finish_status, None)
+    }
+
+    fn lifecycle_fixture_gated(
+        name: &str,
+        register_status: i32,
+        finish_status: i32,
+        gate: Option<&Path>,
+    ) -> (CdylibFixture, PathBuf) {
+        let finish_gate=gate.map(|p|format!("mark(b\"E\"); while !std::path::Path::new({:?}).exists() {{ std::thread::sleep(std::time::Duration::from_millis(1)); }}",p.to_string_lossy())).unwrap_or_default();
+        let marker = gate
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!("rpi-lifecycle-{}-{name}", std::process::id()));
         let _ = fs::remove_file(&marker);
         let offset = std::mem::offset_of!(rpi_plugin_sdk::PluginApi, register_plugin_lifecycle);
         let fixture = build_cdylib_fixture(
@@ -698,6 +749,7 @@ extern "C" fn begin(_: *mut c_void) {{
 extern "C" fn finish(_: *mut c_void) -> i32 {{
     let (_, worker) = WORKER.lock().unwrap().take().unwrap();
     worker.join().unwrap();
+    {finish_gate}
     mark(b"F");
     {finish_status}
 }}
@@ -758,6 +810,105 @@ pub extern "C" fn rpi_plugin_register(api: *const u8) -> i32 {{
                 "DLL remained mapped after successful shutdown"
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn host_guard_covers_inflight_keepalives_async_cleanup_and_unsafe_shutdown() {
+        const CHILD_DIR: &str = "RPI_TEST_GUARD_PROCESS_DIR";
+        let Some(directory) = std::env::var_os(CHILD_DIR) else {
+            for failed in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let output=Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact","loader::tests::host_guard_covers_inflight_keepalives_async_cleanup_and_unsafe_shutdown","--nocapture"])
+                    .env(CHILD_DIR,directory.path()).env("RPI_TEST_GUARD_FAIL",failed.to_string()).output().unwrap();
+                // Child process exit releases even intentionally leaked DLLs.
+                // This parent owns and explicitly removes every fixture byte.
+                directory
+                    .close()
+                    .expect("remove child lifecycle fixtures after process exit");
+                assert!(
+                    output.status.success(),
+                    "lifecycle child failed: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        for failed in [std::env::var("RPI_TEST_GUARD_FAIL").unwrap() == "true"] {
+            let gate = PathBuf::from(directory.clone()).join("finish-gate");
+            struct ReleaseGate(PathBuf);
+            impl Drop for ReleaseGate {
+                fn drop(&mut self) {
+                    let _ = fs::write(&self.0, b"release");
+                }
+            }
+            let _ = fs::remove_file(&gate);
+            let (fixture, marker) = lifecycle_fixture_gated(
+                if failed {
+                    "guard_leaked"
+                } else {
+                    "guard_released"
+                },
+                0,
+                i32::from(failed),
+                Some(&gate),
+            );
+            // Declared after the fixture: panic always opens the finish gate,
+            // and the parent removes files after this process has exited.
+            let _release = ReleaseGate(gate.clone());
+            let guard = Arc::new(());
+            let weak = Arc::downgrade(&guard);
+            let session = load_session_mixed_guarded(
+                &[],
+                std::slice::from_ref(&fixture.path),
+                Arc::new(NullDiagnostics),
+                None,
+                Some(guard.clone()),
+            );
+            drop(guard);
+            // An adapter/provider/callback holds this same keepalive while FFI
+            // is in flight. Dropping the session must not release exclusion.
+            let callback = session.keepalive();
+            drop(session);
+            assert!(weak.upgrade().is_some());
+            assert!(!marker.exists());
+            drop(callback);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !fs::read(&marker).unwrap_or_default().contains(&b'E') {
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            assert!(
+                weak.upgrade().is_some(),
+                "cleanup is blocked; the ownership guard must still be retained"
+            );
+            #[cfg(windows)]
+            assert!(dll_is_mapped(&fixture.path));
+            fs::write(&gate, b"release").unwrap();
+            if failed {
+                while !fs::read(&marker).unwrap_or_default().contains(&b'F') {
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                assert!(
+                    weak.upgrade().is_some(),
+                    "unsafe shutdown must leak exclusion with the DLL"
+                );
+                #[cfg(windows)]
+                assert!(dll_is_mapped(&fixture.path));
+            } else {
+                while weak.upgrade().is_some() {
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                #[cfg(windows)]
+                assert!(!dll_is_mapped(&fixture.path));
+            }
+            let _ = fs::remove_file(&gate);
+            let _ = fs::remove_file(marker);
         }
     }
 

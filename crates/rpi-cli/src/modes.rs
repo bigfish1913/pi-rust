@@ -487,7 +487,8 @@ where
         "maxSnapshotBytes": crate::resource_selection::MAX_STATE_BYTES,
         "changes": "restart-required", "setActiveTools": if harness.has_exact_resources() { "unsupported" } else { "legacy" },
         "configureExternalTools": if harness.has_exact_resources() { "unsupported" } else { "supported" },
-        "automaticPersistenceRecovery": false, "hotApply": false
+        "automaticPersistenceRecovery": false, "hotApply": false,
+        "packageScopes": ["project", "global"], "defaultPackageScope": "project"
     });
     if harness.has_exact_resources() {
         if let Ok(state) = crate::resource_selection::get_resource_state(harness).await {

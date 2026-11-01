@@ -377,6 +377,7 @@ pub fn default_session_dir(cwd: &Path) -> PathBuf {
 /// Extensions are loaded exactly once before model resolution. Their action
 /// host remains unbound until the harness and authenticated catalog exist.
 pub struct PreparedExtensions {
+    resource_leases: Arc<Vec<crate::resource_management::Lease>>,
     resource_selection: Option<crate::resource_selection::ResolvedSelection>,
     session_selection: SessionSelection,
     pub extension_session: ExtensionSession,
@@ -470,6 +471,8 @@ pub fn prepare_extensions(
     cwd: &Path,
     project_trusted: bool,
 ) -> Result<PreparedExtensions, BuildError> {
+    let resource_leases =
+        crate::resource_management::host_leases(cwd).map_err(BuildError::HarnessCreate)?;
     let (resource_selection, session_selection) =
         preflight_extension_startup(args, cwd, project_trusted)?;
     let session_dir = if matches!(session_selection, SessionSelection::Ephemeral) {
@@ -550,11 +553,12 @@ pub fn prepare_extensions(
     );
 
     let extension_session = if let Some(selected) = &resource_selection {
-        let session = rpi_extensions::load_session_mixed(
+        let session = rpi_extensions::load_session_mixed_guarded(
             &[],
             &selected.extensions,
             Arc::new(NullDiagnostics),
             Some(Arc::clone(&action_bridge)),
+            Some(resource_leases.clone()),
         );
         if session.loaded_paths() != selected.extensions.as_slice() {
             return Err(BuildError::HarnessCreate(
@@ -579,6 +583,7 @@ pub fn prepare_extensions(
         report_deferred_renderers(&extension_session);
     }
     Ok(PreparedExtensions {
+        resource_leases,
         resource_selection,
         session_selection,
         session_dir,
@@ -649,6 +654,7 @@ pub async fn build_prepared(
     // before the tools are built, and completed with the session id below once
     // the session exists — the tool set has to exist before the harness does.
     let PreparedExtensions {
+        resource_leases,
         resource_selection,
         session_selection: selection,
         session_dir,
@@ -1213,6 +1219,13 @@ pub async fn build_prepared(
         &harness_cell,
         Arc::new(harness.clone()),
     );
+    // Retain read leases even for resource-only/--no-extensions hosts.
+    let harness_leases = resource_leases.clone();
+    harness
+        .events()
+        .on_lifetime::<rpi_harness::events::RunEndEvent, _>(move |_| {
+            let _ = &harness_leases;
+        });
     install_extension_settlement_bridge(harness.events(), extension_session_cell.clone());
     register_file_io_router(&harness, &file_io);
 
@@ -1270,6 +1283,7 @@ pub async fn build_prepared(
     let mut reload_args = args.clone();
     reload_args.session_dir = Some(session_dir);
     let reload_context = ReloadContext {
+        resource_leases,
         extension_session: extension_session_cell,
         action_bridge: Arc::new(Mutex::new(Some(Arc::clone(&action_bridge)))),
         tool_context,
@@ -1413,6 +1427,7 @@ pub type ActionBridgeCell = Arc<Mutex<Option<Arc<rpi_extensions::ActionBridge>>>
 /// reload callback without borrowing the harness).
 #[derive(Clone)]
 pub struct ReloadContext {
+    resource_leases: Arc<Vec<crate::resource_management::Lease>>,
     /// One neutral router for all built-ins, including those reconstructed on reload.
     pub file_io: Arc<rpi_tools::file_io::FileIORouter>,
     /// The live extension-session cell (swapped on reload).
@@ -1755,6 +1770,7 @@ where
             &effective_args,
             &extension_dirs,
             Some(Arc::clone(&fresh_bridge)),
+            Some(ctx.resource_leases.clone()),
         )
     };
     if extension_session.is_empty() && !effective_args.no_extensions {
@@ -2382,13 +2398,21 @@ pub(crate) fn load_extensions(
         global_extension_dirs()
     };
     dirs.extend(args.extensions_dir.iter().cloned());
-    load_extensions_from_dirs(args, &dirs, action_bridge)
+    let leases = match crate::resource_management::host_leases(cwd) {
+        Ok(leases) => leases,
+        Err(error) => {
+            eprintln!("warning: refusing extension loading: {error}");
+            return ExtensionSession::none();
+        }
+    };
+    load_extensions_from_dirs(args, &dirs, action_bridge, Some(leases))
 }
 
 fn load_extensions_from_dirs(
     args: &Args,
     dirs: &[PathBuf],
     action_bridge: Option<Arc<rpi_extensions::ActionBridge>>,
+    host_guard: Option<Arc<dyn Send + Sync>>,
 ) -> ExtensionSession {
     let diagnostics: Arc<dyn PluginDiagnostics> = Arc::new(NullDiagnostics);
     // B5a: the action bridge is cloned into every loaded plugin's vtable
@@ -2397,7 +2421,13 @@ fn load_extensions_from_dirs(
     // `!no_extensions` and threads `Some(bridge)`; `None` is only passed by the
     // `--no-extensions` branch (which calls `ExtensionSession::none()` directly)
     // and tests. Explicit `--extension`/`-e` files load after the dirs.
-    rpi_extensions::load_session_mixed(dirs, &args.extension, diagnostics, action_bridge)
+    rpi_extensions::load_session_mixed_guarded(
+        dirs,
+        &args.extension,
+        diagnostics,
+        action_bridge,
+        host_guard,
+    )
 }
 
 /// Merge the loaded extension tools into the built-in set. An extension tool

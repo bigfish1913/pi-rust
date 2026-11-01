@@ -57,6 +57,7 @@ mod prebuilt_release;
 pub mod provider;
 pub mod remote;
 pub mod resource_dirs;
+pub mod resource_management;
 pub mod resource_selection;
 pub mod resume_picker;
 pub(crate) mod rpc;

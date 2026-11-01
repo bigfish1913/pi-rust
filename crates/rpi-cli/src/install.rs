@@ -104,6 +104,7 @@ impl NativePackageRegistry {
 
 struct NativePackageMutationLock {
     file: Option<std::fs::File>,
+    _resource_lease: crate::resource_management::Lease,
 }
 
 impl NativePackageMutationLock {
@@ -111,6 +112,7 @@ impl NativePackageMutationLock {
         let parent = metadata_path
             .parent()
             .ok_or_else(|| "native package metadata has no parent".to_string())?;
+        let resource_lease = crate::resource_management::mutation_lease(parent)?;
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         let lock_path = parent.join(NATIVE_PACKAGES_LOCK_FILE);
         let file = std::fs::OpenOptions::new()
@@ -127,7 +129,10 @@ impl NativePackageMutationLock {
         fs2::FileExt::try_lock_exclusive(&file).map_err(|error| {
             format!("could not lock native package state (another install may be running): {error}")
         })?;
-        Ok(Self { file: Some(file) })
+        Ok(Self {
+            file: Some(file),
+            _resource_lease: resource_lease,
+        })
     }
 }
 
@@ -462,6 +467,12 @@ pub fn uninstall(args: &[String]) -> i32 {
             }
         }
     }
+    if let Err(error) =
+        crate::resource_management::legacy_unowned_targets(&agent, &artifact_targets)
+    {
+        eprintln!("error: {error}");
+        return 1;
+    }
     let mut remaining: Vec<_> = records
         .into_iter()
         .filter(|record| record.name != name)
@@ -754,6 +765,8 @@ fn install_native_package_at_with_hook(
         .iter()
         .map(|(name, _)| destination.join(name))
         .collect::<Vec<_>>();
+    crate::resource_management::legacy_unowned_targets(metadata_parent, &installed_targets)?;
+    crate::resource_management::legacy_unowned_targets(metadata_parent, &stale_targets)?;
     if !force {
         for target in &installed_targets {
             if owned_keys.contains(&native_artifact_identity(&artifact_file_name(target)?)) {

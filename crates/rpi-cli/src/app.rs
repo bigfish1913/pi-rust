@@ -146,6 +146,13 @@ async fn run_inner() -> i32 {
                 return EXIT_USAGE;
             }
             let trusted = crate::session::resolve_project_trust(&args, &cwd);
+            let _resource_leases = match crate::resource_management::host_leases(&cwd) {
+                Ok(leases) => leases,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    return EXIT_RUNTIME;
+                }
+            };
             let extension_session = crate::session::load_extensions(&args, &cwd, trusted, None);
             return crate::auth::run_with_extensions(&argv[1..], extension_session.snapshot_arc())
                 .await;
@@ -155,6 +162,7 @@ async fn run_inner() -> i32 {
         Some("install") => return crate::install::run_async(&argv[1..]).await,
         Some("uninstall") => return crate::install::uninstall(&argv[1..]),
         Some("extension") => return crate::packages::run_extension(&argv[1..]),
+        Some("resource") => return crate::resource_management::run(&argv[1..]),
         Some("package") => return crate::packages::run(&argv[1..]),
         // These historical aliases are intentionally rejected instead of
         // falling through to the prompt path.
@@ -305,6 +313,19 @@ async fn run_inner() -> i32 {
     if !project_trusted && cwd != launch_cwd {
         startup_notices.push(crate::session_cwd::untrusted_session_cwd_note(&cwd));
     }
+    // Development preflight precedes prepare_extensions: protect its registry
+    // reads at orchestration too; the fact reader itself stays non-mutating.
+    let _dev_resource_leases = if dev_options.is_some() {
+        match crate::resource_management::host_leases(&cwd) {
+            Ok(leases) => Some(leases),
+            Err(error) => {
+                eprintln!("error: {error}");
+                return EXIT_RUNTIME;
+            }
+        }
+    } else {
+        None
+    };
     // Reject a bound exact session before dev can build or stage any code.
     if dev_options.is_some() {
         if let Err(error) =

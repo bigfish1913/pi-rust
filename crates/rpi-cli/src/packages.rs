@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 const REGISTRY: &str = "packages.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectPackage {
     pub name: String,
     pub version: String,
@@ -119,6 +120,27 @@ fn link(args: &[String]) -> i32 {
             return 1;
         }
     };
+    let native_root = project_root.join(".rpi");
+    let _lease = match crate::resource_management::mutation_lease(&native_root) {
+        Ok(lease) => lease,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return 1;
+        }
+    };
+    if let Err(error) = read_registry(&project_root) {
+        eprintln!("error: {error}");
+        return 1;
+    }
+    // Check an explicit identity before Cargo can execute a build script.
+    if let Some(name) = &name {
+        if let Err(error) =
+            crate::resource_management::legacy_unowned(&native_root, "package", name)
+        {
+            eprintln!("error: {error}");
+            return 1;
+        }
+    }
     let source = source
         .map(|p| project_root.join(p))
         .unwrap_or_else(|| project_root.clone());
@@ -140,6 +162,12 @@ fn link(args: &[String]) -> i32 {
     if !valid_name(&package_name) {
         eprintln!("error: invalid package name `{package_name}`");
         return 2;
+    }
+    if let Err(error) =
+        crate::resource_management::legacy_unowned(&native_root, "package", &package_name)
+    {
+        eprintln!("error: {error}");
+        return 1;
     }
     eprintln!("package: building {}...", selected.name);
     let artifact = match build(&selected, release, locked) {
@@ -282,9 +310,25 @@ fn update_at(
             return 1;
         }
     };
+    let resource_owned =
+        match crate::resource_management::resource_owned_names(&cwd.join(".rpi"), "package") {
+            Ok(names) => names,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return 1;
+            }
+        };
+    if name
+        .as_ref()
+        .is_some_and(|name| resource_owned.contains(name))
+    {
+        eprintln!("error: resource-owned Package; use rpi resource update package NAME --scope project --path PATH");
+        return 1;
+    }
     let packages = registry
         .packages
         .iter()
+        .filter(|package| !resource_owned.contains(&package.name))
         .filter(|package| {
             name.as_deref()
                 .map_or(true, |wanted| wanted == package.name)
@@ -417,6 +461,18 @@ fn unlink(args: &[String]) -> i32 {
             return 1;
         }
     };
+    let native_root = cwd.join(".rpi");
+    let _lease = match crate::resource_management::mutation_lease(&native_root) {
+        Ok(lease) => lease,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return 1;
+        }
+    };
+    if let Err(error) = crate::resource_management::legacy_unowned(&native_root, "package", name) {
+        eprintln!("error: {error}");
+        return 1;
+    }
     let mut registry = match read_registry(&cwd) {
         Ok(r) => r,
         Err(e) => {
@@ -622,13 +678,17 @@ fn write_registry(cwd: &Path, r: &PackageRegistry) -> Result<(), String> {
     std::fs::rename(tmp, path).map_err(|e| e.to_string())
 }
 pub fn selected_project_package(cwd: &Path, name: &str) -> Result<ProjectPackage, String> {
+    selected_package_at(&cwd.join(".rpi"), name)
+}
+
+pub(crate) fn selected_package_at(root: &Path, name: &str) -> Result<ProjectPackage, String> {
     if !valid_name(name) {
         return Err("invalid main package name".into());
     }
     use std::io::Read;
     let mut bytes = Vec::new();
     let limit = crate::resource_selection::MAX_STATE_BYTES;
-    std::fs::File::open(cwd.join(".rpi").join(REGISTRY))
+    std::fs::File::open(root.join(REGISTRY))
         .map_err(|e| e.to_string())?
         .take((limit + 1) as u64)
         .read_to_end(&mut bytes)

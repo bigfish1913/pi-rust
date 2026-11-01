@@ -36,9 +36,12 @@ not a new executable package format or an installation manager.
   instructions, and Skills are UTF-8 text. Config and each persistent instruction
   are limited to 64 KiB, read with a bounded reader. Exact-mode registry input is
   limited to 256 KiB using a bounded reader too.
-* `main_package.name` resolves exactly against `<cwd>/.rpi/packages.json`.
+* `main_package.name` resolves exactly against `<cwd>/.rpi/packages.json`
+  by default. Stage B adds optional `main_package.scope`: `"project"` (the
+  backward-compatible default) or `"global"` (the native agent directory's
+  `packages.json`). There is no cross-scope fallback, even when names collide.
   A missing or duplicate registry entry is an error. Existing package layout is
-  retained: `.rpi/packages/<name>/skills` supplies Skills, and the registry's
+  retained under the chosen scope: `packages/<name>/skills` supplies Skills, and the registry's
   `artifacts` entries name files under that Package's `extensions` directory.
   Only those registered artifacts load; unregistered DLLs beside them do not.
   A resource-only Package with no native artifacts is supported. `.` and `..`
@@ -140,6 +143,14 @@ changing the existing exact selection, even if a caller modifies reload args.
 
 ## Read-only observation and readiness
 
+Catalog, exact selection validation and persisted-session fact readers remain
+non-repairing readers. Native host **startup orchestration** additionally acquires
+Stage B's project/global resource leases before resource validation or code
+loading. This can create native roots and `.resource-lease` files even for an
+empty exact selection or `--no-extensions`; starting a host therefore requires
+writable native roots. It does not repair or rewrite a rejected session. See the
+[management contract](local-resource-management.md) for exclusion and recovery.
+
 Ready includes the normal native RPC capabilities and:
 
 ```json
@@ -152,7 +163,9 @@ Ready includes the normal native RPC capabilities and:
     "changes": "restart-required",
     "setActiveTools": "unsupported",
     "automaticPersistenceRecovery": false,
-    "hotApply": false
+    "hotApply": false,
+    "packageScopes": ["project", "global"],
+    "defaultPackageScope": "project"
   }
 }
 ```
