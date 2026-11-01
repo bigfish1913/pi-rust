@@ -169,6 +169,15 @@ fn needs_early_commit(message: &AssistantMessage, retrying: bool) -> bool {
             .any(|block| matches!(block, rpi_ai::types::Content::ToolCall(_)))
 }
 
+/// A refused final entry ACK is retryable, but its AgentEnd is not observable
+/// until the ordered run-end persistence pass succeeds. This is explicit state:
+/// message/commit counts do not describe persistence across compaction cuts.
+enum FinalAssistantBarrier {
+    Ready,
+    AwaitingPersistence,
+    Pending(Box<AgentEvent>),
+}
+
 /// What a settle observer needs to know about the run it is watching. Shared
 /// with the run loop, which owns the retry counter.
 pub struct SettleState {
@@ -217,6 +226,7 @@ pub struct SettleState {
     /// A final assistant normally waits for run-end persistence. If a queued
     /// message continues this run, commit that assistant before the injection.
     uncommitted_assistant: Mutex<Option<(usize, usize, AssistantMessage)>>,
+    final_assistant_barrier: Mutex<FinalAssistantBarrier>,
     /// The durable frame writer, installed after the run's emitter is created.
     /// Commit paths flush it before binding an assistant entry.
     frame_recorder: Mutex<Option<Arc<crate::frame_progress::FrameRecordingEmitter>>>,
@@ -250,6 +260,7 @@ impl SettleState {
             injected: Mutex::new(VecDeque::new()),
             injected_reservations: Mutex::new(Vec::new()),
             uncommitted_assistant: Mutex::new(None),
+            final_assistant_barrier: Mutex::new(FinalAssistantBarrier::Ready),
             frame_recorder: Mutex::new(None),
             identity_error: Mutex::new(None),
             diagnostics: SettleDiagnostics::new(),
@@ -301,6 +312,23 @@ impl SettleState {
         self.injected_indices.lock().unwrap().clear();
         self.retry_result.lock().unwrap().take();
         self.uncommitted_assistant.lock().unwrap().take();
+        *self.final_assistant_barrier.lock().unwrap() = FinalAssistantBarrier::Ready;
+    }
+
+    /// Called only after every new message in this attempt has been persisted.
+    /// Bypass SettlingEmitter: replaying handle would mutate message/stream state.
+    /// The original recorder still forwards the event to the original consumer.
+    pub(crate) async fn release_pending_agent_end(&self, emitter: &dyn AgentEmitter) {
+        if self.identity_error().is_some() {
+            return;
+        }
+        let pending = std::mem::replace(
+            &mut *self.final_assistant_barrier.lock().unwrap(),
+            FinalAssistantBarrier::Ready,
+        );
+        if let FinalAssistantBarrier::Pending(event) = pending {
+            emitter.emit(*event).await;
+        }
     }
 
     pub(crate) fn reserve_retry_result(&self, entry_id: String) {
@@ -962,6 +990,9 @@ impl SettlingEmitter {
                 // identity loss: keep the reservation for `run_core`'s ordered
                 // persistence pass to retry. A persistent refusal still returns
                 // an error there without completing the run or clearing frames.
+                // Hold AgentEnd until that whole ordered persistence pass ACKs.
+                *self.state.final_assistant_barrier.lock().unwrap() =
+                    FinalAssistantBarrier::AwaitingPersistence;
                 tracing::warn!(
                     %error,
                     "could not commit the final assistant before AgentEnd"
@@ -1034,6 +1065,13 @@ impl SettlingEmitter {
             state
                 .diagnostics
                 .record(SettlePhase::SettleAwait, settle_started);
+            if matches!(&event, AgentEvent::AgentEnd { .. }) {
+                let mut barrier = state.final_assistant_barrier.lock().unwrap();
+                if !matches!(*barrier, FinalAssistantBarrier::Ready) {
+                    *barrier = FinalAssistantBarrier::Pending(Box::new(event));
+                    return;
+                }
+            }
             let inner_started = state.diagnostics.start();
             if injected {
                 inner.emit_injected(event).await;

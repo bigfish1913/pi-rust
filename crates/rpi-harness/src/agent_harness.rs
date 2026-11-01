@@ -4732,6 +4732,12 @@ impl AgentHarness {
                 let (leaf, final_id) = self
                     .persist_new_messages(&new_messages[start..], start, &settle_state)
                     .await?;
+                // A refused final ACK held AgentEnd at the settle barrier. All
+                // loop messages are durable now; release through the original
+                // recorder, without handling/settling the event a second time.
+                settle_state
+                    .release_pending_agent_end(frame_recorder.as_ref())
+                    .await;
                 // A budget stop ends the run "Completed" (the loop's normal exit
                 // path), which would otherwise look like a finished task. Record
                 // *why* it stopped so the user sees it in the transcript and the
