@@ -7,7 +7,7 @@ cargo test -p rpi-harness --features experimental-native-store --lib process_tes
   --locked --offline -- --test-threads=1
 ```
 
-父测试有九项；`child` 为默认 ignored 的内部 helper，不是独立验收项。父仅启动当前
+父测试有十项；`child` 为默认 ignored 的内部 helper，不是独立验收项。父仅启动当前
 libtest executable 的精确 helper 名（不是 CLI、Cargo 或真实 session），通过子进程专属
 manifest/nonce 传参。每次使用独立 TempDir，不修改父环境/cwd，不读取实际配置或密钥。
 没有增加 CLI 恢复入口、公共测试 API、生产 fault 环境变量或新格式。
@@ -36,6 +36,8 @@ helper 发出精确阶段事件后等待父命令，不能自行跨越故障点�
 | 错误阶段 | 必须准确识别阶段不符，unwind 时回收持写锁子进程，后续 writer 成功 |
 | helper panic | 非预期 exit 101 必须成为协议失败，不能当作“预期 crash”绿灯 |
 | 强制 pager spill + hot journal | 2 MiB 正文、小 cache；暂停时有效 journal 且原有 main bytes 已变，kill 后 Store/open/list 首次访问恢复 |
+| 大 progress stream replacement | ClearStream+Append 真正改写旧页；COMMIT 前后 kill，首次 repo.open 与全状态 oracle |
+| 大 progress prune commit boundaries | terminal proof 删同 lane/run 两帧、保留 side 同 run 及 keep；不声称旧页 spill |
 | unsupported header + hot journal | foreign/v1/v2 APP/version 在任何可写 SQLite 访问前拒绝，main/journal 全字节不变 |
 | 缺失/partial/坏 header | gate 本身拒绝各字段，三个入口失败且不创建/改写 artifact 或 sidecar |
 | recognized header + 坏 root | 允许 SQLite 恢复，但后续验证仍拒绝坏逻辑格式；不冒充无副作用错误 |
@@ -107,6 +109,37 @@ foreign/旧格式 hot journal 验证 main/journal 全字节不变；known-v3-hea
 用例确认恢复后仍拒绝且不“修好”逻辑格式。初始 create 未完成、损坏 journal/内部状态或
 恶意伪造 header 不在无副作用拒绝保证内。
 
+## 大 active progress：replacement spill 与 prune 提交边界
+
+另一个父测试覆盖四格独立合成 fixture。baseline 在原三小帧（main/run、main/keep、
+side/run）之后，真实提交 main/run 与 main/keep 各 1 MiB ASCII delta，allocator=5。
+实际 progress auxiliary JSON 在 baseline、control 和恢复后续写时均检查 ≤4 MiB；
+没有调高现有产品预算，也没有修改 root/schema、手动 flush 或注入无关 dirty pages。
+
+- **Stream replacement**：同一次真实 `append_progress` 提交 ClearStream(main/run,
+  index1，无 payload，seq6) 和 Append(main/run，index2，1 MiB，seq7)。旧大 run 帧
+  被替换，clear 不保留为 active frame；其他四帧逐值保留，allocator=7。COMMIT 前
+  raw main 长度仍为 2203648 bytes/538 pages，但原范围 2070502 bytes 已改变；journal
+  2188816 bytes，首段 nRec=7。暂停时及 kill/reap 后、任何 SQLite 打开前均严格验收
+  旧页变化和有效 journal 结构，不以文件增长代替。COMMIT 后 kill 则是 ack-loss 格。
+- **Prune**：故障前只持久化 main/run finish，使 history15→16；prune 删除 main/run
+  两帧，保留 side/run 与 main/keep 两帧的完整值，allocator 仍为5。真实 COMMIT 前后
+  kill，完整状态必须分别等于 baseline/control。**本 fixture 未建立 prune 旧页已
+  写回的证据**：原范围变化实测为0。因此它是大 payload 的提交/终止测试，不是
+  prune dirty-old-page-spill 测试；raw 观察只输出诊断，不作为 spill 验收。
+
+最初的纯追加 1 MiB fixture 同样只有增长而无旧页变化，严格 raw 检查正确失败；不能把
+replacement 的证据推广为纯 Append spill。上述范围收窄不是把失败当作通过，缺少的两类
+spill 证据仍明确未交付。已有小 pure-append/prune crash 矩阵继续保留。
+
+每格关闭 baseline 后另建 control，first recovery 确为新 repo.open 保存的 metadata，
+不先 snapshot/list 偷恢复。比较全部八表、projection 和全部查询，history 与全部
+非 progress 辅助状态逐值不变；除与操作相关的 progress query 外，其余查询也不变。
+独立逐帧完整预期补强共享 action oracle，覆盖 lane/run/index/op/seq/time、全部 payload、
+clear 不留帧和跨 lane 保留。恢复后向 main/keep index2 追加小帧，replacement before/after
+必须 seq6/8，prune before/after 必须 seq6/6；重开后的完整 progress、allocator 和 keep
+查询必须确实持久化，所有原帧保留，history 及非 progress 辅助行不变。断言不打印大正文。
+
 ## 实测与限制
 
 本机 Windows、SQLite 3.45.0、`journal_mode=delete`、`synchronous=2`。已实测串行及
@@ -117,6 +150,11 @@ SQLite 读写版本 2 不是 WAL recovery 的运行证据。
 恢复正确位置后重新全绿。这验证 oracle 能识别“仅暂存”冒充“已提交”。分别移除 Store
 和 repo 的 header gate 也都会使真实 foreign-journal bytes 比较变红；移除 read/write
 version gate 时，直接字段级 gate 断言变红。三项可逆修改均已恢复。
+
+新增 progress 负例也实际变红：共享 action 将新大帧完整 payload 改为另一固定值时，
+独立逐帧预期拒绝它；将续写后的 snapshot 暂时替换为旧 snapshot、模拟未持久化续写时，
+完整 progress/allocator 断言拒绝它。两项均已恢复，再运行最终完整回归。后者是 oracle
+负例，不是声称观察到真实存储丢写。
 
 进程终止不等同断电/内核崩溃，PRAGMA 数值也不是 fsync/物理 I/O 承诺。测试零 busy timeout
 不改变生产 5 秒设置，也不证明生产等待/自动重试语义。SQLite 事务锁证据不等于外部

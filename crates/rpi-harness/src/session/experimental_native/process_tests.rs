@@ -149,6 +149,24 @@ async fn action(s: &ExperimentalNativeStorage, kind: &str) {
                 .await
                 .unwrap();
         }
+        "progress-replace-spill" => {
+            // A related stream replacement changes existing payload pages. A pure
+            // append can grow overflow pages without modifying any old page before
+            // COMMIT, and must not be mislabeled as proven old-page spill.
+            let mut clear = frame("clear-large-run-1", "main", "run", 1);
+            clear.op = AssistantFrameOp::ClearStream;
+            clear.frame = None;
+            let mut large = frame("large-run-2", "main", "run", 2);
+            large.frame = Some(json!({"delta":"r".repeat(1024*1024)}));
+            let prepared = s.append_progress(vec![clear, large]).await.unwrap();
+            assert_eq!(
+                prepared.iter().map(|f| f.base.seq).collect::<Vec<_>>(),
+                vec![6, 7]
+            );
+        }
+        "prune-large-cache" => {
+            assert_eq!(s.prune_completed_progress().await.unwrap(), 2);
+        }
         "progress" => {
             s.append_progress(vec![
                 frame("next-1", "main", "run", 1),
@@ -260,7 +278,10 @@ fn child() {
         return;
     }
     let s = rt.block_on(open(&path));
-    if kind == "history-large-spill" {
+    if matches!(
+        kind.as_str(),
+        "history-large-spill" | "progress-replace-spill" | "prune-large-cache"
+    ) {
         rt.block_on(s.run(|store, _| {
             store.connection.execute_batch(
                 "PRAGMA main.cache_size=8; PRAGMA cache_spill=ON; PRAGMA main.cache_spill=8;",

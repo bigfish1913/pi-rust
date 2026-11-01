@@ -1,5 +1,7 @@
 //! Forced pager-spill evidence, restricted to closed synthetic fixtures.
 use super::*;
+#[path = "progress_spill.rs"]
+mod progress_spill;
 #[path = "spill_raw.rs"]
 mod raw;
 #[path = "spill_rejection.rs"]
