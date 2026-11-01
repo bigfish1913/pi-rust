@@ -47,7 +47,18 @@ fn open_store(path: &Path) -> super::engine::Result<(Store, SessionMetadata)> {
         file.file_type().is_file() && !file.file_type().is_symlink(),
         "experimental artifact must be a regular non-symlink file",
     )?;
-    let probe = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    // A readonly identity probe cannot play a hot journal. First reject foreign
+    // headers without opening SQLite, then allow SQLite to recover our initialized
+    // format before querying identity. list() shares this logically-readonly path:
+    // it may retire a native crash journal, but never migrates or appends facts.
+    super::engine::validate_header(path)?;
+    let probe = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    probe.busy_timeout(std::time::Duration::from_secs(5))?;
+    super::engine::ensure(
+        probe.query_row("PRAGMA application_id", [], |r| r.get::<_, i64>(0))? == 0x52504951
+            && probe.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? == 3,
+        "unsupported native fact format",
+    )?;
     let identity = probe.query_row(
         "SELECT CASE WHEN length(CAST(session AS BLOB))<=128 THEN session ELSE '' END, CASE WHEN length(CAST(generation AS BLOB))<=128 THEN generation ELSE '' END FROM root WHERE singleton=1",
         [],

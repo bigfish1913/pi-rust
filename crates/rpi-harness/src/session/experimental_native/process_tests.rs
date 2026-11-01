@@ -10,6 +10,8 @@ use std::{
 #[path = "process_tests/ipc.rs"]
 mod ipc;
 use ipc::{ChildProcess, Peer};
+#[path = "process_tests/spill_tests.rs"]
+mod spill_tests;
 
 struct FixedClock;
 impl Clock for FixedClock {
@@ -70,6 +72,20 @@ fn history_batch() -> Vec<Write> {
         Write::Label("queued".into(), Some("label".into())),
     ]
 }
+fn large_history_batch() -> Vec<Write> {
+    let mut writes = history_batch();
+    writes[0] = Write::Entry(
+        ProvisionedEntry {
+            id: "queued".into(),
+            kind: ProvisionedKind::Message {
+                message: rpi_ai::UserMessage::new("z".repeat(2 * 1024 * 1024), 42).into(),
+                terminate: None,
+            },
+        },
+        "main".into(),
+    );
+    writes
+}
 async fn open(path: &Path) -> ExperimentalNativeStorage {
     // Deliberately bypass the process-local repo registry: every verifier owns a new connection.
     let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
@@ -125,6 +141,11 @@ async fn action(s: &ExperimentalNativeStorage, kind: &str) {
     match kind {
         "history" => {
             s.run(|store, clock| commit(store, history_batch(), Some(15), clock))
+                .await
+                .unwrap();
+        }
+        "history-large-spill" => {
+            s.run(|store, clock| commit(store, large_history_batch(), Some(15), clock))
                 .await
                 .unwrap();
         }
@@ -234,11 +255,27 @@ fn child() {
     let kind = payload["kind"].as_str().unwrap().to_owned();
     let stage = payload["stage"].as_str().unwrap().to_owned();
     let rt = runtime();
+    if kind == "unsupported-spill" {
+        spill_tests::unsupported_writer(&path, &mut peer);
+        return;
+    }
     let s = rt.block_on(open(&path));
+    if kind == "history-large-spill" {
+        rt.block_on(s.run(|store, _| {
+            store.connection.execute_batch(
+                "PRAGMA main.cache_size=8; PRAGMA cache_spill=ON; PRAGMA main.cache_spill=8;",
+            )?;
+            Ok(())
+        }))
+        .unwrap();
+    }
     let pragmas=rt.block_on(s.run(|store,_|Ok(json!({
         "sqlite":rusqlite::version(),
         "journal":store.connection.query_row("PRAGMA journal_mode",[],|r|r.get::<_,String>(0))?,
         "synchronous":store.connection.query_row("PRAGMA synchronous",[],|r|r.get::<_,i64>(0))?,
+        "cacheSize":store.connection.query_row("PRAGMA cache_size",[],|r|r.get::<_,i64>(0))?,
+        "cacheSpill":store.connection.query_row("PRAGMA cache_spill",[],|r|r.get::<_,i64>(0))?,
+        "pageSize":store.connection.query_row("PRAGMA page_size",[],|r|r.get::<_,i64>(0))?,
         "revision":store.restore()?.0.seq,
     })))).unwrap();
     peer.emit("opened", pragmas);

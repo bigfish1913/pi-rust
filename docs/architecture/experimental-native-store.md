@@ -106,6 +106,11 @@ v3 新增跨分支/reopen/pinned leaf/cursor/limit 的 summary/window oracle 矩
 COMMIT 前后杀子进程、提交后返回前 ACK 丢失、跨进程 typed SQLITE_BUSY、持锁者 release/kill
 后连续序号及 stale revision，另测错误阶段与 helper panic 不可假绿。只使用合成 fixture，
 不新增 CLI 恢复、生产 fault hook 或迁移。现有取消测试仍为同进程 admission/owner 语义。
+强制小 cache/2 MiB 正文变体验证原有 main bytes 已 spill、有效 journal 留存，kill 后
+Store/repo.open/repo.list 首次访问完成恢复。由真实红测修正现有 repo 的只读 identity
+probe：OS header gate 后允许 SQLite 恢复已初始化 v3，再做原有完整校验。list 可能回放
+native journal，逻辑只读不等于物理无写；识别 v3 但内部坏的错误也不保证 bytes 不变。
+foreign/旧 header 必须在 RW SQLite 前拒绝，并用真实 hot-journal 字节不变回归验证。
 
 生产仍缺：完整错误分类及等价性矩阵、跨平台/更多故障点与真正断电验证、外部 generation fencing、
 稳定格式 registry、request-ID 不确定提交对账封装、安全 delete、全面索引/上下文优化，

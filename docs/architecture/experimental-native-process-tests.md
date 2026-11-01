@@ -7,7 +7,7 @@ cargo test -p rpi-harness --features experimental-native-store --lib process_tes
   --locked --offline -- --test-threads=1
 ```
 
-父测试有五项；`child` 为默认 ignored 的内部 helper，不是独立验收项。父仅启动当前
+父测试有九项；`child` 为默认 ignored 的内部 helper，不是独立验收项。父仅启动当前
 libtest executable 的精确 helper 名（不是 CLI、Cargo 或真实 session），通过子进程专属
 manifest/nonce 传参。每次使用独立 TempDir，不修改父环境/cwd，不读取实际配置或密钥。
 没有增加 CLI 恢复入口、公共测试 API、生产 fault 环境变量或新格式。
@@ -35,6 +35,10 @@ helper 发出精确阶段事件后等待父命令，不能自行跨越故障点�
 | 持锁 A release / kill 后 B retry | release 时旧 expected revision 拒绝，再写连续序号；kill 时 A 全回滚，B 紧接 baseline |
 | 错误阶段 | 必须准确识别阶段不符，unwind 时回收持写锁子进程，后续 writer 成功 |
 | helper panic | 非预期 exit 101 必须成为协议失败，不能当作“预期 crash”绿灯 |
+| 强制 pager spill + hot journal | 2 MiB 正文、小 cache；暂停时有效 journal 且原有 main bytes 已变，kill 后 Store/open/list 首次访问恢复 |
+| unsupported header + hot journal | foreign/v1/v2 APP/version 在任何可写 SQLite 访问前拒绝，main/journal 全字节不变 |
+| 缺失/partial/坏 header | gate 本身拒绝各字段，三个入口失败且不创建/改写 artifact 或 sidecar |
+| recognized header + 坏 root | 允许 SQLite 恢复，但后续验证仍拒绝坏逻辑格式；不冒充无副作用错误 |
 
 baseline history=15，batch 五项（user、tool result、finish、name、label）跨 checkpoint
 门槛，明确检查 checkpoint 0→16、revision 15→20，pending/open 被消费/关闭，tool mirror
@@ -65,13 +69,54 @@ IPC/watchdog，不用来证明事务或锁阶段。stdout/stderr 直接到临时
 允许子在调用 finish() 前退出。先确认子退出，再 reopen/删除文件。所有清理都受限且报错，
 不是父进程自身被强制终止时“绝不遗留子进程”的 OS 级保证。
 
+## 强制 spill 与现有 repo 打开顺序修复
+
+原小事务矩阵不保证未提交页已写出 pager cache。新增变体只在 child 的测试连接设置
+`cache_size=8` 页、`cache_spill=ON/8`，将 queued user 正文扩为固定 ASCII 2 MiB；仍走
+真实五项 native batch，不改产品默认配置或正文预算。Store / repo.open / repo.list 各自
+独立 fixture，分别在 COMMIT 前、成功后但返回前 kill；list 是首次逻辑访问，不能先用
+snapshot 偷做恢复。control 位于子目录，不混入 catalog。
+
+before marker 后 parent 不打开 SQLite，仅以普通 OS readonly handle 检查：
+
+- journal 首 28 bytes 的 magic `d9 d5 05 f9 20 a1 63 d7`、有限非零 nRec、original DB
+  页数、合法 sector/page size，checked arithmetic 验证首段记录空间不超过文件长度。
+- 可信 closed baseline 原有范围内必须至少一个字节已变；单纯文件增长/mtime/journal
+  存在不算。main/journal 大小上限各 32 MiB，不由字段驱动无界分配。
+- Windows 使用共享 READ|WRITE|DELETE 的只读 handle；所有 raw handle 在 kill/recovery
+  前关闭。kill/reap 后、首次 SQLite open 前再次验证 main/journal 仍处于该状态。
+
+实测 page size 4096、journal sector size **512**（不是硬盘物理 sector 承诺），main 从
+106496 增长至 2207744 bytes，原有范围约 1900 bytes 改变；journal 首段 nRec=4。
+首 header/空间检查不等于验证所有 journal record/checksum。before 回到完整 baseline，
+after 精确等于完整 committed oracle；深比较不打印多 MiB body。
+
+该测试曾真实暴露 `ExperimentalNativeRepo::open` 的只读 identity probe 在 hot journal
+上报 `attempt to write a readonly database`。现有私有打开路径已修正：先以 OS 只读方式
+检查固定 100-byte SQLite header（magic、native v3 APP/user_version、page size、已知
+SQLite 读写版本），再用无 CREATE 的 RW probe，让 SQLite 自行恢复后读取身份，最后
+保留原 Store/root/checkpoint/digest 校验。Store::open 本身同样先 gate，避免仅为判型而
+提前回放 foreign journal。不是手写 journal replay，也没有新增 CLI 恢复或 API。
+
+header gate 只是格式家族准入，不认证内部状态、不防恶意路径替换或提供 generation
+fencing。识别为 v3 但 root/schema/digest 坏时，可能已回放 journal 后才拒绝；错误不保证
+物理无改写。`list()` 逻辑上不追加事实/不迁移，但可恢复已识别 native hot journal，不是
+严格 filesystem readonly；目录后续有坏 artifact 时，前面的恢复也不会因此撤销。
+unsupported APP/version/magic/短 header 则在任何 RW SQLite 前拒绝。另以四组真实
+foreign/旧格式 hot journal 验证 main/journal 全字节不变；known-v3-header + 坏 root 的
+用例确认恢复后仍拒绝且不“修好”逻辑格式。初始 create 未完成、损坏 journal/内部状态或
+恶意伪造 header 不在无副作用拒绝保证内。
+
 ## 实测与限制
 
-本机 Windows、SQLite 3.45.0、`journal_mode=delete`、`synchronous=2`。已实测串行与五项
-并行隔离执行。没有声称 Linux/macOS、WAL、网络盘或其他 SQLite 配置通过。
+本机 Windows、SQLite 3.45.0、`journal_mode=delete`、`synchronous=2`。已实测串行及
+并行隔离执行。没有声称 Linux/macOS、WAL、网络盘或其他 SQLite 配置通过；header 接受
+SQLite 读写版本 2 不是 WAL recovery 的运行证据。
 
 可逆 mutation：将 history after 探针移到 COMMIT 前，ACK-loss 场景快照比较按预期失败；
-恢复正确位置后重新全绿。这验证 oracle 能识别“仅暂存”冒充“已提交”。
+恢复正确位置后重新全绿。这验证 oracle 能识别“仅暂存”冒充“已提交”。分别移除 Store
+和 repo 的 header gate 也都会使真实 foreign-journal bytes 比较变红；移除 read/write
+version gate 时，直接字段级 gate 断言变红。三项可逆修改均已恢复。
 
 进程终止不等同断电/内核崩溃，PRAGMA 数值也不是 fsync/物理 I/O 承诺。测试零 busy timeout
 不改变生产 5 秒设置，也不证明生产等待/自动重试语义。SQLite 事务锁证据不等于外部

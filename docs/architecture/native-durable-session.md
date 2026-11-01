@@ -152,6 +152,10 @@ routing 与 reload host 保留边界。真实二进制使用隔离 mock provider
 可见性，以及独立 writer busy、释放/死亡后的重试与序号。连接局部探针仅存在于 cfg(test)，
 没有新增 CLI 恢复或自动重试 API。当前实测仅 Windows / SQLite DELETE journal，不代表
 断电原子性、跨进程生命周期 fencing、安全 delete 或生产完成。
+后续强制 cache-spill 变体证明 main 原有页已变与 journal 真实存在，暴露并修复已有
+experimental repo 的只读 identity probe 无法恢复 hot journal 的缺陷；先 OS header
+准入再让 SQLite 恢复，保留所有逻辑校验。不是新增 CLI 恢复或格式迁移；已识别 v3 的
+open/list 可能回放 journal，不能承诺所有报错均物理无副作用。
 
 ## 后续阶段（生产路径尚未实现）
 

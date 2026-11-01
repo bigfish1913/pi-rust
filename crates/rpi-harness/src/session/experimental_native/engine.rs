@@ -6,6 +6,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::OpenOptions,
+    io::Read,
     path::Path,
     time::Duration,
 };
@@ -23,6 +24,30 @@ pub(super) fn ensure(ok: bool, reason: &str) -> Result<()> {
     } else {
         Err(reason.into())
     }
+}
+
+/// Admit only the initialized experimental format before SQLite can replay a
+/// journal. This is a bounded format-family gate, not authentication or fencing:
+/// a recognized but internally damaged artifact may still undergo SQLite recovery
+/// before the later schema/root/digest checks reject it.
+pub(super) fn validate_header(path: &Path) -> Result<()> {
+    let mut file = OpenOptions::new().read(true).open(path)?;
+    ensure(
+        file.metadata()?.is_file(),
+        "native artifact must be a regular file",
+    )?;
+    let mut header = [0u8; 100];
+    file.read_exact(&mut header)?;
+    let page = u16::from_be_bytes([header[16], header[17]]);
+    ensure(
+        &header[..16] == b"SQLite format 3\0"
+            && u32::from_be_bytes(header[60..64].try_into()?) == 3
+            && u32::from_be_bytes(header[68..72].try_into()?) == APP as u32
+            && (page == 1 || ((512..=32768).contains(&page) && page.is_power_of_two()))
+            && matches!(header[18], 1 | 2)
+            && matches!(header[19], 1 | 2),
+        "unsupported native fact format",
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -509,6 +534,7 @@ impl Store {
         })
     }
     pub fn open(path: &Path, identity: Identity) -> Result<Self> {
+        validate_header(path)?;
         let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         connection.busy_timeout(Duration::from_secs(5))?;
         ensure(
