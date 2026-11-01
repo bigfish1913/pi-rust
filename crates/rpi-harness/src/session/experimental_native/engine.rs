@@ -14,9 +14,9 @@ use std::{
 };
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-pub const FORMAT: &str = "rpi-native-fact-experimental-v2";
+pub const FORMAT: &str = "rpi-native-fact-experimental-v3";
 pub const TAIL: u64 = 16;
-const APP: i64 = 0x5250494f;
+const APP: i64 = 0x52504951;
 pub(super) const META_LIMIT: usize = 16384;
 const CHECKPOINT_LIMIT: usize = 256 * 1024;
 pub(super) const BODY_LIMIT: usize = 4 * 1024 * 1024;
@@ -423,6 +423,42 @@ pub enum Fault {
     BeforeCommit,
     LostAck,
 }
+pub(super) fn insert_fact(
+    db: &Connection,
+    identity: &Identity,
+    state: &mut Projection,
+    mutation: &SessionMutation,
+) -> Result<()> {
+    let meta = Meta::from_mutation(mutation)?;
+    ensure(meta.seq <= i64::MAX as u64, "native sequence overflow")?;
+    let json = serde_json::to_string(&meta)?;
+    let body = encode_mutation(mutation);
+    ensure(
+        json.len() <= META_LIMIT && body.len() <= BODY_LIMIT,
+        "native fact budget exceeded",
+    )?;
+    ensure(
+        parse_mutation(body.trim_end_matches('\n'))? == *mutation,
+        "native codec roundtrip mismatch",
+    )?;
+    state.apply(&meta, db)?;
+    db.execute(
+        "INSERT INTO facts VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        params![
+            meta.seq,
+            meta.id(),
+            meta.lane(),
+            meta.kind(),
+            meta.target(),
+            json,
+            digest(identity, meta.seq, "metadata", json.as_bytes()),
+            body,
+            digest(identity, meta.seq, "body", body.as_bytes())
+        ],
+    )?;
+    super::index::publish(db, identity, &meta, mutation)?;
+    Ok(())
+}
 pub struct Store {
     pub(super) connection: Connection,
     pub(super) identity: Identity,
@@ -447,13 +483,14 @@ impl Store {
         let mut connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         connection.busy_timeout(Duration::from_secs(5))?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute_batch(&format!("PRAGMA application_id={APP}; PRAGMA user_version=1;
+        tx.execute_batch(&format!("PRAGMA application_id={APP}; PRAGMA user_version=3;
             CREATE TABLE root(singleton INTEGER PRIMARY KEY CHECK(singleton=1),format TEXT NOT NULL,session TEXT NOT NULL,generation TEXT NOT NULL,revision INTEGER NOT NULL CHECK(revision>=0));
             CREATE TABLE facts(seq INTEGER PRIMARY KEY CHECK(seq>0),id TEXT UNIQUE,lane TEXT,category TEXT NOT NULL,target TEXT,metadata TEXT NOT NULL,metadata_digest BLOB NOT NULL,body TEXT NOT NULL,body_digest BLOB NOT NULL);
             CREATE INDEX lane_kind_target ON facts(lane,category,target,seq);
             CREATE INDEX kind_target_seq ON facts(category,target,seq);
             CREATE TABLE checkpoint(singleton INTEGER PRIMARY KEY CHECK(singleton=1),json TEXT NOT NULL,digest BLOB NOT NULL);
             CREATE TABLE auxiliary(key TEXT PRIMARY KEY,json TEXT NOT NULL,digest BLOB NOT NULL);"))?;
+        super::index::schema(&tx)?;
         tx.execute(
             "INSERT INTO root VALUES(1,?1,?2,?3,0)",
             params![FORMAT, identity.session, identity.generation],
@@ -471,7 +508,7 @@ impl Store {
         connection.busy_timeout(Duration::from_secs(5))?;
         ensure(
             connection.query_row("PRAGMA application_id", [], |r| r.get::<_, i64>(0))? == APP
-                && connection.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? == 1,
+                && connection.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? == 3,
             "unsupported native fact format",
         )?;
         let mut store = Self {
@@ -494,18 +531,6 @@ impl Store {
         fault: Fault,
     ) -> Result<()> {
         let meta = Meta::from_mutation(mutation)?;
-        ensure(meta.seq <= i64::MAX as u64, "native sequence overflow")?;
-        let json = serde_json::to_string(&meta)?;
-        let body = encode_mutation(mutation);
-        ensure(
-            json.len() <= META_LIMIT && body.len() <= BODY_LIMIT,
-            "native fact budget exceeded",
-        )?;
-        // The existing codec is authoritative; reject requests it cannot round-trip.
-        ensure(
-            parse_mutation(body.trim_end_matches('\n'))? == *mutation,
-            "native codec roundtrip mismatch",
-        )?;
         let tx = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -515,21 +540,7 @@ impl Store {
             "stale native revision",
         )?;
         let checkpoint_seq = read_checkpoint(&tx, &self.identity)?.0.seq;
-        state.apply(&meta, &tx)?;
-        tx.execute(
-            "INSERT INTO facts VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-            params![
-                meta.seq,
-                meta.id(),
-                meta.lane(),
-                meta.kind(),
-                meta.target(),
-                json,
-                digest(&self.identity, meta.seq, "metadata", json.as_bytes()),
-                body,
-                digest(&self.identity, meta.seq, "body", body.as_bytes())
-            ],
-        )?;
+        insert_fact(&tx, &self.identity, &mut state, mutation)?;
         tx.execute("UPDATE root SET revision=?1 WHERE singleton=1", [meta.seq])?;
         if meta.seq - checkpoint_seq >= TAIL {
             publish(&tx, &self.identity, &state)?;
@@ -736,6 +747,7 @@ pub(super) fn read_metadata(
             && meta.target() == target.as_deref(),
         "native metadata index mismatch",
     )?;
+    super::index::validate_selection(db, &meta)?;
     Ok((meta, json.len()))
 }
 pub(super) fn read_mutation(
@@ -750,10 +762,12 @@ pub(super) fn read_mutation(
         "native body digest mismatch",
     )?;
     let mutation = parse_mutation(body.trim_end_matches('\n'))?;
+    let meta = read_metadata(db, identity, seq)?.0;
     ensure(
-        Meta::from_mutation(&mutation)? == read_metadata(db, identity, seq)?.0,
+        Meta::from_mutation(&mutation)? == meta,
         "native body metadata mismatch",
     )?;
+    super::index::verify_payload(db, identity, &meta, &mutation)?;
     Ok(mutation)
 }
 fn validate_references(db: &Connection, identity: &Identity, state: &Projection) -> Result<usize> {

@@ -24,6 +24,10 @@ pub struct Selection {
     pub outbox: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub boundary: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub user: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub transcript: bool,
 }
 impl Selection {
     pub fn of(mutation: &SessionMutation) -> Self {
@@ -31,6 +35,7 @@ impl Selection {
         match mutation {
             SessionMutation::Entry { entry, .. } => {
                 s.entry_type = Some(entry.entry_type().into());
+                s.transcript = matches!(entry, Entry::Message(_) | Entry::Compaction(_));
                 if let Entry::Custom(e) = entry {
                     s.custom_type = Some(e.custom_type.clone());
                 }
@@ -51,7 +56,10 @@ impl Selection {
                                 })
                                 .collect();
                         }
-                        AgentMessage::User(_) => s.boundary = true,
+                        AgentMessage::User(_) => {
+                            s.boundary = true;
+                            s.user = true;
+                        }
                         AgentMessage::ToolResult(t) => s.tools.push(t.tool_call_id.clone()),
                         AgentMessage::Custom(c) => {
                             s.outbox = c

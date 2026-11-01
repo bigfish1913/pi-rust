@@ -112,40 +112,7 @@ impl ExperimentalNativeStorage {
             .await
     }
 }
-fn insert(
-    db: &Connection,
-    identity: &Identity,
-    state: &mut Projection,
-    mutation: &SessionMutation,
-) -> Result<()> {
-    let meta = Meta::from_mutation(mutation)?;
-    let json = serde_json::to_string(&meta)?;
-    let body = crate::session::jsonl::encode_mutation(mutation);
-    engine::ensure(
-        json.len() <= engine::META_LIMIT && body.len() <= engine::BODY_LIMIT,
-        "native fact budget exceeded",
-    )?;
-    engine::ensure(
-        crate::session::jsonl::parse_mutation(body.trim_end_matches('\n'))? == *mutation,
-        "native codec roundtrip mismatch",
-    )?;
-    state.apply(&meta, db)?;
-    db.execute(
-        "INSERT INTO facts VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-        params![
-            meta.seq,
-            meta.id(),
-            meta.lane(),
-            meta.kind(),
-            meta.target(),
-            json,
-            engine::digest(identity, meta.seq, "metadata", json.as_bytes()),
-            body,
-            engine::digest(identity, meta.seq, "body", body.as_bytes())
-        ],
-    )?;
-    Ok(())
-}
+
 fn commit(
     store: &mut Store,
     writes: Vec<Write>,
@@ -280,7 +247,7 @@ pub(super) fn apply_writes(
                 );
             }
         }
-        insert(tx, identity, &mut state, &mutation)?;
+        engine::insert_fact(tx, identity, &mut state, &mutation)?;
         if state.seq - checkpoint >= engine::TAIL {
             engine::publish(tx, identity, &state)?;
             checkpoint = state.seq;
@@ -343,9 +310,8 @@ fn selected_entries(
     path: Option<Vec<Meta>>,
 ) -> Result<Vec<Entry>> {
     limit(q.limit)?;
-    let keys = match path {
-        Some(path) => path,
-        None => metas(db, identity)?,
+    let Some(keys) = path else {
+        return super::queries::entries(db, identity, q);
     };
     let mut selected = keys
         .into_iter()
@@ -369,6 +335,9 @@ fn selected_entries(
 }
 fn records(db: &Connection, identity: &Identity, q: &RecordQuery) -> Result<Vec<LaneRecord>> {
     limit(q.limit)?;
+    if !q.pending_queue_only {
+        return super::queries::records(db, identity, q);
+    }
     let mut keys = if q.pending_queue_only {
         let (state, _) = engine::restore(db, identity)?;
         state
@@ -576,6 +545,34 @@ impl SessionStorage for ExperimentalNativeStorage {
             _ => Err(SessionError::storage("invalid atomic append result")),
         }
     }
+    async fn message_summaries(
+        &self,
+        lane: &str,
+        query: &MessageSummaryQuery,
+    ) -> SessionResult<MessageSummaryPage> {
+        let (lane, query) = (lane.to_owned(), query.clone());
+        self.run(move |s, _| {
+            let tx = s.connection.transaction()?;
+            let result = super::pages::summaries(&tx, &s.identity, &lane, &query)?;
+            tx.commit()?;
+            Ok(result)
+        })
+        .await
+    }
+    async fn message_window(
+        &self,
+        lane: &str,
+        query: &MessageWindowQuery,
+    ) -> SessionResult<MessageWindowPage> {
+        let (lane, query) = (lane.to_owned(), query.clone());
+        self.run(move |s, _| {
+            let tx = s.connection.transaction()?;
+            let result = super::pages::window(&tx, &s.identity, &lane, &query)?;
+            tx.commit()?;
+            Ok(result)
+        })
+        .await
+    }
     async fn get_entry(&self, id: &str) -> SessionResult<Option<Entry>> {
         let id = id.to_owned();
         self.run(move |s, _| {
@@ -644,31 +641,9 @@ impl SessionStorage for ExperimentalNativeStorage {
         self.run(move |s, _| {
             limit(Some(q.limit))?;
             let tx = s.connection.transaction()?;
-            let keys = metas(&tx, &s.identity)?
-                .into_iter()
-                .filter(|m| {
-                    matches!(&m.effect,Effect::Record{lane,..} if *lane==q.lane)
-                        && q.after_seq.is_none_or(|v| m.seq > v)
-                        && q.before_seq.is_none_or(|v| m.seq < v)
-                })
-                .collect::<Vec<_>>();
-            let total = keys.len();
-            let skip = if q.from_end {
-                total.saturating_sub(q.limit)
-            } else {
-                0
-            };
-            let records = keys
-                .into_iter()
-                .skip(skip)
-                .take(q.limit)
-                .map(|m| match engine::read_mutation(&tx, &s.identity, m.seq)? {
-                    SessionMutation::Record { record } => Ok(record),
-                    _ => Err("invalid record page".into()),
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let page = super::queries::page(&tx, &s.identity, &q)?;
             tx.commit()?;
-            Ok(RecordPage { records, total })
+            Ok(page)
         })
         .await
     }
@@ -706,12 +681,10 @@ impl SessionStorage for ExperimentalNativeStorage {
         self.run(move |s, _| {
             limit(q.limit)?;
             let tx = s.connection.transaction()?;
-            let keys = metas(&tx, &s.identity)?;
+            let keys = super::queries::log_keys(&tx, &s.identity, &q)?;
             let result = keys
                 .into_iter()
-                .filter(|m| q.after_seq.is_none_or(|a| m.seq > a))
-                .take(q.limit.unwrap_or(usize::MAX))
-                .map(|m| Ok(to_log(engine::read_mutation(&tx, &s.identity, m.seq)?)))
+                .map(|seq| Ok(to_log(engine::read_mutation(&tx, &s.identity, seq)?)))
                 .collect::<Result<Vec<_>>>()?;
             tx.commit()?;
             Ok(result)
@@ -934,6 +907,9 @@ mod cancellation_tests {
     }
 }
 
+#[cfg(test)]
+#[path = "indexed_tests.rs"]
+mod indexed_tests;
 #[cfg(test)]
 #[path = "storage_tests.rs"]
 mod tests;

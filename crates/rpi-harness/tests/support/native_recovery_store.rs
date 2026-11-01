@@ -7,3 +7,10 @@ mod engine;
 #[path = "../../src/session/experimental_native/selection.rs"]
 mod selection;
 pub use engine::*;
+
+#[allow(dead_code)]
+#[path = "../../src/session/experimental_native/index.rs"]
+mod index;
+#[allow(dead_code)]
+#[path = "../../src/session/message_preview.rs"]
+mod preview;

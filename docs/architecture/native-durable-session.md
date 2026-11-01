@@ -120,8 +120,21 @@ primary history 初次读取/解析依然存在，这组数值不能外推为整
 
 [实验 SessionStorage/Repo](experimental-native-store.md) 提供 feature-gated、显式构造的接口，
 复用第三期事实引擎，增加事务批写、独立 progress 与取消后 owner/drain 边界。
-不接 CLI/Web，不迁移旧 session；delete、summary/window 仍 fail closed，一般查询仍扫描 metadata。
+不接 CLI/Web，不迁移旧 session；delete 仍 fail closed。第四期 v2 的一般查询扫描 metadata、
+summary/window unsupported 是该提交的历史边界，不代表下述 v3 查询实现。
 这是实验接口，不是完整生产恢复交付。
+
+## 第五期第一步：v3 选择性查询（宿主 opt-in 待实现）
+
+同一显式实验后端使用独立 v3 格式，拒绝 v1/v2，不自动升级。普通 entry/record/log 查询先在
+SQL 选择 keys 和 limit，再校验所选 metadata/索引并读取正文；summary 仅取独立预算内预览，
+window 只 materialize 选中正文。canonical facts、查询索引、ancestor/user/transcript links、
+UI summary 与 root/checkpoint 同事务发布。Memory oracle、损坏注入和正文 authorizer 验证
+查询边界；不把结构性 point-read 数量当作端到端 benchmark。
+
+branch/context/fork、深 cursor 的 metadata 遍历、SQL COUNT/组合扫描及任意大 active state
+仍不保证常数成本。被访问行的校验不证明任意外部 SQL 改写后的全局索引完备性。
+详见 [实验原生后端](experimental-native-store.md)。此步没有 CLI/Web 路由或真实数据迁移。
 
 ## 后续阶段（生产路径尚未实现）
 

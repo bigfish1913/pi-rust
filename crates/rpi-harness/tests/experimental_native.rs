@@ -378,7 +378,7 @@ async fn independent_repo_handles_allocate_once_and_reject_stale_revision() {
     );
 }
 #[tokio::test]
-async fn invalid_queries_and_unimplemented_windows_fail_closed() {
+async fn invalid_queries_fail_closed_and_empty_summaries_are_supported() {
     let (_d, _repo, s) = fixture().await;
     assert_eq!(
         s.find_entries(&EntryQuery {
@@ -401,7 +401,16 @@ async fn invalid_queries_and_unimplemented_windows_fail_closed() {
     assert!(s
         .message_summaries("main", &MessageSummaryQuery::default())
         .await
-        .is_err());
+        .unwrap()
+        .messages
+        .is_empty());
+    assert_eq!(
+        s.message_window("main", &MessageWindowQuery::default())
+            .await
+            .unwrap_err()
+            .code,
+        SessionErrorCode::InvalidQuery
+    );
 }
 
 #[tokio::test]
@@ -434,5 +443,7 @@ async fn cancellation_batch_requires_matching_pending_run_and_rolls_back_whole_b
     assert_eq!(s.history_revision().await.unwrap(), 3);
 }
 
+#[path = "support/experimental_pages.rs"]
+mod page_matrix;
 #[path = "support/experimental_queries.rs"]
 mod query_matrix;

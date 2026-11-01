@@ -15,6 +15,7 @@ pub(crate) mod diagnostics;
 pub mod experimental_native;
 pub mod jsonl;
 pub mod memory;
+pub(crate) mod message_preview;
 pub(crate) mod progress;
 pub mod reducer;
 pub mod session;

@@ -3,8 +3,9 @@
 ## 状态
 
 > 本页记录第三期提交 `79606147` 的历史设计与验证。第四期将同源引擎移到 feature-gated
-> 实验模块并使用独立 v2 格式；当前 checkout 的 support 是共享 wrapper，不再创建下述 v1。
-> 参见 [第四期实验后端边界](experimental-native-store.md)，不要把历史测试数值当作新格式测量。
+> 实验模块并使用独立 v2 格式；第五期查询步骤进一步使用不兼容的 v3。当前 checkout 的
+> support 是共享 wrapper，不再创建下述 v1。
+> 参见 [当前实验后端边界](experimental-native-store.md)，不要把历史测试数值当作新格式测量。
 
 基于第二期 `1a80247`，仍为 integration-test-only，**未接入任何 production SessionStorage、
 repo、CLI 或宿主启动路径**，也不创建或迁移真实 session。

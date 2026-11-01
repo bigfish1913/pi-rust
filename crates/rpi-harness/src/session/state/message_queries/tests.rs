@@ -1,6 +1,6 @@
 use super::*;
 use crate::session::types::{BranchBounds, EntryBase, EntryQuery, MessageEntry, SessionMutation};
-use rpi_ai::types::{Api, AssistantMessage, UserMessage};
+use rpi_ai::types::{Api, AssistantMessage, Content, UserContent, UserMessage};
 fn append(state: &mut SessionState, id: &str, user: bool) {
     let seq = state.next_sequence();
     let message = if user {
