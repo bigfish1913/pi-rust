@@ -2141,6 +2141,7 @@ dependencies = [
  "rpi-telemetry",
  "rpi-tools",
  "rpi-tui",
+ "rusqlite",
  "schemars",
  "semver",
  "serde",

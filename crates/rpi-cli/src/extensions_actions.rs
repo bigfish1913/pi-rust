@@ -72,6 +72,7 @@ pub struct HarnessActionHost {
     /// locate the session dir.
     cwd: PathBuf,
     session_dir: PathBuf,
+    fresh_session_only: bool,
     /// Parsed unknown long flags retained for extension consumption.
     cli_flags: BTreeMap<String, serde_json::Value>,
     /// The session's plugin-tool context (`cwd` + session id). The session
@@ -106,6 +107,7 @@ impl HarnessActionHost {
                 harness: Arc::clone(&harness),
                 catalog: RwLock::new(catalog),
                 session_dir: default_session_dir(&cwd),
+                fresh_session_only: false,
                 cwd,
                 cli_flags,
                 tool_context,
@@ -122,6 +124,18 @@ impl HarnessActionHost {
             .catalog
             .write()
             .unwrap_or_else(|error| error.into_inner()) = catalog;
+    }
+
+    pub(crate) fn with_fresh_session_only(mut self, locked: bool) -> Self {
+        self.fresh_session_only = locked;
+        self
+    }
+    fn allow_session_routing(&self) -> Result<(), String> {
+        if self.fresh_session_only {
+            Err("experimental native print session forbids session routing actions".into())
+        } else {
+            Ok(())
+        }
     }
 
     pub(crate) fn with_session_dir(mut self, session_dir: PathBuf) -> Self {
@@ -630,6 +644,7 @@ impl RuntimeActionHost for HarnessActionHost {
     }
 
     async fn new_session(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
+        self.allow_session_routing()?;
         let harness = self.harness()?;
         let cwd_str = self.cwd.to_string_lossy().to_string();
         let dir = &self.session_dir;
@@ -644,6 +659,7 @@ impl RuntimeActionHost for HarnessActionHost {
     }
 
     async fn fork(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
+        self.allow_session_routing()?;
         let harness = self.harness()?;
         let cwd_str = self.cwd.to_string_lossy().to_string();
         let new_session =
@@ -656,6 +672,7 @@ impl RuntimeActionHost for HarnessActionHost {
     }
 
     async fn navigate_tree(&self, args: serde_json::Value) -> Result<serde_json::Value, String> {
+        self.allow_session_routing()?;
         let target_id = arg_str_opt(&args, "targetId");
         let summarize = arg_bool(&args, "summarize");
         let custom = arg_str_opt(&args, "customInstructions");
@@ -680,6 +697,7 @@ impl RuntimeActionHost for HarnessActionHost {
     }
 
     async fn switch_session(&self, args: serde_json::Value) -> Result<serde_json::Value, String> {
+        self.allow_session_routing()?;
         let harness = self.harness()?;
         let id = arg_str(&args, "id")?;
         let cwd_str = self.cwd.to_string_lossy().to_string();

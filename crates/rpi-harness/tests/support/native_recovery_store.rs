@@ -1,5 +1,7 @@
 //! Default-feature tests compile the same engine used by the opt-in backend.
 use rpi_harness::session as facts;
+#[path = "../../src/session/experimental_native/codec.rs"]
+mod codec;
 #[allow(dead_code)] // The shared engine also exposes opt-in adapter/diagnostic paths.
 #[path = "../../src/session/experimental_native/engine.rs"]
 mod engine;

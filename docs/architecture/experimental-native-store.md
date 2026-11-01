@@ -4,9 +4,10 @@
 
 第四期提交 `6d2c2b50` 引入默认关闭的 harness feature `experimental-native-store`，导出
 `session::experimental_native::{ExperimentalNativeRepo, ExperimentalNativeStorage}`。
-第五期的第一步在相同显式接口增加 v3 查询索引及 UI summary/window。**此步仍没有 CLI/Web
-路由、默认 backend 替换、旧 session discovery 或迁移**。宿主显式 opt-in 尚未实现。
-调用者必须显式构造专用目录；只使用合成 fixture 验收，不是生产交付。
+第五期第一步 `98fb646` 在相同显式接口增加 v3 查询索引及 UI summary/window。
+第五期第二步增加默认关闭的 [CLI 显式 print opt-in](experimental-native-cli.md)，仅新建
+text/json print session。**没有 Web 路由、默认 backend 替换、旧 session discovery 或迁移**。
+直接 API 调用者仍须显式构造专用目录；只使用合成 fixture 验收，不是生产交付。
 
 ```bash
 cargo test -p rpi-harness --features experimental-native-store --test experimental_native --locked --offline -- --test-threads=1
@@ -102,8 +103,9 @@ v3 新增跨分支/reopen/pinned leaf/cursor/limit 的 summary/window oracle 矩
 读取探针，不是物理页数、进程峰值内存、冷启动 benchmark 或完整恢复加速倍数。
 
 生产仍缺：完整错误分类及等价性矩阵、独立进程 crash/锁/取消测试、外部 generation fencing、
-稳定格式 registry 与旧 writer 拒绝、request-ID 不确定提交对账封装、安全 delete、实际宿主
-opt-in、全面索引/上下文优化，以及隔离旧数据测量和 idle/独占/备份/回滚迁移。
+稳定格式 registry、request-ID 不确定提交对账封装、安全 delete、全面索引/上下文优化，
+以及隔离旧数据测量和 idle/独占/备份/回滚迁移。当前 CLI 显式 opt-in 不提供恢复已有
+session 或生产默认 backend 切换。
 实验协议错误部分统一映射 StorageError；不能当作生产错误码兼容。
 
 **生产 v4 JSONL 初次扫描未改变；总体目标尚未完成。**

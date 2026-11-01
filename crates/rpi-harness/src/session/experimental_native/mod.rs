@@ -3,6 +3,7 @@
 //! No CLI/Web routing, discovery of legacy sessions, migration, or stable format promise.
 use crate::session as facts;
 use crate::session::message_preview as preview;
+mod codec;
 #[allow(dead_code)] // Internal stamped-request probes remain shared with default-feature tests.
 mod engine;
 mod index;

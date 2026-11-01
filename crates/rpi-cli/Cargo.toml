@@ -97,9 +97,12 @@ pkg-fmt = "zip"
 default = ["clipboard"]
 # Enables real clipboard support for `/copy` and image paste (best-effort).
 clipboard = ["dep:arboard"]
+# Explicit new-session print opt-in only; never enabled by default.
+experimental-native-store = ["rpi-harness/experimental-native-store"]
 
 [dev-dependencies]
 criterion = "0.5"
+rusqlite.workspace = true
 
 [[bench]]
 name = "serialization"

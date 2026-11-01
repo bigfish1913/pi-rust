@@ -300,6 +300,8 @@ pub enum SessionSelection {
     Ephemeral,
     /// Fresh durable JSONL session under `--session-dir` (or the default dir).
     New { dir: PathBuf, name: Option<String> },
+    /// Explicit fresh print-only experimental backend; never a restore selection.
+    ExperimentalNative { dir: PathBuf },
     /// `-c` / `-r`: restore the most recent session in the default dir.
     Latest { dir: PathBuf },
     /// `--session <id|path>`: restore the session whose id matches, or whose
@@ -319,6 +321,13 @@ pub fn select_session(args: &Args, cwd: &Path) -> SessionSelection {
 
 /// Resolve the root once at startup; runtime actions retain this selection.
 pub(crate) fn configured_session_dir(args: &Args, cwd: &Path) -> PathBuf {
+    if let Some(root) = &args.experimental_native_store {
+        return if root.is_absolute() {
+            root.clone()
+        } else {
+            cwd.join(root)
+        };
+    }
     let dir = args
         .session_dir
         .clone()
@@ -338,6 +347,9 @@ pub(crate) fn configured_session_dir(args: &Args, cwd: &Path) -> PathBuf {
 }
 
 pub(crate) fn select_session_in_dir(args: &Args, dir: PathBuf) -> SessionSelection {
+    if args.experimental_native_store.is_some() {
+        return SessionSelection::ExperimentalNative { dir };
+    }
     if args.no_session {
         return SessionSelection::Ephemeral;
     }
@@ -378,6 +390,7 @@ pub fn default_session_dir(cwd: &Path) -> PathBuf {
 /// host remains unbound until the harness and authenticated catalog exist.
 pub struct PreparedExtensions {
     pub extension_session: ExtensionSession,
+    native_store: Option<PathBuf>,
     session_dir: PathBuf,
     runtime: tokio::runtime::Handle,
     tool_context: rpi_extensions::ToolCallContext,
@@ -395,6 +408,8 @@ pub fn prepare_extensions(
     cwd: &Path,
     project_trusted: bool,
 ) -> Result<PreparedExtensions, BuildError> {
+    let native_store =
+        crate::native_store::root(args, cwd).map_err(BuildError::NativeStorePolicy)?;
     let session_dir = configured_session_dir(args, cwd);
     let cwd_str = cwd.to_string_lossy().to_string();
     let tool_context = rpi_extensions::ToolCallContext::new(cwd_str.clone());
@@ -432,7 +447,11 @@ pub fn prepare_extensions(
         args.unknown_flags.clone(),
         tool_context.clone(),
     );
-    let action_host = Arc::new(action_host.with_session_dir(session_dir.clone()));
+    let action_host = Arc::new(
+        action_host
+            .with_session_dir(session_dir.clone())
+            .with_fresh_session_only(native_store.is_some()),
+    );
     let host_arc: Arc<dyn rpi_extensions::RuntimeActionHost> = action_host.clone();
     // `runtime` is reused below (B5c: `PluggableProvider` needs a captured
     // `Handle` to `spawn_blocking` the sync `ProviderRequestFn`), so clone here.
@@ -479,7 +498,10 @@ pub fn prepare_extensions(
         }
         report_deferred_renderers(&extension_session);
     }
+    crate::native_store::validate_stdio(native_store.is_some(), extension_session.owns_stdio())
+        .map_err(BuildError::NativeStorePolicy)?;
     Ok(PreparedExtensions {
+        native_store,
         session_dir,
         runtime,
         tool_context,
@@ -542,12 +564,26 @@ pub async fn build_prepared(
     ),
     BuildError,
 > {
+    let native_store =
+        crate::native_store::root(args, cwd).map_err(BuildError::NativeStorePolicy)?;
+    if native_store != prepared.native_store {
+        return Err(BuildError::NativeStorePolicy(
+            "experimental session selection changed after extension preparation".into(),
+        ));
+    }
+    crate::native_store::validate_stdio(
+        native_store.is_some(),
+        prepared.extension_session.owns_stdio(),
+    )
+    .map_err(BuildError::NativeStorePolicy)?;
+    let fresh_session_only = native_store.is_some();
     let cwd_str = cwd.to_string_lossy().to_string();
     // Plugin tools get the session's identity injected into every call's
     // arguments (see `rpi_extensions::ToolCallContext`). It is created here,
     // before the tools are built, and completed with the session id below once
     // the session exists — the tool set has to exist before the harness does.
     let PreparedExtensions {
+        native_store: _,
         session_dir,
         runtime,
         tool_context,
@@ -609,6 +645,11 @@ pub async fn build_prepared(
         let name = requested.trim();
         let name = if name.is_empty() { None } else { Some(name) };
         if let Err(error) = session.set_name(name).await {
+            if fresh_session_only {
+                return Err(BuildError::SessionOpen(format!(
+                    "native session name persistence failed: {error}"
+                )));
+            }
             if args.verbose {
                 eprintln!("warning: could not set session name: {error}");
             }
@@ -1097,6 +1138,7 @@ pub async fn build_prepared(
     let mut reload_args = args.clone();
     reload_args.session_dir = Some(session_dir);
     let reload_context = ReloadContext {
+        fresh_session_only,
         extension_session: extension_session_cell,
         action_bridge: Arc::new(Mutex::new(Some(Arc::clone(&action_bridge)))),
         tool_context,
@@ -1240,6 +1282,8 @@ pub type ActionBridgeCell = Arc<Mutex<Option<Arc<rpi_extensions::ActionBridge>>>
 /// reload callback without borrowing the harness).
 #[derive(Clone)]
 pub struct ReloadContext {
+    /// Startup routing capability, retained independently of mutable args/settings.
+    fresh_session_only: bool,
     /// One neutral router for all built-ins, including those reconstructed on reload.
     pub file_io: Arc<rpi_tools::file_io::FileIORouter>,
     /// The live extension-session cell (swapped on reload).
@@ -1550,7 +1594,11 @@ where
                 &_cell,
                 Arc::new(harness.clone()),
             );
-            Arc::new(action_host.with_session_dir(ctx.session_dir()))
+            Arc::new(
+                action_host
+                    .with_session_dir(ctx.session_dir())
+                    .with_fresh_session_only(ctx.fresh_session_only),
+            )
         }
     };
 
@@ -1573,6 +1621,17 @@ where
             Some(Arc::clone(&fresh_bridge)),
         )
     };
+    if let Err(error) =
+        crate::native_store::validate_stdio(ctx.fresh_session_only, extension_session.owns_stdio())
+    {
+        return ReloadOutcome {
+            summary: "Reload refused by experimental native session policy".into(),
+            had_warnings: true,
+            details: vec![error],
+            had_errors: true,
+            project_trusted: None,
+        };
+    }
     if extension_session.is_empty() && !effective_args.no_extensions {
         // The fresh session may be empty if no cdylibs are present — not a
         // warning per se, but note it.
@@ -2140,6 +2199,8 @@ fn report_deferred_renderers(session: &ExtensionSession) {
 /// A harness-build error.
 #[derive(Debug, thiserror::Error)]
 pub enum BuildError {
+    #[error("Experimental native session policy: {0}")]
+    NativeStorePolicy(String),
     #[error("Could not create the session directory: {0}")]
     SessionDir(String),
     #[error("Could not open the saved session: {0}")]
@@ -2387,6 +2448,30 @@ where
 async fn build_session(selection: &SessionSelection, cwd: &str) -> Result<Session, BuildError> {
     match selection {
         SessionSelection::Ephemeral => Ok(ephemeral_session()),
+        SessionSelection::ExperimentalNative { dir } => {
+            #[cfg(feature = "experimental-native-store")]
+            {
+                use rpi_harness::session::{
+                    experimental_native::ExperimentalNativeRepo,
+                    types::{SessionCreateOptions, SessionRepo},
+                };
+                let repo = ExperimentalNativeRepo::new(dir.clone())
+                    .await
+                    .map_err(|e| BuildError::SessionDir(e.to_string()))?;
+                let storage = repo
+                    .create(&SessionCreateOptions::default())
+                    .await
+                    .map_err(|e| BuildError::SessionOpen(e.to_string()))?;
+                Ok(Session::new(Arc::new(storage), None))
+            }
+            #[cfg(not(feature = "experimental-native-store"))]
+            {
+                let _ = dir;
+                Err(BuildError::NativeStorePolicy(
+                    "binary lacks experimental-native-store feature".into(),
+                ))
+            }
+        }
         SessionSelection::New { dir, .. } => {
             // Ensure the sessions directory exists, then create a fresh JSONL
             // session file inside it.
@@ -2446,6 +2531,7 @@ fn selection_dir(selection: &SessionSelection) -> PathBuf {
     match selection {
         SessionSelection::Ephemeral => PathBuf::new(),
         SessionSelection::New { dir, .. }
+        | SessionSelection::ExperimentalNative { dir }
         | SessionSelection::Latest { dir }
         | SessionSelection::ById { dir, .. }
         | SessionSelection::ByExactId { dir, .. }
@@ -2474,6 +2560,7 @@ async fn resolve_restore_target(
             Ok(metas.into_iter().find(|m| m.id == *id))
         }
         SessionSelection::Fork { .. }
+        | SessionSelection::ExperimentalNative { .. }
         | SessionSelection::New { .. }
         | SessionSelection::Ephemeral => Ok(None),
     }
@@ -3452,6 +3539,10 @@ fn read_prompt_source(path: &Path, sources: &mut Vec<String>) -> Option<String> 
 
 #[cfg(test)]
 mod goal_outbox_smoke_tests;
+#[cfg(all(test, feature = "experimental-native-store"))]
+mod native_roundtrip_tests;
+#[cfg(all(test, feature = "experimental-native-store"))]
+mod native_store_tests;
 #[cfg(test)]
 mod runtime_session_tests;
 

@@ -136,6 +136,15 @@ branch/context/fork、深 cursor 的 metadata 遍历、SQL COUNT/组合扫描及
 仍不保证常数成本。被访问行的校验不证明任意外部 SQL 改写后的全局索引完备性。
 详见 [实验原生后端](experimental-native-store.md)。此步没有 CLI/Web 路由或真实数据迁移。
 
+## 第五期第二步：显式 print-only CLI（默认关闭）
+
+[实验 CLI opt-in](experimental-native-cli.md) 增加默认关闭 feature 与专用参数，仅新建
+text/json print session，不接恢复/选择身份/分叉/Web/RPC/TUI。保留参数在 feature-off
+构建也明确拒绝，非法组合早于旧 session 副作用；prepare/build、stdio/mode、runtime
+routing 与 reload host 保留边界。真实二进制使用隔离 mock provider 验证新格式事实、
+工具结果、持久化失败与旧根不变；默认不带参数仍使用 JSONL。
+不迁移真实 session，不等于稳定生产格式/默认切换或完整有界恢复交付。
+
 ## 后续阶段（生产路径尚未实现）
 
 1. 在隔离旧 session 副本上分别测 load/replay、queue、interrupted repair、上下文准备、首屏 history。

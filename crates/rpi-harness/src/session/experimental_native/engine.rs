@@ -1,8 +1,5 @@
 //! Shared experimental native fact engine. Default host paths never load it.
-use super::facts::{
-    jsonl::{encode_mutation, parse_mutation},
-    types::*,
-};
+use super::facts::{jsonl::encode_mutation, types::*};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -438,7 +435,7 @@ pub(super) fn insert_fact(
         "native fact budget exceeded",
     )?;
     ensure(
-        parse_mutation(body.trim_end_matches('\n'))? == *mutation,
+        super::codec::parse(body.trim_end_matches('\n'))? == *mutation,
         "native codec roundtrip mismatch",
     )?;
     state.apply(&meta, db)?;
@@ -761,7 +758,7 @@ pub(super) fn read_mutation(
         hash.as_deref() == Some(digest(identity, seq, "body", body.as_bytes()).as_slice()),
         "native body digest mismatch",
     )?;
-    let mutation = parse_mutation(body.trim_end_matches('\n'))?;
+    let mutation = super::codec::parse(body.trim_end_matches('\n'))?;
     let meta = read_metadata(db, identity, seq)?.0;
     ensure(
         Meta::from_mutation(&mutation)? == meta,
