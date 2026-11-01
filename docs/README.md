@@ -26,6 +26,7 @@
 | 同机运行时复测、瓶颈定位与优化验证 | [2026-10-24 Linux 复测](performance/runtime-20261024/README.md) |
 | 长历史复制、会话追加与工具修复优化 | [2026-10-24 长历史复测](performance/history-20261024/README.md) |
 | 剩余性能差距、调用栈与单项控制实验 | [2026-10-24 性能定位](performance/diagnosis-20261024/README.md) |
+| 会话消息、崩溃恢复与真实扩展回归 | [测试流程](maintaining/testing.md) |
 | 发版与跨平台分发 | [发布流程](maintaining/releasing.md) |
 | 对外介绍与文章草稿 | [推广素材](promotion/README.md) |
 | CLI `docs` 工具的模型可读输入 | [内置文档源](rpi-tool/README.md) |

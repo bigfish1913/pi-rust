@@ -11,6 +11,52 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.16.0](https://github.com/bigfish1913/pi-rust/compare/v0.15.0...v0.16.0) - 2026-11-01
+
+### Added
+
+- *(rpc)* add durable message IDs, ordered images and delegated text IO
+- *(rpc)* add paginated user summaries and bounded message windows
+- *(cli)* hot-reload the active theme file via fs_watch
+- *(cli)* consume extension themePaths into the theme registry
+- *(cli)* discover theme dirs and list custom themes in /theme
+- *(cli)* accept theme file paths in --theme and settings
+- *(rpc)* add bounded external tool registration and execution
+- *(tui)* parse pi theme JSON files into ThemeColors
+
+### Fixed
+
+- *(cli)* hot-reload through the registry onto the session palette
+- *(cli)* resolve themes through the registry at startup and reload
+- *(tui)* wrap table cells instead of clipping narrow columns
+- *(tui)* expand pasted tabs to the next tab stop, measured per span
+- *(cli)* buffer Windows paste bursts before folding
+- *(rpc)* cancel foreground before returning external writer failures
+- *(tools)* finish a UTF-8 character cut by the pending limit before deciding
+- *(tools)* decode independently of read boundaries; finish on bounded drain
+- *(tools)* prevent browser launch during doctests
+- *(tools)* decode shell output across reads and in the console code page
+- *(harness)* retain run admission through image preparation
+- *(tui)* keep CRLF rows and post-escape accents through the shared wrapper
+- *(tui)* validate slotless theme tokens when loading
+- *(tui)* avoid blocking mouse selection on terminal output
+
+### Other
+
+- Merge main before final ACP capability qualification
+- Merge branch 'main' into feat/paginated-user-message-queries
+- Merge branch 'main' into fix/theme-hot-reload
+- Merge branch 'main' into fix/theme-ext
+- Merge branch 'main' into fix/theme-dirs
+- Merge branch 'main' into fix/theme-load
+- Merge main into fix/tui-table-wrap; retain both changelog entries
+- *(cli)* format the reload registry block
+- *(tools)* assert prompt output after UTF-8 limit lookahead
+- Merge branch 'main' into fix/shell-output-decoding
+- Merge remote-tracking branch 'origin/main' into codex/acp-stage3-external-tools
+- add session recovery and extension regression workflow
+- Merge branch 'main' into fix/theme-json
+
 ### Changed
 
 - *(tui)* pasted tabs now expand to the next 8-column tab stop (counting wide chars as 2 columns, resetting at each newline) instead of a fixed four spaces, so a paste lines up with how the source it was copied from renders it; text that relied on "tab = exactly four spaces" changes what gets sent
