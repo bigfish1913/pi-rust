@@ -137,6 +137,7 @@ ANTHROPIC_AUTH_TOKEN=token
 rpi events path|tail    检查扩展事件日志（需 RPI_EVENT_LOG=1）
 rpi install &lt;crate&gt;
 rpi uninstall &lt;crate&gt;
+rpi extension update [name] # 更新全部符合条件的扩展，或按名称更新
 rpi update                 # 更新 rpi CLI 自身
 rpi dev [options]          # 开发 Rust 扩展：编译、watch、热重载
 rpi dev-local [options]    # 只调试当前 Rust 扩展（隔离模式）
@@ -229,6 +230,12 @@ rpi install rpi-extension-example --force
 <p>本地开发：</p>
 <pre><code class="language-bash">rpi install my-extension --path ../my-rpi-extension --force
 </code></pre>
+<p>推荐用 <code>rpi extension update</code> 更新全部项目链接扩展和全局 registry/prebuilt 扩展，
+或用 <code>rpi extension update &lt;name&gt;</code> 按名称更新。更新保留原来的 Cargo 构建后端或
+显式指定的 GitHub 来源；全局通过 <code>--path</code> 安装的开发扩展不参与更新。
+旧命令 <code>rpi package update [name]</code> 仍兼容，但扩展更新推荐使用
+<code>rpi extension update [name]</code>。项目链接管理仍使用 <code>rpi package link</code>、
+<code>rpi package list</code>、<code>rpi package unlink</code>，这些命令名称不变。</p>
 <p>开发扩展项目时使用 watch 模式：</p>
 <pre><code class="language-bash">cd ../my-rpi-extension
 rpi dev

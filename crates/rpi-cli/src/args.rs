@@ -685,8 +685,10 @@ pub fn print_help() {
   install <crate>                Install a prebuilt Rust extension (--build for source)
                                 (see `rpi install --help`)
   uninstall <crate>              Remove an installed Rust cdylib extension
+  extension update [name]        Update project and global installed Rust extensions
+                                (see `rpi extension update --help`)
   package link|list|update|unlink Manage project-local Rust extension packages
-                                (see `rpi package --help`)
+                                (update is a legacy alias; see `rpi package --help`)
   dev [options]                  Build, watch, and hot-reload a Rust extension
                                 (see `rpi dev --help`)
   dev-local [options]            Debug only the current Rust extension
