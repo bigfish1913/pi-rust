@@ -470,6 +470,7 @@ impl RuntimeActionHost for HarnessActionHost {
                 if args.get("message").is_some() || args.get("outboxKey").is_some() {
                     return Err("scoped custom entry cannot include message/outboxKey".into());
                 }
+                crate::resource_selection::validate_public_entry(&custom_type, args.get("data"))?;
                 rpi_harness::agent_harness::ScopedEntry::Custom {
                     custom_type,
                     data: args.get("data").cloned(),
@@ -492,6 +493,7 @@ impl RuntimeActionHost for HarnessActionHost {
             return Err("outboxKey requires an expected guard".into());
         }
         if let Some(custom_type) = arg_str_opt(&args, "customType") {
+            crate::resource_selection::validate_public_entry(&custom_type, args.get("data"))?;
             let data = args.get("data").cloned();
             let id = self
                 .harness()?

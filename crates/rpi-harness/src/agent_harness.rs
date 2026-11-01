@@ -629,6 +629,7 @@ struct HarnessInner {
     model: Model,
     thinking_level: ThinkingLevel,
     active_tool_names: Vec<String>,
+    exact_resources: bool,
     tools: Vec<HarnessTool>,
     resources: AgentHarnessResources,
     stream_options: AgentHarnessStreamOptions,
@@ -866,6 +867,7 @@ impl AgentHarness {
             model: options.model,
             thinking_level: options.thinking_level,
             active_tool_names: options.active_tool_names,
+            exact_resources: false,
             tools: options.tools,
             resources: options.resources,
             stream_options: options.stream_options,
@@ -2298,6 +2300,27 @@ impl AgentHarness {
         Ok(inner.tools.clone())
     }
 
+    /// Seal the host's exact startup selection. Empty means no tools. Resource
+    /// mutations require a restart; the legacy defaults are unchanged until sealed.
+    pub fn seal_resources(&self, active: Vec<String>) -> HarnessResult<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.exact_resources {
+            return Err(HarnessError::io("exact resources already sealed"));
+        }
+        for name in &active {
+            if !inner.tools.iter().any(|t| t.tool.schema().name == *name) {
+                return Err(HarnessError::io(format!("unknown selected tool: {name}")));
+            }
+        }
+        inner.active_tool_names = active;
+        inner.exact_resources = true;
+        Ok(())
+    }
+
+    pub fn has_exact_resources(&self) -> bool {
+        self.inner.lock().unwrap().exact_resources
+    }
+
     /// `setTools(tools, activeNames?)`. Mirrors TS `AgentHarness.setTools` —
     /// replaces the registry and (when `active_names` is `None`) resets
     /// `active_tool_names` to every tool's schema name. Inputs are moved in
@@ -2310,6 +2333,11 @@ impl AgentHarness {
         let mut inner = self.inner.lock().unwrap();
         if inner.closed {
             return Err(HarnessError::closed());
+        }
+        if inner.exact_resources {
+            return Err(HarnessError::io(
+                "exact resources are restart-required; tool registry mutation unsupported",
+            ));
         }
         let active = active_names
             .unwrap_or_else(|| tools.iter().map(|t| t.tool.schema().name.clone()).collect());
@@ -2341,6 +2369,11 @@ impl AgentHarness {
             let inner = self.inner.lock().unwrap();
             if inner.closed {
                 return Err(HarnessError::closed());
+            }
+            if inner.exact_resources {
+                return Err(HarnessError::io(
+                    "exact resource session switching unsupported; restart required",
+                ));
             }
             if let Some(active) = &inner.active_run {
                 return Err(HarnessError::lane_busy(
@@ -2453,6 +2486,9 @@ impl AgentHarness {
         if inner.closed {
             return Err(HarnessError::closed());
         }
+        if inner.exact_resources {
+            return Err(HarnessError::io("exact resources are restart-required"));
+        }
         inner.system_prompt = prompt;
         Ok(())
     }
@@ -2463,6 +2499,9 @@ impl AgentHarness {
         let mut inner = self.inner.lock().unwrap();
         if inner.closed {
             return Err(HarnessError::closed());
+        }
+        if inner.exact_resources {
+            return Err(HarnessError::io("exact resources are restart-required"));
         }
         inner.resources = resources;
         Ok(())
@@ -3445,7 +3484,20 @@ impl AgentHarness {
             parent_signal: inner.active_run.as_ref().map(|run| run.signal.clone()),
             model: inner.model.clone(),
             thinking_level: inner.thinking_level,
-            active_tool_names: inner.active_tool_names.clone(),
+            active_tool_names: if !inner.exact_resources && inner.active_tool_names.is_empty() {
+                inner
+                    .tools
+                    .iter()
+                    .map(|t| t.tool.schema().name.clone())
+                    .collect()
+            } else {
+                inner
+                    .active_tool_names
+                    .iter()
+                    .filter(|name| inner.tools.iter().any(|t| t.tool.schema().name == **name))
+                    .cloned()
+                    .collect()
+            },
             tools: inner.tools.clone(),
             system_prompt: inner.system_prompt.clone(),
             resources: inner.resources.clone(),
@@ -3468,15 +3520,9 @@ impl AgentHarness {
         })
     }
 
-    /// Build the agent tools vec, filtered by `active_tool_names`. An empty
-    /// `active_tool_names` means "all tools active" (mirrors TS default).
+    /// Filter an already normalized execution selection. Legacy empty-means-all
+    /// is resolved in snapshot_config, before both prompt and schema construction.
     fn active_tools(tools: &[HarnessTool], active: &[String]) -> Vec<Arc<dyn AgentTool>> {
-        if active.is_empty() {
-            return tools
-                .iter()
-                .map(|t| crate::image_tool::wrap(Arc::clone(&t.tool)))
-                .collect();
-        }
         tools
             .iter()
             .filter(|t| active.contains(&t.tool.schema().name))
@@ -5472,6 +5518,11 @@ impl AgentLane for AgentHarness {
         if inner.closed {
             return Err(HarnessError::closed());
         }
+        if inner.exact_resources {
+            return Err(HarnessError::io(
+                "set_active_tools unsupported with exact resources; changes require a new session and restart",
+            ));
+        }
         inner.active_tool_names = names;
         Ok(())
     }
@@ -5818,6 +5869,11 @@ impl AgentLane for LaneHandle {
         let mut inner = self.inner.lock().unwrap();
         if inner.closed {
             return Err(HarnessError::closed());
+        }
+        if inner.exact_resources {
+            return Err(HarnessError::io(
+                "set_active_tools unsupported with exact resources; changes require a new session and restart",
+            ));
         }
         inner.active_tool_names = names;
         Ok(())

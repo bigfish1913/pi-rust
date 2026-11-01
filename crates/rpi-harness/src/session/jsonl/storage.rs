@@ -77,6 +77,20 @@ use crate::session::types::{
     SessionMetadata, SessionMutation, SessionStats, SessionStorage,
 };
 
+/// Read-only native facts for startup preflight. No storage/file capability is
+/// retained; values use the ordinary latest-wins SessionValues reducer.
+#[derive(Debug, Clone)]
+pub struct JsonlSessionFacts {
+    pub metadata: JsonlSessionMetadata,
+    pub values: crate::session::SessionValues,
+}
+
+#[derive(Clone, Copy)]
+enum FrameReplay {
+    Cold,
+    Detached,
+}
+
 /// Durable file-backed `SessionStorage`. Mirrors TS `JsonlSessionStorage`.
 ///
 /// Owns: the shared [`FileSystem`], the session [`JsonlSessionMetadata`] (with
@@ -227,6 +241,73 @@ impl JsonlSessionStorage {
         clock: Arc<dyn Clock>,
         ids: Arc<dyn IdGenerator>,
     ) -> SessionResult<Self> {
+        Self::load_impl(fs, path, clock, ids, true, FrameReplay::Cold).await
+    }
+
+    /// Replay through the canonical native decoder/reducer without repairing,
+    /// appending, claiming a writer, or creating any file. Recoverable tails and
+    /// exact duplicate sequences are ignored in memory, as on normal restore.
+    /// The returned snapshot cannot write to the original transcript.
+    pub async fn read_snapshot(
+        fs: Arc<dyn FileSystem>,
+        path: &str,
+        clock: Arc<dyn Clock>,
+        ids: Arc<dyn IdGenerator>,
+    ) -> SessionResult<crate::session::memory::InMemorySessionStorage> {
+        let storage = Self::load_impl(
+            fs,
+            path,
+            clock.clone(),
+            ids.clone(),
+            false,
+            FrameReplay::Detached,
+        )
+        .await?;
+        let state = (**storage.state.lock().await).clone();
+        Ok(crate::session::memory::InMemorySessionStorage::from_state(
+            storage.metadata.to_base(),
+            state,
+            clock,
+            ids,
+        ))
+    }
+
+    /// Inspect metadata and session values without repairs, writer ownership or
+    /// historical frame hydration. Cold replay is independent of repair policy;
+    /// readerless filesystems retain their normal eager fallback.
+    pub async fn read_facts(
+        fs: Arc<dyn FileSystem>,
+        path: &str,
+        clock: Arc<dyn Clock>,
+        ids: Arc<dyn IdGenerator>,
+    ) -> SessionResult<JsonlSessionFacts> {
+        Self::load_impl(fs, path, clock, ids, false, FrameReplay::Cold)
+            .await?
+            .facts()
+            .await
+    }
+
+    async fn facts(&self) -> SessionResult<JsonlSessionFacts> {
+        let entries = self.state.lock().await.find_entries(&EntryQuery {
+            entry_type: Some("custom"),
+            custom_type: Some(crate::session::values::VALUE_CUSTOM_TYPE.to_string()),
+            order: Some(crate::session::types::EntryOrder::OldestFirst),
+            ..Default::default()
+        })?;
+        Ok(JsonlSessionFacts {
+            metadata: self.metadata.clone(),
+            values: crate::session::SessionValues::from_entries(&entries),
+        })
+    }
+
+    async fn load_impl(
+        fs: Arc<dyn FileSystem>,
+        path: &str,
+        clock: Arc<dyn Clock>,
+        ids: Arc<dyn IdGenerator>,
+        repair: bool,
+        frames: FrameReplay,
+    ) -> SessionResult<Self> {
         let reader = file_result(fs.open_read_file(path).await, "open session history reader")?;
         let content = if let Some(reader) = &reader {
             let bytes = file_result(reader.read_all().await, "read session history")?;
@@ -315,7 +396,13 @@ impl JsonlSessionStorage {
                             SessionMutation::Record {
                                 record: LaneRecord::AssistantFrame(frame),
                             },
-                        ) if frame.op != crate::session::types::AssistantFrameOp::CommitStream => {
+                        ) if matches!(frames, FrameReplay::Cold)
+                            && frame.op
+                                != crate::session::types::AssistantFrameOp::CommitStream =>
+                        {
+                            // Normal loads and facts-only preflight stay cold.
+                            // Detached snapshots eagerly retain all historical
+                            // payloads without keeping a file capability.
                             // Slices point into the same validated UTF-8 file view.
                             let offset = line.as_ptr() as usize - content.as_ptr() as usize;
                             state.defer(frame, reader, offset as u64, line)
@@ -346,6 +433,9 @@ impl JsonlSessionStorage {
                     let is_last = idx == physical_lines.len() - 1;
                     let is_torn_tail = is_last && err.kind == JsonlDecodeErrorKind::Syntax;
                     if is_torn_tail {
+                        if !repair {
+                            return Ok(storage);
+                        }
                         // Drop the unacknowledged partial append by atomically
                         // publishing the valid prefix.
                         let valid_prefix = format!("{}\n", physical_lines[..idx].join("\n"));
@@ -378,7 +468,7 @@ impl JsonlSessionStorage {
         // without the dropped duplicates so the log no longer carries them.
         // Seq values are untouched (no renumbering), so subsequent appends
         // stay consistent with the file.
-        if dropped_duplicates {
+        if dropped_duplicates && repair {
             let mut repaired = String::with_capacity(content.len());
             repaired.push_str(physical_lines[0]);
             repaired.push('\n');
@@ -408,7 +498,7 @@ impl JsonlSessionStorage {
         }
         // Repair an unterminated tail (no trailing "\n") so future appends are
         // on their own line.
-        if !content.ends_with('\n') {
+        if repair && !content.ends_with('\n') {
             file_result(
                 storage
                     .fs
@@ -2094,6 +2184,218 @@ mod tests {
             .unwrap()
             .expect("entry exists");
         assert_eq!(got.id(), "e1");
+    }
+
+    #[tokio::test]
+    async fn read_facts_keeps_preflight_frames_cold_and_source_untouched() {
+        use crate::session::types::{AssistantFrameOp, AssistantFrameRecord};
+        for damage in ["none", "torn", "duplicate", "unterminated"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("facts.jsonl");
+            let mut text = encode_header(&header());
+            for (seq, op) in [
+                (1, AssistantFrameOp::Append),
+                (4, AssistantFrameOp::CommitStream),
+            ] {
+                text.push_str(&encode_mutation(&SessionMutation::Record {
+                    record: LaneRecord::AssistantFrame(AssistantFrameRecord {
+                        base: RecordBase {
+                            id: format!("frame-{seq}"),
+                            seq,
+                            lane: "main".into(),
+                            timestamp: 1,
+                        },
+                        run_id: "pending-run".into(),
+                        stream_index: 0,
+                        op,
+                        frame: Some(serde_json::json!({"payload":"cold historical payload"})),
+                    }),
+                }));
+                if seq == 1 {
+                    for value_seq in 2..=3 {
+                        text.push_str(&encode_mutation(&SessionMutation::Entry {
+                            seq: value_seq,
+                            timestamp: 1,
+                            lane: Some("main".into()),
+                            entry: Entry::Custom(crate::session::types::CustomEntry {
+                                base: crate::session::types::EntryBase {
+                                    entry_type: "custom".into(),
+                                    id: format!("value-{value_seq}"), seq: value_seq,
+                                    parent_id: if value_seq == 3 { Some("value-2".into()) } else { None },
+                                    timestamp: 1,
+                                },
+                                custom_type: crate::session::values::VALUE_CUSTOM_TYPE.into(),
+                                data: Some(serde_json::json!({"key":"rpi.resource-selection.v1","value":value_seq})),
+                            }),
+                        }));
+                    }
+                }
+            }
+            match damage {
+                "torn" => text.push_str("{unacknowledged"),
+                "duplicate" => {
+                    let duplicate = text.lines().last().unwrap().to_owned();
+                    text.push_str(&format!("{duplicate}\n"));
+                }
+                "unterminated" => {
+                    text.pop();
+                }
+                _ => {}
+            }
+            std::fs::write(&path, &text).unwrap();
+            let fs: Arc<dyn FileSystem> =
+                Arc::new(rpi_tools::OsExecutionEnv::with_cwd(dir.path().into()));
+            let clock: Arc<dyn Clock> = Arc::new(FakeClock::new());
+            let ids: Arc<dyn IdGenerator> = Arc::new(CounterIdGenerator::new());
+            let facts = JsonlSessionStorage::read_facts(
+                fs.clone(),
+                path.to_str().unwrap(),
+                clock.clone(),
+                ids.clone(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                Arc::strong_count(&fs),
+                1,
+                "facts must not retain the filesystem"
+            );
+            assert_eq!(facts.metadata.id, header().id);
+            assert_eq!(
+                facts.values.get("rpi.resource-selection.v1"),
+                Some(&serde_json::json!(3))
+            );
+            // Inspect the same production replay policy: only CommitStream is
+            // hot, while the historical Append remains a cold location.
+            let loaded = JsonlSessionStorage::load_impl(
+                fs,
+                path.to_str().unwrap(),
+                clock,
+                ids,
+                false,
+                FrameReplay::Cold,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                loaded
+                    .state
+                    .lock()
+                    .await
+                    .find_records(&RecordQuery::default())
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(
+                loaded
+                    .find_records(&RecordQuery::default())
+                    .await
+                    .unwrap()
+                    .len(),
+                2
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+            // Facts extraction must not hydrate the now-invalid cold row.
+            std::fs::write(
+                &path,
+                text.replacen("cold historical payload", "changed frame payload!!", 1),
+            )
+            .unwrap();
+            assert_eq!(loaded.facts().await.unwrap().values, facts.values);
+            assert!(loaded.find_records(&RecordQuery::default()).await.is_err());
+            drop(loaded);
+            std::fs::remove_file(&path).unwrap();
+            // The pure DTO remains usable after every storage/file owner and
+            // the source itself are gone; it has no lazy payload capability.
+            assert_eq!(
+                facts.values.get("rpi.resource-selection.v1"),
+                Some(&serde_json::json!(3))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn read_snapshot_replays_recoverable_tails_without_writes_or_creation() {
+        for damage in ["torn", "duplicate", "unterminated"] {
+            let fs: Arc<dyn FileSystem> =
+                Arc::new(rpi_tools::InMemoryExecutionEnv::with_cwd("/".into()));
+            let clock: Arc<dyn Clock> = Arc::new(FakeClock::new());
+            let ids: Arc<dyn IdGenerator> = Arc::new(CounterIdGenerator::new());
+            let storage = JsonlSessionStorage::create(
+                fs.clone(),
+                "/s.jsonl",
+                header(),
+                clock.clone(),
+                ids.clone(),
+            )
+            .await
+            .unwrap();
+            storage.set_name(Some("persisted")).await.unwrap();
+            let original = fs.read_text_file("/s.jsonl", None).await.unwrap();
+            let damaged = match damage {
+                "torn" => format!("{original}{{unacknowledged"),
+                "duplicate" => format!("{original}{}\n", original.lines().last().unwrap()),
+                "unterminated" => original.trim_end_matches('\n').to_string(),
+                _ => unreachable!(),
+            };
+            fs.write_file("/s.jsonl", FileContent::Text(damaged.clone()), None)
+                .await
+                .unwrap();
+            let file_paths = |files: Vec<rpi_tools::env::FileInfo>| {
+                files
+                    .into_iter()
+                    .map(|file| file.path)
+                    .collect::<std::collections::BTreeSet<_>>()
+            };
+            let files_before = file_paths(fs.list_dir("/", None).await.unwrap());
+            let progress_before = fs
+                .read_text_file("/s.jsonl.progress.jsonl", None)
+                .await
+                .unwrap();
+            let snapshot = JsonlSessionStorage::read_snapshot(
+                fs.clone(),
+                "/s.jsonl",
+                clock.clone(),
+                ids.clone(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                snapshot.get_name().await.unwrap().as_deref(),
+                Some("persisted")
+            );
+            snapshot.set_name(Some("memory-only")).await.unwrap();
+            assert_eq!(fs.read_text_file("/s.jsonl", None).await.unwrap(), damaged);
+            assert!(JsonlSessionStorage::read_snapshot(
+                fs.clone(),
+                "/absent.jsonl",
+                clock.clone(),
+                ids.clone()
+            )
+            .await
+            .is_err());
+            assert_eq!(
+                file_paths(fs.list_dir("/", None).await.unwrap()),
+                files_before
+            );
+            assert_eq!(
+                fs.read_text_file("/s.jsonl.progress.jsonl", None)
+                    .await
+                    .unwrap(),
+                progress_before
+            );
+            // The accepted writer path retains canonical recovery semantics.
+            let restored = JsonlSessionStorage::load(fs.clone(), "/s.jsonl", clock, ids)
+                .await
+                .unwrap();
+            assert_eq!(
+                restored.get_name().await.unwrap().as_deref(),
+                Some("persisted")
+            );
+            assert_eq!(fs.read_text_file("/s.jsonl", None).await.unwrap(), original);
+        }
     }
 
     #[tokio::test]

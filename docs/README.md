@@ -16,6 +16,7 @@
 | Rust 动态库扩展与 ABI | [扩展开发](extensions/authoring.md) |
 | 启动、会话与关闭事件 | [扩展生命周期](extensions/lifecycle.md) |
 | 子 agent 配置继承、权限与生命周期 | [宿主管理的子 agent](extensions/subagents.md) |
+| Native RPC 精确启动资源、工具与观测（Stage A） | [Resource selection RPC](resource-selection-rpc.md) |
 | 无头服务端与远程 TUI | [远程模式](remote/user-guide.md) |
 | Agent 与扩展调试 | [Rust 调试指南](debugging/rust-debugging.md) |
 | Windows 上修饰键 + Enter 失效（终端改写 vs 守卫） | [Shift+Enter 排查](debugging/windows-shift-enter.md) |

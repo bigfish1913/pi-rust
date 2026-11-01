@@ -198,6 +198,62 @@ async fn cold_indexes_survive_duplicate_torn_and_unterminated_tail_repairs() {
 }
 
 #[tokio::test]
+async fn read_snapshot_preserves_cold_frames_without_repair_or_file_capabilities() {
+    for damage in ["none", "duplicate", "torn", "unterminated"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.jsonl");
+        let original = text();
+        let mut raw = original.clone();
+        match damage {
+            "duplicate" => raw.push_str(&encode_mutation(&record(2, AssistantFrameOp::Append))),
+            "torn" => raw.push_str("{\"seq\":9,"),
+            "unterminated" => {
+                raw.pop();
+            }
+            _ => {}
+        }
+        std::fs::write(&path, &raw).unwrap();
+        let fs: Arc<dyn FileSystem> = Arc::new(OsExecutionEnv::with_cwd(dir.path().into()));
+        let snapshot = JsonlSessionStorage::read_snapshot(
+            fs.clone(),
+            path.to_str().unwrap(),
+            Arc::new(SystemClock),
+            Arc::new(DefaultIdGenerator::new()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        let normal = load(fs, path.to_str().unwrap()).await;
+        assert_eq!(
+            snapshot
+                .find_records(&RecordQuery::default())
+                .await
+                .unwrap(),
+            normal.find_records(&RecordQuery::default()).await.unwrap()
+        );
+        assert_eq!(
+            snapshot.get_log(&LogOptions::default()).await.unwrap(),
+            normal.get_log(&LogOptions::default()).await.unwrap()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        snapshot.set_name(Some("memory only")).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        // Neither later source changes nor dropped file readers can alter the
+        // already-returned snapshot's historical payloads.
+        std::fs::write(&path, "replaced").unwrap();
+        assert_eq!(
+            snapshot
+                .find_records(&RecordQuery::default())
+                .await
+                .unwrap()
+                .len(),
+            7
+        );
+    }
+}
+
+#[tokio::test]
 async fn divergent_duplicate_cold_payload_is_rejected_without_source_rewrite() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("history.jsonl");
