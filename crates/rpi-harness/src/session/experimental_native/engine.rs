@@ -12,6 +12,10 @@ use std::{
 };
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+// Keep atomic path-reservation failures distinct from initializer/SQLite errors.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(super) struct ReservationError(#[source] pub(super) std::io::Error);
 pub const FORMAT: &str = "rpi-native-fact-experimental-v3";
 pub const TAIL: u64 = 16;
 const APP: i64 = 0x52504951;
@@ -507,7 +511,13 @@ impl Store {
                 && identity.generation.len() <= 128,
             "invalid native identity",
         )?;
-        drop(OpenOptions::new().write(true).create_new(true).open(path)?);
+        drop(
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .map_err(ReservationError)?,
+        );
         let mut connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
         connection.busy_timeout(Duration::from_secs(5))?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;

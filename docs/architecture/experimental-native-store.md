@@ -39,8 +39,13 @@ body 校验继承事实引擎；auxiliary 中 metadata/progress 各带 identity-
   `drain` 等待本 handle 组 gate，**不是跨进程 drain**。
 - Repo create/open/list 的 owner 也持有生命周期 gate。create/fork 同事务初始化 schema、
   metadata、progress 与初始 facts；失败可留下不可打开的 artifact，不自动删除或覆盖残留。
+  路径预检与原子 `create_new` 占位阶段的 AlreadyExists 均映射为同一稳定错误码；
+  只识别私有占位错误的结构化 IO kind，初始化回调的同名 IO 错误仍为 StorageError。
 - 同进程同路径 repo open 共用 inner，拒绝活动 handle 的不同 generation。
-  全局 registry 只弱引用，不持有历史正文；不是跨进程 fencing。
+  全局 registry 只弱引用，不持有历史正文；create/fresh-open 注册新 handle 时在原 mutex
+  内清除强计数为零的条目，保留活动 owners；回收扫描 HashMap capacity（可保留过去峰值），
+  不承诺 bucket 缩容或空闲时立即清零，也不是持久 registry、后台回收、跨进程 ownership
+  或 generation fencing。
 - fork 显式全历史 materialize，使用真实 SessionState 生成 fork mutations；不复制 progress。
 - delete 始终 fail closed：活动 handles 明确拒绝，其他情形也因尚无跨进程 lifecycle claim
   而报错。没有安全删除实现，不能宣称完整 Repo 生命周期已完成。

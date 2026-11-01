@@ -28,6 +28,15 @@ fn handles() -> &'static Mutex<HashMap<PathBuf, Weak<Inner>>> {
 fn error(e: impl std::fmt::Display) -> SessionError {
     SessionError::storage(e.to_string())
 }
+fn create_error(e: Box<dyn std::error::Error>) -> SessionError {
+    if e.downcast_ref::<super::engine::ReservationError>()
+        .is_some_and(|e| e.0.kind() == std::io::ErrorKind::AlreadyExists)
+    {
+        SessionError::already_exists("experimental artifact already exists")
+    } else {
+        error(e)
+    }
+}
 fn addressed(root: &Path, id: &str) -> SessionResult<PathBuf> {
     if id.is_empty()
         || id.len() > 128
@@ -141,12 +150,13 @@ impl ExperimentalNativeRepo {
                 )?;
                 Ok(())
             })
-            .map_err(error)?;
+            .map_err(create_error)?;
             let storage = ExperimentalNativeStorage::from_store(store, metadata, clock);
-            handles()
-                .lock()
-                .map_err(error)?
-                .insert(path, Arc::downgrade(&storage.inner));
+            let mut registry = handles().lock().map_err(error)?;
+            // Opportunistic cleanup scans capacity (possibly a past peak); no bucket
+            // shrinking, idle/Drop cleanup, persistent registry, or loss of live owners.
+            registry.retain(|_, weak| weak.strong_count() != 0);
+            registry.insert(path, Arc::downgrade(&storage.inner));
             Ok(storage)
         })
         .await
@@ -187,6 +197,7 @@ impl SessionRepo for ExperimentalNativeRepo {
                     inner,
                 });
             }
+            registry.retain(|_, weak| weak.strong_count() != 0);
             let storage = ExperimentalNativeStorage::from_store(store, saved, clock);
             registry.insert(path, Arc::downgrade(&storage.inner));
             Ok(storage)
