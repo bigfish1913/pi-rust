@@ -3034,11 +3034,15 @@ impl AgentHarness {
             Ok(entries) => entries,
             Err(_) => return false,
         };
-        let Some(Entry::Message(message)) = entries
+        // Extension state (for example durable's AgentStart journal) can be
+        // appended after the prompt without advancing the conversation. Match
+        // lane_is_resumable: inspect the last non-custom entry, not an arbitrary
+        // older user message hidden behind an assistant reply.
+        let tip = entries
             .iter()
             .rev()
-            .find(|entry| !matches!(entry, Entry::Custom(_)))
-        else {
+            .find(|entry| !matches!(entry, Entry::Custom(_)));
+        let Some(Entry::Message(message)) = tip else {
             return false;
         };
         matches!(message.message, AgentMessage::User(_))

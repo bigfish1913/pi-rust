@@ -174,6 +174,30 @@ tasks:
     cmds:
       - cargo test --workspace --locked
 
+  test:session:
+    desc: 离线测试真实 CLI 的消息、重启恢复与会话隔离（诊断目录必须不存在）
+    vars:
+      DEFAULT_PYTHON: '{{if eq OS "windows"}}python{{else}}python3{{end}}'
+      PYTHON: '{{.SESSION_PYTHON | default .DEFAULT_PYTHON}}'
+      BUILD_TARGET: '{{.SESSION_CARGO_TARGET_DIR | default "target/session-smoke-cargo"}}'
+      DEFAULT_BINARY: '{{.BUILD_TARGET}}/debug/rpi{{if eq OS "windows"}}.exe{{end}}'
+      BINARY: '{{.SESSION_BINARY | default .DEFAULT_BINARY}}'
+      DEFAULT_DIAGNOSTICS_DIR:
+        sh: '{{.PYTHON}} -c "import uuid; print(''target/session-smoke-'' + uuid.uuid4().hex)"'
+      DIAGNOSTICS_DIR: '{{.SESSION_DIAGNOSTICS_DIR | default .DEFAULT_DIAGNOSTICS_DIR}}'
+    cmds:
+      - cargo build -p rpi-cli --bin rpi --locked --target-dir "{{.BUILD_TARGET}}"
+      - '{{.PYTHON}} -B scripts/test_session_smoke.py'
+      - '{{.PYTHON}} -B scripts/session-smoke.py --rpi "{{.BINARY}}" --diagnostics-dir "{{.DIAGNOSTICS_DIR}}" {{.CLI_ARGS}}'
+
+  test:recovery:
+    desc: 测试 harness 崩溃恢复、消息顺序与 CLI 会话 cwd 恢复
+    vars:
+      BUILD_TARGET: '{{.SESSION_CARGO_TARGET_DIR | default "target/session-smoke-cargo"}}'
+    cmds:
+      - cargo test -p rpi-harness --test harness_run_e2e --test context_message_order --test frame_progress_recovery --test m5c_jsonl_torn_tail --test jsonl_failure_regressions --locked --target-dir "{{.BUILD_TARGET}}"
+      - cargo test -p rpi-cli --test session_cwd_restore --locked --target-dir "{{.BUILD_TARGET}}"
+
   check:
     desc: Check all locked workspace targets
     cmds:

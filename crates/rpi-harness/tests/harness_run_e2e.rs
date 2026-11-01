@@ -3885,6 +3885,16 @@ async fn an_injected_steering_message_survives_a_crash() {
 /// the user does not need to retype what they already sent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_crash_before_the_first_request_still_continues() {
+    check_crash_before_first_request(false).await;
+}
+
+/// Extension journals are branch data, not an answer to the user's prompt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn custom_entries_do_not_hide_a_crashed_user_prompt() {
+    check_crash_before_first_request(true).await;
+}
+
+async fn check_crash_before_first_request(with_custom_entries: bool) {
     use rpi_harness::session::types::{OperationIntent, OperationStartedRecord, RecordBase};
 
     let session = replay_session();
@@ -3918,6 +3928,15 @@ async fn a_crash_before_the_first_request_still_continues() {
         .await
         .expect("append the run");
 
+    if with_custom_entries {
+        for _ in 0..2 {
+            session
+                .append_custom_entry("durable-state", Some(serde_json::json!({"running": true})))
+                .await
+                .expect("append AgentStart journal");
+        }
+    }
+
     let recovered = replayable_harness(
         session,
         ToolReplay::Never,
@@ -3932,6 +3951,17 @@ async fn a_crash_before_the_first_request_still_continues() {
         .expect("a run that produced nothing should be continued");
     assert_eq!(pending.attempt, 0);
 
+    if with_custom_entries {
+        recovered
+            .session()
+            .append_custom_entry(
+                "durable-state",
+                Some(serde_json::json!({"interrupted": true})),
+            )
+            .await
+            .expect("append SessionStart journal before resuming");
+    }
+
     let resumed = recovered
         .resume_pending()
         .await
@@ -3945,6 +3975,22 @@ async fn a_crash_before_the_first_request_still_continues() {
     assert!(
         joined.contains("answered on the restart"),
         "the continued run must answer, got {joined:?}"
+    );
+    assert!(recovered.pending_resume().is_none());
+    let entries = recovered
+        .session()
+        .view("main")
+        .find_entries_on_branch(&EntryQuery::default(), &BranchBounds::default())
+        .await
+        .unwrap();
+    let users = entries.iter().filter(|entry| {
+        matches!(entry, rpi_harness::session::types::Entry::Message(message)
+            if matches!(message.message, AgentMessage::User(_)))
+    });
+    assert_eq!(
+        users.count(),
+        1,
+        "resume must not duplicate the user prompt"
     );
 }
 
