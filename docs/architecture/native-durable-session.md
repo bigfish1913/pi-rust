@@ -103,7 +103,14 @@ fixture 为 12,132,666 bytes，包含 4096 个已取消 enqueue、4096 条取消
 返回量不是进程峰值内存；fixture 刚写入、查询已预热，不能视为冷磁盘结果。
 primary history 初次读取/解析依然存在，这组数值不能外推为整个 session 恢复加速倍数。
 
-## 后续阶段（尚未实现）
+## 第二期隔离原型
+
+[版本化 managed recovery 原型](managed-recovery-prototype.md) 已在 test-only SQLite 行存储中
+验证 checkpoint + 固定预算 metadata tail、历史正文懒读和事务故障边界。
+它没有接入任何生产 SessionStorage/宿主，也没有改变本页所述 v4 初次全量扫描的事实。
+正式格式、完整事实模型与迁移仍属后续工作。
+
+## 后续阶段（生产路径尚未实现）
 
 1. 在隔离旧 session 副本上分别测 load/replay、queue、interrupted repair、上下文准备、首屏 history。
 2. 定义 primary recovery checkpoint 的 session/branch/generation/序号边界，以及可验证的索引与有界 tail。
