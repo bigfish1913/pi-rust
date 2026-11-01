@@ -123,7 +123,15 @@ fn commit(
         .connection
         .transaction_with_behavior(TransactionBehavior::Immediate)?;
     let result = apply_writes(&tx, &store.identity, writes, expected, clock)?;
+    #[cfg(test)]
+    if let Some(probe) = &store.process_probe {
+        probe("history:before");
+    }
     tx.commit()?;
+    #[cfg(test)]
+    if let Some(probe) = &store.process_probe {
+        probe("history:after");
+    }
     Ok(result)
 }
 pub(super) fn apply_writes(
@@ -735,7 +743,15 @@ impl SessionStorage for ExperimentalNativeStorage {
                 .map_err(SessionError::from)?;
             progress.apply(&prepared);
             publish_aux(&tx, &s.identity, "progress", &progress)?;
+            #[cfg(test)]
+            if let Some(probe) = &s.process_probe {
+                probe("progress:before");
+            }
             tx.commit()?;
+            #[cfg(test)]
+            if let Some(probe) = &s.process_probe {
+                probe("progress:after");
+            }
             Ok(prepared)
         })
         .await
@@ -771,7 +787,11 @@ impl SessionStorage for ExperimentalNativeStorage {
             }
             let removed=progress.prune_completed(&completed);
             if removed>0 {publish_aux(&tx,&s.identity,"progress",&progress)?;}
+            #[cfg(test)]
+            if let Some(probe) = &s.process_probe { probe("prune:before"); }
             tx.commit()?;
+            #[cfg(test)]
+            if let Some(probe) = &s.process_probe { probe("prune:after"); }
             Ok(removed)
         }).await
     }
@@ -910,6 +930,9 @@ mod cancellation_tests {
 #[cfg(test)]
 #[path = "indexed_tests.rs"]
 mod indexed_tests;
+#[cfg(test)]
+#[path = "process_tests.rs"]
+mod process_tests;
 #[cfg(test)]
 #[path = "storage_tests.rs"]
 mod tests;

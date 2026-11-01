@@ -456,9 +456,15 @@ pub(super) fn insert_fact(
     super::index::publish(db, identity, &meta, mutation)?;
     Ok(())
 }
+#[cfg(test)]
+type ProcessProbe = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 pub struct Store {
     pub(super) connection: Connection,
     pub(super) identity: Identity,
+    // Explicit connection-local test observer. Never present in a product artifact,
+    // and deliberately not inferred from environment/global mutable state.
+    #[cfg(test)]
+    pub(super) process_probe: Option<ProcessProbe>,
 }
 impl Store {
     pub fn create(path: &Path, identity: Identity) -> Result<Self> {
@@ -498,6 +504,8 @@ impl Store {
         Ok(Self {
             connection,
             identity,
+            #[cfg(test)]
+            process_probe: None,
         })
     }
     pub fn open(path: &Path, identity: Identity) -> Result<Self> {
@@ -511,6 +519,8 @@ impl Store {
         let mut store = Self {
             connection,
             identity,
+            #[cfg(test)]
+            process_probe: None,
         };
         store.restore()?;
         Ok(store)

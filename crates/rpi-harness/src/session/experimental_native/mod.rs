@@ -1,6 +1,7 @@
 //! Opt-in, explicitly constructed experimental native row store.
 //!
-//! No CLI/Web routing, discovery of legacy sessions, migration, or stable format promise.
+//! Only explicit construction / fresh print-only CLI opt-in; no Web routing,
+//! discovery of legacy sessions, migration, or stable format promise.
 use crate::session as facts;
 use crate::session::message_preview as preview;
 mod codec;

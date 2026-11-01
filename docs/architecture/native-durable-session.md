@@ -145,6 +145,14 @@ routing 与 reload host 保留边界。真实二进制使用隔离 mock provider
 工具结果、持久化失败与旧根不变；默认不带参数仍使用 JSONL。
 不迁移真实 session，不等于稳定生产格式/默认切换或完整有界恢复交付。
 
+## 隔离进程故障验证（仅实验测试）
+
+[进程终止/SQLite 写锁矩阵](experimental-native-process-tests.md) 在合成 fixture 检查真实
+事务 COMMIT 前后 kill、返回前 ACK 丢失、history/checkpoint/派生行与 progress/prune 的原子
+可见性，以及独立 writer busy、释放/死亡后的重试与序号。连接局部探针仅存在于 cfg(test)，
+没有新增 CLI 恢复或自动重试 API。当前实测仅 Windows / SQLite DELETE journal，不代表
+断电原子性、跨进程生命周期 fencing、安全 delete 或生产完成。
+
 ## 后续阶段（生产路径尚未实现）
 
 1. 在隔离旧 session 副本上分别测 load/replay、queue、interrupted repair、上下文准备、首屏 history。

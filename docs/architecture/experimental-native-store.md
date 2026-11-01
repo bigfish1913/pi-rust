@@ -102,7 +102,12 @@ v3 新增跨分支/reopen/pinned leaf/cursor/limit 的 summary/window oracle 矩
 固定两项 latest page 在 32/512 条历史中比较 metadata point-read 的 prepare 次数：这是结构性
 读取探针，不是物理页数、进程峰值内存、冷启动 benchmark 或完整恢复加速倍数。
 
-生产仍缺：完整错误分类及等价性矩阵、独立进程 crash/锁/取消测试、外部 generation fencing、
+新增 [隔离进程故障验证](experimental-native-process-tests.md)：真实 history/progress/prune
+COMMIT 前后杀子进程、提交后返回前 ACK 丢失、跨进程 typed SQLITE_BUSY、持锁者 release/kill
+后连续序号及 stale revision，另测错误阶段与 helper panic 不可假绿。只使用合成 fixture，
+不新增 CLI 恢复、生产 fault hook 或迁移。现有取消测试仍为同进程 admission/owner 语义。
+
+生产仍缺：完整错误分类及等价性矩阵、跨平台/更多故障点与真正断电验证、外部 generation fencing、
 稳定格式 registry、request-ID 不确定提交对账封装、安全 delete、全面索引/上下文优化，
 以及隔离旧数据测量和 idle/独占/备份/回滚迁移。当前 CLI 显式 opt-in 不提供恢复已有
 session 或生产默认 backend 切换。
