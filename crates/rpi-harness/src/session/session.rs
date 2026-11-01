@@ -1405,6 +1405,7 @@ mod tests {
     struct RebindingStorage {
         inner: Arc<dyn SessionStorage>,
         callback: Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>,
+        fail_branch: bool,
     }
 
     #[async_trait::async_trait]
@@ -1458,6 +1459,11 @@ mod tests {
             bounds: &BranchBounds,
             start: &str,
         ) -> SessionResult<Vec<Entry>> {
+            if self.fail_branch {
+                return Err(crate::error::SessionError::storage(
+                    "injected branch read failure",
+                ));
+            }
             self.inner
                 .find_entries_on_branch(query, bounds, start)
                 .await
@@ -1499,6 +1505,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resource_transition_idle_fails_closed_on_branch_read_error() {
+        let original = fixture_session();
+        original
+            .append_message(user("real branch tip"))
+            .await
+            .unwrap();
+        let session = Session::new(
+            Arc::new(RebindingStorage {
+                inner: original.storage(),
+                callback: Arc::new(Mutex::new(None)),
+                fail_branch: true,
+            }),
+            None,
+        );
+        let error = crate::agent_harness::AgentHarness::validate_resource_transition_idle(&session)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("injected branch read failure"));
+    }
+
+    #[tokio::test]
     async fn context_rebind_during_leaf_read_keeps_one_storage_binding() {
         let old_storage: Arc<dyn SessionStorage> = Arc::new(InMemorySessionStorage::new(
             SessionMetadata {
@@ -1527,6 +1554,7 @@ mod tests {
         let wrapper: Arc<dyn SessionStorage> = Arc::new(RebindingStorage {
             inner: old_storage,
             callback: callback.clone(),
+            fail_branch: false,
         });
         let facade = Session::new(wrapper, None);
         let replacement = new.storage();

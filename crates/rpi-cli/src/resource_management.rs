@@ -17,6 +17,16 @@ const MAX_META: usize = 256 * 1024;
 const MAX_FILES: usize = 2048;
 const MAX_FILE: u64 = 64 * 1024 * 1024;
 const MAX_BYTES: u64 = 256 * 1024 * 1024;
+/// Static protocol description only: never resolves a root or opens metadata.
+pub(crate) fn capabilities() -> Value {
+    json!({"version":1,"command":"resource","kinds":["package","skill","extension"],
+        "scopes":["project","global"],"explicitScopeRequired":true,
+        "operations":["list","inspect","install","update","reinstall","remove","recover"],
+        "localSnapshotsOnly":true,"build":false,"network":false,"hotApply":false,
+        "bounds":{"maxMetadataBytes":MAX_META,"maxResultBytes":MAX_META,"maxResourcesPerScope":128,
+            "maxInventoryEntries":MAX_FILES,"maxDepth":32,"maxFileBytes":MAX_FILE,"maxTotalBytes":MAX_BYTES}})
+}
+
 type Result<T> = std::result::Result<T, String>;
 fn err(e: impl std::fmt::Display) -> String {
     e.to_string()

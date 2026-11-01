@@ -481,6 +481,13 @@ where
     let mut run_cancel = tokio_util::sync::CancellationToken::new();
     let mut cancel_on_exit = false;
 
+    let binding = match rpi_harness::session::SessionValues::load(harness.session()).await {
+        Ok(values) => crate::resource_selection::binding_state(&values),
+        Err(error) => {
+            eprintln!("resource binding read failed: {error}");
+            return 1;
+        }
+    };
     let mut ready = rpc_protocol::ready(message_updates);
     ready["resourceState"] = serde_json::json!({
         "version": 1, "enabled": harness.has_exact_resources(), "command": "get_resource_state",
@@ -488,11 +495,20 @@ where
         "changes": "restart-required", "setActiveTools": if harness.has_exact_resources() { "unsupported" } else { "legacy" },
         "configureExternalTools": if harness.has_exact_resources() { "unsupported" } else { "supported" },
         "automaticPersistenceRecovery": false, "hotApply": false,
-        "packageScopes": ["project", "global"], "defaultPackageScope": "project"
+        "packageScopes": ["project", "global"], "defaultPackageScope": "project",
+        "transition": crate::resource_selection::transition_capability(),
+        "binding": binding
     });
     if harness.has_exact_resources() {
         if let Ok(state) = crate::resource_selection::get_resource_state(harness).await {
-            for key in ["hostId", "host", "sessionId", "selection"] {
+            for key in [
+                "hostId",
+                "host",
+                "sessionId",
+                "selection",
+                "binding",
+                "transition",
+            ] {
                 ready["resourceState"][key] = state[key].clone();
             }
         } else {
