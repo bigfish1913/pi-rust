@@ -3336,6 +3336,12 @@ async fn open_session(
         .open_by_jsonl_metadata(meta)
         .await
         .map_err(|e| BuildError::SessionOpen(format!("open {}: {e}", meta.path)))?;
+    // Native saved sessions predating progressFormat remain read-only to plain
+    // storage loaders. Only this locked, not-yet-shared restore opts into writes.
+    let storage = storage
+        .enable_progress_under_exclusive_lock()
+        .await
+        .map_err(|e| BuildError::SessionOpen(format!("upgrade {}: {e}", meta.path)))?;
     let storage_arc: Arc<dyn SessionStorage> = Arc::new(storage);
     Ok(RestoredSession {
         session: Session::new(storage_arc, None),
@@ -4983,6 +4989,65 @@ mod tests {
         let note = crate::session_cwd::missing_session_cwd_note(&peeked.recorded, &launch);
         assert!(note.contains("no longer exists"), "{note}");
         assert!(note.contains("launch-dir"), "{note}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_progress_upgrade_normal_open_runs_and_reopens() {
+        use rpi_ai::providers::faux::{FauxProvider, FauxScript};
+        use rpi_harness::agent_harness::{AgentHarness, AgentLane, HarnessRunOutcome};
+        use rpi_harness::session::jsonl::{
+            encode_header, JsonlSessionCreateOptions, JsonlSessionRepo, JsonlSessionRepoOptions,
+            JsonlV4Header,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let cwd = tmp.path().to_string_lossy().into_owned();
+        let repo = JsonlSessionRepo::with_env_cwd(JsonlSessionRepoOptions {
+            fs: Arc::new(OsExecutionEnv::with_cwd(tmp.path().into())),
+            sessions_root: sessions.to_string_lossy().into_owned(),
+            clock: Arc::new(SystemClock),
+            ids: Arc::new(DefaultIdGenerator::new()),
+        });
+        let fixture = repo
+            .create_typed(&JsonlSessionCreateOptions {
+                id: Some("legacycli001".into()),
+                parent_session_id: None,
+                cwd: cwd.clone(),
+                metadata: None,
+            })
+            .await
+            .unwrap();
+        let path = PathBuf::from(fixture.jsonl_metadata().path);
+        drop(fixture);
+        let sidecar = PathBuf::from(format!("{}.progress.jsonl", path.display()));
+        std::fs::remove_file(&sidecar).unwrap();
+        let header = JsonlV4Header::new("legacycli001".into(), 1, cwd.clone(), None, None, None);
+        std::fs::write(&path, encode_header(&header)).unwrap();
+        assert!(!sidecar.exists());
+        for _ in 0..2 {
+            let restored = open_session_by_id_in_dir("legacycli001", &cwd, &sessions)
+                .await
+                .map_err(|e| e.to_string())
+                .unwrap();
+            assert_eq!(restored.session.storage().metadata().id, "legacycli001");
+            let provider =
+                FauxProvider::new(FauxScript::new().with_text("continued legacy session"));
+            let harness = AgentHarness::create(AgentHarnessOptions {
+                model: provider.default_model().clone(),
+                models: vec![provider],
+                session: restored.session,
+                allow_existing_session: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+            let run = harness.prompt_text("continue", vec![]).await.unwrap();
+            assert!(matches!(run.outcome, HarnessRunOutcome::Completed { .. }));
+        }
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.lines().next().unwrap().contains("progressFormat"));
+        assert!(sidecar.exists());
     }
 
     /// `open_session` hands back the recorded directory as data (for the
