@@ -110,6 +110,12 @@ primary history 初次读取/解析依然存在，这组数值不能外推为整
 它没有接入任何生产 SessionStorage/宿主，也没有改变本页所述 v4 初次全量扫描的事实。
 正式格式、完整事实模型与迁移仍属后续工作。
 
+## 第三期真实事实投影（仍仅隔离测试）
+
+[原生事实恢复投影](native-fact-recovery-prototype.md) 将原型推进到真实 `SessionMutation`，
+逐步对照 `SessionState`，覆盖全部 entry/record 变种、真实 pending/open/facts/stats 语义，
+并验证 checkpoint 活动引用及内容级 ACK 对账。不接入生产 backend，不替换现有 JSONL。
+
 ## 后续阶段（生产路径尚未实现）
 
 1. 在隔离旧 session 副本上分别测 load/replay、queue、interrupted repair、上下文准备、首屏 history。
