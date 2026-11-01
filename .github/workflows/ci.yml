@@ -144,6 +144,9 @@ jobs:
     env:
       RUSTFLAGS: "-D warnings"
       RUSTDOCFLAGS: "-D warnings"
+      # Cargo caches target/, including old diagnostics. Keep smoke output outside
+      # that cache and unique per attempt without weakening overwrite protection.
+      SESSION_SMOKE_DIAGNOSTICS_DIR: ${{ runner.temp }}/session-smoke-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -176,14 +179,14 @@ jobs:
       - name: Test offline CLI session recovery
         run: |
           python3 -B scripts/test_session_smoke.py
-          python3 -B scripts/session-smoke.py --rpi target/debug/rpi --diagnostics-dir target/session-smoke-ci
+          python3 -B scripts/session-smoke.py --rpi target/debug/rpi --diagnostics-dir "$SESSION_SMOKE_DIAGNOSTICS_DIR"
 
       - name: Upload failed session smoke diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: session-smoke-diagnostics
-          path: target/session-smoke-ci
+          path: ${{ env.SESSION_SMOKE_DIAGNOSTICS_DIR }}
           if-no-files-found: ignore
           include-hidden-files: true
 
