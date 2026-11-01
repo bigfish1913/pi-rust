@@ -967,19 +967,26 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            // Keep the socket open without another timer racing the body deadline.
+            std::future::pending::<()>().await;
+            drop(socket);
         });
 
         let response = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_millis(30))
+            // Allow the real loopback connection/headers to arrive on busy CI.
+            .timeout(std::time::Duration::from_secs(5))
             .build()
             .unwrap()
             .get(format!("http://{address}"))
             .send()
             .await
             .unwrap();
-        let mut stream = SseEventStream::new(response, CancellationToken::new());
-        let error = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next_event())
+        // Pause only after headers: this exercises the actual reqwest body
+        // timeout without imposing a 30ms wall-clock budget on connection setup.
+        tokio::time::pause();
+        let mut stream =
+            SseEventStream::new(response, CancellationToken::new()).with_idle_timeout(None);
+        let error = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next_event())
             .await
             .unwrap()
             .unwrap_err();
