@@ -284,6 +284,36 @@ fn clears_retire_frames_from_memory_and_keep_the_log_in_step() {
 }
 
 #[test]
+fn retired_frames_keep_their_ids_reserved() {
+    let frame = |id: &str, seq: u64, op| {
+        LaneRecord::AssistantFrame(AssistantFrameRecord {
+            base: rec_base(id, seq, "main"),
+            run_id: "run".to_string(),
+            stream_index: 0,
+            op,
+            frame: None,
+        })
+    };
+    let mut state = SessionState::new();
+    for record in [
+        frame("frame", 1, AssistantFrameOp::Append),
+        frame("clear", 2, AssistantFrameOp::ClearRun),
+    ] {
+        state
+            .apply_mutation(SessionMutation::Record { record })
+            .unwrap();
+    }
+
+    assert!(state.validate_unused_id("frame").is_err());
+    let err = state
+        .apply_mutation(SessionMutation::Record {
+            record: frame("frame", 3, AssistantFrameOp::Append),
+        })
+        .unwrap_err();
+    assert!(err.to_string().contains("already exists"));
+}
+
+#[test]
 fn state_rejects_write_once_id_reuse() {
     let mut state = SessionState::new();
     let user = user_message("hi");

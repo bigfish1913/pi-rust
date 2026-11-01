@@ -440,6 +440,7 @@ impl SessionState {
     /// parsed JSON value, and never read again because recovery skips what a
     /// clear covers. Left in place they outweigh the transcript several times
     /// over. The session file keeps them, and a reload retires them here too.
+    /// Their IDs stay in `used_ids`: the file still holds them, so they stay taken.
     fn retire_frames(&mut self, run_id: &str, stream_index: Option<usize>) {
         let retired = |record: &LaneRecord| {
             matches!(record, LaneRecord::AssistantFrame(frame)
@@ -455,9 +456,7 @@ impl SessionState {
         let mut kept = first;
         let tail = self.records.split_off(first);
         for (offset, record) in tail.into_iter().enumerate() {
-            if retired(&record) {
-                self.used_ids.remove(record.id());
-            } else {
+            if !retired(&record) {
                 moved[offset] = Some(kept);
                 kept += 1;
                 self.records.push(record);
