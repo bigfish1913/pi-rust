@@ -262,8 +262,30 @@ statistics or the shared entry/record ID index.
 
 New JSONL headers advertise `progressFormat: assistant-progress-v1`; the empty
 companion is initialized before that header is written. A missing required
-companion is an error, not an empty successful recovery. Unmarked JSONL is a
-history-only artifact: import or fork it before recording independent progress.
+companion is an error, not an empty successful recovery. Plain `load` leaves
+unmarked JSONL history-only: arbitrary history artifacts are not automatically
+made writable. For native V4 saved sessions the CLI restore path first claims
+its exclusive OS lock, then consumes the still-unshared storage through
+`JsonlSessionStorage::enable_progress_under_exclusive_lock`. That opt-in checks
+the loaded history's digest, atomically initializes an empty companion, then
+atomically adds the header marker while retaining the session ID and every body
+byte (including legacy assistant-frame records and their sequence numbers).
+Legacy payloads remain in history for history-first replay; they are not migrated
+or duplicated into the new sidecar. The history digest is checked again before
+publishing the header, rejecting concurrent changes under the lock contract.
+
+The upgrade has a detached owner: cancelling its caller cannot leave shared
+in-memory state half-upgraded. A failed header stage/rename can be retried by
+reopening under the lock; only a valid empty checkpoint at sequence zero with
+the same session identity may be reused. Undeclared nonempty, foreign or corrupt
+companions are rejected without changing their bytes. A marked session with a
+missing companion still fails closed. The API requires exclusive external file
+ownership for the returned storage's lifetime; it cannot establish that lock
+itself. `legacy_progress_upgrade.rs` tests preservation, FauxProvider continuation
+across restarts, retry/fault/cancellation boundaries, changed-history rejection,
+and strict companion validation; the CLI restore regression exercises normal
+`open_session_by_id_in_dir` and a completed prompt after upgrading.
+
 CLI import copies and validates the pair, rejects foreign identity/corruption,
 locks external sources, and verifies unchanged history around its sidecar copy.
 The same-process case also checks history because CLI locks outlive hot switches.

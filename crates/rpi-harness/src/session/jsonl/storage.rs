@@ -55,6 +55,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use rpi_tools::env::{FileContent, FileSystem};
@@ -98,6 +99,8 @@ pub struct JsonlSessionStorage {
     /// Set when a failed append cannot be proven/truncated safely.
     uncertain: Arc<AtomicBool>,
     progress: super::progress::JsonlProgressStore,
+    /// Exact loaded legacy history, including its header, before writable opt-in.
+    legacy_history_digest: Option<[u8; 32]>,
 }
 
 impl Clone for JsonlSessionStorage {
@@ -113,6 +116,7 @@ impl Clone for JsonlSessionStorage {
             needs_reconcile: self.needs_reconcile.clone(),
             uncertain: self.uncertain.clone(),
             progress: self.progress.clone(),
+            legacy_history_digest: self.legacy_history_digest,
         }
     }
 }
@@ -181,6 +185,7 @@ impl JsonlSessionStorage {
             append: Arc::new(Mutex::new(None)),
             needs_reconcile: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             uncertain: Arc::new(AtomicBool::new(false)),
+            legacy_history_digest: None,
         }
     }
 
@@ -248,6 +253,9 @@ impl JsonlSessionStorage {
         let metadata = metadata_from_header(&header, path, info.mtime_ms);
         let mut storage = Self::new(fs.clone(), metadata, clock, ids);
         storage.progress.required = header.progress_format.is_some();
+        if !storage.progress.required {
+            storage.legacy_history_digest = Some(Sha256::digest(content.as_bytes()).into());
+        }
 
         // Lines kept through the duplicate-seq recovery, so a healed file can
         // be republished without the dropped duplicates (see after the loop).
@@ -319,6 +327,10 @@ impl JsonlSessionStorage {
                         // Drop the unacknowledged partial append by atomically
                         // publishing the valid prefix.
                         let valid_prefix = format!("{}\n", physical_lines[..idx].join("\n"));
+                        if !storage.progress.required {
+                            storage.legacy_history_digest =
+                                Some(Sha256::digest(valid_prefix.as_bytes()).into());
+                        }
                         let fs = storage.fs.clone();
                         let path_owned = path.to_string();
                         publish_file_atomically(&fs, &path_owned, |fs, temp_path| {
@@ -352,6 +364,9 @@ impl JsonlSessionStorage {
                 repaired.push_str(line);
                 repaired.push('\n');
             }
+            if !storage.progress.required {
+                storage.legacy_history_digest = Some(Sha256::digest(repaired.as_bytes()).into());
+            }
             let fs = storage.fs.clone();
             let path_owned = path.to_string();
             publish_file_atomically(&fs, &path_owned, |fs, temp_path| {
@@ -379,8 +394,108 @@ impl JsonlSessionStorage {
                     .await,
                 &format!("Failed to repair unterminated session tail {path}"),
             )?;
+            if !storage.progress.required {
+                storage.legacy_history_digest =
+                    Some(Sha256::digest(format!("{content}\n").as_bytes()).into());
+            }
         }
         Ok(storage)
+    }
+
+    /// Opt a loaded native V4 session into durable progress, preserving its ID
+    /// and history bytes. Ordinary `load` never performs this upgrade.
+    ///
+    /// The caller MUST hold the session's exclusive OS file lock until all use
+    /// of the returned storage ends, and MUST NOT share this handle beforehand.
+    /// This consumes an unshared handle; a detached owner completes publication
+    /// even if the caller drops its future. On failure, reopen under the same
+    /// lock and retry: only a matching, pristine empty checkpoint is reusable.
+    pub async fn enable_progress_under_exclusive_lock(self) -> SessionResult<Self> {
+        if Arc::strong_count(&self.state) != 1 || Arc::strong_count(&self.tail) != 1 {
+            return Err(SessionError::invalid_payload(
+                "progress upgrade requires an unshared storage handle",
+            ));
+        }
+        tokio::spawn(async move {
+            let mut storage = self;
+            if storage.progress.required {
+                return Ok(storage);
+            }
+            if storage.metadata.source_format != super::types::JsonlSourceFormat::V4 {
+                return Err(SessionError::invalid_payload(
+                    "only native V4 sessions support progress upgrade",
+                ));
+            }
+            let expected = storage.legacy_history_digest.ok_or_else(|| {
+                SessionError::invalid_payload("progress upgrade requires a freshly loaded session")
+            })?;
+            let path = storage.metadata.path.clone();
+            let content = file_result(
+                storage.fs.read_text_file(&path, None).await,
+                "read history for progress upgrade",
+            )?;
+            if <[u8; 32]>::from(Sha256::digest(content.as_bytes())) != expected {
+                return Err(SessionError::invalid_entry(
+                    "session history changed before progress upgrade; reopen session",
+                ));
+            }
+            let (header_line, body) = content.split_once('\n').ok_or_else(|| {
+                SessionError::invalid_entry("progress upgrade requires a complete header")
+            })?;
+            let header = parse_header(header_line).map_err(|e| invalid_file(&path, 1, &e))?;
+            if header.id != storage.metadata.id
+                || header.progress_format.is_some()
+                || header.version != 4
+            {
+                return Err(SessionError::invalid_entry(
+                    "session header changed before progress upgrade",
+                ));
+            }
+            // Preserve unknown header fields as well as every byte of the body.
+            let mut value: serde_json::Value = serde_json::from_str(header_line)
+                .map_err(|e| SessionError::invalid_entry(e.to_string()))?;
+            value["progressFormat"] = super::progress::FORMAT.into();
+            let upgraded = format!(
+                "{}\n{body}",
+                serde_json::to_string(&value).map_err(|e| SessionError::storage(e.to_string()))?
+            );
+            let progress = super::progress::JsonlProgressStore::new(
+                storage.fs.clone(),
+                &path,
+                &header.id,
+                storage.clock.clone(),
+            );
+            progress.initialize_legacy_upgrade().await?;
+            // Publication replaces the inode; never retain a cached append
+            // capability that could later write to the retired history file.
+            *storage.append.lock().await = None;
+            let history_path = path.clone();
+            publish_file_atomically(&storage.fs, &path, |fs, temp_path| {
+                Box::pin(async move {
+                    file_result(
+                        fs.write_file(temp_path, FileContent::Text(upgraded), None)
+                            .await,
+                        "stage progress upgrade header",
+                    )?;
+                    let current = file_result(
+                        fs.read_text_file(&history_path, None).await,
+                        "recheck history for progress upgrade",
+                    )?;
+                    if <[u8; 32]>::from(Sha256::digest(current.as_bytes())) != expected {
+                        return Err(SessionError::invalid_entry(
+                            "session history changed during progress upgrade; reopen session",
+                        ));
+                    }
+                    Ok(())
+                })
+            })
+            .await?;
+            storage.progress = progress;
+            storage.legacy_history_digest = None;
+            Ok(storage)
+        })
+        .await
+        .map_err(|e| SessionError::storage(format!("progress upgrade owner failed: {e}")))?
     }
 
     /// Fork into `path` by writing a fresh header then replaying the fork
@@ -1254,7 +1369,7 @@ fn is_assistant_frame_append(line: &str) -> bool {
 /// while populating leaves only the ignored `.tmp`. Per-destination
 /// serialization is the caller's responsibility (the storage holds its `tail`
 /// mutex; the repo holds its create-destination set).
-async fn publish_file_atomically<F>(
+pub(super) async fn publish_file_atomically<F>(
     fs: &Arc<dyn FileSystem>,
     destination_path: &str,
     populate: F,

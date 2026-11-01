@@ -72,6 +72,57 @@ impl JsonlProgressStore {
         state.progress = Some(progress);
         Ok(())
     }
+    /// For explicit legacy upgrade only. Never adopt or overwrite undeclared
+    /// payloads. A matching pristine checkpoint is the sole retryable remnant
+    /// of an interrupted two-file publication. This deliberately does not call
+    /// `load`, whose repair/normalization behavior could modify foreign data.
+    pub async fn initialize_legacy_upgrade(&self) -> SessionResult<()> {
+        if file_result(
+            self.fs.exists(&self.path, None).await,
+            "check legacy progress companion",
+        )? {
+            let bytes = file_result(
+                self.fs.read_binary_file(&self.path, None).await,
+                "read legacy progress companion",
+            )?;
+            // The normal reader requires exactly one JSONL checkpoint line.
+            // Whole-document JSON would also accept pretty printing or blank
+            // trailing lines that become unreadable after publishing the header.
+            if !bytes.ends_with(b"\n") || bytes[..bytes.len() - 1].contains(&b'\n') {
+                return Err(SessionError::invalid_entry(
+                    "undeclared progress companion is not a single checkpoint line",
+                ));
+            }
+            let mut checkpoint: Checkpoint = serde_json::from_slice(&bytes).map_err(|e| {
+                SessionError::invalid_entry(format!(
+                    "undeclared progress companion is not an empty checkpoint: {e}"
+                ))
+            })?;
+            if checkpoint.format != FORMAT
+                || checkpoint.session_id != self.session_id
+                || checkpoint.state.sequence != 0
+                || !checkpoint.state.frames.is_empty()
+            {
+                return Err(SessionError::invalid_entry(
+                    "undeclared progress companion is not a matching empty checkpoint",
+                ));
+            }
+            checkpoint.state.validate()?;
+            return Ok(());
+        }
+        let bytes = self.checkpoint(&ProgressState::default())?;
+        super::storage::publish_file_atomically(&self.fs, &self.path, |fs, temporary| {
+            Box::pin(async move {
+                file_result(
+                    fs.write_file(temporary, FileContent::Bytes(bytes), None)
+                        .await,
+                    "stage legacy progress companion",
+                )
+            })
+        })
+        .await
+    }
+
     async fn load(&self, state: &mut State) -> SessionResult<()> {
         if state.poisoned {
             return Err(SessionError::storage(
