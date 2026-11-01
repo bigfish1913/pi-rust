@@ -231,7 +231,7 @@ impl rpi_agent::AgentEmitter for HoldLifecycleInjection {
     fn emit(&self, event: rpi_agent::AgentEvent) -> futures::future::BoxFuture<'static, ()> {
         let entered = self.entered.clone();
         Box::pin(async move {
-            if matches!(event, rpi_agent::AgentEvent::MessageStart { message: AgentMessage::User(user) }
+            if matches!(event, rpi_agent::AgentEvent::MessageStart { message: AgentMessage::User(user), .. }
                 if user.content == rpi_ai::types::UserContent::Text("accepted-injection".into()))
             {
                 entered.notify_one();

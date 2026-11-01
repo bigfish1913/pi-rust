@@ -3,7 +3,30 @@
 //! Provides functions for text manipulation with ANSI awareness.
 
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+/// The widest display unit (grapheme cluster) in `text`, in cells.
+///
+/// A column narrower than this cannot be rendered: a two-cell glyph (CJK,
+/// emoji) never fits in a single cell, so `wrap_text_with_ansi` would emit a
+/// two-cell line inside a one-cell column and break the grid. The unit is a
+/// grapheme cluster, not a scalar: `👩‍💻` is one two-cell unit, while measuring
+/// its scalars would score `👩` and `💻` separately and could size the column
+/// for half of a sequence that cannot be split.
+pub fn widest_char_width(text: &str) -> usize {
+    let per_cluster = text
+        .graphemes(true)
+        .map(UnicodeWidthStr::width)
+        .max()
+        .unwrap_or(1);
+    // Keep the per-scalar fallback for text the cluster model under-measures.
+    let per_scalar = text
+        .chars()
+        .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+        .max()
+        .unwrap_or(1);
+    per_cluster.max(per_scalar).max(1)
+}
 
 /// Get the visible width of a string, ignoring ANSI escape sequences.
 pub fn visible_width(s: &str) -> usize {
@@ -13,6 +36,12 @@ pub fn visible_width(s: &str) -> usize {
     let mut width = 0;
     let mut in_escape = false;
     let mut chars = s.chars().peekable();
+    // The visible text between escape sequences is measured as one span.
+    // `UnicodeWidthStr` is not additive across grapheme boundaries: ZWJ and
+    // VS16 sequences, and script ligatures such as Arabic Lam-Alef, are
+    // narrower (or wider) as a whole than as a sum of their scalars, so
+    // summing per scalar mis-measured the string it was sizing.
+    let mut span = String::new();
 
     while let Some(c) = chars.next() {
         if in_escape {
@@ -52,6 +81,8 @@ pub fn visible_width(s: &str) -> usize {
 
         if c == '\x1b' {
             in_escape = true;
+            width += UnicodeWidthStr::width(span.as_str());
+            span.clear();
             continue;
         }
 
@@ -60,10 +91,10 @@ pub fn visible_width(s: &str) -> usize {
             continue;
         }
 
-        width += UnicodeWidthStr::width(c.to_string().as_str());
+        span.push(c);
     }
 
-    width
+    width + UnicodeWidthStr::width(span.as_str())
 }
 
 /// Slice a string by column positions, accounting for ANSI codes.
@@ -273,6 +304,11 @@ pub fn strip_ansi(s: &str) -> String {
 }
 
 /// Wrap text to fit within a maximum width, preserving ANSI codes.
+///
+/// Iteration is per grapheme cluster, not per scalar: a two-column sequence
+/// such as `👩‍💻` (ZWJ) or `👍🏽` (skin-tone modifier) is one display unit and
+/// must never be split across rows. Measuring its scalars individually gives
+/// 2 + 0 + 2, which used to emit `👩‍` on one row and `💻` on the next.
 pub fn wrap_text_with_ansi(s: &str, max_width: usize) -> Vec<String> {
     if max_width == 0 {
         return vec![String::new()];
@@ -284,22 +320,10 @@ pub fn wrap_text_with_ansi(s: &str, max_width: usize) -> Vec<String> {
     let mut in_escape = false;
     let mut pending_style = String::new();
 
-    for c in s.chars() {
-        if in_escape {
-            pending_style.push(c);
-            if c == '\x07' || (('@'..='~').contains(&c) && c != '[') {
-                in_escape = false;
-            }
-            continue;
-        }
-
-        if c == '\x1b' {
-            in_escape = true;
-            pending_style.push(c);
-            continue;
-        }
-
-        if c == '\n' {
+    for grapheme in s.graphemes(true) {
+        // CRLF segments as one grapheme but is a line break like a bare \n
+        // (a lone \r keeps the pre-existing contract: dropped as a control).
+        if grapheme == "\r\n" || grapheme == "\n" {
             if !pending_style.is_empty() {
                 current_line.push_str(&pending_style);
                 pending_style.clear();
@@ -310,28 +334,67 @@ pub fn wrap_text_with_ansi(s: &str, max_width: usize) -> Vec<String> {
             continue;
         }
 
-        if c < ' ' || c == '\x7f' {
+        // ESC starts its own cluster (controls segment apart), so the control
+        // filter must never swallow it; `in_escape` means the tail of a
+        // sequence is spread over the following clusters.
+        if !grapheme.starts_with('\x1b')
+            && !in_escape
+            && grapheme.chars().all(|c| c < ' ' || c == '\x7f')
+        {
             continue;
         }
 
-        let char_width = UnicodeWidthStr::width(c.to_string().as_str());
-
-        if current_width + char_width > max_width {
-            // Start a new line
+        // Split the cluster into ANSI control sequences and the printable
+        // remainder. A combining mark can share a cluster with an SGR
+        // terminator (`m` + U+0301): consuming the whole cluster at the `m`
+        // discarded the visible remainder, losing the accent.
+        let mut rest = grapheme;
+        loop {
+            if in_escape {
+                let mut consumed = 0;
+                for c in rest.chars() {
+                    consumed += c.len_utf8();
+                    pending_style.push(c);
+                    if c == '\x07' || (('@'..='~').contains(&c) && c != '[') {
+                        in_escape = false;
+                        break;
+                    }
+                }
+                rest = &rest[consumed..];
+                if in_escape {
+                    // The sequence continues in the next cluster.
+                    break;
+                }
+            }
+            if rest.starts_with('\x1b') {
+                in_escape = true;
+                pending_style.push('\x1b');
+                rest = &rest[1..];
+                continue;
+            }
+            if rest.is_empty() {
+                break;
+            }
+            // Printable remainder (zero-width marks included): it is the tail
+            // of one display unit and is never split further.
+            let cluster_width = UnicodeWidthStr::width(rest);
+            if current_width + cluster_width > max_width && current_width > 0 && cluster_width > 0 {
+                // Start a new line
+                if !pending_style.is_empty() {
+                    current_line.push_str(&pending_style);
+                }
+                lines.push(current_line);
+                current_line = String::new();
+                current_width = 0;
+            }
             if !pending_style.is_empty() {
                 current_line.push_str(&pending_style);
+                pending_style.clear();
             }
-            lines.push(current_line);
-            current_line = String::new();
-            current_width = 0;
+            current_line.push_str(rest);
+            current_width += cluster_width;
+            break;
         }
-
-        if !pending_style.is_empty() {
-            current_line.push_str(&pending_style);
-            pending_style.clear();
-        }
-        current_line.push(c);
-        current_width += char_width;
     }
 
     if !current_line.is_empty() {
@@ -461,6 +524,84 @@ mod tests {
         assert_eq!(visible_width("Hello"), 5);
         assert_eq!(visible_width("\x1b[31mHello\x1b[0m"), 5);
         assert_eq!(visible_width("你好"), 4); // Chinese characters are wide
+    }
+
+    #[test]
+    fn test_visible_width_measures_sequences_as_whole_spans() {
+        // Each of these is one display unit of two columns. Summing the
+        // scalars instead gave 4 for the ZWJ and skin-tone sequences and 1 for
+        // the VS16 sequence, so callers sizing a column mis-measured the text.
+        for seq in ["👩‍💻", "👍🏽", "❤️"] {
+            assert_eq!(visible_width(seq), 2, "{seq:?} is a 2-column unit");
+        }
+        // A script ligature is narrower as a whole than as a sum of graphemes.
+        assert_eq!(visible_width("لا"), 1);
+        // The span restarts at an escape sequence, so styles do not merge the
+        // text on either side of them into one measurement.
+        assert_eq!(visible_width("\x1b[1m👩‍💻\x1b[0m"), 2);
+        assert_eq!(visible_width("a\x1b[1m👩‍💻\x1b[0mb"), 4);
+    }
+
+    #[test]
+    fn test_widest_char_width_uses_grapheme_clusters() {
+        // The floor for a table column is the widest indivisible unit. `❤️` is
+        // a 2-column unit whose widest scalar (U+2764) measures 1, so a column
+        // floored on scalars would under-reserve it and the sequence would
+        // spill past the cell border.
+        assert_eq!(widest_char_width("❤️"), 2);
+        assert_eq!(widest_char_width("👩‍💻"), 2);
+        // A one-column ligature must not be inflated to two.
+        assert_eq!(widest_char_width("لا"), 1);
+        assert_eq!(widest_char_width("你好"), 2);
+        assert_eq!(widest_char_width("abc"), 1);
+        // A column can never be zero cells wide.
+        assert_eq!(widest_char_width("\u{200b}"), 1);
+    }
+
+    #[test]
+    fn test_wrap_text_never_splits_a_sequence() {
+        for seq in ["👩‍💻", "👍🏽", "❤️"] {
+            // Width 2 is the exact cluster width: it must fit on one line.
+            let lines = wrap_text_with_ansi(&format!("a{seq}b"), 3);
+            assert!(
+                lines.iter().any(|l| l.contains(seq)),
+                "{seq:?} was split: {lines:?}"
+            );
+            assert!(
+                lines.iter().all(|l| visible_width(l) <= 3),
+                "{seq:?} overflowed the wrap width: {lines:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wrap_preserves_crlf_line_breaks() {
+        // CRLF segments as one grapheme; dropping it as controls glued the
+        // rows together ("firstsecond"), losing the newline contract the
+        // per-char wrapper had.
+        assert_eq!(
+            wrap_text_with_ansi("first\r\nsecond", 80),
+            ["first", "second"]
+        );
+        // A bare \r keeps the existing contract: dropped as a control.
+        assert_eq!(wrap_text_with_ansi("first\rsecond", 80), ["firstsecond"]);
+    }
+
+    #[test]
+    fn wrap_keeps_visible_tail_after_an_ansi_sequence_inside_a_cluster() {
+        // A combining mark can share a cluster with the SGR terminator (`m` +
+        // U+0301); consuming the whole cluster at the `m` lost the accent.
+        let lines = wrap_text_with_ansi("a\x1b[31m\u{301}b", 80);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains('\u{301}'),
+            "combining mark after SGR was dropped: {lines:?}"
+        );
+        // A sequence spanning clusters still terminates correctly.
+        assert_eq!(
+            strip_ansi(&wrap_text_with_ansi("\x1b[31mred\x1b[0m", 80).join("")),
+            "red"
+        );
     }
 
     #[test]

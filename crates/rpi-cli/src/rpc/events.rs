@@ -22,6 +22,7 @@ pub(crate) fn encode(
     let AgentEvent::MessageUpdate {
         message,
         assistant_message_event,
+        message_id,
     } = event
     else {
         return serde_json::to_vec(&project(event));
@@ -59,13 +60,17 @@ pub(crate) fn encode(
                 nested["toolName"] = serde_json::json!(call.name);
             }
         }
-        return serde_json::to_vec(&serde_json::json!({
+        let mut value = serde_json::json!({
             "type": "message_update",
             "assistantMessageEvent": nested,
             "eventType": assistant_message_event.type_tag(),
             "contentIndex": index,
             "delta": delta,
-        }));
+        });
+        if let Some(id) = message_id {
+            value["messageId"] = serde_json::json!(id);
+        }
+        return serde_json::to_vec(&value);
     }
     // Value normalizes Content's internally tagged markers just like the legacy
     // projection. Serialize this normalized snapshot once and reuse its bytes.
@@ -96,6 +101,10 @@ pub(crate) fn encode(
     out.extend_from_slice(&index);
     out.extend_from_slice(br#", "delta":"#);
     out.extend_from_slice(&delta);
+    if let Some(id) = message_id {
+        out.extend_from_slice(br#","messageId":"#);
+        out.extend_from_slice(&serde_json::to_vec(id)?);
+    }
     out.push(b'}');
     Ok(out)
 }
@@ -147,6 +156,7 @@ mod tests {
                 },
             ] {
                 let event = AgentEvent::MessageUpdate {
+                    message_id: Some("entry-\"🐈".into()),
                     message: Arc::clone(&message),
                     assistant_message_event: event,
                 };
@@ -210,6 +220,7 @@ mod tests {
                             };
                             encode(
                                 &AgentEvent::MessageUpdate {
+                                    message_id: Some("entry-\"🐈".into()),
                                     message: message.clone(),
                                     assistant_message_event: delta,
                                 },
@@ -305,15 +316,18 @@ mod tests {
             let mut events: Vec<_> = events
                 .into_iter()
                 .map(|assistant_message_event| AgentEvent::MessageUpdate {
+                    message_id: Some("entry-\"🐈".into()),
                     message: message.clone(),
                     assistant_message_event,
                 })
                 .collect();
             events.extend([
                 AgentEvent::MessageStart {
+                    message_id: Some("entry-1".into()),
                     message: final_message.clone(),
                 },
                 AgentEvent::MessageEnd {
+                    message_id: Some("entry-1".into()),
                     message: final_message.clone(),
                 },
                 AgentEvent::TurnEnd {
@@ -347,6 +361,7 @@ mod tests {
             AgentEvent::TurnStart,
             AgentEvent::AgentEnd { messages: vec![] },
             AgentEvent::MessageEnd {
+                message_id: Some("entry-1".into()),
                 message: rpi_ai::UserMessage::new("hello", 0).into(),
             },
         ] {

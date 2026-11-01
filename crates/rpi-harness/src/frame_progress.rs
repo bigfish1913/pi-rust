@@ -1181,6 +1181,7 @@ impl AgentEmitter for FrameRecordingEmitter {
             match &event {
                 AgentEvent::MessageStart {
                     message: AgentMessage::Assistant(assistant),
+                    ..
                 } => {
                     let start = AssistantMessageEvent::Start {
                         partial: Arc::new((**assistant).clone()),
@@ -1195,6 +1196,7 @@ impl AgentEmitter for FrameRecordingEmitter {
                 }
                 AgentEvent::MessageEnd {
                     message: AgentMessage::Assistant(_),
+                    ..
                 } => {
                     shared.state.lock().unwrap().current = None;
                 }
@@ -1202,6 +1204,13 @@ impl AgentEmitter for FrameRecordingEmitter {
             }
             inner.emit(event).await;
         })
+    }
+
+    fn emit_injected(&self, event: AgentEvent) -> BoxFuture<'static, ()> {
+        // Queue deliveries are already complete messages, not provider streams.
+        // SettlingEmitter preserves this explicit marker after assigning IDs;
+        // public message_id metadata must never decide whether frames record.
+        self.inner.emit_injected(event)
     }
 
     fn try_emit(&self, event: AgentEvent) {
@@ -1239,6 +1248,7 @@ mod volatile_tests {
     fn events() -> Vec<AgentEvent> {
         let mut message = AssistantMessage::empty(Api::Faux, "faux", "m", 42);
         let mut events = vec![AgentEvent::MessageStart {
+            message_id: None,
             message: message.clone().into(),
         }];
         // Start snapshots may already cover a delta not yet observed by the
@@ -1246,6 +1256,7 @@ mod volatile_tests {
         message.content.push(Content::text("ahead"));
         let partial = Arc::new(message.clone());
         events.push(AgentEvent::MessageUpdate {
+            message_id: None,
             message: Arc::clone(&partial),
             assistant_message_event: AssistantMessageEvent::TextStart {
                 content_index: 0,
@@ -1260,6 +1271,7 @@ mod volatile_tests {
             }
             let partial = Arc::new(message.clone());
             events.push(AgentEvent::MessageUpdate {
+                message_id: None,
                 message: Arc::clone(&partial),
                 assistant_message_event: AssistantMessageEvent::TextDelta {
                     content_index: 0,
@@ -1303,6 +1315,38 @@ mod volatile_tests {
                 .is_empty());
         }
     }
+    #[tokio::test]
+    async fn reserved_identity_survives_binding_before_first_frame_in_both_modes() {
+        for volatile in [false, true] {
+            let session = session(volatile);
+            bind_stream_entry(&session, "main", "run", 0, "live-id")
+                .await
+                .unwrap();
+            let recorder = FrameRecordingEmitter::new(
+                Arc::new(CollectorEmitter::default()),
+                session.clone(),
+                "main",
+                "run",
+            );
+            for mut event in events() {
+                match &mut event {
+                    AgentEvent::MessageStart { message_id, .. }
+                    | AgentEvent::MessageUpdate { message_id, .. }
+                    | AgentEvent::MessageEnd { message_id, .. } => {
+                        *message_id = Some("live-id".into());
+                    }
+                    _ => {}
+                }
+                recorder.emit(event).await;
+            }
+            recorder.flush().await.unwrap();
+            let recovered = replay_run_streams(&session, "run").await.unwrap();
+            assert_eq!(recovered.len(), 1);
+            assert_eq!(recovered[0].entry_id.as_deref(), Some("live-id"));
+            assert!(!recovered[0].message.content.is_empty());
+        }
+    }
+
     #[tokio::test]
     async fn volatile_bindings_clear_and_storage_switch_preserve_commit_boundaries() {
         for volatile in [false, true] {

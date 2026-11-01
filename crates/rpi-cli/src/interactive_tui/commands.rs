@@ -317,27 +317,62 @@ impl SlashCommand for ThemeCommand {
         "Choose a theme (selector)"
     }
     fn execute(&self, ctx: &CommandContext, args: &str) {
-        let name = args.trim().to_ascii_lowercase();
-        if !name.is_empty() {
+        let arg = args.trim();
+        if !arg.is_empty() {
             // /theme <name> — direct apply + persist (matches /settings Theme).
-            let preset = match name.as_str() {
-                "light" => ThemePreset::Light,
-                "monochrome" => ThemePreset::Monochrome,
-                "dark" => ThemePreset::Dark,
-                _ => {
-                    add_error_message(
-                        &ctx.chat,
-                        &format!("Unknown theme \"{name}\". Valid: dark, light, monochrome."),
-                    );
-                    ctx.tui.request_render(false);
-                    return;
-                }
+            // Resolution lives in `resolve_command_theme`: presets case-fold,
+            // custom themes keep the original case (registry lookup is
+            // case-sensitive, discovery preserves file stems).
+            let registry = ctx
+                .state
+                .theme_registry
+                .read()
+                .ok()
+                .map(|registry| registry.clone());
+            let resolved = crate::themes::resolve_command_theme(arg, registry.as_ref());
+            let Some(spec) = resolved else {
+                add_error_message(
+                    &ctx.chat,
+                    &format!(
+                        "Unknown theme \"{arg}\". Valid: dark, light, monochrome, or a discovered theme."
+                    ),
+                );
+                ctx.tui.request_render(false);
+                return;
             };
-            apply_theme_preset(preset);
-            let mut settings = crate::settings::load_settings().unwrap_or_default();
-            settings.theme = Some(name.clone());
-            let _ = crate::settings::save_settings(&settings);
-            add_note_message(&ctx.chat, &format!("Theme set to {name} (saved)."));
+            let registry = ctx
+                .state
+                .theme_registry
+                .read()
+                .ok()
+                .map(|registry| registry.clone());
+            match crate::themes::apply_and_persist(
+                &spec,
+                &ctx.state.theme_manager,
+                registry.as_ref(),
+            ) {
+                Ok(message) => {
+                    ctx.state.set_active_theme_spec(Some(spec.clone()));
+                    let registry_now = ctx
+                        .state
+                        .theme_registry
+                        .read()
+                        .ok()
+                        .map(|registry| registry.clone());
+                    let chat_watcher = ctx.chat.clone();
+                    if let Some(registry_now) = registry_now.as_ref() {
+                        crate::themes::restart_theme_watcher(
+                            &ctx.state.theme_watcher,
+                            Some(&spec),
+                            registry_now,
+                            &ctx.state.theme_manager,
+                            theme_watch_notify(chat_watcher, ctx.tui.clone()),
+                        );
+                    }
+                    add_note_message(&ctx.chat, &message);
+                }
+                Err(message) => add_error_message(&ctx.chat, &message),
+            }
             ctx.tui.request_render(false);
             ctx.tui.render_now(true);
             return;

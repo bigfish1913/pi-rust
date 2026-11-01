@@ -11,6 +11,15 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+### Changed
+
+- *(tui)* pasted tabs now expand to the next 8-column tab stop (counting wide chars as 2 columns, resetting at each newline) instead of a fixed four spaces, so a paste lines up with how the source it was copied from renders it; text that relied on "tab = exactly four spaces" changes what gets sent
+
+### Fixed
+
+- *(tui)* markdown table cells wrap without splitting a displayed Unicode sequence: `wrap_text_with_ansi`, `visible_width` and the per-column width floor now measure grapheme clusters (and whole ANSI-free spans) instead of summing scalars, so a ZWJ sequence (`👩‍💻`), a skin-tone modifier (`👍🏽`) or a VS16 sequence (`❤️`) stays on one row at ordinary and narrow terminal widths
+- *(tui)* pasted tab stops are measured on each complete tab-free span, so a tab after a width-sensitive Unicode sequence (`❤️`, `👩‍💻`, `👍🏽`) or a cross-grapheme ligature (Arabic Lam-Alef `لا`) lands on the same column the terminal shows instead of one or two columns off
+
 ## [0.15.0](https://github.com/bigfish1913/pi-rust/compare/v0.14.0...v0.15.0) - 2026-10-30
 
 ### Added

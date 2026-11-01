@@ -48,7 +48,7 @@ impl MessageAccumulator {
             | RemoteEvent::RetryScheduled { .. }
             | RemoteEvent::TurnStart
             | RemoteEvent::TurnEnd { .. } => self.reset(),
-            RemoteEvent::MessageStart { message } => {
+            RemoteEvent::MessageStart { message, .. } => {
                 self.reset();
                 self.snapshot(message);
             }
@@ -59,6 +59,7 @@ impl MessageAccumulator {
                 event_type,
                 content_index,
                 delta,
+                ..
             } => {
                 let kind = if event_type.is_empty() {
                     nested.get("type").and_then(Value::as_str).unwrap_or("")

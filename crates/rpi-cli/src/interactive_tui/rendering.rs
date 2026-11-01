@@ -542,6 +542,26 @@ pub(super) fn add_note_message(container: &Arc<Container>, text: &str) {
     container.add_child(Arc::new(Spacer::new(1)));
 }
 
+/// Build the theme-watcher notify closure: append the reload notice to the
+/// transcript and force a full content repaint. Appending alone never requests
+/// a frame and the scheduler only paints idle sessions on size/status changes,
+/// so without the repaint a background reload (or its parse error) stays
+/// invisible until the next interaction repaints the screen.
+pub(super) fn theme_watch_notify(
+    chat: Arc<Container>,
+    tui: Arc<TuiAltScreen>,
+) -> impl Fn(Result<String, String>) + Send + Sync + 'static {
+    move |result| {
+        match result {
+            Ok(message) => add_note_message(&chat, &message),
+            Err(message) => add_error_message(&chat, &message),
+        }
+        // A full repaint (not scroll-cache reuse) so already-styled
+        // transcript rows pick up the new palette too.
+        tui.request_render(true);
+    }
+}
+
 /// Add an explicit skill activation notice to the transcript.
 pub(super) fn add_skill_activation_message(container: &Arc<Container>, name: &str) {
     let c = current_theme().colors;

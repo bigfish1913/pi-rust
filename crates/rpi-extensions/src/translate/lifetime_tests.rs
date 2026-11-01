@@ -8,6 +8,7 @@ fn unobserved_events_are_not_serialized_and_stale_payloads_are_freed_once() {
     let snapshot = Arc::new(registry.snapshot());
     let emitter = ExtensionEmitter::new(snapshot.clone(), crate::PluginKeepalive::empty());
     let event = AgentEvent::MessageEnd {
+        message_id: None,
         message: rpi_ai::UserMessage::new("large payload".repeat(1000), 0).into(),
     };
     let before = TRANSLATED_EVENTS.with(|count| count.get());

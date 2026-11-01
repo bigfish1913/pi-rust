@@ -68,6 +68,56 @@ use rpi_extensions::{
     PluginDiagnostics, PluginToolAdapter, TeeEmitter, ToolPromptMetadata,
 };
 
+// Preserve the existing public modes::rpc signature. This CLI-only attachment
+// table holds no session/router alive and keys by storage allocation identity,
+// NOT by a durable ID (two independent restored hosts must never share routing).
+// The session/tools/ReloadContext own the actual router. RPC owns its client.
+// Reload MUST reuse ReloadContext::file_io, including a disconnected selected
+// client backend; rebuilding a default router would silently restore host file
+// authority. Missing attachments reject configuration (never infer a router or
+// install host-backed replacements). This compatibility bridge can be replaced
+// by an explicit neutral harness attachment when its public API is revised.
+type FileIOAttachment = (
+    std::sync::Weak<dyn rpi_harness::session::types::SessionStorage>,
+    std::sync::Weak<rpi_tools::file_io::FileIORouter>,
+);
+fn file_io_attachments() -> &'static Mutex<Vec<FileIOAttachment>> {
+    static ATTACHMENTS: std::sync::OnceLock<Mutex<Vec<FileIOAttachment>>> =
+        std::sync::OnceLock::new();
+    ATTACHMENTS.get_or_init(|| Mutex::new(Vec::new()))
+}
+pub(crate) fn register_file_io_router(
+    harness: &AgentHarness,
+    router: &Arc<rpi_tools::file_io::FileIORouter>,
+) {
+    let storage = harness.session().storage();
+    let mut attachments = file_io_attachments()
+        .lock()
+        .expect("file I/O attachments poisoned");
+    attachments.retain(|(s, r)| {
+        s.strong_count() > 0
+            && r.strong_count() > 0
+            && !s
+                .upgrade()
+                .is_some_and(|known| Arc::ptr_eq(&known, &storage))
+    });
+    attachments.push((Arc::downgrade(&storage), Arc::downgrade(router)));
+}
+pub(crate) fn file_io_router(
+    harness: &AgentHarness,
+) -> Option<Arc<rpi_tools::file_io::FileIORouter>> {
+    let storage = harness.session().storage();
+    let mut attachments = file_io_attachments()
+        .lock()
+        .expect("file I/O attachments poisoned");
+    attachments.retain(|(s, r)| s.strong_count() > 0 && r.strong_count() > 0);
+    attachments.iter().find_map(|(s, r)| {
+        s.upgrade()
+            .filter(|known| Arc::ptr_eq(known, &storage))
+            .and_then(|_| r.upgrade())
+    })
+}
+
 /// The coding tools registered by the CLI by default.
 pub const BUILTIN_TOOL_NAMES: &[&str] = &["read", "bash", "edit", "write", "docs"];
 
@@ -520,7 +570,9 @@ pub async fn build_prepared(
     let _registry = Arc::new(MutationQueueRegistry::new());
     // `env_dyn` is shared between the tool context (moved in) and the resource
     // loaders below (borrowed); clone one branch so both hold a reference.
-    let ctx = ExecutionToolContext::new(env_dyn.clone(), Some(mut_env));
+    let file_io = Arc::new(rpi_tools::file_io::FileIORouter::new());
+    let ctx =
+        ExecutionToolContext::new(env_dyn.clone(), Some(mut_env)).with_file_io(file_io.clone());
 
     let mut tools = build_tools(&ctx, args);
 
@@ -989,6 +1041,7 @@ pub async fn build_prepared(
     };
 
     install_extension_settlement_bridge(harness.events(), extension_session_cell.clone());
+    register_file_io_router(&harness, &file_io);
 
     // ---- Durable operation recovery (runtime layer) ----
     // A previous process can die between `operation_started` and
@@ -1047,11 +1100,13 @@ pub async fn build_prepared(
         extension_session: extension_session_cell,
         action_bridge: Arc::new(Mutex::new(Some(Arc::clone(&action_bridge)))),
         tool_context,
+        file_io,
         catalog: Arc::new(std::sync::RwLock::new(catalog)),
         providers: Arc::new(std::sync::RwLock::new(resolved.providers.clone())),
         runtime: runtime.clone(),
         cwd: cwd.to_path_buf(),
         project_trusted,
+        discovered_theme_paths: Arc::new(std::sync::Mutex::new(discovered.theme_paths.clone())),
         args: reload_args,
         resolved_model: resolved.model.clone(),
         broadcast: broadcast_for_context,
@@ -1185,6 +1240,8 @@ pub type ActionBridgeCell = Arc<Mutex<Option<Arc<rpi_extensions::ActionBridge>>>
 /// reload callback without borrowing the harness).
 #[derive(Clone)]
 pub struct ReloadContext {
+    /// One neutral router for all built-ins, including those reconstructed on reload.
+    pub file_io: Arc<rpi_tools::file_io::FileIORouter>,
     /// The live extension-session cell (swapped on reload).
     pub extension_session: ExtensionSessionCell,
     /// The session's plugin-tool context (`cwd` + session id), reused — not
@@ -1220,6 +1277,11 @@ pub struct ReloadContext {
     /// Startup consumers reuse this value so extension code cannot change the
     /// effective policy by mutating the process cwd while it is loading.
     pub project_trusted: bool,
+    /// Theme file paths contributed by extensions via `resources_discover`,
+    /// shared so the TUI theme registry can merge them. Filled at startup,
+    /// replaced on every `/reload` (paths are unattributed — the v1 divergence
+    /// documented in `rpi-extensions::resources`).
+    pub discovered_theme_paths: Arc<std::sync::Mutex<Vec<String>>>,
     /// The parsed args (cloned) — `--no-*`/`--tools`/`--exclude-tools`/
     /// `--extensions-dir`/`--no-extensions`/`--system-prompt`/etc all apply on
     /// reload exactly as at startup (a reload re-reads the same flags; it does
@@ -1341,6 +1403,11 @@ pub struct ReloadOutcome {
     /// settings reload errored) and the previous resources were kept. Soft
     /// diagnostics (skill shadowing, name validation) do not set this.
     pub had_errors: bool,
+    /// The project-trust policy this reload actually resolved and applied.
+    /// `None` when the reload failed hard and kept the previous resources, so
+    /// consumers (e.g. theme discovery) should stay on the snapshot they
+    /// already match instead of re-reading a stale startup bool.
+    pub project_trusted: Option<bool>,
 }
 
 struct PreparedReloadInputs {
@@ -1411,6 +1478,7 @@ where
                 had_warnings: true,
                 details: Vec::new(),
                 had_errors: true,
+                project_trusted: None,
             };
         }
     }
@@ -1426,6 +1494,7 @@ where
                 had_warnings: true,
                 details: Vec::new(),
                 had_errors: true,
+                project_trusted: None,
             };
         }
     };
@@ -1451,6 +1520,7 @@ where
             had_warnings: true,
             details: vec![reason],
             had_errors: true,
+            project_trusted: None,
         };
     }
 
@@ -1548,6 +1618,7 @@ where
                         current.provider
                     )],
                     had_errors: true,
+                    project_trusted: None,
                 };
             }
             args.provider = Some(current.provider.clone());
@@ -1570,6 +1641,7 @@ where
                     had_warnings: true,
                     details: vec![error.to_string()],
                     had_errors: true,
+                    project_trusted: None,
                 }
             }
         }
@@ -1613,6 +1685,11 @@ where
         .snapshot_arc()
         .map(|snap| rpi_extensions::emit_resources_discover(&cwd_str, "reload", &snap))
         .unwrap_or_default();
+    // Publish the fresh theme paths so the TUI registry rebuild sees the same
+    // set the skill/prompt loaders just consumed.
+    if let Ok(mut guard) = ctx.discovered_theme_paths.lock() {
+        *guard = discovered.theme_paths.clone();
+    }
 
     // ---- 4. Re-run the Part-A loaders (same precedence + --no-* gates) ----
     let env = Arc::new(rpi_tools::OsExecutionEnv::with_cwd(ctx.cwd.clone()));
@@ -1722,7 +1799,8 @@ where
     // on top, mirroring `build`. Built before the
     // prompt so the prompt lists exactly the active tools.
     let mut_env: Arc<dyn rpi_tools::MutatingEnv> = env.clone();
-    let tool_ctx = rpi_tools::ExecutionToolContext::new(env_dyn.clone(), Some(mut_env));
+    let tool_ctx = rpi_tools::ExecutionToolContext::new(env_dyn.clone(), Some(mut_env))
+        .with_file_io(ctx.file_io.clone());
     let mut tools = build_tools(&tool_ctx, &effective_args);
     merge_extension_tools(
         &mut tools,
@@ -1869,6 +1947,7 @@ where
         // Reload completed; any diagnostics here are soft (shadowing / name
         // validation / skipped optional resources), not hard failures.
         had_errors: false,
+        project_trusted: Some(project_trusted),
     }
 }
 
@@ -4244,6 +4323,10 @@ mod tests {
         assert!(outcome.had_warnings);
         assert!(outcome.summary.contains("Settings reload failed"));
         assert!(outcome.summary.contains("could not load global settings"));
+        // Hard failure keeps the previous resources; the outcome must not
+        // advertise a fresh trust policy either (theme discovery keeps the
+        // registry it already matches).
+        assert_eq!(outcome.project_trusted, None);
         assert_eq!(harness.get_resources().await.unwrap(), before_resources);
         assert_eq!(harness.get_system_prompt().await.unwrap(), before_prompt);
         let after_tools: Vec<String> = harness
@@ -4262,6 +4345,63 @@ mod tests {
             .unwrap()
             .clone();
         assert!(Arc::ptr_eq(&after_bridge, &before_bridge));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reload_outcome_carries_the_current_project_trust() {
+        struct RestoreConfigDir(Option<std::ffi::OsString>);
+
+        impl Drop for RestoreConfigDir {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var(crate::config::CONFIG_DIR_ENV, value),
+                    None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
+                }
+            }
+        }
+
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        let _restore = RestoreConfigDir(std::env::var_os(crate::config::CONFIG_DIR_ENV));
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = tmp.path().join("agent");
+        let cwd = tmp.path().join("project");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
+
+        // Startup snapshot: trusted.
+        crate::config::set_project_trust(&cwd, Some(true)).unwrap();
+        let resolved = crate::provider::resolve(
+            Some("anthropic"),
+            Some(crate::provider::DEFAULT_MODEL_ID),
+            None,
+            Some("test-key"),
+            None,
+        )
+        .unwrap();
+        let args = Args {
+            no_session: true,
+            no_extensions: true,
+            no_prompt_templates: true,
+            no_context_files: true,
+            system_prompt: Some("stable system prompt".into()),
+            ..Args::default()
+        };
+        let (harness, _events, context) = build(&resolved, &args, &cwd, true).await.unwrap();
+        assert!(context.project_trusted, "startup snapshot is trusted");
+
+        // /trust no, then /reload: the outcome must report the CURRENT
+        // decision, not the immutable startup snapshot.
+        crate::config::set_project_trust(&cwd, Some(false)).unwrap();
+        let outcome = reload_extension_resources(&harness, &context).await;
+        assert!(!outcome.had_errors, "{}", outcome.summary);
+        assert_eq!(outcome.project_trusted, Some(false));
+
+        // And the opposite transition back to trusted.
+        crate::config::set_project_trust(&cwd, Some(true)).unwrap();
+        let outcome = reload_extension_resources(&harness, &context).await;
+        assert!(!outcome.had_errors, "{}", outcome.summary);
+        assert_eq!(outcome.project_trusted, Some(true));
     }
 
     #[test]

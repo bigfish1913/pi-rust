@@ -397,6 +397,7 @@ async fn timeout_and_output_limits_are_terminal() {
     timed.state.lock().unwrap().status = "running";
     let message = Arc::new(faux_assistant_message("", StopReason::Stop));
     timed.observe(AgentEvent::MessageUpdate {
+        message_id: None,
         message: message.clone(),
         assistant_message_event: AssistantMessageEvent::TextDelta {
             content_index: 0,

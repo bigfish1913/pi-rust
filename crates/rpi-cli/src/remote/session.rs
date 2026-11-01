@@ -268,7 +268,7 @@ impl RemoteSession {
                 ));
             }
             RemoteEvent::TurnStart | RemoteEvent::TurnEnd { .. } => {}
-            RemoteEvent::MessageStart { message } => {
+            RemoteEvent::MessageStart { message, .. } => {
                 if message_role(message) == "assistant" {
                     // If the previous assistant item is still open with no
                     // content, reuse it; otherwise start a new block.
@@ -276,7 +276,7 @@ impl RemoteSession {
                     self.open_thinking = None;
                 }
             }
-            RemoteEvent::MessageEnd { message } => {
+            RemoteEvent::MessageEnd { message, .. } => {
                 if message_role(message) == "assistant" {
                     let text = message_text(message);
                     if let Some(index) = self.open_assistant.take() {

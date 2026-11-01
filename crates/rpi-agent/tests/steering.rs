@@ -170,7 +170,7 @@ async fn steering_injected_after_tool_batch_completes() {
     let seq: Vec<String> = events
         .iter()
         .filter_map(|e| match e {
-            AgentEvent::MessageStart { message } => match message {
+            AgentEvent::MessageStart { message, .. } => match message {
                 rpi_agent::AgentMessage::ToolResult(t) => Some(format!("tool:{}", t.tool_call_id)),
                 rpi_agent::AgentMessage::User(u) => u.content.as_text().map(|s| s.to_string()),
                 _ => None,

@@ -25,7 +25,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::env::FileContent;
 use crate::error::{FileError, FileErrorCode};
-use crate::file_mutation_queue::{with_file_mutation_queue, MutatingEnv};
+use crate::file_io::{
+    resolve_client_path, with_tool_mutation_queue, FileIOOperation, FileIOReadRange, FileIORouter,
+};
+use crate::file_mutation_queue::MutatingEnv;
 use crate::path_utils::resolve_tool_path;
 use crate::tools::edit_diff::{
     apply_edits_to_normalized_content, detect_line_ending, generate_diff_string,
@@ -67,6 +70,7 @@ pub struct EditToolDetails {
 pub struct EditTool {
     schema: Tool,
     env: Arc<dyn MutatingEnv>,
+    file_io: Option<Arc<FileIORouter>>,
 }
 
 impl EditTool {
@@ -95,6 +99,7 @@ pub fn create_edit_tool(context: &ExecutionToolContext) -> Arc<dyn AgentTool> {
     Arc::new(EditTool {
         schema: EditTool::schema(),
         env,
+        file_io: context.file_io().cloned(),
     })
 }
 
@@ -140,15 +145,33 @@ impl AgentTool for EditTool {
         let path_for_msg = path.clone();
         let edits_count = edits.len();
 
-        let abs = resolve_tool_path(self.env.as_env(), &path, Some(&signal))
-            .await
-            .map_err(file_err_to_agent)?;
+        let client = match &self.file_io {
+            Some(router) => router
+                .select(FileIOOperation::Edit)
+                .await
+                .map_err(|e| file_err_to_agent(e.into()))?,
+            None => None,
+        };
+        let abs = if client.is_some() {
+            resolve_client_path(self.env.as_env().cwd(), &path)
+                .map_err(|e| file_err_to_agent(e.into()))?
+        } else {
+            resolve_tool_path(self.env.as_env(), &path, Some(&signal))
+                .await
+                .map_err(file_err_to_agent)?
+        };
         let abs_str = abs.clone();
+        let client_selected = client.is_some();
 
         let env = self.env.clone();
         let env_ref = env.clone();
         let abs_for_closure = abs_str.clone();
-        let apply_result: Result<ApplyResult, FileError> = with_file_mutation_queue(
+        let apply_result: Result<ApplyResult, FileError> = with_tool_mutation_queue(
+            if client_selected {
+                self.file_io.as_deref()
+            } else {
+                None
+            },
             &*env_ref,
             &abs_str,
             &signal,
@@ -159,18 +182,25 @@ impl AgentTool for EditTool {
                 let abs_str = abs_for_closure.clone();
                 async move {
                     check_abort(cancel)?;
-                    // FileInfo: must be a file or symlink.
-                    let info = env.as_env().file_info(&abs_str, Some(cancel)).await?;
-                    if !matches!(
-                        info.kind,
-                        crate::env::FileKind::File | crate::env::FileKind::Symlink
-                    ) {
-                        return Err(FileError::new(
-                            FileErrorCode::Invalid,
-                            format!("Could not edit file: {path}. Path is not a file."),
-                        ));
-                    }
-                    let read = env.as_env().read_text_file(&abs_str, Some(cancel)).await?;
+                    let read = if let Some(client) = &client {
+                        client
+                            .read_text(&abs_str, FileIOReadRange::Complete, cancel)
+                            .await
+                            .map_err(FileError::from)?
+                    } else {
+                        // Local authority retains its original FileInfo check.
+                        let info = env.as_env().file_info(&abs_str, Some(cancel)).await?;
+                        if !matches!(
+                            info.kind,
+                            crate::env::FileKind::File | crate::env::FileKind::Symlink
+                        ) {
+                            return Err(FileError::new(
+                                FileErrorCode::Invalid,
+                                format!("Could not edit file: {path}. Path is not a file."),
+                            ));
+                        }
+                        env.as_env().read_text_file(&abs_str, Some(cancel)).await?
+                    };
                     check_abort(cancel)?;
 
                     let bom_res = strip_bom(&read);
@@ -185,9 +215,16 @@ impl AgentTool for EditTool {
                         "{bom}{}",
                         restore_line_endings(&apply.new_content, original_ending)
                     );
-                    env.as_env()
-                        .write_file(&abs_str, FileContent::Text(final_content), Some(cancel))
-                        .await?;
+                    if let Some(client) = &client {
+                        client
+                            .write_text(&abs_str, final_content, cancel)
+                            .await
+                            .map_err(FileError::from)?;
+                    } else {
+                        env.as_env()
+                            .write_file(&abs_str, FileContent::Text(final_content), Some(cancel))
+                            .await?;
+                    }
                     check_abort(cancel)?;
                     Ok(apply)
                 }

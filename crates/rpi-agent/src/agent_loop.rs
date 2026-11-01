@@ -99,6 +99,7 @@ pub async fn run_agent_loop(
         emit_event(
             &emit,
             AgentEvent::MessageStart {
+                message_id: None,
                 message: prompt.clone(),
             },
         )
@@ -106,6 +107,7 @@ pub async fn run_agent_loop(
         emit_event(
             &emit,
             AgentEvent::MessageEnd {
+                message_id: None,
                 message: prompt.clone(),
             },
         )
@@ -264,16 +266,15 @@ async fn run_loop(
                 // suffix through the incremental converter.
                 provider_cache.invalidate();
                 for message in pending_messages.drain(..) {
-                    emit_event(
-                        emit,
-                        AgentEvent::MessageStart {
-                            message: message.clone(),
-                        },
-                    )
+                    emit.emit_injected(AgentEvent::MessageStart {
+                        message_id: None,
+                        message: message.clone(),
+                    })
                     .await;
                     emit_event(
                         emit,
                         AgentEvent::MessageEnd {
+                            message_id: None,
                             message: message.clone(),
                         },
                     )
@@ -432,20 +433,31 @@ async fn run_loop(
                 )));
                 // Do not call a provider just to manufacture an abort, or mutate
                 // the original tool-call assistant and its settled tool results.
-                for message in pending_messages
+                let queued_count = pending_messages.len();
+                for (ordinal, message) in pending_messages
                     .drain(..)
                     .chain(std::iter::once(aborted.clone()))
+                    .enumerate()
                 {
+                    let start = AgentEvent::MessageStart {
+                        message_id: None,
+                        message: message.clone(),
+                    };
+                    if ordinal < queued_count {
+                        emit.emit_injected(start).await;
+                    } else {
+                        emit_event(emit, start).await;
+                    }
+                    current_context.messages.push(message.clone());
+                    new_messages.push(message.clone());
                     emit_event(
                         emit,
-                        AgentEvent::MessageStart {
-                            message: message.clone(),
+                        AgentEvent::MessageEnd {
+                            message_id: None,
+                            message,
                         },
                     )
                     .await;
-                    current_context.messages.push(message.clone());
-                    new_messages.push(message.clone());
-                    emit_event(emit, AgentEvent::MessageEnd { message }).await;
                 }
                 emit_event(
                     emit,
@@ -740,7 +752,13 @@ async fn stream_assistant_response(
                 context.messages.push(am.clone());
                 added_partial = true;
                 diagnostics
-                    .emit_agent_event(emit, AgentEvent::MessageStart { message: am })
+                    .emit_agent_event(
+                        emit,
+                        AgentEvent::MessageStart {
+                            message_id: None,
+                            message: am,
+                        },
+                    )
                     .await;
             }
             AssistantMessageEvent::TextStart { partial, .. }
@@ -763,6 +781,7 @@ async fn stream_assistant_response(
                         .emit_agent_event(
                             emit,
                             AgentEvent::MessageUpdate {
+                                message_id: None,
                                 // `Arc` bump, not a deep clone: this fires once per
                                 // streaming delta, and the provider already built the
                                 // snapshot it hands us.
@@ -790,13 +809,20 @@ async fn stream_assistant_response(
                         .emit_agent_event(
                             emit,
                             AgentEvent::MessageStart {
+                                message_id: None,
                                 message: am.clone(),
                             },
                         )
                         .await;
                 }
                 diagnostics
-                    .emit_agent_event(emit, AgentEvent::MessageEnd { message: am })
+                    .emit_agent_event(
+                        emit,
+                        AgentEvent::MessageEnd {
+                            message_id: None,
+                            message: am,
+                        },
+                    )
                     .await;
                 if let Some(started) = event_started {
                     diagnostics.fold_ns += AssistantRequestDiagnostics::elapsed_ns(started);
@@ -825,13 +851,20 @@ async fn stream_assistant_response(
             .emit_agent_event(
                 emit,
                 AgentEvent::MessageStart {
+                    message_id: None,
                     message: am.clone(),
                 },
             )
             .await;
     }
     diagnostics
-        .emit_agent_event(emit, AgentEvent::MessageEnd { message: am })
+        .emit_agent_event(
+            emit,
+            AgentEvent::MessageEnd {
+                message_id: None,
+                message: am,
+            },
+        )
         .await;
     Ok(final_message)
 }
@@ -839,6 +872,37 @@ async fn stream_assistant_response(
 // ----------------------------------------------------------------------------
 // Truncate-fail
 // ----------------------------------------------------------------------------
+
+/// Reject an ambiguous provider batch before ANY invocation starts. A duplicate
+/// call ID cannot safely correlate permission, execution, or durable result
+/// reservations, even if one of its calls would be rejected independently.
+async fn reject_ambiguous_tool_batch(
+    tool_calls: &[ToolCall],
+    emit: &Arc<dyn AgentEmitter>,
+) -> Option<ExecutedToolBatch> {
+    let mut ids = std::collections::BTreeSet::new();
+    if tool_calls.iter().all(|call| ids.insert(call.id.as_str())) {
+        return None;
+    }
+    let mut messages = Vec::with_capacity(tool_calls.len());
+    for call in tool_calls {
+        let finalized = FinalizedToolCall {
+            tool_call: call.clone(),
+            result: create_error_tool_result(
+                "Tool batch was rejected: provider returned duplicate tool call IDs",
+            ),
+            is_error: true,
+        };
+        emit_tool_execution_end(emit, &finalized).await;
+        let result = create_tool_result_message(call, &finalized.result, true);
+        emit_tool_result_message(emit, &result).await;
+        messages.push(result);
+    }
+    Some(ExecutedToolBatch {
+        messages,
+        terminate: false,
+    })
+}
 
 /// Fail every tool call in a truncated message. Mirrors TS
 /// `failToolCallsFromTruncatedMessage`. Each call gets a `tool_execution_start`
@@ -848,6 +912,9 @@ async fn fail_tool_calls_from_truncated_message(
     tool_calls: &[ToolCall],
     emit: &Arc<dyn AgentEmitter>,
 ) -> Result<ExecutedToolBatch, AgentError> {
+    if let Some(rejected) = reject_ambiguous_tool_batch(tool_calls, emit).await {
+        return Ok(rejected);
+    }
     let mut messages: Vec<ToolResultMessage> = Vec::new();
     for tool_call in tool_calls {
         emit_event(
@@ -898,6 +965,9 @@ async fn execute_tool_calls(
     config: &AgentLoopConfig,
     emit: &Arc<dyn AgentEmitter>,
 ) -> Result<ExecutedToolBatch, AgentError> {
+    if let Some(rejected) = reject_ambiguous_tool_batch(tool_calls, emit).await {
+        return Ok(rejected);
+    }
     let has_sequential = tool_calls.iter().any(|tc| {
         current_context
             .tools
@@ -1598,11 +1668,19 @@ async fn emit_tool_result_message(emit: &Arc<dyn AgentEmitter>, trm: &ToolResult
     emit_event(
         emit,
         AgentEvent::MessageStart {
+            message_id: None,
             message: am.clone(),
         },
     )
     .await;
-    emit_event(emit, AgentEvent::MessageEnd { message: am }).await;
+    emit_event(
+        emit,
+        AgentEvent::MessageEnd {
+            message_id: None,
+            message: am,
+        },
+    )
+    .await;
 }
 
 /// Drain steering messages (empty vec if no hook).

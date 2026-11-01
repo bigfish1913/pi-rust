@@ -196,7 +196,8 @@ pub struct SettleState {
     /// commit path, including context boundaries and the final persistence pass.
     assistant_streams: Mutex<BTreeMap<usize, usize>>,
     /// Stable commit reservations, including externally queued messages and
-    /// the first generated assistant of an accepted retry.
+    /// the first generated assistant of an accepted retry. Live events and every
+    /// persistence fallback reuse this reservation; publishing never commits it.
     reserved_entries: Mutex<BTreeMap<usize, String>>,
     injected_indices: Mutex<BTreeSet<usize>>,
     retry_result: Mutex<Option<String>>,
@@ -210,9 +211,8 @@ pub struct SettleState {
     /// emitted. MessageStart transfers each reservation to its loop-message
     /// index, so every role can commit at settle or fall back to run-end writes
     /// without changing the durable queue target's id.
-    injected: Mutex<VecDeque<(String, AgentMessage)>>,
-    /// Pending queue items stay reserved through the run. Dropping its local
-    /// state releases uncommitted handoffs without moving/reordering messages.
+    injected: Mutex<VecDeque<String>>,
+    /// Run-local reservations retain uncommitted inputs until their entry ACK.
     injected_reservations: Mutex<Vec<QueueReservation>>,
     /// A final assistant normally waits for run-end persistence. If a queued
     /// message continues this run, commit that assistant before the injection.
@@ -220,6 +220,7 @@ pub struct SettleState {
     /// The durable frame writer, installed after the run's emitter is created.
     /// Commit paths flush it before binding an assistant entry.
     frame_recorder: Mutex<Option<Arc<crate::frame_progress::FrameRecordingEmitter>>>,
+    identity_error: Mutex<Option<String>>,
     diagnostics: SettleDiagnostics,
 }
 
@@ -250,8 +251,13 @@ impl SettleState {
             injected_reservations: Mutex::new(Vec::new()),
             uncommitted_assistant: Mutex::new(None),
             frame_recorder: Mutex::new(None),
+            identity_error: Mutex::new(None),
             diagnostics: SettleDiagnostics::new(),
         }
+    }
+
+    pub(crate) fn identity_error(&self) -> Option<String> {
+        self.identity_error.lock().unwrap().clone()
     }
 
     pub(crate) fn set_frame_recorder(
@@ -277,11 +283,8 @@ impl SettleState {
 
     /// Register a message the run is about to inject, with the entry id its
     /// `queue_enqueued` record reserved for it.
-    pub fn push_injected(&self, entry_id: impl Into<String>, message: AgentMessage) {
-        self.injected
-            .lock()
-            .unwrap()
-            .push_back((entry_id.into(), message));
+    pub fn push_injected(&self, entry_id: impl Into<String>, _message: AgentMessage) {
+        self.injected.lock().unwrap().push_back(entry_id.into());
     }
 
     /// Start an attempt after its retry wait. Resetting before the wait would
@@ -474,6 +477,8 @@ impl SettleState {
     /// the execution barrier can record it against the right entry and ordinal.
     pub(crate) fn record_tool_calls(&self, entry_id: &str, message: &AssistantMessage) {
         let mut pending = self.pending_calls.lock().unwrap();
+        // ToolStarted uses the reducer's tool-call-only ordinal, not the
+        // position of the block among interleaved text/thinking content.
         for (ordinal, call) in message
             .content
             .iter()
@@ -506,6 +511,7 @@ pub struct SettlingEmitter {
     recorder: Arc<crate::frame_progress::FrameRecordingEmitter>,
     state: Arc<SettleState>,
     harness: AgentHarness,
+    signal: tokio_util::sync::CancellationToken,
 }
 
 impl SettlingEmitter {
@@ -514,13 +520,23 @@ impl SettlingEmitter {
         recorder: Arc<crate::frame_progress::FrameRecordingEmitter>,
         state: Arc<SettleState>,
         harness: AgentHarness,
+        signal: tokio_util::sync::CancellationToken,
     ) -> Self {
         Self {
             inner,
             recorder,
             state,
             harness,
+            signal,
         }
+    }
+
+    fn fail_identity(&self, error: impl std::fmt::Display) {
+        let mut failure = self.state.identity_error.lock().unwrap();
+        if failure.is_none() {
+            *failure = Some(error.to_string());
+        }
+        self.signal.cancel();
     }
 
     /// Commit one settled assistant message and record its `step_attempt`.
@@ -539,6 +555,7 @@ impl SettlingEmitter {
         };
         let entry_id = entry.id.clone();
         if let Err(error) = self.state.prepare_commit_for_assistant(index).await {
+            self.fail_identity(&error);
             tracing::warn!(%error, "could not bind a settled assistant stream");
             return;
         }
@@ -577,6 +594,7 @@ impl SettlingEmitter {
                 }
             }
             Err(error) => {
+                self.fail_identity(&error);
                 tracing::warn!(%error, "could not commit a settled assistant message");
             }
         }
@@ -584,7 +602,7 @@ impl SettlingEmitter {
 
     /// Commit any injected message under the id its queue record reserved.
     ///
-    /// Delivery reservations were matched by content at MessageStart, before
+    /// Delivery reservations were explicitly attached at MessageStart, before
     /// role-based settlement, and remain available for fallback persistence.
     async fn settle_injected(&self, index: usize, message: &AgentMessage) {
         let entry_id = self.state.reserve_entry_id(index, &self.harness);
@@ -603,6 +621,7 @@ impl SettlingEmitter {
                     .prepare_commit(assistant_index, &assistant_id, &self.harness)
                     .await
                 {
+                    self.fail_identity(&error);
                     tracing::warn!(%error, "could not bind the assistant before queue injection");
                     return;
                 }
@@ -614,6 +633,7 @@ impl SettlingEmitter {
                     },
                 };
                 if let Err(error) = self.harness.append_provisioned(entry).await {
+                    self.fail_identity(&error);
                     tracing::warn!(%error, "could not commit the assistant before queue injection");
                     return;
                 }
@@ -635,6 +655,7 @@ impl SettlingEmitter {
             .prepare_commit(index, &entry_id, &self.harness)
             .await
         {
+            self.fail_identity(&error);
             tracing::warn!(%error, "could not bind an injected assistant stream");
             return;
         }
@@ -643,23 +664,24 @@ impl SettlingEmitter {
                 self.state.record_commit(index, &entry_id);
             }
             Err(error) => {
+                self.fail_identity(&error);
                 tracing::warn!(%error, "could not commit an injected message");
             }
         }
     }
 
-    /// Commit a settled tool result under the id its `tool_started` named.
+    /// Commit a settled tool result under its MessageStart reservation, which
+    /// reuses the ToolStarted result id when an invocation actually started.
     async fn settle_tool_result(&self, index: usize, message: &rpi_ai::types::ToolResultMessage) {
         let Some(result_entry_id) = self
             .state
-            .reserved_results
+            .reserved_entries
             .lock()
             .unwrap()
-            .get(&message.tool_call_id)
+            .get(&index)
             .cloned()
         else {
-            // No reserved id (e.g. the call was never recorded): fall back to the
-            // run-end pass, which mints an id normally.
+            self.fail_identity("tool result has no MessageStart reservation");
             return;
         };
         // Preserve the tool_started identity even if this append fails. Both
@@ -692,26 +714,29 @@ impl SettlingEmitter {
                 self.state.record_commit(index, &result_entry_id);
             }
             Err(error) => {
+                // The native reservation still exists. A refused entry ACK is
+                // not lost identity: let the ordered boundary/run-end fallback
+                // retry this same ID before later messages. Persistent failure
+                // propagates there without completing the run or replaying the
+                // tool. Missing reservations above still fail closed.
                 tracing::warn!(%error, "could not commit a settled tool result");
             }
         }
     }
 
-    fn handle(&self, event: &AgentEvent) -> Option<BoxFuture<'static, ()>> {
+    fn handle(&self, event: &AgentEvent, injected_start: bool) -> Option<BoxFuture<'static, ()>> {
         // Recognize queue deliveries before dispatching on role: a stored
         // assistant/tool-result is an injection, not a new provider generation
         // or a tool invocation produced by this run.
-        if let AgentEvent::MessageEnd { message } = event {
+        if let AgentEvent::MessageEnd { message, .. } = event {
             let index = self.state.seen.load(Ordering::Acquire).saturating_sub(1);
             if self.state.injected_indices.lock().unwrap().contains(&index) {
-                if matches!(message, AgentMessage::Assistant(_)) {
-                    self.state.assistant_settled.fetch_add(1, Ordering::AcqRel);
-                }
                 let emitter = Self {
                     inner: Arc::clone(&self.inner),
                     recorder: Arc::clone(&self.recorder),
                     state: Arc::clone(&self.state),
                     harness: self.harness.clone(),
+                    signal: self.signal.clone(),
                 };
                 let message = message.clone();
                 return Some(Box::pin(async move {
@@ -720,29 +745,48 @@ impl SettlingEmitter {
             }
         }
         match event {
-            AgentEvent::MessageStart { message } => {
+            AgentEvent::MessageStart {
+                message,
+                message_id,
+            } => {
                 let index = self.state.seen.fetch_add(1, Ordering::AcqRel);
-                let injection = {
-                    let mut pending = self.state.injected.lock().unwrap();
-                    if pending.front().is_some_and(|(_, queued)| queued == message) {
-                        pending.pop_front()
-                    } else {
-                        None
-                    }
-                };
-                if let Some((entry_id, _)) = injection {
+                // Only the explicit queue-delivery surface transfers a queued
+                // reservation. An upstream ID alone is not a delivery marker.
+                if injected_start {
+                    let Some(entry_id) = message_id else {
+                        self.fail_identity("queue delivery has no reservation");
+                        return None;
+                    };
                     self.state
                         .reserved_entries
                         .lock()
                         .unwrap()
-                        .insert(index, entry_id);
+                        .insert(index, entry_id.clone());
                     self.state.injected_indices.lock().unwrap().insert(index);
+                } else if let AgentMessage::ToolResult(result) = message {
+                    // The native loop rejects malformed call names/IDs with
+                    // End + ToolResult but deliberately no execution Start:
+                    // no side effect began, so no ToolStarted record is needed.
+                    // Always honor an actual Start's reservation; only a result
+                    // with no Start gets a new native session entry id here.
+                    // start_tool still fails closed on missing registration,
+                    // and emit_reserved suppresses events after that failure.
+                    let id = self
+                        .state
+                        .reserved_results
+                        .lock()
+                        .unwrap()
+                        .remove(&result.tool_call_id)
+                        .unwrap_or_else(|| self.harness.next_entry_id());
+                    self.state
+                        .reserved_entries
+                        .lock()
+                        .unwrap()
+                        .insert(index, id);
                 }
-                if matches!(message, AgentMessage::Assistant(_)) {
-                    // A new assistant must not borrow an older call's identity
-                    // or result reservation when a provider reuses its call ID.
-                    // Prior fallback identities already live in reserved_entries
-                    // by message index, independently of these batch-local maps.
+                if !injected_start && matches!(message, AgentMessage::Assistant(_)) {
+                    // New native generations must not borrow a prior batch's
+                    // registrations when a provider reuses its call IDs.
                     self.state.pending_calls.lock().unwrap().clear();
                     self.state.reserved_results.lock().unwrap().clear();
                     let stream_index = self.state.assistant_settled.load(Ordering::Acquire);
@@ -751,32 +795,19 @@ impl SettlingEmitter {
                         .lock()
                         .unwrap()
                         .insert(index, stream_index);
-                    if !self.state.injected_indices.lock().unwrap().contains(&index) {
-                        let retry_id = self.state.retry_result.lock().unwrap().take();
-                        if let Some(entry_id) = retry_id {
-                            self.state
-                                .reserved_entries
-                                .lock()
-                                .unwrap()
-                                .insert(index, entry_id.clone());
-                            let state = Arc::clone(&self.state);
-                            let harness = self.harness.clone();
-                            // This binding also distinguishes a scheduled wait
-                            // from a retry that has actually begun streaming.
-                            return Some(Box::pin(async move {
-                                if let Err(error) =
-                                    state.prepare_commit(index, &entry_id, &harness).await
-                                {
-                                    tracing::warn!(%error, "could not bind a starting retry stream");
-                                }
-                            }));
-                        }
+                    if let Some(id) = self.state.retry_result.lock().unwrap().take() {
+                        self.state
+                            .reserved_entries
+                            .lock()
+                            .unwrap()
+                            .insert(index, id);
                     }
                 }
                 None
             }
             AgentEvent::MessageEnd {
                 message: AgentMessage::Assistant(assistant),
+                ..
             } => {
                 // `seen` was advanced by this message's `MessageStart`; the index
                 // of the message that just settled is one less.
@@ -805,6 +836,7 @@ impl SettlingEmitter {
                     recorder: Arc::clone(&self.recorder),
                     state: Arc::clone(&self.state),
                     harness: self.harness.clone(),
+                    signal: self.signal.clone(),
                 };
                 // Ordinal first, then increment: the message that just settled is
                 // stream `ordinal`.
@@ -817,6 +849,7 @@ impl SettlingEmitter {
             }
             AgentEvent::MessageEnd {
                 message: AgentMessage::ToolResult(result),
+                ..
             } => {
                 let index = self.state.seen.load(Ordering::Acquire).saturating_sub(1);
                 let emitter = SettlingEmitter {
@@ -824,11 +857,27 @@ impl SettlingEmitter {
                     recorder: Arc::clone(&self.recorder),
                     state: Arc::clone(&self.state),
                     harness: self.harness.clone(),
+                    signal: self.signal.clone(),
                 };
                 let result = (**result).clone();
                 Some(Box::pin(async move {
                     emitter.settle_tool_result(index, &result).await;
                 }))
+            }
+            AgentEvent::ToolExecutionStart { tool_call_id, .. } => {
+                // Start is observable before authorization/preparation. Validate
+                // its native owner here, but journal intent only in the execute
+                // barrier, after effective arguments and approval are known.
+                if !self
+                    .state
+                    .pending_calls
+                    .lock()
+                    .unwrap()
+                    .contains_key(tool_call_id)
+                {
+                    self.fail_identity("tool assistant was not committed");
+                }
+                None
             }
             AgentEvent::AgentEnd { .. } => {
                 // The final assistant message of a completed or aborted run is
@@ -849,6 +898,7 @@ impl SettlingEmitter {
                     recorder: Arc::clone(&self.recorder),
                     state: Arc::clone(&self.state),
                     harness: self.harness.clone(),
+                    signal: self.signal.clone(),
                 };
                 Some(Box::pin(async move {
                     emitter.settle_final_assistant().await;
@@ -892,6 +942,7 @@ impl SettlingEmitter {
         {
             // The message stays uncommitted, so `run_core`'s persistence pass
             // will still write it after the emitter returns.
+            self.fail_identity(&error);
             tracing::warn!(%error, "could not bind the final assistant before AgentEnd");
             return;
         }
@@ -910,6 +961,7 @@ impl SettlingEmitter {
                 // Leave the message for `run_core`'s own persistence pass,
                 // which runs after this emitter returns; the log is then
                 // complete one step later than usual.
+                self.fail_identity(&error);
                 tracing::warn!(
                     %error,
                     "could not commit the final assistant before AgentEnd"
@@ -927,36 +979,97 @@ impl SettlingEmitter {
     }
 }
 
-impl AgentEmitter for SettlingEmitter {
-    fn emit(&self, event: AgentEvent) -> BoxFuture<'static, ()> {
+impl SettlingEmitter {
+    fn emit_reserved(&self, mut event: AgentEvent, injected_start: bool) -> BoxFuture<'static, ()> {
+        if self.state.identity_error().is_some() {
+            return Box::pin(async {});
+        }
         let inner = Arc::clone(&self.inner);
+        let harness = self.harness.clone();
+        let signal = self.signal.clone();
         let state = Arc::clone(&self.state);
         let emit_started = state.diagnostics.start();
         let handle_started = state.diagnostics.start();
-        let settles = self.handle(&event);
+        let settles = self.handle(&event, injected_start);
+        let starting = matches!(&event, AgentEvent::MessageStart { .. });
+        let index = state.seen.load(Ordering::Acquire).saturating_sub(1);
+        let injected = matches!(
+            &event,
+            AgentEvent::MessageStart { .. }
+                | AgentEvent::MessageUpdate { .. }
+                | AgentEvent::MessageEnd { .. }
+        ) && state.injected_indices.lock().unwrap().contains(&index);
+        match &mut event {
+            AgentEvent::MessageStart { message_id, .. }
+            | AgentEvent::MessageUpdate { message_id, .. }
+            | AgentEvent::MessageEnd { message_id, .. } => {
+                *message_id = Some(state.reserve_entry_id(index, &harness));
+            }
+            _ => {}
+        }
         state
             .diagnostics
             .record(SettlePhase::EmitHandle, handle_started);
         Box::pin(async move {
+            if state.identity_error().is_some() {
+                return;
+            }
+            if starting && state.stream_at(index).is_some() {
+                let id = state.reserve_entry_id(index, &harness);
+                if let Err(error) = state.prepare_commit(index, &id, &harness).await {
+                    *state.identity_error.lock().unwrap() = Some(error.to_string());
+                    signal.cancel();
+                    return; // Never publish an unbound identity or substitute a new ID.
+                }
+            }
             // Commit *before* forwarding: a UI that renders the settled message
             // must not be able to observe it before it is durable.
             let settle_started = state.diagnostics.start();
             if let Some(settles) = settles {
                 settles.await;
             }
+            if state.identity_error().is_some() {
+                return;
+            }
             state
                 .diagnostics
                 .record(SettlePhase::SettleAwait, settle_started);
             let inner_started = state.diagnostics.start();
-            inner.emit(event).await;
+            if injected {
+                inner.emit_injected(event).await;
+            } else {
+                inner.emit(event).await;
+            }
             state
                 .diagnostics
                 .record(SettlePhase::InnerEmit, inner_started);
             state.diagnostics.record(SettlePhase::Emit, emit_started);
         })
     }
+}
+
+impl AgentEmitter for SettlingEmitter {
+    fn emit(&self, event: AgentEvent) -> BoxFuture<'static, ()> {
+        self.emit_reserved(event, false)
+    }
+
+    fn emit_injected(&self, mut event: AgentEvent) -> BoxFuture<'static, ()> {
+        if let AgentEvent::MessageStart { message_id, .. } = &mut event {
+            let reservation = self.state.injected.lock().unwrap().pop_front();
+            let Some(id) = reservation else {
+                *self.state.identity_error.lock().unwrap() =
+                    Some("queue delivery has no reservation".into());
+                self.signal.cancel();
+                return Box::pin(async {});
+            };
+            *message_id = Some(id);
+        }
+        self.emit_reserved(event, true)
+    }
 
     fn try_emit(&self, event: AgentEvent) {
-        self.inner.try_emit(event);
+        if self.state.identity_error().is_none() {
+            self.inner.try_emit(event);
+        }
     }
 }

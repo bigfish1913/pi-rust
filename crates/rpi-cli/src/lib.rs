@@ -65,6 +65,7 @@ pub mod session_driver;
 pub mod settings;
 mod side_questions;
 pub mod source_info;
+pub mod themes;
 pub mod timings;
 mod transcript_navigation;
 pub mod transcript_view;

@@ -312,6 +312,22 @@ rpi 使用自己的 `.rpi` 目录：
 
 全局资源默认位于 `~/.rpi/agent/`，包括 `settings.json`、`models.json`、`skills/`、`prompts/`、`themes/` 和 `extensions/`。同名资源发生冲突时，项目资源优先于全局资源。
 
+### 自定义主题
+
+主题文件是 pi 兼容的 JSON（`name` + `colors`，支持 `#rrggbb`、`oklch()`/`okhsl()`、
+0-255 调色板索引与 `vars` 变量引用；缺省字段回落默认配色）。三个来源可用：
+
+- 内置 preset：`dark` / `light` / `monochrome`；
+- 文件路径：`rpi --theme ~/ocean.json`，或 `settings.json` 的 `"theme"` 字段写路径
+  （`--theme` 优先于 settings；加载失败时警告并回落默认主题，不阻断启动）；
+- 主题目录发现：`~/.rpi/agent/themes/*.json`（全局）与 `.rpi/themes/*.json`（项目，
+  优先于全局）。`/theme` 选择器在三个内置项之后列出发现的主题（按文件名），
+  选中即生效并持久化；`/theme <名字>` 直达应用。扩展包也可贡献主题
+  （`resources_discover` 的 `themePaths`，优先级在目录之后）。
+
+`--no-themes` 关闭目录发现与扩展主题（内置 preset 仍可用）。untrusted 项目不会
+加载其 `.rpi/themes/`；`/reload` 会重建主题列表，被移除的激活主题回落默认配色。
+
 项目级 `.rpi/settings.json` 可以追加资源目录：
 
 ```json

@@ -9,6 +9,7 @@
 use std::sync::Arc;
 
 use crate::env::ExecutionEnv;
+use crate::file_io::FileIORouter;
 use crate::file_mutation_queue::MutatingEnv;
 
 /// The context handed to a built-in tool's `execute`. Mirrors TS
@@ -22,6 +23,7 @@ use crate::file_mutation_queue::MutatingEnv;
 pub struct ExecutionToolContext {
     env: Arc<dyn ExecutionEnv>,
     mutating_env: Option<Arc<dyn MutatingEnv>>,
+    file_io: Option<Arc<FileIORouter>>,
 }
 
 impl ExecutionToolContext {
@@ -30,7 +32,22 @@ impl ExecutionToolContext {
     /// write/edit). The two arcs point at the same allocation when the caller
     /// passes a single concrete env.
     pub fn new(env: Arc<dyn ExecutionEnv>, mutating_env: Option<Arc<dyn MutatingEnv>>) -> Self {
-        Self { env, mutating_env }
+        Self {
+            env,
+            mutating_env,
+            file_io: None,
+        }
+    }
+
+    /// Attach optional neutral text delegation. The shared router starts local;
+    /// its owner may configure a backend later, only while the session is idle.
+    pub fn with_file_io(mut self, router: Arc<FileIORouter>) -> Self {
+        self.file_io = Some(router);
+        self
+    }
+
+    pub fn file_io(&self) -> Option<&Arc<FileIORouter>> {
+        self.file_io.as_ref()
     }
 
     pub fn env(&self) -> &Arc<dyn ExecutionEnv> {

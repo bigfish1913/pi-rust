@@ -9,6 +9,7 @@ use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 
 use crossterm::event::{KeyCode, KeyModifiers};
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use super::component::{Component, Focusable};
@@ -162,14 +163,65 @@ pub struct PasteSession {
     undo_started: bool,
 }
 
+/// Tab stops the editor expands pasted tabs to, in visible columns. 8 is
+/// the POSIX/terminal default and matches how the source the user copied
+/// from renders, so the paste lines up with what they saw.
+pub(crate) const PASTE_TAB_WIDTH: usize = 8;
+
+/// Expand tabs to spaces that advance to the next tab stop, matching how a
+/// terminal renders them. `col` is the visible column count already consumed
+/// on the current line; wide chars count 2 columns (not chars), and a wide
+/// char straddling a stop jumps past it without partial padding.
+///
+/// Width is measured on each complete tab-free span with
+/// `UnicodeWidthStr::width`, not by summing grapheme (or scalar) widths.
+/// `UnicodeWidthStr` is not additive across cluster boundaries: with the
+/// locked unicode-width 0.1.14, `❤️` (VS16 presentation sequence) is 2
+/// columns as a whole but 1 summed scalar-wise, `👩‍💻` (ZWJ sequence) is 2 as a
+/// whole but 4 summed scalar-wise, and the Arabic Lam-Alef ligature `لا` is 1
+/// column as a whole but 2 summed grapheme-wise. Measuring anything smaller
+/// than the span therefore shifted the tab stop — and the text sent to the
+/// model, since the expanded paste is what gets sent.
+pub(crate) fn expand_tabs(text: &str, tab_width: usize) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut col = 0usize;
+    // Width is a property of the whole run of text between tabs and newlines,
+    // so buffer it and measure once instead of per grapheme.
+    let mut span = String::new();
+    for grapheme in UnicodeSegmentation::graphemes(text, true) {
+        match grapheme {
+            "\n" => {
+                out.push_str(&span);
+                span.clear();
+                out.push('\n');
+                col = 0;
+            }
+            "\t" => {
+                col += UnicodeWidthStr::width(span.as_str());
+                out.push_str(&span);
+                span.clear();
+                let next = (col / tab_width + 1) * tab_width;
+                out.extend(std::iter::repeat(' ').take(next - col));
+                col = next;
+            }
+            _ => span.push_str(grapheme),
+        }
+    }
+    out.push_str(&span);
+    out
+}
+
 /// Apply exactly the same normalization to ordinary and incremental pastes.
 /// Incremental callers normalize the accumulated raw text, so even CRLF and
 /// CSI-u sequences split across chunks are handled as a single payload.
 fn normalize_paste(text: &str) -> String {
-    decode_csi_u_ctrl(text)
+    // Tabs expand to the next tab stop per visible column rather than a fixed
+    // width, so the paste renders the way it did where it was copied from.
+    let decoded = decode_csi_u_ctrl(text)
         .replace("\r\n", "\n")
-        .replace('\r', "\n")
-        .replace('\t', "    ")
+        .replace('\r', "\n");
+    let decoded = expand_tabs(&decoded, PASTE_TAB_WIDTH);
+    decoded
         .chars()
         .filter(|c| *c == '\n' || (*c as u32) >= 32)
         .collect()
@@ -2866,7 +2918,9 @@ l12",
         let expanded = editor.get_expanded_text();
         assert!(!expanded.contains('\r'), "CR must be normalized away");
         assert!(!expanded.contains('\t'), "tab must expand to spaces");
-        assert!(expanded.contains("a    b1"), "tab becomes four spaces");
+        // `a` occupies 1 column, so the tab advances to stop 8: 7 spaces.
+        // (Before the tab-stop fix this was a fixed four spaces.)
+        assert!(expanded.contains("a       b1"), "tab advances to column 8");
         assert_eq!(expanded.split('\n').count(), 12);
     }
 
@@ -3259,6 +3313,154 @@ l12",
     }
 
     #[test]
+    fn expand_tabs_advances_to_the_next_tab_stop_per_line() {
+        // Column 0: 7 spaces to reach the stop at 8.
+        assert_eq!(expand_tabs("\t", 8), " ".repeat(8));
+        // Column 2: 6 spaces to reach 8; column 10: 6 spaces to reach 16.
+        assert_eq!(expand_tabs("if\t", 8), format!("if{}", " ".repeat(6)));
+        assert_eq!(
+            expand_tabs("0123456789\t", 8),
+            format!("0123456789{}", " ".repeat(6))
+        );
+        // Consecutive stops.
+        assert_eq!(expand_tabs("\t\tx", 8), format!("{}x", " ".repeat(16)));
+        // A stop already reached is not another stop away.
+        assert_eq!(
+            expand_tabs("12345678\t", 8),
+            format!("12345678{}", " ".repeat(8))
+        );
+        // The column resets at a newline: line 2's tab lands on stop 8 again.
+        assert_eq!(expand_tabs("a\tb\nc\td", 8), "a       b\nc       d");
+    }
+
+    #[test]
+    fn expand_tabs_counts_wide_chars_as_two_columns() {
+        // "中文" is 4 columns; the tab must land on stop 8, not stop 5.
+        assert_eq!(expand_tabs("中文\t", 8), format!("中文{}", " ".repeat(4)));
+        // An emoji (width 2) after a tab still counts as 2 columns of progress.
+        assert_eq!(
+            expand_tabs("\t\u{1F600}x", 8),
+            format!("{}\u{1F600}x", " ".repeat(8))
+        );
+    }
+
+    #[test]
+    fn expand_tabs_measures_unicode_sequences_not_scalars() {
+        // `UnicodeWidthStr` is not additive across the scalars of one grapheme
+        // cluster. Under the locked unicode-width 0.1.14, `❤️` (VS16
+        // presentation sequence) is 2 columns as a whole but 1 when its
+        // scalars are summed, and `👩‍💻` (ZWJ sequence) is 2 as a whole but 4
+        // when summed. Measuring scalars therefore both under- and over-counted
+        // the column, which moved the tab stop — and the text handed to the
+        // model, since the expanded paste is what gets sent.
+        //
+        // The expected space counts below are an independent oracle: each
+        // sequence occupies exactly 2 terminal columns, so a tab at column 2
+        // advances 6 spaces to stop 8. They are written out literally rather
+        // than derived from the width crate, so a future width regression
+        // cannot make the test agree with the bug.
+        for seq in ["❤️", "👩‍💻", "👍🏽", "🇨🇳", "1️⃣"] {
+            assert_eq!(
+                expand_tabs(&format!("{seq}\tX"), 8),
+                format!("{seq}      X"),
+                "{seq:?} must occupy 2 columns and reach stop 8"
+            );
+        }
+        // A single-width grapheme keeps its own stop: column 1 -> 7 spaces.
+        assert_eq!(expand_tabs("e\u{301}\tX", 8), "e\u{301}       X");
+    }
+
+    #[test]
+    fn pasted_unicode_sequences_reach_the_same_column_through_handle_paste() {
+        // The normalized text is what the model receives, so the assertion has
+        // to go through the real paste path rather than `expand_tabs` alone.
+        // Each 2-column sequence plus 6 spaces puts `X` at column 8.
+        for seq in ["❤️", "👩‍💻", "👍🏽"] {
+            let editor = Editor::simple();
+            editor.handle_paste(&format!("{seq}\tX"));
+            assert_eq!(
+                editor.get_expanded_text(),
+                format!("{seq}      X"),
+                "{seq:?} tab stop must land on column 8 through handle_paste"
+            );
+        }
+        // A 4-column CJK pair advances to stop 8 with 4 spaces.
+        let editor = Editor::simple();
+        editor.handle_paste("中文\tX");
+        assert_eq!(editor.get_expanded_text(), "中文    X");
+    }
+
+    #[test]
+    fn expand_tabs_measures_complete_spans_not_grapheme_sums() {
+        use unicode_width::UnicodeWidthStr;
+        // `UnicodeWidthStr` applies cross-grapheme script rules that no sum
+        // over the parts can reproduce. Under the locked unicode-width 0.1.14
+        // each Arabic Lam-Alef ligature below is one column as a whole while
+        // its two graphemes each measure one column. The expected space counts
+        // are a literal oracle (1 column + 7 spaces = stop 8), not derived
+        // from the width crate, so a width regression cannot agree with a bug.
+        for seq in [
+            "\u{644}\u{627}",
+            "\u{644}\u{623}",
+            "\u{644}\u{622}",
+            "\u{644}\u{671}",
+        ] {
+            assert_eq!(
+                UnicodeWidthStr::width(seq),
+                1,
+                "{seq:?} must measure one column as a complete span"
+            );
+            assert_eq!(
+                expand_tabs(&format!("{seq}\tX"), 8),
+                format!("{seq}       X"),
+                "{seq:?} is a 1-column span and must reach stop 8"
+            );
+        }
+        // The span boundary is the tab, not the ligature: two ligatures are
+        // two columns and still reach stop 8, and a ligature after a tab
+        // advances from the stop by its own width.
+        assert_eq!(
+            expand_tabs("\u{644}\u{627}\u{644}\u{627}\tX", 8),
+            "\u{644}\u{627}\u{644}\u{627}      X"
+        );
+        assert_eq!(
+            expand_tabs("\t\u{644}\u{627}x", 8),
+            format!("{}\u{644}\u{627}x", " ".repeat(8))
+        );
+    }
+
+    #[test]
+    fn pasted_lam_alef_reaches_the_span_column_through_handle_paste() {
+        // The expanded paste is what the model receives, so the assertion has
+        // to go through the real paste path, not `expand_tabs` alone.
+        for seq in ["\u{644}\u{627}", "\u{644}\u{623}"] {
+            let editor = Editor::simple();
+            editor.handle_paste(&format!("{seq}\tX"));
+            assert_eq!(
+                editor.get_expanded_text(),
+                format!("{seq}       X"),
+                "{seq:?} must land `X` at column 8 through handle_paste"
+            );
+        }
+        // Mixed with a previously measured cluster: a 2-column emoji and a
+        // 1-column ligature in the same span are 3 columns, 5 spaces to stop 8.
+        let editor = Editor::simple();
+        editor.handle_paste("\u{1F600}\u{644}\u{627}\tX");
+        assert_eq!(
+            editor.get_expanded_text(),
+            "\u{1F600}\u{644}\u{627}     X",
+            "span widths must add across clusters but never inside one"
+        );
+        // The column resets at a newline, so a ligature on line 2 starts over.
+        let editor = Editor::simple();
+        editor.handle_paste("\u{644}\u{627}\tA\n\u{644}\u{627}\tB");
+        assert_eq!(
+            editor.get_expanded_text(),
+            "\u{644}\u{627}       A\n\u{644}\u{627}       B"
+        );
+    }
+
+    #[test]
     fn paste_session_unicode_tabs_and_split_crlf_match_single_paste() {
         let editor = Editor::simple();
         editor.set_text("前😀后");
@@ -3268,7 +3470,7 @@ l12",
         for chunk in ["\n后\r", "\n\t尾\r", "尾\u{1}\x1b[104;", "5u"] {
             assert!(editor.append_paste_session(&mut session, chunk));
         }
-        let expected = "前中文    😀\n后\n    尾\n尾😀后";
+        let expected = "前中文    😀\n后\n        尾\n尾😀后";
         assert_eq!(editor.get_text(), expected);
         assert_eq!(editor.cursor_position(), (3, "尾".len()));
         assert_eq!(editor.get_expanded_text(), expected);

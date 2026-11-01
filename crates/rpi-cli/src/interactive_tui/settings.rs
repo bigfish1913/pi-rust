@@ -397,11 +397,21 @@ pub(super) fn open_settings_theme_selector(
     tui: &Arc<TuiAltScreen>,
     chat: &Arc<Container>,
 ) {
-    let items = vec![
+    let mut items = vec![
         SelectItem::new("dark", "Dark").with_description("Default dark theme"),
         SelectItem::new("light", "Light").with_description("Light background"),
         SelectItem::new("monochrome", "Monochrome").with_description("No color accents"),
     ];
+    let registry = state
+        .theme_registry
+        .read()
+        .ok()
+        .map(|registry| registry.clone());
+    if let Some(registry) = registry {
+        for name in registry.names() {
+            items.push(SelectItem::new(name, name));
+        }
+    }
     let list = Arc::new(SelectList::new(items, 10));
 
     let state_sel = state.clone();
@@ -410,31 +420,28 @@ pub(super) fn open_settings_theme_selector(
     let tui_sel = tui.clone();
     let chat_sel = chat.clone();
     list.on_select(Arc::new(move |item| {
-        let preset = match item.value.as_str() {
-            "light" => Some(ThemePreset::Light),
-            "monochrome" => Some(ThemePreset::Monochrome),
-            "dark" => Some(ThemePreset::Dark),
-            name => {
-                add_error_message(&chat_sel, &format!("Unknown theme `{name}`."));
-                close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
-                tui_sel.render_now(true);
-                return;
+        let registry = state_sel.theme_registry.read().ok().map(|r| r.clone());
+        match crate::themes::apply_and_persist(
+            &item.value,
+            &state_sel.theme_manager,
+            registry.as_ref(),
+        ) {
+            Ok(message) => {
+                state_sel.set_active_theme_spec(Some(item.value.clone()));
+                let chat_watcher = chat_sel.clone();
+                if let Some(registry_now) = registry.as_ref() {
+                    crate::themes::restart_theme_watcher(
+                        &state_sel.theme_watcher,
+                        Some(&item.value),
+                        registry_now,
+                        &state_sel.theme_manager,
+                        theme_watch_notify(chat_watcher, tui_sel.clone()),
+                    );
+                }
+                add_note_message(&chat_sel, &message);
             }
-        };
-        let Some(preset) = preset else { return };
-        apply_theme_preset(preset);
-        state_sel.theme_manager.apply_preset(preset);
-        let mut settings = crate::settings::load_settings().unwrap_or_default();
-        settings.theme = Some(item.value.clone());
-        let saved = crate::settings::save_settings(&settings);
-        add_note_message(
-            &chat_sel,
-            &format!(
-                "Theme set to {} (saved{})",
-                item.label,
-                if saved.is_ok() { "" } else { ", not saved" },
-            ),
-        );
+            Err(message) => add_error_message(&chat_sel, &message),
+        }
         close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
         tui_sel.render_now(true);
     }));

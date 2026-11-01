@@ -60,6 +60,50 @@ async fn a_grandchild_holding_stdout_does_not_hold_the_call_open() {
     );
 }
 
+/// Already-read partial characters must be finalized even when a descendant
+/// keeps both pipes open past the bounded drain grace period.
+#[cfg(unix)]
+#[tokio::test]
+async fn bounded_pipe_drain_flushes_bytes_already_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = OsExecutionEnv::with_cwd(tmp.path().to_path_buf());
+    let normal = match env
+        .exec(
+            "printf '\\344\\270'; sleep 0.05",
+            ShellExecOptions::default(),
+        )
+        .await
+    {
+        Ok(output) => output,
+        Err(error) if error.code == ExecutionErrorCode::ShellUnavailable => return,
+        Err(error) => panic!("exec failed: {error:?}"),
+    };
+    assert!(!normal.stdout.is_empty());
+
+    let mut stdout_callback = String::new();
+    let mut stderr_callback = String::new();
+    let started = Instant::now();
+    let bounded = tokio::time::timeout(
+        Duration::from_secs(1),
+        env.exec(
+            "printf '\\344\\270'; printf '\\344\\270' >&2; sleep 0.05; sleep 2 &",
+            ShellExecOptions {
+                on_stdout: Some(Box::new(|chunk| stdout_callback.push_str(chunk))),
+                on_stderr: Some(Box::new(|chunk| stderr_callback.push_str(chunk))),
+                ..Default::default()
+            },
+        ),
+    )
+    .await
+    .expect("bounded drain waited for descendant EOF")
+    .expect("exec failed");
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(bounded.stdout, normal.stdout);
+    assert_eq!(bounded.stderr, normal.stdout);
+    assert_eq!(stdout_callback, bounded.stdout);
+    assert_eq!(stderr_callback, bounded.stderr);
+}
+
 /// `cat` with no arguments reads stdin and exits at EOF. If stdin is left as an
 /// open pipe nothing will ever close, it blocks instead.
 #[tokio::test]

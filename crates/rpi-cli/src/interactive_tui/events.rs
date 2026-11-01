@@ -268,7 +268,7 @@ pub(super) async fn handle_agent_event(
             tui.request_render(false);
         }
 
-        AgentEvent::MessageStart { message } => match message {
+        AgentEvent::MessageStart { message, .. } => match message {
             AgentMessage::Assistant(a) => {
                 // The shared transcript view renders this through the same
                 // component path as the remote client. It installs the live
@@ -327,6 +327,7 @@ pub(super) async fn handle_agent_event(
         AgentEvent::MessageUpdate {
             message,
             assistant_message_event,
+            ..
         } => {
             let _ = assistant_message_event; // the snapshot is authoritative
             let a: &rpi_ai::types::AssistantMessage = &message;
@@ -347,7 +348,7 @@ pub(super) async fn handle_agent_event(
             tui.request_render(false);
         }
 
-        AgentEvent::MessageEnd { message } => {
+        AgentEvent::MessageEnd { message, .. } => {
             if let AgentMessage::Assistant(a) = &message {
                 let text = assistant_text(a);
                 state

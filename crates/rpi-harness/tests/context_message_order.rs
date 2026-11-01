@@ -114,7 +114,7 @@ impl AgentEmitter for AppendDuringEvent {
                     proceed.notified().await;
                 }
             }
-            if let AgentEvent::MessageEnd { message } = event {
+            if let AgentEvent::MessageEnd { message, .. } = event {
                 if message != context_message() {
                     return;
                 }
@@ -139,7 +139,7 @@ fn on_tool(event: &AgentEvent) -> bool {
     matches!(event, AgentEvent::ToolExecutionEnd { .. })
 }
 fn on_final(event: &AgentEvent) -> bool {
-    matches!(event, AgentEvent::MessageEnd { message: AgentMessage::Assistant(a) }
+    matches!(event, AgentEvent::MessageEnd { message: AgentMessage::Assistant(a), .. }
         if !a.content.iter().any(|c| matches!(c, Content::ToolCall(_))))
 }
 fn on_start(event: &AgentEvent) -> bool {
@@ -316,7 +316,8 @@ async fn tool_callback_append_waits_for_the_whole_batch_and_reaches_the_next_req
             matches!(
                 e,
                 AgentEvent::MessageEnd {
-                    message: AgentMessage::ToolResult(_)
+                    message: AgentMessage::ToolResult(_),
+                    ..
                 }
             )
         })
@@ -327,7 +328,8 @@ async fn tool_callback_append_waits_for_the_whole_batch_and_reaches_the_next_req
             matches!(
                 e,
                 AgentEvent::MessageEnd {
-                    message: AgentMessage::Custom(_)
+                    message: AgentMessage::Custom(_),
+                    ..
                 }
             )
         })
@@ -1081,7 +1083,7 @@ async fn compaction_then_retry_preserves_the_recovered_final_message() {
 async fn retry_success_with_silent_context_must_not_schedule_another_resume() {
     for failed_attempts in [1, 2] {
         let mut emitter = AppendDuringEvent::new(
-            |event| matches!(event, AgentEvent::MessageEnd { message: AgentMessage::Assistant(a) } if a.stop_reason == StopReason::Stop),
+            |event| matches!(event, AgentEvent::MessageEnd { message: AgentMessage::Assistant(a), .. } if a.stop_reason == StopReason::Stop),
         );
         emitter.send = Some(SendMessageOptions {
             trigger_turn: Some(false),

@@ -491,19 +491,30 @@ pub(super) async fn open_tree_selector(
     );
 }
 
-/// Build + open the `/theme` selector. Built-in presets and enabled package
-/// themes are shown; selecting applies the theme live and re-renders.
+/// Build + open the `/theme` selector. Built-in presets come first, then any
+/// discovered custom themes (project + global theme dirs). Selecting applies
+/// the theme live and persists it; custom themes are parsed only on select.
 pub(super) fn open_theme_selector(
     state: &Arc<TuiState>,
     editor_container: &Arc<Container>,
     editor: &Arc<Editor>,
     tui: &Arc<TuiAltScreen>,
 ) {
-    let items = vec![
+    let mut items = vec![
         SelectItem::new("dark", "Dark").with_description("Default dark theme"),
         SelectItem::new("light", "Light").with_description("Light background"),
         SelectItem::new("monochrome", "Monochrome").with_description("No color accents"),
     ];
+    let registry = state
+        .theme_registry
+        .read()
+        .ok()
+        .map(|registry| registry.clone());
+    if let Some(registry) = registry {
+        for name in registry.names() {
+            items.push(SelectItem::new(name, name));
+        }
+    }
     let list = Arc::new(SelectList::new(items, 10));
 
     let state_sel = state.clone();
@@ -512,23 +523,28 @@ pub(super) fn open_theme_selector(
     let tui_sel = tui.clone();
     let chat_sel = state.chat_container.clone();
     list.on_select(Arc::new(move |item| {
-        let preset = match item.value.as_str() {
-            "light" => Some(ThemePreset::Light),
-            "monochrome" => Some(ThemePreset::Monochrome),
-            "dark" => Some(ThemePreset::Dark),
-            name => {
-                add_error_message(&chat_sel, &format!("Unknown theme `{name}`."));
-                close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
-                tui_sel.render_now(true);
-                return;
+        let registry = state_sel.theme_registry.read().ok().map(|r| r.clone());
+        match crate::themes::apply_and_persist(
+            &item.value,
+            &state_sel.theme_manager,
+            registry.as_ref(),
+        ) {
+            Ok(message) => {
+                state_sel.set_active_theme_spec(Some(item.value.clone()));
+                let chat_watcher = chat_sel.clone();
+                if let Some(registry_now) = registry.as_ref() {
+                    crate::themes::restart_theme_watcher(
+                        &state_sel.theme_watcher,
+                        Some(&item.value),
+                        registry_now,
+                        &state_sel.theme_manager,
+                        theme_watch_notify(chat_watcher, tui_sel.clone()),
+                    );
+                }
+                add_note_message(&chat_sel, &message);
             }
-        };
-        let Some(preset) = preset else { return };
-        apply_theme_preset(preset);
-        state_sel.theme_manager.apply_preset(preset);
-        // A quick accent note so the user sees the change registered even if
-        // the terminal's own colors mask the preset difference.
-        add_note_message(&chat_sel, &format!("Theme set to {}.", item.label));
+            Err(message) => add_error_message(&chat_sel, &message),
+        }
         close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
         tui_sel.render_now(true);
     }));

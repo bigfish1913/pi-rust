@@ -282,7 +282,7 @@ pub fn tool_result_message_ids(events: &[rpi_agent::AgentEvent]) -> Vec<String> 
     events
         .iter()
         .filter_map(|e| match e {
-            rpi_agent::AgentEvent::MessageEnd { message } => match message {
+            rpi_agent::AgentEvent::MessageEnd { message, .. } => match message {
                 rpi_agent::AgentMessage::ToolResult(t) => Some(t.tool_call_id.clone()),
                 _ => None,
             },

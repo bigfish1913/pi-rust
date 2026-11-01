@@ -37,6 +37,7 @@ fn job(owner: u64) -> Arc<Job> {
 fn delta(text: String) -> AgentEvent {
     let partial = Arc::new(faux_assistant_message("", StopReason::Stop));
     AgentEvent::MessageUpdate {
+        message_id: None,
         message: partial.clone(),
         assistant_message_event: AssistantMessageEvent::TextDelta {
             content_index: 0,

@@ -35,6 +35,26 @@ The invariants that the loop guarantees:
   late streaming update arrives after the run already settled.
 - Truncated or failed tool calls never leave a dangling call without a result.
 
+## Optional native message identity
+
+Public `AgentEvent::{MessageStart, MessageUpdate, MessageEnd}` now carry
+`message_id: Option<String>`. The direct agent loop emits `None`; a native
+session/harness can attach its reserved entry ID before publishing the event
+and commit that same ID to history. Provider response IDs and tool-call IDs are
+not substitutes. Tool-execution and unrelated lifecycle events do not acquire
+this field. Consumers constructing these Rust enum variants must supply
+`message_id` (use `None` without a session owner); pattern matches that do not
+need identity can use `..`. Optional wire fields do not make adding a Rust enum
+field source-compatible with exhaustive old constructors/patterns.
+
+`AgentEmitter::emit_injected(event)` marks an actual queued message delivery
+separately from ordinary generation, so the session owner can consume the
+correct durable reservation even for identical-content messages. Its default
+implementation calls `emit(event)`, preserving existing custom emitter behavior
+without requiring an override. It does not generate an ID or change provider
+message content. See the [RPC identity contract](../../docs/message-image-file-io-rpc.md#message-identity)
+for native advertisement and adapter scope.
+
 ## Quick start
 
 Deterministic, offline, no API key — the `faux` provider scripts one text reply:
