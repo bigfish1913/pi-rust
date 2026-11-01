@@ -7,8 +7,9 @@
 //! that keeps that reservation while stamping, appending the JSONL line, and
 //! applying the reducer. Dropping the caller's future cancels only its wait for
 //! the result; the owner still completes the append and reducer commit. Reads
-//! clone straight from the in-memory state (defensive-copy contract), never
-//! blocking on the tail.
+//! clone hot state or materialize selected cold history rows (defensive-copy
+//! contract), never blocking on the tail. Old transient frame records retain
+//! only file locations plus ID/sequence validation state, not decoded payloads.
 //!
 //! ## Load path + torn-tail recovery (plan §5.14)
 //!
@@ -50,6 +51,7 @@
 //! `append_entry` receives a [`ProvisionedEntry`] and stamps via the state +
 //! a [`Clock`], then encodes the resulting full `Entry`.
 
+use super::cold_frames::ResidentState;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -84,7 +86,7 @@ use crate::session::types::{
 pub struct JsonlSessionStorage {
     fs: Arc<dyn FileSystem>,
     metadata: JsonlSessionMetadata,
-    state: Arc<tokio::sync::Mutex<SessionState>>,
+    state: Arc<tokio::sync::Mutex<ResidentState>>,
     clock: Arc<dyn Clock>,
     /// Reserved for future auto-id generation (callers currently supply entry/
     /// record ids). Kept for parity with `InMemorySessionStorage`.
@@ -178,7 +180,7 @@ impl JsonlSessionStorage {
             ),
             fs,
             metadata,
-            state: Arc::new(tokio::sync::Mutex::new(SessionState::new())),
+            state: Arc::new(tokio::sync::Mutex::new(ResidentState::default())),
             clock,
             ids,
             tail: Arc::new(Mutex::new(())),
@@ -225,10 +227,17 @@ impl JsonlSessionStorage {
         clock: Arc<dyn Clock>,
         ids: Arc<dyn IdGenerator>,
     ) -> SessionResult<Self> {
-        let content = file_result(
-            fs.read_text_file(path, None).await,
-            &format!("Failed to read session {path}"),
-        )?;
+        let reader = file_result(fs.open_read_file(path).await, "open session history reader")?;
+        let content = if let Some(reader) = &reader {
+            let bytes = file_result(reader.read_all().await, "read session history")?;
+            String::from_utf8(bytes)
+                .map_err(|_| SessionError::invalid_entry("invalid session UTF-8"))?
+        } else {
+            file_result(
+                fs.read_text_file(path, None).await,
+                &format!("Failed to read session {path}"),
+            )?
+        };
         // TS: content.split("\n"); drop trailing "" from the final "\n".
         let mut physical_lines: Vec<&str> = content.split('\n').collect();
         if physical_lines.last() == Some(&"") {
@@ -300,7 +309,20 @@ impl JsonlSessionStorage {
                     }
                     let original_seq = mutation.seq();
                     let mutation = chain_onto_lane_leaf(mutation, &state);
-                    if let Err(e) = state.apply_mutation(mutation) {
+                    let applied = match (&reader, &mutation) {
+                        (
+                            Some(reader),
+                            SessionMutation::Record {
+                                record: LaneRecord::AssistantFrame(frame),
+                            },
+                        ) if frame.op != crate::session::types::AssistantFrameOp::CommitStream => {
+                            // Slices point into the same validated UTF-8 file view.
+                            let offset = line.as_ptr() as usize - content.as_ptr() as usize;
+                            state.defer(frame, reader, offset as u64, line)
+                        }
+                        _ => state.apply_mutation(mutation).map(|_| ()),
+                    };
+                    if let Err(e) = applied {
                         if e.code == SessionErrorCode::InvalidEntry {
                             drop(state);
                             return Err(invalid_file(path, line_no, &e));
@@ -1028,16 +1050,16 @@ impl SessionStorage for JsonlSessionStorage {
     }
 
     async fn find_records(&self, query: &RecordQuery) -> SessionResult<Vec<LaneRecord>> {
-        let state = self.state.lock().await;
-        state.find_records(query)
+        let plan = self.state.lock().await.record_plan(query)?;
+        plan.read().await
     }
 
     async fn record_page(
         &self,
         query: &crate::session::types::RecordPageQuery,
     ) -> SessionResult<crate::session::types::RecordPage> {
-        let state = self.state.lock().await;
-        state.record_page(query)
+        let (plan, total) = self.state.lock().await.page_plan(query)?;
+        plan.page(total).await
     }
 
     async fn find_open_operations(
@@ -1050,8 +1072,8 @@ impl SessionStorage for JsonlSessionStorage {
     }
 
     async fn get_log(&self, options: &LogOptions) -> SessionResult<Vec<LogItem>> {
-        let state = self.state.lock().await;
-        state.get_log(options)
+        let plan = self.state.lock().await.log_plan(options)?;
+        plan.read().await
     }
 
     async fn get_name(&self) -> SessionResult<Option<String>> {

@@ -1679,4 +1679,5 @@ mod volatile_tests {
             );
         }
     }
+    include!("frame_progress_cold_tests.rs");
 }

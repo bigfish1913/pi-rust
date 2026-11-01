@@ -237,14 +237,22 @@ impl SessionRuntime {
             })
             .collect();
 
-        let records = self
-            .session
-            .find_records(&RecordQuery {
-                lane: Some(lane.to_string()),
-                order: Some(EntryOrder::OldestFirst),
-                ..Default::default()
-            })
-            .await?;
+        // Only these record types contribute to the recovery report. In
+        // particular, reporting recovery must not hydrate retired stream frames.
+        let mut records = Vec::new();
+        for record_type in ["write_deferred", "tool_started"] {
+            records.extend(
+                self.session
+                    .find_records(&RecordQuery {
+                        lane: Some(lane.to_string()),
+                        record_type: Some(record_type),
+                        order: Some(EntryOrder::OldestFirst),
+                        ..Default::default()
+                    })
+                    .await?,
+            );
+        }
+        records.sort_unstable_by_key(LaneRecord::seq);
 
         let mut pending_writes = Vec::new();
         let mut tool_frames = Vec::new();
@@ -403,20 +411,22 @@ impl SessionRuntime {
             .session
             .view(lane)
             .find_entries(&crate::session::types::EntryQuery {
-                order: Some(EntryOrder::OldestFirst),
+                order: Some(EntryOrder::NewestFirst),
+                limit: Some(1),
                 ..Default::default()
             })
             .await?;
-        let last_entry_seq = entries.last().map(|e| e.seq()).unwrap_or(0);
+        let last_entry_seq = entries.first().map(|e| e.seq()).unwrap_or(0);
         let records = self
             .session
             .find_records(&RecordQuery {
                 lane: Some(lane.to_string()),
-                order: Some(EntryOrder::OldestFirst),
+                order: Some(EntryOrder::NewestFirst),
+                limit: Some(1),
                 ..Default::default()
             })
             .await?;
-        let last_record_seq = records.last().map(|r| r.seq()).unwrap_or(0);
+        let last_record_seq = records.first().map(|r| r.seq()).unwrap_or(0);
         let has_open_operation = !self
             .session
             .find_open_operations(lane, Some(1))

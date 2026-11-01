@@ -2757,14 +2757,22 @@ impl AgentHarness {
         session: &Session,
         lane: &str,
     ) -> HarnessResult<Vec<(QueueKind, QueuedMessage)>> {
-        let records = session
-            .find_records(&RecordQuery {
-                lane: Some(lane.to_string()),
-                order: Some(EntryOrder::OldestFirst),
-                ..Default::default()
-            })
-            .await
-            .map_err(session_to_harness_err)?;
+        // Queue reconstruction must not materialize unrelated legacy frames.
+        let mut records = Vec::new();
+        for record_type in ["queue_enqueued", "queue_cancelled"] {
+            records.extend(
+                session
+                    .find_records(&RecordQuery {
+                        lane: Some(lane.to_string()),
+                        record_type: Some(record_type),
+                        order: Some(EntryOrder::OldestFirst),
+                        ..Default::default()
+                    })
+                    .await
+                    .map_err(session_to_harness_err)?,
+            );
+        }
+        records.sort_unstable_by_key(LaneRecord::seq);
         let mut cancelled: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         let mut pending: Vec<QueueEnqueuedRecord> = Vec::new();
         for record in records {

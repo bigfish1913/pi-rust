@@ -139,6 +139,14 @@ pub trait AppendFile: Send + Sync {
     async fn append(&mut self, bytes: &[u8]) -> Result<(), FileError>;
 }
 
+/// Read capability bound to one opened file, even if its path is replaced.
+/// Implementations serialize cursor access and return errors on short ranges.
+#[async_trait]
+pub trait ReadFile: Send + Sync {
+    async fn read_all(&self) -> Result<Vec<u8>, FileError>;
+    async fn read_range(&self, offset: u64, length: usize) -> Result<Vec<u8>, FileError>;
+}
+
 /// Mirrors TS `FileSystem`. All methods async, never panic.
 /// Backends should check cancellation at entry and during long operations.
 #[async_trait]
@@ -204,6 +212,15 @@ pub trait FileSystem: Send + Sync {
         &self,
         _path: &str,
     ) -> Result<Option<Box<dyn AppendFile>>, FileError> {
+        Ok(None)
+    }
+
+    /// Optional stable-generation reader. Unsupported backends retain eager
+    /// history loading; an actual open failure must be returned, not hidden.
+    async fn open_read_file(
+        &self,
+        _path: &str,
+    ) -> Result<Option<std::sync::Arc<dyn ReadFile>>, FileError> {
         Ok(None)
     }
 

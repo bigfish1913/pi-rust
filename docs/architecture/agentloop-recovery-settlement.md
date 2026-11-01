@@ -271,7 +271,27 @@ the loaded history's digest, atomically initializes an empty companion, then
 atomically adds the header marker while retaining the session ID and every body
 byte (including legacy assistant-frame records and their sequence numbers).
 Legacy payloads remain in history for history-first replay; they are not migrated
-or duplicated into the new sidecar. The history digest is checked again before
+or duplicated into the new sidecar. On filesystems with a stable opened-file
+reader, JSONL loads historical `Append`, `ClearStream` and `ClearRun` records into
+a compact byte-range index instead of retaining their decoded record objects.
+Their IDs stay reserved and their sequences still advance the history watermark.
+`CommitStream` stays decoded in memory because its entry binding participates in
+recovery and retries. Record queries, pagination and the unified log merge hot
+records with cold locations before applying their limit, then read and validate
+only selected cold rows. Returned payloads remain defensive copies, not a warm
+cache. Unfinished runs therefore retain the same history-first recovery behavior.
+
+The cold index owns the same opened file generation used for initial validation;
+it does not follow subsequent atomic path replacement. This keeps offsets valid
+across duplicate/torn-tail repair and explicit progress-header opt-in, while new
+appends continue to follow the current path. Short reads or changed indexed bytes
+fail closed. Readerless/custom filesystems retain the existing eager behavior.
+The private JSONL resident view is not serialized as a SQLite snapshot. Initial
+load still reads and validates the whole file; this is lazy record materialization,
+not fully streaming session loading or a constant-memory transcript guarantee.
+Explicit unbounded history queries can still allocate all requested payloads.
+Normal queue reconstruction, recovery reports and RPC stats instead select only
+the record types they need; checkpoint reads select the latest bounded record. The history digest is checked again before
 publishing the header, rejecting concurrent changes under the lock contract.
 
 The upgrade has a detached owner: cancelling its caller cannot leave shared
