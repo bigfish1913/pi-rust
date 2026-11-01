@@ -158,6 +158,7 @@ rpi auth login|check|logout
 rpi events path|tail
 rpi install <crate>
 rpi uninstall <crate>
+rpi extension update [name] # update all eligible extensions, or select one by name
 rpi update                 # download a verified GitHub prebuilt CLI
 rpi update --build         # explicitly compile with Cargo
 rpi dev [options]
@@ -251,6 +252,14 @@ rpi install my-extension --path ../my-rpi-extension --force
 ```
 
 `rpi install <name>` upgrades newer versions directly and skips an already installed version. Use `--force` to reinstall the same version or allow a downgrade. This also applies to Cargo builds and local installs; local changes without a version bump require `--force`.
+
+Use `rpi extension update` to update all project-linked extensions and globally
+installed registry/prebuilt extensions, or `rpi extension update <name>` to select
+one by name. Updates preserve the original Cargo build backend or explicit GitHub
+source. Global development installs made with `--path` are excluded. The old
+`rpi package update [name]` remains compatible; prefer `extension update` for
+extension updates. Project linking commands remain `rpi package link`,
+`rpi package list`, and `rpi package unlink`.
 
 For iterative development:
 
