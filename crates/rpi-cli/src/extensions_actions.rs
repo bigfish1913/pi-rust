@@ -997,7 +997,7 @@ mod list_commands_tests {
             vec![("/model".into(), "built-in".into())],
             vec![("/model".into(), "extension".into())],
             vec![],
-        Vec::new(),
+            Vec::new(),
         );
         assert_eq!(names(&out), vec!["/model"]);
         assert_eq!(out[0]["source"], "builtin");
@@ -1010,7 +1010,7 @@ mod list_commands_tests {
             vec![],
             vec![("deploy".into(), "deploy".into())],
             vec![("review".into(), "review".into())],
-        Vec::new(),
+            Vec::new(),
         );
         assert_eq!(names(&out), vec!["/deploy", "/review"]);
         assert_eq!(out[0]["source"], "extension");
@@ -1026,7 +1026,7 @@ mod list_commands_tests {
             vec![("/help".into(), "help".into())],
             vec![],
             vec![("review".into(), "review a diff".into())],
-        Vec::new(),
+            Vec::new(),
         );
         assert_eq!(names(&out), vec!["/help", "/review"]);
         assert_eq!(out[1]["source"], "prompt");
@@ -1041,7 +1041,7 @@ mod list_commands_tests {
             vec![("/review".into(), "built-in".into())],
             vec![],
             vec![("review".into(), "template".into())],
-        Vec::new(),
+            Vec::new(),
         );
         assert_eq!(names(&out), vec!["/review"]);
         assert_eq!(out[0]["source"], "builtin");
