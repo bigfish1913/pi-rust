@@ -702,7 +702,6 @@ pub trait RuntimeActionHost: Send + Sync {
         }))
     }
 
-    /// Safe, effective runtime metadata; never serialize credential bindings.
     /// Finish the current turn, then stop — the gentle counterpart of
     /// [`Self::abort`].
     ///
@@ -716,6 +715,7 @@ pub trait RuntimeActionHost: Send + Sync {
         Ok(serde_json::json!({ "requested": true }))
     }
 
+    /// Safe, effective runtime metadata; never serialize credential bindings.
     async fn get_execution_context(
         &self,
         _args: serde_json::Value,

@@ -2717,21 +2717,28 @@ async fn a_crash_mid_stream_is_not_auto_resumed() {
         tokio::spawn(async move { harness.prompt_text("a long answer please", vec![]).await })
     };
     let session = harness.session().clone();
-    for _ in 0..200 {
-        let records = session
-            .find_records(&RecordQuery {
-                record_type: Some(rpi_harness::frame_progress::ASSISTANT_FRAME_RECORD_TYPE),
-                ..Default::default()
-            })
-            .await
-            .expect("frame records readable");
-        if !records.is_empty() {
-            break;
+    // Wait for the durable precondition, not just a fixed number of polls:
+    // under CI load the provider may not have produced any frame after 2s.
+    // Aborting before a frame exists tests an empty run, not stream recovery.
+    let started = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let records = session
+                .find_records(&RecordQuery {
+                    record_type: Some(rpi_harness::frame_progress::ASSISTANT_FRAME_RECORD_TYPE),
+                    ..Default::default()
+                })
+                .await
+                .expect("frame records readable");
+            if !records.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
+    })
+    .await;
     run.abort();
     let _ = run.await;
+    started.expect("provider must persist an assistant frame before simulating a stream crash");
     drop(harness);
 
     let recovered = reopen_harness(session).await;

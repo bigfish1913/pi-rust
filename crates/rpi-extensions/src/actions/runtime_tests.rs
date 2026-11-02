@@ -9,10 +9,17 @@ struct Host {
     revoked: AtomicUsize,
     aborts: AtomicUsize,
     command_lists: AtomicUsize,
+    stop_rounds: AtomicUsize,
     side_sinks: std::sync::Mutex<Vec<SideQuestionSink>>,
 }
 #[async_trait::async_trait]
 impl RuntimeActionHost for Host {
+    fn stop_round(&self, args: Value) -> Result<Value, String> {
+        assert!(args.get("__rpiRuntimeKey").is_none());
+        self.stop_rounds.fetch_add(1, Ordering::SeqCst);
+        Ok(json!({"requested":true}))
+    }
+
     async fn list_commands(&self, args: Value) -> Result<Value, String> {
         assert!(args.get("__rpiRuntimeKey").is_none());
         self.command_lists.fetch_add(1, Ordering::SeqCst);
@@ -293,7 +300,7 @@ async fn abort_reaches_the_host_and_is_not_blocked_by_the_action_id_ceiling() {
 
 /// Independently developed wire actions must survive integration together.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn integrated_commands_abort_and_dialog_dispatch_without_renumbering() {
+async fn integrated_commands_abort_dialog_and_stop_round_dispatch_without_renumbering() {
     let host = Arc::new(Host::default());
     let root = ActionBridge::new(Handle::current(), host.clone());
     let plugin = root.for_plugin("integrated-actions");
@@ -304,6 +311,7 @@ async fn integrated_commands_abort_and_dialog_dispatch_without_renumbering() {
         ),
         (27, json!({"aborted":false})),
         (28, json!({"requests":[]})),
+        (29, json!({"requested":true})),
     ] {
         let mut out = StbString::empty();
         let rc = trampoline_runtime_action(
@@ -325,6 +333,7 @@ async fn integrated_commands_abort_and_dialog_dispatch_without_renumbering() {
     assert!(!root.ui_dialog_mailbox().external_takeover());
     assert_eq!(host.command_lists.load(Ordering::SeqCst), 1);
     assert_eq!(host.aborts.load(Ordering::SeqCst), 1);
+    assert_eq!(host.stop_rounds.load(Ordering::SeqCst), 1);
     let mut out = StbString::empty();
     assert_eq!(
         trampoline_runtime_action(
@@ -337,4 +346,5 @@ async fn integrated_commands_abort_and_dialog_dispatch_without_renumbering() {
     );
     assert_eq!(host.command_lists.load(Ordering::SeqCst), 1);
     assert_eq!(host.aborts.load(Ordering::SeqCst), 1);
+    assert_eq!(host.stop_rounds.load(Ordering::SeqCst), 1);
 }

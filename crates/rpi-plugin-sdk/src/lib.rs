@@ -2474,14 +2474,6 @@ mod tests {
             RuntimeActionId::try_from(u32::MAX),
             Err(UnknownRuntimeActionId(u32::MAX))
         );
-        assert_eq!(
-            RuntimeActionId::try_from(one_past_last),
-            Err(UnknownRuntimeActionId(one_past_last))
-        );
-        assert_eq!(
-            RuntimeActionId::try_from(u32::MAX),
-            Err(UnknownRuntimeActionId(u32::MAX))
-        );
     }
 
     fn entrypoint_test_api() -> PluginApi {
