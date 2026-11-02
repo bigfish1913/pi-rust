@@ -703,6 +703,19 @@ pub trait RuntimeActionHost: Send + Sync {
     }
 
     /// Safe, effective runtime metadata; never serialize credential bindings.
+    /// Finish the current turn, then stop — the gentle counterpart of
+    /// [`Self::abort`].
+    ///
+    /// Args: `{}`; result: `{"requested": true}`. The flag is one-shot and
+    /// cleared when the next run starts, so setting it while idle is harmless.
+    ///
+    /// The default implementation reports "requested" without acting: a host
+    /// with no run loop has nothing to stop at a turn boundary, and returning an
+    /// error would make a plugin treat a benign call as a failure.
+    fn stop_round(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
+        Ok(serde_json::json!({ "requested": true }))
+    }
+
     async fn get_execution_context(
         &self,
         _args: serde_json::Value,
@@ -1201,6 +1214,7 @@ async fn dispatch(
         // attached — with no client, the caller should let the TUI draw the
         // dialog instead (otherwise nobody sees the question).
         RuntimeActionId::RelayUiDialog => dispatch_relay_ui_dialog(ui_dialog, args),
+        RuntimeActionId::StopRound => host.stop_round(args),
         RuntimeActionId::StdioLifecycle => {
             Err("stdio lifecycle requires a plugin context".to_owned())
         }
