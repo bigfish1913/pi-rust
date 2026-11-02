@@ -1170,6 +1170,22 @@ pub enum RuntimeActionId {
     /// use start(question), status, cancel, hide and show. Never changes the
     /// main transcript or its queues. Presentation and execution stay in host.
     SideQuestion = 25,
+    /// Enumerate the registered slash commands. Args: `{}`; result:
+    /// `{"commands":[{"name":"…","description":"…","source":"builtin"|"extension"|"prompt"}]}`.
+    ///
+    /// Worth having as an action because the ABI had no way to enumerate
+    /// commands at all: a remote client saw an empty completion list and could
+    /// not tell it apart from "this host has no commands". `GetActiveTools` is
+    /// about tools, not slash commands.
+    ///
+    /// A host with no extension registry returns an **empty list** rather than
+    /// an error: "none registered" is a real answer, and a client should
+    /// degrade to "no completion available" instead of surfacing a failure.
+    ///
+    /// `source` is `builtin` for the host's own commands, `extension` for ones
+    /// a plugin registered, and `prompt` for a prompt template; clients use it
+    /// to decide how to dispatch a chosen entry.
+    ListCommands = 26,
     /// Abort the current run on the main lane. Args: `{}`; result:
     /// `{"aborted": true, "runId": "…"}` when a run was cancelled, or
     /// `{"aborted": false}` when the lane was already idle — aborting an idle
@@ -1189,6 +1205,21 @@ pub enum RuntimeActionId {
     /// its own attachments together. A flat image list would lose the pairing
     /// as soon as two queued messages carry different pictures.
     Abort = 27,
+    /// Relay host UI-dialog requests to an external UI.
+    ///
+    /// Args:
+    /// * `{"op":"take"}` — take every request the host has **not** reserved for
+    ///   a plugin (i.e. ids that do not start with the reserved prefix),
+    ///   removing them from the mailbox. Result:
+    ///   `{"requests":[{"requestId","toolCallId","ui"}]}` (possibly empty).
+    /// * `{"op":"respond","requestId":"…","answer":…}` and
+    ///   `{"op":"cancel","requestId":"…"}` — behave like the corresponding
+    ///   `UiDialog` ops.
+    ///
+    /// Exists because the TUI and plugins share one dialog mailbox: without a
+    /// relay, a third-party extension's question pops up on the terminal while
+    /// the user is watching a remote client, and is effectively lost.
+    RelayUiDialog = 28,
 }
 
 /// Error returned when a plugin passes a numeric runtime-action id that this
@@ -1235,7 +1266,9 @@ impl TryFrom<u32> for RuntimeActionId {
             23 => Ok(Self::GetExecutionContext),
             24 => Ok(Self::ChildAgent),
             25 => Ok(Self::SideQuestion),
+            26 => Ok(Self::ListCommands),
             27 => Ok(Self::Abort),
+            28 => Ok(Self::RelayUiDialog),
             other => Err(UnknownRuntimeActionId(other)),
         }
     }
@@ -1275,7 +1308,9 @@ impl RuntimeActionId {
         Self::GetExecutionContext,
         Self::ChildAgent,
         Self::SideQuestion,
+        Self::ListCommands,
         Self::Abort,
+        Self::RelayUiDialog,
     ];
 
     /// The highest defined action id.
@@ -2394,33 +2429,27 @@ mod tests {
             RuntimeActionId::GetExecutionContext,
             RuntimeActionId::ChildAgent,
             RuntimeActionId::SideQuestion,
+            RuntimeActionId::ListCommands,
             RuntimeActionId::Abort,
+            RuntimeActionId::RelayUiDialog,
         ];
 
-        // Explicit ids, not `enumerate()`: numbering has to stay stable when
-        // two proposed actions are developed in parallel, so a gap is allowed
-        // (26 is reserved for a `ListCommands` proposal). Deriving ids from
-        // position would silently renumber every action after a gap.
+        // Stable wire ids must not depend on which proposal was merged first.
         for expected in ids {
             let raw = u32::from(expected);
             assert_eq!(RuntimeActionId::try_from(raw), Ok(expected));
             assert_eq!(u32::from(expected), raw);
         }
-        // Every id below the highest is either defined or explicitly reserved;
-        // anything else must not be accepted.
-        for reserved in [26u32] {
-            assert!(
-                RuntimeActionId::try_from(reserved).is_err(),
-                "id {reserved} is reserved, not implemented"
-            );
-        }
+        assert_eq!(u32::from(RuntimeActionId::ListCommands), 26);
+        assert_eq!(u32::from(RuntimeActionId::Abort), 27);
+        assert_eq!(u32::from(RuntimeActionId::RelayUiDialog), 28);
+        assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::ListCommands));
+        assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::Abort));
+        assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::RelayUiDialog));
+        assert_eq!(RuntimeActionId::MAX, 28);
         // One past the highest defined id is rejected (nothing is silently
         // accepted), and so is the u32 ceiling.
-        //
-        // Derived from the enum, not hardcoded: adding an action shifts the
-        // boundary, and a literal here would silently start asserting on a real
-        // id (or worse, keep passing while dispatching).
-        let one_past_last = u32::from(RuntimeActionId::Abort) + 1;
+        let one_past_last = RuntimeActionId::MAX + 1;
         assert_eq!(
             RuntimeActionId::try_from(one_past_last),
             Err(UnknownRuntimeActionId(one_past_last))
