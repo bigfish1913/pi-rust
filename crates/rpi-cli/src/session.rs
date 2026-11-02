@@ -2895,7 +2895,7 @@ async fn fork_session_at_launch(
         }
     };
     let fork_storage = repo
-        .fork_typed(
+        .fork_typed_with_value_initializer(
             &source_meta,
             &JsonlSessionCreateOptions {
                 id: None,
@@ -2904,6 +2904,7 @@ async fn fork_session_at_launch(
                 metadata: None,
             },
             &ForkOptions::default(),
+            crate::resource_selection::fork_initial_values,
         )
         .await
         .map_err(|e| BuildError::SessionDir(format!("fork {}: {e}", source_meta.path)))?;
@@ -3370,7 +3371,7 @@ pub(crate) async fn fork_session_storage(
         return Err(format!("current session {id} not found on disk"));
     };
     let fork_storage = repo
-        .fork_typed(
+        .fork_typed_with_value_initializer(
             source,
             &rpi_harness::session::jsonl::JsonlSessionCreateOptions {
                 id: None,
@@ -3379,6 +3380,7 @@ pub(crate) async fn fork_session_storage(
                 metadata: None,
             },
             &rpi_harness::session::types::ForkOptions::default(),
+            crate::resource_selection::fork_initial_values,
         )
         .await
         .map_err(|e| e.to_string())?;

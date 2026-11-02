@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::args::{Args, Mode};
+mod fork;
+pub(crate) use fork::initial_values as fork_initial_values;
 
 pub const MAX_SELECTION_BYTES: usize = 64 * 1024;
 pub const MAX_STATE_BYTES: usize = 256 * 1024;

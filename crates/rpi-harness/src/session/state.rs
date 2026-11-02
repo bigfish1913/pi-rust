@@ -694,7 +694,10 @@ impl SessionState {
                     let entry = self.get_entry(&sel).ok_or_else(|| {
                         SessionError::not_found(format!("Entry not found: {sel}"))
                     })?;
-                    if !matches!(entry, Entry::Message(_)) {
+                    // An omitted target denotes the actual current leaf, which
+                    // may be a host/custom entry. Explicit fork targets retain
+                    // the ordinary message-only contract.
+                    if entry_id.is_some() && !matches!(entry, Entry::Message(_)) {
                         return Err(SessionError::invalid_fork_target(format!(
                             "Fork target is not a message entry: {sel}"
                         )));

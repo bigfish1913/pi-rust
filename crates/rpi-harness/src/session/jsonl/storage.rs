@@ -249,6 +249,17 @@ impl JsonlSessionStorage {
         Self::load_impl(fs, path, clock, ids, true, FrameReplay::Cold).await
     }
 
+    /// Fork reads never repair their source. Use the ordinary cold replay and
+    /// recoverable-tail snapshot semantics, but retain no source writer action.
+    pub(super) async fn load_fork_snapshot(
+        fs: Arc<dyn FileSystem>,
+        path: &str,
+        clock: Arc<dyn Clock>,
+        ids: Arc<dyn IdGenerator>,
+    ) -> SessionResult<Self> {
+        Self::load_impl(fs, path, clock, ids, false, FrameReplay::Cold).await
+    }
+
     /// Replay through the canonical native decoder/reducer without repairing,
     /// appending, claiming a writer, or creating any file. Recoverable tails and
     /// exact duplicate sequences are ignored in memory, as on normal restore.
@@ -713,14 +724,78 @@ impl JsonlSessionStorage {
     pub async fn fork(
         &self,
         path: &str,
-        mut header: JsonlV4Header,
+        header: JsonlV4Header,
         options: &ForkOptions,
         clock: Arc<dyn Clock>,
         ids: Arc<dyn IdGenerator>,
     ) -> SessionResult<Self> {
+        self.fork_with_value_initializer(path, header, options, clock, ids, |_| Ok(Vec::new()))
+            .await
+    }
+
+    /// Native host initialization, in the SAME staged fork publication. The
+    /// initializer sees source-wide latest values from the exact fork snapshot,
+    /// not the historical branch cut. No destination with inherited authority
+    /// is published before the new identity's values are initialized. This is
+    /// a storage seam, not a public RPC/custom-append authorization bypass.
+    pub async fn fork_with_value_initializer(
+        &self,
+        path: &str,
+        mut header: JsonlV4Header,
+        options: &ForkOptions,
+        clock: Arc<dyn Clock>,
+        ids: Arc<dyn IdGenerator>,
+        initialize: impl FnOnce(
+                &crate::session::SessionValues,
+            ) -> SessionResult<Vec<(String, serde_json::Value)>>
+            + Send,
+    ) -> SessionResult<Self> {
         let mutations = {
             let state = self.state.lock().await;
-            state.create_fork_mutations(options)?
+            let mut mutations = state.create_fork_mutations(options)?;
+            let values =
+                crate::session::SessionValues::from_entries(&state.find_entries(&EntryQuery {
+                    entry_type: Some("custom"),
+                    custom_type: Some(crate::session::values::VALUE_CUSTOM_TYPE.into()),
+                    order: Some(crate::session::types::EntryOrder::OldestFirst),
+                    ..Default::default()
+                })?);
+            let updates = initialize(&values)?;
+            if !updates.is_empty() {
+                let mut target = SessionState::new();
+                for mutation in &mutations {
+                    target.apply_mutation(mutation.clone())?;
+                }
+                for (key, value) in updates {
+                    if key.trim().is_empty() {
+                        return Err(SessionError::invalid_payload(
+                            "fork initialization value key must not be empty",
+                        ));
+                    }
+                    let seq = target.next_sequence();
+                    let timestamp = clock.now_ms();
+                    let mutation = SessionMutation::Entry {
+                        seq,
+                        timestamp,
+                        lane: Some("main".into()),
+                        entry: provisioned_into_entry(
+                            ProvisionedEntry {
+                                id: ids.next(),
+                                kind: crate::session::types::ProvisionedKind::Custom {
+                                    custom_type: crate::session::values::VALUE_CUSTOM_TYPE.into(),
+                                    data: Some(serde_json::json!({"key":key,"value":value})),
+                                },
+                            },
+                            seq,
+                            target.require_lane("main")?,
+                            timestamp,
+                        ),
+                    };
+                    target.apply_mutation(mutation.clone())?;
+                    mutations.push(mutation);
+                }
+            }
+            mutations
         };
         header.progress_format = Some(super::progress::FORMAT.into());
         super::progress::JsonlProgressStore::new(self.fs.clone(), path, &header.id, clock.clone())

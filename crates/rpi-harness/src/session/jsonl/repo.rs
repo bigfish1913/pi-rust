@@ -346,7 +346,29 @@ impl JsonlSessionRepo {
         options: &JsonlSessionCreateOptions,
         fork: &ForkOptions,
     ) -> SessionResult<JsonlSessionStorage> {
-        let source_storage = self.open_by_jsonl_metadata(source).await?;
+        self.fork_typed_with_value_initializer(source, options, fork, |_| Ok(Vec::new()))
+            .await
+    }
+
+    /// Host-owned new-identity values are staged by the ordinary fork engine
+    /// before atomic publication, using the source's same-snapshot values.
+    pub async fn fork_typed_with_value_initializer(
+        &self,
+        source: &JsonlSessionMetadata,
+        options: &JsonlSessionCreateOptions,
+        fork: &ForkOptions,
+        initialize: impl FnOnce(
+                &crate::session::SessionValues,
+            ) -> SessionResult<Vec<(String, serde_json::Value)>>
+            + Send,
+    ) -> SessionResult<JsonlSessionStorage> {
+        let source_storage = JsonlSessionStorage::load_fork_snapshot(
+            self.fs.clone(),
+            &source.path,
+            self.clock.clone(),
+            self.ids.clone(),
+        )
+        .await?;
         // TS: parentSessionId ?? source.id.
         let mut create_options = options.clone();
         if create_options.parent_session_id.is_none() {
@@ -356,7 +378,14 @@ impl JsonlSessionRepo {
         self.claim_create_destination(&destination, async {
             let (header, path) = self.prepare_create(&destination, &create_options).await?;
             source_storage
-                .fork(&path, header, fork, self.clock.clone(), self.ids.clone())
+                .fork_with_value_initializer(
+                    &path,
+                    header,
+                    fork,
+                    self.clock.clone(),
+                    self.ids.clone(),
+                    initialize,
+                )
                 .await
         })
         .await
