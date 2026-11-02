@@ -730,6 +730,8 @@ enum TuiMessage {
         input: serde_json::Value,
         purpose: ProviderOAuthPurpose,
         flow_id: u64,
+        /// Cancelled when the flow ends; the plugin call observes it.
+        cancel: CancellationToken,
     },
     /// Result of one provider-owned OAuth action.
     ProviderOAuthResult {
@@ -1279,6 +1281,7 @@ pub async fn interactive_tui(
         active_provider_input: std::sync::Mutex::new(None),
         provider_auth_flow_id: std::sync::atomic::AtomicU64::new(0),
         provider_auth_generation: std::sync::atomic::AtomicU64::new(0),
+        provider_auth_cancel: std::sync::Mutex::new(None),
         active_provider_select: std::sync::Mutex::new(None),
         active_extension_editor: std::sync::Mutex::new(None),
         active_extension_input: std::sync::Mutex::new(None),
@@ -1332,7 +1335,6 @@ pub async fn interactive_tui(
                 if event.active {
                     if state.show_terminal_progress {
                         state.editor.set_working(Some(WorkingState {
-                            frame: 0,
                             started_at: std::time::Instant::now(),
                             message: if event.manual {
                                 "Compacting context… (Esc to cancel)"
@@ -1650,10 +1652,13 @@ pub async fn interactive_tui(
         }
     });
 
-    // ---- Render-tick task (advances the loader spinner while Working) ----
+    // ---- Render-tick task (keeps the spinner animating while Working) ----
     //
-    // The `Loader` only advances its frame on render; without a periodic
-    // `request_render` the spinner visibly freezes between events.
+    // The spinner frame is derived from wall-clock time at render time (one
+    // step per `SPINNER_FRAME_MS`, matching upstream's `setInterval` cadence),
+    // but a frame only reaches the screen when something repaints. Without a
+    // periodic `request_render` a quiet stretch (thinking, tool running) would
+    // show a frozen glyph even though the frame index moved.
     let tui_tick = tui.clone();
     let state_tick = state.clone();
     // The tick, not the key loop, drives the voice-draft auto-send: it must
@@ -1675,12 +1680,9 @@ pub async fn interactive_tui(
     let tick_handle = tokio::spawn(async move {
         // 80ms per frame — upstream's `DEFAULT_INTERVAL_MS`, i.e. a full
         // 10-frame cycle every 800ms. The tick only *requests a repaint*; the
-        // frame is advanced by `Editor::render` (mirroring `Loader::render`),
-        // so streaming output — which schedules a frame per token — spins it
-        // faster, and this interval is the floor when the model is silent.
-        //
-        // Advancing here as well would double-step every tick and make the idle
-        // spinner run at 40ms/frame, twice upstream's rate.
+        // frame itself comes from elapsed wall-clock time inside the render, so
+        // this interval is only the repaint floor for quiet stretches and has
+        // no effect on the visible speed (streaming repaints included).
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(
             rpi_tui::loader::SPINNER_FRAME_MS,
         ));
@@ -2187,13 +2189,16 @@ pub async fn interactive_tui(
                 .load(std::sync::atomic::Ordering::Acquire)
                 != 0
             {
-                if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE {
-                    finish_provider_login(
+                // Only report a cancel that won the flow from a completing result.
+                if key.code == KeyCode::Esc
+                    && key.modifiers == KeyModifiers::NONE
+                    && finish_provider_login(
                         &state_for_key,
                         &ctx_for_key.editor_container,
                         &editor_for_key,
                         &tui_for_key,
-                    );
+                    )
+                {
                     add_note_message(&state_for_key.chat_container, "OAuth flow cancelled.");
                 }
                 tui_for_key.request_render_reusing_scroll_content();
@@ -2757,26 +2762,22 @@ pub async fn interactive_tui(
                 }
             }
 
-            // 5b. ↑/↓ browse submitted-message history when the editor is
-            //     EMPTY (a fresh prompt) — mirrors TS historyPrevious/Next
-            //     without the surprise of replacing typed text. When the
-            //     editor holds content, ↑/↓ fall through to cursor movement
-            //     (typing "hello", pressing ↑ at the start, must never swap
-            //     the draft for a history entry — reported as "text
-            //     disappeared"). Once browsing, ↓ walks back and restores the
-            //     draft.
-            if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::Up {
-                let browsing = *state_for_key.history_index.lock().unwrap() != -1;
-                if editor_for_key.get_text().is_empty() || browsing {
-                    navigate_history(&state_for_key, &editor_for_key, -1);
-                    tui_for_key.request_render_reusing_scroll_content();
-                    continue;
-                }
-            }
-            if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::Down {
-                let browsing = *state_for_key.history_index.lock().unwrap() != -1;
-                if editor_for_key.get_text().is_empty() || browsing {
-                    navigate_history(&state_for_key, &editor_for_key, 1);
+            // 5b. ↑/↓ move the caret through a multi-line draft, and only
+            //     leave for prompt history once the caret cannot move any
+            //     further (first line for ↑, last line for ↓) — mirrors TS
+            //     historyPrevious/Next, which only fire at the editor's edge.
+            //     A fresh prompt (no caret row to move to) recalls
+            //     immediately. A single-line draft keeps the older contract
+            //     and never swaps itself for a history entry: that was
+            //     reported as "text disappeared", and one line has no second
+            //     row to move to — but once a browse session is active, ↑/↓
+            //     keep walking history (a one-line recall must not strand it).
+            if key.modifiers == KeyModifiers::NONE
+                && matches!(key.code, KeyCode::Up | KeyCode::Down)
+            {
+                let direction = if key.code == KeyCode::Up { -1 } else { 1 };
+                if arrow_belongs_to_history(&state_for_key, &editor_for_key, direction) {
+                    navigate_history(&state_for_key, &editor_for_key, direction);
                     tui_for_key.request_render_reusing_scroll_content();
                     continue;
                 }
@@ -3431,7 +3432,16 @@ pub async fn interactive_tui(
                 input,
                 purpose,
                 flow_id,
+                cancel,
             }) => {
+                // The flow ended (Esc, or a newer flow) before its call started.
+                if state
+                    .provider_auth_flow_id
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    != flow_id
+                {
+                    continue;
+                }
                 let (snapshot, keepalive) = {
                     let session = ctx
                         .reload_context
@@ -3450,11 +3460,12 @@ pub async fn interactive_tui(
                             let action_call = action.clone();
                             tokio::task::spawn_blocking(move || {
                                 let _keepalive = keepalive;
-                                rpi_extensions::request_oauth(
+                                rpi_extensions::request_oauth_with_cancel(
                                     &snapshot,
                                     &provider_call,
                                     &action_call,
                                     input,
+                                    &cancel,
                                 )
                                 .map_err(|error| error.to_string())
                             })
@@ -3480,13 +3491,6 @@ pub async fn interactive_tui(
                 purpose,
                 flow_id,
             }) => {
-                if state
-                    .provider_auth_flow_id
-                    .load(std::sync::atomic::Ordering::Acquire)
-                    != flow_id
-                {
-                    continue;
-                }
                 handle_provider_oauth_result(
                     &state,
                     &editor_container,
@@ -3517,29 +3521,16 @@ pub async fn interactive_tui(
                     Some(crate::config::Credential::Oauth {
                         access, refresh, ..
                     }) => {
-                        show_provider_auth_status(
+                        begin_provider_oauth_logout(
                             &state,
                             &editor_container,
                             &editor,
                             &tui,
-                            &format!("Revoking OAuth credentials for {provider}…"),
+                            &ctx.tx,
+                            &provider,
+                            access,
+                            refresh,
                         );
-                        let flow_id = state
-                            .provider_auth_generation
-                            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-                            .wrapping_add(1);
-                        state
-                            .provider_auth_flow_id
-                            .store(flow_id, std::sync::atomic::Ordering::Release);
-                        let _ = ctx.tx.send(TuiMessage::ProviderOAuthAction {
-                            provider,
-                            action: "revoke".to_string(),
-                            input: serde_json::json!({
-                                "credential": {"access": access, "refresh": refresh}
-                            }),
-                            purpose: ProviderOAuthPurpose::Logout,
-                            flow_id,
-                        });
                     }
                     Some(crate::config::Credential::ApiKey { .. }) => {
                         match crate::config::delete_credential(&provider) {

@@ -1410,6 +1410,92 @@ pub type OAuthRequestFn =
 /// `scopes`, `supportsPkce`, and optional `capabilities`.
 pub type OAuthRegisterFn = OAuthRequestFn;
 
+/// Cancellation poll for one OAuth action: returns nonzero once the host no
+/// longer wants the result. It never blocks and never frees anything.
+pub type OAuthRequestCancelledFn = extern "C" fn(user_data: *mut c_void) -> i32;
+
+/// Cancellation view for one OAuth action, passed to an [`OAuthRequestControlFn`].
+///
+/// The host lends the struct for a single action call and the plugin must not
+/// retain it. Poll it through [`OAuthRequestControl::poll_cancelled`], which also
+/// tolerates a host that supplies only a prefix of the struct.
+///
+/// `struct_size` is the first field, so a plugin can read how much the host
+/// supplied before it touches any later field. Fields are only ever appended.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct OAuthRequestControl {
+    /// `sizeof(OAuthRequestControl)` as the host built it.
+    pub struct_size: u32,
+    /// `is_cancelled(user_data) -> i32`: nonzero once the action is cancelled.
+    pub is_cancelled: OAuthRequestCancelledFn,
+    /// Host-owned opaque handle, passed back unchanged to `is_cancelled`.
+    pub user_data: *mut c_void,
+}
+
+extern "C" fn never_cancelled(_user_data: *mut c_void) -> i32 {
+    0
+}
+
+impl OAuthRequestControl {
+    /// A control that is never cancelled. A legacy callback uses it to run a
+    /// control-aware action with no host cancellation available.
+    pub fn uncancellable() -> Self {
+        Self {
+            struct_size: core::mem::size_of::<Self>() as u32,
+            is_cancelled: never_cancelled,
+            user_data: core::ptr::null_mut(),
+        }
+    }
+
+    /// Whether the host has cancelled the action. A null control, or one whose
+    /// `struct_size` does not reach `user_data`, reports `false`.
+    ///
+    /// # Safety
+    /// `control` must be null or point to a control that the host keeps valid
+    /// until the action callback returns.
+    pub unsafe fn poll_cancelled(control: *const Self) -> bool {
+        // SAFETY: `struct_size` is the leading u32, so reading it needs only the
+        // four bytes every host supplies.
+        let Some(size) = (unsafe { control.cast::<u32>().as_ref() }).copied() else {
+            return false;
+        };
+        let reached = core::mem::offset_of!(Self, user_data) + core::mem::size_of::<*mut c_void>();
+        if (size as usize) < reached {
+            return false;
+        }
+        let base = control.cast::<u8>();
+        // SAFETY: the host's `struct_size` covers both fields read here, and the
+        // caller keeps the control valid for the call.
+        let (is_cancelled, user_data) = unsafe {
+            (
+                base.add(core::mem::offset_of!(Self, is_cancelled))
+                    .cast::<OAuthRequestCancelledFn>()
+                    .read(),
+                base.add(core::mem::offset_of!(Self, user_data))
+                    .cast::<*mut c_void>()
+                    .read(),
+            )
+        };
+        is_cancelled(user_data) != 0
+    }
+}
+
+/// OAuth action callback that can observe cancellation through an
+/// [`OAuthRequestControl`]. The envelope and output contract match
+/// [`OAuthRequestFn`]. A host that supports cancellation passes a non-null
+/// `control` to every call. The callback must poll it during any long wait and
+/// return promptly with a nonzero status once it reports cancellation.
+///
+/// A legacy fallback registered through `register_oauth_provider` may pass a
+/// control from [`OAuthRequestControl::uncancellable`], which is never cancelled.
+pub type OAuthRequestControlFn = extern "C" fn(
+    req_json: StbStringRef,
+    control: *const OAuthRequestControl,
+    out: *mut StbString,
+    user_data: *mut c_void,
+) -> i32;
+
 // ---------------------------------------------------------------------------
 // Unified ABI — single struct, version inside
 // ---------------------------------------------------------------------------
@@ -1604,9 +1690,57 @@ pub struct PluginApi {
     /// schema and execution remain available without any prompt contribution.
     pub register_tool_prompt:
         Option<extern "C" fn(name: StbStringRef, metadata_json: StbStringRef) -> i32>,
+    /// Cancellable OAuth registration, appended after `register_tool_prompt`.
+    /// Its callback takes an [`OAuthRequestControl`] and must poll it during long
+    /// waits. A host that predates this slot leaves it `None`. Plugins should
+    /// register through [`register_oauth_provider_cancellable`], which falls back
+    /// to `register_oauth_provider` on such a host.
+    pub register_oauth_provider_cancellable: Option<
+        extern "C" fn(
+            manifest_json: StbStringRef,
+            request_fn: OAuthRequestControlFn,
+            plugin_free_string: FreeStringFn,
+            user_data: *mut c_void,
+        ) -> i32,
+    >,
 }
 unsafe impl Send for PluginApi {}
 unsafe impl Sync for PluginApi {}
+
+/// Register an OAuth provider whose action callback can observe cancellation.
+///
+/// Uses `register_oauth_provider_cancellable` when the host provides it. An older
+/// host leaves that slot `None`, so `legacy_request_fn` is registered through
+/// `register_oauth_provider` instead. Actions on that host run to completion
+/// because the host cannot cancel them. `legacy_request_fn` should call
+/// `request_fn` with [`OAuthRequestControl::uncancellable`]. Returns the host's
+/// registration status, or `-1` when the host offers neither slot.
+pub fn register_oauth_provider_cancellable(
+    api: &PluginApi,
+    manifest_json: &str,
+    request_fn: OAuthRequestControlFn,
+    legacy_request_fn: OAuthRequestFn,
+    user_data: *mut c_void,
+) -> i32 {
+    let free = callbacks::free_string;
+    if let Some(register) = api.register_oauth_provider_cancellable {
+        register(
+            StbStringRef::from_str(manifest_json),
+            request_fn,
+            free,
+            user_data,
+        )
+    } else if let Some(register) = api.register_oauth_provider {
+        register(
+            StbStringRef::from_str(manifest_json),
+            legacy_request_fn,
+            free,
+            user_data,
+        )
+    } else {
+        -1
+    }
+}
 
 /// Unified ABI plugin entrypoint signature: `(api)`. The version is read from
 /// `api->abi_version`.
@@ -1996,6 +2130,7 @@ mod tests {
             register_tool_with_wake: None,
             register_plugin_lifecycle: None,
             register_tool_prompt: None,
+            register_oauth_provider_cancellable: None,
         };
         // All optional slots are null → plugin must degrade.
         assert!(api.register_tool.is_none());
@@ -2013,6 +2148,7 @@ mod tests {
             !core::mem::needs_drop::<ProviderStreamControl>(),
             "the control struct is fn pointers + a u32: it must stay Copy/POD"
         );
+        assert!(!core::mem::needs_drop::<OAuthRequestControl>());
     }
 
     /// New vtable slots must be **appended**, never inserted.
@@ -2089,18 +2225,21 @@ mod tests {
             core::mem::offset_of!(PluginApi, register_tool_with_wake),
             "wake registration must follow streaming registration"
         );
+        let lifecycle = core::mem::offset_of!(PluginApi, register_plugin_lifecycle);
         assert_eq!(
-            core::mem::offset_of!(PluginApi, register_plugin_lifecycle),
+            lifecycle,
             core::mem::offset_of!(PluginApi, register_tool_with_wake) + size_of::<usize>()
         );
+        let tool_prompt = core::mem::offset_of!(PluginApi, register_tool_prompt);
+        assert_eq!(tool_prompt, lifecycle + size_of::<usize>());
+        // The cancellable OAuth slot is the newest and therefore the last field.
+        let cancellable = core::mem::offset_of!(PluginApi, register_oauth_provider_cancellable);
         assert_eq!(
-            core::mem::offset_of!(PluginApi, register_tool_prompt),
-            core::mem::offset_of!(PluginApi, register_plugin_lifecycle) + size_of::<usize>()
+            cancellable,
+            tool_prompt + size_of::<usize>(),
+            "register_oauth_provider_cancellable must be appended after register_tool_prompt"
         );
-        assert_eq!(
-            size_of::<PluginApi>(),
-            core::mem::offset_of!(PluginApi, register_tool_prompt) + size_of::<usize>()
-        );
+        assert_eq!(size_of::<PluginApi>(), cancellable + size_of::<usize>());
         assert_eq!(align_of::<PluginApi>(), align_of::<*const ()>());
     }
 
@@ -2176,6 +2315,7 @@ mod tests {
             register_tool_with_wake: None,
             register_plugin_lifecycle: None,
             register_tool_prompt: None,
+            register_oauth_provider_cancellable: None,
         }
     }
 
@@ -2229,6 +2369,7 @@ mod tests {
             core::mem::offset_of!(PluginApi, register_tool_with_wake),
             core::mem::offset_of!(PluginApi, register_plugin_lifecycle),
             core::mem::offset_of!(PluginApi, register_tool_prompt),
+            core::mem::offset_of!(PluginApi, register_oauth_provider_cancellable),
         ] {
             let mut api = entrypoint_test_api();
             api.struct_size = size as u32;
@@ -2254,6 +2395,7 @@ mod tests {
                     assert!(api.register_tool_with_wake.is_none());
                     assert!(api.register_plugin_lifecycle.is_none());
                     assert!(api.register_tool_prompt.is_none());
+                    assert!(api.register_oauth_provider_cancellable.is_none());
                     assert!(
                         api.register_provider.is_some(),
                         "one-shot fallback remains available"
@@ -2279,11 +2421,140 @@ mod tests {
         for size in [
             core::mem::offset_of!(PluginApi, declare) - 1,
             core::mem::offset_of!(PluginApi, register_streaming_provider) + 1,
+            core::mem::offset_of!(PluginApi, register_oauth_provider_cancellable) + 1,
         ] {
             let mut api = entrypoint_test_api();
             api.struct_size = size as u32;
             let rc = unsafe { register_entrypoint(&api, |_| panic!("incomplete ABI layout")) };
             assert_eq!(rc, 3);
         }
+    }
+
+    #[test]
+    fn oauth_request_control_layout_is_pinned() {
+        use core::mem::{align_of, offset_of, size_of};
+        // Three words after the leading u32, with the pointers aligned: the
+        // same shape on 32-bit and 64-bit targets.
+        assert_eq!(offset_of!(OAuthRequestControl, struct_size), 0);
+        assert_eq!(
+            offset_of!(OAuthRequestControl, is_cancelled),
+            size_of::<*const ()>()
+        );
+        assert_eq!(
+            offset_of!(OAuthRequestControl, user_data),
+            2 * size_of::<*const ()>()
+        );
+        assert_eq!(size_of::<OAuthRequestControl>(), 3 * size_of::<*const ()>());
+        assert_eq!(align_of::<OAuthRequestControl>(), align_of::<*const ()>());
+        assert!(!core::mem::needs_drop::<OAuthRequestControl>());
+    }
+
+    extern "C" fn cancelled_now(_: *mut c_void) -> i32 {
+        1
+    }
+
+    #[test]
+    fn oauth_request_control_is_polled_only_when_the_host_supplied_it() {
+        let mut control = OAuthRequestControl::uncancellable();
+        // SAFETY: null is an accepted input; the other controls are live locals.
+        assert!(!unsafe { OAuthRequestControl::poll_cancelled(core::ptr::null()) });
+        assert!(!unsafe { OAuthRequestControl::poll_cancelled(&control) });
+        control.is_cancelled = cancelled_now;
+        assert!(unsafe { OAuthRequestControl::poll_cancelled(&control) });
+        // A host that supplied only the leading u32, or stopped before
+        // `user_data`, is never polled through the missing fields.
+        control.struct_size = core::mem::size_of::<u32>() as u32;
+        assert!(!unsafe { OAuthRequestControl::poll_cancelled(&control) });
+        control.struct_size = core::mem::offset_of!(OAuthRequestControl, user_data) as u32;
+        assert!(!unsafe { OAuthRequestControl::poll_cancelled(&control) });
+    }
+
+    std::thread_local! {
+        static OAUTH_SLOT: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
+    }
+
+    extern "C" fn record_cancellable_oauth(
+        _: StbStringRef,
+        _: OAuthRequestControlFn,
+        _: FreeStringFn,
+        _: *mut c_void,
+    ) -> i32 {
+        OAUTH_SLOT.with(|slot| slot.set("cancellable"));
+        1
+    }
+
+    extern "C" fn record_legacy_oauth(
+        _: StbStringRef,
+        _: OAuthRequestFn,
+        _: FreeStringFn,
+        _: *mut c_void,
+    ) -> i32 {
+        OAUTH_SLOT.with(|slot| slot.set("legacy"));
+        1
+    }
+
+    extern "C" fn unused_control_request(
+        _: StbStringRef,
+        _: *const OAuthRequestControl,
+        _: *mut StbString,
+        _: *mut c_void,
+    ) -> i32 {
+        0
+    }
+
+    extern "C" fn unused_legacy_request(_: StbStringRef, _: *mut StbString, _: *mut c_void) -> i32 {
+        0
+    }
+
+    #[test]
+    fn oauth_registration_prefers_cancellable_slot_and_falls_back_to_legacy() {
+        let manifest = r#"{"id":"acme"}"#;
+        let register = |api: &PluginApi| {
+            register_oauth_provider_cancellable(
+                api,
+                manifest,
+                unused_control_request,
+                unused_legacy_request,
+                core::ptr::null_mut(),
+            )
+        };
+
+        // A current host offers both slots: the cancellable one is used.
+        let mut current = entrypoint_test_api();
+        current.register_oauth_provider = Some(record_legacy_oauth);
+        current.register_oauth_provider_cancellable = Some(record_cancellable_oauth);
+        assert_eq!(register(&current), 1);
+        assert_eq!(OAUTH_SLOT.with(std::cell::Cell::get), "cancellable");
+
+        // A host that predates the slot: its vtable ends where the slot begins.
+        // The entrypoint normalizes the missing slot to `None`, so the legacy
+        // slot receives the registration.
+        let size = core::mem::offset_of!(PluginApi, register_oauth_provider_cancellable);
+        let mut old = entrypoint_test_api();
+        old.struct_size = size as u32;
+        old.register_oauth_provider = Some(record_legacy_oauth);
+        old.register_oauth_provider_cancellable = None;
+        let mut buffer = vec![0usize; size / core::mem::size_of::<usize>()];
+        // SAFETY: the buffer holds exactly the old layout's `size` bytes.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (&old as *const PluginApi).cast::<u8>(),
+                buffer.as_mut_ptr().cast::<u8>(),
+                size,
+            );
+        }
+        let rc = unsafe {
+            register_entrypoint(buffer.as_ptr().cast(), |api| {
+                assert!(api.register_oauth_provider_cancellable.is_none());
+                register(api)
+            })
+        };
+        assert_eq!(rc, 1);
+        assert_eq!(OAUTH_SLOT.with(std::cell::Cell::get), "legacy");
+
+        // A host with neither slot cannot register the provider.
+        let mut none = entrypoint_test_api();
+        none.register_oauth_provider = None;
+        assert_eq!(register(&none), -1);
     }
 }

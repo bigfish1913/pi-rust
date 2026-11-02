@@ -179,7 +179,7 @@ fn image_source_raw_json_has_one_base64_discriminator() {
     let restored: AnthropicImageSource = serde_json::from_str(&raw).unwrap();
     assert_eq!(restored.kind, "base64");
     assert_eq!(restored.media_type, "image/png");
-    assert_eq!(restored.data, PNG);
+    assert_eq!(&*restored.data, PNG);
 }
 
 #[tokio::test]

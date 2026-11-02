@@ -68,6 +68,8 @@ webp = ["image/webp"]
 # Already locked transitively; safe file-identity handles let receipts share one
 # reader across appends while still detecting atomic pathname replacement.
 same-file = "1.0.6"
+rpi-plugin-sdk = { workspace = true, features = ["process"] }
+win32job = "2"
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [target.'cfg(unix)'.dependencies]
