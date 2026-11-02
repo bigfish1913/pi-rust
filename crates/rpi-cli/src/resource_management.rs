@@ -82,6 +82,20 @@ fn identifier(s: &str) -> Result<()> {
     {
         return Err("invalid resource identity (portable ASCII name required)".into());
     }
+    reserved_identity(s)
+}
+
+// Existing native link records allow leading '_' and '.', unlike new managed
+// identities. Accept that grammar only for safe on-disk package components.
+fn legacy_package_identity(s: &str) -> Result<()> {
+    if !crate::packages::valid_name(s) {
+        return Err("invalid native package identity".into());
+    }
+    relative(Path::new(s))?;
+    reserved_identity(s)
+}
+
+fn reserved_identity(s: &str) -> Result<()> {
     let stem = s.split('.').next().unwrap().to_ascii_uppercase();
     if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
         || (stem.len() == 4
@@ -470,14 +484,16 @@ fn packages(root: &Path) -> Result<Packages> {
     let p: Packages = read_json(&root.join("packages.json"))?;
     let mut names = BTreeSet::new();
     for item in &p.packages {
-        identifier(&item.name)?;
+        legacy_package_identity(&item.name)?;
         if !names.insert(item.name.to_ascii_lowercase()) {
             return Err("duplicate native package identity".into());
         }
+        let mut artifacts = BTreeSet::new();
         for a in &item.artifacts {
             relative(Path::new(a))?;
-            if Path::new(a).components().count() != 1 {
-                return Err("unsafe native artifact".into());
+            reserved_identity(a)?;
+            if Path::new(a).components().count() != 1 || !artifacts.insert(a.to_ascii_lowercase()) {
+                return Err("unsafe/duplicate native artifact".into());
             }
         }
     }
@@ -491,6 +507,11 @@ pub(crate) fn legacy_unowned(root: &Path, kind: &str, name: &str) -> Result<()> 
         .any(|r| r.kind == kind && r.name.eq_ignore_ascii_case(name))
     {
         return Err("resource is managed by rpi resource; use its update/remove commands".into());
+    }
+    if kind == Kind::Package {
+        legacy_package_identity(name)?;
+        let package = root.join(kind.target(name));
+        legacy_unowned_targets(root, &[package.clone(), package.join("extensions")])?;
     }
     Ok(())
 }
@@ -663,6 +684,12 @@ fn copy_snapshot(source: &Path, target: &Path, observed: &Inventory) -> Result<(
     fn copy_file(source: &Path, target: &Path, expected: u64) -> Result<()> {
         checked_path(source)?;
         let input = File::open(source).map_err(err)?;
+        #[cfg(unix)]
+        let mode = {
+            use std::os::unix::fs::PermissionsExt;
+            // Only ordinary rwx permissions; never copy setuid/setgid/sticky.
+            input.metadata().map_err(err)?.permissions().mode() & 0o777
+        };
         let mut output = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -671,6 +698,13 @@ fn copy_snapshot(source: &Path, target: &Path, observed: &Inventory) -> Result<(
         let copied = std::io::copy(&mut input.take(expected + 1), &mut output).map_err(err)?;
         if copied != expected {
             return Err("resource changed during bounded copy".into());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            output
+                .set_permissions(fs::Permissions::from_mode(mode))
+                .map_err(err)?;
         }
         output.sync_all().map_err(err)
     }
@@ -860,7 +894,11 @@ fn parse(args: &[String]) -> Result<Options> {
             return Err("expected KIND NAME".into());
         }
         o.kind = Some(Kind::parse(&pos[0])?);
-        identifier(&pos[1])?;
+        if o.op == "inspect" && o.kind == Some(Kind::Package) {
+            legacy_package_identity(&pos[1])?;
+        } else {
+            identifier(&pos[1])?;
+        }
         o.name = Some(pos[1].clone());
         let mutation = matches!(o.op.as_str(), "install" | "update" | "reinstall");
         if mutation != o.source.is_some() || (!mutation && o.version.is_some()) {
