@@ -481,7 +481,24 @@ where
     let mut run_cancel = tokio_util::sync::CancellationToken::new();
     let mut cancel_on_exit = false;
 
-    write_line(&stdout, &rpc_protocol::ready(message_updates)).await;
+    let mut ready = rpc_protocol::ready(message_updates);
+    ready["resourceState"] = serde_json::json!({
+        "version": 1, "enabled": harness.has_exact_resources(), "command": "get_resource_state",
+        "maxSnapshotBytes": crate::resource_selection::MAX_STATE_BYTES,
+        "changes": "restart-required", "setActiveTools": if harness.has_exact_resources() { "unsupported" } else { "legacy" },
+        "configureExternalTools": if harness.has_exact_resources() { "unsupported" } else { "supported" },
+        "automaticPersistenceRecovery": false, "hotApply": false
+    });
+    if harness.has_exact_resources() {
+        if let Ok(state) = crate::resource_selection::get_resource_state(harness).await {
+            for key in ["hostId", "host", "sessionId", "selection"] {
+                ready["resourceState"][key] = state[key].clone();
+            }
+        } else {
+            ready["resourceState"]["enabled"] = serde_json::json!(false);
+        }
+    }
+    write_line(&stdout, &ready).await;
 
     loop {
         let incoming = tokio::select! {
@@ -540,6 +557,19 @@ where
             .unwrap_or("")
             .to_string();
 
+        if kind == "get_resource_state" && serde_json::to_vec(&id).map_or(true, |v| v.len() > 4096)
+        {
+            write_line(
+                &stdout,
+                &rpc_protocol::response(
+                    None,
+                    &kind,
+                    Err("resource state request id exceeds 4096 bytes".into()),
+                ),
+            )
+            .await;
+            continue;
+        }
         if kind != "prompt"
             && rpc_protocol::SUPPORTED_COMMANDS.contains(&kind.as_str())
             && serde_json::from_value::<rpc_protocol::Request>(msg.clone()).is_err()
@@ -764,6 +794,14 @@ where
                             "error": error,
                             "summary": summary,
                             "pendingResume": pending_resume,
+                            // Present when this settlement also aborted a run:
+                            // the queue the abort reclaimed, so nothing staged
+                            // is silently swallowed.
+                            "reclaimed": result
+                                .as_ref()
+                                .ok()
+                                .and_then(|value| value.get("reclaimed"))
+                                .cloned(),
                         });
                         write_line(&out_task, &settled).await;
                         mailbox_task.cancel_all();
@@ -781,14 +819,17 @@ where
                 // Keep wrapper cancellation for pre-admission aborts, but signal
                 // an admitted harness run before retiring external broker waiters.
                 run_cancel.cancel();
-                let _ = lane.abort().await;
+                let result = lane.abort().await;
                 external_tools.abort();
-                Ok(serde_json::json!({"aborted": true}))
+                // Hand the reclaimed queue back: the caller is a remote UI with
+                // an editor to restore into. Discarding it would silently swallow
+                // messages the user staged while the run was in flight.
+                abort_result_reply(result)
             }
             "abort" => {
-                let result = lane.abort().await.map_err(|e| e.to_string());
+                let result = lane.abort().await;
                 external_tools.abort();
-                result.map(|_| serde_json::json!({"aborted": true}))
+                abort_result_reply(result)
             }
             "configure_external_tools" => {
                 rpc_configure_external_tools(
@@ -826,6 +867,17 @@ where
                 }
                 Ok(serde_json::json!({"accepted": owner.file_io.as_ref()
                     .is_some_and(|client| client.resolve_response(&reply))}))
+            }
+            "get_resource_state" => {
+                if msg.as_object().is_none_or(|o| {
+                    o.keys()
+                        .any(|k| !["type", "id", "version"].contains(&k.as_str()))
+                }) || msg.get("version").is_some_and(|v| v.as_u64() != Some(1))
+                {
+                    Err("unsupported resource state request/schema (version 1 only)".into())
+                } else {
+                    crate::resource_selection::get_resource_state(harness).await
+                }
             }
             "get_state" => Ok(rpc_get_state(&lane, harness).await),
             "get_commands" => Ok(rpc_get_commands(oauth_snapshot.as_deref())),
@@ -1178,13 +1230,32 @@ async fn rpc_prompt_cancellable(
     tokio::select! {
         biased;
         _ = cancel.cancelled() => {
+            // `abort()` reclaims the queue atomically. The entries are not
+            // dropped: they ride back on the settlement so the client can
+            // restore what the user staged while the run was in flight.
             match lane.abort().await {
-                Ok(_) => prompt.await,
+                Ok(reclaimed) => prompt.await.map(|mut value| {
+                    if let Some(object) = value.as_object_mut() {
+                        object.insert(
+                            "reclaimed".to_string(),
+                            reclaimed_payload(&reclaimed),
+                        );
+                    }
+                    value
+                }),
                 Err(_) => Err("Operation aborted".to_string()),
             }
         }
         result = &mut prompt => result,
     }
+}
+
+/// Reclaimed queue entries from an abort, for replies that also settle a run.
+fn reclaimed_payload(result: &rpi_harness::agent_harness::AbortResult) -> serde_json::Value {
+    serde_json::json!({
+        "steer": crate::extensions_actions::queued_message_payloads(&result.steer),
+        "followUp": crate::extensions_actions::queued_message_payloads(&result.follow_up),
+    })
 }
 
 /// Compact the branch, unless the caller cancels first.
@@ -1344,7 +1415,15 @@ async fn rpc_get_state(lane: &Arc<dyn AgentLane>, harness: &AgentHarness) -> ser
         .await
         .ok()
         .map(|t| serde_json::to_value(t).unwrap_or(serde_json::Value::Null));
-    let active_tools = lane.get_active_tools().await.unwrap_or_default();
+    let active_tools = if harness.has_exact_resources() {
+        harness
+            .execution_context()
+            .ok()
+            .and_then(|v| v.get("tools").cloned())
+            .unwrap_or_else(|| serde_json::json!([]))
+    } else {
+        serde_json::json!(lane.get_active_tools().await.unwrap_or_default())
+    };
     let leaf_id = lane.get_leaf_id().await.ok().flatten();
     let context = rpc_context_usage(lane, harness).await;
     let active_operation = lane
@@ -1372,8 +1451,19 @@ async fn rpc_get_state(lane: &Arc<dyn AgentLane>, harness: &AgentHarness) -> ser
         "sessionId": harness.session().storage().metadata().id,
         "activeOperation": active_operation,
         "queue": {
-            "steering": queued.steering,
-            "followUp": queued.follow_up,
+            // Text-only view: these consumers render a single-line pending row.
+            // Attachments travel in the `Abort` / `ClearQueue` replies, which
+            // keep the per-message pairing.
+            //
+            // Each queue is serialized on its own. `texts()` chains steering and
+            // follow-up, so using it here would put follow-up texts in the
+            // `steering` field and duplicate them in `followUp`.
+            "steering": queued
+                .steering
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
+            "followUp": queued.follow_up.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
             "steeringCount": queued.steering.len(),
             "followUpCount": queued.follow_up.len(),
         },
@@ -1630,6 +1720,7 @@ async fn rpc_append_entry(
         .and_then(serde_json::Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| "append_entry requires a non-empty string `customType`".to_string())?;
+    crate::resource_selection::validate_public_entry(custom_type, msg.get("data"))?;
     let entry_id = harness
         .session()
         .append_custom_entry(custom_type, msg.get("data").cloned())
@@ -1806,6 +1897,37 @@ async fn rpc_cancel_queued(
     }))
 }
 
+/// The `abort` reply. Reclaimed queue entries travel back as `{text, images}`
+/// so a remote UI can restore them instead of losing staged input.
+fn abort_response(result: &rpi_harness::agent_harness::AbortResult) -> serde_json::Value {
+    serde_json::json!({
+        "aborted": true,
+        "steer": crate::extensions_actions::queued_message_payloads(&result.steer),
+        "followUp": crate::extensions_actions::queued_message_payloads(&result.follow_up),
+    })
+}
+
+/// Map a lane abort to its RPC reply.
+///
+/// A stop button is idempotent: an already-idle lane reports success with
+/// nothing reclaimed instead of surfacing `NoActiveRun`. Any other error is
+/// still reported.
+fn abort_result_reply(
+    result: Result<rpi_harness::agent_harness::AbortResult, rpi_harness::result::HarnessError>,
+) -> Result<serde_json::Value, String> {
+    match result {
+        Ok(result) => Ok(abort_response(&result)),
+        Err(rpi_harness::result::HarnessError::NoActiveRun { .. }) => {
+            Ok(abort_response(&rpi_harness::agent_harness::AbortResult {
+                run_id: String::new(),
+                steer: Vec::new(),
+                follow_up: Vec::new(),
+            }))
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 async fn rpc_clear_queue(lane: &Arc<dyn AgentLane>) -> Result<serde_json::Value, String> {
     let result = lane
         .clear_queue()
@@ -1813,8 +1935,14 @@ async fn rpc_clear_queue(lane: &Arc<dyn AgentLane>) -> Result<serde_json::Value,
         .map_err(|error| error.to_string())?;
     Ok(serde_json::json!({
         "cleared": result.steering.len() + result.follow_up.len(),
-        "steering": result.steering,
-        "followUp": result.follow_up,
+        // Independent per-queue views; `texts()` would mix the two and
+        // duplicate follow-up entries into `steering`.
+        "steering": result
+            .steering
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect::<Vec<_>>(),
+        "followUp": result.follow_up.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
     }))
 }
 
@@ -2276,7 +2404,15 @@ async fn rpc_get_available_tools(
     lane: &Arc<dyn AgentLane>,
     harness: &AgentHarness,
 ) -> serde_json::Value {
-    let active = lane.get_active_tools().await.unwrap_or_default();
+    let active: Vec<String> = if harness.has_exact_resources() {
+        harness
+            .execution_context()
+            .ok()
+            .and_then(|v| serde_json::from_value(v["tools"].clone()).ok())
+            .unwrap_or_default()
+    } else {
+        lane.get_active_tools().await.unwrap_or_default()
+    };
     let tools = harness
         .get_tools()
         .await
@@ -2340,10 +2476,14 @@ async fn rpc_set_active_tools(
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|v| v.as_str().map(str::to_owned))
-                .collect::<Vec<_>>()
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_owned)
+                        .ok_or("tool names must be strings")
+                })
+                .collect::<Result<Vec<_>, _>>()
         })
-        .ok_or("set_active_tools requires a `tools` array")?;
+        .ok_or("set_active_tools requires a `tools` array")??;
     lane.set_active_tools(tools.clone())
         .await
         .map_err(|e| e.to_string())?;
@@ -2608,6 +2748,39 @@ mod tests {
         AssistantMessage, Content, StopReason, TextContent, TextContentType, Usage,
     };
     use rpi_harness::session::types::OperationError;
+
+    /// Regression: the abort reply must carry the reclaimed queue back instead
+    /// of only `{aborted:true}`, and each queue must be reported separately.
+    #[test]
+    fn abort_response_hands_back_the_reclaimed_queues() {
+        let user = |text: &str| {
+            rpi_agent::AgentMessage::User(rpi_ai::types::UserMessage::new(
+                rpi_ai::types::UserContent::Text(text.to_string()),
+                0,
+            ))
+        };
+        let result = rpi_harness::agent_harness::AbortResult {
+            run_id: "run-1".to_string(),
+            steer: vec![user("S")],
+            follow_up: vec![user("F")],
+        };
+
+        let reply = abort_response(&result);
+        assert_eq!(reply["aborted"], serde_json::json!(true));
+        assert_eq!(reply["steer"][0]["text"], serde_json::json!("S"));
+        assert_eq!(reply["followUp"][0]["text"], serde_json::json!("F"));
+        // Steering must not absorb the follow-up entry.
+        assert_eq!(reply["steer"].as_array().unwrap().len(), 1);
+
+        // The wrapper-cancellation path reports the same shape.
+        assert_eq!(
+            reclaimed_payload(&result),
+            serde_json::json!({
+                "steer": reply["steer"].clone(),
+                "followUp": reply["followUp"].clone(),
+            })
+        );
+    }
 
     include!("rpc/external_tools_configuration_tests.rs");
     include!("rpc/external_tools_lifecycle_tests.rs");

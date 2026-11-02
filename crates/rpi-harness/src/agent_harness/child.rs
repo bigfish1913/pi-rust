@@ -95,8 +95,7 @@ impl AgentHarness {
             .iter()
             .filter(|tool| {
                 let name = &tool.tool.schema().name;
-                name != "delegate_task"
-                    && (snap.active_tool_names.is_empty() || snap.active_tool_names.contains(name))
+                name != "delegate_task" && snap.active_tool_names.contains(name)
             })
             .cloned()
             .collect();

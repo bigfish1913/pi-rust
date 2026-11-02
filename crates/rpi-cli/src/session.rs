@@ -377,6 +377,8 @@ pub fn default_session_dir(cwd: &Path) -> PathBuf {
 /// Extensions are loaded exactly once before model resolution. Their action
 /// host remains unbound until the harness and authenticated catalog exist.
 pub struct PreparedExtensions {
+    resource_selection: Option<crate::resource_selection::ResolvedSelection>,
+    session_selection: SessionSelection,
     pub extension_session: ExtensionSession,
     session_dir: PathBuf,
     runtime: tokio::runtime::Handle,
@@ -390,12 +392,98 @@ pub struct PreparedExtensions {
     action_bridge: Arc<rpi_extensions::ActionBridge>,
 }
 
+/// Validate native durable resource ownership BEFORE loading any executable code.
+/// The synchronous public prepare_extensions API is retained: a scoped reader
+/// thread uses its own runtime so this also works inside current-thread Tokio.
+/// It does no registration, provider callbacks, session creation, or lock claiming.
+pub(crate) fn preflight_extension_startup(
+    args: &Args,
+    cwd: &Path,
+    trusted: bool,
+) -> Result<
+    (
+        Option<crate::resource_selection::ResolvedSelection>,
+        SessionSelection,
+    ),
+    BuildError,
+> {
+    let mut resources = crate::resource_selection::ResolvedSelection::load(args, cwd, trusted)
+        .map_err(BuildError::HarnessCreate)?;
+    let selection = select_session(args, cwd);
+    let pinned = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| BuildError::SessionOpen(e.to_string()))?
+                    .block_on(async {
+                        if let Some(selected) = &mut resources {
+                            let env: Arc<dyn rpi_tools::ExecutionEnv> =
+                                Arc::new(OsExecutionEnv::with_cwd(cwd.to_path_buf()));
+                            selected
+                                .validate_skills(&env)
+                                .await
+                                .map_err(BuildError::HarnessCreate)?;
+                        }
+                        let cwd_str = cwd.to_string_lossy();
+                        let target = match &selection {
+                            SessionSelection::Fork { source, dir } => {
+                                match session_metadata_at(Path::new(source)) {
+                                    Some(meta) => Some(meta),
+                                    None => find_session_metadata(source, &cwd_str, dir).await?,
+                                }
+                            }
+                            _ => resolve_restore_target(&selection, &cwd_str).await?,
+                        };
+                        let Some(meta) = target else {
+                            return Ok(selection.clone());
+                        };
+                        use rpi_harness::session::jsonl::{
+                            JsonlSessionRepo, JsonlSessionRepoOptions,
+                        };
+                        let dir = selection_dir(&selection);
+                        let repo = JsonlSessionRepo::with_env_cwd(JsonlSessionRepoOptions {
+                            fs: Arc::new(OsExecutionEnv::with_cwd(cwd.to_path_buf())),
+                            sessions_root: dir.to_string_lossy().into_owned(),
+                            clock: Arc::new(SystemClock),
+                            ids: Arc::new(DefaultIdGenerator::new()),
+                        });
+                        let storage = repo
+                            .read_snapshot_by_jsonl_metadata(&meta)
+                            .await
+                            .map_err(|e| BuildError::SessionOpen(e.to_string()))?;
+                        let session = Session::new(Arc::new(storage), None);
+                        crate::resource_selection::bind_session(&session, resources.as_ref())
+                            .await
+                            .map_err(BuildError::SessionOpen)?;
+                        Ok(match selection {
+                            SessionSelection::Fork { .. } => SessionSelection::Fork {
+                                source: meta.path,
+                                dir,
+                            },
+                            _ => SessionSelection::ByExactId { id: meta.id, dir },
+                        })
+                    })
+            })
+            .join()
+            .map_err(|_| BuildError::SessionOpen("resource preflight reader panicked".into()))?
+    })?;
+    Ok((resources, pinned))
+}
+
 pub fn prepare_extensions(
     args: &Args,
     cwd: &Path,
     project_trusted: bool,
 ) -> Result<PreparedExtensions, BuildError> {
-    let session_dir = configured_session_dir(args, cwd);
+    let (resource_selection, session_selection) =
+        preflight_extension_startup(args, cwd, project_trusted)?;
+    let session_dir = if matches!(session_selection, SessionSelection::Ephemeral) {
+        configured_session_dir(args, cwd)
+    } else {
+        selection_dir(&session_selection)
+    };
     let cwd_str = cwd.to_string_lossy().to_string();
     let tool_context = rpi_extensions::ToolCallContext::new(cwd_str.clone());
     if !project_trusted && args.verbose {
@@ -468,7 +556,25 @@ pub fn prepare_extensions(
         editor_text_mailbox.clone(),
     );
 
-    let extension_session = if args.no_extensions {
+    let extension_session = if let Some(selected) = &resource_selection {
+        let session = rpi_extensions::load_session_mixed(
+            &[],
+            &selected.extensions,
+            Arc::new(NullDiagnostics),
+            Some(Arc::clone(&action_bridge)),
+        );
+        if session.loaded_paths() != selected.extensions.as_slice() {
+            return Err(BuildError::HarnessCreate(
+                "selected native extension failed to load/register".into(),
+            ));
+        }
+        if session.owns_stdio() {
+            return Err(BuildError::HarnessCreate(
+                "stdio-owning extensions are unsupported with --resource-config".into(),
+            ));
+        }
+        session
+    } else if args.no_extensions {
         ExtensionSession::none()
     } else {
         load_extensions(args, cwd, project_trusted, Some(Arc::clone(&action_bridge)))
@@ -485,6 +591,8 @@ pub fn prepare_extensions(
     // via `RuntimeActionHost::publish_registry`.
     action_host.publish_registry_impl(extension_session.snapshot_arc());
     Ok(PreparedExtensions {
+        resource_selection,
+        session_selection,
         session_dir,
         runtime,
         tool_context,
@@ -553,6 +661,8 @@ pub async fn build_prepared(
     // before the tools are built, and completed with the session id below once
     // the session exists — the tool set has to exist before the harness does.
     let PreparedExtensions {
+        resource_selection,
+        session_selection: selection,
         session_dir,
         runtime,
         tool_context,
@@ -589,7 +699,18 @@ pub async fn build_prepared(
     // the harness lifetime via the returned session guard. `--no-extensions`
     // skips discovery entirely (no dirs scanned, no plugins loaded).
     merge_extension_tools(&mut tools, &extension_session, args, &tool_context);
-    let active = filter_active_tool_names(active_tool_names(&tools, args), args);
+    let active = if let Some(selected) = &resource_selection {
+        selected
+            .active_tools(
+                &tools
+                    .iter()
+                    .map(|t| t.tool.schema().name.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(BuildError::HarnessCreate)?
+    } else {
+        filter_active_tool_names(active_tool_names(&tools, args), args)
+    };
 
     // ---- Session storage ----
     // The root is the one `prepare_extensions` froze at startup, never a fresh
@@ -597,8 +718,10 @@ pub async fn build_prepared(
     // can change while extensions load, and an adopted session cwd would point
     // at another project's tree. Both the cwd peek and this build must read the
     // same root, so the caller pins it into `args` before either runs.
-    let selection = select_session_in_dir(args, session_dir.clone());
     let session = build_session(&selection, &cwd_str).await?;
+    crate::resource_selection::bind_session(&session, resource_selection.as_ref())
+        .await
+        .map_err(BuildError::SessionOpen)?;
     // Plugin tools now know which session they serve: `todo` and friends key
     // their per-session state off it. A session without an id (ephemeral) leaves
     // the field unset and a plugin is expected to fall back to project scope.
@@ -642,12 +765,14 @@ pub async fn build_prepared(
     let mut context_paths = Vec::new();
     let base_prompt = match args.system_prompt.as_deref() {
         Some(explicit) => explicit.to_string(),
-        None if project_trusted => match discover_system_prompt_file(cwd) {
-            Some(path) => {
-                read_prompt_source(&path, &mut context_paths).unwrap_or_else(default_prompt)
+        None if project_trusted && resource_selection.is_none() => {
+            match discover_system_prompt_file(cwd) {
+                Some(path) => {
+                    read_prompt_source(&path, &mut context_paths).unwrap_or_else(default_prompt)
+                }
+                None => default_prompt(),
             }
-            None => default_prompt(),
-        },
+        }
         None => default_prompt(),
     };
 
@@ -662,7 +787,15 @@ pub async fn build_prepared(
         let text = read_append_target(extra, &mut context_paths).unwrap_or_else(|| extra.clone());
         append_texts.push(text);
     }
-    if args.append_system_prompt.is_empty() {
+    if let Some(selected) = &resource_selection {
+        append_texts.extend(
+            selected
+                .instructions
+                .iter()
+                .map(|(_, _, text)| text.clone()),
+        );
+    }
+    if args.append_system_prompt.is_empty() && resource_selection.is_none() {
         if let Some(path) = project_trusted
             .then(|| discover_append_system_prompt_file(cwd))
             .flatten()
@@ -708,13 +841,22 @@ pub async fn build_prepared(
     // A `--no-*` flag suppresses its channel for BOTH static and discovered paths.
     let discovered = extension_session
         .snapshot_arc()
+        .filter(|_| resource_selection.is_none())
         .map(|snap| emit_resources_discover(&cwd_str, "startup", &snap))
         .unwrap_or_default();
 
     let mut skills: Vec<rpi_harness::types::Skill> = Vec::new();
     let mut skill_diags: Vec<rpi_harness::skills::SkillDiagnostic> = Vec::new();
     let mut resource_diags: Vec<rpi_harness::diagnostics::ResourceDiagnostic> = Vec::new();
-    if !args.no_skills {
+    if let Some(selected) = &resource_selection {
+        // Consume the preflight's parsed resources, never rediscover or reread
+        // selected Skills after executable registration / writer opening.
+        skills = selected
+            .validated_skills()
+            .map_err(BuildError::HarnessCreate)?
+            .skills
+            .clone();
+    } else if !args.no_skills {
         let mut dirs = if args.dev_local_only || args.project_only {
             project_skill_dirs(cwd)
         } else if project_trusted {
@@ -732,7 +874,7 @@ pub async fn build_prepared(
 
     let mut prompt_templates: Vec<rpi_harness::types::PromptTemplate> = Vec::new();
     let mut prompt_diags: Vec<rpi_harness::prompt_templates::PromptTemplateDiagnostic> = Vec::new();
-    if !args.no_prompt_templates {
+    if !args.no_prompt_templates && resource_selection.is_none() {
         let mut dirs = if args.dev_local_only || args.project_only {
             project_prompt_template_dirs(cwd)
         } else if project_trusted {
@@ -748,7 +890,8 @@ pub async fn build_prepared(
         resource_diags.extend(result.resource_diagnostics);
     }
 
-    let context_block = if args.no_context_files || !project_trusted {
+    let context_block = if args.no_context_files || !project_trusted || resource_selection.is_some()
+    {
         String::new()
     } else {
         // `load_project_context_files` walks the global agentDir first then
@@ -958,7 +1101,7 @@ pub async fn build_prepared(
     let options = AgentHarnessOptions {
         model: resolved.model.clone(),
         thinking_level: resolved.thinking_level,
-        active_tool_names: active,
+        active_tool_names: active.clone(),
         tools,
         system_prompt: Some(system_prompt),
         resources: AgentHarnessResources {
@@ -1032,19 +1175,44 @@ pub async fn build_prepared(
             .map(|h| Arc::new(h) as Arc<dyn rpi_ai::ProviderHooks>),
     };
 
-    let harness = match AgentHarness::create(options).await {
-        Ok(h) => {
-            // Fill the extension action host now that the harness exists
-            // (plugin runtime_action calls can then reach it).
-            crate::extensions_actions::HarnessActionHost::set_harness(
-                &harness_cell,
-                Arc::new(h.clone()),
-            );
-            h
-        }
-        Err(e) => return Err(BuildError::HarnessCreate(e.to_string())),
-    };
+    let harness = AgentHarness::create(options)
+        .await
+        .map_err(|e| BuildError::HarnessCreate(e.to_string()))?;
 
+    if let Some(selected) = &resource_selection {
+        harness
+            .seal_resources(active)
+            .map_err(|e| BuildError::HarnessCreate(e.to_string()))?;
+        crate::resource_selection::attach(
+            &harness,
+            serde_json::json!({
+                "version": 1,
+                "hostId": uuid::Uuid::new_v4().to_string(),
+                "host": {"name": crate::APP_NAME, "version": crate::VERSION, "pid": std::process::id()},
+                "selection": selected.selection,
+                "package": selected.package,
+                "selectedSkills": selected.skills,
+                "skillDiagnostics": [],
+                "loadedExtensions": extension_session.loaded_paths().iter().map(|p| serde_json::json!({"identity": p.file_stem().and_then(|s| s.to_str()), "path": p})).collect::<Vec<_>>(),
+                "instructions": selected.provenance(),
+                "baseSystemPrompt": "native-default",
+                "projectContext": "disabled",
+                "resourceDiscovery": "disabled",
+                "changes": "restart-required"
+            }),
+        );
+        crate::resource_selection::get_resource_state(&harness)
+            .await
+            .map_err(BuildError::HarnessCreate)?;
+        crate::resource_selection::bind_inventory(&harness, selected)
+            .await
+            .map_err(BuildError::SessionOpen)?;
+    }
+    // Publish only after exact resources have been sealed and validated.
+    crate::extensions_actions::HarnessActionHost::set_harness(
+        &harness_cell,
+        Arc::new(harness.clone()),
+    );
     register_file_io_router(&harness, &file_io);
 
     // ---- Durable operation recovery (runtime layer) ----
@@ -1446,6 +1614,17 @@ async fn reload_extension_resources_inner<F>(
 where
     F: FnOnce() + Send,
 {
+    if harness.has_exact_resources() || ctx.args.resource_config.is_some() {
+        return ReloadOutcome {
+            summary:
+                "Exact resource selection is restart-required; reload/dev hot apply unsupported"
+                    .into(),
+            had_warnings: true,
+            details: Vec::new(),
+            had_errors: true,
+            project_trusted: None,
+        };
+    }
     // Resolve the arguments once for this reload. `rpi dev` may append its
     // freshly staged extension directory; every subsequent loader and policy
     // decision must observe that same effective set rather than falling back
@@ -2308,7 +2487,7 @@ fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
     all.push(("powershell", HarnessTool::new(create_powershell_tool(ctx))));
 
     // Apply default_tools from settings (if no CLI override)
-    if args.tools.is_none() {
+    if args.tools.is_none() && args.resource_config.is_none() {
         if let Ok(settings) = crate::settings::load_settings() {
             if let Some(default_tools) = &settings.default_tools {
                 all.retain(|(name, _)| default_tools.iter().any(|t| t == name));

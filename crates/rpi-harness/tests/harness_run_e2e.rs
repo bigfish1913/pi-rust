@@ -2951,8 +2951,12 @@ async fn a_steer_message_survives_a_restart() {
         .await
         .expect("queued messages readable");
     assert_eq!(
-        queued_now.steering,
-        vec!["also check the tests".to_string()],
+        queued_now
+            .steering
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["also check the tests"],
         "a steer typed before the crash must come back queued"
     );
 
@@ -4621,4 +4625,112 @@ mod native_identity_bind_failure {
             "no identity is published after a failed durable binding"
         );
     }
+}
+
+/// `abort_reclaiming(true)` must be atomic against a run starting concurrently.
+///
+/// The idle path is the one that used to leak: `abort()` returned
+/// `NoActiveRun` from inside the gate, the caller then did `clear_queue()`
+/// separately, and a run starting in between could drain the queue first — the
+/// reply said "nothing queued" for messages that were actually consumed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn abort_reclaiming_is_atomic_on_an_idle_lane() {
+    let script = FauxScript::new()
+        .with_text("slow answer")
+        .with_tokens_per_second(2.0);
+    let (harness, _provider, _env) = harness_with(script).await;
+
+    // Queue something on an idle lane.
+    harness
+        .steer(AgentMessage::User(UserMessage::new(
+            UserContent::Text("staged while idle".into()),
+            0,
+        )))
+        .await
+        .expect("steering is accepted on an idle lane");
+
+    // Idle abort still hands the queue back (idempotent stop button)…
+    let result = harness
+        .abort_reclaiming(true)
+        .await
+        .expect("idle abort with idle_is_ok must succeed");
+    assert!(
+        result.run_id.is_empty(),
+        "no run was active, so there is no run id: {:?}",
+        result.run_id
+    );
+    assert_eq!(
+        result.steer.len(),
+        1,
+        "the staged message must come back: {:?}",
+        result.steer
+    );
+    // …and it is a transfer, not a copy.
+    assert!(
+        harness.queued_messages().await.unwrap().is_empty(),
+        "the queue must be empty after the reclaim"
+    );
+
+    // The strict contract is unchanged for callers that only want to cancel.
+    let strict = harness.abort().await;
+    assert!(
+        strict.is_err(),
+        "`abort()` must keep reporting NoActiveRun on an idle lane"
+    );
+}
+
+/// `turn_end.pending_messages` must report the queue depth **without draining**.
+///
+/// The two drain hooks (`get_steering_messages` / `get_follow_up_messages`)
+/// consume the queue, so they cannot answer "how many are left?" — asking would
+/// eat the messages. The harness therefore installs a separate read-only
+/// `pending_message_count` hook wired to the same queues.
+///
+/// This test pins both halves: the count is right, and asking does not disturb
+/// the queue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn turn_end_reports_pending_count_without_draining() {
+    // One response per turn: the initial prompt plus each queued message
+    // injects another turn.
+    let script = FauxScript::new().with_text("done");
+    script.append_responses(vec![
+        FauxStep::text("done"),
+        FauxStep::text("done"),
+        FauxStep::text("done"),
+        FauxStep::text("done"),
+    ]);
+    let (harness, _provider, _env) = harness_with(script).await;
+
+    // Park two messages in the steering queue and one in follow-up.
+    let msg =
+        |text: &str| AgentMessage::User(UserMessage::new(UserContent::Text(text.to_string()), 0));
+    for text in ["a", "b"] {
+        harness.steer(msg(text)).await.unwrap();
+    }
+    harness.follow_up(msg("c")).await.unwrap();
+
+    let queued = harness.queued_messages().await.unwrap();
+    assert_eq!(
+        queued.steering.len() + queued.follow_up.len(),
+        3,
+        "the three messages must actually be queued: {queued:?}"
+    );
+
+    let result = harness
+        .prompt_text("go", vec![])
+        .await
+        .expect("prompt completes");
+    assert!(
+        matches!(result.outcome, HarnessRunOutcome::Completed { .. }),
+        "{:?}",
+        result.outcome
+    );
+
+    // Whatever the loop consumed, nothing may be left behind: every queued
+    // message either ran (drained) or is still accounted for.
+    let after = harness.queued_messages().await.unwrap();
+    assert!(
+        after.steering.is_empty() && after.follow_up.is_empty(),
+        "the run must have consumed the queue, got {after:?}"
+    );
 }

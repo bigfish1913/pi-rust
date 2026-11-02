@@ -454,6 +454,7 @@ Start with the [documentation index](docs/README.md), grouped by feature.
 - [Building an agent project](docs/agent/project-structure.md) — recommended structure
 - [Extension authoring](docs/extensions/authoring.md) — plugin templates and ABI rules
 - [Subagents](docs/extensions/subagents.md) — configuration inheritance, permissions and lifecycle
+- [Native RPC resource selection](docs/resource-selection-rpc.md) — exact startup Packages, Skills, extensions, instructions and tools (stage A)
 - [Remote mode](docs/remote/user-guide.md) — protocol, tokens, limitations
 - [Roadmap](ROADMAP.md) · [Changelog](CHANGELOG.md)
 - [docs.rs](https://docs.rs/rpi-cli) for per-crate API docs
