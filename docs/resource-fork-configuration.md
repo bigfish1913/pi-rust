@@ -3,9 +3,11 @@
 Fork scope and executable configuration are distinct:
 
 * An omitted branch target means the **actual main-lane leaf**, including a
-  trailing custom/resource binding entry. Copy its entire ordinary branch; do
-  not find a message ancestor. Explicit targets remain message-only, including
-  the existing Before/At defaults and validation. Tree scope remains tree scope.
+  trailing model/thinking change or custom/resource binding entry. Copy its
+  entire ordinary branch; do not find a message ancestor. This lets a fork after
+  a model/thinking switch succeed without discarding the newer state. Explicit
+  targets remain message-only, including the existing Before/At defaults and
+  validation. Tree scope remains tree scope.
 * Native host forks/clones inherit the source's **current** exact declaration
   and validated inventory, independently of an explicit historical message cut.
   They do not reactivate an older package from historical branch entries.
@@ -43,6 +45,8 @@ potentially authoritative inherited ledger has already been published.
 
 ## Regression coverage
 
+* Default JSONL repository fork after model/thinking changes retains the actual
+  state leaf, both copied state payloads, and their complete message ancestry.
 * Real disk native host initializer test: current custom leaf and explicit old
   message At/Before cuts, current rather than historical declaration, copied
   history IDs and ancestry,

@@ -1107,6 +1107,34 @@ mod tests {
             )
             .await
             .unwrap();
+        // A default fork after model/thinking changes must keep the actual
+        // state leaf and its ancestry, not silently cut back to the message.
+        for (id, kind) in [
+            (
+                "model-pick",
+                ProvisionedKind::ModelChange {
+                    provider: "faux".into(),
+                    model_id: "new-model".into(),
+                },
+            ),
+            (
+                "thinking-pick",
+                ProvisionedKind::ThinkingLevel {
+                    thinking_level: "high".into(),
+                },
+            ),
+        ] {
+            source
+                .append_entry(
+                    ProvisionedEntry {
+                        id: id.into(),
+                        kind,
+                    },
+                    "main",
+                )
+                .await
+                .unwrap();
+        }
         let listed = r
             .list_typed(&JsonlSessionListOptions {
                 cwd: Some("/proj".into()),
@@ -1135,6 +1163,31 @@ mod tests {
             .unwrap()
             .expect("forked entry exists");
         assert_eq!(got.id(), "m1");
+        for (id, parent) in [("model-pick", "m1"), ("thinking-pick", "model-pick")] {
+            let copied = forked
+                .get_entry(id)
+                .await
+                .unwrap()
+                .expect("state entry copied");
+            let mut original = source.get_entry(id).await.unwrap().unwrap();
+            original.base_mut().seq = copied.seq(); // fork restamps only sequence
+            assert_eq!(
+                copied, original,
+                "model/state payload and ancestry must survive"
+            );
+            assert_eq!(copied.parent_id(), Some(parent));
+        }
+        let lanes = forked.get_lanes().await.unwrap();
+        assert_eq!(
+            lanes
+                .iter()
+                .find(|lane| lane.lane == "main")
+                .unwrap()
+                .leaf_id
+                .as_deref(),
+            Some("thinking-pick"),
+            "implicit fork must retain the actual nonmessage leaf"
+        );
         // And lists as a separate session with parent = src.
         let listed = r
             .list_typed(&JsonlSessionListOptions {
