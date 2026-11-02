@@ -68,15 +68,6 @@ use crate::session::{default_session_dir, open_session_by_id_in_dir};
 ///   register first and cannot be shadowed; a template sharing a built-in name
 ///   is unreachable there too).
 /// * Extension and template names may omit the leading `/`, so normalize.
-fn merge_command_list(
-    builtin: Vec<(String, String)>,
-    extension: Vec<(String, String)>,
-    templates: Vec<(String, String)>,
-) -> Vec<serde_json::Value> {
-    merge_command_list_reserved(builtin, extension, templates, Vec::new())
-}
-
-/// Like [`merge_command_list`], but also reserves `reserved` names.
 ///
 /// Built-in **aliases and hidden commands** win dispatch in the TUI without
 /// appearing as suggestions. Reserving them here keeps an extension that
@@ -944,7 +935,7 @@ mod send_message_tests {
 
 #[cfg(test)]
 mod list_commands_tests {
-    use super::{merge_command_list, merge_command_list_reserved};
+    use super::merge_command_list_reserved;
 
     /// Reserving names must not delete the built-ins from the listing.
     ///
@@ -1002,10 +993,11 @@ mod list_commands_tests {
 
     #[test]
     fn builtin_wins_over_a_same_named_extension_command() {
-        let out = merge_command_list(
+        let out = merge_command_list_reserved(
             vec![("/model".into(), "built-in".into())],
             vec![("/model".into(), "extension".into())],
             vec![],
+        Vec::new(),
         );
         assert_eq!(names(&out), vec!["/model"]);
         assert_eq!(out[0]["source"], "builtin");
@@ -1014,10 +1006,11 @@ mod list_commands_tests {
 
     #[test]
     fn extension_and_template_names_get_a_leading_slash() {
-        let out = merge_command_list(
+        let out = merge_command_list_reserved(
             vec![],
             vec![("deploy".into(), "deploy".into())],
             vec![("review".into(), "review".into())],
+        Vec::new(),
         );
         assert_eq!(names(&out), vec!["/deploy", "/review"]);
         assert_eq!(out[0]["source"], "extension");
@@ -1029,10 +1022,11 @@ mod list_commands_tests {
     /// `/` completion list is permanently shorter than the terminal's.
     #[test]
     fn prompt_templates_are_listed_with_their_own_source() {
-        let out = merge_command_list(
+        let out = merge_command_list_reserved(
             vec![("/help".into(), "help".into())],
             vec![],
             vec![("review".into(), "review a diff".into())],
+        Vec::new(),
         );
         assert_eq!(names(&out), vec!["/help", "/review"]);
         assert_eq!(out[1]["source"], "prompt");
@@ -1043,10 +1037,11 @@ mod list_commands_tests {
     /// must not be reported twice (or as `prompt`).
     #[test]
     fn a_builtin_name_is_not_reported_as_a_template() {
-        let out = merge_command_list(
+        let out = merge_command_list_reserved(
             vec![("/review".into(), "built-in".into())],
             vec![],
             vec![("review".into(), "template".into())],
+        Vec::new(),
         );
         assert_eq!(names(&out), vec!["/review"]);
         assert_eq!(out[0]["source"], "builtin");
@@ -1054,6 +1049,6 @@ mod list_commands_tests {
 
     #[test]
     fn no_commands_is_an_empty_list_not_an_error() {
-        assert!(merge_command_list(vec![], vec![], vec![]).is_empty());
+        assert!(merge_command_list_reserved(vec![], vec![], vec![], Vec::new()).is_empty());
     }
 }
