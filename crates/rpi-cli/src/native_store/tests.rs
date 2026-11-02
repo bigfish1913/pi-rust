@@ -68,6 +68,7 @@ fn early_paths_are_rejected_without_matching_prompt_substrings() {
         "update",
         "install",
         "uninstall",
+        "extension",
         "package",
         "pi-package",
     ] {

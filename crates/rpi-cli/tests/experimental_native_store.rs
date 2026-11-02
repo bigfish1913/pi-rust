@@ -109,6 +109,9 @@ async fn illegal_optins_reject_before_early_dispatch_or_legacy_writes() {
         vec!["events"],
         vec!["update"],
         vec!["install"],
+        vec!["extension", "--help"],
+        vec!["extension", "update", "--help"],
+        vec!["extension", "update"],
         vec!["package"],
         vec!["dev"],
         vec!["--connect=127.0.0.1:1"],
@@ -145,6 +148,9 @@ async fn illegal_optins_reject_before_early_dispatch_or_legacy_writes() {
             String::from_utf8_lossy(&result.stderr)
         );
         assert!(String::from_utf8_lossy(&result.stderr).contains("experimental-native-store"));
+        if args.first() == Some(&"extension") {
+            assert!(String::from_utf8_lossy(&result.stderr).contains("not a subcommand"));
+        }
         assert!(!f.native.exists());
         assert!(!f.temp.path().join("export.html").exists());
         assert_eq!(f.sentinels(), before);

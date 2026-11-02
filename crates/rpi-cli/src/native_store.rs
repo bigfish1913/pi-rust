@@ -41,6 +41,7 @@ pub(crate) fn early_check(argv: &[String]) -> Result<(), String> {
                 | "update"
                 | "install"
                 | "uninstall"
+                | "extension"
                 | "package"
                 | "pi-package"
                 | "pi-update"
