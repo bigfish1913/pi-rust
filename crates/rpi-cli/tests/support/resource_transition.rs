@@ -135,6 +135,131 @@ async fn controlled_same_id_restart_changes_actual_model_resources_and_preserves
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transition_skill_preflight_and_committed_retry_precede_registration_and_writer() {
+    let fixture = Fixture::build().await;
+    for source in ["explicit-file", "explicit-root", "package"] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fixture_model_config(root);
+        put(
+            root.join("none.json"),
+            r#"{"version":1,"tools":{"mode":"none"}}"#,
+        );
+        let mut host = Host::start(root, "none.json", "skill-transition").await;
+        let initial = host.state().await;
+        host.stop().await;
+        let path = if source == "package" {
+            root.join(".rpi/packages/probe/skills/review/SKILL.md")
+        } else {
+            root.join("skills/review/SKILL.md")
+        };
+        let mut target =
+            json!({"version":1,"extensions":[fixture.library],"tools":{"mode":"none"}});
+        if source == "package" {
+            target["main_package"] = json!({"name":"probe"});
+            put(
+                root.join(".rpi/packages.json"),
+                json!({"packages":[{
+                    "name":"probe","version":"1","source":"fixture",
+                    "cargo_package":"none","artifacts":[]
+                }]})
+                .to_string(),
+            );
+        } else {
+            target["skills"] = if source == "explicit-file" {
+                json!(["skills/review/SKILL.md"])
+            } else {
+                json!(["skills"])
+            };
+        }
+        put(
+            root.join("transition.json"),
+            transition(&initial["binding"], "skill-target", target).to_string(),
+        );
+        let args = [
+            "--resource-transition",
+            "transition.json",
+            "--session-id",
+            "skill-transition",
+        ];
+        let log = root.join("registrations.log");
+        let transcript = session_files(root)
+            .into_keys()
+            .find(|p| {
+                p.extension().is_some_and(|e| e == "jsonl")
+                    && !p.to_string_lossy().ends_with(".progress.jsonl")
+            })
+            .unwrap();
+        let original = std::fs::read(&transcript).unwrap();
+        for malformed in [
+            "---\nname: [\n---\nMalformed YAML\n",
+            "---\nname: review\n---\nMissing description\n",
+            "---\nname: wrong-name\ndescription: Valid description\n---\nInvalid metadata\n",
+        ] {
+            put(&path, malformed);
+            rejected(root, &args, "selected skill").await;
+            assert!(!log.exists(), "{source}: malformed target registered code");
+        }
+        // Even an unrecoverable transition transcript must not get as far as
+        // writer preparation (or mask the earlier selected-Skill diagnostic).
+        let mut torn = original.clone();
+        torn.extend_from_slice(b"{torn transition Skill tail");
+        put(&transcript, torn);
+        rejected(root, &args, "selected skill").await;
+        assert!(!log.exists(), "{source}: malformed target registered code");
+        put(&transcript, &original);
+
+        // A new operation validates its target, not the previous empty inventory.
+        skill(&path, "review", "COMMITTED_TARGET");
+        let original_skill = std::fs::read(&path).unwrap();
+        let mut host = Host::start_with_flag(
+            root,
+            "--resource-transition",
+            "transition.json",
+            "skill-transition",
+        )
+        .await;
+        let applied = host.state().await;
+        assert_eq!(applied["binding"]["revision"], 2);
+        assert_eq!(applied["binding"]["operationId"], "skill-target");
+        assert_eq!(applied["sessionId"], initial["sessionId"]);
+        assert_eq!(applied["loadedSkills"][0]["name"], "review");
+        host.stop().await;
+        fixture.assert_registrations(&log);
+        put(&log, "");
+        // The same operation ID does not authorize changed valid source bytes.
+        // Keep metadata/declaration identical and change only the Skill body.
+        put(
+            &path,
+            String::from_utf8(original_skill.clone())
+                .unwrap()
+                .replace("Skill body COMMITTED_TARGET", "Changed valid target body"),
+        );
+        rejected(root, &args, "Skill inventory changed").await;
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "",
+            "{source}: changed committed target registered code"
+        );
+        // Restoring the committed bytes makes the identical retry a no-append
+        // success, preserving the revision and operation association.
+        put(&path, original_skill);
+        let before = session_files(root);
+        let mut host = Host::start_with_flag(
+            root,
+            "--resource-transition",
+            "transition.json",
+            "skill-transition",
+        )
+        .await;
+        assert_eq!(host.state().await["binding"], applied["binding"]);
+        host.stop().await;
+        assert_eq!(session_files(root), before, "{source}: retry appended");
+        fixture.assert_registrations(&log);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn transition_conflicts_invalid_targets_and_concurrent_writers_are_read_only() {
     let fixture = Fixture::build().await;
     let temp = tempfile::tempdir().unwrap();

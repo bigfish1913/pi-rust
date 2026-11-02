@@ -112,6 +112,13 @@ pub struct ResolvedSelection {
     pub extensions: Vec<PathBuf>,
     pub instructions: Vec<(PathBuf, String, String)>,
     pub transition: Option<ResourceTransition>,
+    validated_skills: Option<ValidatedSkills>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ValidatedSkills {
+    pub skills: Vec<rpi_harness::types::Skill>,
+    inventory: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -393,7 +400,60 @@ impl ResolvedSelection {
             extensions,
             instructions,
             transition,
+            validated_skills: None,
         }))
+    }
+
+    /// Resolve once, before code or native writers. Hash the very bytes parsed
+    /// by the existing loader, preserving ignore/recursion and first-wins rules.
+    pub(crate) async fn validate_skills(
+        &mut self,
+        env: &std::sync::Arc<dyn rpi_tools::ExecutionEnv>,
+    ) -> Result<(), String> {
+        let hashes = Mutex::new(std::collections::HashMap::new());
+        let observe = |path: &str, raw: &str| {
+            hashes.lock().unwrap().insert(
+                path.to_owned(),
+                format!("{:x}", Sha256::digest(raw.as_bytes())),
+            );
+        };
+        let mut skills = Vec::new();
+        let mut diagnostics = Vec::new();
+        for path in &self.skills {
+            let loaded = rpi_harness::skills::load_skills_with_source_observer(
+                env,
+                &[path.to_string_lossy().into_owned()],
+                &observe,
+            )
+            .await;
+            if loaded.skills.is_empty() {
+                return Err(format!(
+                    "selected skill source loaded no Skills: {}",
+                    path.display()
+                ));
+            }
+            skills.extend(loaded.skills);
+            diagnostics.extend(loaded.diagnostics);
+        }
+        let skills = crate::resource_dirs::dedupe_skills(skills, &mut diagnostics);
+        if !diagnostics.is_empty() {
+            return Err(format!("selected skill diagnostics: {diagnostics:?}"));
+        }
+        let hashes = hashes.into_inner().unwrap();
+        let inventory = json!(skills
+            .iter()
+            .map(|skill| json!({
+                "name": skill.name, "path": skill.file_path, "sha256": hashes[&skill.file_path]
+            }))
+            .collect::<Vec<_>>());
+        self.validated_skills = Some(ValidatedSkills { skills, inventory });
+        Ok(())
+    }
+
+    pub(crate) fn validated_skills(&self) -> Result<&ValidatedSkills, String> {
+        self.validated_skills
+            .as_ref()
+            .ok_or_else(|| "selected Skills were not preflight validated".into())
     }
 
     pub fn active_tools(&self, registered: &[String]) -> Result<Vec<String>, String> {
@@ -527,6 +587,9 @@ pub(crate) fn validate_session_binding(
                 .collect::<Result<Vec<_>, String>>()?;
             if old.pointer("/inventory/extensions") != Some(&json!(extensions)) {
                 return Err("session resource artifact inventory changed; restore original resources or use a new session".into());
+            }
+            if old.pointer("/inventory/skills") != Some(&selected.validated_skills()?.inventory) {
+                return Err("session resource Skill inventory changed; restore original resources or use a new session".into());
             }
             Ok(())
         },
@@ -733,6 +796,11 @@ pub(crate) async fn bind_inventory(
     for skill in resources.skills.unwrap_or_default() {
         skills.push(json!({"name": skill.name, "path": skill.file_path, "sha256": fingerprint(Path::new(&skill.file_path))?}));
     }
+    // Defense in depth: neither a registration-time file edit nor a different
+    // constructed resource set may bind source bytes other than those parsed.
+    if json!(skills) != selected.validated_skills()?.inventory {
+        return Err("session resource Skill inventory changed after preflight".into());
+    }
     let mut extensions = Vec::new();
     for path in &selected.extensions {
         extensions.push(json!({"path": path, "sha256": fingerprint(path)?}));
@@ -887,7 +955,11 @@ mod tests {
             extensions: vec![],
             instructions: vec![],
             transition: None,
+            validated_skills: None,
         };
+        let env: std::sync::Arc<dyn rpi_tools::ExecutionEnv> =
+            std::sync::Arc::new(rpi_tools::OsExecutionEnv::with_cwd(temp.path().into()));
+        selected.validate_skills(&env).await.unwrap();
         bind_inventory(&harness, &selected).await.unwrap();
         // Construct a real old-v1 fixture through native storage, not transcript
         // rewriting. Ordinary exact reopen must not migrate its binding fields.
@@ -1014,6 +1086,80 @@ mod tests {
         assert!(validate_persisted_binding(&damaged).is_err());
         damaged["operations"]["one"]["expected"]["fingerprint"] = json!("d".repeat(64));
         assert!(validate_persisted_binding(&damaged).is_ok());
+    }
+
+    #[tokio::test]
+    async fn validated_skills_keep_parsed_content_and_exact_source_hash() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("review")).unwrap();
+        let path = root.join("review/SKILL.md");
+        let raw = "---\r\nname: review\r\ndescription: Review fixture\r\n---\r\nOriginal body\r\n";
+        std::fs::write(&path, raw).unwrap();
+        std::fs::write(
+            root.join("resources.json"),
+            r#"{"version":1,"skills":["review"],"tools":{"mode":"none"}}"#,
+        )
+        .unwrap();
+        let args = Args {
+            mode: Mode::Rpc,
+            resource_config: Some("resources.json".into()),
+            ..Default::default()
+        };
+        let mut selected = ResolvedSelection::load(&args, root, true).unwrap().unwrap();
+        let env: std::sync::Arc<dyn rpi_tools::ExecutionEnv> =
+            std::sync::Arc::new(rpi_tools::OsExecutionEnv::with_cwd(root.to_path_buf()));
+        selected.validate_skills(&env).await.unwrap();
+        let validated = selected.validated_skills().unwrap();
+        assert_eq!(
+            validated.inventory[0]["sha256"],
+            format!("{:x}", Sha256::digest(raw.as_bytes()))
+        );
+        assert_eq!(validated.skills[0].name, "review");
+        let content = validated.skills[0].content.clone();
+        // Construction must retain these parsed Skills, not do a weaker second
+        // read/discovery after native code has had a chance to alter the file.
+        std::fs::write(&path, "---\nname: [\n---\nMalformed replacement").unwrap();
+        assert_eq!(
+            selected.validated_skills().unwrap().skills[0].content,
+            content
+        );
+        assert_ne!(
+            selected.validated_skills().unwrap().inventory[0]["sha256"],
+            fingerprint(&path).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn overlapping_skill_roots_fail_closed_without_validated_inventory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir(root.join("review")).unwrap();
+        std::fs::write(
+            root.join("review/SKILL.md"),
+            "---\nname: review\ndescription: Review fixture\n---\nValid body\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("resources.json"),
+            r#"{"version":1,"skills":["review","review/SKILL.md"],"tools":{"mode":"none"}}"#,
+        )
+        .unwrap();
+        let args = Args {
+            mode: Mode::Rpc,
+            resource_config: Some("resources.json".into()),
+            ..Default::default()
+        };
+        // Distinct overlapping roots pass declaration-level path uniqueness,
+        // but repeat a Skill name even though both reads have the same path.
+        let mut selected = ResolvedSelection::load(&args, root, true).unwrap().unwrap();
+        let env: std::sync::Arc<dyn rpi_tools::ExecutionEnv> =
+            std::sync::Arc::new(rpi_tools::OsExecutionEnv::with_cwd(root.to_path_buf()));
+        let error = selected.validate_skills(&env).await.unwrap_err();
+        assert!(error.contains("selected skill diagnostics"), "{error}");
+        assert!(error.contains("shadowed"), "{error}");
+        assert!(error.contains("first-registration wins"), "{error}");
+        assert!(selected.validated_skills().is_err());
     }
 
     #[tokio::test]

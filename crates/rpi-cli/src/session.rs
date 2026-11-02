@@ -409,7 +409,7 @@ pub(crate) fn preflight_extension_startup(
     ),
     BuildError,
 > {
-    let resources = crate::resource_selection::ResolvedSelection::load(args, cwd, trusted)
+    let mut resources = crate::resource_selection::ResolvedSelection::load(args, cwd, trusted)
         .map_err(BuildError::HarnessCreate)?;
     let selection = select_session(args, cwd);
     let pinned = std::thread::scope(|scope| {
@@ -420,6 +420,14 @@ pub(crate) fn preflight_extension_startup(
                     .build()
                     .map_err(|e| BuildError::SessionOpen(e.to_string()))?
                     .block_on(async {
+                        if let Some(selected) = &mut resources {
+                            let env: Arc<dyn rpi_tools::ExecutionEnv> =
+                                Arc::new(OsExecutionEnv::with_cwd(cwd.to_path_buf()));
+                            selected
+                                .validate_skills(&env)
+                                .await
+                                .map_err(BuildError::HarnessCreate)?;
+                        }
                         let cwd_str = cwd.to_string_lossy();
                         let target = match &selection {
                             SessionSelection::Fork { source, dir } => {
@@ -884,10 +892,16 @@ pub async fn build_prepared(
     let mut skills: Vec<rpi_harness::types::Skill> = Vec::new();
     let mut skill_diags: Vec<rpi_harness::skills::SkillDiagnostic> = Vec::new();
     let mut resource_diags: Vec<rpi_harness::diagnostics::ResourceDiagnostic> = Vec::new();
-    if !args.no_skills {
-        let mut dirs = if let Some(selected) = &resource_selection {
-            selected.skills.clone()
-        } else if args.dev_local_only || args.project_only {
+    if let Some(selected) = &resource_selection {
+        // Consume the preflight's parsed resources, never rediscover or reread
+        // selected Skills after executable registration / writer opening.
+        skills = selected
+            .validated_skills()
+            .map_err(BuildError::HarnessCreate)?
+            .skills
+            .clone();
+    } else if !args.no_skills {
+        let mut dirs = if args.dev_local_only || args.project_only {
             project_skill_dirs(cwd)
         } else if project_trusted {
             skill_dirs(cwd)
@@ -896,25 +910,7 @@ pub async fn build_prepared(
         };
         dirs.extend(args.skill.iter().cloned());
         dirs.extend(discovered.skill_paths.iter().map(PathBuf::from));
-        if resource_selection.is_some() {
-            for path in &dirs {
-                let loaded =
-                    load_skills_with_precedence(&env_dyn, std::slice::from_ref(path)).await;
-                if loaded.skills.is_empty() {
-                    return Err(BuildError::HarnessCreate(format!(
-                        "selected skill source loaded no Skills: {}",
-                        path.display()
-                    )));
-                }
-            }
-        }
         let result = load_skills_with_precedence(&env_dyn, &dirs).await;
-        if resource_selection.is_some() && !result.diagnostics.is_empty() {
-            return Err(BuildError::HarnessCreate(format!(
-                "selected skill diagnostics: {:?}",
-                result.diagnostics
-            )));
-        }
         skills = result.skills;
         skill_diags = result.diagnostics;
         resource_diags.extend(result.resource_diagnostics);

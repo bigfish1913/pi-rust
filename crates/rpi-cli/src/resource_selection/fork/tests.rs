@@ -39,7 +39,11 @@ async fn native_fork_initialization_uses_current_binding_even_for_old_message_cu
         extensions: vec![],
         instructions: vec![],
         transition: None,
+        validated_skills: None,
     };
+    let env: Arc<dyn rpi_tools::ExecutionEnv> =
+        Arc::new(rpi_tools::OsExecutionEnv::with_cwd(temp.path().into()));
+    selected.validate_skills(&env).await.unwrap();
     bind_inventory(&harness, &selected).await.unwrap();
     let message = session
         .append_message(rpi_agent::message::AgentMessage::User(
