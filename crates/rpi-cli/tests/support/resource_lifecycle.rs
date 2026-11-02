@@ -32,6 +32,8 @@ async fn rejected(root: &Path, args: &[&str], expected: &str) {
     .await
     .expect("rejected startup hung")
     .unwrap();
+    put(root.join("rejected.stdout"), &output.stdout);
+    put(root.join("rejected.stderr"), &output.stderr);
     assert_eq!(
         session_files(root),
         before,
@@ -216,6 +218,146 @@ async fn rejected_reopen_never_registers_native_code_and_public_apis_cannot_eras
     .unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("cannot be combined with dev"));
+}
+
+/// Keep private failure evidence (including torn bytes and registration canary)
+/// rather than deleting it during panic unwinding.
+struct FailureEvidence(Option<tempfile::TempDir>);
+impl Drop for FailureEvidence {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            if let Some(directory) = self.0.take() {
+                eprintln!(
+                    "Skill preflight failure evidence: {}",
+                    directory.keep().display()
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn selected_skills_preflight_precedes_registration_and_native_writer() {
+    let fixture = Fixture::build().await;
+    for source in ["explicit-file", "explicit-root", "package"] {
+        let evidence = FailureEvidence(Some(tempfile::tempdir().unwrap()));
+        let root = evidence.0.as_ref().unwrap().path();
+        fixture_model_config(root);
+        let path = if source == "package" {
+            root.join(".rpi/packages/probe/skills/review/SKILL.md")
+        } else {
+            root.join("skills/review/SKILL.md")
+        };
+        let mut config =
+            json!({"version":1,"extensions":[fixture.library],"tools":{"mode":"none"}});
+        if source == "package" {
+            config["main_package"] = json!({"name":"probe"});
+            put(
+                root.join(".rpi/packages.json"),
+                json!({"packages":[{
+                    "name":"probe","version":"1","source":"fixture",
+                    "cargo_package":"none","artifacts":[]
+                }]})
+                .to_string(),
+            );
+        } else {
+            config["skills"] = if source == "explicit-file" {
+                json!(["skills/review/SKILL.md"])
+            } else {
+                json!(["skills"])
+            };
+        }
+        put(root.join("resources.json"), config.to_string());
+        let log = root.join("registrations.log");
+        for malformed in [
+            "---\nname: [\n---\nMalformed YAML\n",
+            "---\nname: review\n---\nMissing description\n",
+            "---\nname: wrong-name\ndescription: Valid description\n---\nInvalid metadata\n",
+        ] {
+            put(&path, malformed);
+            rejected(
+                root,
+                &[
+                    "--resource-config",
+                    "resources.json",
+                    "--session-id",
+                    "initial",
+                    "--name",
+                    "must-not-write",
+                ],
+                "selected skill",
+            )
+            .await;
+            assert!(!log.exists(), "{source}: malformed Skill registered code");
+            assert!(
+                !root.join("sessions").exists(),
+                "{source}: malformed Skill created session files"
+            );
+        }
+        skill(&path, "review", "UNCHANGED");
+        let original_skill = std::fs::read(&path).unwrap();
+        let mut host = Host::start(root, "resources.json", "bound").await;
+        let state = host.state().await;
+        assert_eq!(state["loadedSkills"][0]["name"], "review", "{state}");
+        assert!(state["registeredTools"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("echo")));
+        host.stop().await;
+        fixture.assert_registrations(&log);
+        // An unchanged valid resource binding must reopen successfully.
+        Host::start(root, "resources.json", "bound")
+            .await
+            .stop()
+            .await;
+        assert_eq!(fixture.assert_registrations(&log).lines().count(), 2);
+        let transcript = session_files(root)
+            .into_keys()
+            .find(|p| p.extension().is_some_and(|e| e == "jsonl"))
+            .unwrap();
+        let valid = std::fs::read_to_string(&transcript).unwrap();
+        put(&transcript, format!("{valid}{{disposable torn Skill tail"));
+        put(
+            root.join("torn.before.jsonl"),
+            std::fs::read(&transcript).unwrap(),
+        );
+        // Keep frontmatter unchanged: only the valid body changes.
+        put(
+            &path,
+            String::from_utf8(original_skill.clone())
+                .unwrap()
+                .replace("Skill body UNCHANGED", "Changed valid body"),
+        );
+        put(&log, "");
+        rejected(
+            root,
+            &[
+                "--resource-config",
+                "resources.json",
+                "--session-id",
+                "bound",
+                "--name",
+                "must-not-write",
+            ],
+            "Skill inventory changed",
+        )
+        .await;
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "",
+            "{source}: changed Skill registered code"
+        );
+        // Restoring the original Skill accepts normal native tail recovery.
+        put(&path, original_skill);
+        Host::start(root, "resources.json", "bound")
+            .await
+            .stop()
+            .await;
+        fixture.assert_registrations(&log);
+        let repaired = std::fs::read_to_string(&transcript).unwrap();
+        assert!(!repaired.contains("disposable torn Skill tail"));
+        assert!(!repaired.contains("must-not-write"));
+    }
 }
 
 #[tokio::test]
