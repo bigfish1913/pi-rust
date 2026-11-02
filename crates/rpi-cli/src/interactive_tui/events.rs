@@ -205,6 +205,10 @@ pub(super) async fn handle_agent_event(
                 std::mem::take(&mut *state.pending_bash_messages.lock().unwrap());
             for message in pending {
                 if let Err(error) = lane.append_message(message).await {
+                    state
+                        .history_page
+                        .unsaved
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
                     add_error_message(chat, &format!("Could not record bash result: {error}"));
                 }
             }
@@ -215,7 +219,12 @@ pub(super) async fn handle_agent_event(
             // the run outcome. Report it here: inside the alternate screen a
             // `tracing::warn!` reaches nobody, and the user must know before
             // exiting that the conversation stopped being saved.
-            report_write_failures(chat, lane);
+            if report_write_failures(chat, lane) {
+                state
+                    .history_page
+                    .unsaved
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             // Authoritative footer reconciliation when the broadcast dropped
             // events (`Lagged`). `AgentEnd` is the barrier that makes a rebuild
             // here safe: the broadcast preserves order, so at this point every
@@ -231,6 +240,7 @@ pub(super) async fn handle_agent_event(
             {
                 reconcile_footer_from_lane(lane, state).await;
             }
+            history::settle(state, tui);
             tui.request_render(false);
         }
 
@@ -535,65 +545,9 @@ pub(super) fn record_context_usage(
 /// Best-effort: the footer is cosmetic, so a failed read leaves it untouched
 /// instead of failing the turn.
 pub(super) async fn reconcile_footer_from_lane(lane: &Arc<dyn AgentLane>, state: &Arc<TuiState>) {
-    let entries = match lane
-        .session_view()
-        .find_entries_on_branch(
-            &EntryQuery {
-                order: Some(EntryOrder::OldestFirst),
-                ..Default::default()
-            },
-            &BranchBounds::default(),
-        )
-        .await
-    {
-        Ok(entries) => entries,
-        Err(error) => {
-            tracing::debug!(%error, "could not read session history for footer reconciliation");
-            return;
-        }
-    };
-
-    // Same rules as the live `MessageEnd` handler and the replay path: totals
-    // sum across turns, the cache-hit rate keeps the LATEST eligible turn's
-    // value, and aborted/errored turns do not measure the context.
-    let mut totals = rpi_tui::footer::UsageTotals::default();
-    let mut hit_rate: Option<f64> = None;
-    let mut context: Option<i64> = None;
-    for entry in &entries {
-        let Entry::Message(message_entry) = entry else {
-            continue;
-        };
-        let AgentMessage::Assistant(a) = &message_entry.message else {
-            continue;
-        };
-        totals.add(
-            a.usage.input,
-            a.usage.output,
-            a.usage.cache_read,
-            a.usage.cache_write,
-            a.usage.cost.total,
-        );
-        let denom = a.usage.input + a.usage.cache_read + a.usage.cache_write;
-        if denom > 0 && (a.usage.cache_read + a.usage.cache_write) > 0 {
-            hit_rate = Some(a.usage.cache_read as f64 / denom as f64 * 100.0);
-        }
-        if a.stop_reason != rpi_ai::StopReason::Aborted
-            && a.stop_reason != rpi_ai::StopReason::Error
-        {
-            let tokens = a.usage.context_tokens();
-            if tokens > 0 {
-                context = Some(tokens);
-            }
-        }
-    }
-
-    state.footer.set_usage(totals);
-    state.footer.set_cache_hit_rate(hit_rate);
-    // `set_context_tokens` only when a real measurement survived: a session
-    // whose every assistant turn aborted has no badge value to restore, and
-    // clearing it here would blank a badge the live path was right about.
-    if context.is_some() {
-        state.footer.set_context_tokens(context);
+    match lane.session_view().branch_overview().await {
+        Ok(overview) => history::apply_overview(&state.footer, &overview),
+        Err(error) => tracing::debug!(%error, "could not read branch overview"),
     }
 }
 
@@ -645,10 +599,10 @@ pub(super) fn tool_result_requests_markdown(details: Option<&serde_json::Value>)
 /// Deduplicated by (`what`, `message`) so a backend failing the same way on every
 /// turn shows one line rather than one per turn: the queue is drained every
 /// `AgentEnd`, and the same disk-full error would otherwise repeat forever.
-pub(super) fn report_write_failures(chat: &Arc<Container>, lane: &Arc<dyn AgentLane>) {
+pub(super) fn report_write_failures(chat: &Arc<Container>, lane: &Arc<dyn AgentLane>) -> bool {
     let failures = lane.take_write_failures();
     if failures.is_empty() {
-        return;
+        return false;
     }
     let mut seen: Vec<(String, String)> = Vec::new();
     for failure in failures {
@@ -668,4 +622,5 @@ pub(super) fn report_write_failures(chat: &Arc<Container>, lane: &Arc<dyn AgentL
             ),
         );
     }
+    true
 }

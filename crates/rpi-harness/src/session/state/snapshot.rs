@@ -9,14 +9,14 @@ impl Serialize for SessionState {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut state = serializer.serialize_struct("SessionState", 9)?;
         state.serialize_field("format", FORMAT)?;
-        state.serialize_field("sequence", &self.sequence)?;
-        state.serialize_field("entries", &self.entries)?;
-        state.serialize_field("records", &self.records)?;
-        state.serialize_field("lanes", &self.lanes)?;
-        state.serialize_field("log", &self.log)?;
-        state.serialize_field("stats", &self.stats)?;
-        state.serialize_field("name", &self.name)?;
-        state.serialize_field("labels", &self.labels)?;
+        state.serialize_field("sequence", &self.index.sequence)?;
+        state.serialize_field("entries", &self.index.entries)?;
+        state.serialize_field("records", &self.index.records)?;
+        state.serialize_field("lanes", &self.index.lanes)?;
+        state.serialize_field("log", &self.index.log)?;
+        state.serialize_field("stats", &self.index.stats)?;
+        state.serialize_field("name", &self.index.name)?;
+        state.serialize_field("labels", &self.index.labels)?;
         state.end()
     }
 }
@@ -145,19 +145,23 @@ impl<'de> Deserialize<'de> for SessionState {
                 },
             );
         }
+        let metadata = snapshot.entries.iter().map(EntryMeta::from_entry).collect();
         Ok(Self {
-            nearest_user,
-            sequence: snapshot.sequence,
-            used_ids,
-            entries: snapshot.entries,
-            entries_by_id,
-            records: snapshot.records,
-            open_operations_by_lane,
-            lanes: snapshot.lanes,
-            log: snapshot.log,
-            stats: snapshot.stats,
-            name: snapshot.name,
-            labels: snapshot.labels,
+            index: IndexedState {
+                metadata,
+                nearest_user,
+                sequence: snapshot.sequence,
+                used_ids,
+                entries: snapshot.entries,
+                entries_by_id,
+                records: snapshot.records,
+                open_operations_by_lane,
+                lanes: snapshot.lanes,
+                log: snapshot.log,
+                stats: snapshot.stats,
+                name: snapshot.name,
+                labels: snapshot.labels,
+            },
         })
     }
 }

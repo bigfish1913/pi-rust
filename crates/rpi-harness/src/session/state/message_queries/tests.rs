@@ -16,7 +16,7 @@ fn append(state: &mut SessionState, id: &str, user: bool) {
             entry_type: "message".into(),
             id: id.into(),
             seq,
-            parent_id: state.lanes["main"].clone(),
+            parent_id: state.index.lanes["main"].clone(),
             timestamp: seq as i64,
         },
         message,
@@ -189,7 +189,7 @@ fn snapshot_rebuilds_index_without_persisting_it() {
 fn preview_is_unicode_bounded_and_does_not_contain_image_payloads() {
     let mut state = SessionState::new();
     append(&mut state, "image", true);
-    if let Entry::Message(entry) = &mut state.entries[0] {
+    if let Entry::Message(entry) = &mut state.index.entries[0] {
         entry.message = UserMessage::new(UserContent::Blocks(vec![Content::text(" 猫🐈 ".repeat(5000)), serde_json::from_value(serde_json::json!({"type":"image","data":"secret-base64","mimeType":"image/png"})).unwrap()]), 10).into();
     }
     let page = state
@@ -270,7 +270,7 @@ fn benchmark_borrowed_user_index_against_full_projection() {
         .find_entries_on_branch(
             &EntryQuery::default(),
             &BranchBounds::default(),
-            state.lanes["main"].as_deref().unwrap(),
+            state.index.lanes["main"].as_deref().unwrap(),
         )
         .unwrap();
     let full = serde_json::to_vec(&all).unwrap();
@@ -280,7 +280,12 @@ fn benchmark_borrowed_user_index_against_full_projection() {
         .message_summaries("main", &Default::default())
         .unwrap();
     let bytes = serde_json::to_vec(&summary).unwrap();
-    println!("synthetic 10,100 entries: full projection {legacy:?} {} bytes; 10-user summary {:?} {} bytes", full.len(), start.elapsed(), bytes.len());
+    println!(
+        "synthetic 10,100 entries: full projection {legacy:?} {} bytes; 10-user summary {:?} {} bytes",
+        full.len(),
+        start.elapsed(),
+        bytes.len()
+    );
     assert_eq!(summary.messages.len(), 10);
 }
 
@@ -332,7 +337,7 @@ fn queries_are_lane_scoped_and_reject_foreign_message_cursors() {
         .apply_mutation(SessionMutation::Lane {
             seq: state.next_sequence(),
             lane: "other".into(),
-            leaf_id: state.lanes["main"].clone(),
+            leaf_id: state.index.lanes["main"].clone(),
         })
         .unwrap();
     move_to(&mut state, "u5");

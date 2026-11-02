@@ -1204,6 +1204,69 @@ pub struct MessageWindowPage {
     pub leaf_id: Option<String>,
 }
 
+/// A bounded, UI-independent page of every entry variant on one pinned branch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BranchEntryPageQuery {
+    pub leaf_id: Option<String>,
+    pub before_id: Option<String>,
+    pub after_id: Option<String>,
+    #[serde(default = "default_branch_page_limit")]
+    pub limit: usize,
+    #[serde(default = "default_branch_page_bytes")]
+    pub max_bytes: usize,
+}
+fn default_branch_page_limit() -> usize {
+    50
+}
+fn default_branch_page_bytes() -> usize {
+    4 * 1024 * 1024
+}
+impl Default for BranchEntryPageQuery {
+    fn default() -> Self {
+        Self {
+            leaf_id: None,
+            before_id: None,
+            after_id: None,
+            limit: default_branch_page_limit(),
+            max_bytes: default_branch_page_bytes(),
+        }
+    }
+}
+
+/// Entries are chronological. Cursors are exclusive and belong to `leaf_id`.
+/// The byte budget counts complete JSON entries (not envelope/separators); an
+/// oversized entry is returned alone, never truncated or silently skipped.
+#[derive(Debug, Clone)]
+pub struct BranchEntryPage {
+    pub entries: Vec<Entry>,
+    pub first_id: Option<String>,
+    pub last_id: Option<String>,
+    pub next_before_id: Option<String>,
+    pub next_after_id: Option<String>,
+    pub has_more_before: bool,
+    pub has_more_after: bool,
+    pub leaf_id: Option<String>,
+}
+
+/// Full-branch settings and assistant-only usage, without context messages.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchOverview {
+    pub thinking_level: String,
+    pub model: Option<(String, String)>,
+    pub active_tool_names: Option<Vec<String>>,
+    pub input: i64,
+    pub output: i64,
+    pub cache_read: i64,
+    pub cache_write: i64,
+    pub cost_total: f64,
+    /// Latest eligible assistant cache-hit percentage, not an aggregate rate.
+    pub cache_hit_rate: Option<f64>,
+    /// Latest positive successful measurement since the last compaction.
+    pub context_tokens: Option<i64>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RecordQuery {
     pub lane: Option<String>,
@@ -1536,6 +1599,16 @@ pub trait SessionStorage: Send + Sync {
     }
 
     // Reads
+    async fn branch_entry_page(
+        &self,
+        lane: &str,
+        query: &BranchEntryPageQuery,
+    ) -> SessionResult<BranchEntryPage> {
+        crate::session::branch_queries::storage_branch_entry_page(self, lane, query).await
+    }
+    async fn branch_overview(&self, lane: &str) -> SessionResult<BranchOverview> {
+        crate::session::branch_queries::storage_branch_overview(self, lane).await
+    }
     async fn message_summaries(
         &self,
         lane: &str,
@@ -1638,6 +1711,15 @@ pub trait SessionRepo: Send + Sync {
 /// `SessionTree`. Lane-bound harness runners own one of these views.
 #[async_trait::async_trait]
 pub trait SessionTree: Send + Sync {
+    async fn branch_entry_page(
+        &self,
+        query: &BranchEntryPageQuery,
+    ) -> SessionResult<BranchEntryPage> {
+        crate::session::branch_queries::tree_branch_entry_page(self, query).await
+    }
+    async fn branch_overview(&self) -> SessionResult<BranchOverview> {
+        crate::session::branch_queries::tree_branch_overview(self).await
+    }
     async fn message_summaries(
         &self,
         query: &MessageSummaryQuery,

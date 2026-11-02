@@ -2270,6 +2270,7 @@ dependencies = [
  "rpi-agent",
  "rpi-ai",
  "rpi-plugin-sdk",
+ "same-file",
  "schemars",
  "serde",
  "serde_json",

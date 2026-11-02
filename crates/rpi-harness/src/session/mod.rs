@@ -9,6 +9,14 @@
 //!
 //! Built up incrementally across M5b–M5f.
 
+#[cfg(test)]
+mod storage_contract_tests;
+
+pub(crate) mod branch_queries;
+#[cfg(test)]
+mod branch_queries_compat_tests;
+#[cfg(test)]
+mod branch_queries_tests;
 pub mod context;
 pub(crate) mod diagnostics;
 #[cfg(feature = "experimental-native-store")]

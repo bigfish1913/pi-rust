@@ -1,9 +1,10 @@
 //! Borrow metadata first; clone/serialize only the selected bounded payload.
-use super::SessionState;
+use super::{IndexedState, SessionState};
 use crate::error::{SessionError, SessionErrorCode, SessionResult};
+#[cfg(test)]
+use crate::session::types::Entry;
 use crate::session::types::{
-    Entry, MessageSummary, MessageSummaryPage, MessageSummaryQuery, MessageWindowPage,
-    MessageWindowQuery,
+    MessageSummary, MessageSummaryPage, MessageSummaryQuery, MessageWindowPage, MessageWindowQuery,
 };
 use rpi_agent::message::AgentMessage;
 
@@ -23,7 +24,20 @@ fn validate_id(id: &str) -> SessionResult<()> {
     Ok(())
 }
 
-impl SessionState {
+#[derive(Debug, Clone)]
+pub(crate) struct SummarySelection {
+    pub(crate) indices: Vec<usize>,
+    pub(crate) has_more: bool,
+    pub(crate) leaf: Option<usize>,
+}
+#[derive(Debug, Clone)]
+pub(crate) struct WindowSelection {
+    pub(crate) indices: Vec<usize>,
+    pub(crate) has_more_before: bool,
+    pub(crate) has_more_after: bool,
+    pub(crate) leaf: Option<usize>,
+}
+impl<P: Clone> IndexedState<P> {
     // Parent indices always precede children: apply_mutation requires an existing
     // parent and a new ID. This walk needs neither payload clones nor a path Vec.
     fn query_is_ancestor(&self, ancestor: usize, mut leaf: usize) -> bool {
@@ -34,7 +48,7 @@ impl SessionState {
             if leaf < ancestor {
                 return false;
             }
-            match self.entries[leaf]
+            match self.metadata[leaf]
                 .parent_id()
                 .and_then(|id| self.entries_by_id.get(id))
             {
@@ -69,16 +83,16 @@ impl SessionState {
         Ok(Some(pinned))
     }
     fn previous_user(&self, index: usize) -> Option<usize> {
-        self.entries[index]
+        self.metadata[index]
             .parent_id()
             .and_then(|id| self.entries_by_id.get(id))
             .and_then(|parent| self.nearest_user[*parent])
     }
-    pub fn message_summaries(
+    pub(crate) fn select_message_summaries(
         &self,
         lane: &str,
         query: &MessageSummaryQuery,
-    ) -> SessionResult<MessageSummaryPage> {
+    ) -> SessionResult<SummarySelection> {
         validate_limit(query.limit)?;
         if query.role != "user" {
             return Err(invalid("only role=user is supported"));
@@ -92,10 +106,7 @@ impl SessionState {
                 .get(before)
                 .copied()
                 .ok_or_else(|| invalid("user cursor not found"))?;
-            if !matches!(
-                self.entries[cursor].as_message(),
-                Some(AgentMessage::User(_))
-            ) {
+            if !self.metadata[cursor].is_user() {
                 return Err(invalid("cursor must identify a user message"));
             }
             // Membership walks only the user chain, not intervening tools.
@@ -122,41 +133,17 @@ impl SessionState {
         }
         let has_more = next.is_some();
         selected.reverse();
-        let messages: Vec<_> = selected
-            .into_iter()
-            .map(|index| {
-                let entry = &self.entries[index];
-                let Some(AgentMessage::User(user)) = entry.as_message() else {
-                    unreachable!("user index invariant")
-                };
-                let (preview, has_images) = crate::session::message_preview::preview(&user.content);
-                MessageSummary {
-                    entry_id: entry.id().into(),
-                    role: "user".into(),
-                    preview,
-                    timestamp: user.timestamp,
-                    has_images,
-                }
-            })
-            .collect();
-        let first_id = messages.first().map(|message| message.entry_id.clone());
-        let last_id = messages.last().map(|message| message.entry_id.clone());
-        Ok(MessageSummaryPage {
-            filtered: true,
-            role: "user".into(),
-            next_before_id: has_more.then(|| first_id.clone()).flatten(),
-            first_id,
-            last_id,
-            messages,
+        Ok(SummarySelection {
+            indices: selected,
             has_more,
-            leaf_id: leaf.map(|index| self.entries[index].id().into()),
+            leaf,
         })
     }
-    pub fn message_window(
+    pub(crate) fn select_message_window(
         &self,
         lane: &str,
         query: &MessageWindowQuery,
-    ) -> SessionResult<MessageWindowPage> {
+    ) -> SessionResult<WindowSelection> {
         validate_limit(query.limit)?;
         let cursors = [
             query.anchor_id.as_deref(),
@@ -179,19 +166,19 @@ impl SessionState {
         let mut next = leaf;
         let mut anchor = None;
         while let Some(index) = next {
-            let entry = &self.entries[index];
+            let entry = &self.metadata[index];
             next = entry
                 .parent_id()
                 .and_then(|id| self.entries_by_id.get(id))
                 .copied();
             if entry.id() == cursor {
-                if !matches!(entry, Entry::Message(_) | Entry::Compaction(_)) {
+                if !entry.is_transcript() {
                     return Err(invalid("cursor must identify a transcript message"));
                 }
                 anchor = Some(index);
                 break;
             }
-            if matches!(entry, Entry::Message(_) | Entry::Compaction(_)) {
+            if entry.is_transcript() {
                 newer.push_back(index);
                 if newer.len() > query.limit + 1 {
                     newer.pop_front();
@@ -204,12 +191,12 @@ impl SessionState {
         let newer: Vec<_> = newer.into_iter().rev().collect();
         let mut older = Vec::with_capacity(query.limit + 1);
         while let Some(index) = next {
-            let entry = &self.entries[index];
+            let entry = &self.metadata[index];
             next = entry
                 .parent_id()
                 .and_then(|id| self.entries_by_id.get(id))
                 .copied();
-            if matches!(entry, Entry::Message(_) | Entry::Compaction(_)) {
+            if entry.is_transcript() {
                 older.push(index);
                 if older.len() > query.limit {
                     break;
@@ -246,9 +233,74 @@ impl SessionState {
                 newer.len() > after || discarded_newer,
             )
         };
+        if selected.is_empty() {
+            has_more_before = false;
+            has_more_after = false;
+        }
+        Ok(WindowSelection {
+            indices: selected,
+            has_more_before,
+            has_more_after,
+            leaf,
+        })
+    }
+}
+
+impl SessionState {
+    pub fn message_summaries(
+        &self,
+        lane: &str,
+        query: &MessageSummaryQuery,
+    ) -> SessionResult<MessageSummaryPage> {
+        let SummarySelection {
+            indices: selected,
+            has_more,
+            leaf,
+        } = self.index.select_message_summaries(lane, query)?;
+        let messages: Vec<_> = selected
+            .into_iter()
+            .map(|index| {
+                let entry = &self.index.entries[index];
+                let Some(AgentMessage::User(user)) = entry.as_message() else {
+                    unreachable!("user index invariant")
+                };
+                let (preview, has_images) = crate::session::message_preview::preview(&user.content);
+                MessageSummary {
+                    entry_id: entry.id().into(),
+                    role: "user".into(),
+                    preview,
+                    timestamp: user.timestamp,
+                    has_images,
+                }
+            })
+            .collect();
+        let first_id = messages.first().map(|message| message.entry_id.clone());
+        let last_id = messages.last().map(|message| message.entry_id.clone());
+        Ok(MessageSummaryPage {
+            filtered: true,
+            role: "user".into(),
+            next_before_id: has_more.then(|| first_id.clone()).flatten(),
+            first_id,
+            last_id,
+            messages,
+            has_more,
+            leaf_id: leaf.map(|index| self.index.entries[index].id().into()),
+        })
+    }
+    pub fn message_window(
+        &self,
+        lane: &str,
+        query: &MessageWindowQuery,
+    ) -> SessionResult<MessageWindowPage> {
+        let WindowSelection {
+            indices: selected,
+            mut has_more_before,
+            mut has_more_after,
+            leaf,
+        } = self.index.select_message_window(lane, query)?;
         let entries: Vec<_> = selected
             .into_iter()
-            .map(|index| self.entries[index].clone())
+            .map(|index| self.index.entries[index].clone())
             .collect();
         if entries.is_empty() {
             has_more_before = false;
@@ -264,7 +316,7 @@ impl SessionState {
             last_id,
             has_more_before,
             has_more_after,
-            leaf_id: leaf.map(|index| self.entries[index].id().into()),
+            leaf_id: leaf.map(|index| self.index.entries[index].id().into()),
         })
     }
 }

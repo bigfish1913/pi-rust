@@ -30,6 +30,8 @@
 //!   The interactive `-c`/`-r`/`--session` paths enable that mode and replay
 //!   the existing branch before appending new messages. See [`SessionSelection`].
 
+mod backend;
+
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -2448,30 +2450,10 @@ where
 async fn build_session(selection: &SessionSelection, cwd: &str) -> Result<Session, BuildError> {
     match selection {
         SessionSelection::Ephemeral => Ok(ephemeral_session()),
-        SessionSelection::ExperimentalNative { dir } => {
-            #[cfg(feature = "experimental-native-store")]
-            {
-                use rpi_harness::session::{
-                    experimental_native::ExperimentalNativeRepo,
-                    types::{SessionCreateOptions, SessionRepo},
-                };
-                let repo = ExperimentalNativeRepo::new(dir.clone())
-                    .await
-                    .map_err(|e| BuildError::SessionDir(e.to_string()))?;
-                let storage = repo
-                    .create(&SessionCreateOptions::default())
-                    .await
-                    .map_err(|e| BuildError::SessionOpen(e.to_string()))?;
-                Ok(Session::new(Arc::new(storage), None))
-            }
-            #[cfg(not(feature = "experimental-native-store"))]
-            {
-                let _ = dir;
-                Err(BuildError::NativeStorePolicy(
-                    "binary lacks experimental-native-store feature".into(),
-                ))
-            }
-        }
+        SessionSelection::ExperimentalNative { dir } => Ok(Session::new(
+            backend::fresh_experimental_native(dir).await?,
+            None,
+        )),
         SessionSelection::New { dir, .. } => {
             // Ensure the sessions directory exists, then create a fresh JSONL
             // session file inside it.

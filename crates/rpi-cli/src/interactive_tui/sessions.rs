@@ -107,6 +107,7 @@ pub(super) async fn switch_to_session(
     tool_context: &rpi_extensions::ToolCallContext,
     catalog: &Arc<std::sync::RwLock<Vec<rpi_ai::Model>>>,
 ) -> bool {
+    state.history_page.invalidate();
     if *state.status.lock().unwrap() == RunStatus::Working {
         state.set_status(RunStatus::Aborting);
         let _ = lane.abort().await;
@@ -146,16 +147,13 @@ pub(super) async fn switch_to_session(
             chat.clear();
             state.reset_session_state();
             let (tools, skills, context_files) = current_capabilities(harness, lane).await;
-            add_welcome_message_with_capabilities(chat, &tools, &skills, &context_files);
-            render_session_history(
-                harness,
-                chat,
-                state.markdown_transformer(),
-                Some(state.extension_session.clone()),
-                state.images_visible(),
-                Some(&state.footer),
-            )
-            .await;
+            add_welcome_message_with_capabilities(
+                &state.history_page.header,
+                &tools,
+                &skills,
+                &context_files,
+            );
+            history::restore(harness, state, chat).await;
             state.set_status(RunStatus::Idle);
             add_note_message(chat, &format!("Switched to session {id}."));
             // The tools' working directory is fixed by the run that built them;
@@ -201,6 +199,7 @@ pub(super) async fn import_session(
     tool_context: &rpi_extensions::ToolCallContext,
     catalog: &Arc<std::sync::RwLock<Vec<rpi_ai::Model>>>,
 ) {
+    state.history_page.invalidate();
     use std::path::Path as FsPath;
 
     let src = FsPath::new(path);
@@ -253,19 +252,16 @@ pub(super) async fn import_session(
     chat.clear();
     state.reset_session_state();
     let (tools, skills, context_files) = current_capabilities(harness, lane).await;
-    add_welcome_message_with_capabilities(chat, &tools, &skills, &context_files);
+    add_welcome_message_with_capabilities(
+        &state.history_page.header,
+        &tools,
+        &skills,
+        &context_files,
+    );
     // Same replay as `/session`: the imported session's own history names the
     // model it was last using.
     restore_session_model(harness, lane, state, catalog).await;
-    render_session_history(
-        harness,
-        chat,
-        state.markdown_transformer(),
-        Some(state.extension_session.clone()),
-        state.images_visible(),
-        Some(&state.footer),
-    )
-    .await;
+    history::restore(harness, state, chat).await;
     state.set_status(RunStatus::Idle);
     add_note_message(chat, &format!("Imported session from {path}"));
 }
@@ -277,6 +273,7 @@ pub(super) async fn fork_session(
     state: &Arc<TuiState>,
     tool_context: &rpi_extensions::ToolCallContext,
 ) {
+    state.history_page.invalidate();
     let lane = harness.lane("main");
     if *state.status.lock().unwrap() == RunStatus::Working {
         state.set_status(RunStatus::Aborting);
@@ -319,21 +316,18 @@ pub(super) async fn fork_session(
     chat.clear();
     state.reset_session_state();
     let (tools, skills, context_files) = current_capabilities(harness, &lane).await;
-    add_welcome_message_with_capabilities(chat, &tools, &skills, &context_files);
+    add_welcome_message_with_capabilities(
+        &state.history_page.header,
+        &tools,
+        &skills,
+        &context_files,
+    );
     // A fork continues the CURRENT conversation: a `/model` pick made after the
     // last recorded turn is still the user's live intent, and `apply_model_selection`
     // deliberately persists nothing for the replay to read. Restoring the older
     // recorded model here would silently undo that pick, so the fork keeps the
     // live model instead of replaying.
-    render_session_history(
-        harness,
-        chat,
-        state.markdown_transformer(),
-        Some(state.extension_session.clone()),
-        state.images_visible(),
-        Some(&state.footer),
-    )
-    .await;
+    history::restore(harness, state, chat).await;
     state.set_status(RunStatus::Idle);
     add_note_message(chat, "Forked into a new session.");
 }
@@ -363,6 +357,7 @@ pub(super) async fn start_new_session(
     state: &Arc<TuiState>,
     tool_context: &rpi_extensions::ToolCallContext,
 ) -> bool {
+    state.history_page.invalidate();
     if *state.status.lock().unwrap() == RunStatus::Working {
         state.set_status(RunStatus::Aborting);
         let _ = lane.abort().await;
@@ -436,19 +431,13 @@ pub(super) async fn start_new_session(
     state.reset_session_state();
     chat.clear();
     let (tools, skills, context_files) = current_capabilities(harness, lane).await;
-    add_welcome_message_with_capabilities(chat, &tools, &skills, &context_files);
-    render_session_history(
-        harness,
-        chat,
-        state.markdown_transformer(),
-        Some(state.extension_session.clone()),
-        state.images_visible(),
-        // The fresh session has no recorded usage, so this replay folds
-        // nothing — the footer simply keeps the zeroed counters. Passing the
-        // footer anyway keeps every session-swap path on one shape.
-        Some(&state.footer),
-    )
-    .await;
+    add_welcome_message_with_capabilities(
+        &state.history_page.header,
+        &tools,
+        &skills,
+        &context_files,
+    );
+    history::restore(harness, state, chat).await;
     state.set_status(RunStatus::Idle);
     if ephemeral {
         add_note_message(chat, "Started a new ephemeral session (--no-session).");
@@ -470,6 +459,7 @@ pub(super) async fn start_new_session(
 ///
 /// `footer` is the footer whose per-session counters the replayed usage belongs
 /// to. It is `None` at startup, where the footer has not been built yet.
+#[cfg(test)]
 pub(super) async fn render_session_history(
     harness: &AgentHarness,
     chat: &Arc<Container>,
@@ -478,47 +468,42 @@ pub(super) async fn render_session_history(
     show_images: bool,
     footer: Option<&rpi_tui::FooterComponent>,
 ) {
-    // Usage the replay accumulates, folded into `footer` at the end so
-    // returning to a session restores its counters instead of leaving the
-    // footer blank (or showing the previous session's numbers). Totals are
-    // sums; the cache-hit rate keeps the live `MessageEnd` semantics (the
-    // LATEST eligible turn's rate, not a session average), so reopening a
-    // history cannot change what the footer showed live.
-    let mut restored_input = 0i64;
-    let mut restored_output = 0i64;
-    let mut restored_cache_read = 0i64;
-    let mut restored_cache_write = 0i64;
-    let mut restored_cost = 0f64;
-    let mut restored_hit_rate: Option<f64> = None;
-    let mut restored_context: Option<i64> = None;
-    // Branch-scoped like `restore_session_model`: the transcript and the usage
-    // must reflect the main lane's SELECTED ancestry. The session-wide
-    // `find_entries` ignores which leaf is selected, so a child lane's later
-    // turn would otherwise supply the main context badge (and an abandoned
-    // sibling's history would render).
-    let entries = match harness
-        .find_entries_on_branch(
-            &EntryQuery {
-                // Branch results walk leaf→root; the transcript renders
-                // top-to-bottom, so reverse to chronological.
-                order: Some(EntryOrder::OldestFirst),
-                ..Default::default()
-            },
-            &BranchBounds::default(),
-        )
-        .await
-    {
-        Ok(e) => e,
-        Err(_) => return,
+    let tree = harness.session().view("main");
+    let Ok(page) = tree.branch_entry_page(&Default::default()).await else {
+        return;
     };
-    let mut rendered_any = false;
+    render_history_entries(
+        page.entries,
+        chat,
+        transformer,
+        extension_session,
+        show_images,
+    );
+    restore_history_panels(&tree, chat).await;
+    if let Some(footer) = footer {
+        if let Ok(name) = tree.get_name().await {
+            footer.set_session_name(name.as_deref());
+        }
+        if let Ok(overview) = tree.branch_overview().await {
+            history::apply_overview(footer, &overview);
+        }
+    }
+}
+
+/// Render complete entries without dropping variants or truncating large entries.
+pub(super) fn render_history_entries(
+    entries: Vec<Entry>,
+    chat: &Arc<Container>,
+    transformer: Option<MarkdownTransformer>,
+    extension_session: Option<crate::session::ExtensionSessionCell>,
+    show_images: bool,
+) {
     for e in entries {
         match e {
             Entry::Message(me) => match &me.message {
                 AgentMessage::User(u) => {
                     add_user_message(chat, &user_message_text(u));
                     add_user_images(chat, u, show_images);
-                    rendered_any = true;
                 }
                 AgentMessage::Assistant(a) => {
                     let comp = Arc::new(AssistantMessageComponent::new(
@@ -531,27 +516,6 @@ pub(super) async fn render_session_history(
                     }
                     comp.update_blocks(&assistant_blocks(a));
                     chat.add_child(comp);
-                    // Accumulate under the same rules the live `MessageEnd`
-                    // handler applies (events.rs): totals sum across turns,
-                    // while the cache-hit rate is the LATEST turn's eligible
-                    // rate (each eligible turn overwrites, matching live).
-                    restored_input += a.usage.input;
-                    restored_output += a.usage.output;
-                    restored_cache_read += a.usage.cache_read;
-                    restored_cache_write += a.usage.cache_write;
-                    restored_cost += a.usage.cost.total;
-                    let denom = a.usage.input + a.usage.cache_read + a.usage.cache_write;
-                    if denom > 0 && (a.usage.cache_read + a.usage.cache_write) > 0 {
-                        restored_hit_rate = Some(a.usage.cache_read as f64 / denom as f64 * 100.0);
-                    }
-                    if a.stop_reason != rpi_ai::StopReason::Aborted
-                        && a.stop_reason != rpi_ai::StopReason::Error
-                    {
-                        let tokens = a.usage.context_tokens();
-                        if tokens > 0 {
-                            restored_context = Some(tokens);
-                        }
-                    }
                     // The component adds spacing only when it has visible content.
                     if let Some(text) = extension_usage_text(extension_session.as_ref(), &a.usage) {
                         add_note_message(chat, &text);
@@ -559,31 +523,14 @@ pub(super) async fn render_session_history(
                     if let Some(error) = assistant_error_text(a) {
                         add_error_message(chat, &error);
                     }
-                    rendered_any = true;
                 }
                 AgentMessage::ToolResult(result) => {
+                    // Current panels are independent of the visible history page.
                     if matches!(
                         result.tool_name.as_str(),
-                        "plan_mode_start" | "plan_mode_complete"
+                        "plan_mode_start" | "plan_mode_complete" | "todo"
                     ) && !result.is_error
-                        && crate::transcript_view::update_plan_panel(
-                            chat,
-                            &serde_json::json!({"details":result.details}),
-                        )
                     {
-                        rendered_any = true;
-                        continue;
-                    }
-                    if result.tool_name == "todo"
-                        && !result.is_error
-                        && crate::transcript_view::update_todo_list(
-                            chat,
-                            &serde_json::json!({
-                                "content": result.content, "details": result.details,
-                            }),
-                        )
-                    {
-                        rendered_any = true;
                         continue;
                     }
                     // Tool results are persisted as separate message entries,
@@ -603,7 +550,6 @@ pub(super) async fn render_session_history(
                     }
                     // The tool panel carries its own trailing spacer now (one
                     // convention for every transcript entry) — no host spacer.
-                    rendered_any = true;
                 }
                 AgentMessage::Custom(custom) => {
                     if let Some(session) = &extension_session {
@@ -619,12 +565,10 @@ pub(super) async fn render_session_history(
                         ) {
                             chat.add_child(component);
                             chat.add_child(Arc::new(Spacer::new(1)));
-                            rendered_any = true;
                             continue;
                         }
                     }
                     add_note_message(chat, &custom_message_fallback(custom));
-                    rendered_any = true;
                 }
             },
             Entry::Compaction(compaction) => {
@@ -635,30 +579,16 @@ pub(super) async fn render_session_history(
                         compaction.tokens_before, compaction.summary
                     ),
                 );
-                rendered_any = true;
-                // Same as the live `/compact` success path: the last assistant
-                // usage describes the PRE-compaction context, so the badge must
-                // reset to `?`/0.0% here too. A later valid assistant report on
-                // the branch re-populates it; usage totals stay intact.
-                restored_context = None;
             }
             Entry::BranchSummary(summary) => {
                 add_note_message(chat, &format!("Branch summary: {}", summary.summary));
-                rendered_any = true;
             }
             Entry::Custom(custom) => {
-                if custom.custom_type == "plan-mode" {
-                    let mut details = custom.data.clone().unwrap_or(serde_json::Value::Null);
-                    if let Some(fields) = details.as_object_mut() {
-                        fields.insert("kind".into(), serde_json::json!("plan"));
-                    }
-                    if crate::transcript_view::update_plan_panel(
-                        chat,
-                        &serde_json::json!({"details":details}),
-                    ) {
-                        rendered_any = true;
-                        continue;
-                    }
+                if matches!(
+                    custom.custom_type.as_str(),
+                    "plan-mode" | "todo" | "todo-state"
+                ) {
+                    continue;
                 }
                 let rendered = extension_session.as_ref().and_then(|session| {
                     extension_entry_component(session, &custom.custom_type, custom.data.clone())
@@ -666,12 +596,10 @@ pub(super) async fn render_session_history(
                 if let Some(component) = rendered {
                     chat.add_child(component);
                     chat.add_child(Arc::new(Spacer::new(1)));
-                    rendered_any = true;
                 } else if let Some(text) =
                     custom_entry_display_text(&custom.custom_type, custom.data.as_ref())
                 {
                     add_note_message(chat, &text);
-                    rendered_any = true;
                 }
             }
             Entry::ModelChange(change) => {
@@ -679,51 +607,64 @@ pub(super) async fn render_session_history(
                     chat,
                     &format!("Model changed to {}:{}", change.provider, change.model_id),
                 );
-                rendered_any = true;
             }
             Entry::ThinkingLevel(change) => {
                 add_note_message(
                     chat,
                     &format!("Thinking level: {:?}", change.thinking_level),
                 );
-                rendered_any = true;
             }
             Entry::ActiveTools(change) => {
                 add_note_message(
                     chat,
                     &format!("Active tools: {}", change.active_tool_names.join(", ")),
                 );
-                rendered_any = true;
             }
         }
     }
-    if rendered_any {
-        // No trailing spacer here — each entry already adds its own trailing
-        // Spacer(1), so an extra would double the bottom gap.
+}
+
+/// Current panels are restored with storage-side custom-type filters and limits.
+pub(super) async fn restore_history_panels(
+    tree: &Arc<dyn rpi_harness::session::types::SessionTree>,
+    chat: &Arc<Container>,
+) {
+    // Read at most one entry per supported persisted kind, then replay in
+    // sequence order: legacy todo-state must not overwrite a newer todo entry.
+    let mut latest = Vec::new();
+    for kind in ["plan-mode", "todo", "todo-state"] {
+        let Ok(entries) = tree
+            .find_entries_on_branch(
+                &EntryQuery {
+                    custom_type: Some(kind.into()),
+                    order: Some(EntryOrder::NewestFirst),
+                    limit: Some(1),
+                    ..Default::default()
+                },
+                &BranchBounds::default(),
+            )
+            .await
+        else {
+            continue;
+        };
+        latest.extend(entries);
     }
-    if let Some(footer) = footer {
-        // The session's own name, which `/name` (and a session created by an
-        // extension) records in the log. `reset_session_counters` cleared the
-        // slot before this replay ran, so without this a switch to a named
-        // session left line 1 blank. Independent of the usage gate below: a
-        // session with no recorded turns can still be named.
-        if let Ok(name) = harness.get_name().await {
-            footer.set_session_name(name.as_deref());
-        }
-        // Only restore when the session actually recorded usage; a fresh or
-        // metadata-only session must not overwrite the live counters.
-        if restored_input > 0 || restored_output > 0 || restored_cost > 0.0 {
-            footer.add_usage(
-                restored_input,
-                restored_output,
-                restored_cache_read,
-                restored_cache_write,
-                restored_cost,
+    latest.sort_by_key(Entry::seq);
+    for entry in latest {
+        let Entry::Custom(custom) = entry else {
+            continue;
+        };
+        let mut details = custom.data.unwrap_or(serde_json::Value::Null);
+        if custom.custom_type == "plan-mode" {
+            if let Some(fields) = details.as_object_mut() {
+                fields.insert("kind".into(), serde_json::json!("plan"));
+            }
+            crate::transcript_view::update_plan_panel(
+                chat,
+                &serde_json::json!({"details":details}),
             );
-            if let Some(rate) = restored_hit_rate {
-                footer.set_cache_hit_rate(Some(rate));
-            }
-            footer.set_context_tokens(restored_context);
+        } else {
+            crate::transcript_view::update_todo_list(chat, &serde_json::json!({"details":details}));
         }
     }
 }
@@ -751,27 +692,11 @@ pub(super) async fn restore_session_model(
     state: &Arc<TuiState>,
     catalog: &Arc<std::sync::RwLock<Vec<rpi_ai::Model>>>,
 ) {
-    // Branch-scoped, not `find_entries`: the lane view's session-wide query
-    // ignores which leaf is selected, so abandoned branches and child lanes
-    // would bleed into the derivation.
-    let Ok(entries) = harness
-        .find_entries_on_branch(
-            &EntryQuery {
-                order: Some(EntryOrder::OldestFirst),
-                ..Default::default()
-            },
-            &BranchBounds::default(),
-        )
-        .await
-    else {
+    let _ = harness; // Shared switch helper signature.
+    let Ok(overview) = lane.session_view().branch_overview().await else {
         return;
     };
-    let Some((provider, model_id)) = rpi_harness::session::build_session_context(
-        &entries,
-        &rpi_harness::session::SessionContextBuildOptions::default(),
-    )
-    .model
-    else {
+    let Some((provider, model_id)) = overview.model else {
         return;
     };
     let models = catalog
