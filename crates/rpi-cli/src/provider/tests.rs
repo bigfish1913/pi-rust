@@ -208,6 +208,7 @@ mod package_oauth_refresh {
                 plugin: "acme".into(),
                 manifest_json: r#"{"id":"acme","displayName":"Acme"}"#.into(),
                 request_fn: oauth,
+                control_fn: None,
                 plugin_free_string: free_string,
                 user_data: std::ptr::null_mut(),
             }));
@@ -304,6 +305,7 @@ mod package_oauth_refresh {
                 plugin: id.into(),
                 manifest_json: json!({"id": id, "displayName": id}).to_string(),
                 request_fn: oauth,
+                control_fn: None,
                 plugin_free_string: free_string,
                 user_data: std::ptr::null_mut(),
             });

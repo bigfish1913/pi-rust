@@ -8,6 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// A newtype wrapping a JSON Schema value. Tools carry their parameters schema here
 /// (produced by `schemars::JsonSchema` derive, stored as a `serde_json::Value` so it
@@ -136,7 +137,9 @@ pub struct ImageContent {
     // persisted image blocks round-trip through JSONL.
     #[serde(default, rename = "type")]
     pub kind: ImageContentType,
-    pub data: String,
+    /// Base64. Shared, because messages are cloned between the session, the
+    /// agent loop and the providers, and one image outweighs all their text.
+    pub data: Arc<str>,
     pub mime_type: String,
 }
 

@@ -211,6 +211,63 @@ async fn saved_reader_native_queue_progress_and_legacy_facts_are_readable_not_ex
     assert_eq!(std::fs::read_to_string(&progress).unwrap(), frames);
 }
 #[tokio::test]
+async fn saved_reader_progress_only_change_invalidates_cursor_but_keeps_blocked_history_visible() {
+    use rpi_harness::session::jsonl::JsonlSessionStorage;
+    use rpi_harness::session::{DefaultIdGenerator, SystemClock};
+    use std::sync::Arc;
+
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let path = input(root);
+    let mut query = request(root, &path);
+    let before = invoke(root, &query).await;
+    assert_eq!(before["success"], true, "{before}");
+    let history = std::fs::read(&path).unwrap();
+    let progress_path = PathBuf::from(format!("{}.progress.jsonl", path.display()));
+    let progress = json!({
+        "format":"assistant-progress-v1", "session_id":"saved-id",
+        "state":{"sequence":1,"frames":[{
+            "id":"pending-frame", "seq":1, "timestamp":0, "lane":"main",
+            "runId":"pending-run", "streamIndex":0, "op":"append",
+            "frame":{"type":"text_delta","delta":"not a committed message"}
+        }]}
+    })
+    .to_string()
+        + "\n";
+    put(&progress_path, &progress);
+
+    query["cursor"] = before["data"]["cursor"].clone();
+    let stale = invoke(root, &query).await;
+    assert_eq!(stale["error"]["code"], "branch_changed", "{stale}");
+    query["cursor"] = Value::Null;
+    let blocked = invoke(root, &query).await;
+    assert_eq!(blocked["success"], true, "{blocked}");
+    assert_eq!(blocked["data"]["leafId"], before["data"]["leafId"]);
+    assert_ne!(blocked["data"]["source"], before["data"]["source"]);
+    assert_eq!(blocked["data"]["messages"], before["data"]["messages"]);
+    assert_eq!(blocked["data"]["pending"]["progress"], true);
+    assert_eq!(blocked["data"]["pending"]["idleProofSupported"], true);
+    query["cursor"] = blocked["data"]["cursor"].clone();
+    let next = invoke(root, &query).await;
+    assert_eq!(next["success"], true, "{next}");
+    assert_eq!(next["data"]["messages"][0]["entryId"], "two");
+    assert_eq!(next["data"]["pending"]["progress"], true);
+
+    // Readable history and supported idle-proof machinery are not idle permission.
+    // This is the strict loader used by transition preflight, not a normal open.
+    let result = JsonlSessionStorage::load_for_resource_transition(
+        Arc::new(rpi_tools::OsExecutionEnv::with_cwd(root.to_path_buf())),
+        path.to_str().unwrap(),
+        Arc::new(SystemClock),
+        Arc::new(DefaultIdGenerator::new()),
+    )
+    .await;
+    assert!(matches!(result, Err(error) if error.to_string().contains("pending native progress")));
+    assert_eq!(std::fs::read(&path).unwrap(), history);
+    assert_eq!(std::fs::read_to_string(&progress_path).unwrap(), progress);
+}
+
+#[tokio::test]
 async fn saved_reader_message_and_custom_serialized_limits_are_not_empty_success() {
     let root = tempfile::tempdir().unwrap();
     let root = root.path();

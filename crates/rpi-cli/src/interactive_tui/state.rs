@@ -243,6 +243,10 @@ pub(super) struct TuiState {
     /// Monotonic source for OAuth flow ids. Kept separate so an inactive flow
     /// can use zero without allowing a late result to match a future flow.
     pub(super) provider_auth_generation: std::sync::atomic::AtomicU64,
+    /// Cancellation for the provider OAuth call in flight. Created when a flow
+    /// begins and cancelled when it ends (Esc, a finished result, or a new flow),
+    /// so a plugin's blocking begin, exchange or revoke can stop early.
+    pub(super) provider_auth_cancel: std::sync::Mutex<Option<CancellationToken>>,
     /// The select-list currently occupying the input slot for a choice-style
     /// provider form step (the protocol step). Mutually exclusive with
     /// [`Self::active_provider_input`].
@@ -1288,17 +1292,23 @@ pub(super) fn format_tokens(n: i64) -> String {
 /// Record a submitted message for ↑ recall (mirrors TS `addToHistory`):
 /// trims, skips empty + consecutive duplicates, caps at [`HISTORY_LIMIT`], and
 /// resets the browse state so a fresh prompt never resumes mid-history.
+///
+/// The browse reset is unconditional: resubmitting a recalled entry is a
+/// duplicate and adds nothing to history, but the session still ended — a
+/// stale `history_index` would leave the next ↓ restoring a draft that had
+/// already been submitted.
 pub(super) fn push_history(state: &Arc<TuiState>, text: &str) {
     let trimmed = text.trim().to_string();
     if trimmed.is_empty() {
         return;
     }
-    let mut history = state.history.lock().unwrap();
-    if history.first() == Some(&trimmed) {
-        return;
+    {
+        let mut history = state.history.lock().unwrap();
+        if history.first() != Some(&trimmed) {
+            history.insert(0, trimmed);
+            history.truncate(HISTORY_LIMIT);
+        }
     }
-    history.insert(0, trimmed);
-    history.truncate(HISTORY_LIMIT);
     *state.history_index.lock().unwrap() = -1;
     *state.history_draft.lock().unwrap() = None;
 }
@@ -1379,6 +1389,47 @@ pub(super) fn poll_auto_send(
     }
 }
 
+/// Whether an ↑/↓ press belongs to prompt history rather than to the caret.
+///
+/// Inside a multi-line draft the editor owns the arrow whenever the caret can
+/// still travel in that direction: ↑ moves between logical lines until it
+/// reaches the first line, ↓ until it reaches the last. Only the press that
+/// cannot move the caret any further switches to history, which is what makes
+/// a multi-line prompt — typed or recalled — editable line by line.
+///
+/// A single-line draft keeps the pre-existing contract: the arrows never
+/// replace it. That behaviour is deliberate — swapping a typed draft for a
+/// history entry was reported as "text disappeared" — and a single-line prompt
+/// has no second row to move to, so there is no "again" press to reinterpret.
+/// An active browse session is the exception: after recalling a single-line
+/// entry the editor is exactly that shape, and ↑/↓ must keep walking history
+/// until ↓ past the newest entry ends the session.
+///
+/// `direction` is -1 (↑, older) or 1 (↓, newer), matching [`navigate_history`].
+pub(super) fn arrow_belongs_to_history(
+    state: &Arc<TuiState>,
+    editor: &Arc<Editor>,
+    direction: i32,
+) -> bool {
+    if state.history.lock().unwrap().is_empty() {
+        return false;
+    }
+    // A fresh prompt has no caret row to move to, so the first arrow press
+    // recalls immediately (upstream's `historyPrevious` on an empty editor).
+    if editor.get_text().is_empty() {
+        return true;
+    }
+    if editor.line_count() < 2 {
+        return *state.history_index.lock().unwrap() != -1;
+    }
+    let (row, _col) = editor.cursor_position();
+    if direction < 0 {
+        row == 0
+    } else {
+        row + 1 >= editor.line_count()
+    }
+}
+
 /// Navigate message history. `direction` is -1 (↑, older) or 1 (↓, newer).
 /// Mirrors TS `navigateHistory`: the first entry into browse mode stashes the
 /// current editor text as the draft; navigating back past the newest entry
@@ -1402,18 +1453,15 @@ pub(super) fn navigate_history(state: &Arc<TuiState>, editor: &Arc<Editor>, dire
         // Exited browse mode: restore the draft (or clear if there was none).
         let draft = state.history_draft.lock().unwrap().take();
         match draft {
-            Some(d) => {
-                let len = d.len();
-                editor.set_text(&d);
-                editor.set_cursor(0, len);
-            }
+            Some(d) => set_editor_text_caret_at_end(editor, &d),
             None => editor.set_text(""),
         }
     } else {
         let text = history[new_index as usize].clone();
-        let len = text.len();
-        editor.set_text(&text);
-        editor.set_cursor(0, len);
+        // A recalled prompt is edited from its tail: `set_text` parks the
+        // caret at (0, 0), which for a multi-line entry left ↑ as the only
+        // working arrow — ↓ looked like it skipped the entry entirely.
+        set_editor_text_caret_at_end(editor, &text);
     }
 }
 
@@ -1462,6 +1510,85 @@ impl TuiState {
             previous.cancel();
         }
         cancellation
+    }
+
+    /// Start a provider OAuth flow: allocate its id and publish the id and its
+    /// cancellation token in one step under the token lock, so an Esc that ends
+    /// the flow always finds the token to cancel. A previous flow's token is
+    /// cancelled, so a call from an older flow cannot outlive it.
+    pub(super) fn begin_provider_auth(&self) -> (u64, CancellationToken) {
+        let mut slot = self.provider_auth_cancel.lock().unwrap();
+        let flow_id = self
+            .provider_auth_generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            .wrapping_add(1);
+        let cancellation = CancellationToken::new();
+        if let Some(previous) = slot.replace(cancellation.clone()) {
+            previous.cancel();
+        }
+        self.provider_auth_flow_id
+            .store(flow_id, std::sync::atomic::Ordering::Release);
+        (flow_id, cancellation)
+    }
+
+    /// The token for flow `flow_id`'s next provider call. If that flow is no
+    /// longer active it is already cancelled, so a late submit cannot run
+    /// unobserved or borrow a newer flow's token.
+    pub(super) fn provider_auth_token(&self, flow_id: u64) -> CancellationToken {
+        let slot = self.provider_auth_cancel.lock().unwrap();
+        match slot.as_ref() {
+            Some(cancellation)
+                if self
+                    .provider_auth_flow_id
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    == flow_id =>
+            {
+                cancellation.clone()
+            }
+            _ => {
+                let cancellation = CancellationToken::new();
+                cancellation.cancel();
+                cancellation
+            }
+        }
+    }
+
+    /// End the active provider OAuth flow, if any, and cancel its call. Returns
+    /// whether a flow was active, i.e. this end won it from a completing result.
+    pub(super) fn end_provider_auth(&self) -> bool {
+        let mut slot = self.provider_auth_cancel.lock().unwrap();
+        let ended = self
+            .provider_auth_flow_id
+            .swap(0, std::sync::atomic::Ordering::AcqRel)
+            != 0;
+        if let Some(cancellation) = slot.take() {
+            cancellation.cancel();
+        }
+        ended
+    }
+
+    /// End flow `flow_id` only if it is still the active one, for a result
+    /// about to write the store. Exactly one of this and an Esc's
+    /// [`Self::end_provider_auth`] wins; a losing claim changes nothing.
+    pub(super) fn claim_provider_auth(&self, flow_id: u64) -> bool {
+        let mut slot = self.provider_auth_cancel.lock().unwrap();
+        let claimed = flow_id != 0
+            && self
+                .provider_auth_flow_id
+                .compare_exchange(
+                    flow_id,
+                    0,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_ok();
+        if claimed {
+            // The call already returned; this only clears the slot.
+            if let Some(cancellation) = slot.take() {
+                cancellation.cancel();
+            }
+        }
+        claimed
     }
 
     /// Clear the user-bash slot. Called when the command finishes so the
@@ -1574,7 +1701,6 @@ impl TuiState {
                 // `show_terminal_progress` disables it entirely.
                 if self.show_terminal_progress {
                     self.editor.set_working(Some(WorkingState {
-                        frame: 0,
                         started_at: std::time::Instant::now(),
                         message: "Working…".to_string(),
                     }));

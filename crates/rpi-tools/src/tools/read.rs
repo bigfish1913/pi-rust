@@ -383,7 +383,7 @@ fn image_result(
                         )),
                         TextContentOrImage::Image(ImageContent {
                             kind: ImageContentType,
-                            data: p.data,
+                            data: p.data.into(),
                             mime_type: p.mime_type,
                         }),
                     ],
@@ -417,7 +417,7 @@ fn image_result(
             TextContentOrImage::text(format!("Read image file [{mime}]")),
             TextContentOrImage::Image(ImageContent {
                 kind: ImageContentType,
-                data: encode_base64(bytes),
+                data: encode_base64(bytes).into(),
                 mime_type: mime.to_string(),
             }),
         ],

@@ -369,6 +369,12 @@ impl JsonlSessionRepo {
             self.ids.clone(),
         )
         .await?;
+        if source_storage.jsonl_metadata().id != source.id {
+            return Err(SessionError::invalid_entry(format!(
+                "Session id does not match header: {}",
+                source.id
+            )));
+        }
         // TS: parentSessionId ?? source.id.
         let mut create_options = options.clone();
         if create_options.parent_session_id.is_none() {
@@ -1009,6 +1015,68 @@ mod tests {
         let _opened = r.open(&listed[0]).await.unwrap();
         r.delete(&listed[0]).await.unwrap();
         assert!(r.list().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fork_rejects_mismatched_source_identity_before_initialization_or_publication() {
+        let fs: Arc<dyn FileSystem> =
+            Arc::new(rpi_tools::InMemoryExecutionEnv::with_cwd("/proj".into()));
+        let r = repo(fs.clone());
+        let options = |id: &str| JsonlSessionCreateOptions {
+            id: Some(id.into()),
+            parent_session_id: None,
+            cwd: "/proj".into(),
+            metadata: None,
+        };
+        let source = r.create_typed(&options("source")).await.unwrap();
+        let mut metadata = source.jsonl_metadata();
+        let history = fs.read_binary_file(&metadata.path, None).await.unwrap();
+        let progress_path = format!("{}.progress.jsonl", metadata.path);
+        let progress = fs.read_binary_file(&progress_path, None).await.unwrap();
+        let directory = r.session_directory("/proj").await.unwrap();
+        let paths = || async {
+            let mut paths: Vec<_> = fs
+                .list_dir(&directory, None)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.path)
+                .collect();
+            paths.sort();
+            paths
+        };
+        let before = paths().await;
+        metadata.id = "wrong-source".into();
+        let legacy = r
+            .fork_typed(&metadata, &options("legacy-child"), &ForkOptions::default())
+            .await;
+        let configured = r
+            .fork_typed_with_value_initializer(
+                &metadata,
+                &options("configured-child"),
+                &ForkOptions::default(),
+                |_| panic!("identity rejection must precede initialization"),
+            )
+            .await;
+        for result in [legacy, configured] {
+            let error = match result {
+                Ok(_) => panic!("mismatched source identity must not fork"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code, SessionErrorCode::InvalidEntry);
+            assert!(error
+                .to_string()
+                .contains("Session id does not match header"));
+        }
+        assert_eq!(paths().await, before);
+        assert_eq!(
+            fs.read_binary_file(&metadata.path, None).await.unwrap(),
+            history
+        );
+        assert_eq!(
+            fs.read_binary_file(&progress_path, None).await.unwrap(),
+            progress
+        );
     }
 
     #[tokio::test]

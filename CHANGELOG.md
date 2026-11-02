@@ -11,6 +11,14 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+### Fixed
+
+- *(cli)* keep fullscreen mouse-selection copies on Linux: the arboard clipboard
+  handle now lives for the whole process instead of being dropped right after
+  each copy, which on X11 destroyed the selection data unless a desktop
+  clipboard manager happened to take it over (LXQt/Openbox runs none), so the
+  "Copied" toast was followed by an empty clipboard
+
 ## [0.16.0](https://github.com/bigfish1913/pi-rust/compare/v0.15.0...v0.16.0) - 2026-11-01
 
 ### Added

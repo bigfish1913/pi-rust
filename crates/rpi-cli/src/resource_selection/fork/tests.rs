@@ -84,6 +84,20 @@ async fn native_fork_initialization_uses_current_binding_even_for_old_message_cu
                 position: Some(ForkPosition::At),
             },
         ),
+        (
+            "before-later",
+            ForkOptions::Branch {
+                entry_id: Some(later.clone()),
+                position: Some(ForkPosition::Before),
+            },
+        ),
+        (
+            "before-first-message",
+            ForkOptions::Branch {
+                entry_id: Some(message.clone()),
+                position: Some(ForkPosition::Before),
+            },
+        ),
     ] {
         let fork = repo
             .fork_typed_with_value_initializer(&metadata, &create(id), &options, initial_values)
@@ -110,9 +124,19 @@ async fn native_fork_initialization_uses_current_binding_even_for_old_message_cu
             )
             .await
             .unwrap();
-        assert!(branch.iter().any(|e| e.id() == message));
+        assert_eq!(
+            branch.iter().any(|e| e.id() == message),
+            id != "before-first-message"
+        );
         assert_eq!(branch.iter().any(|e| e.id() == later), id == "clone");
         assert_eq!(branch.iter().any(|e| e.id() == leaf), id == "clone");
+        // Copied history keeps entry identity and ancestry; only the new
+        // resource binding is appended on the destination's own branch.
+        for entry in &branch {
+            if let Some(original) = session.get_entry(entry.id()).await.unwrap() {
+                assert_eq!(entry.parent_id(), original.parent_id());
+            }
+        }
         // Source operation IDs are not destination authority: the SAME textual
         // ID can start a distinct new-session CAS chain from revision one.
         let mut next = selected.clone();

@@ -261,6 +261,8 @@ source. Global development installs made with `--path` are excluded. The old
 extension updates. Project linking commands remain `rpi package link`,
 `rpi package list`, and `rpi package unlink`.
 
+A prebuilt archive may also carry files that the extension needs beside its library, such as a Node worker. The archive's `runtime-assets.json` index, written by the package's release builder, lists each file's path, size and SHA-256. The installer verifies every file before it installs anything, installs them beside the library in one transaction, and removes them on uninstall. Archives without an index install only the library. An `rpi` build without this support also installs only the library and does not reject the archive, so upgrade `rpi` before publishing a package that declares assets.
+
 For iterative development:
 
 ```bash

@@ -210,8 +210,8 @@ async fn reloaded_frames_reduce_to_an_interrupted_message() {
     );
 }
 
-/// A run that committed (wrote `ClearRun`) must salvage nothing, even though its
-/// frames are still on disk.
+/// A run that committed (wrote `ClearRun`) must salvage nothing. Its frames stay
+/// on disk but leave memory, on the reload as they did live.
 #[tokio::test]
 async fn a_cleared_run_salvages_nothing_from_disk() {
     let fs: Arc<dyn FileSystem> = Arc::new(rpi_tools::InMemoryExecutionEnv::with_cwd("/".into()));
@@ -233,12 +233,14 @@ async fn a_cleared_run_salvages_nothing_from_disk() {
         .await
         .expect("append clear");
 
+    let on_disk = fs.read_text_file(PATH, None).await.expect("read session");
+    assert_eq!(on_disk.matches(r#""op":"append""#).count(), 3);
+
     let reloaded = JsonlSessionStorage::load(fs, PATH, clock(), ids())
         .await
         .expect("reload jsonl session");
     let session = Session::new(Arc::new(reloaded), None);
 
-    // The frames are still readable...
     let records = session
         .find_records(&RecordQuery {
             record_type: Some(ASSISTANT_FRAME_RECORD_TYPE),
@@ -247,13 +249,9 @@ async fn a_cleared_run_salvages_nothing_from_disk() {
         })
         .await
         .expect("records readable");
-    assert_eq!(
-        records.len(),
-        4,
-        "frames + the clear marker are all on disk"
-    );
+    assert_eq!(records.len(), 1, "only the clear marker stays in memory");
 
-    // ...but nothing is salvaged, so a committed run is never duplicated.
+    // Nothing is salvaged, so a committed run is never duplicated.
     let salvaged = salvage_run_frames(&session, RUN_ID)
         .await
         .expect("salvage runs");

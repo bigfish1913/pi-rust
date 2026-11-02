@@ -44,7 +44,8 @@ potentially authoritative inherited ledger has already been published.
 ## Regression coverage
 
 * Real disk native host initializer test: current custom leaf and explicit old
-  message At cut, current rather than historical declaration, copied history IDs,
+  message At/Before cuts, current rather than historical declaration, copied
+  history IDs and ancestry,
   fresh revision one without source operations, same textual operation accepted
   on a new-session CAS chain, invalid explicit custom target and initializer
   rejection publish nothing, source bytes unchanged.
@@ -56,6 +57,9 @@ potentially authoritative inherited ledger has already been published.
   the original source remains byte-for-byte unchanged.
 * Real legacy native fork with a custom-only leaf retains its history without
   opting into exact resources; ordinary legacy reopen succeeds.
+* Both legacy and initialized repository forks reject mismatched source metadata
+  and header IDs before initialization or destination creation, preserving source
+  history/progress bytes and the directory contents.
 * Existing native fork, progress omission and atomic-publication failure tests
   remain in force. Core integration exercises current fork, clone, historical
   message fork, settings consumption/source capture, and ordinary configured reopen.

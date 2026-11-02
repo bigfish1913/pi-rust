@@ -166,7 +166,7 @@ async fn post_tool_abort_case(resume: bool, steering: bool) {
         1
     );
     assert!(
-        matches!(&events[events.len()-2], AgentEvent::TurnEnd { message, tool_results } if message == aborted && tool_results.is_empty())
+        matches!(&events[events.len()-2], AgentEvent::TurnEnd { message, tool_results, .. } if message == aborted && tool_results.is_empty())
     );
     assert!(
         matches!(events.last(), Some(AgentEvent::AgentEnd { messages: ended }) if ended == &messages)

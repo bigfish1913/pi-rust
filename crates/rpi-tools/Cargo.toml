@@ -65,6 +65,8 @@ default = []
 webp = ["image/webp"]
 
 [target.'cfg(windows)'.dependencies]
+rpi-plugin-sdk = { workspace = true, features = ["process"] }
+win32job = "2"
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading"] }
 
 [target.'cfg(unix)'.dependencies]

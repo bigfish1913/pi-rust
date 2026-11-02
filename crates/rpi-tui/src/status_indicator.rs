@@ -14,6 +14,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use super::component::Component;
+use super::loader::Loader;
 use crate::ansi::visible_width;
 use crate::countdown_timer::CountdownTimer;
 use crate::keybinding_hints::raw_key_hint;
@@ -45,7 +46,6 @@ pub enum CompactionReason {
 pub struct StatusIndicator {
     kind: Mutex<StatusKind>,
     message: Mutex<String>,
-    frame: Mutex<usize>,
     start: Mutex<Option<Instant>>,
     countdown: Mutex<Option<CountdownTimer>>,
     retry_progress: Option<(u32, u32)>,
@@ -59,7 +59,6 @@ impl StatusIndicator {
         Self {
             kind: Mutex::new(StatusKind::Working),
             message: Mutex::new(message.into()),
-            frame: Mutex::new(0),
             start: Mutex::new(Some(Instant::now())),
             countdown: Mutex::new(None),
             retry_progress: None,
@@ -79,7 +78,6 @@ impl StatusIndicator {
         Self {
             kind: Mutex::new(StatusKind::Retry),
             message: Mutex::new(message),
-            frame: Mutex::new(0),
             start: Mutex::new(Some(Instant::now())),
             countdown: Mutex::new(Some(CountdownTimer::new(delay))),
             retry_progress: Some((attempt, max_attempts)),
@@ -99,7 +97,6 @@ impl StatusIndicator {
         Self {
             kind: Mutex::new(StatusKind::Compaction),
             message: Mutex::new(label),
-            frame: Mutex::new(0),
             start: Mutex::new(Some(Instant::now())),
             countdown: Mutex::new(None),
             retry_progress: None,
@@ -112,7 +109,6 @@ impl StatusIndicator {
         Self {
             kind: Mutex::new(StatusKind::BranchSummary),
             message: Mutex::new(message),
-            frame: Mutex::new(0),
             start: Mutex::new(Some(Instant::now())),
             countdown: Mutex::new(None),
             retry_progress: None,
@@ -150,15 +146,13 @@ impl StatusIndicator {
             .unwrap_or_default()
     }
 
-    fn advance(&self) {
-        if let Ok(mut f) = self.frame.lock() {
-            *f = (*f + 1) % SPINNER.len();
-        }
-    }
-
     fn spinner_char(&self) -> char {
-        let f = *self.frame.lock().unwrap();
-        SPINNER.get(f).copied().unwrap_or('⠋')
+        // Same fixed cadence as upstream's `setInterval` loader: one frame per
+        // `SPINNER_FRAME_MS` of wall clock, independent of repaint frequency.
+        SPINNER
+            .get(Loader::frame_at(self.elapsed(), SPINNER.len()))
+            .copied()
+            .unwrap_or('⠋')
     }
 
     fn colors_for(kind: StatusKind) -> (Color, Color) {
@@ -204,9 +198,6 @@ impl Component for StatusIndicator {
         };
 
         let line = format!("{} {}", prefix, msg_color.fg(&display_msg));
-
-        // Advance spinner for the next render (the 120ms tick re-renders).
-        self.advance();
 
         vec![line]
     }

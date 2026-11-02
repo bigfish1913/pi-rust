@@ -413,7 +413,6 @@ fn sync_working(editor: &Arc<Editor>, streaming: bool) {
     if streaming {
         if editor.working().is_none() {
             editor.set_working(Some(WorkingState {
-                frame: 0,
                 started_at: Instant::now(),
                 message: "Working…".to_string(),
             }));
