@@ -444,7 +444,15 @@ where
         tokio::spawn(async move {
             let mut shown = std::collections::HashSet::new();
             while !stop.is_cancelled() {
-                while let Some(request) = mailbox.take_pending() {
+                // This **is** the external UI in `--remote` mode, so it claims
+                // ownership: the local TUI must not also take from the queue.
+                mailbox.set_external_takeover(true);
+                // Skip plugin-reserved requests: a remote client takes those
+                // through `RelayUiDialog`, and consuming them here would leave
+                // the question unanswered on both ends.
+                while let Some(request) =
+                    mailbox.take_pending_filtered(|r| !mailbox.is_reserved(&r.request_id))
+                {
                     let event = crate::remote::protocol::RemoteEvent::UiDialogRequest {
                         request_id: request.request_id.clone(),
                         tool_call_id: request.tool_call_id,

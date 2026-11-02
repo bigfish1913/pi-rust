@@ -293,7 +293,7 @@ async fn abort_reaches_the_host_and_is_not_blocked_by_the_action_id_ceiling() {
 
 /// Independently developed wire actions must survive integration together.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn integrated_command_listing_and_abort_dispatch_without_renumbering() {
+async fn integrated_commands_abort_and_dialog_dispatch_without_renumbering() {
     let host = Arc::new(Host::default());
     let root = ActionBridge::new(Handle::current(), host.clone());
     let plugin = root.for_plugin("integrated-actions");
@@ -303,6 +303,7 @@ async fn integrated_command_listing_and_abort_dispatch_without_renumbering() {
             json!({"commands":[{"name":"integrated","description":"both actions coexist","source":"extension"}]}),
         ),
         (27, json!({"aborted":false})),
+        (28, json!({"requests":[]})),
     ] {
         let mut out = StbString::empty();
         let rc = trampoline_runtime_action(
@@ -319,6 +320,9 @@ async fn integrated_command_listing_and_abort_dispatch_without_renumbering() {
         let value: Value = serde_json::from_str(&owned.to_string_lossy()).unwrap();
         assert_eq!(value, expected);
     }
+    assert!(root.ui_dialog_mailbox().external_takeover());
+    root.ui_dialog_mailbox().release_takeover();
+    assert!(!root.ui_dialog_mailbox().external_takeover());
     assert_eq!(host.command_lists.load(Ordering::SeqCst), 1);
     assert_eq!(host.aborts.load(Ordering::SeqCst), 1);
     let mut out = StbString::empty();

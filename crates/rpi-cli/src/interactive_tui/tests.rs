@@ -4389,7 +4389,7 @@ fn ask_user_freeform_submit_releases_dialog_locks_before_callback() {
             }))
             .unwrap();
     }
-    let request = bridge.take_pending().unwrap();
+    let request = bridge.take_pending_for_tui().unwrap();
     let input = Arc::new(Input::new());
     input.handle_paste("自定义回答");
     let state_submit = state.clone();
@@ -4415,7 +4415,7 @@ fn ask_user_freeform_submit_releases_dialog_locks_before_callback() {
         mailbox.poll("freeform").unwrap()["answer"]["text"],
         "自定义回答"
     );
-    assert_eq!(bridge.take_pending().unwrap().request_id, "next");
+    assert_eq!(bridge.take_pending_for_tui().unwrap().request_id, "next");
 }
 
 #[test]
@@ -4506,16 +4506,16 @@ fn ask_user_bridge_answers_and_cancels_by_request_id() {
         }))
         .unwrap();
 
-    let first = bridge.take_pending().expect("r1 visible");
+    let first = bridge.take_pending_for_tui().expect("r1 visible");
     assert_eq!(first.request_id, "r1");
     assert!(
-        bridge.take_pending().is_none(),
+        bridge.take_pending_for_tui().is_none(),
         "only one request occupies the input slot"
     );
     bridge.respond("r1", serde_json::json!({"text": "7897"}));
     assert_eq!(mailbox.poll("r1").unwrap()["answer"]["text"], "7897");
 
-    let second = bridge.take_pending().expect("r2 visible");
+    let second = bridge.take_pending_for_tui().expect("r2 visible");
     assert_eq!(second.request_id, "r2");
     bridge.cancel("r2");
     assert_eq!(mailbox.poll("r2").unwrap()["status"], "cancelled");

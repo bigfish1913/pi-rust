@@ -1205,6 +1205,21 @@ pub enum RuntimeActionId {
     /// its own attachments together. A flat image list would lose the pairing
     /// as soon as two queued messages carry different pictures.
     Abort = 27,
+    /// Relay host UI-dialog requests to an external UI.
+    ///
+    /// Args:
+    /// * `{"op":"take"}` — take every request the host has **not** reserved for
+    ///   a plugin (i.e. ids that do not start with the reserved prefix),
+    ///   removing them from the mailbox. Result:
+    ///   `{"requests":[{"requestId","toolCallId","ui"}]}` (possibly empty).
+    /// * `{"op":"respond","requestId":"…","answer":…}` and
+    ///   `{"op":"cancel","requestId":"…"}` — behave like the corresponding
+    ///   `UiDialog` ops.
+    ///
+    /// Exists because the TUI and plugins share one dialog mailbox: without a
+    /// relay, a third-party extension's question pops up on the terminal while
+    /// the user is watching a remote client, and is effectively lost.
+    RelayUiDialog = 28,
 }
 
 /// Error returned when a plugin passes a numeric runtime-action id that this
@@ -1253,6 +1268,7 @@ impl TryFrom<u32> for RuntimeActionId {
             25 => Ok(Self::SideQuestion),
             26 => Ok(Self::ListCommands),
             27 => Ok(Self::Abort),
+            28 => Ok(Self::RelayUiDialog),
             other => Err(UnknownRuntimeActionId(other)),
         }
     }
@@ -1294,6 +1310,7 @@ impl RuntimeActionId {
         Self::SideQuestion,
         Self::ListCommands,
         Self::Abort,
+        Self::RelayUiDialog,
     ];
 
     /// The highest defined action id.
@@ -2414,6 +2431,7 @@ mod tests {
             RuntimeActionId::SideQuestion,
             RuntimeActionId::ListCommands,
             RuntimeActionId::Abort,
+            RuntimeActionId::RelayUiDialog,
         ];
 
         // Stable wire ids must not depend on which proposal was merged first.
@@ -2424,9 +2442,11 @@ mod tests {
         }
         assert_eq!(u32::from(RuntimeActionId::ListCommands), 26);
         assert_eq!(u32::from(RuntimeActionId::Abort), 27);
+        assert_eq!(u32::from(RuntimeActionId::RelayUiDialog), 28);
         assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::ListCommands));
         assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::Abort));
-        assert_eq!(RuntimeActionId::MAX, 27);
+        assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::RelayUiDialog));
+        assert_eq!(RuntimeActionId::MAX, 28);
         // One past the highest defined id is rejected (nothing is silently
         // accepted), and so is the u32 ceiling.
         let one_past_last = RuntimeActionId::MAX + 1;
