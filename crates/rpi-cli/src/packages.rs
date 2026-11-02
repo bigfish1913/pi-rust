@@ -572,6 +572,8 @@ fn is_dynamic(p: &Path) -> bool {
 }
 fn valid_name(s: &str) -> bool {
     !s.is_empty()
+        && s != "."
+        && s != ".."
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
@@ -603,6 +605,36 @@ fn write_registry(cwd: &Path, r: &PackageRegistry) -> Result<(), String> {
     std::fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
     std::fs::rename(tmp, path).map_err(|e| e.to_string())
 }
+pub fn selected_project_package(cwd: &Path, name: &str) -> Result<ProjectPackage, String> {
+    if !valid_name(name) {
+        return Err("invalid main package name".into());
+    }
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    let limit = crate::resource_selection::MAX_STATE_BYTES;
+    std::fs::File::open(cwd.join(".rpi").join(REGISTRY))
+        .map_err(|e| e.to_string())?
+        .take((limit + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() > limit {
+        return Err("project package registry exceeds 256 KiB".into());
+    }
+    let registry: PackageRegistry = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("invalid project package registry: {e}"))?;
+    let mut names = std::collections::HashSet::new();
+    for package in &registry.packages {
+        if !names.insert(&package.name) {
+            return Err(format!("duplicate package in registry: {}", package.name));
+        }
+    }
+    registry
+        .packages
+        .into_iter()
+        .find(|p| p.name == name)
+        .ok_or_else(|| format!("main package `{name}` not in .rpi/packages.json"))
+}
+
 pub fn project_package_dirs(cwd: &Path, kind: &str) -> Vec<PathBuf> {
     match read_registry(cwd) {
         Ok(registry) => registry

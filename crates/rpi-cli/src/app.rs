@@ -179,6 +179,12 @@ async fn run_inner() -> i32 {
         return code;
     }
 
+    if dev_options.is_some() && parsed.resource_config.is_some() {
+        eprintln!(
+            "error: --resource-config is restart-only and cannot be combined with dev/dev-local"
+        );
+        return EXIT_USAGE;
+    }
     let cwd = match resolve_cwd() {
         Ok(cwd) => cwd,
         Err(code) => return code,
@@ -202,12 +208,7 @@ async fn run_inner() -> i32 {
         return list_models(search, &parsed, &cwd).await;
     }
 
-    // Build before provider resolution so compiler errors do not require
-    // valid model credentials. The staged directory joins normal discovery.
-    let dev_extension = match prepare_dev_extension(dev_options.as_ref(), &cwd, &mut parsed) {
-        Ok(extension) => extension,
-        Err(code) => return code,
-    };
+    // Dev compilation is deferred until after native session resource preflight.
 
     // `-r/--resume` is an interactive picker, unlike `-c/--continue` which
     // immediately opens the latest session. Resolve the picker result before
@@ -303,6 +304,20 @@ async fn run_inner() -> i32 {
     if !project_trusted && cwd != launch_cwd {
         startup_notices.push(crate::session_cwd::untrusted_session_cwd_note(&cwd));
     }
+    // Reject a bound exact session before dev can build or stage any code.
+    if dev_options.is_some() {
+        if let Err(error) =
+            crate::session::preflight_extension_startup(&parsed, &cwd, project_trusted)
+        {
+            print_build_error(&error);
+            return EXIT_RUNTIME;
+        }
+    }
+    let dev_extension = match prepare_dev_extension(dev_options.as_ref(), &launch_cwd, &mut parsed)
+    {
+        Ok(extension) => extension,
+        Err(code) => return code,
+    };
     let prepared = match prepare_extensions(&parsed, &cwd, project_trusted) {
         Ok(prepared) => prepared,
         Err(error) => {

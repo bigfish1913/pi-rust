@@ -196,6 +196,16 @@ pub enum SendMessageResult {
 }
 
 /// Result of `abort`. Mirrors TS `AbortResult`.
+///
+/// `steer` / `follow_up` are the queued messages that were **reclaimed** by
+/// the abort, images included and per message.
+///
+/// Upstream used to leave these empty: its TUI calls `clearQueue()` *before*
+/// `abort()`, and a plugin/remote caller cannot do that without a race — a
+/// message enqueued between the two calls is drained into the transcript by the
+/// loop *and* handed back, so a remote UI resends it and the model sees it
+/// twice. Reclaiming inside the same write gate as the cancellation removes
+/// that window.
 #[derive(Debug, Clone)]
 pub struct AbortResult {
     pub run_id: String,
@@ -227,16 +237,73 @@ pub struct CancelQueuedResult {
 /// action restores into the editor.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct QueuedMessages {
-    pub steering: Vec<String>,
-    pub follow_up: Vec<String>,
-    /// Image attachments returned by `clear_queue` for draft restoration.
-    pub images: Vec<rpi_ai::types::ImageContent>,
+    pub steering: Vec<QueuedMessageView>,
+    pub follow_up: Vec<QueuedMessageView>,
 }
 
 impl QueuedMessages {
     /// True when nothing is queued on the lane.
     pub fn is_empty(&self) -> bool {
         self.steering.is_empty() && self.follow_up.is_empty()
+    }
+
+    /// Every queued entry in restore order (steering first, then follow-up).
+    pub fn iter(&self) -> impl Iterator<Item = &QueuedMessageView> {
+        self.steering.iter().chain(self.follow_up.iter())
+    }
+
+    /// The queued texts, attachments dropped.
+    ///
+    /// For callers that only render a single-line pending row (`Steering: …`).
+    /// Anything that has to restore a draft must use [`Self::iter`] instead —
+    /// flattening loses which image belonged to which message.
+    pub fn texts(&self) -> impl Iterator<Item = &str> {
+        self.iter().map(|message| message.text.as_str())
+    }
+}
+
+/// One queued message, with the images that belong to **it**.
+///
+/// The pairing matters: a queue can hold several messages, each with its own
+/// attachments. Collecting every image into one flat list would lose which
+/// picture went with which text — a restored remote draft would then attach
+/// the wrong image (or attach it to the wrong message).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QueuedMessageView {
+    /// The user's text (image blocks excluded; they are in `images`).
+    pub text: String,
+    /// Image attachments of this specific message.
+    pub images: Vec<rpi_ai::types::ImageContent>,
+}
+
+impl QueuedMessageView {
+    /// True when the entry carries neither text nor images (nothing to restore).
+    pub fn is_empty(&self) -> bool {
+        self.text.trim().is_empty() && self.images.is_empty()
+    }
+
+    /// Convert back to an [`AgentMessage`], preserving text **and** images.
+    ///
+    /// A message with images becomes `UserContent::Blocks` (text block first,
+    /// then the images); a text-only message stays `UserContent::Text` so it
+    /// round-trips with what the user typed.
+    pub fn into_message(self) -> AgentMessage {
+        use rpi_ai::types::{Content, TextContent, TextContentType, UserContent};
+        let content = if self.images.is_empty() {
+            UserContent::Text(self.text)
+        } else {
+            let mut blocks: Vec<Content> = Vec::with_capacity(self.images.len() + 1);
+            if !self.text.is_empty() {
+                blocks.push(Content::Text(TextContent {
+                    kind: TextContentType,
+                    text: self.text,
+                    text_signature: None,
+                }));
+            }
+            blocks.extend(self.images.into_iter().map(Content::Image));
+            UserContent::Blocks(blocks)
+        };
+        AgentMessage::User(rpi_ai::types::UserMessage::new(content, 0))
     }
 }
 
@@ -257,6 +324,27 @@ fn queued_message_text(message: &AgentMessage) -> String {
                 .join("\n"),
         },
         _ => String::new(),
+    }
+}
+
+/// A queued message as text **plus the images that belong to it**.
+///
+/// Deliberately one view per message rather than `texts: Vec<String>` +
+/// `images: Vec<ImageContent>`: two queued messages can each carry a different
+/// picture, and a flat image list cannot express which is which.
+fn queued_message_view(message: &AgentMessage) -> QueuedMessageView {
+    let mut images = Vec::new();
+    if let AgentMessage::User(user) = message {
+        if let rpi_ai::types::UserContent::Blocks(blocks) = &user.content {
+            images.extend(blocks.iter().filter_map(|block| match block {
+                rpi_ai::types::Content::Image(image) => Some(image.clone()),
+                _ => None,
+            }));
+        }
+    }
+    QueuedMessageView {
+        text: queued_message_text(message),
+        images,
     }
 }
 
@@ -504,6 +592,15 @@ impl MessageQueue {
         }
     }
 
+    /// How many items are queued **for this lane**, without draining.
+    ///
+    /// Needed by the `pending_message_count` hook (the `turn_end`
+    /// `pendingMessages` field): the drain helpers below consume the queue,
+    /// so asking "how many are left?" with them would eat the messages.
+    fn len_for_lane(&self, lane: &str) -> usize {
+        self.pending.iter().filter(|item| item.lane == lane).count()
+    }
+
     /// Take every queued item for `lane`, keeping each item's id.
     ///
     /// The id matters: it is what the durable `queue_enqueued` record named, so
@@ -560,11 +657,11 @@ impl MessageQueue {
 
     /// The queued message texts for `lane`, in queue order, without touching
     /// the queue. Used by the pending-messages display.
-    fn peek_for_lane(&self, lane: &str) -> Vec<String> {
+    fn peek_for_lane(&self, lane: &str) -> Vec<QueuedMessageView> {
         self.pending
             .iter()
             .filter(|item| item.lane == lane)
-            .map(|item| queued_message_text(&item.message))
+            .map(|item| queued_message_view(&item.message))
             .collect()
     }
 }
@@ -622,6 +719,7 @@ struct HarnessInner {
     model: Model,
     thinking_level: ThinkingLevel,
     active_tool_names: Vec<String>,
+    exact_resources: bool,
     tools: Vec<HarnessTool>,
     resources: AgentHarnessResources,
     stream_options: AgentHarnessStreamOptions,
@@ -758,6 +856,62 @@ mod weak;
 pub use weak::WeakAgentHarness;
 
 impl AgentHarness {
+    /// Cancel the lane's run **and** reclaim its queues in one critical
+    /// section.
+    ///
+    /// `idle_is_ok = false` keeps [`AgentLane::abort`]'s upstream contract: an
+    /// idle lane is `NoActiveRun` (callers branch on it to mean "nothing to
+    /// cancel"). `idle_is_ok = true` is for a plugin/remote "stop" button,
+    /// which must be idempotent and must still hand back messages that landed
+    /// as the run settled — erroring there would strand them.
+    ///
+    /// Either way the queue is reclaimed under the same `message_writes` gate as
+    /// the cancellation, so a new run cannot start and drain the queue in
+    /// between (which is exactly the race a separate `clear_queue()` call
+    /// leaves open).
+    pub async fn abort_reclaiming(&self, idle_is_ok: bool) -> HarnessResult<AbortResult> {
+        let _gate = self.message_writes.lock().await;
+        let run_id = {
+            let inner = self.inner.lock().unwrap();
+            if inner.closed {
+                return Err(HarnessError::closed());
+            }
+            match &inner.active_run {
+                Some(active) if active.lane == self.lane => {
+                    active.signal.cancel();
+                    Some(active.run_id.clone())
+                }
+                Some(_) => {
+                    return Err(HarnessError::no_active_run(
+                        &self.lane,
+                        "No active run to abort on this lane",
+                    ));
+                }
+                None if idle_is_ok => None,
+                None => {
+                    return Err(HarnessError::no_active_run(
+                        &self.lane,
+                        "No active run to abort",
+                    ));
+                }
+            }
+        };
+        let queued = self.clear_queue_locked().await?;
+        Ok(AbortResult {
+            run_id: run_id.unwrap_or_default(),
+            steer: queued
+                .steering
+                .into_iter()
+                .map(|m| m.into_message())
+                .collect(),
+            follow_up: queued
+                .follow_up
+                .into_iter()
+                .map(|m| m.into_message())
+                .collect(),
+        })
+    }
+
     /// Construct from options. Mirrors TS `AgentHarness.create`: when the
     /// session already has records (a prior operation) the default is to
     /// reject (TS throws `HarnessNotImplemented("create.restore")`). The
@@ -842,6 +996,7 @@ impl AgentHarness {
             model: options.model,
             thinking_level: options.thinking_level,
             active_tool_names: options.active_tool_names,
+            exact_resources: false,
             tools: options.tools,
             resources: options.resources,
             stream_options: options.stream_options,
@@ -2275,6 +2430,27 @@ impl AgentHarness {
         Ok(inner.tools.clone())
     }
 
+    /// Seal the host's exact startup selection. Empty means no tools. Resource
+    /// mutations require a restart; the legacy defaults are unchanged until sealed.
+    pub fn seal_resources(&self, active: Vec<String>) -> HarnessResult<()> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.exact_resources {
+            return Err(HarnessError::io("exact resources already sealed"));
+        }
+        for name in &active {
+            if !inner.tools.iter().any(|t| t.tool.schema().name == *name) {
+                return Err(HarnessError::io(format!("unknown selected tool: {name}")));
+            }
+        }
+        inner.active_tool_names = active;
+        inner.exact_resources = true;
+        Ok(())
+    }
+
+    pub fn has_exact_resources(&self) -> bool {
+        self.inner.lock().unwrap().exact_resources
+    }
+
     /// `setTools(tools, activeNames?)`. Mirrors TS `AgentHarness.setTools` —
     /// replaces the registry and (when `active_names` is `None`) resets
     /// `active_tool_names` to every tool's schema name. Inputs are moved in
@@ -2287,6 +2463,11 @@ impl AgentHarness {
         let mut inner = self.inner.lock().unwrap();
         if inner.closed {
             return Err(HarnessError::closed());
+        }
+        if inner.exact_resources {
+            return Err(HarnessError::io(
+                "exact resources are restart-required; tool registry mutation unsupported",
+            ));
         }
         let active = active_names
             .unwrap_or_else(|| tools.iter().map(|t| t.tool.schema().name.clone()).collect());
@@ -2318,6 +2499,11 @@ impl AgentHarness {
             let inner = self.inner.lock().unwrap();
             if inner.closed {
                 return Err(HarnessError::closed());
+            }
+            if inner.exact_resources {
+                return Err(HarnessError::io(
+                    "exact resource session switching unsupported; restart required",
+                ));
             }
             if let Some(active) = &inner.active_run {
                 return Err(HarnessError::lane_busy(
@@ -2426,6 +2612,9 @@ impl AgentHarness {
         if inner.closed {
             return Err(HarnessError::closed());
         }
+        if inner.exact_resources {
+            return Err(HarnessError::io("exact resources are restart-required"));
+        }
         inner.system_prompt = prompt;
         Ok(())
     }
@@ -2436,6 +2625,9 @@ impl AgentHarness {
         let mut inner = self.inner.lock().unwrap();
         if inner.closed {
             return Err(HarnessError::closed());
+        }
+        if inner.exact_resources {
+            return Err(HarnessError::io("exact resources are restart-required"));
         }
         inner.resources = resources;
         Ok(())
@@ -3407,7 +3599,20 @@ impl AgentHarness {
             parent_signal: inner.active_run.as_ref().map(|run| run.signal.clone()),
             model: inner.model.clone(),
             thinking_level: inner.thinking_level,
-            active_tool_names: inner.active_tool_names.clone(),
+            active_tool_names: if !inner.exact_resources && inner.active_tool_names.is_empty() {
+                inner
+                    .tools
+                    .iter()
+                    .map(|t| t.tool.schema().name.clone())
+                    .collect()
+            } else {
+                inner
+                    .active_tool_names
+                    .iter()
+                    .filter(|name| inner.tools.iter().any(|t| t.tool.schema().name == **name))
+                    .cloned()
+                    .collect()
+            },
             tools: inner.tools.clone(),
             system_prompt: inner.system_prompt.clone(),
             resources: inner.resources.clone(),
@@ -3430,15 +3635,9 @@ impl AgentHarness {
         })
     }
 
-    /// Build the agent tools vec, filtered by `active_tool_names`. An empty
-    /// `active_tool_names` means "all tools active" (mirrors TS default).
+    /// Filter an already normalized execution selection. Legacy empty-means-all
+    /// is resolved in snapshot_config, before both prompt and schema construction.
     fn active_tools(tools: &[HarnessTool], active: &[String]) -> Vec<Arc<dyn AgentTool>> {
-        if active.is_empty() {
-            return tools
-                .iter()
-                .map(|t| crate::image_tool::wrap(Arc::clone(&t.tool)))
-                .collect();
-        }
         tools
             .iter()
             .filter(|t| active.contains(&t.tool.schema().name))
@@ -4495,6 +4694,25 @@ impl AgentHarness {
                     Box::pin(async move { harness.drain_injected(queue, &settle).await })
                 })
             }),
+            // Read-only queue depth (**does not drain**).
+            //
+            // The two drain hooks above cannot answer "how many are left?" —
+            // calling them would consume the messages. This reads the harness's
+            // own queues, the same data the drains read, so the "⇥ N queued"
+            // indicator cannot drift from reality.
+            pending_message_count: Some({
+                let steer = Arc::clone(&snap.steering_queue);
+                let follow = Arc::clone(&snap.follow_up_queue);
+                // Queues are per lane, so ask for **this** harness's lane rather
+                // than hardcoding "main": lanes made by `AgentHarness::lane(name)`
+                // run through the same `run_admitted_inner`, and hardcoding would
+                // count their messages as main's (or always report 0).
+                let lane = self.lane.clone();
+                Arc::new(move || {
+                    steer.lock().map(|q| q.len_for_lane(&lane)).unwrap_or(0)
+                        + follow.lock().map(|q| q.len_for_lane(&lane)).unwrap_or(0)
+                })
+            }),
             before_tool_call: snap.before_tool_call.clone(),
             after_tool_call: snap.after_tool_call.clone(),
             tool_execution: snap.tool_execution.to_agent_mode(),
@@ -5033,6 +5251,63 @@ impl AgentHarness {
         self.finish_context_writes(&run_id, None).await?;
         Ok(CompactionResult { run_id, outcome })
     }
+    /// `clear_queue` body. The caller must already hold `message_writes`.
+    ///
+    /// Split out so [`AgentLane::abort`] can reclaim the queue and cancel the
+    /// run in one critical section instead of two.
+    async fn clear_queue_locked(&self) -> HarnessResult<QueuedMessages> {
+        let (steering_items, follow_up_items) = {
+            let inner = self.inner.lock().unwrap();
+            if inner.closed {
+                return Err(HarnessError::closed());
+            }
+            // Bound to locals: the guards are temporaries of the tuple
+            // expression otherwise, and they must not outlive this block.
+            let steering = inner
+                .steering_queue
+                .lock()
+                .unwrap()
+                .take_items_for_lane(&self.lane);
+            let follow_up = inner
+                .follow_up_queue
+                .lock()
+                .unwrap()
+                .take_items_for_lane(&self.lane);
+            (steering, follow_up)
+        };
+        let mut steering = Vec::with_capacity(steering_items.len());
+        let mut follow_up = Vec::with_capacity(follow_up_items.len());
+        // Un-queuing is a cancellation: without the record these messages would
+        // come back on the next start, even though they are in the editor now.
+        //
+        // Text and images are collected **per message**, not into parallel flat
+        // lists: a queue can hold `[text A][image A]` and `[text B][image B]`,
+        // and a flat image list cannot say which picture belongs to which text.
+        for (items, out) in [
+            (steering_items, &mut steering),
+            (follow_up_items, &mut follow_up),
+        ] {
+            for item in items {
+                if let Some(enqueued) = self.find_enqueue(&item.entry_id).await {
+                    if let Err(error) = self
+                        .write_queue_cancelled(&item.entry_id, enqueued.run_id.as_deref())
+                        .await
+                    {
+                        tracing::warn!(
+                            entry_id = %item.entry_id,
+                            %error,
+                            "could not record a queue clear"
+                        );
+                    }
+                }
+                out.push(queued_message_view(&item.message));
+            }
+        }
+        Ok(QueuedMessages {
+            steering,
+            follow_up,
+        })
+    }
 }
 
 /// Config snapshot cloned out of `HarnessInner` at the start of an operation.
@@ -5230,35 +5505,17 @@ impl AgentLane for AgentHarness {
     }
 
     async fn abort(&self) -> HarnessResult<AbortResult> {
-        let (run_id, steer, follow_up) = {
-            let inner = self.inner.lock().unwrap();
-            if inner.closed {
-                return Err(HarnessError::closed());
-            }
-            match &inner.active_run {
-                Some(active) if active.lane == self.lane => {
-                    active.signal.cancel();
-                    (active.run_id.clone(), Vec::new(), Vec::new())
-                }
-                Some(_) => {
-                    return Err(HarnessError::no_active_run(
-                        &self.lane,
-                        "No active run to abort on this lane",
-                    ));
-                }
-                None => {
-                    return Err(HarnessError::no_active_run(
-                        &self.lane,
-                        "No active run to abort",
-                    ));
-                }
-            }
-        };
-        Ok(AbortResult {
-            run_id,
-            steer,
-            follow_up,
-        })
+        // Cancel **and** reclaim under the same write gate.
+        //
+        // The agent loop drains the steering queue when it observes the
+        // cancellation and emits those messages as transcript content. Doing the
+        // reclaim in a separate `clear_queue()` call would leave a window: a
+        // message enqueued just before is handed back *and* drained, so a remote
+        // UI restores and resends it. Both the drain hooks
+        // (`get_steering_messages` / `get_follow_up_messages`) and `clear_queue`
+        // take `message_writes`, so holding it across the cancel excludes every
+        // enqueue/drain for the whole transition.
+        self.abort_reclaiming(false).await
     }
 
     async fn steer(&self, message: AgentMessage) -> HarnessResult<QueueResult> {
@@ -5348,72 +5605,12 @@ impl AgentLane for AgentHarness {
         Ok(QueuedMessages {
             steering,
             follow_up,
-            images: Vec::new(),
         })
     }
 
     async fn clear_queue(&self) -> HarnessResult<QueuedMessages> {
         let _gate = self.message_writes.lock().await;
-        let (steering_items, follow_up_items) = {
-            let inner = self.inner.lock().unwrap();
-            if inner.closed {
-                return Err(HarnessError::closed());
-            }
-            // Bound to locals: the guards are temporaries of the tuple
-            // expression otherwise, and they must not outlive this block.
-            let steering = inner
-                .steering_queue
-                .lock()
-                .unwrap()
-                .take_items_for_lane(&self.lane);
-            let follow_up = inner
-                .follow_up_queue
-                .lock()
-                .unwrap()
-                .take_items_for_lane(&self.lane);
-            (steering, follow_up)
-        };
-        let mut steering = Vec::with_capacity(steering_items.len());
-        let mut follow_up = Vec::with_capacity(follow_up_items.len());
-        let mut images = Vec::new();
-        // Un-queuing is a cancellation: without the record these messages would
-        // come back on the next start, even though they are in the editor now.
-        for (items, out) in [
-            (steering_items, &mut steering),
-            (follow_up_items, &mut follow_up),
-        ] {
-            for item in items {
-                if let Some(enqueued) = self.find_enqueue(&item.entry_id).await {
-                    if let Err(error) = self
-                        .write_queue_cancelled(&item.entry_id, enqueued.run_id.as_deref())
-                        .await
-                    {
-                        tracing::warn!(
-                            entry_id = %item.entry_id,
-                            %error,
-                            "could not record a queue clear"
-                        );
-                    }
-                }
-                out.push(queued_message_text(&item.message));
-                if let AgentMessage::User(user) = &item.message {
-                    if let UserContent::Blocks(blocks) = &user.content {
-                        images.extend(blocks.iter().filter_map(|block| {
-                            if let Content::Image(image) = block {
-                                Some(image.clone())
-                            } else {
-                                None
-                            }
-                        }));
-                    }
-                }
-            }
-        }
-        Ok(QueuedMessages {
-            steering,
-            follow_up,
-            images,
-        })
+        self.clear_queue_locked().await
     }
 
     async fn record_usage(
@@ -5584,6 +5781,11 @@ impl AgentLane for AgentHarness {
         let mut inner = self.inner.lock().unwrap();
         if inner.closed {
             return Err(HarnessError::closed());
+        }
+        if inner.exact_resources {
+            return Err(HarnessError::io(
+                "set_active_tools unsupported with exact resources; changes require a new session and restart",
+            ));
         }
         inner.active_tool_names = names;
         Ok(())
@@ -5932,6 +6134,11 @@ impl AgentLane for LaneHandle {
         if inner.closed {
             return Err(HarnessError::closed());
         }
+        if inner.exact_resources {
+            return Err(HarnessError::io(
+                "set_active_tools unsupported with exact resources; changes require a new session and restart",
+            ));
+        }
         inner.active_tool_names = names;
         Ok(())
     }
@@ -6138,7 +6345,11 @@ mod queue_tests {
             lane: "main".into(),
             message: user("second"),
         });
-        assert_eq!(queue.peek_for_lane("main"), vec!["first", "second"]);
+        let peeked = queue.peek_for_lane("main");
+        assert_eq!(
+            peeked.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
         // Peeking must not change the queue.
         assert_eq!(queue.pending.len(), 3);
     }
@@ -6540,9 +6751,14 @@ mod session_switch_tests {
         harness.steer(message("steer")).await.unwrap();
         harness.follow_up(message("follow")).await.unwrap();
         let restored = harness.clear_queue().await.unwrap();
-        assert_eq!(restored.steering, vec!["steer"]);
-        assert_eq!(restored.follow_up, vec!["follow"]);
-        assert_eq!(restored.images, vec![image.clone(), image]);
+        // Each entry keeps **its own** text and image together: a flat image
+        // list could not express this pairing once two messages differ.
+        assert_eq!(restored.steering.len(), 1);
+        assert_eq!(restored.steering[0].text, "steer");
+        assert_eq!(restored.steering[0].images, vec![image.clone()]);
+        assert_eq!(restored.follow_up.len(), 1);
+        assert_eq!(restored.follow_up[0].text, "follow");
+        assert_eq!(restored.follow_up[0].images, vec![image]);
         assert!(harness.queued_messages().await.unwrap().is_empty());
     }
 

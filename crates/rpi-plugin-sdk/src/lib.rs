@@ -650,6 +650,22 @@ pub enum EventTag {
     AgentEnd = 17,
     AgentSettled = 18,
     TurnStart = 19,
+    /// End of one assistant turn, carrying a JSON `data` payload:
+    /// `{"outcome":"stop"|"aborted"|"error", "stopReason":"<raw>",
+    /// "toolResultCount":N, "pendingMessages":N}`.
+    ///
+    /// `outcome` is the normalized value to branch on: `stop` covers a normal
+    /// stop, a tool-use continuation and a token-ceiling truncation; `aborted`
+    /// means the run was cancelled; `error` covers every other termination.
+    ///
+    /// `pendingMessages` is how many user messages were still queued (steering
+    /// + follow-up) when the turn settled — the data behind an "N queued"
+    /// indicator.
+    ///
+    /// ABI note: hosts before this payload existed sent `turn_end` with an
+    /// **empty** payload. Read it via `EventView::data_text()`, which returns
+    /// `None` for an empty payload, so a consumer handles both without a
+    /// version probe.
     TurnEnd = 20,
     MessageStart = 21,
     MessageUpdate = 22,
@@ -678,13 +694,28 @@ pub enum EventTag {
     /// is deliberately not shipped, because subscribers (a voice extension
     /// barging in on playback) only need to know *that* the user is composing.
     EditorChange = 36,
+
+    /// Turn-end **payload** event, separate from the [`EventTag::TurnEnd`]
+    /// lifecycle tag.
+    ///
+    /// `TurnEnd` may be sent by a host built against a pre-payload SDK, which
+    /// writes it with [`StablePluginEvent::empty`] — a 1-byte write into a
+    /// union whose `data` arm is a 16-byte `StbString`. Reading `payload.data`
+    /// for such a host would read uninitialized memory, and the ABI handshake
+    /// cannot distinguish the two hosts. Carrying the payload under its own tag
+    /// removes the ambiguity: a host that does not support it never sends this
+    /// tag, so the read is only reachable on hosts that do.
+    ///
+    /// Appended last so every existing discriminant stays stable.
+    TurnEndPayload = 37,
 }
 
-/// Number of event categories — `37` (33 Pi `on()` categories + 1 rpi-specific
-/// [`EventTag::BeforeTuiStart`] + 2 UI prompt events + 1 rpi-specific
-/// [`EventTag::EditorChange`]). A test asserts
-/// `EVENT_TAG_COUNT == 37` so a future edit that adds/removes a tag is caught.
-pub const EVENT_TAG_COUNT: usize = 37;
+/// Number of event categories — `38` (33 Pi `on()` categories + 1 rpi-specific
+/// [`EventTag::BeforeTuiStart`] + 2 UI prompt events + 2 rpi-specific payload
+/// tags: [`EventTag::EditorChange`] and [`EventTag::TurnEndPayload`]). A test
+/// asserts `EVENT_TAG_COUNT == 38` so a future edit that adds/removes a tag is
+/// caught.
+pub const EVENT_TAG_COUNT: usize = 38;
 
 /// The application name of the host that loads plugins: `"rpi"`.
 ///
@@ -870,7 +901,21 @@ impl StablePluginEvent {
         Self {
             tag,
             payload: EventPayload {
-                empty: EventEmpty::INSTANCE,
+                // Initialize the **largest** union member, not `EventEmpty`.
+                //
+                // `EventPayload` is a union: writing only `empty` (1 byte)
+                // leaves the remaining bytes — which `data` (`StbString`:
+                // ptr + len) would read — uninitialized. A reader that checks
+                // the tag cannot know whether *this* host wrote the `data` arm,
+                // and a tag an older host sent as no-payload must still be
+                // readable as "no data".
+                //
+                // Writing an empty `StbString` here makes every subsequent
+                // `payload.data.data` read defined, encoding "no payload" as an
+                // empty string rather than as indeterminate bytes.
+                data: EventData {
+                    data: StbString::empty(),
+                },
             },
         }
     }
@@ -1125,6 +1170,41 @@ pub enum RuntimeActionId {
     /// use start(question), status, cancel, hide and show. Never changes the
     /// main transcript or its queues. Presentation and execution stay in host.
     SideQuestion = 25,
+    /// Enumerate the registered slash commands. Args: `{}`; result:
+    /// `{"commands":[{"name":"…","description":"…","source":"builtin"|"extension"|"prompt"}]}`.
+    ///
+    /// Worth having as an action because the ABI had no way to enumerate
+    /// commands at all: a remote client saw an empty completion list and could
+    /// not tell it apart from "this host has no commands". `GetActiveTools` is
+    /// about tools, not slash commands.
+    ///
+    /// A host with no extension registry returns an **empty list** rather than
+    /// an error: "none registered" is a real answer, and a client should
+    /// degrade to "no completion available" instead of surfacing a failure.
+    ///
+    /// `source` is `builtin` for the host's own commands, `extension` for ones
+    /// a plugin registered, and `prompt` for a prompt template; clients use it
+    /// to decide how to dispatch a chosen entry.
+    ListCommands = 26,
+    /// Abort the current run on the main lane. Args: `{}`; result:
+    /// `{"aborted": true, "runId": "…"}` when a run was cancelled, or
+    /// `{"aborted": false}` when the lane was already idle — aborting an idle
+    /// lane is a no-op, not an error, so a plugin's stop button is idempotent.
+    ///
+    /// The abort is cooperative: the host observes the cancellation at its next
+    /// await point, so the run may emit further stream events after this action
+    /// returns.
+    ///
+    /// Queued messages the user staged during the run are **reclaimed** as part
+    /// of the abort and returned in `steer` / `followUp`, because the loop
+    /// drains that queue into the transcript when it observes the cancellation
+    /// (see `agent_loop`'s `drain_steering`). A caller with a remote queue
+    /// restores them instead of losing them.
+    ///
+    /// Each entry is `{"text": "…", "images": [{mediaType, data}]}` — text and
+    /// its own attachments together. A flat image list would lose the pairing
+    /// as soon as two queued messages carry different pictures.
+    Abort = 27,
     /// Relay host UI-dialog requests to an external UI.
     ///
     /// Args:
@@ -1186,6 +1266,8 @@ impl TryFrom<u32> for RuntimeActionId {
             23 => Ok(Self::GetExecutionContext),
             24 => Ok(Self::ChildAgent),
             25 => Ok(Self::SideQuestion),
+            26 => Ok(Self::ListCommands),
+            27 => Ok(Self::Abort),
             28 => Ok(Self::RelayUiDialog),
             other => Err(UnknownRuntimeActionId(other)),
         }
@@ -1226,6 +1308,8 @@ impl RuntimeActionId {
         Self::GetExecutionContext,
         Self::ChildAgent,
         Self::SideQuestion,
+        Self::ListCommands,
+        Self::Abort,
         Self::RelayUiDialog,
     ];
 
@@ -2096,7 +2180,7 @@ mod tests {
     }
 
     #[test]
-    fn event_tag_count_is_37() {
+    fn event_tag_count_is_38() {
         // Enumerate every tag; a compile-time + runtime guarantee that the
         // 37-category surface is intact (33 Pi on() categories + the
         // rpi-specific BeforeTuiStart + 2 UI prompt events + EditorChange).
@@ -2138,13 +2222,14 @@ mod tests {
             EventTag::UiPromptStart,
             EventTag::UiPromptEnd,
             EventTag::EditorChange,
+            EventTag::TurnEndPayload,
         ];
         assert_eq!(tags.len(), EVENT_TAG_COUNT);
-        assert_eq!(EVENT_TAG_COUNT, 37);
-        // Distinct discriminants 0..36.
+        assert_eq!(EVENT_TAG_COUNT, 38);
+        // Distinct discriminants 0..=36.
         let mut discs: Vec<u32> = tags.iter().map(|t| *t as u32).collect();
         discs.sort();
-        assert_eq!(discs, (0..37).collect::<Vec<u32>>());
+        assert_eq!(discs, (0..38).collect::<Vec<u32>>());
     }
 
     #[test]
@@ -2344,32 +2429,27 @@ mod tests {
             RuntimeActionId::GetExecutionContext,
             RuntimeActionId::ChildAgent,
             RuntimeActionId::SideQuestion,
+            RuntimeActionId::ListCommands,
+            RuntimeActionId::Abort,
             RuntimeActionId::RelayUiDialog,
         ];
 
-        // Explicit ids, not `enumerate()`: numbering has to stay stable when
-        // two proposed actions are developed in parallel, so a gap is allowed
-        // (ids 26/27 are reserved by other in-flight proposals). Deriving ids
-        // from position would silently renumber everything after a gap.
+        // Stable wire ids must not depend on which proposal was merged first.
         for expected in ids {
             let raw = u32::from(expected);
             assert_eq!(RuntimeActionId::try_from(raw), Ok(expected));
             assert_eq!(u32::from(expected), raw);
         }
-        // Reserved ids stay unimplemented here rather than silently accepted.
-        for reserved in [26u32, 27u32] {
-            assert!(
-                RuntimeActionId::try_from(reserved).is_err(),
-                "id {reserved} is reserved, not implemented in this PR"
-            );
-        }
+        assert_eq!(u32::from(RuntimeActionId::ListCommands), 26);
+        assert_eq!(u32::from(RuntimeActionId::Abort), 27);
+        assert_eq!(u32::from(RuntimeActionId::RelayUiDialog), 28);
+        assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::ListCommands));
+        assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::Abort));
+        assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::RelayUiDialog));
+        assert_eq!(RuntimeActionId::MAX, 28);
         // One past the highest defined id is rejected (nothing is silently
         // accepted), and so is the u32 ceiling.
-        //
-        // Derived from the enum, not hardcoded: adding an action shifts the
-        // boundary, and a literal here would silently start asserting on a real
-        // id (or keep passing while dispatching).
-        let one_past_last = u32::from(RuntimeActionId::RelayUiDialog) + 1;
+        let one_past_last = RuntimeActionId::MAX + 1;
         assert_eq!(
             RuntimeActionId::try_from(one_past_last),
             Err(UnknownRuntimeActionId(one_past_last))

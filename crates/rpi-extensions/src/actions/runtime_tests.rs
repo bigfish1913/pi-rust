@@ -7,10 +7,20 @@ use tokio_util::sync::CancellationToken;
 struct Host {
     calls: AtomicUsize,
     revoked: AtomicUsize,
+    aborts: AtomicUsize,
+    command_lists: AtomicUsize,
     side_sinks: std::sync::Mutex<Vec<SideQuestionSink>>,
 }
 #[async_trait::async_trait]
 impl RuntimeActionHost for Host {
+    async fn list_commands(&self, args: Value) -> Result<Value, String> {
+        assert!(args.get("__rpiRuntimeKey").is_none());
+        self.command_lists.fetch_add(1, Ordering::SeqCst);
+        Ok(
+            json!({"commands":[{"name":"integrated","description":"both actions coexist","source":"extension"}]}),
+        )
+    }
+
     async fn side_question(
         &self,
         owner: u64,
@@ -21,6 +31,16 @@ impl RuntimeActionHost for Host {
         sink(json!({"op":"register","id":"btw-test","type":"text","slot":"overlay"}))?;
         self.side_sinks.lock().unwrap().push(sink);
         Ok(json!({"owner":owner}))
+    }
+    async fn abort(&self, args: Value) -> Result<Value, String> {
+        self.aborts.fetch_add(1, Ordering::SeqCst);
+        assert!(
+            args.get("__rpiRuntimeKey").is_none(),
+            "capabilities must not reach action payloads"
+        );
+        // No run is active in this mock: mirror the idle-lane no-op contract so
+        // the test also pins "idle abort is not an error".
+        Ok(json!({"aborted": false}))
     }
     async fn send_message(&self, _: Value) -> Result<Value, String> {
         unreachable!()
@@ -242,4 +262,79 @@ async fn side_questions_use_plugin_owner_and_stale_sinks_cannot_resurrect_panels
     let sink = host.side_sinks.lock().unwrap()[0].clone();
     assert!(sink(json!({"op":"register","id":"btw-test","type":"text"})).is_err());
     assert!(root.extension_status_mailbox().panels().is_empty());
+}
+
+/// A newly appended action id must also bump the trampoline's `max_action_id`,
+/// or it dispatches to `2` (unknown id) instead of reaching the host.
+///
+/// This pins the highest id end-to-end through the FFI entrypoint, which is the
+/// one place the enum value, the `TryFrom` table and the ceiling have to agree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abort_reaches_the_host_and_is_not_blocked_by_the_action_id_ceiling() {
+    let host = Arc::new(Host::default());
+    let root = ActionBridge::new(Handle::current(), host.clone());
+    let plugin = root.for_plugin("stopper");
+    let mut out = StbString::empty();
+    let rc = trampoline_runtime_action(
+        RuntimeActionId::Abort.into(),
+        StbStringRef::from_str("{}"),
+        &mut out,
+        plugin.user_data(),
+    );
+    // SAFETY: the trampoline returned a live host allocation to its caller.
+    let owned = unsafe {
+        rpi_plugin_sdk::callbacks::OwnedString::from_raw(out, Some(crate::host_free_string))
+    };
+    let value: Value = serde_json::from_str(&owned.to_string_lossy()).unwrap();
+    assert_eq!(rc, 0, "Abort must dispatch, not fail as an unknown id");
+    assert_eq!(value, json!({"aborted": false}));
+    assert_eq!(host.aborts.load(Ordering::SeqCst), 1);
+}
+
+/// Independently developed wire actions must survive integration together.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn integrated_commands_abort_and_dialog_dispatch_without_renumbering() {
+    let host = Arc::new(Host::default());
+    let root = ActionBridge::new(Handle::current(), host.clone());
+    let plugin = root.for_plugin("integrated-actions");
+    for (id, expected) in [
+        (
+            26,
+            json!({"commands":[{"name":"integrated","description":"both actions coexist","source":"extension"}]}),
+        ),
+        (27, json!({"aborted":false})),
+        (28, json!({"requests":[]})),
+    ] {
+        let mut out = StbString::empty();
+        let rc = trampoline_runtime_action(
+            id,
+            StbStringRef::from_str("{}"),
+            &mut out,
+            plugin.user_data(),
+        );
+        assert_eq!(rc, 0, "action {id} must reach its own host method");
+        // SAFETY: a successful trampoline call returns a live host allocation.
+        let owned = unsafe {
+            rpi_plugin_sdk::callbacks::OwnedString::from_raw(out, Some(crate::host_free_string))
+        };
+        let value: Value = serde_json::from_str(&owned.to_string_lossy()).unwrap();
+        assert_eq!(value, expected);
+    }
+    assert!(root.ui_dialog_mailbox().external_takeover());
+    root.ui_dialog_mailbox().release_takeover();
+    assert!(!root.ui_dialog_mailbox().external_takeover());
+    assert_eq!(host.command_lists.load(Ordering::SeqCst), 1);
+    assert_eq!(host.aborts.load(Ordering::SeqCst), 1);
+    let mut out = StbString::empty();
+    assert_eq!(
+        trampoline_runtime_action(
+            RuntimeActionId::MAX + 1,
+            StbStringRef::from_str("{}"),
+            &mut out,
+            plugin.user_data()
+        ),
+        2
+    );
+    assert_eq!(host.command_lists.load(Ordering::SeqCst), 1);
+    assert_eq!(host.aborts.load(Ordering::SeqCst), 1);
 }

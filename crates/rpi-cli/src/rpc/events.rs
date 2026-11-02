@@ -333,6 +333,7 @@ mod tests {
                 AgentEvent::TurnEnd {
                     message: final_message.clone(),
                     tool_results: vec![],
+                    pending_messages: 0,
                 },
                 AgentEvent::AgentEnd {
                     messages: vec![final_message],
