@@ -16,6 +16,8 @@ pub struct WeakAgentHarness {
     child_scope: Arc<Mutex<CancellationToken>>,
     is_child: bool,
     max_turns: Option<u32>,
+    /// Shared with the owner so a stop request reaches the run loop.
+    stop_round: Arc<std::sync::atomic::AtomicBool>,
 }
 impl AgentHarness {
     pub fn downgrade(&self) -> WeakAgentHarness {
@@ -30,6 +32,7 @@ impl AgentHarness {
             child_scope: self.child_scope.clone(),
             is_child: self.is_child,
             max_turns: self.max_turns,
+            stop_round: Arc::clone(&self.stop_round),
         }
     }
 }
@@ -46,6 +49,7 @@ impl WeakAgentHarness {
             child_scope: self.child_scope.clone(),
             is_child: self.is_child,
             max_turns: self.max_turns,
+            stop_round: Arc::clone(&self.stop_round),
         })
     }
 }
