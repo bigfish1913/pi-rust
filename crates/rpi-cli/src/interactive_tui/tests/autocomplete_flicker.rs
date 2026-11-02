@@ -90,7 +90,15 @@ fn popup_shrinking_candidates_keep_the_container_height() {
         .map(|line| strip_ansi(&line).trim().to_string())
         .collect::<Vec<_>>();
     assert_eq!(rendered.iter().filter(|line| !line.is_empty()).count(), 1);
-    assert!(rendered[0].contains("/clear"), "row 0 is the candidate");
+    // The pad rows stand ABOVE the candidates: the dock stacks this container
+    // directly on top of the editor, so the last rendered row is the one the
+    // user reads against the input line — the candidate must be parked there,
+    // not at the popup's top edge where the old top-fill layout left it.
+    let last = rendered.last().unwrap();
+    assert!(
+        last.contains("/clear"),
+        "the candidate rides the bottom row, adjacent to the editor: {rendered:?}"
+    );
 
     // A close still empties everything, pad rows included.
     editor.set_text("hello");
@@ -466,6 +474,118 @@ fn review172_pad_rows_render_blank_but_present() {
             .count(),
         1,
         "exactly one real candidate is visible"
+    );
+}
+
+// ===========================================================================
+// Bottom anchor — the candidates hug the editor while the panel holds height
+// ===========================================================================
+//
+// The dock stacks `autocomplete_container` directly ON TOP of the editor, so
+// WHICH rows are blank is user-visible geometry: every height probe above
+// passes for either fill order, but a pad TAIL pushes the remaining candidates
+// up, away from the input line they complete — the first choice parks at the
+// popup's top edge however few rows remain. The pad rows must stand ABOVE the
+// candidates (blank prefix, live suffix), so the candidate block stays glued
+// to the editor's top border through the whole edit.
+
+/// Rendered popup rows (ANSI stripped) after driving `prefixes` in order.
+fn rendered_rows_over(
+    state: &Arc<TuiState>,
+    editor: &Arc<Editor>,
+    prefixes: &[&str],
+) -> Vec<Vec<String>> {
+    prefixes
+        .iter()
+        .map(|text| {
+            editor.set_text(text);
+            editor.set_cursor(0, text.len());
+            refresh_autocomplete(state, editor);
+            state
+                .autocomplete_container
+                .render(80)
+                .into_iter()
+                .map(|line| strip_ansi(&line).trim().to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// The visible candidates form the BOTTOM block of the panel at every draft
+/// length: a blank row may only appear ABOVE a live row, never below one —
+/// the last panel row is the one adjacent to the editor's top border, and it
+/// must always carry a candidate while the popup is open.
+#[test]
+fn narrowing_slash_drafts_keep_the_candidates_on_the_rows_adjacent_to_the_editor() {
+    let state = test_state_with_slash_provider();
+    let editor = Arc::new(Editor::simple());
+
+    // Open at the cap on `/`, then narrow: the pad rows stand in above.
+    let timeline = ["/", "/c", "/cl", "/cle", "/clea", "/clear"];
+    for (prefix, rows) in timeline
+        .iter()
+        .zip(rendered_rows_over(&state, &editor, &timeline))
+    {
+        assert!(
+            rows.last().map(|row| !row.is_empty()).unwrap_or(false),
+            "prefix {prefix:?}: the row adjacent to the editor is blank: {rows:?}"
+        );
+        let mut live_seen = false;
+        for row in rows.iter() {
+            if !row.is_empty() {
+                live_seen = true;
+            } else {
+                assert!(
+                    !live_seen,
+                    "prefix {prefix:?}: a blank pad row sits BELOW a live candidate — the candidates drifted away from the editor: {rows:?}"
+                );
+            }
+        }
+    }
+
+    // The extreme case from the field report: one candidate left, four pad
+    // rows — the highlighted first choice must ride the bottom row, not the
+    // panel's top edge.
+    let rows = rendered_rows_over(&state, &editor, &["/clear"])
+        .pop()
+        .unwrap();
+    assert_eq!(rows.len(), 5, "the panel keeps the height it opened with");
+    assert_eq!(
+        rows.iter().filter(|row| !row.is_empty()).count(),
+        1,
+        "exactly one live row"
+    );
+    assert!(
+        rows[4].contains("/clear") && rows[4].contains('→'),
+        "the first choice parks on the editor-adjacent row: {rows:?}"
+    );
+}
+
+/// Over-typing then correcting (the panel never closed): the candidate that
+/// comes back must re-anchor to the editor, leaving its pad above — not
+/// resume its old top position with the pad underneath it.
+#[test]
+fn correcting_an_overtyped_slash_draft_reeanchors_the_candidate_to_the_editor() {
+    let state = test_state_with_slash_provider();
+    let editor = Arc::new(Editor::simple());
+
+    let timeline = ["/clear", "/cle", "/clear"];
+    let frames = rendered_rows_over(&state, &editor, &timeline);
+    assert_eq!(frames.len(), 3);
+
+    // `/clear` alone: one row, one candidate. `/cle`: two candidates, the
+    // container grew a row. Back to `/clear`: the popup does NOT close, so
+    // the row count stays — the departed candidate's row must become a pad
+    // ABOVE the surviving candidate.
+    let rows = frames.last().unwrap();
+    assert_eq!(rows.len(), 2, "the popup never closed, the height stays");
+    assert!(
+        rows[0].is_empty(),
+        "the departed row pads from the top: {rows:?}"
+    );
+    assert!(
+        rows[1].contains("/clear"),
+        "the returning candidate hugs the editor again: {rows:?}"
     );
 }
 

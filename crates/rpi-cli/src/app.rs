@@ -960,7 +960,7 @@ fn image_content_from_bytes(bytes: &[u8]) -> Option<ImageContent> {
     let mime_type = rpi_tools::detect_supported_image_mime_type(bytes)?;
     Some(ImageContent {
         kind: ImageContentType,
-        data: rpi_tools::encode_base64(bytes),
+        data: rpi_tools::encode_base64(bytes).into(),
         mime_type: mime_type.to_string(),
     })
 }

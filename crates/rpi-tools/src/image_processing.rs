@@ -222,12 +222,12 @@ pub fn normalize_image_blocks(blocks: &mut Vec<rpi_ai::types::Content>) {
         if let Content::Image(mut img) = block {
             use base64::{engine::general_purpose::STANDARD, Engine};
             match STANDARD
-                .decode(&img.data)
+                .decode(&*img.data)
                 .map_err(|e| e.to_string())
                 .and_then(|bytes| prepare_inline_image(&bytes))
             {
                 Ok(processed) => {
-                    img.data = processed.data;
+                    img.data = processed.data.into();
                     img.mime_type = processed.mime_type;
                     output.push(Content::Image(img));
                     output.extend(processed.hints.into_iter().map(Content::text));

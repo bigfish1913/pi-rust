@@ -603,6 +603,7 @@ pub fn load_session_mixed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::OAuthExtensionError;
     use std::fs;
     use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -952,6 +953,426 @@ pub extern "C" fn rpi_plugin_register(_: *const std::ffi::c_void) -> i32 {
             None,
         );
         assert!(empty.is_empty());
+    }
+
+    /// Prelude shared by the OAuth ABI fixtures. A foreign plugin sees the host
+    /// types only through their layout, so they are spelled out here by hand.
+    const OAUTH_FIXTURE_PRELUDE: &str = r#"
+use std::ffi::c_void;
+#[repr(C)] #[derive(Clone, Copy)] struct Str { ptr: *const c_void, len: usize }
+#[repr(C)] #[derive(Clone, Copy)] struct Owned { ptr: *mut c_void, len: usize }
+extern "C" fn free_output(_: Owned) {}
+const MANIFEST: &[u8] = b"{\"id\":\"acme\"}";
+fn mark(path: &str, bytes: &[u8]) {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap();
+    file.write_all(bytes).unwrap();
+}
+"#;
+
+    /// An older plugin registers through the legacy `register_oauth_provider`
+    /// slot. The current host must still dispatch to it, with no control.
+    #[test]
+    fn legacy_oauth_slot_from_an_older_plugin_reaches_the_host() {
+        let marker = std::env::temp_dir().join(format!("rpi-oauth-legacy-{}", std::process::id()));
+        let _ = fs::remove_file(&marker);
+        let offset = std::mem::offset_of!(rpi_plugin_sdk::PluginApi, register_oauth_provider);
+        let fixture = build_cdylib_fixture(
+            "oauth_legacy_slot",
+            &format!(
+                r#"{OAUTH_FIXTURE_PRELUDE}
+extern "C" fn legacy(_req: Str, _out: *mut Owned, _data: *mut c_void) -> i32 {{
+    mark({marker:?}, b"L");
+    9
+}}
+#[no_mangle]
+pub extern "C" fn rpi_plugin_register(api: *const u8) -> i32 {{
+    type Register = extern "C" fn(Str, extern "C" fn(Str, *mut Owned, *mut c_void) -> i32,
+        extern "C" fn(Owned), *mut c_void) -> i32;
+    let register: Option<Register> = unsafe {{ std::ptr::read_unaligned(api.add({offset}).cast()) }};
+    let manifest = Str {{ ptr: MANIFEST.as_ptr().cast(), len: MANIFEST.len() }};
+    register.unwrap()(manifest, legacy, free_output, std::ptr::null_mut())
+}}
+"#
+            ),
+        );
+        let session = load_session_mixed(
+            &[],
+            std::slice::from_ref(&fixture.path),
+            Arc::new(NullDiagnostics),
+            None,
+        );
+        let snapshot = session.snapshot_arc().expect("legacy fixture registers");
+        let provider = snapshot.oauth_provider("acme").expect("legacy provider");
+        assert!(provider.control_fn.is_none());
+        let result = crate::request_oauth(&snapshot, "acme", "begin", serde_json::json!({}));
+        assert!(
+            matches!(result, Err(OAuthExtensionError::PluginStatus(9, _))),
+            "{result:?}"
+        );
+        assert_eq!(fs::read(&marker).unwrap(), b"L");
+        let _ = fs::remove_file(marker);
+    }
+
+    /// A current plugin on the `register_oauth_provider_cancellable` slot. Each
+    /// call marks "C", blocks until the host cancels it, then marks "K".
+    fn cancellable_oauth_fixture(name: &str, marker: &Path) -> CdylibFixture {
+        let offset = std::mem::offset_of!(
+            rpi_plugin_sdk::PluginApi,
+            register_oauth_provider_cancellable
+        );
+        build_cdylib_fixture(
+            name,
+            &format!(
+                r#"{OAUTH_FIXTURE_PRELUDE}
+#[repr(C)]
+struct Control {{
+    struct_size: u32,
+    is_cancelled: extern "C" fn(*mut c_void) -> i32,
+    user_data: *mut c_void,
+}}
+extern "C" fn controlled(_req: Str, control: *const Control, _out: *mut Owned, _data: *mut c_void) -> i32 {{
+    let control = unsafe {{ &*control }};
+    if (control.struct_size as usize) < std::mem::size_of::<Control>() {{
+        mark({marker:?}, b"S");
+        return 2;
+    }}
+    mark({marker:?}, b"C");
+    let started = std::time::Instant::now();
+    while (control.is_cancelled)(control.user_data) == 0 {{
+        if started.elapsed() > std::time::Duration::from_secs(10) {{
+            mark({marker:?}, b"T");
+            return 3;
+        }}
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }}
+    mark({marker:?}, b"K");
+    9
+}}
+#[no_mangle]
+pub extern "C" fn rpi_plugin_register(api: *const u8) -> i32 {{
+    type Register = extern "C" fn(Str, extern "C" fn(Str, *const Control, *mut Owned, *mut c_void) -> i32,
+        extern "C" fn(Owned), *mut c_void) -> i32;
+    let register: Option<Register> = unsafe {{ std::ptr::read_unaligned(api.add({offset}).cast()) }};
+    let manifest = Str {{ ptr: MANIFEST.as_ptr().cast(), len: MANIFEST.len() }};
+    register.unwrap()(manifest, controlled, free_output, std::ptr::null_mut())
+}}
+"#
+            ),
+        )
+    }
+
+    /// A current plugin registers through `register_oauth_provider_cancellable`.
+    /// Its `exchange` blocks until the host cancels a request that is in flight,
+    /// across the real cdylib boundary.
+    #[test]
+    fn cancellable_oauth_slot_delivers_host_cancellation_across_the_abi() {
+        let marker = std::env::temp_dir().join(format!("rpi-oauth-cancel-{}", std::process::id()));
+        let _ = fs::remove_file(&marker);
+        let fixture = cancellable_oauth_fixture("oauth_cancellable_slot", &marker);
+        let session = load_session_mixed(
+            &[],
+            std::slice::from_ref(&fixture.path),
+            Arc::new(NullDiagnostics),
+            None,
+        );
+        let snapshot = session
+            .snapshot_arc()
+            .expect("cancellable fixture registers");
+        assert!(snapshot
+            .oauth_provider("acme")
+            .expect("cancellable provider")
+            .control_fn
+            .is_some());
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let trigger = cancel.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            trigger.cancel();
+        });
+        let started = std::time::Instant::now();
+        let result = crate::request_oauth_with_cancel(
+            &snapshot,
+            "acme",
+            "exchange",
+            serde_json::json!({"value": "code"}),
+            &cancel,
+        );
+        let elapsed = started.elapsed();
+        canceller.join().unwrap();
+        assert!(
+            matches!(result, Err(OAuthExtensionError::Cancelled)),
+            "{result:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "took {elapsed:?}"
+        );
+        // "C": the plugin saw a sized control. "K": it observed the cancellation.
+        assert_eq!(fs::read(&marker).unwrap(), b"CK");
+        let _ = fs::remove_file(marker);
+    }
+
+    /// Reload while a cancellable call is in flight: the call keeps the old
+    /// session's keepalive until it returns, cancellation still reaches it, and
+    /// the reloaded snapshot dispatches a new call to a live plugin. (The OS may
+    /// share one mapping for the same path; the keepalive count is what is pinned.)
+    #[test]
+    fn cancellable_oauth_call_survives_a_reload_and_still_cancels() {
+        let marker = std::env::temp_dir().join(format!("rpi-oauth-reload-{}", std::process::id()));
+        let _ = fs::remove_file(&marker);
+        let fixture = cancellable_oauth_fixture("oauth_cancellable_reload", &marker);
+        let load = || {
+            load_session_mixed(
+                &[],
+                std::slice::from_ref(&fixture.path),
+                Arc::new(NullDiagnostics),
+                None,
+            )
+        };
+        let old = load();
+        let (snapshot, keepalive) = (old.snapshot_arc().unwrap(), old.keepalive());
+        let old_keepalive = Arc::downgrade(&keepalive);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let worker_cancel = cancel.clone();
+        // Holds the keepalive across the call, as the TUI's blocking task does.
+        let worker = std::thread::spawn(move || {
+            let _keepalive = keepalive;
+            crate::request_oauth_with_cancel(
+                &snapshot,
+                "acme",
+                "exchange",
+                serde_json::json!({"value": "code"}),
+                &worker_cancel,
+            )
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while fs::read(&marker).unwrap_or_default() != b"C" {
+            assert!(std::time::Instant::now() < deadline, "call never started");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        old.begin_shutdown();
+        drop(old);
+        let reloaded = load();
+        assert!(
+            old_keepalive.strong_count() > 0,
+            "the reload released the old session under the in-flight call"
+        );
+        cancel.cancel();
+        let result = worker.join().unwrap();
+        assert!(
+            matches!(result, Err(OAuthExtensionError::Cancelled)),
+            "{result:?}"
+        );
+        assert_eq!(fs::read(&marker).unwrap(), b"CK");
+        assert_eq!(
+            old_keepalive.strong_count(),
+            0,
+            "the old keepalive outlived the cancelled call"
+        );
+
+        // The reloaded snapshot serves a new call, which a cancel still stops.
+        let new_snapshot = reloaded.snapshot_arc().expect("reloaded plugin registers");
+        let new_cancel = tokio_util::sync::CancellationToken::new();
+        let new_worker_cancel = new_cancel.clone();
+        let new_worker = std::thread::spawn(move || {
+            crate::request_oauth_with_cancel(
+                &new_snapshot,
+                "acme",
+                "exchange",
+                serde_json::json!({"value": "code"}),
+                &new_worker_cancel,
+            )
+        });
+        wait_for_marker(&marker, b"CKC");
+        new_cancel.cancel();
+        let result = new_worker.join().unwrap();
+        assert!(
+            matches!(result, Err(OAuthExtensionError::Cancelled)),
+            "{result:?}"
+        );
+        assert_eq!(fs::read(&marker).unwrap(), b"CKCK");
+
+        let precancelled = tokio_util::sync::CancellationToken::new();
+        precancelled.cancel();
+        let result = crate::request_oauth_with_cancel(
+            &reloaded.snapshot_arc().expect("reloaded plugin registers"),
+            "acme",
+            "begin",
+            serde_json::json!({}),
+            &precancelled,
+        );
+        assert!(
+            matches!(result, Err(OAuthExtensionError::Cancelled)),
+            "{result:?}"
+        );
+        assert_eq!(
+            fs::read(&marker).unwrap(),
+            b"CKCK",
+            "a cancelled call reached the reloaded plugin"
+        );
+        let _ = fs::remove_file(marker);
+    }
+
+    /// Waits until the fixture's marker file holds exactly `expected`.
+    fn wait_for_marker(marker: &Path, expected: &[u8]) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while fs::read(marker).unwrap_or_default() != expected {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "marker never reached {expected:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// Unload, with no replacement session, while a cancellable call is in
+    /// flight. The caller's keepalive clone keeps the library mapped: the plugin
+    /// still runs after the session is dropped, observes the cancellation, and
+    /// the keepalive is released only once the call has returned.
+    #[test]
+    fn cancellable_oauth_call_survives_an_unload_and_releases_the_library_after_return() {
+        let marker = std::env::temp_dir().join(format!("rpi-oauth-unload-{}", std::process::id()));
+        let _ = fs::remove_file(&marker);
+        let fixture = cancellable_oauth_fixture("oauth_cancellable_unload", &marker);
+        let session = load_session_mixed(
+            &[],
+            std::slice::from_ref(&fixture.path),
+            Arc::new(NullDiagnostics),
+            None,
+        );
+        let snapshot = session
+            .snapshot_arc()
+            .expect("cancellable fixture registers");
+        let keepalive = session.keepalive();
+        let released = Arc::downgrade(&keepalive);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let worker_cancel = cancel.clone();
+        let worker = std::thread::spawn(move || {
+            let _keepalive = keepalive;
+            crate::request_oauth_with_cancel(
+                &snapshot,
+                "acme",
+                "exchange",
+                serde_json::json!({"value": "code"}),
+                &worker_cancel,
+            )
+        });
+        wait_for_marker(&marker, b"C");
+        session.begin_shutdown();
+        drop(session);
+        assert!(
+            released.strong_count() > 0,
+            "unloading the session released the library under the in-flight call"
+        );
+        cancel.cancel();
+        let result = worker.join().unwrap();
+        assert!(
+            matches!(result, Err(OAuthExtensionError::Cancelled)),
+            "{result:?}"
+        );
+        // "K": the unloaded plugin still ran and observed the cancellation.
+        assert_eq!(fs::read(&marker).unwrap(), b"CK");
+        assert_eq!(
+            released.strong_count(),
+            0,
+            "the keepalive outlived the cancelled call"
+        );
+        let _ = fs::remove_file(marker);
+    }
+
+    /// An older plugin on the legacy `register_oauth_provider` slot. Its
+    /// `exchange` marks "S", waits for the `release` file, then marks "L" and
+    /// returns a credential. It cannot observe the host's cancellation.
+    fn legacy_oauth_fixture(name: &str, marker: &Path, release: &Path) -> CdylibFixture {
+        let offset = std::mem::offset_of!(rpi_plugin_sdk::PluginApi, register_oauth_provider);
+        build_cdylib_fixture(
+            name,
+            &format!(
+                r#"{OAUTH_FIXTURE_PRELUDE}
+extern "C" fn legacy(_req: Str, out: *mut Owned, _data: *mut c_void) -> i32 {{
+    mark({marker:?}, b"S");
+    let started = std::time::Instant::now();
+    while !std::path::Path::new({release:?}).exists() {{
+        if started.elapsed() > std::time::Duration::from_secs(10) {{
+            mark({marker:?}, b"T");
+            return 3;
+        }}
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }}
+    mark({marker:?}, b"L");
+    let body: &'static [u8] = b"{{\"version\":1,\"kind\":\"credential\",\"payload\":{{\"access\":\"late\"}}}}";
+    unsafe {{ *out = Owned {{ ptr: body.as_ptr() as *mut c_void, len: body.len() }}; }}
+    0
+}}
+#[no_mangle]
+pub extern "C" fn rpi_plugin_register(api: *const u8) -> i32 {{
+    type Register = extern "C" fn(Str, extern "C" fn(Str, *mut Owned, *mut c_void) -> i32,
+        extern "C" fn(Owned), *mut c_void) -> i32;
+    let register: Option<Register> = unsafe {{ std::ptr::read_unaligned(api.add({offset}).cast()) }};
+    let manifest = Str {{ ptr: MANIFEST.as_ptr().cast(), len: MANIFEST.len() }};
+    register.unwrap()(manifest, legacy, free_output, std::ptr::null_mut())
+}}
+"#
+            ),
+        )
+    }
+
+    /// Compatibility path: an older plugin's call is in flight when the session
+    /// is unloaded and then cancelled. The host cannot interrupt the plugin, so
+    /// it must keep the library mapped until the plugin returns, and the late
+    /// credential it produces must come back as `Cancelled`, never as a result.
+    #[test]
+    fn legacy_oauth_call_in_flight_across_an_unload_returns_cancelled() {
+        let pid = std::process::id();
+        let marker = std::env::temp_dir().join(format!("rpi-oauth-legacy-unload-{pid}"));
+        let release = std::env::temp_dir().join(format!("rpi-oauth-legacy-release-{pid}"));
+        let _ = fs::remove_file(&marker);
+        let _ = fs::remove_file(&release);
+        let fixture = legacy_oauth_fixture("oauth_legacy_unload", &marker, &release);
+        let session = load_session_mixed(
+            &[],
+            std::slice::from_ref(&fixture.path),
+            Arc::new(NullDiagnostics),
+            None,
+        );
+        let snapshot = session.snapshot_arc().expect("legacy fixture registers");
+        let keepalive = session.keepalive();
+        let released = Arc::downgrade(&keepalive);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let worker_cancel = cancel.clone();
+        let worker = std::thread::spawn(move || {
+            let _keepalive = keepalive;
+            crate::request_oauth_with_cancel(
+                &snapshot,
+                "acme",
+                "exchange",
+                serde_json::json!({"value": "code"}),
+                &worker_cancel,
+            )
+        });
+        wait_for_marker(&marker, b"S");
+        session.begin_shutdown();
+        drop(session);
+        assert!(
+            released.strong_count() > 0,
+            "unloading the session released the library under the in-flight call"
+        );
+        cancel.cancel();
+        fs::write(&release, b"").unwrap();
+        let result = worker.join().unwrap();
+        assert!(
+            matches!(result, Err(OAuthExtensionError::Cancelled)),
+            "{result:?}"
+        );
+        assert_eq!(fs::read(&marker).unwrap(), b"SL");
+        assert_eq!(
+            released.strong_count(),
+            0,
+            "the keepalive outlived the call"
+        );
+        let _ = fs::remove_file(marker);
+        let _ = fs::remove_file(release);
     }
 
     #[test]

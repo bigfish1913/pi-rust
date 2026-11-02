@@ -528,6 +528,21 @@ rpi auth login --provider <id>
 `rpi auth logout --provider <id>` 会先调用 `revoke`，成功后才删除本地凭证。插件不得
 把 token 写入普通事件、模型消息或日志。
 
+### 取消 action（可选）
+
+插件可以用 `register_oauth_provider_cancellable` 注册 action callback。该回调额外接收
+`OAuthRequestControl`：调用方放弃等待时，宿主把 `is_cancelled` 置为非零（当前是 TUI 的
+provider 登录流程按 Esc，以及 `/logout` 的撤销）。插件应在长时间等待（网络请求、等待本地
+回调）时调用 `OAuthRequestControl::poll_cancelled` 轮询，并尽快返回非零状态码。宿主对已取消
+的调用返回取消错误，并丢弃插件已经产生的输出，因此取消之后到达的 credential 不会被保存。
+
+`OAuthRequestControl` 以 `struct_size` 开头；`poll_cancelled` 只读取宿主提供的字段，插件无需
+自行检查布局。Rust 插件用 `rpi_plugin_sdk::register_oauth_provider_cancellable` 注册：旧宿主没有
+该槽位时，它回退到 `register_oauth_provider`，兼容回调只能无法取消地运行完成。已有插件继续使用
+`register_oauth_provider`，无需重新编译。
+
+目前没有取消入口的是 `rpi auth login`（Ctrl-C 直接结束进程）和 RPC `oauth` 命令（同步执行）。
+
 ## Provider 接入规范
 
 统一生产包为 `rpi-providers`，一个安装入口包含 DeepSeek、OpenRouter、llama.cpp 和 Proxy。

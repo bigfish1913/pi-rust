@@ -225,7 +225,6 @@ impl View {
         if self.show_terminal_progress && running {
             if self.editor.working().is_none() {
                 self.editor.set_working(Some(WorkingState {
-                    frame: 0,
                     started_at: std::time::Instant::now(),
                     message: "Working…".to_string(),
                 }));

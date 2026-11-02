@@ -464,15 +464,36 @@ pub(super) fn copy_last_assistant(state: &Arc<TuiState>, chat: &Arc<Container>) 
     }
 }
 
+/// Run `f` against one process-lifetime clipboard instance.
+///
+/// On X11 the clipboard is served by the process that owns it: dropping the
+/// `arboard::Clipboard` instance destroys the serving window, so a
+/// create-write-drop pattern loses the data whenever no desktop clipboard
+/// manager took it over (arboard only waits 100ms for a `CLIPBOARD_MANAGER`
+/// handoff, and sessions like LXQt/Openbox run none). The instance therefore
+/// lives in a `static` and outlives every copy; Windows and macOS keep
+/// OS-owned clipboards and are immune, but sharing one handle is harmless
+/// there too, so all platforms take the same path. A failed first creation
+/// (headless machine) is retried on later calls, matching the previous
+/// per-call behavior.
+#[cfg(all(feature = "clipboard", not(target_os = "android")))]
+fn with_shared_clipboard<T>(f: impl FnOnce(&mut arboard::Clipboard) -> T) -> Option<T> {
+    static SHARED: Mutex<Option<arboard::Clipboard>> = Mutex::new(None);
+    let mut slot = SHARED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if slot.is_none() {
+        *slot = arboard::Clipboard::new().ok();
+    }
+    Some(f(slot.as_mut()?))
+}
+
 /// Best-effort clipboard write. Enabled only with the `clipboard` feature
 /// (`arboard`) on non-Android platforms; otherwise returns `false` so the
 /// caller degrades to a hint.
 #[cfg(all(feature = "clipboard", not(target_os = "android")))]
 pub(super) fn copy_to_clipboard(text: &str) -> bool {
-    match arboard::Clipboard::new() {
-        Ok(mut cb) => cb.set_text(text).is_ok(),
-        Err(_) => false,
-    }
+    with_shared_clipboard(|clipboard| clipboard.set_text(text).is_ok()).unwrap_or(false)
 }
 
 #[cfg(any(not(feature = "clipboard"), target_os = "android"))]
@@ -485,8 +506,7 @@ pub(super) fn copy_to_clipboard(_text: &str) -> bool {
 /// on Android the OS owns clipboard access so this degrades to `None`.
 #[cfg(all(feature = "clipboard", not(target_os = "android")))]
 pub(super) fn read_clipboard_text() -> Option<String> {
-    let mut clipboard = arboard::Clipboard::new().ok()?;
-    clipboard.get_text().ok()
+    with_shared_clipboard(|clipboard| clipboard.get_text().ok()).flatten()
 }
 
 #[cfg(any(not(feature = "clipboard"), target_os = "android"))]
@@ -499,8 +519,9 @@ pub(super) fn read_clipboard_text() -> Option<String> {
 /// builds free of platform clipboard dependencies.
 #[cfg(all(feature = "clipboard", not(target_os = "android")))]
 pub(super) fn read_clipboard_image() -> Result<Option<rpi_ai::types::ImageContent>, String> {
-    let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
-    let image = match clipboard.get_image() {
+    let image = with_shared_clipboard(|clipboard| clipboard.get_image())
+        .ok_or_else(|| "clipboard unavailable".to_string())?;
+    let image = match image {
         Ok(image) => image,
         Err(_) => return Ok(None),
     };
@@ -523,7 +544,9 @@ pub(super) fn read_clipboard_image() -> Result<Option<rpi_ai::types::ImageConten
     }
     Ok(Some(rpi_ai::types::ImageContent {
         kind: rpi_ai::types::ImageContentType,
-        data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        data: base64::engine::general_purpose::STANDARD
+            .encode(bytes)
+            .into(),
         mime_type: "image/png".into(),
     }))
 }
@@ -758,7 +781,7 @@ pub(super) fn add_image_preview(
     image: &rpi_ai::types::ImageContent,
     show: bool,
 ) {
-    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&image.data) {
+    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&*image.data) {
         // Kitty's f=100 payload must be PNG, regardless of the model MIME type.
         let bytes = if image.mime_type == "image/png" {
             bytes

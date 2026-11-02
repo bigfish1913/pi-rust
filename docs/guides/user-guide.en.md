@@ -252,6 +252,8 @@ rpi install my-extension --path ../my-rpi-extension --force
 
 `rpi install <name>` upgrades newer versions directly and skips an already installed version. Use `--force` to reinstall the same version or allow a downgrade. This also applies to Cargo builds and local installs; local changes without a version bump require `--force`.
 
+A prebuilt archive may also carry files that the extension needs beside its library, such as a Node worker. The archive's `runtime-assets.json` index, written by the package's release builder, lists each file's path, size and SHA-256. The installer verifies every file before it installs anything, installs them beside the library in one transaction, and removes them on uninstall. Archives without an index install only the library. An `rpi` build without this support also installs only the library and does not reject the archive, so upgrade `rpi` before publishing a package that declares assets.
+
 For iterative development:
 
 ```bash

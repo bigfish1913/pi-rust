@@ -103,7 +103,7 @@ async fn read_uses_injected_image_processor_and_resize_option() {
     assert!(text_output(&result).contains("resize=false"));
     assert!(matches!(
         result.content.last(),
-        Some(rpi_agent::types::TextContentOrImage::Image(image)) if image.data == "processed"
+        Some(rpi_agent::types::TextContentOrImage::Image(image)) if &*image.data == "processed"
     ));
 }
 #[tokio::test]
@@ -217,7 +217,7 @@ async fn read_detects_supported_image_by_content() {
     let found = result
         .content
         .iter()
-        .any(|c| matches!(c, rpi_agent::types::TextContentOrImage::Image(i) if i.data == b64));
+        .any(|c| matches!(c, rpi_agent::types::TextContentOrImage::Image(i) if *i.data == *b64));
     assert!(found, "image block data must equal base64(raw bytes)");
 }
 

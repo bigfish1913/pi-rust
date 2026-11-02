@@ -683,7 +683,7 @@ mod tests {
     fn repair_moves_image_content_without_copying_its_payload() {
         let image = rpi_ai::types::ImageContent {
             kind: rpi_ai::types::ImageContentType,
-            data: "large image".repeat(1024),
+            data: "large image".repeat(1024).into(),
             mime_type: "image/png".into(),
         };
         let original_pointer = image.data.as_ptr();

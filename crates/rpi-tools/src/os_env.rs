@@ -14,9 +14,10 @@
 //! `ExecutionError::ShellUnavailable`. Legacy WSL bash (`System32\bash.exe`)
 //! uses `bash -s` stdin transport to avoid argv parse bugs.
 //!
-//! Kill tree: Windows `taskkill /F /T /PID`; POSIX `kill -PG` (process group,
-//! since the child is spawned as its own group leader) with fallback to
-//! `kill -PID`. Best-effort, errors swallowed.
+//! Kill tree: Windows terminates the shell's job object, falling back to
+//! `taskkill /F /T /PID`; POSIX `kill -PG` (process group, since the child is
+//! spawned as its own group leader) with fallback to `kill -PID`. Best-effort,
+//! errors swallowed.
 //!
 //! `exec` abort+timeout bracketing (plan §5.4): the spawn is `tokio::select!`-ed
 //! against the cancellation token and `tokio::time::timeout`. Resolution
@@ -360,11 +361,58 @@ async fn run_command(cmd: &str, args: &[&str], timeout: std::time::Duration) -> 
     }
 }
 
-/// Kill a process tree. Windows: `taskkill /F /T /PID`. POSIX: `kill -PG` with
-/// fallback to `kill -PID`. Best-effort, errors swallowed.
+/// One job object per running shell, by root pid. `taskkill /T` walks parent
+/// pids, and an MSYS shell's children are not on that chain: `sleep` under Git
+/// Bash outlives it. Job membership is inherited by every descendant.
+///
+/// Kill-on-close is armed only when killing, so whatever a command leaves
+/// running on purpose keeps running after it ends normally.
+#[cfg(windows)]
+mod shell_jobs {
+    use std::collections::HashMap;
+    use std::sync::{LazyLock, Mutex};
+
+    use win32job::{ExtendedLimitInfo, Job};
+
+    static JOBS: LazyLock<Mutex<HashMap<u32, Job>>> = LazyLock::new(Default::default);
+
+    /// Put a shell spawned with `CREATE_SUSPENDED` in its own job, then let it
+    /// run: no descendant can start outside the job. A shell that gets no job
+    /// still runs, and cancelling it falls back to `taskkill`.
+    pub fn start(pid: u32, process: std::os::windows::io::RawHandle) -> Result<(), String> {
+        if let Ok(job) = Job::create() {
+            if job.assign_process(process as isize).is_ok() {
+                JOBS.lock().unwrap().insert(pid, job);
+            }
+        }
+        rpi_plugin_sdk::process::resume_child(pid)
+    }
+
+    /// End every process in `pid`'s job: arm kill-on-close, then drop the only
+    /// handle. False when `pid` has no job or arming failed.
+    pub fn terminate(pid: u32) -> bool {
+        let Some(job) = JOBS.lock().unwrap().remove(&pid) else {
+            return false;
+        };
+        let mut info = ExtendedLimitInfo::new();
+        info.limit_kill_on_job_close();
+        job.set_extended_limit_info(&info).is_ok()
+    }
+
+    pub fn forget(pid: u32) {
+        JOBS.lock().unwrap().remove(&pid);
+    }
+}
+
+/// Kill a process tree. Windows: the shell's job object, else
+/// `taskkill /F /T /PID`. POSIX: `kill -PG` with fallback to `kill -PID`.
+/// Best-effort, errors swallowed.
 async fn kill_process_tree(pid: u32) {
     #[cfg(windows)]
     {
+        if shell_jobs::terminate(pid) {
+            return;
+        }
         use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
         let mut cmd = tokio::process::Command::new("taskkill");
         cmd.args(&["/F", "/T", "/PID", &pid.to_string()]);
@@ -918,8 +966,9 @@ impl Shell for OsExecutionEnv {
         }
         #[cfg(windows)]
         {
-            use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
-            cmd.creation_flags(CREATE_NO_WINDOW);
+            use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
+            // Suspended until it is in its job (see `shell_jobs::start`).
+            cmd.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
         }
 
         // Args: stdin transport → `bash -s` (no command argv); argv → append.
@@ -939,6 +988,23 @@ impl Shell for OsExecutionEnv {
             }
         };
         let pid = child.id();
+        #[cfg(windows)]
+        {
+            let started = match (pid, child.raw_handle()) {
+                (Some(pid), Some(process)) => shell_jobs::start(pid, process),
+                _ => Err("the shell has no process handle".to_owned()),
+            };
+            if let Err(error) = started {
+                if let Some(pid) = pid {
+                    shell_jobs::forget(pid);
+                }
+                let _ = child.start_kill();
+                return Err(ExecutionError::new(
+                    ExecutionErrorCode::SpawnError,
+                    format!("failed to start shell: {error}"),
+                ));
+            }
+        }
         if let Some(pid) = pid {
             self.active_pids.lock().await.insert(pid);
         }
@@ -1170,6 +1236,8 @@ impl Shell for OsExecutionEnv {
 
         // Remove from tracked pids.
         if let Some(pid) = pid {
+            #[cfg(windows)]
+            shell_jobs::forget(pid);
             self.active_pids.lock().await.remove(&pid);
         }
 
