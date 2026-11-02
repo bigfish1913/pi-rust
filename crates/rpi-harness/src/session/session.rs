@@ -24,9 +24,10 @@ use rpi_agent::message::AgentMessage;
 
 use crate::error::{SessionError, SessionErrorCode, SessionResult};
 use crate::session::types::{
-    BranchBounds, Entry, EntryQuery, IdGenerator, JsonValue, LanePointer, LaneRecord, LogItem,
-    LogOptions, OperationStartedRecord, ProvisionedEntry, ProvisionedKind, RecordQuery,
-    SessionMetadata, SessionStats, SessionStorage, SessionTree,
+    BranchBounds, BranchEntryPage, BranchEntryPageQuery, BranchOverview, Entry, EntryQuery,
+    IdGenerator, JsonValue, LanePointer, LaneRecord, LogItem, LogOptions, OperationStartedRecord,
+    ProvisionedEntry, ProvisionedKind, RecordQuery, SessionMetadata, SessionStats, SessionStorage,
+    SessionTree,
 };
 
 static AGENT_DIAGNOSTICS: OnceLock<bool> = OnceLock::new();
@@ -193,6 +194,32 @@ impl Session {
             })),
             id_generator: id_generator.unwrap_or_else(|| Arc::new(DefaultIdGenerator::new())),
         }
+    }
+
+    /// Read a complete-entry page from one backing-storage binding.
+    pub async fn branch_entry_page(
+        &self,
+        query: &BranchEntryPageQuery,
+    ) -> SessionResult<BranchEntryPage> {
+        self.branch_entry_page_for_lane("main", query).await
+    }
+
+    pub async fn branch_entry_page_for_lane(
+        &self,
+        lane: &str,
+        query: &BranchEntryPageQuery,
+    ) -> SessionResult<BranchEntryPage> {
+        let storage = self.storage_arc();
+        storage.branch_entry_page(lane, query).await
+    }
+
+    pub async fn branch_overview(&self) -> SessionResult<BranchOverview> {
+        self.branch_overview_for_lane("main").await
+    }
+
+    pub async fn branch_overview_for_lane(&self, lane: &str) -> SessionResult<BranchOverview> {
+        let storage = self.storage_arc();
+        storage.branch_overview(lane).await
     }
 
     /// Atomically swap the backing storage (TUI `/session` hot-switch). The
@@ -915,6 +942,15 @@ fn entry_id(entry: &Entry) -> String {
 
 #[async_trait]
 impl SessionTree for Session {
+    async fn branch_entry_page(
+        &self,
+        query: &BranchEntryPageQuery,
+    ) -> SessionResult<BranchEntryPage> {
+        Session::branch_entry_page(self, query).await
+    }
+    async fn branch_overview(&self) -> SessionResult<BranchOverview> {
+        Session::branch_overview(self).await
+    }
     async fn message_summaries(
         &self,
         query: &crate::session::types::MessageSummaryQuery,
@@ -999,6 +1035,17 @@ pub struct LaneView {
 
 #[async_trait]
 impl SessionTree for LaneView {
+    async fn branch_entry_page(
+        &self,
+        query: &BranchEntryPageQuery,
+    ) -> SessionResult<BranchEntryPage> {
+        self.session
+            .branch_entry_page_for_lane(&self.lane, query)
+            .await
+    }
+    async fn branch_overview(&self) -> SessionResult<BranchOverview> {
+        self.session.branch_overview_for_lane(&self.lane).await
+    }
     async fn message_summaries(
         &self,
         query: &crate::session::types::MessageSummaryQuery,

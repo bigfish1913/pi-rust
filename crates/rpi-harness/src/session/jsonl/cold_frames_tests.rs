@@ -1,5 +1,6 @@
 use super::*;
 use crate::session::jsonl::encode_mutation;
+use crate::session::state::SessionState;
 use crate::session::types::{QueueKind, RecordBase};
 use async_trait::async_trait;
 use rpi_tools::{env::ReadFile, FileError};
@@ -274,4 +275,35 @@ async fn cold_source_modification_or_short_range_fails_closed() {
         .unwrap_err()
         .message
         .contains("short cold"));
+}
+
+#[tokio::test]
+async fn published_frame_plan_does_not_block_new_cold_append() {
+    let (mut lazy, _, reader) = fixture();
+    let query = RecordQuery {
+        record_type: Some("assistant_frame"),
+        limit: Some(1),
+        ..Default::default()
+    };
+    let old_plan = lazy.record_plan(&query).unwrap();
+    let expected = lazy.record_plan(&query).unwrap().read().await.unwrap();
+    let frame = frame(101, "main", "new-run", AssistantFrameOp::Append);
+    let mutation = SessionMutation::Record {
+        record: LaneRecord::AssistantFrame(frame.clone()),
+    };
+    let line = encode_mutation(&mutation);
+    let offset = reader.bytes.lock().unwrap().len();
+    reader
+        .bytes
+        .lock()
+        .unwrap()
+        .extend_from_slice(line.as_bytes());
+    let source: Arc<dyn ReadFile> = reader.clone();
+    lazy.defer(&frame, &source, offset as u64, &line).unwrap();
+    assert_eq!(old_plan.read().await.unwrap(), expected);
+    assert_eq!(
+        lazy.record_plan(&query).unwrap().read().await.unwrap(),
+        vec![LaneRecord::AssistantFrame(frame)]
+    );
+    assert_eq!(lazy.sequence(), 101);
 }
