@@ -71,6 +71,12 @@ pub const DEFAULT_MAX_TURNS_PER_RUN: u32 = 120;
 /// unbounded, matching upstream.
 pub const MAX_TURNS_ENV: &str = "RPI_MAX_TURNS_PER_RUN";
 
+// Readers asserting environment stability and tests mutating this key must
+// share one lock. Tokio's guard is safe to retain across child-run awaits.
+#[cfg(test)]
+pub(crate) static MAX_TURNS_ENV_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
 /// Counts turns in one run and reports when the budget is exhausted.
 ///
 /// The harness builds this once per run and feeds it every turn's result via
@@ -201,13 +207,18 @@ mod tests {
 
     #[test]
     fn from_env_enables_only_for_a_positive_number() {
-        // Env vars are process-global: one test owns this key, and it restores
-        // the previous value before returning.
-        let previous = std::env::var(MAX_TURNS_ENV).ok();
-        let restore = || match &previous {
-            Some(v) => std::env::set_var(MAX_TURNS_ENV, v),
-            None => std::env::remove_var(MAX_TURNS_ENV),
-        };
+        let _guard = MAX_TURNS_ENV_TEST_LOCK.blocking_lock();
+        // Restore even on panic, before releasing the common environment lock.
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var(MAX_TURNS_ENV, value),
+                    None => std::env::remove_var(MAX_TURNS_ENV),
+                }
+            }
+        }
+        let _restore = Restore(std::env::var_os(MAX_TURNS_ENV));
 
         std::env::remove_var(MAX_TURNS_ENV);
         assert!(
@@ -227,8 +238,6 @@ mod tests {
                 "{raw:?} must leave the run unbounded"
             );
         }
-
-        restore();
     }
 
     #[test]

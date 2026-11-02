@@ -209,8 +209,10 @@ handle，`poll` 必须非阻塞并响应取消标记，`cancel` 只置位不释�
   `read` 对应 skill 的 `SKILL.md`"）。运行期通过 `--system-prompt` 或配置注入。
 - `prompts/append-system.md`：追加段，用于环境/项目特定约束。
 - `skills/<name>/SKILL.md`：领域技能。模型从启动时 `<available_skills>` 的
-  `name`/`description`/`triggers` 动态选择，**不要维护硬编码的主题→技能映射**。
+  `name`/`description` 动态选择，**不要维护硬编码的主题→技能映射**。
   发现（`loaded`）不等于使用；真正的激活证据是先完整 `read` 该 `SKILL.md`。
+  frontmatter 另支持 `disable-model-invocation: true`：该 skill 不进入
+  `<available_skills>`，只能由用户经 `/skills <name>` 显式调用。
 - `AGENTS.md`：项目根兜底指令，裸 `rpi` 也会读取。与 `prompts/system.md` 的
   核心约束保持一致，改一个就同步另一个。
 - 系统提示词与 skills 在**每次会话启动时**加载快照；改完要重启会话，已有会话不会热替换。

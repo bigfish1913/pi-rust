@@ -131,7 +131,7 @@ fn decode_content(raw: &Value) -> Result<Vec<TextContentOrImage>, AgentError> {
                 if !i.mime_type.starts_with("image/")
                     || i.mime_type.len() <= 6
                     || base64::engine::general_purpose::STANDARD
-                        .decode(&i.data)
+                        .decode(&*i.data)
                         .is_err()
                 {
                     return Err(AgentError::Validation(

@@ -248,6 +248,48 @@ async fn cold_bounded_reads_coalesce_and_do_not_warm_or_copy_the_index() {
 }
 
 #[tokio::test]
+async fn cold_retirement_matches_eager_state_and_keeps_inflight_plans_and_ids() {
+    for op in [AssistantFrameOp::ClearStream, AssistantFrameOp::ClearRun] {
+        let (mut lazy, mut eager, _) = fixture();
+        let query = RecordQuery::default();
+        let before = eager.find_records(&query).unwrap();
+        let plan = lazy.record_plan(&query).unwrap();
+        let mut clear = frame(101, "main", "run-a", op);
+        clear.stream_index = 0;
+        let mutation = SessionMutation::Record {
+            record: LaneRecord::AssistantFrame(clear),
+        };
+        lazy.apply_mutation(mutation.clone()).unwrap();
+        eager.apply_mutation(mutation).unwrap();
+        assert_eq!(
+            plan.read().await.unwrap(),
+            before,
+            "an issued read owns its pre-clear generation"
+        );
+        assert_eq!(
+            lazy.record_plan(&query).unwrap().read().await.unwrap(),
+            eager.find_records(&query).unwrap()
+        );
+        assert_eq!(
+            lazy.log_plan(&LogOptions::default())
+                .unwrap()
+                .read()
+                .await
+                .unwrap(),
+            eager.get_log(&LogOptions::default()).unwrap()
+        );
+        assert!(
+            lazy.validate_unused_id("frame-100").is_err(),
+            "cleared IDs remain permanently reserved"
+        );
+        assert!(
+            lazy.validate_unused_id("frame-2").is_err(),
+            "already retired IDs remain reserved"
+        );
+    }
+}
+
+#[tokio::test]
 async fn cold_source_modification_or_short_range_fails_closed() {
     let (lazy, _, reader) = fixture();
     let query = RecordQuery {
@@ -255,7 +297,13 @@ async fn cold_source_modification_or_short_range_fails_closed() {
         limit: Some(1),
         ..Default::default()
     };
-    let offset = lazy.cold.locations[0].offset as usize;
+    let offset = lazy
+        .cold
+        .locations
+        .iter()
+        .find(|loc| !loc.retired)
+        .unwrap()
+        .offset as usize;
     reader.bytes.lock().unwrap()[offset] = b' ';
     assert!(lazy
         .record_plan(&query)

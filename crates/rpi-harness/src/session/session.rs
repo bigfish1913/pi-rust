@@ -1505,6 +1505,96 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resource_transition_idle_checks_all_delivery_queues_without_draining() {
+        use crate::agent_harness::AgentHarness;
+        use crate::session::types::{
+            provisioned_into_entry, ProvisionedEntry, ProvisionedKind, QueueCancelledRecord,
+            QueueEnqueuedRecord, QueueKind, RecordBase,
+        };
+        for lane in ["main", "side"] {
+            for queue in [
+                QueueKind::Steer,
+                QueueKind::FollowUp,
+                QueueKind::NextRun,
+                QueueKind::Context,
+            ] {
+                let session = fixture_session();
+                if lane != "main" {
+                    session.create_lane(lane, None).await.unwrap();
+                }
+                session
+                    .view(lane)
+                    .append_message(user("lane seed"))
+                    .await
+                    .unwrap();
+                let target =
+                    crate::session::reducer::entry_provisioned_json(&provisioned_into_entry(
+                        ProvisionedEntry {
+                            id: "queued-delivery".into(),
+                            kind: ProvisionedKind::Message {
+                                message: user("pending native delivery"),
+                                terminate: None,
+                            },
+                        },
+                        0,
+                        None,
+                        0,
+                    ));
+                let base = |id: &str| RecordBase {
+                    id: id.into(),
+                    seq: 0,
+                    timestamp: 0,
+                    lane: lane.into(),
+                };
+                session
+                    .append_record(LaneRecord::QueueEnqueued(QueueEnqueuedRecord {
+                        base: base("enqueue-record"),
+                        queue,
+                        run_id: None,
+                        target,
+                    }))
+                    .await
+                    .unwrap();
+                let before = session.get_log(&LogOptions::default()).await.unwrap();
+                for _ in 0..2 {
+                    let error = AgentHarness::validate_resource_transition_idle(&session)
+                        .await
+                        .unwrap_err();
+                    assert!(
+                        error.to_string().contains("pending native"),
+                        "{lane}/{queue:?}: {error}"
+                    );
+                    assert_eq!(
+                        session.get_log(&LogOptions::default()).await.unwrap(),
+                        before
+                    );
+                    assert!(session
+                        .get_entry("queued-delivery")
+                        .await
+                        .unwrap()
+                        .is_none());
+                }
+                session
+                    .append_record(LaneRecord::QueueCancelled(QueueCancelledRecord {
+                        base: base("cancel-record"),
+                        run_id: None,
+                        entry_id: "queued-delivery".into(),
+                    }))
+                    .await
+                    .unwrap();
+                let cancelled = session.get_log(&LogOptions::default()).await.unwrap();
+                AgentHarness::validate_resource_transition_idle(&session)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    session.get_log(&LogOptions::default()).await.unwrap(),
+                    cancelled
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn resource_transition_idle_fails_closed_on_branch_read_error() {
         let original = fixture_session();
         original

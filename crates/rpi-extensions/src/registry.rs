@@ -15,8 +15,9 @@ use std::sync::Arc;
 use rpi_agent::error::AgentError;
 use rpi_ai::types::Tool;
 use rpi_plugin_sdk::{
-    BeforeAgentStartFn, CommandHandlerFn, EventHandlerFn, EventTag, FreeStringFn, OAuthRequestFn,
-    ProviderRequestFn, ProviderStreamRequestFn, RenderFn, ResourcesDiscoverFn, EVENT_TAG_COUNT,
+    BeforeAgentStartFn, CommandHandlerFn, EventHandlerFn, EventTag, FreeStringFn,
+    OAuthRequestControlFn, OAuthRequestFn, ProviderRequestFn, ProviderStreamRequestFn, RenderFn,
+    ResourcesDiscoverFn, EVENT_TAG_COUNT,
 };
 
 use crate::tool::PluginToolHandle;
@@ -266,7 +267,12 @@ pub struct RegisteredOAuthProvider {
     /// plugin.
     pub plugin: String,
     pub manifest_json: String,
+    /// Legacy action callback. Used only when `control_fn` is `None`.
     pub request_fn: OAuthRequestFn,
+    /// Cancellable action callback (registered through
+    /// `register_oauth_provider_cancellable`). When present the host calls it
+    /// instead of `request_fn`, with a control that reflects cancellation.
+    pub control_fn: Option<OAuthRequestControlFn>,
     pub plugin_free_string: FreeStringFn,
     pub user_data: *mut std::ffi::c_void,
 }
@@ -1291,6 +1297,7 @@ mod tests {
             plugin: "test-plugin".to_string(),
             manifest_json: manifest.to_string(),
             request_fn: noop_oauth,
+            control_fn: None,
             plugin_free_string: noop_free,
             user_data: std::ptr::null_mut(),
         };
