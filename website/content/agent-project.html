@@ -204,8 +204,10 @@ handle，<code>poll</code> 必须非阻塞并响应取消标记，<code>cancel</
   <code>read</code> 对应 skill 的 <code>SKILL.md</code>"）。运行期通过 <code>--system-prompt</code> 或配置注入。</li>
 <li><code>prompts/append-system.md</code>：追加段，用于环境/项目特定约束。</li>
 <li><code>skills/&lt;name&gt;/SKILL.md</code>：领域技能。模型从启动时 <code>&lt;available_skills&gt;</code> 的
-  <code>name</code>/<code>description</code>/<code>triggers</code> 动态选择，<strong>不要维护硬编码的主题→技能映射</strong>。
-  发现（<code>loaded</code>）不等于使用；真正的激活证据是先完整 <code>read</code> 该 <code>SKILL.md</code>。</li>
+  <code>name</code>/<code>description</code> 动态选择，<strong>不要维护硬编码的主题→技能映射</strong>。
+  发现（<code>loaded</code>）不等于使用；真正的激活证据是先完整 <code>read</code> 该 <code>SKILL.md</code>。
+  frontmatter 另支持 <code>disable-model-invocation: true</code>：该 skill 不进入
+  <code>&lt;available_skills&gt;</code>，只能由用户经 <code>/skills &lt;name&gt;</code> 显式调用。</li>
 <li><code>AGENTS.md</code>：项目根兜底指令，裸 <code>rpi</code> 也会读取。与 <code>prompts/system.md</code> 的
   核心约束保持一致，改一个就同步另一个。</li>
 <li>系统提示词与 skills 在<strong>每次会话启动时</strong>加载快照；改完要重启会话，已有会话不会热替换。</li>

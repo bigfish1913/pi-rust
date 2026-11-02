@@ -175,7 +175,7 @@ pub fn assistant_blocks(msg: &AssistantMessage) -> Vec<AssistantBlock> {
             Content::Text(t) => Some(AssistantBlock::Text(t.text.clone())),
             Content::Thinking(t) => Some(AssistantBlock::Thinking(t.thinking.clone())),
             Content::Image(image) => base64::engine::general_purpose::STANDARD
-                .decode(&image.data)
+                .decode(&*image.data)
                 .ok()
                 .filter(|data| !data.is_empty())
                 .map(AssistantBlock::Image),

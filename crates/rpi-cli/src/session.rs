@@ -1223,6 +1223,14 @@ pub async fn build_prepared(
         .await
         .map_err(|e| BuildError::HarnessCreate(e.to_string()))?;
 
+    // Retain read leases even for resource-only/--no-extensions hosts.
+    let harness_leases = resource_leases.clone();
+    harness
+        .events()
+        .on_lifetime::<rpi_harness::events::RunEndEvent, _>(move |_| {
+            let _ = &harness_leases;
+        });
+    install_extension_settlement_bridge(harness.events(), extension_session_cell.clone());
     if let Some(selected) = &resource_selection {
         harness
             .seal_resources(active)
@@ -1301,14 +1309,6 @@ pub async fn build_prepared(
         &harness_cell,
         Arc::new(harness.clone()),
     );
-    // Retain read leases even for resource-only/--no-extensions hosts.
-    let harness_leases = resource_leases.clone();
-    harness
-        .events()
-        .on_lifetime::<rpi_harness::events::RunEndEvent, _>(move |_| {
-            let _ = &harness_leases;
-        });
-    install_extension_settlement_bridge(harness.events(), extension_session_cell.clone());
     register_file_io_router(&harness, &file_io);
 
     // ---- Durable operation recovery (runtime layer) ----

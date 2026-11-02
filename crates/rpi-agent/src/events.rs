@@ -45,6 +45,18 @@ pub enum AgentEvent {
     TurnEnd {
         message: AgentMessage,
         tool_results: Vec<ToolResultMessage>,
+        /// How many messages were sitting in the steering + follow-up queues
+        /// when this turn settled.
+        ///
+        /// Consumers use it for a `pendingMessages` indicator ("N queued"):
+        /// the UI needs to know "there are still N messages waiting", which is
+        /// *not* the same as "a follow-up arrived" (`follow_ups` is drained
+        /// before the round decides to continue).
+        ///
+        /// Additive field: every constructor passes it explicitly; every
+        /// consumer that doesn't care uses `..`.
+        #[doc(alias = "pendingMessages")]
+        pending_messages: usize,
     },
     /// Emitted when any message (user prompt, assistant response, tool result,
     /// custom) is appended to the transcript.

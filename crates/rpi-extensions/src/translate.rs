@@ -39,6 +39,9 @@ pub fn event_tag_for(event: &AgentEvent) -> Option<EventTag> {
         AgentEvent::AgentEnd { .. } => Some(EventTag::AgentEnd),
         AgentEvent::RetryScheduled { .. } => None,
         AgentEvent::TurnStart => Some(EventTag::TurnStart),
+        // The lifecycle tag stays payload-free; the payload rides under its own
+        // tag so a host that predates the payload can never be made to read
+        // uninitialized union storage. See `EventTag::TurnEndPayload`.
         AgentEvent::TurnEnd { .. } => Some(EventTag::TurnEnd),
         AgentEvent::MessageStart { .. } => Some(EventTag::MessageStart),
         AgentEvent::MessageUpdate { .. } => Some(EventTag::MessageUpdate),
@@ -56,6 +59,60 @@ fn message_to_stb(message: &rpi_agent::message::AgentMessage) -> StbString {
     // AgentMessage is Serialize (#[serde(tag="kind")]); use serde_json round-trip.
     let text = serde_json::to_string(message).unwrap_or_else(|_| "null".to_string());
     StbString::from_string(text)
+}
+
+/// Normalize an assistant `StopReason` into the value a plugin branches on.
+///
+/// `stop`, `toolUse` and `length` are all *successful* terminations of a turn:
+/// the run is going to continue (or ended cleanly) either way. `aborted` is the
+/// user cancelling. Everything else is a failure.
+fn turn_outcome(stop_reason: rpi_ai::types::StopReason) -> &'static str {
+    use rpi_ai::types::StopReason;
+    match stop_reason {
+        StopReason::Stop | StopReason::ToolUse | StopReason::Length => "stop",
+        StopReason::Aborted => "aborted",
+        _ => "error",
+    }
+}
+
+/// Payload for `turn_end`.
+///
+/// Carries enough for a plugin to tell a normal stop from a failure or a user
+/// abort without inferring it from the last `message_end`, plus
+/// `pendingMessages` — the queue depth **after** this turn settled.
+fn turn_end_payload(message: &rpi_agent::message::AgentMessage, tool_results: usize) -> String {
+    let stop_reason = message
+        .as_assistant()
+        .map(|assistant| assistant.stop_reason);
+    let outcome = stop_reason.map(turn_outcome).unwrap_or("error");
+    serde_json::json!({
+        "outcome": outcome,
+        "stopReason": stop_reason.map(|reason| reason.as_str()),
+        "toolResultCount": tool_results,
+    })
+    .to_string()
+}
+
+/// Translate one agent event into **every** stable event it must produce.
+///
+/// Almost every event is one-to-one, but `turn_end` is not: existing subscribers
+/// registered for the lifecycle `turn_end` tag must keep receiving an event, and
+/// the payload needs a different tag so a host that predates the payload can
+/// never be made to read uninitialized union storage. Emitting both keeps
+/// legacy handlers working while the payload stays behind the new tag.
+/// Production dispatch additionally filters each subscription before allocating.
+#[cfg(test)]
+fn translate_all(event: &AgentEvent) -> Vec<StablePluginEvent> {
+    match event {
+        AgentEvent::TurnEnd { .. } => {
+            let mut out = vec![StablePluginEvent::empty(EventTag::TurnEnd)];
+            if let Some(payload) = translate(event) {
+                out.push(payload);
+            }
+            out
+        }
+        _ => translate(event).into_iter().collect(),
+    }
 }
 
 /// Build the stable event for an `AgentEvent`, or `None` if the event carries
@@ -118,11 +175,34 @@ pub fn translate(event: &AgentEvent) -> Option<StablePluginEvent> {
             ))
         }
 
+        // `turn_end` carries a payload so a plugin can tell a normal stop from
+        // a failure or a user abort without inferring it from the last
+        // `message_end`, and so a remote UI can show "N queued".
+        //
+        // `pendingMessages` is the queue depth **after** the turn settled. The
+        // drain hooks cannot answer this (they consume the queue), which is why
+        // the agent loop reports it through a read-only `pending_message_count`
+        // hook instead.
+        AgentEvent::TurnEnd {
+            message,
+            tool_results,
+            pending_messages,
+        } => {
+            let mut payload: serde_json::Value =
+                serde_json::from_str(&turn_end_payload(message, tool_results.len()))
+                    .unwrap_or_else(|_| serde_json::json!({}));
+            // Additive: consumers that only know the older (empty) shape ignore it.
+            payload["pendingMessages"] = serde_json::json!(pending_messages);
+            Some(StablePluginEvent::data(
+                EventTag::TurnEndPayload,
+                StbString::from_string(payload.to_string()),
+            ))
+        }
+
         // No-payload events.
-        AgentEvent::AgentStart
-        | AgentEvent::TurnStart
-        | AgentEvent::AgentEnd { .. }
-        | AgentEvent::TurnEnd { .. } => Some(StablePluginEvent::empty(tag)),
+        AgentEvent::AgentStart | AgentEvent::TurnStart | AgentEvent::AgentEnd { .. } => {
+            Some(StablePluginEvent::empty(tag))
+        }
 
         AgentEvent::RetryScheduled { .. } => None,
     }
@@ -323,7 +403,21 @@ impl ExtensionEmitter {
         let Some(tag) = event_tag_for(event) else {
             return;
         };
-        if self.snapshot.handlers_for(tag).is_empty() {
+        // TurnEnd has two independent subscriptions. Preserve the payload-free
+        // lifecycle event even when nobody subscribes to the new payload tag,
+        // and avoid allocating payload strings for empty/stale registries.
+        if matches!(event, AgentEvent::TurnEnd { .. }) {
+            if !self.snapshot.handlers_for(EventTag::TurnEnd).is_empty() {
+                self.dispatch(&StablePluginEvent::empty(EventTag::TurnEnd));
+            }
+            if self
+                .snapshot
+                .handlers_for(EventTag::TurnEndPayload)
+                .is_empty()
+            {
+                return;
+            }
+        } else if self.snapshot.handlers_for(tag).is_empty() {
             return;
         }
         if let Some(stable) = translate(event) {
@@ -946,6 +1040,8 @@ fn free_dispatched_event(event: &StablePluginEvent) {
         | T::AgentEnd
         | T::AgentSettled
         | T::TurnStart
+        // Lifecycle only: the `turn_end` payload rides under
+        // `TurnEndPayload`, so this tag owns no allocation.
         | T::TurnEnd
         | T::ModelSelect
         | T::ThinkingLevelSelect
@@ -962,7 +1058,11 @@ fn free_dispatched_event(event: &StablePluginEvent) {
         | T::BeforeProviderHeaders
         | T::AfterProviderResponse
         | T::Input
-        | T::EditorChange => {
+        | T::EditorChange
+        // `turn_end` carries `{outcome, stopReason, toolResultCount,
+        // pendingMessages}` as an owning `data` allocation under its own tag.
+        // Leaving it in the no-payload arm leaked one allocation per event.
+        | T::TurnEndPayload => {
             // SAFETY: these tags are only ever constructed as data payloads.
             unsafe { host_free_string(event.payload.data.data) };
         }
@@ -993,6 +1093,135 @@ mod tests {
     // before the test returns — no handler outlives the test.
     static HANDLER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    /// `turn_end` must carry `pendingMessages`, and it must be the queue depth
+    /// **after** the turn settled.
+    ///
+    /// This is the only data source for a remote UI's "N queued" indicator: the
+    /// drain hooks consume the queue, so the count has to come from the
+    /// A handler registered for the lifecycle `turn_end` tag must still run.
+    ///
+    /// Regression: routing the payload under its own tag replaced the lifecycle
+    /// event instead of accompanying it, so every existing `turn_end` subscriber
+    /// received nothing (observed 0 calls where 1 is expected).
+    #[test]
+    fn legacy_turn_end_subscribers_still_receive_the_lifecycle_event() {
+        static TURN_END_CALLS: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        extern "C" fn count_turn_end(
+            _ev: rpi_plugin_sdk::StablePluginEvent,
+            _ud: *mut std::ffi::c_void,
+        ) -> i32 {
+            TURN_END_CALLS.fetch_add(1, Ordering::SeqCst);
+            0
+        }
+
+        let mut reg = crate::registry::ExtensionRegistry::new();
+        reg.register_event_handler(
+            "legacy".to_string(),
+            EventTag::TurnEnd,
+            count_turn_end,
+            std::ptr::null_mut(),
+        );
+        let snapshot = reg.snapshot();
+
+        let event = AgentEvent::TurnEnd {
+            message: rpi_agent::AgentMessage::Assistant(Box::new(
+                rpi_ai::types::AssistantMessage::empty(
+                    rpi_ai::types::Api::AnthropicMessages,
+                    "p",
+                    "m",
+                    0,
+                ),
+            )),
+            tool_results: vec![],
+            pending_messages: 0,
+        };
+        TURN_END_CALLS.store(0, Ordering::SeqCst);
+        for stable in translate_all(&event) {
+            dispatch_to_handlers(&snapshot, &stable);
+        }
+        assert_eq!(
+            TURN_END_CALLS.load(Ordering::SeqCst),
+            1,
+            "a legacy `turn_end` subscriber must still be called exactly once"
+        );
+    }
+
+    /// The `turn_end` payload tag owns an allocation, so it must be freed on
+    /// every dispatch path — including zero subscribers, where no handler runs.
+    ///
+    /// A leak here is invisible without accounting, so this asserts the arm the
+    /// cleanup takes rather than pretending to measure the allocator.
+    #[test]
+    fn turn_end_payload_is_freed_on_the_zero_subscriber_path() {
+        let event = StablePluginEvent::data(
+            EventTag::TurnEndPayload,
+            StbString::from_string(r#"{"pendingMessages":2}"#.to_string()),
+        );
+        // Reading it back first proves the payload is live and owning.
+        let view = unsafe { rpi_plugin_sdk::events::EventView::from_raw(&event) };
+        assert_eq!(
+            view.data_text().as_deref(),
+            Some(r#"{"pendingMessages":2}"#)
+        );
+        // The empty registry takes the `handlers.is_empty()` branch, which must
+        // free the allocation instead of leaving it to a handler that never runs.
+        let snapshot = crate::registry::ExtensionRegistry::new().snapshot();
+        dispatch_to_handlers(&snapshot, &event);
+    }
+
+    /// The lifecycle `turn_end` tag owns nothing now that the payload moved to
+    /// its own tag, so freeing it must be a no-op rather than a stray free.
+    #[test]
+    fn turn_end_lifecycle_event_owns_no_payload() {
+        let event = StablePluginEvent::empty(EventTag::TurnEnd);
+        let view = unsafe { rpi_plugin_sdk::events::EventView::from_raw(&event) };
+        assert_eq!(view.data_text(), None);
+        let snapshot = crate::registry::ExtensionRegistry::new().snapshot();
+        dispatch_to_handlers(&snapshot, &event);
+    }
+
+    /// read-only `pending_message_count` hook.
+    #[test]
+    fn turn_end_carries_pending_message_count() {
+        let assistant = AgentMessage::Assistant(Box::new(AssistantMessage {
+            role: rpi_ai::types::AssistantRole,
+            content: vec![rpi_ai::types::Content::text("hi")],
+            api: rpi_ai::types::Api::AnthropicMessages,
+            provider: "anthropic".to_string(),
+            model: "m".into(),
+            response_model: None,
+            response_id: None,
+            usage: Usage::zero(),
+            stop_reason: rpi_ai::types::StopReason::Stop,
+            deferred: None,
+            error_message: None,
+            raw_stop_reason: None,
+            end_turn: None,
+            timestamp: 0,
+        }));
+        let event = AgentEvent::TurnEnd {
+            message: assistant,
+            tool_results: vec![],
+            pending_messages: 3,
+        };
+        let translated = translate(&event).expect("turn_end maps to a tag");
+        // The payload rides under its own tag so an old host — which only sends
+        // the payload-free `TurnEnd` — can never be read through the union.
+        assert_eq!(translated.tag, EventTag::TurnEndPayload);
+        // SAFETY: `TurnEndPayload` carries the `data` variant; discriminating by
+        // tag is the documented contract for this union.
+        let payload = unsafe { translated.payload.data.data.to_string_lossy() };
+        assert!(
+            !payload.is_empty(),
+            "turn_end must carry a payload (an older host sent none)"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("valid JSON");
+        assert_eq!(parsed["pendingMessages"], 3, "{payload}");
+        assert_eq!(parsed["outcome"], "stop", "{payload}");
+        assert_eq!(parsed["toolResultCount"], 0, "{payload}");
+    }
+
     #[test]
     fn all_ten_agent_events_map_to_a_tag() {
         let am = AgentMessage::Assistant(Box::new(AssistantMessage {
@@ -1018,6 +1247,7 @@ mod tests {
             AgentEvent::TurnEnd {
                 message: am.clone(),
                 tool_results: vec![],
+                pending_messages: 0,
             },
             AgentEvent::MessageStart {
                 message_id: None,

@@ -96,7 +96,7 @@ pub struct AnthropicImageSource {
     #[serde(rename = "type")]
     pub kind: String, // always "base64"
     pub media_type: String,
-    pub data: String,
+    pub data: std::sync::Arc<str>,
 }
 
 /// Tool-result content: either a plain string (concatenated text) or an array

@@ -223,15 +223,15 @@ async fn side_editor_matches_main_working_spinner_and_repaints_while_running() {
 
     view.update(&snapshot("partial answer"));
     let first = strip_ansi(&view.editor.render(80)[0]);
-    let frame = view
-        .editor
-        .working()
-        .expect("running side chat is working")
-        .frame;
     assert!(first.contains("Working…"), "side editor border: {first}");
-    assert_eq!(frame, 1, "the shared editor spinner advances on render");
+    // Frames come from elapsed wall clock (shared with the main editor's
+    // indicator), so repaints within one 80ms window show the same glyph;
+    // animation across windows is covered by the rpi-tui editor tests.
     let second = strip_ansi(&view.editor.render(80)[0]);
-    assert_ne!(first, second, "side editor spinner must animate");
+    assert_eq!(
+        first, second,
+        "same-window repaints must not move the shared spinner"
+    );
 
     assert!(fixture.sync(true), "running side chat must request repaint");
 
