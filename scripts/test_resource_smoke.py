@@ -343,6 +343,16 @@ class ProtocolTests(Base):
             smoke.validate_answer(data, prompt, 1, True, {"a1"}, args)
 
     def test_editor_baseline_before_prepare_warmup_reset_cleanup(self):
+        self.check_editor_baseline_before_prepare_warmup_reset_cleanup()
+
+    def test_editor_symlink_alias_preserves_exact_command_and_lifecycle(self):
+        alias = self.root / ("python alias" + self.binary.suffix)
+        alias.symlink_to(self.binary.resolve())
+        self.binary = alias
+        self.assertNotEqual(self.binary, self.binary.resolve())
+        self.check_editor_baseline_before_prepare_warmup_reset_cleanup()
+
+    def check_editor_baseline_before_prepare_warmup_reset_cleanup(self):
         args, report = self.report("--case", "editor", "--editor-probe", str(self.binary),
                                    "--rounds", "2", "--warmup-rounds", "1", "--idle-seconds", ".02")
         real_host = smoke.Host
@@ -358,7 +368,7 @@ for line in sys.stdin:
  if t=='stop': break
 '''
         def host_factory(command, root, env, timeout, secret):
-            self.assertEqual(command, [str(self.binary)])  # no probe flags
+            self.assertEqual(command, [str(self.binary.resolve())])  # exact binary, no probe flags
             host = real_host([sys.executable, "-u", "-c", code], root, env, timeout, secret)
             created.append(host)
             return host

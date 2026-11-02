@@ -110,6 +110,9 @@ async fn illegal_optins_reject_before_early_dispatch_or_legacy_writes() {
         vec!["update"],
         vec!["install"],
         vec!["extension", "list"],
+        vec!["extension", "--help"],
+        vec!["extension", "update", "--help"],
+        vec!["extension", "update"],
         vec!["resource", "list", "--scope", "project"],
         vec!["resource", "inspect", "skill", "demo", "--scope", "project"],
         vec!["resource", "recover", "--scope", "project"],
@@ -149,6 +152,9 @@ async fn illegal_optins_reject_before_early_dispatch_or_legacy_writes() {
             String::from_utf8_lossy(&result.stderr)
         );
         assert!(String::from_utf8_lossy(&result.stderr).contains("experimental-native-store"));
+        if args.first() == Some(&"extension") {
+            assert!(String::from_utf8_lossy(&result.stderr).contains("not a subcommand"));
+        }
         assert!(!f.native.exists());
         assert!(!f.temp.path().join("export.html").exists());
         assert!(!f.temp.path().join(".rpi/.resource-lease").exists());
