@@ -585,6 +585,11 @@ pub fn prepare_extensions(
         }
         report_deferred_renderers(&extension_session);
     }
+    // Publish the extension registry so `ListCommands` can enumerate slash
+    // commands. Done here rather than at host construction because the registry
+    // only exists after extensions load; `/reload` republishes the new snapshot
+    // via `RuntimeActionHost::publish_registry`.
+    action_host.publish_registry_impl(extension_session.snapshot_arc());
     Ok(PreparedExtensions {
         resource_selection,
         session_selection,
@@ -1715,6 +1720,7 @@ where
     };
 
     let reload_cb = rpi_extensions::reload_callback_from_mailbox(ctx.mailbox.clone());
+    let publish_host = Arc::clone(&host);
     let fresh_bridge = rpi_extensions::ActionBridge::with_reload_and_ui(
         ctx.runtime.clone(),
         host,
@@ -1839,6 +1845,14 @@ where
 
     // The session was swapped atomically above; expose its matching bridge.
     *ctx.action_bridge.lock().unwrap() = Some(Arc::clone(&fresh_bridge));
+    // Republish the registry so `ListCommands` reflects the commands the reload
+    // just discovered — without this a remote UI keeps serving the startup set
+    // until the host process restarts. Via the trait method because all we hold
+    // here is `Arc<dyn RuntimeActionHost>`.
+    // Publish even when the reload found nothing: a nonempty -> empty reload
+    // returns `ExtensionSession::none()`, and skipping it would leave the old
+    // snapshot advertised.
+    publish_host.publish_registry_opt(extension_session.snapshot_arc());
 
     // ---- 3. resources_discover ("reload") over the fresh snapshot ----
     let discovered = extension_session

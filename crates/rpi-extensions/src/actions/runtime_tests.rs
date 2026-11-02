@@ -8,10 +8,19 @@ struct Host {
     calls: AtomicUsize,
     revoked: AtomicUsize,
     aborts: AtomicUsize,
+    command_lists: AtomicUsize,
     side_sinks: std::sync::Mutex<Vec<SideQuestionSink>>,
 }
 #[async_trait::async_trait]
 impl RuntimeActionHost for Host {
+    async fn list_commands(&self, args: Value) -> Result<Value, String> {
+        assert!(args.get("__rpiRuntimeKey").is_none());
+        self.command_lists.fetch_add(1, Ordering::SeqCst);
+        Ok(
+            json!({"commands":[{"name":"integrated","description":"both actions coexist","source":"extension"}]}),
+        )
+    }
+
     async fn side_question(
         &self,
         owner: u64,
@@ -279,5 +288,49 @@ async fn abort_reaches_the_host_and_is_not_blocked_by_the_action_id_ceiling() {
     let value: Value = serde_json::from_str(&owned.to_string_lossy()).unwrap();
     assert_eq!(rc, 0, "Abort must dispatch, not fail as an unknown id");
     assert_eq!(value, json!({"aborted": false}));
+    assert_eq!(host.aborts.load(Ordering::SeqCst), 1);
+}
+
+/// Independently developed wire actions must survive integration together.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn integrated_command_listing_and_abort_dispatch_without_renumbering() {
+    let host = Arc::new(Host::default());
+    let root = ActionBridge::new(Handle::current(), host.clone());
+    let plugin = root.for_plugin("integrated-actions");
+    for (id, expected) in [
+        (
+            26,
+            json!({"commands":[{"name":"integrated","description":"both actions coexist","source":"extension"}]}),
+        ),
+        (27, json!({"aborted":false})),
+    ] {
+        let mut out = StbString::empty();
+        let rc = trampoline_runtime_action(
+            id,
+            StbStringRef::from_str("{}"),
+            &mut out,
+            plugin.user_data(),
+        );
+        assert_eq!(rc, 0, "action {id} must reach its own host method");
+        // SAFETY: a successful trampoline call returns a live host allocation.
+        let owned = unsafe {
+            rpi_plugin_sdk::callbacks::OwnedString::from_raw(out, Some(crate::host_free_string))
+        };
+        let value: Value = serde_json::from_str(&owned.to_string_lossy()).unwrap();
+        assert_eq!(value, expected);
+    }
+    assert_eq!(host.command_lists.load(Ordering::SeqCst), 1);
+    assert_eq!(host.aborts.load(Ordering::SeqCst), 1);
+    let mut out = StbString::empty();
+    assert_eq!(
+        trampoline_runtime_action(
+            RuntimeActionId::MAX + 1,
+            StbStringRef::from_str("{}"),
+            &mut out,
+            plugin.user_data()
+        ),
+        2
+    );
+    assert_eq!(host.command_lists.load(Ordering::SeqCst), 1);
     assert_eq!(host.aborts.load(Ordering::SeqCst), 1);
 }
