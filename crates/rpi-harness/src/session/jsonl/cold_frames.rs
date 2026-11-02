@@ -16,6 +16,39 @@ use std::{
     sync::Arc,
 };
 
+/// A single JSONL row may exceed the scanner's 1 MiB I/O window. Keep
+/// hydration bounded at the reader boundary too, without splitting JSON values
+/// or weakening the per-location digest and identity checks.
+async fn read_range_bounded(
+    reader: &Arc<dyn ReadFile>,
+    offset: u64,
+    length: usize,
+) -> SessionResult<Vec<u8>> {
+    const CHUNK: usize = 1024 * 1024;
+    if length <= CHUNK {
+        return file_result(
+            reader.read_range(offset, length).await,
+            "read cold history range",
+        );
+    }
+    let mut bytes = Vec::with_capacity(length);
+    for start in (0..length).step_by(CHUNK) {
+        let count = (length - start).min(CHUNK);
+        let at = offset
+            .checked_add(start as u64)
+            .ok_or_else(|| SessionError::storage("cold history range overflow"))?;
+        let chunk = file_result(
+            reader.read_range(at, count).await,
+            "read cold history range",
+        )?;
+        if chunk.len() != count {
+            return Err(SessionError::storage("short cold history read"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
 #[derive(Clone)]
 pub(super) struct Location {
     reader: Arc<dyn ReadFile>,
@@ -64,10 +97,7 @@ impl Location {
         }
     }
     async fn read(&self) -> SessionResult<SessionMutation> {
-        let raw = file_result(
-            self.reader.read_range(self.offset, self.length).await,
-            "read cold history range",
-        )?;
+        let raw = read_range_bounded(&self.reader, self.offset, self.length).await?;
         self.decode(&raw)
     }
     fn decode(&self, raw: &[u8]) -> SessionResult<SessionMutation> {
@@ -806,10 +836,7 @@ async fn read_entries(selected: Vec<JsonlPayload>) -> SessionResult<Vec<Entry>> 
             end += 1;
         }
         let length = usize::try_from(range_end - first.offset).map_err(|_| overflow())?;
-        let bytes = file_result(
-            first.reader.read_range(first.offset, length).await,
-            "read cold history range",
-        )?;
+        let bytes = read_range_bounded(&first.reader, first.offset, length).await?;
         if bytes.len() != length {
             return Err(SessionError::storage("short cold history read"));
         }
@@ -1056,10 +1083,7 @@ async fn read_frames(locations: Vec<Arc<Location>>) -> SessionResult<HashMap<u64
         }
         let length = usize::try_from(range_end - first.offset)
             .map_err(|_| SessionError::storage("cold history range overflow"))?;
-        let bytes = file_result(
-            first.reader.read_range(first.offset, length).await,
-            "read cold history range",
-        )?;
+        let bytes = read_range_bounded(&first.reader, first.offset, length).await?;
         if bytes.len() != length {
             return Err(SessionError::storage("short cold history read"));
         }

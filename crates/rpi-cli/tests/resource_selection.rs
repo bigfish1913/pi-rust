@@ -10,6 +10,8 @@ mod resource_fixture;
 mod resource_lifecycle;
 #[path = "support/resource_transition.rs"]
 mod resource_transition;
+#[path = "support/saved_resource_read.rs"]
+mod saved_resource_read;
 use resource_fixture::Fixture;
 use serde_json::{json, Value};
 use sha2::Digest as _;

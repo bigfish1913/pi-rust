@@ -12,6 +12,7 @@ struct Scanner {
     buffer: Vec<u8>,
     cursor: usize,
     hash: Sha256,
+    policy: ReadPolicy,
 }
 impl Scanner {
     fn new(reader: Arc<dyn ReadFile>, length: u64) -> Self {
@@ -23,12 +24,14 @@ impl Scanner {
             buffer: Vec::new(),
             cursor: 0,
             hash: Sha256::new(),
+            policy: ReadPolicy::Restore,
         }
     }
     async fn next(&mut self) -> SessionResult<Option<(u64, Vec<u8>, bool, bool)>> {
         let offset = self.offset;
         let mut line = Vec::new();
         loop {
+            self.policy.check(0)?;
             if self.cursor < self.buffer.len() {
                 let mut remainder = &self.buffer[self.cursor..];
                 // The slice BufRead implementation uses the standard library's
@@ -50,6 +53,7 @@ impl Scanner {
                 self.reader.read_range(self.fetched, count).await,
                 "scan session history",
             )?;
+            self.policy.check(0)?;
             if self.buffer.len() != count {
                 return Err(SessionError::storage("short session history scan"));
             }
@@ -116,9 +120,11 @@ impl JsonlSessionStorage {
         length: u64,
         policy: ReadPolicy,
     ) -> SessionResult<Self> {
+        policy.check(0)?;
         let allow_repair = policy.repairs();
         let strict = policy.strict();
         let mut scan = Scanner::new(reader.clone(), length);
+        scan.policy = policy;
         let Some((_, header_raw, _, header_newline)) = scan.next().await? else {
             return Err(invalid_file(path, 1, &"is missing a header"));
         };
@@ -156,6 +162,7 @@ impl JsonlSessionStorage {
         let mut line_no = 1;
         while let Some((offset, raw, last, newline)) = scan.next().await? {
             line_no += 1;
+            policy.check((line_no - 1) as usize)?;
             terminated = newline;
             if strict && !newline {
                 return Err(SessionError::invalid_entry(
@@ -269,6 +276,7 @@ impl JsonlSessionStorage {
                 storage.legacy_history_digest = Some(scan.hash.finalize().into());
             }
         }
+        policy.check((line_no - 1) as usize)?;
         Ok(storage)
     }
 
