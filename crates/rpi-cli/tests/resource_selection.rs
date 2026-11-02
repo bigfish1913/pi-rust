@@ -1,5 +1,7 @@
 //! Native process acceptance tests with automatically built isolated cdylibs.
 //! No external model, installed extensions, or user resources are used.
+#[path = "support/local_resources.rs"]
+mod local_resources;
 #[path = "support/resource_fixture.rs"]
 mod resource_fixture;
 #[path = "support/resource_lifecycle.rs"]

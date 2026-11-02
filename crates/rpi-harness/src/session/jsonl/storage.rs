@@ -83,8 +83,8 @@ use crate::session::types::{
     TranscriptPageQuery,
 };
 
-/// Read-only native startup facts with no file or storage capabilities.
-/// Values use the ordinary latest-wins SessionValues reducer.
+/// Read-only native facts for startup preflight. No storage/file capability is
+/// retained; values use the ordinary latest-wins SessionValues reducer.
 #[derive(Debug, Clone)]
 pub struct JsonlSessionFacts {
     pub metadata: JsonlSessionMetadata,
@@ -436,6 +436,8 @@ impl JsonlSessionStorage {
                                 record: LaneRecord::AssistantFrame(_),
                             },
                         ) => {
+                            // All replay may stay cold: read_snapshot explicitly
+                            // hydrates into capability-free state before returning.
                             let offset = line.as_ptr() as usize - content.as_ptr() as usize;
                             state.apply_loaded(mutation, reader, offset as u64, line.as_bytes())
                         }
@@ -2402,11 +2404,15 @@ mod tests {
                 if seq == 1 {
                     for value_seq in 2..=3 {
                         text.push_str(&encode_mutation(&SessionMutation::Entry {
-                            seq: value_seq, timestamp: 1, lane: Some("main".into()),
+                            seq: value_seq,
+                            timestamp: 1,
+                            lane: Some("main".into()),
                             entry: Entry::Custom(crate::session::types::CustomEntry {
                                 base: crate::session::types::EntryBase {
-                                    entry_type: "custom".into(), id: format!("value-{value_seq}"), seq: value_seq,
-                                    parent_id: if value_seq == 3 { Some("value-2".into()) } else { None }, timestamp: 1,
+                                    entry_type: "custom".into(),
+                                    id: format!("value-{value_seq}"), seq: value_seq,
+                                    parent_id: if value_seq == 3 { Some("value-2".into()) } else { None },
+                                    timestamp: 1,
                                 },
                                 custom_type: crate::session::values::VALUE_CUSTOM_TYPE.into(),
                                 data: Some(serde_json::json!({"key":"rpi.resource-selection.v1","value":value_seq})),
@@ -2449,6 +2455,8 @@ mod tests {
                 facts.values.get("rpi.resource-selection.v1"),
                 Some(&serde_json::json!(3))
             );
+            // Inspect the same production replay policy: only CommitStream is
+            // hot, while the historical Append remains a cold location.
             let loaded = JsonlSessionStorage::load_impl(
                 fs,
                 path.to_str().unwrap(),
@@ -2459,7 +2467,6 @@ mod tests {
             )
             .await
             .unwrap();
-            // Only CommitStream is hot; historical Append stays a cold location.
             assert_eq!(
                 loaded
                     .state
@@ -2480,7 +2487,7 @@ mod tests {
             );
             assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
             assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
-            // Facts never hydrate the now-invalid cold row.
+            // Facts extraction must not hydrate the now-invalid cold row.
             std::fs::write(
                 &path,
                 text.replacen("cold historical payload", "changed frame payload!!", 1),
@@ -2490,6 +2497,8 @@ mod tests {
             assert!(loaded.find_records(&RecordQuery::default()).await.is_err());
             drop(loaded);
             std::fs::remove_file(&path).unwrap();
+            // The pure DTO remains usable after every storage/file owner and
+            // the source itself are gone; it has no lazy payload capability.
             assert_eq!(
                 facts.values.get("rpi.resource-selection.v1"),
                 Some(&serde_json::json!(3))
@@ -2524,13 +2533,13 @@ mod tests {
             fs.write_file("/s.jsonl", FileContent::Text(damaged.clone()), None)
                 .await
                 .unwrap();
-            let paths = |files: Vec<rpi_tools::env::FileInfo>| {
+            let file_paths = |files: Vec<rpi_tools::env::FileInfo>| {
                 files
                     .into_iter()
                     .map(|file| file.path)
                     .collect::<std::collections::BTreeSet<_>>()
             };
-            let files_before = paths(fs.list_dir("/", None).await.unwrap());
+            let files_before = file_paths(fs.list_dir("/", None).await.unwrap());
             let progress_before = fs
                 .read_text_file("/s.jsonl.progress.jsonl", None)
                 .await
@@ -2557,7 +2566,10 @@ mod tests {
             )
             .await
             .is_err());
-            assert_eq!(paths(fs.list_dir("/", None).await.unwrap()), files_before);
+            assert_eq!(
+                file_paths(fs.list_dir("/", None).await.unwrap()),
+                files_before
+            );
             assert_eq!(
                 fs.read_text_file("/s.jsonl.progress.jsonl", None)
                     .await

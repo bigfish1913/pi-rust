@@ -53,6 +53,11 @@ pub struct ResourceSelection {
 #[serde(deny_unknown_fields)]
 pub struct MainPackage {
     pub name: String,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::resource_management::Scope::is_project"
+    )]
+    pub scope: crate::resource_management::Scope,
     /// Explicit package-relative persistent instruction files. Prompts are never auto-executed.
     #[serde(default)]
     pub instructions: Vec<PathBuf>,
@@ -69,9 +74,9 @@ pub enum ToolSelection {
 #[derive(Debug, Clone, Serialize)]
 pub struct ResolvedPackage {
     pub name: String,
-    pub version: String,
+    pub version: Option<String>,
     pub source: String,
-    pub cargo_package: String,
+    pub cargo_package: Option<String>,
     pub root: PathBuf,
 }
 
@@ -223,9 +228,10 @@ impl ResolvedSelection {
         let mut instructions = Vec::new();
         let mut resolved_package = None;
         if let Some(main) = &selection.main_package {
-            let package = crate::packages::selected_project_package(cwd, &main.name)?;
+            let native_root = main.scope.root(cwd)?;
+            let package = crate::packages::selected_package_at(&native_root, &main.name)?;
             let packages_root =
-                std::fs::canonicalize(cwd.join(".rpi/packages")).map_err(|e| e.to_string())?;
+                std::fs::canonicalize(native_root.join("packages")).map_err(|e| e.to_string())?;
             let root = std::fs::canonicalize(packages_root.join(&main.name))
                 .map_err(|e| format!("missing package directory: {e}"))?;
             if !root.is_dir() || !root.starts_with(&packages_root) || root == packages_root {
@@ -251,9 +257,17 @@ impl ResolvedSelection {
             }
             resolved_package = Some(ResolvedPackage {
                 name: package.name,
-                version: package.version,
+                version: if package.version.is_empty() {
+                    None
+                } else {
+                    Some(package.version)
+                },
                 source: package.source,
-                cargo_package: package.cargo_package,
+                cargo_package: if package.cargo_package.is_empty() {
+                    None
+                } else {
+                    Some(package.cargo_package)
+                },
                 root,
             });
         }

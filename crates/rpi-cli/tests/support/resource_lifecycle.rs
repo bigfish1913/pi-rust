@@ -110,7 +110,10 @@ async fn rejected_reopen_never_registers_native_code_and_public_apis_cannot_eras
     host.stop().await;
     let transcript = session_files(root)
         .into_keys()
-        .find(|p| p.extension().is_some_and(|e| e == "jsonl"))
+        .find(|p| {
+            p.extension().is_some_and(|e| e == "jsonl")
+                && !p.to_string_lossy().ends_with(".progress.jsonl")
+        })
         .unwrap();
     let original = std::fs::read_to_string(&transcript).unwrap();
     put(&transcript, format!("{original}{{unacknowledged tail"));
@@ -398,7 +401,10 @@ async fn legacy_torn_tail_still_recovers_on_accepted_restore() {
     host.stop().await;
     let path = session_files(root)
         .into_keys()
-        .find(|p| p.extension().is_some_and(|e| e == "jsonl"))
+        .find(|p| {
+            p.extension().is_some_and(|e| e == "jsonl")
+                && !p.to_string_lossy().ends_with(".progress.jsonl")
+        })
         .unwrap();
     let valid = std::fs::read_to_string(&path).unwrap();
     put(&path, format!("{valid}{{legacy torn"));

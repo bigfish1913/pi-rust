@@ -36,9 +36,12 @@ not a new executable package format or an installation manager.
   instructions, and Skills are UTF-8 text. Config and each persistent instruction
   are limited to 64 KiB, read with a bounded reader. Exact-mode registry input is
   limited to 256 KiB using a bounded reader too.
-* `main_package.name` resolves exactly against `<cwd>/.rpi/packages.json`.
+* `main_package.name` resolves exactly against `<cwd>/.rpi/packages.json`
+  by default. Stage B adds optional `main_package.scope`: `"project"` (the
+  backward-compatible default) or `"global"` (the native agent directory's
+  `packages.json`). There is no cross-scope fallback, even when names collide.
   A missing or duplicate registry entry is an error. Existing package layout is
-  retained: `.rpi/packages/<name>/skills` supplies Skills, and the registry's
+  retained under the chosen scope: `packages/<name>/skills` supplies Skills, and the registry's
   `artifacts` entries name files under that Package's `extensions` directory.
   Only those registered artifacts load; unregistered DLLs beside them do not.
   A resource-only Package with no native artifacts is supported. `.` and `..`
@@ -145,6 +148,14 @@ changing the existing exact selection, even if a caller modifies reload args.
 
 ## Read-only observation and readiness
 
+Catalog, exact selection validation and persisted-session fact readers remain
+non-repairing readers. Native host **startup orchestration** additionally acquires
+Stage B's project/global resource leases before resource validation or code
+loading. This can create native roots and `.resource-lease` files even for an
+empty exact selection or `--no-extensions`; starting a host therefore requires
+writable native roots. It does not repair or rewrite a rejected session. See the
+[management contract](local-resource-management.md) for exclusion and recovery.
+
 Ready includes the normal native RPC capabilities and:
 
 ```json
@@ -157,7 +168,9 @@ Ready includes the normal native RPC capabilities and:
     "changes": "restart-required",
     "setActiveTools": "unsupported",
     "automaticPersistenceRecovery": false,
-    "hotApply": false
+    "hotApply": false,
+    "packageScopes": ["project", "global"],
+    "defaultPackageScope": "project"
   }
 }
 ```
@@ -209,8 +222,11 @@ registrations, and reopening an exact session without its config error instead
 of widening. A legacy transcript may be explicitly bound to exact selection;
 subsequent launches must honor it. After binding, resource changes require a new
 session. Before any native extension registration or provider callback, startup
-preflights the frozen declaration and artifact hashes through a **nonrepairing
-in-memory snapshot** of the canonical native parser/reducer. Preflight never
+preflights the frozen declaration and artifact hashes through **nonrepairing
+metadata/SessionValues facts** from the canonical native parser/reducer. Historical
+assistant frames stay cold on filesystems with stable readers; the returned DTO
+retains no disk storage or file capability. The separate explicit `read_snapshot`
+API eagerly detaches the full historical state when a caller needs it. Preflight never
 claims a writer, creates session/lock files, or changes transcript bytes, even
 with a recoverable torn tail or duplicate sequence. Accepted normal opens retain
 native recovery under the existing writer lock (including legacy torn tails).
@@ -246,9 +262,11 @@ cargo test -p rpi-harness --lib agent_harness::child::tests --locked
 
 The native-process tests automatically build the real workspace `plugin-stub`
 against the workspace SDK using `cargo build --lib --locked --offline` (never
-recursive tests). Each build owns fresh isolated temporary target **and Cargo
-build/intermediate directories**, disables incremental output, has a 120-second /
-2-MiB output bound, and cleans up after native hosts exit.
+recursive tests). Builds honor explicit `CARGO_TARGET_DIR` and
+`CARGO_BUILD_BUILD_DIR` caches (otherwise fixture-owned directories), disable
+incremental output, and have a 120-second / 2-MiB output bound. Each fixture owns
+a fresh isolated DLL copy, cleaned up after native hosts exit; tests sharing a
+Cargo cache must not run concurrent Cargo runners.
 There is no prebuilt/stale-DLL fallback or silent skip; concurrent test processes
 cannot share loaded DLL paths. A build-only source/SDK digest in the real
 registration side effect proves the fixture came from current source. Ordinary

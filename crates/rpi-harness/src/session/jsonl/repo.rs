@@ -298,7 +298,7 @@ impl JsonlSessionRepo {
     pub async fn read_facts_by_jsonl_metadata(
         &self,
         metadata: &JsonlSessionMetadata,
-    ) -> SessionResult<super::storage::JsonlSessionFacts> {
+    ) -> SessionResult<super::JsonlSessionFacts> {
         let facts = JsonlSessionStorage::read_facts(
             self.fs.clone(),
             &metadata.path,

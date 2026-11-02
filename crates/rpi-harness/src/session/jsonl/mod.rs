@@ -21,7 +21,7 @@ pub use codec::{
 };
 pub use errors::{file_result, invalid_file, JsonlDecodeError, JsonlDecodeErrorKind};
 pub use repo::JsonlSessionRepo;
-pub use storage::JsonlSessionStorage;
+pub use storage::{JsonlSessionFacts, JsonlSessionStorage};
 pub use types::{
     HeaderKind, JsonlSessionCreateOptions, JsonlSessionListOptions, JsonlSessionMetadata,
     JsonlSessionRepoOptions, JsonlSourceFormat, JsonlV4Header,
