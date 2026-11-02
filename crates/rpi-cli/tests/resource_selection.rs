@@ -6,6 +6,8 @@ mod local_resources;
 mod resource_binding_corruption;
 #[path = "support/resource_fixture.rs"]
 mod resource_fixture;
+#[path = "support/resource_fork.rs"]
+mod resource_fork;
 #[path = "support/resource_lifecycle.rs"]
 mod resource_lifecycle;
 #[path = "support/resource_transition.rs"]
