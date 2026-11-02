@@ -13,6 +13,7 @@ const RELEASE_CRATES: &[(&str, &str)] = &[
     ("rpi-plugin-sdk", "crates/rpi-plugin-sdk/Cargo.toml"),
     ("rpi-extensions", "crates/rpi-extensions/Cargo.toml"),
     ("rpi-tools", "crates/rpi-tools/Cargo.toml"),
+    ("rpi-durable", "crates/rpi-durable/Cargo.toml"),
     ("rpi-harness", "crates/rpi-harness/Cargo.toml"),
     ("rpi-tui", "crates/rpi-tui/Cargo.toml"),
     ("rpi-cli", "crates/rpi-cli/Cargo.toml"),
@@ -26,6 +27,7 @@ const INTERNAL_DEPENDENCIES: &[&str] = &[
     "rpi-plugin-sdk",
     "rpi-extensions",
     "rpi-tools",
+    "rpi-durable",
     "rpi-harness",
     "rpi-tui",
 ];

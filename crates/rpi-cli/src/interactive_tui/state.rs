@@ -155,6 +155,7 @@ pub(super) fn auto_send_step(
 }
 
 pub(super) struct TuiState {
+    pub(super) history_page: history::HistoryUi,
     /// The root selected at startup, retained across session switches/reloads.
     pub(super) session_dir: std::path::PathBuf,
     /// The in-flight streaming assistant message (cleared on finalize).
@@ -1509,6 +1510,10 @@ impl TuiState {
         {
             previous.cancel();
         }
+        self.history_page.invalidate();
+        if self.history_page.is_bound() && self.history_page.is_latest() {
+            self.history_page.mount_active(&self.chat_container);
+        }
         cancellation
     }
 
@@ -1612,6 +1617,12 @@ impl TuiState {
 
     pub(super) fn set_status(&self, status: RunStatus) {
         *self.status.lock().unwrap() = status;
+        if status == RunStatus::Working {
+            self.history_page.invalidate();
+            if self.history_page.is_bound() && self.history_page.is_latest() {
+                self.history_page.mount_active(&self.chat_container);
+            }
+        }
         self.apply_status(status);
     }
 
@@ -1680,6 +1691,10 @@ impl TuiState {
         }
         *status = RunStatus::Working;
         drop(status);
+        self.history_page.invalidate();
+        if self.history_page.is_bound() && self.history_page.is_latest() {
+            self.history_page.mount_active(&self.chat_container);
+        }
         self.apply_status(RunStatus::Working);
         true
     }
@@ -1961,6 +1976,7 @@ impl TuiState {
     /// container: the footer's accumulated usage/context badge, the `/copy`
     /// cache, and the tool/bash component maps keyed by `tool_call_id`.
     pub(super) fn reset_session_state(&self) {
+        self.history_page.reset();
         self.footer.reset_session_counters();
         *self.last_assistant_text.lock().unwrap() = String::new();
         self.current_assistant.lock().unwrap().take();
@@ -1989,7 +2005,24 @@ impl TuiState {
     pub(super) fn toggle_tool_outputs(&self) -> bool {
         let next = !*self.tool_outputs_expanded.lock().unwrap();
         self.transcript_view().set_expanded(next);
+        self.apply_history_tool_expansion(&self.chat_container);
         next
+    }
+
+    pub(super) fn apply_history_tool_expansion(&self, root: &Container) {
+        let expanded = *self.tool_outputs_expanded.lock().unwrap();
+        let mut pending = root.get_children();
+        while let Some(child) = pending.pop() {
+            if let Some(container) = child.as_any().downcast_ref::<Container>() {
+                pending.extend(container.get_children());
+            }
+            if let Some(tool) = child.as_any().downcast_ref::<ToolExecutionComponent>() {
+                tool.set_expanded(expanded);
+            }
+            if let Some(bash) = child.as_any().downcast_ref::<BashExecutionComponent>() {
+                bash.set_expanded(expanded);
+            }
+        }
     }
 
     /// The model id currently tracked as active (footer + Ctrl+P anchor).
@@ -2024,8 +2057,14 @@ impl TuiState {
     ///
     /// [`TranscriptView`]: crate::transcript_view::TranscriptView
     pub(super) fn transcript_view(&self) -> crate::transcript_view::TranscriptView {
+        // Hosts/tests without a managed history binding keep the original flat view.
+        let managed = self.history_page.is_bound();
         crate::transcript_view::TranscriptView::with_maps(
-            self.chat_container.clone(),
+            if managed {
+                self.history_page.active.clone()
+            } else {
+                self.chat_container.clone()
+            },
             self.current_assistant.clone(),
             self.tool_components.clone(),
             self.bash_components.clone(),
@@ -2033,6 +2072,11 @@ impl TuiState {
             self.tool_outputs_expanded.clone(),
             self.markdown_transformer.clone(),
         )
+        .with_panels(if managed {
+            self.history_page.panels.clone()
+        } else {
+            self.chat_container.clone()
+        })
         .with_show_images(self.images_visible())
     }
 
@@ -2070,7 +2114,13 @@ impl TuiState {
 
     pub(super) fn set_show_images(&self, show: bool) {
         *self.show_images.lock().unwrap() = show;
-        for child in self.chat_container.get_children() {
+        let mut pending = self.chat_container.get_children();
+        // The live slot can be detached while an older page is visible.
+        pending.extend(self.history_page.active.get_children());
+        while let Some(child) = pending.pop() {
+            if let Some(container) = child.as_any().downcast_ref::<Container>() {
+                pending.extend(container.get_children());
+            }
             if let Some(image) = child.as_any().downcast_ref::<Image>() {
                 image.set_inline_visible(show);
             }

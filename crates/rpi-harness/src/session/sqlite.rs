@@ -359,6 +359,16 @@ impl SqliteSessionRepo {
             .map_err(|e| SessionError::storage(format!("open SQLite database: {e}")))?;
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|e| SessionError::storage(format!("configure SQLite busy timeout: {e}")))?;
+        // Reject native experimental artifacts BEFORE WAL/schema initialization.
+        // Compiled unconditionally: feature-off legacy writers must reject too.
+        let application_id: i64 = conn
+            .query_row("PRAGMA application_id", [], |row| row.get(0))
+            .map_err(|e| SessionError::storage(format!("read SQLite format identity: {e}")))?;
+        if matches!(application_id, 0x5250494e | 0x5250494f | 0x52504951) {
+            return Err(SessionError::storage(
+                "experimental native artifact cannot be opened by the legacy SQLite writer",
+            ));
+        }
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              CREATE TABLE IF NOT EXISTS sessions (

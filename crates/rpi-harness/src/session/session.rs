@@ -24,9 +24,10 @@ use rpi_agent::message::AgentMessage;
 
 use crate::error::{SessionError, SessionErrorCode, SessionResult};
 use crate::session::types::{
-    BranchBounds, Entry, EntryQuery, IdGenerator, JsonValue, LanePointer, LaneRecord, LogItem,
-    LogOptions, OperationStartedRecord, ProvisionedEntry, ProvisionedKind, RecordQuery,
-    SessionMetadata, SessionStats, SessionStorage, SessionTree,
+    BranchBounds, BranchEntryPage, BranchEntryPageQuery, BranchOverview, Entry, EntryQuery,
+    IdGenerator, JsonValue, LanePointer, LaneRecord, LogItem, LogOptions, OperationStartedRecord,
+    ProvisionedEntry, ProvisionedKind, RecordQuery, SessionMetadata, SessionStats, SessionStorage,
+    SessionTree,
 };
 
 static AGENT_DIAGNOSTICS: OnceLock<bool> = OnceLock::new();
@@ -195,6 +196,32 @@ impl Session {
         }
     }
 
+    /// Read a complete-entry page from one backing-storage binding.
+    pub async fn branch_entry_page(
+        &self,
+        query: &BranchEntryPageQuery,
+    ) -> SessionResult<BranchEntryPage> {
+        self.branch_entry_page_for_lane("main", query).await
+    }
+
+    pub async fn branch_entry_page_for_lane(
+        &self,
+        lane: &str,
+        query: &BranchEntryPageQuery,
+    ) -> SessionResult<BranchEntryPage> {
+        let storage = self.storage_arc();
+        storage.branch_entry_page(lane, query).await
+    }
+
+    pub async fn branch_overview(&self) -> SessionResult<BranchOverview> {
+        self.branch_overview_for_lane("main").await
+    }
+
+    pub async fn branch_overview_for_lane(&self, lane: &str) -> SessionResult<BranchOverview> {
+        let storage = self.storage_arc();
+        storage.branch_overview(lane).await
+    }
+
     /// Atomically swap the backing storage (TUI `/session` hot-switch). The
     /// facade shares its binding, so every existing `Session` clone — the
     /// harness's field, lane handles, the config snapshot — observes the new
@@ -310,6 +337,13 @@ impl Session {
     /// `getEntry(id)`. Mirrors TS `Session.getEntry`.
     pub async fn get_entry(&self, id: &str) -> SessionResult<Option<Entry>> {
         self.storage_arc().get_entry(id).await
+    }
+
+    /// Estimate the main lane's default context, if supported by storage.
+    pub async fn context_usage(
+        &self,
+    ) -> SessionResult<Option<crate::compaction::ContextUsageEstimate>> {
+        self.storage_arc().context_usage("main").await
     }
 
     /// `getStats()`. Mirrors TS `Session.getStats`.
@@ -915,6 +949,27 @@ fn entry_id(entry: &Entry) -> String {
 
 #[async_trait]
 impl SessionTree for Session {
+    async fn context_usage(
+        &self,
+    ) -> SessionResult<Option<crate::compaction::ContextUsageEstimate>> {
+        Session::context_usage(self).await
+    }
+
+    async fn branch_entry_page(
+        &self,
+        query: &BranchEntryPageQuery,
+    ) -> SessionResult<BranchEntryPage> {
+        Session::branch_entry_page(self, query).await
+    }
+    async fn branch_overview(&self) -> SessionResult<BranchOverview> {
+        Session::branch_overview(self).await
+    }
+    async fn transcript_page(
+        &self,
+        query: &crate::session::types::TranscriptPageQuery,
+    ) -> SessionResult<Option<crate::session::types::TranscriptPage>> {
+        self.storage_arc().transcript_page("main", query).await
+    }
     async fn message_summaries(
         &self,
         query: &crate::session::types::MessageSummaryQuery,
@@ -999,6 +1054,32 @@ pub struct LaneView {
 
 #[async_trait]
 impl SessionTree for LaneView {
+    async fn context_usage(
+        &self,
+    ) -> SessionResult<Option<crate::compaction::ContextUsageEstimate>> {
+        self.session.storage_arc().context_usage(&self.lane).await
+    }
+
+    async fn branch_entry_page(
+        &self,
+        query: &BranchEntryPageQuery,
+    ) -> SessionResult<BranchEntryPage> {
+        self.session
+            .branch_entry_page_for_lane(&self.lane, query)
+            .await
+    }
+    async fn branch_overview(&self) -> SessionResult<BranchOverview> {
+        self.session.branch_overview_for_lane(&self.lane).await
+    }
+    async fn transcript_page(
+        &self,
+        query: &crate::session::types::TranscriptPageQuery,
+    ) -> SessionResult<Option<crate::session::types::TranscriptPage>> {
+        self.session
+            .storage_arc()
+            .transcript_page(&self.lane, query)
+            .await
+    }
     async fn message_summaries(
         &self,
         query: &crate::session::types::MessageSummaryQuery,

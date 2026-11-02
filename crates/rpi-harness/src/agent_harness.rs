@@ -69,9 +69,9 @@ use crate::session::context::{
 };
 use crate::session::session::Session;
 use crate::session::types::{
-    AssistantFrameOp, AssistantFrameRecord, BranchBounds, CompactionReason, Entry, EntryOrder,
-    EntryQuery, JsonValue, LaneRecord, OperationError, OperationFinishedRecord, OperationIntent,
-    OperationOutcome, OperationStartedRecord, ProvisionedEntry, ProvisionedKind,
+    AssistantFrameOp, AssistantFrameRecord, BranchBounds, CompactionReason, Entry, EntryCursor,
+    EntryOrder, EntryQuery, JsonValue, LaneRecord, OperationError, OperationFinishedRecord,
+    OperationIntent, OperationOutcome, OperationStartedRecord, ProvisionedEntry, ProvisionedKind,
     QueueCancelledRecord, QueueEnqueuedRecord, QueueKind, RecordBase, RecordQuery,
     RetryPendingRecord, SessionStats, SessionTree, StepAttemptRecord, StepKind, ToolReplay,
     ToolStartedRecord, UsageCause, UsageRecord, WriteDeferredRecord,
@@ -534,6 +534,11 @@ pub trait AgentLane: Send + Sync {
     async fn set_label(&self, target_id: &str, label: Option<&str>) -> HarnessResult<()>;
     async fn get_stats(&self) -> HarnessResult<SessionStats>;
     async fn snapshot(&self) -> HarnessResult<LaneSnapshot>;
+    /// Lightweight active-operation read. Custom lanes retain their snapshot
+    /// semantics unless they provide an equivalent projection without labels.
+    async fn active_operation(&self) -> HarnessResult<Option<ActiveOperationSnapshot>> {
+        Ok(self.snapshot().await?.active)
+    }
     async fn inspect_execution(
         &self,
         tool_call_id: &str,
@@ -1183,78 +1188,95 @@ impl AgentHarness {
         lane: &str,
         strict: bool,
     ) -> HarnessResult<bool> {
-        // Lane-scoped branch read (the session-wide one is hardcoded to "main").
-        let entries = match session
-            .view(lane)
-            .find_entries_on_branch(
-                &EntryQuery {
-                    order: Some(EntryOrder::OldestFirst),
-                    ..Default::default()
-                },
-                &BranchBounds::default(),
-            )
-            .await
-        {
-            Ok(entries) => entries,
+        // Pin one leaf: a concurrent append/move must not change the branch
+        // between batches. Bound payload hydration even for very long histories.
+        let view = session.view(lane);
+        let leaf = match view.get_leaf_id().await {
+            Ok(Some(leaf)) => leaf,
+            Ok(None) => return Ok(false),
             Err(error) if strict => return Err(session_to_harness_err(error)),
             Err(_) => return Ok(false),
         };
-        let queues = if strict {
-            Self::queued_entry_kinds_checked(session, lane).await?
-        } else {
-            Self::queued_entry_kinds(session, lane).await
+        let bounds = BranchBounds {
+            start: Some(leaf),
+            ..Default::default()
         };
-        for entry in entries.iter().rev() {
-            let message = match entry {
-                Entry::Message(message) => message,
-                Entry::Custom(_) => continue, // extension data is not model input
-                _ => return Ok(false),
+        let mut cursor = None;
+        loop {
+            let entries = match view
+                .find_entries_on_branch(
+                    &EntryQuery {
+                        order: Some(EntryOrder::NewestFirst),
+                        limit: Some(16),
+                        cursor,
+                        ..Default::default()
+                    },
+                    &bounds,
+                )
+                .await
+            {
+                Ok(entries) => entries,
+                Err(error) if strict => return Err(session_to_harness_err(error)),
+                Err(_) => return Ok(false),
             };
-            match queues.get(&message.base.id) {
-                Some(QueueKind::Steer | QueueKind::FollowUp) => return Ok(true),
-                // A silent context update doesn't request a reply. Look behind
-                // it to see whether the interrupted tool batch still did.
-                Some(QueueKind::Context) => continue,
-                _ => {
-                    return Ok(matches!(message.message, AgentMessage::ToolResult(_))
-                        && message.terminate != Some(true))
+            let Some(last) = entries.last() else {
+                return Ok(false);
+            };
+            cursor = Some(EntryCursor {
+                after_seq: last.base().seq,
+            });
+            for entry in &entries {
+                let message = match entry {
+                    Entry::Message(message) => message,
+                    Entry::Custom(_) => continue, // extension data is not model input
+                    _ => return Ok(false),
+                };
+                let queue = Self::queued_entry_kind_checked(session, lane, &message.base.id).await;
+                let queue = if strict {
+                    queue?
+                } else {
+                    queue.unwrap_or(None)
+                };
+                match queue {
+                    Some(QueueKind::Steer | QueueKind::FollowUp) => return Ok(true),
+                    // A silent context update doesn't request a reply. Keep
+                    // looking, including across a batch boundary.
+                    Some(QueueKind::Context) => continue,
+                    _ => {
+                        return Ok(matches!(message.message, AgentMessage::ToolResult(_))
+                            && message.terminate != Some(true))
+                    }
                 }
             }
         }
-        Ok(false)
     }
 
     /// Recovery uses the accepted delivery mode, not a custom message's role,
     /// to distinguish queued continuations from context-only updates.
-    async fn queued_entry_kinds(session: &Session, lane: &str) -> BTreeMap<String, QueueKind> {
-        Self::queued_entry_kinds_checked(session, lane)
-            .await
-            .unwrap_or_default()
-    }
-
-    async fn queued_entry_kinds_checked(
+    async fn queued_entry_kind_checked(
         session: &Session,
         lane: &str,
-    ) -> HarnessResult<BTreeMap<String, QueueKind>> {
+        entry_id: &str,
+    ) -> HarnessResult<Option<QueueKind>> {
+        // The old newest-first scan collected into a map, so duplicate target
+        // ids were overwritten by the OLDEST enqueue. Preserve that behavior,
+        // filtering before copying payloads and returning at most one record.
         Ok(session
             .find_records(&RecordQuery {
                 lane: Some(lane.to_string()),
                 record_type: Some("queue_enqueued"),
+                target_entry_id: Some(entry_id.to_string()),
+                order: Some(EntryOrder::OldestFirst),
+                limit: Some(1),
                 ..Default::default()
             })
             .await
             .map_err(session_to_harness_err)?
             .into_iter()
-            .filter_map(|record| {
-                let LaneRecord::QueueEnqueued(record) = record else {
-                    return None;
-                };
-                Some((
-                    Self::target_entry_id(&record.target)?.to_string(),
-                    record.queue,
-                ))
-            })
-            .collect())
+            .find_map(|record| match record {
+                LaneRecord::QueueEnqueued(record) => Some(record.queue),
+                _ => None,
+            }))
     }
 
     /// The resume chain a run belongs to: `(origin run id, resumes so far)`.
@@ -1586,6 +1608,29 @@ impl AgentHarness {
     ) -> HarnessResult<Vec<Entry>> {
         self.view()
             .find_entries_on_branch(query, bounds)
+            .await
+            .map_err(session_to_harness_err)
+    }
+
+    /// Optional storage-selected transcript page. `None` asks the caller to
+    /// use its legacy projection; storage errors must not trigger that fallback.
+    pub async fn transcript_page(
+        &self,
+        query: &crate::session::types::TranscriptPageQuery,
+    ) -> HarnessResult<Option<crate::session::types::TranscriptPage>> {
+        self.view()
+            .transcript_page(query)
+            .await
+            .map_err(session_to_harness_err)
+    }
+
+    /// Optional bounded, hook-free context token estimate. Unsupported storage
+    /// returns `None`; actual errors must not trigger a full-body fallback.
+    pub async fn context_usage(
+        &self,
+    ) -> HarnessResult<Option<crate::compaction::ContextUsageEstimate>> {
+        self.view()
+            .context_usage()
             .await
             .map_err(session_to_harness_err)
     }
@@ -3006,48 +3051,28 @@ impl AgentHarness {
         session: &Session,
         lane: &str,
     ) -> HarnessResult<Vec<(QueueKind, QueuedMessage)>> {
-        // Queue reconstruction must not materialize unrelated legacy frames.
-        let mut records = Vec::new();
-        for record_type in ["queue_enqueued", "queue_cancelled"] {
-            records.extend(
-                session
-                    .find_records(&RecordQuery {
-                        lane: Some(lane.to_string()),
-                        record_type: Some(record_type),
-                        order: Some(EntryOrder::OldestFirst),
-                        ..Default::default()
-                    })
-                    .await
-                    .map_err(session_to_harness_err)?,
-            );
-        }
-        records.sort_unstable_by_key(LaneRecord::seq);
-        let mut cancelled: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        let mut pending: Vec<QueueEnqueuedRecord> = Vec::new();
-        for record in records {
-            match record {
-                LaneRecord::QueueEnqueued(enqueued) => pending.push(enqueued),
-                LaneRecord::QueueCancelled(cancelled_record) => {
-                    cancelled.insert(cancelled_record.entry_id);
-                }
-                _ => {}
-            }
-        }
+        let diagnostics = crate::session::diagnostics::RecoveryPhase::start("queue_rebuild");
+        // Filter before cloning payloads. A single backend read also avoids
+        // merging enqueue/cancel snapshots from different points in time.
+        let records = session
+            .find_records(&RecordQuery {
+                lane: Some(lane.to_string()),
+                record_type: Some("queue_enqueued"),
+                pending_queue_only: true,
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            })
+            .await
+            .map_err(session_to_harness_err)?;
+        let selected = records.len();
         let mut rebuilt = Vec::new();
-        for enqueued in pending {
+        for record in records {
+            let LaneRecord::QueueEnqueued(enqueued) = record else {
+                continue;
+            };
             let Some(entry_id) = Self::target_entry_id(&enqueued.target) else {
                 continue;
             };
-            if cancelled.contains(entry_id)
-                || session
-                    .view(lane)
-                    .get_entry(entry_id)
-                    .await
-                    .map_err(session_to_harness_err)?
-                    .is_some()
-            {
-                continue;
-            }
             let Some(message) = Self::message_from_target(&enqueued.target) else {
                 continue;
             };
@@ -3060,6 +3085,7 @@ impl AgentHarness {
                 },
             ));
         }
+        diagnostics.finish(selected, rebuilt.len());
         Ok(rebuilt)
     }
 
@@ -3303,10 +3329,10 @@ impl AgentHarness {
             return false;
         };
         matches!(message.message, AgentMessage::User(_))
-            && Self::queued_entry_kinds(session, lane)
+            && Self::queued_entry_kind_checked(session, lane, &message.base.id)
                 .await
-                .get(&message.base.id)
-                != Some(&QueueKind::Context)
+                .unwrap_or(None)
+                != Some(QueueKind::Context)
     }
 
     /// Whether the branch tip is an assistant message.
@@ -5793,6 +5819,16 @@ impl AgentLane for AgentHarness {
         AgentHarness::snapshot(self).await
     }
 
+    async fn active_operation(&self) -> HarnessResult<Option<ActiveOperationSnapshot>> {
+        // Retain snapshot's authoritative lane/storage validation without
+        // computing its best-effort labels, name, or statistics.
+        self.view()
+            .get_leaf_id()
+            .await
+            .map_err(session_to_harness_err)?;
+        Ok(self.active_operation_snapshot())
+    }
+
     async fn inspect_execution(
         &self,
         tool_call_id: &str,
@@ -6169,6 +6205,14 @@ impl AgentLane for LaneHandle {
         self.runner().snapshot().await
     }
 
+    async fn active_operation(&self) -> HarnessResult<Option<ActiveOperationSnapshot>> {
+        self.view
+            .get_leaf_id()
+            .await
+            .map_err(session_to_harness_err)?;
+        Ok(self.runner().active_operation_snapshot())
+    }
+
     async fn inspect_execution(
         &self,
         tool_call_id: &str,
@@ -6200,6 +6244,9 @@ impl AgentLane for LaneHandle {
 #[cfg(test)]
 #[path = "agent_harness/image_normalization_tests.rs"]
 mod image_normalization_tests;
+
+#[cfg(test)]
+mod resumable_probe_tests;
 
 #[cfg(test)]
 mod queue_tests {
@@ -6368,6 +6415,39 @@ mod session_switch_tests {
     use crate::session::types::SessionMetadata;
     use rpi_ai::{Api, Model};
     use rpi_tools::{FileSystem, OsExecutionEnv};
+
+    #[tokio::test]
+    async fn lightweight_active_operation_matches_snapshot_for_every_kind_and_after_release() {
+        let harness = AgentHarness::create(opts()).await.unwrap();
+        let lane = harness.lane("main");
+        assert!(harness.lane("missing").snapshot().await.is_err());
+        assert!(harness.lane("missing").active_operation().await.is_err());
+        for kind in [
+            OperationKind::Run,
+            OperationKind::Compaction,
+            OperationKind::Navigation,
+        ] {
+            let (run_id, _, _) = harness.acquire_run(kind).await.unwrap();
+            let expected = harness.snapshot().await.unwrap().active.unwrap();
+            for actual in [
+                AgentLane::active_operation(&harness)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                lane.active_operation().await.unwrap().unwrap(),
+            ] {
+                assert_eq!(actual.run_id, expected.run_id);
+                assert_eq!(actual.lane, expected.lane);
+                assert_eq!(actual.kind, expected.kind);
+            }
+            harness.release_run(&run_id);
+            assert!(AgentLane::active_operation(&harness)
+                .await
+                .unwrap()
+                .is_none());
+            assert!(lane.active_operation().await.unwrap().is_none());
+        }
+    }
 
     fn opts() -> AgentHarnessOptions {
         AgentHarnessOptions {

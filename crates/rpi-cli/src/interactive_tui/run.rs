@@ -228,7 +228,12 @@ pub(super) async fn run_prompt_streaming(
     refresh_pending_messages(state, lane).await;
     // The blocking path has no drain task, so `AgentEnd` never runs and this is
     // the only place its write failures can surface.
-    super::events::report_write_failures(&state.chat_container, lane);
+    if super::events::report_write_failures(&state.chat_container, lane) {
+        state
+            .history_page
+            .unsaved
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
 
     // Footer repair for a dropped `MessageEnd` used to live here, but that call
     // raced the drain: the final assistant message can already be in the log
@@ -297,11 +302,7 @@ pub(super) async fn run_prompt_streaming(
                 if !streaming {
                     let text = assistant_text(final_message);
                     if !text.is_empty() {
-                        add_assistant_message_blocking(
-                            &state.chat_container,
-                            &text,
-                            state.markdown_transformer(),
-                        );
+                        add_assistant_message_for_state(state, &text);
                         *state.last_assistant_text.lock().unwrap() = text;
                     }
                 }
@@ -311,6 +312,10 @@ pub(super) async fn run_prompt_streaming(
             // A refused session write is not a provider problem: retrying will fail
             // the same way, and the transcript on screen is the only copy left.
             if e.tag() == rpi_harness::result::HarnessErrorTag::SessionStorage {
+                state
+                    .history_page
+                    .unsaved
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 add_error_message(&state.chat_container, &tui_session_storage_notice(&e));
             } else {
                 add_error_message(&state.chat_container, &e.to_string());
@@ -318,6 +323,9 @@ pub(super) async fn run_prompt_streaming(
         }
     }
 
+    if !streaming {
+        history::settle(state, tui);
+    }
     tui.request_render(false);
 }
 
@@ -362,11 +370,7 @@ pub(super) async fn run_skill_streaming(
                 if !streaming {
                     let text = assistant_text(&final_message);
                     if !text.is_empty() {
-                        add_assistant_message_blocking(
-                            &state.chat_container,
-                            &text,
-                            state.markdown_transformer(),
-                        );
+                        add_assistant_message_for_state(state, &text);
                         *state.last_assistant_text.lock().unwrap() = text;
                     }
                 }
@@ -396,6 +400,9 @@ pub(super) async fn run_skill_streaming(
         },
         Err(error) => add_error_message(&state.chat_container, &error.to_string()),
     }
+    if !streaming {
+        history::settle(state, tui);
+    }
     tui.request_render(false);
 }
 
@@ -422,6 +429,7 @@ pub(super) async fn run_compact(
         }
     }
     state.set_status(RunStatus::Idle);
+    history::settle(state, tui);
     tui.request_render(false);
 }
 
@@ -807,6 +815,17 @@ pub(super) fn add_image_preview(
 #[cfg(any(not(feature = "clipboard"), target_os = "android"))]
 pub(super) fn read_clipboard_image() -> Result<Option<rpi_ai::types::ImageContent>, String> {
     Ok(None)
+}
+
+/// Keep the non-streaming fallback in the same live slot as streaming output.
+/// In particular, running a prompt while browsing an old page must not mutate it.
+pub(super) fn add_assistant_message_for_state(state: &TuiState, text: &str) {
+    let container = if state.history_page.is_bound() {
+        &state.history_page.active
+    } else {
+        &state.chat_container
+    };
+    add_assistant_message_blocking(container, text, state.markdown_transformer());
 }
 
 /// Blocking fallback (no `event_rx`): render the final assistant text as a

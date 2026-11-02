@@ -7,16 +7,33 @@ const FORMAT: &str = "indexed-session-v1";
 
 impl Serialize for SessionState {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("SessionState", 9)?;
+        let mut state = serializer.serialize_struct("SessionState", 10)?;
         state.serialize_field("format", FORMAT)?;
-        state.serialize_field("sequence", &self.sequence)?;
-        state.serialize_field("entries", &self.entries)?;
-        state.serialize_field("records", &self.records)?;
-        state.serialize_field("lanes", &self.lanes)?;
-        state.serialize_field("log", &self.log)?;
-        state.serialize_field("stats", &self.stats)?;
-        state.serialize_field("name", &self.name)?;
-        state.serialize_field("labels", &self.labels)?;
+        state.serialize_field("sequence", &self.index.sequence)?;
+        state.serialize_field("entries", &self.index.entries)?;
+        state.serialize_field("records", &self.index.records)?;
+        state.serialize_field("lanes", &self.index.lanes)?;
+        state.serialize_field("log", &self.index.log)?;
+        state.serialize_field("stats", &self.index.stats)?;
+        state.serialize_field("name", &self.index.name)?;
+        state.serialize_field("labels", &self.index.labels)?;
+        // Retired frame bodies are gone, but their IDs must remain taken after
+        // every SQLite snapshot refresh, not only during JSONL replay.
+        let live_ids: std::collections::HashSet<_> = self
+            .index
+            .entries
+            .iter()
+            .map(Entry::id)
+            .chain(self.index.records.iter().map(LaneRecord::id))
+            .collect();
+        let mut reserved_ids: Vec<_> = self
+            .index
+            .used_ids
+            .iter()
+            .filter(|id| !live_ids.contains(id.as_str()))
+            .collect();
+        reserved_ids.sort_unstable();
+        state.serialize_field("reserved_ids", &reserved_ids)?;
         state.end()
     }
 }
@@ -32,6 +49,8 @@ struct Snapshot {
     stats: SessionStats,
     name: Option<String>,
     labels: HashMap<String, String>,
+    #[serde(default)]
+    reserved_ids: Vec<String>,
 }
 
 impl<'de> Deserialize<'de> for SessionState {
@@ -50,7 +69,7 @@ impl<'de> Deserialize<'de> for SessionState {
         if entries_by_id.len() != snapshot.entries.len() {
             return Err(D::Error::custom("duplicate snapshot entry id"));
         }
-        let used_ids: std::collections::HashSet<_> = snapshot
+        let mut used_ids: std::collections::HashSet<_> = snapshot
             .entries
             .iter()
             .map(|entry| entry.id().to_owned())
@@ -58,6 +77,11 @@ impl<'de> Deserialize<'de> for SessionState {
             .collect();
         if used_ids.len() != snapshot.entries.len() + snapshot.records.len() {
             return Err(D::Error::custom("duplicate snapshot payload id"));
+        }
+        for id in snapshot.reserved_ids {
+            if !used_ids.insert(id) {
+                return Err(D::Error::custom("duplicate snapshot reserved id"));
+            }
         }
         let mut last_seq = 0;
         let mut entry_indexes = std::collections::HashSet::new();
@@ -145,20 +169,47 @@ impl<'de> Deserialize<'de> for SessionState {
                 },
             );
         }
-        Ok(Self {
-            nearest_user,
-            sequence: snapshot.sequence,
-            used_ids,
-            entries: snapshot.entries,
-            entries_by_id,
-            records: snapshot.records,
-            open_operations_by_lane,
-            lanes: snapshot.lanes,
-            log: snapshot.log,
-            stats: snapshot.stats,
-            name: snapshot.name,
-            labels: snapshot.labels,
-        })
+        let metadata = snapshot.entries.iter().map(EntryMeta::from_entry).collect();
+        let mut state = Self {
+            index: IndexedState {
+                metadata,
+                nearest_user,
+                sequence: snapshot.sequence,
+                used_ids,
+                entries: snapshot.entries,
+                entries_by_id,
+                records: snapshot.records,
+                open_operations_by_lane,
+                lanes: snapshot.lanes,
+                log: snapshot.log,
+                stats: snapshot.stats,
+                name: snapshot.name,
+                labels: snapshot.labels,
+            },
+        };
+        // Old snapshots can still contain append bodies covered by a clear.
+        // Validate every original reference first, then retire bodies and remap
+        // their log indexes together. IDs remain permanently reserved.
+        let clears: Vec<_> = state
+            .index
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                LaneRecord::AssistantFrame(frame)
+                    if matches!(
+                        frame.op,
+                        AssistantFrameOp::ClearStream | AssistantFrameOp::ClearRun
+                    ) =>
+                {
+                    Some(frame.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        for frame in clears {
+            state.index.retire_cleared_frames(&frame);
+        }
+        Ok(state)
     }
 }
 
@@ -258,6 +309,65 @@ mod tests {
             let mut value = serde_json::to_value(state()).unwrap();
             value[field] = replacement;
             assert!(serde_json::from_value::<SessionState>(value).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod retirement_tests {
+    use super::*;
+    use crate::session::types::{AssistantFrameRecord, RecordBase};
+    #[test]
+    fn old_snapshot_retires_only_prior_bodies_and_remaps_record_log_atomically() {
+        let records: Vec<_> = [
+            (1, AssistantFrameOp::Append),
+            (2, AssistantFrameOp::ClearRun),
+            (3, AssistantFrameOp::Append),
+        ]
+        .into_iter()
+        .map(|(seq, op)| {
+            LaneRecord::AssistantFrame(AssistantFrameRecord {
+                base: RecordBase {
+                    id: format!("frame-{seq}"),
+                    seq,
+                    lane: "main".into(),
+                    timestamp: 1,
+                },
+                run_id: "run".into(),
+                stream_index: 0,
+                op,
+                frame: Some(serde_json::json!({"body":"stale or live"})),
+            })
+        })
+        .collect();
+        let mut value = serde_json::to_value(SessionState::new()).unwrap();
+        value.as_object_mut().unwrap().remove("reserved_ids"); // Legacy snapshot.
+        value["sequence"] = serde_json::json!(3);
+        value["records"] = serde_json::to_value(&records).unwrap();
+        value["log"] = serde_json::json!([{"Record":0},{"Record":1},{"Record":2}]);
+        let restored: SessionState = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.index.records, records[1..]);
+        assert!(restored.validate_unused_id("frame-1").is_err());
+        assert_eq!(restored.index.log.len(), 2);
+        assert!(matches!(restored.index.log[0], StoredLogItem::Record(0)));
+        assert!(matches!(restored.index.log[1], StoredLogItem::Record(1)));
+        let encoded = serde_json::to_value(&restored).unwrap();
+        assert_eq!(encoded["records"].as_array().unwrap().len(), 2);
+        assert_eq!(encoded["reserved_ids"], serde_json::json!(["frame-1"]));
+        let mut restored = restored;
+        for _ in 0..3 {
+            restored = serde_json::from_value(serde_json::to_value(&restored).unwrap()).unwrap();
+            assert!(restored.validate_unused_id("frame-1").is_err());
+            assert_eq!(restored.index.records, records[1..]);
+            assert_eq!(restored.index.log.len(), 2);
+        }
+        for ids in [
+            serde_json::json!(["frame-1", "frame-1"]),
+            serde_json::json!(["frame-2"]),
+        ] {
+            let mut corrupt = encoded.clone();
+            corrupt["reserved_ids"] = ids;
+            assert!(serde_json::from_value::<SessionState>(corrupt).is_err());
         }
     }
 }

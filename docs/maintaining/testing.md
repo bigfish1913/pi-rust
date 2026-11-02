@@ -1,19 +1,21 @@
-# 会话与恢复测试
+# 会话、恢复与资源测试
 
 ## 下次直接运行
 
 从 `pi-rust` 仓库根目录执行。前提是 Python 3、Rust/Cargo 和 Go Task 已安装。下面是本机 Windows PowerShell 可直接复制的命令；**任一步失败就先保留日志排查，不要把后续部分成功当成整轮通过。** 测试不会自动安装新 binary、替换全局 DLL 或重启服务。
 
-### 1. 日常回归：先跑这两项
+### 1. 日常回归：会话、恢复和资源
 
 ```powershell
 task test:session
 if ($LASTEXITCODE -ne 0) { throw 'Session 冒烟失败，请检查输出中的诊断目录' }
 task test:recovery
 if ($LASTEXITCODE -ne 0) { throw '恢复回归失败' }
+task test:resources
+if ($LASTEXITCODE -ne 0) { throw '资源回归未通过；请区分 FAIL 与平台 SKIP 并保留诊断' }
 ```
 
-第一项自动构建当前源码、运行 Python 控制器测试，再检查两种 RPC 编码下的消息/工具结果、重启恢复、真实 kill 后续跑和 session 隔离；每次自动创建唯一诊断目录。第二项运行底层恢复回归。**这两项默认不加载全局扩展，不能替代下面的扩展检查。**
+第一项自动构建当前源码、运行 Python 控制器测试，再检查两种 RPC 编码下的消息/工具结果、重启恢复、真实 kill 后续跑和 session 隔离；每次自动创建唯一诊断目录。第二项运行底层恢复回归。第三项构建 release CLI 和实际编辑器压力进程，检查大粘贴/撤销历史及两种 RPC 编码的多轮内存、CPU、完成性和最终结论。**三项默认都不加载全局扩展，不调用真实模型，不能替代下面的扩展检查。**
 
 准备合并或发版时，再运行完整检查（不要只依据某次测试数量判断是否通过）：
 
@@ -66,6 +68,7 @@ if ($LASTEXITCODE -ne 0) { throw "相邻状态扩展回归失败，诊断目录�
 | --- | --- |
 | `task test:session` | Python 控制器测试成功，且 `compact-deltas`、`snapshot` 均为 PASS；进程退出码为 0。 |
 | `task test:recovery` | 所有测试目标均无失败，Task 退出码为 0。 |
+| `task test:resources` | 编辑器与两个 RPC 场景全部 PASS；逐轮资源预算和最终结论通过。退出 77 / 不支持平台为 SKIP，不算通过。 |
 | todo / durable | 显式传入 DLL 后，`results.json` 中对应 `todoState` / `durableState` 为 PASS；没有加载库时的 SKIP 不算通过。 |
 | provider / subagent / btw | 按下文设置真实库变量，使用 `--nocapture` 确认没有因缺少库而提前跳过。 |
 
@@ -205,6 +208,75 @@ if ($LASTEXITCODE -ne 0) { throw 'plugin-stub 真实动态库回归失败' }
 
 **库未构建或对应变量未设置时，必须把真实库覆盖记为 SKIP，不得记为 PASS。** 这些测试可能通过提前返回而让 Cargo 汇总显示 `ok`；请用 `--nocapture` 查看 `SKIP` 提示，并在报告中区分“测试进程成功退出”和“真实库断言确实执行”。设置了变量但文件不存在属于错误，不应伪装成成功。默认 workspace 测试通过也不能替代这些显式真实库测试。
 
+## 内存、CPU 与多轮结论回归
+
+### 运行入口
+
+```sh
+# 默认：release 编辑器 20 轮 + 两种 RPC 编码各 20 轮；无真实模型费用。
+task test:resources
+# 加长轮次，或只检查一个 RPC 编码：
+task test:resources -- --rounds 100 --encoding snapshot
+# 直接检查指定产物，不构建、不安装：
+python3 -B scripts/resource-smoke.py --rpi /path/to/rpi --editor-probe /path/to/editor_resource_probe --diagnostics-dir target/resource-smoke-unique --profile release
+```
+
+Windows 的独立调用示例：
+
+```powershell
+$diag = 'target/resource-smoke-' + [guid]::NewGuid().ToString('N')
+python -B scripts/resource-smoke.py --rpi target/resource-tests-cargo/release/rpi.exe --editor-probe target/resource-tests-cargo/release/examples/editor_resource_probe.exe --diagnostics-dir "$diag" --profile release
+if ($LASTEXITCODE -ne 0) { throw "资源回归未通过：$diag" }
+```
+
+Task 显式使用 `target/resource-tests-cargo`，不依赖全局 Cargo target。可覆盖 `RESOURCE_CARGO_TARGET_DIR`、`RESOURCE_BINARY`、`RESOURCE_EDITOR_PROBE`、`RESOURCE_PYTHON`、`RESOURCE_DIAGNOSTICS_DIR`。binary/probe 覆盖只是改测已有产物，Task 仍构建源码；只测现成产物用脚本。`--profile` 是记录用户声明的构建 profile，不能自动认证外部 binary 的构建方式；性能对比应使用同 profile 的 release 产物。诊断目录必须不存在。
+
+### 必须分开的覆盖
+
+1. **编辑器内存路径**：`editor_resource_probe` 使用真实 `Editor`，不是模拟内存数组。保留同一个 1 MiB 折叠粘贴正文，每轮插入/退格 64 次，积累 undo 历史，验证 undo/redo 正文和渲染。压力前采集基线，不把首次复制藏入 warmup。它不打开终端，覆盖编辑器内核/渲染，**不代表全部终端后端或交互 TUI 都通过**。
+2. **RPC 多轮路径**：在隔离会话连接本地 streaming provider，分别检查 compact-deltas/snapshot。默认先运行 2 轮 RPC warmup，之后重设增长基线，测量 20 轮。每轮检查当前 user/assistant 的原生 ID、completed outcome、正常 stop、累加任务的 round/sum；最后一轮要求正确的 final 结论。warmup 仍受绝对内存上限保护，但不计入增长/单轮 CPU 预算。
+3. **确定性 owner 回归**：Task 同时运行 TUI Rust 测试，包括共享粘贴正文、最后 owner 释放、增量粘贴不改变旧快照，以及 probe 协议测试。单测检查数据所有权，进程压力检查实际资源，不能互相冒充。
+
+每个测量轮次后都有独立 idle 窗口，所以能标注首次出现空转 CPU 问题的轮次。所有场景只启动和结束本次子进程，隔离 HOME/config/session/tmp，禁用全局扩展、工具、skills、prompt templates、上下文文件、自动重试和 compaction；不会操作正在运行的 rpi 或真实用户会话。
+
+### 指标、预算与结论边界
+
+| 指标/预算 | 默认值或口径 |
+| --- | --- |
+| Windows 主内存指标 | PrivateUsage（私有提交字节），另报 Working Set、峰值 resident/commit |
+| Linux 主内存指标 | RSS、峰值 RSS，取自 `/proc`；不与 Windows Private Bytes 混为同一含义 |
+| CPU | 进程 user+kernel 秒；百分比按单核口径，100% 为一个逻辑核，可超过 100% |
+| 绝对主内存上限 | 512 MiB，`--max-memory-mib` |
+| RPC 增长预算 | warmup 后 96 MiB，`--max-rpc-growth-mib` |
+| 编辑器增长预算 | 压力前基线后 32 MiB，`--max-editor-growth-mib` |
+| 每轮活动 CPU | 5 秒，`--max-round-cpu-seconds`；不是墙钟/网络延迟 |
+| idle CPU | 单核 25%，`--max-idle-cpu-percent` |
+| idle 窗口 / 采样周期 | 1 秒 / 200ms，`--idle-seconds` / `--sample-interval` |
+
+以上预算针对受控测试负载，不是任意真实会话的 SLA。采样或指标缺失、时间倒退、进程崩溃、超时、超预算、回复截断或结论错误均不能算 PASS。退出码：0=PASS、1=FAIL、2=参数错误、77=不支持平台的 SKIP。目前 Windows/Linux 有实际采样后端；其他平台不伪造零值。
+
+诊断文件：
+
+- `results.json`：版本/实际 binary 和 probe 摘要、profile、workload/预算、场景汇总、`firstProblemRound`/`firstProblem`、`finalConclusion`。仓库 HEAD/dirty 元数据描述控制器所在仓库，**不是外部 binary 的构建来源证明**。
+- `metrics.jsonl`：各阶段及每轮活动/idle 原始指标、CPU delta、内存增长、经过验证的答案/entry IDs、可用的 usage 和累计观察到的消息 JSON 字节。
+- `<case>/process.jsonl`：有大小上限并脱敏的进程输入/输出；`sessions/` 为本次合成历史。
+
+`firstProblem` 给出类别、phase、轮次、实际值和预算。startup/prepare/warmup 失败按阶段报告，不伪造一个已测量轮次。功能失败归为 semantic/protocol 等类别，不直接称为内存泄漏。短测 PASS 只说明已执行轮次满足预算；内存增长可能来自合法历史，reset 后 RSS 未立即下降可能是 allocator 保留 arena，均不能单凭一个数推断泄漏。累加任务只验证多轮完成性和小型确定性结论，不认证一般推理质量。普通离线结果中 live 为 **SKIP**，不得宣称真实模型已验证。
+
+### 可选真实模型：显式启用，默认不执行
+
+```powershell
+# 凭据由你在当前进程环境安全设置；不要把密钥写到命令行或测试文件。
+# 例中仅写环境变量名 RESOURCE_TEST_API_KEY，不展示其值。
+task test:resources:live -- --api openai-completions --base-url https://api.openai.com/v1 --model YOUR_MODEL --api-key-env RESOURCE_TEST_API_KEY --rounds 5 --max-output-tokens 256 --max-requests 5
+```
+
+支持 `openai-completions`、`openai-responses`、`anthropic-messages` 参数；endpoint 必须使用 HTTPS（仅 loopback 允许 HTTP），不得包含 userinfo、query 或 fragment。需显式提供 model、endpoint 和已设置的凭据环境变量名；不读取默认 auth，不加载原会话。为避免覆盖隔离环境，`RPI_`、`XDG_` 前缀及 HOME/PATH 等保留变量不能作为凭据变量。
+
+live 默认 snapshot、5 轮、无 warmup、每轮最多 256 输出 tokens、请求超时 60 秒，跨编码/含 warmup 的总请求计划不得超过默认 `--max-requests 5`。两种编码、额外 warmup 或更长测试需显式调整请求预算。密钥仅通过指定环境变量传入，临时 models.json 保存 `$ENV_NAME` 引用，不保存值；日志脱敏原值及常见编码。输出/token/call 上限不是未知价格下的美元费用保证。模型忽略 JSON 格式、输出被截断或结论错误也会失败，不会为凑 PASS 自动追加请求。
+
+本次真实模型覆盖明确为 SKIP。live 通路只用 loopback OpenAI Completions 假 endpoint 验证配置、限制、凭据隔离和脱敏；真实服务以及 Responses/Anthropic 真实集成未执行。普通 `task test:resources`、Python 测试和 CI 不会调用真实模型。
+
 ## CI
 
 `.github/workflows/ci.yml` 的现有 Ubuntu `test` job 在 workspace 测试后显式构建 CLI，再执行：
@@ -212,7 +284,9 @@ if ($LASTEXITCODE -ne 0) { throw 'plugin-stub 真实动态库回归失败' }
 ```sh
 cargo build -p rpi-cli --bin rpi --locked --target-dir target
 python3 -B scripts/test_session_smoke.py
-python3 -B scripts/session-smoke.py --rpi target/debug/rpi --diagnostics-dir target/session-smoke-ci
+python3 -B scripts/session-smoke.py --rpi target/debug/rpi --diagnostics-dir "$RUNNER_TEMP/$SESSION_SMOKE_DIAGNOSTICS_NAME"
 ```
 
-CI 不传 `--extension`，因此不依赖相邻的独立包仓库或全局安装。失败时上传 `target/session-smoke-ci` 为 `session-smoke-diagnostics` artifact（包含隔离 HOME 等隐藏文件）；若尚未生成目录则不因缺少 artifact 再报错。CI 的该 smoke 结果只证明本次二进制的离线会话链路，不代表全部扩展业务得到认证。
+session 的 basename 包含 run_id/run_attempt，输出在 runner.temp 而不是 Cargo 缓存中的 target；失败从同一路径上传 `session-smoke-diagnostics`，保留拒绝覆盖旧目录的保护。CI 不传独立扩展，因此该结果不代表全扩展业务认证。
+
+新增 Ubuntu `Offline resource regression` job 独立构建 release CLI/probe，运行 Python 控制器及 Rust editor 测试，再执行编辑器和两种 RPC 编码各 5 个测量轮次。资源诊断同样使用 runner.temp 下 run/attempt 唯一目录，失败上传 `resource-smoke-diagnostics`。release/preview 的发布准备依赖该门禁。无 secrets、无 live 模式；不能将 CI 的合成模型 PASS 当作真实模型 PASS。

@@ -368,17 +368,15 @@ fn agent_tool_result_to_json(result: &rpi_agent::types::AgentToolResult) -> Stri
 /// Dispatch is `catch_unwind`-wrapped: a panicking plugin handler is logged and
 /// skipped (abort-on-unwind policy would be too aggressive for event dispatch
 /// where one bad handler shouldn't kill the session; we log + continue, unlike
-/// tool-partial dispatch which aborts because it cannot unwind across FFI from
-/// a blocking thread). The distinction: `emit` runs on the async runtime thread
-/// where `catch_unwind` can recover cleanly; the tool partial cb runs inside
-/// `spawn_blocking` cross-FFI where recovery is unsafe.
+/// tool-partial dispatch which aborts because it cannot unwind across FFI).
+/// Awaited observers run on blocking workers: a synchronous plugin callback may
+/// wait for a host action that needs another tool future in the same batch.
 pub struct ExtensionEmitter {
     snapshot: Arc<RegistrySnapshot>,
     /// Keeps the loaded cdylibs mapped for as long as this emitter (installed
     /// into `AgentHarnessOptions.agent_emitter`) may dispatch to handler fn
     /// pointers that live inside them. Cloned from the load session; the
     /// libraries unload only when every holder (adapter + emitter) drops.
-    #[allow(dead_code)]
     keepalive: Arc<crate::PluginKeepalive>,
 }
 
@@ -927,11 +925,60 @@ pub async fn dispatch_lifecycle_event(
 
 impl AgentEmitter for ExtensionEmitter {
     fn emit(&self, event: AgentEvent) -> BoxFuture<'static, ()> {
-        // Translate + dispatch synchronously (the emitter's emit is awaited by
-        // the loop in event order; dispatch is non-blocking fn-pointer calls).
-        // If the event maps to no tag, do nothing.
-        self.dispatch_agent(&event);
-        Box::pin(async {})
+        let subscribed = match event_tag_for(&event) {
+            Some(EventTag::TurnEnd) => {
+                !self.snapshot.handlers_for(EventTag::TurnEnd).is_empty()
+                    || !self
+                        .snapshot
+                        .handlers_for(EventTag::TurnEndPayload)
+                        .is_empty()
+            }
+            Some(tag) => !self.snapshot.handlers_for(tag).is_empty(),
+            None => false,
+        };
+        if !crate::registry::assert_active(self.snapshot.active_flag()) || !subscribed {
+            return Box::pin(async {});
+        }
+        let snapshot = Arc::clone(&self.snapshot);
+        let keepalive = Arc::clone(&self.keepalive);
+        Box::pin(async move {
+            // Awaiting preserves event ordering while the parallel batch keeps
+            // polling its owned tool futures. block_in_place inside a callback
+            // only releases a Tokio worker; it cannot poll those sibling futures.
+            // The closure owns its libraries even if its caller is cancelled.
+            let background = rpi_agent::tool_execution_scope::track_background_tool();
+            let result = tokio::task::spawn_blocking(move || {
+                let _background = background;
+                let emitter = ExtensionEmitter {
+                    snapshot,
+                    keepalive,
+                };
+                #[cfg(test)]
+                let before = (
+                    TRANSLATED_EVENTS.with(|count| count.get()),
+                    FREED_EVENTS.with(|count| count.get()),
+                );
+                emitter.dispatch_agent(&event);
+                // Test-only accounting follows the awaited dispatch across the
+                // blocking boundary without making counters global to tests.
+                #[cfg(test)]
+                {
+                    (
+                        TRANSLATED_EVENTS.with(|count| count.get()) - before.0,
+                        FREED_EVENTS.with(|count| count.get()) - before.1,
+                    )
+                }
+            })
+            .await;
+            #[cfg(test)]
+            if let Ok((translated, freed)) = &result {
+                TRANSLATED_EVENTS.with(|count| count.set(count.get() + translated));
+                FREED_EVENTS.with(|count| count.set(count.get() + freed));
+            }
+            if let Err(error) = result {
+                tracing::error!(%error, "extension observer task failed");
+            }
+        })
     }
 
     fn try_emit(&self, event: AgentEvent) {
@@ -975,9 +1022,8 @@ impl AgentEmitter for TeeEmitter {
     fn emit(&self, event: AgentEvent) -> BoxFuture<'static, ()> {
         // We can't hold `&self` across an await boundary into a 'static future
         // cheaply here without cloning the Arcs — so clone them and drive the
-        // fan-out inside a pinned async block. Each child's emit returns a
-        // no-op future (both BroadcastEmitter and ExtensionEmitter complete
-        // synchronously), so this is effectively a synchronous loop in practice.
+        // fan-out inside a pinned async block. Await each child so asynchronous
+        // extension observers retain the same order as the host broadcast.
         let emitters = self.emitters.clone();
         Box::pin(async move {
             for e in &emitters {
@@ -1387,6 +1433,107 @@ mod tests {
     extern "C" fn counting_handler(_ev: StablePluginEvent, _ud: *mut std::ffi::c_void) -> i32 {
         HANDLER_HITS.fetch_add(1, Ordering::SeqCst);
         0
+    }
+
+    struct WaitingObserver {
+        released: Mutex<bool>,
+        ready: std::sync::Condvar,
+        entered: tokio::sync::Notify,
+        completed: std::sync::atomic::AtomicBool,
+    }
+
+    extern "C" fn waiting_observer(_ev: StablePluginEvent, data: *mut std::ffi::c_void) -> i32 {
+        // The test owns this allocation until the awaited callback returns.
+        let state = unsafe { &*data.cast::<WaitingObserver>() };
+        state.entered.notify_one();
+        let (released, _) = state
+            .ready
+            .wait_timeout_while(
+                state.released.lock().unwrap(),
+                std::time::Duration::from_secs(5),
+                |released| !*released,
+            )
+            .unwrap();
+        state.completed.store(*released, Ordering::SeqCst);
+        0
+    }
+
+    #[tokio::test]
+    async fn awaited_observer_allows_sibling_futures_to_progress() {
+        let state = Box::new(WaitingObserver {
+            released: Mutex::new(false),
+            ready: std::sync::Condvar::new(),
+            entered: tokio::sync::Notify::new(),
+            completed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let mut registry = crate::registry::ExtensionRegistry::new();
+        registry.register_event_handler(
+            "waiting-observer".into(),
+            EventTag::ToolExecutionStart,
+            waiting_observer,
+            (&*state as *const WaitingObserver).cast_mut().cast(),
+        );
+        let emitter = ExtensionEmitter::new(
+            Arc::new(registry.snapshot()),
+            crate::loader::PluginKeepalive::empty(),
+        );
+        // Model a plugin waiting for a host action that needs a sibling tool
+        // future owned by this same parent task. A synchronous emit blocks
+        // before join can ever poll that sibling; the finite callback timeout
+        // makes that regression fail instead of hanging the test process.
+        let dispatch = emitter.emit(AgentEvent::ToolExecutionStart {
+            tool_call_id: "call".into(),
+            tool_name: "read".into(),
+            args: serde_json::json!({}),
+        });
+        tokio::join!(dispatch, async {
+            *state.released.lock().unwrap() = true;
+            state.ready.notify_one();
+        });
+        assert!(
+            state.completed.load(Ordering::SeqCst),
+            "observer blocked the sibling future it depended on"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_observer_retains_background_scope_until_callback_finishes() {
+        let state = Box::new(WaitingObserver {
+            released: Mutex::new(false),
+            ready: std::sync::Condvar::new(),
+            entered: tokio::sync::Notify::new(),
+            completed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let mut registry = crate::registry::ExtensionRegistry::new();
+        registry.register_event_handler(
+            "waiting-observer".into(),
+            EventTag::AgentStart,
+            waiting_observer,
+            (&*state as *const WaitingObserver).cast_mut().cast(),
+        );
+        let emitter = ExtensionEmitter::new(
+            Arc::new(registry.snapshot()),
+            crate::loader::PluginKeepalive::empty(),
+        );
+        let scope = Arc::new(rpi_agent::tool_execution_scope::ToolExecutionScope::default());
+        let task_scope = Arc::clone(&scope);
+        let dispatch = emitter.emit(AgentEvent::AgentStart);
+        let task = tokio::spawn(async move { task_scope.run(dispatch).await });
+        state.entered.notified().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let mut idle = Box::pin(scope.wait_idle());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut idle)
+                .await
+                .is_err()
+        );
+        *state.released.lock().unwrap() = true;
+        state.ready.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), idle)
+            .await
+            .unwrap();
+        assert!(state.completed.load(Ordering::SeqCst));
     }
 
     #[test]
