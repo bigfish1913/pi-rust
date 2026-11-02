@@ -210,22 +210,6 @@ pub(crate) fn queued_message_payloads(
         .collect()
 }
 
-/// Same wire shape for the `QueuedMessages` views the idle path reads.
-fn queued_message_view_payloads(
-    messages: &[rpi_harness::agent_harness::QueuedMessageView],
-) -> Vec<serde_json::Value> {
-    messages
-        .iter()
-        .filter(|message| !message.is_empty())
-        .map(|message| {
-            serde_json::json!({
-                "text": message.text,
-                "images": image_payloads(&message.images),
-            })
-        })
-        .collect()
-}
-
 /// Serialize image attachments as `{mediaType, data}`.
 fn image_payloads(images: &[rpi_ai::types::ImageContent]) -> Vec<serde_json::Value> {
     images
