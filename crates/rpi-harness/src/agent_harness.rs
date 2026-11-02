@@ -774,8 +774,30 @@ impl AgentHarness {
     /// Read-only startup gate for resource transitions. Application-level idle
     /// authorization remains the caller's responsibility.
     pub async fn validate_resource_transition_idle(session: &Session) -> HarnessResult<()> {
+        if Self::resource_session_has_pending_work(session, None).await? {
+            return Err(HarnessError::io(
+                "resource transition rejects pending native execution/queue/recovery",
+            ));
+        }
+        Ok(())
+    }
+    /// Read-only pending facts, including queue/recovery/resume. No harness
+    /// creation, progress pruning, recovery writes or provider registration.
+    pub async fn saved_session_has_pending_work(
+        session: &Session,
+        deadline: std::time::Instant,
+    ) -> HarnessResult<bool> {
+        Self::resource_session_has_pending_work(session, Some(deadline)).await
+    }
+    async fn resource_session_has_pending_work(
+        session: &Session,
+        deadline: Option<std::time::Instant>,
+    ) -> HarnessResult<bool> {
         let runtime = crate::runtime::SessionRuntime::new(session.clone());
         for lane in session.get_lanes().await.map_err(session_to_harness_err)? {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                return Err(HarnessError::io("saved read processing deadline exceeded"));
+            }
             let recovery = runtime
                 .recover_lane(&lane.lane)
                 .await
@@ -785,12 +807,10 @@ impl AgentHarness {
                 || !Self::rebuild_queues(session, &lane.lane).await?.is_empty()
                 || Self::lane_is_resumable_checked(session, &lane.lane).await?
             {
-                return Err(HarnessError::io(
-                    "resource transition rejects pending native execution/queue/recovery",
-                ));
+                return Ok(true);
             }
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Construct from options. Existing sessions require explicit restore opt-in.

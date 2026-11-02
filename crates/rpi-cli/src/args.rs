@@ -649,6 +649,7 @@ pub fn print_help() {
   --timeout <seconds>            LLM API request timeout (default: 600)
   --stream-idle-timeout <seconds> Max silence between response bytes (default: 300; 0 disables)
   --resource-capabilities       Pure bounded JSON resource protocol profile (use alone; no startup)
+  --resource-session-read <file> Strict bounded nonexecuting saved-session read (standalone)
   --resource-transition <file>   Explicit same-session resource CAS (RPC only; see docs/resource-transition-rpc.md)
   --resource-config <file>       Exact versioned startup resources (RPC only; see docs/resource-selection-rpc.md)
   --system-prompt <text>         Replace the default system prompt

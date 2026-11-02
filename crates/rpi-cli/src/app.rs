@@ -113,6 +113,13 @@ async fn run_inner() -> i32 {
         }
     }
 
+    if argv
+        .iter()
+        .any(|arg| arg == "--resource-session-read" || arg.starts_with("--resource-session-read="))
+    {
+        return crate::saved_session_read::run(&argv).await;
+    }
+
     if argv.first().map(String::as_str) == Some("__rpi_dev_cleanup") {
         return crate::dev_extension::run_cleanup_helper(&argv[1..]);
     }

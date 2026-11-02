@@ -126,10 +126,13 @@ impl JsonlProgressStore {
     async fn load(&self, state: &mut State) -> SessionResult<()> {
         self.load_with_repair(state, true).await
     }
-    pub async fn require_idle_without_repair(&self) -> SessionResult<()> {
+    pub async fn inspect_pending_without_repair(&self) -> SessionResult<bool> {
         let mut state = self.state.lock().await;
         self.load_with_repair(&mut state, false).await?;
-        if !state.progress.as_ref().unwrap().frames.is_empty() {
+        Ok(!state.progress.as_ref().unwrap().frames.is_empty())
+    }
+    pub async fn require_idle_without_repair(&self) -> SessionResult<()> {
+        if self.inspect_pending_without_repair().await? {
             return Err(SessionError::invalid_entry(
                 "resource transition rejects pending native progress",
             ));

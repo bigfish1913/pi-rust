@@ -34,7 +34,7 @@ pub(crate) fn capabilities() -> Value {
             "stateCommand":"get_resource_state","toolModes":["default","only","none"],
             "packageScopes":["project","global"],"ordinaryReopen":"immutable","hotApply":false},
         "management":crate::resource_management::capabilities(),
-        "transition":transition_capability(),"loadedFacts":false})
+        "transition":transition_capability(),"savedSessionRead":crate::saved_session_read::capabilities(),"loadedFacts":false})
 }
 const SESSION_KEY: &str = "rpi.resource-selection.v1";
 
@@ -662,6 +662,14 @@ fn validate_persisted_binding(binding: &Value) -> Result<u64, String> {
     Ok(revision)
 }
 
+pub(crate) fn saved_binding_state(
+    values: &rpi_harness::session::SessionValues,
+) -> Result<Value, String> {
+    if let Some(binding) = values.get(SESSION_KEY) {
+        validate_persisted_binding(binding)?;
+    }
+    Ok(binding_state(values))
+}
 pub(crate) fn binding_state(values: &rpi_harness::session::SessionValues) -> Value {
     match values.get(SESSION_KEY) {
         Some(binding) => match validate_persisted_binding(binding) {

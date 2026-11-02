@@ -89,8 +89,12 @@ pub struct JsonlSessionFacts {
 enum FrameReplay {
     Cold,
     TransitionCold,
+    SavedReadCold(std::time::Instant),
     Detached,
 }
+
+mod saved_read;
+pub use saved_read::{SavedSessionReadData, SavedSessionReadQuery};
 
 /// Durable file-backed `SessionStorage`. Mirrors TS `JsonlSessionStorage`.
 ///
@@ -366,7 +370,28 @@ impl JsonlSessionStorage {
             )?
         };
         // Transitions never normalize/recover history, including a missing LF.
-        let strict = matches!(frames, FrameReplay::TransitionCold);
+        let strict = matches!(
+            frames,
+            FrameReplay::TransitionCold | FrameReplay::SavedReadCold(_)
+        );
+        if let FrameReplay::SavedReadCold(deadline) = frames {
+            if std::time::Instant::now() >= deadline {
+                return Err(SessionError::invalid_entry(
+                    "saved read processing deadline exceeded",
+                ));
+            }
+            if content
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .take(65_538)
+                .count()
+                > 65_537
+            {
+                return Err(SessionError::invalid_entry(
+                    "saved read history mutation limit exceeded",
+                ));
+            }
+        }
         if strict && !content.ends_with('\n') {
             return Err(SessionError::invalid_entry(
                 "resource transition requires complete unrecovered history",
@@ -406,6 +431,13 @@ impl JsonlSessionStorage {
         let mut dropped_duplicates = false;
         let mut seen_lines: HashMap<u64, &str> = HashMap::new();
         for (idx, line) in physical_lines.iter().enumerate().skip(1) {
+            if let FrameReplay::SavedReadCold(deadline) = frames {
+                if std::time::Instant::now() >= deadline {
+                    return Err(SessionError::invalid_entry(
+                        "saved read processing deadline exceeded",
+                    ));
+                }
+            }
             let line_no = (idx + 1) as u32;
             match parse_mutation(line) {
                 Ok(mutation) => {
@@ -454,9 +486,13 @@ impl JsonlSessionStorage {
                             SessionMutation::Record {
                                 record: LaneRecord::AssistantFrame(frame),
                             },
-                        ) if matches!(frames, FrameReplay::Cold | FrameReplay::TransitionCold)
-                            && frame.op
-                                != crate::session::types::AssistantFrameOp::CommitStream =>
+                        ) if matches!(
+                            frames,
+                            FrameReplay::Cold
+                                | FrameReplay::TransitionCold
+                                | FrameReplay::SavedReadCold(_)
+                        ) && frame.op
+                            != crate::session::types::AssistantFrameOp::CommitStream =>
                         {
                             // Normal loads and facts-only preflight stay cold.
                             // Detached snapshots eagerly retain all historical
