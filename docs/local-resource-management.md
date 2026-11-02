@@ -55,7 +55,9 @@ cannot hide a traversed link/junction. Owned relative targets/receipts continue
 to reject traversal. Source/target overlap is rejected using canonical path
 identity, including Windows extended paths and case aliases. Packages copy their complete
 bounded directory, including explicit instruction files; prompts are not implicitly
-persistent instructions. Removal verifies the recorded inventory before deleting.
+persistent instructions. On Unix, copied files retain ordinary rwx permissions
+(including executable helper scripts), but never setuid, setgid, or sticky bits.
+Removal verifies the recorded inventory before deleting.
 
 ## Publication, leases and failure
 
@@ -109,8 +111,12 @@ global Packages are selected explicitly, not injected into legacy discovery.
 Legacy commands remain available; they cannot replace/remove resources owned by
 the new facade and direct users to `resource` instead. Automatic `extension update`
 (and its `package update` alias) skips facade-owned Packages; explicitly naming one
-gives resource-update guidance rather than invoking Cargo. Resource mutations affect
-future startups only. Exact-session declaration/inventory checks remain unchanged;
+gives resource-update guidance rather than invoking Cargo. Legacy Package writes
+check the addressed directory, extensions and artifact/staging paths; aliases and
+pre-existing staging files are refused rather than followed or truncated. Safe
+legacy registry names such as `_legacy` and `.tools` remain listable/inspectable;
+this does not widen the identity grammar for new managed resources. Resource
+mutations affect future startups only. Exact-session declaration/inventory checks remain unchanged;
 no transcript migration, task stopping, unload, or live capability widening occurs.
 
 For example, install a resource-only or combined bundle globally:
