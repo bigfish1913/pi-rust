@@ -2437,9 +2437,6 @@ mod relay_tests {
         assert_eq!(own.request_id, reserved);
     }
 
-    /// `RelayUiDialog {op:"take"}` hands over everything no plugin reserved and
-    /// leaves the reserved entries queued.
-    #[test]
     /// Losing the relay consumer must not leave the TUI locked out forever.
     #[test]
     fn release_or_detach_clears_takeover_and_requeues_unanswered() {
@@ -2493,6 +2490,9 @@ mod relay_tests {
         assert_eq!(mailbox.take_all_unreserved().len(), 1);
     }
 
+    /// `RelayUiDialog {op:"take"}` hands over everything no plugin reserved and
+    /// leaves the reserved entries queued.
+    #[test]
     fn relay_take_returns_unreserved_and_keeps_reserved() {
         let mailbox = UiDialogMailbox::new();
         mailbox.attach();
