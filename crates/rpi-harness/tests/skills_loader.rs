@@ -33,6 +33,42 @@ fn fresh_env() -> (Arc<InMemoryExecutionEnv>, Arc<dyn rpi_tools::ExecutionEnv>) 
 }
 
 #[tokio::test]
+async fn source_observer_sees_exact_parser_input_for_file_and_recursive_roots() {
+    let (typed, env) = fresh_env();
+    typed
+        .create_dir("skills/example", true, None)
+        .await
+        .unwrap();
+    let raw = "---\r\nname: example\r\ndescription: Example skill\r\n---\r\nUse this skill.\r\n";
+    typed
+        .write_file("skills/example/SKILL.md", raw.into(), None)
+        .await
+        .unwrap();
+    for root in ["skills", "skills/example/SKILL.md"] {
+        let observed = std::sync::Mutex::new(Vec::new());
+        let result = rpi_harness::skills::load_skills_with_source_observer(
+            &env,
+            &[root.to_owned()],
+            &|path, source| {
+                observed
+                    .lock()
+                    .unwrap()
+                    .push((path.to_owned(), source.to_owned()));
+            },
+        )
+        .await;
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert_eq!(result.skills.len(), 1);
+        let observed = observed.into_inner().unwrap();
+        assert_eq!(
+            observed,
+            vec![(result.skills[0].file_path.clone(), raw.to_owned())]
+        );
+        assert_eq!(result.skills[0].content, "Use this skill.");
+    }
+}
+
+#[tokio::test]
 async fn loads_skill_md_with_frontmatter() {
     let (typed, env) = fresh_env();
     typed
