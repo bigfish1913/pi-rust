@@ -314,6 +314,14 @@ async fn selected_skills_preflight_precedes_registration_and_native_writer() {
             .stop()
             .await;
         assert_eq!(fixture.assert_registrations(&log).lines().count(), 2);
+        let fork_args = ["--resource-config", "resources.json", "--fork", "bound"];
+        put(&log, "");
+        put(&path, "---\nname: [\n---\nMalformed fork Skill\n");
+        // The same preflight must reject a fork before registering code or
+        // creating any child files, not merely protect ordinary reopen.
+        rejected(root, &fork_args, "selected skill").await;
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "");
+        put(&path, &original_skill);
         let transcript = session_files(root)
             .into_keys()
             .find(|p| p.extension().is_some_and(|e| e == "jsonl"))
@@ -345,6 +353,7 @@ async fn selected_skills_preflight_precedes_registration_and_native_writer() {
             "Skill inventory changed",
         )
         .await;
+        rejected(root, &fork_args, "Skill inventory changed").await;
         assert_eq!(
             std::fs::read_to_string(&log).unwrap(),
             "",

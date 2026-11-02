@@ -217,7 +217,7 @@ async fn fork_takes_a_session_file_outside_the_session_directory() {
     )
     .unwrap();
     let root = temporary.path().join("sessions");
-    let forked = fork_session_at_launch(&copy.to_string_lossy(), &root, &cwd)
+    let forked = fork_session_at_launch(&copy.to_string_lossy(), &root, &cwd, None)
         .await
         .unwrap_or_else(|error| panic!("fork from a file path failed: {error}"));
     let forked_meta = forked.get_metadata().await.unwrap();

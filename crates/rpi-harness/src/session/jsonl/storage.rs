@@ -284,6 +284,17 @@ impl JsonlSessionStorage {
         Self::load_impl(fs, path, clock, ids, ReadPolicy::Restore).await
     }
 
+    /// Fork reads never repair their source. Use the ordinary cold replay and
+    /// recoverable-tail snapshot semantics, but retain no source writer action.
+    pub(super) async fn load_fork_snapshot(
+        fs: Arc<dyn FileSystem>,
+        path: &str,
+        clock: Arc<dyn Clock>,
+        ids: Arc<dyn IdGenerator>,
+    ) -> SessionResult<Self> {
+        Self::load_impl(fs, path, clock, ids, ReadPolicy::ReadOnly).await
+    }
+
     /// Replay through the canonical native decoder/reducer without repairing,
     /// appending, claiming a writer, or creating any file. Recoverable tails and
     /// exact duplicate sequences are ignored in memory, as on normal restore.
@@ -768,16 +779,90 @@ impl JsonlSessionStorage {
     pub async fn fork(
         &self,
         path: &str,
-        mut header: JsonlV4Header,
+        header: JsonlV4Header,
         options: &ForkOptions,
         clock: Arc<dyn Clock>,
         ids: Arc<dyn IdGenerator>,
     ) -> SessionResult<Self> {
-        let plan = self.state.lock().await.fork_plan(options)?;
+        self.fork_initialized(
+            path,
+            header,
+            options,
+            clock,
+            ids,
+            None::<
+                fn(
+                    &crate::session::SessionValues,
+                ) -> SessionResult<Vec<(String, serde_json::Value)>>,
+            >,
+        )
+        .await
+    }
+
+    /// Native host initialization in the SAME staged fork publication. The
+    /// initializer sees source-wide latest values from the exact fork snapshot,
+    /// not the historical branch cut. This is a storage seam, not a public
+    /// RPC/custom-append authorization bypass. The host supplies validated
+    /// new-identity values (including independent binding revision/authority).
+    pub async fn fork_with_value_initializer(
+        &self,
+        path: &str,
+        header: JsonlV4Header,
+        options: &ForkOptions,
+        clock: Arc<dyn Clock>,
+        ids: Arc<dyn IdGenerator>,
+        initialize: impl FnOnce(
+                &crate::session::SessionValues,
+            ) -> SessionResult<Vec<(String, serde_json::Value)>>
+            + Send,
+    ) -> SessionResult<Self> {
+        self.fork_initialized(path, header, options, clock, ids, Some(initialize))
+            .await
+    }
+
+    async fn fork_initialized(
+        &self,
+        path: &str,
+        mut header: JsonlV4Header,
+        options: &ForkOptions,
+        clock: Arc<dyn Clock>,
+        ids: Arc<dyn IdGenerator>,
+        initialize: Option<
+            impl FnOnce(
+                    &crate::session::SessionValues,
+                ) -> SessionResult<Vec<(String, serde_json::Value)>>
+                + Send,
+        >,
+    ) -> SessionResult<Self> {
+        let plan = self
+            .state
+            .lock()
+            .await
+            .fork_plan(options, initialize.is_some())?;
+        let updates = if let (Some(initialize), Some(values)) = (initialize, plan.source_values) {
+            let values = crate::session::SessionValues::from_entries(&values.read().await?);
+            initialize(&values)?
+        } else {
+            Vec::new()
+        };
+        for (key, _) in &updates {
+            if key.trim().is_empty() {
+                return Err(SessionError::invalid_payload(
+                    "fork initialization value key must not be empty",
+                ));
+            }
+        }
+        let mut main_leaf = plan
+            .lanes
+            .iter()
+            .find(|pointer| pointer.lane == "main")
+            .and_then(|pointer| pointer.leaf_id.clone());
         header.progress_format = Some(super::progress::FORMAT.into());
         super::progress::JsonlProgressStore::new(self.fs.clone(), path, &header.id, clock.clone())
             .initialize()
             .await?;
+        let fork_clock = clock.clone();
+        let fork_ids = ids.clone();
         publish_file_atomically(&self.fs, path, move |fs, temp_path| {
             Box::pin(async move {
                 file_result(
@@ -788,8 +873,10 @@ impl JsonlSessionStorage {
                 // Hydrate and release one row at a time. Only small reference
                 // plans, lane pointers and labels survive between writes.
                 let mut seq = 1;
+                let mut entry_ids = HashSet::new();
                 for source in plan.entries {
                     let mut entry = source.read().await?;
+                    entry_ids.insert(entry.id().to_owned());
                     entry.base_mut().seq = seq;
                     let mutation = SessionMutation::Entry {
                         seq,
@@ -856,6 +943,46 @@ impl JsonlSessionStorage {
                         .await,
                         "stage fork label",
                     )?;
+                    seq += 1;
+                }
+                // Initial values are new mutations at the selected main cut,
+                // after copied lanes/facts, never a post-publication append.
+                // This also handles an empty branch cut and Tree/all mode.
+                for (key, value) in updates {
+                    let id = fork_ids.next();
+                    if !entry_ids.insert(id.clone()) {
+                        return Err(SessionError::already_exists(format!(
+                            "Session id already exists: {id}"
+                        )));
+                    }
+                    let timestamp = fork_clock.now_ms();
+                    let mutation = SessionMutation::Entry {
+                        seq,
+                        timestamp,
+                        lane: Some("main".into()),
+                        entry: provisioned_into_entry(
+                            ProvisionedEntry {
+                                id: id.clone(),
+                                kind: crate::session::types::ProvisionedKind::Custom {
+                                    custom_type: crate::session::values::VALUE_CUSTOM_TYPE.into(),
+                                    data: Some(serde_json::json!({"key": key, "value": value})),
+                                },
+                            },
+                            seq,
+                            main_leaf,
+                            timestamp,
+                        ),
+                    };
+                    file_result(
+                        fs.append_file(
+                            temp_path,
+                            FileContent::Text(encode_mutation(&mutation)),
+                            None,
+                        )
+                        .await,
+                        "stage fork initial value",
+                    )?;
+                    main_leaf = Some(id);
                     seq += 1;
                 }
                 Ok(())

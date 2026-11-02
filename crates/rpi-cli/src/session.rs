@@ -804,7 +804,7 @@ pub async fn build_prepared(
     // same root, so the caller pins it into `args` before either runs.
     let session = match transition_session {
         Some(session) => session,
-        None => build_session(&selection, &cwd_str).await?,
+        None => build_session(&selection, &cwd_str, resource_selection.as_ref()).await?,
     };
     crate::resource_selection::bind_session(&session, resource_selection.as_ref())
         .await
@@ -2761,7 +2761,11 @@ where
 }
 
 /// Build the `Session` facade for the chosen selection.
-async fn build_session(selection: &SessionSelection, cwd: &str) -> Result<Session, BuildError> {
+async fn build_session(
+    selection: &SessionSelection,
+    cwd: &str,
+    selected: Option<&crate::resource_selection::ResolvedSelection>,
+) -> Result<Session, BuildError> {
     match selection {
         SessionSelection::Ephemeral => Ok(ephemeral_session()),
         SessionSelection::ExperimentalNative { dir } => Ok(Session::new(
@@ -2781,7 +2785,9 @@ async fn build_session(selection: &SessionSelection, cwd: &str) -> Result<Sessio
         SessionSelection::Latest { .. }
         | SessionSelection::ById { .. }
         | SessionSelection::ByExactId { .. } => restore_session(selection, cwd).await,
-        SessionSelection::Fork { source, dir } => fork_session_at_launch(source, dir, cwd).await,
+        SessionSelection::Fork { source, dir } => {
+            fork_session_at_launch(source, dir, cwd, selected).await
+        }
     }
 }
 
@@ -2936,6 +2942,7 @@ async fn fork_session_at_launch(
     source: &str,
     dir: &Path,
     cwd: &str,
+    selected: Option<&crate::resource_selection::ResolvedSelection>,
 ) -> Result<Session, BuildError> {
     use rpi_harness::session::jsonl::{
         JsonlSessionCreateOptions, JsonlSessionRepo, JsonlSessionRepoOptions,
@@ -2974,7 +2981,7 @@ async fn fork_session_at_launch(
         }
     };
     let fork_storage = repo
-        .fork_typed(
+        .fork_typed_with_value_initializer(
             &source_meta,
             &JsonlSessionCreateOptions {
                 id: None,
@@ -2983,6 +2990,7 @@ async fn fork_session_at_launch(
                 metadata: None,
             },
             &ForkOptions::default(),
+            |values| crate::resource_selection::fork_initial_values_for_selection(values, selected),
         )
         .await
         .map_err(|e| BuildError::SessionDir(format!("fork {}: {e}", source_meta.path)))?;
@@ -3449,7 +3457,7 @@ pub(crate) async fn fork_session_storage(
         return Err(format!("current session {id} not found on disk"));
     };
     let fork_storage = repo
-        .fork_typed(
+        .fork_typed_with_value_initializer(
             source,
             &rpi_harness::session::jsonl::JsonlSessionCreateOptions {
                 id: None,
@@ -3458,6 +3466,7 @@ pub(crate) async fn fork_session_storage(
                 metadata: None,
             },
             &rpi_harness::session::types::ForkOptions::default(),
+            crate::resource_selection::fork_initial_values,
         )
         .await
         .map_err(|e| e.to_string())?;
