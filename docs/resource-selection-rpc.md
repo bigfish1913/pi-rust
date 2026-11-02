@@ -137,8 +137,13 @@ Conflicting CLI resource controls are rejected: `--system-prompt`,
 unknown extension flags, and explicit/unresolved negative project trust.
 Use trusted `--mode rpc` (and `--approve` when necessary). Standard model,
 session, timeout, and thinking options remain usable. An existing native session
-requires the **same declaration and inventory** on restart. Resource changes
-require a new session; `/reload` and dev hot apply return an error without
+requires the **same declaration and inventory** on restart. Selected Skills
+(including Package Skills) are discovered, parsed, validated and fingerprinted
+before native extension registration or any repair-capable session writer/name
+write. A saved binding's actual Skill inventory is compared at that read-only
+preflight, and construction uses the same validated Skills without rediscovery.
+The later complete inventory/tool-schema comparison remains a second check.
+Resource changes require a new session; `/reload` and dev hot apply return an error without
 changing the existing exact selection, even if a caller modifies reload args.
 
 ## Read-only observation and readiness
