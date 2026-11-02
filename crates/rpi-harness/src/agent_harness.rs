@@ -504,6 +504,15 @@ impl MessageQueue {
         }
     }
 
+    /// How many items are queued **for this lane**, without draining.
+    ///
+    /// Needed by the `pending_message_count` hook (the `turn_end`
+    /// `pendingMessages` field): the drain helpers below consume the queue,
+    /// so asking "how many are left?" with them would eat the messages.
+    fn len_for_lane(&self, lane: &str) -> usize {
+        self.pending.iter().filter(|item| item.lane == lane).count()
+    }
+
     /// Take every queued item for `lane`, keeping each item's id.
     ///
     /// The id matters: it is what the durable `queue_enqueued` record named, so
@@ -4539,6 +4548,25 @@ impl AgentHarness {
                     let queue = Arc::clone(&queue);
                     let settle = Arc::clone(&settle);
                     Box::pin(async move { harness.drain_injected(queue, &settle).await })
+                })
+            }),
+            // Read-only queue depth (**does not drain**).
+            //
+            // The two drain hooks above cannot answer "how many are left?" —
+            // calling them would consume the messages. This reads the harness's
+            // own queues, the same data the drains read, so the "⇥ N queued"
+            // indicator cannot drift from reality.
+            pending_message_count: Some({
+                let steer = Arc::clone(&snap.steering_queue);
+                let follow = Arc::clone(&snap.follow_up_queue);
+                // Queues are per lane, so ask for **this** harness's lane rather
+                // than hardcoding "main": lanes made by `AgentHarness::lane(name)`
+                // run through the same `run_admitted_inner`, and hardcoding would
+                // count their messages as main's (or always report 0).
+                let lane = self.lane.clone();
+                Arc::new(move || {
+                    steer.lock().map(|q| q.len_for_lane(&lane)).unwrap_or(0)
+                        + follow.lock().map(|q| q.len_for_lane(&lane)).unwrap_or(0)
                 })
             }),
             before_tool_call: snap.before_tool_call.clone(),

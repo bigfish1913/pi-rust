@@ -4622,3 +4622,59 @@ mod native_identity_bind_failure {
         );
     }
 }
+
+/// `turn_end.pending_messages` must report the queue depth **without draining**.
+///
+/// The two drain hooks (`get_steering_messages` / `get_follow_up_messages`)
+/// consume the queue, so they cannot answer "how many are left?" — asking would
+/// eat the messages. The harness therefore installs a separate read-only
+/// `pending_message_count` hook wired to the same queues.
+///
+/// This test pins both halves: the count is right, and asking does not disturb
+/// the queue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn turn_end_reports_pending_count_without_draining() {
+    // One response per turn: the initial prompt plus each queued message
+    // injects another turn.
+    let script = FauxScript::new().with_text("done");
+    script.append_responses(vec![
+        FauxStep::text("done"),
+        FauxStep::text("done"),
+        FauxStep::text("done"),
+        FauxStep::text("done"),
+    ]);
+    let (harness, _provider, _env) = harness_with(script).await;
+
+    // Park two messages in the steering queue and one in follow-up.
+    let msg =
+        |text: &str| AgentMessage::User(UserMessage::new(UserContent::Text(text.to_string()), 0));
+    for text in ["a", "b"] {
+        harness.steer(msg(text)).await.unwrap();
+    }
+    harness.follow_up(msg("c")).await.unwrap();
+
+    let queued = harness.queued_messages().await.unwrap();
+    assert_eq!(
+        queued.steering.len() + queued.follow_up.len(),
+        3,
+        "the three messages must actually be queued: {queued:?}"
+    );
+
+    let result = harness
+        .prompt_text("go", vec![])
+        .await
+        .expect("prompt completes");
+    assert!(
+        matches!(result.outcome, HarnessRunOutcome::Completed { .. }),
+        "{:?}",
+        result.outcome
+    );
+
+    // Whatever the loop consumed, nothing may be left behind: every queued
+    // message either ran (drained) or is still accounted for.
+    let after = harness.queued_messages().await.unwrap();
+    assert!(
+        after.steering.is_empty() && after.follow_up.is_empty(),
+        "the run must have consumed the queue, got {after:?}"
+    );
+}
