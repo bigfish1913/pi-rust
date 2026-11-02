@@ -2095,27 +2095,7 @@ mod tests {
             rpi_plugin_sdk::callbacks::OwnedString::from_raw(out, Some(crate::host_free_string))
         });
     }
-}
-
-impl Drop for ActionBridge {
-    fn drop(&mut self) {
-        bridges()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|_, weak| !std::ptr::eq(weak.as_ptr(), self));
-        if self.invocation.is_some() {
-            return;
-        }
-        if let Some((owner, _)) = &self.plugin_identity {
-            self.ext_status.remove_owner(*owner);
-            self.host.cancel_child_agents(*owner);
-            self.host.cancel_side_questions(*owner);
-        }
-    }
-}
-
-#[cfg(test)]
-mod runtime_tests    /// The FFI trampoline's ceiling must be exactly the SDK's highest action id.
+    /// The FFI trampoline's ceiling must be exactly the SDK's highest action id.
     ///
     /// A branch that adds an action but leaves the ceiling behind compiles,
     /// keeps every other test green, and quietly makes the newest action
@@ -2158,12 +2138,28 @@ mod runtime_tests    /// The FFI trampoline's ceiling must be exactly the SDK's 
         if rc == 0 {
             // SAFETY: success means the trampoline wrote a live host allocation.
             drop(unsafe {
-                rpi_plugin_sdk::callbacks::OwnedString::from_raw(
-                    out,
-                    Some(crate::host_free_string),
-                )
+                rpi_plugin_sdk::callbacks::OwnedString::from_raw(out, Some(crate::host_free_string))
             });
         }
     }
-
 }
+
+impl Drop for ActionBridge {
+    fn drop(&mut self) {
+        bridges()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, weak| !std::ptr::eq(weak.as_ptr(), self));
+        if self.invocation.is_some() {
+            return;
+        }
+        if let Some((owner, _)) = &self.plugin_identity {
+            self.ext_status.remove_owner(*owner);
+            self.host.cancel_child_agents(*owner);
+            self.host.cancel_side_questions(*owner);
+        }
+    }
+}
+
+#[cfg(test)]
+mod runtime_tests;
