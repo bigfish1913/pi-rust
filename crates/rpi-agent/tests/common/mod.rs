@@ -213,6 +213,7 @@ pub fn loop_config_with_converter(
         after_tool_results: None,
         get_steering_messages: None,
         get_follow_up_messages: None,
+        pending_message_count: None,
         before_tool_call: None,
         after_tool_call: None,
         tool_execution: rpi_agent::ToolExecutionMode::Parallel,

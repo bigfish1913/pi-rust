@@ -104,6 +104,13 @@ fn selection_is_explicit(state: &Arc<TuiState>, sugg: &AutocompleteSuggestions) 
 /// rows until the popup closes, and closing empties the container so the
 /// transcript reclaims the rows.
 ///
+/// The pad rows stand ABOVE the live candidates, not below them: the dock
+/// places this container directly on top of the editor, so a pad tail would
+/// push the rows the user reads away from the input they belong to — the
+/// highlighted first choice would sit at the popup's top edge and stay there
+/// while the draft narrows, however close the panel once was. Blanking from
+/// the top keeps the candidates anchored to the editor's top border.
+///
 /// Keeping the row *count* flat is not enough on its own: a row rendered by
 /// `Text` word-wraps, so a long candidate costs two screen lines while the
 /// blank pad that replaces it costs one, and the popup still contracts behind
@@ -182,11 +189,14 @@ fn close_autocomplete_popup(state: &Arc<TuiState>) {
 }
 
 /// Write `rows` into the popup container, relabeling its `Text` children in
-/// place and never shrinking the row count: rows past `rows.len()` are
-/// blanked, not removed, so the dock keeps the height the popup already had
-/// while candidates shrink. Only a close (`close_autocomplete_popup`) or an
-/// outside owner (selector/extension swaps clear the container) resets the
-/// row set.
+/// place and never shrinking the row count: rows that left the candidate
+/// window are blanked, not removed, so the dock keeps the height the popup
+/// already had while candidates shrink. The blanks are taken from the TOP of
+/// the container — the dock stacks it directly above the editor, so filling
+/// from the top would push the candidates up, away from the input line, and
+/// park the first choice at the popup's top edge however few rows remain.
+/// Only a close (`close_autocomplete_popup`) or an outside owner
+/// (selector/extension swaps clear the container) resets the row set.
 fn render_popup_rows(state: &Arc<TuiState>, rows: Vec<String>) {
     let children = state.autocomplete_container.get_children();
     if children
@@ -198,15 +208,18 @@ fn render_popup_rows(state: &Arc<TuiState>, rows: Vec<String>) {
         state.autocomplete_container.clear();
         return render_popup_rows(state, rows);
     }
+    let pad = children.len().saturating_sub(rows.len());
     for (index, child) in children.iter().enumerate() {
         let popup_row = child
             .as_any()
             .downcast_ref::<PopupRow>()
             .expect("checked above");
-        match rows.get(index) {
-            Some(line) => popup_row.set_line(line.clone()),
-            None => popup_row.set_line(String::new()),
-        }
+        let line = if index < pad {
+            String::new()
+        } else {
+            rows[index - pad].clone()
+        };
+        popup_row.set_line(line);
     }
     for row in rows.iter().skip(children.len()) {
         state

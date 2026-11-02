@@ -132,6 +132,7 @@ async fn children_cannot_expand_tools_or_create_grandchildren() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn child_turn_budget_is_per_instance_and_does_not_change_parent_or_environment() {
+    let _env_guard = crate::run_budget::MAX_TURNS_ENV_TEST_LOCK.lock().await;
     let script = FauxScript::new();
     script.set_responses(vec![
         FauxStep::tool_call("read", serde_json::json!({"path":"test.txt"})),

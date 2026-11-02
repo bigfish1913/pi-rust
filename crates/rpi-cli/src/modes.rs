@@ -2819,6 +2819,39 @@ mod tests {
             rpi_extensions::ToolCallContext::default(),
         );
         crate::extensions_actions::HarnessActionHost::set_harness(&cell, Arc::new(harness.clone()));
+        // Preview's CAS API must not bypass main's host-owned binding guard.
+        let before = harness
+            .session()
+            .find_entries(&EntryQuery::default())
+            .await
+            .unwrap();
+        let values = host
+            .get_session_branch(serde_json::json!({"customTypes":["rpi.value"]}))
+            .await
+            .unwrap();
+        for key in ["rpi.resource-selection.v1", "rpi.resource-inventory.v1"] {
+            let forged = serde_json::json!({
+                "customType":"rpi.value", "data":{"key":key,"value":{}},
+                "expected":{"sessionId":values["sessionId"],"leafId":values["leafId"],"customType":"rpi.value","entryId":null}
+            });
+            assert!(host
+                .append_entry(forged.clone())
+                .await
+                .unwrap_err()
+                .contains("host-owned"));
+            assert!(rpc_append_entry(&harness, &forged)
+                .await
+                .unwrap_err()
+                .contains("host-owned"));
+        }
+        assert_eq!(
+            harness
+                .session()
+                .find_entries(&EntryQuery::default())
+                .await
+                .unwrap(),
+            before
+        );
         let snapshot = host
             .get_session_branch(
                 serde_json::json!({"customTypes":["goal-state"],"limit":1,"order":"newestFirst"}),

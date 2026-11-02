@@ -249,6 +249,72 @@ fn state_rejects_non_consecutive_seq() {
 }
 
 #[test]
+fn clears_retire_frames_from_memory_and_keep_the_log_in_step() {
+    let frame = |seq: u64, stream_index, op| {
+        LaneRecord::AssistantFrame(AssistantFrameRecord {
+            base: rec_base(&format!("frame-{seq}"), seq, "main"),
+            run_id: "run".to_string(),
+            stream_index,
+            op,
+            frame: None,
+        })
+    };
+    let mut state = SessionState::new();
+    for record in [
+        frame(1, 0, AssistantFrameOp::Append),
+        abort_requested(2, "abort", "run"),
+        frame(3, 1, AssistantFrameOp::Append),
+        frame(4, 0, AssistantFrameOp::ClearStream),
+    ] {
+        state
+            .apply_mutation(SessionMutation::Record { record })
+            .unwrap();
+    }
+    let log_seqs = |state: &SessionState| -> Vec<u64> {
+        let log = state.get_log(&LogOptions::default()).unwrap();
+        log.iter().map(|item| item.seq()).collect()
+    };
+    assert_eq!(log_seqs(&state), [2, 3, 4]);
+
+    state
+        .apply_mutation(SessionMutation::Record {
+            record: frame(5, 0, AssistantFrameOp::ClearRun),
+        })
+        .unwrap();
+    assert_eq!(log_seqs(&state), [2, 4, 5]);
+}
+
+#[test]
+fn retired_frames_keep_their_ids_reserved() {
+    let frame = |id: &str, seq: u64, op| {
+        LaneRecord::AssistantFrame(AssistantFrameRecord {
+            base: rec_base(id, seq, "main"),
+            run_id: "run".to_string(),
+            stream_index: 0,
+            op,
+            frame: None,
+        })
+    };
+    let mut state = SessionState::new();
+    for record in [
+        frame("frame", 1, AssistantFrameOp::Append),
+        frame("clear", 2, AssistantFrameOp::ClearRun),
+    ] {
+        state
+            .apply_mutation(SessionMutation::Record { record })
+            .unwrap();
+    }
+
+    assert!(state.validate_unused_id("frame").is_err());
+    let err = state
+        .apply_mutation(SessionMutation::Record {
+            record: frame("frame", 3, AssistantFrameOp::Append),
+        })
+        .unwrap_err();
+    assert!(err.to_string().contains("already exists"));
+}
+
+#[test]
 fn state_rejects_write_once_id_reuse() {
     let mut state = SessionState::new();
     let user = user_message("hi");

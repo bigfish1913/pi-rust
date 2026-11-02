@@ -57,6 +57,75 @@ async fn load(fs: Arc<dyn FileSystem>, path: &str) -> JsonlSessionStorage {
     .await
     .unwrap()
 }
+#[tokio::test]
+async fn read_snapshot_preserves_cold_frames_without_repair_or_file_capabilities() {
+    for damage in ["none", "duplicate", "torn", "unterminated"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.jsonl");
+        let original = text();
+        let mut raw = original.clone();
+        match damage {
+            "duplicate" => raw.push_str(&encode_mutation(&record(2, AssistantFrameOp::Append))),
+            "torn" => raw.push_str("{\"seq\":9,"),
+            "unterminated" => {
+                raw.pop();
+            }
+            _ => {}
+        }
+        std::fs::write(&path, &raw).unwrap();
+        let fs: Arc<dyn FileSystem> = Arc::new(OsExecutionEnv::with_cwd(dir.path().into()));
+        let snapshot = JsonlSessionStorage::read_snapshot(
+            fs.clone(),
+            path.to_str().unwrap(),
+            Arc::new(SystemClock),
+            Arc::new(DefaultIdGenerator::new()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            Arc::strong_count(&fs),
+            1,
+            "snapshot must release file/storage capabilities"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        let normal = load(fs, path.to_str().unwrap()).await;
+        let expected = normal.find_records(&RecordQuery::default()).await.unwrap();
+        let expected_log = normal.get_log(&LogOptions::default()).await.unwrap();
+        assert_eq!(
+            snapshot
+                .find_records(&RecordQuery::default())
+                .await
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            snapshot.get_log(&LogOptions::default()).await.unwrap(),
+            expected_log
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        snapshot.set_name(Some("memory only")).await.unwrap();
+        let detached_log = snapshot.get_log(&LogOptions::default()).await.unwrap();
+        assert_eq!(detached_log.len(), expected_log.len() + 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        drop(normal);
+        // Neither in-place changes nor deletion can alter a detached snapshot.
+        std::fs::write(&path, "replaced").unwrap();
+        assert_eq!(
+            snapshot
+                .find_records(&RecordQuery::default())
+                .await
+                .unwrap(),
+            expected
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            snapshot.get_log(&LogOptions::default()).await.unwrap(),
+            detached_log
+        );
+    }
+}
+
 async fn assert_equal(left: &JsonlSessionStorage, right: &JsonlSessionStorage) {
     for order in [EntryOrder::OldestFirst, EntryOrder::NewestFirst] {
         for limit in [None, Some(1), Some(3)] {
@@ -198,7 +267,7 @@ async fn cold_indexes_survive_duplicate_torn_and_unterminated_tail_repairs() {
 }
 
 #[tokio::test]
-async fn read_snapshot_preserves_cold_frames_without_repair_or_file_capabilities() {
+async fn read_snapshot_preserves_historical_payloads_after_source_replacement() {
     for damage in ["none", "duplicate", "torn", "unterminated"] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("history.jsonl");

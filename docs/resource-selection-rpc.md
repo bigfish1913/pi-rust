@@ -262,9 +262,11 @@ cargo test -p rpi-harness --lib agent_harness::child::tests --locked
 
 The native-process tests automatically build the real workspace `plugin-stub`
 against the workspace SDK using `cargo build --lib --locked --offline` (never
-recursive tests). Each build owns fresh isolated temporary target **and Cargo
-build/intermediate directories**, disables incremental output, has a 120-second /
-2-MiB output bound, and cleans up after native hosts exit.
+recursive tests). Builds honor explicit `CARGO_TARGET_DIR` and
+`CARGO_BUILD_BUILD_DIR` caches (otherwise fixture-owned directories), disable
+incremental output, and have a 120-second / 2-MiB output bound. Each fixture owns
+a fresh isolated DLL copy, cleaned up after native hosts exit; tests sharing a
+Cargo cache must not run concurrent Cargo runners.
 There is no prebuilt/stale-DLL fallback or silent skip; concurrent test processes
 cannot share loaded DLL paths. A build-only source/SDK digest in the real
 registration side effect proves the fixture came from current source. Ordinary
