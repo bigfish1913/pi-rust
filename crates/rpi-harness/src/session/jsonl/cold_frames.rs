@@ -193,14 +193,7 @@ impl JsonlPayload {
                 source,
                 parent,
                 live_nulls,
-            } => {
-                let SessionMutation::Entry { mut entry, .. } = source.read().await? else {
-                    return Err(SessionError::invalid_entry("cold entry identity mismatch"));
-                };
-                entry.base_mut().parent_id = parent.clone();
-                live_nulls.apply(&mut entry);
-                Ok(entry)
-            }
+            } => restore_entry(source.read().await?, parent, live_nulls),
         }
     }
 }
@@ -431,6 +424,81 @@ impl ResidentState {
             facts,
         })
     }
+    /// Pin the lane leaf and payload generations together under the caller's
+    /// state lock. Only default model-visible rows after the latest compaction
+    /// can contribute; an ordinary assistant usage lets us skip earlier bodies.
+    pub fn context_usage_plan(&self, lane: &str) -> SessionResult<ContextUsagePlan> {
+        use rpi_ai::types::StopReason;
+        let leaf = self.reducer.require_lane(lane)?;
+        let mut path = self
+            .reducer
+            .walk_to_root(leaf.as_deref(), &BranchBounds::default())?;
+        path.reverse();
+        let boundary = path
+            .iter()
+            .rposition(|&i| self.reducer.entry_meta(i).unwrap().kind == "compaction")
+            .unwrap_or(0);
+        let path = &path[boundary..];
+        let anchor = path
+            .iter()
+            .rposition(|&i| {
+                let meta = self.reducer.entry_meta(i).unwrap();
+                meta.kind == "message"
+                    && meta.stop_reason.as_ref().is_some_and(|reason| {
+                        !matches!(
+                            reason,
+                            StopReason::Deferred | StopReason::Aborted | StopReason::Error
+                        )
+                    })
+                    && meta
+                        .usage
+                        .as_ref()
+                        .is_some_and(|usage| usage.context_tokens() > 0)
+            })
+            .unwrap_or(0);
+        let message_offset = path[..anchor]
+            .iter()
+            .map(|&i| self.reducer.entry_meta(i).unwrap().context_message_count)
+            .sum();
+        let selected = self.refs(
+            path[anchor..]
+                .iter()
+                .copied()
+                .filter(|&i| self.reducer.entry_meta(i).unwrap().context_message_count > 0),
+        );
+        Ok(ContextUsagePlan {
+            selected,
+            message_offset,
+        })
+    }
+
+    pub fn transcript_plan(
+        &self,
+        lane: &str,
+        query: &TranscriptPageQuery,
+    ) -> SessionResult<TranscriptPlan> {
+        let leaf_id = self.reducer.require_lane(lane)?;
+        let mut indices = self
+            .reducer
+            .walk_to_root(leaf_id.as_deref(), &BranchBounds::default())?;
+        indices.reverse();
+        indices.retain(|&i| self.reducer.entry_meta(i).unwrap().is_transcript());
+        let total = indices.len();
+        let end = match &query.before_id {
+            Some(id) => indices
+                .iter()
+                .position(|&i| self.reducer.entry_meta(i).unwrap().id == *id)
+                .ok_or_else(|| SessionError::invalid_query(format!("beforeId not found: {id}")))?,
+            None => total,
+        };
+        let start = end.saturating_sub(query.limit.max(1));
+        Ok(TranscriptPlan {
+            selected: self.refs(indices[start..end].iter().copied()),
+            total,
+            has_more: start > 0,
+            leaf_id,
+        })
+    }
     pub fn summary_plan(
         &self,
         lane: &str,
@@ -615,12 +683,171 @@ pub(super) struct ForkPlan {
     pub labels: Vec<(String, String)>,
     pub name: Option<String>,
 }
+fn restore_entry(
+    mutation: SessionMutation,
+    parent: &Option<String>,
+    live_nulls: &LiveNulls,
+) -> SessionResult<Entry> {
+    let SessionMutation::Entry { mut entry, .. } = mutation else {
+        return Err(SessionError::invalid_entry("cold entry identity mismatch"));
+    };
+    entry.base_mut().parent_id = parent.clone();
+    live_nulls.apply(&mut entry);
+    Ok(entry)
+}
+
+// Coalesce only within this read plan and reader generation. Keep selected order
+// independently of physical offsets; no payload is retained in the index/cache.
+async fn read_entries(selected: Vec<JsonlPayload>) -> SessionResult<Vec<Entry>> {
+    let mut entries = vec![None; selected.len()];
+    let mut locations = Vec::new();
+    // Consume resident references before any I/O so a retired plan does not
+    // retain all original bodies alongside their defensive copies.
+    for (slot, payload) in selected.into_iter().enumerate() {
+        match payload {
+            JsonlPayload::Resident(entry) => entries[slot] = Some((*entry).clone()),
+            JsonlPayload::Cold {
+                source,
+                parent,
+                live_nulls,
+            } => {
+                locations.push((slot, source, parent, live_nulls));
+            }
+        }
+    }
+    locations.sort_unstable_by_key(|(_, loc, _, _)| {
+        (Arc::as_ptr(&loc.reader) as *const () as usize, loc.offset)
+    });
+    let overflow = || SessionError::storage("cold history range overflow");
+    let mut start = 0;
+    while start < locations.len() {
+        let (_, first, _, _) = &locations[start];
+        let mut end = start + 1;
+        let mut range_end = first
+            .offset
+            .checked_add(u64::try_from(first.length).map_err(|_| overflow())?)
+            .ok_or_else(overflow)?;
+        while end < locations.len() {
+            let (_, next, _, _) = &locations[end];
+            let next_end = next
+                .offset
+                .checked_add(u64::try_from(next.length).map_err(|_| overflow())?)
+                .ok_or_else(overflow)?;
+            let combined_end = range_end.max(next_end);
+            if !Arc::ptr_eq(&first.reader, &next.reader)
+                || next.offset.saturating_sub(range_end) > 8192
+                || combined_end.saturating_sub(first.offset) > 256 * 1024
+            {
+                break;
+            }
+            range_end = combined_end;
+            end += 1;
+        }
+        let length = usize::try_from(range_end - first.offset).map_err(|_| overflow())?;
+        let bytes = file_result(
+            first.reader.read_range(first.offset, length).await,
+            "read cold history range",
+        )?;
+        if bytes.len() != length {
+            return Err(SessionError::storage("short cold history read"));
+        }
+        for (slot, loc, parent, live_nulls) in &locations[start..end] {
+            let offset = usize::try_from(loc.offset - first.offset).map_err(|_| overflow())?;
+            let end = offset.checked_add(loc.length).ok_or_else(overflow)?;
+            let raw = bytes.get(offset..end).ok_or_else(overflow)?;
+            entries[*slot] = Some(restore_entry(loc.decode(raw)?, parent, live_nulls)?);
+        }
+        start = end;
+    }
+    entries
+        .into_iter()
+        .map(|entry| entry.ok_or_else(|| SessionError::storage("missing selected entry")))
+        .collect()
+}
+
+/// No body/token cache: a plan owns only selected payload references and an
+/// exact projection offset. All I/O and canonical projection occur lock-free.
+pub(super) struct ContextUsagePlan {
+    selected: Vec<JsonlPayload>,
+    message_offset: usize,
+}
+impl ContextUsagePlan {
+    pub async fn read(self) -> SessionResult<crate::compaction::ContextUsageEstimate> {
+        use crate::compaction::{estimate_context_tokens, ContextUsageEstimate};
+        let mut estimate = ContextUsageEstimate::default();
+        let mut offset = self.message_offset;
+        let mut selected = self.selected.into_iter().peekable();
+        while let Some(first) = selected.next() {
+            // Resident entries and oversized cold rows are always handled alone.
+            let mut bytes = match &first {
+                JsonlPayload::Cold { source, .. } => Some(source.length),
+                JsonlPayload::Resident(_) => None,
+            };
+            let mut batch = vec![first];
+            while batch.len() < 16 {
+                let (Some(total), Some(JsonlPayload::Cold { source, .. })) =
+                    (bytes, selected.peek())
+                else {
+                    break;
+                };
+                if total > 256 * 1024 || source.length > 256 * 1024 - total {
+                    break;
+                }
+                bytes = Some(total + source.length);
+                batch.push(selected.next().unwrap());
+            }
+            for entry in read_entries(batch).await? {
+                let messages = crate::session::context::build_session_context_owned(
+                    vec![entry],
+                    &Default::default(),
+                )
+                .messages;
+                let group = estimate_context_tokens(&messages);
+                if let Some(index) = group.last_usage_index {
+                    estimate = ContextUsageEstimate {
+                        last_usage_index: Some(offset + index),
+                        ..group
+                    };
+                } else {
+                    estimate.trailing_tokens += group.trailing_tokens;
+                    estimate.tokens = estimate.usage_tokens + estimate.trailing_tokens;
+                }
+                offset += messages.len();
+                // The row and projected message bodies are dropped each iteration.
+            }
+        }
+        Ok(estimate)
+    }
+}
+
+pub(super) struct TranscriptPlan {
+    selected: Vec<JsonlPayload>,
+    total: usize,
+    has_more: bool,
+    leaf_id: Option<String>,
+}
+impl TranscriptPlan {
+    pub async fn read(self) -> SessionResult<TranscriptPage> {
+        Ok(TranscriptPage {
+            entries: read_entries(self.selected).await?,
+            total: self.total,
+            has_more: self.has_more,
+            leaf_id: self.leaf_id,
+        })
+    }
+}
+
 pub(super) struct EntryPlan {
     selected: Vec<JsonlPayload>,
     query: EntryQuery,
 }
 impl EntryPlan {
     pub async fn read(self) -> SessionResult<Vec<Entry>> {
+        // Metadata selection already applied limit. Payload predicates must
+        // retain their original early stop: do not decode unconsumed rows.
+        if self.query.tool_call_id.is_none() && self.query.outbox_key.is_none() {
+            return read_entries(self.selected).await;
+        }
         let mut entries = Vec::new();
         for payload in self.selected {
             let entry = payload.read().await?;
@@ -640,10 +867,7 @@ pub(super) struct ContextPlan {
 }
 impl ContextPlan {
     pub async fn read(mut self) -> SessionResult<crate::session::context::SessionContext> {
-        let mut entries = Vec::with_capacity(self.selected.len());
-        for payload in self.selected {
-            entries.push(payload.read().await?);
-        }
+        let entries = read_entries(self.selected).await?;
         self.facts.messages =
             crate::session::context::build_session_context_owned(entries, &Default::default())
                 .messages;
@@ -864,6 +1088,9 @@ impl LogPlan {
         Ok(result)
     }
 }
+#[cfg(test)]
+#[path = "context_usage_tests.rs"]
+mod context_usage_tests;
 #[cfg(test)]
 #[path = "cold_frames_tests.rs"]
 mod tests;

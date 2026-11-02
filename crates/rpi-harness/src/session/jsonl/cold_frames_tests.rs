@@ -307,3 +307,942 @@ async fn published_frame_plan_does_not_block_new_cold_append() {
     );
     assert_eq!(lazy.sequence(), 101);
 }
+
+// Entry hydration regressions: construction follows the streaming loader's
+// apply_loaded(mutation, reader, offset, raw) path, not the frame-only defer.
+fn entry_batch_reader() -> Arc<MemoryReader> {
+    Arc::new(MemoryReader {
+        bytes: Mutex::new(Vec::new()),
+        reads: AtomicUsize::new(0),
+        read_bytes: AtomicUsize::new(0),
+    })
+}
+
+fn entry_batch_user(seq: u64, text: &str) -> SessionMutation {
+    SessionMutation::Entry {
+        seq,
+        timestamp: 1,
+        lane: Some("main".into()),
+        entry: Entry::Message(MessageEntry {
+            base: EntryBase {
+                entry_type: "message".into(),
+                id: format!("entry-{seq}"),
+                seq,
+                parent_id: (seq > 1).then(|| format!("entry-{}", seq - 1)),
+                timestamp: 1,
+            },
+            message: rpi_ai::UserMessage::new(text, 1).into(),
+            terminate: None,
+        }),
+    }
+}
+
+fn entry_batch_load(
+    state: &mut ResidentState,
+    reader: &Arc<MemoryReader>,
+    mutation: SessionMutation,
+    gap: usize,
+) -> (usize, usize) {
+    let raw = encode_mutation(&mutation);
+    let offset = {
+        let mut bytes = reader.bytes.lock().unwrap();
+        let offset = bytes.len() + gap;
+        bytes.resize(offset, b' ');
+        bytes.extend_from_slice(raw.as_bytes());
+        offset
+    };
+    let source: Arc<dyn ReadFile> = reader.clone();
+    state
+        .apply_loaded(mutation, &source, offset as u64, raw.as_bytes())
+        .unwrap();
+    (offset, raw.len())
+}
+
+fn entry_batch_fixture(count: u64) -> (ResidentState, SessionState, Arc<MemoryReader>) {
+    let reader = entry_batch_reader();
+    let mut cold = ResidentState::default();
+    let mut eager = SessionState::new();
+    for seq in 1..=count {
+        let mutation = entry_batch_user(seq, &format!("message {seq} 🌊\r\n"));
+        eager.apply_mutation(mutation.clone()).unwrap();
+        entry_batch_load(&mut cold, &reader, mutation, 0);
+    }
+    (cold, eager, reader)
+}
+
+#[tokio::test]
+async fn cold_entry_batch_preserves_selected_order_limit_and_rereads() {
+    let (cold, eager, reader) = entry_batch_fixture(60);
+    for order in [EntryOrder::OldestFirst, EntryOrder::NewestFirst] {
+        let query = EntryQuery {
+            order: Some(order),
+            limit: Some(50),
+            ..Default::default()
+        };
+        let expected = eager.find_entries(&query).unwrap();
+        let selected_bytes: usize = expected
+            .iter()
+            .map(|entry| {
+                encode_mutation(&SessionMutation::Entry {
+                    seq: entry.seq(),
+                    timestamp: 1,
+                    lane: Some("main".into()),
+                    entry: entry.clone(),
+                })
+                .len()
+            })
+            .sum();
+        for _ in 0..2 {
+            let reads = reader.reads.load(Ordering::Relaxed);
+            let bytes = reader.read_bytes.load(Ordering::Relaxed);
+            assert_eq!(
+                cold.entry_plan(&query, None).unwrap().read().await.unwrap(),
+                expected
+            );
+            assert_eq!(reader.reads.load(Ordering::Relaxed) - reads, 1);
+            assert_eq!(
+                reader.read_bytes.load(Ordering::Relaxed) - bytes,
+                selected_bytes
+            );
+        }
+    }
+    assert!(matches!(
+        cold.entry_ref("entry-1"),
+        Some(JsonlPayload::Cold { .. })
+    ));
+    assert!(matches!(
+        cold.entry_ref("entry-60"),
+        Some(JsonlPayload::Cold { .. })
+    ));
+}
+
+#[tokio::test]
+async fn cold_context_batch_coalesces_fifty_entries_without_warming() {
+    let (cold, eager, reader) = entry_batch_fixture(50);
+    let bounds = BranchBounds::default();
+    let expected = eager.context_on_branch(&bounds, "entry-50").unwrap();
+    for reads in 1..=2 {
+        let actual = cold
+            .context_plan(&bounds, "entry-50")
+            .unwrap()
+            .read()
+            .await
+            .unwrap();
+        assert_eq!(actual.messages, expected.messages);
+        assert_eq!(actual.thinking_level, expected.thinking_level);
+        assert_eq!(actual.model, expected.model);
+        assert_eq!(actual.active_tool_names, expected.active_tool_names);
+        assert_eq!(reader.reads.load(Ordering::Relaxed), reads);
+        assert_eq!(
+            reader.read_bytes.load(Ordering::Relaxed),
+            reader.bytes.lock().unwrap().len() * reads
+        );
+    }
+}
+
+#[tokio::test]
+async fn cold_entry_batch_mixes_resident_and_distinct_reader_generations() {
+    let mut cold = ResidentState::default();
+    let mut eager = SessionState::new();
+    let first = entry_batch_reader();
+    let second = entry_batch_reader();
+    for seq in 1..=5 {
+        let mutation = entry_batch_user(seq, &format!("generation payload {seq}"));
+        eager.apply_mutation(mutation.clone()).unwrap();
+        match seq {
+            2 => {
+                cold.apply_mutation(mutation).unwrap();
+            }
+            1 | 3 => {
+                entry_batch_load(&mut cold, &first, mutation, 0);
+            }
+            _ => {
+                entry_batch_load(&mut cold, &second, mutation, 0);
+            }
+        }
+    }
+    // Both source generations begin at offset zero, but contain different IDs.
+    // Keep the plan alive after replacing the entire resident view as well.
+    let query = EntryQuery {
+        order: Some(EntryOrder::OldestFirst),
+        ..Default::default()
+    };
+    let plan = cold.entry_plan(&query, None).unwrap();
+    cold = ResidentState::default();
+    assert_eq!(
+        plan.read().await.unwrap(),
+        eager.find_entries(&query).unwrap()
+    );
+    assert_eq!(first.reads.load(Ordering::Relaxed), 1);
+    assert_eq!(second.reads.load(Ordering::Relaxed), 1);
+    for reader in [&first, &second] {
+        assert_eq!(
+            reader.read_bytes.load(Ordering::Relaxed),
+            reader.bytes.lock().unwrap().len()
+        );
+    }
+    assert!(cold.entry_ref("entry-1").is_none());
+}
+
+#[tokio::test]
+async fn cold_entry_batch_checks_each_selected_line_digest() {
+    let (cold, _, reader) = entry_batch_fixture(3);
+    let last = match cold.entry_ref("entry-3").unwrap() {
+        JsonlPayload::Cold { source, .. } => source.offset as usize,
+        _ => panic!("expected cold entry"),
+    };
+    // Change message text without changing JSON shape, identity, or length.
+    // Every row's digest must be checked, even the last row of a merged read.
+    {
+        let mut bytes = reader.bytes.lock().unwrap();
+        let text = bytes[last..]
+            .windows(b"message 3".len())
+            .position(|window| window == b"message 3")
+            .unwrap();
+        bytes[last + text] = b'M';
+    }
+    let error = cold
+        .entry_plan(&EntryQuery::default(), None)
+        .unwrap()
+        .read()
+        .await
+        .unwrap_err();
+    assert!(error.message.contains("source changed"));
+    assert_eq!(reader.reads.load(Ordering::Relaxed), 1);
+    let error = cold
+        .context_plan(&BranchBounds::default(), "entry-3")
+        .unwrap()
+        .read()
+        .await
+        .unwrap_err();
+    assert!(error.message.contains("source changed"));
+}
+
+#[tokio::test]
+async fn cold_entry_and_context_batches_reject_short_ranges() {
+    let (cold, _, reader) = entry_batch_fixture(3);
+    reader.bytes.lock().unwrap().pop();
+    let error = cold
+        .entry_plan(&EntryQuery::default(), None)
+        .unwrap()
+        .read()
+        .await
+        .unwrap_err();
+    assert!(error.message.contains("short cold"));
+    let error = cold
+        .context_plan(&BranchBounds::default(), "entry-3")
+        .unwrap()
+        .read()
+        .await
+        .unwrap_err();
+    assert!(error.message.contains("short cold"));
+    assert_eq!(reader.reads.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test]
+async fn cold_entry_batch_gap_boundary_is_inclusive_and_bounded() {
+    for (gap, expected_reads) in [(8192, 1), (8193, 2)] {
+        let reader = entry_batch_reader();
+        let mut cold = ResidentState::default();
+        let (_, first_len) = entry_batch_load(&mut cold, &reader, entry_batch_user(1, "first"), 0);
+        let (_, second_len) =
+            entry_batch_load(&mut cold, &reader, entry_batch_user(2, "second"), gap);
+        let entries = cold
+            .entry_plan(&EntryQuery::default(), None)
+            .unwrap()
+            .read()
+            .await
+            .unwrap();
+        assert_eq!(
+            entries.iter().map(Entry::id).collect::<Vec<_>>(),
+            vec!["entry-2", "entry-1"]
+        );
+        assert_eq!(
+            reader.reads.load(Ordering::Relaxed),
+            expected_reads,
+            "gap {gap}"
+        );
+        assert_eq!(
+            reader.read_bytes.load(Ordering::Relaxed),
+            first_len + second_len + if expected_reads == 1 { gap } else { 0 }
+        );
+    }
+}
+
+#[tokio::test]
+async fn cold_entry_batch_span_boundary_is_inclusive_and_bounded() {
+    const MAX_SPAN: usize = 256 * 1024;
+
+    for (span, expected_reads) in [(MAX_SPAN, 1), (MAX_SPAN + 1, 2)] {
+        let reader = entry_batch_reader();
+        let mut cold = ResidentState::default();
+        let (_, first_len) = entry_batch_load(&mut cold, &reader, entry_batch_user(1, "first"), 0);
+        let empty_len = encode_mutation(&entry_batch_user(2, "")).len();
+        let (_, second_len) = entry_batch_load(
+            &mut cold,
+            &reader,
+            entry_batch_user(2, &"x".repeat(span - first_len - empty_len)),
+            0,
+        );
+        assert_eq!(first_len + second_len, span);
+        assert!(second_len < MAX_SPAN);
+        let entries = cold
+            .entry_plan(&EntryQuery::default(), None)
+            .unwrap()
+            .read()
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            reader.reads.load(Ordering::Relaxed),
+            expected_reads,
+            "span {span}"
+        );
+        assert_eq!(reader.read_bytes.load(Ordering::Relaxed), span);
+    }
+}
+
+#[tokio::test]
+async fn cold_entry_batch_reads_oversized_single_line_without_neighbors() {
+    let reader = entry_batch_reader();
+    let mut cold = ResidentState::default();
+    let mut eager = SessionState::new();
+    for (seq, text) in [
+        (1, "before".into()),
+        (2, "x".repeat(256 * 1024)),
+        (3, "after".into()),
+    ] {
+        let mutation = entry_batch_user(seq, &text);
+        eager.apply_mutation(mutation.clone()).unwrap();
+        entry_batch_load(&mut cold, &reader, mutation, 0);
+    }
+    let query = EntryQuery::default();
+    assert_eq!(
+        cold.entry_plan(&query, None).unwrap().read().await.unwrap(),
+        eager.find_entries(&query).unwrap()
+    );
+    assert_eq!(reader.reads.load(Ordering::Relaxed), 3);
+    assert_eq!(
+        reader.read_bytes.load(Ordering::Relaxed),
+        reader.bytes.lock().unwrap().len()
+    );
+}
+
+fn entry_batch_tool(call: &str) -> rpi_agent::message::AgentMessage {
+    rpi_ai::ToolResultMessage {
+        role: rpi_ai::types::ToolResultRole,
+        tool_call_id: call.into(),
+        tool_name: "tool".into(),
+        content: Vec::new(),
+        details: Some(serde_json::Value::Null),
+        usage: None,
+        added_tool_names: Vec::new(),
+        is_error: false,
+        timestamp: 1,
+    }
+    .into()
+}
+
+#[tokio::test]
+async fn cold_entry_payload_filters_stop_before_corrupt_unconsumed_rows() {
+    for outbox in [false, true] {
+        let reader = entry_batch_reader();
+        let mut cold = ResidentState::default();
+        let mut eager = SessionState::new();
+        let mut consumed_bytes = 0;
+        for seq in 1..=3 {
+            let key = if seq == 2 { "wanted" } else { "other" };
+            let mut mutation = entry_batch_user(seq, "unused");
+            if let SessionMutation::Entry {
+                entry: Entry::Message(entry),
+                ..
+            } = &mut mutation
+            {
+                entry.message = if outbox {
+                    rpi_agent::message::AgentMessage::Custom(
+                        rpi_agent::message::CustomMessage::new(
+                            "outbox",
+                            Vec::new(),
+                            json!({"__rpiOutbox":{"key":key}}),
+                            1,
+                        ),
+                    )
+                } else {
+                    entry_batch_tool(key)
+                };
+            }
+            eager.apply_mutation(mutation.clone()).unwrap();
+            let (offset, length) = entry_batch_load(&mut cold, &reader, mutation, 0);
+            if seq < 3 {
+                consumed_bytes += length;
+            } else {
+                reader.bytes.lock().unwrap()[offset] = b'!';
+            }
+        }
+        let query = EntryQuery {
+            order: Some(EntryOrder::OldestFirst),
+            limit: Some(1),
+            tool_call_id: (!outbox).then(|| "wanted".into()),
+            outbox_key: outbox.then(|| "wanted".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            cold.entry_plan(&query, None).unwrap().read().await.unwrap(),
+            eager.find_entries(&query).unwrap()
+        );
+        assert_eq!(reader.reads.load(Ordering::Relaxed), 2);
+        assert_eq!(reader.read_bytes.load(Ordering::Relaxed), consumed_bytes);
+        let unlimited = EntryQuery {
+            limit: None,
+            ..query
+        };
+        assert!(cold
+            .entry_plan(&unlimited, None)
+            .unwrap()
+            .read()
+            .await
+            .unwrap_err()
+            .message
+            .contains("source changed"));
+    }
+}
+
+#[tokio::test]
+async fn cold_entry_batch_restores_rechained_parent_and_live_nulls() {
+    let reader = entry_batch_reader();
+    let source: Arc<dyn ReadFile> = reader.clone();
+    let mut cold = ResidentState::default();
+    let mut eager = SessionState::new();
+    let first = entry_batch_user(1, "root");
+    eager.apply_mutation(first.clone()).unwrap();
+    entry_batch_load(&mut cold, &reader, first, 0);
+    let mut original = entry_batch_user(2, "unused");
+    if let SessionMutation::Entry {
+        entry: Entry::Message(entry),
+        ..
+    } = &mut original
+    {
+        entry.base.parent_id = None; // Divergent raw row, repaired by the loader.
+        entry.message = entry_batch_tool("call");
+    }
+    let raw = encode_mutation(&original);
+    let offset = reader.bytes.lock().unwrap().len();
+    reader
+        .bytes
+        .lock()
+        .unwrap()
+        .extend_from_slice(raw.as_bytes());
+    let mut repaired = original;
+    if let SessionMutation::Entry { entry, .. } = &mut repaired {
+        entry.base_mut().parent_id = Some("entry-1".into());
+    }
+    // Loader contract: digest/identity describe the original row, while the
+    // resident metadata and presence corrections describe the repaired entry.
+    eager.apply_mutation(repaired.clone()).unwrap();
+    cold.apply_loaded(repaired, &source, offset as u64, raw.as_bytes())
+        .unwrap();
+    let query = EntryQuery {
+        order: Some(EntryOrder::OldestFirst),
+        ..Default::default()
+    };
+    let entries = cold.entry_plan(&query, None).unwrap().read().await.unwrap();
+    assert_eq!(entries, eager.find_entries(&query).unwrap());
+    assert_eq!(entries[1].parent_id(), Some("entry-1"));
+    match entries[1].as_message().unwrap() {
+        rpi_agent::message::AgentMessage::ToolResult(result) => {
+            assert_eq!(result.details, Some(serde_json::Value::Null))
+        }
+        _ => panic!("expected tool result"),
+    }
+    assert_eq!(reader.reads.load(Ordering::Relaxed), 1);
+    let bounds = BranchBounds::default();
+    let actual = cold
+        .context_plan(&bounds, "entry-2")
+        .unwrap()
+        .read()
+        .await
+        .unwrap();
+    assert_eq!(
+        actual.messages,
+        eager
+            .context_on_branch(&bounds, "entry-2")
+            .unwrap()
+            .messages
+    );
+    assert_eq!(reader.reads.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test]
+async fn cold_entry_batch_releases_retired_resident_before_io() {
+    struct ReleaseReader {
+        retired: std::sync::Weak<Entry>,
+        bytes: Vec<u8>,
+    }
+    #[async_trait]
+    impl ReadFile for ReleaseReader {
+        async fn read_all(&self) -> Result<Vec<u8>, FileError> {
+            panic!("batch must use range reads")
+        }
+        async fn read_range(&self, offset: u64, length: usize) -> Result<Vec<u8>, FileError> {
+            assert!(
+                self.retired.upgrade().is_none(),
+                "retired original held across I/O"
+            );
+            Ok(self.bytes[offset as usize..offset as usize + length].to_vec())
+        }
+    }
+    let SessionMutation::Entry { entry, .. } = entry_batch_user(1, &"x".repeat(1024 * 1024)) else {
+        unreachable!()
+    };
+    let original = Arc::new(entry);
+    let mutation = entry_batch_user(2, "cold");
+    let bytes = encode_mutation(&mutation).into_bytes();
+    let reader: Arc<dyn ReadFile> = Arc::new(ReleaseReader {
+        retired: Arc::downgrade(&original),
+        bytes: bytes.clone(),
+    });
+    let source = Arc::new(Location::new(reader, 0, &bytes, &mutation));
+    let result = read_entries(vec![
+        JsonlPayload::Resident(original),
+        JsonlPayload::Cold {
+            source,
+            parent: Some("entry-1".into()),
+            live_nulls: LiveNulls::default(),
+        },
+    ])
+    .await
+    .unwrap();
+    assert_eq!(result.len(), 2);
+    assert_eq!(result[1].parent_id(), Some("entry-1"));
+}
+
+#[tokio::test]
+async fn cold_entry_batch_empty_and_overflow_are_checked_without_io() {
+    assert!(read_entries(Vec::new()).await.unwrap().is_empty());
+    let reader = entry_batch_reader();
+    let mutation = entry_batch_user(1, "overflow");
+    let bytes = encode_mutation(&mutation);
+    let source = Arc::new(Location::new(
+        reader.clone(),
+        u64::MAX,
+        bytes.as_bytes(),
+        &mutation,
+    ));
+    let error = read_entries(vec![JsonlPayload::Cold {
+        source,
+        parent: None,
+        live_nulls: LiveNulls::default(),
+    }])
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("overflow"));
+    assert_eq!(reader.reads.load(Ordering::Relaxed), 0);
+}
+
+// Transcript paging selects metadata before retaining or reading payloads.
+fn transcript_query(limit: usize, before: Option<&str>) -> TranscriptPageQuery {
+    TranscriptPageQuery {
+        limit,
+        before_id: before.map(str::to_owned),
+    }
+}
+
+fn transcript_ids(page: &TranscriptPage) -> Vec<&str> {
+    page.entries.iter().map(Entry::id).collect()
+}
+
+fn transcript_fixture() -> (ResidentState, Arc<MemoryReader>) {
+    let reader = entry_batch_reader();
+    let mut cold = ResidentState::default();
+    // Every entry variant appears on main; only messages and compaction belong
+    // to the transcript, including tool-result messages after the compaction.
+    for seq in 1..=9 {
+        let mut mutation = entry_batch_user(seq, &format!("transcript {seq}"));
+        if let SessionMutation::Entry { entry, .. } = &mut mutation {
+            let mut base = entry.base().clone();
+            *entry = match seq {
+                2 => {
+                    base.entry_type = "model_change".into();
+                    Entry::ModelChange(ModelChangeEntry {
+                        base,
+                        provider: "provider".into(),
+                        model_id: "model".into(),
+                    })
+                }
+                3 => {
+                    base.entry_type = "compaction".into();
+                    Entry::Compaction(CompactionEntry {
+                        base,
+                        summary: "summary".into(),
+                        retained_tail: Vec::new(),
+                        tokens_before: 100,
+                        details: None,
+                        usage: None,
+                    })
+                }
+                4 => {
+                    base.entry_type = "thinking_level".into();
+                    Entry::ThinkingLevel(ThinkingLevelEntry {
+                        base,
+                        thinking_level: "high".into(),
+                    })
+                }
+                5 => {
+                    base.entry_type = "active_tools".into();
+                    Entry::ActiveTools(ActiveToolsEntry {
+                        base,
+                        active_tool_names: vec!["read".into()],
+                    })
+                }
+                6 => {
+                    base.entry_type = "branch_summary".into();
+                    Entry::BranchSummary(BranchSummaryEntry {
+                        base,
+                        from_id: "entry-1".into(),
+                        summary: "branch summary".into(),
+                        details: None,
+                        usage: None,
+                    })
+                }
+                7 => {
+                    base.entry_type = "custom".into();
+                    Entry::Custom(CustomEntry {
+                        base,
+                        custom_type: "metadata".into(),
+                        data: None,
+                    })
+                }
+                8 => Entry::Message(MessageEntry {
+                    base,
+                    message: entry_batch_tool("call"),
+                    terminate: None,
+                }),
+                _ => entry.clone(),
+            };
+        }
+        entry_batch_load(&mut cold, &reader, mutation, 0);
+    }
+    cold.apply_mutation(SessionMutation::Lane {
+        seq: 10,
+        lane: "side".into(),
+        leaf_id: Some("entry-3".into()),
+    })
+    .unwrap();
+    let mut side = entry_batch_user(11, "side transcript");
+    if let SessionMutation::Entry { lane, entry, .. } = &mut side {
+        *lane = Some("side".into());
+        entry.base_mut().parent_id = Some("entry-3".into());
+    }
+    entry_batch_load(&mut cold, &reader, side, 0);
+    // The branch leaf need not itself belong to the transcript projection.
+    entry_batch_load(
+        &mut cold,
+        &reader,
+        SessionMutation::Entry {
+            seq: 12,
+            timestamp: 1,
+            lane: Some("side".into()),
+            entry: Entry::Custom(CustomEntry {
+                base: EntryBase {
+                    entry_type: "custom".into(),
+                    id: "entry-12".into(),
+                    seq: 12,
+                    parent_id: Some("entry-11".into()),
+                    timestamp: 1,
+                },
+                custom_type: "metadata".into(),
+                data: None,
+            }),
+        },
+        0,
+    );
+    (cold, reader)
+}
+
+#[tokio::test]
+async fn cold_transcript_projects_all_kinds_and_counts_only_lane_branch() {
+    let (cold, _) = transcript_fixture();
+    for (lane, expected, leaf) in [
+        (
+            "main",
+            vec!["entry-1", "entry-3", "entry-8", "entry-9"],
+            "entry-9",
+        ),
+        ("side", vec!["entry-1", "entry-3", "entry-11"], "entry-12"),
+    ] {
+        let page = cold
+            .transcript_plan(lane, &transcript_query(usize::MAX, None))
+            .unwrap()
+            .read()
+            .await
+            .unwrap();
+        assert_eq!(transcript_ids(&page), expected);
+        assert_eq!(page.total, expected.len());
+        assert!(!page.has_more);
+        assert_eq!(page.leaf_id.as_deref(), Some(leaf));
+    }
+}
+
+#[tokio::test]
+async fn cold_transcript_cursor_must_belong_to_projected_branch_without_io() {
+    let (cold, reader) = transcript_fixture();
+    for (lane, id) in [
+        ("main", "unknown"),
+        ("main", "entry-2"),
+        ("main", "entry-7"),
+        ("main", "entry-11"),
+        ("side", "entry-9"),
+        ("side", "entry-12"),
+    ] {
+        let error = cold
+            .transcript_plan(lane, &transcript_query(2, Some(id)))
+            .err()
+            .expect("invalid cursor must fail at planning");
+        assert_eq!(error.code, crate::error::SessionErrorCode::InvalidQuery);
+        assert_eq!(error.message, format!("beforeId not found: {id}"));
+    }
+    assert_eq!(reader.reads.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn cold_transcript_exclusive_windows_normalize_zero_and_preserve_total() {
+    let (cold, _) = transcript_fixture();
+    for (limit, before, ids, has_more) in [
+        (0, None, vec!["entry-9"], true),
+        (2, None, vec!["entry-8", "entry-9"], true),
+        (2, Some("entry-8"), vec!["entry-1", "entry-3"], false),
+        (1, Some("entry-9"), vec!["entry-8"], true),
+        (usize::MAX, Some("entry-3"), vec!["entry-1"], false),
+        (2, Some("entry-1"), vec![], false),
+        (
+            4,
+            None,
+            vec!["entry-1", "entry-3", "entry-8", "entry-9"],
+            false,
+        ),
+    ] {
+        let page = cold
+            .transcript_plan("main", &transcript_query(limit, before))
+            .unwrap()
+            .read()
+            .await
+            .unwrap();
+        assert_eq!(transcript_ids(&page), ids);
+        assert_eq!(page.total, 4);
+        assert_eq!(page.has_more, has_more);
+        assert_eq!(page.leaf_id.as_deref(), Some("entry-9"));
+    }
+}
+
+#[tokio::test]
+async fn cold_transcript_reads_only_selected_window_and_never_warms() {
+    let (cold, _, reader) = entry_batch_fixture(60);
+    let expected_bytes: usize = (41..=50)
+        .map(|seq| encode_mutation(&entry_batch_user(seq, &format!("message {seq} 🌊\r\n"))).len())
+        .sum();
+    for attempt in 1..=2 {
+        let plan = cold
+            .transcript_plan("main", &transcript_query(10, Some("entry-51")))
+            .unwrap();
+        assert_eq!(plan.selected.len(), 10);
+        assert_eq!(reader.reads.load(Ordering::Relaxed), attempt - 1);
+        let page = plan.read().await.unwrap();
+        let expected: Vec<_> = (41..=50).map(|seq| format!("entry-{seq}")).collect();
+        assert_eq!(transcript_ids(&page), expected);
+        assert_eq!(page.total, 60);
+        assert!(page.has_more);
+        assert_eq!(reader.reads.load(Ordering::Relaxed), attempt);
+        assert_eq!(
+            reader.read_bytes.load(Ordering::Relaxed),
+            attempt * expected_bytes
+        );
+    }
+    assert!(matches!(
+        cold.entry_ref("entry-41"),
+        Some(JsonlPayload::Cold { .. })
+    ));
+}
+
+#[tokio::test]
+async fn cold_transcript_ignores_unselected_corruption_but_rejects_selected_rows() {
+    let (cold, reader) = transcript_fixture();
+    // Damage a metadata-only row, an off-branch message, and an older message.
+    // Unselected rows may be inside a coalesced range but must not be decoded.
+    for id in ["entry-7", "entry-11", "entry-1"] {
+        let JsonlPayload::Cold { source, .. } = cold.entry_ref(id).unwrap() else {
+            panic!("cold fixture");
+        };
+        reader.bytes.lock().unwrap()[source.offset as usize] = b'!';
+    }
+    let page = cold
+        .transcript_plan("main", &transcript_query(3, None))
+        .unwrap()
+        .read()
+        .await
+        .unwrap();
+    assert_eq!(transcript_ids(&page), ["entry-3", "entry-8", "entry-9"]);
+    assert_eq!(page.total, 4);
+    assert_eq!(reader.reads.load(Ordering::Relaxed), 1);
+    for (lane, query) in [
+        ("main", transcript_query(4, None)),
+        ("side", transcript_query(1, None)),
+    ] {
+        let error = cold
+            .transcript_plan(lane, &query)
+            .unwrap()
+            .read()
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, crate::error::SessionErrorCode::InvalidEntry);
+        assert!(error.message.contains("source changed"));
+    }
+}
+
+#[tokio::test]
+async fn cold_transcript_selected_short_read_is_an_error() {
+    let (cold, _, reader) = entry_batch_fixture(3);
+    reader.bytes.lock().unwrap().pop();
+    let error = cold
+        .transcript_plan("main", &transcript_query(1, None))
+        .unwrap()
+        .read()
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, crate::error::SessionErrorCode::Storage);
+    assert!(error.message.contains("short cold history read"));
+}
+
+#[tokio::test]
+async fn cold_transcript_published_plan_keeps_leaf_total_and_reader_after_append_and_replace() {
+    let (mut cold, _, old_reader) = entry_batch_fixture(3);
+    let plan = cold
+        .transcript_plan("main", &transcript_query(2, None))
+        .unwrap();
+    // Appending does not widen a previously published page or its total.
+    entry_batch_load(
+        &mut cold,
+        &old_reader,
+        entry_batch_user(4, "later append"),
+        0,
+    );
+    let current = cold
+        .transcript_plan("main", &transcript_query(1, None))
+        .unwrap()
+        .read()
+        .await
+        .unwrap();
+    assert_eq!(transcript_ids(&current), ["entry-4"]);
+    assert_eq!(current.total, 4);
+    assert_eq!(current.leaf_id.as_deref(), Some("entry-4"));
+    // Simulate atomic state replacement using a distinct reader generation.
+    let (replacement, _, new_reader) = entry_batch_fixture(1);
+    cold = replacement;
+    assert!(cold.entry_ref("entry-3").is_none());
+    drop(old_reader);
+    let page = plan.read().await.unwrap();
+    assert_eq!(transcript_ids(&page), ["entry-2", "entry-3"]);
+    assert_eq!(page.total, 3);
+    assert!(page.has_more);
+    assert_eq!(page.leaf_id.as_deref(), Some("entry-3"));
+    assert_eq!(new_reader.reads.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn cold_transcript_empty_lanes_and_first_cursor_do_not_read_payloads() {
+    let mut cold = ResidentState::default();
+    cold.apply_mutation(SessionMutation::Lane {
+        seq: 1,
+        lane: "side".into(),
+        leaf_id: None,
+    })
+    .unwrap();
+    for lane in ["main", "side"] {
+        let page = cold
+            .transcript_plan(lane, &transcript_query(0, None))
+            .unwrap()
+            .read()
+            .await
+            .unwrap();
+        assert!(page.entries.is_empty());
+        assert_eq!(page.total, 0);
+        assert!(!page.has_more);
+        assert_eq!(page.leaf_id, None);
+        let error = cold
+            .transcript_plan(lane, &transcript_query(1, Some("missing")))
+            .err()
+            .unwrap();
+        assert_eq!(error.code, crate::error::SessionErrorCode::InvalidQuery);
+        assert_eq!(error.message, "beforeId not found: missing");
+    }
+    let error = cold
+        .transcript_plan("missing", &transcript_query(1, None))
+        .err()
+        .unwrap();
+    assert_eq!(error.code, crate::error::SessionErrorCode::InvalidLane);
+    let (cold, reader) = transcript_fixture();
+    let page = cold
+        .transcript_plan("main", &transcript_query(2, Some("entry-1")))
+        .unwrap()
+        .read()
+        .await
+        .unwrap();
+    assert!(page.entries.is_empty());
+    assert_eq!(page.total, 4);
+    assert!(!page.has_more);
+    assert_eq!(reader.reads.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn cold_transcript_metadata_only_lane_and_resident_payload_defensive_copies() {
+    let mut cold = ResidentState::default();
+    cold.apply_mutation(SessionMutation::Entry {
+        seq: 1,
+        timestamp: 1,
+        lane: Some("main".into()),
+        entry: Entry::Custom(CustomEntry {
+            base: EntryBase {
+                entry_type: "custom".into(),
+                id: "entry-1".into(),
+                seq: 1,
+                parent_id: None,
+                timestamp: 1,
+            },
+            custom_type: "metadata".into(),
+            data: None,
+        }),
+    })
+    .unwrap();
+    let page = cold
+        .transcript_plan("main", &transcript_query(1, None))
+        .unwrap()
+        .read()
+        .await
+        .unwrap();
+    assert!(page.entries.is_empty());
+    assert_eq!(page.total, 0);
+    assert!(!page.has_more);
+    assert_eq!(page.leaf_id.as_deref(), Some("entry-1"));
+    let error = cold
+        .transcript_plan("main", &transcript_query(1, Some("entry-1")))
+        .err()
+        .unwrap();
+    assert_eq!(error.code, crate::error::SessionErrorCode::InvalidQuery);
+    cold.apply_mutation(entry_batch_user(2, "resident message"))
+        .unwrap();
+    let mut page = cold
+        .transcript_plan("main", &transcript_query(usize::MAX, None))
+        .unwrap()
+        .read()
+        .await
+        .unwrap();
+    assert_eq!(transcript_ids(&page), ["entry-2"]);
+    assert_eq!(page.total, 1);
+    page.entries[0].base_mut().id = "mutated copy".into();
+    let original = cold
+        .transcript_plan("main", &transcript_query(1, None))
+        .unwrap()
+        .read()
+        .await
+        .unwrap();
+    assert_eq!(transcript_ids(&original), ["entry-2"]);
+}

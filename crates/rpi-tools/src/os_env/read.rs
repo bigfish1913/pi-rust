@@ -1,15 +1,100 @@
 //! A file-generation reader; unlike append handles it never follows a rename.
 use crate::{
-    env::ReadFile,
+    env::{check_cancel_file, ReadFile},
     error::{io_to_file_error, FileError, FileErrorCode},
 };
 use async_trait::async_trait;
 use std::{
     fs::{File, OpenOptions},
+    future::Future,
     io::{Read, Seek, SeekFrom},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio_util::sync::CancellationToken;
+
+const LINE_READ_BUFFER_SIZE: usize = 8 * 1024;
+
+/// Read only the requested prefix. Buffered read-ahead is bounded to 8 KiB;
+/// bytes after the selected newline are neither consumed nor UTF-8 validated.
+/// Memory beyond the buffer is proportional to the selected lines (a single
+/// selected line can itself be arbitrarily long).
+pub(super) async fn read_text_lines(
+    path: &Path,
+    max_lines: Option<usize>,
+    cancel: Option<&CancellationToken>,
+) -> Result<Vec<String>, FileError> {
+    let addressed = path.to_string_lossy();
+    check_cancel_file(cancel, Some(&addressed))?;
+    if max_lines == Some(0) {
+        return Ok(Vec::new());
+    }
+    let file = line_read_io(tokio::fs::File::open(path), &addressed, cancel).await?;
+    read_lines_from(file, &addressed, max_lines, cancel).await
+}
+
+async fn line_read_io<T>(
+    operation: impl Future<Output = std::io::Result<T>>,
+    path: &str,
+    cancel: Option<&CancellationToken>,
+) -> Result<T, FileError> {
+    check_cancel_file(cancel, Some(path))?;
+    let result = if let Some(token) = cancel {
+        tokio::select! {
+            biased;
+            _ = token.cancelled() => return Err(FileError::aborted().with_path(path)),
+            result = operation => result,
+        }
+    } else {
+        operation.await
+    };
+    result.map_err(|error| io_to_file_error(error, Some(path)))
+}
+
+async fn read_lines_from<R: AsyncRead + Unpin>(
+    reader: R,
+    path: &str,
+    max_lines: Option<usize>,
+    cancel: Option<&CancellationToken>,
+) -> Result<Vec<String>, FileError> {
+    check_cancel_file(cancel, Some(path))?;
+    if max_lines == Some(0) {
+        return Ok(Vec::new());
+    }
+    let mut reader = BufReader::with_capacity(LINE_READ_BUFFER_SIZE, reader);
+    let mut lines = Vec::new();
+    let mut line = Vec::new();
+    loop {
+        // Check cancellation on every bounded chunk, including long lines.
+        let available = line_read_io(reader.fill_buf(), path, cancel).await?;
+        if available.is_empty() {
+            // split('\n') historically returned [""] for an empty file, but
+            // did not retain the extra empty item after a trailing newline.
+            if !line.is_empty() || lines.is_empty() {
+                lines.push(decode_line(line, path)?);
+            }
+            return Ok(lines);
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let count = newline.map_or(available.len(), |index| index + 1);
+        let content_len = if newline.is_some() { count - 1 } else { count };
+        line.extend_from_slice(&available[..content_len]);
+        reader.consume(count);
+        if newline.is_some() {
+            lines.push(decode_line(std::mem::take(&mut line), path)?);
+            if max_lines == Some(lines.len()) {
+                return Ok(lines);
+            }
+        }
+    }
+}
+
+fn decode_line(bytes: Vec<u8>, path: &str) -> Result<String, FileError> {
+    String::from_utf8(bytes).map_err(|error| {
+        FileError::new(FileErrorCode::Invalid, format!("invalid utf-8: {error}")).with_path(path)
+    })
+}
 
 pub(super) struct OsReadFile {
     file: Arc<Mutex<File>>,
@@ -82,6 +167,10 @@ impl ReadFile for OsReadFile {
         .map_err(|error| io_to_file_error(error, Some(&self.path.to_string_lossy())))
     }
 }
+
+#[cfg(test)]
+#[path = "read_lines_tests.rs"]
+mod read_lines_tests;
 
 #[cfg(test)]
 mod tests {

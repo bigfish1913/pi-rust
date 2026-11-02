@@ -30,16 +30,17 @@ impl Scanner {
         let mut line = Vec::new();
         loop {
             if self.cursor < self.buffer.len() {
-                let remainder = &self.buffer[self.cursor..];
-                if let Some(end) = remainder.iter().position(|&byte| byte == b'\n') {
-                    line.extend_from_slice(&remainder[..end]);
-                    self.cursor += end + 1;
-                    self.offset += end as u64 + 1;
+                let mut remainder = &self.buffer[self.cursor..];
+                // The slice BufRead implementation uses the standard library's
+                // optimized delimiter search without validating partial UTF-8.
+                let consumed = std::io::BufRead::read_until(&mut remainder, b'\n', &mut line)
+                    .expect("reading a byte slice is infallible");
+                self.cursor += consumed;
+                self.offset += consumed as u64;
+                if line.last() == Some(&b'\n') {
+                    line.pop();
                     return Ok(Some((offset, line, self.offset == self.length, true)));
                 }
-                line.extend_from_slice(remainder);
-                self.offset += remainder.len() as u64;
-                self.cursor = self.buffer.len();
             }
             if self.fetched == self.length {
                 return Ok((!line.is_empty()).then_some((offset, line, true, false)));

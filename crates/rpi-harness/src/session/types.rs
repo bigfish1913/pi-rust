@@ -1121,6 +1121,21 @@ pub struct BranchBounds {
 }
 
 // Bounded transcript reads. These are session/storage types, not UI or RPC types.
+/// Chronological transcript window ending exclusively before `before_id`.
+#[derive(Debug, Clone)]
+pub struct TranscriptPageQuery {
+    pub limit: usize,
+    pub before_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TranscriptPage {
+    pub entries: Vec<Entry>,
+    pub total: usize,
+    pub has_more: bool,
+    pub leaf_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MessageSummaryQuery {
@@ -1599,6 +1614,24 @@ pub trait SessionStorage: Send + Sync {
     }
 
     // Reads
+    /// Optional bounded estimate for the default, hook-free lane context.
+    /// `None` means unsupported; read/validation failures must remain errors.
+    async fn context_usage(
+        &self,
+        _lane: &str,
+    ) -> SessionResult<Option<crate::compaction::ContextUsageEstimate>> {
+        Ok(None)
+    }
+
+    /// Optional metadata-first transcript paging. `None` means unsupported;
+    /// supported backends return errors rather than falling back on failure.
+    async fn transcript_page(
+        &self,
+        _lane: &str,
+        _query: &TranscriptPageQuery,
+    ) -> SessionResult<Option<TranscriptPage>> {
+        Ok(None)
+    }
     async fn branch_entry_page(
         &self,
         lane: &str,
@@ -1711,6 +1744,21 @@ pub trait SessionRepo: Send + Sync {
 /// `SessionTree`. Lane-bound harness runners own one of these views.
 #[async_trait::async_trait]
 pub trait SessionTree: Send + Sync {
+    /// Optional bounded estimate for this lane's default, hook-free context.
+    /// `None` means unsupported, not an error fallback.
+    async fn context_usage(
+        &self,
+    ) -> SessionResult<Option<crate::compaction::ContextUsageEstimate>> {
+        Ok(None)
+    }
+
+    /// Optional metadata-first transcript paging for this lane-bound view.
+    async fn transcript_page(
+        &self,
+        _query: &TranscriptPageQuery,
+    ) -> SessionResult<Option<TranscriptPage>> {
+        Ok(None)
+    }
     async fn branch_entry_page(
         &self,
         query: &BranchEntryPageQuery,

@@ -79,7 +79,8 @@ use crate::session::state::ApplyOutcome;
 use crate::session::types::{
     provisioned_into_entry, BranchBounds, Entry, EntryQuery, ForkOptions, IdGenerator, LanePointer,
     LaneRecord, LogItem, LogOptions, OperationStartedRecord, ProvisionedEntry, RecordQuery,
-    SessionMetadata, SessionMutation, SessionStats, SessionStorage,
+    SessionMetadata, SessionMutation, SessionStats, SessionStorage, TranscriptPage,
+    TranscriptPageQuery,
 };
 
 /// Durable file-backed `SessionStorage`. Mirrors TS `JsonlSessionStorage`.
@@ -1153,6 +1154,14 @@ impl SessionStorage for JsonlSessionStorage {
         self.run_owned(move |s| async move { s.append_records_owned(records).await })
             .await
     }
+    async fn transcript_page(
+        &self,
+        lane: &str,
+        query: &TranscriptPageQuery,
+    ) -> SessionResult<Option<TranscriptPage>> {
+        let plan = self.state.lock().await.transcript_plan(lane, query)?;
+        Ok(Some(plan.read().await?))
+    }
     async fn message_summaries(
         &self,
         lane: &str,
@@ -1208,6 +1217,14 @@ impl SessionStorage for JsonlSessionStorage {
             .await
             .entry_plan(query, Some((bounds, start)))?;
         plan.read().await
+    }
+
+    async fn context_usage(
+        &self,
+        lane: &str,
+    ) -> SessionResult<Option<crate::compaction::ContextUsageEstimate>> {
+        let plan = self.state.lock().await.context_usage_plan(lane)?;
+        Ok(Some(plan.read().await?))
     }
 
     async fn context_on_branch(

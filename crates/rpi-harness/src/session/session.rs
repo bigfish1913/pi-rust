@@ -339,6 +339,13 @@ impl Session {
         self.storage_arc().get_entry(id).await
     }
 
+    /// Estimate the main lane's default context, if supported by storage.
+    pub async fn context_usage(
+        &self,
+    ) -> SessionResult<Option<crate::compaction::ContextUsageEstimate>> {
+        self.storage_arc().context_usage("main").await
+    }
+
     /// `getStats()`. Mirrors TS `Session.getStats`.
     pub async fn get_stats(&self) -> SessionResult<SessionStats> {
         self.storage_arc().get_stats().await
@@ -942,6 +949,12 @@ fn entry_id(entry: &Entry) -> String {
 
 #[async_trait]
 impl SessionTree for Session {
+    async fn context_usage(
+        &self,
+    ) -> SessionResult<Option<crate::compaction::ContextUsageEstimate>> {
+        Session::context_usage(self).await
+    }
+
     async fn branch_entry_page(
         &self,
         query: &BranchEntryPageQuery,
@@ -950,6 +963,12 @@ impl SessionTree for Session {
     }
     async fn branch_overview(&self) -> SessionResult<BranchOverview> {
         Session::branch_overview(self).await
+    }
+    async fn transcript_page(
+        &self,
+        query: &crate::session::types::TranscriptPageQuery,
+    ) -> SessionResult<Option<crate::session::types::TranscriptPage>> {
+        self.storage_arc().transcript_page("main", query).await
     }
     async fn message_summaries(
         &self,
@@ -1035,6 +1054,12 @@ pub struct LaneView {
 
 #[async_trait]
 impl SessionTree for LaneView {
+    async fn context_usage(
+        &self,
+    ) -> SessionResult<Option<crate::compaction::ContextUsageEstimate>> {
+        self.session.storage_arc().context_usage(&self.lane).await
+    }
+
     async fn branch_entry_page(
         &self,
         query: &BranchEntryPageQuery,
@@ -1045,6 +1070,15 @@ impl SessionTree for LaneView {
     }
     async fn branch_overview(&self) -> SessionResult<BranchOverview> {
         self.session.branch_overview_for_lane(&self.lane).await
+    }
+    async fn transcript_page(
+        &self,
+        query: &crate::session::types::TranscriptPageQuery,
+    ) -> SessionResult<Option<crate::session::types::TranscriptPage>> {
+        self.session
+            .storage_arc()
+            .transcript_page(&self.lane, query)
+            .await
     }
     async fn message_summaries(
         &self,

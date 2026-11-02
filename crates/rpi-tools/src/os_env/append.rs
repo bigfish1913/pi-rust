@@ -204,7 +204,15 @@ fn identity_from_file(file: &File) -> io::Result<FileIdentity> {
 
 #[cfg(windows)]
 fn identity_at_path(path: &Path) -> io::Result<FileIdentity> {
-    same_file::Handle::from_path(path).map(|handle| FileIdentity(Arc::new(handle)))
+    use std::os::windows::fs::OpenOptionsExt;
+
+    // File identity queries need metadata access only. Opening another data
+    // reader after every write can force expensive Windows cache/oplock work.
+    // access_mode(0) overrides GENERIC_READ, but still allows handle metadata
+    // queries. Keep this handle alive through the same-file comparison so IDs
+    // cannot be reused; never substitute pathname/stat heuristics for identity.
+    let file = OpenOptions::new().read(true).access_mode(0).open(path)?;
+    same_file::Handle::from_file(file).map(|handle| FileIdentity(Arc::new(handle)))
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -220,6 +228,37 @@ fn identity_at_path(_path: &Path) -> io::Result<FileIdentity> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn metadata_identity_matches_open_file_without_reading_contents() {
+        use std::io::Read;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("journal");
+        std::fs::write(&path, b"synthetic contents").unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let original = identity_from_file(&file).unwrap();
+        let metadata = identity_at_path(&path).unwrap();
+        assert_eq!(metadata, original);
+        let mut metadata_file = metadata.0.as_file().try_clone().unwrap();
+        assert_eq!(metadata_file.metadata().unwrap().len(), 18);
+        assert!(
+            metadata_file.read(&mut [0; 1]).is_err(),
+            "identity handle must not read payloads"
+        );
+        let replacement = directory.path().join("replacement");
+        std::fs::write(&replacement, b"different generation").unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        assert_ne!(identity_at_path(&path).unwrap(), original);
+        assert_eq!(
+            metadata, original,
+            "retired handles keep their original identity"
+        );
+    }
 
     #[tokio::test]
     async fn unknown_identity_reopens_after_external_replacement() {

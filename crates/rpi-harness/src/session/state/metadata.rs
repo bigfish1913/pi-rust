@@ -18,6 +18,9 @@ pub(crate) struct EntryMeta {
     pub(crate) thinking_level: Option<String>,
     pub(crate) active_tools: Option<Vec<String>>,
     pub(crate) usage: Option<rpi_ai::types::Usage>,
+    /// Number of messages in the default, hook-free context projection.
+    /// Retained compaction tails deliberately include Deferred messages.
+    pub(crate) context_message_count: usize,
     pub(crate) stop_reason: Option<rpi_ai::types::StopReason>,
 }
 
@@ -38,6 +41,16 @@ impl EntryMeta {
             thinking_level: None,
             active_tools: None,
             usage: None,
+            context_message_count: match entry {
+                Entry::Message(message) => usize::from(!matches!(
+                    &message.message,
+                    AgentMessage::Assistant(assistant)
+                        if assistant.stop_reason == rpi_ai::types::StopReason::Deferred
+                )),
+                Entry::Compaction(compaction) => 1 + compaction.retained_tail.len(),
+                Entry::BranchSummary(summary) => usize::from(!summary.summary.is_empty()),
+                _ => 0,
+            },
             stop_reason: None,
         };
         match entry {

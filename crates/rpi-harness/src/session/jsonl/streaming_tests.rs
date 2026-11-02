@@ -10,6 +10,7 @@ use std::sync::atomic::AtomicUsize;
 struct StrictReader {
     inner: Arc<dyn ReadFile>,
     calls: AtomicUsize,
+    ranges: std::sync::Mutex<Vec<(u64, usize)>>,
 }
 #[async_trait]
 impl ReadFile for StrictReader {
@@ -25,6 +26,7 @@ impl ReadFile for StrictReader {
         length: usize,
     ) -> Result<Vec<u8>, rpi_tools::FileError> {
         self.calls.fetch_add(1, Ordering::Relaxed);
+        self.ranges.lock().unwrap().push((offset, length));
         self.inner.read_range(offset, length).await
     }
 }
@@ -62,6 +64,7 @@ async fn strict_load(
     let reader = Arc::new(StrictReader {
         inner,
         calls: AtomicUsize::new(0),
+        ranges: std::sync::Mutex::new(Vec::new()),
     });
     let length = reader.byte_len().await.unwrap().unwrap();
     let storage = JsonlSessionStorage::load_streaming(
@@ -268,6 +271,54 @@ async fn cold_entry_queries_windows_context_log_and_fork_match_eager() {
 }
 
 #[tokio::test]
+async fn scanner_delimiters_preserve_raw_lines_offsets_flags_and_digest() {
+    let temp = tempfile::tempdir().unwrap();
+    let fs: Arc<dyn FileSystem> = Arc::new(rpi_tools::OsExecutionEnv::with_cwd(
+        temp.path().to_path_buf(),
+    ));
+    let mut cases = vec![Vec::new(), b"\n\n".to_vec(), b"one\r\ntwo".to_vec()];
+    for newline_offset in [CHUNK - 1, CHUNK, CHUNK + 1] {
+        let mut bytes = vec![b'a'; newline_offset - 1];
+        bytes.extend_from_slice(b"\r\n\n");
+        // Keep raw scanning distinct from UTF-8/schema validation. Include
+        // split multibyte text, an invalid byte and an unterminated tail.
+        bytes.extend_from_slice("🌊".repeat(CHUNK / 4 + 1).as_bytes());
+        bytes.extend_from_slice(b"\xff\nlast\r");
+        cases.push(bytes);
+    }
+    for (index, bytes) in cases.into_iter().enumerate() {
+        let path = format!("scanner-{index}");
+        fs.write_file(&path, FileContent::Bytes(bytes.clone()), None)
+            .await
+            .unwrap();
+        let reader = fs.open_read_file(&path).await.unwrap().unwrap();
+        let mut scanner = Scanner::new(reader, bytes.len() as u64);
+        let mut offset = 0;
+        for part in bytes.split_inclusive(|byte| *byte == b'\n') {
+            let newline = part.last() == Some(&b'\n');
+            let body = if newline {
+                &part[..part.len() - 1]
+            } else {
+                part
+            };
+            let end = offset + part.len() as u64;
+            assert_eq!(
+                scanner.next().await.unwrap().unwrap(),
+                (offset, body.to_vec(), end == bytes.len() as u64, newline),
+                "case={index}, offset={offset}"
+            );
+            offset = end;
+        }
+        assert!(scanner.next().await.unwrap().is_none());
+        assert_eq!(scanner.offset, bytes.len() as u64);
+        assert_eq!(
+            <[u8; 32]>::from(scanner.hash.finalize()),
+            <[u8; 32]>::from(Sha256::digest(&bytes))
+        );
+    }
+}
+
+#[tokio::test]
 async fn scanner_chunk_boundaries_utf8_crlf_and_final_newline() {
     let temp = tempfile::tempdir().unwrap();
     let fs: Arc<dyn FileSystem> = Arc::new(rpi_tools::OsExecutionEnv::with_cwd(
@@ -290,6 +341,39 @@ async fn scanner_chunk_boundaries_utf8_crlf_and_final_newline() {
         .unwrap()
         .ends_with(b"\n"));
     assert!(is_cold(&storage.state.lock().await, "large"));
+}
+
+#[tokio::test]
+async fn bounded_header_lookup_does_not_bypass_full_history_utf8_validation() {
+    let temp = tempfile::tempdir().unwrap();
+    let fs: Arc<dyn FileSystem> = Arc::new(rpi_tools::OsExecutionEnv::with_cwd(
+        temp.path().to_path_buf(),
+    ));
+    let encoded_header = encode_header(&header());
+    let mut bytes = encoded_header.as_bytes().to_vec();
+    bytes.extend_from_slice(encode_mutation(&message("valid", 1, None, "synthetic")).as_bytes());
+    // A complete malformed line, not a recoverable torn final write.
+    bytes.extend_from_slice(b"\xff\n");
+    fs.write_file("history.jsonl", FileContent::Bytes(bytes), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        fs.read_text_lines("history.jsonl", Some(1), None)
+            .await
+            .unwrap(),
+        [encoded_header.trim_end_matches('\n')]
+    );
+    let result = JsonlSessionStorage::load(
+        fs,
+        "history.jsonl",
+        Arc::new(FakeClock::new()),
+        Arc::new(CounterIdGenerator::new()),
+    )
+    .await;
+    let error = result
+        .err()
+        .expect("full replay must reject invalid history");
+    assert!(error.message.contains("invalid session UTF-8"), "{error}");
 }
 
 #[tokio::test]
@@ -354,7 +438,11 @@ async fn context_uses_metadata_before_compaction_and_payload_filter_precedes_lim
     }
     let mut eager = SessionState::new();
     let mut bytes = encode_header(&header());
+    let mut context_start = 0;
     for entry in entries {
+        if entry.seq() == 5 {
+            context_start = bytes.len() as u64;
+        }
         let mutation = SessionMutation::Entry {
             seq: entry.seq(),
             timestamp: entry.base().timestamp,
@@ -382,7 +470,15 @@ async fn context_uses_metadata_before_compaction_and_payload_filter_precedes_lim
     assert_eq!(context.active_tool_names, expected.active_tool_names);
     // Only compaction, its tail and the custom entry are hydrated. Model,
     // thinking and active-tools state come from small full-path facts.
-    assert_eq!(reader.calls.load(Ordering::Relaxed) - before, 3);
+    // Compaction and its tail coalesce; the >256 KiB custom entry stays alone.
+    assert_eq!(reader.calls.load(Ordering::Relaxed) - before, 2);
+    let ranges = reader.ranges.lock().unwrap();
+    let selected_ranges = &ranges[ranges.len() - 2..];
+    assert_eq!(selected_ranges[0].0, context_start);
+    assert!(selected_ranges
+        .iter()
+        .all(|(offset, _)| *offset >= context_start));
+    drop(ranges);
     let before = reader.calls.load(Ordering::Relaxed);
     let overview = storage.branch_overview("main").await.unwrap();
     assert_eq!(overview.model, expected.model);
