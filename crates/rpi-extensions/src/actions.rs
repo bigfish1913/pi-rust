@@ -499,6 +499,20 @@ pub trait RuntimeActionHost: Send + Sync {
     /// type to downcast to. A default no-op keeps every other host source-compatible.
     fn publish_registry(&self, _snapshot: std::sync::Arc<crate::registry::RegistrySnapshot>) {}
 
+    /// Publish the registry, or `None` when a reload found no plugins at all.
+    ///
+    /// Distinct from [`Self::publish_registry`] because "no extensions" is a
+    /// real state: a nonempty -> empty reload must replace the cached snapshot
+    /// rather than leave removed commands advertised.
+    fn publish_registry_opt(
+        &self,
+        snapshot: Option<std::sync::Arc<crate::registry::RegistrySnapshot>>,
+    ) {
+        if let Some(snapshot) = snapshot {
+            self.publish_registry(snapshot);
+        }
+    }
+
     async fn get_execution_context(
         &self,
         _args: serde_json::Value,

@@ -73,7 +73,30 @@ fn merge_command_list(
     extension: Vec<(String, String)>,
     templates: Vec<(String, String)>,
 ) -> Vec<serde_json::Value> {
+    merge_command_list_reserved(builtin, extension, templates, Vec::new())
+}
+
+/// Like [`merge_command_list`], but also reserves `reserved` names.
+///
+/// Built-in **aliases and hidden commands** win dispatch in the TUI without
+/// appearing as suggestions. Reserving them here keeps an extension that
+/// registers the same name from being advertised as `source:"extension"` when
+/// the built-in is what actually runs.
+fn merge_command_list_reserved(
+    builtin: Vec<(String, String)>,
+    extension: Vec<(String, String)>,
+    templates: Vec<(String, String)>,
+    reserved: Vec<String>,
+) -> Vec<serde_json::Value> {
     let mut seen = std::collections::BTreeSet::new();
+    for name in reserved {
+        let name = if !name.starts_with('/') {
+            format!("/{name}")
+        } else {
+            name
+        };
+        seen.insert(name);
+    }
     let mut out: Vec<serde_json::Value> = Vec::new();
     for (source, commands) in [
         ("builtin", builtin),
@@ -186,12 +209,16 @@ impl HarnessActionHost {
     }
 
     /// Publish the loaded extension registry so `ListCommands` can answer.
+    ///
+    /// `None` publishes "no extensions". A reload that ends with zero plugins
+    /// must publish that too: otherwise the previous snapshot stays cached and
+    /// removed extensions keep advertising their commands.
     pub(crate) fn publish_registry_impl(
         &self,
-        snapshot: std::sync::Arc<rpi_extensions::RegistrySnapshot>,
+        snapshot: Option<std::sync::Arc<rpi_extensions::RegistrySnapshot>>,
     ) {
         if let Ok(mut slot) = self.registry.write() {
-            *slot = Some(snapshot);
+            *slot = snapshot;
         }
     }
 
@@ -498,11 +525,23 @@ impl RuntimeActionHost for HarnessActionHost {
             Err(_) => Vec::new(),
         };
         Ok(serde_json::json!({
-            "commands": merge_command_list(builtin, extension, templates)
+            "commands": merge_command_list_reserved(
+                builtin,
+                extension,
+                templates,
+                crate::interactive_tui::builtin_reserved_names(),
+            )
         }))
     }
 
     fn publish_registry(&self, snapshot: std::sync::Arc<rpi_extensions::RegistrySnapshot>) {
+        self.publish_registry_impl(Some(snapshot));
+    }
+
+    fn publish_registry_opt(
+        &self,
+        snapshot: Option<std::sync::Arc<rpi_extensions::RegistrySnapshot>>,
+    ) {
         self.publish_registry_impl(snapshot);
     }
 
@@ -896,7 +935,27 @@ mod send_message_tests {
 
 #[cfg(test)]
 mod list_commands_tests {
-    use super::merge_command_list;
+    use super::{merge_command_list, merge_command_list_reserved};
+
+    /// A built-in alias or hidden built-in wins TUI dispatch without showing up
+    /// as a suggestion, so an extension registering the same name must not be
+    /// advertised as `source:"extension"`.
+    #[test]
+    fn reserved_builtin_aliases_hide_colliding_extension_entries() {
+        let out = merge_command_list_reserved(
+            vec![("/help".into(), "help".into())],
+            vec![
+                ("q".into(), "quit".into()),
+                ("context".into(), "context".into()),
+                ("deploy".into(), "deploy".into()),
+            ],
+            vec![],
+            vec!["/q".into(), "/context".into()],
+        );
+        // `/q` and `/context` are unreachable, `/deploy` is not a built-in.
+        assert_eq!(names(&out), vec!["/help", "/deploy"]);
+        assert_eq!(out[1]["source"], "extension");
+    }
 
     fn names(v: &[serde_json::Value]) -> Vec<&str> {
         v.iter().map(|c| c["name"].as_str().unwrap()).collect()

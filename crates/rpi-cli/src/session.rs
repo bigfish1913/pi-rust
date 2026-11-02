@@ -483,9 +483,7 @@ pub fn prepare_extensions(
     // commands. Done here rather than at host construction because the registry
     // only exists after extensions load; `/reload` republishes the new snapshot
     // via `RuntimeActionHost::publish_registry`.
-    if let Some(snapshot) = extension_session.snapshot_arc() {
-        action_host.publish_registry_impl(snapshot);
-    }
+    action_host.publish_registry_impl(extension_session.snapshot_arc());
     Ok(PreparedExtensions {
         session_dir,
         runtime,
@@ -1672,9 +1670,10 @@ where
     // just discovered — without this a remote UI keeps serving the startup set
     // until the host process restarts. Via the trait method because all we hold
     // here is `Arc<dyn RuntimeActionHost>`.
-    if let Some(snapshot) = extension_session.snapshot_arc() {
-        publish_host.publish_registry(snapshot);
-    }
+    // Publish even when the reload found nothing: a nonempty -> empty reload
+    // returns `ExtensionSession::none()`, and skipping it would leave the old
+    // snapshot advertised.
+    publish_host.publish_registry_opt(extension_session.snapshot_arc());
 
     // ---- 3. resources_discover ("reload") over the fresh snapshot ----
     let discovered = extension_session

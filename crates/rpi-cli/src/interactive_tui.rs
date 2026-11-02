@@ -335,6 +335,24 @@ pub(crate) fn build_builtin_commands_for_abi() -> Vec<(String, String)> {
         .collect()
 }
 
+/// Every name the built-in dispatch answers to: canonical names **and** aliases,
+/// including hidden commands.
+///
+/// This is the reservation set, not a suggestion list. A remote command listing
+/// merges extension entries into the built-ins, and an extension registering
+/// `/q` or `/context` is unreachable in the terminal (the built-in wins
+/// dispatch), yet without this it would still be advertised as
+/// `source:"extension"`.
+pub(crate) fn builtin_reserved_names() -> Vec<String> {
+    let registry = build_builtin_registry();
+    let mut out: Vec<String> = Vec::new();
+    for command in &registry.commands {
+        out.push(command.name().to_string());
+        out.extend(command.aliases().iter().map(|a| (*a).to_string()));
+    }
+    out
+}
+
 /// Holds all registered slash commands; the single source of truth for both
 /// dispatch and the autocomplete list.
 struct CommandRegistry {
