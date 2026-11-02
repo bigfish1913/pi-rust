@@ -91,6 +91,26 @@ fn turn_end_payload(message: &rpi_agent::message::AgentMessage, tool_results: us
 /// no payload that maps onto a stable variant (always maps today, but kept as
 /// `Option` for forward-compat with unmapped future variants). Ownership of any
 /// `StbString` in the returned event passes to the handler.
+/// Translate one agent event into **every** stable event it must produce.
+///
+/// Almost every event is one-to-one, but `turn_end` is not: existing subscribers
+/// registered for the lifecycle `turn_end` tag must keep receiving an event, and
+/// the payload needs a different tag so a host that predates the payload can
+/// never be made to read uninitialized union storage. Emitting both keeps
+/// legacy handlers working while the payload stays behind the new tag.
+pub fn translate_all(event: &AgentEvent) -> Vec<StablePluginEvent> {
+    match event {
+        AgentEvent::TurnEnd { .. } => {
+            let mut out = vec![StablePluginEvent::empty(EventTag::TurnEnd)];
+            if let Some(payload) = translate(event) {
+                out.push(payload);
+            }
+            out
+        }
+        _ => translate(event).into_iter().collect(),
+    }
+}
+
 pub fn translate(event: &AgentEvent) -> Option<StablePluginEvent> {
     let tag = event_tag_for(event)?;
     match event {
@@ -890,14 +910,14 @@ impl AgentEmitter for ExtensionEmitter {
         // Translate + dispatch synchronously (the emitter's emit is awaited by
         // the loop in event order; dispatch is non-blocking fn-pointer calls).
         // If the event maps to no tag, do nothing.
-        if let Some(stable) = translate(&event) {
+        for stable in translate_all(&event) {
             self.dispatch(&stable);
         }
         Box::pin(async {})
     }
 
     fn try_emit(&self, event: AgentEvent) {
-        if let Some(stable) = translate(&event) {
+        for stable in translate_all(&event) {
             self.dispatch(&stable);
         }
     }
@@ -1060,6 +1080,55 @@ mod tests {
     ///
     /// This is the only data source for a remote UI's "N queued" indicator: the
     /// drain hooks consume the queue, so the count has to come from the
+    /// A handler registered for the lifecycle `turn_end` tag must still run.
+    ///
+    /// Regression: routing the payload under its own tag replaced the lifecycle
+    /// event instead of accompanying it, so every existing `turn_end` subscriber
+    /// received nothing (observed 0 calls where 1 is expected).
+    #[test]
+    fn legacy_turn_end_subscribers_still_receive_the_lifecycle_event() {
+        static TURN_END_CALLS: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        extern "C" fn count_turn_end(
+            _ev: rpi_plugin_sdk::StablePluginEvent,
+            _ud: *mut std::ffi::c_void,
+        ) -> i32 {
+            TURN_END_CALLS.fetch_add(1, Ordering::SeqCst);
+            0
+        }
+
+        let mut reg = crate::registry::ExtensionRegistry::new();
+        reg.register_event_handler(
+            "legacy".to_string(),
+            EventTag::TurnEnd,
+            count_turn_end,
+            std::ptr::null_mut(),
+        );
+        let snapshot = reg.snapshot();
+
+        let event = AgentEvent::TurnEnd {
+            message: rpi_agent::AgentMessage::Assistant(Box::new(
+                rpi_ai::types::AssistantMessage::empty(
+                    rpi_ai::types::Api::AnthropicMessages,
+                    "p",
+                    "m",
+                    0,
+                ),
+            )),
+            tool_results: vec![],
+            pending_messages: 0,
+        };
+        TURN_END_CALLS.store(0, Ordering::SeqCst);
+        for stable in translate_all(&event) {
+            dispatch_to_handlers(&snapshot, &stable);
+        }
+        assert_eq!(
+            TURN_END_CALLS.load(Ordering::SeqCst),
+            1,
+            "a legacy `turn_end` subscriber must still be called exactly once"
+        );
+    }
+
     /// The `turn_end` payload tag owns an allocation, so it must be freed on
     /// every dispatch path — including zero subscribers, where no handler runs.
     ///
