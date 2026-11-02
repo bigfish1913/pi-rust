@@ -677,3 +677,5 @@ fn rollback_window_never_invents_a_physical_line_boundary() {
 
 #[path = "live_null_tests.rs"]
 mod live_null_tests;
+#[path = "storage/saved_read_tests.rs"]
+mod saved_read_tests;

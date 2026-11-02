@@ -98,17 +98,38 @@ enum ReadPolicy {
     Restore,
     ReadOnly,
     ResourceTransitionStrict,
+    SavedReadCold(std::time::Instant),
 }
 
 impl ReadPolicy {
+    const SAVED_MUTATION_LIMIT: usize = 65_536;
+
     fn repairs(self) -> bool {
         matches!(self, Self::Restore)
     }
 
     fn strict(self) -> bool {
-        matches!(self, Self::ResourceTransitionStrict)
+        matches!(
+            self,
+            Self::ResourceTransitionStrict | Self::SavedReadCold(_)
+        )
+    }
+
+    fn check(self, mutations: usize) -> SessionResult<()> {
+        if let Self::SavedReadCold(deadline) = self {
+            saved_read::deadline(deadline)?;
+            if mutations > Self::SAVED_MUTATION_LIMIT {
+                return Err(SessionError::invalid_entry(
+                    "saved read history mutation limit exceeded",
+                ));
+            }
+        }
+        Ok(())
     }
 }
+
+mod saved_read;
+pub use saved_read::{SavedSessionReadData, SavedSessionReadQuery};
 
 /// Durable file-backed `SessionStorage`. Mirrors TS `JsonlSessionStorage`.
 ///
@@ -377,10 +398,12 @@ impl JsonlSessionStorage {
         ids: Arc<dyn IdGenerator>,
         policy: ReadPolicy,
     ) -> SessionResult<Self> {
+        policy.check(0)?;
         let repair = policy.repairs();
         let strict = policy.strict();
         let read_diagnostics = crate::session::diagnostics::RecoveryPhase::start("history_read");
         let reader = file_result(fs.open_read_file(path).await, "open session history reader")?;
+        policy.check(0)?;
         if let Some(source) = &reader {
             if let Some(length) =
                 file_result(source.byte_len().await, "stat session history reader")?
@@ -391,6 +414,7 @@ impl JsonlSessionStorage {
         }
         // Compatibility only: custom readers without byte_len (or filesystems
         // without a stable reader) retain the historical eager text path.
+        policy.check(0)?;
         let content = if let Some(reader) = &reader {
             let bytes = file_result(reader.read_all().await, "read session history")?;
             String::from_utf8(bytes)
@@ -401,7 +425,19 @@ impl JsonlSessionStorage {
                 &format!("Failed to read session {path}"),
             )?
         };
-        // Transitions never normalize/recover history, including a missing LF.
+        policy.check(0)?;
+        // Count physical mutations, not sequence values (which may have gaps).
+        // Bound the preflight itself and reject before allocating the line index.
+        if matches!(policy, ReadPolicy::SavedReadCold(_)) {
+            policy.check(
+                content
+                    .split_terminator('\n')
+                    .skip(1)
+                    .take(ReadPolicy::SAVED_MUTATION_LIMIT + 1)
+                    .count(),
+            )?;
+        }
+        // Strict readers never normalize/recover history, including a missing LF.
         if strict && !content.ends_with('\n') {
             return Err(SessionError::invalid_entry(
                 "resource transition requires complete unrecovered history",
@@ -457,6 +493,7 @@ impl JsonlSessionStorage {
         let mut dropped_duplicates = false;
         let mut seen_lines: HashMap<u64, &str> = HashMap::new();
         for (idx, line) in physical_lines.iter().enumerate().skip(1) {
+            policy.check(idx)?;
             let line_no = (idx + 1) as u32;
             match parse_mutation(line) {
                 Ok(mutation) => {
@@ -621,6 +658,7 @@ impl JsonlSessionStorage {
                     Some(Sha256::digest(format!("{content}\n").as_bytes()).into());
             }
         }
+        policy.check(physical_lines.len() - 1)?;
         replay_diagnostics.finish(physical_lines.len() - 1, seen_lines.len());
         Ok(storage)
     }

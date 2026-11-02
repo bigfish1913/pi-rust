@@ -876,8 +876,30 @@ impl AgentHarness {
     /// Read-only startup gate for resource transitions. Application-level idle
     /// authorization remains the caller's responsibility.
     pub async fn validate_resource_transition_idle(session: &Session) -> HarnessResult<()> {
+        if Self::resource_session_has_pending_work(session, None).await? {
+            return Err(HarnessError::io(
+                "resource transition rejects pending native execution/queue/recovery",
+            ));
+        }
+        Ok(())
+    }
+    /// Read-only pending facts, including queue/recovery/resume. No harness
+    /// creation, progress pruning, recovery writes or provider registration.
+    pub async fn saved_session_has_pending_work(
+        session: &Session,
+        deadline: std::time::Instant,
+    ) -> HarnessResult<bool> {
+        Self::resource_session_has_pending_work(session, Some(deadline)).await
+    }
+    async fn resource_session_has_pending_work(
+        session: &Session,
+        deadline: Option<std::time::Instant>,
+    ) -> HarnessResult<bool> {
         let runtime = crate::runtime::SessionRuntime::new(session.clone());
         for lane in session.get_lanes().await.map_err(session_to_harness_err)? {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                return Err(HarnessError::io("saved read processing deadline exceeded"));
+            }
             let recovery = runtime
                 .recover_lane(&lane.lane)
                 .await
@@ -885,14 +907,17 @@ impl AgentHarness {
             if !recovery.is_clean()
                 || !recovery.tool_frames.is_empty()
                 || !Self::rebuild_queues(session, &lane.lane).await?.is_empty()
-                || Self::lane_is_resumable_checked(session, &lane.lane).await?
+                || match deadline {
+                    Some(at) => {
+                        Self::lane_is_resumable_impl(session, &lane.lane, true, Some(at)).await?
+                    }
+                    None => Self::lane_is_resumable_checked(session, &lane.lane).await?,
+                }
             {
-                return Err(HarnessError::io(
-                    "resource transition rejects pending native execution/queue/recovery",
-                ));
+                return Ok(true);
             }
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Cancel the lane's run **and** reclaim its queues in one critical
@@ -1174,19 +1199,20 @@ impl AgentHarness {
     async fn lane_is_resumable(session: &Session, lane: &str) -> bool {
         // Preserve legacy recovery's best-effort read behavior. Explicit
         // transitions instead use the fallible path and fail closed.
-        Self::lane_is_resumable_impl(session, lane, false)
+        Self::lane_is_resumable_impl(session, lane, false, None)
             .await
             .unwrap_or(false)
     }
 
     async fn lane_is_resumable_checked(session: &Session, lane: &str) -> HarnessResult<bool> {
-        Self::lane_is_resumable_impl(session, lane, true).await
+        Self::lane_is_resumable_impl(session, lane, true, None).await
     }
 
     async fn lane_is_resumable_impl(
         session: &Session,
         lane: &str,
         strict: bool,
+        deadline: Option<std::time::Instant>,
     ) -> HarnessResult<bool> {
         // Pin one leaf: a concurrent append/move must not change the branch
         // between batches. Bound payload hydration even for very long histories.
@@ -1203,6 +1229,9 @@ impl AgentHarness {
         };
         let mut cursor = None;
         loop {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                return Err(HarnessError::io("saved read processing deadline exceeded"));
+            }
             let entries = match view
                 .find_entries_on_branch(
                     &EntryQuery {
