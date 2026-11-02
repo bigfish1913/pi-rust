@@ -353,3 +353,377 @@ async fn competing_guarded_writers_accept_only_one_mutation() {
     let (a, b) = tokio::join!(write(), write());
     assert_ne!(a.is_ok(), b.is_ok());
 }
+
+mod scoped_drop_probe {
+    use super::*;
+    use crate::session::jsonl::{JsonlSessionStorage, JsonlV4Header};
+    use crate::session::memory::SystemClock;
+    use crate::session::session::DefaultIdGenerator;
+    use rpi_tools::env::AppendFile;
+    use rpi_tools::{FileContent, FileError, FileSystem};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+    use tokio::sync::Notify;
+
+    #[derive(Default)]
+    struct AppendGate {
+        used: AtomicBool,
+        entered: Notify,
+        release: Notify,
+    }
+
+    // Real JSONL append barrier: cancel only the API caller while the storage
+    // owner retains its tail reservation and commits the enqueue.
+    struct GatedAppend {
+        fs: Arc<dyn FileSystem>,
+        path: String,
+        gate: Arc<AppendGate>,
+    }
+
+    #[async_trait::async_trait]
+    impl AppendFile for GatedAppend {
+        async fn append(&mut self, bytes: &[u8]) -> Result<(), FileError> {
+            if String::from_utf8_lossy(bytes).contains("queue_enqueued")
+                && !self.gate.used.swap(true, Ordering::SeqCst)
+            {
+                self.gate.entered.notify_one();
+                self.gate.release.notified().await;
+            }
+            self.fs
+                .append_file(&self.path, FileContent::Bytes(bytes.to_vec()), None)
+                .await
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_scoped_notice_caller_schedules_context_control() {
+        tokio::time::timeout(Duration::from_secs(20), probe(false))
+            .await
+            .expect("control timed out: append owner, admission gate, or retry did not finish");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_scoped_notice_retry_must_schedule_context() {
+        tokio::time::timeout(Duration::from_secs(20), probe(true))
+            .await
+            .expect("probe timed out: append owner, admission gate, or retry did not finish");
+    }
+
+    async fn probe(drop_caller: bool) {
+        let dir = match std::env::var_os("RPI_NOTICE_TEST_ROOT") {
+            Some(root) => tempfile::tempdir_in(root).unwrap(),
+            None => tempfile::tempdir().unwrap(),
+        };
+        let path = dir
+            .path()
+            .join("scoped-drop.jsonl")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let fs: Arc<dyn FileSystem> =
+            Arc::new(rpi_tools::OsExecutionEnv::with_cwd(dir.path().to_owned()));
+        let storage = Arc::new(
+            JsonlSessionStorage::create(
+                fs.clone(),
+                &path,
+                JsonlV4Header::new(
+                    "scoped-drop-probe".into(),
+                    1,
+                    dir.path().display().to_string(),
+                    None,
+                    None,
+                    None,
+                ),
+                Arc::new(SystemClock),
+                Arc::new(DefaultIdGenerator::new()),
+            )
+            .await
+            .unwrap(),
+        );
+        let h = AgentHarness::create(AgentHarnessOptions {
+            session: Session::new(storage.clone(), None),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let source = state(&h).await;
+        let before_open = guard(&h).await;
+
+        // A real open operation suppresses the scoped notice's idle flush.
+        // It is appended AFTER harness creation, so startup recovery cannot
+        // consume it or rebuild the in-process pending-context hint.
+        h.session
+            .append_record(LaneRecord::OperationStarted(OperationStartedRecord {
+                base: RecordBase {
+                    id: "held-open-operation".into(),
+                    seq: 0,
+                    lane: "main".into(),
+                    timestamp: 0,
+                },
+                source_leaf_id: Some(source.clone()),
+                intent: OperationIntent::Run {
+                    original_prompt: vec![],
+                    initial_messages: vec![],
+                    system_prompt_override: None,
+                    resume_data: None,
+                },
+            }))
+            .await
+            .unwrap();
+        let initial = guard(&h).await;
+        assert_eq!(initial.leaf_id, before_open.leaf_id);
+        assert_eq!(initial.entry_id.as_deref(), Some(source.as_str()));
+        assert_eq!(initial.entry_id, before_open.entry_id);
+        assert!(
+            !h.has_pending_context(),
+            "setup unexpectedly scheduled context"
+        );
+        let revision = h.session.storage().history_revision().await.unwrap();
+
+        let gate = Arc::new(AppendGate::default());
+        storage.install_append_handle(Box::new(GatedAppend {
+            fs: fs.clone(),
+            path: path.clone(),
+            gate: gate.clone(),
+        }));
+        let caller = {
+            let h = h.clone();
+            let initial = initial.clone();
+            tokio::spawn(async move {
+                h.append_scoped_entry(
+                    &initial,
+                    ScopedEntry::Notice {
+                        message: notice(),
+                        key: "revision-1".into(),
+                    },
+                )
+                .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), gate.entered.notified())
+            .await
+            .expect("scoped notice never reached the real JSONL enqueue append");
+        // The backend owner is now inside append(), holding its real tail
+        // reservation. Abort ONLY the API caller, not the storage-owned task.
+        let caller = if drop_caller {
+            caller.abort();
+            assert!(caller.await.unwrap_err().is_cancelled());
+            None
+        } else {
+            Some(caller)
+        };
+        gate.release.notify_one();
+        h.session.drain().await; // tail barrier includes reducer commit, not just disk append
+        let live_ack = match caller {
+            Some(caller) => Some(caller.await.unwrap().unwrap()),
+            None => None,
+        };
+
+        let query = RecordQuery {
+            lane: Some("main".into()),
+            record_type: Some("queue_enqueued"),
+            queue_kind: Some(QueueKind::Context),
+            pending_queue_only: true,
+            ..Default::default()
+        };
+        let records = h.session.find_records(&query).await.unwrap();
+        assert_eq!(
+            records.len(),
+            1,
+            "storage owner did not commit exactly one pending enqueue"
+        );
+        let LaneRecord::QueueEnqueued(enqueue) = &records[0] else {
+            unreachable!()
+        };
+        let original_id = enqueue.target["id"]
+            .as_str()
+            .expect("enqueue target must carry its reserved entry ID")
+            .to_owned();
+        if let Some(ack) = live_ack {
+            assert_eq!(ack, original_id);
+        }
+        assert_eq!(
+            h.session.storage().history_revision().await.unwrap(),
+            revision + 1,
+            "only queue_enqueued may advance history; operation/source were already committed"
+        );
+        assert!(
+            h.session.get_entry(&original_id).await.unwrap().is_none(),
+            "held-open operation must prevent idle delivery"
+        );
+        let bytes = fs.read_text_file(&path, None).await.unwrap();
+        assert_eq!(
+            bytes
+                .lines()
+                .filter(|line| line.contains("queue_enqueued"))
+                .count(),
+            1,
+            "the enqueue must actually exist in the temporary JSONL file"
+        );
+
+        let fresh = guard(&h).await;
+        if drop_caller {
+            assert!(
+                !h.has_pending_context(),
+                "setup must reproduce the missing hint"
+            );
+            let mut stale = fresh.clone();
+            stale.session_id.push_str("-stale");
+            assert!(h
+                .append_scoped_entry(
+                    &stale,
+                    ScopedEntry::Notice {
+                        message: notice(),
+                        key: "revision-1".into(),
+                    }
+                )
+                .await
+                .is_err());
+            let mut changed = notice();
+            if let AgentMessage::Custom(custom) = &mut changed {
+                custom.data["changed"] = serde_json::json!(true);
+            }
+            assert!(h
+                .append_scoped_entry(
+                    &fresh,
+                    ScopedEntry::Notice {
+                        message: changed,
+                        key: "revision-1".into(),
+                    }
+                )
+                .await
+                .is_err());
+            assert!(h
+                .append_scoped_entry(
+                    &fresh,
+                    ScopedEntry::Notice {
+                        message: notice(),
+                        key: String::new(),
+                    }
+                )
+                .await
+                .is_err());
+            assert!(
+                !h.has_pending_context(),
+                "rejected guards and payloads must not schedule"
+            );
+        }
+        assert_eq!(fresh.session_id, initial.session_id);
+        assert_eq!(
+            fresh.leaf_id, initial.leaf_id,
+            "enqueue must not move the branch leaf"
+        );
+        assert_eq!(
+            fresh.entry_id, initial.entry_id,
+            "source guard must remain valid"
+        );
+        let retry_id = h
+            .append_scoped_entry(
+                &fresh,
+                ScopedEntry::Notice {
+                    message: notice(),
+                    key: "revision-1".into(),
+                },
+            )
+            .await
+            .expect("retry of the committed pending notice must return Ok(original_id)");
+        assert_eq!(
+            retry_id, original_id,
+            "retry must deduplicate to the original reserved ID"
+        );
+        assert_eq!(
+            h.session.storage().history_revision().await.unwrap(),
+            revision + 1,
+            "dedup retry must not append another record or deliver while the operation is open"
+        );
+        assert_eq!(h.session.find_records(&query).await.unwrap().len(), 1);
+        assert!(h.session.get_entry(&original_id).await.unwrap().is_none());
+        assert_eq!(
+            h.session
+                .find_open_operations("main", None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        let pending = h.pending_context_entries().await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, original_id);
+
+        eprintln!("scoped-drop probe: dropped={drop_caller}, retry=Ok({retry_id}), durable_pending={}, scheduled={}",
+            pending.len(), h.has_pending_context());
+        // Desired contract, deliberately NOT inverted to accept the bug.
+        // This is the exact private predicate used by context_boundary_hook's
+        // fully-committed-prefix fast path; no provider/configuration is needed.
+        assert!(
+            h.has_pending_context(),
+            "BUG: successful scoped Notice retry acknowledged original ID {original_id}, \
+             but its durable pending context has no delivery scheduling hint \
+             (dropped_caller={drop_caller}); a fully committed next-turn boundary skips it"
+        );
+
+        // Exercise the actual fast-path hook with an entirely committed (empty)
+        // prefix. The restored hint must cause delivery, not just flip a bit.
+        let settle = Arc::new(crate::settle::SettleState::new(
+            "held-open-operation",
+            false,
+            0,
+            Default::default(),
+        ));
+        let error = Arc::new(Mutex::new(None));
+        let signal = CancellationToken::new();
+        let hook = h.context_boundary_hook(None, settle, signal.clone(), error.clone());
+        let mut assistant = AssistantMessage::empty(rpi_ai::Api::Faux, "faux", "faux", 0);
+        assistant.stop_reason = rpi_ai::StopReason::Stop;
+        let context = rpi_agent::AgentContext::default();
+        let update = hook(ShouldStopAfterTurnContext {
+            message: &assistant,
+            tool_results: &[],
+            context: &context,
+            new_messages: &[],
+        })
+        .await
+        .expect("scheduled context must update the fully committed boundary");
+        assert_eq!(update.context.unwrap().messages.len(), 1);
+        assert!(error.lock().unwrap().is_none());
+        assert!(!signal.is_cancelled());
+        assert!(h.session.get_entry(&original_id).await.unwrap().is_some());
+        assert!(h.pending_context_entries().await.unwrap().is_empty());
+        assert!(!h.has_pending_context());
+        let delivered_revision = h.session.storage().history_revision().await.unwrap();
+        assert_eq!(deliver(&h).await, original_id);
+        assert!(
+            !h.has_pending_context(),
+            "consumed branch dedup must not fabricate work"
+        );
+        assert_eq!(
+            h.session.storage().history_revision().await.unwrap(),
+            delivered_revision
+        );
+        assert!(
+            hook(ShouldStopAfterTurnContext {
+                message: &assistant,
+                tool_results: &[],
+                context: &context,
+                new_messages: &[],
+            })
+            .await
+            .is_none(),
+            "consumed notice must not be delivered again"
+        );
+        let bytes = fs.read_text_file(&path, None).await.unwrap();
+        assert_eq!(
+            bytes
+                .lines()
+                .filter(|line| line.contains("queue_enqueued"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            bytes
+                .lines()
+                .filter(|line| line.contains("queue_cancelled"))
+                .count(),
+            0
+        );
+    }
+}

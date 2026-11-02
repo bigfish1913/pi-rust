@@ -210,6 +210,14 @@ scoped writes refuse the recovery window, which cannot hold a gate while replayi
 external tools. Callbacks and notice events run only after releasing the gate.
 Direct low-level `Session` mutations are not part of this extension API contract.
 
+Queue clear and abort/reclaim retain the harness and an owned message-write gate
+through durable cancellation ACKs and in-memory removal, even if their API caller
+is cancelled. Abort cancels the run and calls the same locked clear implementation
+without reacquiring the gate: enqueue, drain and queue snapshots cannot observe a
+half-reclaimed transition. Reserved handoffs remain excluded; cancellation batches
+must succeed before items leave memory. Queue views and handback preserve text and
+images per message, rather than flattening images into an unrelated shared list.
+
 Goal no longer keeps process-global pending state, pending notices or injection
 fingerprints. A successful mutation is a durable state append, not an in-memory
 stage. Its `notice` is a persistent outbox snapshot: UUID revision, goal payload
@@ -222,7 +230,13 @@ making another mutation, never flush a global cached state into a different bran
 At safe turn/command boundaries the plugin reloads the current branch and delivers
 its notice through generic scoped `AppendEntry` with `outboxKey`. The host dedupes
 against messages on that branch since the last compaction and accepted-but-pending
-context records. Reusing a key for a different payload fails. Durable reserved
+context records. Reusing a key for a different payload fails. A successful retry
+of an accepted, still-pending target restores that lane's delivery scheduling
+hint, including when only the original API caller was cancelled while the storage
+owner committed. This does not append another enqueue, change the reserved ID or
+cancel the target. Rejected guards/payloads do not schedule; deduplication against
+an already-consumed branch message does not recreate pending work or redeliver it.
+Durable reserved
 message IDs acknowledge queue acceptance, not premature transcript insertion:
 context waits until the assistant/tool-result batch is committed. Pending notices
 only drain on a branch containing their source-state entry. A real JSONL reopen

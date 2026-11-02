@@ -1645,16 +1645,16 @@ impl TuiState {
         }
         let colors = current_theme().colors;
         container.add_child(Arc::new(Spacer::new(1)));
-        for text in &messages.steering {
+        for message in &messages.steering {
             container.add_child(Arc::new(Text::new(
-                colors.muted.fg(&format!("Steering: {text}")),
+                colors.muted.fg(&format!("Steering: {}", message.text)),
                 1,
                 0,
             )));
         }
-        for text in &messages.follow_up {
+        for message in &messages.follow_up {
             container.add_child(Arc::new(Text::new(
-                colors.muted.fg(&format!("Follow-up: {text}")),
+                colors.muted.fg(&format!("Follow-up: {}", message.text)),
                 1,
                 0,
             )));
