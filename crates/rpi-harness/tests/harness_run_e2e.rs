@@ -4676,7 +4676,6 @@ async fn abort_reclaiming_is_atomic_on_an_idle_lane() {
     assert!(
         strict.is_err(),
         "`abort()` must keep reporting NoActiveRun on an idle lane"
-
     );
 }
 
