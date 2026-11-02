@@ -171,7 +171,9 @@ impl HarnessActionHost {
 /// pairing as soon as two queued messages carry different pictures: a restore
 /// would attach image B next to text A, or attach the picture to whichever
 /// entry happened to be first.
-fn queued_message_payloads(messages: &[rpi_agent::AgentMessage]) -> Vec<serde_json::Value> {
+pub(crate) fn queued_message_payloads(
+    messages: &[rpi_agent::AgentMessage],
+) -> Vec<serde_json::Value> {
     messages
         .iter()
         .map(|message| {
