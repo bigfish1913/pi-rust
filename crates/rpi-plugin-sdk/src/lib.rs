@@ -1220,6 +1220,17 @@ pub enum RuntimeActionId {
     /// relay, a third-party extension's question pops up on the terminal while
     /// the user is watching a remote client, and is effectively lost.
     RelayUiDialog = 28,
+    /// Finish the current turn, then stop — the gentle counterpart of `Abort`.
+    ///
+    /// `Abort` interrupts the in-flight provider call and running tools; this
+    /// only prevents the loop from starting another turn, so the current answer
+    /// is not truncated. That is what a user means by "stop after this round".
+    ///
+    /// Args: `{}`; result: `{"requested": true}`.
+    ///
+    /// The flag is one-shot: it is consumed at the next turn boundary and
+    /// cleared when a new run starts. Setting it while idle is a harmless no-op.
+    StopRound = 29,
 }
 
 /// Error returned when a plugin passes a numeric runtime-action id that this
@@ -1269,6 +1280,7 @@ impl TryFrom<u32> for RuntimeActionId {
             26 => Ok(Self::ListCommands),
             27 => Ok(Self::Abort),
             28 => Ok(Self::RelayUiDialog),
+            29 => Ok(Self::StopRound),
             other => Err(UnknownRuntimeActionId(other)),
         }
     }
@@ -1311,6 +1323,7 @@ impl RuntimeActionId {
         Self::ListCommands,
         Self::Abort,
         Self::RelayUiDialog,
+        Self::StopRound,
     ];
 
     /// The highest defined action id.
@@ -2432,6 +2445,7 @@ mod tests {
             RuntimeActionId::ListCommands,
             RuntimeActionId::Abort,
             RuntimeActionId::RelayUiDialog,
+            RuntimeActionId::StopRound,
         ];
 
         // Stable wire ids must not depend on which proposal was merged first.
@@ -2443,10 +2457,12 @@ mod tests {
         assert_eq!(u32::from(RuntimeActionId::ListCommands), 26);
         assert_eq!(u32::from(RuntimeActionId::Abort), 27);
         assert_eq!(u32::from(RuntimeActionId::RelayUiDialog), 28);
+        assert_eq!(u32::from(RuntimeActionId::StopRound), 29);
         assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::ListCommands));
         assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::Abort));
         assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::RelayUiDialog));
-        assert_eq!(RuntimeActionId::MAX, 28);
+        assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::StopRound));
+        assert_eq!(RuntimeActionId::MAX, 29);
         // One past the highest defined id is rejected (nothing is silently
         // accepted), and so is the u32 ceiling.
         let one_past_last = RuntimeActionId::MAX + 1;
