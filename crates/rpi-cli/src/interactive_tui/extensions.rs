@@ -558,13 +558,12 @@ impl AskUserBridge {
             return None;
         }
         // An external UI owns delivery: taking here would steal the request and
-        // draw it in a terminal the user is not watching.
-        if self.mailbox.external_takeover() {
-            return None;
-        }
+        // draw it in a terminal the user is not watching. The ownership check
+        // and the dequeue share one lock, so a relay claiming ownership cannot
+        // interleave between them.
         let request = self
             .mailbox
-            .take_pending_filtered(|r| !self.mailbox.is_reserved(&r.request_id))?;
+            .take_pending_unless_external(|r| !self.mailbox.is_reserved(&r.request_id))?;
         *visible = Some(request.request_id.clone());
         Some(request)
     }
