@@ -21,6 +21,24 @@ impl SlashCommand for HelpCommand {
     }
 }
 
+pub(super) struct HistoryCommand;
+impl SlashCommand for HistoryCommand {
+    fn name(&self) -> &'static str {
+        "/history"
+    }
+    fn description(&self) -> &'static str {
+        "Browse history: /history [older|newer|latest] (default: older)"
+    }
+    fn execute(&self, ctx: &CommandContext, args: &str) {
+        if let Some(direction) = history::Direction::parse(args) {
+            history::request(ctx.state.clone(), ctx.tui.clone(), direction);
+        } else {
+            add_error_message(&ctx.chat, "Usage: /history [older|newer|latest]");
+            ctx.tui.request_render(false);
+        }
+    }
+}
+
 pub(super) struct ClearChatCommand;
 impl SlashCommand for ClearChatCommand {
     fn name(&self) -> &'static str {
@@ -895,6 +913,7 @@ pub(super) fn build_builtin_registry() -> CommandRegistry {
     let mut r = CommandRegistry::new();
     r.register(Arc::new(HelpCommand));
     r.register(Arc::new(ClearChatCommand));
+    r.register(Arc::new(HistoryCommand));
     r.register(Arc::new(ExitCommand));
     r.register(Arc::new(VersionCommand));
     r.register(Arc::new(ChangelogCommand));

@@ -1,0 +1,113 @@
+[
+  {
+    "label": "3a49e30-release-eager-baseline",
+    "fixture": {
+      "phase": "generated",
+      "entries": 512,
+      "bodyBytes": 8192,
+      "fileBytes": 4285850
+    },
+    "timing": {
+      "phase": "ready",
+      "loadNs": 7572400,
+      "fileBytes": 4285850,
+      "messageCount": 512,
+      "pageEntries": 5,
+      "pid": 12156,
+      "measurementPhase": "timing"
+    },
+    "memory": {
+      "phase": "ready",
+      "loadNs": 7734900,
+      "fileBytes": 4285850,
+      "messageCount": 512,
+      "pageEntries": 5,
+      "pid": 20112,
+      "readyRssBytes": 12455936,
+      "peakRssBytes": 16666624,
+      "readyPrivateBytes": 6311936,
+      "method": "Windows GetProcessMemoryInfo after ready; native peak counter",
+      "quiescent": {
+        "readyRssBytes": 12455936,
+        "peakRssBytes": 16666624,
+        "readyPrivateBytes": 6311936,
+        "method": "Windows GetProcessMemoryInfo after ready; native peak counter"
+      },
+      "measurementPhase": "memory"
+    }
+  },
+  {
+    "label": "3a49e30-release-eager-baseline",
+    "fixture": {
+      "phase": "generated",
+      "entries": 512,
+      "bodyBytes": 131072,
+      "fileBytes": 67200412
+    },
+    "timing": {
+      "phase": "ready",
+      "loadNs": 74984300,
+      "fileBytes": 67200412,
+      "messageCount": 512,
+      "pageEntries": 5,
+      "pid": 33948,
+      "measurementPhase": "timing"
+    },
+    "memory": {
+      "phase": "ready",
+      "loadNs": 79447700,
+      "fileBytes": 67200412,
+      "messageCount": 512,
+      "pageEntries": 5,
+      "pid": 7860,
+      "readyRssBytes": 75988992,
+      "peakRssBytes": 142864384,
+      "readyPrivateBytes": 70246400,
+      "method": "Windows GetProcessMemoryInfo after ready; native peak counter",
+      "quiescent": {
+        "readyRssBytes": 75988992,
+        "peakRssBytes": 142864384,
+        "readyPrivateBytes": 70246400,
+        "method": "Windows GetProcessMemoryInfo after ready; native peak counter"
+      },
+      "measurementPhase": "memory"
+    }
+  },
+  {
+    "label": "3a49e30-release-eager-baseline",
+    "fixture": {
+      "phase": "generated",
+      "entries": 4096,
+      "bodyBytes": 8192,
+      "fileBytes": 34296803
+    },
+    "timing": {
+      "phase": "ready",
+      "loadNs": 58113400,
+      "fileBytes": 34296803,
+      "messageCount": 4096,
+      "pageEntries": 5,
+      "pid": 37092,
+      "measurementPhase": "timing"
+    },
+    "memory": {
+      "phase": "ready",
+      "loadNs": 59303400,
+      "fileBytes": 34296803,
+      "messageCount": 4096,
+      "pageEntries": 5,
+      "pid": 31240,
+      "readyRssBytes": 47980544,
+      "peakRssBytes": 82210816,
+      "readyPrivateBytes": 42541056,
+      "method": "Windows GetProcessMemoryInfo after ready; native peak counter",
+      "quiescent": {
+        "readyRssBytes": 47980544,
+        "peakRssBytes": 82210816,
+        "readyPrivateBytes": 42541056,
+        "method": "Windows GetProcessMemoryInfo after ready; native peak counter"
+      },
+      "measurementPhase": "memory"
+    }
+  }
+]

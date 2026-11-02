@@ -35,12 +35,19 @@ use crate::session::types::{
     SessionMetadata, SessionMutation, SessionStats,
 };
 
+mod index;
+#[cfg(test)]
+mod index_tests;
+mod metadata;
 #[cfg(test)]
 mod record_page_tests;
+mod selection;
 mod snapshot;
+pub(crate) use index::IndexedState;
+pub(crate) use metadata::EntryMeta;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-enum StoredLogItem {
+pub(crate) enum StoredLogItem {
     Entry(usize),
     Record(usize),
     Other(Box<LogItem>),
@@ -51,19 +58,7 @@ enum StoredLogItem {
 /// global name/labels facts, and running stats.
 #[derive(Debug, Clone)]
 pub struct SessionState {
-    sequence: u64,
-    used_ids: std::collections::HashSet<String>,
-    entries: Vec<Entry>,
-    entries_by_id: HashMap<String, usize>,
-    // Rebuilt by replay, including imported/forked entries; never persisted separately.
-    nearest_user: Vec<Option<usize>>,
-    records: Vec<LaneRecord>,
-    open_operations_by_lane: HashMap<String, BTreeMap<u64, OperationStartedRecord>>,
-    lanes: BTreeMap<String, Option<String>>,
-    log: Vec<StoredLogItem>,
-    stats: SessionStats,
-    name: Option<String>,
-    labels: HashMap<String, String>,
+    index: IndexedState<Entry>,
 }
 
 impl Default for SessionState {
@@ -75,169 +70,67 @@ impl Default for SessionState {
 impl SessionState {
     /// Borrow record payloads; copy only terminal scope metadata once per cleanup.
     pub(crate) fn completed_progress_runs(&self) -> super::progress::CompletedProgressRuns {
-        let mut completed = super::progress::CompletedProgressRuns::new();
-        for record in &self.records {
-            if let LaneRecord::OperationFinished(finished) = record {
-                completed
-                    .entry(finished.base.lane.clone())
-                    .or_default()
-                    .insert(finished.run_id.clone());
-            }
-        }
-        completed
+        self.index.completed_progress_runs()
     }
 
     /// New state with a single `main` lane pointing at no leaf (mirrors TS
     /// `lanes = new Map([["main", null]])`).
     pub fn new() -> Self {
-        let mut lanes = BTreeMap::new();
-        lanes.insert("main".to_string(), None);
         Self {
-            sequence: 0,
-            used_ids: std::collections::HashSet::new(),
-            entries: Vec::new(),
-            entries_by_id: HashMap::new(),
-            nearest_user: Vec::new(),
-            records: Vec::new(),
-            open_operations_by_lane: HashMap::new(),
-            lanes,
-            log: Vec::new(),
-            stats: SessionStats::default(),
-            name: None,
-            labels: HashMap::new(),
+            index: IndexedState::new(),
         }
     }
 
     pub fn next_sequence(&self) -> u64 {
-        self.sequence + 1
+        self.index.next_sequence()
     }
 
     /// The highest applied mutation seq (0 before any mutation). The JSONL
     /// loader uses this to detect a duplicated/late append, where a mutation
     /// arrives with an already-consumed seq.
     pub(crate) fn sequence(&self) -> u64 {
-        self.sequence
-    }
-
-    /// JSONL-only cold frame reservation. Its immutable payload/log slot lives
-    /// in the file-backed wrapper, but IDs and sequence remain write-once.
-    pub(crate) fn reserve_cold_frame(
-        &mut self,
-        frame: &crate::session::types::AssistantFrameRecord,
-    ) -> SessionResult<()> {
-        if frame.base.seq != self.sequence + 1 {
-            return Err(SessionError::invalid_entry(
-                "non-consecutive cold frame sequence",
-            ));
-        }
-        if !self.lanes.contains_key(&frame.base.lane) {
-            return Err(SessionError::invalid_entry(format!(
-                "Invalid session mutation: references missing lane {}",
-                frame.base.lane
-            )));
-        }
-        self.validate_unused_id(&frame.base.id)?;
-        self.sequence = frame.base.seq;
-        self.used_ids.insert(frame.base.id.clone());
-        Ok(())
+        self.index.sequence()
     }
 
     /// Validate the entire cancellation batch before any reducer mutation.
     pub(crate) fn validate_queue_cancellations(&self, records: &[LaneRecord]) -> SessionResult<()> {
-        let mut ids = std::collections::HashSet::new();
-        let mut targets = std::collections::HashSet::new();
-        for record in records {
-            let LaneRecord::QueueCancelled(cancel) = record else {
-                return Err(SessionError::storage(
-                    "cancellation batch contains a non-cancellation",
-                ));
-            };
-            self.require_lane(&cancel.base.lane)?;
-            self.validate_unused_id(&cancel.base.id)?;
-            if !ids.insert(cancel.base.id.as_str()) || !targets.insert(cancel.entry_id.as_str()) {
-                return Err(SessionError::storage("duplicate queue cancellation"));
-            }
-            let enqueue = self.find_records(&RecordQuery {
-                lane: Some(cancel.base.lane.clone()),
-                target_entry_id: Some(cancel.entry_id.clone()),
-                pending_queue_only: true,
-                limit: Some(1),
-                ..Default::default()
-            })?;
-            if !matches!(enqueue.first(), Some(LaneRecord::QueueEnqueued(enqueued)) if enqueued.run_id == cancel.run_id)
-            {
-                return Err(SessionError::storage(
-                    "queue cancellation has no pending matching enqueue",
-                ));
-            }
-        }
-        Ok(())
+        self.index.validate_queue_cancellations(records)
     }
 
     pub(crate) fn check_revision(&self, expected: u64) -> SessionResult<()> {
-        if self.sequence != expected {
-            return Err(SessionError::storage(
-                "branch write conflict: history changed during conditional write",
-            ));
-        }
-        Ok(())
+        self.index.check_revision(expected)
     }
 
     /// Advance the seq counter to `seq` (no-op when already at or past it).
     /// The JSONL loader calls this when a divergent writer's counter leaves a
     /// gap, so the next mutation is accepted instead of refused.
+    #[cfg(test)]
     pub(crate) fn resync_sequence(&mut self, seq: u64) {
-        if seq > self.sequence {
-            self.sequence = seq;
-        }
+        self.index.resync_sequence(seq)
     }
 
     pub fn get_lanes(&self) -> Vec<LanePointer> {
-        self.lanes
-            .iter()
-            .map(|(lane, leaf_id)| LanePointer {
-                lane: lane.clone(),
-                leaf_id: leaf_id.clone(),
-            })
-            .collect()
+        self.index.get_lanes()
     }
 
     /// Look up a lane's leaf, or `invalid_lane` if the lane doesn't exist.
     pub fn require_lane(&self, lane: &str) -> SessionResult<Option<String>> {
-        self.lanes
-            .get(lane)
-            .cloned()
-            .ok_or_else(|| SessionError::invalid_lane(format!("Lane not found: {lane}")))
+        self.index.require_lane(lane)
     }
 
     /// `already_exists` if the lane already exists. Mirrors `validateNewLane`.
     pub fn validate_new_lane(&self, lane: &str) -> SessionResult<()> {
-        if self.lanes.contains_key(lane) {
-            return Err(SessionError::already_exists(format!(
-                "Lane already exists: {lane}"
-            )));
-        }
-        Ok(())
+        self.index.validate_new_lane(lane)
     }
 
     /// `not_found` if `target_id` is set and unknown. Mirrors `validateTarget`.
     pub fn validate_target(&self, target_id: Option<&str>) -> SessionResult<()> {
-        if let Some(id) = target_id {
-            if !self.entries_by_id.contains_key(id) {
-                return Err(SessionError::not_found(format!("Entry not found: {id}")));
-            }
-        }
-        Ok(())
+        self.index.validate_target(target_id)
     }
 
     /// `already_exists` if the id was already used. Mirrors `validateUnusedId`.
     pub fn validate_unused_id(&self, id: &str) -> SessionResult<()> {
-        if self.used_ids.contains(id) {
-            return Err(SessionError::already_exists(format!(
-                "Session id already exists: {id}"
-            )));
-        }
-        Ok(())
+        self.index.validate_unused_id(id)
     }
 
     /// Apply a mutation, enforcing every invariant. Mirrors TS `applyMutation`.
@@ -245,197 +138,23 @@ impl SessionState {
     /// are already stamped by the storage layer (TS shape); the state *validates*
     /// lane-leaf chaining against `entry.parent_id`, it does not set it.
     pub fn apply_mutation(&mut self, mutation: SessionMutation) -> SessionResult<ApplyOutcome> {
-        let seq = mutation.seq();
-        if seq != self.sequence + 1 {
-            return Err(SessionError::invalid_entry(format!(
-                "Invalid session mutation: has non-consecutive seq {seq}"
-            )));
-        }
-
-        match mutation {
-            SessionMutation::Entry {
-                seq, lane, entry, ..
-            } => {
-                self.validate_unused_id(entry.id())?;
-                // Lane chaining — only when a lane is named (fork passes None).
-                if let Some(lane_name) = lane.as_deref() {
-                    let leaf = self.lanes.get(lane_name).cloned().ok_or_else(|| {
-                        SessionError::invalid_entry(format!(
-                            "Invalid session mutation: references missing lane {lane_name}"
-                        ))
-                    })?;
-                    // `entry.parent_id` must equal the lane's current leaf.
-                    if entry.parent_id().map(|s| s.to_string()) != leaf {
-                        return Err(SessionError::invalid_entry(
-                            "Invalid session mutation: does not chain to the lane leaf".to_string(),
-                        ));
-                    }
-                }
-                // Parent existence (when set).
-                if let Some(parent) = entry.parent_id() {
-                    if !self.entries_by_id.contains_key(parent) {
-                        return Err(SessionError::invalid_entry(format!(
-                            "Invalid session mutation: references missing parent {parent}"
-                        )));
-                    }
-                }
-
-                let nearest_user = if matches!(
-                    entry.as_message(),
-                    Some(rpi_agent::message::AgentMessage::User(_))
-                ) {
-                    Some(self.entries.len())
-                } else {
-                    entry
-                        .parent_id()
-                        .and_then(|id| self.entries_by_id.get(id))
-                        .and_then(|index| self.nearest_user[*index])
-                };
-                self.nearest_user.push(nearest_user);
-                let is_message = matches!(entry, Entry::Message(_));
-                self.sequence = seq;
-                self.used_ids.insert(entry.id().to_string());
-                self.entries_by_id
-                    .insert(entry.id().to_string(), self.entries.len());
-                if let Some(lane_name) = lane.as_deref() {
-                    if let Some(slot) = self.lanes.get_mut(lane_name) {
-                        *slot = Some(entry.id().to_string());
-                    }
-                }
-                self.log.push(StoredLogItem::Entry(self.entries.len()));
-                self.entries.push(entry.clone());
-                if is_message {
-                    self.stats.message_count += 1;
-                }
-                Ok(ApplyOutcome::Entry(entry))
-            }
-            SessionMutation::Record { record } => {
-                let lane = record.lane().to_string();
-                if !self.lanes.contains_key(&lane) {
-                    return Err(SessionError::invalid_entry(format!(
-                        "Invalid session mutation: references missing lane {lane}"
-                    )));
-                }
-                self.validate_unused_id(record.id())?;
-                let seq = record.seq();
-                self.sequence = seq;
-                self.used_ids.insert(record.id().to_string());
-                match &record {
-                    LaneRecord::OperationStarted(started) => {
-                        self.open_operations_by_lane
-                            .entry(lane.clone())
-                            .or_default()
-                            .insert(seq, started.clone());
-                    }
-                    LaneRecord::OperationFinished(finished) => {
-                        if let Some(open) = self.open_operations_by_lane.get_mut(&lane) {
-                            // Remove by run_id (matching the operation_started id).
-                            open.retain(|_, started| started.base.id != finished.run_id);
-                            if open.is_empty() {
-                                self.open_operations_by_lane.remove(&lane);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-                if let LaneRecord::Usage(usage_rec) = &record {
-                    self.stats.cached_tokens += usage_rec.usage.cache_read;
-                    self.stats.uncached_tokens +=
-                        usage_rec.usage.input + usage_rec.usage.cache_write;
-                    self.stats.total_tokens += usage_rec.usage.total_tokens;
-                    self.stats.cost_total += usage_rec.usage.cost.total;
-                }
-                self.log.push(StoredLogItem::Record(self.records.len()));
-                self.records.push(record.clone());
-                if let LaneRecord::AssistantFrame(frame) = &record {
-                    match frame.op {
-                        AssistantFrameOp::ClearStream => {
-                            self.retire_frames(&frame.run_id, Some(frame.stream_index));
-                        }
-                        AssistantFrameOp::ClearRun => self.retire_frames(&frame.run_id, None),
-                        _ => {}
-                    }
-                }
-                Ok(ApplyOutcome::Record(record))
-            }
-            SessionMutation::Lane { seq, lane, leaf_id } => {
-                if let Some(leaf) = leaf_id.as_deref() {
-                    if !self.entries_by_id.contains_key(leaf) {
-                        return Err(SessionError::invalid_entry(format!(
-                            "Invalid session mutation: references missing lane target {leaf}"
-                        )));
-                    }
-                }
-                self.sequence = seq;
-                self.lanes.insert(lane.clone(), leaf_id.clone());
-                self.log.push(StoredLogItem::Other(Box::new(LogItem::Lane {
-                    seq,
-                    lane,
-                    leaf_id,
-                })));
-                Ok(ApplyOutcome::Lane)
-            }
-            SessionMutation::FactName { seq, name } => {
-                self.sequence = seq;
-                self.name = name.clone();
-                self.log
-                    .push(StoredLogItem::Other(Box::new(LogItem::FactName {
-                        seq,
-                        name,
-                    })));
-                Ok(ApplyOutcome::Fact)
-            }
-            SessionMutation::FactLabel {
-                seq,
-                target_id,
-                label,
-            } => {
-                if !self.entries_by_id.contains_key(&target_id) {
-                    return Err(SessionError::invalid_entry(format!(
-                        "Invalid session mutation: references missing label target {target_id}"
-                    )));
-                }
-                self.sequence = seq;
-                match &label {
-                    Some(l) => {
-                        self.labels.insert(target_id.clone(), l.clone());
-                    }
-                    None => {
-                        self.labels.remove(&target_id);
-                    }
-                }
-                self.log
-                    .push(StoredLogItem::Other(Box::new(LogItem::FactLabel {
-                        seq,
-                        target_id,
-                        label,
-                    })));
-                Ok(ApplyOutcome::Fact)
-            }
-        }
+        self.index.apply_mutation(mutation, |entry| entry.clone())
     }
 
     pub fn get_entry(&self, id: &str) -> Option<&Entry> {
-        self.entries_by_id
+        self.index
+            .entries_by_id
             .get(id)
-            .map(|index| &self.entries[*index])
+            .map(|index| &self.index.entries[*index])
     }
 
     pub fn find_entries(&self, query: &EntryQuery) -> SessionResult<Vec<Entry>> {
-        validate_limit(query.limit)?;
-        let order = query.order.unwrap_or_default();
         let mut results = Vec::new();
-        let iter: Box<dyn Iterator<Item = &Entry>> = match order {
-            EntryOrder::OldestFirst => Box::new(self.entries.iter()),
-            EntryOrder::NewestFirst => Box::new(self.entries.iter().rev()),
-        };
-        for entry in iter {
-            if !self.matches_entry_query(entry, query) {
-                continue;
-            }
-            results.push(entry.clone());
-            if let Some(limit) = query.limit {
-                if results.len() >= limit {
+        for index in self.index.select_entry_indices(query, None)? {
+            let entry = &self.index.entries[index];
+            if matches_entry_payload(entry, query) {
+                results.push(entry.clone());
+                if query.limit.is_some_and(|limit| results.len() >= limit) {
                     break;
                 }
             }
@@ -449,34 +168,16 @@ impl SessionState {
         bounds: &BranchBounds,
         start: &str,
     ) -> SessionResult<Vec<Entry>> {
-        validate_limit(query.limit)?;
-        let order = query.order.unwrap_or_default();
-        let path = self.walk_to_root(Some(start), bounds)?;
         let mut results = Vec::new();
-        match order {
-            EntryOrder::OldestFirst => {
-                for entry in path.into_iter().rev() {
-                    let reached_bound = bounds.stop_at_id.as_deref() == Some(entry.id())
-                        || bounds
-                            .stop_at_type
-                            .map(|t| t == entry.entry_type())
-                            .unwrap_or(false);
-                    if self.matches_entry_query(entry, query) {
-                        results.push(entry.clone());
-                    }
-                    if reached_bound || query.limit.map(|l| results.len() >= l).unwrap_or(false) {
-                        break;
-                    }
-                }
-            }
-            EntryOrder::NewestFirst => {
-                for entry in path {
-                    if self.matches_entry_query(entry, query) {
-                        results.push(entry.clone());
-                    }
-                    if query.limit.map(|l| results.len() >= l).unwrap_or(false) {
-                        break;
-                    }
+        for index in self
+            .index
+            .select_entry_indices(query, Some((bounds, start)))?
+        {
+            let entry = &self.index.entries[index];
+            if matches_entry_payload(entry, query) {
+                results.push(entry.clone());
+                if query.limit.is_some_and(|limit| results.len() >= limit) {
+                    break;
                 }
             }
         }
@@ -516,139 +217,15 @@ impl SessionState {
         Ok(crate::session::context::build_session_context_from_borrowed(&path))
     }
 
-    /// Drop the frames a clear has retired: one per streamed delta, each a
-    /// parsed JSON value, and never read again because recovery skips what a
-    /// clear covers. Left in place they outweigh the transcript several times
-    /// over. The session file keeps them, and a reload retires them here too.
-    /// Their IDs stay in `used_ids`: the file still holds them, so they stay taken.
-    fn retire_frames(&mut self, run_id: &str, stream_index: Option<usize>) {
-        let retired = |record: &LaneRecord| {
-            matches!(record, LaneRecord::AssistantFrame(frame)
-                if frame.op == AssistantFrameOp::Append
-                    && frame.run_id == run_id
-                    && stream_index.is_none_or(|index| frame.stream_index == index))
-        };
-        // Everything before the first retired frame keeps its index.
-        let Some(first) = self.records.iter().position(retired) else {
-            return;
-        };
-        let mut moved = vec![None; self.records.len() - first];
-        let mut kept = first;
-        let tail = self.records.split_off(first);
-        for (offset, record) in tail.into_iter().enumerate() {
-            if !retired(&record) {
-                moved[offset] = Some(kept);
-                kept += 1;
-                self.records.push(record);
-            }
-        }
-        // The log lists records in order, so only its tail can name a moved one.
-        let log_tail = self
-            .log
-            .iter()
-            .rposition(|item| matches!(item, StoredLogItem::Record(index) if *index < first))
-            .map_or(0, |at| at + 1);
-        let mut position = 0;
-        self.log.retain_mut(|item| {
-            position += 1;
-            if position <= log_tail {
-                return true;
-            }
-            let StoredLogItem::Record(index) = item else {
-                return true;
-            };
-            match moved[*index - first] {
-                Some(now) => {
-                    *index = now;
-                    true
-                }
-                None => false,
-            }
-        });
-    }
-
     pub fn find_records(&self, query: &RecordQuery) -> SessionResult<Vec<LaneRecord>> {
-        validate_limit(query.limit)?;
-        let order = query.order.unwrap_or_default();
-        let mut results = Vec::new();
-        // Borrow cancellation identities, not historical message payloads.
-        let cancelled: std::collections::HashSet<(&str, &str)> = if query.pending_queue_only {
-            self.records
-                .iter()
-                .filter_map(|record| match record {
-                    LaneRecord::QueueCancelled(cancel) => {
-                        Some((cancel.base.lane.as_str(), cancel.entry_id.as_str()))
-                    }
-                    _ => None,
-                })
-                .collect()
-        } else {
-            Default::default()
-        };
-        let iter: Box<dyn Iterator<Item = &LaneRecord>> = match order {
-            EntryOrder::OldestFirst => Box::new(self.records.iter()),
-            EntryOrder::NewestFirst => Box::new(self.records.iter().rev()),
-        };
-        for record in iter {
-            if !self.matches_record_query(record, query) {
-                continue;
-            }
-            if query.pending_queue_only {
-                let LaneRecord::QueueEnqueued(enqueued) = record else {
-                    continue;
-                };
-                let Some(id) = enqueued
-                    .target
-                    .get("id")
-                    .and_then(serde_json::Value::as_str)
-                else {
-                    continue;
-                };
-                if self.entries_by_id.contains_key(id) || cancelled.contains(&(record.lane(), id)) {
-                    continue;
-                }
-            }
-            results.push(record.clone());
-            if let Some(limit) = query.limit {
-                if results.len() >= limit {
-                    break;
-                }
-            }
-        }
-        Ok(results)
+        self.index.find_records(query)
     }
 
     pub fn record_page(
         &self,
         query: &crate::session::types::RecordPageQuery,
     ) -> SessionResult<crate::session::types::RecordPage> {
-        validate_limit(Some(query.limit))?;
-        let matches = |record: &&LaneRecord| {
-            record.lane() == query.lane
-                && query.after_seq.is_none_or(|seq| record.seq() > seq)
-                && query.before_seq.is_none_or(|seq| record.seq() < seq)
-        };
-        let total = self.records.iter().filter(matches).count();
-        let mut records: Vec<_> = if query.from_end {
-            self.records
-                .iter()
-                .rev()
-                .filter(matches)
-                .take(query.limit)
-                .cloned()
-                .collect()
-        } else {
-            self.records
-                .iter()
-                .filter(matches)
-                .take(query.limit)
-                .cloned()
-                .collect()
-        };
-        if query.from_end {
-            records.reverse();
-        }
-        Ok(crate::session::types::RecordPage { records, total })
+        self.index.record_page(query)
     }
 
     pub fn find_open_operations(
@@ -656,54 +233,25 @@ impl SessionState {
         lane: &str,
         limit: Option<usize>,
     ) -> SessionResult<Vec<OperationStartedRecord>> {
-        validate_limit(limit)?;
-        let mut open: Vec<OperationStartedRecord> = self
-            .open_operations_by_lane
-            .get(lane)
-            .map(|m| m.values().rev().cloned().collect())
-            .unwrap_or_default();
-        if let Some(limit) = limit {
-            open.truncate(limit);
-        }
-        Ok(open)
-    }
-
-    pub(crate) fn has_open_operation_except(
-        &self,
-        lane: &str,
-        except_run_id: Option<&str>,
-    ) -> bool {
-        self.open_operations_by_lane
-            .get(lane)
-            .map(|open| {
-                open.values()
-                    .any(|started| Some(started.base.id.as_str()) != except_run_id)
-            })
-            .unwrap_or(false)
+        self.index.find_open_operations(lane, limit)
     }
 
     pub fn get_log(&self, options: &LogOptions) -> SessionResult<Vec<LogItem>> {
-        validate_limit(options.limit)?;
         let mut results = Vec::new();
-        for item in &self.log {
+        for item in self.index.log_items(options)? {
             let seq = match item {
-                StoredLogItem::Entry(index) => self.entries[*index].seq(),
-                StoredLogItem::Record(index) => self.records[*index].seq(),
+                StoredLogItem::Entry(index) => self.index.entries[*index].seq(),
+                StoredLogItem::Record(index) => self.index.records[*index].seq(),
                 StoredLogItem::Other(item) => item.seq(),
             };
-            if let Some(after) = options.after_seq {
-                if seq <= after {
-                    continue;
-                }
-            }
             results.push(match item {
                 StoredLogItem::Entry(index) => LogItem::Entry {
                     seq,
-                    entry: self.entries[*index].clone(),
+                    entry: self.index.entries[*index].clone(),
                 },
                 StoredLogItem::Record(index) => LogItem::Record {
                     seq,
-                    record: self.records[*index].clone(),
+                    record: self.index.records[*index].clone(),
                 },
                 StoredLogItem::Other(item) => (**item).clone(),
             });
@@ -717,15 +265,15 @@ impl SessionState {
     }
 
     pub fn get_name(&self) -> Option<&str> {
-        self.name.as_deref()
+        self.index.get_name()
     }
 
     pub fn get_label(&self, id: &str) -> Option<&str> {
-        self.labels.get(id).map(|s| s.as_str())
+        self.index.get_label(id)
     }
 
     pub fn get_stats(&self) -> &SessionStats {
-        &self.stats
+        self.index.get_stats()
     }
 
     /// Build the fork mutation list. Mirrors TS `createForkMutations`. The
@@ -814,7 +362,7 @@ impl SessionState {
             });
             sequence += 1;
         }
-        if let Some(name) = &self.name {
+        if let Some(name) = &self.index.name {
             mutations.push(SessionMutation::FactName {
                 seq: sequence,
                 name: Some(name.clone()),
@@ -822,7 +370,7 @@ impl SessionState {
             sequence += 1;
         }
         for entry in &copied_entries {
-            if let Some(label) = self.labels.get(entry.id()) {
+            if let Some(label) = self.index.labels.get(entry.id()) {
                 mutations.push(SessionMutation::FactLabel {
                     seq: sequence,
                     target_id: entry.id().to_string(),
@@ -841,132 +389,12 @@ impl SessionState {
         start: Option<&str>,
         bounds: &BranchBounds,
     ) -> SessionResult<Vec<&Entry>> {
-        let mut path = Vec::new();
-        let mut next_id = start;
-        let mut visited = std::collections::HashSet::new();
-        while let Some(id) = next_id.take() {
-            let current = self
-                .get_entry(id)
-                .ok_or_else(|| SessionError::not_found(format!("Entry not found: {id}")))?;
-            if !visited.insert(current.id()) {
-                return Err(SessionError::invalid_entry(format!(
-                    "Session branch contains a cycle at {}",
-                    current.id()
-                )));
-            }
-            let reached = bounds.stop_at_id.as_deref() == Some(current.id())
-                || bounds
-                    .stop_at_type
-                    .map(|t| t == current.entry_type())
-                    .unwrap_or(false)
-                || current.parent_id().is_none();
-            path.push(current);
-            if reached {
-                break;
-            }
-            next_id = current.parent_id();
-        }
-        Ok(path)
-    }
-
-    fn matches_entry_query(&self, entry: &Entry, query: &EntryQuery) -> bool {
-        let type_ok = query
-            .entry_type
-            .map(|t| t == entry.entry_type())
-            .unwrap_or(true);
-        let custom_ok = query
-            .custom_type
-            .as_deref()
-            .map(|ct| {
-                if let Entry::Custom(c) = entry {
-                    c.custom_type == ct
-                } else {
-                    false
-                }
-            })
-            .unwrap_or(true);
-        let cursor_ok = query
-            .cursor
-            .map(|c| {
-                let after = c.after_seq;
-                match query.order.unwrap_or_default() {
-                    EntryOrder::OldestFirst => entry.seq() > after,
-                    EntryOrder::NewestFirst => entry.seq() < after,
-                }
-            })
-            .unwrap_or(true);
-        let identity_ok = query.entry_id.as_deref().is_none_or(|id| entry.id() == id);
-        let outbox_ok = query.outbox_key.as_deref().is_none_or(|key| match entry {
-            Entry::Message(message) => match &message.message {
-                rpi_agent::AgentMessage::Custom(custom) => {
-                    custom
-                        .data
-                        .get("__rpiOutbox")
-                        .and_then(|value| value.get("key"))
-                        .and_then(serde_json::Value::as_str)
-                        == Some(key)
-                }
-                _ => false,
-            },
-            _ => false,
-        });
-        let tool_ok = query.tool_call_id.as_deref().is_none_or(|id| {
-            match entry {
-            Entry::Message(entry) => match &entry.message {
-                rpi_agent::AgentMessage::Assistant(message) => message.content.iter().any(|block| {
-                    matches!(block, rpi_ai::types::Content::ToolCall(call) if call.id == id)
-                }),
-                rpi_agent::AgentMessage::ToolResult(result) => result.tool_call_id == id,
-                _ => false,
-            },
-            _ => false,
-        }
-        });
-        let boundary_ok = !query.message_boundary_only
-            || matches!(entry,
-            Entry::Message(entry) if matches!(entry.message, rpi_agent::AgentMessage::Assistant(_) | rpi_agent::AgentMessage::User(_)));
-        type_ok && custom_ok && cursor_ok && identity_ok && outbox_ok && tool_ok && boundary_ok
-    }
-
-    fn matches_record_query(&self, record: &LaneRecord, query: &RecordQuery) -> bool {
-        let lane_ok = query
-            .lane
-            .as_deref()
-            .map(|l| record.lane() == l)
-            .unwrap_or(true);
-        let type_ok = query
-            .record_type
-            .map(|t| t == record.record_type())
-            .unwrap_or(true);
-        let run_ok = query
-            .run_id
-            .as_deref()
-            .map(|run| match record {
-                LaneRecord::OperationStarted(s) => s.base.id == run,
-                _ => record.run_id().map(|r| r == run).unwrap_or(false),
-            })
-            .unwrap_or(true);
-        let kind_ok = query
-            .operation_kind
-            .map(|k| {
-                matches!(record,
-                    LaneRecord::OperationStarted(s) if s.intent.kind() == k)
-            })
-            .unwrap_or(true);
-        let after_ok = query
-            .after_seq
-            .map(|after| record.seq() > after)
-            .unwrap_or(true);
-        let queue_ok = query.queue_kind.is_none_or(
-            |kind| matches!(record, LaneRecord::QueueEnqueued(enqueued) if enqueued.queue == kind),
-        );
-        let target_ok = query.target_entry_id.as_deref().is_none_or(|id| {
-            matches!(record, LaneRecord::QueueEnqueued(enqueued) if enqueued.target.get("id").and_then(serde_json::Value::as_str) == Some(id))
-        });
-        let tool_ok = query.tool_call_id.as_deref().is_none_or(
-            |id| matches!(record, LaneRecord::ToolStarted(started) if started.tool_call_id == id),
-        );
-        lane_ok && type_ok && run_ok && kind_ok && after_ok && queue_ok && target_ok && tool_ok
+        Ok(self
+            .index
+            .walk_to_root(start, bounds)?
+            .into_iter()
+            .map(|index| &self.index.entries[index])
+            .collect())
     }
 }
 
@@ -1004,11 +432,169 @@ fn validate_limit(limit: Option<usize>) -> SessionResult<()> {
 #[allow(dead_code)] // state introspection helpers for upcoming session_state tests
 impl SessionState {
     pub(crate) fn lanes(&self) -> &BTreeMap<String, Option<String>> {
-        &self.lanes
+        &self.index.lanes
     }
     pub(crate) fn entries(&self) -> &[Entry] {
-        &self.entries
+        &self.index.entries
     }
 }
 
 mod message_queries;
+
+/// Complete matcher for hydrated entries. Metadata candidates alone are not a
+/// match when a tool/outbox predicate is present.
+#[cfg(test)]
+pub(crate) fn matches_entry_query(entry: &Entry, query: &EntryQuery) -> bool {
+    EntryMeta::from_entry(entry).matches_query(query) && matches_entry_payload(entry, query)
+}
+
+/// Apply only predicates omitted by metadata selection, without cloning facts.
+pub(crate) fn matches_entry_payload(entry: &Entry, query: &EntryQuery) -> bool {
+    let outbox_ok = query.outbox_key.as_deref().is_none_or(|key| match entry {
+        Entry::Message(message) => match &message.message {
+            rpi_agent::AgentMessage::Custom(custom) => {
+                custom
+                    .data
+                    .get("__rpiOutbox")
+                    .and_then(|value| value.get("key"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(key)
+            }
+            _ => false,
+        },
+        _ => false,
+    });
+    let tool_ok = query.tool_call_id.as_deref().is_none_or(|id| match entry {
+        Entry::Message(entry) => match &entry.message {
+            rpi_agent::AgentMessage::Assistant(message) => message.content.iter().any(
+                |block| matches!(block, rpi_ai::types::Content::ToolCall(call) if call.id == id),
+            ),
+            rpi_agent::AgentMessage::ToolResult(result) => result.tool_call_id == id,
+            _ => false,
+        },
+        _ => false,
+    });
+    outbox_ok && tool_ok
+}
+
+impl<P: Clone> IndexedState<P> {
+    /// Drop the frames a clear has retired: one per streamed delta, each a
+    /// parsed JSON value, and never read again because recovery skips what a
+    /// clear covers. Left in place they outweigh the transcript several times
+    /// over. The session file keeps them, and a reload retires them here too.
+    /// Their IDs stay in `used_ids`: the file still holds them, so they stay taken.
+    fn retire_frames(&mut self, run_id: &str, stream_index: Option<usize>, before_seq: u64) {
+        let retired = |record: &LaneRecord| {
+            matches!(record, LaneRecord::AssistantFrame(frame)
+                if frame.op == AssistantFrameOp::Append
+                    && frame.base.seq < before_seq
+                    && frame.run_id == run_id
+                    && stream_index.is_none_or(|index| frame.stream_index == index))
+        };
+        // Everything before the first retired frame keeps its index.
+        let Some(first) = self.records.iter().position(retired) else {
+            return;
+        };
+        let mut moved = vec![None; self.records.len() - first];
+        let mut kept = first;
+        let tail = self.records.split_off(first);
+        for (offset, record) in tail.into_iter().enumerate() {
+            if !retired(&record) {
+                moved[offset] = Some(kept);
+                kept += 1;
+                self.records.push(record);
+            }
+        }
+        // The log lists records in order, so only its tail can name a moved one.
+        let log_tail = self
+            .log
+            .iter()
+            .rposition(|item| matches!(item, StoredLogItem::Record(index) if *index < first))
+            .map_or(0, |at| at + 1);
+        let mut position = 0;
+        self.log.retain_mut(|item| {
+            position += 1;
+            if position <= log_tail {
+                return true;
+            }
+            let StoredLogItem::Record(index) = item else {
+                return true;
+            };
+            match moved[*index - first] {
+                Some(now) => {
+                    *index = now;
+                    true
+                }
+                None => false,
+            }
+        });
+    }
+}
+
+impl<P: Clone> IndexedState<P> {
+    pub(crate) fn retire_cleared_frames(
+        &mut self,
+        frame: &crate::session::types::AssistantFrameRecord,
+    ) {
+        match frame.op {
+            AssistantFrameOp::ClearStream => {
+                self.retire_frames(&frame.run_id, Some(frame.stream_index), frame.base.seq)
+            }
+            AssistantFrameOp::ClearRun => self.retire_frames(&frame.run_id, None, frame.base.seq),
+            _ => {}
+        }
+    }
+    pub(crate) fn take_payloads(&mut self) -> Vec<P> {
+        std::mem::take(&mut self.entries)
+    }
+    /// Transfer validated metadata without replay or loss of retired ID reservations.
+    pub(crate) fn into_session_state(
+        mut self,
+        entries: Vec<Entry>,
+        cold_records: Vec<LaneRecord>,
+    ) -> SessionState {
+        assert_eq!(entries.len(), self.metadata.len());
+        let original_seqs: Vec<_> = self.records.iter().map(LaneRecord::seq).collect();
+        let cold_seqs: Vec<_> = cold_records.iter().map(LaneRecord::seq).collect();
+        self.records.extend(cold_records);
+        self.records.sort_unstable_by_key(LaneRecord::seq);
+        let positions: HashMap<_, _> = self
+            .records
+            .iter()
+            .enumerate()
+            .map(|(i, record)| (record.seq(), i))
+            .collect();
+        for item in &mut self.log {
+            if let StoredLogItem::Record(index) = item {
+                *index = positions[&original_seqs[*index]];
+            }
+        }
+        self.log.extend(
+            cold_seqs
+                .into_iter()
+                .map(|seq| StoredLogItem::Record(positions[&seq])),
+        );
+        self.log.sort_unstable_by_key(|item| match item {
+            StoredLogItem::Entry(i) => entries[*i].seq(),
+            StoredLogItem::Record(i) => self.records[*i].seq(),
+            StoredLogItem::Other(item) => item.seq(),
+        });
+        SessionState {
+            index: IndexedState {
+                sequence: self.sequence,
+                used_ids: self.used_ids,
+                entries,
+                metadata: self.metadata,
+                entries_by_id: self.entries_by_id,
+                nearest_user: self.nearest_user,
+                records: self.records,
+                open_operations_by_lane: self.open_operations_by_lane,
+                lanes: self.lanes,
+                log: self.log,
+                stats: self.stats,
+                name: self.name,
+                labels: self.labels,
+            },
+        }
+    }
+}

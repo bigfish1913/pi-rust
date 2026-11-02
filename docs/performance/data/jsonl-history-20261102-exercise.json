@@ -1,0 +1,268 @@
+{
+  "label": "verified-lazy-jsonl",
+  "fixture": {
+    "phase": "generated",
+    "entries": 512,
+    "bodyBytes": 131072,
+    "fileBytes": 67200425
+  },
+  "appendCount": 512,
+  "bodyBytes": 131072,
+  "appendPayloadBytes": 67108864,
+  "measurementPhase": "exercise",
+  "notes": "Independent child; phase RSS and cumulative native peak, no heap trimming. Raw operation timings exclude phase pauses but include sampling overhead if the sampler overlaps work; not a constant-memory guarantee.",
+  "phases": [
+    {
+      "phase": "loaded",
+      "loadNs": 180172700,
+      "fileBytes": 67200425,
+      "messageCount": 512,
+      "pid": 23836,
+      "memory": {
+        "readyRssBytes": 8245248,
+        "peakRssBytes": 10317824,
+        "readyPrivateBytes": 1855488,
+        "method": "Windows GetProcessMemoryInfo after phase; native peak counter"
+      },
+      "sampleMonotonicNs": 56915937000000,
+      "quiescent": {
+        "readyRssBytes": 8245248,
+        "peakRssBytes": 10317824,
+        "readyPrivateBytes": 1855488,
+        "method": "Windows GetProcessMemoryInfo after phase; native peak counter"
+      }
+    },
+    {
+      "phase": "paged",
+      "pid": 23836,
+      "pageCount": 102,
+      "olderPages": 51,
+      "newerPages": 48,
+      "latestPages": 3,
+      "pageLimit": 50,
+      "pageMaxBytes": 4194304,
+      "pageNs": 736284900,
+      "memory": {
+        "readyRssBytes": 11218944,
+        "peakRssBytes": 13660160,
+        "readyPrivateBytes": 4841472,
+        "method": "Windows GetProcessMemoryInfo after phase; native peak counter"
+      },
+      "sampleMonotonicNs": 56917187000000,
+      "quiescent": {
+        "readyRssBytes": 11218944,
+        "peakRssBytes": 13660160,
+        "readyPrivateBytes": 4841472,
+        "method": "Windows GetProcessMemoryInfo after phase; native peak counter"
+      }
+    },
+    {
+      "phase": "appended",
+      "pid": 23836,
+      "appendCount": 64,
+      "requestedAppendCount": 512,
+      "batchCount": 64,
+      "bodyBytes": 131072,
+      "initialMessages": 512,
+      "totalMessages": 576,
+      "batchAppendNs": 292571000,
+      "appendNs": 292571000,
+      "finished": false,
+      "memory": {
+        "readyRssBytes": 9920512,
+        "peakRssBytes": 13660160,
+        "readyPrivateBytes": 3805184,
+        "method": "Windows GetProcessMemoryInfo after phase; native peak counter"
+      },
+      "sampleMonotonicNs": 56918000000000,
+      "quiescent": {
+        "readyRssBytes": 9920512,
+        "peakRssBytes": 13660160,
+        "readyPrivateBytes": 3805184,
+        "method": "Windows GetProcessMemoryInfo after phase; native peak counter"
+      }
+    },
+    {
+      "phase": "appended",
+      "pid": 23836,
+      "appendCount": 128,
+      "requestedAppendCount": 512,
+      "batchCount": 64,
+      "bodyBytes": 131072,
+      "initialMessages": 512,
+      "totalMessages": 640,
+      "batchAppendNs": 298931600,
+      "appendNs": 591502600,
+      "finished": false,
+      "memory": {
+        "readyRssBytes": 10022912,
+        "peakRssBytes": 13660160,
+        "readyPrivateBytes": 3833856,
+        "method": "Windows GetProcessMemoryInfo after phase; native peak counter"
+      },
+      "sampleMonotonicNs": 56918796000000,
+      "quiescent": {
+        "readyRssBytes": 10022912,
+        "peakRssBytes": 13660160,
+        "readyPrivateBytes": 3833856,
+        "method": "Windows GetProcessMemoryInfo after phase; native peak counter"
+      }
+    },
+    {
+      "phase": "appended",
+      "pid": 23836,
+      "appendCount": 192,
+      "requestedAppendCount": 512,
+      "batchCount": 64,
+      "bodyBytes": 131072,
+      "initialMessages": 512,
+      "totalMessages": 704,
+      "batchAppendNs": 297201300,
+      "appendNs": 888703900,
+      "finished": false,
+      "memory": {
+        "readyRssBytes": 10059776,
+        "peakRssBytes": 13660160,
+        "readyPrivateBytes": 3883008,
+        "method": "Windows GetProcessMemoryInfo after phase; native peak counter"
+      },
+      "sampleMonotonicNs": 56919609000000,
+      "quiescent": {
+        "readyRssBytes": 10059776,
+        "peakRssBytes": 13660160,
+        "readyPrivateBytes": 3883008,
+        "method": "Windows GetProcessMemoryInfo after phase; native peak counter"
+      }
+    },
+    {
+      "phase": "appended",
+      "pid": 23836,
+      "appendCount": 256,
+      "requestedAppendCount": 512,
+      "batchCount": 64,
+      "bodyBytes": 131072,
+      "initialMessages": 512,
+      "totalMessages": 768,
+      "batchAppendNs": 296227400,
+      "appendNs": 1184931300,
+      "finished": false,
+      "memory": {
+        "readyRssBytes": 10117120,
+        "peakRssBytes": 13660160,
+        "readyPrivateBytes": 3956736,
+        "method": "Windows GetProcessMemoryInfo after phase; native peak counter"
+      },
+      "sampleMonotonicNs": 56920421000000,
+      "quiescent": {
+        "readyRssBytes": 10117120,
+        "peakRssBytes": 13660160,
+        "readyPrivateBytes": 3956736,
+        "method": "Windows GetProcessMemoryInfo after phase; native peak counter"
+      }
+    },
+    {
+      "phase": "appended",
+      "pid": 23836,
+      "appendCount": 320,
+      "requestedAppendCount": 512,
+      "batchCount": 64,
+      "bodyBytes": 131072,
+      "initialMessages": 512,
+      "totalMessages": 832,
+      "batchAppendNs": 243337700,
+      "appendNs": 1428269000,
+      "finished": false,
+      "memory": {
+        "readyRssBytes": 10186752,
+        "peakRssBytes": 13660160,
+        "readyPrivateBytes": 3932160,
+        "method": "Windows GetProcessMemoryInfo after phase; native peak counter"
+      },
+      "sampleMonotonicNs": 56921171000000,
+      "quiescent": {
+        "readyRssBytes": 10186752,
+        "peakRssBytes": 13660160,
+        "readyPrivateBytes": 3932160,
+        "method": "Windows GetProcessMemoryInfo after phase; native peak counter"
+      }
+    },
+    {
+      "phase": "appended",
+      "pid": 23836,
+      "appendCount": 384,
+      "requestedAppendCount": 512,
+      "batchCount": 64,
+      "bodyBytes": 131072,
+      "initialMessages": 512,
+      "totalMessages": 896,
+      "batchAppendNs": 244206600,
+      "appendNs": 1672475600,
+      "finished": false,
+      "memory": {
+        "readyRssBytes": 10223616,
+        "peakRssBytes": 13660160,
+        "readyPrivateBytes": 3891200,
+        "method": "Windows GetProcessMemoryInfo after phase; native peak counter"
+      },
+      "sampleMonotonicNs": 56921921000000,
+      "quiescent": {
+        "readyRssBytes": 10223616,
+        "peakRssBytes": 13660160,
+        "readyPrivateBytes": 3891200,
+        "method": "Windows GetProcessMemoryInfo after phase; native peak counter"
+      }
+    },
+    {
+      "phase": "appended",
+      "pid": 23836,
+      "appendCount": 448,
+      "requestedAppendCount": 512,
+      "batchCount": 64,
+      "bodyBytes": 131072,
+      "initialMessages": 512,
+      "totalMessages": 960,
+      "batchAppendNs": 240993500,
+      "appendNs": 1913469100,
+      "finished": false,
+      "memory": {
+        "readyRssBytes": 10342400,
+        "peakRssBytes": 13660160,
+        "readyPrivateBytes": 3862528,
+        "method": "Windows GetProcessMemoryInfo after phase; native peak counter"
+      },
+      "sampleMonotonicNs": 56922656000000,
+      "quiescent": {
+        "readyRssBytes": 10342400,
+        "peakRssBytes": 13660160,
+        "readyPrivateBytes": 3862528,
+        "method": "Windows GetProcessMemoryInfo after phase; native peak counter"
+      }
+    },
+    {
+      "phase": "appended",
+      "pid": 23836,
+      "appendCount": 512,
+      "requestedAppendCount": 512,
+      "batchCount": 64,
+      "bodyBytes": 131072,
+      "initialMessages": 512,
+      "totalMessages": 1024,
+      "batchAppendNs": 247089200,
+      "appendNs": 2160558300,
+      "finished": true,
+      "memory": {
+        "readyRssBytes": 10395648,
+        "peakRssBytes": 13660160,
+        "readyPrivateBytes": 3895296,
+        "method": "Windows GetProcessMemoryInfo after phase; native peak counter"
+      },
+      "sampleMonotonicNs": 56923406000000,
+      "quiescent": {
+        "readyRssBytes": 10395648,
+        "peakRssBytes": 13660160,
+        "readyPrivateBytes": 3895296,
+        "method": "Windows GetProcessMemoryInfo after phase; native peak counter"
+      }
+    }
+  ]
+}

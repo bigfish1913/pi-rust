@@ -61,7 +61,7 @@ pub fn outcome_exit_code(outcome: &HarnessRunOutcome) -> i32 {
 /// return the exit code. Mirrors TS `runPrintMode` (text).
 pub async fn print(
     harness: &AgentHarness,
-    _args: &Args,
+    args: &Args,
     initial: Option<String>,
     extra_messages: &[String],
     initial_images: Vec<ImageContent>,
@@ -69,6 +69,7 @@ pub async fn print(
     let lane: Arc<dyn AgentLane> = harness.lane("main");
 
     let mut last_exit = 0;
+    let mut persistence_failed = false;
     let mut last_msg: Option<AssistantMessage> = None;
 
     // The initial prompt (and its `@file` attachments) go in one user message;
@@ -93,6 +94,7 @@ pub async fn print(
         // stderr. Silence here is what let a conversation stop being saved while
         // the run looked fine.
         for failure in lane.take_write_failures() {
+            persistence_failed |= args.experimental_native_store.is_some();
             eprintln!(
                 "session not saved: could not persist {} ({})",
                 failure.what, failure.message
@@ -162,7 +164,11 @@ pub async fn print(
         }
     }
 
-    last_exit
+    if persistence_failed {
+        1
+    } else {
+        last_exit
+    }
 }
 
 /// `json` mode: emit each harness event as a JSON line on stdout, run the
@@ -170,7 +176,7 @@ pub async fn print(
 /// text. Mirrors TS `runPrintMode` (`mode === "json"`) streaming every event.
 pub async fn json(
     harness: &AgentHarness,
-    _args: &Args,
+    args: &Args,
     initial: Option<String>,
     extra_messages: &[String],
     initial_images: Vec<ImageContent>,
@@ -223,6 +229,7 @@ pub async fn json(
     }
 
     let mut last_exit = 0;
+    let mut persistence_failed = false;
     let mut final_outcome: Option<HarnessRunOutcome> = None;
 
     let mut images = initial_images;
@@ -249,10 +256,30 @@ pub async fn json(
                     "error": e.to_string(),
                 });
                 println!("{line}");
+                if args.experimental_native_store.is_some() {
+                    for failure in lane.take_write_failures() {
+                        persistence_failed = true;
+                        println!(
+                            "{}",
+                            serde_json::json!({"type":"error","kind":"session_write_failed","error":failure.message,"what":failure.what})
+                        );
+                    }
+                    last_exit = 1;
+                    break;
+                }
                 if let Some(task) = agent_event_task {
                     task.abort();
                 }
                 return 1;
+            }
+        }
+        if args.experimental_native_store.is_some() {
+            for failure in lane.take_write_failures() {
+                persistence_failed = true;
+                println!(
+                    "{}",
+                    serde_json::json!({"type":"error","kind":"session_write_failed","error":failure.message,"what":failure.what})
+                );
             }
         }
     }
@@ -270,13 +297,18 @@ pub async fn json(
             ("failed", t)
         }
         Some(HarnessRunOutcome::Suspended { .. }) => ("suspended", None),
+        None if last_exit != 0 => ("failed", None),
         None => ("idle", None),
     };
-    let result_line = serde_json::json!({
+    let mut result_line = serde_json::json!({
         "type": "result",
-        "outcome": outcome_str,
+        "outcome": if persistence_failed{"failed"}else{outcome_str},
         "finalText": final_text,
     });
+    if persistence_failed {
+        result_line["persistenceFailed"] = true.into();
+        last_exit = 1;
+    }
     println!("{result_line}");
     if let Some(task) = agent_event_task {
         task.abort();
@@ -327,6 +359,33 @@ pub async fn rpc(
     .await
 }
 
+/// Opt-in, payload-free stage markers. An unmatched begin identifies an
+/// unfinished await, not its cause. Enqueue completion is NOT pipe delivery.
+struct RpcPhaseTiming {
+    phase: &'static str,
+    started: Option<std::time::Instant>,
+}
+
+impl RpcPhaseTiming {
+    fn start(enabled: bool, phase: &'static str) -> Self {
+        let started = enabled.then(std::time::Instant::now);
+        if enabled {
+            eprintln!("RPI_RPC_DIAGNOSTICS phase={phase} event=begin");
+        }
+        Self { phase, started }
+    }
+
+    fn finish(self) {
+        if let Some(started) = self.started {
+            eprintln!(
+                "RPI_RPC_DIAGNOSTICS phase={} event=end elapsed_ns={}",
+                self.phase,
+                started.elapsed().as_nanos()
+            );
+        }
+    }
+}
+
 async fn rpc_with_io<R, W>(
     harness: &AgentHarness,
     mut agent_events: Option<tokio::sync::broadcast::Receiver<AgentEvent>>,
@@ -341,6 +400,9 @@ where
     R: tokio::io::AsyncBufRead + Unpin,
     W: Write + Send + 'static,
 {
+    let phase_diagnostics =
+        std::env::var_os("RPI_RPC_DIAGNOSTICS").is_some_and(|value| value != "0");
+    let setup_timing = RpcPhaseTiming::start(phase_diagnostics, "setup_to_ready_enqueue");
     let mut command_tasks: Vec<RetainedRpcTask<()>> = Vec::new();
     let lane: Arc<dyn AgentLane> = harness.lane("main");
     // One blocking writer owns stdout. Producers only enqueue bounded messages,
@@ -499,6 +561,7 @@ where
         }
     }
     write_line(&stdout, &ready).await;
+    setup_timing.finish();
 
     loop {
         let incoming = tokio::select! {
@@ -718,6 +781,8 @@ where
                         let _finished =
                             crate::rpc::prompt_content::validation_test_hook::for_command(&msg)
                                 .map(crate::rpc::prompt_content::validation_test_hook::RunFinished);
+                        let validation_timing =
+                            RpcPhaseTiming::start(phase_diagnostics, "validation");
                         let content = if resume || compact {
                             Ok(crate::rpc::prompt_content::ParsedPrompt::Legacy(
                                 String::new(),
@@ -725,6 +790,7 @@ where
                         } else {
                             rpc_validate_prompt(&lane_task, msg, &cancel_task).await
                         };
+                        validation_timing.finish();
                         let content = match content {
                             Ok(content) => content,
                             Err(error) => {
@@ -747,6 +813,7 @@ where
                         )
                         .await;
                         let outcome_cancel = cancel_task.clone();
+                        let execute_timing = RpcPhaseTiming::start(phase_diagnostics, "execute");
                         let result = if compact {
                             rpc_compact_cancellable(&lane_task, instructions, cancel_task).await
                         } else if resume {
@@ -754,12 +821,15 @@ where
                         } else {
                             rpc_prompt_cancellable(&lane_task, content, cancel_task).await
                         };
+                        execute_timing.finish();
+                        let flush_timing = RpcPhaseTiming::start(phase_diagnostics, "event_flush");
                         if let Some(flush) = flush_events {
                             let (done, drained) = tokio::sync::oneshot::channel();
                             if flush.send(done).is_ok() {
                                 let _ = drained.await;
                             }
                         }
+                        flush_timing.finish();
                         let (outcome, aborted, error) = match &result {
                             Ok(value) => {
                                 let outcome = value
@@ -780,7 +850,10 @@ where
                         };
                         // Recovery may leave a continuable run behind an abort, so the
                         // settlement carries what the client needs to offer "continue".
+                        let resume_timing =
+                            RpcPhaseTiming::start(phase_diagnostics, "pending_resume");
                         let pending_resume = lane_task.has_pending_resume().await;
+                        resume_timing.finish();
                         let summary = result
                             .as_ref()
                             .ok()
@@ -795,7 +868,10 @@ where
                             "summary": summary,
                             "pendingResume": pending_resume,
                         });
+                        let enqueue_timing =
+                            RpcPhaseTiming::start(phase_diagnostics, "settled_enqueue");
                         write_line(&out_task, &settled).await;
+                        enqueue_timing.finish();
                         mailbox_task.cancel_all();
                         active_task.store(false, std::sync::atomic::Ordering::Release);
                     }),
@@ -1396,18 +1472,13 @@ async fn rpc_get_state(lane: &Arc<dyn AgentLane>, harness: &AgentHarness) -> ser
     };
     let leaf_id = lane.get_leaf_id().await.ok().flatten();
     let context = rpc_context_usage(lane, harness).await;
-    let active_operation = lane
-        .snapshot()
-        .await
-        .ok()
-        .and_then(|snapshot| snapshot.active)
-        .map(|active| {
-            serde_json::json!({
-                "runId": active.run_id,
-                "lane": active.lane,
-                "kind": format!("{:?}", active.kind).to_lowercase(),
-            })
-        });
+    let active_operation = lane.active_operation().await.ok().flatten().map(|active| {
+        serde_json::json!({
+            "runId": active.run_id,
+            "lane": active.lane,
+            "kind": format!("{:?}", active.kind).to_lowercase(),
+        })
+    });
     let queued = lane.queued_messages().await.unwrap_or_default();
     let stats = rpc_get_stats(lane, harness).await.ok();
     serde_json::json!({
@@ -1953,17 +2024,27 @@ async fn rpc_context_usage(lane: &Arc<dyn AgentLane>, harness: &AgentHarness) ->
     use rpi_harness::compaction::{build_session_context, estimate_context_tokens};
     use rpi_harness::session::types::{BranchBounds, EntryOrder, EntryQuery};
 
-    let entries = harness
-        .find_entries_on_branch(
-            &EntryQuery {
-                order: Some(EntryOrder::OldestFirst),
-                ..Default::default()
-            },
-            &BranchBounds::default(),
-        )
-        .await
-        .unwrap_or_default();
-    let estimate = estimate_context_tokens(&build_session_context(&entries).messages);
+    let estimate = match harness.context_usage().await {
+        Ok(Some(estimate)) => estimate,
+        Ok(None) => {
+            // Legacy/custom backends keep the original default projection.
+            let entries = harness
+                .find_entries_on_branch(
+                    &EntryQuery {
+                        order: Some(EntryOrder::OldestFirst),
+                        ..Default::default()
+                    },
+                    &BranchBounds::default(),
+                )
+                .await
+                .unwrap_or_default();
+            estimate_context_tokens(&build_session_context(&entries).messages)
+        }
+        // State polling has always been best effort: a read failure yielded
+        // an empty estimate. Do not retry a supported backend by reading all
+        // bodies again, or turn its failure into an "unsupported" capability.
+        Err(_) => estimate_context_tokens(&[]),
+    };
     let window = lane
         .get_model()
         .await
@@ -2020,7 +2101,7 @@ async fn rpc_get_messages(
     harness: &AgentHarness,
     msg: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    use rpi_harness::session::types::{BranchBounds, Entry, EntryOrder, EntryQuery};
+    use rpi_harness::session::types::{BranchBounds, EntryOrder, EntryQuery};
 
     const DEFAULT_LIMIT: usize = 400;
     let limit = msg
@@ -2037,61 +2118,60 @@ async fn rpc_get_messages(
         .and_then(|value| value.as_str())
         .filter(|value| !value.is_empty())
         .map(str::to_owned);
-    let entries = harness
-        .find_entries_on_branch(
-            &EntryQuery {
-                order: Some(EntryOrder::OldestFirst),
-                ..Default::default()
-            },
-            &BranchBounds::default(),
-        )
+    let selected = harness
+        .transcript_page(&rpi_harness::session::types::TranscriptPageQuery {
+            limit,
+            before_id: before_id.clone(),
+        })
         .await
         .map_err(|error| error.to_string())?;
-    let mut items: Vec<(String, serde_json::Value)> = Vec::new();
-    for entry in entries {
-        match entry {
-            Entry::Message(entry) => {
-                let mut value = serde_json::to_value(&entry.message).map_err(|e| e.to_string())?;
-                // The session entry id, not the message's own id: it is what
-                // `beforeId` keys on, and what makes rows stable across reloads.
-                value["entryId"] = serde_json::json!(entry.base.id);
-                items.push((entry.base.id, value));
-            }
-            // Compaction rewrites what the model sees, not the branch, so the
-            // transcript keeps its messages. Marking the boundary is what lets a
-            // client explain why the context suddenly shrank.
-            Entry::Compaction(compaction) => items.push((
-                compaction.base.id.clone(),
-                serde_json::json!({
-                    "role": "compaction",
-                    "entryId": compaction.base.id,
-                    "tokensBefore": compaction.tokens_before,
-                    "retainedMessages": compaction.retained_tail.len(),
-                    "timestamp": compaction.base.timestamp,
-                }),
-            )),
-            _ => {}
-        }
-    }
-    let total = items.len();
-    let before_index = match &before_id {
-        Some(before) => match items.iter().position(|(id, _)| id == before) {
-            Some(index) => Some(index),
-            None => return Err(format!("beforeId not found: {before}")),
-        },
-        None => None,
+    let (window, total, has_more, leaf_id) = if let Some(page) = selected {
+        // The storage pins/counts the branch using metadata and hydrates only
+        // this window. Use its snapshot leaf, not a later lane position.
+        (
+            rpc_project_transcript(page.entries)?,
+            page.total,
+            page.has_more,
+            page.leaf_id,
+        )
+    } else {
+        // Legacy/custom storage keeps the original projection and error rules.
+        let entries = harness
+            .find_entries_on_branch(
+                &EntryQuery {
+                    order: Some(EntryOrder::OldestFirst),
+                    ..Default::default()
+                },
+                &BranchBounds::default(),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut items = rpc_project_transcript(entries)?;
+        let total = items.len();
+        let before_index = match &before_id {
+            Some(before) => Some(
+                items
+                    .iter()
+                    .position(|(id, _)| id == before)
+                    .ok_or_else(|| format!("beforeId not found: {before}"))?,
+            ),
+            None => None,
+        };
+        let (range, has_more) = page_window(total, limit, before_index);
+        let window = items.drain(range).collect::<Vec<_>>();
+        (
+            window,
+            total,
+            has_more,
+            lane.get_leaf_id().await.ok().flatten(),
+        )
     };
-    let (range, has_more) = page_window(total, limit, before_index);
-    let window = items[range].to_vec();
     let first_id = window.first().map(|(id, _)| id.clone());
     let last_id = window.last().map(|(id, _)| id.clone());
     let messages = window
-        .iter()
-        .map(|(_, value)| value.clone())
+        .into_iter()
+        .map(|(_, value)| value)
         .collect::<Vec<_>>();
-    // Read-only branch position: the leaf the snapshot ends on, and whether
-    // recovery left an interrupted run that a client may want to surface.
-    let leaf_id = lane.get_leaf_id().await.ok().flatten();
     let pending_resume = lane.has_pending_resume().await;
     Ok(serde_json::json!({
         "messages": messages,
@@ -2105,6 +2185,35 @@ async fn rpc_get_messages(
         "leafId": leaf_id,
         "pendingResume": pending_resume,
     }))
+}
+
+fn rpc_project_transcript(
+    entries: Vec<rpi_harness::session::types::Entry>,
+) -> Result<Vec<(String, serde_json::Value)>, String> {
+    use rpi_harness::session::types::Entry;
+    let mut items = Vec::new();
+    for entry in entries {
+        match entry {
+            Entry::Message(entry) => {
+                let mut value = serde_json::to_value(&entry.message).map_err(|e| e.to_string())?;
+                // Use the session entry ID for stable beforeId cursors.
+                value["entryId"] = serde_json::json!(entry.base.id);
+                items.push((entry.base.id, value));
+            }
+            Entry::Compaction(compaction) => items.push((
+                compaction.base.id.clone(),
+                serde_json::json!({
+                    "role": "compaction",
+                    "entryId": compaction.base.id,
+                    "tokensBefore": compaction.tokens_before,
+                    "retainedMessages": compaction.retained_tail.len(),
+                    "timestamp": compaction.base.timestamp,
+                }),
+            )),
+            _ => {}
+        }
+    }
+    Ok(items)
 }
 
 fn rpc_auth_provider_ids(model_catalog: &[rpi_ai::Model]) -> std::collections::BTreeSet<String> {
@@ -2693,6 +2802,12 @@ fn session_storage_notice(message: &str) -> String {
 #[cfg(test)]
 #[path = "rpc/native_dispatch_tests.rs"]
 mod native_dispatch_tests;
+#[cfg(all(test, feature = "experimental-native-store"))]
+#[path = "modes/native_persistence_tests.rs"]
+mod native_persistence_tests;
+#[cfg(test)]
+#[path = "modes/transcript_page_tests.rs"]
+mod transcript_page_tests;
 
 #[cfg(test)]
 mod tests {
