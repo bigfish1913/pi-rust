@@ -2216,6 +2216,53 @@ mod tests {
             rpi_plugin_sdk::callbacks::OwnedString::from_raw(out, Some(crate::host_free_string))
         });
     }
+    /// The FFI trampoline's ceiling must be exactly the SDK's highest action id.
+    ///
+    /// A branch that adds an action but leaves the ceiling behind compiles,
+    /// keeps every other test green, and quietly makes the newest action
+    /// un-dispatchable. The ceiling and the enum live in different crates, so
+    /// nothing but a test can notice the drift.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn trampoline_ceiling_matches_the_highest_defined_action() {
+        let highest = RuntimeActionId::MAX;
+        assert_eq!(
+            highest,
+            RuntimeActionId::ALL
+                .iter()
+                .copied()
+                .map(u32::from)
+                .max()
+                .unwrap(),
+            "RuntimeActionId::MAX must be the maximum of RuntimeActionId::ALL"
+        );
+        let host: Arc<dyn RuntimeActionHost> = Arc::new(MockHost {
+            prompt: String::new(),
+            saw: Mutex::new(Vec::new()),
+        });
+        let bridge = ActionBridge::with_ui_dialog(
+            tokio::runtime::Handle::current(),
+            host,
+            UiDialogMailbox::new(),
+        );
+        let mut out = StbString::empty();
+        let rc = trampoline_runtime_action(
+            highest,
+            StbStringRef::from_str("{}"),
+            &mut out,
+            bridge.user_data(),
+        );
+        assert_ne!(
+            rc, 2,
+            "the highest defined action id ({highest}) must not be rejected as unknown — \
+             the trampoline ceiling is stale"
+        );
+        if rc == 0 {
+            // SAFETY: success means the trampoline wrote a live host allocation.
+            drop(unsafe {
+                rpi_plugin_sdk::callbacks::OwnedString::from_raw(out, Some(crate::host_free_string))
+            });
+        }
+    }
 }
 
 impl Drop for ActionBridge {
@@ -2440,52 +2487,5 @@ mod relay_tests {
         mailbox.attach();
         assert!(mailbox.is_reserved(&request(PLUGIN_RESERVED_PREFIX).request_id));
         assert!(!mailbox.is_reserved(&request("plain").request_id));
-    }
-    /// The FFI trampoline's ceiling must be exactly the SDK's highest action id.
-    ///
-    /// A branch that adds an action but leaves the ceiling behind compiles,
-    /// keeps every other test green, and quietly makes the newest action
-    /// un-dispatchable. The ceiling and the enum live in different crates, so
-    /// nothing but a test can notice the drift.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn trampoline_ceiling_matches_the_highest_defined_action() {
-        let highest = RuntimeActionId::MAX;
-        assert_eq!(
-            highest,
-            RuntimeActionId::ALL
-                .iter()
-                .copied()
-                .map(u32::from)
-                .max()
-                .unwrap(),
-            "RuntimeActionId::MAX must be the maximum of RuntimeActionId::ALL"
-        );
-        let host: Arc<dyn RuntimeActionHost> = Arc::new(MockHost {
-            prompt: String::new(),
-            saw: Mutex::new(Vec::new()),
-        });
-        let bridge = ActionBridge::with_ui_dialog(
-            tokio::runtime::Handle::current(),
-            host,
-            UiDialogMailbox::new(),
-        );
-        let mut out = StbString::empty();
-        let rc = trampoline_runtime_action(
-            highest,
-            StbStringRef::from_str("{}"),
-            &mut out,
-            bridge.user_data(),
-        );
-        assert_ne!(
-            rc, 2,
-            "the highest defined action id ({highest}) must not be rejected as unknown — \
-             the trampoline ceiling is stale"
-        );
-        if rc == 0 {
-            // SAFETY: success means the trampoline wrote a live host allocation.
-            drop(unsafe {
-                rpi_plugin_sdk::callbacks::OwnedString::from_raw(out, Some(crate::host_free_string))
-            });
-        }
     }
 }
