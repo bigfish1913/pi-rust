@@ -346,8 +346,17 @@ renderers and discovered resources.
 ```bash
 rpi install rpi-todo                    # prebuilt extension; no Rust toolchain needed
 rpi install my-ext --path ../my-ext     # local, for development
+rpi extension update [name]             # all eligible extensions, or one by name
 rpi dev                                 # build + watch + live reload
 ```
+
+Use `rpi extension update` to update all project-linked extensions and globally
+installed registry/prebuilt extensions, or `rpi extension update <name>` to select
+one by name. Updates preserve the original Cargo build backend or explicit GitHub
+source. Global development installs made with `--path` are excluded. The old
+`rpi package update [name]` remains compatible; prefer `extension update` for
+extension updates. Project linking commands remain `rpi package link`,
+`rpi package list`, and `rpi package unlink`.
 
 The host loads project `.rpi/extensions`, then global
 `~/.rpi/agent/extensions`, then any `--extensions-dir`.

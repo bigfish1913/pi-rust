@@ -310,6 +310,7 @@ fn last_assistant_usage_info(messages: &[AgentMessage]) -> Option<(Usage, usize)
 
 /// Estimated context-token usage for a message list. Mirrors
 /// `estimateContextTokens` + `ContextUsageEstimate`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContextUsageEstimate {
     pub tokens: i64,
     pub usage_tokens: i64,

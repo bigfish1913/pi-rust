@@ -211,6 +211,7 @@ rpi auth login|check|logout
 rpi events path|tail    检查扩展事件日志（需 RPI_EVENT_LOG=1）
 rpi install <crate>
 rpi uninstall <crate>
+rpi extension update [name] # 更新全部符合条件的扩展，或按名称更新
 rpi update                 # 更新 rpi CLI 自身
 rpi dev [options]          # 开发 Rust 扩展：编译、watch、热重载
 rpi dev-local [options]    # 只调试当前 Rust 扩展（隔离模式）
@@ -403,6 +404,13 @@ rpi install rpi-todo --build --version 0.2.0 --force
 ```bash
 rpi install my-extension --path ../my-rpi-extension --force
 ```
+
+推荐用 `rpi extension update` 更新全部项目链接扩展和全局 registry/prebuilt 扩展，
+或用 `rpi extension update <name>` 按名称更新。更新保留原来的 Cargo 构建后端或
+显式指定的 GitHub 来源；全局通过 `--path` 安装的开发扩展不参与更新。
+旧命令 `rpi package update [name]` 仍兼容，但扩展更新推荐使用
+`rpi extension update [name]`。项目链接管理仍使用 `rpi package link`、
+`rpi package list`、`rpi package unlink`，这些命令名称不变。
 
 开发扩展项目时使用 watch 模式：
 

@@ -95,6 +95,7 @@ impl JsonlV4Header {
         Self {
             kind: super::types::HeaderKind,
             version: 4,
+            progress_format: None,
             id,
             created_at,
             cwd,
@@ -138,9 +139,17 @@ fn decode_header(line: &str) -> Result<JsonlV4Header, JsonlDecodeError> {
     let created_at = require_timestamp(&value, "createdAt")?;
     let cwd = require_string(&value, "cwd")?;
 
+    let progress_format = optional_string_field(&value, "progressFormat")?;
+    if progress_format
+        .as_deref()
+        .is_some_and(|format| format != super::progress::FORMAT)
+    {
+        return Err(schema("unsupported progress format"));
+    }
     Ok(JsonlV4Header {
         kind: super::types::HeaderKind,
         version: 4,
+        progress_format,
         id,
         created_at,
         cwd,

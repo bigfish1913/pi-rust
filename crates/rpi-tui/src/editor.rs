@@ -143,7 +143,10 @@ fn snap_boundary(s: &str, idx: usize) -> usize {
 /// submitted, at which point [`Editor::get_expanded_text`] splices it back in.
 #[derive(Debug, Clone)]
 struct PasteEntry {
-    content: String,
+    // Undo/redo snapshots share unchanged bodies instead of copying potentially
+    // large pastes for every edit. Incremental pastes replace the Arc so earlier
+    // snapshots remain immutable.
+    content: Arc<str>,
 }
 
 /// An exclusive continuation token for one incrementally delivered paste.
@@ -307,7 +310,7 @@ fn expand_paste_markers(document: &str, pastes: &HashMap<u32, PasteEntry>) -> St
         .replace_all(document, |caps: &regex::Captures| {
             let id: u32 = caps[1].parse().unwrap_or(0);
             match pastes.get(&id) {
-                Some(entry) => entry.content.clone(),
+                Some(entry) => entry.content.to_string(),
                 None => caps[0].to_string(),
             }
         })
@@ -638,7 +641,12 @@ impl Editor {
                 }
             };
             if let Ok(mut pastes) = self.pastes.lock() {
-                pastes.insert(id, PasteEntry { content: filtered });
+                pastes.insert(
+                    id,
+                    PasteEntry {
+                        content: filtered.into(),
+                    },
+                );
             }
             let marker = if by_lines {
                 format!("[paste #{id} +{count} lines]")
@@ -747,7 +755,7 @@ impl Editor {
             let Some(entry) = pastes.get(&id) else {
                 return false;
             };
-            let Some(suffix) = normalized.strip_prefix(&entry.content) else {
+            let Some(suffix) = normalized.strip_prefix(entry.content.as_ref()) else {
                 return false;
             };
             let Some(marker) = paste_marker_regex()
@@ -804,7 +812,7 @@ impl Editor {
         self.pastes.lock().unwrap().insert(
             id,
             PasteEntry {
-                content: normalized.to_string(),
+                content: normalized.into(),
             },
         );
         if lines > PASTE_FOLD_LINE_THRESHOLD {
@@ -2909,6 +2917,109 @@ l12",
     }
 
     #[test]
+    fn folded_paste_snapshots_share_payload_across_undo_and_redo() {
+        let editor = Editor::simple();
+        let payload = "x".repeat(1024 * 1024);
+        editor.handle_paste(&payload);
+        let original_ptr = editor.pastes.lock().unwrap()[&1].content.as_ptr();
+        editor.insert(&"a".repeat(64));
+        for _ in 0..64 {
+            editor.handle_key(crossterm::event::KeyEvent::new(
+                KeyCode::Backspace,
+                KeyModifiers::NONE,
+            ));
+        }
+        assert_eq!(editor.get_expanded_text(), payload);
+        {
+            let undo = editor.undo_stack.lock().unwrap();
+            let stored_pastes: Vec<_> = undo
+                .states()
+                .filter_map(|snapshot| snapshot.pastes.get(&1))
+                .collect();
+            assert_eq!(stored_pastes.len(), 64);
+            for entry in stored_pastes {
+                assert_eq!(
+                    entry.content.as_ptr(),
+                    original_ptr,
+                    "undo snapshots must share the unchanged folded-paste body"
+                );
+            }
+        }
+        editor.undo();
+        assert_eq!(editor.get_expanded_text(), format!("{payload}a"));
+        assert_eq!(
+            editor.pastes.lock().unwrap()[&1].content.as_ptr(),
+            original_ptr
+        );
+        assert_eq!(
+            editor.redo_stack.lock().unwrap()[0].pastes[&1]
+                .content
+                .as_ptr(),
+            original_ptr
+        );
+        editor.redo();
+        assert_eq!(editor.get_expanded_text(), payload);
+        assert_eq!(
+            editor.pastes.lock().unwrap()[&1].content.as_ptr(),
+            original_ptr
+        );
+    }
+
+    #[test]
+    fn folded_paste_body_is_released_after_undo_and_redo_owners_drop() {
+        let editor = Editor::simple();
+        let payload = "x".repeat(2000);
+        editor.handle_paste(&payload);
+        let weak = Arc::downgrade(&editor.pastes.lock().unwrap()[&1].content);
+
+        editor.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::Backspace,
+            KeyModifiers::NONE,
+        ));
+        assert!(editor.pastes.lock().unwrap().is_empty());
+        assert!(
+            weak.upgrade().is_some(),
+            "undo must retain the deleted paste"
+        );
+        editor.undo();
+        assert_eq!(editor.get_expanded_text(), payload);
+        editor.redo();
+        assert!(editor.pastes.lock().unwrap().is_empty());
+        assert!(weak.upgrade().is_some());
+
+        drop(editor);
+        assert!(
+            weak.upgrade().is_none(),
+            "no global owner may retain the body"
+        );
+    }
+
+    #[test]
+    fn paste_session_replacement_keeps_snapshot_body_immutable() {
+        let editor = Editor::simple();
+        let payload = "x".repeat(2000);
+        let mut session = editor.start_paste_session(&payload);
+        let before = editor.snapshot_state();
+        assert!(Arc::ptr_eq(
+            &before.pastes[&1].content,
+            &editor.pastes.lock().unwrap()[&1].content,
+        ));
+
+        assert!(editor.append_paste_session(&mut session, "tail"));
+        assert_eq!(before.pastes[&1].content.as_ref(), payload);
+        assert_eq!(editor.get_expanded_text(), format!("{payload}tail"));
+        assert!(!Arc::ptr_eq(
+            &before.pastes[&1].content,
+            &editor.pastes.lock().unwrap()[&1].content,
+        ));
+        editor.undo();
+        assert_eq!(editor.get_expanded_text(), "");
+        editor.redo();
+        assert_eq!(editor.get_expanded_text(), format!("{payload}tail"));
+        assert_eq!(before.pastes[&1].content.as_ref(), payload);
+    }
+
+    #[test]
     fn many_line_paste_folds_to_a_marker() {
         let editor = Editor::simple();
         let payload = (1..=12)
@@ -3162,7 +3273,14 @@ l12",
             format!("{other}\nleft新{body}尾right\nuntouched")
         );
         assert_eq!(
-            editor.pastes.lock().unwrap().get(&1).unwrap().content,
+            editor
+                .pastes
+                .lock()
+                .unwrap()
+                .get(&1)
+                .unwrap()
+                .content
+                .as_ref(),
             other
         );
         assert_eq!(editor.pastes.lock().unwrap().len(), 2);

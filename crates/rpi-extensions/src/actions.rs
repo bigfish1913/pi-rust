@@ -596,7 +596,12 @@ pub trait RuntimeActionHost: Send + Sync {
     /// `AppendEntry` — append without starting a run. `customType`/`data`
     /// persists extension data only. A `message` is durably queued during an
     /// operation and committed after its current turn; the returned `entryId`
-    /// is reserved and may not yet resolve to a transcript entry.
+    /// is reserved and may not yet resolve to a transcript entry. Optional
+    /// `expected: {sessionId, leafId, customType, entryId}` performs a conditional
+    /// write against that exact branch snapshot; a successful reply must confirm
+    /// `scoped: true`. Scoped messages additionally require `outboxKey` and must
+    /// be custom messages: acceptance is idempotent on the current branch and
+    /// pending context stays with its source state entry.
     async fn append_entry(&self, args: serde_json::Value) -> Result<serde_json::Value, String>;
     /// `SetSessionName` — set the session's display name.
     async fn set_session_name(&self, args: serde_json::Value) -> Result<serde_json::Value, String>;
@@ -726,6 +731,8 @@ pub trait RuntimeActionHost: Send + Sync {
     /// Sorting/limit apply globally across the requested types; identifiers
     /// match exactly. Consumers must require `filtered == true` in the reply
     /// rather than accepting an older host's unfiltered successful response.
+    /// This host also returns pinned `sessionId`, `leafId`, and `scopedAppend:
+    /// true` for callers performing conditional state writes or outbox delivery.
     async fn get_session_branch(
         &self,
         _args: serde_json::Value,

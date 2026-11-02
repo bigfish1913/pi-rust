@@ -35,6 +35,7 @@ mod commands;
 use commands::*;
 mod settings;
 use settings::*;
+mod history;
 mod sessions;
 use sessions::*;
 mod run;
@@ -621,11 +622,13 @@ fn start_user_bash(ctx: &CommandContext, command: &str, exclude_from_context: bo
         exclude_from_context,
     ));
     comp.set_expanded(*ctx.state.tool_outputs_expanded.lock().unwrap());
-    ctx.chat.add_child(comp.clone());
-
-    // Register the cancellation slot before spawning so an Esc arriving on the
-    // key thread can never miss the run (upstream's `_bashAbortControllers`).
+    // Reserve/invalidate before exposing the component to a paging worker.
     let cancel = ctx.state.begin_user_bash();
+    if ctx.state.history_page.is_bound() {
+        ctx.state.history_page.active.add_child(comp.clone());
+    } else {
+        ctx.chat.add_child(comp.clone());
+    }
     ctx.tui.request_render(false);
 
     let env: Arc<dyn rpi_tools::ExecutionEnv> =
@@ -1136,19 +1139,6 @@ pub async fn interactive_tui(
     // A normal launch creates a fresh session and must not replay records from
     // another/project harness. Only explicit restore/fork modes render prior
     // conversation history. This fixes stale prompts appearing every startup.
-    if launch_restores_history(args) {
-        render_session_history(
-            harness,
-            &chat_container,
-            initial_transformer.clone(),
-            Some(reload_context.extension_session.clone()),
-            show_images,
-            // The footer is built later in this function, so there is nothing
-            // to fold replayed usage into yet.
-            None,
-        )
-        .await;
-    }
 
     // `document_container` wraps the welcome header + chat so the scrollview
     // follows the whole transcript (mirrors TS `documentContainer`).
@@ -1295,6 +1285,7 @@ pub async fn interactive_tui(
         .get_as::<bool>("display.tool_outputs_expanded")
         .unwrap_or(false);
     let state = Arc::new(TuiState {
+        history_page: history::HistoryUi::default(),
         session_dir: reload_context.session_dir(),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -1359,6 +1350,12 @@ pub async fn interactive_tui(
             rpi_harness::agent_harness::QueuedMessages::default(),
         ),
     });
+
+    state.history_page.bind(harness);
+    state.history_page.mount_active(&chat_container);
+    if launch_restores_history(args) {
+        history::restore(harness, &state, &chat_container).await;
+    }
 
     let _compaction_watcher = harness.watch({
         let state = Arc::clone(&state);
@@ -1609,7 +1606,7 @@ pub async fn interactive_tui(
         // `crates/rpi-harness/tests/harness_run_e2e.rs`. Queued steering /
         // follow-up prompts DO get a `message_start` (the loop drains those
         // itself), so those are deliberately rendered from the event instead.
-        add_user_message(&ctx_for_cb.chat, text);
+        add_user_message(&ctx_for_cb.state.history_page.active, text);
         // A new prompt starts a fresh interaction at the tail even when the
         // user had scrolled up to inspect older output.
         if let Some(scroll) = ctx_for_cb.tui.get_primary_scroll_view() {
@@ -2773,7 +2770,16 @@ pub async fn interactive_tui(
             // 5. Global transcript scroll. PageUp/PageDown use the actual
             // viewport height with four rows of overlap (upstream behavior),
             // while Home/End jump to the transcript boundaries.
-            if crate::transcript_navigation::handle_key(&tui_for_key, &keybindings_for_key, &key) {
+            if history::handle_key(&state_for_key, &tui_for_key, &keybindings_for_key, &key) {
+                continue;
+            }
+            if editor_for_key.get_text().is_empty()
+                && crate::transcript_navigation::handle_key(
+                    &tui_for_key,
+                    &keybindings_for_key,
+                    &key,
+                )
+            {
                 continue;
             }
 
@@ -2859,7 +2865,7 @@ pub async fn interactive_tui(
                         // Direct send: the harness emits no user `message_start`
                         // for it, so render the bubble here (see the submit
                         // handler in `interactive_tui`).
-                        add_user_message(&state_for_key.chat_container, &prompt);
+                        add_user_message(&state_for_key.history_page.active, &prompt);
                         push_history(&state_for_key, &prompt);
                         let _ = tx_for_key.send(TuiMessage::UserInput(
                             prompt,
@@ -3100,8 +3106,8 @@ pub async fn interactive_tui(
         // The harness emits no user `message_start` for a directly-sent prompt
         // (it drives the loop with an empty prompts vec), so the initial
         // `-p` / `--prompt` bubbles are rendered here.
-        add_user_message(&chat_container, &prompt);
-        add_image_previews(&chat_container, &images, show_images);
+        add_user_message(&state.history_page.active, &prompt);
+        add_image_previews(&state.history_page.active, &images, show_images);
         tui.request_render(false);
         run_prompt_streaming(
             &lane,
@@ -3158,7 +3164,11 @@ pub async fn interactive_tui(
                 // as a user edit made a hands-free voice session switch itself
                 // off the moment it was started.
                 state.clear_editor_programmatically();
-                add_image_previews(&chat_container, &prompt_images, state.images_visible());
+                add_image_previews(
+                    &state.history_page.active,
+                    &prompt_images,
+                    state.images_visible(),
+                );
                 if !prompt_images.is_empty() {
                     add_note_message(
                         &chat_container,
@@ -3207,12 +3217,17 @@ pub async fn interactive_tui(
                 // flushed at `AgentEnd` (upstream `_pendingBashMessages`).
                 if *state.status.lock().unwrap() == RunStatus::Idle {
                     if let Err(error) = lane.append_message(message).await {
+                        state
+                            .history_page
+                            .unsaved
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
                         add_error_message(
                             &chat_container,
                             &format!("Could not record bash result: {error}"),
                         );
                         tui.request_render(false);
                     }
+                    history::settle(&state, &tui);
                 } else {
                     state.pending_bash_messages.lock().unwrap().push(message);
                 }
@@ -3238,6 +3253,7 @@ pub async fn interactive_tui(
                 }
             }
             Some(TuiMessage::NavigateTree(entry_id)) => {
+                state.history_page.invalidate();
                 match lane.navigate_tree(Some(&entry_id), false, None, None).await {
                     Ok(result) => match result.outcome {
                         rpi_harness::agent_harness::NavigationOutcome::Completed { .. } => {
@@ -3246,20 +3262,12 @@ pub async fn interactive_tui(
                             let (tools, skills, context_files) =
                                 current_capabilities(harness, &lane).await;
                             add_welcome_message_with_capabilities(
-                                &chat_container,
+                                &state.history_page.header,
                                 &tools,
                                 &skills,
                                 &context_files,
                             );
-                            render_session_history(
-                                harness,
-                                &chat_container,
-                                state.markdown_transformer(),
-                                Some(state.extension_session.clone()),
-                                state.images_visible(),
-                                Some(&state.footer),
-                            )
-                            .await;
+                            history::restore(harness, &state, &chat_container).await;
                             add_note_message(
                                 &chat_container,
                                 "Moved to the selected session entry.",
@@ -3706,6 +3714,7 @@ pub async fn interactive_tui(
     }
 
     // ---- Shutdown ----
+    state.history_page.invalidate();
     // Let anything the lane has already committed to writing reach the disk
     // before the tasks that carry those writes are aborted. A turn's entries are
     // appended by the harness rather than by the drain task, but the drain task

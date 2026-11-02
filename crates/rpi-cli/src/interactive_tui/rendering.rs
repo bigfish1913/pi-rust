@@ -244,6 +244,10 @@ pub(super) fn add_help_message(container: &Arc<Container>) {
         ("/exit, /quit, /q", "Exit the application"),
         ("/version, /v", "Show version information"),
         ("/changelog", "Show recent release changes"),
+        (
+            "/history",
+            "Browse older/newer/latest history (default: older)",
+        ),
         ("/model, /m", "Choose a model (live switch)"),
         (
             "/provider",

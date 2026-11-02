@@ -27,6 +27,22 @@ struct PackageRegistry {
     packages: Vec<ProjectPackage>,
 }
 
+/// Extension management deliberately exposes only the shared update operation.
+pub fn run_extension(args: &[String]) -> i32 {
+    match args.first().map(String::as_str) {
+        None | Some("--help") | Some("-h") => {
+            print_extension_help();
+            0
+        }
+        Some("update") => update(&args[1..]),
+        Some(other) => {
+            eprintln!("error: unknown extension command `{other}`");
+            print_extension_help();
+            2
+        }
+    }
+}
+
 pub fn run(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
         None | Some("--help") | Some("-h") => {
@@ -251,7 +267,7 @@ fn update_at(
             }
             value => {
                 if name.replace(value.to_string()).is_some() {
-                    eprintln!("error: update accepts at most one package name");
+                    eprintln!("error: update accepts at most one extension name");
                     return 2;
                 }
             }
@@ -302,20 +318,20 @@ fn update_at(
             .any(|package| package.name == wanted);
         let global_found = global_packages.iter().any(|package| package.name == wanted);
         if !project_found && !global_found {
-            eprintln!("error: package `{wanted}` is not installed");
+            eprintln!("error: extension `{wanted}` is not installed");
             return 1;
         }
     }
 
     if packages.is_empty() && global_packages.is_empty() {
-        println!("no project or global packages to update");
+        println!("no project or global extensions to update");
         return 0;
     }
 
     let mut status = 0;
     for package in packages {
         let package_name = package.name.clone();
-        eprintln!("package: updating project package `{package_name}`...");
+        eprintln!("extension: updating project extension `{package_name}`...");
         let mut args = vec![
             "--path".to_string(),
             package.source,
@@ -331,7 +347,7 @@ fn update_at(
         }
     }
     for package in global_packages {
-        eprintln!("package: updating global package `{}`...", package.name);
+        eprintln!("extension: updating global extension `{}`...", package.name);
         if !update_global(&package, &link_args) {
             status = 1;
         }
@@ -375,7 +391,7 @@ fn update_global_package(
     match command.status() {
         Ok(exit) if exit.success() => true,
         Ok(exit) => {
-            eprintln!("error: updating global package `{name}` failed with {exit}");
+            eprintln!("error: updating global extension `{name}` failed with {exit}");
             false
         }
         Err(error) => {
@@ -648,14 +664,18 @@ pub fn project_package_dirs(cwd: &Path, kind: &str) -> Vec<PathBuf> {
         }
     }
 }
+fn print_extension_help() {
+    println!("Usage: rpi extension <command>\n\nCommands:\n  update [name] [--debug] [--locked]  Update project and global installed extensions\n\nSee `rpi extension update --help` for options.");
+}
+
 pub fn print_help() {
-    println!("Usage: rpi package <command>\n\nCommands:\n  link [name] [--path <dir>] [--package <name>] [--force]  Build and link a project-local Rust extension\n  list                                                   List project packages\n  update [name] [--debug] [--locked]                    Update project and global installed packages\n  unlink <name>                                          Remove a project package");
+    println!("Usage: rpi package <command>\n\nCommands:\n  link [name] [--path <dir>] [--package <name>] [--force]  Build and link a project-local Rust extension\n  list                                                   List project packages\n  update [name] [--debug] [--locked]                    Legacy compatibility alias for `rpi extension update`\n  unlink <name>                                          Remove a project package");
 }
 fn print_link_help() {
     println!("Usage: rpi package link [name] [options]\n\nOptions:\n  --path <dir>       Extension source directory (default: current directory)\n  --package, -P <n>  Select a Cargo cdylib package\n  --debug            Build debug artifacts instead of release\n  --locked           Pass --locked to Cargo\n  --force, -f        Replace an existing package");
 }
 fn print_update_help() {
-    println!("Usage: rpi package update [name] [options]\n\nOptions:\n  --debug            Build debug artifacts instead of release\n  --locked           Pass --locked to Cargo\n  --help, -h         Show this help\n\nWithout a name, all project and global installed packages are updated.");
+    println!("Usage: rpi extension update [name] [options]\n\nOptions:\n  --debug            Build debug artifacts instead of release\n  --locked           Pass --locked to Cargo\n  --help, -h         Show this help\n\nWithout a name, all project and global installed extensions are updated.\nLegacy compatibility alias: rpi package update [name] [options]");
 }
 
 #[cfg(test)]

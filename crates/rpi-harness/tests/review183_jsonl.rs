@@ -12,8 +12,8 @@ use rpi_harness::session::{
     session::{DefaultIdGenerator, Session},
     types::{
         AssistantFrameOp, AssistantFrameRecord, BranchBounds, Entry, EntryOrder, EntryQuery,
-        LaneRecord, OperationIntent, OperationStartedRecord, RecordBase, ToolReplay,
-        ToolStartedRecord,
+        LaneRecord, OperationIntent, OperationStartedRecord, ProvisionedEntry, ProvisionedKind,
+        RecordBase, ToolReplay, ToolStartedRecord,
     },
 };
 use rpi_harness::types::{AgentHarnessOptions, HarnessTool, ToolReplay as HarnessReplay};
@@ -114,7 +114,16 @@ async fn reopen_case(
     assistant.content.push(call(mark.clone()));
     if committed {
         session
-            .append_message(AgentMessage::Assistant(Box::new(assistant)))
+            .append_entry(
+                ProvisionedEntry {
+                    id: "assistant".into(),
+                    kind: ProvisionedKind::Message {
+                        message: AgentMessage::Assistant(Box::new(assistant)),
+                        terminate: None,
+                    },
+                },
+                "main",
+            )
             .await
             .unwrap();
     } else {
@@ -153,6 +162,18 @@ async fn reopen_case(
                 .await
                 .unwrap();
         }
+        // A tool-start record must refer to the actual reserved assistant,
+        // including when its binding reached disk before the entry itself.
+        session
+            .append_record(LaneRecord::AssistantFrame(AssistantFrameRecord {
+                base: base("binding"),
+                run_id: "run".into(),
+                stream_index: 0,
+                op: AssistantFrameOp::CommitStream,
+                frame: Some(json!({"entryId":"assistant"})),
+            }))
+            .await
+            .unwrap();
     }
     if replay_record {
         session

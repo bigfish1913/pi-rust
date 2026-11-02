@@ -105,11 +105,8 @@ pub async fn export_session(
     let tree = harness.session().view("main");
     let entries = tree
         .find_entries(&EntryQuery {
-            entry_type: None,
-            custom_type: None,
             order: Some(EntryOrder::OldestFirst),
-            limit: None,
-            cursor: None,
+            ..Default::default()
         })
         .await
         .map_err(|e| format!("Could not read session: {e}"))?;
@@ -382,6 +379,7 @@ mod tests {
             kind: HeaderKind,
             version: 4,
             id: "s-export".to_string(),
+            progress_format: None,
             created_at: 0,
             cwd: "/tmp".to_string(),
             parent_session_id: None,

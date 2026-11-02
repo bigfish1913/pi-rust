@@ -198,6 +198,42 @@ tasks:
       - cargo test -p rpi-harness --test harness_run_e2e --test context_message_order --test frame_progress_recovery --test m5c_jsonl_torn_tail --test jsonl_failure_regressions --locked --target-dir "{{.BUILD_TARGET}}"
       - cargo test -p rpi-cli --test session_cwd_restore --locked --target-dir "{{.BUILD_TARGET}}"
 
+  test:resources:
+    desc: 离线测试 release 编辑器与多轮 RPC 的内存、CPU 和最终结论（不使用真实模型）
+    vars:
+      DEFAULT_PYTHON: '{{if eq OS "windows"}}python{{else}}python3{{end}}'
+      PYTHON: '{{.RESOURCE_PYTHON | default .DEFAULT_PYTHON}}'
+      BUILD_TARGET: '{{.RESOURCE_CARGO_TARGET_DIR | default "target/resource-tests-cargo"}}'
+      BINARY: '{{.RESOURCE_BINARY | default (printf "%s/release/rpi%s" .BUILD_TARGET (ternary ".exe" "" (eq OS "windows")))}}'
+      PROBE: '{{.RESOURCE_EDITOR_PROBE | default (printf "%s/release/examples/editor_resource_probe%s" .BUILD_TARGET (ternary ".exe" "" (eq OS "windows")))}}'
+      DEFAULT_DIAGNOSTICS_DIR:
+        sh: '{{.PYTHON}} -c "import uuid; print(''target/resource-smoke-'' + uuid.uuid4().hex)"'
+      DIAGNOSTICS_DIR: '{{.RESOURCE_DIAGNOSTICS_DIR | default .DEFAULT_DIAGNOSTICS_DIR}}'
+    env:
+      RPI_RESOURCE_SMOKE_BINARY: '{{.BINARY}}'
+    cmds:
+      - cargo build -p rpi-cli --bin rpi --release --locked --target-dir "{{.BUILD_TARGET}}"
+      - cargo build -p rpi-tui --example editor_resource_probe --release --locked --target-dir "{{.BUILD_TARGET}}"
+      - '{{.PYTHON}} -B scripts/test_resource_smoke.py'
+      - cargo test -p rpi-tui --lib --example editor_resource_probe --release --locked --target-dir "{{.BUILD_TARGET}}"
+      - '{{.PYTHON}} -B scripts/resource-smoke.py --rpi "{{.BINARY}}" --editor-probe "{{.PROBE}}" --diagnostics-dir "{{.DIAGNOSTICS_DIR}}" --profile release {{.CLI_ARGS}}'
+
+  test:resources:live:
+    desc: 显式启用真实模型的有界多轮资源回归（需 endpoint/model/凭据环境变量，可能收费）
+    vars:
+      DEFAULT_PYTHON: '{{if eq OS "windows"}}python{{else}}python3{{end}}'
+      PYTHON: '{{.RESOURCE_PYTHON | default .DEFAULT_PYTHON}}'
+      BUILD_TARGET: '{{.RESOURCE_CARGO_TARGET_DIR | default "target/resource-tests-cargo"}}'
+      BINARY: '{{.RESOURCE_BINARY | default (printf "%s/release/rpi%s" .BUILD_TARGET (ternary ".exe" "" (eq OS "windows")))}}'
+      PROBE: '{{.RESOURCE_EDITOR_PROBE | default (printf "%s/release/examples/editor_resource_probe%s" .BUILD_TARGET (ternary ".exe" "" (eq OS "windows")))}}'
+      DEFAULT_DIAGNOSTICS_DIR:
+        sh: '{{.PYTHON}} -c "import uuid; print(''target/resource-smoke-live-'' + uuid.uuid4().hex)"'
+      DIAGNOSTICS_DIR: '{{.RESOURCE_DIAGNOSTICS_DIR | default .DEFAULT_DIAGNOSTICS_DIR}}'
+    cmds:
+      - cargo build -p rpi-cli --bin rpi --release --locked --target-dir "{{.BUILD_TARGET}}"
+      - cargo build -p rpi-tui --example editor_resource_probe --release --locked --target-dir "{{.BUILD_TARGET}}"
+      - '{{.PYTHON}} -B scripts/resource-smoke.py --live --rpi "{{.BINARY}}" --editor-probe "{{.PROBE}}" --diagnostics-dir "{{.DIAGNOSTICS_DIR}}" --profile release {{.CLI_ARGS}}'
+
   check:
     desc: Check all locked workspace targets
     cmds:

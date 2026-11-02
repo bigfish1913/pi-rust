@@ -142,6 +142,7 @@ pub struct HarnessActionHost {
     /// locate the session dir.
     cwd: PathBuf,
     session_dir: PathBuf,
+    fresh_session_only: bool,
     /// Parsed unknown long flags retained for extension consumption.
     cli_flags: BTreeMap<String, serde_json::Value>,
     /// The session's plugin-tool context (`cwd` + session id). The session
@@ -184,6 +185,7 @@ impl HarnessActionHost {
                 harness: Arc::clone(&harness),
                 catalog: RwLock::new(catalog),
                 session_dir: default_session_dir(&cwd),
+                fresh_session_only: false,
                 cwd,
                 cli_flags,
                 tool_context,
@@ -201,6 +203,18 @@ impl HarnessActionHost {
             .catalog
             .write()
             .unwrap_or_else(|error| error.into_inner()) = catalog;
+    }
+
+    pub(crate) fn with_fresh_session_only(mut self, locked: bool) -> Self {
+        self.fresh_session_only = locked;
+        self
+    }
+    fn allow_session_routing(&self) -> Result<(), String> {
+        if self.fresh_session_only {
+            Err("experimental native print session forbids session routing actions".into())
+        } else {
+            Ok(())
+        }
     }
 
     pub(crate) fn with_session_dir(mut self, session_dir: PathBuf) -> Self {
@@ -739,12 +753,40 @@ impl RuntimeActionHost for HarnessActionHost {
         // is driven. Messages use the harness boundary writer, whose entry id
         // may be reserved until the current turn settles. Custom data stays out
         // of model context unless a caller explicitly configures a projector.
+        if let Some(expected) = args.get("expected") {
+            let guard = serde_json::from_value(expected.clone())
+                .map_err(|error| format!("invalid AppendEntry expected guard: {error}"))?;
+            let entry = if let Some(custom_type) = arg_str_opt(&args, "customType") {
+                if args.get("message").is_some() || args.get("outboxKey").is_some() {
+                    return Err("scoped custom entry cannot include message/outboxKey".into());
+                }
+                crate::resource_selection::validate_public_entry(&custom_type, args.get("data"))?;
+                rpi_harness::agent_harness::ScopedEntry::Custom {
+                    custom_type,
+                    data: args.get("data").cloned(),
+                }
+            } else {
+                let message =
+                    serde_json::from_value(args.get("message").cloned().ok_or("missing message")?)
+                        .map_err(|error| format!("invalid message: {error}"))?;
+                let key = arg_str(&args, "outboxKey")?;
+                rpi_harness::agent_harness::ScopedEntry::Notice { message, key }
+            };
+            let id = self
+                .harness()?
+                .append_scoped_entry(&guard, entry)
+                .await
+                .map_err(|error| error.to_string())?;
+            return Ok(serde_json::json!({"entryId":id, "scoped":true}));
+        }
+        if args.get("outboxKey").is_some() {
+            return Err("outboxKey requires an expected guard".into());
+        }
         if let Some(custom_type) = arg_str_opt(&args, "customType") {
             crate::resource_selection::validate_public_entry(&custom_type, args.get("data"))?;
             let data = args.get("data").cloned();
             let id = self
                 .harness()?
-                .session()
                 .append_custom_entry(&custom_type, data)
                 .await
                 .map_err(|e| e.to_string())?;
@@ -768,7 +810,8 @@ impl RuntimeActionHost for HarnessActionHost {
         args: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         let request = crate::modes::branch_entry_query(&args)?;
-        let entries = crate::modes::find_branch_entries(&self.harness()?, &request).await?;
+        let (entries, session_id, leaf_id) =
+            crate::modes::branch_snapshot(&self.harness()?, &request).await?;
         let entries = entries
             .iter()
             .map(serde_json::to_value)
@@ -778,6 +821,9 @@ impl RuntimeActionHost for HarnessActionHost {
             "entries": entries,
             "count": entries.len(),
             "filtered": true,
+            "sessionId": session_id,
+            "leafId": leaf_id,
+            "scopedAppend": true,
         }))
     }
 
@@ -876,6 +922,7 @@ impl RuntimeActionHost for HarnessActionHost {
     }
 
     async fn new_session(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
+        self.allow_session_routing()?;
         let harness = self.harness()?;
         let cwd_str = self.cwd.to_string_lossy().to_string();
         let dir = &self.session_dir;
@@ -890,6 +937,7 @@ impl RuntimeActionHost for HarnessActionHost {
     }
 
     async fn fork(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
+        self.allow_session_routing()?;
         let harness = self.harness()?;
         let cwd_str = self.cwd.to_string_lossy().to_string();
         let new_session =
@@ -902,6 +950,7 @@ impl RuntimeActionHost for HarnessActionHost {
     }
 
     async fn navigate_tree(&self, args: serde_json::Value) -> Result<serde_json::Value, String> {
+        self.allow_session_routing()?;
         let target_id = arg_str_opt(&args, "targetId");
         let summarize = arg_bool(&args, "summarize");
         let custom = arg_str_opt(&args, "customInstructions");
@@ -926,6 +975,7 @@ impl RuntimeActionHost for HarnessActionHost {
     }
 
     async fn switch_session(&self, args: serde_json::Value) -> Result<serde_json::Value, String> {
+        self.allow_session_routing()?;
         let harness = self.harness()?;
         let id = arg_str(&args, "id")?;
         let cwd_str = self.cwd.to_string_lossy().to_string();

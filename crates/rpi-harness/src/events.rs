@@ -246,11 +246,19 @@ impl HarnessEventBus {
         }
     }
 
-    /// Register a typed listener for one event type and return an unsubscribe
-    /// guard. Earlier events are not replayed. Mirrors TS `Events.on`.
-    ///
-    /// The returned guard is `'static` (holds a `Weak` to the bus), so it can
-    /// be stored anywhere; dropping it unregisters the listener.
+    /// Retain a listener for the lifetime of this bus. The callback must not
+    /// capture an owning handle back to this bus (or its harness).
+    pub fn on_lifetime<T, F>(&self, listener: F)
+    where
+        T: HarnessEventOf,
+        F: Fn(&T) + Send + Sync + 'static,
+    {
+        let mut subscription = self.on::<T, F>(listener);
+        subscription.taken = true;
+    }
+
+    /// Register a typed listener and return a guard that unregisters it on drop.
+    /// Earlier events are not replayed. The guard owns only a weak bus handle.
     pub fn on<T, F>(&self, listener: F) -> OnUnsubscribe
     where
         T: HarnessEventOf,

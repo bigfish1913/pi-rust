@@ -36,9 +36,7 @@ use rpi_agent::message::AgentMessage;
 use crate::error::{SessionError, SessionResult};
 use crate::events::{HarnessEvent, HarnessEventBus};
 use crate::session::session::Session;
-use crate::session::types::{
-    Entry, EntryOrder, EntryQuery, LaneRecord, OperationIntent, RecordQuery,
-};
+use crate::session::types::{Entry, EntryOrder, LaneRecord, OperationIntent, RecordQuery};
 
 /// How many open operations constitute corruption (mirrors the TS
 /// `find_open_operations(limit: 2)` rule).
@@ -237,14 +235,22 @@ impl SessionRuntime {
             })
             .collect();
 
-        let records = self
-            .session
-            .find_records(&RecordQuery {
-                lane: Some(lane.to_string()),
-                order: Some(EntryOrder::OldestFirst),
-                ..Default::default()
-            })
-            .await?;
+        // Only these record types contribute to the recovery report. In
+        // particular, reporting recovery must not hydrate retired stream frames.
+        let mut records = Vec::new();
+        for record_type in ["write_deferred", "tool_started"] {
+            records.extend(
+                self.session
+                    .find_records(&RecordQuery {
+                        lane: Some(lane.to_string()),
+                        record_type: Some(record_type),
+                        order: Some(EntryOrder::OldestFirst),
+                        ..Default::default()
+                    })
+                    .await?,
+            );
+        }
+        records.sort_unstable_by_key(LaneRecord::seq);
 
         let mut pending_writes = Vec::new();
         let mut tool_frames = Vec::new();
@@ -258,26 +264,12 @@ impl SessionRuntime {
         // (a frame that never landed because the process died).
         //
         // Settled means the referenced entry exists: for a deferred write, the
-        // provisioned id was committed; for a tool frame, the result for that
-        // `tool_call_id` landed.
-        let entries = self
-            .session
-            .find_entries(&EntryQuery {
-                order: Some(EntryOrder::OldestFirst),
-                ..Default::default()
-            })
-            .await?;
-        let entry_ids: BTreeSet<&str> = entries.iter().map(|entry| entry.id()).collect();
-        let landed_tool_results: BTreeSet<&str> = entries
-            .iter()
-            .filter_map(|entry| match entry {
-                Entry::Message(message) => match &message.message {
-                    AgentMessage::ToolResult(result) => Some(result.tool_call_id.as_str()),
-                    _ => None,
-                },
-                _ => None,
-            })
-            .collect();
+        // provisioned id was committed; for a tool frame, its reserved result
+        // entry must carry the matching call ID AND tool name. Provider IDs
+        // alone may recur in another batch, branch or lane.
+        // Look up each reserved ID session-wide, not on the current lane or
+        // branch. Hydrate at most one entry at a time; unrelated payloads (and
+        // lanes with no recovery records) must not be read.
 
         for record in records {
             match record {
@@ -289,11 +281,10 @@ impl SessionRuntime {
                         .map(str::to_string);
                     // The commit landed: this write is history, not a pending
                     // frame, whatever happened to the operation afterwards.
-                    if provisioned_id
-                        .as_deref()
-                        .is_some_and(|id| entry_ids.contains(id))
-                    {
-                        continue;
+                    if let Some(id) = provisioned_id.as_deref() {
+                        if self.session.get_entry(id).await?.is_some() {
+                            continue;
+                        }
                     }
                     if !open_ids.contains(&w.run_id) {
                         findings.push(RecoveryFinding::DanglingWrite {
@@ -308,7 +299,17 @@ impl SessionRuntime {
                 }
                 LaneRecord::ToolStarted(t) => {
                     // The tool's result landed: the invocation is settled.
-                    if landed_tool_results.contains(t.tool_call_id.as_str()) {
+                    let landed = match self.session.get_entry(&t.result_entry_id).await? {
+                        Some(Entry::Message(message)) => match message.message {
+                            AgentMessage::ToolResult(result) => {
+                                result.tool_call_id == t.tool_call_id
+                                    && result.tool_name == t.tool_name
+                            }
+                            _ => false,
+                        },
+                        _ => false,
+                    };
+                    if landed {
                         continue;
                     }
                     if !open_ids.contains(&t.run_id) {
@@ -394,20 +395,22 @@ impl SessionRuntime {
             .session
             .view(lane)
             .find_entries(&crate::session::types::EntryQuery {
-                order: Some(EntryOrder::OldestFirst),
+                order: Some(EntryOrder::NewestFirst),
+                limit: Some(1),
                 ..Default::default()
             })
             .await?;
-        let last_entry_seq = entries.last().map(|e| e.seq()).unwrap_or(0);
+        let last_entry_seq = entries.first().map(|e| e.seq()).unwrap_or(0);
         let records = self
             .session
             .find_records(&RecordQuery {
                 lane: Some(lane.to_string()),
-                order: Some(EntryOrder::OldestFirst),
+                order: Some(EntryOrder::NewestFirst),
+                limit: Some(1),
                 ..Default::default()
             })
             .await?;
-        let last_record_seq = records.last().map(|r| r.seq()).unwrap_or(0);
+        let last_record_seq = records.first().map(|r| r.seq()).unwrap_or(0);
         let has_open_operation = !self
             .session
             .find_open_operations(lane, Some(1))
@@ -453,6 +456,10 @@ pub async fn recover_all_lanes(
     }
     Ok(out)
 }
+
+#[cfg(test)]
+#[path = "runtime_recovery_tests.rs"]
+mod recovery_tests;
 
 #[cfg(test)]
 mod tests {
@@ -507,6 +514,7 @@ mod tests {
                 run_id: run_id.to_string(),
                 outcome: OperationOutcome::Completed,
                 error: None,
+                result: None,
             }))
             .await
             .unwrap();
@@ -765,12 +773,18 @@ mod tests {
             }))
             .await
             .unwrap();
-        // The tool's result landed, then the run closed.
+        // The tool's result landed under the reserved identity, then the run closed.
         session
-            .view("main")
-            .append_message(AgentMessage::ToolResult(Box::new(tool_result(
-                "call-1", "write",
-            ))))
+            .append_entry(
+                ProvisionedEntry {
+                    id: "result-1".to_string(),
+                    kind: ProvisionedKind::Message {
+                        message: AgentMessage::ToolResult(Box::new(tool_result("call-1", "write"))),
+                        terminate: None,
+                    },
+                },
+                "main",
+            )
             .await
             .unwrap();
         finish_operation(&session, "run-1", "main").await;
@@ -963,7 +977,7 @@ mod tests {
                 .await
                 .unwrap(),
             entries: session
-                .find_entries(&EntryQuery {
+                .find_entries(&crate::session::types::EntryQuery {
                     order: Some(EntryOrder::OldestFirst),
                     ..Default::default()
                 })

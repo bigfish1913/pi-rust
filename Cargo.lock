@@ -2141,6 +2141,7 @@ dependencies = [
  "rpi-telemetry",
  "rpi-tools",
  "rpi-tui",
+ "rusqlite",
  "schemars",
  "semver",
  "serde",
@@ -2155,6 +2156,15 @@ dependencies = [
  "uuid",
  "windows-sys 0.59.0",
  "zip",
+]
+
+[[package]]
+name = "rpi-durable"
+version = "0.16.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -2186,12 +2196,14 @@ dependencies = [
  "futures",
  "rpi-agent",
  "rpi-ai",
+ "rpi-durable",
  "rpi-telemetry",
  "rpi-tools",
  "rusqlite",
  "schemars",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -2258,6 +2270,7 @@ dependencies = [
  "rpi-agent",
  "rpi-ai",
  "rpi-plugin-sdk",
+ "same-file",
  "schemars",
  "serde",
  "serde_json",

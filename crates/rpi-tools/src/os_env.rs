@@ -66,6 +66,7 @@ struct ShellConfig {
 }
 
 mod append;
+mod read;
 
 /// Environment variables the **host** sets for its own runtime plumbing, which
 /// must not be handed to a shell it spawns.
@@ -452,6 +453,14 @@ impl FileSystem for OsExecutionEnv {
         Ok(Some(Box::new(append::OsAppendFile::open(path).await?)))
     }
 
+    async fn open_read_file(
+        &self,
+        path: &str,
+    ) -> Result<Option<Arc<dyn crate::env::ReadFile>>, FileError> {
+        let path = Self::resolve_path(&self.cwd, path);
+        Ok(Some(Arc::new(read::OsReadFile::open(path).await?)))
+    }
+
     async fn truncate_file(
         &self,
         path: &str,
@@ -531,17 +540,8 @@ impl FileSystem for OsExecutionEnv {
         if max_lines.map(|m| m == 0).unwrap_or(false) {
             return Ok(Vec::new());
         }
-        let text = self.read_text_file(path, cancel).await?;
-        let mut lines: Vec<String> = text.split('\n').map(|s| s.to_string()).collect();
-        if text.ends_with('\n') {
-            if lines.last().map(|s| s.is_empty()).unwrap_or(false) {
-                lines.pop();
-            }
-        }
-        if let Some(m) = max_lines {
-            lines.truncate(m);
-        }
-        Ok(lines)
+        let abs = Self::resolve_path(&self.cwd, path);
+        read::read_text_lines(&abs, max_lines, cancel).await
     }
 
     async fn read_binary_file(

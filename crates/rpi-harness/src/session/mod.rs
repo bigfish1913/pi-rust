@@ -9,9 +9,22 @@
 //!
 //! Built up incrementally across M5b–M5f.
 
+#[cfg(test)]
+mod storage_contract_tests;
+
+pub(crate) mod branch_queries;
+#[cfg(test)]
+mod branch_queries_compat_tests;
+#[cfg(test)]
+mod branch_queries_tests;
 pub mod context;
+pub(crate) mod diagnostics;
+#[cfg(feature = "experimental-native-store")]
+pub mod experimental_native;
 pub mod jsonl;
 pub mod memory;
+pub(crate) mod message_preview;
+pub(crate) mod progress;
 pub mod reducer;
 pub mod session;
 pub mod sqlite;

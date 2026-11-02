@@ -446,6 +446,14 @@ pub(crate) async fn bind_session(
     let values = SessionValues::load(session)
         .await
         .map_err(|e| e.to_string())?;
+    validate_session_binding(&values, selected)
+}
+
+/// Shared read-only check for preflight facts and the accepted writer's session.
+pub(crate) fn validate_session_binding(
+    values: &rpi_harness::session::SessionValues,
+    selected: Option<&ResolvedSelection>,
+) -> Result<(), String> {
     match (values.get(SESSION_KEY), selected) {
         (Some(old), Some(selected)) if old.get("declaration") == Some(&declaration(selected)) => {
             // Code identity is checked before dlopen/registration, not just after

@@ -208,7 +208,14 @@ async fn fork_takes_a_session_file_outside_the_session_directory() {
     // A caller copies the parent file elsewhere and forks from that copy.
     let copy = temporary.path().join("elsewhere").join("parent.jsonl");
     std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
-    std::fs::copy(list_session_files_sync(&source_root).remove(0), &copy).unwrap();
+    // Move the complete recovery pair, not only the history manifest.
+    let original = list_session_files_sync(&source_root).remove(0);
+    std::fs::copy(&original, &copy).unwrap();
+    std::fs::copy(
+        format!("{}.progress.jsonl", original.display()),
+        format!("{}.progress.jsonl", copy.display()),
+    )
+    .unwrap();
     let root = temporary.path().join("sessions");
     let forked = fork_session_at_launch(&copy.to_string_lossy(), &root, &cwd)
         .await

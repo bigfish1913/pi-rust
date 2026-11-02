@@ -16,6 +16,12 @@
 | 运行环境 | 本机动态库，当前用户权限 |
 | 适用场景 | 本地工具、系统集成、性能敏感或纯 Rust 项目 |
 
+推荐用 `rpi extension update [name]` 更新扩展：省略名称时更新全部项目链接扩展和
+全局 registry/prebuilt 扩展，指定名称时只更新匹配项。更新保留原来的 Cargo 构建
+后端或显式 GitHub 来源；全局通过 `--path` 安装的开发扩展不参与更新。
+旧命令 `rpi package update [name]` 仍兼容；项目链接管理命令仍为
+`rpi package link`、`rpi package list`、`rpi package unlink`，不改名。
+
 扩展应遵循能力检测：只调用宿主明确提供的 capability，检查 `PluginApi`
 对应注册槽位是否为 `Some`。缺少能力时返回清晰错误并优雅降级，不要 panic、
 空指针或依赖 `undefined` 语义。

@@ -7,8 +7,9 @@
 //! that keeps that reservation while stamping, appending the JSONL line, and
 //! applying the reducer. Dropping the caller's future cancels only its wait for
 //! the result; the owner still completes the append and reducer commit. Reads
-//! clone straight from the in-memory state (defensive-copy contract), never
-//! blocking on the tail.
+//! clone hot state or materialize selected cold history rows (defensive-copy
+//! contract), never blocking on the tail. Old transient frame records retain
+//! only file locations plus ID/sequence validation state, not decoded payloads.
 //!
 //! ## Load path + torn-tail recovery (plan §5.14)
 //!
@@ -50,11 +51,18 @@
 //! `append_entry` receives a [`ProvisionedEntry`] and stamps via the state +
 //! a [`Clock`], then encodes the resulting full `Entry`.
 
+use super::cold_frames::ResidentState;
+#[cfg(test)]
+#[path = "storage_compat_tests.rs"]
+mod compatibility_tests;
+#[path = "streaming.rs"]
+mod streaming;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use rpi_tools::env::{FileContent, FileSystem};
@@ -67,12 +75,27 @@ use crate::session::jsonl::codec::{
 use crate::session::jsonl::errors::{file_result, invalid_file, JsonlDecodeErrorKind};
 use crate::session::jsonl::types::{JsonlSessionMetadata, JsonlV4Header};
 use crate::session::memory::{stamp_record, Clock};
-use crate::session::state::{ApplyOutcome, SessionState};
+use crate::session::state::ApplyOutcome;
 use crate::session::types::{
     provisioned_into_entry, BranchBounds, Entry, EntryQuery, ForkOptions, IdGenerator, LanePointer,
     LaneRecord, LogItem, LogOptions, OperationStartedRecord, ProvisionedEntry, RecordQuery,
-    SessionMetadata, SessionMutation, SessionStats, SessionStorage,
+    SessionMetadata, SessionMutation, SessionStats, SessionStorage, TranscriptPage,
+    TranscriptPageQuery,
 };
+
+/// Read-only native startup facts with no file or storage capabilities.
+/// Values use the ordinary latest-wins SessionValues reducer.
+#[derive(Debug, Clone)]
+pub struct JsonlSessionFacts {
+    pub metadata: JsonlSessionMetadata,
+    pub values: crate::session::SessionValues,
+}
+
+#[derive(Clone, Copy)]
+enum FrameReplay {
+    Cold,
+    Detached,
+}
 
 /// Durable file-backed `SessionStorage`. Mirrors TS `JsonlSessionStorage`.
 ///
@@ -83,7 +106,7 @@ use crate::session::types::{
 pub struct JsonlSessionStorage {
     fs: Arc<dyn FileSystem>,
     metadata: JsonlSessionMetadata,
-    state: Arc<tokio::sync::Mutex<SessionState>>,
+    state: Arc<tokio::sync::Mutex<ResidentState>>,
     clock: Arc<dyn Clock>,
     /// Reserved for future auto-id generation (callers currently supply entry/
     /// record ids). Kept for parity with `InMemorySessionStorage`.
@@ -97,6 +120,9 @@ pub struct JsonlSessionStorage {
     needs_reconcile: Arc<std::sync::atomic::AtomicBool>,
     /// Set when a failed append cannot be proven/truncated safely.
     uncertain: Arc<AtomicBool>,
+    progress: super::progress::JsonlProgressStore,
+    /// Exact loaded legacy history, including its header, before writable opt-in.
+    legacy_history_digest: Option<[u8; 32]>,
 }
 
 impl Clone for JsonlSessionStorage {
@@ -111,6 +137,8 @@ impl Clone for JsonlSessionStorage {
             append: self.append.clone(),
             needs_reconcile: self.needs_reconcile.clone(),
             uncertain: self.uncertain.clone(),
+            progress: self.progress.clone(),
+            legacy_history_digest: self.legacy_history_digest,
         }
     }
 }
@@ -164,15 +192,22 @@ impl JsonlSessionStorage {
         ids: Arc<dyn IdGenerator>,
     ) -> Self {
         Self {
+            progress: super::progress::JsonlProgressStore::new(
+                fs.clone(),
+                &metadata.path,
+                &metadata.id,
+                clock.clone(),
+            ),
             fs,
             metadata,
-            state: Arc::new(tokio::sync::Mutex::new(SessionState::new())),
+            state: Arc::new(tokio::sync::Mutex::new(ResidentState::default())),
             clock,
             ids,
             tail: Arc::new(Mutex::new(())),
             append: Arc::new(Mutex::new(None)),
             needs_reconcile: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             uncertain: Arc::new(AtomicBool::new(false)),
+            legacy_history_digest: None,
         }
     }
 
@@ -181,10 +216,14 @@ impl JsonlSessionStorage {
     pub async fn create(
         fs: Arc<dyn FileSystem>,
         path: &str,
-        header: JsonlV4Header,
+        mut header: JsonlV4Header,
         clock: Arc<dyn Clock>,
         ids: Arc<dyn IdGenerator>,
     ) -> SessionResult<Self> {
+        header.progress_format = Some(super::progress::FORMAT.into());
+        let progress =
+            super::progress::JsonlProgressStore::new(fs.clone(), path, &header.id, clock.clone());
+        progress.initialize().await?;
         file_result(
             fs.write_file(path, FileContent::Text(encode_header(&header)), None)
                 .await,
@@ -195,7 +234,9 @@ impl JsonlSessionStorage {
             &format!("Failed to read session metadata {path}"),
         )?;
         let metadata = metadata_from_header(&header, path, info.mtime_ms);
-        Ok(Self::new(fs, metadata, clock, ids))
+        let mut storage = Self::new(fs, metadata, clock, ids);
+        storage.progress = progress;
+        Ok(storage)
     }
 
     /// Load + replay an existing session file, repairing a torn tail if the
@@ -206,7 +247,7 @@ impl JsonlSessionStorage {
         clock: Arc<dyn Clock>,
         ids: Arc<dyn IdGenerator>,
     ) -> SessionResult<Self> {
-        Self::load_impl(fs, path, clock, ids, true).await
+        Self::load_impl(fs, path, clock, ids, true, FrameReplay::Cold).await
     }
 
     /// Replay through the canonical native decoder/reducer without repairing,
@@ -219,8 +260,18 @@ impl JsonlSessionStorage {
         clock: Arc<dyn Clock>,
         ids: Arc<dyn IdGenerator>,
     ) -> SessionResult<crate::session::memory::InMemorySessionStorage> {
-        let storage = Self::load_impl(fs, path, clock.clone(), ids.clone(), false).await?;
-        let state = storage.state.lock().await.clone();
+        let storage = Self::load_impl(
+            fs,
+            path,
+            clock.clone(),
+            ids.clone(),
+            false,
+            FrameReplay::Detached,
+        )
+        .await?;
+        let state = std::mem::take(&mut *storage.state.lock().await)
+            .into_detached()
+            .await?;
         Ok(crate::session::memory::InMemorySessionStorage::from_state(
             storage.metadata.to_base(),
             state,
@@ -229,17 +280,84 @@ impl JsonlSessionStorage {
         ))
     }
 
+    /// Inspect metadata and session values without repairs, writer ownership or
+    /// historical frame hydration. Cold replay is independent of repair policy;
+    /// readerless filesystems retain their normal eager fallback.
+    pub async fn read_facts(
+        fs: Arc<dyn FileSystem>,
+        path: &str,
+        clock: Arc<dyn Clock>,
+        ids: Arc<dyn IdGenerator>,
+    ) -> SessionResult<JsonlSessionFacts> {
+        Self::load_impl(fs, path, clock, ids, false, FrameReplay::Cold)
+            .await?
+            .facts()
+            .await
+    }
+
+    async fn facts(&self) -> SessionResult<JsonlSessionFacts> {
+        let plan = self.state.lock().await.entry_plan(
+            &EntryQuery {
+                entry_type: Some("custom"),
+                custom_type: Some(crate::session::values::VALUE_CUSTOM_TYPE.to_string()),
+                order: Some(crate::session::types::EntryOrder::OldestFirst),
+                ..Default::default()
+            },
+            None,
+        )?;
+        let entries = plan.read().await?;
+        Ok(JsonlSessionFacts {
+            metadata: self.metadata.clone(),
+            values: crate::session::SessionValues::from_entries(&entries),
+        })
+    }
+
     async fn load_impl(
         fs: Arc<dyn FileSystem>,
         path: &str,
         clock: Arc<dyn Clock>,
         ids: Arc<dyn IdGenerator>,
         repair: bool,
+        _frames: FrameReplay,
     ) -> SessionResult<Self> {
-        let content = file_result(
-            fs.read_text_file(path, None).await,
-            &format!("Failed to read session {path}"),
-        )?;
+        let read_diagnostics = crate::session::diagnostics::RecoveryPhase::start("history_read");
+        let reader = file_result(fs.open_read_file(path).await, "open session history reader")?;
+        if let Some(source) = &reader {
+            if let Some(length) =
+                file_result(source.byte_len().await, "stat session history reader")?
+            {
+                return Self::load_streaming(fs, path, clock, ids, source.clone(), length, repair)
+                    .await;
+            }
+        }
+        // Compatibility only: custom readers without byte_len (or filesystems
+        // without a stable reader) retain the historical eager text path.
+        let content = if let Some(reader) = &reader {
+            let bytes = file_result(reader.read_all().await, "read session history")?;
+            String::from_utf8(bytes)
+                .map_err(|_| SessionError::invalid_entry("invalid session UTF-8"))?
+        } else {
+            file_result(
+                fs.read_text_file(path, None).await,
+                &format!("Failed to read session {path}"),
+            )?
+        };
+        // Only legacy assistant frames may retain locations on this eager
+        // path. A read_all-only reader is not a cold-payload capability. Probe
+        // ranges explicitly, treating only NotSupported as absence: real I/O
+        // failures must still fail load rather than silently changing modes.
+        let frame_reader = if let Some(source) = &reader {
+            match source.read_range(0, 0).await {
+                Ok(_) => Some(source.clone()),
+                Err(error) if error.code == rpi_tools::FileErrorCode::NotSupported => None,
+                Err(error) => return file_result(Err(error), "probe legacy history ranges"),
+            }
+        } else {
+            None
+        };
+        read_diagnostics.finish(content.len(), content.len());
+        let replay_diagnostics =
+            crate::session::diagnostics::RecoveryPhase::start("history_replay");
         // TS: content.split("\n"); drop trailing "" from the final "\n".
         let mut physical_lines: Vec<&str> = content.split('\n').collect();
         if physical_lines.last() == Some(&"") {
@@ -249,12 +367,24 @@ impl JsonlSessionStorage {
             return Err(invalid_file(path, 1, &"is missing a header".to_string()));
         }
         let header = parse_header(physical_lines[0]).map_err(|e| invalid_file(path, 1, &e))?;
+        if header.progress_format.is_some()
+            && !file_result(
+                fs.exists(&format!("{path}.progress.jsonl"), None).await,
+                "check required progress companion",
+            )?
+        {
+            return Err(SessionError::invalid_entry("required progress companion is missing; restore the complete session, not only its history"));
+        }
         let info = file_result(
             fs.file_info(path, None).await,
             &format!("Failed to read session metadata {path}"),
         )?;
         let metadata = metadata_from_header(&header, path, info.mtime_ms);
-        let storage = Self::new(fs.clone(), metadata, clock, ids);
+        let mut storage = Self::new(fs.clone(), metadata, clock, ids);
+        storage.progress.required = header.progress_format.is_some();
+        if !storage.progress.required {
+            storage.legacy_history_digest = Some(Sha256::digest(content.as_bytes()).into());
+        }
 
         // Lines kept through the duplicate-seq recovery, so a healed file can
         // be republished without the dropped duplicates (see after the loop).
@@ -299,7 +429,19 @@ impl JsonlSessionStorage {
                     }
                     let original_seq = mutation.seq();
                     let mutation = chain_onto_lane_leaf(mutation, &state);
-                    if let Err(e) = state.apply_mutation(mutation) {
+                    let applied = match (&frame_reader, &mutation) {
+                        (
+                            Some(reader),
+                            SessionMutation::Record {
+                                record: LaneRecord::AssistantFrame(_),
+                            },
+                        ) => {
+                            let offset = line.as_ptr() as usize - content.as_ptr() as usize;
+                            state.apply_loaded(mutation, reader, offset as u64, line.as_bytes())
+                        }
+                        _ => state.apply_mutation(mutation).map(|_| ()),
+                    };
+                    if let Err(e) = applied {
                         if e.code == SessionErrorCode::InvalidEntry {
                             drop(state);
                             return Err(invalid_file(path, line_no, &e));
@@ -329,6 +471,10 @@ impl JsonlSessionStorage {
                         // Drop the unacknowledged partial append by atomically
                         // publishing the valid prefix.
                         let valid_prefix = format!("{}\n", physical_lines[..idx].join("\n"));
+                        if !storage.progress.required {
+                            storage.legacy_history_digest =
+                                Some(Sha256::digest(valid_prefix.as_bytes()).into());
+                        }
                         let fs = storage.fs.clone();
                         let path_owned = path.to_string();
                         publish_file_atomically(&fs, &path_owned, |fs, temp_path| {
@@ -344,6 +490,8 @@ impl JsonlSessionStorage {
                             })
                         })
                         .await?;
+                        let applied = kept_lines.len();
+                        replay_diagnostics.finish(physical_lines.len() - 1, applied);
                         return Ok(storage);
                     }
                     return Err(invalid_file(path, line_no, &err));
@@ -362,6 +510,9 @@ impl JsonlSessionStorage {
                 repaired.push_str(line);
                 repaired.push('\n');
             }
+            if !storage.progress.required {
+                storage.legacy_history_digest = Some(Sha256::digest(repaired.as_bytes()).into());
+            }
             let fs = storage.fs.clone();
             let path_owned = path.to_string();
             publish_file_atomically(&fs, &path_owned, |fs, temp_path| {
@@ -377,6 +528,7 @@ impl JsonlSessionStorage {
                 })
             })
             .await?;
+            replay_diagnostics.finish(physical_lines.len() - 1, seen_lines.len());
             return Ok(storage);
         }
         // Repair an unterminated tail (no trailing "\n") so future appends are
@@ -389,8 +541,112 @@ impl JsonlSessionStorage {
                     .await,
                 &format!("Failed to repair unterminated session tail {path}"),
             )?;
+            if !storage.progress.required {
+                storage.legacy_history_digest =
+                    Some(Sha256::digest(format!("{content}\n").as_bytes()).into());
+            }
         }
+        replay_diagnostics.finish(physical_lines.len() - 1, seen_lines.len());
         Ok(storage)
+    }
+
+    /// Opt a loaded native V4 session into durable progress, preserving its ID
+    /// and history bytes. Ordinary `load` never performs this upgrade.
+    ///
+    /// The caller MUST hold the session's exclusive OS file lock until all use
+    /// of the returned storage ends, and MUST NOT share this handle beforehand.
+    /// This consumes an unshared handle; a detached owner completes publication
+    /// even if the caller drops its future. On failure, reopen under the same
+    /// lock and retry: only a matching, pristine empty checkpoint is reusable.
+    pub async fn enable_progress_under_exclusive_lock(self) -> SessionResult<Self> {
+        if Arc::strong_count(&self.state) != 1 || Arc::strong_count(&self.tail) != 1 {
+            return Err(SessionError::invalid_payload(
+                "progress upgrade requires an unshared storage handle",
+            ));
+        }
+        tokio::spawn(async move {
+            let mut storage = self;
+            if storage.progress.required {
+                return Ok(storage);
+            }
+            if storage.metadata.source_format != super::types::JsonlSourceFormat::V4 {
+                return Err(SessionError::invalid_payload(
+                    "only native V4 sessions support progress upgrade",
+                ));
+            }
+            let expected = storage.legacy_history_digest.ok_or_else(|| {
+                SessionError::invalid_payload("progress upgrade requires a freshly loaded session")
+            })?;
+            if storage.upgrade_streaming(expected).await? {
+                return Ok(storage);
+            }
+            let path = storage.metadata.path.clone();
+            let content = file_result(
+                storage.fs.read_text_file(&path, None).await,
+                "read history for progress upgrade",
+            )?;
+            if <[u8; 32]>::from(Sha256::digest(content.as_bytes())) != expected {
+                return Err(SessionError::invalid_entry(
+                    "session history changed before progress upgrade; reopen session",
+                ));
+            }
+            let (header_line, body) = content.split_once('\n').ok_or_else(|| {
+                SessionError::invalid_entry("progress upgrade requires a complete header")
+            })?;
+            let header = parse_header(header_line).map_err(|e| invalid_file(&path, 1, &e))?;
+            if header.id != storage.metadata.id
+                || header.progress_format.is_some()
+                || header.version != 4
+            {
+                return Err(SessionError::invalid_entry(
+                    "session header changed before progress upgrade",
+                ));
+            }
+            // Preserve unknown header fields as well as every byte of the body.
+            let mut value: serde_json::Value = serde_json::from_str(header_line)
+                .map_err(|e| SessionError::invalid_entry(e.to_string()))?;
+            value["progressFormat"] = super::progress::FORMAT.into();
+            let upgraded = format!(
+                "{}\n{body}",
+                serde_json::to_string(&value).map_err(|e| SessionError::storage(e.to_string()))?
+            );
+            let progress = super::progress::JsonlProgressStore::new(
+                storage.fs.clone(),
+                &path,
+                &header.id,
+                storage.clock.clone(),
+            );
+            progress.initialize_legacy_upgrade().await?;
+            // Publication replaces the inode; never retain a cached append
+            // capability that could later write to the retired history file.
+            *storage.append.lock().await = None;
+            let history_path = path.clone();
+            publish_file_atomically(&storage.fs, &path, |fs, temp_path| {
+                Box::pin(async move {
+                    file_result(
+                        fs.write_file(temp_path, FileContent::Text(upgraded), None)
+                            .await,
+                        "stage progress upgrade header",
+                    )?;
+                    let current = file_result(
+                        fs.read_text_file(&history_path, None).await,
+                        "recheck history for progress upgrade",
+                    )?;
+                    if <[u8; 32]>::from(Sha256::digest(current.as_bytes())) != expected {
+                        return Err(SessionError::invalid_entry(
+                            "session history changed during progress upgrade; reopen session",
+                        ));
+                    }
+                    Ok(())
+                })
+            })
+            .await?;
+            storage.progress = progress;
+            storage.legacy_history_digest = None;
+            Ok(storage)
+        })
+        .await
+        .map_err(|e| SessionError::storage(format!("progress upgrade owner failed: {e}")))?
     }
 
     /// Fork into `path` by writing a fresh header then replaying the fork
@@ -399,32 +655,95 @@ impl JsonlSessionStorage {
     pub async fn fork(
         &self,
         path: &str,
-        header: JsonlV4Header,
+        mut header: JsonlV4Header,
         options: &ForkOptions,
         clock: Arc<dyn Clock>,
         ids: Arc<dyn IdGenerator>,
     ) -> SessionResult<Self> {
-        let mutations = {
-            let state = self.state.lock().await;
-            state.create_fork_mutations(options)?
-        };
-        publish_file_atomically(&self.fs, path, |fs, temp_path| {
-            let header = header.clone();
-            let mutations = mutations.clone();
-            let clock = clock.clone();
-            let ids = ids.clone();
+        let plan = self.state.lock().await.fork_plan(options)?;
+        header.progress_format = Some(super::progress::FORMAT.into());
+        super::progress::JsonlProgressStore::new(self.fs.clone(), path, &header.id, clock.clone())
+            .initialize()
+            .await?;
+        publish_file_atomically(&self.fs, path, move |fs, temp_path| {
             Box::pin(async move {
-                let target =
-                    JsonlSessionStorage::create(fs.clone(), temp_path, header, clock, ids).await?;
-                for mutation in &mutations {
-                    let line = encode_mutation(mutation);
+                file_result(
+                    fs.write_file(temp_path, FileContent::Text(encode_header(&header)), None)
+                        .await,
+                    "stage fork header",
+                )?;
+                // Hydrate and release one row at a time. Only small reference
+                // plans, lane pointers and labels survive between writes.
+                let mut seq = 1;
+                for source in plan.entries {
+                    let mut entry = source.read().await?;
+                    entry.base_mut().seq = seq;
+                    let mutation = SessionMutation::Entry {
+                        seq,
+                        timestamp: entry.base().timestamp,
+                        lane: None,
+                        entry,
+                    };
                     file_result(
-                        fs.append_file(temp_path, FileContent::Text(line), None)
-                            .await,
-                        &format!("Failed to append session {temp_path}"),
+                        fs.append_file(
+                            temp_path,
+                            FileContent::Text(encode_mutation(&mutation)),
+                            None,
+                        )
+                        .await,
+                        "stage fork entry",
                     )?;
-                    let mut state = target.state.lock().await;
-                    state.apply_mutation(mutation.clone())?;
+                    seq += 1;
+                }
+                for pointer in plan.lanes {
+                    let mutation = SessionMutation::Lane {
+                        seq,
+                        lane: pointer.lane,
+                        leaf_id: pointer.leaf_id,
+                    };
+                    file_result(
+                        fs.append_file(
+                            temp_path,
+                            FileContent::Text(encode_mutation(&mutation)),
+                            None,
+                        )
+                        .await,
+                        "stage fork lane",
+                    )?;
+                    seq += 1;
+                }
+                if let Some(name) = plan.name {
+                    let mutation = SessionMutation::FactName {
+                        seq,
+                        name: Some(name),
+                    };
+                    file_result(
+                        fs.append_file(
+                            temp_path,
+                            FileContent::Text(encode_mutation(&mutation)),
+                            None,
+                        )
+                        .await,
+                        "stage fork name",
+                    )?;
+                    seq += 1;
+                }
+                for (target_id, label) in plan.labels {
+                    let mutation = SessionMutation::FactLabel {
+                        seq,
+                        target_id,
+                        label: Some(label),
+                    };
+                    file_result(
+                        fs.append_file(
+                            temp_path,
+                            FileContent::Text(encode_mutation(&mutation)),
+                            None,
+                        )
+                        .await,
+                        "stage fork label",
+                    )?;
+                    seq += 1;
                 }
                 Ok(())
             })
@@ -481,7 +800,7 @@ impl JsonlSessionStorage {
             )?;
         }
         let result = if let Some(writer) = append.as_mut() {
-            let result = writer.append(&lines).await;
+            let result = writer.append_with_receipt(&lines).await;
             if result.is_err() {
                 *append = None;
             }
@@ -490,25 +809,63 @@ impl JsonlSessionStorage {
             self.fs
                 .append_file(&self.metadata.path, FileContent::Bytes(lines.clone()), None)
                 .await
+                .map(|_| None)
         };
-        if let Err(error) = result {
-            // The reducer has not seen this batch. Remove the whole batch,
-            // including any complete lines before a torn final line.
-            drop(append);
-            if self.cut_back_failed_append(&lines).await.is_err() {
-                self.uncertain.store(true, Ordering::SeqCst);
-                self.needs_reconcile.store(true, Ordering::Release);
+        let receipt = match result {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                // The reducer has not seen this batch. Remove the whole batch,
+                // including any complete lines before a torn final line.
+                drop(append);
+                if self.cut_back_failed_append(&lines).await.is_err() {
+                    self.uncertain.store(true, Ordering::SeqCst);
+                    self.needs_reconcile.store(true, Ordering::Release);
+                }
+                return file_result(
+                    Err(error),
+                    &format!("Failed to append session {}", self.metadata.path),
+                );
             }
-            return file_result(
-                Err(error),
-                &format!("Failed to append session {}", self.metadata.path),
-            );
+        };
+        drop(append);
+        // A missing (or malformed custom) receipt is a compatibility fallback,
+        // never an error after bytes have already been acknowledged.
+        if let Some(receipt) = receipt.filter(|receipt| receipt.length == lines.len()) {
+            self.state.lock().await.bind_append(receipt, &lines);
         }
         Ok(())
     }
 
     /// Cut the failed batch back only when its bytes are provably the file tail.
     async fn cut_back_failed_append(&self, batch: &[u8]) -> Result<(), ()> {
+        let reader = self
+            .fs
+            .open_read_file(&self.metadata.path)
+            .await
+            .map_err(|_| ())?;
+        if let Some(reader) = reader {
+            if let Some(length) = reader.byte_len().await.map_err(|_| ())? {
+                // A failed batch can occupy at most batch.len() tail bytes.
+                // Include its preceding byte so the window's artificial start
+                // is never mistaken for a physical line boundary.
+                let offset = length.saturating_sub(batch.len() as u64).saturating_sub(1);
+                let size = usize::try_from(length - offset).map_err(|_| ())?;
+                let bytes = reader.read_range(offset, size).await.map_err(|_| ())?;
+                if bytes.len() != size {
+                    return Err(());
+                }
+                let start = failed_append_start_at(&bytes, batch, offset == 0).ok_or(())?;
+                if start == bytes.len() {
+                    return Ok(());
+                }
+                return self
+                    .fs
+                    .truncate_file(&self.metadata.path, offset + start as u64, None)
+                    .await
+                    .map_err(|_| ());
+            }
+        }
+        // Compatibility for backends without stable length/range capability.
         let bytes = self
             .fs
             .read_binary_file(&self.metadata.path, None)
@@ -633,6 +990,7 @@ impl JsonlSessionStorage {
         }
         let state = self.state.lock().await;
         let mut candidate = state.clone();
+        let mut mutations = Vec::with_capacity(records.len());
         let mut encoded_lines = Vec::with_capacity(records.len() * 256);
         let mut stamped_records = Vec::with_capacity(records.len());
 
@@ -653,6 +1011,7 @@ impl JsonlSessionStorage {
             let stamped = stamp_record(record, seq, lane, timestamp);
             let mutation = SessionMutation::Record { record: stamped };
             encode_mutation_into(&mutation, &mut encoded_lines);
+            mutations.push(mutation.clone());
             match candidate.apply_mutation(mutation)? {
                 ApplyOutcome::Record(stamped) => stamped_records.push(stamped),
                 _ => {
@@ -666,7 +1025,9 @@ impl JsonlSessionStorage {
 
         self.append_encoded_bytes(encoded_lines).await?;
         let mut state = self.state.lock().await;
-        *state = candidate;
+        for mutation in mutations {
+            state.apply_mutation(mutation)?;
+        }
         Ok(stamped_records)
     }
 
@@ -681,8 +1042,15 @@ impl JsonlSessionStorage {
 /// Return the start of a failed batch only when its complete or partial bytes
 /// are an exact suffix beginning at a physical line boundary.
 fn failed_append_start(bytes: &[u8], batch: &[u8]) -> Option<usize> {
+    failed_append_start_at(bytes, batch, true)
+}
+
+fn failed_append_start_at(bytes: &[u8], batch: &[u8], starts_at_boundary: bool) -> Option<usize> {
     if bytes.ends_with(batch) {
-        return Some(bytes.len() - batch.len());
+        let start = bytes.len() - batch.len();
+        if (start == 0 && starts_at_boundary) || (start > 0 && bytes[start - 1] == b'\n') {
+            return Some(start);
+        }
     }
 
     // Search the longest matching suffix first. A failed multi-line write may
@@ -690,7 +1058,10 @@ fn failed_append_start(bytes: &[u8], batch: &[u8]) -> Option<usize> {
     // choosing the shortest suffix would leave those committed-but-unreduced
     // lines in the journal.
     let window_start = bytes.len().saturating_sub(batch.len());
-    let mut boundaries = vec![0];
+    let mut boundaries = Vec::new();
+    if starts_at_boundary {
+        boundaries.push(0);
+    }
     boundaries.extend(
         bytes
             .iter()
@@ -716,7 +1087,7 @@ fn failed_append_start(bytes: &[u8], batch: &[u8]) -> Option<usize> {
 /// diverge, an entry can land with a parent the local state never reached;
 /// re-chaining onto the leaf recovers the session instead of refusing to open
 /// it. Non-entry mutations and entries without a named lane pass through.
-fn chain_onto_lane_leaf(mutation: SessionMutation, state: &SessionState) -> SessionMutation {
+fn chain_onto_lane_leaf(mutation: SessionMutation, state: &ResidentState) -> SessionMutation {
     if let SessionMutation::Entry {
         seq,
         timestamp,
@@ -744,6 +1115,29 @@ fn chain_onto_lane_leaf(mutation: SessionMutation, state: &SessionState) -> Sess
 
 #[async_trait]
 impl SessionStorage for JsonlSessionStorage {
+    async fn prune_completed_progress(&self) -> SessionResult<usize> {
+        let completed = self.state.lock().await.completed_progress_runs();
+        self.progress.prune_completed(completed).await
+    }
+
+    async fn append_progress(
+        &self,
+        records: Vec<crate::session::types::AssistantFrameRecord>,
+    ) -> SessionResult<Vec<crate::session::types::AssistantFrameRecord>> {
+        {
+            let state = self.state.lock().await;
+            for record in &records {
+                state.require_lane(&record.base.lane)?;
+            }
+        }
+        self.progress.append(records).await
+    }
+    async fn read_progress(
+        &self,
+        run_id: &str,
+    ) -> SessionResult<Vec<crate::session::types::AssistantFrameRecord>> {
+        self.progress.read(run_id).await
+    }
     fn metadata(&self) -> SessionMetadata {
         self.metadata.to_base()
     }
@@ -769,6 +1163,36 @@ impl SessionStorage for JsonlSessionStorage {
         self.run_owned(move |s| async move { s.move_lane_owned(&lane, to.as_deref()).await })
             .await
     }
+    async fn history_revision(&self) -> SessionResult<u64> {
+        Ok(self.state.lock().await.sequence())
+    }
+
+    async fn append_entry_if_revision(
+        &self,
+        entry: ProvisionedEntry,
+        lane: &str,
+        expected: u64,
+    ) -> SessionResult<Entry> {
+        let lane = lane.to_owned();
+        self.run_owned(move |s| async move {
+            s.state.lock().await.check_revision(expected)?;
+            s.append_entry_owned(entry, &lane).await
+        })
+        .await
+    }
+
+    async fn append_record_if_revision(
+        &self,
+        record: LaneRecord,
+        expected: u64,
+    ) -> SessionResult<LaneRecord> {
+        self.run_owned(move |s| async move {
+            s.state.lock().await.check_revision(expected)?;
+            s.append_record_owned(record).await
+        })
+        .await
+    }
+
     async fn append_entry(&self, entry: ProvisionedEntry, lane: &str) -> SessionResult<Entry> {
         let lane = lane.to_string();
         self.run_owned(move |s| async move { s.append_entry_owned(entry, &lane).await })
@@ -804,32 +1228,72 @@ impl SessionStorage for JsonlSessionStorage {
         self.run_owned(move |s| async move { s.append_record_owned(record).await })
             .await
     }
+    async fn append_queue_cancellations(
+        &self,
+        records: Vec<LaneRecord>,
+    ) -> SessionResult<Vec<LaneRecord>> {
+        self.run_owned(move |s| async move {
+            s.state
+                .lock()
+                .await
+                .validate_queue_cancellations(&records)?;
+            s.append_record_batch_owned(records).await
+        })
+        .await
+    }
     async fn append_records(&self, records: Vec<LaneRecord>) -> SessionResult<Vec<LaneRecord>> {
         self.run_owned(move |s| async move { s.append_records_owned(records).await })
             .await
+    }
+    async fn transcript_page(
+        &self,
+        lane: &str,
+        query: &TranscriptPageQuery,
+    ) -> SessionResult<Option<TranscriptPage>> {
+        let plan = self.state.lock().await.transcript_plan(lane, query)?;
+        Ok(Some(plan.read().await?))
     }
     async fn message_summaries(
         &self,
         lane: &str,
         query: &crate::session::types::MessageSummaryQuery,
     ) -> SessionResult<crate::session::types::MessageSummaryPage> {
-        self.state.lock().await.message_summaries(lane, query)
+        let plan = self.state.lock().await.summary_plan(lane, query)?;
+        plan.read().await
     }
     async fn message_window(
         &self,
         lane: &str,
         query: &crate::session::types::MessageWindowQuery,
     ) -> SessionResult<crate::session::types::MessageWindowPage> {
-        self.state.lock().await.message_window(lane, query)
+        let plan = self.state.lock().await.window_plan(lane, query)?;
+        plan.read().await
     }
-    async fn get_entry(&self, id: &str) -> SessionResult<Option<Entry>> {
+    async fn branch_overview(
+        &self,
+        lane: &str,
+    ) -> SessionResult<crate::session::types::BranchOverview> {
         let state = self.state.lock().await;
-        Ok(state.get_entry(id).cloned())
+        let leaf = state.require_lane(lane)?;
+        let path = state.walk_to_root(leaf.as_deref(), &BranchBounds::default())?;
+        Ok(crate::session::branch_queries::overview_from_metadata(
+            path.iter()
+                .rev()
+                .map(|&index| state.entry_meta(index).expect("validated branch index")),
+        ))
+    }
+
+    async fn get_entry(&self, id: &str) -> SessionResult<Option<Entry>> {
+        let selected = self.state.lock().await.entry_ref(id);
+        match selected {
+            Some(payload) => Ok(Some(payload.read().await?)),
+            None => Ok(None),
+        }
     }
 
     async fn find_entries(&self, query: &EntryQuery) -> SessionResult<Vec<Entry>> {
-        let state = self.state.lock().await;
-        state.find_entries(query)
+        let plan = self.state.lock().await.entry_plan(query, None)?;
+        plan.read().await
     }
 
     async fn find_entries_on_branch(
@@ -838,8 +1302,20 @@ impl SessionStorage for JsonlSessionStorage {
         bounds: &BranchBounds,
         start: &str,
     ) -> SessionResult<Vec<Entry>> {
-        let state = self.state.lock().await;
-        state.find_entries_on_branch(query, bounds, start)
+        let plan = self
+            .state
+            .lock()
+            .await
+            .entry_plan(query, Some((bounds, start)))?;
+        plan.read().await
+    }
+
+    async fn context_usage(
+        &self,
+        lane: &str,
+    ) -> SessionResult<Option<crate::compaction::ContextUsageEstimate>> {
+        let plan = self.state.lock().await.context_usage_plan(lane)?;
+        Ok(Some(plan.read().await?))
     }
 
     async fn context_on_branch(
@@ -847,13 +1323,21 @@ impl SessionStorage for JsonlSessionStorage {
         bounds: &BranchBounds,
         start: &str,
     ) -> SessionResult<crate::session::context::SessionContext> {
-        let state = self.state.lock().await;
-        state.context_on_branch(bounds, start)
+        let plan = self.state.lock().await.context_plan(bounds, start)?;
+        plan.read().await
     }
 
     async fn find_records(&self, query: &RecordQuery) -> SessionResult<Vec<LaneRecord>> {
-        let state = self.state.lock().await;
-        state.find_records(query)
+        let plan = self.state.lock().await.record_plan(query)?;
+        plan.read().await
+    }
+
+    async fn record_page(
+        &self,
+        query: &crate::session::types::RecordPageQuery,
+    ) -> SessionResult<crate::session::types::RecordPage> {
+        let (plan, total) = self.state.lock().await.page_plan(query)?;
+        plan.page(total).await
     }
 
     async fn find_open_operations(
@@ -866,8 +1350,8 @@ impl SessionStorage for JsonlSessionStorage {
     }
 
     async fn get_log(&self, options: &LogOptions) -> SessionResult<Vec<LogItem>> {
-        let state = self.state.lock().await;
-        state.get_log(options)
+        let plan = self.state.lock().await.log_plan(options)?;
+        plan.read().await
     }
 
     async fn get_name(&self) -> SessionResult<Option<String>> {
@@ -906,6 +1390,7 @@ impl SessionStorage for JsonlSessionStorage {
     /// caller's `await` on the append returns.
     async fn drain(&self) {
         let _reservation = self.tail.lock().await;
+        self.progress.drain().await;
     }
 }
 
@@ -1184,7 +1669,7 @@ fn is_assistant_frame_append(line: &str) -> bool {
 /// while populating leaves only the ignored `.tmp`. Per-destination
 /// serialization is the caller's responsibility (the storage holds its `tail`
 /// mutex; the repo holds its create-destination set).
-async fn publish_file_atomically<F>(
+pub(super) async fn publish_file_atomically<F>(
     fs: &Arc<dyn FileSystem>,
     destination_path: &str,
     populate: F,
@@ -1890,6 +2375,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_facts_keeps_preflight_frames_cold_and_source_untouched() {
+        use crate::session::types::{AssistantFrameOp, AssistantFrameRecord};
+        for damage in ["none", "torn", "duplicate", "unterminated"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("facts.jsonl");
+            let mut text = encode_header(&header());
+            for (seq, op) in [
+                (1, AssistantFrameOp::Append),
+                (4, AssistantFrameOp::CommitStream),
+            ] {
+                text.push_str(&encode_mutation(&SessionMutation::Record {
+                    record: LaneRecord::AssistantFrame(AssistantFrameRecord {
+                        base: RecordBase {
+                            id: format!("frame-{seq}"),
+                            seq,
+                            lane: "main".into(),
+                            timestamp: 1,
+                        },
+                        run_id: "pending-run".into(),
+                        stream_index: 0,
+                        op,
+                        frame: Some(serde_json::json!({"payload":"cold historical payload"})),
+                    }),
+                }));
+                if seq == 1 {
+                    for value_seq in 2..=3 {
+                        text.push_str(&encode_mutation(&SessionMutation::Entry {
+                            seq: value_seq, timestamp: 1, lane: Some("main".into()),
+                            entry: Entry::Custom(crate::session::types::CustomEntry {
+                                base: crate::session::types::EntryBase {
+                                    entry_type: "custom".into(), id: format!("value-{value_seq}"), seq: value_seq,
+                                    parent_id: if value_seq == 3 { Some("value-2".into()) } else { None }, timestamp: 1,
+                                },
+                                custom_type: crate::session::values::VALUE_CUSTOM_TYPE.into(),
+                                data: Some(serde_json::json!({"key":"rpi.resource-selection.v1","value":value_seq})),
+                            }),
+                        }));
+                    }
+                }
+            }
+            match damage {
+                "torn" => text.push_str("{unacknowledged"),
+                "duplicate" => {
+                    let duplicate = text.lines().last().unwrap().to_owned();
+                    text.push_str(&format!("{duplicate}\n"));
+                }
+                "unterminated" => {
+                    text.pop();
+                }
+                _ => {}
+            }
+            std::fs::write(&path, &text).unwrap();
+            let fs: Arc<dyn FileSystem> =
+                Arc::new(rpi_tools::OsExecutionEnv::with_cwd(dir.path().into()));
+            let clock: Arc<dyn Clock> = Arc::new(FakeClock::new());
+            let ids: Arc<dyn IdGenerator> = Arc::new(CounterIdGenerator::new());
+            let facts = JsonlSessionStorage::read_facts(
+                fs.clone(),
+                path.to_str().unwrap(),
+                clock.clone(),
+                ids.clone(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                Arc::strong_count(&fs),
+                1,
+                "facts must not retain the filesystem"
+            );
+            assert_eq!(facts.metadata.id, header().id);
+            assert_eq!(
+                facts.values.get("rpi.resource-selection.v1"),
+                Some(&serde_json::json!(3))
+            );
+            let loaded = JsonlSessionStorage::load_impl(
+                fs,
+                path.to_str().unwrap(),
+                clock,
+                ids,
+                false,
+                FrameReplay::Cold,
+            )
+            .await
+            .unwrap();
+            // Only CommitStream is hot; historical Append stays a cold location.
+            assert_eq!(
+                loaded
+                    .state
+                    .lock()
+                    .await
+                    .find_records(&RecordQuery::default())
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(
+                loaded
+                    .find_records(&RecordQuery::default())
+                    .await
+                    .unwrap()
+                    .len(),
+                2
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+            // Facts never hydrate the now-invalid cold row.
+            std::fs::write(
+                &path,
+                text.replacen("cold historical payload", "changed frame payload!!", 1),
+            )
+            .unwrap();
+            assert_eq!(loaded.facts().await.unwrap().values, facts.values);
+            assert!(loaded.find_records(&RecordQuery::default()).await.is_err());
+            drop(loaded);
+            std::fs::remove_file(&path).unwrap();
+            assert_eq!(
+                facts.values.get("rpi.resource-selection.v1"),
+                Some(&serde_json::json!(3))
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn read_snapshot_replays_recoverable_tails_without_writes_or_creation() {
         for damage in ["torn", "duplicate", "unterminated"] {
             let fs: Arc<dyn FileSystem> =
@@ -1916,6 +2524,17 @@ mod tests {
             fs.write_file("/s.jsonl", FileContent::Text(damaged.clone()), None)
                 .await
                 .unwrap();
+            let paths = |files: Vec<rpi_tools::env::FileInfo>| {
+                files
+                    .into_iter()
+                    .map(|file| file.path)
+                    .collect::<std::collections::BTreeSet<_>>()
+            };
+            let files_before = paths(fs.list_dir("/", None).await.unwrap());
+            let progress_before = fs
+                .read_text_file("/s.jsonl.progress.jsonl", None)
+                .await
+                .unwrap();
             let snapshot = JsonlSessionStorage::read_snapshot(
                 fs.clone(),
                 "/s.jsonl",
@@ -1938,7 +2557,13 @@ mod tests {
             )
             .await
             .is_err());
-            assert_eq!(fs.list_dir("/", None).await.unwrap().len(), 1);
+            assert_eq!(paths(fs.list_dir("/", None).await.unwrap()), files_before);
+            assert_eq!(
+                fs.read_text_file("/s.jsonl.progress.jsonl", None)
+                    .await
+                    .unwrap(),
+                progress_before
+            );
             // The accepted writer path retains canonical recovery semantics.
             let restored = JsonlSessionStorage::load(fs.clone(), "/s.jsonl", clock, ids)
                 .await
