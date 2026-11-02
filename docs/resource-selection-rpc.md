@@ -93,8 +93,9 @@ Only model-effective tools get schemas in the model request. Registered tools
 remain separately observable, including in `none` mode. No bogus tool name is
 used to implement `none`. `set_active_tools` (including empty arrays), external
 tool registration, resource/system-prompt replacement, and session hot switching
-are rejected in exact mode. Restart with a new selection and a new session for
-capability changes. The harness enforces this for plugin runtime actions too,
+are rejected in exact mode. Capability changes require either a new session or
+an [explicit idle same-ID startup transition](resource-transition-rpc.md).
+Ordinary reopen never changes a binding. The harness enforces this for plugin runtime actions too,
 not only for RPC commands. Exact `none` also cannot expand through child-agent
 inheritance. Legacy `set_active_tools([])` still means all **registered** tools
 for execution, and the legacy `get_state.activeTools` / `get_available_tools`
@@ -137,13 +138,16 @@ Conflicting CLI resource controls are rejected: `--system-prompt`,
 unknown extension flags, and explicit/unresolved negative project trust.
 Use trusted `--mode rpc` (and `--approve` when necessary). Standard model,
 session, timeout, and thinking options remain usable. An existing native session
-requires the **same declaration and inventory** on restart. Selected Skills
-(including Package Skills) are discovered, parsed, validated and fingerprinted
-before native extension registration or any repair-capable session writer/name
-write. A saved binding's actual Skill inventory is compared at that read-only
-preflight, and construction uses the same validated Skills without rediscovery.
+requires the **same declaration and inventory** on ordinary restart. Selected
+Skills (including Package Skills) are discovered, parsed, validated and
+fingerprinted before native extension registration or any repair-capable session
+writer/name write. An ordinary reopen or committed transition retry compares the
+actual Skill inventory against its saved binding at that read-only preflight;
+a new transition validates its target Skills without comparing them to the old
+selection. Construction uses the same validated Skills without rediscovery.
 The later complete inventory/tool-schema comparison remains a second check.
-Resource changes require a new session; `/reload` and dev hot apply return an error without
+Resource changes require a new session or the explicit startup transition;
+`/reload` and dev hot apply return an error without
 changing the existing exact selection, even if a caller modifies reload args.
 
 ## Read-only observation and readiness
@@ -174,6 +178,12 @@ Ready includes the normal native RPC capabilities and:
   }
 }
 ```
+
+In exact mode this descriptor also carries authoritative `binding` (`revision`,
+`fingerprint`, `operationId`) and a `transition` capability descriptor; legacy
+ready reports the expected-unbound binding (`revision: 0`, `fingerprint: null`).
+See the [transition integration contract](resource-transition-rpc.md) for the
+bounded startup request and fail-closed idle/retry rules.
 
 In exact mode this descriptor also carries observed `hostId`, `host`, native
 `sessionId`, and declared `selection`; `configureExternalTools` is `unsupported`.
@@ -221,7 +231,8 @@ these; changed selection, added/removed/changed Skill files, changed instruction
 registrations, and reopening an exact session without its config error instead
 of widening. A legacy transcript may be explicitly bound to exact selection;
 subsequent launches must honor it. After binding, resource changes require a new
-session. Before any native extension registration or provider callback, startup
+session or an explicit expected-binding transition (never an implicit reopen).
+Before any native extension registration or provider callback, startup
 preflights the frozen declaration and artifact hashes through **nonrepairing
 metadata/SessionValues facts** from the canonical native parser/reducer. Historical
 assistant frames stay cold on filesystems with stable readers; the returned DTO

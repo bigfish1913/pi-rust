@@ -1,7 +1,7 @@
 // Native lifecycle probes reuse the parent test module's bounded RPC driver.
 use super::*;
 
-fn session_files(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+pub(super) fn session_files(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
     fn walk(path: &Path, files: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>) {
         if path.is_file() {
             // Windows denies reads of the live writer's advisory lock range.
@@ -23,7 +23,7 @@ fn session_files(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
     files
 }
 
-async fn rejected(root: &Path, args: &[&str], expected: &str) {
+pub(super) async fn rejected(root: &Path, args: &[&str], expected: &str) {
     let before = session_files(root);
     let output = tokio::time::timeout(
         Duration::from_secs(25),
@@ -51,7 +51,7 @@ async fn rejected(root: &Path, args: &[&str], expected: &str) {
         String::from_utf8_lossy(&output.stderr)
     );
 }
-fn fixture_model_config(root: &Path) {
+pub(super) fn fixture_model_config(root: &Path) {
     put(root.join("agent/models.json"),json!({"providers":{"fixture":{"api":"openai-completions","apiKey":"fixture-only","baseUrl":"http://127.0.0.1:1","models":[{"id":"test"}]}}}).to_string());
 }
 

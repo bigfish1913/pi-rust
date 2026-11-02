@@ -2,10 +2,14 @@
 //! No external model, installed extensions, or user resources are used.
 #[path = "support/local_resources.rs"]
 mod local_resources;
+#[path = "support/resource_binding_corruption.rs"]
+mod resource_binding_corruption;
 #[path = "support/resource_fixture.rs"]
 mod resource_fixture;
 #[path = "support/resource_lifecycle.rs"]
 mod resource_lifecycle;
+#[path = "support/resource_transition.rs"]
+mod resource_transition;
 use resource_fixture::Fixture;
 use serde_json::{json, Value};
 use sha2::Digest as _;
@@ -64,9 +68,12 @@ struct Host {
 }
 impl Host {
     async fn start(root: &Path, config: &str, id: &str) -> Self {
+        Self::start_with_flag(root, "--resource-config", config, id).await
+    }
+    async fn start_with_flag(root: &Path, flag: &str, config: &str, id: &str) -> Self {
         let error = std::fs::File::create(root.join(format!("{id}.stderr"))).unwrap();
         let mut child = command(root)
-            .args(["--resource-config", config, "--session-id", id])
+            .args([flag, config, "--session-id", id])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(error)

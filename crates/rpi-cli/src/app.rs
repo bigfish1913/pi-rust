@@ -88,6 +88,35 @@ async fn run_inner() -> i32 {
         return EXIT_USAGE;
     }
 
+    // Safe old-host negotiation: callers discover this flag through --help
+    // first. Never fall through to prompts, remote clients, resource commands,
+    // trust, migration, leases, credentials, providers or DLL startup.
+    if argv
+        .iter()
+        .any(|a| a == "--resource-capabilities" || a.starts_with("--resource-capabilities="))
+    {
+        if argv.len() != 1 || argv[0] != "--resource-capabilities" {
+            println!(
+                "{}",
+                serde_json::json!({"version":1,"success":false,"error":"--resource-capabilities must be used alone"})
+            );
+            return EXIT_USAGE;
+        }
+        match serde_json::to_string(&crate::resource_selection::capabilities()) {
+            Ok(profile) if profile.len() < crate::resource_selection::MAX_CAPABILITIES_BYTES => {
+                println!("{profile}");
+                return 0;
+            }
+            _ => {
+                println!(
+                    "{}",
+                    serde_json::json!({"version":1,"success":false,"error":"capability profile exceeds bound"})
+                );
+                return EXIT_RUNTIME;
+            }
+        }
+    }
+
     if argv.first().map(String::as_str) == Some("__rpi_dev_cleanup") {
         return crate::dev_extension::run_cleanup_helper(&argv[1..]);
     }
@@ -192,7 +221,9 @@ async fn run_inner() -> i32 {
         return code;
     }
 
-    if dev_options.is_some() && parsed.resource_config.is_some() {
+    if dev_options.is_some()
+        && (parsed.resource_config.is_some() || parsed.resource_transition.is_some())
+    {
         eprintln!(
             "error: --resource-config is restart-only and cannot be combined with dev/dev-local"
         );

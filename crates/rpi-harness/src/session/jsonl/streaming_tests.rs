@@ -74,11 +74,71 @@ async fn strict_load(
         Arc::new(CounterIdGenerator::new()),
         reader.clone(),
         length,
-        true,
+        ReadPolicy::Restore,
     )
     .await
     .unwrap();
     (storage, reader)
+}
+
+#[tokio::test]
+async fn strict_cold_replay_obeys_scan_budget_and_metadata_never_hydrates_bodies() {
+    let temp = tempfile::tempdir().unwrap();
+    let fs: Arc<dyn FileSystem> = Arc::new(rpi_tools::OsExecutionEnv::with_cwd(
+        temp.path().to_path_buf(),
+    ));
+    let mut bytes = encode_header(&header());
+    for seq in 1..=12 {
+        let parent = (seq > 1).then(|| format!("e{}", seq - 1));
+        bytes.push_str(&encode_mutation(&message(
+            &format!("e{seq}"),
+            seq,
+            parent.as_deref(),
+            &"x".repeat(CHUNK / 3),
+        )));
+    }
+    fs.write_file("strict.jsonl", FileContent::Text(bytes.clone()), None)
+        .await
+        .unwrap();
+    let reader = Arc::new(StrictReader {
+        inner: fs.open_read_file("strict.jsonl").await.unwrap().unwrap(),
+        calls: AtomicUsize::new(0),
+        ranges: std::sync::Mutex::new(Vec::new()),
+    });
+    let storage = JsonlSessionStorage::load_streaming(
+        fs.clone(),
+        "strict.jsonl",
+        Arc::new(FakeClock::new()),
+        Arc::new(CounterIdGenerator::new()),
+        reader.clone(),
+        bytes.len() as u64,
+        ReadPolicy::ResourceTransitionStrict,
+    )
+    .await
+    .unwrap();
+    let calls = reader.calls.load(Ordering::Relaxed);
+    assert_eq!(calls, bytes.len().div_ceil(CHUNK));
+    assert!(reader
+        .ranges
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|(_, count)| *count <= CHUNK));
+    for seq in 1..=12 {
+        assert!(is_cold(&storage.state.lock().await, &format!("e{seq}")));
+    }
+    storage.facts().await.unwrap();
+    storage.branch_overview("main").await.unwrap();
+    storage.get_lanes().await.unwrap();
+    assert_eq!(
+        reader.calls.load(Ordering::Relaxed),
+        calls,
+        "facts and metadata must not read any historical message payload"
+    );
+    assert_eq!(
+        fs.read_text_file("strict.jsonl", None).await.unwrap(),
+        bytes
+    );
 }
 
 #[tokio::test]

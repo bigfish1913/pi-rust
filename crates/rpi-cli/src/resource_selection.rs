@@ -14,6 +14,28 @@ use crate::args::{Args, Mode};
 
 pub const MAX_SELECTION_BYTES: usize = 64 * 1024;
 pub const MAX_STATE_BYTES: usize = 256 * 1024;
+pub(crate) fn transition_capability() -> Value {
+    json!({"version":1, "startupFlag":"--resource-transition", "maxRequestBytes":MAX_SELECTION_BYTES,
+        "maxOperationIdBytes":128,"operationIdPattern":"^[A-Za-z0-9._-]{1,128}$",
+        "request":{"requiredFields":["version","operation_id","expected","target"],
+            "unknownFields":"reject","duplicateFields":"reject",
+            "expected":{"revision":"u64","fingerprint":"lowercase-sha256-or-null","unboundRevision":0},
+            "target":"complete-exact-selection-v1"},
+        "expected":"revision-and-fingerprint", "retry":"same-operation-current-binding", "legacyTarget":false})
+}
+
+pub(crate) const MAX_CAPABILITIES_BYTES: usize = 16 * 1024;
+/// Pure static profile; no environment, filesystem, provider or native loader.
+pub(crate) fn capabilities() -> Value {
+    json!({"version":1,"type":"resource_capabilities","maxResponseBytes":MAX_CAPABILITIES_BYTES,
+        "host":{"name":crate::APP_NAME,"version":crate::VERSION},
+        "exactSelection":{"versions":[1],"startupFlag":"--resource-config","mode":"rpc",
+            "maxConfigBytes":MAX_SELECTION_BYTES,"maxSnapshotBytes":MAX_STATE_BYTES,
+            "stateCommand":"get_resource_state","toolModes":["default","only","none"],
+            "packageScopes":["project","global"],"ordinaryReopen":"immutable","hotApply":false},
+        "management":crate::resource_management::capabilities(),
+        "transition":transition_capability(),"loadedFacts":false})
+}
 const SESSION_KEY: &str = "rpi.resource-selection.v1";
 
 /// Only public generic append APIs are restricted. Native SessionValueWriter
@@ -87,6 +109,7 @@ pub struct ResolvedSelection {
     pub skills: Vec<PathBuf>,
     pub extensions: Vec<PathBuf>,
     pub instructions: Vec<(PathBuf, String, String)>,
+    pub transition: Option<ResourceTransition>,
     validated_skills: Option<ValidatedSkills>,
 }
 
@@ -94,6 +117,47 @@ pub struct ResolvedSelection {
 pub(crate) struct ValidatedSkills {
     pub skills: Vec<rpi_harness::types::Skill>,
     inventory: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceTransition {
+    pub version: u32,
+    pub operation_id: String,
+    pub expected: ExpectedBinding,
+    pub target: ResourceSelection,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectedBinding {
+    pub revision: u64,
+    pub fingerprint: Option<String>,
+}
+
+impl ResourceTransition {
+    fn validate(&self) -> Result<(), String> {
+        if self.version != 1
+            || self.operation_id.is_empty()
+            || self.operation_id.len() > 128
+            || !self
+                .operation_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+            || (self.expected.revision == 0) != self.expected.fingerprint.is_none()
+            || self.expected.fingerprint.as_ref().is_some_and(|f| {
+                f.len() != 64
+                    || !f
+                        .bytes()
+                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            })
+        {
+            return Err(
+                "invalid resource transition version, operation ID or expected binding".into(),
+            );
+        }
+        Ok(())
+    }
 }
 
 fn contained(path: &Path, root: &Path) -> Result<PathBuf, String> {
@@ -183,10 +247,20 @@ fn relative(path: &Path) -> Result<(), String> {
 
 impl ResolvedSelection {
     pub fn load(args: &Args, cwd: &Path, trusted: bool) -> Result<Option<Self>, String> {
-        let Some(config) = &args.resource_config else {
+        let Some(config) = args
+            .resource_transition
+            .as_ref()
+            .or(args.resource_config.as_ref())
+        else {
             return Ok(None);
         };
-        if args.mode != Mode::Rpc
+        if (args.resource_config.is_some() && args.resource_transition.is_some())
+            || (args.resource_transition.is_some()
+                && (args.name.is_some()
+                    || args.fork.is_some()
+                    || args.no_session
+                    || !args.messages.is_empty()))
+            || args.mode != Mode::Rpc
             || args.dev_local_only
             || args.project_only
             || args.trust_override == Some(false)
@@ -210,8 +284,19 @@ impl ResolvedSelection {
             return Err("--resource-config requires trusted --mode rpc and conflicts with resource/tool/prompt/discovery/dev flags and unknown extension flags".into());
         }
         let bytes = read_limited(&cwd.join(config))?;
-        let selection: ResourceSelection =
-            serde_json::from_slice(&bytes).map_err(|e| format!("invalid resource config: {e}"))?;
+        let transition: Option<ResourceTransition> = if args.resource_transition.is_some() {
+            let request: ResourceTransition = serde_json::from_slice(&bytes)
+                .map_err(|e| format!("invalid resource transition: {e}"))?;
+            request.validate()?;
+            Some(request)
+        } else {
+            None
+        };
+        let selection: ResourceSelection = if let Some(request) = &transition {
+            request.target.clone()
+        } else {
+            serde_json::from_slice(&bytes).map_err(|e| format!("invalid resource config: {e}"))?
+        };
         if selection.version != 1 {
             return Err("unsupported resource config version".into());
         }
@@ -312,6 +397,7 @@ impl ResolvedSelection {
             skills,
             extensions,
             instructions,
+            transition,
             validated_skills: None,
         }))
     }
@@ -431,6 +517,14 @@ pub async fn get_resource_state(harness: &AgentHarness) -> Result<Value, String>
         .as_array()
         .is_some_and(|names| names.iter().any(|n| n == "read"));
     state["sessionId"] = json!(metadata.id);
+    let values = rpi_harness::session::SessionValues::load(harness.session())
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Some(binding) = values.get(SESSION_KEY) {
+        validate_persisted_binding(binding)?;
+    }
+    state["binding"] = binding_state(&values);
+    state["transition"] = transition_capability();
     state["registeredTools"] = json!(registered);
     state["modelEffectiveTools"] = active;
     state["loadedSkills"] = json!(resources.skills.unwrap_or_default().iter().map(|s| json!({
@@ -468,6 +562,21 @@ pub(crate) fn validate_session_binding(
     values: &rpi_harness::session::SessionValues,
     selected: Option<&ResolvedSelection>,
 ) -> Result<(), String> {
+    if let Some(binding) = values.get(SESSION_KEY) {
+        validate_persisted_binding(binding)?;
+    }
+    if let Some(request) = selected.and_then(|s| s.transition.as_ref()) {
+        validate_transition(values, request)?;
+        // A committed retry must still verify its original artifact inventory.
+        if values
+            .get(SESSION_KEY)
+            .and_then(|v| v.get("operationId"))
+            .and_then(Value::as_str)
+            != Some(request.operation_id.as_str())
+        {
+            return Ok(());
+        }
+    }
     match (values.get(SESSION_KEY), selected) {
         (Some(old), Some(selected)) if old.get("declaration") == Some(&declaration(selected)) => {
             // Code identity is checked before dlopen/registration, not just after
@@ -485,6 +594,184 @@ pub(crate) fn validate_session_binding(
         (Some(_), _) => Err("session resource selection differs or is missing; restart with the same declared selection or use a new session".into()),
         (None, _) => Ok(()),
     }
+}
+
+/// Fingerprint only native binding facts, not caller operation metadata.
+fn binding_fingerprint(binding: &Value) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&json!({
+                "declaration": binding["declaration"], "inventory": binding["inventory"]
+            }))
+            .expect("JSON binding")
+        )
+    )
+}
+
+fn valid_digest(value: &Value) -> bool {
+    value.as_str().is_some_and(|s| {
+        s.len() == 64
+            && s.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+/// Missing old-v1 fields are compatible; present malformed facts are never defaults.
+fn validate_persisted_binding(binding: &Value) -> Result<u64, String> {
+    let invalid = || "invalid persisted resource binding metadata".to_string();
+    let object = binding.as_object().ok_or_else(invalid)?;
+    if !object.get("declaration").is_some_and(Value::is_object)
+        || !object.get("inventory").is_some_and(Value::is_object)
+        || serde_json::to_vec(binding).map_err(|_| invalid())?.len() > MAX_STATE_BYTES
+    {
+        return Err(invalid());
+    }
+    let revision = match object.get("revision") {
+        None if !object.contains_key("operationId") && !object.contains_key("operations") => 1,
+        Some(value) => value.as_u64().filter(|r| *r > 0).ok_or_else(invalid)?,
+        None => return Err(invalid()),
+    };
+    let operations = match object.get("operations") {
+        Some(value) => Some(value.as_object().ok_or_else(invalid)?),
+        None => None,
+    };
+    let current = match object.get("operationId") {
+        Some(value) => Some(value.as_str().ok_or_else(invalid)?),
+        None => None,
+    };
+    let mut revisions = std::collections::HashSet::new();
+    if let Some(operations) = operations {
+        for (id, operation) in operations {
+            if id.is_empty()
+                || id.len() > 128
+                || !id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+            {
+                return Err(invalid());
+            }
+            let op = operation.as_object().ok_or_else(invalid)?;
+            if op.len() != 4
+                || !valid_digest(&operation["target"])
+                || !valid_digest(&operation["fingerprint"])
+            {
+                return Err(invalid());
+            }
+            let expected: ExpectedBinding =
+                serde_json::from_value(operation["expected"].clone()).map_err(|_| invalid())?;
+            if (expected.revision == 0) != expected.fingerprint.is_none()
+                || expected
+                    .fingerprint
+                    .as_ref()
+                    .is_some_and(|f| !valid_digest(&json!(f)))
+            {
+                return Err(invalid());
+            }
+            let result = operation["revision"].as_u64().ok_or_else(invalid)?;
+            if expected.revision.checked_add(1) != Some(result)
+                || result > revision
+                || !revisions.insert(result)
+            {
+                return Err(invalid());
+            }
+            if current == Some(id.as_str()) {
+                let target = format!(
+                    "{:x}",
+                    Sha256::digest(
+                        serde_json::to_vec(&binding["declaration"]["selection"])
+                            .map_err(|_| invalid())?
+                    )
+                );
+                if result != revision
+                    || operation["fingerprint"] != binding_fingerprint(binding)
+                    || operation["target"] != target
+                {
+                    return Err(invalid());
+                }
+            } else if result == revision {
+                return Err(invalid());
+            }
+            // Ledger entries are never pruned. Validate every retained predecessor
+            // association, not only the operation being retried.
+            if let Some(previous) = operations
+                .values()
+                .find(|p| p["revision"].as_u64() == Some(expected.revision))
+            {
+                if previous["fingerprint"] != json!(expected.fingerprint) {
+                    return Err(invalid());
+                }
+            }
+        }
+    }
+    if let Some(operations) = operations {
+        if !operations.is_empty() {
+            let first = *revisions.iter().min().ok_or_else(invalid)?;
+            if first > 2
+                || revision.checked_sub(first).and_then(|n| n.checked_add(1))
+                    != Some(operations.len() as u64)
+            {
+                return Err(invalid());
+            }
+        }
+    }
+    match current {
+        Some(id) if !operations.is_some_and(|ops| ops.contains_key(id)) => return Err(invalid()),
+        None if operations.is_some_and(|ops| !ops.is_empty()) || revision != 1 => {
+            return Err(invalid())
+        }
+        _ => {}
+    }
+    Ok(revision)
+}
+
+pub(crate) fn binding_state(values: &rpi_harness::session::SessionValues) -> Value {
+    match values.get(SESSION_KEY) {
+        Some(binding) => match validate_persisted_binding(binding) {
+            Ok(revision) => json!({"revision": revision,
+                "fingerprint": binding_fingerprint(binding), "operationId": binding.get("operationId")}),
+            Err(error) => json!({"error": error}),
+        },
+        None => json!({"revision": 0, "fingerprint": null, "operationId": null}),
+    }
+}
+
+fn target_fingerprint(request: &ResourceTransition) -> String {
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&request.target).expect("typed target"))
+    )
+}
+
+fn validate_transition(
+    values: &rpi_harness::session::SessionValues,
+    request: &ResourceTransition,
+) -> Result<(), String> {
+    let old = values.get(SESSION_KEY);
+    if let Some(binding) = old {
+        validate_persisted_binding(binding)?;
+    }
+    let actual = binding_state(values);
+    if let Some(operation) = old
+        .and_then(|v| v.get("operations"))
+        .and_then(|v| v.get(&request.operation_id))
+    {
+        if operation["target"] != target_fingerprint(request)
+            || operation["expected"] != json!(request.expected)
+            || actual["operationId"] != request.operation_id
+            || operation["revision"] != actual["revision"]
+            || operation["fingerprint"] != actual["fingerprint"]
+        {
+            return Err("resource transition operation conflict or superseded retry".into());
+        }
+        return Ok(());
+    }
+    if actual["revision"] != request.expected.revision
+        || actual["fingerprint"] != json!(request.expected.fingerprint)
+    {
+        return Err("stale resource transition expected binding".into());
+    }
+    Ok(())
 }
 
 /// Reopening observes the same files/registrations, not merely the same JSON.
@@ -520,7 +807,14 @@ pub(crate) async fn bind_inventory(
     let values = SessionValues::load(session)
         .await
         .map_err(|e| e.to_string())?;
-    if let Some(old) = values.get(SESSION_KEY) {
+    validate_session_binding(&values, Some(selected))?;
+    let old = values.get(SESSION_KEY);
+    let retry = selected.transition.as_ref().is_some_and(|r| {
+        old.and_then(|v| v.get("operationId"))
+            .and_then(Value::as_str)
+            == Some(r.operation_id.as_str())
+    });
+    if let Some(old) = old.filter(|_| selected.transition.is_none() || retry) {
         if old.get("inventory") != Some(&inventory)
             || old.get("declaration") != Some(&declaration(selected))
         {
@@ -530,12 +824,32 @@ pub(crate) async fn bind_inventory(
             );
         }
     } else {
-        // One native append binds declaration and observed inventory together.
+        // One native append commits the full binding and operation association.
+        let revision = binding_state(&values)["revision"]
+            .as_u64()
+            .unwrap()
+            .checked_add(1)
+            .ok_or("resource binding revision overflow")?;
+        let mut binding = json!({"declaration": declaration(selected), "inventory": inventory, "revision": revision});
+        if let Some(request) = &selected.transition {
+            let mut operations = old
+                .and_then(|v| v.get("operations"))
+                .cloned()
+                .unwrap_or(json!({}));
+            operations[&request.operation_id] = json!({"target": target_fingerprint(request), "expected": request.expected,
+                "revision": revision, "fingerprint": binding_fingerprint(&binding)});
+            binding["operations"] = operations;
+            binding["operationId"] = json!(request.operation_id);
+        }
+        if serde_json::to_vec(&binding)
+            .map_err(|e| e.to_string())?
+            .len()
+            > MAX_STATE_BYTES
+        {
+            return Err("resource binding/operation ledger exceeds 256 KiB".into());
+        }
         SessionValueWriter::new(session.clone())
-            .set(
-                SESSION_KEY,
-                json!({"declaration": declaration(selected), "inventory": inventory}),
-            )
+            .set(SESSION_KEY, binding)
             .await
             .map_err(|e| e.to_string())?;
     }
@@ -582,6 +896,186 @@ mod tests {
         assert!(crate::packages::selected_project_package(root, "valid")
             .unwrap_err()
             .contains("exceeds 256 KiB"));
+    }
+
+    #[tokio::test]
+    async fn real_storage_v1_reopen_and_complete_committed_retry_never_double_revision() {
+        use rpi_harness::session::jsonl::{JsonlSessionStorage, JsonlV4Header};
+        use rpi_harness::session::{Session, SessionValueWriter, SessionValues};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("history.jsonl");
+        let fs: std::sync::Arc<dyn rpi_tools::FileSystem> =
+            std::sync::Arc::new(rpi_tools::OsExecutionEnv::with_cwd(temp.path().into()));
+        let clock = std::sync::Arc::new(rpi_harness::session::memory::SystemClock);
+        let ids = std::sync::Arc::new(rpi_harness::session::session::DefaultIdGenerator::new());
+        let storage = JsonlSessionStorage::create(
+            fs.clone(),
+            path.to_str().unwrap(),
+            JsonlV4Header::new(
+                "binding-retry".into(),
+                1,
+                temp.path().to_string_lossy().into(),
+                None,
+                None,
+                None,
+            ),
+            clock.clone(),
+            ids.clone(),
+        )
+        .await
+        .unwrap();
+        let session = Session::new(std::sync::Arc::new(storage), None);
+        let harness = AgentHarness::create(rpi_harness::types::AgentHarnessOptions {
+            session: session.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let message = session
+            .append_message(rpi_agent::message::AgentMessage::User(
+                rpi_ai::types::UserMessage::new("preserved real message", 1),
+            ))
+            .await
+            .unwrap();
+        let mut selected = ResolvedSelection {
+            package: None,
+            selection: serde_json::from_value(json!({"version":1,"tools":{"mode":"none"}}))
+                .unwrap(),
+            skills: vec![],
+            extensions: vec![],
+            instructions: vec![],
+            transition: None,
+            validated_skills: None,
+        };
+        let env: std::sync::Arc<dyn rpi_tools::ExecutionEnv> =
+            std::sync::Arc::new(rpi_tools::OsExecutionEnv::with_cwd(temp.path().into()));
+        selected.validate_skills(&env).await.unwrap();
+        bind_inventory(&harness, &selected).await.unwrap();
+        // Construct a real old-v1 fixture through native storage, not transcript
+        // rewriting. Ordinary exact reopen must not migrate its binding fields.
+        let mut old = SessionValues::load(&session)
+            .await
+            .unwrap()
+            .get(SESSION_KEY)
+            .unwrap()
+            .clone();
+        old.as_object_mut().unwrap().remove("revision");
+        let original = old.clone();
+        for (field, value) in [
+            ("revision", json!("corrupt")),
+            ("revision", json!(null)),
+            ("revision", json!(0)),
+            ("operations", json!([])),
+            ("operations", json!(1)),
+            ("operationId", json!(7)),
+            ("operations", json!({"bad":null})),
+            (
+                "operations",
+                json!({"bad":{"target":"bad","expected":{"revision":0,"fingerprint":null},"revision":1,"fingerprint":"bad"}}),
+            ),
+        ] {
+            let mut damaged = original.clone();
+            damaged[field] = value;
+            SessionValueWriter::new(session.clone())
+                .set(SESSION_KEY, damaged)
+                .await
+                .unwrap();
+            let before = std::fs::read(&path).unwrap();
+            assert!(bind_session(&session, Some(&selected))
+                .await
+                .unwrap_err()
+                .contains("invalid persisted"));
+            assert!(bind_inventory(&harness, &selected).await.is_err());
+            let facts = SessionValues::load(&session).await.unwrap();
+            assert!(binding_state(&facts).get("error").is_some());
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+        SessionValueWriter::new(session.clone())
+            .set(SESSION_KEY, original)
+            .await
+            .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        bind_session(&session, Some(&selected)).await.unwrap();
+        bind_inventory(&harness, &selected).await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let base = binding_state(&SessionValues::load(&session).await.unwrap());
+        assert_eq!(base["revision"], 1);
+        selected.selection.tools = ToolSelection::Only { names: vec![] };
+        selected.transition = Some(ResourceTransition {
+            version: 1,
+            operation_id: "committed-with-lost-result".into(),
+            expected: serde_json::from_value(
+                json!({"revision":base["revision"],"fingerprint":base["fingerprint"]}),
+            )
+            .unwrap(),
+            target: selected.selection.clone(),
+        });
+        bind_inventory(&harness, &selected).await.unwrap();
+        drop(harness);
+        drop(session);
+        let committed = std::fs::read(&path).unwrap();
+        let storage = JsonlSessionStorage::load_for_resource_transition(
+            fs,
+            path.to_str().unwrap(),
+            clock,
+            ids,
+        )
+        .await
+        .unwrap();
+        let session = Session::new(std::sync::Arc::new(storage), None);
+        let harness = AgentHarness::create(rpi_harness::types::AgentHarnessOptions {
+            session: session.clone(),
+            allow_existing_session: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        // This is the same production retry path used when the storage fault
+        // regression leaves a whole new record despite reporting append error.
+        bind_session(&session, Some(&selected)).await.unwrap();
+        bind_inventory(&harness, &selected).await.unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), committed);
+        let state = binding_state(&SessionValues::load(&session).await.unwrap());
+        assert_eq!(state["revision"], 2);
+        assert_eq!(state["operationId"], "committed-with-lost-result");
+        assert!(session.get_entry(&message).await.unwrap().is_some());
+    }
+
+    #[test]
+    fn persisted_operation_associations_are_validated_in_full() {
+        let selected = json!({"version":1,"tools":{"mode":"none"}});
+        let target = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&selected).unwrap())
+        );
+        let mut binding = json!({"declaration":{"selection":selected},"inventory":{},"revision":2,"operationId":"one"});
+        let fingerprint = binding_fingerprint(&binding);
+        binding["operations"] = json!({"one":{"target":target,"expected":{"revision":1,"fingerprint":"a".repeat(64)},"revision":2,"fingerprint":fingerprint}});
+        assert_eq!(validate_persisted_binding(&binding).unwrap(), 2);
+        for (pointer, value) in [
+            ("/operationId", json!("missing")),
+            ("/operations/one/target", json!("b".repeat(64))),
+            ("/operations/one/fingerprint", json!("b".repeat(64))),
+            (
+                "/operations/one/expected",
+                json!({"revision":1,"fingerprint":null}),
+            ),
+            (
+                "/operations/one/expected",
+                json!({"revision":0,"fingerprint":"a".repeat(64)}),
+            ),
+            ("/operations/one/revision", json!(3)),
+            ("/operations/one/expected/revision", json!("1")),
+        ] {
+            let mut damaged = binding.clone();
+            *damaged.pointer_mut(pointer).unwrap() = value;
+            assert!(validate_persisted_binding(&damaged).is_err(), "{pointer}");
+        }
+        let mut damaged = binding.clone();
+        damaged["operations"]["older"] = json!({"target":"c".repeat(64),"expected":{"revision":0,"fingerprint":null},"revision":1,"fingerprint":"d".repeat(64)});
+        assert!(validate_persisted_binding(&damaged).is_err());
+        damaged["operations"]["one"]["expected"]["fingerprint"] = json!("d".repeat(64));
+        assert!(validate_persisted_binding(&damaged).is_ok());
     }
 
     #[tokio::test]

@@ -124,6 +124,19 @@ impl JsonlProgressStore {
     }
 
     async fn load(&self, state: &mut State) -> SessionResult<()> {
+        self.load_with_repair(state, true).await
+    }
+    pub async fn require_idle_without_repair(&self) -> SessionResult<()> {
+        let mut state = self.state.lock().await;
+        self.load_with_repair(&mut state, false).await?;
+        if !state.progress.as_ref().unwrap().frames.is_empty() {
+            return Err(SessionError::invalid_entry(
+                "resource transition rejects pending native progress",
+            ));
+        }
+        Ok(())
+    }
+    async fn load_with_repair(&self, state: &mut State, repair: bool) -> SessionResult<()> {
         if state.poisoned {
             return Err(SessionError::storage(
                 "progress append is uncertain; reopen session",
@@ -171,6 +184,11 @@ impl JsonlProgressStore {
                         && index + 1 == remainder.len()
                         && !line.ends_with('\n') =>
                 {
+                    if !repair {
+                        return Err(SessionError::invalid_entry(
+                            "resource transition rejects torn progress tail",
+                        ));
+                    }
                     file_result(
                         self.fs
                             .truncate_file(&self.path, valid_bytes as u64, None)
@@ -198,6 +216,11 @@ impl JsonlProgressStore {
         // A complete JSON value without its final newline must not be followed
         // by concatenated JSON on the next append. Publish a canonical checkpoint.
         if normalize {
+            if !repair {
+                return Err(SessionError::invalid_entry(
+                    "resource transition rejects incomplete progress newline",
+                ));
+            }
             self.publish(self.checkpoint(&progress)?, state).await?;
         } else {
             state.length = valid_bytes as u64;

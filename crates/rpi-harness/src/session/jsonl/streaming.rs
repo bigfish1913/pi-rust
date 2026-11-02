@@ -114,8 +114,10 @@ impl JsonlSessionStorage {
         ids: Arc<dyn IdGenerator>,
         reader: Arc<dyn ReadFile>,
         length: u64,
-        allow_repair: bool,
+        policy: ReadPolicy,
     ) -> SessionResult<Self> {
+        let allow_repair = policy.repairs();
+        let strict = policy.strict();
         let mut scan = Scanner::new(reader.clone(), length);
         let Some((_, header_raw, _, header_newline)) = scan.next().await? else {
             return Err(invalid_file(path, 1, &"is missing a header"));
@@ -124,6 +126,11 @@ impl JsonlSessionStorage {
             .map_err(|_| SessionError::invalid_entry("invalid session UTF-8"))?;
         if header_line.is_empty() {
             return Err(invalid_file(path, 1, &"is missing a header"));
+        }
+        if strict && !header_newline {
+            return Err(SessionError::invalid_entry(
+                "resource transition requires complete unrecovered history",
+            ));
         }
         let header = parse_header(header_line).map_err(|e| invalid_file(path, 1, &e))?;
         if header.progress_format.is_some()
@@ -150,6 +157,11 @@ impl JsonlSessionStorage {
         while let Some((offset, raw, last, newline)) = scan.next().await? {
             line_no += 1;
             terminated = newline;
+            if strict && !newline {
+                return Err(SessionError::invalid_entry(
+                    "resource transition requires complete unrecovered history",
+                ));
+            }
             let line = std::str::from_utf8(&raw)
                 .map_err(|_| SessionError::invalid_entry("invalid session UTF-8"))?;
             match parse_mutation(line) {
@@ -170,6 +182,11 @@ impl JsonlSessionStorage {
                             false
                         };
                         if duplicate {
+                            if strict {
+                                return Err(SessionError::invalid_entry(
+                                    "resource transition rejects duplicate history sequences",
+                                ));
+                            }
                             repair = true;
                             continue;
                         }
@@ -197,13 +214,14 @@ impl JsonlSessionStorage {
                     spans.push((offset, raw.len() as u64));
                 }
                 Err(error)
-                    if error.kind == JsonlDecodeErrorKind::Schema
+                    if !strict
+                        && error.kind == JsonlDecodeErrorKind::Schema
                         && is_assistant_frame_append(line) =>
                 {
                     tracing::warn!(line = line_no, "skipping undecodable assistant frame");
                     spans.push((offset, raw.len() as u64));
                 }
-                Err(error) if last && error.kind == JsonlDecodeErrorKind::Syntax => {
+                Err(error) if !strict && last && error.kind == JsonlDecodeErrorKind::Syntax => {
                     repair = true;
                     break;
                 }

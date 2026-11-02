@@ -546,6 +546,114 @@ async fn many_large_successful_appends_share_one_reader_and_stay_cold_across_loa
     }
 }
 
+#[tokio::test]
+async fn strict_and_recoverable_policies_match_on_streaming_and_eager_readers() {
+    for mode in [Mode::Stable, Mode::ReadAllOnly, Mode::LegacyRanged] {
+        for damage in [
+            "none",
+            "gap",
+            "duplicate",
+            "conflict",
+            "zero",
+            "torn",
+            "torn-lf",
+            "unterminated",
+            "bad-frame",
+            "schema",
+        ] {
+            let fs = MemoryFs::new(mode);
+            let original = create(fs.clone()).await;
+            original
+                .append_entry(large_message("e1"), "main")
+                .await
+                .unwrap();
+            let path = "/history.jsonl";
+            let mut bytes = fs.read_text_file(path, None).await.unwrap();
+            let row = bytes.lines().last().unwrap().to_owned();
+            match damage {
+                "gap" => bytes.push_str(&encode_mutation(&SessionMutation::FactName {
+                    seq: 4,
+                    name: Some("gap remains compatible".into()),
+                })),
+                "duplicate" => bytes.push_str(&format!("  {row} \n")),
+                "conflict" => bytes.push_str(&encode_mutation(&SessionMutation::FactName {
+                    seq: 1,
+                    name: None,
+                })),
+                "zero" => bytes.push_str(&encode_mutation(&SessionMutation::FactName {
+                    seq: 0,
+                    name: None,
+                })),
+                "torn" => bytes.push_str("{unacknowledged"),
+                "torn-lf" => bytes.push_str("{unacknowledged\n"),
+                "unterminated" => {
+                    bytes.pop();
+                }
+                "bad-frame" => bytes.push_str(
+                    "{\"kind\":\"record\",\"type\":\"assistant_frame\",\"op\":\"append\"}\n",
+                ),
+                "schema" => bytes.push_str("{}\n"),
+                _ => {}
+            }
+            fs.write_file(path, FileContent::Text(bytes.clone()), None)
+                .await
+                .unwrap();
+            let progress = fs
+                .read_text_file("/history.jsonl.progress.jsonl", None)
+                .await
+                .unwrap();
+            for policy in [ReadPolicy::ResourceTransitionStrict, ReadPolicy::ReadOnly] {
+                let result = JsonlSessionStorage::load_impl(
+                    fs.clone(),
+                    path,
+                    Arc::new(FakeClock::new()),
+                    Arc::new(CounterIdGenerator::new()),
+                    policy,
+                )
+                .await;
+                let expected = if policy.strict() {
+                    matches!(damage, "none" | "gap")
+                } else {
+                    !matches!(damage, "conflict" | "zero" | "schema")
+                };
+                assert_eq!(
+                    result.is_ok(),
+                    expected,
+                    "strict={}, damage={damage}",
+                    policy.strict()
+                );
+                if let Ok(storage) = result {
+                    assert!(storage.get_entry("e1").await.unwrap().is_some());
+                    assert!(storage.facts().await.unwrap().values.is_empty());
+                }
+                assert_eq!(fs.read_text_file(path, None).await.unwrap(), bytes);
+                assert_eq!(
+                    fs.read_text_file("/history.jsonl.progress.jsonl", None)
+                        .await
+                        .unwrap(),
+                    progress
+                );
+                assert_eq!(fs.list_dir("/", None).await.unwrap().len(), 2);
+            }
+            if !matches!(damage, "conflict" | "zero" | "schema") {
+                let snapshot = JsonlSessionStorage::read_snapshot(
+                    fs.clone(),
+                    path,
+                    Arc::new(FakeClock::new()),
+                    Arc::new(CounterIdGenerator::new()),
+                )
+                .await
+                .unwrap();
+                // Snapshot materialization owns its bodies, not a lazy source capability.
+                fs.write_file(path, FileContent::Text(String::new()), None)
+                    .await
+                    .unwrap();
+                assert!(snapshot.get_entry("e1").await.unwrap().is_some());
+            }
+        }
+    }
+}
+
 #[test]
 fn rollback_window_never_invents_a_physical_line_boundary() {
     let batch = b"record\nnext\n";

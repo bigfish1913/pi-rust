@@ -134,6 +134,7 @@ pub struct Args {
     /// Maximum silence between streamed response bytes; zero disables it.
     pub stream_idle_timeout: Option<Duration>,
     pub resource_config: Option<PathBuf>,
+    pub resource_transition: Option<PathBuf>,
     pub system_prompt: Option<String>,
     pub append_system_prompt: Vec<String>,
     /// `--theme` — built-in theme name or a theme file path.
@@ -436,6 +437,10 @@ pub fn parse_args(args: &[String]) -> Args {
                 result.resource_config =
                     take_value(&mut result, "--resource-config").map(PathBuf::from)
             }
+            "--resource-transition" => {
+                result.resource_transition =
+                    take_value(&mut result, "--resource-transition").map(PathBuf::from)
+            }
             "--system-prompt" => result.system_prompt = take_value(&mut result, "--system-prompt"),
             "--append-system-prompt" => {
                 if let Some(v) = take_value(&mut result, "--append-system-prompt") {
@@ -588,7 +593,7 @@ pub fn parse_args(args: &[String]) -> Args {
     }
 
     // Exact startup ignores discovery environment, but still rejects explicit CLI dirs.
-    if result.resource_config.is_none() {
+    if result.resource_config.is_none() && result.resource_transition.is_none() {
         env_extension_dirs.append(&mut result.extensions_dir);
         result.extensions_dir = env_extension_dirs;
     }
@@ -659,6 +664,8 @@ pub fn print_help() {
   --base-url <url>               Override the selected model endpoint
   --timeout <seconds>            LLM API request timeout (default: 600)
   --stream-idle-timeout <seconds> Max silence between response bytes (default: 300; 0 disables)
+  --resource-capabilities       Pure bounded JSON resource protocol profile (use alone; no startup)
+  --resource-transition <file>   Explicit same-session resource CAS (RPC only; see docs/resource-transition-rpc.md)
   --resource-config <file>       Exact versioned startup resources (RPC only; see docs/resource-selection-rpc.md)
   --system-prompt <text>         Replace the default system prompt
   --append-system-prompt <text>  Append text to the system prompt (repeatable)
