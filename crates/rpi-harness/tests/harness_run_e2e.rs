@@ -55,6 +55,30 @@ use rpi_tools::{
 // set/remove call, because the harness reads the variable while starting a run.
 static RUN_BUDGET_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+async fn pending_frames(session: &Session) -> Vec<LaneRecord> {
+    let runs = session
+        .find_records(&RecordQuery {
+            record_type: Some("operation_started"),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let mut frames = Vec::new();
+    for run in runs {
+        frames.extend(
+            session
+                .read_progress(run.id())
+                .await
+                .unwrap()
+                .into_iter()
+                // CommitStream binds identity, not content. Crash gates must
+                // wait for actual streamed frames, as on main.
+                .filter(|frame| frame.op == rpi_harness::session::types::AssistantFrameOp::Append)
+                .map(LaneRecord::AssistantFrame),
+        );
+    }
+    frames
+}
 #[path = "harness_run_e2e/native_identity_blockers.rs"]
 mod native_identity_blockers;
 
@@ -1227,24 +1251,8 @@ async fn a_crashed_run_can_be_salvaged_from_its_committed_frames() {
     let session = harness.session().clone();
     let mut committed = 0usize;
     for _ in 0..200 {
-        let records = session
-            .find_records(&RecordQuery {
-                record_type: Some(rpi_harness::frame_progress::ASSISTANT_FRAME_RECORD_TYPE),
-                ..Default::default()
-            })
-            .await
-            .expect("frame records readable");
-        // CommitStream binds identity, but is not streamed content. Wait for
-        // the same three Append frames as before identity binding existed.
-        committed = records
-            .iter()
-            .filter(|record| {
-                matches!(record,
-                    LaneRecord::AssistantFrame(frame)
-                        if frame.op == rpi_harness::session::types::AssistantFrameOp::Append
-                )
-            })
-            .count();
+        let records = pending_frames(&session).await;
+        committed = records.len();
         if committed >= 3 {
             break;
         }
@@ -1301,13 +1309,7 @@ async fn a_crashed_run_can_be_salvaged_from_its_committed_frames() {
     assert!(salvaged.is_empty(), "a different run id salvages nothing");
 
     // Read the run id that actually wrote the frames.
-    let records = session
-        .find_records(&RecordQuery {
-            record_type: Some(rpi_harness::frame_progress::ASSISTANT_FRAME_RECORD_TYPE),
-            ..Default::default()
-        })
-        .await
-        .expect("frame records readable");
+    let records = pending_frames(&session).await;
     let run_id = records
         .iter()
         .filter_map(|record| record.run_id().map(str::to_string))
@@ -1444,24 +1446,8 @@ async fn reopening_a_crashed_session_restores_the_committed_prefix() {
     };
     let session = harness.session().clone();
     for _ in 0..200 {
-        let records = session
-            .find_records(&RecordQuery {
-                record_type: Some(rpi_harness::frame_progress::ASSISTANT_FRAME_RECORD_TYPE),
-                ..Default::default()
-            })
-            .await
-            .expect("frame records readable");
-        if records
-            .iter()
-            .filter(|record| {
-                matches!(record,
-                    LaneRecord::AssistantFrame(frame)
-                        if frame.op == rpi_harness::session::types::AssistantFrameOp::Append
-                )
-            })
-            .count()
-            >= 3
-        {
+        let records = pending_frames(&session).await;
+        if records.len() >= 3 {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -1555,13 +1541,7 @@ async fn recovering_the_same_crashed_session_twice_does_not_duplicate() {
     };
     let session = harness.session().clone();
     for _ in 0..200 {
-        let records = session
-            .find_records(&RecordQuery {
-                record_type: Some(rpi_harness::frame_progress::ASSISTANT_FRAME_RECORD_TYPE),
-                ..Default::default()
-            })
-            .await
-            .expect("frame records readable");
+        let records = pending_frames(&session).await;
         if records.len() >= 3 {
             break;
         }
@@ -1723,24 +1703,28 @@ async fn crashing_during_a_tool_call_leaves_a_valid_transcript() {
     };
     let session = harness.session().clone();
 
-    // Wait until the committed tool call is running.
-    let mut saw_tool_call = false;
+    // The assistant entry precedes the actual execution checkpoint. Wait for
+    // the checkpoint itself: killing between those two writes is a different
+    // (never entered execute) boundary, not this in-flight recovery scenario.
+    let mut saw_tool_start = false;
     for _ in 0..300 {
-        let records = session
-            .find_records(&RecordQuery::default())
+        saw_tool_start = session
+            .find_records(&RecordQuery {
+                record_type: Some("tool_started"),
+                ..Default::default()
+            })
             .await
-            .expect("records readable");
-        saw_tool_call = records
+            .unwrap()
             .iter()
-            .any(|record| matches!(record, LaneRecord::ToolStarted(_)));
-        if saw_tool_call {
+            .any(|record| matches!(record, LaneRecord::ToolStarted(started) if started.tool_name == "slow_tool"));
+        if saw_tool_start {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     assert!(
-        saw_tool_call,
-        "the tool call must be committed before the crash for this test to mean anything"
+        saw_tool_start,
+        "the execution checkpoint must precede the crash"
     );
 
     // Kill the run inside tool execution: no tool result will ever exist.
@@ -2634,6 +2618,7 @@ async fn a_run_that_keeps_dying_is_not_resumed_forever() {
             run_id: "orig-run".to_string(),
             outcome: OperationOutcome::Aborted,
             error: None,
+            result: None,
         }))
         .await
         .expect("close original run");
@@ -2665,6 +2650,7 @@ async fn a_run_that_keeps_dying_is_not_resumed_forever() {
                     run_id: run_id.clone(),
                     outcome: OperationOutcome::Aborted,
                     error: None,
+                    result: None,
                 }))
                 .await
                 .expect("close resume run");
@@ -2720,15 +2706,10 @@ async fn a_crash_mid_stream_is_not_auto_resumed() {
     // Wait for the durable precondition, not just a fixed number of polls:
     // under CI load the provider may not have produced any frame after 2s.
     // Aborting before a frame exists tests an empty run, not stream recovery.
+    // Frames now live in the progress store, not the history record list.
     let started = tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
-            let records = session
-                .find_records(&RecordQuery {
-                    record_type: Some(rpi_harness::frame_progress::ASSISTANT_FRAME_RECORD_TYPE),
-                    ..Default::default()
-                })
-                .await
-                .expect("frame records readable");
+            let records = pending_frames(&session).await;
             if !records.is_empty() {
                 break;
             }
@@ -2876,13 +2857,7 @@ async fn a_completed_run_is_not_resumed() {
 /// process dies.
 async fn wait_until_streaming(session: &rpi_harness::session::Session) {
     for _ in 0..300 {
-        let records = session
-            .find_records(&RecordQuery {
-                record_type: Some(rpi_harness::frame_progress::ASSISTANT_FRAME_RECORD_TYPE),
-                ..Default::default()
-            })
-            .await
-            .expect("frame records readable");
+        let records = pending_frames(session).await;
         if !records.is_empty() {
             return;
         }
@@ -4157,6 +4132,10 @@ async fn a_deferred_response_suspends_and_then_resumes_through_its_tools() {
     assert!(live.iter().any(|event| matches!(event,
         AgentEvent::MessageStart { message: AgentMessage::ToolResult(result), message_id: Some(id) }
             if result.tool_call_id == "polled-call" && id == &started.result_entry_id)));
+    assert_eq!(started.effective_args, serde_json::json!({"path":"b.txt"}));
+    assert!(entries.iter().any(|entry| matches!(entry,
+        rpi_harness::session::types::Entry::Message(entry) if entry.base.id == started.result_entry_id && matches!(&entry.message,
+            AgentMessage::ToolResult(result) if result.tool_call_id == "polled-call"))));
     assert!(
         !polled_result.is_error || !polled_result.content.is_empty(),
         "the tool must actually have run, got {polled_result:?}"
@@ -4535,6 +4514,21 @@ mod native_identity_bind_failure {
     impl SessionStorage for RefuseBindings {
         fn metadata(&self) -> SessionMetadata {
             self.inner.metadata()
+        }
+        async fn append_progress(
+            &self,
+            records: Vec<AssistantFrameRecord>,
+        ) -> SessionResult<Vec<AssistantFrameRecord>> {
+            self.inner.append_progress(records).await
+        }
+        async fn read_progress(&self, run_id: &str) -> SessionResult<Vec<AssistantFrameRecord>> {
+            self.inner.read_progress(run_id).await
+        }
+        async fn prune_completed_progress(&self) -> SessionResult<usize> {
+            self.inner.prune_completed_progress().await
+        }
+        async fn record_page(&self, query: &RecordPageQuery) -> SessionResult<RecordPage> {
+            self.inner.record_page(query).await
         }
         async fn get_lanes(&self) -> SessionResult<Vec<LanePointer>> {
             self.inner.get_lanes().await

@@ -176,6 +176,7 @@ fn operation_finished(seq: u64, id: &str, run_id: &str) -> LaneRecord {
         run_id: run_id.to_string(),
         outcome: OperationOutcome::Completed,
         error: None,
+        result: None,
     })
 }
 

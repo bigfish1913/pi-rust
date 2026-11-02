@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
@@ -131,12 +132,45 @@ impl<'a> ShellExecOptions<'a> {
     }
 }
 
+/// A completed append range bound to the file generation actually written.
+/// The reader remains valid if the journal path is subsequently replaced.
+#[derive(Clone)]
+pub struct AppendReceipt {
+    pub reader: Arc<dyn ReadFile>,
+    pub offset: u64,
+    pub length: usize,
+}
+
 /// An optional, single-owner append capability for a journal.
 #[async_trait]
 pub trait AppendFile: Send + Sync {
     /// Append and finish the write before acknowledging it. This is the same
     /// visibility boundary as `FileSystem::append_file`, not a power-loss fsync.
     async fn append(&mut self, bytes: &[u8]) -> Result<(), FileError>;
+
+    /// Append with an optional stable-generation range. Missing read permission
+    /// or receipt support must not turn a successful append into a failure.
+    async fn append_with_receipt(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<Option<AppendReceipt>, FileError> {
+        self.append(bytes).await?;
+        Ok(None)
+    }
+}
+
+/// Read capability bound to one opened file, even if its path is replaced.
+/// Implementations serialize cursor access and return errors on short ranges.
+#[async_trait]
+pub trait ReadFile: Send + Sync {
+    async fn read_all(&self) -> Result<Vec<u8>, FileError>;
+    async fn read_range(&self, offset: u64, length: usize) -> Result<Vec<u8>, FileError>;
+
+    /// Current byte length of this opened generation, when supported. This is
+    /// not a snapshot: later appends or truncation may change the length.
+    async fn byte_len(&self) -> Result<Option<u64>, FileError> {
+        Ok(None)
+    }
 }
 
 /// Mirrors TS `FileSystem`. All methods async, never panic.
@@ -204,6 +238,15 @@ pub trait FileSystem: Send + Sync {
         &self,
         _path: &str,
     ) -> Result<Option<Box<dyn AppendFile>>, FileError> {
+        Ok(None)
+    }
+
+    /// Optional stable-generation reader. Unsupported backends retain eager
+    /// history loading; an actual open failure must be returned, not hidden.
+    async fn open_read_file(
+        &self,
+        _path: &str,
+    ) -> Result<Option<std::sync::Arc<dyn ReadFile>>, FileError> {
         Ok(None)
     }
 
@@ -352,4 +395,62 @@ pub fn check_cancel_exec(cancel: Option<&CancellationToken>) -> Result<(), Execu
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    // Deliberately implement only the original required methods. These doubles
+    // guard source compatibility as well as dispatch through the trait object.
+    #[derive(Default)]
+    struct LegacyAppender(Vec<u8>);
+
+    #[async_trait]
+    impl AppendFile for LegacyAppender {
+        async fn append(&mut self, bytes: &[u8]) -> Result<(), FileError> {
+            self.0.extend_from_slice(bytes);
+            Ok(())
+        }
+    }
+
+    struct LegacyReader;
+
+    #[async_trait]
+    impl ReadFile for LegacyReader {
+        async fn read_all(&self) -> Result<Vec<u8>, FileError> {
+            Ok(b"legacy".to_vec())
+        }
+
+        async fn read_range(&self, _offset: u64, _length: usize) -> Result<Vec<u8>, FileError> {
+            Err(FileError::new(FileErrorCode::NotSupported, "legacy reader"))
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_capabilities_keep_their_default_behavior() {
+        let mut writer = LegacyAppender::default();
+        let appender: &mut dyn AppendFile = &mut writer;
+        assert!(appender
+            .append_with_receipt(b"frame\n")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(writer.0, b"frame\n");
+        let reader: Arc<dyn ReadFile> = Arc::new(LegacyReader);
+        assert_eq!(reader.byte_len().await.unwrap(), None);
+        assert_eq!(reader.read_all().await.unwrap(), b"legacy");
+    }
+
+    #[tokio::test]
+    async fn default_receipt_method_preserves_append_errors() {
+        struct FailingAppender;
+        #[async_trait]
+        impl AppendFile for FailingAppender {
+            async fn append(&mut self, _bytes: &[u8]) -> Result<(), FileError> {
+                Err(FileError::new(FileErrorCode::Unknown, "append failed"))
+            }
+        }
+        assert!(FailingAppender.append_with_receipt(b"frame").await.is_err());
+    }
 }

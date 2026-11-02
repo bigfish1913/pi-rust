@@ -38,8 +38,31 @@ mod writer_failure_ordering {
     // Dropping the sender unblocks the physical writer even if an assertion fails.
     struct ObservedBackend {
         inner: Arc<ExternalTools>,
-        cancelled_at_return: AtomicBool,
-        retired_at_return: AtomicBool,
+        returned: AtomicBool,
+        cancelled_at_completion: AtomicBool,
+        retired_at_completion: AtomicBool,
+    }
+    struct ObserveCompletion<'a> {
+        backend: &'a ObservedBackend,
+        cancel: CancellationToken,
+    }
+    impl Drop for ObserveCompletion<'_> {
+        fn drop(&mut self) {
+            self.backend
+                .cancelled_at_completion
+                .store(self.cancel.is_cancelled(), Ordering::SeqCst);
+            // The external-tool wrapper may drop this backend future as soon
+            // as owned abort completion cancels the root. Observe after the
+            // awaited inner future is retired on BOTH return and cancellation.
+            // All 64 slots must be available; checking on Drop must not hide a
+            // genuinely leaked request in the losing operation future.
+            let slots: Vec<_> = (0..64)
+                .map(|_| self.backend.inner.broker.register())
+                .collect();
+            self.backend
+                .retired_at_completion
+                .store(slots.iter().all(Result::is_ok), Ordering::SeqCst);
+        }
     }
     #[async_trait]
     impl ExternalToolBackend for ObservedBackend {
@@ -49,14 +72,38 @@ mod writer_failure_ordering {
             args: Value,
             cancel: CancellationToken,
         ) -> Result<AgentToolResult, AgentError> {
-            let result = self.inner.execute(name, args, cancel.clone()).await;
-            self.cancelled_at_return
-                .store(cancel.is_cancelled(), Ordering::SeqCst);
-            // All 64 broker slots must be available after the failed operation.
-            let slots: Vec<_> = (0..64).map(|_| self.inner.broker.register()).collect();
-            self.retired_at_return
-                .store(slots.iter().all(Result::is_ok), Ordering::SeqCst);
+            let observation = ObserveCompletion {
+                backend: self,
+                cancel: cancel.clone(),
+            };
+            let result = self.inner.execute(name, args, cancel).await;
+            self.returned.store(true, Ordering::SeqCst);
+            drop(observation);
             result
+        }
+    }
+    // Direct control: keep polling the backend through root cancellation,
+    // unlike create_external_tool's deliberately cancellation-droppable wrapper.
+    struct DirectBackendTool {
+        tool: Arc<dyn AgentTool>,
+        backend: Arc<ObservedBackend>,
+    }
+    #[async_trait]
+    impl AgentTool for DirectBackendTool {
+        fn schema(&self) -> &rpi_ai::types::Tool {
+            self.tool.schema()
+        }
+        fn label(&self) -> &str {
+            "owned backend control"
+        }
+        async fn execute(
+            &self,
+            _: &str,
+            params: Value,
+            signal: CancellationToken,
+            _: Arc<dyn Fn(ToolResultPartial) + Send + Sync>,
+        ) -> Result<AgentToolResult, AgentError> {
+            self.backend.execute(&self.schema().name, params, signal).await
         }
     }
     struct DangerousNative {
@@ -82,7 +129,7 @@ mod writer_failure_ordering {
             Ok(AgentToolResult::text("dangerous native action executed"))
         }
     }
-    async fn case(kind: &str) {
+    async fn case(kind: &str, direct: bool) {
         let script = FauxScript::new();
         script.set_responses(vec![
             FauxStep::factory(|_| {
@@ -120,21 +167,28 @@ mod writer_failure_ordering {
         let inner = ExternalTools::new(writer.clone(), Arc::downgrade(&lane));
         let backend = Arc::new(ObservedBackend {
             inner: inner.clone(),
-            cancelled_at_return: AtomicBool::new(false),
-            retired_at_return: AtomicBool::new(false),
+            returned: AtomicBool::new(false),
+            cancelled_at_completion: AtomicBool::new(false),
+            retired_at_completion: AtomicBool::new(false),
         });
         let native_calls = Arc::new(AtomicUsize::new(0));
+        let external_tool = create_external_tool(
+            ExternalToolDefinition {
+                name: "external_test".into(),
+                description: "test".into(),
+                input_schema: json!({"type":"object"}),
+            },
+            backend.clone(),
+        );
+        let external_tool: Arc<dyn AgentTool> = if direct {
+            Arc::new(DirectBackendTool { tool: external_tool, backend: backend.clone() })
+        } else {
+            external_tool
+        };
         harness
             .set_tools(
                 vec![
-                    HarnessTool::new(create_external_tool(
-                        ExternalToolDefinition {
-                            name: "external_test".into(),
-                            description: "test".into(),
-                            input_schema: json!({"type":"object"}),
-                        },
-                        backend.clone(),
-                    )),
+                    HarnessTool::new(external_tool),
                     HarnessTool::new(Arc::new(DangerousNative {
                         schema: rpi_ai::types::Tool {
                             name: "dangerous_native".into(),
@@ -183,6 +237,13 @@ mod writer_failure_ordering {
             }
         }
         let finished = tokio::time::timeout(Duration::from_secs(3), run).await;
+        // Measure real request retirement BEFORE shutdown's cancel_all can hide
+        // a leak. The run has settled (or the timeout is reported below).
+        let slots: Vec<_> = (0..64).map(|_| inner.broker.register()).collect();
+        let available = slots.iter().filter(|slot| slot.is_ok()).count();
+        drop(slots);
+        let returned = backend.returned.load(Ordering::SeqCst);
+        eprintln!("writer failure kind={kind} direct={direct} backend_returned={returned} broker_slots_after_settlement={available}/64");
         // Release blocked OS IO before making assertions; failure stops queue draining.
         drop(release);
         inner.shutdown();
@@ -197,9 +258,13 @@ mod writer_failure_ordering {
             failure.is_cancelled(),
             "must originate from output, not invalid input"
         );
+        assert_eq!(available, 64, "request leaked after foreground settlement");
+        if direct {
+            assert!(returned, "owned direct control must return through the backend");
+        }
         assert!(
-            backend.retired_at_return.load(Ordering::SeqCst),
-            "pending request leaked"
+            backend.retired_at_completion.load(Ordering::SeqCst),
+            "pending request leaked at backend return/drop"
         );
         assert_eq!(
             native_calls.load(Ordering::SeqCst),
@@ -212,8 +277,8 @@ mod writer_failure_ordering {
             "provider continued after writer failure"
         );
         assert!(
-            backend.cancelled_at_return.load(Ordering::SeqCst),
-            "root must be cancelled before backend returns (tool signal is a child)"
+            backend.cancelled_at_completion.load(Ordering::SeqCst),
+            "root must be cancelled before backend returns or is dropped (tool signal is a child)"
         );
         let end = ends.lock().unwrap().last().unwrap().clone();
         assert_eq!(end.outcome, RunEndOutcome::Aborted);
@@ -226,14 +291,20 @@ mod writer_failure_ordering {
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn writer_failure_enqueue_cancels_root_before_backend_return() {
-        case("enqueue").await;
+        case("enqueue", false).await;
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn writer_failure_physical_cancels_root_before_backend_return() {
-        case("physical").await;
+        case("physical", false).await;
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn writer_failure_closure_cancels_root_before_backend_return() {
-        case("closure").await;
+        case("closure", false).await;
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn writer_failure_owned_backend_controls_cancel_root_before_return() {
+        for kind in ["enqueue", "physical", "closure"] {
+            case(kind, true).await;
+        }
     }
 }

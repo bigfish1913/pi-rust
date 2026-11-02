@@ -293,16 +293,49 @@ impl JsonlSessionRepo {
         Ok(snapshot)
     }
 
+    /// Inspect only native metadata/values, keeping historical frames cold and
+    /// never repairing or exporting a disk-backed storage capability.
+    pub async fn read_facts_by_jsonl_metadata(
+        &self,
+        metadata: &JsonlSessionMetadata,
+    ) -> SessionResult<super::storage::JsonlSessionFacts> {
+        let facts = JsonlSessionStorage::read_facts(
+            self.fs.clone(),
+            &metadata.path,
+            self.clock.clone(),
+            self.ids.clone(),
+        )
+        .await?;
+        if facts.metadata.id != metadata.id {
+            return Err(SessionError::invalid_entry(format!(
+                "Session id does not match header: {}",
+                metadata.id
+            )));
+        }
+        Ok(facts)
+    }
+
     /// Delete a session by its rich JSONL metadata (direct-path remove).
     /// Mirrors TS `delete(metadata: JsonlSessionMetadata)`.
     pub async fn delete_by_jsonl_metadata(
         &self,
         metadata: &JsonlSessionMetadata,
     ) -> SessionResult<()> {
+        // Remove the session first: a failed primary deletion must not erase
+        // recovery payloads from a session which still exists.
         file_result(
             self.fs.remove(&metadata.path, false, true, None).await,
             &format!("Failed to delete session {}", metadata.path),
-        )
+        )?;
+        for suffix in [".progress.jsonl", ".progress.jsonl.tmp"] {
+            file_result(
+                self.fs
+                    .remove(&format!("{}{suffix}", metadata.path), false, true, None)
+                    .await,
+                "delete session progress",
+            )?;
+        }
+        Ok(())
     }
 
     /// Fork a session. Mirrors TS
@@ -565,7 +598,11 @@ async fn list_jsonl_session_metadata(
         )?;
         let files: Vec<_> = entries
             .iter()
-            .filter(|entry| entry.kind != FileKind::Directory && entry.name.ends_with(".jsonl"))
+            .filter(|entry| {
+                entry.kind != FileKind::Directory
+                    && entry.name.ends_with(".jsonl")
+                    && !entry.name.ends_with(".progress.jsonl")
+            })
             .collect();
         for file in files {
             let lines = file_result(

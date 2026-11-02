@@ -103,6 +103,7 @@ impl Clock for FakeClock {
 /// Mutable inner state shared across clones of an [`InMemorySessionStorage`].
 struct Inner {
     state: Mutex<SessionState>,
+    progress: Mutex<super::progress::ProgressState>,
     clock: Arc<dyn Clock>,
     /// Reserved for future auto-id generation (callers currently supply entry/
     /// record ids). Kept so the constructor signature matches the JSONL repo's
@@ -147,6 +148,7 @@ impl InMemorySessionStorage {
             metadata,
             inner: Arc::new(Inner {
                 state: Mutex::new(SessionState::new()),
+                progress: Mutex::new(Default::default()),
                 clock,
                 ids,
             }),
@@ -174,10 +176,69 @@ impl InMemorySessionStorage {
             metadata,
             inner: Arc::new(Inner {
                 state: Mutex::new(state),
+                progress: Mutex::new(Default::default()),
                 clock,
                 ids,
             }),
         }
+    }
+
+    fn append_entry_checked(
+        &self,
+        entry: ProvisionedEntry,
+        lane: &str,
+        expected: Option<u64>,
+    ) -> SessionResult<Entry> {
+        self.inner.with_state(|state| {
+            if let Some(expected) = expected {
+                state.check_revision(expected)?;
+            }
+            let parent_id = state.require_lane(lane)?;
+            state.validate_unused_id(&entry.id)?;
+            let seq = state.next_sequence();
+            let timestamp = self.inner.clock.now_ms();
+            let full = provisioned_into_entry(entry, seq, parent_id, timestamp);
+            match state.apply_mutation(SessionMutation::Entry {
+                seq,
+                timestamp,
+                lane: Some(lane.to_string()),
+                entry: full,
+            })? {
+                ApplyOutcome::Entry(stamped) => Ok(stamped),
+                _ => Err(SessionError::storage("append_entry did not persist")),
+            }
+        })
+    }
+
+    fn append_record_checked(
+        &self,
+        record: LaneRecord,
+        expected: Option<u64>,
+    ) -> SessionResult<LaneRecord> {
+        let lane = record.lane().to_string();
+        let is_operation_started = matches!(record, LaneRecord::OperationStarted(_));
+        self.inner.with_state(|state| {
+            if let Some(expected) = expected {
+                state.check_revision(expected)?;
+            }
+            state.require_lane(&lane)?;
+            state.validate_unused_id(record.id())?;
+            if is_operation_started {
+                if let Some(current) = state.find_open_operations(&lane, Some(1))?.first() {
+                    return Err(SessionError::storage(format!(
+                        "Lane {} already has an open operation {}",
+                        lane, current.base.id
+                    )));
+                }
+            }
+            let seq = state.next_sequence();
+            let timestamp = self.inner.clock.now_ms();
+            let stamped = stamp_record(record, seq, lane, timestamp);
+            match state.apply_mutation(SessionMutation::Record { record: stamped })? {
+                ApplyOutcome::Record(stamped) => Ok(stamped),
+                _ => Err(SessionError::storage("append_record did not persist")),
+            }
+        })
     }
 
     /// Fork from a source storage — mirrors TS `fork`. Applies the source
@@ -205,6 +266,39 @@ impl InMemorySessionStorage {
 
 #[async_trait]
 impl SessionStorage for InMemorySessionStorage {
+    async fn prune_completed_progress(&self) -> SessionResult<usize> {
+        let completed = self
+            .inner
+            .with_state(|state| Ok(state.completed_progress_runs()))?;
+        Ok(self
+            .inner
+            .progress
+            .lock()
+            .unwrap()
+            .prune_completed(&completed))
+    }
+
+    async fn append_progress(
+        &self,
+        records: Vec<super::types::AssistantFrameRecord>,
+    ) -> SessionResult<Vec<super::types::AssistantFrameRecord>> {
+        self.inner.with_state(|state| {
+            for record in &records {
+                state.require_lane(&record.base.lane)?;
+            }
+            Ok(())
+        })?;
+        let mut progress = self.inner.progress.lock().unwrap();
+        let records = progress.prepare(records, || self.inner.clock.now_ms())?;
+        progress.apply(&records);
+        Ok(records)
+    }
+    async fn read_progress(
+        &self,
+        run_id: &str,
+    ) -> SessionResult<Vec<super::types::AssistantFrameRecord>> {
+        Ok(self.inner.progress.lock().unwrap().read(run_id))
+    }
     fn metadata(&self) -> SessionMetadata {
         self.metadata.clone()
     }
@@ -245,51 +339,58 @@ impl SessionStorage for InMemorySessionStorage {
         })
     }
 
-    async fn append_entry(&self, entry: ProvisionedEntry, lane: &str) -> SessionResult<Entry> {
+    async fn append_queue_cancellations(
+        &self,
+        records: Vec<LaneRecord>,
+    ) -> SessionResult<Vec<LaneRecord>> {
         self.inner.with_state(|state| {
-            let parent_id = state.require_lane(lane)?;
-            state.validate_unused_id(&entry.id)?;
-            let seq = state.next_sequence();
-            let timestamp = self.inner.clock.now_ms();
-            let full = provisioned_into_entry(entry, seq, parent_id.clone(), timestamp);
-            match state.apply_mutation(SessionMutation::Entry {
-                seq,
-                timestamp,
-                lane: Some(lane.to_string()),
-                entry: full,
-            })? {
-                ApplyOutcome::Entry(stamped) => Ok(stamped),
-                _ => Err(SessionError::storage("append_entry did not persist")),
+            state.validate_queue_cancellations(&records)?;
+            let mut committed = Vec::with_capacity(records.len());
+            for record in records {
+                let lane = record.lane().to_owned();
+                let record = stamp_record(
+                    record,
+                    state.next_sequence(),
+                    lane,
+                    self.inner.clock.now_ms(),
+                );
+                if let ApplyOutcome::Record(record) =
+                    state.apply_mutation(SessionMutation::Record { record })?
+                {
+                    committed.push(record);
+                }
             }
+            Ok(committed)
         })
     }
 
+    async fn history_revision(&self) -> SessionResult<u64> {
+        Ok(self.inner.read_state(SessionState::sequence))
+    }
+
+    async fn append_entry_if_revision(
+        &self,
+        entry: ProvisionedEntry,
+        lane: &str,
+        expected: u64,
+    ) -> SessionResult<Entry> {
+        self.append_entry_checked(entry, lane, Some(expected))
+    }
+
+    async fn append_record_if_revision(
+        &self,
+        record: LaneRecord,
+        expected: u64,
+    ) -> SessionResult<LaneRecord> {
+        self.append_record_checked(record, Some(expected))
+    }
+
+    async fn append_entry(&self, entry: ProvisionedEntry, lane: &str) -> SessionResult<Entry> {
+        self.append_entry_checked(entry, lane, None)
+    }
+
     async fn append_record(&self, record: LaneRecord) -> SessionResult<LaneRecord> {
-        let lane = record.lane().to_string();
-        let is_operation_started = matches!(record, LaneRecord::OperationStarted(_));
-        self.inner.with_state(|state| {
-            state.require_lane(&lane)?;
-            state.validate_unused_id(record.id())?;
-            // At-most-one open op per lane (storage-level precondition, mirrors
-            // TS `InMemorySessionStorage.appendRecord`). The reducer still
-            // flags two-open as corruption for recovery slices.
-            if is_operation_started {
-                let open = state.find_open_operations(&lane, Some(1))?;
-                if let Some(current) = open.first() {
-                    return Err(SessionError::storage(format!(
-                        "Lane {} already has an open operation {}",
-                        lane, current.base.id
-                    )));
-                }
-            }
-            let seq = state.next_sequence();
-            let timestamp = self.inner.clock.now_ms();
-            let stamped = stamp_record(record, seq, lane.clone(), timestamp);
-            match state.apply_mutation(SessionMutation::Record { record: stamped })? {
-                ApplyOutcome::Record(stamped) => Ok(stamped),
-                _ => Err(SessionError::storage("append_record did not persist")),
-            }
-        })
+        self.append_record_checked(record, None)
     }
 
     async fn message_summaries(
@@ -337,6 +438,13 @@ impl SessionStorage for InMemorySessionStorage {
 
     async fn find_records(&self, query: &RecordQuery) -> SessionResult<Vec<LaneRecord>> {
         self.inner.read_state(|state| state.find_records(query))
+    }
+
+    async fn record_page(
+        &self,
+        query: &crate::session::types::RecordPageQuery,
+    ) -> SessionResult<crate::session::types::RecordPage> {
+        self.inner.read_state(|state| state.record_page(query))
     }
 
     async fn find_open_operations(

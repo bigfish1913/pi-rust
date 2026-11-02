@@ -22,6 +22,12 @@ use crate::registry::RegistrySnapshot;
 #[cfg(test)]
 mod lifetime_tests;
 
+#[cfg(test)]
+thread_local! {
+    static TRANSLATED_EVENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FREED_EVENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Map a native [`AgentEvent`] to its pi `on()` [`EventTag`], or `None` if the
 /// host event has no stable-event counterpart. This is the **fold** described
 /// in the crate docs: the ten stable lifecycle variants map onto matching tags;
@@ -47,8 +53,8 @@ pub fn event_tag_for(event: &AgentEvent) -> Option<EventTag> {
 }
 
 /// Serialize an [`AgentMessage`](rpi_agent::message::AgentMessage) to an owning
-/// `StbString` for a message-payload event. The host produced this string, so
-/// the **handler** (plugin side) frees it via the host's `free_string`.
+/// `StbString` for a message-payload event. Handlers borrow its bytes;
+/// the dispatcher's cleanup guard frees it after fan-out.
 fn message_to_stb(message: &rpi_agent::message::AgentMessage) -> StbString {
     // AgentMessage is Serialize (#[serde(tag="kind")]); use serde_json round-trip.
     let text = serde_json::to_string(message).unwrap_or_else(|_| "null".to_string());
@@ -87,10 +93,6 @@ fn turn_end_payload(message: &rpi_agent::message::AgentMessage, tool_results: us
     .to_string()
 }
 
-/// Build the stable event for an `AgentEvent`, or `None` if the event carries
-/// no payload that maps onto a stable variant (always maps today, but kept as
-/// `Option` for forward-compat with unmapped future variants). Ownership of any
-/// `StbString` in the returned event passes to the handler.
 /// Translate one agent event into **every** stable event it must produce.
 ///
 /// Almost every event is one-to-one, but `turn_end` is not: existing subscribers
@@ -98,7 +100,9 @@ fn turn_end_payload(message: &rpi_agent::message::AgentMessage, tool_results: us
 /// the payload needs a different tag so a host that predates the payload can
 /// never be made to read uninitialized union storage. Emitting both keeps
 /// legacy handlers working while the payload stays behind the new tag.
-pub fn translate_all(event: &AgentEvent) -> Vec<StablePluginEvent> {
+/// Production dispatch additionally filters each subscription before allocating.
+#[cfg(test)]
+fn translate_all(event: &AgentEvent) -> Vec<StablePluginEvent> {
     match event {
         AgentEvent::TurnEnd { .. } => {
             let mut out = vec![StablePluginEvent::empty(EventTag::TurnEnd)];
@@ -111,7 +115,12 @@ pub fn translate_all(event: &AgentEvent) -> Vec<StablePluginEvent> {
     }
 }
 
+/// Build the stable event for an `AgentEvent`, or `None` if the event carries
+/// no payload that maps onto a stable variant. The caller owns the returned
+/// strings; dispatch borrows them to callbacks and frees them exactly once.
 pub fn translate(event: &AgentEvent) -> Option<StablePluginEvent> {
+    #[cfg(test)]
+    TRANSLATED_EVENTS.with(|count| count.set(count.get() + 1));
     let tag = event_tag_for(event)?;
     match event {
         AgentEvent::MessageStart { message, .. } | AgentEvent::MessageEnd { message, .. } => {
@@ -342,27 +351,6 @@ fn agent_tool_result_to_json(result: &rpi_agent::types::AgentToolResult) -> Stri
     txt
 }
 
-/// Free every `StbString` owned by a dispatched [[`StablePluginEvent`]] via the
-/// host's `free_string`. Called after dispatch completes (the handler SHOULD
-/// have freed them, but the host keeps ownership-of-cleanup so a buggy plugin
-/// that retains/leaks can't double-free the host's allocation — the host never
-/// trusts the plugin to free, per the SDK's "receiver owns" contract: here the
-/// host is the producer → receiver is the plugin; if the plugin failed to free,
-/// the host's free is a leak fix, not a double-free, because `StbString` is
-/// `Copy` and the host's `host_free_string` reconstructs the `Box<[u8]>` and
-/// drops it — a second free of the same bytes would be UB, so this must run
-/// EXACTLY ONCE per event. The contract is: the plugin frees what it receives.
-/// To honor that, we do NOT free here; the plugin owns the free. This fn is
-/// therefore a no-op kept for documentation + future audit).
-///
-/// **In practice:** the plugin handler is contractually required to free every
-/// `StbString` it receives via the host `free_string`. The host does not
-/// double-free. If a plugin leaks, that is a plugin bug.
-#[allow(dead_code)]
-fn free_event_strings(_event: &StablePluginEvent) {
-    // intentionally empty — see doc comment.
-}
-
 // ===========================================================================
 // ExtensionEmitter — AgentEmitter impl fanning out to plugin handlers
 // ===========================================================================
@@ -380,17 +368,15 @@ fn free_event_strings(_event: &StablePluginEvent) {
 /// Dispatch is `catch_unwind`-wrapped: a panicking plugin handler is logged and
 /// skipped (abort-on-unwind policy would be too aggressive for event dispatch
 /// where one bad handler shouldn't kill the session; we log + continue, unlike
-/// tool-partial dispatch which aborts because it cannot unwind across FFI from
-/// a blocking thread). The distinction: `emit` runs on the async runtime thread
-/// where `catch_unwind` can recover cleanly; the tool partial cb runs inside
-/// `spawn_blocking` cross-FFI where recovery is unsafe.
+/// tool-partial dispatch which aborts because it cannot unwind across FFI).
+/// Awaited observers run on blocking workers: a synchronous plugin callback may
+/// wait for a host action that needs another tool future in the same batch.
 pub struct ExtensionEmitter {
     snapshot: Arc<RegistrySnapshot>,
     /// Keeps the loaded cdylibs mapped for as long as this emitter (installed
     /// into `AgentHarnessOptions.agent_emitter`) may dispatch to handler fn
     /// pointers that live inside them. Cloned from the load session; the
     /// libraries unload only when every holder (adapter + emitter) drops.
-    #[allow(dead_code)]
     keepalive: Arc<crate::PluginKeepalive>,
 }
 
@@ -408,6 +394,35 @@ impl ExtensionEmitter {
     /// is `catch_unwind`-wrapped; errors (nonzero return) are logged but do not
     /// abort the fan-out (one handler's failure doesn't block the others — mir-
     /// rors pi's per-handler try/catch).
+    fn dispatch_agent(&self, event: &AgentEvent) {
+        if !crate::registry::assert_active(self.snapshot.active_flag()) {
+            return;
+        }
+        let Some(tag) = event_tag_for(event) else {
+            return;
+        };
+        // TurnEnd has two independent subscriptions. Preserve the payload-free
+        // lifecycle event even when nobody subscribes to the new payload tag,
+        // and avoid allocating payload strings for empty/stale registries.
+        if matches!(event, AgentEvent::TurnEnd { .. }) {
+            if !self.snapshot.handlers_for(EventTag::TurnEnd).is_empty() {
+                self.dispatch(&StablePluginEvent::empty(EventTag::TurnEnd));
+            }
+            if self
+                .snapshot
+                .handlers_for(EventTag::TurnEndPayload)
+                .is_empty()
+            {
+                return;
+            }
+        } else if self.snapshot.handlers_for(tag).is_empty() {
+            return;
+        }
+        if let Some(stable) = translate(event) {
+            self.dispatch(&stable);
+        }
+    }
+
     fn dispatch(&self, event: &StablePluginEvent) {
         dispatch_to_handlers(&self.snapshot, event);
     }
@@ -418,15 +433,20 @@ impl ExtensionEmitter {
 /// dispatcher ([`crate::provider_hooks`]). Handlers MUST NOT free the event
 /// strings; the host frees exactly once after the fan-out.
 pub fn dispatch_to_handlers(snapshot: &RegistrySnapshot, event: &StablePluginEvent) {
+    // Install cleanup before every early return, including stale snapshots.
+    struct Cleanup<'a>(&'a StablePluginEvent);
+    impl Drop for Cleanup<'_> {
+        fn drop(&mut self) {
+            free_dispatched_event(self.0);
+        }
+    }
+    let _cleanup = Cleanup(event);
     // Staleness guard: a stale registry (swapped-out session) does nothing.
     if !crate::registry::assert_active(snapshot.active_flag()) {
         return;
     }
     let handlers = snapshot.handlers_for(event.tag);
     if handlers.is_empty() {
-        // No subscribers — and critically, the event's StbStrings are owned
-        // by the host and must still be freed (no handler ran to free them).
-        free_dispatched_event(event);
         return;
     }
     for h in handlers {
@@ -490,8 +510,6 @@ pub fn dispatch_to_handlers(snapshot: &RegistrySnapshot, event: &StablePluginEve
             }
         }
     }
-    // Host frees the event's strings exactly once after the fan-out.
-    free_dispatched_event(event);
 }
 
 /// Build + dispatch a generic `data` event (JSON payload) to the tag's
@@ -907,19 +925,64 @@ pub async fn dispatch_lifecycle_event(
 
 impl AgentEmitter for ExtensionEmitter {
     fn emit(&self, event: AgentEvent) -> BoxFuture<'static, ()> {
-        // Translate + dispatch synchronously (the emitter's emit is awaited by
-        // the loop in event order; dispatch is non-blocking fn-pointer calls).
-        // If the event maps to no tag, do nothing.
-        for stable in translate_all(&event) {
-            self.dispatch(&stable);
+        let subscribed = match event_tag_for(&event) {
+            Some(EventTag::TurnEnd) => {
+                !self.snapshot.handlers_for(EventTag::TurnEnd).is_empty()
+                    || !self
+                        .snapshot
+                        .handlers_for(EventTag::TurnEndPayload)
+                        .is_empty()
+            }
+            Some(tag) => !self.snapshot.handlers_for(tag).is_empty(),
+            None => false,
+        };
+        if !crate::registry::assert_active(self.snapshot.active_flag()) || !subscribed {
+            return Box::pin(async {});
         }
-        Box::pin(async {})
+        let snapshot = Arc::clone(&self.snapshot);
+        let keepalive = Arc::clone(&self.keepalive);
+        Box::pin(async move {
+            // Awaiting preserves event ordering while the parallel batch keeps
+            // polling its owned tool futures. block_in_place inside a callback
+            // only releases a Tokio worker; it cannot poll those sibling futures.
+            // The closure owns its libraries even if its caller is cancelled.
+            let background = rpi_agent::tool_execution_scope::track_background_tool();
+            let result = tokio::task::spawn_blocking(move || {
+                let _background = background;
+                let emitter = ExtensionEmitter {
+                    snapshot,
+                    keepalive,
+                };
+                #[cfg(test)]
+                let before = (
+                    TRANSLATED_EVENTS.with(|count| count.get()),
+                    FREED_EVENTS.with(|count| count.get()),
+                );
+                emitter.dispatch_agent(&event);
+                // Test-only accounting follows the awaited dispatch across the
+                // blocking boundary without making counters global to tests.
+                #[cfg(test)]
+                {
+                    (
+                        TRANSLATED_EVENTS.with(|count| count.get()) - before.0,
+                        FREED_EVENTS.with(|count| count.get()) - before.1,
+                    )
+                }
+            })
+            .await;
+            #[cfg(test)]
+            if let Ok((translated, freed)) = &result {
+                TRANSLATED_EVENTS.with(|count| count.set(count.get() + translated));
+                FREED_EVENTS.with(|count| count.set(count.get() + freed));
+            }
+            if let Err(error) = result {
+                tracing::error!(%error, "extension observer task failed");
+            }
+        })
     }
 
     fn try_emit(&self, event: AgentEvent) {
-        for stable in translate_all(&event) {
-            self.dispatch(&stable);
-        }
+        self.dispatch_agent(&event);
     }
 }
 
@@ -959,9 +1022,8 @@ impl AgentEmitter for TeeEmitter {
     fn emit(&self, event: AgentEvent) -> BoxFuture<'static, ()> {
         // We can't hold `&self` across an await boundary into a 'static future
         // cheaply here without cloning the Arcs — so clone them and drive the
-        // fan-out inside a pinned async block. Each child's emit returns a
-        // no-op future (both BroadcastEmitter and ExtensionEmitter complete
-        // synchronously), so this is effectively a synchronous loop in practice.
+        // fan-out inside a pinned async block. Await each child so asynchronous
+        // extension observers retain the same order as the host broadcast.
         let emitters = self.emitters.clone();
         Box::pin(async move {
             for e in &emitters {
@@ -981,6 +1043,8 @@ impl AgentEmitter for TeeEmitter {
 /// host's `free_string`. Called by [`ExtensionEmitter::dispatch`] after the
 /// fan-out completes. Handlers MUST NOT free event strings (host owns cleanup).
 fn free_dispatched_event(event: &StablePluginEvent) {
+    #[cfg(test)]
+    FREED_EVENTS.with(|count| count.set(count.get() + 1));
     use rpi_plugin_sdk::EventTag as T;
     match event.tag {
         T::MessageStart | T::MessageUpdate | T::MessageEnd => {
@@ -1369,6 +1433,107 @@ mod tests {
     extern "C" fn counting_handler(_ev: StablePluginEvent, _ud: *mut std::ffi::c_void) -> i32 {
         HANDLER_HITS.fetch_add(1, Ordering::SeqCst);
         0
+    }
+
+    struct WaitingObserver {
+        released: Mutex<bool>,
+        ready: std::sync::Condvar,
+        entered: tokio::sync::Notify,
+        completed: std::sync::atomic::AtomicBool,
+    }
+
+    extern "C" fn waiting_observer(_ev: StablePluginEvent, data: *mut std::ffi::c_void) -> i32 {
+        // The test owns this allocation until the awaited callback returns.
+        let state = unsafe { &*data.cast::<WaitingObserver>() };
+        state.entered.notify_one();
+        let (released, _) = state
+            .ready
+            .wait_timeout_while(
+                state.released.lock().unwrap(),
+                std::time::Duration::from_secs(5),
+                |released| !*released,
+            )
+            .unwrap();
+        state.completed.store(*released, Ordering::SeqCst);
+        0
+    }
+
+    #[tokio::test]
+    async fn awaited_observer_allows_sibling_futures_to_progress() {
+        let state = Box::new(WaitingObserver {
+            released: Mutex::new(false),
+            ready: std::sync::Condvar::new(),
+            entered: tokio::sync::Notify::new(),
+            completed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let mut registry = crate::registry::ExtensionRegistry::new();
+        registry.register_event_handler(
+            "waiting-observer".into(),
+            EventTag::ToolExecutionStart,
+            waiting_observer,
+            (&*state as *const WaitingObserver).cast_mut().cast(),
+        );
+        let emitter = ExtensionEmitter::new(
+            Arc::new(registry.snapshot()),
+            crate::loader::PluginKeepalive::empty(),
+        );
+        // Model a plugin waiting for a host action that needs a sibling tool
+        // future owned by this same parent task. A synchronous emit blocks
+        // before join can ever poll that sibling; the finite callback timeout
+        // makes that regression fail instead of hanging the test process.
+        let dispatch = emitter.emit(AgentEvent::ToolExecutionStart {
+            tool_call_id: "call".into(),
+            tool_name: "read".into(),
+            args: serde_json::json!({}),
+        });
+        tokio::join!(dispatch, async {
+            *state.released.lock().unwrap() = true;
+            state.ready.notify_one();
+        });
+        assert!(
+            state.completed.load(Ordering::SeqCst),
+            "observer blocked the sibling future it depended on"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_observer_retains_background_scope_until_callback_finishes() {
+        let state = Box::new(WaitingObserver {
+            released: Mutex::new(false),
+            ready: std::sync::Condvar::new(),
+            entered: tokio::sync::Notify::new(),
+            completed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let mut registry = crate::registry::ExtensionRegistry::new();
+        registry.register_event_handler(
+            "waiting-observer".into(),
+            EventTag::AgentStart,
+            waiting_observer,
+            (&*state as *const WaitingObserver).cast_mut().cast(),
+        );
+        let emitter = ExtensionEmitter::new(
+            Arc::new(registry.snapshot()),
+            crate::loader::PluginKeepalive::empty(),
+        );
+        let scope = Arc::new(rpi_agent::tool_execution_scope::ToolExecutionScope::default());
+        let task_scope = Arc::clone(&scope);
+        let dispatch = emitter.emit(AgentEvent::AgentStart);
+        let task = tokio::spawn(async move { task_scope.run(dispatch).await });
+        state.entered.notified().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let mut idle = Box::pin(scope.wait_idle());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut idle)
+                .await
+                .is_err()
+        );
+        *state.released.lock().unwrap() = true;
+        state.ready.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), idle)
+            .await
+            .unwrap();
+        assert!(state.completed.load(Ordering::SeqCst));
     }
 
     #[test]

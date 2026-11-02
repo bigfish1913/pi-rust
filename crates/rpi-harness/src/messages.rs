@@ -305,9 +305,9 @@ const RECOVERY_TOOL_RESULT: &str = concat!(
 );
 
 /// Repair interrupted or interleaved tool batches in the provider context.
-/// Results are matched only until the next assistant message, so an id reused
-/// in a later turn cannot hide a missing result in this one. The durable history
-/// is unchanged and no tool is executed during this repair.
+/// Results must match both call ID and tool name, and only until the next
+/// assistant message, so a reused ID cannot hide a different invocation. The
+/// durable history is unchanged and no tool is executed during this repair.
 pub fn repair_orphaned_tool_calls(
     messages: Vec<AgentMessage>,
 ) -> (Vec<AgentMessage>, ToolCallRepairReport) {
@@ -328,12 +328,15 @@ fn tool_batches_need_no_repair(messages: &[AgentMessage]) -> bool {
                     return false;
                 }
                 pending.extend(assistant.content.iter().filter_map(|block| match block {
-                    Content::ToolCall(call) => Some(call.id.as_str()),
+                    Content::ToolCall(call) => Some((call.id.as_str(), call.name.as_str())),
                     _ => None,
                 }));
             }
             AgentMessage::ToolResult(result) => {
-                let Some(index) = pending.iter().position(|id| *id == result.tool_call_id) else {
+                let Some(index) = pending
+                    .iter()
+                    .position(|(id, name)| *id == result.tool_call_id && *name == result.tool_name)
+                else {
                     return false;
                 };
                 pending.remove(index);
@@ -381,7 +384,7 @@ fn repair_orphaned_tool_calls_slow(
             if let AgentMessage::ToolResult(result) = &message {
                 if let Some(index) = pending
                     .iter()
-                    .position(|(id, _)| id == &result.tool_call_id)
+                    .position(|(id, name)| id == &result.tool_call_id && name == &result.tool_name)
                 {
                     pending.remove(index);
                     repaired.push(message);

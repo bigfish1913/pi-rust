@@ -57,6 +57,11 @@ mod tests {
         armed: AtomicBool,
         fail_after_write: AtomicBool,
         truncate_fail: AtomicBool,
+        corrupt_prefix: AtomicBool,
+        fail_stage: AtomicBool,
+        rename_mode: std::sync::atomic::AtomicUsize,
+        block_rename: AtomicBool,
+        block_truncate: AtomicBool,
         entered: Notify,
         release: Notify,
     }
@@ -72,6 +77,20 @@ mod tests {
     #[async_trait]
     impl AppendFile for GatedAppend {
         async fn append(&mut self, bytes: &[u8]) -> Result<(), FileError> {
+            if self.gate.corrupt_prefix.swap(false, Ordering::SeqCst) {
+                let mut prior = self.inner.read_binary_file(&self.path, None).await?;
+                prior[0] = b'[';
+                self.inner
+                    .write_file(&self.path, FileContent::Bytes(prior), None)
+                    .await?;
+                self.inner
+                    .append_file(&self.path, FileContent::Bytes(bytes[..7].to_vec()), None)
+                    .await?;
+                return Err(FileError::new(
+                    rpi_tools::FileErrorCode::Unknown,
+                    "foreign prefix plus uncertain append",
+                ));
+            }
             let mode = self.gate.fail_prefix.swap(0, Ordering::SeqCst);
             if mode > 0 {
                 let boundary = bytes.iter().position(|b| *b == b'\n').unwrap() + 1;
@@ -104,6 +123,9 @@ mod tests {
             Ok(())
         }
     }
+    include!("support/progress_fault_cases.rs");
+    include!("support/progress_retirement_faults.rs");
+
     #[async_trait]
     impl FileSystem for GatedFs {
         fn cwd(&self) -> &Path {
@@ -151,6 +173,17 @@ mod tests {
             b: FileContent,
             c: Option<&CancellationToken>,
         ) -> Result<(), FileError> {
+            if self.gate.fail_stage.swap(false, Ordering::SeqCst)
+                && p.ends_with(".progress.jsonl.tmp")
+            {
+                self.inner
+                    .write_file(p, FileContent::Text("partial staging".into()), c)
+                    .await?;
+                return Err(FileError::new(
+                    rpi_tools::FileErrorCode::Unknown,
+                    "controlled checkpoint staging failure",
+                ));
+            }
             self.inner.write_file(p, b, c).await
         }
         async fn append_file(
@@ -173,6 +206,10 @@ mod tests {
                     "controlled truncate failure",
                 ));
             }
+            if self.gate.block_truncate.swap(false, Ordering::SeqCst) {
+                self.gate.entered.notify_one();
+                self.gate.release.notified().await;
+            }
             self.inner.truncate_file(p, n, c).await
         }
         async fn open_append_file(
@@ -191,7 +228,25 @@ mod tests {
             q: &str,
             c: Option<&CancellationToken>,
         ) -> Result<(), FileError> {
-            self.inner.rename_file(p, q, c).await
+            let mode = self.gate.rename_mode.swap(0, Ordering::SeqCst);
+            if self.gate.block_rename.swap(false, Ordering::SeqCst) {
+                self.gate.entered.notify_one();
+                self.gate.release.notified().await;
+            }
+            if mode == 1 {
+                return Err(FileError::new(
+                    rpi_tools::FileErrorCode::Unknown,
+                    "controlled failure before rename",
+                ));
+            }
+            self.inner.rename_file(p, q, c).await?;
+            if mode == 2 {
+                return Err(FileError::new(
+                    rpi_tools::FileErrorCode::Unknown,
+                    "controlled failure after rename",
+                ));
+            }
+            Ok(())
         }
         async fn file_info(
             &self,

@@ -34,6 +34,7 @@ mod tests {
             run_id: run.into(),
             outcome: OperationOutcome::Completed,
             error: None,
+            result: None,
         })
     }
     fn frame(id: &str) -> LaneRecord {

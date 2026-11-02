@@ -46,8 +46,7 @@ impl SessionValues {
                 entry_type: Some("custom"),
                 custom_type: Some(VALUE_CUSTOM_TYPE.to_string()),
                 order: Some(EntryOrder::OldestFirst),
-                limit: None,
-                cursor: None,
+                ..Default::default()
             })
             .await?;
         Ok(Self::from_entries(&entries))

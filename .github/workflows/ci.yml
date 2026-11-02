@@ -144,6 +144,11 @@ jobs:
     env:
       RUSTFLAGS: "-D warnings"
       RUSTDOCFLAGS: "-D warnings"
+      # Large workspace test binaries can exhaust the hosted runner disk.
+      # Keep assertions and warning checks; only omit symbols/incremental state.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
       # Cargo caches target/, including old diagnostics. Keep smoke output outside
       # that cache and unique per attempt without weakening overwrite protection.
       SESSION_SMOKE_DIAGNOSTICS_NAME: session-smoke-${{ github.run_id }}-${{ github.run_attempt }}
@@ -161,6 +166,8 @@ jobs:
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          key: test-no-debuginfo
 
       - name: Verify embedded docs are in sync
         run: |
@@ -236,10 +243,59 @@ jobs:
       - name: Check DLL shutdown and tool ownership
         run: cargo test -p rpi-extensions --lib --features rpi-ai/providers --locked
 
+  resources:
+    name: Offline resource regression
+    if: >-
+      ${{ !(github.event_name == 'pull_request' &&
+      github.repository == 'bigfish1913/pi-rust' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.head.ref, 'release-plz-') &&
+      github.event.pull_request.draft == true) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RUSTFLAGS: "-D warnings"
+      RESOURCE_DIAGNOSTICS_NAME: resource-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+      RPI_RESOURCE_SMOKE_BINARY: target/resource-tests-cargo/release/rpi
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: resources-release
+          workspaces: . -> target/resource-tests-cargo
+      - name: Build release resource fixtures
+        run: |
+          cargo build -p rpi-cli --bin rpi --release --locked --target-dir target/resource-tests-cargo
+          cargo build -p rpi-tui --example editor_resource_probe --release --locked --target-dir target/resource-tests-cargo
+      - name: Test resource controller and editor invariants
+        run: |
+          python3 -B scripts/test_resource_smoke.py
+          cargo test -p rpi-tui --lib --example editor_resource_probe --release --locked --target-dir target/resource-tests-cargo
+      - name: Test offline memory CPU and round conclusions
+        run: >-
+          python3 -B scripts/resource-smoke.py
+          --rpi target/resource-tests-cargo/release/rpi
+          --editor-probe target/resource-tests-cargo/release/examples/editor_resource_probe
+          --diagnostics-dir "$RUNNER_TEMP/$RESOURCE_DIAGNOSTICS_NAME"
+          --rounds 5 --profile release
+      - name: Upload failed resource diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: resource-smoke-diagnostics
+          path: ${{ runner.temp }}/${{ env.RESOURCE_DIAGNOSTICS_NAME }}
+          if-no-files-found: ignore
+          include-hidden-files: true
+
   release:
     name: Release automation
     if: github.repository == 'bigfish1913/pi-rust' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-    needs: [msrv, check, test, windows-installer]
+    needs: [msrv, check, test, resources, windows-installer]
     permissions:
       contents: write
       pull-requests: read
@@ -251,7 +307,7 @@ jobs:
   preview-version:
     name: Prepare preview release
     if: github.repository == 'bigfish1913/pi-rust' && github.ref == 'refs/heads/preview' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-    needs: [msrv, check, test, windows-installer]
+    needs: [msrv, check, test, resources, windows-installer]
     runs-on: ubuntu-latest
     permissions:
       contents: write

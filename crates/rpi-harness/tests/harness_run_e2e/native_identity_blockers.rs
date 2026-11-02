@@ -36,7 +36,10 @@ struct GateEmitter {
 impl AgentEmitter for GateEmitter {
     fn emit(&self, event: AgentEvent) -> BoxFuture<'static, ()> {
         let block = if self.at_tool {
-            matches!(&event, AgentEvent::ToolExecutionStart { .. })
+            // Start precedes preparation; the execute barrier journals only
+            // approved effective args. End is after that ACK, before the result
+            // MessageStart/commit, so it gates the recovery identity window.
+            matches!(&event, AgentEvent::ToolExecutionEnd { .. })
         } else {
             matches!(
                 &event,
@@ -240,18 +243,19 @@ async fn crash_stream(volatile: bool, injected: bool) {
     })
     .await
     .expect("identified generated events must actually record frames");
-    let frames = session.find_records(&RecordQuery::default()).await.unwrap();
+    let frames = session.read_progress(&run_id).await.unwrap();
     if !volatile {
         assert!(
-            frames.iter().any(|record| matches!(record,
-            LaneRecord::AssistantFrame(frame) if frame.run_id == run_id && frame.stream_index == 0
-                && frame.op == AssistantFrameOp::Append)),
+            frames.iter().any(|frame| frame.run_id == run_id
+                && frame.stream_index == 0
+                && frame.op == AssistantFrameOp::Append),
             "queue assistants must not shift generated stream ordinal"
         );
     } else {
-        assert!(!frames
-            .iter()
-            .any(|record| matches!(record, LaneRecord::AssistantFrame(_))));
+        assert!(
+            frames.is_empty(),
+            "volatile payloads do not enter durable progress"
+        );
     }
     run.abort();
     assert!(run.await.unwrap_err().is_cancelled());
@@ -375,7 +379,7 @@ async fn native_deferred_resume_tool_started_result_id_survives_recovery() {
             tokio::spawn(async move { harness.resume(&deferred.id).await })
         };
         loop {
-            if matches!(next_event(&mut rx).await, AgentEvent::ToolExecutionStart { tool_call_id, .. } if tool_call_id == "polled-slot")
+            if matches!(next_event(&mut rx).await, AgentEvent::ToolExecutionEnd { tool_call_id, .. } if tool_call_id == "polled-slot")
             {
                 break;
             }
@@ -668,17 +672,38 @@ async fn native_rejected_tool_calls_keep_error_result_ids_without_fake_tool_star
         HarnessToolExecution::Parallel,
         HarnessToolExecution::Sequential,
     ] {
-        for (id, name, arguments, starts) in [
-            ("bad-name", "", serde_json::json!({}), false),
-            ("blank-name", "  ", serde_json::json!({}), false),
-            ("", "read", serde_json::json!({"path":"a.txt"}), false),
-            ("  ", "read", serde_json::json!({"path":"a.txt"}), false),
-            ("bad-args", "read", serde_json::json!({"path":7}), true),
+        for (id, name, arguments, starts, executes) in [
+            ("bad-name", "", serde_json::json!({}), false, false),
+            ("blank-name", "  ", serde_json::json!({}), false, false),
+            (
+                "",
+                "read",
+                serde_json::json!({"path":"a.txt"}),
+                false,
+                false,
+            ),
+            (
+                "  ",
+                "read",
+                serde_json::json!({"path":"a.txt"}),
+                false,
+                false,
+            ),
+            // Native argument coercion turns 7 into "7": execute is entered,
+            // then the absent file fails. Journal its effective args, not 7.
+            (
+                "bad-args",
+                "read",
+                serde_json::json!({"path":7}),
+                true,
+                true,
+            ),
             (
                 "string-args",
                 "read",
                 serde_json::json!("not an object"),
                 true,
+                false,
             ),
         ] {
             let (session, fs) = fixture(false).await;
@@ -746,10 +771,14 @@ async fn native_rejected_tool_calls_keep_error_result_ids_without_fake_tool_star
                 .collect::<Vec<_>>();
             assert_eq!(
                 tool_starts.len(),
-                usize::from(starts),
-                "rejection without execution must not invent ToolStarted"
+                usize::from(executes),
+                "only actual execute entry journals intent: id={id:?} mode={mode:?}"
             );
-            if starts {
+            if executes {
+                assert_eq!(
+                    tool_starts[0].effective_args,
+                    serde_json::json!({"path":"7"})
+                );
                 assert_eq!(tool_starts[0].result_entry_id, result_ids[0]);
             }
             validate_native_session(&session).await;

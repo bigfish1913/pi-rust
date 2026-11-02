@@ -415,18 +415,7 @@ fn report_from_cache(cache: &UpdateCache) -> UpdateReport {
                 name: package.name.clone(),
                 current: package.version,
                 latest: latest.clone(),
-                command: if let Some(source) =
-                    package.prebuilt.as_ref().filter(|p| p.custom_repository)
-                {
-                    format!(
-                        "rpi install {} --github {}",
-                        package.name, source.repository
-                    )
-                } else if package.prebuilt.is_some() {
-                    format!("rpi install {}", package.name)
-                } else {
-                    format!("rpi install {} --build", package.name)
-                },
+                command: format!("rpi extension update {}", package.name),
             });
         }
     }
@@ -2607,7 +2596,7 @@ fn write_windows_update_status(path: &Path, state: &str, message: &str) -> Resul
 #[cfg(test)]
 mod tests {
     #[test]
-    fn prebuilt_update_notices_preserve_repository_and_separate_source_caches() {
+    fn extension_update_notices_unify_commands_and_separate_source_caches() {
         let _guard = crate::config::test_support::env_lock()
             .lock()
             .unwrap_or_else(|p| p.into_inner());
@@ -2634,10 +2623,7 @@ mod tests {
         let report = super::report_from_cache(&cache);
         assert_eq!(report.notices.len(), 1);
         assert_eq!(report.notices[0].latest, "2.0.0");
-        assert_eq!(
-            report.notices[0].command,
-            "rpi install demo --github https://github.com/owner/repo"
-        );
+        assert_eq!(report.notices[0].command, "rpi extension update demo");
         let mut other = record.clone();
         other.prebuilt.as_mut().unwrap().repository = "https://github.com/another/repo".into();
         assert_ne!(
@@ -2665,8 +2651,8 @@ mod tests {
         cargo.source = None;
         cargo.prebuilt = None;
         for (package, command) in [
-            (other, "rpi install demo"),
-            (cargo, "rpi install demo --build"),
+            (other, "rpi extension update demo"),
+            (cargo, "rpi extension update demo"),
         ] {
             cache
                 .native_packages

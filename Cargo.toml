@@ -5,6 +5,7 @@ members = [
     "crates/rpi-ai",
     "crates/rpi-agent",
     "crates/rpi-tools",
+    "crates/rpi-durable",
     "crates/rpi-harness",
     "crates/rpi-cli",
     "crates/rpi-runtime",
@@ -76,6 +77,7 @@ rpi-telemetry = { path = "crates/rpi-telemetry", version = "0.16.0" }
 rpi-ai = { path = "crates/rpi-ai", version = "0.16.0" }
 rpi-agent = { path = "crates/rpi-agent", version = "0.16.0" }
 rpi-tools = { path = "crates/rpi-tools", version = "0.16.0" }
+rpi-durable = { path = "crates/rpi-durable", version = "0.16.0" }
 rpi-harness = { path = "crates/rpi-harness", version = "0.16.0" }
 
 rpi-runtime = { path = "crates/rpi-runtime", version = "0.16.0" }

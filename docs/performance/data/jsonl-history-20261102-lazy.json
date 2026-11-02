@@ -1,0 +1,113 @@
+[
+  {
+    "label": "verified-lazy-jsonl",
+    "fixture": {
+      "phase": "generated",
+      "entries": 512,
+      "bodyBytes": 8192,
+      "fileBytes": 4285843
+    },
+    "timing": {
+      "phase": "ready",
+      "loadNs": 10422600,
+      "fileBytes": 4285843,
+      "messageCount": 512,
+      "pageEntries": 5,
+      "pid": 42636,
+      "measurementPhase": "timing"
+    },
+    "memory": {
+      "phase": "ready",
+      "loadNs": 10205800,
+      "fileBytes": 4285843,
+      "messageCount": 512,
+      "pageEntries": 5,
+      "pid": 38924,
+      "readyRssBytes": 8404992,
+      "peakRssBytes": 10207232,
+      "readyPrivateBytes": 2031616,
+      "method": "Windows GetProcessMemoryInfo after ready; native peak counter",
+      "quiescent": {
+        "readyRssBytes": 8404992,
+        "peakRssBytes": 10207232,
+        "readyPrivateBytes": 2031616,
+        "method": "Windows GetProcessMemoryInfo after ready; native peak counter"
+      },
+      "measurementPhase": "memory"
+    }
+  },
+  {
+    "label": "verified-lazy-jsonl",
+    "fixture": {
+      "phase": "generated",
+      "entries": 512,
+      "bodyBytes": 131072,
+      "fileBytes": 67200405
+    },
+    "timing": {
+      "phase": "ready",
+      "loadNs": 183517800,
+      "fileBytes": 67200405,
+      "messageCount": 512,
+      "pageEntries": 5,
+      "pid": 6232,
+      "measurementPhase": "timing"
+    },
+    "memory": {
+      "phase": "ready",
+      "loadNs": 193100300,
+      "fileBytes": 67200405,
+      "messageCount": 512,
+      "pageEntries": 5,
+      "pid": 23480,
+      "readyRssBytes": 8949760,
+      "peakRssBytes": 10342400,
+      "readyPrivateBytes": 2543616,
+      "method": "Windows GetProcessMemoryInfo after ready; native peak counter",
+      "quiescent": {
+        "readyRssBytes": 8949760,
+        "peakRssBytes": 10342400,
+        "readyPrivateBytes": 2543616,
+        "method": "Windows GetProcessMemoryInfo after ready; native peak counter"
+      },
+      "measurementPhase": "memory"
+    }
+  },
+  {
+    "label": "verified-lazy-jsonl",
+    "fixture": {
+      "phase": "generated",
+      "entries": 4096,
+      "bodyBytes": 8192,
+      "fileBytes": 34296796
+    },
+    "timing": {
+      "phase": "ready",
+      "loadNs": 73243300,
+      "fileBytes": 34296796,
+      "messageCount": 4096,
+      "pageEntries": 5,
+      "pid": 41556,
+      "measurementPhase": "timing"
+    },
+    "memory": {
+      "phase": "ready",
+      "loadNs": 70465700,
+      "fileBytes": 34296796,
+      "messageCount": 4096,
+      "pageEntries": 5,
+      "pid": 38828,
+      "readyRssBytes": 12173312,
+      "peakRssBytes": 14368768,
+      "readyPrivateBytes": 5894144,
+      "method": "Windows GetProcessMemoryInfo after ready; native peak counter",
+      "quiescent": {
+        "readyRssBytes": 12173312,
+        "peakRssBytes": 14368768,
+        "readyPrivateBytes": 5894144,
+        "method": "Windows GetProcessMemoryInfo after ready; native peak counter"
+      },
+      "measurementPhase": "memory"
+    }
+  }
+]

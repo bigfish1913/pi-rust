@@ -45,7 +45,7 @@ use futures::future::BoxFuture;
 use rpi_agent::{AgentEmitter, AgentEvent, AgentMessage};
 use rpi_ai::types::{AssistantMessage, StopReason};
 
-use crate::agent_harness::AgentHarness;
+use crate::agent_harness::{AgentHarness, QueueReservation};
 use crate::session::types::{
     ProvisionedEntry, ProvisionedKind, RecordBase, ToolReplay, ToolStartedRecord,
 };
@@ -169,6 +169,15 @@ fn needs_early_commit(message: &AssistantMessage, retrying: bool) -> bool {
             .any(|block| matches!(block, rpi_ai::types::Content::ToolCall(_)))
 }
 
+/// A refused final entry ACK is retryable, but its AgentEnd is not observable
+/// until the ordered run-end persistence pass succeeds. This is explicit state:
+/// message/commit counts do not describe persistence across compaction cuts.
+enum FinalAssistantBarrier {
+    Ready,
+    AwaitingPersistence,
+    Pending(Box<AgentEvent>),
+}
+
 /// What a settle observer needs to know about the run it is watching. Shared
 /// with the run loop, which owns the retry counter.
 pub struct SettleState {
@@ -187,7 +196,8 @@ pub struct SettleState {
     /// message is the recorder's stream n: both are assigned in event order, and
     /// only assistant messages create streams.
     assistant_settled: AtomicUsize,
-    /// Indices already committed, so the run-end pass does not duplicate them.
+    /// Indices already committed. Every commit path checks its predecessors,
+    /// so this is a contiguous prefix of the current attempt's message indices.
     committed: Mutex<BTreeSet<usize>>,
     /// The entry each settled message produced, by loop-message index.
     assistant_entries: Mutex<BTreeMap<usize, String>>,
@@ -211,9 +221,12 @@ pub struct SettleState {
     /// index, so every role can commit at settle or fall back to run-end writes
     /// without changing the durable queue target's id.
     injected: Mutex<VecDeque<String>>,
+    /// Run-local reservations retain uncommitted inputs until their entry ACK.
+    injected_reservations: Mutex<Vec<QueueReservation>>,
     /// A final assistant normally waits for run-end persistence. If a queued
     /// message continues this run, commit that assistant before the injection.
     uncommitted_assistant: Mutex<Option<(usize, usize, AssistantMessage)>>,
+    final_assistant_barrier: Mutex<FinalAssistantBarrier>,
     /// The durable frame writer, installed after the run's emitter is created.
     /// Commit paths flush it before binding an assistant entry.
     frame_recorder: Mutex<Option<Arc<crate::frame_progress::FrameRecordingEmitter>>>,
@@ -245,7 +258,9 @@ impl SettleState {
             pending_calls: Mutex::new(BTreeMap::new()),
             reserved_results: Mutex::new(BTreeMap::new()),
             injected: Mutex::new(VecDeque::new()),
+            injected_reservations: Mutex::new(Vec::new()),
             uncommitted_assistant: Mutex::new(None),
+            final_assistant_barrier: Mutex::new(FinalAssistantBarrier::Ready),
             frame_recorder: Mutex::new(None),
             identity_error: Mutex::new(None),
             diagnostics: SettleDiagnostics::new(),
@@ -273,6 +288,10 @@ impl SettleState {
         Ok(())
     }
 
+    pub(crate) fn hold_injected_reservation(&self, reservation: QueueReservation) {
+        self.injected_reservations.lock().unwrap().push(reservation);
+    }
+
     /// Register a message the run is about to inject, with the entry id its
     /// `queue_enqueued` record reserved for it.
     pub fn push_injected(&self, entry_id: impl Into<String>, _message: AgentMessage) {
@@ -293,6 +312,23 @@ impl SettleState {
         self.injected_indices.lock().unwrap().clear();
         self.retry_result.lock().unwrap().take();
         self.uncommitted_assistant.lock().unwrap().take();
+        *self.final_assistant_barrier.lock().unwrap() = FinalAssistantBarrier::Ready;
+    }
+
+    /// Called only after every new message in this attempt has been persisted.
+    /// Bypass SettlingEmitter: replaying handle would mutate message/stream state.
+    /// The original recorder still forwards the event to the original consumer.
+    pub(crate) async fn release_pending_agent_end(&self, emitter: &dyn AgentEmitter) {
+        if self.identity_error().is_some() {
+            return;
+        }
+        let pending = std::mem::replace(
+            &mut *self.final_assistant_barrier.lock().unwrap(),
+            FinalAssistantBarrier::Ready,
+        );
+        if let FinalAssistantBarrier::Pending(event) = pending {
+            emitter.emit(*event).await;
+        }
     }
 
     pub(crate) fn reserve_retry_result(&self, entry_id: String) {
@@ -322,6 +358,38 @@ impl SettleState {
         self.committed.lock().unwrap().len()
     }
 
+    fn ensure_commit_prefix(&self, index: usize) -> crate::result::HarnessResult<()> {
+        let committed = self.committed_count();
+        if committed < index {
+            return Err(crate::result::HarnessError::io(format!(
+                "cannot commit message {index} before pending message {committed}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The prefix a turn boundary must make durable before continuing. Keep the
+    /// final/retryable assistant deferred as before; earlier messages (including
+    /// every tool result) must be entries before compaction or another request.
+    pub(crate) fn required_prefix_len(&self, messages: &[AgentMessage]) -> usize {
+        match messages.last() {
+            Some(AgentMessage::Assistant(message))
+                if !needs_early_commit(
+                    message,
+                    will_retry(
+                        message,
+                        self.retry_enabled,
+                        self.attempt(),
+                        self.max_retries,
+                    ),
+                ) =>
+            {
+                messages.len() - 1
+            }
+            _ => messages.len(),
+        }
+    }
+
     pub(crate) fn attempt(&self) -> u32 {
         self.attempt.load(Ordering::Acquire)
     }
@@ -341,7 +409,11 @@ impl SettleState {
     /// Flush frame progress before a commit whose binding is written together
     /// with the entry. The binding itself is appended by the caller so it can
     /// share the entry/step durable append.
-    pub(crate) async fn prepare_commit_for_assistant(&self) -> crate::result::HarnessResult<()> {
+    pub(crate) async fn prepare_commit_for_assistant(
+        &self,
+        index: usize,
+    ) -> crate::result::HarnessResult<()> {
+        self.ensure_commit_prefix(index)?;
         self.flush_prepare_commit().await
     }
 
@@ -353,6 +425,7 @@ impl SettleState {
         entry_id: &str,
         harness: &AgentHarness,
     ) -> crate::result::HarnessResult<()> {
+        self.ensure_commit_prefix(index)?;
         self.flush_prepare_commit().await?;
         let stream_index = self.assistant_streams.lock().unwrap().get(&index).copied();
         if let Some(stream_index) = stream_index {
@@ -376,8 +449,60 @@ impl SettleState {
             .insert(index, entry_id.to_string());
     }
 
+    /// Persist actual execution intent after argument preparation/authorization.
+    /// The caller must not enter the underlying tool unless this acknowledges.
+    pub(crate) async fn start_tool(
+        &self,
+        harness: &AgentHarness,
+        tool_call_id: &str,
+        tool_name: &str,
+        args: &serde_json::Value,
+    ) -> crate::result::HarnessResult<()> {
+        let (assistant_entry_id, tool_index) = self
+            .pending_calls
+            .lock()
+            .unwrap()
+            .get(tool_call_id)
+            .cloned()
+            .ok_or_else(|| {
+                crate::result::HarnessError::io(format!(
+                    "cannot execute tool {tool_call_id}: its assistant entry was not committed"
+                ))
+            })?;
+        let result_entry_id = harness.next_entry_id();
+        let record = ToolStartedRecord {
+            base: RecordBase {
+                id: harness.next_entry_id(),
+                seq: 0,
+                lane: harness.lane_name().to_string(),
+                timestamp: 0,
+            },
+            run_id: self.run_id.clone(),
+            assistant_entry_id,
+            tool_index,
+            tool_call_id: tool_call_id.to_string(),
+            tool_name: tool_name.to_string(),
+            effective_args: args.clone(),
+            result_entry_id: result_entry_id.clone(),
+            replay: self
+                .tool_replays
+                .get(tool_name)
+                .copied()
+                .unwrap_or(ToolReplay::Never),
+        };
+        let started = self.diagnostics.start();
+        let result = harness.write_tool_started(record).await;
+        self.diagnostics.record(SettlePhase::ToolStarted, started);
+        result?;
+        self.reserved_results
+            .lock()
+            .unwrap()
+            .insert(tool_call_id.to_string(), result_entry_id);
+        Ok(())
+    }
+
     /// Remember each tool call of a freshly committed assistant message, keyed so
-    /// `tool_execution_start` can record it against the right entry and ordinal.
+    /// the execution barrier can record it against the right entry and ordinal.
     pub(crate) fn record_tool_calls(&self, entry_id: &str, message: &AssistantMessage) {
         let mut pending = self.pending_calls.lock().unwrap();
         // ToolStarted uses the reducer's tool-call-only ordinal, not the
@@ -457,7 +582,7 @@ impl SettlingEmitter {
             },
         };
         let entry_id = entry.id.clone();
-        if let Err(error) = self.state.prepare_commit_for_assistant().await {
+        if let Err(error) = self.state.prepare_commit_for_assistant(index).await {
             self.fail_identity(&error);
             tracing::warn!(%error, "could not bind a settled assistant stream");
             return;
@@ -500,70 +625,6 @@ impl SettlingEmitter {
                 self.fail_identity(&error);
                 tracing::warn!(%error, "could not commit a settled assistant message");
             }
-        }
-    }
-
-    /// Record a tool call that is about to run, and reserve the id its result
-    /// will be committed under.
-    ///
-    /// Fails closed when the call has no committed assistant registration: a
-    /// `tool_started` record must reference an existing assistant entry (the
-    /// reducer rejects a mismatch). Deferred continuations seed these
-    /// registrations from their durable source entry before entering the loop.
-    async fn start_tool(&self, tool_call_id: &str, tool_name: &str, args: &serde_json::Value) {
-        let Some((assistant_entry_id, tool_index)) = self
-            .state
-            .pending_calls
-            .lock()
-            .unwrap()
-            .get(tool_call_id)
-            .cloned()
-        else {
-            self.fail_identity("tool assistant was not committed");
-            tracing::warn!(
-                tool_call_id,
-                "skipping a tool_started record: the assistant message carrying this call was not committed"
-            );
-            return;
-        };
-        let result_entry_id = self.harness.next_entry_id();
-        self.state
-            .reserved_results
-            .lock()
-            .unwrap()
-            .insert(tool_call_id.to_string(), result_entry_id.clone());
-        let replay = self
-            .state
-            .tool_replays
-            .get(tool_name)
-            .copied()
-            .unwrap_or(ToolReplay::Never);
-        let record = ToolStartedRecord {
-            base: RecordBase {
-                id: self.harness.next_entry_id(),
-                seq: 0,
-                // The store re-stamps the lane; it must still name a real one,
-                // since the lane is how the store routes the append.
-                lane: self.harness.lane_name().to_string(),
-                timestamp: 0,
-            },
-            run_id: self.state.run_id.clone(),
-            assistant_entry_id,
-            tool_index,
-            tool_call_id: tool_call_id.to_string(),
-            tool_name: tool_name.to_string(),
-            effective_args: args.clone(),
-            result_entry_id,
-            replay,
-        };
-        let tool_started_started = self.state.diagnostics.start();
-        let tool_started_result = self.harness.write_tool_started(record).await;
-        self.state
-            .diagnostics
-            .record(SettlePhase::ToolStarted, tool_started_started);
-        if let Err(error) = tool_started_result {
-            self.fail_identity(&error);
-            tracing::warn!(%error, tool_call_id, "could not record a tool_started frame");
         }
     }
 
@@ -651,6 +712,19 @@ impl SettlingEmitter {
             self.fail_identity("tool result has no MessageStart reservation");
             return;
         };
+        // Preserve the tool_started identity even if this append fails. Both
+        // context-boundary and run-end fallback writes resolve IDs by message
+        // index, not by tool call ID.
+        self.state
+            .reserved_entries
+            .lock()
+            .unwrap()
+            .insert(index, result_entry_id.clone());
+        if self.state.ensure_commit_prefix(index).is_err() {
+            // A previous result could not be written. Keep source order: the
+            // turn-boundary fallback will persist the whole pending prefix.
+            return;
+        }
         let entry = ProvisionedEntry {
             id: result_entry_id.clone(),
             kind: ProvisionedKind::Message {
@@ -668,7 +742,11 @@ impl SettlingEmitter {
                 self.state.record_commit(index, &result_entry_id);
             }
             Err(error) => {
-                self.fail_identity(&error);
+                // The native reservation still exists. A refused entry ACK is
+                // not lost identity: let the ordered boundary/run-end fallback
+                // retry this same ID before later messages. Persistent failure
+                // propagates there without completing the run or replaying the
+                // tool. Missing reservations above still fail closed.
                 tracing::warn!(%error, "could not commit a settled tool result");
             }
         }
@@ -735,6 +813,10 @@ impl SettlingEmitter {
                         .insert(index, id);
                 }
                 if !injected_start && matches!(message, AgentMessage::Assistant(_)) {
+                    // New native generations must not borrow a prior batch's
+                    // registrations when a provider reuses its call IDs.
+                    self.state.pending_calls.lock().unwrap().clear();
+                    self.state.reserved_results.lock().unwrap().clear();
                     let stream_index = self.state.assistant_settled.load(Ordering::Acquire);
                     self.state
                         .assistant_streams
@@ -810,24 +892,20 @@ impl SettlingEmitter {
                     emitter.settle_tool_result(index, &result).await;
                 }))
             }
-            AgentEvent::ToolExecutionStart {
-                tool_call_id,
-                tool_name,
-                args,
-            } => {
-                let emitter = SettlingEmitter {
-                    inner: Arc::clone(&self.inner),
-                    recorder: Arc::clone(&self.recorder),
-                    state: Arc::clone(&self.state),
-                    harness: self.harness.clone(),
-                    signal: self.signal.clone(),
-                };
-                let tool_call_id = tool_call_id.clone();
-                let tool_name = tool_name.clone();
-                let args = args.clone();
-                Some(Box::pin(async move {
-                    emitter.start_tool(&tool_call_id, &tool_name, &args).await;
-                }))
+            AgentEvent::ToolExecutionStart { tool_call_id, .. } => {
+                // Start is observable before authorization/preparation. Validate
+                // its native owner here, but journal intent only in the execute
+                // barrier, after effective arguments and approval are known.
+                if !self
+                    .state
+                    .pending_calls
+                    .lock()
+                    .unwrap()
+                    .contains_key(tool_call_id)
+                {
+                    self.fail_identity("tool assistant was not committed");
+                }
+                None
             }
             AgentEvent::AgentEnd { .. } => {
                 // The final assistant message of a completed or aborted run is
@@ -908,10 +986,13 @@ impl SettlingEmitter {
                 self.state.record_commit(assistant_index, &assistant_id);
             }
             Err(error) => {
-                // Leave the message for `run_core`'s own persistence pass,
-                // which runs after this emitter returns; the log is then
-                // complete one step later than usual.
-                self.fail_identity(&error);
+                // The native ID is already bound. An entry ACK refusal is not
+                // identity loss: keep the reservation for `run_core`'s ordered
+                // persistence pass to retry. A persistent refusal still returns
+                // an error there without completing the run or clearing frames.
+                // Hold AgentEnd until that whole ordered persistence pass ACKs.
+                *self.state.final_assistant_barrier.lock().unwrap() =
+                    FinalAssistantBarrier::AwaitingPersistence;
                 tracing::warn!(
                     %error,
                     "could not commit the final assistant before AgentEnd"
@@ -984,6 +1065,13 @@ impl SettlingEmitter {
             state
                 .diagnostics
                 .record(SettlePhase::SettleAwait, settle_started);
+            if matches!(&event, AgentEvent::AgentEnd { .. }) {
+                let mut barrier = state.final_assistant_barrier.lock().unwrap();
+                if !matches!(*barrier, FinalAssistantBarrier::Ready) {
+                    *barrier = FinalAssistantBarrier::Pending(Box::new(event));
+                    return;
+                }
+            }
             let inner_started = state.diagnostics.start();
             if injected {
                 inner.emit_injected(event).await;

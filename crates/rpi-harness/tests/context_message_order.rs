@@ -1759,6 +1759,22 @@ mod resume_admission {
 
     #[async_trait::async_trait]
     impl SessionStorage for PausedStorage {
+        async fn prune_completed_progress(&self) -> SessionResult<usize> {
+            self.inner.prune_completed_progress().await
+        }
+
+        async fn append_progress(
+            &self,
+            records: Vec<rpi_harness::session::types::AssistantFrameRecord>,
+        ) -> SessionResult<Vec<rpi_harness::session::types::AssistantFrameRecord>> {
+            self.inner.append_progress(records).await
+        }
+        async fn read_progress(
+            &self,
+            run_id: &str,
+        ) -> SessionResult<Vec<rpi_harness::session::types::AssistantFrameRecord>> {
+            self.inner.read_progress(run_id).await
+        }
         fn metadata(&self) -> SessionMetadata {
             self.inner.metadata()
         }
@@ -1801,6 +1817,12 @@ mod resume_admission {
         }
         async fn find_records(&self, query: &RecordQuery) -> SessionResult<Vec<LaneRecord>> {
             self.inner.find_records(query).await
+        }
+        async fn record_page(
+            &self,
+            query: &rpi_harness::session::types::RecordPageQuery,
+        ) -> SessionResult<rpi_harness::session::types::RecordPage> {
+            self.inner.record_page(query).await
         }
         async fn find_open_operations(
             &self,
@@ -2171,6 +2193,7 @@ async fn restored_legacy_run_bound_queues_can_be_cancelled_after_their_run_finis
                     run_id: "legacy-run".into(),
                     outcome: OperationOutcome::Completed,
                     error: None,
+                    result: None,
                 }))
                 .await
                 .unwrap();
