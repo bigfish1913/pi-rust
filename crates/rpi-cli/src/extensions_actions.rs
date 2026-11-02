@@ -52,6 +52,76 @@ use tokio::runtime::Handle;
 
 use crate::session::{default_session_dir, open_session_by_id_in_dir};
 
+/// Merge built-in / extension / prompt-template commands into the
+/// `ListCommands` payload.
+///
+/// It is one function because it is the single source of truth for the shape:
+///
+/// * Built-in commands live in the TUI's `CommandRegistry`, not the plugin
+///   registry. Reporting only the extension half leaves a remote client without
+///   the most common entries (`/help`, `/model`, …).
+/// * Prompt templates live in **neither**: the TUI merges them into autocomplete
+///   separately (`build_builtin_registry` explicitly says so). They have to be
+///   read from the harness resources, or a remote `/` completion list is
+///   permanently shorter than the terminal's — same host, two command tables.
+/// * Precedence is built-in > extension > prompt, matching the TUI (built-ins
+///   register first and cannot be shadowed; a template sharing a built-in name
+///   is unreachable there too).
+/// * Extension and template names may omit the leading `/`, so normalize.
+///
+/// Built-in **aliases and hidden commands** win dispatch in the TUI without
+/// appearing as suggestions. Reserving them here keeps an extension that
+/// registers the same name from being advertised as `source:"extension"` when
+/// the built-in is what actually runs.
+fn merge_command_list_reserved(
+    builtin: Vec<(String, String)>,
+    extension: Vec<(String, String)>,
+    templates: Vec<(String, String)>,
+    reserved: Vec<String>,
+) -> Vec<serde_json::Value> {
+    // Reserved names must block *later* sources without blocking the built-ins
+    // themselves: a visible built-in canonical name is both the reservation and
+    // a real entry, so seeding `seen` with it would drop every built-in from the
+    // listing. Keep the reservation set separate and consult it only for
+    // non-builtin sources; collisions among the sources still fall to `seen`.
+    let mut reserved_names = std::collections::BTreeSet::new();
+    for name in reserved {
+        let name = if !name.starts_with('/') {
+            format!("/{name}")
+        } else {
+            name
+        };
+        reserved_names.insert(name);
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    for (source, commands) in [
+        ("builtin", builtin),
+        ("extension", extension),
+        ("prompt", templates),
+    ] {
+        for (name, description) in commands {
+            let name = if source != "builtin" && !name.starts_with('/') {
+                format!("/{name}")
+            } else {
+                name
+            };
+            if source != "builtin" && reserved_names.contains(&name) {
+                continue;
+            }
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            out.push(serde_json::json!({
+                "name": name,
+                "description": description,
+                "source": source,
+            }));
+        }
+    }
+    out
+}
+
 /// The `RuntimeActionHost` impl over an `AgentHarness`. Built once per session
 /// in [`crate::session::build`] — constructed **empty** before extension load
 /// (the harness doesn't exist yet), then filled via [`set_harness`](Self::set_harness)
@@ -85,6 +155,14 @@ pub struct HarnessActionHost {
     side_questions: crate::side_questions::SideQuestions,
     #[allow(dead_code)]
     runtime: Handle,
+    /// Loaded extension registry, set once the session's extensions are in.
+    ///
+    /// Needed by `ListCommands`: the plugin ABI had no way to enumerate slash
+    /// commands, so a remote UI could not offer completion. `None` before the
+    /// registry is published (and in tests that never load extensions) — the
+    /// action then answers with an empty list rather than failing, matching
+    /// the "no commands registered" case.
+    registry: std::sync::RwLock<Option<std::sync::Arc<rpi_extensions::RegistrySnapshot>>>,
 }
 
 impl HarnessActionHost {
@@ -114,6 +192,7 @@ impl HarnessActionHost {
                 children: crate::child_agents::ChildAgents::default(),
                 side_questions: crate::side_questions::SideQuestions::default(),
                 runtime,
+                registry: std::sync::RwLock::new(None),
             },
             harness,
         )
@@ -141,6 +220,24 @@ impl HarnessActionHost {
     pub(crate) fn with_session_dir(mut self, session_dir: PathBuf) -> Self {
         self.session_dir = session_dir;
         self
+    }
+
+    /// Publish the loaded extension registry so `ListCommands` can answer.
+    ///
+    /// `None` publishes "no extensions". A reload that ends with zero plugins
+    /// must publish that too: otherwise the previous snapshot stays cached and
+    /// removed extensions keep advertising their commands.
+    pub(crate) fn publish_registry_impl(
+        &self,
+        snapshot: Option<std::sync::Arc<rpi_extensions::RegistrySnapshot>>,
+    ) {
+        if let Ok(mut slot) = self.registry.write() {
+            *slot = snapshot;
+        }
+    }
+
+    fn registry_snapshot(&self) -> Option<std::sync::Arc<rpi_extensions::RegistrySnapshot>> {
+        self.registry.read().ok().and_then(|slot| slot.clone())
     }
 
     /// Fill the harness cell. Call exactly once, immediately after
@@ -464,6 +561,63 @@ impl RuntimeActionHost for HarnessActionHost {
     fn replace_model_catalog(&self, models: Vec<rpi_ai::Model>) {
         self.set_catalog(models);
     }
+    async fn list_commands(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
+        let builtin = crate::interactive_tui::build_builtin_commands_for_abi();
+        let extension: Vec<(String, String)> = self
+            .registry_snapshot()
+            .as_deref()
+            .map(|snapshot| {
+                snapshot
+                    .commands()
+                    .iter()
+                    .map(|c| (c.name.clone(), c.description.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Prompt templates are harness resources, not registry entries — see
+        // `merge_command_list`. A missing/closed harness yields no templates
+        // rather than an error: "none discovered" is a real answer, and `/`
+        // completion must still work for the commands that do exist.
+        let templates: Vec<(String, String)> = match self.harness() {
+            Ok(harness) => match harness.get_resources().await {
+                Ok(resources) => resources
+                    .prompt_templates
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|template| {
+                        (
+                            template.name,
+                            template
+                                .description
+                                .unwrap_or_else(|| "Expand prompt template".to_string()),
+                        )
+                    })
+                    .collect(),
+                Err(_) => Vec::new(),
+            },
+            Err(_) => Vec::new(),
+        };
+        Ok(serde_json::json!({
+            "commands": merge_command_list_reserved(
+                builtin,
+                extension,
+                templates,
+                crate::interactive_tui::builtin_reserved_names(),
+            )
+        }))
+    }
+
+    fn publish_registry(&self, snapshot: std::sync::Arc<rpi_extensions::RegistrySnapshot>) {
+        self.publish_registry_impl(Some(snapshot));
+    }
+
+    fn publish_registry_opt(
+        &self,
+        snapshot: Option<std::sync::Arc<rpi_extensions::RegistrySnapshot>>,
+    ) {
+        self.publish_registry_impl(snapshot);
+    }
+
     async fn abort(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
         // The harness reclaims the queue and cancels the run under one write
         // gate, so there is no `clear_queue()` + `abort()` window in which a
@@ -922,5 +1076,125 @@ mod send_message_tests {
             }),
             serde_json::json!({"status":"queued", "entryId":"reserved", "deliverAs":"nextTurn"})
         );
+    }
+}
+
+#[cfg(test)]
+mod list_commands_tests {
+    use super::merge_command_list_reserved;
+
+    /// Reserving names must not delete the built-ins from the listing.
+    ///
+    /// The reservation set contains every built-in canonical name, so seeding
+    /// the dedupe set with it silently dropped all of them: the real listing
+    /// went from 32 built-ins to 0, leaving only extension entries.
+    #[test]
+    fn reserved_names_do_not_remove_the_builtins_themselves() {
+        let builtin = vec![
+            ("/help".to_string(), "help".to_string()),
+            ("/model".to_string(), "model".to_string()),
+        ];
+        let out = merge_command_list_reserved(
+            builtin,
+            vec![("deploy".into(), "deploy".into())],
+            vec![],
+            // Every built-in name is reserved (as in production), plus an alias
+            // and a hidden command that are not listed.
+            vec![
+                "/help".to_string(),
+                "/model".to_string(),
+                "/q".to_string(),
+                "/context".to_string(),
+            ],
+        );
+        assert_eq!(names(&out), vec!["/help", "/model", "/deploy"]);
+        assert_eq!(out[0]["source"], "builtin");
+        assert_eq!(out[1]["source"], "builtin");
+        assert_eq!(out[2]["source"], "extension");
+    }
+
+    /// A built-in alias or hidden built-in wins TUI dispatch without showing up
+    /// as a suggestion, so an extension registering the same name must not be
+    /// advertised as `source:"extension"`.
+    #[test]
+    fn reserved_builtin_aliases_hide_colliding_extension_entries() {
+        let out = merge_command_list_reserved(
+            vec![("/help".into(), "help".into())],
+            vec![
+                ("q".into(), "quit".into()),
+                ("context".into(), "context".into()),
+                ("deploy".into(), "deploy".into()),
+            ],
+            vec![],
+            vec!["/q".into(), "/context".into()],
+        );
+        // `/q` and `/context` are unreachable, `/deploy` is not a built-in.
+        assert_eq!(names(&out), vec!["/help", "/deploy"]);
+        assert_eq!(out[1]["source"], "extension");
+    }
+
+    fn names(v: &[serde_json::Value]) -> Vec<&str> {
+        v.iter().map(|c| c["name"].as_str().unwrap()).collect()
+    }
+
+    #[test]
+    fn builtin_wins_over_a_same_named_extension_command() {
+        let out = merge_command_list_reserved(
+            vec![("/model".into(), "built-in".into())],
+            vec![("/model".into(), "extension".into())],
+            vec![],
+            Vec::new(),
+        );
+        assert_eq!(names(&out), vec!["/model"]);
+        assert_eq!(out[0]["source"], "builtin");
+        assert_eq!(out[0]["description"], "built-in");
+    }
+
+    #[test]
+    fn extension_and_template_names_get_a_leading_slash() {
+        let out = merge_command_list_reserved(
+            vec![],
+            vec![("deploy".into(), "deploy".into())],
+            vec![("review".into(), "review".into())],
+            Vec::new(),
+        );
+        assert_eq!(names(&out), vec!["/deploy", "/review"]);
+        assert_eq!(out[0]["source"], "extension");
+        assert_eq!(out[1]["source"], "prompt");
+    }
+
+    /// Prompt templates live in neither the built-in registry nor the extension
+    /// registry, so `ListCommands` has to merge them itself — otherwise a remote
+    /// `/` completion list is permanently shorter than the terminal's.
+    #[test]
+    fn prompt_templates_are_listed_with_their_own_source() {
+        let out = merge_command_list_reserved(
+            vec![("/help".into(), "help".into())],
+            vec![],
+            vec![("review".into(), "review a diff".into())],
+            Vec::new(),
+        );
+        assert_eq!(names(&out), vec!["/help", "/review"]);
+        assert_eq!(out[1]["source"], "prompt");
+        assert_eq!(out[1]["description"], "review a diff");
+    }
+
+    /// A template sharing a built-in name is unreachable in the TUI too, so it
+    /// must not be reported twice (or as `prompt`).
+    #[test]
+    fn a_builtin_name_is_not_reported_as_a_template() {
+        let out = merge_command_list_reserved(
+            vec![("/review".into(), "built-in".into())],
+            vec![],
+            vec![("review".into(), "template".into())],
+            Vec::new(),
+        );
+        assert_eq!(names(&out), vec!["/review"]);
+        assert_eq!(out[0]["source"], "builtin");
+    }
+
+    #[test]
+    fn no_commands_is_an_empty_list_not_an_error() {
+        assert!(merge_command_list_reserved(vec![], vec![], vec![], Vec::new()).is_empty());
     }
 }
