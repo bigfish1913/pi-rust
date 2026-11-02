@@ -1,5 +1,5 @@
-//! Build only the real workspace cdylib, never tests. Each test process owns a
-//! fresh isolated target tree (no stale fallback or cross-process DLL locking).
+//! Build only the real workspace cdylib, never tests. Each fixture owns a fresh
+//! DLL copy, avoiding cross-process DLL locking even with a shared Cargo cache.
 use sha2::{Digest, Sha256};
 use std::{
     io::Read,
@@ -59,7 +59,12 @@ impl Fixture {
                 .tempdir()
                 .unwrap()
         };
-        let target = directory.path().join("target");
+        let target = std::env::var_os("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| directory.path().join("target"));
+        let build = std::env::var_os("CARGO_BUILD_BUILD_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| directory.path().join("build"));
         let log_path = directory.path().join("build.log");
         let log = std::fs::File::create(&log_path).unwrap();
         let mut child = tokio::process::Command::new(
@@ -77,7 +82,8 @@ impl Fixture {
             "--target-dir",
         ])
         .arg(&target)
-        .env("CARGO_BUILD_BUILD_DIR", directory.path().join("build"))
+        .env("CARGO_TARGET_DIR", &target)
+        .env("CARGO_BUILD_BUILD_DIR", build)
         .env("CARGO_INCREMENTAL", "0")
         .env("RPI_RESOURCE_FIXTURE_SOURCE_SHA256", &source_digest)
         .env("CARGO_BUILD_JOBS", "2")
@@ -122,9 +128,13 @@ impl Fixture {
             "isolated fixture build did not produce {}: {output}",
             library.display()
         );
+        // A successful source-digest-stamped build is mandatory; never fall
+        // back to an old artifact. Hosts load only the fixture-owned copy.
+        let owned_library = directory.path().join(library.file_name().unwrap());
+        std::fs::copy(&library, &owned_library).unwrap();
         Self {
             _directory: directory,
-            library,
+            library: owned_library,
             source_digest,
         }
     }

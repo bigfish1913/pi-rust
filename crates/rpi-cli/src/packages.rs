@@ -179,10 +179,6 @@ fn link(args: &[String]) -> i32 {
     };
     let root = project_root.join(".rpi/packages").join(&package_name);
     let ext = root.join("extensions");
-    if let Err(e) = std::fs::create_dir_all(&ext) {
-        eprintln!("error: could not create {}: {e}", ext.display());
-        return 1;
-    }
     let file = match artifact.file_name().and_then(|n| n.to_str()) {
         Some(n) => n.to_string(),
         None => {
@@ -191,20 +187,62 @@ fn link(args: &[String]) -> i32 {
         }
     };
     let target = ext.join(&file);
+    let tmp = ext.join(format!(".{file}.tmp"));
+    // Cargo can execute build scripts. Recheck the addressed write paths after
+    // it returns, before creating directories or removing/copying any artifact.
+    if let Err(error) =
+        crate::resource_management::legacy_unowned(&native_root, "package", &package_name).and_then(
+            |_| {
+                crate::resource_management::legacy_unowned_targets(
+                    &native_root,
+                    &[target.clone(), tmp.clone()],
+                )
+            },
+        )
+    {
+        eprintln!("error: {error}");
+        return 1;
+    }
     if target.exists() && !force {
         eprintln!("error: package already exists; use --force");
         return 1;
     }
-    let tmp = ext.join(format!(".{file}.tmp"));
+    if let Err(e) = std::fs::create_dir_all(&ext) {
+        eprintln!("error: could not create {}: {e}", ext.display());
+        return 1;
+    }
+    // Never follow/truncate a pre-existing fixed staging path (including a
+    // hardlink). Only clean up a temporary file this invocation created.
+    let mut staged = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!("error: could not stage package artifact: {error}");
+            return 1;
+        }
+    };
+    let copied = std::fs::File::open(&artifact)
+        .and_then(|mut input| std::io::copy(&mut input, &mut staged))
+        .and_then(|_| staged.sync_all());
+    drop(staged);
+    if let Err(error) = copied {
+        let _ = std::fs::remove_file(&tmp);
+        eprintln!("error: could not stage package artifact: {error}");
+        return 1;
+    }
     if force {
         if let Err(e) = std::fs::remove_file(&target) {
             if e.kind() != std::io::ErrorKind::NotFound {
+                let _ = std::fs::remove_file(&tmp);
                 eprintln!("error: could not replace existing package artifact: {e}");
                 return 1;
             }
         }
     }
-    if let Err(e) = std::fs::copy(&artifact, &tmp).and_then(|_| std::fs::rename(&tmp, &target)) {
+    if let Err(e) = std::fs::rename(&tmp, &target) {
         let _ = std::fs::remove_file(&tmp);
         eprintln!("error: could not activate package: {e}");
         return 1;
@@ -642,7 +680,7 @@ fn is_dynamic(p: &Path) -> bool {
         Some("dll" | "so" | "dylib")
     )
 }
-fn valid_name(s: &str) -> bool {
+pub(crate) fn valid_name(s: &str) -> bool {
     !s.is_empty()
         && s != "."
         && s != ".."

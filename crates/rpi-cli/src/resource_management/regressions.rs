@@ -14,6 +14,55 @@ fn install(kind: Kind, name: &str, source: PathBuf) -> Options {
     }
 }
 #[test]
+fn safe_legacy_registry_names_do_not_relax_managed_or_metadata_validation() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path();
+    let record = |name: &str, artifacts: Value| {
+        json!({
+            "name":name,"version":"1","source":"fixture","cargo_package":"fixture","artifacts":artifacts
+        })
+    };
+    put(
+        &root.join("packages.json"),
+        json!({"packages":[
+            record("_legacy", json!(["helper.dll"])), record(".tools", json!([]))
+        ]})
+        .to_string()
+        .as_bytes(),
+    );
+    assert_eq!(packages(root).unwrap().packages.len(), 2);
+    for name in ["_legacy", ".tools"] {
+        assert!(identifier(name).is_err(), "managed grammar widened");
+        assert!(
+            parse(&["inspect", "package", name, "--scope", "project"].map(str::to_owned)).is_ok()
+        );
+        assert!(
+            parse(&["remove", "package", name, "--scope", "project"].map(str::to_owned)).is_err()
+        );
+    }
+    for records in [
+        vec![record("..", json!([]))],
+        vec![record("../escape", json!([]))],
+        vec![record("trailing.", json!([]))],
+        vec![record("CON", json!([]))],
+        vec![record("_legacy", json!([])), record("_LEGACY", json!([]))],
+        vec![record(".tools", json!(["../outside.dll"]))],
+        vec![record(".tools", json!(["nested/helper.dll"]))],
+        vec![record(".tools", json!(["C:helper.dll"]))],
+        vec![record(".tools", json!(["CON.dll"]))],
+        vec![record(".tools", json!(["helper.dll", "HELPER.dll"]))],
+    ] {
+        let bytes = json!({"packages":records}).to_string();
+        put(&root.join("packages.json"), bytes.as_bytes());
+        assert!(packages(root).is_err(), "unsafe registry accepted: {bytes}");
+        assert_eq!(
+            fs::read(root.join("packages.json")).unwrap(),
+            bytes.as_bytes()
+        );
+    }
+}
+
+#[test]
 fn unknown_package_metadata_is_never_discarded() {
     let d = tempfile::tempdir().unwrap();
     let root = d.path().join("native");
