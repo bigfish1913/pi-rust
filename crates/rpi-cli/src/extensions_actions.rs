@@ -450,11 +450,38 @@ impl RuntimeActionHost for HarnessActionHost {
     ) -> Result<serde_json::Value, String> {
         let text = arg_str(&args, "text")?;
         let lane = self.harness()?.lane("main");
+        // Honor the same scheduling instructions `SendMessage` accepts.
+        //
+        // The action used to call `prompt_text` directly, which ignored
+        // `deliverAs` entirely. Two consequences:
+        //
+        // 1. A message sent while a run is in flight was rejected with
+        //    "lane busy" instead of being queued — and because this action
+        //    blocks for the whole run, callers that fire-and-forget (a bridge,
+        //    a remote UI) never saw the error. The message silently vanished.
+        // 2. `steer` / `followUp` / `nextTurn` were all delivered as "start a
+        //    new prompt", so a client could not express them at all.
+        //
+        // `send_message` with `triggerTurn: Some(true)` keeps the idle behavior
+        // (start a run) while giving an active run the queueing semantics the
+        // delivery mode asks for.
+        let mut options = send_message_options(&args)?;
+        if options.trigger_turn.is_none() {
+            options.trigger_turn = Some(true);
+        }
+        let message = rpi_agent::AgentMessage::User(rpi_ai::types::UserMessage::new(
+            text,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .min(i64::MAX as u128) as i64,
+        ));
         let result = lane
-            .prompt_text(&text, Vec::new())
+            .send_message(message, options)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(run_outcome_json(result.outcome))
+        Ok(send_message_result(result))
     }
 
     async fn append_entry(&self, args: serde_json::Value) -> Result<serde_json::Value, String> {

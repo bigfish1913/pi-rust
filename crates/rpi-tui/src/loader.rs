@@ -19,6 +19,10 @@ pub const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', 
 /// Frame interval for animated indicators. Mirrors upstream's
 /// `DEFAULT_INTERVAL_MS`: one frame per 80 ms, i.e. a full 10-frame cycle every
 /// 800 ms.
+///
+/// Upstream animates with a real `setInterval` timer; here the frame is
+/// *derived from the start timestamp at render time* (see [`Loader::current_char`]),
+/// which lands on the same visible cadence without owning a timer thread.
 pub const SPINNER_FRAME_MS: u64 = 80;
 
 /// Loader indicator options.
@@ -45,7 +49,6 @@ impl Default for LoaderIndicatorOptions {
 /// Loader component.
 pub struct Loader {
     options: LoaderIndicatorOptions,
-    frame: Mutex<usize>,
     start_time: Mutex<Option<Instant>>,
     running: Mutex<bool>,
 }
@@ -55,7 +58,6 @@ impl Loader {
     pub fn new() -> Self {
         Self {
             options: LoaderIndicatorOptions::default(),
-            frame: Mutex::new(0),
             start_time: Mutex::new(None),
             running: Mutex::new(false),
         }
@@ -65,7 +67,6 @@ impl Loader {
     pub fn with_options(options: LoaderIndicatorOptions) -> Self {
         Self {
             options,
-            frame: Mutex::new(0),
             start_time: Mutex::new(None),
             running: Mutex::new(false),
         }
@@ -109,16 +110,24 @@ impl Loader {
             .unwrap_or_default()
     }
 
-    /// Advance to the next frame.
-    pub fn advance(&self) {
-        if let Ok(mut frame) = self.frame.lock() {
-            *frame = (*frame + 1) % self.options.spinner_chars.len();
-        }
+    /// Derive the spinner frame from the elapsed wall-clock time, one frame per
+    /// `SPINNER_FRAME_MS`. Upstream steps the frame in a `setInterval` callback
+    /// at the same cadence; deriving it at render time shows the same rhythm no
+    /// matter how often repaints happen (streamed output used to step it once
+    /// per repaint, spinning at the 16ms render-throttle rate). Unstarted
+    /// loaders hold frame 0, matching upstream's stopped state.
+    ///
+    /// Public so the editor's working indicator (which owns its own start
+    /// timestamp) derives its frame the same way.
+    pub fn frame_at(elapsed: Duration, frame_count: usize) -> usize {
+        let step = elapsed.as_millis() / SPINNER_FRAME_MS as u128;
+        (step % frame_count.max(1) as u128) as usize
     }
 
     /// Get the current spinner character.
     fn current_char(&self) -> char {
-        let frame = *self.frame.lock().unwrap();
+        let elapsed = self.elapsed();
+        let frame = Self::frame_at(elapsed, self.options.spinner_chars.len());
         self.options
             .spinner_chars
             .get(frame)
@@ -174,9 +183,6 @@ impl Component for Loader {
                 spinner, display_text, time_str
             )
         };
-
-        // Advance frame for next render
-        self.advance();
 
         vec![line]
     }
@@ -361,9 +367,6 @@ impl Component for ProgressLoader {
             format!("{} {}", text_display, bar)
         };
 
-        // Advance frame
-        self.loader.advance();
-
         vec![line]
     }
 
@@ -402,6 +405,47 @@ mod tests {
         let lines = loader.render(40);
         assert!(!lines.is_empty());
         assert!(lines[0].contains("Loading"));
+    }
+
+    #[test]
+    fn loader_repaint_storm_cannot_spin_faster_than_the_cadence() {
+        // Streaming used to step the frame once per repaint: every token
+        // scheduled a render and the spinner ran at the 16ms render-throttle
+        // rate instead of upstream's 80ms cadence. Fail-on-old probe: on the
+        // old per-render counter the 20 rapid renders below each moved the
+        // frame, so the glyph visibly changed inside the burst; with the
+        // wall-clock derivation every render in one 80ms window shows the
+        // same frame-0 glyph.
+        let loader = Loader::with_text("Loading...");
+        loader.start();
+        let glyph_of = |line: &str| {
+            let plain = crate::strip_ansi(line);
+            SPINNER_FRAMES
+                .iter()
+                .copied()
+                .find(|c| plain.contains(*c))
+                .expect("rendered loader line must contain a spinner glyph")
+        };
+
+        let first = glyph_of(&loader.render(40)[0]);
+        assert_eq!(first, SPINNER_FRAMES[0], "a fresh loader starts on frame 0");
+
+        // A repaint storm: 20 renders back-to-back, all inside one 80ms window.
+        for _ in 0..20 {
+            assert_eq!(
+                glyph_of(&loader.render(40)[0]),
+                SPINNER_FRAMES[0],
+                "repaint burst within one window must hold frame 0"
+            );
+        }
+
+        // Crossing the 80ms boundary does move the glyph.
+        std::thread::sleep(std::time::Duration::from_millis(85));
+        let after = glyph_of(&loader.render(40)[0]);
+        assert_ne!(
+            after, SPINNER_FRAMES[0],
+            "the next window advances the frame"
+        );
     }
 
     #[test]

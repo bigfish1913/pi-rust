@@ -1292,17 +1292,23 @@ pub(super) fn format_tokens(n: i64) -> String {
 /// Record a submitted message for ↑ recall (mirrors TS `addToHistory`):
 /// trims, skips empty + consecutive duplicates, caps at [`HISTORY_LIMIT`], and
 /// resets the browse state so a fresh prompt never resumes mid-history.
+///
+/// The browse reset is unconditional: resubmitting a recalled entry is a
+/// duplicate and adds nothing to history, but the session still ended — a
+/// stale `history_index` would leave the next ↓ restoring a draft that had
+/// already been submitted.
 pub(super) fn push_history(state: &Arc<TuiState>, text: &str) {
     let trimmed = text.trim().to_string();
     if trimmed.is_empty() {
         return;
     }
-    let mut history = state.history.lock().unwrap();
-    if history.first() == Some(&trimmed) {
-        return;
+    {
+        let mut history = state.history.lock().unwrap();
+        if history.first() != Some(&trimmed) {
+            history.insert(0, trimmed);
+            history.truncate(HISTORY_LIMIT);
+        }
     }
-    history.insert(0, trimmed);
-    history.truncate(HISTORY_LIMIT);
     *state.history_index.lock().unwrap() = -1;
     *state.history_draft.lock().unwrap() = None;
 }
@@ -1383,6 +1389,47 @@ pub(super) fn poll_auto_send(
     }
 }
 
+/// Whether an ↑/↓ press belongs to prompt history rather than to the caret.
+///
+/// Inside a multi-line draft the editor owns the arrow whenever the caret can
+/// still travel in that direction: ↑ moves between logical lines until it
+/// reaches the first line, ↓ until it reaches the last. Only the press that
+/// cannot move the caret any further switches to history, which is what makes
+/// a multi-line prompt — typed or recalled — editable line by line.
+///
+/// A single-line draft keeps the pre-existing contract: the arrows never
+/// replace it. That behaviour is deliberate — swapping a typed draft for a
+/// history entry was reported as "text disappeared" — and a single-line prompt
+/// has no second row to move to, so there is no "again" press to reinterpret.
+/// An active browse session is the exception: after recalling a single-line
+/// entry the editor is exactly that shape, and ↑/↓ must keep walking history
+/// until ↓ past the newest entry ends the session.
+///
+/// `direction` is -1 (↑, older) or 1 (↓, newer), matching [`navigate_history`].
+pub(super) fn arrow_belongs_to_history(
+    state: &Arc<TuiState>,
+    editor: &Arc<Editor>,
+    direction: i32,
+) -> bool {
+    if state.history.lock().unwrap().is_empty() {
+        return false;
+    }
+    // A fresh prompt has no caret row to move to, so the first arrow press
+    // recalls immediately (upstream's `historyPrevious` on an empty editor).
+    if editor.get_text().is_empty() {
+        return true;
+    }
+    if editor.line_count() < 2 {
+        return *state.history_index.lock().unwrap() != -1;
+    }
+    let (row, _col) = editor.cursor_position();
+    if direction < 0 {
+        row == 0
+    } else {
+        row + 1 >= editor.line_count()
+    }
+}
+
 /// Navigate message history. `direction` is -1 (↑, older) or 1 (↓, newer).
 /// Mirrors TS `navigateHistory`: the first entry into browse mode stashes the
 /// current editor text as the draft; navigating back past the newest entry
@@ -1406,18 +1453,15 @@ pub(super) fn navigate_history(state: &Arc<TuiState>, editor: &Arc<Editor>, dire
         // Exited browse mode: restore the draft (or clear if there was none).
         let draft = state.history_draft.lock().unwrap().take();
         match draft {
-            Some(d) => {
-                let len = d.len();
-                editor.set_text(&d);
-                editor.set_cursor(0, len);
-            }
+            Some(d) => set_editor_text_caret_at_end(editor, &d),
             None => editor.set_text(""),
         }
     } else {
         let text = history[new_index as usize].clone();
-        let len = text.len();
-        editor.set_text(&text);
-        editor.set_cursor(0, len);
+        // A recalled prompt is edited from its tail: `set_text` parks the
+        // caret at (0, 0), which for a multi-line entry left ↑ as the only
+        // working arrow — ↓ looked like it skipped the entry entirely.
+        set_editor_text_caret_at_end(editor, &text);
     }
 }
 
@@ -1657,7 +1701,6 @@ impl TuiState {
                 // `show_terminal_progress` disables it entirely.
                 if self.show_terminal_progress {
                     self.editor.set_working(Some(WorkingState {
-                        frame: 0,
                         started_at: std::time::Instant::now(),
                         message: "Working…".to_string(),
                     }));

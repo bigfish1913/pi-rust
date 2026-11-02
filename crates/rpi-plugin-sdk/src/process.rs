@@ -76,8 +76,9 @@ impl ProcessTree {
     }
 }
 
+/// Resume a process created with `CREATE_SUSPENDED`, once it is in its job.
 #[cfg(windows)]
-fn resume_child(pid: u32) -> Result<(), String> {
+pub fn resume_child(pid: u32) -> Result<(), String> {
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
@@ -88,7 +89,7 @@ fn resume_child(pid: u32) -> Result<(), String> {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         if snapshot == INVALID_HANDLE_VALUE {
             return Err(format!(
-                "snapshot MCP thread: {}",
+                "snapshot child thread: {}",
                 std::io::Error::last_os_error()
             ));
         }
@@ -96,13 +97,13 @@ fn resume_child(pid: u32) -> Result<(), String> {
         let mut entry: THREADENTRY32 = std::mem::zeroed();
         entry.dwSize = std::mem::size_of_val(&entry) as u32;
         let mut found = Thread32First(snapshot.as_raw_handle(), &mut entry);
-        let mut result = Err("MCP primary thread not found".into());
+        let mut result = Err("child primary thread not found".into());
         while found != 0 {
             if entry.th32OwnerProcessID == pid {
                 let thread = OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID);
                 if thread.is_null() {
                     result = Err(format!(
-                        "open MCP thread: {}",
+                        "open child thread: {}",
                         std::io::Error::last_os_error()
                     ));
                 } else {

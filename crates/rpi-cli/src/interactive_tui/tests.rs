@@ -6,6 +6,7 @@ mod autocomplete_flicker;
 mod clipboard_persistence;
 mod enter_completion;
 mod session_regressions;
+mod updown_cursor;
 
 #[test]
 fn changelog_command_shows_current_release_and_all_is_explicit() {

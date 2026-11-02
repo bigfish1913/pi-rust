@@ -1721,21 +1721,16 @@ async fn crashing_during_a_tool_call_leaves_a_valid_transcript() {
     };
     let session = harness.session().clone();
 
-    // Wait until the tool call itself is committed in the frames.
+    // Wait until the committed tool call is running.
     let mut saw_tool_call = false;
     for _ in 0..300 {
         let records = session
-            .find_records(&RecordQuery {
-                record_type: Some(rpi_harness::frame_progress::ASSISTANT_FRAME_RECORD_TYPE),
-                ..Default::default()
-            })
+            .find_records(&RecordQuery::default())
             .await
-            .expect("frame records readable");
-        saw_tool_call = records.iter().any(|record| {
-            matches!(record, LaneRecord::AssistantFrame(f)
-                if f.frame.as_ref().and_then(|v| v.get("type")).and_then(|v| v.as_str())
-                    == Some("toolcall_end"))
-        });
+            .expect("records readable");
+        saw_tool_call = records
+            .iter()
+            .any(|record| matches!(record, LaneRecord::ToolStarted(_)));
         if saw_tool_call {
             break;
         }

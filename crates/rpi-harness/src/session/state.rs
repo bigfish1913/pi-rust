@@ -30,9 +30,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{SessionError, SessionResult};
 use crate::session::types::{
-    BranchBounds, Entry, EntryOrder, EntryQuery, ForkOptions, ForkPosition, LanePointer,
-    LaneRecord, LogItem, LogOptions, OperationStartedRecord, RecordQuery, SessionMetadata,
-    SessionMutation, SessionStats,
+    AssistantFrameOp, BranchBounds, Entry, EntryOrder, EntryQuery, ForkOptions, ForkPosition,
+    LanePointer, LaneRecord, LogItem, LogOptions, OperationStartedRecord, RecordQuery,
+    SessionMetadata, SessionMutation, SessionStats,
 };
 
 mod snapshot;
@@ -267,6 +267,15 @@ impl SessionState {
                 }
                 self.log.push(StoredLogItem::Record(self.records.len()));
                 self.records.push(record.clone());
+                if let LaneRecord::AssistantFrame(frame) = &record {
+                    match frame.op {
+                        AssistantFrameOp::ClearStream => {
+                            self.retire_frames(&frame.run_id, Some(frame.stream_index));
+                        }
+                        AssistantFrameOp::ClearRun => self.retire_frames(&frame.run_id, None),
+                        _ => {}
+                    }
+                }
                 Ok(ApplyOutcome::Record(record))
             }
             SessionMutation::Lane { seq, lane, leaf_id } => {
@@ -425,6 +434,57 @@ impl SessionState {
             );
         }
         Ok(crate::session::context::build_session_context_from_borrowed(&path))
+    }
+
+    /// Drop the frames a clear has retired: one per streamed delta, each a
+    /// parsed JSON value, and never read again because recovery skips what a
+    /// clear covers. Left in place they outweigh the transcript several times
+    /// over. The session file keeps them, and a reload retires them here too.
+    /// Their IDs stay in `used_ids`: the file still holds them, so they stay taken.
+    fn retire_frames(&mut self, run_id: &str, stream_index: Option<usize>) {
+        let retired = |record: &LaneRecord| {
+            matches!(record, LaneRecord::AssistantFrame(frame)
+                if frame.op == AssistantFrameOp::Append
+                    && frame.run_id == run_id
+                    && stream_index.is_none_or(|index| frame.stream_index == index))
+        };
+        // Everything before the first retired frame keeps its index.
+        let Some(first) = self.records.iter().position(retired) else {
+            return;
+        };
+        let mut moved = vec![None; self.records.len() - first];
+        let mut kept = first;
+        let tail = self.records.split_off(first);
+        for (offset, record) in tail.into_iter().enumerate() {
+            if !retired(&record) {
+                moved[offset] = Some(kept);
+                kept += 1;
+                self.records.push(record);
+            }
+        }
+        // The log lists records in order, so only its tail can name a moved one.
+        let log_tail = self
+            .log
+            .iter()
+            .rposition(|item| matches!(item, StoredLogItem::Record(index) if *index < first))
+            .map_or(0, |at| at + 1);
+        let mut position = 0;
+        self.log.retain_mut(|item| {
+            position += 1;
+            if position <= log_tail {
+                return true;
+            }
+            let StoredLogItem::Record(index) = item else {
+                return true;
+            };
+            match moved[*index - first] {
+                Some(now) => {
+                    *index = now;
+                    true
+                }
+                None => false,
+            }
+        });
     }
 
     pub fn find_records(&self, query: &RecordQuery) -> SessionResult<Vec<LaneRecord>> {
