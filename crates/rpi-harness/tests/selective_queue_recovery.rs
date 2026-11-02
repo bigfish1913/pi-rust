@@ -3,7 +3,7 @@ use rpi_agent::AgentMessage;
 use rpi_ai::types::{UserContent, UserMessage};
 use rpi_harness::session::jsonl::{JsonlSessionStorage, JsonlV4Header};
 use rpi_harness::{
-    agent_harness::AgentHarness,
+    agent_harness::{AgentHarness, AgentLane},
     error::{SessionError, SessionResult},
     session::{types::*, DefaultIdGenerator, Session, SqliteSessionRepo, SystemClock},
     types::AgentHarnessOptions,
@@ -17,6 +17,8 @@ use std::sync::{
 struct Probe {
     inner: Arc<dyn SessionStorage>,
     queue_reads: Mutex<Vec<(String, usize)>>,
+    cancellation_batches: Mutex<Vec<usize>>,
+    fail_cancellation: AtomicBool,
     fail: AtomicBool,
 }
 #[async_trait::async_trait]
@@ -58,6 +60,13 @@ impl SessionStorage for Probe {
         &self,
         records: Vec<LaneRecord>,
     ) -> SessionResult<Vec<LaneRecord>> {
+        self.cancellation_batches
+            .lock()
+            .unwrap()
+            .push(records.len());
+        if self.fail_cancellation.load(Ordering::Relaxed) {
+            return Err(SessionError::storage("cancellation batch rejected"));
+        }
         self.inner.append_queue_cancellations(records).await
     }
     async fn get_entry(&self, id: &str) -> SessionResult<Option<Entry>> {
@@ -241,6 +250,8 @@ async fn check(store: Arc<dyn SessionStorage>) {
     let probe = Arc::new(Probe {
         inner: store,
         queue_reads: Mutex::new(Vec::new()),
+        cancellation_batches: Mutex::new(Vec::new()),
+        fail_cancellation: AtomicBool::new(false),
         fail: AtomicBool::new(false),
     });
     let session = Session::new(probe.clone(), None);
@@ -252,13 +263,33 @@ async fn check(store: Arc<dyn SessionStorage>) {
     .await
     .unwrap();
     let queued = harness.lane("main").queued_messages().await.unwrap();
-    assert_eq!(queued.steering, ["first", "third"]);
-    assert_eq!(queued.follow_up, ["second"]);
+    assert_eq!(
+        queued
+            .steering
+            .iter()
+            .map(|view| view.text.as_str())
+            .collect::<Vec<_>>(),
+        ["first", "third"]
+    );
+    assert_eq!(
+        queued
+            .follow_up
+            .iter()
+            .map(|view| view.text.as_str())
+            .collect::<Vec<_>>(),
+        ["second"]
+    );
     assert_eq!(*probe.queue_reads.lock().unwrap(), [("main".into(), 3)]);
     harness.set_session(session.clone()).await.unwrap();
     let side = harness.lane("side").queued_messages().await.unwrap();
     assert!(side.steering.is_empty());
-    assert_eq!(side.follow_up, ["side survives"]);
+    assert_eq!(
+        side.follow_up
+            .iter()
+            .map(|view| view.text.as_str())
+            .collect::<Vec<_>>(),
+        ["side survives"]
+    );
     assert_eq!(probe.queue_reads.lock().unwrap().len(), 3);
     probe.fail.store(true, Ordering::Relaxed);
     assert!(harness.set_session(session.clone()).await.is_err());
@@ -293,9 +324,54 @@ async fn check(store: Arc<dyn SessionStorage>) {
             .queued_messages()
             .await
             .unwrap()
-            .steering,
+            .steering
+            .iter()
+            .map(|view| view.text.as_str())
+            .collect::<Vec<_>>(),
         ["third"]
     );
+    let next = harness
+        .next_run(UserMessage::new("next survives", 0).into())
+        .await
+        .unwrap();
+    let before_clear = harness.queued_messages().await.unwrap();
+    assert_eq!(before_clear.steering[0].text, "third");
+    assert_eq!(before_clear.follow_up[0].text, "second");
+    probe.fail_cancellation.store(true, Ordering::Relaxed);
+    assert!(harness.clear_queue().await.is_err());
+    assert_eq!(harness.queued_messages().await.unwrap(), before_clear);
+    harness
+        .set_session(harness.session().clone())
+        .await
+        .unwrap();
+    assert_eq!(harness.queued_messages().await.unwrap(), before_clear);
+    probe.fail_cancellation.store(false, Ordering::Relaxed);
+    assert_eq!(harness.clear_queue().await.unwrap(), before_clear);
+    assert_eq!(*probe.cancellation_batches.lock().unwrap(), [1, 2, 2]);
+    harness
+        .set_session(harness.session().clone())
+        .await
+        .unwrap();
+    assert!(harness.queued_messages().await.unwrap().is_empty());
+    let pending = harness
+        .session()
+        .find_records(&RecordQuery {
+            lane: Some("main".into()),
+            record_type: Some("queue_enqueued"),
+            pending_queue_only: true,
+            order: Some(EntryOrder::OldestFirst),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 1, "clear must preserve next-run work");
+    let LaneRecord::QueueEnqueued(pending) = &pending[0] else {
+        panic!("expected enqueue")
+    };
+    assert_eq!(pending.queue, QueueKind::NextRun);
+    assert_eq!(pending.target["id"].as_str(), Some(next.entry_id.as_str()));
+    let side = harness.lane("side").queued_messages().await.unwrap();
+    assert_eq!(side.follow_up[0].text, "side survives");
 }
 
 #[tokio::test]

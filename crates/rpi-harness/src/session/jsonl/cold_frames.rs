@@ -666,10 +666,34 @@ impl ResidentState {
             ForkOptions::Branch { entry_id, position } => {
                 let selected = entry_id.clone().or(self.reducer.require_lane("main")?);
                 let target = if let Some(id) = selected {
-                    let i = self
+                    let mut i = self
                         .reducer
                         .entry_index(&id)
                         .ok_or_else(|| SessionError::not_found(format!("Entry not found: {id}")))?;
+                    // Match SessionState's implicit-tip contract without reading
+                    // cold payloads. Explicit non-message targets still error.
+                    if entry_id.is_none() {
+                        let mut steps = 0usize;
+                        while self.reducer.entry_meta(i).unwrap().kind != "message" {
+                            let Some(parent) =
+                                self.reducer.entry_meta(i).unwrap().parent_id.as_deref()
+                            else {
+                                break;
+                            };
+                            i = self.reducer.entry_index(parent).ok_or_else(|| {
+                                SessionError::not_found(format!("Entry not found: {parent}"))
+                            })?;
+                            if self.reducer.entry_meta(i).unwrap().kind == "message" {
+                                break;
+                            }
+                            steps += 1;
+                            if steps > 10_000 {
+                                return Err(SessionError::invalid_fork_target(format!(
+                                    "Fork target has no message ancestor: {id}"
+                                )));
+                            }
+                        }
+                    }
                     let meta = self.reducer.entry_meta(i).unwrap();
                     if meta.kind != "message" {
                         return Err(SessionError::invalid_fork_target(format!(
@@ -681,7 +705,7 @@ impl ResidentState {
                     } else {
                         ForkPosition::At
                     }) {
-                        ForkPosition::At => Some(id),
+                        ForkPosition::At => Some(meta.id.clone()),
                         ForkPosition::Before => meta.parent_id.clone(),
                     }
                 } else {
