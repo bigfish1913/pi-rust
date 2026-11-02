@@ -389,10 +389,10 @@ async fn lifecycle_dropped_handoff_keeps_only_the_uncommitted_prefix_pending() {
     caller.abort();
     assert!(caller.await.unwrap_err().is_cancelled());
     h.set_agent_emitter(None).await.unwrap();
-    assert_eq!(
-        h.queued_messages().await.unwrap().steering,
-        ["accepted-injection"]
-    );
+    let queued = h.queued_messages().await.unwrap();
+    assert_eq!(queued.steering.len(), 1);
+    assert_eq!(queued.steering[0].text, "accepted-injection");
+    assert!(queued.steering[0].images.is_empty());
     let second = h.prompt_text("retry", vec![]).await.unwrap();
     assert!(
         matches!(second.outcome, HarnessRunOutcome::Completed { .. }),

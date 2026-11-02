@@ -174,6 +174,8 @@ impl AgentHarness {
                     if let Entry::Message(entry) = entry {
                         if matching_notice(&entry.message, &message, &key)? {
                             self.check_notice_revision(revision).await?;
+                            // This branch entry is already consumed. An ACK
+                            // must not manufacture pending work or redeliver it.
                             return Ok(entry.base.id.clone());
                         }
                     }
@@ -187,6 +189,15 @@ impl AgentHarness {
                     {
                         if matching_notice(&existing, &message, &key)? {
                             self.check_notice_revision(revision).await?;
+                            // The storage owner may have committed after the
+                            // original caller was dropped, before it published
+                            // this hint. Only an accepted, still-pending target
+                            // can restore scheduling; no durable write is needed.
+                            self.inner
+                                .lock()
+                                .unwrap()
+                                .pending_context_lanes
+                                .insert(self.lane.clone());
                             return Ok(entry.id);
                         }
                     }
