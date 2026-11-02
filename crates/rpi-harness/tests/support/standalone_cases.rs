@@ -187,7 +187,9 @@ async fn dropping_enqueue_caller_does_not_abandon_memory_publication() {
     assert!(caller.await.unwrap_err().is_cancelled());
     gate.release.notify_one();
     let queued = h.queued_messages().await.unwrap();
-    assert_eq!(queued.steering, ["accepted while caller left"]);
+    assert_eq!(queued.steering.len(), 1);
+    assert_eq!(queued.steering[0].text, "accepted while caller left");
+    assert!(queued.steering[0].images.is_empty());
     drop(h);
     assert_eq!(
         reopen(&path, fs).await.queued_messages().await.unwrap(),
@@ -302,11 +304,11 @@ async fn queue_cancel_and_clear_cannot_consume_another_lanes_input() {
         rpi_harness::agent_harness::CancelQueuedOutcome::AlreadyConsumed
     );
     assert!(h.clear_queue().await.unwrap().is_empty());
-    assert_eq!(
-        other.queued_messages().await.unwrap().steering,
-        ["other input"]
-    );
-    assert_eq!(other.clear_queue().await.unwrap().steering, ["other input"]);
+    let queued = other.queued_messages().await.unwrap();
+    assert_eq!(queued.steering.len(), 1);
+    assert_eq!(queued.steering[0].text, "other input");
+    assert!(queued.steering[0].images.is_empty());
+    assert_eq!(other.clear_queue().await.unwrap(), queued);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

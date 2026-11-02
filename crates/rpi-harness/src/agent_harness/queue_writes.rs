@@ -167,65 +167,61 @@ impl AgentHarness {
         let harness = self.clone();
         tokio::spawn(async move {
             let _gate = gate;
-            let queues = {
-                let inner = harness.inner.lock().unwrap();
-                if inner.closed {
-                    return Err(HarnessError::closed());
-                }
-                [inner.steering_queue.clone(), inner.follow_up_queue.clone()]
-            };
-            let items: Vec<Vec<QueuedMessage>> = queues
-                .iter()
-                .map(|queue| {
-                    let q = queue.lock().unwrap();
-                    q.pending
-                        .iter()
-                        .filter(|item| {
-                            item.lane == harness.lane && !q.reserved.contains(&item.entry_id)
-                        })
-                        .cloned()
-                        .collect()
-                })
-                .collect();
-            let mut records = Vec::new();
-            for item in items.iter().flatten() {
-                records.push(harness.queue_cancellation(&item.entry_id).await?);
-            }
-            if !records.is_empty() {
-                harness
-                    .session
-                    .append_queue_cancellations(records)
-                    .await
-                    .map_err(session_to_harness_err)?;
-            }
-            let mut restored = QueuedMessages::default();
-            for (index, (queue, items)) in queues.iter().zip(&items).enumerate() {
-                for item in items {
-                    queue.lock().unwrap().remove(&item.entry_id);
-                    let out = if index == 0 {
-                        &mut restored.steering
-                    } else {
-                        &mut restored.follow_up
-                    };
-                    out.push(queued_message_text(&item.message));
-                    if let AgentMessage::User(user) = &item.message {
-                        if let UserContent::Blocks(blocks) = &user.content {
-                            restored
-                                .images
-                                .extend(blocks.iter().filter_map(|block| match block {
-                                    Content::Image(image) => Some(image.clone()),
-                                    _ => None,
-                                }));
-                        }
-                    }
-                }
-            }
-            Ok(restored)
+            harness.clear_queue_locked().await
         })
         .await
         .map_err(|error| HarnessError::io(format!("queue clear task failed: {error}")))?
     }
+
+    /// Caller owns message_writes across cancellation and in-memory removal.
+    /// Shared with abort so cancelling the run cannot race a queue drain.
+    pub(super) async fn clear_queue_locked(&self) -> HarnessResult<QueuedMessages> {
+        let queues = {
+            let inner = self.inner.lock().unwrap();
+            if inner.closed {
+                return Err(HarnessError::closed());
+            }
+            [inner.steering_queue.clone(), inner.follow_up_queue.clone()]
+        };
+        let items: Vec<Vec<QueuedMessage>> = queues
+            .iter()
+            .map(|queue| {
+                let q = queue.lock().unwrap();
+                q.pending
+                    .iter()
+                    .filter(|item| item.lane == self.lane && !q.reserved.contains(&item.entry_id))
+                    .cloned()
+                    .collect()
+            })
+            .collect();
+        let mut records = Vec::new();
+        for item in items.iter().flatten() {
+            records.push(self.queue_cancellation(&item.entry_id).await?);
+        }
+        if !records.is_empty() {
+            self.session
+                .append_queue_cancellations(records)
+                .await
+                .map_err(session_to_harness_err)?;
+        }
+        let mut restored = QueuedMessages::default();
+        for (index, (queue, items)) in queues.iter().zip(&items).enumerate() {
+            for item in items {
+                queue.lock().unwrap().remove(&item.entry_id);
+                let out = if index == 0 {
+                    &mut restored.steering
+                } else {
+                    &mut restored.follow_up
+                };
+                out.push(queued_message_view(&item.message));
+            }
+        }
+        Ok(restored)
+    }
 }
+
+#[cfg(test)]
+mod cancellation_tests;
 
 #[cfg(test)]
 mod reservation_tests {
@@ -243,6 +239,16 @@ mod reservation_tests {
         Arc::new(Mutex::new(queue))
     }
 
+    fn views(texts: &[&str]) -> Vec<QueuedMessageView> {
+        texts
+            .iter()
+            .map(|text| QueuedMessageView {
+                text: (*text).into(),
+                images: Vec::new(),
+            })
+            .collect()
+    }
+
     #[test]
     fn reservations_preserve_mode_lane_order_and_uncommitted_drop() {
         for (mode, expected) in [(QueueMode::OneAtATime, 1), (QueueMode::All, 2)] {
@@ -251,7 +257,10 @@ mod reservation_tests {
             assert_eq!(reservation.items.len(), expected);
             assert_eq!(reservation.items[0].entry_id, "first");
             assert_eq!(queue.lock().unwrap().pending.len(), 3);
-            assert_eq!(queue.lock().unwrap().peek_for_lane("side"), ["other"]);
+            assert_eq!(
+                queue.lock().unwrap().peek_for_lane("side"),
+                views(&["other"])
+            );
             assert_eq!(
                 queue.lock().unwrap().peek_for_lane("main").len(),
                 2 - expected
@@ -259,7 +268,7 @@ mod reservation_tests {
             drop(reservation);
             assert_eq!(
                 queue.lock().unwrap().peek_for_lane("main"),
-                ["first", "last"]
+                views(&["first", "last"])
             );
             assert!(queue.lock().unwrap().reserved.is_empty());
         }
@@ -275,7 +284,13 @@ mod reservation_tests {
         // cannot resurrect that committed prefix or reorder the suffix.
         queue.lock().unwrap().remove("first");
         drop(reservation);
-        assert_eq!(queue.lock().unwrap().peek_for_lane("main"), ["last"]);
-        assert_eq!(queue.lock().unwrap().peek_for_lane("side"), ["other"]);
+        assert_eq!(
+            queue.lock().unwrap().peek_for_lane("main"),
+            views(&["last"])
+        );
+        assert_eq!(
+            queue.lock().unwrap().peek_for_lane("side"),
+            views(&["other"])
+        );
     }
 }
