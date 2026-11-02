@@ -59,9 +59,9 @@ use crate::session::jsonl::types::{
     JsonlSessionCreateOptions, JsonlSessionListOptions, JsonlSessionMetadata,
     JsonlSessionRepoOptions, JsonlV4Header,
 };
-use crate::session::memory::Clock;
+use crate::session::memory::{Clock, InMemorySessionStorage};
 use crate::session::types::{
-    ForkOptions, JsonValue, SessionCreateOptions, SessionMetadata, SessionRepo,
+    ForkOptions, JsonValue, SessionCreateOptions, SessionMetadata, SessionRepo, SessionStorage,
 };
 
 /// `^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$` — a session id must be
@@ -268,6 +268,29 @@ impl JsonlSessionRepo {
         metadata: &JsonlSessionMetadata,
     ) -> SessionResult<JsonlSessionStorage> {
         load_jsonl_session_storage(self, metadata).await
+    }
+
+    /// Inspect recovered native facts without the writer lifecycle or on-disk
+    /// repair. Unlike `open_by_jsonl_metadata`, this never changes the source;
+    /// any snapshot mutations are confined to memory.
+    pub async fn read_snapshot_by_jsonl_metadata(
+        &self,
+        metadata: &JsonlSessionMetadata,
+    ) -> SessionResult<InMemorySessionStorage> {
+        let snapshot = JsonlSessionStorage::read_snapshot(
+            self.fs.clone(),
+            &metadata.path,
+            self.clock.clone(),
+            self.ids.clone(),
+        )
+        .await?;
+        if snapshot.metadata().id != metadata.id {
+            return Err(SessionError::invalid_entry(format!(
+                "Session id does not match header: {}",
+                metadata.id
+            )));
+        }
+        Ok(snapshot)
     }
 
     /// Delete a session by its rich JSONL metadata (direct-path remove).
