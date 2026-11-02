@@ -110,6 +110,7 @@ rpi --provider gateway --model custom-claude -p &quot;hello&quot;
 rpi events path|tail
 rpi install &lt;crate&gt;
 rpi uninstall &lt;crate&gt;
+rpi extension update [name] # update all eligible extensions, or select one by name
 rpi update
 rpi dev [options]
 rpi dev-local [options]
@@ -169,6 +170,13 @@ rpi --extensions-dir target/debug -p 'echo &quot;hi&quot;'
 rpi install rpi-extension-example --version 0.1.0
 rpi install my-extension --path ../my-rpi-extension --force
 </code></pre>
+<p>Use <code>rpi extension update</code> to update all project-linked extensions and globally
+installed registry/prebuilt extensions, or <code>rpi extension update &lt;name&gt;</code> to select
+one by name. Updates preserve the original Cargo build backend or explicit GitHub
+source. Global development installs made with <code>--path</code> are excluded. The old
+<code>rpi package update [name]</code> remains compatible; prefer <code>extension update</code> for
+extension updates. Project linking commands remain <code>rpi package link</code>,
+<code>rpi package list</code>, and <code>rpi package unlink</code>.</p>
 <p>For iterative development:</p>
 <pre><code class="language-bash">cd ../my-rpi-extension
 rpi dev
