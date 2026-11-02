@@ -88,15 +88,21 @@ fn merge_command_list_reserved(
     templates: Vec<(String, String)>,
     reserved: Vec<String>,
 ) -> Vec<serde_json::Value> {
-    let mut seen = std::collections::BTreeSet::new();
+    // Reserved names must block *later* sources without blocking the built-ins
+    // themselves: a visible built-in canonical name is both the reservation and
+    // a real entry, so seeding `seen` with it would drop every built-in from the
+    // listing. Keep the reservation set separate and consult it only for
+    // non-builtin sources; collisions among the sources still fall to `seen`.
+    let mut reserved_names = std::collections::BTreeSet::new();
     for name in reserved {
         let name = if !name.starts_with('/') {
             format!("/{name}")
         } else {
             name
         };
-        seen.insert(name);
+        reserved_names.insert(name);
     }
+    let mut seen = std::collections::BTreeSet::new();
     let mut out: Vec<serde_json::Value> = Vec::new();
     for (source, commands) in [
         ("builtin", builtin),
@@ -109,6 +115,9 @@ fn merge_command_list_reserved(
             } else {
                 name
             };
+            if source != "builtin" && reserved_names.contains(&name) {
+                continue;
+            }
             if !seen.insert(name.clone()) {
                 continue;
             }
@@ -936,6 +945,36 @@ mod send_message_tests {
 #[cfg(test)]
 mod list_commands_tests {
     use super::{merge_command_list, merge_command_list_reserved};
+
+    /// Reserving names must not delete the built-ins from the listing.
+    ///
+    /// The reservation set contains every built-in canonical name, so seeding
+    /// the dedupe set with it silently dropped all of them: the real listing
+    /// went from 32 built-ins to 0, leaving only extension entries.
+    #[test]
+    fn reserved_names_do_not_remove_the_builtins_themselves() {
+        let builtin = vec![
+            ("/help".to_string(), "help".to_string()),
+            ("/model".to_string(), "model".to_string()),
+        ];
+        let out = merge_command_list_reserved(
+            builtin,
+            vec![("deploy".into(), "deploy".into())],
+            vec![],
+            // Every built-in name is reserved (as in production), plus an alias
+            // and a hidden command that are not listed.
+            vec![
+                "/help".to_string(),
+                "/model".to_string(),
+                "/q".to_string(),
+                "/context".to_string(),
+            ],
+        );
+        assert_eq!(names(&out), vec!["/help", "/model", "/deploy"]);
+        assert_eq!(out[0]["source"], "builtin");
+        assert_eq!(out[1]["source"], "builtin");
+        assert_eq!(out[2]["source"], "extension");
+    }
 
     /// A built-in alias or hidden built-in wins TUI dispatch without showing up
     /// as a suggestion, so an extension registering the same name must not be
