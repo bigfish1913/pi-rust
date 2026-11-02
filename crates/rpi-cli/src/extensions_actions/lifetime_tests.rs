@@ -136,7 +136,14 @@ async fn send_user_message_queues_while_the_lane_is_busy() {
 
     // 队列里真的有它（不是被吞掉）。
     let queued = lane.clear_queue().await.unwrap();
-    assert_eq!(queued.steering, vec!["插队的消息".to_string()]);
+    assert_eq!(
+        queued
+            .steering
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect::<Vec<_>>(),
+        vec!["插队的消息"]
+    );
 
     let _ = lane.abort().await;
     let _ = running.await;
