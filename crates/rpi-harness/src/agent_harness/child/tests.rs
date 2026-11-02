@@ -132,6 +132,7 @@ async fn children_cannot_expand_tools_or_create_grandchildren() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn child_turn_budget_is_per_instance_and_does_not_change_parent_or_environment() {
+    let _env_guard = crate::run_budget::MAX_TURNS_ENV_TEST_LOCK.lock().await;
     let script = FauxScript::new();
     script.set_responses(vec![
         FauxStep::tool_call("read", serde_json::json!({"path":"test.txt"})),
@@ -273,6 +274,37 @@ async fn side_question_inherits_private_binding_but_not_main_run_lifetime_or_too
     assert_eq!(parent.get_tip_id().await.unwrap(), parent_tip);
     parent.close().await.unwrap();
     assert!(child.scope.is_cancelled());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_none_cannot_expand_through_child_or_mutation() {
+    let (parent, _, _) = parent(FauxScript::new()).await;
+    assert!(!parent.get_tools().await.unwrap().is_empty());
+    assert!(parent.seal_resources(vec!["unknown".into()]).is_err());
+    parent.seal_resources(vec![]).unwrap();
+    assert_eq!(
+        parent.execution_context().unwrap()["tools"],
+        serde_json::json!([])
+    );
+    assert!(parent.set_active_tools(vec![]).await.is_err());
+    assert!(parent
+        .lane("main")
+        .set_active_tools(vec!["read".into()])
+        .await
+        .is_err());
+    assert!(parent.set_tools(vec![], None).await.is_err());
+    assert!(parent.set_resources(Default::default()).await.is_err());
+    assert!(parent.set_system_prompt(None).await.is_err());
+    assert!(parent.set_session(session("swapped")).await.is_err());
+    let child = parent
+        .create_child(session("child"), emitter(), 1, None)
+        .await
+        .unwrap();
+    assert!(child.harness.get_tools().await.unwrap().is_empty());
+    assert!(parent
+        .create_child(session("expanded"), emitter(), 1, Some(vec!["read".into()]))
+        .await
+        .is_err());
 }
 
 #[test]

@@ -445,9 +445,10 @@ pub struct Editor {
 /// State for the working indicator embedded in the editor's top border.
 #[derive(Debug, Clone)]
 pub struct WorkingState {
-    /// Spinner animation frame index.
-    pub frame: usize,
-    /// When the working state started (for elapsed time display).
+    /// When the working state started. Also seeds the spinner: the frame is
+    /// derived from elapsed time (one step per `SPINNER_FRAME_MS`), matching
+    /// upstream's fixed-cadence `setInterval` animation regardless of how
+    /// often repaints land.
     pub started_at: std::time::Instant,
     /// The message to display (e.g. "Working…").
     pub message: String,
@@ -857,6 +858,11 @@ impl Editor {
             .lock()
             .map(|s| (s.cursor_row, s.cursor_col))
             .unwrap_or((0, 0))
+    }
+
+    /// Number of logical lines in the draft (always at least 1).
+    pub fn line_count(&self) -> usize {
+        self.state.lock().map(|s| s.lines.len()).unwrap_or(1).max(1)
     }
 
     /// Set the cursor position (clamped to text bounds), clearing any
@@ -1850,24 +1856,20 @@ impl Component for Editor {
             .unwrap_or(crate::theme::theme().colors.border);
         // Check if we have a working state to display in the top border.
         //
-        // The frame advances once per render, mirroring `Loader::render`: the
-        // spinner is therefore driven by *repaints*, so it visibly speeds up
-        // while the model is streaming (each token schedules a frame) and falls
-        // back to the render tick's cadence when nothing is being produced. A
-        // timer-only animation looked constant-speed and unrelated to output.
-        let working_state = self.working.lock().ok().and_then(|mut guard| {
-            guard.as_mut().map(|state| {
-                let snapshot = state.clone();
-                state.frame = state.frame.wrapping_add(1);
-                snapshot
-            })
-        });
+        // The frame is derived from elapsed wall-clock time (one step per
+        // `SPINNER_FRAME_MS`), mirroring upstream's fixed-cadence `setInterval`
+        // animation. It used to advance once per render, which tied the visible
+        // speed to the repaint rate: streamed output scheduled a repaint per
+        // token and spun the spinner at the 16ms render-throttle rate.
+        let working_state = self.working.lock().ok().and_then(|guard| guard.clone());
         let top_border = if let Some(ref working) = working_state {
             // Working indicator embedded in the top border: spinner + message +
             // elapsed time, with the remaining width filled by border glyphs.
-            // The frame set is shared with `Loader` so the two never drift.
+            // The frame set and cadence are shared with `Loader` so the two
+            // never drift.
             let frames = crate::loader::SPINNER_FRAMES;
-            let spinner_char = frames[working.frame % frames.len()];
+            let spinner_char =
+                frames[crate::loader::Loader::frame_at(working.started_at.elapsed(), frames.len())];
             let colors = crate::theme::theme().colors;
 
             let elapsed = working.started_at.elapsed();
@@ -2018,12 +2020,13 @@ mod tests {
     }
 
     #[test]
-    fn working_spinner_advances_per_render_not_per_timer() {
+    fn working_spinner_follows_wall_clock_cadence() {
         use crate::component::Component;
         let editor = Editor::simple();
         editor.set_working(Some(WorkingState {
-            frame: 0,
-            started_at: std::time::Instant::now(),
+            // 5ms into the first window: ~75ms of scheduling slack before the
+            // two repaints could legally land in different windows.
+            started_at: std::time::Instant::now() - std::time::Duration::from_millis(5),
             message: "Working…".to_string(),
         }));
 
@@ -2031,21 +2034,28 @@ mod tests {
         let first = crate::strip_ansi(&editor.render(60)[0]);
         assert!(first.contains("Working"), "top border: {first}");
 
-        // Each render steps the frame, so repaints driven by streamed output
-        // visibly advance the spinner; no timer is required for that.
-        let frame_after_first = editor.working().expect("working state").frame;
-        assert_eq!(frame_after_first, 1, "render must advance the frame once");
-        let _ = editor.render(60);
-        assert_eq!(editor.working().expect("working state").frame, 2);
-
-        // Two renders of the same state differ on screen (spinner char moves).
+        // The frame comes from elapsed time, not from the repaint count: two
+        // renders inside the same 80ms window show the same glyph. Under the
+        // previous per-render stepping these two renders differed, which is
+        // what made streaming (one repaint per token) spin at the render
+        // throttle's rate.
         let a = crate::strip_ansi(&editor.render(60)[0]);
         let b = crate::strip_ansi(&editor.render(60)[0]);
-        let spinner_of = |line: &str| line.chars().find(|c| "⠋⠘⠹⠸⠼⠴⠦⠧⠇⠏".contains(*c));
+        assert_eq!(
+            a, b,
+            "repaints within one frame window must not move the spinner"
+        );
+
+        // Elapsed time does move it: a state started ~125ms ago (one step past
+        // the 80ms boundary) shows the second frame.
+        editor.set_working(Some(WorkingState {
+            started_at: std::time::Instant::now() - std::time::Duration::from_millis(125),
+            message: "Working…".to_string(),
+        }));
+        let later = crate::strip_ansi(&editor.render(60)[0]);
         assert_ne!(
-            spinner_of(&a),
-            spinner_of(&b),
-            "consecutive renders must show different spinner frames: {a:?} vs {b:?}"
+            a, later,
+            "crossing an 80ms boundary must advance the spinner"
         );
 
         // Idle editors have no indicator.
@@ -2067,14 +2077,11 @@ mod tests {
         // 10 frames at 80ms = the 800ms full cycle upstream animates at.
         assert_eq!(crate::loader::SPINNER_FRAME_MS, 80);
 
-        // The rendered indicator steps through exactly that list, in order.
+        // The rendered indicator steps through exactly that list, in order,
+        // one frame per SPINNER_FRAME_MS of elapsed wall clock — upstream's
+        // `setInterval` cadence, evaluated at render time.
         use crate::component::Component;
         let editor = Editor::simple();
-        editor.set_working(Some(WorkingState {
-            frame: 0,
-            started_at: std::time::Instant::now(),
-            message: "Working…".to_string(),
-        }));
         let spinner_of = |line: &str| {
             let plain = crate::strip_ansi(line);
             crate::loader::SPINNER_FRAMES
@@ -2083,47 +2090,67 @@ mod tests {
                 .find(|c| plain.contains(*c))
         };
         let mut seen = Vec::new();
-        for _ in 0..10 {
+        for i in 0..10u32 {
+            editor.set_working(Some(WorkingState {
+                started_at: std::time::Instant::now()
+                    - std::time::Duration::from_millis((i * 80 + 10).into()),
+                message: "Working…".to_string(),
+            }));
             seen.push(spinner_of(&editor.render(60)[0]).expect("a spinner glyph"));
         }
-        // The snapshot is taken before the advance, so the first paint shows
-        // frame 0 — exactly upstream, whose `start()` paints frame 0 and then
-        // steps on each interval. Ten paints therefore cover the whole cycle in
-        // order and wrap back to the start.
         let expected: Vec<char> = crate::loader::SPINNER_FRAMES.to_vec();
         assert_eq!(seen, expected);
+    }
+
+    #[test]
+    fn loader_frame_at_follows_elapsed_wall_clock() {
+        use std::time::Duration;
+        // Mid-window stays on the frame; each 80ms boundary steps once; the
+        // cycle wraps after 10 frames (800ms).
         assert_eq!(
-            editor.working().expect("working").frame % crate::loader::SPINNER_FRAMES.len(),
-            0,
-            "ten paints must land back on the first frame"
+            crate::loader::Loader::frame_at(Duration::from_millis(0), 10),
+            0
+        );
+        assert_eq!(
+            crate::loader::Loader::frame_at(Duration::from_millis(79), 10),
+            0
+        );
+        assert_eq!(
+            crate::loader::Loader::frame_at(Duration::from_millis(80), 10),
+            1
+        );
+        assert_eq!(
+            crate::loader::Loader::frame_at(Duration::from_millis(750), 10),
+            9
+        );
+        assert_eq!(
+            crate::loader::Loader::frame_at(Duration::from_millis(800), 10),
+            0
+        );
+        // A frame count of 1 (or 0 from a bad caller) must not divide by zero.
+        assert_eq!(
+            crate::loader::Loader::frame_at(Duration::from_millis(999), 1),
+            0
+        );
+        assert_eq!(
+            crate::loader::Loader::frame_at(Duration::from_millis(999), 0),
+            0
         );
     }
 
     #[test]
     fn idle_cadence_matches_native_pi() {
-        // One frame per `SPINNER_FRAME_MS` of wall clock when nothing else is
-        // repainting. This is the property the tick task relies on: it only
-        // requests a repaint, and the repaint advances exactly one frame. The
-        // tick used to *also* advance the frame, which made the idle spinner
-        // run at 40ms/frame — twice upstream's rate.
-        use crate::component::Component;
+        // One frame per `SPINNER_FRAME_MS` of wall clock, matching upstream's
+        // `setInterval` cadence. The render tick only *requests a repaint*;
+        // the visible frame is derived from elapsed time, so a repaint storm
+        // (streamed output) cannot speed the spinner up and a quiet stretch
+        // cannot freeze it.
         assert_eq!(crate::loader::SPINNER_FRAME_MS, 80);
         assert_eq!(
             crate::loader::SPINNER_FRAME_MS * crate::loader::SPINNER_FRAMES.len() as u64,
             800,
             "a full cycle should take 800ms, like upstream"
         );
-
-        let editor = Editor::simple();
-        editor.set_working(Some(WorkingState {
-            frame: 0,
-            started_at: std::time::Instant::now(),
-            message: "Working…".to_string(),
-        }));
-        // One repaint == one frame, i.e. one tick advances the spinner once.
-        let before = editor.working().expect("working").frame;
-        let _ = editor.render(60);
-        assert_eq!(editor.working().expect("working").frame, before + 1);
     }
 
     #[test]
@@ -2141,7 +2168,6 @@ mod tests {
                 assert_eq!(content.trim_end(), draft);
 
                 editor.set_working(Some(WorkingState {
-                    frame: 0,
                     started_at: std::time::Instant::now(),
                     message: "Working".to_string(),
                 }));
@@ -2186,7 +2212,6 @@ mod tests {
         assert!(position.is_some());
 
         editor.set_working(Some(WorkingState {
-            frame: 0,
             started_at: std::time::Instant::now(),
             message: "Working".to_string(),
         }));

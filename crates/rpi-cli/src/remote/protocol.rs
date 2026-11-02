@@ -60,6 +60,10 @@ pub enum RemoteEvent {
         tool_result_count: usize,
         #[serde(rename = "toolResults")]
         tool_results: Value,
+        /// Queue depth when this turn settled, so a client can render
+        /// "N queued". Defaulted for wire compatibility with older peers.
+        #[serde(default, rename = "pendingMessages")]
+        pending_messages: usize,
     },
     MessageStart {
         #[serde(rename = "messageId", default, skip_serializing_if = "Option::is_none")]
@@ -173,10 +177,13 @@ impl RemoteEvent {
             AgentEvent::TurnEnd {
                 message,
                 tool_results,
+                pending_messages,
+                ..
             } => RemoteEvent::TurnEnd {
                 message: serde_json::to_value(message).unwrap_or(Value::Null),
                 tool_result_count: tool_results.len(),
                 tool_results: serde_json::to_value(tool_results).unwrap_or(Value::Null),
+                pending_messages: *pending_messages,
             },
             AgentEvent::MessageStart {
                 message,
@@ -415,6 +422,57 @@ pub struct PromptOutcome {
 mod tests {
     use super::*;
     use rpi_agent::types::AgentToolResult;
+
+    /// The queue depth must survive the native remote projection: a client that
+    /// never sees it cannot render the "N queued" indicator.
+    #[test]
+    fn turn_end_projects_pending_messages() {
+        let event = AgentEvent::TurnEnd {
+            message: rpi_agent::AgentMessage::Assistant(Box::new(
+                rpi_ai::types::AssistantMessage::empty(
+                    rpi_ai::types::Api::AnthropicMessages,
+                    "p",
+                    "m",
+                    0,
+                ),
+            )),
+            tool_results: vec![],
+            pending_messages: 3,
+        };
+        let projected = RemoteEvent::from_agent_event(&event);
+        assert_eq!(projected.type_tag(), "turn_end");
+        let wire = serde_json::to_value(&projected).unwrap();
+        assert_eq!(wire["pendingMessages"], 3, "{wire}");
+
+        // Zero is a real value, not an absent field.
+        let zero = AgentEvent::TurnEnd {
+            message: rpi_agent::AgentMessage::Assistant(Box::new(
+                rpi_ai::types::AssistantMessage::empty(
+                    rpi_ai::types::Api::AnthropicMessages,
+                    "p",
+                    "m",
+                    0,
+                ),
+            )),
+            tool_results: vec![],
+            pending_messages: 0,
+        };
+        let wire = serde_json::to_value(RemoteEvent::from_agent_event(&zero)).unwrap();
+        assert_eq!(wire["pendingMessages"], 0, "{wire}");
+
+        // A peer that predates the field still deserializes.
+        let legacy: RemoteEvent = serde_json::from_value(serde_json::json!({
+            "type":"turn_end", "message":null, "toolResultCount":0, "toolResults":[],
+        }))
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            RemoteEvent::TurnEnd {
+                pending_messages: 0,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn dialog_wire_shapes_round_trip_with_request_ids() {

@@ -19,14 +19,18 @@ use std::{
     sync::Arc,
 };
 
+#[derive(Clone)]
 struct Location {
     seq: u64,
+    stream_index: usize,
+    append: bool,
+    retired: bool,
     offset: u64,
     length: usize,
     scope: usize,
     digest: [u8; 32],
 }
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ColdFrames {
     reader: Option<Arc<dyn ReadFile>>,
     locations: Vec<Location>,
@@ -50,6 +54,25 @@ impl DerefMut for ResidentState {
     }
 }
 impl ResidentState {
+    pub fn apply_mutation(
+        &mut self,
+        mutation: SessionMutation,
+    ) -> SessionResult<crate::session::state::ApplyOutcome> {
+        let outcome = self.reducer.apply_mutation(mutation)?;
+        if let crate::session::state::ApplyOutcome::Record(LaneRecord::AssistantFrame(frame)) =
+            &outcome
+        {
+            if matches!(
+                frame.op,
+                AssistantFrameOp::ClearStream | AssistantFrameOp::ClearRun
+            ) {
+                // Existing plans keep their immutable pre-clear generation.
+                Arc::make_mut(&mut self.cold).retire(frame);
+            }
+        }
+        Ok(outcome)
+    }
+
     pub fn defer(
         &mut self,
         frame: &AssistantFrameRecord,
@@ -61,6 +84,7 @@ impl ResidentState {
         let cold = Arc::get_mut(&mut self.cold)
             .ok_or_else(|| SessionError::storage("cold history already published"))?;
         cold.reader = Some(reader.clone());
+        cold.retire(frame);
         let scope = (frame.base.lane.clone(), frame.run_id.clone());
         let next = cold.scopes.len();
         let scope_id = *cold.scope_ids.entry(scope.clone()).or_insert_with(|| {
@@ -69,6 +93,9 @@ impl ResidentState {
         });
         cold.locations.push(Location {
             seq: frame.base.seq,
+            stream_index: frame.stream_index,
+            append: frame.op == AssistantFrameOp::Append,
+            retired: false,
             offset,
             length: line.len(),
             scope: scope_id,
@@ -104,7 +131,8 @@ impl ResidentState {
             cold.by_ref()
                 .filter(|(_, loc)| {
                     let (lane, run) = &self.cold.scopes[loc.scope];
-                    query.lane.as_ref().is_none_or(|v| v == lane)
+                    !loc.retired
+                        && query.lane.as_ref().is_none_or(|v| v == lane)
                         && query.run_id.as_ref().is_none_or(|v| v == run)
                         && query.after_seq.is_none_or(|v| loc.seq > v)
                 })
@@ -124,7 +152,8 @@ impl ResidentState {
     pub fn page_plan(&self, query: &RecordPageQuery) -> SessionResult<(RecordPlan, usize)> {
         let hot = self.reducer.record_page(query)?;
         let matching = |loc: &&Location| {
-            self.cold.scopes[loc.scope].0 == query.lane
+            !loc.retired
+                && self.cold.scopes[loc.scope].0 == query.lane
                 && query.after_seq.is_none_or(|v| loc.seq > v)
                 && query.before_seq.is_none_or(|v| loc.seq < v)
         };
@@ -168,7 +197,7 @@ impl ResidentState {
                 .locations
                 .iter()
                 .enumerate()
-                .filter(|(_, loc)| options.after_seq.is_none_or(|v| loc.seq > v))
+                .filter(|(_, loc)| !loc.retired && options.after_seq.is_none_or(|v| loc.seq > v))
                 .take(options.limit.unwrap_or(usize::MAX))
                 .map(|(i, _)| Selected::Cold(i)),
         );
@@ -240,6 +269,27 @@ impl LogPlan {
     }
 }
 impl ColdFrames {
+    // Match SessionState retirement exactly, including its run-wide scope.
+    // Keep locations and permanent reducer ID reservations; only hide retired
+    // append payloads from new queries, never from an already-issued read plan.
+    fn retire(&mut self, frame: &AssistantFrameRecord) {
+        if !matches!(
+            frame.op,
+            AssistantFrameOp::ClearStream | AssistantFrameOp::ClearRun
+        ) {
+            return;
+        }
+        for loc in &mut self.locations {
+            if loc.append
+                && self.scopes[loc.scope].1 == frame.run_id
+                && (frame.op == AssistantFrameOp::ClearRun
+                    || loc.stream_index == frame.stream_index)
+            {
+                loc.retired = true;
+            }
+        }
+    }
+
     async fn read_selected<T>(
         &self,
         selected: &[Selected<T>],

@@ -253,6 +253,7 @@ pub(super) async fn handle_agent_event(
         AgentEvent::TurnEnd {
             message,
             tool_results,
+            ..
         } => {
             // Finalize the assistant message for this turn.
             let view = state.transcript_view();

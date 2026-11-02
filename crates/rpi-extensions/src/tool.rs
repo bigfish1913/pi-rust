@@ -136,7 +136,7 @@ fn json_to_result(text: &str) -> AgentToolResult {
                         result.content.push(TextContentOrImage::Image(
                             rpi_ai::types::ImageContent {
                                 kind: rpi_ai::types::ImageContentType,
-                                data,
+                                data: data.into(),
                                 mime_type: mime,
                             },
                         ));

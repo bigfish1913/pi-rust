@@ -65,10 +65,10 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
 use rpi_plugin_sdk::{
-    BeforeAgentStartFn, EventHandlerFn, EventTag, FreeStringFn, OAuthRequestFn, ProviderRequestFn,
-    ProviderStreamRequestFn, RenderFn, ResourcesDiscoverFn, RuntimeActionFn, StablePluginEvent,
-    StableToolSchema, StbString, StbStringRef, ToolCancelFn, ToolDestroyFn, ToolExecuteFn,
-    ToolPollFn,
+    BeforeAgentStartFn, EventHandlerFn, EventTag, FreeStringFn, OAuthRequestControlFn,
+    OAuthRequestFn, ProviderRequestFn, ProviderStreamRequestFn, RenderFn, ResourcesDiscoverFn,
+    RuntimeActionFn, StablePluginEvent, StableToolSchema, StbString, StbStringRef, ToolCancelFn,
+    ToolDestroyFn, ToolExecuteFn, ToolPollFn,
 };
 use thiserror::Error;
 
@@ -83,8 +83,9 @@ pub use loader::{
     LoadedPlugin, PluginKeepalive, PluginLoadError,
 };
 pub use oauth::{
-    list as list_oauth_providers, request as request_oauth, OAuthActionResponse,
-    OAuthExtensionError, OAuthProviderInfo, OAuthResponseKind,
+    list as list_oauth_providers, request as request_oauth,
+    request_with_cancel as request_oauth_with_cancel, OAuthActionResponse, OAuthExtensionError,
+    OAuthProviderInfo, OAuthResponseKind,
 };
 pub use prompt_transform::emit_before_agent_start;
 pub use provider::PluggableProvider;
@@ -326,6 +327,9 @@ impl HostApi {
             // offset (a plugin built against the previous layout keeps working).
             register_before_agent_start: Some(trampoline_register_before_agent_start),
             register_oauth_provider: Some(trampoline_register_oauth_provider),
+            register_oauth_provider_cancellable: Some(
+                trampoline_register_oauth_provider_cancellable,
+            ),
             runtime_action: runtime_action_fn,
             dispatch_event: Some(trampoline_dispatch_event),
             user_data: ud,
@@ -799,11 +803,58 @@ extern "C" fn unsupported_one_shot_provider_request(
 
 /// Register an OAuth provider manifest and action callback. The manifest is
 /// copied immediately; token-bearing responses remain plugin-owned and are
-/// reclaimed through the plugin free function when invoked by a future host
-/// OAuth bridge.
+/// reclaimed through the plugin free function when invoked by the host OAuth
+/// bridge. The legacy callback cannot observe cancellation.
 extern "C" fn trampoline_register_oauth_provider(
     manifest_json: StbStringRef,
     request_fn: OAuthRequestFn,
+    plugin_free_string: FreeStringFn,
+    user_data: *mut c_void,
+) -> i32 {
+    register_oauth_provider_record(
+        manifest_json,
+        request_fn,
+        None,
+        plugin_free_string,
+        user_data,
+    )
+}
+
+/// Register an OAuth provider whose action callback takes an
+/// [`rpi_plugin_sdk::OAuthRequestControl`]. The host passes a control that
+/// reflects cancellation of each action. Otherwise identical to
+/// [`trampoline_register_oauth_provider`].
+extern "C" fn trampoline_register_oauth_provider_cancellable(
+    manifest_json: StbStringRef,
+    request_fn: OAuthRequestControlFn,
+    plugin_free_string: FreeStringFn,
+    user_data: *mut c_void,
+) -> i32 {
+    register_oauth_provider_record(
+        manifest_json,
+        unsupported_legacy_oauth_request,
+        Some(request_fn),
+        plugin_free_string,
+        user_data,
+    )
+}
+
+/// Placeholder legacy callback for a cancellable registration. The host always
+/// prefers `control_fn` when it is present, so this fails loudly if a future code
+/// path ever calls it, rather than dereferencing a null pointer.
+extern "C" fn unsupported_legacy_oauth_request(
+    _req_json: StbStringRef,
+    _out: *mut StbString,
+    _user_data: *mut c_void,
+) -> i32 {
+    tracing::error!("a cancellable OAuth provider was driven through the legacy request path");
+    1
+}
+
+fn register_oauth_provider_record(
+    manifest_json: StbStringRef,
+    request_fn: OAuthRequestFn,
+    control_fn: Option<OAuthRequestControlFn>,
     plugin_free_string: FreeStringFn,
     user_data: *mut c_void,
 ) -> i32 {
@@ -815,6 +866,7 @@ extern "C" fn trampoline_register_oauth_provider(
         plugin: with_current_api(|api| api.name.clone()).unwrap_or_default(),
         manifest_json: manifest,
         request_fn,
+        control_fn,
         plugin_free_string,
         user_data,
     };
