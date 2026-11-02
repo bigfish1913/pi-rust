@@ -531,14 +531,15 @@ async fn context_uses_metadata_before_compaction_and_payload_filter_precedes_lim
     assert_eq!(context.active_tool_names, expected.active_tool_names);
     // Only compaction, its tail and the custom entry are hydrated. Model,
     // thinking and active-tools state come from small full-path facts.
-    // Compaction and its tail coalesce; the >256 KiB custom entry stays alone.
-    assert_eq!(reader.calls.load(Ordering::Relaxed) - before, 2);
+    // Compaction and its tail coalesce. The custom row plus its JSON envelope
+    // exceeds 1 MiB and is hydrated alone, through two bounded physical reads.
+    assert_eq!(reader.calls.load(Ordering::Relaxed) - before, 3);
     let ranges = reader.ranges.lock().unwrap();
-    let selected_ranges = &ranges[ranges.len() - 2..];
+    let selected_ranges = &ranges[ranges.len() - 3..];
     assert_eq!(selected_ranges[0].0, context_start);
     assert!(selected_ranges
         .iter()
-        .all(|(offset, _)| *offset >= context_start));
+        .all(|(offset, length)| *offset >= context_start && *length <= CHUNK));
     drop(ranges);
     let before = reader.calls.load(Ordering::Relaxed);
     let overview = storage.branch_overview("main").await.unwrap();

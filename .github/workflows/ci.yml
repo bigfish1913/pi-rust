@@ -144,6 +144,11 @@ jobs:
     env:
       RUSTFLAGS: "-D warnings"
       RUSTDOCFLAGS: "-D warnings"
+      # Large workspace test binaries can exhaust the hosted runner disk.
+      # Keep assertions and warning checks; only omit symbols/incremental state.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
       # Cargo caches target/, including old diagnostics. Keep smoke output outside
       # that cache and unique per attempt without weakening overwrite protection.
       SESSION_SMOKE_DIAGNOSTICS_NAME: session-smoke-${{ github.run_id }}-${{ github.run_attempt }}
@@ -161,6 +166,8 @@ jobs:
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
+        with:
+          key: test-no-debuginfo
 
       - name: Verify embedded docs are in sync
         run: |
