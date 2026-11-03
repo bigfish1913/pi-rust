@@ -501,6 +501,36 @@ impl SettleState {
         Ok(())
     }
 
+    /// Nested effects are descendants of a real committed Never-replay call.
+    /// Custom records are audit metadata, not fabricated assistant/tool messages.
+    pub(crate) async fn start_nested_tool(
+        &self,
+        harness: &AgentHarness,
+        parent: &rpi_agent::tool_program::NestedParent,
+        id: &str,
+        name: &str,
+        args: &serde_json::Value,
+    ) -> crate::result::HarnessResult<()> {
+        if self
+            .tool_replays
+            .get(&parent.root_name)
+            .copied()
+            .unwrap_or(ToolReplay::Never)
+            != ToolReplay::Never
+            || !self
+                .reserved_results
+                .lock()
+                .unwrap()
+                .contains_key(&parent.root_id)
+        {
+            return Err(crate::result::HarnessError::io(
+                "nested invocation requires a checkpointed Never-replay parent",
+            ));
+        }
+        harness.append_custom_entry("rpi.tool_program.intent.v1", Some(serde_json::json!({"runId":self.run_id,"rootToolCallId":parent.root_id,"parentToolCallId":parent.parent_id,"requestId":id,"name":name,"arguments":args,"replay":"never"}))).await?;
+        Ok(())
+    }
+
     /// Remember each tool call of a freshly committed assistant message, keyed so
     /// the execution barrier can record it against the right entry and ordinal.
     pub(crate) fn record_tool_calls(&self, entry_id: &str, message: &AssistantMessage) {

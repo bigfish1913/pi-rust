@@ -554,6 +554,14 @@ pub type SideQuestionSink =
 /// are routed directly by the plugin bridge.
 #[async_trait::async_trait]
 pub trait RuntimeActionHost: Send + Sync {
+    /// Action 30: an authenticated host-owned executing invocation, never registry JSON.
+    async fn tool_program(
+        &self,
+        capability: Arc<rpi_agent::tool_program::ToolProgram>,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        capability.handle(args).await
+    }
     /// Revoke side questions when their plugin bridge is retired.
     fn cancel_side_questions(&self, _owner: u64) {}
     /// Host-internal TUI snapshots; never exposed as a cross-owner plugin action.
@@ -784,6 +792,7 @@ pub struct ActionBridge {
     /// Some(child) only for a live host-created tool invocation.
     invocation: Option<(bool, String, tokio_util::sync::CancellationToken)>,
     execution_context: Option<serde_json::Value>,
+    tool_program: Option<Arc<rpi_agent::tool_program::ToolProgram>>,
     stdio: crate::StdioLifecycle,
     plugin_identity: Option<(u64, String)>,
     component_owners: Arc<std::sync::Mutex<Vec<u64>>>,
@@ -844,9 +853,14 @@ impl ActionBridge {
         child: bool,
         signal: tokio_util::sync::CancellationToken,
     ) -> Arc<Self> {
+        let tool_program = rpi_agent::tool_program::current();
+        if let Some(program) = &tool_program {
+            program.bind_signal(signal.clone());
+        }
         Arc::new(Self {
             invocation: Some((child, uuid::Uuid::new_v4().to_string(), signal)),
             execution_context: rpi_agent::tool_execution_scope::execution_context(),
+            tool_program,
             stdio: self.stdio.clone(),
             plugin_identity: self.plugin_identity.clone(),
             component_owners: self.component_owners.clone(),
@@ -873,6 +887,7 @@ impl ActionBridge {
     pub fn new(runtime: Handle, host: Arc<dyn RuntimeActionHost>) -> Arc<Self> {
         Arc::new(Self {
             invocation: None,
+            tool_program: None,
             execution_context: None,
             stdio: crate::StdioLifecycle::default(),
             plugin_identity: None,
@@ -912,6 +927,7 @@ impl ActionBridge {
     ) -> Arc<Self> {
         Arc::new(Self {
             invocation: None,
+            tool_program: None,
             execution_context: None,
             stdio: crate::StdioLifecycle::default(),
             plugin_identity: None,
@@ -937,6 +953,7 @@ impl ActionBridge {
     ) -> Arc<Self> {
         Arc::new(Self {
             invocation: None,
+            tool_program: None,
             execution_context: None,
             stdio: crate::StdioLifecycle::default(),
             plugin_identity: None,
@@ -960,6 +977,7 @@ impl ActionBridge {
             .push(owner);
         Arc::new(Self {
             invocation: None,
+            tool_program: None,
             execution_context: None,
             component_owners: self.component_owners.clone(),
             stdio: self.stdio.clone(),
@@ -1024,6 +1042,20 @@ impl ActionBridge {
             }
             owners.clone()
         };
+        // Cancel captured capabilities across FFI thread hops on reload/session retirement.
+        let live: Vec<_> = bridges()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect();
+        for bridge in live {
+            if Arc::ptr_eq(&bridge.active, &self.active) {
+                if let Some(program) = &bridge.tool_program {
+                    program.cancel_all();
+                }
+            }
+        }
         // Host cancellation may contend with a job publishing through its
         // sink. Never invoke it while holding the sink's lifecycle gate.
         for owner in owners {
@@ -1213,6 +1245,7 @@ async fn dispatch(
         RuntimeActionId::SetEditorText => editor_text.handle(args),
         RuntimeActionId::GetSessionBranch => host.get_session_branch(args).await,
         RuntimeActionId::GetExecutionContext => host.get_execution_context(args).await,
+        RuntimeActionId::ToolProgram => Err("ToolProgram requires a live invocation bridge".into()),
         RuntimeActionId::ChildAgent => Err("ChildAgent requires a plugin bridge".into()),
         RuntimeActionId::SideQuestion => Err("SideQuestion requires a plugin bridge".into()),
         RuntimeActionId::ListCommands => host.list_commands(args).await,
@@ -1428,6 +1461,45 @@ fn run_action(
             bridge.runtime.spawn(async move {
                 let _ = tx.send(host.side_question(owner, args, sink).await);
             });
+        }
+    } else if action == RuntimeActionId::GetActiveTools && bridge.tool_program.is_some() {
+        let tools = bridge
+            .tool_program
+            .as_ref()
+            .expect("checked")
+            .active_tool_names();
+        let _ = tx.send(Ok(serde_json::json!({"tools":tools})));
+    } else if action == RuntimeActionId::SetActiveTools && bridge.execution_context.is_some() {
+        let _ = tx.send(Err(
+            "cannot replace active tools from a narrowed execution".into()
+        ));
+    } else if action == RuntimeActionId::ToolProgram {
+        let cleanup = matches!(
+            args.get("op").and_then(serde_json::Value::as_str),
+            Some("poll" | "cancel" | "dispose")
+        );
+        let authenticated = bridge.invocation.as_ref().is_some_and(|(_, key, signal)| {
+            (cleanup || !signal.is_cancelled())
+                && (invocation_thread
+                    || runtime_key.as_ref().and_then(serde_json::Value::as_str)
+                        == Some(key.as_str()))
+        });
+        if let Some(capability) = bridge.tool_program.clone().filter(|_| authenticated) {
+            let signal = bridge.invocation.as_ref().expect("authenticated").2.clone();
+            bridge.runtime.spawn(async move {
+                if signal.is_cancelled() {
+                    capability.cancel_all();
+                    if !cleanup {
+                        let _ = tx.send(Err("parent invocation is no longer active".into()));
+                        return;
+                    }
+                }
+                let _ = tx.send(host.tool_program(capability, args).await);
+            });
+        } else {
+            let _ = tx.send(Err(
+                "ToolProgram requires an authenticated executing invocation".into(),
+            ));
         }
     } else if action == RuntimeActionId::ChildAgent {
         // A registration handle cannot assert that it is a parent invocation.

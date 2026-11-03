@@ -1,0 +1,40 @@
+name: Native tool program checks
+
+on:
+  pull_request:
+    paths:
+      - 'crates/rpi-agent/**'
+      - 'crates/rpi-plugin-sdk/**'
+      - 'crates/rpi-extensions/**'
+      - 'crates/rpi-harness/**'
+      - 'crates/rpi-cli/src/extensions_actions.rs'
+      - 'scripts/codemode-smoke.py'
+      - 'docs/extensions/tool-program.md'
+      - '.github/workflows/codemode-checks.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tool-program:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check changed package formatting
+        run: cargo fmt -p rpi-agent -p rpi-plugin-sdk -p rpi-extensions -p rpi-harness -- --check
+      - name: Test tool program execution, auth and durable intent
+        run: cargo test --locked -p rpi-agent -p rpi-plugin-sdk -p rpi-extensions -p rpi-harness tool_program
+      - name: Check CLI binding
+        run: cargo check --locked -p rpi-cli
+      - name: Check native smoke syntax (not native qualification)
+        run: python -c "import ast,pathlib; ast.parse(pathlib.Path('scripts/codemode-smoke.py').read_text(encoding='utf-8'))"

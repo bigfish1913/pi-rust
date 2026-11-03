@@ -54,6 +54,10 @@ impl ToolExecutionScope {
     }
 }
 
+pub fn current_scope() -> Option<Arc<ToolExecutionScope>> {
+    CURRENT.try_with(Clone::clone).ok()
+}
+
 pub fn is_child_execution() -> bool {
     CURRENT.try_with(|_| ()).is_ok()
 }

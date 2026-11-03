@@ -396,9 +396,12 @@ impl AgentTool for PluginToolAdapter {
     }
 
     fn execution_mode(&self) -> ToolExecutionMode {
-        // Plugin tools default to Parallel (the AgentTool default). A plugin
-        // could declare Sequential via a future schema field; v1 keeps Parallel.
-        ToolExecutionMode::Parallel
+        // A JSON Schema extension keyword works with old SDK raw registration.
+        if self.schema.parameters.as_value()["x-rpi-execution-mode"] == "sequential" {
+            ToolExecutionMode::Sequential
+        } else {
+            ToolExecutionMode::Parallel
+        }
     }
 
     async fn execute(
@@ -829,6 +832,16 @@ mod tests {
             constrained_sampling: None,
         };
         PluginToolAdapter::new(tool, stub_handle(), PluginKeepalive::empty())
+    }
+
+    #[test]
+    fn tool_program_sequential_metadata_supports_old_raw_schema() {
+        let mut adapter = echo_adapter();
+        assert_eq!(adapter.execution_mode(), ToolExecutionMode::Parallel);
+        adapter.schema.parameters = rpi_ai::types::Schema::new(serde_json::json!({
+            "type": "object", "x-rpi-execution-mode": "sequential"
+        }));
+        assert_eq!(adapter.execution_mode(), ToolExecutionMode::Sequential);
     }
 
     fn reset_counters() {

@@ -348,3 +348,7 @@ async fn integrated_commands_abort_dialog_and_stop_round_dispatch_without_renumb
     assert_eq!(host.aborts.load(Ordering::SeqCst), 1);
     assert_eq!(host.stop_rounds.load(Ordering::SeqCst), 1);
 }
+
+#[path = "../../../rpi-agent/tests/common/mod.rs"]
+mod agent_common;
+mod tool_program;

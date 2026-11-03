@@ -527,6 +527,14 @@ pub(crate) fn assistant_text(msg: &rpi_ai::types::AssistantMessage) -> String {
 
 #[async_trait::async_trait]
 impl RuntimeActionHost for HarnessActionHost {
+    async fn tool_program(
+        &self,
+        capability: Arc<rpi_agent::tool_program::ToolProgram>,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        // Deliberately do not look up the root harness: capability owns the effective binding.
+        capability.handle(args).await
+    }
     fn cancel_side_questions(&self, owner: u64) {
         self.side_questions.cancel_owner(owner);
     }
