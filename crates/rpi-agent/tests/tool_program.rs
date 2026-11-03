@@ -502,3 +502,201 @@ async fn outer_program_waits_for_timed_out_native_cleanup_before_returning() {
     }), common::base_config(), count, 100).await;
     assert!(began.elapsed() >= std::time::Duration::from_millis(100));
 }
+
+/// A native descendant that observes cancellation but keeps its cleanup alive.
+struct CleanupProbe {
+    schema: Tool,
+    live: Arc<AtomicUsize>,
+    cleaned: Arc<AtomicUsize>,
+    overlap: Arc<AtomicUsize>,
+    observe: bool,
+}
+#[async_trait::async_trait]
+impl AgentTool for CleanupProbe {
+    fn schema(&self) -> &Tool {
+        &self.schema
+    }
+    fn label(&self) -> &str {
+        "cleanup probe"
+    }
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Sequential
+    }
+    async fn execute(
+        &self,
+        _: &str,
+        _: Value,
+        signal: CancellationToken,
+        _: Arc<dyn Fn(ToolResultPartial) + Send + Sync>,
+    ) -> Result<AgentToolResult, AgentError> {
+        if self.observe {
+            self.overlap
+                .fetch_add(self.live.load(Ordering::SeqCst), Ordering::SeqCst);
+        } else {
+            self.live.store(1, Ordering::SeqCst);
+            signal.cancelled().await;
+            // Cancellation cannot interrupt a foreign/native destroy callback.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            self.live.store(0, Ordering::SeqCst);
+            self.cleaned.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(AgentToolResult::text("cleaned"))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn panicking_nested_program_drains_descendants_before_releasing_its_gate() {
+    // Check both root return and a later sequential sibling after polling failure.
+    for sibling in [false, true] {
+        let live = Arc::new(AtomicUsize::new(0));
+        let cleaned = Arc::new(AtomicUsize::new(0));
+        let overlap = Arc::new(AtomicUsize::new(0));
+        let before = Arc::new(AtomicUsize::new(0));
+        let after = Arc::new(AtomicUsize::new(0));
+        let mut cfg = common::base_config();
+        let seen = before.clone();
+        cfg.before_tool_call = Some(Arc::new(move |ctx, _| {
+            if ctx.tool_call.name == "nested" {
+                seen.fetch_add(1, Ordering::SeqCst);
+            }
+            Box::pin(async { None })
+        }));
+        let seen = after.clone();
+        cfg.after_tool_call = Some(Arc::new(move |ctx, _| {
+            if ctx.tool_call.name == "nested" {
+                seen.fetch_add(1, Ordering::SeqCst);
+            }
+            Box::pin(async { None })
+        }));
+        let observed = live.clone();
+        let tools: Vec<Arc<dyn AgentTool>> = vec![
+            Arc::new(Program {
+                schema: schema("codemode"),
+                mode: ToolExecutionMode::Sequential,
+                body: Arc::new(move |p| {
+                    Box::pin(async move {
+                        let id = p
+                            .handle(json!({
+                                "op":"start", "name":"nested", "arguments":{"value":"ok"}
+                            }))
+                            .await
+                            .unwrap()["requestId"]
+                            .clone();
+                        let failure = poll(&p, &id).await;
+                        assert_eq!(failure["status"], "failed");
+                        assert_eq!(failure["error"], "nested invocation panicked");
+                        if sibling {
+                            let id = p
+                                .handle(json!({
+                                    "op":"start", "name":"probe", "arguments":{"value":"ok"}
+                                }))
+                                .await
+                                .unwrap()["requestId"]
+                                .clone();
+                            assert_eq!(poll(&p, &id).await["status"], "done");
+                        }
+                    })
+                }),
+            }),
+            Arc::new(Program {
+                schema: schema("nested"),
+                mode: ToolExecutionMode::Sequential,
+                body: Arc::new(move |p| {
+                    let observed = observed.clone();
+                    Box::pin(async move {
+                        p.handle(json!({
+                            "op":"start", "name":"slow", "arguments":{"value":"ok"}
+                        }))
+                        .await
+                        .unwrap();
+                        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                            while observed.load(Ordering::SeqCst) == 0 {
+                                tokio::task::yield_now().await;
+                            }
+                        })
+                        .await
+                        .unwrap();
+                        panic!("controlled nested program panic");
+                    })
+                }),
+            }),
+            Arc::new(CleanupProbe {
+                schema: schema("slow"),
+                live: live.clone(),
+                cleaned: cleaned.clone(),
+                overlap: overlap.clone(),
+                observe: false,
+            }),
+            Arc::new(CleanupProbe {
+                schema: schema("probe"),
+                live: live.clone(),
+                cleaned: cleaned.clone(),
+                overlap: overlap.clone(),
+                observe: true,
+            }),
+        ];
+        tokio::time::timeout(std::time::Duration::from_secs(3), run_tools(tools, cfg))
+            .await
+            .unwrap();
+        assert_eq!(
+            overlap.load(Ordering::SeqCst),
+            0,
+            "sibling overlapped cleanup"
+        );
+        assert_eq!(
+            live.load(Ordering::SeqCst),
+            0,
+            "root left a live descendant"
+        );
+        assert_eq!(cleaned.load(Ordering::SeqCst), 1);
+        assert_eq!(before.load(Ordering::SeqCst), 1);
+        // A panic is still a lifecycle failure, not a finalized tool error.
+        assert_eq!(after.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn oversized_finalized_terminate_latches_before_reply_encoding() {
+    // Admission follows the final hook override, including an oversized error
+    // result, not the original tool result or whether encoding succeeds.
+    for (terminate, is_error) in [(true, false), (true, true), (false, false)] {
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut cfg = common::base_config();
+        cfg.after_tool_call = Some(Arc::new(move |ctx, _| {
+            let effect = ctx.tool_call.name == "effect";
+            Box::pin(async move {
+                effect.then(|| AfterToolCallResult {
+                    terminate: Some(terminate),
+                    is_error: Some(is_error),
+                    details: Some(json!({"large":"x".repeat(1024 * 1024)})),
+                    ..Default::default()
+                })
+            })
+        }));
+        run(
+            Arc::new(move |p| {
+                Box::pin(async move {
+                    let id = start(&p).await;
+                    let reply = poll(&p, &id).await;
+                    assert_eq!(reply["status"], "failed");
+                    assert_eq!(reply["error"], "ToolProgram JSON exceeds 1 MiB");
+                    if terminate {
+                        assert_eq!(
+                            start_result(&p).await.unwrap_err(),
+                            "parent invocation is no longer active"
+                        );
+                        assert!(p.handle(json!({"op":"list"})).await.is_err());
+                    } else {
+                        let id = start(&p).await;
+                        assert_eq!(poll(&p, &id).await["status"], "failed");
+                    }
+                })
+            }),
+            cfg,
+            count.clone(),
+            0,
+        )
+        .await;
+        assert_eq!(count.load(Ordering::SeqCst), if terminate { 1 } else { 2 });
+    }
+}

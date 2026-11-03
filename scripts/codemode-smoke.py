@@ -26,6 +26,8 @@ CASES = {
     "invalid": {"code": "return await tools.read({});"},
     "partial": {"code": "await tools.write({path:'partial.txt',content:'effect-before-error'}); throw new Error('expected smoke failure');"},
     "timeout": {"code": "while(true){}", "timeoutMs": 25},
+    "regexp_rejected": {"code": "return /^(a+)+$/.test('a'.repeat(25)+'!');", "timeoutMs": 50},
+    "caught_oom": {"code": "try { const a=[]; for(;;) a.push(new Array(10000).fill('x')); } catch(e) {} return 42;", "timeoutMs": 5000},
     "cancel": {"code": "while(true){}", "timeoutMs": 120000},
     "denied": {"code": "return await tools.write({path:'denied.txt',content:'must-not-exist'});"},
     "after_cancel": {"code": "return (await tools.read({path:'seed.txt'})).content;"},
@@ -161,7 +163,7 @@ def run_group(args, root, gated=False):
         host = Host(command, root, env, 45)
         ready = host.wait(lambda f: f.get("type") == "ready")
         dump(root / "ready.json", ready)
-        cases = ["denied"] if gated else ["list", "compose", "invalid", "partial", "timeout", "cancel", "after_cancel"]
+        cases = ["denied"] if gated else ["list", "compose", "invalid", "partial", "timeout", "regexp_rejected", "caught_oom", "cancel", "after_cancel"]
         findings = []
         for case in cases:
             require(host.call("prompt", message=case) == {"accepted": True}, "prompt acceptance")
@@ -185,6 +187,12 @@ def run_group(args, root, gated=False):
             else:
                 require(result.get("isError") is True, result)
                 require(summary and summary["status"] == ("timed_out" if case == "timeout" else "error"), result)
+                if case == "regexp_rejected":
+                    require("regexp" in summary["error"].lower(), summary)
+                    require(summary["durationMs"] < 1000 and not summary["calls"], summary)
+                if case == "caught_oom":
+                    require(summary["error"] == "codemode memory budget exceeded", summary)
+                    require(summary["result"] is None and not summary["calls"], summary)
                 if case == "partial":
                     require((root / "workspace/partial.txt").read_text() == "effect-before-error", summary)
                 if case == "denied":

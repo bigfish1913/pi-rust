@@ -1540,25 +1540,31 @@ async fn execute_prepared_tool_call(
     };
 
     let execute_started = agent_diagnostics_enabled().then(Instant::now);
-    let outcome = match crate::tool_program::scope(
-        capability.clone(),
-        tool.execute(&tool_call.id, args.clone(), child_token, on_update),
-    )
-    .await
-    {
-        Ok(result) => {
-            accepting_updates.store(false, Ordering::SeqCst);
-            ExecutedToolCallOutcome {
-                result,
-                is_error: false,
-            }
-        }
-        Err(e) => {
-            accepting_updates.store(false, Ordering::SeqCst);
-            ExecutedToolCallOutcome {
-                result: create_error_tool_result(&e.to_string()),
-                is_error: true,
-            }
+    let executed = std::panic::AssertUnwindSafe(async {
+        crate::tool_program::scope(
+            capability.clone(),
+            tool.execute(&tool_call.id, args.clone(), child_token, on_update),
+        )
+        .await
+    })
+    .catch_unwind()
+    .await;
+    accepting_updates.store(false, Ordering::SeqCst);
+    let outcome = match executed {
+        Ok(Ok(result)) => ExecutedToolCallOutcome {
+            result,
+            is_error: false,
+        },
+        Ok(Err(e)) => ExecutedToolCallOutcome {
+            result: create_error_tool_result(&e.to_string()),
+            is_error: true,
+        },
+        Err(panic) => {
+            // Keep the containing request's gate/permits until every descendant
+            // has stopped, even when execute unwinds. Then let the existing
+            // outer panic handler preserve its error and hook semantics.
+            capability.finish().await;
+            std::panic::resume_unwind(panic);
         }
     };
     if let Some(started) = execute_started {

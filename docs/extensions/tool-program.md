@@ -61,6 +61,11 @@ a request does not release its active permit or gate. The outer program also
 cancels and drains its descendants before returning, so a Sequential peer cannot
 start while a previous group's foreign destroy callback is still executing.
 Noncooperative tools can consequently hold the gate indefinitely (fail closed).
+Rust tool-execution panics also cancel and drain descendants at the
+capability-owning layer before unwinding to the existing panic handler; an
+exception cannot release the containing gate early. Finalized termination is
+latched before fallible reply serialization/bounds, so an oversized terminating
+result cannot reopen admission.
 
 The harness requires an already checkpointed **Never-replay** root parent.
 Replay-Safe parents fail closed before the nested effect. The ordinary parent
@@ -110,12 +115,12 @@ provider requests, messages and `results.json`. Existing evidence directories
 are rejected rather than overwritten. The approval case is explicitly skipped
 if no gate DLL is supplied.
 
-Local Windows validation passed eight cases: catalog discovery, dependent and
+Local Windows validation passed ten cases: catalog discovery, dependent and
 parallel read/write composition, invalid arguments, partial effect followed by
-JS error, timeout, explicit abort, reuse after abort, and rejected nested write
-approval. Checks also confirm durable nested markers, no orphan provider tool
+JS error, timeout, rejected native regex execution, caught-OOM failure, explicit
+abort, reuse after abort, and rejected nested write approval. Checks also confirm durable nested markers, no orphan provider tool
 results and no persisted invocation capabilities. Evidence is in the local
-`target/codemode-native-smoke-3/` directory; it is not a release asset. This is a
+`target/codemode-riskfix-native-smoke-1/` directory; it is not a release asset. This is a
 local source-build qualification, not installation/deployment, a performance
 benchmark, live-provider validation, or proof that Linux/macOS/native reload
 races have passed. Cross-platform workflows are authored but not run locally.

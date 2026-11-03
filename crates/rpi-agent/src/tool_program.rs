@@ -303,6 +303,11 @@ impl ToolProgram {
                         };
                         let finalized = result.map_err(|e| e.to_string())?;
                         let result = &finalized.result;
+                        // Finalization (including hooks), not reply encoding,
+                        // decides admission. Serialization/bounds may fail.
+                        if result.terminate {
+                            this.terminated.store(true, Ordering::SeqCst);
+                        }
                         let content: Vec<Value> = result
                             .content
                             .iter()
@@ -314,9 +319,6 @@ impl ToolProgram {
                             .map_err(|e| e.to_string())?;
                         let reply = json!({"requestId":request_id,"status":"done","isError":finalized.is_error,"result":{"content":content,"details":result.details,"terminate":result.terminate,"addedToolNames":result.added_tool_names,"usage":result.usage}});
                         bounded(&reply)?;
-                        if result.terminate {
-                            this.terminated.store(true, Ordering::SeqCst);
-                        }
                         Ok::<_, String>(reply)
                     };
                     let work = std::panic::AssertUnwindSafe(work).catch_unwind();
