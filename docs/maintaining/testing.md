@@ -1,5 +1,20 @@
 # 会话、恢复与资源测试
 
+## macOS / iTerm2 原生历史滚动验收
+
+场景、提交归因、协议测试和人工步骤见 [macOS / iTerm2 长会话验收](../debugging/macos-iterm2-scrollback.md)。
+
+```bash
+cargo test -p rpi-tui --test main_screen_scroll_up --locked -- --nocapture
+```
+
+验收覆盖后台计时、持续追加输出的逐帧完整性、历史区光标隐藏及返回、列 0/显示设置，
+以及强制重绘对消息唯一性和外部残留单元格的修复。默认 workspace 测试会执行，当前该
+集成目标 **15 通过、0 失败、0 ignored**，保留既有历史重排测试。
+regular 工具面板使用稳定运行状态，实时耗时仍在输入区工作状态中显示；fullscreen 和
+完成总耗时不变。真实 macOS / iTerm2 视觉验收未执行，不能用虚拟终端或 fullscreen
+对照 PASS 代替；真实历史编辑/重排仍可能重建 scrollback。
+
 ## 下次直接运行
 
 从 `pi-rust` 仓库根目录执行。前提是 Python 3、Rust/Cargo 和 Go Task 已安装。下面是本机 Windows PowerShell 可直接复制的命令；**任一步失败就先保留日志排查，不要把后续部分成功当成整轮通过。** 测试不会自动安装新 binary、替换全局 DLL 或重启服务。
