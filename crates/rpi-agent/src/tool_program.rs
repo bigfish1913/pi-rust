@@ -10,12 +10,15 @@ use std::{
     future::Future,
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, Weak,
     },
     time::Duration,
 };
 use tokio::sync::{RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
+
+#[path = "tool_program_accounting.rs"]
+mod accounting;
 
 const MAX_BYTES: usize = 1024 * 1024;
 static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -51,6 +54,7 @@ struct Request {
 #[derive(Default)]
 struct State {
     requests: HashMap<String, Request>,
+    accounting: accounting::Accounting,
 }
 /// Captured from the effective executing loop, never from a root registry.
 pub struct ToolProgram {
@@ -67,6 +71,7 @@ pub struct ToolProgram {
     tree_active: Arc<Semaphore>,
     ordered: bool,
     terminated: AtomicBool,
+    progress: Arc<Progress>,
     pub(crate) signal: CancellationToken,
 }
 impl ToolProgram {
@@ -76,7 +81,12 @@ impl ToolProgram {
         call: &ToolCall,
         config: &AgentLoopConfig,
         signal: CancellationToken,
+        on_update: Arc<dyn Fn(crate::ToolResultPartial) + Send + Sync>,
     ) -> Arc<Self> {
+        // Closing this composition must not cancel its containing native tool:
+        // wrappers may still need that tool's signal for result postprocessing.
+        // Caller cancellation still propagates down into the program and children.
+        let signal = signal.child_token();
         let previous = current();
         let mut ancestors = previous
             .as_ref()
@@ -119,6 +129,16 @@ impl ToolProgram {
             serial: RwLock::new(()),
             active: Arc::new(Semaphore::new(8)),
             terminated: AtomicBool::new(false),
+            progress: previous
+                .as_ref()
+                .map(|p| p.progress.clone())
+                .unwrap_or_else(|| {
+                    Arc::new(Progress {
+                        callback: on_update,
+                        signal: signal.clone(),
+                        budget: Mutex::default(),
+                    })
+                }),
             signal,
         })
     }
@@ -153,6 +173,12 @@ impl ToolProgram {
         // An outer Sequential call cannot finish ahead of its descendants.
         let _idle = self.active.acquire_many(8).await;
     }
+    pub(crate) fn merge_accounting(
+        &self,
+        result: &mut crate::AgentToolResult,
+    ) -> Result<(), String> {
+        self.state.lock().unwrap().accounting.merge(result)
+    }
     pub fn handle(self: &Arc<Self>, args: Value) -> BoxFuture<'static, Result<Value, String>> {
         let this = self.clone();
         Box::pin(async move { this.handle_inner(args).await })
@@ -184,7 +210,7 @@ impl ToolProgram {
                 let end = offset.saturating_add(limit).min(all.len());
                 let page = all.get(offset..end).unwrap_or(&[]);
                 Ok(
-                    json!({"protocolVersion":1,"tools":page,"nextOffset":if end<all.len(){Some(end)}else{None}}),
+                    json!({"protocolVersion":1,"capabilities":{"resultEnvelope":1,"hostAccounting":1,"parentProgress":1},"tools":page,"nextOffset":if end<all.len(){Some(end)}else{None}}),
                 )
             }
             "start" => {
@@ -241,7 +267,7 @@ impl ToolProgram {
                     {
                         return Err("ToolProgram start budget exceeded".into());
                     }
-                    if self.signal.is_cancelled() {
+                    if self.signal.is_cancelled() || self.terminated.load(Ordering::SeqCst) {
                         return Err("parent invocation is no longer active".into());
                     }
                     state.requests.insert(
@@ -254,6 +280,9 @@ impl ToolProgram {
                 }
                 let this = self.clone();
                 let request_id = id.clone();
+                let progress_name = name.clone();
+                let updates = Arc::new(AtomicUsize::new(0));
+                self.report(&id, &progress_name, "started", 0, &signal);
                 tokio::spawn(async move {
                     let _permit = permit;
                     let _tree_permit = tree_permit;
@@ -282,7 +311,13 @@ impl ToolProgram {
                         };
                         let mut config = this.config.clone();
                         config.signal = signal.clone();
-                        let emit: Arc<dyn AgentEmitter> = Arc::new(SilentEmitter);
+                        let emit: Arc<dyn AgentEmitter> = Arc::new(ProgressEmitter {
+                            program: Arc::downgrade(&this),
+                            request_id: request_id.clone(),
+                            name: progress_name.clone(),
+                            signal: signal.clone(),
+                            updates: updates.clone(),
+                        });
                         let execute = PARENT.scope(
                             this.identity.clone(),
                             scope(
@@ -303,10 +338,15 @@ impl ToolProgram {
                         };
                         let finalized = result.map_err(|e| e.to_string())?;
                         let result = &finalized.result;
-                        // Finalization (including hooks), not reply encoding,
-                        // decides admission. Serialization/bounds may fail.
-                        if result.terminate {
-                            this.terminated.store(true, Ordering::SeqCst);
+                        // Exactly one retention per direct request, before any fallible frame encoding.
+                        {
+                            let mut state = this.state.lock().unwrap();
+                            state.accounting.retain(result);
+                            // Serialize terminal retention with start's last admission check.
+                            // Finalization, not fallible reply encoding, decides admission.
+                            if result.terminate {
+                                this.terminated.store(true, Ordering::SeqCst);
+                            }
                         }
                         let content: Vec<Value> = result
                             .content
@@ -333,6 +373,21 @@ impl ToolProgram {
                             Err(_) => Err("nested invocation panicked".into()),
                         }, false),
                     };
+                    this.report(
+                        &request_id,
+                        &progress_name,
+                        if result.is_ok() {
+                            if result.as_ref().is_ok_and(|r| r["isError"] == true) {
+                                "failed"
+                            } else {
+                                "completed"
+                            }
+                        } else {
+                            "failed"
+                        },
+                        updates.load(Ordering::Relaxed),
+                        &signal,
+                    );
                     signal.cancel();
                     let reply = result.unwrap_or_else(
                         |error| json!({"requestId":request_id,"status":"failed","error":error}),
@@ -396,9 +451,72 @@ fn integer(args: &Value, key: &str, default: u64, min: u64, max: u64) -> Result<
         Ok(value)
     }
 }
-struct SilentEmitter;
-impl AgentEmitter for SilentEmitter {
-    fn emit(&self, _: AgentEvent) -> BoxFuture<'static, ()> {
+struct ProgressEmitter {
+    // Native tools may retain their update callback in the program's tool registry.
+    // Such callbacks must not keep that registry (and themselves) alive.
+    program: Weak<ToolProgram>,
+    request_id: String,
+    name: String,
+    signal: CancellationToken,
+    updates: Arc<AtomicUsize>,
+}
+impl AgentEmitter for ProgressEmitter {
+    fn emit(&self, event: AgentEvent) -> BoxFuture<'static, ()> {
+        self.try_emit(event);
         Box::pin(async {})
+    }
+    fn try_emit(&self, event: AgentEvent) {
+        if let (AgentEvent::ToolExecutionUpdate { .. }, Some(program)) =
+            (event, self.program.upgrade())
+        {
+            let count = self
+                .updates
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
+            program.report(
+                &self.request_id,
+                &self.name,
+                "progress",
+                count,
+                &self.signal,
+            );
+        }
+    }
+}
+
+/// Only lifecycle identity and a count cross the outer native update callback.
+struct Progress {
+    callback: Arc<dyn Fn(crate::ToolResultPartial) + Send + Sync>,
+    signal: CancellationToken,
+    budget: Mutex<(usize, usize)>,
+}
+impl ToolProgram {
+    fn report(&self, id: &str, name: &str, phase: &str, count: usize, signal: &CancellationToken) {
+        if signal.is_cancelled()
+            || self.signal.is_cancelled()
+            || self.progress.signal.is_cancelled()
+        {
+            return;
+        }
+        let short = |s: &str| s.chars().take(256).collect::<String>();
+        let details = json!({"toolProgram": {"rootId":short(&self.identity.root_id),
+            "parentId":short(&self.identity.parent_id), "requestId":short(id),
+            "tool":short(name), "phase":phase, "updateCount":count}});
+        let bytes = details.to_string().len();
+        {
+            let mut budget = self.progress.budget.lock().unwrap();
+            if budget.0 >= 256 || budget.1 + bytes > 64 * 1024 {
+                return;
+            }
+            budget.0 += 1;
+            budget.1 += bytes;
+        }
+        // An observer must never unwind past a cancelled worker's drain/permits.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (self.progress.callback)(crate::AgentToolResult {
+                details,
+                ..Default::default()
+            });
+        }));
     }
 }

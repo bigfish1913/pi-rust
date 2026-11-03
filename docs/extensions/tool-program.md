@@ -14,7 +14,8 @@ foreign workers authenticate the captured invocation, including child subsets.
 Operations:
 
 - `list`: `{op:"list", offset?:0, limit?:32}` returns
-  `{protocolVersion:1, tools:[{name,description,parameters}], nextOffset}`.
+  `{protocolVersion:1, capabilities:{resultEnvelope:1,hostAccounting:1,parentProgress:1},
+   tools:[{name,description,parameters}], nextOffset}`.
   Pages allow 1..128 entries; catalog maximum is 4096 entries and 1 MiB.
   The executing tool and ancestor names are excluded.
 - `start`: `{op:"start", name, arguments:{...}, timeoutMs?:30000}` returns
@@ -43,7 +44,7 @@ registry or JSON tool names. Tools retain their own project environment/cwd.
 The legacy names-only GetActiveTools action also uses this effective snapshot.
 
 Nested calls reuse prepare_arguments, schema validation, before/after hooks, and
-tool execution. A silent emitter prevents synthetic nested ToolExecutionStart or
+tool execution. A lifecycle-only emitter prevents synthetic nested ToolExecutionStart or
 MessageEnd events from entering the ordinary settlement/transcript stream.
 Sibling requests use a per-invocation read/write gate: Sequential calls exclude
 parallel siblings, and a Sequential loop serializes every sibling. The executing
@@ -60,6 +61,10 @@ signal, and continues polling the same execution future through cleanup. Disposi
 a request does not release its active permit or gate. The outer program also
 cancels and drains its descendants before returning, so a Sequential peer cannot
 start while a previous group's foreign destroy callback is still executing.
+The composition owns a child cancellation token: closing its plugin binding
+retires nested work without cancelling the containing tool's native image
+postprocessing. The containing native token still retires after execute and
+postprocessing finish. Caller cancellation propagates down through the tree.
 Noncooperative tools can consequently hold the gate indefinitely (fail closed).
 Rust tool-execution panics also cancel and drain descendants at the
 capability-owning layer before unwinding to the existing panic handler; an
@@ -76,6 +81,81 @@ arguments. Successful execution adds `rpi.tool_program.finished.v1` audit metada
 These custom entries are not fabricated assistant/tool-result messages and do
 not alter provider history. Interrupted parent programs remain unknown outcomes
 and are never automatically replayed. No automatic retry is provided.
+
+## Native result envelope and host accounting
+
+Raw registration schemas opt into strict Done decoding with
+`parameters["x-rpi-result-envelope"] = 1`. Both the original polling driver and
+wake-capable driver accept this payload without changing any SDK ABI slot:
+
+```json
+{"$rpiToolResult":1,"isError":true,"result":{"content":[{"type":"text","text":"bounded error summary"}],"details":{"summary":"retained"},"terminate":false,"usage":null,"addedToolNames":[]}}
+```
+
+`content`, `details` and boolean `terminate` are required; `usage` (nullable)
+and `addedToolNames` are optional. The envelope requires version 1 and boolean
+`isError`. Only text and image blocks are accepted, with typed text/MIME/base64
+fields. The complete envelope is bounded to 1 MiB and content to 256 blocks;
+name metadata is bounded to 256 names of at most 256 UTF-8 bytes each. Malformed
+opted-in payloads fail closed. All non-opted-in Done parsing and ABI Err handling
+remain unchanged. An extension must negotiate **all three** list capabilities
+before guest execution; an older action-30 host might support protocol 1 without
+these additive semantics. Older hosts without action 30 still reject it.
+
+Failed envelopes become native `AgentError::StructuredTool(Box<AgentToolResult>)`.
+The agent loop preserves the native content, details, termination and metadata
+while marking the outcome erroneous, **before** running ordinary after hooks.
+The native image wrapper normalizes successful and structured-error image
+content through the same pipeline while preserving error status and metadata.
+Those hooks retain their existing final authority over content/details, usage,
+termination and error status. Infrastructure failures can still use ABI Err.
+Oversized extension errors should compact their summaries without converting
+failure to success or discarding termination.
+
+The host retains finalized direct-child usage, added tool names and termination
+exactly once, before reply encoding, independently of polling, disposal or guest
+return values. After descendant drain it merges these into the containing native
+outcome, including ordinary and structured errors. Cancellation/deadline results
+published early do not prevent retaining metadata finalized during cleanup.
+Oversized result frames likewise do not discard accounting or reopen termination
+admission. Each nesting level rolls up only its own direct children; **extensions
+must not sum or re-emit child usage as their own usage**. Added names are metadata,
+not permission to refresh or widen the effective catalog. Panic outcomes without
+finalized results remain lifecycle failures, with no replay.
+
+Accounting uses checked i64 additions (including optional reasoning/cache-write
+fields) and finite cost sums. Overflow/non-finite usage becomes unavailable and
+the containing outcome becomes an error; it never panics. Names are deduplicated
+and sorted. An invalid/oversized name set is omitted as a whole, with a native
+accounting error, rather than retaining a completion-order-dependent prefix.
+Available valid usage and termination remain intact. After hooks can override
+these outcomes exactly as for direct tool execution. Tools that compose no
+children retain their own metadata unchanged, including original name order.
+
+## Parent-associated progress
+
+Nested work reports through the **existing outer native update callback**,
+captured only after its normal completion/cancellation gate exists. It does not
+emit synthetic nested tool starts, messages or transcript results. Partial
+content is empty; `details.toolProgram` carries bounded `rootId`, `parentId`,
+`requestId`, `tool`, `phase` (`started`, `progress`, `completed`, `failed`) and
+`updateCount`. Identity strings are limited to 256 characters. No nested raw
+arguments, invocation credentials, partial payloads or images are forwarded.
+The ordinary outer event retains its normal native tool identity and arguments.
+
+An entire invocation tree shares 256 projected updates / 64 KiB of encoded
+lifecycle metadata. Raw callback count is retained even if projections hit the
+budget. Cancellation, completion and late callbacks are suppressed through the
+native gates, and observer panics cannot release a worker before cancellation
+drain. Retained native callbacks keep only a weak reference to their program,
+so storing a late callback does not create a registry ownership cycle.
+Action polling and SDK ABI are unchanged.
+
+Native content selection (`tools.emit` and returned native content objects) is
+implemented by the companion Code Mode extension: selected image bytes occur
+once in outer native content, not in repeated JSON summaries. Intermediate
+images are not automatically promoted. This host preserves selected native
+blocks; it does not infer images from arbitrary nested JSON.
 
 ## Validation and current boundaries
 
@@ -98,12 +178,22 @@ tests exercise JSONL and SQLite as well.
 ## Real native smoke
 
 Build this host and the companion `rpi-package` checkout's `rpi-codemode` and
-`rpi-permission-gate` libraries, then run with explicit local artifact paths:
+`rpi-permission-gate` libraries. Optionally build the
+[test-only parity fixture](../../scripts/fixtures/codemode-parity/README.md)
+for trusted accounting and native partial-callback coverage:
 
 ```sh
-python scripts/codemode-smoke.py --rpi /path/to/rpi \
+cargo build --locked --manifest-path scripts/fixtures/codemode-parity/Cargo.toml \
+  --target-dir target/codemode-parity-fixture
+```
+
+Then run with explicit local artifact paths (never install the fixture):
+
+```sh
+python -B scripts/codemode-smoke.py --rpi /path/to/rpi \
   --extension /path/to/rpi_codemode.dll \
   --permission-gate /path/to/rpi_permission_gate.dll \
+  --fixture-extension target/codemode-parity-fixture/debug/codemode_parity_fixture.dll \
   --evidence-dir /new/empty/evidence-directory
 ```
 
@@ -115,12 +205,22 @@ provider requests, messages and `results.json`. Existing evidence directories
 are rejected rather than overwritten. The approval case is explicitly skipped
 if no gate DLL is supplied.
 
-Local Windows validation passed ten cases: catalog discovery, dependent and
-parallel read/write composition, invalid arguments, partial effect followed by
-JS error, timeout, rejected native regex execution, caught-OOM failure, explicit
-abort, reuse after abort, and rejected nested write approval. Checks also confirm durable nested markers, no orphan provider tool
-results and no persisted invocation capabilities. Evidence is in the local
-`target/codemode-riskfix-native-smoke-1/` directory; it is not a release asset. This is a
-local source-build qualification, not installation/deployment, a performance
-benchmark, live-provider validation, or proof that Linux/macOS/native reload
-races have passed. Cross-platform workflows are authored but not run locally.
+Local Windows validation passed **25 cases** with freshly built native host,
+Code Mode DLL, test fixture and permission gate. Coverage includes the original
+ten safety/composition cases plus real PNG return/emission, image output after
+JS failure, no implicit image forwarding, malformed text signatures, sticky
+emission failure, ordinary JSON and forged accounting, both guest-size and
+final-envelope-size limits, and real ABI accounting on success/JS failure/caught
+native error/terminal error. The image-capable loopback provider verifies native
+image delivery; terminal failure must not trigger another model turn. Fixture
+partials verify parent-linked lifecycle/count progress without synthetic calls.
+Checks also confirm durable nested markers, bounded message reads, no orphan
+provider results and no persisted invocation capabilities. Evidence is in local
+`target/codemode-parity-native-smoke-5/`; it is not a release asset.
+
+This is local source-build qualification, not installation/deployment, a
+performance benchmark, live-provider validation, or proof that Linux/macOS
+native integration/reload races have passed. CI builds and focused tests run on
+Linux, Windows and macOS; real native host-plus-DLL qualification remains
+Windows-only. Omit `--fixture-extension` to run 20 base cases; the optional gate
+adds one denial case, and the fixture adds four accounting/progress cases.

@@ -1499,14 +1499,9 @@ async fn execute_prepared_tool_call(
     assistant_message: &Arc<AssistantMessage>,
 ) -> ExecutedToolCallOutcome {
     let child_token = config.signal.child_token();
-    let capability = crate::tool_program::ToolProgram::capture(
-        current_context,
-        assistant_message,
-        tool_call,
-        config,
-        child_token.clone(),
-    );
-    let _lifetime = crate::tool_program::InvocationLifetime(capability.signal.clone());
+    // Retire the native invocation after execute (including adapter image
+    // postprocessing) and descendant drain, not when its program binding closes.
+    let _native_lifetime = crate::tool_program::InvocationLifetime(child_token.clone());
     // Gate for late updates: flipped false once execute resolves. on_update
     // checks it and returns early. This is the late-update-suppression invariant.
     let accepting_updates = Arc::new(AtomicBool::new(true));
@@ -1519,12 +1514,12 @@ async fn execute_prepared_tool_call(
 
     let on_update: Arc<dyn Fn(crate::types::ToolResultPartial) + Send + Sync> = {
         let gate = Arc::clone(&accepting_updates);
+        let update_signal = child_token.clone();
         Arc::new(move |partial: crate::types::ToolResultPartial| {
-            if !gate.load(Ordering::SeqCst) {
+            if !gate.load(Ordering::SeqCst) || update_signal.is_cancelled() {
                 return;
             }
-            // Cancellation during a cancelled batch: still emit for non-cancelled
-            // runs; the gate above is the real suppression.
+            // Both completion and cancellation retire the native update callback.
             let ev = AgentEvent::ToolExecutionUpdate {
                 tool_call_id: tool_call_id.clone(),
                 tool_name: tool_name.clone(),
@@ -1539,6 +1534,15 @@ async fn execute_prepared_tool_call(
         })
     };
 
+    let capability = crate::tool_program::ToolProgram::capture(
+        current_context,
+        assistant_message,
+        tool_call,
+        config,
+        child_token.clone(),
+        on_update.clone(),
+    );
+    let _lifetime = crate::tool_program::InvocationLifetime(capability.signal.clone());
     let execute_started = agent_diagnostics_enabled().then(Instant::now);
     let executed = std::panic::AssertUnwindSafe(async {
         crate::tool_program::scope(
@@ -1550,10 +1554,14 @@ async fn execute_prepared_tool_call(
     .catch_unwind()
     .await;
     accepting_updates.store(false, Ordering::SeqCst);
-    let outcome = match executed {
+    let mut outcome = match executed {
         Ok(Ok(result)) => ExecutedToolCallOutcome {
             result,
             is_error: false,
+        },
+        Ok(Err(AgentError::StructuredTool(result))) => ExecutedToolCallOutcome {
+            result: *result,
+            is_error: true,
         },
         Ok(Err(e)) => ExecutedToolCallOutcome {
             result: create_error_tool_result(&e.to_string()),
@@ -1577,6 +1585,10 @@ async fn execute_prepared_tool_call(
         );
     }
     capability.finish().await;
+    if let Err(error) = capability.merge_accounting(&mut outcome.result) {
+        outcome.is_error = true;
+        outcome.result.content.push(TextContentOrImage::text(error));
+    }
     outcome
 }
 

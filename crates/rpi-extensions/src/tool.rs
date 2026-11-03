@@ -177,6 +177,123 @@ fn json_to_result(text: &str) -> AgentToolResult {
     result
 }
 
+/// Validate nonempty, padded standard base64, including unused padding bits.
+fn canonical_image_base64(data: &str) -> bool {
+    if data.is_empty() || !data.len().is_multiple_of(4) {
+        return false;
+    }
+    let payload = data.trim_end_matches('=');
+    let padding = data.len() - payload.len();
+    if padding > 2 {
+        return false;
+    }
+    let sextet = |byte| match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    };
+    if !payload.bytes().all(|byte| sextet(byte).is_some()) {
+        return false;
+    }
+    let last = payload.bytes().last().and_then(sextet).unwrap_or(0);
+    match padding {
+        0 => true,
+        1 => last & 0b11 == 0,
+        2 => last & 0b1111 == 0,
+        _ => false,
+    }
+}
+
+/// Done decoding is opt-in; legacy tools keep the historical lenient parser.
+fn done_to_result(text: &str, envelope: bool) -> Result<AgentToolResult, AgentError> {
+    if !envelope {
+        return Ok(json_to_result(text));
+    }
+    parse_result_envelope(text)
+        .map_err(|error| AgentError::tool(format!("invalid tool result envelope: {error}")))?
+}
+fn parse_result_envelope(text: &str) -> Result<Result<AgentToolResult, AgentError>, String> {
+    if text.len() > 1024 * 1024 {
+        return Err("exceeds 1 MiB".into());
+    }
+    let value: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    if value["$rpiToolResult"].as_u64() != Some(1) {
+        return Err("unsupported or missing version".into());
+    }
+    let is_error = value["isError"]
+        .as_bool()
+        .ok_or("isError must be boolean")?;
+    let result = value["result"]
+        .as_object()
+        .ok_or("result must be an object")?;
+    let blocks = result
+        .get("content")
+        .and_then(Value::as_array)
+        .ok_or("content must be an array")?;
+    if blocks.len() > 256 {
+        return Err("content exceeds 256 blocks".into());
+    }
+    let mut content = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        content.push(match block["type"].as_str() {
+            Some("text") => TextContentOrImage::Text(
+                serde_json::from_value(block.clone()).map_err(|e| e.to_string())?,
+            ),
+            Some("image") => {
+                let image: rpi_ai::types::ImageContent =
+                    serde_json::from_value(block.clone()).map_err(|e| e.to_string())?;
+                if !matches!(
+                    image.mime_type.as_str(),
+                    "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+                ) || image.data.is_empty()
+                {
+                    return Err("invalid image MIME/data".into());
+                }
+                if !canonical_image_base64(&image.data) {
+                    return Err("invalid image base64".into());
+                }
+                TextContentOrImage::Image(image)
+            }
+            _ => return Err("unsupported content block".into()),
+        });
+    }
+    let details = result.get("details").ok_or("details is required")?.clone();
+    let terminate = result
+        .get("terminate")
+        .and_then(Value::as_bool)
+        .ok_or("terminate must be boolean")?;
+    let usage: Option<rpi_ai::types::Usage> = result
+        .get("usage")
+        .filter(|v| !v.is_null())
+        .map(|v| serde_json::from_value(v.clone()))
+        .transpose()
+        .map_err(|e| e.to_string())?;
+    let added_tool_names: Vec<String> = result
+        .get("addedToolNames")
+        .map(|v| serde_json::from_value(v.clone()))
+        .transpose()
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
+    if added_tool_names.len() > 256 || added_tool_names.iter().any(|name| name.len() > 256) {
+        return Err("addedToolNames exceeds limit".into());
+    }
+    let result = AgentToolResult {
+        content,
+        details,
+        terminate,
+        usage,
+        added_tool_names,
+    };
+    Ok(if is_error {
+        Err(AgentError::StructuredTool(Box::new(result)))
+    } else {
+        Ok(result)
+    })
+}
+
 // ---------------------------------------------------------------------------
 // ToolCallContext — the per-session context a plugin tool is handed
 // ---------------------------------------------------------------------------
@@ -478,6 +595,7 @@ impl AgentTool for PluginToolAdapter {
         let cancel_fn = self.handle.cancel_fn;
         let destroy_fn = self.handle.destroy_fn;
 
+        let result_envelope = self.schema.parameters.as_value()["x-rpi-result-envelope"] == 1;
         let schema_name = self.schema.name.clone();
         let schema_name_for_error = schema_name.clone();
 
@@ -575,8 +693,7 @@ impl AgentTool for PluginToolAdapter {
                         continue;
                     }
                     Step::Done(done) => {
-                        let result = json_to_result(&done);
-                        break Ok(result);
+                        break done_to_result(&done, result_envelope);
                     }
                     Step::Err(message) => {
                         break Err(AgentError::Tool(message));
@@ -844,6 +961,86 @@ mod tests {
         assert_eq!(adapter.execution_mode(), ToolExecutionMode::Sequential);
     }
 
+    static TERMINAL: Mutex<String> = Mutex::new(String::new());
+    extern "C" fn envelope_poll(
+        _: StepHandle,
+        _: Option<ToolPartialCb>,
+        _: *mut c_void,
+    ) -> StepResult {
+        StepResult::done(StbString::from_string(TERMINAL.lock().unwrap().clone()))
+    }
+    extern "C" fn no_wake(_: StepHandle, _: Option<rpi_plugin_sdk::ToolWakeCb>, _: *mut c_void) {}
+    #[tokio::test]
+    async fn opt_in_envelope_crosses_both_abi_drivers_and_legacy_done_stays_unchanged() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        for wake in [false, true] {
+            for opt_in in [false, true] {
+                for is_error in [false, true] {
+                    reset_counters();
+                    *TERMINAL.lock().unwrap() =
+                        super::result_envelope_tests::envelope(is_error).to_string();
+                    let mut adapter = echo_adapter();
+                    adapter.handle.poll_fn = envelope_poll;
+                    if wake {
+                        adapter.handle.set_waker_fn = Some(no_wake);
+                    }
+                    if opt_in {
+                        adapter.schema.parameters =
+                            rpi_ai::types::Schema::new(json!({"x-rpi-result-envelope":1}));
+                    }
+                    let result = adapter
+                        .execute("id", json!({}), CancellationToken::new(), Arc::new(|_| {}))
+                        .await;
+                    let result = if opt_in && is_error {
+                        match result.unwrap_err() {
+                            AgentError::StructuredTool(r) => *r,
+                            e => panic!("{e:?}"),
+                        }
+                    } else {
+                        result.unwrap()
+                    };
+                    assert_eq!(result.terminate, opt_in);
+                    assert_eq!(result.content.len(), if opt_in { 2 } else { 0 });
+                    if opt_in {
+                        assert!(matches!(result.content[1], TextContentOrImage::Image(_)));
+                        assert_eq!(result.details["summary"], "retained");
+                        assert_eq!(result.usage.unwrap().total_tokens, 3);
+                        assert_eq!(result.added_tool_names, vec!["native-added"]);
+                    }
+                    assert_eq!(DESTROY_COUNT.load(Ordering::SeqCst), 1);
+                }
+            }
+            // A registration opting in must not silently accept a legacy payload.
+            let mut adapter = echo_adapter();
+            adapter.schema.parameters =
+                rpi_ai::types::Schema::new(json!({"x-rpi-result-envelope":1}));
+            adapter.handle.poll_fn = envelope_poll;
+            if wake {
+                adapter.handle.set_waker_fn = Some(no_wake);
+            }
+            let mut invalid = vec![json!({})];
+            for image in super::result_envelope_tests::invalid_images() {
+                let mut value = super::result_envelope_tests::envelope(false);
+                value["result"]["content"] = json!([image]);
+                invalid.push(value);
+            }
+            for value in invalid {
+                reset_counters();
+                *TERMINAL.lock().unwrap() = value.to_string();
+                assert!(
+                    matches!(
+                        adapter
+                            .execute("id", json!({}), CancellationToken::new(), Arc::new(|_| {}))
+                            .await,
+                        Err(AgentError::Tool(_))
+                    ),
+                    "wake={wake}: {value}"
+                );
+                assert_eq!(DESTROY_COUNT.load(Ordering::SeqCst), 1);
+            }
+        }
+    }
+
     fn reset_counters() {
         DESTROY_COUNT.store(0, Ordering::SeqCst);
         CANCEL_COUNT.store(0, Ordering::SeqCst);
@@ -1052,5 +1249,150 @@ mod tests {
         assert_eq!(seen["action"], "list");
         assert_eq!(seen["__rpi"]["cwd"], "D:\\proj");
         assert_eq!(seen["__rpi"]["sessionId"], "sess-42");
+    }
+}
+
+#[cfg(test)]
+mod result_envelope_tests {
+    use super::*;
+    use serde_json::json;
+    pub(super) fn envelope(is_error: bool) -> Value {
+        json!({"$rpiToolResult":1,"isError":is_error,"result":{
+            "content":[{"type":"text","text":"bounded failure summary"},{"type":"image","mimeType":"image/png","data":"AA=="}],
+            "details":{"summary":"retained"},"terminate":true,
+            "usage":{"input":1,"output":2,"cacheRead":0,"cacheWrite":0,"totalTokens":3,
+                "reasoning":1,"cacheWrite1h":2,"cost":{"input":0.1,"output":0.2,"cacheRead":0.0,"cacheWrite":0.0,"total":0.3}},
+            "addedToolNames":["native-added"]}})
+    }
+    #[test]
+    fn opted_in_success_and_error_preserve_all_native_metadata() {
+        for is_error in [false, true] {
+            let result = done_to_result(&envelope(is_error).to_string(), true);
+            let result = if is_error {
+                match result.unwrap_err() {
+                    AgentError::StructuredTool(result) => *result,
+                    error => panic!("{error:?}"),
+                }
+            } else {
+                result.unwrap()
+            };
+            assert_eq!(result.content.len(), 2);
+            assert!(matches!(result.content[1], TextContentOrImage::Image(_)));
+            assert_eq!(result.details["summary"], "retained");
+            assert!(result.terminate);
+            assert_eq!(result.usage.unwrap().reasoning, Some(1));
+            assert_eq!(result.added_tool_names, vec!["native-added"]);
+        }
+    }
+    pub(super) fn invalid_images() -> Vec<Value> {
+        let mut images = Vec::new();
+        for mime in [
+            "image/",
+            "image/svg+xml",
+            "image/png; charset=utf-8",
+            "IMAGE/PNG",
+        ] {
+            images.push(json!({"type":"image","data":"AA==","mimeType":mime}));
+        }
+        for data in [
+            "", "AB==", "AAB=", "AA=A", "A===", "====", "AA", "AA==\n", "AA-_", "é==",
+        ] {
+            images.push(json!({"type":"image","data":data,"mimeType":"image/png"}));
+        }
+        images
+    }
+    #[test]
+    fn supported_image_mimes_and_canonical_base64_are_accepted() {
+        for mime in ["image/png", "image/jpeg", "image/gif", "image/webp"] {
+            for data in ["AA==", "AAA=", "AAAA", "/w==", "//8=", "+///"] {
+                let mut value = envelope(false);
+                value["result"]["content"][1] = json!({"type":"image","data":data,"mimeType":mime});
+                assert!(done_to_result(&value.to_string(), true).is_ok(), "{value}");
+            }
+        }
+    }
+    #[test]
+    fn malformed_opted_in_envelopes_fail_closed_but_legacy_remains_lenient() {
+        let mut bad = vec![json!(null), json!({}), json!({"content":[]}), json!([])];
+        for path in ["$rpiToolResult", "isError", "result"] {
+            let mut value = envelope(false);
+            value.as_object_mut().unwrap().remove(path);
+            bad.push(value);
+        }
+        for version in [json!(2), json!("1"), json!(1.0), json!(null)] {
+            let mut value = envelope(false);
+            value["$rpiToolResult"] = version;
+            bad.push(value);
+        }
+        for (field, invalid) in [
+            ("content", json!({})),
+            ("content", json!([{"type":"thinking","text":"no"}])),
+            ("content", json!([{"type":"text"}])),
+            (
+                "content",
+                json!([{"type":"image","data":"bad","mimeType":"image/png"}]),
+            ),
+            (
+                "content",
+                json!([{"type":"image","data":"AA==","mimeType":"text/html"}]),
+            ),
+            ("terminate", json!("false")),
+            ("usage", json!({})),
+            ("addedToolNames", json!([1])),
+            ("addedToolNames", json!(["x".repeat(257)])),
+            (
+                "content",
+                json!(vec![json!({"type":"text","text":"x"}); 257]),
+            ),
+        ] {
+            let mut value = envelope(false);
+            value["result"][field] = invalid;
+            bad.push(value);
+        }
+        for image in invalid_images() {
+            let mut value = envelope(false);
+            value["result"]["content"] = json!([image]);
+            bad.push(value);
+        }
+        for field in ["content", "details", "terminate"] {
+            let mut value = envelope(false);
+            value["result"].as_object_mut().unwrap().remove(field);
+            bad.push(value);
+        }
+        for value in bad {
+            assert!(
+                matches!(
+                    done_to_result(&value.to_string(), true),
+                    Err(AgentError::Tool(_))
+                ),
+                "{value}"
+            );
+            assert!(
+                done_to_result(&value.to_string(), false).is_ok(),
+                "legacy must not gain strict parsing"
+            );
+        }
+        assert!(done_to_result("not JSON", true).is_err());
+        assert!(done_to_result("not JSON", false)
+            .unwrap()
+            .content
+            .is_empty());
+        let mut huge = envelope(true);
+        huge["result"]["details"] = json!("x".repeat(1024 * 1024));
+        assert!(done_to_result(&huge.to_string(), true).is_err());
+        // Non-opted-in tools never interpret the reserved envelope marker.
+        assert!(done_to_result(&envelope(true).to_string(), false)
+            .unwrap()
+            .content
+            .is_empty());
+        assert_eq!(
+            done_to_result(
+                r#"{"content":[{"text":"legacy","type":"future"}],"terminate":true}"#,
+                false
+            )
+            .unwrap()
+            .content,
+            vec![TextContentOrImage::text("legacy")]
+        );
     }
 }

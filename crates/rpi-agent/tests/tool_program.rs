@@ -700,3 +700,825 @@ async fn oversized_finalized_terminate_latches_before_reply_encoding() {
         assert_eq!(count.load(Ordering::SeqCst), if terminate { 1 } else { 2 });
     }
 }
+
+// Native parity follow-up: host rollup must not depend on guest result handling.
+type Update = Arc<dyn Fn(ToolResultPartial) + Send + Sync>;
+type ParityBody = Arc<
+    dyn Fn(
+            Arc<ToolProgram>,
+            CancellationToken,
+            Update,
+        ) -> BoxFuture<'static, Result<AgentToolResult, AgentError>>
+        + Send
+        + Sync,
+>;
+struct ParityTool {
+    schema: Tool,
+    body: ParityBody,
+}
+#[async_trait::async_trait]
+impl AgentTool for ParityTool {
+    fn schema(&self) -> &Tool {
+        &self.schema
+    }
+    fn label(&self) -> &str {
+        &self.schema.name
+    }
+    fn execution_mode(&self) -> ToolExecutionMode {
+        ToolExecutionMode::Sequential
+    }
+    async fn execute(
+        &self,
+        _: &str,
+        _: Value,
+        signal: CancellationToken,
+        update: Update,
+    ) -> Result<AgentToolResult, AgentError> {
+        (self.body)(current().unwrap(), signal, update).await
+    }
+}
+fn parity_tool(name: &str, body: ParityBody) -> Arc<dyn AgentTool> {
+    Arc::new(ParityTool {
+        schema: schema(name),
+        body,
+    })
+}
+fn metadata(tokens: i64, terminate: bool) -> AgentToolResult {
+    let mut usage = rpi_ai::types::Usage::zero();
+    usage.input = tokens;
+    usage.total_tokens = tokens;
+    usage.reasoning = Some(tokens);
+    usage.cache_write_1h = Some(tokens);
+    usage.cost.total = tokens as f64 / 10.0;
+    AgentToolResult {
+        usage: Some(usage),
+        added_tool_names: vec!["z".into(), "a".into(), "z".into()],
+        terminate,
+        ..AgentToolResult::text("native")
+    }
+}
+async fn parity_run(
+    tools: Vec<Arc<dyn AgentTool>>,
+    cfg: rpi_agent::AgentLoopConfig,
+) -> (Vec<rpi_agent::AgentEvent>, rpi_ai::types::ToolResultMessage) {
+    let (events, messages) = common::run_and_collect(
+        vec![common::user_message("run")],
+        AgentContext {
+            tools,
+            ..Default::default()
+        },
+        cfg,
+        common::mock_stream_fn(vec![
+            common::assistant_tool_calls(
+                vec![("parent", "codemode", json!({"value":"private-args"}))],
+                StopReason::ToolUse,
+            ),
+            common::assistant_text("done", StopReason::Stop),
+        ]),
+    )
+    .await;
+    let results: Vec<_> = messages
+        .into_iter()
+        .filter_map(|m| match m {
+            rpi_agent::AgentMessage::ToolResult(r) => Some(*r),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 1, "no synthetic nested transcript results");
+    (events, results.into_iter().next().unwrap())
+}
+
+#[tokio::test]
+async fn host_rollup_survives_errors_repeated_poll_disposal_and_unawaited_drain() {
+    for failure in [0, 1, 2] {
+        let finished = Arc::new(AtomicUsize::new(0));
+        let done = finished.clone();
+        let tools = vec![
+            parity_tool(
+                "codemode",
+                Arc::new(move |p, _, _| {
+                    Box::pin(async move {
+                        let page = p.handle(json!({"op":"list"})).await.unwrap();
+                        assert_eq!(
+                            page["capabilities"],
+                            json!({"resultEnvelope":1,"hostAccounting":1,"parentProgress":1})
+                        );
+                        let id = start(&p).await;
+                        for _ in 0..3 {
+                            assert_eq!(poll(&p, &id).await["status"], "done");
+                        }
+                        p.handle(json!({"op":"dispose", "requestId":id}))
+                            .await
+                            .unwrap();
+                        let id = start(&p).await;
+                        // Dispose an executing call, but retain its eventual finalized metadata.
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        p.handle(json!({"op":"dispose", "requestId":id}))
+                            .await
+                            .unwrap();
+                        match failure {
+                            0 => Ok(metadata(7, false)),
+                            1 => Err(AgentError::tool("ordinary script failure")),
+                            _ => Err(AgentError::StructuredTool(Box::new(metadata(7, false)))),
+                        }
+                    })
+                }),
+            ),
+            parity_tool(
+                "effect",
+                Arc::new(move |_, _, _| {
+                    let done = done.clone();
+                    Box::pin(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+                        done.fetch_add(1, Ordering::SeqCst);
+                        Ok(metadata(3, false))
+                    })
+                }),
+            ),
+        ];
+        let (_, result) = parity_run(tools, common::base_config()).await;
+        assert_eq!(finished.load(Ordering::SeqCst), 2);
+        assert_eq!(result.is_error, failure != 0);
+        let usage = result.usage.unwrap();
+        assert_eq!(usage.total_tokens, if failure == 1 { 6 } else { 13 });
+        assert_eq!(usage.reasoning, Some(usage.total_tokens));
+        assert_eq!(usage.cache_write_1h, Some(usage.total_tokens));
+        assert!((usage.cost.total - usage.total_tokens as f64 / 10.0).abs() < 0.00001);
+        assert_eq!(result.added_tool_names, vec!["a", "z"]);
+    }
+}
+
+#[tokio::test]
+async fn host_rollup_nested_programs_counts_each_direct_child_once() {
+    let (_, result) = parity_run(
+        vec![
+            parity_tool(
+                "codemode",
+                Arc::new(|p, _, _| {
+                    Box::pin(async move {
+                        let id = p
+                            .handle(
+                                json!({"op":"start","name":"nested","arguments":{"value":"ok"}}),
+                            )
+                            .await
+                            .unwrap()["requestId"]
+                            .clone();
+                        assert_eq!(poll(&p, &id).await["result"]["usage"]["totalTokens"], 5);
+                        Ok(metadata(7, false))
+                    })
+                }),
+            ),
+            parity_tool(
+                "nested",
+                Arc::new(|p, _, _| {
+                    Box::pin(async move {
+                        let id = start(&p).await;
+                        assert_eq!(poll(&p, &id).await["status"], "done");
+                        Ok(metadata(2, false))
+                    })
+                }),
+            ),
+            parity_tool(
+                "effect",
+                Arc::new(|_, _, _| Box::pin(async { Ok(metadata(3, false)) })),
+            ),
+        ],
+        common::base_config(),
+    )
+    .await;
+    assert_eq!(result.usage.unwrap().total_tokens, 12);
+    assert_eq!(result.added_tool_names, vec!["a", "z"]);
+}
+
+#[tokio::test]
+async fn cancelled_and_oversized_child_metadata_is_available_before_outer_after_hook() {
+    for oversized in [false, true] {
+        let seen = Arc::new(AtomicUsize::new(0));
+        let observed = seen.clone();
+        let mut cfg = common::base_config();
+        cfg.after_tool_call = Some(Arc::new(move |ctx, _| {
+            if ctx.tool_call.name == "codemode" {
+                assert!(ctx.result.terminate);
+                assert_eq!(ctx.result.usage.as_ref().unwrap().total_tokens, 3);
+                assert_eq!(ctx.result.added_tool_names, vec!["a", "z"]);
+                assert!(ctx.is_error);
+                observed.fetch_add(1, Ordering::SeqCst);
+                // Ordinary native after hooks retain final authority.
+                return Box::pin(async {
+                    Some(AfterToolCallResult {
+                        terminate: Some(false),
+                        is_error: Some(false),
+                        usage: Some(rpi_ai::types::Usage::zero()),
+                        ..Default::default()
+                    })
+                });
+            }
+            Box::pin(async { None })
+        }));
+        let (_, result) = parity_run(vec![
+            parity_tool("codemode", Arc::new(move |p, _, _| Box::pin(async move {
+                let id = p.handle(json!({"op":"start","name":"effect","arguments":{"value":"ok"},"timeoutMs":if oversized {1000} else {5}})).await.unwrap()["requestId"].clone();
+                assert_eq!(poll(&p, &id).await["status"], "failed");
+                Err(AgentError::tool("script failed after child"))
+            }))),
+            parity_tool("effect", Arc::new(move |_, _, _| Box::pin(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                let mut result = metadata(3, true);
+                if oversized { result.details = json!({"large":"x".repeat(1024*1024)}); }
+                Err(AgentError::StructuredTool(Box::new(result)))
+            }))),
+        ], cfg).await;
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+        assert!(!result.is_error);
+        assert_eq!(result.usage.unwrap().total_tokens, 0);
+    }
+}
+
+#[tokio::test]
+async fn structured_native_error_preserves_result_before_authoritative_hooks() {
+    let mut cfg = common::base_config();
+    cfg.after_tool_call = Some(Arc::new(|ctx, _| {
+        assert!(ctx.is_error);
+        assert_eq!(ctx.result.details, json!({"bounded":"summary"}));
+        assert!(matches!(
+            ctx.result.content[0],
+            rpi_agent::TextContentOrImage::Image(_)
+        ));
+        assert_eq!(ctx.result.usage.as_ref().unwrap().total_tokens, 4);
+        assert!(ctx.result.terminate);
+        Box::pin(async {
+            Some(AfterToolCallResult {
+                is_error: Some(false),
+                content: Some(vec![rpi_agent::TextContentOrImage::text("hook")]),
+                ..Default::default()
+            })
+        })
+    }));
+    let (_, result) = parity_run(
+        vec![parity_tool(
+            "codemode",
+            Arc::new(|_, _, _| {
+                Box::pin(async {
+                    let mut result = metadata(4, true);
+                    result.details = json!({"bounded":"summary"});
+                    result.content = vec![rpi_agent::TextContentOrImage::Image(
+                        serde_json::from_value(
+                            json!({"type":"image","data":"AA==","mimeType":"image/png"}),
+                        )
+                        .unwrap(),
+                    )];
+                    Err(AgentError::StructuredTool(Box::new(result)))
+                })
+            }),
+        )],
+        cfg,
+    )
+    .await;
+    assert!(!result.is_error);
+    assert_eq!(result.content[0], rpi_ai::types::Content::text("hook"));
+}
+
+#[tokio::test]
+async fn nested_progress_uses_outer_callback_and_only_bounded_lifecycle_metadata() {
+    let (_, result) = parity_run(
+        vec![parity_tool(
+            "codemode",
+            Arc::new(|_, _, _| Box::pin(async { Ok(AgentToolResult::text("baseline")) })),
+        )],
+        common::base_config(),
+    )
+    .await;
+    assert!(!result.is_error);
+    let (events, _) = parity_run(vec![
+        parity_tool("codemode", Arc::new(|p, _, _| Box::pin(async move {
+            let id = p.handle(json!({"op":"start","name":"nested","arguments":{"value":"nested-secret"}})).await.unwrap()["requestId"].clone();
+            assert_eq!(poll(&p, &id).await["status"], "done");
+            Ok(AgentToolResult::text("done"))
+        }))),
+        parity_tool("nested", Arc::new(|p, _, _| Box::pin(async move {
+            let id = start(&p).await;
+            assert_eq!(poll(&p, &id).await["status"], "done");
+            Ok(AgentToolResult::text("done"))
+        }))),
+        parity_tool("effect", Arc::new(|_, _, update| Box::pin(async move {
+            for _ in 0..3 {
+                update(AgentToolResult { details: json!({"runtimeKey":"secret-capability","image":"raw-image-secret"}), ..AgentToolResult::text("raw-payload-secret") });
+                tokio::task::yield_now().await;
+            }
+            Ok(AgentToolResult::text("done"))
+        }))),
+    ], common::base_config()).await;
+    let updates: Vec<_> = events
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| match e {
+            rpi_agent::AgentEvent::ToolExecutionUpdate {
+                tool_call_id,
+                tool_name,
+                partial_result,
+                ..
+            } => {
+                assert_eq!(tool_call_id, "parent");
+                assert_eq!(tool_name, "codemode");
+                assert!(partial_result.content.is_empty());
+                let text = partial_result.details.to_string();
+                for secret in [
+                    "runtimeKey",
+                    "secret-capability",
+                    "raw-image-secret",
+                    "raw-payload-secret",
+                    "nested-secret",
+                ] {
+                    assert!(!text.contains(secret));
+                }
+                Some((i, partial_result.details["toolProgram"].clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(updates.len(), 7); // Two lifecycle pairs plus three child updates.
+    let nested_id = updates
+        .iter()
+        .find(|(_, d)| d["tool"] == "nested")
+        .unwrap()
+        .1["requestId"]
+        .clone();
+    for (_, d) in &updates {
+        assert_eq!(d["rootId"], "parent");
+        assert_eq!(
+            d["parentId"],
+            if d["tool"] == "nested" {
+                json!("parent")
+            } else {
+                nested_id.clone()
+            }
+        );
+    }
+    let completed = updates
+        .iter()
+        .find(|(_, d)| d["tool"] == "effect" && d["phase"] == "completed")
+        .unwrap();
+    assert_eq!(completed.1["updateCount"], 3);
+    let end = events
+        .iter()
+        .position(|e| matches!(e, rpi_agent::AgentEvent::ToolExecutionEnd { .. }))
+        .unwrap();
+    assert!(updates.iter().all(|(i, _)| *i < end));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, rpi_agent::AgentEvent::ToolExecutionStart { .. }))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn progress_budget_is_tree_wide_and_cancellation_and_late_updates_are_suppressed() {
+    for cancel in [false, true] {
+        let saved: Arc<Mutex<Option<Update>>> = Arc::new(Mutex::new(None));
+        let out = saved.clone();
+        let mut cfg = common::base_config();
+        cfg.after_tool_call = Some(Arc::new(move |ctx, _| {
+            if ctx.tool_call.name == "codemode" {
+                // Child and root update gates have closed by after-hook execution.
+                out.lock().unwrap().as_ref().unwrap()(AgentToolResult::text("late-secret"));
+            }
+            Box::pin(async { None })
+        }));
+        let (events, _) = parity_run(
+            vec![
+                parity_tool(
+                    "codemode",
+                    Arc::new(move |p, _, _| {
+                        Box::pin(async move {
+                            let id = start(&p).await;
+                            assert_eq!(poll(&p, &id).await["status"], "done");
+                            Ok(AgentToolResult::text("done"))
+                        })
+                    }),
+                ),
+                parity_tool(
+                    "effect",
+                    Arc::new(move |_, signal, update| {
+                        let saved = saved.clone();
+                        Box::pin(async move {
+                            *saved.lock().unwrap() = Some(update.clone());
+                            if cancel {
+                                signal.cancel();
+                            }
+                            for _ in 0..600 {
+                                update(AgentToolResult::text("secret"));
+                            }
+                            Ok(AgentToolResult::text("done"))
+                        })
+                    }),
+                ),
+            ],
+            cfg,
+        )
+        .await;
+        let projected: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                rpi_agent::AgentEvent::ToolExecutionUpdate { partial_result, .. } => {
+                    Some(partial_result)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(!projected.is_empty());
+        assert!(projected.len() <= 256);
+        assert!(
+            projected
+                .iter()
+                .map(|p| p.details.to_string().len())
+                .sum::<usize>()
+                <= 64 * 1024
+        );
+        if cancel {
+            assert_eq!(
+                projected.len(),
+                2,
+                "self-cancel suppresses raw progress; request still finalizes its lifecycle"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn root_rust_panic_drains_native_descendants_before_unwinding_and_skips_after_hook() {
+    use futures::FutureExt;
+    let live = Arc::new(AtomicUsize::new(0));
+    let cleaned = Arc::new(AtomicUsize::new(0));
+    let hooks = Arc::new(AtomicUsize::new(0));
+    let seen = live.clone();
+    let observed = hooks.clone();
+    let mut cfg = common::base_config();
+    cfg.after_tool_call = Some(Arc::new(move |ctx, _| {
+        if ctx.tool_call.name == "codemode" {
+            observed.fetch_add(1, Ordering::SeqCst);
+        }
+        Box::pin(async { None })
+    }));
+    let tools: Vec<Arc<dyn AgentTool>> = vec![
+        parity_tool(
+            "codemode",
+            Arc::new(move |p, _, _| {
+                let seen = seen.clone();
+                Box::pin(async move {
+                    p.handle(json!({"op":"start","name":"slow","arguments":{"value":"ok"}}))
+                        .await
+                        .unwrap();
+                    while seen.load(Ordering::SeqCst) == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                    panic!("controlled root panic");
+                })
+            }),
+        ),
+        Arc::new(CleanupProbe {
+            schema: schema("slow"),
+            live: live.clone(),
+            cleaned: cleaned.clone(),
+            overlap: Arc::new(AtomicUsize::new(0)),
+            observe: false,
+        }),
+    ];
+    let result = std::panic::AssertUnwindSafe(parity_run(tools, cfg))
+        .catch_unwind()
+        .await;
+    assert!(result.is_err());
+    assert_eq!(live.load(Ordering::SeqCst), 0);
+    assert_eq!(cleaned.load(Ordering::SeqCst), 1);
+    assert_eq!(hooks.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn checked_rollup_overflow_returns_native_error_not_panic() {
+    let (_, result) = parity_run(
+        vec![
+            parity_tool(
+                "codemode",
+                Arc::new(|p, _, _| {
+                    Box::pin(async move {
+                        let id = start(&p).await;
+                        assert_eq!(poll(&p, &id).await["status"], "done");
+                        Ok(metadata(1, false))
+                    })
+                }),
+            ),
+            parity_tool(
+                "effect",
+                Arc::new(|_, _, _| Box::pin(async { Ok(metadata(i64::MAX, false)) })),
+            ),
+        ],
+        common::base_config(),
+    )
+    .await;
+    assert!(result.is_error);
+    assert!(result.usage.is_none());
+    assert!(common::tool_result_text(&result).contains("accounting overflow"));
+    assert_eq!(result.added_tool_names, vec!["a", "z"]);
+}
+
+#[tokio::test]
+async fn parent_cancellation_suppresses_cleanup_progress_and_retains_finalized_usage() {
+    let ready = Arc::new(AtomicUsize::new(0));
+    let started = ready.clone();
+    let mut cfg = common::base_config();
+    let observed = ready.clone();
+    cfg.after_tool_call = Some(Arc::new(move |ctx, _| {
+        if ctx.tool_call.name == "codemode" {
+            assert_eq!(ctx.result.usage.as_ref().unwrap().total_tokens, 3);
+            assert!(ctx.result.terminate);
+            assert_eq!(observed.load(Ordering::SeqCst), 2);
+        }
+        Box::pin(async { None })
+    }));
+    let (events, result) = parity_run(
+        vec![
+            parity_tool(
+                "codemode",
+                Arc::new(move |p, _, _| {
+                    let ready = ready.clone();
+                    Box::pin(async move {
+                        let id = start(&p).await;
+                        while ready.load(Ordering::SeqCst) == 0 {
+                            tokio::task::yield_now().await;
+                        }
+                        p.cancel_all();
+                        assert_eq!(poll(&p, &id).await["status"], "failed");
+                        Err(AgentError::tool("cancelled parent"))
+                    })
+                }),
+            ),
+            parity_tool(
+                "effect",
+                Arc::new(move |_, signal, update| {
+                    let started = started.clone();
+                    Box::pin(async move {
+                        update(AgentToolResult::text("before cancellation"));
+                        started.store(1, Ordering::SeqCst);
+                        signal.cancelled().await;
+                        update(AgentToolResult::text("cancelled secret"));
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        started.store(2, Ordering::SeqCst);
+                        Ok(metadata(3, true))
+                    })
+                }),
+            ),
+        ],
+        cfg,
+    )
+    .await;
+    assert!(result.is_error);
+    assert_eq!(result.usage.unwrap().total_tokens, 3);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, rpi_agent::AgentEvent::ToolExecutionUpdate { .. }))
+            .count(),
+        2
+    );
+}
+
+struct PanickingProgressEmitter;
+impl rpi_agent::AgentEmitter for PanickingProgressEmitter {
+    fn emit(&self, _: rpi_agent::AgentEvent) -> BoxFuture<'static, ()> {
+        Box::pin(async {})
+    }
+    fn try_emit(&self, _: rpi_agent::AgentEvent) {
+        panic!("observer panic must not bypass drain");
+    }
+}
+#[tokio::test]
+async fn panicking_progress_observer_cannot_drop_timed_out_native_cleanup() {
+    let cleaned = Arc::new(AtomicUsize::new(0));
+    let done = cleaned.clone();
+    let tools = vec![
+        parity_tool(
+            "codemode",
+            Arc::new(|p, _, _| {
+                Box::pin(async move {
+                    let id = p.handle(json!({"op":"start","name":"effect","arguments":{"value":"ok"},"timeoutMs":5})).await.unwrap()["requestId"].clone();
+                    assert_eq!(poll(&p, &id).await["status"], "failed");
+                    Ok(AgentToolResult::text("done"))
+                })
+            }),
+        ),
+        parity_tool(
+            "effect",
+            Arc::new(move |_, _, update| {
+                let done = done.clone();
+                Box::pin(async move {
+                    update(AgentToolResult::text("progress"));
+                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                    done.fetch_add(1, Ordering::SeqCst);
+                    Ok(metadata(3, false))
+                })
+            }),
+        ),
+    ];
+    rpi_agent::run_agent_loop(
+        vec![common::user_message("run")],
+        AgentContext {
+            tools,
+            ..Default::default()
+        },
+        common::base_config(),
+        Arc::new(PanickingProgressEmitter),
+        common::mock_stream_fn(vec![
+            common::assistant_tool_calls(
+                vec![("parent", "codemode", json!({"value":"ok"}))],
+                StopReason::ToolUse,
+            ),
+            common::assistant_text("done", StopReason::Stop),
+        ]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(cleaned.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn retained_native_update_does_not_keep_tool_programs_alive() {
+    use std::sync::Weak;
+    let saved: Arc<Mutex<Option<Update>>> = Arc::new(Mutex::new(None));
+    let programs: Arc<Mutex<Vec<Weak<ToolProgram>>>> = Arc::new(Mutex::new(Vec::new()));
+    let root_programs = programs.clone();
+    let child_programs = programs.clone();
+    let retained = saved.clone();
+    let (events, _) = parity_run(
+        vec![
+            parity_tool(
+                "codemode",
+                Arc::new(move |p, _, _| {
+                    root_programs.lock().unwrap().push(Arc::downgrade(&p));
+                    Box::pin(async move {
+                        let id = start(&p).await;
+                        assert_eq!(poll(&p, &id).await["status"], "done");
+                        Ok(AgentToolResult::text("done"))
+                    })
+                }),
+            ),
+            parity_tool(
+                "effect",
+                Arc::new(move |p, _, update| {
+                    // ToolProgram -> context.tools -> this closure -> saved update.
+                    // The saved native callback must not close that ownership cycle.
+                    child_programs.lock().unwrap().push(Arc::downgrade(&p));
+                    *retained.lock().unwrap() = Some(update.clone());
+                    Box::pin(async move {
+                        update(AgentToolResult::text("private progress"));
+                        Ok(AgentToolResult::text("done"))
+                    })
+                }),
+            ),
+        ],
+        common::base_config(),
+    )
+    .await;
+    assert_eq!(programs.lock().unwrap().len(), 2);
+    // A worker can still be returning after releasing its drain permit.
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while programs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p.strong_count() != 0)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("retained callback must not own either program");
+    let callback = saved.lock().unwrap().as_ref().unwrap().clone();
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        callback(AgentToolResult::text("late private update"));
+    }))
+    .is_ok());
+    assert!(programs
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|p| p.upgrade().is_none()));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, rpi_agent::AgentEvent::ToolExecutionUpdate { .. }))
+            .count(),
+        3,
+        "only started, progress and completed reach the root callback"
+    );
+}
+
+#[tokio::test]
+async fn program_close_and_finish_leave_containing_native_signal_alive() {
+    for close in ["finish", "cancel_all", "binding"] {
+        let saved = Arc::new(Mutex::new(None));
+        let observed = saved.clone();
+        let (_, result) = parity_run(
+            vec![
+                parity_tool(
+                    "codemode",
+                    Arc::new(move |p, signal, _| {
+                        let saved = saved.clone();
+                        Box::pin(async move {
+                            let id = start(&p).await;
+                            assert_eq!(poll(&p, &id).await["status"], "done");
+                            match close {
+                                "cancel_all" => p.cancel_all(),
+                                "binding" => {
+                                    let driver = CancellationToken::new();
+                                    p.bind_signal(driver.clone());
+                                    driver.cancel();
+                                    tokio::time::timeout(
+                                        std::time::Duration::from_secs(3),
+                                        async {
+                                            while p.handle(json!({"op":"list"})).await.is_ok() {
+                                                tokio::task::yield_now().await;
+                                            }
+                                        },
+                                    )
+                                    .await
+                                    .unwrap();
+                                }
+                                _ => {}
+                            }
+                            assert!(
+                                !signal.is_cancelled(),
+                                "{close} cancelled native postprocessing"
+                            );
+                            *saved.lock().unwrap() = Some((p, signal));
+                            Ok(AgentToolResult::text("postprocessing succeeded"))
+                        })
+                    }),
+                ),
+                parity_tool(
+                    "effect",
+                    Arc::new(|_, _, _| Box::pin(async { Ok(AgentToolResult::text("child done")) })),
+                ),
+            ],
+            common::base_config(),
+        )
+        .await;
+        assert!(!result.is_error);
+        let (program, signal) = observed.lock().unwrap().take().unwrap();
+        assert!(
+            signal.is_cancelled(),
+            "containing native signal must retire after execute and postprocessing finish"
+        );
+        assert!(program.handle(json!({"op":"list"})).await.is_err());
+        assert!(start_result(&program).await.is_err());
+    }
+}
+
+#[tokio::test]
+async fn containing_native_cancellation_reaches_program_and_drains_children() {
+    let ready = Arc::new(tokio::sync::Notify::new());
+    let started = ready.clone();
+    let cleaned = Arc::new(AtomicUsize::new(0));
+    let observed = cleaned.clone();
+    let (_, result) = parity_run(
+        vec![
+            parity_tool(
+                "codemode",
+                Arc::new(move |p, signal, _| {
+                    let ready = ready.clone();
+                    Box::pin(async move {
+                        let id = start(&p).await;
+                        tokio::time::timeout(std::time::Duration::from_secs(3), ready.notified())
+                            .await
+                            .unwrap();
+                        signal.cancel();
+                        assert!(p.handle(json!({"op":"list"})).await.is_err());
+                        assert!(start_result(&p).await.is_err());
+                        assert_eq!(poll(&p, &id).await["status"], "failed");
+                        Ok(AgentToolResult::text("cancelled and drained"))
+                    })
+                }),
+            ),
+            parity_tool(
+                "effect",
+                Arc::new(move |_, signal, _| {
+                    let ready = started.clone();
+                    let cleaned = cleaned.clone();
+                    Box::pin(async move {
+                        ready.notify_one();
+                        tokio::time::timeout(std::time::Duration::from_secs(3), signal.cancelled())
+                            .await
+                            .unwrap();
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        cleaned.fetch_add(1, Ordering::SeqCst);
+                        Ok(metadata(3, false))
+                    })
+                }),
+            ),
+        ],
+        common::base_config(),
+    )
+    .await;
+    assert_eq!(observed.load(Ordering::SeqCst), 1);
+    assert_eq!(result.usage.unwrap().total_tokens, 3);
+}

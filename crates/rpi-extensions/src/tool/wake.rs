@@ -235,6 +235,7 @@ impl PluginToolAdapter {
             _background: rpi_agent::tool_execution_scope::track_background_tool(),
             _keepalive: self.keepalive.clone(),
         }));
+        let result_envelope = self.schema.parameters.as_value()["x-rpi-result-envelope"] == 1;
         tokio::spawn(async move {
             let (mut driver, ()) = call(driver, move |driver| {
                 driver.handle = (driver.functions.execute_fn)(
@@ -277,7 +278,7 @@ impl PluginToolAdapter {
                         break Err(AgentError::Tool("plugin tool cancelled".into()));
                     }
                     match step {
-                        Step::Done(done) => break Ok(json_to_result(&done)),
+                        Step::Done(done) => break done_to_result(&done, result_envelope),
                         Step::Err(error) => break Err(AgentError::Tool(error)),
                         Step::Pending(progress) => {
                             if !progress.is_empty() {
