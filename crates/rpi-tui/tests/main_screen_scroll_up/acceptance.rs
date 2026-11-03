@@ -142,42 +142,60 @@ fn streamed_output_growth_preserves_history_commands_and_draft() {
     for lines in 41..=43 {
         bash.append_output(&output(lines));
         tui.request_render(false);
-    }
 
-    assert_eq!(
-        term.state.lock().unwrap().scrollback_erase_count,
-        erases_before
-    );
-    assert_eq!(term.state.lock().unwrap().history_view_top, Some(10));
-    assert_eq!(term.visible(), visible_before);
-    assert_history_once(&term);
-    let rows = document(&term);
-    for i in 0..43 {
-        let line = format!("tool-output-{i:03}");
+        // Check every painted frame, not just a final frame that could have
+        // recovered from a transient duplicate/overwrite during streaming.
         assert_eq!(
-            rows.iter().filter(|row| row.contains(&line)).count(),
-            1,
-            "streamed output missing or duplicated: {line}"
+            term.state.lock().unwrap().scrollback_erase_count,
+            erases_before
         );
-    }
-    for line in [command, "cargo test -p rpi-tui --locked", "FOOTER-STATUS"] {
-        assert_eq!(
-            rows.iter().filter(|row| row.contains(line)).count(),
-            1,
-            "command/draft/footer missing, truncated or duplicated: {line}"
-        );
+        assert_eq!(term.state.lock().unwrap().history_view_top, Some(10));
+        assert_eq!(term.visible(), visible_before);
+        assert_history_once(&term);
+        let rows = document(&term);
+        for i in 0..lines {
+            let line = format!("tool-output-{i:03}");
+            assert_eq!(
+                rows.iter().filter(|row| row.contains(&line)).count(),
+                1,
+                "streamed output missing or duplicated: {line}"
+            );
+        }
+        for line in [command, "cargo test -p rpi-tui --locked", "FOOTER-STATUS"] {
+            assert_eq!(
+                rows.iter().filter(|row| row.contains(line)).count(),
+                1,
+                "command/draft/footer missing, truncated or duplicated: {line}"
+            );
+        }
     }
 }
 
-struct CommandsWithCursorAboveTail;
+struct CommandsWithCursorAboveTail {
+    cursor_row: Mutex<usize>,
+    cursor_at_start: bool,
+}
+
+impl Default for CommandsWithCursorAboveTail {
+    fn default() -> Self {
+        Self {
+            cursor_row: Mutex::new(6),
+            cursor_at_start: false,
+        }
+    }
+}
 
 impl Component for CommandsWithCursorAboveTail {
     fn render(&self, _width: usize) -> Vec<String> {
         (0..12)
             .map(|i| {
                 let mut line = format!("command {i:02} complete");
-                if i == 6 {
-                    line.push_str(CURSOR_MARKER);
+                if i == *self.cursor_row.lock().unwrap() {
+                    if self.cursor_at_start {
+                        line.insert_str(0, CURSOR_MARKER);
+                    } else {
+                        line.push_str(CURSOR_MARKER);
+                    }
                 }
                 line
             })
@@ -198,7 +216,7 @@ fn cursor_above_live_viewport_does_not_duplicate_or_drop_command_rows() {
     let term = VirtualTerminal::new(40, 4);
     let tui = TuiAltScreen::new(Box::new(term.clone()), true, None);
     tui.set_main_screen_mode(true);
-    tui.set_layout_root(Some(Arc::new(CommandsWithCursorAboveTail)));
+    tui.set_layout_root(Some(Arc::new(CommandsWithCursorAboveTail::default())));
     tui.start_readerless();
 
     let expected: Vec<_> = (0..12)
@@ -211,4 +229,111 @@ fn cursor_above_live_viewport_does_not_duplicate_or_drop_command_rows() {
         expected,
         "unchanged repaint changed history"
     );
+}
+
+#[test]
+fn offscreen_cursor_can_return_without_corrupting_the_physical_ledger() {
+    let term = VirtualTerminal::new(40, 4);
+    let tui = TuiAltScreen::new(Box::new(term.clone()), true, None);
+    tui.set_main_screen_mode(true);
+    let commands = Arc::new(CommandsWithCursorAboveTail::default());
+    tui.set_layout_root(Some(commands.clone()));
+    tui.start_readerless();
+    let expected = document(&term);
+    assert!(!term.state.lock().unwrap().cursor_visible);
+
+    for row in [11, 6, 9] {
+        *commands.cursor_row.lock().unwrap() = row;
+        tui.request_render(false);
+        assert_eq!(document(&term), expected);
+        let st = term.state.lock().unwrap();
+        assert_eq!(st.viewport_top, 8);
+        if row >= st.viewport_top {
+            assert!(st.cursor_visible);
+            assert_eq!(st.cursor_row + st.viewport_top, row);
+            assert_eq!(st.cursor_col, "command 00 complete".len());
+        } else {
+            assert!(!st.cursor_visible);
+        }
+    }
+}
+
+#[test]
+fn column_zero_cursor_and_hidden_cursor_preference_are_respected() {
+    for show_cursor in [true, false] {
+        let term = VirtualTerminal::new(40, 4);
+        let tui = TuiAltScreen::new(Box::new(term.clone()), show_cursor, None);
+        tui.set_main_screen_mode(true);
+        tui.set_layout_root(Some(Arc::new(CommandsWithCursorAboveTail {
+            cursor_row: Mutex::new(11),
+            cursor_at_start: true,
+        })));
+        tui.start_readerless();
+        let st = term.state.lock().unwrap();
+        assert_eq!(st.cursor_col, 0, "CSI 0 C would incorrectly move right");
+        assert_eq!(st.cursor_visible, show_cursor);
+    }
+}
+
+#[test]
+fn forced_repaints_repair_live_rows_without_appending_or_erasing_history() {
+    let term = VirtualTerminal::new(WIDTH, HEIGHT);
+    let tui = TuiAltScreen::new(Box::new(term.clone()), true, None);
+    tui.set_main_screen_mode(true);
+    let root = Arc::new(Container::new());
+    root.add_child(old_history());
+    root.add_child(Arc::new(Text::new("complete tool command", 0, 0)));
+    add_dock(&root);
+    tui.set_layout_root(Some(root));
+    tui.start_readerless();
+    term.browse_history_at(10);
+    let visible_before = term.visible();
+    let expected = document(&term);
+    let erases_before = term.state.lock().unwrap().scrollback_erase_count;
+    for _ in 0..3 {
+        // Simulate an externally damaged live cell without moving the physical
+        // cursor. A forced repaint must repair it, not patch against equal rows.
+        {
+            let mut st = term.state.lock().unwrap();
+            let row = st.viewport_top;
+            st.document[row][0] = '?';
+        }
+        tui.render_now(true);
+        assert_eq!(document(&term), expected);
+        assert_eq!(
+            term.state.lock().unwrap().scrollback_erase_count,
+            erases_before
+        );
+        assert_eq!(term.state.lock().unwrap().history_view_top, Some(10));
+        assert_eq!(term.visible(), visible_before);
+        assert_history_once(&term);
+    }
+}
+
+#[test]
+fn forced_repaint_clears_line_suffixes_and_unused_live_rows() {
+    let term = VirtualTerminal::new(40, 4);
+    let tui = TuiAltScreen::new(Box::new(term.clone()), true, None);
+    tui.set_main_screen_mode(true);
+    let text = Arc::new(Text::new("short", 0, 0));
+    tui.set_layout_root(Some(text.clone()));
+    tui.start_readerless();
+    let expected = document(&term);
+    {
+        let mut st = term.state.lock().unwrap();
+        st.document[0][25] = '?';
+        st.document[2][3] = '?';
+    }
+    tui.render_now(true);
+    assert_eq!(document(&term), expected);
+    assert_eq!(term.state.lock().unwrap().scrollback_erase_count, 0);
+
+    // Subsequent appends must still start at the actual tail, not the blank
+    // row visited while clearing the rest of the live screen.
+    text.set_text("short\nnext command complete");
+    tui.request_render(false);
+    let rows = document(&term);
+    assert_eq!(rows[0], "short");
+    assert_eq!(rows[1], "next command complete");
+    assert!(rows[2..].iter().all(String::is_empty));
 }

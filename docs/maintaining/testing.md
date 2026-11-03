@@ -8,11 +8,12 @@
 cargo test -p rpi-tui --test main_screen_scroll_up --locked -- --nocapture
 ```
 
-新增三条测试分别检查后台仅更新耗时、持续追加工具输出，以及光标在 live viewport
-上方时的历史/命令完整性。它们不使用 ignore，默认 workspace 测试会执行。
-当前为 **RED 阶段：合计 9 通过、2 失败、0 ignored**，尚未修改生产渲染逻辑，不能视为
-可合并的全绿修复。真实 macOS / iTerm2 视觉验收未执行，不能用虚拟终端或 fullscreen
-对照 PASS 代替。后续修复须保留这些验收和既有历史重排测试。
+验收覆盖后台计时、持续追加输出的逐帧完整性、历史区光标隐藏及返回、列 0/显示设置，
+以及强制重绘对消息唯一性和外部残留单元格的修复。默认 workspace 测试会执行，当前该
+集成目标 **15 通过、0 失败、0 ignored**，保留既有历史重排测试。
+regular 工具面板使用稳定运行状态，实时耗时仍在输入区工作状态中显示；fullscreen 和
+完成总耗时不变。真实 macOS / iTerm2 视觉验收未执行，不能用虚拟终端或 fullscreen
+对照 PASS 代替；真实历史编辑/重排仍可能重建 scrollback。
 
 ## 下次直接运行
 

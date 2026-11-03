@@ -335,15 +335,22 @@ impl BashExecutionComponent {
 
         if status == BashStatus::Running {
             let elapsed = self.elapsed();
+            let main_screen = crate::render::is_main_screen_frame();
+            // A concurrent tool can push even this bottom status row into
+            // scrollback. Keep regular-mode transcript panels clock-independent;
+            // the live dock owns animation/time and completion keeps total time.
+            let status_text = if main_screen {
+                "running (Esc / Ctrl+C 中止)".to_string()
+            } else {
+                crate::tool_execution::format_elapsed(elapsed)
+            };
             let row = format!(
                 "{} {}",
                 colors.accent.fg("●"),
-                colors
-                    .muted
-                    .fg(&crate::tool_execution::format_elapsed(elapsed)),
+                colors.muted.fg(&status_text),
             );
             lines.push(panel_line(&truncate_to_width(&row, content_width, "…")));
-            if elapsed > LONG_RUNNING_HINT_AFTER {
+            if !main_screen && elapsed > LONG_RUNNING_HINT_AFTER {
                 let hint = format!("{} Esc / Ctrl+C 中止", colors.muted.fg("⏸"));
                 for part in wrap_text_with_ansi(&hint, content_width) {
                     lines.push(panel_line(&part));
@@ -683,6 +690,33 @@ mod tests {
             !plain.contains("Running"),
             "the `Running...` label was replaced by the elapsed timer: {plain}"
         );
+    }
+
+    #[test]
+    fn regular_running_panel_is_stable_across_clock_and_hint_thresholds() {
+        let c = BashExecutionComponent::new("printf complete-command");
+        c.append_output("complete output");
+        *c.started_at.lock().unwrap() = Some(Instant::now() - Duration::from_secs(2));
+        let regular = crate::render::with_main_screen_frame(|| c.render(80));
+        let fullscreen = c.render(80);
+        assert_ne!(regular, fullscreen);
+        assert!(strip_ansi(&regular.join("\n")).contains("running"));
+
+        *c.started_at.lock().unwrap() = Some(Instant::now() - Duration::from_secs(65));
+        assert_eq!(
+            crate::render::with_main_screen_frame(|| c.render(80)),
+            regular,
+            "clock/hint changes must not reshape a regular transcript panel"
+        );
+        assert!(strip_ansi(&c.render(80).join("\n")).contains("Ctrl+C"));
+
+        c.set_complete(Some(0), false, BashTruncation::default());
+        let start = Instant::now() - Duration::from_secs(10);
+        *c.started_at.lock().unwrap() = Some(start);
+        *c.finished_at.lock().unwrap() = Some(start + Duration::from_millis(3200));
+        let finished_regular = crate::render::with_main_screen_frame(|| c.render(80));
+        assert!(strip_ansi(&finished_regular.join("\n")).contains("3.2s"));
+        assert_eq!(finished_regular, c.render(80));
     }
 
     #[test]

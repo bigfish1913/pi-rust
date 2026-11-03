@@ -33,6 +33,7 @@ struct VtState {
     scrollback_erase_count: usize,
     cursor_row: usize,
     cursor_col: usize,
+    cursor_visible: bool,
     scrollback_limit: Option<usize>,
 }
 
@@ -56,6 +57,7 @@ impl VirtualTerminal {
             scrollback_erase_count: 0,
             cursor_row: 0,
             cursor_col: 0,
+            cursor_visible: true,
             scrollback_limit: None,
         };
         Self {
@@ -318,8 +320,11 @@ impl VirtualTerminal {
                                     let n = nums.first().copied().unwrap_or(1);
                                     self.scroll_down(n);
                                 }
+                                b'h' | b'l' if params == "?25" => {
+                                    self.state.lock().unwrap().cursor_visible = final_byte == b'h';
+                                }
                                 _ => {
-                                    // Ignore unsupported sequences (2026h/l, 25h/l, ...).
+                                    // Ignore unsupported sequences (2026h/l, ...).
                                 }
                             }
                         }
