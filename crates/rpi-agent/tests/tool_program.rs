@@ -801,7 +801,7 @@ async fn host_rollup_survives_errors_repeated_poll_disposal_and_unawaited_drain(
                         let page = p.handle(json!({"op":"list"})).await.unwrap();
                         assert_eq!(
                             page["capabilities"],
-                            json!({"resultEnvelope":1,"hostAccounting":1,"parentProgress":1})
+                            json!({"resultEnvelope":1,"hostAccounting":1,"parentProgress":1,"losslessValues":1})
                         );
                         let id = start(&p).await;
                         for _ in 0..3 {
@@ -1521,4 +1521,357 @@ async fn containing_native_cancellation_reaches_program_and_drains_children() {
     .await;
     assert_eq!(observed.load(Ordering::SeqCst), 1);
     assert_eq!(result.usage.unwrap().total_tokens, 3);
+}
+
+// Neutral AgentTool JSON is business data, not extension ABI transport metadata.
+// In particular, these nested names do not claim the top-level __rpi binding.
+fn business_json() -> Value {
+    json!({"record": {
+        "runtimeKey":"customer-key", "runtimeHandle":{"id":7},
+        "__rpi":{"owner":"customer"}, "__rpiRuntimeKey":"customer-runtime",
+        "items":[{"runtimeKey":"nested-key", "runtimeHandle":"nested-handle",
+            "__rpi":{"runtimeKey":"deep-key"}, "__rpiRuntimeKey":"nested-runtime"}]
+    }})
+}
+fn business_result(args: Value) -> AgentToolResult {
+    AgentToolResult {
+        content: vec![rpi_agent::TextContentOrImage::Text(
+            serde_json::from_value(json!({"type":"text", "text":"business result",
+                "textSignature":"business-signature"}))
+            .unwrap(),
+        )],
+        details: args,
+        ..Default::default()
+    }
+}
+// Compare the finalized native event, not just a hand-written expected envelope.
+fn finalized_json(result: &AgentToolResult) -> Value {
+    let content: Vec<_> = result
+        .content
+        .iter()
+        .map(|c| match c {
+            rpi_agent::TextContentOrImage::Text(t) => serde_json::to_value(t).unwrap(),
+            rpi_agent::TextContentOrImage::Image(i) => serde_json::to_value(i).unwrap(),
+        })
+        .collect();
+    json!({"content":content, "details":result.details, "usage":result.usage,
+        "addedToolNames":result.added_tool_names, "terminate":result.terminate})
+}
+struct BusinessEcho {
+    schema: Tool,
+    effects: Arc<Mutex<Vec<Value>>>,
+}
+#[async_trait::async_trait]
+impl AgentTool for BusinessEcho {
+    fn schema(&self) -> &Tool {
+        &self.schema
+    }
+    fn label(&self) -> &str {
+        "business"
+    }
+    fn prepare_arguments(&self, args: Value) -> Result<Value, AgentError> {
+        self.effects.lock().unwrap().push(json!({"prepare":args}));
+        Ok(args)
+    }
+    async fn execute(
+        &self,
+        _: &str,
+        args: Value,
+        _: CancellationToken,
+        _: Update,
+    ) -> Result<AgentToolResult, AgentError> {
+        self.effects.lock().unwrap().push(json!({"execute":args}));
+        Ok(business_result(args))
+    }
+}
+async fn differential_business_run(nested: bool, hooks: bool) -> (Value, Vec<Value>) {
+    let effects = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::new(Mutex::new(None));
+    let reply = observed.clone();
+    let mut cfg = common::base_config();
+    if hooks {
+        let seen = effects.clone();
+        cfg.before_tool_call = Some(Arc::new(move |ctx, _| {
+            let result = if ctx.tool_call.name == "business" {
+                seen.lock().unwrap().push(json!({"before":ctx.args}));
+                Some(BeforeToolCallResult {
+                    args: Some(json!({"hookReplacement":business_json()})),
+                    ..Default::default()
+                })
+            } else {
+                None
+            };
+            Box::pin(async move { result })
+        }));
+        let seen = effects.clone();
+        cfg.after_tool_call = Some(Arc::new(move |ctx, _| {
+            let result = if ctx.tool_call.name == "business" {
+                seen.lock().unwrap().push(json!({"afterArgs":ctx.args,
+                    "afterResult":finalized_json(ctx.result), "isError":ctx.is_error}));
+                let finalized = business_result(json!({"hookFinalized":business_json()}));
+                Some(AfterToolCallResult {
+                    content: Some(finalized.content),
+                    details: Some(finalized.details),
+                    ..Default::default()
+                })
+            } else {
+                None
+            };
+            Box::pin(async move { result })
+        }));
+    }
+    let tools: Vec<Arc<dyn AgentTool>> = vec![
+        Arc::new(BusinessEcho {
+            schema: serde_json::from_value(json!({"name":"business", "description":"echo JSON",
+                "parameters":{"type":"object", "properties":{"record":{"type":"object"}},
+                    "required":["record"], "additionalProperties":false}}))
+            .unwrap(),
+            effects: effects.clone(),
+        }),
+        parity_tool(
+            "codemode",
+            Arc::new(move |p, _, _| {
+                let reply = reply.clone();
+                Box::pin(async move {
+                    let started = p
+                        .handle(json!({"op":"start", "name":"business",
+                    "arguments":business_json()}))
+                        .await
+                        .unwrap();
+                    *reply.lock().unwrap() = Some(poll(&p, &started["requestId"]).await);
+                    Ok(AgentToolResult::text("parent"))
+                })
+            }),
+        ),
+    ];
+    let name = if nested { "codemode" } else { "business" };
+    let (events, messages) = common::run_and_collect(
+        vec![common::user_message("run")],
+        AgentContext {
+            tools,
+            ..Default::default()
+        },
+        cfg,
+        common::mock_stream_fn(vec![
+            common::assistant_tool_calls(
+                vec![(
+                    "parent",
+                    name,
+                    if nested {
+                        json!({"value":"body"})
+                    } else {
+                        business_json()
+                    },
+                )],
+                StopReason::ToolUse,
+            ),
+            common::assistant_text("done", StopReason::Stop),
+        ]),
+    )
+    .await;
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|m| matches!(m, rpi_agent::AgentMessage::ToolResult(_)))
+            .count(),
+        1
+    );
+    let finalized: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            rpi_agent::AgentEvent::ToolExecutionEnd {
+                result, is_error, ..
+            } => {
+                assert!(!is_error, "outer execution failed: {result:?}");
+                Some(finalized_json(result))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        finalized.len(),
+        1,
+        "nested children must not emit ordinary events"
+    );
+    let result = if nested {
+        let child = observed.lock().unwrap().take().unwrap();
+        assert_eq!(child["status"], "done", "{child}");
+        assert_eq!(child["isError"], false, "{child}");
+        child["result"].clone()
+    } else {
+        finalized[0].clone()
+    };
+    let effects = effects.lock().unwrap().clone();
+    (result, effects)
+}
+#[tokio::test]
+async fn differential_business_json_and_signed_result_survive_nested_execution() {
+    let direct = differential_business_run(false, false).await;
+    assert_eq!(direct.0, finalized_json(&business_result(business_json())));
+    assert_eq!(
+        direct.1,
+        vec![
+            json!({"prepare":business_json()}),
+            json!({"execute":business_json()})
+        ]
+    );
+    let nested = differential_business_run(true, false).await;
+    assert_eq!(
+        nested.1, direct.1,
+        "native parameter preparation/execution must match"
+    );
+    assert_eq!(
+        nested.0, direct.0,
+        "finalized details and textSignature must match"
+    );
+}
+#[tokio::test]
+async fn differential_hooks_preserve_business_json_rewrites_and_finalized_results() {
+    let direct = differential_business_run(false, true).await;
+    let replacement = json!({"hookReplacement":business_json()});
+    assert_eq!(
+        direct.1,
+        vec![
+            json!({"prepare":business_json()}),
+            json!({"before":business_json()}),
+            json!({"execute":replacement}),
+            json!({"afterArgs":replacement, "afterResult":finalized_json(&business_result(replacement.clone())), "isError":false}),
+        ]
+    );
+    assert_eq!(
+        direct.0,
+        finalized_json(&business_result(json!({"hookFinalized":business_json()})))
+    );
+    let nested = differential_business_run(true, true).await;
+    assert_eq!(
+        nested.1, direct.1,
+        "native hooks and side effects must match exactly"
+    );
+    assert_eq!(
+        nested.0, direct.0,
+        "after-hook finalized business result must match"
+    );
+}
+
+#[tokio::test]
+async fn differential_catalog_uses_effective_batch_snapshot_not_added_names() {
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let nested = observed.clone();
+    let program = parity_tool(
+        "codemode",
+        Arc::new(move |p, _, _| {
+            let nested = nested.clone();
+            Box::pin(async move {
+                let page = p.handle(json!({"op":"list"})).await.unwrap();
+                assert_eq!(page["tools"].as_array().unwrap().len(), 1);
+                assert_eq!(page["tools"][0]["name"], "effect");
+                assert!(p
+                    .handle(
+                        json!({"op":"start", "name":"announced-only", "arguments":{"value":"ok"}})
+                    )
+                    .await
+                    .is_err());
+                let id = start(&p).await;
+                let result = poll(&p, &id).await;
+                assert_eq!(result["status"], "done", "{result}");
+                assert_eq!(result["isError"], false, "{result}");
+                nested
+                    .lock()
+                    .unwrap()
+                    .push(json!({"catalog":page["tools"], "result":result["result"]}));
+                Ok(AgentToolResult::text("parent"))
+            })
+        }),
+    );
+    let effects = Arc::new(AtomicUsize::new(0));
+    let make_effect = |version: &'static str| {
+        let effects = effects.clone();
+        let mut tool_schema = schema("effect");
+        tool_schema.description = version.into();
+        Arc::new(ParityTool {
+            schema: tool_schema,
+            body: Arc::new(move |_, _, _| {
+                let effects = effects.clone();
+                Box::pin(async move {
+                    effects.fetch_add(1, Ordering::SeqCst);
+                    Ok(AgentToolResult {
+                        added_tool_names: vec!["announced-only".into()],
+                        ..AgentToolResult::text(version)
+                    })
+                })
+            }),
+        }) as Arc<dyn AgentTool>
+    };
+    let first = make_effect("batch-one");
+    let second = make_effect("batch-two");
+    let next_tools = vec![program.clone(), second];
+    let turns = Arc::new(AtomicUsize::new(0));
+    let mut cfg = common::base_config();
+    cfg.prepare_next_turn = Some(Arc::new(move |ctx| {
+        let update = if turns.fetch_add(1, Ordering::SeqCst) == 0 {
+            let mut context = ctx.context.clone();
+            context.tools = next_tools.clone();
+            Some(rpi_agent::AgentLoopTurnUpdate {
+                context: Some(context),
+                ..Default::default()
+            })
+        } else {
+            None
+        };
+        Box::pin(async move { update })
+    }));
+    let batch = || {
+        common::assistant_tool_calls(
+            vec![
+                ("direct", "effect", json!({"value":"ok"})),
+                ("parent", "codemode", json!({"value":"body"})),
+            ],
+            StopReason::ToolUse,
+        )
+    };
+    let (events, _) = common::run_and_collect(
+        vec![common::user_message("run")],
+        AgentContext {
+            tools: vec![program, first],
+            ..Default::default()
+        },
+        cfg,
+        common::mock_stream_fn(vec![
+            batch(),
+            batch(),
+            common::assistant_text("done", StopReason::Stop),
+        ]),
+    )
+    .await;
+    let direct: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            rpi_agent::AgentEvent::ToolExecutionEnd {
+                tool_name,
+                result,
+                is_error,
+                ..
+            } => {
+                assert!(!is_error, "{result:?}");
+                (tool_name == "effect").then(|| finalized_json(result))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(direct.len(), 2);
+    let nested = observed.lock().unwrap();
+    assert_eq!(nested.len(), 2);
+    for (i, version) in ["batch-one", "batch-two"].iter().enumerate() {
+        assert_eq!(direct[i]["content"][0]["text"], *version);
+        assert_eq!(nested[i]["catalog"][0]["description"], *version);
+        assert_eq!(
+            nested[i]["result"], direct[i],
+            "direct and child must execute the same batch authority"
+        );
+    }
+    assert_eq!(
+        effects.load(Ordering::SeqCst),
+        4,
+        "one direct and one child execution per batch"
+    );
 }

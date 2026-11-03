@@ -11,6 +11,7 @@ import hashlib
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import importlib.util
 import json
+import re
 from pathlib import Path
 import struct
 import threading
@@ -22,6 +23,27 @@ import zlib
 spec = importlib.util.spec_from_file_location("resource_smoke", Path(__file__).with_name("resource-smoke.py"))
 resource = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(resource)
+
+# Legitimate business properties/strings must survive every boundary unchanged.
+BUSINESS = {
+    "runtimeKey": "customer-key", "runtimeHandle": {"id": 7},
+    "__rpi": {"owner": "customer", "runtimeKey": "business-deep-key"},
+    "__rpiRuntimeKey": "customer-runtime",
+    "items": [{"runtimeKey": "nested-key", "runtimeHandle": "nested-handle",
+               "__rpi": {"runtimeKey": "deep-key"}, "__rpiRuntimeKey": "nested-runtime"}],
+    "literal": "runtimeKey runtimeHandle __rpi __rpiRuntimeKey are business strings",
+}
+BUSINESS_JS = json.dumps(BUSINESS, ensure_ascii=False)
+DIRECT_CASES = {
+    "fixture_direct_success": {"business": BUSINESS},
+    "fixture_direct_error": {"business": BUSINESS, "error": True},
+}
+EXACT_CASES = {"fixture_result_success": "fixture_direct_success",
+               "fixture_result_error": "fixture_direct_error",
+               "fixture_result_deleted_details": "fixture_direct_success",
+               "fixture_result_undefined_details": "fixture_direct_error"}
+MUTATED_DETAILS_CASES = {"fixture_result_deleted_details", "fixture_result_undefined_details"}
+BINDING_CASES = ("fixture_binding_success", "fixture_binding_error")
 
 CASES = {
     "list": {"action": "list", "limit": 2},
@@ -50,11 +72,31 @@ CASES = {
     "fixture_caught_error": {"code": "try {await tools.parity_probe({error:true});} catch(e) {return {caught:true,raw:e.result};} throw Error('expected native error');"},
     "fixture_terminal": {"code": "return await tools.parity_probe({error:true,terminate:true});"},
 }
+CASES.update({
+    **DIRECT_CASES,
+    "fixture_result_success": {"code": "return tools.result(await tools.parity_probe({business:" + BUSINESS_JS + "}));"},
+    # A caught native error completes JS normally, but exact selection retains
+    # outer isError and must not synthesize error text or a CodeMode summary.
+    "fixture_result_error": {"code": "try {await tools.parity_probe({error:true,business:" + BUSINESS_JS + "});} catch(e) {return tools.result(e.result);} throw Error('missing native error');"},
+    "fixture_result_deleted_details": {"code": "const r=await tools.parity_probe({business:" + BUSINESS_JS + "}); delete r.details; return tools.result(r);"},
+    "fixture_result_undefined_details": {"code": "try {await tools.parity_probe({error:true,business:" + BUSINESS_JS + "});} catch(e) {e.result.details=undefined; return tools.result(e.result);} throw Error('missing native error');"},
+    "fixture_business": {"code": "const catalog=tools.list(); const raw=await tools.parity_probe({business:" + BUSINESS_JS + "}); return {schema:catalog.find(t=>t.name==='parity_probe'),raw:raw,guest:" + BUSINESS_JS + "};"},
+    "fixture_aliases": {"code": "const out=[]; for(const name of ['call','list','emit','result']) {out.push(await tools.call(name,{business:" + BUSINESS_JS + "}));} return out;"},
+})
+for binding_case in BINDING_CASES:
+    CASES[binding_case] = {"code": "let raw, caught=false; try {raw=await tools.parity_probe({echoBinding:true,error:"
+        + ("true" if binding_case.endswith("error") else "false") + ",business:" + BUSINESS_JS
+        + "});} catch(e) {caught=true; raw=e.result;} const echo=raw.details.bindingEcho; "
+          "if(echo.metadata!==null || echo.key!=='[redacted invocation credential]') throw Error('binding reached guest'); "
+          "return {raw:raw,caught:caught,guest:JSON.parse(JSON.stringify(raw)),text:JSON.parse(raw.content[0].text)};"}
+
 BASE_CASES = ["list", "compose", "png_return", "png_emit", "png_emit_throw", "png_intermediate",
               "bad_signature", "empty_emit_throw", "cyclic_emit", "ordinary_json",
               "fabricated_usage", "oversized_output", "framed_oversized_output", "invalid", "partial", "timeout",
               "regexp_rejected", "caught_oom", "cancel", "after_cancel"]
-FIXTURE_CASES = ["fixture_success", "fixture_throw", "fixture_caught_error", "fixture_terminal"]
+FIXTURE_CASES = [*DIRECT_CASES, *EXACT_CASES, "fixture_business", *BINDING_CASES,
+                 "fixture_aliases", "fixture_success", "fixture_throw",
+                 "fixture_caught_error", "fixture_terminal"]
 
 
 def require(ok, reason):
@@ -124,11 +166,11 @@ class Provider:
                         if case.startswith("fixture_"):
                             require("parity_probe" in names, "missing fixture tool")
                         delta = {"role": "assistant", "tool_calls": [{"index": 0, "id": "smoke-" + case,
-                            "type": "function", "function": {"name": "codemode",
+                            "type": "function", "function": {"name": "parity_probe" if case in DIRECT_CASES else "codemode",
                             "arguments": json.dumps(CASES[case])}}]}
                         finish = "tool_calls"
                     else:
-                        require(len(results) == 1, "expected only outer codemode result")
+                        require(len(results) == 1, "expected one direct or outer result")
                         require(case != "fixture_terminal", "terminal child triggered a second model turn")
                         require(image_count(messages[last + 1:]) == (1 if case in ("png_return", "png_emit", "png_emit_throw") else 0),
                                 "wrong image count in latest case segment: " + case)
@@ -205,12 +247,12 @@ class Host(resource.Host):
             self.send({"type": "ui_dialog_response", "requestId": frame["requestId"], "answer": False})
 
 
-def outer_result(host):
+def outer_result(host, expected_tool="codemode"):
     data = host.call("get_messages", limit=64)
     results = [m for m in data["messages"] if m.get("role") in ("toolResult", "tool")]
     require(results, data)
     result = results[-1]
-    require(result.get("toolName", result.get("tool_name")) == "codemode", result)
+    require(result.get("toolName", result.get("tool_name")) == expected_tool, result)
     if isinstance(result.get("details"), dict):
         return result, result["details"]
     raw = resource.text(result.get("content"))
@@ -237,16 +279,83 @@ def check_native(case, result, summary):
         require(summary["result"]["usage"]["totalTokens"] == 1998, summary)
 
 
-def check_fixture(case, result, summary, host, provider):
-    count = 2 if case == "fixture_success" else 1
+def exact_payload(result):
+    # Compare ALL payload fields; only identity/time and added-name set
+    # semantics differ at the outer native accounting boundary.
+    ignored = {"role", "toolCallId", "tool_call_id", "toolName", "tool_name", "timestamp", "entryId"}
+    value = {k: v for k, v in result.items() if k not in ignored}
+    if "addedToolNames" in value:
+        value["addedToolNames"] = sorted(set(value["addedToolNames"]))
+    return value
+
+
+def check_binding(raw):
+    details = raw["details"]
+    require(details["business"] == BUSINESS, details)
+    echo = details["bindingEcho"]
+    require(echo["metadata"] is None, "actual metadata was not null")
+    require(echo["key"] == "[redacted invocation credential]", "private key escaped")
+    require(echo["embedded"] == "before:[redacted invocation credential]:after", echo)
+    require(isinstance(echo["handle"], int) and echo["handle"] > 0, "bare handle was redacted")
+    require(echo["business"] == BUSINESS, echo)
+    require(json.loads(echo["serialized"]) == {
+        "metadata": None, "key": "[redacted invocation credential]", "business": BUSINESS}, echo)
+    require(json.loads(raw["content"][0]["text"]) == details, "text echo differs from object echo")
+    require(raw["content"][0]["textSignature"] == "native-parity-signature", raw)
+    # Private invocation keys are UUID v4; numeric handles alone aren't secrets.
+    require(not re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+                          json.dumps(raw), re.I), "private invocation UUID escaped")
+
+
+def check_fixture(case, result, summary, host, provider, baselines):
+    count = 4 if case == "fixture_aliases" else 2 if case == "fixture_success" else 1
     usage = result.get("usage") or {}
     require(usage.get("input") == count and usage.get("output") == 2 * count
             and usage.get("totalTokens") == 3 * count, result)
-    require(result.get("addedToolNames") == ["fixture-added"], result)
+    require(set(result.get("addedToolNames", [])) == {"fixture-added"}, result)
+    if case not in DIRECT_CASES:
+        require(result["addedToolNames"] == ["fixture-added"], "outer names not deduped")
     for key, value in {"input": .1, "output": .2, "cacheRead": 0, "cacheWrite": 0, "total": .3}.items():
         require(abs(usage["cost"][key] - value * count) < 1e-9, usage)
-    failed = case in ("fixture_throw", "fixture_terminal")
+    failed = case in ("fixture_throw", "fixture_terminal", "fixture_direct_error", "fixture_result_error", "fixture_result_undefined_details")
     require(bool(result.get("isError")) == failed, result)
+    if case in DIRECT_CASES:
+        require(summary == {"fixture": "native-parity", "business": BUSINESS}, summary)
+        require(result["content"] == [{"type": "text", "text": "native parity probe",
+                "textSignature": "native-parity-signature"}], result)
+        baselines[case] = result
+        require(not any(p["toolCallId"] == "smoke-" + case for p in host.progress),
+                "direct baseline went through CodeMode")
+        return
+    if case in EXACT_CASES:
+        baseline = exact_payload(baselines[EXACT_CASES[case]])
+        if case in MUTATED_DETAILS_CASES:
+            baseline["details"] = None
+        require(exact_payload(result) == baseline,
+                {"case": case, "actual": exact_payload(result), "baseline": baseline})
+        require(summary == (None if case in MUTATED_DETAILS_CASES else
+                            {"fixture": "native-parity", "business": BUSINESS}),
+                "exact details contain a CodeMode summary or lack native null")
+    elif case in ("fixture_business", *BINDING_CASES, "fixture_aliases"):
+        require(summary["status"] == "completed", summary)
+        value = summary["result"]
+        if case == "fixture_business":
+            require(value["guest"] == BUSINESS and value["raw"]["details"]["business"] == BUSINESS, value)
+            schema = value["schema"]["parameters"]
+            require(schema["properties"]["business"] == {
+                "type": "object", "additionalProperties": True, "properties": {
+                    "runtimeKey": {"type": "string"}, "runtimeHandle": {},
+                    "__rpi": {"type": "object", "additionalProperties": True,
+                              "properties": {"runtimeKey": {"type": "string"}}},
+                    "__rpiRuntimeKey": {"type": "string"}}}, schema)
+            require(schema["properties"]["echoBinding"] == {"type": "boolean"}, schema)
+            require(value["raw"]["content"][0]["textSignature"] == "native-parity-signature", value)
+        elif case in BINDING_CASES:
+            check_binding(value["raw"])
+            require(value["guest"] == value["raw"] and value["text"] == value["raw"]["details"], value)
+            require(value["caught"] == case.endswith("error"), value)
+        else:
+            require(len(value) == 4 and all(v["details"]["business"] == BUSINESS for v in value), value)
     if case == "fixture_throw":
         require(summary["status"] == "error" and "after native child" in summary["error"], summary)
     if case == "fixture_caught_error":
@@ -254,8 +363,9 @@ def check_fixture(case, result, summary, host, provider):
         require(raw["usage"]["totalTokens"] == 3 and raw["details"]["fixture"] == "native-parity", summary)
         require(raw["addedToolNames"] == ["fixture-added", "fixture-added"], summary)
     parent_id = "smoke-" + case
-    progress = [p for p in host.progress if p["toolCallId"] == parent_id and p["tool"] == "parity_probe"]
-    terminal_phase = "failed" if case in ("fixture_caught_error", "fixture_terminal") else "completed"
+    progress = [p for p in host.progress if p["toolCallId"] == parent_id
+                and p["tool"] in (["call", "list", "emit", "result"] if case == "fixture_aliases" else ["parity_probe"])]
+    terminal_phase = "failed" if case in ("fixture_caught_error", "fixture_terminal", "fixture_result_error", "fixture_result_undefined_details", "fixture_binding_error") else "completed"
     for phase in ("started", "progress", terminal_phase):
         require(sum(p["phase"] == phase for p in progress) == count, progress)
     require(len({p["requestId"] for p in progress}) == count, progress)
@@ -265,6 +375,27 @@ def check_fixture(case, result, summary, host, provider):
         require(host.ends.get(parent_id) == {"terminate": True, "isError": True}, host.ends)
         require(sum(latest_case(c["messages"])[1] == case for c in provider.calls) == 1,
                 "terminal error performed another provider turn")
+
+
+def assert_no_binding(value):
+    if isinstance(value, dict):
+        # Field-name bans reject legitimate data. Actual injected metadata has
+        # both a numeric handle and a UUID credential, including text echoes.
+        key = value.get("runtimeKey")
+        require(not (isinstance(key, str) and isinstance(value.get("runtimeHandle"), int)
+                     and re.fullmatch(r"[0-9a-f-]{36}", key, re.I)), "injected binding escaped")
+        for item in value.values():
+            assert_no_binding(item)
+    elif isinstance(value, list):
+        for item in value:
+            assert_no_binding(item)
+    elif isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except (ValueError, RecursionError):
+            return
+        if isinstance(decoded, (dict, list)):
+            assert_no_binding(decoded)
 
 
 def run_group(args, root, gated=False):
@@ -283,7 +414,7 @@ def run_group(args, root, gated=False):
         command = [str(args.rpi), "--mode", "rpc", "--provider", "resource-fixture", "--model", "synthetic",
                    "--session-dir", str(root / "sessions"), "--session-id", str(uuid.uuid4()),
                    "--rpc-message-updates", "compact-deltas", "--local-only", "--no-skills", "--no-context-files",
-                   "--no-prompt-templates", "--tools", "read,write,codemode" + (",parity_probe" if args.fixture_extension and not gated else ""), "--thinking", "off", "--timeout", "15",
+                   "--no-prompt-templates", "--tools", "read,write,codemode" + (",parity_probe,call,list,emit,result" if args.fixture_extension and not gated else ""), "--thinking", "off", "--timeout", "15",
                    "--extension", str(args.extension)]
         if args.fixture_extension and not gated:
             command += ["--extension", str(args.fixture_extension)]
@@ -295,7 +426,7 @@ def run_group(args, root, gated=False):
         ready = host.wait(lambda f: f.get("type") == "ready")
         dump(root / "ready.json", ready)
         cases = ["denied"] if gated else BASE_CASES + (FIXTURE_CASES if args.fixture_extension else [])
-        findings = []
+        findings, baselines = [], {}
         for case in cases:
             require(host.call("prompt", message=case) == {"accepted": True}, "prompt acceptance")
             if case == "cancel":
@@ -305,16 +436,16 @@ def run_group(args, root, gated=False):
                 findings.append({"case": case, "passed": True})
                 continue
             host.settlement()
-            result, summary = outer_result(host)
+            result, summary = outer_result(host, "parity_probe" if case in DIRECT_CASES else "codemode")
             if case == "list":
                 require(not result.get("isError"), result)
                 require(summary["protocolVersion"] == 1 and len(summary["tools"]) <= 2, summary)
                 require(all(t["name"] != "codemode" for t in summary["tools"]), summary)
-                require(summary["capabilities"] == {"resultEnvelope": 1, "hostAccounting": 1, "parentProgress": 1}, summary)
+                require(summary["capabilities"] == {"resultEnvelope": 1, "hostAccounting": 1, "parentProgress": 1, "losslessValues": 1}, summary)
             elif case in ("png_return", "png_emit", "png_intermediate", "ordinary_json", "fabricated_usage"):
                 check_native(case, result, summary)
             elif case.startswith("fixture_"):
-                check_fixture(case, result, summary, host, provider)
+                check_fixture(case, result, summary, host, provider, baselines)
             elif case in ("compose", "after_cancel"):
                 require(not result.get("isError") and summary["status"] == "completed", result)
                 if case == "compose":
@@ -356,14 +487,39 @@ def run_group(args, root, gated=False):
         dump(root / "parent-ends.json", host.ends)
         data = host.call("get_messages", limit=64)
         dump(root / "messages.json", data)
-        require("runtimeKey" not in json.dumps(data) and "runtimeHandle" not in json.dumps(data), "capability leak")
+        assert_no_binding(data)
         host.exit_ok()
         sessions = list((root / "sessions").rglob("*.jsonl"))
         require(sessions, "no native JSONL transcript")
         raw = "\n".join(p.read_text(encoding="utf-8") for p in sessions)
         if not gated:
             require("rpi.tool_program.intent.v1" in raw and "rpi.tool_program.finished.v1" in raw, "no durable nested markers")
-        require("runtimeKey" not in raw and "runtimeHandle" not in raw, "capability persisted")
+        # Several native transcript segments may end with newlines; joining
+        # them creates blank separators, not additional JSON records.
+        entries = [json.loads(line) for line in raw.splitlines() if line.strip()]
+        for entry in entries:
+            assert_no_binding(entry)
+        assert_no_binding(provider.calls)
+        for line in (root / "process.jsonl").read_text(encoding="utf-8").splitlines():
+            assert_no_binding(json.loads(line))
+        intents = [e["data"] for e in entries if e.get("customType") == "rpi.tool_program.intent.v1"]
+        finished = [e["data"] for e in entries if e.get("customType") == "rpi.tool_program.finished.v1"]
+        require(all(e["replay"] == "never" for e in intents), "native child is replayable")
+        for case in FIXTURE_CASES:
+            if case not in cases:
+                continue
+            expected = 0 if case in DIRECT_CASES else 4 if case == "fixture_aliases" else 2 if case == "fixture_success" else 1
+            starts = [e for e in intents if e["rootToolCallId"] == "smoke-" + case]
+            ends = [e for e in finished if e["rootToolCallId"] == "smoke-" + case]
+            require(len(starts) == expected and len(ends) == expected,
+                    "native child replayed/lost, or direct baseline nested: " + case)
+            require({e["requestId"] for e in starts} == {e["requestId"] for e in ends},
+                    "unmatched native lifecycle marker: " + case)
+            child_error = case in ("fixture_caught_error", "fixture_terminal",
+                                   "fixture_result_error", "fixture_result_undefined_details",
+                                   "fixture_binding_error")
+            require(all(e["isError"] == child_error for e in ends),
+                    "native child lost its error: " + case)
         return findings
     finally:
         if host:

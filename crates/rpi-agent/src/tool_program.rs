@@ -210,7 +210,7 @@ impl ToolProgram {
                 let end = offset.saturating_add(limit).min(all.len());
                 let page = all.get(offset..end).unwrap_or(&[]);
                 Ok(
-                    json!({"protocolVersion":1,"capabilities":{"resultEnvelope":1,"hostAccounting":1,"parentProgress":1},"tools":page,"nextOffset":if end<all.len(){Some(end)}else{None}}),
+                    json!({"protocolVersion":1,"capabilities":{"resultEnvelope":1,"hostAccounting":1,"parentProgress":1,"losslessValues":1},"tools":page,"nextOffset":if end<all.len(){Some(end)}else{None}}),
                 )
             }
             "start" => {

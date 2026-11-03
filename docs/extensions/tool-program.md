@@ -4,6 +4,11 @@
 extension runtime-action ABI. No MCP connection, subprocess model, or second
 assistant turn is involved. Older hosts reject action 30 explicitly.
 
+This documents the **implemented first full-parity increment**, not the complete
+parity plan. The companion extension requires four exact version-1 capabilities;
+large-result transport, complete child progress/history/recovery and Web/ACP
+child cards/reload remain outstanding.
+
 A tool receives opaque `__rpi.runtimeHandle` and `__rpi.runtimeKey` from its native
 driver. Forward the handle as runtime-action user_data and the key as the reserved
 `__rpiRuntimeKey` argument. Keep both out of guest JavaScript, model-visible
@@ -14,10 +19,13 @@ foreign workers authenticate the captured invocation, including child subsets.
 Operations:
 
 - `list`: `{op:"list", offset?:0, limit?:32}` returns
-  `{protocolVersion:1, capabilities:{resultEnvelope:1,hostAccounting:1,parentProgress:1},
+  `{protocolVersion:1, capabilities:{resultEnvelope:1,hostAccounting:1,parentProgress:1,losslessValues:1},
    tools:[{name,description,parameters}], nextOffset}`.
   Pages allow 1..128 entries; catalog maximum is 4096 entries and 1 MiB.
-  The executing tool and ancestor names are excluded.
+  The executing tool and ancestor names are excluded; this is not 100% of the
+  native full tool set. Catalogs match native batch boundaries. Each invocation
+  uses its batch's effective tool snapshot; later invocations see legitimate
+  native batch updates, not authority granted by `addedToolNames`.
 - `start`: `{op:"start", name, arguments:{...}, timeoutMs?:30000}` returns
   `{requestId,status:"running"}`. Deadlines allow 1..120000 ms. IDs are host-owned.
 - `poll`: `{op:"poll",requestId}` returns running, done, or failed. Done includes
@@ -98,8 +106,8 @@ and `addedToolNames` are optional. The envelope requires version 1 and boolean
 fields. The complete envelope is bounded to 1 MiB and content to 256 blocks;
 name metadata is bounded to 256 names of at most 256 UTF-8 bytes each. Malformed
 opted-in payloads fail closed. All non-opted-in Done parsing and ABI Err handling
-remain unchanged. An extension must negotiate **all three** list capabilities
-before guest execution; an older action-30 host might support protocol 1 without
+remain unchanged. An extension must negotiate **all four exact integer version-1**
+list capabilities before guest execution; an older action-30 host might support protocol 1 without
 these additive semantics. Older hosts without action 30 still reject it.
 
 Failed envelopes become native `AgentError::StructuredTool(Box<AgentToolResult>)`.
@@ -132,6 +140,23 @@ Available valid usage and termination remain intact. After hooks can override
 these outcomes exactly as for direct tool execution. Tools that compose no
 children retain their own metadata unchanged, including original name order.
 
+## Lossless business values and native output hygiene
+
+`losslessValues:1` preserves legitimate business schema/argument/result properties
+named `runtimeKey`, `runtimeHandle`, `__rpi` and `__rpiRuntimeKey`, including nested
+data. There is no blanket recursive property-name blacklist. The native extension
+ABI still owns injected top-level `__rpi`, exactly as for direct plugin calls;
+it is not a business argument slot.
+
+An invocation-local public-output guard captures actual injected metadata and
+credential values. Both polling and wake drivers sanitize callbacks, Pending
+payloads, legacy Done, opted-in envelopes including structured errors, and plain
+tool errors. Exact injected metadata objects and credential values, including
+ordinary serialized JSON and aliases/collisions, are guarded without stripping
+unrelated business properties. Ordinary bare numbers are not blanket-redacted.
+This is output hygiene, **not a sandbox against malicious native plugins**:
+arbitrary encoding and direct plugin I/O are unguarded.
+
 ## Parent-associated progress
 
 Nested work reports through the **existing outer native update callback**,
@@ -157,6 +182,24 @@ once in outer native content, not in repeated JSON summaries. Intermediate
 images are not automatically promoted. This host preserves selected native
 blocks; it does not infer images from arbitrary nested JSON.
 
+The companion extension additionally implements
+`tools.result(nativeResultOrErrorResult)`: a captured WeakMap associates finalized
+native child objects (including caught `error.result`) with authoritative
+`isError`. Exactly one selection is allowed, without `tools.emit` or returning
+another content object. Fabricated/cloned inputs, conflicting/multiple selections
+and invalid serialization cause sticky failure even if caught. Normal completion
+keeps exact supported content/details/isError, with no summary in selected details
+and no synthetic error text appended to exact errors. Ordinary return/content
+emission behavior is unchanged. Usage/names/termination stay host-authoritative;
+a later throw/cancel/timeout/OOM/lifecycle failure/terminal child wins. The
+extension remains inline at 128 blocks / 1 MiB content, plus the 1 MiB envelope;
+this is not large-result support.
+
+Selection uses the current guest-mutated content/details snapshot, not an
+immutable copy. Missing selected `details` (including deletion or `undefined`)
+is normalized to native `null` in the required result-envelope field.
+Authoritative native `isError` remains independent of guest mutations.
+
 ## Validation and current boundaries
 
 Focused tests cover invocation authentication/staleness, narrowed catalogs,
@@ -174,6 +217,17 @@ faults, shared descendant active limits, and child execution scope propagation.
 Live DLL reload races still need additional integration coverage. The new
 interruption integration test uses in-memory storage; existing recovery regression
 tests exercise JSONL and SQLite as well.
+
+Three new neutral-layer differential tests compare direct and nested execution:
+business JSON and native text signatures, before/after-hook rewrites/finalized
+results, and effective catalogs across native batch boundaries. Announced names
+do not authorize calls. These tests do not qualify a real DLL/provider or UI.
+
+Complete child progress and original native history snapshots/recovery are not
+implemented by bounded lifecycle updates and intent/finish audit markers. Values
+over 1 MiB still need host-backed references/chunks/attachments. Web/ACP full child
+cards/reload are outstanding; a third UI dev worktree is approved, but no UI
+changes are part of this increment. Protected self/ancestor exclusion remains.
 
 ## Real native smoke
 
@@ -205,7 +259,8 @@ provider requests, messages and `results.json`. Existing evidence directories
 are rejected rather than overwritten. The approval case is explicitly skipped
 if no gate DLL is supplied.
 
-Local Windows validation passed **25 cases** with freshly built native host,
+**Previous-increment evidence only:** local Windows validation passed **25 cases**
+with freshly built native host,
 Code Mode DLL, test fixture and permission gate. Coverage includes the original
 ten safety/composition cases plus real PNG return/emission, image output after
 JS failure, no implicit image forwarding, malformed text signatures, sticky
@@ -220,7 +275,28 @@ provider results and no persisted invocation capabilities. Evidence is in local
 
 This is local source-build qualification, not installation/deployment, a
 performance benchmark, live-provider validation, or proof that Linux/macOS
-native integration/reload races have passed. CI builds and focused tests run on
-Linux, Windows and macOS; real native host-plus-DLL qualification remains
-Windows-only. Omit `--fixture-extension` to run 20 base cases; the optional gate
-adds one denial case, and the fixture adds four accounting/progress cases.
+native integration/reload races have passed. Existing CI configuration is not
+evidence that the new increment is green.
+Real native host-plus-DLL qualification recorded above remains Windows-only.
+
+**Current-increment local evidence:** fresh actual Windows host + Code Mode DLL,
+test-only fixture and permission gate passed **35 real smoke cases**: 20 base,
+14 fixture and one denial. Ten additions over the original 25 cover direct
+success/error baselines, exact success/error selection, deleted/undefined selected
+details normalized to native null, business JSON, actual binding success/error
+echoes and helper-name aliases (`call/list/emit/result` via `tools.call`).
+Final `results.json` reports PASSED for all 35 cases; `provenance.json` retains
+all four artifact SHA-256 values. Evidence directory: `target/codemode-full-parity-smoke-5/`.
+Earlier full-parity runs `-1/`, `-2/` and `-4/` failed; `-3/` passed 33 cases
+before the final missing-details fix. They are not the final qualification.
+A read-only review found that omitted selected details produced an invalid
+required-field envelope; engine/final-envelope normalization to null is covered
+by unit checks and two real cases in the final run.
+
+Host `cargo test --locked -p rpi-agent -p rpi-extensions -p rpi-plugin-sdk -p rpi-harness`
+passed **1109 tests, 6 ignored, 0 failed**; log: `target/codemode-full-parity-tests.log`.
+Host `cargo fmt --all -- --check` passed. Package evidence is **72 passing tests**
+and strict all-target Clippy passed with
+`cargo clippy --locked -p rpi-codemode --all-targets -- -D warnings`.
+This is Windows local source-build qualification, not deployment, installation,
+live-provider or Linux/macOS integration qualification, or a new CI-green claim.

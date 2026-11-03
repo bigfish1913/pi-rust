@@ -34,13 +34,34 @@ extern "C" fn poll(
             callback(StbString::from_string(json!({"content":[{"type":"text","text":"fixture partial"}],"details":{"fixturePartial":true}}).to_string()), data);
         }
         let mut details = json!({"fixture":"native-parity"});
+        if let Some(business) = params.get("business") {
+            details["business"] = business.clone();
+        }
+        if params["echoBinding"] == true {
+            // Echo the real child invocation. The outer CodeMode DLL has a
+            // different credential, so it cannot sanitize a missed child leak.
+            let binding = &params[rpi_plugin_sdk::HOST_CONTEXT_KEY];
+            let key = binding["runtimeKey"].as_str().unwrap_or("missing-binding");
+            details["bindingEcho"] = json!({
+                "metadata":binding, "key":key, "handle":binding["runtimeHandle"],
+                "embedded":format!("before:{key}:after"),
+                "serialized":json!({"metadata":binding,"key":key,
+                    "business":params["business"]}).to_string(),
+                "business":params["business"]
+            });
+        }
+        let text = if params["echoBinding"] == true {
+            details.to_string()
+        } else {
+            "native parity probe".into()
+        };
         if params["oversized"] == true {
             // Deliberately tests ABI envelope rejection, NOT retained accounting:
             // opted-in envelopes above 1 MiB are rejected before ToolProgram.
             details["padding"] = json!("x".repeat(1024 * 1024));
         }
         let result = json!({"$rpiToolResult":1,"isError":params["error"] == true,"result":{
-            "content":[{"type":"text","text":"native parity probe"}],"details":details,
+            "content":[{"type":"text","text":text,"textSignature":"native-parity-signature"}],"details":details,
             "terminate":params["terminate"] == true,
             "usage":{"input":1,"output":2,"cacheRead":0,"cacheWrite":0,"totalTokens":3,
                 "cost":{"input":0.1,"output":0.2,"cacheRead":0.0,"cacheWrite":0.0,"total":0.3}},
@@ -67,18 +88,39 @@ mod registration {
         name: StbString::from_string("parity_probe".into()),
         description: StbString::from_string("Test-only native ABI parity probe; no side effects".into()),
         parameters: StbString::from_string(json!({"type":"object","x-rpi-result-envelope":1,
-            "properties":{"error":{"type":"boolean"},"terminate":{"type":"boolean"},"oversized":{"type":"boolean"}},
+            "properties":{"error":{"type":"boolean"},"terminate":{"type":"boolean"},"oversized":{"type":"boolean"},
+                "business":{"type":"object","additionalProperties":true,
+                    "properties":{"runtimeKey":{"type":"string"},"runtimeHandle":{},
+                        "__rpi":{"type":"object","additionalProperties":true,
+                            "properties":{"runtimeKey":{"type":"string"}}},
+                        "__rpiRuntimeKey":{"type":"string"}}},
+                "echoBinding":{"type":"boolean"}},
             "additionalProperties":false}).to_string()),
     };
         match api.register_tool {
-            Some(register) => register(
-                &schema,
-                execute,
-                poll,
-                cancel,
-                destroy,
-                rpi_plugin_sdk::callbacks::free_string,
-            ),
+            Some(register) => {
+                // Reserved guest helpers remain reachable as native aliases
+                // through tools.call(name, args).
+                for name in ["parity_probe", "call", "list", "emit", "result"] {
+                    let alias = StableToolSchema {
+                        name: StbString::from_string(name.into()),
+                        description: StbString::from_string(schema.description.to_string_lossy()),
+                        parameters: StbString::from_string(schema.parameters.to_string_lossy()),
+                    };
+                    let status = register(
+                        &alias,
+                        execute,
+                        poll,
+                        cancel,
+                        destroy,
+                        rpi_plugin_sdk::callbacks::free_string,
+                    );
+                    if status != 0 {
+                        return status;
+                    }
+                }
+                0
+            }
             None => 1,
         }
     });
