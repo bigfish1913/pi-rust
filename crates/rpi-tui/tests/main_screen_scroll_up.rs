@@ -26,8 +26,11 @@ struct VtState {
     italic: bool,
     inverses: Vec<Vec<bool>>,
     inverse: bool,
-    /// Document index currently at the top of the screen.
+    /// Document index currently at the top of the live screen.
     viewport_top: usize,
+    /// Native scrollback browsing is independent of the application's cursor.
+    history_view_top: Option<usize>,
+    scrollback_erase_count: usize,
     cursor_row: usize,
     cursor_col: usize,
     scrollback_limit: Option<usize>,
@@ -49,6 +52,8 @@ impl VirtualTerminal {
             inverses: vec![vec![false; columns]; rows],
             inverse: false,
             viewport_top: 0,
+            history_view_top: None,
+            scrollback_erase_count: 0,
             cursor_row: 0,
             cursor_col: 0,
             scrollback_limit: None,
@@ -74,10 +79,18 @@ impl VirtualTerminal {
         }
     }
 
-    /// Visible screen as strings (top to bottom).
+    /// Browse saved history without moving the application's live cursor.
+    fn browse_history_at(&self, top: usize) {
+        let mut st = self.state.lock().unwrap();
+        assert!(top < st.viewport_top, "fixture must have saved history");
+        st.history_view_top = Some(top);
+    }
+
+    /// Visible screen as strings (top to bottom), including native history.
     fn visible(&self) -> Vec<String> {
         let st = self.state.lock().unwrap();
-        (st.viewport_top..st.viewport_top + st.rows)
+        let top = st.history_view_top.unwrap_or(st.viewport_top);
+        (top..top + st.rows)
             .map(|i| {
                 st.document
                     .get(i)
@@ -135,6 +148,7 @@ impl VirtualTerminal {
             st.italics.drain(..excess);
             st.inverses.drain(..excess);
             st.viewport_top -= excess;
+            st.history_view_top = st.history_view_top.map(|top| top.saturating_sub(excess));
         }
     }
 
@@ -238,6 +252,9 @@ impl VirtualTerminal {
                                     if nums.first() == Some(&3) {
                                         // Erase saved lines only; the live screen
                                         // and cursor stay at their screen positions.
+                                        // The old native browsing anchor is gone.
+                                        st.scrollback_erase_count += 1;
+                                        st.history_view_top = None;
                                         let top = st.viewport_top;
                                         st.document.drain(..top);
                                         st.italics.drain(..top);
@@ -763,3 +780,6 @@ fn long_transcript_stream_rewrite_keeps_dock_visible() {
         "the dock must remain pinned across repeated streamed rewrites: {visible:?}"
     );
 }
+
+#[path = "main_screen_scroll_up/acceptance.rs"]
+mod acceptance;

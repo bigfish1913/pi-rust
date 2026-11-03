@@ -1,5 +1,19 @@
 # 会话、恢复与资源测试
 
+## macOS / iTerm2 原生历史滚动验收
+
+场景、提交归因、协议测试和人工步骤见 [macOS / iTerm2 长会话验收](../debugging/macos-iterm2-scrollback.md)。
+
+```bash
+cargo test -p rpi-tui --test main_screen_scroll_up --locked -- --nocapture
+```
+
+新增三条测试分别检查后台仅更新耗时、持续追加工具输出，以及光标在 live viewport
+上方时的历史/命令完整性。它们不使用 ignore，默认 workspace 测试会执行。
+当前为 **RED 阶段：合计 9 通过、2 失败、0 ignored**，尚未修改生产渲染逻辑，不能视为
+可合并的全绿修复。真实 macOS / iTerm2 视觉验收未执行，不能用虚拟终端或 fullscreen
+对照 PASS 代替。后续修复须保留这些验收和既有历史重排测试。
+
 ## 下次直接运行
 
 从 `pi-rust` 仓库根目录执行。前提是 Python 3、Rust/Cargo 和 Go Task 已安装。下面是本机 Windows PowerShell 可直接复制的命令；**任一步失败就先保留日志排查，不要把后续部分成功当成整轮通过。** 测试不会自动安装新 binary、替换全局 DLL 或重启服务。
