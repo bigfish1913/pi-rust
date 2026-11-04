@@ -35,8 +35,12 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock, Weak};
 
 // Opaque, non-reused IDs, never addresses. A copied PluginApi may outlive its
 // registration (e.g. a failed reload); resolving it must not dereference freed memory.
-static BRIDGES: OnceLock<Mutex<HashMap<usize, Weak<ActionBridge>>>> = OnceLock::new();
-fn bridges() -> &'static Mutex<HashMap<usize, Weak<ActionBridge>>> {
+struct RegistryEntry {
+    bridge: Weak<ActionBridge>,
+    active: Weak<AtomicBool>,
+}
+static BRIDGES: OnceLock<Mutex<HashMap<usize, RegistryEntry>>> = OnceLock::new();
+fn bridges() -> &'static Mutex<HashMap<usize, RegistryEntry>> {
     BRIDGES.get_or_init(Mutex::default)
 }
 thread_local! {
@@ -826,7 +830,7 @@ impl ActionBridge {
         let mut registry = bridges().lock().unwrap_or_else(|e| e.into_inner());
         if let Some((&id, _)) = registry
             .iter()
-            .find(|(_, weak)| weak.as_ptr() == Arc::as_ptr(self))
+            .find(|(_, entry)| entry.bridge.as_ptr() == Arc::as_ptr(self))
         {
             return id as *mut c_void;
         }
@@ -838,7 +842,13 @@ impl ActionBridge {
                 Err(current) => id = current,
             }
         }
-        registry.insert(id, Arc::downgrade(self));
+        registry.insert(
+            id,
+            RegistryEntry {
+                bridge: Arc::downgrade(self),
+                active: Arc::downgrade(&self.active),
+            },
+        );
         id as *mut c_void
     }
     pub(crate) fn resolve_handle(id: usize) -> Option<Arc<Self>> {
@@ -846,7 +856,7 @@ impl ActionBridge {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&id)
-            .and_then(Weak::upgrade)
+            .and_then(|entry| entry.bridge.upgrade())
     }
     pub(crate) fn for_invocation(
         &self,
@@ -872,6 +882,25 @@ impl ActionBridge {
             editor_text: self.editor_text.clone(),
             active: self.active.clone(),
         })
+    }
+    /// Native receipt selection uses the driver-captured invocation, never a
+    /// task-local lookup on a blocking worker or a registration/root binding.
+    pub(crate) fn resolve_result_reference(
+        &self,
+        id: &str,
+    ) -> Result<(rpi_agent::AgentToolResult, bool), String> {
+        if !self.is_active()
+            || !self
+                .invocation
+                .as_ref()
+                .is_some_and(|(_, _, signal)| !signal.is_cancelled())
+        {
+            return Err("result reference requires a live invocation bridge".into());
+        }
+        self.tool_program
+            .as_ref()
+            .ok_or("result reference requires an effective ToolProgram")?
+            .resolve_result_reference(id)
     }
     pub(crate) fn invocation_key(&self) -> Option<&str> {
         self.invocation.as_ref().map(|(_, key, _)| key.as_str())
@@ -1043,17 +1072,10 @@ impl ActionBridge {
             owners.clone()
         };
         // Cancel captured capabilities across FFI thread hops on reload/session retirement.
-        let live: Vec<_> = bridges()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .values()
-            .filter_map(Weak::upgrade)
-            .collect();
+        let live = self.bridges_for_owner();
         for bridge in live {
-            if Arc::ptr_eq(&bridge.active, &self.active) {
-                if let Some(program) = &bridge.tool_program {
-                    program.cancel_all();
-                }
+            if let Some(program) = &bridge.tool_program {
+                program.cancel_all();
             }
         }
         // Host cancellation may contend with a job publishing through its
@@ -1062,6 +1084,22 @@ impl ActionBridge {
             self.host.cancel_child_agents(owner);
             self.host.cancel_side_questions(owner);
         }
+    }
+
+    fn bridges_for_owner(&self) -> Vec<Arc<Self>> {
+        let active = Arc::downgrade(&self.active);
+        // Filter weak owner identity BEFORE upgrading: even a transient upgrade
+        // of another session's invocation delays its immediate handle retirement.
+        // The weak metadata keeps that allocation's identity from being reused.
+        // Collect every upgraded Arc out of the registry lock; dropping a last
+        // Arc here would deadlock when ActionBridge::drop locks the registry.
+        bridges()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter(|entry| entry.active.ptr_eq(&active))
+            .filter_map(|entry| entry.bridge.upgrade())
+            .collect()
     }
 
     /// Whether this bridge is still the live session's bridge.
@@ -1476,7 +1514,7 @@ fn run_action(
     } else if action == RuntimeActionId::ToolProgram {
         let cleanup = matches!(
             args.get("op").and_then(serde_json::Value::as_str),
-            Some("poll" | "cancel" | "dispose")
+            Some("poll" | "cancel" | "dispose" | "release_result")
         );
         let authenticated = bridge.invocation.as_ref().is_some_and(|(_, key, signal)| {
             (cleanup || !signal.is_cancelled())
@@ -2572,7 +2610,7 @@ impl Drop for ActionBridge {
         bridges()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .retain(|_, weak| !std::ptr::eq(weak.as_ptr(), self));
+            .retain(|_, entry| !std::ptr::eq(entry.bridge.as_ptr(), self));
         if self.invocation.is_some() {
             return;
         }

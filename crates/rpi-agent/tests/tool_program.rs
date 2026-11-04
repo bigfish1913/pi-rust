@@ -801,7 +801,7 @@ async fn host_rollup_survives_errors_repeated_poll_disposal_and_unawaited_drain(
                         let page = p.handle(json!({"op":"list"})).await.unwrap();
                         assert_eq!(
                             page["capabilities"],
-                            json!({"resultEnvelope":1,"hostAccounting":1,"parentProgress":1,"losslessValues":1})
+                            json!({"resultEnvelope":1,"hostAccounting":1,"parentProgress":1,"losslessValues":1,"resultReferences":1})
                         );
                         let id = start(&p).await;
                         for _ in 0..3 {
@@ -1874,4 +1874,407 @@ async fn differential_catalog_uses_effective_batch_snapshot_not_added_names() {
         4,
         "one direct and one child execution per batch"
     );
+}
+
+async fn reference_start(p: &Arc<ToolProgram>, name: &str) -> Value {
+    p.handle(json!({"op":"start","name":name,"arguments":{"value":"ok"},"resultMode":"reference"}))
+        .await
+        .unwrap()["requestId"]
+        .clone()
+}
+
+#[tokio::test]
+async fn reference_large_finalized_unicode_receipt_reads_losslessly_and_dispose_is_not_release() {
+    let saved = Arc::new(Mutex::new(None));
+    let retained = saved.clone();
+    let mut native = business_result(business_json());
+    native.content.push(rpi_agent::TextContentOrImage::text(
+        "界😀\"\\n".repeat(150_000),
+    ));
+    native.details["large"] = json!("é😀\"\\n".repeat(150_000));
+    let expected = finalized_json(&native);
+    let encoded = serde_json::to_string(&json!({"content":expected["content"],"details":expected["details"],"terminate":expected["terminate"],"addedToolNames":expected["addedToolNames"],"usage":expected["usage"]})).unwrap();
+    assert!(encoded.len() > 1024 * 1024);
+    let actual = native.clone();
+    parity_run(vec![
+        parity_tool("codemode", Arc::new(move |p, _, _| {
+            let encoded = encoded.clone();
+            let retained = retained.clone();
+            Box::pin(async move {
+                for invalid in [json!(null), json!(false), json!(1), json!("inline"), json!({})] {
+                    assert!(p.handle(json!({"op":"start","name":"effect","arguments":{"value":"ok"},"resultMode":invalid})).await.is_err());
+                }
+                let id = reference_start(&p, "effect").await;
+                let reply = poll(&p, &id).await;
+                assert_eq!(reply, json!({"requestId":id,"status":"done","isError":false,
+                    "resultReference":{"version":1,"id":id,"byteLength":encoded.len(),"contentBlocks":2,"isError":false,"terminate":false}}));
+                assert!(reply.get("result").is_none());
+                let mut offset = 0;
+                let mut rebuilt = String::new();
+                loop {
+                    let chunk = p.handle(json!({"op":"read_result","resultId":id,"offset":offset,"limit":65536})).await.unwrap();
+                    assert!(chunk.to_string().len() <= 1024 * 1024);
+                    assert_eq!(chunk["offset"], offset);
+                    assert_eq!(chunk["byteLength"], encoded.len());
+                    rebuilt.push_str(chunk["data"].as_str().unwrap());
+                    match chunk["nextOffset"].as_u64() { Some(next) => { assert!(next > offset); offset = next; }, None => break }
+                }
+                assert_eq!(rebuilt, encoded);
+                let mid = encoded.find('界').unwrap() + 1;
+                for offset in [json!(mid), json!(encoded.len()+1), json!(-1), json!(1.5), json!("0")] {
+                    assert!(p.handle(json!({"op":"read_result","resultId":id,"offset":offset,"limit":4})).await.is_err());
+                }
+                for limit in [json!(0), json!(3), json!(65537), json!(4.0), json!(-1)] {
+                    assert!(p.handle(json!({"op":"read_result","resultId":id,"offset":0,"limit":limit})).await.is_err());
+                }
+                let eof = p.handle(json!({"op":"read_result","resultId":id,"offset":encoded.len(),"limit":4})).await.unwrap();
+                assert_eq!(eof["data"], ""); assert!(eof["nextOffset"].is_null());
+                let at = encoded.find('😀').unwrap();
+                let floor = p.handle(json!({"op":"read_result","resultId":id,"offset":at-3,"limit":4})).await.unwrap();
+                assert_eq!(floor["nextOffset"], at); // Cannot cut a four-byte code point.
+                p.handle(json!({"op":"dispose","requestId":id})).await.unwrap();
+                assert!(p.handle(json!({"op":"poll","requestId":id})).await.is_err());
+                let (attached, error) = p.resolve_result_reference(id.as_str().unwrap()).unwrap();
+                assert!(!error); assert_eq!(finalized_json(&attached), serde_json::from_str::<Value>(&encoded).unwrap());
+                assert!(p.handle(json!({"op":"read_result","resultId":id,"limit":4})).await.is_ok());
+                assert!(p.resolve_result_reference("tp-foreign").is_err());
+                assert!(p.handle(json!({"op":"release_result","resultId":"tp-foreign"})).await.is_err());
+                p.handle(json!({"op":"release_result","resultId":id})).await.unwrap();
+                assert!(p.resolve_result_reference(id.as_str().unwrap()).is_err());
+                assert!(p.handle(json!({"op":"read_result","resultId":id})).await.is_err());
+                assert!(p.handle(json!({"op":"release_result","resultId":id})).await.is_err());
+                let id = reference_start(&p, "effect").await;
+                assert_eq!(poll(&p, &id).await["status"], "done");
+                *retained.lock().unwrap() = Some((p, id));
+                Ok(AgentToolResult::text("parent"))
+            })
+        })),
+        parity_tool("effect", Arc::new(move |_, _, _| { let actual = actual.clone(); Box::pin(async move { Ok(actual) }) })),
+    ], common::base_config()).await;
+    let (p, id) = saved.lock().unwrap().take().unwrap();
+    assert!(p.resolve_result_reference(id.as_str().unwrap()).is_err());
+    assert!(p
+        .handle(json!({"op":"read_result","resultId":id}))
+        .await
+        .is_err());
+    // Finish clears storage even if an external Arc keeps the program alive.
+    assert!(p
+        .handle(json!({"op":"release_result","resultId":id}))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn reference_native_attachment_authority_metadata_once_and_termination() {
+    for error in [false, true] {
+        for empty in [false, true] {
+            let (_, message) = parity_run(
+                vec![
+                    parity_tool(
+                        "codemode",
+                        Arc::new(move |p, _, _| {
+                            Box::pin(async move {
+                                let id = reference_start(&p, "effect").await;
+                                let reply = poll(&p, &id).await;
+                                assert_eq!(reply["status"], "done");
+                                assert_eq!(reply["isError"], error);
+                                assert!(reply.get("result").is_none());
+                                assert_eq!(reply["resultReference"]["terminate"], true);
+                                let inspection = p
+                                    .handle(json!({"op":"read_result","resultId":id}))
+                                    .await
+                                    .unwrap();
+                                let inspection: Value =
+                                    serde_json::from_str(inspection["data"].as_str().unwrap())
+                                        .unwrap();
+                                assert_eq!(inspection["usage"]["totalTokens"], 3);
+                                assert_eq!(inspection["addedToolNames"], json!(["z", "a", "z"]));
+                                assert!(start_result(&p).await.is_err());
+                                for _ in 0..3 {
+                                    let (native, native_error) =
+                                        p.resolve_result_reference(id.as_str().unwrap()).unwrap();
+                                    assert_eq!(native_error, error);
+                                    assert!(native.usage.is_none());
+                                    assert!(native.added_tool_names.is_empty());
+                                    assert!(native.terminate);
+                                }
+                                let (native, native_error) =
+                                    p.resolve_result_reference(id.as_str().unwrap()).unwrap();
+                                if native_error {
+                                    Err(AgentError::StructuredTool(Box::new(native)))
+                                } else {
+                                    Ok(native)
+                                }
+                            })
+                        }),
+                    ),
+                    parity_tool(
+                        "effect",
+                        Arc::new(move |_, _, _| {
+                            Box::pin(async move {
+                                let mut native = metadata(3, true);
+                                native.content = if empty {
+                                    vec![]
+                                } else {
+                                    business_result(business_json()).content
+                                };
+                                native.details = business_json();
+                                if error {
+                                    Err(AgentError::StructuredTool(Box::new(native)))
+                                } else {
+                                    Ok(native)
+                                }
+                            })
+                        }),
+                    ),
+                ],
+                common::base_config(),
+            )
+            .await;
+            assert_eq!(message.is_error, error);
+            assert_eq!(message.usage.unwrap().total_tokens, 3);
+            assert_eq!(message.added_tool_names, vec!["a", "z"]);
+            assert_eq!(message.content.len(), if empty { 0 } else { 1 });
+            if !empty {
+                assert_eq!(
+                    serde_json::to_value(&message.content[0]).unwrap()["textSignature"],
+                    "business-signature"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn reference_count_limit_release_and_cancel_cleanup_keep_accounting() {
+    let (_, result) = parity_run(
+        vec![
+            parity_tool(
+                "codemode",
+                Arc::new(|p, _, _| {
+                    Box::pin(async move {
+                        let mut ids = vec![];
+                        for i in 0..17 {
+                            let id = reference_start(&p, "effect").await;
+                            let reply = poll(&p, &id).await;
+
+                            if i == 16 {
+                                assert_eq!(reply["status"], "failed");
+                                assert!(reply["error"]
+                                    .as_str()
+                                    .unwrap()
+                                    .contains("reference limit"));
+                            } else {
+                                assert_eq!(reply["status"], "done");
+                                ids.push(id.clone());
+                            }
+                            p.handle(json!({"op":"dispose","requestId":id}))
+                                .await
+                                .unwrap();
+                        }
+                        p.handle(json!({"op":"release_result","resultId":ids[0]}))
+                            .await
+                            .unwrap();
+                        let id = reference_start(&p, "effect").await;
+                        assert_eq!(poll(&p, &id).await["status"], "done");
+                        p.cancel_all();
+                        assert!(p.resolve_result_reference(id.as_str().unwrap()).is_err());
+                        assert!(p
+                            .handle(json!({"op":"read_result","resultId":id}))
+                            .await
+                            .is_err());
+                        p.handle(json!({"op":"release_result","resultId":id}))
+                            .await
+                            .unwrap();
+                        Ok(AgentToolResult::text("parent"))
+                    })
+                }),
+            ),
+            parity_tool(
+                "effect",
+                Arc::new(|_, _, _| Box::pin(async { Ok(metadata(3, false)) })),
+            ),
+        ],
+        common::base_config(),
+    )
+    .await;
+    assert_eq!(result.usage.unwrap().total_tokens, 18 * 3);
+}
+
+#[tokio::test]
+async fn reference_shared_tree_quota_and_foreign_programs_are_enforced() {
+    let outer = Arc::new(Mutex::new(None));
+    let saved = outer.clone();
+    let (_, result) = parity_run(
+        vec![
+            parity_tool(
+                "codemode",
+                Arc::new(move |p, _, _| {
+                    let saved = saved.clone();
+                    Box::pin(async move {
+                        let id = reference_start(&p, "effect").await;
+                        assert_eq!(poll(&p, &id).await["status"], "done");
+                        *saved.lock().unwrap() = Some((p.clone(), id));
+                        let id = p
+                            .handle(
+                                json!({"op":"start","name":"nested","arguments":{"value":"ok"}}),
+                            )
+                            .await
+                            .unwrap()["requestId"]
+                            .clone();
+                        assert_eq!(poll(&p, &id).await["status"], "done");
+                        // Nested finish returned its permits despite retaining a receipt.
+                        let id = reference_start(&p, "effect").await;
+                        assert_eq!(poll(&p, &id).await["status"], "done");
+                        Ok(AgentToolResult::text("parent"))
+                    })
+                }),
+            ),
+            parity_tool(
+                "nested",
+                Arc::new(move |p, _, _| {
+                    let outer = outer.clone();
+                    Box::pin(async move {
+                        let (parent, foreign) = outer.lock().unwrap().take().unwrap();
+                        assert!(p
+                            .resolve_result_reference(foreign.as_str().unwrap())
+                            .is_err());
+                        assert!(p
+                            .handle(json!({"op":"read_result","resultId":foreign}))
+                            .await
+                            .is_err());
+                        assert!(p
+                            .handle(json!({"op":"release_result","resultId":foreign}))
+                            .await
+                            .is_err());
+                        let id = reference_start(&p, "effect").await;
+                        let failed = poll(&p, &id).await;
+                        assert_eq!(failed["status"], "failed");
+                        assert!(failed["error"].as_str().unwrap().contains("byte quota"));
+                        parent
+                            .handle(json!({"op":"release_result","resultId":foreign}))
+                            .await
+                            .unwrap();
+                        let id = reference_start(&p, "effect").await;
+                        assert_eq!(poll(&p, &id).await["status"], "done");
+                        assert!(parent
+                            .resolve_result_reference(id.as_str().unwrap())
+                            .is_err());
+                        Ok(AgentToolResult::text("nested"))
+                    })
+                }),
+            ),
+            parity_tool(
+                "effect",
+                Arc::new(|_, _, _| {
+                    Box::pin(async {
+                        let mut r = metadata(3, false);
+                        r.details = json!({"big":"x".repeat(18*1024*1024)});
+                        Ok(r)
+                    })
+                }),
+            ),
+        ],
+        common::base_config(),
+    )
+    .await;
+    assert_eq!(result.usage.unwrap().total_tokens, 12);
+}
+
+#[tokio::test]
+async fn reference_per_result_overflow_still_retains_termination_and_finalized_accounting() {
+    let (_, message) = parity_run(
+        vec![
+            parity_tool(
+                "codemode",
+                Arc::new(|p, _, _| {
+                    Box::pin(async move {
+                        let id = reference_start(&p, "effect").await;
+                        let reply = poll(&p, &id).await;
+                        assert_eq!(reply["status"], "failed");
+                        assert!(reply["error"].as_str().unwrap().contains("byte quota"));
+                        assert!(p.resolve_result_reference(id.as_str().unwrap()).is_err());
+                        assert!(start_result(&p).await.is_err());
+                        Ok(AgentToolResult::text("parent"))
+                    })
+                }),
+            ),
+            parity_tool(
+                "effect",
+                Arc::new(|_, _, _| {
+                    Box::pin(async {
+                        let mut r = metadata(3, true);
+                        r.details = json!({"big":"x".repeat(32*1024*1024)});
+                        Ok(r)
+                    })
+                }),
+            ),
+        ],
+        common::base_config(),
+    )
+    .await;
+    assert_eq!(message.usage.unwrap().total_tokens, 3);
+}
+
+#[tokio::test]
+async fn reference_finish_clears_receipts_after_error_panic_and_timeout_drain() {
+    use futures::FutureExt;
+    for mode in ["error", "panic", "timeout"] {
+        let saved = Arc::new(Mutex::new(None));
+        let observed = saved.clone();
+        let cleaned = Arc::new(AtomicUsize::new(0));
+        let done = cleaned.clone();
+        let execution = parity_run(
+            vec![
+                parity_tool(
+                    "codemode",
+                    Arc::new(move |p, _, _| {
+                        let saved = saved.clone();
+                        Box::pin(async move {
+                            let id = p.handle(json!({"op":"start","name":"effect","arguments":{"value":"ok"},"resultMode":"reference","timeoutMs":if mode == "timeout" {1} else {1000}})).await.unwrap()["requestId"].clone();
+                            assert_eq!(
+                                poll(&p, &id).await["status"],
+                                if mode == "timeout" { "failed" } else { "done" }
+                            );
+                            *saved.lock().unwrap() = Some((p, id));
+                            if mode == "panic" {
+                                panic!("reference owner panic");
+                            }
+                            Err(AgentError::tool("reference owner error"))
+                        })
+                    }),
+                ),
+                parity_tool(
+                    "effect",
+                    Arc::new(move |_, _, _| {
+                        let done = done.clone();
+                        Box::pin(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                            done.fetch_add(1, Ordering::SeqCst);
+                            Ok(metadata(3, false))
+                        })
+                    }),
+                ),
+            ],
+            common::base_config(),
+        );
+        let outcome = std::panic::AssertUnwindSafe(execution).catch_unwind().await;
+        assert_eq!(outcome.is_err(), mode == "panic");
+        if let Ok((_, message)) = outcome {
+            assert_eq!(message.usage.unwrap().total_tokens, 3);
+        }
+        assert_eq!(
+            cleaned.load(Ordering::SeqCst),
+            1,
+            "finish drained native work"
+        );
+        let (p, id) = observed.lock().unwrap().take().unwrap();
+        assert!(p.resolve_result_reference(id.as_str().unwrap()).is_err());
+        assert!(
+            p.handle(json!({"op":"release_result","resultId":id}))
+                .await
+                .is_err(),
+            "finish cleared the receipt, even after late timeout finalization"
+        );
+    }
 }

@@ -19,6 +19,8 @@ use tokio_util::sync::CancellationToken;
 
 #[path = "tool_program_accounting.rs"]
 mod accounting;
+#[path = "tool_program_results.rs"]
+mod results;
 
 const MAX_BYTES: usize = 1024 * 1024;
 static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -55,6 +57,7 @@ struct Request {
 struct State {
     requests: HashMap<String, Request>,
     accounting: accounting::Accounting,
+    results: results::Store,
 }
 /// Captured from the effective executing loop, never from a root registry.
 pub struct ToolProgram {
@@ -69,6 +72,7 @@ pub struct ToolProgram {
     serial: RwLock<()>,
     active: Arc<Semaphore>,
     tree_active: Arc<Semaphore>,
+    result_bytes: Arc<Semaphore>,
     ordered: bool,
     terminated: AtomicBool,
     progress: Arc<Progress>,
@@ -120,6 +124,10 @@ impl ToolProgram {
                 .as_ref()
                 .map(|p| p.tree_active.clone())
                 .unwrap_or_else(|| Arc::new(Semaphore::new(8))),
+            result_bytes: previous
+                .as_ref()
+                .map(|p| p.result_bytes.clone())
+                .unwrap_or_else(|| Arc::new(Semaphore::new(results::TREE_BYTES))),
             ordered: config.tool_execution == ToolExecutionMode::Sequential
                 || context.tools.iter().any(|t| {
                     t.schema().name == call.name
@@ -172,6 +180,7 @@ impl ToolProgram {
         self.cancel_all();
         // An outer Sequential call cannot finish ahead of its descendants.
         let _idle = self.active.acquire_many(8).await;
+        self.state.lock().unwrap().results.clear();
     }
     pub(crate) fn merge_accounting(
         &self,
@@ -210,10 +219,17 @@ impl ToolProgram {
                 let end = offset.saturating_add(limit).min(all.len());
                 let page = all.get(offset..end).unwrap_or(&[]);
                 Ok(
-                    json!({"protocolVersion":1,"capabilities":{"resultEnvelope":1,"hostAccounting":1,"parentProgress":1,"losslessValues":1},"tools":page,"nextOffset":if end<all.len(){Some(end)}else{None}}),
+                    json!({"protocolVersion":1,"capabilities":{"resultEnvelope":1,"hostAccounting":1,"parentProgress":1,"losslessValues":1,"resultReferences":1},"tools":page,"nextOffset":if end<all.len(){Some(end)}else{None}}),
                 )
             }
+            "read_result" => self.read_result(&args),
+            "release_result" => self.release_result(&args),
             "start" => {
+                let reference = match args.get("resultMode") {
+                    None => false,
+                    Some(Value::String(mode)) if mode == "reference" => true,
+                    _ => return Err("resultMode must be reference when provided".into()),
+                };
                 // The executing parent cannot hold its children's gate. It
                 // must instead exclude peers in its own containing batch.
                 // Inductively, this also orders independent program groups.
@@ -357,8 +373,22 @@ impl ToolProgram {
                             })
                             .collect::<Result<_, _>>()
                             .map_err(|e| e.to_string())?;
-                        let reply = json!({"requestId":request_id,"status":"done","isError":finalized.is_error,"result":{"content":content,"details":result.details,"terminate":result.terminate,"addedToolNames":result.added_tool_names,"usage":result.usage}});
-                        bounded(&reply)?;
+                        let payload = json!({"content":content,"details":result.details,"terminate":result.terminate,"addedToolNames":result.added_tool_names,"usage":result.usage});
+                        let reply = if reference {
+                            let encoded =
+                                serde_json::to_string(&payload).map_err(|e| e.to_string())?;
+                            drop(payload);
+                            this.retain_result(
+                                &request_id,
+                                finalized.result,
+                                finalized.is_error,
+                                encoded,
+                            )?
+                        } else {
+                            let reply = json!({"requestId":request_id,"status":"done","isError":finalized.is_error,"result":payload});
+                            bounded(&reply)?;
+                            reply
+                        };
                         Ok::<_, String>(reply)
                     };
                     let work = std::panic::AssertUnwindSafe(work).catch_unwind();

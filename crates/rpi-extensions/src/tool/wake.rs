@@ -284,7 +284,11 @@ impl PluginToolAdapter {
                             break driver
                                 .callback
                                 .public_binding
-                                .terminal(done_to_result(&done, result_envelope))
+                                .terminal(done_with_invocation(
+                                    &done,
+                                    result_envelope,
+                                    driver.invocation.as_deref(),
+                                ))
                         }
                         Step::Err(error) => {
                             break Err(AgentError::Tool(

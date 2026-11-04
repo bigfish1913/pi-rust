@@ -24,6 +24,15 @@ spec = importlib.util.spec_from_file_location("resource_smoke", Path(__file__).w
 resource = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(resource)
 
+# Local overrides ONLY: resource-smoke's shared small-output limits stay intact.
+# Real native results legitimately exceed 1 MiB; every RPC line/log remains bounded.
+MIB = 1024 * 1024
+resource.MAX_LINE = 16 * MIB
+resource.MAX_LOG = 64 * MIB
+HTTP_BYTES, HTTP_REQUESTS = 16 * MIB, 128
+LARGE_TEXT = "native-large:中文😀:" + "x" * (2 * MIB)
+
+
 # Legitimate business properties/strings must survive every boundary unchanged.
 BUSINESS = {
     "runtimeKey": "customer-key", "runtimeHandle": {"id": 7},
@@ -81,7 +90,7 @@ CASES.update({
     "fixture_result_deleted_details": {"code": "const r=await tools.parity_probe({business:" + BUSINESS_JS + "}); delete r.details; return tools.result(r);"},
     "fixture_result_undefined_details": {"code": "try {await tools.parity_probe({error:true,business:" + BUSINESS_JS + "});} catch(e) {e.result.details=undefined; return tools.result(e.result);} throw Error('missing native error');"},
     "fixture_business": {"code": "const catalog=tools.list(); const raw=await tools.parity_probe({business:" + BUSINESS_JS + "}); return {schema:catalog.find(t=>t.name==='parity_probe'),raw:raw,guest:" + BUSINESS_JS + "};"},
-    "fixture_aliases": {"code": "const out=[]; for(const name of ['call','list','emit','result']) {out.push(await tools.call(name,{business:" + BUSINESS_JS + "}));} return out;"},
+    "fixture_aliases": {"code": "const out=[]; for(const name of ['call','list','emit','result','release']) {out.push(await tools.call(name,{business:" + BUSINESS_JS + "}));} return out;"},
 })
 for binding_case in BINDING_CASES:
     CASES[binding_case] = {"code": "let raw, caught=false; try {raw=await tools.parity_probe({echoBinding:true,error:"
@@ -97,6 +106,38 @@ BASE_CASES = ["list", "compose", "png_return", "png_emit", "png_emit_throw", "pn
 FIXTURE_CASES = [*DIRECT_CASES, *EXACT_CASES, "fixture_business", *BINDING_CASES,
                  "fixture_aliases", "fixture_success", "fixture_throw",
                  "fixture_caught_error", "fixture_terminal"]
+
+
+# Isolated native sessions avoid growing multi-megabyte provider contexts. Actual
+# direct end-event baselines are retained as canonical payload hashes only.
+LARGE_DIRECT = {
+    "large_direct_text": {"kind":"text", "business":BUSINESS},
+    "large_direct_image": {"kind":"image", "business":BUSINESS},
+    "large_direct_error": {"kind":"error"},
+    "large_direct_terminal": {"kind":"text", "business":BUSINESS, "terminate":True},
+}
+LARGE_EXACT = {"large_result_" + k: "large_direct_" + k for k in ("text", "image", "error")}
+LARGE_EXACT["large_terminal"] = "large_direct_terminal"
+LARGE_CASES = [*LARGE_DIRECT, *LARGE_EXACT, "large_inspect", "large_release", "large_select_throw"]
+CASES.update(LARGE_DIRECT)
+for kind in ("text", "image"):
+    CASES["large_result_" + kind] = {"code": "return tools.result(await tools.parity_large({kind:'"
+        + kind + "',business:" + BUSINESS_JS + "}));"}
+CASES["large_result_error"] = {"code": "try {await tools.parity_large({kind:'error'});} catch(e) {return tools.result(e.result);} throw Error('missing native error');"}
+CASES["large_terminal"] = {"code": "await tools.parity_large({kind:'text',business:" + BUSINESS_JS
+    + ",terminate:true}); await tools.write({path:'terminal-must-not-exist.txt',content:'bad'}); throw Error('JS resumed after terminal child');"}
+CASES["large_inspect"] = {"code": "const r=await tools.parity_large({kind:'text',business:" + BUSINESS_JS + "}); "
+    "if(!Object.isFrozen(r)||!Object.isFrozen(r.content)||!Object.isFrozen(r.content[0])||!Object.isFrozen(r.details)) throw Error('receipt not frozen'); "
+    "let rejected=0; for(const mutate of [()=>{'use strict';r.details={bad:true}},()=>{'use strict';r.content[0].text='bad'},()=>{'use strict';r.details.business.runtimeKey='bad'}]) "
+    "{try {mutate();} catch(e) {rejected++;}} if(rejected!==3) throw Error('mutation silently ignored'); "
+    "return {length:r.content[0].text.length,blocks:r.content.length,fixture:r.details.fixture,business:r.details.business,rejected};"}
+CASES["large_release"] = {"code": "for(let i=0;i<20;i++){const r=await tools.parity_large({kind:'text',business:"
+    + BUSINESS_JS + "}); if(!Object.isFrozen(r)||r.content.length!==1||r.details.business.runtimeKey!=='customer-key') throw Error('bad receipt'); "
+    "await tools.release(r);} return {released:20};", "timeoutMs":120000}
+CASES["large_select_throw"] = {"code": "tools.result(await tools.parity_large({kind:'text',business:"
+    + BUSINESS_JS + "})); throw Error('discard selected native receipt');"}
+TERMINAL_CASES = {"fixture_terminal", "large_direct_terminal", "large_terminal"}
+IMAGE_CASES = {"png_return", "png_emit", "png_emit_throw", "large_direct_image", "large_result_image"}
 
 
 def require(ok, reason):
@@ -118,6 +159,45 @@ def png_fixture():
             + chunk(b"IDAT", zlib.compress(b"\x00\xff\x00\x00\xff")) + chunk(b"IEND", b""))
 
 
+def large_fixtures(workspace):
+    """Deterministic incompressible 768x768 RGB, below native resize dimension cap."""
+    def chunk(kind, data):
+        return (struct.pack(">I", len(data)) + kind + data
+                + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff))
+    noise = hashlib.shake_256(b"rpi-native-large-PNG-v1").digest(768 * 768 * 3)
+    scanlines = b"".join(bytes([0]) + noise[i:i + 768 * 3] for i in range(0, len(noise), 768 * 3))
+    png = (bytes([137,80,78,71,13,10,26,10]) + chunk(b"IHDR", struct.pack(">IIBBBBB", 768, 768, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(scanlines)) + chunk(b"IEND", b""))
+    data = base64.b64encode(png).decode()
+    require(len(data) > MIB, "PNG did not exercise large native result")
+    common = {"details":{"fixture":"native-large", "business":BUSINESS}, "terminate":False,
+              "usage":{"input":1,"output":2,"cacheRead":0,"cacheWrite":0,"totalTokens":3,
+                       "cost":{"input":.1,"output":.2,"cacheRead":0,"cacheWrite":0,"total":.3}},
+              "addedToolNames":["fixture-added","fixture-added"]}
+    dump(workspace / "large-native-text-result.json", {**common,"content":[{"type":"text","text":LARGE_TEXT}]})
+    # Keep the native receipt large even if the host reencodes/resizes image bytes.
+    image_common = {**common,"details":{**common["details"],"padding":"i" * (MIB + 32)}}
+    dump(workspace / "large-native-image-result.json", {**image_common,"content":[
+        {"type":"text","text":"native large image"}, {"type":"image","data":data,"mimeType":"image/png"}]})
+
+
+def bounded_value(value):
+    """Retain exact small fields and size/SHA256 for big strings, never big copies."""
+    if isinstance(value, str) and len(value.encode()) > 4096:
+        raw = value.encode()
+        return {"$largeString":{"bytes":len(raw),"sha256":hashlib.sha256(raw).hexdigest()}}
+    if isinstance(value, list):
+        return [bounded_value(v) for v in value]
+    if isinstance(value, dict):
+        return {k:bounded_value(v) for k,v in value.items()}
+    return value
+
+
+def payload_digest(value):
+    raw = json.dumps(exact_payload(value), sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()
+    return {"bytes":len(raw), "sha256":hashlib.sha256(raw).hexdigest()}
+
+
 def latest_case(messages):
     # Native OpenAI tool-image flushing adds another user message. Find the
     # latest recognized case, not the latest user role (nor an old case).
@@ -135,7 +215,8 @@ def image_count(messages):
 
 class Provider:
     def __init__(self, root):
-        self.calls, self.errors = [], []
+        self.calls, self.errors, self.retained_bytes = [], [], 0
+        self.image_evidence, self.result_evidence = {}, {}
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -146,11 +227,9 @@ class Provider:
                 try:
                     require(self.path == "/v1/chat/completions", self.path)
                     size = int(self.headers["Content-Length"])
-                    require(0 < size <= 2 * 1024 * 1024, "provider input budget")
+                    require(0 < size <= HTTP_BYTES, "provider input budget")
                     body = json.loads(self.rfile.read(size))
-                    require(len(owner.calls) < 96, "provider request budget")
-                    owner.calls.append(body)
-                    dump(root / "provider-requests.json", owner.calls)
+                    require(len(owner.calls) < HTTP_REQUESTS, "provider request budget")
                     messages = body["messages"]
                     last, case = latest_case(messages)
                     results = [m for m in messages[last + 1:] if m["role"] == "tool"]
@@ -165,16 +244,41 @@ class Provider:
                         require({"codemode", "read", "write"} <= names, "missing tools: " + str(names))
                         if case.startswith("fixture_"):
                             require("parity_probe" in names, "missing fixture tool")
+                        if case in LARGE_CASES:
+                            require("parity_large" in names, "missing large legacy fixture tool")
                         delta = {"role": "assistant", "tool_calls": [{"index": 0, "id": "smoke-" + case,
-                            "type": "function", "function": {"name": "parity_probe" if case in DIRECT_CASES else "codemode",
+                            "type": "function", "function": {"name": ("parity_probe" if case in DIRECT_CASES else "parity_large" if case in LARGE_DIRECT else "codemode"),
                             "arguments": json.dumps(CASES[case])}}]}
                         finish = "tool_calls"
                     else:
                         require(len(results) == 1, "expected one direct or outer result")
-                        require(case != "fixture_terminal", "terminal child triggered a second model turn")
-                        require(image_count(messages[last + 1:]) == (1 if case in ("png_return", "png_emit", "png_emit_throw") else 0),
+                        require(case not in TERMINAL_CASES, "terminal child triggered a second model turn")
+                        require(results[0]["tool_call_id"] == "smoke-" + case, "wrong current tool result identity")
+                        require(image_count(messages[last + 1:]) == (1 if case in IMAGE_CASES else 0),
                                 "wrong image count in latest case segment: " + case)
                         delta, finish = {"role": "assistant", "content": "DONE:" + case}, "stop"
+                    # Validate real request BEFORE replacing large strings.
+                    assert_no_binding(body)
+                    if results and case in ("large_direct_image", "large_result_image"):
+                        images = [b for m in messages[last + 1:] for b in
+                                  (m.get("content") if isinstance(m.get("content"), list) else [])
+                                  if b.get("type") in ("image_url", "input_image", "image")]
+                        require(len(images) == 1, "large provider image missing")
+                        image = images[0]
+                        url = image.get("image_url", {})
+                        url = url.get("url", "") if isinstance(url, dict) else url
+                        require(isinstance(url, str) and url.startswith("data:image/"), "provider image not inline")
+                        decoded = base64.b64decode(url.split(",", 1)[1], validate=True)
+                        require(decoded.startswith((bytes([137,80,78,71,13,10,26,10]), bytes([255,216,255]))), "invalid provider image")
+                        owner.image_evidence[case] = bounded_value(image)
+                    if results and case in LARGE_CASES:
+                        owner.result_evidence[case] = bounded_value(results[0].get("content"))
+                    retained = bounded_value(body)
+                    retained_bytes = len(json.dumps(retained).encode())
+                    require(owner.retained_bytes + retained_bytes <= 8 * MIB, "provider evidence retention budget")
+                    owner.calls.append(retained)
+                    owner.retained_bytes += retained_bytes
+                    dump(root / "provider-requests.json", owner.calls)
                     frames = [
                         {"choices": [{"index": 0, "delta": delta, "finish_reason": None}]},
                         {"choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
@@ -212,6 +316,7 @@ class Host(resource.Host):
     def __init__(self, *args):
         self.denials, self.progress, self.ends = [], [], {}
         self.progress_bytes = 0
+        self.last_end = None
         super().__init__(*args)
 
     def record(self, name, line):
@@ -236,10 +341,14 @@ class Host(resource.Host):
                         and metadata.get("phase") in ("started", "progress", "completed", "failed"), "progress phase/identity")
                 self.progress.append({"toolCallId": frame["toolCallId"], **metadata})
                 self.progress_bytes += len(encoded.encode())
-        elif kind == "tool_execution_end" and frame.get("toolName") == "codemode":
-            require(len(self.ends) < 32, "end metadata retention budget")
+        elif kind == "tool_execution_end":
+            require(len(self.ends) < 64, "end metadata retention budget")
             result = frame.get("result", {})
             self.ends[frame["toolCallId"]] = {"terminate": result.get("terminate"), "isError": frame.get("isError")}
+            # One bounded native payload only, including direct baselines; no backlog.
+            require(len(line.encode()) <= resource.MAX_LINE, "native end retention budget")
+            self.last_end = {"toolCallId":frame["toolCallId"], "toolName":frame["toolName"],
+                             "result":{**result,"isError":frame.get("isError", False)}}
         elif kind == "ui_dialog_request":
             require(frame.get("toolCallId", "").startswith("tp-"), "approval is not a nested call")
             require(len(self.denials) < 8, "denial retention budget")
@@ -308,7 +417,7 @@ def check_binding(raw):
 
 
 def check_fixture(case, result, summary, host, provider, baselines):
-    count = 4 if case == "fixture_aliases" else 2 if case == "fixture_success" else 1
+    count = 5 if case == "fixture_aliases" else 2 if case == "fixture_success" else 1
     usage = result.get("usage") or {}
     require(usage.get("input") == count and usage.get("output") == 2 * count
             and usage.get("totalTokens") == 3 * count, result)
@@ -355,7 +464,7 @@ def check_fixture(case, result, summary, host, provider, baselines):
             require(value["guest"] == value["raw"] and value["text"] == value["raw"]["details"], value)
             require(value["caught"] == case.endswith("error"), value)
         else:
-            require(len(value) == 4 and all(v["details"]["business"] == BUSINESS for v in value), value)
+            require(len(value) == 5 and all(v["details"]["business"] == BUSINESS for v in value), value)
     if case == "fixture_throw":
         require(summary["status"] == "error" and "after native child" in summary["error"], summary)
     if case == "fixture_caught_error":
@@ -364,17 +473,87 @@ def check_fixture(case, result, summary, host, provider, baselines):
         require(raw["addedToolNames"] == ["fixture-added", "fixture-added"], summary)
     parent_id = "smoke-" + case
     progress = [p for p in host.progress if p["toolCallId"] == parent_id
-                and p["tool"] in (["call", "list", "emit", "result"] if case == "fixture_aliases" else ["parity_probe"])]
+                and p["tool"] in (["call", "list", "emit", "result", "release"] if case == "fixture_aliases" else ["parity_probe"])]
     terminal_phase = "failed" if case in ("fixture_caught_error", "fixture_terminal", "fixture_result_error", "fixture_result_undefined_details", "fixture_binding_error") else "completed"
     for phase in ("started", "progress", terminal_phase):
         require(sum(p["phase"] == phase for p in progress) == count, progress)
     require(len({p["requestId"] for p in progress}) == count, progress)
     require(all(p["updateCount"] == 1 for p in progress if p["phase"] == "progress"), progress)
     if case == "fixture_terminal":
-        require(summary["status"] == "terminated" and summary["isError"] is True, summary)
+        # Terminal results now attach the original native receipt, not an
+        # extension diagnostic wrapper. Outcome remains host-authoritative.
+        require(summary == {"fixture": "native-parity"}, summary)
+        require(result["content"] == [{"type": "text", "text": "native parity probe",
+                "textSignature": "native-parity-signature"}], result)
         require(host.ends.get(parent_id) == {"terminate": True, "isError": True}, host.ends)
         require(sum(latest_case(c["messages"])[1] == case for c in provider.calls) == 1,
                 "terminal error performed another provider turn")
+
+
+def check_large(case, host, provider, baselines, root):
+    end = host.last_end
+    require(end and end["toolCallId"] == "smoke-" + case, "missing exact native end event: " + case)
+    require(end["toolName"] == ("parity_large" if case in LARGE_DIRECT else "codemode"), "wrong native tool")
+    result = end["result"]
+    assert_no_binding(result)
+    error = case in ("large_direct_error", "large_result_error", "large_select_throw")
+    require(bool(result.get("isError")) == error, "wrong large error flag")
+    require(bool(result.get("terminate")) == (case in TERMINAL_CASES), "wrong large terminal flag")
+    count = 20 if case == "large_release" else 1
+    if case in ("large_direct_error", "large_result_error"):
+        require(result.get("usage") is None and not result.get("addedToolNames"), "AgentError invented accounting")
+    else:
+        usage = result.get("usage") or {}
+        require(all(usage.get(k) == n * count for k,n in
+                    {"input":1,"output":2,"cacheRead":0,"cacheWrite":0,"totalTokens":3}.items()), "large accounting not counted once")
+        for key,n in {"input":.1,"output":.2,"cacheRead":0,"cacheWrite":0,"total":.3}.items():
+            require(abs(usage["cost"][key] - n * count) < 1e-9, "large cost not counted once")
+        require(set(result.get("addedToolNames", [])) == {"fixture-added"}, "large names missing/forged")
+        if case not in LARGE_DIRECT:
+            require(result["addedToolNames"] == ["fixture-added"], "large names not deduped")
+    payload = payload_digest(result)
+    if case in LARGE_DIRECT or case in LARGE_EXACT:
+        require(payload["bytes"] > MIB, "not a real large native result")
+    if case in LARGE_DIRECT:
+        baselines[case] = payload
+        if case not in TERMINAL_CASES:
+            baselines[case + "_provider"] = provider.result_evidence[case]
+        if case == "large_direct_image":
+            baselines["provider_image"] = provider.image_evidence[case]
+    elif case in LARGE_EXACT:
+        require(payload == baselines[LARGE_EXACT[case]],
+                {"case":case,"actual":payload,"direct":baselines[LARGE_EXACT[case]]})
+        if case not in TERMINAL_CASES:
+            require(provider.result_evidence[case] == baselines[LARGE_EXACT[case] + "_provider"],
+                    "direct/composed provider tool content differs")
+        if case == "large_result_image":
+            require(provider.image_evidence[case] == baselines["provider_image"], "direct/composed provider image differs")
+    else:
+        summary = result["details"]
+        if case == "large_inspect":
+            require(summary["status"] == "completed", bounded_value(summary))
+            # JS string length is UTF-16 code units, not Python Unicode scalars.
+            require(summary["result"] == {"length":len(LARGE_TEXT.encode("utf-16-le")) // 2,
+                    "blocks":1,"fixture":"native-large","business":BUSINESS,"rejected":3}, "lazy inspection/mutation mismatch")
+        elif case == "large_release":
+            require(summary["status"] == "completed" and summary["result"] == {"released":20}, "release loop failed")
+            # Twenty 2 MiB results exceed both 16 references and 64 MiB charged
+            # native+encoded storage if release fails to recover either quota.
+        else:
+            require(summary["status"] == "error" and "discard selected native receipt" in summary["error"], "selection failure lost")
+            require(payload["bytes"] < 128 * 1024 and not any(b.get("type") == "image" for b in result["content"]), "failed selection forwarded native payload")
+    if case in TERMINAL_CASES:
+        require(len(provider.calls) == 1, "terminal child resumed provider")
+        require(not (root / "workspace/terminal-must-not-exist.txt").exists(), "terminal child resumed JS")
+    else:
+        require(len(provider.calls) == 2, "large result not delivered to provider")
+    count = 0 if case in LARGE_DIRECT else count
+    progress = [p for p in host.progress if p["toolCallId"] == "smoke-" + case and p["tool"] == "parity_large"]
+    for phase in ("started", "progress", "failed" if case == "large_result_error" else "completed"):
+        require(sum(p["phase"] == phase for p in progress) == count, "large progress lifecycle: " + case)
+    require(len({p["requestId"] for p in progress}) == count, "large progress identity")
+    require(all(p["updateCount"] == 1 for p in progress if p["phase"] == "progress"), "large partial not exactly once")
+    dump(root / "large-payload.json", {"case":case,"payload":payload,"fields":bounded_value(result)})
 
 
 def assert_no_binding(value):
@@ -398,7 +577,7 @@ def assert_no_binding(value):
             assert_no_binding(decoded)
 
 
-def run_group(args, root, gated=False):
+def run_group(args, root, gated=False, selected_cases=None, large_baselines=None):
     root.mkdir()
     provider = Provider(root)
     host = None
@@ -407,14 +586,18 @@ def run_group(args, root, gated=False):
         env = resource.environment(root, options, f"http://127.0.0.1:{provider.server.server_port}/v1")
         models_path = root / "agent/models.json"
         models = json.loads(models_path.read_text(encoding="utf-8"))
-        models["providers"]["resource-fixture"]["models"][0]["input"] = ["text", "image"]
+        model = models["providers"]["resource-fixture"]["models"][0]
+        model["input"] = ["text", "image"]
+        model["contextWindow"] = 8_000_000  # Valid model config; avoid synthetic compaction.
         dump(models_path, models)
+        if selected_cases:
+            large_fixtures(root / "workspace")
         (root / "workspace/pixel.png").write_bytes(png_fixture())
         (root / "workspace/seed.txt").write_text("native-code-mode-中文", encoding="utf-8")
         command = [str(args.rpi), "--mode", "rpc", "--provider", "resource-fixture", "--model", "synthetic",
                    "--session-dir", str(root / "sessions"), "--session-id", str(uuid.uuid4()),
                    "--rpc-message-updates", "compact-deltas", "--local-only", "--no-skills", "--no-context-files",
-                   "--no-prompt-templates", "--tools", "read,write,codemode" + (",parity_probe,call,list,emit,result" if args.fixture_extension and not gated else ""), "--thinking", "off", "--timeout", "15",
+                   "--no-prompt-templates", "--tools", "read,write,codemode" + (",parity_probe,parity_large,call,list,emit,result,release" if args.fixture_extension and not gated else ""), "--thinking", "off", "--timeout", "15",
                    "--extension", str(args.extension)]
         if args.fixture_extension and not gated:
             command += ["--extension", str(args.fixture_extension)]
@@ -425,7 +608,7 @@ def run_group(args, root, gated=False):
         host = Host(command, root, env, 45)
         ready = host.wait(lambda f: f.get("type") == "ready")
         dump(root / "ready.json", ready)
-        cases = ["denied"] if gated else BASE_CASES + (FIXTURE_CASES if args.fixture_extension else [])
+        cases = selected_cases or (["denied"] if gated else BASE_CASES + (FIXTURE_CASES if args.fixture_extension else []))
         findings, baselines = [], {}
         for case in cases:
             require(host.call("prompt", message=case) == {"accepted": True}, "prompt acceptance")
@@ -436,12 +619,16 @@ def run_group(args, root, gated=False):
                 findings.append({"case": case, "passed": True})
                 continue
             host.settlement()
+            if case in LARGE_CASES:
+                check_large(case, host, provider, large_baselines, root)
+                findings.append({"case":case,"passed":True,"validation":"native end event + provider delivery"})
+                continue
             result, summary = outer_result(host, "parity_probe" if case in DIRECT_CASES else "codemode")
             if case == "list":
                 require(not result.get("isError"), result)
                 require(summary["protocolVersion"] == 1 and len(summary["tools"]) <= 2, summary)
                 require(all(t["name"] != "codemode" for t in summary["tools"]), summary)
-                require(summary["capabilities"] == {"resultEnvelope": 1, "hostAccounting": 1, "parentProgress": 1, "losslessValues": 1}, summary)
+                require(summary["capabilities"] == {"resultEnvelope": 1, "hostAccounting": 1, "parentProgress": 1, "losslessValues": 1, "resultReferences": 1}, summary)
             elif case in ("png_return", "png_emit", "png_intermediate", "ordinary_json", "fabricated_usage"):
                 check_native(case, result, summary)
             elif case.startswith("fixture_"):
@@ -485,30 +672,46 @@ def run_group(args, root, gated=False):
         require(not host.error, str(host.error))
         dump(root / "parent-progress.json", host.progress)
         dump(root / "parent-ends.json", host.ends)
-        data = host.call("get_messages", limit=64)
-        dump(root / "messages.json", data)
+        # Not a large transcript-equality test: bounded last-message snapshot,
+        # or user summary when terminal completion leaves a huge tool message.
+        data = (host.call("get_message_summaries", limit=1) if selected_cases and cases[-1] in TERMINAL_CASES
+                else host.call("get_messages", limit=1 if selected_cases else 64))
+        dump(root / "messages.json", bounded_value(data))
         assert_no_binding(data)
         host.exit_ok()
         sessions = list((root / "sessions").rglob("*.jsonl"))
         require(sessions, "no native JSONL transcript")
-        raw = "\n".join(p.read_text(encoding="utf-8") for p in sessions)
+        intents, finished = [], []
+        for path in sessions:
+            with path.open(encoding="utf-8") as stream:
+                while True:
+                    line = stream.readline(resource.MAX_LINE + 1)
+                    if not line:
+                        break
+                    require(len(line.encode()) <= resource.MAX_LINE, "transcript line budget")
+                    if not line.strip():
+                        continue
+                    entry = json.loads(line)
+                    assert_no_binding(entry)
+                    kind = entry.get("customType")
+                    if kind in ("rpi.tool_program.intent.v1", "rpi.tool_program.finished.v1"):
+                        dest = intents if kind.endswith("intent.v1") else finished
+                        require(len(dest) < 1024, "lifecycle retention budget")
+                        dest.append(entry["data"])
         if not gated:
-            require("rpi.tool_program.intent.v1" in raw and "rpi.tool_program.finished.v1" in raw, "no durable nested markers")
-        # Several native transcript segments may end with newlines; joining
-        # them creates blank separators, not additional JSON records.
-        entries = [json.loads(line) for line in raw.splitlines() if line.strip()]
-        for entry in entries:
-            assert_no_binding(entry)
+            if selected_cases and cases[0] in LARGE_DIRECT:
+                require(not intents and not finished, "direct baseline nested")
+            else:
+                require(intents and finished, "no durable native markers")
         assert_no_binding(provider.calls)
-        for line in (root / "process.jsonl").read_text(encoding="utf-8").splitlines():
-            assert_no_binding(json.loads(line))
-        intents = [e["data"] for e in entries if e.get("customType") == "rpi.tool_program.intent.v1"]
-        finished = [e["data"] for e in entries if e.get("customType") == "rpi.tool_program.finished.v1"]
+        with (root / "process.jsonl").open(encoding="utf-8") as stream:
+            for line in stream:
+                assert_no_binding(json.loads(line))
         require(all(e["replay"] == "never" for e in intents), "native child is replayable")
         for case in FIXTURE_CASES:
             if case not in cases:
                 continue
-            expected = 0 if case in DIRECT_CASES else 4 if case == "fixture_aliases" else 2 if case == "fixture_success" else 1
+            expected = 0 if case in DIRECT_CASES else 5 if case == "fixture_aliases" else 2 if case == "fixture_success" else 1
             starts = [e for e in intents if e["rootToolCallId"] == "smoke-" + case]
             ends = [e for e in finished if e["rootToolCallId"] == "smoke-" + case]
             require(len(starts) == expected and len(ends) == expected,
@@ -520,6 +723,13 @@ def run_group(args, root, gated=False):
                                    "fixture_binding_error")
             require(all(e["isError"] == child_error for e in ends),
                     "native child lost its error: " + case)
+        for case in (c for c in cases if c in LARGE_CASES):
+            expected = 0 if case in LARGE_DIRECT else 20 if case == "large_release" else 1
+            starts = [e for e in intents if e["rootToolCallId"] == "smoke-" + case]
+            ends = [e for e in finished if e["rootToolCallId"] == "smoke-" + case]
+            require(len(starts) == len(ends) == expected, "large native replay/lost lifecycle: " + case)
+            require({e["requestId"] for e in starts} == {e["requestId"] for e in ends}, "large unmatched lifecycle")
+            require(all(e["isError"] == (case == "large_result_error") for e in ends), "large child error lost")
         return findings
     finally:
         if host:
@@ -553,6 +763,10 @@ def main():
     result = {"status": "FAILED", "cases": []}
     try:
         result["cases"] += run_group(args, root / "normal")
+        if args.fixture_extension:
+            baselines = {}
+            for case in LARGE_CASES:
+                result["cases"] += run_group(args, root / case, selected_cases=[case], large_baselines=baselines)
         if args.permission_gate:
             result["cases"] += run_group(args, root / "gated", True)
         else:

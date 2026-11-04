@@ -1,13 +1,20 @@
-//! Disposable, synchronous native ABI accounting/progress probe. No IO or workers.
+//! Disposable native ABI probes. Only parity_large reads fixed test scratch files.
 #![deny(unsafe_code)]
 
 use rpi_plugin_sdk::{
     handles::ToolHandles, StableToolSchema, StbString, StepHandle, StepResult, ToolPartialCb,
 };
 use serde_json::{json, Value};
-use std::sync::atomic::Ordering;
+use std::{io::Read, sync::atomic::Ordering};
 
 static JOBS: ToolHandles<Option<Value>> = ToolHandles::new();
+
+rpi_plugin_sdk::execute_handler! { fn execute_large(_id, params) {
+    let mut value: Value = serde_json::from_str(&params.to_string_lossy()).unwrap_or(Value::Null);
+    // Private fixture dispatch marker is inserted only after ABI argument decoding.
+    value["fixtureLarge"] = json!(true);
+    JOBS.insert(Some(value))
+} }
 
 rpi_plugin_sdk::execute_handler! { fn execute(_id, params) {
     let value = serde_json::from_str(&params.to_string_lossy()).unwrap_or(Value::Null);
@@ -32,6 +39,37 @@ extern "C" fn poll(
         // Ownership passes to the host, which uses this plugin's deallocator.
         if let Some(callback) = partial {
             callback(StbString::from_string(json!({"content":[{"type":"text","text":"fixture partial"}],"details":{"fixturePartial":true}}).to_string()), data);
+        }
+        if params["fixtureLarge"] == true {
+            // Never accept a path from JS/model arguments. These files are generated
+            // by the smoke harness in the disposable host workspace before launch.
+            let path = match params["kind"].as_str() {
+                Some("text" | "error") => "large-native-text-result.json",
+                Some("image") => "large-native-image-result.json",
+                _ => return StepResult::err(StbString::from_string("invalid large fixture kind".into())),
+            };
+            let mut payload = String::new();
+            let read = std::fs::File::open(path).and_then(|file| {
+                file.take(8 * 1024 * 1024 + 1).read_to_string(&mut payload)
+            });
+            if read.is_err() || payload.len() > 8 * 1024 * 1024 {
+                return StepResult::err(StbString::from_string("large fixture unavailable/oversized".into()));
+            }
+            let mut result: Value = match serde_json::from_str(&payload) {
+                Ok(value) => value,
+                Err(_) => return StepResult::err(StbString::from_string("invalid large fixture JSON".into())),
+            };
+            if params["kind"] == "error" {
+                // Exercise real AgentError finalization: no fabricated accounting,
+                // names, structured-error envelope, or terminal flag on this path.
+                return StepResult::err(StbString::from_string(
+                    result["content"][0]["text"].as_str().unwrap_or("").to_owned()));
+            }
+            if let Some(business) = params.get("business") {
+                result["details"]["business"] = business.clone();
+            }
+            result["terminate"] = json!(params["terminate"] == true);
+            return StepResult::done(StbString::from_string(result.to_string()));
         }
         let mut details = json!({"fixture":"native-parity"});
         if let Some(business) = params.get("business") {
@@ -101,7 +139,7 @@ mod registration {
             Some(register) => {
                 // Reserved guest helpers remain reachable as native aliases
                 // through tools.call(name, args).
-                for name in ["parity_probe", "call", "list", "emit", "result"] {
+                for name in ["parity_probe", "call", "list", "emit", "result", "release"] {
                     let alias = StableToolSchema {
                         name: StbString::from_string(name.into()),
                         description: StbString::from_string(schema.description.to_string_lossy()),
@@ -119,7 +157,29 @@ mod registration {
                         return status;
                     }
                 }
-                0
+                // Deliberately legacy: no x-rpi-result-envelope opt-in (1 MiB cap).
+                let large = StableToolSchema {
+                    name: StbString::from_string("parity_large".into()),
+                    description: StbString::from_string(
+                        "Test-only fixed scratch large native result".into(),
+                    ),
+                    parameters: StbString::from_string(
+                        json!({"type":"object",
+                        "properties":{"kind":{"type":"string","enum":["text","image","error"]},
+                            "business":{"type":"object","additionalProperties":true},
+                            "terminate":{"type":"boolean"}},
+                        "required":["kind"],"additionalProperties":false})
+                        .to_string(),
+                    ),
+                };
+                register(
+                    &large,
+                    execute_large,
+                    poll,
+                    cancel,
+                    destroy,
+                    rpi_plugin_sdk::callbacks::free_string,
+                )
             }
             None => 1,
         }

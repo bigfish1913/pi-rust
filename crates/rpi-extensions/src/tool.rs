@@ -217,7 +217,24 @@ fn done_to_result(text: &str, envelope: bool) -> Result<AgentToolResult, AgentEr
     parse_result_envelope(text)
         .map_err(|error| AgentError::tool(format!("invalid tool result envelope: {error}")))?
 }
+fn done_with_invocation(
+    text: &str,
+    envelope: bool,
+    invocation: Option<&crate::ActionBridge>,
+) -> Result<AgentToolResult, AgentError> {
+    if !envelope {
+        return done_to_result(text, false);
+    }
+    parse_result_envelope_with(text, invocation)
+        .map_err(|error| AgentError::tool(format!("invalid tool result envelope: {error}")))?
+}
 fn parse_result_envelope(text: &str) -> Result<Result<AgentToolResult, AgentError>, String> {
+    parse_result_envelope_with(text, None)
+}
+fn parse_result_envelope_with(
+    text: &str,
+    invocation: Option<&crate::ActionBridge>,
+) -> Result<Result<AgentToolResult, AgentError>, String> {
     if text.len() > 1024 * 1024 {
         return Err("exceeds 1 MiB".into());
     }
@@ -228,6 +245,33 @@ fn parse_result_envelope(text: &str) -> Result<Result<AgentToolResult, AgentErro
     let is_error = value["isError"]
         .as_bool()
         .ok_or("isError must be boolean")?;
+    if let Some(reference) = value.get("resultReference") {
+        if value.get("result").is_some() {
+            return Err("result and resultReference are mutually exclusive".into());
+        }
+        let reference = reference
+            .as_object()
+            .ok_or("resultReference must be an object")?;
+        if reference.get("version").and_then(Value::as_u64) != Some(1) {
+            return Err("unsupported result reference version".into());
+        }
+        let id = reference
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or("result reference id is required")?;
+        let (result, host_error) = invocation
+            .ok_or("result reference requires a live invocation bridge")?
+            .resolve_result_reference(id)?;
+        if is_error != host_error {
+            return Err("result reference isError does not match host outcome".into());
+        }
+        return Ok(if host_error {
+            Err(AgentError::StructuredTool(Box::new(result)))
+        } else {
+            Ok(result)
+        });
+    }
     let result = value["result"]
         .as_object()
         .ok_or("result must be an object")?;
@@ -704,7 +748,11 @@ impl AgentTool for PluginToolAdapter {
                     Step::Done(done) => {
                         break callback_context
                             .public_binding
-                            .terminal(done_to_result(&done, result_envelope));
+                            .terminal(done_with_invocation(
+                                &done,
+                                result_envelope,
+                                invocation.as_deref(),
+                            ));
                     }
                     Step::Err(message) => {
                         break Err(AgentError::Tool(
