@@ -44,7 +44,7 @@ fs2 = "0.4"
 
 # Serialization / schemas
 serde = { version = "1", features = ["derive", "rc"] }
-serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
+serde_json = { version = "1", features = ["preserve_order", "raw_value", "float_roundtrip"] }
 yaml_serde = "=0.10.2"
 indexmap = { version = "2", features = ["serde"] }
 schemars = { version = "0.8", features = ["preserve_order"] }
