@@ -1892,8 +1892,7 @@ async fn reference_large_finalized_unicode_receipt_reads_losslessly_and_dispose_
         "界😀\"\\n".repeat(150_000),
     ));
     native.details["large"] = json!("é😀\"\\n".repeat(150_000));
-    let expected = finalized_json(&native);
-    let encoded = serde_json::to_string(&json!({"content":expected["content"],"details":expected["details"],"terminate":expected["terminate"],"addedToolNames":expected["addedToolNames"],"usage":expected["usage"]})).unwrap();
+    let encoded = serde_json::to_string(&native).unwrap();
     assert!(encoded.len() > 1024 * 1024);
     let actual = native.clone();
     parity_run(vec![

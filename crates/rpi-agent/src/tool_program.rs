@@ -378,20 +378,9 @@ impl ToolProgram {
                                 this.terminated.store(true, Ordering::SeqCst);
                             }
                         }
-                        let content: Vec<Value> = result
-                            .content
-                            .iter()
-                            .map(|c| match c {
-                                TextContentOrImage::Text(t) => serde_json::to_value(t),
-                                TextContentOrImage::Image(i) => serde_json::to_value(i),
-                            })
-                            .collect::<Result<_, _>>()
-                            .map_err(|e| e.to_string())?;
-                        let payload = json!({"content":content,"details":result.details,"terminate":result.terminate,"addedToolNames":result.added_tool_names,"usage":result.usage});
                         let reply = if reference {
                             let encoded =
-                                serde_json::to_string(&payload).map_err(|e| e.to_string())?;
-                            drop(payload);
+                                serde_json::to_string(result).map_err(|e| e.to_string())?;
                             this.retain_result(
                                 &request_id,
                                 finalized.result,
@@ -399,6 +388,8 @@ impl ToolProgram {
                                 encoded,
                             )?
                         } else {
+                            let payload =
+                                serde_json::to_value(result).map_err(|e| e.to_string())?;
                             let reply = json!({"requestId":request_id,"status":"done","isError":finalized.is_error,"result":payload});
                             bounded(&reply)?;
                             reply

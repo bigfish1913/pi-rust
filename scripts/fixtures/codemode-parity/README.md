@@ -12,6 +12,37 @@ disposable scratch workspace. It accepts no caller-provided path and bounds its
 read at 8 MiB. The smoke harness creates these files before launch. There is no
 fixture network access.
 
+## Latest native result-codec follow-up (child-history groundwork)
+
+The uncommitted native follow-up adds camelCase `Serialize` for `AgentToolResult` and
+untagged `Serialize` for `TextContentOrImage`. ToolProgram reference mode now
+serializes the borrowed native result without an intermediate payload `Value`;
+native RPC uses the same canonical serializer, fixing dropped optional
+`textSignature` in `ToolExecutionUpdate` / `ToolExecutionEnd`. The native field
+is `Option<String>`: even JSON-formatted signature strings retain their exact
+string bytes, not a parsed/reformatted object. Result wire fields are unchanged
+except this additive optional RPC field. Reference JSON now follows canonical
+struct field order; byte-identical object-key order across the upgrade is **not**
+promised. No `Deserialize` or new authority is added; `isError` remains external
+to the result and host-authoritative. Native SDK ABI/layout and the Code Mode
+DLL/source are unchanged; that DLL was not rebuilt for this follow-up.
+
+This is a codec foundation for a **future native child journal**, not a fourth
+history increment or full child-history parity. Actual child events/records,
+bounded history/query/replay/recovery, neutral core/adapter integration and UI
+remain pending. No install, deployment or running-service upgrade is implied.
+
+Latest Windows evidence:
+`pi-rust-codemode/target/codemode-native-codec-smoke-2/{results.json,provenance.json}`: **59 cases PASSED, all true**, with all four
+artifact hashes verified. SDK/agent/extensions/harness passed **1,128 tests,
+0 failed, 6 ignored, twice**; focused CLI protocol tests passed **8** (not the
+full CLI suite). Package **124 tests and strict all-target Clippy remain passing**
+from unchanged package evidence; **native strict Clippy is blocked**, not green.
+See the [latest matrix checkpoint](../../../../rpi-package-codemode/docs/codemode-full-parity-matrix.md#latest-native-result-codec-follow-up-child-history-groundwork)
+for hashes, logs, focused codec checks and native lint blockers. The earlier
+third-increment 59-case / 1,123-test evidence and `5dba…` host hash are
+historical, not qualification of the rebuilt host.
+
 ## Build and run from source
 
 From the host repository root:
@@ -178,7 +209,7 @@ effects or grant new authority. Cancellation, whole-result selection, terminal
 handoff and known retained-reference cleanup failure never use this recovery.
 Native final decoding checks live ownership again.
 
-## Current third-increment evidence
+## Historical third-increment evidence (before codec follow-up)
 
 
 | Evidence | Proven scope / limits |
@@ -190,10 +221,10 @@ Native final decoding checks live ownership again.
 | Broad native regression | Default-parallel SDK/agent/extensions/harness: **1,123 passed, 0 failed, 6 ignored**, twice. Native `target/codemode-content-parts-tests.log` and `target/codemode-content-parts-tests-repeat.log`. Existing both-driver full-reference 22-scenario test and new content-parts scenario test are **test functions**, not separate extra scenario counts. |
 | Failed content-parts attempt | `codemode-content-parts-native-smoke-1` **FAILED after 53 cases, before overflow**: masking numeric handle 3 corrupted the real `32 MiB` diagnostic. Implementation fixed; expected needle not weakened. Never cite `-1` as passing. |
 
-Current evidence files:
+Historical third-increment evidence files (not current host qualification):
 `pi-rust-codemode/target/codemode-content-parts-native-smoke-2/{results.json,provenance.json}`.
 
-| Windows artifact recorded in current provenance | Recorded SHA-256 |
+| Windows artifact recorded in historical third-increment provenance | Recorded SHA-256 |
 | --- | --- |
 | Host `pi-rust-codemode/target/debug/rpi.exe` | `5dba0fa76a699b79f9b286721cd8b2ab1e21b79f3f30536090d086d76d2dc7c7` |
 | Code Mode `rpi-package-codemode/target/debug/rpi_codemode.dll` | `5fccaaa062bdebb1fe74294a470d18816cbb59ffe8e79ad43196e220e8ebdd6f` |
