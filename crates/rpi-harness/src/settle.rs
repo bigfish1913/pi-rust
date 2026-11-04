@@ -501,6 +501,98 @@ impl SettleState {
         Ok(())
     }
 
+    /// Resolve a child against the real checkpointed root and committed assistant.
+    /// A private nested request ID is not an assistant tool-call ID or authority.
+    async fn child_origin(
+        &self,
+        session: &crate::session::Session,
+        lane: &str,
+        child: &rpi_agent::tool_program_observation::ToolProgramChild,
+    ) -> Result<crate::tool_program_journal::ChildOrigin, String> {
+        if self
+            .tool_replays
+            .get(&child.root_name)
+            .copied()
+            .unwrap_or(ToolReplay::Never)
+            != ToolReplay::Never
+            || !self
+                .reserved_results
+                .lock()
+                .unwrap()
+                .contains_key(&child.root_id)
+        {
+            return Err("child requires a checkpointed Never-replay root".into());
+        }
+        let (assistant_entry_id, tool_index) = self
+            .pending_calls
+            .lock()
+            .unwrap()
+            .get(&child.root_id)
+            .cloned()
+            .ok_or_else(|| "child root has no committed assistant slot".to_owned())?;
+        let entries = session
+            .view(lane)
+            .find_entries(&crate::session::types::EntryQuery {
+                entry_id: Some(assistant_entry_id.clone()),
+                limit: Some(1),
+                ..Default::default()
+            })
+            .await
+            .map_err(|_| "child assistant lookup failed".to_owned())?;
+        let Some(crate::session::types::Entry::Message(entry)) = entries.first() else {
+            return Err("child assistant entry unavailable".into());
+        };
+        let AgentMessage::Assistant(message) = &entry.message else {
+            return Err("child root does not belong to an assistant".into());
+        };
+        let call = message
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                rpi_ai::types::Content::ToolCall(call) => Some(call),
+                _ => None,
+            })
+            .nth(tool_index as usize);
+        if !call.is_some_and(|call| call.id == child.root_id && call.name == child.root_name) {
+            return Err("child root differs from committed assistant slot".into());
+        }
+        Ok(crate::tool_program_journal::ChildOrigin {
+            run_id: self.run_id.clone(),
+            assistant_entry_id,
+            tool_index,
+        })
+    }
+
+    /// Nested effects are descendants of a real committed Never-replay call.
+    /// Custom records are audit metadata, not fabricated assistant/tool messages.
+    pub(crate) async fn start_nested_tool(
+        &self,
+        harness: &AgentHarness,
+        parent: &rpi_agent::tool_program::NestedParent,
+        id: &str,
+        name: &str,
+        args: &serde_json::Value,
+    ) -> crate::result::HarnessResult<()> {
+        if self
+            .tool_replays
+            .get(&parent.root_name)
+            .copied()
+            .unwrap_or(ToolReplay::Never)
+            != ToolReplay::Never
+            || !self
+                .reserved_results
+                .lock()
+                .unwrap()
+                .contains_key(&parent.root_id)
+        {
+            return Err(crate::result::HarnessError::io(
+                "nested invocation requires a checkpointed Never-replay parent",
+            ));
+        }
+        harness.append_custom_entry("rpi.tool_program.intent.v1", Some(serde_json::json!({"runId":self.run_id,"rootToolCallId":parent.root_id,"parentToolCallId":parent.parent_id,"requestId":id,"name":name,"arguments":args,"replay":"never"}))).await?;
+        Ok(())
+    }
+
     /// Remember each tool call of a freshly committed assistant message, keyed so
     /// the execution barrier can record it against the right entry and ordinal.
     pub(crate) fn record_tool_calls(&self, entry_id: &str, message: &AssistantMessage) {
@@ -540,6 +632,7 @@ pub struct SettlingEmitter {
     state: Arc<SettleState>,
     harness: AgentHarness,
     signal: tokio_util::sync::CancellationToken,
+    observer: Arc<dyn rpi_agent::tool_program_observation::ToolProgramObserver>,
 }
 
 impl SettlingEmitter {
@@ -550,12 +643,54 @@ impl SettlingEmitter {
         harness: AgentHarness,
         signal: tokio_util::sync::CancellationToken,
     ) -> Self {
+        // Pin correlation and archival writes to the same native binding. A
+        // facade switch must not redirect either half to a different session.
+        let session = harness
+            .session()
+            .pin(harness.session().id_generator().clone());
+        let lane = harness.lane_name().to_owned();
+        let correlate: crate::tool_program_journal::Correlate = {
+            let state = state.clone();
+            let session = session.clone();
+            let lane = lane.clone();
+            Arc::new(move |child| {
+                let state = state.clone();
+                let session = session.clone();
+                let lane = lane.clone();
+                Box::pin(async move { state.child_origin(&session, &lane, &child).await })
+            })
+        };
+        let fail: crate::tool_program_journal::Fail = {
+            let state = state.clone();
+            let signal = signal.clone();
+            Arc::new(move |error| {
+                state.identity_error.lock().unwrap().get_or_insert(error);
+                signal.cancel();
+            })
+        };
+        let journal = Arc::new(crate::tool_program_journal::JournalObserver::new(
+            session,
+            lane,
+            correlate,
+            fail.clone(),
+        ));
+        let observer: Arc<dyn rpi_agent::tool_program_observation::ToolProgramObserver> =
+            if let Some(extra) = inner.tool_program_observer() {
+                Arc::new(crate::tool_program_observers::CombinedObserver {
+                    journal,
+                    extra,
+                    fail,
+                })
+            } else {
+                journal
+            };
         Self {
             inner,
             recorder,
             state,
             harness,
             signal,
+            observer,
         }
     }
 
@@ -765,6 +900,7 @@ impl SettlingEmitter {
                     state: Arc::clone(&self.state),
                     harness: self.harness.clone(),
                     signal: self.signal.clone(),
+                    observer: self.observer.clone(),
                 };
                 let message = message.clone();
                 return Some(Box::pin(async move {
@@ -865,6 +1001,7 @@ impl SettlingEmitter {
                     state: Arc::clone(&self.state),
                     harness: self.harness.clone(),
                     signal: self.signal.clone(),
+                    observer: self.observer.clone(),
                 };
                 // Ordinal first, then increment: the message that just settled is
                 // stream `ordinal`.
@@ -886,6 +1023,7 @@ impl SettlingEmitter {
                     state: Arc::clone(&self.state),
                     harness: self.harness.clone(),
                     signal: self.signal.clone(),
+                    observer: self.observer.clone(),
                 };
                 let result = (**result).clone();
                 Some(Box::pin(async move {
@@ -927,6 +1065,7 @@ impl SettlingEmitter {
                     state: Arc::clone(&self.state),
                     harness: self.harness.clone(),
                     signal: self.signal.clone(),
+                    observer: self.observer.clone(),
                 };
                 Some(Box::pin(async move {
                     emitter.settle_final_assistant().await;
@@ -1087,6 +1226,12 @@ impl SettlingEmitter {
 }
 
 impl AgentEmitter for SettlingEmitter {
+    fn tool_program_observer(
+        &self,
+    ) -> Option<Arc<dyn rpi_agent::tool_program_observation::ToolProgramObserver>> {
+        Some(self.observer.clone())
+    }
+
     fn emit(&self, event: AgentEvent) -> BoxFuture<'static, ()> {
         self.emit_reserved(event, false)
     }

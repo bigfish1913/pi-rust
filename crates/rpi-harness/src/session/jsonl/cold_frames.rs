@@ -534,8 +534,18 @@ impl ResidentState {
             query: query.clone(),
         })
     }
+    pub fn branch_ancestry(
+        &self,
+        bounds: &BranchBounds,
+        start: &str,
+    ) -> SessionResult<Vec<EntryAncestry>> {
+        self.reducer.branch_ancestry(bounds, start)
+    }
     pub fn context_plan(&self, bounds: &BranchBounds, start: &str) -> SessionResult<ContextPlan> {
         let query = EntryQuery {
+            // Selection still validates the full ancestry and preserves all
+            // non-archival metadata facts and compaction boundaries.
+            exclude_tool_program_bodies: true,
             order: Some(EntryOrder::OldestFirst),
             ..Default::default()
         };

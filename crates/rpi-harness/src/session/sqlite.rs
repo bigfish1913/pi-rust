@@ -264,6 +264,17 @@ impl SessionStorage for SqliteSessionStorage {
             .find_entries_on_branch(query, bounds, start)
             .await
     }
+    async fn branch_ancestry(
+        &self,
+        bounds: &BranchBounds,
+        start: &str,
+    ) -> SessionResult<Vec<crate::session::types::EntryAncestry>> {
+        // SQLite's existing snapshot refresh eagerly deserializes state_json.
+        // Only the subsequent ancestry walk is metadata-only in this backend.
+        let _gate = self.refresh_read().await?;
+        self.inner.branch_ancestry(bounds, start).await
+    }
+
     async fn context_on_branch(
         &self,
         bounds: &BranchBounds,

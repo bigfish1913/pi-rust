@@ -184,6 +184,14 @@ impl SessionState {
         Ok(results)
     }
 
+    pub fn branch_ancestry(
+        &self,
+        bounds: &BranchBounds,
+        start: &str,
+    ) -> SessionResult<Vec<crate::session::types::EntryAncestry>> {
+        self.index.branch_ancestry(bounds, start)
+    }
+
     /// Project a validated branch without allocating owned copies for entries
     /// that fall before the latest compaction boundary.
     pub(crate) fn context_on_branch(

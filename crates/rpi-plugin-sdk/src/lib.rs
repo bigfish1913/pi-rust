@@ -1231,6 +1231,8 @@ pub enum RuntimeActionId {
     /// The flag is one-shot: it is consumed at the next turn boundary and
     /// cleared when a new run starts. Setting it while idle is a harmless no-op.
     StopRound = 29,
+    /// Invocation-bound nested tool execution (protocol version 1).
+    ToolProgram = 30,
 }
 
 /// Error returned when a plugin passes a numeric runtime-action id that this
@@ -1281,6 +1283,7 @@ impl TryFrom<u32> for RuntimeActionId {
             27 => Ok(Self::Abort),
             28 => Ok(Self::RelayUiDialog),
             29 => Ok(Self::StopRound),
+            30 => Ok(Self::ToolProgram),
             other => Err(UnknownRuntimeActionId(other)),
         }
     }
@@ -1324,6 +1327,7 @@ impl RuntimeActionId {
         Self::Abort,
         Self::RelayUiDialog,
         Self::StopRound,
+        Self::ToolProgram,
     ];
 
     /// The highest defined action id.
@@ -2446,6 +2450,7 @@ mod tests {
             RuntimeActionId::Abort,
             RuntimeActionId::RelayUiDialog,
             RuntimeActionId::StopRound,
+            RuntimeActionId::ToolProgram,
         ];
 
         // Stable wire ids must not depend on which proposal was merged first.
@@ -2462,7 +2467,7 @@ mod tests {
         assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::Abort));
         assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::RelayUiDialog));
         assert!(RuntimeActionId::ALL.contains(&RuntimeActionId::StopRound));
-        assert_eq!(RuntimeActionId::MAX, 29);
+        assert_eq!(RuntimeActionId::MAX, 30);
         // One past the highest defined id is rejected (nothing is silently
         // accepted), and so is the u32 ceiling.
         let one_past_last = RuntimeActionId::MAX + 1;

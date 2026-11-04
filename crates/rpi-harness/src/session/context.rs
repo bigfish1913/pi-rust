@@ -28,7 +28,9 @@ use rpi_agent::message::AgentMessage;
 use rpi_ai::types::StopReason;
 
 use crate::messages::{create_branch_summary_message, create_compaction_summary_message};
-use crate::session::types::{BranchSummaryEntry, CompactionEntry, CustomEntry, Entry};
+use crate::session::types::{
+    is_tool_program_body_type, BranchSummaryEntry, CompactionEntry, CustomEntry, Entry,
+};
 
 /// `SessionContext` — the provider-facing snapshot built from a branch path.
 /// Mirrors TS `SessionContext`. `model` carries `(provider, model_id)`.
@@ -41,7 +43,9 @@ pub struct SessionContext {
 }
 
 /// `ContextEntryTransform` — a caller-supplied transform applied to the context
-/// entries AFTER the default compaction-boundary transform. Mirrors TS
+/// entries AFTER the default compaction-boundary transform. Reserved native body
+/// archives are not hook input; indexes refer to the filtered semantic slice.
+/// Ordinary extension custom entries remain in their original order. Mirrors TS
 /// `ContextEntryTransform`. `Arc` so it can live in an options bag.
 pub type ContextEntryTransform = Arc<dyn Fn(&[Entry]) -> Vec<Entry> + Send + Sync>;
 
@@ -75,7 +79,11 @@ impl std::fmt::Debug for SessionContextBuildOptions {
 /// after it; if no compaction, keep all entries. Mirrors
 /// `defaultContextEntryTransform`.
 pub fn default_context_entry_transform(path_entries: &[Entry]) -> Vec<Entry> {
-    default_context_entries(path_entries).to_vec()
+    default_context_entries(path_entries)
+        .iter()
+        .filter(|entry| !is_body_entry(entry))
+        .cloned()
+        .collect()
 }
 
 fn default_context_entries(path_entries: &[Entry]) -> &[Entry] {
@@ -86,13 +94,32 @@ fn default_context_entries(path_entries: &[Entry]) -> &[Entry] {
     &path_entries[start..]
 }
 
+fn is_body_entry(entry: &Entry) -> bool {
+    matches!(entry, Entry::Custom(custom) if is_tool_program_body_type(&custom.custom_type))
+}
+
 fn context_entries<'a>(
     path_entries: &'a [Entry],
     options: &SessionContextBuildOptions,
 ) -> std::borrow::Cow<'a, [Entry]> {
-    let mut entries = std::borrow::Cow::Borrowed(default_context_entries(path_entries));
+    let slice = default_context_entries(path_entries);
+    // Direct borrowed builders may receive full resident history. Filter before
+    // cloning anything or exposing the slice to user transforms/projectors.
+    let mut entries = if slice.iter().any(is_body_entry) {
+        std::borrow::Cow::Owned(
+            slice
+                .iter()
+                .filter(|entry| !is_body_entry(entry))
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(slice)
+    };
     for transform in &options.entry_transforms {
-        entries = std::borrow::Cow::Owned(transform(&entries));
+        let mut transformed = transform(&entries);
+        transformed.retain(|entry| !is_body_entry(entry));
+        entries = std::borrow::Cow::Owned(transformed);
     }
     entries
 }
@@ -294,6 +321,9 @@ fn custom_to_context_messages(
     entries: &[Entry],
     options: &SessionContextBuildOptions,
 ) -> Vec<AgentMessage> {
+    if is_tool_program_body_type(&c.custom_type) {
+        return Vec::new();
+    }
     match options.entry_projectors.get(&c.custom_type) {
         Some(projector) => projector(c, index, entries),
         None => Vec::new(),

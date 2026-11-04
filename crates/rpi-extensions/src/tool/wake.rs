@@ -219,6 +219,7 @@ impl PluginToolAdapter {
             context["runtimeHandle"] = serde_json::json!(invocation.user_data() as usize);
             context["runtimeKey"] = serde_json::json!(invocation.invocation_key());
         }
+        let public_binding = PublicBindingGuard::capture(&params, invocation.as_deref());
         let params = params.to_string();
         let id = tool_call_id.to_owned();
         let (sender, mut partials) = mpsc::unbounded_channel();
@@ -229,12 +230,14 @@ impl PluginToolAdapter {
             callback: PartialCallbackContext {
                 sender,
                 plugin_free: self.handle.plugin_free_string,
+                public_binding,
             },
             registration: WakeRegistration::new(),
             invocation,
             _background: rpi_agent::tool_execution_scope::track_background_tool(),
             _keepalive: self.keepalive.clone(),
         }));
+        let result_envelope = self.schema.parameters.as_value()["x-rpi-result-envelope"] == 1;
         tokio::spawn(async move {
             let (mut driver, ()) = call(driver, move |driver| {
                 driver.handle = (driver.functions.execute_fn)(
@@ -277,11 +280,29 @@ impl PluginToolAdapter {
                         break Err(AgentError::Tool("plugin tool cancelled".into()));
                     }
                     match step {
-                        Step::Done(done) => break Ok(json_to_result(&done)),
-                        Step::Err(error) => break Err(AgentError::Tool(error)),
+                        Step::Done(done) => {
+                            break driver
+                                .callback
+                                .public_binding
+                                .terminal(done_with_invocation(
+                                    &done,
+                                    result_envelope,
+                                    driver.invocation.as_deref(),
+                                ))
+                        }
+                        Step::Err(error) => {
+                            break Err(AgentError::Tool(
+                                driver.callback.public_binding.string(&error),
+                            ))
+                        }
                         Step::Pending(progress) => {
                             if !progress.is_empty() {
-                                let _ = driver.callback.sender.send(json_to_result(&progress));
+                                let _ = driver.callback.sender.send(
+                                    driver
+                                        .callback
+                                        .public_binding
+                                        .result(json_to_result(&progress)),
+                                );
                             }
                             tokio::select! {
                                 _ = driver.registration.notify.notified() => {},

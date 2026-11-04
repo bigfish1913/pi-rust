@@ -37,7 +37,8 @@ pub enum QueueMode {
 /// Result returned from a tool `execute`. Mirrors TS `AgentToolResult<T>`:
 /// `content` goes back to the model, `details` are structured log/UI payload,
 /// `usage` is optionally reported, and `terminate` hints the batch should stop.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentToolResult {
     pub content: Vec<TextContentOrImage>,
     pub details: serde_json::Value,
@@ -47,7 +48,8 @@ pub struct AgentToolResult {
 }
 /// an enum so tool authors stay within the provider-content language without
 /// pulling in the full `Content` union (which adds Thinking/ToolCall).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(untagged)]
 pub enum TextContentOrImage {
     Text(TextContent),
     Image(ImageContent),
@@ -268,4 +270,149 @@ pub(crate) fn default_model() -> rpi_ai::model::Model {
         "unknown",
         "",
     )
+}
+
+#[cfg(test)]
+mod result_codec_tests {
+    use super::*;
+    use serde_json::json;
+    use std::io::{self, Write};
+
+    #[test]
+    fn canonical_result_shape_keeps_null_usage_and_separate_error_authority() {
+        let value = serde_json::to_value(AgentToolResult::error_text("failed")).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "content": [{"type":"text", "text":"failed"}],
+                "details": null, "usage": null, "addedToolNames": [], "terminate": false,
+            })
+        );
+    }
+
+    #[test]
+    fn canonical_text_signatures_preserve_native_strings_exactly() {
+        // The native field is Option<String>, including JSON-formatted signatures.
+        for signature in [
+            "primitive-签名\"\\\n",
+            "123",
+            r#"{ "version": 1, "id": "sig-😀", "nested": [true, null] }"#,
+        ] {
+            let result = AgentToolResult {
+                content: vec![TextContentOrImage::Text(TextContent {
+                    kind: rpi_ai::types::TextContentType,
+                    text: "界😀\"\\\n".into(),
+                    text_signature: Some(signature.into()),
+                })],
+                ..Default::default()
+            };
+            let encoded = serde_json::to_string(&result).unwrap();
+            let value: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(
+                value["content"][0],
+                json!({
+                    "type":"text", "text":"界😀\"\\\n", "textSignature":signature,
+                })
+            );
+            assert_eq!(
+                value["content"][0]["textSignature"]
+                    .as_str()
+                    .unwrap()
+                    .as_bytes(),
+                signature.as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_result_preserves_images_business_details_usage_and_batch_hints() {
+        let details = json!({"runtimeKey":"customer", "runtimeHandle":{"id":7},
+            "__rpi":{"owner":"business"}, "__rpiRuntimeKey":["nested", {"runtimeKey":true}]});
+        let mut usage = Usage::zero();
+        usage.input = 7;
+        usage.output = 3;
+        usage.cache_read = 2;
+        usage.cache_write = 4;
+        usage.cache_write_1h = Some(1);
+        usage.reasoning = Some(2);
+        usage.total_tokens = 16;
+        usage.cost.input = 0.5;
+        usage.cost.total = 0.75;
+        let result = AgentToolResult {
+            content: vec![TextContentOrImage::Image(ImageContent {
+                kind: rpi_ai::types::ImageContentType,
+                data: "AAEC+/==".into(),
+                mime_type: "image/png".into(),
+            })],
+            details: details.clone(),
+            usage: Some(usage),
+            added_tool_names: vec!["read".into(), "read".into(), "写".into()],
+            terminate: true,
+        };
+        assert_eq!(
+            serde_json::to_value(&result).unwrap(),
+            json!({
+                "content":[{"type":"image", "data":"AAEC+/==", "mimeType":"image/png"}],
+                "details":details,
+                "usage":{"input":7,"output":3,"cacheRead":2,"cacheWrite":4,
+                    "cacheWrite1h":1,"reasoning":2,"totalTokens":16,
+                    "cost":{"input":0.5,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":0.75}},
+                "addedToolNames":["read","read","写"], "terminate":true,
+            })
+        );
+    }
+
+    #[test]
+    fn borrowed_writer_counts_large_unicode_and_image_without_a_payload_value() {
+        #[derive(Default)]
+        struct ByteCounter {
+            bytes: usize,
+            chunks: usize,
+        }
+        impl Write for ByteCounter {
+            fn write(&mut self, chunk: &[u8]) -> io::Result<usize> {
+                self.bytes += chunk.len();
+                self.chunks += 1;
+                Ok(chunk.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut result = AgentToolResult::text("界😀é\"\\\n".repeat(150_000));
+        result.content.push(TextContentOrImage::Image(ImageContent {
+            kind: rpi_ai::types::ImageContentType,
+            data: "aGVsbG8=".repeat(150_000).into(),
+            mime_type: "image/webp".into(),
+        }));
+        let mut counter = ByteCounter::default();
+        serde_json::to_writer(&mut counter, &result).unwrap();
+        let encoded = serde_json::to_string(&result).unwrap();
+        assert!(counter.bytes > 1024 * 1024);
+        assert!(counter.chunks > 10);
+        assert_eq!(counter.bytes, encoded.len());
+        assert!(encoded.len() > encoded.chars().count());
+        assert_eq!(result.content.len(), 2);
+    }
+
+    #[test]
+    fn borrowed_writer_propagates_io_failure() {
+        struct FailingWriter;
+        impl Write for FailingWriter {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::other("journal unavailable"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let result = AgentToolResult::text("still owned");
+        let error = serde_json::to_writer(FailingWriter, &result).unwrap_err();
+        assert!(error.is_io());
+        assert!(error.to_string().contains("journal unavailable"));
+        assert_eq!(
+            result.content,
+            vec![TextContentOrImage::text("still owned")]
+        );
+    }
 }

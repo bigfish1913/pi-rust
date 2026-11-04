@@ -35,8 +35,12 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock, Weak};
 
 // Opaque, non-reused IDs, never addresses. A copied PluginApi may outlive its
 // registration (e.g. a failed reload); resolving it must not dereference freed memory.
-static BRIDGES: OnceLock<Mutex<HashMap<usize, Weak<ActionBridge>>>> = OnceLock::new();
-fn bridges() -> &'static Mutex<HashMap<usize, Weak<ActionBridge>>> {
+struct RegistryEntry {
+    bridge: Weak<ActionBridge>,
+    active: Weak<AtomicBool>,
+}
+static BRIDGES: OnceLock<Mutex<HashMap<usize, RegistryEntry>>> = OnceLock::new();
+fn bridges() -> &'static Mutex<HashMap<usize, RegistryEntry>> {
     BRIDGES.get_or_init(Mutex::default)
 }
 thread_local! {
@@ -554,6 +558,14 @@ pub type SideQuestionSink =
 /// are routed directly by the plugin bridge.
 #[async_trait::async_trait]
 pub trait RuntimeActionHost: Send + Sync {
+    /// Action 30: an authenticated host-owned executing invocation, never registry JSON.
+    async fn tool_program(
+        &self,
+        capability: Arc<rpi_agent::tool_program::ToolProgram>,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        capability.handle(args).await
+    }
     /// Revoke side questions when their plugin bridge is retired.
     fn cancel_side_questions(&self, _owner: u64) {}
     /// Host-internal TUI snapshots; never exposed as a cross-owner plugin action.
@@ -784,6 +796,7 @@ pub struct ActionBridge {
     /// Some(child) only for a live host-created tool invocation.
     invocation: Option<(bool, String, tokio_util::sync::CancellationToken)>,
     execution_context: Option<serde_json::Value>,
+    tool_program: Option<Arc<rpi_agent::tool_program::ToolProgram>>,
     stdio: crate::StdioLifecycle,
     plugin_identity: Option<(u64, String)>,
     component_owners: Arc<std::sync::Mutex<Vec<u64>>>,
@@ -817,7 +830,7 @@ impl ActionBridge {
         let mut registry = bridges().lock().unwrap_or_else(|e| e.into_inner());
         if let Some((&id, _)) = registry
             .iter()
-            .find(|(_, weak)| weak.as_ptr() == Arc::as_ptr(self))
+            .find(|(_, entry)| entry.bridge.as_ptr() == Arc::as_ptr(self))
         {
             return id as *mut c_void;
         }
@@ -829,7 +842,13 @@ impl ActionBridge {
                 Err(current) => id = current,
             }
         }
-        registry.insert(id, Arc::downgrade(self));
+        registry.insert(
+            id,
+            RegistryEntry {
+                bridge: Arc::downgrade(self),
+                active: Arc::downgrade(&self.active),
+            },
+        );
         id as *mut c_void
     }
     pub(crate) fn resolve_handle(id: usize) -> Option<Arc<Self>> {
@@ -837,16 +856,21 @@ impl ActionBridge {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&id)
-            .and_then(Weak::upgrade)
+            .and_then(|entry| entry.bridge.upgrade())
     }
     pub(crate) fn for_invocation(
         &self,
         child: bool,
         signal: tokio_util::sync::CancellationToken,
     ) -> Arc<Self> {
+        let tool_program = rpi_agent::tool_program::current();
+        if let Some(program) = &tool_program {
+            program.bind_signal(signal.clone());
+        }
         Arc::new(Self {
             invocation: Some((child, uuid::Uuid::new_v4().to_string(), signal)),
             execution_context: rpi_agent::tool_execution_scope::execution_context(),
+            tool_program,
             stdio: self.stdio.clone(),
             plugin_identity: self.plugin_identity.clone(),
             component_owners: self.component_owners.clone(),
@@ -858,6 +882,43 @@ impl ActionBridge {
             editor_text: self.editor_text.clone(),
             active: self.active.clone(),
         })
+    }
+    /// Native receipt selection uses the driver-captured invocation, never a
+    /// task-local lookup on a blocking worker or a registration/root binding.
+    pub(crate) fn resolve_result_reference(
+        &self,
+        id: &str,
+    ) -> Result<(rpi_agent::AgentToolResult, bool), String> {
+        if !self.is_active()
+            || !self
+                .invocation
+                .as_ref()
+                .is_some_and(|(_, _, signal)| !signal.is_cancelled())
+        {
+            return Err("result reference requires a live invocation bridge".into());
+        }
+        self.tool_program
+            .as_ref()
+            .ok_or("result reference requires an effective ToolProgram")?
+            .resolve_result_reference(id)
+    }
+    /// Content-only plans use the same captured live authority as full receipts.
+    pub(crate) fn resolve_content_parts(
+        &self,
+        parts: Vec<rpi_agent::tool_program::ToolProgramContentPart>,
+    ) -> Result<Vec<rpi_agent::TextContentOrImage>, String> {
+        if !self.is_active()
+            || !self
+                .invocation
+                .as_ref()
+                .is_some_and(|(_, _, signal)| !signal.is_cancelled())
+        {
+            return Err("content parts require a live invocation bridge".into());
+        }
+        self.tool_program
+            .as_ref()
+            .ok_or("content parts require an effective ToolProgram")?
+            .resolve_content_parts(parts)
     }
     pub(crate) fn invocation_key(&self) -> Option<&str> {
         self.invocation.as_ref().map(|(_, key, _)| key.as_str())
@@ -873,6 +934,7 @@ impl ActionBridge {
     pub fn new(runtime: Handle, host: Arc<dyn RuntimeActionHost>) -> Arc<Self> {
         Arc::new(Self {
             invocation: None,
+            tool_program: None,
             execution_context: None,
             stdio: crate::StdioLifecycle::default(),
             plugin_identity: None,
@@ -912,6 +974,7 @@ impl ActionBridge {
     ) -> Arc<Self> {
         Arc::new(Self {
             invocation: None,
+            tool_program: None,
             execution_context: None,
             stdio: crate::StdioLifecycle::default(),
             plugin_identity: None,
@@ -937,6 +1000,7 @@ impl ActionBridge {
     ) -> Arc<Self> {
         Arc::new(Self {
             invocation: None,
+            tool_program: None,
             execution_context: None,
             stdio: crate::StdioLifecycle::default(),
             plugin_identity: None,
@@ -960,6 +1024,7 @@ impl ActionBridge {
             .push(owner);
         Arc::new(Self {
             invocation: None,
+            tool_program: None,
             execution_context: None,
             component_owners: self.component_owners.clone(),
             stdio: self.stdio.clone(),
@@ -1024,12 +1089,35 @@ impl ActionBridge {
             }
             owners.clone()
         };
+        // Cancel captured capabilities across FFI thread hops on reload/session retirement.
+        let live = self.bridges_for_owner();
+        for bridge in live {
+            if let Some(program) = &bridge.tool_program {
+                program.cancel_all();
+            }
+        }
         // Host cancellation may contend with a job publishing through its
         // sink. Never invoke it while holding the sink's lifecycle gate.
         for owner in owners {
             self.host.cancel_child_agents(owner);
             self.host.cancel_side_questions(owner);
         }
+    }
+
+    fn bridges_for_owner(&self) -> Vec<Arc<Self>> {
+        let active = Arc::downgrade(&self.active);
+        // Filter weak owner identity BEFORE upgrading: even a transient upgrade
+        // of another session's invocation delays its immediate handle retirement.
+        // The weak metadata keeps that allocation's identity from being reused.
+        // Collect every upgraded Arc out of the registry lock; dropping a last
+        // Arc here would deadlock when ActionBridge::drop locks the registry.
+        bridges()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter(|entry| entry.active.ptr_eq(&active))
+            .filter_map(|entry| entry.bridge.upgrade())
+            .collect()
     }
 
     /// Whether this bridge is still the live session's bridge.
@@ -1213,6 +1301,7 @@ async fn dispatch(
         RuntimeActionId::SetEditorText => editor_text.handle(args),
         RuntimeActionId::GetSessionBranch => host.get_session_branch(args).await,
         RuntimeActionId::GetExecutionContext => host.get_execution_context(args).await,
+        RuntimeActionId::ToolProgram => Err("ToolProgram requires a live invocation bridge".into()),
         RuntimeActionId::ChildAgent => Err("ChildAgent requires a plugin bridge".into()),
         RuntimeActionId::SideQuestion => Err("SideQuestion requires a plugin bridge".into()),
         RuntimeActionId::ListCommands => host.list_commands(args).await,
@@ -1428,6 +1517,45 @@ fn run_action(
             bridge.runtime.spawn(async move {
                 let _ = tx.send(host.side_question(owner, args, sink).await);
             });
+        }
+    } else if action == RuntimeActionId::GetActiveTools && bridge.tool_program.is_some() {
+        let tools = bridge
+            .tool_program
+            .as_ref()
+            .expect("checked")
+            .active_tool_names();
+        let _ = tx.send(Ok(serde_json::json!({"tools":tools})));
+    } else if action == RuntimeActionId::SetActiveTools && bridge.execution_context.is_some() {
+        let _ = tx.send(Err(
+            "cannot replace active tools from a narrowed execution".into()
+        ));
+    } else if action == RuntimeActionId::ToolProgram {
+        let cleanup = matches!(
+            args.get("op").and_then(serde_json::Value::as_str),
+            Some("poll" | "cancel" | "dispose" | "release_result")
+        );
+        let authenticated = bridge.invocation.as_ref().is_some_and(|(_, key, signal)| {
+            (cleanup || !signal.is_cancelled())
+                && (invocation_thread
+                    || runtime_key.as_ref().and_then(serde_json::Value::as_str)
+                        == Some(key.as_str()))
+        });
+        if let Some(capability) = bridge.tool_program.clone().filter(|_| authenticated) {
+            let signal = bridge.invocation.as_ref().expect("authenticated").2.clone();
+            bridge.runtime.spawn(async move {
+                if signal.is_cancelled() {
+                    capability.cancel_all();
+                    if !cleanup {
+                        let _ = tx.send(Err("parent invocation is no longer active".into()));
+                        return;
+                    }
+                }
+                let _ = tx.send(host.tool_program(capability, args).await);
+            });
+        } else {
+            let _ = tx.send(Err(
+                "ToolProgram requires an authenticated executing invocation".into(),
+            ));
         }
     } else if action == RuntimeActionId::ChildAgent {
         // A registration handle cannot assert that it is a parent invocation.
@@ -2500,7 +2628,7 @@ impl Drop for ActionBridge {
         bridges()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .retain(|_, weak| !std::ptr::eq(weak.as_ptr(), self));
+            .retain(|_, entry| !std::ptr::eq(entry.bridge.as_ptr(), self));
         if self.invocation.is_some() {
             return;
         }

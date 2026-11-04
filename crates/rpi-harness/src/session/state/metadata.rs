@@ -1,5 +1,5 @@
 //! Small, typed facts derived from a validated entry; never a placeholder Entry.
-use crate::session::types::{Entry, EntryOrder, EntryQuery};
+use crate::session::types::{is_tool_program_body_type, Entry, EntryOrder, EntryQuery};
 use rpi_agent::message::{AgentMessage, AgentMessageRole};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -97,7 +97,12 @@ impl EntryMeta {
     /// Only reject using facts actually in the index. Tool/outbox predicates
     /// MUST be applied to the complete hydrated entry, before enforcing limit.
     pub(crate) fn matches_query(&self, query: &EntryQuery) -> bool {
-        query.entry_type.is_none_or(|kind| self.kind == kind)
+        !(query.exclude_tool_program_bodies
+            && self
+                .custom_type
+                .as_deref()
+                .is_some_and(is_tool_program_body_type))
+            && query.entry_type.is_none_or(|kind| self.kind == kind)
             && query
                 .custom_type
                 .as_deref()

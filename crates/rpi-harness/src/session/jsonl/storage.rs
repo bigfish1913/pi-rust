@@ -1562,6 +1562,14 @@ impl SessionStorage for JsonlSessionStorage {
         Ok(Some(plan.read().await?))
     }
 
+    async fn branch_ancestry(
+        &self,
+        bounds: &BranchBounds,
+        start: &str,
+    ) -> SessionResult<Vec<crate::session::types::EntryAncestry>> {
+        self.state.lock().await.branch_ancestry(bounds, start)
+    }
+
     async fn context_on_branch(
         &self,
         bounds: &BranchBounds,

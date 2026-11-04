@@ -2193,6 +2193,7 @@ name = "rpi-harness"
 version = "0.18.0"
 dependencies = [
  "async-trait",
+ "base64",
  "futures",
  "rpi-agent",
  "rpi-ai",

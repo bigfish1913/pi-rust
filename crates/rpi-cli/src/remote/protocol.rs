@@ -272,26 +272,8 @@ impl RemoteEvent {
 /// Serialize a tool result into the stable wire shape (content blocks, details,
 /// usage, and the batch hints).
 pub fn tool_result_json(result: &AgentToolResult) -> Value {
-    let content: Vec<Value> = result
-        .content
-        .iter()
-        .map(|item| match item {
-            rpi_agent::types::TextContentOrImage::Text(text) => serde_json::json!({
-                "type": "text",
-                "text": text.text,
-            }),
-            rpi_agent::types::TextContentOrImage::Image(image) => {
-                serde_json::to_value(image).unwrap_or(Value::Null)
-            }
-        })
-        .collect();
-    serde_json::json!({
-        "content": content,
-        "details": result.details,
-        "usage": result.usage.as_ref().and_then(|usage| serde_json::to_value(usage).ok()),
-        "addedToolNames": result.added_tool_names,
-        "terminate": result.terminate,
-    })
+    serde_json::to_value(result)
+        .expect("AgentToolResult contains only JSON-serializable native content, details and usage")
 }
 
 /// A command sent from the client to the server (`{"id":…,"type":…,…}`).
@@ -422,6 +404,73 @@ pub struct PromptOutcome {
 mod tests {
     use super::*;
     use rpi_agent::types::AgentToolResult;
+
+    fn signed_native_result() -> AgentToolResult {
+        use rpi_agent::types::TextContentOrImage;
+        AgentToolResult {
+            content: vec![
+                TextContentOrImage::Text(
+                    serde_json::from_value(serde_json::json!({
+                        "type":"text", "text":"signed 界😀", "textSignature":
+                            "{ \"version\": 1, \"id\": \"sig-😀\" }",
+                    }))
+                    .unwrap(),
+                ),
+                TextContentOrImage::Image(
+                    serde_json::from_value(serde_json::json!({
+                        "type":"image", "data":"AAEC+/==", "mimeType":"image/png",
+                    }))
+                    .unwrap(),
+                ),
+            ],
+            details: serde_json::json!({"runtimeKey":"business", "runtimeHandle":{"id":7},
+                "__rpi":{"owner":"customer"}, "__rpiRuntimeKey":"unchanged"}),
+            usage: Some(rpi_ai::types::Usage::zero()),
+            added_tool_names: vec!["read".into(), "read".into()],
+            terminate: true,
+        }
+    }
+
+    #[test]
+    fn tool_update_preserves_canonical_native_result_and_text_signature() {
+        let result = signed_native_result();
+        let expected = serde_json::to_value(&result).unwrap();
+        let event = AgentEvent::ToolExecutionUpdate {
+            tool_call_id: "call".into(),
+            tool_name: "read".into(),
+            args: serde_json::json!({"path":"file"}),
+            partial_result: result.into(),
+        };
+        let wire = serde_json::to_value(RemoteEvent::from_agent_event(&event)).unwrap();
+        assert_eq!(wire["type"], "tool_execution_update");
+        assert_eq!(wire["partialResult"], expected);
+        assert_eq!(
+            wire["partialResult"]["content"][0]["textSignature"],
+            "{ \"version\": 1, \"id\": \"sig-😀\" }"
+        );
+        assert!(wire["partialResult"].get("isError").is_none());
+    }
+
+    #[test]
+    fn tool_end_preserves_canonical_native_result_and_separate_error_authority() {
+        let result = signed_native_result();
+        let expected = serde_json::to_value(&result).unwrap();
+        let event = AgentEvent::ToolExecutionEnd {
+            tool_call_id: "call".into(),
+            tool_name: "read".into(),
+            result,
+            is_error: true,
+        };
+        let wire = serde_json::to_value(RemoteEvent::from_agent_event(&event)).unwrap();
+        assert_eq!(wire["type"], "tool_execution_end");
+        assert_eq!(wire["result"], expected);
+        assert!(wire["result"]["content"][0]["textSignature"].is_string());
+        assert_eq!(wire["isError"], true);
+        assert!(wire["result"].get("isError").is_none());
+        let plain = tool_result_json(&AgentToolResult::text("unsigned"));
+        assert!(plain["content"][0].get("textSignature").is_none());
+        assert!(plain["usage"].is_null());
+    }
 
     /// The queue depth must survive the native remote projection: a client that
     /// never sees it cannot render the "N queued" indicator.

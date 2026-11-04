@@ -42,16 +42,33 @@ impl AgentTool for ToolExecutionBarrier {
         if signal.is_cancelled() || self.signal.is_cancelled() {
             return Err(AgentError::Abort);
         }
-        if let Err(error) = self
-            .settle
-            .start_tool(
-                &self.harness,
-                tool_call_id,
-                &self.tool.schema().name,
-                &params,
-            )
-            .await
+        let parent = rpi_agent::tool_program::nested_parent();
+        if parent.is_some()
+            && serde_json::to_vec(&params).map_or(true, |bytes| bytes.len() > 1024 * 1024)
         {
+            return Err(AgentError::tool("nested prepared arguments exceed 1 MiB"));
+        }
+        let checkpoint = if let Some(parent) = &parent {
+            self.settle
+                .start_nested_tool(
+                    &self.harness,
+                    parent,
+                    tool_call_id,
+                    &self.tool.schema().name,
+                    &params,
+                )
+                .await
+        } else {
+            self.settle
+                .start_tool(
+                    &self.harness,
+                    tool_call_id,
+                    &self.tool.schema().name,
+                    &params,
+                )
+                .await
+        };
+        if let Err(error) = checkpoint {
             let message = error.to_string();
             self.write_error
                 .lock()
@@ -63,13 +80,38 @@ impl AgentTool for ToolExecutionBarrier {
             tracing::warn!(%error, tool_call_id, "refusing execution without a durable tool checkpoint");
             return Err(AgentError::tool(message));
         }
-        // Cancellation may arrive during the storage await. An acknowledged
-        // marker is conservative intent, not proof execute was entered.
+        // The native observation receives effective arguments only after the
+        // existing Never-replay checkpoint has ACKed, still before effects. It
+        // is not a substitute for that checkpoint or an execution authority.
+        if parent.is_some() {
+            if let Some(observation) = rpi_agent::tool_program_observation::current_observation() {
+                if let Err(message) = observation.prepared(&params).await {
+                    self.write_error
+                        .lock()
+                        .unwrap()
+                        .get_or_insert(message.clone());
+                    self.signal.cancel();
+                    return Err(AgentError::tool(message));
+                }
+            }
+        }
+        // Cancellation may arrive during either storage await. Acknowledged
+        // intent/prepared arguments are not proof execute was entered.
         if signal.is_cancelled() || self.signal.is_cancelled() {
             return Err(AgentError::Abort);
         }
-        self.tool
+        let result = self
+            .tool
             .execute(tool_call_id, params, signal, on_update)
-            .await
+            .await;
+        if let Some(parent) = parent {
+            if let Err(error) = self.harness.append_custom_entry("rpi.tool_program.finished.v1", Some(serde_json::json!({"rootToolCallId":parent.root_id,"parentToolCallId":parent.parent_id,"requestId":tool_call_id,"isError":result.is_err()}))).await {
+                self.signal.cancel();
+                self.write_error.lock().unwrap().get_or_insert(error.to_string());
+                // Preserve the actual effect result (including terminate/usage)
+                // while the run reports the persistence failure separately.
+            }
+        }
+        result
     }
 }

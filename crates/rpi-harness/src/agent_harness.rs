@@ -1261,6 +1261,7 @@ impl AgentHarness {
             let entries = match view
                 .find_entries_on_branch(
                     &EntryQuery {
+                        exclude_tool_program_bodies: true,
                         order: Some(EntryOrder::NewestFirst),
                         limit: Some(16),
                         cursor,
@@ -3299,6 +3300,7 @@ impl AgentHarness {
             .view(lane)
             .find_entries_on_branch(
                 &EntryQuery {
+                    exclude_tool_program_bodies: true,
                     order: Some(EntryOrder::NewestFirst),
                     ..Default::default()
                 },
@@ -3446,6 +3448,7 @@ impl AgentHarness {
             .view(lane)
             .find_entries_on_branch(
                 &EntryQuery {
+                    exclude_tool_program_bodies: true,
                     order: Some(EntryOrder::OldestFirst),
                     ..Default::default()
                 },
@@ -3480,6 +3483,7 @@ impl AgentHarness {
             .view(lane)
             .find_entries_on_branch(
                 &EntryQuery {
+                    exclude_tool_program_bodies: true,
                     order: Some(EntryOrder::OldestFirst),
                     ..Default::default()
                 },
@@ -3810,6 +3814,7 @@ impl AgentHarness {
             return Ok(Vec::new());
         };
         let query = EntryQuery {
+            exclude_tool_program_bodies: true,
             order: Some(EntryOrder::OldestFirst),
             ..Default::default()
         };

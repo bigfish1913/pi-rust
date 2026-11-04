@@ -33,7 +33,9 @@ use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+mod public_binding;
 mod wake;
+use public_binding::PublicBindingGuard;
 
 use crate::host_free_string;
 use crate::loader::PluginKeepalive;
@@ -175,6 +177,244 @@ fn json_to_result(text: &str) -> AgentToolResult {
         }
     }
     result
+}
+
+/// Validate nonempty, padded standard base64, including unused padding bits.
+fn canonical_image_base64(data: &str) -> bool {
+    if data.is_empty() || !data.len().is_multiple_of(4) {
+        return false;
+    }
+    let payload = data.trim_end_matches('=');
+    let padding = data.len() - payload.len();
+    if padding > 2 {
+        return false;
+    }
+    let sextet = |byte| match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    };
+    if !payload.bytes().all(|byte| sextet(byte).is_some()) {
+        return false;
+    }
+    let last = payload.bytes().last().and_then(sextet).unwrap_or(0);
+    match padding {
+        0 => true,
+        1 => last & 0b11 == 0,
+        2 => last & 0b1111 == 0,
+        _ => false,
+    }
+}
+
+/// Done decoding is opt-in; legacy tools keep the historical lenient parser.
+fn done_to_result(text: &str, envelope: bool) -> Result<AgentToolResult, AgentError> {
+    if !envelope {
+        return Ok(json_to_result(text));
+    }
+    parse_result_envelope(text)
+        .map_err(|error| AgentError::tool(format!("invalid tool result envelope: {error}")))?
+}
+fn done_with_invocation(
+    text: &str,
+    envelope: bool,
+    invocation: Option<&crate::ActionBridge>,
+) -> Result<AgentToolResult, AgentError> {
+    if !envelope {
+        return done_to_result(text, false);
+    }
+    parse_result_envelope_with(text, invocation)
+        .map_err(|error| AgentError::tool(format!("invalid tool result envelope: {error}")))?
+}
+fn parse_result_envelope(text: &str) -> Result<Result<AgentToolResult, AgentError>, String> {
+    parse_result_envelope_with(text, None)
+}
+fn parse_result_envelope_with(
+    text: &str,
+    invocation: Option<&crate::ActionBridge>,
+) -> Result<Result<AgentToolResult, AgentError>, String> {
+    if text.len() > 1024 * 1024 {
+        return Err("exceeds 1 MiB".into());
+    }
+    let value: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    if value["$rpiToolResult"].as_u64() != Some(1) {
+        return Err("unsupported or missing version".into());
+    }
+    let is_error = value["isError"]
+        .as_bool()
+        .ok_or("isError must be boolean")?;
+    if let Some(reference) = value.get("resultReference") {
+        if value.get("result").is_some() {
+            return Err("result and resultReference are mutually exclusive".into());
+        }
+        if value.get("contentParts").is_some() {
+            return Err("contentParts and resultReference are mutually exclusive".into());
+        }
+        let reference = reference
+            .as_object()
+            .ok_or("resultReference must be an object")?;
+        if reference.get("version").and_then(Value::as_u64) != Some(1) {
+            return Err("unsupported result reference version".into());
+        }
+        let id = reference
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or("result reference id is required")?;
+        let (result, host_error) = invocation
+            .ok_or("result reference requires a live invocation bridge")?
+            .resolve_result_reference(id)?;
+        if is_error != host_error {
+            return Err("result reference isError does not match host outcome".into());
+        }
+        return Ok(if host_error {
+            Err(AgentError::StructuredTool(Box::new(result)))
+        } else {
+            Ok(result)
+        });
+    }
+    let result = value["result"]
+        .as_object()
+        .ok_or("result must be an object")?;
+    let content = if let Some(parts) = value.get("contentParts") {
+        if result.contains_key("content") {
+            return Err("result.content is forbidden with contentParts".into());
+        }
+        let parts = parse_content_parts(parts)?;
+        invocation
+            .ok_or("content parts require a live invocation bridge")?
+            .resolve_content_parts(parts)?
+    } else {
+        parse_inline_content(result.get("content").ok_or("content must be an array")?)?
+    };
+    let details = result.get("details").ok_or("details is required")?.clone();
+    let terminate = result
+        .get("terminate")
+        .and_then(Value::as_bool)
+        .ok_or("terminate must be boolean")?;
+    let usage: Option<rpi_ai::types::Usage> = result
+        .get("usage")
+        .filter(|v| !v.is_null())
+        .map(|v| serde_json::from_value(v.clone()))
+        .transpose()
+        .map_err(|e| e.to_string())?;
+    let added_tool_names: Vec<String> = result
+        .get("addedToolNames")
+        .map(|v| serde_json::from_value(v.clone()))
+        .transpose()
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
+    if added_tool_names.len() > 256 || added_tool_names.iter().any(|name| name.len() > 256) {
+        return Err("addedToolNames exceeds limit".into());
+    }
+    let result = AgentToolResult {
+        content,
+        details,
+        terminate,
+        usage,
+        added_tool_names,
+    };
+    Ok(if is_error {
+        Err(AgentError::StructuredTool(Box::new(result)))
+    } else {
+        Ok(result)
+    })
+}
+
+/// Shared strict inline parser for legacy envelopes and attachment parts.
+fn parse_inline_content(value: &Value) -> Result<Vec<TextContentOrImage>, String> {
+    let blocks = value.as_array().ok_or("content must be an array")?;
+    if blocks.len() > 256 {
+        return Err("content exceeds 256 blocks".into());
+    }
+    let mut content = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        content.push(match block["type"].as_str() {
+            Some("text") => TextContentOrImage::Text(
+                serde_json::from_value(block.clone()).map_err(|e| e.to_string())?,
+            ),
+            Some("image") => {
+                let image: rpi_ai::types::ImageContent =
+                    serde_json::from_value(block.clone()).map_err(|e| e.to_string())?;
+                if !matches!(
+                    image.mime_type.as_str(),
+                    "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+                ) || image.data.is_empty()
+                {
+                    return Err("invalid image MIME/data".into());
+                }
+                if !canonical_image_base64(&image.data) {
+                    return Err("invalid image base64".into());
+                }
+                TextContentOrImage::Image(image)
+            }
+            _ => return Err("unsupported content block".into()),
+        });
+    }
+    Ok(content)
+}
+
+fn parse_content_parts(
+    value: &Value,
+) -> Result<Vec<rpi_agent::tool_program::ToolProgramContentPart>, String> {
+    use rpi_agent::tool_program::ToolProgramContentPart;
+    let parts = value.as_array().ok_or("contentParts must be an array")?;
+    if parts.len() > 256 {
+        return Err("content exceeds 256 parts".into());
+    }
+    let mut parsed = Vec::with_capacity(parts.len());
+    let mut inline_blocks = 0;
+    for part in parts {
+        let part = part.as_object().ok_or("content part must be an object")?;
+        if part.contains_key("content") {
+            if part.len() != 1 {
+                return Err("inline part must contain only content".into());
+            }
+            let blocks = parse_inline_content(&part["content"])?;
+            inline_blocks += blocks.len();
+            if inline_blocks > 256 {
+                return Err("content exceeds 256 blocks".into());
+            }
+            parsed.push(ToolProgramContentPart::Inline(blocks));
+        } else {
+            if part.keys().any(|k| k != "reference" && k != "indices") {
+                return Err("unknown content reference part key".into());
+            }
+            let reference = part
+                .get("reference")
+                .and_then(Value::as_object)
+                .ok_or("content part requires content or reference")?;
+            if reference.len() != 2 || reference.get("version").and_then(Value::as_u64) != Some(1) {
+                return Err("invalid content reference version/keys".into());
+            }
+            let id = reference
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or("content reference id is required")?
+                .to_owned();
+            let indices = match part.get("indices") {
+                None | Some(Value::Null) => None,
+                Some(Value::Array(values)) if values.len() <= 256 => Some(
+                    values
+                        .iter()
+                        .map(|v| {
+                            v.as_u64()
+                                .and_then(|n| usize::try_from(n).ok())
+                                .ok_or_else(|| {
+                                    "indices must contain nonnegative integers".to_owned()
+                                })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                ),
+                _ => return Err("indices must be null or an array of at most 256 integers".into()),
+            };
+            parsed.push(ToolProgramContentPart::Reference { id, indices });
+        }
+    }
+    Ok(parsed)
 }
 
 // ---------------------------------------------------------------------------
@@ -349,6 +589,7 @@ impl PluginToolAdapter {
 struct PartialCallbackContext {
     sender: mpsc::UnboundedSender<AgentToolResult>,
     plugin_free: FreeStringFn,
+    public_binding: PublicBindingGuard,
 }
 
 /// The blocking driver owns the callback context until poll returns. The
@@ -367,7 +608,9 @@ extern "C" fn partial_cb_trampoline(partial: StbString, user_data: *mut c_void) 
         let context = unsafe { &*user_data.cast::<PartialCallbackContext>() };
         // SAFETY: the plugin transfers a live partial and its registered free fn.
         let owned = unsafe { OwnedString::from_raw(partial, Some(context.plugin_free)) };
-        let result = json_to_result(&owned.to_string_lossy());
+        let result = context
+            .public_binding
+            .result(json_to_result(&owned.to_string_lossy()));
         let _ = context.sender.send(result);
     }));
     if outcome.is_err() {
@@ -396,9 +639,12 @@ impl AgentTool for PluginToolAdapter {
     }
 
     fn execution_mode(&self) -> ToolExecutionMode {
-        // Plugin tools default to Parallel (the AgentTool default). A plugin
-        // could declare Sequential via a future schema field; v1 keeps Parallel.
-        ToolExecutionMode::Parallel
+        // A JSON Schema extension keyword works with old SDK raw registration.
+        if self.schema.parameters.as_value()["x-rpi-execution-mode"] == "sequential" {
+            ToolExecutionMode::Sequential
+        } else {
+            ToolExecutionMode::Parallel
+        }
     }
 
     async fn execute(
@@ -465,6 +711,7 @@ impl AgentTool for PluginToolAdapter {
             context["runtimeHandle"] = serde_json::json!(invocation.user_data() as usize);
             context["runtimeKey"] = serde_json::json!(invocation.invocation_key());
         }
+        let public_binding = PublicBindingGuard::capture(&params, invocation.as_deref());
         let params_json = serde_json::to_string(&params).unwrap_or_else(|_| "null".to_string());
         let params_stb = StbString::from_string(params_json);
         let tool_call_id = tool_call_id.to_owned();
@@ -475,6 +722,7 @@ impl AgentTool for PluginToolAdapter {
         let cancel_fn = self.handle.cancel_fn;
         let destroy_fn = self.handle.destroy_fn;
 
+        let result_envelope = self.schema.parameters.as_value()["x-rpi-result-envelope"] == 1;
         let schema_name = self.schema.name.clone();
         let schema_name_for_error = schema_name.clone();
 
@@ -487,6 +735,7 @@ impl AgentTool for PluginToolAdapter {
         let callback_context = PartialCallbackContext {
             sender: partial_tx.clone(),
             plugin_free,
+            public_binding,
         };
         let keepalive = self.keepalive.clone();
         runtime.spawn_blocking(move || {
@@ -563,7 +812,9 @@ impl AgentTool for PluginToolAdapter {
                         if !progress.is_empty() {
                             // The plugin may also have pushed via the partial cb;
                             // both paths land in partial_rx. Forward this one too.
-                            let pr = json_to_result(&progress);
+                            let pr = callback_context
+                                .public_binding
+                                .result(json_to_result(&progress));
                             let _ = partial_tx.send(pr);
                         }
                         // poll is a nonblocking ABI. Empty Pending must not spin
@@ -572,11 +823,18 @@ impl AgentTool for PluginToolAdapter {
                         continue;
                     }
                     Step::Done(done) => {
-                        let result = json_to_result(&done);
-                        break Ok(result);
+                        break callback_context
+                            .public_binding
+                            .terminal(done_with_invocation(
+                                &done,
+                                result_envelope,
+                                invocation.as_deref(),
+                            ));
                     }
                     Step::Err(message) => {
-                        break Err(AgentError::Tool(message));
+                        break Err(AgentError::Tool(
+                            callback_context.public_binding.string(&message),
+                        ));
                     }
                 }
             };
@@ -726,6 +984,7 @@ mod tests {
         let context = PartialCallbackContext {
             sender,
             plugin_free: counted_plugin_free,
+            public_binding: PublicBindingGuard::default(),
         };
         partial_cb_trampoline(
             StbString::from_string("{}".into()),
@@ -829,6 +1088,379 @@ mod tests {
             constrained_sampling: None,
         };
         PluginToolAdapter::new(tool, stub_handle(), PluginKeepalive::empty())
+    }
+
+    #[test]
+    fn tool_program_sequential_metadata_supports_old_raw_schema() {
+        let mut adapter = echo_adapter();
+        assert_eq!(adapter.execution_mode(), ToolExecutionMode::Parallel);
+        adapter.schema.parameters = rpi_ai::types::Schema::new(serde_json::json!({
+            "type": "object", "x-rpi-execution-mode": "sequential"
+        }));
+        assert_eq!(adapter.execution_mode(), ToolExecutionMode::Sequential);
+    }
+
+    struct BindingHost;
+    #[async_trait]
+    impl crate::RuntimeActionHost for BindingHost {
+        async fn send_message(&self, _: Value) -> Result<Value, String> {
+            unreachable!("not called")
+        }
+        async fn send_user_message(&self, _: Value) -> Result<Value, String> {
+            unreachable!("not called")
+        }
+        async fn append_entry(&self, _: Value) -> Result<Value, String> {
+            unreachable!("not called")
+        }
+        async fn set_session_name(&self, _: Value) -> Result<Value, String> {
+            unreachable!("not called")
+        }
+        async fn get_active_tools(&self, _: Value) -> Result<Value, String> {
+            unreachable!("not called")
+        }
+        async fn set_active_tools(&self, _: Value) -> Result<Value, String> {
+            unreachable!("not called")
+        }
+        async fn set_model(&self, _: Value) -> Result<Value, String> {
+            unreachable!("not called")
+        }
+        async fn get_thinking_level(&self, _: Value) -> Result<Value, String> {
+            unreachable!("not called")
+        }
+        async fn set_thinking_level(&self, _: Value) -> Result<Value, String> {
+            unreachable!("not called")
+        }
+        async fn compact(&self, _: Value) -> Result<Value, String> {
+            unreachable!("not called")
+        }
+        async fn get_system_prompt(&self, _: Value) -> Result<Value, String> {
+            unreachable!("not called")
+        }
+        async fn new_session(&self, _: Value) -> Result<Value, String> {
+            unreachable!("not called")
+        }
+        async fn fork(&self, _: Value) -> Result<Value, String> {
+            unreachable!("not called")
+        }
+        async fn navigate_tree(&self, _: Value) -> Result<Value, String> {
+            unreachable!("not called")
+        }
+        async fn switch_session(&self, _: Value) -> Result<Value, String> {
+            unreachable!("not called")
+        }
+        async fn reload(&self, _: Value) -> Result<Value, String> {
+            unreachable!("not called")
+        }
+    }
+
+    extern "C" fn binding_waker(
+        _: StepHandle,
+        callback: Option<rpi_plugin_sdk::ToolWakeCb>,
+        data: *mut c_void,
+    ) {
+        // Retained notification allows the first Pending to resume immediately.
+        if let Some(callback) = callback {
+            callback(data);
+        }
+    }
+
+    fn binding_payload(params: &Value) -> Value {
+        let metadata = &params[rpi_plugin_sdk::HOST_CONTEXT_KEY];
+        let key = metadata["runtimeKey"]
+            .as_str()
+            .unwrap_or("no-binding-secret");
+        let business = json!({
+            "runtimeKey":"business-key", "runtimeHandle":42,
+            "__rpi":{"runtimeKey":"business-nested"},
+            "__rpiRuntimeKey":"business-legacy",
+            "schema":{"type":"object", "properties":{
+                "runtimeKey":{"type":"string"}, "__rpi":{"type":"object"}}}
+        });
+        let mut details = json!({
+            "alias":metadata, "secretAlias":key, "business":business,
+            "handle":metadata["runtimeHandle"],
+            "serialized":json!({"alias":metadata, "secret":key}).to_string(),
+            "embedded":format!("before:{key}:after"),
+            "collision":{key:"credential", "[redacted invocation credential]":"sibling"}
+        });
+        details[format!("prefix-{key}-suffix")] = json!("renamed");
+        let mut result = super::result_envelope_tests::envelope(false)["result"].clone();
+        result["content"] = json!([{"type":"text", "text":details.to_string(), "textSignature":"stable-signature"}]);
+        result["details"] = details;
+        result
+    }
+
+    extern "C" fn binding_poll(
+        handle: StepHandle,
+        callback: Option<ToolPartialCb>,
+        data: *mut c_void,
+    ) -> StepResult {
+        let params: Value =
+            serde_json::from_str(LAST_PARAMS.lock().unwrap().as_ref().unwrap()).unwrap();
+        let payload = binding_payload(&params);
+        if let Some(callback) = callback {
+            callback(StbString::from_string(payload.to_string()), data);
+        }
+        let entry = TEST_DRIVES.get(handle).unwrap();
+        let mut state = entry.lock();
+        state.polls += 1;
+        if state.polls == 1 {
+            return StepResult::pending(StbString::from_string(payload.to_string()));
+        }
+        match params["mode"].as_str().unwrap() {
+            "plain-error" => StepResult::err(StbString::from_string(format!(
+                "failure: {}",
+                payload["details"]
+            ))),
+            "legacy" => StepResult::done(StbString::from_string(payload.to_string())),
+            mode => StepResult::done(StbString::from_string(
+                json!({
+                    "$rpiToolResult":1, "isError":mode == "structured-error", "result":payload
+                })
+                .to_string(),
+            )),
+        }
+    }
+
+    fn assert_public_binding_result(result: &AgentToolResult, key: &str, envelope: bool) {
+        let public = result_to_json(result);
+        assert!(!public.contains(key), "credential escaped output guard");
+        assert!(result.details["alias"].is_null());
+        assert_eq!(
+            result.details["secretAlias"],
+            "[redacted invocation credential]"
+        );
+        assert_eq!(result.details["business"]["runtimeKey"], "business-key");
+        assert_eq!(result.details["business"]["runtimeHandle"], 42);
+        assert_eq!(
+            result.details["business"]["__rpi"]["runtimeKey"],
+            "business-nested"
+        );
+        assert_eq!(
+            result.details["business"]["__rpiRuntimeKey"],
+            "business-legacy"
+        );
+        assert_eq!(
+            result.details["business"]["schema"]["properties"]["runtimeKey"]["type"],
+            "string"
+        );
+        assert!(result.details["handle"].is_number());
+        assert_eq!(
+            result.details["prefix-[redacted invocation credential]-suffix"],
+            "renamed"
+        );
+        // Collision fails closed without silently retaining one of two siblings.
+        assert_eq!(
+            result.details["collision"],
+            "[redacted invocation credential]"
+        );
+        let serialized: Value =
+            serde_json::from_str(result.details["serialized"].as_str().unwrap()).unwrap();
+        assert!(serialized["alias"].is_null());
+        assert!(result.terminate);
+        assert_eq!(result.added_tool_names, ["native-added"]);
+        assert_eq!(result.usage.as_ref().unwrap().total_tokens, 3);
+        let TextContentOrImage::Text(text) = &result.content[0] else {
+            panic!("text expected")
+        };
+        if envelope {
+            assert_eq!(text.text_signature.as_deref(), Some("stable-signature"));
+        }
+        let text_json: Value = serde_json::from_str(&text.text).unwrap();
+        assert!(text_json["alias"].is_null());
+        assert_eq!(text_json["collision"], "[redacted invocation credential]");
+    }
+
+    #[tokio::test]
+    async fn invocation_credentials_are_guarded_before_both_drivers_publish_any_output() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let bridge =
+            crate::ActionBridge::new(tokio::runtime::Handle::current(), Arc::new(BindingHost));
+        for wake in [false, true] {
+            for mode in ["legacy", "envelope", "structured-error", "plain-error"] {
+                reset_counters();
+                let mut adapter = echo_adapter().with_context(ToolCallContext::new("business-cwd"));
+                adapter.handle.runtime_handle = Some(bridge.user_data() as usize);
+                adapter.handle.poll_fn = binding_poll;
+                if wake {
+                    adapter.handle.set_waker_fn = Some(binding_waker);
+                }
+                if mode != "legacy" {
+                    adapter.schema.parameters =
+                        rpi_ai::types::Schema::new(json!({"x-rpi-result-envelope":1}));
+                }
+                let observed = Arc::new(Mutex::new(Vec::new()));
+                let updates = observed.clone();
+                let result = adapter
+                    .execute(
+                        "binding",
+                        json!({"mode":mode}),
+                        CancellationToken::new(),
+                        Arc::new(move |partial| {
+                            // Validate at callback time, not just after execute returns.
+                            let params: Value =
+                                serde_json::from_str(LAST_PARAMS.lock().unwrap().as_ref().unwrap())
+                                    .unwrap();
+                            let key = params["__rpi"]["runtimeKey"].as_str().unwrap();
+                            assert_public_binding_result(&partial, key, false);
+                            updates.lock().unwrap().push(partial);
+                        }),
+                    )
+                    .await;
+                let params = take_last_params();
+                let key = params["__rpi"]["runtimeKey"].as_str().unwrap();
+                assert_eq!(observed.lock().unwrap().len(), 3); // 2 callbacks + Pending.
+                match result {
+                    Ok(result) => {
+                        assert!(mode == "legacy" || mode == "envelope");
+                        assert_public_binding_result(&result, key, mode == "envelope");
+                    }
+                    Err(AgentError::StructuredTool(result)) => {
+                        assert_eq!(mode, "structured-error");
+                        assert_public_binding_result(&result, key, true);
+                    }
+                    Err(AgentError::Tool(error)) => {
+                        assert_eq!(mode, "plain-error");
+                        assert!(error.starts_with("failure: "));
+                        assert!(!error.contains(key));
+                    }
+                    other => panic!("unexpected result: {other:?}"),
+                }
+                assert_eq!(DESTROY_COUNT.load(Ordering::SeqCst), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn no_binding_preserves_business_outputs_in_both_drivers() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        for wake in [false, true] {
+            for mode in ["legacy", "envelope", "structured-error", "plain-error"] {
+                let mut adapter = echo_adapter();
+                adapter.handle.poll_fn = binding_poll;
+                if wake {
+                    adapter.handle.set_waker_fn = Some(binding_waker);
+                }
+                if mode != "legacy" {
+                    adapter.schema.parameters =
+                        rpi_ai::types::Schema::new(json!({"x-rpi-result-envelope":1}));
+                }
+                let params = json!({"mode":mode, "__rpi":{
+                    "runtimeKey":"business-invocation-key", "runtimeHandle":37,
+                    "__rpiRuntimeKey":"business-old-key"
+                }});
+                let payload = binding_payload(&params);
+                let expected_partial = json_to_result(&payload.to_string());
+                let partial_json = result_to_json(&expected_partial);
+                let seen = Arc::new(AtomicUsize::new(0));
+                let updates = seen.clone();
+                let result = adapter
+                    .execute(
+                        "no-binding",
+                        params,
+                        CancellationToken::new(),
+                        Arc::new(move |partial| {
+                            assert_eq!(result_to_json(&partial), partial_json);
+                            updates.fetch_add(1, Ordering::SeqCst);
+                        }),
+                    )
+                    .await;
+                assert_eq!(seen.load(Ordering::SeqCst), 3);
+                let expected = result_to_json(&expected_partial);
+                match result {
+                    Ok(result) => assert_eq!(result_to_json(&result), expected),
+                    Err(AgentError::StructuredTool(result)) => {
+                        assert_eq!(mode, "structured-error");
+                        assert_eq!(result_to_json(&result), expected);
+                    }
+                    Err(AgentError::Tool(error)) => {
+                        assert_eq!(mode, "plain-error");
+                        assert_eq!(error, format!("failure: {}", payload["details"]));
+                    }
+                    other => panic!("unexpected result: {other:?}"),
+                }
+            }
+        }
+    }
+
+    static TERMINAL: Mutex<String> = Mutex::new(String::new());
+    extern "C" fn envelope_poll(
+        _: StepHandle,
+        _: Option<ToolPartialCb>,
+        _: *mut c_void,
+    ) -> StepResult {
+        StepResult::done(StbString::from_string(TERMINAL.lock().unwrap().clone()))
+    }
+    extern "C" fn no_wake(_: StepHandle, _: Option<rpi_plugin_sdk::ToolWakeCb>, _: *mut c_void) {}
+    #[tokio::test]
+    async fn opt_in_envelope_crosses_both_abi_drivers_and_legacy_done_stays_unchanged() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        for wake in [false, true] {
+            for opt_in in [false, true] {
+                for is_error in [false, true] {
+                    reset_counters();
+                    *TERMINAL.lock().unwrap() =
+                        super::result_envelope_tests::envelope(is_error).to_string();
+                    let mut adapter = echo_adapter();
+                    adapter.handle.poll_fn = envelope_poll;
+                    if wake {
+                        adapter.handle.set_waker_fn = Some(no_wake);
+                    }
+                    if opt_in {
+                        adapter.schema.parameters =
+                            rpi_ai::types::Schema::new(json!({"x-rpi-result-envelope":1}));
+                    }
+                    let result = adapter
+                        .execute("id", json!({}), CancellationToken::new(), Arc::new(|_| {}))
+                        .await;
+                    let result = if opt_in && is_error {
+                        match result.unwrap_err() {
+                            AgentError::StructuredTool(r) => *r,
+                            e => panic!("{e:?}"),
+                        }
+                    } else {
+                        result.unwrap()
+                    };
+                    assert_eq!(result.terminate, opt_in);
+                    assert_eq!(result.content.len(), if opt_in { 2 } else { 0 });
+                    if opt_in {
+                        assert!(matches!(result.content[1], TextContentOrImage::Image(_)));
+                        assert_eq!(result.details["summary"], "retained");
+                        assert_eq!(result.usage.unwrap().total_tokens, 3);
+                        assert_eq!(result.added_tool_names, vec!["native-added"]);
+                    }
+                    assert_eq!(DESTROY_COUNT.load(Ordering::SeqCst), 1);
+                }
+            }
+            // A registration opting in must not silently accept a legacy payload.
+            let mut adapter = echo_adapter();
+            adapter.schema.parameters =
+                rpi_ai::types::Schema::new(json!({"x-rpi-result-envelope":1}));
+            adapter.handle.poll_fn = envelope_poll;
+            if wake {
+                adapter.handle.set_waker_fn = Some(no_wake);
+            }
+            let mut invalid = vec![json!({})];
+            for image in super::result_envelope_tests::invalid_images() {
+                let mut value = super::result_envelope_tests::envelope(false);
+                value["result"]["content"] = json!([image]);
+                invalid.push(value);
+            }
+            for value in invalid {
+                reset_counters();
+                *TERMINAL.lock().unwrap() = value.to_string();
+                assert!(
+                    matches!(
+                        adapter
+                            .execute("id", json!({}), CancellationToken::new(), Arc::new(|_| {}))
+                            .await,
+                        Err(AgentError::Tool(_))
+                    ),
+                    "wake={wake}: {value}"
+                );
+                assert_eq!(DESTROY_COUNT.load(Ordering::SeqCst), 1);
+            }
+        }
     }
 
     fn reset_counters() {
@@ -1039,5 +1671,191 @@ mod tests {
         assert_eq!(seen["action"], "list");
         assert_eq!(seen["__rpi"]["cwd"], "D:\\proj");
         assert_eq!(seen["__rpi"]["sessionId"], "sess-42");
+    }
+}
+
+#[cfg(test)]
+mod result_envelope_tests {
+    use super::*;
+    use serde_json::json;
+    pub(super) fn envelope(is_error: bool) -> Value {
+        json!({"$rpiToolResult":1,"isError":is_error,"result":{
+            "content":[{"type":"text","text":"bounded failure summary"},{"type":"image","mimeType":"image/png","data":"AA=="}],
+            "details":{"summary":"retained"},"terminate":true,
+            "usage":{"input":1,"output":2,"cacheRead":0,"cacheWrite":0,"totalTokens":3,
+                "reasoning":1,"cacheWrite1h":2,"cost":{"input":0.1,"output":0.2,"cacheRead":0.0,"cacheWrite":0.0,"total":0.3}},
+            "addedToolNames":["native-added"]}})
+    }
+    #[test]
+    fn opted_in_success_and_error_preserve_all_native_metadata() {
+        for is_error in [false, true] {
+            let result = done_to_result(&envelope(is_error).to_string(), true);
+            let result = if is_error {
+                match result.unwrap_err() {
+                    AgentError::StructuredTool(result) => *result,
+                    error => panic!("{error:?}"),
+                }
+            } else {
+                result.unwrap()
+            };
+            assert_eq!(result.content.len(), 2);
+            assert!(matches!(result.content[1], TextContentOrImage::Image(_)));
+            assert_eq!(result.details["summary"], "retained");
+            assert!(result.terminate);
+            assert_eq!(result.usage.unwrap().reasoning, Some(1));
+            assert_eq!(result.added_tool_names, vec!["native-added"]);
+        }
+    }
+    #[test]
+    fn content_parts_require_live_bridge_even_for_inline_or_empty_plans() {
+        for parts in [
+            json!([]),
+            json!([{"content":[]}]),
+            json!([{"content":[{"type":"text","text":"inline"}]}]),
+        ] {
+            let value = json!({"$rpiToolResult":1,"isError":false,"result":{"details":null,"terminate":false},"contentParts":parts});
+            assert!(parse_result_envelope(&value.to_string())
+                .unwrap_err()
+                .contains("live invocation bridge"));
+        }
+    }
+    #[test]
+    fn content_parts_strict_shapes_and_shared_inline_validation() {
+        let mut bad = vec![
+            json!(null),
+            json!({}),
+            json!([null]),
+            json!([{}]),
+            json!([{"reference":null}]),
+            json!([{"reference":{"version":1,"id":"r"},"extra":true}]),
+            json!([{"reference":{"version":1,"id":7}}]),
+            json!([{"reference":{"version":1,"id":"r"},"indices":false}]),
+            json!([{"reference":{"version":1,"id":"r"},"indices":["0"]}]),
+            json!([{"content":[{"type":"text"}]}]),
+            json!([{"content":[{"type":"text","text":"x","textSignature":{}}]}]),
+            json!([{"content":[{"type":"thinking","text":"x"}]}]),
+            json!([{"content":vec![json!({"type":"text","text":"x"});256]},{"content":[{"type":"text","text":"overflow"}]}]),
+        ];
+        for image in invalid_images() {
+            bad.push(json!([{"content":[image]}]));
+        }
+        for value in bad {
+            assert!(parse_content_parts(&value).is_err(), "{value}");
+        }
+        assert!(parse_content_parts(
+            &json!([{"content":[{"type":"text","text":"x","textSignature":null}]}])
+        )
+        .is_ok());
+    }
+    pub(super) fn invalid_images() -> Vec<Value> {
+        let mut images = Vec::new();
+        for mime in [
+            "image/",
+            "image/svg+xml",
+            "image/png; charset=utf-8",
+            "IMAGE/PNG",
+        ] {
+            images.push(json!({"type":"image","data":"AA==","mimeType":mime}));
+        }
+        for data in [
+            "", "AB==", "AAB=", "AA=A", "A===", "====", "AA", "AA==\n", "AA-_", "é==",
+        ] {
+            images.push(json!({"type":"image","data":data,"mimeType":"image/png"}));
+        }
+        images
+    }
+    #[test]
+    fn supported_image_mimes_and_canonical_base64_are_accepted() {
+        for mime in ["image/png", "image/jpeg", "image/gif", "image/webp"] {
+            for data in ["AA==", "AAA=", "AAAA", "/w==", "//8=", "+///"] {
+                let mut value = envelope(false);
+                value["result"]["content"][1] = json!({"type":"image","data":data,"mimeType":mime});
+                assert!(done_to_result(&value.to_string(), true).is_ok(), "{value}");
+            }
+        }
+    }
+    #[test]
+    fn malformed_opted_in_envelopes_fail_closed_but_legacy_remains_lenient() {
+        let mut bad = vec![json!(null), json!({}), json!({"content":[]}), json!([])];
+        for path in ["$rpiToolResult", "isError", "result"] {
+            let mut value = envelope(false);
+            value.as_object_mut().unwrap().remove(path);
+            bad.push(value);
+        }
+        for version in [json!(2), json!("1"), json!(1.0), json!(null)] {
+            let mut value = envelope(false);
+            value["$rpiToolResult"] = version;
+            bad.push(value);
+        }
+        for (field, invalid) in [
+            ("content", json!({})),
+            ("content", json!([{"type":"thinking","text":"no"}])),
+            ("content", json!([{"type":"text"}])),
+            (
+                "content",
+                json!([{"type":"image","data":"bad","mimeType":"image/png"}]),
+            ),
+            (
+                "content",
+                json!([{"type":"image","data":"AA==","mimeType":"text/html"}]),
+            ),
+            ("terminate", json!("false")),
+            ("usage", json!({})),
+            ("addedToolNames", json!([1])),
+            ("addedToolNames", json!(["x".repeat(257)])),
+            (
+                "content",
+                json!(vec![json!({"type":"text","text":"x"}); 257]),
+            ),
+        ] {
+            let mut value = envelope(false);
+            value["result"][field] = invalid;
+            bad.push(value);
+        }
+        for image in invalid_images() {
+            let mut value = envelope(false);
+            value["result"]["content"] = json!([image]);
+            bad.push(value);
+        }
+        for field in ["content", "details", "terminate"] {
+            let mut value = envelope(false);
+            value["result"].as_object_mut().unwrap().remove(field);
+            bad.push(value);
+        }
+        for value in bad {
+            assert!(
+                matches!(
+                    done_to_result(&value.to_string(), true),
+                    Err(AgentError::Tool(_))
+                ),
+                "{value}"
+            );
+            assert!(
+                done_to_result(&value.to_string(), false).is_ok(),
+                "legacy must not gain strict parsing"
+            );
+        }
+        assert!(done_to_result("not JSON", true).is_err());
+        assert!(done_to_result("not JSON", false)
+            .unwrap()
+            .content
+            .is_empty());
+        let mut huge = envelope(true);
+        huge["result"]["details"] = json!("x".repeat(1024 * 1024));
+        assert!(done_to_result(&huge.to_string(), true).is_err());
+        // Non-opted-in tools never interpret the reserved envelope marker.
+        assert!(done_to_result(&envelope(true).to_string(), false)
+            .unwrap()
+            .content
+            .is_empty());
+        assert_eq!(
+            done_to_result(
+                r#"{"content":[{"text":"legacy","type":"future"}],"terminate":true}"#,
+                false
+            )
+            .unwrap()
+            .content,
+            vec![TextContentOrImage::text("legacy")]
+        );
     }
 }

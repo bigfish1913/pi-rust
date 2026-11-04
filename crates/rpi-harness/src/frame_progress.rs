@@ -546,6 +546,7 @@ pub(crate) async fn unknown_tool_outcomes_with_started(
         .find_entries_on_branch(
             &EntryQuery {
                 order: Some(EntryOrder::OldestFirst),
+                exclude_tool_program_bodies: true,
                 ..Default::default()
             },
             &Default::default(),
@@ -1172,6 +1173,12 @@ impl FrameRecordingEmitter {
 }
 
 impl AgentEmitter for FrameRecordingEmitter {
+    fn tool_program_observer(
+        &self,
+    ) -> Option<Arc<dyn rpi_agent::tool_program_observation::ToolProgramObserver>> {
+        self.inner.tool_program_observer()
+    }
+
     fn emit(&self, event: AgentEvent) -> BoxFuture<'static, ()> {
         let inner = Arc::clone(&self.inner);
         let shared = Arc::clone(&self.shared);

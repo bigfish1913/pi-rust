@@ -142,6 +142,13 @@ impl AgentEvent {
 ///   Order is preserved because `try_emit` is only ever called from within a
 ///   single tool's `execute`, and `emit` is awaited between tool phases.
 pub trait AgentEmitter: Send + Sync {
+    /// Optional native child observation; ordinary emitters remain unchanged.
+    fn tool_program_observer(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::tool_program_observation::ToolProgramObserver>> {
+        None
+    }
+
     /// Async emit — awaited by the loop so event order matches emit call order.
     fn emit(&self, event: AgentEvent) -> futures::future::BoxFuture<'static, ()>;
 
