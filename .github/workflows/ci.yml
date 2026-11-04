@@ -218,8 +218,8 @@ jobs:
       - name: Test provider bridge reconstruction and capacity
         run: cargo test -p rpi-extensions --features provider-performance --locked 'provider::'
 
-      - name: Test offline website verifier
-        run: python3 -B scripts/test_website.py VerifierTests
+      - name: Test offline website verifier and community entries
+        run: python3 -B scripts/test_website.py VerifierTests CommunityTests
 
       - name: Test prebuilt release manifests
         run: python3 scripts/test_prebuilt_release.py

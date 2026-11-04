@@ -215,10 +215,22 @@ a:focus-visible, button:focus-visible { outline: 3px solid var(--orange-deep); o
 .support-page .donation-card h2 { font-size: 16px; }
 .support-page .donation-image { height: auto; }
 .donation-crop { position: relative; display: block; width: 100%; max-width: 300px; aspect-ratio: 1; overflow: hidden; border-radius: 8px; }
-.support-page .donation-crop img { position: absolute; width: var(--crop-width); max-width: none; height: auto; left: var(--crop-left); top: var(--crop-top); }
-.donation-wechat { --crop-width: 190.909091%; --crop-left: -45.454545%; --crop-top: -50%; }
-.donation-alipay { --crop-width: 134.512195%; --crop-left: -17.682927%; --crop-top: -70.731707%; }
-.donation-binance { --crop-width: 146.25%; --crop-left: -23.055556%; --crop-top: -80.555556%; }
+.support-page .donation-crop img { width: 100%; height: 100%; object-fit: contain; }
+.community-section { padding-top: 48px; padding-bottom: 48px; border-top: 1px solid var(--line); scroll-margin-top: 110px; }
+.community-section .section-heading h2 { font-size: clamp(24px, 4vw, 32px); line-height: 1.4; }
+.community-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; max-width: 800px; margin: 24px auto 0; }
+.community-card { display: flex; flex-direction: column; align-items: center; padding: 24px; border: 1px solid var(--line); background: var(--white); text-align: center; }
+.community-card h3 { margin: 0 0 12px; font-size: 20px; }
+.community-card p { margin: 0 0 20px; color: #545650; font-size: 16px; line-height: 1.8; }
+.community-card .button { max-width: 100%; min-height: 44px; white-space: normal; }
+.community-qr { display: block; max-width: 100%; margin-bottom: 20px; }
+.community-qr img { display: block; width: 230px; max-width: 100%; height: auto; aspect-ratio: 1; object-fit: contain; }
+.community-qr:focus-visible, .community-card .button:focus-visible { outline: 3px solid var(--orange-deep); outline-offset: 5px; }
+.community-card .community-note { margin: 16px 0 0; font-size: 14px; }
+@media (max-width: 680px) {
+  .community-section { padding-top: 32px; padding-bottom: 32px; }
+  .community-grid { grid-template-columns: 1fr; max-width: 360px; }
+}
 .support-page .donation-original { font-size: 14px; min-height: 44px; }
 @media (max-width: 900px) {
   .support-page .donation-grid { grid-template-columns: 1fr; max-width: 360px; gap: 16px; }
