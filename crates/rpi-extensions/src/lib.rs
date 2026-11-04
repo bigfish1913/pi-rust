@@ -79,8 +79,8 @@ pub use actions::{
 pub use editor_text::{EditorTextEdit, EditorTextMailbox, EditorTextMode};
 pub use event_log::{event_log_path, log_handler_invocation, EventLogger};
 pub use loader::{
-    load_dir, load_one, load_session, load_session_mixed, merge_registries, ExtensionSession,
-    LoadedPlugin, PluginKeepalive, PluginLoadError,
+    load_dir, load_one, load_session, load_session_mixed, load_session_mixed_guarded,
+    merge_registries, ExtensionSession, LoadedPlugin, PluginKeepalive, PluginLoadError,
 };
 pub use oauth::{
     list as list_oauth_providers, request as request_oauth,

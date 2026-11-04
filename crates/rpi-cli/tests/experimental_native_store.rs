@@ -109,9 +109,13 @@ async fn illegal_optins_reject_before_early_dispatch_or_legacy_writes() {
         vec!["events"],
         vec!["update"],
         vec!["install"],
+        vec!["extension", "list"],
         vec!["extension", "--help"],
         vec!["extension", "update", "--help"],
         vec!["extension", "update"],
+        vec!["resource", "list", "--scope", "project"],
+        vec!["resource", "inspect", "skill", "demo", "--scope", "project"],
+        vec!["resource", "recover", "--scope", "project"],
         vec!["package"],
         vec!["dev"],
         vec!["--connect=127.0.0.1:1"],
@@ -153,6 +157,8 @@ async fn illegal_optins_reject_before_early_dispatch_or_legacy_writes() {
         }
         assert!(!f.native.exists());
         assert!(!f.temp.path().join("export.html").exists());
+        assert!(!f.temp.path().join(".rpi/.resource-lease").exists());
+        assert!(!f.agent.join(".resource-lease").exists());
         assert_eq!(f.sentinels(), before);
     }
     let result = output(
@@ -312,3 +318,6 @@ mod guards;
 #[cfg(feature = "experimental-native-store")]
 #[path = "experimental_native_store/pipeline.rs"]
 mod pipeline;
+#[cfg(feature = "experimental-native-store")]
+#[path = "experimental_native_store/resources.rs"]
+mod resources;

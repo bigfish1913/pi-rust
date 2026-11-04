@@ -38,6 +38,13 @@ cargo build --workspace --locked
 cargo test  --workspace --locked
 ```
 
+For the regression inventory, scenario-specific commands, CI coverage and optional
+checks, see [Regression testing](docs/maintaining/testing.md). This includes
+session/crash recovery, resource budgets and large-history cold-start gates.
+Keep generated test reports, measurements and protocol logs outside Git. CI uses
+owned synthetic fixtures and diagnostic-file allowlists, never real user histories
+or credentials.
+
 For changes that may affect the minimum supported Rust version:
 
 ```bash

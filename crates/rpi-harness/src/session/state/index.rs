@@ -11,6 +11,11 @@ pub(crate) struct IndexedState<P: Clone> {
     // Rebuilt by replay, including imported/forked entries; never persisted separately.
     pub(super) nearest_user: Vec<Option<usize>>,
     pub(super) records: Vec<LaneRecord>,
+    // Resident append bodies are the only records that a clear can retire.
+    // Cold-only replay uses this as an O(1) guard before considering records.
+    pub(super) hot_append_count: usize,
+    #[cfg(test)]
+    pub(super) retire_record_checks: usize,
     pub(super) open_operations_by_lane: HashMap<String, BTreeMap<u64, OperationStartedRecord>>,
     pub(super) lanes: BTreeMap<String, Option<String>>,
     pub(super) log: Vec<StoredLogItem>,
@@ -31,6 +36,9 @@ impl<P: Clone> IndexedState<P> {
             entries_by_id: HashMap::new(),
             nearest_user: Vec::new(),
             records: Vec::new(),
+            hot_append_count: 0,
+            #[cfg(test)]
+            retire_record_checks: 0,
             open_operations_by_lane: HashMap::new(),
             lanes,
             log: Vec::new(),
@@ -67,20 +75,28 @@ impl<P: Clone> IndexedState<P> {
         &mut self,
         frame: &crate::session::types::AssistantFrameRecord,
     ) -> SessionResult<()> {
-        if frame.base.seq != self.sequence + 1 {
+        self.reserve_cold_frame_identity(&frame.base.id, frame.base.seq, &frame.base.lane)
+    }
+
+    pub(crate) fn reserve_cold_frame_identity(
+        &mut self,
+        id: &str,
+        seq: u64,
+        lane: &str,
+    ) -> SessionResult<()> {
+        if seq != self.sequence + 1 {
             return Err(SessionError::invalid_entry(
                 "non-consecutive cold frame sequence",
             ));
         }
-        if !self.lanes.contains_key(&frame.base.lane) {
+        if !self.lanes.contains_key(lane) {
             return Err(SessionError::invalid_entry(format!(
-                "Invalid session mutation: references missing lane {}",
-                frame.base.lane
+                "Invalid session mutation: references missing lane {lane}"
             )));
         }
-        self.validate_unused_id(&frame.base.id)?;
-        self.sequence = frame.base.seq;
-        self.used_ids.insert(frame.base.id.clone());
+        self.validate_unused_id(id)?;
+        self.sequence = seq;
+        self.used_ids.insert(id.to_owned());
         Ok(())
     }
 
@@ -451,6 +467,9 @@ impl<P: Clone> IndexedState<P> {
                 self.log.push(StoredLogItem::Record(self.records.len()));
                 self.records.push(record.clone());
                 if let LaneRecord::AssistantFrame(frame) = &record {
+                    if frame.op == AssistantFrameOp::Append {
+                        self.hot_append_count += 1;
+                    }
                     self.retire_cleared_frames(frame);
                 }
                 Ok(ApplyOutcome::Record(record))

@@ -1,4 +1,50 @@
-# 会话、恢复与资源测试
+# 回归测试清单与运行流程
+
+## 当前覆盖清单
+
+本页是仓库回归测试的统一入口，按**场景组**列出测试，而不是逐个罗列 Rust
+`#[test]`。CI 状态以 [工作流配置](../../.github/workflows/ci.yml) 为准；“已接入”只说明
+配置会执行，不代表远端最新一次运行已经通过。默认 CI 不读取真实用户会话、不使用真实
+模型凭据，也不会替换安装产物或重启线上服务。
+
+### 已接入默认 CI
+
+| 场景组 | 本地入口 / 主要测试 | CI 位置与边界 |
+| --- | --- | --- |
+| Rust 基础、文档与默认功能回归 | `task test` / `cargo test --workspace --locked` | Ubuntu `test`；包含默认 feature 下的单元、集成和 doc tests，ignored/条件提前返回不等于实际覆盖。 |
+| macOS regular 主屏历史回看、后台计时/输出及命令完整性 | `cargo test -p rpi-tui --test main_screen_scroll_up --locked`；[修复语义与验收步骤](../debugging/macos-iterm2-scrollback.md) | PR #237 已修复计时刷新、历史区光标与强制重绘路径，保留既有历史重排测试；默认 workspace 会执行。虚拟终端不代替真实 iTerm2 视觉验证。 |
+| MSRV、跨平台编译与格式 | Rust 1.88 `cargo check`、stable all-targets、`cargo fmt --all -- --check` | `msrv` / `check` 覆盖 Linux、Windows；格式在 `test`，编译检查不能代替运行测试。 |
+| 会话恢复、消息顺序、工具重放、半截 JSONL、cwd | `task test:recovery` | 已含于 `test` 的 workspace 测试，无须重复执行同一组 Rust tests。 |
+| 冷帧/冷消息、分页、fork、progress 升级与完整性 | `rpi-harness` 的 JSONL、branch queries、storage contract 等测试 | `test` 默认 Rust 测试；主要是语义/I/O 契约，不代替全进程耗时门禁。 |
+| 资源选择、重绑定、saved-session 读取及隔离 | CLI `resource_selection`、`resource_management`、`saved_session_read`，harness 对应测试 | `test` 默认 Rust 测试；只读与写入入口分别覆盖。 |
+| 真实 CLI 消息/工具 roundtrip、重启、kill 后恢复和会话隔离 | `task test:session`、`test_session_smoke.py` | `test` 显式构建 CLI，运行两种 RPC 编码；状态扩展未传入时不算覆盖。 |
+| 编辑器大粘贴、undo/redo owner、多轮 RPC 内存/CPU/最终结论 | `task test:resources`、`test_resource_smoke.py`、TUI Rust tests | `resources`；release 编辑器和两种 RPC 编码各 5 个测量轮次，不是实际终端视觉验证。 |
+| **701,000 append frames 的历史冷启动** | **`task test:cold-start`、`test_resource_cold_start.py`** | **`resources`；modern/legacy 各 701,000 append frames + 21,733 entries，每格式 3 次 fresh process；检查 ready、查询、内容、idle 和清理。** |
+| 外部工具 RPC、结果隔离、abort 原子性与 stdin EOF 生命周期 | `external-tools-smoke.py --rpi ... --diagnostics-dir ...` | `resources`；compact-deltas / snapshot 各 3 个真实 native 场景，使用隔离 loopback fixture。 |
+| 多版本资源比较控制器 | `python -B scripts/test_compare_resources.py` | `resources`；验证统计、门槛、语义、参数与结果判定，不代表实际多版本性能对比已执行。 |
+| PTY 压力控制器、资源上限、有限输出与 owned cleanup | `python -B scripts/test_resource_tui.py` | `resources`；**fake PTY 单测**，无 pywinpty 依赖，不代表 Windows ConPTY 实测。 |
+| SDK/插件 ABI、provider bridge、真实 plugin-stub | `rpi-plugin-sdk` provider tests、`plugin_stub_smoke` 等 | `test` 显式构建仓库 plugin-stub；`windows-plugin-lifecycle` 检查 Windows ABI/DLL，不能替代独立业务扩展。 |
+| Windows 安装器 | `scripts/tests/install.Tests.ps1` | `windows-installer`，分别用 Windows PowerShell / PowerShell Core 离线执行。 |
+| 发布授权、Release PR、渠道、预构建清单 | `test_release_automation.py`、`test_release_pr_readiness.py`、`test_release_channels.py`、`test_prebuilt_release.py` | `test`；mock/临时仓库测试，不执行真实发布。 |
+| 官网 HTTP 校验器的状态码、缓存、内容与重定向断言 | `python -B scripts/test_website.py VerifierTests` | `test`；mock 响应单测，不访问线上站点，不代表真实 Caddy HTTP 集成。 |
+
+### 手动、可选或尚未接入的覆盖
+
+| 场景 | 当前入口 | 为什么不与默认 CI PASS 混淆 / 后续条件 |
+| --- | --- | --- |
+| 实验 native store 与进程终止/SQLite spill 恢复 | `cargo test -p rpi-harness --features experimental-native-store --lib process_tests --locked -- --test-threads=1` | 具备合成、离线、子进程隔离条件，**适合后续独立 feature CI job**；当前工作流未启用此 feature，默认 workspace 绿灯不覆盖它。详见 [实验进程测试](../architecture/experimental-native-process-tests.md)。 |
+| 真实 Windows TUI 压力 | `compare-resources.py --case tui ...` | 需要 Windows ConPTY、可用的 pywinpty 与实际输入确认；当前仅控制器单测进 CI，实际终端缺依赖/未确认输入应记 SKIP。 |
+| 真实 macOS / iTerm2 长会话向上回看 | [iTerm2 人工验收](../debugging/macos-iterm2-scrollback.md#iterm2-人工验收修复后仍必需) | 后台工具仍运行、耗时行进入历史区时观察多帧闪屏/跳位，以及完整命令和消息唯一性；当前环境未执行，不能用虚拟终端或 fullscreen 对照 PASS 代替。 |
+| 多版本 binary 的资源/冷启动 AB/BA 对比 | `compare-resources.py --variant ...`；`resource-cold-start.py --baseline ... --candidate ...` | 需要可验证的旧、新产物与一致 profile；CI 冷启动门禁只测当前产物，不伪造旧基线。可后续做受控 performance workflow。 |
+| 独立 provider/subagent/btw/todo/durable 库 | 下文真实库环境变量或 session smoke 的 `--extension` | 依赖独立仓库/可信共享库及明确版本，当前 CI 未准备这些产物；缺失时记 SKIP。 |
+| 真实模型多轮资源回归 | `task test:resources:live -- ...` | 有凭据、费用与外部服务依赖，必须显式授权、有请求预算，不进入默认 PR CI。 |
+| 真实 Caddy HTTP 集成 | 设置 `CADDY_BIN` 后 `python -B scripts/test_website.py` | 可后续在固定 Caddy 版本的独立 job 跑本地服务；当前默认 CI 只运行 `VerifierTests`，不声称真实服务通过。 |
+| 真实域名 Web 打开历史/首屏、认证与渲染 | 隔离浏览器环境中的专项验收 | Native ready 不等于 Web 首屏；真实域名认证、Vite/正式 assets 和服务状态需分别核实，不能绕过认证或操作真实 session 凑 PASS。 |
+| 历史 `scripts/rpc-smoke.py` | 手工脚本，不纳入默认 CI | 沿用用户 HOME/配置和 provider，隔离条件不足；日常恢复用 `session-smoke.py`，需先改造隔离与 fixture 才能接 CI。 |
+
+新增或修复场景时，同步更新本表、实际测试入口和对应 CI 步骤；详细性能预算只在明确
+负载、profile、平台与测量边界下解释。**RSS 降低、I/O 次数减少、storage load、native
+ready 和浏览器首屏是不同指标，不能互相代替。**
 
 ## macOS / iTerm2 原生历史滚动验收
 
@@ -9,8 +55,8 @@ cargo test -p rpi-tui --test main_screen_scroll_up --locked -- --nocapture
 ```
 
 验收覆盖后台计时、持续追加输出的逐帧完整性、历史区光标隐藏及返回、列 0/显示设置，
-以及强制重绘对消息唯一性和外部残留单元格的修复。默认 workspace 测试会执行，当前该
-集成目标 **15 通过、0 失败、0 ignored**，保留既有历史重排测试。
+以及强制重绘对消息唯一性和外部残留单元格的修复。默认 workspace 测试会执行，
+并保留既有历史重排测试。
 regular 工具面板使用稳定运行状态，实时耗时仍在输入区工作状态中显示；fullscreen 和
 完成总耗时不变。真实 macOS / iTerm2 视觉验收未执行，不能用虚拟终端或 fullscreen
 对照 PASS 代替；真实历史编辑/重排仍可能重建 scrollback。
@@ -19,7 +65,7 @@ regular 工具面板使用稳定运行状态，实时耗时仍在输入区工作
 
 从 `pi-rust` 仓库根目录执行。前提是 Python 3、Rust/Cargo 和 Go Task 已安装。下面是本机 Windows PowerShell 可直接复制的命令；**任一步失败就先保留日志排查，不要把后续部分成功当成整轮通过。** 测试不会自动安装新 binary、替换全局 DLL 或重启服务。
 
-### 1. 日常回归：会话、恢复和资源
+### 1. 日常回归：会话、恢复、资源和历史冷启动
 
 ```powershell
 task test:session
@@ -28,9 +74,11 @@ task test:recovery
 if ($LASTEXITCODE -ne 0) { throw '恢复回归失败' }
 task test:resources
 if ($LASTEXITCODE -ne 0) { throw '资源回归未通过；请区分 FAIL 与平台 SKIP 并保留诊断' }
+task test:cold-start
+if ($LASTEXITCODE -ne 0) { throw '历史冷启动回归未通过；检查 modern/legacy 各自门槛与清理结果' }
 ```
 
-第一项自动构建当前源码、运行 Python 控制器测试，再检查两种 RPC 编码下的消息/工具结果、重启恢复、真实 kill 后续跑和 session 隔离；每次自动创建唯一诊断目录。第二项运行底层恢复回归。第三项构建 release CLI 和实际编辑器压力进程，检查大粘贴/撤销历史及两种 RPC 编码的多轮内存、CPU、完成性和最终结论。**三项默认都不加载全局扩展，不调用真实模型，不能替代下面的扩展检查。**
+第一项自动构建当前源码、运行 Python 控制器测试，再检查两种 RPC 编码下的消息/工具结果、重启恢复、真实 kill 后续跑和 session 隔离；每次自动创建唯一诊断目录。第二项运行底层恢复回归。第三项构建 release CLI 和实际编辑器压力进程，检查大粘贴/撤销历史及两种 RPC 编码的多轮内存、CPU、完成性和最终结论。第四项用合成海量流式记录验证现代格式恢复与旧格式首次升级，每种格式启动 5 个全新 CLI 进程。**四项默认都不加载全局扩展，不调用真实模型，不能替代下面的扩展检查。** 冷启动 Task 构建带 `--locked --offline`，首次使用前需准备好 Cargo 依赖缓存；build 和性能测量不混为一项。
 
 准备合并或发版时，再运行完整检查（不要只依据某次测试数量判断是否通过）：
 
@@ -84,6 +132,7 @@ if ($LASTEXITCODE -ne 0) { throw "相邻状态扩展回归失败，诊断目录�
 | `task test:session` | Python 控制器测试成功，且 `compact-deltas`、`snapshot` 均为 PASS；进程退出码为 0。 |
 | `task test:recovery` | 所有测试目标均无失败，Task 退出码为 0。 |
 | `task test:resources` | 编辑器与两个 RPC 场景全部 PASS；逐轮资源预算和最终结论通过。退出 77 / 不支持平台为 SKIP，不算通过。 |
+| `task test:cold-start` | 控制器和真实 RPC 小测通过，modern/legacy 各 5 次完整规模观测全部完成，ready/query 门槛、消息与 idle 语义、清理均 PASS；旧格式使用单独的显式预算。 |
 | todo / durable | 显式传入 DLL 后，`results.json` 中对应 `todoState` / `durableState` 为 PASS；没有加载库时的 SKIP 不算通过。 |
 | provider / subagent / btw | 按下文设置真实库变量，使用 `--nocapture` 确认没有因缺少库而提前跳过。 |
 
@@ -259,7 +308,7 @@ Task 显式使用 `target/resource-tests-cargo`，不依赖全局 Cargo target�
 | 指标/预算 | 默认值或口径 |
 | --- | --- |
 | Windows 主内存指标 | PrivateUsage（私有提交字节），另报 Working Set、峰值 resident/commit |
-| Linux 主内存指标 | RSS、峰值 RSS，取自 `/proc`；不与 Windows Private Bytes 混为同一含义 |
+| Linux 主内存指标 | `/proc` 的 VmRSS/VmHWM 为近似快照，VmHWM 不保证采样间单调；内存门禁取已采样 VmRSS 的最大值，不是精确 OS 峰值，也不与 Windows Private Bytes 混为同一含义 |
 | CPU | 进程 user+kernel 秒；百分比按单核口径，100% 为一个逻辑核，可超过 100% |
 | 绝对主内存上限 | 512 MiB，`--max-memory-mib` |
 | RPC 增长预算 | warmup 后 96 MiB，`--max-rpc-growth-mib` |
@@ -290,7 +339,44 @@ task test:resources:live -- --api openai-completions --base-url https://api.open
 
 live 默认 snapshot、5 轮、无 warmup、每轮最多 256 输出 tokens、请求超时 60 秒，跨编码/含 warmup 的总请求计划不得超过默认 `--max-requests 5`。两种编码、额外 warmup 或更长测试需显式调整请求预算。密钥仅通过指定环境变量传入，临时 models.json 保存 `$ENV_NAME` 引用，不保存值；日志脱敏原值及常见编码。输出/token/call 上限不是未知价格下的美元费用保证。模型忽略 JSON 格式、输出被截断或结论错误也会失败，不会为凑 PASS 自动追加请求。
 
-本次真实模型覆盖明确为 SKIP。live 通路只用 loopback OpenAI Completions 假 endpoint 验证配置、限制、凭据隔离和脱敏；真实服务以及 Responses/Anthropic 真实集成未执行。普通 `task test:resources`、Python 测试和 CI 不会调用真实模型。
+默认离线回归不覆盖真实模型。loopback OpenAI Completions fixture 只用于验证配置、限制、凭据隔离和脱敏，不认证真实服务或 Responses/Anthropic 的真实集成。普通 `task test:resources`、Python 控制器测试和 CI 不会调用真实模型。
+
+## 海量流式记录的历史冷启动回归
+
+固定场景名为 `historical-frame-heavy-v1`，只生成合成历史，不读取或复制真实
+session。每次包含 **701,000 个 append frames（每个 delta 为 256 bytes）、21,733 条消息 entries**，每 4,000 个
+append（含最后一批）写 commit；分别生成已声明 progress 的现代格式与首次需升级的
+旧格式，不依赖预建索引。默认脚本参数由控制器单测锁定。
+
+```sh
+task test:cold-start
+# 只跑快速控制器单测，无需构建 native；真实 RPC 小测默认明确 SKIP：
+python3 -B scripts/test_resource_cold_start.py
+```
+
+完整 Task 构建 release CLI，运行控制器/真实 RPC 小测，然后按格式各运行 5 次独立
+进程。默认诊断在仓库外的系统 temp；需要固定到仓库外位置时，设置
+`RESOURCE_CARGO_TARGET_DIR` 和 `COLD_START_DIAGNOSTICS_DIR`。只检查已有产物可直接
+运行 `scripts/resource-cold-start.py --candidate <binary> --output <new-outside-directory>`，
+`--baseline` 可选；命令完整参数见 [冷启动诊断与门禁](../debugging/session-cold-start.md)。
+
+每次必须检查 ready、最后 40 条消息的数量/顺序/内容、`pendingResume=false`、
+`activeOperation=null`、两条 queue 为空，以及正常 stop 和 owned-process 清理。
+耗时缺失、非有限、负数、功能错误、轮次不完整均不能 PASS；清理失败停止后续观测。
+
+| 入口 | Modern ready 中位数 / 最大值 | Legacy ready 中位数 / 最大值 | 消息查询最大值 | State 查询最大值 |
+| --- | --- | --- | --- | --- |
+| 本地 Task（每格式 5 次） | 2000 / 3000 ms | 3500 / 5000 ms | 100 ms | 1500 ms |
+| CI `resources`（每格式 3 次） | 4000 / 8000 ms | 6000 / 10000 ms | 250 ms | 2000 ms |
+
+旧格式含锁内升级、额外摘要校验及复制；单独的 legacy 预算**不等于默认两秒目标**，
+不能用另一组预算冒充两秒 PASS。共享 runner 的宽松预算必须结合远端结果校准；配置接入不等于已经在
+GitHub runner 实测。所有结果为 fresh process，**不清 OS 磁盘缓存，也不是 Web 首屏 SLA**。
+
+每种格式保留 `results.json`（含 gate、实际 binary hash 与所有观测）、`reproduce.json`
+（参数和脚本 hash）及各次 `report.json`/协议日志。只删除本次生成的 history、companion
+和 lock，不删除未知文件。CI 在成功/失败时均上传 `historical-cold-start-diagnostics`，
+使用文件白名单，避免清理失败时将巨大合成历史或配置上传为 artifact。诊断、测量结果及原始日志不提交到 Git；分享前检查内容和路径。隔离配置不是 OS 网络/文件访问沙箱，必须使用可信的待测二进制。
 
 ## CI
 
@@ -302,6 +388,15 @@ python3 -B scripts/test_session_smoke.py
 python3 -B scripts/session-smoke.py --rpi target/debug/rpi --diagnostics-dir "$RUNNER_TEMP/$SESSION_SMOKE_DIAGNOSTICS_NAME"
 ```
 
-session 的 basename 包含 run_id/run_attempt，输出在 runner.temp 而不是 Cargo 缓存中的 target；失败从同一路径上传 `session-smoke-diagnostics`，保留拒绝覆盖旧目录的保护。CI 不传独立扩展，因此该结果不代表全扩展业务认证。
+session 的 basename 包含 run_id/run_attempt，输出在 runner.temp 而不是 Cargo 缓存中的 target；失败时从同一路径按白名单上传 `session-smoke-diagnostics`（不含原始 sessions、snapshot、provider 请求或配置文件），保留拒绝覆盖旧目录的保护。CI 不传独立扩展，因此该结果不代表全扩展业务认证。
 
-新增 Ubuntu `Offline resource regression` job 独立构建 release CLI/probe，运行 Python 控制器及 Rust editor 测试，再执行编辑器和两种 RPC 编码各 5 个测量轮次。资源诊断同样使用 runner.temp 下 run/attempt 唯一目录，失败上传 `resource-smoke-diagnostics`。release/preview 的发布准备依赖该门禁。无 secrets、无 live 模式；不能将 CI 的合成模型 PASS 当作真实模型 PASS。
+Ubuntu `Offline resource regression`（`resources`）job 共用同一次构建的 release CLI/probe，依次检查：
+
+1. 资源 smoke、冷启动、资源比较、fake PTY 四组 Python 控制器，以及 Rust editor invariants；设置 `RPI_COLD_START_BINARY` 以确保冷启动的小型真实 RPC 测试不是 SKIP。
+2. 外部工具 RPC 两种编码各 3 个场景，含 roundtrip/abort、外部工具 pending 时 EOF、仅模型运行时 EOF，使用 loopback fixture；成功收回 owned 进程树/provider 后删除生成的 home/config/session/tmp，清理失败停止后续场景并保留数据。失败仅按白名单上传 `external-tools-smoke-diagnostics`，不含生成的 auth/config/session 文件。
+3. 编辑器与两种 RPC 编码各 5 个资源测量轮次；失败上传 `resource-smoke-diagnostics`。
+4. modern/legacy 各 3 次完整海量帧冷启动；成功/失败上传白名单 `historical-cold-start-diagnostics`。
+
+诊断均在 runner.temp，名称带 run/attempt，避免 Cargo cache 复用旧输出。`test` job 另显式运行官网校验器 `VerifierTests`，真实 Caddy 集成不包含在内。release/preview 的发布准备依赖 `test` 与 `resources` 等门禁；仓库 branch protection 的 required checks 仍需在 GitHub 设置中另行确认，工作流不能替代该设置。
+
+这些新增步骤不需要 secrets、不启用 live、不下载或安装独立业务扩展。本地验证不能冒充远端 CI 结果；普通 CI 的合成模型、fake PTY 与仓库 plugin-stub PASS，也不能推广为真实模型、真实终端或所有独立扩展 PASS。

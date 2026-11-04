@@ -14,6 +14,36 @@ use tokio::sync::Mutex;
 
 pub(super) const FORMAT: &str = "assistant-progress-v1";
 
+/// Saved views only. Writable restore and transition inspection retain their
+/// existing policy. Caps bound checkpoint validation and each reducer clear;
+/// deadline checks bracket those otherwise synchronous operations.
+#[derive(Clone, Copy)]
+struct SavedReadBudget {
+    deadline: std::time::Instant,
+    max_records: usize,
+    max_frames: usize,
+}
+impl SavedReadBudget {
+    fn check(self, records: usize, frames: usize) -> SessionResult<()> {
+        if std::time::Instant::now() >= self.deadline {
+            return Err(SessionError::invalid_entry(
+                "saved read processing deadline exceeded",
+            ));
+        }
+        if records > self.max_records {
+            return Err(SessionError::invalid_entry(
+                "saved read progress record limit exceeded",
+            ));
+        }
+        if frames > self.max_frames {
+            return Err(SessionError::invalid_entry(
+                "saved read progress frame limit exceeded",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Checkpoint {
@@ -124,12 +154,59 @@ impl JsonlProgressStore {
     }
 
     async fn load(&self, state: &mut State) -> SessionResult<()> {
+        self.load_with_repair(state, true).await
+    }
+    pub async fn inspect_pending_without_repair(&self) -> SessionResult<bool> {
+        let mut state = self.state.lock().await;
+        self.load_with_repair(&mut state, false).await?;
+        Ok(!state.progress.as_ref().unwrap().frames.is_empty())
+    }
+    pub async fn inspect_pending_without_repair_with_deadline(
+        &self,
+        deadline: std::time::Instant,
+        max_records: usize,
+        max_frames: usize,
+    ) -> SessionResult<bool> {
+        let budget = SavedReadBudget {
+            deadline,
+            max_records,
+            max_frames,
+        };
+        budget.check(0, 0)?;
+        let mut state = self.state.lock().await;
+        self.load_with_budget(&mut state, false, Some(budget))
+            .await?;
+        budget.check(0, state.progress.as_ref().unwrap().frames.len())?;
+        Ok(!state.progress.as_ref().unwrap().frames.is_empty())
+    }
+    pub async fn require_idle_without_repair(&self) -> SessionResult<()> {
+        if self.inspect_pending_without_repair().await? {
+            return Err(SessionError::invalid_entry(
+                "resource transition rejects pending native progress",
+            ));
+        }
+        Ok(())
+    }
+    async fn load_with_repair(&self, state: &mut State, repair: bool) -> SessionResult<()> {
+        self.load_with_budget(state, repair, None).await
+    }
+    async fn load_with_budget(
+        &self,
+        state: &mut State,
+        repair: bool,
+        budget: Option<SavedReadBudget>,
+    ) -> SessionResult<()> {
+        let check = |records, frames| -> SessionResult<()> {
+            budget.map_or(Ok(()), |budget| budget.check(records, frames))
+        };
+        check(0, 0)?;
         if state.poisoned {
             return Err(SessionError::storage(
                 "progress append is uncertain; reopen session",
             ));
         }
-        if state.progress.is_some() {
+        if let Some(progress) = &state.progress {
+            check(0, progress.frames.len())?;
             return Ok(());
         }
         if !self.required {
@@ -141,6 +218,7 @@ impl JsonlProgressStore {
             Ok(text) => text,
             Err(error) => return file_result(Err(error), "read required progress companion"),
         };
+        check(0, 0)?;
         let mut lines = text.split_inclusive('\n');
         let header = lines
             .next()
@@ -150,6 +228,7 @@ impl JsonlProgressStore {
                 "incomplete progress checkpoint",
             ));
         }
+        check(0, 0)?;
         let mut checkpoint: Checkpoint = serde_json::from_str(header).map_err(|error| {
             SessionError::invalid_entry(format!("invalid progress checkpoint: {error}"))
         })?;
@@ -158,12 +237,26 @@ impl JsonlProgressStore {
                 "progress format/session identity mismatch",
             ));
         }
+        check(0, checkpoint.state.frames.len())?;
         checkpoint.state.validate()?;
+        check(0, checkpoint.state.frames.len())?;
         let mut progress = checkpoint.state;
         let mut valid_bytes = header.len();
         let mut normalize = false;
+        // Preflight before collecting the physical record index. The bounded
+        // scan cannot be evaded by clears that leave no active frames.
+        if let Some(budget) = budget {
+            check(
+                lines
+                    .clone()
+                    .take(budget.max_records.saturating_add(1))
+                    .count(),
+                progress.frames.len(),
+            )?;
+        }
         let remainder: Vec<_> = lines.collect();
         for (index, line) in remainder.iter().enumerate() {
+            check(index + 1, progress.frames.len())?;
             let record: AssistantFrameRecord = match serde_json::from_str(line) {
                 Ok(record) => record,
                 Err(error)
@@ -171,6 +264,11 @@ impl JsonlProgressStore {
                         && index + 1 == remainder.len()
                         && !line.ends_with('\n') =>
                 {
+                    if !repair {
+                        return Err(SessionError::invalid_entry(
+                            "resource transition rejects torn progress tail",
+                        ));
+                    }
                     file_result(
                         self.fs
                             .truncate_file(&self.path, valid_bytes as u64, None)
@@ -190,20 +288,37 @@ impl JsonlProgressStore {
                     "nonconsecutive progress sequence",
                 ));
             }
+            // ClearRun/ClearStream scan at most max_frames, with checks on
+            // both sides. Appends cannot grow beyond that cap either.
+            check(
+                index + 1,
+                progress
+                    .frames
+                    .len()
+                    .saturating_add(usize::from(record.op == AssistantFrameOp::Append)),
+            )?;
             progress.prepare(vec![record.clone()], || record.base.timestamp)?;
+            check(index + 1, progress.frames.len())?;
             progress.apply(&[record]);
+            check(index + 1, progress.frames.len())?;
             valid_bytes += line.len();
             normalize |= !line.ends_with('\n');
         }
         // A complete JSON value without its final newline must not be followed
         // by concatenated JSON on the next append. Publish a canonical checkpoint.
         if normalize {
+            if !repair {
+                return Err(SessionError::invalid_entry(
+                    "resource transition rejects incomplete progress newline",
+                ));
+            }
             self.publish(self.checkpoint(&progress)?, state).await?;
         } else {
             state.length = valid_bytes as u64;
             state.digest = Sha256::new();
             state.digest.update(&text.as_bytes()[..valid_bytes]);
         }
+        check(remainder.len(), progress.frames.len())?;
         state.progress = Some(progress);
         Ok(())
     }

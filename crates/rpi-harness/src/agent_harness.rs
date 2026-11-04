@@ -69,9 +69,9 @@ use crate::session::context::{
 };
 use crate::session::session::Session;
 use crate::session::types::{
-    AssistantFrameOp, AssistantFrameRecord, BranchBounds, CompactionReason, Entry, EntryOrder,
-    EntryQuery, JsonValue, LaneRecord, OperationError, OperationFinishedRecord, OperationIntent,
-    OperationOutcome, OperationStartedRecord, ProvisionedEntry, ProvisionedKind,
+    AssistantFrameOp, AssistantFrameRecord, BranchBounds, CompactionReason, Entry, EntryCursor,
+    EntryOrder, EntryQuery, JsonValue, LaneRecord, OperationError, OperationFinishedRecord,
+    OperationIntent, OperationOutcome, OperationStartedRecord, ProvisionedEntry, ProvisionedKind,
     QueueCancelledRecord, QueueEnqueuedRecord, QueueKind, RecordBase, RecordQuery,
     RetryPendingRecord, SessionStats, SessionTree, StepAttemptRecord, StepKind, ToolReplay,
     ToolStartedRecord, UsageCause, UsageRecord, WriteDeferredRecord,
@@ -883,6 +883,53 @@ mod weak;
 pub use weak::WeakAgentHarness;
 
 impl AgentHarness {
+    /// Read-only startup gate for resource transitions. Application-level idle
+    /// authorization remains the caller's responsibility.
+    pub async fn validate_resource_transition_idle(session: &Session) -> HarnessResult<()> {
+        if Self::resource_session_has_pending_work(session, None).await? {
+            return Err(HarnessError::io(
+                "resource transition rejects pending native execution/queue/recovery",
+            ));
+        }
+        Ok(())
+    }
+    /// Read-only pending facts, including queue/recovery/resume. No harness
+    /// creation, progress pruning, recovery writes or provider registration.
+    pub async fn saved_session_has_pending_work(
+        session: &Session,
+        deadline: std::time::Instant,
+    ) -> HarnessResult<bool> {
+        Self::resource_session_has_pending_work(session, Some(deadline)).await
+    }
+    async fn resource_session_has_pending_work(
+        session: &Session,
+        deadline: Option<std::time::Instant>,
+    ) -> HarnessResult<bool> {
+        let runtime = crate::runtime::SessionRuntime::new(session.clone());
+        for lane in session.get_lanes().await.map_err(session_to_harness_err)? {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                return Err(HarnessError::io("saved read processing deadline exceeded"));
+            }
+            let recovery = runtime
+                .recover_lane(&lane.lane)
+                .await
+                .map_err(session_to_harness_err)?;
+            if !recovery.is_clean()
+                || !recovery.tool_frames.is_empty()
+                || !Self::rebuild_queues(session, &lane.lane).await?.is_empty()
+                || match deadline {
+                    Some(at) => {
+                        Self::lane_is_resumable_impl(session, &lane.lane, true, Some(at)).await?
+                    }
+                    None => Self::lane_is_resumable_checked(session, &lane.lane).await?,
+                }
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Cancel the lane's run **and** reclaim its queues in one critical
     /// section.
     ///
@@ -962,12 +1009,7 @@ impl AgentHarness {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// Construct from options. Mirrors TS `AgentHarness.create`: when the
-    /// session already has records (a prior operation) the default is to
-    /// reject (TS throws `HarnessNotImplemented("create.restore")`). The
-    /// restore path (`--continue`/`--resume`/`--session`) sets
-    /// `allow_existing_session` so the harness loads the existing transcript
-    /// and continues appending.
+    /// Construct from options. Existing sessions require explicit restore opt-in.
     pub async fn create(options: AgentHarnessOptions) -> HarnessResult<Self> {
         if !options.allow_existing_session {
             let existing = options
@@ -1179,64 +1221,115 @@ impl AgentHarness {
     /// so a tool result as the tip means the run died before it could. A tool that
     /// set `terminate` legitimately ends the run there, so it is excluded.
     async fn lane_is_resumable(session: &Session, lane: &str) -> bool {
-        // Lane-scoped branch read (the session-wide one is hardcoded to "main").
-        let entries = match session
-            .view(lane)
-            .find_entries_on_branch(
-                &EntryQuery {
-                    order: Some(EntryOrder::OldestFirst),
-                    ..Default::default()
-                },
-                &BranchBounds::default(),
-            )
+        // Preserve legacy recovery's best-effort read behavior. Explicit
+        // transitions instead use the fallible path and fail closed.
+        Self::lane_is_resumable_impl(session, lane, false, None)
             .await
-        {
-            Ok(entries) => entries,
-            Err(_) => return false,
+            .unwrap_or(false)
+    }
+
+    async fn lane_is_resumable_checked(session: &Session, lane: &str) -> HarnessResult<bool> {
+        Self::lane_is_resumable_impl(session, lane, true, None).await
+    }
+
+    async fn lane_is_resumable_impl(
+        session: &Session,
+        lane: &str,
+        strict: bool,
+        deadline: Option<std::time::Instant>,
+    ) -> HarnessResult<bool> {
+        // Pin one leaf: a concurrent append/move must not change the branch
+        // between batches. Bound payload hydration even for very long histories.
+        let view = session.view(lane);
+        let leaf = match view.get_leaf_id().await {
+            Ok(Some(leaf)) => leaf,
+            Ok(None) => return Ok(false),
+            Err(error) if strict => return Err(session_to_harness_err(error)),
+            Err(_) => return Ok(false),
         };
-        let queues = Self::queued_entry_kinds(session, lane).await;
-        for entry in entries.iter().rev() {
-            let message = match entry {
-                Entry::Message(message) => message,
-                Entry::Custom(_) => continue, // extension data is not model input
-                _ => return false,
+        let bounds = BranchBounds {
+            start: Some(leaf),
+            ..Default::default()
+        };
+        let mut cursor = None;
+        loop {
+            if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                return Err(HarnessError::io("saved read processing deadline exceeded"));
+            }
+            let entries = match view
+                .find_entries_on_branch(
+                    &EntryQuery {
+                        order: Some(EntryOrder::NewestFirst),
+                        limit: Some(16),
+                        cursor,
+                        ..Default::default()
+                    },
+                    &bounds,
+                )
+                .await
+            {
+                Ok(entries) => entries,
+                Err(error) if strict => return Err(session_to_harness_err(error)),
+                Err(_) => return Ok(false),
             };
-            match queues.get(&message.base.id) {
-                Some(QueueKind::Steer | QueueKind::FollowUp) => return true,
-                // A silent context update doesn't request a reply. Look behind
-                // it to see whether the interrupted tool batch still did.
-                Some(QueueKind::Context) => continue,
-                _ => {
-                    return matches!(message.message, AgentMessage::ToolResult(_))
-                        && message.terminate != Some(true)
+            let Some(last) = entries.last() else {
+                return Ok(false);
+            };
+            cursor = Some(EntryCursor {
+                after_seq: last.base().seq,
+            });
+            for entry in &entries {
+                let message = match entry {
+                    Entry::Message(message) => message,
+                    Entry::Custom(_) => continue, // extension data is not model input
+                    _ => return Ok(false),
+                };
+                let queue = Self::queued_entry_kind_checked(session, lane, &message.base.id).await;
+                let queue = if strict {
+                    queue?
+                } else {
+                    queue.unwrap_or(None)
+                };
+                match queue {
+                    Some(QueueKind::Steer | QueueKind::FollowUp) => return Ok(true),
+                    // A silent context update doesn't request a reply. Keep
+                    // looking, including across a batch boundary.
+                    Some(QueueKind::Context) => continue,
+                    _ => {
+                        return Ok(matches!(message.message, AgentMessage::ToolResult(_))
+                            && message.terminate != Some(true))
+                    }
                 }
             }
         }
-        false
     }
 
     /// Recovery uses the accepted delivery mode, not a custom message's role,
     /// to distinguish queued continuations from context-only updates.
-    async fn queued_entry_kinds(session: &Session, lane: &str) -> BTreeMap<String, QueueKind> {
-        session
+    async fn queued_entry_kind_checked(
+        session: &Session,
+        lane: &str,
+        entry_id: &str,
+    ) -> HarnessResult<Option<QueueKind>> {
+        // The old newest-first scan collected into a map, so duplicate target
+        // ids were overwritten by the OLDEST enqueue. Preserve that behavior,
+        // filtering before copying payloads and returning at most one record.
+        Ok(session
             .find_records(&RecordQuery {
                 lane: Some(lane.to_string()),
                 record_type: Some("queue_enqueued"),
+                target_entry_id: Some(entry_id.to_string()),
+                order: Some(EntryOrder::OldestFirst),
+                limit: Some(1),
                 ..Default::default()
             })
             .await
-            .unwrap_or_default()
+            .map_err(session_to_harness_err)?
             .into_iter()
-            .filter_map(|record| {
-                let LaneRecord::QueueEnqueued(record) = record else {
-                    return None;
-                };
-                Some((
-                    Self::target_entry_id(&record.target)?.to_string(),
-                    record.queue,
-                ))
-            })
-            .collect()
+            .find_map(|record| match record {
+                LaneRecord::QueueEnqueued(record) => Some(record.queue),
+                _ => None,
+            }))
     }
 
     /// The resume chain a run belongs to: `(origin run id, resumes so far)`.
@@ -3302,10 +3395,10 @@ impl AgentHarness {
             return false;
         };
         matches!(message.message, AgentMessage::User(_))
-            && Self::queued_entry_kinds(session, lane)
+            && Self::queued_entry_kind_checked(session, lane, &message.base.id)
                 .await
-                .get(&message.base.id)
-                != Some(&QueueKind::Context)
+                .unwrap_or(None)
+                != Some(QueueKind::Context)
     }
 
     /// Whether the branch tip is an assistant message.
@@ -6296,6 +6389,9 @@ mod admission_window_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod resumable_probe_tests;
 
 #[cfg(test)]
 mod queue_tests {

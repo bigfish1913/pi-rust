@@ -74,11 +74,71 @@ async fn strict_load(
         Arc::new(CounterIdGenerator::new()),
         reader.clone(),
         length,
-        true,
+        ReadPolicy::Restore,
     )
     .await
     .unwrap();
     (storage, reader)
+}
+
+#[tokio::test]
+async fn strict_cold_replay_obeys_scan_budget_and_metadata_never_hydrates_bodies() {
+    let temp = tempfile::tempdir().unwrap();
+    let fs: Arc<dyn FileSystem> = Arc::new(rpi_tools::OsExecutionEnv::with_cwd(
+        temp.path().to_path_buf(),
+    ));
+    let mut bytes = encode_header(&header());
+    for seq in 1..=12 {
+        let parent = (seq > 1).then(|| format!("e{}", seq - 1));
+        bytes.push_str(&encode_mutation(&message(
+            &format!("e{seq}"),
+            seq,
+            parent.as_deref(),
+            &"x".repeat(CHUNK / 3),
+        )));
+    }
+    fs.write_file("strict.jsonl", FileContent::Text(bytes.clone()), None)
+        .await
+        .unwrap();
+    let reader = Arc::new(StrictReader {
+        inner: fs.open_read_file("strict.jsonl").await.unwrap().unwrap(),
+        calls: AtomicUsize::new(0),
+        ranges: std::sync::Mutex::new(Vec::new()),
+    });
+    let storage = JsonlSessionStorage::load_streaming(
+        fs.clone(),
+        "strict.jsonl",
+        Arc::new(FakeClock::new()),
+        Arc::new(CounterIdGenerator::new()),
+        reader.clone(),
+        bytes.len() as u64,
+        ReadPolicy::ResourceTransitionStrict,
+    )
+    .await
+    .unwrap();
+    let calls = reader.calls.load(Ordering::Relaxed);
+    assert_eq!(calls, bytes.len().div_ceil(CHUNK));
+    assert!(reader
+        .ranges
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|(_, count)| *count <= CHUNK));
+    for seq in 1..=12 {
+        assert!(is_cold(&storage.state.lock().await, &format!("e{seq}")));
+    }
+    storage.facts().await.unwrap();
+    storage.branch_overview("main").await.unwrap();
+    storage.get_lanes().await.unwrap();
+    assert_eq!(
+        reader.calls.load(Ordering::Relaxed),
+        calls,
+        "facts and metadata must not read any historical message payload"
+    );
+    assert_eq!(
+        fs.read_text_file("strict.jsonl", None).await.unwrap(),
+        bytes
+    );
 }
 
 #[tokio::test]
@@ -471,14 +531,15 @@ async fn context_uses_metadata_before_compaction_and_payload_filter_precedes_lim
     assert_eq!(context.active_tool_names, expected.active_tool_names);
     // Only compaction, its tail and the custom entry are hydrated. Model,
     // thinking and active-tools state come from small full-path facts.
-    // Compaction and its tail coalesce; the >256 KiB custom entry stays alone.
-    assert_eq!(reader.calls.load(Ordering::Relaxed) - before, 2);
+    // Compaction and its tail coalesce. The custom row plus its JSON envelope
+    // exceeds 1 MiB and is hydrated alone, through two bounded physical reads.
+    assert_eq!(reader.calls.load(Ordering::Relaxed) - before, 3);
     let ranges = reader.ranges.lock().unwrap();
-    let selected_ranges = &ranges[ranges.len() - 2..];
+    let selected_ranges = &ranges[ranges.len() - 3..];
     assert_eq!(selected_ranges[0].0, context_start);
     assert!(selected_ranges
         .iter()
-        .all(|(offset, _)| *offset >= context_start));
+        .all(|(offset, length)| *offset >= context_start && *length <= CHUNK));
     drop(ranges);
     let before = reader.calls.load(Ordering::Relaxed);
     let overview = storage.branch_overview("main").await.unwrap();
@@ -509,4 +570,385 @@ async fn context_uses_metadata_before_compaction_and_payload_filter_precedes_lim
     drop(inner);
     fs.truncate_file("history.jsonl", 1, None).await.unwrap();
     assert!(storage.get_entry("e7").await.is_err());
+}
+
+fn cold_frame_row(seq: u64, op: &str, payload: serde_json::Value) -> String {
+    serde_json::json!({
+        "kind": "record", "type": "assistant_frame", "id": format!("f{seq}"),
+        "seq": seq, "lane": "main", "timestamp": -(seq as i64),
+        "runId": "run", "streamIndex": 0, "op": op, "frame": payload
+    })
+    .to_string()
+}
+
+async fn load_frame_history(
+    fs: Arc<dyn FileSystem>,
+    path: &str,
+    policy: ReadPolicy,
+) -> (SessionResult<JsonlSessionStorage>, Arc<StrictReader>) {
+    let reader = Arc::new(StrictReader {
+        inner: fs.open_read_file(path).await.unwrap().unwrap(),
+        calls: AtomicUsize::new(0),
+        ranges: std::sync::Mutex::new(Vec::new()),
+    });
+    let length = reader.byte_len().await.unwrap().unwrap();
+    let result = JsonlSessionStorage::load_streaming(
+        fs,
+        path,
+        Arc::new(FakeClock::new()),
+        Arc::new(CounterIdGenerator::new()),
+        reader.clone(),
+        length,
+        policy,
+    )
+    .await;
+    (result, reader)
+}
+
+#[tokio::test]
+async fn cold_frame_duplicate_sequences_compare_semantics_and_reject_conflicts() {
+    let temp = tempfile::tempdir().unwrap();
+    let fs: Arc<dyn FileSystem> = Arc::new(rpi_tools::OsExecutionEnv::with_cwd(
+        temp.path().to_path_buf(),
+    ));
+    for op in ["append", "clear_stream", "clear_run"] {
+        let first = cold_frame_row(1, op, serde_json::json!({"a": 1, "z": [true, null]}));
+        let value: serde_json::Value = serde_json::from_str(&first).unwrap();
+        let fields = value
+            .as_object()
+            .unwrap()
+            .iter()
+            .rev()
+            .map(|(key, value)| format!("{key:?}: {value}"))
+            .collect::<Vec<_>>();
+        let duplicate = format!(" {{ {} }} ", fields.join(", "));
+        assert_ne!(first, duplicate);
+        assert_eq!(
+            parse_mutation(&first).unwrap(),
+            parse_mutation(&duplicate).unwrap()
+        );
+        assert!(crate::session::jsonl::cold_decode::parse_cold_frame(&first).is_some());
+        assert!(crate::session::jsonl::cold_decode::parse_cold_frame(&duplicate).is_some());
+        // The first row is fresh and fast; its stale equivalent must re-read
+        // that original row through the full codec, even after a later seq.
+        let next = cold_frame_row(2, "append", serde_json::json!("later"));
+        let original = format!(
+            "{}{}\n{}\n{}\n",
+            encode_header(&header()),
+            first,
+            next,
+            duplicate
+        );
+        fs.write_file("frames.jsonl", FileContent::Text(original.clone()), None)
+            .await
+            .unwrap();
+        let (strict, _) = load_frame_history(
+            fs.clone(),
+            "frames.jsonl",
+            ReadPolicy::ResourceTransitionStrict,
+        )
+        .await;
+        assert!(strict
+            .err()
+            .unwrap()
+            .message
+            .contains("duplicate history sequences"));
+        let (restored, reader) =
+            load_frame_history(fs.clone(), "frames.jsonl", ReadPolicy::Restore).await;
+        let restored = restored.unwrap();
+        assert_eq!(restored.state.lock().await.sequence(), 2);
+        let mut expected = SessionState::new();
+        expected
+            .apply_mutation(parse_mutation(&first).unwrap())
+            .unwrap();
+        expected
+            .apply_mutation(parse_mutation(&next).unwrap())
+            .unwrap();
+        let query = crate::session::types::RecordQuery::default();
+        assert_eq!(
+            restored.find_records(&query).await.unwrap(),
+            expected.find_records(&query).unwrap()
+        );
+        assert!(
+            reader.calls.load(Ordering::Relaxed) > 1,
+            "duplicates require a reference-row read"
+        );
+        let repaired = fs.read_text_file("frames.jsonl", None).await.unwrap();
+        assert_eq!(
+            repaired,
+            format!("{}{}\n{}\n", encode_header(&header()), first, next)
+        );
+        let mut conflicting = value;
+        conflicting["frame"] = serde_json::json!({"a": 2, "z": [true, null]});
+        fs.write_file(
+            "conflict.jsonl",
+            FileContent::Text(format!(
+                "{}{}\n{}\n",
+                encode_header(&header()),
+                first,
+                conflicting
+            )),
+            None,
+        )
+        .await
+        .unwrap();
+        let (result, _) =
+            load_frame_history(fs.clone(), "conflict.jsonl", ReadPolicy::Restore).await;
+        let error = result.err().unwrap();
+        assert!(
+            error
+                .message
+                .contains("conflicting mutations share sequence 1"),
+            "{error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cold_frame_reordered_fields_and_duplicate_known_keys_keep_full_codec_authority() {
+    let temp = tempfile::tempdir().unwrap();
+    let fs: Arc<dyn FileSystem> = Arc::new(rpi_tools::OsExecutionEnv::with_cwd(
+        temp.path().to_path_buf(),
+    ));
+    // Frame before discriminators; unknown duplicate keys do not require fallback.
+    let reordered = r#"{"frame":{"z":"🌊","a":[null,true]},"op":"append","streamIndex":3,"runId":"run","timestamp":-1,"lane":"main","seq":1,"id":"f1","extra":1,"extra":2,"type":"assistant_frame","kind":"record"}"#;
+    // Known duplicate keys must fall back to Value's last-key-wins behavior,
+    // including an earlier invalid type and an earlier conflicting identity.
+    let canonical = cold_frame_row(2, "append", serde_json::json!({"text": "kept"}));
+    let fallback = canonical.replacen(
+        '{',
+        r#"{"streamIndex":"invalid","id":"shadow","frame":"discarded","#,
+        1,
+    );
+    assert!(crate::session::jsonl::cold_decode::parse_cold_frame(reordered).is_some());
+    assert!(crate::session::jsonl::cold_decode::parse_cold_frame(&fallback).is_none());
+    assert_eq!(
+        parse_mutation(&fallback).unwrap(),
+        parse_mutation(&canonical).unwrap()
+    );
+    let bytes = format!("{}{}\n{}\n", encode_header(&header()), reordered, fallback);
+    fs.write_file("fields.jsonl", FileContent::Text(bytes.clone()), None)
+        .await
+        .unwrap();
+    let (result, reader) = load_frame_history(
+        fs.clone(),
+        "fields.jsonl",
+        ReadPolicy::ResourceTransitionStrict,
+    )
+    .await;
+    let storage = result.unwrap();
+    assert_eq!(reader.calls.load(Ordering::Relaxed), 1);
+    {
+        let state = storage.state.lock().await;
+        assert_eq!(state.sequence(), 2);
+        assert!(state.validate_unused_id("shadow").is_ok());
+        assert!(state.validate_unused_id("f2").is_err());
+    }
+    let mut eager = SessionState::new();
+    for line in [reordered, fallback.as_str()] {
+        eager.apply_mutation(parse_mutation(line).unwrap()).unwrap();
+    }
+    let query = crate::session::types::RecordQuery::default();
+    assert_eq!(
+        storage.find_records(&query).await.unwrap(),
+        eager.find_records(&query).unwrap()
+    );
+    assert_eq!(
+        fs.read_text_file("fields.jsonl", None).await.unwrap(),
+        bytes
+    );
+}
+
+#[tokio::test]
+async fn fresh_fast_frames_cross_chunk_boundaries_and_recover_complete_or_torn_tails() {
+    let temp = tempfile::tempdir().unwrap();
+    let fs: Arc<dyn FileSystem> = Arc::new(rpi_tools::OsExecutionEnv::with_cwd(
+        temp.path().to_path_buf(),
+    ));
+    let template = cold_frame_row(1, "append", serde_json::json!({"delta": "BOUNDARY"}));
+    let padding = CHUNK - encode_header(&header()).len() - template.find("BOUNDARY").unwrap() - 1;
+    let large = cold_frame_row(
+        1,
+        "append",
+        serde_json::json!({
+            "delta": format!("{}🌊\r\n{}", "x".repeat(padding), "🌊".repeat(CHUNK / 4))
+        }),
+    );
+    assert!(large.len() > CHUNK);
+    let absolute_emoji = encode_header(&header()).len() + large.find('🌊').unwrap();
+    assert_eq!(
+        absolute_emoji,
+        CHUNK - 1,
+        "UTF-8 must straddle the scan boundary"
+    );
+    let tail = cold_frame_row(2, "append", serde_json::json!([null, {"tail": "🌊"}]));
+    // Fresh monotone sequences + recognizer success force load_streaming's
+    // metadata-only branch, unlike tests that only call the recognizer.
+    for line in [&large, &tail] {
+        assert!(crate::session::jsonl::cold_decode::parse_cold_frame(line).is_some());
+    }
+    let mut eager = SessionState::new();
+    for line in [&large, &tail] {
+        eager.apply_mutation(parse_mutation(line).unwrap()).unwrap();
+    }
+    for (index, (suffix, policy)) in [
+        ("\n", ReadPolicy::ResourceTransitionStrict),
+        ("", ReadPolicy::Restore),
+        ("\n{\"kind\":", ReadPolicy::Restore),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let path = format!("large-frame-{index}.jsonl");
+        let bytes = format!(
+            "{}{}\r\n{}{}",
+            encode_header(&header()),
+            large,
+            tail,
+            suffix
+        );
+        fs.write_file(&path, FileContent::Text(bytes.clone()), None)
+            .await
+            .unwrap();
+        let (result, reader) = load_frame_history(fs.clone(), &path, policy).await;
+        let storage = result.unwrap();
+        if index == 0 {
+            assert_eq!(
+                reader.calls.load(Ordering::Relaxed),
+                bytes.len().div_ceil(CHUNK)
+            );
+        }
+        assert!(reader
+            .ranges
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(_, length)| *length <= CHUNK));
+        let before = reader.calls.load(Ordering::Relaxed);
+        storage.facts().await.unwrap();
+        assert_eq!(storage.state.lock().await.sequence(), 2);
+        assert_eq!(
+            reader.calls.load(Ordering::Relaxed),
+            before,
+            "metadata must not hydrate frame bodies"
+        );
+        let query = crate::session::types::RecordQuery::default();
+        assert!(
+            storage
+                .state
+                .lock()
+                .await
+                .find_records(&query)
+                .unwrap()
+                .is_empty(),
+            "fresh frames must remain outside the resident reducer"
+        );
+        assert_eq!(
+            storage.find_records(&query).await.unwrap(),
+            eager.find_records(&query).unwrap()
+        );
+        assert_eq!(
+            storage.find_records(&query).await.unwrap(),
+            eager.find_records(&query).unwrap()
+        );
+        let repaired = fs.read_text_file(&path, None).await.unwrap();
+        assert!(repaired.ends_with('\n'));
+        assert_eq!(repaired.lines().count(), 3);
+    }
+}
+
+#[tokio::test]
+async fn raw_value_clear_rows_keep_canonical_tail_and_policy_semantics() {
+    let temp = tempfile::tempdir().unwrap();
+    let fs: Arc<dyn FileSystem> = Arc::new(rpi_tools::OsExecutionEnv::with_cwd(
+        temp.path().to_path_buf(),
+    ));
+    let append = cold_frame_row(1, "append", serde_json::json!({"delta": "kept"}));
+    let bad_clear = cold_frame_row(
+        2,
+        "clear_run",
+        serde_json::json!({"$serde_json::private::RawValue": 0}),
+    );
+    // This row is valid outer JSON, but canonical Value decoding rejects its
+    // raw_value protocol value. The cold recognizer must therefore never
+    // retire the preceding append before policy-specific canonical handling.
+    assert!(crate::session::jsonl::cold_decode::parse_cold_frame(&bad_clear).is_none());
+    assert!(parse_mutation(&bad_clear).is_err());
+
+    let make_history = |middle: bool| {
+        if middle {
+            format!(
+                "{}{}\n{}\n{}\n",
+                encode_header(&header()),
+                append,
+                bad_clear,
+                cold_frame_row(3, "append", serde_json::json!({"delta": "after"}))
+            )
+        } else {
+            format!("{}{}\n{}\n", encode_header(&header()), append, bad_clear)
+        }
+    };
+
+    // A canonical syntax failure at the physical tail is recoverable only for
+    // Restore: the repaired source contains the valid prefix and sequence 1.
+    let tail = make_history(false);
+    fs.write_file("raw-tail.jsonl", FileContent::Text(tail), None)
+        .await
+        .unwrap();
+    let (restored, _) = load_frame_history(fs.clone(), "raw-tail.jsonl", ReadPolicy::Restore).await;
+    let restored = restored.unwrap();
+    assert_eq!(restored.state.lock().await.sequence(), 1);
+    assert_eq!(
+        fs.read_text_file("raw-tail.jsonl", None).await.unwrap(),
+        format!("{}{}\n", encode_header(&header()), append)
+    );
+
+    // FactsOnly has the same acceptance boundary but cannot publish repair;
+    // the prior append remains accepted and the bad tail remains untouched.
+    let facts_tail = make_history(false);
+    fs.write_file(
+        "raw-facts-tail.jsonl",
+        FileContent::Text(facts_tail.clone()),
+        None,
+    )
+    .await
+    .unwrap();
+    let (facts, _) =
+        load_frame_history(fs.clone(), "raw-facts-tail.jsonl", ReadPolicy::FactsOnly).await;
+    assert_eq!(facts.unwrap().state.lock().await.sequence(), 1);
+    assert_eq!(
+        fs.read_text_file("raw-facts-tail.jsonl", None)
+            .await
+            .unwrap(),
+        facts_tail
+    );
+
+    // Middle corruption is never a torn tail, and strict mode rejects the
+    // same canonical error even when it is physically last.
+    for (path, history, policy) in [
+        (
+            "raw-middle-restore.jsonl",
+            make_history(true),
+            ReadPolicy::Restore,
+        ),
+        (
+            "raw-middle-facts.jsonl",
+            make_history(true),
+            ReadPolicy::FactsOnly,
+        ),
+        (
+            "raw-tail-strict.jsonl",
+            make_history(false),
+            ReadPolicy::ResourceTransitionStrict,
+        ),
+    ] {
+        fs.write_file(path, FileContent::Text(history), None)
+            .await
+            .unwrap();
+        let (result, _) = load_frame_history(fs.clone(), path, policy).await;
+        assert!(
+            result.is_err(),
+            "canonical raw_value error must remain visible: {path}"
+        );
+    }
 }

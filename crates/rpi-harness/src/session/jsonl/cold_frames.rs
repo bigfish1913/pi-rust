@@ -16,6 +16,39 @@ use std::{
     sync::Arc,
 };
 
+/// A single JSONL row may exceed the scanner's 1 MiB I/O window. Keep
+/// hydration bounded at the reader boundary too, without splitting JSON values
+/// or weakening the per-location digest and identity checks.
+async fn read_range_bounded(
+    reader: &Arc<dyn ReadFile>,
+    offset: u64,
+    length: usize,
+) -> SessionResult<Vec<u8>> {
+    const CHUNK: usize = 1024 * 1024;
+    if length <= CHUNK {
+        return file_result(
+            reader.read_range(offset, length).await,
+            "read cold history range",
+        );
+    }
+    let mut bytes = Vec::with_capacity(length);
+    for start in (0..length).step_by(CHUNK) {
+        let count = (length - start).min(CHUNK);
+        let at = offset
+            .checked_add(start as u64)
+            .ok_or_else(|| SessionError::storage("cold history range overflow"))?;
+        let chunk = file_result(
+            reader.read_range(at, count).await,
+            "read cold history range",
+        )?;
+        if chunk.len() != count {
+            return Err(SessionError::storage("short cold history read"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
 #[derive(Clone)]
 pub(super) struct Location {
     reader: Arc<dyn ReadFile>,
@@ -27,12 +60,12 @@ pub(super) struct Location {
     length: usize,
     digest: [u8; 32],
     id: String,
-    lane: String,
-    run: String,
+    lane: Arc<str>,
+    run: Arc<str>,
 }
 impl Location {
     fn new(reader: Arc<dyn ReadFile>, offset: u64, raw: &[u8], mutation: &SessionMutation) -> Self {
-        let (id, lane, run) = match mutation {
+        let (id, lane, run): (String, String, String) = match mutation {
             SessionMutation::Entry { entry, .. } => {
                 (entry.id().into(), String::new(), String::new())
             }
@@ -59,15 +92,12 @@ impl Location {
             length: raw.len(),
             digest: Sha256::digest(raw).into(),
             id,
-            lane,
-            run,
+            lane: Arc::from(lane),
+            run: Arc::from(run),
         }
     }
     async fn read(&self) -> SessionResult<SessionMutation> {
-        let raw = file_result(
-            self.reader.read_range(self.offset, self.length).await,
-            "read cold history range",
-        )?;
+        let raw = read_range_bounded(&self.reader, self.offset, self.length).await?;
         self.decode(&raw)
     }
     fn decode(&self, raw: &[u8]) -> SessionResult<SessionMutation> {
@@ -87,8 +117,8 @@ impl Location {
             SessionMutation::Entry { entry, .. } => entry.id() == self.id,
             SessionMutation::Record { record } => {
                 record.id() == self.id
-                    && record.lane() == self.lane
-                    && record.run_id().unwrap_or_default() == self.run
+                    && record.lane() == self.lane.as_ref()
+                    && record.run_id().unwrap_or_default() == self.run.as_ref()
             }
             _ => false,
         };
@@ -212,6 +242,9 @@ impl JsonlPayload {
 #[derive(Clone, Default)]
 struct ColdFrames {
     locations: Vec<Arc<Location>>,
+    // Only unretired append locations. Clears do not repeatedly walk all prior
+    // runs; immutable read plans continue owning their original Location Arcs.
+    active: HashMap<String, HashMap<usize, Vec<usize>>>,
 }
 #[derive(Clone)]
 pub(super) struct ResidentState {
@@ -220,6 +253,10 @@ pub(super) struct ResidentState {
     // Only the currently durable batch, consumed by apply_mutation. Custom
     // appenders without receipts simply leave real payloads resident.
     pending: HashMap<u64, Arc<Location>>,
+    // Most consecutive historical frames share one lane and run. Keep at most
+    // these two symbols, not a lifetime-wide interning table.
+    last_frame_lane: Option<Arc<str>>,
+    last_frame_run: Option<Arc<str>>,
 }
 impl Default for ResidentState {
     fn default() -> Self {
@@ -227,6 +264,8 @@ impl Default for ResidentState {
             reducer: IndexedState::new(),
             cold: ColdFrames::default(),
             pending: HashMap::new(),
+            last_frame_lane: None,
+            last_frame_run: None,
         }
     }
 }
@@ -285,7 +324,7 @@ impl ResidentState {
                 self.reducer.reserve_cold_frame(frame)?;
                 self.reducer.retire_cleared_frames(frame);
                 self.cold.retire(frame);
-                self.cold.locations.push(source.clone());
+                self.cold.push(source.clone());
                 return Ok(ApplyOutcome::Record(LaneRecord::AssistantFrame(
                     frame.clone(),
                 )));
@@ -323,6 +362,77 @@ impl ResidentState {
         }
         Ok(self.reducer.into_session_state(entries, frames))
     }
+    /// Facts-only preflight still validates every historical ID/sequence/lane,
+    /// but exports no frame-query capability and needs no payload locations.
+    pub fn reserve_loaded_frame(
+        &mut self,
+        metadata: super::cold_decode::ColdFrame<'_>,
+    ) -> SessionResult<()> {
+        self.reserve_frame_metadata(&metadata)
+    }
+    fn reserve_frame_metadata(
+        &mut self,
+        metadata: &super::cold_decode::ColdFrame<'_>,
+    ) -> SessionResult<()> {
+        self.reducer
+            .reserve_cold_frame_identity(&metadata.id, metadata.seq, &metadata.lane)?;
+        if matches!(
+            metadata.op,
+            AssistantFrameOp::ClearStream | AssistantFrameOp::ClearRun
+        ) {
+            let frame = AssistantFrameRecord {
+                base: RecordBase {
+                    id: metadata.id.to_string(),
+                    seq: metadata.seq,
+                    timestamp: metadata.timestamp,
+                    lane: metadata.lane.to_string(),
+                },
+                run_id: metadata.run_id.to_string(),
+                stream_index: metadata.stream_index,
+                op: metadata.op,
+                frame: None,
+            };
+            self.reducer.retire_cleared_frames(&frame);
+            self.cold.retire(&frame);
+        }
+        Ok(())
+    }
+    /// Apply a validated historical frame without constructing its discarded
+    /// JSON payload or a payload-bearing ApplyOutcome. Hydration still uses the
+    /// original codec and the same digest/reader-generation checks.
+    pub fn apply_loaded_frame(
+        &mut self,
+        metadata: super::cold_decode::ColdFrame<'_>,
+        reader: &Arc<dyn ReadFile>,
+        offset: u64,
+        raw: &[u8],
+    ) -> SessionResult<()> {
+        self.reserve_frame_metadata(&metadata)?;
+        fn symbol(slot: &mut Option<Arc<str>>, value: &str) -> Arc<str> {
+            if let Some(current) = slot.as_ref().filter(|current| current.as_ref() == value) {
+                return current.clone();
+            }
+            let current = Arc::<str>::from(value);
+            *slot = Some(current.clone());
+            current
+        }
+        let lane = symbol(&mut self.last_frame_lane, &metadata.lane);
+        let run = symbol(&mut self.last_frame_run, &metadata.run_id);
+        self.cold.push(Arc::new(Location {
+            reader: reader.clone(),
+            seq: metadata.seq,
+            stream_index: metadata.stream_index,
+            append: metadata.op == AssistantFrameOp::Append,
+            retired: false,
+            offset,
+            length: raw.len(),
+            digest: Sha256::digest(raw).into(),
+            id: metadata.id.into_owned(),
+            lane,
+            run,
+        }));
+        Ok(())
+    }
     pub fn apply_loaded(
         &mut self,
         mutation: SessionMutation,
@@ -330,8 +440,12 @@ impl ResidentState {
         offset: u64,
         raw: &[u8],
     ) -> SessionResult<()> {
-        let source = Arc::new(Location::new(reader.clone(), offset, raw, &mutation));
-        self.apply_source(mutation, Some(source)).map(|_| ())
+        let source = matches!(
+            mutation,
+            SessionMutation::Entry { .. } | SessionMutation::Record { .. }
+        )
+        .then(|| Arc::new(Location::new(reader.clone(), offset, raw, &mutation)));
+        self.apply_source(mutation, source).map(|_| ())
     }
     pub fn bind_append(&mut self, receipt: AppendReceipt, bytes: &[u8]) {
         let mut offset = receipt.offset;
@@ -581,8 +695,8 @@ impl ResidentState {
             selected.extend(
                 iter.filter(|loc| {
                     !loc.retired
-                        && query.lane.as_ref().is_none_or(|v| v == &loc.lane)
-                        && query.run_id.as_ref().is_none_or(|v| v == &loc.run)
+                        && query.lane.as_ref().is_none_or(|v| v == loc.lane.as_ref())
+                        && query.run_id.as_ref().is_none_or(|v| v == loc.run.as_ref())
                         && query.after_seq.is_none_or(|v| loc.seq > v)
                 })
                 .take(query.limit.unwrap_or(usize::MAX))
@@ -601,7 +715,7 @@ impl ResidentState {
         let hot = self.reducer.record_page(query)?;
         let matching = |loc: &&Arc<Location>| {
             !loc.retired
-                && loc.lane == query.lane
+                && loc.lane.as_ref() == query.lane
                 && query.after_seq.is_none_or(|v| loc.seq > v)
                 && query.before_seq.is_none_or(|v| loc.seq < v)
         };
@@ -657,7 +771,11 @@ impl ResidentState {
         selected.truncate(options.limit.unwrap_or(usize::MAX));
         Ok(LogPlan { selected })
     }
-    pub fn fork_plan(&self, options: &ForkOptions) -> SessionResult<ForkPlan> {
+    pub fn fork_plan(
+        &self,
+        options: &ForkOptions,
+        include_values: bool,
+    ) -> SessionResult<ForkPlan> {
         let (indices, lanes) = match options {
             ForkOptions::Tree => (
                 (0..self.reducer.metadata().len()).collect::<Vec<_>>(),
@@ -666,36 +784,15 @@ impl ResidentState {
             ForkOptions::Branch { entry_id, position } => {
                 let selected = entry_id.clone().or(self.reducer.require_lane("main")?);
                 let target = if let Some(id) = selected {
-                    let mut i = self
+                    let i = self
                         .reducer
                         .entry_index(&id)
                         .ok_or_else(|| SessionError::not_found(format!("Entry not found: {id}")))?;
-                    // Match SessionState's implicit-tip contract without reading
-                    // cold payloads. Explicit non-message targets still error.
-                    if entry_id.is_none() {
-                        let mut steps = 0usize;
-                        while self.reducer.entry_meta(i).unwrap().kind != "message" {
-                            let Some(parent) =
-                                self.reducer.entry_meta(i).unwrap().parent_id.as_deref()
-                            else {
-                                break;
-                            };
-                            i = self.reducer.entry_index(parent).ok_or_else(|| {
-                                SessionError::not_found(format!("Entry not found: {parent}"))
-                            })?;
-                            if self.reducer.entry_meta(i).unwrap().kind == "message" {
-                                break;
-                            }
-                            steps += 1;
-                            if steps > 10_000 {
-                                return Err(SessionError::invalid_fork_target(format!(
-                                    "Fork target has no message ancestor: {id}"
-                                )));
-                            }
-                        }
-                    }
+                    // An omitted target denotes the actual leaf, including
+                    // custom/model/thinking entries. Only explicit targets
+                    // retain the ordinary message-only contract.
                     let meta = self.reducer.entry_meta(i).unwrap();
-                    if meta.kind != "message" {
+                    if entry_id.is_some() && meta.kind != "message" {
                         return Err(SessionError::invalid_fork_target(format!(
                             "Fork target is not a message entry: {id}"
                         )));
@@ -736,6 +833,22 @@ impl ResidentState {
             lanes,
             labels,
             name: self.reducer.get_name().map(str::to_owned),
+            // Source-wide latest values, not merely values on the selected
+            // branch. Capture references under the same lock/reader generation
+            // as the cut; hydration and host validation happen before publish.
+            source_values: if include_values {
+                Some(self.entry_plan(
+                    &EntryQuery {
+                        entry_type: Some("custom"),
+                        custom_type: Some(crate::session::values::VALUE_CUSTOM_TYPE.into()),
+                        order: Some(EntryOrder::OldestFirst),
+                        ..Default::default()
+                    },
+                    None,
+                )?)
+            } else {
+                None
+            },
         })
     }
 }
@@ -744,6 +857,7 @@ pub(super) struct ForkPlan {
     pub lanes: Vec<LanePointer>,
     pub labels: Vec<(String, String)>,
     pub name: Option<String>,
+    pub source_values: Option<EntryPlan>,
 }
 fn restore_entry(
     mutation: SessionMutation,
@@ -806,10 +920,7 @@ async fn read_entries(selected: Vec<JsonlPayload>) -> SessionResult<Vec<Entry>> 
             end += 1;
         }
         let length = usize::try_from(range_end - first.offset).map_err(|_| overflow())?;
-        let bytes = file_result(
-            first.reader.read_range(first.offset, length).await,
-            "read cold history range",
-        )?;
+        let bytes = read_range_bounded(&first.reader, first.offset, length).await?;
         if bytes.len() != length {
             return Err(SessionError::storage("short cold history read"));
         }
@@ -1056,10 +1167,7 @@ async fn read_frames(locations: Vec<Arc<Location>>) -> SessionResult<HashMap<u64
         }
         let length = usize::try_from(range_end - first.offset)
             .map_err(|_| SessionError::storage("cold history range overflow"))?;
-        let bytes = file_result(
-            first.reader.read_range(first.offset, length).await,
-            "read cold history range",
-        )?;
+        let bytes = read_range_bounded(&first.reader, first.offset, length).await?;
         if bytes.len() != length {
             return Err(SessionError::storage("short cold history read"));
         }
@@ -1158,22 +1266,42 @@ mod context_usage_tests;
 mod tests;
 
 impl ColdFrames {
-    fn retire(&mut self, frame: &AssistantFrameRecord) {
-        if !matches!(
-            frame.op,
-            AssistantFrameOp::ClearStream | AssistantFrameOp::ClearRun
-        ) {
-            return;
+    fn push(&mut self, location: Arc<Location>) {
+        if location.append {
+            if !self.active.contains_key(location.run.as_ref()) {
+                self.active.insert(location.run.to_string(), HashMap::new());
+            }
+            self.active
+                .get_mut(location.run.as_ref())
+                .expect("active run inserted")
+                .entry(location.stream_index)
+                .or_default()
+                .push(self.locations.len());
         }
-        // Plans own their immutable Location generation. Copy only the tiny
-        // location when retiring it, never a payload or the whole index.
-        for loc in &mut self.locations {
-            if loc.append
-                && loc.run == frame.run_id
-                && (frame.op == AssistantFrameOp::ClearRun
-                    || loc.stream_index == frame.stream_index)
-            {
-                Arc::make_mut(loc).retired = true;
+        self.locations.push(location);
+    }
+    fn retire(&mut self, frame: &AssistantFrameRecord) {
+        let streams = match frame.op {
+            AssistantFrameOp::ClearRun => self.active.remove(&frame.run_id),
+            AssistantFrameOp::ClearStream => {
+                let Some(streams) = self.active.get_mut(&frame.run_id) else {
+                    return;
+                };
+                let selected = streams.remove(&frame.stream_index);
+                if streams.is_empty() {
+                    self.active.remove(&frame.run_id);
+                }
+                selected.map(|positions| HashMap::from([(frame.stream_index, positions)]))
+            }
+            _ => return,
+        };
+        // Preserve historical run/stream matching (including across lanes).
+        // IDs remain reserved independently of this disposable lookup index.
+        if let Some(streams) = streams {
+            for positions in streams.into_values() {
+                for position in positions {
+                    Arc::make_mut(&mut self.locations[position]).retired = true;
+                }
             }
         }
     }

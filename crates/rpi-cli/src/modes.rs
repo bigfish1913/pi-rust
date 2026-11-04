@@ -551,17 +551,34 @@ where
     let mut run_cancel = tokio_util::sync::CancellationToken::new();
     let mut cancel_on_exit = false;
 
+    let binding = match rpi_harness::session::SessionValues::load(harness.session()).await {
+        Ok(values) => crate::resource_selection::binding_state(&values),
+        Err(error) => {
+            eprintln!("resource binding read failed: {error}");
+            return 1;
+        }
+    };
     let mut ready = rpc_protocol::ready(message_updates);
     ready["resourceState"] = serde_json::json!({
         "version": 1, "enabled": harness.has_exact_resources(), "command": "get_resource_state",
         "maxSnapshotBytes": crate::resource_selection::MAX_STATE_BYTES,
         "changes": "restart-required", "setActiveTools": if harness.has_exact_resources() { "unsupported" } else { "legacy" },
         "configureExternalTools": if harness.has_exact_resources() { "unsupported" } else { "supported" },
-        "automaticPersistenceRecovery": false, "hotApply": false
+        "automaticPersistenceRecovery": false, "hotApply": false,
+        "packageScopes": ["project", "global"], "defaultPackageScope": "project",
+        "transition": crate::resource_selection::transition_capability(),
+        "binding": binding
     });
     if harness.has_exact_resources() {
         if let Ok(state) = crate::resource_selection::get_resource_state(harness).await {
-            for key in ["hostId", "host", "sessionId", "selection"] {
+            for key in [
+                "hostId",
+                "host",
+                "sessionId",
+                "selection",
+                "binding",
+                "transition",
+            ] {
                 ready["resourceState"][key] = state[key].clone();
             }
         } else {
@@ -2987,6 +3004,56 @@ mod tests {
                 assert_eq!(query.cursor, Some(EntryCursor { after_seq: 42 }));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn resource_selection_binding_is_protected_for_scoped_and_unscoped_public_appends() {
+        use rpi_extensions::RuntimeActionHost;
+        let harness = AgentHarness::create(Default::default()).await.unwrap();
+        let (host, cell) = crate::extensions_actions::HarnessActionHost::new_empty(
+            vec![],
+            std::env::temp_dir(),
+            tokio::runtime::Handle::current(),
+            Default::default(),
+            rpi_extensions::ToolCallContext::default(),
+        );
+        crate::extensions_actions::HarnessActionHost::set_harness(&cell, Arc::new(harness.clone()));
+        let (_, session_id, leaf_id) = branch_snapshot(
+            &harness,
+            &branch_entry_query(&serde_json::json!({"customTypes":["rpi.value"]})).unwrap(),
+        )
+        .await
+        .unwrap();
+        let guard = serde_json::json!({
+            "sessionId": session_id, "leafId": leaf_id,
+            "customType": "rpi.value", "entryId": null
+        });
+        for key in ["rpi.resource-selection.v1", "rpi.resource-inventory.v1"] {
+            for value in [serde_json::Value::Null, serde_json::json!({"forged":true})] {
+                for scoped in [false, true] {
+                    let mut request = serde_json::json!({
+                        "customType":"rpi.value", "data":{"key":key,"value":value}
+                    });
+                    if scoped {
+                        request["expected"] = guard.clone();
+                    }
+                    assert!(rpc_append_entry(&harness, &request)
+                        .await
+                        .unwrap_err()
+                        .contains("host-owned"));
+                    assert!(host
+                        .append_entry(request)
+                        .await
+                        .unwrap_err()
+                        .contains("host-owned"));
+                }
+            }
+        }
+        let request = serde_json::json!({
+            "customType":"rpi.value", "data":{"key":"user.preference","value":1},
+            "expected":guard
+        });
+        assert_eq!(host.append_entry(request).await.unwrap()["scoped"], true);
     }
 
     #[tokio::test]
