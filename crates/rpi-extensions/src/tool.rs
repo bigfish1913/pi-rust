@@ -249,6 +249,9 @@ fn parse_result_envelope_with(
         if value.get("result").is_some() {
             return Err("result and resultReference are mutually exclusive".into());
         }
+        if value.get("contentParts").is_some() {
+            return Err("contentParts and resultReference are mutually exclusive".into());
+        }
         let reference = reference
             .as_object()
             .ok_or("resultReference must be an object")?;
@@ -275,37 +278,17 @@ fn parse_result_envelope_with(
     let result = value["result"]
         .as_object()
         .ok_or("result must be an object")?;
-    let blocks = result
-        .get("content")
-        .and_then(Value::as_array)
-        .ok_or("content must be an array")?;
-    if blocks.len() > 256 {
-        return Err("content exceeds 256 blocks".into());
-    }
-    let mut content = Vec::with_capacity(blocks.len());
-    for block in blocks {
-        content.push(match block["type"].as_str() {
-            Some("text") => TextContentOrImage::Text(
-                serde_json::from_value(block.clone()).map_err(|e| e.to_string())?,
-            ),
-            Some("image") => {
-                let image: rpi_ai::types::ImageContent =
-                    serde_json::from_value(block.clone()).map_err(|e| e.to_string())?;
-                if !matches!(
-                    image.mime_type.as_str(),
-                    "image/png" | "image/jpeg" | "image/gif" | "image/webp"
-                ) || image.data.is_empty()
-                {
-                    return Err("invalid image MIME/data".into());
-                }
-                if !canonical_image_base64(&image.data) {
-                    return Err("invalid image base64".into());
-                }
-                TextContentOrImage::Image(image)
-            }
-            _ => return Err("unsupported content block".into()),
-        });
-    }
+    let content = if let Some(parts) = value.get("contentParts") {
+        if result.contains_key("content") {
+            return Err("result.content is forbidden with contentParts".into());
+        }
+        let parts = parse_content_parts(parts)?;
+        invocation
+            .ok_or("content parts require a live invocation bridge")?
+            .resolve_content_parts(parts)?
+    } else {
+        parse_inline_content(result.get("content").ok_or("content must be an array")?)?
+    };
     let details = result.get("details").ok_or("details is required")?.clone();
     let terminate = result
         .get("terminate")
@@ -338,6 +321,100 @@ fn parse_result_envelope_with(
     } else {
         Ok(result)
     })
+}
+
+/// Shared strict inline parser for legacy envelopes and attachment parts.
+fn parse_inline_content(value: &Value) -> Result<Vec<TextContentOrImage>, String> {
+    let blocks = value.as_array().ok_or("content must be an array")?;
+    if blocks.len() > 256 {
+        return Err("content exceeds 256 blocks".into());
+    }
+    let mut content = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        content.push(match block["type"].as_str() {
+            Some("text") => TextContentOrImage::Text(
+                serde_json::from_value(block.clone()).map_err(|e| e.to_string())?,
+            ),
+            Some("image") => {
+                let image: rpi_ai::types::ImageContent =
+                    serde_json::from_value(block.clone()).map_err(|e| e.to_string())?;
+                if !matches!(
+                    image.mime_type.as_str(),
+                    "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+                ) || image.data.is_empty()
+                {
+                    return Err("invalid image MIME/data".into());
+                }
+                if !canonical_image_base64(&image.data) {
+                    return Err("invalid image base64".into());
+                }
+                TextContentOrImage::Image(image)
+            }
+            _ => return Err("unsupported content block".into()),
+        });
+    }
+    Ok(content)
+}
+
+fn parse_content_parts(
+    value: &Value,
+) -> Result<Vec<rpi_agent::tool_program::ToolProgramContentPart>, String> {
+    use rpi_agent::tool_program::ToolProgramContentPart;
+    let parts = value.as_array().ok_or("contentParts must be an array")?;
+    if parts.len() > 256 {
+        return Err("content exceeds 256 parts".into());
+    }
+    let mut parsed = Vec::with_capacity(parts.len());
+    let mut inline_blocks = 0;
+    for part in parts {
+        let part = part.as_object().ok_or("content part must be an object")?;
+        if part.contains_key("content") {
+            if part.len() != 1 {
+                return Err("inline part must contain only content".into());
+            }
+            let blocks = parse_inline_content(&part["content"])?;
+            inline_blocks += blocks.len();
+            if inline_blocks > 256 {
+                return Err("content exceeds 256 blocks".into());
+            }
+            parsed.push(ToolProgramContentPart::Inline(blocks));
+        } else {
+            if part.keys().any(|k| k != "reference" && k != "indices") {
+                return Err("unknown content reference part key".into());
+            }
+            let reference = part
+                .get("reference")
+                .and_then(Value::as_object)
+                .ok_or("content part requires content or reference")?;
+            if reference.len() != 2 || reference.get("version").and_then(Value::as_u64) != Some(1) {
+                return Err("invalid content reference version/keys".into());
+            }
+            let id = reference
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or("content reference id is required")?
+                .to_owned();
+            let indices = match part.get("indices") {
+                None | Some(Value::Null) => None,
+                Some(Value::Array(values)) if values.len() <= 256 => Some(
+                    values
+                        .iter()
+                        .map(|v| {
+                            v.as_u64()
+                                .and_then(|n| usize::try_from(n).ok())
+                                .ok_or_else(|| {
+                                    "indices must contain nonnegative integers".to_owned()
+                                })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                ),
+                _ => return Err("indices must be null or an array of at most 256 integers".into()),
+            };
+            parsed.push(ToolProgramContentPart::Reference { id, indices });
+        }
+    }
+    Ok(parsed)
 }
 
 // ---------------------------------------------------------------------------
@@ -1628,6 +1705,47 @@ mod result_envelope_tests {
             assert_eq!(result.usage.unwrap().reasoning, Some(1));
             assert_eq!(result.added_tool_names, vec!["native-added"]);
         }
+    }
+    #[test]
+    fn content_parts_require_live_bridge_even_for_inline_or_empty_plans() {
+        for parts in [
+            json!([]),
+            json!([{"content":[]}]),
+            json!([{"content":[{"type":"text","text":"inline"}]}]),
+        ] {
+            let value = json!({"$rpiToolResult":1,"isError":false,"result":{"details":null,"terminate":false},"contentParts":parts});
+            assert!(parse_result_envelope(&value.to_string())
+                .unwrap_err()
+                .contains("live invocation bridge"));
+        }
+    }
+    #[test]
+    fn content_parts_strict_shapes_and_shared_inline_validation() {
+        let mut bad = vec![
+            json!(null),
+            json!({}),
+            json!([null]),
+            json!([{}]),
+            json!([{"reference":null}]),
+            json!([{"reference":{"version":1,"id":"r"},"extra":true}]),
+            json!([{"reference":{"version":1,"id":7}}]),
+            json!([{"reference":{"version":1,"id":"r"},"indices":false}]),
+            json!([{"reference":{"version":1,"id":"r"},"indices":["0"]}]),
+            json!([{"content":[{"type":"text"}]}]),
+            json!([{"content":[{"type":"text","text":"x","textSignature":{}}]}]),
+            json!([{"content":[{"type":"thinking","text":"x"}]}]),
+            json!([{"content":vec![json!({"type":"text","text":"x"});256]},{"content":[{"type":"text","text":"overflow"}]}]),
+        ];
+        for image in invalid_images() {
+            bad.push(json!([{"content":[image]}]));
+        }
+        for value in bad {
+            assert!(parse_content_parts(&value).is_err(), "{value}");
+        }
+        assert!(parse_content_parts(
+            &json!([{"content":[{"type":"text","text":"x","textSignature":null}]}])
+        )
+        .is_ok());
     }
     pub(super) fn invalid_images() -> Vec<Value> {
         let mut images = Vec::new();

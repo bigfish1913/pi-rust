@@ -109,16 +109,25 @@ FIXTURE_CASES = [*DIRECT_CASES, *EXACT_CASES, "fixture_business", *BINDING_CASES
 
 
 # Isolated native sessions avoid growing multi-megabyte provider contexts. Actual
-# direct end-event baselines are retained as canonical payload hashes only.
+# direct end-event baselines retain canonical hashes and bounded content blocks.
 LARGE_DIRECT = {
     "large_direct_text": {"kind":"text", "business":BUSINESS},
     "large_direct_image": {"kind":"image", "business":BUSINESS},
+    "large_direct_mixed": {"kind":"mixed", "business":BUSINESS},
     "large_direct_error": {"kind":"error"},
     "large_direct_terminal": {"kind":"text", "business":BUSINESS, "terminate":True},
 }
 LARGE_EXACT = {"large_result_" + k: "large_direct_" + k for k in ("text", "image", "error")}
 LARGE_EXACT["large_terminal"] = "large_direct_terminal"
-LARGE_CASES = [*LARGE_DIRECT, *LARGE_EXACT, "large_inspect", "large_release", "large_select_throw"]
+LARGE_EMIT_CASES = ["large_emit_text", "large_emit_image", "large_emit_mixed", "large_emit_subset",
+                    "large_emit_error", "large_emit_throw", "large_emit_release", "large_emit_overflow",
+                    "large_emit_invalid_indices", "large_emit_invalid_scalar", "large_emit_tojson", "large_emit_terminal"]
+# All direct baselines MUST precede every dependent composed case.
+LARGE_CASES = [*LARGE_DIRECT, *LARGE_EXACT, "large_inspect", "large_release", "large_select_throw", *LARGE_EMIT_CASES]
+LARGE_NATIVE_ERRORS = {"large_direct_error", "large_result_error", "large_emit_error"}
+LARGE_JS_ERRORS = {"large_select_throw", "large_emit_throw", "large_emit_release",
+                   "large_emit_overflow", "large_emit_invalid_indices", "large_emit_invalid_scalar"}
+LARGE_STICKY_CASES = {"large_emit_release", "large_emit_overflow", "large_emit_invalid_indices", "large_emit_invalid_scalar"}
 CASES.update(LARGE_DIRECT)
 for kind in ("text", "image"):
     CASES["large_result_" + kind] = {"code": "return tools.result(await tools.parity_large({kind:'"
@@ -136,8 +145,48 @@ CASES["large_release"] = {"code": "for(let i=0;i<20;i++){const r=await tools.par
     "await tools.release(r);} return {released:20};", "timeoutMs":120000}
 CASES["large_select_throw"] = {"code": "tools.result(await tools.parity_large({kind:'text',business:"
     + BUSINESS_JS + "})); throw Error('discard selected native receipt');"}
-TERMINAL_CASES = {"fixture_terminal", "large_direct_terminal", "large_terminal"}
-IMAGE_CASES = {"png_return", "png_emit", "png_emit_throw", "large_direct_image", "large_result_image"}
+for kind in ("text", "image"):
+    CASES["large_emit_" + kind] = {"code": "tools.emit(await tools.parity_large({kind:'"
+        + kind + "',business:" + BUSINESS_JS + "})); return {emitted:true};"}
+CASES["large_emit_mixed"] = {"code": "tools.emit([{type:'text',text:'inline before'}]); "
+    "tools.emit(await tools.parity_large({kind:'image',business:" + BUSINESS_JS + "}),[1]); "
+    "tools.emit([{type:'text',text:'inline between'}]); "
+    "tools.emit(await tools.parity_large({kind:'image',business:" + BUSINESS_JS + "}),[1]); "
+    "tools.emit([{type:'text',text:'inline after'}]); return {emitted:true};"}
+CASES["large_emit_subset"] = {"code": "const r=await tools.parity_large({kind:'mixed',business:"
+    + BUSINESS_JS + "}); tools.emit(r,[2,1,0,1]); return {emitted:true};"}
+CASES["large_emit_tojson"] = {"code": "const r=await tools.parity_large({kind:'mixed',business:"
+    + BUSINESS_JS + "}); let calls=0; const indices=[2]; indices.toJSON=()=>{calls++;return null}; "
+    "Array.prototype.toJSON=()=>{calls++;return [1]}; tools.emit(r,indices); delete Array.prototype.toJSON; "
+    "if(calls!==0) throw Error('directive serialization called toJSON'); return {emitted:true};"}
+CASES["large_emit_error"] = {"code": "try {await tools.parity_large({kind:'error'});} "
+    "catch(e) {tools.emit(e.result); return {caught:true};} throw Error('missing native error');"}
+CASES["large_emit_throw"] = {"code": "tools.emit(await tools.parity_large({kind:'image',business:"
+    + BUSINESS_JS + "}),[1]); throw Error('after emitted native image');"}
+for case, rejected in {
+    "large_emit_release": "await tools.release(r)",
+    "large_emit_overflow": "const textReceipt=await tools.parity_large({kind:'text',business:"
+        + BUSINESS_JS + "}); tools.emit(textReceipt,Array(20).fill(0))",
+    "large_emit_invalid_indices": "tools.emit(r,[-1])",
+    "large_emit_invalid_scalar": "tools.emit(r,NaN)",
+}.items():
+    CASES[case] = {"code": "const r=await tools.parity_large({kind:'image',business:" + BUSINESS_JS
+        + "}); tools.emit(r,[1]); let caught=false; try {" + rejected + ";} catch(e) {caught=true;} "
+        "try {await tools.write({path:'" + case + "-must-not-exist.txt',content:'bad'});} catch(e) {} "
+        "return {caught};"}
+CASES["large_emit_terminal"] = {"code": "tools.emit(await tools.parity_large({kind:'image',business:"
+    + BUSINESS_JS + "}),[1]); await tools.parity_large({kind:'text',business:" + BUSINESS_JS
+    + ",terminate:true}); await tools.write({path:'terminal-must-not-exist.txt',content:'bad'}); "
+    "throw Error('JS resumed after terminal child');"}
+TERMINAL_CASES = {"fixture_terminal", "large_direct_terminal", "large_terminal", "large_emit_terminal"}
+IMAGE_CASES = {"png_return", "png_emit", "png_emit_throw", "large_direct_image", "large_direct_mixed",
+               "large_result_image", "large_emit_image", "large_emit_throw", *LARGE_STICKY_CASES}
+DOUBLE_IMAGE_CASES = {"large_emit_mixed", "large_emit_subset"}
+
+
+def large_executions(case):
+    return 20 if case == "large_release" else 2 if case in (
+        "large_emit_mixed", "large_emit_overflow", "large_emit_terminal") else 1
 
 
 def require(ok, reason):
@@ -179,6 +228,103 @@ def large_fixtures(workspace):
     image_common = {**common,"details":{**common["details"],"padding":"i" * (MIB + 32)}}
     dump(workspace / "large-native-image-result.json", {**image_common,"content":[
         {"type":"text","text":"native large image"}, {"type":"image","data":data,"mimeType":"image/png"}]})
+
+
+def validate_image(data, mime):
+    """Validate decoded bytes before hashing/retention (stdlib only, bounded)."""
+    require(0 < len(data) <= HTTP_BYTES, "decoded image budget")
+    if mime == "image/png":
+        require(data.startswith(b"\x89PNG\r\n\x1a\n"), "invalid PNG signature")
+        offset, chunks, compressed, header = 8, [], bytearray(), None
+        while offset < len(data):
+            require(offset + 12 <= len(data), "truncated PNG chunk")
+            size = struct.unpack(">I", data[offset:offset + 4])[0]
+            kind = data[offset + 4:offset + 8]
+            end = offset + 12 + size
+            require(end <= len(data), "truncated PNG payload")
+            payload = data[offset + 8:end - 4]
+            require(zlib.crc32(kind + payload) & 0xffffffff == struct.unpack(">I", data[end - 4:end])[0],
+                    "invalid PNG CRC")
+            chunks.append(kind)
+            if kind == b"IHDR":
+                require(header is None and size == 13, "invalid PNG IHDR")
+                header = struct.unpack(">IIBBBBB", payload)
+            elif kind == b"IDAT":
+                compressed.extend(payload)
+            elif kind == b"IEND":
+                require(size == 0 and end == len(data), "invalid PNG IEND")
+            offset = end
+        require(chunks and chunks[0] == b"IHDR" and chunks[-1] == b"IEND" and compressed,
+                "incomplete PNG")
+        width, height, depth, color, compression, filtering, interlace = header
+        channels = {0:1, 2:3, 3:1, 4:2, 6:4}.get(color, 0)
+        require(width > 0 and height > 0 and channels and depth in (1, 2, 4, 8, 16)
+                and compression == filtering == interlace == 0, "unsupported/invalid PNG layout")
+        row = (width * channels * depth + 7) // 8 + 1
+        expected = row * height
+        require(expected <= HTTP_BYTES, "decoded PNG scanline budget")
+        decoder = zlib.decompressobj()
+        pixels = decoder.decompress(compressed, expected + 1)
+        require(decoder.eof and not decoder.unused_data and len(pixels) == expected,
+                "invalid PNG scanlines")
+        require(all(pixels[i] <= 4 for i in range(0, expected, row)), "invalid PNG filters")
+    else:
+        require(mime == "image/jpeg" and data.startswith(b"\xff\xd8") and data.endswith(b"\xff\xd9"),
+                "invalid JPEG signature/end")
+        # Parse complete segment/scan framing, not just a three-byte magic prefix.
+        offset, dimensions, scans = 2, False, 0
+        while offset < len(data):
+            require(data[offset] == 255, "invalid JPEG marker")
+            while offset < len(data) and data[offset] == 255:
+                offset += 1
+            require(offset < len(data), "truncated JPEG marker")
+            marker = data[offset]
+            offset += 1
+            if marker == 0xd9:
+                require(offset == len(data), "JPEG trailing bytes")
+                break
+            require(marker not in (0, 0xd8) and not 0xd0 <= marker <= 0xd7 and offset + 2 <= len(data),
+                    "unexpected JPEG marker")
+            size = struct.unpack(">H", data[offset:offset + 2])[0]
+            end = offset + size
+            require(size >= 2 and end <= len(data), "truncated JPEG segment")
+            if marker in (0xc0, 0xc1, 0xc2):
+                require(size >= 8, "invalid JPEG frame")
+                height, width = struct.unpack(">HH", data[offset + 3:offset + 7])
+                require(width > 0 and height > 0 and width * height * 4 <= HTTP_BYTES, "JPEG dimension budget")
+                dimensions = True
+            offset = end
+            if marker == 0xda:
+                scans += 1
+                start = offset
+                while offset + 1 < len(data):
+                    if data[offset] != 255:
+                        offset += 1
+                    elif data[offset + 1] == 0 or 0xd0 <= data[offset + 1] <= 0xd7:
+                        offset += 2
+                    else:
+                        break
+                require(offset > start, "empty JPEG scan")
+        require(dimensions and scans and offset == len(data), "incomplete JPEG")
+    return {"mimeType":mime, "bytes":len(data), "sha256":hashlib.sha256(data).hexdigest()}
+
+
+def provider_images(messages):
+    evidence = []
+    for message in messages:
+        for block in message.get("content", []) if isinstance(message.get("content"), list) else []:
+            if block.get("type") not in ("image_url", "input_image", "image"):
+                continue
+            url = block.get("image_url", {})
+            url = url.get("url", "") if isinstance(url, dict) else url
+            if not url:
+                url = block.get("url", "")
+            require(isinstance(url, str) and url.startswith("data:image/"), "provider image not inline")
+            header, encoded = url.split(",", 1)
+            require(header.endswith(";base64"), "provider image not base64")
+            decoded = base64.b64decode(encoded, validate=True)
+            evidence.append({"block":bounded_value(block), **validate_image(decoded, header[5:-7])})
+    return evidence
 
 
 def bounded_value(value):
@@ -254,23 +400,15 @@ class Provider:
                         require(len(results) == 1, "expected one direct or outer result")
                         require(case not in TERMINAL_CASES, "terminal child triggered a second model turn")
                         require(results[0]["tool_call_id"] == "smoke-" + case, "wrong current tool result identity")
-                        require(image_count(messages[last + 1:]) == (1 if case in IMAGE_CASES else 0),
+                        require(image_count(messages[last + 1:]) == (2 if case in DOUBLE_IMAGE_CASES else 1 if case in IMAGE_CASES else 0),
                                 "wrong image count in latest case segment: " + case)
                         delta, finish = {"role": "assistant", "content": "DONE:" + case}, "stop"
                     # Validate real request BEFORE replacing large strings.
                     assert_no_binding(body)
-                    if results and case in ("large_direct_image", "large_result_image"):
-                        images = [b for m in messages[last + 1:] for b in
-                                  (m.get("content") if isinstance(m.get("content"), list) else [])
-                                  if b.get("type") in ("image_url", "input_image", "image")]
-                        require(len(images) == 1, "large provider image missing")
-                        image = images[0]
-                        url = image.get("image_url", {})
-                        url = url.get("url", "") if isinstance(url, dict) else url
-                        require(isinstance(url, str) and url.startswith("data:image/"), "provider image not inline")
-                        decoded = base64.b64decode(url.split(",", 1)[1], validate=True)
-                        require(decoded.startswith((bytes([137,80,78,71,13,10,26,10]), bytes([255,216,255]))), "invalid provider image")
-                        owner.image_evidence[case] = bounded_value(image)
+                    if results:
+                        # Validate EVERY actual image, including both copies in a
+                        # mixed/subset case, before hashing or dropping the body.
+                        owner.image_evidence[case] = provider_images(messages[last + 1:])
                     if results and case in LARGE_CASES:
                         owner.result_evidence[case] = bounded_value(results[0].get("content"))
                     retained = bounded_value(body)
@@ -346,7 +484,7 @@ class Host(resource.Host):
             result = frame.get("result", {})
             self.ends[frame["toolCallId"]] = {"terminate": result.get("terminate"), "isError": frame.get("isError")}
             # One bounded native payload only, including direct baselines; no backlog.
-            require(len(line.encode()) <= resource.MAX_LINE, "native end retention budget")
+            require(len(line.encode()) <= 8 * MIB, "native end retention budget")
             self.last_end = {"toolCallId":frame["toolCallId"], "toolName":frame["toolName"],
                              "result":{**result,"isError":frame.get("isError", False)}}
         elif kind == "ui_dialog_request":
@@ -496,11 +634,13 @@ def check_large(case, host, provider, baselines, root):
     require(end["toolName"] == ("parity_large" if case in LARGE_DIRECT else "codemode"), "wrong native tool")
     result = end["result"]
     assert_no_binding(result)
-    error = case in ("large_direct_error", "large_result_error", "large_select_throw")
-    require(bool(result.get("isError")) == error, "wrong large error flag")
+    # Caught native error + content-only emit completes successfully; exact
+    # tools.result(error) instead preserves the original native error outcome.
+    error = case in LARGE_JS_ERRORS or case in ("large_direct_error", "large_result_error")
+    require(bool(result.get("isError")) == error, "wrong large error flag: " + case)
     require(bool(result.get("terminate")) == (case in TERMINAL_CASES), "wrong large terminal flag")
-    count = 20 if case == "large_release" else 1
-    if case in ("large_direct_error", "large_result_error"):
+    count = large_executions(case)
+    if case in LARGE_NATIVE_ERRORS:
         require(result.get("usage") is None and not result.get("addedToolNames"), "AgentError invented accounting")
     else:
         usage = result.get("usage") or {}
@@ -512,14 +652,27 @@ def check_large(case, host, provider, baselines, root):
         if case not in LARGE_DIRECT:
             require(result["addedToolNames"] == ["fixture-added"], "large names not deduped")
     payload = payload_digest(result)
+    blocks = bounded_value(result["content"])
     if case in LARGE_DIRECT or case in LARGE_EXACT:
         require(payload["bytes"] > MIB, "not a real large native result")
     if case in LARGE_DIRECT:
         baselines[case] = payload
+        baselines[case + "_blocks"] = blocks
+        baselines[case + "_usage"] = result.get("usage")
         if case not in TERMINAL_CASES:
             baselines[case + "_provider"] = provider.result_evidence[case]
         if case == "large_direct_image":
             baselines["provider_image"] = provider.image_evidence[case]
+            require(len(blocks) == 2 and blocks[0] == {"type":"text","text":"native large image"}
+                    and blocks[1]["type"] == "image", "invalid direct image baseline")
+        elif case == "large_direct_mixed":
+            require(blocks == [{"type":"text","text":"native left"},
+                               baselines["large_direct_image_blocks"][1],
+                               {"type":"text","text":"native right"}], "direct native mixed order differs")
+            # Legacy decoding drops text signatures: compare ACTUAL native
+            # blocks, without claiming legacy signature preservation.
+            require(provider.image_evidence[case] == baselines["provider_image"], "direct mixed image differs")
+        require(len(json.dumps(baselines).encode()) <= 8 * MIB, "baseline retention budget")
     elif case in LARGE_EXACT:
         require(payload == baselines[LARGE_EXACT[case]],
                 {"case":case,"actual":payload,"direct":baselines[LARGE_EXACT[case]]})
@@ -528,8 +681,16 @@ def check_large(case, host, provider, baselines, root):
                     "direct/composed provider tool content differs")
         if case == "large_result_image":
             require(provider.image_evidence[case] == baselines["provider_image"], "direct/composed provider image differs")
+    elif case == "large_emit_terminal":
+        # Original terminal content/details override the earlier image. Only
+        # accounting changes: BOTH executions must be counted exactly once.
+        require(payload_digest({**result,"usage":baselines["large_direct_terminal_usage"]})
+                == baselines["large_direct_terminal"], "emitted image overrode original terminal result")
     else:
         summary = result["details"]
+        encoded_summary = json.dumps(summary, ensure_ascii=False)
+        require(len(encoded_summary.encode()) < 128 * 1024, "large payload duplicated into details")
+        require("nativeContentParts" not in encoded_summary, "private content parts leaked into Done summary")
         if case == "large_inspect":
             require(summary["status"] == "completed", bounded_value(summary))
             # JS string length is UTF-16 code units, not Python Unicode scalars.
@@ -539,9 +700,56 @@ def check_large(case, host, provider, baselines, root):
             require(summary["status"] == "completed" and summary["result"] == {"released":20}, "release loop failed")
             # Twenty 2 MiB results exceed both 16 references and 64 MiB charged
             # native+encoded storage if release fails to recover either quota.
-        else:
+        elif case == "large_select_throw":
             require(summary["status"] == "error" and "discard selected native receipt" in summary["error"], "selection failure lost")
             require(payload["bytes"] < 128 * 1024 and not any(b.get("type") == "image" for b in result["content"]), "failed selection forwarded native payload")
+        else:
+            # Content-only emission retains the engine summary as details,
+            # unlike tools.result(), which forwards native fixture details.
+            require(summary["status"] == ("error" if case in LARGE_JS_ERRORS else "completed"),
+                    "wrong content-only engine summary status: " + case)
+            require(len(summary["calls"]) == count and all(c["name"] == "parity_large" for c in summary["calls"]),
+                    "emission invented/replayed a call or sticky write reached native host")
+            if case in ("large_emit_text", "large_emit_image", "large_emit_error"):
+                direct = "large_direct_" + case.removeprefix("large_emit_")
+                require(blocks == baselines[direct + "_blocks"], "emitted native content differs from direct baseline")
+                require(provider.result_evidence[case] == baselines[direct + "_provider"],
+                        "emitted provider content differs from direct baseline")
+                require(summary["result"] == ({"caught":True} if case == "large_emit_error" else {"emitted":True}),
+                        "content emission lost completed JS result")
+            elif case == "large_emit_mixed":
+                require(summary["result"] == {"emitted":True}, "mixed emission lost JS result")
+                image = baselines["large_direct_image_blocks"][1]
+                require(blocks == [{"type":"text","text":"inline before"}, image,
+                                   {"type":"text","text":"inline between"}, image,
+                                   {"type":"text","text":"inline after"}], "mixed native end block order/payload differs")
+            elif case == "large_emit_subset":
+                require(summary["result"] == {"emitted":True}, "subset emission lost JS result")
+                direct = baselines["large_direct_mixed_blocks"]
+                require(blocks == [direct[i] for i in [2,1,0,1]], "selected/repeated native block order/payload differs")
+            elif case == "large_emit_tojson":
+                require(summary["result"] == {"emitted":True}, "directive coercion lost JS result")
+                require(blocks == [baselines["large_direct_mixed_blocks"][2]], "toJSON widened native block selection")
+                require(provider.image_evidence[case] == [], "toJSON exposed an unselected image")
+            elif case in LARGE_JS_ERRORS:
+                require(len(blocks) == 2 and blocks[0] == baselines["large_direct_image_blocks"][1],
+                        "explicit native image lost after JS/sticky error: " + case)
+                last = result["content"][-1]
+                needle = {"large_emit_throw":"after emitted native image", "large_emit_release":"release",
+                          "large_emit_overflow":"32 MiB", "large_emit_invalid_indices":"indices",
+                          "large_emit_invalid_scalar":"indices"}[case]
+                require(last.get("type") == "text" and len(last["text"].encode()) < 128 * 1024
+                        and needle in last["text"] and needle in summary["error"], "missing last compact emission error: " + case)
+                require("nativeContentParts" not in last["text"], "private parts leaked into compact error")
+            if case in LARGE_STICKY_CASES:
+                require(not (root / "workspace" / (case + "-must-not-exist.txt")).exists(), "caught error bypassed sticky failure")
+                require(not host.denials, "sticky write was blocked by permission gate, not engine")
+            if case in DOUBLE_IMAGE_CASES or case in IMAGE_CASES:
+                # Check each delivered image's actual validated bytes against
+                # the normalized direct baseline, including repeated images.
+                copies = 2 if case in DOUBLE_IMAGE_CASES else 1
+                require(provider.image_evidence[case] == baselines["provider_image"] * copies,
+                        "actual delivered image bytes differ from direct baseline: " + case)
     if case in TERMINAL_CASES:
         require(len(provider.calls) == 1, "terminal child resumed provider")
         require(not (root / "workspace/terminal-must-not-exist.txt").exists(), "terminal child resumed JS")
@@ -549,9 +757,13 @@ def check_large(case, host, provider, baselines, root):
         require(len(provider.calls) == 2, "large result not delivered to provider")
     count = 0 if case in LARGE_DIRECT else count
     progress = [p for p in host.progress if p["toolCallId"] == "smoke-" + case and p["tool"] == "parity_large"]
-    for phase in ("started", "progress", "failed" if case == "large_result_error" else "completed"):
+    for phase in ("started", "progress", "failed" if case in LARGE_NATIVE_ERRORS else "completed"):
         require(sum(p["phase"] == phase for p in progress) == count, "large progress lifecycle: " + case)
+    require(len(progress) == 3 * count, "unexpected large progress phase")
     require(len({p["requestId"] for p in progress}) == count, "large progress identity")
+    expected_phases = sorted(["started", "progress", "failed" if case in LARGE_NATIVE_ERRORS else "completed"])
+    require(all(sorted(p["phase"] for p in progress if p["requestId"] == request_id) == expected_phases
+                for request_id in {p["requestId"] for p in progress}), "large per-child progress lifecycle")
     require(all(p["updateCount"] == 1 for p in progress if p["phase"] == "progress"), "large partial not exactly once")
     dump(root / "large-payload.json", {"case":case,"payload":payload,"fields":bounded_value(result)})
 
@@ -628,7 +840,7 @@ def run_group(args, root, gated=False, selected_cases=None, large_baselines=None
                 require(not result.get("isError"), result)
                 require(summary["protocolVersion"] == 1 and len(summary["tools"]) <= 2, summary)
                 require(all(t["name"] != "codemode" for t in summary["tools"]), summary)
-                require(summary["capabilities"] == {"resultEnvelope": 1, "hostAccounting": 1, "parentProgress": 1, "losslessValues": 1, "resultReferences": 1}, summary)
+                require(summary["capabilities"] == {"resultEnvelope": 1, "hostAccounting": 1, "parentProgress": 1, "losslessValues": 1, "resultReferences": 1, "contentAttachments": 1}, summary)
             elif case in ("png_return", "png_emit", "png_intermediate", "ordinary_json", "fabricated_usage"):
                 check_native(case, result, summary)
             elif case.startswith("fixture_"):
@@ -724,12 +936,18 @@ def run_group(args, root, gated=False, selected_cases=None, large_baselines=None
             require(all(e["isError"] == child_error for e in ends),
                     "native child lost its error: " + case)
         for case in (c for c in cases if c in LARGE_CASES):
-            expected = 0 if case in LARGE_DIRECT else 20 if case == "large_release" else 1
+            expected = 0 if case in LARGE_DIRECT else large_executions(case)
             starts = [e for e in intents if e["rootToolCallId"] == "smoke-" + case]
             ends = [e for e in finished if e["rootToolCallId"] == "smoke-" + case]
             require(len(starts) == len(ends) == expected, "large native replay/lost lifecycle: " + case)
             require({e["requestId"] for e in starts} == {e["requestId"] for e in ends}, "large unmatched lifecycle")
-            require(all(e["isError"] == (case == "large_result_error") for e in ends), "large child error lost")
+            require(all(e["isError"] == (case in LARGE_NATIVE_ERRORS) for e in ends), "large child error lost")
+            require(len({e["requestId"] for e in starts}) == expected, "large child identity reused")
+            require(all(e["name"] == "parity_large" for e in starts), "unexpected large child tool")
+            require(all(e["parentToolCallId"] == "smoke-" + case for e in starts + ends), "large marker parent differs")
+            require({e["requestId"] for e in starts} == {
+                p["requestId"] for p in host.progress if p["toolCallId"] == "smoke-" + case},
+                "native markers and progress refer to different children")
         return findings
     finally:
         if host:

@@ -801,7 +801,7 @@ async fn host_rollup_survives_errors_repeated_poll_disposal_and_unawaited_drain(
                         let page = p.handle(json!({"op":"list"})).await.unwrap();
                         assert_eq!(
                             page["capabilities"],
-                            json!({"resultEnvelope":1,"hostAccounting":1,"parentProgress":1,"losslessValues":1,"resultReferences":1})
+                            json!({"resultEnvelope":1,"hostAccounting":1,"parentProgress":1,"losslessValues":1,"resultReferences":1,"contentAttachments":1})
                         );
                         let id = start(&p).await;
                         for _ in 0..3 {
@@ -2140,6 +2140,13 @@ async fn reference_shared_tree_quota_and_foreign_programs_are_enforced() {
                             .resolve_result_reference(foreign.as_str().unwrap())
                             .is_err());
                         assert!(p
+                            .handle(json!({"op":"measure_result_content","resultId":foreign}))
+                            .await
+                            .is_err());
+                        assert!(p
+                            .resolve_content_parts(vec![content_part(&foreign, None)])
+                            .is_err());
+                        assert!(p
                             .handle(json!({"op":"read_result","resultId":foreign}))
                             .await
                             .is_err());
@@ -2277,4 +2284,139 @@ async fn reference_finish_clears_receipts_after_error_panic_and_timeout_drain() 
             "finish cleared the receipt, even after late timeout finalization"
         );
     }
+}
+
+fn content_part(
+    id: &Value,
+    indices: Option<Vec<usize>>,
+) -> rpi_agent::tool_program::ToolProgramContentPart {
+    rpi_agent::tool_program::ToolProgramContentPart::Reference {
+        id: id.as_str().unwrap().to_owned(),
+        indices,
+    }
+}
+fn content_wire(content: Vec<rpi_agent::TextContentOrImage>) -> Value {
+    finalized_json(&AgentToolResult {
+        content,
+        ..Default::default()
+    })["content"]
+        .clone()
+}
+#[tokio::test]
+async fn content_measure_selection_wire_bytes_and_native_lifetime() {
+    use rpi_agent::{tool_program::ToolProgramContentPart as Part, TextContentOrImage as Block};
+    let native = AgentToolResult {
+        content: vec![
+            Block::Text(
+                serde_json::from_value(json!({"type":"text","text":"界😀
+\"","textSignature":"sig-é"}))
+                .unwrap(),
+            ),
+            Block::Image(
+                serde_json::from_value(
+                    json!({"type":"image","mimeType":"image/png","data":"YWJj"}),
+                )
+                .unwrap(),
+            ),
+            Block::text("tail"),
+        ],
+        details: json!({"not":"selected"}),
+        ..Default::default()
+    };
+    let wire = content_wire(native.content.clone());
+    let saved = Arc::new(Mutex::new(None));
+    let retained = saved.clone();
+    parity_run(vec![
+        parity_tool("codemode", Arc::new(move |p, _, _| {
+            let wire = wire.clone(); let retained = retained.clone();
+            Box::pin(async move {
+                let id = reference_start(&p, "effect").await;
+                assert_eq!(poll(&p, &id).await["status"], "done");
+                for indices in [None, Some(json!(null)), Some(json!([])), Some(json!([2,0,2,1])), Some(json!([0]))] {
+                    let mut args = json!({"op":"measure_result_content","resultId":id});
+                    if let Some(indices) = &indices { args["indices"] = indices.clone(); }
+                    let selected: Vec<usize> = match &indices {
+                        Some(Value::Array(a)) => a.iter().map(|i| i.as_u64().unwrap() as usize).collect(),
+                        _ => vec![0,1,2],
+                    };
+                    let bytes: usize = selected.iter().map(|i| serde_json::to_vec(&wire[*i]).unwrap().len()).sum();
+                    let measured = p.handle(args).await.unwrap();
+                    assert_eq!(measured, json!({"resultId":id,"contentBlocks":selected.len(),"encodedBytes":bytes}));
+                    assert!(measured.get("data").is_none());
+                    let blocks = p.resolve_content_parts(vec![content_part(&id, Some(selected.clone()))]).unwrap();
+                    assert_eq!(content_wire(blocks), Value::Array(selected.iter().map(|i| wire[*i].clone()).collect()));
+                }
+                for indices in [json!([-1]),json!([1.0]),json!([3]),json!(false),json!(["0"]),json!(vec![0;257])] {
+                    assert!(p.handle(json!({"op":"measure_result_content","resultId":id,"indices":indices})).await.is_err());
+                }
+                assert!(p.resolve_content_parts(vec![content_part(&id, Some(vec![3]))]).is_err());
+                let mixed = p.resolve_content_parts(vec![Part::Inline(vec![Block::text("prefix")]),content_part(&id,Some(vec![0,1])),Part::Inline(vec![Block::text("suffix")])]).unwrap();
+                assert_eq!(mixed.len(),4);
+                assert_eq!(content_wire(mixed)[1],wire[0]);
+                assert!(p.handle(json!({"op":"measure_result_content","resultId":"foreign"})).await.is_err());
+                assert!(p.resolve_content_parts(vec![content_part(&json!("foreign"),None)]).is_err());
+                p.handle(json!({"op":"dispose","requestId":id})).await.unwrap();
+                assert!(p.handle(json!({"op":"measure_result_content","resultId":id})).await.is_ok());
+                p.handle(json!({"op":"release_result","resultId":id})).await.unwrap();
+                assert!(p.handle(json!({"op":"measure_result_content","resultId":id,"indices":[]})).await.is_err());
+                assert!(p.resolve_content_parts(vec![content_part(&id,Some(vec![]))]).is_err());
+                let id = reference_start(&p,"effect").await;
+                assert_eq!(poll(&p,&id).await["status"],"done");
+                p.cancel_all();
+                assert!(p.handle(json!({"op":"measure_result_content","resultId":id})).await.is_err());
+                assert!(p.resolve_content_parts(vec![Part::Inline(vec![])]).is_err());
+                *retained.lock().unwrap() = Some((p,id));
+                Ok(AgentToolResult::text("parent"))
+            })
+        })),
+        parity_tool("effect",Arc::new(move |_,_,_| {let native=native.clone(); Box::pin(async move {Ok(native)})})),
+    ],common::base_config()).await;
+    let (p, id) = saved.lock().unwrap().take().unwrap();
+    assert!(p
+        .handle(json!({"op":"measure_result_content","resultId":id}))
+        .await
+        .is_err());
+    assert!(p
+        .resolve_content_parts(vec![content_part(&id, None)])
+        .is_err());
+    assert!(p
+        .handle(json!({"op":"release_result","resultId":id}))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn content_parts_count_and_duplicate_expansion_budget() {
+    use rpi_agent::{tool_program::ToolProgramContentPart as Part, TextContentOrImage as Block};
+    parity_run(vec![
+        parity_tool("codemode",Arc::new(|p,_,_| Box::pin(async move {
+            let id=reference_start(&p,"effect").await;
+            assert_eq!(poll(&p,&id).await["status"],"done");
+            assert!(p.resolve_content_parts(vec![Part::Inline(vec![]);257]).is_err());
+            assert!(p.resolve_content_parts(vec![Part::Inline(vec![]);256]).unwrap().is_empty());
+            let many=reference_start(&p,"many").await;
+            assert_eq!(poll(&p,&many).await["status"],"done");
+            assert!(p.handle(json!({"op":"measure_result_content","resultId":many})).await.unwrap_err().contains("256"));
+            assert!(p.resolve_content_parts(vec![content_part(&many,None)]).is_err());
+            assert_eq!(p.handle(json!({"op":"measure_result_content","resultId":many,"indices":[256]})).await.unwrap()["contentBlocks"],1);
+            assert_eq!(p.resolve_content_parts(vec![content_part(&many,Some(vec![256]))]).unwrap().len(),1);
+            assert!(p.resolve_content_parts(vec![Part::Inline(vec![Block::text("");257])]).is_err());
+            assert!(p.resolve_content_parts(vec![content_part(&id,Some(vec![0;257]))]).is_err());
+            for copies in [4,128,256] {
+                assert!(p.handle(json!({"op":"measure_result_content","resultId":id,"indices":vec![0;copies]})).await.unwrap_err().contains("32 MiB"));
+                assert!(p.resolve_content_parts(vec![content_part(&id,Some(vec![0;copies]))]).unwrap_err().contains("32 MiB"));
+            }
+            assert_eq!(p.resolve_content_parts(vec![content_part(&id,Some(vec![0;3]))]).unwrap().len(),3);
+            // Output expansion must neither consume retained-tree quota nor release the source.
+            assert!(p.handle(json!({"op":"measure_result_content","resultId":id})).await.is_ok());
+            let empty_size=content_wire(vec![Block::text("")]).to_string().len();
+            let exact=Block::text("x".repeat(32*1024*1024-empty_size));
+            assert_eq!(p.resolve_content_parts(vec![Part::Inline(vec![exact.clone()])]).unwrap().len(),1);
+            assert!(p.resolve_content_parts(vec![Part::Inline(vec![exact,Block::text("")])]).unwrap_err().contains("32 MiB"));
+            assert_eq!(p.resolve_content_parts(vec![Part::Inline(vec![Block::text("");256])]).unwrap().len(),256);
+            Ok(AgentToolResult::text("parent"))
+        }))),
+        parity_tool("effect",Arc::new(|_,_,_| Box::pin(async {Ok(AgentToolResult::text("x".repeat(8*1024*1024)))}))),
+        parity_tool("many",Arc::new(|_,_,_| Box::pin(async {Ok(AgentToolResult {content:vec![Block::text("");257],..Default::default()})}))),
+    ],common::base_config()).await;
 }

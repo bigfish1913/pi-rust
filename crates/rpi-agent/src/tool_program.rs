@@ -22,6 +22,19 @@ mod accounting;
 #[path = "tool_program_results.rs"]
 mod results;
 
+/// Native content composition. References select only content, never child metadata.
+#[derive(Clone, Debug)]
+pub enum ToolProgramContentPart {
+    /// Adapter-validated owned blocks; plugin frames remain limited to 1 MiB.
+    Inline(Vec<TextContentOrImage>),
+    /// Invocation-owned native content. None selects all; an empty selection
+    /// selects none. Ordered indices may repeat, but must remain in bounds.
+    Reference {
+        id: String,
+        indices: Option<Vec<usize>>,
+    },
+}
+
 const MAX_BYTES: usize = 1024 * 1024;
 static NEXT: AtomicU64 = AtomicU64::new(1);
 tokio::task_local! { static CURRENT: Arc<ToolProgram>; static PARENT: NestedParent; }
@@ -219,10 +232,11 @@ impl ToolProgram {
                 let end = offset.saturating_add(limit).min(all.len());
                 let page = all.get(offset..end).unwrap_or(&[]);
                 Ok(
-                    json!({"protocolVersion":1,"capabilities":{"resultEnvelope":1,"hostAccounting":1,"parentProgress":1,"losslessValues":1,"resultReferences":1},"tools":page,"nextOffset":if end<all.len(){Some(end)}else{None}}),
+                    json!({"protocolVersion":1,"capabilities":{"resultEnvelope":1,"hostAccounting":1,"parentProgress":1,"losslessValues":1,"resultReferences":1,"contentAttachments":1},"tools":page,"nextOffset":if end<all.len(){Some(end)}else{None}}),
                 )
             }
             "read_result" => self.read_result(&args),
+            "measure_result_content" => self.measure_result_content(&args),
             "release_result" => self.release_result(&args),
             "start" => {
                 let reference = match args.get("resultMode") {

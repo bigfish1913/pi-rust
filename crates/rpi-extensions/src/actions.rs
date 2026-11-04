@@ -902,6 +902,24 @@ impl ActionBridge {
             .ok_or("result reference requires an effective ToolProgram")?
             .resolve_result_reference(id)
     }
+    /// Content-only plans use the same captured live authority as full receipts.
+    pub(crate) fn resolve_content_parts(
+        &self,
+        parts: Vec<rpi_agent::tool_program::ToolProgramContentPart>,
+    ) -> Result<Vec<rpi_agent::TextContentOrImage>, String> {
+        if !self.is_active()
+            || !self
+                .invocation
+                .as_ref()
+                .is_some_and(|(_, _, signal)| !signal.is_cancelled())
+        {
+            return Err("content parts require a live invocation bridge".into());
+        }
+        self.tool_program
+            .as_ref()
+            .ok_or("content parts require an effective ToolProgram")?
+            .resolve_content_parts(parts)
+    }
     pub(crate) fn invocation_key(&self) -> Option<&str> {
         self.invocation.as_ref().map(|(_, key, _)| key.as_str())
     }

@@ -45,7 +45,7 @@ extern "C" fn poll(
             // by the smoke harness in the disposable host workspace before launch.
             let path = match params["kind"].as_str() {
                 Some("text" | "error") => "large-native-text-result.json",
-                Some("image") => "large-native-image-result.json",
+                Some("image" | "mixed") => "large-native-image-result.json",
                 _ => return StepResult::err(StbString::from_string("invalid large fixture kind".into())),
             };
             let mut payload = String::new();
@@ -64,6 +64,14 @@ extern "C" fn poll(
                 // names, structured-error envelope, or terminal flag on this path.
                 return StepResult::err(StbString::from_string(
                     result["content"][0]["text"].as_str().unwrap_or("").to_owned()));
+            }
+            if params["kind"] == "mixed" {
+                let image = result["content"][1].clone();
+                result["content"] = json!([
+                    {"type":"text","text":"native left"},
+                    image,
+                    {"type":"text","text":"native right"}
+                ]);
             }
             if let Some(business) = params.get("business") {
                 result["details"]["business"] = business.clone();
@@ -165,7 +173,7 @@ mod registration {
                     ),
                     parameters: StbString::from_string(
                         json!({"type":"object",
-                        "properties":{"kind":{"type":"string","enum":["text","image","error"]},
+                        "properties":{"kind":{"type":"string","enum":["text","image","mixed","error"]},
                             "business":{"type":"object","additionalProperties":true},
                             "terminate":{"type":"boolean"}},
                         "required":["kind"],"additionalProperties":false})
