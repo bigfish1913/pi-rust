@@ -11,6 +11,17 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.17.2](https://github.com/bigfish1913/pi-rust/compare/v0.17.1...v0.17.2) - 2026-11-04
+
+### Fixed
+
+- *(tui)* preserve startup output above the live transcript
+- parse JSON floats exactly so committed costs compare equal
+
+### Other
+
+- update Cargo.toml dependencies
+
 ## [0.17.1](https://github.com/bigfish1913/pi-rust/compare/v0.17.0...v0.17.1) - 2026-11-04
 
 ### Fixed
