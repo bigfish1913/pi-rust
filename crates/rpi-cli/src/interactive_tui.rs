@@ -295,7 +295,7 @@ trait SlashCommand: Send + Sync {
         &[]
     }
     /// Whether the canonical name appears in the `/` autocomplete list. Hidden
-    /// commands (`/context`, `/name`, …) return `false`.
+    /// commands (`/name`, …) return `false`.
     fn visible(&self) -> bool {
         true
     }

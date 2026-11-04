@@ -1,10 +1,45 @@
-//! Editor-swapping selectors for models, sessions, themes, thinking, tools, and images.
+//! Editor-swapping selectors for models, sessions, themes, context, thinking, tools, and images.
 
 use super::*;
 
 // ===========================================================================
 // Selectors — editor-container swap (TS showSelector pattern)
 // ===========================================================================
+
+/// Browse the current resource snapshot without appending notes to the chat.
+/// Both confirm and cancel only dismiss the panel; no resources are unloaded.
+pub(super) fn open_context_selector(
+    state: &Arc<TuiState>,
+    editor_container: &Arc<Container>,
+    editor: &Arc<Editor>,
+    tui: &Arc<TuiAltScreen>,
+    resources: &rpi_harness::types::AgentHarnessResources,
+) {
+    let items = context_panel_lines(resources)
+        .into_iter()
+        .map(|line| SelectItem::new(&line, &line))
+        .collect();
+    let list = Arc::new(SelectList::new(items, 10));
+    let close = {
+        let state = state.clone();
+        let container = editor_container.clone();
+        let editor = editor.clone();
+        let tui = tui.clone();
+        Arc::new(move || close_selector(&state, &container, &editor, &tui))
+    };
+    list.on_cancel(close.clone());
+    list.on_select(Arc::new(move |_| close()));
+    open_searchable_selector(
+        state,
+        editor_container,
+        editor,
+        tui,
+        Some("Context — loaded resources"),
+        Some("Esc/Enter close · Type to filter · ↑/↓ browse · /usage for token totals"),
+        list,
+        SelectorKind::Context,
+    );
+}
 
 /// Swap the `editor_container`'s child (the editor) for a `SelectList`,
 /// hiding the editor while the selector is open. Records the selector in

@@ -235,8 +235,10 @@ Windows 会暂存更新，等待当前进程退出后完成替换。
 启动 TUI 时，`Context` 会列出实际加载成功的系统提示词和项目指令文件路径，
 包括 `SYSTEM.md`、`APPEND_SYSTEM.md` 以及 `AGENTS.md` / `CLAUDE.md`。
 项目 `SYSTEM.md` 和 `APPEND_SYSTEM.md` 优先于全局同名文件；清单只显示生效的来源。
-没有加载文件时，启动页会省略 `Context`。`/context` 可查看当前完整资源清单，
-成功执行 `/reload` 后，启动页的 `Context` 和 `/context` 都会更新。
+没有加载文件时，启动页会省略 `Context`。`/context` 可在临时面板中查看当前完整资源清单，
+输入文字可筛选，↑/↓ 浏览，Esc 或 Enter 关闭。关闭只移除面板，不会清空聊天记录、
+模型上下文或已加载的文件；用量统计请使用 `/usage`。
+成功执行 `/reload` 后，启动页的 `Context` 和再次打开的 `/context` 都会更新。
 设置 `quietStartup: true` 可隐藏启动资源清单。
 
 ### 更新日志

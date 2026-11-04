@@ -166,7 +166,7 @@ rpi dev-local [options]
 rpi package link|list|unlink
 ```
 
-The startup `Context` summary lists the effective `SYSTEM.md`, `APPEND_SYSTEM.md`, `AGENTS.md`, and `CLAUDE.md` resources. `/context` shows the full list and `/reload` refreshes it. `/changelog` displays the release notes embedded in the current binary; `/changelog all` displays the complete history.
+The startup `Context` summary lists the effective `SYSTEM.md`, `APPEND_SYSTEM.md`, `AGENTS.md`, and `CLAUDE.md` resources. `/context` opens a temporary panel with the full resource list: type to filter, use ↑/↓ to browse, and press Esc or Enter to close. Closing only dismisses the panel; it does not clear chat history, model context, or loaded files. Use `/usage` for token and cost statistics. `/reload` refreshes the startup summary and the next `/context` panel. `/changelog` displays the release notes embedded in the current binary; `/changelog all` displays the complete history.
 
 ### Headless server and remote client
 
