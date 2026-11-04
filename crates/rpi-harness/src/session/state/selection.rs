@@ -54,6 +54,24 @@ impl<P: Clone> IndexedState<P> {
         Ok(path)
     }
 
+    pub(crate) fn branch_ancestry(
+        &self,
+        bounds: &BranchBounds,
+        start: &str,
+    ) -> SessionResult<Vec<crate::session::types::EntryAncestry>> {
+        Ok(self
+            .walk_to_root(Some(start), bounds)?
+            .into_iter()
+            .map(|index| {
+                let meta = &self.metadata[index];
+                crate::session::types::EntryAncestry {
+                    id: meta.id.clone(),
+                    parent_id: meta.parent_id.clone(),
+                }
+            })
+            .collect())
+    }
+
     /// Ordered metadata candidates. Deliberately does NOT enforce query.limit:
     /// callers must hydrate and run matches_entry_query before counting matches.
     /// This is essential for tool_call_id and outbox_key predicates.

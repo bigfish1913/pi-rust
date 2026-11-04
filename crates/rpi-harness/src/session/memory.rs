@@ -427,6 +427,15 @@ impl SessionStorage for InMemorySessionStorage {
             .read_state(|state| state.find_entries_on_branch(query, bounds, start))
     }
 
+    async fn branch_ancestry(
+        &self,
+        bounds: &BranchBounds,
+        start: &str,
+    ) -> SessionResult<Vec<crate::session::types::EntryAncestry>> {
+        self.inner
+            .read_state(|state| state.branch_ancestry(bounds, start))
+    }
+
     async fn context_on_branch(
         &self,
         bounds: &BranchBounds,

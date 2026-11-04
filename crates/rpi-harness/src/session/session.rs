@@ -408,6 +408,40 @@ impl Session {
         Ok(entries.pop())
     }
 
+    /// Main-lane ancestry, retaining archival identities without their bodies.
+    pub async fn branch_ancestry(
+        &self,
+        bounds: &BranchBounds,
+    ) -> SessionResult<Vec<crate::session::types::EntryAncestry>> {
+        self.branch_ancestry_for_lane("main", bounds).await
+    }
+
+    async fn branch_ancestry_for_lane(
+        &self,
+        lane: &str,
+        bounds: &BranchBounds,
+    ) -> SessionResult<Vec<crate::session::types::EntryAncestry>> {
+        // Keep lane resolution and the walk on the same storage binding.
+        let storage = self.storage_arc();
+        let start = match &bounds.start {
+            Some(id) => id.clone(),
+            None => {
+                let leaf = storage
+                    .get_lanes()
+                    .await?
+                    .into_iter()
+                    .find(|pointer| pointer.lane == lane)
+                    .ok_or_else(|| SessionError::invalid_lane(format!("Lane not found: {lane}")))?
+                    .leaf_id;
+                let Some(id) = leaf else {
+                    return Ok(Vec::new());
+                };
+                id
+            }
+        };
+        storage.branch_ancestry(bounds, &start).await
+    }
+
     /// Build the default hook-free provider context directly from this lane's
     /// validated branch. Custom transforms/projectors intentionally do not use
     /// this method; callers retain the ordinary entry-reading path for hooks.
@@ -1017,6 +1051,12 @@ impl SessionTree for Session {
     ) -> SessionResult<Vec<Entry>> {
         Session::find_entries_on_branch(self, query, bounds).await
     }
+    async fn branch_ancestry(
+        &self,
+        bounds: &BranchBounds,
+    ) -> SessionResult<Vec<crate::session::types::EntryAncestry>> {
+        Session::branch_ancestry(self, bounds).await
+    }
     async fn find_entry_on_branch(
         &self,
         query: &EntryQuery,
@@ -1134,6 +1174,14 @@ impl SessionTree for LaneView {
     ) -> SessionResult<Vec<Entry>> {
         self.session
             .query_branch_entries(&self.lane, query, bounds, query.limit)
+            .await
+    }
+    async fn branch_ancestry(
+        &self,
+        bounds: &BranchBounds,
+    ) -> SessionResult<Vec<crate::session::types::EntryAncestry>> {
+        self.session
+            .branch_ancestry_for_lane(&self.lane, bounds)
             .await
     }
     async fn find_entry_on_branch(
@@ -1754,6 +1802,51 @@ mod tests {
                 if matches!(message.message, AgentMessage::User(ref user)
                     if user.content == rpi_ai::types::UserContent::Text("new storage".into()))
         ));
+    }
+
+    #[tokio::test]
+    async fn ancestry_rebind_keeps_one_storage_binding_and_legacy_storage_fallback() {
+        let old = fixture_session();
+        let root = old.append_message(user("old root")).await.unwrap();
+        let archive = old
+            .append_custom_entry(crate::tool_program_body::CHUNK_CUSTOM_TYPE, None)
+            .await
+            .unwrap();
+        let new = fixture_session();
+        let new_leaf = new.append_message(user("new root")).await.unwrap();
+        let callback: Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>> = Arc::new(Mutex::new(None));
+        // RebindingStorage deliberately has no branch_ancestry override: old
+        // implementers still compile and the full-entry fallback keeps all IDs.
+        let facade = Session::new(
+            Arc::new(RebindingStorage {
+                inner: old.storage(),
+                callback: callback.clone(),
+            }),
+            None,
+        );
+        let replacement = new.storage();
+        *callback.lock().unwrap() = Some(Box::new({
+            let facade = facade.clone();
+            move || facade.set_storage(replacement)
+        }));
+        let path = facade
+            .branch_ancestry(&BranchBounds::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            path,
+            vec![
+                crate::session::types::EntryAncestry {
+                    id: archive,
+                    parent_id: Some(root.clone()),
+                },
+                crate::session::types::EntryAncestry {
+                    id: root,
+                    parent_id: None,
+                },
+            ]
+        );
+        assert_eq!(facade.get_leaf_id().await.unwrap(), Some(new_leaf));
     }
 
     #[tokio::test]

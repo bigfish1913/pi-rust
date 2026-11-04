@@ -546,6 +546,7 @@ pub(crate) async fn unknown_tool_outcomes_with_started(
         .find_entries_on_branch(
             &EntryQuery {
                 order: Some(EntryOrder::OldestFirst),
+                exclude_tool_program_bodies: true,
                 ..Default::default()
             },
             &Default::default(),

@@ -24,7 +24,7 @@ Mode capabilities and the SDK ABI/layout remain unchanged.
 
 Native **1,146 tests passed twice (6 ignored)**; the existing Windows smoke
 remains **59/59** with a freshly rebuilt host and unchanged fixture/DLL/gate.
-See the [observation checkpoint](../../../docs/extensions/tool-program.md#latest-native-observation-seam-not-durable-history)
+See the [observation checkpoint](../../../docs/extensions/tool-program.md#latest-native-archival-body-primitive-not-installed-child-history)
 for exact scope, lifecycle tests, current artifact evidence, native Clippy blockers
 and the still-pending durable history/core/adapters/Web work.
 

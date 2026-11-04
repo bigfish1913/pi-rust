@@ -19,7 +19,79 @@ and logs. A numeric handle alone is not a credential or authorization. A registr
 a tool invocation. Synchronous callbacks inherit their actual driver identity;
 foreign workers authenticate the captured invocation, including child subsets.
 
-## Latest native observation seam (not durable history)
+## Latest native archival-body primitive (not installed child history)
+
+Native `rpi-harness::tool_program_body` now offers `append_body()` and
+`read_body_page()`. This is a **standalone primary-session storage primitive**:
+no default observer writer, child RPC capabilities/commands/events, core adapter
+or Web presentation is installed. The six Code Mode caps and SDK ABI stay unchanged.
+
+Borrowed canonical JSON is serialized into decoded **32 KiB chunks**, at most
+**32 MiB / 1,024 chunks**. The synchronous encoder stages bounded chunk buffers;
+it does not build an intermediate payload Value or contiguous full-body String.
+All quota/encoding preflight occurs before any append. Primary custom chunk
+entries ACK sequentially; the commit descriptor is appended **last**, with native
+IDs, byte counts and SHA-256. Entry envelopes are at most **64 KiB**. Conditional
+append conflicts/uncertain ACKs fail closed without retry or execution replay;
+orphan chunks are not repaired or advertised as complete. Existing native
+append durability applies, not a new fsync/power-loss guarantee.
+
+Reads pin current native session/lane ownership and exact branch ancestry.
+Cursors bind session/lane/leaf/descriptor/index. Pages cap decoded data at
+**64 KiB**, count at **8**, and encoded responses at **128 KiB**, with no oversized
+first-entry exception. Per-chunk checksums are verified; consumers must stream
+all pages to verify the descriptor's aggregate hash. No blanket complete/available
+flag is returned. Forks read copied destination entries only, never source-session
+fallback. The primitive accepts an existing branch-local non-body custom entry
+as its child anchor; this is **not a validated production child-begin authority**
+or a host-authenticated custom-type namespace.
+
+Exact reserved body types are excluded from semantic context, user transforms/
+projectors, recovery/tip scans, unknown-outcome repair, notice lookup and branch
+summarization **before cold payload reads** on native cold backends. Metadata-only
+`EntryAncestry` preserves the true common ancestor even when it is archival;
+ordinary custom entries and noncustom boundaries remain intact. Generic explicit
+history/export/body reads remain broad and validate payloads. Label/checkpoint
+reads are not redesigned here. Native metadata/ancestry still grow with history;
+memory/ordinary SQLite retain eager backend behavior. Custom storage ancestry
+fallbacks may hydrate entries. These are **not RSS or zero-I/O bounds**.
+
+**Rust API migration:** `EntryQuery` has a new public
+`exclude_tool_program_bodies: bool` field, default false. Exhaustive downstream
+struct literals must add it or use `..Default::default()`; custom storage
+implementations must honor it before payload loading. New default
+`SessionStorage` / `SessionTree::branch_ancestry()` methods preserve implementer
+compilation, but require metadata overrides for cold-read guarantees.
+
+Qualification: **1,164 native tests passed, 0 failed, 6 ignored, twice** in
+`target/codemode-native-body-tests-final-state{,-repeat}.log`. Includes 18 new
+default-feature tests; do not count them again. A separate all-features body
+focus passed **21 tests** (11 body, 4 context/recovery/notice, 3 branch-summary,
+3 experimental selector). Cold poisoned-body probes, restart/fork/source deletion,
+conditional write/lost ACK, session switch, UTF-8 chunk boundaries, quota/error
+and bounded pages are covered. The first broad attempt failed on SQLite DiskFull;
+a subsequent compile attempt found a test-only crate-root path bug in the shared
+metadata oracle, fixed before the passing runs. Neither failed attempt is passing
+evidence. Only this isolated worktree's generated incremental cache was cleared;
+production files/binaries/services and existing smoke evidence were preserved.
+
+Fresh rebuilt Windows host + unchanged DLL/fixture/gate smoke: **59/59**, local
+`pi-rust-codemode/target/codemode-native-body-smoke-1/{results.json,provenance.json}`.
+Host SHA-256: `977257c54277af187a6b0a01412fb8b4e114aad17c2396f4f512aad7bec833e9`;
+all four actual artifact hashes verified. This validates unchanged normal native
+host/DLL behavior, **not production archival observer integration**. Fmt/CLI build
+pass; strict native Clippy remains blocked by existing diagnostics. A new test
+lock-across-await warning was fixed; diagnostic Clippy without `-D warnings` is
+not a strict-green claim. No deployment, install, production restart, Linux/macOS,
+live-provider, full-workspace-all-features or full-parity claim.
+
+**Next:** wire a native-owned bounded observation queue/writer with real
+assistant/run/child identities and finalized result descriptors; capability-gated
+summary/body/event queries and snapshot/live reconciliation; then neutral
+extcore, thin HTTP/ACP and approved dev frontend cards/reload/reconnect/HMR.
+Protected recursion policy is unchanged. Overall goal remains incomplete.
+
+## Historical native observation seam (not durable history)
 
 The host now provides an **optional native observation seam**, not a production
 child journal or new RPC capability. It observes genuine requested/prepared

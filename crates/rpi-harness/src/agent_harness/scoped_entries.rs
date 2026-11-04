@@ -159,6 +159,9 @@ impl AgentHarness {
                     .view()
                     .find_entries_on_branch(
                         &EntryQuery {
+                            // Outbox notices are custom messages, never archival
+                            // custom entries. Select metadata before hydration.
+                            entry_type: Some("message"),
                             outbox_key: Some(key.clone()),
                             limit: Some(1),
                             ..Default::default()
