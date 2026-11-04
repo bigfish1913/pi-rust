@@ -38,6 +38,10 @@ pub(super) struct HistoryUi {
     pub(super) active: Arc<Container>,
     pub(super) panels: Arc<Container>,
     pub(super) header: Arc<Container>,
+    /// Startup notices must stay before the live transcript slot. If they are
+    /// appended to `chat` directly, streamed output (which belongs to `active`)
+    /// renders above the notice box.
+    pub(super) updates: Arc<Container>,
 }
 impl HistoryUi {
     pub(super) fn invalidate(&self) {
@@ -58,6 +62,7 @@ impl HistoryUi {
         self.active.clear();
         self.panels.clear();
         self.header.clear();
+        self.updates.clear();
     }
     pub(super) fn bind(&self, harness: &AgentHarness) {
         self.invalidate();
@@ -95,7 +100,21 @@ impl HistoryUi {
             chat.add_child(header);
         }
     }
+    // Reserve this slot even while empty: the background update check may
+    // complete after assistant streaming has already begun.
+    pub(super) fn mount_updates(&self, chat: &Arc<Container>) {
+        let updates: Arc<dyn Component> = self.updates.clone();
+        if !chat
+            .get_children()
+            .iter()
+            .any(|child| Arc::ptr_eq(child, &updates))
+        {
+            chat.add_child(updates);
+        }
+    }
     pub(super) fn mount_active(&self, chat: &Arc<Container>) {
+        self.mount_header(chat);
+        self.mount_updates(chat);
         let active: Arc<dyn Component> = self.active.clone();
         if !chat
             .get_children()
@@ -165,6 +184,7 @@ async fn restore_bound(state: &Arc<TuiState>, chat: &Arc<Container>) {
     clear_settled_active(state);
     chat.clear();
     state.history_page.mount_header(chat);
+    state.history_page.mount_updates(chat);
     chat.add_child(page_chat);
     resident.error = None;
     state.history_page.panels.clear();
@@ -298,6 +318,7 @@ pub(super) fn request(state: Arc<TuiState>, tui: Arc<TuiAltScreen>, direction: D
                 // Drop every reference to the old page (including image components).
                 state.chat_container.clear();
                 state.history_page.mount_header(&state.chat_container);
+                state.history_page.mount_updates(&state.chat_container);
                 state.chat_container.add_child(page_chat);
                 if !page.has_more_after {
                     state
