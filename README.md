@@ -535,7 +535,7 @@ Join us to ask questions, share ideas and try early builds.
       <sub><b>WeChat / 微信交流群</b> — 扫码加入 / Scan to join</sub>
     </td>
     <td align="center" width="50%">
-      <a href="https://t.me/+7YfN4TZPP7Y0M2Q1"><img src="docs/images/tg.png" width="230" alt="Telegram group QR code"></a><br>
+      <a href="https://t.me/+7YfN4TZPP7Y0M2Q1"><img src="https://assets.bigfisharc.cn/images/support/tg.png" width="230" alt="Telegram group QR code"></a><br>
       <sub><b>Telegram</b> — <a href="https://t.me/+7YfN4TZPP7Y0M2Q1">t.me/+7YfN4TZPP7Y0M2Q1</a></sub>
     </td>
   </tr>

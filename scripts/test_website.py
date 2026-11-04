@@ -69,6 +69,10 @@ class CommunityTests(unittest.TestCase):
             self.assertIn('href="https://t.me/+7YfN4TZPP7Y0M2Q1"', html)
         self.assertEqual(support.count('data-wechat-group'), 3)
 
+    def test_telegram_qr_uses_shared_asset_and_links_to_group(self):
+        html = (ROOT / 'website/support.html').read_text(encoding='utf-8')
+        self.assertRegex(html, r'<a class="community-qr" href="https://t\.me/\+7YfN4TZPP7Y0M2Q1"[^>]*><img src="https://assets\.bigfisharc\.cn/images/support/tg\.png"[^>]*alt="[^"]+"')
+
     def test_community_labels_are_translated_in_both_languages(self):
         locales = json.loads((ROOT / 'website/data/locales.json').read_text(encoding='utf-8'))
         for name in ('index.html', 'support.html'):
