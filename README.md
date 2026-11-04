@@ -11,7 +11,7 @@
 [![Best of Agent Harnesses](https://img.shields.io/badge/%F0%9F%8F%86_Best_of-Agent_Harnesses-5ac4bf)](https://github.com/RyanAlberts/best-of-Agent-Harnesses)
 
 `rpi` is a library-first coding-agent runtime written in Rust, plus a terminal
-agent built on top of it. Ten composable crates span provider adapters, a
+agent built on top of it. Eleven composable crates span provider adapters, a
 durable crash-resumable agent loop, a reusable runtime, a terminal UI, and a
 stable plugin ABI — so the same code works as an embedded SDK or as a ready-to-run
 `rpi` command.
@@ -64,7 +64,7 @@ On **Windows (x64)**, run in PowerShell 5.1 or later:
 Verifies the published SHA-256 checksum and installs to
 `$env:LOCALAPPDATA\Programs\rpi`. Follow the printed instructions to add it to
 PATH, then run `rpi --version`. Append `-DryRun` to preview, or use
-`-Version 0.3.22` and `-Dir 'C:\Tools\rpi'` to select a version and directory.
+`-Version <version>` and `-Dir 'C:\Tools\rpi'` to select a version and directory.
 
 **From crates.io** (requires Rust 1.88+):
 
@@ -218,7 +218,7 @@ provider — the full version is in [`examples/minimal/src/main.rs`](examples/mi
 
 ## Crates
 
-Ten workspace crates, one shared version. Dependency direction is one-way
+Eleven workspace crates, one shared version. Dependency direction is one-way
 and enforced in review:
 
 ```
@@ -226,8 +226,11 @@ rpi-telemetry → rpi-ai → rpi-agent → rpi-tools → rpi-harness
                     ↘ rpi-runtime
 ```
 
-Five crates sit outside that chain:
+Six crates sit outside that chain:
 
+- `rpi-durable` provides backend-independent checkpoint validation and progress
+  projection for `rpi-harness`; it has no `rpi-*` dependencies. It is a native
+  library, distinct from the workflow extension of the same name.
 - `rpi-tui` depends on no other `rpi-*` crate.
 - `rpi-runtime` depends on `rpi-ai` and provides embeddable model catalogs,
   credential resolution and execution bindings. See the
@@ -238,16 +241,17 @@ Five crates sit outside that chain:
   the ABI. That edge is names-only — nothing is linked or called.
 - `rpi-extensions` is `rpi-plugin-sdk` plus `rpi-ai`/`rpi-agent`, since it hosts
   plugins that run tools.
-- `rpi-cli` depends on all ten of the others, which is how the `rpi` binary
-gets the TUI, the harness and the plugin loader at once.
+- `rpi-cli` brings together the TUI, the harness and the plugin loader, with
+  `rpi-durable` included through `rpi-harness`.
 
 | Crate | What it is |
 | ----- | ---------- |
 | [`rpi-telemetry`](https://crates.io/crates/rpi-telemetry) | Span/event contracts with a no-op default — instrumentation is opt-in, and pulls in no tracing or OpenTelemetry backend |
 | [`rpi-ai`](https://crates.io/crates/rpi-ai) | Provider-agnostic message, streaming and tool-schema types; Anthropic + OpenAI-compatible + `faux` providers |
-| [`rpi-runtime`](crates/rpi-runtime) | Embeddable model catalog, credential resolution, model selection and execution bindings (new; not yet published) |
+| [`rpi-runtime`](https://crates.io/crates/rpi-runtime) | Embeddable model catalog, credential resolution, model selection and execution bindings |
 | [`rpi-agent`](https://crates.io/crates/rpi-agent) | The agent loop: `AgentTool`, events, hooks, queues, cancellation |
 | [`rpi-tools`](https://crates.io/crates/rpi-tools) | `read`/`write`/`edit`/`bash` (+ `grep`, `find`, `ls`, `powershell`) and the `ExecutionEnv` seam |
+| [`rpi-durable`](crates/rpi-durable) | Backend-independent checkpoint validation and assistant-progress projection; no tool execution or storage backend |
 | [`rpi-harness`](https://crates.io/crates/rpi-harness) | Session tree, JSONL persistence, compaction, crash recovery, the run loop |
 | [`rpi-tui`](https://crates.io/crates/rpi-tui) | Terminal UI primitives: components, layout, editor, transcript rendering |
 | [`rpi-cli`](https://crates.io/crates/rpi-cli) | The `rpi` binary: TUI, one-shot and JSON modes, config, plugin loading |
@@ -270,8 +274,9 @@ changes what you can build with it:
   real HTTP providers behind a `providers` feature flag, so your test suite
   cannot silently depend on the network for the paths you exercise.
 - **Durable.** Sessions are a tree with JSONL persistence and per-frame
-  progress. A crash mid-tool-call resumes instead of losing the turn or
-  double-executing the tool.
+  progress. Recovery resumes from committed progress; it does not guarantee
+  exactly-once external side effects. Tools still need appropriate idempotency
+  and recovery checks.
 - **Extensible across a stable boundary.** Plugins are Rust `cdylib`s behind a
   hand-written, panic-contained C ABI with version negotiation — the ABI
   survives compiler and crate version skew, so extensions do not break on every
@@ -445,7 +450,7 @@ machine. See [`docs/remote/user-guide.md`](docs/remote/user-guide.md).
 
 | | |
 | --- | --- |
-| Current release | **[0.17.2](https://github.com/bigfish1913/pi-rust/releases)** (nine crates, published together) |
+| Current release | **[0.17.2](https://github.com/bigfish1913/pi-rust/releases)** (eleven workspace crates, one shared version) |
 | Stability | `rpi-ai`, `rpi-agent`, `rpi-tools`, `rpi-harness`, `rpi-plugin-sdk` are the intended stable surface |
 | MSRV | 1.88 |
 | Platforms | Linux, macOS, Windows (CI runs the suite on Linux) |
@@ -478,37 +483,6 @@ through [SECURITY.md](SECURITY.md), not a public issue.
 
 The whole test suite runs offline: `cargo test --workspace --locked`.
 
-## Support / 赞赏支持
-
-If rpi helps you, consider buying the author a coffee. Tips and donations support continued development and maintenance. Thank you!
-
-如果 rpi 帮到了你，欢迎请作者喝杯咖啡，赞赏或捐助支持持续开发与维护。感谢每一份支持！
-
-| 微信支付 / WeChat Pay | 支付宝 / Alipay | Binance Pay |
-| :---: | :---: | :---: |
-| ![微信支付赞赏码](docs/images/weixinsk.png) | ![支付宝赞赏码](docs/images/alipay.jpg) | ![Binance Pay 赞赏码](docs/images/bian.png) |
-
-扫码或点击图片查看原图；手机上可保存图片后，在对应 App 中识别。 / Scan the code or click to view the original. On mobile, save the image and scan it from the matching app’s photo library.
-
-## Community
-
-Questions, ideas and early builds are welcome in either group:
-
-<table>
-  <tr>
-    <td align="center" width="50%">
-      <img src="docs/images/weixin.png" width="230" alt="WeChat group QR code"><br>
-      <sub><b>WeChat</b> — <a href="https://weixin.qq.com/g/AQYAAD8z3FmKPk143hi_HUVOtGvNqlHWMtVZu1VGGB_46JKoNpyhJvS7kDwQwUTr">微信交流群</a></sub>
-    </td>
-    <td align="center" width="50%">
-      <img src="docs/images/tg.png" width="230" alt="Telegram group QR code"><br>
-      <sub><b>Telegram</b> — <a href="https://t.me/+7YfN4TZPP7Y0M2Q1">t.me/+7YfN4TZPP7Y0M2Q1</a></sub>
-    </td>
-  </tr>
-</table>
-
-<sub>Group invite codes expire — WeChat's rotates every few days. If a QR code stops working, open an issue and it will be refreshed.</sub>
-
 ## Acknowledgements
 
 Thank you to Mario Zechner and the [Pi contributors](https://github.com/earendil-works/pi)
@@ -524,6 +498,63 @@ MIT. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
 The `rpi-*` crates are a Rust-native coding-agent stack.
 
+## Support / 赞赏支持
+
+If rpi helps you, consider buying the author a coffee. Donations support
+continued development and maintenance. Thank you!
+
+如果 rpi 帮到了你，欢迎请作者喝杯咖啡，支持持续开发与维护。感谢每一份支持！
+
+<table>
+  <tr>
+    <th>微信支付 / WeChat Pay</th>
+    <th>支付宝 / Alipay</th>
+    <th>Binance Pay</th>
+  </tr>
+  <tr>
+    <td align="center"><a href="https://assets.bigfisharc.cn/images/support/wechat.png"><img src="https://assets.bigfisharc.cn/images/support/wechat.png" width="200" alt="微信支付赞赏码 / WeChat Pay donation QR code"></a></td>
+    <td align="center"><a href="https://assets.bigfisharc.cn/images/support/alipay.jpg"><img src="https://assets.bigfisharc.cn/images/support/alipay.jpg" width="200" alt="支付宝赞赏码 / Alipay donation QR code"></a></td>
+    <td align="center"><a href="https://assets.bigfisharc.cn/images/support/binance.png"><img src="https://assets.bigfisharc.cn/images/support/binance.png" width="200" alt="Binance Pay donation QR code"></a></td>
+  </tr>
+</table>
+
+Scan a code or click an image to view the original. On mobile, save the image
+and scan it from the matching app’s photo library.
+
+扫码或点击图片查看原图；手机上可保存图片后，在对应 App 中识别。
+
+## Community / 交流群
+
+Join us to ask questions, share ideas and try early builds.
+欢迎交流使用问题、分享想法和体验新功能。
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <a href="https://assets.bigfisharc.cn/images/support/weixin.png?date=2026-11-04"><img src="https://assets.bigfisharc.cn/images/support/weixin.png?date=2026-11-04" width="230" alt="微信交流群二维码 / WeChat group QR code"></a><br>
+      <sub><b>WeChat / 微信交流群</b> — 扫码加入 / Scan to join</sub>
+    </td>
+    <td align="center" width="50%">
+      <a href="https://t.me/+7YfN4TZPP7Y0M2Q1"><img src="docs/images/tg.png" width="230" alt="Telegram group QR code"></a><br>
+      <sub><b>Telegram</b> — <a href="https://t.me/+7YfN4TZPP7Y0M2Q1">t.me/+7YfN4TZPP7Y0M2Q1</a></sub>
+    </td>
+  </tr>
+</table>
+
+<sub>The WeChat image URL is refreshed daily with a date parameter (UTC+8) by
+<a href=".github/workflows/readme-images.yml">README image refresh</a> to avoid stale cached
+images. This does not renew the group invitation itself; if it expires, please
+open an issue. / 微信群图片链接每日更新日期参数以刷新缓存；若入群邀请失效，请提 issue。</sub>
+
 ## Star history
 
 [![Star History Chart](https://api.star-history.com/svg?repos=bigfish1913/pi-rust,pi-rust/rpi-package&type=Date)](https://www.star-history.com/#bigfish1913/pi-rust&pi-rust/rpi-package&Date)
+
+## Contributors
+
+Thank you to everyone who contributes code, documentation, bug reports and ideas.
+感谢所有参与代码、文档、问题反馈和建议的贡献者！
+
+[![Contributors to pi-rust](https://contrib.rocks/image?repo=bigfish1913/pi-rust)](https://github.com/bigfish1913/pi-rust/graphs/contributors)
+
+[View the full contributor list](https://github.com/bigfish1913/pi-rust/graphs/contributors) · [How to contribute](CONTRIBUTING.md)
