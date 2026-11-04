@@ -308,7 +308,7 @@ Task 显式使用 `target/resource-tests-cargo`，不依赖全局 Cargo target�
 | 指标/预算 | 默认值或口径 |
 | --- | --- |
 | Windows 主内存指标 | PrivateUsage（私有提交字节），另报 Working Set、峰值 resident/commit |
-| Linux 主内存指标 | RSS、峰值 RSS，取自 `/proc`；不与 Windows Private Bytes 混为同一含义 |
+| Linux 主内存指标 | `/proc` 的 VmRSS/VmHWM 为近似快照，VmHWM 不保证采样间单调；内存门禁取已采样 VmRSS 的最大值，不是精确 OS 峰值，也不与 Windows Private Bytes 混为同一含义 |
 | CPU | 进程 user+kernel 秒；百分比按单核口径，100% 为一个逻辑核，可超过 100% |
 | 绝对主内存上限 | 512 MiB，`--max-memory-mib` |
 | RPC 增长预算 | warmup 后 96 MiB，`--max-rpc-growth-mib` |

@@ -350,7 +350,7 @@ class MainTests(TemporaryCase):
 
 
 class RunOnceTests(TemporaryCase):
-    def run_fake(self, entries=12, change_messages=None, state=None, close_error=False):
+    def run_fake(self, entries=12, change_messages=None, state=None, close_error=False, samples=None):
         root = self.base / ("observation-" + str(entries) + "-" +
                             str(len(list(self.base.glob("observation-*")))))
         calls = []
@@ -386,11 +386,30 @@ class RunOnceTests(TemporaryCase):
                     raise cold.smoke.Problem("cleanup", "mock tree cleanup failure")
                 host.tree_cleanup.append(dict(method="fake-owned-tree", ok=True))
 
-        sampler = SimpleNamespace(peak=1024, close=lambda: None,
-            take=lambda: dict(primary_metric="rss_bytes", peak_commit_bytes=None))
+        real_sampler = cold.smoke.Sampler
+        samplers = []
+        reader = mock.Mock(side_effect=samples)
+        thread = mock.Mock()
+        thread.is_alive.return_value = False
+
+        def make_sampler(pid, interval):
+            if samples is None:
+                return SimpleNamespace(peak=1024, close=lambda: None,
+                    take=lambda: dict(primary_metric="rss_bytes", peak_commit_bytes=None))
+            sampler = real_sampler(pid, interval, reader=reader)
+            samplers.append(sampler)
+            return sampler
+
         with mock.patch.object(cold, "ColdHost", FakeHost), \
-             mock.patch.object(cold.smoke, "Sampler", return_value=sampler):
+             mock.patch.object(cold.smoke, "Sampler", side_effect=make_sampler), \
+             mock.patch.object(cold.smoke.threading, "Thread", return_value=thread):
             result = cold.run_once(self.binary, root, parameters(entries=entries), "modern", "candidate", 1)
+        if samples is not None:
+            self.assertEqual(len(samplers), 1)
+            self.assertTrue(samplers[0].stop_event.is_set())
+            thread.start.assert_called_once()
+            thread.join.assert_called_once_with(timeout=5)
+            self.assertEqual(reader.call_count, len(samples))
         self.assertEqual(result, json.loads((root / "report.json").read_text(encoding="utf-8")))
         self.assertTrue((root / "fixture.json").is_file())
         history = root / "sessions" / "fixture" / "history.jsonl"
@@ -410,6 +429,34 @@ class RunOnceTests(TemporaryCase):
                 self.assertEqual(calls, ["get_messages", "get_state", "stop"])
                 self.assertEqual(result["stateFlags"], dict(activeOperation=None, steeringCount=0,
                                                           followUpCount=0, pendingResume=False))
+
+    def test_linux_approximate_peak_decrease_does_not_fail_ready_or_cleanup(self):
+        samples = [dict(primary_metric="linux_rss", primary_bytes=rss, rss_bytes=rss,
+                        peak_rss_bytes=hwm, user_seconds=1, kernel_seconds=1, wall_seconds=i)
+                   for i, (rss, hwm) in enumerate(
+                       ((4096, 8192), (2048, 4096), (3072, 6144), (1024, 2048)), 1)]
+        result, calls = self.run_fake(samples=samples)
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(result["primaryMetric"], "linux_rss")
+        self.assertEqual(result["metrics"]["peakPrimaryBytes"], 4096)
+        self.assertEqual(calls, ["get_messages", "get_state", "stop"])
+        self.assertTrue(all(item.get("ok") or item.get("deleted") or item.get("absent")
+                            for item in result["cleanup"]))
+
+    def test_cpu_and_wall_decreases_still_fail_ready_and_clean_up(self):
+        before = dict(primary_metric="linux_rss", primary_bytes=4096, rss_bytes=4096,
+                      peak_rss_bytes=8192, user_seconds=1, kernel_seconds=1, wall_seconds=1)
+        for key in ("user_seconds", "kernel_seconds", "wall_seconds"):
+            with self.subTest(key=key):
+                after = before | {"peak_rss_bytes": 4096, key: 0}
+                result, calls = self.run_fake(samples=[before, after])
+                self.assertEqual(result["status"], "FAIL")
+                self.assertEqual(result["errors"][0]["phase"], "ready")
+                self.assertEqual(result["errors"][0]["message"], "retrograde metric: " + key)
+                self.assertEqual(result["metrics"]["peakPrimaryBytes"], 4096)
+                self.assertEqual(calls, [])
+                self.assertTrue(any(item.get("ok") for item in result["cleanup"]))
 
     def test_process_cleanup_failure_retains_owned_history(self):
         result, _ = self.run_fake(close_error=True)
