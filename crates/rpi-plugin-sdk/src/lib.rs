@@ -1083,6 +1083,30 @@ pub type ResourcesDiscoverFn = extern "C" fn(
 pub type BeforeAgentStartFn =
     extern "C" fn(event_json: StbStringRef, out: *mut StbString, user_data: *mut c_void) -> i32;
 
+/// `tool_result` transform signature: pi's `tool_result` handler, which may
+/// return a changed `content` / `details` for a finished tool call
+/// (`ToolResultEventResult`). The [`EventTag::ToolResult`] broadcast only
+/// observes.
+///
+/// `event_json` is a borrowed envelope `{"toolCallId", "toolName", "input",
+/// "content", "details"}`: `input` holds the arguments the tool ran with,
+/// `content` is the result in the shape a plugin tool returns (`text` and
+/// `image` blocks, `image` carrying base64 `data` and `mimeType`). `out` is
+/// plugin-produced JSON with the fields to replace, `{"content": [...]}`,
+/// `{"details": ...}` or both; an empty string or object leaves the result
+/// alone. It is reclaimed via the `plugin_free_string` given at registration.
+///
+/// Handlers chain in registration order, each seeing the previous one's
+/// result. A nonzero return or a panic leaves the result as it was and the
+/// fan-out continues. Only successful results are offered: a tool that fails
+/// reports an error, not content. Handlers run on a blocking thread, so slow
+/// work (re-encoding an image) does not stall the runtime.
+///
+/// SAFETY: the plugin warrants `user_data` is valid for the registry's lifetime
+/// and the handler is callable from any thread.
+pub type ToolResultFn =
+    extern "C" fn(event_json: StbStringRef, out: *mut StbString, user_data: *mut c_void) -> i32;
+
 // ---------------------------------------------------------------------------
 // Runtime actions — uniform JSON-RPC dispatch by RuntimeActionId
 // ---------------------------------------------------------------------------
@@ -1896,6 +1920,18 @@ pub struct PluginApi {
             user_data: *mut c_void,
         ) -> i32,
     >,
+    /// Register a [`ToolResultFn`] transform, appended after
+    /// `register_oauth_provider_cancellable`. A host that predates this slot
+    /// does not reach it with `struct_size`: register through
+    /// [`register_tool_result`], which checks that and returns `-1` on such a
+    /// host, whose tool results then stay as the tools returned them.
+    pub register_tool_result: Option<
+        extern "C" fn(
+            handler: ToolResultFn,
+            plugin_free_string: FreeStringFn,
+            user_data: *mut c_void,
+        ) -> i32,
+    >,
 }
 unsafe impl Send for PluginApi {}
 unsafe impl Sync for PluginApi {}
@@ -1932,6 +1968,22 @@ pub fn register_oauth_provider_cancellable(
         )
     } else {
         -1
+    }
+}
+
+/// Register a `tool_result` transform (see [`ToolResultFn`]).
+///
+/// Returns the host's registration status, or `-1` when the host predates the
+/// slot (its `struct_size` does not reach it) or leaves it `None`.
+pub fn register_tool_result(api: &PluginApi, handler: ToolResultFn, user_data: *mut c_void) -> i32 {
+    let end =
+        core::mem::offset_of!(PluginApi, register_tool_result) + core::mem::size_of::<usize>();
+    if (api.struct_size as usize) < end {
+        return -1;
+    }
+    match api.register_tool_result {
+        Some(register) => register(handler, callbacks::free_string, user_data),
+        None => -1,
     }
 }
 
@@ -2325,6 +2377,7 @@ mod tests {
             register_plugin_lifecycle: None,
             register_tool_prompt: None,
             register_oauth_provider_cancellable: None,
+            register_tool_result: None,
         };
         // All optional slots are null → plugin must degrade.
         assert!(api.register_tool.is_none());
@@ -2426,14 +2479,19 @@ mod tests {
         );
         let tool_prompt = core::mem::offset_of!(PluginApi, register_tool_prompt);
         assert_eq!(tool_prompt, lifecycle + size_of::<usize>());
-        // The cancellable OAuth slot is the newest and therefore the last field.
         let cancellable = core::mem::offset_of!(PluginApi, register_oauth_provider_cancellable);
         assert_eq!(
             cancellable,
             tool_prompt + size_of::<usize>(),
             "register_oauth_provider_cancellable must be appended after register_tool_prompt"
         );
-        assert_eq!(size_of::<PluginApi>(), cancellable + size_of::<usize>());
+        let tool_result = core::mem::offset_of!(PluginApi, register_tool_result);
+        assert_eq!(
+            tool_result,
+            cancellable + size_of::<usize>(),
+            "register_tool_result must be appended after register_oauth_provider_cancellable"
+        );
+        assert_eq!(size_of::<PluginApi>(), tool_result + size_of::<usize>());
         assert_eq!(align_of::<PluginApi>(), align_of::<*const ()>());
     }
 
@@ -2531,6 +2589,7 @@ mod tests {
             register_plugin_lifecycle: None,
             register_tool_prompt: None,
             register_oauth_provider_cancellable: None,
+            register_tool_result: None,
         }
     }
 
