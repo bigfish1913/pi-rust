@@ -65,6 +65,7 @@ use crate::resource_dirs::{
     load_prompt_templates_with_precedence, load_skills_with_precedence, project_extension_dirs,
     project_prompt_template_dirs, project_skill_dirs, prompt_template_dirs, skill_dirs,
 };
+use crate::startup_diagnostics::{Phase, StartupSpan};
 use rpi_extensions::{
     emit_resources_discover, ExtensionEmitter, ExtensionSession, NullDiagnostics,
     PluginDiagnostics, PluginToolAdapter, TeeEmitter, ToolPromptMetadata,
@@ -391,8 +392,10 @@ pub fn default_session_dir(cwd: &Path) -> PathBuf {
 /// Extensions are loaded exactly once before model resolution. Their action
 /// host remains unbound until the harness and authenticated catalog exist.
 pub struct PreparedExtensions {
+    resource_leases: Arc<Vec<crate::resource_management::Lease>>,
     resource_selection: Option<crate::resource_selection::ResolvedSelection>,
     session_selection: SessionSelection,
+    transition_session: Option<Session>,
     pub extension_session: ExtensionSession,
     native_store: Option<PathBuf>,
     session_dir: PathBuf,
@@ -452,8 +455,14 @@ pub(crate) fn preflight_extension_startup(
                             _ => resolve_restore_target(&selection, &cwd_str).await?,
                         };
                         let Some(meta) = target else {
+                            if resources.as_ref().is_some_and(|r| r.transition.is_some()) {
+                                return Err(BuildError::SessionOpen("resource transition requires an existing native session".into()));
+                            }
                             return Ok(selection.clone());
                         };
+                        if resources.as_ref().is_some_and(|r| r.transition.is_some()) && matches!(selection, SessionSelection::Fork { .. }) {
+                            return Err(BuildError::SessionOpen("resource transition cannot fork".into()));
+                        }
                         use rpi_harness::session::jsonl::{
                             JsonlSessionRepo, JsonlSessionRepoOptions,
                         };
@@ -464,15 +473,20 @@ pub(crate) fn preflight_extension_startup(
                             clock: Arc::new(SystemClock),
                             ids: Arc::new(DefaultIdGenerator::new()),
                         });
-                        let facts = repo
-                            .read_facts_by_jsonl_metadata(&meta)
-                            .await
+                        let binding_facts = StartupSpan::start(Phase::BindingFacts);
+                        let facts = if resources.as_ref().is_some_and(|r| r.transition.is_some()) {
+                            rpi_harness::session::jsonl::JsonlSessionStorage::read_resource_transition_facts(
+                                Arc::new(OsExecutionEnv::with_cwd(cwd.to_path_buf())), &meta.path,
+                                Arc::new(SystemClock), Arc::new(DefaultIdGenerator::new()),
+                            ).await
+                        } else { repo.read_facts_by_jsonl_metadata(&meta).await }
                             .map_err(|e| BuildError::SessionOpen(e.to_string()))?;
                         crate::resource_selection::validate_session_binding(
                             &facts.values,
                             resources.as_ref(),
                         )
                         .map_err(BuildError::SessionOpen)?;
+                        binding_facts.finish();
                         Ok(match selection {
                             SessionSelection::Fork { .. } => SessionSelection::Fork {
                                 source: meta.path,
@@ -495,8 +509,37 @@ pub fn prepare_extensions(
 ) -> Result<PreparedExtensions, BuildError> {
     let native_store =
         crate::native_store::root(args, cwd).map_err(BuildError::NativeStorePolicy)?;
+    let resource_leases =
+        crate::resource_management::host_leases(cwd).map_err(BuildError::HarnessCreate)?;
     let (resource_selection, session_selection) =
         preflight_extension_startup(args, cwd, project_trusted)?;
+    // Transition hosts own the writer before any DLL registration. The strict
+    // loader cannot repair history/progress or migrate metadata on rejection.
+    let transition_session = if resource_selection
+        .as_ref()
+        .is_some_and(|r| r.transition.is_some())
+    {
+        Some(std::thread::scope(|scope| {
+            scope.spawn(|| {
+            tokio::runtime::Builder::new_current_thread().enable_all().build()
+                .map_err(|e| BuildError::SessionOpen(e.to_string()))?.block_on(async {
+                    let meta = resolve_restore_target(&session_selection, &cwd.to_string_lossy()).await?
+                        .ok_or_else(|| BuildError::SessionOpen("transition session disappeared".into()))?;
+                    let path = std::fs::canonicalize(&meta.path).map_err(|e| BuildError::SessionOpen(e.to_string()))?;
+                    claim_session_lock_inner(&path.to_string_lossy(), false).map_err(BuildError::SessionOpen)?;
+                    let storage = rpi_harness::session::jsonl::JsonlSessionStorage::load_for_resource_transition(
+                        Arc::new(OsExecutionEnv::with_cwd(cwd.to_path_buf())), &path.to_string_lossy(),
+                        Arc::new(SystemClock), Arc::new(DefaultIdGenerator::new()),
+                    ).await.map_err(|e| BuildError::SessionOpen(e.to_string()))?;
+                    let session = Session::new(Arc::new(storage), None);
+                    crate::resource_selection::bind_session(&session, resource_selection.as_ref()).await.map_err(BuildError::SessionOpen)?;
+                    Ok::<_, BuildError>(session)
+                })
+        }).join().map_err(|_| BuildError::SessionOpen("transition writer preparation panicked".into()))?
+        })?)
+    } else {
+        None
+    };
     let session_dir = if matches!(session_selection, SessionSelection::Ephemeral) {
         configured_session_dir(args, cwd)
     } else {
@@ -578,12 +621,14 @@ pub fn prepare_extensions(
         editor_text_mailbox.clone(),
     );
 
+    let extension_register = StartupSpan::start(Phase::ExtensionRegister);
     let extension_session = if let Some(selected) = &resource_selection {
-        let session = rpi_extensions::load_session_mixed(
+        let session = rpi_extensions::load_session_mixed_guarded(
             &[],
             &selected.extensions,
             Arc::new(NullDiagnostics),
             Some(Arc::clone(&action_bridge)),
+            Some(resource_leases.clone()),
         );
         if session.loaded_paths() != selected.extensions.as_slice() {
             return Err(BuildError::HarnessCreate(
@@ -601,6 +646,7 @@ pub fn prepare_extensions(
     } else {
         load_extensions(args, cwd, project_trusted, Some(Arc::clone(&action_bridge)))
     };
+    extension_register.finish();
     if args.verbose {
         if let Some(s) = extension_session.summary() {
             eprintln!("extensions: {s}");
@@ -615,8 +661,10 @@ pub fn prepare_extensions(
     // via `RuntimeActionHost::publish_registry`.
     action_host.publish_registry_impl(extension_session.snapshot_arc());
     Ok(PreparedExtensions {
+        resource_leases,
         resource_selection,
         session_selection,
+        transition_session,
         native_store,
         session_dir,
         runtime,
@@ -699,8 +747,10 @@ pub async fn build_prepared(
     // before the tools are built, and completed with the session id below once
     // the session exists — the tool set has to exist before the harness does.
     let PreparedExtensions {
+        resource_leases,
         resource_selection,
         session_selection: selection,
+        transition_session,
         native_store: _,
         session_dir,
         runtime,
@@ -757,7 +807,10 @@ pub async fn build_prepared(
     // can change while extensions load, and an adopted session cwd would point
     // at another project's tree. Both the cwd peek and this build must read the
     // same root, so the caller pins it into `args` before either runs.
-    let session = build_session(&selection, &cwd_str).await?;
+    let session = match transition_session {
+        Some(session) => session,
+        None => build_session(&selection, &cwd_str, resource_selection.as_ref()).await?,
+    };
     crate::resource_selection::bind_session(&session, resource_selection.as_ref())
         .await
         .map_err(BuildError::SessionOpen)?;
@@ -1223,6 +1276,13 @@ pub async fn build_prepared(
         .await
         .map_err(|e| BuildError::HarnessCreate(e.to_string()))?;
 
+    // Retain read leases even for resource-only/--no-extensions hosts.
+    let harness_leases = resource_leases.clone();
+    harness
+        .events()
+        .on_lifetime::<rpi_harness::events::RunEndEvent, _>(move |_| {
+            let _ = &harness_leases;
+        });
     install_extension_settlement_bridge(harness.events(), extension_session_cell.clone());
     if let Some(selected) = &resource_selection {
         harness
@@ -1246,12 +1306,60 @@ pub async fn build_prepared(
                 "changes": "restart-required"
             }),
         );
+        let resource_observation = StartupSpan::start(Phase::ResourceObservation);
         crate::resource_selection::get_resource_state(&harness)
             .await
             .map_err(BuildError::HarnessCreate)?;
+        resource_observation.finish();
+        if selected.transition.is_some() {
+            // Re-read persisted facts at commit, not merely the startup mirror.
+            // The canonical OS writer claim acquired before registration is
+            // retained by the host for the entire session lifetime.
+            let meta = resolve_restore_target(&selection, &cwd_str)
+                .await?
+                .ok_or_else(|| {
+                    BuildError::SessionOpen("transition session disappeared before commit".into())
+                })?;
+            let path = std::fs::canonicalize(&meta.path)
+                .map_err(|e| BuildError::SessionOpen(e.to_string()))?;
+            let lock_path = PathBuf::from(format!("{}.lock", path.display()));
+            if !SESSION_LOCK_PATHS
+                .get_or_init(|| Mutex::new(HashSet::new()))
+                .lock()
+                .unwrap()
+                .contains(&lock_path)
+            {
+                return Err(BuildError::SessionOpen(
+                    "resource transition lost canonical writer ownership".into(),
+                ));
+            }
+            let facts =
+                rpi_harness::session::jsonl::JsonlSessionStorage::read_resource_transition_facts(
+                    Arc::new(OsExecutionEnv::with_cwd(cwd.to_path_buf())),
+                    &path.to_string_lossy(),
+                    Arc::new(SystemClock),
+                    Arc::new(DefaultIdGenerator::new()),
+                )
+                .await
+                .map_err(|e| BuildError::SessionOpen(e.to_string()))?;
+            crate::resource_selection::validate_session_binding(&facts.values, Some(selected))
+                .map_err(BuildError::SessionOpen)?;
+            let mirror = rpi_harness::session::SessionValues::load(harness.session())
+                .await
+                .map_err(|e| BuildError::SessionOpen(e.to_string()))?;
+            if crate::resource_selection::binding_state(&mirror)
+                != crate::resource_selection::binding_state(&facts.values)
+            {
+                return Err(BuildError::SessionOpen(
+                    "resource binding changed before commit".into(),
+                ));
+            }
+        }
+        let inventory_bind = StartupSpan::start(Phase::InventoryBind);
         crate::resource_selection::bind_inventory(&harness, selected)
             .await
             .map_err(BuildError::SessionOpen)?;
+        inventory_bind.finish();
     }
     // Publish only after exact resources have been sealed and validated.
     crate::extensions_actions::HarnessActionHost::set_harness(
@@ -1314,6 +1422,7 @@ pub async fn build_prepared(
     let mut reload_args = args.clone();
     reload_args.session_dir = Some(session_dir);
     let reload_context = ReloadContext {
+        resource_leases,
         fresh_session_only,
         extension_session: extension_session_cell,
         action_bridge: Arc::new(Mutex::new(Some(Arc::clone(&action_bridge)))),
@@ -1458,6 +1567,7 @@ pub type ActionBridgeCell = Arc<Mutex<Option<Arc<rpi_extensions::ActionBridge>>>
 /// reload callback without borrowing the harness).
 #[derive(Clone)]
 pub struct ReloadContext {
+    resource_leases: Arc<Vec<crate::resource_management::Lease>>,
     /// Startup routing capability, retained independently of mutable args/settings.
     fresh_session_only: bool,
     /// One neutral router for all built-ins, including those reconstructed on reload.
@@ -1680,7 +1790,10 @@ async fn reload_extension_resources_inner<F>(
 where
     F: FnOnce() + Send,
 {
-    if harness.has_exact_resources() || ctx.args.resource_config.is_some() {
+    if harness.has_exact_resources()
+        || ctx.args.resource_config.is_some()
+        || ctx.args.resource_transition.is_some()
+    {
         return ReloadOutcome {
             summary:
                 "Exact resource selection is restart-required; reload/dev hot apply unsupported"
@@ -1807,6 +1920,7 @@ where
             &effective_args,
             &extension_dirs,
             Some(Arc::clone(&fresh_bridge)),
+            Some(ctx.resource_leases.clone()),
         )
     };
     if let Err(error) =
@@ -2455,13 +2569,21 @@ pub(crate) fn load_extensions(
         global_extension_dirs()
     };
     dirs.extend(args.extensions_dir.iter().cloned());
-    load_extensions_from_dirs(args, &dirs, action_bridge)
+    let leases = match crate::resource_management::host_leases(cwd) {
+        Ok(leases) => leases,
+        Err(error) => {
+            eprintln!("warning: refusing extension loading: {error}");
+            return ExtensionSession::none();
+        }
+    };
+    load_extensions_from_dirs(args, &dirs, action_bridge, Some(leases))
 }
 
 fn load_extensions_from_dirs(
     args: &Args,
     dirs: &[PathBuf],
     action_bridge: Option<Arc<rpi_extensions::ActionBridge>>,
+    host_guard: Option<Arc<dyn Send + Sync>>,
 ) -> ExtensionSession {
     let diagnostics: Arc<dyn PluginDiagnostics> = Arc::new(NullDiagnostics);
     // B5a: the action bridge is cloned into every loaded plugin's vtable
@@ -2470,7 +2592,13 @@ fn load_extensions_from_dirs(
     // `!no_extensions` and threads `Some(bridge)`; `None` is only passed by the
     // `--no-extensions` branch (which calls `ExtensionSession::none()` directly)
     // and tests. Explicit `--extension`/`-e` files load after the dirs.
-    rpi_extensions::load_session_mixed(dirs, &args.extension, diagnostics, action_bridge)
+    rpi_extensions::load_session_mixed_guarded(
+        dirs,
+        &args.extension,
+        diagnostics,
+        action_bridge,
+        host_guard,
+    )
 }
 
 /// Merge the loaded extension tools into the built-in set. An extension tool
@@ -2570,7 +2698,8 @@ fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
     all.push(("powershell", HarnessTool::new(create_powershell_tool(ctx))));
 
     // Apply default_tools from settings (if no CLI override)
-    if args.tools.is_none() && args.resource_config.is_none() {
+    if args.tools.is_none() && args.resource_config.is_none() && args.resource_transition.is_none()
+    {
         if let Ok(settings) = crate::settings::load_settings() {
             if let Some(default_tools) = &settings.default_tools {
                 all.retain(|(name, _)| default_tools.iter().any(|t| t == name));
@@ -2641,7 +2770,11 @@ where
 }
 
 /// Build the `Session` facade for the chosen selection.
-async fn build_session(selection: &SessionSelection, cwd: &str) -> Result<Session, BuildError> {
+async fn build_session(
+    selection: &SessionSelection,
+    cwd: &str,
+    selected: Option<&crate::resource_selection::ResolvedSelection>,
+) -> Result<Session, BuildError> {
     match selection {
         SessionSelection::Ephemeral => Ok(ephemeral_session()),
         SessionSelection::ExperimentalNative { dir } => Ok(Session::new(
@@ -2661,7 +2794,9 @@ async fn build_session(selection: &SessionSelection, cwd: &str) -> Result<Sessio
         SessionSelection::Latest { .. }
         | SessionSelection::ById { .. }
         | SessionSelection::ByExactId { .. } => restore_session(selection, cwd).await,
-        SessionSelection::Fork { source, dir } => fork_session_at_launch(source, dir, cwd).await,
+        SessionSelection::Fork { source, dir } => {
+            fork_session_at_launch(source, dir, cwd, selected).await
+        }
     }
 }
 
@@ -2697,9 +2832,14 @@ async fn restore_session(selection: &SessionSelection, cwd: &str) -> Result<Sess
         };
     };
     let sessions_root = selection_dir(selection);
-    open_session(&meta, cwd, &sessions_root)
+    let writer_restore = StartupSpan::start(Phase::WriterRestore);
+    let result = open_session(&meta, cwd, &sessions_root)
         .await
-        .map(|restored| restored.session)
+        .map(|restored| restored.session);
+    if result.is_ok() {
+        writer_restore.finish();
+    }
+    result
 }
 
 /// The sessions root a selection was resolved against.
@@ -2816,6 +2956,7 @@ async fn fork_session_at_launch(
     source: &str,
     dir: &Path,
     cwd: &str,
+    selected: Option<&crate::resource_selection::ResolvedSelection>,
 ) -> Result<Session, BuildError> {
     use rpi_harness::session::jsonl::{
         JsonlSessionCreateOptions, JsonlSessionRepo, JsonlSessionRepoOptions,
@@ -2854,7 +2995,7 @@ async fn fork_session_at_launch(
         }
     };
     let fork_storage = repo
-        .fork_typed(
+        .fork_typed_with_value_initializer(
             &source_meta,
             &JsonlSessionCreateOptions {
                 id: None,
@@ -2863,6 +3004,7 @@ async fn fork_session_at_launch(
                 metadata: None,
             },
             &ForkOptions::default(),
+            |values| crate::resource_selection::fork_initial_values_for_selection(values, selected),
         )
         .await
         .map_err(|e| BuildError::SessionDir(format!("fork {}: {e}", source_meta.path)))?;
@@ -2947,9 +3089,15 @@ pub(crate) async fn list_session_metadata_in_dir(
         clock: Arc::new(SystemClock),
         ids: Arc::new(DefaultIdGenerator::new()),
     });
-    repo.list_typed(&JsonlSessionListOptions::default())
+    let metadata_lookup = StartupSpan::start(Phase::MetadataLookup);
+    let result = repo
+        .list_typed(&JsonlSessionListOptions::default())
         .await
-        .map_err(|e| BuildError::SessionDir(format!("list sessions: {e}")))
+        .map_err(|e| BuildError::SessionDir(format!("list sessions: {e}")));
+    if result.is_ok() {
+        metadata_lookup.finish();
+    }
+    result
 }
 
 /// A cheap, display-oriented summary of one JSONL session file.
@@ -3329,7 +3477,7 @@ pub(crate) async fn fork_session_storage(
         return Err(format!("current session {id} not found on disk"));
     };
     let fork_storage = repo
-        .fork_typed(
+        .fork_typed_with_value_initializer(
             source,
             &rpi_harness::session::jsonl::JsonlSessionCreateOptions {
                 id: None,
@@ -3338,6 +3486,7 @@ pub(crate) async fn fork_session_storage(
                 metadata: None,
             },
             &rpi_harness::session::types::ForkOptions::default(),
+            crate::resource_selection::fork_initial_values,
         )
         .await
         .map_err(|e| e.to_string())?;
@@ -3523,14 +3672,22 @@ static SESSION_LOCKS: OnceLock<Mutex<Vec<std::fs::File>>> = OnceLock::new();
 /// exits (no stale-lock cleanup). Re-claiming a path this process already holds
 /// is a no-op, so the TUI's session hot-switch can re-open freely.
 fn claim_session_lock(session_path: &str) -> Result<(), String> {
-    let lock_path = PathBuf::from(format!("{session_path}.lock"));
-    if SESSION_LOCK_PATHS
+    claim_session_lock_inner(session_path, true)
+}
+fn claim_session_lock_inner(session_path: &str, allow_reentry: bool) -> Result<(), String> {
+    let canonical =
+        std::fs::canonicalize(session_path).unwrap_or_else(|_| PathBuf::from(session_path));
+    let lock_path = PathBuf::from(format!("{}.lock", canonical.display()));
+    let mut paths = SESSION_LOCK_PATHS
         .get_or_init(|| Mutex::new(HashSet::new()))
         .lock()
-        .unwrap()
-        .contains(&lock_path)
-    {
-        return Ok(());
+        .unwrap();
+    if paths.contains(&lock_path) {
+        return if allow_reentry {
+            Ok(())
+        } else {
+            Err("transition session already has a writer in this process".into())
+        };
     }
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -3547,11 +3704,7 @@ fn claim_session_lock(session_path: &str) -> Result<(), String> {
         .lock()
         .unwrap()
         .push(file);
-    SESSION_LOCK_PATHS
-        .get_or_init(|| Mutex::new(HashSet::new()))
-        .lock()
-        .unwrap()
-        .insert(lock_path);
+    paths.insert(lock_path);
     Ok(())
 }
 

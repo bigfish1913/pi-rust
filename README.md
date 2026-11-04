@@ -445,7 +445,7 @@ machine. See [`docs/remote/user-guide.md`](docs/remote/user-guide.md).
 
 | | |
 | --- | --- |
-| Current release | **[0.16.0](https://github.com/bigfish1913/pi-rust/releases)** (nine crates, published together) |
+| Current release | **[0.17.1](https://github.com/bigfish1913/pi-rust/releases)** (nine crates, published together) |
 | Stability | `rpi-ai`, `rpi-agent`, `rpi-tools`, `rpi-harness`, `rpi-plugin-sdk` are the intended stable surface |
 | MSRV | 1.88 |
 | Platforms | Linux, macOS, Windows (CI runs the suite on Linux) |
@@ -464,6 +464,7 @@ Start with the [documentation index](docs/README.md), grouped by feature.
 - [Extension authoring](docs/extensions/authoring.md) — plugin templates and ABI rules
 - [Subagents](docs/extensions/subagents.md) — configuration inheritance, permissions and lifecycle
 - [Native RPC resource selection](docs/resource-selection-rpc.md) — exact startup Packages, Skills, extensions, instructions and tools (stage A)
+- [Local native resource management](docs/local-resource-management.md) — scoped snapshot install/inspect/update/remove, ownership, recovery and host leases (stage B)
 - [Remote mode](docs/remote/user-guide.md) — protocol, tokens, limitations
 - [Roadmap](ROADMAP.md) · [Changelog](CHANGELOG.md)
 - [docs.rs](https://docs.rs/rpi-cli) for per-crate API docs

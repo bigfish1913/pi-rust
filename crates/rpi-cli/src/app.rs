@@ -23,6 +23,7 @@ use rpi_ai::types::{ImageContent, ImageContentType};
 use crate::args::{parse_args, print_help, print_version, resolve_mode, Args, RunMode};
 use crate::provider::{resolve_with_extensions, ResolveError};
 use crate::session::{build_prepared, prepare_extensions, BuildError};
+use crate::startup_diagnostics::{Phase, StartupSpan};
 
 /// The exit code for a usage/parse error. (TS `main.ts` uses `process.exit(1)`
 /// for most error paths; v1 distinguishes usage errors with the conventional
@@ -80,12 +81,49 @@ pub async fn run() -> i32 {
 }
 
 async fn run_inner() -> i32 {
+    let startup = StartupSpan::start(Phase::StartupToHarness);
     // argv[0] is the program name; skip it (TS `main(args)` receives the same,
     // already sliced by the Node CLI entry).
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
     if let Err(error) = crate::native_store::early_check(&argv) {
         eprintln!("error: {error}");
         return EXIT_USAGE;
+    }
+
+    // Safe old-host negotiation: callers discover this flag through --help
+    // first. Never fall through to prompts, remote clients, resource commands,
+    // trust, migration, leases, credentials, providers or DLL startup.
+    if argv
+        .iter()
+        .any(|a| a == "--resource-capabilities" || a.starts_with("--resource-capabilities="))
+    {
+        if argv.len() != 1 || argv[0] != "--resource-capabilities" {
+            println!(
+                "{}",
+                serde_json::json!({"version":1,"success":false,"error":"--resource-capabilities must be used alone"})
+            );
+            return EXIT_USAGE;
+        }
+        match serde_json::to_string(&crate::resource_selection::capabilities()) {
+            Ok(profile) if profile.len() < crate::resource_selection::MAX_CAPABILITIES_BYTES => {
+                println!("{profile}");
+                return 0;
+            }
+            _ => {
+                println!(
+                    "{}",
+                    serde_json::json!({"version":1,"success":false,"error":"capability profile exceeds bound"})
+                );
+                return EXIT_RUNTIME;
+            }
+        }
+    }
+
+    if argv
+        .iter()
+        .any(|arg| arg == "--resource-session-read" || arg.starts_with("--resource-session-read="))
+    {
+        return crate::saved_session_read::run(&argv).await;
     }
 
     if argv.first().map(String::as_str) == Some("__rpi_dev_cleanup") {
@@ -150,6 +188,13 @@ async fn run_inner() -> i32 {
                 return EXIT_USAGE;
             }
             let trusted = crate::session::resolve_project_trust(&args, &cwd);
+            let _resource_leases = match crate::resource_management::host_leases(&cwd) {
+                Ok(leases) => leases,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    return EXIT_RUNTIME;
+                }
+            };
             let extension_session = crate::session::load_extensions(&args, &cwd, trusted, None);
             return crate::auth::run_with_extensions(&argv[1..], extension_session.snapshot_arc())
                 .await;
@@ -159,6 +204,7 @@ async fn run_inner() -> i32 {
         Some("install") => return crate::install::run_async(&argv[1..]).await,
         Some("uninstall") => return crate::install::uninstall(&argv[1..]),
         Some("extension") => return crate::packages::run_extension(&argv[1..]),
+        Some("resource") => return crate::resource_management::run(&argv[1..]),
         Some("package") => return crate::packages::run(&argv[1..]),
         // These historical aliases are intentionally rejected instead of
         // falling through to the prompt path.
@@ -184,7 +230,9 @@ async fn run_inner() -> i32 {
         return code;
     }
 
-    if dev_options.is_some() && parsed.resource_config.is_some() {
+    if dev_options.is_some()
+        && (parsed.resource_config.is_some() || parsed.resource_transition.is_some())
+    {
         eprintln!(
             "error: --resource-config is restart-only and cannot be combined with dev/dev-local"
         );
@@ -279,7 +327,9 @@ async fn run_inner() -> i32 {
     // The peek and the build both derive their selection from this frozen root,
     // so they can never inspect one session and open another.
     let selection = crate::session::select_session_in_dir(&parsed, session_root);
+    let cwd_lookup = StartupSpan::start(Phase::CwdLookup);
     let restored_cwd = crate::session::peek_restored_session_cwd(&selection, &cwd).await;
+    cwd_lookup.finish();
     // Pin the session the peek resolved: `-c` re-lists the directory when the
     // build runs, and another `rpi` may have written a newer session in
     // between. Adopting one session's directory while opening another would
@@ -318,6 +368,19 @@ async fn run_inner() -> i32 {
     if !project_trusted && cwd != launch_cwd {
         startup_notices.push(crate::session_cwd::untrusted_session_cwd_note(&cwd));
     }
+    // Development preflight precedes prepare_extensions: protect its registry
+    // reads at orchestration too; the fact reader itself stays non-mutating.
+    let _dev_resource_leases = if dev_options.is_some() {
+        match crate::resource_management::host_leases(&cwd) {
+            Ok(leases) => Some(leases),
+            Err(error) => {
+                eprintln!("error: {error}");
+                return EXIT_RUNTIME;
+            }
+        }
+    } else {
+        None
+    };
     // Reject a bound exact session before dev can build or stage any code.
     if dev_options.is_some() {
         if let Err(error) =
@@ -332,6 +395,7 @@ async fn run_inner() -> i32 {
         Ok(extension) => extension,
         Err(code) => return code,
     };
+    let extension_prepare = StartupSpan::start(Phase::ExtensionPrepare);
     let prepared = match prepare_extensions(&parsed, &cwd, project_trusted) {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -339,6 +403,8 @@ async fn run_inner() -> i32 {
             return EXIT_RUNTIME;
         }
     };
+    extension_prepare.finish();
+    let model_resolve = StartupSpan::start(Phase::ModelResolve);
     let resolved = match resolve_with_extensions(
         &parsed,
         &cwd,
@@ -355,6 +421,7 @@ async fn run_inner() -> i32 {
         }
     };
 
+    model_resolve.finish();
     for warning in &resolved.compat_warnings {
         eprintln!("warning: models.json: {warning}");
     }
@@ -393,6 +460,7 @@ async fn run_inner() -> i32 {
     }
 
     // ---- harness build ----
+    let harness_build = StartupSpan::start(Phase::HarnessBuild);
     let (harness, event_rx, mut reload_context) =
         match build_prepared(&resolved, &parsed, &cwd, project_trusted, prepared).await {
             Ok(triple) => triple,
@@ -401,6 +469,8 @@ async fn run_inner() -> i32 {
                 return EXIT_RUNTIME;
             }
         };
+    harness_build.finish();
+    startup.finish();
     reload_context.dev_extension = dev_extension;
 
     // ---- post-load stdin claim + initial message ----
@@ -567,15 +637,18 @@ async fn run_inner() -> i32 {
             // up on SessionShutdown, exactly as in interactive mode. This is why
             // `rpi --server` works headless: the SessionStart hook fires and the
             // extension brings up the TCP server.
+            let before_start = StartupSpan::start(Phase::BeforeStartHooks);
             let veto = crate::session::dispatch_session_event_async(
                 &reload_context,
                 rpi_plugin_sdk::EventTag::BeforeTuiStart,
             )
             .await;
+            before_start.finish();
             if let Some(reason) = veto {
                 eprintln!("[rpi] startup vetoed by extension: {reason}");
                 EXIT_VETOED
             } else {
+                let session_start = StartupSpan::start(Phase::SessionStartHooks);
                 if let Some(reason) = crate::session::dispatch_session_event_async(
                     &reload_context,
                     rpi_plugin_sdk::EventTag::SessionStart,
@@ -586,6 +659,7 @@ async fn run_inner() -> i32 {
                         "[rpi] extension vetoed SessionStart (headless, advisory): {reason}"
                     );
                 }
+                session_start.finish();
 
                 let code = if parsed.unknown_flags.contains_key("server") || stdio_claimed {
                     // Server mode OR a plugin-claimed stdio server: the extension

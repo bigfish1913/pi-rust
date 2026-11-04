@@ -193,9 +193,15 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: session-smoke-diagnostics
-          path: ${{ runner.temp }}/${{ env.SESSION_SMOKE_DIAGNOSTICS_NAME }}
+          # Only synthetic protocol/summary diagnostics; never homes, auth or histories.
+          path: |
+            ${{ runner.temp }}/${{ env.SESSION_SMOKE_DIAGNOSTICS_NAME }}/results.json
+            ${{ runner.temp }}/${{ env.SESSION_SMOKE_DIAGNOSTICS_NAME }}/*/failure.log
+            ${{ runner.temp }}/${{ env.SESSION_SMOKE_DIAGNOSTICS_NAME }}/*/*/command.json
+            ${{ runner.temp }}/${{ env.SESSION_SMOKE_DIAGNOSTICS_NAME }}/*/*/stdout.jsonl
+            ${{ runner.temp }}/${{ env.SESSION_SMOKE_DIAGNOSTICS_NAME }}/*/*/stderr.log
           if-no-files-found: ignore
-          include-hidden-files: true
+          include-hidden-files: false
 
       - name: Test the optional provider SDK bridge
         run: cargo test -p rpi-plugin-sdk --features provider --locked
@@ -211,6 +217,9 @@ jobs:
 
       - name: Test provider bridge reconstruction and capacity
         run: cargo test -p rpi-extensions --features provider-performance --locked 'provider::'
+
+      - name: Test offline website verifier
+        run: python3 -B scripts/test_website.py VerifierTests
 
       - name: Test prebuilt release manifests
         run: python3 scripts/test_prebuilt_release.py
@@ -243,6 +252,57 @@ jobs:
       - name: Check DLL shutdown and tool ownership
         run: cargo test -p rpi-extensions --lib --features rpi-ai/providers --locked
 
+  platform-startup:
+    name: Platform startup (${{ matrix.target }})
+    if: >-
+      ${{ !(github.event_name == 'pull_request' &&
+      github.repository == 'bigfish1913/pi-rust' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.head.ref, 'release-plz-') &&
+      github.event.pull_request.draft == true) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: platform-startup-${{ matrix.target }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build native CLI
+        run: cargo build -p rpi-cli --bin rpi --release --locked --target ${{ matrix.target }}
+      - name: Start native CLI through linked external prefixes
+        shell: bash
+        run: |
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            binary="target/${{ matrix.target }}/release/rpi.exe"
+          else
+            binary="target/${{ matrix.target }}/release/rpi"
+          fi
+          python -B scripts/test_resource_lease_startup_smoke.py
+          python -B scripts/resource-lease-startup-smoke.py --rpi "$binary"
+
   resources:
     name: Offline resource regression
     if: >-
@@ -253,11 +313,14 @@ jobs:
       startsWith(github.event.pull_request.head.ref, 'release-plz-') &&
       github.event.pull_request.draft == true) }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     env:
       RUSTFLAGS: "-D warnings"
       RESOURCE_DIAGNOSTICS_NAME: resource-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+      COLD_START_DIAGNOSTICS_NAME: cold-start-${{ github.run_id }}-${{ github.run_attempt }}
+      EXTERNAL_TOOLS_DIAGNOSTICS_NAME: external-tools-${{ github.run_id }}-${{ github.run_attempt }}
       RPI_RESOURCE_SMOKE_BINARY: target/resource-tests-cargo/release/rpi
+      RPI_COLD_START_BINARY: target/resource-tests-cargo/release/rpi
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -275,7 +338,31 @@ jobs:
       - name: Test resource controller and editor invariants
         run: |
           python3 -B scripts/test_resource_smoke.py
+          python3 -B scripts/test_resource_cold_start.py
+          python3 -B scripts/test_compare_resources.py
+          python3 -B scripts/test_resource_tui.py
           cargo test -p rpi-tui --lib --example editor_resource_probe --release --locked --target-dir target/resource-tests-cargo
+      - name: Test offline external-tool RPC lifecycle
+        run: >-
+          python3 -B scripts/external-tools-smoke.py
+          --rpi target/resource-tests-cargo/release/rpi
+          --diagnostics-dir "$RUNNER_TEMP/$EXTERNAL_TOOLS_DIAGNOSTICS_NAME"
+      - name: Upload failed external-tool diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: external-tools-smoke-diagnostics
+          # Only synthetic protocol/summary diagnostics; never homes, auth or histories.
+          path: |
+            ${{ runner.temp }}/${{ env.EXTERNAL_TOOLS_DIAGNOSTICS_NAME }}/results.json
+            ${{ runner.temp }}/${{ env.EXTERNAL_TOOLS_DIAGNOSTICS_NAME }}/failure.txt
+            ${{ runner.temp }}/${{ env.EXTERNAL_TOOLS_DIAGNOSTICS_NAME }}/*/failure.txt
+            ${{ runner.temp }}/${{ env.EXTERNAL_TOOLS_DIAGNOSTICS_NAME }}/*/native-command.json
+            ${{ runner.temp }}/${{ env.EXTERNAL_TOOLS_DIAGNOSTICS_NAME }}/*/native-stdout.jsonl
+            ${{ runner.temp }}/${{ env.EXTERNAL_TOOLS_DIAGNOSTICS_NAME }}/*/native-stderr.log
+            ${{ runner.temp }}/${{ env.EXTERNAL_TOOLS_DIAGNOSTICS_NAME }}/*/provider-errors.json
+          if-no-files-found: ignore
+          include-hidden-files: false
       - name: Test offline memory CPU and round conclusions
         run: >-
           python3 -B scripts/resource-smoke.py
@@ -283,19 +370,56 @@ jobs:
           --editor-probe target/resource-tests-cargo/release/examples/editor_resource_probe
           --diagnostics-dir "$RUNNER_TEMP/$RESOURCE_DIAGNOSTICS_NAME"
           --rounds 5 --profile release
+      # Shared hosted runners need explicit, more tolerant budgets than the
+      # local 2s modern target. Both shapes keep the full historical record load.
+      - name: Regress cold opening 701000 synthetic append frames (modern)
+        run: >-
+          python3 -B scripts/resource-cold-start.py
+          --candidate target/resource-tests-cargo/release/rpi
+          --output "$RUNNER_TEMP/$COLD_START_DIAGNOSTICS_NAME-modern"
+          --shapes modern --frames 701000 --entries 21733 --repeats 3
+          --max-ready-ms 4000 --max-single-ready-ms 8000
+          --max-get-messages-ms 250 --max-get-state-ms 2000
+      - name: Regress cold opening 701000 synthetic append frames (legacy upgrade)
+        run: >-
+          python3 -B scripts/resource-cold-start.py
+          --candidate target/resource-tests-cargo/release/rpi
+          --output "$RUNNER_TEMP/$COLD_START_DIAGNOSTICS_NAME-legacy"
+          --shapes legacy --frames 701000 --entries 21733 --repeats 3
+          --max-ready-ms 6000 --max-single-ready-ms 10000
+          --max-get-messages-ms 250 --max-get-state-ms 2000
+      - name: Upload historical cold-start regression diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: historical-cold-start-diagnostics
+          # Allowlist diagnostics: even a failed history cleanup must not upload
+          # hundreds of MiB of generated transcripts/companion data.
+          path: |
+            ${{ runner.temp }}/${{ env.COLD_START_DIAGNOSTICS_NAME }}-*/results.json
+            ${{ runner.temp }}/${{ env.COLD_START_DIAGNOSTICS_NAME }}-*/reproduce.json
+            ${{ runner.temp }}/${{ env.COLD_START_DIAGNOSTICS_NAME }}-*/*/report.json
+            ${{ runner.temp }}/${{ env.COLD_START_DIAGNOSTICS_NAME }}-*/*/fixture.json
+            ${{ runner.temp }}/${{ env.COLD_START_DIAGNOSTICS_NAME }}-*/*/process.jsonl
+          if-no-files-found: ignore
+          include-hidden-files: false
       - name: Upload failed resource diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: resource-smoke-diagnostics
-          path: ${{ runner.temp }}/${{ env.RESOURCE_DIAGNOSTICS_NAME }}
+          # Only synthetic protocol/summary diagnostics; never homes, auth or histories.
+          path: |
+            ${{ runner.temp }}/${{ env.RESOURCE_DIAGNOSTICS_NAME }}/results.json
+            ${{ runner.temp }}/${{ env.RESOURCE_DIAGNOSTICS_NAME }}/metrics.jsonl
+            ${{ runner.temp }}/${{ env.RESOURCE_DIAGNOSTICS_NAME }}/*/process.jsonl
           if-no-files-found: ignore
-          include-hidden-files: true
+          include-hidden-files: false
 
   release:
     name: Release automation
     if: github.repository == 'bigfish1913/pi-rust' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-    needs: [msrv, check, test, resources, windows-installer]
+    needs: [msrv, check, test, resources, platform-startup, windows-installer]
     permissions:
       contents: write
       pull-requests: read
@@ -307,7 +431,7 @@ jobs:
   preview-version:
     name: Prepare preview release
     if: github.repository == 'bigfish1913/pi-rust' && github.ref == 'refs/heads/preview' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-    needs: [msrv, check, test, resources, windows-installer]
+    needs: [msrv, check, test, resources, platform-startup, windows-installer]
     runs-on: ubuntu-latest
     permissions:
       contents: write

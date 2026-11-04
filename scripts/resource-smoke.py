@@ -139,10 +139,16 @@ def validate_sample(value, previous=None):
     primary_field = "private_bytes" if value["primary_metric"] == "windows_private_commit" else "rss_bytes"
     require(value.get(primary_field) == value["primary_bytes"], "primary metric/value mismatch", "metrics")
     if previous:
-        for key in ("user_seconds", "kernel_seconds", "wall_seconds", "peak_rss_bytes", "peak_commit_bytes"):
+        require(value["primary_metric"] == previous["primary_metric"], "primary metric changed", "metrics")
+        monotonic = ("user_seconds", "kernel_seconds", "wall_seconds", "peak_commit_bytes")
+        # Linux /proc VmHWM (like VmRSS) is an approximate, inconsistent snapshot,
+        # not a monotonic counter (proc_pid_status(5); fs/proc/task_mmu.c:task_mem).
+        # Keep the raw value; the memory gate uses Sampler.peak = max(primary_bytes).
+        if value["primary_metric"] == "windows_private_commit":
+            monotonic += ("peak_rss_bytes",)
+        for key in monotonic:
             if key in previous:
                 require(key in value and value[key] >= previous[key], "retrograde metric: " + key, "metrics")
-        require(value["primary_metric"] == previous["primary_metric"], "primary metric changed", "metrics")
 
 
 def delta(before, after):

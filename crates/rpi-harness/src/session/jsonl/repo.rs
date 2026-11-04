@@ -298,7 +298,7 @@ impl JsonlSessionRepo {
     pub async fn read_facts_by_jsonl_metadata(
         &self,
         metadata: &JsonlSessionMetadata,
-    ) -> SessionResult<super::storage::JsonlSessionFacts> {
+    ) -> SessionResult<super::JsonlSessionFacts> {
         let facts = JsonlSessionStorage::read_facts(
             self.fs.clone(),
             &metadata.path,
@@ -346,7 +346,60 @@ impl JsonlSessionRepo {
         options: &JsonlSessionCreateOptions,
         fork: &ForkOptions,
     ) -> SessionResult<JsonlSessionStorage> {
-        let source_storage = self.open_by_jsonl_metadata(source).await?;
+        self.fork_initialized(
+            source,
+            options,
+            fork,
+            None::<
+                fn(
+                    &crate::session::SessionValues,
+                ) -> SessionResult<Vec<(String, serde_json::Value)>>,
+            >,
+        )
+        .await
+    }
+
+    /// Host-owned new-identity values are staged by the ordinary fork engine
+    /// before atomic publication, using the source's same-snapshot values.
+    pub async fn fork_typed_with_value_initializer(
+        &self,
+        source: &JsonlSessionMetadata,
+        options: &JsonlSessionCreateOptions,
+        fork: &ForkOptions,
+        initialize: impl FnOnce(
+                &crate::session::SessionValues,
+            ) -> SessionResult<Vec<(String, serde_json::Value)>>
+            + Send,
+    ) -> SessionResult<JsonlSessionStorage> {
+        self.fork_initialized(source, options, fork, Some(initialize))
+            .await
+    }
+
+    async fn fork_initialized(
+        &self,
+        source: &JsonlSessionMetadata,
+        options: &JsonlSessionCreateOptions,
+        fork: &ForkOptions,
+        initialize: Option<
+            impl FnOnce(
+                    &crate::session::SessionValues,
+                ) -> SessionResult<Vec<(String, serde_json::Value)>>
+                + Send,
+        >,
+    ) -> SessionResult<JsonlSessionStorage> {
+        let source_storage = JsonlSessionStorage::load_fork_snapshot(
+            self.fs.clone(),
+            &source.path,
+            self.clock.clone(),
+            self.ids.clone(),
+        )
+        .await?;
+        if source_storage.jsonl_metadata().id != source.id {
+            return Err(SessionError::invalid_entry(format!(
+                "Session id does not match header: {}",
+                source.id
+            )));
+        }
         // TS: parentSessionId ?? source.id.
         let mut create_options = options.clone();
         if create_options.parent_session_id.is_none() {
@@ -355,9 +408,25 @@ impl JsonlSessionRepo {
         let destination = self.resolve_create_destination(&create_options).await?;
         self.claim_create_destination(&destination, async {
             let (header, path) = self.prepare_create(&destination, &create_options).await?;
-            source_storage
-                .fork(&path, header, fork, self.clock.clone(), self.ids.clone())
-                .await
+            match initialize {
+                Some(initialize) => {
+                    source_storage
+                        .fork_with_value_initializer(
+                            &path,
+                            header,
+                            fork,
+                            self.clock.clone(),
+                            self.ids.clone(),
+                            initialize,
+                        )
+                        .await
+                }
+                None => {
+                    source_storage
+                        .fork(&path, header, fork, self.clock.clone(), self.ids.clone())
+                        .await
+                }
+            }
         })
         .await
     }
@@ -983,6 +1052,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fork_rejects_mismatched_source_identity_before_initialization_or_publication() {
+        let fs: Arc<dyn FileSystem> =
+            Arc::new(rpi_tools::InMemoryExecutionEnv::with_cwd("/proj".into()));
+        let r = repo(fs.clone());
+        let options = |id: &str| JsonlSessionCreateOptions {
+            id: Some(id.into()),
+            parent_session_id: None,
+            cwd: "/proj".into(),
+            metadata: None,
+        };
+        let source = r.create_typed(&options("source")).await.unwrap();
+        let mut metadata = source.jsonl_metadata();
+        let history = fs.read_binary_file(&metadata.path, None).await.unwrap();
+        let progress_path = format!("{}.progress.jsonl", metadata.path);
+        let progress = fs.read_binary_file(&progress_path, None).await.unwrap();
+        let directory = r.session_directory("/proj").await.unwrap();
+        let paths = || async {
+            let mut paths: Vec<_> = fs
+                .list_dir(&directory, None)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.path)
+                .collect();
+            paths.sort();
+            paths
+        };
+        let before = paths().await;
+        metadata.id = "wrong-source".into();
+        let legacy = r
+            .fork_typed(&metadata, &options("legacy-child"), &ForkOptions::default())
+            .await;
+        let configured = r
+            .fork_typed_with_value_initializer(
+                &metadata,
+                &options("configured-child"),
+                &ForkOptions::default(),
+                |_| panic!("identity rejection must precede initialization"),
+            )
+            .await;
+        for result in [legacy, configured] {
+            let error = match result {
+                Ok(_) => panic!("mismatched source identity must not fork"),
+                Err(error) => error,
+            };
+            assert_eq!(error.code, SessionErrorCode::InvalidEntry);
+            assert!(error
+                .to_string()
+                .contains("Session id does not match header"));
+        }
+        assert_eq!(paths().await, before);
+        assert_eq!(
+            fs.read_binary_file(&metadata.path, None).await.unwrap(),
+            history
+        );
+        assert_eq!(
+            fs.read_binary_file(&progress_path, None).await.unwrap(),
+            progress
+        );
+    }
+
+    #[tokio::test]
     async fn fork_typed_branch_default_leaf() {
         let env = rpi_tools::InMemoryExecutionEnv::with_cwd("/proj".into());
         let fs: Arc<dyn FileSystem> = Arc::new(env);
@@ -1010,6 +1141,34 @@ mod tests {
             )
             .await
             .unwrap();
+        // A default fork after model/thinking changes must keep the actual
+        // state leaf and its ancestry, not silently cut back to the message.
+        for (id, kind) in [
+            (
+                "model-pick",
+                ProvisionedKind::ModelChange {
+                    provider: "faux".into(),
+                    model_id: "new-model".into(),
+                },
+            ),
+            (
+                "thinking-pick",
+                ProvisionedKind::ThinkingLevel {
+                    thinking_level: "high".into(),
+                },
+            ),
+        ] {
+            source
+                .append_entry(
+                    ProvisionedEntry {
+                        id: id.into(),
+                        kind,
+                    },
+                    "main",
+                )
+                .await
+                .unwrap();
+        }
         let listed = r
             .list_typed(&JsonlSessionListOptions {
                 cwd: Some("/proj".into()),
@@ -1038,6 +1197,31 @@ mod tests {
             .unwrap()
             .expect("forked entry exists");
         assert_eq!(got.id(), "m1");
+        for (id, parent) in [("model-pick", "m1"), ("thinking-pick", "model-pick")] {
+            let copied = forked
+                .get_entry(id)
+                .await
+                .unwrap()
+                .expect("state entry copied");
+            let mut original = source.get_entry(id).await.unwrap().unwrap();
+            original.base_mut().seq = copied.seq(); // fork restamps only sequence
+            assert_eq!(
+                copied, original,
+                "model/state payload and ancestry must survive"
+            );
+            assert_eq!(copied.parent_id(), Some(parent));
+        }
+        let lanes = forked.get_lanes().await.unwrap();
+        assert_eq!(
+            lanes
+                .iter()
+                .find(|lane| lane.lane == "main")
+                .unwrap()
+                .leaf_id
+                .as_deref(),
+            Some("thinking-pick"),
+            "implicit fork must retain the actual nonmessage leaf"
+        );
         // And lists as a separate session with parent = src.
         let listed = r
             .list_typed(&JsonlSessionListOptions {

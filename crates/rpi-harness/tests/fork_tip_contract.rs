@@ -23,6 +23,23 @@ fn model(id: &str) -> ProvisionedEntry {
         },
     }
 }
+fn thinking(id: &str) -> ProvisionedEntry {
+    ProvisionedEntry {
+        id: id.into(),
+        kind: ProvisionedKind::ThinkingLevel {
+            thinking_level: "high".into(),
+        },
+    }
+}
+fn custom(id: &str) -> ProvisionedEntry {
+    ProvisionedEntry {
+        id: id.into(),
+        kind: ProvisionedKind::Custom {
+            custom_type: "note".into(),
+            data: Some(serde_json::json!({"body": id})),
+        },
+    }
+}
 fn message(id: &str) -> ProvisionedEntry {
     ProvisionedEntry {
         id: id.into(),
@@ -30,6 +47,12 @@ fn message(id: &str) -> ProvisionedEntry {
             message: rpi_ai::UserMessage::new(id, 0).into(),
             terminate: None,
         },
+    }
+}
+fn oldest() -> EntryQuery {
+    EntryQuery {
+        order: Some(EntryOrder::OldestFirst),
+        ..Default::default()
     }
 }
 async fn check<R: SessionRepo>(repo: R) {
@@ -40,22 +63,15 @@ async fn check<R: SessionRepo>(repo: R) {
         model("between"),
         message("m2"),
         model("switch"),
-        ProvisionedEntry {
-            id: "thinking".into(),
-            kind: ProvisionedKind::ThinkingLevel {
-                thinking_level: "high".into(),
-            },
-        },
+        thinking("thinking"),
+        custom("custom-tip"),
     ] {
         source.append_entry(entry, "main").await.unwrap();
     }
     source.set_name(Some("named source")).await.unwrap();
+    source.set_label("m2", Some("message label")).await.unwrap();
     source
-        .set_label("m2", Some("nearest message"))
-        .await
-        .unwrap();
-    source
-        .set_label("thinking", Some("excluded suffix"))
+        .set_label("custom-tip", Some("actual leaf"))
         .await
         .unwrap();
     source.create_lane("side", Some("m1")).await.unwrap();
@@ -64,25 +80,61 @@ async fn check<R: SessionRepo>(repo: R) {
         .await
         .unwrap();
     let metadata = source.metadata();
-    // JSONL fork reopens a cold source: exercise the metadata path, not only
-    // freshly appended resident entries. Also release the writer claim.
+    let original_entries = source.find_entries(&oldest()).await.unwrap();
+    let original_log = source.get_log(&LogOptions::default()).await.unwrap();
+    let original_lanes = source.get_lanes().await.unwrap();
+    // JSONL fork reopens a cold source, exercising metadata selection and
+    // releasing the source writer claim. No fork may mutate the source.
     drop(source);
     for (index, entry_id, position, expected) in [
-        (0, None, None, vec!["root", "m1", "between", "m2"]),
+        (
+            0,
+            None,
+            None,
+            vec![
+                "root",
+                "m1",
+                "between",
+                "m2",
+                "switch",
+                "thinking",
+                "custom-tip",
+            ],
+        ),
         (
             1,
             None,
             Some(ForkPosition::At),
-            vec!["root", "m1", "between", "m2"],
+            vec![
+                "root",
+                "m1",
+                "between",
+                "m2",
+                "switch",
+                "thinking",
+                "custom-tip",
+            ],
         ),
         (
             2,
             None,
             Some(ForkPosition::Before),
-            vec!["root", "m1", "between"],
+            vec!["root", "m1", "between", "m2", "switch", "thinking"],
         ),
         (3, Some("m2"), None, vec!["root", "m1", "between"]),
         (4, Some("m1"), None, vec!["root"]),
+        (
+            5,
+            Some("m2"),
+            Some(ForkPosition::At),
+            vec!["root", "m1", "between", "m2"],
+        ),
+        (
+            6,
+            Some("m2"),
+            Some(ForkPosition::Before),
+            vec!["root", "m1", "between"],
+        ),
     ] {
         let child = repo
             .fork(
@@ -95,14 +147,17 @@ async fn check<R: SessionRepo>(repo: R) {
             )
             .await
             .unwrap();
-        let entries = child
-            .find_entries(&EntryQuery {
-                order: Some(EntryOrder::OldestFirst),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
+        let entries = child.find_entries(&oldest()).await.unwrap();
         assert_eq!(entries.iter().map(Entry::id).collect::<Vec<_>>(), expected);
+        for copied in &entries {
+            let mut original = original_entries
+                .iter()
+                .find(|entry| entry.id() == copied.id())
+                .unwrap()
+                .clone();
+            original.base_mut().seq = copied.seq();
+            assert_eq!(&original, copied, "only sequence may be restamped");
+        }
         assert_eq!(
             child.get_lanes().await.unwrap(),
             vec![LanePointer {
@@ -114,92 +169,140 @@ async fn check<R: SessionRepo>(repo: R) {
             child.get_name().await.unwrap().as_deref(),
             Some("named source")
         );
-        assert_eq!(child.get_label("thinking").await.unwrap(), None);
+        assert_eq!(
+            child.get_label("custom-tip").await.unwrap().as_deref(),
+            expected.contains(&"custom-tip").then_some("actual leaf")
+        );
         if expected.contains(&"m2") {
             assert_eq!(
                 child.get_label("m2").await.unwrap().as_deref(),
-                Some("nearest message")
+                Some("message label")
             );
         }
     }
-    for (index, position) in [None, Some(ForkPosition::At), Some(ForkPosition::Before)]
-        .into_iter()
-        .enumerate()
-    {
-        let result = repo
-            .fork(
-                &metadata,
-                &options(&format!("rejected-{index}")),
-                &ForkOptions::Branch {
-                    entry_id: Some("thinking".into()),
-                    position,
-                },
-            )
-            .await;
-        assert_eq!(
-            result
-                .err()
-                .expect("explicit state target must be rejected")
-                .code,
-            SessionErrorCode::InvalidForkTarget
-        );
+    for id in ["root", "switch", "thinking", "custom-tip"] {
+        for (index, position) in [None, Some(ForkPosition::At), Some(ForkPosition::Before)]
+            .into_iter()
+            .enumerate()
+        {
+            let result = repo
+                .fork(
+                    &metadata,
+                    &options(&format!("rejected-{id}-{index}")),
+                    &ForkOptions::Branch {
+                        entry_id: Some(id.into()),
+                        position,
+                    },
+                )
+                .await;
+            assert_eq!(
+                result
+                    .err()
+                    .expect("explicit nonmessage target must be rejected")
+                    .code,
+                SessionErrorCode::InvalidForkTarget
+            );
+        }
     }
     let tree = repo
         .fork(&metadata, &options("tree"), &ForkOptions::Tree)
         .await
         .unwrap();
-    assert_eq!(
-        tree.find_entries(&EntryQuery::default())
-            .await
-            .unwrap()
-            .len(),
-        7
-    );
-    assert_eq!(tree.get_lanes().await.unwrap().len(), 2);
+    let tree_entries = tree.find_entries(&oldest()).await.unwrap();
+    let mut expected_tree = original_entries.clone();
+    for (index, entry) in expected_tree.iter_mut().enumerate() {
+        entry.base_mut().seq = index as u64 + 1;
+    }
+    assert_eq!(tree_entries, expected_tree);
+    assert_eq!(tree.get_lanes().await.unwrap(), original_lanes);
     drop(tree);
-    let no_message = repo.create(&options("no-message")).await.unwrap();
-    no_message
-        .append_entry(model("only-state"), "main")
+    let reopened = repo.open(&metadata).await.unwrap();
+    assert_eq!(
+        reopened.get_log(&LogOptions::default()).await.unwrap(),
+        original_log
+    );
+    assert_eq!(reopened.get_lanes().await.unwrap(), original_lanes);
+    drop(reopened);
+
+    // With no message ancestor at all, each nonmessage kind is a valid
+    // implicit actual leaf. Before cuts its sole root away, leaving empty main.
+    for (kind, entry) in [
+        ("model", model("only-state")),
+        ("thinking", thinking("only-state")),
+        ("custom", custom("only-state")),
+    ] {
+        let source = repo
+            .create(&options(&format!("only-{kind}")))
+            .await
+            .unwrap();
+        source.append_entry(entry, "main").await.unwrap();
+        let metadata = source.metadata();
+        drop(source);
+        for (index, position) in [None, Some(ForkPosition::At), Some(ForkPosition::Before)]
+            .into_iter()
+            .enumerate()
+        {
+            let child = repo
+                .fork(
+                    &metadata,
+                    &options(&format!("only-{kind}-child-{index}")),
+                    &ForkOptions::Branch {
+                        entry_id: None,
+                        position,
+                    },
+                )
+                .await
+                .unwrap();
+            let before = matches!(position, Some(ForkPosition::Before));
+            assert_eq!(
+                child.find_entries(&oldest()).await.unwrap().len(),
+                usize::from(!before)
+            );
+            assert_eq!(
+                child.get_lanes().await.unwrap(),
+                vec![LanePointer {
+                    lane: "main".into(),
+                    leaf_id: (!before).then(|| "only-state".into())
+                }]
+            );
+        }
+    }
+    // Explicit Before defaults to an empty cut when the target is a root message.
+    let source = repo.create(&options("root-message")).await.unwrap();
+    source
+        .append_entry(message("root-message"), "main")
         .await
         .unwrap();
-    let metadata = no_message.metadata();
-    drop(no_message);
-    let result = repo
+    let metadata = source.metadata();
+    drop(source);
+    let child = repo
         .fork(
             &metadata,
-            &options("no-ancestor"),
+            &options("before-root"),
             &ForkOptions::Branch {
-                entry_id: None,
+                entry_id: Some("root-message".into()),
                 position: None,
             },
         )
-        .await;
+        .await
+        .unwrap();
+    assert!(child.find_entries(&oldest()).await.unwrap().is_empty());
     assert_eq!(
-        result
-            .err()
-            .expect("implicit state tip needs a message ancestor")
-            .code,
-        SessionErrorCode::InvalidForkTarget
+        child.get_lanes().await.unwrap(),
+        vec![LanePointer {
+            lane: "main".into(),
+            leaf_id: None
+        }]
     );
+
     let empty = repo.create(&options("empty")).await.unwrap();
     let metadata = empty.metadata();
     drop(empty);
     let child = repo
-        .fork(
-            &metadata,
-            &options("empty-child"),
-            &ForkOptions::Branch {
-                entry_id: None,
-                position: None,
-            },
-        )
+        .fork(&metadata, &options("empty-child"), &ForkOptions::default())
         .await
         .unwrap();
-    assert!(child
-        .find_entries(&EntryQuery::default())
-        .await
-        .unwrap()
-        .is_empty());
+    assert!(child.find_entries(&oldest()).await.unwrap().is_empty());
 }
 
 #[tokio::test]

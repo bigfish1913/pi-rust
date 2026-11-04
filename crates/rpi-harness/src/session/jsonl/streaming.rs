@@ -10,8 +10,11 @@ struct Scanner {
     fetched: u64,
     offset: u64,
     buffer: Vec<u8>,
+    recycled_line: Vec<u8>,
     cursor: usize,
     hash: Sha256,
+    hash_enabled: bool,
+    policy: ReadPolicy,
 }
 impl Scanner {
     fn new(reader: Arc<dyn ReadFile>, length: u64) -> Self {
@@ -21,14 +24,26 @@ impl Scanner {
             fetched: 0,
             offset: 0,
             buffer: Vec::new(),
+            recycled_line: Vec::new(),
             cursor: 0,
             hash: Sha256::new(),
+            hash_enabled: true,
+            policy: ReadPolicy::Restore,
+        }
+    }
+    fn recycle(&mut self, mut line: Vec<u8>) {
+        // One unusually large row must not become a permanently retained
+        // scratch allocation for the rest of the history.
+        if line.capacity() <= CHUNK {
+            line.clear();
+            self.recycled_line = line;
         }
     }
     async fn next(&mut self) -> SessionResult<Option<(u64, Vec<u8>, bool, bool)>> {
         let offset = self.offset;
-        let mut line = Vec::new();
+        let mut line = std::mem::take(&mut self.recycled_line);
         loop {
+            self.policy.check(0)?;
             if self.cursor < self.buffer.len() {
                 let mut remainder = &self.buffer[self.cursor..];
                 // The slice BufRead implementation uses the standard library's
@@ -50,10 +65,13 @@ impl Scanner {
                 self.reader.read_range(self.fetched, count).await,
                 "scan session history",
             )?;
+            self.policy.check(0)?;
             if self.buffer.len() != count {
                 return Err(SessionError::storage("short session history scan"));
             }
-            self.hash.update(&self.buffer);
+            if self.hash_enabled {
+                self.hash.update(&self.buffer);
+            }
             self.fetched += count as u64;
             self.cursor = 0;
         }
@@ -114,9 +132,14 @@ impl JsonlSessionStorage {
         ids: Arc<dyn IdGenerator>,
         reader: Arc<dyn ReadFile>,
         length: u64,
-        allow_repair: bool,
+        policy: ReadPolicy,
     ) -> SessionResult<Self> {
+        let diagnostics = crate::session::diagnostics::RecoveryPhase::start("history_streaming");
+        policy.check(0)?;
+        let allow_repair = policy.repairs();
+        let strict = policy.strict();
         let mut scan = Scanner::new(reader.clone(), length);
+        scan.policy = policy;
         let Some((_, header_raw, _, header_newline)) = scan.next().await? else {
             return Err(invalid_file(path, 1, &"is missing a header"));
         };
@@ -125,7 +148,19 @@ impl JsonlSessionStorage {
         if header_line.is_empty() {
             return Err(invalid_file(path, 1, &"is missing a header"));
         }
+        if strict && !header_newline {
+            return Err(SessionError::invalid_entry(
+                "resource transition requires complete unrecovered history",
+            ));
+        }
         let header = parse_header(header_line).map_err(|e| invalid_file(path, 1, &e))?;
+        // This whole-file digest is ONLY the guard for a future legacy format
+        // upgrade, not a persisted checksum of the source. Modern histories do
+        // not upgrade, and FactsOnly exports no writable storage capability.
+        // All retained cold rows still keep their per-location SHA-256 checks.
+        let needs_legacy_digest =
+            header.progress_format.is_none() && !matches!(policy, ReadPolicy::FactsOnly);
+        scan.hash_enabled = needs_legacy_digest;
         if header.progress_format.is_some()
             && !file_result(
                 fs.exists(&format!("{path}.progress.jsonl"), None).await,
@@ -149,9 +184,47 @@ impl JsonlSessionStorage {
         let mut line_no = 1;
         while let Some((offset, raw, last, newline)) = scan.next().await? {
             line_no += 1;
+            policy.check((line_no - 1) as usize)?;
             terminated = newline;
+            if strict && !newline {
+                return Err(SessionError::invalid_entry(
+                    "resource transition requires complete unrecovered history",
+                ));
+            }
             let line = std::str::from_utf8(&raw)
                 .map_err(|_| SessionError::invalid_entry("invalid session UTF-8"))?;
+            if let Some(frame) = super::super::cold_decode::parse_cold_frame(line) {
+                let mut state = storage.state.lock().await;
+                // Stale sequences must still take the canonical full-decode
+                // semantic comparison below (key order/whitespace may differ).
+                if frame.seq > state.sequence() {
+                    if frame.seq > state.next_sequence() {
+                        state.resync_sequence(frame.seq - 1);
+                    }
+                    let seq = frame.seq;
+                    // FactsOnly never escapes read_facts as a storage handle.
+                    // Keep ID/sequence/lane validation and frame retirement,
+                    // but there is no frame-read capability to index or hash.
+                    // Stale seqs and unrecognized rows still use the unchanged
+                    // full decoder/reducer path below.
+                    let applied = if matches!(policy, ReadPolicy::FactsOnly) {
+                        state.reserve_loaded_frame(frame)
+                    } else {
+                        state.apply_loaded_frame(frame, &reader, offset, &raw)
+                    };
+                    applied.map_err(|error| {
+                        if error.code == SessionErrorCode::InvalidEntry {
+                            invalid_file(path, line_no, &error)
+                        } else {
+                            error
+                        }
+                    })?;
+                    seen.insert(seq, (offset, raw.len()));
+                    spans.push((offset, raw.len() as u64));
+                    scan.recycle(raw);
+                    continue;
+                }
+            }
             match parse_mutation(line) {
                 Ok(mutation) => {
                     let mut state = storage.state.lock().await;
@@ -170,7 +243,13 @@ impl JsonlSessionStorage {
                             false
                         };
                         if duplicate {
+                            if strict {
+                                return Err(SessionError::invalid_entry(
+                                    "resource transition rejects duplicate history sequences",
+                                ));
+                            }
                             repair = true;
+                            scan.recycle(raw);
                             continue;
                         }
                         return Err(invalid_file(
@@ -197,18 +276,20 @@ impl JsonlSessionStorage {
                     spans.push((offset, raw.len() as u64));
                 }
                 Err(error)
-                    if error.kind == JsonlDecodeErrorKind::Schema
+                    if !strict
+                        && error.kind == JsonlDecodeErrorKind::Schema
                         && is_assistant_frame_append(line) =>
                 {
                     tracing::warn!(line = line_no, "skipping undecodable assistant frame");
                     spans.push((offset, raw.len() as u64));
                 }
-                Err(error) if last && error.kind == JsonlDecodeErrorKind::Syntax => {
+                Err(error) if !strict && last && error.kind == JsonlDecodeErrorKind::Syntax => {
                     repair = true;
                     break;
                 }
                 Err(error) => return Err(invalid_file(path, line_no, &error)),
             }
+            scan.recycle(raw);
         }
         if repair && allow_repair {
             let digest = Arc::new(std::sync::Mutex::new(None));
@@ -235,7 +316,7 @@ impl JsonlSessionStorage {
                 })
             })
             .await?;
-            if !storage.progress.required {
+            if needs_legacy_digest {
                 storage.legacy_history_digest = *digest.lock().unwrap();
             }
         } else {
@@ -247,10 +328,12 @@ impl JsonlSessionStorage {
                 )?;
                 scan.hash.update(b"\n");
             }
-            if !storage.progress.required {
+            if needs_legacy_digest {
                 storage.legacy_history_digest = Some(scan.hash.finalize().into());
             }
         }
+        policy.check((line_no - 1) as usize)?;
+        diagnostics.finish(length as usize, (line_no - 1) as usize);
         Ok(storage)
     }
 

@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 const REGISTRY: &str = "packages.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectPackage {
     pub name: String,
     pub version: String,
@@ -119,6 +120,27 @@ fn link(args: &[String]) -> i32 {
             return 1;
         }
     };
+    let native_root = project_root.join(".rpi");
+    let _lease = match crate::resource_management::mutation_lease(&native_root) {
+        Ok(lease) => lease,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return 1;
+        }
+    };
+    if let Err(error) = read_registry(&project_root) {
+        eprintln!("error: {error}");
+        return 1;
+    }
+    // Check an explicit identity before Cargo can execute a build script.
+    if let Some(name) = &name {
+        if let Err(error) =
+            crate::resource_management::legacy_unowned(&native_root, "package", name)
+        {
+            eprintln!("error: {error}");
+            return 1;
+        }
+    }
     let source = source
         .map(|p| project_root.join(p))
         .unwrap_or_else(|| project_root.clone());
@@ -141,6 +163,12 @@ fn link(args: &[String]) -> i32 {
         eprintln!("error: invalid package name `{package_name}`");
         return 2;
     }
+    if let Err(error) =
+        crate::resource_management::legacy_unowned(&native_root, "package", &package_name)
+    {
+        eprintln!("error: {error}");
+        return 1;
+    }
     eprintln!("package: building {}...", selected.name);
     let artifact = match build(&selected, release, locked) {
         Ok(p) => p,
@@ -151,10 +179,6 @@ fn link(args: &[String]) -> i32 {
     };
     let root = project_root.join(".rpi/packages").join(&package_name);
     let ext = root.join("extensions");
-    if let Err(e) = std::fs::create_dir_all(&ext) {
-        eprintln!("error: could not create {}: {e}", ext.display());
-        return 1;
-    }
     let file = match artifact.file_name().and_then(|n| n.to_str()) {
         Some(n) => n.to_string(),
         None => {
@@ -163,20 +187,62 @@ fn link(args: &[String]) -> i32 {
         }
     };
     let target = ext.join(&file);
+    let tmp = ext.join(format!(".{file}.tmp"));
+    // Cargo can execute build scripts. Recheck the addressed write paths after
+    // it returns, before creating directories or removing/copying any artifact.
+    if let Err(error) =
+        crate::resource_management::legacy_unowned(&native_root, "package", &package_name).and_then(
+            |_| {
+                crate::resource_management::legacy_unowned_targets(
+                    &native_root,
+                    &[target.clone(), tmp.clone()],
+                )
+            },
+        )
+    {
+        eprintln!("error: {error}");
+        return 1;
+    }
     if target.exists() && !force {
         eprintln!("error: package already exists; use --force");
         return 1;
     }
-    let tmp = ext.join(format!(".{file}.tmp"));
+    if let Err(e) = std::fs::create_dir_all(&ext) {
+        eprintln!("error: could not create {}: {e}", ext.display());
+        return 1;
+    }
+    // Never follow/truncate a pre-existing fixed staging path (including a
+    // hardlink). Only clean up a temporary file this invocation created.
+    let mut staged = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!("error: could not stage package artifact: {error}");
+            return 1;
+        }
+    };
+    let copied = std::fs::File::open(&artifact)
+        .and_then(|mut input| std::io::copy(&mut input, &mut staged))
+        .and_then(|_| staged.sync_all());
+    drop(staged);
+    if let Err(error) = copied {
+        let _ = std::fs::remove_file(&tmp);
+        eprintln!("error: could not stage package artifact: {error}");
+        return 1;
+    }
     if force {
         if let Err(e) = std::fs::remove_file(&target) {
             if e.kind() != std::io::ErrorKind::NotFound {
+                let _ = std::fs::remove_file(&tmp);
                 eprintln!("error: could not replace existing package artifact: {e}");
                 return 1;
             }
         }
     }
-    if let Err(e) = std::fs::copy(&artifact, &tmp).and_then(|_| std::fs::rename(&tmp, &target)) {
+    if let Err(e) = std::fs::rename(&tmp, &target) {
         let _ = std::fs::remove_file(&tmp);
         eprintln!("error: could not activate package: {e}");
         return 1;
@@ -282,9 +348,25 @@ fn update_at(
             return 1;
         }
     };
+    let resource_owned =
+        match crate::resource_management::resource_owned_names(&cwd.join(".rpi"), "package") {
+            Ok(names) => names,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return 1;
+            }
+        };
+    if name
+        .as_ref()
+        .is_some_and(|name| resource_owned.contains(name))
+    {
+        eprintln!("error: resource-owned Package; use rpi resource update package NAME --scope project --path PATH");
+        return 1;
+    }
     let packages = registry
         .packages
         .iter()
+        .filter(|package| !resource_owned.contains(&package.name))
         .filter(|package| {
             name.as_deref()
                 .map_or(true, |wanted| wanted == package.name)
@@ -417,6 +499,18 @@ fn unlink(args: &[String]) -> i32 {
             return 1;
         }
     };
+    let native_root = cwd.join(".rpi");
+    let _lease = match crate::resource_management::mutation_lease(&native_root) {
+        Ok(lease) => lease,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return 1;
+        }
+    };
+    if let Err(error) = crate::resource_management::legacy_unowned(&native_root, "package", name) {
+        eprintln!("error: {error}");
+        return 1;
+    }
     let mut registry = match read_registry(&cwd) {
         Ok(r) => r,
         Err(e) => {
@@ -586,7 +680,7 @@ fn is_dynamic(p: &Path) -> bool {
         Some("dll" | "so" | "dylib")
     )
 }
-fn valid_name(s: &str) -> bool {
+pub(crate) fn valid_name(s: &str) -> bool {
     !s.is_empty()
         && s != "."
         && s != ".."
@@ -622,13 +716,17 @@ fn write_registry(cwd: &Path, r: &PackageRegistry) -> Result<(), String> {
     std::fs::rename(tmp, path).map_err(|e| e.to_string())
 }
 pub fn selected_project_package(cwd: &Path, name: &str) -> Result<ProjectPackage, String> {
+    selected_package_at(&cwd.join(".rpi"), name)
+}
+
+pub(crate) fn selected_package_at(root: &Path, name: &str) -> Result<ProjectPackage, String> {
     if !valid_name(name) {
         return Err("invalid main package name".into());
     }
     use std::io::Read;
     let mut bytes = Vec::new();
     let limit = crate::resource_selection::MAX_STATE_BYTES;
-    std::fs::File::open(cwd.join(".rpi").join(REGISTRY))
+    std::fs::File::open(root.join(REGISTRY))
         .map_err(|e| e.to_string())?
         .take((limit + 1) as u64)
         .read_to_end(&mut bytes)

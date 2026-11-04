@@ -1,7 +1,7 @@
 // Native lifecycle probes reuse the parent test module's bounded RPC driver.
 use super::*;
 
-fn session_files(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+pub(super) fn session_files(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
     fn walk(path: &Path, files: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>) {
         if path.is_file() {
             // Windows denies reads of the live writer's advisory lock range.
@@ -23,7 +23,7 @@ fn session_files(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
     files
 }
 
-async fn rejected(root: &Path, args: &[&str], expected: &str) {
+pub(super) async fn rejected(root: &Path, args: &[&str], expected: &str) {
     let before = session_files(root);
     let output = tokio::time::timeout(
         Duration::from_secs(25),
@@ -51,7 +51,7 @@ async fn rejected(root: &Path, args: &[&str], expected: &str) {
         String::from_utf8_lossy(&output.stderr)
     );
 }
-fn fixture_model_config(root: &Path) {
+pub(super) fn fixture_model_config(root: &Path) {
     put(root.join("agent/models.json"),json!({"providers":{"fixture":{"api":"openai-completions","apiKey":"fixture-only","baseUrl":"http://127.0.0.1:1","models":[{"id":"test"}]}}}).to_string());
 }
 
@@ -110,7 +110,10 @@ async fn rejected_reopen_never_registers_native_code_and_public_apis_cannot_eras
     host.stop().await;
     let transcript = session_files(root)
         .into_keys()
-        .find(|p| p.extension().is_some_and(|e| e == "jsonl"))
+        .find(|p| {
+            p.extension().is_some_and(|e| e == "jsonl")
+                && !p.to_string_lossy().ends_with(".progress.jsonl")
+        })
         .unwrap();
     let original = std::fs::read_to_string(&transcript).unwrap();
     put(&transcript, format!("{original}{{unacknowledged tail"));
@@ -311,6 +314,14 @@ async fn selected_skills_preflight_precedes_registration_and_native_writer() {
             .stop()
             .await;
         assert_eq!(fixture.assert_registrations(&log).lines().count(), 2);
+        let fork_args = ["--resource-config", "resources.json", "--fork", "bound"];
+        put(&log, "");
+        put(&path, "---\nname: [\n---\nMalformed fork Skill\n");
+        // The same preflight must reject a fork before registering code or
+        // creating any child files, not merely protect ordinary reopen.
+        rejected(root, &fork_args, "selected skill").await;
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "");
+        put(&path, &original_skill);
         let transcript = session_files(root)
             .into_keys()
             .find(|p| p.extension().is_some_and(|e| e == "jsonl"))
@@ -342,6 +353,7 @@ async fn selected_skills_preflight_precedes_registration_and_native_writer() {
             "Skill inventory changed",
         )
         .await;
+        rejected(root, &fork_args, "Skill inventory changed").await;
         assert_eq!(
             std::fs::read_to_string(&log).unwrap(),
             "",
@@ -398,7 +410,10 @@ async fn legacy_torn_tail_still_recovers_on_accepted_restore() {
     host.stop().await;
     let path = session_files(root)
         .into_keys()
-        .find(|p| p.extension().is_some_and(|e| e == "jsonl"))
+        .find(|p| {
+            p.extension().is_some_and(|e| e == "jsonl")
+                && !p.to_string_lossy().ends_with(".progress.jsonl")
+        })
         .unwrap();
     let valid = std::fs::read_to_string(&path).unwrap();
     put(&path, format!("{valid}{{legacy torn"));

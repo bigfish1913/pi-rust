@@ -150,6 +150,8 @@ enum FaultTarget {
     WriteFile,
     /// Inject an error on the next `rename_file`.
     RenameFile,
+    /// Fail only the initial value row appended to a staged fork.
+    AppendInitialValue,
 }
 
 struct FaultyFs {
@@ -181,11 +183,13 @@ impl FaultyFs {
         let matches = match self.target {
             FaultTarget::WriteFile => is_write,
             FaultTarget::RenameFile => !is_write,
+            FaultTarget::AppendInitialValue => false,
         };
         if matches && self.armed.swap(false, Ordering::SeqCst) {
             Some(Self::fault_error(match self.target {
                 FaultTarget::WriteFile => "write_file",
                 FaultTarget::RenameFile => "rename_file",
+                FaultTarget::AppendInitialValue => "append_file",
             }))
         } else {
             None
@@ -259,6 +263,13 @@ impl FileSystem for FaultyFs {
         content: FileContent,
         cancel: Option<&CancellationToken>,
     ) -> Result<(), FileError> {
+        if matches!(self.target, FaultTarget::AppendInitialValue)
+            && path.ends_with(".tmp")
+            && matches!(&content, FileContent::Text(text) if text.contains("rpi.value"))
+            && self.armed.swap(false, Ordering::SeqCst)
+        {
+            return Err(Self::fault_error("append initial fork value").with_path(path));
+        }
         self.inner.append_file(path, content, cancel).await
     }
 
@@ -470,6 +481,57 @@ async fn fork_rename_failure_leaves_no_destination_and_no_tmp() {
     assert_eq!(list_ids(&r, "/proj").await, vec!["source"]);
     // Recovery path removes the staged `.tmp`.
     assert!(tmp_files_in_sessions_dir(&base).await.is_empty());
+}
+
+/// Initialization is part of staging: failure of its final append or of the
+/// subsequent publication must never expose an inherited-authority child.
+#[tokio::test]
+async fn initialized_fork_append_and_publish_failures_leave_no_destination() {
+    for target in [FaultTarget::AppendInitialValue, FaultTarget::RenameFile] {
+        let base: Arc<dyn FileSystem> =
+            Arc::new(rpi_tools::InMemoryExecutionEnv::with_cwd("/proj".into()));
+        let r = repo(base.clone());
+        let source = r.create_typed(&create_options("source")).await.unwrap();
+        source
+            .append_entry(note_provisioned("m1"), "main")
+            .await
+            .unwrap();
+        let metadata = source.jsonl_metadata();
+        let history = base.read_binary_file(&metadata.path, None).await.unwrap();
+        let progress_path = format!("{}.progress.jsonl", metadata.path);
+        let progress = base.read_binary_file(&progress_path, None).await.unwrap();
+        drop(source);
+        let faulty = FaultyFs::new(base.clone(), target);
+        let faulty_fs: Arc<dyn FileSystem> = faulty.clone();
+        let r_faulty = repo(faulty_fs);
+        let error = r_faulty
+            .fork_typed_with_value_initializer(
+                &metadata,
+                &create_options("initialized-child"),
+                &ForkOptions::default(),
+                |_| {
+                    Ok(vec![(
+                        "rpi.resource-selection.v1".into(),
+                        serde_json::json!({"revision": 1}),
+                    )])
+                },
+            )
+            .await
+            .err()
+            .expect("injected initialization/publication failure");
+        assert_eq!(error.code, SessionErrorCode::Storage);
+        assert!(!faulty.armed.load(Ordering::SeqCst));
+        assert_eq!(list_ids(&r, "/proj").await, vec!["source"]);
+        assert!(tmp_files_in_sessions_dir(&base).await.is_empty());
+        assert_eq!(
+            base.read_binary_file(&metadata.path, None).await.unwrap(),
+            history
+        );
+        assert_eq!(
+            base.read_binary_file(&progress_path, None).await.unwrap(),
+            progress
+        );
+    }
 }
 
 /// Mirrors "releases a destination reservation after a failed create" (the

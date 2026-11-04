@@ -9,6 +9,7 @@
 //! - [`repo`] — `JsonlSessionRepo` (`SessionRepo` impl over JSONL files).
 
 pub mod codec;
+mod cold_decode;
 mod cold_frames;
 pub mod errors;
 mod progress;
@@ -21,7 +22,7 @@ pub use codec::{
 };
 pub use errors::{file_result, invalid_file, JsonlDecodeError, JsonlDecodeErrorKind};
 pub use repo::JsonlSessionRepo;
-pub use storage::JsonlSessionStorage;
+pub use storage::{JsonlSessionFacts, JsonlSessionStorage};
 pub use types::{
     HeaderKind, JsonlSessionCreateOptions, JsonlSessionListOptions, JsonlSessionMetadata,
     JsonlSessionRepoOptions, JsonlSourceFormat, JsonlV4Header,

@@ -1,23 +1,30 @@
 #!/usr/bin/env python3
 """Real native JSONL external-tool smoke; Python 3 standard library only.
 
-Run with an explicitly built Stage3 binary (never searches PATH or builds):
+Run with an explicitly built native binary (never searches PATH or builds):
   python -B scripts/external-tools-smoke.py --rpi <target/debug/rpi.exe> \
-      --diagnostics-dir <Cargo-target/acp-stage3-01/smoke-worker-unique>
+      --diagnostics-dir <new-isolated-diagnostics-directory>
 
-All homes, configuration, sessions, temporary files and wire/provider logs are
-retained under the required diagnostics directory. No real credentials, external
-network, ACP bridge, installed extensions, or cross-repository helpers are used.
-The caller must choose a new diagnostics directory underneath its Cargo target.
+Generated homes, configuration, sessions and temporary data are deleted after
+owned process-tree/provider cleanup; protocol diagnostics are retained. No real
+credentials, external network, ACP bridge, installed extensions, or cross-repository
+helpers are used. This is isolation, not an OS sandbox: use a trusted binary.
+The diagnostics directory must be new and outside the checkout; CI uses runner.temp.
 """
+import sys
+
+sys.dont_write_bytecode = True
+
 import argparse
+import importlib.util
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import os
 from pathlib import Path
 import queue
+import shutil
+import signal
 import subprocess
-import sys
 import threading
 import time
 import traceback
@@ -43,6 +50,31 @@ DEFINITION = {
         "required": ["query", "nested"], "additionalProperties": False},
 }
 TIMEOUT = 25
+OWNED_DIRECTORIES = ("home", "agent", "tmp", "sessions", "workspace", "appdata", "localappdata")
+
+
+class OwnedCleanupError(RuntimeError):
+    """Owned cleanup is incomplete; no more scenarios may start."""
+
+
+def windows_job():
+    # Reuse the cold-start controller's kill-on-close Job Object implementation.
+    path = Path(__file__).with_name("resource-cold-start.py")
+    spec = importlib.util.spec_from_file_location("external_smoke_cold_start", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.WindowsJob()
+
+
+def cleanup_environment(root):
+    # Only directories created by environment() inside our new exclusive root.
+    # Never follow an unexpected symlink or remove the diagnostic root itself.
+    for name in OWNED_DIRECTORIES:
+        path = root / name
+        if path.is_symlink():
+            raise RuntimeError("refusing cleanup symlink: " + str(path))
+        if path.exists():
+            shutil.rmtree(path)
 
 
 def dump(path, value):
@@ -180,7 +212,7 @@ def environment(root, model):
     allowed = {"SYSTEMROOT", "WINDIR", "COMSPEC", "PATH", "PATHEXT", "SYSTEMDRIVE",
                "PROCESSOR_ARCHITECTURE", "NUMBER_OF_PROCESSORS"}
     env = {k: v for k, v in os.environ.items() if k.upper() in allowed}
-    for name in ("home", "agent", "tmp", "sessions", "workspace", "appdata", "localappdata"):
+    for name in OWNED_DIRECTORIES:
         (root / name).mkdir()
     home = root / "home"
     env.update(HOME=str(home), USERPROFILE=str(home), APPDATA=str(root / "appdata"),
@@ -204,6 +236,8 @@ class Native:
         self.root, self.frames, self.pending = root, [], []
         self.queue = queue.Queue()
         self.counter = 0
+        self.process = self.reader = self.job = None
+        self.closed = False
         self.stderr = (root / "native-stderr.log").open("w", encoding="utf-8")
         command = [str(rpi), "--mode", "rpc", "--provider", "fixture", "--model", "synthetic",
                    "--session-dir", str(root / "sessions"), "--session-id", str(uuid.uuid4()),
@@ -211,14 +245,22 @@ class Native:
                    "--no-prompt-templates", "--no-context-files", "--local-only"]
         dump(root / "native-command.json", command)
         try:
+            if os.name == "nt":
+                self.job = windows_job()
             self.process = subprocess.Popen(command, cwd=root / "workspace", env=environment(root, model),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.stderr,
-                text=True, encoding="utf-8", errors="strict", bufsize=1)
-        except BaseException:
-            self.stderr.close()
+                text=True, encoding="utf-8", errors="strict", bufsize=1,
+                start_new_session=os.name != "nt")
+            if self.job:
+                self.job.assign(self.process)
+            self.reader = threading.Thread(target=self.pump, name="external-smoke-stdout")
+            self.reader.start()
+        except BaseException as error:
+            try:
+                self.close()
+            except Exception as cleanup_error:
+                raise OwnedCleanupError(str(error) + "; startup cleanup: " + str(cleanup_error)) from error
             raise
-        self.reader = threading.Thread(target=self.pump, name="external-smoke-stdout")
-        self.reader.start()
 
     def pump(self):
         try:
@@ -301,22 +343,53 @@ class Native:
                 raise frame
 
     def close(self):
-        # Cleanup never relies on an unbounded stdin read, detached reader, or
-        # the old two-second native shutdown watchdog. A failed test kills/reaps.
-        try:
-            self.eof()
+        if self.closed:
+            return
+        errors = []
+
+        def attempt(operation):
+            try:
+                operation()
+            except Exception as error:
+                errors.append(str(error))
+
+        if self.process:
+            attempt(self.eof)
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass  # Owned tree termination below is mandatory, even after parent exit.
+            except Exception as error:
+                errors.append(str(error))
+        if self.job:
+            attempt(self.job.close)
+        elif self.process:
+            try:
+                os.killpg(self.process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass  # The entire owned process group has already exited.
+            except Exception as error:
+                errors.append(str(error))
+        if self.process:
             if self.process.poll() is None:
-                try:
-                    self.process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    self.process.kill()
-                    self.process.wait(timeout=10)
-        finally:
-            self.reader.join(timeout=10)
-            self.process.stdout.close()
-            self.stderr.close()
-            assert not self.reader.is_alive(), "leaked native reader thread"
-            assert self.process.poll() is not None, "leaked native process"
+                attempt(self.process.kill)  # Also reap after failed Job assignment.
+            attempt(lambda: self.process.wait(timeout=10))
+        if self.reader and self.reader.ident is not None:
+            attempt(lambda: self.reader.join(timeout=10))
+            if self.reader.is_alive():
+                errors.append("leaked native reader thread")
+            else:
+                attempt(self.process.stdout.close)
+        elif self.process:
+            attempt(self.process.stdout.close)
+        if self.process and not self.process.stdin.closed:
+            attempt(self.process.stdin.close)
+        attempt(self.stderr.close)
+        if self.process and self.process.poll() is None:
+            errors.append("leaked native process")
+        self.closed = not errors
+        if errors:
+            raise OwnedCleanupError("owned cleanup failed: " + "; ".join(errors))
 
 
 def external_request(host):
@@ -444,21 +517,33 @@ def run(rpi, diagnostics):
             root.mkdir()
             model, host = Model(root), None
             label = encoding + ": " + name
+            failures, cleanup_failures = [], []
             try:
-                try:
-                    host = Native(rpi, root, encoding, model)
-                    host.ready(encoding)
-                    scenario(host, model)
-                finally:
-                    model.stopping.set()
-                    model.release.set()
+                host = Native(rpi, root, encoding, model)
+                host.ready(encoding)
+                scenario(host, model)
+            except Exception as error:
+                failures.append(traceback.format_exc())
+                # Constructor cleanup can fail before a host is returned.
+                if host is None and isinstance(error, OwnedCleanupError):
+                    cleanup_failures.append(failures[-1])
+            finally:
+                model.stopping.set()
+                model.release.set()
+                for close in ([host.close] if host is not None else []) + [model.close]:
                     try:
-                        if host is not None:
-                            host.close()
-                    finally:
-                        model.close()
-            except Exception:
-                failure = traceback.format_exc()
+                        close()
+                    except Exception:
+                        cleanup_failures.append(traceback.format_exc())
+                # Never delete data while an owned process/thread may still use it.
+                if not cleanup_failures:
+                    try:
+                        cleanup_environment(root)
+                    except Exception:
+                        cleanup_failures.append(traceback.format_exc())
+            failures.extend(cleanup_failures)
+            if failures:
+                failure = "\n".join(failures)
                 (root / "failure.txt").write_text(failure, encoding="utf-8")
                 failed.append({"scenario": label, "error": failure})
                 print("FAIL " + label + "; see " + str(root / "failure.txt"), flush=True)
@@ -467,6 +552,8 @@ def run(rpi, diagnostics):
                 print("PASS " + label, flush=True)
             dump(diagnostics / "passed.json", passed)
             dump(diagnostics / "results.json", {"passed": passed, "failed": failed})
+            if cleanup_failures:
+                raise RuntimeError("owned cleanup failed; stopping further scenarios")
     assert not failed, f"{len(failed)} native scenario(s) failed; see {diagnostics / 'results.json'}"
     return passed
 
@@ -476,9 +563,16 @@ def main():
     parser.add_argument("--rpi", required=True, type=Path)
     parser.add_argument("--diagnostics-dir", required=True, type=Path)
     args = parser.parse_args()
+    if not __debug__:
+        parser.error("assertions are required; do not run this smoke with python -O")
     rpi = args.rpi.resolve(strict=True)
     assert rpi.is_file(), "--rpi must name a native executable, not a directory"
+    if args.diagnostics_dir.exists() or args.diagnostics_dir.is_symlink():
+        parser.error("diagnostics directory already exists; refusing reuse")
     diagnostics = args.diagnostics_dir.resolve()
+    repository = Path(__file__).resolve().parent.parent
+    if diagnostics == repository or repository in diagnostics.parents:
+        parser.error("diagnostics directory must be outside the repository")
     # Refuse reuse: every run has independent native homes and session state.
     diagnostics.mkdir(parents=True, exist_ok=False)
     try:

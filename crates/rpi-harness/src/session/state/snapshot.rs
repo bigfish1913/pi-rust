@@ -170,6 +170,13 @@ impl<'de> Deserialize<'de> for SessionState {
             );
         }
         let metadata = snapshot.entries.iter().map(EntryMeta::from_entry).collect();
+        let hot_append_count = snapshot
+            .records
+            .iter()
+            .filter(|record| {
+                matches!(record, LaneRecord::AssistantFrame(frame) if frame.op == AssistantFrameOp::Append)
+            })
+            .count();
         let mut state = Self {
             index: IndexedState {
                 metadata,
@@ -179,6 +186,9 @@ impl<'de> Deserialize<'de> for SessionState {
                 entries: snapshot.entries,
                 entries_by_id,
                 records: snapshot.records,
+                hot_append_count,
+                #[cfg(test)]
+                retire_record_checks: 0,
                 open_operations_by_lane,
                 lanes: snapshot.lanes,
                 log: snapshot.log,
