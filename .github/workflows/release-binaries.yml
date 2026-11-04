@@ -124,9 +124,18 @@ jobs:
             cargo build -p rpi-cli --release --locked --target ${{ matrix.target }}
           fi
 
-      - name: Smoke test Intel macOS binary
-        if: matrix.target == 'x86_64-apple-darwin'
-        run: target/${{ matrix.target }}/release/rpi --version
+      # --version bypasses resource leases/harness initialization. Exercise the
+      # actual candidate on every native runner before staging any release asset.
+      - name: Smoke test native startup and resource link boundaries
+        shell: bash
+        run: |
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            binary="target/${{ matrix.target }}/release/rpi.exe"
+          else
+            binary="target/${{ matrix.target }}/release/rpi"
+          fi
+          python -B scripts/test_resource_lease_startup_smoke.py
+          python -B scripts/resource-lease-startup-smoke.py --rpi "$binary"
 
       - name: Stage artifact
         id: stage
