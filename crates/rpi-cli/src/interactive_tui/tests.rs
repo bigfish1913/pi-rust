@@ -4,8 +4,10 @@ use rpi_tui::Component;
 mod autocomplete_flicker;
 #[cfg(all(feature = "clipboard", not(target_os = "android")))]
 mod clipboard_persistence;
+mod context_panel;
 mod enter_completion;
 mod session_regressions;
+mod skill_commands;
 mod updown_cursor;
 
 #[test]
@@ -1408,17 +1410,15 @@ fn reload_updates_context_header_and_context_panel_without_stale_paths() {
     assert!(header.contains("/new/APPEND_SYSTEM.md"));
     assert!(!header.contains("/old/SYSTEM.md"));
     assert_eq!(*shared.lock().unwrap(), fresh);
-    let panel = Arc::new(Container::new());
-    show_context_panel(&panel, &shared.lock().unwrap());
-    let output = strip_ansi(&panel.render(120).join("\n"));
+    let output = context_panel_lines(&shared.lock().unwrap()).join("\n");
     assert!(output.contains("/new/CLAUDE.md"));
     assert!(!output.contains("/old/SYSTEM.md"));
 
     update_resource_listing(&shared, Some(&listing), Default::default());
     assert!(!strip_ansi(&chat.render(120).join("\n")).contains("Context"));
-    let panel = Arc::new(Container::new());
-    show_context_panel(&panel, &shared.lock().unwrap());
-    assert!(strip_ansi(&panel.render(120).join("\n")).contains("no context files loaded"));
+    assert!(context_panel_lines(&shared.lock().unwrap())
+        .join("\n")
+        .contains("no context files loaded"));
 }
 
 #[test]
@@ -1764,6 +1764,7 @@ fn test_registry_visible_entries_cover_dispatch() {
         "/images",
         "/thinking",
         "/usage",
+        "/context",
         "/skills",
     ] {
         assert!(
@@ -1772,7 +1773,7 @@ fn test_registry_visible_entries_cover_dispatch() {
         );
     }
     // Hidden commands stay off the list.
-    for hidden in ["/context", "/q", "/m", "/v", "/think", "/resume", "/?"] {
+    for hidden in ["/q", "/m", "/v", "/think", "/resume", "/?"] {
         assert!(
             !names.contains(&hidden.to_string()),
             "{hidden} should be hidden from autocomplete"

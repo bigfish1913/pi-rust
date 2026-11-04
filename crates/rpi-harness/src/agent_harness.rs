@@ -76,7 +76,7 @@ use crate::session::types::{
     RetryPendingRecord, SessionStats, SessionTree, StepAttemptRecord, StepKind, ToolReplay,
     ToolStartedRecord, UsageCause, UsageRecord, WriteDeferredRecord,
 };
-use crate::skills::format_skill_invocation;
+use crate::skills::{format_skill_command, format_skill_invocation, parse_skill_command};
 use crate::system_prompt::compose_system_prompt;
 use crate::types::{
     AgentHarnessOptions, AgentHarnessResources, AgentHarnessStreamOptions, CompactionSettings,
@@ -728,6 +728,7 @@ struct HarnessInner {
     // still retain the public session/event facades.
     child_scope: Arc<Mutex<CancellationToken>>,
     execution_scope: Option<Arc<rpi_agent::tool_execution_scope::ToolExecutionScope>>,
+    skill_execution_env: Option<Arc<dyn rpi_tools::ExecutionEnv>>,
     model: Model,
     thinking_level: ThinkingLevel,
     active_tool_names: Vec<String>,
@@ -1097,6 +1098,7 @@ impl AgentHarness {
         let inner = HarnessInner {
             child_scope: child_scope.clone(),
             execution_scope: None,
+            skill_execution_env: None,
             model: options.model,
             thinking_level: options.thinking_level,
             active_tool_names: options.active_tool_names,
@@ -1800,6 +1802,7 @@ impl AgentHarness {
         message: AgentMessage,
         options: SendMessageOptions,
     ) -> HarnessResult<SendMessageResult> {
+        let message = self.expand_skill_input(message, None).await;
         let message = normalize_user_images(message).await?;
         let gate = self.message_writes.clone().lock_owned().await;
         let active = {
@@ -2987,6 +2990,75 @@ impl AgentHarness {
         target.get("id").and_then(|value| value.as_str())
     }
 
+    /// Bind manual skill reads to the host's execution environment (including
+    /// remote/read routing). Sealed resources use their validated snapshot instead.
+    /// No local filesystem fallback is used. Lane handles share this binding;
+    /// independent child harnesses must inherit it explicitly.
+    pub fn set_skill_execution_env(&self, env: Arc<dyn rpi_tools::ExecutionEnv>) {
+        self.inner.lock().unwrap().skill_execution_env = Some(env);
+    }
+
+    async fn expand_skill_input(
+        &self,
+        mut message: AgentMessage,
+        signal: Option<&CancellationToken>,
+    ) -> AgentMessage {
+        let AgentMessage::User(user) = &mut message else {
+            return message;
+        };
+        // A command belongs to the whole user input, not arbitrary substrings
+        // or later text blocks. Keep images and all other blocks untouched.
+        let text = match &mut user.content {
+            UserContent::Text(text) => Some(text),
+            UserContent::Blocks(blocks) => blocks.iter_mut().find_map(|block| match block {
+                Content::Text(text) => Some(&mut text.text),
+                _ => None,
+            }),
+        };
+        let Some(text) = text else { return message };
+        let Some((name, args)) = parse_skill_command(text) else {
+            return message;
+        };
+        let (skill, env, exact_resources) = {
+            let inner = self.inner.lock().unwrap();
+            (
+                inner
+                    .resources
+                    .skills
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .find(|skill| skill.name == name)
+                    .cloned(),
+                inner.skill_execution_env.clone(),
+                inner.exact_resources,
+            )
+        };
+        let Some(skill) = skill else { return message };
+        if exact_resources {
+            // Exact startup selection validated and pinned this body. Rereading
+            // here would bypass its hash/lease checks and restart-only contract.
+            *text = format_skill_invocation(&skill, Some(args));
+            return message;
+        }
+        let Some(env) = env else {
+            tracing::warn!(path = %skill.file_path, event = "skill_expansion",
+                "Cannot expand skill command without an execution environment");
+            return message;
+        };
+        match env
+            .read_text_file(&skill.file_path, signal)
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|source| format_skill_command(&skill, &source, args))
+        {
+            Ok(expanded) => *text = expanded,
+            Err(error) => tracing::warn!(path = %skill.file_path, event = "skill_expansion",
+                error = %error, "Could not expand skill command"),
+        }
+        message
+    }
+
     /// Enqueue a message and record the intent durably.
     ///
     /// The record is what lets a queued message survive a crash: the in-memory
@@ -2998,6 +3070,7 @@ impl AgentHarness {
         message: AgentMessage,
         kind: QueueKind,
     ) -> HarnessResult<QueueResult> {
+        let message = self.expand_skill_input(message, None).await;
         let gate = self.message_writes.clone().lock_owned().await;
         self.enqueue_message_locked(message, kind, gate).await
     }
@@ -4307,6 +4380,7 @@ impl AgentHarness {
                     "Operation aborted during image preparation",
                 ));
             }
+            let prompt = self.expand_skill_input(prompt, Some(&admission.1)).await;
             normalized.push(normalize_user_images(prompt).await?);
         }
         // Await an already-started decoder even on abort, but never persist or

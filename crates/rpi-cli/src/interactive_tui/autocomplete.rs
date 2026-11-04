@@ -9,6 +9,54 @@ use rpi_tui::truncate_to_width;
 // Autocomplete
 // ===========================================================================
 
+/// Install one command-discovery snapshot at startup and after successful
+/// resource reloads. Skills expand in the harness's normal input path, not in
+/// slash dispatch, so images and queued messages keep their ordinary behavior.
+pub(super) fn configure_resource_autocomplete(
+    autocomplete: &AutocompleteManager,
+    mut commands: Vec<SlashCommandEntry>,
+    resources: &rpi_harness::types::AgentHarnessResources,
+    cwd: &std::path::Path,
+    enable_skill_commands: bool,
+) {
+    let resources = crate::resource_commands::resource_command_entries(resources);
+    // Builtins/extensions are already in dispatch order. Deduplicate first-wins,
+    // then reserve hidden builtins and aliases against resource commands too.
+    let mut seen = std::collections::BTreeSet::new();
+    commands.retain(|command| seen.insert(command.name.clone()));
+    seen.extend(super::builtin_reserved_names());
+    let skills = if enable_skill_commands {
+        resources.skills
+    } else {
+        Vec::new()
+    };
+    for (name, description) in resources.templates.into_iter().chain(skills) {
+        let name = if name.starts_with('/') {
+            name
+        } else {
+            format!("/{name}")
+        };
+        if seen.insert(name.clone()) {
+            commands.push(SlashCommandEntry { name, description });
+        }
+    }
+    let mut combined = CombinedAutocompleteProvider::new();
+    combined.add_provider(Arc::new(SlashCommandAutocompleteProvider::new(commands)));
+    combined.add_provider(Arc::new(FilePathAutocompleteProvider::with_root(
+        cwd.to_path_buf(),
+    )));
+    autocomplete.set_provider(Arc::new(combined));
+}
+
+pub(super) fn skill_commands_enabled(
+    global: &crate::settings::Settings,
+    project: &[crate::settings::Settings],
+) -> bool {
+    preferred_project_setting(project, |s| s.enable_skill_commands)
+        .or(global.enable_skill_commands)
+        .unwrap_or(true)
+}
+
 /// Refresh the autocomplete suggestion list from the current editor text +
 /// cursor. Renders the suggestions into `autocomplete_container` (above the
 /// editor) or clears it when there are none.

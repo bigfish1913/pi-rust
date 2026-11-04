@@ -184,6 +184,10 @@ pub struct Settings {
     /// Hide the body of thinking blocks while retaining a compact label.
     #[serde(default)]
     pub hide_thinking_block: Option<bool>,
+    /// Show `/skill:name` in command discovery (default true). Manual commands
+    /// remain available when false; unrelated to disable-model-invocation.
+    #[serde(default)]
+    pub enable_skill_commands: Option<bool>,
     /// Suppress the interactive startup header and resource summary.
     /// Update checks remain enabled, matching upstream.
     #[serde(default)]
@@ -612,6 +616,10 @@ fn save_settings_to_path(
             settings.hide_thinking_block.map(serde_json::Value::Bool),
         ),
         (
+            "enableSkillCommands",
+            settings.enable_skill_commands.map(serde_json::Value::Bool),
+        ),
+        (
             "quietStartup",
             settings.quiet_startup.map(serde_json::Value::Bool),
         ),
@@ -1021,6 +1029,25 @@ mod scoped_tests {
         assert_eq!(settings.branch_summary_reserve_tokens(), Some(4242));
         assert!(settings.branch_summary_skipped());
     }
+    #[test]
+    fn skill_command_discovery_setting_roundtrips_pi_key() {
+        let (_tmp, _guard) = with_temp_env();
+        let mut settings = Settings::default();
+        for enabled in [Some(false), Some(true), None] {
+            settings.enable_skill_commands = enabled;
+            save_settings(&settings).unwrap();
+            assert_eq!(load_settings().unwrap().enable_skill_commands, enabled);
+            let raw: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(config::settings_path().unwrap()).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                raw.get("enableSkillCommands"),
+                enabled.map(serde_json::Value::Bool).as_ref()
+            );
+        }
+    }
+
     #[test]
     fn save_load_scoped_models_roundtrip() {
         let (_tmp, _guard) = with_temp_env();
