@@ -1117,6 +1117,12 @@ impl SettlingEmitter {
 }
 
 impl AgentEmitter for SettlingEmitter {
+    fn tool_program_observer(
+        &self,
+    ) -> Option<Arc<dyn rpi_agent::tool_program_observation::ToolProgramObserver>> {
+        self.inner.tool_program_observer()
+    }
+
     fn emit(&self, event: AgentEvent) -> BoxFuture<'static, ()> {
         self.emit_reserved(event, false)
     }

@@ -19,9 +19,66 @@ and logs. A numeric handle alone is not a credential or authorization. A registr
 a tool invocation. Synchronous callbacks inherit their actual driver identity;
 foreign workers authenticate the captured invocation, including child subsets.
 
-## Latest native result-codec follow-up (child-history groundwork)
+## Latest native observation seam (not durable history)
 
-The uncommitted native follow-up adds camelCase `Serialize` for `AgentToolResult` and
+The host now provides an **optional native observation seam**, not a production
+child journal or new RPC capability. It observes genuine requested/prepared
+arguments, original signed partials and the actual post-hook final result.
+Existing private `tp-*` request/progress/audit identity is unchanged; a future
+native durable entry ID is separate. Default emitters return no observer, so the
+normal CLI still has **no installed child-history writer**. Six negotiated Code
+Mode capabilities and the SDK ABI/layout remain unchanged.
+
+`AgentEmitter::tool_program_observer()` is forwarded through native settling,
+frame and extension tee wrappers. Nested captures inherit their real parent;
+guest JSON cannot select lineage or an observer. At the harness execution
+barrier, effective arguments are observed only after the existing Never-replay
+checkpoint ACK and before effects. Prepared-observer errors, including future
+construction/poll panics, refuse effects and report a harness persistence error.
+
+The driver retains finalized usage/names/termination **before** fallible observer
+finish/serialization. An optional atomic admission/retirement gate drains accepted
+in-flight callbacks before finish/close; saved callbacks hold only weak runtime
+and writer references. One absolute timeout covers work and writer shutdown.
+Cancellation/timeout replies remain prompt even during close, but the same native
+work/close future and active permits are retained through drain. One tee observer
+is forwarded; identical shared owner Arcs are deduplicated and distinct owners
+fail closed before either begin. Ordinary event fan-out is unchanged.
+
+The observer owns partially-created resources until begin returns success, and
+must clean them up on error/panic. Close must drain/join even when returning an
+error. These contracts and mock failure tests do **not** prove cleanup by an
+as-yet-unimplemented production writer.
+
+Qualification: default-parallel SDK/agent/extensions/harness **1,146 passed,
+0 failed, 6 ignored**, twice; logs `target/codemode-native-observation-tests-final-repeat.log`
+and `target/codemode-native-observation-tests-qualified-repeat.log`. This includes
+**18 new tests** (10 agent observation, 6 real-harness observation, 2 tee), not
+additional counts to sum again. Tests cover after-hook authority, prepared
+checkpoint ordering, denial/invalid preparation, retained accounting/termination,
+weak ownership, panic/failure, in-flight updates, and cancellation during close.
+An independent second review accepted the optional seam after the four discovered
+lifecycle/composition/panic issues were fixed.
+
+Fresh Windows host plus unchanged Code Mode DLL/fixture/gate passed the existing
+**59/59 cases**: `pi-rust-codemode/target/codemode-native-observation-smoke-1/{results.json,provenance.json}`.
+All four actual artifact hashes were independently verified. This smoke proves
+unchanged normal host/DLL behavior, **not production child archival capture**.
+Native workspace fmt and CLI build pass. Strict native all-target Clippy remains
+blocked by existing agent/extensions/harness diagnostics; the two introduced
+manual-inspect diagnostics were fixed. Package runtime/checkpoint remains the
+unchanged **124 tests plus strict all-target Clippy**. No deployment, installation,
+production restart, live-provider, Linux/macOS or full-parity claim.
+
+**Still pending:** native primary-session durable body/record writer, bounded
+lazy queries and explicit capabilities/events, interruption/restart/fork and
+snapshot/live continuity, neutral extcore/thin HTTP/ACP integration, and Web
+cards/reload/reconnect/HMR in the approved `rpi-package-dev` worktree. Do not infer
+any of these from this seam or the old intent/finish markers.
+
+## Historical native result-codec checkpoint
+
+The committed native codec follow-up adds camelCase `Serialize` for `AgentToolResult` and
 untagged `Serialize` for `TextContentOrImage`. ToolProgram reference mode now
 serializes the borrowed native result without an intermediate payload `Value`;
 native RPC uses the same canonical serializer, fixing dropped optional
@@ -39,13 +96,13 @@ history increment or full child-history parity. Actual child events/records,
 bounded history/query/replay/recovery, neutral core/adapter integration and UI
 remain pending. No install, deployment or running-service upgrade is implied.
 
-Latest Windows evidence:
+Historical codec Windows evidence:
 `pi-rust-codemode/target/codemode-native-codec-smoke-2/{results.json,provenance.json}`: **59 cases PASSED, all true**, with all four
 artifact hashes verified. SDK/agent/extensions/harness passed **1,128 tests,
 0 failed, 6 ignored, twice**; focused CLI protocol tests passed **8** (not the
 full CLI suite). Package **124 tests and strict all-target Clippy remain passing**
 from unchanged package evidence; **native strict Clippy is blocked**, not green.
-See the [latest matrix checkpoint](../../../rpi-package-codemode/docs/codemode-full-parity-matrix.md#latest-native-result-codec-follow-up-child-history-groundwork)
+See the [latest matrix checkpoint](../../../rpi-package-codemode/docs/codemode-full-parity-matrix.md#historical-native-result-codec-checkpoint)
 for hashes, logs, focused codec checks and native lint blockers. The earlier
 third-increment 59-case / 1,123-test evidence and `5dba…` host hash are
 historical, not qualification of the rebuilt host.

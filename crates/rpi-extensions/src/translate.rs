@@ -1019,6 +1019,27 @@ impl TeeEmitter {
 }
 
 impl AgentEmitter for TeeEmitter {
+    fn tool_program_observer(
+        &self,
+    ) -> Option<Arc<dyn rpi_agent::tool_program_observation::ToolProgramObserver>> {
+        let mut owner = None;
+        for emitter in &self.emitters {
+            if let Some(candidate) = emitter.tool_program_observer() {
+                if let Some(selected) = &owner {
+                    if !Arc::ptr_eq(selected, &candidate) {
+                        // Observation is single-owner, unlike ordinary event
+                        // fan-out. Never silently drop it or choose authority
+                        // by registration order. Refuse before child effects.
+                        return Some(Arc::new(AmbiguousToolProgramObservers));
+                    }
+                } else {
+                    owner = Some(candidate);
+                }
+            }
+        }
+        owner
+    }
+
     fn emit(&self, event: AgentEvent) -> BoxFuture<'static, ()> {
         // We can't hold `&self` across an await boundary into a 'static future
         // cheaply here without cloning the Arcs — so clone them and drive the
@@ -1036,6 +1057,21 @@ impl AgentEmitter for TeeEmitter {
         for e in &self.emitters {
             e.try_emit(event.clone());
         }
+    }
+}
+
+struct AmbiguousToolProgramObservers;
+impl rpi_agent::tool_program_observation::ToolProgramObserver for AmbiguousToolProgramObservers {
+    fn begin<'a>(
+        &'a self,
+        _child: rpi_agent::tool_program_observation::ToolProgramChild,
+        _arguments: &'a serde_json::Value,
+        _signal: tokio_util::sync::CancellationToken,
+    ) -> BoxFuture<
+        'a,
+        Result<Arc<dyn rpi_agent::tool_program_observation::ToolProgramObservation>, String>,
+    > {
+        Box::pin(async { Err("multiple distinct ToolProgram observers are not supported".into()) })
     }
 }
 
@@ -1603,6 +1639,108 @@ mod tests {
     }
 
     // --- TeeEmitter: fan-out to both the broadcast + the extension emitter ----
+
+    struct ObservationOwner {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl rpi_agent::tool_program_observation::ToolProgramObserver for ObservationOwner {
+        fn begin<'a>(
+            &'a self,
+            _child: rpi_agent::tool_program_observation::ToolProgramChild,
+            _arguments: &'a serde_json::Value,
+            _signal: tokio_util::sync::CancellationToken,
+        ) -> BoxFuture<
+            'a,
+            Result<Arc<dyn rpi_agent::tool_program_observation::ToolProgramObservation>, String>,
+        > {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err("reached genuine owner".into()) })
+        }
+    }
+    struct ObservedEmitter(Arc<dyn rpi_agent::tool_program_observation::ToolProgramObserver>);
+    impl AgentEmitter for ObservedEmitter {
+        fn tool_program_observer(
+            &self,
+        ) -> Option<Arc<dyn rpi_agent::tool_program_observation::ToolProgramObserver>> {
+            Some(self.0.clone())
+        }
+        fn emit(&self, _event: AgentEvent) -> BoxFuture<'static, ()> {
+            Box::pin(async {})
+        }
+    }
+    fn observation_child() -> rpi_agent::tool_program_observation::ToolProgramChild {
+        rpi_agent::tool_program_observation::ToolProgramChild {
+            root_id: "root".into(),
+            root_name: "program".into(),
+            parent_id: "root".into(),
+            request_id: "tp-original".into(),
+            name: "effect".into(),
+            ordinal: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn tee_emitter_preserves_single_nested_and_shared_observer_authority() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let owner: Arc<dyn rpi_agent::tool_program_observation::ToolProgramObserver> =
+            Arc::new(ObservationOwner {
+                calls: calls.clone(),
+            });
+        let observed: Arc<dyn AgentEmitter> = Arc::new(ObservedEmitter(owner.clone()));
+        let nested = TeeEmitter::new(vec![observed.clone()]);
+        let tee = TeeEmitter::new(vec![
+            Arc::new(rpi_agent::CollectorEmitter::default()),
+            Arc::new(nested),
+            observed,
+        ]);
+        let forwarded = tee.tool_program_observer().unwrap();
+        assert!(Arc::ptr_eq(&owner, &forwarded));
+        let error = forwarded
+            .begin(
+                observation_child(),
+                &serde_json::json!({}),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error, "reached genuine owner");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(TeeEmitter::new(vec![]).tool_program_observer().is_none());
+        assert!(
+            TeeEmitter::new(vec![Arc::new(rpi_agent::CollectorEmitter::default())])
+                .tool_program_observer()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn tee_emitter_refuses_distinct_observers_before_either_begin() {
+        let first = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let second = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tee = TeeEmitter::new(vec![
+            Arc::new(ObservedEmitter(Arc::new(ObservationOwner {
+                calls: first.clone(),
+            }))),
+            Arc::new(ObservedEmitter(Arc::new(ObservationOwner {
+                calls: second.clone(),
+            }))),
+        ]);
+        let error = tee
+            .tool_program_observer()
+            .unwrap()
+            .begin(
+                observation_child(),
+                &serde_json::json!({}),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(error.contains("multiple distinct"));
+        assert_eq!(first.load(Ordering::SeqCst), 0);
+        assert_eq!(second.load(Ordering::SeqCst), 0);
+    }
 
     #[tokio::test]
     async fn tee_emitter_fans_out_to_every_child() {

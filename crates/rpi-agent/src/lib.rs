@@ -25,6 +25,7 @@ pub mod queue;
 pub mod stream_fn;
 pub mod tool_execution_scope;
 pub mod tool_program;
+pub mod tool_program_observation;
 pub mod types;
 
 pub use abort::AbortHandle;

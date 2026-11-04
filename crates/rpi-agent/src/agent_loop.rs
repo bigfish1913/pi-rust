@@ -1427,7 +1427,7 @@ pub fn recorded_tool_result(
         Some(_) => {
             return Err(
                 "Unsupported recorded tool result version; replay cannot execute work".into(),
-            )
+            );
         }
         None => return Err(INVALID.into()),
     }
@@ -1541,6 +1541,7 @@ async fn execute_prepared_tool_call(
         config,
         child_token.clone(),
         on_update.clone(),
+        emit,
     );
     let _lifetime = crate::tool_program::InvocationLifetime(capability.signal.clone());
     let execute_started = agent_diagnostics_enabled().then(Instant::now);

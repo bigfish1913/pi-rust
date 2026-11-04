@@ -12,9 +12,25 @@ disposable scratch workspace. It accepts no caller-provided path and bounds its
 read at 8 MiB. The smoke harness creates these files before launch. There is no
 fixture network access.
 
-## Latest native result-codec follow-up (child-history groundwork)
+## Latest native observation seam (not durable history)
 
-The uncommitted native follow-up adds camelCase `Serialize` for `AgentToolResult` and
+The host now provides an **optional native observation seam**, not a production
+child journal or new RPC capability. It observes genuine requested/prepared
+arguments, original signed partials and the actual post-hook final result.
+Existing private `tp-*` request/progress/audit identity is unchanged; a future
+native durable entry ID is separate. Default emitters return no observer, so the
+normal CLI still has **no installed child-history writer**. Six negotiated Code
+Mode capabilities and the SDK ABI/layout remain unchanged.
+
+Native **1,146 tests passed twice (6 ignored)**; the existing Windows smoke
+remains **59/59** with a freshly rebuilt host and unchanged fixture/DLL/gate.
+See the [observation checkpoint](../../../docs/extensions/tool-program.md#latest-native-observation-seam-not-durable-history)
+for exact scope, lifecycle tests, current artifact evidence, native Clippy blockers
+and the still-pending durable history/core/adapters/Web work.
+
+## Historical native result-codec checkpoint
+
+The committed native codec follow-up adds camelCase `Serialize` for `AgentToolResult` and
 untagged `Serialize` for `TextContentOrImage`. ToolProgram reference mode now
 serializes the borrowed native result without an intermediate payload `Value`;
 native RPC uses the same canonical serializer, fixing dropped optional
@@ -32,13 +48,13 @@ history increment or full child-history parity. Actual child events/records,
 bounded history/query/replay/recovery, neutral core/adapter integration and UI
 remain pending. No install, deployment or running-service upgrade is implied.
 
-Latest Windows evidence:
+Historical codec Windows evidence:
 `pi-rust-codemode/target/codemode-native-codec-smoke-2/{results.json,provenance.json}`: **59 cases PASSED, all true**, with all four
 artifact hashes verified. SDK/agent/extensions/harness passed **1,128 tests,
 0 failed, 6 ignored, twice**; focused CLI protocol tests passed **8** (not the
 full CLI suite). Package **124 tests and strict all-target Clippy remain passing**
 from unchanged package evidence; **native strict Clippy is blocked**, not green.
-See the [latest matrix checkpoint](../../../../rpi-package-codemode/docs/codemode-full-parity-matrix.md#latest-native-result-codec-follow-up-child-history-groundwork)
+See the [latest matrix checkpoint](../../../../rpi-package-codemode/docs/codemode-full-parity-matrix.md#historical-native-result-codec-checkpoint)
 for hashes, logs, focused codec checks and native lint blockers. The earlier
 third-increment 59-case / 1,123-test evidence and `5dba…` host hash are
 historical, not qualification of the rebuilt host.

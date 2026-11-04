@@ -80,8 +80,23 @@ impl AgentTool for ToolExecutionBarrier {
             tracing::warn!(%error, tool_call_id, "refusing execution without a durable tool checkpoint");
             return Err(AgentError::tool(message));
         }
-        // Cancellation may arrive during the storage await. An acknowledged
-        // marker is conservative intent, not proof execute was entered.
+        // The native observation receives effective arguments only after the
+        // existing Never-replay checkpoint has ACKed, still before effects. It
+        // is not a substitute for that checkpoint or an execution authority.
+        if parent.is_some() {
+            if let Some(observation) = rpi_agent::tool_program_observation::current_observation() {
+                if let Err(message) = observation.prepared(&params).await {
+                    self.write_error
+                        .lock()
+                        .unwrap()
+                        .get_or_insert(message.clone());
+                    self.signal.cancel();
+                    return Err(AgentError::tool(message));
+                }
+            }
+        }
+        // Cancellation may arrive during either storage await. Acknowledged
+        // intent/prepared arguments are not proof execute was entered.
         if signal.is_cancelled() || self.signal.is_cancelled() {
             return Err(AgentError::Abort);
         }

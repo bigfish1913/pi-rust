@@ -1,4 +1,7 @@
 //! Host-owned, invocation-local nested execution. No model turns or transcript events.
+use crate::tool_program_observation::{
+    self, ToolProgramChild, ToolProgramObservation, ToolProgramObserver,
+};
 use crate::{
     AgentContext, AgentEmitter, AgentEvent, AgentLoopConfig, TextContentOrImage, ToolExecutionMode,
 };
@@ -14,7 +17,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{Notify, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 #[path = "tool_program_accounting.rs"]
@@ -80,6 +83,7 @@ pub struct ToolProgram {
     ancestors: Vec<String>,
     identity: NestedParent,
     child_scope: Option<Arc<crate::tool_execution_scope::ToolExecutionScope>>,
+    observer: Option<Arc<dyn ToolProgramObserver>>,
     starts: Arc<AtomicUsize>,
     state: Mutex<State>,
     serial: RwLock<()>,
@@ -99,6 +103,7 @@ impl ToolProgram {
         config: &AgentLoopConfig,
         signal: CancellationToken,
         on_update: Arc<dyn Fn(crate::ToolResultPartial) + Send + Sync>,
+        emit: &Arc<dyn AgentEmitter>,
     ) -> Arc<Self> {
         // Closing this composition must not cancel its containing native tool:
         // wrappers may still need that tool's signal for result postprocessing.
@@ -129,6 +134,11 @@ impl ToolProgram {
             ancestors,
             identity,
             child_scope: crate::tool_execution_scope::current_scope(),
+            // Nested execution inherits only the actual containing capture.
+            observer: match &previous {
+                Some(parent) => parent.observer.clone(),
+                None => emit.tool_program_observer(),
+            },
             starts: previous
                 .as_ref()
                 .map(|p| p.starts.clone())
@@ -282,21 +292,20 @@ impl ToolProgram {
                     .map_err(|_| "ToolProgram invocation-tree active request limit exceeded")?;
                 let signal = self.signal.child_token();
                 let id = format!("tp-{}", NEXT.fetch_add(1, Ordering::Relaxed));
+                let ordinal;
                 {
                     let mut state = self.state.lock().unwrap();
                     if state.requests.len() >= 16 {
                         return Err("ToolProgram retained/active request limit exceeded".into());
                     }
                     #[allow(deprecated)] // Keep the workspace Rust 1.88 MSRV.
-                    if self
+                    let previous = self
                         .starts
                         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                             (n < 128).then_some(n + 1)
                         })
-                        .is_err()
-                    {
-                        return Err("ToolProgram start budget exceeded".into());
-                    }
+                        .map_err(|_| "ToolProgram start budget exceeded")?;
+                    ordinal = previous + 1;
                     if self.signal.is_cancelled() || self.terminated.load(Ordering::SeqCst) {
                         return Err("parent invocation is no longer active".into());
                     }
@@ -316,126 +325,251 @@ impl ToolProgram {
                 tokio::spawn(async move {
                     let _permit = permit;
                     let _tree_permit = tree_permit;
-                    let work = async {
-                        // The parent never takes this lock: Sequential programs cannot self-deadlock.
-                        let _write;
-                        let _read;
-                        if sequential {
-                            _write = Some(this.serial.write().await);
-                            _read = None;
-                        } else {
-                            _read = Some(this.serial.read().await);
-                            _write = None;
-                        }
-                        if signal.is_cancelled() {
-                            return Err("nested invocation cancelled".to_owned());
-                        }
-                        let call = ToolCall {
-                            kind: ToolCallType,
-                            id: request_id.clone(),
-                            name,
-                            arguments,
-                            thought_signature: None,
-                            namespace: None,
-                            recorded: None,
-                        };
-                        let mut config = this.config.clone();
-                        config.signal = signal.clone();
-                        let emit: Arc<dyn AgentEmitter> = Arc::new(ProgressEmitter {
-                            program: Arc::downgrade(&this),
-                            request_id: request_id.clone(),
-                            name: progress_name.clone(),
-                            signal: signal.clone(),
-                            updates: updates.clone(),
-                        });
-                        let execute = PARENT.scope(
-                            this.identity.clone(),
-                            scope(
-                                this.clone(),
-                                crate::agent_loop::run_one_tool_call(
-                                    &this.context,
-                                    &this.assistant,
-                                    &call,
-                                    &config,
-                                    &emit,
-                                ),
-                            ),
-                        );
-                        let result = if let Some(scope) = &this.child_scope {
-                            scope.run(execute).await
-                        } else {
-                            execute.await
-                        };
-                        let finalized = result.map_err(|e| e.to_string())?;
-                        let result = &finalized.result;
-                        // Exactly one retention per direct request, before any fallible frame encoding.
-                        {
-                            let mut state = this.state.lock().unwrap();
-                            state.accounting.retain(result);
-                            // Serialize terminal retention with start's last admission check.
-                            // Finalization, not fallible reply encoding, decides admission.
-                            if result.terminate {
-                                this.terminated.store(true, Ordering::SeqCst);
-                            }
-                        }
-                        let reply = if reference {
-                            let encoded =
-                                serde_json::to_string(result).map_err(|e| e.to_string())?;
-                            this.retain_result(
-                                &request_id,
-                                finalized.result,
-                                finalized.is_error,
-                                encoded,
-                            )?
-                        } else {
-                            let payload =
-                                serde_json::to_value(result).map_err(|e| e.to_string())?;
-                            let reply = json!({"requestId":request_id,"status":"done","isError":finalized.is_error,"result":payload});
-                            bounded(&reply)?;
-                            reply
-                        };
-                        Ok::<_, String>(reply)
-                    };
-                    let work = std::panic::AssertUnwindSafe(work).catch_unwind();
-                    tokio::pin!(work);
-                    let (result, drain) = tokio::select! {
-                        biased;
-                        _ = signal.cancelled() => (Err("nested invocation cancelled".into()), true),
-                        _ = tokio::time::sleep(Duration::from_millis(timeout)) => (
-                            Err("nested invocation timed out; side effects may have occurred".into()), true),
-                        result = &mut work => (match result {
-                            Ok(reply) => reply,
-                            Err(_) => Err("nested invocation panicked".into()),
-                        }, false),
-                    };
-                    this.report(
-                        &request_id,
-                        &progress_name,
-                        if result.is_ok() {
-                            if result.as_ref().is_ok_and(|r| r["isError"] == true) {
-                                "failed"
+                    // One deadline covers native work, callback retirement and writer close.
+                    let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout);
+                    let update_gate = this
+                        .observer
+                        .as_ref()
+                        .map(|_| Arc::new(UpdateGate::default()));
+                    // Strong writer ownership survives the work future's unwind/drain.
+                    let mut observation: Option<Arc<dyn ToolProgramObservation>> = None;
+                    let observation_error = this
+                        .observer
+                        .as_ref()
+                        .map(|_| Arc::new(Mutex::new(None::<String>)));
+                    let publish = |result: Result<Value, String>| {
+                        this.report(
+                            &request_id,
+                            &progress_name,
+                            if result.is_ok() {
+                                if result.as_ref().is_ok_and(|r| r["isError"] == true) {
+                                    "failed"
+                                } else {
+                                    "completed"
+                                }
                             } else {
-                                "completed"
+                                "failed"
+                            },
+                            updates.load(Ordering::Relaxed),
+                            &signal,
+                        );
+                        let reply = result.unwrap_or_else(
+                            |error| json!({"requestId":request_id,"status":"failed","error":error}),
+                        );
+                        if let Some(request) =
+                            this.state.lock().unwrap().requests.get_mut(&request_id)
+                        {
+                            request.result = Some(reply);
+                        }
+                    };
+                    let (mut result, mut published) = {
+                        let work = async {
+                            // The parent never takes this lock: Sequential programs cannot self-deadlock.
+                            let _write;
+                            let _read;
+                            if sequential {
+                                _write = Some(this.serial.write().await);
+                                _read = None;
+                            } else {
+                                _read = Some(this.serial.read().await);
+                                _write = None;
                             }
+                            if signal.is_cancelled() {
+                                return Err("nested invocation cancelled".to_owned());
+                            }
+                            if let Some(observer) = &this.observer {
+                                let child = ToolProgramChild {
+                                    root_id: this.identity.root_id.clone(),
+                                    root_name: this.identity.root_name.clone(),
+                                    parent_id: this.identity.parent_id.clone(),
+                                    request_id: request_id.clone(),
+                                    name: name.clone(),
+                                    ordinal,
+                                };
+                                let writer = observer
+                                    .begin(child, &arguments, signal.clone())
+                                    .await
+                                    .inspect_err(|_| this.cancel_all())?;
+                                observation = Some(Arc::new(NativeObservation {
+                                    writer,
+                                    program: Arc::downgrade(&this),
+                                    error: observation_error.as_ref().unwrap().clone(),
+                                }));
+                                if signal.is_cancelled() {
+                                    return Err("nested invocation cancelled".into());
+                                }
+                            }
+                            let call = ToolCall {
+                                kind: ToolCallType,
+                                id: request_id.clone(),
+                                name,
+                                arguments,
+                                thought_signature: None,
+                                namespace: None,
+                                recorded: None,
+                            };
+                            let mut config = this.config.clone();
+                            config.signal = signal.clone();
+                            let emit: Arc<dyn AgentEmitter> = Arc::new(ProgressEmitter {
+                                program: Arc::downgrade(&this),
+                                request_id: request_id.clone(),
+                                name: progress_name.clone(),
+                                signal: signal.clone(),
+                                updates: updates.clone(),
+                                observation: observation.as_ref().map(Arc::downgrade),
+                                observation_error: observation_error.clone(),
+                                update_gate: update_gate.clone(),
+                            });
+                            let execute = PARENT.scope(
+                                this.identity.clone(),
+                                scope(
+                                    this.clone(),
+                                    crate::agent_loop::run_one_tool_call(
+                                        &this.context,
+                                        &this.assistant,
+                                        &call,
+                                        &config,
+                                        &emit,
+                                    ),
+                                ),
+                            );
+                            let execute = async {
+                                if let Some(scope) = &this.child_scope {
+                                    scope.run(execute).await
+                                } else {
+                                    execute.await
+                                }
+                            };
+                            let result = if let Some(observation) = &observation {
+                                tool_program_observation::scope(observation.clone(), execute).await
+                            } else {
+                                execute.await
+                            };
+                            let finalized = result.map_err(|e| e.to_string())?;
+                            let result = &finalized.result;
+                            // Exactly one retention per direct request, before any fallible frame encoding.
+                            {
+                                let mut state = this.state.lock().unwrap();
+                                state.accounting.retain(result);
+                                // Serialize terminal retention with start's last admission check.
+                                // Finalization, not fallible reply encoding, decides admission.
+                                if result.terminate {
+                                    this.terminated.store(true, Ordering::SeqCst);
+                                }
+                            }
+                            if let Some(gate) = &update_gate {
+                                gate.retire().await;
+                            }
+                            if let Some(observation) = &observation {
+                                observation
+                                    .finish(result, finalized.is_error, signal.is_cancelled())
+                                    .await
+                                    .inspect_err(|_| this.cancel_all())?;
+                            }
+                            if let Some(error) = observation_error
+                                .as_ref()
+                                .and_then(|e| e.lock().unwrap().clone())
+                            {
+                                return Err(error);
+                            }
+                            let reply = if reference {
+                                let encoded =
+                                    serde_json::to_string(result).map_err(|e| e.to_string())?;
+                                this.retain_result(
+                                    &request_id,
+                                    finalized.result,
+                                    finalized.is_error,
+                                    encoded,
+                                )?
+                            } else {
+                                let payload =
+                                    serde_json::to_value(result).map_err(|e| e.to_string())?;
+                                let reply = json!({"requestId":request_id,"status":"done","isError":finalized.is_error,"result":payload});
+                                bounded(&reply)?;
+                                reply
+                            };
+                            Ok::<_, String>(reply)
+                        };
+                        let work = std::panic::AssertUnwindSafe(work).catch_unwind();
+                        tokio::pin!(work);
+                        let (result, drain) = tokio::select! {
+                            biased;
+                            _ = signal.cancelled() => (Err("nested invocation cancelled".into()), true),
+                            _ = tokio::time::sleep_until(deadline) => (
+                                Err("nested invocation timed out; side effects may have occurred".into()), true),
+                            result = &mut work => (match result {
+                                Ok(reply) => reply,
+                                Err(_) => {
+                                    if this.observer.is_some() { this.cancel_all(); }
+                                    Err("nested invocation panicked".into())
+                                },
+                            }, false),
+                        };
+                        if drain {
+                            // Publish promptly, but retain native execution and permits.
+                            publish(result.clone());
+                            signal.cancel();
+                            if (&mut work).await.is_err() && this.observer.is_some() {
+                                // A writer may panic only after cancellation won
+                                // the select. It still fails program admission closed.
+                                this.cancel_all();
+                            }
+                        }
+                        (result, drain)
+                    };
+                    let reason = result.as_ref().err().cloned();
+                    // Own exactly one cleanup future. Cancellation/deadline may publish
+                    // failure, but never drop retirement/close or release either permit.
+                    let cleanup = async {
+                        if let Some(gate) = &update_gate {
+                            gate.retire().await;
+                        }
+                        // Native callbacks have retired, including their root reports.
+                        if let Some(observation) = observation {
+                            std::panic::AssertUnwindSafe(async {
+                                observation.close(reason.as_deref()).await
+                            })
+                            .catch_unwind()
+                            .await
+                            .unwrap_or_else(|_| Err("observation close panicked".into()))
                         } else {
-                            "failed"
-                        },
-                        updates.load(Ordering::Relaxed),
-                        &signal,
-                    );
+                            Ok(())
+                        }
+                    };
+                    tokio::pin!(cleanup);
+                    let closed = if published {
+                        (&mut cleanup).await
+                    } else {
+                        let interruption = tokio::select! {
+                            biased;
+                            _ = signal.cancelled() => Some("nested invocation cancelled"),
+                            _ = tokio::time::sleep_until(deadline) => Some(
+                                "nested invocation timed out; side effects may have occurred"),
+                            closed = &mut cleanup => {
+                                if let Err(error) = closed {
+                                    this.cancel_all();
+                                    result = Err(error);
+                                }
+                                None
+                            }
+                        };
+                        if let Some(error) = interruption {
+                            publish(Err(error.into()));
+                            published = true;
+                            signal.cancel();
+                            (&mut cleanup).await
+                        } else {
+                            Ok(())
+                        }
+                    };
+                    if let Err(error) = closed {
+                        this.cancel_all();
+                        result = Err(error);
+                    }
+                    if !published {
+                        publish(result);
+                    }
                     signal.cancel();
-                    let reply = result.unwrap_or_else(
-                        |error| json!({"requestId":request_id,"status":"failed","error":error}),
-                    );
-                    if let Some(request) = this.state.lock().unwrap().requests.get_mut(&request_id)
-                    {
-                        request.result = Some(reply);
-                    }
-                    if drain {
-                        // Publish promptly, but never drop native execution.
-                        // Its gate and our permits survive foreign cancel/destroy.
-                        let _ = work.await;
-                    }
                 });
                 Ok(json!({"requestId":id,"status":"running"}))
             }
@@ -486,6 +620,93 @@ fn integer(args: &Value, key: &str, default: u64, min: u64, max: u64) -> Result<
         Ok(value)
     }
 }
+// A prepared-barrier failure is an observation failure, not merely a tool
+// error: stop admission in the genuine containing program. No strong registry
+// reference is retained by the observation or by native callbacks.
+struct NativeObservation {
+    writer: Arc<dyn ToolProgramObservation>,
+    program: Weak<ToolProgram>,
+    error: Arc<Mutex<Option<String>>>,
+}
+impl ToolProgramObservation for NativeObservation {
+    fn id(&self) -> &str {
+        self.writer.id()
+    }
+    fn update(&self, partial: Arc<crate::AgentToolResult>) -> Result<(), String> {
+        self.writer.update(partial)
+    }
+    fn prepared<'a>(&'a self, arguments: &'a Value) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            // Construct the writer future inside the catch as well as polling it.
+            let result =
+                std::panic::AssertUnwindSafe(async { self.writer.prepared(arguments).await })
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|_| Err("observation prepared panicked".into()));
+            if let Err(error) = &result {
+                *self.error.lock().unwrap() = Some(error.clone());
+                if let Some(program) = self.program.upgrade() {
+                    program.cancel_all();
+                }
+            }
+            result
+        })
+    }
+    fn finish<'a>(
+        &'a self,
+        result: &'a crate::AgentToolResult,
+        is_error: bool,
+        cancelled: bool,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        self.writer.finish(result, is_error, cancelled)
+    }
+    fn close<'a>(&'a self, reason: Option<&'a str>) -> BoxFuture<'a, Result<(), String>> {
+        self.writer.close(reason)
+    }
+}
+
+// A single atomic orders admission against retirement: once CLOSED is set,
+// no callback can increment the active count. Only observed requests allocate it.
+#[derive(Default)]
+struct UpdateGate {
+    state: AtomicUsize,
+    idle: Notify,
+}
+const UPDATES_CLOSED: usize = 1usize << (usize::BITS - 1);
+impl UpdateGate {
+    fn enter(&self) -> Option<UpdatePermit<'_>> {
+        #[allow(deprecated)] // Keep the workspace Rust 1.88 MSRV.
+        self.state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                (state & UPDATES_CLOSED == 0 && state < UPDATES_CLOSED - 1).then(|| state + 1)
+            })
+            .ok()
+            .map(|_| UpdatePermit(self))
+    }
+    async fn retire(&self) {
+        self.state.fetch_or(UPDATES_CLOSED, Ordering::AcqRel);
+        loop {
+            let idle = self.idle.notified();
+            tokio::pin!(idle);
+            // Register before checking the counter, so the last exiting callback
+            // cannot notify between the check and waiter registration.
+            idle.as_mut().enable();
+            if self.state.load(Ordering::Acquire) == UPDATES_CLOSED {
+                return;
+            }
+            idle.await;
+        }
+    }
+}
+struct UpdatePermit<'a>(&'a UpdateGate);
+impl Drop for UpdatePermit<'_> {
+    fn drop(&mut self) {
+        if self.0.state.fetch_sub(1, Ordering::AcqRel) & !UPDATES_CLOSED == 1 {
+            self.0.idle.notify_waiters();
+        }
+    }
+}
+
 struct ProgressEmitter {
     // Native tools may retain their update callback in the program's tool registry.
     // Such callbacks must not keep that registry (and themselves) alive.
@@ -494,6 +715,9 @@ struct ProgressEmitter {
     name: String,
     signal: CancellationToken,
     updates: Arc<AtomicUsize>,
+    observation: Option<Weak<dyn ToolProgramObservation>>,
+    observation_error: Option<Arc<Mutex<Option<String>>>>,
+    update_gate: Option<Arc<UpdateGate>>,
 }
 impl AgentEmitter for ProgressEmitter {
     fn emit(&self, event: AgentEvent) -> BoxFuture<'static, ()> {
@@ -501,9 +725,32 @@ impl AgentEmitter for ProgressEmitter {
         Box::pin(async {})
     }
     fn try_emit(&self, event: AgentEvent) {
-        if let (AgentEvent::ToolExecutionUpdate { .. }, Some(program)) =
+        // Saved callbacks own only this standalone gate and weak runtime/writer
+        // references. Hold admission through writer acceptance AND root reporting.
+        let _admission = match &self.update_gate {
+            Some(gate) => match gate.enter() {
+                Some(permit) => Some(permit),
+                None => return,
+            },
+            None => None,
+        };
+        if let (AgentEvent::ToolExecutionUpdate { partial_result, .. }, Some(program)) =
             (event, self.program.upgrade())
         {
+            if !self.signal.is_cancelled() && !program.signal.is_cancelled() {
+                if let Some(observation) = self.observation.as_ref().and_then(Weak::upgrade) {
+                    let updated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        observation.update(partial_result)
+                    }))
+                    .unwrap_or_else(|_| Err("observation update panicked".into()));
+                    if let Err(error) = updated {
+                        if let Some(slot) = &self.observation_error {
+                            *slot.lock().unwrap() = Some(error);
+                        }
+                        program.cancel_all();
+                    }
+                }
+            }
             let count = self
                 .updates
                 .fetch_add(1, Ordering::Relaxed)
