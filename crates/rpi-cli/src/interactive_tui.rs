@@ -1085,10 +1085,13 @@ pub async fn interactive_tui(
     ask_user_bridge.attach();
     tui.set_main_screen_mode(matches!(args.tui_mode, crate::args::TuiMode::Regular));
 
+    // Keep startup output in the retained header, not loose chat children:
+    // settling the first reply replaces the chat's history page.
+    let history_page = history::HistoryUi::default();
     let chat_container = Arc::new(Container::new());
     let startup_context = if should_show_startup_listing(args.verbose, quiet_startup) {
         Some(add_welcome_message_with_capabilities(
-            &chat_container,
+            &history_page.header,
             &active_tool_names,
             &skill_names,
             &resources_snapshot.context_files,
@@ -1101,7 +1104,7 @@ pub async fn interactive_tui(
     // stderr: the TUI is already in the alternate screen by the time it draws
     // this, and a stray write would corrupt the layout (issue #115).
     for notice in &reload_context.startup_notices {
-        add_note_message(&chat_container, notice);
+        add_note_message(&history_page.header, notice);
     }
 
     // First-launch gate: if `~/.rpi/.setup_done` is absent, show the welcome
@@ -1111,14 +1114,14 @@ pub async fn interactive_tui(
     let existing_profile = crate::extras::setup_done()
         || saved_settings.last_changelog_version.is_some()
         || saved_settings.last_rpi_changelog_version.is_some();
-    crate::extras::maybe_first_time_setup(&chat_container);
+    crate::extras::maybe_first_time_setup(&history_page.header);
     let collapse_changelog =
         preferred_project_setting(&project_settings, |settings| settings.collapse_changelog)
             .or(saved_settings.collapse_changelog)
             .unwrap_or(false);
     maybe_add_startup_changelog(
         harness,
-        &chat_container,
+        &history_page.header,
         &saved_settings,
         collapse_changelog,
         existing_profile,
@@ -1285,7 +1288,7 @@ pub async fn interactive_tui(
         .get_as::<bool>("display.tool_outputs_expanded")
         .unwrap_or(false);
     let state = Arc::new(TuiState {
-        history_page: history::HistoryUi::default(),
+        history_page,
         session_dir: reload_context.session_dir(),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -1642,12 +1645,12 @@ pub async fn interactive_tui(
     // Check rpi and installed registry packages in the background so startup
     // remains responsive while their latest versions are fetched.
     let mut update_check_handles = Vec::new();
-    let rpi_chat = chat_container.clone();
+    let update_container = state.history_page.updates.clone();
     let rpi_tui = tui.clone();
     update_check_handles.push(tokio::spawn(async move {
         let report = crate::updates::check_rpi_startup().await;
         if !report.is_empty() {
-            add_update_notices(&rpi_chat, &report);
+            add_update_notices(&update_container, &report);
         }
         rpi_tui.request_render(false);
     }));
