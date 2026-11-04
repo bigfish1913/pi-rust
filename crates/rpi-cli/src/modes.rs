@@ -436,22 +436,10 @@ where
         let out = stdout.clone();
         tokio::spawn(async move {
             loop {
-                match commit_rx.recv().await {
-                    Ok(commit) => {
-                        write_line(
-                            &out,
-                            &serde_json::json!({
-                                "type": "session_entry_committed",
-                                "entryId": commit.entry_id,
-                                "entryType": commit.entry_type,
-                                "customType": commit.custom_type,
-                                "lane": commit.lane,
-                            }),
-                        )
-                        .await;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                match crate::rpc::tool_program_queries::commit_stream_event(commit_rx.recv().await)
+                {
+                    Some(event) => write_line(&out, &event).await,
+                    None => break,
                 }
             }
         })
@@ -985,6 +973,15 @@ where
             "get_messages" => rpc_get_messages(&lane, harness, &msg).await,
             "get_message_summaries" => crate::rpc::message_queries::summaries(harness, &msg).await,
             "get_message_window" => crate::rpc::message_queries::window(harness, &msg).await,
+            "get_tool_program_children" => {
+                crate::rpc::tool_program_queries::children(harness, &msg).await
+            }
+            "get_tool_program_child_phases" => {
+                crate::rpc::tool_program_queries::phases(harness, &msg).await
+            }
+            "get_tool_program_child_body" => {
+                crate::rpc::tool_program_queries::body(harness, &msg).await
+            }
             "get_history" => rpc_get_history(&lane, harness, &msg).await,
             "get_session_branch" => rpc_get_session_branch(harness, &msg).await,
             "append_entry" => rpc_append_entry(harness, &msg).await,

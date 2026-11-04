@@ -156,16 +156,34 @@ pub fn assert_json_serializable(value: &Value) -> SessionResult<()> {
 // Session — the facade. Mirrors TS `class Session`.
 // ---------------------------------------------------------------------------
 
+/// Maximum serialized size of a native child commit event.
+pub const NATIVE_JOURNAL_EVENT_MAX_BYTES: usize = 32 * 1024;
+
 /// Metadata published after a session entry has been committed.
 ///
 /// The event is an invalidation signal only; consumers must reread the branch
-/// when they need the canonical entry data.
+/// when they need the canonical entry data. Native journal commits additionally
+/// carry the bounded canonical metadata that was acknowledged by storage.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeJournalCommit {
+    pub schema_version: u8,
+    pub source_session_id: String,
+    pub lane: String,
+    pub entry_id: String,
+    pub parent_entry_id: Option<String>,
+    pub seq: u64,
+    pub custom_type: String,
+    pub data: Value,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionEntryCommit {
     pub entry_id: String,
     pub entry_type: String,
     pub custom_type: Option<String>,
     pub lane: String,
+    pub native_journal: Option<NativeJournalCommit>,
 }
 
 /// The session facade over a [`SessionStorage`] and [`IdGenerator`]. Mirrors TS
@@ -1089,6 +1107,23 @@ impl Session {
                 entry_type: entry.base().entry_type.clone(),
                 custom_type,
                 lane: lane.to_string(),
+                native_journal: None,
+            });
+        }
+    }
+
+    /// Publish the canonical native journal metadata after its storage append
+    /// has been acknowledged. The ordinary invalidation remains a separate
+    /// event from `publish_entry_commit`, preserving existing subscribers.
+    pub(crate) fn publish_tool_program_commit(&self, native_journal: NativeJournalCommit) {
+        let publisher = self.binding.read().unwrap().entry_commit_publisher.clone();
+        if let Some(publisher) = publisher {
+            let _ = publisher.send(SessionEntryCommit {
+                entry_id: native_journal.entry_id.clone(),
+                entry_type: "custom".to_owned(),
+                custom_type: Some(native_journal.custom_type.clone()),
+                lane: native_journal.lane.clone(),
+                native_journal: Some(native_journal),
             });
         }
     }

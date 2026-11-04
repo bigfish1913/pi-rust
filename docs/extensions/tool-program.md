@@ -10,7 +10,8 @@ capabilities: resultEnvelope, hostAccounting, parentProgress, losslessValues,
 resultReferences and the additive sixth contentAttachments. SDK pin **0.3.20**
 and native ABI/layout are unchanged. Older/mismatched hosts fail closed without
 fallback. Non-reference legacy clients/non-opted tools keep their old behavior.
-Complete child events/history/recovery and Web/ACP cards/reload remain outstanding.
+The native bounded query/event and neutral core-reader checkpoint is described
+below. Snapshot/live reconciliation and HTTP/ACP/Web cards/reload remain outstanding.
 
 A tool receives opaque `__rpi.runtimeHandle` and `__rpi.runtimeKey` from its native
 driver. Forward the handle as runtime-action user_data and the key as the reserved
@@ -19,7 +20,83 @@ and logs. A numeric handle alone is not a credential or authorization. A registr
 a tool invocation. Synchronous callbacks inherit their actual driver identity;
 foreign workers authenticate the captured invocation, including child subsets.
 
-## Latest installed native child journal (queries and UI still pending)
+## Latest bounded native child queries and commit events
+
+Native RPC now advertises **`toolProgramChildren.version = 1`** with three
+implemented read-only commands: `get_tool_program_children`,
+`get_tool_program_child_phases`, and `get_tool_program_child_body`. This is separate
+from the six existing Code Mode tool capabilities; SDK 0.3.20/ABI and protected
+self/ancestor policy are unchanged. Unknown/old profiles must not receive these
+commands or a generic history-scan fallback.
+
+Strict queries require explicit direction/count/byte budgets. Begin pages return
+at most **32** genuine, validated child summaries. Phase pages return at most
+**32** matching phases while scanning at most **128** phase candidates, filtered
+by exact journal type before cold payload reads. Sparse pages may be empty with
+a continuation. Complete encoded data pages are capped at **128 KiB**, with no
+oversized-first exception; the compatibility RPC frame duplicates data/result
+and is not itself bounded to 128 KiB. Body pages reuse the existing at-most-eight
+chunks / 64 KiB decoded limits, after validating the exact child, native phase,
+descriptor and branch authority. Summaries/phases never hydrate archival bodies.
+
+Cursors bind destination session, lane, selected ancestor leaf, direction and
+child/body source. Readers validate real assistant tool-call-only slots, bounded
+parent ancestry, native Never checkpoints, phase shapes and descriptor commits.
+Native forks do not copy operation records: copied entries therefore explicitly
+carry **`originVerification: forkCopy`**, preserving historical origin IDs without
+claiming a destination execution checkpoint. Normal origins use `nativeCheckpoint`.
+Only complete absence of both checkpoints plus valid fork metadata permits the
+historical-copy path; partial/ambiguous/mismatched evidence fails closed. Copies
+read only destination-owned entries, including after source deletion; a fork
+before an archive does not acquire future bodies. This is trusted native storage
+provenance, not protection against a raw-storage writer forging a transcript.
+
+Summary and phase-page **state remains `unknown`**. Scan exhaustion is not child
+completion; missing final/close remains uncertain. Read/reopen never executes,
+repairs, retries a write, or replays a program. Metadata ancestry may grow with
+history; custom ancestry fallbacks/eager backends remain outside an RSS guarantee.
+
+The separate **`toolProgramChildEvents.version = 1`** profile advertises
+`tool_program_child_begin`, `tool_program_child_phase`, and
+`tool_program_child_resync_required`. Dedicated events contain bounded canonical
+metadata only, with pinned source session, native entry ID/seq/parent and actual
+journal data, published **after storage ACK**. They do not fabricate assistant
+calls or settle parent tools. Body bytes/private request IDs are not inserted
+into these envelopes. Native seq/entry IDs are durable reconciliation keys.
+The existing bounded commit broadcast is best-effort: lag/oversized dedicated
+events explicitly require resync through bounded native reads, not silent
+successful-stream truncation. Generic commit invalidations retain their behavior.
+
+The companion package adds neutral strict DTOs and exact-profile-gated
+`rpi_extcore::service::{child_summaries, child_phases, child_body}`. They use an
+existing live host and validate count/bytes/cursors/descriptors/chunk hashes;
+old hosts get Unsupported without new commands or transcript scans. Unclassified
+native failures are sanitized HostUnavailable, not presumed caller errors.
+Whole-body integrity still requires a streaming consumer to check the aggregate
+hash. Core snapshot/live reconciliation and HTTP/ACP/Web integration are **not
+implemented by this checkpoint**.
+
+Qualification: native agent/extensions/harness/SDK **1,201 passed / 0 failed /
+6 ignored**, with a final-state repeat; CLI RPC **79 passed**; all-features native
+query/journal focus **26 passed**. Companion core **288 passed / 3 ignored**;
+core/HTTP/ACP/Web regression repeat **527 passed / 3 ignored**. The first broad
+adapter run failed the unchanged catalog duplicate-header test (returned a
+continuation); its isolated recheck and default-parallel full repeat passed.
+Native diagnostic Clippy passes with 48 existing harness warnings; strict core
+Clippy remains blocked by two existing durable.rs diagnostics, not strict-green.
+
+Fresh rebuilt Windows host + unchanged DLL/fixture/gate: **59/59** differential
+smoke, with **406** genuine ordered live events matched exactly to primary
+entries (70 begins / 336 phases). A separate copied-session recovery pass made
+**2,079 real RPC page reads**, recovering 26 sessions / 70 children / 266 bodies /
+101,830,803 decoded bytes and chunk/aggregate hashes, with **zero execution
+events**. Evidence: `target/codemode-native-query-events-smoke-1/` and
+`target/codemode-query-recovery-final/`. Frozen host SHA-256:
+`0b7ec9871462d8a6b68367ccbe5e55358eef1a5f502eea67a3f8d733750d1a39`.
+No full parity, native core-to-adapter smoke, UI/HMR, live-provider, Unix runtime,
+installed-binary, deployment, production restart or RSS/performance claim.
+
+## Historical installed native child journal (before query/event APIs)
 
 The harness now installs a native ToolProgram journal by default, using the
 existing primary-session body primitive. This is **real persisted child history**,

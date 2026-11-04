@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    session::{types::*, Session},
+    session::{session::NativeJournalCommit, types::*, Session},
     tool_program_body::{append_body, BodyDescriptor, BodyKind, MAX_BODY_BYTES},
 };
 
@@ -222,6 +222,18 @@ impl Core {
         data: &T,
     ) -> Result<()> {
         size(data, METADATA_BYTES)?;
+        let canonical_data = serde_json::to_value(data)
+            .map_err(|_| "journal metadata encoding failed".to_owned())?;
+        // Pin the source identity before any revision/ancestry check or append.
+        // The commit signal must never discover a session id after a facade
+        // switch, and a metadata read failure must prevent the append attempt.
+        let source_session_id = self
+            .session
+            .get_metadata()
+            .await
+            .map_err(|_| "journal metadata read failed".to_owned())?
+            .id;
+        bounded(&source_session_id)?;
         // Read the revision BEFORE the ancestry validation. Mutation during either
         // check fails the native conditional append. Never fall back or retry.
         let revision = self
@@ -235,16 +247,27 @@ impl Core {
             id: entry_id.clone(),
             kind: ProvisionedKind::Custom {
                 custom_type: custom_type.into(),
-                data: Some(
-                    serde_json::to_value(data)
-                        .map_err(|_| "journal metadata encoding failed".to_owned())?,
-                ),
+                data: Some(canonical_data.clone()),
             },
         };
-        self.session
+        let stamped = self
+            .session
             .append_entry_if_revision(entry, &self.lane, revision)
             .await
             .map_err(|_| "journal conditional append failed".to_owned())?;
+        // This is deliberately synchronous and follows the real append ACK. The
+        // stamped native seq/parent are the durable ordering/reconciliation key.
+        self.session
+            .publish_tool_program_commit(NativeJournalCommit {
+                schema_version: 1,
+                source_session_id,
+                lane: self.lane.clone(),
+                entry_id: stamped.base().id.clone(),
+                parent_entry_id: stamped.base().parent_id.clone(),
+                seq: stamped.base().seq,
+                custom_type: custom_type.to_owned(),
+                data: canonical_data,
+            });
         tx.anchor = Some(entry_id);
         Ok(())
     }
@@ -746,7 +769,10 @@ impl ToolProgramObservation for Observation {
 mod tests {
     use super::*;
     use crate::{
-        session::{DefaultIdGenerator, InMemorySessionStorage, SystemClock},
+        session::{
+            session::{SessionEntryCommit, NATIVE_JOURNAL_EVENT_MAX_BYTES},
+            DefaultIdGenerator, InMemorySessionStorage, SystemClock,
+        },
         tool_program_body::{read_body_page, BodyPageQuery, MAX_PAGE_BYTES},
     };
     use base64::{engine::general_purpose::STANDARD, Engine};
@@ -771,6 +797,15 @@ mod tests {
     // The parent owns full assistant/tool-call correlation. This fixture gives
     // its trusted closure a native anchor, not an identity from argument JSON.
     async fn fixture() -> (Session, JournalObserver, Arc<AtomicUsize>) {
+        let (session, observer, failures, _) = fixture_with_publisher().await;
+        (session, observer, failures)
+    }
+    async fn fixture_with_publisher() -> (
+        Session,
+        JournalObserver,
+        Arc<AtomicUsize>,
+        tokio::sync::broadcast::Receiver<SessionEntryCommit>,
+    ) {
         let session = memory("journal");
         let assistant = session
             .append_message(rpi_agent::AgentMessage::Assistant(Box::new(
@@ -783,6 +818,8 @@ mod tests {
             )))
             .await
             .unwrap();
+        let (publisher, commits) = tokio::sync::broadcast::channel::<SessionEntryCommit>(256);
+        session.set_entry_commit_publisher(Some(publisher));
         let origin = ChildOrigin {
             run_id: "run-native".into(),
             assistant_entry_id: assistant,
@@ -802,7 +839,7 @@ mod tests {
                 count.fetch_add(1, Ordering::SeqCst);
             }),
         );
-        (session, observer, failures)
+        (session, observer, failures, commits)
     }
     fn child(request: &str, parent: &str) -> ToolProgramChild {
         ToolProgramChild {
@@ -941,6 +978,106 @@ mod tests {
         assert_eq!(phases[5].failed, Some(false));
         assert_eq!(phases[5].interrupted, Some(false));
         assert_eq!(failures.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn native_commit_signals_follow_ack_order_and_pin_source_metadata() {
+        let (session, observer, failures, mut commits) = fixture_with_publisher().await;
+        let original = session.storage();
+
+        let observation = begin(&observer, "tp-private-signal").await;
+        observation
+            .prepared(&json!({"prepared": true}))
+            .await
+            .unwrap();
+        // Rebinding while the child is active must not change the source
+        // identity or redirect its subsequent update/final/closed appends.
+        session.set_storage(memory("replacement").storage());
+        observation
+            .update(Arc::new(signed("private-update")))
+            .unwrap();
+        observation
+            .finish(&signed("private-result"), false, false)
+            .await
+            .unwrap();
+        observation.close(None).await.unwrap();
+        let captured: Vec<_> = std::iter::from_fn(|| commits.try_recv().ok()).collect();
+        let native: Vec<_> = captured
+            .iter()
+            .filter_map(|commit| commit.native_journal.as_ref())
+            .collect();
+        assert_eq!(native.len(), 6); // begin + requested, prepared, update, final, closed
+        assert!(native
+            .windows(2)
+            .all(|window| window[0].seq < window[1].seq));
+        assert!(native
+            .iter()
+            .all(|commit| commit.source_session_id == "journal"));
+        assert!(native.iter().all(|commit| {
+            serde_json::to_vec(commit).unwrap().len() <= NATIVE_JOURNAL_EVENT_MAX_BYTES
+        }));
+        for commit in &native {
+            let entry = original.get_entry(&commit.entry_id).await.unwrap().unwrap();
+            match entry {
+                Entry::Custom(custom) => assert_eq!(custom.data.unwrap(), commit.data),
+                other => panic!("native signal points to non-custom entry: {other:?}"),
+            }
+            let encoded = serde_json::to_string(commit).unwrap();
+            assert!(!encoded.contains("tp-private"));
+            assert!(!encoded.contains("private-result"));
+            assert!(!encoded.contains("private-update"));
+            assert!(!encoded.contains("provider-native-signature"));
+        }
+        // Each native append still has exactly one legacy invalidation, while
+        // the dedicated signal is an additional projection, not a duplicate.
+        for commit in &native {
+            assert_eq!(
+                captured
+                    .iter()
+                    .filter(|candidate| candidate.native_journal.is_none()
+                        && candidate.entry_id == commit.entry_id)
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(failures.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_native_append_emits_no_native_metadata() {
+        let (session, observer, failures, mut commits) = fixture_with_publisher().await;
+        let observation = begin(&observer, "tp-private-failed-signal").await;
+        let before: Vec<_> = std::iter::from_fn(|| commits.try_recv().ok()).collect();
+        let native_before = before
+            .iter()
+            .filter(|commit| commit.native_journal.is_some())
+            .count();
+        assert_eq!(native_before, 2); // begin/requested only
+
+        // Rebase invalidates the captured anchor. The conditional append fails,
+        // so no native metadata may be published for the failed phase.
+        let assistant = observer
+            .core
+            .transaction
+            .lock()
+            .await
+            .children
+            .values()
+            .next()
+            .unwrap()
+            .begin
+            .origin
+            .assistant_entry_id
+            .clone();
+        session.move_lane("main", Some(&assistant)).await.unwrap();
+        assert!(observation
+            .prepared(&json!({"will": "fail"}))
+            .await
+            .is_err());
+        let after: Vec<_> = std::iter::from_fn(|| commits.try_recv().ok()).collect();
+        assert!(after.iter().all(|commit| commit.native_journal.is_none()));
+        assert_eq!(failures.load(Ordering::SeqCst), 1);
+        assert!(observation.close(None).await.is_err());
     }
 
     #[tokio::test]

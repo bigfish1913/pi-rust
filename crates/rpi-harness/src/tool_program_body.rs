@@ -389,7 +389,7 @@ fn parse<T: DeserializeOwned>(entry: Entry, custom_type: &str) -> SessionResult<
         _ => Err(invalid("incorrect body entry type")),
     }
 }
-fn validate_descriptor(d: &BodyDescriptor, requested: &str) -> SessionResult<()> {
+pub(crate) fn validate_descriptor(d: &BodyDescriptor, requested: &str) -> SessionResult<()> {
     id(&d.child_id)?;
     if Uuid::parse_str(&d.body_id)
         .ok()
