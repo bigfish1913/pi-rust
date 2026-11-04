@@ -42,6 +42,8 @@ pub(super) struct ProviderFormState {
 /// Which selector overlay (if any) is currently swapped into the editor slot.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum SelectorKind {
+    /// `/context` — read-only loaded resources; dismiss without changing chat.
+    Context,
     /// `/model` — available models (live switch via `lane.set_model`).
     Model,
     /// `/thinking` — supported thinking levels (live via `lane.set_thinking_level`).

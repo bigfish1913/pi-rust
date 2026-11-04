@@ -1275,6 +1275,9 @@ pub async fn build_prepared(
     let harness = AgentHarness::create(options)
         .await
         .map_err(|e| BuildError::HarnessCreate(e.to_string()))?;
+    // Manual skill commands read current bodies through the same environment
+    // that discovered these host-owned resources, including after /reload.
+    harness.set_skill_execution_env(env_dyn.clone());
 
     // Retain read leases even for resource-only/--no-extensions hosts.
     let harness_leases = resource_leases.clone();

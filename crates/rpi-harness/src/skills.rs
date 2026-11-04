@@ -98,6 +98,27 @@ pub fn format_skill_invocation(skill: &Skill, additional_instructions: Option<&s
     }
 }
 
+/// Parse only a leading, manually entered skill command. Like pi, the first
+/// literal space separates the name from arguments; argument interiors are
+/// deliberately not tokenized or normalized.
+pub fn parse_skill_command(text: &str) -> Option<(&str, &str)> {
+    let command = text.strip_prefix("/skill:")?;
+    Some(match command.split_once(' ') {
+        Some((name, args)) => (name, args.trim()),
+        None => (command, ""),
+    })
+}
+
+/// Read the current body using the same frontmatter parser as discovery.
+/// Metadata errors are returned so the caller can report them and pass the
+/// original command through, matching pi's skill-expansion fallback.
+pub fn format_skill_command(skill: &Skill, source: &str, args: &str) -> Result<String, String> {
+    let (_, body) = parse_frontmatter(source.trim_start_matches('\u{feff}'))?;
+    let mut fresh = skill.clone();
+    fresh.content = body.trim().to_string();
+    Ok(format_skill_invocation(&fresh, Some(args)))
+}
+
 // ---------------------------------------------------------------------------
 // System-prompt listing (XML-escaped) — invariant §9 path (1)
 // ---------------------------------------------------------------------------
