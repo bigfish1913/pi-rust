@@ -179,9 +179,13 @@ Use `/skill:name [instructions]`, as in pi, to explicitly invoke a discovered sk
 Skills appear in slash completion, including those with `disable-model-invocation: true`
 (which only disables automatic model selection). Set `enableSkillCommands: false` to
 hide skill completions without disabling manual invocation. A successful `/reload`
-refreshes the skill command list. Invocation reads the current skill file body and
-preserves spaces and newlines inside additional instructions. Unknown skills and
-read/parse failures pass the original command through the normal input path.
+refreshes the skill command list. In normal mode, invocation reads the current skill
+file body. With `--resource-config`, exact-resource mode instead uses the validated
+startup snapshot; file changes require a restart. Additional instructions preserve
+interior spaces and newlines. The command-discovery API also lists skills with
+`source: "skill"`; `enableSkillCommands` only filters local TUI suggestions, not the
+API's skill list. Unknown skills and read/parse failures pass the original command
+through the normal input path.
 `/skills` still lists skills; `/skills name [instructions]` remains compatible.
 
 ### Headless server and remote client

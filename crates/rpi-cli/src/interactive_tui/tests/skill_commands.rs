@@ -104,3 +104,62 @@ fn rebuilding_autocomplete_removes_stale_skills_and_adds_reloaded_names() {
         .iter()
         .any(|s| s.starts_with("/skill:")));
 }
+
+#[test]
+fn resource_autocomplete_preserves_priority_reservations_and_default_descriptions() {
+    let manager = AutocompleteManager::new();
+    let mut commands = build_builtin_registry().visible_entries();
+    commands.push(SlashCommandEntry {
+        name: "/skill:extension".into(),
+        description: "Extension wins".into(),
+    });
+    let mut loaded = resources("manual");
+    let mut duplicate = loaded.skills.as_ref().unwrap()[0].clone();
+    duplicate.description = "Duplicate must lose".into();
+    let mut extension = duplicate.clone();
+    extension.name = "extension".into();
+    loaded
+        .skills
+        .as_mut()
+        .unwrap()
+        .extend([duplicate, extension]);
+    loaded.prompt_templates = Some(
+        [
+            "help",
+            "q",
+            "skill:extension",
+            "skill:manual",
+            "summarize",
+            "/summarize",
+        ]
+        .into_iter()
+        .map(|name| PromptTemplate {
+            name: name.into(),
+            description: None,
+            content: "template".into(),
+        })
+        .collect(),
+    );
+    configure_resource_autocomplete(&manager, commands, &loaded, std::path::Path::new("."), true);
+    let items = manager.get_suggestions("/", 1).unwrap().items;
+    let find = |name: &str| items.iter().find(|item| item.text == name).unwrap();
+    assert_eq!(
+        find("/help").description.as_deref(),
+        Some("Show available commands")
+    );
+    assert_eq!(
+        find("/skill:extension").description.as_deref(),
+        Some("Extension wins")
+    );
+    assert_eq!(
+        find("/skill:manual").description.as_deref(),
+        Some("Expand prompt template")
+    );
+    assert_eq!(
+        find("/summarize").description.as_deref(),
+        Some("Expand prompt template")
+    );
+    assert!(!items.iter().any(|item| item.text == "/q"));
+    let unique: std::collections::BTreeSet<_> = items.iter().map(|item| &item.text).collect();
+    assert_eq!(unique.len(), items.len());
+}

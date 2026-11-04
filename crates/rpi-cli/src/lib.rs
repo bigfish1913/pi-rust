@@ -57,6 +57,7 @@ pub mod prebuilt_extensions;
 mod prebuilt_release;
 pub mod provider;
 pub mod remote;
+mod resource_commands;
 pub mod resource_dirs;
 pub mod resource_management;
 pub mod resource_selection;

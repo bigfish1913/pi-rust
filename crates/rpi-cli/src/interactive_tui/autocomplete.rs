@@ -19,33 +19,26 @@ pub(super) fn configure_resource_autocomplete(
     cwd: &std::path::Path,
     enable_skill_commands: bool,
 ) {
-    commands.extend(
-        resources
-            .prompt_templates
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .map(|t| SlashCommandEntry {
-                name: format!("/{}", t.name),
-                description: t
-                    .description
-                    .clone()
-                    .unwrap_or_else(|| "Expand prompt template".into()),
-            }),
-    );
-    if enable_skill_commands {
-        // disable-model-invocation hides automatic selection, NOT explicit use.
-        commands.extend(
-            resources
-                .skills
-                .as_deref()
-                .unwrap_or(&[])
-                .iter()
-                .map(|skill| SlashCommandEntry {
-                    name: format!("/skill:{}", skill.name),
-                    description: skill.description.clone(),
-                }),
-        );
+    let resources = crate::resource_commands::resource_command_entries(resources);
+    // Builtins/extensions are already in dispatch order. Deduplicate first-wins,
+    // then reserve hidden builtins and aliases against resource commands too.
+    let mut seen = std::collections::BTreeSet::new();
+    commands.retain(|command| seen.insert(command.name.clone()));
+    seen.extend(super::builtin_reserved_names());
+    let skills = if enable_skill_commands {
+        resources.skills
+    } else {
+        Vec::new()
+    };
+    for (name, description) in resources.templates.into_iter().chain(skills) {
+        let name = if name.starts_with('/') {
+            name
+        } else {
+            format!("/{name}")
+        };
+        if seen.insert(name.clone()) {
+            commands.push(SlashCommandEntry { name, description });
+        }
     }
     let mut combined = CombinedAutocompleteProvider::new();
     combined.add_provider(Arc::new(SlashCommandAutocompleteProvider::new(commands)));

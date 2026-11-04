@@ -2991,8 +2991,9 @@ impl AgentHarness {
     }
 
     /// Bind manual skill reads to the host's execution environment (including
-    /// remote/read routing). No local filesystem fallback is used. Lane handles
-    /// share this binding; independent child harnesses must inherit it explicitly.
+    /// remote/read routing). Sealed resources use their validated snapshot instead.
+    /// No local filesystem fallback is used. Lane handles share this binding;
+    /// independent child harnesses must inherit it explicitly.
     pub fn set_skill_execution_env(&self, env: Arc<dyn rpi_tools::ExecutionEnv>) {
         self.inner.lock().unwrap().skill_execution_env = Some(env);
     }
@@ -3018,7 +3019,7 @@ impl AgentHarness {
         let Some((name, args)) = parse_skill_command(text) else {
             return message;
         };
-        let (skill, env) = {
+        let (skill, env, exact_resources) = {
             let inner = self.inner.lock().unwrap();
             (
                 inner
@@ -3030,9 +3031,16 @@ impl AgentHarness {
                     .find(|skill| skill.name == name)
                     .cloned(),
                 inner.skill_execution_env.clone(),
+                inner.exact_resources,
             )
         };
         let Some(skill) = skill else { return message };
+        if exact_resources {
+            // Exact startup selection validated and pinned this body. Rereading
+            // here would bypass its hash/lease checks and restart-only contract.
+            *text = format_skill_invocation(&skill, Some(args));
+            return message;
+        }
         let Some(env) = env else {
             tracing::warn!(path = %skill.file_path, event = "skill_expansion",
                 "Cannot expand skill command without an execution environment");

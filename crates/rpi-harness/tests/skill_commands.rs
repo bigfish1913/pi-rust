@@ -1,5 +1,5 @@
 //! Manual commands must reach both provider context and durable history through
-//! the configured execution environment, never the process filesystem.
+//! the configured execution environment, or the validated snapshot when sealed.
 use std::sync::{Arc, Mutex};
 
 use rpi_agent::AgentMessage;
@@ -9,8 +9,11 @@ use rpi_ai::types::{
 };
 use rpi_harness::agent_harness::{AgentHarness, AgentLane};
 use rpi_harness::session::types::{EntryOrder, EntryQuery};
-use rpi_harness::skills::{format_skill_command, parse_skill_command};
-use rpi_harness::types::{AgentHarnessOptions, AgentHarnessResources, CompactionSettings, Skill};
+use rpi_harness::skills::{format_skill_command, format_skill_invocation, parse_skill_command};
+use rpi_harness::types::{
+    AgentHarnessOptions, AgentHarnessResources, CompactionSettings, MessageDelivery,
+    SendMessageOptions, Skill,
+};
 use rpi_tools::{FileSystem, InMemoryExecutionEnv};
 
 type Requests = Arc<Mutex<Vec<Vec<Message>>>>;
@@ -26,6 +29,10 @@ fn skill() -> Skill {
 }
 
 async fn setup() -> (AgentHarness, Arc<InMemoryExecutionEnv>, Requests) {
+    setup_with_env(true).await
+}
+
+async fn setup_with_env(bind_env: bool) -> (AgentHarness, Arc<InMemoryExecutionEnv>, Requests) {
     let env = Arc::new(InMemoryExecutionEnv::new());
     env.create_dir("skills/manual", true, None).await.unwrap();
     env.write_file(
@@ -64,8 +71,127 @@ async fn setup() -> (AgentHarness, Arc<InMemoryExecutionEnv>, Requests) {
     })
     .await
     .unwrap();
-    harness.set_skill_execution_env(env.clone());
+    if bind_env {
+        harness.set_skill_execution_env(env.clone());
+    }
     (harness, env, requests)
+}
+
+fn sealed_skill() -> Skill {
+    Skill {
+        content: "VALIDATED_STARTUP_BODY\n  preserved indentation".into(),
+        ..skill()
+    }
+}
+
+async fn setup_sealed(bind_env: bool) -> (AgentHarness, Arc<InMemoryExecutionEnv>, Requests) {
+    let (h, env, requests) = setup_with_env(bind_env).await;
+    h.set_resources(AgentHarnessResources {
+        skills: Some(vec![sealed_skill()]),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    h.seal_resources(vec![]).unwrap();
+    (h, env, requests)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sealed_skill_uses_validated_body_despite_source_edits_or_read_failures() {
+    let (h, env, requests) = setup_sealed(true).await;
+    assert!(h
+        .set_resources(AgentHarnessResources::default())
+        .await
+        .is_err());
+    let expected = format_skill_invocation(&sealed_skill(), Some("a  b\n  c"));
+    for source in ["AFTER_SEAL_MUTATION", "---\ninvalid: [\n---\nBad body"] {
+        env.write_file(&skill().file_path, source.into(), None)
+            .await
+            .unwrap();
+        h.prompt_text("/skill:manual  a  b\n  c \n", vec![])
+            .await
+            .unwrap();
+        assert_eq!(
+            provider_users(requests.lock().unwrap().last().unwrap()).last(),
+            Some(&expected)
+        );
+    }
+    // A sealed invocation must not need a readable file, even if the bound
+    // environment is replaced after startup.
+    h.set_skill_execution_env(Arc::new(InMemoryExecutionEnv::new()));
+    h.prompt_message(user("/skill:manual  a  b\n  c \n"))
+        .await
+        .unwrap();
+    assert_eq!(
+        provider_users(requests.lock().unwrap().last().unwrap()).last(),
+        Some(&expected)
+    );
+    let entries = h
+        .session()
+        .view("main")
+        .find_entries_on_branch(&EntryQuery::default(), &Default::default())
+        .await
+        .unwrap();
+    let history = serde_json::to_string(&entries).unwrap();
+    assert!(history.contains("VALIDATED_STARTUP_BODY"));
+    assert!(!history.contains("AFTER_SEAL_MUTATION"));
+    assert!(!history.contains("/skill:manual"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sealed_skill_does_not_require_a_bound_execution_environment() {
+    let (h, _, requests) = setup_sealed(false).await;
+    h.prompt_messages(vec![user("/skill:manual explicit")])
+        .await
+        .unwrap();
+    assert_eq!(
+        provider_users(&requests.lock().unwrap()[0]),
+        vec![format_skill_invocation(&sealed_skill(), Some("explicit"))]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sealed_skill_queues_and_send_message_use_the_same_validated_body() {
+    let (h, env, requests) = setup_sealed(true).await;
+    env.write_file(&skill().file_path, "AFTER_SEAL_MUTATION".into(), None)
+        .await
+        .unwrap();
+    h.steer(user("/skill:manual steering")).await.unwrap();
+    h.follow_up(user("/skill:manual follow  up\n  request"))
+        .await
+        .unwrap();
+    h.send_message(
+        user("/skill:manual next turn"),
+        SendMessageOptions {
+            deliver_as: MessageDelivery::NextTurn,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let queued = h.queued_messages().await.unwrap();
+    assert_eq!(
+        queued.steering[0].text,
+        format_skill_invocation(&sealed_skill(), Some("steering"))
+    );
+    assert_eq!(
+        queued.follow_up[0].text,
+        format_skill_invocation(&sealed_skill(), Some("follow  up\n  request"))
+    );
+    // The next-turn, steer, and follow-up drain must not reread the source.
+    env.write_file(&skill().file_path, "LATER_MUTATION".into(), None)
+        .await
+        .unwrap();
+    h.prompt_text("start", vec![]).await.unwrap();
+    let requests = requests.lock().unwrap();
+    let users: Vec<_> = requests
+        .iter()
+        .flat_map(|request| provider_users(request))
+        .collect();
+    for args in ["steering", "follow  up\n  request", "next turn"] {
+        assert!(users.contains(&format_skill_invocation(&sealed_skill(), Some(args))));
+    }
+    assert!(!users.iter().any(|text| text.contains("MUTATION")));
 }
 
 fn user(text: &str) -> AgentMessage {
