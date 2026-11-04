@@ -435,12 +435,10 @@ where
     let commit_task = {
         let out = stdout.clone();
         tokio::spawn(async move {
-            loop {
-                match crate::rpc::tool_program_queries::commit_stream_event(commit_rx.recv().await)
-                {
-                    Some(event) => write_line(&out, &event).await,
-                    None => break,
-                }
+            while let Some(event) =
+                crate::rpc::tool_program_queries::commit_stream_event(commit_rx.recv().await)
+            {
+                write_line(&out, &event).await;
             }
         })
     };

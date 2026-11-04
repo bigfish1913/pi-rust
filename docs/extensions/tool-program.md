@@ -90,9 +90,9 @@ smoke, with **406** genuine ordered live events matched exactly to primary
 entries (70 begins / 336 phases). A separate copied-session recovery pass made
 **2,079 real RPC page reads**, recovering 26 sessions / 70 children / 266 bodies /
 101,830,803 decoded bytes and chunk/aggregate hashes, with **zero execution
-events**. Evidence: `target/codemode-native-query-events-smoke-1/` and
-`target/codemode-query-recovery-final/`. Frozen host SHA-256:
-`0b7ec9871462d8a6b68367ccbe5e55358eef1a5f502eea67a3f8d733750d1a39`.
+events**. Evidence: `target/codemode-native-query-events-smoke-2/` and
+`target/codemode-query-recovery-final-2/`. Frozen host SHA-256:
+`559fd48b57dc671865205d5a8f1bb5ec6caad69628cb3bbfa3c6e838f8c9bfc7`.
 No full parity, native core-to-adapter smoke, UI/HMR, live-provider, Unix runtime,
 installed-binary, deployment, production restart or RSS/performance claim.
 
