@@ -60,12 +60,12 @@ pub(super) struct Location {
     length: usize,
     digest: [u8; 32],
     id: String,
-    lane: String,
-    run: String,
+    lane: Arc<str>,
+    run: Arc<str>,
 }
 impl Location {
     fn new(reader: Arc<dyn ReadFile>, offset: u64, raw: &[u8], mutation: &SessionMutation) -> Self {
-        let (id, lane, run) = match mutation {
+        let (id, lane, run): (String, String, String) = match mutation {
             SessionMutation::Entry { entry, .. } => {
                 (entry.id().into(), String::new(), String::new())
             }
@@ -92,8 +92,8 @@ impl Location {
             length: raw.len(),
             digest: Sha256::digest(raw).into(),
             id,
-            lane,
-            run,
+            lane: Arc::from(lane),
+            run: Arc::from(run),
         }
     }
     async fn read(&self) -> SessionResult<SessionMutation> {
@@ -117,8 +117,8 @@ impl Location {
             SessionMutation::Entry { entry, .. } => entry.id() == self.id,
             SessionMutation::Record { record } => {
                 record.id() == self.id
-                    && record.lane() == self.lane
-                    && record.run_id().unwrap_or_default() == self.run
+                    && record.lane() == self.lane.as_ref()
+                    && record.run_id().unwrap_or_default() == self.run.as_ref()
             }
             _ => false,
         };
@@ -242,6 +242,9 @@ impl JsonlPayload {
 #[derive(Clone, Default)]
 struct ColdFrames {
     locations: Vec<Arc<Location>>,
+    // Only unretired append locations. Clears do not repeatedly walk all prior
+    // runs; immutable read plans continue owning their original Location Arcs.
+    active: HashMap<String, HashMap<usize, Vec<usize>>>,
 }
 #[derive(Clone)]
 pub(super) struct ResidentState {
@@ -250,6 +253,10 @@ pub(super) struct ResidentState {
     // Only the currently durable batch, consumed by apply_mutation. Custom
     // appenders without receipts simply leave real payloads resident.
     pending: HashMap<u64, Arc<Location>>,
+    // Most consecutive historical frames share one lane and run. Keep at most
+    // these two symbols, not a lifetime-wide interning table.
+    last_frame_lane: Option<Arc<str>>,
+    last_frame_run: Option<Arc<str>>,
 }
 impl Default for ResidentState {
     fn default() -> Self {
@@ -257,6 +264,8 @@ impl Default for ResidentState {
             reducer: IndexedState::new(),
             cold: ColdFrames::default(),
             pending: HashMap::new(),
+            last_frame_lane: None,
+            last_frame_run: None,
         }
     }
 }
@@ -315,7 +324,7 @@ impl ResidentState {
                 self.reducer.reserve_cold_frame(frame)?;
                 self.reducer.retire_cleared_frames(frame);
                 self.cold.retire(frame);
-                self.cold.locations.push(source.clone());
+                self.cold.push(source.clone());
                 return Ok(ApplyOutcome::Record(LaneRecord::AssistantFrame(
                     frame.clone(),
                 )));
@@ -353,6 +362,77 @@ impl ResidentState {
         }
         Ok(self.reducer.into_session_state(entries, frames))
     }
+    /// Facts-only preflight still validates every historical ID/sequence/lane,
+    /// but exports no frame-query capability and needs no payload locations.
+    pub fn reserve_loaded_frame(
+        &mut self,
+        metadata: super::cold_decode::ColdFrame<'_>,
+    ) -> SessionResult<()> {
+        self.reserve_frame_metadata(&metadata)
+    }
+    fn reserve_frame_metadata(
+        &mut self,
+        metadata: &super::cold_decode::ColdFrame<'_>,
+    ) -> SessionResult<()> {
+        self.reducer
+            .reserve_cold_frame_identity(&metadata.id, metadata.seq, &metadata.lane)?;
+        if matches!(
+            metadata.op,
+            AssistantFrameOp::ClearStream | AssistantFrameOp::ClearRun
+        ) {
+            let frame = AssistantFrameRecord {
+                base: RecordBase {
+                    id: metadata.id.to_string(),
+                    seq: metadata.seq,
+                    timestamp: metadata.timestamp,
+                    lane: metadata.lane.to_string(),
+                },
+                run_id: metadata.run_id.to_string(),
+                stream_index: metadata.stream_index,
+                op: metadata.op,
+                frame: None,
+            };
+            self.reducer.retire_cleared_frames(&frame);
+            self.cold.retire(&frame);
+        }
+        Ok(())
+    }
+    /// Apply a validated historical frame without constructing its discarded
+    /// JSON payload or a payload-bearing ApplyOutcome. Hydration still uses the
+    /// original codec and the same digest/reader-generation checks.
+    pub fn apply_loaded_frame(
+        &mut self,
+        metadata: super::cold_decode::ColdFrame<'_>,
+        reader: &Arc<dyn ReadFile>,
+        offset: u64,
+        raw: &[u8],
+    ) -> SessionResult<()> {
+        self.reserve_frame_metadata(&metadata)?;
+        fn symbol(slot: &mut Option<Arc<str>>, value: &str) -> Arc<str> {
+            if let Some(current) = slot.as_ref().filter(|current| current.as_ref() == value) {
+                return current.clone();
+            }
+            let current = Arc::<str>::from(value);
+            *slot = Some(current.clone());
+            current
+        }
+        let lane = symbol(&mut self.last_frame_lane, &metadata.lane);
+        let run = symbol(&mut self.last_frame_run, &metadata.run_id);
+        self.cold.push(Arc::new(Location {
+            reader: reader.clone(),
+            seq: metadata.seq,
+            stream_index: metadata.stream_index,
+            append: metadata.op == AssistantFrameOp::Append,
+            retired: false,
+            offset,
+            length: raw.len(),
+            digest: Sha256::digest(raw).into(),
+            id: metadata.id.into_owned(),
+            lane,
+            run,
+        }));
+        Ok(())
+    }
     pub fn apply_loaded(
         &mut self,
         mutation: SessionMutation,
@@ -360,8 +440,12 @@ impl ResidentState {
         offset: u64,
         raw: &[u8],
     ) -> SessionResult<()> {
-        let source = Arc::new(Location::new(reader.clone(), offset, raw, &mutation));
-        self.apply_source(mutation, Some(source)).map(|_| ())
+        let source = matches!(
+            mutation,
+            SessionMutation::Entry { .. } | SessionMutation::Record { .. }
+        )
+        .then(|| Arc::new(Location::new(reader.clone(), offset, raw, &mutation)));
+        self.apply_source(mutation, source).map(|_| ())
     }
     pub fn bind_append(&mut self, receipt: AppendReceipt, bytes: &[u8]) {
         let mut offset = receipt.offset;
@@ -611,8 +695,8 @@ impl ResidentState {
             selected.extend(
                 iter.filter(|loc| {
                     !loc.retired
-                        && query.lane.as_ref().is_none_or(|v| v == &loc.lane)
-                        && query.run_id.as_ref().is_none_or(|v| v == &loc.run)
+                        && query.lane.as_ref().is_none_or(|v| v == loc.lane.as_ref())
+                        && query.run_id.as_ref().is_none_or(|v| v == loc.run.as_ref())
                         && query.after_seq.is_none_or(|v| loc.seq > v)
                 })
                 .take(query.limit.unwrap_or(usize::MAX))
@@ -631,7 +715,7 @@ impl ResidentState {
         let hot = self.reducer.record_page(query)?;
         let matching = |loc: &&Arc<Location>| {
             !loc.retired
-                && loc.lane == query.lane
+                && loc.lane.as_ref() == query.lane
                 && query.after_seq.is_none_or(|v| loc.seq > v)
                 && query.before_seq.is_none_or(|v| loc.seq < v)
         };
@@ -1182,22 +1266,42 @@ mod context_usage_tests;
 mod tests;
 
 impl ColdFrames {
-    fn retire(&mut self, frame: &AssistantFrameRecord) {
-        if !matches!(
-            frame.op,
-            AssistantFrameOp::ClearStream | AssistantFrameOp::ClearRun
-        ) {
-            return;
+    fn push(&mut self, location: Arc<Location>) {
+        if location.append {
+            if !self.active.contains_key(location.run.as_ref()) {
+                self.active.insert(location.run.to_string(), HashMap::new());
+            }
+            self.active
+                .get_mut(location.run.as_ref())
+                .expect("active run inserted")
+                .entry(location.stream_index)
+                .or_default()
+                .push(self.locations.len());
         }
-        // Plans own their immutable Location generation. Copy only the tiny
-        // location when retiring it, never a payload or the whole index.
-        for loc in &mut self.locations {
-            if loc.append
-                && loc.run == frame.run_id
-                && (frame.op == AssistantFrameOp::ClearRun
-                    || loc.stream_index == frame.stream_index)
-            {
-                Arc::make_mut(loc).retired = true;
+        self.locations.push(location);
+    }
+    fn retire(&mut self, frame: &AssistantFrameRecord) {
+        let streams = match frame.op {
+            AssistantFrameOp::ClearRun => self.active.remove(&frame.run_id),
+            AssistantFrameOp::ClearStream => {
+                let Some(streams) = self.active.get_mut(&frame.run_id) else {
+                    return;
+                };
+                let selected = streams.remove(&frame.stream_index);
+                if streams.is_empty() {
+                    self.active.remove(&frame.run_id);
+                }
+                selected.map(|positions| HashMap::from([(frame.stream_index, positions)]))
+            }
+            _ => return,
+        };
+        // Preserve historical run/stream matching (including across lanes).
+        // IDs remain reserved independently of this disposable lookup index.
+        if let Some(streams) = streams {
+            for positions in streams.into_values() {
+                for position in positions {
+                    Arc::make_mut(&mut self.locations[position]).retired = true;
+                }
             }
         }
     }

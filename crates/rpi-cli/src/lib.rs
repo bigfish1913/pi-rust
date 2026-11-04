@@ -69,6 +69,7 @@ pub mod session_driver;
 pub mod settings;
 mod side_questions;
 pub mod source_info;
+mod startup_diagnostics;
 pub mod themes;
 pub mod timings;
 mod transcript_navigation;

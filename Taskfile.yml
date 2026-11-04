@@ -215,8 +215,30 @@ tasks:
       - cargo build -p rpi-cli --bin rpi --release --locked --target-dir "{{.BUILD_TARGET}}"
       - cargo build -p rpi-tui --example editor_resource_probe --release --locked --target-dir "{{.BUILD_TARGET}}"
       - '{{.PYTHON}} -B scripts/test_resource_smoke.py'
+      - '{{.PYTHON}} -B scripts/test_compare_resources.py'
+      - '{{.PYTHON}} -B scripts/test_resource_tui.py'
       - cargo test -p rpi-tui --lib --example editor_resource_probe --release --locked --target-dir "{{.BUILD_TARGET}}"
       - '{{.PYTHON}} -B scripts/resource-smoke.py --rpi "{{.BINARY}}" --editor-probe "{{.PROBE}}" --diagnostics-dir "{{.DIAGNOSTICS_DIR}}" --profile release {{.CLI_ARGS}}'
+
+  test:cold-start:
+    desc: 回归 701000 append frames + 21733 entries 的历史冷启动、消息查询与旧格式升级（合成数据，无模型调用）
+    vars:
+      DEFAULT_PYTHON: '{{if eq OS "windows"}}python{{else}}python3{{end}}'
+      PYTHON: '{{.RESOURCE_PYTHON | default .DEFAULT_PYTHON}}'
+      BUILD_TARGET: '{{.RESOURCE_CARGO_TARGET_DIR | default "target/resource-tests-cargo"}}'
+      BINARY: '{{.COLD_START_BINARY | default (printf "%s/release/rpi%s" .BUILD_TARGET (ternary ".exe" "" (eq OS "windows")))}}'
+      DEFAULT_DIAGNOSTICS_DIR:
+        sh: '{{.PYTHON}} -B -c "import pathlib, tempfile, uuid; print(pathlib.Path(tempfile.gettempdir()) / (''rpi-cold-start-'' + uuid.uuid4().hex))"'
+      DIAGNOSTICS_DIR: '{{.COLD_START_DIAGNOSTICS_DIR | default .DEFAULT_DIAGNOSTICS_DIR}}'
+    env:
+      RPI_COLD_START_BINARY: '{{.BINARY}}'
+    cmds:
+      - cargo build -p rpi-cli --bin rpi --release -j 1 --locked --offline --target-dir "{{.BUILD_TARGET}}"
+      - '{{.PYTHON}} -B scripts/test_resource_cold_start.py'
+      - '{{.PYTHON}} -B scripts/resource-cold-start.py --candidate "{{.BINARY}}" --output "{{.DIAGNOSTICS_DIR}}-modern" --shapes modern --frames 701000 --entries 21733 --repeats 5 --max-ready-ms 2000 --max-single-ready-ms 3000 {{.CLI_ARGS}}'
+      # Legacy first-open also pays for the checked progress-format upgrade.
+      # Keep its explicit budget separate; do not silently relax the modern SLA.
+      - '{{.PYTHON}} -B scripts/resource-cold-start.py --candidate "{{.BINARY}}" --output "{{.DIAGNOSTICS_DIR}}-legacy" --shapes legacy --frames 701000 --entries 21733 --repeats 5 --max-ready-ms 3500 --max-single-ready-ms 5000 {{.CLI_ARGS}}'
 
   test:resources:live:
     desc: 显式启用真实模型的有界多轮资源回归（需 endpoint/model/凭据环境变量，可能收费）

@@ -487,6 +487,11 @@ impl<P: Clone> IndexedState<P> {
     /// over. The session file keeps them, and a reload retires them here too.
     /// Their IDs stay in `used_ids`: the file still holds them, so they stay taken.
     fn retire_frames(&mut self, run_id: &str, stream_index: Option<usize>, before_seq: u64) {
+        // Cold replay has no resident appends. Do not scan unrelated commit,
+        // operation, or usage records for a retirement that cannot match.
+        if self.hot_append_count == 0 {
+            return;
+        }
         let retired = |record: &LaneRecord| {
             matches!(record, LaneRecord::AssistantFrame(frame)
                 if frame.op == AssistantFrameOp::Append
@@ -496,16 +501,30 @@ impl<P: Clone> IndexedState<P> {
         };
         // Everything before the first retired frame keeps its index.
         let Some(first) = self.records.iter().position(retired) else {
+            #[cfg(test)]
+            {
+                self.retire_record_checks += self.records.len();
+            }
             return;
         };
+        #[cfg(test)]
+        {
+            self.retire_record_checks += first + 1;
+        }
         let mut moved = vec![None; self.records.len() - first];
         let mut kept = first;
         let tail = self.records.split_off(first);
         for (offset, record) in tail.into_iter().enumerate() {
+            #[cfg(test)]
+            {
+                self.retire_record_checks += 1;
+            }
             if !retired(&record) {
                 moved[offset] = Some(kept);
                 kept += 1;
                 self.records.push(record);
+            } else {
+                self.hot_append_count -= 1;
             }
         }
         // The log lists records in order, so only its tail can name a moved one.
@@ -535,6 +554,11 @@ impl<P: Clone> IndexedState<P> {
 }
 
 impl<P: Clone> IndexedState<P> {
+    #[cfg(test)]
+    pub(crate) fn retire_record_checks(&self) -> usize {
+        self.retire_record_checks
+    }
+
     pub(crate) fn retire_cleared_frames(
         &mut self,
         frame: &crate::session::types::AssistantFrameRecord,
@@ -561,6 +585,13 @@ impl<P: Clone> IndexedState<P> {
         let cold_seqs: Vec<_> = cold_records.iter().map(LaneRecord::seq).collect();
         self.records.extend(cold_records);
         self.records.sort_unstable_by_key(LaneRecord::seq);
+        self.hot_append_count = self
+            .records
+            .iter()
+            .filter(|record| {
+                matches!(record, LaneRecord::AssistantFrame(frame) if frame.op == AssistantFrameOp::Append)
+            })
+            .count();
         let positions: HashMap<_, _> = self
             .records
             .iter()
@@ -591,6 +622,9 @@ impl<P: Clone> IndexedState<P> {
                 entries_by_id: self.entries_by_id,
                 nearest_user: self.nearest_user,
                 records: self.records,
+                hot_append_count: self.hot_append_count,
+                #[cfg(test)]
+                retire_record_checks: self.retire_record_checks,
                 open_operations_by_lane: self.open_operations_by_lane,
                 lanes: self.lanes,
                 log: self.log,

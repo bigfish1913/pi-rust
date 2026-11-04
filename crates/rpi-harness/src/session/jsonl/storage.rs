@@ -97,6 +97,10 @@ pub struct JsonlSessionFacts {
 enum ReadPolicy {
     Restore,
     ReadOnly,
+    /// Private, capability-free facts replay only: never export its storage.
+    /// Recovery acceptance matches ReadOnly, but recognized cold frames need
+    /// only reserve reducer metadata, not retain hydration locations.
+    FactsOnly,
     ResourceTransitionStrict,
     SavedReadCold(std::time::Instant),
 }
@@ -319,15 +323,15 @@ impl JsonlSessionStorage {
     }
 
     /// Inspect metadata and session values without repairs, writer ownership or
-    /// historical frame hydration. Cold replay is independent of repair policy;
-    /// readerless filesystems retain their normal eager fallback.
+    /// historical frame hydration. The private facts replay omits recognized
+    /// cold-frame locations; readerless filesystems keep the eager fallback.
     pub async fn read_facts(
         fs: Arc<dyn FileSystem>,
         path: &str,
         clock: Arc<dyn Clock>,
         ids: Arc<dyn IdGenerator>,
     ) -> SessionResult<JsonlSessionFacts> {
-        Self::load_impl(fs, path, clock, ids, ReadPolicy::ReadOnly)
+        Self::load_impl(fs, path, clock, ids, ReadPolicy::FactsOnly)
             .await?
             .facts()
             .await
@@ -2763,6 +2767,267 @@ mod tests {
         assert_eq!(got.id(), "e1");
     }
 
+    fn facts_test_frame(
+        id: &str,
+        seq: u64,
+        lane: &str,
+        op: crate::session::types::AssistantFrameOp,
+    ) -> String {
+        encode_mutation(&SessionMutation::Record {
+            record: LaneRecord::AssistantFrame(crate::session::types::AssistantFrameRecord {
+                base: RecordBase {
+                    id: id.into(),
+                    seq,
+                    lane: lane.into(),
+                    timestamp: 1,
+                },
+                run_id: "facts-run".into(),
+                stream_index: 0,
+                op,
+                frame: Some(serde_json::json!({"payload": "discarded", "nested": [1, null]})),
+            }),
+        })
+    }
+
+    fn facts_test_history() -> String {
+        use crate::session::types::AssistantFrameOp;
+        let mut text = encode_header(&header());
+        for (seq, op) in [
+            (1, AssistantFrameOp::Append),
+            (2, AssistantFrameOp::ClearStream),
+            (3, AssistantFrameOp::Append),
+            (4, AssistantFrameOp::ClearRun),
+            (5, AssistantFrameOp::Append),
+            (6, AssistantFrameOp::CommitStream),
+        ] {
+            text.push_str(&facts_test_frame(&format!("frame-{seq}"), seq, "main", op));
+        }
+        for seq in 7..=8 {
+            text.push_str(&encode_mutation(&SessionMutation::Entry {
+                seq,
+                timestamp: 1,
+                lane: Some("main".into()),
+                entry: Entry::Custom(crate::session::types::CustomEntry {
+                    base: crate::session::types::EntryBase {
+                        entry_type: "custom".into(),
+                        id: format!("value-{seq}"),
+                        seq,
+                        parent_id: (seq == 8).then(|| "value-7".into()),
+                        timestamp: 1,
+                    },
+                    custom_type: crate::session::values::VALUE_CUSTOM_TYPE.into(),
+                    data: Some(serde_json::json!({"key": "facts-key", "value": seq})),
+                }),
+            }));
+        }
+        text.push_str(&facts_test_frame(
+            "frame-10",
+            10,
+            "main",
+            AssistantFrameOp::Append,
+        ));
+        text
+    }
+
+    #[tokio::test]
+    async fn facts_only_matches_read_only_without_cold_frame_locations() {
+        for damage in [
+            "none",
+            "torn",
+            "duplicate",
+            "reordered-duplicate",
+            "unterminated",
+            "duplicate-key-fallback",
+            "skipped-frame-schema",
+        ] {
+            let mut text = facts_test_history();
+            let first = text.lines().nth(1).unwrap().to_owned();
+            match damage {
+                "torn" => text.push_str("{unacknowledged"),
+                "duplicate" => text.push_str(&format!("{first}\n")),
+                "reordered-duplicate" => {
+                    let value: serde_json::Value = serde_json::from_str(&first).unwrap();
+                    let mut fields: Vec<_> = value.as_object().unwrap().iter().collect();
+                    fields.reverse();
+                    let reordered = fields
+                        .into_iter()
+                        .map(|(key, value)| {
+                            format!("{}:{value}", serde_json::to_string(key).unwrap())
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    text.push_str(&format!("{{{reordered}}}\n"));
+                }
+                "unterminated" => {
+                    text.pop();
+                }
+                "duplicate-key-fallback" => {
+                    let fallback = first.replacen('{', "{\"id\":\"ignored\",", 1);
+                    assert!(super::super::cold_decode::parse_cold_frame(&fallback).is_none());
+                    assert!(parse_mutation(&fallback).is_ok());
+                    text = text.replacen(&first, &fallback, 1);
+                }
+                "skipped-frame-schema" => {
+                    let mut value: serde_json::Value = serde_json::from_str(&first).unwrap();
+                    value["streamIndex"] = serde_json::json!("bad");
+                    text = text.replacen(&first, &value.to_string(), 1);
+                }
+                _ => {}
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("facts-policy.jsonl");
+            std::fs::write(&path, &text).unwrap();
+            let fs: Arc<dyn FileSystem> =
+                Arc::new(rpi_tools::OsExecutionEnv::with_cwd(dir.path().into()));
+            let clock: Arc<dyn Clock> = Arc::new(FakeClock::new());
+            let ids: Arc<dyn IdGenerator> = Arc::new(CounterIdGenerator::new());
+            let mut loaded = Vec::new();
+            for policy in [ReadPolicy::ReadOnly, ReadPolicy::FactsOnly] {
+                loaded.push(
+                    JsonlSessionStorage::load_impl(
+                        fs.clone(),
+                        path.to_str().unwrap(),
+                        clock.clone(),
+                        ids.clone(),
+                        policy,
+                    )
+                    .await
+                    .unwrap(),
+                );
+            }
+            let ordinary = loaded[0].facts().await.unwrap();
+            let minimal = loaded[1].facts().await.unwrap();
+            assert_eq!(ordinary.values, minimal.values, "{damage}");
+            assert_eq!(minimal.values.get("facts-key"), Some(&serde_json::json!(8)));
+            assert_eq!(
+                format!("{:?}", ordinary.metadata),
+                format!("{:?}", minimal.metadata)
+            );
+            assert_eq!(
+                loaded[0].legacy_history_digest,
+                Some(Sha256::digest(text.as_bytes()).into())
+            );
+            // FactsOnly is private and exports no upgrade capability. The
+            // normal loader must retain the exact legacy guard unchanged.
+            assert_eq!(loaded[1].legacy_history_digest, None);
+            {
+                let full = loaded[0].state.lock().await;
+                let minimal = loaded[1].state.lock().await;
+                assert_eq!(full.sequence(), minimal.sequence());
+                assert_eq!(full.get_lanes(), minimal.get_lanes());
+            }
+            if damage == "none" {
+                // Only CommitStream is resident in either reducer; only the
+                // ReadOnly handle retains historical frame-read locations.
+                assert_eq!(
+                    loaded[1]
+                        .find_records(&RecordQuery::default())
+                        .await
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                assert!(
+                    loaded[0]
+                        .find_records(&RecordQuery::default())
+                        .await
+                        .unwrap()
+                        .len()
+                        > 1
+                );
+            }
+            let public =
+                JsonlSessionStorage::read_facts(fs.clone(), path.to_str().unwrap(), clock, ids)
+                    .await
+                    .unwrap();
+            assert_eq!(public.values, ordinary.values);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "{damage}");
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn facts_only_rejects_the_same_corruption_as_read_only() {
+        use crate::session::types::AssistantFrameOp;
+        for damage in [
+            "used-frame-id",
+            "used-entry-id",
+            "missing-lane",
+            "conflicting-seq",
+            "middle-syntax",
+            "entry-schema",
+            "missing-progress",
+        ] {
+            let mut text = facts_test_history();
+            match damage {
+                "used-frame-id" => text.push_str(&facts_test_frame(
+                    "frame-1",
+                    11,
+                    "main",
+                    AssistantFrameOp::Append,
+                )),
+                "used-entry-id" => {
+                    let mut entry: serde_json::Value =
+                        serde_json::from_str(text.lines().nth(7).unwrap()).unwrap();
+                    entry["id"] = serde_json::json!("frame-1");
+                    entry["seq"] = serde_json::json!(11);
+                    text.push_str(&format!("{entry}\n"));
+                }
+                "missing-lane" => text.push_str(&facts_test_frame(
+                    "bad-lane",
+                    11,
+                    "missing",
+                    AssistantFrameOp::Append,
+                )),
+                "conflicting-seq" => text.push_str(&facts_test_frame(
+                    "conflict",
+                    1,
+                    "main",
+                    AssistantFrameOp::Append,
+                )),
+                "middle-syntax" => {
+                    let first = text.lines().nth(1).unwrap().to_owned();
+                    text = text.replacen(&first, "{broken", 1);
+                }
+                "entry-schema" => text.push_str("{\"kind\":\"entry\"}\n"),
+                "missing-progress" => {
+                    let mut required = header();
+                    required.progress_format = Some(super::super::progress::FORMAT.into());
+                    let first = text.lines().next().unwrap().to_owned();
+                    text = text.replacen(&first, encode_header(&required).trim_end(), 1);
+                }
+                _ => unreachable!(),
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("bad-facts-policy.jsonl");
+            std::fs::write(&path, &text).unwrap();
+            let fs: Arc<dyn FileSystem> =
+                Arc::new(rpi_tools::OsExecutionEnv::with_cwd(dir.path().into()));
+            let mut errors = Vec::new();
+            for policy in [ReadPolicy::ReadOnly, ReadPolicy::FactsOnly] {
+                match JsonlSessionStorage::load_impl(
+                    fs.clone(),
+                    path.to_str().unwrap(),
+                    Arc::new(FakeClock::new()),
+                    Arc::new(CounterIdGenerator::new()),
+                    policy,
+                )
+                .await
+                {
+                    Ok(_) => panic!("{damage} must be rejected"),
+                    Err(error) => errors.push(error),
+                }
+            }
+            // Duplicate identity failures retain their original AlreadyExists
+            // code; malformed history uses InvalidEntry. Compare to the normal
+            // reader rather than imposing a new error classification.
+            assert_eq!(errors[0].code, errors[1].code, "{damage}");
+            assert_eq!(errors[0].to_string(), errors[1].to_string(), "{damage}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "{damage}");
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        }
+    }
+
     #[tokio::test]
     async fn read_facts_keeps_preflight_frames_cold_and_source_untouched() {
         use crate::session::types::{AssistantFrameOp, AssistantFrameRecord};
@@ -2842,8 +3107,9 @@ mod tests {
                 facts.values.get("rpi.resource-selection.v1"),
                 Some(&serde_json::json!(3))
             );
-            // Inspect the same production replay policy: only CommitStream is
-            // hot, while the historical Append remains a cold location.
+            // ReadOnly remains fully capable; the facts-only handles below
+            // are private test probes and are never returned by a public API.
+            // Only CommitStream is hot, while Append retains a cold location.
             let loaded = JsonlSessionStorage::load_impl(
                 fs,
                 path.to_str().unwrap(),

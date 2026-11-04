@@ -23,6 +23,7 @@ use rpi_ai::types::{ImageContent, ImageContentType};
 use crate::args::{parse_args, print_help, print_version, resolve_mode, Args, RunMode};
 use crate::provider::{resolve_with_extensions, ResolveError};
 use crate::session::{build_prepared, prepare_extensions, BuildError};
+use crate::startup_diagnostics::{Phase, StartupSpan};
 
 /// The exit code for a usage/parse error. (TS `main.ts` uses `process.exit(1)`
 /// for most error paths; v1 distinguishes usage errors with the conventional
@@ -80,6 +81,7 @@ pub async fn run() -> i32 {
 }
 
 async fn run_inner() -> i32 {
+    let startup = StartupSpan::start(Phase::StartupToHarness);
     // argv[0] is the program name; skip it (TS `main(args)` receives the same,
     // already sliced by the Node CLI entry).
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
@@ -325,7 +327,9 @@ async fn run_inner() -> i32 {
     // The peek and the build both derive their selection from this frozen root,
     // so they can never inspect one session and open another.
     let selection = crate::session::select_session_in_dir(&parsed, session_root);
+    let cwd_lookup = StartupSpan::start(Phase::CwdLookup);
     let restored_cwd = crate::session::peek_restored_session_cwd(&selection, &cwd).await;
+    cwd_lookup.finish();
     // Pin the session the peek resolved: `-c` re-lists the directory when the
     // build runs, and another `rpi` may have written a newer session in
     // between. Adopting one session's directory while opening another would
@@ -391,6 +395,7 @@ async fn run_inner() -> i32 {
         Ok(extension) => extension,
         Err(code) => return code,
     };
+    let extension_prepare = StartupSpan::start(Phase::ExtensionPrepare);
     let prepared = match prepare_extensions(&parsed, &cwd, project_trusted) {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -398,6 +403,8 @@ async fn run_inner() -> i32 {
             return EXIT_RUNTIME;
         }
     };
+    extension_prepare.finish();
+    let model_resolve = StartupSpan::start(Phase::ModelResolve);
     let resolved = match resolve_with_extensions(
         &parsed,
         &cwd,
@@ -414,6 +421,7 @@ async fn run_inner() -> i32 {
         }
     };
 
+    model_resolve.finish();
     for warning in &resolved.compat_warnings {
         eprintln!("warning: models.json: {warning}");
     }
@@ -452,6 +460,7 @@ async fn run_inner() -> i32 {
     }
 
     // ---- harness build ----
+    let harness_build = StartupSpan::start(Phase::HarnessBuild);
     let (harness, event_rx, mut reload_context) =
         match build_prepared(&resolved, &parsed, &cwd, project_trusted, prepared).await {
             Ok(triple) => triple,
@@ -460,6 +469,8 @@ async fn run_inner() -> i32 {
                 return EXIT_RUNTIME;
             }
         };
+    harness_build.finish();
+    startup.finish();
     reload_context.dev_extension = dev_extension;
 
     // ---- post-load stdin claim + initial message ----
@@ -626,15 +637,18 @@ async fn run_inner() -> i32 {
             // up on SessionShutdown, exactly as in interactive mode. This is why
             // `rpi --server` works headless: the SessionStart hook fires and the
             // extension brings up the TCP server.
+            let before_start = StartupSpan::start(Phase::BeforeStartHooks);
             let veto = crate::session::dispatch_session_event_async(
                 &reload_context,
                 rpi_plugin_sdk::EventTag::BeforeTuiStart,
             )
             .await;
+            before_start.finish();
             if let Some(reason) = veto {
                 eprintln!("[rpi] startup vetoed by extension: {reason}");
                 EXIT_VETOED
             } else {
+                let session_start = StartupSpan::start(Phase::SessionStartHooks);
                 if let Some(reason) = crate::session::dispatch_session_event_async(
                     &reload_context,
                     rpi_plugin_sdk::EventTag::SessionStart,
@@ -645,6 +659,7 @@ async fn run_inner() -> i32 {
                         "[rpi] extension vetoed SessionStart (headless, advisory): {reason}"
                     );
                 }
+                session_start.finish();
 
                 let code = if parsed.unknown_flags.contains_key("server") || stdio_claimed {
                     // Server mode OR a plugin-claimed stdio server: the extension

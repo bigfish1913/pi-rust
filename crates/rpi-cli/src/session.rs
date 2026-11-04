@@ -65,6 +65,7 @@ use crate::resource_dirs::{
     load_prompt_templates_with_precedence, load_skills_with_precedence, project_extension_dirs,
     project_prompt_template_dirs, project_skill_dirs, prompt_template_dirs, skill_dirs,
 };
+use crate::startup_diagnostics::{Phase, StartupSpan};
 use rpi_extensions::{
     emit_resources_discover, ExtensionEmitter, ExtensionSession, NullDiagnostics,
     PluginDiagnostics, PluginToolAdapter, TeeEmitter, ToolPromptMetadata,
@@ -472,6 +473,7 @@ pub(crate) fn preflight_extension_startup(
                             clock: Arc::new(SystemClock),
                             ids: Arc::new(DefaultIdGenerator::new()),
                         });
+                        let binding_facts = StartupSpan::start(Phase::BindingFacts);
                         let facts = if resources.as_ref().is_some_and(|r| r.transition.is_some()) {
                             rpi_harness::session::jsonl::JsonlSessionStorage::read_resource_transition_facts(
                                 Arc::new(OsExecutionEnv::with_cwd(cwd.to_path_buf())), &meta.path,
@@ -484,6 +486,7 @@ pub(crate) fn preflight_extension_startup(
                             resources.as_ref(),
                         )
                         .map_err(BuildError::SessionOpen)?;
+                        binding_facts.finish();
                         Ok(match selection {
                             SessionSelection::Fork { .. } => SessionSelection::Fork {
                                 source: meta.path,
@@ -618,6 +621,7 @@ pub fn prepare_extensions(
         editor_text_mailbox.clone(),
     );
 
+    let extension_register = StartupSpan::start(Phase::ExtensionRegister);
     let extension_session = if let Some(selected) = &resource_selection {
         let session = rpi_extensions::load_session_mixed_guarded(
             &[],
@@ -642,6 +646,7 @@ pub fn prepare_extensions(
     } else {
         load_extensions(args, cwd, project_trusted, Some(Arc::clone(&action_bridge)))
     };
+    extension_register.finish();
     if args.verbose {
         if let Some(s) = extension_session.summary() {
             eprintln!("extensions: {s}");
@@ -1301,9 +1306,11 @@ pub async fn build_prepared(
                 "changes": "restart-required"
             }),
         );
+        let resource_observation = StartupSpan::start(Phase::ResourceObservation);
         crate::resource_selection::get_resource_state(&harness)
             .await
             .map_err(BuildError::HarnessCreate)?;
+        resource_observation.finish();
         if selected.transition.is_some() {
             // Re-read persisted facts at commit, not merely the startup mirror.
             // The canonical OS writer claim acquired before registration is
@@ -1348,9 +1355,11 @@ pub async fn build_prepared(
                 ));
             }
         }
+        let inventory_bind = StartupSpan::start(Phase::InventoryBind);
         crate::resource_selection::bind_inventory(&harness, selected)
             .await
             .map_err(BuildError::SessionOpen)?;
+        inventory_bind.finish();
     }
     // Publish only after exact resources have been sealed and validated.
     crate::extensions_actions::HarnessActionHost::set_harness(
@@ -2823,9 +2832,14 @@ async fn restore_session(selection: &SessionSelection, cwd: &str) -> Result<Sess
         };
     };
     let sessions_root = selection_dir(selection);
-    open_session(&meta, cwd, &sessions_root)
+    let writer_restore = StartupSpan::start(Phase::WriterRestore);
+    let result = open_session(&meta, cwd, &sessions_root)
         .await
-        .map(|restored| restored.session)
+        .map(|restored| restored.session);
+    if result.is_ok() {
+        writer_restore.finish();
+    }
+    result
 }
 
 /// The sessions root a selection was resolved against.
@@ -3075,9 +3089,15 @@ pub(crate) async fn list_session_metadata_in_dir(
         clock: Arc::new(SystemClock),
         ids: Arc::new(DefaultIdGenerator::new()),
     });
-    repo.list_typed(&JsonlSessionListOptions::default())
+    let metadata_lookup = StartupSpan::start(Phase::MetadataLookup);
+    let result = repo
+        .list_typed(&JsonlSessionListOptions::default())
         .await
-        .map_err(|e| BuildError::SessionDir(format!("list sessions: {e}")))
+        .map_err(|e| BuildError::SessionDir(format!("list sessions: {e}")));
+    if result.is_ok() {
+        metadata_lookup.finish();
+    }
+    result
 }
 
 /// A cheap, display-oriented summary of one JSONL session file.
