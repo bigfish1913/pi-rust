@@ -66,6 +66,8 @@ class RefreshTests(unittest.TestCase):
             self.assertEqual(text.count(f"https://assets.bigfisharc.cn/images/support/{name}"), 2)
         self.assertEqual(len(images.DATED_URL.findall(text)), 2)
         self.assertNotIn("{date}", text)
+        self.assertIn('src="https://assets.bigfisharc.cn/images/support/tg.png"', text)
+        self.assertNotIn('src="docs/images/tg.png"', text)
         self.assertIn("https://contrib.rocks/image?repo=bigfish1913/pi-rust", text)
         self.assertIn("https://github.com/bigfish1913/pi-rust/graphs/contributors", text)
 
