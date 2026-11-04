@@ -1,6 +1,7 @@
 //! Bounded physical-line scanner and atomic span-copy repair. Offsets always
 //! refer to the reader generation that validated them, never the published path.
 use super::*;
+use crate::session::types::AssistantFrameOp;
 use rpi_tools::env::ReadFile;
 const CHUNK: usize = 1024 * 1024;
 
@@ -182,6 +183,40 @@ impl JsonlSessionStorage {
         let mut repair = false;
         let mut terminated = header_newline;
         let mut line_no = 1;
+        // One cheap pre-scan identifies run-wide retirement markers before the
+        // replay builds cold payload Locations. Only a strictly increasing set
+        // of marker seqs is accepted: duplicate/stale markers disable the
+        // optimization, leaving the canonical duplicate/corruption rules to
+        // the authoritative replay below.
+        if !strict {
+            let mut preview = Scanner::new(reader.clone(), length);
+            preview.policy = policy;
+            preview.hash_enabled = false;
+            let _ = preview.next().await?;
+            let mut max_seq = 0u64;
+            let mut clean = true;
+            let mut runs = Vec::new();
+            while let Some((_, raw, _, _)) = preview.next().await? {
+                if let Ok(line) = std::str::from_utf8(&raw) {
+                    if let Some((seq, run)) = super::super::cold_decode::parse_cold_clear_run(line)
+                    {
+                        if seq <= max_seq {
+                            clean = false;
+                            break;
+                        }
+                        max_seq = seq;
+                        runs.push(run);
+                    }
+                }
+                preview.recycle(raw);
+            }
+            if clean {
+                let mut state = storage.state.lock().await;
+                for run in runs {
+                    state.activate_terminal_clear_run(&run);
+                }
+            }
+        }
         while let Some((offset, raw, last, newline)) = scan.next().await? {
             line_no += 1;
             policy.check((line_no - 1) as usize)?;
@@ -209,6 +244,13 @@ impl JsonlSessionStorage {
                     // full decoder/reducer path below.
                     let applied = if matches!(policy, ReadPolicy::FactsOnly) {
                         state.reserve_loaded_frame(frame)
+                    } else if frame.op == AssistantFrameOp::Append
+                        && state.has_terminal_clear(frame.run_id.as_ref())
+                    {
+                        // Its future clear was validated by the pre-scan. Keep
+                        // the append-only ID/sequence contract without indexing
+                        // a payload that no reader can reach after replay.
+                        state.reserve_retired_loaded_frame(frame)
                     } else {
                         state.apply_loaded_frame(frame, &reader, offset, &raw)
                     };
@@ -263,15 +305,27 @@ impl JsonlSessionStorage {
                     }
                     let seq = mutation.seq();
                     let mutation = chain_onto_lane_leaf(mutation, &state);
-                    state
-                        .apply_loaded(mutation, &reader, offset, &raw)
-                        .map_err(|error| {
-                            if error.code == SessionErrorCode::InvalidEntry {
-                                invalid_file(path, line_no, &error)
-                            } else {
-                                error
-                            }
-                        })?;
+                    let retired_append = match &mutation {
+                        SessionMutation::Record {
+                            record: LaneRecord::AssistantFrame(frame),
+                        } => {
+                            frame.op == AssistantFrameOp::Append
+                                && state.has_terminal_clear(&frame.run_id)
+                        }
+                        _ => false,
+                    };
+                    let applied = if retired_append {
+                        state.reserve_retired_mutation(&mutation)
+                    } else {
+                        state.apply_loaded(mutation, &reader, offset, &raw)
+                    };
+                    applied.map_err(|error| {
+                        if error.code == SessionErrorCode::InvalidEntry {
+                            invalid_file(path, line_no, &error)
+                        } else {
+                            error
+                        }
+                    })?;
                     seen.insert(seq, (offset, raw.len()));
                     spans.push((offset, raw.len() as u64));
                 }

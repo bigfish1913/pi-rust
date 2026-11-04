@@ -41,6 +41,39 @@ pub(super) fn parse_cold_frame(line: &str) -> Option<ColdFrame<'_>> {
     Some(frame)
 }
 
+/// Pre-scan hint for a run-wide retirement marker. A recognized marker is
+/// validated as a complete JSON document; the authoritative replay still
+/// applies its seq/duplicate/corruption rules. Any stale marker disables the
+/// speculative retirement optimization in the caller.
+pub(super) fn parse_cold_clear_run(line: &str) -> Option<(u64, String)> {
+    let prefix = line.trim_start();
+    if !prefix.starts_with('{')
+        || !prefix.contains("kind")
+        || !prefix.contains("\"record\"")
+        || !prefix.contains("type")
+        || !prefix.contains("\"assistant_frame\"")
+        || !prefix.contains("op")
+        || !prefix.contains("\"clear_run\"")
+        || !prefix.contains("runId")
+        || !prefix.contains("seq")
+    {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    let valid = value.get("kind").and_then(|v| v.as_str()) == Some("record")
+        && value.get("type").and_then(|v| v.as_str()) == Some("assistant_frame")
+        && value.get("op").and_then(|v| v.as_str()) == Some("clear_run");
+    if !valid {
+        return None;
+    }
+    let seq = value
+        .get("seq")
+        .and_then(|v| v.as_u64())
+        .filter(|v| *v > 0)?;
+    let run = value.get("runId").and_then(|v| v.as_str())?.to_owned();
+    Some((seq, run))
+}
+
 /// Unlike Deserialize for Cow itself, preserve strings borrowed from the input
 /// whenever serde_json can expose them without unescaping.
 struct WireString<'a>(Cow<'a, str>);

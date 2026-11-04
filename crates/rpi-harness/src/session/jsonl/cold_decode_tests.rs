@@ -438,6 +438,47 @@ fn ordinary_kind_hint_never_replaces_complete_codec_validation() {
 }
 
 #[test]
+fn terminal_clear_hint_only_matches_a_complete_clear_run_row() {
+    let mut clear = row();
+    clear["op"] = json!("clear_run");
+    let canonical = clear.to_string();
+    assert_eq!(
+        parse_cold_clear_run(&canonical),
+        Some((1, "run-1".to_owned()))
+    );
+    let fields: Vec<_> = clear
+        .as_object()
+        .unwrap()
+        .iter()
+        .rev()
+        .map(|(key, value)| format!("{key:?}: {value}"))
+        .collect();
+    let reordered = format!(" {{ {} }} ", fields.join(", "));
+    assert_eq!(
+        parse_mutation(&reordered).unwrap(),
+        parse_mutation(&canonical).unwrap(),
+        "reordered row must remain a valid equivalent mutation"
+    );
+    assert_eq!(
+        parse_cold_clear_run(&reordered),
+        Some((1, "run-1".to_owned())),
+        "key order and whitespace must not lose a terminal clear"
+    );
+    for op in ["append", "clear_stream", "commit_stream"] {
+        let mut other = clear.clone();
+        other["op"] = json!(op);
+        assert_eq!(parse_cold_clear_run(&other.to_string()), None);
+    }
+    let mut broken = canonical.clone();
+    broken.push_str(" trailing");
+    assert_eq!(parse_cold_clear_run(&broken), None);
+    assert_eq!(
+        parse_cold_clear_run("{\"kind\":\"entry\",\"runId\":\"run-1\"}"),
+        None
+    );
+}
+
+#[test]
 fn uncommon_enum_maps_are_conservatively_left_to_reference() {
     let mut value = row();
     for op in ["append", "clear_stream", "clear_run", "commit_stream"] {

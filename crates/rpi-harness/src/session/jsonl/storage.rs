@@ -77,10 +77,10 @@ use crate::session::jsonl::types::{JsonlSessionMetadata, JsonlV4Header};
 use crate::session::memory::{stamp_record, Clock};
 use crate::session::state::ApplyOutcome;
 use crate::session::types::{
-    provisioned_into_entry, BranchBounds, Entry, EntryQuery, ForkOptions, IdGenerator, LanePointer,
-    LaneRecord, LogItem, LogOptions, OperationStartedRecord, ProvisionedEntry, RecordQuery,
-    SessionLaneBranch, SessionMetadata, SessionMutation, SessionStats, SessionStorage,
-    TranscriptPage, TranscriptPageQuery,
+    provisioned_into_entry, AssistantFrameOp, BranchBounds, Entry, EntryQuery, ForkOptions,
+    IdGenerator, LanePointer, LaneRecord, LogItem, LogOptions, OperationStartedRecord,
+    ProvisionedEntry, RecordQuery, SessionLaneBranch, SessionMetadata, SessionMutation,
+    SessionStats, SessionStorage, TranscriptPage, TranscriptPageQuery,
 };
 
 /// Read-only native facts for startup preflight. No storage/file capability is
@@ -182,6 +182,10 @@ impl Clone for JsonlSessionStorage {
 }
 
 impl JsonlSessionStorage {
+    #[cfg(test)]
+    pub(super) fn state(&self) -> Arc<tokio::sync::Mutex<ResidentState>> {
+        self.state.clone()
+    }
     /// Replace the append handle. Test-only: lets a probe make the backend
     /// refuse or tear a write without a real disk fault.
     #[cfg(test)]
@@ -507,6 +511,29 @@ impl JsonlSessionStorage {
         let mut kept_lines: Vec<&str> = Vec::new();
         let mut dropped_duplicates = false;
         let mut seen_lines: HashMap<u64, &str> = HashMap::new();
+        // Same conservative marker pre-scan as the streaming path; custom
+        // readers without stable ranged reads use this eager compatibility path.
+        if !strict {
+            let mut max_seq = 0u64;
+            let mut clean = true;
+            let mut runs = Vec::new();
+            for line in physical_lines.iter().skip(1) {
+                if let Some((seq, run)) = super::cold_decode::parse_cold_clear_run(line) {
+                    if seq <= max_seq {
+                        clean = false;
+                        break;
+                    }
+                    max_seq = seq;
+                    runs.push(run);
+                }
+            }
+            if clean {
+                let mut state = storage.state.lock().await;
+                for run in runs {
+                    state.activate_terminal_clear_run(&run);
+                }
+            }
+        }
         for (idx, line) in physical_lines.iter().enumerate().skip(1) {
             policy.check(idx)?;
             let line_no = (idx + 1) as u32;
@@ -551,19 +578,32 @@ impl JsonlSessionStorage {
                     }
                     let original_seq = mutation.seq();
                     let mutation = chain_onto_lane_leaf(mutation, &state);
-                    let applied = match (&frame_reader, &mutation) {
-                        (
-                            Some(reader),
-                            SessionMutation::Record {
-                                record: LaneRecord::AssistantFrame(_),
-                            },
-                        ) => {
-                            // All replay may stay cold: read_snapshot explicitly
-                            // hydrates into capability-free state before returning.
-                            let offset = line.as_ptr() as usize - content.as_ptr() as usize;
-                            state.apply_loaded(mutation, reader, offset as u64, line.as_bytes())
+                    let retired_append = match &mutation {
+                        SessionMutation::Record {
+                            record: LaneRecord::AssistantFrame(frame),
+                        } => {
+                            frame.op == AssistantFrameOp::Append
+                                && state.has_terminal_clear(&frame.run_id)
                         }
-                        _ => state.apply_mutation(mutation).map(|_| ()),
+                        _ => false,
+                    };
+                    let applied = if retired_append {
+                        state.reserve_retired_mutation(&mutation)
+                    } else {
+                        match (&frame_reader, &mutation) {
+                            (
+                                Some(reader),
+                                SessionMutation::Record {
+                                    record: LaneRecord::AssistantFrame(_),
+                                },
+                            ) => {
+                                // All replay may stay cold: read_snapshot
+                                // hydrates into capability-free state.
+                                let offset = line.as_ptr() as usize - content.as_ptr() as usize;
+                                state.apply_loaded(mutation, reader, offset as u64, line.as_bytes())
+                            }
+                            _ => state.apply_mutation(mutation).map(|_| ()),
+                        }
                     };
                     if let Err(e) = applied {
                         if e.code == SessionErrorCode::InvalidEntry {
@@ -3951,3 +3991,7 @@ mod tests {
             .expect("drain must complete once the append settled");
     }
 }
+
+#[cfg(test)]
+#[path = "issue12_probe.rs"]
+mod issue12_probe;

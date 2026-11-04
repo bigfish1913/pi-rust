@@ -257,6 +257,9 @@ pub(super) struct ResidentState {
     // these two symbols, not a lifetime-wide interning table.
     last_frame_lane: Option<Arc<str>>,
     last_frame_run: Option<Arc<str>>,
+    // Runs whose append bodies are retired by a later clear_run. Filled only
+    // by a conservative load pre-scan; live appends use incremental retirement.
+    terminal_clears: std::collections::HashSet<String>,
 }
 impl Default for ResidentState {
     fn default() -> Self {
@@ -266,6 +269,7 @@ impl Default for ResidentState {
             pending: HashMap::new(),
             last_frame_lane: None,
             last_frame_run: None,
+            terminal_clears: Default::default(),
         }
     }
 }
@@ -281,6 +285,18 @@ impl DerefMut for ResidentState {
     }
 }
 impl ResidentState {
+    #[cfg(test)]
+    pub(super) fn cold_locations(&self) -> Vec<(String, bool)> {
+        self.cold
+            .locations
+            .iter()
+            .map(|location| (location.run.to_string(), location.append))
+            .collect()
+    }
+    #[cfg(test)]
+    pub(super) fn active_run(&self, run: &str) -> bool {
+        self.cold.active.contains_key(run)
+    }
     #[cfg(test)]
     pub(super) fn assert_cold_shared(&self, ids: &[String]) -> Arc<dyn ReadFile> {
         assert!(
@@ -396,6 +412,33 @@ impl ResidentState {
             self.cold.retire(&frame);
         }
         Ok(())
+    }
+    pub fn activate_terminal_clear_run(&mut self, run_id: &str) {
+        self.terminal_clears.insert(run_id.to_owned());
+    }
+    pub fn has_terminal_clear(&self, run_id: &str) -> bool {
+        self.terminal_clears.contains(run_id)
+    }
+    /// Reserve only the durable identity of an append whose payload a known
+    /// later `clear_run` retires. No cold Location, digest, or record/log row
+    /// is created for an unreachable historical body; its ID stays reserved.
+    pub fn reserve_retired_loaded_frame(
+        &mut self,
+        metadata: super::cold_decode::ColdFrame<'_>,
+    ) -> SessionResult<()> {
+        self.reducer
+            .reserve_cold_frame_identity(&metadata.id, metadata.seq, &metadata.lane)
+    }
+    /// Full-decoder fallback for unusual wire shapes.
+    pub fn reserve_retired_mutation(&mut self, mutation: &SessionMutation) -> SessionResult<()> {
+        let SessionMutation::Record {
+            record: LaneRecord::AssistantFrame(frame),
+        } = mutation
+        else {
+            return Err(SessionError::storage("expected a retired frame mutation"));
+        };
+        self.reducer
+            .reserve_cold_frame_identity(&frame.base.id, frame.base.seq, &frame.base.lane)
     }
     /// Apply a validated historical frame without constructing its discarded
     /// JSON payload or a payload-bearing ApplyOutcome. Hydration still uses the
