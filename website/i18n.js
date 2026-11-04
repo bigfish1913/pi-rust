@@ -107,7 +107,7 @@ function syncLocaleLinks() {
 
 export async function initI18n() {
   if (!dictionary) {
-    const response = await fetch('./data/locales.json?v=20261014-language-fix');
+    const response = await fetch('./data/locales.json?v=20261104-community');
     dictionary = await response.json();
   }
   persistLocale(locale);
