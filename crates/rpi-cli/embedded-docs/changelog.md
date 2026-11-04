@@ -11,6 +11,12 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.17.1](https://github.com/bigfish1913/pi-rust/compare/v0.17.0...v0.17.1) - 2026-11-04
+
+### Fixed
+
+- *(resource)* resolve external scope prefixes before leasing
+
 ## [0.17.0](https://github.com/bigfish1913/pi-rust/compare/v0.16.0...v0.17.0) - 2026-11-04
 
 ### Added
