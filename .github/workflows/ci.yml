@@ -252,6 +252,57 @@ jobs:
       - name: Check DLL shutdown and tool ownership
         run: cargo test -p rpi-extensions --lib --features rpi-ai/providers --locked
 
+  platform-startup:
+    name: Platform startup (${{ matrix.target }})
+    if: >-
+      ${{ !(github.event_name == 'pull_request' &&
+      github.repository == 'bigfish1913/pi-rust' &&
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.head.ref, 'release-plz-') &&
+      github.event.pull_request.draft == true) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: platform-startup-${{ matrix.target }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build native CLI
+        run: cargo build -p rpi-cli --bin rpi --release --locked --target ${{ matrix.target }}
+      - name: Start native CLI through linked external prefixes
+        shell: bash
+        run: |
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            binary="target/${{ matrix.target }}/release/rpi.exe"
+          else
+            binary="target/${{ matrix.target }}/release/rpi"
+          fi
+          python -B scripts/test_resource_lease_startup_smoke.py
+          python -B scripts/resource-lease-startup-smoke.py --rpi "$binary"
+
   resources:
     name: Offline resource regression
     if: >-
@@ -368,7 +419,7 @@ jobs:
   release:
     name: Release automation
     if: github.repository == 'bigfish1913/pi-rust' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-    needs: [msrv, check, test, resources, windows-installer]
+    needs: [msrv, check, test, resources, platform-startup, windows-installer]
     permissions:
       contents: write
       pull-requests: read
@@ -380,7 +431,7 @@ jobs:
   preview-version:
     name: Prepare preview release
     if: github.repository == 'bigfish1913/pi-rust' && github.ref == 'refs/heads/preview' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-    needs: [msrv, check, test, resources, windows-installer]
+    needs: [msrv, check, test, resources, platform-startup, windows-installer]
     runs-on: ubuntu-latest
     permissions:
       contents: write
