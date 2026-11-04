@@ -168,6 +168,22 @@ rpi package link|list|unlink
 
 The startup `Context` summary lists the effective `SYSTEM.md`, `APPEND_SYSTEM.md`, `AGENTS.md`, and `CLAUDE.md` resources. `/context` opens a temporary panel with the full resource list: type to filter, use ↑/↓ to browse, and press Esc or Enter to close. Closing only dismisses the panel; it does not clear chat history, model context, or loaded files. Use `/usage` for token and cost statistics. `/reload` refreshes the startup summary and the next `/context` panel. `/changelog` displays the release notes embedded in the current binary; `/changelog all` displays the complete history.
 
+### Skill commands
+
+Use `/skill:name [instructions]`, as in pi, to explicitly invoke a discovered skill:
+
+```text
+/skill:review Check these changes, especially concurrency
+```
+
+Skills appear in slash completion, including those with `disable-model-invocation: true`
+(which only disables automatic model selection). Set `enableSkillCommands: false` to
+hide skill completions without disabling manual invocation. A successful `/reload`
+refreshes the skill command list. Invocation reads the current skill file body and
+preserves spaces and newlines inside additional instructions. Unknown skills and
+read/parse failures pass the original command through the normal input path.
+`/skills` still lists skills; `/skills name [instructions]` remains compatible.
+
 ### Headless server and remote client
 
 Run the agent without a local TUI and connect from another process:

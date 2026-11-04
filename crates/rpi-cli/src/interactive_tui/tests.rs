@@ -7,6 +7,7 @@ mod clipboard_persistence;
 mod context_panel;
 mod enter_completion;
 mod session_regressions;
+mod skill_commands;
 mod updown_cursor;
 
 #[test]

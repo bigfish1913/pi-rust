@@ -262,9 +262,10 @@ pub(super) fn add_help_message(container: &Arc<Container>) {
         ("/compact", "Compact the conversation"),
         ("/copy", "Copy last reply to clipboard"),
         ("/hotkeys", "Show keyboard shortcuts"),
+        ("/skill:<name>", "Invoke a skill with optional instructions"),
         (
             "/skills",
-            "List skills or invoke one: /skills <name> [instructions]",
+            "List skills (legacy invocation: /skills <name> [instructions])",
         ),
     ];
     let cmd_w = cmds.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
@@ -606,7 +607,8 @@ pub(super) fn show_skills_panel(
                 skill.description.chars().take(72).collect::<String>()
             ));
         }
-        lines.push("  Invoke with: /skills <name> [instructions]".into());
+        lines.push("  Invoke with: /skill:<name> [instructions]".into());
+        lines.push("  Compatibility: /skills <name> [instructions]".into());
     }
     container_note_block(chat, &lines.join("\n"));
 }

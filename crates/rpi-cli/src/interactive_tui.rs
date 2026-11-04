@@ -1233,30 +1233,7 @@ pub async fn interactive_tui(
     let status_container = Arc::new(Container::new());
     let loader = Arc::new(Loader::with_text("Working…"));
 
-    // ---- Autocomplete (slash commands + @file paths, rooted at cwd) ----
-    // Prompt templates discovered at session build (Part A2) are surfaced as
-    // `/`-prefixed entries alongside the built-in slash commands: typing
-    // `/<name>` in the editor expands the template (mirrors pi
-    // `expandPromptTemplate`, `agent-session.ts:1124`). The description carries
-    // the template's frontmatter description (or a fallback) so the autocomplete
-    // popover shows what each template does.
-    //
-    // Build autocomplete from the initial templates. /context shares a resource
-    // snapshot that the async reload handler refreshes, so its blocking command
-    // can list the current files without awaiting the harness accessor.
-    let template_slash_commands: Vec<SlashCommandEntry> = resources_snapshot
-        .prompt_templates
-        .clone()
-        .unwrap_or_default()
-        .iter()
-        .map(|t| SlashCommandEntry {
-            name: format!("/{}", t.name),
-            description: t
-                .description
-                .clone()
-                .unwrap_or_else(|| "Expand prompt template".to_string()),
-        })
-        .collect();
+    // ---- Autocomplete (built-ins, templates, /skill:name, and @file paths) ----
     let resources_arc = Arc::new(Mutex::new(resources_snapshot));
     // Build the built-in command registry once — the single source of truth for
     // both dispatch and the built-in autocomplete entries. The discovered
@@ -1269,19 +1246,14 @@ pub async fn interactive_tui(
         reload_context.extension_session.clone(),
     );
     let registry = Arc::new(command_registry);
-    let mut all_slash_commands = registry.visible_entries();
-    all_slash_commands.extend(template_slash_commands);
     let autocomplete = AutocompleteManager::new();
-    {
-        let mut combined = CombinedAutocompleteProvider::new();
-        combined.add_provider(Arc::new(SlashCommandAutocompleteProvider::new(
-            all_slash_commands,
-        )));
-        combined.add_provider(Arc::new(FilePathAutocompleteProvider::with_root(
-            cwd.clone(),
-        )));
-        autocomplete.set_provider(Arc::new(combined));
-    }
+    configure_resource_autocomplete(
+        &autocomplete,
+        registry.visible_entries(),
+        &resources_arc.lock().unwrap(),
+        &cwd,
+        skill_commands_enabled(&saved_settings, &project_settings),
+    );
     let autocomplete_container = Arc::new(Container::new());
 
     let tool_outputs_expanded = session_values
@@ -3611,6 +3583,20 @@ pub async fn interactive_tui(
                     crate::session::reload_extension_resources(harness, &reload_ctx).await;
                 if !outcome.had_errors {
                     if let Ok(resources) = harness.get_resources().await {
+                        let global = crate::settings::load_settings().unwrap_or_default();
+                        let project = if outcome.project_trusted.unwrap_or(project_trusted) {
+                            crate::settings::load_project_settings(&cwd)
+                        } else {
+                            Vec::new()
+                        };
+                        configure_resource_autocomplete(
+                            &state.autocomplete,
+                            registry.visible_entries(),
+                            &resources,
+                            &cwd,
+                            skill_commands_enabled(&global, &project),
+                        );
+                        state.autocomplete_container.clear();
                         update_resource_listing(
                             &ctx.resources,
                             ctx.startup_context.as_ref(),
